@@ -1,0 +1,18 @@
+{
+  "os_name": "Single Level Storage OS",
+  "version": "1.0.0-Distributed",
+  "disk_layout": {
+    "sector_size_bytes": 512,
+    "god_anchor_sector": 1024,
+    "kernel_start_sector": 2048,
+    "system_matrix_start_sector": 4096,
+    "user_space_start_sector": 32768
+  },
+  "payloads": [
+    {
+      "name": "kernel_binary",
+      "source_file": "my_sls_kernel.bin",
+      "target_sector_offset": 2048
+    }
+  ]
+}
