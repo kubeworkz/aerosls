@@ -47,11 +47,23 @@ To make this seamless, we build an **LLVM Abstract Syntax Tree (AST) Consumer an
 **The LLVM IR Pass Plugin (**`SLSAllocatorPass.cpp`**)**
 
 ```cpp
-#include "llvm/IR/PassManager.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Attributes.h"
-#include "llvm/Passes/PassPlugin.h"
-#include "llvm/Passes/PassBuilder.h"
+// This is a custom LLVM pass that implements a persistent heap allocation mechanism for global variables marked // with a specific metadata attribute. The pass scans the module for global variables with the  "sls::persistent_heap" attribute, computes a unique identifier for each variable, and injects inline assembly to // perform a system call that allocates memory in a persistent heap. The allocated memory address is then stored // back into the global variable.
+
+// To build:
+// ---------
+// sudo apt install -y llvm llvm-dev clang
+// llvm-config --version
+// clang++ -shared -fPIC $(llvm-config --cxxflags) \
+    compiler/SLSAllocationPassV2.cpp \
+    $(llvm-config --ldflags) \
+    -o SLSAllocationPassV2.so
+
+#include <llvm/IR/PassManager.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Attributes.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/Passes/PassPlugin.h>
+#include <llvm/Passes/PassBuilder.h>
 
 using namespace llvm;
 
@@ -97,7 +109,8 @@ struct SLSAllocatorPass : public PassInfoMixin<SLSAllocatorPass> {
                 Value *MappedVAddr = Builder.CreateCall(SyscallAsm, {ObjIdVal, SizeVal, FlagsVal});
 
                 // 5. Overwrite the global pointer reference with the returned virtual address space window
-                Value *BitcastedPtr = Builder.CreateBitCast(MappedVAddr, GV.getType()->getPointerElementType());
+                Type *ElementType = GV.getValueType();
+                Value *BitcastedPtr = Builder.CreateBitCast(MappedVAddr, ElementType);
                 Builder.CreateStore(BitcastedPtr, &GV);
 
                 Modified = true;
@@ -402,8 +415,6 @@ clean-user-app:
 	rm -f *.ll *.o $(COMPLEX_PLUGIN) $(TREE_DB_APP)
 
 ```
-
-
 
 ---
 

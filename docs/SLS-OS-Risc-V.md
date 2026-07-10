@@ -164,8 +164,6 @@ riscv_switch_satp:
 
 ```
 
-
-
 ## **Next Steps for the RISC-V Architecture Evolution**
 
 1. **Toolchain Shift:** Swap out `x86_64-elf-gcc` inside your Makefile configuration rules to target the cross-compiler environment `riscv64-unknown-elf-gcc`.
@@ -330,8 +328,6 @@ struct SLSObject create_riscv_persistent_region(size_t size) {
 }
 
 ```
-
-
 
 ## **Complete Cross-Platform Compilation Check**
 
@@ -1145,7 +1141,7 @@ perform_riscv_context_switch:
 With the PLIC driver and context switch assembly linked into your global `Makefile` rules, your cross-compiled RISC-V kernel handles execution peaks with absolute stability:
 
 1. **Bootup Provisioning:** The Bootstrap Processor (Hart 0) boots via `boot_riscv.S`, drops into `kernel_riscv_main`, and calls `init_riscv_plic(0)`. This sets the priority of IRQ 10 to 5, unmasks it inside the Hart 0 Supervisor Enable line, and clears the local priority threshold.
-2. **Asynchronous Shell Capture:** A developer types a command over the QEMU terminal window. The emulated UART interface fires a physical line interrupt. The PLIC captures it, evaluates the threshold, and routes a **Supervisor External Interrupt (IRQ 9)** straight to Core 0. [[1](https://wiki.osdev.org/PLIC), [2](https://doc.nucleisys.com/nuclei_spec/isa/plic.html)]
+2. **Asynchronous Shell Capture:** A developer types a command over the QEMU terminal window. The emulated UART interface fires a physical line interrupt. The PLIC captures it, evaluates the threshold, and routes a **Supervisor External Interrupt (IRQ 9)** straight to Core 0.
 3. **Trap Collection & Claiming:**
   The CPU halts execution and branches to your Supervisor Trap Router handler. The handler reads the unique event code by invoking `plic_claim_interrupt(0)`, which returns `10`. It drains the character payload using OpenSBI `sbi_getchar` calls, forwards the typed buffer to the single-level shell parser, and writes a acknowledgment token back to the PLIC via `plic_complete_interrupt(0, 10)`.
 4. **Thread-Safe Context Shifting:** If the shell parser triggers an intensive background data-fetch segment requiring the shell thread to block, the kernel invokes:
@@ -1432,8 +1428,6 @@ By clearing the \texttt{sstatus.VS} bitmask to \texttt{00} (\textit{OFF}) during
 When a thread eventually triggers an illegal instruction Exception 02 by executing a vectorized ChaCha20 block cipher operation, our localized trap handler intercepts the fault and synchronizes the vector register data in just $12.4$ clock cycles, as illustrated in Figure~\ref{fig:riscv_vector_latency}. This confirms that the AeroSLS lazy-swapping paradigm successfully eliminates execution jitter for scalar tasks, allowing background cryptographic page sealing to run at maximum hardware capability with minimal performance overhead.
 
 ```
-
-
 
 ---
 

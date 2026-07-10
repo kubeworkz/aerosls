@@ -1,3 +1,5 @@
+// kernel.c - Freestanding C entry point
+
 // Prevent name mangling if using a C++ compiler later
 #ifdef __cplusplus
 extern "C"
