@@ -1,6 +1,8 @@
 bits 64
 global isr14_stub
+global isr32_stub
 extern handle_page_fault
+extern timer_irq_handler
 
 isr14_stub:
     push rbp               ; Save base pointer
@@ -36,3 +38,28 @@ isr14_stub:
     pop rbp
     add rsp, 8             ; Clean up error code from stack
     iretq                  ; 64-bit Interrupt Return
+
+isr32_stub:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    call timer_irq_handler
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    iretq

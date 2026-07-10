@@ -1,9 +1,9 @@
 #include "prefetch.h"
 #include "dspp.h"
 #include "io_prio.h"
+#include "e1000.h"
 
 extern uint64_t* walk_page_tables(uint64_t virtual_address);
-extern void e1000_transmit_packet(void* phys_buf, uint16_t size);
 
 // Evaluates adjacent virtual address space steps on demand
 void issue_speculative_prefetch(uint64_t object_id, uint64_t current_fault_vaddr) {

@@ -1,6 +1,7 @@
 #ifndef SCHEDULER_LAZY_H
 #define SCHEDULER_LAZY_H
 
+#include <stddef.h>
 #include "scheduler_extended.h"
 
 // Per-core pointer tracking the thread whose data is *physically* loaded in the FPU/ZMM registers

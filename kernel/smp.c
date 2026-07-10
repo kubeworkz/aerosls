@@ -1,13 +1,9 @@
 #include <stdint.h>
 #include <stddef.h>
+#include "../arch/x86/lapic.h"
 
-#define LAPIC_REG_ICR_LOW  0x0300
-#define LAPIC_REG_ICR_HIGH 0x0310
-
-extern void lapic_write(uint32_t reg, uint32_t value);
 extern void* allocate_physical_ram_frame(void);
 extern void ap_kernel_main(void); // Defined in your C main code tree
-extern void init_local_apic_registers(void);
 extern void sls_flush_daemon_loop(void);
 extern void kernel_sleep_ticks(uint32_t ticks);
 

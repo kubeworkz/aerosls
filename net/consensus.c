@@ -1,7 +1,7 @@
 #include "consensus.h"
 #include "dspp.h"
 
-extern void e1000_transmit_packet(void* phys_buf, uint16_t size);
+#include "e1000.h"
 extern void update_page_table_permissions_globally(uint32_t force_read_only);
 
 // Executed every 10ms by the kernel timer interrupt handler on Core 3

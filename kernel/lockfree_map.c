@@ -21,7 +21,7 @@ static struct SLSObjectNode* volatile concurrent_object_directory[HASH_MATRIX_BU
 
 extern uint64_t generate_unique_object_id(const char* key, size_t length);
 extern struct SLSObject create_persistent_region(size_t size);
-extern void* allocate_kernel_memory(size_t size);
+extern void* allocate_physical_ram_frame(void);
 
 struct SLSObjectNode* lockfree_lookup_object(uint64_t object_id) {
     uint32_t bucket = object_id % HASH_MATRIX_BUCKETS;
@@ -48,7 +48,7 @@ uint64_t concurrent_get_or_create_object(const char* name, size_t name_len, size
     }
 
     // Allocate a temporary node descriptor space
-    struct SLSObjectNode* new_node = (struct SLSObjectNode*)allocate_kernel_memory(sizeof(struct SLSObjectNode));
+    struct SLSObjectNode* new_node = (struct SLSObjectNode*)allocate_physical_ram_frame();
     new_node->unique_object_id = obj_id;
     new_node->allocated_bytes = size_bytes;
     

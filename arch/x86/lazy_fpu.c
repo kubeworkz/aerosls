@@ -1,9 +1,8 @@
 #include "scheduler_lazy.h"
+#include <stddef.h>
 
 extern struct ExtendedTask* kernel_get_current_task_struct(void);
-extern void lapic_write(uint32_t reg, uint32_t value);
-
-#define LAPIC_REG_EOI 0x00B0
+#include "lapic.h"
 
 void handle_device_not_available_fault(void) {
     // 1. Instantly clear the TS bit so the kernel itself can execute saving commands safely

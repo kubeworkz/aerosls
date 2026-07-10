@@ -33,7 +33,8 @@ void enqueue_prioritized_io(struct NVMeCmd cmd, uint64_t vaddr, enum IOPriority 
 
 // Invoked regularly by the scheduler daemon or hardware completion interrupts
 void dispatch_pending_ios_to_nvme(void) {
-    struct NVMeCmd* io_sq = (struct NVMeCmd*)io_sq_phys_base;
+    struct NVMeCmd* io_sq = (struct NVMeCmd*)nvme_ctrl.mmio_base + 0x1000;
+    uint32_t io_sq_tail = 0;
     
     // Strict Priority Strictures: Only drain lower lanes if higher lanes are completely empty
     for (int prio = PRIO_HIGH; prio < PRIO_COUNT; prio++) {
@@ -47,7 +48,7 @@ void dispatch_pending_ios_to_nvme(void) {
             // Propagate thread-blocking constraints out to matching token arrays
             block_thread_on_storage_token(p_cmd->thread_id, p_cmd->command.command_id, p_cmd->faulting_vaddr);
             
-            io_sq_tail = (io_sq_tail + 1) % IO_QUEUE_SIZE;
+            io_sq_tail = (io_sq_tail + 1) % PRIO_QUEUE_DEPTH;
             
             // Clean out software scheduling queue slot metadata
             p_cmd->is_active = 0;
