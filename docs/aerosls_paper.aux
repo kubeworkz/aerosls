@@ -1,0 +1,90 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{Abstract}{1}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Architectural comparison: legacy VFS double-caching stack vs.\ the AeroSLS direct hardware memory-mapped persistence layout.}}{2}{figure.caption.4}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:arch_comparison}{{1}{2}{Architectural comparison: legacy VFS double-caching stack vs.\ the AeroSLS direct hardware memory-mapped persistence layout}{figure.caption.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}System Architecture Design}{2}{section.2}\protected@file@percent }
+\newlabel{sec:design}{{2}{2}{System Architecture Design}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Unified 64-bit Address Topology}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Concurrent Lock-Free Object Indexing}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Lock-Free Head Node Entry Insertion}}{2}{algorithm.1}\protected@file@percent }
+\newlabel{alg:cas_insertion}{{1}{2}{Lock-Free Head Node Entry Insertion}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Linear Extent Translation Matrix}{2}{subsection.2.3}\protected@file@percent }
+\citation{nvme_spec}
+\citation{intel_64}
+\citation{intel_64}
+\citation{chacha20}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Predictive Spatial Pre-Fetching Architecture}{3}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Hardware Integration and Multi-Core Scalability}{3}{section.3}\protected@file@percent }
+\newlabel{sec:hardware}{{3}{3}{Hardware Integration and Multi-Core Scalability}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}NVMe Submission and Completion Queue Architecture}{3}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Symmetric Multiprocessing Bootstrap}{3}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Distributed Interrupt Routing via APIC}{3}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Memory Protection and Data Privacy at Rest}{3}{section.4}\protected@file@percent }
+\newlabel{sec:security}{{4}{3}{Memory Protection and Data Privacy at Rest}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Hardware-Enforced Capability Access Control}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Core allocation topology: Cores\nonbreakingspace 0--1 handle scheduler threads and allocations; Cores\nonbreakingspace 2--3 function as isolated vectorized ChaCha20 cryptoprocessors.}}{3}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:crypto_cores}{{2}{3}{Core allocation topology: Cores~0--1 handle scheduler threads and allocations; Cores~2--3 function as isolated vectorized ChaCha20 cryptoprocessors}{figure.caption.5}{}}
+\citation{raft}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Parallel AVX-512 Cryptographic Page Sealing}{4}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Lazy Floating-Point Context Switching}{4}{subsection.4.3}\protected@file@percent }
+\newlabel{sec:lazy_fpu}{{4.3}{4}{Lazy Floating-Point Context Switching}{subsection.4.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{State size model.}{4}{section*.6}\protected@file@percent }
+\newlabel{eq:state_size}{{3}{4}{State size model}{equation.4.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Latency model.}{4}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Crash Consistency and Distributed Fault Tolerance}{4}{section.5}\protected@file@percent }
+\newlabel{sec:consensus}{{5}{4}{Crash Consistency and Distributed Fault Tolerance}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Write-Ahead Journaling and Object Directory}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}In-Kernel Raft-Lite Consensus Engine}{4}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Distributed SLS Page Protocol (DSPP)}{4}{subsection.5.3}\protected@file@percent }
+\citation{multics}
+\citation{ibmi}
+\citation{twizzler}
+\citation{aurora}
+\citation{pmfs}
+\citation{nova}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Evaluation and Experimental Results}{5}{section.6}\protected@file@percent }
+\newlabel{sec:eval}{{6}{5}{Evaluation and Experimental Results}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Experimental Setup}{5}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Memory Resolution Abstraction Tax}{5}{subsection.6.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Dual-panel evaluation results. (a)\nonbreakingspace Memory resolution abstraction tax: legacy VFS stack versus AeroSLS direct MMU index. (b)\nonbreakingspace Core scheduler jitter mitigation: forced strict XSAVE/XRSTOR versus lazy CR0.TS context switching. Panel\nonbreakingspace (b) uses a logarithmic $y$-axis.}}{5}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:perf}{{3}{5}{Dual-panel evaluation results. (a)~Memory resolution abstraction tax: legacy VFS stack versus AeroSLS direct MMU index. (b)~Core scheduler jitter mitigation: forced strict XSAVE/XRSTOR versus lazy CR0.TS context switching. Panel~(b) uses a logarithmic $y$-axis}{figure.caption.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Core Scheduler Context-Switch Jitter}{5}{subsection.6.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Per-metric cycle count summary across 100 trial iterations (QEMU x86\_64, 4-core, 4\,GiB RAM).}}{5}{table.caption.9}\protected@file@percent }
+\newlabel{tab:results}{{1}{5}{Per-metric cycle count summary across 100 trial iterations (QEMU x86\_64, 4-core, 4\,GiB RAM)}{table.caption.9}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Related Work}{5}{section.7}\protected@file@percent }
+\newlabel{sec:related}{{7}{5}{Related Work}{section.7}{}}
+\citation{spdk}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion and Future Work}{6}{section.8}\protected@file@percent }
+\newlabel{sec:conclusion}{{8}{6}{Conclusion and Future Work}{section.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Heterogeneous Architecture and Protocol Scaling}{6}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Hardware-Accelerated RDMA over Converged Ethernet}{6}{subsection.8.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Proposed AeroSLS zero-copy RoCEv2 integration pipeline for sub-microsecond distributed page resolution.}}{6}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:roce_pipeline}{{4}{6}{Proposed AeroSLS zero-copy RoCEv2 integration pipeline for sub-microsecond distributed page resolution}{figure.caption.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}SLS-Aware Compiler Plugins for Legacy Runtimes}{6}{subsection.8.3}\protected@file@percent }
+\bibstyle{ACM-Reference-Format}
+\bibdata{aerosls_paper}
+\bibcite{twizzler}{{1}{2020}{{Bittman et~al\mbox  {.}}}{{}}}
+\bibcite{aurora}{{2}{2009}{{Condit et~al\mbox  {.}}}{{}}}
+\bibcite{multics}{{3}{1965}{{Corbat\'{o} and Vyssotsky}}{{}}}
+\bibcite{pmfs}{{4}{2014}{{Dulloor et~al\mbox  {.}}}{{}}}
+\bibcite{ibmi}{{5}{1978}{{IBM Corporation}}{{}}}
+\bibcite{intel_64}{{6}{2023}{{Intel Corporation}}{{}}}
+\bibcite{chacha20}{{7}{2015}{{Nir and Langley}}{{}}}
+\bibcite{nvme_spec}{{8}{2021}{{NVM Express, Inc.}}{{}}}
+\bibcite{raft}{{9}{2014}{{Ongaro and Ousterhout}}{{}}}
+\bibcite{nova}{{10}{2016}{{Xu and Zhang}}{{}}}
+\bibcite{spdk}{{11}{2017}{{Yang et~al\mbox  {.}}}{{}}}
+\newlabel{tocindent-1}{0pt}
+\newlabel{tocindent0}{0pt}
+\newlabel{tocindent1}{4.62497pt}
+\newlabel{tocindent2}{11.81937pt}
+\newlabel{tocindent3}{0pt}
+\@writefile{toc}{\contentsline {section}{References}{7}{section*.12}\protected@file@percent }
+\newlabel{TotPages}{{7}{7}{}{page.7}{}}
+\gdef \@abspage@last{7}
