@@ -166,7 +166,7 @@ riscv_switch_satp:
 
 ## **Next Steps for the RISC-V Architecture Evolution**
 
-1. **Toolchain Shift:** Swap out `x86_64-elf-gcc` inside your Makefile configuration rules to target the cross-compiler environment `riscv64-unknown-elf-gcc`.
+1. **Toolchain Shift:** Swap out `x86_64-elf-gcc` inside our Makefile configuration rules to target the cross-compiler environment `riscv64-unknown-elf-gcc`.
 2. **QEMU Emulation Adaptation:** Change the core hardware machine emulator from `qemu-system-x86_64` to `qemu-system-riscv64` using option flags `-machine virt` and mapping the storage device over virtio-blk configurations.
 
 The low-overhead, zero-abstraction design principles of AeroSLS have successfully scaled to an entirely new ISA.
@@ -183,7 +183,7 @@ Here is the custom RISC-V linker script followed by the cross-compilation pipeli
 
 ### **1. The RISC-V Structural Linker Script (**`linker_riscv.ld`**)**
 
-This script targets the standard 64-bit RISC-V Virt machine memory topology. It loads the text section at physical offset `0x80000000` and ensures that all inner segments are page-aligned to a strict 4KB boundary, matching the layout expectations of your `walk_page_tables_sv39` translation logic.
+This script targets the standard 64-bit RISC-V Virt machine memory topology. It loads the text section at physical offset `0x80000000` and ensures that all inner segments are page-aligned to a strict 4KB boundary, matching the layout expectations of our `walk_page_tables_sv39` translation logic.
 
 ```
 /* Specify the entry point of the executable (defined in boot.S for RISC-V) */
@@ -230,7 +230,7 @@ SECTIONS
 
 ### **2. Comprehensive RISC-V Project** `Makefile`
 
-This Makefile swaps out your x86 toolchain for `riscv64-unknown-elf-` and changes the emulated processor machine to `qemu-system-riscv64`. It disables standard compression features (`-mno-relax`) to prevent optimization steps from unaligning your memory-mapped tracking loops.
+This Makefile swaps out our x86 toolchain for `riscv64-unknown-elf-` and changes the emulated processor machine to `qemu-system-riscv64`. It disables standard compression features (`-mno-relax`) to prevent optimization steps from unaligning our memory-mapped tracking loops.
 
 ```
 # ==============================================================================
@@ -293,14 +293,14 @@ clean:
 
 ### **3. Adapting User-Space Allocations for Sv39 Address Constraints**
 
-When your compiler extensions and `sys_sls_allocate` module run under **Sv39**, you must shift your universal virtual memory address space base pointer.
+When our compiler extensions and `sys_sls_allocate` module run under **Sv39**, you must shift our universal virtual memory address space base pointer.
 
 On x86_64, we arbitrarily picked `0x0000700000000000`. On RISC-V Sv39, **bit 38 must be sign-extended up to bit 63**. This splits the valid 39-bit virtual space into two discrete chunks:
 
 1. **Lower Space (User):** `0x0000000000000000` to `0x0000003F_FFFFFFFF`
 2. **Upper Space (Kernel):** `0xFFFFFFC000000000` to `0xFFFFFFFF_FFFFFFFF`
 
-To comply with this hardware specification, your **User-Space Memory Manager** must assign single-level persistent objects within the upper limits of the lower space boundary:
+To comply with this hardware specification, our **User-Space Memory Manager** must assign single-level persistent objects within the upper limits of the lower space boundary:
 
 ```c
 // Adjusted virtual address allocation anchoring base for RISC-V Sv39 Paging
@@ -331,11 +331,11 @@ struct SLSObject create_riscv_persistent_region(size_t size) {
 
 ## **Complete Cross-Platform Compilation Check**
 
-1. Save your scripts and type `make run-riscv` into your development shell terminal.
+1. Save our scripts and type `make run-riscv` into our development shell terminal.
 2. The toolchain will trigger the RISC-V assembler, link the text blocks directly to physical offset `0x80000000`, append OpenSBI boot variables automatically, and cleanly boot the system.
-3. When user threads write data parameters to `0x0000003000000000`, the hardware automatically tracks `VPN2->VPN1->VPN0` table translation indexes, throwing **Store Page Faults (Exception 15)** right into your new Supervisor Trap router handler.
+3. When user threads write data parameters to `0x0000003000000000`, the hardware automatically tracks `VPN2->VPN1->VPN0` table translation indexes, throwing **Store Page Faults (Exception 15)** right into our new Supervisor Trap router handler.
 
-Your zero-abstraction Single-Level Storage engine is now operational across two completely independent processor architectures.
+Our zero-abstraction Single-Level Storage engine is now operational across two completely independent processor architectures.
 
 ---
 
@@ -343,7 +343,7 @@ Your zero-abstraction Single-Level Storage engine is now operational across two 
 
 On RISC-V, when the OpenSBI firmware completes its early machine-level initialization, it jumps to the kernel's entry point (`_start`) in **Supervisor Mode** (S-Mode). The bootloader passes the boot core's ID (the **Hart ID**) in register `a0` and a pointer to the Flattened Device Tree (FDT) in register `a1`.
 
-The bootstrap file must handle initial multi-core serialization (parking secondary cores until Core 0 sets up the primary page tables), allocate a temporary bootstrap stack, and jump to your C kernel entry point (`kernel_riscv_main`).
+The bootstrap file must handle initial multi-core serialization (parking secondary cores until Core 0 sets up the primary page tables), allocate a temporary bootstrap stack, and jump to our C kernel entry point (`kernel_riscv_main`).
 
 ```
 # boot_riscv.S - Low-Level RISC-V Bootstrap Entry
@@ -417,7 +417,7 @@ flag_cores_synchronized:
 
 ### **2. The Cross-Platform Interface Header (**`sls_mmu.h`**)**
 
-To prevent you from having to rewrite your high-level Single-Level Storage engine logic (like `create_persistent_region` or your background flush daemon) whenever you compile for a different CPU target, you must implement a **Hardware Abstraction Layer (HAL)** interface header.
+To prevent you from having to rewrite our high-level Single-Level Storage engine logic (like `create_persistent_region` or our background flush daemon) whenever you compile for a different CPU target, you must implement a **Hardware Abstraction Layer (HAL)** interface header.
 
 This abstract interface maps generic system naming flags (`SLS_PTE_VALID`, `SLS_PTE_WRITABLE`) directly to architecture-specific bitmasks at compile time using standard preprocessor conditionals (`#ifdef`).
 
@@ -506,7 +506,7 @@ static inline int sls_is_page_dirty(uint64_t pte_val) {
 
 ### **3. Compilation Verification Output**
 
-By using the `sls_mmu.h` cross-platform interface header, your generic high-level Single-Level Storage functions now compile perfectly across both platforms without modifying a single line of structural logic:
+By using the `sls_mmu.h` cross-platform interface header, our generic high-level Single-Level Storage functions now compile perfectly across both platforms without modifying a single line of structural logic:
 
 ```c
 // Example of cross-platform code inside create_persistent_region()
@@ -528,7 +528,7 @@ Our Single-Level Storage engine architecture is now completely platform-agnostic
 
 ## **1. Updating the LLVM IR Pass for the RISC-V Calling Convention**
 
-When porting your custom LLVM compiler extensions to RISC-V, you must modify the inline assembly generation logic. The System V AMD64 ABI (x86_64) passes its first three system call arguments in `RDI`, `RSI`, and `RDX`, with the syscall number in `RAX`.
+When porting our custom LLVM compiler extensions to RISC-V, you must modify the inline assembly generation logic. The System V AMD64 ABI (x86_64) passes its first three system call arguments in `RDI`, `RSI`, and `RDX`, with the syscall number in `RAX`.
 
 Conversely, the **RISC-V Calling Convention (Standard standard** `lp64d` **ABI)** dictates that supervisor-level environment calls—triggered via the `ecall` instruction—pass the first seven system call arguments in registers `a0` **through** `a6`, while the System Call ID number is explicitly mapped to register `a7`.
 
@@ -702,7 +702,7 @@ void migrate_x86_table_to_riscv(uint64_t* x86_page_table_src, uint64_t* riscv_pa
 
 ### **Section 3: Architecture-Agnostic Migration Workflow**
 
-With these additions, your Single-Level Storage engine successfully bridges cross-ISA boundary constraints during an object live-migration event:
+With these additions, our Single-Level Storage engine successfully bridges cross-ISA boundary constraints during an object live-migration event:
 
 ```
 ==================================================================================
@@ -730,7 +730,7 @@ Our compiler pipelines and memory translation layers are now unified. The LLVM p
 
 To manage both the legacy **x86_64** architecture pipeline and the new **RISC-V (Sv39)** architectural deployment matrices within a single project tree, we refactor the global `Makefile` into a multi-target build framework.
 
-This configuration separates toolchains, links targeted configuration objects to separate linker layouts, and passes the correct platform-specific optimization flags to your custom LLVM shared-object transformer plugins.
+This configuration separates toolchains, links targeted configuration objects to separate linker layouts, and passes the correct platform-specific optimization flags to our custom LLVM shared-object transformer plugins.
 
 ```
 # ==============================================================================
@@ -850,7 +850,7 @@ clean:
 
 On RISC-V, low-level physical console communications and environment execution management are delegated to **OpenSBI (Open Supervisor Binary Interface)** firmware executing in Machine Mode (M-Mode). To interact with input and output lines without writing raw hardware register drivers for a specific platform's board layout, the kernel executes Supervisor Binary Interface (SBI) calls via the `ecall` assembly primitive.
 
-When an asynchronous character input interrupt triggers over the virtual **NS16550A UART interface**, the processor routes execution to your registered trap handler. The handler reads the input character via SBI calls and passes it directly into the Single-Level Storage secure shell engine.
+When an asynchronous character input interrupt triggers over the virtual **NS16550A UART interface**, the processor routes execution to our registered trap handler. The handler reads the input character via SBI calls and passes it directly into the Single-Level Storage secure shell engine.
 
 **Step A: Defining SBI Firmware Extension Primitives (**`sbi.h`**)**
 
@@ -971,14 +971,14 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
 
 ## **3. Verification of Multi-Arch Operational Workflows**
 
-With these configuration blocks active, you can seamlessly direct execution targets across completely distinct computing platforms from your unified development shell tree:
+With these configuration blocks active, you can seamlessly direct execution targets across completely distinct computing platforms from our unified development shell tree:
 
 - **To verify the x86_64 architecture track:** execute `make x86-run`. The multi-core QEMU environment launches, initializes the local thread managers, loads the write-ahead journaling ledgers, and maps the standard user shell.
-- **To verify the RISC-V architecture track:** execute `make riscv-run`. The compiler switches to your `riscv64-unknown-elf` toolchain, links segments dynamically to physical offset `0x80000000`, loads OpenSBI firmware, and boots into a fast, headless terminal environment.
+- **To verify the RISC-V architecture track:** execute `make riscv-run`. The compiler switches to our `riscv64-unknown-elf` toolchain, links segments dynamically to physical offset `0x80000000`, loads OpenSBI firmware, and boots into a fast, headless terminal environment.
 
-When you type a command into the RISC-V console, the characters are parsed asynchronously by your kernel interrupt handler using **OpenSBI Firmware traps**. If you trigger an operation like `create persistent_vault 8192`, your cross-compiled **LLVM pass plugin (**`libSLSAllocationPassV2.so`**)** handles the register footprint dynamically—issuing an `ecall` environment trap with the call identifier loaded into register `a7` instead of an x86 `syscall` primitive.
+When you type a command into the RISC-V console, the characters are parsed asynchronously by our kernel interrupt handler using **OpenSBI Firmware traps**. If you trigger an operation like `create persistent_vault 8192`, our cross-compiled **LLVM pass plugin (**`libSLSAllocationPassV2.so`**)** handles the register footprint dynamically—issuing an `ecall` environment trap with the call identifier loaded into register `a7` instead of an x86 `syscall` primitive.
 
-The entire un-abstracted single-level storage paradigm runs seamlessly across modern computing platforms with zero modifications to your high-level system logic.
+The entire un-abstracted single-level storage paradigm runs seamlessly across modern computing platforms with zero modifications to our high-level system logic.
 
 ---
 
@@ -992,7 +992,7 @@ Following that, we will implement the native 64-bit RISC-V context switch routin
 
 ### **1. RISC-V PLIC Driver Management (**`plic.c`**)**
 
-On the standard QEMU RISC-V Virt machine platform, the PLIC resides at base MMIO address `0x0C000000`. Peripheral **IRQ 10** corresponds to the primary UART console. To route this interrupt to the supervisor-mode processing loops of your cores, you must configure the priority vector and unmask the supervisor-level enable bitmask registers.
+On the standard QEMU RISC-V Virt machine platform, the PLIC resides at base MMIO address `0x0C000000`. Peripheral **IRQ 10** corresponds to the primary UART console. To route this interrupt to the supervisor-mode processing loops of our cores, you must configure the priority vector and unmask the supervisor-level enable bitmask registers.
 
 ```c
 #include <stdint.h>
@@ -1138,12 +1138,12 @@ perform_riscv_context_switch:
 
 ### **3. Fully Integrated Hardware Workflow**
 
-With the PLIC driver and context switch assembly linked into your global `Makefile` rules, your cross-compiled RISC-V kernel handles execution peaks with absolute stability:
+With the PLIC driver and context switch assembly linked into our global `Makefile` rules, our cross-compiled RISC-V kernel handles execution peaks with absolute stability:
 
 1. **Bootup Provisioning:** The Bootstrap Processor (Hart 0) boots via `boot_riscv.S`, drops into `kernel_riscv_main`, and calls `init_riscv_plic(0)`. This sets the priority of IRQ 10 to 5, unmasks it inside the Hart 0 Supervisor Enable line, and clears the local priority threshold.
 2. **Asynchronous Shell Capture:** A developer types a command over the QEMU terminal window. The emulated UART interface fires a physical line interrupt. The PLIC captures it, evaluates the threshold, and routes a **Supervisor External Interrupt (IRQ 9)** straight to Core 0.
 3. **Trap Collection & Claiming:**
-  The CPU halts execution and branches to your Supervisor Trap Router handler. The handler reads the unique event code by invoking `plic_claim_interrupt(0)`, which returns `10`. It drains the character payload using OpenSBI `sbi_getchar` calls, forwards the typed buffer to the single-level shell parser, and writes a acknowledgment token back to the PLIC via `plic_complete_interrupt(0, 10)`.
+  The CPU halts execution and branches to our Supervisor Trap Router handler. The handler reads the unique event code by invoking `plic_claim_interrupt(0)`, which returns `10`. It drains the character payload using OpenSBI `sbi_getchar` calls, forwards the typed buffer to the single-level shell parser, and writes a acknowledgment token back to the PLIC via `plic_complete_interrupt(0, 10)`.
 4. **Thread-Safe Context Shifting:** If the shell parser triggers an intensive background data-fetch segment requiring the shell thread to block, the kernel invokes:
   ```c
   perform_riscv_context_switch(&shell_task_struct, &idle_task_struct);
@@ -1151,15 +1151,15 @@ With the PLIC driver and context switch assembly linked into your global `Makefi
   ```
   The assembly wrapper catches the call, freezes the callee-saved registers into the 112-byte stack frame array, records the `sp` state, swaps the stack pointer to point to the idle thread's context block, and returns seamlessly without any data contamination across parallel tasks.
 
-Your Single-Level Storage operating system is now a complete cross-platform system, possessing optimized compiler pipelines, automated page-table conversion daemons, and low-overhead multi-core hardware interrupt handlers functional across both major enterprise processor specifications.
+Our Single-Level Storage operating system is now a complete cross-platform system, possessing optimized compiler pipelines, automated page-table conversion daemons, and low-overhead multi-core hardware interrupt handlers functional across both major enterprise processor specifications.
 
 ---
 
 ## **1. Automated Unit Tests for the PLIC Interrupt Claim Loop**
 
-To verify that your PLIC interrupt claim and completion loop handles hardware console commands reliably inside QEMU without manual key-pressing, you can write an in-kernel **Automated Testing Suite**.
+To verify that our PLIC interrupt claim and completion loop handles hardware console commands reliably inside QEMU without manual key-pressing, you can write an in-kernel **Automated Testing Suite**.
 
-This harness utilizes the **NS16550A UART Loopback Mode**. By writing a sequence of ASCII bytes to the transmitter with loopback enabled, the virtual UART will mock hardware-level input and instantly trigger PLIC IRQ 10. The test verifies that the PLIC register claims the interrupt, triggers your supervisor routing handler, blocks/unblocks appropriately, and clears cleanly via the End-Of-Interrupt (EOI) write handshake.
+This harness utilizes the **NS16550A UART Loopback Mode**. By writing a sequence of ASCII bytes to the transmitter with loopback enabled, the virtual UART will mock hardware-level input and instantly trigger PLIC IRQ 10. The test verifies that the PLIC register claims the interrupt, triggers our supervisor routing handler, blocks/unblocks appropriately, and clears cleanly via the End-Of-Interrupt (EOI) write handshake.
 
 **Step A: Defining UART Test Registers (**`uart_test.c`**)**
 
@@ -1240,7 +1240,7 @@ void run_plic_loopback_unit_test(void) {
 
 ## **2. RISC-V Vector Register Context Isolation Suite (**`vsetvli`**)**
 
-When bringing your parallel cryptographic page sealer to the RISC-V platform, you swap out x86_64 AVX-512 code for the native **RISC-V Vector Extension (RVV v1.0)**. RVV introduces 32 architectural vector registers (`v0` to `v31`).
+When bringing our parallel cryptographic page sealer to the RISC-V platform, you swap out x86_64 AVX-512 code for the native **RISC-V Vector Extension (RVV v1.0)**. RVV introduces 32 architectural vector registers (`v0` to `v31`).
 
 Like the x86 FPU optimization we built, saving and restoring these large vector states on every standard scalar context switch causes massive performance decay. We must design a **Lazy Vector Context Switcher** utilizing the `status` supervisor control register.
 
@@ -1364,7 +1364,7 @@ riscv_vector_load_state:
 
 ## **3. Integrated Micro-Optimization Validation Timeline**
 
-When you run your dual-node testing pipeline inside the RISC-V environment (`make riscv-run`), the telemetry dashboard logs the exact hardware trap synchronization metrics:
+When you run our dual-node testing pipeline inside the RISC-V environment (`make riscv-run`), the telemetry dashboard logs the exact hardware trap synchronization metrics:
 
 ```
 [0031.002] [TEST] Injecting mock console byte 'A' into hardware loops...
@@ -1433,9 +1433,9 @@ When a thread eventually triggers an illegal instruction Exception 02 by executi
 
 ### **Step 4: Academic Integrity and Data Validation Check**
 
-Before finalizing your document compilation within Overleaf, verify the structural integrity of your paper's technical argument:
+Before finalizing our document compilation within Overleaf, verify the structural integrity of our paper's technical argument:
 
 1. **The Architectural Symmetry Proof:** The table proves to reviewers that because AeroSLS relies on a unified Hardware Abstraction Layer (`sls_mmu.h`), the kernel's high-level Single-Level Storage engine logic is completely cross-platform.
-2. **The ISA Efficiency Argument:** Point out in your text that RISC-V's streamlined, uniform register files and simple 3-level page directory structure natively reduce page-resolution delays compared to the legacy complexity of x86 systems.
+2. **The ISA Efficiency Argument:** Point out in our text that RISC-V's streamlined, uniform register files and simple 3-level page directory structure natively reduce page-resolution delays compared to the legacy complexity of x86 systems.
 3. **The Variable Footprint Disclaimer:** By adding the LaTeX `\tablefootnote`, you demonstrate a deep understanding of RISC-V architectural specifications, noting that while x86 AVX-512 state sizes are fixed at 2,688 bytes, RISC-V vector state footprints are completely platform-dependent based on the implementation's explicit hardware `VLEN` register bit settings.
 

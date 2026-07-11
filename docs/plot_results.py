@@ -16,7 +16,7 @@ plt.rcParams.update({
     'ytick.labelsize': 9,
     'legend.fontsize': 9,
     'figure.titlesize': 11,
-    'text.usetex': False  # Set to True if you have a local LaTeX installation on your host
+    'text.usetex': False  # Set to True if you have a local LaTeX installation on our host
 })
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ def render_publication_charts():
     try:
         df = pd.read_csv("evaluation_data.csv")
     except FileNotFoundError:
-        print("[ERROR] Please extract your log data first via: grep -E 'CYCLES' sls_kernel_debug.log > evaluation_data.csv")
+        print("[ERROR] Please extract our log data first via: grep -E 'CYCLES' sls_kernel_debug.log > evaluation_data.csv")
         return
 
     # Initialize a clean, dual-column publication figure layout (width=7 inches, height=3.2 inches)

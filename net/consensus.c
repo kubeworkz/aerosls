@@ -51,7 +51,7 @@ void trigger_kernel_election_campaign(void) {
     e1000_transmit_packet(&vote_req, sizeof(struct DSPPFullPagePacket));
 }
 
-// Processing interface extending your existing 'handle_network_rx_interrupt_packet' handler
+// Processing interface extending our existing 'handle_network_rx_interrupt_packet' handler
 void process_consensus_packet(struct DSPPFullPagePacket* packet) {
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
 

@@ -20,7 +20,7 @@ isr14_stub:
     push r11
 
     ; The CPU leaves an error code on the stack above the saved registers
-    ; Pass the error code as the first argument (RDI) to your C function
+    ; Pass the error code as the first argument (RDI) to our C function
     mov rdi, [rbp + 8] 
     call handle_page_fault
 

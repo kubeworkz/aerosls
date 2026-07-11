@@ -143,10 +143,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
 
 **3. Integrating the Compiler Plugin into the Build Automation Pipeline**
 
-To compile user applications using this new automation toolkit, expand your project `Makefile` to build the LLVM plugin shared object library (`.so`) and pipe it directly into the compilation path of your telemetry database binaries.
+To compile user applications using this new automation toolkit, expand our project `Makefile` to build the LLVM plugin shared object library (`.so`) and pipe it directly into the compilation path of our telemetry database binaries.
 
 ```
-# Add these definitions to your project compilation Makefile framework
+# Add these definitions to our project compilation Makefile framework
 LLVM_CONFIG = llvm-config
 CXXFLAGS   += $(shell $(LLVM_CONFIG) --cxxflags) -fPIC -shared
 
@@ -176,9 +176,9 @@ When an enterprise telemetry application is deployed using this compiler engine,
 
 1. **Zero-Overhead Initialization:** The moment the database binary executes `_start`, the code injected by the LLVM IR pass executes. It invokes `SYS_SLS_ALLOCATE` for `"engine_telemetry_vault"`. The kernel instantly resolves or mints the persistent 1MB region and initializes the `metrics_log` pointer to point to `0x0000700000000000` with zero initialization latency.
 2. **Raw Memory Traversal Logging:** High-frequency threads invoke `log_sensor_payload()`. The engine writes metrics tuples straight into memory arrays. No data buffering, string manipulation, formatting loops, or POSIX filesystem synchronization stalls take place.
-3. **Hardware-Driven Commit Fences:** When the tracking block crosses critical telemetry threshold loops, the application runs a standard `sys_sls_fence` call via compiler macro abstractions. The priority traffic broker steps in to clear the dirty page bits, forcing a fast, parallelized AVX-512 encrypted write directly across your NVMe storage sectors.
+3. **Hardware-Driven Commit Fences:** When the tracking block crosses critical telemetry threshold loops, the application runs a standard `sys_sls_fence` call via compiler macro abstractions. The priority traffic broker steps in to clear the dirty page bits, forcing a fast, parallelized AVX-512 encrypted write directly across our NVMe storage sectors.
 
-By extending your architecture into the compiler tier, you have successfully bridged the gap between low-level kernel optimizations and everyday software programming constructs. Application developers gain the benefits of automated, crash-resilient persistence simply by using standard syntax decorators.
+By extending our architecture into the compiler tier, you have successfully bridged the gap between low-level kernel optimizations and everyday software programming constructs. Application developers gain the benefits of automated, crash-resilient persistence simply by using standard syntax decorators.
 
 ---
 
@@ -357,13 +357,13 @@ This compiler layout pass natively eliminates memory bounds collisions when stru
 
 ```
 
-Your compiler toolchain is now fully aware of position-independent complex graph structures. Application developers can build linked trees, cyclic telemetry configurations, or pointer-heavy tables across gigabytes of un-abstracted memory.
+Our compiler toolchain is now fully aware of position-independent complex graph structures. Application developers can build linked trees, cyclic telemetry configurations, or pointer-heavy tables across gigabytes of un-abstracted memory.
 
 The LLVM pass handles structure relocations implicitly, completely preserving data persistence across node reboots or cross-cluster memory migrations.
 
-To integrate and deploy the expanded `SLSComplexPointerPass` into your toolchain build automation, you must modify the intermediate generation blocks of your compilation chain.
+To integrate and deploy the expanded `SLSComplexPointerPass` into our toolchain build automation, you must modify the intermediate generation blocks of our compilation chain.
 
-Because LLVM plugins manipulate code directly at the Intermediate Representation (IR) layer, your `Makefile` must be updated to first build the compiler plugin as a shared runtime library (`.so`), compile the user-space multi-page application down to unoptimized LLVM assembly (`.ll`), execute the specialized instruction mutation pass via the LLVM `opt` optimizer tool, and then pass the transformed bitcode to the backend assembler.
+Because LLVM plugins manipulate code directly at the Intermediate Representation (IR) layer, our `Makefile` must be updated to first build the compiler plugin as a shared runtime library (`.so`), compile the user-space multi-page application down to unoptimized LLVM assembly (`.ll`), execute the specialized instruction mutation pass via the LLVM `opt` optimizer tool, and then pass the transformed bitcode to the backend assembler.
 
 Here are the updated project `Makefile` rules to deploy the complex structure tracking pass.
 
@@ -371,7 +371,7 @@ Here are the updated project `Makefile` rules to deploy the complex structure tr
 
 **Expanded Project Build Automation Matrix (**`Makefile`**)**
 
-Update your core project `Makefile` to include these targeted compilation sequences for the complex compiler optimizer plugin:
+Update our core project `Makefile` to include these targeted compilation sequences for the complex compiler optimizer plugin:
 
 ```
 # ==============================================================================
@@ -420,7 +420,7 @@ clean-user-app:
 
 **Execution and Verification Protocol**
 
-To verify that the instruction transformation is injecting relative-offset memory structures, run the following pipeline targets in your developer host terminal environment:
+To verify that the instruction transformation is injecting relative-offset memory structures, run the following pipeline targets in our developer host terminal environment:
 
 ```bash
 # 1. Execute the plugin generation and source transformation pipeline
@@ -428,7 +428,7 @@ make deploy-complex-tree
 
 ```
 
-To audit what the compiler pass physically changed inside your complex pointer layout structures, inspect the differences between the raw and mutated LLVM assembly files using standard terminal parsing commands:
+To audit what the compiler pass physically changed inside our complex pointer layout structures, inspect the differences between the raw and mutated LLVM assembly files using standard terminal parsing commands:
 
 ```bash
 # Locate standard absolute store commands inside the unoptimized code
@@ -445,5 +445,5 @@ The compiler pass replaces standard memory operations with position-independent 
 
 - The raw absolute store instruction (`store ptr %history_buffer, ptr %historical_readings_window`) is completely stripped out.
 - In its place, the plugin injects an underlying `ptrtoint` hardware register abstraction, followed by an LLVM `sub` **(subtraction)** instruction that computes the positional vector delta from the `global_cluster_tree` base address.
-- When loading the array address downstream, an LLVM `add` **(addition)** instruction dynamically recalculates the exact canonical linear memory address, ensuring complete pointer safety across your entire distributed single-level storage grid.
+- When loading the array address downstream, an LLVM `add` **(addition)** instruction dynamically recalculates the exact canonical linear memory address, ensuring complete pointer safety across our entire distributed single-level storage grid.
 

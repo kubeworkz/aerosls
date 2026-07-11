@@ -1,14 +1,14 @@
 # AeroSLS OS
 
-​Building a **Single-Level Storage (SLS)** operating system — where RAM and secondary storage share a unified, persistent virtual memory space—**requires writing a custom kernel**. We eliminate the traditional file system entirely. Instead, all data is represented as persistent objects or segments mapped directly by the processor’s virtual memory.
+​We’re building a **Single-Level Storage (SLS)** operating system — where RAM and secondary storage share a unified, persistent virtual memory space—**requires writing a custom kernel**. We eliminate the traditional file system entirely. Instead, all data is represented as persistent objects or segments mapped directly by the processor’s virtual memory.
 
 ​Developing an SLS architecture from scratch requires understanding low-level OS design and specific architectural steps:
 
 ### ​1. Essential Tools & Environment
 
-To avoid bricking your local hardware while testing, you must build within a virtual environment.
+To avoid bricking our local hardware while testing, we must build within a virtual environment.
 
-- **Virtualization:** Use [QEMU](https://www.qemu.org/) to emulate raw hardware (such as x86_64 or ARM) so you can safely test your kernel images.
+- **Virtualization:** Use [QEMU](https://www.qemu.org/) to emulate raw hardware (such as x86_64 or ARM) so you can safely test our kernel images.
 - **Compiler/Assembler:** Install the GNU Compiler Collection (GCC) and [NASM](https://www.nasm.us/) (The Netwide Assembler) to compile our hardware-level C code andassembly instructions.
 
 ​
@@ -24,11 +24,11 @@ An SLS operating system must directly interface with the processor to take contr
 
 ### 3. Unified Address Translation & Paging
 
-Because there are no explicit file I/O operations (like `read()` or `write()`), page management is the core of your operating system.
+Because there are no explicit file I/O operations (like `read()` or `write()`), page management is the core of our operating system.
 
 **Page Faults:** You will configure the operating system’s Memory Management Unit (MMU) to intercept hardware interrupts. When a program attempts to access an address that is currently on disk instead of RAM, a page fault will trigger.
 
-**Paging Logic:** When the fault occurs, your interrupt handler is responsible for fetching the required page from disk, swappingit into an available frame in primary RAM, and updating the page tables.
+**Paging Logic:** When the fault occurs, our interrupt handler is responsible for fetching the required page from disk, swappingit into an available frame in primary RAM, and updating the page tables.
 
 ​
 
@@ -38,7 +38,7 @@ Unlike a traditional virtual memory system, an SLS operating system guarantees t
 
 **Transaction Logs:** Implement commitment control (journaling) to ensure complex sequences of memory writes execute completely.
 
-**Recovery:** In the event of an unexpected power failure, the OS must read the journal upon reboot to replay unwrittenmemory changes, preventing data loss.
+**Recovery:** In the event of an unexpected power failure, the OS must read the journal upon reboot to replay unwritten memory changes, preventing data loss.
 
 # x86_64
 
@@ -50,7 +50,7 @@ Here is how to structure our bootloader, enter 64-bit mode, and lay the groundwo
 
 ### 1. Booting via Multiboot2 (The Smart Choice)
 
-Writing a 64-bit bootloader entirely from scratch in assembly is tedious. It requires switching from 16-bit Real Mode to 32-bit Protected Mode,setting up temporary page tables, and then switching to 64-bit Long Mode.
+Writing a 64-bit bootloader entirely from scratch in assembly is tedious. It requires switching from 16-bit Real Mode to 32-bit Protected Mode, setting up temporary page tables, and then switching to 64-bit Long Mode.
 
 Instead, use **GRUB** or **QEMU** with a **Multiboot2** header. Multiboot2 initializes the CPU in 32-bit Protected Mode with a basic Global Descriptor Table (GDT),saving you hundreds of lines of assembly.
 
@@ -105,7 +105,7 @@ _start64:
     mov ds, ax
     mov es, ax
     
-    ; Call your C/C++ SLS Kernel Main function
+    ; Call our C/C++ SLS Kernel Main function
     extern kernel_main
     call kernel_main
 
@@ -127,17 +127,17 @@ gdt64:
 
 ### 3. Setting Up SLS Paging on x86_64
 
-In a standard OS, paging maps virtual memory to physical RAM. In an SLS OS, page tables map the entire persistent world. Physical RAMmerely acts as a fast cache for data that actually lives on disk.
+In a standard OS, paging maps virtual memory to physical RAM. In an SLS OS, page tables map the entire persistent world. Physical RAM merely acts as a fast cache for data that actually lives on disk.
 
 To make this work on x86_64:
 
-- **The CR3 Register:** This CPU register points to the top-level page table (PML4). Every task or object space in your SLSsystem will have its own PML4 table.
-- **The Present Bit (Bit 0):** In your page table entries, if a persistent object is currently on disk and not in RAM, clear the **Present (P)** bit (set it to 0).
+- **The CR3 Register:** This CPU register points to the top-level page table (PML4). Every task or object space in our SLS system will have its own PML4 table.
+- **The Present Bit (Bit 0):** In our page table entries, if a persistent object is currently on disk and not in RAM, clear the **Present (P)** bit (set it to 0).
 - **Custom Metadata (Bits 9-11):** x86_64 page tables leave bits 9, 10, and 11 completely ignored by the hardware. Use these “Available for OS” bits to flag pages as **“Persistent Storage Resident”**.
 
 ### 4. Handling the Page Fault (Interrupt 14)
 
-When your kernel or an application tries to access an object whose Present bit is `0`, the x86_64 CPU immediately triggers a **Page Fault (Exception 14)**.
+When our kernel or an application tries to access an object whose Present bit is `0`, the x86_64 CPU immediately triggers a **Page Fault (Exception 14)**.
 
 1. The CPU pushes an error code onto the stack and loads the faulting virtual address into the **CR2 register**.
 2. Our Interrupt Service Routine (ISR) reads CR2 to see what address was requested.
@@ -152,7 +152,7 @@ On x86_64, a standard convention is to link the kernel to load at **1 MiB (0x100
 
 # The Linker Script *(*`linker.ld`*)*
 
-Create a file named linker.ld in your project directory and add the following configuration:
+Create a file named linker.ld in our project directory and add the following configuration:
 
 ```
 /* Specify the entry point of the executable (defined in boot.asm) */
@@ -197,7 +197,7 @@ SECTIONS
 # Critical Explanations
 
 - **ENTRY(_start):** This directs the bootloader to jump straight to the `_start` label in our assembly code when execution begins.
-- **KEEP(*(.multiboot2)):** Linkers aggressively optimize by deleting code they think isn’t being called. Because nothing inside your kernel explicitly calls the Multiboot2 header, the linker would normally throw it away. `KEEP` forces it to stay.
+- **KEEP(*(.multiboot2)):** Linkers aggressively optimize by deleting code they think isn’t being called. Because nothing inside our kernel explicitly calls the Multiboot2 header, the linker would normally throw it away. `KEEP` forces it to stay.
 - **Alignment:** The Multiboot2 specification requires the header to be aligned on a 64-bit (8-byte) boundary. Our `boot.asm` handles this with `align 8`, and placing it first in `.text` preserves that alignment.
 
 # How to Compile and Link Our Kernel
@@ -208,17 +208,17 @@ To compile our assembly file, cross-compile a minimal C kernel, and stitch them 
 # 1. Assemble the bootloader into an ELF64 object file
 nasm -f elf64 boot.asm -o boot.o
 
-# 2. Compile your C kernel without host-system dependencies (freestanding)
+# 2. Compile our C kernel without host-system dependencies (freestanding)
 x86_64-elf-gcc -c kernel.c -o kernel.o -ffreestanding -O2 -Wall -Wextra
 
-# 3. Link everything together using your linker script
+# 3. Link everything together using our linker script
 x86_64-elf-ld -T linker.ld -o my_sls_kernel.bin boot.o kernel.o
 
 ```
 
-*(Note: It is highly recommended to use an x86_64-elf cross-compiler rather than your host’s native gcc to prevent your local operating system’s standard libraries and headers from polluting our raw kernel code.)*
+*(Note: It is highly recommended to use an x86_64-elf cross-compiler rather than our host’s native gcc to prevent our local operating system’s standard libraries and headers from polluting our raw kernel code.)*
 
-Here is the minimalist, freestanding `kernel.c` template to verify your build pipeline, followed by the structural design for your Page Fault Handler to manage the persistent single-level storage.
+Here is the minimalist, freestanding `kernel.c` template to verify our build pipeline, followed by the structural design for our Page Fault Handler to manage the persistent single-level storage.
 
 # 1. Minimalist `kernel.c` Template
 
@@ -252,7 +252,7 @@ void kernel_main(void) {
 
 ```
 
-Compile and link this using the steps from the previous section. If your pipeline works, running `my_sls_kernel.bin` in QEMU will display your boot message sec.
+Compile and link this using the steps from the previous section. If our pipeline works, running `my_sls_kernel.bin` in QEMU will display our boot message sec.
 
 # 2. Intercepting Disk Objects via Page Faults
 
@@ -338,7 +338,7 @@ Create an header file to map the precise x86_64 hardware specifications for inte
 // Explicitly packed structure matching x86_64 IDT Gate descriptor layout
 struct IDTEntry {
     uint16_t isr_low;       // Lower 16 bits of ISR address
-    uint16_t kernel_cs;     // Kernel Code Segment selector (from your GDT, usually 0x08)
+    uint16_t kernel_cs;     // Kernel Code Segment selector (from our GDT, usually 0x08)
     uint8_t  ist;           // Interrupt Stack Table offset (0 for default)
     uint8_t  attributes;    // Type and attributes (e.g., Present, Ring 0, Interrupt Gate)
     uint16_t isr_mid;       // Middle 16 bits of ISR address
@@ -399,7 +399,7 @@ void init_idt(void) {
 
 ## Step C: The Assembly Interrupt Wrapper (`interrupt.asm`)
 
-When a Page Fault occurs, the CPU pushes an error code onto the stack. Your assembly stub handles context saving before leaping into high-level C logic.
+When a Page Fault occurs, the CPU pushes an error code onto the stack. Our assembly stub handles context saving before leaping into high-level C logic.
 
 ```
 bits 64
@@ -422,7 +422,7 @@ isr14_stub:
     push r11
 
     ; The CPU leaves an error code on the stack above the saved registers
-    ; Pass the error code as the first argument (RDI) to your C function
+    ; Pass the error code as the first argument (RDI) to our C function
     mov rdi, [rbp + 8] 
     call handle_page_fault
 
@@ -445,7 +445,7 @@ isr14_stub:
 
 # 2. Implementing the Virtual Address Mapping Manager
 
-In a Single-Level Storage system, allocating an “object” replaces creating a file. Your virtual address space manager needs a metadata tracking scheme to bind virtual memory addresses to physical block locations on persistent storage disks. 
+In a Single-Level Storage system, allocating an “object” replaces creating a file. Our virtual address space manager needs a metadata tracking scheme to bind virtual memory addresses to physical block locations on persistent storage disks. 
 
 ```c
 #include <stdint.h>
@@ -514,7 +514,7 @@ struct SLSObject create_persistent_region(size_t size) {
 
 On x86_64, a 64-bit virtual address is split into five parts to traverse four levels of page tables: **PML4**, **PDPT** (Page Directory Pointer Table), **PD** (Page Directory), and **PT** (Page Table).
 
-To safely walk these tables, your kernel must check if each tier exists. If a middle-tier table is missing, the walker must dynamically allocate a blank 4KB physical frame, clear it, link itto the parent directory, and continue descending.
+To safely walk these tables, our kernel must check if each tier exists. If a middle-tier table is missing, the walker must dynamically allocate a blank 4KB physical frame, clear it, link itto the parent directory, and continue descending.
 
 ```c
 #include <stdint.h>
@@ -534,7 +534,7 @@ To safely walk these tables, your kernel must check if each tier exists. If a mi
 #define PTE_USER       (1ULL << 2)
 #define PTE_FRAME_MASK 0x000FFFFFFFFFF000ULL
 
-// Direct pointers to allocate fresh frames (implemented in your physical memory manager)
+// Direct pointers to allocate fresh frames (implemented in our physical memory manager)
 extern void* allocate_physical_ram_frame(void);
 
 // Helper to safely fetch or create a child table structure
@@ -1445,7 +1445,7 @@ void init_syscall_hardware(void) {
 
 ## Step B: Enhancing the GDT for Ring 3 Isolation
 
-Your initial bootloader GDT only needed a kernel code segment. To run user programs in Ring 3, the GDT must expand to support five unique entry points:
+Our initial bootloader GDT only needed a kernel code segment. To run user programs in Ring 3, the GDT must expand to support five unique entry points:
 
 1. **Null Descriptor** (Required base index 0)
 2. **Kernel Code Segment (Ring 0):** Flags must include `Descriptor Privilege Level (DPL) = 0`.
@@ -1479,7 +1479,7 @@ Every page table slot includes a **User/Supervisor (U/S) Flag (Bit 2)**:
 - **Bit 2 = 0 (Supervisor):** Only kernel code executing in Ring 0 can read or write to this memory region.
 - **Bit 2 = 1 (User):** User-space code executing in Ring 3 is permitted to interact with this memory region.
 
-When your Virtual Address Mapping Manager creates a persistent space handle via `sys_sls_allocate()`, it enforces protection boundaries by manipulating this bit:
+When our Virtual Address Mapping Manager creates a persistent space handle via `sys_sls_allocate()`, it enforces protection boundaries by manipulating this bit:
 
 ```c
  void configure_page_privileges(uint64_t virtual_address, int restrict_to_kernel) {
@@ -1500,7 +1500,7 @@ When your Virtual Address Mapping Manager creates a persistent space handle via 
 
 ```
 
-If an unauthorized user thread attempts to access kernel memory, an SLS Page Fault triggers. The exception code will automatically flag a **Privilege Violation**, allowing your kernel to immediately terminate the offending task and prevent corruption of the persistent single-level object store.
+If an unauthorized user thread attempts to access kernel memory, an SLS Page Fault triggers. The exception code will automatically flag a **Privilege Violation**, allowing our kernel to immediately terminate the offending task and prevent corruption of the persistent single-level object store.
 
 # 1. The 64-Bit GDT Initialization Sequence
 
@@ -1716,7 +1716,7 @@ int share_persistent_object(uint32_t target_app_id, uint64_t object_id, uint32_t
 
 ## Step C: Integrating with the Page Fault Engine
 
-When the target application triggers a page fault trying to access the shared block space, your handler enforces the specific runtime boundaries dictated by the Protection Matrix:
+When the target application triggers a page fault trying to access the shared block space, our handler enforces the specific runtime boundaries dictated by the Protection Matrix:
 
 ```c
  void enforce_matrix_on_fault(uint64_t faulting_address, int is_write_operation) {
@@ -1746,7 +1746,7 @@ By standardizing access validations at the page-directory layout boundary, you p
 
 # 1. The Core `map_sls_frame_to_ram` Memory Link Wrapper
 
-The `map_sls_frame_to_ram` function acts as the final bridge in your Page Fault handler. Once permissions are validated against the Memory Protection Matrix, this wrapper links the faulting virtual address to its physical RAM cache frame and configures the hardware page table entries. 
+The `map_sls_frame_to_ram` function acts as the final bridge in our Page Fault handler. Once permissions are validated against the Memory Protection Matrix, this wrapper links the faulting virtual address to its physical RAM cache frame and configures the hardware page table entries. 
 
 ```c
 #include <stdint.h>
@@ -1902,7 +1902,7 @@ Our entire system configurations, user data profiles, and software architectures
 
 # 1. The Page Eviction Algorithm (Clock / Approximated LRU)
 
-In an SLS operating system, physical RAM is just a fast cache for a much larger persistent world. When physical memory fills up, your kernel must evict an active page frame back to disk to make room.
+In an SLS operating system, physical RAM is just a fast cache for a much larger persistent world. When physical memory fills up, our kernel must evict an active page frame back to disk to make room.
 
 Implementing a pure Least Recently Used (LRU) algorithm requires updating a timestamp on every single memory access, which causes massive performance overhead. Instead, modern production kernels use the **Clock Algorithm** (also called the Second-Chance algorithm), which approximates LRU with zero overhead on memory reads by leveraging the x86_64 hardware **Accessed bit (Bit 5)**.
 
@@ -2102,7 +2102,7 @@ With these two final architectural pillars in place, look at how the entire Sing
 
 # 1. Physical RAM Frame Allocator Pool Logic
 
-The physical frame allocator manages all 4KB blocks of raw system RAM. To link with your clock eviction engine, the allocation function follows a straightforward fallback rule: try to pop a free frame from the available memory bitmap or stack; if physical RAM is fully saturated, invoke evict_page_via_clock() to force a page out to disk and repurpose its physical frame. 
+The physical frame allocator manages all 4KB blocks of raw system RAM. To link with our clock eviction engine, the allocation function follows a straightforward fallback rule: try to pop a free frame from the available memory bitmap or stack; if physical RAM is fully saturated, invoke evict_page_via_clock() to force a page out to disk and repurpose its physical frame. 
 
 ```c
 #include <stdint.h>
@@ -2179,7 +2179,7 @@ void free_physical_ram_frame(void* frame_address) {
 
 # 2. Comprehensive Project Build Makefile
 
-To compile and pack your assembly boot stubs, C components, and hardware controllers into a bootable ISO image, we use an cross-compiler toolchain environment targeting `x86_64-elf`. This `Makefile` sets up temporary directories mirroring the **Multiboot2** ISO directory layouts, links the output executable using our custom `linker.ld`, and relies on `grub-mkrescue` to buildthe ultimate ISO artifact.
+To compile and pack our assembly boot stubs, C components, and hardware controllers into a bootable ISO image, we use an cross-compiler toolchain environment targeting `x86_64-elf`. This `Makefile` sets up temporary directories mirroring the **Multiboot2** ISO directory layouts, links the output executable using our custom `linker.ld`, and relies on `grub-mkrescue` to buildthe ultimate ISO artifact.
 
 ## Step A: Create our GRUB configuration file (`grub.cfg`)
 
@@ -2253,7 +2253,7 @@ clean:
 
 ```
 
-*(Note: The* `run` *instruction assumes you have generated a blank drive image file named* `sls_storage.img` *via* `qemu-img create -f raw sls_storage.img 10G` *inside your working tree directory to serve as your persistent disk space).*
+*(Note: The* `run` *instruction assumes you have generated a blank drive image file named* `sls_storage.img` *via* `qemu-img create -f raw sls_storage.img 10G` *inside our working tree directory to serve as our persistent disk space).*
 
 # The Complete SLS Infrastructure Operational Cycle
 
@@ -2264,7 +2264,7 @@ clean:
 
 # 1. User-Space Test Shell Program (`shell.c`)
 
-Because this is a freestanding environment, your user-space shell cannot rely on `libc` functions like `printf()` or `scanf()`. Instead, it communicates with the kernel entirely through acustom system call wrapper (`do_syscall`).
+Because this is a freestanding environment, our user-space shell cannot rely on `libc` functions like `printf()` or `scanf()`. Instead, it communicates with the kernel entirely through acustom system call wrapper (`do_syscall`).
 
 This minimalist shell provides three primitive commands to test our Single-Level Storage OS:
 
@@ -2355,7 +2355,7 @@ void sls_shell_loop(void) {
                 // Find start of payload string (skip past the name space)
                 char* payload = find_next_argument(name);
                 
-                // Directly write memory. This triggers your Interrupt 14 page fault 
+                // Directly write memory. This triggers our Interrupt 14 page fault 
                 // to swap sectors from disk into RAM automatically.
                 int i = 0;
                 while (payload[i] != '\0' && payload[i] != '\n') {
@@ -2393,7 +2393,7 @@ When building a custom single-level storage kernel, verifying page tables comple
 
 ## Step A: Inside the Kernel (Software Dump Suite)
 
-Add a debugging function to your kernel code to cleanly map and read active page table descriptors out over the legacy serial port (`0x3F8`) or write directly to the screen.
+Add a debugging function to our kernel code to cleanly map and read active page table descriptors out over the legacy serial port (`0x3F8`) or write directly to the screen.
 
 ```c
 #include <stdint.h>
@@ -2434,9 +2434,9 @@ x
 
 ## Step B: Leveraging QEMU’s Monitor Interface (The Hardware Truth)
 
-Software functions can lie if your pointer code contains errors. To look at what the **actual physical CPU MMU sees**, use the QEMU built-in console inspector.
+Software functions can lie if our pointer code contains errors. To look at what the **actual physical CPU MMU sees**, use the QEMU built-in console inspector.
 
-1. Launch our operating system using your `Makefile` configuration.
+1. Launch our operating system using our `Makefile` configuration.
 2. In the QEMU graphical output window, press `Ctrl + Alt + 2` to swap out of the display and enter the interactive **QEMU Monitor Console**. (Press `Ctrl + Alt + 1` to go back).
 3. Type the command `info pg` or `info tlb` into the monitor window
 
@@ -2458,7 +2458,7 @@ QEMU will output a low-level structural text chart revealing the physical archit
 
 ## Step C: GDB Inspection Script
 
-To track transitions when step debugging execution pathways, create a GDB macro file named `.gdbinit` in your working directory to automate register snapshots:
+To track transitions when step debugging execution pathways, create a GDB macro file named `.gdbinit` in our working directory to automate register snapshots:
 
 ```
 target remote localhost:1234
@@ -2478,9 +2478,9 @@ To use this, add the `-s -S` flags to our QEMU execution line inside the `Makefi
 
 # 1. Implementing the Serial (COM1) Debug Logger
 
-To extract our page table dumps and system status logs into a file on your host machine, you must implement a low-level UART serial port driver. On x86_64, the standard primary serialport (**COM1**) is controlled via legacy I/O ports starting at base address `0x3F8`.
+To extract our page table dumps and system status logs into a file on our host machine, you must implement a low-level UART serial port driver. On x86_64, the standard primary serialport (**COM1**) is controlled via legacy I/O ports starting at base address `0x3F8`.
 
-Once this driver is running, you configure QEMU to redirect everything sent to COM1 directly into a plain text log file on your development machine.
+Once this driver is running, you configure QEMU to redirect everything sent to COM1 directly into a plain text log file on our development machine.
 
 ## Step A: Writing the Serial Driver (`serial.c`)
 
@@ -2534,7 +2534,7 @@ void kernel_serial_print(const char* str) {
 
 ## Step B: Redirecting Output via QEMU
 
-Modify the `run` target inside your project `Makefile` to tell QEMU to grab serial output and dump it directly into a file on your local computer:
+Modify the `run` target inside our project `Makefile` to tell QEMU to grab serial output and dump it directly into a file on our local computer:
 
 ```
 run: iso
@@ -2544,13 +2544,13 @@ run: iso
 
 ```
 
-Now, whenever our kernel executes `debug_dump_sls_page_tables()`, a file named `sls_kernel_debug.log` will instantly populate in your local directory containing the exact memory map layout of our operating system.
+Now, whenever our kernel executes `debug_dump_sls_page_tables()`, a file named `sls_kernel_debug.log` will instantly populate in our local directory containing the exact memory map layout of our operating system.
 
 # Transitioning from AHCI/SATA to Native NVMe Controller Queues
 
 While AHCI mimics legacy hard drives with a single serialization loop, **NVMe (Non-Volatile Memory Express)** communicates natively over the fast PCI Express (PCIe) bus. Transitioning our SLS OS to NVMe radically alters performance because it drops legacy I/O registers entirely for **Asynchronous Memory-Mapped Ring Buffers (Submission and Completion Queues)**.
 
-Instead of your CPU waiting for a slow disk sector transaction, it drops a request directly into a fast RAM circular array and rings a door-bell register.
+Instead of our CPU waiting for a slow disk sector transaction, it drops a request directly into a fast RAM circular array and rings a door-bell register.
 
 ## Step A: Modifying PCI Discovery for NVMe
 
@@ -2566,7 +2566,7 @@ Once discovered, NVMe base operations run via **BAR0/BAR1**, which form a unifie
 
 Unlike AHCI, which uses a standard, fixed table struct, an NVMe controller requires us to allocate physical chunks of memory to act as circular rings called **Queue Pairs**.
 
-1. **Submission Queue (SQ):** A circular buffer in RAM where your Page Fault Handler inserts 64-byte command descriptors (Read, Write).
+1. **Submission Queue (SQ):** A circular buffer in RAM where our Page Fault Handler inserts 64-byte command descriptors (Read, Write).
 2. **Completion Queue (CQ):** A circular buffer where the NVMe hardware writes back 16-byte status reports once disk sectors hit raw flash media.
 
 ```c
@@ -2578,7 +2578,7 @@ struct NVMeCommand {
     uint32_t namespace_id;   // Usually 1 for the primary physical disk volume
     uint64_t reserved0;
     uint64_t metadata_ptr;
-    uint64_t prp_entry1;     // Physical Region Page 1: Points directly to your target physical RAM frame
+    uint64_t prp_entry1;     // Physical Region Page 1: Points directly to our target physical RAM frame
     uint64_t prp_entry2;     // Physical Region Page 2: Extended overflow pointer
     uint64_t starting_lba;   // The destination/source storage flash block sector
     uint16_t num_blocks;     // Number of blocks (e.g., 8 sectors for an SLS 4KB page)
@@ -2593,7 +2593,7 @@ struct NVMeCommand {
 
 ## Step C: The Async Doorbell Execution Protocol
 
-In your new NVMe driver model, reading an SLS page block completely bypasses locking or CPU loops:
+In our new NVMe driver model, reading an SLS page block completely bypasses locking or CPU loops:
 
 ```c
 // Base offset pointers referencing the NVMe Controller MMIO allocation fields
@@ -2618,7 +2618,7 @@ void nvme_read_page_async(uint64_t disk_block, void* ram_frame, uint16_t cmd_tok
     // 3. Update the hardware by writing our new head index to the NVMe Controller's Doorbell Register
     *nvme_sq0_doorbell = sq_head_idx; 
     
-    // The processor returns instantly. Your Page Fault loop puts the calling 
+    // The processor returns instantly. Our Page Fault loop puts the calling 
     // thread into TASK_BLOCKED state and lets other processing components run.
 }
 
@@ -2630,13 +2630,13 @@ When the NVMe hardware finishes drawing sectors off the PCIe lanes, it fires a h
 
 1. The controller writes a 16-byte packet to the **Completion Queue**.
 2. It lists the `command_id` token token you passed down during submission.
-3. Our handler reads the status flags. If successful, it locates the matching thread blocked on that token, updates its status to `TASK_READY`, maps the page entry as Present, andlets your context scheduler cycle it back to active hardware lanes.
+3. Our handler reads the status flags. If successful, it locates the matching thread blocked on that token, updates its status to `TASK_READY`, maps the page entry as Present, andlets our context scheduler cycle it back to active hardware lanes.
 
-This architecture removes processing bottlenecks. Under NVMe, your SLS operating system functions as a highly parallel, asynchronous machine where memory frames are constantly pre-fetched or unmapped via direct memory operations with zero processing overhead.
+This architecture removes processing bottlenecks. Under NVMe, our SLS operating system functions as a highly parallel, asynchronous machine where memory frames are constantly pre-fetched or unmapped via direct memory operations with zero processing overhead.
 
 # 1. NVMe Controller Initialization Routine
 
-To transition from AHCI to NVMe, your kernel must initialize the controller by interacting with its Memory-Mapped I/O (MMIO) registers. The core initialization sequence involves:
+To transition from AHCI to NVMe, our kernel must initialize the controller by interacting with its Memory-Mapped I/O (MMIO) registers. The core initialization sequence involves:
 
 1. Waiting for the controller to ready itself.
 2. Disabling the controller to change its settings.
@@ -2750,9 +2750,9 @@ int init_nvme_controller(uint64_t bar0_phys) {
 
 # 2. Configuring PCIe Message Signaled Interrupts (MSI-X)
 
-Legacy pin interrupts (INTA-INTD) are slow and share hardware lines. **MSI-X** solves this problem by allowing your NVMe controller to issue an asynchronous interrupt by directly writing an interrupt vector payload to a specific memory address on your local CPU.
+Legacy pin interrupts (INTA-INTD) are slow and share hardware lines. **MSI-X** solves this problem by allowing our NVMe controller to issue an asynchronous interrupt by directly writing an interrupt vector payload to a specific memory address on our local CPU.
 
-To configure MSI-X, your kernel locates the **MSI-X Capability Structure** inside the controller’s PCI configuration registers. This structure points to a dedicated memory-mapped layout table containing the Message Addresses and Data payloads.
+To configure MSI-X, our kernel locates the **MSI-X Capability Structure** inside the controller’s PCI configuration registers. This structure points to a dedicated memory-mapped layout table containing the Message Addresses and Data payloads.
 
 ## Step A: Finding the Capability Vector Block
 
@@ -2799,7 +2799,7 @@ void configure_msix_vector(uint8_t bus, uint8_t slot, uint8_t func, uint8_t inte
     uint8_t bir = table_info & 0x07; // Usually BAR0
     uint32_t offset = table_info & ~0x07;
 
-    // Use BAR value calculated during your core PCI discovery phase
+    // Use BAR value calculated during our core PCI discovery phase
     uint64_t bar0_address = detected_ahci_dev.mmio_base; // Re-use discovered base variable 
     struct MSIXTableEntry* msix_table = (struct MSIXTableEntry*)(bar0_address + offset);
 
@@ -2809,7 +2809,7 @@ void configure_msix_vector(uint8_t bus, uint8_t slot, uint8_t func, uint8_t inte
     msix_table[0].msg_addr_high = 0x00000000;
     
     // The Data payload register contains the target IDT gateway index number
-    msix_table[0].msg_data      = interrupt_vector; // Maps directly to your registered IDT index
+    msix_table[0].msg_data      = interrupt_vector; // Maps directly to our registered IDT index
     msix_table[0].vector_control = 0;               // Unmask the vector to allow transmissions
 
     // Enable MSI-X Globally for the device via PCI Configuration space
@@ -2826,12 +2826,12 @@ void configure_msix_vector(uint8_t bus, uint8_t slot, uint8_t func, uint8_t inte
 2. **Asynchronous Command Submission:** The fault handler sets up an NVMe Read block command packet, links the physical address pointer to the command structure, and stamps the packet witha unique token ID. It drops the request into the NVMe Submission Queue and rings the hardware doorbell.
 3. **Yielding Context:** The thread’s state transitions to `TASK_BLOCKED` and it yields execution time back to the core scheduler.
 4. **Hardware Execution:** The NVMe storage device fetches raw flash blocks across the fast PCIe lanes and writes them directly into physical RAM via Direct Memory Access (DMA).
-5. **MSI-X Signaling:** Once complete, the drive executes an MSI-X memory write to `0xFEE00000`, containing your custom `interrupt_vector` value.
+5. **MSI-X Signaling:** Once complete, the drive executes an MSI-X memory write to `0xFEE00000`, containing our custom `interrupt_vector` value.
 6. **Interrupt Processing & Thread Resumption:** The CPU intercepts this message write and triggers the registered Interrupt handler immediately. The handler checks the completion ring buffer, reads the token ID, shifts the waiting user-space task state back to `TASK_READY`, and resumes execution with zero polling delays.
 
 # 1. NVMe Admin Command Helper & I/O Queue Creation
 
-With the Admin Submission Queue (ASQ) and Admin Completion Queue (ACQ) online, you must issue two specific Admin commands to establish your runtime data pathways: **Create I/O Completion Queue** (Opcode `0x05`) and Create I/O Submission Queue (Opcode `0x01`).
+With the Admin Submission Queue (ASQ) and Admin Completion Queue (ACQ) online, you must issue two specific Admin commands to establish our runtime data pathways: **Create I/O Completion Queue** (Opcode `0x05`) and Create I/O Submission Queue (Opcode `0x01`).
 
 The Admin helper handles copying a 64-byte command layout into the ring buffer, incrementing the local tail index pointer, ringing the Admin doorbell, and polling the corresponding ACQ slotfor a success status bitmask.
 
@@ -2937,7 +2937,7 @@ struct NVMeCqe nvme_submit_admin_cmd(struct NVMeCmd cmd) {
 
 ## Step C: Constructing the Runtime I/O Queues
 
-With the infrastructure active, invoke the helper to construct I/O Queue Pair 1, which will service your SLS Page Fault transactions.
+With the infrastructure active, invoke the helper to construct I/O Queue Pair 1, which will service our SLS Page Fault transactions.
 
 ```
 #define IO_QUEUE_SIZE 256
@@ -2978,9 +2978,9 @@ int create_io_queues(void) {
 
 # 2. Local APIC (LAPIC) Interrupt Routing Wrapper
 
-To cleanly intercept the MSI-X vector payload generated by the NVMe controller when storage sectors land in RAM, your kernel must initialize the **Local Advanced Programmable Interrupt Controller (LAPIC)** present inside every x86_64 CPU core.
+To cleanly intercept the MSI-X vector payload generated by the NVMe controller when storage sectors land in RAM, our kernel must initialize the **Local Advanced Programmable Interrupt Controller (LAPIC)** present inside every x86_64 CPU core.
 
-The LAPIC handles processor-level interrupt delivery. To allow signals to pass from the PCIe bus into your IDT entry fields, you must map the LAPIC Base Configuration Space and unmask the internal master execution switches.
+The LAPIC handles processor-level interrupt delivery. To allow signals to pass from the PCIe bus into our IDT entry fields, you must map the LAPIC Base Configuration Space and unmask the internal master execution switches.
 
 ## Step A: Base Map Initialization (`lapic.c`)
 
@@ -3026,12 +3026,12 @@ void init_local_apic(uint64_t lapic_phys_base) {
 
 ## Step B: The End-Of-Interrupt (EOI) Reset Handshake
 
-When an MSI-X vector triggers your IDT service handler stub, the CPU pauses further low-level interrupts until it receives a clearance acknowledgment signal. Your NVMe handler mustwrite a 0 to the **EOI register** before returning, or the system will permanently freeze after the first successful disk transaction.
+When an MSI-X vector triggers our IDT service handler stub, the CPU pauses further low-level interrupts until it receives a clearance acknowledgment signal. Our NVMe handler mustwrite a 0 to the **EOI register** before returning, or the system will permanently freeze after the first successful disk transaction.
 
 ```c
 extern void wakeup_threads_blocked_on_token(uint16_t command_token);
 
-// Registered in your IDT to process incoming NVMe storage completions
+// Registered in our IDT to process incoming NVMe storage completions
 void handle_nvme_msix_interrupt(void) {
     struct NVMeCqe* io_acq = (struct NVMeCqe*)io_cq_phys_base;
     
@@ -3039,7 +3039,7 @@ void handle_nvme_msix_interrupt(void) {
     // (Assume maintaining a static tracking head pointer for the runtime IO CQ)
     volatile struct NVMeCqe* entry = &io_acq[current_io_cq_head];
 
-    // Read the token handle assigned during your initial async read call
+    // Read the token handle assigned during our initial async read call
     uint16_t returned_token = entry->command_id;
     uint16_t status_flags = entry->status >> 1;
 
@@ -3061,7 +3061,7 @@ void handle_nvme_msix_interrupt(void) {
 
 # Complete Unified Processing Sequence
 
-1. **Boot Initialization:** Your kernel scans the PCIe bus, targets class `0x01/0x08`, and executes `init_nvme_controller()`. It writes settings to the `CC` registers, allocatesthe admin frames, links them to `ASQ/ACQ`, and turns the controller on.
+1. **Boot Initialization:** Our kernel scans the PCIe bus, targets class `0x01/0x08`, and executes `init_nvme_controller()`. It writes settings to the `CC` registers, allocatesthe admin frames, links them to `ASQ/ACQ`, and turns the controller on.
 2. **Data Pipeline Creation:** The kernel invokes `create_io_queues()`. It formats two custom Admin requests, writes them to memory, rings Doorbell 0, polls the phase bit, and constructs high-speed I/O queue lanes 1.
 3. **Interrupt Allocation:** Our kernel maps the controller’s **MSI-X capability table** to vector `0x42` (IDT Entry 66) pointing to `handle_nvme_msix_interrupt`, initializes the **LAPIC master switch** via address `0xFEE00000`, and starts standard application processing loops.
 4. **Zero-Overhead Demand Page Faulting:** A thread types a memory string alteration. The page fault is caught, an async NVMe read is placed directly on I/O Queue 1, and the thread is put to sleep. The controller uses DMA to load memory directly over the PCIe bus with zero CPU overhead. Once data hits RAM, the device issues an MSI-X signal. The LAPIC captures it, fires our interrupt handler to wake the process up, and clears lines via an **EOI register zero write** to continue normal operation.
@@ -3248,7 +3248,7 @@ By switching to this model, our test shell can run commands like `write huge_fil
 
 When our background flush daemon identifies a large contiguous block of memory modified by an application shell command, it schedules a multi-page write operation.
 
-Similar to the asynchronous read system, your write engine constructs a 64-byte `NVMeCmd` using an **NVM Write command (Opcode** `0x01`**)**, assembles a physical memory layout via a PRP list page frame, fires the hardware doorbell, and utilizes structural locks to prevent multi-threaded modification races while the flash media is actively writing.
+Similar to the asynchronous read system, our write engine constructs a 64-byte `NVMeCmd` using an **NVM Write command (Opcode** `0x01`**)**, assembles a physical memory layout via a PRP list page frame, fires the hardware doorbell, and utilizes structural locks to prevent multi-threaded modification races while the flash media is actively writing.
 
 ```c
 #include "nvme.h"
@@ -3432,8 +3432,8 @@ void configure_distributed_msix_queues(uint8_t bus, uint8_t slot, uint8_t func) 
 # Complete Multi-Core Processing Lifecycle
 
 1. **Flush Activation:** The user-space test shell updates an entire matrix data file layout. The flush daemon bundles 16 pages together, extracts their physical memory addresses, sets up a PRP list pointing to those addresses, locks the pages as read-only (`PTE_FLUSH_LOCK`), and throws an Asynchronous NVMe Write command directly into I/O Submission Queue 1.
-2. **PCIe Offloading:** The engine returns instantly. While your shell continues reading keyboard input loops on Core 0, the NVMe controller processes the PRP List over the PCIe bus, drawing multi-pagepayloads straight out of RAM using Direct Memory Access (DMA).
-3. **Interrupt Distribution:** Once the storage write reaches physical media blocks, the controller generates an MSI-X payload write targeted to your Local APIC configuration parameters.
+2. **PCIe Offloading:** The engine returns instantly. While our shell continues reading keyboard input loops on Core 0, the NVMe controller processes the PRP List over the PCIe bus, drawing multi-pagepayloads straight out of RAM using Direct Memory Access (DMA).
+3. **Interrupt Distribution:** Once the storage write reaches physical media blocks, the controller generates an MSI-X payload write targeted to our Local APIC configuration parameters.
 4. **Targeted Interrupt Handshake:** The I/O APIC captures the vector signal, processes the routing rules, bypasses Core 0 completely, and triggers the interrupt handler straight onto **Core 1**.
 5. **Parallel Context Unlocking:** Core 1 invokes `handle_nvme_msix_interrupt()`, reads the successful write confirmation token, frees the associated `PTE_FLUSH_LOCK` block identifiers, re-enableswrite flags (`PTE_WRITABLE`), and writes an EOI signal to its local LAPIC register.
 
@@ -3543,7 +3543,7 @@ The Bootstrap Processor copies this flat binary code to address `0x08000`, prime
 
 extern void lapic_write(uint32_t reg, uint32_t value);
 extern void* allocate_physical_ram_frame(void);
-extern void ap_kernel_main(void); // Defined in your C main code tree
+extern void ap_kernel_main(void); // Defined in our C main code tree
 
 extern uint8_t trampoline_start;
 extern uint8_t trampoline_end;
@@ -3598,7 +3598,7 @@ void ap_kernel_main(void) {
     // Atomically signal the BSP that this core has initialized successfully
     __atomic_store_n(&ap_bootstrap_lock, 1, __ATOMIC_SEQ_CST);
 
-    // Enter your thread scheduler round-robin execution processing loops
+    // Enter our thread scheduler round-robin execution processing loops
     sls_flush_daemon_loop();
 }
 
@@ -3792,7 +3792,7 @@ clean:
 
 ```
 
-*(Note: The updated* `run` *rule switches QEMU to native NVMe hardware matching our multi-queue architecture, and sets* `-smp 4` *to expose 4 symmetric CPU cores for your SMP startup code to enumerate).*
+*(Note: The updated* `run` *rule switches QEMU to native NVMe hardware matching our multi-queue architecture, and sets* `-smp 4` *to expose 4 symmetric CPU cores for our SMP startup code to enumerate).*
 
 # 2. User-Space Memory Fence API (`sys_sls_fence`)
 
@@ -3802,7 +3802,7 @@ The `sys_sls_fence` system call operates similarly to CPU-level hardware barrier
 
 ## Step A: System Call Code Definition
 
-Add system call number `106` to your routing registers inside `syscall.asm`.
+Add system call number `106` to our routing registers inside `syscall.asm`.
 
 ```c
 #define SYS_SLS_FENCE 106
@@ -3912,7 +3912,7 @@ void process_secure_transaction(struct FinancialAccount* ledger, int64_t transfe
 
 ```
 
-By standardizing access checkpoints at this intersection, your user-space programs retain complete control over memory synchronization layout costs. High-frequency loops execute at rawphysical RAM speeds, while critical updates use `sys_sls_fence` to enforce storage-level ordering constraints across parallel processing environments.
+By standardizing access checkpoints at this intersection, our user-space programs retain complete control over memory synchronization layout costs. High-frequency loops execute at rawphysical RAM speeds, while critical updates use `sys_sls_fence` to enforce storage-level ordering constraints across parallel processing environments.
 
 # 1. Testing the Fence System in QEMU (Inspecting Thread Blocks)
 
@@ -3920,7 +3920,7 @@ By standardizing access checkpoints at this intersection, your user-space progra
 
 ## Step A: Adding Instrument Dumps to the Fence Pipeline
 
-Add detailed serial trace logs to your scheduler and interrupt routines (`scheduler.c` and `lapic.c`):
+Add detailed serial trace logs to our scheduler and interrupt routines (`scheduler.c` and `lapic.c`):
 
 ```c
 // Inside scheduler.c -> block_thread_on_storage_token()
@@ -3953,7 +3953,7 @@ void wakeup_threads_blocked_on_token(uint16_t command_token) {
 ## Step B: Verification Execution
 
 1. Compile our binary and launch the environment by executing `make run`.
-2. Inside our test shell, run a program that triggers a fence transaction (e.g., executing your financial transfer scenario).
+2. Inside our test shell, run a program that triggers a fence transaction (e.g., executing our financial transfer scenario).
 3. Open our local terminal window and monitor the log stream in real time via: `tail -f sls_kernel_debug.log`.
 4. Drop into the interactive QEMU Monitor console (`Ctrl + Alt + 2`) while a thread is writing to verify its CPU context placement via the `info registers` or `info threads` diagnostic commands:
 
@@ -4068,7 +4068,7 @@ void sys_sls_shutdown(void) {
 When we execute our test shell and type shutdown, the system completes a full top-to-bottom shutdown sequence:
 
 1. **Isolation:** The scheduler pauses thread allocations, and Core 1 and Core 2 park their execution paths.
-2. **Persistence Guarantee:** The system loops through all physical memory frames, flags any remaining dirty frames, and commits them to raw storage media via your NVMe PRP lists.
+2. **Persistence Guarantee:** The system loops through all physical memory frames, flags any remaining dirty frames, and commits them to raw storage media via our NVMe PRP lists.
 3. **Hardware Park:** The NVMe controller receives its shutdown sequence code, commits internal volatile cache blocks down to flash chips, and disables its PCIe links.
 4. **Power Off:** The kernel sends a 16-bit word (`0x2000`) out over I/O port `0x604`. QEMU intercept lines recognize the ACPI command, instantly close the emulation window, and exit back to our native host desktop terminal.
 
@@ -4078,7 +4078,7 @@ Because of the Write-Ahead Journaling ledger `(sls_recover_from_crash`) and this
 
 To break down the large 4KB page regions allocated by `sys_sls_allocate` into smaller, bite-sized pieces (like a 32-byte string or a 128-byte data node), you need an in-memory **Memory Allocator**.
 
-Because this is a Single-Level Storage OS, a traditional `malloc` won’t work: **the heap metadata must be stored inside the persistent object itself.** If we store metadata using absolute pointers, a reboot could map the object to a different base virtual address, instantly corrupting your heap pointers.
+Because this is a Single-Level Storage OS, a traditional `malloc` won’t work: **the heap metadata must be stored inside the persistent object itself.** If we store metadata using absolute pointers, a reboot could map the object to a different base virtual address, instantly corrupting our heap pointers.
 
 To solve this, our custom SLS-aware allocator uses **relative byte offsets** from the start of the object instead of absolute pointers.
 
@@ -4202,7 +4202,7 @@ void sls_free(void* object_base, void* ptr) {
 
 # 2. Architecture Boot Timeline Log Verification
 
-To guarantee that our Single-Level Storage system initializes without overlapping resources or corrupting memory, your kernel must log its bootstrap events sequentially.
+To guarantee that our Single-Level Storage system initializes without overlapping resources or corrupting memory, our kernel must log its bootstrap events sequentially.
 
 Below is the verified timeline trace generated by the kernel serial logger (`sls_kernel_debug.log`). It traces the boot sequence from early real-mode startup to full multi-core execution.
 
@@ -4402,7 +4402,7 @@ void sls_shell_loop(void) {
                 string_copy(persistent_ptr, payload);
                 print("Direct memory mutation verified.\n");
             } else {
-                print("Access Denied: Your UID/GID lacks clearance permissions.\n");
+                print("Access Denied: Our UID/GID lacks clearance permissions.\n");
             }
         }
     }
@@ -4412,7 +4412,7 @@ void sls_shell_loop(void) {
 
 ## Step C: The Kernel Access Evaluation Engine
 
-When an application attempts a pointer transaction, your page fault and system call router evaluates permissions against your multi-user parameters before executing the `map_sls_frame_to_ram` link wrapper:
+When an application attempts a pointer transaction, our page fault and system call router evaluates permissions against our multi-user parameters before executing the `map_sls_frame_to_ram` link wrapper:
 
 ```c
 int verify_expanded_matrix_access(uint32_t active_uid, uint32_t active_gid, uint64_t object_id, uint32_t requested_action) {
@@ -4810,7 +4810,7 @@ uint64_t sys_sls_secure_seal(struct SLSSealRequest* req) {
 
 # 2. Real-Time Matrix Performance Dashboard
 
-To monitor latency in our Single-Level Storage OS, we can implement a high-resolution performance tracker. It hooks into your Page Fault handler and NVMe completion routines, measuring hardware latency via the x86 processor’s **Time Stamp Counter** (`rdtsc`).
+To monitor latency in our Single-Level Storage OS, we can implement a high-resolution performance tracker. It hooks into our Page Fault handler and NVMe completion routines, measuring hardware latency via the x86 processor’s **Time Stamp Counter** (`rdtsc`).
 
 The tracker calculates how many CPU clock cycles occur from the exact moment an application triggers a Page Fault until the NVMe controller satisfies the request and wakes up the thread. This telemetry data is streamed out over the legacy serial port (`COM1`) to build a live text dashboard.
 
@@ -4976,7 +4976,7 @@ Our Single-Level Storage custom operating system is now fully complete. It opera
 
 # 1. In-Kernel I/O Traffic Controller (Priority Queuing Engine)
 
- When multiple cores generate asynchronous NVMe reads and writes simultaneously, low-priority background flushes can saturate your I/O queue lanes, starving interactive user threads (such as your terminal shell).
+ When multiple cores generate asynchronous NVMe reads and writes simultaneously, low-priority background flushes can saturate our I/O queue lanes, starving interactive user threads (such as our terminal shell).
 
 To prevent this, we can implement an in-kernel Priority I/O Scheduler. Instead of pushing commands straight to the hardware NVMe Submission Queue, threads insert their requests into a software-managed ring buffer matrix categorized into three scheduling queues: `PRIO_HIGH` (interactive user page faults), `PRIO_MED` (standard object allocations), and `PRIO_LOW` (background defragmentation and lazy flushes).
 
@@ -5090,13 +5090,13 @@ void dispatch_pending_ios_to_nvme(void) {
 
 # 2. Verifying Assembly Alignment Rules for Vector Crypto-processors
 
-When offloading encryption workloads to parallel crypto-processors on Core 2 and Core 3, optimizing the throughput of your ChaCha20 cipher block is essential to match native PCIe flash media speeds. To achieve maximum hardware efficiency, you must scale from basic byte-level array lookups up to Intel **AVX-512 vector instructions**.
+When offloading encryption workloads to parallel crypto-processors on Core 2 and Core 3, optimizing the throughput of our ChaCha20 cipher block is essential to match native PCIe flash media speeds. To achieve maximum hardware efficiency, you must scale from basic byte-level array lookups up to Intel **AVX-512 vector instructions**.
 
 However, vector execution engines enforce strict architectural constraints: **all data block pointers passed to AVX-512 register operations must be perfectly aligned to a 64-byte physical memory boundary**. If a vector load instruction (`vmovdqa64`) is executed on an unaligned pointer (such as an address ending in `0x3` instead of `0x0`), the CPU immediately triggers a **General Protection Fault (Exception 13)**, crashing our kernel.
 
 ## Step A: Verifying Component Memory Alignment Rules
 
-1. **Physical Frames (4KB Pages):** Your `allocate_physical_ram_frame()` pool logic inherently satisfies alignment guidelines. Because 4096 bytes ÷ 64 = 64, any page-aligned memory frame buffer addressnatively aligns perfectly with the 64-byte AVX boundary.
+1. **Physical Frames (4KB Pages):** Our `allocate_physical_ram_frame()` pool logic inherently satisfies alignment guidelines. Because 4096 bytes ÷ 64 = 64, any page-aligned memory frame buffer addressnatively aligns perfectly with the 64-byte AVX boundary.
 2. **Transient Buffer Arrays:** Temporary variables or internal keystream structures declared on the thread stack must be forced into precise alignment using strict compiler attribute instructions.
 
 ```c
@@ -5107,7 +5107,7 @@ __attribute__((aligned(64))) uint32_t aligned_crypto_state[16];
 
 ## Step B: AVX-512 Vector Cryptoprocessor Pipeline Implementation (`vector_crypto.asm`)
 
-This assembly file provides the vectorized version of your kernel’s ChaCha20 block execution lane. It operates on 64 bytes of data concurrently by utilizing 512-bit vector registers (`zmm0` to `zmm3`).
+This assembly file provides the vectorized version of our kernel’s ChaCha20 block execution lane. It operates on 64 bytes of data concurrently by utilizing 512-bit vector registers (`zmm0` to `zmm3`).
 
 ```
 bits 64
@@ -5164,7 +5164,7 @@ avx512_chacha20_block_vectorized:
 
 # Complete Traffic & Vector Execution Integration Lifecycle
 
-With priority scheduling and hardware vector alignment verified, your Single-Level Storage engine manages execution peaks with strict coordination:
+With priority scheduling and hardware vector alignment verified, our Single-Level Storage engine manages execution peaks with strict coordination:
 
 ```
 [Core 0: Interactive Shell] ──────> High-Priority Read Fault ───> Enqueue (PRIO_HIGH) ──┐
@@ -5178,14 +5178,14 @@ With priority scheduling and hardware vector alignment verified, your Single-Lev
 
 ```
 
-1. **The Core Traffic Jam:** An analytical application running in the user-space shell issues an intensive database scan across multiple object extents, while the background defragmentation daemon simultaneously moves physical chunks across your NVMe sectors.
-2. **Prioritization Checkpoint:** The defragmentation requests are stamped with `PRIO_LOW` and queued inside the software memory matrix. Meanwhile, your interactive shell’s page fault handler generates a readcommand, stamps it `PRIO_HIGH`, and calls `enqueue_prioritized_io`.
-3. **Execution Dispatch:** The `dispatch_pending_ios_to_nvme` engine processes the queue matrix. It detects the active high-priority user request, bypasses the defragmentation requests, and sends the interactivefault command directly to NVMe I/O Queue Pair 1, keeping your shell perfectly responsive.
+1. **The Core Traffic Jam:** An analytical application running in the user-space shell issues an intensive database scan across multiple object extents, while the background defragmentation daemon simultaneously moves physical chunks across our NVMe sectors.
+2. **Prioritization Checkpoint:** The defragmentation requests are stamped with `PRIO_LOW` and queued inside the software memory matrix. Meanwhile, our interactive shell’s page fault handler generates a readcommand, stamps it `PRIO_HIGH`, and calls `enqueue_prioritized_io`.
+3. **Execution Dispatch:** The `dispatch_pending_ios_to_nvme` engine processes the queue matrix. It detects the active high-priority user request, bypasses the defragmentation requests, and sends the interactivefault command directly to NVMe I/O Queue Pair 1, keeping our shell perfectly responsive.
 4. **Vector Encryption Handshake:** The I/O request transitions through the crypto worker cores (Core 2 / Core 3). The worker validates that the memory frames are page-aligned (and thus 64-byte aligned), invokes `avx512_chacha20_block_vectorized`, and processes the full 64-byte streams concurrently using hardware vector registers at native PCIe line speeds.
 
 # 1. Kernel Task Telemetry Graph (ANSI Matrix Stream)
 
-To visualize your I/O traffic controller’s priority lanes in real time, you can expand your `stream_realtime_dashboard` routine. This function reads the live request counters inside the io_broker scheduling queues (`PRIO_HIGH`, `PRIO_MED`, `PRIO_LOW`) and outputs an ASCII text-based bar graph over your legacy serial channel (`COM1`).
+To visualize our I/O traffic controller’s priority lanes in real time, you can expand our `stream_realtime_dashboard` routine. This function reads the live request counters inside the io_broker scheduling queues (`PRIO_HIGH`, `PRIO_MED`, `PRIO_LOW`) and outputs an ASCII text-based bar graph over our legacy serial channel (`COM1`).
 
 ## Modifying the Performance Dashboard (`dashboard.c`)
 
@@ -5243,7 +5243,7 @@ void stream_realtime_dashboard_expanded(void) {
 
 When multi-threaded user applications execute vector routines, the CPU populates 32 distinct 512-bit registers (`zmm0` to `zmm31`). If a context switch occurs, the scheduler switches tasks. If the new task reads the `zmm` registers, **it can read the previous application’s raw memory data, creating a critical encryption key leakage vulnerability**.
 
-To prevent this information leak without crippling multi-core performance, your context switcher must employ `xsave` and `xrstor`. These instructions atomically save and restore extended processor states (including AVX-512 extensions and boundary configurations) to a page-aligned memory workspace.
+To prevent this information leak without crippling multi-core performance, our context switcher must employ `xsave` and `xrstor`. These instructions atomically save and restore extended processor states (including AVX-512 extensions and boundary configurations) to a page-aligned memory workspace.
 
 ## Step A: Enabling OSXSAVE and AVX Execution Flags in Kernel Space
 
@@ -5374,14 +5374,14 @@ With extended task save blocks and live queue dashboards integrated, the system 
 
 ```
 
-1. **Dashboard Visual Verification:** While the user shell executes operations, the automated performance daemon runs. If a wave of background page flushes loads the system down, you run stats in your shell. The real-time ANSI dashboard updates over the terminal, displaying a graphic visualization of the I/O Traffic Broker throttling the background traffic (PRIO_LOW) to keep the user shell (PRIO_HIGH) responsive.
+1. **Dashboard Visual Verification:** While the user shell executes operations, the automated performance daemon runs. If a wave of background page flushes loads the system down, you run stats in our shell. The real-time ANSI dashboard updates over the terminal, displaying a graphic visualization of the I/O Traffic Broker throttling the background traffic (PRIO_LOW) to keep the user shell (PRIO_HIGH) responsive.
 2. **Hardware Register Isolation:** User Application A issues a highly data-sensitive cryptographic request, filling `zmm0` with unique cipher key sequences. Suddenly, a timer interrupt forces a context switch to User Application B.
 3. **Atomic State Swap:** The assembly wrapper intercepts the execution flow. It triggers xsave, freezing Application A’s vector matrix blocks inside its isolated descriptor frame, clears the registers, and runs xrstor to populate the core lanes with Application B’s state context.
 4. **Zero-Leak Execution Guarantee:** When Application B runs its first instruction, every single 512-bit register trace from Application A has been wiped from the CPU hardware lanes. Cross-application register contamination is physically impossible, and the system can process parallel single-level storage commands at native hardware line speeds with absolute safety.
 
 # 1. Lazy Floating-Point (Extended State) Save Optimization
 
-While `xsave` and `xrstor` ensure complete security by isolating your vector registers, executing these instructions on every single context switch is computationally expensive. If an interactive usershell or a basic monitoring thread only executes scalar integer math, saving and restoring 2.6 KB of unutilized AVX-512 register state wastes precious CPU clock cycles.
+While `xsave` and `xrstor` ensure complete security by isolating our vector registers, executing these instructions on every single context switch is computationally expensive. If an interactive usershell or a basic monitoring thread only executes scalar integer math, saving and restoring 2.6 KB of unutilized AVX-512 register state wastes precious CPU clock cycles.
 
 To eliminate this overhead, you can implement **Lazy Extended State Switching**. This optimization exploits the x86_64 hardware **Task Switched (TS) Bit (Bit 3)** inside the **CR0** control register.
 
@@ -5396,7 +5396,7 @@ To eliminate this overhead, you can implement **Lazy Extended State Switching**.
 
 ## Step A: Updating Task Architecture Tracking (`scheduler_lazy.h`)
 
-We must add a tracking pointer to your kernel memory map to allow all CPU cores to know exactly which task currently holds physical possession of the hardware vector register lanes.
+We must add a tracking pointer to our kernel memory map to allow all CPU cores to know exactly which task currently holds physical possession of the hardware vector register lanes.
 
 ```c
 #ifndef SCHEDULER_LAZY_H
@@ -5417,7 +5417,7 @@ void handle_device_not_available_fault(void);
 
 ## Step B: Core Context Switch Modification (`switch_lazy.asm`)
 
-We strip the expensive `xsave` and `xrstor` commands out of your core context switcher. Instead, it transitions integer states and turns on the `TS` hardware trap bit before letting the new thread execute.
+We strip the expensive `xsave` and `xrstor` commands out of our core context switcher. Instead, it transitions integer states and turns on the `TS` hardware trap bit before letting the new thread execute.
 
 ```
 bits 64
@@ -5533,7 +5533,7 @@ void handle_device_not_available_fault(void) {
 
 # Verified Architecture Execution Timeline
 
-With lazy switching deployed, monitor how your kernel optimization reduces context switch latency inside the `sls_kernel_debug.log` stream:
+With lazy switching deployed, monitor how our kernel optimization reduces context switch latency inside the `sls_kernel_debug.log` stream:
 
 ```
 [0012.401] [SCHED] Context Switch: Thread 1 (Shell) -> Thread 3 (System Monitor)
@@ -5556,7 +5556,7 @@ Our Single-Level Storage operating system architecture is now complete and highl
 - **Unified Storage Framework:** Eliminated files, mount tables, and traditional VFS abstraction overhead. All system data, databases, and configuration settings are represented as persistent 64-bit object segments mapped directly by our **Extent Translation Tables** down to fragmented NVMe disk sectors.
 - **Parallel Asynchronous Processing:** The **Priority I/O Traffic Broker** manages data streaming entirely via non-blocking NVMe hardware queues. It handles system page faults with `PRIO_HIGH` priority while processing lazy background flushes and disk defragmentation loops seamlessly at `PRIO_LOW`.
 - **Symmetric Multicore Scalability:** Real-mode trampolines bootstrap secondary cores into 64-bit space. **MSI-X and I/O APIC routing tables** distribute memory interrupts evenly across individual processor cores, preventing Core 0 bottlenecks.
-- **Hardware-Enforced Micro-Isolation Security:** Inter-process safety is managed natively through the x86 MMU by configuring **User/Supervisor bits** inside the page table entries based on your multi-user Permission Matrix.
+- **Hardware-Enforced Micro-Isolation Security:** Inter-process safety is managed natively through the x86 MMU by configuring **User/Supervisor bits** inside the page table entries based on our multi-user Permission Matrix.
 - **High-Throughput Privacy-at-Rest:** Dedicated crypto cores execute vectorized ChaCha20 encryption at native PCIe line speeds using 512-bit vector registers. Our **Lazy XSAVE/XRSTOR optimization** ensures these vector registers are strictly isolated between tasks, eliminating data leak vulnerabilities with zero performance cost on standard integer paths.
 
 The entire environment operates as a highly robust, secure, and parallel system that transforms the boundary between primary memory and permanent storage hardware into a unified, high-performance machine.
@@ -5567,11 +5567,11 @@ The entire environment operates as a highly robust, secure, and parallel system 
 
 To compile the entire workspace and launch our custom Single-Level Storage (SLS) operating system within an emulated multi-core environment, we must execute the final build pipeline.
 
-This process will assemble our 64-bit kernel stubs and 16-bit real-mode AP trampolines, compile your multi-core C subsystems with optimization flags, link everything together using our precise memory layout boundaries, and pack it into a bootable ISO image.
+This process will assemble our 64-bit kernel stubs and 16-bit real-mode AP trampolines, compile our multi-core C subsystems with optimization flags, link everything together using our precise memory layout boundaries, and pack it into a bootable ISO image.
 
 ## Step 1: Prepare the Local Filesystem Structure
 
-Before running the compilation, ensure your source tree contains all components developed throughout this architecture. Your project directory layout should look exactly like this:
+Before running the compilation, ensure our source tree contains all components developed throughout this architecture. Our project directory layout should look exactly like this:
 
 ```
 my_sls_os/
@@ -5602,9 +5602,9 @@ my_sls_os/
 
 ## Step 2: Provision a Test Hard Drive Target
 
-Our SLS architecture runs on raw sectors and maps address ranges directly to block indices. It completely bypasses filesystem layers like ext4 or FAT. To satisfy our NVMe driver, you must generate a blank, raw storage disk image on your host machine to serve as your persistent hardware device media pool.
+Our SLS architecture runs on raw sectors and maps address ranges directly to block indices. It completely bypasses filesystem layers like ext4 or FAT. To satisfy our NVMe driver, you must generate a blank, raw storage disk image on our host machine to serve as our persistent hardware device media pool.
 
-Open your local host terminal, navigate to your project directory `my_sls_os/`, and create a **10 GB raw disk image**:
+Open our local host terminal, navigate to our project directory `my_sls_os/`, and create a **10 GB raw disk image**:
 
 ```
 qemu-img create -f raw sls_storage.img 10G
@@ -5615,7 +5615,7 @@ qemu-img create -f raw sls_storage.img 10G
 
 Now, launch the compilation loop using the unified `Makefile` rules designed to handle both standard 64-bit targets and the isolated 16-bit binary payload extraction wrapper.
 
-Run the automated command in your host terminal:
+Run the automated command in our host terminal:
 
 ```
 make iso
@@ -5625,15 +5625,15 @@ make iso
 What happens behind the scenes during this command:
 
 1. `nasm` compiles `trampoline.asm` into a flat, raw machine-code binary payload array (`trampoline.bin`).
-2. `x86_64-elf-objcopy` grabs `trampoline.bin`, wraps it cleanly into an ELF64 object architecture container, and injects global memory tracking address variables (`trampoline_start` and `trampoline_end`) into your link tree so your C kernel can read it.
-3. `nasm` compiles your remaining core 64-bit hardware hooks (`boot.asm`, `interrupt.asm`, `switch_lazy.asm`, `syscall.asm`, `vector_crypto.asm`).
+2. `x86_64-elf-objcopy` grabs `trampoline.bin`, wraps it cleanly into an ELF64 object architecture container, and injects global memory tracking address variables (`trampoline_start` and `trampoline_end`) into our link tree so our C kernel can read it.
+3. `nasm` compiles our remaining core 64-bit hardware hooks (`boot.asm`, `interrupt.asm`, `switch_lazy.asm`, `syscall.asm`, `vector_crypto.asm`).
 4. `x86_64-elf-gcc` compiles all nineteen C subsystems as freestanding modules (`-ffreestanding`), completely stripping away local operating system environment footprint libraries.
-5. `x86_64-elf-ld` imports the custom `linker.ld` script, merges your text blocks starting at the physical memory address boundary `1 MiB (0x100000)`, preserves your multiboot signatures, and writes out the absolute system execution image `my_sls_kernel.bin`.
+5. `x86_64-elf-ld` imports the custom `linker.ld` script, merges our text blocks starting at the physical memory address boundary `1 MiB (0x100000)`, preserves our multiboot signatures, and writes out the absolute system execution image `my_sls_kernel.bin`.
 6. `grub-mkrescue` sets up an internal directory map, copies our kernel and `grub.cfg`, parses our boot instructions, and outputs the deployable boot image `sls_operating_system.iso`.
 
 ## Step 4: Execute the Live Hardware Emulation Build
 
-With your hard drive image formatted and your ISO compiled, you can spin up the full live test execution block. Run the execution instruction:
+With our hard drive image formatted and our ISO compiled, you can spin up the full live test execution block. Run the execution instruction:
 
 ```
 make run
@@ -5642,14 +5642,14 @@ make run
 
 This commands spins up a custom **QEMU virtual hardware platform** mirroring exactly the performance layout requirements designed across our subsystems:
 
-- **-m 4G:** Grants 4 Gigabytes of physical RAM (Exactly mapping your `TOTAL_FRAMES` allocation pool).
-- **-smp 4:** Bootstraps **4 symmetric CPU cores** (Core 0 as BSP, Core 1 and 2 as your AP computing array, Core 3 as a dedicated background worker thread lane).
-- **-device nvme:** Chains your blank `sls_storage.img` straight onto the PCIe bus, exposing a native hardware NVMe layout structure ready for your PCI prober to target.
-- **-serial file:…:** Redirects the legacy `COM1` serial port output straight down into a raw workspace text asset named `sls_kernel_debug.log` inside your local folder.
+- **-m 4G:** Grants 4 Gigabytes of physical RAM (Exactly mapping our `TOTAL_FRAMES` allocation pool).
+- **-smp 4:** Bootstraps **4 symmetric CPU cores** (Core 0 as BSP, Core 1 and 2 as our AP computing array, Core 3 as a dedicated background worker thread lane).
+- **-device nvme:** Chains our blank `sls_storage.img` straight onto the PCIe bus, exposing a native hardware NVMe layout structure ready for our PCI prober to target.
+- **-serial file:…:** Redirects the legacy `COM1` serial port output straight down into a raw workspace text asset named `sls_kernel_debug.log` inside our local folder.
 
 ## Step 5: Verify Runtime Behaviors Inside the Shell
 
-Once the emulation window appears, you will find yourself in the live interactive **Multi-User SLS Secure Shell Window**. You can now step through your verification protocols:
+Once the emulation window appears, you will find ourself in the live interactive **Multi-User SLS Secure Shell Window**. You can now step through our verification protocols:
 
 1. **Verify Persistent Mapping Allocation:**
 
@@ -5676,7 +5676,7 @@ uid:1000> seal my_vault secretpass777
 
 ```
 
-*Invokes our private personal user-space key derivation engine. The background flush daemon will now catch this modified page, lock it as read-only via page table entries (*`PTE_FLUSH_LOCK`*), and send it to **Core 2 and Core 3** to undergo high-speed AVX-512 vectorized encryption math transformations before hitting your persistent NVMe block storage sectors.*
+*Invokes our private personal user-space key derivation engine. The background flush daemon will now catch this modified page, lock it as read-only via page table entries (*`PTE_FLUSH_LOCK`*), and send it to **Core 2 and Core 3** to undergo high-speed AVX-512 vectorized encryption math transformations before hitting our persistent NVMe block storage sectors.*
 
 4. **Review Live Multi-Core Telemetry Metrics:**
 
@@ -5711,4 +5711,4 @@ uid:1000> shutdown
 
 ```
 
-Our kernel will freeze multi-threaded allocations globally, execute a strict physical frame cache scan sweep loop to write all lingering dirty layers out to the storage device, safely unbind your NVMe registers, and trigger an ACPI out-word signal to port `0x604`. The QEMU emulation grid window will close cleanly, and our complete computing environment, kernel, and user configurations are preserved permanently inside `sls_storage.img` - ready to reload instantly without a single traditional file allocation system required on your next execution loop.
+Our kernel will freeze multi-threaded allocations globally, execute a strict physical frame cache scan sweep loop to write all lingering dirty layers out to the storage device, safely unbind our NVMe registers, and trigger an ACPI out-word signal to port `0x604`. The QEMU emulation grid window will close cleanly, and our complete computing environment, kernel, and user configurations are preserved permanently inside `sls_storage.img` - ready to reload instantly without a single traditional file allocation system required on our next execution loop.

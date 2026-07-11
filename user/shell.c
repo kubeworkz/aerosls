@@ -63,7 +63,7 @@ void sls_shell_loop(void) {
                 string_copy(persistent_ptr, payload);
                 print("Direct memory mutation verified.\n");
             } else {
-                print("Access Denied: Your UID/GID lacks clearance permissions.\n");
+                print("Access Denied: Our UID/GID lacks clearance permissions.\n");
             }
         }
     }

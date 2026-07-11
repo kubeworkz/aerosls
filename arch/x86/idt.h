@@ -6,7 +6,7 @@
 // Explicitly packed structure matching x86_64 IDT Gate descriptor layout
 struct IDTEntry {
     uint16_t isr_low;       // Lower 16 bits of ISR address
-    uint16_t kernel_cs;     // Kernel Code Segment selector (from your GDT, usually 0x08)
+    uint16_t kernel_cs;     // Kernel Code Segment selector (from our GDT, usually 0x08)
     uint8_t  ist;           // Interrupt Stack Table offset (0 for default)
     uint8_t  attributes;    // Type and attributes (e.g., Present, Ring 0, Interrupt Gate)
     uint16_t isr_mid;       // Middle 16 bits of ISR address

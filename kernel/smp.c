@@ -3,7 +3,7 @@
 #include "../arch/x86/lapic.h"
 
 extern void* allocate_physical_ram_frame(void);
-extern void ap_kernel_main(void); // Defined in your C main code tree
+extern void ap_kernel_main(void); // Defined in our C main code tree
 extern void sls_flush_daemon_loop(void);
 extern void kernel_sleep_ticks(uint32_t ticks);
 
@@ -61,6 +61,6 @@ void ap_kernel_main(void) {
     // Atomically signal the BSP that this core has initialized successfully
     __atomic_store_n(&ap_bootstrap_lock, 1, __ATOMIC_SEQ_CST);
 
-    // Enter your thread scheduler round-robin execution processing loops
+    // Enter our thread scheduler round-robin execution processing loops
     sls_flush_daemon_loop();
 }

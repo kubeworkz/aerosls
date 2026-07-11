@@ -463,15 +463,15 @@ Package: cmap 2021/02/06 v1.0j CMap support: searchable PDF
 )
 
 Class acmart Warning: You do not have the libertine package installed. Please u
-pgrade your TeX on input line 854.
+pgrade our TeX on input line 854.
 
 
 Class acmart Warning: You do not have the inconsolata (zi4.sty) package install
-ed. Please upgrade your TeX on input line 857.
+ed. Please upgrade our TeX on input line 857.
 
 
 Class acmart Warning: You do not have the newtxmath package installed. Please u
-pgrade your TeX on input line 860.
+pgrade our TeX on input line 860.
 
 (/usr/share/texlive/texmf-dist/tex/latex/caption/caption.sty
 Package: caption 2023/08/05 v3.6o Customizing captions (AR)

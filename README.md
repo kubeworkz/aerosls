@@ -20,7 +20,7 @@ Building any OS from scratch requires structured phases. For an SLS system, we w
 
 ### **Phase I: Bootstrapping and Environment**
 
-### **Setup a Cross-Compiler**: Configure `gcc` or `clang` targeting your choice architecture (like x86_64 or ARM64) on a host system.
+### **Setup a Cross-Compiler**: Configure `gcc` or `clang` targeting our choice architecture (like x86_64 or ARM64) on a host system.
 
 - **Write the Bootloader**: Code a minimal assembly routine to switch the processor from 16-bit real mode into long 64-bit protected mode.
 - **Target Emulator**: Use tools like ++**[QEMU](https://www.qemu.org/)**++ to test our custom kernel without crashing physical machines.
@@ -29,12 +29,12 @@ Building any OS from scratch requires structured phases. For an SLS system, we w
 
 - **Global Descriptor Table (GDT)**: Establish segment definitions to dictate code and data bounds.
 - **Page Table Mapping**: Set up 4-level or 5-level page tables mapping virtual addresses directly to physical memory.
-- **Custom Page Fault Handler**: This is the heart of an SLS. When a program requests a memory address that isn't mapped to RAM, your handler must trap the `CR2` register fault, identify which storage block corresponds to that virtual address, fetch it from secondary storage, map it, and resume execution.
+- **Custom Page Fault Handler**: This is the heart of an SLS. When a program requests a memory address that isn't mapped to RAM, our handler must trap the `CR2` register fault, identify which storage block corresponds to that virtual address, fetch it from secondary storage, map it, and resume execution.
 
 ### **Phase III: Hardware & Object Layer**
 
 - **Storage Drivers**: Implement a raw AHCI or NVMe storage driver capable of reading and writing fixed-size blocks (typically 4KB) based on an address mapping tree.
-- **Object Directory Tracker**: Implement a thread-safe, resilient tree structure (like a B-Tree or an inverted page table) that permanently records which virtual address blocks map to physical sectors on your persistent disk.
+- **Object Directory Tracker**: Implement a thread-safe, resilient tree structure (like a B-Tree or an inverted page table) that permanently records which virtual address blocks map to physical sectors on our persistent disk.
 - **Language Safety Integration**: Because classical hardware memory management can degrade performance, consider a modern approach like ++**[Microsoft's Midori research](https://wiki.c2.com/?SingleAddressSpaceOperatingSystem)**++, utilizing a type-safe language (such as Rust or specialized C#) to enforce object boundary security in software rather than pure hardware tables.
 
 ---
@@ -53,7 +53,7 @@ Building any OS from scratch requires structured phases. For an SLS system, we w
 
 1. **Run:** git clone [git@github.com](mailto:git@github.com):kubeworkz/slsos.git slsos
 2. **Open the folder:** Launch VS Code or CLion, and select **Open Folder** on the freshly populated root workspace directory.
-3. **Run your cross-compilation loops:** You can execute your targets directly inside your integrated terminal window:
+3. **Run our cross-compilation loops:** You can execute our targets directly inside our integrated terminal window:
   - **For the x86_64 target:** Run `make x86-run`
   - **For the RISC-V target:** Run `make riscv-run`
 

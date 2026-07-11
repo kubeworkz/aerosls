@@ -135,7 +135,7 @@ When an application invokes `sys_sls_fence` to save its data structures, we modi
 extern void e1000_transmit_packet(void* phys_buf, uint16_t size);
 static uint32_t dspp_tx_id_generator = 1000;
 
-// Extends your network synchronization logic
+// Extends our network synchronization logic
 void replicate_page_over_network(uint64_t object_id, uint64_t vaddr, void* physical_ram_frame) {
     // 1. Allocate a temporary page-aligned kernel packet frame to prevent mutation races
     struct DSPPFullPagePacket* packet = (struct DSPPFullPagePacket*)allocate_physical_ram_frame();
@@ -173,7 +173,7 @@ void replicate_page_over_network(uint64_t object_id, uint64_t vaddr, void* physi
 
 ## **3. Asynchronous Multi-Node Network Processing Receiver**
 
-When an incoming packet hits your network card, the e1000 triggers an **MSI-X network interrupt**. Your interrupt routing layer catches the vector and passes execution to the in-kernel network routing engine on **Core 3** (your dedicated background tracking processor).
+When an incoming packet hits our network card, the e1000 triggers an **MSI-X network interrupt**. Our interrupt routing layer catches the vector and passes execution to the in-kernel network routing engine on **Core 3** (our dedicated background tracking processor).
 
 ```c
 extern void wakeup_threads_blocked_on_net_token(uint32_t transaction_id);
@@ -251,7 +251,7 @@ void handle_network_rx_interrupt_packet(void) {
 
 ## **4. Updating QEMU Clusters Emulation Framework**
 
-To test these advanced network replication paths in your live workspace environment, you must simulate a multi-node cluster on your host machine. You achieve this by spinning up **two distinct instances of QEMU simultaneously**.
+To test these advanced network replication paths in our live workspace environment, you must simulate a multi-node cluster on our host machine. You achieve this by spinning up **two distinct instances of QEMU simultaneously**.
 
 We link their emulated e1000 adapters together using a virtual backend socket mesh network and create individual raw NVMe storage drives for each system image.
 
@@ -285,17 +285,17 @@ run-node2: iso
 When our system is operational across both host cluster windows, memory management evolves into a globally resilient machine:
 
 1. **The Distributed Transaction Call:** A banking terminal shell script running on Node 1 updates user data accounts and fires a `sys_sls_fence` request to commit modifications securely.
-2. **Network Replication Dispatch:** Your kernel detects that the memory object requires remote safety mirroring. It pins the local RAM cache frame, creates a 4KB payload packet using the **DSPP protocol**, drops it into the e1000 Transmit ring, and rings the hardware doorbell register. The interactive application thread transitions to a blocked state, completely eliminating local execution stalls.
+2. **Network Replication Dispatch:** Our kernel detects that the memory object requires remote safety mirroring. It pins the local RAM cache frame, creates a 4KB payload packet using the **DSPP protocol**, drops it into the e1000 Transmit ring, and rings the hardware doorbell register. The interactive application thread transitions to a blocked state, completely eliminating local execution stalls.
 3. **Cross-Node Memory Injection:** The e1000 card streams the data packet across the emulated socket loop. Node 2 captures the packet, causing an MSI-X interrupt to fire on its background processor (**Core 3**). Core 2 decodes the incoming **DSPP_PAGE_WRITE_REQ**, resolves the object identifier, and writes the 4KB data frame directly into its localized RAM via memory-mapped buffers.
 4. **Cluster Resolution:** Node 2 returns a `DSPP_PAGE_WRITE_ACK` packet. Node 1 processes this acknowledgment via its receive handler on Core 3, matches the transaction ID, clears the blocked status token, and marks the user thread as ready.
 
-Our Single-Level Storage environment is now fully distributed: memory objects are replicated across network paths with hardware-level isolation, rendering traditional files and communication layers completely obsolete across your computing cluster.
+Our Single-Level Storage environment is now fully distributed: memory objects are replicated across network paths with hardware-level isolation, rendering traditional files and communication layers completely obsolete across our computing cluster.
 
 ## **1. In-Kernel Consensus Algorithm (Distributed Object Ownership)**
 
 When our Single-Level Storage (SLS) operating system scales across multiple network nodes, separating the network cable can create a **split-brain scenario**. If Node 1 and Node 2 both lose contact but remain running, they might both assume they are the absolute "owner" of a global persistent object space (e.g., `Object 99`). If both nodes concurrently write changes to their local NVMe sectors, the persistent object state will be permanently corrupted.
 
-To prevent this, you can implement an in-kernel consensus algorithm based on a **replicated state machine protocol (Raft-lite)**. This engine executes directly within your core network routing processor (**Core 3**) and maps ownership status to three states: `LEADER` (granted exclusive write access), `FOLLOWER` (read-only mirror node), or `CANDIDATE` (actively campaigning for node quorum).
+To prevent this, you can implement an in-kernel consensus algorithm based on a **replicated state machine protocol (Raft-lite)**. This engine executes directly within our core network routing processor (**Core 3**) and maps ownership status to three states: `LEADER` (granted exclusive write access), `FOLLOWER` (read-only mirror node), or `CANDIDATE` (actively campaigning for node quorum).
 
 ### **Step A: Defining Cluster State Metrics (**`consensus.h`**)**
 
@@ -396,7 +396,7 @@ void trigger_kernel_election_campaign(void) {
     e1000_transmit_packet(&vote_req, sizeof(struct DSPPFullPagePacket));
 }
 
-// Processing interface extending your existing 'handle_network_rx_interrupt_packet' handler
+// Processing interface extending our existing 'handle_network_rx_interrupt_packet' handler
 void process_consensus_packet(struct DSPPFullPagePacket* packet) {
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
 
@@ -458,7 +458,7 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet) {
 
 To hide network read latencies when an application traverses sequential memory data (such as a database object array), you can build an in-kernel **Network Pre-Fetch Engine**.
 
-When an application shell command hits a page fault on virtual page N inside an object, your `map_sls_frame_to_ram` wrapper triggers a low-priority background command to speculatively pre-fetch pages N+1 and N+2 from the remote leader node's RAM buffer *before* the application actually requests them.
+When an application shell command hits a page fault on virtual page N inside an object, our `map_sls_frame_to_ram` wrapper triggers a low-priority background command to speculatively pre-fetch pages N+1 and N+2 from the remote leader node's RAM buffer *before* the application actually requests them.
 
 **Step A: Prefetch Queue Definitions (**`prefetch.h`**)**
 
@@ -582,7 +582,7 @@ void process_incoming_prefetch_payload(struct DSPPFullPagePacket* packet) {
 
 ## **Distributed Cluster Execution Verification Log Timeline**
 
-With both modules operating natively inside the kernel framework, inspect your serial dashboard trace log outputs (`node1_debug.log`) under an active cluster network step:
+With both modules operating natively inside the kernel framework, inspect our serial dashboard trace log outputs (`node1_debug.log`) under an active cluster network step:
 
 ```
 [0024.102] [CONSENSUS] Processing Heartbeat from Master Node 2 (Term 4). Status: FOLLOWER
@@ -604,7 +604,7 @@ With both modules operating natively inside the kernel framework, inspect your s
 
 ## **Architectural Breakdown of the Completed Distributed Engine**
 
-Your Single-Level Storage OS now functions as a globally available, partition-resilient computing platform:
+Our Single-Level Storage OS now functions as a globally available, partition-resilient computing platform:
 
 1. **Split-Brain Mitigation:** If a network cable is severed, the **Raft-lite consensus loop** on Core 3 instantly detects the isolation. It drops write permissions globally via the processor page tables (`update_page_table_permissions_globally`), preventing inconsistent data states from being committed across split nodes. Write access is only restored once a stable majority quorum is recovered.
 2. **Predictive Latency Masking:** When applications read data sequentially, the **Spatial Pre-Fetch Engine** populates adjacent cache frames in the background via non-blocking network commands. When the user thread steps forward, it hits pre-cached RAM frames instantly, bypassing network latency loops entirely.
@@ -620,9 +620,9 @@ This test will verify that **Node 1** and **Node 2** can successfully complete t
 
 ### **Step 1: Provision Two Isolated Storage Drives**
 
-Because each virtual machine acts as a distinct bare-metal server in your cluster, they cannot share the same physical hard drive image simultaneously without instantly destroying the raw NVMe tracking structures.
+Because each virtual machine acts as a distinct bare-metal server in our cluster, they cannot share the same physical hard drive image simultaneously without instantly destroying the raw NVMe tracking structures.
 
-Open a terminal on your host machine, navigate to your project directory, and create **two separate, blank 10 GB raw disk target images**:
+Open a terminal on our host machine, navigate to our project directory, and create **two separate, blank 10 GB raw disk target images**:
 
 ```bash
 qemu-img create -f raw sls_storage_node1.img 10G
@@ -636,7 +636,7 @@ qemu-img create -f raw sls_storage_node2.img 10G
 
 To connect the nodes together without needing a complex host system network bridge configuration, use QEMU’s built-in **TCP Stream Socket Mesh** (`-netdev socket`). Node 1 will spin up a local port listener on port `1234`, and Node 2 will connect straight into that socket layer.
 
-Ensure your `Makefile` includes these explicit, multi-window execution recipes:
+Ensure our `Makefile` includes these explicit, multi-window execution recipes:
 
 ```
 # target: run-node1
@@ -665,11 +665,11 @@ run-node2: iso
 
 ### **Step 3: Run the Concurrent Live Cluster Sequence**
 
-To watch the live interaction, distributed page faults, and consensus heartbeats happen across your systems, you should run the nodes in adjacent host windows.
+To watch the live interaction, distributed page faults, and consensus heartbeats happen across our systems, you should run the nodes in adjacent host windows.
 
 1. **Compile the Master Workspace and Boot Node 1:**
 
-In your first terminal window, type: 
+In our first terminal window, type: 
 
 ```
 make run-node1
@@ -680,7 +680,7 @@ make run-node1
 
 2. **Boot Node 2 and Link the Cluster Mesh:**
 
-Open a second, adjacent terminal window on your host, navigate to the same project directory, and type:
+Open a second, adjacent terminal window on our host, navigate to the same project directory, and type:
 
 ```
 make run-node2
@@ -693,7 +693,7 @@ make run-node2
 
 ### **Step 4: Trace the Live Dual-Node Test Operations**
 
-To verify your distributed code pathways are functioning exactly as designed, execute these three real-time cluster test scenarios inside your running environments:
+To verify our distributed code pathways are functioning exactly as designed, execute these three real-time cluster test scenarios inside our running environments:
 
 **Scenario A: Verifying Inter-Node Memory Replication**
 
@@ -705,7 +705,7 @@ uid:1000> write global_ledger "Cluster Balance: $5,000,000"
 
 ```
 
-1. Open a third terminal window on your host machine to inspect the raw packet activity logging generated by **Node 2's background network processor (Core 3)**:
+1. Open a third terminal window on our host machine to inspect the raw packet activity logging generated by **Node 2's background network processor (Core 3)**:
   ```
   tail -f node2_debug.log
 
@@ -728,12 +728,12 @@ uid:1000> write global_ledger "Cluster Balance: $5,000,000"
   ```
 2. Watch the output timing traces. Because the data isn't natively resident on Node 2's NVMe sectors yet, Node 2's MMU catches a non-present page fault (**Interrupt 14**).
 3. The background pre-fetch engine speculatively issues a network cache request packet (`DSPP_PAGE_READ_REQ`) to Node 1. Node 1 reads the data frame straight out of its fast RAM cache using Core 3 and returns it over the network.
-4. Node 2 receives it, maps it into its local page directories, and prints out your text payload (`Cluster Balance: $5,000,000`) instantly, with your performance metrics dashboard tracking a massive **microsecond-level latency savings** compared to pulling it from cold disk blocks.
+4. Node 2 receives it, maps it into its local page directories, and prints out our text payload (`Cluster Balance: $5,000,000`) instantly, with our performance metrics dashboard tracking a massive **microsecond-level latency savings** compared to pulling it from cold disk blocks.
 
 **Scenario C: Testing Severe Split-Brain Consensus Isolation**
 
 1. Simulate a severe network failure by unlinking or closing the **Node 2 QEMU window entirely** (killing its process).
-2. Instantly look back at your active **Node 1 log stream** (`tail -f node1_debug.log`).
+2. Instantly look back at our active **Node 1 log stream** (`tail -f node1_debug.log`).
 3. Within exactly 1.5 seconds, Node 1's consensus watch-dog timer on Core 3 will notice the total loss of incoming heartbeat ticks. It will realize it no longer has access to a majority cluster quorum:
   ```
   [IPI] Link Failure! Heartbeat silent for 150 ticks. Connection lost to remote peer.
@@ -743,18 +743,18 @@ uid:1000> write global_ledger "Cluster Balance: $5,000,000"
   [SECURITY] Page directories scrubbed: All shared SLS objects updated to STRICT READ-ONLY status.
 
   ```
-4. Try to write to your ledger object inside the remaining **Node 1 shell**:
+4. Try to write to our ledger object inside the remaining **Node 1 shell**:
   ```
   uid:1000> write global_ledger "Malicious Split Modification Attempt"
 
   ```
 5. The shell will print an immediate security error: `Access Denied: Object state frozen due to network partition isolation.`
 
-Our hardware-driven page table access guards have successfully protected the global state from corruption, proving that your Single-Level Storage cluster remains fully synchronized and split-brain resilient without needing a single file or a traditional filesystem layer.
+Our hardware-driven page table access guards have successfully protected the global state from corruption, proving that our Single-Level Storage cluster remains fully synchronized and split-brain resilient without needing a single file or a traditional filesystem layer.
 
 To transition our custom Single-Level Storage operating system from a development folder into a polished, redistributable **installer and deployment package**, you must build an orchestration wrapper.
 
-Because an SLS OS runs directly on raw disk sectors and entirely bypasses traditional partition formatting (like ext4 or NTFS), the installation media cannot simply use a file extraction loop like a standard Linux distribution. Instead, the installation image script must map out raw disk geometry, flash your compiled kernel and bootloaders to predefined offsets, and bake a fresh **Global Object Directory (GOD)** directly into the target master boot sector.
+Because an SLS OS runs directly on raw disk sectors and entirely bypasses traditional partition formatting (like ext4 or NTFS), the installation media cannot simply use a file extraction loop like a standard Linux distribution. Instead, the installation image script must map out raw disk geometry, flash our compiled kernel and bootloaders to predefined offsets, and bake a fresh **Global Object Directory (GOD)** directly into the target master boot sector.
 
 Here is how to create a deployment script that rolls everything up into an automated distribution toolkit.
 
@@ -790,7 +790,7 @@ Create a manifest file that explicitly tracks the binary footprints, target sect
 
 ### **Step 2: The Core Host-Side Installer Script (**`deploy.py`**)**
 
-This python-based deployment tool replicates what a bare-metal flash utility would do. It compiles your code, dynamically builds a binary-level **GOD Anchor structural table block** populated with the `GOD_MAGIC` token you designed, and directly writes the payload into raw block images.
+This python-based deployment tool replicates what a bare-metal flash utility would do. It compiles our code, dynamically builds a binary-level **GOD Anchor structural table block** populated with the `GOD_MAGIC` token you designed, and directly writes the payload into raw block images.
 
 ```python
 import struct
@@ -798,7 +798,7 @@ import json
 import os
 import subprocess
 
-# Match the explicit C definitions from your kernel's GOD manager
+# Match the explicit C definitions from our kernel's GOD manager
 GOD_MAGIC = 0x534C524F4F544F44 # "SLSROOTD"
 
 def build_god_anchor(layout):
@@ -867,10 +867,10 @@ if __name__ == "__main__":
 
 ### **Step 3: Integrating the Deployment Target into a** `Makefile`
 
-Expand your project `Makefile` to add a unified script target that streamlines your installer compilation loop.
+Expand our project `Makefile` to add a unified script target that streamlines our installer compilation loop.
 
 ```
-# Add this target entry at the bottom of your existing project Makefile
+# Add this target entry at the bottom of our existing project Makefile
 
 .PHONY: release deploy-test
 
@@ -891,7 +891,7 @@ deploy-test: release
 
 ### **Step 4: Running a Clean Deployment Build**
 
-To run a final distribution deployment test pipelines, execute the following commands in your host terminal framework:
+To run a final distribution deployment test pipelines, execute the following commands in our host terminal framework:
 
 1. **Build and Package the Release Target Drive:**
   ```bash
@@ -904,6 +904,6 @@ To run a final distribution deployment test pipelines, execute the following com
   make deploy-test
 
   ```
-  *QEMU will parse the raw disk image directly. It bypasses the live ISO CD-ROM emulation target used during development. The processor lands immediately inside your 64-bit kernel code, checks Sector 1024, identifies the freshly baked* `GOD_MAGIC` *anchor layout block, detects a **Cold-Boot Configuration**, sets up the internal tracking matrices automatically, and opens up the secure shell.*
+  *QEMU will parse the raw disk image directly. It bypasses the live ISO CD-ROM emulation target used during development. The processor lands immediately inside our 64-bit kernel code, checks Sector 1024, identifies the freshly baked* `GOD_MAGIC` *anchor layout block, detects a **Cold-Boot Configuration**, sets up the internal tracking matrices automatically, and opens up the secure shell.*
 
 Our entire system architecture is now bundled into an enterprise-ready bare-metal deployment toolset.
