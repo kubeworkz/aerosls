@@ -6,7 +6,7 @@ static struct IDTEntry idt[256];
 static struct IDTPointer idt_ptr;
 
 // External reference to the assembly wrapper for the page fault handler
-extern void isr14_stub(void);
+#include "isr_stubs.h"
 
 void set_idt_gate(uint8_t vector, uint64_t isr_address, uint8_t attributes) {
     idt[vector].isr_low    = (uint16_t)(isr_address & 0xFFFF);

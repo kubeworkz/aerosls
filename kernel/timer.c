@@ -19,9 +19,9 @@ void kernel_sleep_ticks(uint32_t ticks) {
     }
 }
 
-// Register the timer IRQ0 stub in the IDT (call once during kernel init)
-extern void isr32_stub(void); // Assembly stub defined in interrupt.asm
+#include "../arch/x86/isr_stubs.h"
 
+// Register the timer IRQ0 stub in the IDT (call once during kernel init)
 void init_timer(void) {
     // IRQ0 maps to IDT vector 32 (after the 32 reserved CPU exception vectors)
     // 0x8E: Present, Ring 0, 64-bit Interrupt Gate
