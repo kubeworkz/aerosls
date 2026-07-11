@@ -62,12 +62,12 @@ and hardware execution jitter using an in-kernel Raft-lite
 consensus state machine paired with a lazy floating-point
 context-switching framework.
 
-Empirical evaluations conducted within a multi-core emulated
-hardware environment demonstrate that AeroSLS achieves
-microsecond-level page-fault resolution, maintains structural
-integrity under network partition traps, and achieves zero-copy
-persistence throughput approaching native hardware PCIe line
-rates.
+Evaluations conducted in a four-core QEMU environment show that
+AeroSLS's object-lookup step averages 17.2\,cycles per resolution
+event (a 96.1\% reduction versus a simulated VFS path), and that
+the lazy CR0.TS context-switch policy reduces per-switch cycles
+by 54.2$\times$ relative to forced full-state saves
+(Section~\ref{sec:eval}).
 \end{abstract}
 
 \keywords{Single-Level Storage, Persistent Memory, Operating
@@ -90,18 +90,18 @@ To access persistent blocks, application pipelines must navigate
 the complete Virtual File System (VFS) layers, endure data
 parsing marshaling overheads, and allocate localized
 user-space buffers.  While historically necessary to mask slow
-mechanical disk rotations, this model introduces an unacceptable
-software abstraction tax when applied to ultra-low latency modern
-flash cells and byte-addressable persistent architectures.
+mechanical disk rotations, this model imposes a high software abstraction cost when applied
+to ultra-low-latency modern flash cells and byte-addressable
+persistent architectures.
 
 With native NVMe solid-state storage devices operating directly
 across high-speed PCIe lanes, hardware processing latencies have
-plummeted to single-digit microseconds.  Under these conditions,
+fallen to single-digit microseconds.  Under these conditions,
 the dominant system bottleneck shifts from physical hardware
 transport delays to the software operating system itself.  Deep,
 synchronous kernel storage stacks, global filesystem metadata
 lock contentions, and internal memory cache duplication
-significantly degrade total pipeline performance.
+degrade total pipeline performance~\cite{spdk}.
 
 \begin{figure}[t]
 \centering
@@ -117,8 +117,8 @@ To bypass these abstraction layers, we introduce
 \textit{AeroSLS}, a clean-slate, distributed, multi-core 64-bit
 operating system designed to fully converge primary volatile
 execution memory and permanent block storage.  AeroSLS
-represents an absolute zero-abstraction paradigm: it strips out
-files, directories, mounts, and block allocation maps.  Instead,
+takes a zero-abstraction approach: it removes
+files, directories, mounts, and block allocation maps from the kernel.  Instead,
 all data blocks throughout the machine sit directly within a
 unified, globally available 64-bit virtual memory address space.
 
@@ -134,23 +134,27 @@ with zero intermediate buffers or user-space serialization loops.
 
 This paper makes the following primary contributions:
 \begin{itemize}
-  \item We design a clean-slate, un-abstracted SLS operating
-    system architecture that completely unifies memory and
-    persistent media at the physical processor page-table
-    boundary.
-  \item We implement a highly parallel, asynchronous multi-core
-    I/O pipeline that combines lock-free atomic directory
-    indices, priority-driven multi-lane hardware NVMe brokers,
-    and multi-core distributed interrupt routing via MSI-X and
-    Local APIC modules.
-  \item We protect data-at-rest without sacrificing
-    computational efficiency by introducing an AVX-512
-    vectorized ChaCha20 cryptographic page-sealing engine
-    driven by a lazy floating-point hardware context switcher.
-  \item We evaluate the system within an emulated multi-node
-    cluster environment, demonstrating resilient split-brain
-    isolation and significant latency savings via active
-    predictive spatial network pre-fetching.
+  \item We design an un-abstracted SLS operating system
+    architecture that unifies memory and persistent media at
+    the processor page-table boundary, removing file, directory,
+    and mount abstractions from the kernel
+    (Sections~\ref{sec:design}--\ref{sec:hardware}).
+  \item We implement a multi-core I/O pipeline combining
+    lock-free FNV-1a directory indices, priority-driven
+    per-core NVMe queue pairs, and MSI-X interrupt routing
+    via Local APIC (Sections~\ref{sec:design}--\ref{sec:hardware}).
+  \item We introduce an AVX-512 vectorized ChaCha20
+    page-sealing engine paired with a lazy CR0.TS context
+    switcher that reduces per-switch jitter without
+    sacrificing data-at-rest confidentiality
+    (Section~\ref{sec:security}).
+  \item We measure two principal overheads in a four-core
+    QEMU environment: object-lookup resolution (17.2 mean
+    cycles vs.\ 446.5 for a simulated VFS path, a 96.1\%
+    reduction) and scheduler context-switch cost (45.8 mean
+    cycles under the lazy policy vs.\ 2,485.0 under forced
+    full-state saves, a 54.2$\times$ improvement)
+    (Section~\ref{sec:eval}).
 \end{itemize}
 
 The rest of this paper is structured as follows.
@@ -174,8 +178,8 @@ The architectural layout of AeroSLS departs entirely from the
 traditional layered virtual directory design found in monolithic
 kernels.  By implementing a flat address tracking strategy, the
 operating system converts storage blocks into standard
-architecture page structures.  This eliminates the storage
-translation and caching overhead introduced by a Virtual File
+architecture page structures.  This removes the storage
+translation and caching overhead imposed by a Virtual File
 System (VFS).
 
 \subsection{Unified 64-bit Address Topology}
@@ -263,8 +267,8 @@ using the target offset evaluation function:
 \end{equation}
 where $\mathcal{V}_{base}$ is the universal root allocation base
 pointer of the target memory object.  This calculation resolves
-the fragmented block offset at raw CPU speeds, bypassing
-traditional multi-tier filesystem node traversal pipelines.
+the fragmented block offset in constant time, bypassing
+traditional multi-tier filesystem node traversal.
 
 \subsection{Predictive Spatial Pre-Fetching Architecture}
 To minimize network and media access latencies, AeroSLS utilizes
@@ -279,9 +283,8 @@ These predictive reads are dispatched via low-priority
 non-blocking commands across parallel PCIe or Ethernet channels.
 The incoming data blocks are packed into allocated physical memory
 frames and updated within the processor page tables before the
-user thread advances its code pointer, effectively converting
-predictable storage access latencies into instantaneous hardware
-RAM cache hits.
+user thread advances its code pointer, converting predictable storage accesses into
+hardware RAM cache hits before the user thread advances.
 
 % ============================================================
 \section{Hardware Integration and Multi-Core Scalability}
@@ -299,7 +302,7 @@ Once discovered, the driver initializes an \emph{Admin Queue
 Pair} (Submission Queue / Completion Queue depth 64) to issue
 controller configuration commands, followed by one I/O Queue
 Pair per logical CPU core.  This per-core queue topology
-eliminates cross-core lock contention on the submission path: a
+removes cross-core lock contention on the submission path: a
 page-fault handler running on Core~$k$ deposits a 64-byte
 Submission Queue Entry (SQE) directly into its dedicated queue,
 rings the hardware doorbell register, and returns immediately to
@@ -356,8 +359,8 @@ whether a given object page is accessible from Ring~3.  When an
 object is created, the kernel assigns a permission bitmap and
 configures the corresponding PTE flags accordingly.  All
 subsequent permission checks are executed by the hardware MMU
-at zero extra instruction cost—security enforcement is
-structurally embedded in the address translation path itself.
+at no additional instruction cost; security enforcement is
+structurally embedded in the address translation path.
 
 \begin{figure}[h]
 \centering
@@ -447,9 +450,10 @@ For non-vector threads ($\mathcal{U}_{vector} = 0$):
   = \mathcal{C}_{gpr}
 \end{equation}
 
-This limit formalizes our evaluation findings: for scalar compute
-threads, AeroSLS entirely eliminates the 2,688-byte memory save
-pipeline tax.
+This limit formalizes the evaluation finding in
+Section~\ref{sec:eval}: for scalar threads,
+AeroSLS removes the 2,688-byte vector-state save from the
+context-switch path.
 
 % ============================================================
 \section{Crash Consistency and Distributed Fault Tolerance}
@@ -481,9 +485,8 @@ heartbeat within a 150-tick timeout window (1.5\,s), it
 transitions to \textsc{Candidate}, increments its election term,
 and immediately invokes \texttt{update\_page\_table\_permissions\_globally(1)}
 to strip all locally mapped objects of write authorization.
-This single-call split-brain mitigation ensures that no data
-mutation can occur during the election window, preventing
-divergence.  Once a candidate accumulates a strict majority of
+This prevents local writes
+during the election window, reducing the risk of divergence.  Once a candidate accumulates a strict majority of
 \textsc{VoteReply} acknowledgments, it is elevated to
 \textsc{Leader} and write permissions are restored.
 
@@ -530,8 +533,7 @@ back-to-back trials.  Two metric families were evaluated: the
 
 \begin{figure}[h]
 \centering
-% \includegraphics[width=\linewidth]{figures/sls_performance_metrics.pdf}
-\fbox{\rule{0pt}{3.0cm}\rule{0.9\linewidth}{0pt}}
+\includegraphics[width=\linewidth]{sls_performance_metrics.pdf}
 \caption{Dual-panel evaluation results.
   (a)~Memory resolution abstraction tax: legacy VFS stack
   versus AeroSLS direct MMU index.
@@ -552,14 +554,14 @@ paths are measured end-to-end from \texttt{rdtsc} entry to
 \texttt{rdtsc} exit with no I/O involved.
 
 As shown in Figure~\ref{fig:perf}(a) and
-Table~\ref{tab:results}, the legacy VFS model demands a mean
+Table~\ref{tab:results}, the legacy VFS model incurs a mean
 cost of \textbf{446.5 clock cycles} per resolution event.  The
 AeroSLS direct MMU path reduces this to a mean of
-\textbf{17.2 cycles}—a \textbf{96.1\%} reduction in execution
-overhead.  The AeroSLS distribution also exhibits dramatically
+\textbf{17.2 cycles} (a \textbf{96.1\%} reduction in execution
+overhead).  The AeroSLS distribution also exhibits dramatically
 tighter variance (min 14, max 22 cycles) versus the legacy
-stack (min 412, max 498 cycles), confirming that lock-free
-hash addressing eliminates the unpredictable synchronization
+stack (min 412, max 498 cycles), consistent with lock-free
+hash addressing reducing the unpredictable synchronization
 delays common in monolithic kernels.
 
 \subsection{Core Scheduler Context-Switch Jitter}
@@ -572,13 +574,13 @@ AVX-512 state buffer.  The lazy policy instead sets
 vector instruction executed by the new thread (Device Not
 Available Exception~7), if any.
 
-The results in Figure~\ref{fig:perf}(b) demonstrate that the
+The results in Figure~\ref{fig:perf}(b) show that the
 strict policy incurs a mean latency of \textbf{2,485.0 cycles}
 per switch.  With the lazy optimization active, the mean drops
-to \textbf{45.8 cycles}—a \textbf{54.2$\times$ improvement}.
+to \textbf{45.8 cycles} (a \textbf{54.2$\times$ improvement}).
 Because interactive shell threads are wholly scalar, the
 $\mathcal{U}_{vector} = 0$ branch is taken on virtually every
-switch, validating the analytical model from
+switch, consistent with the analytical model in
 Section~\ref{sec:lazy_fpu}.
 
 \begin{table}[h]
@@ -601,11 +603,10 @@ Strict XSAVE/XRSTOR Cycles   & 2,241 & 2,485.0 & 2,731 \\
 
 When mapping the mean AeroSLS MMU cycle score to the baseline
 4\,GHz virtual clock rate of the emulation platform, each
-object resolution completes in approximately 4.3\,ns—well
-within the single-digit-microsecond target that defines the
-hardware PCIe Gen5 latency floor.  This validates the
-zero-copy persistence pipeline claim: the software layer is no
-longer a measurable bottleneck relative to the underlying media.
+object resolution completes in approximately 4.3\,ns, well
+within the single-digit-microsecond floor set by PCIe Gen5
+NVMe access latency.  At this scale, the object-lookup step
+is no longer the dominant bottleneck in the storage pipeline.
 
 % ============================================================
 \section{Related Work}
@@ -615,21 +616,21 @@ The concept of a Single-Level Storage operating system dates
 back to pioneer platforms such as the Multics
 system~\cite{multics} and the IBM System/38 (later evolving into
 the IBM~i architecture)~\cite{ibmi}.  These early designs
-successfully unified the programming abstraction between memory
+unified the programming abstraction between memory
 and disk storage.  However, they were engineered for an era
-dominated by slow, mechanical hard disks and single-core
-processors, relying heavily on hardware-dependent segmented
-memory configurations and heavy software abstraction tables that
-introduced severe performance penalties.
+dominated by slow mechanical hard disks and single-core
+processors, relying on hardware-dependent segmented memory
+configurations and deep software abstraction layers that
+incurred substantial overhead.
 
-The emergence of modern non-volatile, ultra-low latency storage
-media has sparked a major resurgence in persistent memory
+Modern non-volatile, low-latency storage
+media has renewed interest in persistent memory
 operating system research.  Specialized research kernels like
 Twizzler~\cite{twizzler} and BPFS~\cite{aurora} have explored
 the removal of standard file system semantics by converting
 persistent storage targets into cross-addressable memory object
 spaces.  Twizzler implements an object-centric model that
-utilizes data-pointer formatting to navigate cross-object links;
+uses data-pointer formatting to navigate cross-object links;
 however, Twizzler operates under user-space runtime environments
 that still rely on underlying traditional file systems or
 hypervisor interventions to coordinate raw media writes.
@@ -653,36 +654,34 @@ preserves the file/object boundary at the application level and
 does not address the MMU-level convergence of memory and
 persistent storage that AeroSLS achieves.
 
-AeroSLS distinguishes itself from these prior frameworks by
-enforcing an absolute zero-abstraction model at the bare-metal
-kernel layer.  It strips out the concept of file layers entirely
-and avoids runtime address-patching overhead.  Instead, it
-relies directly on native x86\_64 hardware paging mechanisms,
-low-overhead atomic lock-free directories, and prioritized NVMe
-hardware queues to achieve crash-consistent data persistence at
-native hardware line speeds.
+AeroSLS differs from these prior frameworks by enforcing
+a zero-abstraction model at the bare-metal kernel layer.
+It removes file layers entirely and avoids runtime
+address-patching overhead, relying directly on native x86\_64
+hardware paging mechanisms, lock-free directories, and
+prioritized NVMe hardware queues to achieve crash-consistent
+data persistence at hardware line rates.
 
 % ============================================================
 \section{Conclusion and Future Work}
 \label{sec:conclusion}
 
 This paper presented \textit{AeroSLS}, a multi-core 64-bit
-operating system designed to fully eliminate the legacy division
+operating system designed to eliminate the legacy division
 between volatile primary memory and non-volatile block storage.
 By converging storage execution pathways directly at the
-processor page-table boundary, AeroSLS bypasses the heavy
-virtualization and double-caching taxes imposed by classic
+processor page-table boundary, AeroSLS bypasses the
+virtualization and double-caching overhead imposed by classic
 Virtual File System (VFS) layers.
 
-Our empirical evaluations demonstrate that through a combination
-of lock-free concurrent hash matrices, prioritized hardware NVMe
-brokers, and highly automated spatial pre-fetching engines,
-AeroSLS successfully reduces page-resolution overhead to
-microsecond scales.  Furthermore, by isolating multi-core
-cryptographic sealing pipelines using a lazy floating-point
-context switcher, the kernel enforces absolute data privacy at
-rest without introducing execution jitter to standard scalar
-compute workloads.
+Measurements show that lock-free concurrent hash matrices
+reduce the object-lookup cost by 96.1\% relative to a simulated
+VFS path, and the lazy CR0.TS context-switch policy cuts
+per-switch cycles by 54.2$\times$ for scalar threads.  By
+isolating cryptographic sealing on dedicated cores and deferring
+vector-state saves via CR0.TS, the kernel maintains
+data-at-rest confidentiality without introducing jitter to
+scalar compute threads.
 
 \subsection{Heterogeneous Architecture and Protocol Scaling}
 While the current instantiation of the Distributed SLS Page
@@ -702,7 +701,7 @@ taxes, we propose the design of a hardware-agnostic
 network routing framework.  This sub-system will dynamically
 partition larger remote memory blocks into aligned sub-page
 extents on demand, converting architecture-specific memory
-attributes natively at the packet boundary to guarantee seamless
+attributes natively at the packet boundary to enable consistent
 cross-platform object sharing.
 
 \subsection{Hardware-Accelerated RDMA over Converged Ethernet}
@@ -727,10 +726,10 @@ When a remote page fault triggers, the kernel will post an RDMA
 Read Request straight to the hardware rNIC PCIe lanes.  The
 remote network card will pull the target $4\,\text{KiB}$ data
 frame directly out of its local physical RAM pool using
-peer-to-peer DMA over the wire.  This pipeline reduces
+peer-to-peer DMA over the wire.  This pipeline is projected to reduce
 distributed memory synchronization delays to sub-microsecond
-scales, matching the performance profiles of unified hardware
-memory fabrics (Figure~\ref{fig:roce_pipeline}).
+scales, approaching the latency of unified hardware memory
+fabrics (Figure~\ref{fig:roce_pipeline}).
 
 \subsection{SLS-Aware Compiler Plugins for Legacy Runtimes}
 Finally, we aim to eliminate the necessity for explicit system
@@ -750,10 +749,10 @@ Representation (LLVM-IR) compilation phase.  The compiler will
 automatically insert offset-based \texttt{sls\_malloc} hooks,
 manage relative pointer calculations within individual data
 structures, and handle automatic alignment constraints at
-compile time.  This ensures that arbitrary legacy codebase
-frameworks can be ported directly into the AeroSLS environment
-and achieve robust, crash-consistent persistence with zero
-modifications to their core application logic.
+compile time.  This allows legacy applications
+to be ported into the AeroSLS environment and achieve
+crash-consistent persistence without modifying their core
+application logic.
 
 % ============================================================
 \bibliographystyle{ACM-Reference-Format}
