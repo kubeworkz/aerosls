@@ -29,12 +29,12 @@
   Lock-Free Distributed Single-Level Storage Operating System
   over Native NVMe Queues}
 
-\author{Author Name}
+\author{Dave F. Cook}
 \affiliation{%
-  \institution{Department of Computer Science}
-  \country{Your Institution}
+  \institution{Independent Researcher}
+  \country{}
 }
-\email{author@example.com}
+\email{dave@gridworkz.com}
 
 % ============================================================
 \begin{abstract}
@@ -105,8 +105,7 @@ degrade total pipeline performance~\cite{spdk}.
 
 \begin{figure}[t]
 \centering
-% \includegraphics[width=\linewidth]{figures/arch_comparison.pdf}
-\fbox{\rule{0pt}{2.2cm}\rule{0.9\linewidth}{0pt}}
+\includegraphics[width=\linewidth]{arch_comparison.pdf}
 \caption{Architectural comparison: legacy VFS double-caching
   stack vs.\ the AeroSLS direct hardware memory-mapped
   persistence layout.}
@@ -364,8 +363,7 @@ structurally embedded in the address translation path.
 
 \begin{figure}[h]
 \centering
-% \includegraphics[width=\linewidth]{figures/crypto_core_map.pdf}
-\fbox{\rule{0pt}{2.2cm}\rule{0.9\linewidth}{0pt}}
+\includegraphics[width=\columnwidth]{crypto_core_map.pdf}
 \caption{Core allocation topology: Cores~0--1 handle scheduler
   threads and allocations; Cores~2--3 function as isolated
   vectorized ChaCha20 cryptoprocessors.}
@@ -715,8 +713,7 @@ the local and remote CPU cores entirely during remote reads.
 
 \begin{figure}[h]
 \centering
-% \includegraphics[width=\linewidth]{figures/roce_pipeline.pdf}
-\fbox{\rule{0pt}{2.2cm}\rule{0.9\linewidth}{0pt}}
+\includegraphics[width=\linewidth]{roce_pipeline.pdf}
 \caption{Proposed AeroSLS zero-copy RoCEv2 integration pipeline
   for sub-microsecond distributed page resolution.}
 \label{fig:roce_pipeline}

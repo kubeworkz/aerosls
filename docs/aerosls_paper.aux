@@ -4,11 +4,11 @@
 \providecommand\HyField@AuxAddToCoFields[2]{}
 \citation{spdk}
 \@writefile{toc}{\contentsline {section}{Abstract}{1}{section*.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Architectural comparison: legacy VFS double-caching stack vs.\ the AeroSLS direct hardware memory-mapped persistence layout.}}{1}{figure.caption.4}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:arch_comparison}{{1}{1}{Architectural comparison: legacy VFS double-caching stack vs.\ the AeroSLS direct hardware memory-mapped persistence layout}{figure.caption.4}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
 \newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Architectural comparison: legacy VFS double-caching stack vs.\ the AeroSLS direct hardware memory-mapped persistence layout.}}{2}{figure.caption.4}\protected@file@percent }
-\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
-\newlabel{fig:arch_comparison}{{1}{2}{Architectural comparison: legacy VFS double-caching stack vs.\ the AeroSLS direct hardware memory-mapped persistence layout}{figure.caption.4}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {2}System Architecture Design}{2}{section.2}\protected@file@percent }
 \newlabel{sec:design}{{2}{2}{System Architecture Design}{section.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Unified 64-bit Address Topology}{2}{subsection.2.1}\protected@file@percent }
@@ -29,10 +29,10 @@
 \@writefile{toc}{\contentsline {section}{\numberline {4}Memory Protection and Data Privacy at Rest}{3}{section.4}\protected@file@percent }
 \newlabel{sec:security}{{4}{3}{Memory Protection and Data Privacy at Rest}{section.4}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Hardware-Enforced Capability Access Control}{3}{subsection.4.1}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Core allocation topology: Cores\nonbreakingspace 0--1 handle scheduler threads and allocations; Cores\nonbreakingspace 2--3 function as isolated vectorized ChaCha20 cryptoprocessors.}}{3}{figure.caption.5}\protected@file@percent }
-\newlabel{fig:crypto_cores}{{2}{3}{Core allocation topology: Cores~0--1 handle scheduler threads and allocations; Cores~2--3 function as isolated vectorized ChaCha20 cryptoprocessors}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Parallel AVX-512 Cryptographic Page Sealing}{3}{subsection.4.2}\protected@file@percent }
 \citation{raft}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Parallel AVX-512 Cryptographic Page Sealing}{4}{subsection.4.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Core allocation topology: Cores\nonbreakingspace 0--1 handle scheduler threads and allocations; Cores\nonbreakingspace 2--3 function as isolated vectorized ChaCha20 cryptoprocessors.}}{4}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:crypto_cores}{{2}{4}{Core allocation topology: Cores~0--1 handle scheduler threads and allocations; Cores~2--3 function as isolated vectorized ChaCha20 cryptoprocessors}{figure.caption.5}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Lazy Floating-Point Context Switching}{4}{subsection.4.3}\protected@file@percent }
 \newlabel{sec:lazy_fpu}{{4.3}{4}{Lazy Floating-Point Context Switching}{subsection.4.3}{}}
 \@writefile{toc}{\contentsline {paragraph}{State size model.}{4}{section*.6}\protected@file@percent }
@@ -47,8 +47,6 @@
 \citation{ibmi}
 \citation{twizzler}
 \citation{aurora}
-\citation{pmfs}
-\citation{nova}
 \@writefile{toc}{\contentsline {section}{\numberline {6}Evaluation and Experimental Results}{5}{section.6}\protected@file@percent }
 \newlabel{sec:eval}{{6}{5}{Evaluation and Experimental Results}{section.6}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Experimental Setup}{5}{subsection.6.1}\protected@file@percent }
@@ -60,10 +58,9 @@
 \newlabel{tab:results}{{1}{5}{Per-metric cycle count summary across 100 trial iterations (QEMU x86\_64, 4-core, 4\,GiB RAM)}{table.caption.9}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {7}Related Work}{5}{section.7}\protected@file@percent }
 \newlabel{sec:related}{{7}{5}{Related Work}{section.7}{}}
+\citation{pmfs}
+\citation{nova}
 \citation{spdk}
-\bibstyle{ACM-Reference-Format}
-\bibdata{aerosls_paper}
-\bibcite{twizzler}{{1}{2020}{{Bittman et~al\mbox  {.}}}{{}}}
 \@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion and Future Work}{6}{section.8}\protected@file@percent }
 \newlabel{sec:conclusion}{{8}{6}{Conclusion and Future Work}{section.8}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Heterogeneous Architecture and Protocol Scaling}{6}{subsection.8.1}\protected@file@percent }
@@ -71,6 +68,9 @@
 \@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Proposed AeroSLS zero-copy RoCEv2 integration pipeline for sub-microsecond distributed page resolution.}}{6}{figure.caption.10}\protected@file@percent }
 \newlabel{fig:roce_pipeline}{{4}{6}{Proposed AeroSLS zero-copy RoCEv2 integration pipeline for sub-microsecond distributed page resolution}{figure.caption.10}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.3}SLS-Aware Compiler Plugins for Legacy Runtimes}{6}{subsection.8.3}\protected@file@percent }
+\bibstyle{ACM-Reference-Format}
+\bibdata{aerosls_paper}
+\bibcite{twizzler}{{1}{2020}{{Bittman et~al\mbox  {.}}}{{}}}
 \bibcite{aurora}{{2}{2009}{{Condit et~al\mbox  {.}}}{{}}}
 \bibcite{multics}{{3}{1965}{{Corbat\'{o} and Vyssotsky}}{{}}}
 \bibcite{pmfs}{{4}{2014}{{Dulloor et~al\mbox  {.}}}{{}}}

@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023/Debian) (preloaded format=pdflatex 2026.7.11)  11 JUL 2026 17:52
+This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023/Debian) (preloaded format=pdflatex 2026.7.11)  11 JUL 2026 19:16
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -713,60 +713,81 @@ File: mt-msa.cfg 2006/02/04 v1.1 microtype config. file: AMS symbols (a) (RS)
 (/usr/share/texlive/texmf-dist/tex/latex/microtype/mt-msb.cfg
 File: mt-msb.cfg 2005/06/01 v1.0 microtype config. file: AMS symbols (b) (RS)
 )
+<arch_comparison.pdf, id=129, 489.9906pt x 240.27742pt>
+File: arch_comparison.pdf Graphic file (type pdf)
+<use arch_comparison.pdf>
+Package pdftex.def Info: arch_comparison.pdf  used on input line 108.
+(pdftex.def)             Requested size: 241.14749pt x 118.25024pt.
 
-Class acmart Warning: A possible image without description on input line 114.
+
+Class acmart Warning: A possible image without description on input line 113.
 
 [1.1{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}
 
-]<<ot1tt.cmap>>
+ <./arch_comparison.pdf>]<<ot1tt.cmap>>
 Package microtype Info: Loading generic protrusion settings for font family
 (microtype)             `cmtt' (encoding: OT1).
 (microtype)             For optimal results, create family-specific settings.
 (microtype)             See the microtype manual for details.
-Package hyperref Info: bookmark level for unknown algorithm defaults to 0 on in
-put line 210.
 
-Overfull \hbox (7.15395pt too wide) in paragraph at lines 214--216
+Underfull \vbox (badness 10000) has occurred while \output is active []
+
+Package hyperref Info: bookmark level for unknown algorithm defaults to 0 on in
+put line 209.
+
+Overfull \hbox (7.15395pt too wide) in paragraph at lines 213--215
 [] []$\OML/cmm/m/it/9 Node \OMS/cmsy/m/n/9   []\OT1/cmr/m/n/9 (-20) ([](\OML/cm
 m/m/it/9 SLSObjectNode\OT1/cmr/m/n/9 (-20) ))$
  []
 
 
-Overfull \hbox (108.98413pt too wide) in paragraph at lines 224--224
+Overfull \hbox (108.98413pt too wide) in paragraph at lines 223--223
 [] []\OT1/cmr/bx/n/9 (-20) if $[]\OT1/cmr/m/n/9 (-20) (&[][\OML/cmm/m/it/9 Buck
 et[]Index\OT1/cmr/m/n/9 (-20) ]\OML/cmm/m/it/9 ; Current[]Head; Node\OT1/cmr/m/
 n/9 (-20) )$
  []
 
 LaTeX Font Info:    Trying to load font information for OMS+cmr on input line 2
-26.
+25.
 (/usr/share/texlive/texmf-dist/tex/latex/base/omscmr.fd
 File: omscmr.fd 2023/04/13 v2.5m Standard LaTeX font definitions
 )
 LaTeX Font Info:    Font shape `OMS/cmr/m/n' in size <9> not available
-(Font)              Font shape `OMS/cmsy/m/n' tried instead on input line 226.
+(Font)              Font shape `OMS/cmsy/m/n' tried instead on input line 225.
  [2.2]
+<crypto_core_map.pdf, id=248, 252.2223pt x 163.38214pt>
+File: crypto_core_map.pdf Graphic file (type pdf)
+<use crypto_core_map.pdf>
+Package pdftex.def Info: crypto_core_map.pdf  used on input line 366.
+(pdftex.def)             Requested size: 241.14749pt x 156.20934pt.
 
-Class acmart Warning: A possible image without description on input line 373.
 
-[3.3]
-Underfull \vbox (badness 10000) has occurred while \output is active []
+Class acmart Warning: A possible image without description on input line 371.
 
- [4.4]
-<sls_performance_metrics.pdf, id=221, 505.89pt x 231.26399pt>
+
+LaTeX Warning: `h' float specifier changed to `ht'.
+
+[3.3] [4.4 <./crypto_core_map.pdf>]
+<sls_performance_metrics.pdf, id=342, 505.89pt x 231.26399pt>
 File: sls_performance_metrics.pdf Graphic file (type pdf)
 <use sls_performance_metrics.pdf>
-Package pdftex.def Info: sls_performance_metrics.pdf  used on input line 536.
+Package pdftex.def Info: sls_performance_metrics.pdf  used on input line 534.
 (pdftex.def)             Requested size: 241.14749pt x 110.2397pt.
 
 
-Class acmart Warning: A possible image without description on input line 544.
+Class acmart Warning: A possible image without description on input line 542.
 
 [5.5 <./sls_performance_metrics.pdf>]
+<roce_pipeline.pdf, id=417, 500.10838pt x 150.22096pt>
+File: roce_pipeline.pdf Graphic file (type pdf)
+<use roce_pipeline.pdf>
+Package pdftex.def Info: roce_pipeline.pdf  used on input line 716.
+(pdftex.def)             Requested size: 241.14749pt x 72.4353pt.
 
-Class acmart Warning: A possible image without description on input line 723.
 
-(./aerosls_paper.bbl [6.6])
+Class acmart Warning: A possible image without description on input line 720.
+
+[6.6 <./roce_pipeline.pdf>] (./aerosls_paper.bbl)
 
 Class acmart Warning: Some images may lack descriptions.
 
@@ -788,10 +809,10 @@ Package rerunfilecheck Info: File `aerosls_paper.out' has not changed.
 (rerunfilecheck)             Checksum: 400CD0347583435D758B077727B090E1;7342.
  ) 
 Here is how much of TeX's memory you used:
- 17549 strings out of 476106
- 279291 string characters out of 5793933
- 1950975 words of memory out of 5000000
- 38767 multiletter control sequences out of 15000+600000
+ 17570 strings out of 476106
+ 279892 string characters out of 5793933
+ 1947975 words of memory out of 5000000
+ 38788 multiletter control sequences out of 15000+600000
  577436 words of font info for 200 fonts, out of 8000000 for 9000
  220 hyphenation exceptions out of 8191
  90i,13n,131p,1010b,724s stack positions out of 10000i,1000n,20000p,200000b,200000s
@@ -817,10 +838,10 @@ t/fonts/type1/public/amsfonts/cm/cmsy9.pfb></usr/share/texlive/texmf-dist/fonts
 public/amsfonts/cm/cmti8.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/
 amsfonts/cm/cmti9.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfont
 s/cm/cmtt9.pfb>
-Output written on aerosls_paper.pdf (7 pages, 387960 bytes).
+Output written on aerosls_paper.pdf (7 pages, 436953 bytes).
 PDF statistics:
- 406 PDF objects out of 1000 (max. 8388607)
- 313 compressed objects within 4 object streams
+ 600 PDF objects out of 1000 (max. 8388607)
+ 336 compressed objects within 4 object streams
  76 named destinations out of 1000 (max. 500000)
- 45830 words of extra memory for PDF output out of 51595 (max. 10000000)
+ 45845 words of extra memory for PDF output out of 51595 (max. 10000000)
 

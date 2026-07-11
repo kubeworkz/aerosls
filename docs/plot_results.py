@@ -1,4 +1,5 @@
 import os
+from matplotlib.patches import Rectangle
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -112,6 +113,188 @@ def simulate_and_save_data(log_path="sls_kernel_debug.log",
     print(f"[SIM] Evaluation CSV written -> {csv_path}")
 
 
+# ---------------------------------------------------------------------------
+# Architecture Diagram Helpers
+# ---------------------------------------------------------------------------
+
+def _box(ax, cx, cy, w, h, label,
+         fc='#cccccc', ec='black', lw=0.8, fs=7.5, tc='black'):
+    """Draw a rectangle centered at (cx, cy) with a text label."""
+    ax.add_patch(Rectangle((cx - w / 2, cy - h / 2), w, h,
+                            facecolor=fc, edgecolor=ec,
+                            linewidth=lw, zorder=2))
+    ax.text(cx, cy, label, ha='center', va='center',
+            fontsize=fs, color=tc, zorder=3, linespacing=1.3)
+
+
+def _arr(ax, x0, y0, x1, y1, color='#333333', lw=0.9, ms=9):
+    """Draw an arrow from (x0, y0) to (x1, y1)."""
+    ax.annotate('', xy=(x1, y1), xytext=(x0, y0),
+                arrowprops=dict(arrowstyle='->',
+                                color=color, lw=lw,
+                                mutation_scale=ms), zorder=2)
+
+
+def generate_arch_comparison(path="arch_comparison.pdf"):
+    """
+    Two-panel figure: legacy VFS stack (left) vs. AeroSLS zero-abstraction
+    path (right).
+    """
+    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(7.0, 3.6))
+    fig.subplots_adjust(wspace=0.08, left=0.03, right=0.97,
+                        top=0.88, bottom=0.05)
+    for ax in (ax_l, ax_r):
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+
+    # ── left: VFS stack (7 layers) ──────────────────────────────────────
+    vfs_rows = [
+        ("Application Process",         '#f4f4f4', 'black'),
+        ("open() / read() / write()",   '#e0e0e0', 'black'),
+        ("VFS Dispatch Layer",          '#cccccc', 'black'),
+        ("Kernel Page Cache",           '#b8b8b8', 'black'),
+        ("Block I/O Layer",             '#a4a4a4', 'black'),
+        ("NVMe Storage Driver",         '#888888', 'white'),
+        ("NVMe Device (Hardware)",      '#555555', 'white'),
+    ]
+    bh, gap = 0.094, 0.014
+    y_top = 0.920
+    for i, (label, fc, tc) in enumerate(vfs_rows):
+        cy = y_top - i * (bh + gap) - bh / 2
+        _box(ax_l, 0.50, cy, 0.84, bh, label, fc=fc, tc=tc)
+        if i < len(vfs_rows) - 1:
+            _arr(ax_l, 0.50, cy - bh / 2, 0.50, cy - bh / 2 - gap)
+
+    # overhead brace
+    yb_top = y_top - bh / 2
+    yb_bot = y_top - 4 * (bh + gap) - bh / 2
+    ax_l.annotate('', xy=(0.96, yb_bot), xytext=(0.96, yb_top),
+                  arrowprops=dict(arrowstyle='<->',
+                                  color='#666', lw=0.7,
+                                  mutation_scale=8), zorder=2)
+    ax_l.text(1.00, (yb_top + yb_bot) / 2,
+              'Software\nOverhead', fontsize=5.5,
+              ha='left', va='center', color='#666')
+    ax_l.set_title("(a) Legacy VFS Stack", fontsize=9, pad=3)
+
+    # ── right: AeroSLS path (4 stages) ──────────────────────────────────
+    sls_rows = [
+        ("Application Process\n(Virtual Address Access)",  '#f4f4f4', 'black'),
+        ("MMU Page Fault  (Int 14)\nKernel Trap",          '#d0d0d0', 'black'),
+        ("Lock-Free FNV-1a Index\nCAS Object Lookup",      '#a0a0a0', 'black'),
+        ("NVMe Submission Queue\nDirect DMA",              '#555555', 'white'),
+    ]
+    bh_r, gap_r = 0.146, 0.028
+    n_r = len(sls_rows)
+    total_r = n_r * bh_r + (n_r - 1) * gap_r
+    y_top_r = 0.5 + total_r / 2
+    for i, (label, fc, tc) in enumerate(sls_rows):
+        cy = y_top_r - i * (bh_r + gap_r) - bh_r / 2
+        _box(ax_r, 0.50, cy, 0.84, bh_r, label, fc=fc, tc=tc)
+        if i < n_r - 1:
+            _arr(ax_r, 0.50, cy - bh_r / 2, 0.50, cy - bh_r / 2 - gap_r)
+    ax_r.set_title("(b) AeroSLS Zero-Abstraction Path", fontsize=9, pad=3)
+
+    plt.savefig(path, format='pdf', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[FIG] Arch comparison          -> {path}")
+
+
+def generate_crypto_core_map(path="crypto_core_map.pdf"):
+    """2x2 core allocation topology: scheduler cores vs. crypto/consensus cores."""
+    fig, ax = plt.subplots(figsize=(3.5, 2.6))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    fig.subplots_adjust(left=0.03, right=0.97, top=0.88, bottom=0.14)
+
+    core_specs = [
+        (0.26, 0.73, "Core 0\nScheduler\nShell Threads",    '#e8e8e8', 'black'),
+        (0.74, 0.73, "Core 1\nScheduler\nShell Threads",    '#e8e8e8', 'black'),
+        (0.26, 0.37, "Core 2\nChaCha20\nCrypto (AVX-512)", '#707070', 'white'),
+        (0.74, 0.37, "Core 3\nConsensus\nNet Pre-Fetch",   '#999999', 'white'),
+    ]
+    bw, bh2 = 0.44, 0.30
+    for cx, cy, label, fc, tc in core_specs:
+        _box(ax, cx, cy, bw, bh2, label, fc=fc, tc=tc)
+
+    # dirty-page flush arrows: top cores -> bottom cores
+    for cx in (0.26, 0.74):
+        _arr(ax, cx, 0.58, cx, 0.52)
+    ax.text(0.50, 0.55, 'dirty-page flush',
+            ha='center', va='center', fontsize=6, color='#444',
+            style='italic',
+            bbox=dict(facecolor='white', edgecolor='none', pad=1, alpha=0.9))
+
+    # NVMe bar
+    _box(ax, 0.50, 0.10, 0.90, 0.10,
+         'NVMe Submission Queue  (Direct DMA)',
+         fc='#444444', tc='white')
+    _arr(ax, 0.26, 0.22, 0.26, 0.15)
+    _arr(ax, 0.74, 0.22, 0.74, 0.15)
+
+    ax.set_title("Core Allocation Topology", fontsize=9, pad=3)
+    plt.savefig(path, format='pdf', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[FIG] Core topology            -> {path}")
+
+
+def generate_roce_pipeline(path="roce_pipeline.pdf"):
+    """Horizontal RoCEv2 pipeline: page-fault handler to remote RAM via rNIC."""
+    fig, ax = plt.subplots(figsize=(7.0, 2.4))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.82, bottom=0.10)
+
+    # Node 1
+    _box(ax, 0.10, 0.70, 0.17, 0.30,
+         "Node 1\nCPU Core\nPage Fault\nHandler", fc='#e4e4e4')
+    _box(ax, 0.10, 0.25, 0.17, 0.28,
+         "Node 1\nrNIC\n(Queue Pair)", fc='#999999', tc='white')
+    _arr(ax, 0.10, 0.55, 0.10, 0.39)
+    ax.text(0.195, 0.47, 'MMIO\nwrite',
+            ha='left', va='center', fontsize=6, color='#444')
+
+    # Network
+    _box(ax, 0.50, 0.25, 0.28, 0.28,
+         "RoCEv2\nEthernet\nNetwork", fc='#d0d0d0', ec='#555555', lw=1.2)
+    _arr(ax, 0.185, 0.25, 0.36, 0.25)
+    ax.text(0.272, 0.36, 'RDMA Read\nRequest',
+            ha='center', va='bottom', fontsize=6, color='#444')
+
+    # Node 2
+    _box(ax, 0.90, 0.70, 0.17, 0.30,
+         "Node 2\nRAM\n(4\u202fKiB frame)", fc='#e4e4e4')
+    _box(ax, 0.90, 0.25, 0.17, 0.28,
+         "Node 2\nrNIC\n(Queue Pair)", fc='#999999', tc='white')
+    _arr(ax, 0.64, 0.25, 0.815, 0.25)
+    ax.text(0.728, 0.36, 'Peer DMA\nTransfer',
+            ha='center', va='bottom', fontsize=6, color='#444')
+    _arr(ax, 0.90, 0.39, 0.90, 0.55)
+    ax.text(0.822, 0.47, 'DMA to\nRAM',
+            ha='right', va='center', fontsize=6, color='#444')
+
+    # CPU bypassed indicator
+    ax.text(0.90, 0.92, '(CPU bypassed)',
+            ha='center', va='center', fontsize=6, color='#888', style='italic')
+
+    ax.set_title(
+        "Proposed AeroSLS RoCEv2 Pipeline: Zero-Copy Remote Page Resolution",
+        fontsize=9, pad=4)
+    plt.savefig(path, format='pdf', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[FIG] RoCEv2 pipeline          -> {path}")
+
+
+def generate_architecture_figures():
+    """Generate all three architecture block diagram PDFs."""
+    generate_arch_comparison()
+    generate_crypto_core_map()
+    generate_roce_pipeline()
+
+
 def render_publication_charts():
     # Load and clean the exported CSV file
     try:
@@ -186,4 +369,5 @@ if __name__ == "__main__":
     if not os.path.exists(csv_path):
         print(f"[INFO] {csv_path} not found — running data simulation.")
         simulate_and_save_data(log_path=log_path, csv_path=csv_path)
+    generate_architecture_figures()
     render_publication_charts()

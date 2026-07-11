@@ -5711,4 +5711,4 @@ uid:1000> shutdown
 
 ```
 
-Our kernel will freeze multi-threaded allocations globally, execute a strict physical frame cache scan sweep loop to write all lingering dirty layers out to the storage device, safely unbind your NVMe registers, and trigger an ACPI out-word signal to port `0x604`.The QEMU emulation grid window will close cleanly, and your complete computing environment, kernel, and user configurations are preserved permanently inside `sls_storage.img` - ready to reload instantly without a single traditional file allocation system required on your next execution loop.
+Our kernel will freeze multi-threaded allocations globally, execute a strict physical frame cache scan sweep loop to write all lingering dirty layers out to the storage device, safely unbind your NVMe registers, and trigger an ACPI out-word signal to port `0x604`. The QEMU emulation grid window will close cleanly, and our complete computing environment, kernel, and user configurations are preserved permanently inside `sls_storage.img` - ready to reload instantly without a single traditional file allocation system required on your next execution loop.
