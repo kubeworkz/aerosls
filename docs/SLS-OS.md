@@ -17,7 +17,7 @@ To avoid bricking your local hardware while testing, you must build within a vir
 
 An SLS operating system must directly interface with the processor to take control of memory mapping.
 
-- **Bootloader:** Write a primary bootloader in Assembly to transition the CPU from its initial 16-bit real mode to 32-bit or 64-bit protected mode.You can streamline this process by referencing the [Limine Bare Bones](https://wiki.osdev.org/Limine_Bare_Bones) guide on the [OSDev Wiki](https://wiki.osdev.org/).
+- **Bootloader:** Write a primary bootloader in Assembly to transition the CPU from its initial 16-bit real mode to 32-bit or 64-bit protected mode. We can streamline this process by referencing the [Limine Bare Bones](https://wiki.osdev.org/Limine_Bare_Bones) guide on the [OSDev Wiki](https://wiki.osdev.org/).
 - **Global Descriptor Table (GDT):** Define a GDT to dictate memory segments for code, heap, and stack space.
 
 ​
