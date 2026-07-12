@@ -3,8 +3,13 @@
 #include "ipv4.h"
 #include "../kernel/kernel_io.h"
 
-// ─── Our MAC address (matches cluster-node1 in Makefile) ─────────────────────
-MACAddr net_my_mac = {{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x01 }};
+// ─── Runtime network identity ─────────────────────────────────────────────────
+// MAC is zero-initialised here; e1000_init() overwrites it from the NIC EEPROM.
+// IP/GW default to the compile-time values from include/config.h; Phase H2
+// (DHCP) will update them at runtime without a recompile.
+MACAddr  net_my_mac;                         // filled by e1000_init()
+IPv4Addr net_my_ip  = KERNEL_STATIC_IP;      // 10.0.2.15 by default
+IPv4Addr net_gw_ip  = KERNEL_STATIC_GW;      // 10.0.2.2  by default
 
 // ─── Static packet buffer pool ───────────────────────────────────────────────
 static uint8_t  pkt_pool[NET_PKT_BUF_COUNT][NET_PKT_BUF_SIZE]

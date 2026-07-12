@@ -50,7 +50,7 @@ struct E1000RxDesc {
 
 extern uint64_t e1000_mmio_base;
 
-void e1000_init(uint64_t mmio_base);
+void e1000_init(uint64_t mmio_base, uint8_t pci_slot);
 void e1000_transmit_packet(void* physical_buffer, uint16_t size);
 void e1000_poll_rx(void);   // drain receive ring; dispatches to net_rx_dispatch
 

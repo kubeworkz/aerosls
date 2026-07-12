@@ -73,7 +73,10 @@ void kernel_main(void) {
     kernel_serial_print("[NET] PCI scanning for e1000...\n");
     {
         extern uint32_t pci_read_config(uint8_t, uint8_t, uint8_t, uint8_t);
-        // Scan bus 0 for e1000 (Intel vendor 8086, device 100e/10d3/107c)
+        // Scan bus 0 for e1000 (Intel vendor 8086, device 100e/10d3/107c).
+        // Store both the MMIO base and the PCI slot so e1000_init can use
+        // the correct slot for Bus Master Enable without another scan.
+        uint8_t found_slot = 0;
         for (int slot = 0; slot < 32; slot++) {
             uint32_t vid_did = pci_read_config(0, (uint8_t)slot, 0, 0x00);
             if (vid_did == 0xFFFFFFFF) continue;
@@ -87,17 +90,20 @@ void kernel_main(void) {
                 if (is64) base |= ((uint64_t)bar1 << 32);
                 if ((bar0 & 0x1) == 0 && base != 0) {
                     e1000_mmio_base = base;
+                    found_slot      = (uint8_t)slot;
+                    kernel_serial_printf("[NET] e1000 at PCI slot %d MMIO 0x%lx\n",
+                                         slot, base);
                     break;
                 }
             }
         }
-    }
-    if (e1000_mmio_base) {
-        e1000_init(e1000_mmio_base);
-        net_init();   // sends gratuitous ARP
-        kernel_serial_print("[NET] e1000 RX/TX rings online.\n");
-    } else {
-        kernel_serial_print("[NET] e1000 not found — network disabled.\n");
+        if (e1000_mmio_base) {
+            e1000_init(e1000_mmio_base, found_slot);
+            net_init();   // sends gratuitous ARP
+            kernel_serial_print("[NET] e1000 RX/TX rings online.\n");
+        } else {
+            kernel_serial_print("[NET] e1000 not found — network disabled.\n");
+        }
     }
 
     kernel_serial_print(

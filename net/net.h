@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../include/config.h"
 
 // ─── MAC / IPv4 types ─────────────────────────────────────────────────────────
 typedef struct { uint8_t b[6]; } __attribute__((packed)) MACAddr;
@@ -89,14 +90,20 @@ static inline uint16_t net_checksum(const void* data, size_t len) {
     return (uint16_t)~sum;
 }
 
-// ─── Our addresses (QEMU user-mode network defaults) ─────────────────────────
-// 10.0.2.15 in network byte order:  0x0F_02_00_0A
-#define NET_MY_IP   0x0F02000AUL
-// Gateway 10.0.2.2:                 0x02_02_00_0A
-#define NET_GW_IP   0x0202000AUL
-#define NET_HTTP_PORT  3000
+// ─── Our addresses ────────────────────────────────────────────────────────────
+// Both are runtime variables so DHCP (Phase H2) can update them without a
+// recompile.  Defaults come from include/config.h (KERNEL_STATIC_IP / _GW).
+// Use NET_MY_IP / NET_GW_IP as before — they now expand to the variables.
+extern IPv4Addr net_my_ip;
+extern IPv4Addr net_gw_ip;
+#define NET_MY_IP   (net_my_ip)
+#define NET_GW_IP   (net_gw_ip)
 
-extern MACAddr net_my_mac;
+// Runtime MAC address — filled from the NIC's EEPROM by e1000_init().
+// Zero until e1000_init() has run.
+extern MACAddr  net_my_mac;
+
+#define NET_HTTP_PORT  KERNEL_HTTP_PORT
 
 // ─── Packet buffer pool ───────────────────────────────────────────────────────
 #define NET_PKT_BUF_COUNT 64

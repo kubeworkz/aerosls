@@ -44,6 +44,7 @@ static uint16_t tx_tail = 0;
 // rx_tail starts at RING_SIZE-1 so the first poll checks descriptor 0.
 // The e1000 fills from RDH=0; we give it back descriptors as we consume them.
 static uint16_t rx_tail = E1000_RING_SIZE - 1;
+static uint8_t  e1000_pci_slot = 0;   // set by e1000_init(), used for PCI config writes
 
 static inline volatile uint32_t* reg(uint32_t off) {
     return (volatile uint32_t*)(e1000_mmio_base + off);
@@ -61,16 +62,18 @@ static inline uint32_t mmio_read32(uint64_t addr) {
     return v;
 }
 
-void e1000_init(uint64_t mmio_base) {
-    e1000_mmio_base = mmio_base;
+void e1000_init(uint64_t mmio_base, uint8_t pci_slot) {
+    e1000_mmio_base  = mmio_base;
+    e1000_pci_slot   = pci_slot;
 
-    // Enable PCI Memory Space and Bus Master (slot 4 = e1000 in QEMU with NVMe)
+    // Enable PCI Memory Space (bit 1) and Bus Master (bit 2) for this NIC.
+    // Using the dynamically detected slot so the same binary works on any hardware.
     {
         extern uint32_t pci_read_config(uint8_t, uint8_t, uint8_t, uint8_t);
         extern void pci_write_config(uint8_t, uint8_t, uint8_t, uint8_t, uint32_t);
-        uint32_t cmd = pci_read_config(0, 4, 0, 0x04);
+        uint32_t cmd = pci_read_config(0, pci_slot, 0, 0x04);
         cmd |= (1U << 1) | (1U << 2);
-        pci_write_config(0, 4, 0, 0x04, cmd);
+        pci_write_config(0, pci_slot, 0, 0x04, cmd);
     }
 
     // Mark the MMIO BAR0 region as uncacheable via MTRR.
@@ -101,15 +104,34 @@ void e1000_init(uint64_t mmio_base) {
                           | (0x0FU << 4)   /* CT  */
                           | (0x040U << 12); /* COLD */
 
-    // ── RX ring ──────────────────────────────────────────────────────────────
-    kernel_serial_print("[E1000] init: setting up RX ring\n");
+    // ── MAC from EEPROM ──────────────────────────────────────────────────────
+    // RAL0/RAH0 are loaded from the NIC's EEPROM at power-on (or from the MAC
+    // specified on the QEMU command line).  Read them now — before we write
+    // anything to those registers — to populate net_my_mac for the ARP/IP stack.
+    {
+        uint32_t ral = *reg(E1000_REG_RAL0);
+        uint32_t rah = *reg(E1000_REG_RAH0);
+        net_my_mac.b[0] = (uint8_t)(ral);
+        net_my_mac.b[1] = (uint8_t)(ral >>  8);
+        net_my_mac.b[2] = (uint8_t)(ral >> 16);
+        net_my_mac.b[3] = (uint8_t)(ral >> 24);
+        net_my_mac.b[4] = (uint8_t)(rah);
+        net_my_mac.b[5] = (uint8_t)(rah >>  8);
+        kernel_serial_printf("[E1000] MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+            net_my_mac.b[0], net_my_mac.b[1], net_my_mac.b[2],
+            net_my_mac.b[3], net_my_mac.b[4], net_my_mac.b[5]);
+    }
 
-    // Program our MAC into the receive address filter (slot 0)
-    // MAC = 52:54:00:12:34:01 → RAL = 0x12005452, RAH = 0x80000134
-    // (bytes in memory order: [0]=52 [1]=54 [2]=00 [3]=12 → LE dword=0x12005452)
-    // ([4]=34 [5]=01 → upper 16b of RAH=0x0134, plus AV bit 31)
-    *reg(E1000_REG_RAL0) = 0x12005452U;
-    *reg(E1000_REG_RAH0) = 0x80000134U; // AV bit (31) set
+    // ── RX ring ──────────────────────────────────────────────────────────────
+    // Program the EEPROM MAC back into the receive address filter (slot 0),
+    // setting the Address Valid (AV) bit so the NIC accepts frames for our MAC.
+    *reg(E1000_REG_RAL0) = ((uint32_t)net_my_mac.b[0])
+                         | ((uint32_t)net_my_mac.b[1] <<  8)
+                         | ((uint32_t)net_my_mac.b[2] << 16)
+                         | ((uint32_t)net_my_mac.b[3] << 24);
+    *reg(E1000_REG_RAH0) = ((uint32_t)net_my_mac.b[4])
+                         | ((uint32_t)net_my_mac.b[5] <<  8)
+                         | (1U << 31); // AV = Address Valid
 
     // Also enable unicast+multicast promiscuous so we never miss a packet
     // RCTL_UPE=bit3, RCTL_MPE=bit4 — harmless in addition to BAM
