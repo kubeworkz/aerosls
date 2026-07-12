@@ -2,6 +2,7 @@
 #include "permissions.h"
 #include "../kernel/syscall_dispatch.h"
 #include "../kernel/object_catalog.h"
+#include "../kernel/secure_api.h"
 #include "../kernel/transaction.h"
 #include "../kernel/microkernel.h"
 #include "../kernel/ipc.h"

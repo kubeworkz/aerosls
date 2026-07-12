@@ -36,6 +36,13 @@ void kernel_serial_print(const char* s) {
     }
 }
 
+void kernel_serial_print_hex64(uint64_t v) {
+    static const char hex[] = "0123456789abcdef";
+    char buf[17];
+    buf[16] = 0;
+    for (int i = 15; i >= 0; i--) { buf[i] = hex[v & 0xF]; v >>= 4; }
+    kernel_serial_print(buf);
+}
 // ─── Minimal printf ───────────────────────────────────────────────────────────
 // Handles: %s %-Ns %c %d %u %ld %lu %x %lx %016lx %04x %02x %Nx %%
 // Does NOT require libc — uses GCC __builtin_va_* (available in -ffreestanding)

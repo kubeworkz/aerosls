@@ -1,0 +1,22 @@
+# Build artifacts
+*.bin
+*.iso
+*.o
+*.img
+*.elf
+*.so
+*.a
+
+# Runtime logs
+*.log
+
+# Compiler plugin
+compiler/*.so
+compiler/*.dylib
+
+# Disk images
+sls_storage.img
+sls_storage_rv64.img
+
+# Packet captures
+*.pcap

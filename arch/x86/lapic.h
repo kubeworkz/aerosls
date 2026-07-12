@@ -3,12 +3,15 @@
 
 #include <stdint.h>
 
-#define LAPIC_BASE_VIRT    0xFFFFFFFF40000000ULL
+#define LAPIC_BASE_VIRT    0xFEE00000ULL
 
 #define LAPIC_REG_ID       0x0020
 #define LAPIC_REG_EOI      0x00B0
 #define LAPIC_REG_SPURIOUS 0x00F0
 #define LAPIC_REG_LVT_TMR  0x0320
+#define LAPIC_REG_TICR     0x0380   // Timer Initial Count Register
+#define LAPIC_REG_TCCR     0x0390   // Timer Current Count Register
+#define LAPIC_REG_TDCR     0x03E0   // Timer Divide Configuration Register
 #define LAPIC_REG_ICR_LOW  0x0300
 #define LAPIC_REG_ICR_HIGH 0x0310
 

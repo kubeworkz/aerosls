@@ -175,15 +175,20 @@ static void register_service(const char* name, uint32_t pid, uint16_t port,
     s->base_addr       = base_addr;
     s->state           = SVC_STATE_ONLINE;
     s->reboot_count    = 0;
-    s->task_id         = pid;  // task_id mirrors PID for kernel services
+    s->task_id         = pid;
     s->latency_us_x100 = latency_us_x100;
     s->msgs_processed  = 0;
     s->active          = 1;
     s->handler         = handler;
 
-    kernel_serial_printf(
-        "[MK] Service ONLINE: %-22s PID: %u | ADDR: 0x%016lx\n",
-        name, pid, base_addr);
+    kernel_serial_print("[MK] Service ONLINE: ");
+    kernel_serial_print(name);
+    kernel_serial_print("  PID=");
+    // print pid as decimal without variadic
+    { uint32_t v=pid; char b[12]; int l=0;
+      if(!v){b[l++]='0';}else{while(v){b[l++]=(char)('0'+v%10);v/=10;}}
+      for(int k=l-1;k>=0;k--) kernel_serial_putchar(b[k]); }
+    kernel_serial_print("\n");
 }
 
 // ─── microkernel_init ─────────────────────────────────────────────────────────
@@ -192,6 +197,8 @@ void microkernel_init(void) {
         "[MK] Microkernel booted successfully. Ring-0 primitives online.\n");
 
     ipc_init();
+
+    kernel_serial_print("[MK] registering services\n");
 
     // Register the five services in PID order (matches simulator)
     register_service("VirtualMemoryMgr",    101, IPC_PORT_VMMGR,

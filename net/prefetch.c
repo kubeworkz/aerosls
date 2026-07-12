@@ -1,6 +1,6 @@
 #include "prefetch.h"
 #include "dspp.h"
-#include "io_prio.h"
+#include "../drivers/io_prio.h"
 #include "e1000.h"
 
 extern uint64_t* walk_page_tables(uint64_t virtual_address);

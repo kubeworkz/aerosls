@@ -16,7 +16,12 @@ void tcp_init(void) {
 // ─── TCP pseudo-header checksum ───────────────────────────────────────────────
 uint16_t tcp_checksum(IPv4Addr src, IPv4Addr dst,
                        struct TCPHeader* seg, uint16_t seg_len) {
-    // Pseudo-header: src(4) + dst(4) + zero(1) + proto(1) + tcp_len(2)
+    // Build the 12-byte TCP pseudo-header in a byte array (network byte order
+    // = big-endian).  Then sum ALL 16-bit words identically — by reading each
+    // pair of bytes as (bytes[0]<<8 | bytes[1]) to get the network-order value.
+    // The TCP segment bytes are ALSO in network byte order in memory, so we sum
+    // them the same way.  Mixing the two summation methods (pseudo big-endian,
+    // segment little-endian native) was the previous bug.
     uint8_t pseudo[12];
     pseudo[0]=(uint8_t)(src);      pseudo[1]=(uint8_t)(src>>8);
     pseudo[2]=(uint8_t)(src>>16);  pseudo[3]=(uint8_t)(src>>24);
@@ -27,16 +32,25 @@ uint16_t tcp_checksum(IPv4Addr src, IPv4Addr dst,
     pseudo[10]= (uint8_t)(seg_len >> 8);
     pseudo[11]= (uint8_t)(seg_len & 0xFF);
 
-    // Sum pseudo-header + segment
     uint32_t sum = 0;
+
+    // Sum pseudo-header (big-endian byte pairs)
     for (int i = 0; i < 12; i += 2)
-        sum += (uint32_t)(((uint16_t)pseudo[i] << 8) | pseudo[i+1]);
-    const uint16_t* p = (const uint16_t*)seg;
+        sum += ((uint32_t)pseudo[i] << 8) | pseudo[i + 1];
+
+    // Sum TCP segment (also big-endian byte pairs for consistency)
+    const uint8_t* p = (const uint8_t*)seg;
     size_t rem = seg_len;
-    while (rem > 1) { sum += *p++; rem -= 2; }
-    if (rem) sum += *(const uint8_t*)p;
+    while (rem > 1) {
+        sum += ((uint32_t)p[0] << 8) | p[1];
+        p += 2; rem -= 2;
+    }
+    if (rem) sum += (uint32_t)p[0] << 8;
+
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)~sum;
+    // Result is in big-endian logical form; htons converts to the byte order
+    // needed when storing directly into the network header field (uint16_t).
+    return htons((uint16_t)~sum);
 }
 
 // ─── Build and send a TCP segment ─────────────────────────────────────────────
@@ -127,6 +141,16 @@ void tcp_handle_segment(struct IPv4Header* ip, struct TCPHeader* seg,
 
     if (!found) return;
     struct TCPConn* c = found;
+
+    // ── SYN retransmit for a pending SYN_RECEIVED connection ─────────────────
+    // Peer retransmitted SYN (our SYN-ACK was lost — likely because ARP for
+    // the remote IP wasn't resolved when we first tried to send it).
+    // Now that ARP should be resolved, resend the SYN-ACK.
+    if (c->state == TCP_SYN_RECEIVED &&
+        (flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
+        tcp_send_flags(c, TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0);
+        return;
+    }
 
     // ── ACK of our SYN-ACK: connection established ────────────────────────────
     if (c->state == TCP_SYN_RECEIVED &&

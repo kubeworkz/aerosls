@@ -26,7 +26,16 @@ void boot_application_processors(uint8_t target_apic_id) {
     uint64_t current_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
     *(volatile uint32_t*)(0x07000) = (uint32_t)current_cr3;
-    *(volatile uint64_t*)(0x07010) = (uint64_t)&gdt_ptr; // Passes structural pointer base
+
+    // The trampoline does `lgdt [0x07010]` which reads the struct CONTENTS
+    // at 0x07010, NOT a pointer to the struct.  Copy the 10-byte GDTPointer
+    // struct directly into the handshake area.
+    {
+        volatile uint8_t* dst = (volatile uint8_t*)0x07010;
+        const uint8_t* src = (const uint8_t*)&gdt_ptr;
+        for (int gi = 0; gi < 10; gi++) dst[gi] = src[gi];
+    }
+
     *(volatile uint64_t*)(0x07020) = (uint64_t)ap_kernel_main;
 
     // Allocate an isolated 4KB stack space for the incoming AP thread

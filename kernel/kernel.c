@@ -65,19 +65,39 @@ void kernel_main(void) {
     microkernel_init();
 
     // ── 6. Boot Application Processor (Core 1) ─────────────────────────
+    kernel_serial_print("[BSP] Waking Core 1...\n");
     boot_application_processors(1);
+    kernel_serial_print("[BSP] Core 1 online.\n");
 
-    // ── 7. Network stack  ───────────────────────────────────────────────────────
-    // e1000_mmio_base is discovered by the PCI scan in a real boot;
-    // for QEMU user-mode networking the default BAR0 is 0xFEBC0000.
-    // Leave init conditional so the kernel boots without a NIC too.
+    // ── 7. Network stack (PCI scan → e1000 init → gratuitous ARP) ─────────────
+    kernel_serial_print("[NET] PCI scanning for e1000...\n");
+    {
+        extern uint32_t pci_read_config(uint8_t, uint8_t, uint8_t, uint8_t);
+        // Scan bus 0 for e1000 (Intel vendor 8086, device 100e/10d3/107c)
+        for (int slot = 0; slot < 32; slot++) {
+            uint32_t vid_did = pci_read_config(0, (uint8_t)slot, 0, 0x00);
+            if (vid_did == 0xFFFFFFFF) continue;
+            uint32_t vid = vid_did & 0xFFFF;
+            uint32_t did = (vid_did >> 16) & 0xFFFF;
+            if (vid == 0x8086 && (did == 0x100e || did == 0x10d3 || did == 0x107c)) {
+                uint32_t bar0 = pci_read_config(0, (uint8_t)slot, 0, 0x10);
+                uint32_t bar1 = pci_read_config(0, (uint8_t)slot, 0, 0x14);
+                int is64 = ((bar0 & 0x06) == 0x04);
+                uint64_t base = (uint64_t)(bar0 & 0xFFFFFFF0);
+                if (is64) base |= ((uint64_t)bar1 << 32);
+                if ((bar0 & 0x1) == 0 && base != 0) {
+                    e1000_mmio_base = base;
+                    break;
+                }
+            }
+        }
+    }
     if (e1000_mmio_base) {
         e1000_init(e1000_mmio_base);
-        net_init();   // also sends gratuitous ARP
+        net_init();   // sends gratuitous ARP
         kernel_serial_print("[NET] e1000 RX/TX rings online.\n");
     } else {
-        kernel_serial_print("[NET] No e1000 base address — network disabled.\n"
-                            "      Set e1000_mmio_base before boot for HTTP API.\n");
+        kernel_serial_print("[NET] e1000 not found — network disabled.\n");
     }
 
     kernel_serial_print(

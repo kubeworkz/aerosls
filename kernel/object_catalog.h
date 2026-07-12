@@ -61,8 +61,8 @@ static inline const char* tier_name(SLSStorageTier t) {
 }
 
 // ─── Catalog Entry ────────────────────────────────────────────────────────────
-#define CATALOG_MAX_OBJECTS  256
-#define OBJECT_NAME_LEN       64
+#define CATALOG_MAX_OBJECTS   64   // reduced from 256 for BSS budget
+#define OBJECT_NAME_LEN        64
 
 struct SLSObjectEntry {
     uint64_t       object_id;               // FNV-1a hash of name

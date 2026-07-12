@@ -11,6 +11,7 @@ void serial_init(void);
 
 void kernel_serial_putchar(char c);
 void kernel_serial_print(const char* s);
+void kernel_serial_print_hex64(uint64_t v);
 void kernel_serial_printf(const char* fmt, ...);
 
 // Blocking read of one line from COM1 into buf (max 255 chars + NUL)

@@ -192,6 +192,10 @@ static void http_respond(int conn, int status, const char* ctype,
     if (blen > 0) tcp_send(conn, body, (uint16_t)blen);
 }
 
+// Forward declarations for helpers defined in the Phase F section below
+static int json_str(const char* json, const char* key, char* out, int max);
+static int json_int(const char* json, const char* key);
+
 // ─── POST /auth/token — issue a bearer token for an email ─────────────────────
 static int api_auth_token(const char* body, char* buf, int max) {
     if (!body) {
@@ -324,7 +328,7 @@ static void http_options(int conn) {
                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                     "Content-Length: 0\r\n\r\n";
-    tcp_send(conn, h, (uint16_t)__builtin_strlen(h));
+    tcp_send(conn, h, (uint16_t)strlen(h));
 }
 
 // ─── GET /api/objects ─────────────────────────────────────────────────────────
@@ -358,10 +362,10 @@ static int api_object_detail(const char* name, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         struct SLSObjectEntry* e = &object_catalog[i];
-        if (!e->active || !__builtin_strcmp(e->name, name)) {
+        if (!e->active || !strcmp(e->name, name)) {
             if (!e->active) continue;
         }
-        if (__builtin_strcmp(e->name, name) != 0) continue;
+        if (strcmp(e->name, name) != 0) continue;
         jb_obj_open(&j, 0);
         jb_str(&j, "name",  e->name);           jb_putc(&j, ',');
         jb_str(&j, "type",  obj_type_name(e->type)); jb_putc(&j, ',');
@@ -381,7 +385,7 @@ static int api_object_detail(const char* name, char* buf, int max) {
             const char* tname = "STRING";
             for (uint32_t s = 0; s < SCHEMA_MAX_FIELDS; s++) {
                 if (object_schemas[i].fields[s].active &&
-                    !__builtin_strcmp(object_schemas[i].fields[s].key,
+                    !strcmp(object_schemas[i].fields[s].key,
                                       rec->fields[f].key)) {
                     tname = field_type_name(object_schemas[i].fields[s].type);
                     break;
@@ -565,8 +569,8 @@ static int api_record_post(const char* body, char* buf, int max) {
     json_str(body, "value", req.value, RECORD_VAL_LEN);
     json_str(body, "op",    op, 16);
     uint64_t rc = 1;
-    if (!__builtin_strcmp(op, "update")) rc = sys_sls_update(&req);
-    else if (!__builtin_strcmp(op, "delete")) rc = sys_sls_delete(&req);
+    if (!strcmp(op, "update")) rc = sys_sls_update(&req);
+    else if (!strcmp(op, "delete")) rc = sys_sls_delete(&req);
     else rc = sys_sls_insert(&req);
     jb_obj_open(&j,0);
     jb_str(&j, "ok", rc==0 ? "true" : "false");
@@ -579,14 +583,14 @@ static int api_tx_post(const char* op, char* buf, int max) {
     uint32_t tid = kernel_get_current_thread_id();
     uint64_t rc = 1;
     jb_obj_open(&j, 0);
-    if (!__builtin_strcmp(op, "begin")) {
+    if (!strcmp(op, "begin")) {
         uint64_t tx = sys_sls_tx_begin(tid);
         jb_str(&j, "ok", tx ? "true" : "false"); jb_putc(&j, ',');
         jb_uint(&j, "tx_id", tx);
-    } else if (!__builtin_strcmp(op, "commit")) {
+    } else if (!strcmp(op, "commit")) {
         rc = sys_sls_tx_commit(tid);
         jb_str(&j, "ok", rc==0 ? "true" : "false");
-    } else if (!__builtin_strcmp(op, "rollback")) {
+    } else if (!strcmp(op, "rollback")) {
         rc = sys_sls_tx_rollback(tid);
         jb_str(&j, "ok", rc==0 ? "true" : "false");
     } else {
@@ -626,19 +630,19 @@ static void http_route(int conn, char* req) {
 
     // ── GET routes ────────────────────────────────────────────────────────────
     if (!is_post) {
-        if (!__builtin_strcmp(path, "/auth/verify")) {
+        if (!strcmp(path, "/auth/verify")) {
             blen = api_auth_verify(req, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/health")) {
+        if (!strcmp(path, "/api/health")) {
             blen = api_health(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/scan")) {
+        if (!strcmp(path, "/api/scan")) {
             blen = api_scan(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/objects")) {
+        if (!strcmp(path, "/api/objects")) {
             blen = api_objects(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
@@ -646,23 +650,23 @@ static void http_route(int conn, char* req) {
             blen = api_object_detail(path + 13, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/services")) {
+        if (!strcmp(path, "/api/services")) {
             blen = api_services_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/wal")) {
+        if (!strcmp(path, "/api/wal")) {
             blen = api_wal_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/tiers")) {
+        if (!strcmp(path, "/api/tiers")) {
             blen = api_tiers_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/processes")) {
+        if (!strcmp(path, "/api/processes")) {
             blen = api_processes_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/query")) {
+        if (!strcmp(path, "/api/query")) {
             char q[256] = "show all";
             url_param(qs, "q", q, (int)sizeof(q));
             blen = api_query_json(q, resp_body, (int)sizeof(resp_body));
@@ -678,7 +682,7 @@ static void http_route(int conn, char* req) {
 
     // ── POST routes ───────────────────────────────────────────────────────────
     if (is_post) {        // POST /auth/token — public, no auth required
-        if (!__builtin_strcmp(path, "/auth/token")) {
+        if (!strcmp(path, "/auth/token")) {
             blen = api_auth_token(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
@@ -689,9 +693,9 @@ static void http_route(int conn, char* req) {
         if (req_role == ROLE_GUEST) {
             const char* e401 = "{\"error\":\"Unauthorized — include Authorization: Bearer <token>\"}";
             http_respond(conn, 401, "application/json", e401,
-                         (int)__builtin_strlen(e401));
+                         (int)strlen(e401));
             return;
-        }        if (!__builtin_strcmp(path, "/api/valloc")) {
+        }        if (!strcmp(path, "/api/valloc")) {
             // Pass the authenticated uid as the object owner
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
             // Inject the authenticated uid into the valloc request
@@ -699,19 +703,19 @@ static void http_route(int conn, char* req) {
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/record")) {
+        if (!strcmp(path, "/api/record")) {
             blen = api_record_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/tx/begin")) {
+        if (!strcmp(path, "/api/tx/begin")) {
             blen = api_tx_post("begin", resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/tx/commit")) {
+        if (!strcmp(path, "/api/tx/commit")) {
             blen = api_tx_post("commit", resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        if (!__builtin_strcmp(path, "/api/tx/rollback")) {
+        if (!strcmp(path, "/api/tx/rollback")) {
             blen = api_tx_post("rollback", resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
@@ -719,7 +723,7 @@ static void http_route(int conn, char* req) {
 
     // 404 fallback
     const char* e404 = "{\"error\":\"not found\"}";
-    http_respond(conn, 404, "application/json", e404, (int)__builtin_strlen(e404));
+    http_respond(conn, 404, "application/json", e404, (int)strlen(e404));
 }
 
 // ─── HTTP server main loop ────────────────────────────────────────────────────
@@ -739,11 +743,14 @@ void http_server_run(void) {
     for (;;) {
         int conn = tcp_accept(listen_fd);
         if (conn < 0) continue;
+        kernel_serial_print("[HTTP] connection accepted\n");
 
         int rlen = tcp_recv(conn, req_buf, (uint16_t)(sizeof(req_buf) - 1));
+        kernel_serial_print("[HTTP] request received\n");
         if (rlen > 0) {
             req_buf[rlen] = '\0';
             http_route(conn, req_buf);
+            kernel_serial_print("[HTTP] response sent\n");
         }
         tcp_close(conn);
     }

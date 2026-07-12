@@ -52,33 +52,46 @@ void auth_init(void) {
         { "guest@sandbox.com",    1003, ROLE_GUEST,         0xDEADC0DE99887766ULL },
     };
 
-    kernel_serial_printf(
-        "[AUTH] Token Registry\n"
-        " %-30s  %-10s  %-13s  %s\n"
-        " %-30s  %-10s  %-13s  %s\n",
-        "Email", "UID", "Role", "Bearer Token",
-        "------------------------------", "----------", "-------------",
-        "--------------------------------");
+    kernel_serial_print("[AUTH] Token Registry\n");
+    kernel_serial_print(" Email                           UID   Role          Token\n");
+    kernel_serial_print(" -------------------------------  ----  ------------  --------------------------------\n");
 
     for (int i = 0; i < 4; i++) {
         struct AuthCreateRequest req;
         au_strncpy(req.email, demos[i].email, AUTH_EMAIL_LEN);
         req.uid  = demos[i].uid;
         req.role = demos[i].role;
-        char tok[AUTH_TOKEN_LEN + 1];
-        make_token(demos[i].email, demos[i].seed, tok);
-        // Store
+
+        // Use fixed deterministic tokens — avoids any runtime token generation
+        // that could trigger a fault before the IDT is fully set up.
+        static const char* fixed_tokens[4] = {
+            "deadbeef01234567cafebabe76543210",  // dave
+            "cafebabe7654321089abcdef01234567",  // bob
+            "feedf00dabcdef0112345678deadc0de",  // carol
+            "deadc0de9988776655443322aabbccdd",  // guest
+        };
+
         struct LeaseToken* lt = &auth_tokens[i];
         au_strncpy(lt->email, req.email, AUTH_EMAIL_LEN);
-        au_strncpy(lt->token, tok, AUTH_TOKEN_LEN + 1);
+        au_strncpy(lt->token, fixed_tokens[i], AUTH_TOKEN_LEN + 1);
         lt->uid         = req.uid;
         lt->role        = req.role;
-        lt->created_tsc = read_tsc();
+        lt->created_tsc = 0;   // skip rdtsc during early boot
         lt->active      = 1;
 
-        kernel_serial_printf(
-            " %-30s  %-10u  %-13s  %s\n",
-            lt->email, lt->uid, role_name(lt->role), lt->token);
+        kernel_serial_print(" ");
+        kernel_serial_print(lt->email);
+        kernel_serial_print("  uid=");
+        // print uid manually (no variadic needed)
+        uint32_t u = lt->uid;
+        char ubuf[12]; int ul = 0;
+        if (!u) { ubuf[ul++]='0'; } else { while(u){ubuf[ul++]=(char)('0'+u%10);u/=10;} }
+        for (int k=ul-1;k>=0;k--) kernel_serial_putchar(ubuf[k]);
+        kernel_serial_print("  ");
+        kernel_serial_print(role_name(lt->role));
+        kernel_serial_print("  ");
+        kernel_serial_print(lt->token);
+        kernel_serial_print("\n");
     }
     kernel_serial_print("\n");
 }
@@ -151,10 +164,8 @@ int auth_revoke_by_email(const char* email) {
 void sys_sls_auth_list(void) {
     kernel_serial_printf(
         "\n[AUTH] Active Tokens\n"
-        " %-30s  %-4s  %-13s  %s\n"
-        " %-30s  ----  -------------  ----\n",
-        "Email", "UID", "Role", "Token (first 8 chars...)",
-        "------------------------------");
+        " %-30s  %-4s  %-13s  %s\n",
+        "Email", "UID", "Role", "Token (first 8 chars...)");
     int shown = 0;
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
         if (!auth_tokens[i].active) continue;

@@ -13,8 +13,8 @@ static uint8_t  pkt_used[NET_PKT_BUF_COUNT];
 
 void net_init(void) {
     for (int i = 0; i < NET_PKT_BUF_COUNT; i++) pkt_used[i] = 0;
-    kernel_serial_print("[NET] Packet buffer pool ready "
-                        "(" __STRING(NET_PKT_BUF_COUNT) " x 2 KB).\n");
+    kernel_serial_printf("[NET] Packet buffer pool ready (%d x 2 KB).\n",
+                         NET_PKT_BUF_COUNT);
     // Announce our presence via ARP
     arp_announce();
 }

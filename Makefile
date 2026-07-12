@@ -14,11 +14,12 @@ ALLOC_PLUGIN    = libSLSAllocationPassV2.so
 # --- x86_64 Toolchain ---
 X86_CC      = x86_64-elf-gcc
 X86_LD      = x86_64-elf-ld
-X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=kernel -mno-red-zone -msse -mavx512f
-X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib
+X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -msse -fno-pie -fno-pic -fno-tree-vectorize
+X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
 X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm
 X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c arch/x86/lazy_fpu.c \
+              arch/x86/walk_page_tables_x86.c \
               kernel/lockfree_map.c drivers/ahci.c drivers/pci.c drivers/nvme.c drivers/nvme_admin.c \
               kernel/frame_pool.c kernel/dashboard.c user/shell.c kernel/smp.c drivers/io_prio.c \
               net/consensus.c net/prefetch.c kernel/secure_api.c kernel/pte_migrate.c \
@@ -32,7 +33,8 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c a
               kernel/loader.c \
               kernel/webapp.c \
               kernel/net_event.c \
-              kernel/auth.c
+              kernel/auth.c \
+              kernel/stubs.c
 
 X86_OBJECTS = $(X86_ASM_SRC:.asm=.x86.o) $(X86_C_SRC:.c=.x86.o) arch/x86/trampoline.o
 X86_BIN     = my_sls_kernel.bin
@@ -85,8 +87,12 @@ x86-iso: $(X86_BIN)
 
 x86-run: x86-iso
 	@if [ ! -f sls_storage.img ]; then qemu-img create -f raw sls_storage.img 10G; fi
-	qemu-system-x86_64 -cdrom $(X86_ISO) -drive id=disk,file=sls_storage.img,if=none,format=raw \
-		-device nvme,drive=disk,serial=slsdev0 -m 4G -smp 4 -boot d -serial file:sls_kernel_debug.log
+	qemu-system-x86_64 -cdrom $(X86_ISO) \
+		-drive id=disk,file=sls_storage.img,if=none,format=raw \
+		-device nvme,drive=disk,serial=slsdev0 \
+		-netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:01 \
+		-m 4G -smp 4 -boot d -serial file:sls_kernel_debug.log
 
 %.rv.o: %.S
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@

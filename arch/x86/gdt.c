@@ -2,7 +2,7 @@
 
 // Define a 7-entry GDT (Null, KCode, KData, UData, UCode, and 2 slots for the 16-byte TSS)
 static struct GDTEntry gdt[7];
-static struct GDTPointer gdt_ptr;
+struct GDTPointer gdt_ptr;   // exported for smp.c trampoline handshake
 static struct TaskStateSegment tss;
 
 // Static kernel stack dedicated strictly for handling exceptions/syscalls from user space

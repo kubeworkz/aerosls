@@ -54,7 +54,7 @@ struct IPCMessage {
 };
 
 // ─── Per-Port Circular Queue ──────────────────────────────────────────────────
-#define IPC_QUEUE_DEPTH 32
+#define IPC_QUEUE_DEPTH 8   // reduced from 32 for BSS budget
 
 struct IPCQueue {
     struct IPCMessage msgs[IPC_QUEUE_DEPTH];

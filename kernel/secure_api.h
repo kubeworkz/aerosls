@@ -1,3 +1,6 @@
+#pragma once
+#include <stdint.h>
+
 #define SYS_SLS_SECURE_SEAL 109
 
 struct SLSSealRequest {

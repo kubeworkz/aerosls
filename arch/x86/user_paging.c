@@ -1,5 +1,6 @@
 #include "user_paging.h"
 #include "../../kernel/kernel_io.h"
+#include <stddef.h>
 
 extern void* allocate_physical_ram_frame(void);
 

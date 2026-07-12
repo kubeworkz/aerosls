@@ -7,7 +7,7 @@
 // ─── WAL On-Disk Sector ───────────────────────────────────────────────────────
 // Matches the boot logger trace: Sector 2048 = Write-Ahead Journal
 #define WAL_DISK_SECTOR_BASE   2048
-#define WAL_MAX_ENTRIES        4096
+#define WAL_MAX_ENTRIES        512     // reduced from 4096 for BSS budget
 #define WAL_MAGIC              0x534C5357414C454EULL  // "SLSWALN"
 
 // ─── WAL Entry States ─────────────────────────────────────────────────────────
