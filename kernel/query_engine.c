@@ -308,7 +308,11 @@ static void handle_general(void) {
                          object_catalog_count);
 }
 
-// ─── sys_sls_query — main entry point ─────────────────────────────────────────
+// ─── query_domain_for — public wrapper used by the HTTP REST API ──────────────
+QueryDomain query_domain_for(const char* text) { return route_query(text); }
+
+// ─── sys_sls_query — main entry point ────────────────────────────────────────
+QueryDomain query_domain_for(const char* text) { return route_query(text); }─
 void sys_sls_query(const char* text) {
     QueryDomain domain = route_query(text);
 

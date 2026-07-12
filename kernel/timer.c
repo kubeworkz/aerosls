@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "../arch/x86/idt.h"
 #include "../arch/x86/lapic.h"
+#include "net_event.h"   /* Phase E: timer-driven network poll */
 
 // Global monotonic tick counter incremented by the timer IRQ handler
 volatile uint64_t kernel_tick_counter = 0;
@@ -8,6 +9,12 @@ volatile uint64_t kernel_tick_counter = 0;
 // Called from the IRQ0 assembly stub on each timer interrupt
 void timer_irq_handler(void) {
     kernel_tick_counter++;
+
+    // Phase E: drain the e1000 receive ring on every tick (~100 Hz).
+    // Threads blocking in net_event_hlt_wait() wake here and recheck
+    // their TCP receive buffer without any busy-spin.
+    net_poll_tick();
+
     lapic_write(LAPIC_REG_EOI, 0);
 }
 

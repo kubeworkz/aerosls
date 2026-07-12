@@ -7,6 +7,10 @@
 #include "../kernel/ipc.h"
 #include "../kernel/tier_mgr.h"
 #include "../kernel/query_engine.h"
+#include "../kernel/process.h"
+#include "../kernel/loader.h"
+#include "../kernel/webapp.h"
+#include "../kernel/auth.h"
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -90,7 +94,23 @@ static void print_help(void) {
         "  tx rollback                    discard staged writes\n"
         "  wal dump                       print WAL entries\n"
         "  wal recover                    replay WAL after simulated crash\n"
-        "  -- AI Query Interface (Phase 7) --\n"
+        "  -- Token Auth (Phase G) --\n"
+        "  auth create <email> <uid> <role>  create a bearer token\n"
+        "  auth list                         show token registry\n"
+        "  auth revoke <email>               revoke all tokens for email\n"
+        "  -- Web App Assets (Phase D) --\n"
+        "  webapp set <obj> <path> <html>  store an asset (e.g. /hello.html)\n"
+        "  webapp append <obj> <path> <s>  append content to an existing asset\n"
+        "  webapp list [<obj>]             list all assets (use * for all)\n"
+        "  -- Service Loader (Phase C) --\n"
+        "  demo <name>                   load built-in AeroSLS test binary\n"
+        "  upload <name> <hex>           write hex-encoded bytes to binary store\n"
+        "  load <name>                   spawn process from uploaded binary\n"
+        "  loader list                   show all binaries in the store\n"
+        "  -- Process Isolation (Phase B) --\n"
+        "  proc list                     show all Ring-3 processes\n"
+        "  proc spawn <object>           create a process from SERVICE_PROCESS object\n"
+        "  proc kill <pid>               terminate a running process\n"
         "  query <natural language text>  cognitive direct object scan\n"
         "  query scan                     export full catalog as JSON manifest\n"
         "  tier list                     show each object's current storage tier\n"
@@ -416,6 +436,141 @@ void sls_shell_loop(void) {
         // ── Phase 3: wal recover ──────────────────────────────────────────────
         else if (sh_eq(input_buffer, "wal recover")) {
             sys_sls_tx_recover();
+        }
+
+        // ── Phase G: auth create <email> <uid> <role> ──────────────────────────
+        else if (sh_starts(input_buffer, "auth create ")) {
+            const char* p = input_buffer + 12;
+            struct AuthCreateRequest req;
+            size_t elen = 0;
+            while (p[elen] && p[elen] != ' ') elen++;
+            sh_copy(req.email, p, elen+1 < AUTH_EMAIL_LEN ? (int)(elen+1) : AUTH_EMAIL_LEN);
+            p = sh_next(p);
+            req.uid = sh_atoi(p);
+            p = sh_next(p);
+            if      (sh_eq(p, "SYSTEM_KERNEL")) req.role = ROLE_SYSTEM_KERNEL;
+            else if (sh_eq(p, "DB_ADMIN"))      req.role = ROLE_DB_ADMIN;
+            else if (sh_eq(p, "APP_USER"))      req.role = ROLE_APP_USER;
+            else                                req.role = ROLE_GUEST;
+            char tok[AUTH_TOKEN_LEN + 1];
+            if (auth_create_token(&req, tok))
+                kernel_serial_printf("[AUTH] Token: %s\n", tok);
+        }
+
+        // ── Phase G: auth list ───────────────────────────────────────────
+        else if (sh_eq(input_buffer, "auth list")) {
+            do_syscall(SYS_SLS_AUTH_LIST, 0);
+        }
+
+        // ── Phase G: auth revoke <email> ───────────────────────────────────
+        else if (sh_starts(input_buffer, "auth revoke ")) {
+            do_syscall(SYS_SLS_AUTH_REVOKE, (void*)(input_buffer + 12));
+        }
+
+        // ── Phase D: webapp set / append ──────────────────────────────────────
+        else if (sh_starts(input_buffer, "webapp set ") ||
+                 sh_starts(input_buffer, "webapp append ")) {
+            int append = sh_starts(input_buffer, "webapp append ");
+            const char* p = input_buffer + (append ? 14 : 11);
+            struct WebAppSetRequest req;
+            req.append = (uint8_t)append;
+            // parse obj name
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.obj_name, p,
+                    nlen+1 < OBJECT_NAME_LEN ? (int)(nlen+1) : OBJECT_NAME_LEN);
+            p = sh_next(p);
+            // parse path (URL)
+            size_t plen = 0;
+            while (p[plen] && p[plen] != ' ') plen++;
+            sh_copy(req.path, p,
+                    plen+1 < WEBAPP_PATH_LEN ? (int)(plen+1) : WEBAPP_PATH_LEN);
+            p = sh_next(p);
+            // rest of line = content
+            size_t clen = 0;
+            while (p[clen]) clen++;
+            if (clen >= WEBAPP_CONTENT_LEN) clen = WEBAPP_CONTENT_LEN - 1;
+            sh_copy(req.content, p, (int)(clen + 1));
+            req.content_len = (uint32_t)clen;
+            do_syscall(SYS_SLS_WEBAPP_SET, &req);
+        }
+
+        // ── Phase D: webapp list [<obj>] ───────────────────────────────────
+        else if (sh_starts(input_buffer, "webapp list")) {
+            const char* arg = sh_eq(input_buffer, "webapp list")
+                              ? "*" : input_buffer + 12;
+            do_syscall(SYS_SLS_WEBAPP_LIST, (void*)arg);
+        }
+
+        // ── Phase C: demo <name> ─────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "demo ")) {
+            const char* name = input_buffer + 5;
+            // Write the built-in demo binary to the store, then spawn
+            struct SLSUploadRequest req;
+            sh_copy(req.object_name, name, PROC_NAME_LEN);
+            req.byte_offset = 0;
+            req.chunk_len   = aerosls_demo_bin_size < UPLOAD_CHUNK_MAX
+                              ? aerosls_demo_bin_size : UPLOAD_CHUNK_MAX;
+            for (uint32_t i = 0; i < req.chunk_len; i++)
+                req.chunk[i] = aerosls_demo_bin[i];
+            req.is_last     = 1;
+            do_syscall(SYS_SLS_UPLOAD_BINARY, &req);
+            do_syscall(SYS_SLS_LOAD, (void*)name);
+        }
+
+        // ── Phase C: upload <name> <hex> ─────────────────────────────────────
+        else if (sh_starts(input_buffer, "upload ")) {
+            const char* p = input_buffer + 7;
+            struct SLSUploadRequest req;
+            // parse name
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.object_name, p,
+                    nlen + 1 < PROC_NAME_LEN ? nlen + 1 : PROC_NAME_LEN);
+            p = sh_next(p);
+            // decode hex string into chunk[]
+            req.byte_offset = 0;
+            req.chunk_len   = 0;
+            while (p[0] && p[1] && req.chunk_len < UPLOAD_CHUNK_MAX) {
+                // each byte = two hex chars
+                uint8_t hi = (uint8_t)(p[0] >= 'a' ? p[0]-'a'+10 :
+                                       p[0] >= 'A' ? p[0]-'A'+10 : p[0]-'0');
+                uint8_t lo = (uint8_t)(p[1] >= 'a' ? p[1]-'a'+10 :
+                                       p[1] >= 'A' ? p[1]-'A'+10 : p[1]-'0');
+                req.chunk[req.chunk_len++] = (uint8_t)((hi << 4) | lo);
+                p += 2;
+            }
+            req.is_last = 1;
+            do_syscall(SYS_SLS_UPLOAD_BINARY, &req);
+        }
+
+        // ── Phase C: load <name> ──────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "load ")) {
+            do_syscall(SYS_SLS_LOAD, (void*)(input_buffer + 5));
+        }
+
+        // ── Phase C: loader list ───────────────────────────────────────────
+        else if (sh_eq(input_buffer, "loader list")) {
+            do_syscall(172, 0);
+        }
+
+        // ── Phase B: proc list ───────────────────────────────────────────────
+        else if (sh_eq(input_buffer, "proc list")) {
+            do_syscall(SYS_SLS_PROC_LIST, 0);
+        }
+
+        // ── Phase B: proc spawn <object_name> ────────────────────────────────
+        else if (sh_starts(input_buffer, "proc spawn ")) {
+            struct ProcCreateRequest req;
+            sh_copy(req.object_name, input_buffer + 11, PROC_NAME_LEN);
+            req.owner_uid = current_session_uid;
+            do_syscall(SYS_SLS_PROC_CREATE, &req);
+        }
+
+        // ── Phase B: proc kill <pid> ─────────────────────────────────────────
+        else if (sh_starts(input_buffer, "proc kill ")) {
+            uint32_t pid = sh_atoi(input_buffer + 10);
+            do_syscall(SYS_SLS_PROC_KILL, (void*)(uintptr_t)pid);
         }
 
         // ── Phase 7: query scan (structured JSON manifest) ────────────────────

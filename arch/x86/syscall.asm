@@ -1,5 +1,6 @@
 bits 64
 global syscall_entry_stub
+global enter_user_process
 extern sys_sls_allocate
 extern sys_sls_valloc
 extern sys_sls_vfree

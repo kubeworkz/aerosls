@@ -5,6 +5,10 @@
 #include "ipc.h"
 #include "tier_mgr.h"
 #include "query_engine.h"
+#include "process.h"
+#include "loader.h"
+#include "../kernel/webapp.h"
+#include "../kernel/auth.h"
 #include "../kernel/secure_api.h"
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
@@ -123,6 +127,37 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_query((const char*)arg); return 0;
     case SYS_SLS_QUERY_SCAN:
         sys_sls_query_scan(); return 0;
+
+    // ── Phase B: Processes (160–162) ───────────────────────────────────────
+    case SYS_SLS_PROC_CREATE:
+        return process_create((struct ProcCreateRequest*)arg);
+    case SYS_SLS_PROC_KILL:
+        process_kill((uint32_t)(uintptr_t)arg); return 0;
+    case SYS_SLS_PROC_LIST:
+        sys_sls_proc_list(); return 0;
+
+    // ── Phase C: Loader (170–171) ───────────────────────────────────────
+    case SYS_SLS_LOAD:
+        return sys_sls_load((const char*)arg,
+                            kernel_get_current_thread_id());
+    case SYS_SLS_UPLOAD_BINARY:
+        return sys_sls_upload_binary((struct SLSUploadRequest*)arg);
+    case 172: /* loader_list */
+        loader_list(); return 0;
+
+    // ── Phase D: Web App (180–182) ───────────────────────────────────────
+    case SYS_SLS_WEBAPP_SET:
+        return sys_sls_webapp_set((struct WebAppSetRequest*)arg);
+    case SYS_SLS_WEBAPP_LIST:
+        sys_sls_webapp_list(arg ? (const char*)arg : "*"); return 0;
+
+    // ── Phase G: Token Auth (190–192) ─────────────────────────────────────
+    case SYS_SLS_AUTH_CREATE:
+        return auth_create_token((struct AuthCreateRequest*)arg, 0);
+    case SYS_SLS_AUTH_LIST:
+        sys_sls_auth_list(); return 0;
+    case SYS_SLS_AUTH_REVOKE:
+        return auth_revoke_by_email((const char*)arg);
 
     default:
         return 0;

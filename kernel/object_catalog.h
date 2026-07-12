@@ -6,10 +6,12 @@
 
 // ─── Object Types ─────────────────────────────────────────────────────────────
 typedef enum {
-    OBJ_TYPE_SYSTEM_METADATA = 0,
-    OBJ_TYPE_DB_TABLE        = 1,
-    OBJ_TYPE_DB_INDEX        = 2,
-    OBJ_TYPE_HEAP_BLOB       = 3,
+    OBJ_TYPE_SYSTEM_METADATA  = 0,
+    OBJ_TYPE_DB_TABLE         = 1,
+    OBJ_TYPE_DB_INDEX         = 2,
+    OBJ_TYPE_HEAP_BLOB        = 3,
+    OBJ_TYPE_SERVICE_PROCESS  = 4,  // Ring-3 executable + stack; scheduled by kernel
+    OBJ_TYPE_WEB_APP          = 5,  // HTML/JS/CSS assets stored as key-value records
 } SLSObjectType;
 
 // ─── Storage Tiers ────────────────────────────────────────────────────────────
@@ -43,6 +45,8 @@ static inline const char* obj_type_name(SLSObjectType t) {
         case OBJ_TYPE_DB_TABLE:        return "DB_TABLE";
         case OBJ_TYPE_DB_INDEX:        return "DB_INDEX";
         case OBJ_TYPE_HEAP_BLOB:       return "HEAP_BLOB";
+        case OBJ_TYPE_SERVICE_PROCESS: return "SERVICE_PROCESS";
+        case OBJ_TYPE_WEB_APP:         return "WEB_APP";
         default:                       return "UNKNOWN";
     }
 }
@@ -178,6 +182,9 @@ struct SLSGrantRequest {
 #define SYS_SLS_DELETE      143
 #define SYS_SLS_SCHEMA_SET  144
 #define SYS_SLS_SCHEMA_SHOW 145
+#define SYS_SLS_PROC_CREATE 160
+#define SYS_SLS_PROC_KILL   161
+#define SYS_SLS_PROC_LIST   162
 
 // ─── Public Catalog API ───────────────────────────────────────────────────────
 extern struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];

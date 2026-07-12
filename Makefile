@@ -17,7 +17,7 @@ X86_LD      = x86_64-elf-ld
 X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=kernel -mno-red-zone -msse -mavx512f
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib
 
-X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm
+X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm
 X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c arch/x86/lazy_fpu.c \
               kernel/lockfree_map.c drivers/ahci.c drivers/pci.c drivers/nvme.c drivers/nvme_admin.c \
               kernel/frame_pool.c kernel/dashboard.c user/shell.c kernel/smp.c drivers/io_prio.c \
@@ -26,7 +26,13 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c a
               kernel/kernel_io.c kernel/syscall_dispatch.c \
               kernel/object_catalog.c kernel/transaction.c \
               kernel/ipc.c kernel/microkernel.c \
-              kernel/tier_mgr.c kernel/query_engine.c
+              kernel/tier_mgr.c kernel/query_engine.c \
+              net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/e1000.c \
+              kernel/process.c arch/x86/user_paging.c \
+              kernel/loader.c \
+              kernel/webapp.c \
+              kernel/net_event.c \
+              kernel/auth.c
 
 X86_OBJECTS = $(X86_ASM_SRC:.asm=.x86.o) $(X86_C_SRC:.c=.x86.o) arch/x86/trampoline.o
 X86_BIN     = my_sls_kernel.bin
