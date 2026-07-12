@@ -8,7 +8,8 @@
 enum TaskState {
     TASK_READY,
     TASK_RUNNING,
-    TASK_BLOCKED
+    TASK_BLOCKED,
+    TASK_CRASHED    // service fault-isolation: task halted but descriptor preserved
 };
 
 struct TaskContext {
@@ -31,5 +32,6 @@ void kernel_yield_scheduler(void);
 void block_thread_on_object(uint32_t thread_id, uint64_t vaddr);
 void wakeup_threads_blocked_on_object(uint64_t vaddr);
 uint32_t kernel_get_current_thread_id(void);
+uint32_t spawn_kernel_thread(void (*fn)(void), uint32_t task_id);
 
 #endif

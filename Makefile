@@ -21,7 +21,12 @@ X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm 
 X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c arch/x86/lazy_fpu.c \
               kernel/lockfree_map.c drivers/ahci.c drivers/pci.c drivers/nvme.c drivers/nvme_admin.c \
               kernel/frame_pool.c kernel/dashboard.c user/shell.c kernel/smp.c drivers/io_prio.c \
-              net/consensus.c net/prefetch.c kernel/secure_api.c kernel/pte_migrate.c
+              net/consensus.c net/prefetch.c kernel/secure_api.c kernel/pte_migrate.c \
+              kernel/timer.c kernel/flush_daemon.c \
+              kernel/kernel_io.c kernel/syscall_dispatch.c \
+              kernel/object_catalog.c kernel/transaction.c \
+              kernel/ipc.c kernel/microkernel.c \
+              kernel/tier_mgr.c kernel/query_engine.c
 
 X86_OBJECTS = $(X86_ASM_SRC:.asm=.x86.o) $(X86_C_SRC:.c=.x86.o) arch/x86/trampoline.o
 X86_BIN     = my_sls_kernel.bin

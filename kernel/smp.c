@@ -1,10 +1,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../arch/x86/lapic.h"
+#include "microkernel.h"
 
 extern void* allocate_physical_ram_frame(void);
-extern void ap_kernel_main(void); // Defined in our C main code tree
-extern void sls_flush_daemon_loop(void);
+extern void ap_kernel_main(void);
+extern void flush_daemon_tick(void);
 extern void kernel_sleep_ticks(uint32_t ticks);
 
 extern uint8_t trampoline_start;
@@ -56,11 +57,15 @@ void boot_application_processors(uint8_t target_apic_id) {
 // Executed concurrently by Core 1 and Core 2 when they leave the trampoline
 void ap_kernel_main(void) {
     // Reload local core segment references
-    init_local_apic_registers(); 
-    
+    init_local_apic_registers();
+
     // Atomically signal the BSP that this core has initialized successfully
     __atomic_store_n(&ap_bootstrap_lock, 1, __ATOMIC_SEQ_CST);
 
-    // Enter our thread scheduler round-robin execution processing loops
-    sls_flush_daemon_loop();
+    // Combined loop: dirty-page flush + microkernel service bus poll
+    while (1) {
+        flush_daemon_tick();
+        microkernel_service_poll();
+        kernel_sleep_ticks(10);
+    }
 }

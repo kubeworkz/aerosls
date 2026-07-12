@@ -45,14 +45,18 @@ void flush_dirty_sls_region(uint64_t start_vaddr, size_t size_in_bytes) {
     }
 }
 
+// Single iteration: scan all objects and flush dirty pages to storage
+void flush_daemon_tick(void) {
+    for (size_t i = 0; i < total_active_sls_objects; i++) {
+        struct SLSObject obj = global_sls_object_table[i];
+        flush_dirty_sls_region(obj.start_virtual_address, obj.size_in_bytes);
+    }
+}
+
 // Background daemon loop executed by each AP after boot
 void sls_flush_daemon_loop(void) {
     while (1) {
-        for (size_t i = 0; i < total_active_sls_objects; i++) {
-            struct SLSObject obj = global_sls_object_table[i];
-            flush_dirty_sls_region(obj.start_virtual_address, obj.size_in_bytes);
-        }
-
+        flush_daemon_tick();
         kernel_sleep_ticks(100);
     }
 }

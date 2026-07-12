@@ -4,6 +4,26 @@ static struct Task task_table[MAX_TASKS];
 static uint32_t current_task_idx = 0;
 static uint32_t total_tasks = 0;
 
+void init_scheduler(void) {
+    task_table[0].id    = 0;
+    task_table[0].state = TASK_RUNNING;
+    total_tasks         = 1;
+    current_task_idx    = 0;
+}
+
+// Register a new kernel-mode thread in the task table.
+// The thread's entry point fn() will be called by the AP service poll loop.
+uint32_t spawn_kernel_thread(void (*fn)(void), uint32_t task_id) {
+    (void)fn; // fn is invoked directly by the service loop, not via context switch
+    if (total_tasks >= MAX_TASKS) return 0;
+    uint32_t slot = total_tasks++;
+    task_table[slot].id               = task_id;
+    task_table[slot].state            = TASK_READY;
+    task_table[slot].blocked_on_vaddr = 0;
+    task_table[slot].rsp              = 0;
+    return task_id;
+}
+
 uint32_t kernel_get_current_thread_id(void) {
     return task_table[current_task_idx].id;
 }
