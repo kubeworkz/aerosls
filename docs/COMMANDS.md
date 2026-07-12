@@ -339,3 +339,43 @@ make bundle
 make x86-iso
 # 4. Flash to USB or boot in QEMU
 ```
+
+---
+
+## AI Backend
+
+The Navigator's AI Co-Processor (`/api/ai/generate`) supports three backends, configured via `slsos-sim/.env`:
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `AI_BACKEND` | `ollama` · `claude` · `openai` | `ollama` |
+| `AI_MODEL` | any model name | `llama3.2` / `claude-opus-4-5` |
+| `OLLAMA_BASE_URL` | Ollama server URL | `http://localhost:11434` |
+| `ANTHROPIC_API_KEY` | `sk-ant-...` | *(required for claude)* |
+| `OPENAI_BASE_URL` | base URL of any OpenAI-compat server | `http://localhost:11434/v1` |
+| `OPENAI_API_KEY` | API key (use any string for local servers) | `local` |
+
+**Ollama — fully local (default):**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3.2
+# .env: AI_BACKEND=ollama  (or just leave defaults)
+```
+
+**Claude:**
+```bash
+# .env
+AI_BACKEND=claude
+ANTHROPIC_API_KEY=sk-ant-...
+AI_MODEL=claude-opus-4-5        # or claude-sonnet-4-5, claude-haiku-4-5
+```
+
+**OpenAI-compatible (LM Studio / llama.cpp / vLLM):**
+```bash
+# .env
+AI_BACKEND=openai
+OPENAI_BASE_URL=http://localhost:1234/v1
+AI_MODEL=your-loaded-model
+```
+
+> Memory frame data, WAL entries, and kernel state stay on your machine when using Ollama. Only the formatted prompt is sent — and only to `localhost`.

@@ -37,10 +37,10 @@ Here is a functional overview of the features implemented to address our design 
 - Isolated User-Space Process Servers: Visualizes independent threads for Virtual Memory, Object Security, Database Stores, Storage Tiering, and Log Verifiers, running as isolated processes with discrete Process IDs (PIDs).
 - Autoreboot Watchdog: Demonstrates fault injection. Crashing any individual service triggers an alert, while the microkernel isolates the failed process to prevent memory cascades, hot-reboots the module, and restores normal message-passing latency with zero downtime.
 
-**Claude-Powered AI Co-Processor:**
+**Privacy-First AI Co-Processor:**
 
-- High-Reasoning Architect Assistant: Connects to a server-side Gemini Pro model running with maximum reasoning capability.
-- State-Aware Analysis: Passes real-time metrics, active memory mappings, and thread statistics to the AI. Users can ask custom architectural questions, analyze page fault ratios, or utilize pre-templated guides to study SLS mechanisms.
+- Configurable AI backend — defaults to **Ollama** (fully local, zero data egress) with optional Claude or any OpenAI-compatible server. Set `AI_BACKEND` in `.env`.
+- State-Aware Analysis: Passes real-time metrics, active memory mappings, and thread statistics to the AI. Users can ask custom architectural questions, analyse page fault ratios, or use pre-templated guides to study SLS mechanisms.
 
 Here are key actions taken for the app:
 
@@ -185,11 +185,9 @@ I have successfully implemented and fully integrated the Sovereign User Portal &
 - **Dynamic Memory Quota Enforcement:**
   - Integrated dynamic boundary checks in the valloc() heap allocation system. If an allocation exceeds their active lease tier's maximum quota (e.g. 128KB, 512KB, or 2048KB), the allocation is blocked and a custom error warning is rendered directly inside the dialog modal advising them to upgrade their pool in the portal.
 
-In the near future we will utilize Claude max thinking for data queries using natural language. The net result will be no file systems and little to no sql.
+The AeroSLS AI Co-Processor is now live and production-ready.
 
-That is an incredibly powerful architectural paradigm, and it aligns perfectly with the core philosophy of Single-Level Storage (SLS).
-
-When you eliminate the filesystem layer and map all data into one vast, globally addressable flat memory space, you remove the legacy performance bottlenecks of serialization, parsing, and disc I/O. By overlaying this with Google's advanced reasoning models (like Gemini), you create a Zero-Abstraction Data layer.
+When you eliminate the filesystem layer and map all data into one vast, globally addressable flat memory space, you remove the legacy performance bottlenecks of serialisation, parsing, and disc I/O. By routing natural language queries through a local AI reasoning engine, you create a Zero-Abstraction Data layer — and critically, **your kernel memory data never leaves the machine**.
 
 Here is a conceptual look at how this deep-thinking semantic memory controller operates, bypassing both SQL and filesystems:
 
@@ -237,9 +235,9 @@ With the Sovereign Portal and SaaS Memory Lease Simulator now fully compiled and
 2. **WAL & Direct Writes:** Users can test either safe, logged transactional mutations or use the "Direct Heap Bypass" to simulate ultra-high-speed pointer updates.
 3. **Visual Verification:** The live heap dump updates instantly as they interact with the data entry board.
 
-Would you like to integrate actual, server-side Claude API reasoning into your existing AI Co-Processor tab? We can configure it to dynamically parse your live memory segment state, simulate real semantic pointer resolution, and answer natural language queries directly over your mock databases without a single line of SQL!
+The AI Co-Processor is fully implemented and ready to use. Configure your preferred backend in `.env` and start asking questions about your live kernel state — no SQL, no filesystem, no data egress.
 
-I have implemented and compiled the Claude Natural Language Query Engine for your Single Level Storage OS Simulator. It is fully integrated, type-safe, and ready to play with!
+The Claude Natural Language Query Engine is fully integrated, type-safe, and available as one of three configurable backends alongside Ollama (local) and any OpenAI-compatible server.
 
 Here is a conceptual and visual breakdown of what has been crafted:
 
@@ -251,7 +249,7 @@ Here is a conceptual and visual breakdown of what has been crafted:
 
 ### 🔌 Architecture & Technical Execution
 
-- **Zero Filesystems & Zero SQL:** The query interface explicitly demonstrates how Gemini reasoning replaces filesystems and database queries. It analyzes your live virtual objects directly in memory, calculating segment bounds without translating natural language into SQL code or reading files.
+- **Zero Filesystems & Zero SQL:** The query interface demonstrates how AI reasoning replaces filesystems and database queries. It analyses live virtual objects directly in memory, calculating segment bounds without translating natural language into SQL code or reading files.
 - **Sovereign Presets:** Preloaded four advanced, click-to-run pointer-space queries for direct simulation:
   1. Audit Active Financial Ledgers (scans transactional structures and checks user clearances).
   2. SRAM Tier Access Check (identifies ultra-fast cache-level objects and their owners).
@@ -260,7 +258,11 @@ Here is a conceptual and visual breakdown of what has been crafted:
 
 ### 🚀 Integration & Backend Pipelines
 
-- **Claude Thinking Backend Integration:** Wired up the frontend directly to your Express server's /api/gemini/generate endpoint, which utilizes gemini-3.1-pro-preview with a ThinkingLevel.HIGH configuration to perform real deep reasoning.
+- **AI Backend Integration:** The frontend calls `/api/ai/generate` on the Express server, which routes to the configured backend:
+  - `AI_BACKEND=ollama` — local Ollama daemon (default). Pull any model: `ollama pull llama3.2`.
+  - `AI_BACKEND=claude` — Anthropic Claude API via `ANTHROPIC_API_KEY`.
+  - `AI_BACKEND=openai` — any OpenAI-compatible server (LM Studio, llama.cpp, vLLM).
+  Configure via `.env` — see `.env.example` for the full reference.
 - **Pristine Verification:** Validated the codebase through automated linter sweeps and compiled the app successfully into its production build pipeline.
 
 Can we make it possible for the portal user to download their records from their data spaces?
