@@ -46,6 +46,7 @@ make x86-iso
 This produces `sls_operating_system.iso` — a UEFI + BIOS bootable GRUB2 disc image with the kernel binary and the full Navigator SPA **embedded inside the kernel itself**.
 
 > **Rebuilding the Navigator UI:** if you change `slsos-sim/src/`, regenerate the embedded bundle and rebuild the ISO:
+>
 > ```bash
 > make bundle   # runs npm build in slsos-sim/, regenerates kernel/webapp_bundle.c
 > make x86-iso
@@ -125,7 +126,8 @@ http://localhost:3001/
 
 The **Address Space Map**, **WAL Log**, **Service Monitor**, and **Query Console** tabs all read live data from the running kernel.
 
-> **Alternatively** — the `slsos-sim` repo runs a Node.js development server that proxies the same API routes to the kernel and adds the Gemini AI query panel:
+> **Alternatively** — the `slsos-sim` repo runs a Node.js development server that proxies the same API routes to the kernel and adds an AI query panel:
+>
 > ```bash
 > cd slsos-sim && npm install && npm run dev -- --port 3000 --host
 > ```
