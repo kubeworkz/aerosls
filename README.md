@@ -4,7 +4,7 @@
 
 ## **1. Build & Run Guide**
 
-This section covers everything needed to compile AeroSLS, boot it in QEMU, and connect the Navigator simulator to the live kernel's REST API.
+This section covers everything needed to compile AeroSLS, boot it in QEMU, and connect the Navigator to the live kernel's REST API.
 
 ### Prerequisites
 
@@ -14,11 +14,13 @@ Install the following tools on Ubuntu/Debian:
 sudo apt update
 sudo apt install -y \
     nasm \
-    grub-pc-bin grub-common xorriso \
+    grub-pc-bin grub-common grub-efi-amd64-bin xorriso \
     qemu-system-x86 \
     gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu \
-    build-essential
+    build-essential python3
 ```
+
+> `grub-efi-amd64-bin` is required so `grub-mkrescue` produces a **UEFI + BIOS hybrid ISO** that boots on any modern machine without enabling CSM.
 
 The cross-compiler is expected as `x86_64-elf-gcc`. If your distro provides it as `x86_64-linux-gnu-gcc` instead, create a symlink:
 
@@ -41,7 +43,13 @@ cd slsos
 make x86-iso
 ```
 
-This produces `sls_operating_system.iso` (a bootable GRUB2 disc image containing the kernel binary).
+This produces `sls_operating_system.iso` — a UEFI + BIOS bootable GRUB2 disc image with the kernel binary and the full Navigator SPA **embedded inside the kernel itself**.
+
+> **Rebuilding the Navigator UI:** if you change `slsos-sim/src/`, regenerate the embedded bundle and rebuild the ISO:
+> ```bash
+> make bundle   # runs npm build in slsos-sim/, regenerates kernel/webapp_bundle.c
+> make x86-iso
+> ```
 
 ### Step 2: Create a persistent storage image (first run only)
 
@@ -69,12 +77,17 @@ Or use the Makefile shortcut (interactive, with display):
 make x86-run
 ```
 
-The kernel boots in ~2 seconds. The serial log is written to `sls_kernel_debug.log`. A clean boot looks like:
+The kernel boots in ~3 seconds. The serial log is written to `sls_kernel_debug.log`. A clean boot looks like:
 
 ```
-[BSP] LAPIC and IRQ0 timer online.
-[MK] Service ONLINE: VirtualMemoryMgr   PID=101
-[MK] Service ONLINE: NativeDbStoreMgr   PID=103
+[HW] CPU GenuineIntel family=6 model=158
+[HW] Memory map:
+[HW]   0000000000100000 +   1023 MiB  RAM
+[HW]   ...
+[HW] Usable RAM: 1023 MiB
+[E1000] MAC 52:54:00:12:34:01
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2
 [NET] e1000 RX/TX rings online.
 [HTTP] Listening on port 3000.
 ```
@@ -102,19 +115,20 @@ curl -X POST http://localhost:3001/auth/token \
      -d '{"email":"dave@gridworkz.com","password":"any"}'
 ```
 
-### Step 5: Connect the Navigator Simulator
+### Step 5: Open the Navigator
 
-The simulator is a React/TypeScript SPA in `/home/ubuntu/slsos-sim` (separate repo). Once the kernel is running, start the simulator and it will proxy all OS API calls to the live kernel:
+The Navigator SPA is **embedded in the kernel** and served directly at port 3000. Open it in a browser:
 
-```bash
-cd slsos-sim
-npm install
-npm run dev -- --port 3000 --host
+```
+http://localhost:3001/
 ```
 
-Open `http://localhost:3000` in a browser. The simulator's **Address Space Map**, **WAL Log**, **Service Monitor**, and **Query Console** tabs all read live data from the running kernel.
+The **Address Space Map**, **WAL Log**, **Service Monitor**, and **Query Console** tabs all read live data from the running kernel.
 
-> The simulator proxy is configured in `server.ts` via `http-proxy-middleware`. Routes `/api/scan`, `/api/services`, `/api/tiers`, `/api/wal`, `/api/processes`, `/api/query`, `/api/valloc`, `/api/record`, `/api/tx`, `/auth/token`, and `/auth/verify` are forwarded to `http://localhost:3001`. All other routes (`/api/health`, `/api/v1/*`, Gemini AI) are handled by the simulator itself.
+> **Alternatively** — the `slsos-sim` repo runs a Node.js development server that proxies the same API routes to the kernel and adds the Gemini AI query panel:
+> ```bash
+> cd slsos-sim && npm install && npm run dev -- --port 3000 --host
+> ```
 
 ### Step 6: Stop the kernel
 
@@ -124,7 +138,53 @@ pkill -f qemu-system-x86_64
 
 ---
 
-## **2. API Reference**
+## **2. Real Hardware**
+
+AeroSLS boots on any x86-64 machine with an Intel e1000/e1000e NIC (available as a ~$10 PCIe card, or built into many server boards).
+
+### Flash to USB
+
+```bash
+sudo dd if=sls_operating_system.iso of=/dev/sdX bs=4M status=progress
+```
+
+Replace `/dev/sdX` with your USB drive (`lsblk` to identify it). The ISO is a hybrid image — it boots from both **USB** and **optical disc** in both **UEFI native** and **BIOS/CSM** modes.
+
+### Boot
+
+Select the USB from your machine's boot menu (usually F12 or Del at POST). The GRUB menu appears with a 3-second timeout. No keyboard input needed — the default entry boots automatically.
+
+### What the serial log shows on real hardware
+
+Connect a 3.3V USB-UART adapter to COM1 (pin 3 = TX out, pin 5 = GND) and open a terminal at 38400 baud. You will see:
+
+```
+[HW] CPU GenuineIntel family=6 model=158   ← your actual CPU
+[HW] Memory map:
+[HW]   0000000000100000 +  16384 MiB  RAM  ← real detected RAM
+[HW]   ...
+[E1000] MAC aa:bb:cc:dd:ee:ff              ← read from NIC EEPROM
+[DHCP] Bound: 192.168.1.42  gw 192.168.1.1 ← IP from your router
+[HTTP] Listening on port 3000.
+```
+
+Then open `http://192.168.1.42:3000/` in a browser on any machine on the same network.
+
+### Configuring a static IP (optional)
+
+If you want a fixed IP instead of DHCP, edit `include/config.h` before building:
+
+```c
+// include/config.h
+#define KERNEL_STATIC_IP  0x6401A8C0UL  // 192.168.1.100
+#define KERNEL_STATIC_GW  0x0101A8C0UL  // 192.168.1.1
+```
+
+The DHCP client still runs first and wins if a server responds. The static values are the fallback if DHCP times out (~3 seconds).
+
+---
+
+## **3. API Reference**
 
 
 | Method | Endpoint              | Description                                |
