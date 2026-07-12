@@ -44,7 +44,7 @@ Here is a functional overview of the features implemented to address our design 
 
 Here are key actions taken for the app:
 
-### 🎨 Design & Layout Overhaul
+### 🎨 Design & Layoutl
 
 We created a visual overlay on the SlsMemoryMap that flashes red when an L4 archive access triggers a page fault, adding a brief animation that demonstrates the 'page swap' process from archival storage back to DRAM.
 
