@@ -195,7 +195,7 @@ uint64_t sys_sls_webapp_set(struct WebAppSetRequest* req) {
 // ─── sys_sls_webapp_list ──────────────────────────────────────────────────────
 void sys_sls_webapp_list(const char* obj_name) {
     int all = wa_streq(obj_name, "*") || obj_name[0] == '\0';
-    kernel_serial_print(
+    kernel_serial_printf(
         "\n[WEBAPP] Asset Store\n"
         " %-20s  %-28s  %-30s  %s\n"
         " --------------------  ----------------------------  "

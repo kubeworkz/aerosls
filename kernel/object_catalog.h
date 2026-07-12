@@ -106,6 +106,11 @@ static inline const char* field_type_name(SLSFieldType t) {
 
 #define SCHEMA_MAX_FIELDS  32   // same depth as RECORD_MAX_FIELDS
 
+// ─── Typed Record Fields (key-value store inside a DB_TABLE object) ─────────────
+#define RECORD_MAX_FIELDS  32
+#define RECORD_KEY_LEN     48
+#define RECORD_VAL_LEN     64
+
 struct SLSSchemaField {
     char         key[RECORD_KEY_LEN];
     SLSFieldType type;
@@ -117,11 +122,6 @@ struct SLSObjectSchema {
     uint32_t              field_count;
     struct SLSSchemaField fields[SCHEMA_MAX_FIELDS];
 };
-
-// ─── Typed Record Fields (key-value store inside a DB_TABLE object) ─────────────
-#define RECORD_MAX_FIELDS  32
-#define RECORD_KEY_LEN     48
-#define RECORD_VAL_LEN     64
 
 struct SLSRecordField {
     char    key[RECORD_KEY_LEN];

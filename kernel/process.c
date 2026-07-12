@@ -141,7 +141,7 @@ void process_kill(uint32_t pid) {
 
 // ─── sys_sls_proc_list ────────────────────────────────────────────────────────
 void sys_sls_proc_list(void) {
-    kernel_serial_print(
+    kernel_serial_printf(
         "\n[PROC] Process Table\n"
         " %-5s  %-24s  %-10s  %-4s  %s\n"
         " -----  ------------------------  ----------  ----  ------------------\n",

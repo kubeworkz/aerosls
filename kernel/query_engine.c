@@ -3,6 +3,7 @@
 #include "tier_mgr.h"
 #include "microkernel.h"
 #include "ipc.h"
+#include "../user/permissions.h"
 
 // ─── String helpers ───────────────────────────────────────────────────────────
 static size_t qe_strlen(const char* s) { size_t n=0; while(s[n]) n++; return n; }
@@ -312,7 +313,6 @@ static void handle_general(void) {
 QueryDomain query_domain_for(const char* text) { return route_query(text); }
 
 // ─── sys_sls_query — main entry point ────────────────────────────────────────
-QueryDomain query_domain_for(const char* text) { return route_query(text); }─
 void sys_sls_query(const char* text) {
     QueryDomain domain = route_query(text);
 
