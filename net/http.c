@@ -8,6 +8,7 @@
 #include "../kernel/tier_mgr.h"
 #include "../kernel/webapp.h"
 #include "../kernel/bundle.h"
+#include "../kernel/journal.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -591,7 +592,8 @@ static int api_record_post(const char* body, char* buf, int max) {
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSRecordRequest req;
     char op[16] = "insert";
-    json_str(body, "obj",   req.name,  OBJECT_NAME_LEN);
+    json_str(body, "object", req.name, OBJECT_NAME_LEN);
+    if (!req.name[0]) json_str(body, "obj", req.name, OBJECT_NAME_LEN);
     json_str(body, "key",   req.key,   RECORD_KEY_LEN);
     json_str(body, "value", req.value, RECORD_VAL_LEN);
     json_str(body, "op",    op, 16);
@@ -699,6 +701,35 @@ static void http_route(int conn, char* req) {
             blen = api_query_json(q, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── GET /api/journal/<name>[?since=N] ─────────────────────────────────
+        if (str_find(path, "/api/journal/") == path) {
+            const char* jname = path + 13;
+            uint64_t since = 0;
+            char since_s[32] = "0";
+            url_param(qs, "since", since_s, (int)sizeof(since_s));
+            const char* sp = since_s;
+            while (*sp >= '0' && *sp <= '9') { since = since * 10 + (uint64_t)(*sp - '0'); sp++; }
+            blen = journal_to_json(jname, since, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/journals")) {
+            // List all active journal attachments
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_putc(&j, '[');
+            int first = 1;
+            for (uint32_t i = 0; i < journal_attachment_count; i++) {
+                if (!journal_attachments[i].active) continue;
+                if (!first) jb_putc(&j, ',');
+                first = 0;
+                jb_obj_open(&j, 0);
+                jb_str(&j, "journal", journal_attachments[i].journal_name); jb_putc(&j, ',');
+                jb_str(&j, "table",   journal_attachments[i].object_name);
+                jb_obj_close(&j);
+            }
+            jb_putc(&j, ']');
+            j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
         // Compiled-in bundle (full Navigator SPA) — checked first
         const struct BundleAsset* ba = bundle_find(path);
         if (ba) {
@@ -728,16 +759,30 @@ static void http_route(int conn, char* req) {
                          (int)strlen(e401));
             return;
         }        if (!strcmp(path, "/api/valloc")) {
-            // Pass the authenticated uid as the object owner
-            blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
-            // Inject the authenticated uid into the valloc request
-            json_str(body_ptr ? body_ptr : "", "name", resp_body, 64); // reuse buffer temporarily
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/record")) {
             blen = api_record_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── POST /api/journal/attach|detach ───────────────────────────────────
+        if (!strcmp(path, "/api/journal/attach") ||
+            !strcmp(path, "/api/journal/detach")) {
+            char jname[32];
+            char tname[64];
+            jname[0] = '\0';
+            tname[0] = '\0';
+            json_str(body_ptr, "journal", jname, (int)sizeof(jname));
+            json_str(body_ptr, "table",   tname, (int)sizeof(tname));
+            int rc = (!strcmp(path, "/api/journal/attach"))
+                   ? journal_attach(jname, tname)
+                   : journal_detach(jname, tname);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0);
+            jb_str(&j, "ok", rc == 0 ? "true" : "false");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
         }
         if (!strcmp(path, "/api/tx/begin")) {
             blen = api_tx_post("begin", resp_body, (int)sizeof(resp_body));
@@ -775,14 +820,11 @@ void http_server_run(void) {
     for (;;) {
         int conn = tcp_accept(listen_fd);
         if (conn < 0) continue;
-        kernel_serial_print("[HTTP] connection accepted\n");
 
         int rlen = tcp_recv(conn, req_buf, (uint16_t)(sizeof(req_buf) - 1));
-        kernel_serial_print("[HTTP] request received\n");
         if (rlen > 0) {
             req_buf[rlen] = '\0';
             http_route(conn, req_buf);
-            kernel_serial_print("[HTTP] response sent\n");
         }
         tcp_close(conn);
     }

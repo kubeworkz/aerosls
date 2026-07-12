@@ -19,6 +19,7 @@
 #include "../net/e1000.h"
 #include "../net/http.h"
 #include "../arch/x86/multiboot2.h"
+#include "../kernel/journal.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -119,6 +120,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4f. Token authentication registry ─────────────────────────────────
     auth_init();     // registers 4 demo tokens; prints them to serial log
+
+    // ── 4g. Journal subsystem (IBM i-style before/after-image journaling) ──
+    journal_init();
 
     // ── 5. Microkernel (IPC + 5 services + tier manager) ──────────────────
     microkernel_init();

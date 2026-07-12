@@ -1,4 +1,5 @@
 #include "object_catalog.h"
+#include "journal.h"
 #include "../user/permissions.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
@@ -166,10 +167,14 @@ uint64_t sys_sls_valloc(struct SLSVallocRequest* req) {
 
     object_catalog_count++;
 
-    kernel_serial_printf(
-        "[CATALOG] valloc: '%s' | type=%-16s | vaddr=0x%016lx | %u pages | tier=%s\n",
-        e->name, obj_type_name(e->type), e->base_vaddr,
-        e->size_pages, tier_name(e->storage_tier));
+    // Safe print: avoid mixed-type variadic printf which crashes on freestanding x86.
+    kernel_serial_print("[CATALOG] valloc: '");
+    kernel_serial_print(e->name);
+    kernel_serial_print("' type=");
+    kernel_serial_print(obj_type_name(e->type));
+    kernel_serial_print(" tier=");
+    kernel_serial_print(tier_name(e->storage_tier));
+    kernel_serial_print("\n");
 
     return obj_id;
 }
@@ -365,6 +370,10 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             if (tx) {
                 wal_stage(tid, object_catalog[obj_idx].object_id,
                           req->key, rec->fields[i].value, req->value);
+                // Journal: UB (before-image) staged; UP committed on tx commit
+                journal_write(req->name, req->key,
+                              rec->fields[i].value, req->value,
+                              JENT_UB, tx);
                 kernel_serial_printf(
                     "[DB] UPDATE %s.%s staged -> tx=%lu  "
                     "(commit to apply)\n",
@@ -373,7 +382,13 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             }
 
             // Direct write — no open transaction
+            // Journal: write UB + UP immediately (auto-commit, no tx)
+            journal_write(req->name, req->key,
+                          rec->fields[i].value, req->value,
+                          JENT_UB, 0);
             cat_strncpy(rec->fields[i].value, req->value, RECORD_VAL_LEN);
+            journal_write(req->name, req->key,
+                          "", req->value, JENT_UP, 0);
             kernel_serial_printf("[DB] UPDATE %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
             return 0;
@@ -414,6 +429,7 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
     if (tx) {
         wal_stage(tid, object_catalog[obj_idx].object_id,
                   req->key, "", req->value);
+        journal_write(req->name, req->key, "", req->value, JENT_PT, tx);
         kernel_serial_printf(
             "[DB] INSERT %s.%s staged -> tx=%lu  (commit to apply)\n",
             req->name, req->key, tx);
@@ -427,6 +443,7 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
             cat_strncpy(rec->fields[i].value, req->value, RECORD_VAL_LEN);
             rec->fields[i].active = 1;
             rec->field_count++;
+            journal_write(req->name, req->key, "", req->value, JENT_PT, 0);
             kernel_serial_printf("[DB] INSERT %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
             return 0;
@@ -463,6 +480,8 @@ uint64_t sys_sls_delete(struct SLSRecordRequest* req) {
         if (tx) {
             wal_stage(tid, e->object_id,
                       req->key, rec->fields[i].value, "");
+            journal_write(req->name, req->key,
+                          rec->fields[i].value, "", JENT_DL, tx);
             kernel_serial_printf(
                 "[DB] DELETE %s.%s staged -> tx=%lu\n",
                 req->name, req->key, tx);

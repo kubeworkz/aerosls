@@ -148,9 +148,12 @@ void e1000_init(uint64_t mmio_base, uint8_t pci_slot) {
 }
 
 void e1000_transmit_packet(void* physical_buffer, uint16_t size) {
-    // Disable interrupts for the duration of the TX descriptor write to prevent
-    // the timer ISR from entering e1000_poll_rx mid-transmission.
-    __asm__ volatile("cli");
+    // NOTE: We do NOT disable interrupts here.  The e1000 TX descriptor ring
+    // is written atomically (TDT update is a single 32-bit MMIO write) and
+    // the timer ISR only reads RX descriptors via e1000_poll_rx — it never
+    // touches TX.  Holding cli would block the LAPIC timer, preventing ARP
+    // replies from being processed during the TX wait, causing a deadlock when
+    // the SYN-ACK needs ARP for the gateway and the ARP reply never arrives.
 
     struct E1000TxDesc* desc = &tx_ring[tx_tail];
     desc->buffer_addr = (uint64_t)physical_buffer;
@@ -161,17 +164,21 @@ void e1000_transmit_packet(void* physical_buffer, uint16_t size) {
     tx_tail = (uint16_t)((tx_tail + 1) % E1000_RING_SIZE);
     *reg(E1000_REG_TDT) = tx_tail;
 
+    uint32_t tx_timeout = 0;
     while (!(desc->status & 0x01)) {
-        // Timeout so early-boot ARP doesn't hang if link is still negotiating.
-        uint32_t tx_timeout = 0;
         if (++tx_timeout > 2000000) break;
         __asm__ volatile("pause");
     }
-
-    __asm__ volatile("sti");
 }
 
 void e1000_poll_rx(void) {
+    // Re-entrancy guard: the timer ISR calls us, but tcp_handle_segment called
+    // from within us may trigger another TX which fires another timer tick.
+    // A static flag prevents recursive/reentrant calls from corrupting state.
+    static volatile uint8_t _in_poll = 0;
+    if (_in_poll) return;
+    _in_poll = 1;
+
     for (;;) {
         uint16_t next = (uint16_t)((rx_tail + 1) % E1000_RING_SIZE);
         struct E1000RxDesc* desc = &rx_ring[next];
@@ -188,4 +195,5 @@ void e1000_poll_rx(void) {
         *reg(E1000_REG_RDT) = next;
         rx_tail = next;
     }
+    _in_poll = 0;
 }

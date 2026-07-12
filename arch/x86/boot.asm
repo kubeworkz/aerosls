@@ -20,10 +20,10 @@ multiboot_start:
     dd 8                                    ; end tag size
 multiboot_end:
 
-; ─── Bootstrap stack (16 KiB) ─────────────────────────────────────────────────
+; ─── Bootstrap stack (64 KiB) ─────────────────────────────────────────────────
 section .bootstrap_stack, nobits
 align 16
-stack_bottom: resb 4096 * 4
+stack_bottom: resb 4096 * 16
 stack_top:
 
 ; ─── Early page tables (BSS — zeroed by GRUB) ────────────────────────────────

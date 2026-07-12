@@ -299,7 +299,11 @@ void tcp_close(int id) {
     struct TCPConn* c = &tcp_conns[id];
     if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) {
         tcp_send_flags(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-        c->state = TCP_FIN_WAIT;
+        // Always mark closed regardless of whether the FIN-ACK was delivered.
+        // If ARP for the gateway isn't cached the FIN-ACK is dropped silently;
+        // the peer will timeout and clean up its side.
+        c->state  = TCP_CLOSED;
+        c->active = 0;
     } else {
         c->state  = TCP_CLOSED;
         c->active = 0;

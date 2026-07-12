@@ -12,6 +12,7 @@ typedef enum {
     OBJ_TYPE_HEAP_BLOB        = 3,
     OBJ_TYPE_SERVICE_PROCESS  = 4,  // Ring-3 executable + stack; scheduled by kernel
     OBJ_TYPE_WEB_APP          = 5,  // HTML/JS/CSS assets stored as key-value records
+    OBJ_TYPE_JOURNAL          = 6,  // IBM i-style journal object
 } SLSObjectType;
 
 // ─── Storage Tiers ────────────────────────────────────────────────────────────
@@ -47,6 +48,7 @@ static inline const char* obj_type_name(SLSObjectType t) {
         case OBJ_TYPE_HEAP_BLOB:       return "HEAP_BLOB";
         case OBJ_TYPE_SERVICE_PROCESS: return "SERVICE_PROCESS";
         case OBJ_TYPE_WEB_APP:         return "WEB_APP";
+        case OBJ_TYPE_JOURNAL:         return "JOURNAL";
         default:                       return "UNKNOWN";
     }
 }

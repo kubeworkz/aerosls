@@ -14,7 +14,9 @@ ALLOC_PLUGIN    = libSLSAllocationPassV2.so
 # --- x86_64 Toolchain ---
 X86_CC      = x86_64-elf-gcc
 X86_LD      = x86_64-elf-ld
-X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -msse -fno-pie -fno-pic -fno-tree-vectorize
+X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
+              -mno-sse -mno-sse2 -mno-mmx \
+              -fno-pie -fno-pic -fno-tree-vectorize
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
 X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm
@@ -33,6 +35,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c a
               kernel/loader.c \
               kernel/webapp.c \
               kernel/webapp_bundle.c \
+              kernel/journal.c \
               kernel/net_event.c \
               kernel/auth.c \
               kernel/stubs.c

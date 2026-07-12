@@ -1,5 +1,6 @@
 #include "transaction.h"
 #include "object_catalog.h"
+#include "journal.h"
 
 // ─── WAL In-RAM Buffer ────────────────────────────────────────────────────────
 struct WALEntry wal_buffer[WAL_MAX_ENTRIES];
@@ -129,6 +130,9 @@ uint64_t sys_sls_tx_commit(uint32_t thread_id) {
         "[WAL] Transaction %lu COMMITTED. %u operation(s) applied.\n",
         committed_tx_id, committed);
 
+    // Notify the journal subsystem so pending entries are marked committed
+    journal_commit_tx(committed_tx_id);
+
     return 0;
 }
 
@@ -153,6 +157,9 @@ uint64_t sys_sls_tx_rollback(uint32_t thread_id) {
     kernel_serial_printf(
         "[WAL] Transaction %lu ROLLED BACK. %u staged operation(s) discarded.\n",
         ctx->tx_id, rolled);
+
+    // Notify the journal subsystem so pending entries are marked rolled-back
+    journal_rollback_tx(ctx->tx_id);
 
     ctx->active = 0;
     return 0;
