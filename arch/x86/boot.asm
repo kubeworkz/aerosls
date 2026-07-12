@@ -42,12 +42,23 @@ p2_table_2:  resb 4096   ; PD for  2 –  3 GiB
 global p2_table_3
 p2_table_3:  resb 4096   ; PD for  3 –  4 GiB  (LAPIC @ 0xFEE00000, PCIe BARs)
 
+; Saved multiboot2 handoff registers (written in 32-bit mode, read in 64-bit)
+global mb2_magic_saved
+mb2_magic_saved:  resd 1   ; eax at _start (should be 0x36d76289)
+global mb2_info_saved
+mb2_info_saved:   resd 1   ; ebx at _start (physical addr of mb2_info struct)
+
 ; ─── 32-bit entry point ───────────────────────────────────────────────────────
 section .text
 bits 32
 global _start
 
 _start:
+    ; ── 0. Save multiboot2 handoff values (eax=magic, ebx=info ptr) ─────────
+    ;  Do this FIRST before eax is overwritten by the page-table setup below.
+    mov  [mb2_magic_saved], eax
+    mov  [mb2_info_saved],  ebx
+
     mov  esp, stack_top
 
     ; ── 1. Build identity-map page tables (0–4 GiB) ────────────────────────
@@ -143,6 +154,13 @@ _start64:
     mov  es, ax
     mov  fs, ax
     mov  gs, ax
+
+    ; Pass multiboot2 info to kernel_main (System V AMD64 calling convention):
+    ;   rdi = first arg  = mb2_magic (uint32_t)
+    ;   rsi = second arg = mb2_info_phys (uint32_t physical address)
+    ; Both are identity-mapped (0–4 GiB), so the physical addr = virtual addr.
+    mov  edi, dword [mb2_magic_saved]
+    mov  esi, dword [mb2_info_saved]
 
     extern kernel_main
     call kernel_main

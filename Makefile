@@ -83,7 +83,8 @@ x86-iso: $(X86_BIN)
 	mkdir -p isodir/boot/grub
 	cp $(X86_BIN) isodir/boot/
 	cp grub.cfg isodir/boot/grub/
-	grub-mkrescue -o $(X86_ISO) isodir
+	grub-mkrescue --modules="normal multiboot2 iso9660 gfxterm font" \
+	              -o $(X86_ISO) isodir
 	rm -rf isodir
 
 x86-run: x86-iso

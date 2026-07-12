@@ -18,14 +18,69 @@
 #include "../net/net.h"
 #include "../net/e1000.h"
 #include "../net/http.h"
+#include "../arch/x86/multiboot2.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
 
+// ─── Multiboot2 memory map + hardware diagnostics ────────────────────────────
+static void print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
+    // 1. Verify magic
+    if (mb2_magic != (uint32_t)MULTIBOOT2_MAGIC) {
+        kernel_serial_printf("[MB2] WARNING: bad magic 0x%x (expected 0x36d76289)\n",
+                             mb2_magic);
+        return;
+    }
+
+    // 2. CPU vendor string via CPUID leaf 0
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx) : "a"(0));
+    char vendor[13];
+    ((uint32_t*)vendor)[0] = ebx;
+    ((uint32_t*)vendor)[1] = edx;
+    ((uint32_t*)vendor)[2] = ecx;
+    vendor[12] = '\0';
+    __asm__ volatile("cpuid" : "=a"(eax) : "a"(1) : "ebx","ecx","edx");
+    uint32_t family  = ((eax >> 8) & 0xF)  + ((eax >> 20) & 0xFF);
+    uint32_t model   = ((eax >> 4) & 0xF)  | ((eax >> 12) & 0xF0);
+    kernel_serial_printf("[HW] CPU %s family=%u model=%u\n", vendor, family, model);
+
+    // 3. Walk MB2 tags for memory map
+    const struct mb2_info* info = (const struct mb2_info*)(uintptr_t)mb2_phys;
+    const struct mb2_tag* tag   = (const struct mb2_tag*)(info + 1);
+    const struct mb2_tag* end   = (const struct mb2_tag*)(
+                                  (uint8_t*)(uintptr_t)mb2_phys + info->total_size);
+    uint64_t usable_bytes = 0;
+
+    while (tag < end && tag->type != MB2_TAG_END) {
+        if (tag->type == MB2_TAG_MMAP) {
+            const struct mb2_tag_mmap* mm = (const struct mb2_tag_mmap*)tag;
+            const struct mb2_mmap_entry* e =
+                (const struct mb2_mmap_entry*)((const uint8_t*)mm + sizeof(*mm));
+            const struct mb2_mmap_entry* me =
+                (const struct mb2_mmap_entry*)((const uint8_t*)mm + mm->size);
+            kernel_serial_print("[HW] Memory map:\n");
+            while (e < me) {
+                static const char* const types[] = {
+                    "?", "RAM", "Reserved", "ACPI", "NVS", "Bad" };
+                const char* tname = (e->type <= 5) ? types[e->type] : "?";
+                kernel_serial_printf("[HW]   %016lx + %8lu KiB  %s\n",
+                    e->base_addr, (uint32_t)(e->length / 1024), tname);
+                if (e->type == MB2_MEM_AVAILABLE) usable_bytes += e->length;
+                e = (const struct mb2_mmap_entry*)((const uint8_t*)e + mm->entry_size);
+            }
+        }
+        tag = mb2_tag_next(tag);
+    }
+    if (usable_bytes)
+        kernel_serial_printf("[HW] Usable RAM: %u MiB\n",
+                             (uint32_t)(usable_bytes >> 20));
+}
+
 #ifdef __cplusplus
 extern "C"
 #endif
-void kernel_main(void) {
+void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 1. Serial output — must be first so all subsequent prints are visible ──
     serial_init();
@@ -37,6 +92,9 @@ void kernel_main(void) {
     kernel_serial_print("[BSP] Loading GDT and IDT...\n");
     init_gdt();
     init_idt();
+
+    // ── 2b. Hardware info (CPU + memory map from multiboot2) ──────────────────
+    print_hw_info(mb2_magic, mb2_phys);
 
     // ── 3. Local APIC + timer IRQ ──────────────────────────────────────────
     init_local_apic_registers();
