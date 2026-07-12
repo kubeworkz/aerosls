@@ -1,6 +1,7 @@
 #include "ipv4.h"
 #include "arp.h"
 #include "tcp.h"
+#include "udp.h"
 #include "e1000.h"
 #include "../kernel/kernel_io.h"
 
@@ -14,22 +15,28 @@ static uint16_t ip_checksum(struct IPv4Header* hdr) {
 }
 
 // ─── Build and transmit an Ethernet + IPv4 frame ─────────────────────────────
+// dst_ip=0xFFFFFFFF: broadcast — Ethernet ff:ff:ff:ff:ff:ff, bypasses ARP.
+// Callers (udp_send) pass src_ip explicitly; ipv4_send always uses NET_MY_IP.
 void ipv4_send(IPv4Addr dst_ip, uint8_t proto, void* payload, uint16_t plen) {
     uint8_t* pkt = (uint8_t*)net_alloc_buf();
     if (!pkt) return;
 
-    // Resolve destination MAC (use gateway MAC for non-local IPs)
+    // Resolve destination MAC
     MACAddr dst_mac;
-    IPv4Addr resolve_ip = dst_ip;
-    // Simple subnet check: 10.0.2.x is local
-    if ((ntohl(dst_ip) & 0xFFFFFF00) != (ntohl(NET_MY_IP) & 0xFFFFFF00))
-        resolve_ip = NET_GW_IP;
+    if (dst_ip == 0xFFFFFFFFUL) {
+        // Broadcast — no ARP needed
+        for (int i = 0; i < 6; i++) dst_mac.b[i] = 0xFF;
+    } else {
+        IPv4Addr resolve_ip = dst_ip;
+        // Simple subnet check: same /24 is local
+        if ((ntohl(dst_ip) & 0xFFFFFF00) != (ntohl(NET_MY_IP) & 0xFFFFFF00))
+            resolve_ip = NET_GW_IP;
 
-    if (!arp_lookup(resolve_ip, &dst_mac)) {
-        // MAC unknown — send ARP request and drop this packet
-        arp_send_request(resolve_ip);
-        net_free_buf(pkt);
-        return;
+        if (!arp_lookup(resolve_ip, &dst_mac)) {
+            arp_send_request(resolve_ip);
+            net_free_buf(pkt);
+            return;
+        }
     }
 
     struct EthernetHeader* eth = (struct EthernetHeader*)pkt;
@@ -74,8 +81,10 @@ static void icmp_echo_reply(struct EthernetHeader* eth,
 
 // ─── IPv4 receive handler ─────────────────────────────────────────────────────
 void ipv4_handle_packet(struct EthernetHeader* eth, struct IPv4Header* ip) {
-    // Only process packets addressed to us
-    if (ip->dst != NET_MY_IP) return;
+    // Accept packets addressed to us OR to the broadcast address.
+    // Broadcast acceptance is required for DHCP (OFFER/ACK go to 255.255.255.255
+    // before the client has an IP, or to our IP once bound).
+    if (ip->dst != NET_MY_IP && ip->dst != 0xFFFFFFFFUL) return;
 
     int ihl = (ip->version_ihl & 0x0F) * 4;
     uint8_t* payload = (uint8_t*)ip + ihl;
@@ -83,6 +92,8 @@ void ipv4_handle_packet(struct EthernetHeader* eth, struct IPv4Header* ip) {
 
     if (ip->protocol == IP_PROTO_TCP && plen >= (uint16_t)sizeof(struct TCPHeader)) {
         tcp_handle_segment(ip, (struct TCPHeader*)payload, plen);
+    } else if (ip->protocol == IP_PROTO_UDP && plen >= (uint16_t)sizeof(struct UDPHeader)) {
+        udp_handle_packet(ip, plen);
     } else if (ip->protocol == IP_PROTO_ICMP && plen > 0 && payload[0] == 8) {
         icmp_echo_reply(eth, ip, payload, plen);
     }

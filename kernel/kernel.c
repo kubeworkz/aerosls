@@ -13,6 +13,7 @@
 #include "loader.h"
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
+#include "../net/dhcp.h"
 #include "../arch/x86/user_paging.h"
 #include "../net/net.h"
 #include "../net/e1000.h"
@@ -100,6 +101,7 @@ void kernel_main(void) {
         if (e1000_mmio_base) {
             e1000_init(e1000_mmio_base, found_slot);
             net_init();   // sends gratuitous ARP
+            dhcp_start(); // DISCOVER → OFFER → REQUEST → ACK; updates net_my_ip
             kernel_serial_print("[NET] e1000 RX/TX rings online.\n");
         } else {
             kernel_serial_print("[NET] e1000 not found — network disabled.\n");
