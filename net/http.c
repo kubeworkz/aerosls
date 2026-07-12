@@ -7,6 +7,7 @@
 #include "../kernel/microkernel.h"
 #include "../kernel/tier_mgr.h"
 #include "../kernel/webapp.h"
+#include "../kernel/bundle.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -188,8 +189,34 @@ static void http_respond(int conn, int status, const char* ctype,
     while (*cors) hdr[hpos++] = *cors++;
     hdr[hpos++] = '\r'; hdr[hpos++] = '\n';  // end of headers
 
-    tcp_send(conn, hdr, (uint16_t)hpos);
-    if (blen > 0) tcp_send(conn, body, (uint16_t)blen);
+    tcp_send(conn, hdr, (uint32_t)hpos);
+    if (blen > 0) tcp_send(conn, body, (uint32_t)blen);
+}
+
+// Like http_respond but for binary/large assets from the compiled-in bundle.
+// Accepts uint32_t length so files larger than 64 KiB (e.g. the JS bundle)
+// are served correctly via tcp_send's internal chunking.
+static void http_respond_raw(int conn, const char* ctype,
+                              const uint8_t* data, uint32_t blen) {
+    char hdr[256];
+    int hpos = 0;
+    // Status line
+    const char* sl = "HTTP/1.1 200 OK\r\nContent-Type: ";
+    while (*sl) hdr[hpos++] = *sl++;
+    while (*ctype) hdr[hpos++] = *ctype++;
+    const char* cl = "\r\nContent-Length: ";
+    while (*cl) hdr[hpos++] = *cl++;
+    // Write blen as decimal (uint32_t, up to 10 digits)
+    char tmp[12]; int tl = 0;
+    uint32_t bl = blen;
+    if (bl == 0) { tmp[tl++] = '0'; }
+    else { while (bl) { tmp[tl++] = (char)('0' + bl % 10); bl /= 10; } }
+    for (int i = tl - 1; i >= 0; i--) hdr[hpos++] = tmp[i];
+    const char* cors = "\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    while (*cors) hdr[hpos++] = *cors++;
+
+    tcp_send(conn, hdr, (uint32_t)hpos);
+    if (blen > 0) tcp_send(conn, data, blen);
 }
 
 // Forward declarations for helpers defined in the Phase F section below
@@ -328,7 +355,7 @@ static void http_options(int conn) {
                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                     "Content-Length: 0\r\n\r\n";
-    tcp_send(conn, h, (uint16_t)strlen(h));
+    tcp_send(conn, h, (uint32_t)strlen(h));
 }
 
 // ─── GET /api/objects ─────────────────────────────────────────────────────────
@@ -672,7 +699,12 @@ static void http_route(int conn, char* req) {
             blen = api_query_json(q, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        // WEB_APP asset lookup
+        // Compiled-in bundle (full Navigator SPA) — checked first
+        const struct BundleAsset* ba = bundle_find(path);
+        if (ba) {
+            http_respond_raw(conn, ba->mime, ba->data, ba->len); return;
+        }
+        // WEB_APP asset lookup (dynamic assets stored via syscall)
         struct WebAsset* asset = webapp_find(path);
         if (asset) {
             http_respond(conn, 200, asset->mime,

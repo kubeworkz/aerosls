@@ -274,7 +274,7 @@ int tcp_recv(int id, void* buf, uint16_t max_len) {
     return (int)n;
 }
 
-int tcp_send(int id, const void* data, uint16_t len) {
+int tcp_send(int id, const void* data, uint32_t len) {
     if (id < 0 || id >= TCP_MAX_CONNS) return -1;
     struct TCPConn* c = &tcp_conns[id];
     if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) return -1;
@@ -284,10 +284,9 @@ int tcp_send(int id, const void* data, uint16_t len) {
                            - ETH_HDR_LEN
                            - (uint16_t)sizeof(struct IPv4Header)
                            - (uint16_t)sizeof(struct TCPHeader));
-    uint16_t sent = 0;
+    uint32_t sent = 0;
     while (sent < len) {
-        uint16_t n = (uint16_t)(len - sent);
-        if (n > CHUNK) n = CHUNK;
+        uint16_t n = (uint16_t)((len - sent) > CHUNK ? CHUNK : (len - sent));
         tcp_send_flags(c, TCP_FLAG_ACK | TCP_FLAG_PSH,
                        (const uint8_t*)data + sent, n);
         sent += n;

@@ -32,6 +32,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c a
               kernel/process.c arch/x86/user_paging.c \
               kernel/loader.c \
               kernel/webapp.c \
+              kernel/webapp_bundle.c \
               kernel/net_event.c \
               kernel/auth.c \
               kernel/stubs.c
@@ -114,5 +115,11 @@ riscv-run: riscv-elf
 
 clean:
 	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
+
+bundle:
+	@echo "[BUNDLE] Generating kernel/webapp_bundle.c from slsos-sim/dist..."
+	@cd ../slsos-sim && npm run build --silent 2>/dev/null || true
+	@python3 tools/bundle_webapp.py ../slsos-sim/dist > kernel/webapp_bundle.c
+	@echo "[BUNDLE] Done — $$(wc -l < kernel/webapp_bundle.c) lines generated."
 	find . -name "*.o" -type f -delete
 	find . -name "*.bin" -type f -delete

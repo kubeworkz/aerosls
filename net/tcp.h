@@ -50,7 +50,7 @@ void tcp_handle_segment(struct IPv4Header* ip, struct TCPHeader* seg, uint16_t s
 // Called by socket layer
 int  tcp_listen(uint16_t port);             // returns conn_id or -1
 int  tcp_accept(int listen_id);             // blocks until connection; returns new conn_id
-int  tcp_send(int conn_id, const void* buf, uint16_t len);
+int  tcp_send(int conn_id, const void* buf, uint32_t len);
 int  tcp_recv(int conn_id, void* buf, uint16_t max_len);  // returns bytes read
 void tcp_close(int conn_id);
 
