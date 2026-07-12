@@ -52,7 +52,7 @@ void auth_init(void) {
         { "guest@sandbox.com",    1003, ROLE_GUEST,         0xDEADC0DE99887766ULL },
     };
 
-    kernel_serial_print(
+    kernel_serial_printf(
         "[AUTH] Token Registry\n"
         " %-30s  %-10s  %-13s  %s\n"
         " %-30s  %-10s  %-13s  %s\n",
@@ -149,7 +149,7 @@ int auth_revoke_by_email(const char* email) {
 
 // ─── sys_sls_auth_list ────────────────────────────────────────────────────────
 void sys_sls_auth_list(void) {
-    kernel_serial_print(
+    kernel_serial_printf(
         "\n[AUTH] Active Tokens\n"
         " %-30s  %-4s  %-13s  %s\n"
         " %-30s  ----  -------------  ----\n",

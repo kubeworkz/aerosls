@@ -1,9 +1,10 @@
 #include "process.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
-#include "frame_pool.h"
 #include "loader.h"
 #include "../arch/x86/user_paging.h"
+
+extern void* allocate_physical_ram_frame(void);
 
 struct ProcessDescriptor proc_table[PROC_MAX];
 uint32_t                 proc_count = 0;

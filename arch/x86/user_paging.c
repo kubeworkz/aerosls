@@ -1,6 +1,7 @@
 #include "user_paging.h"
-#include "../../kernel/frame_pool.h"
 #include "../../kernel/kernel_io.h"
+
+extern void* allocate_physical_ram_frame(void);
 
 struct PerCPUData per_cpu_data[4];
 

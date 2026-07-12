@@ -1,7 +1,6 @@
 #include "arp.h"
 #include "e1000.h"
 #include "../kernel/kernel_io.h"
-#include "../kernel/frame_pool.h"
 
 struct ARPEntry arp_table[ARP_TABLE_SIZE];
 

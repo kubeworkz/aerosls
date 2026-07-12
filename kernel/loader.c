@@ -1,8 +1,10 @@
 #include "loader.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
-#include "frame_pool.h"
 #include "../arch/x86/user_paging.h"
+
+// frame_pool.c has no header — declare the allocator directly
+extern void* allocate_physical_ram_frame(void);
 
 // ─── Binary store ─────────────────────────────────────────────────────────────
 struct ServiceBinary service_binaries[MAX_SERVICE_BINARIES];
@@ -240,7 +242,7 @@ uint64_t loader_load_into_process(const char* object_name,
 
 // ─── loader_list ─────────────────────────────────────────────────────────────
 void loader_list(void) {
-    kernel_serial_print(
+    kernel_serial_printf(
         "\n[LOADER] Service Binary Store\n"
         " %-24s  %-8s  %-6s  %s\n"
         " ------------------------  --------  ------  ----\n",
