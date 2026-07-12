@@ -1,6 +1,7 @@
 #include "transaction.h"
 #include "object_catalog.h"
 #include "journal.h"
+#include "lock_mgr.h"
 
 // ─── WAL In-RAM Buffer ────────────────────────────────────────────────────────
 struct WALEntry wal_buffer[WAL_MAX_ENTRIES];
@@ -132,6 +133,7 @@ uint64_t sys_sls_tx_commit(uint32_t thread_id) {
 
     // Notify the journal subsystem so pending entries are marked committed
     journal_commit_tx(committed_tx_id);
+    lock_release_tx(committed_tx_id);  // release all row locks held by this tx
 
     return 0;
 }
@@ -160,6 +162,7 @@ uint64_t sys_sls_tx_rollback(uint32_t thread_id) {
 
     // Notify the journal subsystem so pending entries are marked rolled-back
     journal_rollback_tx(ctx->tx_id);
+    lock_release_tx(ctx->tx_id);  // release all row locks on rollback
 
     ctx->active = 0;
     return 0;

@@ -9,6 +9,7 @@
 #include "../kernel/webapp.h"
 #include "../kernel/bundle.h"
 #include "../kernel/journal.h"
+#include "../kernel/lock_mgr.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -699,6 +700,11 @@ static void http_route(int conn, char* req) {
             char q[256] = "show all";
             url_param(qs, "q", q, (int)sizeof(q));
             blen = api_query_json(q, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── GET /api/locks — active row locks ─────────────────────────────────
+        if (!strcmp(path, "/api/locks")) {
+            blen = lock_to_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── GET /api/journal/<name>[?since=N] ─────────────────────────────────

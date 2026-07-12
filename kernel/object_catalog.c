@@ -1,5 +1,6 @@
 #include "object_catalog.h"
 #include "journal.h"
+#include "lock_mgr.h"
 #include "../user/permissions.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
@@ -368,6 +369,13 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             uint32_t tid = kernel_get_current_thread_id();
             uint64_t tx  = tx_get_active(tid);
             if (tx) {
+                // Acquire exclusive row lock before staging to WAL.
+                // Rejects the write if another transaction holds the key.
+                if (lock_acquire(tx, object_catalog[obj_idx].object_id,
+                                 req->key, LOCK_EXCLUSIVE) != 0) {
+                    kernel_serial_print("[DB] UPDATE blocked: lock conflict\n");
+                    return 2;  // conflict — caller should rollback
+                }
                 wal_stage(tid, object_catalog[obj_idx].object_id,
                           req->key, rec->fields[i].value, req->value);
                 // Journal: UB (before-image) staged; UP committed on tx commit
@@ -427,6 +435,12 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
     uint32_t tid = kernel_get_current_thread_id();
     uint64_t tx  = tx_get_active(tid);
     if (tx) {
+        // Acquire exclusive lock on the new key
+        if (lock_acquire(tx, object_catalog[obj_idx].object_id,
+                         req->key, LOCK_EXCLUSIVE) != 0) {
+            kernel_serial_print("[DB] INSERT blocked: lock conflict\n");
+            return 2;
+        }
         wal_stage(tid, object_catalog[obj_idx].object_id,
                   req->key, "", req->value);
         journal_write(req->name, req->key, "", req->value, JENT_PT, tx);
@@ -478,6 +492,11 @@ uint64_t sys_sls_delete(struct SLSRecordRequest* req) {
         uint32_t tid = kernel_get_current_thread_id();
         uint64_t tx  = tx_get_active(tid);
         if (tx) {
+            if (lock_acquire(tx, e->object_id,
+                             req->key, LOCK_EXCLUSIVE) != 0) {
+                kernel_serial_print("[DB] DELETE blocked: lock conflict\n");
+                return 2;
+            }
             wal_stage(tid, e->object_id,
                       req->key, rec->fields[i].value, "");
             journal_write(req->name, req->key,

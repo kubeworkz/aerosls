@@ -8,6 +8,8 @@
 #include "../kernel/ipc.h"
 #include "../kernel/tier_mgr.h"
 #include "../kernel/query_engine.h"
+#include "../kernel/journal.h"
+#include "../kernel/lock_mgr.h"
 #include "../kernel/process.h"
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
@@ -95,6 +97,14 @@ static void print_help(void) {
         "  tx rollback                    discard staged writes\n"
         "  wal dump                       print WAL entries\n"
         "  wal recover                    replay WAL after simulated crash\n"
+        "  -- Journaling (DB1 / IBM i STRJRNPF) --\n"
+        "  journal create <name>            create a journal object\n"
+        "  journal attach <jrn> <table>     start journaling a table\n"
+        "  journal detach <jrn> <table>     stop journaling a table\n"
+        "  journal list                     list all journals and attachments\n"
+        "  journal dump <name>              show all entries for a journal\n"
+        "  journal dump <name> <seq>        show entries since sequence number\n"
+        "  journal purge <name>             remove rolled-back entries\n"
         "  -- Token Auth (Phase G) --\n"
         "  auth create <email> <uid> <role>  create a bearer token\n"
         "  auth list                         show token registry\n"
@@ -123,6 +133,8 @@ static void print_help(void) {
         "  svc restart <name>             restart a crashed service\n"
         "  ipc stat                       IPC queue depths and latency\n"
         "  ipc post <svc> <opcode_hex>    post a raw IPC message for testing\n"
+        "  -- Row Locks (DB2 / Read-Committed isolation) --\n"
+        "  lock list                      show all active row locks\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -438,7 +450,66 @@ void sls_shell_loop(void) {
         else if (sh_eq(input_buffer, "wal recover")) {
             sys_sls_tx_recover();
         }
-
+        // ── DB1: journal commands (IBM i-style journaling) ─────────────────────
+        else if (sh_starts(input_buffer, "journal create ")) {
+            const char* name = input_buffer + 15;
+            struct SLSVallocRequest req;
+            for (int i = 0; i < OBJECT_NAME_LEN; i++) req.name[i] = 0;
+            for (int i = 0; name[i] && i < OBJECT_NAME_LEN - 1; i++) req.name[i] = name[i];
+            req.type       = OBJ_TYPE_JOURNAL;
+            req.size_pages = 1;
+            req.owner_uid  = current_session_uid;
+            req.perm_mask  = 0;
+            sys_sls_valloc(&req);
+            kernel_serial_printf("[JOURNAL] Created journal '%s'.\n", name);
+        }
+        else if (sh_starts(input_buffer, "journal attach ")) {
+            // journal attach <journal_name> <table_name>
+            const char* p = input_buffer + 15;
+            char jname[64] = {0}, tname[64] = {0};
+            int ji = 0;
+            while (*p && *p != ' ' && ji < 63) jname[ji++] = *p++;
+            while (*p == ' ') p++;
+            int ti = 0;
+            while (*p && ti < 63) tname[ti++] = *p++;
+            journal_attach(jname, tname);
+        }
+        else if (sh_starts(input_buffer, "journal detach ")) {
+            const char* p = input_buffer + 15;
+            char jname[64] = {0}, tname[64] = {0};
+            int ji = 0;
+            while (*p && *p != ' ' && ji < 63) jname[ji++] = *p++;
+            while (*p == ' ') p++;
+            int ti = 0;
+            while (*p && ti < 63) tname[ti++] = *p++;
+            journal_detach(jname, tname);
+        }
+        else if (sh_eq(input_buffer, "journal list")) {
+            kernel_serial_print("[JOURNAL] Attachments:\n");
+            int found = 0;
+            for (uint32_t i = 0; i < journal_attachment_count; i++) {
+                if (journal_attachments[i].active) {
+                    kernel_serial_printf("  %-24s  →  %s\n",
+                        journal_attachments[i].journal_name,
+                        journal_attachments[i].object_name);
+                    found = 1;
+                }
+            }
+            if (!found) kernel_serial_print("  (no journals active)\n");
+        }
+        else if (sh_starts(input_buffer, "journal dump ")) {
+            const char* p = input_buffer + 13;
+            char jname[64] = {0};
+            int ji = 0;
+            while (*p && *p != ' ' && ji < 63) jname[ji++] = *p++;
+            while (*p == ' ') p++;
+            uint64_t since = 0;
+            while (*p >= '0' && *p <= '9') { since = since * 10 + (uint64_t)(*p - '0'); p++; }
+            journal_dump(jname, since);
+        }
+        else if (sh_starts(input_buffer, "journal purge ")) {
+            journal_purge(input_buffer + 14);
+        }
         // ── Phase G: auth create <email> <uid> <role> ──────────────────────────
         else if (sh_starts(input_buffer, "auth create ")) {
             const char* p = input_buffer + 12;
@@ -615,6 +686,23 @@ void sls_shell_loop(void) {
         }
 
         // ── Phase 4: ipc stat ─────────────────────────────────────────────────
+        else if (sh_eq(input_buffer, "lock list")) {
+            int found = 0;
+            kernel_serial_print("[LOCK] Active row locks:\n");
+            for (uint32_t i = 0; i < LOCK_MAX_ENTRIES; i++) {
+                if (!lock_table[i].active) continue;
+                kernel_serial_print("  tx=");
+                kernel_serial_print_hex64(lock_table[i].tx_id);
+                kernel_serial_print(" type=");
+                kernel_serial_print(lock_table[i].type == (uint8_t)LOCK_EXCLUSIVE ? "X" : "S");
+                kernel_serial_print(" key=");
+                kernel_serial_print(lock_table[i].key[0] ? lock_table[i].key : "(obj)");
+                kernel_serial_print("\n");
+                found = 1;
+            }
+            if (!found) kernel_serial_print("  (no locks held)\n");
+        }
+
         else if (sh_eq(input_buffer, "ipc stat")) {
             do_syscall(SYS_SLS_IPC_STAT, 0);
         }
