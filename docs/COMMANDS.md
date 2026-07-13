@@ -483,7 +483,7 @@ Demo accounts:
 | `GET`  | `/api/locks`          | None | Active row locks (DB2)               |
 
 
-#### Journaling — DB1
+#### Journaling
 
 
 | Method | Path                            | Auth        | Description                                              |
@@ -494,7 +494,7 @@ Demo accounts:
 | `GET`  | `/api/journal/<name>[?since=N]` | None        | JSON array of journal entries from sequence N            |
 
 
-#### Indexes — DB3
+#### Indexes
 
 
 | Method | Path                            | Auth        | Description                                                       |
@@ -506,7 +506,7 @@ Demo accounts:
 | `POST` | `/api/index/rebuild`            | `APP_USER+` | `{"name":"…"}`                                                    |
 
 
-#### Constraints — DB4
+#### Constraints
 
 
 | Method | Path                         | Auth        | Description                                                                                    |
@@ -516,7 +516,7 @@ Demo accounts:
 | `POST` | `/api/constraint/remove`     | `APP_USER+` | `{"table":"…","field":"…","type":"…"}`                                                         |
 
 
-#### Cursors — DB5
+#### Cursors
 
 
 | Method | Path                         | Auth        | Description                                                                     |
@@ -527,7 +527,7 @@ Demo accounts:
 | `GET`  | `/api/cursor/close?id=N`     | None        | Close cursor                                                                    |
 
 
-#### Aggregates — DB6
+#### Aggregates
 
 
 | Method | Path             | Auth        | Description                                                                                                                               |
@@ -537,7 +537,7 @@ Demo accounts:
 
 `fn` can be empty (or omitted) for a plain ORDER BY without aggregation.
 
-#### Materialized Query Tables — DB7
+#### Materialized Query Tables
 
 
 | Method | Path               | Auth        | Description                                                      |
