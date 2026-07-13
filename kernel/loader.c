@@ -1,6 +1,7 @@
 #include "loader.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
+#include "process.h"
 #include "../arch/x86/user_paging.h"
 
 // frame_pool.c has no header — declare the allocator directly
@@ -298,7 +299,7 @@ uint64_t sys_sls_load(const char* object_name, uint32_t owner_uid) {
 // accepts the new OBJ_TYPE_PROGRAM type that represents a named executable in
 // the SLS object store — the OS-native replacement for filesystem executables.
 uint64_t program_load(const char* object_name, uint32_t owner_uid) {
-    // Verify the object exists and has the correct type
+    // Validate type before handing off to program_spawn()
     int found = 0;
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         if (!object_catalog[i].active) continue;
@@ -320,16 +321,6 @@ uint64_t program_load(const char* object_name, uint32_t owner_uid) {
         return 0;
     }
 
-    // Reuse the same binary store and process-create path as sys_sls_load.
-    // The binary must have been uploaded via SYS_SLS_UPLOAD_BINARY beforehand.
-    struct ProcCreateRequest req;
-    ld_strncpy(req.object_name, object_name, PROC_NAME_LEN);
-    req.owner_uid = owner_uid;
-    uint64_t pid = process_create(&req);
-    if (pid) {
-        kernel_serial_printf(
-            "[LOADER] program_load: spawned '%s' as PID %llu.\n",
-            object_name, pid);
-    }
-    return pid;
+    // Delegate to program_spawn() which owns the page-table mapping pipeline
+    return (uint64_t)program_spawn(object_name, owner_uid);
 }

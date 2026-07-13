@@ -58,6 +58,12 @@ uint32_t process_create(struct ProcCreateRequest* req);  // returns PID or 0
 void     process_kill(uint32_t pid);
 void     sys_sls_proc_list(void);
 
+// Spawn a Ring-3 process from an OBJ_TYPE_PROGRAM catalog object.
+// Identical pipeline to process_create() but accepts PROGRAM type,
+// making OBJ_TYPE_PROGRAM the SLS-native replacement for a filesystem exec.
+// Returns the new PID on success, 0 on failure.
+uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
+
 // Low-level: enter user space via sysretq (does not return in kernel context)
 void enter_user_process(uint64_t cr3, uint64_t rip, uint64_t rsp);
 

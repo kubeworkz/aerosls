@@ -126,6 +126,107 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     return pd->pid;
 }
 
+// ─── program_spawn ────────────────────────────────────────────────────────────
+// Spawn a Ring-3 process from an OBJ_TYPE_PROGRAM catalog object.
+//
+// Design notes:
+//   - OBJ_TYPE_PROGRAM is the SLS-native executable concept: the type tag in
+//     the catalog IS the execute permission. No filesystem, no chmod +x.
+//   - The binary image was uploaded via SYS_SLS_UPLOAD_BINARY and lives in the
+//     ServiceBinary store keyed by object name, exactly as SERVICE_PROCESS.
+//   - Page-table mapping reuses loader_load_into_process() which handles both
+//     ELF64 and flat binaries. NX bits are set per ELF segment flags.
+//   - User stack is placed immediately above the object's virtual range, with
+//     a one-page guard gap, identical to the SERVICE_PROCESS layout.
+uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
+    if (!object_name) return 0;
+
+    // 1. Look up the OBJ_TYPE_PROGRAM object
+    struct SLSObjectEntry* obj = 0;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (!object_catalog[i].active) continue;
+        if (object_catalog[i].type != OBJ_TYPE_PROGRAM) continue;
+        if (pr_streq(object_catalog[i].name, object_name)) {
+            obj = &object_catalog[i];
+            break;
+        }
+    }
+    if (!obj) {
+        kernel_serial_printf(
+            "[PROC] program_spawn: OBJ_TYPE_PROGRAM '%s' not found in catalog.\n",
+            object_name);
+        return 0;
+    }
+
+    // 2. Find a free process slot
+    struct ProcessDescriptor* pd = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) { pd = &proc_table[i]; break; }
+    }
+    if (!pd) {
+        kernel_serial_print("[PROC] program_spawn: process table full.\n");
+        return 0;
+    }
+
+    // 3. Clone the kernel page table (upper half only) — fresh address space
+    uint64_t new_cr3 = user_clone_page_table();
+    if (!new_cr3) {
+        kernel_serial_print("[PROC] program_spawn: page table clone failed.\n");
+        return 0;
+    }
+    uint64_t* pml4 = (uint64_t*)(uintptr_t)new_cr3;
+
+    // 4. Map the program binary into the new address space.
+    //    loader_load_into_process() handles ELF64 (per-segment NX/RW flags)
+    //    and flat binaries (mapped executable at obj->base_vaddr).
+    //    OBJ_TYPE_PROGRAM pages get NX cleared only for executable segments —
+    //    data/BSS segments keep NX set, enforcing W^X at the page level.
+    uint64_t entry_rip = loader_load_into_process(
+                             object_name, obj->base_vaddr, pml4);
+    if (!entry_rip) {
+        kernel_serial_printf(
+            "[PROC] program_spawn: '%s' has no binary. "
+            "Upload via SYS_SLS_UPLOAD_BINARY first.\n", object_name);
+        return 0;   // refuse to spawn an empty PROGRAM object
+    }
+
+    // 5. Allocate and map a user-space stack (W, no-exec, user-accessible)
+    //    Guard gap: leave one page between the text segment and the stack.
+    uint64_t stack_base = obj->base_vaddr
+                        + (uint64_t)obj->size_pages * 4096
+                        + 4096; /* guard page */
+    for (uint32_t p = 0; p < PROC_USER_STACK_PAGES; p++) {
+        void* frame = allocate_physical_ram_frame();
+        if (!frame) break;
+        user_map_page(pml4, stack_base + (uint64_t)p * 4096,
+                      (uint64_t)(uintptr_t)frame,
+                      USER_PTE_PRESENT | USER_PTE_USER
+                      | USER_PTE_WRITE | USER_PTE_NOEXEC);
+    }
+    uint64_t user_rsp = stack_base + PROC_USER_STACK_PAGES * 4096 - 16;
+
+    // 6. Populate the process descriptor
+    pd->pid          = next_pid++;
+    pr_strcpy(pd->name, object_name, PROC_NAME_LEN);
+    pd->object_id    = obj->object_id;
+    pd->cr3          = new_cr3;
+    pd->user_rip     = entry_rip;
+    pd->user_rsp     = user_rsp;
+    pd->owner_uid    = owner_uid;
+    pd->state        = PROC_RUNNING;
+    pd->active       = 1;
+    proc_count++;
+
+    kernel_serial_printf(
+        "[PROC] program_spawn: PID %u '%s'  "
+        "RIP=0x%016lx  RSP=0x%016lx  CR3=0x%016lx\n",
+        pd->pid, pd->name, pd->user_rip, pd->user_rsp, pd->cr3);
+
+    // 7. Enter Ring-3 — does not return to caller
+    enter_user_process(pd->cr3, pd->user_rip, pd->user_rsp);
+    return pd->pid; /* unreachable after enter_user_process */
+}
+
 // ─── process_kill ─────────────────────────────────────────────────────────────
 void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
