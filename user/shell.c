@@ -11,6 +11,7 @@
 #include "../kernel/journal.h"
 #include "../kernel/lock_mgr.h"
 #include "../kernel/index_mgr.h"
+#include "../kernel/constraint.h"
 #include "../kernel/process.h"
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
@@ -142,6 +143,13 @@ static void print_help(void) {
         "  index rebuild <name>             rescan table and rebuild\n"
         "  index drop <name>                remove an index\n"
         "  index scan <name> [<value>]      lookup / range scan via index\n"
+        "  -- Constraints (DB4 / data integrity) --\n"
+        "  constraint add <tbl> <fld> UNIQUE              no duplicate values\n"
+        "  constraint add <tbl> <fld> NOT_NULL            reject empty values\n"
+        "  constraint add <tbl> <fld> RANGE <min> <max>   numeric range check\n"
+        "  constraint add <tbl> <fld> REFERENCE <reftbl>  FK integrity\n"
+        "  constraint list [<table>]                       show constraints\n"
+        "  constraint remove <tbl> <fld> <type>           drop a constraint\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -760,6 +768,64 @@ void sls_shell_loop(void) {
             while(*p == ' ') p++;
             kernel_serial_print("[INDEX] scan results:\n");
             index_range_scan(iname, *p ? p : "", shell_index_scan_cb);
+        }
+
+        // ── DB4: constraint commands ──────────────────────────────────────────
+        else if (sh_starts(input_buffer, "constraint add ")) {
+            const char* p = input_buffer + 15;
+            char tbl[64], fld[64], typ[16];
+            tbl[0] = fld[0] = typ[0] = '\0';
+            int ti=0; while(*p&&*p!=' '&&ti<63) tbl[ti++]=*p++; while(*p==' ')p++;
+            int fi=0; while(*p&&*p!=' '&&fi<63) fld[fi++]=*p++; while(*p==' ')p++;
+            int yi=0; while(*p&&*p!=' '&&yi<15) typ[yi++]=*p++; while(*p==' ')p++;
+            if      (!strcmp(typ, "UNIQUE"))    constraint_add_unique(tbl, fld);
+            else if (!strcmp(typ, "NOT_NULL"))  constraint_add_not_null(tbl, fld);
+            else if (!strcmp(typ, "REFERENCE")) constraint_add_reference(tbl, fld, p);
+            else if (!strcmp(typ, "RANGE")) {
+                char smin[20], smax[20]; smin[0]=smax[0]='\0';
+                int mi=0; while(*p&&*p!=' '&&mi<19) smin[mi++]=*p++; while(*p==' ')p++;
+                int xi=0; while(*p&&xi<19) smax[xi++]=*p++;
+                int64_t mn=0,mx=0;
+                const char*q=smin; int neg=(*q=='-'?q++,1:0);
+                while(*q>='0'&&*q<='9'){mn=mn*10+(*q-'0');q++;} if(neg)mn=-mn;
+                q=smax; neg=(*q=='-'?q++,1:0);
+                while(*q>='0'&&*q<='9'){mx=mx*10+(*q-'0');q++;} if(neg)mx=-mx;
+                constraint_add_range(tbl, fld, mn, mx);
+            }
+        }
+        else if (sh_starts(input_buffer, "constraint list")) {
+            const char* tbl = sh_eq(input_buffer, "constraint list")
+                            ? "" : input_buffer + 16;
+            int found = 0;
+            static const char* const ctnames[] = {"UNIQUE","NOT_NULL","RANGE","REFERENCE"};
+            for (int i = 0; i < CONSTRAINT_MAX; i++) {
+                if (!constraint_table[i].active) continue;
+                if (tbl[0] && !sh_eq(constraint_table[i].table_name, tbl)) continue;
+                kernel_serial_print("  ");
+                kernel_serial_print(constraint_table[i].table_name);
+                kernel_serial_print(".");
+                kernel_serial_print(constraint_table[i].field_name);
+                kernel_serial_print(" ");
+                kernel_serial_print(constraint_table[i].type <= 3
+                                    ? ctnames[constraint_table[i].type] : "?");
+                kernel_serial_print("\n");
+                found = 1;
+            }
+            if (!found) kernel_serial_print("  (no constraints)\n");
+        }
+        else if (sh_starts(input_buffer, "constraint remove ")) {
+            const char* p = input_buffer + 18;
+            char tbl[64], fld[64], typ[16];
+            tbl[0]=fld[0]=typ[0]='\0';
+            int ti=0; while(*p&&*p!=' '&&ti<63) tbl[ti++]=*p++; while(*p==' ')p++;
+            int fi=0; while(*p&&*p!=' '&&fi<63) fld[fi++]=*p++; while(*p==' ')p++;
+            int yi=0; while(*p&&yi<15) typ[yi++]=*p++;
+            int t=-1;
+            if (!strcmp(typ,"UNIQUE"))    t=0;
+            else if (!strcmp(typ,"NOT_NULL"))  t=1;
+            else if (!strcmp(typ,"RANGE"))     t=2;
+            else if (!strcmp(typ,"REFERENCE")) t=3;
+            constraint_remove(tbl, fld, t);
         }
 
         else if (sh_eq(input_buffer, "ipc stat")) {

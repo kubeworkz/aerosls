@@ -2,6 +2,7 @@
 #include "journal.h"
 #include "lock_mgr.h"
 #include "index_mgr.h"
+#include "constraint.h"
 #include "../user/permissions.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
@@ -370,12 +371,18 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             uint32_t tid = kernel_get_current_thread_id();
             uint64_t tx  = tx_get_active(tid);
             if (tx) {
+                // Constraint check before acquiring lock or staging to WAL
+                int cv = constraint_check_update(req->name, req->key,
+                                                 rec->fields[i].value, req->value);
+                if (cv) {
+                    kernel_serial_printf("[DB] UPDATE blocked by constraint (code %d)\n", cv);
+                    return 3;
+                }
                 // Acquire exclusive row lock before staging to WAL.
-                // Rejects the write if another transaction holds the key.
                 if (lock_acquire(tx, object_catalog[obj_idx].object_id,
                                  req->key, LOCK_EXCLUSIVE) != 0) {
                     kernel_serial_print("[DB] UPDATE blocked: lock conflict\n");
-                    return 2;  // conflict — caller should rollback
+                    return 2;
                 }
                 wal_stage(tid, object_catalog[obj_idx].object_id,
                           req->key, rec->fields[i].value, req->value);
@@ -391,6 +398,14 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             }
 
             // Direct write — no open transaction
+            {
+                int cv = constraint_check_update(req->name, req->key,
+                                                 rec->fields[i].value, req->value);
+                if (cv) {
+                    kernel_serial_printf("[DB] UPDATE blocked by constraint (code %d)\n", cv);
+                    return 3;
+                }
+            }
             // Journal: write UB + UP immediately (auto-commit, no tx)
             journal_write(req->name, req->key,
                           rec->fields[i].value, req->value,
@@ -439,6 +454,12 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
     uint32_t tid = kernel_get_current_thread_id();
     uint64_t tx  = tx_get_active(tid);
     if (tx) {
+        // Constraint check before acquiring lock + staging to WAL
+        int cv = constraint_check_insert(req->name, req->key, req->value);
+        if (cv) {
+            kernel_serial_printf("[DB] INSERT blocked by constraint (code %d)\n", cv);
+            return 3;
+        }
         // Acquire exclusive lock on the new key
         if (lock_acquire(tx, object_catalog[obj_idx].object_id,
                          req->key, LOCK_EXCLUSIVE) != 0) {
@@ -457,6 +478,12 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
     // Direct insert
     for (uint32_t i = 0; i < RECORD_MAX_FIELDS; i++) {
         if (!rec->fields[i].active) {
+            // Constraint check for direct (auto-commit) inserts
+            int cv = constraint_check_insert(req->name, req->key, req->value);
+            if (cv) {
+                kernel_serial_printf("[DB] INSERT blocked by constraint (code %d)\n", cv);
+                return 3;
+            }
             cat_strncpy(rec->fields[i].key,   req->key,   RECORD_KEY_LEN);
             cat_strncpy(rec->fields[i].value, req->value, RECORD_VAL_LEN);
             rec->fields[i].active = 1;

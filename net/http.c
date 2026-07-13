@@ -11,6 +11,7 @@
 #include "../kernel/journal.h"
 #include "../kernel/lock_mgr.h"
 #include "../kernel/index_mgr.h"
+#include "../kernel/constraint.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -703,7 +704,14 @@ static void http_route(int conn, char* req) {
             blen = api_query_json(q, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        // ── GET /api/locks — active row locks ─────────────────────────────────
+        // ── GET /api/constraints[?table=<name>] ───────────────────────────────
+        if (!strcmp(path, "/api/constraints")) {
+            char tbl[OBJECT_NAME_LEN];
+            tbl[0] = '\0';
+            url_param(qs, "table", tbl, (int)sizeof(tbl));
+            blen = constraints_to_json(tbl, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         if (!strcmp(path, "/api/locks")) {
             blen = lock_to_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -849,6 +857,52 @@ static void http_route(int conn, char* req) {
             index_rebuild(iname);
             JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
             jb_obj_open(&j, 0); jb_str(&j, "ok", "true");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        // ── POST /api/constraint/add|remove ───────────────────────────────────
+        if (!strcmp(path, "/api/constraint/add")) {
+            char tbl[OBJECT_NAME_LEN], fld[RECORD_KEY_LEN], typ[16], ref[OBJECT_NAME_LEN];
+            tbl[0] = fld[0] = typ[0] = ref[0] = '\0';
+            json_str(body_ptr, "table", tbl, (int)sizeof(tbl));
+            json_str(body_ptr, "field", fld, (int)sizeof(fld));
+            json_str(body_ptr, "type",  typ, (int)sizeof(typ));
+            json_str(body_ptr, "ref",   ref, (int)sizeof(ref));
+            int rc = 1;
+            if (!strcmp(typ, "UNIQUE"))    rc = constraint_add_unique(tbl, fld);
+            else if (!strcmp(typ, "NOT_NULL"))  rc = constraint_add_not_null(tbl, fld);
+            else if (!strcmp(typ, "REFERENCE")) rc = constraint_add_reference(tbl, fld, ref);
+            else if (!strcmp(typ, "RANGE")) {
+                char smin[24], smax[24]; smin[0] = smax[0] = '\0';
+                json_str(body_ptr, "min", smin, (int)sizeof(smin));
+                json_str(body_ptr, "max", smax, (int)sizeof(smax));
+                // Parse min/max with simple atoi
+                int64_t mn = 0, mx = 0;
+                const char* p = smin; if (*p=='-'){mn=-1;p++;} int neg=mn<0; mn=0;
+                while(*p>='0'&&*p<='9'){mn=mn*10+(*p-'0');p++;} if(neg) mn=-mn;
+                p = smax; neg=0; if (*p=='-'){neg=1;p++;} mx=0;
+                while(*p>='0'&&*p<='9'){mx=mx*10+(*p-'0');p++;} if(neg) mx=-mx;
+                rc = constraint_add_range(tbl, fld, mn, mx);
+            }
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0); jb_str(&j, "ok", rc==0 ? "true" : "false");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/constraint/remove")) {
+            char tbl[OBJECT_NAME_LEN], fld[RECORD_KEY_LEN], typ[16];
+            tbl[0] = fld[0] = typ[0] = '\0';
+            json_str(body_ptr, "table", tbl, (int)sizeof(tbl));
+            json_str(body_ptr, "field", fld, (int)sizeof(fld));
+            json_str(body_ptr, "type",  typ, (int)sizeof(typ));
+            int t = -1;
+            if      (!strcmp(typ, "UNIQUE"))    t = 0;
+            else if (!strcmp(typ, "NOT_NULL"))  t = 1;
+            else if (!strcmp(typ, "RANGE"))     t = 2;
+            else if (!strcmp(typ, "REFERENCE")) t = 3;
+            int rc = constraint_remove(tbl, fld, t);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0); jb_str(&j, "ok", rc==0 ? "true" : "false");
             jb_obj_close(&j); j.buf[j.pos] = '\0';
             http_respond(conn, 200, "application/json", resp_body, j.pos); return;
         }
