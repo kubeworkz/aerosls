@@ -239,11 +239,11 @@ Server-side iterators that hold scan position across multiple FETCH calls (IBM i
 Analytics queries in a single pass over the table (IBM i `OPNQRYF / GROUP BY / ORDER BY`).
 
 
-|     |     |
-| --- | --- |
-|     |     |
-|     |     |
-|     |     |
+| Command | Description |
+| ------- | ----------- |
+|         |             |
+|         |             |
+|         |             |
 
 
 **Examples:**
