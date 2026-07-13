@@ -13,6 +13,7 @@
 #include "../kernel/index_mgr.h"
 #include "../kernel/constraint.h"
 #include "../kernel/cursor.h"
+#include "../kernel/aggregate.h"
 #include "../kernel/process.h"
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
@@ -156,6 +157,10 @@ static void print_help(void) {
         "  cursor fetch <id> [<n>]                              fetch next N rows\n"
         "  cursor close <id>                                    close cursor\n"
         "  cursor list                                          list open cursors\n"
+        "  -- Aggregates (DB6 / analytics) --\n"
+        "  aggregate <tbl> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]\n"
+        "  aggregate <tbl> SUM|AVG|MIN|MAX <field> [where <f>=<v>] [order ASC|DESC]\n"
+        "  select <tbl> [where <f>=<v>] [order <f> ASC|DESC]     ORDER BY query\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -898,6 +903,69 @@ void sls_shell_loop(void) {
                 found = 1;
             }
             if (!found) kernel_serial_print("  (no open cursors)\n");
+        }
+
+        // ── DB6: aggregate + ORDER BY commands ───────────────────────────────
+        else if (sh_starts(input_buffer, "aggregate ") ||
+                 sh_starts(input_buffer, "select ")) {
+            // aggregate <tbl> COUNT|SUM|AVG|MIN|MAX [field] [where <f>=<v>] [group <f>] [having <n>] [order ASC|DESC]
+            // select    <tbl> [where <f>=<v>] [order <f> ASC|DESC]
+            int is_select = sh_starts(input_buffer, "select ");
+            const char* p = input_buffer + (is_select ? 7 : 10);
+            struct AggQuery q;
+            q.table[0]=q.agg_field[0]=q.where_field[0]=q.where_eq[0]='\0';
+            q.group_field[0]=q.order_field[0]='\0';
+            q.having_min_count=0; q.order_desc=0;
+            q.fn = (uint8_t)AGG_NONE;
+
+            // parse table
+            int ti=0; while(*p&&*p!=' '&&ti<OBJECT_NAME_LEN-1) q.table[ti++]=*p++; q.table[ti]='\0';
+            while(*p==' ')p++;
+
+            if (!is_select) {
+                // parse fn
+                char fn_s[8]; int fi=0; while(*p&&*p!=' '&&fi<7) fn_s[fi++]=*p++; fn_s[fi]='\0';
+                while(*p==' ')p++;
+                if      (!strcmp(fn_s,"COUNT")) q.fn=(uint8_t)AGG_COUNT;
+                else if (!strcmp(fn_s,"SUM"))   q.fn=(uint8_t)AGG_SUM;
+                else if (!strcmp(fn_s,"AVG"))   q.fn=(uint8_t)AGG_AVG;
+                else if (!strcmp(fn_s,"MIN"))   q.fn=(uint8_t)AGG_MIN;
+                else if (!strcmp(fn_s,"MAX"))   q.fn=(uint8_t)AGG_MAX;
+                // parse optional field
+                if (*p && *p!='w' && *p!='g' && *p!='h' && *p!='o') {
+                    int ai=0; while(*p&&*p!=' '&&ai<RECORD_KEY_LEN-1) q.agg_field[ai++]=*p++; q.agg_field[ai]='\0';
+                    while(*p==' ')p++;
+                }
+            }
+
+            // parse optional clauses: where/group/having/order
+            while (*p) {
+                if (*p=='w'&&*(p+1)=='h'&&*(p+2)=='e'&&*(p+3)=='r'&&*(p+4)=='e'&&*(p+5)==' ') {
+                    p+=6; int wi=0; while(*p&&*p!='='&&wi<RECORD_KEY_LEN-1) q.where_field[wi++]=*p++; q.where_field[wi]='\0';
+                    if(*p=='='){p++;int vi=0;while(*p&&*p!=' '&&vi<RECORD_VAL_LEN-1) q.where_eq[vi++]=*p++; q.where_eq[vi]='\0';}
+                    while(*p==' ')p++;
+                } else if (*p=='g'&&*(p+1)=='r'&&*(p+2)=='o'&&*(p+3)=='u'&&*(p+4)=='p'&&*(p+5)==' ') {
+                    p+=6; int gi=0; while(*p&&*p!=' '&&gi<RECORD_KEY_LEN-1) q.group_field[gi++]=*p++; q.group_field[gi]='\0';
+                    while(*p==' ')p++;
+                } else if (*p=='h'&&*(p+1)=='a'&&*(p+2)=='v'&&*(p+3)=='i'&&*(p+4)=='n'&&*(p+5)=='g'&&*(p+6)==' ') {
+                    p+=7; int64_t hv=0; while(*p>='0'&&*p<='9'){hv=hv*10+(*p-'0');p++;}
+                    q.having_min_count=hv; while(*p==' ')p++;
+                } else if (*p=='o'&&*(p+1)=='r'&&*(p+2)=='d'&&*(p+3)=='e'&&*(p+4)=='r'&&*(p+5)==' ') {
+                    p+=6;
+                    // for 'select': order <field> ASC|DESC
+                    if (is_select || q.fn==(uint8_t)AGG_NONE) {
+                        int oi=0; while(*p&&*p!=' '&&oi<RECORD_KEY_LEN-1) q.order_field[oi++]=*p++; q.order_field[oi]='\0';
+                        while(*p==' ')p++;
+                    }
+                    if (*p=='D'||*p=='d') q.order_desc=1;
+                    while(*p&&*p!=' ')p++; while(*p==' ')p++;
+                } else { while(*p&&*p!=' ')p++; while(*p==' ')p++; }
+            }
+
+            static char agg_result[8192];
+            aggregate_exec(&q, agg_result, (int)sizeof(agg_result));
+            kernel_serial_print(agg_result);
+            kernel_serial_print("\n");
         }
 
         else if (sh_eq(input_buffer, "ipc stat")) {

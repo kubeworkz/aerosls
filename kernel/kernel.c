@@ -24,6 +24,7 @@
 #include "../kernel/index_mgr.h"
 #include "../kernel/constraint.h"
 #include "../kernel/cursor.h"
+#include "../kernel/aggregate.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);

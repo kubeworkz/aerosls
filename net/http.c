@@ -13,6 +13,7 @@
 #include "../kernel/index_mgr.h"
 #include "../kernel/constraint.h"
 #include "../kernel/cursor.h"
+#include "../kernel/aggregate.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -937,6 +938,39 @@ static void http_route(int conn, char* req) {
             jb_obj_open(&j, 0); jb_str(&j, "ok", rc==0 ? "true" : "false");
             jb_obj_close(&j); j.buf[j.pos] = '\0';
             http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        // ── POST /api/aggregate ────────────────────────────────────────────────
+        // Body: {"table":"...","fn":"COUNT|SUM|AVG|MIN|MAX",
+        //        "field":"...","where":"...","eq":"...",
+        //        "group_by":"...","having":N,"order_by":"...","order":"ASC|DESC"}
+        // fn="" or omitted → AGG_NONE (ORDER BY only)
+        if (!strcmp(path, "/api/aggregate")) {
+            struct AggQuery q;
+            char fn_s[8];
+            q.table[0] = q.agg_field[0] = q.where_field[0] = q.where_eq[0] = '\0';
+            q.group_field[0] = q.order_field[0] = fn_s[0] = '\0';
+            q.having_min_count = 0; q.order_desc = 0;
+            json_str(body_ptr, "table",    q.table,       OBJECT_NAME_LEN);
+            json_str(body_ptr, "fn",       fn_s,          (int)sizeof(fn_s));
+            json_str(body_ptr, "field",    q.agg_field,   RECORD_KEY_LEN);
+            json_str(body_ptr, "where",    q.where_field, RECORD_KEY_LEN);
+            json_str(body_ptr, "eq",       q.where_eq,    RECORD_VAL_LEN);
+            json_str(body_ptr, "group_by", q.group_field, RECORD_KEY_LEN);
+            json_str(body_ptr, "order_by", q.order_field, RECORD_KEY_LEN);
+            char ord_dir[8]; ord_dir[0] = '\0';
+            json_str(body_ptr, "order",    ord_dir,       (int)sizeof(ord_dir));
+            if (ord_dir[0] == 'D' || ord_dir[0] == 'd') q.order_desc = 1;
+            int hav = json_int(body_ptr, "having");
+            q.having_min_count = (int64_t)(hav > 0 ? hav : 0);
+            // Map fn string to enum
+            if      (!strcmp(fn_s,"COUNT")) q.fn = (uint8_t)AGG_COUNT;
+            else if (!strcmp(fn_s,"SUM"))   q.fn = (uint8_t)AGG_SUM;
+            else if (!strcmp(fn_s,"AVG"))   q.fn = (uint8_t)AGG_AVG;
+            else if (!strcmp(fn_s,"MIN"))   q.fn = (uint8_t)AGG_MIN;
+            else if (!strcmp(fn_s,"MAX"))   q.fn = (uint8_t)AGG_MAX;
+            else                            q.fn = (uint8_t)AGG_NONE;
+            blen = aggregate_exec(&q, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── POST /api/cursor/open ─────────────────────────────────────────────
         if (!strcmp(path, "/api/cursor/open")) {
