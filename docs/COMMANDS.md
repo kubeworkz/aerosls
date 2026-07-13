@@ -271,7 +271,7 @@ Pre-computed aggregate tables that auto-refresh on every committed INSERT, UPDAT
 | `mqt scan <name>`                                                                    | Show current result records        |
 
 
-MQT results are stored as regular `DB_TABLE` records — readable via `select`, indexable via DB3, and queryable via DB5/DB6.  The `refreshed_tick` key records the kernel tick at last refresh.
+MQT results are stored as regular `DB_TABLE` records - readable via `select`, indexable, and queryable.  The `refreshed_tick` key records the kernel tick at last refresh.
 
 ---
 
