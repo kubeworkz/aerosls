@@ -242,8 +242,8 @@ Analytics queries in a single pass over the table (IBM i `OPNQRYF / GROUP BY / O
 | Command                                                                      | Description                             |
 | ---------------------------------------------------------------------------- | --------------------------------------- |
 | `aggregate <table> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]`   | Count matching rows, optionally grouped |
-| `aggregate <table> SUM/AVG/MIN/MAX <field> [where <f>=<v>] [order ASC/DESC]` | Numeric aggregate                       |
-| Testing                                                                      | ORDER BY with no aggregation            |
+| `aggregate <table> SUM/AVG/MIN/MAX <field> [where <f>=<v>] [order ASC|DESC]` | Numeric aggregate                       |
+| `select <table> [where <f>=<v>]`                                             | ORDER BY with no aggregation            |
 
 
 **Examples:**
