@@ -568,6 +568,16 @@ static int api_query_json(const char* q, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── uint64 → decimal string (freestanding; no printf) ─────────────────────
+static void prog_u64_to_str(uint64_t v, char* out, int max) {
+    if (max < 2) { out[0] = '\0'; return; }
+    if (v == 0) { out[0] = '0'; out[1] = '\0'; return; }
+    char tmp[21]; int len = 0;
+    while (v && len < 20) { tmp[len++] = (char)('0' + v % 10); v /= 10; }
+    int i; for (i = 0; i < len && i < max - 1; i++) out[i] = tmp[len - 1 - i];
+    out[i] = '\0';
+}
+
 // ─── Hex decode helper (used by program upload) ─────────────────────────────
 static size_t hex_decode(const char* hex, uint8_t* out, size_t max_bytes) {
     size_t n = 0;
@@ -649,6 +659,28 @@ static int api_program_create(const char* body, char* buf, int max) {
     uint64_t id = sys_sls_valloc(&req);
     jb_obj_open(&j, 0);
     if (id) {
+        /* Step 4: seed metadata records so the full DB1-DB7 hook chain
+           (journal, lock, index, constraint, MQT) fires on every
+           subsequent upload and spawn lifecycle event. */
+        struct SLSRecordRequest mr;
+        int i; for (i=0;i<OBJECT_NAME_LEN-1&&req.name[i];i++) mr.name[i]=req.name[i]; mr.name[i]='\0';
+        mr.key[0]='\0'; mr.value[0]='\0';
+        /* status */
+        mr.key[0]='s'; mr.key[1]='t'; mr.key[2]='a'; mr.key[3]='t'; mr.key[4]='u'; mr.key[5]='s'; mr.key[6]='\0';
+        mr.value[0]='c'; mr.value[1]='r'; mr.value[2]='e'; mr.value[3]='a'; mr.value[4]='t'; mr.value[5]='e'; mr.value[6]='d'; mr.value[7]='\0';
+        sys_sls_insert(&mr);
+        /* binary_size */
+        const char* bsk = "binary_size"; for (i=0;bsk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=bsk[i]; mr.key[i]='\0';
+        mr.value[0]='0'; mr.value[1]='\0';
+        sys_sls_insert(&mr);
+        /* format */
+        const char* fmk = "format"; for (i=0;fmk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=fmk[i]; mr.key[i]='\0';
+        mr.value[0]='n'; mr.value[1]='o'; mr.value[2]='n'; mr.value[3]='e'; mr.value[4]='\0';
+        sys_sls_insert(&mr);
+        /* last_pid */
+        const char* lpk = "last_pid"; for (i=0;lpk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=lpk[i]; mr.key[i]='\0';
+        mr.value[0]='0'; mr.value[1]='\0';
+        sys_sls_insert(&mr);
         jb_str(&j, "ok",   "true");     jb_putc(&j, ',');
         jb_hex(&j, "object_id", id);    jb_putc(&j, ',');
         jb_str(&j, "type", "PROGRAM");
@@ -697,6 +729,35 @@ static int api_program_upload(const char* body, char* buf, int max) {
         jb_uint(&j, "bytes_written", (uint64_t)ureq.chunk_len);   jb_putc(&j, ',');
         jb_uint(&j, "offset",        (uint64_t)ureq.byte_offset); jb_putc(&j, ',');
         jb_str(&j,  "final",         ureq.is_last ? "true" : "false");
+        /* Step 4: on the final chunk, write metadata records so journal,
+           index, and MQT machinery see the completed upload. */
+        if (rc == 0 && ureq.is_last) {
+            /* Discover binary size + format from the store */
+            uint32_t tot_bytes = 0;
+            const char* fmt_str = "flat";
+            for (int b = 0; b < MAX_SERVICE_BINARIES; b++) {
+                if (service_binaries[b].active &&
+                    !strcmp(service_binaries[b].object_name, ureq.object_name)) {
+                    tot_bytes = service_binaries[b].size;
+                    fmt_str   = service_binaries[b].is_elf ? "ELF64" : "flat";
+                    break;
+                }
+            }
+            struct SLSRecordRequest mr;
+            int i; for (i=0;i<PROC_NAME_LEN-1&&ureq.object_name[i];i++) mr.name[i]=ureq.object_name[i]; mr.name[i]='\0';
+            /* binary_size */
+            const char* bsk="binary_size"; for (i=0;bsk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=bsk[i]; mr.key[i]='\0';
+            prog_u64_to_str((uint64_t)tot_bytes, mr.value, RECORD_VAL_LEN);
+            sys_sls_update(&mr);
+            /* format */
+            const char* fmk="format"; for (i=0;fmk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=fmk[i]; mr.key[i]='\0';
+            for (i=0;fmt_str[i]&&i<RECORD_VAL_LEN-1;i++) mr.value[i]=fmt_str[i]; mr.value[i]='\0';
+            sys_sls_update(&mr);
+            /* status -> ready */
+            const char* stk="status"; for (i=0;stk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=stk[i]; mr.key[i]='\0';
+            mr.value[0]='r'; mr.value[1]='e'; mr.value[2]='a'; mr.value[3]='d'; mr.value[4]='y'; mr.value[5]='\0';
+            sys_sls_update(&mr);
+        }
     }
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
@@ -722,6 +783,20 @@ static int api_program_spawn_handler(const char* body, char* buf, int max) {
     jb_obj_open(&j, 0);
     jb_str(&j,  "ok",  pid ? "true" : "false"); jb_putc(&j, ',');
     jb_uint(&j, "pid", pid);
+    /* Step 4: on successful spawn, update metadata records so journal
+       captures the before/after audit trail and MQTs auto-refresh. */
+    if (pid) {
+        struct SLSRecordRequest mr;
+        int i; for (i=0;i<OBJECT_NAME_LEN-1&&pname[i];i++) mr.name[i]=pname[i]; mr.name[i]='\0';
+        /* status -> running */
+        const char* stk="status"; for (i=0;stk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=stk[i]; mr.key[i]='\0';
+        mr.value[0]='r'; mr.value[1]='u'; mr.value[2]='n'; mr.value[3]='n'; mr.value[4]='i'; mr.value[5]='n'; mr.value[6]='g'; mr.value[7]='\0';
+        sys_sls_update(&mr);
+        /* last_pid */
+        const char* lpk="last_pid"; for (i=0;lpk[i]&&i<RECORD_KEY_LEN-1;i++) mr.key[i]=lpk[i]; mr.key[i]='\0';
+        prog_u64_to_str(pid, mr.value, RECORD_VAL_LEN);
+        sys_sls_update(&mr);
+    }
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
