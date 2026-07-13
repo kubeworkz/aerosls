@@ -12,6 +12,7 @@
 #include "../kernel/lock_mgr.h"
 #include "../kernel/index_mgr.h"
 #include "../kernel/constraint.h"
+#include "../kernel/cursor.h"
 #include "../kernel/process.h"
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
@@ -150,6 +151,11 @@ static void print_help(void) {
         "  constraint add <tbl> <fld> REFERENCE <reftbl>  FK integrity\n"
         "  constraint list [<table>]                       show constraints\n"
         "  constraint remove <tbl> <fld> <type>           drop a constraint\n"
+        "  -- Cursors (DB5 / server-side iteration) --\n"
+        "  cursor open <tbl> [where <fld>=<val>] [order <idx>]  open a cursor\n"
+        "  cursor fetch <id> [<n>]                              fetch next N rows\n"
+        "  cursor close <id>                                    close cursor\n"
+        "  cursor list                                          list open cursors\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -826,6 +832,72 @@ void sls_shell_loop(void) {
             else if (!strcmp(typ,"RANGE"))     t=2;
             else if (!strcmp(typ,"REFERENCE")) t=3;
             constraint_remove(tbl, fld, t);
+        }
+
+        // ── DB5: cursor commands ──────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "cursor open ")) {
+            // cursor open <table> [where <field>=<value>] [order <index>]
+            const char* p = input_buffer + 12;
+            char tbl[64], wfld[64], wval[64], oidx[64];
+            tbl[0] = wfld[0] = wval[0] = oidx[0] = '\0';
+            int ti = 0; while (*p && *p != ' ' && ti < 63) tbl[ti++] = *p++;
+            while (*p == ' ') p++;
+            // optional: where <field>=<value>
+            if (*p == 'w' && *(p+1)=='h' && *(p+2)=='e' && *(p+3)=='r' && *(p+4)=='e' && *(p+5)==' ') {
+                p += 6;
+                int fi = 0; while (*p && *p != '=' && fi < 63) wfld[fi++] = *p++;
+                if (*p == '=') { p++; int vi = 0; while (*p && *p != ' ' && vi < 63) wval[vi++] = *p++; }
+                while (*p == ' ') p++;
+            }
+            // optional: order <index_name>
+            if (*p == 'o' && *(p+1)=='r' && *(p+2)=='d' && *(p+3)=='e' && *(p+4)=='r' && *(p+5)==' ') {
+                p += 6;
+                int oi = 0; while (*p && oi < 63) oidx[oi++] = *p++;
+            }
+            uint32_t cid = cursor_open(tbl, wfld, wval, oidx);
+            if (cid) {
+                kernel_serial_print("[CURSOR] id=");
+                kernel_serial_print_hex64(cid);
+                kernel_serial_print("\n");
+            }
+        }
+        else if (sh_starts(input_buffer, "cursor fetch ")) {
+            const char* p = input_buffer + 13;
+            uint32_t cid = 0; while (*p >= '0' && *p <= '9') { cid = cid*10+(*p-'0'); p++; }
+            while (*p == ' ') p++;
+            uint32_t nrows = 5; if (*p) { nrows = 0; while (*p >= '0' && *p <= '9') { nrows = nrows*10+(*p-'0'); p++; } }
+            if (!nrows) nrows = 5;
+            static char cursor_fetch_buf[4096];
+            cursor_fetch(cid, nrows, cursor_fetch_buf, (int)sizeof(cursor_fetch_buf));
+            kernel_serial_print(cursor_fetch_buf);
+            kernel_serial_print("\n");
+        }
+        else if (sh_starts(input_buffer, "cursor close ")) {
+            uint32_t cid = 0;
+            const char* p = input_buffer + 13;
+            while (*p >= '0' && *p <= '9') { cid = cid*10+(*p-'0'); p++; }
+            cursor_close(cid);
+        }
+        else if (sh_eq(input_buffer, "cursor list")) {
+            int found = 0;
+            for (int i = 0; i < CURSOR_MAX; i++) {
+                if (!cursor_table[i].active) continue;
+                kernel_serial_print("  #");
+                kernel_serial_print_hex64(cursor_table[i].cursor_id);
+                kernel_serial_print(" ");
+                kernel_serial_print(cursor_table[i].table_name);
+                if (cursor_table[i].where_field[0]) {
+                    kernel_serial_print(" where ");
+                    kernel_serial_print(cursor_table[i].where_field);
+                    if (cursor_table[i].where_value[0]) {
+                        kernel_serial_print("=");
+                        kernel_serial_print(cursor_table[i].where_value);
+                    }
+                }
+                kernel_serial_print(cursor_table[i].done ? " DONE\n" : "\n");
+                found = 1;
+            }
+            if (!found) kernel_serial_print("  (no open cursors)\n");
         }
 
         else if (sh_eq(input_buffer, "ipc stat")) {

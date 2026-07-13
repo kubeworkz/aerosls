@@ -12,6 +12,7 @@
 #include "../kernel/lock_mgr.h"
 #include "../kernel/index_mgr.h"
 #include "../kernel/constraint.h"
+#include "../kernel/cursor.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -712,6 +713,37 @@ static void http_route(int conn, char* req) {
             blen = constraints_to_json(tbl, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── GET /api/cursors — list open cursors ──────────────────────────────
+        if (!strcmp(path, "/api/cursors")) {
+            blen = cursors_to_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── GET /api/cursor/fetch?id=N&n=M ────────────────────────────────────
+        if (!strcmp(path, "/api/cursor/fetch")) {
+            char sid[16], sn[8];
+            sid[0] = sn[0] = '\0';
+            url_param(qs, "id", sid, (int)sizeof(sid));
+            url_param(qs, "n",  sn,  (int)sizeof(sn));
+            uint32_t cid = 0; const char* sp = sid;
+            while (*sp >= '0' && *sp <= '9') { cid = cid * 10 + (uint32_t)(*sp - '0'); sp++; }
+            uint32_t nrows = 10; sp = sn;
+            if (*sp) { nrows = 0; while (*sp >= '0' && *sp <= '9') { nrows = nrows * 10 + (uint32_t)(*sp - '0'); sp++; } }
+            if (!nrows) nrows = 10;
+            blen = cursor_fetch(cid, nrows, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── GET /api/cursor/close?id=N ────────────────────────────────────────
+        if (!strcmp(path, "/api/cursor/close")) {
+            char sid[16]; sid[0] = '\0';
+            url_param(qs, "id", sid, (int)sizeof(sid));
+            uint32_t cid = 0; const char* sp = sid;
+            while (*sp >= '0' && *sp <= '9') { cid = cid * 10 + (uint32_t)(*sp - '0'); sp++; }
+            cursor_close(cid);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0); jb_str(&j, "ok", "true");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
         if (!strcmp(path, "/api/locks")) {
             blen = lock_to_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -903,6 +935,23 @@ static void http_route(int conn, char* req) {
             int rc = constraint_remove(tbl, fld, t);
             JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
             jb_obj_open(&j, 0); jb_str(&j, "ok", rc==0 ? "true" : "false");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        // ── POST /api/cursor/open ─────────────────────────────────────────────
+        if (!strcmp(path, "/api/cursor/open")) {
+            char tbl[OBJECT_NAME_LEN], wfld[RECORD_KEY_LEN];
+            char wval[RECORD_VAL_LEN], oidx[OBJECT_NAME_LEN];
+            tbl[0] = wfld[0] = wval[0] = oidx[0] = '\0';
+            json_str(body_ptr, "table",  tbl,  (int)sizeof(tbl));
+            json_str(body_ptr, "where",  wfld, (int)sizeof(wfld));
+            json_str(body_ptr, "eq",     wval, (int)sizeof(wval));
+            json_str(body_ptr, "order",  oidx, (int)sizeof(oidx));
+            uint32_t cid = cursor_open(tbl, wfld, wval, oidx);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0);
+            jb_str(&j, "ok", cid > 0 ? "true" : "false"); jb_putc(&j, ',');
+            jb_uint(&j, "cursor_id", cid);
             jb_obj_close(&j); j.buf[j.pos] = '\0';
             http_respond(conn, 200, "application/json", resp_body, j.pos); return;
         }
