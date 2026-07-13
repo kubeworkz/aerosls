@@ -1,4 +1,4 @@
-# AeroSLS OS
+# AeroSLS OS - A Novel Flat Memory Operating system
 
 ---
 
@@ -219,4 +219,8 @@ Demo tokens (no real password check):
 | `carol@gridworkz.com` | `DB_ADMIN` | `feedf00dabcdef0112345678deadc0de` |
 | `guest@sandbox.com`   | `GUEST`    | `deadc0de9988776655443322aabbccdd` |
 
+
+
+
+# Flatter is Better
 
