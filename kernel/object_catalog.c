@@ -1,6 +1,7 @@
 #include "object_catalog.h"
 #include "journal.h"
 #include "lock_mgr.h"
+#include "index_mgr.h"
 #include "../user/permissions.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
@@ -394,6 +395,9 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             journal_write(req->name, req->key,
                           rec->fields[i].value, req->value,
                           JENT_UB, 0);
+            // Update any indexes on this field before changing the value
+            index_on_update(req->name, req->key, req->key,
+                            rec->fields[i].value, req->value);
             cat_strncpy(rec->fields[i].value, req->value, RECORD_VAL_LEN);
             journal_write(req->name, req->key,
                           "", req->value, JENT_UP, 0);
@@ -458,6 +462,7 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
             rec->fields[i].active = 1;
             rec->field_count++;
             journal_write(req->name, req->key, "", req->value, JENT_PT, 0);
+            index_on_insert(req->name, req->key, req->key, req->value);
             kernel_serial_printf("[DB] INSERT %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
             return 0;
@@ -510,6 +515,8 @@ uint64_t sys_sls_delete(struct SLSRecordRequest* req) {
         rec->fields[i].active = 0;
         rec->field_count--;
         tier_notify_access(e->object_id);
+        // Remove this key from all indexes on the table
+        index_on_delete(req->name, req->key);
         kernel_serial_printf("[DB] DELETE %s.%s  [OK]\n", req->name, req->key);
         return 0;
     }

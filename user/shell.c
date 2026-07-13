@@ -10,6 +10,7 @@
 #include "../kernel/query_engine.h"
 #include "../kernel/journal.h"
 #include "../kernel/lock_mgr.h"
+#include "../kernel/index_mgr.h"
 #include "../kernel/process.h"
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
@@ -135,6 +136,12 @@ static void print_help(void) {
         "  ipc post <svc> <opcode_hex>    post a raw IPC message for testing\n"
         "  -- Row Locks (DB2 / Read-Committed isolation) --\n"
         "  lock list                      show all active row locks\n"
+        "  -- Indexes (DB3 / keyed access path) --\n"
+        "  index create <idx> <tbl> <fld>  build a sorted index on a field\n"
+        "  index list                       show all indexes\n"
+        "  index rebuild <name>             rescan table and rebuild\n"
+        "  index drop <name>                remove an index\n"
+        "  index scan <name> [<value>]      lookup / range scan via index\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -169,6 +176,13 @@ static uint32_t parse_hex(const char* s) {
 }
 
 // ─── Main Shell Loop ──────────────────────────────────────────────────────────
+// File-scope callback for the 'index scan' shell command
+static int shell_index_scan_cb(const char* k, const char* v) {
+    kernel_serial_print("  key="); kernel_serial_print(k);
+    kernel_serial_print("  val="); kernel_serial_print(v);
+    kernel_serial_print("\n"); return 1;
+}
+
 void sls_shell_loop(void) {
     char input_buffer[256];
     kernel_serial_print("\n--- Multi-User SLS Secure Shell Active ---\n");
@@ -701,6 +715,51 @@ void sls_shell_loop(void) {
                 found = 1;
             }
             if (!found) kernel_serial_print("  (no locks held)\n");
+        }
+
+        // ── DB3: index commands ───────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "index create ")) {
+            // index create <idx_name> <table> <field>
+            const char* p = input_buffer + 13;
+            char iname[64], tname[64], fname[64];
+            iname[0] = tname[0] = fname[0] = '\0';
+            int ii = 0; while(*p && *p != ' ' && ii < 63) iname[ii++] = *p++;
+            while(*p == ' ') p++;
+            int ti = 0; while(*p && *p != ' ' && ti < 63) tname[ti++] = *p++;
+            while(*p == ' ') p++;
+            int fi = 0; while(*p && fi < 63) fname[fi++] = *p++;
+            index_create(iname, tname, fname);
+        }
+        else if (sh_eq(input_buffer, "index list")) {
+            int found = 0;
+            for (int i = 0; i < INDEX_MAX; i++) {
+                if (!index_store[i].active) continue;
+                kernel_serial_print("  ");
+                kernel_serial_print(index_store[i].index_name);
+                kernel_serial_print("  on ");
+                kernel_serial_print(index_store[i].table_name);
+                kernel_serial_print(".");
+                kernel_serial_print(index_store[i].field_name);
+                kernel_serial_print("\n");
+                found = 1;
+            }
+            if (!found) kernel_serial_print("  (no indexes)\n");
+        }
+        else if (sh_starts(input_buffer, "index rebuild ")) {
+            index_rebuild(input_buffer + 14);
+        }
+        else if (sh_starts(input_buffer, "index drop ")) {
+            index_drop(input_buffer + 11);
+        }
+        else if (sh_starts(input_buffer, "index scan ")) {
+            // index scan <name> [<start_value>]
+            const char* p = input_buffer + 11;
+            char iname[64];
+            iname[0] = '\0';
+            int ii = 0; while(*p && *p != ' ' && ii < 63) iname[ii++] = *p++;
+            while(*p == ' ') p++;
+            kernel_serial_print("[INDEX] scan results:\n");
+            index_range_scan(iname, *p ? p : "", shell_index_scan_cb);
         }
 
         else if (sh_eq(input_buffer, "ipc stat")) {

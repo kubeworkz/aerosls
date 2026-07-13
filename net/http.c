@@ -10,6 +10,7 @@
 #include "../kernel/bundle.h"
 #include "../kernel/journal.h"
 #include "../kernel/lock_mgr.h"
+#include "../kernel/index_mgr.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -707,6 +708,32 @@ static void http_route(int conn, char* req) {
             blen = lock_to_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── GET /api/indexes — list all indexes ───────────────────────────────
+        if (!strcmp(path, "/api/indexes")) {
+            blen = indexes_to_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── GET /api/index/<name>[?q=<value>] ─────────────────────────────────
+        if (str_find(path, "/api/index/") == path) {
+            const char* iname = path + 11;
+            char q_val[64];
+            q_val[0] = '\0';
+            url_param(qs, "q", q_val, (int)sizeof(q_val));
+            if (q_val[0]) {
+                // Exact lookup — return matching record key
+                char rec_key[64];
+                rec_key[0] = '\0';
+                int hit = index_lookup(iname, q_val, rec_key);
+                JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+                jb_obj_open(&j, 0);
+                jb_str(&j, "hit", hit ? "true" : "false");
+                if (hit) { jb_putc(&j, ','); jb_str(&j, "key", rec_key); }
+                jb_obj_close(&j); j.buf[j.pos] = '\0';
+                http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+            }
+            blen = index_to_json(iname, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── GET /api/journal/<name>[?since=N] ─────────────────────────────────
         if (str_find(path, "/api/journal/") == path) {
             const char* jname = path + 13;
@@ -793,6 +820,37 @@ static void http_route(int conn, char* req) {
         if (!strcmp(path, "/api/tx/begin")) {
             blen = api_tx_post("begin", resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── POST /api/index/create|drop|rebuild ───────────────────────────────
+        if (!strcmp(path, "/api/index/create")) {
+            char iname[OBJECT_NAME_LEN], tname[OBJECT_NAME_LEN], fname[RECORD_KEY_LEN];
+            iname[0] = tname[0] = fname[0] = '\0';
+            json_str(body_ptr, "name",  iname, (int)sizeof(iname));
+            json_str(body_ptr, "table", tname, (int)sizeof(tname));
+            json_str(body_ptr, "field", fname, (int)sizeof(fname));
+            int rc = index_create(iname, tname, fname);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0); jb_str(&j, "ok", rc == 0 ? "true" : "false");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/index/drop")) {
+            char iname[OBJECT_NAME_LEN]; iname[0] = '\0';
+            json_str(body_ptr, "name", iname, (int)sizeof(iname));
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0);
+            jb_str(&j, "ok", index_drop(iname) == 0 ? "true" : "false");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/index/rebuild")) {
+            char iname[OBJECT_NAME_LEN]; iname[0] = '\0';
+            json_str(body_ptr, "name", iname, (int)sizeof(iname));
+            index_rebuild(iname);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0); jb_str(&j, "ok", "true");
+            jb_obj_close(&j); j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
         }
         if (!strcmp(path, "/api/tx/commit")) {
             blen = api_tx_post("commit", resp_body, (int)sizeof(resp_body));

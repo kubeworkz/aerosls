@@ -21,6 +21,7 @@
 #include "../arch/x86/multiboot2.h"
 #include "../kernel/journal.h"
 #include "../kernel/lock_mgr.h"
+#include "../kernel/index_mgr.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -127,6 +128,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4h. Row-level lock manager (Read-Committed isolation) ───────────────
     lock_mgr_init();
+
+    // ── 4i. Secondary index manager ─────────────────────────────────
+    index_mgr_init();
 
     // ── 5. Microkernel (IPC + 5 services + tier manager) ──────────────────
     microkernel_init();
