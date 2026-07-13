@@ -10,7 +10,7 @@ AeroSLS exposes three command surfaces:
 
 ## Serial Shell
 
-Connect at 38400 baud on COM1. The prompt shows `uid:<id>[tx:<n>]>`  when a transaction is open, otherwise `uid:<id>>` .
+Connect at 38400 baud on COM1. The prompt shows `uid:<id>[tx:<n>]>`  when a transaction is open, otherwise `uid:<id>>` 
 
 ```
 uid:0> help
