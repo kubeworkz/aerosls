@@ -242,8 +242,8 @@ Analytics queries in a single pass over the table (IBM i `OPNQRYF / GROUP BY / O
 | Command                                                                      | Description                             |
 | ---------------------------------------------------------------------------- | --------------------------------------- |
 | `aggregate <table> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]`   | Count matching rows, optionally grouped |
-| `aggregate <table> SUM|AVG|MIN|MAX <field> [where <f>=<v>] [order ASC|DESC]` | Numeric aggregate                       |
-| `select <table> [where <f>=<v>] [order <f> ASC|DESC]`                        | ORDER BY with no aggregation            |
+| `aggregate <table> SUM&#124;AVG&#124;MIN&#124;MAX <field> [where <f>=<v>] [order ASC&#124;DESC]` | Numeric aggregate                       |
+| `select <table> [where <f>=<v>] [order <f> ASC&#124;DESC]`                        | ORDER BY with no aggregation            |
 
 
 **Examples:**
@@ -264,7 +264,7 @@ Pre-computed aggregate tables that auto-refresh on every committed INSERT, UPDAT
 
 | Command                                                                              | Description                        |
 | ------------------------------------------------------------------------------------ | ---------------------------------- |
-| `mqt create <name> <base> COUNT|SUM|AVG|MIN|MAX [field] [group <f>] [where <f>=<v>]` | Create an MQT with initial refresh |
+| `mqt create <name> <base> COUNT&#124;SUM&#124;AVG&#124;MIN&#124;MAX [field] [group <f>] [where <f>=<v>]` | Create an MQT with initial refresh |
 | `mqt list`                                                                           | Show all MQTs                      |
 | `mqt refresh <name>`                                                                 | Force a re-computation             |
 | `mqt drop <name>`                                                                    | Remove MQT and free result table   |
@@ -512,7 +512,7 @@ Demo accounts:
 | Method | Path                         | Auth        | Description                                                                                    |
 | ------ | ---------------------------- | ----------- | ---------------------------------------------------------------------------------------------- |
 | `GET`  | `/api/constraints[?table=T]` | None        | List constraints, optionally filtered by table                                                 |
-| `POST` | `/api/constraint/add`        | `APP_USER+` | `{"table":"…","field":"…","type":"UNIQUE|NOT_NULL|RANGE|REFERENCE","min":N,"max":N,"ref":"…"}` |
+| `POST` | `/api/constraint/add`        | `APP_USER+` | `{"table":"…","field":"…","type":"UNIQUE&#124;NOT_NULL&#124;RANGE&#124;REFERENCE","min":N,"max":N,"ref":"…"}` |
 | `POST` | `/api/constraint/remove`     | `APP_USER+` | `{"table":"…","field":"…","type":"…"}`                                                         |
 
 
@@ -532,7 +532,7 @@ Demo accounts:
 
 | Method | Path             | Auth        | Description                                                                                                                               |
 | ------ | ---------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/api/aggregate` | `APP_USER+` | `{"table":"…","fn":"COUNT|SUM|AVG|MIN|MAX","field":"…","where":"…","eq":"…","group_by":"…","having":N,"order_by":"…","order":"ASC|DESC"}` |
+| `POST` | `/api/aggregate` | `APP_USER+` | `{"table":"…","fn":"COUNT&#124;SUM&#124;AVG&#124;MIN&#124;MAX","field":"…","where":"…","eq":"…","group_by":"…","having":N,"order_by":"…","order":"ASC&#124;DESC"}` |
 
 
 `fn` can be empty (or omitted) for a plain ORDER BY without aggregation.
