@@ -220,7 +220,7 @@ Demo tokens (no real password check):
 | `guest@sandbox.com`   | `GUEST`    | `deadc0de9988776655443322aabbccdd` |
 
 
-
+---
 
 # Flatter is Better
 
