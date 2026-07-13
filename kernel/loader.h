@@ -93,6 +93,11 @@ uint64_t loader_load_into_process(const char* object_name,
 // Load the demo binary into a named object, then spawn the process
 uint64_t sys_sls_load(const char* object_name, uint32_t owner_uid);
 
+// Spawn a process from an OBJ_TYPE_PROGRAM catalog object.
+// The object must already have been uploaded via SYS_SLS_UPLOAD_BINARY.
+// Returns the new PID on success, 0 on failure.
+uint64_t program_load(const char* object_name, uint32_t owner_uid);
+
 // Print info about all loaded service binaries
 void     loader_list(void);
 

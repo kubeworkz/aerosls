@@ -108,11 +108,20 @@ int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_per
             return !(needed_perm & PERM_WRITE) && !(needed_perm & PERM_EXECUTE);
     }
 
-    // GUEST: read-only on HEAP_BLOB only
+    // GUEST: read-only on HEAP_BLOB and STREAM only
     if (role == ROLE_GUEST) {
-        if (e->type == OBJ_TYPE_HEAP_BLOB && needed_perm == PERM_READ)
+        if ((e->type == OBJ_TYPE_HEAP_BLOB || e->type == OBJ_TYPE_STREAM)
+                && needed_perm == PERM_READ)
             return 1;
         return 0;
+    }
+
+    // APP_USER: read + execute on PROGRAM objects (can spawn, not modify)
+    if (role == ROLE_APP_USER) {
+        if (e->type == OBJ_TYPE_PROGRAM &&
+                (needed_perm & (PERM_READ | PERM_EXECUTE)) &&
+                !(needed_perm & PERM_WRITE))
+            return 1;
     }
 
     // Fall back to stored per-object perm_mask
@@ -158,6 +167,8 @@ uint64_t sys_sls_valloc(struct SLSVallocRequest* req) {
         case OBJ_TYPE_SYSTEM_METADATA: e->storage_tier = STORAGE_TIER_L1_CACHE; break;
         case OBJ_TYPE_DB_TABLE:        e->storage_tier = STORAGE_TIER_L2_DRAM;  break;
         case OBJ_TYPE_DB_INDEX:        e->storage_tier = STORAGE_TIER_L2_DRAM;  break;
+        case OBJ_TYPE_PROGRAM:         e->storage_tier = STORAGE_TIER_L2_DRAM;  break;
+        case OBJ_TYPE_STREAM:          e->storage_tier = STORAGE_TIER_L3_SSD;   break;
         default:                       e->storage_tier = STORAGE_TIER_L3_SSD;   break;
     }
     e->owner_role   = catalog_get_role(req->owner_uid);

@@ -291,3 +291,45 @@ uint64_t sys_sls_load(const char* object_name, uint32_t owner_uid) {
     req.owner_uid = owner_uid;
     return process_create(&req);
 }
+
+// ─── program_load ─────────────────────────────────────────────────────────────
+// Spawn a process from an OBJ_TYPE_PROGRAM catalog object.
+// Unlike sys_sls_load (which expects OBJ_TYPE_SERVICE_PROCESS), this function
+// accepts the new OBJ_TYPE_PROGRAM type that represents a named executable in
+// the SLS object store — the OS-native replacement for filesystem executables.
+uint64_t program_load(const char* object_name, uint32_t owner_uid) {
+    // Verify the object exists and has the correct type
+    int found = 0;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (!object_catalog[i].active) continue;
+        if (!ld_streq(object_catalog[i].name, object_name)) continue;
+        if (object_catalog[i].type != OBJ_TYPE_PROGRAM) {
+            kernel_serial_printf(
+                "[LOADER] program_load: '%s' is not an OBJ_TYPE_PROGRAM object "
+                "(type=%s). Use sys_sls_load for SERVICE_PROCESS objects.\n",
+                object_name,
+                obj_type_name(object_catalog[i].type));
+            return 0;
+        }
+        found = 1;
+        break;
+    }
+    if (!found) {
+        kernel_serial_printf(
+            "[LOADER] program_load: object '%s' not found.\n", object_name);
+        return 0;
+    }
+
+    // Reuse the same binary store and process-create path as sys_sls_load.
+    // The binary must have been uploaded via SYS_SLS_UPLOAD_BINARY beforehand.
+    struct ProcCreateRequest req;
+    ld_strncpy(req.object_name, object_name, PROC_NAME_LEN);
+    req.owner_uid = owner_uid;
+    uint64_t pid = process_create(&req);
+    if (pid) {
+        kernel_serial_printf(
+            "[LOADER] program_load: spawned '%s' as PID %llu.\n",
+            object_name, pid);
+    }
+    return pid;
+}

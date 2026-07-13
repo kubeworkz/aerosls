@@ -13,6 +13,8 @@ typedef enum {
     OBJ_TYPE_SERVICE_PROCESS  = 4,  // Ring-3 executable + stack; scheduled by kernel
     OBJ_TYPE_WEB_APP          = 5,  // HTML/JS/CSS assets stored as key-value records
     OBJ_TYPE_JOURNAL          = 6,  // IBM i-style journal object
+    OBJ_TYPE_PROGRAM          = 7,  // Executable program image (flat binary)
+    OBJ_TYPE_STREAM           = 8,  // Raw byte-stream "file" (read-only by default)
 } SLSObjectType;
 
 // ─── Storage Tiers ────────────────────────────────────────────────────────────
@@ -49,6 +51,8 @@ static inline const char* obj_type_name(SLSObjectType t) {
         case OBJ_TYPE_SERVICE_PROCESS: return "SERVICE_PROCESS";
         case OBJ_TYPE_WEB_APP:         return "WEB_APP";
         case OBJ_TYPE_JOURNAL:         return "JOURNAL";
+        case OBJ_TYPE_PROGRAM:         return "PROGRAM";
+        case OBJ_TYPE_STREAM:          return "STREAM";
         default:                       return "UNKNOWN";
     }
 }
@@ -184,9 +188,10 @@ struct SLSGrantRequest {
 #define SYS_SLS_DELETE      143
 #define SYS_SLS_SCHEMA_SET  144
 #define SYS_SLS_SCHEMA_SHOW 145
-#define SYS_SLS_PROC_CREATE 160
-#define SYS_SLS_PROC_KILL   161
-#define SYS_SLS_PROC_LIST   162
+#define SYS_SLS_PROC_CREATE     160
+#define SYS_SLS_PROC_KILL       161
+#define SYS_SLS_PROC_LIST       162
+#define SYS_SLS_PROGRAM_SPAWN   163   // spawn an OBJ_TYPE_PROGRAM object as a process
 
 // ─── Public Catalog API ───────────────────────────────────────────────────────
 extern struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];
