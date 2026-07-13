@@ -14,6 +14,7 @@
 #include "../kernel/constraint.h"
 #include "../kernel/cursor.h"
 #include "../kernel/aggregate.h"
+#include "../kernel/mqt.h"
 #include "../kernel/process.h"
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
@@ -161,6 +162,12 @@ static void print_help(void) {
         "  aggregate <tbl> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]\n"
         "  aggregate <tbl> SUM|AVG|MIN|MAX <field> [where <f>=<v>] [order ASC|DESC]\n"
         "  select <tbl> [where <f>=<v>] [order <f> ASC|DESC]     ORDER BY query\n"
+        "  -- Materialized Query Tables (DB7) --\n"
+        "  mqt create <name> <base> COUNT|SUM|AVG|MIN|MAX [field] [group <f>]\n"
+        "  mqt list                   show all MQTs\n"
+        "  mqt refresh <name>         re-run query and update results\n"
+        "  mqt drop <name>            remove MQT and result table\n"
+        "  mqt scan <name>            show current MQT results\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -966,6 +973,60 @@ void sls_shell_loop(void) {
             aggregate_exec(&q, agg_result, (int)sizeof(agg_result));
             kernel_serial_print(agg_result);
             kernel_serial_print("\n");
+        }
+
+        // ── DB7: MQT commands ─────────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "mqt create ")) {
+            // mqt create <name> <base> COUNT|SUM|AVG|MIN|MAX [field] [group <f>] [where <f>=<v>]
+            const char* p = input_buffer + 11;
+            char mname[64], btable[64], fn_s[16], afld[64], gfld[64], wfld[64], weq[64];
+            mname[0]=btable[0]=fn_s[0]=afld[0]=gfld[0]=wfld[0]=weq[0]='\0';
+            int n=0; while(*p&&*p!=' '&&n<63) mname[n++]=*p++;  while(*p==' ')p++;
+            n=0;     while(*p&&*p!=' '&&n<63) btable[n++]=*p++; while(*p==' ')p++;
+            n=0;     while(*p&&*p!=' '&&n<15) fn_s[n++]=*p++;   while(*p==' ')p++;
+            // optional: field then group/where
+            while (*p) {
+                if (*p=='g'&&*(p+1)=='r'&&*(p+2)=='o'&&*(p+3)=='u'&&*(p+4)=='p'&&*(p+5)==' ') {
+                    p+=6; int gi=0; while(*p&&*p!=' '&&gi<63) gfld[gi++]=*p++; while(*p==' ')p++;
+                } else if (*p=='w'&&*(p+1)=='h'&&*(p+2)=='e'&&*(p+3)=='r'&&*(p+4)=='e'&&*(p+5)==' ') {
+                    p+=6; int wi=0; while(*p&&*p!='='&&wi<63) wfld[wi++]=*p++;
+                    if(*p=='='){p++;int vi=0;while(*p&&*p!=' '&&vi<63) weq[vi++]=*p++;}
+                    while(*p==' ')p++;
+                } else {
+                    int ai=0; while(*p&&*p!=' '&&ai<63) afld[ai++]=*p++; while(*p==' ')p++;
+                }
+            }
+            uint8_t fn=(uint8_t)AGG_COUNT;
+            if(!strcmp(fn_s,"SUM"))fn=(uint8_t)AGG_SUM; else if(!strcmp(fn_s,"AVG"))fn=(uint8_t)AGG_AVG;
+            else if(!strcmp(fn_s,"MIN"))fn=(uint8_t)AGG_MIN; else if(!strcmp(fn_s,"MAX"))fn=(uint8_t)AGG_MAX;
+            mqt_create(mname, btable, fn, afld, wfld, weq, gfld);
+        }
+        else if (sh_eq(input_buffer, "mqt list")) {
+            int found = 0;
+            static const char* fn_names[] = {"COUNT","SUM","AVG","MIN","MAX"};
+            for (int i = 0; i < MQT_MAX; i++) {
+                if (!mqt_table[i].active) continue;
+                kernel_serial_print("  "); kernel_serial_print(mqt_table[i].mqt_name);
+                kernel_serial_print(" <- "); kernel_serial_print(mqt_table[i].base_table);
+                kernel_serial_print(" "); kernel_serial_print(mqt_table[i].fn<=4?fn_names[mqt_table[i].fn]:"?");
+                kernel_serial_print("\n"); found = 1;
+            }
+            if (!found) kernel_serial_print("  (no MQTs)\n");
+        }
+        else if (sh_starts(input_buffer, "mqt refresh ")) {
+            mqt_refresh(input_buffer + 12);
+        }
+        else if (sh_starts(input_buffer, "mqt drop ")) {
+            mqt_drop(input_buffer + 9);
+        }
+        else if (sh_starts(input_buffer, "mqt scan ")) {
+            // Use select to show MQT result table
+            const char* mname = input_buffer + 9;
+            struct SLSRecordRequest req;
+            for (int i = 0; i < OBJECT_NAME_LEN; i++) req.name[i] = 0;
+            for (int i = 0; mname[i] && i < OBJECT_NAME_LEN-1; i++) req.name[i] = mname[i];
+            req.key[0] = '\0';
+            sys_sls_obj_stat(req.name);
         }
 
         else if (sh_eq(input_buffer, "ipc stat")) {

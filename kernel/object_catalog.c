@@ -3,6 +3,7 @@
 #include "lock_mgr.h"
 #include "index_mgr.h"
 #include "constraint.h"
+#include "mqt.h"
 #include "../user/permissions.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
@@ -418,6 +419,7 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
                           "", req->value, JENT_UP, 0);
             kernel_serial_printf("[DB] UPDATE %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
+            mqt_refresh_for_table(req->name);   // auto-refresh MQTs
             return 0;
         }
     }
@@ -492,6 +494,7 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
             index_on_insert(req->name, req->key, req->key, req->value);
             kernel_serial_printf("[DB] INSERT %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
+            mqt_refresh_for_table(req->name);   // auto-refresh MQTs
             return 0;
         }
     }
@@ -545,6 +548,7 @@ uint64_t sys_sls_delete(struct SLSRecordRequest* req) {
         // Remove this key from all indexes on the table
         index_on_delete(req->name, req->key);
         kernel_serial_printf("[DB] DELETE %s.%s  [OK]\n", req->name, req->key);
+        mqt_refresh_for_table(req->name);   // auto-refresh MQTs
         return 0;
     }
     kernel_serial_printf("[DB] DELETE: Key '%s' not found in '%s'.\n",

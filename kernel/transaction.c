@@ -2,6 +2,7 @@
 #include "object_catalog.h"
 #include "journal.h"
 #include "lock_mgr.h"
+#include "mqt.h"
 
 // ─── WAL In-RAM Buffer ────────────────────────────────────────────────────────
 struct WALEntry wal_buffer[WAL_MAX_ENTRIES];
@@ -134,6 +135,20 @@ uint64_t sys_sls_tx_commit(uint32_t thread_id) {
     // Notify the journal subsystem so pending entries are marked committed
     journal_commit_tx(committed_tx_id);
     lock_release_tx(committed_tx_id);  // release all row locks held by this tx
+
+    // Auto-refresh any MQTs whose base table was modified in this transaction.
+    // We scan the WAL entries we just committed to find affected tables.
+    for (uint32_t i = wal_start; i < wal_start + wal_count; i++) {
+        if (wal_buffer[i].state != WAL_STATE_COMMITTED) continue;
+        // Resolve object name from object_id
+        for (uint32_t j = 0; j < object_catalog_count; j++) {
+            if (object_catalog[j].active &&
+                object_catalog[j].object_id == wal_buffer[i].object_id) {
+                mqt_refresh_for_table(object_catalog[j].name);
+                break;
+            }
+        }
+    }
 
     return 0;
 }

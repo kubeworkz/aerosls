@@ -14,6 +14,7 @@
 #include "../kernel/constraint.h"
 #include "../kernel/cursor.h"
 #include "../kernel/aggregate.h"
+#include "../kernel/mqt.h"
 #include "../kernel/query_engine.h"
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
@@ -749,6 +750,17 @@ static void http_route(int conn, char* req) {
             blen = lock_to_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── GET /api/mqts — list all MQTs ────────────────────────────────────
+        if (!strcmp(path, "/api/mqts")) {
+            blen = mqts_to_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── GET /api/mqt/<name> — read current MQT result table ──────────────
+        if (str_find(path, "/api/mqt/") == path) {
+            const char* mname = path + 9;
+            blen = api_object_detail(mname, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── GET /api/indexes — list all indexes ───────────────────────────────
         if (!strcmp(path, "/api/indexes")) {
             blen = indexes_to_json(resp_body, (int)sizeof(resp_body));
@@ -939,8 +951,48 @@ static void http_route(int conn, char* req) {
             jb_obj_close(&j); j.buf[j.pos] = '\0';
             http_respond(conn, 200, "application/json", resp_body, j.pos); return;
         }
-        // ── POST /api/aggregate ────────────────────────────────────────────────
-        // Body: {"table":"...","fn":"COUNT|SUM|AVG|MIN|MAX",
+        // ── POST /api/mqt/create|drop|refresh ────────────────────────────────
+        if (!strcmp(path, "/api/mqt/create")) {
+            char mname[OBJECT_NAME_LEN], btable[OBJECT_NAME_LEN];
+            char fn_s[8], afld[RECORD_KEY_LEN], wfld[RECORD_KEY_LEN];
+            char weq[RECORD_VAL_LEN], gfld[RECORD_KEY_LEN];
+            mname[0]=btable[0]=fn_s[0]=afld[0]=wfld[0]=weq[0]=gfld[0]='\0';
+            json_str(body_ptr, "name",     mname,  OBJECT_NAME_LEN);
+            json_str(body_ptr, "table",    btable, OBJECT_NAME_LEN);
+            json_str(body_ptr, "fn",       fn_s,   (int)sizeof(fn_s));
+            json_str(body_ptr, "field",    afld,   RECORD_KEY_LEN);
+            json_str(body_ptr, "where",    wfld,   RECORD_KEY_LEN);
+            json_str(body_ptr, "eq",       weq,    RECORD_VAL_LEN);
+            json_str(body_ptr, "group_by", gfld,   RECORD_KEY_LEN);
+            uint8_t fn = (uint8_t)AGG_COUNT;
+            if      (!strcmp(fn_s,"SUM")) fn=(uint8_t)AGG_SUM;
+            else if (!strcmp(fn_s,"AVG")) fn=(uint8_t)AGG_AVG;
+            else if (!strcmp(fn_s,"MIN")) fn=(uint8_t)AGG_MIN;
+            else if (!strcmp(fn_s,"MAX")) fn=(uint8_t)AGG_MAX;
+            int rc = mqt_create(mname, btable, fn, afld, wfld, weq, gfld);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j,0); jb_str(&j,"ok",rc==0?"true":"false");
+            jb_obj_close(&j); j.buf[j.pos]='\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/mqt/drop")) {
+            char mname[OBJECT_NAME_LEN]; mname[0]='\0';
+            json_str(body_ptr, "name", mname, OBJECT_NAME_LEN);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j,0); jb_str(&j,"ok",mqt_drop(mname)==0?"true":"false");
+            jb_obj_close(&j); j.buf[j.pos]='\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/mqt/refresh")) {
+            char mname[OBJECT_NAME_LEN]; mname[0]='\0';
+            json_str(body_ptr, "name", mname, OBJECT_NAME_LEN);
+            mqt_refresh(mname);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j,0); jb_str(&j,"ok","true");
+            jb_obj_close(&j); j.buf[j.pos]='\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        // ── POST /api/aggregate ────────────────────────────────────────────────        // Body: {"table":"...","fn":"COUNT|SUM|AVG|MIN|MAX",
         //        "field":"...","where":"...","eq":"...",
         //        "group_by":"...","having":N,"order_by":"...","order":"ASC|DESC"}
         // fn="" or omitted → AGG_NONE (ORDER BY only)

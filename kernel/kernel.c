@@ -25,6 +25,7 @@
 #include "../kernel/constraint.h"
 #include "../kernel/cursor.h"
 #include "../kernel/aggregate.h"
+#include "../kernel/mqt.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -140,6 +141,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4k. Server-side cursor engine ────────────────────────────────
     cursor_mgr_init();
+
+    // ── 4l. Materialized Query Table engine ──────────────────────────
+    mqt_init();
 
     // ── 5. Microkernel (IPC + 5 services + tier manager) ──────────────────
     microkernel_init();
