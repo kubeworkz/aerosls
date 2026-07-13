@@ -19,6 +19,8 @@
 #include "../kernel/process.h"
 #include "../kernel/scheduler.h"
 #include "../kernel/auth.h"
+#include "../kernel/loader.h"
+#include "../user/permissions.h"
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -566,6 +568,163 @@ static int api_query_json(const char* q, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── Hex decode helper (used by program upload) ─────────────────────────────
+static size_t hex_decode(const char* hex, uint8_t* out, size_t max_bytes) {
+    size_t n = 0;
+    while (hex[0] && hex[1] && n < max_bytes) {
+        char c;
+        uint8_t hi, lo;
+        c = hex[0];
+        hi = (c>='0'&&c<='9') ? (uint8_t)(c-'0')
+           : (c>='a'&&c<='f') ? (uint8_t)(c-'a'+10)
+           : (c>='A'&&c<='F') ? (uint8_t)(c-'A'+10) : 0xFF;
+        c = hex[1];
+        lo = (c>='0'&&c<='9') ? (uint8_t)(c-'0')
+           : (c>='a'&&c<='f') ? (uint8_t)(c-'a'+10)
+           : (c>='A'&&c<='F') ? (uint8_t)(c-'A'+10) : 0xFF;
+        if (hi == 0xFF || lo == 0xFF) break;
+        out[n++] = (uint8_t)((hi << 4) | lo);
+        hex += 2;
+    }
+    return n;
+}
+
+// ─── GET /api/programs ────────────────────────────────────────────────────────
+static int api_programs_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "programs");
+    int first = 1;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        struct SLSObjectEntry* e = &object_catalog[i];
+        if (!e->active || e->type != OBJ_TYPE_PROGRAM) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j,  "name",  e->name);         jb_putc(&j, ',');
+        jb_hex(&j,  "vaddr", e->base_vaddr);   jb_putc(&j, ',');
+        jb_uint(&j, "pages", e->size_pages);   jb_putc(&j, ',');
+        jb_str(&j,  "tier",  tier_name(e->storage_tier)); jb_putc(&j, ',');
+        int bin_loaded = 0;
+        uint32_t bin_size = 0;
+        const char* bin_fmt = "none";
+        for (int b = 0; b < MAX_SERVICE_BINARIES; b++) {
+            if (service_binaries[b].active &&
+                !strcmp(service_binaries[b].object_name, e->name)) {
+                bin_loaded = 1;
+                bin_size   = service_binaries[b].size;
+                bin_fmt    = service_binaries[b].is_elf ? "ELF64" : "flat";
+                break;
+            }
+        }
+        jb_str(&j,  "binary",       bin_loaded ? "yes" : "no"); jb_putc(&j, ',');
+        jb_uint(&j, "binary_bytes", (uint64_t)bin_size);        jb_putc(&j, ',');
+        jb_str(&j,  "format",       bin_fmt);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j);
+    j.buf[j.pos] = '\0';
+    return j.pos;
+}
+
+// ─── POST /api/program/create ─────────────────────────────────────────────────
+static int api_program_create(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) {
+        jb_obj_open(&j, 0); jb_str(&j, "error", "missing body");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    struct SLSVallocRequest req;
+    req.owner_uid = 0;
+    req.perm_mask = PERM_READ | PERM_EXECUTE | PERM_OWNER;
+    req.type      = OBJ_TYPE_PROGRAM;
+    req.name[0]   = '\0';
+    json_str(body, "name", req.name, OBJECT_NAME_LEN);
+    req.size_pages = (uint32_t)json_int(body, "pages");
+    if (!req.name[0] || !req.size_pages) {
+        jb_obj_open(&j, 0); jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "name and pages required");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    uint64_t id = sys_sls_valloc(&req);
+    jb_obj_open(&j, 0);
+    if (id) {
+        jb_str(&j, "ok",   "true");     jb_putc(&j, ',');
+        jb_hex(&j, "object_id", id);    jb_putc(&j, ',');
+        jb_str(&j, "type", "PROGRAM");
+    } else {
+        jb_str(&j, "ok",    "false");   jb_putc(&j, ',');
+        jb_str(&j, "error", "valloc failed");
+    }
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+// ─── POST /api/program/upload ─────────────────────────────────────────────────
+// Body: {"name":"<obj>","hex":"<hex-bytes>","offset":N,"last":0|1}
+//   hex:    lower- or upper-case hex pairs of raw binary bytes
+//   offset: byte offset into the program binary this chunk starts at
+//   last:   1 = final chunk; triggers size finalisation in binary store
+static int api_program_upload(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) {
+        jb_obj_open(&j, 0); jb_str(&j, "error", "missing body");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    /* UPLOAD_CHUNK_MAX = 1024 bytes = 2048 hex chars; static avoids stack bloat */
+    static char hex_buf[UPLOAD_CHUNK_MAX * 2 + 4];
+    static struct SLSUploadRequest ureq;
+    hex_buf[0] = '\0';
+    ureq.object_name[0] = '\0';
+    json_str(body, "name", ureq.object_name, PROC_NAME_LEN);
+    json_str(body, "hex",  hex_buf, (int)sizeof(hex_buf));
+    int offset = json_int(body, "offset");
+    int last   = json_int(body, "last");
+    if (!ureq.object_name[0] || !hex_buf[0]) {
+        jb_obj_open(&j, 0); jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "name and hex required");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    ureq.byte_offset = (uint32_t)(offset >= 0 ? offset : 0);
+    ureq.is_last     = (uint8_t)(last ? 1 : 0);
+    ureq.chunk_len   = (uint32_t)hex_decode(hex_buf, ureq.chunk, UPLOAD_CHUNK_MAX);
+    jb_obj_open(&j, 0);
+    if (ureq.chunk_len == 0) {
+        jb_str(&j, "ok",    "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "hex decode produced zero bytes");
+    } else {
+        uint64_t rc = sys_sls_upload_binary(&ureq);
+        jb_str(&j,  "ok",           rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+        jb_uint(&j, "bytes_written", (uint64_t)ureq.chunk_len);   jb_putc(&j, ',');
+        jb_uint(&j, "offset",        (uint64_t)ureq.byte_offset); jb_putc(&j, ',');
+        jb_str(&j,  "final",         ureq.is_last ? "true" : "false");
+    }
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+// ─── POST /api/program/spawn ──────────────────────────────────────────────────
+static int api_program_spawn_handler(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) {
+        jb_obj_open(&j, 0); jb_str(&j, "error", "missing body");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    char pname[OBJECT_NAME_LEN];
+    pname[0] = '\0';
+    json_str(body, "name", pname, OBJECT_NAME_LEN);
+    if (!pname[0]) {
+        jb_obj_open(&j, 0); jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "name required");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    /* program_load() validates OBJ_TYPE_PROGRAM, calls program_spawn()
+       which maps pages into a fresh PML4 and enters Ring-3. */
+    uint64_t pid = program_load(pname, 0);
+    jb_obj_open(&j, 0);
+    jb_str(&j,  "ok",  pid ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "pid", pid);
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 // ─── POST /api/valloc ─────────────────────────────────────────────────────────
 static int api_valloc_post(const char* body, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -699,6 +858,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/processes")) {
             blen = api_processes_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/programs")) {
+            blen = api_programs_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/query")) {
@@ -1040,6 +1203,19 @@ static void http_route(int conn, char* req) {
             jb_uint(&j, "cursor_id", cid);
             jb_obj_close(&j); j.buf[j.pos] = '\0';
             http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        // ── POST /api/program/create|upload|spawn ───────────────────────────────────
+        if (!strcmp(path, "/api/program/create")) {
+            blen = api_program_create(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/program/upload")) {
+            blen = api_program_upload(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/program/spawn")) {
+            blen = api_program_spawn_handler(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/tx/commit")) {
             blen = api_tx_post("commit", resp_body, (int)sizeof(resp_body));
