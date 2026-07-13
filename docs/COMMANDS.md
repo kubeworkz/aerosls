@@ -43,15 +43,15 @@ The SLS object catalog is the kernel's persistent namespace. Every piece of data
 **Object types for `valloc`:**
 
 
-| Code | Name          | Purpose                          |
-| ---- | ------------- | -------------------------------- |
-| `0`  | `SYSTEM_META` | Kernel metadata, config blobs    |
-| `1`  | `DB_TABLE`    | Relational table (keyed records) |
-| `2`  | `DB_INDEX`    | B-tree index over a table        |
-| `3`  | `HEAP_BLOB`   | Unstructured byte heap           |
-| `4`  | `SERVICE_PROCESS` | Ring-3 executable            |
-| `5`  | `WEB_APP`     | HTML/JS/CSS asset store          |
-| `6`  | `JOURNAL`     | IBM i-style journal object       |
+| Code | Name              | Purpose                          |
+| ---- | ----------------- | -------------------------------- |
+| `0`  | `SYSTEM_META`     | Kernel metadata, config blobs    |
+| `1`  | `DB_TABLE`        | Relational table (keyed records) |
+| `2`  | `DB_INDEX`        | B-tree index over a table        |
+| `3`  | `HEAP_BLOB`       | Unstructured byte heap           |
+| `4`  | `SERVICE_PROCESS` | Ring-3 executable                |
+| `5`  | `WEB_APP`         | HTML/JS/CSS asset store          |
+| `6`  | `JOURNAL`         | IBM i-style journal object       |
 
 
 **Example:**
@@ -127,110 +127,127 @@ AeroSLS uses Write-Ahead Logging (WAL) for ACID durability.
 
 ---
 
-### Journaling — DB1
+### Journaling
 
 IBM i-style before/after-image journal.  Each journal captures every INSERT, UPDATE, and DELETE on attached tables.  Journal entries survive beyond a single transaction (unlike the WAL) and are used for audit trails and change-data capture.
 
-| Command | Description |
-|---------|-------------|
-| `journal create <name>` | Create a journal object (type=6) |
-| `journal attach <journal> <table>` | Start capturing DML changes for a table |
-| `journal detach <journal> <table>` | Stop capturing |
-| `journal list` | Show all active journal attachments |
-| `journal dump <name> [<seq>]` | Print entries (optionally from sequence N) |
-| `journal purge <name>` | Remove rolled-back entries to reclaim space |
+
+| Command                            | Description                                 |
+| ---------------------------------- | ------------------------------------------- |
+| `journal create <name>`            | Create a journal object (type=6)            |
+| `journal attach <journal> <table>` | Start capturing DML changes for a table     |
+| `journal detach <journal> <table>` | Stop capturing                              |
+| `journal list`                     | Show all active journal attachments         |
+| `journal dump <name> [<seq>]`      | Print entries (optionally from sequence N)  |
+| `journal purge <name>`             | Remove rolled-back entries to reclaim space |
+
 
 **Entry types** (IBM i codes):
 
-| Type | Meaning |
-|------|---------|
-| `PT` | Put — INSERT |
-| `UP` | Update (after-image) |
+
+| Type | Meaning                      |
+| ---- | ---------------------------- |
+| `PT` | Put — INSERT                 |
+| `UP` | Update (after-image)         |
 | `UB` | Update Before (before-image) |
-| `DL` | Delete |
-| `CM` | Commit marker |
-| `RB` | Rollback marker |
+| `DL` | Delete                       |
+| `CM` | Commit marker                |
+| `RB` | Rollback marker              |
+
 
 ---
 
-### Row Locking — DB2
+### Row Locking
 
 Exclusive (X) row locks — Read-Committed isolation.  Locks are acquired before WAL staging and released on commit or rollback.
 
-| Command | Description |
-|---------|-------------|
+
+| Command     | Description                                  |
+| ----------- | -------------------------------------------- |
 | `lock list` | Show all active row locks (tx_id, type, key) |
+
 
 Conflict behaviour: a second transaction trying to write the same key is immediately rejected (no wait/deadlock).
 
 ---
 
-### Secondary Indexes — DB3
+### Secondary Indexes
 
 Sorted keyed access paths over DB_TABLE fields (IBM i logical file / keyed access path).  Indexes are auto-maintained on every INSERT, UPDATE, and DELETE.
 
-| Command | Description |
-|---------|-------------|
-| `index create <name> <table> <field>` | Build a sorted index on a field suffix |
-| `index list` | Show all indexes |
-| `index rebuild <name>` | Re-scan the parent table and rebuild |
-| `index drop <name>` | Remove an index |
-| `index scan <name> [<start_value>]` | O(log n) lookup or range scan from a value |
+
+| Command                               | Description                                |
+| ------------------------------------- | ------------------------------------------ |
+| `index create <name> <table> <field>` | Build a sorted index on a field suffix     |
+| `index list`                          | Show all indexes                           |
+| `index rebuild <name>`                | Re-scan the parent table and rebuild       |
+| `index drop <name>`                   | Remove an index                            |
+| `index scan <name> [<start_value>]`   | O(log n) lookup or range scan from a value |
+
 
 Field matching uses suffix rules: `field="dept"` captures `alice_dept`, `bob_dept`, etc.
 
 ---
 
-### Constraints — DB4
+### Constraints
 
 Data integrity enforced at the kernel boundary, before the lock and WAL stage.
 
-| Command | Description |
-|---------|-------------|
-| `constraint add <table> <field> UNIQUE` | Reject duplicate values |
-| `constraint add <table> <field> NOT_NULL` | Reject empty values |
-| `constraint add <table> <field> RANGE <min> <max>` | Numeric range check |
-| `constraint add <table> <field> REFERENCE <ref_table>` | Foreign-key integrity |
-| `constraint list [<table>]` | Show active constraints |
-| `constraint remove <table> <field> <type>` | Drop a constraint |
+
+| Command                                                | Description             |
+| ------------------------------------------------------ | ----------------------- |
+| `constraint add <table> <field> UNIQUE`                | Reject duplicate values |
+| `constraint add <table> <field> NOT_NULL`              | Reject empty values     |
+| `constraint add <table> <field> RANGE <min> <max>`     | Numeric range check     |
+| `constraint add <table> <field> REFERENCE <ref_table>` | Foreign-key integrity   |
+| `constraint list [<table>]`                            | Show active constraints |
+| `constraint remove <table> <field> <type>`             | Drop a constraint       |
+
 
 **Violation codes** returned by DML on constraint failure:
 
+
 | Code | Constraint |
-|------|------------|
-| `1`  | UNIQUE |
-| `2`  | NOT_NULL |
-| `3`  | RANGE |
-| `4`  | REFERENCE |
+| ---- | ---------- |
+| `1`  | UNIQUE     |
+| `2`  | NOT_NULL   |
+| `3`  | RANGE      |
+| `4`  | REFERENCE  |
+
 
 ---
 
-### Cursors — DB5
+### Cursors
 
 Server-side iterators that hold scan position across multiple FETCH calls (IBM i `DECLARE CURSOR / OPEN / FETCH / CLOSE`).
 
-| Command | Description |
-|---------|-------------|
-| `cursor open <table> [where <field>=<value>] [order <index>]` | Open a cursor, optionally filtered and ordered |
-| `cursor fetch <id> [<n>]` | Fetch next N rows (default 5) |
-| `cursor close <id>` | Close cursor and free slot |
-| `cursor list` | List all open cursors with position/done status |
+
+| Command                                                       | Description                                     |
+| ------------------------------------------------------------- | ----------------------------------------------- |
+| `cursor open <table> [where <field>=<value>] [order <index>]` | Open a cursor, optionally filtered and ordered  |
+| `cursor fetch <id> [<n>]`                                     | Fetch next N rows (default 5)                   |
+| `cursor close <id>`                                           | Close cursor and free slot                      |
+| `cursor list`                                                 | List all open cursors with position/done status |
+
 
 `cursor fetch` returns `{"id":N,"rows":[...],"fetched":N,"done":bool}`.  Keep calling fetch until `done=true`.
 
 ---
 
-### Aggregates & ORDER BY — DB6
+### Aggregates & ORDER BY
 
 Analytics queries in a single pass over the table (IBM i `OPNQRYF / GROUP BY / ORDER BY`).
 
-| Command | Description |
-|---------|-------------|
-| `aggregate <table> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]` | Count matching rows, optionally grouped |
-| `aggregate <table> SUM\|AVG\|MIN\|MAX <field> [where <f>=<v>] [order ASC\|DESC]` | Numeric aggregate |
-| `select <table> [where <f>=<v>] [order <f> ASC\|DESC]` | ORDER BY with no aggregation |
+
+| Command                                                                      | Description                             |
+| ---------------------------------------------------------------------------- | --------------------------------------- |
+| `aggregate <table> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]`   | Count matching rows, optionally grouped |
+| `aggregate <table> SUM|AVG|MIN|MAX <field> [where <f>=<v>] [order ASC|DESC]` | Numeric aggregate                       |
+| `select <table> [where <f>=<v>] [order <f> ASC|DESC]`                        | ORDER BY with no aggregation            |
+
 
 **Examples:**
+
 ```
 aggregate employees COUNT
 aggregate employees SUM score where dept=Engineering
@@ -240,17 +257,19 @@ select employees where dept=Engineering order score DESC
 
 ---
 
-### Materialized Query Tables — DB7
+### Materialized Query Tables
 
 Pre-computed aggregate tables that auto-refresh on every committed INSERT, UPDATE, or DELETE to the base table (IBM i summary tables / `CREATE TABLE … AS SELECT …`).
 
-| Command | Description |
-|---------|-------------|
-| `mqt create <name> <base> COUNT\|SUM\|AVG\|MIN\|MAX [field] [group <f>] [where <f>=<v>]` | Create an MQT with initial refresh |
-| `mqt list` | Show all MQTs |
-| `mqt refresh <name>` | Force a re-computation |
-| `mqt drop <name>` | Remove MQT and free result table |
-| `mqt scan <name>` | Show current result records |
+
+| Command                                                                              | Description                        |
+| ------------------------------------------------------------------------------------ | ---------------------------------- |
+| `mqt create <name> <base> COUNT|SUM|AVG|MIN|MAX [field] [group <f>] [where <f>=<v>]` | Create an MQT with initial refresh |
+| `mqt list`                                                                           | Show all MQTs                      |
+| `mqt refresh <name>`                                                                 | Force a re-computation             |
+| `mqt drop <name>`                                                                    | Remove MQT and free result table   |
+| `mqt scan <name>`                                                                    | Show current result records        |
+
 
 MQT results are stored as regular `DB_TABLE` records — readable via `select`, indexable via DB3, and queryable via DB5/DB6.  The `refreshed_tick` key records the kernel tick at last refresh.
 
@@ -466,62 +485,68 @@ Demo accounts:
 
 #### Journaling — DB1
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `POST` | `/api/journal/attach` | `APP_USER+` | `{"journal":"…","table":"…"}` — start journaling a table |
-| `POST` | `/api/journal/detach` | `APP_USER+` | `{"journal":"…","table":"…"}` — stop journaling |
-| `GET`  | `/api/journals` | None | List all active journal attachments |
-| `GET`  | `/api/journal/<name>[?since=N]` | None | JSON array of journal entries from sequence N |
+
+| Method | Path                            | Auth        | Description                                              |
+| ------ | ------------------------------- | ----------- | -------------------------------------------------------- |
+| `POST` | `/api/journal/attach`           | `APP_USER+` | `{"journal":"…","table":"…"}` — start journaling a table |
+| `POST` | `/api/journal/detach`           | `APP_USER+` | `{"journal":"…","table":"…"}` — stop journaling          |
+| `GET`  | `/api/journals`                 | None        | List all active journal attachments                      |
+| `GET`  | `/api/journal/<name>[?since=N]` | None        | JSON array of journal entries from sequence N            |
 
 
 #### Indexes — DB3
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET`  | `/api/indexes` | None | List all indexes |
-| `GET`  | `/api/index/<name>[?q=<value>]` | None | Dump index; `?q=val` does exact lookup → `{"hit":bool,"key":"…"}` |
-| `POST` | `/api/index/create` | `APP_USER+` | `{"name":"…","table":"…","field":"…"}` |
-| `POST` | `/api/index/drop`   | `APP_USER+` | `{"name":"…"}` |
-| `POST` | `/api/index/rebuild`| `APP_USER+` | `{"name":"…"}` |
+
+| Method | Path                            | Auth        | Description                                                       |
+| ------ | ------------------------------- | ----------- | ----------------------------------------------------------------- |
+| `GET`  | `/api/indexes`                  | None        | List all indexes                                                  |
+| `GET`  | `/api/index/<name>[?q=<value>]` | None        | Dump index; `?q=val` does exact lookup → `{"hit":bool,"key":"…"}` |
+| `POST` | `/api/index/create`             | `APP_USER+` | `{"name":"…","table":"…","field":"…"}`                            |
+| `POST` | `/api/index/drop`               | `APP_USER+` | `{"name":"…"}`                                                    |
+| `POST` | `/api/index/rebuild`            | `APP_USER+` | `{"name":"…"}`                                                    |
 
 
 #### Constraints — DB4
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET`  | `/api/constraints[?table=T]` | None | List constraints, optionally filtered by table |
-| `POST` | `/api/constraint/add`    | `APP_USER+` | `{"table":"…","field":"…","type":"UNIQUE\|NOT_NULL\|RANGE\|REFERENCE","min":N,"max":N,"ref":"…"}` |
-| `POST` | `/api/constraint/remove` | `APP_USER+` | `{"table":"…","field":"…","type":"…"}` |
+
+| Method | Path                         | Auth        | Description                                                                                    |
+| ------ | ---------------------------- | ----------- | ---------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/constraints[?table=T]` | None        | List constraints, optionally filtered by table                                                 |
+| `POST` | `/api/constraint/add`        | `APP_USER+` | `{"table":"…","field":"…","type":"UNIQUE|NOT_NULL|RANGE|REFERENCE","min":N,"max":N,"ref":"…"}` |
+| `POST` | `/api/constraint/remove`     | `APP_USER+` | `{"table":"…","field":"…","type":"…"}`                                                         |
 
 
 #### Cursors — DB5
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET`  | `/api/cursors` | None | List open cursors |
-| `POST` | `/api/cursor/open` | `APP_USER+` | `{"table":"…","where":"…","eq":"…","order":"<index_name>"}` → `{"cursor_id":N}` |
-| `GET`  | `/api/cursor/fetch?id=N&n=M` | None | Fetch next M rows → `{"rows":[…],"done":bool}` |
-| `GET`  | `/api/cursor/close?id=N` | None | Close cursor |
+
+| Method | Path                         | Auth        | Description                                                                     |
+| ------ | ---------------------------- | ----------- | ------------------------------------------------------------------------------- |
+| `GET`  | `/api/cursors`               | None        | List open cursors                                                               |
+| `POST` | `/api/cursor/open`           | `APP_USER+` | `{"table":"…","where":"…","eq":"…","order":"<index_name>"}` → `{"cursor_id":N}` |
+| `GET`  | `/api/cursor/fetch?id=N&n=M` | None        | Fetch next M rows → `{"rows":[…],"done":bool}`                                  |
+| `GET`  | `/api/cursor/close?id=N`     | None        | Close cursor                                                                    |
 
 
 #### Aggregates — DB6
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `POST` | `/api/aggregate` | `APP_USER+` | `{"table":"…","fn":"COUNT\|SUM\|AVG\|MIN\|MAX","field":"…","where":"…","eq":"…","group_by":"…","having":N,"order_by":"…","order":"ASC\|DESC"}` |
+
+| Method | Path             | Auth        | Description                                                                                                                               |
+| ------ | ---------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/aggregate` | `APP_USER+` | `{"table":"…","fn":"COUNT|SUM|AVG|MIN|MAX","field":"…","where":"…","eq":"…","group_by":"…","having":N,"order_by":"…","order":"ASC|DESC"}` |
+
 
 `fn` can be empty (or omitted) for a plain ORDER BY without aggregation.
 
-
 #### Materialized Query Tables — DB7
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET`  | `/api/mqts` | None | List all MQTs |
-| `GET`  | `/api/mqt/<name>` | None | Read current MQT result records |
+
+| Method | Path               | Auth        | Description                                                      |
+| ------ | ------------------ | ----------- | ---------------------------------------------------------------- |
+| `GET`  | `/api/mqts`        | None        | List all MQTs                                                    |
+| `GET`  | `/api/mqt/<name>`  | None        | Read current MQT result records                                  |
 | `POST` | `/api/mqt/create`  | `APP_USER+` | `{"name":"…","table":"…","fn":"SUM","field":"…","group_by":"…"}` |
-| `POST` | `/api/mqt/refresh` | `APP_USER+` | `{"name":"…"}` — force re-computation |
-| `POST` | `/api/mqt/drop`    | `APP_USER+` | `{"name":"…"}` |
+| `POST` | `/api/mqt/refresh` | `APP_USER+` | `{"name":"…"}` — force re-computation                            |
+| `POST` | `/api/mqt/drop`    | `APP_USER+` | `{"name":"…"}`                                                   |
 
 
 #### Auth
