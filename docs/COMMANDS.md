@@ -49,9 +49,11 @@ The SLS object catalog is the kernel's persistent namespace. Every piece of data
 | `1`  | `DB_TABLE`        | Relational table (keyed records) |
 | `2`  | `DB_INDEX`        | B-tree index over a table        |
 | `3`  | `HEAP_BLOB`       | Unstructured byte heap           |
-| `4`  | `SERVICE_PROCESS` | Ring-3 executable                |
+| `4`  | `SERVICE_PROCESS` | Ring-3 executable (internal kernel services) |
 | `5`  | `WEB_APP`         | HTML/JS/CSS asset store          |
 | `6`  | `JOURNAL`         | IBM i-style journal object       |
+| `7`  | `PROGRAM`         | Named executable — SLS-native replacement for a filesystem binary. Journaled, indexed, MQT-tracked. Use `/api/program/*` endpoints. |
+| `8`  | `STREAM`          | Raw byte-stream object (read-only "file" analogue). Readable by `GUEST` role; no execute permission. |
 
 
 **Example:**
@@ -479,6 +481,10 @@ Demo accounts:
 | `GET`  | `/api/wal`            | None | Write-Ahead Log entries              |
 | `GET`  | `/api/tiers`          | None | Storage tier contents (L1 / L2 / L3) |
 | `GET`  | `/api/processes`      | None | Ring-3 process table                 |
+| `GET`  | `/api/programs`       | None | List all `PROGRAM` objects — `{programs:[{name, vaddr, pages, tier, binary, binary_bytes, format}]}`. Live metadata (`status`, `last_pid`) visible via `/api/objects/<name>`. |
+| `POST` | `/api/program/create` | `APP_USER+` | Create a `PROGRAM` object — `{"name":"…","pages":N}`. Auto-inserts metadata records (`status`, `binary_size`, `format`, `last_pid`) which are journaled, indexed, and MQT-tracked via the DB1–DB7 hook chain. |
+| `POST` | `/api/program/upload` | `APP_USER+` | Upload binary hex — `{"name":"…","hex":"deadbeef…","offset":N,"last":0\|1}`. Up to 1024 bytes/request; chain calls with `offset`. On `last=1` updates metadata records (`binary_size`, `format`, `status→ready`). |
+| `POST` | `/api/program/spawn`  | `APP_USER+` | Spawn process — `{"name":"…"}`. Maps binary into a fresh PML4 via `program_spawn()`, enters Ring-3. Updates `status→running` and `last_pid`. Returns `{"ok":"true","pid":N}`. |
 | `GET`  | `/api/query?q=<text>` | None | Natural-language object scan         |
 | `GET`  | `/api/locks`          | None | Active row locks (DB2)               |
 
