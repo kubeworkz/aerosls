@@ -146,7 +146,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // ── 4l. Materialized Query Table engine ──────────────────────────
     mqt_init();
     // ── 4m. Stream object store (OBJ_TYPE_STREAM) ─────────────────
-    stream_init();
+    // nvme_io_init + stream_init run after the PCI scan (step 7) so that
+    // nvme_ctrl is fully set up before we attempt I/O queue creation.
+    // Placeholder: stream_init is deferred to step 7b below.
     // ── 5. Microkernel (IPC + 5 services + tier manager) ──────────────────
     microkernel_init();
 
@@ -192,7 +194,48 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
             kernel_serial_print("[NET] e1000 not found — network disabled.\n");
         }
     }
-
+    // ── 7b. NVMe PCI scan + I/O queue + stream persistence ────────────────
+    {
+        extern uint32_t pci_read_config(uint8_t, uint8_t, uint8_t, uint8_t);
+        for (int slot = 0; slot < 32; slot++) {
+            uint32_t vid_did = pci_read_config(0, (uint8_t)slot, 0, 0x00);
+            if (vid_did == 0xFFFFFFFF) continue;
+            // NVMe class code = 0x01 0x08 0x02 (bits 31:8 of class register)
+            uint32_t cls = pci_read_config(0, (uint8_t)slot, 0, 0x08);
+            uint8_t base_cls = (uint8_t)((cls >> 24) & 0xFF);
+            uint8_t sub_cls  = (uint8_t)((cls >> 16) & 0xFF);
+            uint8_t prog_if  = (uint8_t)((cls >>  8) & 0xFF);
+            if (base_cls == 0x01 && sub_cls == 0x08 && prog_if == 0x02) {
+                uint32_t bar0 = pci_read_config(0, (uint8_t)slot, 0, 0x10);
+                uint32_t bar1 = pci_read_config(0, (uint8_t)slot, 0, 0x14);
+                int is64 = ((bar0 & 0x06) == 0x04);
+                uint64_t nvme_mmio = (uint64_t)(bar0 & 0xFFFFF000UL);
+                if (is64) nvme_mmio |= ((uint64_t)(bar1) << 32);
+                kernel_serial_printf("[NVME] Controller at PCI slot %d MMIO 0x%lx\n",
+                                      slot, nvme_mmio);
+                if (nvme_mmio && nvme_mmio < 0x100000000ULL) {
+                    // Address is within the 4 GiB identity map — safe to access
+                    if (init_nvme_controller(nvme_mmio)) {
+                        kernel_serial_print("[NVME] Admin queue ready.\n");
+                        if (nvme_io_init()) {
+                            stream_init();
+                        } else {
+                            kernel_serial_print("[NVME] I/O queue setup failed; stream cold start.\n");
+                            stream_init();
+                        }
+                    } else {
+                        kernel_serial_print("[NVME] Controller init failed; stream cold start.\n");
+                        stream_init();
+                    }
+                } else {
+                    kernel_serial_printf("[NVME] MMIO above 4 GiB (0x%lx) \u2014 stream cold start.\n",
+                                         nvme_mmio);
+                    stream_init();
+                }
+                break;
+            }
+        }
+    }
     kernel_serial_print(
         "----------------------------------------------------------------------------------\n"
         "[SLS] System ready. Launching secure shell...\n"
