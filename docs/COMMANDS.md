@@ -53,7 +53,7 @@ The SLS object catalog is the kernel's persistent namespace. Every piece of data
 | `5`  | `WEB_APP`         | HTML/JS/CSS asset store          |
 | `6`  | `JOURNAL`         | IBM i-style journal object       |
 | `7`  | `PROGRAM`         | Named executable — SLS-native replacement for a filesystem binary. Journaled, indexed, MQT-tracked. Use `/api/program/*` endpoints. |
-| `8`  | `STREAM`          | Raw byte-stream object (read-only "file" analogue). Readable by `GUEST` role; no execute permission. |
+| `8`  | `STREAM`          | Raw byte-stream "file" object. Up to 1 MiB per stream (256 × 4 KiB frames, lazily allocated from the physical frame pool — no static BSS cost). Readable by `GUEST` role; no execute permission. Use `/api/stream/*` endpoints. |
 
 
 **Example:**
@@ -482,9 +482,13 @@ Demo accounts:
 | `GET`  | `/api/tiers`          | None | Storage tier contents (L1 / L2 / L3) |
 | `GET`  | `/api/processes`      | None | Ring-3 process table                 |
 | `GET`  | `/api/programs`       | None | List all `PROGRAM` objects — `{programs:[{name, vaddr, pages, tier, binary, binary_bytes, format}]}`. Live metadata (`status`, `last_pid`) visible via `/api/objects/<name>`. |
-| `POST` | `/api/program/create` | `APP_USER+` | Create a `PROGRAM` object — `{"name":"…","pages":N}`. Auto-inserts metadata records (`status`, `binary_size`, `format`, `last_pid`) which are journaled, indexed, and MQT-tracked via the DB1–DB7 hook chain. |
+| `POST` | `/api/program/create` | `APP_USER+` | Create a `PROGRAM` object — `{"name":"…","pages":N}`. Auto-inserts metadata records (`status`, `binary_size`, `format`, `last_pid`) which are journaled, indexed, and MQT-tracked via the DB engine hook chain. |
 | `POST` | `/api/program/upload` | `APP_USER+` | Upload binary hex — `{"name":"…","hex":"deadbeef…","offset":N,"last":0\|1}`. Up to 1024 bytes/request; chain calls with `offset`. On `last=1` updates metadata records (`binary_size`, `format`, `status→ready`). |
 | `POST` | `/api/program/spawn`  | `APP_USER+` | Spawn process — `{"name":"…"}`. Maps binary into a fresh PML4 via `program_spawn()`, enters Ring-3. Updates `status→running` and `last_pid`. Returns `{"ok":"true","pid":N}`. |
+| `GET`  | `/api/streams`        | None        | List all `STREAM` objects — `{streams:[{name, mime_type, size, frames}]}`. |
+| `GET`  | `/api/stream/<name>`  | None        | Download raw file content. Sets `Content-Disposition: attachment` and the stored MIME type. Data is served frame-by-frame from the physical frame pool. |
+| `POST` | `/api/stream/create`  | `APP_USER+` | Create a `STREAM` object — `{"name":"…","mime":"text/plain"}`. Auto-inserts metadata records (`status`, `byte_size`, `mime_type`). |
+| `POST` | `/api/stream/upload`  | `APP_USER+` | Upload file data as hex — `{"name":"…","hex":"…","offset":N,"last":0\|1}`. Same chunked protocol as `/api/program/upload`. Max 1 MiB per stream (256 × 4 KiB frames from the physical frame pool — no static BSS cost). On `last=1` updates `byte_size` and `status→ready`. |
 | `GET`  | `/api/query?q=<text>` | None | Natural-language object scan         |
 | `GET`  | `/api/locks`          | None | Active row locks (DB2)               |
 
