@@ -35,4 +35,7 @@ struct NVMeCqe {
     uint16_t status; // Bit 0 is the Phase Tag (P) matching execution status
 } __attribute__((packed));
 
+// Submit an Admin command synchronously and return the completion entry.
+struct NVMeCqe nvme_submit_admin_cmd(struct NVMeCmd cmd);
+
 #endif

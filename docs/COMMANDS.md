@@ -43,16 +43,16 @@ The SLS object catalog is the kernel's persistent namespace. Every piece of data
 **Object types for `valloc`:**
 
 
-| Code | Name              | Purpose                          |
-| ---- | ----------------- | -------------------------------- |
-| `0`  | `SYSTEM_META`     | Kernel metadata, config blobs    |
-| `1`  | `DB_TABLE`        | Relational table (keyed records) |
-| `2`  | `DB_INDEX`        | B-tree index over a table        |
-| `3`  | `HEAP_BLOB`       | Unstructured byte heap           |
-| `4`  | `SERVICE_PROCESS` | Ring-3 executable (internal kernel services) |
-| `5`  | `WEB_APP`         | HTML/JS/CSS asset store          |
-| `6`  | `JOURNAL`         | IBM i-style journal object       |
-| `7`  | `PROGRAM`         | Named executable — SLS-native replacement for a filesystem binary. Journaled, indexed, MQT-tracked. Use `/api/program/*` endpoints. |
+| Code | Name              | Purpose                                                                                                                                                                                                                         |
+| ---- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | `SYSTEM_META`     | Kernel metadata, config blobs                                                                                                                                                                                                   |
+| `1`  | `DB_TABLE`        | Relational table (keyed records)                                                                                                                                                                                                |
+| `2`  | `DB_INDEX`        | B-tree index over a table                                                                                                                                                                                                       |
+| `3`  | `HEAP_BLOB`       | Unstructured byte heap                                                                                                                                                                                                          |
+| `4`  | `SERVICE_PROCESS` | Ring-3 executable (internal kernel services)                                                                                                                                                                                    |
+| `5`  | `WEB_APP`         | HTML/JS/CSS asset store                                                                                                                                                                                                         |
+| `6`  | `JOURNAL`         | IBM i-style journal object                                                                                                                                                                                                      |
+| `7`  | `PROGRAM`         | Named executable — SLS-native replacement for a filesystem binary. Journaled, indexed, MQT-tracked. Use `/api/program/*` endpoints.                                                                                             |
 | `8`  | `STREAM`          | Raw byte-stream "file" object. Up to 1 MiB per stream (256 × 4 KiB frames, lazily allocated from the physical frame pool — no static BSS cost). Readable by `GUEST` role; no execute permission. Use `/api/stream/*` endpoints. |
 
 
@@ -241,11 +241,11 @@ Server-side iterators that hold scan position across multiple FETCH calls (IBM i
 Analytics queries in a single pass over the table (IBM i `OPNQRYF / GROUP BY / ORDER BY`).
 
 
-| Command                                                                      | Description                             |
-| ---------------------------------------------------------------------------- | --------------------------------------- |
-| `aggregate <table> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]`   | Count matching rows, optionally grouped |
+| Command                                                                                          | Description                             |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------- |
+| `aggregate <table> COUNT [field] [where <f>=<v>] [group <f>] [having <n>]`                       | Count matching rows, optionally grouped |
 | `aggregate <table> SUM&#124;AVG&#124;MIN&#124;MAX <field> [where <f>=<v>] [order ASC&#124;DESC]` | Numeric aggregate                       |
-| `select <table> [where <f>=<v>] [order <f> ASC&#124;DESC]`                        | ORDER BY with no aggregation            |
+| `select <table> [where <f>=<v>] [order <f> ASC&#124;DESC]`                                       | ORDER BY with no aggregation            |
 
 
 **Examples:**
@@ -264,13 +264,13 @@ select employees where dept=Engineering order score DESC
 Pre-computed aggregate tables that auto-refresh on every committed INSERT, UPDATE, or DELETE to the base table (IBM i summary tables / `CREATE TABLE … AS SELECT …`).
 
 
-| Command                                                                              | Description                        |
-| ------------------------------------------------------------------------------------ | ---------------------------------- |
+| Command                                                                                                  | Description                        |
+| -------------------------------------------------------------------------------------------------------- | ---------------------------------- |
 | `mqt create <name> <base> COUNT&#124;SUM&#124;AVG&#124;MIN&#124;MAX [field] [group <f>] [where <f>=<v>]` | Create an MQT with initial refresh |
-| `mqt list`                                                                           | Show all MQTs                      |
-| `mqt refresh <name>`                                                                 | Force a re-computation             |
-| `mqt drop <name>`                                                                    | Remove MQT and free result table   |
-| `mqt scan <name>`                                                                    | Show current result records        |
+| `mqt list`                                                                                               | Show all MQTs                      |
+| `mqt refresh <name>`                                                                                     | Force a re-computation             |
+| `mqt drop <name>`                                                                                        | Remove MQT and free result table   |
+| `mqt scan <name>`                                                                                        | Show current result records        |
 
 
 MQT results are stored as regular `DB_TABLE` records — readable via `select`, indexable via DB3, and queryable via DB5/DB6.  The `refreshed_tick` key records the kernel tick at last refresh.
@@ -475,25 +475,25 @@ Demo accounts:
 #### Observability
 
 
-| Method | Path                  | Auth | Description                          |
-| ------ | --------------------- | ---- | ------------------------------------ |
-| `GET`  | `/api/services`       | None | Microkernel service list + IPC stats |
-| `GET`  | `/api/wal`            | None | Write-Ahead Log entries              |
-| `GET`  | `/api/tiers`          | None | Storage tier contents (L1 / L2 / L3) |
-| `GET`  | `/api/processes`      | None | Ring-3 process table                 |
-| `GET`  | `/api/programs`       | None | List all `PROGRAM` objects — `{programs:[{name, vaddr, pages, tier, binary, binary_bytes, format}]}`. Live metadata (`status`, `last_pid`) visible via `/api/objects/<name>`. |
-| `POST` | `/api/program/create` | `APP_USER+` | Create a `PROGRAM` object — `{"name":"…","pages":N}`. Auto-inserts metadata records (`status`, `binary_size`, `format`, `last_pid`) which are journaled, indexed, and MQT-tracked via the DB engine hook chain. |
-| `POST` | `/api/program/upload` | `APP_USER+` | Upload binary hex — `{"name":"…","hex":"deadbeef…","offset":N,"last":0\|1}`. Up to 1024 bytes/request; chain calls with `offset`. On `last=1` updates metadata records (`binary_size`, `format`, `status→ready`). |
-| `POST` | `/api/program/spawn`  | `APP_USER+` | Spawn process — `{"name":"…"}`. Maps binary into a fresh PML4 via `program_spawn()`, enters Ring-3. Updates `status→running` and `last_pid`. Returns `{"ok":"true","pid":N}`. |
-| `GET`  | `/api/streams`        | None        | List all `STREAM` objects — `{streams:[{name, mime_type, size, frames}]}`. |
-| `GET`  | `/api/stream/<name>`  | None        | Download raw file content. Sets `Content-Disposition: attachment` and the stored MIME type. Data is served frame-by-frame from the physical frame pool. |
-| `POST` | `/api/stream/create`  | `APP_USER+` | Create a `STREAM` object — `{"name":"…","mime":"text/plain"}`. Auto-inserts metadata records (`status`, `byte_size`, `mime_type`). |
-| `POST` | `/api/stream/upload`  | `APP_USER+` | Upload file data as hex — `{"name":"…","hex":"…","offset":N,"last":0\|1}`. Same chunked protocol as `/api/program/upload`. Max 1 MiB per stream (256 × 4 KiB frames from the physical frame pool — no static BSS cost). On `last=1` updates `byte_size` and `status→ready`. |
-| `GET`  | `/api/query?q=<text>` | None | Natural-language object scan         |
-| `GET`  | `/api/locks`          | None | Active row locks (DB2)               |
+| Method | Path                  | Auth        | Description                                                                                                                                                                                                                                                                |
+| ------ | --------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/services`       | None        | Microkernel service list + IPC stats                                                                                                                                                                                                                                       |
+| `GET`  | `/api/wal`            | None        | Write-Ahead Log entries                                                                                                                                                                                                                                                    |
+| `GET`  | `/api/tiers`          | None        | Storage tier contents (L1 / L2 / L3)                                                                                                                                                                                                                                       |
+| `GET`  | `/api/processes`      | None        | Ring-3 process table                                                                                                                                                                                                                                                       |
+| `GET`  | `/api/programs`       | None        | List all `PROGRAM` objects — `{programs:[{name, vaddr, pages, tier, binary, binary_bytes, format}]}`. Live metadata (`status`, `last_pid`) visible via `/api/objects/<name>`.                                                                                              |
+| `POST` | `/api/program/create` | `APP_USER+` | Create a `PROGRAM` object — `{"name":"…","pages":N}`. Auto-inserts metadata records (`status`, `binary_size`, `format`, `last_pid`) which are journaled, indexed, and MQT-tracked via the DB engine hook chain.                                                            |
+| `POST` | `/api/program/upload` | `APP_USER+` | Upload binary hex — `{"name":"…","hex":"deadbeef…","offset":N,"last":0|1}`. Up to 1024 bytes/request; chain calls with `offset`. On `last=1` updates metadata records (`binary_size`, `format`, `status→ready`).                                                           |
+| `POST` | `/api/program/spawn`  | `APP_USER+` | Spawn process — `{"name":"…"}`. Maps binary into a fresh PML4 via `program_spawn()`, enters Ring-3. Updates `status→running` and `last_pid`. Returns `{"ok":"true","pid":N}`.                                                                                              |
+| `GET`  | `/api/streams`        | None        | List all `STREAM` objects — `{streams:[{name, mime_type, size, frames}]}`.                                                                                                                                                                                                 |
+| `GET`  | `/api/stream/<name>`  | None        | Download raw file content. Sets `Content-Disposition: attachment` and the stored MIME type. Data is served frame-by-frame from the physical frame pool.                                                                                                                    |
+| `POST` | `/api/stream/create`  | `APP_USER+` | Create a `STREAM` object — `{"name":"…","mime":"text/plain"}`. Auto-inserts metadata records (`status`, `byte_size`, `mime_type`).                                                                                                                                         |
+| `POST` | `/api/stream/upload`  | `APP_USER+` | Upload file data as hex — `{"name":"…","hex":"…","offset":N,"last":0|1}`. Same chunked protocol as `/api/program/upload`. Max 1 MiB per stream (256 × 4 KiB frames from the physical frame pool — no static BSS cost). On `last=1` updates `byte_size` and `status→ready`. |
+| `GET`  | `/api/query?q=<text>` | None        | Natural-language object scan                                                                                                                                                                                                                                               |
+| `GET`  | `/api/locks`          | None        | Active row locks (DB2)                                                                                                                                                                                                                                                     |
 
 
-#### Journaling — DB1
+#### Journaling
 
 
 | Method | Path                            | Auth        | Description                                              |
@@ -504,7 +504,7 @@ Demo accounts:
 | `GET`  | `/api/journal/<name>[?since=N]` | None        | JSON array of journal entries from sequence N            |
 
 
-#### Indexes — DB3
+#### Indexes
 
 
 | Method | Path                            | Auth        | Description                                                       |
@@ -516,17 +516,17 @@ Demo accounts:
 | `POST` | `/api/index/rebuild`            | `APP_USER+` | `{"name":"…"}`                                                    |
 
 
-#### Constraints — DB4
+#### Constraints
 
 
-| Method | Path                         | Auth        | Description                                                                                    |
-| ------ | ---------------------------- | ----------- | ---------------------------------------------------------------------------------------------- |
-| `GET`  | `/api/constraints[?table=T]` | None        | List constraints, optionally filtered by table                                                 |
+| Method | Path                         | Auth        | Description                                                                                                   |
+| ------ | ---------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/constraints[?table=T]` | None        | List constraints, optionally filtered by table                                                                |
 | `POST` | `/api/constraint/add`        | `APP_USER+` | `{"table":"…","field":"…","type":"UNIQUE&#124;NOT_NULL&#124;RANGE&#124;REFERENCE","min":N,"max":N,"ref":"…"}` |
-| `POST` | `/api/constraint/remove`     | `APP_USER+` | `{"table":"…","field":"…","type":"…"}`                                                         |
+| `POST` | `/api/constraint/remove`     | `APP_USER+` | `{"table":"…","field":"…","type":"…"}`                                                                        |
 
 
-#### Cursors — DB5
+#### Cursors
 
 
 | Method | Path                         | Auth        | Description                                                                     |
@@ -537,17 +537,17 @@ Demo accounts:
 | `GET`  | `/api/cursor/close?id=N`     | None        | Close cursor                                                                    |
 
 
-#### Aggregates — DB6
+#### Aggregates
 
 
-| Method | Path             | Auth        | Description                                                                                                                               |
-| ------ | ---------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Method | Path             | Auth        | Description                                                                                                                                                        |
+| ------ | ---------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `POST` | `/api/aggregate` | `APP_USER+` | `{"table":"…","fn":"COUNT&#124;SUM&#124;AVG&#124;MIN&#124;MAX","field":"…","where":"…","eq":"…","group_by":"…","having":N,"order_by":"…","order":"ASC&#124;DESC"}` |
 
 
 `fn` can be empty (or omitted) for a plain ORDER BY without aggregation.
 
-#### Materialized Query Tables — DB7
+#### Materialized Query Tables
 
 
 | Method | Path               | Auth        | Description                                                      |
