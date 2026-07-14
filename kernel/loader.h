@@ -62,7 +62,7 @@ struct ELF64ProgramHeader {
 #define SYS_SLS_UPLOAD_BINARY  171   // write a chunk into the binary store
 
 // ─── Upload request (one chunk at a time) ─────────────────────────────────────
-#define UPLOAD_CHUNK_MAX 1024
+#define UPLOAD_CHUNK_MAX 16384  // 16 KiB binary per request; hex = 32 KiB, fits in 64 KiB req_buf
 
 struct SLSUploadRequest {
     char     object_name[PROC_NAME_LEN];

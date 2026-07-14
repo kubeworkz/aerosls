@@ -6,7 +6,7 @@
 
 // ─── Stream store constants ──────────────────────────────────────────────────
 #define STREAM_MAX          8
-#define STREAM_MAX_FRAMES   256      // 256 × 4 KiB frames = 1 MiB max per stream
+#define STREAM_MAX_FRAMES   16384    // 16384 × 4 KiB frames = 64 MiB max per stream
 #define STREAM_NAME_LEN     64
 #define STREAM_MIME_LEN     64
 

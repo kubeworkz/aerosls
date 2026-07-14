@@ -1417,7 +1417,7 @@ void http_server_run(void) {
                          "GET http://10.0.2.15:3000/api/scan\n",
                          NET_HTTP_PORT);
 
-    static char req_buf[4096];
+    static char req_buf[65536];  // 64 KiB — fits a 16 KiB binary chunk (32 KiB hex) + headers
 
     for (;;) {
         int conn = tcp_accept(listen_fd);
