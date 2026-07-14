@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "kernel_io.h"
+#include "../arch/x86/vga.h"
 #include "scheduler.h"
 #include "microkernel.h"
 #include "../arch/x86/gdt.h"
@@ -90,7 +91,11 @@ extern "C"
 #endif
 void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
-    // ── 1. Serial output — must be first so all subsequent prints are visible ──
+    // ── 1a. VGA text-mode HMI — initialise before serial so the screen is
+    //        ready as soon as the first kernel_serial_print() fires.
+    vga_init();
+
+    // ── 1b. Serial output ─────────────────────────────────────────────────────
     serial_init();
     kernel_serial_print(
         "[AEROSLS BOOT LOGGER V1.0.0 RUNNING]\n"

@@ -1,61 +1,10 @@
 ---
-marp: true
-theme: default
-paginate: true
-style: |
-  section {
-    background: #0B0F19;
-    color: #E2E8F0;
-    font-family: 'Segoe UI', 'Inter', sans-serif;
-    font-size: 22px;
-  }
-  h1 {
-    color: #38BDF8;
-    font-size: 2em;
-    border-bottom: 2px solid #38BDF8;
-    padding-bottom: 0.2em;
-  }
-  h2 {
-    color: #7DD3FC;
-    font-size: 1.4em;
-  }
-  h3 { color: #93C5FD; }
-  strong { color: #FCD34D; }
-  em { color: #86EFAC; }
-  code {
-    background: #1E293B;
-    color: #86EFAC;
-    padding: 0.1em 0.4em;
-    border-radius: 4px;
-    font-size: 0.85em;
-  }
-  pre {
-    background: #1E293B;
-    border-left: 4px solid #38BDF8;
-    padding: 1em;
-    border-radius: 6px;
-    font-size: 0.75em;
-  }
-  ul li { margin: 0.4em 0; }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.85em;
-  }
-  th {
-    background: #1E293B;
-    color: #38BDF8;
-    padding: 0.5em 1em;
-  }
-  td { padding: 0.4em 1em; border-bottom: 1px solid #334155; }
-  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 2em; }
-  section.title-slide h1 { font-size: 2.2em; border: none; text-align: center; margin-top: 1.5em; }
-  section.title-slide { text-align: center; }
-  .metric { color: #34D399; font-size: 1.6em; font-weight: bold; }
-  .warn { color: #F87171; }
----
 
-<!-- _class: title-slide -->
+marp: true theme: default paginate: true style: | section { background: #0B0F19; color: #E2E8F0; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 22px; } h1 { color: #38BDF8; font-size: 2em; border-bottom: 2px solid #38BDF8; padding-bottom: 0.2em; } h2 { color: #7DD3FC; font-size: 1.4em; } h3 { color: #93C5FD; } strong { color: #FCD34D; } em { color: #86EFAC; } code { background: #1E293B; color: #86EFAC; padding: 0.1em 0.4em; border-radius: 4px; font-size: 0.85em; } pre { background: #1E293B; border-left: 4px solid #38BDF8; padding: 1em; border-radius: 6px; font-size: 0.75em; } ul li { margin: 0.4em 0; } table { width: 100%; border-collapse: collapse; font-size: 0.85em; } th { background: #1E293B; color: #38BDF8; padding: 0.5em 1em; } td { padding: 0.4em 1em; border-bottom: 1px solid #334155; } .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 2em; } section.title-slide h1 { font-size: 2.2em; border: none; text-align: center; margin-top: 1.5em; } section.title-slide { text-align: center; } .metric { color: #34D399; font-size: 1.6em; font-weight: bold; }
+
+##   .warn { color: #F87171; }
+
+
 
 # Zero-Abstraction Systems
 
@@ -64,27 +13,27 @@ style: |
 
 ---
 
-*Dave F Cook — Independent Researcher*  
-*AeroSLS OS — github.com/kubeworkz/slsos*
+*Dave F Cook - Independent Researcher*  
+*AeroSLS OS - github.com/kubeworkz/slsos*
 
 ---
 
 ## The Core Systems Bottleneck
 
-<div class="columns">
-<div>
+
 
 **The Problem**
+
 - PCIe Gen5 NVMe hardware delivers **microsecond-scale** I/O latency
 - Legacy OS software stacks add **hundreds of cycles** of overhead
 - VFS path parsing, permission checks, buffer copies — all unnecessary
 
 **The Root Cause**
+
 - Every file read bounces through 4+ software layers
 - Double-caching destroys multi-core throughput
 
-</div>
-<div>
+
 
 ```
 Application read()
@@ -95,11 +44,10 @@ Application read()
               └─ (finally) NVMe response
 ```
 
-*NVMe hardware is no longer the bottleneck —  
-**the OS abstraction layer is.***
+*NVMe hardware is no longer the bottleneck —*  
+***the OS abstraction layer is.***
 
-</div>
-</div>
+
 
 ---
 
@@ -111,13 +59,15 @@ Application read()
 Storage Device  →  Disk Controller Cache  →  VFS Page Cache  →  User Buffer
 ```
 
-| Layer | Overhead |
-|-------|---------|
-| VFS path string parse | ~180 cycles |
-| Permission array walk | ~85 cycles |
-| Page cache lookup | ~110 cycles |
-| `read()` buffer copy | ~70 cycles |
-| **Total POSIX tax** | **~446.5 cycles** |
+
+| Layer                 | Overhead          |
+| --------------------- | ----------------- |
+| VFS path string parse | ~180 cycles       |
+| Permission array walk | ~85 cycles        |
+| Page cache lookup     | ~110 cycles       |
+| `read()` buffer copy  | ~70 cycles        |
+| **Total POSIX tax**   | **~446.5 cycles** |
+
 
 > Double-caching and pointer serialisation loops destroy multi-core CPU throughput.
 
@@ -125,21 +75,23 @@ Storage Device  →  Disk Controller Cache  →  VFS Page Cache  →  User Buffe
 
 ## Thesis: Zero-Abstraction Architecture
 
-<br>
+  
+
 
 > **Eliminate files, directories, and mount tables.**
 
-<br>
-
+  
 Represent the entire persistent universe as a raw, globally addressable **64-bit object namespace** mapped directly by the processor's MMU.
 
-<br>
 
-| Traditional OS | AeroSLS |
-|---|---|
-| Files → VFS → Block layer → NVMe | Object ID → MMU → NVMe DMA |
-| ~446 cycles per access | **17.2 cycles per access** |
-| Software-managed caching | Hardware page-fault demand paging |
+
+
+| Traditional OS                   | AeroSLS                           |
+| -------------------------------- | --------------------------------- |
+| Files → VFS → Block layer → NVMe | Object ID → MMU → NVMe DMA        |
+| ~446 cycles per access           | **17.2 cycles per access**        |
+| Software-managed caching         | Hardware page-fault demand paging |
+
 
 ---
 
@@ -168,8 +120,7 @@ Virtual Address Space (64-bit)
 
 ## Lock-Free Directory Scaling
 
-<div class="columns">
-<div>
+
 
 **Traditional spinlock approach**
 
@@ -184,8 +135,7 @@ pthread_mutex_unlock(&dir_lock);
 - ❌ Cache-line ping-pong under load
 - ❌ Scales to ~1 core effectively
 
-</div>
-<div>
+
 
 **AeroSLS concurrent hash matrix**
 
@@ -202,8 +152,7 @@ __sync_bool_compare_and_swap(
 - ✅ Each core inserts into separate bucket rows
 - ✅ Scales linearly with core count
 
-</div>
-</div>
+
 
 ---
 
@@ -211,7 +160,9 @@ __sync_bool_compare_and_swap(
 
 Contiguous virtual address window → fragmented physical NVMe sectors:
 
-$$\mathcal{E} = \langle V_{page},\ L_{lba},\ \mathcal{S}_{count} \rangle$$
+$$
+\mathcal{E} = \langle V_{page},\ L_{lba},\ \mathcal{S}_{count} \rangle
+$$
 
 ```
 Virtual range:   0x0000700000000000 → 0x0000700000400000  (4 MB window)
@@ -297,23 +248,24 @@ Bit:  63  ...  12  11  10  9   8   7   6   5   4   3   2   1   0
 
 ## Parallelised Privacy at Rest
 
-<div class="columns">
-<div>
+
 
 **Core assignment**
 
-| Core | Role |
-|------|------|
-| 0–1 | Shell, allocations, network I/O |
-| 2–3 | Isolated crypto-processors |
+
+| Core | Role                            |
+| ---- | ------------------------------- |
+| 0–1  | Shell, allocations, network I/O |
+| 2–3  | Isolated crypto-processors      |
+
 
 **Isolation mechanism**
+
 - Crypto cores operate in separate address space segments
 - ChaCha20 cipher math runs on dedicated vector register banks
 - No shared mutable state with application cores
 
-</div>
-<div>
+
 
 ```c
 // Core 2/3 — vectorized cipher loop
@@ -329,8 +281,7 @@ void chacha20_block_avx512(
 }
 ```
 
-</div>
-</div>
+
 
 ---
 
@@ -380,11 +331,13 @@ Step 4: Thread touches vector register → INT #7 fires
   }
 ```
 
-| Mode | Cycles/switch |
-|------|--------------|
+
+| Mode                     | Cycles/switch    |
+| ------------------------ | ---------------- |
 | Forced full context save | **2,485 cycles** |
-| Lazy CR0.TS optimisation | **45.8 cycles** |
-| **Improvement** | **54.2×** |
+| Lazy CR0.TS optimisation | **45.8 cycles**  |
+| **Improvement**          | **54.2×**        |
+
 
 ---
 
@@ -465,16 +418,19 @@ Application thread advances to page N+1:
 
 **Measurement:** `RDTSC` clock cycles per memory-read operation
 
-| Implementation | Min | Mean | Max |
-|----------------|-----|------|-----|
-| Legacy VFS stack | 380 | **446.5** | 612 |
-| AeroSLS direct MMU | 14 | **17.2** | 22 |
-| **Reduction** | | **96.1%** | |
 
-<br>
+| Implementation     | Min | Mean      | Max |
+| ------------------ | --- | --------- | --- |
+| Legacy VFS stack   | 380 | **446.5** | 612 |
+| AeroSLS direct MMU | 14  | **17.2**  | 22  |
+| **Reduction**      |     | **96.1%** |     |
 
-> *"From 446.5 CPU clock cycles to just 17.2 clock cycles —  
-> a **96.1% reduction** in processor instruction overhead."*
+
+  
+
+
+> *"From 446.5 CPU clock cycles to just 17.2 clock cycles —*  
+> *a **96.1% reduction** in processor instruction overhead."*
 
 Every eliminated cycle directly frees CPU time for user application workloads.
 
@@ -485,16 +441,19 @@ Every eliminated cycle directly frees CPU time for user application workloads.
 **Measurement:** `RDTSC` cycles per context switch  
 *(log scale — delta spans multiple orders of magnitude)*
 
-| Context Switch Policy | Cycles |
-|----------------------|--------|
+
+| Context Switch Policy                    | Cycles      |
+| ---------------------------------------- | ----------- |
 | Forced strict AVX-512 save (2,688 bytes) | **2,485.0** |
-| Lazy CR0.TS optimisation | **45.8** |
-| **Optimisation yield** | **54.2×** |
+| Lazy CR0.TS optimisation                 | **45.8**    |
+| **Optimisation yield**                   | **54.2×**   |
 
-<br>
 
-> *"Integer-only threads switch tasks with a median latency of only  
-> **45.8 clock cycles** — bypassing the 2.6 KB vector data-movement penalty entirely."*
+  
+
+
+> *"Integer-only threads switch tasks with a median latency of only*  
+> ***45.8 clock cycles** — bypassing the 2.6 KB vector data-movement penalty entirely."*
 
 When encryption eventually triggers INT #7, the kernel resolves the swap  
 at microsecond scale — **deterministic across all parallel cores**.
@@ -505,12 +464,14 @@ at microsecond scale — **deterministic across all parallel cores**.
 
 **Table 1 — Cycle-level telemetry across evaluation sweeps**
 
-| Metric | Min | Mean | Max | Variance |
-|--------|-----|------|-----|---------|
-| AeroSLS MMU index | 14 | **17.2** | 22 | ±4 cycles |
-| Legacy VFS path | 380 | **446.5** | 612 | ±116 cycles |
-| Lazy context switch | 38 | **45.8** | 61 | ±12 cycles |
+
+| Metric                | Min   | Mean      | Max   | Variance    |
+| --------------------- | ----- | --------- | ----- | ----------- |
+| AeroSLS MMU index     | 14    | **17.2**  | 22    | ±4 cycles   |
+| Legacy VFS path       | 380   | **446.5** | 612   | ±116 cycles |
+| Lazy context switch   | 38    | **45.8**  | 61    | ±12 cycles  |
 | Forced context switch | 2,180 | **2,485** | 2,890 | ±355 cycles |
+
 
 > The AeroSLS MMU index varies by **only ±4 cycles** — proving lock-free  
 > concurrent hash mapping eliminates unpredictable synchronisation delays.
@@ -526,7 +487,8 @@ Mapped to PCIe clock baseline: **single-digit microsecond** media access latency
 
 ## Final Architectural Takeaways
 
-<br>
+  
+
 
 **✅ Unification of storage and memory** at the physical page table boundary works at bare-metal line speeds
 
@@ -536,27 +498,32 @@ Mapped to PCIe clock baseline: **single-digit microsecond** media access latency
 
 **✅ Lazy optimisations compound** — CR0.TS + demand paging + async doorbells eliminate blocking at every layer
 
-<br>
+  
 
-| Goal | Result |
-|------|--------|
-| Remove VFS overhead | **96.1% cycle reduction** |
-| Eliminate scheduler jitter | **54.2× improvement** |
-| Approach PCIe line speed | **Single-digit µs latency** |
+
+
+| Goal                       | Result                      |
+| -------------------------- | --------------------------- |
+| Remove VFS overhead        | **96.1% cycle reduction**   |
+| Eliminate scheduler jitter | **54.2× improvement**       |
+| Approach PCIe line speed   | **Single-digit µs latency** |
+
 
 ---
 
-<!-- _class: title-slide -->
+
 
 # Thank You
 
 **Questions?**
 
-<br>
+  
 
-*AeroSLS OS — Apache 2.0*  
+
+*AeroSLS OS - Apache 2.0*  
 `github.com/kubeworkz/slsos`
 
-<br>
+  
 
-*Dave F Cook — Independent Researcher*
+
+*Dave F Cook - Independent Researcher*

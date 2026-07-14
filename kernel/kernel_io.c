@@ -1,4 +1,5 @@
 #include "kernel_io.h"
+#include "../arch/x86/vga.h"
 
 // ─── x86 Port I/O ─────────────────────────────────────────────────────────────
 static inline void outb(uint16_t port, uint8_t val) {
@@ -27,6 +28,8 @@ void kernel_serial_putchar(char c) {
     while (!(inb(SERIAL_COM1_BASE + 5) & 0x20))
         __asm__ volatile("pause");
     outb(SERIAL_COM1_BASE, (uint8_t)c);
+    // Mirror output to VGA text-mode HMI once the driver is initialised
+    if (vga_is_ready()) vga_putchar(c);
 }
 
 void kernel_serial_print(const char* s) {

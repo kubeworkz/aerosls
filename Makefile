@@ -20,7 +20,7 @@ X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
 X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm
-X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c arch/x86/lazy_fpu.c \
+X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kernel/scheduler.c arch/x86/lazy_fpu.c \
               arch/x86/walk_page_tables_x86.c \
               kernel/lockfree_map.c drivers/ahci.c drivers/pci.c drivers/nvme.c drivers/nvme_admin.c \
               kernel/frame_pool.c kernel/dashboard.c user/shell.c kernel/smp.c drivers/io_prio.c \
@@ -105,6 +105,7 @@ x86-run: x86-iso
 		-device nvme,drive=disk,serial=slsdev0 \
 		-netdev user,id=net0,hostfwd=tcp::3001-:3000 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:01 \
+		-vga std -display gtk \
 		-m 4G -smp 4 -boot d -serial file:sls_kernel_debug.log
 
 %.rv.o: %.S

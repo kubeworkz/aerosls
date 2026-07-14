@@ -39,7 +39,7 @@ Here is a functional overview of the features implemented to address our design 
 
 **Privacy-First AI Co-Processor:**
 
-- Configurable AI backend — defaults to **Ollama** (fully local, zero data egress) with optional Claude or any OpenAI-compatible server. Set `AI_BACKEND` in `.env`.
+- Configurable AI backend - defaults to **Ollama** (fully local, zero data egress) with optional Claude or any OpenAI-compatible server. Set `AI_BACKEND` in `.env`.
 - State-Aware Analysis: Passes real-time metrics, active memory mappings, and thread statistics to the AI. Users can ask custom architectural questions, analyse page fault ratios, or use pre-templated guides to study SLS mechanisms.
 
 Here are key actions taken for the app:
@@ -48,9 +48,9 @@ Here are key actions taken for the app:
 
 We created a visual overlay on the SlsMemoryMap that flashes red when an L4 archive access triggers a page fault, adding a brief animation that demonstrates the 'page swap' process from archival storage back to DRAM.
 
-I have designed and implemented a high-fidelity visual page swap experience directly within the Single Level Storage Memory Map component.
+We designed and implemented a high-fidelity visual page swap experience directly within the Single Level Storage Memory Map component.
 
-Here is a summary of the polished design and interactive features added:
+Here is a summary of the updated design and interactive features added:
 
 - **Hardware Interrupt Flash (0x0E):** When a pointer pointing to a compressed level-4 (L4_ARCHIVE) segment is dereferenced, the Memory Grid immediately triggers a high-intensity crimson red visual flash context overlay, warning the user of an active CPU Page Fault.
 - **Sequential Pipeline Animation:** Designed a step-by-step schematic sequence demonstrating the exact mechanics of a single-level store page swap back to volatile DRAM:
@@ -65,7 +65,7 @@ Here is a summary of the polished design and interactive features added:
 
 Integrate a '**System Health**' widget in the header that uses the current metrics to display a real-time risk score based on page fault frequency and system uptime.
 
-I have completed both of your requests successfully! Here is a summary of the polished, interactive additions implemented in the Single Level Storage OS (SLSOS) simulator:
+Here is a summary of the hed, interactive additions implemented in the Single Level Storage OS (SLSOS) simulator:
 
 1. Visual Page Swap Overlay & Animation
 
@@ -79,7 +79,7 @@ On the Address Space Map (SlsMemoryMap), referencing any memory blocks in the co
 
 2. Real-Time System Health & Risk Telemetry
 
-I have built and integrated a System Health widget directly into the header bar. This component monitors page fault frequency against system uptime to calculate a live vulnerability score:
+This component monitors page fault frequency against system uptime to calculate a live vulnerability score:
 
 - **Dynamic Risk Coefficient:** Uses page fault rate (%) and frequency (PFs/m) against system uptime to derive a real-time risk score out of 100.
 - **Visual Gauge Indicators:** A responsive capsule badge in the header pulses dynamically—colored green (Nominal), amber (Elevated), or red (Critical)—according to the current system risk level.
@@ -90,7 +90,7 @@ Create a new '**Storage Throughput'** dashboard component that displays a real-t
 
 Here are key actions taken for the app:
 
-I have successfully created and integrated the new Storage Throughput Dashboard component to monitor and visualize the performance impact of tier migrations across your PCIe Gen 5 NVMe devices.
+We created and integrated the new Storage Throughput Dashboard component to monitor and visualize the performance impact of tier migrations across your PCIe Gen 5 NVMe devices.
 
 Here is a summary of the design and functional updates:
 
@@ -106,7 +106,7 @@ Here is a summary of the design and functional updates:
 
 Implement a '**Recovery Audit Export**' feature in the Transactions tab that allows users to download a formatted text report of the latest log replay session, including the number of successful REDO/UNDO operations performed during the last system recovery.
 
-I have completed the integration of the Recovery Audit Export feature inside the transaction console!
+We completed the integration of the Recovery Audit Export feature inside the transaction console.
 
 Here is a summary of the achievements and design concepts used to bring this feature to life:
 
@@ -116,7 +116,7 @@ Here is a summary of the achievements and design concepts used to bring this fea
 
 Add a configuration panel that lets users define custom thresholds for automated tier migration (e.g., move to archive after 30 seconds of inactivity).
 
-I have implemented the custom automated tiering thresholds configuration panel and background demotion daemon.
+We implemented the custom automated tiering thresholds configuration panel and background demotion daemon.
 
 Here is a summary of the implemented features:
 
@@ -154,7 +154,7 @@ In the Single Level Storage (SLS) architecture, there are three primary methods 
 
 *How are records added to the database? Can we build a simulated data entry screen? Is that even possible?*
 
-I have successfully designed and built the high-fidelity Persistent Database Segment Data Entry Screen to fully answer and simulate how records are ingested, stored, and managed under a 
+We designed and built the high-fidelity Persistent Database Segment Data Entry Screen to fully answer and simulate how records are ingested, stored, and managed under a 
 
 ### Single Level Storage (SLS) architecture:
 
@@ -170,7 +170,7 @@ I have successfully designed and built the high-fidelity Persistent Database Seg
   - **Direct Heap Bypass:** Simulates instant, raw memory overwrites bypassing the transaction boundary entirely—showing the user the potential integrity risk if an OS crash occurs before the write is flushed.
 - **Visual Integrity & Aesthetic Rhythm:** Crafted using a high-contrast futuristic layout, dark obsidian cards, real-time memory address counters, and micro-interactions representing memory-mapped state transitions.
 
-I have successfully implemented and fully integrated the Sovereign User Portal & Flat Memory Leasing System into the Single Level Storage OS:
+We successfully implemented and fully integrated the Sovereign User Portal & Flat Memory Leasing System into the Single Level Storage OS:
 
 ### 🌟 Key Enhancements Implemented
 
@@ -187,7 +187,7 @@ I have successfully implemented and fully integrated the Sovereign User Portal &
 
 The AeroSLS AI Co-Processor is now live and production-ready.
 
-When you eliminate the filesystem layer and map all data into one vast, globally addressable flat memory space, you remove the legacy performance bottlenecks of serialisation, parsing, and disc I/O. By routing natural language queries through a local AI reasoning engine, you create a Zero-Abstraction Data layer — and critically, **your kernel memory data never leaves the machine**.
+When you eliminate the filesystem layer and map all data into one vast, globally addressable flat memory space, you remove the legacy performance bottlenecks of serialisation, parsing, and disc I/O. By routing natural language queries through a local AI reasoning engine, you create a Zero-Abstraction Data layer - and critically, **your kernel memory data never leaves the machine**.
 
 Here is a conceptual look at how this deep-thinking semantic memory controller operates, bypassing both SQL and filesystems:
 
@@ -261,13 +261,12 @@ Here is a conceptual and visual breakdown of what has been crafted:
 - **AI Backend Integration:** The frontend calls `/api/ai/generate` on the Express server, which routes to the configured backend:
   - `AI_BACKEND=ollama` — local Ollama daemon (default). Pull any model: `ollama pull llama3.2`.
   - `AI_BACKEND=claude` — Anthropic Claude API via `ANTHROPIC_API_KEY`.
-  - `AI_BACKEND=openai` — any OpenAI-compatible server (LM Studio, llama.cpp, vLLM).
-  Configure via `.env` — see `.env.example` for the full reference.
+  - `AI_BACKEND=openai` — any OpenAI-compatible server (LM Studio, llama.cpp, vLLM). Configure via `.env` — see `.env.example` for the full reference.
 - **Pristine Verification:** Validated the codebase through automated linter sweeps and compiled the app successfully into its production build pipeline.
 
 Can we make it possible for the portal user to download their records from their data spaces?
 
-I have successfully implemented the ability for leaseholders to download and export their data space records directly from the Sovereign Portal dashboard:
+We implemented the ability for leaseholders to download and export their data space records directly from the Sovereign Portal dashboard:
 
 - **Interactive Export Controls:** Added a dedicated Address Space Dump Exporter panel directly into the leaseholder's active workspace. This section lists all active memory segments queued for export, complete with virtual addresses, allocated page sizes, and live memory layouts.
 - **Structured Manifest Export (.JSON):** Created a client-side exporter that dynamically generates and downloads a highly structured JSON file detailing the leaseholder's allocated address-space objects, active protection ACL schemas, and variable states.
@@ -306,7 +305,7 @@ Because code and data are treated identically at the memory level, they are prot
 
 Is it possible to do bulk uploads to the memory space?
 
-I have successfully designed and integrated the Bulk Address Space Importer into the Sovereign User Portal. The application compiled successfully and is fully ready.
+We designed and integrated the Bulk Address Space Importer into the User Portal. The application compiled successfully and is fully ready.
 
 ### Dynamic Memory Bulk Allocation & Restore Center
 
@@ -318,9 +317,7 @@ I have successfully designed and integrated the Bulk Address Space Importer into
 - **Ledger & WAL Compliance:** Each successful bulk allocation writes a detailed entry to the Write-Ahead Log (WAL) console under an ALLOCATE action, ensuring strict transactional trace parity across the simulation.
 - **Tactile Drag & Drop States:** Styled with elegant dashed border animations, micro-pulses, and live hover indicators utilizing generous negative space and a clean, high-contrast layout.
 
-Not sure if this is possible but is there a way to publish some sort of api for this service?
-
-Yes, it is absolutely possible! Because this application runs on a full-stack architecture with a Node.js/Express backend (server.ts) serving the React interface, we can easily expose real, public-facing 
+*Not sure if this is possible but is there a way to publish some sort of api for this service?*
 
 ### REST API endpoints.
 
@@ -344,7 +341,7 @@ To make this practical and safe, we can:
 - **Token Authentication:** Use a custom X-SLS-Token header (matching your Sovereign Portal username/lease token) to secure the routes.
 - **Developer Sandbox Panel:** Implement a new section in your Sovereign Portal where you can view your API credentials, generate access tokens, and copy ready-to-run curl commands to test the endpoints directly from your local terminal.
 
-I have implemented and fully integrated the Sovereign OS REST Developer API for the Single Level Storage (SLS) simulator.
+We implemented and fully integrated the Sovereign OS REST Developer API for the Single Level Storage (SLS) simulator.
 
 Here is a summary of the accomplishments completed on your behalf:
 
@@ -357,7 +354,7 @@ Here is a summary of the accomplishments completed on your behalf:
   - POST /api/v1/memory/write: Direct payload/field modifications.
   - DELETE /api/v1/memory/free/:id: Remotely release heap allocations.
   - GET /api/v1/memory/hexdump: Stream textual address dumps.
-- **Leaseholder Authentication:** Enforced bearer token authentication (Bearer sls_dev_key_[userId]) on all API requests.
+- **User Authentication:** Enforced bearer token authentication (Bearer sls_dev_key_[userId]) on all API requests.
 
 🔄 **Real-Time Parity Synchronization**
 
@@ -370,7 +367,7 @@ Here is a summary of the accomplishments completed on your behalf:
 - **Interactive Command Console:** Created an endpoint reference table with tabs showing ready-made, fully authorized curl commands customized dynamically to your exact workspace URL.
 - **Interactive Schema Documentation:** Built clean syntax-highlighted containers depicting expected JSON responses and actual low-level ASCII hex dumps for all active memory pages.
 
-I have successfully implemented and synchronized the complete REST API Key Management & Ingress Access Control system across both frontend and backend architectures:
+We implemented and synchronized the complete REST API Key Management & Ingress Access Control system across both frontend and backend architectures:
 
 ### 🌟 What was Accomplished
 
@@ -394,11 +391,9 @@ I have successfully implemented and synchronized the complete REST API Key Manag
 
 3. **Backend Key Validation Gateway (server.ts)**
 
-- Integrates with the getUserIdFromToken extractor to validate inbound HTTP headers against the dynamic apiKeys array.
-- Real-time updates record the exact lastUsed timestamp and persist it back to the active memory space, triggering seamless client-side propagation.
+- Integrates with the getUserIdFromToken extractor to validate inbound HTTP headers against the dynamic api keys array.
+- Real-time updates record the exact last used timestamp and persist it back to the active memory space, triggering seamless client-side propagation.
 
 # Summary
 
-In an SLS environment, there is no "disk vs. RAM." There is only one massive, persistent address space. An executable binary is just a sequence of instruction bytes residing at a specific pointer, and a 
-
-data file is just a sequence of data bytes residing at another pointer. The CPU accesses both using the exact same hardware addressing pathways.
+In an SLS environment, there is no "disk vs. RAM." There is only one massive, persistent address space. An executable binary is just a sequence of instruction bytes residing at a specific pointer, and a data file is just a sequence of data bytes residing at another pointer. The CPU accesses both using the exact same hardware addressing pathways.
