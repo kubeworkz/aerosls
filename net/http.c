@@ -821,7 +821,17 @@ static void http_respond_stream(int conn, struct StreamEntry* se) {
     const char* co="Access-Control-Allow-Origin: *\r\n"; while(*co) hdr[hp++]=*co++;
     hdr[hp++]='\r'; hdr[hp++]='\n';
     tcp_send(conn, hdr, (uint32_t)hp);
-    if (se->size>0) tcp_send(conn, (const char*)se->data, se->size);
+    /* Send content frame-by-frame — each frame is a 4-KiB physical page
+       from the frame pool; last frame may be a partial page. */
+    if (se->size > 0) {
+        uint32_t remaining = se->size;
+        for (uint32_t fi = 0; fi < STREAM_MAX_FRAMES && remaining > 0; fi++) {
+            if (!se->frames[fi]) break;
+            uint32_t to_send = remaining < 4096u ? remaining : 4096u;
+            tcp_send(conn, (const char*)se->frames[fi], to_send);
+            remaining -= to_send;
+        }
+    }
 }
 
 // ─── POST /api/stream/create ──────────────────────────────────────────────────
