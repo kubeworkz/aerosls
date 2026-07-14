@@ -26,6 +26,7 @@
 #include "../kernel/cursor.h"
 #include "../kernel/aggregate.h"
 #include "../kernel/mqt.h"
+#include "../kernel/stream.h"#include "../kernel/stream.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -144,7 +145,8 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4l. Materialized Query Table engine ──────────────────────────
     mqt_init();
-
+    // ── 4m. Stream object store (OBJ_TYPE_STREAM) ─────────────────
+    stream_init();
     // ── 5. Microkernel (IPC + 5 services + tier manager) ──────────────────
     microkernel_init();
 

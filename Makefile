@@ -42,6 +42,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c kernel/scheduler.c a
               kernel/cursor.c \
               kernel/aggregate.c \
               kernel/mqt.c \
+              kernel/stream.c \
               kernel/net_event.c \
               kernel/auth.c \
               kernel/stubs.c

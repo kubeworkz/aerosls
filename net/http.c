@@ -20,6 +20,7 @@
 #include "../kernel/scheduler.h"
 #include "../kernel/auth.h"
 #include "../kernel/loader.h"
+#include "../kernel/stream.h"
 #include "../user/permissions.h"
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
@@ -800,6 +801,69 @@ static int api_program_spawn_handler(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+// ─── Stream binary download ────────────────────────────────────────────────────
+static void http_respond_stream(int conn, struct StreamEntry* se) {
+    char hdr[384]; int hp=0;
+    const char* sl="HTTP/1.1 200 OK\r\n"; while(*sl) hdr[hp++]=*sl++;
+    const char* ct="Content-Type: "; while(*ct) hdr[hp++]=*ct++;
+    const char* mt=se->mime_type[0] ? se->mime_type : "application/octet-stream";
+    while(*mt) hdr[hp++]=*mt++;
+    hdr[hp++]='\r'; hdr[hp++]='\n';
+    const char* cd="Content-Disposition: attachment; filename=\"";
+    while(*cd) hdr[hp++]=*cd++;
+    const char* fn=se->name; while(*fn) hdr[hp++]=*fn++;
+    hdr[hp++]='"'; hdr[hp++]='\r'; hdr[hp++]='\n';
+    const char* cl="Content-Length: "; while(*cl) hdr[hp++]=*cl++;
+    char tmp[12]; int tl=0; uint32_t v=se->size;
+    if (!v){tmp[tl++]='0';} else {while(v){tmp[tl++]=(char)('0'+v%10);v/=10;}}
+    for(int i=tl-1;i>=0;i--) hdr[hp++]=tmp[i];
+    hdr[hp++]='\r'; hdr[hp++]='\n';
+    const char* co="Access-Control-Allow-Origin: *\r\n"; while(*co) hdr[hp++]=*co++;
+    hdr[hp++]='\r'; hdr[hp++]='\n';
+    tcp_send(conn, hdr, (uint32_t)hp);
+    if (se->size>0) tcp_send(conn, (const char*)se->data, se->size);
+}
+
+// ─── POST /api/stream/create ──────────────────────────────────────────────────
+static int api_stream_create(const char* body, char* buf, int max) {
+    JSONBuf j={buf,0,max};
+    if (!body){jb_obj_open(&j,0);jb_str(&j,"error","missing body");jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;}
+    char sname[STREAM_NAME_LEN], smime[STREAM_MIME_LEN];
+    sname[0]=smime[0]='\0';
+    json_str(body,"name",sname,STREAM_NAME_LEN);
+    json_str(body,"mime",smime,STREAM_MIME_LEN);
+    if (!sname[0]){jb_obj_open(&j,0);jb_str(&j,"ok","false");jb_putc(&j,',');jb_str(&j,"error","name required");jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;}
+    int rc=stream_create(sname,smime);
+    jb_obj_open(&j,0);
+    jb_str(&j,"ok",rc==0?"true":"false");jb_putc(&j,',');
+    jb_str(&j,"name",sname);
+    if(rc!=0){jb_putc(&j,',');jb_str(&j,"error",rc==2?"already exists":"store full");}
+    jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;
+}
+
+// ─── POST /api/stream/upload ──────────────────────────────────────────────────
+static int api_stream_upload(const char* body, char* buf, int max) {
+    JSONBuf j={buf,0,max};
+    if (!body){jb_obj_open(&j,0);jb_str(&j,"error","missing body");jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;}
+    static char st_hex[UPLOAD_CHUNK_MAX*2+4];
+    static uint8_t st_chunk[UPLOAD_CHUNK_MAX];
+    char sname[STREAM_NAME_LEN]; sname[0]=st_hex[0]='\0';
+    json_str(body,"name",sname,STREAM_NAME_LEN);
+    json_str(body,"hex", st_hex,(int)sizeof(st_hex));
+    int offset=json_int(body,"offset"), last=json_int(body,"last");
+    if (!sname[0]||!st_hex[0]){jb_obj_open(&j,0);jb_str(&j,"ok","false");jb_putc(&j,',');jb_str(&j,"error","name and hex required");jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;}
+    size_t decoded=hex_decode(st_hex,st_chunk,UPLOAD_CHUNK_MAX);
+    jb_obj_open(&j,0);
+    if(decoded==0){jb_str(&j,"ok","false");jb_putc(&j,',');jb_str(&j,"error","hex decode produced zero bytes");}
+    else{
+        int rc=stream_write_chunk(sname,st_chunk,(uint32_t)decoded,(uint32_t)(offset>=0?offset:0),(uint8_t)(last?1:0));
+        jb_str(&j,"ok",rc==0?"true":"false");jb_putc(&j,',');
+        jb_uint(&j,"bytes_written",(uint64_t)decoded);jb_putc(&j,',');
+        jb_str(&j,"final",last?"true":"false");
+    }
+    jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;
+}
+
 // ─── POST /api/valloc ─────────────────────────────────────────────────────────
 static int api_valloc_post(const char* body, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -938,6 +1002,21 @@ static void http_route(int conn, char* req) {
         if (!strcmp(path, "/api/programs")) {
             blen = api_programs_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/streams")) {
+            blen = stream_list_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (str_find(path, "/api/stream/") == path) {
+            const char* sname = path + 12; /* skip "/api/stream/" */
+            struct StreamEntry* se = stream_find(sname);
+            if (!se) {
+                const char* e = "{\"error\":\"stream not found\"}";
+                http_respond(conn, 404, "application/json", e, (int)strlen(e));
+            } else {
+                http_respond_stream(conn, se);
+            }
+            return;
         }
         if (!strcmp(path, "/api/query")) {
             char q[256] = "show all";
@@ -1290,6 +1369,15 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/program/spawn")) {
             blen = api_program_spawn_handler(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── POST /api/stream/create|upload ──────────────────────────────────────
+        if (!strcmp(path, "/api/stream/create")) {
+            blen = api_stream_create(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/stream/upload")) {
+            blen = api_stream_upload(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/tx/commit")) {
