@@ -14,9 +14,17 @@ struct SLSTelemetry {
 static struct SLSTelemetry global_telemetry = {0};
 
 static inline uint64_t read_tsc(void) {
+#if defined(__x86_64__)
     uint32_t low, high;
     __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
     return ((uint64_t)high << 32) | low;
+#elif defined(__riscv)
+    uint64_t cycles;
+    __asm__ volatile("csrr %0, cycle" : "=r"(cycles));
+    return cycles;
+#else
+    return 0;
+#endif
 }
 
 void dashboard_log_fault_start(uint16_t token);

@@ -56,11 +56,11 @@ X86_ISO     = sls_operating_system.iso
 RV_CC       = riscv64-unknown-elf-gcc
 RV_LD       = riscv64-unknown-elf-ld
 RV_CFLAGS   = -ffreestanding -O2 -Wall -Wextra -mcmodel=medany \
-              -march=rv64gc -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections
+              -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections
 RV_LDFLAGS  = -T arch/riscv/linker_riscv.ld -nostdlib --gc-sections
 
 RV_ASM_SRC  = arch/riscv/boot_riscv.S arch/riscv/context_riscv.S arch/riscv/vector_state.S
-RV_C_SRC    = kernel/kernel_riscv.c arch/riscv/walk_page_tables_riscv.c drivers/pci.c \
+RV_C_SRC    = kernel/kernel_riscv.c arch/riscv/walk_page_tables_riscv.c \
               kernel/frame_pool.c kernel/dashboard.c kernel/pte_migrate.c arch/riscv/sbi.c \
               arch/riscv/plic.c arch/riscv/lazy_vector.c
 

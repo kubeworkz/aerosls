@@ -26,7 +26,6 @@ _start:
 .jump_to_c_kernel:
     # Set up arguments for the C entry point function matching the calling convention
     # a0 already holds Hart ID, a1 already holds FDT physical pointer
-    extern kernel_riscv_main
     jal  kernel_riscv_main      # Leap directly into C subsystem logic
 
 .halt:
@@ -39,7 +38,7 @@ _start:
 .spin_lock_check:
     ld   t1, 0(t0)
     bnez t1, .ap_boot_bridge
-    pause                       # Conserve execution pipeline energy
+    nop                         # Conserve execution pipeline energy (hint)
     j    .spin_lock_check
 
 .ap_boot_bridge:
@@ -48,7 +47,6 @@ _start:
     la   sp, bsp_stack_top
     sub  sp, sp, t2             # Assign unique offset stack context
 
-    extern ap_riscv_kernel_main
     jal  ap_riscv_kernel_main
 
 # Allocate memory areas inside the uninitialized BSS block data segments
