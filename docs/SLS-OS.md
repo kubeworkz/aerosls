@@ -1,6 +1,6 @@
 # AeroSLS OS
 
-​We’re building a **Single-Level Storage (SLS)** operating system — where RAM and secondary storage share a unified, persistent virtual memory space—**requires writing a custom kernel**. We eliminate the traditional file system entirely. Instead, all data is represented as persistent objects or segments mapped directly by the processor’s virtual memory.
+​We’re building a **Single-Level Storage (SLS)** operating system — where RAM and secondary storage share a unified, persistent virtual memory space - **requires writing a custom kernel**. We eliminate the traditional file system entirely. Instead, all data is represented as persistent objects or segments mapped directly by the processor’s virtual memory.
 
 ​Developing an SLS architecture from scratch requires understanding low-level OS design and specific architectural steps:
 
