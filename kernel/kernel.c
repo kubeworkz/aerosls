@@ -29,6 +29,7 @@
 #include "../kernel/mqt.h"
 #include "../kernel/stream.h"
 #include "../kernel/agent.h"
+#include "persist.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -224,6 +225,7 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
                     if (init_nvme_controller(nvme_mmio)) {
                         kernel_serial_print("[NVME] Admin queue ready.\n");
                         if (nvme_io_init()) {
+                            persist_restore_all();  // restore L2 catalog/records/schemas/programs
                             stream_init();
                         } else {
                             kernel_serial_print("[NVME] I/O queue setup failed; stream cold start.\n");

@@ -43,6 +43,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/aggregate.c \
               kernel/mqt.c \
               kernel/stream.c \
+              kernel/persist.c \
               kernel/agent.c \
               kernel/agent_tools.c \
               drivers/nvme_io.c \

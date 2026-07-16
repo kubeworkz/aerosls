@@ -221,4 +221,8 @@ void     sys_sls_schema_show(const char* name);
 int      catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_perm);
 SLSRole  catalog_get_role(uint32_t uid);
 
+// Called by persist.c after restoring the catalog from NVMe to recalculate
+// the next_obj_vaddr watermark from the restored base_vaddr + size_pages values.
+void     catalog_after_restore(void);
+
 #endif /* OBJECT_CATALOG_H */

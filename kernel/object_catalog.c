@@ -1,4 +1,5 @@
 #include "object_catalog.h"
+#include "persist.h"
 #include "journal.h"
 #include "lock_mgr.h"
 #include "index_mgr.h"
@@ -29,6 +30,21 @@ uint32_t               object_catalog_count = 0;
 #define PAGE_SIZE_BYTES  4096ULL
 
 static uint64_t next_obj_vaddr = OBJ_VADDR_BASE;
+
+// ─── catalog_after_restore ───────────────────────────────────────────────────
+// Called by persist.c after restoring object_catalog[] from NVMe.
+// Recalculates next_obj_vaddr so future valloc() calls don't collide with
+// virtual address ranges that were assigned before the reboot.
+void catalog_after_restore(void) {
+    uint64_t max_end = OBJ_VADDR_BASE;
+    for (uint32_t i = 0; i < CATALOG_MAX_OBJECTS; i++) {
+        if (!object_catalog[i].active) continue;
+        uint64_t end = object_catalog[i].base_vaddr
+                     + (uint64_t)object_catalog[i].size_pages * PAGE_SIZE_BYTES;
+        if (end > max_end) max_end = end;
+    }
+    next_obj_vaddr = max_end;
+}
 
 // ─── Internal String Helpers ──────────────────────────────────────────────────
 static size_t cat_strlen(const char* s) {
@@ -181,6 +197,7 @@ uint64_t sys_sls_valloc(struct SLSVallocRequest* req) {
     object_records[slot].field_count = 0;
 
     object_catalog_count++;
+    persist_catalog();
 
     // Safe print: avoid mixed-type variadic printf which crashes on freestanding x86.
     kernel_serial_print("[CATALOG] valloc: '");
@@ -205,6 +222,7 @@ uint64_t sys_sls_vfree(const char* name) {
     object_records[idx].field_count = 0;
     kernel_serial_printf("[CATALOG] vfree: '%s' released from address space.\n",
                          name);
+    persist_catalog();
     return 0;
 }
 
@@ -274,6 +292,7 @@ uint64_t sys_sls_role_set(struct SLSRoleRequest* req) {
             role_table[i].role = req->role;
             kernel_serial_printf("[SECURITY] UID %u role updated to %s.\n",
                                  req->uid, role_name(req->role));
+            persist_catalog();
             return 0;
         }
     }
@@ -285,6 +304,7 @@ uint64_t sys_sls_role_set(struct SLSRoleRequest* req) {
             role_table[i].active = 1;
             kernel_serial_printf("[SECURITY] UID %u assigned role %s.\n",
                                  req->uid, role_name(req->role));
+            persist_catalog();
             return 0;
         }
     }
@@ -431,6 +451,7 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
             kernel_serial_printf("[DB] UPDATE %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
             mqt_refresh_for_table(req->name);   // auto-refresh MQTs
+            persist_records();
             return 0;
         }
     }
@@ -506,6 +527,7 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
             kernel_serial_printf("[DB] INSERT %s.%s = %s  [DIRECT]\n",
                                  req->name, req->key, req->value);
             mqt_refresh_for_table(req->name);   // auto-refresh MQTs
+            persist_records();
             return 0;
         }
     }
@@ -560,6 +582,7 @@ uint64_t sys_sls_delete(struct SLSRecordRequest* req) {
         index_on_delete(req->name, req->key);
         kernel_serial_printf("[DB] DELETE %s.%s  [OK]\n", req->name, req->key);
         mqt_refresh_for_table(req->name);   // auto-refresh MQTs
+        persist_records();
         return 0;
     }
     kernel_serial_printf("[DB] DELETE: Key '%s' not found in '%s'.\n",
@@ -588,6 +611,7 @@ uint64_t sys_sls_schema_set(struct SLSSchemaRequest* req) {
         kernel_serial_printf("[SCHEMA] Updated '%s.%s' -> %s\n",
                              req->object_name, req->key,
                              field_type_name(req->type));
+        persist_schemas();
         return 0;
     }
     // New field definition
@@ -600,6 +624,7 @@ uint64_t sys_sls_schema_set(struct SLSSchemaRequest* req) {
             kernel_serial_printf("[SCHEMA] Defined '%s.%s' as %s\n",
                                  req->object_name, req->key,
                                  field_type_name(req->type));
+            persist_schemas();
             return 0;
         }
     }

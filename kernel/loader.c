@@ -1,4 +1,5 @@
 #include "loader.h"
+#include "persist.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "process.h"
@@ -130,6 +131,9 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
         "[LOADER] '%s': wrote %u bytes at offset %u (total=%u, %s)\n",
         req->object_name, req->chunk_len, req->byte_offset, sb->size,
         sb->is_elf ? "ELF64" : "flat");
+
+    if (req->is_last)
+        persist_programs();
 
     (void)ld_strlen;  // suppress unused warning
     return 0;
