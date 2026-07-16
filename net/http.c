@@ -840,6 +840,34 @@ static void http_respond_stream(int conn, struct StreamEntry* se) {
     }
 }
 
+// ─── Program binary download ───────────────────────────────────────────────────
+static void http_respond_program_binary(int conn, struct ServiceBinary* sb) {
+    char hdr[512]; int hp = 0;
+    const char* sl = "HTTP/1.1 200 OK\r\n"; while (*sl) hdr[hp++] = *sl++;
+    const char* ct = "Content-Type: application/octet-stream\r\n";
+    while (*ct) hdr[hp++] = *ct++;
+    const char* cd = "Content-Disposition: attachment; filename=\"";
+    while (*cd) hdr[hp++] = *cd++;
+    const char* fn = sb->object_name; while (*fn) hdr[hp++] = *fn++;
+    hdr[hp++] = '"'; hdr[hp++] = '\r'; hdr[hp++] = '\n';
+    /* X-Binary-Format header so the downloader knows ELF vs flat */
+    const char* xbf = "X-Binary-Format: ";
+    while (*xbf) hdr[hp++] = *xbf++;
+    const char* fmt = sb->is_elf ? "ELF64" : "flat";
+    while (*fmt) hdr[hp++] = *fmt++;
+    hdr[hp++] = '\r'; hdr[hp++] = '\n';
+    const char* cl = "Content-Length: "; while (*cl) hdr[hp++] = *cl++;
+    char tmp[12]; int tl = 0; uint32_t v = sb->size;
+    if (!v) { tmp[tl++] = '0'; } else { while (v) { tmp[tl++] = (char)('0' + v % 10); v /= 10; } }
+    for (int i = tl - 1; i >= 0; i--) hdr[hp++] = tmp[i];
+    hdr[hp++] = '\r'; hdr[hp++] = '\n';
+    const char* co = "Access-Control-Allow-Origin: *\r\n"; while (*co) hdr[hp++] = *co++;
+    hdr[hp++] = '\r'; hdr[hp++] = '\n';
+    tcp_send(conn, hdr, (uint32_t)hp);
+    if (sb->size > 0)
+        tcp_send(conn, (const char*)sb->data, sb->size);
+}
+
 // ─── POST /api/stream/create ──────────────────────────────────────────────────
 static int api_stream_create(const char* body, char* buf, int max) {
     JSONBuf j={buf,0,max};
@@ -1322,6 +1350,24 @@ static void http_route(int conn, char* req) {
                 http_respond(conn, 404, "application/json", e, (int)strlen(e));
             } else {
                 http_respond_stream(conn, se);
+            }
+            return;
+        }
+        if (str_find(path, "/api/program/") == path) {
+            const char* pname = path + 13; /* skip "/api/program/" */
+            struct ServiceBinary* sb = 0;
+            for (int b = 0; b < MAX_SERVICE_BINARIES; b++) {
+                if (service_binaries[b].active &&
+                    !str_ncmp2(service_binaries[b].object_name, pname,
+                               (int)strlen(pname) + 1)) {
+                    sb = &service_binaries[b]; break;
+                }
+            }
+            if (!sb) {
+                const char* e = "{\"error\":\"program not found\"}";
+                http_respond(conn, 404, "application/json", e, (int)strlen(e));
+            } else {
+                http_respond_program_binary(conn, sb);
             }
             return;
         }
