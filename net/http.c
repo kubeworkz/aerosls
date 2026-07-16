@@ -2,6 +2,7 @@
 #include "tcp.h"
 #include "net.h"
 #include "../kernel/kernel_io.h"
+#include "../kernel/timer.h"
 #include "../kernel/object_catalog.h"
 #include "../kernel/transaction.h"
 #include "../kernel/microkernel.h"
@@ -157,8 +158,10 @@ static int api_scan(char* body, int max) {
 static int api_health(char* body, int max) {
     JSONBuf j = { body, 0, max };
     jb_obj_open(&j, 0);
-    jb_str(&j, "status", "ok"); jb_putc(&j, ',');
-    jb_str(&j, "system", "AeroSLS 4.0");
+    jb_str(&j,  "status",       "ok");                     jb_putc(&j, ',');
+    jb_str(&j,  "system",       "AeroSLS 4.0");             jb_putc(&j, ',');
+    jb_uint(&j, "uptime_ticks", kernel_tick_counter);       jb_putc(&j, ',');
+    jb_uint(&j, "object_count", object_catalog_count);
     jb_obj_close(&j);
     j.buf[j.pos] = '\0';
     return j.pos;
