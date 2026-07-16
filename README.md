@@ -1,4 +1,4 @@
-# AeroSLS OS - A Novel Flat Memory Operating system
+# AeroSLS OS - An AI Driven Single Level Storage OS
 
 ---
 
