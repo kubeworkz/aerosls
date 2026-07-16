@@ -240,7 +240,7 @@ For uploading binary programs, the format is chunked hex over `POST /api/program
 
 via `/api/stream/upload`.
 
-# Here's a concrete breakdown:
+## Here's a concrete breakdown:
 
 **name:** the name of the `PROGRAM object` you previously created with `/api/program/create`. It's just a string identifier, e.g. `"myapp"`.
 
@@ -337,7 +337,9 @@ A 4 KiB directory at `STREAM_DIR_LBA` on NVMe (magic `SLSSTRMX`) tracks all acti
 
 The `mime_type` field is purely informational - the kernel doesn't interpret it; it just echoes it back in the `Content-Type` response header.
 
-### **Checkpointing / Snapshots**
+
+
+# **Checkpointing / Snapshots**
 
 There is persistence at the L1/L2 memory tiers. 
 
