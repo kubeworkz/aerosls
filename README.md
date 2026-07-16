@@ -236,7 +236,7 @@ e.g. `insert employees name Alice`
 
 Each `DB_TABLE` stores keyed string fields. If you need a structured row, you insert multiple fields with a common prefix (e.g., alice_name, alice_dept), following the suffix-matching convention used by indexes, constraints, and aggregates.
 
-For uploading binary programs, the format is chunked hex over `POST /api/program/upload` -{"name":"…","hex":"deadbeef…","offset":N,"last":0|1} - up to 1024 bytes per chunk. Similarly for streams
+For uploading binary programs, the format is chunked hex over `POST /api/program/upload` -`{"name":"…","hex":"deadbeef…","offset":N,"last":0|1}` - up to 1024 bytes per chunk. Similarly for streams
 
 via `/api/stream/upload`.
 
@@ -271,3 +271,74 @@ which produces something like `"7f454c460201010000000000..."` (ELF magic number 
 `{"name": "myapp", "hex": "<next  2048 hex chars>",  "offset": 1024, "last": 0}`
 
 `{"name": "myapp", "hex": "<final chunk hex>",       "offset": 2048, "last": 1}`
+
+---
+
+Here's how arbitrary files (text, PDF, binary blobs, etc.) flow through the system:
+
+## **The** `STREAM` **Object Type**
+
+Non-executable, non-DB files use the `OBJ_TYPE_STREAM` path, which is distinct from `OBJ_TYPE_PROGRAM` (executables) and `OBJ_TYPE_DB_TABLE`.
+
+### **Ingestion Path**
+
+**1. Create a named stream object**
+
+```
+POST /api/stream/create
+{ "name": "report.pdf", "mime": "application/pdf" }
+```
+
+This calls `stream_create()` in [stream.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/125df4672b/resources/app/out/vs/code/electron-browser/workbench/workbench.html), which:
+
+- Allocates a slot in `stream_store[STREAM_MAX]`
+- Registers it in the object catalog as `OBJ_TYPE_STREAM` (storage tier: **L3_SSD**)
+- Seeds metadata records: `status=created`, `byte_size=0`, `mime_type=...`
+- Assigns an NVMe LBA base: `STREAM_DATA_LBA_BASE + slot * STREAM_SECTORS_PER_SLOT`
+
+
+
+**2. Upload the file in hex-encoded chunks**
+
+```
+POST /api/stream/upload
+{ "name": "report.pdf", "hex": "255044462d...", "offset": 0, "last": 1 }
+```
+
+This calls `stream_write_chunk()`, which:
+
+- Decodes hex → raw bytes via `hex_decode()`
+- Allocates 4 KiB physical RAM frames on demand from the frame pool
+- Copies bytes into `se->frames[frame_idx]` using frame-aligned writes
+- On `last=1`: flushes all frames to NVMe synchronously, updates metadata records (`byte_size`, `status=ready`), persists the stream directory to NVMe
+
+
+
+### **Serving/Download**
+
+`GET /api/stream/<name>` triggers `http_respond_stream()`:
+
+- Sends HTTP headers with the stored `mime_type` and `Content-Disposition: attachment`
+- Sends content frame-by-frame (4 KiB each)
+- If a frame is `NULL` (post-reboot, not in RAM yet) → **lazy-loads** it from NVMe via `stream_lazy_load_frame()`
+
+
+
+### **Persistence**
+
+A 4 KiB directory at `STREAM_DIR_LBA` on NVMe (magic `SLSSTRMX`) tracks all active streams. On `stream_init()` at boot, it reads this directory and re-registers all streams in the object catalog so they survive reboots.
+
+### **Key difference from executables**
+
+
+|                        | **PROGRAM**                            | **STREAM**                                |
+| ---------------------- | -------------------------------------- | ----------------------------------------- |
+| **Catalog type**       | `OBJ_TYPE_PROGRAM`                     | `OBJ_TYPE_STREAM`                         |
+| **Storage tier**       | L2_DRAM                                | L3_SSD                                    |
+| **Upload endpoint**    | `/api/program/upload`                  | `/api/stream/upload`                      |
+| **On** `last=1`        | Detects ELF, maps into PML4, spawnable | Flush to NVMe, mark `ready`, downloadable |
+| **Execute permission** | Yes                                    | No (guests can only read)                 |
+| **Persistence**        | In-RAM binary store (lost on reboot)   | NVMe directory with lazy frame reload     |
+
+
+The `mime_type` field is purely informational - the kernel doesn't interpret it; it just echoes it back in the `Content-Type` response header.
