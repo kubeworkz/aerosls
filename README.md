@@ -342,3 +342,8 @@ A 4 KiB directory at `STREAM_DIR_LBA` on NVMe (magic `SLSSTRMX`) tracks all acti
 
 
 The `mime_type` field is purely informational - the kernel doesn't interpret it; it just echoes it back in the `Content-Type` response header.
+
+
+
+### **Checkpointing**
+
