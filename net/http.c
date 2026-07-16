@@ -1786,9 +1786,30 @@ void http_server_run(void) {
         int conn = tcp_accept(listen_fd);
         if (conn < 0) continue;
 
-        int rlen = tcp_recv(conn, req_buf, (uint16_t)(sizeof(req_buf) - 1));
-        if (rlen > 0) {
+        /* Accumulate the full HTTP request, respecting Content-Length. */
+        int rlen = 0;
+        for (;;) {
+            int got = tcp_recv(conn, req_buf + rlen,
+                               (uint16_t)(sizeof(req_buf) - 1 - rlen));
+            if (got <= 0) break;
+            rlen += got;
             req_buf[rlen] = '\0';
+            /* Must have complete headers before we can parse Content-Length. */
+            const char *body_start = str_find(req_buf, "\r\n\r\n");
+            if (!body_start) { if (rlen < (int)(sizeof(req_buf) - 1)) continue; else break; }
+            /* No Content-Length → GET / HEAD / no body; done. */
+            const char *cl = str_find(req_buf, "Content-Length:");
+            if (!cl) cl = str_find(req_buf, "content-length:");
+            if (!cl) break;
+            int clen = 0;
+            const char *cp = cl + 15;
+            while (*cp == ' ') cp++;
+            while (*cp >= '0' && *cp <= '9') { clen = clen * 10 + (*cp++ - '0'); }
+            int hdr_end = (int)(body_start - req_buf) + 4;
+            if (rlen >= hdr_end + clen) break;  /* full body received */
+            if (rlen >= (int)(sizeof(req_buf) - 1)) break;  /* buffer full */
+        }
+        if (rlen > 0) {
             http_route(conn, req_buf);
         }
         tcp_close(conn);

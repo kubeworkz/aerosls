@@ -18,7 +18,7 @@ typedef enum {
 
 // ─── Per-connection buffers and state ────────────────────────────────────────
 #define TCP_MAX_CONNS     8
-#define TCP_RECV_BUF_SZ   4096
+#define TCP_RECV_BUF_SZ   32768   /* 32 KiB — supports 16 KiB upload chunks (32 KiB hex) */
 #define TCP_SEND_BUF_SZ   8192
 
 struct TCPConn {
