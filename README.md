@@ -296,8 +296,6 @@ This calls `stream_create()` in [stream.c](vscode-file://vscode-app/c:/Users/kub
 - Seeds metadata records: `status=created`, `byte_size=0`, `mime_type=...`
 - Assigns an NVMe LBA base: `STREAM_DATA_LBA_BASE + slot * STREAM_SECTORS_PER_SLOT`
 
-
-
 **2. Upload the file in hex-encoded chunks**
 
 ```
@@ -312,8 +310,6 @@ This calls `stream_write_chunk()`, which:
 - Copies bytes into `se->frames[frame_idx]` using frame-aligned writes
 - On `last=1`: flushes all frames to NVMe synchronously, updates metadata records (`byte_size`, `status=ready`), persists the stream directory to NVMe
 
-
-
 ### **Serving/Download**
 
 `GET /api/stream/<name>` triggers `http_respond_stream()`:
@@ -321,8 +317,6 @@ This calls `stream_write_chunk()`, which:
 - Sends HTTP headers with the stored `mime_type` and `Content-Disposition: attachment`
 - Sends content frame-by-frame (4 KiB each)
 - If a frame is `NULL` (post-reboot, not in RAM yet) → **lazy-loads** it from NVMe via `stream_lazy_load_frame()`
-
-
 
 ### **Persistence**
 
@@ -343,7 +337,53 @@ A 4 KiB directory at `STREAM_DIR_LBA` on NVMe (magic `SLSSTRMX`) tracks all acti
 
 The `mime_type` field is purely informational - the kernel doesn't interpret it; it just echoes it back in the `Content-Type` response header.
 
+### **Checkpointing / Snapshots**
+
+There is persistence at the L1/L2 memory tiers. 
+
+**How it works:**
 
 
-### **Checkpointing**
+| Event                                                     | Hook                    | NVMe write                                     |
+| --------------------------------------------------------- | ----------------------- | ---------------------------------------------- |
+| `valloc` / `vfree` / `role_set`                           | `persist_catalog()`     | LBA 1024–1055: object_catalog[] + role_table[] |
+| `insert` / `update` / `delete` (direct or tx-commit path) | `persist_records()`     | LBA 2048–2567: object_records[] (~232 KiB)     |
+| `schema_set`                                              | `persist_schemas()`     | LBA 2568–2807: object_schemas[] (~116 KiB)     |
+| final binary chunk upload                                 | `persist_programs()`    | LBA 4096–4240: service_binaries[] (~66 KiB)    |
+| boot (after nvme_io_init)                                 | `persist_restore_all()` | reads all 4 regions back before stream_init()  |
 
+
+**Safety:** Each region has a distinct magic header (`0xCAFE...01-04`). A struct-size check guards against format mismatches between kernel builds - wrong size = cold start for that subsystem, others still restore. Works correctly alongside the existing stream NVMe persistence (stream data is at LBA 65536+, these snapshots sit at LBA 1024–4240).
+
+## AuroraSLS vs AeroSLS (persistence strategy)
+
+**What Aurora does:**
+
+- **Incremental checkpoints**: tracks dirty pages, only flushes changed pages to NVMe via `SLOS` (their custom object store on NVMe)
+- **Partition model**: groups processes into SLS partitions that checkpoint together atomically
+- **Page-oriented memsnap**: the unit of persistence is a 4 KiB page, not a data structure
+- `slsctl checkpoint` triggers it; `slsctl restore` replays it at boot
+
+**What AeroSLS already has that's relevant:**
+
+- **A working WAL in journal.c and transaction.c::** logs mutations but never replays at boot
+- **The stream directory pattern:** a fixed NVMe LBA with a magic header, written on every mutation, read back on `stream_init()`
+- **The tier manager's auto-promote/demote loop in the AP poll:** a natural hook for periodic checkpoints
+
+**Our Strategy for AeroSLS:**
+
+Rather than full Aurora-style dirty-page tracking (which requires MMU-level write protection on catalog pages), a simpler fit  would be **three snapshot LBA ranges** modeled exactly on how streams already work:
+
+
+| What                                | NVMe LBA           | Written when                     | Read back when                 |
+| ----------------------------------- | ------------------ | -------------------------------- | ------------------------------ |
+| object_catalog[] + role_table[]     | `CATALOG_SNAP_LBA` | every `valloc`/`vfree`           | new `catalog_init()` at boot   |
+| object_records[] + object_schemas[] | `RECORD_SNAP_LBA`  | every `insert`/`update`/`delete` | same                           |
+| `service_binaries[]` (programs)     | `PROG_SNAP_LBA`    | on `last=1` upload chunk         | new `loader_restore()` at boot |
+
+
+This is essentially **Aurora's checkpoint concept but simplified**: instead of process memory snapshots, we're only persisting kernel metadata structs (which are small - `CATALOG_MAX_OBJECTS=256` entries fits in well under 1 MiB total).
+
+**The main gap** is our boot replay path - `kernel.c` currently calls `stream_init()` but there's no equivalent `catalog_restore()` or `loader_restore()`. That's where we do our thing.
+
+The WAL is also already doing half the job for DB records - we just needed a compact replay pass at boot instead of only being used for within-session ACID.
