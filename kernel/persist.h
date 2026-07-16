@@ -8,31 +8,36 @@
 // All regions sit below STREAM_DIR_LBA (8192), avoiding any collision with the
 // stream subsystem.  Each "frame" = 4 KiB = 8 × 512-byte NVMe sectors.
 //
-//  LBA 1024  PERSIST_CAT_HDR_LBA   1 frame  — catalog + role header
-//  LBA 1032  PERSIST_CAT_ENT_LBA   2 frames — object_catalog[64]
-//  LBA 1048  PERSIST_ROLE_ENT_LBA  1 frame  — role_table[64]
+// Expanded for CATALOG_MAX_OBJECTS=128, RECORD_KEY_LEN=64, RECORD_VAL_LEN=256:
 //
-//  LBA 2048  PERSIST_REC_HDR_LBA   1 frame  — records header
-//  LBA 2056  PERSIST_REC_ENT_LBA  57 frames — object_records[64]  (~232 KiB)
+//  LBA 1024  PERSIST_CAT_HDR_LBA   1 frame   — catalog header
+//  LBA 1032  PERSIST_CAT_ENT_LBA   4 frames  — object_catalog[128]  (~14 KiB)
+//  LBA 1064  PERSIST_ROLE_ENT_LBA  1 frame   — role_table[64]       (~768 B)
 //
-//  LBA 2568  PERSIST_SCH_HDR_LBA   1 frame  — schemas header
-//  LBA 2576  PERSIST_SCH_ENT_LBA  29 frames — object_schemas[64]  (~116 KiB)
+//  LBA 2048  PERSIST_REC_HDR_LBA   1 frame   — records header
+//  LBA 2056  PERSIST_REC_ENT_LBA 322 frames  — object_records[128]  (~1.26 MiB)
+//  (end LBA 4632)
 //
-//  LBA 4096  PERSIST_PROG_HDR_LBA  1 frame  — programs header
-//  LBA 4104  PERSIST_PROG_DAT_LBA 17 frames — service_binaries[4] (~66 KiB)
+//  LBA 4640  PERSIST_SCH_HDR_LBA   1 frame   — schemas header
+//  LBA 4648  PERSIST_SCH_ENT_LBA  73 frames  — object_schemas[128]  (~290 KiB)
+//  (end LBA 5232)
+//
+//  LBA 5248  PERSIST_PROG_HDR_LBA  1 frame   — programs header
+//  LBA 5256  PERSIST_PROG_DAT_LBA 17 frames  — service_binaries[4]  (~66 KiB)
+//  (end LBA 5392 — 800 sectors free before STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
-#define PERSIST_ROLE_ENT_LBA  1048ULL
+#define PERSIST_ROLE_ENT_LBA  1064ULL
 
 #define PERSIST_REC_HDR_LBA   2048ULL
 #define PERSIST_REC_ENT_LBA   2056ULL
 
-#define PERSIST_SCH_HDR_LBA   2568ULL
-#define PERSIST_SCH_ENT_LBA   2576ULL
+#define PERSIST_SCH_HDR_LBA   4640ULL
+#define PERSIST_SCH_ENT_LBA   4648ULL
 
-#define PERSIST_PROG_HDR_LBA  4096ULL
-#define PERSIST_PROG_DAT_LBA  4104ULL
+#define PERSIST_PROG_HDR_LBA  5248ULL
+#define PERSIST_PROG_DAT_LBA  5256ULL
 
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.

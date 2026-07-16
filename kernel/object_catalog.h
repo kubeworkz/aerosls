@@ -71,7 +71,7 @@ static inline const char* tier_name(SLSStorageTier t) {
 }
 
 // ─── Catalog Entry ────────────────────────────────────────────────────────────
-#define CATALOG_MAX_OBJECTS   64   // reduced from 256 for BSS budget
+#define CATALOG_MAX_OBJECTS   128  // 128 objects — enough for ~100 CSV rows + system objects
 #define OBJECT_NAME_LEN        64
 
 struct SLSObjectEntry {
@@ -118,8 +118,8 @@ static inline const char* field_type_name(SLSFieldType t) {
 
 // ─── Typed Record Fields (key-value store inside a DB_TABLE object) ─────────────
 #define RECORD_MAX_FIELDS  32
-#define RECORD_KEY_LEN     48
-#define RECORD_VAL_LEN     64
+#define RECORD_KEY_LEN     64   // supports column names up to 63 chars
+#define RECORD_VAL_LEN     256  // supports CSV values up to 255 chars
 
 struct SLSSchemaField {
     char         key[RECORD_KEY_LEN];
