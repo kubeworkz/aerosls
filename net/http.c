@@ -167,6 +167,21 @@ static int api_health(char* body, int max) {
     return j.pos;
 }
 
+// ─── GET /api/metrics ─────────────────────────────────────────────────────────
+// Live kernel instrumentation: access events, tier promotions, IPC latency.
+static int api_metrics(char* body, int max) {
+    JSONBuf j = { body, 0, max };
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "total_accesses",    tier_total_accesses);       jb_putc(&j, ',');
+    jb_uint(&j, "total_promotions",  tier_total_promotions);     jb_putc(&j, ',');
+    jb_uint(&j, "ipc_posted",        ipc_stats.total_posted);    jb_putc(&j, ',');
+    jb_uint(&j, "ipc_dispatched",    ipc_stats.total_dispatched);jb_putc(&j, ',');
+    jb_uint(&j, "ipc_avg_latency_ns",ipc_stats.avg_latency_ns);
+    jb_obj_close(&j);
+    j.buf[j.pos] = '\0';
+    return j.pos;
+}
+
 // ─── HTTP response helper ─────────────────────────────────────────────────────
 static void http_respond(int conn, int status, const char* ctype,
                           const char* body, int blen) {
@@ -1307,6 +1322,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/health")) {
             blen = api_health(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/metrics")) {
+            blen = api_metrics(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/scan")) {

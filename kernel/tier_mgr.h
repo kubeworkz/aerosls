@@ -13,6 +13,10 @@
 // Must be >= CATALOG_MAX_OBJECTS
 #define TIER_MAX_TRACKED        256
 
+// ─── Cumulative event counters (never reset) ─────────────────────────────────
+extern volatile uint64_t tier_total_accesses;   // every tier_notify_access() call
+extern volatile uint64_t tier_total_promotions; // every auto or manual tier promote
+
 // ─── Per-Object Access Statistics ────────────────────────────────────────────
 struct TierStat {
     uint64_t object_id;

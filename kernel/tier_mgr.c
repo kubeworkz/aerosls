@@ -2,7 +2,9 @@
 #include "ipc.h"
 
 struct TierStat tier_stats[TIER_MAX_TRACKED];
-static uint32_t tier_tick_counter = 0;
+static uint32_t  tier_tick_counter  = 0;
+volatile uint64_t tier_total_accesses   = 0;
+volatile uint64_t tier_total_promotions = 0;
 
 // ─── String comparison helper ─────────────────────────────────────────────────
 static int tm_streq(const char* a, const char* b) {
@@ -27,6 +29,7 @@ void tier_mgr_init(void) {
 // Called on every page fault hit, record select, update, or insert so the tier
 // manager can track which objects are hot and which have gone cold.
 void tier_notify_access(uint64_t object_id) {
+    __atomic_fetch_add(&tier_total_accesses, 1, __ATOMIC_RELAXED);
     // Find existing entry
     for (int i = 0; i < TIER_MAX_TRACKED; i++) {
         if (tier_stats[i].active && tier_stats[i].object_id == object_id) {
@@ -80,6 +83,7 @@ void tier_mgr_tick(void) {
             e->storage_tier > STORAGE_TIER_L1_CACHE) {
 
             e->storage_tier = (SLSStorageTier)(e->storage_tier - 1);
+            __atomic_fetch_add(&tier_total_promotions, 1, __ATOMIC_RELAXED);
             kernel_serial_printf(
                 "[TIER] AUTO-PROMOTE: '%-20s'  %s  (accesses=%u/tick)\n",
                 e->name, tier_name(e->storage_tier), accesses);
