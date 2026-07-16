@@ -222,5 +222,52 @@ Demo tokens (no real password check):
 
 ---
 
-# Flatter is Better
+# File Manipulation Details
 
+Data is written to the DB engine as key-value records in a DB_TABLE object. There's no external "file" to upload — you write individual fields directly. Other files such as executables and other file types use streaming. Two interfaces:
+
+### Shell:
+
+`insert <object> <key> <value>`
+
+e.g. `insert employees name Alice`
+
+`REST API (POST /api/record): { "object": "employees", "key": "name", "value": "Alice" }`
+
+Each `DB_TABLE` stores keyed string fields. If you need a structured row, you insert multiple fields with a common prefix (e.g., alice_name, alice_dept), following the suffix-matching convention used by indexes, constraints, and aggregates.
+
+For uploading binary programs, the format is chunked hex over `POST /api/program/upload` -{"name":"…","hex":"deadbeef…","offset":N,"last":0|1} - up to 1024 bytes per chunk. Similarly for streams
+
+via `/api/stream/upload`.
+
+# Here's a concrete breakdown:
+
+**name:** the name of the `PROGRAM object` you previously created with `/api/program/create`. It's just a string identifier, e.g. `"myapp"`.
+
+**hex:** the raw bytes of the binary file encoded as a continuous lowercase hex string (2 chars per byte). For example, the 4 bytes `0xDE 0xAD 0xBE 0xEF` become `"deadbeef"`. For a real ELF binary you'd do:
+
+  `xxd -p mybinary | tr -d '\n'`
+
+which produces something like `"7f454c460201010000000000..."` (ELF magic number followed by the rest of the file).
+
+**offset:** byte position in the binary where this chunk begins. First chunk is 0.
+
+**last:** 1 only on the final chunk; triggers the kernel to finalize `binary_size`, detect ELF vs flat format, and set status → ready.
+
+### **Full example**: small binary that fits in one chunk (≤ 1024 bytes):
+
+`POST /api/program/create`
+
+`{"name": "myapp", "pages": 2}`
+
+`POST /api/program/upload`
+
+`{"name": "myapp", "hex": "7f454c46020101000000000000000000", "offset": 0, "last": 1}`
+
+### Multi-chunk example (file > 1024 bytes):
+
+`{"name": "myapp", "hex": "<first 2048 hex chars>",  "offset":    0, "last": 0}`
+
+`{"name": "myapp", "hex": "<next  2048 hex chars>",  "offset": 1024, "last": 0}`
+
+`{"name": "myapp", "hex": "<final chunk hex>",       "offset": 2048, "last": 1}`
