@@ -1,9 +1,13 @@
 #include "tcp.h"
 #include "ipv4.h"
+#include "arp.h"
 #include "../kernel/kernel_io.h"
 #include "../kernel/net_event.h"  /* Phase E: HLT-based yield */
 
 struct TCPConn tcp_conns[TCP_MAX_CONNS];
+
+// Ephemeral port counter for client-initiated connections
+static uint16_t ephemeral_port_next = 49152;
 
 void tcp_init(void) {
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
@@ -141,6 +145,16 @@ void tcp_handle_segment(struct IPv4Header* ip, struct TCPHeader* seg,
 
     if (!found) return;
     struct TCPConn* c = found;
+
+    // ── SYN-ACK: connection we initiated (TCP_SYN_SENT → TCP_ESTABLISHED) ───────────
+    if (c->state == TCP_SYN_SENT &&
+        (flags & TCP_FLAG_SYN) && (flags & TCP_FLAG_ACK)) {
+        c->rcv_nxt = seq + 1;   // acknowledge the server's SYN
+        c->snd_una = ack;        // mark our SYN as acknowledged
+        c->state   = TCP_ESTABLISHED;
+        tcp_send_flags(c, TCP_FLAG_ACK, 0, 0);
+        return;
+    }
 
     // ── SYN retransmit for a pending SYN_RECEIVED connection ─────────────────
     // Peer retransmitted SYN (our SYN-ACK was lost — likely because ARP for
@@ -308,4 +322,70 @@ void tcp_close(int id) {
         c->state  = TCP_CLOSED;
         c->active = 0;
     }
+}
+
+// ─── tcp_connect — active open to a remote (ip, port) ─────────────────────────────────
+// Returns conn_id (>= 0) on success, -1 on failure or timeout (~2 seconds).
+int tcp_connect(IPv4Addr dst_ip, uint16_t dst_port) {
+    // 1. Warm up ARP: resolve gateway MAC if needed before the SYN is sent.
+    //    ipv4_send() silently drops packets when ARP misses, so we pre-resolve.
+    IPv4Addr resolve_ip = dst_ip;
+    if ((ntohl(dst_ip)   & 0xFFFFFF00UL) !=
+        (ntohl(NET_MY_IP) & 0xFFFFFF00UL))
+        resolve_ip = NET_GW_IP;
+
+    MACAddr dummy;
+    if (!arp_lookup(resolve_ip, &dummy)) {
+        arp_send_request(resolve_ip);
+        for (int i = 0; i < 50; i++) {
+            net_event_hlt_wait();
+            if (arp_lookup(resolve_ip, &dummy)) break;
+        }
+        if (!arp_lookup(resolve_ip, &dummy)) {
+            kernel_serial_printf("[TCP] connect: ARP timeout for gateway\n");
+            return -1;
+        }
+    }
+
+    // 2. Find a free connection slot.
+    struct TCPConn* nc = 0;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!tcp_conns[i].active) { nc = &tcp_conns[i]; break; }
+    }
+    if (!nc) {
+        kernel_serial_printf("[TCP] connect: no free slots\n");
+        return -1;
+    }
+
+    // 3. Initialise the connection descriptor.
+    nc->active      = 1;
+    nc->state       = TCP_SYN_SENT;
+    nc->local_port  = ephemeral_port_next++;
+    if (ephemeral_port_next > 65534) ephemeral_port_next = 49152;
+    nc->remote_port = dst_port;
+    nc->remote_ip   = dst_ip;
+    nc->snd_nxt     = 0xABCD1234UL;  // ISN
+    nc->snd_una     = nc->snd_nxt;
+    nc->rcv_nxt     = 0;
+    nc->rbuf_head   = 0;
+    nc->rbuf_used   = 0;
+    nc->rcv_wnd     = TCP_RECV_BUF_SZ;
+
+    // 4. Send SYN (tcp_send_flags increments snd_nxt for the SYN).
+    tcp_send_flags(nc, TCP_FLAG_SYN, 0, 0);
+
+    // 5. Spin-wait for ESTABLISHED (200 ticks ≈ 2 s at 100 Hz).
+    for (int i = 0; i < 200; i++) {
+        net_event_hlt_wait();
+        if (nc->state == TCP_ESTABLISHED)
+            return (int)(nc - tcp_conns);
+        if (nc->state == TCP_CLOSED)
+            return -1;
+    }
+
+    // Timeout — clean up.
+    nc->state  = TCP_CLOSED;
+    nc->active = 0;
+    kernel_serial_printf("[TCP] connect: timeout waiting for SYN-ACK\n");
+    return -1;
 }

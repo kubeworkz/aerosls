@@ -7,7 +7,7 @@
 // ─── Asset store limits ───────────────────────────────────────────────────────
 #define WEBAPP_MAX_ASSETS    32
 #define WEBAPP_PATH_LEN     128    // URL path, e.g. "/index.html"
-#define WEBAPP_CONTENT_LEN 2048   // 2 KiB per asset (reduced for BSS budget)
+#define WEBAPP_CONTENT_LEN 3072   // 3 KiB per asset
 #define WEBAPP_MIME_LEN      48
 
 // ─── One stored web asset ─────────────────────────────────────────────────────

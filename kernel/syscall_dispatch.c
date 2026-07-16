@@ -7,6 +7,7 @@
 #include "query_engine.h"
 #include "process.h"
 #include "loader.h"
+#include "agent.h"
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
 #include "../kernel/secure_api.h"
@@ -161,6 +162,26 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_auth_list(); return 0;
     case SYS_SLS_AUTH_REVOKE:
         return auth_revoke_by_email((const char*)arg);
+
+    // ── Phase H: AI Agents (200–207) ──────────────────────────────────────────
+    case SYS_SLS_AGENT_CREATE:
+        return sys_sls_agent_create((struct AgentCreateRequest*)arg);
+    case SYS_SLS_AGENT_RUN:
+        return sys_sls_agent_run((struct AgentRunRequest*)arg);
+    case SYS_SLS_AGENT_STATUS:
+        sys_sls_agent_status((const char*)arg); return 0;
+    case SYS_SLS_AGENT_KILL:
+        return sys_sls_agent_kill((const char*)arg);
+    case SYS_SLS_AGENT_LIST:
+        sys_sls_agent_list(); return 0;
+    case SYS_SLS_WORKFLOW_CREATE:
+        return sys_sls_workflow_create((struct WorkflowCreateRequest*)arg);
+    case SYS_SLS_WORKFLOW_RUN:
+        return sys_sls_workflow_run((struct WorkflowRunRequest*)arg);
+    case SYS_SLS_WORKFLOW_STATUS:
+        sys_sls_workflow_status((const char*)arg); return 0;
+    case SYS_SLS_AGENT_SCHEDULE:
+        return sys_sls_agent_schedule((struct AgentScheduleRequest*)arg);
 
     default:
         return 0;

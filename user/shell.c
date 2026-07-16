@@ -19,6 +19,7 @@
 #include "../kernel/loader.h"
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
+#include "../kernel/agent.h"
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -168,6 +169,19 @@ static void print_help(void) {
         "  mqt refresh <name>         re-run query and update results\n"
         "  mqt drop <name>            remove MQT and result table\n"
         "  mqt scan <name>            show current MQT results\n"
+        "  -- AI Agents (Phase H) --\n"
+        "  agent create <name> <endpoint> <model>   create an agent (no tools)\n"
+        "  agent run    <name> <message...>          run ReAct loop with message\n"
+        "  agent list                                list all agents\n"
+        "  agent status <name>                       show agent descriptor\n"
+        "  agent kill   <name>                       stop and remove agent\n"
+        "  agent schedule <name> <ticks> <msg...>    run every N service-poll ticks\n"
+        "  agent unschedule <name>                   disable scheduled run\n"
+        "  workflow create <name> <shared_tbl> <n>  define an n-step workflow\n"
+        "  workflow addstep <name> <agent> <in> <out> append a step\n"
+        "  workflow run    <name> <input...>         execute all steps\n"
+        "  workflow list                             list all workflows\n"
+        "  workflow status <name>                    show workflow descriptor\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -1070,6 +1084,125 @@ void sls_shell_loop(void) {
                     "ipc post: opcode=0x%04x -> %s (port 0x%04x)\n",
                     opcode, svc_name, target_port);
             }
+        }
+
+        // ── Phase H: AI Agents ────────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "agent create ")) {
+            const char* p = input_buffer + 13;
+            struct AgentCreateRequest req;
+            req.name[0]=req.inference_endpoint[0]=req.model[0]=req.system_prompt[0]='\0';
+            req.tool_mask=0; req.owner_uid=current_session_uid;
+            size_t nlen=0; while(p[nlen]&&p[nlen]!=' ') nlen++;
+            sh_copy(req.name, p, nlen+1<OBJECT_NAME_LEN?nlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            size_t elen=0; while(p[elen]&&p[elen]!=' ') elen++;
+            sh_copy(req.inference_endpoint, p, elen+1<AGENT_ENDPOINT_LEN?elen+1:AGENT_ENDPOINT_LEN);
+            p=sh_next(p);
+            sh_copy(req.model, p, AGENT_MODEL_LEN);
+            do_syscall(SYS_SLS_AGENT_CREATE, &req);
+        }
+        else if (sh_starts(input_buffer, "agent run ")) {
+            const char* p = input_buffer + 10;
+            struct AgentRunRequest req; req.name[0]=req.message[0]='\0';
+            size_t nlen=0; while(p[nlen]&&p[nlen]!=' ') nlen++;
+            sh_copy(req.name, p, nlen+1<OBJECT_NAME_LEN?nlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            sh_copy(req.message, p, AGENT_PROMPT_LEN);
+            do_syscall(SYS_SLS_AGENT_RUN, &req);
+        }
+        else if (sh_eq(input_buffer, "agent list")) {
+            do_syscall(SYS_SLS_AGENT_LIST, 0);
+        }
+        else if (sh_starts(input_buffer, "agent status ")) {
+            do_syscall(SYS_SLS_AGENT_STATUS, (void*)(input_buffer + 13));
+        }
+        else if (sh_starts(input_buffer, "agent kill ")) {
+            do_syscall(SYS_SLS_AGENT_KILL, (void*)(input_buffer + 11));
+        }
+        else if (sh_starts(input_buffer, "agent schedule ")) {
+            // agent schedule <name> <ticks> <message...>
+            const char* p = input_buffer + 15;
+            struct AgentScheduleRequest sr;
+            sr.name[0]=sr.message[0]='\0'; sr.ticks=0;
+            size_t nlen=0; while(p[nlen]&&p[nlen]!=' ') nlen++;
+            sh_copy(sr.name, p, nlen+1<OBJECT_NAME_LEN?nlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            sr.ticks=(uint32_t)sh_atoi(p);
+            p=sh_next(p);
+            sh_copy(sr.message, p, sizeof(sr.message));
+            do_syscall(SYS_SLS_AGENT_SCHEDULE, &sr);
+        }
+        else if (sh_starts(input_buffer, "agent unschedule ")) {
+            struct AgentScheduleRequest sr;
+            sh_copy(sr.name, input_buffer+17, OBJECT_NAME_LEN);
+            sr.message[0]='\0'; sr.ticks=0;
+            do_syscall(SYS_SLS_AGENT_SCHEDULE, &sr);
+        }
+
+        // ── Phase H: Workflows ────────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "workflow create ")) {
+            // workflow create <name> <shared_table> <step_count>
+            const char* p = input_buffer + 16;
+            struct WorkflowCreateRequest req;
+            req.name[0]=req.shared_state_table[0]='\0';
+            req.step_count=0; req.owner_uid=current_session_uid;
+            size_t nlen=0; while(p[nlen]&&p[nlen]!=' ') nlen++;
+            sh_copy(req.name, p, nlen+1<OBJECT_NAME_LEN?nlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            size_t tlen=0; while(p[tlen]&&p[tlen]!=' ') tlen++;
+            sh_copy(req.shared_state_table, p, tlen+1<OBJECT_NAME_LEN?tlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            req.step_count=(uint8_t)(sh_atoi(p)<WORKFLOW_MAX_STEPS?sh_atoi(p):WORKFLOW_MAX_STEPS);
+            do_syscall(SYS_SLS_WORKFLOW_CREATE, &req);
+        }
+        else if (sh_starts(input_buffer, "workflow addstep ")) {
+            // workflow addstep <wf_name> <agent_name> <input_key> <output_key>
+            const char* p = input_buffer + 17;
+            char wf_name[OBJECT_NAME_LEN]={0};
+            size_t nlen=0; while(p[nlen]&&p[nlen]!=' ') nlen++;
+            sh_copy(wf_name, p, nlen+1<OBJECT_NAME_LEN?nlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            // Find the workflow and append a step
+            for (int wi=0; wi<WORKFLOW_MAX; wi++) {
+                if (!workflow_table[wi].active) continue;
+                int m=1;
+                for (int k=0; workflow_table[wi].name[k]||wf_name[k]; k++)
+                    if (workflow_table[wi].name[k]!=wf_name[k]){m=0;break;}
+                if (!m) continue;
+                uint8_t s=workflow_table[wi].step_count;
+                if (s>=WORKFLOW_MAX_STEPS) { kernel_serial_printf("[WF] step table full\n"); break; }
+                size_t alen=0; while(p[alen]&&p[alen]!=' ') alen++;
+                sh_copy(workflow_table[wi].steps[s].agent_name, p,
+                        alen+1<OBJECT_NAME_LEN?alen+1:OBJECT_NAME_LEN);
+                p=sh_next(p);
+                size_t ilen=0; while(p[ilen]&&p[ilen]!=' ') ilen++;
+                sh_copy(workflow_table[wi].steps[s].input_key, p,
+                        ilen+1<RECORD_KEY_LEN?ilen+1:RECORD_KEY_LEN);
+                p=sh_next(p);
+                sh_copy(workflow_table[wi].steps[s].output_key, p, RECORD_KEY_LEN);
+                workflow_table[wi].step_count++;
+                kernel_serial_printf("[WF] '%s' step %u: agent=%s in=%s out=%s\n",
+                    wf_name, s,
+                    workflow_table[wi].steps[s].agent_name,
+                    workflow_table[wi].steps[s].input_key,
+                    workflow_table[wi].steps[s].output_key);
+                break;
+            }
+        }
+        else if (sh_starts(input_buffer, "workflow run ")) {
+            const char* p = input_buffer + 13;
+            struct WorkflowRunRequest req; req.name[0]=req.input[0]='\0';
+            size_t nlen=0; while(p[nlen]&&p[nlen]!=' ') nlen++;
+            sh_copy(req.name, p, nlen+1<OBJECT_NAME_LEN?nlen+1:OBJECT_NAME_LEN);
+            p=sh_next(p);
+            sh_copy(req.input, p, AGENT_PROMPT_LEN);
+            do_syscall(SYS_SLS_WORKFLOW_RUN, &req);
+        }
+        else if (sh_eq(input_buffer, "workflow list")) {
+            sys_sls_workflow_list();
+        }
+        else if (sh_starts(input_buffer, "workflow status ")) {
+            do_syscall(SYS_SLS_WORKFLOW_STATUS, (void*)(input_buffer + 16));
         }
 
         // ── Legacy: write <name> <payload> ───────────────────────────────────

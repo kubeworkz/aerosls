@@ -2,6 +2,7 @@
 #include "ipc.h"
 #include "object_catalog.h"
 #include "transaction.h"
+#include "agent.h"
 #include "../kernel/dashboard.h"
 
 extern void tier_mgr_init(void);
@@ -163,6 +164,39 @@ static void log_handler(struct IPCMessage* msg) {
     }
 }
 
+// ─── AgentRuntimeMgr handler ────────────────────────────────────────────────────
+static void agent_handler(struct IPCMessage* msg) {
+    switch (msg->opcode) {
+    case AGENT_OP_SPAWN: {
+        struct AgentCreateRequest* req =
+            (struct AgentCreateRequest*)(uintptr_t)msg->payload[0];
+        if (req) sys_sls_agent_create(req);
+        break;
+    }
+    case AGENT_OP_STEP: {
+        // NOTE: sys_sls_agent_run blocks on network I/O (net_event_hlt_wait).
+        // Core 1's service poll loop is parked during inference; Core 0's
+        // HTTP server continues independently on its own execution path.
+        struct AgentRunRequest* req =
+            (struct AgentRunRequest*)(uintptr_t)msg->payload[0];
+        if (req) sys_sls_agent_run(req);
+        break;
+    }
+    case AGENT_OP_COMPLETE:
+        kernel_serial_printf("[AGENT-SVC] COMPLETE: step_count=%lu\n",
+                             msg->payload[0]);
+        break;
+    case AGENT_OP_KILL: {
+        const char* name = (const char*)(uintptr_t)msg->payload[0];
+        if (name) sys_sls_agent_kill(name);
+        break;
+    }
+    default:
+        kernel_serial_printf("[AGENT-SVC] Unknown opcode: 0x%04x\n",
+                             msg->opcode);
+    }
+}
+
 // ─── Service Registration ─────────────────────────────────────────────────────
 static void register_service(const char* name, uint32_t pid, uint16_t port,
                               uint64_t base_addr, uint32_t latency_us_x100,
@@ -211,6 +245,8 @@ void microkernel_init(void) {
                      0x0000000010004000ULL,   90, tier_handler);
     register_service("RecoveryLogVerifier", 105, IPC_PORT_LOGMGR,
                      0x0000000010005000ULL,  140, log_handler);
+    register_service("AgentRuntimeMgr",     106, IPC_PORT_AGENTMGR,
+                     0x0000000010006000ULL,    0, agent_handler);
 
     kernel_serial_print(
         "[MK] Fault Isolation Daemon active. Poll interval: 100ms.\n");
@@ -243,6 +279,8 @@ void microkernel_service_poll(void) {
 
     // Periodic tier evaluation: promote hot objects, demote cold ones
     tier_mgr_tick();
+    // (E) Fire any scheduled agent runs
+    agent_scheduler_tick();
 }
 
 // ─── sys_sls_svc_list ─────────────────────────────────────────────────────────
@@ -381,4 +419,35 @@ void mk_post_log_append(uint64_t entry_id, uint64_t tx_id) {
         .payload  = { entry_id, tx_id, 0, 0 }
     };
     ipc_post(IPC_PORT_LOGMGR, &m);
+}
+
+// ─── Agent IPC wrappers ────────────────────────────────────────────────────────────
+void mk_post_agent_spawn(struct AgentCreateRequest* req) {
+    struct IPCMessage m = {
+        .src_port = 0,
+        .dst_port = IPC_PORT_AGENTMGR,
+        .opcode   = AGENT_OP_SPAWN,
+        .payload  = { (uint64_t)(uintptr_t)req, 0, 0, 0 }
+    };
+    ipc_post(IPC_PORT_AGENTMGR, &m);
+}
+
+void mk_post_agent_step(struct AgentRunRequest* req) {
+    struct IPCMessage m = {
+        .src_port = 0,
+        .dst_port = IPC_PORT_AGENTMGR,
+        .opcode   = AGENT_OP_STEP,
+        .payload  = { (uint64_t)(uintptr_t)req, 0, 0, 0 }
+    };
+    ipc_post(IPC_PORT_AGENTMGR, &m);
+}
+
+void mk_post_agent_kill(const char* name) {
+    struct IPCMessage m = {
+        .src_port = 0,
+        .dst_port = IPC_PORT_AGENTMGR,
+        .opcode   = AGENT_OP_KILL,
+        .payload  = { (uint64_t)(uintptr_t)name, 0, 0, 0 }
+    };
+    ipc_post(IPC_PORT_AGENTMGR, &m);
 }

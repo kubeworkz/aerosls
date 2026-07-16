@@ -30,7 +30,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/object_catalog.c kernel/transaction.c \
               kernel/ipc.c kernel/microkernel.c \
               kernel/tier_mgr.c kernel/query_engine.c \
-              net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/e1000.c net/udp.c net/dhcp.c \
+              net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
               kernel/process.c arch/x86/user_paging.c \
               kernel/loader.c \
               kernel/webapp.c \
@@ -43,6 +43,8 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/aggregate.c \
               kernel/mqt.c \
               kernel/stream.c \
+              kernel/agent.c \
+              kernel/agent_tools.c \
               drivers/nvme_io.c \
               kernel/net_event.c \
               kernel/auth.c \

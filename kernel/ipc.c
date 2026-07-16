@@ -23,7 +23,7 @@ void ipc_init(void) {
 
     kernel_serial_print(
         "[IPC] Message Passing interface configured "
-        "(Port bounds 0x1001 - 0x1005).\n");
+        "(Port bounds 0x1001 - 0x1006).\n");
 }
 
 // ─── Post a message into the destination port's queue ─────────────────────────

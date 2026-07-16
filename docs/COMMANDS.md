@@ -407,6 +407,36 @@ Dynamic web asset store (served alongside the compiled-in Navigator bundle).
 
 ---
 
+### AI Agents (Phase H)
+
+First-class OS objects wrapping an LLM inference endpoint, a permitted tool set, and a persistent memory table.  Agents execute a **ReAct** (Reason + Act) loop: the LLM reasons, calls kernel tools (DB read/write, tier promote, stream I/O), then produces a final text answer — all without leaving the kernel address space.
+
+
+| Command                                      | Description                                            |
+| -------------------------------------------- | ------------------------------------------------------ |
+| `agent create <name> <endpoint> <model>`     | Create an agent (no tools; use REST to set tool mask)  |
+| `agent run <name> <message…>`                | Run one ReAct loop; answer printed to serial log       |
+| `agent list`                                 | List all agents with state, steps, and tool mask       |
+| `agent status <name>`                        | Show full descriptor including last answer             |
+| `agent kill <name>`                          | Stop and remove agent from catalog                     |
+
+
+### Workflows (Phase H)
+
+Ordered sequences of agent invocations.  Each step reads its input from a shared `DB_TABLE` and writes its output back — creating a data pipeline entirely within the OS.
+
+
+| Command                                             | Description                                   |
+| --------------------------------------------------- | --------------------------------------------- |
+| `workflow create <name> <shared_table> <step_count>` | Define an empty workflow                     |
+| `workflow addstep <name> <agent> <in_key> <out_key>` | Append a step to the pipeline                |
+| `workflow run <name> <input…>`                       | Execute all steps sequentially               |
+| `workflow list`                                      | List all workflows with progress bars        |
+| `workflow status <name>`                             | Show step detail and current step index      |
+
+
+---
+
 ## REST API
 
 The kernel HTTP server listens on port 3000. All endpoints return JSON. CORS is open (`*`).
@@ -566,6 +596,27 @@ Demo accounts:
 | ------ | -------------- | ------ | ------------------------------------------- |
 | `POST` | `/auth/token`  | None   | Issue a bearer token                        |
 | `GET`  | `/auth/verify` | Bearer | Validate a token — returns uid, role, email |
+
+
+#### AI Agents & Workflows (Phase H)
+
+All write routes require `APP_USER+`. Read routes are open.
+
+| Method   | Path                    | Auth        | Description                                                                                                                                                                      |
+| -------- | ----------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`    | `/api/agents`           | None        | List all agents — `{count, agents:[{name, model, endpoint, state, steps, tool_mask, object_id}]}`                                                                               |
+| `GET`    | `/api/agent/<name>`     | None        | Single agent descriptor                                                                                                                                                          |
+| `POST`   | `/api/agent/create`     | `APP_USER+` | Create an agent — `{"name":"…","endpoint":"ip:port","model":"llama3.2","system_prompt":"…","tools":"db_select,db_query"}`. Tool list is comma-separated.              |
+| `POST`   | `/api/agent/run`        | `APP_USER+` | Run one ReAct loop — `{"name":"…","message":"…"}`. **Blocks** until inference completes. Returns `{ok, agent, steps}`. Full answer is on the kernel serial log.              |
+| `POST`   | `/api/agent/drop`       | `APP_USER+` | Remove an agent — `{"name":"…"}`                                                                                                                                              |
+| `GET`    | `/api/workflows`        | None        | List all workflows — `{count, workflows:[{name, state, step_count, current_step}]}`                                                                                              |
+| `GET`    | `/api/workflow/<name>`  | None        | Workflow descriptor with steps array                                                                                                                                             |
+| `POST`   | `/api/workflow/create`  | `APP_USER+` | Define pipeline — `{"name":"…","shared_table":"…","step_count":N,"step0_agent":"…","step0_in":"…","step0_out":"…",…}`. Keys follow `stepN_agent/in/out` pattern.        |
+| `POST`   | `/api/workflow/run`     | `APP_USER+` | Execute pipeline — `{"name":"…","input":"…"}`. **Blocks** until all steps finish. Each step's output is written to the shared state table under `out_key`.                  |
+
+**Available tool names for `tools` field:** `db_select` · `db_insert` · `db_query` · `stream_read` · `stream_write` · `tier_promote`
+
+**Demo admin token (fixed at boot):** `deadbeef01234567cafebabe76543210` (uid=1000, role=`DB_ADMIN`)
 
 
 #### Navigator SPA

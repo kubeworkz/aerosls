@@ -22,6 +22,8 @@
 #include "../kernel/loader.h"
 #include "../kernel/stream.h"
 #include "../user/permissions.h"
+#include "../kernel/agent.h"
+#include "../kernel/agent_tools.h"
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -946,7 +948,298 @@ static int api_tx_post(const char* op, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-// ─── Route an incoming HTTP request ──────────────────────────────────────────
+// ─── Phase H: Agent / Workflow REST API ──────────────────────────────────────
+
+// Convert a comma-separated tool name string to an AGENT_TOOL_* bitmask.
+// Accepts both "db_select,db_query" and ["db_select","db_query"] formats.
+static uint32_t parse_tool_mask(const char* s) {
+    uint32_t m = 0;
+    if (!s || !s[0]) return 0;
+    if (str_find(s, "db_select"))    m |= AGENT_TOOL_DB_SELECT;
+    if (str_find(s, "db_insert"))    m |= AGENT_TOOL_DB_INSERT;
+    if (str_find(s, "db_query"))     m |= AGENT_TOOL_DB_QUERY;
+    if (str_find(s, "stream_read"))  m |= AGENT_TOOL_STREAM_READ;
+    if (str_find(s, "stream_write")) m |= AGENT_TOOL_STREAM_WRITE;
+    if (str_find(s, "tier_promote")) m |= AGENT_TOOL_TIER_PROMOTE;
+    if (str_find(s, "ipc_post"))     m |= AGENT_TOOL_IPC_POST;
+    if (str_find(s, "agent_run"))    m |= AGENT_TOOL_AGENT_RUN;
+    return m;
+}
+
+// ─── GET /api/agents ──────────────────────────────────────────────────────────
+static int api_agents_list(char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    uint32_t cnt = 0;
+    for (int i = 0; i < AGENT_MAX; i++) cnt += agent_table[i].active ? 1 : 0;
+    jb_obj_open(&j,0);
+    jb_uint(&j,"count",(uint64_t)cnt); jb_putc(&j,',');
+    jb_arr_open(&j,"agents");
+    int first = 1;
+    for (int i = 0; i < AGENT_MAX; i++) {
+        if (!agent_table[i].active) continue;
+        struct AgentDescriptor* ag = &agent_table[i];
+        if (!first) jb_putc(&j,','); first=0;
+        jb_obj_open(&j,0);
+        jb_str (&j,"name",     ag->name);                        jb_putc(&j,',');
+        jb_str (&j,"model",    ag->model);                       jb_putc(&j,',');
+        jb_str (&j,"endpoint", ag->inference_endpoint);          jb_putc(&j,',');
+        jb_str (&j,"state",    agent_state_name(ag->state));     jb_putc(&j,',');
+        jb_uint(&j,"steps",    (uint64_t)ag->step_count);        jb_putc(&j,',');
+        jb_uint(&j,"tool_mask",(uint64_t)ag->tool_mask);          jb_putc(&j,',');
+        jb_str (&j,"last_answer",ag->last_answer[0]?ag->last_answer:"");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/agent/<name> ────────────────────────────────────────────────────
+static int api_agent_status(const char* name, char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    for (int i = 0; i < AGENT_MAX; i++) {
+        if (!agent_table[i].active) continue;
+        struct AgentDescriptor* ag = &agent_table[i];
+        int match = 1;
+        for (int k = 0; ag->name[k] || name[k]; k++)
+            if (ag->name[k] != name[k]) { match=0; break; }
+        if (!match) continue;
+        jb_obj_open(&j,0);
+        jb_str (&j,"name",      ag->name);                       jb_putc(&j,',');
+        jb_str (&j,"model",     ag->model);                      jb_putc(&j,',');
+        jb_str (&j,"endpoint",  ag->inference_endpoint);         jb_putc(&j,',');
+        jb_str (&j,"state",     agent_state_name(ag->state));    jb_putc(&j,',');
+        jb_uint(&j,"steps",     (uint64_t)ag->step_count);       jb_putc(&j,',');
+        jb_uint(&j,"tool_mask", (uint64_t)ag->tool_mask);        jb_putc(&j,',');
+        jb_uint(&j,"object_id", ag->object_id);                  jb_putc(&j,',');
+        jb_uint(&j,"run_count", (uint64_t)ag->run_count);        jb_putc(&j,',');
+        jb_uint(&j,"sched_ticks",(uint64_t)ag->schedule_ticks);  jb_putc(&j,',');
+        jb_str (&j,"memory_table",ag->memory_table_name[0]?ag->memory_table_name:""); jb_putc(&j,',');
+        jb_str (&j,"last_answer",ag->last_answer[0]?ag->last_answer:"");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    jb_obj_open(&j,0); jb_str(&j,"error","agent not found");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/agent/create ───────────────────────────────────────────────────
+static int api_agent_create(const char* body, char* buf, int max,
+                             uint32_t uid) {
+    JSONBuf j = {buf,0,max};
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    static struct AgentCreateRequest req;
+    req.name[0]=req.inference_endpoint[0]=req.model[0]=req.system_prompt[0]='\0';
+    req.tool_mask=0; req.owner_uid=uid;
+
+    json_str(body,"name",          req.name,               OBJECT_NAME_LEN);
+    json_str(body,"endpoint",      req.inference_endpoint, AGENT_ENDPOINT_LEN);
+    json_str(body,"model",         req.model,              AGENT_MODEL_LEN);
+    json_str(body,"system_prompt", req.system_prompt,      AGENT_PROMPT_LEN);
+
+    static char tools_str[256]; tools_str[0]='\0';
+    json_str(body,"tools",tools_str,sizeof(tools_str));
+    req.tool_mask = parse_tool_mask(tools_str);
+
+    if (!req.name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t rc = sys_sls_agent_create(&req);
+    jb_obj_open(&j,0);
+    jb_str (&j,"ok",       rc==0?"true":"false");  jb_putc(&j,',');
+    jb_str (&j,"name",     req.name);              jb_putc(&j,',');
+    jb_uint(&j,"tool_mask",(uint64_t)req.tool_mask);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/agent/run ──────────────────────────────────────────────────────
+// Blocks until the ReAct loop completes (may take several seconds for inference).
+static int api_agent_run(const char* body, char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    static struct AgentRunRequest req;
+    req.name[0]=req.message[0]='\0';
+    json_str(body,"name",    req.name,    OBJECT_NAME_LEN);
+    json_str(body,"message", req.message, AGENT_PROMPT_LEN);
+
+    if (!req.name[0]||!req.message[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name and message required");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t rc = sys_sls_agent_run(&req);
+
+    // Report step_count from the descriptor
+    uint32_t steps = 0;
+    for (int i = 0; i < AGENT_MAX; i++) {
+        if (agent_table[i].active) {
+            int m=1;
+            for (int k=0; agent_table[i].name[k]||req.name[k]; k++)
+                if (agent_table[i].name[k]!=req.name[k]){m=0;break;}
+            if (m) { steps=agent_table[i].step_count; break; }
+        }
+    }
+    jb_obj_open(&j,0);
+    jb_str (&j,"ok",    rc==0?"true":"false"); jb_putc(&j,',');
+    jb_str (&j,"agent", req.name);             jb_putc(&j,',');
+    jb_uint(&j,"steps", (uint64_t)steps);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/agent/drop ─────────────────────────────────────────────────────
+static int api_agent_drop(const char* body, char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body,"name",name,OBJECT_NAME_LEN);
+    if (!name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t rc = sys_sls_agent_kill(name);
+    jb_obj_open(&j,0);
+    jb_str(&j,"ok",rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/workflows ───────────────────────────────────────────────────────
+static int api_workflows_list(char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    uint32_t cnt = 0;
+    for (int i=0;i<WORKFLOW_MAX;i++) cnt += workflow_table[i].active?1:0;
+    jb_obj_open(&j,0);
+    jb_uint(&j,"count",(uint64_t)cnt); jb_putc(&j,',');
+    jb_arr_open(&j,"workflows");
+    int first=1;
+    for (int i=0;i<WORKFLOW_MAX;i++) {
+        if (!workflow_table[i].active) continue;
+        struct WorkflowDescriptor* wf = &workflow_table[i];
+        if (!first) jb_putc(&j,','); first=0;
+        jb_obj_open(&j,0);
+        jb_str (&j,"name",  wf->name);                          jb_putc(&j,',');
+        jb_str (&j,"state", workflow_state_name(wf->state));    jb_putc(&j,',');
+        jb_uint(&j,"steps", (uint64_t)wf->step_count);          jb_putc(&j,',');
+        jb_uint(&j,"current_step",(uint64_t)wf->current_step);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/workflow/<name> ─────────────────────────────────────────────────
+static int api_workflow_status(const char* name, char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    for (int i=0;i<WORKFLOW_MAX;i++) {
+        if (!workflow_table[i].active) continue;
+        struct WorkflowDescriptor* wf = &workflow_table[i];
+        int m=1;
+        for (int k=0;wf->name[k]||name[k];k++)
+            if (wf->name[k]!=name[k]){m=0;break;}
+        if (!m) continue;
+        jb_obj_open(&j,0);
+        jb_str (&j,"name",         wf->name);                       jb_putc(&j,',');
+        jb_str (&j,"state",        workflow_state_name(wf->state)); jb_putc(&j,',');
+        jb_uint(&j,"step_count",   (uint64_t)wf->step_count);       jb_putc(&j,',');
+        jb_uint(&j,"current_step", (uint64_t)wf->current_step);     jb_putc(&j,',');
+        jb_arr_open(&j,"steps");
+        for (uint8_t s=0;s<wf->step_count;s++) {
+            if (s) jb_putc(&j,',');
+            jb_obj_open(&j,0);
+            jb_str(&j,"agent",  wf->steps[s].agent_name); jb_putc(&j,',');
+            jb_str(&j,"input",  wf->steps[s].input_key);  jb_putc(&j,',');
+            jb_str(&j,"output", wf->steps[s].output_key);
+            jb_obj_close(&j);
+        }
+        jb_arr_close(&j);
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    jb_obj_open(&j,0); jb_str(&j,"error","workflow not found");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/workflow/create ────────────────────────────────────────────────
+// Body: {"name":"wf","shared_table":"tbl","step_count":2,
+//        "step0_agent":"a1","step0_in":"q","step0_out":"r1",
+//        "step1_agent":"a2","step1_in":"r1","step1_out":"ans"}
+static int api_workflow_create(const char* body, char* buf, int max,
+                                uint32_t uid) {
+    JSONBuf j = {buf,0,max};
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    static struct WorkflowCreateRequest req;
+    req.name[0]=req.shared_state_table[0]='\0';
+    req.step_count=0; req.owner_uid=uid;
+
+    json_str(body,"name",         req.name,               OBJECT_NAME_LEN);
+    json_str(body,"shared_table", req.shared_state_table, OBJECT_NAME_LEN);
+    int sc = json_int(body,"step_count");
+    if (sc < 0) sc = 0;
+    if (sc > WORKFLOW_MAX_STEPS) sc = WORKFLOW_MAX_STEPS;
+    req.step_count = (uint8_t)sc;
+
+    if (!req.name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    // Parse per-step fields: step0_agent, step0_in, step0_out, ...
+    for (int s=0; s<sc; s++) {
+        char ka[32],ki[32],ko[32];
+        // build key names manually (no sprintf available)
+        ka[0]='s';ka[1]='t';ka[2]='e';ka[3]='p';ka[4]=(char)('0'+s);
+        ka[5]='_';ka[6]='a';ka[7]='g';ka[8]='e';ka[9]='n';ka[10]='t';ka[11]='\0';
+        ki[0]='s';ki[1]='t';ki[2]='e';ki[3]='p';ki[4]=(char)('0'+s);
+        ki[5]='_';ki[6]='i';ki[7]='n';ki[8]='\0';
+        ko[0]='s';ko[1]='t';ko[2]='e';ko[3]='p';ko[4]=(char)('0'+s);
+        ko[5]='_';ko[6]='o';ko[7]='u';ko[8]='t';ko[9]='\0';
+        req.steps[s].agent_name[0]=req.steps[s].input_key[0]=req.steps[s].output_key[0]='\0';
+        json_str(body,ka,req.steps[s].agent_name,OBJECT_NAME_LEN);
+        json_str(body,ki,req.steps[s].input_key, RECORD_KEY_LEN);
+        json_str(body,ko,req.steps[s].output_key,RECORD_KEY_LEN);
+    }
+    uint64_t rc = sys_sls_workflow_create(&req);
+    jb_obj_open(&j,0);
+    jb_str (&j,"ok",  rc==0?"true":"false"); jb_putc(&j,',');
+    jb_str (&j,"name",req.name);             jb_putc(&j,',');
+    jb_uint(&j,"steps",(uint64_t)sc);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/workflow/run ───────────────────────────────────────────────────
+static int api_workflow_run(const char* body, char* buf, int max) {
+    JSONBuf j = {buf,0,max};
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    static struct WorkflowRunRequest req;
+    req.name[0]=req.input[0]='\0';
+    json_str(body,"name",  req.name,  OBJECT_NAME_LEN);
+    json_str(body,"input", req.input, AGENT_PROMPT_LEN);
+    if (!req.name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t rc = sys_sls_workflow_run(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j,"ok",rc==0?"true":"false"); jb_putc(&j,',');
+    jb_str(&j,"name",req.name);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // req[] is a NUL-terminated string of the raw HTTP request.
 static void http_route(int conn, char* req) {
     // Parse: METHOD /path[?qs] HTTP/x.x
@@ -1146,6 +1439,23 @@ static void http_route(int conn, char* req) {
             jb_putc(&j, ']');
             j.buf[j.pos] = '\0';
             http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        // ── Phase H: Agent & Workflow GET routes ─────────────────────────────
+        if (!strcmp(path, "/api/agents")) {
+            blen = api_agents_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (str_find(path, "/api/agent/") == path) {
+            blen = api_agent_status(path + 11, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/workflows")) {
+            blen = api_workflows_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (str_find(path, "/api/workflow/") == path) {
+            blen = api_workflow_status(path + 14, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // Compiled-in bundle (full Navigator SPA) — checked first
         const struct BundleAsset* ba = bundle_find(path);
@@ -1400,6 +1710,55 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/tx/rollback")) {
             blen = api_tx_post("rollback", resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Phase H: Agent & Workflow POST routes ─────────────────────────────
+        if (!strcmp(path, "/api/agent/create")) {
+            blen = api_agent_create(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/agent/run")) {
+            blen = api_agent_run(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/agent/drop")) {
+            blen = api_agent_drop(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/agent/schedule")) {
+            char aname[OBJECT_NAME_LEN]; aname[0]='\0';
+            char amsg[128];             amsg[0]='\0';
+            json_str(body_ptr, "name",    aname, OBJECT_NAME_LEN);
+            json_str(body_ptr, "message", amsg,  sizeof(amsg));
+            int aticks = json_int(body_ptr, "ticks");
+            struct AgentScheduleRequest sr;
+            for(int i=0;aname[i]&&i<(int)(sizeof(sr.name)-1);i++) sr.name[i]=aname[i]; sr.name[sizeof(sr.name)-1]='\0';
+            for(int i=0;amsg[i] &&i<(int)(sizeof(sr.message)-1);i++) sr.message[i]=amsg[i]; sr.message[sizeof(sr.message)-1]='\0';
+            sr.ticks = (uint32_t)(aticks > 0 ? aticks : 0);
+            uint64_t rc = sys_sls_agent_schedule(&sr);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j,0); jb_str(&j,"ok",rc==0?"true":"false");
+            jb_obj_close(&j); j.buf[j.pos]='\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/agent/unschedule")) {
+            char aname[OBJECT_NAME_LEN]; aname[0]='\0';
+            json_str(body_ptr, "name", aname, OBJECT_NAME_LEN);
+            struct AgentScheduleRequest sr;
+            for(int i=0;aname[i]&&i<(int)(sizeof(sr.name)-1);i++) sr.name[i]=aname[i]; sr.name[sizeof(sr.name)-1]='\0';
+            sr.message[0]='\0'; sr.ticks=0;
+            uint64_t rc = sys_sls_agent_schedule(&sr);
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j,0); jb_str(&j,"ok",rc==0?"true":"false");
+            jb_obj_close(&j); j.buf[j.pos]='\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
+        if (!strcmp(path, "/api/workflow/create")) {
+            blen = api_workflow_create(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/workflow/run")) {
+            blen = api_workflow_run(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
     }

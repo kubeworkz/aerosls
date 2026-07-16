@@ -10,10 +10,11 @@
 #define IPC_PORT_DBMGR    0x1003   // NativeDbStoreMgr
 #define IPC_PORT_TIERMGR  0x1004   // StorageTierMgr
 #define IPC_PORT_LOGMGR   0x1005   // RecoveryLogVerifier
+#define IPC_PORT_AGENTMGR 0x1006   // AgentRuntimeMgr
 
 #define IPC_PORT_FIRST    0x1001
-#define IPC_PORT_LAST     0x1005
-#define IPC_NUM_QUEUES    5
+#define IPC_PORT_LAST     0x1006
+#define IPC_NUM_QUEUES    6
 
 // ─── Opcodes per Service ──────────────────────────────────────────────────────
 // VirtualMemoryMgr
@@ -40,6 +41,12 @@
 #define LOG_OP_APPEND        0x0501
 #define LOG_OP_VERIFY        0x0502
 #define LOG_OP_RECOVER       0x0503
+
+// AgentRuntimeMgr
+#define AGENT_OP_SPAWN       0x0601   // create + start an agent
+#define AGENT_OP_STEP        0x0602   // run one ReAct step (blocks until done)
+#define AGENT_OP_COMPLETE    0x0603   // agent finished — log and record result
+#define AGENT_OP_KILL        0x0604   // stop and remove an agent
 
 // ─── Message Struct ───────────────────────────────────────────────────────────
 // No-copy design: payload carries pointers / object IDs, not raw data bytes.

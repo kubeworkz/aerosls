@@ -27,7 +27,8 @@
 #include "../kernel/cursor.h"
 #include "../kernel/aggregate.h"
 #include "../kernel/mqt.h"
-#include "../kernel/stream.h"#include "../kernel/stream.h"
+#include "../kernel/stream.h"
+#include "../kernel/agent.h"
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -149,8 +150,8 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     cursor_mgr_init();
 
     // ── 4l. Materialized Query Table engine ──────────────────────────
-    mqt_init();
-    // ── 4m. Stream object store (OBJ_TYPE_STREAM) ─────────────────
+    mqt_init();    // ── 4n. AI agent engine ───────────────────────────────────────────────────
+    agent_init();    // ── 4m. Stream object store (OBJ_TYPE_STREAM) ─────────────────
     // nvme_io_init + stream_init run after the PCI scan (step 7) so that
     // nvme_ctrl is fully set up before we attempt I/O queue creation.
     // Placeholder: stream_init is deferred to step 7b below.

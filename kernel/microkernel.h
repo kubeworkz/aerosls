@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "ipc.h"
+#include "agent.h"
 
 // ─── Service State ────────────────────────────────────────────────────────────
 typedef enum {
@@ -62,5 +63,12 @@ void     mk_post_valloc(uint64_t obj_id, uint32_t size_pages);
 void     mk_post_security_check(uint64_t obj_id, uint32_t uid, uint32_t perm);
 void     mk_post_tier_flush(uint64_t obj_id);
 void     mk_post_log_append(uint64_t entry_id, uint64_t tx_id);
+
+// ─── Agent IPC wrappers ───────────────────────────────────────────────────────
+// Pointer in payload[0] must remain valid until the AP service poll processes it.
+// Since poll runs every ~10 ticks on Core 1, static/BSS-allocated structs are safe.
+void     mk_post_agent_spawn(struct AgentCreateRequest* req);
+void     mk_post_agent_step(struct AgentRunRequest* req);
+void     mk_post_agent_kill(const char* name);
 
 #endif /* MICROKERNEL_H */

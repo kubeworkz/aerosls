@@ -15,6 +15,8 @@ typedef enum {
     OBJ_TYPE_JOURNAL          = 6,  // IBM i-style journal object
     OBJ_TYPE_PROGRAM          = 7,  // Executable program image (flat binary)
     OBJ_TYPE_STREAM           = 8,  // Raw byte-stream "file" (read-only by default)
+    OBJ_TYPE_AGENT            = 9,  // AI agent (descriptor + memory table + history stream)
+    OBJ_TYPE_WORKFLOW         = 10, // Ordered sequence of agent steps
 } SLSObjectType;
 
 // ─── Storage Tiers ────────────────────────────────────────────────────────────
@@ -53,6 +55,8 @@ static inline const char* obj_type_name(SLSObjectType t) {
         case OBJ_TYPE_JOURNAL:         return "JOURNAL";
         case OBJ_TYPE_PROGRAM:         return "PROGRAM";
         case OBJ_TYPE_STREAM:          return "STREAM";
+        case OBJ_TYPE_AGENT:           return "AGENT";
+        case OBJ_TYPE_WORKFLOW:        return "WORKFLOW";
         default:                       return "UNKNOWN";
     }
 }
