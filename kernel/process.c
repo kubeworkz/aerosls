@@ -119,10 +119,14 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     (void)obj_idx;
     (void)pr_strlen;
 
-    // 7. Enter Ring-3 (does not return in the caller's context)
-    enter_user_process(pd->cr3, pd->user_rip, pd->user_rsp);
+    // 7. Enter Ring-3, saving the kernel continuation so process_exit() can
+    //    return here cleanly.
+    kernel_enter_ring3(&pd->kernel_rsp, &pd->kernel_cr3,
+                       pd->cr3, pd->user_rip, pd->user_rsp);
 
-    // Unreachable — enter_user_process switches to user space via sysretq
+    // Resumes here after SYS_SLS_EXIT
+    kernel_serial_printf("[PROC] PID %u '%s' returned to kernel.\n",
+                         pd->pid, pd->name);
     return pd->pid;
 }
 
@@ -222,9 +226,53 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
         "RIP=0x%016lx  RSP=0x%016lx  CR3=0x%016lx\n",
         pd->pid, pd->name, pd->user_rip, pd->user_rsp, pd->cr3);
 
-    // 7. Enter Ring-3 — does not return to caller
-    enter_user_process(pd->cr3, pd->user_rip, pd->user_rsp);
-    return pd->pid; /* unreachable after enter_user_process */
+    // 7. Enter Ring-3, saving the kernel continuation so process_exit() can
+    //    return here cleanly.
+    kernel_enter_ring3(&pd->kernel_rsp, &pd->kernel_cr3,
+                       pd->cr3, pd->user_rip, pd->user_rsp);
+
+    // Resumes here after SYS_SLS_EXIT
+    kernel_serial_printf("[PROC] PID %u '%s' returned to kernel.\n",
+                         pd->pid, pd->name);
+    return pd->pid;
+}
+
+// ─── process_exit ────────────────────────────────────────────────────────────
+// Called from SYS_SLS_EXIT dispatch.  Finds the running Ring-3 process,
+// marks it ZOMBIE, restores the kernel's RSP and CR3 saved by
+// kernel_enter_ring3(), then rets back into program_spawn() / process_create().
+void process_exit(uint32_t exit_code) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || pd->state != PROC_RUNNING) continue;
+        if (!pd->kernel_rsp) continue;   // not entered via kernel_enter_ring3
+
+        uint64_t saved_rsp = pd->kernel_rsp;
+        uint64_t saved_cr3 = pd->kernel_cr3;
+
+        pd->kernel_rsp = 0;
+        pd->kernel_cr3 = 0;
+        pd->state      = PROC_ZOMBIE;
+        pd->active     = 0;
+        proc_count--;
+
+        kernel_serial_printf(
+            "[PROC] PID %u '%s' exited (code=%u).\n",
+            pd->pid, pd->name, exit_code);
+
+        // Restore kernel page table and stack, then return to kernel_enter_ring3
+        // caller.  The 'ret' pops the return address from [saved_rsp].
+        __asm__ volatile(
+            "mov %0, %%cr3\n\t"   /* restore kernel page tables */
+            "mov %1, %%rsp\n\t"   /* restore kernel stack         */
+            "ret\n\t"              /* return to kernel_enter_ring3 call site */
+            :
+            : "r"(saved_cr3), "r"(saved_rsp)
+            : "memory"
+        );
+        __builtin_unreachable();
+    }
+    kernel_serial_print("[PROC] exit: no active Ring-3 process found.\n");
 }
 
 // ─── process_kill ─────────────────────────────────────────────────────────────

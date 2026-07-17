@@ -38,7 +38,11 @@ void init_idt(void) {
     idt_ptr.base  = (uint64_t)&idt;
 
     // 0x8E: Present, Ring 0, 64-bit Interrupt Gate
-    set_idt_gate(14, (uint64_t)isr14_stub, 0x8E);
+    set_idt_gate( 6, (uint64_t)isr6_stub,  0x8E);  // #UD Invalid Opcode
+    set_idt_gate(11, (uint64_t)isr11_stub, 0x8E);  // #NP Segment Not Present
+    set_idt_gate(12, (uint64_t)isr12_stub, 0x8E);  // #SS Stack-Segment Fault
+    set_idt_gate(13, (uint64_t)isr13_stub, 0x8E);  // #GP General Protection
+    set_idt_gate(14, (uint64_t)isr14_stub, 0x8E);  // #PF Page Fault
 
     // Remap and silence the legacy 8259A PIC BEFORE enabling interrupts.
     // Without this, IRQ0 fires as INT 0x08 (#DF) → triple fault.

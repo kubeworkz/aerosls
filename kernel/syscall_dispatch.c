@@ -129,13 +129,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_QUERY_SCAN:
         sys_sls_query_scan(); return 0;
 
-    // ── Phase B: Processes (160–162) ───────────────────────────────────────
+    // ── Phase B: Processes (160–164) ───────────────────────────────────────
     case SYS_SLS_PROC_CREATE:
         return process_create((struct ProcCreateRequest*)arg);
     case SYS_SLS_PROC_KILL:
         process_kill((uint32_t)(uintptr_t)arg); return 0;
     case SYS_SLS_PROC_LIST:
         sys_sls_proc_list(); return 0;
+    case SYS_SLS_EXIT:
+        process_exit((uint32_t)(uintptr_t)arg); return 0;
 
     // ── Phase C: Loader (170–171) ───────────────────────────────────────
     case SYS_SLS_LOAD:

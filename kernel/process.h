@@ -33,6 +33,8 @@ struct ProcessDescriptor {
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_phys;       // physical base of the stack allocation
+    uint64_t   kernel_rsp;            // saved kernel RSP — restored on exit
+    uint64_t   kernel_cr3;            // saved kernel CR3 — restored on exit
     uint32_t   owner_uid;
     ProcState  state;
     uint8_t    active;
@@ -42,7 +44,7 @@ struct ProcessDescriptor {
 #define SYS_SLS_PROC_CREATE 160
 #define SYS_SLS_PROC_KILL   161
 #define SYS_SLS_PROC_LIST   162
-
+#define SYS_SLS_EXIT        164  // Ring-3 self-exit; returns control to kernel
 // ─── Syscall argument for process creation ────────────────────────────────────
 struct ProcCreateRequest {
     char     object_name[PROC_NAME_LEN];  // name of the SERVICE_PROCESS SLS object
@@ -63,6 +65,15 @@ void     sys_sls_proc_list(void);
 // making OBJ_TYPE_PROGRAM the SLS-native replacement for a filesystem exec.
 // Returns the new PID on success, 0 on failure.
 uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
+
+// Kernel-side exit handler: restores kernel context saved by kernel_enter_ring3.
+// Called from SYS_SLS_EXIT syscall dispatch.
+void process_exit(uint32_t exit_code);
+
+// Low-level: save kernel RSP/CR3, enter user space via sysretq.
+// Returns after process_exit() restores the kernel continuation.
+void kernel_enter_ring3(uint64_t* rsp_save, uint64_t* cr3_save,
+                         uint64_t cr3, uint64_t rip, uint64_t rsp);
 
 // Low-level: enter user space via sysretq (does not return in kernel context)
 void enter_user_process(uint64_t cr3, uint64_t rip, uint64_t rsp);

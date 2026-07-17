@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include "kernel_io.h"
 #include "object_catalog.h"
+#include "process.h"
 
 // ─── C-library string functions (freestanding replacements) ──────────────────
 
@@ -55,17 +56,38 @@ int memcmp(const void* a, const void* b, size_t n) {
 }
 
 // ─── Page fault handler ───────────────────────────────────────────────────────
-// Called from isr14_stub.  A proper implementation would check the SLS disk
-// bit in the faulting PTE and schedule an NVMe read.  For now, panic on all
-// faults that reach this handler.
+// Called from isr14_stub.  Error code bit 2 (U/S): set = Ring-3 fault → kill
+// the process and return to kernel.  Clear = kernel fault → panic.
 void handle_page_fault(unsigned long error_code) {
     unsigned long faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
+
+    if (error_code & 0x4) {
+        kernel_serial_printf(
+            "[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx  — killing process.\n",
+            error_code, faulting_address);
+        process_exit(139);   /* SIGSEGV-equivalent */
+        /* process_exit() restores kernel context and does not return here */
+    }
     kernel_serial_printf(
-        "\n[FAULT] Page Fault  error=0x%lx  addr=0x%016lx\n"
-        "        This fault was not handled by the SLS page-in path.\n"
-        "        Halting.\n",
+        "\n[FAULT] Kernel #PF  error=0x%lx  addr=0x%016lx  — Halting.\n",
         error_code, faulting_address);
+    __asm__ volatile("cli");
+    for (;;) __asm__ volatile("hlt");
+}
+
+// ─── General Ring-3 fault handler (#UD/#GP/#SS/#NP) ─────────────────────────
+// saved_cs bits 0-1 = CPL; CPL==3 → Ring-3 → kill process.  Else panic.
+void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs) {
+    if ((saved_cs & 3) == 3) {
+        kernel_serial_printf(
+            "[FAULT] Ring-3 fault  cs=0x%lx  error=0x%lx  — killing process.\n",
+            saved_cs, error_code);
+        process_exit(134);   /* SIGABRT-equivalent */
+    }
+    kernel_serial_printf(
+        "\n[FAULT] Kernel fault  cs=0x%lx  error=0x%lx  — Halting.\n",
+        saved_cs, error_code);
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }
