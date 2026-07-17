@@ -24,6 +24,7 @@
 #define MSR_KERNEL_GS    0xC0000102
 
 #define EFER_SCE         (1ULL << 0)   // SYSCALL Enable
+#define EFER_NXE         (1ULL << 11)  // No-Execute Enable (makes bit 63 of PTE valid)
 
 // ─── Per-CPU data structure (swapgs target) ───────────────────────────────────
 // syscall_entry_stub accesses [gs:0] and [gs:8] for RSP swapping.

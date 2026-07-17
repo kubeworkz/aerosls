@@ -78,16 +78,16 @@ void handle_page_fault(unsigned long error_code) {
 
 // ─── General Ring-3 fault handler (#UD/#GP/#SS/#NP) ─────────────────────────
 // saved_cs bits 0-1 = CPL; CPL==3 → Ring-3 → kill process.  Else panic.
-void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs) {
+void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsigned long saved_rip) {
     if ((saved_cs & 3) == 3) {
         kernel_serial_printf(
-            "[FAULT] Ring-3 fault  cs=0x%lx  error=0x%lx  — killing process.\n",
-            saved_cs, error_code);
-        process_exit(134);   /* SIGABRT-equivalent */
+            "[FAULT] Ring-3 fault  cs=0x%lx  error=0x%lx  rip=0x%016lx  — killing process.\n",
+            saved_cs, error_code, saved_rip);
+        process_exit(134);
     }
     kernel_serial_printf(
-        "\n[FAULT] Kernel fault  cs=0x%lx  error=0x%lx  — Halting.\n",
-        saved_cs, error_code);
+        "\n[FAULT] Kernel fault  cs=0x%lx  error=0x%lx  rip=0x%016lx  — Halting.\n",
+        saved_cs, error_code, saved_rip);
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }

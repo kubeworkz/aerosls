@@ -25,8 +25,9 @@ extern timer_irq_handler
     push r9
     push r10
     push r11
-    mov  rdi, [rbp + 8]          ; error_code (pushed by CPU)
-    mov  rsi, [rbp + 24]         ; saved CS (5 qwords above error_code)
+    mov  rdi, [rbp + 8]          ; error_code
+    mov  rsi, [rbp + 24]         ; saved CS
+    mov  rdx, [rbp + 16]         ; saved RIP (faulting instruction)
     call handle_ring3_fault
     pop  r11
     pop  r10
@@ -57,7 +58,8 @@ extern timer_irq_handler
     push r10
     push r11
     xor  rdi, rdi                ; no error code — pass 0
-    mov  rsi, [rbp + 16]         ; saved CS (4 qwords above saved rbp)
+    mov  rsi, [rbp + 16]         ; saved CS
+    mov  rdx, [rbp + 8]          ; saved RIP
     call handle_ring3_fault
     pop  r11
     pop  r10

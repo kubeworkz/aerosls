@@ -23,9 +23,9 @@ static uint8_t kernel_syscall_stack[4096] __attribute__((aligned(16)));
 // ─── syscall_gate_init ────────────────────────────────────────────────────────
 // Must be called once by the BSP during kernel_main before entering Ring-3.
 void syscall_gate_init(void) {
-    // Enable SYSCALL / SYSRET in EFER
+    // Enable SYSCALL/SYSRET and No-Execute (NX) page protection in EFER
     uint64_t efer = rdmsr(MSR_EFER);
-    efer |= EFER_SCE;
+    efer |= EFER_SCE | EFER_NXE;
     wrmsr(MSR_EFER, efer);
 
     // STAR: bits[47:32] = SYSCALL kernel CS (0x08); bits[63:48] = SYSRET CS base (0x10)
@@ -93,8 +93,10 @@ uint64_t user_clone_page_table(void) {
     uint64_t* new_pml4 = alloc_page_table();
     if (!new_pml4) return 0;
 
-    // Copy kernel-space entries (upper 256 slots of PML4)
-    for (int i = 256; i < 512; i++) new_pml4[i] = kernel_pml4[i];
+    // Copy ALL 512 PML4 entries: lower half has the kernel binary (0x100000–)
+    // so that interrupt/syscall handlers remain reachable after CR3 switch.
+    // Kernel PTEs have U/S=0 (Supervisor), so Ring-3 cannot access them.
+    for (int i = 0; i < 512; i++) new_pml4[i] = kernel_pml4[i];
 
     kernel_serial_printf("[PAGING] New user PML4 at 0x%016lx\n",
                          (uint64_t)(uintptr_t)new_pml4);

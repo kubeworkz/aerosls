@@ -11,6 +11,12 @@ uint32_t                 proc_count = 0;
 
 static uint32_t next_pid = 100;   // PIDs start above the microkernel service PIDs
 
+// Virtual address at which user process code is mapped.
+// Must be a canonical user-space address (bit 47 = 0, bits 63:48 = 0).
+// x86-64 canonical user range: 0x0000000000000000 – 0x00007FFFFFFFFFFF.
+// 0x0000400000000000 = 64 TiB, well within range and clear of SLS objects.
+#define USER_PROC_CODE_BASE 0x0000400000000000ULL
+
 // ─── String helpers ───────────────────────────────────────────────────────────
 static size_t pr_strlen(const char* s) { size_t n=0; while(s[n]) n++; return n; }
 static int    pr_streq(const char* a, const char* b) {
@@ -186,7 +192,7 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
     //    OBJ_TYPE_PROGRAM pages get NX cleared only for executable segments —
     //    data/BSS segments keep NX set, enforcing W^X at the page level.
     uint64_t entry_rip = loader_load_into_process(
-                             object_name, obj->base_vaddr, pml4);
+                             object_name, USER_PROC_CODE_BASE, pml4);
     if (!entry_rip) {
         kernel_serial_printf(
             "[PROC] program_spawn: '%s' has no binary. "
@@ -196,7 +202,7 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
 
     // 5. Allocate and map a user-space stack (W, no-exec, user-accessible)
     //    Guard gap: leave one page between the text segment and the stack.
-    uint64_t stack_base = obj->base_vaddr
+    uint64_t stack_base = USER_PROC_CODE_BASE
                         + (uint64_t)obj->size_pages * 4096
                         + 4096; /* guard page */
     for (uint32_t p = 0; p < PROC_USER_STACK_PAGES; p++) {

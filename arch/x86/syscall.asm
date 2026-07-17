@@ -1,6 +1,7 @@
 bits 64
 global syscall_entry_stub
 global enter_user_process
+extern do_syscall          ; C dispatcher for syscalls not in the asm table
 extern sys_sls_allocate
 extern sys_sls_valloc
 extern sys_sls_vfree
@@ -236,7 +237,13 @@ syscall_entry_stub:
     jmp  .syscall_return
 
 .unknown_syscall:
-    xor  rax, rax           ; return 0/NULL for unsupported calls
+    ; Fall through to the C dispatcher for any syscall number not handled above.
+    ; do_syscall(uint64_t num, void* arg): rdi = num, rsi = arg
+    mov  rsi, rdi          ; arg was in RDI
+    mov  rdi, rax          ; syscall number from RAX
+    call do_syscall
+    ; return value already in RAX
+    jmp  .syscall_return
 
 .syscall_return:
     pop  r11
@@ -250,4 +257,4 @@ syscall_entry_stub:
 
     mov  rsp, [gs:0]
     swapgs
-    sysretq
+    o64 sysret          ; return to Ring-3 (NASM 2.16: use o64 sysret, not sysretq)

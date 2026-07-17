@@ -132,6 +132,41 @@ riscv-run: riscv-elf
 clean:
 	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
 
+# ── User-space programs ────────────────────────────────────────────────────────
+# Builds all .c files under user/examples/ into flat binaries using libsls.
+# The binaries are position-independent (PIC) so the kernel can load them
+# at any virtual address allocated by sys_sls_valloc().
+#
+# Prerequisites: gcc (host, x86-64), ld (GNU)
+#
+# Usage:
+#   make user-programs
+#   python3 utils/program_upload.py --file user/examples/hello.bin --name hello
+#   curl -X POST http://localhost:3001/api/program/spawn \
+#        -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
+#        -H "Content-Type: application/json" -d '{"name":"hello"}'
+
+USER_CC      = gcc
+USER_CFLAGS  = -m64 -O2 -std=c11 -ffreestanding -nostdlib \
+               -fPIC -fno-plt -fno-stack-protector \
+               -mno-sse -mno-sse2 -mno-avx \
+               -Wall -Wextra -Iuser/libsls
+USER_LDFLAGS = -nostdlib -static -T user/libsls/user.ld
+USER_SRCS    = $(wildcard user/examples/*.c)
+USER_BINS    = $(USER_SRCS:.c=.bin)
+USER_ELFS    = $(USER_SRCS:.c=.elf)
+
+user/examples/%.elf: user/examples/%.c user/libsls/start.S user/libsls/sls.h user/libsls/user.ld
+	$(USER_CC) $(USER_CFLAGS) $(USER_LDFLAGS) user/libsls/start.S $< -o $@
+
+user/examples/%.bin: user/examples/%.elf
+	objcopy -O binary $< $@
+	@echo "[USER] Built $@ ($$(wc -c < $@) bytes)"
+
+user-programs: $(USER_BINS)
+
+.PHONY: user-programs
+
 bundle:
 	@echo "[BUNDLE] Generating kernel/webapp_bundle.c from slsos-sim/dist..."
 	@cd ../slsos-sim && npm run build --silent 2>/dev/null || true
