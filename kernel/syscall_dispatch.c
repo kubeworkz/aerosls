@@ -107,6 +107,33 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_IPC_POST:
         return sys_sls_ipc_post((struct IPCPostRequest*)arg);
 
+    // ── Ring-3 User IPC (166–168) ─────────────────────────────────────────────
+    case SYS_SLS_IPC_BIND: {
+        /* arg = (void*)(uintptr_t)port  — bind calling process to user port */
+        uint16_t port = (uint16_t)(uintptr_t)arg;
+        uint32_t caller_pid = 0;
+        for (int _i = 0; _i < PROC_MAX; _i++) {
+            if (proc_table[_i].active && proc_table[_i].state == PROC_RUNNING) {
+                caller_pid = proc_table[_i].pid; break;
+            }
+        }
+        return (uint64_t)(uint32_t)ipc_user_bind(port, caller_pid);
+    }
+    case SYS_SLS_IPC_SEND: {
+        /* arg = pointer to IPCUserSendReq */
+        uint32_t caller_pid = 0;
+        for (int _i = 0; _i < PROC_MAX; _i++) {
+            if (proc_table[_i].active && proc_table[_i].state == PROC_RUNNING) {
+                caller_pid = proc_table[_i].pid; break;
+            }
+        }
+        return (uint64_t)(uint32_t)ipc_user_send(
+            (const struct IPCUserSendReq*)arg, caller_pid);
+    }
+    case SYS_SLS_IPC_RECV:
+        /* arg = pointer to IPCUserRecvReq (port field set by caller) */
+        return (uint64_t)ipc_user_recv((struct IPCUserRecvReq*)arg);
+
     // ── Phase 5: Storage Tiers (140–142) ──────────────────────────────────────
     case SYS_SLS_TIER_LIST:
         sys_sls_tier_list(); return 0;

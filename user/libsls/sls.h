@@ -21,6 +21,21 @@
 #define SLS_SYS_DELETE          143   /* delete a record field                */
 #define SLS_SYS_EXIT            164   /* terminate process, return to kernel  */
 #define SLS_SYS_SERIAL_WRITE    165   /* write string to kernel serial log    */
+#define SLS_SYS_IPC_BIND        166   /* bind process to a user IPC port      */
+#define SLS_SYS_IPC_SEND        167   /* send message to any port             */
+#define SLS_SYS_IPC_RECV        168   /* non-blocking recv from user port     */
+
+/* ── IPC port ranges ────────────────────────────────────────────────────── */
+/* Kernel service ports (0x1001-0x1006) — send-only from Ring-3             */
+#define SLS_IPC_PORT_VMMGR    0x1001
+#define SLS_IPC_PORT_SECMGR   0x1002
+#define SLS_IPC_PORT_DBMGR    0x1003
+#define SLS_IPC_PORT_TIERMGR  0x1004
+#define SLS_IPC_PORT_LOGMGR   0x1005
+#define SLS_IPC_PORT_AGENTMGR 0x1006
+/* User ports (0x2000-0x200F) — bind + send + recv                          */
+#define SLS_IPC_USER_PORT_FIRST  0x2000
+#define SLS_IPC_USER_PORT_LAST   0x200F
 
 /* ── Object type codes (must match kernel OBJ_TYPE_* enum) ─────────────── */
 #define SLS_OBJ_SYSTEM_METADATA  0
@@ -168,4 +183,70 @@ static inline int sls_delete(const char *object, const char *key) {
     sls_strncpy(req.name, object, SLS_NAME_LEN - 1);
     sls_strncpy(req.key,  key,    SLS_KEY_LEN  - 1);
     return (int)_sls_syscall(SLS_SYS_DELETE, &req);
+}
+
+/* ── IPC ────────────────────────────────────────────────────────────────── */
+
+/* Message struct — layout MUST match kernel struct IPCMessage in ipc.h */
+struct sls_ipc_msg {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t opcode;
+    uint64_t payload[4];
+    uint32_t reply_token;
+    uint8_t  consumed;
+    uint8_t  _pad[3];
+};
+
+/* Send-request struct — layout matches kernel struct IPCUserSendReq */
+struct sls_ipc_send_req {
+    uint16_t  dst_port;
+    uint16_t  _pad0;
+    uint32_t  opcode;
+    uint64_t  payload[4];
+};
+
+/* Recv-request struct — layout matches kernel struct IPCUserRecvReq */
+struct sls_ipc_recv_req {
+    uint16_t          port;    /* [in]  user port to receive from */
+    uint8_t           _pad[6];
+    struct sls_ipc_msg msg;    /* [out] filled on successful recv */
+};
+
+/* Bind the calling process to a user IPC port (0x2000–0x200F).
+ * Only one process per port.  Returns 0 on success. */
+static inline int sls_ipc_bind(uint16_t port) {
+    return (int)_sls_syscall(SLS_SYS_IPC_BIND, (void *)(uintptr_t)port);
+}
+
+/* Send a message to any port.
+ * dst 0x1001-0x1006 = kernel service; 0x2000-0x200F = user process.
+ * Returns 0 on success, non-zero on queue-full or bad port. */
+static inline int sls_ipc_send(uint16_t dst, uint32_t opcode,
+                                uint64_t a0, uint64_t a1,
+                                uint64_t a2, uint64_t a3) {
+    struct sls_ipc_send_req req;
+    sls_memset(&req, 0, sizeof(req));
+    req.dst_port   = dst;
+    req.opcode     = opcode;
+    req.payload[0] = a0; req.payload[1] = a1;
+    req.payload[2] = a2; req.payload[3] = a3;
+    return (int)_sls_syscall(SLS_SYS_IPC_SEND, &req);
+}
+
+/* Non-blocking receive from a user port.
+ * Returns 1 and fills *out if a message is available; returns 0 if empty.
+ * Typical usage: spin until sls_ipc_recv() returns 1 (preemptive timer
+ * will switch to other processes while spinning). */
+static inline int sls_ipc_recv(uint16_t port, struct sls_ipc_msg *out) {
+    struct sls_ipc_recv_req req;
+    sls_memset(&req, 0, sizeof(req));
+    req.port = port;
+    int rc = (int)_sls_syscall(SLS_SYS_IPC_RECV, &req);
+    if (rc && out) {
+        uint8_t *src = (uint8_t *)&req.msg;
+        uint8_t *dst = (uint8_t *)out;
+        for (size_t i = 0; i < sizeof(*out); i++) dst[i] = src[i];
+    }
+    return rc;
 }

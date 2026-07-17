@@ -79,8 +79,31 @@ struct IPCStats {
 };
 
 // ─── Syscall Numbers ──────────────────────────────────────────────────────────
-#define SYS_SLS_IPC_POST  134
 #define SYS_SLS_IPC_STAT  133
+#define SYS_SLS_IPC_POST  134
+// User-space IPC (Ring-3 ↔ Ring-3 and Ring-3 ↔ kernel)
+#define SYS_SLS_IPC_BIND  166
+#define SYS_SLS_IPC_SEND  167
+#define SYS_SLS_IPC_RECV  168
+
+// ─── User Port Space ──────────────────────────────────────────────────────────
+#define IPC_USER_PORT_FIRST  0x2000
+#define IPC_USER_PORT_LAST   0x200F
+#define IPC_USER_NUM_PORTS   16
+
+// ─── User IPC Argument Structs ────────────────────────────────────────────────
+struct IPCUserSendReq {
+    uint16_t  dst_port;
+    uint16_t  _pad0;
+    uint32_t  opcode;
+    uint64_t  payload[4];
+};  /* 40 bytes */
+
+struct IPCUserRecvReq {
+    uint16_t          port;    /* [in]  user port to receive from */
+    uint8_t           _pad[6];
+    struct IPCMessage msg;     /* [out] filled on successful recv */
+};
 
 // ─── IPC Post Request (syscall 134 argument) ──────────────────────────────────
 struct IPCPostRequest {
@@ -90,11 +113,18 @@ struct IPCPostRequest {
 // ─── Public API ───────────────────────────────────────────────────────────────
 extern struct IPCQueue ipc_queues[IPC_NUM_QUEUES];
 extern struct IPCStats ipc_stats;
+extern struct IPCQueue ipc_user_queues[IPC_USER_NUM_PORTS];
+extern uint32_t        ipc_user_port_pid[IPC_USER_NUM_PORTS]; /* 0 = unbound */
 
 void ipc_init(void);
 int  ipc_post(uint16_t port, const struct IPCMessage* msg);
 int  ipc_recv(uint16_t port, struct IPCMessage* out);
 int  ipc_queue_depth(uint16_t port);
+
+// User-space IPC handlers (called from syscall_dispatch)
+int  ipc_user_bind(uint16_t port, uint32_t pid);
+int  ipc_user_send(const struct IPCUserSendReq* req, uint32_t src_pid);
+int  ipc_user_recv(struct IPCUserRecvReq* req);
 
 // Kernel syscall handler
 uint64_t sys_sls_ipc_post(struct IPCPostRequest* req);
