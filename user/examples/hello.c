@@ -17,30 +17,28 @@
 #include <sls.h>
 
 int main(void) {
-    sls_println("[hello] starting");
+    sls_puts("[hello] starting\n");
 
-    /* Create a DB_TABLE object to store results */
+    /* Create a DB_TABLE for results (may already exist on re-runs) */
     uint64_t oid = sls_valloc("hello_output", SLS_OBJ_DB_TABLE, 4);
-    if (!oid)
-        sls_println("[hello] valloc: object already exists, continuing");
+    if (!oid) sls_puts("[hello] valloc: object exists, continuing\n");
 
-    /* Write a record */
+    /* Insert a record */
     int rc = sls_insert("hello_output", "message", "Hello from Ring-3!");
-    if (rc == 0)
-        sls_println("[hello] insert ok");
-    else
-        sls_println("[hello] insert failed (key may exist)");
+    if (rc == 0) sls_puts("[hello] insert ok\n");
+    else         sls_puts("[hello] insert failed\n");
 
     /* Read it back */
     char buf[SLS_VAL_LEN];
     rc = sls_select("hello_output", "message", buf, sizeof(buf));
     if (rc == 0) {
         sls_puts("[hello] select: ");
-        sls_println(buf);
+        sls_puts(buf);
+        sls_puts("\n");
     } else {
-        sls_println("[hello] select failed");
+        sls_puts("[hello] select failed\n");
     }
 
-    sls_println("[hello] done");
+    sls_puts("[hello] done\n");
     return 0;
 }

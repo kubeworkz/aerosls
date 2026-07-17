@@ -23,8 +23,8 @@
 //  (end LBA 5232)
 //
 //  LBA 5248  PERSIST_PROG_HDR_LBA  1 frame   — programs header
-//  LBA 5256  PERSIST_PROG_DAT_LBA 17 frames  — service_binaries[4]  (~66 KiB)
-//  (end LBA 5392 — 800 sectors free before STREAM_DIR_LBA 8192)
+//  LBA 5256  PERSIST_PROG_DAT_LBA 65 frames  — service_binaries[16] (~257 KiB)
+//  (end LBA 5776 — 2416 sectors free before STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL

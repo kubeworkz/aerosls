@@ -139,6 +139,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_EXIT:
         process_exit((uint32_t)(uintptr_t)arg); return 0;
 
+    // ── Ring-3 debug output (165) ───────────────────────────────────────
+    case 165: /* SYS_SLS_SERIAL_WRITE */
+        if (arg) kernel_serial_print((const char*)arg);
+        return 0;
+
     // ── Phase C: Loader (170–171) ───────────────────────────────────────
     case SYS_SLS_LOAD:
         return sys_sls_load((const char*)arg,

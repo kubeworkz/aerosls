@@ -281,6 +281,66 @@ void process_exit(uint32_t exit_code) {
     kernel_serial_print("[PROC] exit: no active Ring-3 process found.\n");
 }
 
+// ─── schedule_ring3 ──────────────────────────────────────────────────────────
+// Called from isr32_stub (Ring-3 timer preemption path).
+// ctx_rsp points to a 20-qword area on the interrupt stack:
+//   [0..14] = GPRs in struct TaskContext order (r15 first, rax last)
+//   [15..19] = CPU iretq frame (rip, cs, rflags, user_rsp, user_ss)
+//
+// Round-robin between RUNNING/SUSPENDED Ring-3 processes.
+// Writes the chosen process's context to the interrupt stack and returns
+// ctx_rsp (same pointer; caller pops GPRs + iretq from the updated stack).
+uint64_t schedule_ring3(uint64_t ctx_rsp) {
+    uint64_t* frame = (uint64_t*)ctx_rsp;
+
+    // Find current running Ring-3 process
+    struct ProcessDescriptor* current = NULL;
+    int current_idx = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active &&
+            proc_table[i].state == PROC_RUNNING &&
+            proc_table[i].kernel_rsp != 0) {
+            current     = &proc_table[i];
+            current_idx = i;
+            break;
+        }
+    }
+    if (!current) return ctx_rsp;  /* nothing to schedule */
+
+    // Save current Ring-3 context from interrupt stack
+    uint64_t* dst = (uint64_t*)&current->ring3_ctx;
+    for (int i = 0; i < 20; i++) dst[i] = frame[i];
+    current->state = PROC_SUSPENDED;
+
+    // Round-robin: find next SUSPENDED Ring-3 process (wrap around)
+    struct ProcessDescriptor* next = NULL;
+    for (int i = 1; i < PROC_MAX; i++) {
+        int idx = (current_idx + i) % PROC_MAX;
+        if (proc_table[idx].active &&
+            proc_table[idx].state == PROC_SUSPENDED &&
+            proc_table[idx].kernel_rsp != 0) {
+            next = &proc_table[idx];
+            break;
+        }
+    }
+
+    if (!next) {
+        // Only one Ring-3 process — resume it immediately
+        current->state = PROC_RUNNING;
+        return ctx_rsp;   /* frame already has correct context */
+    }
+
+    // Replace interrupt stack with next process's saved context
+    uint64_t* src = (uint64_t*)&next->ring3_ctx;
+    for (int i = 0; i < 20; i++) frame[i] = src[i];
+    next->state = PROC_RUNNING;
+
+    // Switch to the next process's page table
+    __asm__ volatile("mov %0, %%cr3" : : "r"(next->cr3) : "memory");
+
+    return ctx_rsp;
+}
+
 // ─── process_kill ─────────────────────────────────────────────────────────────
 void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {

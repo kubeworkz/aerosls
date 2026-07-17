@@ -58,14 +58,15 @@ int memcmp(const void* a, const void* b, size_t n) {
 // ─── Page fault handler ───────────────────────────────────────────────────────
 // Called from isr14_stub.  Error code bit 2 (U/S): set = Ring-3 fault → kill
 // the process and return to kernel.  Clear = kernel fault → panic.
-void handle_page_fault(unsigned long error_code) {
+void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
     unsigned long faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
 
     if (error_code & 0x4) {
         kernel_serial_printf(
-            "[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx  — killing process.\n",
-            error_code, faulting_address);
+            "[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx  rip=0x%016lx  — killing process.\n",
+            error_code, faulting_address, saved_rip);
+        process_exit(139);
         process_exit(139);   /* SIGSEGV-equivalent */
         /* process_exit() restores kernel context and does not return here */
     }

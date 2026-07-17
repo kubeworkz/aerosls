@@ -39,14 +39,18 @@ syscall_entry_stub:
     mov [gs:0], rsp
     mov rsp, [gs:8]
 
+    ; Save callee-saved regs (C ABI requires caller to preserve these).
+    ; Also save RCX (user RIP) and R11 (user RFLAGS) which SYSCALL destroys.
+    ; Caller-saved regs (R8-R10, RSI, RDX, RDI) are NOT preserved here —
+    ; user programs must list them as clobbers in their inline asm.
     push rbp
     push rbx
     push r12
     push r13
     push r14
     push r15
-    push rcx
-    push r11
+    push rcx       ; user RIP (set by CPU on SYSCALL)
+    push r11       ; user RFLAGS
 
     ; ── Route on syscall number in RAX ───────────────────────────────────────
     cmp rax, 105

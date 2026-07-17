@@ -67,13 +67,21 @@ static inline void sls_memset(void *dst, int val, size_t n) {
 }
 
 /* ── Raw syscall ────────────────────────────────────────────────────────── */
+/* Clobber list tells GCC which registers the kernel may modify.
+ * RAX = return value (output).  RCX and R11 are trashed by the CPU's
+ * SYSCALL/SYSRETQ mechanism.  R8-R10, RSI, RDX are caller-saved in the C
+ * ABI and not preserved by our kernel stub — list them so GCC spills any
+ * live values around each syscall. */
 static inline uint64_t _sls_syscall(uint64_t num, void *arg) {
     uint64_t ret;
     __asm__ volatile (
         "syscall"
         : "=a" (ret)
         : "a"  (num), "D" (arg)
-        : "rcx", "r11", "memory"
+        : "rcx", "r11",
+          "r8", "r9", "r10",
+          "rsi", "rdx",
+          "memory"
     );
     return ret;
 }

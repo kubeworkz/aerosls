@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "scheduler.h"   /* struct TaskContext */
 
 // ─── Process states ───────────────────────────────────────────────────────────
 typedef enum {
@@ -35,6 +36,7 @@ struct ProcessDescriptor {
     uint64_t   user_stack_phys;       // physical base of the stack allocation
     uint64_t   kernel_rsp;            // saved kernel RSP — restored on exit
     uint64_t   kernel_cr3;            // saved kernel CR3 — restored on exit
+    struct TaskContext ring3_ctx;     // full Ring-3 context saved by timer ISR
     uint32_t   owner_uid;
     ProcState  state;
     uint8_t    active;
@@ -67,8 +69,14 @@ void     sys_sls_proc_list(void);
 uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
 
 // Kernel-side exit handler: restores kernel context saved by kernel_enter_ring3.
-// Called from SYS_SLS_EXIT syscall dispatch.
 void process_exit(uint32_t exit_code);
+
+// Called from isr32_stub when a Ring-3 timer interrupt fires.
+// Saves the current Ring-3 process context from the interrupt stack,
+// selects the next Ring-3 process (or the same if only one), writes its
+// context back to the interrupt stack, and returns the interrupt RSP
+// (unchanged — the interrupt stack is the arena for all context frames).
+uint64_t schedule_ring3(uint64_t ctx_rsp);
 
 // Low-level: save kernel RSP/CR3, enter user space via sysretq.
 // Returns after process_exit() restores the kernel continuation.

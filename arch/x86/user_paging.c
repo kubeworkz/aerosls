@@ -18,7 +18,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
 }
 
 // ─── Kernel syscall stack (used by the swapgs RSP swap) ──────────────────────
-static uint8_t kernel_syscall_stack[4096] __attribute__((aligned(16)));
+static uint8_t kernel_syscall_stack[8192] __attribute__((aligned(16)));
 
 // ─── syscall_gate_init ────────────────────────────────────────────────────────
 // Must be called once by the BSP during kernel_main before entering Ring-3.

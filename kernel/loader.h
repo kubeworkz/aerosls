@@ -7,7 +7,7 @@
 
 // ─── Binary store ─────────────────────────────────────────────────────────────
 #define LOADER_MAX_BINARY_SIZE  16384   // 16 KiB per service binary (reduced from 64)
-#define MAX_SERVICE_BINARIES    4
+#define MAX_SERVICE_BINARIES    16
 
 struct ServiceBinary {
     char     object_name[PROC_NAME_LEN];
