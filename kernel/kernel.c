@@ -11,6 +11,7 @@
 #include "../arch/x86/isr_stubs.h"
 #include "timer.h"
 #include "process.h"
+#include "partition.h"
 #include "loader.h"
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
@@ -125,6 +126,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4c. Process manager ────────────────────────────────────────────
     process_init();
+
+    // ── 4c-bis. LPAR groundwork: partition table (Phase 8) ─────────────────
+    partition_init();
 
     // ── 4d. Service binary loader ───────────────────────────────────────────
     loader_init();

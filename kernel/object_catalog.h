@@ -88,6 +88,9 @@ struct SLSObjectEntry {
     SLSRole        owner_role;
     uint32_t       perm_mask;
     uint8_t        active;
+    uint32_t       partition_id;            // Phase 8 (LPAR groundwork) — see partition.h;
+                                             // 0 (PARTITION_SYSTEM/DEFAULT) for every object
+                                             // predating Phase 8, by struct zero-init
 };
 
 // ─── Role Assignment Table ────────────────────────────────────────────────────
@@ -155,6 +158,10 @@ struct SLSVallocRequest {
     uint32_t      size_pages;
     uint32_t      owner_uid;
     uint32_t      perm_mask;
+    uint32_t      partition_id;   // Phase 8: which partition's SLS this object lives
+                                   // in; 0 (PARTITION_SYSTEM/DEFAULT) if the caller
+                                   // doesn't set it (zero-initialized request struct),
+                                   // matching every pre-Phase-8 valloc call site exactly
 };
 
 struct SLSRecordRequest {
@@ -209,6 +216,10 @@ extern uint32_t               object_catalog_count;
 
 uint64_t sys_sls_valloc(struct SLSVallocRequest* req);
 uint64_t sys_sls_vfree(const char* name);
+// Phase 14 (LPAR): destroys every catalog object belonging to partition_id
+// in one pass (mirrors sys_sls_vfree()'s per-entry actions). Returns the
+// number of objects freed. Called from partition_destroy().
+uint32_t catalog_vfree_partition(uint32_t partition_id);
 void     sys_sls_obj_list(void);
 uint64_t sys_sls_obj_stat(const char* name);
 uint64_t sys_sls_role_set(struct SLSRoleRequest* req);

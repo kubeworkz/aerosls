@@ -273,6 +273,7 @@ void sls_shell_loop(void) {
             req.size_pages = sh_atoi(p) ? sh_atoi(p) : 1;
             req.owner_uid  = current_session_uid;
             req.perm_mask  = PERM_RWX;
+            req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
             do_syscall(SYS_SLS_VALLOC, &req);
         }
 
@@ -514,6 +515,7 @@ void sls_shell_loop(void) {
             req.size_pages = 1;
             req.owner_uid  = current_session_uid;
             req.perm_mask  = 0;
+            req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
             sys_sls_valloc(&req);
             kernel_serial_printf("[JOURNAL] Created journal '%s'.\n", name);
         }

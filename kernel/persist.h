@@ -24,7 +24,12 @@
 //
 //  LBA 5248  PERSIST_PROG_HDR_LBA  1 frame   — programs header
 //  LBA 5256  PERSIST_PROG_DAT_LBA 65 frames  — service_binaries[16] (~257 KiB)
-//  (end LBA 5776 — 2416 sectors free before STREAM_DIR_LBA 8192)
+//  (end LBA 5776)
+//
+//  LBA 5792  PERSIST_PART_HDR_LBA    1 frame — partitions header
+//  LBA 5800  PERSIST_PART_ENT_LBA    1 frame — partition_table[16]        (~640 B)
+//  LBA 5808  PERSIST_PART_ASSIGN_LBA 1 frame — partition_assign_table[64] (~768 B)
+//  (end LBA 5816 — 2376 sectors free before STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
@@ -39,12 +44,17 @@
 #define PERSIST_PROG_HDR_LBA  5248ULL
 #define PERSIST_PROG_DAT_LBA  5256ULL
 
+#define PERSIST_PART_HDR_LBA    5792ULL
+#define PERSIST_PART_ENT_LBA    5800ULL
+#define PERSIST_PART_ASSIGN_LBA 5808ULL
+
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.
 #define PERSIST_MAGIC_CAT   0xCAFE000000000001ULL
 #define PERSIST_MAGIC_REC   0xCAFE000000000002ULL
 #define PERSIST_MAGIC_SCH   0xCAFE000000000003ULL
 #define PERSIST_MAGIC_PROG  0xCAFE000000000004ULL
+#define PERSIST_MAGIC_PART  0xCAFE000000000005ULL
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -71,5 +81,10 @@ void persist_schemas(void);
 // Snapshot service_binaries[] → NVMe.
 // Call after the final chunk (is_last=1) is written in sys_sls_upload_binary.
 void persist_programs(void);
+
+// Snapshot partition_table[] + partition_assign_table[] → NVMe. Phase 10
+// (LPAR persistence). Call after every successful partition_create() /
+// partition_assign_uid().
+void persist_partitions(void);
 
 #endif /* PERSIST_H */

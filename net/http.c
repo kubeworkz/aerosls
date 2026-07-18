@@ -668,6 +668,7 @@ static int api_program_create(const char* body, char* buf, int max) {
     struct SLSVallocRequest req;
     req.owner_uid = 0;
     req.perm_mask = PERM_READ | PERM_EXECUTE | PERM_OWNER;
+    req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
     req.type      = OBJ_TYPE_PROGRAM;
     req.name[0]   = '\0';
     json_str(body, "name", req.name, OBJECT_NAME_LEN);
@@ -932,6 +933,7 @@ static int api_valloc_post(const char* body, char* buf, int max) {
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSVallocRequest req;
     req.owner_uid = 0; req.perm_mask = 0;
+    req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
     json_str(body, "name", req.name, OBJECT_NAME_LEN);
     req.type       = (SLSObjectType)json_int(body, "type");
     req.size_pages = (uint32_t)json_int(body, "pages");

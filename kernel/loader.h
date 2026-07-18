@@ -151,9 +151,17 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req);
 // Load the binary for the named SERVICE_PROCESS object into the process's page
 // table.  Returns the detected entry point (e_entry for ELF, base_vaddr for flat).
 // Returns 0 on failure.
+//
+// partition_id (Phase 13, LPAR): the spawning process's partition, used to
+// quota-check the ELF64/flat segment frames this function allocates —
+// these are the per-binary, potentially-large frame allocations Phase 13
+// exists to cap. Unused for the TIMI branch (timi_translate_and_map()'s
+// frames come from the shared, deliberately partition-agnostic activation
+// cache — see frame_pool.h's header comment).
 uint64_t loader_load_into_process(const char* object_name,
                                    uint64_t base_vaddr,
-                                   uint64_t* pml4);
+                                   uint64_t* pml4,
+                                   uint32_t partition_id);
 
 // Load the demo binary into a named object, then spawn the process
 uint64_t sys_sls_load(const char* object_name, uint32_t owner_uid);

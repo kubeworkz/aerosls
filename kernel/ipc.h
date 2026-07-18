@@ -115,6 +115,10 @@ extern struct IPCQueue ipc_queues[IPC_NUM_QUEUES];
 extern struct IPCStats ipc_stats;
 extern struct IPCQueue ipc_user_queues[IPC_USER_NUM_PORTS];
 extern uint32_t        ipc_user_port_pid[IPC_USER_NUM_PORTS]; /* 0 = unbound */
+extern uint32_t        ipc_user_port_partition[IPC_USER_NUM_PORTS]; /* Phase 11 (LPAR):
+                          partition_id of the binding pid, set alongside
+                          ipc_user_port_pid at bind time; meaningless
+                          (never consulted) while the port is unbound. */
 
 void ipc_init(void);
 int  ipc_post(uint16_t port, const struct IPCMessage* msg);
@@ -124,7 +128,9 @@ int  ipc_queue_depth(uint16_t port);
 // User-space IPC handlers (called from syscall_dispatch)
 int  ipc_user_bind(uint16_t port, uint32_t pid);
 int  ipc_user_send(const struct IPCUserSendReq* req, uint32_t src_pid);
-int  ipc_user_recv(struct IPCUserRecvReq* req);
+// Phase 11 (LPAR): caller_pid identifies who's asking, so a bound port can
+// be gated on partition — see ipc.c's ipc_user_recv() for the check.
+int  ipc_user_recv(struct IPCUserRecvReq* req, uint32_t caller_pid);
 
 // Kernel syscall handler
 uint64_t sys_sls_ipc_post(struct IPCPostRequest* req);

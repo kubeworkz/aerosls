@@ -2,14 +2,22 @@
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "loader.h"
+#include "partition.h"
+#include "frame_pool.h"
 #include "../arch/x86/user_paging.h"
-
-extern void* allocate_physical_ram_frame(void);
+#include "../user/permissions.h"
 
 struct ProcessDescriptor proc_table[PROC_MAX];
 uint32_t                 proc_count = 0;
 
 static uint32_t next_pid = 100;   // PIDs start above the microkernel service PIDs
+
+// Phase 12 (LPAR): per-partition scheduling cursor — see the definitions
+// near pick_next_partition()/pick_next_process_in_partition() below for
+// the full design note. Declared here (with proc_table/next_pid) rather
+// than next to its user functions purely so process_init() below, which
+// resets it, doesn't need a forward declaration.
+static int g_last_index_in_partition[PARTITION_MAX];
 
 // Virtual address at which user process code is mapped.
 // Must be a canonical user-space address (bit 47 = 0, bits 63:48 = 0).
@@ -30,6 +38,10 @@ static void pr_strcpy(char* d, const char* s, size_t n) {
 // ─── process_init ─────────────────────────────────────────────────────────────
 void process_init(void) {
     for (int i = 0; i < PROC_MAX; i++) proc_table[i].active = 0;
+    // Phase 12: -1 = "never scheduled from this partition yet" for every
+    // partition's round-robin cursor (BSS zero-init would give 0, a real
+    // proc_table[] index, not a sentinel — must be set explicitly).
+    for (int i = 0; i < PARTITION_MAX; i++) g_last_index_in_partition[i] = -1;
     kernel_serial_print("[PROC] Ring-3 process manager initialised.\n");
 }
 
@@ -55,6 +67,26 @@ uint32_t process_create(struct ProcCreateRequest* req) {
         return 0;
     }
 
+    // Phase 9 (LPAR): authority-checked spawn. Process spawning never went
+    // through the Phase 6/7 authority model at all before this — a real,
+    // pre-existing gap, not a regression. catalog_check_access() folds in
+    // Phase 8's partition boundary automatically (it's the outermost check
+    // inside that function), so this one call closes both gaps at once:
+    // a uid outside this object's partition, or one without EXECUTE
+    // permission on it, is now denied instead of always succeeding.
+    if (!catalog_check_access(req->owner_uid, req->object_name, PERM_EXECUTE)) {
+        kernel_serial_printf(
+            "[PROC] create: uid %u denied execute access to '%s'.\n",
+            req->owner_uid, req->object_name);
+        return 0;
+    }
+
+    // Phase 13 (LPAR): resolved once, up front, so it can be used both for
+    // the quota-checked frame allocations below and the descriptor's
+    // partition_id field at step 6 — avoids a second partition_get_for_uid()
+    // lookup and guarantees both uses agree.
+    uint32_t spawn_partition_id = partition_get_for_uid(req->owner_uid);
+
     // 2. Find a free process slot
     struct ProcessDescriptor* pd = 0;
     for (int i = 0; i < PROC_MAX; i++) {
@@ -78,7 +110,8 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     //    If no binary is registered yet, map empty execute pages (allows
     //    a later 'upload' + 'load' to populate the frames).
     uint64_t entry_rip = loader_load_into_process(
-                             req->object_name, obj->base_vaddr, pml4);
+                             req->object_name, obj->base_vaddr, pml4,
+                             spawn_partition_id);
 
     if (!entry_rip) {
         // No binary: fall back to empty executable pages so the descriptor
@@ -87,7 +120,10 @@ uint32_t process_create(struct ProcCreateRequest* req) {
             "[PROC] '%s': no binary loaded — process created with empty pages.\n",
             req->object_name);
         for (uint32_t p = 0; p < obj->size_pages; p++) {
-            void* frame = allocate_physical_ram_frame();
+            // Phase 13 (LPAR): quota-checked — an unbounded object size_pages
+            // is exactly the kind of tenant-attributable, unboundedly-large
+            // allocation this phase's quota exists to cap.
+            void* frame = allocate_physical_ram_frame_for_partition(spawn_partition_id);
             if (!frame) break;
             user_map_page(pml4, obj->base_vaddr + (uint64_t)p * 4096,
                           (uint64_t)(uintptr_t)frame,
@@ -99,7 +135,8 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     // 5. Allocate and map a user-space stack
     uint64_t stack_vaddr = obj->base_vaddr + (uint64_t)obj->size_pages * 4096 + 4096;
     for (uint32_t p = 0; p < PROC_USER_STACK_PAGES; p++) {
-        void* frame = allocate_physical_ram_frame();
+        // Phase 13 (LPAR): quota-checked, same rationale as above.
+        void* frame = allocate_physical_ram_frame_for_partition(spawn_partition_id);
         if (!frame) break;
         user_map_page(pml4, stack_vaddr + p * 4096,
                       (uint64_t)(uintptr_t)frame,
@@ -115,6 +152,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     pd->user_rip        = entry_rip;
     pd->user_rsp        = user_rsp;
     pd->owner_uid       = req->owner_uid;
+    pd->partition_id    = spawn_partition_id;   // Phase 9, resolved once at Phase 13
     pd->state           = PROC_RUNNING;
     pd->active          = 1;
     proc_count++;
@@ -168,6 +206,18 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
         return 0;
     }
 
+    // Phase 9 (LPAR): authority-checked spawn — same gate and rationale as
+    // process_create() above; folds in Phase 8's partition boundary too.
+    if (!catalog_check_access(owner_uid, object_name, PERM_EXECUTE)) {
+        kernel_serial_printf(
+            "[PROC] program_spawn: uid %u denied execute access to '%s'.\n",
+            owner_uid, object_name);
+        return 0;
+    }
+
+    // Phase 13 (LPAR): resolved once, same rationale as process_create().
+    uint32_t spawn_partition_id = partition_get_for_uid(owner_uid);
+
     // 2. Find a free process slot
     struct ProcessDescriptor* pd = 0;
     for (int i = 0; i < PROC_MAX; i++) {
@@ -192,7 +242,8 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
     //    OBJ_TYPE_PROGRAM pages get NX cleared only for executable segments —
     //    data/BSS segments keep NX set, enforcing W^X at the page level.
     uint64_t entry_rip = loader_load_into_process(
-                             object_name, USER_PROC_CODE_BASE, pml4);
+                             object_name, USER_PROC_CODE_BASE, pml4,
+                             spawn_partition_id);
     if (!entry_rip) {
         kernel_serial_printf(
             "[PROC] program_spawn: '%s' has no binary. "
@@ -206,7 +257,8 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
                         + (uint64_t)obj->size_pages * 4096
                         + 4096; /* guard page */
     for (uint32_t p = 0; p < PROC_USER_STACK_PAGES; p++) {
-        void* frame = allocate_physical_ram_frame();
+        // Phase 13 (LPAR): quota-checked, same rationale as process_create().
+        void* frame = allocate_physical_ram_frame_for_partition(spawn_partition_id);
         if (!frame) break;
         user_map_page(pml4, stack_base + (uint64_t)p * 4096,
                       (uint64_t)(uintptr_t)frame,
@@ -223,6 +275,7 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
     pd->user_rip     = entry_rip;
     pd->user_rsp     = user_rsp;
     pd->owner_uid    = owner_uid;
+    pd->partition_id = spawn_partition_id;   // Phase 9, resolved once at Phase 13
     pd->state        = PROC_RUNNING;
     pd->active       = 1;
     proc_count++;
@@ -301,15 +354,121 @@ void process_exit(uint32_t exit_code) {
     kernel_serial_print("[PROC] exit: no active Ring-3 process found.\n");
 }
 
+// ─── Phase 12 (LPAR): partition-fair scheduling helpers ─────────────────────
+// Both are pure functions of proc_table[]'s current state — no interrupt-
+// frame or CR3 manipulation — deliberately factored out of schedule_ring3()
+// so the fairness algorithm itself can be exercised by a host-side unit
+// test. schedule_ring3() as a whole can't be: its tail unconditionally
+// executes a privileged `mov cr3` instruction that would fault outside
+// ring 0, so nothing that reaches that line is safely host-callable. See
+// AeroSLS-LPAR-Roadmap-v0.1.md §6.
+//
+// The problem this closes: the pre-Phase-12 flat round robin visited every
+// active proc_table[] slot once per cycle regardless of partition, which
+// gives each PROCESS an equal share but not each PARTITION one — a
+// partition with 10 processes collectively gets 10x the CPU turns of a
+// sibling partition with 1, even though "one partition shouldn't be able
+// to buy more CPU share just by spawning more processes" is exactly the
+// property partition isolation is supposed to provide. The fix: round-
+// robin across PARTITIONS first (skipping ones with nothing runnable),
+// then round-robin within the chosen partition's processes — so a
+// partition with 1 runnable process gets the same fraction of scheduling
+// turns as a sibling with 10, and each of those 10 individually gets a
+// smaller share of their partition's turn instead of the same share as
+// the lone process next door.
+//
+// g_last_partition_scheduled persists across calls (module-level, same
+// lifetime as proc_table[] itself) so consecutive picks rotate forward
+// through partitions instead of re-deriving from scratch each tick.
+static uint32_t g_last_partition_scheduled = PARTITION_SYSTEM;
+
+// Finds the next partition (after `last_partition`, wrapping, inclusive of
+// revisiting `last_partition` itself once nothing else remains) that has
+// at least one active, PROC_SUSPENDED, kernel_rsp!=0 process — i.e. a
+// process schedule_ring3() could actually switch to. Returns 1 and sets
+// *out_partition on success, 0 if no partition has anything runnable
+// (mirrors the pre-Phase-12 "!next" fallback one level up).
+static int pick_next_partition(uint32_t last_partition, uint32_t* out_partition) {
+    for (uint32_t p = 1; p <= PARTITION_MAX; p++) {
+        uint32_t candidate = (last_partition + p) % PARTITION_MAX;
+        // Phase 14 (LPAR): a paused partition is skipped entirely, without
+        // even scanning its processes -- pause is a scheduling exclusion,
+        // not a "nothing runnable" state, so this check comes before the
+        // inner scan rather than folding into its condition.
+        if (partition_is_paused(candidate)) continue;
+        for (int i = 0; i < PROC_MAX; i++) {
+            if (proc_table[i].active &&
+                proc_table[i].state == PROC_SUSPENDED &&
+                proc_table[i].kernel_rsp != 0 &&
+                proc_table[i].partition_id == candidate) {
+                *out_partition = candidate;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Per-partition round-robin cursor (declared up top with proc_table[],
+// initialized to -1 for every entry in process_init()): the proc_table[]
+// index last scheduled FROM each partition, tracked independently per
+// partition_id (-1 = never scheduled from yet).
+//
+// This replaces an earlier version of pick_next_process_in_partition()
+// that searched from the shared `current_idx` instead — real execution
+// (a host-side unit test threading consecutive schedule_ring3()-style
+// ticks together, see scheduler_fairness_host_test.c) caught a genuine
+// starvation bug in that version: with proc_table laid out as [SYSTEM,
+// SYSTEM, SYSTEM, SYSTEM, SYSTEM, other-partition], alternating between
+// PARTITION_SYSTEM and the other partition made current_idx bounce
+// between exactly two values (0 and 5) forever, and PARTITION_SYSTEM's
+// wraparound scan from current_idx=5 always landed on slot 0 first no
+// matter how many ticks ran — slots 1-4 were never reached, in an
+// infinite loop. A per-partition cursor doesn't have this failure mode:
+// each partition remembers its OWN last-scheduled index independent of
+// which OTHER partition ran in between, so PARTITION_SYSTEM's rotation
+// (0, 1, 2, 3, 4, 0, ...) keeps advancing regardless of how many times
+// some other partition's turn interleaves with it. Same category of bug
+// as Phase 5's reg_disp() off-by-one and Phase 6's RV64 jalr bug — caught
+// by execution, not visible from reading the code.
+
+// Within `partition_id` only, finds the next runnable process after that
+// partition's own cursor (wrapping), never returning `exclude_idx` (the
+// process schedule_ring3() just preempted — same "don't immediately
+// reschedule the process we just suspended" property the pre-Phase-12
+// flat scan had, preserved here as an explicit parameter instead of an
+// implicit search-base). Returns the proc_table[] index and advances that
+// partition's cursor to it, or -1 if partition_id has no other eligible
+// process (the sole survivor in a single-process partition, after
+// excluding itself — schedule_ring3()'s existing "!next -> resume
+// current immediately" fallback handles that case, unchanged).
+static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx) {
+    int start = g_last_index_in_partition[partition_id];
+    for (int step = 1; step <= PROC_MAX; step++) {
+        int idx = (start + step) % PROC_MAX;
+        if (idx == exclude_idx) continue;
+        if (proc_table[idx].active &&
+            proc_table[idx].state == PROC_SUSPENDED &&
+            proc_table[idx].kernel_rsp != 0 &&
+            proc_table[idx].partition_id == partition_id) {
+            g_last_index_in_partition[partition_id] = idx;
+            return idx;
+        }
+    }
+    return -1;
+}
+
 // ─── schedule_ring3 ──────────────────────────────────────────────────────────
 // Called from isr32_stub (Ring-3 timer preemption path).
 // ctx_rsp points to a 20-qword area on the interrupt stack:
 //   [0..14] = GPRs in struct TaskContext order (r15 first, rax last)
 //   [15..19] = CPU iretq frame (rip, cs, rflags, user_rsp, user_ss)
 //
-// Round-robin between RUNNING/SUSPENDED Ring-3 processes.
-// Writes the chosen process's context to the interrupt stack and returns
-// ctx_rsp (same pointer; caller pops GPRs + iretq from the updated stack).
+// Partition-fair round-robin (Phase 12) between RUNNING/SUSPENDED Ring-3
+// processes — see pick_next_partition()/pick_next_process_in_partition()
+// above for the algorithm. Writes the chosen process's context to the
+// interrupt stack and returns ctx_rsp (same pointer; caller pops GPRs +
+// iretq from the updated stack).
 uint64_t schedule_ring3(uint64_t ctx_rsp) {
     uint64_t* frame = (uint64_t*)ctx_rsp;
 
@@ -332,15 +491,15 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
     for (int i = 0; i < 20; i++) dst[i] = frame[i];
     current->state = PROC_SUSPENDED;
 
-    // Round-robin: find next SUSPENDED Ring-3 process (wrap around)
+    // Phase 12: pick a partition first (round-robin, skipping ones with
+    // nothing runnable), then pick a process within it.
     struct ProcessDescriptor* next = NULL;
-    for (int i = 1; i < PROC_MAX; i++) {
-        int idx = (current_idx + i) % PROC_MAX;
-        if (proc_table[idx].active &&
-            proc_table[idx].state == PROC_SUSPENDED &&
-            proc_table[idx].kernel_rsp != 0) {
-            next = &proc_table[idx];
-            break;
+    uint32_t chosen_partition;
+    if (pick_next_partition(g_last_partition_scheduled, &chosen_partition)) {
+        int next_idx = pick_next_process_in_partition(chosen_partition, current_idx);
+        if (next_idx >= 0) {
+            next = &proc_table[next_idx];
+            g_last_partition_scheduled = chosen_partition;
         }
     }
 
@@ -391,6 +550,24 @@ void process_kill(uint32_t pid) {
         return;
     }
     kernel_serial_printf("[PROC] kill: PID %u not found.\n", pid);
+}
+
+// ─── process_kill_partition ────────────────────────────────────────────────────
+// Phase 14 (LPAR): kills every active process whose partition_id matches,
+// reusing process_kill() per-pid (rather than duplicating its ZOMBIE/active
+// bookkeeping here) as the roadmap's scope explicitly called for. Pids are
+// collected into a snapshot first, then killed, so the "who matches" scan
+// and the mutation itself stay clearly separate. Returns the number killed.
+uint32_t process_kill_partition(uint32_t partition_id) {
+    uint32_t pids[PROC_MAX];
+    int n = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].partition_id == partition_id) {
+            pids[n++] = proc_table[i].pid;
+        }
+    }
+    for (int i = 0; i < n; i++) process_kill(pids[i]);
+    return (uint32_t)n;
 }
 
 // ─── sys_sls_proc_list ────────────────────────────────────────────────────────

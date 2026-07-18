@@ -14,6 +14,7 @@
 #include "object_catalog.h"
 #include "loader.h"
 #include "kernel_io.h"
+#include "partition.h"
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -119,6 +120,24 @@ void persist_programs(void) {
     kernel_serial_print("[PERSIST] Programs snapshot written.\n");
 }
 
+// ─── persist_partitions ───────────────────────────────────────────────────────
+// Phase 10 (LPAR persistence). Writes partition_table[] and
+// partition_assign_table[] together in one header, same "two arrays, one
+// magic-tagged header" shape persist_catalog() already uses for
+// object_catalog[]/role_table[] — partition_table[]/partition_assign_table[]
+// are that same pair's sibling (defined-partitions table + uid-assignment
+// table), so the persistence shape matches on purpose.
+void persist_partitions(void) {
+    if (!io_sq || !io_cq) return;
+    uint32_t part_bytes   = (uint32_t)sizeof(partition_table);
+    uint32_t assign_bytes = (uint32_t)sizeof(partition_assign_table);
+    write_hdr(PERSIST_PART_HDR_LBA, PERSIST_MAGIC_PART,
+              part_bytes, assign_bytes, 0);
+    persist_write_array(partition_table,        part_bytes,   PERSIST_PART_ENT_LBA);
+    persist_write_array(partition_assign_table, assign_bytes, PERSIST_PART_ASSIGN_LBA);
+    kernel_serial_print("[PERSIST] Partitions snapshot written.\n");
+}
+
 // ─── persist_restore_all ─────────────────────────────────────────────────────
 // Called once at boot (kernel.c step 7b), before stream_init().
 // Each region is independently checked: a missing or mismatched magic causes
@@ -200,6 +219,31 @@ void persist_restore_all(void) {
             } else {
                 kernel_serial_print("[PERSIST] Programs: struct size mismatch — cold start.\n");
             }
+        }
+    }
+
+    // ── 5. Partitions (Phase 10) ─────────────────────────────────────────────
+    // Runs after partition_init() (kernel.c step 4c-bis) has already set up
+    // the default single-partition state — a valid snapshot here simply
+    // overwrites those defaults, same relationship persist_catalog()'s
+    // restore has with object_catalog[]'s BSS-zeroed starting state.
+    if (nvme_read_sync(PERSIST_PART_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_PART) {
+            uint32_t part_bytes, assign_bytes;
+            p_memcpy(&part_bytes,   p_buf +  8, 4);
+            p_memcpy(&assign_bytes, p_buf + 12, 4);
+            if (part_bytes   == (uint32_t)sizeof(partition_table) &&
+                assign_bytes == (uint32_t)sizeof(partition_assign_table)) {
+                persist_read_array(partition_table,        part_bytes,   PERSIST_PART_ENT_LBA);
+                persist_read_array(partition_assign_table, assign_bytes, PERSIST_PART_ASSIGN_LBA);
+                kernel_serial_print("[PERSIST] Partitions restored from NVMe.\n");
+            } else {
+                kernel_serial_print("[PERSIST] Partitions: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Partitions: no snapshot — cold start.\n");
         }
     }
 }

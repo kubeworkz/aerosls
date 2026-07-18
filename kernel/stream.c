@@ -140,6 +140,7 @@ void stream_init(void) {
                     req.size_pages = 1;
                     req.owner_uid  = 0;
                     req.perm_mask  = PERM_READ | PERM_OWNER;
+                    req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
                     sys_sls_valloc(&req);
                     // Metadata records are re-inserted so DB hooks see them
                     struct SLSRecordRequest mr;
@@ -210,6 +211,7 @@ int stream_create(const char* name, const char* mime_type) {
             req.size_pages = 1;
             req.owner_uid  = 0;
             req.perm_mask  = PERM_READ | PERM_OWNER;
+            req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
             uint64_t id = sys_sls_valloc(&req);
             if (id) {
                 struct SLSRecordRequest mr;

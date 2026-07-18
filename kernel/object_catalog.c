@@ -5,6 +5,7 @@
 #include "index_mgr.h"
 #include "constraint.h"
 #include "mqt.h"
+#include "partition.h"
 #include "../user/permissions.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
@@ -109,6 +110,16 @@ int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_per
 
     struct SLSObjectEntry* e = &object_catalog[idx];
 
+    // Phase 8 (LPAR groundwork): partition boundary — the outermost check
+    // below the kernel-always-passes rule above, ahead of even the owner
+    // check. A uid outside an object's partition is denied regardless of
+    // ownership/role — partition isolation is meant to model a hypervisor-
+    // level boundary, stronger than any in-partition authority rule. Every
+    // pre-Phase-8 object/uid defaults to partition 0 (PARTITION_SYSTEM ==
+    // PARTITION_DEFAULT), so this is a no-op unless partitions are
+    // explicitly created and used — see partition.h's top comment.
+    if (e->partition_id != partition_get_for_uid(uid)) return 0;
+
     // Owner always has full access to their own object
     if (e->owner_uid == uid) return 1;
 
@@ -190,6 +201,17 @@ uint64_t sys_sls_valloc(struct SLSVallocRequest* req) {
     e->owner_role   = catalog_get_role(req->owner_uid);
     e->perm_mask    = req->perm_mask ? req->perm_mask
                                      : (PERM_READ | PERM_WRITE | PERM_OWNER);
+    // Phase 8: if the caller didn't set partition_id explicitly (0 — the
+    // same "0 means use a sensible default" idiom as perm_mask above),
+    // default to the owner's own assigned partition rather than hardcoding
+    // PARTITION_SYSTEM. This matters: catalog_check_access()'s partition
+    // check runs before the owner check, so defaulting to a fixed 0 would
+    // silently lock an owner in a non-system partition out of their own
+    // freshly-created object. An explicit non-zero partition_id still
+    // overrides (e.g. a provisioning process placing an object into a
+    // partition other than its own).
+    e->partition_id = req->partition_id ? req->partition_id
+                                        : partition_get_for_uid(req->owner_uid);
     e->active       = 1;
 
     // Initialise an empty record store for this slot
@@ -224,6 +246,26 @@ uint64_t sys_sls_vfree(const char* name) {
                          name);
     persist_catalog();
     return 0;
+}
+
+// ─── Phase 14 (LPAR): catalog_vfree_partition ─────────────────────────────────
+// Destroys every active catalog object whose partition_id matches, mirroring
+// sys_sls_vfree()'s exact per-entry actions (active=0, field_count=0) but
+// batched into one persist_catalog() call at the end instead of one per
+// object. Called from partition_destroy() as one of its teardown steps.
+uint32_t catalog_vfree_partition(uint32_t partition_id) {
+    uint32_t freed = 0;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (!object_catalog[i].active) continue;
+        if (object_catalog[i].partition_id != partition_id) continue;
+        kernel_serial_printf("[CATALOG] vfree (partition %u teardown): '%s'\n",
+                             (unsigned)partition_id, object_catalog[i].name);
+        object_catalog[i].active = 0;
+        object_records[i].field_count = 0;
+        freed++;
+    }
+    if (freed) persist_catalog();
+    return freed;
 }
 
 // ─── Phase 1: ls objects ──────────────────────────────────────────────────────

@@ -5,9 +5,7 @@
 #include "process.h"
 #include "timi_translate.h"
 #include "../arch/x86/user_paging.h"
-
-// frame_pool.c has no header — declare the allocator directly
-extern void* allocate_physical_ram_frame(void);
+#include "frame_pool.h"
 
 // ─── Binary store ─────────────────────────────────────────────────────────────
 struct ServiceBinary service_binaries[MAX_SERVICE_BINARIES];
@@ -191,7 +189,8 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
 // Returns the entry point vaddr, or 0 on failure.
 uint64_t loader_load_into_process(const char* object_name,
                                    uint64_t base_vaddr,
-                                   uint64_t* pml4) {
+                                   uint64_t* pml4,
+                                   uint32_t partition_id) {
     // Find the binary
     struct ServiceBinary* sb = 0;
     for (int i = 0; i < MAX_SERVICE_BINARIES; i++) {
@@ -265,7 +264,11 @@ uint64_t loader_load_into_process(const char* object_name,
                 (phdr[ph].p_flags & PF_X) ? 'X' : '-');
 
             for (uint32_t p = 0; p < n_pages; p++) {
-                void* frame = allocate_physical_ram_frame();
+                // Phase 13 (LPAR): quota-checked — an ELF segment's page
+                // count is attacker/tenant-controlled (memsz from the
+                // uploaded binary), exactly the kind of unbounded,
+                // per-tenant growth this phase's quota exists to cap.
+                void* frame = allocate_physical_ram_frame_for_partition(partition_id);
                 if (!frame) return 0;
                 ld_memset(frame, 0, 4096);  // zero (BSS) fill
 
@@ -292,7 +295,8 @@ uint64_t loader_load_into_process(const char* object_name,
     // ── Flat binary loader ────────────────────────────────────────────────────
     uint32_t n_pages = (sb->size + 4095) / 4096;
     for (uint32_t p = 0; p < n_pages; p++) {
-        void* frame = allocate_physical_ram_frame();
+        // Phase 13 (LPAR): quota-checked, same rationale as the ELF64 loop.
+        void* frame = allocate_physical_ram_frame_for_partition(partition_id);
         if (!frame) return 0;
         ld_memset(frame, 0, 4096);
 

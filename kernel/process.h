@@ -38,6 +38,8 @@ struct ProcessDescriptor {
     uint64_t   kernel_cr3;            // saved kernel CR3 — restored on exit
     struct TaskContext ring3_ctx;     // full Ring-3 context saved by timer ISR
     uint32_t   owner_uid;
+    uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
+                                       // at spawn time — see partition.h
     ProcState  state;
     uint8_t    active;
 };
@@ -61,6 +63,11 @@ void     process_init(void);
 uint32_t process_create(struct ProcCreateRequest* req);  // returns PID or 0
 void     process_kill(uint32_t pid);
 void     sys_sls_proc_list(void);
+
+// Phase 14 (LPAR): kills every active process in partition_id, reusing
+// process_kill() per-pid. Returns the number of processes killed. Called
+// from partition_destroy().
+uint32_t process_kill_partition(uint32_t partition_id);
 
 // Spawn a Ring-3 process from an OBJ_TYPE_PROGRAM catalog object.
 // Identical pipeline to process_create() but accepts PROGRAM type,

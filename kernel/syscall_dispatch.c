@@ -11,6 +11,8 @@
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
 #include "../kernel/secure_api.h"
+#include "partition.h"
+#include "frame_pool.h"
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -130,9 +132,16 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return (uint64_t)(uint32_t)ipc_user_send(
             (const struct IPCUserSendReq*)arg, caller_pid);
     }
-    case SYS_SLS_IPC_RECV:
+    case SYS_SLS_IPC_RECV: {
         /* arg = pointer to IPCUserRecvReq (port field set by caller) */
-        return (uint64_t)ipc_user_recv((struct IPCUserRecvReq*)arg);
+        uint32_t caller_pid = 0;
+        for (int _i = 0; _i < PROC_MAX; _i++) {
+            if (proc_table[_i].active && proc_table[_i].state == PROC_RUNNING) {
+                caller_pid = proc_table[_i].pid; break;
+            }
+        }
+        return (uint64_t)ipc_user_recv((struct IPCUserRecvReq*)arg, caller_pid);
+    }
 
     // ── Phase 5: Storage Tiers (140–142) ──────────────────────────────────────
     case SYS_SLS_TIER_LIST:
@@ -218,6 +227,26 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_workflow_status((const char*)arg); return 0;
     case SYS_SLS_AGENT_SCHEDULE:
         return sys_sls_agent_schedule((struct AgentScheduleRequest*)arg);
+
+    // ── Phase 8: LPAR groundwork (210–212) ────────────────────────────────────
+    case SYS_SLS_PARTITION_CREATE:
+        return sys_sls_partition_create((struct SLSPartitionCreateRequest*)arg);
+    case SYS_SLS_PARTITION_ASSIGN:
+        return sys_sls_partition_assign((struct SLSPartitionAssignRequest*)arg);
+    case SYS_SLS_PARTITION_LIST:
+        sys_sls_partition_list(); return 0;
+
+    // ── Phase 13: LPAR physical memory quotas (213) ─────────────────────────
+    case SYS_SLS_PARTITION_QUOTA_SET:
+        return sys_sls_partition_quota_set((struct SLSPartitionQuotaSetRequest*)arg);
+
+    // ── Phase 14: LPAR partition lifecycle (214-216) ────────────────────────
+    case SYS_SLS_PARTITION_DESTROY:
+        return sys_sls_partition_destroy((uint32_t)(uintptr_t)arg);
+    case SYS_SLS_PARTITION_PAUSE:
+        return sys_sls_partition_pause((uint32_t)(uintptr_t)arg);
+    case SYS_SLS_PARTITION_RESUME:
+        return sys_sls_partition_resume((uint32_t)(uintptr_t)arg);
 
     default:
         return 0;
