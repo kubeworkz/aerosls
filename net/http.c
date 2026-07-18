@@ -643,7 +643,7 @@ static int api_programs_list(char* buf, int max) {
                 !strcmp(service_binaries[b].object_name, e->name)) {
                 bin_loaded = 1;
                 bin_size   = service_binaries[b].size;
-                bin_fmt    = service_binaries[b].is_elf ? "ELF64" : "flat";
+                bin_fmt    = binary_format_name(&service_binaries[b]);
                 break;
             }
         }
@@ -760,7 +760,7 @@ static int api_program_upload(const char* body, char* buf, int max) {
                 if (service_binaries[b].active &&
                     !strcmp(service_binaries[b].object_name, ureq.object_name)) {
                     tot_bytes = service_binaries[b].size;
-                    fmt_str   = service_binaries[b].is_elf ? "ELF64" : "flat";
+                    fmt_str   = binary_format_name(&service_binaries[b]);
                     break;
                 }
             }
@@ -868,10 +868,10 @@ static void http_respond_program_binary(int conn, struct ServiceBinary* sb) {
     while (*cd) hdr[hp++] = *cd++;
     const char* fn = sb->object_name; while (*fn) hdr[hp++] = *fn++;
     hdr[hp++] = '"'; hdr[hp++] = '\r'; hdr[hp++] = '\n';
-    /* X-Binary-Format header so the downloader knows ELF vs flat */
+    /* X-Binary-Format header so the downloader knows ELF vs flat vs TIMI */
     const char* xbf = "X-Binary-Format: ";
     while (*xbf) hdr[hp++] = *xbf++;
-    const char* fmt = sb->is_elf ? "ELF64" : "flat";
+    const char* fmt = binary_format_name(sb);
     while (*fmt) hdr[hp++] = *fmt++;
     hdr[hp++] = '\r'; hdr[hp++] = '\n';
     const char* cl = "Content-Length: "; while (*cl) hdr[hp++] = *cl++;

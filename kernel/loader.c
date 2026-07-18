@@ -3,6 +3,7 @@
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "process.h"
+#include "timi_translate.h"
 #include "../arch/x86/user_paging.h"
 
 // frame_pool.c has no header — declare the allocator directly
@@ -52,6 +53,42 @@ static void ld_memset(void* p, uint8_t v, size_t n) {
 static void ld_memcpy(void* d, const void* s, size_t n) {
     uint8_t* dd = (uint8_t*)d; const uint8_t* ss = (const uint8_t*)s;
     while (n--) *dd++ = *ss++;
+}
+
+// ─── TIMI object validation ────────────────────────────────────────────────────
+// See loader.h for the format description. Bounds-checks the header's
+// declared counts against the actual buffer size before anything downstream
+// (loader_timi_info, and eventually the Phase 3 translator) walks the
+// instruction/literal/entry arrays — a truncated or corrupted upload must
+// fail here, not read past the end of sb->data.
+int timi_validate(const uint8_t* data, uint32_t size, struct TimiObjectHeader* out_hdr) {
+    if (!data || !out_hdr || size < sizeof(struct TimiObjectHeader)) return 0;
+
+    struct TimiObjectHeader hdr;
+    ld_memcpy(&hdr, data, sizeof(hdr));
+    if (hdr.magic != TIMI_MAGIC) return 0;
+
+    // Compute the exact expected size and check it against what we actually
+    // received. Do the arithmetic in 64-bit so a maliciously/corrupt large
+    // count can't wrap a 32-bit sum back under `size` and slip past the check.
+    uint64_t expect = sizeof(struct TimiObjectHeader);
+    expect += (uint64_t)hdr.num_instr    * 8;                        // uint64_t words
+    expect += (uint64_t)hdr.num_literals * 8;                        // uint64_t words
+    expect += (uint64_t)hdr.num_entries  * sizeof(struct TimiEntryRec);
+    expect += (uint64_t)hdr.num_names    * sizeof(struct TimiNameRec); // v0.3
+
+    if (expect != (uint64_t)size) return 0;
+
+    *out_hdr = hdr;
+    return 1;
+}
+
+// ─── binary_format_name ────────────────────────────────────────────────────────
+const char* binary_format_name(const struct ServiceBinary* sb) {
+    if (!sb) return "?";
+    if (sb->is_timi) return "TIMI";
+    if (sb->is_elf)  return "ELF64";
+    return "flat";
 }
 
 // ─── loader_init ──────────────────────────────────────────────────────────────
@@ -119,18 +156,28 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
 
     if (end > sb->size) sb->size = end;
 
-    // Detect ELF magic on the first chunk
+    // Detect ELF or TIMI magic on the first chunk. Mutually exclusive —
+    // ELF_MAGIC0 (0x7F) and TIMI_MAGIC's low byte ('1' = 0x31) never collide,
+    // but check ELF first and only fall through to TIMI if it didn't match,
+    // matching the existing is_elf detection's structure.
     if (req->byte_offset == 0 && req->chunk_len >= 4) {
         sb->is_elf = (sb->data[0] == ELF_MAGIC0 &&
                       sb->data[1] == ELF_MAGIC1 &&
                       sb->data[2] == ELF_MAGIC2 &&
                       sb->data[3] == ELF_MAGIC3);
+        if (!sb->is_elf) {
+            uint32_t magic;
+            ld_memcpy(&magic, sb->data, 4);
+            sb->is_timi = (magic == TIMI_MAGIC);
+        } else {
+            sb->is_timi = 0;
+        }
     }
 
     kernel_serial_printf(
         "[LOADER] '%s': wrote %u bytes at offset %u (total=%u, %s)\n",
         req->object_name, req->chunk_len, req->byte_offset, sb->size,
-        sb->is_elf ? "ELF64" : "flat");
+        binary_format_name(sb));
 
     if (req->is_last)
         persist_programs();
@@ -159,6 +206,25 @@ uint64_t loader_load_into_process(const char* object_name,
             "[LOADER] '%s': no binary — use 'upload' or 'demo' first.\n",
             object_name);
         return 0;
+    }
+
+    // ── TIMI loader (Phase 3) ────────────────────────────────────────────────
+    // Validate, then hand off to timi_translate_and_map(), which runs the
+    // real x86-64 translator (kernel/timi_x86.c — byte-identical to the
+    // host toolchain's copy, verified there by timi-jit-test executing its
+    // output on real hardware; see AeroSLS-TIMI-ISA-v0.1.md §9) and maps
+    // the translated native code executable, exactly like the ELF64/flat
+    // paths below map their bytes. Only `.entry main` is spawnable in this
+    // v1 — see timi_translate.c's header comment.
+    if (sb->is_timi) {
+        struct TimiObjectHeader hdr;
+        if (!timi_validate(sb->data, sb->size, &hdr)) {
+            kernel_serial_printf(
+                "[LOADER] '%s': TIMI magic matched but header failed "
+                "validation (corrupt or truncated upload).\n", object_name);
+            return 0;
+        }
+        return timi_translate_and_map(object_name, base_vaddr, pml4);
     }
 
     // ── ELF64 loader ─────────────────────────────────────────────────────────
@@ -259,11 +325,72 @@ void loader_list(void) {
             " %-24s  %-8u  %-6s  yes\n",
             service_binaries[i].object_name,
             service_binaries[i].size,
-            service_binaries[i].is_elf ? "ELF64" : "flat");
+            binary_format_name(&service_binaries[i]));
         found++;
     }
     if (!found) kernel_serial_print(" (no binaries loaded)\n");
     kernel_serial_print("\n");
+}
+
+// ─── loader_timi_info ───────────────────────────────────────────────────────
+// Diagnostic dump for a TIMI object: header counts and exported entry-point
+// names. Deliberately mirrors loader_list()'s table style. This is the
+// Phase 2 stand-in for a real disassembler/debugger — the host toolchain's
+// timi-dis is still the tool of record for a full instruction listing; this
+// just confirms the kernel-side upload parsed the same object correctly.
+void loader_timi_info(const char* object_name) {
+    struct ServiceBinary* sb = 0;
+    for (int i = 0; i < MAX_SERVICE_BINARIES; i++) {
+        if (service_binaries[i].active &&
+            ld_streq(service_binaries[i].object_name, object_name)) {
+            sb = &service_binaries[i];
+            break;
+        }
+    }
+    if (!sb) {
+        kernel_serial_printf("[LOADER] timi-info: '%s' not found.\n", object_name);
+        return;
+    }
+    if (!sb->is_timi) {
+        kernel_serial_printf(
+            "[LOADER] timi-info: '%s' is not a TIMI object (format=%s).\n",
+            object_name, binary_format_name(sb));
+        return;
+    }
+
+    struct TimiObjectHeader hdr;
+    if (!timi_validate(sb->data, sb->size, &hdr)) {
+        kernel_serial_printf(
+            "[LOADER] timi-info: '%s' has TIMI magic but failed header "
+            "validation (corrupt or truncated upload, %u bytes stored).\n",
+            object_name, sb->size);
+        return;
+    }
+
+    kernel_serial_printf(
+        "\n[LOADER] TIMI object '%s'\n"
+        "  instructions : %u\n"
+        "  literals     : %u\n"
+        "  entry points : %u\n"
+        "  names (v0.3) : %u\n",
+        object_name, hdr.num_instr, hdr.num_literals, hdr.num_entries, hdr.num_names);
+
+    const struct TimiEntryRec* entries = (const struct TimiEntryRec*)
+        (sb->data + sizeof(struct TimiObjectHeader) +
+         (uint64_t)hdr.num_instr * 8 + (uint64_t)hdr.num_literals * 8);
+    for (uint32_t i = 0; i < hdr.num_entries; i++) {
+        kernel_serial_printf("    .entry %-24s -> @%u\n",
+                             entries[i].name, entries[i].offset);
+    }
+    const struct TimiNameRec* names = (const struct TimiNameRec*)
+        ((const uint8_t*)entries + (uint64_t)hdr.num_entries * sizeof(struct TimiEntryRec));
+    for (uint32_t i = 0; i < hdr.num_names; i++) {
+        kernel_serial_printf("    .name  [%u] = \"%s\"\n", i, names[i].name);
+    }
+    timi_activation_info(object_name);
+    kernel_serial_print(
+        "  (spawnable via POST /api/program/spawn — Phase 3 native translator; "
+        "v1 only translates the \".entry main\" entry point)\n\n");
 }
 
 // ─── sys_sls_load ─────────────────────────────────────────────────────────────

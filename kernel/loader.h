@@ -16,6 +16,7 @@ struct ServiceBinary {
     uint32_t size;        // bytes written so far
     uint8_t  active;
     uint8_t  is_elf;      // detected on first write
+    uint8_t  is_timi;     // detected on first write — see TIMI section below
 };
 
 // ─── Minimal ELF64 structures ─────────────────────────────────────────────────
@@ -56,6 +57,70 @@ struct ELF64ProgramHeader {
     uint64_t p_memsz;       // bytes to allocate (p_memsz - p_filesz = BSS)
     uint64_t p_align;
 } __attribute__((packed));
+
+// ─── TIMI object format (AeroSLS-TIMI-ISA-v0.1.md, Phase 2; v0.3 Phase 6) ────
+// A TIMI-format binary is the flat .tmo container produced by the Phase 1
+// host toolchain (timi-asm): a header of five little-endian u32 fields,
+// followed by the instruction stream, the literal pool, the entry-point
+// table, and (v0.3) the object-name pool, back to back. This struct layout
+// is byte-for-byte identical to `TimiObject`'s on-disk form in the host
+// tool's timi_isa.h/timi_obj.c — a .tmo produced there can be uploaded via
+// SYS_SLS_UPLOAD_BINARY unmodified.
+//
+// v0.3 (Phase 6) adds num_names + TimiNameRec, breaking the v0.2 16-byte
+// header (see timi_isa.h's top comment for why this was a clean bump
+// rather than a back-compat shim) — every .tmo in this project is
+// regenerated from source by the same toolchain, so there is nothing else
+// to keep compatible with.
+//
+// TIMI bytecode is never executed directly (ISA spec design principle #1:
+// "never interpreted, always translated"). loader_load_into_process()
+// detects and validates a TIMI payload, then hands it to
+// timi_translate_and_map() (kernel/timi_translate.c, Phase 3) to be
+// translated to real x86-64 machine code and mapped executable — the
+// bytecode words themselves are never mapped or run as-is.
+#define TIMI_MAGIC          0x314D4954u   // "TIM1", matches timi_isa.h TIMI_MAGIC
+#define TIMI_ENTRY_NAME_LEN 32            // matches host tool's TIMI_MAX_NAME
+
+struct TimiObjectHeader {
+    uint32_t magic;
+    uint32_t num_instr;
+    uint32_t num_literals;
+    uint32_t num_entries;
+    uint32_t num_names;    // v0.3
+} __attribute__((packed));
+
+struct TimiEntryRec {
+    char     name[TIMI_ENTRY_NAME_LEN];
+    uint32_t offset;   // instruction index
+} __attribute__((packed));
+
+// v0.3 (Phase 6): object-name pool entry, referenced by RESOLVE's operand.
+// Same 32-byte fixed-slot shape as TimiEntryRec, matches timi_isa.h's
+// TimiName / timi_x86.h's TxNameRec.
+struct TimiNameRec {
+    char name[TIMI_ENTRY_NAME_LEN];
+} __attribute__((packed));
+
+// Validates a TIMI payload sitting in `data` (size `size` bytes): checks the
+// magic number and that the header's declared instr/literal/entry counts
+// actually fit inside `size` (a corrupt or truncated header could otherwise
+// claim a huge instruction count and walk off the end of the buffer).
+// On success, fills `out_hdr` and returns 1. Returns 0 and leaves `out_hdr`
+// untouched on any failure.
+int  timi_validate(const uint8_t* data, uint32_t size, struct TimiObjectHeader* out_hdr);
+
+// Prints a loader_list()-style report for one TIMI object: header counts,
+// exported entry-point names, and (since Phase 3 doesn't exist yet) a
+// reminder that it can't be spawned.
+void loader_timi_info(const char* object_name);
+
+// Shared by loader_list() and the three net/http.c format-string sites so
+// TIMI uploads report correctly everywhere instead of falling through to
+// the ELF/flat ternary and showing up mislabeled as "flat".
+const char* binary_format_name(const struct ServiceBinary* sb);
+
+#define SYS_SLS_TIMI_INFO 173   // dump TIMI header/entry info for an uploaded object
 
 // ─── Syscall numbers ──────────────────────────────────────────────────────────
 #define SYS_SLS_LOAD           170   // load binary + spawn process

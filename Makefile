@@ -33,6 +33,9 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
               kernel/process.c arch/x86/user_paging.c \
               kernel/loader.c \
+              kernel/timi_x86.c \
+              kernel/timi_runtime.c \
+              kernel/timi_translate.c \
               kernel/webapp.c \
               kernel/webapp_bundle.c \
               kernel/journal.c \
@@ -166,6 +169,18 @@ user/examples/%.bin: user/examples/%.elf
 user-programs: $(USER_BINS)
 
 .PHONY: user-programs
+
+# ── TIMI host toolchain ─────────────────────────────────────────────────────
+# Assembler/interpreter/disassembler/JIT-test for TIMI bytecode (tools/timi/).
+# Builds with the host cc — no cross-compiler needed. See tools/timi/README.md.
+timi-tools:
+	$(MAKE) -C tools/timi all
+
+timi-test: timi-tools
+	$(MAKE) -C tools/timi test
+	$(MAKE) -C tools/timi test-native
+
+.PHONY: timi-tools timi-test
 
 bundle:
 	@echo "[BUNDLE] Generating kernel/webapp_bundle.c from slsos-sim/dist..."

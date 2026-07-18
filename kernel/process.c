@@ -268,7 +268,27 @@ void process_exit(uint32_t exit_code) {
 
         // Restore kernel page table and stack, then return to kernel_enter_ring3
         // caller.  The 'ret' pops the return address from [saved_rsp].
+        //
+        // Bug fix: process_exit() is reached via SYS_SLS_EXIT, i.e. through
+        // syscall_entry_stub (arch/x86/syscall.asm), which does `swapgs` on
+        // entry so [gs:0]/[gs:8] address this core's PerCPUData (user_rsp/
+        // kernel_rsp). Jumping straight back into program_spawn()'s C code
+        // here — instead of falling through to .syscall_return's matching
+        // `swapgs` — left GS_BASE/KERNEL_GS_BASE permanently swapped after
+        // the first process ever exited this way. The next process's own
+        // syscall entry then swapgs'd them the WRONG direction: GS_BASE
+        // became 0 instead of &per_cpu_data[0], so `mov rsp,[gs:8]` read
+        // from physical address 0x8 instead of the real per-CPU struct —
+        // a garbage RSP, page/general-protection fault, and eventually a
+        // triple fault. Never triggered before because nothing in this
+        // project had spawned, exited, and then spawned a second Ring-3
+        // process in the same boot session until real end-to-end TIMI
+        // verification (Phase 4) actually exercised it. The extra swapgs
+        // below restores the pre-syscall GS state exactly like
+        // .syscall_return's own swapgs would have, before this path
+        // diverges from the normal syscall return.
         __asm__ volatile(
+            "swapgs\n\t"           /* undo syscall_entry_stub's entry swapgs */
             "mov %0, %%cr3\n\t"   /* restore kernel page tables */
             "mov %1, %%rsp\n\t"   /* restore kernel stack         */
             "ret\n\t"              /* return to kernel_enter_ring3 call site */
@@ -339,6 +359,25 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(next->cr3) : "memory");
 
     return ctx_rsp;
+}
+
+// ─── process_find_current ────────────────────────────────────────────────────
+// Phase 7: identical scan to the one schedule_ring3() does internally to
+// find "the process currently executing" — active, PROC_RUNNING, and
+// actually entered via kernel_enter_ring3 (kernel_rsp != 0). Used by
+// timi_runtime.c's authority-checked RESOLVE to find the calling
+// process's owner_uid. Returns NULL when called from pure kernel context
+// (no Ring-3 process running), which callers should treat as uid 0 /
+// ROLE_SYSTEM_KERNEL — always-passes, per catalog_check_access().
+struct ProcessDescriptor* process_find_current(void) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active &&
+            proc_table[i].state == PROC_RUNNING &&
+            proc_table[i].kernel_rsp != 0) {
+            return &proc_table[i];
+        }
+    }
+    return NULL;
 }
 
 // ─── process_kill ─────────────────────────────────────────────────────────────

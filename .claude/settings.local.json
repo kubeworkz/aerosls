@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl --list --verbose)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(wsl -d Ubuntu -- bash -lc 'echo \"--- toolchain check ---\"; command -v x86_64-elf-gcc && x86_64-elf-gcc --version | head -1 || echo \"x86_64-elf-gcc: NOT FOUND\"; command -v nasm && nasm -v || echo \"nasm: NOT FOUND\"; command -v qemu-system-x86_64 && qemu-system-x86_64 --version | head -1 || echo \"qemu: NOT FOUND\"; command -v grub-mkrescue && grub-mkrescue --version || echo \"grub-mkrescue: NOT FOUND\"; command -v make && make --version | head -1 || echo \"make: NOT FOUND\"; echo \"--- repo check ---\"; ls /mnt/c/Users/kubew/aerosls2 2>&1 | head -5')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'sudo -n true 2>&1 && echo \"PASSWORDLESS_SUDO_OK\" || echo \"SUDO_NEEDS_PASSWORD\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'grep -A6 \"Installing apt prerequisites\" /mnt/c/Users/kubew/aerosls2/setup-toolchain.sh | head -8')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'for p in build-essential bison flex libgmp-dev libmpc-dev libmpfr-dev texinfo nasm wget curl; do dpkg -s $p >/dev/null 2>&1 && echo \"OK: $p\" || echo \"MISSING: $p\"; done; echo \"---\"; gcc --version | head -1; nproc; free -h | head -2')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'cd ~ && nohup ./build-toolchain.sh > ~/toolchain-build.log 2>&1 & echo \"started PID $!\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'pgrep -af \"build-toolchain|configure|make\" | head -20; echo \"---log tail---\"; tail -20 ~/toolchain-build.log 2>&1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'ls -la ~/build-toolchain.sh; echo \"exit: $?\"; echo $HOME; whoami')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'cd ~ && ./build-toolchain.sh > ~/toolchain-build.log 2>&1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'pgrep -af \"wget|configure|make|gcc|binutils\" | head -10; echo \"---\"; tail -15 ~/toolchain-build.log 2>&1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'cat -A ~/build-toolchain.sh | head -15')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'src=\"/mnt/c/Users/kubew/AppData/Local/Temp/claude/C--Users-kubew-aerosls2/f498d6f5-06f6-4558-b0b8-020f68b8e9e2/scratchpad/build-toolchain.sh\"; cp \"$src\" ~/build-toolchain.sh; sed -i \"s/\\\\r$//\" ~/build-toolchain.sh; chmod +x ~/build-toolchain.sh; cat -A ~/build-toolchain.sh | sed -n \"1,10p\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'ls -la \"/mnt/c/Users/kubew/AppData/Local/Temp/claude/C--Users-kubew-aerosls2/f498d6f5-06f6-4558-b0b8-020f68b8e9e2/scratchpad/build-toolchain.sh\"; echo \"ls exit: $?\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'head -10 \"/mnt/c/Users/kubew/AppData/Local/Temp/claude/C--Users-kubew-aerosls2/f498d6f5-06f6-4558-b0b8-020f68b8e9e2/scratchpad/build-toolchain.sh\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'rm -f ~/build-toolchain.sh; cp \"/mnt/c/Users/kubew/AppData/Local/Temp/claude/C--Users-kubew-aerosls2/f498d6f5-06f6-4558-b0b8-020f68b8e9e2/scratchpad/build-toolchain.sh\" ~/build-toolchain.sh; echo \"cp exit: $?\"; head -10 ~/build-toolchain.sh')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'sed -i \"s/\\\\r$//\" ~/build-toolchain.sh; chmod +x ~/build-toolchain.sh; bash -n ~/build-toolchain.sh && echo \"syntax OK\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'ps aux | grep -E \"wget|configure|make|cc1|gcc\" | grep -v grep; echo \"---log---\"; tail -20 ~/toolchain-build.log 2>&1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'tail -15 ~/toolchain-build.log; echo \"---\"; export PATH=\"$HOME/opt/cross/bin:$PATH\"; x86_64-elf-gcc --version | head -1; x86_64-elf-ld --version | head -1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'export PATH=\"$HOME/opt/cross/bin:$PATH\"; cd /mnt/c/Users/kubew/aerosls2 && make x86-iso 2>&1 | tee ~/kernel-build.log | tail -100')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'tail -30 ~/kernel-build.log; echo \"---\"; ls -la /mnt/c/Users/kubew/aerosls2/sls_operating_system.iso /mnt/c/Users/kubew/aerosls2/my_sls_kernel.bin')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'export PATH=\"$HOME/opt/cross/bin:$PATH\"; cd /mnt/c/Users/kubew/aerosls2 && make x86-run > ~/kernel-run.log 2>&1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'sleep 5; ps aux | grep qemu | grep -v grep; echo \"---log---\"; cat ~/kernel-run.log 2>&1')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'cd /mnt/c/Users/kubew/aerosls2 && sleep 3 && tail -50 sls_kernel_debug.log 2>&1')",
+      "Bash(curl -s -m 5 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:3001/api/scan)",
+      "Bash(wsl -d Ubuntu -- bash -lc 'curl -s -m 5 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:3001/api/scan; curl -s -m 5 http://localhost:3001/api/scan | head -c 300')",
+      "Bash(wc -l C:/Users/kubew/aerosls2/kernel/webapp_bundle.c C:/Users/kubew/aerosls2/kernel/webapp.c 2>&1; echo \"---\"; ls C:/Users/kubew/aerosls2/../slsos-sim 2>&1; echo \"---grep bundle---\"; grep -o -i \"address.space\\\\|memory.map\\\\|\\\\.cell\\\\|\\\\.square\\\\|\\\\.grid\\\\|object.grid\\\\|is-lit\\\\|\\\\blit\\\\b\" C:/Users/kubew/aerosls2/kernel/webapp_bundle.c | sort -u | head -30)",
+      "Bash(grep -v \"^\\\\./\\\\.git\")",
+      "Bash(wsl -d Ubuntu -- bash -lc 'export PATH=\"$HOME/opt/cross/bin:$PATH\"; cd /mnt/c/Users/kubew/aerosls2 && x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -c kernel/loader.c -o kernel/loader.x86.o && echo \"COMPILE OK\"')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'export PATH=\"$HOME/opt/cross/bin:$PATH\"; cd /mnt/c/Users/kubew/aerosls2 && make x86-iso 2>&1 | tee ~/kernel-build2.log | tail -60')",
+      "Bash(wsl -d Ubuntu -- bash -lc 'tail -20 ~/kernel-build2.log; echo \"---\"; ls -la /mnt/c/Users/kubew/aerosls2/sls_operating_system.iso')"
+    ]
+  }
+}

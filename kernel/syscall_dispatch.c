@@ -179,6 +179,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_upload_binary((struct SLSUploadRequest*)arg);
     case 172: /* loader_list */
         loader_list(); return 0;
+    case SYS_SLS_TIMI_INFO:
+        loader_timi_info((const char*)arg); return 0;
     case SYS_SLS_PROGRAM_SPAWN:
         return program_load((const char*)arg,
                             kernel_get_current_thread_id());

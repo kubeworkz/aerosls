@@ -71,6 +71,15 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
 // Kernel-side exit handler: restores kernel context saved by kernel_enter_ring3.
 void process_exit(uint32_t exit_code);
 
+// Phase 7: find the Ring-3 process currently executing, for callers that
+// need to know "who is asking" (e.g. timi_runtime.c's authority-checked
+// RESOLVE). Mirrors schedule_ring3()'s own scan for the running process
+// (active && state==PROC_RUNNING && kernel_rsp!=0 — kernel_rsp is only
+// nonzero while the kernel has actually entered that process via
+// kernel_enter_ring3). Returns NULL if no Ring-3 process is currently
+// running (e.g. a call made from pure kernel context).
+struct ProcessDescriptor* process_find_current(void);
+
 // Called from isr32_stub when a Ring-3 timer interrupt fires.
 // Saves the current Ring-3 process context from the interrupt stack,
 // selects the next Ring-3 process (or the same if only one), writes its

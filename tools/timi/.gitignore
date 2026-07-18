@@ -1,0 +1,9 @@
+# Build outputs — regenerate with `make` in this directory.
+timi-asm
+timi-run
+timi-dis
+timi-jit-test
+timi-riscv-verify
+tests/*.tmo
+tests/*.log
+tests/*.txt

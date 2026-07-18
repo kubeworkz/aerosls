@@ -1,0 +1,7 @@
+.entry main
+main:
+    ENTER #16
+    LOADI   r3, #8192, objref
+    OBJSIZE r4, r3, u64
+    MOV     r0, r4, u64
+    RET
