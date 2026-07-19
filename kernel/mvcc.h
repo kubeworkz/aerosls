@@ -128,6 +128,22 @@
  * alongside it regardless. No garbage collection / vacuum of old committed
  * versions (named above). No SELECT ... FOR UPDATE / explicit read locks —
  * MVCC readers never lock anything, by design.
+ *
+ * --- Phase 23: constraint + journal hooks, automatic like row_index's own ---
+ * `mvcc_row_insert()`/`_update()` now call `row_constraint_check_write()`
+ * (row_constraint.h) before any physical write, and `mvcc_row_delete()`
+ * calls `row_constraint_check_delete()` before tombstoning -- the same
+ * "automatic maintenance, not an opt-in step" reasoning Phase 17 used for
+ * `rowstore.c` calling `row_index_notify_*()` automatically, applied here
+ * to business-rule integrity instead of index maintenance. `mvcc_row_
+ * insert/update/delete()` also call `row_journal_notify_insert/update/
+ * delete()` (row_journal.h) after staging a change, and `mvcc_commit()`/
+ * `mvcc_rollback()` call `row_journal_commit_tx()`/`_rollback_tx()` --
+ * this file now genuinely depends on both new Phase 23 headers, a real,
+ * new coupling worth naming plainly (mvcc.c was previously self-contained
+ * apart from rowstore.h). See row_constraint.h's own header comment for
+ * why this doesn't create a circular header dependency despite
+ * row_constraint.c needing to call back into mvcc_table_scan().
  */
 #ifndef MVCC_H
 #define MVCC_H
@@ -153,6 +169,11 @@ typedef enum {
     MVCC_ERR_TXN_TABLE_FULL,      // MVCC_MAX_TXNS concurrently active transactions already
     MVCC_ERR_VERSION_POOL_FULL,   // MVCC_MAX_VERSIONS exhausted
     MVCC_ERR_VALUES_INVALID,      // propagated from rowstore_row_insert's own column/type validation
+    MVCC_ERR_CONSTRAINT_UNIQUE,      // Phase 23: a UNIQUE constraint would be violated
+    MVCC_ERR_CONSTRAINT_NOT_NULL,    // Phase 23: a NOT NULL constraint would be violated
+    MVCC_ERR_CONSTRAINT_RANGE,       // Phase 23: a RANGE constraint would be violated
+    MVCC_ERR_CONSTRAINT_REFERENCE,   // Phase 23: a REFERENCE (FK) value doesn't match any row in the referenced table
+    MVCC_ERR_CONSTRAINT_REFERENCED,  // Phase 23: can't delete -- this row is still referenced by another table
 } MvccError;
 
 // A logical row's stable identity across however many physical versions it
@@ -221,6 +242,15 @@ MvccError mvcc_row_delete(uint64_t txn_id, uint32_t caller_uid, const char* tabl
 typedef void (*MvccScanCb)(struct MvccRowId id, const struct RowValues* values, void* ctx);
 uint32_t mvcc_table_scan(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
                          MvccScanCb cb, void* ctx);
+
+// Returns 1 if txn_id is currently an active transaction, 0 otherwise (bad,
+// never issued, already committed, or already rolled back). mvcc_table_scan()
+// deliberately does NOT distinguish "transaction inactive" from "0 rows
+// matched" in its own return value (both report 0, matching that function's
+// own "returns the number of rows visited" contract) -- a caller that needs
+// to tell those two cases apart (e.g. sql_exec.c, which owes its own callers
+// a real error rather than a silently-empty result) should check this first.
+int mvcc_txn_is_active(uint64_t txn_id);
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 // Zeroes the transaction table and version pool, resets both monotonic

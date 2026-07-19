@@ -12,12 +12,27 @@
  * check-plus-logic-review here), matching every prior phase's pattern of
  * meeting or beating its own predicted verification bar.
  *
+ * Phase 22 update: sql_exec.c now routes every statement through
+ * kernel/mvcc.c (each sql_execute() call is its own autocommit
+ * transaction), so this test now also links kernel/mvcc.c and calls
+ * mvcc_init() at startup. Every scenario below still passes unchanged --
+ * MVCC is a correct, transparent pass-through for single-statement
+ * autocommit callers, confirming this phase's rewiring didn't regress
+ * Phase 19's own behavior.
+ *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
  *       -o /tmp/sql_exec_host_test sql_exec_host_test.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
- *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c
+ *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
+ *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c
  *   /tmp/sql_exec_host_test
+ *
+ * Phase 23 update: mvcc.c now calls into kernel/row_constraint.c/
+ * kernel/row_journal.c automatically, so this test's link line now
+ * includes both. Neither is initialized/populated here, so every call is a
+ * guaranteed no-op -- see row_constraint_journal_host_test.c for the test
+ * that actually exercises them.
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
@@ -123,6 +138,7 @@ int main(void) {
     row_index_init();
     rowstore_init();
     cursor_mgr_init();
+    mvcc_init();   // Phase 22: sql_exec.c now routes every statement through mvcc.c
     make_employees_table();
     CHECK(row_index_create(1, "idx_id", "employees", "id") == 0, "setup: idx_id created on 'id'");
 

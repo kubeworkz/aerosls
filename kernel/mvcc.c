@@ -23,6 +23,8 @@
 #include "mvcc.h"
 #include "object_catalog.h"
 #include "../user/permissions.h"
+#include "row_constraint.h"
+#include "row_journal.h"
 #include <stddef.h>
 
 // ─── String helper (no libc — each kernel source file keeps its own small
@@ -125,6 +127,25 @@ static int mv_find_visible_version(uint64_t logical_id, const struct MvccTxn* t)
     return -1;
 }
 
+int mvcc_txn_is_active(uint64_t txn_id) {
+    return mv_find_txn(txn_id) >= 0;
+}
+
+// Phase 23: maps a row_constraint.c violation onto the matching MvccError.
+// Registration-time error codes (ROW_CONSTRAINT_ERR_*) are never passed
+// here -- row_constraint_check_write()/_check_delete() only ever return
+// ROW_CONSTRAINT_OK or a VIOLATION_* code at runtime.
+static MvccError map_constraint_violation(RowConstraintResult r) {
+    switch (r) {
+        case ROW_CONSTRAINT_VIOLATION_UNIQUE:     return MVCC_ERR_CONSTRAINT_UNIQUE;
+        case ROW_CONSTRAINT_VIOLATION_NOT_NULL:   return MVCC_ERR_CONSTRAINT_NOT_NULL;
+        case ROW_CONSTRAINT_VIOLATION_RANGE:      return MVCC_ERR_CONSTRAINT_RANGE;
+        case ROW_CONSTRAINT_VIOLATION_REFERENCE:  return MVCC_ERR_CONSTRAINT_REFERENCE;
+        case ROW_CONSTRAINT_VIOLATION_REFERENCED: return MVCC_ERR_CONSTRAINT_REFERENCED;
+        default:                                  return MVCC_OK;
+    }
+}
+
 // ─── Transaction lifecycle ────────────────────────────────────────────────
 uint64_t mvcc_begin(void) {
     for (uint32_t i = 0; i < MVCC_MAX_TXNS; i++) {
@@ -158,6 +179,7 @@ MvccError mvcc_commit(uint64_t txn_id) {
         if (v->xmin_txn == txn_id && !v->xmin_committed) { v->xmin = seq; v->xmin_committed = 1; }
         if (v->xmax_txn == txn_id && !v->xmax_committed) { v->xmax = seq; v->xmax_committed = 1; }
     }
+    row_journal_commit_tx(txn_id);
     mvcc_txns[tidx].active = 0;
     return MVCC_OK;
 }
@@ -190,6 +212,7 @@ MvccError mvcc_rollback(uint64_t txn_id, uint32_t caller_uid) {
             v->xmax_txn = 0;
         }
     }
+    row_journal_rollback_tx(txn_id);
     mvcc_txns[tidx].active = 0;
     return MVCC_OK;
 }
@@ -200,12 +223,20 @@ MvccError mvcc_row_insert(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     int tidx = mv_find_txn(txn_id);
     if (tidx < 0) return MVCC_ERR_TXN_NOT_ACTIVE;
 
+    // Phase 23: table_object_id is now resolved BEFORE the physical write
+    // (rather than after, as this function did through Phase 22) because
+    // the constraint check needs it, and rejecting a bad insert before any
+    // physical row exists avoids having to roll one back on violation.
+    int cidx = mv_find_table_index(table_name);
+    if (cidx < 0) return MVCC_ERR_TABLE_NOT_FOUND;
+    uint64_t table_object_id = object_catalog[cidx].object_id;
+
+    RowConstraintResult cres = row_constraint_check_write(txn_id, caller_uid, table_object_id, values, 0);
+    if (cres != ROW_CONSTRAINT_OK) return map_constraint_violation(cres);
+
     struct RowId phys;
     int rc = rowstore_row_insert(caller_uid, table_name, values, &phys);
     if (rc != 0) return map_rowstore_err(rc);
-
-    int cidx = mv_find_table_index(table_name);
-    if (cidx < 0) return MVCC_ERR_TABLE_NOT_FOUND;   // shouldn't happen -- insert just succeeded
 
     if (mvcc_version_count >= MVCC_MAX_VERSIONS) {
         rowstore_row_delete(caller_uid, table_name, phys);   // don't leave an orphan physical row
@@ -215,10 +246,12 @@ MvccError mvcc_row_insert(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     struct MvccVersion* v = &mvcc_versions[mvcc_version_count++];
     v->active = 1;
     v->logical_id = mvcc_next_logical_id++;
-    v->table_object_id = object_catalog[cidx].object_id;
+    v->table_object_id = table_object_id;
     v->physical_id = phys;
     v->xmin = 0; v->xmin_committed = 0; v->xmin_txn = txn_id;
     v->xmax = 0; v->xmax_committed = 0; v->xmax_txn = 0;
+
+    row_journal_notify_insert(txn_id, table_name, table_object_id, v->logical_id, values);
 
     if (out_id) out_id->logical_id = v->logical_id;
     return MVCC_OK;
@@ -244,6 +277,21 @@ MvccError mvcc_row_update(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     struct MvccVersion* old = &mvcc_versions[vidx];
     if (old->xmax_txn != 0 && old->xmax_txn != txn_id) return MVCC_ERR_WRITE_CONFLICT;
 
+    // Phase 23: check the NEW candidate values against every constraint on
+    // this table before touching storage. exclude_logical_id = id.logical_id
+    // so a UNIQUE check doesn't reject the row for "conflicting" with its
+    // own current value.
+    RowConstraintResult cres = row_constraint_check_write(txn_id, caller_uid, old->table_object_id, values, id.logical_id);
+    if (cres != ROW_CONSTRAINT_OK) return map_constraint_violation(cres);
+
+    // Phase 23: fetch the pre-update row for the journal's before-image --
+    // best-effort (a failed fetch here is unusual, since this transaction
+    // just proved the row visible via mv_find_visible_version() above, but
+    // is handled the same "don't let a journaling concern block a real
+    // mutation" way row_constraint_check_delete() treats a vanished row).
+    struct RowValues before;
+    int have_before = (rowstore_row_get(caller_uid, table_name, old->physical_id, &before) == 0);
+
     struct RowId phys;
     int rc = rowstore_row_insert(caller_uid, table_name, values, &phys);
     if (rc != 0) return map_rowstore_err(rc);
@@ -263,6 +311,9 @@ MvccError mvcc_row_update(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     nv->xmax = 0; nv->xmax_committed = 0; nv->xmax_txn = 0;
 
     old->xmax_txn = txn_id;   // pending supersede -- becomes real at commit, undone at rollback
+
+    row_journal_notify_update(txn_id, table_name, old->table_object_id, id.logical_id,
+                              have_before ? &before : NULL, values);
     return MVCC_OK;
 }
 
@@ -284,7 +335,18 @@ MvccError mvcc_row_delete(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     struct MvccVersion* v = &mvcc_versions[vidx];
     if (v->xmax_txn != 0 && v->xmax_txn != txn_id) return MVCC_ERR_WRITE_CONFLICT;
 
+    // Phase 23: REFERENCE constraints are enforced on delete of the
+    // REFERENCED row (RESTRICT -- block if any other table still points
+    // at it), not on the deleted row's own outbound columns.
+    RowConstraintResult cres = row_constraint_check_delete(txn_id, caller_uid, table_name, v->table_object_id, v->physical_id);
+    if (cres != ROW_CONSTRAINT_OK) return map_constraint_violation(cres);
+
+    struct RowValues before;
+    int have_before = (rowstore_row_get(caller_uid, table_name, v->physical_id, &before) == 0);
+
     v->xmax_txn = txn_id;   // pending delete -- becomes real at commit, undone at rollback
+
+    row_journal_notify_delete(txn_id, table_name, v->table_object_id, id.logical_id, have_before ? &before : NULL);
     return MVCC_OK;
 }
 

@@ -13,6 +13,8 @@
 #include "../kernel/secure_api.h"
 #include "partition.h"
 #include "frame_pool.h"
+#include "sql_exec.h"
+#include "vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -247,6 +249,33 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_partition_pause((uint32_t)(uintptr_t)arg);
     case SYS_SLS_PARTITION_RESUME:
         return sys_sls_partition_resume((uint32_t)(uintptr_t)arg);
+
+    // ── Phase 22: SQL engine, live at last (220) ────────────────────────────
+    // The first dispatch-reachable entry point into Phases 19-22's SQL
+    // engine -- sql_execute() was previously callable only from its own
+    // host tests. Autocommit only (see sql_exec.h) -- caller_uid travels
+    // inside the request struct, matching SLSVallocRequest's own
+    // owner_uid-embedded-in-the-request convention, since do_syscall()
+    // itself has no uid context of its own to supply.
+    case SYS_SLS_SQL_EXECUTE:
+        return sys_sls_sql_execute((struct SLSSqlRequest*)arg);
+
+    // ── Vector Store Roadmap Phase 4: make it live (221-224) ────────────────
+    // The first dispatch-reachable entry points into Phases 1-3's vector
+    // store + Ollama embedding client -- vecstore_create_collection()/
+    // vecstore_insert()/vecstore_search() and ollama_embed() were
+    // previously callable only from their own host tests, exactly the gap
+    // SYS_SLS_SQL_EXECUTE closed for the SQL engine above. caller_uid
+    // travels inside each request struct (see vecstore.h's own comment),
+    // same convention as SYS_SLS_SQL_EXECUTE.
+    case SYS_SLS_VEC_CREATE:
+        return sys_sls_vec_create((struct SLSVecCreateRequest*)arg);
+    case SYS_SLS_VEC_INSERT:
+        return sys_sls_vec_insert((struct SLSVecInsertRequest*)arg);
+    case SYS_SLS_VEC_EMBED_INSERT:
+        return sys_sls_vec_embed_insert((struct SLSVecEmbedInsertRequest*)arg);
+    case SYS_SLS_VEC_SEARCH:
+        return sys_sls_vec_search((struct SLSVecSearchRequest*)arg);
 
     default:
         return 0;

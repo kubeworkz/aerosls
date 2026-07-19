@@ -33,6 +33,10 @@
 #include "../kernel/rowstore.h"
 #include "../kernel/row_index.h"
 #include "../kernel/mvcc.h"
+#include "../kernel/row_constraint.h"
+#include "../kernel/row_journal.h"
+#include "../kernel/vecstore.h"
+#include "../kernel/vec_index.h"
 #include "persist.h"
 
 extern void sls_shell_loop(void);
@@ -180,6 +184,32 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // for the same "relational-layer subsystems init together" readability
     // this boot sequence already groups by.
     mvcc_init();
+    // ── 4l-quinquies. Row-set constraints + journaling (Phase 23, relational
+    // layer) ───────────────────────────────────────────────────────────────
+    // Both RAM-only, same non-goal as row_index_init()/mvcc_init() above --
+    // no restore step at 7b. Must come after mvcc_init() since mvcc.c is the
+    // only caller of either subsystem (constraint checks/journal notifies
+    // are wired into mvcc_row_insert/update/delete, not called directly by
+    // sql_exec.c or anything else), though nothing here actually depends on
+    // mvcc_init() having run first -- placed after it for the same
+    // call-graph-order readability, not a real ordering requirement.
+    row_constraint_init();
+    row_journal_init();
+    // ── 4l-sexies. Vector store engine (Vector Store Roadmap Phase 1) ───────
+    // A wholly separate subsystem from the relational engine above (see
+    // docs/AeroSLS-VectorStore-Roadmap-v0.1.md §0's own "new parallel
+    // subsystem, not an extension" decision) -- its own page pool, its own
+    // collection headers, no dependency on rowstore.c/mvcc.c at all. RAM-only
+    // this phase (see vecstore.h's header comment), so -- like row_index_init()
+    // and mvcc_init() above -- no restore step at 7b.
+    vecstore_init();
+    // ── 4l-septies. Approximate nearest-neighbor index (Vector Store
+    // Roadmap Phase 6) ─────────────────────────────────────────────────────
+    // A third parallel structure over vecstore.c, same relationship
+    // row_index.c has to rowstore.c (see vec_index.h's own header
+    // comment). RAM-only, no restore step, same reasoning as vecstore_init()
+    // immediately above.
+    vec_index_init();
     // ── 4n. AI agent engine ───────────────────────────────────────────────────
     agent_init();    // ── 4m. Stream object store (OBJ_TYPE_STREAM) ─────────────────
     // nvme_io_init + stream_init run after the PCI scan (step 7) so that

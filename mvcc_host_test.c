@@ -15,8 +15,17 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
  *       -o /tmp/mvcc_host_test mvcc_host_test.c \
- *       kernel/mvcc.c kernel/rowstore.c kernel/persist.c
+ *       kernel/mvcc.c kernel/rowstore.c kernel/persist.c \
+ *       kernel/row_constraint.c kernel/row_journal.c
  *   /tmp/mvcc_host_test
+ *
+ * Phase 23 update: mvcc.c now calls into kernel/row_constraint.c (constraint
+ * enforcement) and kernel/row_journal.c (audit trail) automatically from
+ * mvcc_row_insert()/_update()/_delete(), so this test's link line now
+ * includes both -- with row_constraint_init()/row_journal_init() never
+ * called here, both subsystems have zero registered constraints/
+ * attachments, so every call into them is a guaranteed no-op (see their own
+ * header comments) and every scenario below still passes unchanged.
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"

@@ -384,6 +384,20 @@ uint64_t sys_sls_select(struct SLSRecordRequest* req) {
         kernel_serial_printf("[DB] SELECT: Object '%s' not found.\n", req->name);
         return 1;
     }
+    // Phase 24: an object promoted to row-set storage (rowstore_create_table())
+    // has its real data in table_headers[]/rowstore.c's pages, not here --
+    // object_records[obj_idx] is stale/unmaintained for such an object (see
+    // this codebase's own rowstore_create_table(), which never touches it).
+    // Reading through the legacy field API here would silently return
+    // whatever leftover/empty data happens to be in that stale slot instead
+    // of an honest error -- reject instead, matching this whole roadmap's
+    // "denial looks like absence" fix pattern rather than repeating it.
+    if (object_catalog[obj_idx].uses_rowstore) {
+        kernel_serial_printf(
+            "[DB] SELECT: '%s' is a row-set table -- use the SQL/row-set path (sql_execute()), not the legacy record API.\n",
+            req->name);
+        return 4;
+    }
     tier_notify_access(object_catalog[obj_idx].object_id);
 
     // Empty key or "*" → dump every active field
@@ -432,6 +446,13 @@ uint64_t sys_sls_update(struct SLSRecordRequest* req) {
     if (obj_idx < 0) {
         kernel_serial_printf("[DB] UPDATE: Object '%s' not found.\n", req->name);
         return 1;
+    }
+    // Phase 24: see sys_sls_select()'s own comment above -- same guard.
+    if (object_catalog[obj_idx].uses_rowstore) {
+        kernel_serial_printf(
+            "[DB] UPDATE: '%s' is a row-set table -- use the SQL/row-set path (sql_execute()), not the legacy record API.\n",
+            req->name);
+        return 4;
     }
     tier_notify_access(object_catalog[obj_idx].object_id);
 
@@ -509,6 +530,13 @@ uint64_t sys_sls_insert(struct SLSRecordRequest* req) {
         kernel_serial_printf("[DB] INSERT: Object '%s' not found.\n", req->name);
         return 1;
     }
+    // Phase 24: see sys_sls_select()'s own comment above -- same guard.
+    if (object_catalog[obj_idx].uses_rowstore) {
+        kernel_serial_printf(
+            "[DB] INSERT: '%s' is a row-set table -- use the SQL/row-set path (sql_execute()), not the legacy record API.\n",
+            req->name);
+        return 4;
+    }
     tier_notify_access(object_catalog[obj_idx].object_id);
 
     struct SLSObjectRecord* rec = &object_records[obj_idx];
@@ -583,6 +611,13 @@ uint64_t sys_sls_delete(struct SLSRecordRequest* req) {
         kernel_serial_printf("[DB] DELETE: Object '%s' not found.\n", req->name);
         return 1;
     }
+    // Phase 24: see sys_sls_select()'s own comment above -- same guard.
+    if (object_catalog[obj_idx].uses_rowstore) {
+        kernel_serial_printf(
+            "[DB] DELETE: '%s' is a row-set table -- use the SQL/row-set path (sql_execute()), not the legacy record API.\n",
+            req->name);
+        return 4;
+    }
     struct SLSObjectEntry* e = &object_catalog[obj_idx];
 
     // Honour the append-only flag — deletion is not permitted
@@ -640,6 +675,22 @@ uint64_t sys_sls_schema_set(struct SLSSchemaRequest* req) {
         kernel_serial_printf("[SCHEMA] Object '%s' not found.\n",
                              req->object_name);
         return 1;
+    }
+    // Phase 24: rowstore_create_table() computes a row-set table's
+    // RowTableLayout ONCE from object_schemas[obj_idx] at promotion time
+    // (rowstore.c's compute_layout()) -- it is never recomputed afterward.
+    // Allowing a schema field to be added/retyped post-promotion would
+    // silently desync table_headers[obj_idx].layout from object_schemas[]
+    // (new/changed columns the row-set engine never allocated storage for
+    // or never learns about), corrupting every future row read/write for
+    // that table. Reject instead, same boundary as the record API guards
+    // above -- schema changes for a live row-set table are out of scope
+    // (ALTER TABLE-equivalent work, not attempted anywhere in this roadmap).
+    if (object_catalog[obj_idx].uses_rowstore) {
+        kernel_serial_printf(
+            "[SCHEMA] '%s' is a row-set table -- its layout is fixed at rowstore_create_table() time and cannot be changed.\n",
+            req->object_name);
+        return 4;
     }
 
     struct SLSObjectSchema* schema = &object_schemas[obj_idx];

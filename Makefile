@@ -31,6 +31,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/ipc.c kernel/microkernel.c \
               kernel/tier_mgr.c kernel/query_engine.c \
               net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
+              net/ollama_client.c \
               kernel/process.c arch/x86/user_paging.c \
               kernel/partition.c \
               kernel/loader.c \
@@ -54,6 +55,11 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/sql_parser.c \
               kernel/sql_exec.c \
               kernel/mvcc.c \
+              kernel/row_constraint.c \
+              kernel/row_journal.c \
+              kernel/vecstore.c \
+              kernel/vec_index.c \
+              kernel/vec_join.c \
               kernel/agent.c \
               kernel/agent_tools.c \
               drivers/nvme_io.c \

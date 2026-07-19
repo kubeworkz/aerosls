@@ -20,6 +20,8 @@
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
 #include "../kernel/agent.h"
+#include "../kernel/sql_exec.h"
+#include "../kernel/vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -68,6 +70,59 @@ static uint32_t sh_atoi(const char* s) {
     uint32_t v = 0;
     while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
     return v;
+}
+
+// ── Vector Store Roadmap Phase 4: shell parsing helpers ────────────────────
+// No prior shell command needed to tokenize an unbounded, space-separated
+// list of values (every existing command has a small, fixed argument
+// count) -- the "vec insert"/"vec search" commands do (one value per
+// vector dimension), so this is genuinely new machinery, not an oversight
+// that a helper like this didn't already exist.
+
+// Copies the current whitespace-delimited token from s into out (bounded to
+// outlen, always NUL-terminated), then returns a pointer to the start of
+// the NEXT token, skipping any run of spaces -- or a pointer to the
+// terminating NUL if no more tokens remain.
+static const char* sh_token(const char* s, char* out, size_t outlen) {
+    size_t i = 0;
+    while (*s && *s != ' ' && i < outlen - 1) out[i++] = *s++;
+    out[i] = '\0';
+    while (*s == ' ') s++;
+    return s;
+}
+
+// Minimal freestanding string->float parser (no atof/strtof exists
+// anywhere in this kernel -- confirmed by grep before writing this).
+// Deliberately narrower than net/ollama_client.c's oc_parse_json_number():
+// optional leading '-' and an optional decimal point, no exponent
+// notation. That's a real, sufficient grammar for hand-typed shell input
+// (a person is not going to type "4.5e-2" at a prompt) -- it is NOT
+// sufficient for genuinely external JSON, which is exactly why
+// oc_parse_json_number() is a separate, more complete implementation
+// rather than this function being reused there.
+static float sh_atof(const char* s) {
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    float v = 0.0f;
+    while (*s >= '0' && *s <= '9') { v = v * 10.0f + (float)(*s - '0'); s++; }
+    if (*s == '.') {
+        s++;
+        float frac = 0.1f;
+        while (*s >= '0' && *s <= '9') { v += (float)(*s - '0') * frac; frac *= 0.1f; s++; }
+    }
+    return neg ? -v : v;
+}
+
+// ── Phase 22: row-printing callback for "sql" SELECTs ──────────────────────
+// cursor_fetch_rows() hands back the cursor's FULL materialized row (column
+// projection is metadata-only, per sql_exec.h -- see the roadmap's own
+// Phase 19 findings), so this just prints every column of every fetched row.
+static void sh_sql_print_row(struct RowId id, const struct RowValues* v, void* ctx) {
+    (void)id; (void)ctx;
+    for (uint32_t i = 0; i < v->count; i++) {
+        kernel_serial_printf("%s%s", i ? ", " : "  ", v->values[i]);
+    }
+    kernel_serial_print("\n");
 }
 
 // ─── Shell Helpers ────────────────────────────────────────────────────────────
@@ -182,6 +237,11 @@ static void print_help(void) {
         "  workflow run    <name> <input...>         execute all steps\n"
         "  workflow list                             list all workflows\n"
         "  workflow status <name>                    show workflow descriptor\n"
+        "  -- Vector Store (Phase 4) --\n"
+        "  vec create <name> <dim>        register a vector collection (needs valloc first)\n"
+        "  vec insert <name> <ext_id> <v0> <v1> ...       insert a raw vector\n"
+        "  vec embed-insert <name> <ext_id> <model> <text...>  embed via local Ollama, then store\n"
+        "  vec search <name> cosine|l2 <k> <v0> <v1> ...  top-k nearest neighbors\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name>                  encrypt object with password\n"
         "  help                           show this message\n\n");
@@ -499,6 +559,147 @@ void sls_shell_loop(void) {
         // ── Phase 3: wal dump ─────────────────────────────────────────────────
         else if (sh_eq(input_buffer, "wal dump")) {
             wal_dump();
+        }
+
+        // ── Phase 22: sql <statement> ────────────────────────────────────────
+        // The first real, syscall-reachable entry point into the Phases
+        // 19-22 SQL engine (see docs/AeroSLS-RDBMS-Roadmap-v0.1.md §9) --
+        // routes through the real SYS_SLS_SQL_EXECUTE syscall via
+        // do_syscall(), not a direct function call, so this command
+        // genuinely exercises the dispatch path this phase added, not just
+        // the engine itself. Runs as one autocommit statement under
+        // current_session_uid (matching every other command's uid source
+        // in this file).
+        else if (sh_starts(input_buffer, "sql ")) {
+            struct SLSSqlRequest req;
+            req.caller_uid = current_session_uid;
+            sh_copy(req.sql_text, input_buffer + 4, sizeof(req.sql_text));
+            uint64_t rc = do_syscall(SYS_SLS_SQL_EXECUTE, &req);
+            if (rc != 0) {
+                kernel_serial_printf("[SQL] error %d: %s\n",
+                                     (int)req.result.error, req.result.error_msg);
+            } else if (req.result.kind == SQL_STMT_SELECT) {
+                kernel_serial_printf("[SQL] %u row(s)%s\n", req.result.row_count,
+                                     req.result.truncated ? " (truncated)" : "");
+                cursor_fetch_rows(req.result.cursor_id, req.result.row_count,
+                                  sh_sql_print_row, 0);
+                cursor_close(req.result.cursor_id);
+            } else {
+                kernel_serial_printf("[SQL] OK, %u row(s) affected\n", req.result.affected_rows);
+            }
+        }
+
+        // ── Vector Store Roadmap Phase 4: vec create/insert/embed-insert/
+        // search ───────────────────────────────────────────────────────────
+        // The first real, syscall-reachable entry points into the vector
+        // store + Ollama embedding client (Phases 1-3), matching the "sql "
+        // block immediately above -- each routes through a real
+        // SYS_SLS_VEC_* syscall via do_syscall(), not a direct function
+        // call, under current_session_uid (same uid source as every other
+        // command in this file). "vec create" is the syscall this phase's
+        // own roadmap scope bullet didn't originally name -- see vecstore.h's
+        // header comment on why it was added anyway (without it, insert/
+        // search are dispatch-reachable but never actually reachable, since
+        // nothing else in this codebase can create a vector collection).
+        //
+        // embed-insert always targets a local Ollama instance
+        // (127.0.0.1:11434) rather than taking an endpoint per call -- a
+        // real, named first-cut simplification: this shell-demo surface has
+        // no caller needing more than one Ollama instance yet, and adding
+        // an endpoint argument to every "vec embed-insert" invocation would
+        // be friction with no real use today.
+        else if (sh_starts(input_buffer, "vec create ")) {
+            struct SLSVecCreateRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 11;
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            req.dimension = sh_atoi(p);
+            uint64_t rc = do_syscall(SYS_SLS_VEC_CREATE, &req);
+            kernel_serial_printf("[VEC] create '%s' dim=%u -> %s (status %d)\n",
+                                 req.collection_name, req.dimension,
+                                 rc == 0 ? "OK" : "FAILED", req.status);
+        }
+        else if (sh_starts(input_buffer, "vec insert ")) {
+            struct SLSVecInsertRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 11;
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            char idtok[32];
+            p = sh_token(p, idtok, sizeof(idtok));
+            req.external_id = (uint64_t)sh_atoi(idtok);
+            uint32_t n = 0;
+            while (*p && n < VECSTORE_MAX_DIMENSION) {
+                char vtok[32];
+                p = sh_token(p, vtok, sizeof(vtok));
+                if (!vtok[0]) break;
+                req.values.values[n++] = sh_atof(vtok);
+            }
+            req.values.count = n;
+            uint64_t rc = do_syscall(SYS_SLS_VEC_INSERT, &req);
+            if (rc == 0) {
+                kernel_serial_printf("[VEC] inserted %u-dim vector into '%s', external_id=%llu -> page=%u slot=%u\n",
+                                     n, req.collection_name, (unsigned long long)req.external_id,
+                                     req.out_id.page_id, req.out_id.slot_index);
+            } else {
+                kernel_serial_printf("[VEC] insert failed, status %d\n", req.status);
+            }
+        }
+        else if (sh_starts(input_buffer, "vec embed-insert ")) {
+            struct SLSVecEmbedInsertRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 18;
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            char idtok[32];
+            p = sh_token(p, idtok, sizeof(idtok));
+            req.external_id = (uint64_t)sh_atoi(idtok);
+            p = sh_token(p, req.ollama_req.model, sizeof(req.ollama_req.model));
+            sh_copy(req.ollama_req.endpoint_ip, "127.0.0.1", sizeof(req.ollama_req.endpoint_ip));
+            req.ollama_req.port = 11434;
+            sh_copy(req.ollama_req.prompt, p, sizeof(req.ollama_req.prompt));
+            uint64_t rc = do_syscall(SYS_SLS_VEC_EMBED_INSERT, &req);
+            if (rc == 0) {
+                kernel_serial_printf("[VEC] embedded+inserted into '%s' via model '%s', external_id=%llu -> page=%u slot=%u\n",
+                                     req.collection_name, req.ollama_req.model,
+                                     (unsigned long long)req.external_id,
+                                     req.out_id.page_id, req.out_id.slot_index);
+            } else if (req.ollama_status != 0) {
+                kernel_serial_printf("[VEC] embed-insert failed: Ollama call failed (status %d) -- is Ollama running at %s:%u?\n",
+                                     req.ollama_status, req.ollama_req.endpoint_ip, req.ollama_req.port);
+            } else {
+                kernel_serial_printf("[VEC] embed-insert failed: embedding succeeded but insert failed, status %d\n",
+                                     req.insert_status);
+            }
+        }
+        else if (sh_starts(input_buffer, "vec search ")) {
+            struct SLSVecSearchRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 11;
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            char metrictok[16];
+            p = sh_token(p, metrictok, sizeof(metrictok));
+            req.metric = sh_eq(metrictok, "l2") ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+            char ktok[16];
+            p = sh_token(p, ktok, sizeof(ktok));
+            req.k = sh_atoi(ktok);
+            uint32_t n = 0;
+            while (*p && n < VECSTORE_MAX_DIMENSION) {
+                char vtok[32];
+                p = sh_token(p, vtok, sizeof(vtok));
+                if (!vtok[0]) break;
+                req.query.values[n++] = sh_atof(vtok);
+            }
+            req.query.count = n;
+            do_syscall(SYS_SLS_VEC_SEARCH, &req);
+            kernel_serial_printf("[VEC] search '%s' (%s, k=%u, query dim=%u) -> %u match(es)%s\n",
+                                 req.collection_name, metrictok, req.k, n, req.match_count,
+                                 req.truncated ? " (k truncated)" : "");
+            for (uint32_t i = 0; i < req.match_count; i++) {
+                int whole = (int)req.matches[i].distance;
+                int frac  = (int)((req.matches[i].distance - (float)whole) * 1000.0f);
+                if (frac < 0) frac = -frac;
+                kernel_serial_printf("  #%u external_id=%llu distance=%d.%03d\n", i,
+                                     (unsigned long long)req.matches[i].external_id, whole, frac);
+            }
         }
 
         // ── Phase 3: wal recover ──────────────────────────────────────────────

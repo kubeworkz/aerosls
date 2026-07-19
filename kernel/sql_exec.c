@@ -4,9 +4,9 @@
  */
 #include "sql_exec.h"
 #include "object_catalog.h"
-#include "row_index.h"
 #include "predicate.h"
 #include "cursor.h"
+#include "mvcc.h"
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -123,63 +123,66 @@ static int predicate_columns_valid(const struct Predicate* pred, uint32_t idx,
     return predicate_columns_valid(pred, n->left, layout) && predicate_columns_valid(pred, n->right, layout);
 }
 
-// ─── Planner + candidate row collection ─────────────────────────────────────
-struct sql_collect_ctx { struct RowId* ids; uint32_t count; uint32_t max; };
-static void sql_collect_cb(struct RowId id, const struct RowValues* values, void* ctxp) {
-    (void)values;
-    struct sql_collect_ctx* ctx = (struct sql_collect_ctx*)ctxp;
+// ─── Planner + candidate row collection (Phase 22: MVCC-routed) ────────────
+// Always a full, snapshot-consistent mvcc_table_scan() plus a client-side
+// predicate_eval() recheck -- Phase 19/20's Phase-17-index-assisted short
+// cut does not survive MVCC routing (see sql_exec.h's header comment for
+// why: the B-tree stores physical RowIds with no notion of which version
+// is visible to a given transaction's snapshot). Correctness is unaffected
+// -- every candidate is still checked against the full predicate -- only
+// the "skip the scan when an index applies" performance property is lost,
+// a real, named scope cut, not a silent regression.
+struct mvcc_collect_ctx {
+    struct MvccRowId*            ids;
+    uint32_t                     count;
+    uint32_t                     max;
+    const struct Predicate*      pred;
+    const struct RowTableLayout* layout;
+};
+static void mvcc_collect_cb(struct MvccRowId id, const struct RowValues* values, void* ctxp) {
+    struct mvcc_collect_ctx* ctx = (struct mvcc_collect_ctx*)ctxp;
+    if (ctx->pred && !predicate_eval(ctx->pred, ctx->layout, values)) return;
     if (ctx->count < ctx->max) ctx->ids[ctx->count] = id;
     ctx->count++;
 }
 
 // Returns the TRUE total match count (may exceed max_ids -- caller detects
-// truncation the same way row_index_lookup()/_range_scan() already do).
-static uint32_t sql_find_matching_rows(uint32_t caller_uid, int tidx, const char* table_name,
-                                       const struct Predicate* pred,
-                                       struct RowId* out_ids, uint32_t max_ids) {
-    const struct RowTableLayout* layout = &table_headers[tidx].layout;
-
-    // Trivial planner: only a single top-level comparison (not AND/OR-
-    // wrapped) against an indexed, non-"!="-compared column is eligible.
-    // See sql_exec.h's header comment for why the index path is always
-    // re-checked against the full predicate rather than trusted outright.
-    if (pred && pred->root != PREDICATE_INVALID_NODE) {
-        const struct PredicateNode* n = &pred->nodes[pred->root];
-        if (n->kind == PRED_NODE_COMPARISON && n->op != PRED_OP_NE) {
-            uint32_t col = find_column_index(layout, n->column_name);
-            if (col != 0xFFFFFFFFu) {
-                char idx_name[OBJECT_NAME_LEN];
-                if (row_index_find_for_column(object_catalog[tidx].object_id, col, idx_name)) {
-                    struct RowId candidates[CURSOR_MAX_ROWSET_ROWS];
-                    uint32_t cand_n;
-                    if (n->op == PRED_OP_EQ) {
-                        cand_n = row_index_lookup(caller_uid, idx_name, n->literal, candidates, CURSOR_MAX_ROWSET_ROWS);
-                    } else {
-                        const char* lo = (n->op == PRED_OP_GT || n->op == PRED_OP_GE) ? n->literal : NULL;
-                        const char* hi = (n->op == PRED_OP_LT || n->op == PRED_OP_LE) ? n->literal : NULL;
-                        cand_n = row_index_range_scan(caller_uid, idx_name, lo, hi, candidates, CURSOR_MAX_ROWSET_ROWS);
-                    }
-                    uint32_t take = cand_n < CURSOR_MAX_ROWSET_ROWS ? cand_n : CURSOR_MAX_ROWSET_ROWS;
-                    uint32_t found = 0;
-                    for (uint32_t i = 0; i < take; i++) {
-                        struct RowValues rv;
-                        if (rowstore_row_get(caller_uid, table_name, candidates[i], &rv) != 0) continue;
-                        if (!predicate_eval(pred, layout, &rv)) continue;
-                        if (found < max_ids) out_ids[found] = candidates[i];
-                        found++;
-                    }
-                    return found;
-                }
-            }
-        }
-    }
-
-    // Fallback: full predicate_table_scan() (Phase 18) -- also the path
-    // for "no WHERE at all" (pred == NULL), matching predicate_table_scan's
-    // own "NULL predicate visits every row" convention.
-    struct sql_collect_ctx ctx = { out_ids, 0, max_ids };
-    predicate_table_scan(caller_uid, table_name, pred, sql_collect_cb, &ctx);
+// truncation the same way the pre-Phase-22 planner already did).
+static uint32_t mvcc_find_matching_rows(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
+                                        const struct Predicate* pred, const struct RowTableLayout* layout,
+                                        struct MvccRowId* out_ids, uint32_t max_ids) {
+    struct mvcc_collect_ctx ctx = { out_ids, 0, max_ids, pred, layout };
+    mvcc_table_scan(txn_id, caller_uid, table_name, mvcc_collect_cb, &ctx);
     return ctx.count;
+}
+
+// Maps an MvccError onto the closest SqlErrorCode -- shared by every
+// exec_* function below so the mapping is defined exactly once.
+static SqlErrorCode map_mvcc_err(MvccError e) {
+    switch (e) {
+        case MVCC_OK:                    return SQL_ERR_NONE;
+        case MVCC_ERR_TABLE_NOT_FOUND:    return SQL_ERR_TABLE_NOT_FOUND;
+        case MVCC_ERR_PERMISSION_DENIED:  return SQL_ERR_PERMISSION_DENIED;
+        case MVCC_ERR_ROW_NOT_VISIBLE:    return SQL_ERR_ROW_NOT_FOUND;
+        case MVCC_ERR_WRITE_CONFLICT:     return SQL_ERR_WRITE_CONFLICT;
+        case MVCC_ERR_TXN_NOT_ACTIVE:     return SQL_ERR_TXN_NOT_ACTIVE;
+        case MVCC_ERR_TXN_TABLE_FULL:     return SQL_ERR_TXN_UNAVAILABLE;
+        case MVCC_ERR_VALUES_INVALID:     return SQL_ERR_VALUE_INVALID;
+        case MVCC_ERR_VERSION_POOL_FULL:  return SQL_ERR_INTERNAL;
+        // Phase 23: all five row_constraint.c violation kinds collapse to
+        // one SqlErrorCode -- the caller_uid/table/column-level detail
+        // lives in row_constraint.c's own return value, not in SQL's
+        // error surface, matching this file's existing "one error per
+        // subsystem checkpoint, not one per internal reason" posture
+        // (e.g. every mvcc_table_scan() failure already collapses the
+        // same way above).
+        case MVCC_ERR_CONSTRAINT_UNIQUE:
+        case MVCC_ERR_CONSTRAINT_NOT_NULL:
+        case MVCC_ERR_CONSTRAINT_RANGE:
+        case MVCC_ERR_CONSTRAINT_REFERENCE:
+        case MVCC_ERR_CONSTRAINT_REFERENCED:  return SQL_ERR_CONSTRAINT_VIOLATION;
+        default:                         return SQL_ERR_INTERNAL;
+    }
 }
 
 // ─── Statement execution ─────────────────────────────────────────────────
@@ -192,10 +195,10 @@ static uint32_t sql_find_matching_rows(uint32_t caller_uid, int tidx, const char
 // project's row-set path is safe under concurrent execution today.
 static struct RowValues g_select_scratch[CURSOR_MAX_ROWSET_ROWS];
 
-static void exec_select_join(uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
+static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 
-static void exec_select(uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
-    if (s->has_join) { exec_select_join(caller_uid, s, out); return; }
+static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    if (s->has_join) { exec_select_join(txn_id, caller_uid, s, out); return; }
 
     int tidx = find_table_catalog_index(s->table_name);
     if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
@@ -225,15 +228,15 @@ static void exec_select(uint32_t caller_uid, const struct SqlSelectStmt* s, stru
         return;
     }
 
-    struct RowId ids[CURSOR_MAX_ROWSET_ROWS];
-    uint32_t total = sql_find_matching_rows(caller_uid, tidx, s->table_name,
-                                            s->has_where ? &s->where : NULL,
-                                            ids, CURSOR_MAX_ROWSET_ROWS);
+    struct MvccRowId ids[CURSOR_MAX_ROWSET_ROWS];
+    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name,
+                                             s->has_where ? &s->where : NULL, layout,
+                                             ids, CURSOR_MAX_ROWSET_ROWS);
     uint32_t n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
     out->truncated = (total > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
 
     for (uint32_t i = 0; i < n; i++) {
-        if (rowstore_row_get(caller_uid, s->table_name, ids[i], &g_select_scratch[i]) != 0) {
+        if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &g_select_scratch[i]) != MVCC_OK) {
             se_memset(&g_select_scratch[i], 0, sizeof(g_select_scratch[i]));
         }
     }
@@ -292,8 +295,8 @@ static void build_qualified_name(char* out, uint32_t max, const char* table, con
 static struct Predicate g_join_probe_pred;
 
 struct join_ctx {
+    uint64_t                     txn_id;
     uint32_t                     caller_uid;
-    int                          tidx_b;
     const char*                  table_b_name;
     uint32_t                     join_col_a;
     uint32_t                     join_col_b;
@@ -305,12 +308,15 @@ struct join_ctx {
 };
 
 // Called once per row of table A (the outer loop). Probes table B for
-// matching rows using the SAME sql_find_matching_rows() the single-table
-// path uses -- this is what makes "indexed nested-loop join when B has an
-// index on the join column" fall out for free: sql_find_matching_rows()
-// already prefers an index for a single EQ comparison, and a join-column
-// probe is exactly that shape.
-static void join_outer_cb(struct RowId id_a, const struct RowValues* row_a, void* ctxp) {
+// matching rows using the SAME mvcc_find_matching_rows() the single-table
+// path uses. Phase 22 note: since that planner no longer takes an
+// index-assisted short cut under MVCC routing (see sql_exec.h's header
+// comment), the join probe is now always a full, snapshot-consistent scan
+// of B per outer row too -- "indexed nested-loop join for free" no longer
+// applies once a query runs through a real transaction. Correctness is
+// unaffected; only this join's algorithmic complexity regressed, a real,
+// named consequence of this phase, not a silent one.
+static void join_outer_cb(struct MvccRowId id_a, const struct RowValues* row_a, void* ctxp) {
     (void)id_a;
     struct join_ctx* ctx = (struct join_ctx*)ctxp;
 
@@ -320,14 +326,14 @@ static void join_outer_cb(struct RowId id_a, const struct RowValues* row_a, void
     if (probe_root == PREDICATE_INVALID_NODE) return;   // shouldn't happen (one fresh node), fail closed if it ever does
     g_join_probe_pred.root = probe_root;
 
-    struct RowId matches[CURSOR_MAX_ROWSET_ROWS];
-    uint32_t total_b = sql_find_matching_rows(ctx->caller_uid, ctx->tidx_b, ctx->table_b_name,
-                                              &g_join_probe_pred, matches, CURSOR_MAX_ROWSET_ROWS);
+    struct MvccRowId matches[CURSOR_MAX_ROWSET_ROWS];
+    uint32_t total_b = mvcc_find_matching_rows(ctx->txn_id, ctx->caller_uid, ctx->table_b_name,
+                                               &g_join_probe_pred, ctx->layout_b, matches, CURSOR_MAX_ROWSET_ROWS);
     uint32_t take_b = total_b < CURSOR_MAX_ROWSET_ROWS ? total_b : CURSOR_MAX_ROWSET_ROWS;
 
     for (uint32_t i = 0; i < take_b; i++) {
         struct RowValues row_b;
-        if (rowstore_row_get(ctx->caller_uid, ctx->table_b_name, matches[i], &row_b) != 0) continue;
+        if (mvcc_row_get(ctx->txn_id, ctx->caller_uid, ctx->table_b_name, matches[i], &row_b) != MVCC_OK) continue;
 
         struct RowValues combined;
         se_memset(&combined, 0, sizeof(combined));
@@ -344,7 +350,7 @@ static void join_outer_cb(struct RowId id_a, const struct RowValues* row_a, void
     }
 }
 
-static void exec_select_join(uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
     int tidx_a = find_table_catalog_index(s->table_name);
     if (tidx_a < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "left table not found", SQL_ERR_MSG_LEN); return; }
     int tidx_b = find_table_catalog_index(s->join_table);
@@ -425,9 +431,9 @@ static void exec_select_join(uint32_t caller_uid, const struct SqlSelectStmt* s,
     }
 
     struct join_ctx ctx;
-    ctx.caller_uid      = caller_uid;
-    ctx.tidx_b           = tidx_b;
-    ctx.table_b_name     = s->join_table;
+    ctx.txn_id            = txn_id;
+    ctx.caller_uid        = caller_uid;
+    ctx.table_b_name      = s->join_table;
     ctx.join_col_a       = join_col_a;
     ctx.join_col_b       = join_col_b;
     ctx.layout_a         = layout_a;
@@ -439,9 +445,10 @@ static void exec_select_join(uint32_t caller_uid, const struct SqlSelectStmt* s,
     // Nested-loop join: A is always the outer scan (the FROM table, no
     // cost-based side selection -- see sql_exec.h). No WHERE pushdown into
     // either side's scan before joining -- a real, named non-goal (query-
-    // optimizer territory, out of scope per this roadmap's own Phase 22
-    // framing), not an oversight.
-    rowstore_table_scan(caller_uid, s->table_name, join_outer_cb, &ctx);
+    // optimizer territory, out of scope per this roadmap's own Phase 25
+    // framing), not an oversight. Phase 22: the outer scan is now
+    // snapshot-consistent (mvcc_table_scan()), not a raw physical scan.
+    mvcc_table_scan(txn_id, caller_uid, s->table_name, join_outer_cb, &ctx);
 
     uint32_t n = ctx.count < CURSOR_MAX_ROWSET_ROWS ? ctx.count : CURSOR_MAX_ROWSET_ROWS;
     out->truncated = (ctx.count > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
@@ -482,7 +489,7 @@ static void exec_select_join(uint32_t caller_uid, const struct SqlSelectStmt* s,
     }
 }
 
-static void exec_insert(uint32_t caller_uid, const struct SqlInsertStmt* s, struct SqlResult* out) {
+static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlInsertStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
     if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
@@ -517,11 +524,13 @@ static void exec_insert(uint32_t caller_uid, const struct SqlInsertStmt* s, stru
         }
     }
 
-    struct RowId new_id;
-    int rc = rowstore_row_insert(caller_uid, s->table_name, &values, &new_id);
-    if (rc != 0) {
-        out->error = (rc == 2) ? SQL_ERR_PERMISSION_DENIED : SQL_ERR_VALUE_INVALID;
-        se_strcpy(out->error_msg, "INSERT rejected by the row store", SQL_ERR_MSG_LEN);
+    struct MvccRowId new_id;
+    MvccError rc = mvcc_row_insert(txn_id, caller_uid, s->table_name, &values, &new_id);
+    if (rc != MVCC_OK) {
+        out->error = map_mvcc_err(rc);
+        se_strcpy(out->error_msg, out->error == SQL_ERR_CONSTRAINT_VIOLATION
+                  ? "INSERT violates a UNIQUE, NOT NULL, RANGE, or REFERENCE constraint"
+                  : "INSERT rejected by the row store", SQL_ERR_MSG_LEN);
         return;
     }
     out->error         = SQL_ERR_NONE;
@@ -529,7 +538,7 @@ static void exec_insert(uint32_t caller_uid, const struct SqlInsertStmt* s, stru
     out->inserted_id   = new_id;
 }
 
-static void exec_update(uint32_t caller_uid, const struct SqlUpdateStmt* s, struct SqlResult* out) {
+static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUpdateStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
     if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
@@ -550,26 +559,55 @@ static void exec_update(uint32_t caller_uid, const struct SqlUpdateStmt* s, stru
         return;
     }
 
-    struct RowId ids[CURSOR_MAX_ROWSET_ROWS];
-    uint32_t total = sql_find_matching_rows(caller_uid, tidx, s->table_name,
-                                            s->has_where ? &s->where : NULL,
-                                            ids, CURSOR_MAX_ROWSET_ROWS);
+    struct MvccRowId ids[CURSOR_MAX_ROWSET_ROWS];
+    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name,
+                                             s->has_where ? &s->where : NULL, layout,
+                                             ids, CURSOR_MAX_ROWSET_ROWS);
     uint32_t n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
 
+    // Statement-level atomicity (Phase 22): a write-write conflict on ANY
+    // matched row aborts the WHOLE statement rather than reporting a
+    // partial affected-row count -- under sql_execute()'s autocommit
+    // wrapper the caller then rolls back the transaction, which correctly
+    // undoes every row this loop already updated before hitting the
+    // conflict, not just the row that conflicted. Matches this whole
+    // roadmap's "fail cleanly, no partial effects" posture.
     uint32_t affected = 0;
     for (uint32_t i = 0; i < n; i++) {
         struct RowValues rv;
-        if (rowstore_row_get(caller_uid, s->table_name, ids[i], &rv) != 0) continue;
+        if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &rv) != MVCC_OK) continue;
         for (uint32_t j = 0; j < s->set_count; j++)
             se_strcpy(rv.values[set_cols[j]], s->set_values[j], RECORD_VAL_LEN);
-        if (rowstore_row_update(caller_uid, s->table_name, ids[i], &rv) == 0) affected++;
+        MvccError rc = mvcc_row_update(txn_id, caller_uid, s->table_name, ids[i], &rv);
+        // Phase 23 fix: this used to special-case only MVCC_ERR_WRITE_CONFLICT
+        // and silently drop any other non-OK rc (constraint violations
+        // included) without incrementing affected_rows OR setting out->error --
+        // a fresh instance of this project's recurring "denial looks like
+        // absence" class (see mvcc_txn_is_active()'s own Phase 22 fix). Any
+        // non-OK rc now aborts the whole statement, matching the write-conflict
+        // path's existing statement-level-atomicity contract.
+        if (rc == MVCC_ERR_WRITE_CONFLICT) {
+            out->error = SQL_ERR_WRITE_CONFLICT;
+            se_strcpy(out->error_msg, "a row this UPDATE would affect was concurrently modified by another transaction", SQL_ERR_MSG_LEN);
+            out->affected_rows = 0;
+            return;
+        }
+        if (rc != MVCC_OK) {
+            out->error = map_mvcc_err(rc);
+            se_strcpy(out->error_msg, out->error == SQL_ERR_CONSTRAINT_VIOLATION
+                      ? "UPDATE violates a UNIQUE, NOT NULL, RANGE, or REFERENCE constraint"
+                      : "UPDATE rejected by the row store", SQL_ERR_MSG_LEN);
+            out->affected_rows = 0;
+            return;
+        }
+        affected++;
     }
     out->error         = SQL_ERR_NONE;
     out->affected_rows = affected;
     out->truncated     = (total > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
 }
 
-static void exec_delete(uint32_t caller_uid, const struct SqlDeleteStmt* s, struct SqlResult* out) {
+static void exec_delete(uint64_t txn_id, uint32_t caller_uid, const struct SqlDeleteStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
     if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
@@ -579,15 +617,32 @@ static void exec_delete(uint32_t caller_uid, const struct SqlDeleteStmt* s, stru
         return;
     }
 
-    struct RowId ids[CURSOR_MAX_ROWSET_ROWS];
-    uint32_t total = sql_find_matching_rows(caller_uid, tidx, s->table_name,
-                                            s->has_where ? &s->where : NULL,
-                                            ids, CURSOR_MAX_ROWSET_ROWS);
+    struct MvccRowId ids[CURSOR_MAX_ROWSET_ROWS];
+    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name,
+                                             s->has_where ? &s->where : NULL, layout,
+                                             ids, CURSOR_MAX_ROWSET_ROWS);
     uint32_t n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
 
+    // Statement-level atomicity -- same reasoning as exec_update() above.
     uint32_t affected = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (rowstore_row_delete(caller_uid, s->table_name, ids[i]) == 0) affected++;
+        MvccError rc = mvcc_row_delete(txn_id, caller_uid, s->table_name, ids[i]);
+        // Same "any non-OK rc aborts the statement" fix as exec_update() above.
+        if (rc == MVCC_ERR_WRITE_CONFLICT) {
+            out->error = SQL_ERR_WRITE_CONFLICT;
+            se_strcpy(out->error_msg, "a row this DELETE would affect was concurrently modified by another transaction", SQL_ERR_MSG_LEN);
+            out->affected_rows = 0;
+            return;
+        }
+        if (rc != MVCC_OK) {
+            out->error = map_mvcc_err(rc);
+            se_strcpy(out->error_msg, out->error == SQL_ERR_CONSTRAINT_VIOLATION
+                      ? "DELETE violates a REFERENCE constraint (row is still referenced by another table)"
+                      : "DELETE rejected by the row store", SQL_ERR_MSG_LEN);
+            out->affected_rows = 0;
+            return;
+        }
+        affected++;
     }
     out->error         = SQL_ERR_NONE;
     out->affected_rows = affected;
@@ -600,7 +655,37 @@ static void exec_delete(uint32_t caller_uid, const struct SqlDeleteStmt* s, stru
 // freestanding kernel's stack repeatedly, same reasoning, same tradeoff.
 static struct SqlStatement g_stmt_scratch;
 
-int sql_execute(uint32_t caller_uid, const char* sql_text, struct SqlResult* out) {
+// Runs ONE already-parsed statement against an already-open txn_id -- the
+// shared core both sql_execute() (autocommit) and sql_execute_tx()
+// (caller-managed transaction) dispatch through. Not itself public.
+static void dispatch_stmt(uint64_t txn_id, uint32_t caller_uid, struct SqlStatement* stmt, struct SqlResult* out) {
+    out->kind = stmt->kind;
+    // mvcc_table_scan()/mvcc_row_get() etc. report "transaction inactive"
+    // and "found nothing" identically (both return an empty/zero result,
+    // matching their own documented contracts) -- without this check, a
+    // SELECT against a bad txn_id would silently come back as an empty
+    // result instead of a real error, the exact "denial looks like
+    // absence" ambiguity Phase 19's predicate_columns_valid() was built to
+    // avoid for unknown WHERE columns. Checked once, here, rather than
+    // separately inside every exec_* function.
+    if (!mvcc_txn_is_active(txn_id)) {
+        out->error = SQL_ERR_TXN_NOT_ACTIVE;
+        se_strcpy(out->error_msg, "transaction is not active", SQL_ERR_MSG_LEN);
+        return;
+    }
+    switch (stmt->kind) {
+        case SQL_STMT_SELECT: exec_select(txn_id, caller_uid, &stmt->u.select, out); break;
+        case SQL_STMT_INSERT: exec_insert(txn_id, caller_uid, &stmt->u.insert, out); break;
+        case SQL_STMT_UPDATE: exec_update(txn_id, caller_uid, &stmt->u.update, out); break;
+        case SQL_STMT_DELETE: exec_delete(txn_id, caller_uid, &stmt->u.del,    out); break;
+        default:
+            out->error = SQL_ERR_INTERNAL;
+            se_strcpy(out->error_msg, "unhandled statement kind", SQL_ERR_MSG_LEN);
+            break;
+    }
+}
+
+int sql_execute_tx(uint64_t txn_id, uint32_t caller_uid, const char* sql_text, struct SqlResult* out) {
     se_memset(out, 0, sizeof(*out));
 
     char err[SQL_ERR_MSG_LEN];
@@ -611,16 +696,41 @@ int sql_execute(uint32_t caller_uid, const char* sql_text, struct SqlResult* out
         return 1;
     }
 
-    out->kind = g_stmt_scratch.kind;
-    switch (g_stmt_scratch.kind) {
-        case SQL_STMT_SELECT: exec_select(caller_uid, &g_stmt_scratch.u.select, out); break;
-        case SQL_STMT_INSERT: exec_insert(caller_uid, &g_stmt_scratch.u.insert, out); break;
-        case SQL_STMT_UPDATE: exec_update(caller_uid, &g_stmt_scratch.u.update, out); break;
-        case SQL_STMT_DELETE: exec_delete(caller_uid, &g_stmt_scratch.u.del,    out); break;
-        default:
-            out->error = SQL_ERR_INTERNAL;
-            se_strcpy(out->error_msg, "unhandled statement kind", SQL_ERR_MSG_LEN);
-            break;
-    }
+    dispatch_stmt(txn_id, caller_uid, &g_stmt_scratch, out);
     return out->error == SQL_ERR_NONE ? 0 : 1;
+}
+
+int sql_execute(uint32_t caller_uid, const char* sql_text, struct SqlResult* out) {
+    se_memset(out, 0, sizeof(*out));
+
+    uint64_t txn_id = mvcc_begin();
+    if (txn_id == 0) {
+        out->kind  = SQL_STMT_INVALID;
+        out->error = SQL_ERR_TXN_UNAVAILABLE;
+        se_strcpy(out->error_msg, "too many concurrently active transactions", SQL_ERR_MSG_LEN);
+        return 1;
+    }
+
+    int rc = sql_execute_tx(txn_id, caller_uid, sql_text, out);
+    if (out->error == SQL_ERR_NONE) {
+        mvcc_commit(txn_id);
+    } else {
+        mvcc_rollback(txn_id, caller_uid);
+    }
+    return rc;
+}
+
+uint64_t sql_tx_begin(void) {
+    return mvcc_begin();
+}
+int sql_tx_commit(uint64_t txn_id) {
+    return mvcc_commit(txn_id) == MVCC_OK ? 0 : 1;
+}
+int sql_tx_rollback(uint64_t txn_id, uint32_t caller_uid) {
+    return mvcc_rollback(txn_id, caller_uid) == MVCC_OK ? 0 : 1;
+}
+
+uint64_t sys_sls_sql_execute(struct SLSSqlRequest* req) {
+    if (!req) return 1;
+    return (uint64_t)sql_execute(req->caller_uid, req->sql_text, &req->result);
 }
