@@ -1236,16 +1236,76 @@ static int api_valloc_post(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── POST /api/schema — Gap Remediation Phase H ────────────────────────────────
+// Closes the "smaller, separate, still-open gap" api_table_create_post()'s
+// own comment (right below) has flagged since Phase B: sys_sls_schema_set()
+// (SYS_SLS_SCHEMA_SET, object_catalog.c) was already syscall/shell-reachable
+// ("schema set <object> <key> <type>", user/shell.c) but had no HTTP route,
+// meaning the three-step "create a real SQL table" flow (valloc -> schema
+// set (one field at a time) -> POST /api/tables) had its middle step missing
+// over HTTP -- the frontend could valloc an empty object and promote it, but
+// never actually define its columns. Body: {"name": "<object_name>",
+// "columns": [{"name":"<col>", "type":"STRING|UINT64|INT|FLOAT|BOOL"}, ...]}.
+// Loops sys_sls_schema_set() once per column (that syscall's own one-field-
+// at-a-time contract, not reinvented here), same json_array_object_at()
+// array-of-objects idiom /api/vec/join already established, and the same
+// type-string aliasing shell.c's own "schema set" command already uses
+// (INT accepted as UINT64's alias; unrecognized/absent type defaults to
+// STRING). Stops at the first column that fails (object not found, or
+// object already promoted to row-store -- schema is frozen post-promotion,
+// see object_catalog.c's own guard comment) rather than silently applying a
+// partial schema and calling it success.
+static int api_schema_set_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSSchemaRequest req;
+    json_str(body, "name", req.object_name, OBJECT_NAME_LEN);
+    if (!req.object_name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    char colbuf[192];
+    char typ[16];
+    uint32_t applied = 0;
+    int failed = 0;
+    for (int n = 0; n < SCHEMA_MAX_FIELDS; n++) {
+        if (!json_array_object_at(body, "columns", n, colbuf, (int)sizeof(colbuf))) break;
+        json_str(colbuf, "name", req.key, RECORD_KEY_LEN);
+        typ[0] = '\0';
+        json_str(colbuf, "type", typ, (int)sizeof(typ));
+        if      (!strcmp(typ, "UINT64") || !strcmp(typ, "INT")) req.type = FIELD_TYPE_UINT64;
+        else if (!strcmp(typ, "FLOAT"))                          req.type = FIELD_TYPE_FLOAT;
+        else if (!strcmp(typ, "BOOL"))                           req.type = FIELD_TYPE_BOOL;
+        else                                                      req.type = FIELD_TYPE_STRING;
+        if (!req.key[0]) { failed = 1; break; }
+        uint64_t rc = sys_sls_schema_set(&req);
+        if (rc != 0) { failed = 1; break; }
+        applied++;
+    }
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", (!failed && applied) ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", req.object_name); jb_putc(&j,',');
+    jb_uint(&j, "columns_set", applied);
+    if (failed) {
+        jb_putc(&j,',');
+        jb_str(&j, "error", applied == 0 && !req.key[0]
+                             ? "malformed or empty columns array"
+                             : "schema_set failed (object not found, or already promoted to row-store)");
+        jb_putc(&j,',');
+        jb_str(&j, "failed_column", req.key);
+    }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── POST /api/tables — Gap Remediation Phase B ───────────────────────────────
 // The live path rowstore_create_table() never had: before this, the only
 // way to promote a valloc'd + schema'd catalog object into a real row-set
 // table was a host test calling rowstore_create_table() directly (see
 // docs/AeroSLS-Gap-Analysis-v0.1.md §2/§5). Body: {"name": "<table_name>"}.
 // Does not valloc or schema-set for the caller -- POST /api/valloc
-// (type=1/DB_TABLE) already covers the first step; schema_set has no HTTP
-// route yet either (a smaller, separate, still-open gap -- not addressed
-// here, same scope boundary rowstore.h's own comment on this syscall
-// draws).
+// (type=1/DB_TABLE) covers the first step, POST /api/schema (Gap
+// Remediation Phase H, above) covers the second.
 static int api_table_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
@@ -2425,6 +2485,11 @@ static void http_route(int conn, char* req) {
             return;
         }        if (!strcmp(path, "/api/valloc")) {
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase H ─────────────────────────────────────────────
+        if (!strcmp(path, "/api/schema")) {
+            blen = api_schema_set_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Gap Remediation Phase B ────────────────────────────────────────────
