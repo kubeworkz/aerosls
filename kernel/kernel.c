@@ -30,6 +30,9 @@
 #include "../kernel/mqt.h"
 #include "../kernel/stream.h"
 #include "../kernel/agent.h"
+#include "../kernel/rowstore.h"
+#include "../kernel/row_index.h"
+#include "../kernel/mvcc.h"
 #include "persist.h"
 
 extern void sls_shell_loop(void);
@@ -155,7 +158,29 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     cursor_mgr_init();
 
     // ── 4l. Materialized Query Table engine ──────────────────────────
-    mqt_init();    // ── 4n. AI agent engine ───────────────────────────────────────────────────
+    mqt_init();
+    // ── 4l-bis. Row-set storage engine (Phase 16, relational layer) ────
+    // RAM-only init here (zeroes table_headers[]/page cache); the real
+    // NVMe restore happens inside persist_restore_all() (step 7b below),
+    // same relationship stream_init() has with persist_restore_all().
+    rowstore_init();
+    // ── 4l-ter. B-tree row index engine (Phase 17, relational layer) ───
+    // RAM-only, no persistence this phase (see row_index.h's design
+    // comment) -- no restore step needed at 7b, unlike rowstore_init()
+    // above. Must come after rowstore_init() so table_headers[] is ready
+    // if an index is ever created eagerly during boot (not done today,
+    // but keeps the ordering meaningful).
+    row_index_init();
+    // ── 4l-quater. MVCC concurrency control (Phase 21, relational layer) ───
+    // RAM-only, no persistence this phase (see mvcc.h's design comment,
+    // same non-goal row_index_init() above already established) -- no
+    // restore step needed at 7b. Ordering relative to rowstore_init()/
+    // row_index_init() doesn't matter functionally (mvcc.c looks tables up
+    // by name at call time, not at init time), but is placed alongside them
+    // for the same "relational-layer subsystems init together" readability
+    // this boot sequence already groups by.
+    mvcc_init();
+    // ── 4n. AI agent engine ───────────────────────────────────────────────────
     agent_init();    // ── 4m. Stream object store (OBJ_TYPE_STREAM) ─────────────────
     // nvme_io_init + stream_init run after the PCI scan (step 7) so that
     // nvme_ctrl is fully set up before we attempt I/O queue creation.

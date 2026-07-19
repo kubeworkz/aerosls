@@ -26,6 +26,7 @@
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
 #include "kernel/partition.h"
+#include "kernel/rowstore.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -41,6 +42,13 @@ struct SLSObjectRecord object_records[CATALOG_MAX_OBJECTS];
 struct SLSObjectSchema object_schemas[CATALOG_MAX_OBJECTS];
 struct ServiceBinary   service_binaries[MAX_SERVICE_BINARIES];
 void catalog_after_restore(void) { /* no-op for this test */ }
+
+/* Phase 16 (relational layer): persist.c's restore block 6 (added this
+ * phase) touches rowstore.c's table_headers[]/rowstore_next_free_page_id.
+ * This persistence-focused test has no interest in row-store data — see
+ * rowstore_host_test.c for the real, call-tracked coverage of that. */
+struct RowTableHeader table_headers[ROWSTORE_MAX_TABLES];
+uint32_t               rowstore_next_free_page_id = 0;
 
 /* kernel_io.h's two logging functions — persist.c and partition.c both
  * call these purely for diagnostic serial output, no test-relevant

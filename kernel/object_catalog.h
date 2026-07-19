@@ -91,6 +91,11 @@ struct SLSObjectEntry {
     uint32_t       partition_id;            // Phase 8 (LPAR groundwork) — see partition.h;
                                              // 0 (PARTITION_SYSTEM/DEFAULT) for every object
                                              // predating Phase 8, by struct zero-init
+    uint8_t        uses_rowstore;           // Phase 16 (relational layer) — see rowstore.h;
+                                             // 0 for every object predating Phase 16 (struct
+                                             // zero-init) and for every object that never opts
+                                             // in: it keeps using the legacy single-record
+                                             // object_records[] path exactly as before.
 };
 
 // ─── Role Assignment Table ────────────────────────────────────────────────────

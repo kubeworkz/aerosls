@@ -87,6 +87,13 @@ uint32_t cursor_open(const char* table_name,
     c->index_pos = 0;
     c->done      = 0;
     c->active    = 1;
+    // Phase 19: a reused slot may have last been a row-set cursor -- reset
+    // its mode flag explicitly, the same "slot reuse leaves stale fields"
+    // lesson Phase 8's partition_id bug and Phase 14's frame-usage reset
+    // both taught this project to watch for. result_rows[]/result_count
+    // don't need clearing: is_rowset==0 makes them permanently unreachable
+    // through this cursor from here on.
+    c->is_rowset = 0;
 
     kernel_serial_print("[CURSOR] opened #");
     kernel_serial_print_hex64(c->cursor_id);
@@ -286,4 +293,68 @@ int cursors_to_json(char* buf, int max) {
     #undef JWC
     #undef JWU
     return n;
+}
+
+// ─── Phase 19 (relational layer) row-set mode ────────────────────────────
+// See cursor.h's struct comment: shares the slot pool and the opaque
+// cursor_id/position/done pagination shape with the legacy path above, but
+// touches none of the legacy path's fields or logic.
+uint32_t cursor_open_rowset(const char* table_name,
+                            const struct RowValues* rows, uint32_t row_count) {
+    struct SLSCursor* c = 0;
+    for (int i = 0; i < CURSOR_MAX; i++) {
+        if (!cursor_table[i].active) { c = &cursor_table[i]; break; }
+    }
+    if (!c) {
+        kernel_serial_print("[CURSOR] max cursors open (rowset)\n");
+        return 0;
+    }
+
+    c->cursor_id = cursor_next_id++;
+    cs_cpy(c->table_name, table_name ? table_name : "", (int)sizeof(c->table_name));
+    // Legacy-path fields don't apply to a row-set cursor -- reset rather
+    // than leave a prior slot occupant's values visible to cursors_to_json.
+    c->where_field[0] = '\0';
+    c->where_value[0] = '\0';
+    c->order_index[0] = '\0';
+    c->position  = 0;
+    c->index_pos = 0;
+
+    uint32_t n = row_count;
+    if (n > CURSOR_MAX_ROWSET_ROWS) n = CURSOR_MAX_ROWSET_ROWS;   // documented cap -- see cursor.h
+    for (uint32_t i = 0; i < n; i++) c->result_rows[i] = rows[i];
+    c->result_count = n;
+    c->result_pos   = 0;
+
+    c->is_rowset = 1;
+    c->done      = (n == 0) ? 1 : 0;
+    c->active    = 1;
+
+    kernel_serial_print("[CURSOR] opened rowset cursor #");
+    kernel_serial_print_hex64(c->cursor_id);
+    kernel_serial_print(" on ");
+    kernel_serial_print(c->table_name);
+    kernel_serial_print("\n");
+    return c->cursor_id;
+}
+
+uint32_t cursor_fetch_rows(uint32_t cursor_id, uint32_t max_rows, RowScanCb cb, void* ctx) {
+    struct SLSCursor* c = 0;
+    for (int i = 0; i < CURSOR_MAX; i++) {
+        if (cursor_table[i].active && cursor_table[i].cursor_id == cursor_id) {
+            c = &cursor_table[i]; break;
+        }
+    }
+    if (!c || !c->is_rowset) return 0;
+    if (c->done) return 0;
+
+    struct RowId zero_id = { 0, 0 };   // materialized rows carry no identity -- see cursor.h's note
+    uint32_t fetched = 0;
+    while (c->result_pos < c->result_count && fetched < max_rows) {
+        if (cb) cb(zero_id, &c->result_rows[c->result_pos], ctx);
+        c->result_pos++;
+        fetched++;
+    }
+    if (c->result_pos >= c->result_count) c->done = 1;
+    return fetched;
 }

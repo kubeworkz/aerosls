@@ -15,6 +15,7 @@
 #include "loader.h"
 #include "kernel_io.h"
 #include "partition.h"
+#include "rowstore.h"
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -138,6 +139,21 @@ void persist_partitions(void) {
     kernel_serial_print("[PERSIST] Partitions snapshot written.\n");
 }
 
+// ─── persist_rowstore_headers ─────────────────────────────────────────────────
+// Phase 16 (relational layer). Writes table_headers[] plus the page-pool
+// bump-allocator cursor (rowstore_next_free_page_id, stashed in the header
+// frame's v1 slot — same "steal a uint32 slot in write_hdr()" trick this
+// file has no dedicated pattern for otherwise). Row PAGE data is NOT
+// written here — see persist.h's comment on this function.
+void persist_rowstore_headers(void) {
+    if (!io_sq || !io_cq) return;
+    uint32_t hdr_bytes = (uint32_t)sizeof(table_headers);
+    write_hdr(PERSIST_ROWSTORE_HDR_LBA, PERSIST_MAGIC_ROWSTORE,
+              hdr_bytes, rowstore_next_free_page_id, 0);
+    persist_write_array(table_headers, hdr_bytes, PERSIST_ROWSTORE_ENT_LBA);
+    kernel_serial_print("[PERSIST] Row-store table headers snapshot written.\n");
+}
+
 // ─── persist_restore_all ─────────────────────────────────────────────────────
 // Called once at boot (kernel.c step 7b), before stream_init().
 // Each region is independently checked: a missing or mismatched magic causes
@@ -244,6 +260,33 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[PERSIST] Partitions: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 6. Row-store table headers (Phase 16) ────────────────────────────────
+    // Runs after rowstore_init() (kernel.c, alongside mqt_init()/agent_init())
+    // has already zeroed table_headers[] and reset the page-pool cursor — a
+    // valid snapshot here overwrites those cold-start defaults, same
+    // relationship every other restore block has with its subsystem's
+    // BSS-zeroed/explicitly-reset starting state. Row PAGE data itself is
+    // NOT restored here — pages restore lazily, one at a time, on first
+    // access via rowstore_load_page(), exactly like stream.c's frames[].
+    if (nvme_read_sync(PERSIST_ROWSTORE_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_ROWSTORE) {
+            uint32_t hdr_bytes, next_page;
+            p_memcpy(&hdr_bytes, p_buf +  8, 4);
+            p_memcpy(&next_page, p_buf + 12, 4);
+            if (hdr_bytes == (uint32_t)sizeof(table_headers)) {
+                persist_read_array(table_headers, hdr_bytes, PERSIST_ROWSTORE_ENT_LBA);
+                rowstore_next_free_page_id = next_page;
+                kernel_serial_print("[PERSIST] Row-store table headers restored from NVMe.\n");
+            } else {
+                kernel_serial_print("[PERSIST] Row-store: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Row-store: no snapshot — cold start.\n");
         }
     }
 }
