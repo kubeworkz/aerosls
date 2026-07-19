@@ -291,10 +291,16 @@ uint32_t vecstore_search(uint32_t caller_uid, const char* collection_name,
 // recall, and that comparison is only meaningful if both paths agree on
 // what "distance" and "closest" mean bit-for-bit. Reuse, not duplication,
 // is what makes that comparison trustworthy.
-float vs_sqrtf(float x);
-float vs_dot(const struct VecValues* a, const struct VecValues* b, uint32_t n);
-float vs_distance_cosine(const struct VecValues* a, const struct VecValues* b, uint32_t n);
-float vs_distance_l2(const struct VecValues* a, const struct VecValues* b, uint32_t n);
+// Gap Remediation (post-roadmap x86 boot-build fix): out-parameter
+// convention, not a by-value float return -- see vecstore.c's own header
+// comment on these four functions for why (the real x86-64 cross-build
+// disables SSE, and x86-64 has no ABI path for returning a float without
+// it; parameters and internal math are unaffected). Callers pass a `float*
+// out` as the first argument instead of using the return value.
+void vs_sqrtf(float* out, float x);
+void vs_dot(float* out, const struct VecValues* a, const struct VecValues* b, uint32_t n);
+void vs_distance_cosine(float* out, const struct VecValues* a, const struct VecValues* b, uint32_t n);
+void vs_distance_l2(float* out, const struct VecValues* a, const struct VecValues* b, uint32_t n);
 void  vs_topk_insert(struct VecMatch* out, uint32_t* found, uint32_t k, struct VecMatch cand);
 
 // ─── Vector Store Roadmap Phase 4: syscall surface ("make it live") ──────

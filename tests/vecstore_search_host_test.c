@@ -13,8 +13,8 @@
  * doesn't need to reason about tie-breaking behavior at all.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
- *       -o /tmp/vecstore_search_host_test vecstore_search_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
+ *       -o /tmp/vecstore_search_host_test tests/vecstore_search_host_test.c \
  *       kernel/vecstore.c kernel/vec_index.c
  *   /tmp/vecstore_search_host_test
  *

@@ -19,9 +19,9 @@
  *      predicate.c inherits rowstore.c's dependency surface for this half.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/predicate_host_test \
- *       predicate_host_test.c kernel/predicate.c kernel/rowstore.c kernel/persist.c
+ *       tests/predicate_host_test.c kernel/predicate.c kernel/rowstore.c kernel/persist.c
  *   /tmp/predicate_host_test
  */
 #include "kernel/object_catalog.h"
@@ -30,6 +30,11 @@
 #include "kernel/rowstore.h"
 #include "kernel/predicate.h"
 #include "kernel/persist.h"
+#include "kernel/row_index.h"
+#include "kernel/row_constraint.h"
+#include "kernel/row_journal.h"
+#include "kernel/vecstore.h"
+#include "kernel/vec_index.h"
 #include "user/permissions.h"
 #include <stdio.h>
 #include <string.h>
@@ -76,6 +81,53 @@ int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_per
     (void)uid; (void)obj_name; (void)needed_perm;
     g_access_calls++;
     return g_access_force_deny ? 0 : 1;
+}
+
+/* Pre-existing gap fixed in passing (post-roadmap, found while moving host
+ * tests into tests/ and reverifying every documented build line): this
+ * file's own link line never linked kernel/mvcc.c/row_index.c/row_
+ * constraint.c/row_journal.c/vecstore.c/vec_index.c, but persist.c's
+ * restore blocks 6b-11 reference their globals/functions unconditionally
+ * -- the same "persist.c grew cross-subsystem calls, one host test's own
+ * stub set was never updated to match" class already found and fixed
+ * several times over (Phase D, Phase F addenda) in OTHER files; this
+ * particular file was apparently missed by every prior sweep. Confirmed
+ * via the original, unmodified git history version of this file (before
+ * this session's own unrelated tests/ move) that the link failure is
+ * pre-existing, not something the move caused. Same minimal-stub pattern
+ * as persist_partition_host_test.c's own identical block -- every restore
+ * block correctly no-ops at "no snapshot" before ever touching this
+ * content, so none of it is exercised by this test's own scenarios. */
+struct RowConstraintDef row_constraints[ROW_CONSTRAINT_MAX];
+uint32_t                 row_constraint_count = 0;
+struct RowJournalEntry      row_journal_buffer[ROW_JOURNAL_MAX_ENTRIES];
+uint32_t                    row_journal_entry_count = 0;
+struct RowJournalAttachment row_journal_attachments[ROW_JOURNAL_MAX_ATTACHMENTS];
+uint32_t                    row_journal_attachment_count = 0;
+struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
+uint32_t                   vecstore_next_free_page_id = 0;
+struct RowIndex          row_indexes[ROW_INDEX_MAX];
+struct VecIndex             vec_indexes[VEC_INDEX_MAX];
+void mvcc_bootstrap_from_rowstore(void) { }
+void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
+                             struct VecId id, uint64_t external_id,
+                             const struct VecValues* values) {
+    (void)caller_uid; (void)collection_name; (void)id; (void)external_id; (void)values;
+}
+int row_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* table_name, const char* column_name) {
+    (void)caller_uid; (void)index_name; (void)table_name; (void)column_name;
+    return 1;
+}
+int vec_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* collection_name, VecMetric metric) {
+    (void)caller_uid; (void)index_name; (void)collection_name; (void)metric;
+    return 1;
+}
+uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_name,
+                                  VecScanCb cb, void* ctx) {
+    (void)caller_uid; (void)collection_name; (void)cb; (void)ctx;
+    return 0;
 }
 
 void* allocate_physical_ram_frame(void) { return malloc(4096); }

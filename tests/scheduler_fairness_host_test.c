@@ -20,9 +20,9 @@
  * schedule_ring3() itself.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I arch/x86 -I user \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 -I user \
  *       -o /tmp/scheduler_fairness_host_test \
- *       scheduler_fairness_host_test.c kernel/partition.c
+ *       tests/scheduler_fairness_host_test.c kernel/partition.c
  *   /tmp/scheduler_fairness_host_test
  */
 #include "kernel/process.h"

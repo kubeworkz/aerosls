@@ -15,8 +15,8 @@
  * "did it return something plausible."
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
- *       -o /tmp/vec_index_host_test vec_index_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
+ *       -o /tmp/vec_index_host_test tests/vec_index_host_test.c \
  *       kernel/vec_index.c kernel/vecstore.c
  *   /tmp/vec_index_host_test
  */

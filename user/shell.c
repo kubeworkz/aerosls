@@ -105,7 +105,11 @@ static const char* sh_token(const char* s, char* out, size_t outlen) {
 // sufficient for genuinely external JSON, which is exactly why
 // oc_parse_json_number() is a separate, more complete implementation
 // rather than this function being reused there.
-static float sh_atof(const char* s) {
+// Gap Remediation (post-roadmap x86 boot-build fix): out-parameter, not a
+// by-value float return -- the real x86-64 cross-build (-mno-sse) has no
+// ABI path for returning a float; see kernel/vecstore.c's own header
+// comment on the same fix applied there. Internal math is unchanged.
+static void sh_atof(float* out, const char* s) {
     int neg = 0;
     if (*s == '-') { neg = 1; s++; }
     float v = 0.0f;
@@ -115,7 +119,7 @@ static float sh_atof(const char* s) {
         float frac = 0.1f;
         while (*s >= '0' && *s <= '9') { v += (float)(*s - '0') * frac; frac *= 0.1f; s++; }
     }
-    return neg ? -v : v;
+    *out = neg ? -v : v;
 }
 
 // ── Phase 22: row-printing callback for "sql" SELECTs ──────────────────────
@@ -748,7 +752,7 @@ void sls_shell_loop(void) {
                 char vtok[32];
                 p = sh_token(p, vtok, sizeof(vtok));
                 if (!vtok[0]) break;
-                req.values.values[n++] = sh_atof(vtok);
+                sh_atof(&req.values.values[n++], vtok);
             }
             req.values.count = n;
             uint64_t rc = do_syscall(SYS_SLS_VEC_INSERT, &req);
@@ -802,7 +806,7 @@ void sls_shell_loop(void) {
                 char vtok[32];
                 p = sh_token(p, vtok, sizeof(vtok));
                 if (!vtok[0]) break;
-                req.query.values[n++] = sh_atof(vtok);
+                sh_atof(&req.query.values[n++], vtok);
             }
             req.query.count = n;
             do_syscall(SYS_SLS_VEC_SEARCH, &req);
@@ -868,7 +872,7 @@ void sls_shell_loop(void) {
                 char vtok[32];
                 p = sh_token(p, vtok, sizeof(vtok));
                 if (!vtok[0]) break;
-                req.query.values[n++] = sh_atof(vtok);
+                sh_atof(&req.query.values[n++], vtok);
             }
             req.query.count = n;
             do_syscall(SYS_SLS_VEC_INDEX_SEARCH, &req);
@@ -911,7 +915,7 @@ void sls_shell_loop(void) {
                 char vtok[32];
                 p = sh_token(p, vtok, sizeof(vtok));
                 if (!vtok[0]) break;
-                sreq.query.values[n++] = sh_atof(vtok);
+                sh_atof(&sreq.query.values[n++], vtok);
             }
             sreq.query.count = n;
             do_syscall(SYS_SLS_VEC_SEARCH, &sreq);

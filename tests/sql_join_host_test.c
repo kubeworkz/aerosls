@@ -23,8 +23,8 @@
  * note) yet still produce identical, correct results either way.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
- *       -o /tmp/sql_join_host_test sql_join_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
+ *       -o /tmp/sql_join_host_test tests/sql_join_host_test.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
  *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
  *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c

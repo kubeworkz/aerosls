@@ -307,42 +307,64 @@ uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_na
 // under 10 iterations for any realistic embedding-magnitude input) rather
 // than looping until exact equality, which float rounding can make loop
 // forever for some inputs.
-float vs_sqrtf(float x) {
-    if (x <= 0.0f) return 0.0f;
+// Gap Remediation (post-roadmap x86 boot-build fix): every function on this
+// page used to return float by value. The real x86_64-elf-gcc cross-compile
+// (this project's Makefile x86-run target, using -mno-sse -mno-sse2 -mno-mmx
+// -- deliberately disabled since the CR0.TS/#NM lazy-FPU-switch scaffolding
+// in arch/x86/lazy_fpu.c is not actually wired up yet: no IDT vector 7 gate,
+// no CR4.OSFXSR/OSXSAVE, no xsetbv anywhere in the tree) failed with "SSE
+// register return with SSE disabled" the first time this project was ever
+// actually built with its own real cross-compiler -- every previous phase's
+// "syntax-check clean" claim used host gcc's default flags, which never
+// exercised -mno-sse and so never could have caught this. Confirmed by
+// direct experiment (see the roadmap's own Phase A gap) that on x86-64,
+// -mno-sse only breaks float/double BY-VALUE RETURN -- float parameters and
+// all-local float arithmetic still compile fine (GCC silently falls back to
+// stack-passing for params and x87 for local math) -- so the fix is
+// narrowly an out-parameter convention on every function that used to
+// `return` a float, not a rewrite of the math itself. Internal arithmetic,
+// precision, and behavior are all unchanged; only the calling convention is.
+void vs_sqrtf(float* out, float x) {
+    if (x <= 0.0f) { *out = 0.0f; return; }
     float guess = (x < 1.0f) ? 1.0f : x;
     for (int i = 0; i < 20; i++) {
         float next = 0.5f * (guess + x / guess);
         if (next == guess) break;
         guess = next;
     }
-    return guess;
+    *out = guess;
 }
 
-float vs_dot(const struct VecValues* a, const struct VecValues* b, uint32_t n) {
+void vs_dot(float* out, const struct VecValues* a, const struct VecValues* b, uint32_t n) {
     float s = 0.0f;
     for (uint32_t i = 0; i < n; i++) s += a->values[i] * b->values[i];
-    return s;
+    *out = s;
 }
 
 // 1.0f - cosine similarity -- see vecstore.h's header comment on why this
 // (not raw similarity) is what this file calls "cosine distance."
-float vs_distance_cosine(const struct VecValues* a, const struct VecValues* b, uint32_t n) {
-    float na = vs_sqrtf(vs_dot(a, a, n));
-    float nb = vs_sqrtf(vs_dot(b, b, n));
-    if (na == 0.0f || nb == 0.0f) return 1.0f;   // undefined direction -- neutral, not min or max
-    float sim = vs_dot(a, b, n) / (na * nb);
+void vs_distance_cosine(float* out, const struct VecValues* a, const struct VecValues* b, uint32_t n) {
+    float aa, bb, ab;
+    vs_dot(&aa, a, a, n);
+    vs_dot(&bb, b, b, n);
+    float na, nb;
+    vs_sqrtf(&na, aa);
+    vs_sqrtf(&nb, bb);
+    if (na == 0.0f || nb == 0.0f) { *out = 1.0f; return; }   // undefined direction -- neutral, not min or max
+    vs_dot(&ab, a, b, n);
+    float sim = ab / (na * nb);
     if (sim > 1.0f) sim = 1.0f;     // clamp -- float rounding can push a tiny bit outside [-1,1]
     if (sim < -1.0f) sim = -1.0f;
-    return 1.0f - sim;
+    *out = 1.0f - sim;
 }
 
-float vs_distance_l2(const struct VecValues* a, const struct VecValues* b, uint32_t n) {
+void vs_distance_l2(float* out, const struct VecValues* a, const struct VecValues* b, uint32_t n) {
     float s = 0.0f;
     for (uint32_t i = 0; i < n; i++) {
         float d = a->values[i] - b->values[i];
         s += d * d;
     }
-    return vs_sqrtf(s);
+    vs_sqrtf(out, s);
 }
 
 // Bounded top-K insertion: out[0..*found) stays sorted ascending by
@@ -381,9 +403,9 @@ struct vs_search_ctx {
 
 static void vs_search_cb(struct VecId id, uint64_t external_id, const struct VecValues* v, void* ctxp) {
     struct vs_search_ctx* ctx = (struct vs_search_ctx*)ctxp;
-    float dist = (ctx->metric == VEC_METRIC_L2)
-                 ? vs_distance_l2(ctx->query, v, ctx->dimension)
-                 : vs_distance_cosine(ctx->query, v, ctx->dimension);
+    float dist;
+    if (ctx->metric == VEC_METRIC_L2) vs_distance_l2(&dist, ctx->query, v, ctx->dimension);
+    else                              vs_distance_cosine(&dist, ctx->query, v, ctx->dimension);
     struct VecMatch cand = { external_id, id, dist };
     vs_topk_insert(ctx->out, &ctx->found, ctx->k, cand);
 }

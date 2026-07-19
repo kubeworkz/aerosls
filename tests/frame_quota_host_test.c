@@ -11,8 +11,8 @@
  * not a function call), so no other kernel source needs linking.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -o /tmp/frame_quota_host_test \
- *       frame_quota_host_test.c kernel/frame_pool.c
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -o /tmp/frame_quota_host_test \
+ *       tests/frame_quota_host_test.c kernel/frame_pool.c
  *   /tmp/frame_quota_host_test
  */
 #include "kernel/frame_pool.h"

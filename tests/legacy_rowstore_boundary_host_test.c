@@ -44,8 +44,8 @@
  * comes for free with the real file).
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
- *       -o /tmp/legacy_rowstore_boundary_host_test legacy_rowstore_boundary_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
+ *       -o /tmp/legacy_rowstore_boundary_host_test tests/legacy_rowstore_boundary_host_test.c \
  *       kernel/object_catalog.c kernel/rowstore.c
  *   /tmp/legacy_rowstore_boundary_host_test
  */

@@ -80,19 +80,23 @@ static int vi_fetch_values(struct VecIndex* idx, uint32_t caller_uid, uint32_t n
     return vecstore_get(caller_uid, idx->collection_name, vec_index_nodes[node_idx].vec_id, &ext, out);
 }
 
-static float vi_distance(struct VecIndex* idx, uint32_t caller_uid, const struct VecValues* query, uint32_t node_idx) {
+// Gap Remediation (post-roadmap x86 boot-build fix): out-parameter
+// convention, not a by-value float return -- see vecstore.c's own header
+// comment (the real x86-64 cross-build disables SSE, which breaks float
+// BY-VALUE RETURN specifically; parameters and internal math are fine).
+static void vi_distance(float* out, struct VecIndex* idx, uint32_t caller_uid, const struct VecValues* query, uint32_t node_idx) {
     struct VecValues v;
-    if (vi_fetch_values(idx, caller_uid, node_idx, &v) != 0) return VI_DISTANCE_INFINITY;
-    return (idx->metric == VEC_METRIC_L2) ? vs_distance_l2(query, &v, idx->dimension)
-                                          : vs_distance_cosine(query, &v, idx->dimension);
+    if (vi_fetch_values(idx, caller_uid, node_idx, &v) != 0) { *out = VI_DISTANCE_INFINITY; return; }
+    if (idx->metric == VEC_METRIC_L2) vs_distance_l2(out, query, &v, idx->dimension);
+    else                              vs_distance_cosine(out, query, &v, idx->dimension);
 }
 
-static float vi_node_distance(struct VecIndex* idx, uint32_t caller_uid, uint32_t a, uint32_t b) {
+static void vi_node_distance(float* out, struct VecIndex* idx, uint32_t caller_uid, uint32_t a, uint32_t b) {
     struct VecValues va, vb;
-    if (vi_fetch_values(idx, caller_uid, a, &va) != 0) return VI_DISTANCE_INFINITY;
-    if (vi_fetch_values(idx, caller_uid, b, &vb) != 0) return VI_DISTANCE_INFINITY;
-    return (idx->metric == VEC_METRIC_L2) ? vs_distance_l2(&va, &vb, idx->dimension)
-                                          : vs_distance_cosine(&va, &vb, idx->dimension);
+    if (vi_fetch_values(idx, caller_uid, a, &va) != 0) { *out = VI_DISTANCE_INFINITY; return; }
+    if (vi_fetch_values(idx, caller_uid, b, &vb) != 0) { *out = VI_DISTANCE_INFINITY; return; }
+    if (idx->metric == VEC_METRIC_L2) vs_distance_l2(out, &va, &vb, idx->dimension);
+    else                              vs_distance_cosine(out, &va, &vb, idx->dimension);
 }
 
 // ─── Bounded candidate list -- structurally the same insertion-sorted-
@@ -156,7 +160,7 @@ static void vi_search_layer(struct VecIndex* idx, uint32_t caller_uid,
         uint32_t node_idx = entry_points[i];
         if (node_idx >= VEC_INDEX_MAX_NODES || vi_visited[node_idx]) continue;
         vi_visited[node_idx] = 1;
-        float d = vi_distance(idx, caller_uid, query, node_idx);
+        float d; vi_distance(&d, idx, caller_uid, query, node_idx);
         struct vi_cand c = { node_idx, d };
         vi_beam_insert(&frontier, VEC_INDEX_MAX_EF, c);
         vi_beam_insert(result, ef, c);
@@ -177,7 +181,7 @@ static void vi_search_layer(struct VecIndex* idx, uint32_t caller_uid,
             uint32_t nb = node->neighbors[layer][i];
             if (nb >= VEC_INDEX_MAX_NODES || vi_visited[nb]) continue;
             vi_visited[nb] = 1;
-            float d = vi_distance(idx, caller_uid, query, nb);
+            float d; vi_distance(&d, idx, caller_uid, query, nb);
             if (result->count < ef || d < result->items[result->count - 1].distance) {
                 struct vi_cand c = { nb, d };
                 vi_beam_insert(&frontier, VEC_INDEX_MAX_EF, c);
@@ -196,7 +200,7 @@ static uint32_t vi_greedy_descend(struct VecIndex* idx, uint32_t caller_uid,
                                   const struct VecValues* query,
                                   uint32_t entry_node, uint32_t from_layer, uint32_t down_to_layer) {
     uint32_t current = entry_node;
-    float current_dist = vi_distance(idx, caller_uid, query, current);
+    float current_dist; vi_distance(&current_dist, idx, caller_uid, query, current);
     for (uint32_t layer = from_layer; layer > down_to_layer; layer--) {
         int improved = 1;
         while (improved) {
@@ -205,7 +209,7 @@ static uint32_t vi_greedy_descend(struct VecIndex* idx, uint32_t caller_uid,
             if (layer > node->top_layer) break;   // defensive
             for (uint32_t i = 0; i < node->neighbor_count[layer]; i++) {
                 uint32_t nb = node->neighbors[layer][i];
-                float d = vi_distance(idx, caller_uid, query, nb);
+                float d; vi_distance(&d, idx, caller_uid, query, nb);
                 if (d < current_dist) { current = nb; current_dist = d; improved = 1; }
             }
         }
@@ -230,11 +234,11 @@ static void vi_connect(struct VecIndex* idx, uint32_t caller_uid, uint32_t from,
         return;
     }
 
-    float new_dist = vi_node_distance(idx, caller_uid, from, to);
+    float new_dist; vi_node_distance(&new_dist, idx, caller_uid, from, to);
     uint32_t worst_i = 0;
-    float worst_dist = vi_node_distance(idx, caller_uid, from, node->neighbors[layer][0]);
+    float worst_dist; vi_node_distance(&worst_dist, idx, caller_uid, from, node->neighbors[layer][0]);
     for (uint32_t i = 1; i < node->neighbor_count[layer]; i++) {
-        float d = vi_node_distance(idx, caller_uid, from, node->neighbors[layer][i]);
+        float d; vi_node_distance(&d, idx, caller_uid, from, node->neighbors[layer][i]);
         if (d > worst_dist) { worst_dist = d; worst_i = i; }
     }
     if (new_dist < worst_dist) node->neighbors[layer][worst_i] = to;

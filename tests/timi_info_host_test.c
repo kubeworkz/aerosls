@@ -46,8 +46,8 @@
  * real serial-port driver).
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -o /tmp/timi_info_host_test \
- *       timi_info_host_test.c kernel/loader.c kernel/timi_translate.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -o /tmp/timi_info_host_test \
+ *       tests/timi_info_host_test.c kernel/loader.c kernel/timi_translate.c \
  *       kernel/timi_x86.c
  *   /tmp/timi_info_host_test
  */

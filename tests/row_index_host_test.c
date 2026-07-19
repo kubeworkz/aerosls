@@ -14,9 +14,9 @@
  * isolation.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/row_index_host_test \
- *       row_index_host_test.c kernel/row_index.c kernel/rowstore.c kernel/persist.c
+ *       tests/row_index_host_test.c kernel/row_index.c kernel/rowstore.c kernel/persist.c
  *   /tmp/row_index_host_test
  */
 #include "kernel/object_catalog.h"

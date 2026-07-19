@@ -25,8 +25,8 @@
  * surface, just to link).
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
- *       -o /tmp/vecstore_host_test vecstore_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
+ *       -o /tmp/vecstore_host_test tests/vecstore_host_test.c \
  *       kernel/vecstore.c kernel/vec_index.c
  *   /tmp/vecstore_host_test
  *

@@ -426,13 +426,19 @@ static void json_str_or_default(const char* json, const char* key, char* out, in
 // Extract "key": F (a single decimal number) as a float -- Gap Remediation
 // Phase C, the scalar counterpart to json_float_array() above, needed for
 // distance values inside a "matches" array element (POST /api/vec/join).
-static float json_float(const char* json, const char* key) {
+// Gap Remediation (post-roadmap x86 boot-build fix): out-parameter, not a
+// by-value float return -- see kernel/vecstore.c's own header comment on
+// why (the real x86-64 cross-build disables SSE, which breaks float
+// BY-VALUE RETURN specifically; local double/float math is unaffected).
+// Behavior unchanged from the original by-value version: *out is set to
+// 0.0f if `key` isn't found, same as the old "return 0.0f" default.
+static void json_float(const char* json, const char* key, float* out) {
     char srch[128]; int si = 0;
     srch[si++] = '"';
     for (int i = 0; key[i]&&si<120; i++) srch[si++] = key[i];
     srch[si++] = '"'; srch[si++] = ':'; srch[si] = '\0';
     const char* p = str_find(json, srch);
-    if (!p) return 0.0f;
+    if (!p) { *out = 0.0f; return; }
     p += si;
     while (*p==' '||*p=='\t') p++;
     int neg = 0;
@@ -444,7 +450,7 @@ static float json_float(const char* json, const char* key) {
         double frac = 0.1;
         while (*p>='0'&&*p<='9') { v += (double)(*p-'0') * frac; frac *= 0.1; p++; }
     }
-    return (float)(neg ? -v : v);
+    *out = (float)(neg ? -v : v);
 }
 
 // Extracts the n-th top-level JSON object from a "key": [ {...}, {...} ]
@@ -1725,7 +1731,7 @@ static int api_vec_join_post(const char* body, char* buf, int max, uint32_t req_
         req.matches[n].external_id  = json_uint64(objbuf, "external_id");
         req.matches[n].id.page_id    = (uint32_t)json_int(objbuf, "page_id");
         req.matches[n].id.slot_index = (uint32_t)json_int(objbuf, "slot_index");
-        req.matches[n].distance      = json_float(objbuf, "distance");
+        json_float(objbuf, "distance", &req.matches[n].distance);
         n++;
     }
     req.match_count = n;

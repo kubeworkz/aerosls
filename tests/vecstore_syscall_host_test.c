@@ -18,8 +18,8 @@
  * vecstore_search_host_test.c).
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
- *       -o /tmp/vecstore_syscall_host_test vecstore_syscall_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
+ *       -o /tmp/vecstore_syscall_host_test tests/vecstore_syscall_host_test.c \
  *       kernel/vecstore.c kernel/vec_index.c
  *   /tmp/vecstore_syscall_host_test
  *

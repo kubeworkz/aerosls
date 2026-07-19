@@ -13,8 +13,8 @@
  * partition_host_test.c and Phase 10's persist_partition_host_test.c.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -o /tmp/ipc_partition_host_test \
- *       ipc_partition_host_test.c kernel/ipc.c kernel/partition.c
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -o /tmp/ipc_partition_host_test \
+ *       tests/ipc_partition_host_test.c kernel/ipc.c kernel/partition.c
  *   /tmp/ipc_partition_host_test
  */
 #include "kernel/process.h"

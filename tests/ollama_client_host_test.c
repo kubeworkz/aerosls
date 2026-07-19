@@ -23,8 +23,8 @@
  * that it parses responses correctly.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
- *       -o /tmp/ollama_client_host_test ollama_client_host_test.c net/ollama_client.c
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
+ *       -o /tmp/ollama_client_host_test tests/ollama_client_host_test.c net/ollama_client.c
  *   /tmp/ollama_client_host_test
  */
 #include "net/ollama_client.h"

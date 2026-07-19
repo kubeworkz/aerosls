@@ -12,8 +12,8 @@
  * for NVMe (fake in-memory block store) and TSC-seeded token generation.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
- *       -o /tmp/auth_host_test auth_host_test.c kernel/auth.c
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
+ *       -o /tmp/auth_host_test tests/auth_host_test.c kernel/auth.c
  *   /tmp/auth_host_test
  */
 #include "kernel/auth.h"

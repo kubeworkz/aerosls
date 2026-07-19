@@ -18,9 +18,9 @@
  * the io_sq/io_cq "is NVMe up" guards — small enough to fake convincingly.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/persist_partition_host_test \
- *       persist_partition_host_test.c kernel/persist.c kernel/partition.c
+ *       tests/persist_partition_host_test.c kernel/persist.c kernel/partition.c
  *   /tmp/persist_partition_host_test
  */
 #include "kernel/object_catalog.h"

@@ -18,8 +18,8 @@
  *
  * Not part of any Makefile target — a one-off verification artifact, built
  * and run directly:
- *   gcc -Wall -Wextra -std=c11 -I kernel -o /tmp/partition_host_test \
- *       partition_host_test.c kernel/partition.c
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -o /tmp/partition_host_test \
+ *       tests/partition_host_test.c kernel/partition.c
  *   /tmp/partition_host_test
  */
 #include "kernel/partition.h"

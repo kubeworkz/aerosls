@@ -22,9 +22,9 @@
  * restore block 6, not just rowstore.c's in-RAM logic.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/rowstore_host_test \
- *       rowstore_host_test.c kernel/rowstore.c kernel/persist.c
+ *       tests/rowstore_host_test.c kernel/rowstore.c kernel/persist.c
  *   /tmp/rowstore_host_test
  */
 #include "kernel/object_catalog.h"

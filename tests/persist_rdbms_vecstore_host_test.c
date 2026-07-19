@@ -38,9 +38,9 @@
  * "reuse the real engine, don't drag in what it doesn't need" precedent.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/persist_rdbms_vecstore_host_test \
- *       persist_rdbms_vecstore_host_test.c \
+ *       tests/persist_rdbms_vecstore_host_test.c \
  *       kernel/persist.c kernel/rowstore.c kernel/row_index.c kernel/mvcc.c \
  *       kernel/row_constraint.c kernel/row_journal.c kernel/vecstore.c \
  *       kernel/vec_index.c

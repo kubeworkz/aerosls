@@ -15,9 +15,9 @@
  * test.c for that). Zero fake NVMe, zero catalog, zero rowstore state.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/sql_parser_host_test \
- *       sql_parser_host_test.c kernel/sql_parser.c kernel/predicate.c
+ *       tests/sql_parser_host_test.c kernel/sql_parser.c kernel/predicate.c
  *   /tmp/sql_parser_host_test
  */
 #include "kernel/object_catalog.h"

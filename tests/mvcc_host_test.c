@@ -13,8 +13,8 @@
  * host test already proved out for a different subsystem.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
- *       -o /tmp/mvcc_host_test mvcc_host_test.c \
+ *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
+ *       -o /tmp/mvcc_host_test tests/mvcc_host_test.c \
  *       kernel/mvcc.c kernel/rowstore.c kernel/persist.c \
  *       kernel/row_constraint.c kernel/row_journal.c
  *   /tmp/mvcc_host_test
