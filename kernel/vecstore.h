@@ -55,16 +55,27 @@
  * Phase 22 used to justify adding `mvcc_txn_is_active()` only once
  * `sql_exec.c`'s own test actually needed it.
  *
- * ─── Why this phase is RAM-only, with no NVMe persistence ────────────────
- * A real, explicit scope cut, not an oversight: `row_index.c` (Phase 17)
- * already established the precedent of a RAM-only first cut for a new
- * storage-adjacent subsystem in this codebase ("no persistence this phase"
- * — see its own header comment). Adding NVMe paging here would mean a new
- * `PERSIST_MAGIC_VECSTORE` region, a new reserved LBA range (mirroring
- * `ROWSTORE_LBA_BASE`), and lazy-load/eager-flush plumbing identical in
- * shape to `rowstore.c`'s own — real, mechanical work that this first
- * phase defers rather than silently skips. `vecstore_init()` simply zeroes
- * everything at boot every time, the same as `row_index_init()` does.
+ * ─── Why this phase is RAM-only, with no NVMe persistence (SUPERSEDED —
+ * see Gap Remediation Phase D below) ───────────────────────────────────────
+ * A real, explicit scope cut, not an oversight, AT THE TIME: `row_index.c`
+ * (Phase 17) already established the precedent of a RAM-only first cut for
+ * a new storage-adjacent subsystem in this codebase ("no persistence this
+ * phase" — see its own header comment). Kept here as the historical record
+ * of why that was the original decision. Gap Remediation Phase D
+ * (docs/AeroSLS-Gap-Remediation-Roadmap-v0.1.md) did the "real, mechanical
+ * work that this first phase defers" this paragraph named: `vecstore.c`'s
+ * page pool now lazy-loads from / eagerly flushes to NVMe exactly like
+ * `rowstore.c`'s own, via `VECSTORE_LBA_BASE` below, and `vector_
+ * collections[]` itself persists via `persist.h`'s ordinary magic-tagged
+ * pattern. `row_index.c`'s OWN precedent still holds, unchanged — B-tree
+ * indexes remain a derived, rebuild-on-boot structure over now-persisted
+ * row data, not persisted directly (see row_index.h and Phase D's own
+ * findings addendum for why the two subsystems get different treatment).
+ * `vecstore_init()` still zeroes the in-RAM page-pointer cache at every
+ * boot (mirroring `rowstore_init()`'s identical relationship with
+ * `persist_restore_all()`, which runs later and may then lazily repopulate
+ * pages from NVMe on first access) — only the RAM-only CLAIM in this
+ * paragraph's title is superseded, not the init-then-restore sequencing.
  *
  * ─── Registration: object must already exist via `sys_sls_valloc`, no
  * schema step ───────────────────────────────────────────────────────────
@@ -95,9 +106,26 @@
                                           // all-minilm=384, bge-large=1024 -- revisit only if a
                                           // future model genuinely needs more, not speculatively
 #define VECSTORE_PAGE_SIZE        4096
-#define VECSTORE_MAX_PAGES        65536   // RAM-only (see header comment) -- 256 MiB ceiling at
-                                           // VECSTORE_PAGE_SIZE, a real, stated cap not a silent one
+#define VECSTORE_MAX_PAGES        65536   // 256 MiB ceiling at VECSTORE_PAGE_SIZE, a real, stated
+                                           // cap not a silent one -- now backed by real NVMe
+                                           // persistence (Gap Remediation Phase D, see below);
+                                           // was RAM-only through Phase 6, see this header's own
+                                           // superseded "RAM-only" rationale further up, kept as
+                                           // historical record of why that was the original
+                                           // decision rather than deleted
 #define VECSTORE_INVALID_PAGE     0xFFFFFFFFu
+
+// ─── Gap Remediation Phase D: bulk page-data persistence ────────────────────
+// Mirrors rowstore.h's own ROWSTORE_LBA_BASE exactly -- a separate, large,
+// sparse NVMe region for page data, distinct from persist.h's small-struct-
+// array regions (vector_collections[] itself persists via persist.h's
+// ordinary PERSIST_VECSTORE_HDR_LBA/PERSIST_VECSTORE_ENT_LBA instead -- see
+// persist.h). Placed well clear of ROWSTORE_LBA_BASE's own reserved span
+// (2,000,000 + ROWSTORE_MAX_PAGES*8 sectors = ends at LBA 4,097,152) with
+// margin; reserves VECSTORE_MAX_PAGES*8 = 524,288 sectors, ending at LBA
+// 4,724,288 -- comfortably inside the 10 GiB disk image's 20,971,520-sector
+// budget (see Makefile).
+#define VECSTORE_LBA_BASE  4200000ULL
 
 // Max bytes one serialized entry can occupy: 1 tombstone byte + 8-byte
 // external_id + up to VECSTORE_MAX_DIMENSION floats. Used to size a stack
@@ -371,5 +399,17 @@ uint64_t sys_sls_vec_create(struct SLSVecCreateRequest* req);
 uint64_t sys_sls_vec_insert(struct SLSVecInsertRequest* req);
 uint64_t sys_sls_vec_embed_insert(struct SLSVecEmbedInsertRequest* req);
 uint64_t sys_sls_vec_search(struct SLSVecSearchRequest* req);
+
+// ─── Gap Remediation Phase C: collection enumeration ──────────────────────
+// Before this, a caller had to already know a collection's name -- there
+// was no way, at any level (syscall, shell, HTTP), to ask "what vector
+// collections exist" (docs/AeroSLS-Gap-Analysis-v0.1.md §7). Mirrors
+// sys_sls_obj_list()'s own shape exactly (object_catalog.c): dumps every
+// active vector_collections[] entry directly via kernel_serial_printf, no
+// return value, matching that established "list" syscall convention rather
+// than SYS_SLS_VEC_CREATE/etc.'s own request-struct-with-status shape
+// (there is no per-call caller-supplied data for a list operation to carry).
+#define SYS_SLS_VEC_LIST 229
+void sys_sls_vec_list(void);
 
 #endif /* VECSTORE_H */

@@ -5,6 +5,7 @@
 #include "row_constraint.h"
 #include "object_catalog.h"
 #include "mvcc.h"
+#include "persist.h"   // Gap Remediation Phase D -- persist_row_constraints()
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc -- each kernel source file keeps its
@@ -149,6 +150,8 @@ static RowConstraintResult rc_add(RowConstraintKind kind, const char* table_name
     c->ref_table_name[0] = '\0';
     if (ref_table_name) rc_strcpy(c->ref_table_name, ref_table_name, OBJECT_NAME_LEN);
     c->ref_column_index = ref_col;
+
+    persist_row_constraints();   // Gap Remediation Phase D
     return ROW_CONSTRAINT_OK;
 }
 

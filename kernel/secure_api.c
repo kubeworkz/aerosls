@@ -32,6 +32,23 @@ void derive_user_key(const char* password, uint32_t len, uint32_t* out_key) {
     out_key[7] = 0xCAFEBABE ^ out_key[1];
 }
 
+// Gap Remediation Phase E: sys_sls_secure_seal() derives a password-based
+// key (via derive_user_key() above) and stores it in the kernel's in-memory
+// key directory, keyed by system_object_id. That is ALL it does. It does
+// NOT read, transform, or write back the target object's actual stored
+// data -- nothing in this function ever touches the object's own bytes on
+// NVMe or in RAM, so calling this on an object leaves that object's
+// content exactly as readable as it was before the call. The struct
+// SLSSealRequest's own encryption_algorithm_flags field (secure_api.h,
+// e.g. "1 = ChaCha20-User") is accepted but never read below -- no cipher
+// is ever applied, ChaCha20 or otherwise. This function previously logged
+// "successfully encrypted," which was false and actively misleading to
+// anyone reading the kernel log; the roadmap's own gap analysis named this
+// specifically. Per the roadmap's own recommendation, this pass relabels
+// rather than implements real encryption (a much larger project: it would
+// need a real cipher, and hooks into every object-storage read/write path
+// this kernel has -- rowstore, vecstore, legacy KV records -- to actually
+// transform data at rest, not just register a key nobody uses yet).
 uint64_t sys_sls_secure_seal(struct SLSSealRequest* req) {
     if (!req || req->password_len == 0) return -1;
 
@@ -56,7 +73,10 @@ uint64_t sys_sls_secure_seal(struct SLSSealRequest* req) {
     derive_user_key(req->user_password, req->password_len, secure_key_directory[target_slot].derived_key);
     secure_key_directory[target_slot].is_active = 1;
 
-    // Force an immediate reload of the cryptographic parameters in the background crypto workers
-    kernel_serial_printf("[SECURITY] Object %d successfully encrypted with user password key matrix.\n", req->system_object_id);
+    // Gap Remediation Phase E: this log previously claimed the object was
+    // "successfully encrypted" -- it wasn't (see this function's own header
+    // comment). Relabeled to describe exactly what happened: a key was
+    // derived and stored, nothing more.
+    kernel_serial_printf("[SECURITY] Key derived and stored for object %d (data NOT re-encrypted -- key registration only).\n", req->system_object_id);
     return 0;
 }

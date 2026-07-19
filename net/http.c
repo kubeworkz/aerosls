@@ -25,6 +25,12 @@
 #include "../user/permissions.h"
 #include "../kernel/agent.h"
 #include "../kernel/agent_tools.h"
+#include "../kernel/rowstore.h"   // Gap Remediation Phase B -- POST /api/tables, GET /api/tables[/name/schema]
+#include "../kernel/sql_exec.h"   // Gap Remediation Phase B -- POST /api/sql
+#include "../kernel/vec_join.h"   // Gap Remediation Phase C -- POST /api/vec/join
+#include "../kernel/vec_index.h"  // Gap Remediation Phase C -- POST /api/vec/indexes, /api/vec/index/search
+#include "../kernel/partition.h"  // Gap Remediation Phase F -- partition create/list/destroy/assign/pause/resume
+#include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -346,6 +352,146 @@ static int json_int(const char* json, const char* key) {
     return v;
 }
 
+// Extract "key": N (integer, widened to 64 bits) from a JSON string --
+// json_int()'s own parse loop widened, needed for vector external_id values
+// (Gap Remediation Phase C).
+static uint64_t json_uint64(const char* json, const char* key) {
+    char srch[128]; int si = 0;
+    srch[si++] = '"';
+    for (int i = 0; key[i]&&si<120; i++) srch[si++] = key[i];
+    srch[si++] = '"'; srch[si++] = ':'; srch[si] = '\0';
+    const char* p = str_find(json, srch);
+    if (!p) return 0;
+    p += si;
+    while (*p==' '||*p=='\t') p++;
+    uint64_t v = 0;
+    while (*p>='0'&&*p<='9') { v = v*10 + (uint64_t)(*p-'0'); p++; }
+    return v;
+}
+
+// Extract a JSON array of numbers "key": [n0, n1, ...] into out[] as floats
+// -- Gap Remediation Phase C, needed for vector query/insert values. No
+// libc strtof (freestanding) -- a hand-rolled decimal/sign/fraction parse,
+// the same shape rowstore.c's own rs_parse_f64()/net/ollama_client.c's own
+// oc_parse_json_number() already use elsewhere, kept as its own small copy
+// here rather than shared (matching this project's established "each file
+// keeps its own small helpers" convention -- see vec_join.h's own header
+// comment on why). Returns the number of floats written (0..max).
+static int json_float_array(const char* json, const char* key, float* out, int max) {
+    char srch[128]; int si = 0;
+    srch[si++] = '"';
+    for (int i = 0; key[i]&&si<120; i++) srch[si++] = key[i];
+    srch[si++] = '"'; srch[si++] = ':'; srch[si] = '\0';
+    const char* p = str_find(json, srch);
+    if (!p) return 0;
+    p += si;
+    while (*p==' '||*p=='\t') p++;
+    if (*p != '[') return 0;
+    p++;
+    int n = 0;
+    while (*p && *p != ']' && n < max) {
+        while (*p==' '||*p=='\t'||*p==',') p++;
+        if (*p == ']' || !*p) break;
+        int neg = 0;
+        if (*p == '-') { neg = 1; p++; }
+        double v = 0.0;
+        while (*p>='0'&&*p<='9') { v = v*10.0 + (double)(*p-'0'); p++; }
+        if (*p == '.') {
+            p++;
+            double frac = 0.1;
+            while (*p>='0'&&*p<='9') { v += (double)(*p-'0') * frac; frac *= 0.1; p++; }
+        }
+        out[n++] = (float)(neg ? -v : v);
+        while (*p==' '||*p=='\t') p++;
+    }
+    return n;
+}
+
+// Fills out[] with json_str(json, key, ...)'s result, or with def if the
+// key was absent/empty -- json_str() itself leaves out[] untouched (not
+// even null-terminated) on failure, so a caller that needs a guaranteed
+// default must pre-clear first. No libc strcpy (freestanding, and not used
+// anywhere else in this file) -- a small hand-rolled copy loop instead,
+// matching this codebase's established per-file *_strcpy() convention.
+static void json_str_or_default(const char* json, const char* key, char* out, int max, const char* def) {
+    out[0] = '\0';
+    json_str(json, key, out, max);
+    if (!out[0]) {
+        int i = 0;
+        for (; i < max - 1 && def[i]; i++) out[i] = def[i];
+        out[i] = '\0';
+    }
+}
+
+// Extract "key": F (a single decimal number) as a float -- Gap Remediation
+// Phase C, the scalar counterpart to json_float_array() above, needed for
+// distance values inside a "matches" array element (POST /api/vec/join).
+static float json_float(const char* json, const char* key) {
+    char srch[128]; int si = 0;
+    srch[si++] = '"';
+    for (int i = 0; key[i]&&si<120; i++) srch[si++] = key[i];
+    srch[si++] = '"'; srch[si++] = ':'; srch[si] = '\0';
+    const char* p = str_find(json, srch);
+    if (!p) return 0.0f;
+    p += si;
+    while (*p==' '||*p=='\t') p++;
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; }
+    double v = 0.0;
+    while (*p>='0'&&*p<='9') { v = v*10.0 + (double)(*p-'0'); p++; }
+    if (*p == '.') {
+        p++;
+        double frac = 0.1;
+        while (*p>='0'&&*p<='9') { v += (double)(*p-'0') * frac; frac *= 0.1; p++; }
+    }
+    return (float)(neg ? -v : v);
+}
+
+// Extracts the n-th top-level JSON object from a "key": [ {...}, {...} ]
+// array into out (a plain, null-terminated copy of just that one object's
+// text, braces included) -- Gap Remediation Phase C, needed for POST
+// /api/vec/join, the one route on this surface taking an array of OBJECTS
+// rather than an array of plain numbers (json_float_array already covers
+// those). Assumes no nested objects inside a match entry (true for the
+// {external_id, page_id, slot_index, distance} shape this route expects --
+// matching exactly what GET .../api/vec/search's own response already
+// emits, so a client can round-trip one response straight into the next
+// request's body). Returns 1 if index n existed and was copied, 0
+// otherwise (array too short, key missing, malformed).
+static int json_array_object_at(const char* json, const char* key, int n, char* out, int max) {
+    char srch[128]; int si = 0;
+    srch[si++] = '"';
+    for (int i = 0; key[i]&&si<120; i++) srch[si++] = key[i];
+    srch[si++] = '"'; srch[si++] = ':'; srch[si] = '\0';
+    const char* p = str_find(json, srch);
+    if (!p) return 0;
+    p += si;
+    while (*p==' '||*p=='\t') p++;
+    if (*p != '[') return 0;
+    p++;
+    int idx = 0;
+    while (*p && *p != ']') {
+        while (*p==' '||*p=='\t'||*p==',') p++;
+        if (*p != '{') break;
+        const char* start = p;
+        int depth = 0;
+        while (*p) {
+            if (*p == '{') depth++;
+            else if (*p == '}') { depth--; if (depth == 0) { p++; break; } }
+            p++;
+        }
+        if (idx == n) {
+            int len = (int)(p - start);
+            if (len >= max) len = max - 1;
+            for (int i = 0; i < len; i++) out[i] = start[i];
+            out[len] = '\0';
+            return 1;
+        }
+        idx++;
+    }
+    return 0;
+}
+
 // URL-decode: replace + with space and %XX with the byte value
 static int url_decode(const char* src, char* dst, int max) {
     int n = 0;
@@ -412,6 +558,64 @@ static int api_objects(char* buf, int max) {
     }
     jb_arr_close(&j);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/tables — Gap Remediation Phase B ────────────────────────────────
+// Enumerates row-set tables (object_catalog[] entries with uses_rowstore
+// set -- distinct from OBJ_TYPE_DB_TABLE, which also covers legacy
+// single-record KV objects that never called rowstore_create_table()).
+// Needed so a Navigator-style table browser can list what exists without
+// already knowing a name -- no such enumeration had any HTTP route before
+// this (docs/AeroSLS-Gap-Analysis-v0.1.md §5).
+static int api_tables_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "tables");
+    int first = 1;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        struct SLSObjectEntry* e = &object_catalog[i];
+        if (!e->active || !e->uses_rowstore) continue;
+        struct RowTableHeader* h = &table_headers[i];
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "name", e->name); jb_putc(&j, ',');
+        jb_uint(&j, "column_count", h->layout.column_count); jb_putc(&j, ',');
+        jb_uint(&j, "row_count", h->row_count); jb_putc(&j, ',');
+        jb_uint(&j, "page_count", h->page_count);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/tables/<name>/schema — Gap Remediation Phase B ──────────────────
+// Column names + types for one row-set table, derived from its
+// RowTableLayout (computed once at rowstore_create_table() time -- see
+// rowstore.h). Distinct from the legacy /api/objects/<name>'s own
+// best-effort per-field type lookup (which walks object_schemas[] matching
+// on live record field keys); this reads the table's own fixed layout
+// directly, the authoritative source for a row-set table's real columns.
+static int api_table_schema(const char* name, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        struct SLSObjectEntry* e = &object_catalog[i];
+        if (!e->active || !e->uses_rowstore || strcmp(e->name, name) != 0) continue;
+        struct RowTableLayout* layout = &table_headers[i].layout;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "name", e->name); jb_putc(&j, ',');
+        jb_arr_open(&j, "columns");
+        for (uint32_t c = 0; c < layout->column_count; c++) {
+            if (c) jb_putc(&j, ',');
+            jb_obj_open(&j, 0);
+            jb_str(&j, "name", layout->column_names[c]); jb_putc(&j, ',');
+            jb_str(&j, "type", field_type_name(layout->column_types[c]));
+            jb_obj_close(&j);
+        }
+        jb_arr_close(&j);
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    jb_obj_open(&j, 0); jb_str(&j, "error", "table not found"); jb_obj_close(&j);
+    j.buf[j.pos]='\0'; return j.pos;
 }
 
 // ─── GET /api/objects/<name> ──────────────────────────────────────────────────
@@ -658,6 +862,66 @@ static int api_programs_list(char* buf, int max) {
     return j.pos;
 }
 
+// ─── GET /api/timi/<name> — Gap Remediation Phase G ────────────────────────────
+// Structured counterpart to loader_timi_info()'s own console dump -- reads
+// through loader_timi_info_query() directly (the same real logic
+// loader_timi_info() itself now wraps, see loader.c's own comment), not the
+// SYS_SLS_TIMI_INFO syscall -- matching Phase B/C/F's established "read
+// kernel state / call the query function directly for a JSON response
+// rather than repurposing a console-dump-shaped syscall" precedent.
+static int api_timi_info(const char* name, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    struct TimiInfoResult r;
+    loader_timi_info_query(name, &r);
+
+    jb_obj_open(&j, 0);
+    jb_str(&j, "name", name); jb_putc(&j, ',');
+    const char* status_str =
+        r.status == TIMI_INFO_STATUS_OK        ? "ok" :
+        r.status == TIMI_INFO_STATUS_NOT_FOUND ? "not_found" :
+        r.status == TIMI_INFO_STATUS_NOT_TIMI  ? "not_timi" : "corrupt";
+    jb_str(&j, "status", status_str);
+    if (r.status == TIMI_INFO_STATUS_NOT_TIMI) {
+        jb_putc(&j, ','); jb_str(&j, "format", r.format_name);
+    }
+    if (r.status == TIMI_INFO_STATUS_OK) {
+        jb_putc(&j, ',');
+        jb_uint(&j, "num_instr",    r.num_instr);    jb_putc(&j, ',');
+        jb_uint(&j, "num_literals", r.num_literals);  jb_putc(&j, ',');
+        jb_uint(&j, "num_entries",  r.num_entries);   jb_putc(&j, ',');
+        jb_uint(&j, "num_names",    r.num_names);     jb_putc(&j, ',');
+        jb_arr_open(&j, "entries");
+        for (uint32_t i = 0; i < r.entries_returned; i++) {
+            if (i) jb_putc(&j, ',');
+            jb_obj_open(&j, 0);
+            jb_str(&j, "name", r.entries[i].name); jb_putc(&j, ',');
+            jb_uint(&j, "offset", r.entries[i].offset);
+            jb_obj_close(&j);
+        }
+        jb_arr_close(&j); jb_putc(&j, ',');
+        jb_str(&j, "entries_truncated", r.entries_truncated ? "true" : "false"); jb_putc(&j, ',');
+        jb_arr_open(&j, "names");
+        for (uint32_t i = 0; i < r.names_returned; i++) {
+            if (i) jb_putc(&j, ',');
+            jb_esc_str(&j, r.names[i].name);
+        }
+        jb_arr_close(&j); jb_putc(&j, ',');
+        jb_str(&j, "names_truncated", r.names_truncated ? "true" : "false"); jb_putc(&j, ',');
+        jb_obj_open(&j, "activation");
+        jb_str(&j, "cached", r.activation.cached ? "true" : "false");
+        if (r.activation.cached) {
+            jb_putc(&j, ',');
+            jb_uint(&j, "code_pages",   r.activation.code_pages);   jb_putc(&j, ',');
+            jb_uint(&j, "entry_offset", r.activation.entry_offset); jb_putc(&j, ',');
+            jb_hex(&j,  "content_hash", r.activation.content_hash);
+        }
+        jb_obj_close(&j);
+    }
+    jb_obj_close(&j);
+    j.buf[j.pos] = '\0';
+    return j.pos;
+}
+
 // ─── POST /api/program/create ─────────────────────────────────────────────────
 static int api_program_create(const char* body, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -785,7 +1049,19 @@ static int api_program_upload(const char* body, char* buf, int max) {
 }
 
 // ─── POST /api/program/spawn ──────────────────────────────────────────────────
-static int api_program_spawn_handler(const char* body, char* buf, int max) {
+// Gap Remediation Phase F: req_uid now threads through to program_load() as
+// the real caller identity, replacing a hardcoded 0 (PARTITION_SYSTEM/kernel
+// identity) named as its own separate gap in docs/AeroSLS-Gap-Analysis-v0.1.md
+// §5 and again in the Phase B addendum's own /api/sql comment -- every
+// spawned process was silently owned by the kernel regardless of who
+// actually authenticated the request, meaning catalog_check_access()'s
+// PERM_EXECUTE check inside program_spawn() (kernel/process.c) was checking
+// the wrong identity, and every spawned process landed in PARTITION_SYSTEM
+// instead of the caller's own partition (kernel/partition.c's
+// partition_get_for_uid()). Same req_uid plumbing api_table_create_post()/
+// api_sql_post()/api_agent_create() already established -- copying an
+// existing pattern, not inventing one.
+static int api_program_spawn_handler(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) {
         jb_obj_open(&j, 0); jb_str(&j, "error", "missing body");
@@ -801,7 +1077,7 @@ static int api_program_spawn_handler(const char* body, char* buf, int max) {
     }
     /* program_load() validates OBJ_TYPE_PROGRAM, calls program_spawn()
        which maps pages into a fresh PML4 and enters Ring-3. */
-    uint64_t pid = program_load(pname, 0);
+    uint64_t pid = program_load(pname, req_uid);
     jb_obj_open(&j, 0);
     jb_str(&j,  "ok",  pid ? "true" : "false"); jb_putc(&j, ',');
     jb_uint(&j, "pid", pid);
@@ -951,6 +1227,529 @@ static int api_valloc_post(const char* body, char* buf, int max) {
         jb_str(&j,"ok","false"); jb_putc(&j,',');
         jb_str(&j,"error","valloc failed");
     }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/tables — Gap Remediation Phase B ───────────────────────────────
+// The live path rowstore_create_table() never had: before this, the only
+// way to promote a valloc'd + schema'd catalog object into a real row-set
+// table was a host test calling rowstore_create_table() directly (see
+// docs/AeroSLS-Gap-Analysis-v0.1.md §2/§5). Body: {"name": "<table_name>"}.
+// Does not valloc or schema-set for the caller -- POST /api/valloc
+// (type=1/DB_TABLE) already covers the first step; schema_set has no HTTP
+// route yet either (a smaller, separate, still-open gap -- not addressed
+// here, same scope boundary rowstore.h's own comment on this syscall
+// draws).
+static int api_table_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSRowstoreCreateTableRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.table_name, OBJECT_NAME_LEN);
+    if (!req.table_name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t rc = sys_sls_rowstore_create_table(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", req.table_name);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/sql — Gap Remediation Phase B ──────────────────────────────────
+// The live path sql_execute() never had over HTTP: SYS_SLS_SQL_EXECUTE
+// (Phase 22) was already syscall/shell-reachable, but net/http.c had zero
+// "sql" routes at all (docs/AeroSLS-Gap-Analysis-v0.1.md §5) -- confirmed
+// by direct inspection before this phase, not assumed. Body:
+// {"query": "<statement>"}. Runs one autocommit statement under req_uid
+// (the real bearer-token identity, matching the agent/workflow POST routes'
+// own req_uid convention -- not a hardcoded uid, unlike the program-spawn
+// routes' own separately-named gap in the analysis doc). SELECT results are
+// fetched and embedded directly in this one response (up to however many
+// rows fit in the shared resp_body buffer -- this file's existing, established
+// truncate-silently-at-the-byte-buffer convention, same as every other
+// dump-a-collection endpoint here; no new pagination route is added).
+struct sql_row_json_ctx { JSONBuf* j; int first; };
+static void sql_row_to_json_cb(struct RowId id, const struct RowValues* v, void* ctxp) {
+    (void)id;
+    struct sql_row_json_ctx* ctx = (struct sql_row_json_ctx*)ctxp;
+    if (!ctx->first) jb_putc(ctx->j, ',');
+    ctx->first = 0;
+    jb_arr_open(ctx->j, 0);
+    for (uint32_t i = 0; i < v->count; i++) {
+        if (i) jb_putc(ctx->j, ',');
+        jb_esc_str(ctx->j, v->values[i]);
+    }
+    jb_arr_close(ctx->j);
+}
+static int api_sql_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSSqlRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "query", req.sql_text, SQL_MAX_TEXT_LEN);
+    uint64_t rc = sys_sls_sql_execute(&req);
+
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j, ',');
+    if (rc != 0) {
+        jb_uint(&j, "error_code", (uint64_t)req.result.error); jb_putc(&j, ',');
+        jb_str(&j, "error", req.result.error_msg);
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    if (req.result.kind == SQL_STMT_SELECT) {
+        jb_uint(&j, "row_count", req.result.row_count); jb_putc(&j, ',');
+        jb_str(&j, "truncated", req.result.truncated ? "true" : "false"); jb_putc(&j, ',');
+        jb_arr_open(&j, "columns");
+        for (uint32_t c = 0; c < req.result.column_count; c++) {
+            if (c) jb_putc(&j, ',');
+            jb_esc_str(&j, req.result.columns[c]);
+        }
+        jb_arr_close(&j); jb_putc(&j, ',');
+        jb_arr_open(&j, "rows");
+        struct sql_row_json_ctx ctx = { &j, 1 };
+        cursor_fetch_rows(req.result.cursor_id, req.result.row_count, sql_row_to_json_cb, &ctx);
+        cursor_close(req.result.cursor_id);
+        jb_arr_close(&j);
+    } else {
+        jb_uint(&j, "affected_rows", req.result.affected_rows);
+    }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/vec/collections — Gap Remediation Phase C ───────────────────────
+// Enumerates vector collections -- reads vector_collections[] directly
+// (index-aligned with object_catalog[], same idiom api_tables_list() uses
+// for row-set tables) rather than going through SYS_SLS_VEC_LIST, which
+// dumps to the serial console, not a return buffer -- matching Phase B's
+// own GET-route precedent of reading kernel state directly for a JSON
+// response rather than repurposing a console-dump syscall.
+static int api_vec_collections_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "collections");
+    int first = 1;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (!object_catalog[i].active || !vector_collections[i].active) continue;
+        struct VecCollectionHeader* h = &vector_collections[i];
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "name", object_catalog[i].name); jb_putc(&j, ',');
+        jb_uint(&j, "dimension", h->dimension); jb_putc(&j, ',');
+        jb_uint(&j, "entry_count", h->entry_count); jb_putc(&j, ',');
+        jb_uint(&j, "page_count", h->page_count);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/vec/indexes — Gap Remediation Phase C ────────────────────────────
+// Enumerates HNSW indexes -- reads vec_indexes[] directly, same reasoning
+// as api_vec_collections_list() above.
+static int api_vec_indexes_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "indexes");
+    int first = 1;
+    for (uint32_t i = 0; i < VEC_INDEX_MAX; i++) {
+        if (!vec_indexes[i].active) continue;
+        struct VecIndex* idx = &vec_indexes[i];
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "name", idx->index_name); jb_putc(&j, ',');
+        jb_str(&j, "collection", idx->collection_name); jb_putc(&j, ',');
+        jb_str(&j, "metric", idx->metric == VEC_METRIC_L2 ? "l2" : "cosine"); jb_putc(&j, ',');
+        jb_uint(&j, "active_count", idx->active_count); jb_putc(&j, ',');
+        jb_uint(&j, "node_count", idx->node_count);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/partitions — Gap Remediation Phase F ─────────────────────────────
+// Enumerates defined partitions -- reads partition_table[] directly, same
+// "read kernel state, don't repurpose a console-dump syscall" idiom as
+// api_vec_collections_list() above. Every partition syscall (create, list,
+// destroy, assign, pause, resume) was already correctly wired at the
+// syscall/dispatch layer since Phase 8/14 -- this is the first time any of
+// it is reachable outside a host test or the raw shell (docs/AeroSLS-Gap-
+// Remediation-Roadmap-v0.1.md Phase F).
+static int api_partitions_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "partitions");
+    int first = 1;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        if (!partition_table[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "id", partition_table[i].partition_id); jb_putc(&j, ',');
+        jb_str(&j, "name", partition_table[i].name); jb_putc(&j, ',');
+        jb_uint(&j, "frame_usage", (uint32_t)partition_get_frame_usage(i)); jb_putc(&j, ',');
+        uint64_t quota = partition_get_frame_quota(i);
+        jb_uint(&j, "frame_quota", (uint32_t)quota); jb_putc(&j, ',');
+        jb_str(&j, "quota_unlimited", quota == 0 ? "true" : "false");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/partition/quotas — Gap Remediation Phase F ───────────────────────
+// Same per-partition usage/quota data folded into api_partitions_list() above
+// (added there directly, the same "one list, everything about it" shape
+// api_tables_list() already established) -- this route exists as a distinct,
+// narrower endpoint anyway, mirroring the syscall-level split between
+// sys_sls_partition_list() and sys_sls_partition_quota_list() (Phase F also
+// gave the latter its first syscall number -- frame_pool.h), so a caller who
+// only cares about quota pressure doesn't have to parse the wider payload.
+static int api_partition_quotas_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "quotas");
+    int first = 1;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        uint64_t usage = partition_get_frame_usage(i);
+        uint64_t quota = partition_get_frame_quota(i);
+        if (usage == 0 && quota == 0) continue;   // mirrors sys_sls_partition_quota_list()'s own skip rule
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", i); jb_putc(&j, ',');
+        jb_uint(&j, "usage", (uint32_t)usage); jb_putc(&j, ',');
+        jb_uint(&j, "quota", (uint32_t)quota); jb_putc(&j, ',');
+        jb_str(&j, "unlimited", quota == 0 ? "true" : "false");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/partitions — Gap Remediation Phase F ────────────────────────────
+// Body: {"name": "<partition_name>"}. Thin wrapper over
+// sys_sls_partition_create(), the same shape as api_table_create_post().
+static int api_partition_create_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSPartitionCreateRequest req;
+    req.name[0] = '\0';
+    json_str(body, "name", req.name, PARTITION_NAME_LEN);
+    if (!req.name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t id = sys_sls_partition_create(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", id != 0xFFFFFFFFu ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "partition_id", (uint32_t)id);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/partition/assign — Gap Remediation Phase F ─────────────────────
+// Body: {"uid": N, "partition_id": N}.
+static int api_partition_assign_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSPartitionAssignRequest req;
+    req.uid          = (uint32_t)json_int(body, "uid");
+    req.partition_id = (uint32_t)json_int(body, "partition_id");
+    uint64_t rc = sys_sls_partition_assign(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/partition/destroy — Gap Remediation Phase F ────────────────────
+// Body: {"partition_id": N}.
+static int api_partition_destroy_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    uint32_t partition_id = (uint32_t)json_int(body, "partition_id");
+    uint64_t rc = sys_sls_partition_destroy(partition_id);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/partition/pause | /api/partition/resume — Gap Remediation
+// Phase F ─────────────────────────────────────────────────────────────────────
+// Body: {"partition_id": N}. `resume` selects sys_sls_partition_resume()
+// instead of sys_sls_partition_pause() -- same one-function-two-routes shape
+// api_tx_post() already established for commit/rollback.
+static int api_partition_pause_post(const char* body, char* buf, int max, int resume) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    uint32_t partition_id = (uint32_t)json_int(body, "partition_id");
+    uint64_t rc = resume ? sys_sls_partition_resume(partition_id)
+                         : sys_sls_partition_pause(partition_id);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/partition/quota — Gap Remediation Phase F ──────────────────────
+// Body: {"partition_id": N, "frame_quota": N}. frame_quota=0 means unlimited
+// (frame_pool.h's own convention) -- passing it explicitly re-uncaps a
+// previously-limited partition, not just an omission default.
+static int api_partition_quota_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSPartitionQuotaSetRequest req;
+    req.partition_id = (uint32_t)json_int(body, "partition_id");
+    req.frame_quota  = json_uint64(body, "frame_quota");
+    uint64_t rc = sys_sls_partition_quota_set(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/collections — Gap Remediation Phase C ──────────────────────
+// The live path Vector Store Phase 4's SYS_SLS_VEC_CREATE never had over
+// HTTP -- syscall/shell-reachable since Phase 4, zero HTTP routes for any
+// vector-store capability before this (docs/AeroSLS-Gap-Analysis-v0.1.md
+// §7). Body: {"name": "<collection>", "dimension": N}. Requires the
+// catalog object to already exist via POST /api/valloc, matching
+// SYS_SLS_VEC_CREATE's own precondition.
+static int api_vec_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecCreateRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.collection_name, OBJECT_NAME_LEN);
+    req.dimension = (uint32_t)json_int(body, "dimension");
+    uint64_t rc = sys_sls_vec_create(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", req.collection_name); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/insert — Gap Remediation Phase C ────────────────────────────
+// Body: {"collection": "<name>", "external_id": N, "values": [f0, f1, ...]}.
+static int api_vec_insert_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecInsertRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
+    req.external_id = json_uint64(body, "external_id");
+    req.values.count = (uint32_t)json_float_array(body, "values", req.values.values, VECSTORE_MAX_DIMENSION);
+    uint64_t rc = sys_sls_vec_insert(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status); jb_putc(&j,',');
+    jb_uint(&j, "page_id", req.out_id.page_id); jb_putc(&j,',');
+    jb_uint(&j, "slot_index", req.out_id.slot_index);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/embed-insert — Gap Remediation Phase C ──────────────────────
+// Body: {"collection": "<name>", "external_id": N, "endpoint_ip": "...",
+// "port": N, "model": "...", "prompt": "..."}. endpoint_ip/port default to
+// 127.0.0.1:11434 (local Ollama) if omitted, matching the shell command's
+// own "embed-insert always targets a local Ollama instance" convention
+// (user/shell.c).
+static int api_vec_embed_insert_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecEmbedInsertRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
+    req.external_id = json_uint64(body, "external_id");
+    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "127.0.0.1");
+    int port = json_int(body, "port");
+    req.ollama_req.port = (uint16_t)(port ? port : 11434);
+    json_str_or_default(body, "model", req.ollama_req.model, OLLAMA_MODEL_LEN, "nomic-embed-text");
+    req.ollama_req.prompt[0] = '\0';
+    json_str(body, "prompt", req.ollama_req.prompt, OLLAMA_PROMPT_LEN);
+    uint64_t rc = sys_sls_vec_embed_insert(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "ollama_status", (uint64_t)req.ollama_status); jb_putc(&j,',');
+    jb_uint(&j, "insert_status", (uint64_t)req.insert_status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/search — Gap Remediation Phase C ────────────────────────────
+// Body: {"collection": "<name>", "query": [f0, f1, ...], "metric":
+// "cosine"|"l2" (default cosine), "k": N}.
+static int api_vec_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecSearchRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
+    req.query.count = (uint32_t)json_float_array(body, "query", req.query.values, VECSTORE_MAX_DIMENSION);
+    char metric_s[16]; metric_s[0] = '\0';
+    json_str(body, "metric", metric_s, (int)sizeof(metric_s));
+    req.metric = (!strcmp(metric_s, "l2") || !strcmp(metric_s, "L2")) ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+    req.k = (uint32_t)json_int(body, "k");
+    if (!req.k) req.k = 10;
+    uint64_t rc = sys_sls_vec_search(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "match_count", req.match_count); jb_putc(&j,',');
+    jb_str(&j, "truncated", req.truncated ? "true" : "false"); jb_putc(&j,',');
+    jb_arr_open(&j, "matches");
+    uint32_t nshown = req.match_count < VEC_SEARCH_MAX_K ? req.match_count : VEC_SEARCH_MAX_K;
+    for (uint32_t i = 0; i < nshown; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "external_id", req.matches[i].external_id); jb_putc(&j, ',');
+        jb_uint(&j, "page_id", req.matches[i].id.page_id); jb_putc(&j, ',');
+        jb_uint(&j, "slot_index", req.matches[i].id.slot_index); jb_putc(&j, ',');
+        jb_key(&j, "distance");
+        // distance is a float -- no float formatter in this file's JSONBuf
+        // yet; round-trip via the same fixed-6-decimal shape rowstore.c's
+        // own rs_f64_to_str() uses, inlined here since it's the only float
+        // field this whole API surface has ever needed to emit.
+        {
+            double v = (double)req.matches[i].distance;
+            char fb[32]; int fn = 0;
+            if (v < 0) { fb[fn++] = '-'; v = -v; }
+            uint64_t ip = (uint64_t)v; double frac = v - (double)ip;
+            char ipb[24]; int il = 0;
+            if (!ip) ipb[il++] = '0'; else { uint64_t t = ip; while (t) { ipb[il++] = (char)('0'+t%10); t/=10; } }
+            for (int k = il-1; k >= 0; k--) fb[fn++] = ipb[k];
+            fb[fn++] = '.';
+            for (int d = 0; d < 6; d++) { frac *= 10.0; int digit = (int)frac; if (digit<0) digit=0; if (digit>9) digit=9; fb[fn++]=(char)('0'+digit); frac -= (double)digit; }
+            fb[fn] = '\0';
+            jb_raw(&j, fb);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/indexes — Gap Remediation Phase C ───────────────────────────
+// Live path for vec_index_create() (Vector Store Phase 6, HNSW), which had
+// no syscall/shell/HTTP surface at all before this pass (vec_index.h's own
+// point 6 named it a deliberate "revisit only when a real caller needs it"
+// cut). Body: {"name": "<index>", "collection": "<collection>", "metric":
+// "cosine"|"l2" (default cosine)}. Does not backfill an already-populated
+// collection -- see vec_index.h's own point 7.
+static int api_vec_index_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecIndexCreateRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.index_name, OBJECT_NAME_LEN);
+    json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
+    char metric_s[16]; metric_s[0] = '\0';
+    json_str(body, "metric", metric_s, (int)sizeof(metric_s));
+    req.metric = (!strcmp(metric_s, "l2") || !strcmp(metric_s, "L2")) ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+    uint64_t rc = sys_sls_vec_index_create(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", req.index_name); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/index/search — Gap Remediation Phase C ──────────────────────
+// Live path for vec_index_search() (approximate top-K over the HNSW
+// index). Body: {"index": "<name>", "query": [f0, f1, ...], "k": N,
+// "ef": N (default = k)}. Response shape matches POST /api/vec/search's own
+// (external_id/page_id/slot_index/distance per match) so a client can treat
+// exact and approximate search as interchangeable result consumers.
+static int api_vec_index_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecIndexSearchRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "index", req.index_name, OBJECT_NAME_LEN);
+    req.query.count = (uint32_t)json_float_array(body, "query", req.query.values, VECSTORE_MAX_DIMENSION);
+    req.k = (uint32_t)json_int(body, "k");
+    if (!req.k) req.k = 10;
+    req.ef = (uint32_t)json_int(body, "ef");
+    if (!req.ef) req.ef = req.k;
+    uint64_t rc = sys_sls_vec_index_search(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "match_count", req.match_count); jb_putc(&j,',');
+    jb_str(&j, "truncated", req.truncated ? "true" : "false"); jb_putc(&j,',');
+    jb_arr_open(&j, "matches");
+    uint32_t nshown = req.match_count < VEC_SEARCH_MAX_K ? req.match_count : VEC_SEARCH_MAX_K;
+    for (uint32_t i = 0; i < nshown; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "external_id", req.matches[i].external_id); jb_putc(&j, ',');
+        jb_uint(&j, "page_id", req.matches[i].id.page_id); jb_putc(&j, ',');
+        jb_uint(&j, "slot_index", req.matches[i].id.slot_index); jb_putc(&j, ',');
+        jb_key(&j, "distance");
+        {
+            double v = (double)req.matches[i].distance;
+            char fb[32]; int fn = 0;
+            if (v < 0) { fb[fn++] = '-'; v = -v; }
+            uint64_t ip = (uint64_t)v; double frac = v - (double)ip;
+            char ipb[24]; int il = 0;
+            if (!ip) ipb[il++] = '0'; else { uint64_t t = ip; while (t) { ipb[il++] = (char)('0'+t%10); t/=10; } }
+            for (int k = il-1; k >= 0; k--) fb[fn++] = ipb[k];
+            fb[fn++] = '.';
+            for (int d = 0; d < 6; d++) { frac *= 10.0; int digit = (int)frac; if (digit<0) digit=0; if (digit>9) digit=9; fb[fn++]=(char)('0'+digit); frac -= (double)digit; }
+            fb[fn] = '\0';
+            jb_raw(&j, fb);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/join — Gap Remediation Phase C ──────────────────────────────
+// Live path for vec_join_resolve() (Vector Store Phase 5), which had no
+// syscall/shell/HTTP surface at all before this pass. Body: {"table":
+// "<name>", "id_column": "<col>", "matches": [{"external_id": N,
+// "page_id": N, "slot_index": N, "distance": F}, ...]} -- takes matches
+// directly (typically the "matches" array from a prior POST /api/vec/search
+// or /api/vec/index/search response, round-tripped as-is) rather than
+// re-running a search itself, matching sys_sls_vec_join()'s own real
+// contract: this is the join primitive alone, composable with either search
+// path via ordinary REST calls rather than a hidden second search.
+static int api_vec_join_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecJoinRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "table", req.table_name, OBJECT_NAME_LEN);
+    json_str(body, "id_column", req.id_column, RECORD_KEY_LEN);
+    uint32_t n = 0;
+    char objbuf[256];
+    while (n < VEC_SEARCH_MAX_K && json_array_object_at(body, "matches", (int)n, objbuf, (int)sizeof(objbuf))) {
+        req.matches[n].external_id  = json_uint64(objbuf, "external_id");
+        req.matches[n].id.page_id    = (uint32_t)json_int(objbuf, "page_id");
+        req.matches[n].id.slot_index = (uint32_t)json_int(objbuf, "slot_index");
+        req.matches[n].distance      = json_float(objbuf, "distance");
+        n++;
+    }
+    req.match_count = n;
+    uint64_t rc = sys_sls_vec_join(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "match_count", n); jb_putc(&j,',');
+    jb_uint(&j, "result_count", req.result_count); jb_putc(&j,',');
+    jb_str(&j, "truncated", req.truncated ? "true" : "false"); jb_putc(&j,',');
+    jb_arr_open(&j, "results");
+    uint32_t nshown = req.result_count < VEC_JOIN_MAX_RESULTS ? req.result_count : VEC_JOIN_MAX_RESULTS;
+    for (uint32_t i = 0; i < nshown; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "external_id", req.results[i].match.external_id); jb_putc(&j, ',');
+        jb_arr_open(&j, "row");
+        for (uint32_t c = 0; c < req.results[i].row.count; c++) {
+            if (c) jb_putc(&j, ',');
+            jb_esc_str(&j, req.results[i].row.values[c]);
+        }
+        jb_arr_close(&j);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
@@ -1318,6 +2117,24 @@ static void http_route(int conn, char* req) {
 
     // ── GET routes ────────────────────────────────────────────────────────────
     if (!is_post) {
+        // Gap Remediation Phase E: bearer-token gate for GET routes, mirroring
+        // the POST gate further below. Scoped to /api/* data routes only --
+        // /auth/token and /auth/verify stay public (issuing or checking a
+        // token can't itself require a valid one), /api/health stays public
+        // as a conventional unauthenticated liveness probe, and everything
+        // NOT under /api/ (the compiled-in Navigator SPA bundle + dynamic
+        // WEB_APP assets, matched further down) stays public too -- the
+        // SPA's own login screen has to be reachable before a caller has a
+        // token to present in the first place.
+        if (str_find(path, "/api/") == path && strcmp(path, "/api/health") != 0) {
+            uint32_t get_uid = 0; SLSRole get_role = ROLE_GUEST;
+            auth_http_extract(req, &get_uid, &get_role);
+            if (get_role == ROLE_GUEST) {
+                const char* e401 = "{\"error\":\"Unauthorized — include Authorization: Bearer <token>\"}";
+                http_respond(conn, 401, "application/json", e401, (int)strlen(e401));
+                return;
+            }
+        }
         if (!strcmp(path, "/auth/verify")) {
             blen = api_auth_verify(req, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -1341,6 +2158,51 @@ static void http_route(int conn, char* req) {
         if (str_find(path, "/api/objects/") == path) {
             blen = api_object_detail(path + 13, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase C: GET /api/vec/collections, /api/vec/indexes ──
+        if (!strcmp(path, "/api/vec/collections")) {
+            blen = api_vec_collections_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/indexes")) {
+            blen = api_vec_indexes_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase F: GET /api/partitions, /api/partition/quotas ──
+        if (!strcmp(path, "/api/partitions")) {
+            blen = api_partitions_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/quotas")) {
+            blen = api_partition_quotas_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase G: GET /api/timi/<name> ──────────────────────
+        if (str_find(path, "/api/timi/") == path) {
+            blen = api_timi_info(path + 10, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase B: GET /api/tables[/<name>/schema] ──────────
+        if (!strcmp(path, "/api/tables")) {
+            blen = api_tables_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (str_find(path, "/api/tables/") == path) {
+            const char* rest = path + 12;   // after "/api/tables/"
+            const char* suffix = str_find(rest, "/schema");
+            char tname[OBJECT_NAME_LEN]; tname[0] = '\0';
+            if (suffix && suffix[7] == '\0') {   // exact trailing "/schema", nothing after
+                uint32_t n = (uint32_t)(suffix - rest);
+                if (n >= OBJECT_NAME_LEN) n = OBJECT_NAME_LEN - 1;
+                for (uint32_t k = 0; k < n; k++) tname[k] = rest[k];
+                tname[n] = '\0';
+            }
+            if (tname[0]) {
+                blen = api_table_schema(tname, resp_body, (int)sizeof(resp_body));
+                http_respond(conn, 200, "application/json", resp_body, blen); return;
+            }
+            const char* e = "{\"error\":\"unknown /api/tables/ route -- try /api/tables/<name>/schema\"}";
+            http_respond(conn, 404, "application/json", e, (int)strlen(e)); return;
         }
         if (!strcmp(path, "/api/services")) {
             blen = api_services_json(resp_body, (int)sizeof(resp_body));
@@ -1559,6 +2421,44 @@ static void http_route(int conn, char* req) {
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Gap Remediation Phase B ────────────────────────────────────────────
+        if (!strcmp(path, "/api/tables")) {
+            blen = api_table_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/sql")) {
+            blen = api_sql_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase C: Vector Store HTTP reachability ────────────
+        if (!strcmp(path, "/api/vec/collections")) {
+            blen = api_vec_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/insert")) {
+            blen = api_vec_insert_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/embed-insert")) {
+            blen = api_vec_embed_insert_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/search")) {
+            blen = api_vec_search_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/indexes")) {
+            blen = api_vec_index_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/index/search")) {
+            blen = api_vec_index_search_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/join")) {
+            blen = api_vec_join_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         if (!strcmp(path, "/api/record")) {
             blen = api_record_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -1762,7 +2662,35 @@ static void http_route(int conn, char* req) {
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/program/spawn")) {
-            blen = api_program_spawn_handler(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_program_spawn_handler(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Gap Remediation Phase F: partition create/assign/destroy/pause/
+        // resume/quota — every one of these syscalls was already correctly
+        // wired at the dispatch layer; this is the first HTTP surface for any
+        // of them. ────────────────────────────────────────────────────────────
+        if (!strcmp(path, "/api/partitions")) {
+            blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/assign")) {
+            blen = api_partition_assign_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/destroy")) {
+            blen = api_partition_destroy_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/pause")) {
+            blen = api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 0);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/resume")) {
+            blen = api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 1);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/quota")) {
+            blen = api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── POST /api/stream/create|upload ──────────────────────────────────────

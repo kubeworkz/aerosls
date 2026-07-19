@@ -62,9 +62,72 @@ static uint64_t          mvcc_next_txn_id;
 static uint64_t          mvcc_next_logical_id;
 static uint64_t          mvcc_commit_seq;   // next commit-sequence number to hand out
 
+// ─── Phase 25: physical RowId -> version-slot index ────────────────────────
+// A small fixed open-addressed hash table (2x MVCC_MAX_VERSIONS, so load
+// factor never exceeds 50% since at most one entry exists per version ever
+// created -- see mvcc.h's header comment on mvcc_resolve_physical()). No
+// deletion: matching this whole file's "no reclaim in first cut" posture,
+// a stale entry (its version since rolled back or superseded) just fails
+// mv_visible() when looked up -- it never needs to be removed for
+// correctness, only for reclaiming the hash slot, which nothing here does.
+#define MVCC_PHYS_HASH_SIZE (MVCC_MAX_VERSIONS * 2)
+struct MvccPhysEntry {
+    uint8_t      used;
+    struct RowId physical_id;
+    uint32_t     version_slot;
+};
+static struct MvccPhysEntry mvcc_phys_index[MVCC_PHYS_HASH_SIZE];
+
+static uint32_t mv_phys_hash(struct RowId id) {
+    uint32_t h = id.page_id * 2654435761u;    // Knuth multiplicative hash constant
+    h ^= id.slot_index * 40503u;
+    h ^= h >> 13;
+    return h & (MVCC_PHYS_HASH_SIZE - 1);
+}
+
+// Records that physical_id belongs to mvcc_versions[version_slot]. Called
+// once, right after each new struct MvccVersion is created (mvcc_row_insert(),
+// mvcc_row_update()) -- physical RowIds are never reused for different
+// content (rowstore.c never reclaims a tombstoned slot), so each physical_id
+// is inserted here exactly once, ever. If the table is somehow full (can't
+// happen while MVCC_MAX_VERSIONS <= MVCC_PHYS_HASH_SIZE/2, since one version
+// creates at most one entry -- left as a documented invariant, not asserted,
+// matching this codebase's no-panic posture), the entry is silently dropped:
+// always SAFE, never silently wrong -- mvcc_resolve_physical() simply
+// reports "not found" for it and the planner's caller falls back to a full
+// scan, exactly as if this index didn't exist for that one row.
+static void mv_phys_index_put(struct RowId id, uint32_t version_slot) {
+    uint32_t h = mv_phys_hash(id);
+    for (uint32_t probe = 0; probe < MVCC_PHYS_HASH_SIZE; probe++) {
+        uint32_t slot = (h + probe) & (MVCC_PHYS_HASH_SIZE - 1);
+        if (!mvcc_phys_index[slot].used) {
+            mvcc_phys_index[slot].used = 1;
+            mvcc_phys_index[slot].physical_id = id;
+            mvcc_phys_index[slot].version_slot = version_slot;
+            return;
+        }
+    }
+}
+
+// Returns the mvcc_versions[] slot index for physical_id, or -1 if it was
+// never indexed (or the table was full at insert time -- see above).
+static int mv_phys_index_get(struct RowId id) {
+    uint32_t h = mv_phys_hash(id);
+    for (uint32_t probe = 0; probe < MVCC_PHYS_HASH_SIZE; probe++) {
+        uint32_t slot = (h + probe) & (MVCC_PHYS_HASH_SIZE - 1);
+        if (!mvcc_phys_index[slot].used) return -1;   // open addressing, no tombstones: an empty
+                                                        // slot means "never inserted," search over
+        if (mvcc_phys_index[slot].physical_id.page_id == id.page_id &&
+            mvcc_phys_index[slot].physical_id.slot_index == id.slot_index)
+            return (int)mvcc_phys_index[slot].version_slot;
+    }
+    return -1;
+}
+
 void mvcc_init(void) {
     for (uint32_t i = 0; i < MVCC_MAX_TXNS; i++) mvcc_txns[i].active = 0;
     for (uint32_t i = 0; i < MVCC_MAX_VERSIONS; i++) mvcc_versions[i].active = 0;
+    for (uint32_t i = 0; i < MVCC_PHYS_HASH_SIZE; i++) mvcc_phys_index[i].used = 0;
     mvcc_version_count = 0;
     mvcc_next_txn_id = 1;       // 0 reserved: "no transaction" / invalid, matching
                                  // transaction.h's own tx_get_active() "0 = none" convention
@@ -243,13 +306,15 @@ MvccError mvcc_row_insert(uint64_t txn_id, uint32_t caller_uid, const char* tabl
         return MVCC_ERR_VERSION_POOL_FULL;
     }
 
-    struct MvccVersion* v = &mvcc_versions[mvcc_version_count++];
+    uint32_t vslot = mvcc_version_count++;
+    struct MvccVersion* v = &mvcc_versions[vslot];
     v->active = 1;
     v->logical_id = mvcc_next_logical_id++;
     v->table_object_id = table_object_id;
     v->physical_id = phys;
     v->xmin = 0; v->xmin_committed = 0; v->xmin_txn = txn_id;
     v->xmax = 0; v->xmax_committed = 0; v->xmax_txn = 0;
+    mv_phys_index_put(phys, vslot);   // Phase 25: O(1) physical->version lookup for the planner
 
     row_journal_notify_insert(txn_id, table_name, table_object_id, v->logical_id, values);
 
@@ -301,7 +366,8 @@ MvccError mvcc_row_update(uint64_t txn_id, uint32_t caller_uid, const char* tabl
         return MVCC_ERR_VERSION_POOL_FULL;
     }
 
-    struct MvccVersion* nv = &mvcc_versions[mvcc_version_count++];
+    uint32_t nvslot = mvcc_version_count++;
+    struct MvccVersion* nv = &mvcc_versions[nvslot];
     nv->active = 1;
     nv->logical_id = id.logical_id;
     nv->table_object_id = old->table_object_id;   // old may be a stale pointer after the array grew?
@@ -309,6 +375,7 @@ MvccError mvcc_row_update(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     nv->physical_id = phys;
     nv->xmin = 0; nv->xmin_committed = 0; nv->xmin_txn = txn_id;
     nv->xmax = 0; nv->xmax_committed = 0; nv->xmax_txn = 0;
+    mv_phys_index_put(phys, nvslot);   // Phase 25: O(1) physical->version lookup for the planner
 
     old->xmax_txn = txn_id;   // pending supersede -- becomes real at commit, undone at rollback
 
@@ -374,4 +441,60 @@ uint32_t mvcc_table_scan(uint64_t txn_id, uint32_t caller_uid, const char* table
         }
     }
     return visited;
+}
+
+// ─── Gap Remediation Phase D: MVCC bootstrap on restore ─────────────────────
+// See mvcc.h's own header comment for the full "why this exists" writeup.
+struct mv_bootstrap_ctx { uint64_t table_object_id; };
+static void mv_bootstrap_cb(struct RowId id, const struct RowValues* values, void* ctxp) {
+    (void)values;
+    struct mv_bootstrap_ctx* ctx = (struct mv_bootstrap_ctx*)ctxp;
+    if (mvcc_version_count >= MVCC_MAX_VERSIONS) return;   // pool exhausted -- best-effort,
+                                                             // matches this file's "no reclaim"
+                                                             // posture elsewhere; the rows this
+                                                             // misses simply stay invisible to
+                                                             // mvcc_table_scan(), same as any
+                                                             // other MVCC_ERR_VERSION_POOL_FULL
+                                                             // consequence
+    uint32_t vslot = mvcc_version_count++;
+    struct MvccVersion* v = &mvcc_versions[vslot];
+    v->active = 1;
+    v->logical_id = mvcc_next_logical_id++;
+    v->table_object_id = ctx->table_object_id;
+    v->physical_id = id;
+    v->xmin = 0; v->xmin_committed = 1; v->xmin_txn = 0;   // "committed since before time began" -- see header comment
+    v->xmax = 0; v->xmax_committed = 0; v->xmax_txn = 0;
+    mv_phys_index_put(id, vslot);   // Phase 25's index-assisted planning path works post-restore too
+}
+
+void mvcc_bootstrap_from_rowstore(void) {
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (!object_catalog[i].active || !object_catalog[i].uses_rowstore) continue;
+        struct mv_bootstrap_ctx ctx = { object_catalog[i].object_id };
+        // caller_uid=0 -- the existing, already-established "kernel role
+        // always passes catalog_check_access()" convention, same as every
+        // other Phase D rebuild-on-boot caller (row_index_create(),
+        // vec_index_create()) in persist.c.
+        rowstore_table_scan(0, object_catalog[i].name, mv_bootstrap_cb, &ctx);
+    }
+}
+
+// ─── Phase 25: index-assisted planning entry point ─────────────────────────
+MvccError mvcc_resolve_physical(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
+                                struct RowId physical_id,
+                                struct MvccRowId* out_id, struct RowValues* out_values) {
+    int tidx = mv_find_txn(txn_id);
+    if (tidx < 0) return MVCC_ERR_TXN_NOT_ACTIVE;
+    if (mv_find_table_index(table_name) < 0) return MVCC_ERR_TABLE_NOT_FOUND;
+
+    int vslot = mv_phys_index_get(physical_id);
+    if (vslot < 0) return MVCC_ERR_ROW_NOT_VISIBLE;   // never indexed -- caller falls back to a full scan
+    struct MvccVersion* v = &mvcc_versions[(uint32_t)vslot];
+    if (!v->active) return MVCC_ERR_ROW_NOT_VISIBLE;
+    if (!mv_visible(v, &mvcc_txns[tidx])) return MVCC_ERR_ROW_NOT_VISIBLE;
+
+    if (out_values && rowstore_row_get(caller_uid, table_name, v->physical_id, out_values) != 0)
+        return MVCC_ERR_ROW_NOT_VISIBLE;
+    if (out_id) out_id->logical_id = v->logical_id;
+    return MVCC_OK;
 }

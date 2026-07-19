@@ -3,11 +3,25 @@
 
 #include <stdint.h>
 #include "object_catalog.h"
+#include "timer.h"   // Gap Remediation Phase E -- kernel_tick_counter, see below
 
 // ─── Token constants ──────────────────────────────────────────────────────────
 #define AUTH_MAX_TOKENS  32
 #define AUTH_EMAIL_LEN   64
 #define AUTH_TOKEN_LEN   32   // 32 hex chars = 128 bits
+
+// Gap Remediation Phase E: token TTL, expressed in LAPIC timer ticks rather
+// than TSC cycles. This codebase has no calibrated TSC-to-wallclock ratio
+// anywhere (dashboard.c's own "average_fault_latency_cycles" is deliberately
+// left as raw, uncalibrated cycles -- fine for a relative latency metric,
+// useless as an absolute expiry threshold across different CPUs). timer.c's
+// kernel_tick_counter, by contrast, increments at a documented ~100 Hz
+// (init_timer()'s own comment: "fires roughly every 10 ms"), so it's the
+// only monotonic counter in the kernel with even an approximate real-time
+// meaning. TTL is therefore approximate wall-clock, not exact -- the same
+// honesty-over-precision tradeoff init_timer()'s own comment already makes,
+// not a new one invented for this phase.
+#define AUTH_TOKEN_TTL_TICKS  360000ULL   // ~1 hour at the documented ~100 Hz
 
 // ─── Leaseholder token ────────────────────────────────────────────────────────
 // Ties an email address to a uid + role in the AeroSLS capability model.
@@ -17,7 +31,13 @@ struct LeaseToken {
     char     token[AUTH_TOKEN_LEN + 1];  // NUL-terminated 32-char hex string
     uint32_t uid;
     SLSRole  role;
-    uint64_t created_tsc;
+    uint64_t created_tick;  // kernel_tick_counter value at issuance (Phase E; was created_tsc)
+    uint8_t  no_expiry;     // Phase E: 1 for the 4 standing auth_init() demo
+                             // accounts (deliberate, permanent local-dev
+                             // credentials, not runtime session tokens --
+                             // see auth_init()'s own comment); 0 for every
+                             // token issued at runtime via auth_create_token(),
+                             // which always gets real TTL enforcement.
     uint8_t  active;
 };
 

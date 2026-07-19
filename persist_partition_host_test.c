@@ -27,6 +27,11 @@
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "kernel/rowstore.h"
+#include "kernel/row_index.h"
+#include "kernel/row_constraint.h"
+#include "kernel/row_journal.h"
+#include "kernel/vecstore.h"
+#include "kernel/vec_index.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -49,6 +54,47 @@ void catalog_after_restore(void) { /* no-op for this test */ }
  * rowstore_host_test.c for the real, call-tracked coverage of that. */
 struct RowTableHeader table_headers[ROWSTORE_MAX_TABLES];
 uint32_t               rowstore_next_free_page_id = 0;
+
+/* Gap Remediation Phase D (found while regression-sweeping for Phase F --
+ * this file was missed during Phase D's own sweep of every persist.c-
+ * linking host test): persist.c's restore blocks 6b-11 reference row_
+ * index.c/row_constraint.c/row_journal.c/vecstore.c/vec_index.c/mvcc.c's
+ * own globals/functions, none of which this persistence-focused test has
+ * any interest in linking -- same minimal-stub pattern every other Phase D-
+ * affected host test already uses (see e.g. rowstore_host_test.c's own
+ * identical block). Every restore block correctly no-ops at "no snapshot"
+ * before ever touching this content. */
+struct RowConstraintDef row_constraints[ROW_CONSTRAINT_MAX];
+uint32_t                 row_constraint_count = 0;
+struct RowIndex          row_indexes[ROW_INDEX_MAX];
+struct RowJournalEntry      row_journal_buffer[ROW_JOURNAL_MAX_ENTRIES];
+uint32_t                    row_journal_entry_count = 0;
+struct RowJournalAttachment row_journal_attachments[ROW_JOURNAL_MAX_ATTACHMENTS];
+uint32_t                    row_journal_attachment_count = 0;
+struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
+uint32_t                   vecstore_next_free_page_id = 0;
+struct VecIndex             vec_indexes[VEC_INDEX_MAX];
+void mvcc_bootstrap_from_rowstore(void) { }
+int row_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* table_name, const char* column_name) {
+    (void)caller_uid; (void)index_name; (void)table_name; (void)column_name;
+    return 1;
+}
+int vec_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* collection_name, VecMetric metric) {
+    (void)caller_uid; (void)index_name; (void)collection_name; (void)metric;
+    return 1;
+}
+uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_name,
+                                  VecScanCb cb, void* ctx) {
+    (void)caller_uid; (void)collection_name; (void)cb; (void)ctx;
+    return 0;
+}
+void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
+                             struct VecId id, uint64_t external_id,
+                             const struct VecValues* values) {
+    (void)caller_uid; (void)collection_name; (void)id; (void)external_id; (void)values;
+}
 
 /* kernel_io.h's two logging functions — persist.c and partition.c both
  * call these purely for diagnostic serial output, no test-relevant

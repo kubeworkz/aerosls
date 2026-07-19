@@ -4,6 +4,7 @@
  */
 #include "row_journal.h"
 #include "kernel_io.h"
+#include "persist.h"   // Gap Remediation Phase D -- persist_row_journal()
 #include <stddef.h>
 
 // ─── String helpers (no libc -- rj_* here, matching this codebase's
@@ -69,6 +70,7 @@ int row_journal_attach(const char* journal_name, const char* table_name) {
             rj_strcpy(row_journal_attachments[i].journal_name, journal_name, ROW_JOURNAL_NAME_LEN);
             rj_strcpy(row_journal_attachments[i].table_name, table_name, OBJECT_NAME_LEN);
             row_journal_attachment_count++;
+            persist_row_journal();   // Gap Remediation Phase D
             return 0;
         }
     }
@@ -81,6 +83,7 @@ int row_journal_detach(const char* journal_name, const char* table_name) {
             rj_streq(row_journal_attachments[i].journal_name, journal_name) &&
             rj_streq(row_journal_attachments[i].table_name, table_name)) {
             row_journal_attachments[i].active = 0;
+            persist_row_journal();   // Gap Remediation Phase D
             return 0;
         }
     }
@@ -112,6 +115,10 @@ static void rj_write(uint64_t txn_id, const char* journal_name, const char* tabl
     e->committed = 0;   // pending until row_journal_commit_tx()
     if (before) e->before = *before; else e->before.count = 0;
     if (after)  e->after  = *after;  else e->after.count  = 0;
+
+    persist_row_journal();   // Gap Remediation Phase D -- covers all three
+                               // notify_insert/update/delete() callers, which
+                               // all funnel through this one function
 }
 
 void row_journal_notify_insert(uint64_t txn_id, const char* table_name, uint64_t table_object_id,
@@ -139,6 +146,7 @@ void row_journal_commit_tx(uint64_t txn_id) {
         if (row_journal_buffer[i].active && row_journal_buffer[i].tx_id == txn_id && !row_journal_buffer[i].committed)
             row_journal_buffer[i].committed = 1;
     }
+    persist_row_journal();   // Gap Remediation Phase D
 }
 void row_journal_rollback_tx(uint64_t txn_id) {
     // Real garbage -- these entries described a mutation that never took
@@ -150,6 +158,7 @@ void row_journal_rollback_tx(uint64_t txn_id) {
         if (row_journal_buffer[i].active && row_journal_buffer[i].tx_id == txn_id && !row_journal_buffer[i].committed)
             row_journal_buffer[i].active = 0;
     }
+    persist_row_journal();   // Gap Remediation Phase D
 }
 
 // Formats one RowValues as "v0|v1|v2" for dump/JSON output -- a plain,

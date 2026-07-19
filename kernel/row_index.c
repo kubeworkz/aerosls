@@ -5,6 +5,7 @@
 #include "row_index.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
+#include "persist.h"   // Gap Remediation Phase D -- persist_row_index_defs()
 #include "../user/permissions.h"
 #include <stddef.h>
 
@@ -191,7 +192,12 @@ static int btree_insert(struct RowIndex* idx, const uint8_t key[BTREE_MAX_KEY_BY
     // duplicate list (no structural change, no split possible).
     for (uint32_t i = 0; i < lf->key_count; i++) {
         if (key_cmp(lf->keys[i], key) == 0) {
-            if (lf->id_count[i] >= BTREE_MAX_DUPES_PER_KEY) return 1;   // duplicate cap hit
+            if (lf->id_count[i] >= BTREE_MAX_DUPES_PER_KEY) {
+                lf->key_capped[i] = 1;   // Phase 25: sticky -- a lookup on this key can no
+                                          // longer be trusted as complete, ever, even after
+                                          // later deletes bring the active count back down
+                return 1;                 // duplicate cap hit
+            }
             lf->ids[i][lf->id_count[i]] = id;
             lf->id_active[i][lf->id_count[i]] = 1;
             lf->id_count[i]++;
@@ -208,12 +214,14 @@ static int btree_insert(struct RowIndex* idx, const uint8_t key[BTREE_MAX_KEY_BY
         ri_memcpy(lf->ids[j], lf->ids[j - 1], sizeof(lf->ids[j]));
         ri_memcpy(lf->id_active[j], lf->id_active[j - 1], sizeof(lf->id_active[j]));
         lf->id_count[j] = lf->id_count[j - 1];
+        lf->key_capped[j] = lf->key_capped[j - 1];
     }
     ri_memcpy(lf->keys[i], key, BTREE_MAX_KEY_BYTES);
     ri_memset(lf->id_active[i], 0, sizeof(lf->id_active[i]));
     lf->ids[i][0] = id;
     lf->id_active[i][0] = 1;
     lf->id_count[i] = 1;
+    lf->key_capped[i] = 0;   // brand-new distinct key: definitely not capped yet
     lf->key_count++;
     idx->entry_count++;
 
@@ -234,6 +242,7 @@ static int btree_insert(struct RowIndex* idx, const uint8_t key[BTREE_MAX_KEY_BY
         ri_memcpy(right->ids[dst], left->ids[k], sizeof(right->ids[dst]));
         ri_memcpy(right->id_active[dst], left->id_active[k], sizeof(right->id_active[dst]));
         right->id_count[dst] = left->id_count[k];
+        right->key_capped[dst] = left->key_capped[k];
     }
     right->key_count = old_count - mid;
     left->key_count = mid;
@@ -381,6 +390,8 @@ int row_index_create(uint32_t caller_uid, const char* index_name,
 
     kernel_serial_printf("[ROW_INDEX] '%s' created on %s.%s: %u entrie(s) indexed.\n",
                          index_name, table_name, column_name, idx->entry_count);
+
+    persist_row_index_defs();   // Gap Remediation Phase D
     return 0;
 }
 
@@ -511,6 +522,47 @@ uint32_t row_index_lookup(uint32_t caller_uid, const char* index_name,
 
     uint8_t key[BTREE_MAX_KEY_BYTES];
     if (encode_key(idx->column_type, value, key)) return 0;
+    return range_scan_internal(idx, key, key, out_ids, max_ids);
+}
+
+// Descends to the one leaf that would hold `key` and reports whether that
+// exact key's duplicate list was ever capped. Returns 0 (not capped) if the
+// key isn't present at all -- an absent key has, by construction, never had
+// an insert attempted against it that could have been dropped.
+static int leaf_key_capped(struct RowIndex* idx, const uint8_t key[BTREE_MAX_KEY_BYTES]) {
+    if (idx->root_node == BTREE_INVALID_NODE) return 0;
+    uint32_t cur = idx->root_node;
+    while (!btree_nodes[cur].is_leaf) {
+        struct BTreeNode* n = &btree_nodes[cur];
+        uint32_t i = 0;
+        while (i < n->key_count && key_cmp(key, n->keys[i]) >= 0) i++;
+        cur = n->children[i];
+    }
+    struct BTreeNode* lf = &btree_nodes[cur];
+    for (uint32_t i = 0; i < lf->key_count; i++) {
+        if (key_cmp(lf->keys[i], key) == 0) return lf->key_capped[i];
+    }
+    return 0;
+}
+
+uint32_t row_index_lookup_checked(uint32_t caller_uid, const char* index_name,
+                                  const char* value, struct RowId* out_ids, uint32_t max_ids,
+                                  uint8_t* out_complete) {
+    if (out_complete) *out_complete = 1;
+    int slot = find_index_slot(index_name);
+    if (slot < 0) return 0;
+    struct RowIndex* idx = &row_indexes[slot];
+
+    int tidx = -1;
+    for (uint32_t i = 0; i < object_catalog_count; i++)
+        if (object_catalog[i].active && object_catalog[i].object_id == idx->table_object_id) { tidx = (int)i; break; }
+    if (tidx < 0) return 0;
+    if (!catalog_check_access(caller_uid, object_catalog[tidx].name, PERM_READ)) return 0;
+
+    uint8_t key[BTREE_MAX_KEY_BYTES];
+    if (encode_key(idx->column_type, value, key)) return 0;
+
+    if (out_complete) *out_complete = (uint8_t)!leaf_key_capped(idx, key);
     return range_scan_internal(idx, key, key, out_ids, max_ids);
 }
 

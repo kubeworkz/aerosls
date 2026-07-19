@@ -144,9 +144,21 @@ static struct TimiActivation* tt_find_or_alloc_activation(const char* object_nam
  * translation. Called from loader.c's loader_timi_info() so the existing
  * `timi-info` report shows activation state alongside the header/entry
  * dump it already prints. */
-void timi_activation_info(const char* object_name) {
+int timi_activation_query(const char* object_name, struct TimiActivationStatus* out) {
+    if (!out) return 0;
+    out->cached = 0; out->code_pages = 0; out->entry_offset = 0; out->content_hash = 0;
     struct TimiActivation* act = tt_find_activation(object_name);
-    if (!act || !act->valid) {
+    if (!act || !act->valid) return 0;
+    out->cached        = 1;
+    out->code_pages    = act->code_pages;
+    out->entry_offset  = act->entry_off;
+    out->content_hash  = act->content_hash;
+    return 1;
+}
+
+void timi_activation_info(const char* object_name) {
+    struct TimiActivationStatus st;
+    if (!timi_activation_query(object_name, &st)) {
         kernel_serial_print(
             "  activation   : not yet translated (next spawn will translate + cache)\n");
         return;
@@ -154,7 +166,7 @@ void timi_activation_info(const char* object_name) {
     kernel_serial_printf(
         "  activation   : cached — %u page(s) native code, entry @+0x%x, "
         "content hash 0x%08x\n",
-        act->code_pages, act->entry_off, act->content_hash);
+        st.code_pages, st.entry_offset, st.content_hash);
 }
 
 uint64_t timi_translate_and_map(const char* object_name, uint64_t base_vaddr, uint64_t* pml4) {

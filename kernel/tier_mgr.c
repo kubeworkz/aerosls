@@ -119,7 +119,12 @@ void tier_mgr_tick(void) {
 
 // ─── sys_sls_tier_list ────────────────────────────────────────────────────────
 void sys_sls_tier_list(void) {
-    kernel_serial_print(
+    // Gap Remediation Phase C fix: kernel_serial_print() takes exactly one
+    // argument (kernel_io.h) -- this was passing a format string plus 5
+    // extra args to it, the same bug found and fixed in object_catalog.c's
+    // sys_sls_obj_list() (see that file's own comment). kernel_serial_printf()
+    // is the variadic one.
+    kernel_serial_printf(
         "\n[TIER] Storage Tier Map\n"
         " %-22s  %-10s  %-8s  %-10s  %s\n"
         " %-22s  %-10s  %-8s  %-10s  %s\n",

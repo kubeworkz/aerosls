@@ -7,6 +7,7 @@
 #include "predicate.h"
 #include "cursor.h"
 #include "mvcc.h"
+#include "row_index.h"
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -123,15 +124,43 @@ static int predicate_columns_valid(const struct Predicate* pred, uint32_t idx,
     return predicate_columns_valid(pred, n->left, layout) && predicate_columns_valid(pred, n->right, layout);
 }
 
-// ─── Planner + candidate row collection (Phase 22: MVCC-routed) ────────────
-// Always a full, snapshot-consistent mvcc_table_scan() plus a client-side
-// predicate_eval() recheck -- Phase 19/20's Phase-17-index-assisted short
-// cut does not survive MVCC routing (see sql_exec.h's header comment for
-// why: the B-tree stores physical RowIds with no notion of which version
-// is visible to a given transaction's snapshot). Correctness is unaffected
-// -- every candidate is still checked against the full predicate -- only
-// the "skip the scan when an index applies" performance property is lost,
-// a real, named scope cut, not a silent regression.
+// ─── Planner + candidate row collection (Phase 22: MVCC-routed; Phase 25:
+// index-assisted equality lookups restored) ─────────────────────────────
+// Phase 19/20's original Phase-17-index-assisted short cut stopped
+// surviving Phase 22's MVCC routing: a B-tree index (row_index.h) only
+// ever stores physical RowIds, and under MVCC a column value's physical
+// row changes on every UPDATE, with no notion in the index of which
+// version is visible to a given transaction's snapshot (see sql_exec.h's
+// header comment for the original scope note this phase closes out).
+//
+// mvcc_resolve_physical() (mvcc.h, Phase 25) is the piece that makes an
+// index hit trustworthy again: given a physical RowId, it reports whether
+// that EXACT version is the one visible to this transaction's snapshot, in
+// O(1) average (a hash lookup, not a scan). row_index_lookup_checked()
+// (row_index.h, Phase 25) is the other half: it reports whether an index
+// key's result can be trusted as COMPLETE, closing a second, independent
+// hole discovered while building this -- a B-tree leaf's duplicate list
+// (BTREE_MAX_DUPES_PER_KEY=16 entries per distinct value) fills up with
+// every VERSION a value ever had under MVCC, not just current ones, so a
+// hot value can silently exceed the cap with no signal available from the
+// plain row_index_lookup() API. Both pieces together let ONE case be
+// safely accelerated: a single top-level equality comparison against an
+// indexed column. Every candidate the index returns is still rechecked
+// against the full predicate before being trusted (the same "index
+// narrows, recheck is the authority" shape this whole roadmap has used
+// since Phase 19) -- this is a genuine algorithmic improvement (real
+// O(1)-ish candidate resolution, not a fake one), not a relaxation of the
+// correctness bar.
+//
+// Deliberately narrower than Phase 19's original design, which also
+// index-assisted range comparisons (<, >, <=, >=) and let AND/OR combine
+// with an index probe. Range comparisons are NOT restored here: the
+// completeness problem above applies independently to EVERY distinct key a
+// range touches, with no aggregate "was anything dropped in this range"
+// signal available without a larger row_index.c change -- a real, named
+// limitation, not an oversight (see the roadmap findings addendum). Ranges
+// and AND/OR predicates always fall back to the full scan below, exactly
+// as they did before this phase.
 struct mvcc_collect_ctx {
     struct MvccRowId*            ids;
     uint32_t                     count;
@@ -146,11 +175,59 @@ static void mvcc_collect_cb(struct MvccRowId id, const struct RowValues* values,
     ctx->count++;
 }
 
+// Attempts the index-assisted fast path for a single top-level EQ
+// comparison against an indexed column. Returns 1 (and fills *out_count,
+// out_ids) if the index path was used and its result is provably complete;
+// 0 if it declined for any reason (no such predicate shape, no index on
+// that column, or the index result couldn't be proven complete) -- the
+// caller falls back to the full scan exactly as before this phase.
+static int try_index_assisted_eq(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
+                                 const struct Predicate* pred, const struct RowTableLayout* layout,
+                                 struct MvccRowId* out_ids, uint32_t max_ids, uint32_t* out_count) {
+    if (!pred || pred->root == PREDICATE_INVALID_NODE) return 0;
+    const struct PredicateNode* n = &pred->nodes[pred->root];
+    if (n->kind != PRED_NODE_COMPARISON || n->op != PRED_OP_EQ) return 0;
+
+    uint32_t col = find_column_index(layout, n->column_name);
+    if (col == 0xFFFFFFFFu) return 0;
+
+    int cidx = find_table_catalog_index(table_name);
+    if (cidx < 0) return 0;
+    uint64_t table_object_id = object_catalog[cidx].object_id;
+
+    char index_name[OBJECT_NAME_LEN];
+    if (!row_index_find_for_column(table_object_id, col, index_name)) return 0;
+
+    struct RowId candidates[BTREE_MAX_DUPES_PER_KEY];
+    uint8_t complete = 0;
+    uint32_t found = row_index_lookup_checked(caller_uid, index_name, n->literal,
+                                              candidates, BTREE_MAX_DUPES_PER_KEY, &complete);
+    if (!complete) return 0;   // this key's duplicate list was capped at some point --
+                                 // can't prove the index result is the full match set
+
+    uint32_t n_out = 0;
+    for (uint32_t i = 0; i < found && n_out < max_ids; i++) {
+        struct MvccRowId mid;
+        struct RowValues vals;
+        if (mvcc_resolve_physical(txn_id, caller_uid, table_name, candidates[i], &mid, &vals) != MVCC_OK)
+            continue;   // this physical version is stale/superseded/not visible here -- an
+                         // OLDER version of a row the index still remembers, not a current match
+        if (!predicate_eval(pred, layout, &vals)) continue;   // authoritative recheck
+        out_ids[n_out++] = mid;
+    }
+    *out_count = n_out;
+    return 1;
+}
+
 // Returns the TRUE total match count (may exceed max_ids -- caller detects
 // truncation the same way the pre-Phase-22 planner already did).
 static uint32_t mvcc_find_matching_rows(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
                                         const struct Predicate* pred, const struct RowTableLayout* layout,
                                         struct MvccRowId* out_ids, uint32_t max_ids) {
+    uint32_t idx_count;
+    if (try_index_assisted_eq(txn_id, caller_uid, table_name, pred, layout, out_ids, max_ids, &idx_count))
+        return idx_count;
+
     struct mvcc_collect_ctx ctx = { out_ids, 0, max_ids, pred, layout };
     mvcc_table_scan(txn_id, caller_uid, table_name, mvcc_collect_cb, &ctx);
     return ctx.count;

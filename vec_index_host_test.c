@@ -52,6 +52,36 @@ int ollama_embed(const struct OllamaEmbedRequest* req, struct OllamaEmbedRespons
     return -1;   // unused by this suite -- see vecstore_host_test.c's identical stub/comment
 }
 
+/* ─── Gap Remediation Phase D stubs -- see vecstore_host_test.c's own top
+ * comment for the rationale (this suite has zero interest in persistence
+ * round-tripping, covered separately by persist_rdbms_vecstore_host_
+ * test.c). ─────────────────────────────────────────────────────────────── */
+void persist_vecstore_headers(void) { }
+void persist_vec_index_defs(void) { }
+
+#define FAKE_NVME_MAX_FRAMES 512
+static struct { uint64_t lba; uint8_t data[4096]; int used; } g_fake_nvme[FAKE_NVME_MAX_FRAMES];
+void* io_sq = (void*)1;
+void* io_cq = (void*)1;
+static int find_or_alloc_frame(uint64_t lba) {
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+        if (g_fake_nvme[i].used && g_fake_nvme[i].lba == lba) return i;
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+        if (!g_fake_nvme[i].used) { g_fake_nvme[i].used = 1; g_fake_nvme[i].lba = lba; return i; }
+    return -1;
+}
+int nvme_write_sync(uint64_t lba, const void* buf) {
+    int idx = find_or_alloc_frame(lba);
+    if (idx < 0) return 1;
+    memcpy(g_fake_nvme[idx].data, buf, 4096);
+    return 0;
+}
+int nvme_read_sync(uint64_t lba, void* buf) {
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+        if (g_fake_nvme[i].used && g_fake_nvme[i].lba == lba) { memcpy(buf, g_fake_nvme[i].data, 4096); return 0; }
+    return 1;
+}
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \

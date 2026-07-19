@@ -134,6 +134,65 @@ int main(void) {
     CHECK(partition_get_frame_usage(3) == 5, "scenario 8: usage counter climbs back to 5 after 5 fresh allocations under the still-configured quota of 5");
     CHECK(partition_reset_frame_usage(999) == 1, "scenario 8: resetting an out-of-range partition_id fails cleanly");
 
+    /* ── Scenario 9 (Gap Remediation Phase F): free_physical_ram_frame() /
+     * free_physical_ram_frame_for_partition() -- frame_pool.c's first-ever
+     * free primitive. Round-trip: allocate a frame, free it, confirm the
+     * usage counter drops, then confirm the SAME physical address comes
+     * back out on the next allocation -- proof this is a REAL bitmap free
+     * (unlike partition_reset_frame_usage()'s accounting-only reset in
+     * scenario 8 above, which scenario 8 itself proved never reuses an
+     * address). ───────────────────────────────────────────────────────────── */
+    CHECK(partition_get_frame_usage(4) == 0, "scenario 9: partition 4 starts clean");
+    void* f9 = allocate_physical_ram_frame_for_partition(4);
+    CHECK(f9 != NULL, "scenario 9: partition 4 allocates one frame");
+    CHECK(partition_get_frame_usage(4) == 1, "scenario 9: usage is 1 after the allocation");
+    CHECK(free_physical_ram_frame_for_partition(f9, 4) == 0, "scenario 9: freeing that exact frame under partition 4 succeeds");
+    CHECK(partition_get_frame_usage(4) == 0, "scenario 9: usage drops back to 0 after the free");
+    void* f9b = allocate_physical_ram_frame_for_partition(4);
+    CHECK(f9b == f9, "scenario 9: the very next allocation gets back the SAME physical address -- a real bitmap free, not accounting-only");
+    CHECK(free_physical_ram_frame_for_partition(f9b, 4) == 0, "scenario 9: cleanup -- free it again so it doesn't leak into later scenarios' address-uniqueness checks");
+
+    /* ── Scenario 10: double-free and bogus-address rejection -- the exact
+     * "denial looks like absence" carefulness every other allocator boundary
+     * check in this project already has. A double-free or a never-allocated
+     * address must fail (1) WITHOUT corrupting the bitmap or decrementing
+     * any partition's usage counter -- confirmed by checking usage is
+     * unchanged and that a subsequent real allocation still behaves
+     * normally. ───────────────────────────────────────────────────────────── */
+    void* f10 = allocate_physical_ram_frame_for_partition(4);
+    CHECK(f10 != NULL, "scenario 10: partition 4 allocates a frame to double-free");
+    CHECK(free_physical_ram_frame_for_partition(f10, 4) == 0, "scenario 10: first free succeeds");
+    CHECK(partition_get_frame_usage(4) == 0, "scenario 10: usage is 0 after the first free");
+    CHECK(free_physical_ram_frame_for_partition(f10, 4) == 1, "scenario 10: the SECOND free of the same address fails (1) -- a double-free is rejected, not silently accepted");
+    CHECK(partition_get_frame_usage(4) == 0, "scenario 10: usage counter is unaffected by the rejected double-free (not decremented into an underflow)");
+    CHECK(free_physical_ram_frame(NULL) == 1, "scenario 10: freeing NULL is rejected cleanly, not dereferenced");
+    CHECK(free_physical_ram_frame((void*)1) == 1, "scenario 10: freeing a misaligned (non-page-aligned) address is rejected");
+    CHECK(free_physical_ram_frame((void*)(999999999ULL * 4096ULL)) == 1, "scenario 10: freeing a wildly out-of-range address is rejected, not read/written out of bounds");
+    /* Out-of-range partition_id must fail closed -- BEFORE touching the
+     * bitmap at all, same posture as allocate_physical_ram_frame_for_
+     * partition()'s own out-of-range check. Proven causally, not by
+     * guessing where the allocator's next first-fit scan would land: take
+     * a FRESH still-allocated frame, attempt the rejected free, then
+     * confirm a normal free of the SAME frame under the correct partition
+     * still succeeds afterward -- if the rejected call had wrongly cleared
+     * the bit, this second call would itself be rejected as a double-free. */
+    void* f10c = allocate_physical_ram_frame_for_partition(4);
+    CHECK(f10c != NULL, "scenario 10: partition 4 allocates a second frame to probe the out-of-range-partition_id rejection");
+    CHECK(free_physical_ram_frame_for_partition(f10c, 999) == 1, "scenario 10: freeing under an out-of-range partition_id (999) fails closed");
+    CHECK(partition_get_frame_usage(4) == 1, "scenario 10: partition 4's usage is UNCHANGED by the rejected out-of-range-partition free");
+    CHECK(free_physical_ram_frame_for_partition(f10c, 4) == 0, "scenario 10: f10c is still validly freeable under the CORRECT partition afterward -- proves the rejected call above never touched the bitmap (a wrongly-cleared bit would make this a double-free and fail)");
+    CHECK(partition_get_frame_usage(4) == 0, "scenario 10: usage back to 0 after the real free");
+
+    /* ── Scenario 11: free_physical_ram_frame() (the unaccounted path)
+     * decrements PARTITION_SYSTEM's counter, mirroring how
+     * allocate_physical_ram_frame() always increments it. ─────────────────── */
+    uint64_t sys_usage_before = partition_get_frame_usage(PARTITION_SYSTEM);
+    void* f11 = allocate_physical_ram_frame();
+    CHECK(f11 != NULL, "scenario 11: unaccounted allocation succeeds");
+    CHECK(partition_get_frame_usage(PARTITION_SYSTEM) == sys_usage_before + 1, "scenario 11: PARTITION_SYSTEM's usage incremented by exactly 1");
+    CHECK(free_physical_ram_frame(f11) == 0, "scenario 11: unaccounted free succeeds");
+    CHECK(partition_get_frame_usage(PARTITION_SYSTEM) == sys_usage_before, "scenario 11: PARTITION_SYSTEM's usage decremented back to where it started");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

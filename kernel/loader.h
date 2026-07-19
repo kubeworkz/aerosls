@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "process.h"
+#include "timi_translate.h"   // Gap Remediation Phase G -- struct TimiActivationStatus
 
 // ─── Binary store ─────────────────────────────────────────────────────────────
 #define LOADER_MAX_BINARY_SIZE  16384   // 16 KiB per service binary (reduced from 64)
@@ -112,7 +113,9 @@ int  timi_validate(const uint8_t* data, uint32_t size, struct TimiObjectHeader* 
 
 // Prints a loader_list()-style report for one TIMI object: header counts,
 // exported entry-point names, and (since Phase 3 doesn't exist yet) a
-// reminder that it can't be spawned.
+// reminder that it can't be spawned. Gap Remediation Phase G: now a thin
+// wrapper over loader_timi_info_query() below (single source of truth)
+// rather than its own independent parse.
 void loader_timi_info(const char* object_name);
 
 // Shared by loader_list() and the three net/http.c format-string sites so
@@ -120,7 +123,62 @@ void loader_timi_info(const char* object_name);
 // the ELF/flat ternary and showing up mislabeled as "flat".
 const char* binary_format_name(const struct ServiceBinary* sb);
 
-#define SYS_SLS_TIMI_INFO 173   // dump TIMI header/entry info for an uploaded object
+// ─── Gap Remediation Phase G: structured TIMI introspection ───────────────────
+// Before this phase, loader_timi_info() only ever kernel_serial_printf'd its
+// findings -- no caller (HTTP, syscall, or otherwise) could get the data back
+// structurally. TIMI_INFO_MAX_ENTRIES/NAMES caps this project's usual "16"
+// fixed-array convention (matches ROW_JOURNAL_MAX_ENTRIES, BTREE_MAX_DUPES_
+// PER_KEY, etc.) -- a real object with more than 16 entries or names is
+// reported truncated (entries_truncated/names_truncated), not silently cut
+// off with no signal, same "denial looks like absence" carefulness as every
+// other capped-array result in this project (see row_index.h's
+// row_index_lookup_checked() for the precedent this mirrors).
+#define TIMI_INFO_STATUS_OK        0
+#define TIMI_INFO_STATUS_NOT_FOUND 1   // no such uploaded object
+#define TIMI_INFO_STATUS_NOT_TIMI  2   // object exists but isn't a TIMI upload
+#define TIMI_INFO_STATUS_CORRUPT   3   // TIMI magic present but header validation failed
+
+#define TIMI_INFO_MAX_ENTRIES 16
+#define TIMI_INFO_MAX_NAMES   16
+
+struct TimiInfoResult {
+    uint32_t status;                 // TIMI_INFO_STATUS_*
+    char     format_name[16];        // filled on NOT_TIMI (binary_format_name()'s string)
+    uint32_t num_instr, num_literals, num_entries, num_names;   // raw header counts
+    struct TimiEntryRec entries[TIMI_INFO_MAX_ENTRIES];
+    uint32_t entries_returned;
+    uint8_t  entries_truncated;      // 1 if num_entries > TIMI_INFO_MAX_ENTRIES
+    struct TimiNameRec  names[TIMI_INFO_MAX_NAMES];
+    uint32_t names_returned;
+    uint8_t  names_truncated;        // 1 if num_names > TIMI_INFO_MAX_NAMES
+    struct TimiActivationStatus activation;
+};
+
+// Fills *out with the same data loader_timi_info() prints, structurally.
+// Always fills *out (status tells the caller what happened) -- never
+// leaves it uninitialized, same "no partial/garbage result" posture as
+// every other query function in this project. Returns 1 if status ==
+// TIMI_INFO_STATUS_OK, 0 otherwise (mirrors timi_activation_query()'s
+// own 1/0-means-"was there real data" convention).
+int loader_timi_info_query(const char* object_name, struct TimiInfoResult* out);
+
+struct SLSTimiInfoRequest {
+    char object_name[PROC_NAME_LEN];   // [in]
+    struct TimiInfoResult result;      // [out]
+};
+
+// Thin syscall wrapper -- returns 0 if result.status == TIMI_INFO_STATUS_OK,
+// 1 otherwise, matching this project's usual 0-success/1-failure convention
+// (the full detail is always in req->result.status regardless).
+uint64_t sys_sls_timi_info(struct SLSTimiInfoRequest* req);
+
+#define SYS_SLS_TIMI_INFO 173   // Gap Remediation Phase G: now struct-based
+                                 // (struct SLSTimiInfoRequest*), not a raw
+                                 // const char* object name -- confirmed via
+                                 // direct repo-wide grep that nothing else
+                                 // (no host test, no other kernel file, no
+                                 // shell command) depended on the old raw-
+                                 // string wire format before changing it.
 
 // ─── Syscall numbers ──────────────────────────────────────────────────────────
 #define SYS_SLS_LOAD           170   // load binary + spawn process

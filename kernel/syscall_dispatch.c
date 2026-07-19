@@ -15,6 +15,9 @@
 #include "frame_pool.h"
 #include "sql_exec.h"
 #include "vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
+#include "rowstore.h"   // Gap Remediation Phase B -- SYS_SLS_ROWSTORE_CREATE_TABLE
+#include "vec_join.h"   // Gap Remediation Phase C -- SYS_SLS_VEC_JOIN
+#include "vec_index.h"  // Gap Remediation Phase C -- SYS_SLS_VEC_INDEX_CREATE/SEARCH
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -190,8 +193,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_upload_binary((struct SLSUploadRequest*)arg);
     case 172: /* loader_list */
         loader_list(); return 0;
+    // Gap Remediation Phase G: struct-based, replacing the old raw-string,
+    // no-output-to-caller shape (see loader.h's own comment).
     case SYS_SLS_TIMI_INFO:
-        loader_timi_info((const char*)arg); return 0;
+        return sys_sls_timi_info((struct SLSTimiInfoRequest*)arg);
     case SYS_SLS_PROGRAM_SPAWN:
         return program_load((const char*)arg,
                             kernel_get_current_thread_id());
@@ -242,6 +247,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_PARTITION_QUOTA_SET:
         return sys_sls_partition_quota_set((struct SLSPartitionQuotaSetRequest*)arg);
 
+    // ── Gap Remediation Phase F: sys_sls_partition_quota_list() was fully
+    // implemented since Phase 13 but never got a syscall number or a
+    // dispatcher case (217) -- fixed here.
+    case SYS_SLS_PARTITION_QUOTA_LIST:
+        sys_sls_partition_quota_list(); return 0;
+
     // ── Phase 14: LPAR partition lifecycle (214-216) ────────────────────────
     case SYS_SLS_PARTITION_DESTROY:
         return sys_sls_partition_destroy((uint32_t)(uintptr_t)arg);
@@ -276,6 +287,27 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_vec_embed_insert((struct SLSVecEmbedInsertRequest*)arg);
     case SYS_SLS_VEC_SEARCH:
         return sys_sls_vec_search((struct SLSVecSearchRequest*)arg);
+
+    // ── Gap Remediation Phase B: the live path rowstore_create_table() ──────
+    // never had (225) -- see rowstore.h's own comment on this syscall.
+    case SYS_SLS_ROWSTORE_CREATE_TABLE:
+        return sys_sls_rowstore_create_table((struct SLSRowstoreCreateTableRequest*)arg);
+
+    // ── Gap Remediation Phase C: live surfaces vec_join_resolve() (226) and
+    // the HNSW index (227-228) never had -- see vec_join.h's/vec_index.h's
+    // own comments on these syscalls.
+    case SYS_SLS_VEC_JOIN:
+        return sys_sls_vec_join((struct SLSVecJoinRequest*)arg);
+    case SYS_SLS_VEC_INDEX_CREATE:
+        return sys_sls_vec_index_create((struct SLSVecIndexCreateRequest*)arg);
+    case SYS_SLS_VEC_INDEX_SEARCH:
+        return sys_sls_vec_index_search((struct SLSVecIndexSearchRequest*)arg);
+    case SYS_SLS_VEC_LIST:
+        sys_sls_vec_list();
+        return 0;
+    case SYS_SLS_VEC_INDEX_LIST:
+        sys_sls_vec_index_list();
+        return 0;
 
     default:
         return 0;

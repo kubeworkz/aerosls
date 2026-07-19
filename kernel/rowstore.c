@@ -300,6 +300,13 @@ int rowstore_create_table(const char* table_name) {
     return 0;
 }
 
+// ─── Phase B: live reachability adapter ─────────────────────────────────────
+uint64_t sys_sls_rowstore_create_table(struct SLSRowstoreCreateTableRequest* req) {
+    if (!req) return 1;
+    req->status = rowstore_create_table(req->table_name);
+    return (uint64_t)req->status;
+}
+
 // ─── Row CRUD ────────────────────────────────────────────────────────────────
 int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
                         const struct RowValues* values, struct RowId* out_id) {

@@ -18,11 +18,30 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
  *       -o /tmp/vec_join_host_test vec_join_host_test.c \
- *       kernel/vec_join.c kernel/vecstore.c \
+ *       kernel/vec_join.c kernel/vecstore.c kernel/vec_index.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
  *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
  *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c
  *   /tmp/vec_join_host_test
+ *
+ * Gap Remediation Phase B note: this link line was missing kernel/vec_index.c
+ * (found while regression-sweeping Phase B's own changes) -- Phase 6, built
+ * after this test, added vec_index_notify_insert()/_delete() calls into
+ * vecstore.c's vecstore_insert()/_delete() but never updated this file's own
+ * documented build line to match, leaving it unable to link since. Not a
+ * Phase B regression; a pre-existing Phase 6 gap this pass happened to
+ * surface and fixes alongside its own work.
+ *
+ * Gap Remediation Phase C note: Scenarios 4-6 (appended below) cover the new
+ * syscall adapters this file's own link line already supports linking --
+ * sys_sls_vec_index_create()/sys_sls_vec_index_search() (kernel/vec_index.c),
+ * sys_sls_vec_join() (kernel/vec_join.c), and the smoke-tested
+ * sys_sls_vec_list()/sys_sls_vec_index_list() (kernel/vecstore.c,
+ * kernel/vec_index.c). Extended in place rather than as a new file, matching
+ * Phase B's own precedent of extending sql_exec_host_test.c rather than
+ * forking -- this file already links the full stack every new scenario
+ * needs (vec_join.c + vecstore.c + vec_index.c + the relational stack), so a
+ * new file would only duplicate that setup for no real isolation benefit.
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
@@ -36,6 +55,7 @@
 #include "kernel/persist.h"
 #include "kernel/vecstore.h"
 #include "kernel/vec_join.h"
+#include "kernel/vec_index.h"
 #include "user/permissions.h"
 #include <stdio.h>
 #include <string.h>
@@ -164,6 +184,7 @@ int main(void) {
     cursor_mgr_init();
     mvcc_init();
     vecstore_init();
+    vec_index_init();
 
     make_employees_table();   // sets object_catalog_count = 1 internally
 
@@ -265,6 +286,109 @@ int main(void) {
             if (idx < 0 || strcmp(ctx.rows[idx].name, expect) != 0) all_correct = 0;
         }
         CHECK(all_correct, "s3: every one of the 20 batched matches resolved to its own correct employee row");
+    }
+
+    /* ── Scenario 4: Gap Remediation Phase C -- sys_sls_vec_index_create()/
+     * sys_sls_vec_index_search(), the HNSW syscall adapters. vec_index_create()
+     * does NOT backfill an already-populated collection (vec_index.h's own
+     * header comment, point 7), so the 26 embeddings inserted above are
+     * deliberately NOT expected to appear in this index -- fresh, controlled-
+     * position vectors are inserted AFTER index creation instead, exercising
+     * the real auto-maintenance path (vecstore_insert() -> vec_index_notify_
+     * insert()) rather than assuming it works. ─────────────────────────────── */
+    {
+        struct SLSVecIndexCreateRequest creq;
+        memset(&creq, 0, sizeof(creq));
+        creq.caller_uid = 1;
+        strcpy(creq.index_name, "emp_hnsw");
+        strcpy(creq.collection_name, "employee_embeddings");
+        creq.metric = VEC_METRIC_L2;
+        uint64_t crc = sys_sls_vec_index_create(&creq);
+        CHECK(crc == 0 && creq.status == 0, "s4: sys_sls_vec_index_create creates an HNSW index over employee_embeddings");
+
+        // Positions deliberately far from every other embedding already in
+        // this shared collection (employee ids 1-5 at x in {0,1,3,6,10}, the
+        // orphan at x=100, the 20 batch entries at x in [1010,1029]) -- a
+        // real bug caught during verification: an earlier version of this
+        // scenario reused x=0/2/5/9, which collided with employee id=1's own
+        // (0,1,0) vector and skewed Scenario 5's later top-3 search. Distinct
+        // ranges keep each scenario's own nearest-neighbor assertions
+        // unambiguous.
+        float hxs[4] = {50.0f, 52.0f, 55.0f, 59.0f};
+        for (int i = 0; i < 4; i++) {
+            struct VecValues v = { 3, { hxs[i], 1.0f, 0.0f } };
+            struct VecId hid;
+            CHECK(vecstore_insert(1, "employee_embeddings", (uint64_t)(500 + i), &v, &hid) == 0,
+                  "s4: setup: post-index embedding inserted (auto-indexed via vec_index_notify_insert)");
+        }
+
+        struct SLSVecIndexSearchRequest sreq;
+        memset(&sreq, 0, sizeof(sreq));
+        sreq.caller_uid = 1;
+        strcpy(sreq.index_name, "emp_hnsw");
+        sreq.query.count = 3;
+        sreq.query.values[0] = 50.0f; sreq.query.values[1] = 1.0f; sreq.query.values[2] = 0.0f;
+        sreq.k = 2;
+        sreq.ef = 64;
+        uint64_t src = sys_sls_vec_index_search(&sreq);
+        CHECK(src == 0, "s4: sys_sls_vec_index_search returns success status");
+        CHECK(sreq.match_count == 2, "s4: HNSW search returns the requested top-2");
+        CHECK(sreq.truncated == 0, "s4: k=2 well under VEC_SEARCH_MAX_K, not truncated");
+        // Only 4 well-separated post-index points and ef=64 (>> node count) --
+        // recall should be exact here, verified against the known layout
+        // rather than asserting HNSW's general approximate contract (see
+        // vec_index.h's own header comment on why exactness isn't guaranteed
+        // in general).
+        int found_500 = 0;
+        for (uint32_t i = 0; i < sreq.match_count; i++)
+            if (sreq.matches[i].external_id == 500) found_500 = 1;
+        CHECK(found_500, "s4: nearest post-index point (external_id=500, exactly at the query) is in the top-2");
+    }
+
+    /* ── Scenario 5: Gap Remediation Phase C -- sys_sls_vec_join(), the join
+     * syscall adapter. Feeds it real matches from a real vecstore_search()
+     * call (mirroring how a caller would copy SLSVecSearchRequest.matches[]
+     * across in practice) and confirms it resolves exactly like the already-
+     * verified vec_join_resolve() does in Scenario 1. ───────────────────────── */
+    {
+        struct VecValues query = { 3, { 0.0f, 1.0f, 0.0f } };
+        struct VecMatch matches[3];
+        uint32_t n = vecstore_search(1, "employee_embeddings", &query, VEC_METRIC_L2, 3, matches);
+        CHECK(n == 3, "s5: setup: exact search still returns top-3 (unaffected by the HNSW index existing alongside)");
+        CHECK(matches[0].external_id == 1 && matches[1].external_id == 2 && matches[2].external_id == 3,
+              "s5: setup: top-3 is still employees 1, 2, 3 (Scenario 4's own probe points live far away at x>=50, no collision)");
+
+        struct SLSVecJoinRequest jreq;
+        memset(&jreq, 0, sizeof(jreq));
+        jreq.caller_uid = 1;
+        strcpy(jreq.table_name, "employees");
+        strcpy(jreq.id_column, "id");
+        memcpy(jreq.matches, matches, sizeof(struct VecMatch) * n);
+        jreq.match_count = n;
+        uint64_t jrc = sys_sls_vec_join(&jreq);
+        CHECK(jrc == 0, "s5: sys_sls_vec_join always returns 0 (per its own documented contract)");
+        CHECK(jreq.result_count == 3, "s5: sys_sls_vec_join resolves all 3 matches to real employee rows");
+        CHECK(jreq.truncated == 0, "s5: result_count (3) is well under VEC_JOIN_MAX_RESULTS, not truncated");
+
+        int all_match = 1;
+        for (uint32_t i = 0; i < jreq.result_count && i < VEC_JOIN_MAX_RESULTS; i++) {
+            char expect[32];
+            snprintf(expect, sizeof(expect), "employee%llu", (unsigned long long)jreq.results[i].match.external_id);
+            if (jreq.results[i].row.count < 2 || strcmp(jreq.results[i].row.values[1], expect) != 0) all_match = 0;
+        }
+        CHECK(all_match, "s5: every resolved row's name matches its own match's external_id, via the syscall path");
+    }
+
+    /* ── Scenario 6: Gap Remediation Phase C -- sys_sls_vec_list()/
+     * sys_sls_vec_index_list() smoke tests. Both are console-dump functions
+     * with no return value, matching this project's established precedent
+     * of not asserting on sys_sls_obj_list()-style console output -- this
+     * just confirms they run without crashing against a real, populated
+     * collection/index set (26+4 embeddings, 1 HNSW index). ─────────────────── */
+    {
+        sys_sls_vec_list();
+        sys_sls_vec_index_list();
+        CHECK(1, "s6: sys_sls_vec_list()/sys_sls_vec_index_list() run without crashing against real data");
     }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");

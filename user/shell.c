@@ -22,6 +22,11 @@
 #include "../kernel/agent.h"
 #include "../kernel/sql_exec.h"
 #include "../kernel/vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
+#include "../kernel/rowstore.h"   // Gap Remediation Phase B -- SYS_SLS_ROWSTORE_CREATE_TABLE
+#include "../kernel/vec_join.h"   // Gap Remediation Phase C -- SYS_SLS_VEC_JOIN
+#include "../kernel/vec_index.h"  // Gap Remediation Phase C -- SYS_SLS_VEC_INDEX_CREATE/SEARCH
+#include "../kernel/partition.h"  // Gap Remediation Phase F -- SYS_SLS_PARTITION_CREATE/ASSIGN/LIST/DESTROY/PAUSE/RESUME
+#include "../kernel/frame_pool.h" // Gap Remediation Phase F -- SYS_SLS_PARTITION_QUOTA_SET/QUOTA_LIST
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -179,6 +184,8 @@ static void print_help(void) {
         "  upload <name> <hex>           write hex-encoded bytes to binary store\n"
         "  load <name>                   spawn process from uploaded binary\n"
         "  loader list                   show all binaries in the store\n"
+        "  timi info <name>               structured TIMI header/entries/names/\n"
+        "                                   activation-cache dump (Gap Remediation Phase G)\n"
         "  -- Process Isolation (Phase B) --\n"
         "  proc list                     show all Ring-3 processes\n"
         "  proc spawn <object>           create a process from SERVICE_PROCESS object\n"
@@ -237,13 +244,36 @@ static void print_help(void) {
         "  workflow run    <name> <input...>         execute all steps\n"
         "  workflow list                             list all workflows\n"
         "  workflow status <name>                    show workflow descriptor\n"
+        "  -- Row-Set Tables + SQL (Phases 16-22, Gap Remediation Phase B) --\n"
+        "  table create <name>            promote a valloc'd+schema'd object to a row-set\n"
+        "                                   table (run valloc + schema set on it first)\n"
+        "  sql <statement>                 run one autocommit SQL statement\n"
         "  -- Vector Store (Phase 4) --\n"
         "  vec create <name> <dim>        register a vector collection (needs valloc first)\n"
+        "  -- Vector Store (Phases 5-6, Gap Remediation Phase C) --\n"
+        "  vec list                        list all vector collections\n"
+        "  vec index list                  list all HNSW indexes\n"
+        "  vec index create <idx> <coll> <cosine|l2>       define an HNSW index\n"
+        "  vec index search <idx> <k> <ef> <query...>       approximate top-K search\n"
+        "  vec join <coll> <table> <id_col> <cosine|l2> <k> <query...>\n"
+        "                                   search then resolve matches to real rows\n"
         "  vec insert <name> <ext_id> <v0> <v1> ...       insert a raw vector\n"
         "  vec embed-insert <name> <ext_id> <model> <text...>  embed via local Ollama, then store\n"
         "  vec search <name> cosine|l2 <k> <v0> <v1> ...  top-k nearest neighbors\n"
+        "  -- Partitions / LPAR (Phases 8/13/14, Gap Remediation Phase F) --\n"
+        "  partition create <name>                 define a new partition\n"
+        "  partition list                          list all defined partitions\n"
+        "  partition assign <uid> <partition_id>   assign a uid to a partition\n"
+        "  partition destroy <partition_id>        tear down a partition (kills its\n"
+        "                                            processes, vfrees its objects)\n"
+        "  partition pause <partition_id>           stop scheduling this partition\n"
+        "  partition resume <partition_id>          resume scheduling this partition\n"
+        "  partition quota <partition_id> <frames>  set a frame quota (0=unlimited)\n"
+        "  partition quotas                         list per-partition usage/quota\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
-        "  seal   <name>                  encrypt object with password\n"
+        "  seal   <name>                  derive+store a password-based key for an\n"
+        "                                   object (does NOT encrypt its data -- see\n"
+        "                                   kernel/secure_api.c's own header comment)\n"
         "  help                           show this message\n\n");
 }
 
@@ -589,6 +619,92 @@ void sls_shell_loop(void) {
             }
         }
 
+        // ── Gap Remediation Phase B: table create <name> ─────────────────────
+        // The live path rowstore_create_table() never had -- before this,
+        // the only way to promote a valloc'd + schema'd object into a real
+        // row-set table was a host test calling rowstore_create_table()
+        // directly. Matches the "sql "/"vec create " blocks' own shape:
+        // routes through the real SYS_SLS_ROWSTORE_CREATE_TABLE syscall via
+        // do_syscall(), under current_session_uid. Does not valloc or
+        // schema-set for you -- run "valloc <name> 1 <pages>" and one or
+        // more "schema set <name> <col> <type>" first (see rowstore.h's own
+        // comment on this syscall for why table creation isn't folded into
+        // one combined command).
+        else if (sh_starts(input_buffer, "table create ")) {
+            struct SLSRowstoreCreateTableRequest req;
+            req.caller_uid = current_session_uid;
+            sh_copy(req.table_name, input_buffer + 13, sizeof(req.table_name));
+            uint64_t rc = do_syscall(SYS_SLS_ROWSTORE_CREATE_TABLE, &req);
+            kernel_serial_printf("[TABLE] create '%s' -> %s (status %d)\n",
+                                 req.table_name, rc == 0 ? "OK" : "FAILED", req.status);
+        }
+
+        // ── Gap Remediation Phase F: partition create/list/assign/destroy/
+        // pause/resume/quota — every one of these syscalls was already
+        // correctly wired at the dispatch layer since Phase 8/13/14; this is
+        // the first shell surface for any of them (mirrors "table create "'s
+        // own shape immediately above). Prefix lengths below were computed
+        // programmatically (Python len()), not hand-counted, after finding a
+        // pre-existing hand-counting off-by-one in this same file's own
+        // "vec index create "/"vec index search " blocks (offset 18 where
+        // strlen() is actually 17) during this phase's own investigation --
+        // named here rather than silently fixed elsewhere, since it's a
+        // separate, pre-existing bug outside Phase F's own scope. ──────────
+        else if (sh_starts(input_buffer, "partition create ")) {
+            struct SLSPartitionCreateRequest req;
+            sh_copy(req.name, input_buffer + 17, sizeof(req.name));
+            uint64_t id = do_syscall(SYS_SLS_PARTITION_CREATE, &req);
+            kernel_serial_printf("[PARTITION] create '%s' -> id=%llu%s\n",
+                                 req.name, (unsigned long long)id,
+                                 id == 0xFFFFFFFFu ? " (FAILED)" : "");
+        }
+        else if (sh_eq(input_buffer, "partition list")) {
+            do_syscall(SYS_SLS_PARTITION_LIST, 0);
+        }
+        else if (sh_starts(input_buffer, "partition assign ")) {
+            struct SLSPartitionAssignRequest req;
+            const char* p = input_buffer + 17;
+            char uidtok[16], pidtok[16];
+            p = sh_token(p, uidtok, sizeof(uidtok));
+            sh_token(p, pidtok, sizeof(pidtok));
+            req.uid = sh_atoi(uidtok);
+            req.partition_id = sh_atoi(pidtok);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_ASSIGN, &req);
+            kernel_serial_printf("[PARTITION] assign uid=%u -> partition=%u -> %s\n",
+                                 req.uid, req.partition_id, rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_starts(input_buffer, "partition destroy ")) {
+            uint32_t pid = sh_atoi(input_buffer + 18);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_DESTROY, (void*)(uintptr_t)pid);
+            kernel_serial_printf("[PARTITION] destroy %u -> %s\n", pid, rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_starts(input_buffer, "partition pause ")) {
+            uint32_t pid = sh_atoi(input_buffer + 16);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_PAUSE, (void*)(uintptr_t)pid);
+            kernel_serial_printf("[PARTITION] pause %u -> %s\n", pid, rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_starts(input_buffer, "partition resume ")) {
+            uint32_t pid = sh_atoi(input_buffer + 17);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_RESUME, (void*)(uintptr_t)pid);
+            kernel_serial_printf("[PARTITION] resume %u -> %s\n", pid, rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_starts(input_buffer, "partition quota ")) {
+            struct SLSPartitionQuotaSetRequest req;
+            const char* p = input_buffer + 16;
+            char pidtok[16], qtok[24];
+            p = sh_token(p, pidtok, sizeof(pidtok));
+            sh_token(p, qtok, sizeof(qtok));
+            req.partition_id = sh_atoi(pidtok);
+            req.frame_quota  = (uint64_t)sh_atoi(qtok);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_QUOTA_SET, &req);
+            kernel_serial_printf("[PARTITION] quota partition=%u frames=%llu -> %s\n",
+                                 req.partition_id, (unsigned long long)req.frame_quota,
+                                 rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_eq(input_buffer, "partition quotas")) {
+            do_syscall(SYS_SLS_PARTITION_QUOTA_LIST, 0);
+        }
+
         // ── Vector Store Roadmap Phase 4: vec create/insert/embed-insert/
         // search ───────────────────────────────────────────────────────────
         // The first real, syscall-reachable entry points into the vector
@@ -699,6 +815,125 @@ void sls_shell_loop(void) {
                 if (frac < 0) frac = -frac;
                 kernel_serial_printf("  #%u external_id=%llu distance=%d.%03d\n", i,
                                      (unsigned long long)req.matches[i].external_id, whole, frac);
+            }
+        }
+
+        // ── Gap Remediation Phase C: vec list, vec index list ─────────────────
+        // Live surfaces vector-collection/index enumeration never had at any
+        // level -- a caller had to already know a name (docs/AeroSLS-Gap-
+        // Analysis-v0.1.md §7). Mirrors "ls objects"'s own do_syscall(...,
+        // 0) shape (no request struct needed for a pure list operation).
+        else if (sh_eq(input_buffer, "vec list")) {
+            do_syscall(SYS_SLS_VEC_LIST, 0);
+        }
+        else if (sh_eq(input_buffer, "vec index list")) {
+            do_syscall(SYS_SLS_VEC_INDEX_LIST, 0);
+        }
+
+        // ── Gap Remediation Phase C: vec index create/search, vec join ───────
+        // Live surfaces vec_index_create()/vec_index_search() (HNSW,
+        // Vector Store Phase 6) and vec_join_resolve() (Phase 5) never had
+        // -- both were plain host-testable kernel functions with zero
+        // syscall/shell/HTTP reachability before this (see vec_index.h's
+        // own point 6 and vec_join.h's own header comment, both of which
+        // named this as a deliberate "revisit only when a real caller
+        // needs it" cut). All three route through real syscalls via
+        // do_syscall(), matching every other "vec "-prefixed command above.
+        else if (sh_starts(input_buffer, "vec index create ")) {
+            struct SLSVecIndexCreateRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 18;
+            p = sh_token(p, req.index_name, sizeof(req.index_name));
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            char metrictok[16];
+            sh_token(p, metrictok, sizeof(metrictok));
+            req.metric = sh_eq(metrictok, "l2") ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+            uint64_t rc = do_syscall(SYS_SLS_VEC_INDEX_CREATE, &req);
+            kernel_serial_printf("[VEC] index create '%s' on '%s' (%s) -> %s (status %d)\n",
+                                 req.index_name, req.collection_name, metrictok,
+                                 rc == 0 ? "OK" : "FAILED", req.status);
+        }
+        else if (sh_starts(input_buffer, "vec index search ")) {
+            struct SLSVecIndexSearchRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 18;
+            p = sh_token(p, req.index_name, sizeof(req.index_name));
+            char ktok[16], eftok[16];
+            p = sh_token(p, ktok, sizeof(ktok));
+            req.k = sh_atoi(ktok);
+            p = sh_token(p, eftok, sizeof(eftok));
+            req.ef = sh_atoi(eftok);
+            uint32_t n = 0;
+            while (*p && n < VECSTORE_MAX_DIMENSION) {
+                char vtok[32];
+                p = sh_token(p, vtok, sizeof(vtok));
+                if (!vtok[0]) break;
+                req.query.values[n++] = sh_atof(vtok);
+            }
+            req.query.count = n;
+            do_syscall(SYS_SLS_VEC_INDEX_SEARCH, &req);
+            kernel_serial_printf("[VEC] index search '%s' (k=%u, ef=%u, query dim=%u) -> %u match(es)%s\n",
+                                 req.index_name, req.k, req.ef, n, req.match_count,
+                                 req.truncated ? " (k truncated)" : "");
+            for (uint32_t i = 0; i < req.match_count; i++) {
+                int whole = (int)req.matches[i].distance;
+                int frac  = (int)((req.matches[i].distance - (float)whole) * 1000.0f);
+                if (frac < 0) frac = -frac;
+                kernel_serial_printf("  #%u external_id=%llu distance=%d.%03d\n", i,
+                                     (unsigned long long)req.matches[i].external_id, whole, frac);
+            }
+        }
+        else if (sh_starts(input_buffer, "vec join ")) {
+            // Convenience: search, then join the results, in one command --
+            // two real syscalls under the hood (SYS_SLS_VEC_SEARCH then
+            // SYS_SLS_VEC_JOIN), not a shortcut around either. The syscall
+            // itself (sys_sls_vec_join()) stays a pure join-already-computed-
+            // matches primitive, matching vec_join_resolve()'s own real
+            // contract -- this command is the ergonomic layer on top, the
+            // same relationship "sql "/"vec search " have to their own
+            // underlying engines.
+            struct SLSVecSearchRequest sreq;
+            sreq.caller_uid = current_session_uid;
+            const char* p = input_buffer + 9;
+            p = sh_token(p, sreq.collection_name, sizeof(sreq.collection_name));
+            char table_name[OBJECT_NAME_LEN];
+            p = sh_token(p, table_name, sizeof(table_name));
+            char id_column[RECORD_KEY_LEN];
+            p = sh_token(p, id_column, sizeof(id_column));
+            char metrictok[16];
+            p = sh_token(p, metrictok, sizeof(metrictok));
+            sreq.metric = sh_eq(metrictok, "l2") ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+            char ktok[16];
+            p = sh_token(p, ktok, sizeof(ktok));
+            sreq.k = sh_atoi(ktok);
+            uint32_t n = 0;
+            while (*p && n < VECSTORE_MAX_DIMENSION) {
+                char vtok[32];
+                p = sh_token(p, vtok, sizeof(vtok));
+                if (!vtok[0]) break;
+                sreq.query.values[n++] = sh_atof(vtok);
+            }
+            sreq.query.count = n;
+            do_syscall(SYS_SLS_VEC_SEARCH, &sreq);
+
+            struct SLSVecJoinRequest jreq;
+            jreq.caller_uid = current_session_uid;
+            sh_copy(jreq.table_name, table_name, sizeof(jreq.table_name));
+            sh_copy(jreq.id_column, id_column, sizeof(jreq.id_column));
+            jreq.match_count = sreq.match_count < VEC_SEARCH_MAX_K ? sreq.match_count : VEC_SEARCH_MAX_K;
+            for (uint32_t i = 0; i < jreq.match_count; i++) jreq.matches[i] = sreq.matches[i];
+            do_syscall(SYS_SLS_VEC_JOIN, &jreq);
+
+            kernel_serial_printf("[VEC] join '%s' -> '%s'.%s: %u search match(es) -> %u resolved row(s)%s\n",
+                                 sreq.collection_name, table_name, id_column,
+                                 sreq.match_count, jreq.result_count,
+                                 jreq.truncated ? " (truncated)" : "");
+            uint32_t nshown = jreq.result_count < VEC_JOIN_MAX_RESULTS ? jreq.result_count : VEC_JOIN_MAX_RESULTS;
+            for (uint32_t i = 0; i < nshown; i++) {
+                kernel_serial_printf("  external_id=%llu ->", (unsigned long long)jreq.results[i].match.external_id);
+                for (uint32_t c = 0; c < jreq.results[i].row.count; c++)
+                    kernel_serial_printf("%s%s", c ? ", " : " ", jreq.results[i].row.values[c]);
+                kernel_serial_print("\n");
             }
         }
 
@@ -881,6 +1116,54 @@ void sls_shell_loop(void) {
         // ── Phase C: loader list ───────────────────────────────────────────
         else if (sh_eq(input_buffer, "loader list")) {
             do_syscall(172, 0);
+        }
+
+        // ── Gap Remediation Phase G: timi info <name> ─────────────────────────
+        // First shell surface for SYS_SLS_TIMI_INFO (173) -- previously
+        // reachable only via loader_timi_info()'s own console dump, called
+        // nowhere. Now struct-based (see loader.h): the syscall fills
+        // req.result in place (single address space, no marshalling) and
+        // this command formats it. Prefix offset via Python len(), not
+        // hand-counted, per Phase F's own established practice.
+        else if (sh_starts(input_buffer, "timi info ")) {
+            struct SLSTimiInfoRequest req;
+            sh_copy(req.object_name, input_buffer + 10, sizeof(req.object_name));
+            do_syscall(SYS_SLS_TIMI_INFO, &req);
+            struct TimiInfoResult* r = &req.result;
+            if (r->status == TIMI_INFO_STATUS_NOT_FOUND) {
+                kernel_serial_printf("[TIMI] '%s' not found\n", req.object_name);
+            } else if (r->status == TIMI_INFO_STATUS_NOT_TIMI) {
+                kernel_serial_printf("[TIMI] '%s' is not a TIMI object (format: %s)\n",
+                                     req.object_name, r->format_name);
+            } else if (r->status == TIMI_INFO_STATUS_CORRUPT) {
+                kernel_serial_printf("[TIMI] '%s' has a corrupt TIMI header\n", req.object_name);
+            } else {
+                kernel_serial_printf("[TIMI] '%s': %u instr, %u literals, %u entries, %u names\n",
+                                     req.object_name, r->num_instr, r->num_literals,
+                                     r->num_entries, r->num_names);
+                for (uint32_t i = 0; i < r->entries_returned; i++) {
+                    kernel_serial_printf("  entry: %s @ %u\n",
+                                         r->entries[i].name, r->entries[i].offset);
+                }
+                if (r->entries_truncated) {
+                    kernel_serial_printf("  (%u more entries, truncated)\n",
+                                         r->num_entries - r->entries_returned);
+                }
+                for (uint32_t i = 0; i < r->names_returned; i++) {
+                    kernel_serial_printf("  name: %s\n", r->names[i].name);
+                }
+                if (r->names_truncated) {
+                    kernel_serial_printf("  (%u more names, truncated)\n",
+                                         r->num_names - r->names_returned);
+                }
+                if (r->activation.cached) {
+                    kernel_serial_printf("  activation: cached, %u code pages, entry+%u, hash=%08x\n",
+                                         r->activation.code_pages, r->activation.entry_offset,
+                                         r->activation.content_hash);
+                } else {
+                    kernel_serial_printf("  activation: not cached\n");
+                }
+            }
         }
 
         // ── Phase B: proc list ───────────────────────────────────────────────

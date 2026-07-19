@@ -36,6 +36,23 @@ static void make_token(const char* email, uint64_t seed, char* out) {
     out[32] = '\0';
 }
 
+// ─── au_token_expired ─────────────────────────────────────────────────────────
+// Gap Remediation Phase E. Shared by every call site that decides whether an
+// existing token slot is still good: auth_validate_token() (below), and the
+// two "does this email already have a token" reuse checks in
+// auth_create_token() and auth_http_issue(). Centralizing this matters
+// because those two reuse checks originally only tested `active`, not
+// expiry -- meaning once a token aged past AUTH_TOKEN_TTL_TICKS, POST
+// /auth/token would keep re-handing out that same dead token forever with
+// no way for a caller to get a working one short of an admin-initiated
+// revoke. That's a real, concrete "denial looks like absence" bug this
+// TTL feature itself would otherwise have introduced, caught and fixed in
+// the same pass rather than shipped and found later.
+static int au_token_expired(const struct LeaseToken* lt) {
+    if (lt->no_expiry) return 0;
+    return (kernel_tick_counter - lt->created_tick) > AUTH_TOKEN_TTL_TICKS;
+}
+
 // ─── auth_init ────────────────────────────────────────────────────────────────
 // Pre-register the four simulator demo accounts with deterministic tokens
 // (fixed seeds so they survive any TSC reading quirks).
@@ -74,10 +91,18 @@ void auth_init(void) {
         struct LeaseToken* lt = &auth_tokens[i];
         au_strncpy(lt->email, req.email, AUTH_EMAIL_LEN);
         au_strncpy(lt->token, fixed_tokens[i], AUTH_TOKEN_LEN + 1);
-        lt->uid         = req.uid;
-        lt->role        = req.role;
-        lt->created_tsc = 0;   // skip rdtsc during early boot
-        lt->active      = 1;
+        lt->uid          = req.uid;
+        lt->role         = req.role;
+        lt->created_tick = kernel_tick_counter;  // a plain global read, unlike
+                                                   // rdtsc -- safe this early
+        // Gap Remediation Phase E: these four are standing local-dev demo
+        // credentials (see this function's own header comment), not
+        // runtime-issued session tokens -- exempt from TTL expiry so the
+        // simulator's login flow doesn't silently break after an hour of
+        // uptime. Every token issued later via auth_create_token() still
+        // gets real TTL enforcement.
+        lt->no_expiry    = 1;
+        lt->active       = 1;
 
         kernel_serial_print(" ");
         kernel_serial_print(lt->email);
@@ -100,10 +125,26 @@ void auth_init(void) {
 int auth_create_token(struct AuthCreateRequest* req, char* out_token) {
     if (!req) return 0;
 
-    // Check if this email already has a token
+    // Check if this email already has a token. Phase E: only reuse it if
+    // it's still live -- an expired slot falls through to the reissue path
+    // below instead, reusing the same slot rather than the free-slot search
+    // (see au_token_expired()'s own comment for why this matters).
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
         if (auth_tokens[i].active && au_streq(auth_tokens[i].email, req->email)) {
-            if (out_token) au_strncpy(out_token, auth_tokens[i].token, AUTH_TOKEN_LEN+1);
+            if (!au_token_expired(&auth_tokens[i])) {
+                if (out_token) au_strncpy(out_token, auth_tokens[i].token, AUTH_TOKEN_LEN+1);
+                return 1;
+            }
+            char tok[AUTH_TOKEN_LEN + 1];
+            make_token(req->email, read_tsc(), tok);
+            au_strncpy(auth_tokens[i].token, tok, AUTH_TOKEN_LEN + 1);
+            auth_tokens[i].uid          = req->uid;
+            auth_tokens[i].role         = req->role;
+            auth_tokens[i].created_tick = kernel_tick_counter;
+            if (out_token) au_strncpy(out_token, tok, AUTH_TOKEN_LEN + 1);
+            kernel_serial_printf(
+                "[AUTH] Token re-issued (previous expired): uid=%u role=%s email=%s\n",
+                req->uid, role_name(req->role), req->email);
             return 1;
         }
     }
@@ -116,10 +157,11 @@ int auth_create_token(struct AuthCreateRequest* req, char* out_token) {
 
             au_strncpy(auth_tokens[i].email, req->email, AUTH_EMAIL_LEN);
             au_strncpy(auth_tokens[i].token, tok, AUTH_TOKEN_LEN + 1);
-            auth_tokens[i].uid         = req->uid;
-            auth_tokens[i].role        = req->role;
-            auth_tokens[i].created_tsc = read_tsc();
-            auth_tokens[i].active      = 1;
+            auth_tokens[i].uid          = req->uid;
+            auth_tokens[i].role         = req->role;
+            auth_tokens[i].created_tick = kernel_tick_counter;  // Phase E
+            auth_tokens[i].no_expiry    = 0;                    // Phase E: real TTL applies
+            auth_tokens[i].active       = 1;
 
             if (out_token) au_strncpy(out_token, tok, AUTH_TOKEN_LEN + 1);
             kernel_serial_printf(
@@ -133,10 +175,19 @@ int auth_create_token(struct AuthCreateRequest* req, char* out_token) {
 }
 
 // ─── auth_validate_token ──────────────────────────────────────────────────────
+// Gap Remediation Phase E: now also enforces TTL expiry for any token that
+// isn't one of auth_init()'s standing demo accounts (no_expiry==1). An
+// expired token fails validation exactly like an unknown one -- the slot is
+// left active rather than reclaimed (bump-allocated, no-reclaim is this
+// project's existing precedent for fixed-size registries under pressure,
+// e.g. row_constraint.h's ROW_CONSTRAINT_MAX; freeing expired slots for
+// reuse is a real future improvement, named in the Phase E findings rather
+// than built here).
 int auth_validate_token(const char* token, uint32_t* out_uid, SLSRole* out_role) {
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
         if (!auth_tokens[i].active) continue;
         if (au_streq(auth_tokens[i].token, token)) {
+            if (au_token_expired(&auth_tokens[i])) break;  // expired -- fall through to failure
             if (out_uid)  *out_uid  = auth_tokens[i].uid;
             if (out_role) *out_role = auth_tokens[i].role;
             return 1;
@@ -193,9 +244,13 @@ int auth_http_issue(const char* email, char* resp_buf, int max) {
         return n;
     }
 
-    // Try existing token first
+    // Try existing token first. Phase E: skip (and fall through to the
+    // "unknown email" reissue path below) if it's expired -- see
+    // au_token_expired()'s own comment for why an expired slot can't just
+    // be handed back as-is.
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
-        if (auth_tokens[i].active && au_streq(auth_tokens[i].email, email)) {
+        if (auth_tokens[i].active && au_streq(auth_tokens[i].email, email) &&
+            !au_token_expired(&auth_tokens[i])) {
             // Found — return it
             int pos = 0;
             const char* pre = "{\"ok\":true,\"token\":\"";

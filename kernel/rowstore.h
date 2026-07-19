@@ -148,6 +148,37 @@ void rowstore_init(void);
 // than ROWSTORE_MAX_COLUMNS.
 int rowstore_create_table(const char* table_name);
 
+// ─── Phase B (gap remediation, docs/AeroSLS-Gap-Remediation-Roadmap-v0.1.md
+// §Phase B): the live reachability path this function never had. Every
+// caller of rowstore_create_table() before this was a host test -- there
+// was no syscall, no shell command, and no HTTP route, meaning there was NO
+// way, at runtime, to promote a valloc'd + schema'd object into a real
+// row-set table. caller_uid travels inside the request struct, matching
+// SYS_SLS_SQL_EXECUTE/SYS_SLS_VEC_CREATE's own established convention (do_
+// syscall()'s opaque void* arg has no uid context of its own). This syscall
+// does NOT valloc or schema_set for the caller -- sys_sls_valloc()
+// (OBJ_TYPE_DB_TABLE) and sys_sls_schema_set() are already independently
+// reachable (shell: "valloc"/"schema set"; HTTP: POST /api/valloc for the
+// former, schema_set has no HTTP route yet either -- a smaller, separate
+// gap, not addressed here) and this phase adds only the one missing final
+// step, not a second way to do the first two.
+#define SYS_SLS_ROWSTORE_CREATE_TABLE 225
+
+struct SLSRowstoreCreateTableRequest {
+    uint32_t caller_uid;   // currently unused by rowstore_create_table() itself (it takes no
+                            // caller_uid -- table creation isn't gated by catalog_check_access(),
+                            // matching valloc/schema_set's own ungated pre-creation posture), kept
+                            // here anyway for the same reason every other Phase 22+ request struct
+                            // carries one: consistency, and so a future permission gate on table
+                            // creation doesn't need a struct layout change to add.
+    char     table_name[OBJECT_NAME_LEN];
+    int      status;       // rowstore_create_table()'s own return code (0 = success)
+};
+
+// Returns 0 on success, 1 on error (matching rowstore_create_table()'s own
+// return contract) -- req->status is always filled in either way.
+uint64_t sys_sls_rowstore_create_table(struct SLSRowstoreCreateTableRequest* req);
+
 // Row CRUD. Every call resolves table_name to a catalog entry and gates on
 // catalog_check_access() first (PERM_READ for get/scan, PERM_WRITE for
 // insert/update/delete) — see the header comment above for why this is a

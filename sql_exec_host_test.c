@@ -43,6 +43,8 @@
 #include "kernel/sql_exec.h"
 #include "kernel/cursor.h"
 #include "kernel/index_mgr.h"
+#include "kernel/vecstore.h"
+#include "kernel/vec_index.h"
 #include "kernel/persist.h"
 #include "user/permissions.h"
 #include <stdio.h>
@@ -67,6 +69,31 @@ void catalog_after_restore(void) { /* no-op for this test */ }
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
+
+/* Gap Remediation Phase D: persist.c's new restore blocks 9-10 reference
+ * vecstore.c/vec_index.c's own globals/functions, neither of which is
+ * linked here (this suite is scoped to the RDBMS layer) -- stubbed purely
+ * to satisfy the linker, matching rowstore_host_test.c's own identical
+ * precedent; both restore blocks correctly no-op at "no snapshot" before
+ * ever touching this content. */
+struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
+uint32_t                   vecstore_next_free_page_id = 0;
+struct VecIndex             vec_indexes[VEC_INDEX_MAX];
+int vec_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* collection_name, VecMetric metric) {
+    (void)caller_uid; (void)index_name; (void)collection_name; (void)metric;
+    return 1;
+}
+uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_name,
+                                  VecScanCb cb, void* ctx) {
+    (void)caller_uid; (void)collection_name; (void)cb; (void)ctx;
+    return 0;
+}
+void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
+                             struct VecId id, uint64_t external_id,
+                             const struct VecValues* values) {
+    (void)caller_uid; (void)collection_name; (void)id; (void)external_id; (void)values;
+}
 
 static int      g_access_calls = 0;
 static int      g_access_force_deny = 0;
@@ -179,11 +206,15 @@ int main(void) {
         cursor_close(r.cursor_id);   // CURSOR_MAX (cursor.h) is only 8 slots -- close each cursor once done, matching real usage
     }
 
-    /* ── Scenario 4: SELECT using the INDEX path -- range scan (single
-     * top-level GE/LE style via GT/LT), verified against a full-scan-only
-     * predicate on a non-indexed column returning the same logical answer,
-     * proving both planner paths agree. ──────────────────────────────────── */
-    CHECK(sql_execute(1, "SELECT * FROM employees WHERE id > 15", &r) == 0, "scenario 4: indexed range SELECT (id > 15) succeeds");
+    /* ── Scenario 4: a range comparison on an indexed column. Gap Remediation
+     * Phase B's restored index-assisted planner deliberately does NOT
+     * accelerate ranges (see sql_exec.c's header comment on
+     * try_index_assisted_eq() for why -- the B-tree duplicate-cap
+     * completeness proof this phase relies on doesn't extend safely to a
+     * range scan), so this always runs the full mvcc_table_scan() +
+     * predicate_eval() path -- still exercised here to confirm that path
+     * remains correct on its own, independent of the EQ fast path. ──────── */
+    CHECK(sql_execute(1, "SELECT * FROM employees WHERE id > 15", &r) == 0, "scenario 4: range SELECT (id > 15, full-scan path) succeeds");
     CHECK(r.row_count == 4, "scenario 4: id > 15 matches exactly 4 rows (16,17,18,19)");
     cursor_close(r.cursor_id);
 
@@ -292,6 +323,61 @@ int main(void) {
     CHECK(sql_execute(1, "DELETE FROM no_such_table", &r) == 1 && r.error == SQL_ERR_TABLE_NOT_FOUND, "scenario 12: DELETE on unknown table");
     CHECK(sql_execute(1, "SELECT bogus_col FROM employees", &r) == 1 && r.error == SQL_ERR_COLUMN_NOT_FOUND, "scenario 12: SELECT of an unknown column");
     CHECK(sql_execute(1, "SELECT * FROM employees ORDER BY bogus_col", &r) == 1 && r.error == SQL_ERR_COLUMN_NOT_FOUND, "scenario 12: ORDER BY an unknown column");
+
+    /* ── Scenario 13 (Gap Remediation Phase B): the correctness-critical case
+     * try_index_assisted_eq()'s completeness check exists for -- a value
+     * with MORE duplicate rows than a B-tree leaf's BTREE_MAX_DUPES_PER_KEY
+     * (16) cap. If the planner trusted an incomplete index result here, it
+     * would silently UNDER-report matches; it must instead detect the cap
+     * and fall back to a full scan, returning the true, complete count. ──── */
+    memset(&object_catalog[1], 0, sizeof(object_catalog[1]));
+    strcpy(object_catalog[1].name, "wide_status");
+    object_catalog[1].type = OBJ_TYPE_DB_TABLE;
+    object_catalog[1].object_id = 0xE702;
+    object_catalog[1].active = 1;
+    object_catalog_count = 2;
+    memset(&object_schemas[1], 0, sizeof(object_schemas[1]));
+    strcpy(object_schemas[1].fields[0].key, "sid");    object_schemas[1].fields[0].type = FIELD_TYPE_UINT64; object_schemas[1].fields[0].active = 1;
+    strcpy(object_schemas[1].fields[1].key, "status"); object_schemas[1].fields[1].type = FIELD_TYPE_STRING; object_schemas[1].fields[1].active = 1;
+    object_schemas[1].field_count = 2;
+    CHECK(rowstore_create_table("wide_status") == 0, "scenario 13: wide_status table created");
+    CHECK(row_index_create(1, "idx_wstatus", "wide_status", "status") == 0, "scenario 13: idx_wstatus created on 'status'");
+
+    int wide_inserted = 0;
+    for (int i = 0; i < 25; i++) {   // 25 > BTREE_MAX_DUPES_PER_KEY(16) -- every row shares status='dup'
+        char q[256];
+        snprintf(q, sizeof(q), "INSERT INTO wide_status (sid, status) VALUES (%d, 'dup')", i);
+        if (sql_execute(1, q, &r) == 0) wide_inserted++;
+    }
+    CHECK(wide_inserted == 25, "scenario 13: all 25 duplicate-value INSERTs succeed (rows themselves are never capped)");
+
+    CHECK(sql_execute(1, "SELECT * FROM wide_status WHERE status = 'dup'", &r) == 0,
+          "scenario 13: EQ SELECT on the over-capacity indexed value succeeds");
+    CHECK(r.row_count == 25,
+          "scenario 13: all 25 rows reported -- the incomplete index was detected and the planner fell back to a full scan, not silently under-counting at 16");
+    cursor_close(r.cursor_id);
+
+    /* ── Scenario 14 (Gap Remediation Phase B): the index-assisted EQ path
+     * stays correct across an MVCC UPDATE -- the OLD value must stop
+     * matching and the NEW value must start, even though the B-tree index
+     * still remembers the OLD physical row (mvcc_resolve_physical() is what
+     * filters it out as no-longer-visible). idx_id (on 'id', scenario 3's
+     * index) never approaches the duplicate cap, so this exercises the real
+     * index-assisted fast path, not the scenario 13 fallback. ────────────── */
+    CHECK(sql_execute(1, "UPDATE employees SET id = 777 WHERE id = 6", &r) == 0 && r.affected_rows == 1,
+          "scenario 14: UPDATE changes id 6 -> 777");
+    CHECK(sql_execute(1, "SELECT * FROM employees WHERE id = 6", &r) == 0 && r.row_count == 0,
+          "scenario 14: EQ lookup on the OLD id (6) now correctly matches nothing");
+    cursor_close(r.cursor_id);
+    CHECK(sql_execute(1, "SELECT * FROM employees WHERE id = 777", &r) == 0 && r.row_count == 1,
+          "scenario 14: EQ lookup on the NEW id (777) correctly finds exactly the updated row");
+    {
+        struct collect_ctx ctx = {{{0}}, {{0}}, 0};
+        cursor_fetch_rows(r.cursor_id, 10, collect_id_cb, &ctx);
+        CHECK(ctx.count == 1 && strcmp(ctx.ids_seen[0], "777") == 0,
+              "scenario 14: the row returned via the index-assisted path really is id=777");
+        cursor_close(r.cursor_id);
+    }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

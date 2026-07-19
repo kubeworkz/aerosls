@@ -31,6 +31,11 @@
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "kernel/rowstore.h"
+#include "kernel/vecstore.h"
+#include "kernel/vec_index.h"
+#include "kernel/row_index.h"
+#include "kernel/row_constraint.h"
+#include "kernel/row_journal.h"
 #include "kernel/persist.h"
 #include "user/permissions.h"
 #include <stdio.h>
@@ -49,6 +54,56 @@ struct ServiceBinary   service_binaries[MAX_SERVICE_BINARIES];
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
 void catalog_after_restore(void) { /* no-op for this test */ }
+
+/* Gap Remediation Phase D: persist.c's new restore blocks 9-10 reference
+ * vecstore.c/vec_index.c's own globals and functions even though this test
+ * never triggers a real vecstore/vec_index snapshot on the fake NVMe below
+ * (nothing here ever calls persist_vecstore_headers()/persist_vec_index_
+ * defs()) -- those two restore blocks correctly no-op at "no snapshot --
+ * cold start" before ever touching these stubs' content, so it's never
+ * exercised; they exist purely so the linker can resolve persist.c's other
+ * two blocks, matching this file's own established pattern immediately
+ * above for the five earlier subsystems. */
+struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
+uint32_t                   vecstore_next_free_page_id = 0;
+struct VecIndex             vec_indexes[VEC_INDEX_MAX];
+int vec_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* collection_name, VecMetric metric) {
+    (void)caller_uid; (void)index_name; (void)collection_name; (void)metric;
+    return 1;
+}
+uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_name,
+                                  VecScanCb cb, void* ctx) {
+    (void)caller_uid; (void)collection_name; (void)cb; (void)ctx;
+    return 0;
+}
+void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
+                             struct VecId id, uint64_t external_id,
+                             const struct VecValues* values) {
+    (void)caller_uid; (void)collection_name; (void)id; (void)external_id; (void)values;
+}
+
+/* Same reasoning as immediately above, for the row_index/row_constraint/
+ * row_journal/mvcc symbols persist.c's restore blocks 7/8/11 and the 6b
+ * MVCC-bootstrap step reference -- none of row_index.c/row_constraint.c/
+ * row_journal.c/mvcc.c is linked here (this test is scoped to rowstore.c's
+ * own storage engine, matching every other file-scoped host test in this
+ * project), so their globals/functions are stubbed purely to satisfy the
+ * linker; restore blocks 7/8/11 all no-op at "no snapshot" before touching
+ * any of this content, same as the vecstore/vec_index stubs above. */
+struct RowIndex row_indexes[ROW_INDEX_MAX];
+int row_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* table_name, const char* column_name) {
+    (void)caller_uid; (void)index_name; (void)table_name; (void)column_name;
+    return 1;
+}
+struct RowConstraintDef row_constraints[ROW_CONSTRAINT_MAX];
+uint32_t                row_constraint_count = 0;
+struct RowJournalEntry      row_journal_buffer[ROW_JOURNAL_MAX_ENTRIES];
+uint32_t                    row_journal_entry_count = 0;
+struct RowJournalAttachment row_journal_attachments[ROW_JOURNAL_MAX_ATTACHMENTS];
+uint32_t                    row_journal_attachment_count = 0;
+void mvcc_bootstrap_from_rowstore(void) { /* no-op -- mvcc.c isn't linked here */ }
 
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }

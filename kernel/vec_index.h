@@ -211,4 +211,46 @@ uint32_t vec_index_search(uint32_t caller_uid, const char* index_name,
                           const struct VecValues* query, uint32_t k, uint32_t ef,
                           struct VecMatch* out);
 
+// ─── Gap Remediation Phase C: live reachability ────────────────────────────
+// Point 6 of this header's own simplifications list named "no syscall/shell
+// surface this phase" as a deliberate cut, revisit only when a real caller
+// needs it -- a frontend wanting to demonstrate the HNSW index is that real
+// caller. caller_uid travels inside each request struct, matching every
+// other Phase 22+/Vector-Store-Phase-4+ syscall's own convention.
+#define SYS_SLS_VEC_INDEX_CREATE 227
+#define SYS_SLS_VEC_INDEX_SEARCH 228
+
+struct SLSVecIndexCreateRequest {
+    uint32_t  caller_uid;
+    char      index_name[OBJECT_NAME_LEN];
+    char      collection_name[OBJECT_NAME_LEN];   // must already be a vector collection
+    VecMetric metric;
+    int       status;   // vec_index_create()'s own return code (0 = success)
+};
+
+struct SLSVecIndexSearchRequest {
+    uint32_t         caller_uid;
+    char             index_name[OBJECT_NAME_LEN];
+    struct VecValues query;
+    uint32_t         k;                            // capped to VEC_SEARCH_MAX_K internally
+    uint32_t         ef;
+    struct VecMatch  matches[VEC_SEARCH_MAX_K];     // filled in by the call
+    uint32_t         match_count;                    // filled in by the call
+    uint8_t          truncated;                      // 1 if the caller's k exceeded VEC_SEARCH_MAX_K
+};
+
+// Thin adapters, matching sys_sls_vec_create()/sys_sls_vec_search()'s own
+// shape exactly (vecstore.c) -- unpack the request struct, call straight
+// into the already-built, already-host-tested engine function, return a
+// 0/nonzero status.
+uint64_t sys_sls_vec_index_create(struct SLSVecIndexCreateRequest* req);
+uint64_t sys_sls_vec_index_search(struct SLSVecIndexSearchRequest* req);
+
+// ─── Gap Remediation Phase C: index enumeration ───────────────────────────
+// Mirrors SYS_SLS_VEC_LIST's own shape exactly (vecstore.h) -- before this,
+// a caller had to already know an index's name; there was no way to ask
+// "what HNSW indexes exist."
+#define SYS_SLS_VEC_INDEX_LIST 230
+void sys_sls_vec_index_list(void);
+
 #endif /* VEC_INDEX_H */

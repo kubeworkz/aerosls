@@ -6,7 +6,9 @@
 #include "object_catalog.h"
 #include "frame_pool.h"
 #include "kernel_io.h"
+#include "persist.h"     // Gap Remediation Phase D -- persist_vecstore_headers()
 #include "../user/permissions.h"
+#include "../drivers/nvme_io.h"   // Gap Remediation Phase D -- real page persistence
 #include "vec_index.h"   // Vector Store Roadmap Phase 6 -- auto-maintenance hooks only, see
                           // vecstore_insert()/vecstore_delete() below and vec_index.h's own
                           // header comment on why this mirrors row_index.c/rowstore.c's
@@ -16,10 +18,11 @@
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
 
-// RAM-only page cache -- NULL = not allocated. Unlike rowstore.c's
-// row_pages[], there is no lazy-load-from-NVMe path at all this phase
-// (see vecstore.h's header comment): once a page is allocated it simply
-// stays allocated in RAM for the process/kernel's lifetime.
+// RAM-cached page pointers -- NULL = not resident this boot. Gap
+// Remediation Phase D: this is no longer purely RAM-only (see vecstore.h's
+// header comment) -- a page either lives here already, or is lazily loaded
+// from NVMe on first access via vecstore_load_page(), exactly mirroring
+// rowstore.c's row_pages[]/rowstore_load_page() precedent.
 static uint8_t* vec_pages[VECSTORE_MAX_PAGES];
 
 // ─── String / memory helpers (no libc, vs_* here, matching this
@@ -54,6 +57,10 @@ static int find_active_collection(const char* name) {
 // ─── Page pool ───────────────────────────────────────────────────────────────
 // Allocates a brand-new page from the shared bump-allocator pool. No
 // reclaim in this first cut, matching rowstore.c's identical posture.
+// Gap Remediation Phase D: does NOT flush the fresh frame to NVMe itself --
+// same crash-window trade-off rowstore_alloc_page() already accepts (the
+// page becomes "real" on NVMe only once vecstore_flush_page() is first
+// called on it, matching this file's own new insert-path ordering below).
 static uint32_t vecstore_alloc_page(void) {
     if (vecstore_next_free_page_id >= VECSTORE_MAX_PAGES) return VECSTORE_INVALID_PAGE;
     uint32_t id = vecstore_next_free_page_id;
@@ -69,12 +76,39 @@ static uint32_t vecstore_alloc_page(void) {
     return id;
 }
 
-// No lazy-load step this phase (see header comment) -- a page either was
-// already allocated this boot (and is sitting in vec_pages[]) or doesn't
-// exist yet. This helper exists purely to centralize the bounds check.
-static uint8_t* vecstore_page(uint32_t page_id) {
+// Gap Remediation Phase D: loads page_id into RAM (allocating a fresh frame
+// first if needed), lazily reading it from NVMe if it's a previously-
+// allocated page this boot hasn't touched yet -- mirrors rowstore.c's
+// rowstore_load_page() (and, one level further back, stream.c's
+// stream_lazy_load_frame()) exactly. Replaces the old, purely-RAM
+// vecstore_page() accessor this file had through Phase 6.
+static uint8_t* vecstore_load_page(uint32_t page_id) {
     if (page_id >= VECSTORE_MAX_PAGES) return 0;
-    return vec_pages[page_id];
+    if (vec_pages[page_id]) return vec_pages[page_id];
+
+    uint8_t* frame = (uint8_t*)allocate_physical_ram_frame();
+    if (!frame) return 0;
+
+    if (page_id < vecstore_next_free_page_id) {
+        // Previously allocated (this boot or a prior one) -- may have real
+        // data on NVMe. Errors are swallowed the same way rowstore.c's
+        // identical path does: the caller sees whatever's in the zeroed
+        // frame, detectable as "no valid entries" rather than a crash.
+        vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
+        nvme_read_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8, frame);
+    } else {
+        vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
+        uint32_t invalid = VECSTORE_INVALID_PAGE;
+        vs_memcpy(frame, &invalid, 4);
+    }
+    vec_pages[page_id] = frame;
+    return frame;
+}
+
+// Gap Remediation Phase D: mirrors rowstore.c's rowstore_flush_page().
+static void vecstore_flush_page(uint32_t page_id) {
+    if (page_id >= VECSTORE_MAX_PAGES || !vec_pages[page_id]) return;
+    nvme_write_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8, vec_pages[page_id]);
 }
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -107,6 +141,8 @@ int vecstore_create_collection(const char* collection_name, uint32_t dimension) 
     h->last_page_id     = VECSTORE_INVALID_PAGE;
 
     if (h->entries_per_page == 0) { vs_memset(h, 0, sizeof(*h)); return 1; }   // entry too wide for even one per page
+
+    persist_vecstore_headers();   // Gap Remediation Phase D
 
     kernel_serial_printf(
         "[VECSTORE] '%s' enabled: dimension=%u, entry_width=%u, %u entr(y/ies)/page.\n",
@@ -149,25 +185,27 @@ int vecstore_insert(uint32_t caller_uid, const char* collection_name,
         if (h->first_page_id == VECSTORE_INVALID_PAGE) {
             h->first_page_id = new_page;
         } else {
-            uint8_t* prev = vecstore_page(h->last_page_id);
-            if (prev) vs_memcpy(prev, &new_page, 4);
+            uint8_t* prev = vecstore_load_page(h->last_page_id);
+            if (prev) { vs_memcpy(prev, &new_page, 4); vecstore_flush_page(h->last_page_id); }
         }
         h->last_page_id = new_page;
         h->entries_in_last_page = 0;
         h->page_count++;
     }
 
-    uint8_t* page = vecstore_page(h->last_page_id);
+    uint8_t* page = vecstore_load_page(h->last_page_id);
     if (!page) return 5;
     uint32_t slot_idx = h->entries_in_last_page;
     uint8_t* slot = page + 4 + slot_idx * h->entry_width;
     vs_write_entry(slot, external_id, values, h->dimension);
+    vecstore_flush_page(h->last_page_id);   // Gap Remediation Phase D
 
     h->entries_in_last_page++;
     h->entry_count++;
 
     struct VecId new_id = { h->last_page_id, slot_idx };
     if (out_id) *out_id = new_id;
+    persist_vecstore_headers();   // Gap Remediation Phase D
 
     // Phase 6: auto-maintenance -- see vec_index.h's own header comment on
     // why this call is unconditional here (vec_index_notify_insert() is
@@ -188,7 +226,7 @@ int vecstore_get(uint32_t caller_uid, const char* collection_name,
     if (id.page_id >= vecstore_next_free_page_id) return 3;
     if (id.slot_index >= h->entries_per_page) return 3;
 
-    uint8_t* page = vecstore_page(id.page_id);
+    uint8_t* page = vecstore_load_page(id.page_id);
     if (!page) return 3;
     uint8_t* slot = page + 4 + id.slot_index * h->entry_width;
     if (!slot[0]) return 3;   // tombstoned / never written
@@ -209,13 +247,15 @@ int vecstore_delete(uint32_t caller_uid, const char* collection_name, struct Vec
     if (id.page_id >= vecstore_next_free_page_id) return 3;
     if (id.slot_index >= h->entries_per_page) return 3;
 
-    uint8_t* page = vecstore_page(id.page_id);
+    uint8_t* page = vecstore_load_page(id.page_id);
     if (!page) return 3;
     uint8_t* slot = page + 4 + id.slot_index * h->entry_width;
     if (!slot[0]) return 3;   // already deleted / never written
 
     slot[0] = 0;   // tombstone -- slot is NOT reclaimed for reuse in this first cut
+    vecstore_flush_page(id.page_id);   // Gap Remediation Phase D
     h->entry_count--;
+    persist_vecstore_headers();        // Gap Remediation Phase D
 
     // Phase 6: auto-maintenance -- see the identical comment in
     // vecstore_insert() above.
@@ -234,7 +274,7 @@ uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_na
     uint32_t visited = 0;
     uint32_t page_id = h->first_page_id;
     while (page_id != VECSTORE_INVALID_PAGE) {
-        uint8_t* page = vecstore_page(page_id);
+        uint8_t* page = vecstore_load_page(page_id);
         if (!page) break;
         uint32_t next_page; vs_memcpy(&next_page, page, 4);
         uint32_t limit = (page_id == h->last_page_id) ? h->entries_in_last_page : h->entries_per_page;
@@ -436,4 +476,33 @@ uint64_t sys_sls_vec_search(struct SLSVecSearchRequest* req) {
     req->match_count = vecstore_search(req->caller_uid, req->collection_name,
                                        &req->query, req->metric, k, req->matches);
     return 0;
+}
+
+// ─── Gap Remediation Phase C: collection enumeration ────────────────────────
+// Mirrors sys_sls_obj_list()'s own shape exactly (object_catalog.c) -- see
+// vecstore.h's own comment on this syscall.
+void sys_sls_vec_list(void) {
+    // kernel_serial_print() takes exactly one argument (const char*, no
+    // format processing at all -- kernel_io.c's own definition) --
+    // kernel_serial_printf() is the variadic one. Worth noting: this file's
+    // own established precedent, sys_sls_obj_list() (object_catalog.c),
+    // calls kernel_serial_print() with a format string PLUS several extra
+    // string arguments for its header row -- a real, pre-existing bug (see
+    // that file's own Gap Remediation Phase C fix), not a pattern to copy.
+    kernel_serial_printf(
+        "\n[VECSTORE] Collection Directory\n"
+        " %-24s %-6s %-8s %s\n"
+        " %-24s %-6s %-8s %s\n",
+        "Name", "Dim", "Entries", "Pages",
+        "------------------------", "------", "--------", "-----");
+
+    uint32_t shown = 0;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (!object_catalog[i].active || !vector_collections[i].active) continue;
+        struct VecCollectionHeader* h = &vector_collections[i];
+        kernel_serial_printf(" %-24s %-6u %-8u %u\n",
+                             object_catalog[i].name, h->dimension, h->entry_count, h->page_count);
+        shown++;
+    }
+    if (!shown) kernel_serial_print(" (no vector collections defined)\n");
 }

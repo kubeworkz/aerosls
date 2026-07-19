@@ -72,6 +72,54 @@ int partition_set_frame_quota(uint32_t partition_id, uint64_t frame_quota);
 uint64_t partition_get_frame_usage(uint32_t partition_id);
 uint64_t partition_get_frame_quota(uint32_t partition_id);
 
+/* Gap Remediation Phase F: the free-side counterpart to
+ * allocate_physical_ram_frame()/allocate_physical_ram_frame_for_partition().
+ * Before this phase, frame_pool.c had NO free primitive at all for any
+ * subsystem -- every frame ever handed out stayed marked allocated in
+ * physical_memory_bitmap forever, kernel-wide, not just for partitions.
+ *
+ * Clears frame's bit in the bitmap and decrements the relevant partition's
+ * usage counter (floored at 0, defensive against an already-inconsistent
+ * counter). Validates before touching anything: frame must be page-aligned,
+ * in range, non-NULL/non-frame-0 (frame 0 is never handed out, see
+ * alloc_raw_frame()'s own skip), and its bit must currently be SET --
+ * calling this on an address that was never allocated, or double-freeing
+ * one already freed, is rejected as a no-op failure (returns 1) rather than
+ * corrupting the bitmap or a partition counter. Same fail-cleanly-before-
+ * any-side-effect posture as every other allocator boundary check in this
+ * project.
+ *
+ * free_physical_ram_frame() decrements PARTITION_SYSTEM's counter, mirroring
+ * how allocate_physical_ram_frame() always increments it.
+ * free_physical_ram_frame_for_partition() decrements the given partition_id
+ * instead, mirroring the accounted alloc path -- fails (returns 1, bitmap
+ * untouched) if partition_id is out of range.
+ *
+ * NEITHER is currently called from partition_destroy(). See that function's
+ * own comment (kernel/partition.c) and the Phase F findings addendum for
+ * why: frame_pool.c only ever tracked an aggregate per-partition frame
+ * COUNT, never which individual physical frames belong to which partition
+ * or which process, so partition_destroy() has no list of addresses to
+ * pass here. Building that list would mean walking each of the partition's
+ * processes' own page tables at teardown -- and this investigation found
+ * that doing so naively would be actively dangerous, not just unbuilt:
+ * user_clone_page_table() (arch/x86/user_paging.c) currently clones a new
+ * process's PML4 by copying all 512 raw entries from the running kernel's
+ * own PML4, meaning a freshly-cloned process's page table can point at
+ * intermediate PDPT/PD/PT frames it doesn't itself own and never allocated
+ * -- a walker that frees everything reachable from a process's own PML4
+ * without first distinguishing "this process's own mappings" from
+ * "inherited-by-copy-at-clone-time" entries would free live kernel/shared
+ * page-table frames out from under the rest of the system. That's a real,
+ * separate, larger project (a correct per-process mapping walker, doubled
+ * for both the x86 and RISC-V arch targets this kernel supports) -- named
+ * here rather than attempted unsafely in this pass. This phase closes the
+ * narrower, concretely-scoped gap the roadmap named: frame_pool.c now HAS a
+ * free primitive, for the first time, available to any future caller that
+ * does have a specific frame address in hand. */
+int free_physical_ram_frame(void* frame);
+int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id);
+
 /* Phase 14 (LPAR): resets partition_id's frame-usage counter to 0.
  * ACCOUNTING-LEVEL RECLAMATION ONLY — this does NOT clear any bits in the
  * underlying physical bitmap. frame_pool.c only ever tracked an aggregate
@@ -101,5 +149,14 @@ struct SLSPartitionQuotaSetRequest {
  * sys_sls_partition_assign() — returns a 64-bit value regardless of the
  * underlying function's natural width, matching do_syscall()'s ABI. */
 uint64_t sys_sls_partition_quota_set(struct SLSPartitionQuotaSetRequest* req);
+
+/* Gap Remediation Phase F: sys_sls_partition_quota_list() (above) was fully
+ * implemented since Phase 13 but had no syscall number and no dispatcher
+ * case -- syscall-unreachable, not just shell/HTTP-unreachable, unlike
+ * every other gap this roadmap has closed so far. 217 is free (210-212,
+ * 213, 214-216 already taken; 220+ belongs to the SQL/Vector Store
+ * syscalls). No request struct needed -- takes no arguments at all, same
+ * shape as sys_sls_partition_list()'s own dispatch case. */
+#define SYS_SLS_PARTITION_QUOTA_LIST 217
 
 #endif /* FRAME_POOL_H */

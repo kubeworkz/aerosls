@@ -39,6 +39,46 @@
 //  NOT live in this small-struct-array region — it has its own dedicated
 //  region at ROWSTORE_LBA_BASE (rowstore.h), the same separation stream.c's
 //  STREAM_DATA_LBA_BASE already has from this file's regions.
+//
+//  Gap Remediation Phase D (docs/AeroSLS-Gap-Remediation-Roadmap-v0.1.md):
+//  persistence for the RDBMS/Vector Store subsystems that were RAM-only
+//  through Phase 24/Phase 6. Exact frame counts computed from real
+//  `sizeof()`, not estimated (see Phase D's own findings addendum) —
+//  RowConstraintDef=680B*64=42.5KiB, RowIndex definitions=96B*16=1.5KiB,
+//  VecCollectionHeader=48B*128=6KiB, VecIndex definitions=156B*16=2.4KiB,
+//  RowJournalEntry=8336B*16=130.25KiB, RowJournalAttachment=97B*16=1.5KiB.
+//
+//  LBA 6160  PERSIST_ROW_CONSTRAINT_HDR_LBA  1 frame  — row_constraints[] header
+//  LBA 6168  PERSIST_ROW_CONSTRAINT_ENT_LBA 11 frames — row_constraints[64] (~42.5 KiB)
+//            direct restore, no rebuild — pure definitions, no derived state (see header comment)
+//  (end LBA 6256)
+//
+//  LBA 6272  PERSIST_ROW_INDEX_HDR_LBA  1 frame — row-index definitions header
+//  LBA 6280  PERSIST_ROW_INDEX_ENT_LBA  1 frame — row_indexes[16] definitions (~1.5 KiB)
+//            rebuild-on-boot — restored definitions feed row_index_create(),
+//            which re-derives the actual B-tree from already-restored row data
+//  (end LBA 6288)
+//
+//  LBA 6304  PERSIST_VECSTORE_HDR_LBA  1 frame — vector_collections[] header
+//  LBA 6312  PERSIST_VECSTORE_ENT_LBA  2 frames — vector_collections[128] (~6 KiB)
+//            direct restore (mirrors PERSIST_ROWSTORE_HDR/ENT_LBA's own shape
+//            exactly) — bulk page data restores lazily, see VECSTORE_LBA_BASE
+//            (vecstore.h)
+//  (end LBA 6328)
+//
+//  LBA 6344  PERSIST_VEC_INDEX_HDR_LBA  1 frame — HNSW index definitions header
+//  LBA 6352  PERSIST_VEC_INDEX_ENT_LBA  1 frame — vec_indexes[16] definitions (~2.4 KiB)
+//            rebuild-on-boot — restored definitions feed vec_index_create()
+//            + a backfill scan over the now-restored vecstore collection
+//  (end LBA 6360)
+//
+//  LBA 6376  PERSIST_ROW_JOURNAL_HDR_LBA     1 frame  — row journal header
+//  LBA 6384  PERSIST_ROW_JOURNAL_ENT_LBA    33 frames — row_journal_buffer[16] (~130 KiB)
+//  LBA 6664  PERSIST_ROW_JOURNAL_ATTACH_LBA  1 frame  — row_journal_attachments[16] (~1.5 KiB)
+//            direct restore — an audit trail is inherently historical, not a
+//            derived structure that can be rebuilt from current row state
+//            (see Phase D's own findings addendum)
+//  (end LBA 6672 — comfortably clear of STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
@@ -60,14 +100,36 @@
 #define PERSIST_ROWSTORE_HDR_LBA 5824ULL
 #define PERSIST_ROWSTORE_ENT_LBA 5832ULL
 
+// ─── Gap Remediation Phase D ────────────────────────────────────────────────
+#define PERSIST_ROW_CONSTRAINT_HDR_LBA 6160ULL
+#define PERSIST_ROW_CONSTRAINT_ENT_LBA 6168ULL
+
+#define PERSIST_ROW_INDEX_HDR_LBA 6272ULL
+#define PERSIST_ROW_INDEX_ENT_LBA 6280ULL
+
+#define PERSIST_VECSTORE_HDR_LBA 6304ULL
+#define PERSIST_VECSTORE_ENT_LBA 6312ULL
+
+#define PERSIST_VEC_INDEX_HDR_LBA 6344ULL
+#define PERSIST_VEC_INDEX_ENT_LBA 6352ULL
+
+#define PERSIST_ROW_JOURNAL_HDR_LBA    6376ULL
+#define PERSIST_ROW_JOURNAL_ENT_LBA    6384ULL
+#define PERSIST_ROW_JOURNAL_ATTACH_LBA 6664ULL
+
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.
-#define PERSIST_MAGIC_CAT       0xCAFE000000000001ULL
-#define PERSIST_MAGIC_REC       0xCAFE000000000002ULL
-#define PERSIST_MAGIC_SCH       0xCAFE000000000003ULL
-#define PERSIST_MAGIC_PROG      0xCAFE000000000004ULL
-#define PERSIST_MAGIC_PART      0xCAFE000000000005ULL
-#define PERSIST_MAGIC_ROWSTORE  0xCAFE000000000006ULL
+#define PERSIST_MAGIC_CAT            0xCAFE000000000001ULL
+#define PERSIST_MAGIC_REC            0xCAFE000000000002ULL
+#define PERSIST_MAGIC_SCH            0xCAFE000000000003ULL
+#define PERSIST_MAGIC_PROG           0xCAFE000000000004ULL
+#define PERSIST_MAGIC_PART           0xCAFE000000000005ULL
+#define PERSIST_MAGIC_ROWSTORE       0xCAFE000000000006ULL
+#define PERSIST_MAGIC_ROW_CONSTRAINT 0xCAFE000000000007ULL
+#define PERSIST_MAGIC_ROW_INDEX      0xCAFE000000000008ULL
+#define PERSIST_MAGIC_VECSTORE       0xCAFE000000000009ULL
+#define PERSIST_MAGIC_VEC_INDEX      0xCAFE00000000000AULL
+#define PERSIST_MAGIC_ROW_JOURNAL    0xCAFE00000000000BULL
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -107,5 +169,48 @@ void persist_partitions(void);
 // that's rowstore.c's own direct nvme_write_sync() per page, a separate
 // mechanism for a separate (large, sparse) kind of data. See rowstore.h.
 void persist_rowstore_headers(void);
+
+// ─── Gap Remediation Phase D ────────────────────────────────────────────────
+// See docs/AeroSLS-Gap-Remediation-Roadmap-v0.1.md's Phase D findings
+// addendum for the full design rationale (direct-persist vs. rebuild-on-
+// boot, per subsystem).
+
+// Snapshot row_constraints[] → NVMe. Call after every successful
+// row_constraint_add_unique/_not_null/_range/_reference(). Pure definitions,
+// no derived runtime state — direct restore, no rebuild step needed.
+void persist_row_constraints(void);
+
+// Snapshot row_indexes[] → NVMe. Call after every successful
+// row_index_create(). NOTE: restored definitions are NOT loaded directly
+// into the live row_indexes[]/B-tree node pool — persist_restore_all()
+// feeds them through the real row_index_create() again, which re-derives
+// the actual B-tree from already-restored row data (rebuild-on-boot; see
+// row_index.h's own "persistence explicitly out of scope" comment, now
+// superseded by Phase D the same way vecstore.h's was).
+void persist_row_index_defs(void);
+
+// Snapshot vector_collections[] → NVMe. Call after every successful
+// vecstore_create_collection() / vecstore_insert() / vecstore_delete().
+// Mirrors persist_rowstore_headers()'s exact shape — bulk page data is NOT
+// written here, see VECSTORE_LBA_BASE (vecstore.h).
+void persist_vecstore_headers(void);
+
+// Snapshot vec_indexes[] → NVMe. Call after every successful
+// vec_index_create(). Same rebuild-on-boot relationship persist_row_index_
+// defs() has with row_index_create() — restored definitions feed
+// vec_index_create() again, then a backfill scan over the now-restored
+// vecstore collection rebuilds the actual HNSW graph (vec_index_create()
+// itself never backfills — see vec_index.h's own point 7 — so
+// persist_restore_all() does the one-time backfill scan itself).
+void persist_vec_index_defs(void);
+
+// Snapshot row_journal_buffer[] + row_journal_attachments[] → NVMe. Call
+// after every row_journal_notify_insert/update/delete() and every
+// row_journal_commit_tx()/_rollback_tx() — an audit trail is inherently
+// historical, not a derived structure that can be rebuilt from current row
+// state, so (unlike row_index/vec_index above) this persists directly,
+// full-array-rewrite-per-mutation, matching persist_records()'s own
+// established trade-off for a small-enough struct array.
+void persist_row_journal(void);
 
 #endif /* PERSIST_H */

@@ -92,6 +92,11 @@ struct BTreeNode {
     struct RowId ids[BTREE_ORDER][BTREE_MAX_DUPES_PER_KEY];
     uint8_t      id_active[BTREE_ORDER][BTREE_MAX_DUPES_PER_KEY];
     uint32_t     id_count[BTREE_ORDER];
+    uint8_t      key_capped[BTREE_ORDER];                  // Phase 25: 1 if this key's duplicate
+                                                             // list ever hit BTREE_MAX_DUPES_PER_KEY
+                                                             // and a later insert for the same key
+                                                             // was silently dropped -- see
+                                                             // row_index_lookup_checked() below
     uint32_t     next_leaf;                                // leaf chain, for range scans; BTREE_INVALID_NODE = none
 };
 
@@ -150,6 +155,27 @@ void row_index_notify_delete(uint64_t table_object_id, struct RowId id,
 // the caller lacks PERM_READ on the underlying table, or there's no match.
 uint32_t row_index_lookup(uint32_t caller_uid, const char* index_name,
                           const char* value, struct RowId* out_ids, uint32_t max_ids);
+
+// Phase 25 (index-assisted SQL planning): identical to row_index_lookup(),
+// plus *out_complete tells the caller whether the result can be TRUSTED as
+// the full, current match set. row_index_lookup() alone can't answer that:
+// its returned count is however many currently-active entries this key's
+// duplicate list holds, and that number looks the same whether the key
+// genuinely has that many matches or whether BTREE_MAX_DUPES_PER_KEY was
+// hit at some point and a later legitimate insert for this exact value was
+// silently dropped (row_index.h's own documented best-effort duplicate-cap
+// behavior) -- churn (inserts then deletes) can even leave the active count
+// LOW while the cap is still permanently exhausted for that key. This
+// function is the one place that distinguishes the two: *out_complete is 0
+// if this key's duplicate list ever hit the cap (a sticky, permanent flag
+// once set -- matching this whole subsystem's "no reclaim in first cut"
+// posture), 1 otherwise. A caller planning to use this index result INSTEAD
+// OF a full table scan (rather than merely as a candidate set it will
+// re-verify row-by-row) must treat *out_complete == 0 as "don't trust this,
+// fall back." out_complete must be non-NULL.
+uint32_t row_index_lookup_checked(uint32_t caller_uid, const char* index_name,
+                                  const char* value, struct RowId* out_ids, uint32_t max_ids,
+                                  uint8_t* out_complete);
 
 // Phase 19 (relational layer): planner support. Finds the first active
 // index defined on (table_object_id, column_index) -- "first applicable

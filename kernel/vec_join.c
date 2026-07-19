@@ -154,3 +154,24 @@ uint32_t vec_join_resolve(uint32_t caller_uid, const char* table_name,
 
     return total_delivered;
 }
+
+// ─── Gap Remediation Phase C: live reachability adapter ────────────────────
+static void vjs_collect_cb(const struct VecMatch* match, const struct RowValues* row, void* ctxp) {
+    struct SLSVecJoinRequest* req = (struct SLSVecJoinRequest*)ctxp;
+    if (req->result_count < VEC_JOIN_MAX_RESULTS) {
+        req->results[req->result_count].match = *match;
+        req->results[req->result_count].row = *row;
+    }
+    req->result_count++;   // count past the cap too -- how truncation is detected
+}
+
+uint64_t sys_sls_vec_join(struct SLSVecJoinRequest* req) {
+    if (!req) return 1;
+    req->result_count = 0;
+    uint32_t k = req->match_count;
+    if (k > VEC_SEARCH_MAX_K) k = VEC_SEARCH_MAX_K;
+    vec_join_resolve(req->caller_uid, req->table_name, req->id_column,
+                     req->matches, k, vjs_collect_cb, req);
+    req->truncated = (req->result_count > VEC_JOIN_MAX_RESULTS) ? 1 : 0;
+    return 0;
+}

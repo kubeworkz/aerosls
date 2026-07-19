@@ -13,9 +13,15 @@
  * doesn't need to reason about tie-breaking behavior at all.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers \
- *       -o /tmp/vecstore_search_host_test vecstore_search_host_test.c kernel/vecstore.c
+ *   gcc -Wall -Wextra -std=c11 -I kernel -I drivers -I net \
+ *       -o /tmp/vecstore_search_host_test vecstore_search_host_test.c \
+ *       kernel/vecstore.c kernel/vec_index.c
  *   /tmp/vecstore_search_host_test
+ *
+ * Gap Remediation Phase D note: this link line was missing kernel/vec_
+ * index.c -- the same pre-existing Phase 6 gap already found and fixed in
+ * vecstore_host_test.c during this same regression sweep (see that file's
+ * own note for the full explanation).
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
@@ -47,6 +53,34 @@ void* allocate_physical_ram_frame(void) { return malloc(4096); }
 int ollama_embed(const struct OllamaEmbedRequest* req, struct OllamaEmbedResponse* resp) {
     (void)req; (void)resp;
     return -1;
+}
+
+/* ─── Gap Remediation Phase D stubs -- matching vecstore_host_test.c's own
+ * identical set exactly (see that file's top comment for the rationale). ── */
+void persist_vecstore_headers(void) { }
+void persist_vec_index_defs(void) { }
+
+#define FAKE_NVME_MAX_FRAMES 128
+static struct { uint64_t lba; uint8_t data[4096]; int used; } g_fake_nvme[FAKE_NVME_MAX_FRAMES];
+void* io_sq = (void*)1;
+void* io_cq = (void*)1;
+static int find_or_alloc_frame(uint64_t lba) {
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+        if (g_fake_nvme[i].used && g_fake_nvme[i].lba == lba) return i;
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+        if (!g_fake_nvme[i].used) { g_fake_nvme[i].used = 1; g_fake_nvme[i].lba = lba; return i; }
+    return -1;
+}
+int nvme_write_sync(uint64_t lba, const void* buf) {
+    int idx = find_or_alloc_frame(lba);
+    if (idx < 0) return 1;
+    memcpy(g_fake_nvme[idx].data, buf, 4096);
+    return 0;
+}
+int nvme_read_sync(uint64_t lba, void* buf) {
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+        if (g_fake_nvme[i].used && g_fake_nvme[i].lba == lba) { memcpy(buf, g_fake_nvme[i].data, 4096); return 0; }
+    return 1;
 }
 
 static int g_fail = 0;

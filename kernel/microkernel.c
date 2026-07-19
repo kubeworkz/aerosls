@@ -285,7 +285,11 @@ void microkernel_service_poll(void) {
 
 // ─── sys_sls_svc_list ─────────────────────────────────────────────────────────
 void sys_sls_svc_list(void) {
-    kernel_serial_print(
+    // Gap Remediation Phase C fix: same kernel_serial_print()-called-with-
+    // extra-arguments bug found and fixed in object_catalog.c's
+    // sys_sls_obj_list() and tier_mgr.c's sys_sls_tier_list() -- see
+    // object_catalog.c's own comment on this pattern.
+    kernel_serial_printf(
         "\n[MK] Microkernel Service Map\n"
         " %-22s  PID   PORT    ADDR                 STATE     REBOOTS  "
         "LATENCY    MSGS\n"

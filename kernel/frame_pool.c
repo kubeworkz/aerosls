@@ -71,6 +71,36 @@ void *allocate_physical_ram_frame_for_partition(uint32_t partition_id)
     return frame;
 }
 
+// Gap Remediation Phase F: shared validation + bitmap-clear for both free
+// entry points below. Returns 1 (failure, bitmap untouched) if addr isn't a
+// currently-allocated, in-range, page-aligned, non-zero frame address --
+// see frame_pool.h's own comment on free_physical_ram_frame() for the full
+// rationale. Returns 0 and clears the bit on success.
+static int free_raw_frame(void* addr) {
+    uint64_t a = (uint64_t)(uintptr_t)addr;
+    if (a == 0 || (a % FRAME_SIZE) != 0) return 1;          // NULL or misaligned
+    uint64_t frame_index = a / FRAME_SIZE;
+    if (frame_index == 0 || frame_index >= TOTAL_FRAMES) return 1;  // out of range
+    size_t word = frame_index / 64;
+    int    bit  = (int)(frame_index % 64);
+    if (!(physical_memory_bitmap[word] & (1ULL << bit))) return 1;  // not allocated -- double free or bogus
+    physical_memory_bitmap[word] &= ~(1ULL << bit);
+    return 0;
+}
+
+int free_physical_ram_frame(void* frame) {
+    if (free_raw_frame(frame)) return 1;
+    if (partition_frame_usage[PARTITION_SYSTEM] > 0) partition_frame_usage[PARTITION_SYSTEM]--;
+    return 0;
+}
+
+int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id) {
+    if (partition_id >= PARTITION_MAX) return 1;   // out of range -> fail closed, bitmap untouched
+    if (free_raw_frame(frame)) return 1;
+    if (partition_frame_usage[partition_id] > 0) partition_frame_usage[partition_id]--;
+    return 0;
+}
+
 int partition_set_frame_quota(uint32_t partition_id, uint64_t frame_quota)
 {
     if (partition_id >= PARTITION_MAX) return 1;

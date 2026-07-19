@@ -106,4 +106,51 @@ uint32_t vec_join_resolve(uint32_t caller_uid, const char* table_name,
                           const char* id_column, const struct VecMatch* matches,
                           uint32_t match_count, VecJoinRowCb cb, void* ctx);
 
+// ─── Gap Remediation Phase C: live reachability ────────────────────────────
+// vec_join_resolve() had no syscall/shell/HTTP surface at all before this --
+// Phase 5's own scope note called that a deliberate cut ("no reachability
+// blocker forcing a live surface"), which held until a frontend actually
+// needed to demonstrate the join-back capability. caller_uid travels inside
+// the request struct, matching SYS_SLS_SQL_EXECUTE/SYS_SLS_VEC_*'s own
+// established convention.
+//
+// This syscall takes matches[] directly (typically copied straight from a
+// prior SLSVecSearchRequest.matches[]) rather than re-running a search
+// itself -- it is the join primitive alone, matching vec_join_resolve()'s
+// own real contract (a caller who already has matches from elsewhere, e.g.
+// a separate /api/vec/search call, can join them without paying for a
+// second search).
+#define SYS_SLS_VEC_JOIN 226
+
+// Same cap as VEC_SEARCH_MAX_K (vecstore.h) -- a join is only ever run
+// against a search's own result set in practice, so there is no reason for
+// this cap to differ from the one bounding how many matches can exist to
+// join in the first place.
+#define VEC_JOIN_MAX_RESULTS VEC_SEARCH_MAX_K
+
+struct VecJoinResultRow {
+    struct VecMatch  match;   // the original search result that produced this row
+    struct RowValues row;     // the resolved relational row's full column data
+};
+
+struct SLSVecJoinRequest {
+    uint32_t          caller_uid;
+    char               table_name[OBJECT_NAME_LEN];
+    char               id_column[RECORD_KEY_LEN];
+    struct VecMatch     matches[VEC_SEARCH_MAX_K];   // caller-supplied, e.g. copied from a
+                                                        // prior SLSVecSearchRequest.matches[]
+    uint32_t            match_count;                   // capped to VEC_SEARCH_MAX_K internally
+    struct VecJoinResultRow results[VEC_JOIN_MAX_RESULTS];   // filled in by the call
+    uint32_t            result_count;                  // TRUE delivered count -- may exceed
+                                                          // VEC_JOIN_MAX_RESULTS; compare against
+                                                          // it (or check `truncated`) to detect
+    uint8_t             truncated;                      // 1 if result_count > VEC_JOIN_MAX_RESULTS
+};
+
+// Always returns 0 -- vec_join_resolve() itself has no failure mode beyond
+// "0 (or fewer) results delivered," matching its own "0 is a valid outcome,
+// not an error" contract (see vec_join.h's own header comment); req->
+// result_count/truncated are always filled in.
+uint64_t sys_sls_vec_join(struct SLSVecJoinRequest* req);
+
 #endif /* VEC_JOIN_H */

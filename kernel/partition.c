@@ -142,9 +142,16 @@ int partition_destroy(uint32_t partition_id) {
     // (object_catalog.c, mirrors sys_sls_vfree()'s own per-entry actions).
     uint32_t freed_objects = catalog_vfree_partition(partition_id);
 
-    // Step 3: reset frame-usage accounting. ACCOUNTING ONLY -- see
-    // frame_pool.h's comment on partition_reset_frame_usage() for why the
-    // underlying physical frames are not actually reclaimed by this call.
+    // Step 3: reset frame-usage accounting. ACCOUNTING ONLY -- the underlying
+    // physical frames are not actually reclaimed by this call. Gap
+    // Remediation Phase F added a real free_physical_ram_frame_for_partition()
+    // primitive (frame_pool.h) but does NOT call it here: this partition's
+    // held frames aren't tracked as individual addresses anywhere (only an
+    // aggregate count), so there's no list of frames to pass it. See
+    // frame_pool.h's own comment on free_physical_ram_frame() for the full
+    // explanation, including why a naive page-table walk to recover that
+    // list would itself be unsafe with this kernel's current
+    // user_clone_page_table() design.
     partition_reset_frame_usage(partition_id);
 
     // Step 4: clear every uid assignment pointing at this partition. Those

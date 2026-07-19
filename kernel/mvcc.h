@@ -252,6 +252,89 @@ uint32_t mvcc_table_scan(uint64_t txn_id, uint32_t caller_uid, const char* table
 // a real error rather than a silently-empty result) should check this first.
 int mvcc_txn_is_active(uint64_t txn_id);
 
+// ─── Phase 25: the missing piece named in sql_exec.h's own "index-assisted
+// planning doesn't survive this phase" scope note ────────────────────────
+// A Phase 17 B-tree index (row_index.h) only ever stores PHYSICAL RowIds.
+// Under MVCC, a column value's physical row changes on every UPDATE (a new
+// physical row is inserted for the new version; row_index_notify_insert()
+// fires unconditionally, so the index accumulates one entry per version
+// that column value ever had, with no notion of which one is visible to a
+// given transaction's snapshot). mvcc_resolve_physical() is what a planner
+// needs to turn a raw index hit back into a real answer: given a physical
+// RowId (e.g. from row_index_lookup()/row_index_range_scan()), it reports
+// whether THIS EXACT version is the one visible under txn_id's snapshot,
+// and if so, its logical id and current values -- the same visibility rule
+// mvcc_table_scan() applies per-row, just entered from a physical id
+// instead of a table-wide scan.
+//
+// This is backed by an O(1)-average physical-id -> version lookup (a small
+// fixed open-addressed hash table, sized 2x MVCC_MAX_VERSIONS -- see
+// mvcc.c), not a linear scan of mvcc_versions[] -- resolving one candidate
+// this way costs O(1), not O(total versions ever created), which is the
+// whole point of using an index for candidate generation in the first
+// place. Every physical row created by mvcc_row_insert()/mvcc_row_update()
+// is indexed into this table at creation time; entries for rolled-back or
+// superseded versions are never removed (matching this whole roadmap's "no
+// reclaim in first cut" posture elsewhere) -- mv_visible() is still what
+// decides visibility, the hash table only accelerates finding the version
+// struct to check.
+//
+// Returns MVCC_OK and fills *out_id (if non-NULL) and *out_values (if
+// non-NULL, via a real rowstore_row_get() call gated on caller_uid exactly
+// like mvcc_table_scan()'s own per-row fetch) when physical_id's version IS
+// the one visible to txn_id. Returns MVCC_ERR_ROW_NOT_VISIBLE if physical_id
+// was never indexed, belongs to a stale/superseded/not-yet-committed
+// version, or the values fetch failed. Returns MVCC_ERR_TABLE_NOT_FOUND /
+// MVCC_ERR_TXN_NOT_ACTIVE for the obvious reasons. Does not itself gate
+// PERM_READ on table_name beyond what the out_values fetch already does --
+// callers are expected to have gated once, up front, the same "one
+// permission check per statement, not per candidate row" shape sql_exec.c
+// already uses for the full-scan path.
+MvccError mvcc_resolve_physical(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
+                                struct RowId physical_id,
+                                struct MvccRowId* out_id, struct RowValues* out_values);
+
+// ─── Gap Remediation Phase D: MVCC bootstrap on restore ───────────────────
+// A real, previously-undocumented gap this phase found while verifying its
+// own persistence work, not something Phase D set out to build: mvcc.h's
+// own header comment (above) always named persistence "out of scope,
+// nothing forces it yet" — true when written, but Phase 22 (RDBMS roadmap)
+// later wired sql_exec.c's entire live query path through mvcc_table_scan()
+// (not rowstore_table_scan() directly), and Phase D now gives rowstore.c's
+// own row data real NVMe persistence. Combined, those two facts mean: after
+// a restart, restored row bytes and a restored, rebuilt B-tree index (see
+// row_index_create(), which scans via rowstore_table_scan() and so never
+// had this problem) are both genuinely present and correct, but
+// mvcc_table_scan() -- and therefore the entire SQL engine wired through it
+// since Phase 22 -- would see ZERO rows for every table, because
+// mvcc_versions[]/mvcc_phys_index[] are pure RAM caches with no version
+// registered for any pre-restart row. A restored UNIQUE/REFERENCE
+// constraint (row_constraint.c, also Phase D) would be silently unable to
+// ever detect a real violation for the same reason, since its own runtime
+// checks run through mvcc_table_scan() too. "Persistence with a hole that
+// makes the query engine see an empty database" is strictly worse than not
+// persisting at all -- exactly the "denial looks like absence" failure
+// class this project has repeatedly named and closed (Phase 19, 22, 23,
+// 25) -- so Phase D closes this one too rather than shipping persistence
+// work that doesn't actually make restarted data queryable.
+//
+// Bootstraps one synthetic MvccVersion per already-restored physical row,
+// for every row-set table currently active in object_catalog[] -- with
+// xmin=0/xmin_committed=1 ("committed since before time began," a
+// deliberately reserved sequence number no real mvcc_commit() ever hands
+// out, since mvcc_init() starts mvcc_commit_seq at 1) and xmax=0/
+// xmax_committed=0/xmax_txn=0 (never superseded) -- visible to every
+// snapshot from the very first post-restart transaction onward, exactly
+// like a row that has simply always existed, which from the restarted
+// kernel's point of view it has. Called exactly once by persist_restore_
+// all(), immediately after rowstore's own restore block (row data and
+// table_headers[] must already be back) and before any real transaction
+// can run. NOT idempotent -- calling this twice would create duplicate
+// versions of the same physical rows; persist_restore_all() is the only
+// correct call site, matching this whole roadmap's "one real choke point"
+// posture for every other rebuild-on-boot step Phase D added.
+void mvcc_bootstrap_from_rowstore(void);
+
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 // Zeroes the transaction table and version pool, resets both monotonic
 // counters (next txn_id, next logical_id) and the global commit-sequence

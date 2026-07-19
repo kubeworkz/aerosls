@@ -24,6 +24,22 @@
 #define SLS_SYS_IPC_BIND        166   /* bind process to a user IPC port      */
 #define SLS_SYS_IPC_SEND        167   /* send message to any port             */
 #define SLS_SYS_IPC_RECV        168   /* non-blocking recv from user port     */
+#define SLS_SYS_TIMI_INFO       173   /* structured TIMI object introspection */
+/* Gap Remediation Phase G: TIMI/partition syscalls below were reachable from
+ * the shell (direct C call into the kernel, same address space) but had no
+ * binding here for a real Ring-3 program built against this header and
+ * trapping in via `syscall` — see this file's own top comment on the ABI
+ * difference. Numbers below match kernel/partition.h and kernel/
+ * frame_pool.h exactly; kept in sync by hand since this header has no
+ * generation step (same posture as every other syscall number above). */
+#define SLS_SYS_PARTITION_CREATE     210  /* define a new partition          */
+#define SLS_SYS_PARTITION_ASSIGN     211  /* assign a uid to a partition     */
+#define SLS_SYS_PARTITION_LIST       212  /* console dump, no struct back    */
+#define SLS_SYS_PARTITION_QUOTA_SET  213  /* set a partition's frame quota   */
+#define SLS_SYS_PARTITION_DESTROY    214  /* tear down a partition           */
+#define SLS_SYS_PARTITION_PAUSE      215  /* stop scheduling a partition     */
+#define SLS_SYS_PARTITION_RESUME     216  /* resume scheduling a partition   */
+#define SLS_SYS_PARTITION_QUOTA_LIST 217  /* console dump, no struct back    */
 
 /* ── IPC port ranges ────────────────────────────────────────────────────── */
 /* Kernel service ports (0x1001-0x1006) — send-only from Ring-3             */
@@ -61,6 +77,69 @@ struct sls_record_req {
     char name[SLS_NAME_LEN];   /* object name  */
     char key [SLS_KEY_LEN ];   /* field key    */
     char val [SLS_VAL_LEN ];   /* field value  */
+};
+
+/* ── TIMI introspection (Gap Remediation Phase G) ────────────────────────── */
+/* Layout MUST be identical to kernel/loader.h's TimiEntryRec/TimiNameRec/
+ * TimiActivationStatus/TimiInfoResult/SLSTimiInfoRequest. TIMI_ENTRY_NAME_LEN
+ * (32) and the TIMI_INFO_MAX_ENTRIES/NAMES cap (16) are inlined as literals
+ * here rather than re-#defined, to avoid a second set of names for the same
+ * constants in a header with no shared-generation step against the kernel. */
+#define SLS_TIMI_INFO_STATUS_OK        0
+#define SLS_TIMI_INFO_STATUS_NOT_FOUND 1
+#define SLS_TIMI_INFO_STATUS_NOT_TIMI  2
+#define SLS_TIMI_INFO_STATUS_CORRUPT   3
+
+struct sls_timi_entry_rec {
+    char     name[32];
+    uint32_t offset;
+} __attribute__((packed));
+
+struct sls_timi_name_rec {
+    char name[32];
+} __attribute__((packed));
+
+struct sls_timi_activation_status {
+    uint8_t  cached;
+    uint32_t code_pages;
+    uint32_t entry_offset;
+    uint32_t content_hash;
+};
+
+struct sls_timi_info_result {
+    uint32_t status;
+    char     format_name[16];
+    uint32_t num_instr, num_literals, num_entries, num_names;
+    struct sls_timi_entry_rec entries[16];
+    uint32_t entries_returned;
+    uint8_t  entries_truncated;
+    struct sls_timi_name_rec  names[16];
+    uint32_t names_returned;
+    uint8_t  names_truncated;
+    struct sls_timi_activation_status activation;
+};
+
+struct sls_timi_info_req {
+    char object_name[SLS_NAME_LEN];   /* [in]  must fit PROC_NAME_LEN (64) */
+    struct sls_timi_info_result result; /* [out] */
+};
+
+/* ── Partitions / LPAR (Gap Remediation Phase G) ─────────────────────────── */
+/* Layout MUST be identical to kernel/partition.h / kernel/frame_pool.h. */
+#define SLS_PARTITION_INVALID_ID 0xFFFFFFFFu  /* sentinel returned by create on failure */
+
+struct sls_partition_create_req {
+    char name[32];   /* PARTITION_NAME_LEN */
+};
+
+struct sls_partition_assign_req {
+    uint32_t uid;
+    uint32_t partition_id;
+};
+
+struct sls_partition_quota_set_req {
+    uint32_t partition_id;
+    uint64_t frame_quota;
 };
 
 /* ── Minimal freestanding string utilities ──────────────────────────────── */
@@ -249,4 +328,83 @@ static inline int sls_ipc_recv(uint16_t port, struct sls_ipc_msg *out) {
         for (size_t i = 0; i < sizeof(*out); i++) dst[i] = src[i];
     }
     return rc;
+}
+
+/* ── TIMI introspection (Gap Remediation Phase G) ────────────────────────── */
+
+/* Query a TIMI object's header, entries, exported names, and activation-
+ * cache status. Fills *out (always -- same "no partial result" contract as
+ * the kernel's own loader_timi_info_query()) and returns 0 if
+ * out->status == SLS_TIMI_INFO_STATUS_OK, 1 otherwise (the full detail is
+ * always in out->status regardless of the return value). */
+static inline int sls_timi_info(const char *object_name,
+                                 struct sls_timi_info_result *out) {
+    struct sls_timi_info_req req;
+    sls_memset(&req, 0, sizeof(req));
+    sls_strncpy(req.object_name, object_name, SLS_NAME_LEN - 1);
+    int rc = (int)_sls_syscall(SLS_SYS_TIMI_INFO, &req);
+    if (out) *out = req.result;
+    return rc;
+}
+
+/* ── Partitions / LPAR (Gap Remediation Phase G) ─────────────────────────── */
+
+/* Define a new partition. Returns its id, or SLS_PARTITION_INVALID_ID if
+ * the partition table is full (mirrors kernel/partition.h's own sentinel;
+ * see this file's own top comment on why it isn't a named kernel-side
+ * constant either). */
+static inline uint64_t sls_partition_create(const char *name) {
+    struct sls_partition_create_req req;
+    sls_memset(&req, 0, sizeof(req));
+    sls_strncpy(req.name, name, sizeof(req.name) - 1);
+    return _sls_syscall(SLS_SYS_PARTITION_CREATE, &req);
+}
+
+/* Assign a uid to a partition. Returns 0 on success. */
+static inline int sls_partition_assign(uint32_t uid, uint32_t partition_id) {
+    struct sls_partition_assign_req req;
+    req.uid          = uid;
+    req.partition_id = partition_id;
+    return (int)_sls_syscall(SLS_SYS_PARTITION_ASSIGN, &req);
+}
+
+/* Tear down a partition (kills its processes, vfrees its objects).
+ * Returns 0 on success. */
+static inline int sls_partition_destroy(uint32_t partition_id) {
+    return (int)_sls_syscall(SLS_SYS_PARTITION_DESTROY,
+                              (void *)(uintptr_t)partition_id);
+}
+
+/* Stop scheduling a partition. Returns 0 on success. */
+static inline int sls_partition_pause(uint32_t partition_id) {
+    return (int)_sls_syscall(SLS_SYS_PARTITION_PAUSE,
+                              (void *)(uintptr_t)partition_id);
+}
+
+/* Resume scheduling a partition. Returns 0 on success. */
+static inline int sls_partition_resume(uint32_t partition_id) {
+    return (int)_sls_syscall(SLS_SYS_PARTITION_RESUME,
+                              (void *)(uintptr_t)partition_id);
+}
+
+/* Set a partition's frame quota (0 = unlimited). Returns 0 on success. */
+static inline int sls_partition_quota_set(uint32_t partition_id,
+                                           uint64_t frame_quota) {
+    struct sls_partition_quota_set_req req;
+    req.partition_id = partition_id;
+    req.frame_quota  = frame_quota;
+    return (int)_sls_syscall(SLS_SYS_PARTITION_QUOTA_SET, &req);
+}
+
+/* List all defined partitions / per-partition usage+quota. Neither syscall
+ * returns structured data to the caller (console-dump only, same as
+ * SYS_SLS_PROC_LIST/SYS_SLS_OBJ_LIST) -- see loader.h's own comment on why
+ * only loader_timi_info() got the structured-data treatment in Phase G,
+ * not this pair. Kept here anyway so a native program can at least trigger
+ * the dump without hand-rolling the trap. */
+static inline void sls_partition_list(void) {
+    _sls_syscall(SLS_SYS_PARTITION_LIST, 0);
+}
+static inline void sls_partition_quota_list(void) {
+    _sls_syscall(SLS_SYS_PARTITION_QUOTA_LIST, 0);
 }

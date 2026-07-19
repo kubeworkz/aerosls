@@ -270,7 +270,16 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) {
 
 // ─── Phase 1: ls objects ──────────────────────────────────────────────────────
 void sys_sls_obj_list(void) {
-    kernel_serial_print(
+    // Gap Remediation Phase C fix: this was calling kernel_serial_print()
+    // (kernel_io.h: `void kernel_serial_print(const char* s)` -- exactly
+    // ONE argument, no format processing) with a format string plus 5
+    // extra string arguments. Never caught because this file doesn't
+    // include kernel_io.h itself (no prototype in scope to conflict with),
+    // and this whole project has never been compiled end to end with the
+    // real cross-compiler (docs/AeroSLS-Gap-Analysis-v0.1.md §1) --
+    // discovered while writing an analogous sys_sls_vec_list() and nearly
+    // copying the same bug. kernel_serial_printf() is the variadic one.
+    kernel_serial_printf(
         "\n[CATALOG] Object Directory\n"
         " %-20s %-18s %-10s %-8s %s\n"
         " %-20s %-18s %-10s %-8s %s\n",

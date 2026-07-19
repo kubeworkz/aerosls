@@ -336,13 +336,22 @@ void loader_list(void) {
     kernel_serial_print("\n");
 }
 
-// ─── loader_timi_info ───────────────────────────────────────────────────────
-// Diagnostic dump for a TIMI object: header counts and exported entry-point
-// names. Deliberately mirrors loader_list()'s table style. This is the
-// Phase 2 stand-in for a real disassembler/debugger — the host toolchain's
-// timi-dis is still the tool of record for a full instruction listing; this
-// just confirms the kernel-side upload parsed the same object correctly.
-void loader_timi_info(const char* object_name) {
+// ─── loader_timi_info_query ─────────────────────────────────────────────────
+// Gap Remediation Phase G: the real logic, extracted from loader_timi_info()
+// (console version, below) so both the structured (syscall/HTTP) and
+// console callers share one source of truth instead of two independent
+// parses that could drift. Always fills *out (see loader.h's own comment on
+// the "no partial/garbage result" contract).
+int loader_timi_info_query(const char* object_name, struct TimiInfoResult* out) {
+    if (!out) return 0;
+    out->status = TIMI_INFO_STATUS_NOT_FOUND;
+    out->format_name[0] = '\0';
+    out->num_instr = out->num_literals = out->num_entries = out->num_names = 0;
+    out->entries_returned = 0; out->entries_truncated = 0;
+    out->names_returned   = 0; out->names_truncated   = 0;
+    out->activation.cached = 0; out->activation.code_pages = 0;
+    out->activation.entry_offset = 0; out->activation.content_hash = 0;
+
     struct ServiceBinary* sb = 0;
     for (int i = 0; i < MAX_SERVICE_BINARIES; i++) {
         if (service_binaries[i].active &&
@@ -351,23 +360,74 @@ void loader_timi_info(const char* object_name) {
             break;
         }
     }
-    if (!sb) {
-        kernel_serial_printf("[LOADER] timi-info: '%s' not found.\n", object_name);
-        return;
-    }
+    if (!sb) return 0;   // status already NOT_FOUND
+
     if (!sb->is_timi) {
-        kernel_serial_printf(
-            "[LOADER] timi-info: '%s' is not a TIMI object (format=%s).\n",
-            object_name, binary_format_name(sb));
-        return;
+        out->status = TIMI_INFO_STATUS_NOT_TIMI;
+        const char* fmt = binary_format_name(sb);
+        int k = 0; while (fmt[k] && k < (int)sizeof(out->format_name) - 1) { out->format_name[k] = fmt[k]; k++; }
+        out->format_name[k] = '\0';
+        return 0;
     }
 
     struct TimiObjectHeader hdr;
     if (!timi_validate(sb->data, sb->size, &hdr)) {
+        out->status = TIMI_INFO_STATUS_CORRUPT;
+        return 0;
+    }
+
+    out->status       = TIMI_INFO_STATUS_OK;
+    out->num_instr    = hdr.num_instr;
+    out->num_literals = hdr.num_literals;
+    out->num_entries  = hdr.num_entries;
+    out->num_names    = hdr.num_names;
+
+    const struct TimiEntryRec* entries = (const struct TimiEntryRec*)
+        (sb->data + sizeof(struct TimiObjectHeader) +
+         (uint64_t)hdr.num_instr * 8 + (uint64_t)hdr.num_literals * 8);
+    uint32_t ecap = hdr.num_entries < TIMI_INFO_MAX_ENTRIES ? hdr.num_entries : TIMI_INFO_MAX_ENTRIES;
+    for (uint32_t i = 0; i < ecap; i++) out->entries[i] = entries[i];
+    out->entries_returned  = ecap;
+    out->entries_truncated = hdr.num_entries > TIMI_INFO_MAX_ENTRIES;
+
+    const struct TimiNameRec* names = (const struct TimiNameRec*)
+        ((const uint8_t*)entries + (uint64_t)hdr.num_entries * sizeof(struct TimiEntryRec));
+    uint32_t ncap = hdr.num_names < TIMI_INFO_MAX_NAMES ? hdr.num_names : TIMI_INFO_MAX_NAMES;
+    for (uint32_t i = 0; i < ncap; i++) out->names[i] = names[i];
+    out->names_returned  = ncap;
+    out->names_truncated = hdr.num_names > TIMI_INFO_MAX_NAMES;
+
+    timi_activation_query(object_name, &out->activation);
+    return 1;
+}
+
+// ─── loader_timi_info ───────────────────────────────────────────────────────
+// Diagnostic dump for a TIMI object: header counts and exported entry-point
+// names. Deliberately mirrors loader_list()'s table style. This is the
+// Phase 2 stand-in for a real disassembler/debugger — the host toolchain's
+// timi-dis is still the tool of record for a full instruction listing; this
+// just confirms the kernel-side upload parsed the same object correctly.
+// Gap Remediation Phase G: now a thin wrapper over loader_timi_info_query()
+// above -- prints the exact same data the structured path returns, instead
+// of an independent parse.
+void loader_timi_info(const char* object_name) {
+    struct TimiInfoResult r;
+    loader_timi_info_query(object_name, &r);
+
+    if (r.status == TIMI_INFO_STATUS_NOT_FOUND) {
+        kernel_serial_printf("[LOADER] timi-info: '%s' not found.\n", object_name);
+        return;
+    }
+    if (r.status == TIMI_INFO_STATUS_NOT_TIMI) {
+        kernel_serial_printf(
+            "[LOADER] timi-info: '%s' is not a TIMI object (format=%s).\n",
+            object_name, r.format_name);
+        return;
+    }
+    if (r.status == TIMI_INFO_STATUS_CORRUPT) {
         kernel_serial_printf(
             "[LOADER] timi-info: '%s' has TIMI magic but failed header "
-            "validation (corrupt or truncated upload, %u bytes stored).\n",
-            object_name, sb->size);
+            "validation (corrupt or truncated upload).\n", object_name);
         return;
     }
 
@@ -377,24 +437,40 @@ void loader_timi_info(const char* object_name) {
         "  literals     : %u\n"
         "  entry points : %u\n"
         "  names (v0.3) : %u\n",
-        object_name, hdr.num_instr, hdr.num_literals, hdr.num_entries, hdr.num_names);
+        object_name, r.num_instr, r.num_literals, r.num_entries, r.num_names);
 
-    const struct TimiEntryRec* entries = (const struct TimiEntryRec*)
-        (sb->data + sizeof(struct TimiObjectHeader) +
-         (uint64_t)hdr.num_instr * 8 + (uint64_t)hdr.num_literals * 8);
-    for (uint32_t i = 0; i < hdr.num_entries; i++) {
+    for (uint32_t i = 0; i < r.entries_returned; i++) {
         kernel_serial_printf("    .entry %-24s -> @%u\n",
-                             entries[i].name, entries[i].offset);
+                             r.entries[i].name, r.entries[i].offset);
     }
-    const struct TimiNameRec* names = (const struct TimiNameRec*)
-        ((const uint8_t*)entries + (uint64_t)hdr.num_entries * sizeof(struct TimiEntryRec));
-    for (uint32_t i = 0; i < hdr.num_names; i++) {
-        kernel_serial_printf("    .name  [%u] = \"%s\"\n", i, names[i].name);
+    if (r.entries_truncated) kernel_serial_printf("    ... (%u more entries, truncated)\n", r.num_entries - r.entries_returned);
+    for (uint32_t i = 0; i < r.names_returned; i++) {
+        kernel_serial_printf("    .name  [%u] = \"%s\"\n", i, r.names[i].name);
     }
-    timi_activation_info(object_name);
+    if (r.names_truncated) kernel_serial_printf("    ... (%u more names, truncated)\n", r.num_names - r.names_returned);
+
+    if (r.activation.cached) {
+        kernel_serial_printf(
+            "  activation   : cached — %u page(s) native code, entry @+0x%x, "
+            "content hash 0x%08x\n",
+            r.activation.code_pages, r.activation.entry_offset, r.activation.content_hash);
+    } else {
+        kernel_serial_print(
+            "  activation   : not yet translated (next spawn will translate + cache)\n");
+    }
     kernel_serial_print(
         "  (spawnable via POST /api/program/spawn — Phase 3 native translator; "
         "v1 only translates the \".entry main\" entry point)\n\n");
+}
+
+// ─── sys_sls_timi_info ───────────────────────────────────────────────────────
+// Gap Remediation Phase G: struct-based syscall wrapper, replacing the old
+// raw-const-char*-in/no-output-at-all shape (see loader.h's own comment on
+// SYS_SLS_TIMI_INFO for why this was safe to change outright).
+uint64_t sys_sls_timi_info(struct SLSTimiInfoRequest* req) {
+    if (!req) return 1;
+    loader_timi_info_query(req->object_name, &req->result);
+    return req->result.status == TIMI_INFO_STATUS_OK ? 0 : 1;
 }
 
 // ─── sys_sls_load ─────────────────────────────────────────────────────────────

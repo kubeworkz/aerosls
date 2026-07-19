@@ -4,6 +4,8 @@
  */
 #include "vec_index.h"
 #include "object_catalog.h"
+#include "kernel_io.h"   // Gap Remediation Phase C -- sys_sls_vec_index_list()
+#include "persist.h"     // Gap Remediation Phase D -- persist_vec_index_defs()
 #include "../user/permissions.h"
 #include <stddef.h>
 
@@ -344,6 +346,8 @@ int vec_index_create(uint32_t caller_uid, const char* index_name,
     idx->node_count = 0;
     idx->active_count = 0;
     idx->active = 1;
+
+    persist_vec_index_defs();   // Gap Remediation Phase D
     return 0;
 }
 
@@ -406,4 +410,57 @@ uint32_t vec_index_search(uint32_t caller_uid, const char* index_name,
         found++;
     }
     return found;
+}
+
+// ─── Gap Remediation Phase C: live reachability adapters ───────────────────
+// Thin adapters, matching sys_sls_vec_create()/sys_sls_vec_search()'s own
+// shape exactly (kernel/vecstore.c) -- see vec_index.h's own comment.
+uint64_t sys_sls_vec_index_create(struct SLSVecIndexCreateRequest* req) {
+    if (!req) return 1;
+    req->status = vec_index_create(req->caller_uid, req->index_name,
+                                   req->collection_name, req->metric);
+    return (uint64_t)req->status;
+}
+
+uint64_t sys_sls_vec_index_search(struct SLSVecIndexSearchRequest* req) {
+    if (!req) return 1;
+
+    uint32_t k = req->k;
+    req->truncated = (k > VEC_SEARCH_MAX_K) ? 1 : 0;
+    if (k > VEC_SEARCH_MAX_K) k = VEC_SEARCH_MAX_K;
+
+    // Same documented 0-is-ambiguous contract vec_index_search()/
+    // vecstore_search() already have, deliberately preserved rather than
+    // "fixed" at the syscall boundary -- see sys_sls_vec_search()'s own
+    // adapter (vecstore.c) for the identical, already-established posture.
+    req->match_count = vec_index_search(req->caller_uid, req->index_name,
+                                        &req->query, k, req->ef, req->matches);
+    return 0;
+}
+
+// ─── Gap Remediation Phase C: index enumeration ─────────────────────────────
+// Mirrors sys_sls_vec_list()'s own shape exactly (vecstore.c) -- see
+// vec_index.h's own comment on this syscall. Uses kernel_serial_printf()
+// (the variadic one), not kernel_serial_print() -- see the header comment
+// object_catalog.c's sys_sls_obj_list() fix carries for why that
+// distinction matters.
+void sys_sls_vec_index_list(void) {
+    kernel_serial_printf(
+        "\n[VEC_INDEX] Index Directory\n"
+        " %-24s %-24s %-8s %-8s %s\n"
+        " %-24s %-24s %-8s %-8s %s\n",
+        "Name", "Collection", "Metric", "Active", "Nodes",
+        "------------------------", "------------------------", "--------", "--------", "-----");
+
+    uint32_t shown = 0;
+    for (uint32_t i = 0; i < VEC_INDEX_MAX; i++) {
+        if (!vec_indexes[i].active) continue;
+        struct VecIndex* idx = &vec_indexes[i];
+        kernel_serial_printf(" %-24s %-24s %-8s %-8u %u\n",
+                             idx->index_name, idx->collection_name,
+                             idx->metric == VEC_METRIC_L2 ? "l2" : "cosine",
+                             idx->active_count, idx->node_count);
+        shown++;
+    }
+    if (!shown) kernel_serial_print(" (no vector indexes defined)\n");
 }

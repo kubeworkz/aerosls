@@ -31,6 +31,8 @@
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
+#include "kernel/vecstore.h"
+#include "kernel/vec_index.h"
 #include "kernel/partition.h"
 #include "kernel/rowstore.h"
 #include "kernel/row_index.h"
@@ -59,6 +61,31 @@ void catalog_after_restore(void) { /* no-op for this test */ }
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
+
+/* Gap Remediation Phase D: persist.c's new restore blocks 9-10 reference
+ * vecstore.c/vec_index.c's own globals/functions, neither of which is
+ * linked here (this suite is scoped to the RDBMS layer) -- stubbed purely
+ * to satisfy the linker, matching rowstore_host_test.c's own identical
+ * precedent; both restore blocks correctly no-op at "no snapshot" before
+ * ever touching this content. */
+struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
+uint32_t                   vecstore_next_free_page_id = 0;
+struct VecIndex             vec_indexes[VEC_INDEX_MAX];
+int vec_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* collection_name, VecMetric metric) {
+    (void)caller_uid; (void)index_name; (void)collection_name; (void)metric;
+    return 1;
+}
+uint32_t vecstore_collection_scan(uint32_t caller_uid, const char* collection_name,
+                                  VecScanCb cb, void* ctx) {
+    (void)caller_uid; (void)collection_name; (void)cb; (void)ctx;
+    return 0;
+}
+void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
+                             struct VecId id, uint64_t external_id,
+                             const struct VecValues* values) {
+    (void)caller_uid; (void)collection_name; (void)id; (void)external_id; (void)values;
+}
 
 int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_perm) {
     (void)uid; (void)obj_name; (void)needed_perm;
