@@ -1,0 +1,53 @@
+# AeroSLS — TLS-terminating reverse proxy (Architectural Phase 5)
+# docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md
+#
+# Terminates HTTPS for the public domain and forwards plaintext HTTP to the
+# kernel's own HTTP server on localhost:3001. The kernel serves both the
+# compiled-in Navigator SPA bundle (kernel/webapp_bundle.c, produced by
+# `make bundle`) and the /api/* routes from that same port -- see net/http.c's
+# own comment on the GET-route bearer-token gate, which explicitly carves out
+# "everything NOT under /api/ (the compiled-in Navigator SPA bundle...)" as
+# public. So port 3001 is the single real production backend; nothing in the
+# kernel itself needs to change -- it keeps speaking plain HTTP exactly as
+# today, same as every other phase in this roadmap left it doing.
+#
+# localhost:3000 (the Node/Express dev proxy, server.ts) is NOT fronted here
+# on purpose: it's a local hot-reload dev convenience against a locally-
+# running kernel, never exposed publicly, so it doesn't need TLS.
+#
+# Setup (Debian/Ubuntu):
+#   1. Install Caddy:  https://caddyserver.com/docs/install
+#   2. Copy this file to /etc/caddy/Caddyfile
+#   3. sudo systemctl reload caddy   (or: sudo caddy run --config Caddyfile)
+#   Caddy handles the Let's Encrypt certificate automatically on first
+#   request to the domain below -- no separate certbot step needed.
+
+aerosls.kubeworkz.io {
+	reverse_proxy localhost:3001
+
+	# Standard security headers a reverse-proxy layer is the natural place
+	# to add, independent of anything in the kernel itself.
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+
+	# Rate limiting (named as a bonus in the roadmap doc): Caddy's rate_limit
+	# directive isn't in the default build -- needs a custom build via xcaddy
+	# with github.com/mholt/caddy-ratelimit, e.g.:
+	#   xcaddy build --with github.com/mholt/caddy-ratelimit
+	# Left commented out rather than assumed, since it changes how the Caddy
+	# binary itself gets built, not just this config file.
+	# rate_limit {
+	# 	zone dynamic {
+	# 		key {remote_host}
+	# 		events 100
+	# 		window 1m
+	# 	}
+	# }
+
+	log {
+		output file /var/log/caddy/aerosls.log
+	}
+}

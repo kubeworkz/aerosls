@@ -39,6 +39,28 @@ struct LeaseToken {
                              // token issued at runtime via auth_create_token(),
                              // which always gets real TTL enforcement.
     uint8_t  active;
+
+    // Architectural Phase 4 (docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md):
+    // previously POST /auth/token handed back an existing account's live
+    // token to anyone who supplied that account's email, no credential
+    // check at all. password_key is derive_user_key() (kernel/secure_api.c
+    // -- the same password-derived-key primitive `seal` already uses, not
+    // a second scheme) applied to "<email>:<password>", not just the raw
+    // password -- a poor-man's per-account salt, since derive_user_key()
+    // itself has none, so two accounts sharing a password wouldn't
+    // otherwise derive the same key. This is NOT a real cryptographic
+    // password hash (no salt of its own, fixed non-standard iteration
+    // scheme) -- reusing the existing primitive matches this codebase's
+    // established honesty-over-false-security convention (see
+    // secure_api.c's own comment on sys_sls_secure_seal()) rather than
+    // pretending to a security level this kernel doesn't actually have.
+    // has_password==0 means "no password ever set" -- auth_http_issue()
+    // requires a password match only when has_password==1, so the
+    // auto-provisioned anonymous ROLE_GUEST accounts (unknown email hitting
+    // POST /auth/token) keep today's passwordless behavior, since they
+    // claim no real identity to protect.
+    uint32_t password_key[8];
+    uint8_t  has_password;
 };
 
 // ─── Syscall numbers ──────────────────────────────────────────────────────────
@@ -51,6 +73,12 @@ struct AuthCreateRequest {
     char     email[AUTH_EMAIL_LEN];
     uint32_t uid;
     SLSRole  role;
+    // Architectural Phase 4: password for the account being created/
+    // reissued. password_len==0 leaves the account with no password set
+    // (has_password stays 0 on LeaseToken) -- matches pre-Phase-4 behavior
+    // for that one case, since there's nothing to check yet.
+    char     password[64];
+    uint32_t password_len;
 };
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -74,10 +102,13 @@ int   auth_revoke_by_email(const char* email);
 void  sys_sls_auth_list(void);
 
 // Called by the HTTP layer for POST /auth/token.
-// Looks up the email — if a registered address, issues/returns its token.
-// Otherwise creates a new ROLE_GUEST token for the email.
+// Looks up the email — if a registered address with has_password==1, the
+// caller must supply the matching password (Architectural Phase 4) or this
+// returns a JSON error instead of a token. Otherwise creates a new
+// ROLE_GUEST token for the email (unknown addresses; no password required
+// for that case, see LeaseToken's own comment on has_password==0).
 // Writes a JSON response body into resp_buf.  Returns body length.
-int   auth_http_issue(const char* email, char* resp_buf, int max);
+int   auth_http_issue(const char* email, const char* password, char* resp_buf, int max);
 
 // Called by the HTTP layer: extract the "Authorization: Bearer <token>" header
 // from raw_request and validate.  On success fills out_uid/out_role and returns 1.

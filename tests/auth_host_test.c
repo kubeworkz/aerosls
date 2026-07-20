@@ -34,6 +34,20 @@ void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_print_hex64(uint64_t v) { (void)v; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
+/* Architectural Phase 4: auth.c now links kernel/secure_api.c for
+ * derive_user_key() (the real password-derivation logic under test, not a
+ * reimplementation -- same "link the real file" convention this test
+ * already follows for auth.c itself). secure_api.c's OTHER function,
+ * sys_sls_secure_seal(), is never called here but still needs its own two
+ * dependencies to link; stubbed with matching real signatures rather than
+ * pulling in the object catalog they'd otherwise require. */
+uint32_t kernel_get_current_thread_id(void) { return 0; }
+int verify_expanded_matrix_access(uint32_t uid, uint32_t gid,
+                                   uint64_t object_id, uint32_t needed_mask) {
+    (void)uid; (void)gid; (void)object_id; (void)needed_mask;
+    return 1;
+}
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \
@@ -63,6 +77,7 @@ int main(void) {
     struct AuthCreateRequest req;
     strcpy(req.email, "newuser@example.com");
     req.uid = 42; req.role = ROLE_APP_USER;
+    req.password_len = 0;  // Architectural Phase 4: no password for this scenario's account
     char tok[AUTH_TOKEN_LEN + 1];
     CHECK(auth_create_token(&req, tok) == 1, "s3: auth_create_token() issues a fresh token");
     CHECK(auth_validate_token(tok, &uid, &role) == 1 && uid == 42 && role == ROLE_APP_USER,
@@ -97,11 +112,11 @@ int main(void) {
      * token, and re-issuing before expiry returns the SAME token (real
      * reuse, not wasteful reissue every call). ──────────────────────────── */
     char resp[256];
-    int n = auth_http_issue("fresh@example.com", resp, (int)sizeof(resp));
+    int n = auth_http_issue("fresh@example.com", "", resp, (int)sizeof(resp));
     CHECK(n > 0 && strstr(resp, "\"ok\":true") && strstr(resp, "\"role\":\"GUEST\""),
-          "s6: auth_http_issue() for a brand-new email returns an ok GUEST token");
+          "s6: auth_http_issue() for a brand-new email returns an ok GUEST token, no password needed");
     char resp2[256];
-    int n2 = auth_http_issue("fresh@example.com", resp2, (int)sizeof(resp2));
+    int n2 = auth_http_issue("fresh@example.com", "", resp2, (int)sizeof(resp2));
     CHECK(n2 > 0 && strcmp(resp, resp2) == 0,
           "s6: re-issuing for the same email before expiry returns the identical response (real reuse)");
 
@@ -114,6 +129,45 @@ int main(void) {
     CHECK(auth_revoke_by_email("fresh@example.com") == 1, "s7: revoke succeeds for a known email");
     CHECK(auth_validate_token(freshtok, &uid, &role) == 0, "s7: the same token fails validation immediately after revoke");
     CHECK(auth_revoke_by_email("nobody@example.com") == 0, "s7: revoke of an unregistered email returns 0");
+
+    /* ── Scenario 8 (Architectural Phase 4): POST /auth/token now requires
+     * a matching password for any account that has one set -- previously
+     * knowing a live account's email alone was enough to get its real
+     * token back. Covers: a fresh account created WITH a password, and one
+     * of auth_init()'s own standing demo accounts (which now also carry
+     * fixed demo passwords). ─────────────────────────────────────────────── */
+    struct AuthCreateRequest sreq;
+    strcpy(sreq.email, "secured@example.com");
+    sreq.uid = 55; sreq.role = ROLE_APP_USER;
+    strcpy(sreq.password, "hunter2");
+    sreq.password_len = 7;
+    char stok[AUTH_TOKEN_LEN + 1];
+    CHECK(auth_create_token(&sreq, stok) == 1, "s8: auth_create_token() with a password succeeds");
+
+    char sresp[256];
+    int sn = auth_http_issue("secured@example.com", "wrong-password", sresp, (int)sizeof(sresp));
+    CHECK(sn > 0 && strstr(sresp, "\"error\"") && !strstr(sresp, "\"ok\":true"),
+          "s8: wrong password is rejected with a JSON error, no token leaked");
+
+    char sresp2[256];
+    int sn2 = auth_http_issue("secured@example.com", "", sresp2, (int)sizeof(sresp2));
+    CHECK(sn2 > 0 && strstr(sresp2, "\"error\""),
+          "s8: no password supplied at all is rejected the same way");
+
+    char sresp3[256];
+    int sn3 = auth_http_issue("secured@example.com", "hunter2", sresp3, (int)sizeof(sresp3));
+    CHECK(sn3 > 0 && strstr(sresp3, "\"ok\":true") && strstr(sresp3, stok),
+          "s8: the correct password returns the real token");
+
+    char dresp[256];
+    int dn = auth_http_issue("dave@gridworkz.com", "not-daves-password", dresp, (int)sizeof(dresp));
+    CHECK(dn > 0 && strstr(dresp, "\"error\""),
+          "s8: dave's standing demo account also now rejects a wrong password -- "
+          "the exact gap that motivated this phase (email alone used to be enough)");
+    char dresp2[256];
+    int dn2 = auth_http_issue("dave@gridworkz.com", "demo-dave", dresp2, (int)sizeof(dresp2));
+    CHECK(dn2 > 0 && strstr(dresp2, "\"ok\":true") && strstr(dresp2, "deadbeef01234567cafebabe76543210"),
+          "s8: dave's correct fixed demo password returns his real fixed demo token");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

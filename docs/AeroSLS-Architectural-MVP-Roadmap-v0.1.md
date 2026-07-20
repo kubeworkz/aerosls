@@ -137,39 +137,101 @@ must not share one identity or one open SQL transaction.
 make the existing global-state bug live (two real concurrent users instead of
 one at a time hitting the same globals).
 
-## Phase 3 — Lock down CORS
+## Phase 3 — Lock down CORS — DONE
 
-- Replace the three hardcoded `Access-Control-Allow-Origin: *` sites in
-  `net/http.c` (~L249, L276, preflight handler ~L563) with the actual deployed
-  origin(s), ideally sourced from a boot-time config value so dev/staging/prod
-  can differ without a rebuild.
-- Independent of every other phase. Smallest, lowest-risk change in this doc —
-  candidate to do first as a quick win regardless of Phase 1/2 sequencing.
+Implemented: there were actually five hardcoded `Access-Control-Allow-Origin:
+*` sites (`http_respond`, `http_respond_raw`, `http_respond_stream`,
+`http_respond_program_binary`, `http_options`), not three — found the other
+two while implementing. A wildcard could never have served more than "any
+origin" anyway, since a browser only accepts a CORS response whose header
+exactly matches its own `Origin`, so a fixed allowlist needed a real
+per-request reflection, not a second static string.
 
-## Phase 4 — Real credential check on token issuance
+`CORS_ALLOWED_ORIGINS[]` is a compile-time array (`https://aerosls.kubeworkz.io`,
+`http://localhost:3000`, `http://localhost:3001` — confirmed with Dave).
+`http_resolve_cors_origin()` reads the request's `Origin:` header once, in
+`http_route()` before any response helper runs, and writes either the
+matching allowed origin or an empty string into `g_cors_origin_hdr`; all five
+sites now append that instead of a literal `*`. Resolved into a file-scope
+buffer rather than threaded as a parameter through `http_respond()`'s ~90
+call sites — safe for the same reason Phase 1/2's own state is: request
+handling is still fully serialized, so nothing else touches that buffer
+between it being set and read.
 
-- Add a password field to account records and verify it in `auth_http_issue()`
-  before minting a token — today there is no check at all. `secure_api.c`
-  already has a password-derived-key primitive (used by the `seal` shell
-  command) that's the natural thing to reuse for hashing credentials, rather
-  than introducing a second hashing scheme.
-- The four existing `auth_init()` demo accounts become seed data for one org's
-  admin/demo users rather than the entire auth model.
-- Open product question, not an engineering one: does MVP need self-serve
-  signup, or is "admin provisions accounts, users log in with a password"
-  sufficient? Worth deciding before implementation, not assumed.
-- Independent of Phases 1/2/3.
+`gcc -fsyntax-only` clean — 0 errors, no new warnings.
 
-## Phase 5 — TLS (infrastructure, not kernel code)
+## Phase 4 — Real credential check on token issuance — DONE
 
-- Put a TLS-terminating reverse proxy (Caddy or nginx) in front of both the
-  QEMU port-forward (host 3001) and the Node dev proxy (host 3000); it speaks
-  HTTPS to clients and plaintext HTTP to the kernel exactly as today. Building
-  TLS into the from-scratch net stack is disproportionate effort for MVP.
-- Bonus: the same proxy layer is the natural place to add rate limiting
-  (previously flagged as lower-priority) essentially for free.
-- Independent of every other phase — can be done in parallel by whoever isn't
-  touching `http.c`.
+Implemented: `LeaseToken` (kernel/auth.h) gained `password_key[8]` +
+`has_password`. `derive_user_key()` (`kernel/secure_api.c`, the same
+primitive `seal` already uses — reused, not a second scheme) is applied to
+`"<email>:<password>"` rather than the bare password, as a poor-man's
+per-account salt, since the primitive itself has none. This is explicitly
+**not** a real cryptographic password hash (no salt of its own, a fixed
+non-standard iteration scheme) — documented as such in `LeaseToken`'s own
+comment, matching this codebase's established honesty-over-false-security
+convention (see `secure_api.c`'s own comment on `sys_sls_secure_seal()`).
+
+`auth_http_issue()` (`POST /auth/token`) now requires the matching password
+for any account with `has_password==1`, returning `{"error":"invalid
+credentials"}` instead of the token otherwise. Unknown emails still
+auto-provision a `ROLE_GUEST` token with no password required — no existing
+identity to protect. All four `auth_init()` demo accounts got fixed demo
+passwords (`demo-dave`, `demo-bob`, `demo-carol`, `demo-guest`), printed to
+the boot log next to their tokens, same "developer can copy-paste it"
+convention already used for the tokens themselves.
+
+**Additional finding folded into this phase:** `auth create` (the shell
+command that provisions new accounts) had no permission check at all — any
+session, including a GUEST one, could mint itself a DB_ADMIN account.
+Discovered while implementing the password check, in the exact code this
+phase was already touching, so fixed in the same pass rather than filed
+separately: `auth create` and `auth revoke` now require the caller to
+already be DB_ADMIN or SYSTEM_KERNEL (`catalog_get_role(sess->uid)`).
+`auth create` also gained a required trailing `<password>` argument.
+
+**Frontend note:** `slsos-sim` never actually calls `POST /auth/token` —
+every request uses one hardcoded `DEMO_TOKEN` constant
+(`src/lib/apiFetch.ts`), and the "User Portal" login UI
+(`SlsUserPortal.tsx`) is local/cosmetic (`localStorage`), not a real backend
+login. So this phase closes a live vulnerability reachable by anyone calling
+the API directly (e.g. `curl`), but doesn't change anything the shipped
+frontend does today. Building a real per-user login flow that actually calls
+this endpoint is a separate, larger frontend project — still an open item,
+not attempted here.
+
+Verified via `tests/auth_host_test.c` (extended, linked against the real
+`kernel/auth.c` + `kernel/secure_api.c`, 22/22 checks pass, including wrong
+password rejected, no password rejected, correct password accepted, and
+dave's own demo account now requiring its password) and `gcc -fsyntax-only`
+clean on every touched file (0 errors; only pre-existing warnings, none in
+new code).
+
+## Phase 5 — TLS (infrastructure, not kernel code) — DONE (config delivered; needs manual install)
+
+Delivered: `deploy/Caddyfile`, targeting `localhost:3001` only. Re-examined
+the production topology while writing this: the kernel itself serves the
+compiled-in Navigator SPA bundle (`kernel/webapp_bundle.c`, produced by
+`make bundle`) directly alongside `/api/*` on port 3001 — confirmed via
+`net/http.c`'s own GET-route comment, which explicitly carves out "the
+compiled-in Navigator SPA bundle" as public, non-`/api/` traffic on that
+same port. So port 3001 is the one real production backend; the Node/Express
+dev proxy on port 3000 (`server.ts`) is a local hot-reload convenience
+against a locally-running kernel, never exposed publicly, and doesn't need
+TLS — the Caddyfile deliberately doesn't front it.
+
+No kernel code changes — the kernel keeps speaking plain HTTP behind the
+proxy exactly as every other phase left it. Rate limiting (the bonus named
+in this phase's original scope) is included as a commented-out block, since
+it requires a custom Caddy build (`xcaddy` + `caddy-ratelimit`), not just a
+config change — left as a documented next step rather than silently assumed.
+
+This phase can't be verified with `gcc -fsyntax-only` like Phases 1-4 — it's
+a config file that needs installing on the actual server, outside what's
+reachable from here. Open question for Dave: does `aerosls.kubeworkz.io`
+already have TLS termination somewhere (e.g. Cloudflare) in front of it
+today? If so this Caddyfile should either replace that layer or be adapted
+to sit behind it in "full" mode rather than compete with it on port 443.
 
 ---
 

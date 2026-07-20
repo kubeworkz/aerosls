@@ -14,3 +14,13 @@ struct SLSSealRequest {
     uint32_t password_len;
     uint32_t encryption_algorithm_flags; // accepted, not yet consulted -- see note above
 };
+
+// Derives a 256-bit key from a password string (kernel/secure_api.c).
+// Previously used only within that file with no header declaration, so
+// every caller outside it (this used to mean none) would need its own
+// implicit/duplicate declaration. Architectural Phase 4 (see
+// docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md) reuses this in
+// kernel/auth.c for account password verification -- deliberately the
+// same primitive `seal` already uses, not a second scheme -- which is
+// what surfaced the missing prototype.
+void derive_user_key(const char* password, uint32_t len, uint32_t* out_key);

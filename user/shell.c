@@ -1032,23 +1032,49 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         else if (sh_starts(input_buffer, "journal purge ")) {
             journal_purge(input_buffer + 14);
         }
-        // ── Phase G: auth create <email> <uid> <role> ──────────────────────────
+        // ── Phase G: auth create <email> <uid> <role> <password> ───────────────
+        // Architectural Phase 4 (docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md):
+        // two changes to this command specifically. First, it now takes a
+        // trailing <password> -- creating an account with no password meant
+        // that account's token could later be handed to anyone who just
+        // knew its email via POST /auth/token (see auth_http_issue()'s own
+        // comment). Second, it's now gated to DB_ADMIN/SYSTEM_KERNEL callers
+        // -- previously ANY caller with shell access at all, including a
+        // GUEST-role session, could run this command and mint themselves a
+        // DB_ADMIN token, a privilege-escalation gap discovered while
+        // implementing the password check above and fixed in the same pass
+        // since it sits in the exact code this phase was already touching.
+        // `auth revoke` gets the same gate for the same reason (anyone could
+        // revoke anyone's access). Password on the command line, visible in
+        // shell history/logs, is not ideal but matches the precedent this
+        // codebase already set for `seal <name> <password>`.
         else if (sh_starts(input_buffer, "auth create ")) {
-            const char* p = input_buffer + 12;
-            struct AuthCreateRequest req;
-            size_t elen = 0;
-            while (p[elen] && p[elen] != ' ') elen++;
-            sh_copy(req.email, p, elen+1 < AUTH_EMAIL_LEN ? (int)(elen+1) : AUTH_EMAIL_LEN);
-            p = sh_next(p);
-            req.uid = sh_atoi(p);
-            p = sh_next(p);
-            if      (sh_eq(p, "SYSTEM_KERNEL")) req.role = ROLE_SYSTEM_KERNEL;
-            else if (sh_eq(p, "DB_ADMIN"))      req.role = ROLE_DB_ADMIN;
-            else if (sh_eq(p, "APP_USER"))      req.role = ROLE_APP_USER;
-            else                                req.role = ROLE_GUEST;
-            char tok[AUTH_TOKEN_LEN + 1];
-            if (auth_create_token(&req, tok))
-                kernel_serial_printf("[AUTH] Token: %s\n", tok);
+            if (catalog_get_role(sess->uid) > ROLE_DB_ADMIN) {
+                kernel_serial_print("Security Violation: 'auth create' requires DB_ADMIN or higher.\n");
+            } else {
+                const char* p = input_buffer + 12;
+                struct AuthCreateRequest req;
+                size_t elen = 0;
+                while (p[elen] && p[elen] != ' ') elen++;
+                sh_copy(req.email, p, elen+1 < AUTH_EMAIL_LEN ? (int)(elen+1) : AUTH_EMAIL_LEN);
+                p = sh_next(p);
+                req.uid = sh_atoi(p);
+                p = sh_next(p);
+                if      (sh_starts(p, "SYSTEM_KERNEL")) req.role = ROLE_SYSTEM_KERNEL;
+                else if (sh_starts(p, "DB_ADMIN"))      req.role = ROLE_DB_ADMIN;
+                else if (sh_starts(p, "APP_USER"))      req.role = ROLE_APP_USER;
+                else                                     req.role = ROLE_GUEST;
+                p = sh_next(p);
+                size_t plen = 0;
+                while (p[plen] && p[plen] != ' ') plen++;
+                if (plen >= sizeof(req.password)) plen = sizeof(req.password) - 1;
+                for (size_t k = 0; k < plen; k++) req.password[k] = p[k];
+                req.password[plen] = '\0';
+                req.password_len = (uint32_t)plen;
+                char tok[AUTH_TOKEN_LEN + 1];
+                if (auth_create_token(&req, tok))
+                    kernel_serial_printf("[AUTH] Token: %s\n", tok);
+            }
         }
 
         // ── Phase G: auth list ───────────────────────────────────────────
@@ -1058,7 +1084,11 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
 
         // ── Phase G: auth revoke <email> ───────────────────────────────────
         else if (sh_starts(input_buffer, "auth revoke ")) {
-            do_syscall(SYS_SLS_AUTH_REVOKE, (void*)(input_buffer + 12));
+            if (catalog_get_role(sess->uid) > ROLE_DB_ADMIN) {
+                kernel_serial_print("Security Violation: 'auth revoke' requires DB_ADMIN or higher.\n");
+            } else {
+                do_syscall(SYS_SLS_AUTH_REVOKE, (void*)(input_buffer + 12));
+            }
         }
 
         // ── Phase D: webapp set / append ──────────────────────────────────────

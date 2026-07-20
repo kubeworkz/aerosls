@@ -214,6 +214,34 @@ static int api_metrics(char* body, int max) {
     return j.pos;
 }
 
+// ─── Architectural Phase 3: CORS allowlist ────────────────────────────────────
+// (docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md). Replaces the previous
+// unconditional "Access-Control-Allow-Origin: *". A browser only ever
+// accepts a CORS response whose header exactly matches its own Origin, so a
+// single static value could never have covered more than one real origin
+// anyway -- the wildcard's only actual effect was allowing literally any
+// origin at all, not "these origins" specifically. http_resolve_cors_origin()
+// (defined below, after str_find()) reflects the request's own Origin back
+// only if it's on the fixed allowlist, into this buffer; every response
+// helper appends whatever's in here (empty string if the origin wasn't
+// allowed, which is the standard/safe CORS failure mode -- the browser just
+// blocks the page's JS from reading the response).
+//
+// Resolved once per request, in http_route() before any handler runs,
+// rather than threaded as a new parameter through http_respond()'s ~90 call
+// sites: safe under this server's concurrency model (Architectural Phase 1)
+// because request handling is still fully serialized end to end -- one
+// request's entire parse/dispatch/respond cycle completes before the next
+// begins -- the same reasoning already documented for Phase 1's own
+// connection state.
+static const char* const CORS_ALLOWED_ORIGINS[] = {
+    "https://aerosls.kubeworkz.io",
+    "http://localhost:3000",
+    "http://localhost:3001",
+};
+#define CORS_ALLOWED_ORIGINS_COUNT (int)(sizeof(CORS_ALLOWED_ORIGINS) / sizeof(CORS_ALLOWED_ORIGINS[0]))
+static char g_cors_origin_hdr[128];  // "" (no header) or "Access-Control-Allow-Origin: <origin>\r\n"
+
 // ─── HTTP response helper ─────────────────────────────────────────────────────
 static void http_respond(int conn, int status, const char* ctype,
                           const char* body, int blen) {
@@ -247,7 +275,7 @@ static void http_respond(int conn, int status, const char* ctype,
     else { while (bl) { tmp[tl++] = (char)('0' + bl%10); bl /= 10; } }
     for (int i = tl-1; i >= 0; i--) hdr[hpos++] = tmp[i];
     hdr[hpos++] = '\r'; hdr[hpos++] = '\n';
-    const char* cors = "Access-Control-Allow-Origin: *\r\n";
+    const char* cors = g_cors_origin_hdr;
     while (*cors) hdr[hpos++] = *cors++;
     hdr[hpos++] = '\r'; hdr[hpos++] = '\n';  // end of headers
 
@@ -274,8 +302,12 @@ static void http_respond_raw(int conn, const char* ctype,
     if (bl == 0) { tmp[tl++] = '0'; }
     else { while (bl) { tmp[tl++] = (char)('0' + bl % 10); bl /= 10; } }
     for (int i = tl - 1; i >= 0; i--) hdr[hpos++] = tmp[i];
-    const char* cors = "\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    const char* crlf = "\r\n";
+    while (*crlf) hdr[hpos++] = *crlf++;
+    const char* cors = g_cors_origin_hdr;
     while (*cors) hdr[hpos++] = *cors++;
+    const char* crlf2 = "\r\n";
+    while (*crlf2) hdr[hpos++] = *crlf2++;
 
     tcp_send(conn, hdr, (uint32_t)hpos);
     if (blen > 0) tcp_send(conn, data, blen);
@@ -286,14 +318,20 @@ static int json_str(const char* json, const char* key, char* out, int max);
 static int json_int(const char* json, const char* key);
 
 // ─── POST /auth/token — issue a bearer token for an email ─────────────────────
+// Architectural Phase 4: also reads "password" from the body. Missing/empty
+// is fine for an unknown email (auto-provisioned GUEST, no password
+// required) but will fail auth_http_issue()'s credential check for any
+// account that has one set -- see that function's own comment.
 static int api_auth_token(const char* body, char* buf, int max) {
     if (!body) {
         const char* err = "{\"error\":\"missing body\"}";
         int n=0; while(err[n]&&n<max-1) buf[n]=err[n++]; buf[n]='\0'; return n;
     }
     char email[AUTH_EMAIL_LEN];
+    char password[64];
     json_str(body, "email", email, AUTH_EMAIL_LEN);
-    return auth_http_issue(email, buf, max);
+    json_str(body, "password", password, sizeof(password));
+    return auth_http_issue(email, password, buf, max);
 }
 
 // ─── GET /auth/verify — decode and return token metadata ────────────────────
@@ -558,12 +596,47 @@ static int url_param(const char* qs, const char* key, char* out, int max) {
 
 // ─── CORS preflight ───────────────────────────────────────────────────────────
 static void http_options(int conn) {
-    const char* h = "HTTP/1.1 204 No Content\r\n"
-                    "Access-Control-Allow-Origin: *\r\n"
-                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-                    "Content-Length: 0\r\n\r\n";
-    tcp_send(conn, h, (uint32_t)strlen(h));
+    char h[256]; int hp = 0;
+    const char* sl = "HTTP/1.1 204 No Content\r\n";
+    while (*sl) h[hp++] = *sl++;
+    const char* co = g_cors_origin_hdr;
+    while (*co) h[hp++] = *co++;
+    const char* rest = "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                       "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    while (*rest) h[hp++] = *rest++;
+    tcp_send(conn, h, (uint32_t)hp);
+}
+
+// Resolves the current request's Origin header against CORS_ALLOWED_ORIGINS
+// into g_cors_origin_hdr. Defined here (after str_find()/str_ncmp2(), which
+// it needs) rather than next to CORS_ALLOWED_ORIGINS above; called once per
+// request from the top of http_route(), before http_options() or any other
+// response helper runs.
+static void http_resolve_cors_origin(const char* req) {
+    g_cors_origin_hdr[0] = '\0';
+    const char* o = str_find(req, "Origin:");
+    if (!o) o = str_find(req, "origin:");
+    if (!o) return;
+    o += 7;
+    while (*o == ' ') o++;
+    const char* end = o;
+    while (*end && *end != '\r' && *end != '\n') end++;
+    int len = (int)(end - o);
+    if (len <= 0 || len >= 96) return;
+    for (int i = 0; i < CORS_ALLOWED_ORIGINS_COUNT; i++) {
+        const char* allowed = CORS_ALLOWED_ORIGINS[i];
+        int alen = 0; while (allowed[alen]) alen++;
+        if (alen != len) continue;
+        if (str_ncmp2(allowed, o, len) != 0) continue;
+        int p = 0;
+        const char* pre = "Access-Control-Allow-Origin: ";
+        while (*pre) g_cors_origin_hdr[p++] = *pre++;
+        for (int k = 0; k < len; k++) g_cors_origin_hdr[p++] = o[k];
+        g_cors_origin_hdr[p++] = '\r'; g_cors_origin_hdr[p++] = '\n';
+        g_cors_origin_hdr[p] = '\0';
+        return;
+    }
 }
 
 // ─── GET /api/objects ─────────────────────────────────────────────────────────
@@ -1147,7 +1220,7 @@ static void http_respond_stream(int conn, struct StreamEntry* se) {
     if (!v){tmp[tl++]='0';} else {while(v){tmp[tl++]=(char)('0'+v%10);v/=10;}}
     for(int i=tl-1;i>=0;i--) hdr[hp++]=tmp[i];
     hdr[hp++]='\r'; hdr[hp++]='\n';
-    const char* co="Access-Control-Allow-Origin: *\r\n"; while(*co) hdr[hp++]=*co++;
+    const char* co=g_cors_origin_hdr; while(*co) hdr[hp++]=*co++;
     hdr[hp++]='\r'; hdr[hp++]='\n';
     tcp_send(conn, hdr, (uint32_t)hp);
     /* Send content frame-by-frame; lazy-load from NVMe if frame not in RAM
@@ -1188,7 +1261,7 @@ static void http_respond_program_binary(int conn, struct ServiceBinary* sb) {
     if (!v) { tmp[tl++] = '0'; } else { while (v) { tmp[tl++] = (char)('0' + v % 10); v /= 10; } }
     for (int i = tl - 1; i >= 0; i--) hdr[hp++] = tmp[i];
     hdr[hp++] = '\r'; hdr[hp++] = '\n';
-    const char* co = "Access-Control-Allow-Origin: *\r\n"; while (*co) hdr[hp++] = *co++;
+    const char* co = g_cors_origin_hdr; while (*co) hdr[hp++] = *co++;
     hdr[hp++] = '\r'; hdr[hp++] = '\n';
     tcp_send(conn, hdr, (uint32_t)hp);
     if (sb->size > 0)
@@ -2277,6 +2350,10 @@ static void http_route(int conn, char* req) {
     const char* body_ptr = http_body(req);
     static char resp_body[16384];
     int blen = 0;
+
+    // Architectural Phase 3: resolve this request's CORS origin once, before
+    // any response helper (including http_options() below) runs.
+    http_resolve_cors_origin(req);
 
     // OPTIONS: CORS preflight
     if (method[0] == 'O') { http_options(conn); return; }

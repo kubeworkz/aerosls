@@ -1,6 +1,7 @@
 #include "auth.h"
 #include "kernel_io.h"
 #include "dashboard.h"     // for read_tsc()
+#include "secure_api.h"    // Architectural Phase 4 -- derive_user_key(), reused for account passwords
 
 struct LeaseToken auth_tokens[AUTH_MAX_TOKENS];
 
@@ -53,6 +54,35 @@ static int au_token_expired(const struct LeaseToken* lt) {
     return (kernel_tick_counter - lt->created_tick) > AUTH_TOKEN_TTL_TICKS;
 }
 
+// ─── Architectural Phase 4: account passwords ──────────────────────────────────
+// See LeaseToken's own comment (auth.h) for why this salts with the email
+// rather than calling derive_user_key() directly on the bare password.
+static void au_derive_password_key(const char* email, const char* password,
+                                    uint32_t password_len, uint32_t* out_key) {
+    char salted[AUTH_EMAIL_LEN + 64 + 2];
+    int p = 0;
+    for (int i = 0; email[i] && p < AUTH_EMAIL_LEN; i++) salted[p++] = email[i];
+    salted[p++] = ':';
+    uint32_t n = password_len > 64 ? 64 : password_len;
+    for (uint32_t i = 0; i < n; i++) salted[p++] = password[i];
+    derive_user_key(salted, (uint32_t)p, out_key);
+}
+
+// lt->email must already be populated -- it's the salt input.
+static void au_set_password(struct LeaseToken* lt, const char* password, uint32_t password_len) {
+    if (!password || password_len == 0) { lt->has_password = 0; return; }
+    au_derive_password_key(lt->email, password, password_len, lt->password_key);
+    lt->has_password = 1;
+}
+
+static int au_check_password(const struct LeaseToken* lt, const char* password, uint32_t password_len) {
+    if (!lt->has_password || !password || password_len == 0) return 0;
+    uint32_t key[8];
+    au_derive_password_key(lt->email, password, password_len, key);
+    for (int i = 0; i < 8; i++) if (key[i] != lt->password_key[i]) return 0;
+    return 1;
+}
+
 // ─── auth_init ────────────────────────────────────────────────────────────────
 // Pre-register the four simulator demo accounts with deterministic tokens
 // (fixed seeds so they survive any TSC reading quirks).
@@ -70,8 +100,8 @@ void auth_init(void) {
     };
 
     kernel_serial_print("[AUTH] Token Registry\n");
-    kernel_serial_print(" Email                           UID   Role          Token\n");
-    kernel_serial_print(" -------------------------------  ----  ------------  --------------------------------\n");
+    kernel_serial_print(" Email                           UID   Role          Token                             Password\n");
+    kernel_serial_print(" -------------------------------  ----  ------------  --------------------------------  --------\n");
 
     for (int i = 0; i < 4; i++) {
         struct AuthCreateRequest req;
@@ -86,6 +116,17 @@ void auth_init(void) {
             "cafebabe7654321089abcdef01234567",  // bob
             "feedf00dabcdef0112345678deadc0de",  // carol
             "deadc0de9988776655443322aabbccdd",  // guest
+        };
+        // Architectural Phase 4: fixed demo passwords, printed to the boot
+        // log right alongside the token -- same "everything's public so the
+        // developer can copy-paste it" convention this function already
+        // used for the tokens themselves (see this function's own header
+        // comment). These are standing local-dev demo credentials, not a
+        // real security boundary, exactly like the tokens. Every account
+        // created later via `auth create` (Phase G) requires a real caller-
+        // supplied password instead -- see auth_create_token()'s own note.
+        static const char* fixed_passwords[4] = {
+            "demo-dave", "demo-bob", "demo-carol", "demo-guest",
         };
 
         struct LeaseToken* lt = &auth_tokens[i];
@@ -103,6 +144,7 @@ void auth_init(void) {
         // gets real TTL enforcement.
         lt->no_expiry    = 1;
         lt->active       = 1;
+        au_set_password(lt, fixed_passwords[i], (uint32_t)au_strlen(fixed_passwords[i]));
 
         kernel_serial_print(" ");
         kernel_serial_print(lt->email);
@@ -116,6 +158,8 @@ void auth_init(void) {
         kernel_serial_print(role_name(lt->role));
         kernel_serial_print("  ");
         kernel_serial_print(lt->token);
+        kernel_serial_print("  ");
+        kernel_serial_print(fixed_passwords[i]);
         kernel_serial_print("\n");
     }
     kernel_serial_print("\n");
@@ -141,6 +185,7 @@ int auth_create_token(struct AuthCreateRequest* req, char* out_token) {
             auth_tokens[i].uid          = req->uid;
             auth_tokens[i].role         = req->role;
             auth_tokens[i].created_tick = kernel_tick_counter;
+            au_set_password(&auth_tokens[i], req->password, req->password_len);  // Architectural Phase 4
             if (out_token) au_strncpy(out_token, tok, AUTH_TOKEN_LEN + 1);
             kernel_serial_printf(
                 "[AUTH] Token re-issued (previous expired): uid=%u role=%s email=%s\n",
@@ -162,6 +207,7 @@ int auth_create_token(struct AuthCreateRequest* req, char* out_token) {
             auth_tokens[i].created_tick = kernel_tick_counter;  // Phase E
             auth_tokens[i].no_expiry    = 0;                    // Phase E: real TTL applies
             auth_tokens[i].active       = 1;
+            au_set_password(&auth_tokens[i], req->password, req->password_len);  // Architectural Phase 4
 
             if (out_token) au_strncpy(out_token, tok, AUTH_TOKEN_LEN + 1);
             kernel_serial_printf(
@@ -235,14 +281,22 @@ void sys_sls_auth_list(void) {
 }
 
 // ─── auth_http_issue ─────────────────────────────────────────────────────────
-// Called by POST /auth/token.  Looks up the email; if a known address, returns
-// its token.  Otherwise issues a new GUEST token.
-int auth_http_issue(const char* email, char* resp_buf, int max) {
+// Called by POST /auth/token. Looks up the email; if a known address with a
+// password set (Architectural Phase 4), the supplied password must match or
+// this returns a JSON error instead of the token -- previously ANY caller
+// who supplied a known email got that account's live token back, no
+// credential check at all, which meant knowing e.g. dave@gridworkz.com's
+// address was enough to obtain his real DB_ADMIN token. Unknown emails
+// still get a new ROLE_GUEST token with no password required, since they
+// claim no existing identity to protect (see LeaseToken's own comment on
+// has_password==0).
+int auth_http_issue(const char* email, const char* password, char* resp_buf, int max) {
     if (!email || !email[0]) {
         const char* err = "{\"error\":\"email required\"}";
         int n = 0; while (err[n]&&n<max-1) resp_buf[n++]=err[n]; resp_buf[n]='\0';
         return n;
     }
+    uint32_t password_len = password ? (uint32_t)au_strlen(password) : 0;
 
     // Try existing token first. Phase E: skip (and fall through to the
     // "unknown email" reissue path below) if it's expired -- see
@@ -251,6 +305,16 @@ int auth_http_issue(const char* email, char* resp_buf, int max) {
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
         if (auth_tokens[i].active && au_streq(auth_tokens[i].email, email) &&
             !au_token_expired(&auth_tokens[i])) {
+            // Architectural Phase 4: an account with a password set must
+            // present it. Accounts without one (only the auto-provisioned
+            // GUEST accounts below can currently reach this state) fall
+            // through unchanged, matching pre-Phase-4 behavior for that case.
+            if (auth_tokens[i].has_password &&
+                !au_check_password(&auth_tokens[i], password, password_len)) {
+                const char* err = "{\"error\":\"invalid credentials\"}";
+                int n = 0; while (err[n]&&n<max-1) { resp_buf[n]=err[n]; n++; } resp_buf[n]='\0';
+                return n;
+            }
             // Found — return it
             int pos = 0;
             const char* pre = "{\"ok\":true,\"token\":\"";
@@ -276,11 +340,13 @@ int auth_http_issue(const char* email, char* resp_buf, int max) {
         }
     }
 
-    // Unknown email — issue GUEST token
+    // Unknown email — issue GUEST token, no password (see this function's
+    // own header comment for why that's fine: no existing identity to protect).
     struct AuthCreateRequest req;
     au_strncpy(req.email, email, AUTH_EMAIL_LEN);
     req.uid  = 9999;
     req.role = ROLE_GUEST;
+    req.password_len = 0;
     char tok[AUTH_TOKEN_LEN + 1];
     auth_create_token(&req, tok);
 
