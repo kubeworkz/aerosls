@@ -228,10 +228,20 @@ config change — left as a documented next step rather than silently assumed.
 
 This phase can't be verified with `gcc -fsyntax-only` like Phases 1-4 — it's
 a config file that needs installing on the actual server, outside what's
-reachable from here. Open question for Dave: does `aerosls.kubeworkz.io`
-already have TLS termination somewhere (e.g. Cloudflare) in front of it
-today? If so this Caddyfile should either replace that layer or be adapted
-to sit behind it in "full" mode rather than compete with it on port 443.
+reachable from here.
+
+**Superseded by `deploy/nginx-aerosls.conf`.** Dave confirmed nginx already
+runs in front of `aerosls.kubeworkz.io`, with the domain on Cloudflare in
+Full (strict) SSL mode — the Caddyfile above assumed no existing proxy and
+is left only as a reference/alternative. The nginx config: terminates TLS
+with a Cloudflare Origin CA cert (required for Full strict — Cloudflare
+verifies it), proxies to `localhost:3001` (confirmed the real production
+backend per this phase's own earlier note, not `:3000`), and includes
+`limit_req` rate limiting built into nginx directly (no plugin needed,
+unlike Caddy's rate-limit module). Sets `X-Forwarded-Proto`/`X-Real-IP`
+(preferring Cloudflare's own `CF-Connecting-IP` header for the real client
+IP once Cloudflare is in the path). Full one-time Origin CA cert setup
+steps are in the file's own header comment.
 
 ---
 

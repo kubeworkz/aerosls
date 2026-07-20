@@ -1,3 +1,8 @@
+# NOT the active choice -- Dave already runs nginx in front of
+# aerosls.kubeworkz.io, with the domain on Cloudflare (Full strict SSL mode).
+# See deploy/nginx-aerosls.conf instead, which fits that existing setup.
+# Left here only as a reference/alternative if this ever migrates off nginx.
+#
 # AeroSLS — TLS-terminating reverse proxy (Architectural Phase 5)
 # docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md
 #
