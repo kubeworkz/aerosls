@@ -1,0 +1,31 @@
+name: CI
+
+# Operational Phase A (docs/AeroSLS-Operational-MVP-Roadmap-v0.1.md).
+#
+# Runs the same two verification steps that have been done by hand,
+# manually, at the end of every phase of every roadmap doc in docs/ this
+# whole project's history: the host test suite, and a gcc -fsyntax-only
+# sweep of every kernel source file using the Makefile's own real cross-
+# build flags (no x86_64-elf-gcc cross-compiler available here, matching
+# every prior manual verification pass -- see tools/syntax_check_all.sh's
+# own header comment). Nothing new is invented here; this just makes those
+# two known-good commands run automatically instead of relying on a person
+# remembering to run them before merging.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host test suite (tests/*_host_test.c)
+        run: bash tests/run_all.sh
+
+      - name: Kernel syntax check (gcc -fsyntax-only, X86_C_SRC)
+        run: bash tools/syntax_check_all.sh

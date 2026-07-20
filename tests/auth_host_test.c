@@ -13,8 +13,16 @@
  *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
- *       -o /tmp/auth_host_test tests/auth_host_test.c kernel/auth.c
+ *       -o /tmp/auth_host_test tests/auth_host_test.c kernel/auth.c \
+ *       kernel/secure_api.c
  *   /tmp/auth_host_test
+ *
+ * kernel/secure_api.c added for Architectural Phase 4 (account passwords --
+ * auth.c now calls its derive_user_key()). This comment previously fell out
+ * of sync with the actual command used to verify that phase by hand; caught
+ * by tests/run_all.sh (Operational Phase A) actually running this comment's
+ * command instead of a person's memory of it, which is the whole reason
+ * that script reads the command from here rather than hardcoding its own copy.
  */
 #include "kernel/auth.h"
 #include <stdio.h>
