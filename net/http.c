@@ -3,6 +3,7 @@
 #include "net.h"
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
+#include "../kernel/net_event.h"  // Architectural Phase 1 -- net_event_hlt_wait() for the multiplexed HTTP loop
 #include "../kernel/object_catalog.h"
 #include "../kernel/transaction.h"
 #include "../kernel/microkernel.h"
@@ -1376,14 +1377,55 @@ static void sql_row_to_json_cb(struct RowId id, const struct RowValues* v, void*
     jb_arr_close(ctx->j);
 }
 // ─── Kernel-Side Shell Refactor (docs/AeroSLS-Web-Terminal-Plan-v0.1.md §10.4) ─
-// extern, not a new header -- matches how kernel.c declares sls_shell_loop()
-// today (a plain extern at the one call site, no shell.h for one function).
-extern int sls_shell_execute(const char* input, char* out_buf, size_t out_cap);
+// Now a real header (user/shell.h), not a bare extern -- Architectural
+// Phase 2 (docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md) added a struct
+// passed by pointer across this translation-unit boundary, and that needs
+// an identical layout on both sides, which only a shared header guarantees.
+#include "../user/shell.h"
 
 // Must match the constant of the same name in user/shell.c's sls_shell_loop()
 // -- no shared header exists for this one value, so both copies carry this
 // cross-reference instead (see shell.c's own comment on the same constant).
 #define SHELL_EXEC_OUT_CAP 8192
+
+// ─── Architectural Phase 2: one ShellSession per authenticated uid ───────────
+// Replaces the single shared, global shell.c session this route used to run
+// every caller through regardless of who they were (see the superseded
+// comment this replaced, below, and shell.h's comment for the full
+// rationale). Sized off AUTH_MAX_TOKENS since that's already this
+// codebase's cap on distinct concurrently-valid identities.
+#define HTTP_SHELL_SESSION_MAX AUTH_MAX_TOKENS
+static struct ShellSession http_shell_sessions[HTTP_SHELL_SESSION_MAX];
+static uint8_t             http_shell_session_used[HTTP_SHELL_SESSION_MAX];
+static uint32_t            http_shell_session_uid[HTTP_SHELL_SESSION_MAX];
+
+// Finds (or lazily creates) the persistent ShellSession for `uid`, so a
+// `tx begin` on one HTTP request is found by `tx commit` on a later one --
+// necessary because Phase 1 makes every HTTP request its own short-lived TCP
+// connection, so there's no connection to hang session state off of instead.
+// Two different uids can never collide since uid is both the lookup key and
+// (in api_shell_exec_post() below) reseeded from the bearer token on every
+// call rather than trusted from anything stored. Returns 0 if the table is
+// full (HTTP_SHELL_SESSION_MAX concurrent distinct identities all with an
+// in-progress shell session at once) -- not expected at MVP scale, but
+// handled rather than silently reusing the wrong slot.
+static struct ShellSession* http_shell_session_for(uint32_t uid) {
+    for (int i = 0; i < HTTP_SHELL_SESSION_MAX; i++) {
+        if (http_shell_session_used[i] && http_shell_session_uid[i] == uid)
+            return &http_shell_sessions[i];
+    }
+    for (int i = 0; i < HTTP_SHELL_SESSION_MAX; i++) {
+        if (!http_shell_session_used[i]) {
+            http_shell_session_used[i] = 1;
+            http_shell_session_uid[i]  = uid;
+            http_shell_sessions[i].uid = uid;
+            http_shell_sessions[i].gid = uid;  // no per-request gid to seed from; cosmetic only, see shell.h
+            http_shell_sessions[i].tx_id = 0;
+            return &http_shell_sessions[i];
+        }
+    }
+    return 0;
+}
 
 // Runs the FULL ~90-command shell.c dispatch, not a curated subset -- this
 // is what closes every command on §3's "Missing" list (login, role set,
@@ -1391,18 +1433,19 @@ extern int sls_shell_execute(const char* input, char* out_buf, size_t out_cap);
 // upload, load, loader list, svc crash/restart, proc kill, ipc post/stat,
 // journal create/purge, tier demote/promote, vfree, workflow addstep,
 // webapp set/list/append) without 24 individual new routes -- see §10.6.
-// req_uid is unused: shell session state (current_session_uid/gid/
-// current_tx_id) is shared, global, file-scope state in shell.c, the same
-// single-simulated-machine model this app already has everywhere else
-// (one DEMO_TOKEN, no per-request session) -- see §10.3.
 static int api_shell_exec_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    (void)req_uid;
+    struct ShellSession* sess = http_shell_session_for(req_uid);
+    if (!sess) {
+        jb_obj_open(&j,0); jb_str(&j,"error","too many concurrent shell sessions"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    sess->uid = req_uid;  // always reseed identity from the bearer token, never trust stored state
     char command[256];
     json_str(body, "command", command, sizeof(command));
     static char shell_out[SHELL_EXEC_OUT_CAP];
-    int recognized = sls_shell_execute(command, shell_out, sizeof(shell_out));
+    int recognized = sls_shell_execute(command, sess, shell_out, sizeof(shell_out));
     jb_obj_open(&j, 0);
     jb_str(&j, "ok", recognized ? "true" : "false"); jb_putc(&j, ',');
     jb_str_multiline(&j, "output", shell_out);
@@ -2902,6 +2945,75 @@ static void http_route(int conn, char* req) {
 }
 
 // ─── HTTP server main loop ────────────────────────────────────────────────────
+//
+// Architectural Phase 1 (docs/AeroSLS-Architectural-MVP-Roadmap-v0.1.md).
+//
+// This used to be a single blocking loop: tcp_accept() ONE connection, then
+// tcp_recv() that same connection until its request was complete, dispatch,
+// close, repeat. Any client that opened a connection and stalled -- slow
+// upload, or just never sending anything -- froze every other client
+// indefinitely, because there was only one execution path through this
+// function and it was parked inside that one connection's tcp_recv().
+//
+// tcp_conns[] (net/tcp.c) already tracks up to TCP_MAX_CONNS connections
+// independently -- packets for every connection get demuxed into the right
+// slot's receive ring buffer by tcp_handle_segment(), which runs off the
+// timer IRQ via net_poll_tick(), completely independent of what this loop
+// happens to be doing. So the fix is entirely in this loop: poll every
+// connection each sweep instead of committing to one at a time. No change
+// needed in tcp.c.
+//
+// Request dispatch (http_route()) still runs one request fully to
+// completion before moving to the next connection's request -- this fixes
+// I/O concurrency (many clients can be mid-request at once without blocking
+// each other), not kernel-state concurrency (two requests never execute
+// interleaved). That distinction is deliberate: it's what lets this ship
+// without touching lock_mgr.c or any of the ~40 kernel subsystems for
+// thread-safety. Making per-request identity/transaction state safe under
+// this concurrency is Phase 2 (session/tx globals in user/shell.c), which
+// must land alongside or immediately after this.
+
+#define HTTP_REQ_BUF_SZ         65536  // unchanged cap from the old single-buffer version
+// ~10s at the timer's documented ~100 Hz (kernel/auth.c's AUTH_TOKEN_TTL_TICKS
+// comment establishes the same tick-rate reasoning) -- long enough for a real
+// slow client, short enough that an abandoned half-open connection doesn't
+// tie up one of only TCP_MAX_CONNS (8) slots indefinitely. That's a new
+// failure mode this loop introduces (the old loop had no notion of "wasted
+// slot" since it only ever tracked one connection at a time) and needs a
+// guard now that many connections can be tracked at once.
+#define HTTP_IDLE_TIMEOUT_TICKS  1000
+
+struct HttpConnState {
+    uint8_t  in_use;   // 1 while we're accumulating this connection's request
+    int      len;
+    uint64_t last_activity_tick;
+    char     buf[HTTP_REQ_BUF_SZ];
+};
+// Indexed directly by tcp_conns[] slot index (conn_id) -- avoids any separate
+// allocation bookkeeping, since conn_id is already the stable identity tcp.c
+// hands out for the lifetime of a connection.
+static struct HttpConnState http_conns[TCP_MAX_CONNS];
+
+// Returns 1 once buf[0..len) holds a complete HTTP request (full headers,
+// and full body per Content-Length if one is present), or once `len` has
+// reached `cap - 1` and we have to dispatch whatever we've got rather than
+// overflow. Extracted, unchanged in behavior, from the old single-connection
+// accumulation loop so every tracked connection can run the same check.
+static int http_request_ready(const char* buf, int len, int cap) {
+    const char* body_start = str_find(buf, "\r\n\r\n");
+    if (!body_start) return len >= cap - 1;
+    const char* cl = str_find(buf, "Content-Length:");
+    if (!cl) cl = str_find(buf, "content-length:");
+    if (!cl) return 1;  // headers complete, no body expected
+    int clen = 0;
+    const char* cp = cl + 15;
+    while (*cp == ' ') cp++;
+    while (*cp >= '0' && *cp <= '9') { clen = clen * 10 + (*cp++ - '0'); }
+    int hdr_end = (int)(body_start - buf) + 4;
+    if (len >= hdr_end + clen) return 1;
+    return len >= cap - 1;
+}
+
 void http_server_run(void) {
     tcp_init();
     int listen_fd = tcp_listen(NET_HTTP_PORT);
@@ -2913,38 +3025,66 @@ void http_server_run(void) {
                          "GET http://10.0.2.15:3000/api/scan\n",
                          NET_HTTP_PORT);
 
-    static char req_buf[65536];  // 64 KiB — fits a 16 KiB binary chunk (32 KiB hex) + headers
+    for (int i = 0; i < TCP_MAX_CONNS; i++) http_conns[i].in_use = 0;
 
     for (;;) {
-        int conn = tcp_accept(listen_fd);
-        if (conn < 0) continue;
+        int did_work = 0;
 
-        /* Accumulate the full HTTP request, respecting Content-Length. */
-        int rlen = 0;
-        for (;;) {
-            int got = tcp_recv(conn, req_buf + rlen,
-                               (uint16_t)(sizeof(req_buf) - 1 - rlen));
-            if (got <= 0) break;
-            rlen += got;
-            req_buf[rlen] = '\0';
-            /* Must have complete headers before we can parse Content-Length. */
-            const char *body_start = str_find(req_buf, "\r\n\r\n");
-            if (!body_start) { if (rlen < (int)(sizeof(req_buf) - 1)) continue; else break; }
-            /* No Content-Length → GET / HEAD / no body; done. */
-            const char *cl = str_find(req_buf, "Content-Length:");
-            if (!cl) cl = str_find(req_buf, "content-length:");
-            if (!cl) break;
-            int clen = 0;
-            const char *cp = cl + 15;
-            while (*cp == ' ') cp++;
-            while (*cp >= '0' && *cp <= '9') { clen = clen * 10 + (*cp++ - '0'); }
-            int hdr_end = (int)(body_start - req_buf) + 4;
-            if (rlen >= hdr_end + clen) break;  /* full body received */
-            if (rlen >= (int)(sizeof(req_buf) - 1)) break;  /* buffer full */
+        // Opportunistically pick up any newly-ESTABLISHED connection we
+        // aren't already tracking -- the same scan tcp_accept() itself did,
+        // just one non-blocking pass instead of a spin/hlt-wait loop.
+        for (int i = 0; i < TCP_MAX_CONNS; i++) {
+            if (i == listen_fd) continue;
+            struct TCPConn* c = &tcp_conns[i];
+            if (c->active && c->local_port == tcp_conns[listen_fd].local_port &&
+                c->state == TCP_ESTABLISHED && !http_conns[i].in_use) {
+                http_conns[i].in_use = 1;
+                http_conns[i].len   = 0;
+                http_conns[i].last_activity_tick = kernel_tick_counter;
+                did_work = 1;
+            }
         }
-        if (rlen > 0) {
-            http_route(conn, req_buf);
+
+        // Advance every connection currently accumulating a request.
+        for (int i = 0; i < TCP_MAX_CONNS; i++) {
+            if (!http_conns[i].in_use) continue;
+            struct HttpConnState* hc = &http_conns[i];
+            struct TCPConn* c = &tcp_conns[i];
+
+            if (c->rbuf_used > 0) {
+                int space = (int)sizeof(hc->buf) - 1 - hc->len;
+                if (space > 0) {
+                    int got = tcp_recv(i, hc->buf + hc->len, (uint16_t)space);
+                    if (got > 0) {
+                        hc->len += got;
+                        hc->buf[hc->len] = '\0';
+                        hc->last_activity_tick = kernel_tick_counter;
+                    }
+                }
+                did_work = 1;
+            }
+
+            int peer_done = (!c->active || c->state == TCP_CLOSE_WAIT || c->state == TCP_CLOSED);
+            int ready = hc->len > 0 && http_request_ready(hc->buf, hc->len, (int)sizeof(hc->buf));
+
+            if (ready || (peer_done && c->rbuf_used == 0)) {
+                did_work = 1;
+                if (hc->len > 0) http_route(i, hc->buf);
+                tcp_close(i);
+                hc->in_use = 0;
+                continue;
+            }
+
+            if (kernel_tick_counter - hc->last_activity_tick > HTTP_IDLE_TIMEOUT_TICKS) {
+                did_work = 1;
+                tcp_close(i);
+                hc->in_use = 0;
+            }
         }
-        tcp_close(conn);
+
+        // Nothing needed attention anywhere this sweep -- halt until the
+        // next timer tick instead of busy-spinning (same idiom tcp_accept()/
+        // tcp_recv() used before; see kernel/net_event.h).
+        if (!did_work) net_event_hlt_wait();
     }
 }

@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include "shell.h"
 #include "permissions.h"
 #include "../kernel/syscall_dispatch.h"
 #include "../kernel/object_catalog.h"
@@ -36,9 +37,11 @@ struct SLSAllocationRequest {
 };
 
 // ─── Session State ────────────────────────────────────────────────────────────
-static uint32_t current_session_uid = 1000;
-static uint32_t current_session_gid = 1000;
-static uint64_t current_tx_id       = 0;    // 0 = no open transaction
+// Architectural Phase 2: the one persistent session for the physical serial
+// console, which by definition has exactly one user at a time -- see
+// shell.h's comment for why this is no longer file-scope-global state that
+// every caller (including HTTP requests) shared.
+static struct ShellSession serial_session = { .uid = 1000, .gid = 1000, .tx_id = 0 };
 
 // ─── String helpers (freestanding) ───────────────────────────────────────────
 static int sh_starts(const char* s, const char* prefix) {
@@ -339,9 +342,20 @@ static int shell_index_scan_cb(const char* k, const char* v) {
 // unrecognized non-empty command (out_buf holds the "Unknown command: ..."
 // message) or for empty/whitespace input (out_buf is empty, matching the
 // loop's own long-standing silent no-op for a blank line).
-int sls_shell_execute(const char* input_buffer, char* out_buf, size_t out_cap) {
+int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
+                      char* out_buf, size_t out_cap) {
     int recognized = 1;
     kernel_serial_capture_start(out_buf, out_cap);
+
+    // Architectural Phase 2: local copies of what used to be file-scope
+    // globals, named identically on purpose -- every read/write of
+    // current_session_uid/gid/current_tx_id in the ~1400 lines below is
+    // unchanged and now binds to these caller-supplied locals instead,
+    // with zero edits needed at any of those call sites. Written back to
+    // *sess just before returning, below.
+    uint32_t current_session_uid = sess->uid;
+    uint32_t current_session_gid = sess->gid;
+    uint64_t current_tx_id       = sess->tx_id;
 
         // ── help ──────────────────────────────────────────────────────────────
         if (sh_eq(input_buffer, "help")) {
@@ -1796,6 +1810,12 @@ int sls_shell_execute(const char* input_buffer, char* out_buf, size_t out_cap) {
             recognized = 0;
         }
 
+    // Architectural Phase 2: persist any mutation (login, tx begin/commit/
+    // rollback) back into the caller's session before returning.
+    sess->uid   = current_session_uid;
+    sess->gid   = current_session_gid;
+    sess->tx_id = current_tx_id;
+
     kernel_serial_capture_stop();
     return recognized;
 }
@@ -1814,14 +1834,14 @@ void sls_shell_loop(void) {
     kernel_serial_print("Type 'help' for available commands.\n\n");
 
     while (1) {
-        if (current_tx_id)
-            kernel_serial_printf("uid:%u[tx:%lu]> ", current_session_uid,
-                                 current_tx_id);
+        if (serial_session.tx_id)
+            kernel_serial_printf("uid:%u[tx:%lu]> ", serial_session.uid,
+                                 serial_session.tx_id);
         else
-            kernel_serial_printf("uid:%u> ", current_session_uid);
+            kernel_serial_printf("uid:%u> ", serial_session.uid);
 
         read_line(input_buffer);
-        sls_shell_execute(input_buffer, output_buffer, sizeof(output_buffer));
+        sls_shell_execute(input_buffer, &serial_session, output_buffer, sizeof(output_buffer));
         kernel_serial_print(output_buffer);
     }
 }
