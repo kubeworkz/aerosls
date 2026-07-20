@@ -868,29 +868,29 @@ static int api_programs_list(char* buf, int max) {
     return j.pos;
 }
 
-// ─── GET /api/timi/<name> — Gap Remediation Phase G ────────────────────────────
-// Structured counterpart to loader_timi_info()'s own console dump -- reads
-// through loader_timi_info_query() directly (the same real logic
-// loader_timi_info() itself now wraps, see loader.c's own comment), not the
-// SYS_SLS_TIMI_INFO syscall -- matching Phase B/C/F's established "read
+// ─── GET /api/simi/<name> — Gap Remediation Phase G ────────────────────────────
+// Structured counterpart to loader_simi_info()'s own console dump -- reads
+// through loader_simi_info_query() directly (the same real logic
+// loader_simi_info() itself now wraps, see loader.c's own comment), not the
+// SYS_SLS_SIMI_INFO syscall -- matching Phase B/C/F's established "read
 // kernel state / call the query function directly for a JSON response
 // rather than repurposing a console-dump-shaped syscall" precedent.
-static int api_timi_info(const char* name, char* buf, int max) {
+static int api_simi_info(const char* name, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
-    struct TimiInfoResult r;
-    loader_timi_info_query(name, &r);
+    struct SimiInfoResult r;
+    loader_simi_info_query(name, &r);
 
     jb_obj_open(&j, 0);
     jb_str(&j, "name", name); jb_putc(&j, ',');
     const char* status_str =
-        r.status == TIMI_INFO_STATUS_OK        ? "ok" :
-        r.status == TIMI_INFO_STATUS_NOT_FOUND ? "not_found" :
-        r.status == TIMI_INFO_STATUS_NOT_TIMI  ? "not_timi" : "corrupt";
+        r.status == SIMI_INFO_STATUS_OK        ? "ok" :
+        r.status == SIMI_INFO_STATUS_NOT_FOUND ? "not_found" :
+        r.status == SIMI_INFO_STATUS_NOT_SIMI  ? "not_simi" : "corrupt";
     jb_str(&j, "status", status_str);
-    if (r.status == TIMI_INFO_STATUS_NOT_TIMI) {
+    if (r.status == SIMI_INFO_STATUS_NOT_SIMI) {
         jb_putc(&j, ','); jb_str(&j, "format", r.format_name);
     }
-    if (r.status == TIMI_INFO_STATUS_OK) {
+    if (r.status == SIMI_INFO_STATUS_OK) {
         jb_putc(&j, ',');
         jb_uint(&j, "num_instr",    r.num_instr);    jb_putc(&j, ',');
         jb_uint(&j, "num_literals", r.num_literals);  jb_putc(&j, ',');
@@ -1151,7 +1151,7 @@ static void http_respond_program_binary(int conn, struct ServiceBinary* sb) {
     while (*cd) hdr[hp++] = *cd++;
     const char* fn = sb->object_name; while (*fn) hdr[hp++] = *fn++;
     hdr[hp++] = '"'; hdr[hp++] = '\r'; hdr[hp++] = '\n';
-    /* X-Binary-Format header so the downloader knows ELF vs flat vs TIMI */
+    /* X-Binary-Format header so the downloader knows ELF vs flat vs SIMI */
     const char* xbf = "X-Binary-Format: ";
     while (*xbf) hdr[hp++] = *xbf++;
     const char* fmt = binary_format_name(sb);
@@ -2243,9 +2243,9 @@ static void http_route(int conn, char* req) {
             blen = api_partition_quotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        // ── Gap Remediation Phase G: GET /api/timi/<name> ──────────────────────
-        if (str_find(path, "/api/timi/") == path) {
-            blen = api_timi_info(path + 10, resp_body, (int)sizeof(resp_body));
+        // ── Gap Remediation Phase G: GET /api/simi/<name> ──────────────────────
+        if (str_find(path, "/api/simi/") == path) {
+            blen = api_simi_info(path + 10, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Gap Remediation Phase B: GET /api/tables[/<name>/schema] ──────────

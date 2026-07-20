@@ -69,7 +69,7 @@ int main(void) {
      * path is genuinely exempt from quota enforcement — setting an
      * aggressively low quota on PARTITION_SYSTEM must not block it, since
      * every pre-Phase-13 kernel-infrastructure caller (page-table walkers,
-     * NVMe queues, SMP stacks, the TIMI activation cache, catalog index
+     * NVMe queues, SMP stacks, the SIMI activation cache, catalog index
      * nodes) goes through this path and none of them were touched by this
      * phase's changes — see frame_pool.h's header comment. ───────────────── */
     CHECK(partition_set_frame_quota(PARTITION_SYSTEM, 1) == 0, "scenario 4: set an aggressively low quota (1) on PARTITION_SYSTEM");

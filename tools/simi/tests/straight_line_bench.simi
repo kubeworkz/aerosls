@@ -1,0 +1,26 @@
+; straight_line_bench.simi — Gap Remediation SIMI Phase 11 verification:
+; a straight-line, loop-free, call-free basic block with six simultaneously
+; live values (more than the x86 allocator's 4-register pool), exercising
+; both real allocation AND the spill-when-exhausted path in one program.
+; r0..r5 are all independent LOADIs, none consumed until the combining
+; expression at the end -- the "worst case" register-pressure shape for a
+; linear-scan allocator, deliberately chosen over a left-to-right reduction
+; (which never needs more than 2 live values at once and wouldn't exercise
+; the pool at all).
+; Expected result: 21
+.entry main
+main:
+    ENTER #12
+    LOADI r0, #1, i32
+    LOADI r1, #2, i32
+    LOADI r2, #3, i32
+    LOADI r3, #4, i32
+    LOADI r4, #5, i32
+    LOADI r5, #6, i32
+    ADD r6, r0, r1, i32
+    ADD r7, r2, r3, i32
+    ADD r8, r4, r5, i32
+    ADD r9, r6, r7, i32
+    ADD r10, r9, r8, i32
+    MOV r0, r10, i32
+    RET

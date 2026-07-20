@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "process.h"
-#include "timi_translate.h"   // Gap Remediation Phase G -- struct TimiActivationStatus
+#include "simi_translate.h"   // Gap Remediation Phase G -- struct SimiActivationStatus
 
 // ─── Binary store ─────────────────────────────────────────────────────────────
 #define LOADER_MAX_BINARY_SIZE  16384   // 16 KiB per service binary (reduced from 64)
@@ -17,7 +17,7 @@ struct ServiceBinary {
     uint32_t size;        // bytes written so far
     uint8_t  active;
     uint8_t  is_elf;      // detected on first write
-    uint8_t  is_timi;     // detected on first write — see TIMI section below
+    uint8_t  is_simi;     // detected on first write — see SIMI section below
 };
 
 // ─── Minimal ELF64 structures ─────────────────────────────────────────────────
@@ -59,31 +59,31 @@ struct ELF64ProgramHeader {
     uint64_t p_align;
 } __attribute__((packed));
 
-// ─── TIMI object format (AeroSLS-TIMI-ISA-v0.1.md, Phase 2; v0.3 Phase 6) ────
-// A TIMI-format binary is the flat .tmo container produced by the Phase 1
-// host toolchain (timi-asm): a header of five little-endian u32 fields,
+// ─── SIMI object format (AeroSLS-SIMI-ISA-v0.1.md, Phase 2; v0.3 Phase 6) ────
+// A SIMI-format binary is the flat .tmo container produced by the Phase 1
+// host toolchain (simi-asm): a header of five little-endian u32 fields,
 // followed by the instruction stream, the literal pool, the entry-point
 // table, and (v0.3) the object-name pool, back to back. This struct layout
-// is byte-for-byte identical to `TimiObject`'s on-disk form in the host
-// tool's timi_isa.h/timi_obj.c — a .tmo produced there can be uploaded via
+// is byte-for-byte identical to `SimiObject`'s on-disk form in the host
+// tool's simi_isa.h/simi_obj.c — a .tmo produced there can be uploaded via
 // SYS_SLS_UPLOAD_BINARY unmodified.
 //
-// v0.3 (Phase 6) adds num_names + TimiNameRec, breaking the v0.2 16-byte
-// header (see timi_isa.h's top comment for why this was a clean bump
+// v0.3 (Phase 6) adds num_names + SimiNameRec, breaking the v0.2 16-byte
+// header (see simi_isa.h's top comment for why this was a clean bump
 // rather than a back-compat shim) — every .tmo in this project is
 // regenerated from source by the same toolchain, so there is nothing else
 // to keep compatible with.
 //
-// TIMI bytecode is never executed directly (ISA spec design principle #1:
+// SIMI bytecode is never executed directly (ISA spec design principle #1:
 // "never interpreted, always translated"). loader_load_into_process()
-// detects and validates a TIMI payload, then hands it to
-// timi_translate_and_map() (kernel/timi_translate.c, Phase 3) to be
+// detects and validates a SIMI payload, then hands it to
+// simi_translate_and_map() (kernel/simi_translate.c, Phase 3) to be
 // translated to real x86-64 machine code and mapped executable — the
 // bytecode words themselves are never mapped or run as-is.
-#define TIMI_MAGIC          0x314D4954u   // "TIM1", matches timi_isa.h TIMI_MAGIC
-#define TIMI_ENTRY_NAME_LEN 32            // matches host tool's TIMI_MAX_NAME
+#define SIMI_MAGIC          0x314D4954u   // "TIM1", matches simi_isa.h SIMI_MAGIC
+#define SIMI_ENTRY_NAME_LEN 32            // matches host tool's SIMI_MAX_NAME
 
-struct TimiObjectHeader {
+struct SimiObjectHeader {
     uint32_t magic;
     uint32_t num_instr;
     uint32_t num_literals;
@@ -91,89 +91,89 @@ struct TimiObjectHeader {
     uint32_t num_names;    // v0.3
 } __attribute__((packed));
 
-struct TimiEntryRec {
-    char     name[TIMI_ENTRY_NAME_LEN];
+struct SimiEntryRec {
+    char     name[SIMI_ENTRY_NAME_LEN];
     uint32_t offset;   // instruction index
 } __attribute__((packed));
 
 // v0.3 (Phase 6): object-name pool entry, referenced by RESOLVE's operand.
-// Same 32-byte fixed-slot shape as TimiEntryRec, matches timi_isa.h's
-// TimiName / timi_x86.h's TxNameRec.
-struct TimiNameRec {
-    char name[TIMI_ENTRY_NAME_LEN];
+// Same 32-byte fixed-slot shape as SimiEntryRec, matches simi_isa.h's
+// SimiName / simi_x86.h's TxNameRec.
+struct SimiNameRec {
+    char name[SIMI_ENTRY_NAME_LEN];
 } __attribute__((packed));
 
-// Validates a TIMI payload sitting in `data` (size `size` bytes): checks the
+// Validates a SIMI payload sitting in `data` (size `size` bytes): checks the
 // magic number and that the header's declared instr/literal/entry counts
 // actually fit inside `size` (a corrupt or truncated header could otherwise
 // claim a huge instruction count and walk off the end of the buffer).
 // On success, fills `out_hdr` and returns 1. Returns 0 and leaves `out_hdr`
 // untouched on any failure.
-int  timi_validate(const uint8_t* data, uint32_t size, struct TimiObjectHeader* out_hdr);
+int  simi_validate(const uint8_t* data, uint32_t size, struct SimiObjectHeader* out_hdr);
 
-// Prints a loader_list()-style report for one TIMI object: header counts,
+// Prints a loader_list()-style report for one SIMI object: header counts,
 // exported entry-point names, and (since Phase 3 doesn't exist yet) a
 // reminder that it can't be spawned. Gap Remediation Phase G: now a thin
-// wrapper over loader_timi_info_query() below (single source of truth)
+// wrapper over loader_simi_info_query() below (single source of truth)
 // rather than its own independent parse.
-void loader_timi_info(const char* object_name);
+void loader_simi_info(const char* object_name);
 
 // Shared by loader_list() and the three net/http.c format-string sites so
-// TIMI uploads report correctly everywhere instead of falling through to
+// SIMI uploads report correctly everywhere instead of falling through to
 // the ELF/flat ternary and showing up mislabeled as "flat".
 const char* binary_format_name(const struct ServiceBinary* sb);
 
-// ─── Gap Remediation Phase G: structured TIMI introspection ───────────────────
-// Before this phase, loader_timi_info() only ever kernel_serial_printf'd its
+// ─── Gap Remediation Phase G: structured SIMI introspection ───────────────────
+// Before this phase, loader_simi_info() only ever kernel_serial_printf'd its
 // findings -- no caller (HTTP, syscall, or otherwise) could get the data back
-// structurally. TIMI_INFO_MAX_ENTRIES/NAMES caps this project's usual "16"
+// structurally. SIMI_INFO_MAX_ENTRIES/NAMES caps this project's usual "16"
 // fixed-array convention (matches ROW_JOURNAL_MAX_ENTRIES, BTREE_MAX_DUPES_
 // PER_KEY, etc.) -- a real object with more than 16 entries or names is
 // reported truncated (entries_truncated/names_truncated), not silently cut
 // off with no signal, same "denial looks like absence" carefulness as every
 // other capped-array result in this project (see row_index.h's
 // row_index_lookup_checked() for the precedent this mirrors).
-#define TIMI_INFO_STATUS_OK        0
-#define TIMI_INFO_STATUS_NOT_FOUND 1   // no such uploaded object
-#define TIMI_INFO_STATUS_NOT_TIMI  2   // object exists but isn't a TIMI upload
-#define TIMI_INFO_STATUS_CORRUPT   3   // TIMI magic present but header validation failed
+#define SIMI_INFO_STATUS_OK        0
+#define SIMI_INFO_STATUS_NOT_FOUND 1   // no such uploaded object
+#define SIMI_INFO_STATUS_NOT_SIMI  2   // object exists but isn't a SIMI upload
+#define SIMI_INFO_STATUS_CORRUPT   3   // SIMI magic present but header validation failed
 
-#define TIMI_INFO_MAX_ENTRIES 16
-#define TIMI_INFO_MAX_NAMES   16
+#define SIMI_INFO_MAX_ENTRIES 16
+#define SIMI_INFO_MAX_NAMES   16
 
-struct TimiInfoResult {
-    uint32_t status;                 // TIMI_INFO_STATUS_*
-    char     format_name[16];        // filled on NOT_TIMI (binary_format_name()'s string)
+struct SimiInfoResult {
+    uint32_t status;                 // SIMI_INFO_STATUS_*
+    char     format_name[16];        // filled on NOT_SIMI (binary_format_name()'s string)
     uint32_t num_instr, num_literals, num_entries, num_names;   // raw header counts
-    struct TimiEntryRec entries[TIMI_INFO_MAX_ENTRIES];
+    struct SimiEntryRec entries[SIMI_INFO_MAX_ENTRIES];
     uint32_t entries_returned;
-    uint8_t  entries_truncated;      // 1 if num_entries > TIMI_INFO_MAX_ENTRIES
-    struct TimiNameRec  names[TIMI_INFO_MAX_NAMES];
+    uint8_t  entries_truncated;      // 1 if num_entries > SIMI_INFO_MAX_ENTRIES
+    struct SimiNameRec  names[SIMI_INFO_MAX_NAMES];
     uint32_t names_returned;
-    uint8_t  names_truncated;        // 1 if num_names > TIMI_INFO_MAX_NAMES
-    struct TimiActivationStatus activation;
+    uint8_t  names_truncated;        // 1 if num_names > SIMI_INFO_MAX_NAMES
+    struct SimiActivationStatus activation;
 };
 
-// Fills *out with the same data loader_timi_info() prints, structurally.
+// Fills *out with the same data loader_simi_info() prints, structurally.
 // Always fills *out (status tells the caller what happened) -- never
 // leaves it uninitialized, same "no partial/garbage result" posture as
 // every other query function in this project. Returns 1 if status ==
-// TIMI_INFO_STATUS_OK, 0 otherwise (mirrors timi_activation_query()'s
+// SIMI_INFO_STATUS_OK, 0 otherwise (mirrors simi_activation_query()'s
 // own 1/0-means-"was there real data" convention).
-int loader_timi_info_query(const char* object_name, struct TimiInfoResult* out);
+int loader_simi_info_query(const char* object_name, struct SimiInfoResult* out);
 
-struct SLSTimiInfoRequest {
+struct SLSSimiInfoRequest {
     char object_name[PROC_NAME_LEN];   // [in]
-    struct TimiInfoResult result;      // [out]
+    struct SimiInfoResult result;      // [out]
 };
 
-// Thin syscall wrapper -- returns 0 if result.status == TIMI_INFO_STATUS_OK,
+// Thin syscall wrapper -- returns 0 if result.status == SIMI_INFO_STATUS_OK,
 // 1 otherwise, matching this project's usual 0-success/1-failure convention
 // (the full detail is always in req->result.status regardless).
-uint64_t sys_sls_timi_info(struct SLSTimiInfoRequest* req);
+uint64_t sys_sls_simi_info(struct SLSSimiInfoRequest* req);
 
-#define SYS_SLS_TIMI_INFO 173   // Gap Remediation Phase G: now struct-based
-                                 // (struct SLSTimiInfoRequest*), not a raw
+#define SYS_SLS_SIMI_INFO 173   // Gap Remediation Phase G: now struct-based
+                                 // (struct SLSSimiInfoRequest*), not a raw
                                  // const char* object name -- confirmed via
                                  // direct repo-wide grep that nothing else
                                  // (no host test, no other kernel file, no
@@ -213,7 +213,7 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req);
 // partition_id (Phase 13, LPAR): the spawning process's partition, used to
 // quota-check the ELF64/flat segment frames this function allocates —
 // these are the per-binary, potentially-large frame allocations Phase 13
-// exists to cap. Unused for the TIMI branch (timi_translate_and_map()'s
+// exists to cap. Unused for the SIMI branch (simi_translate_and_map()'s
 // frames come from the shared, deliberately partition-agnostic activation
 // cache — see frame_pool.h's header comment).
 uint64_t loader_load_into_process(const char* object_name,

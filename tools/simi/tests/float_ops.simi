@@ -1,0 +1,87 @@
+; float_ops.simi — Gap Remediation SIMI Phase 10: exercises ADD/SUB/MUL/DIV/
+; NEG/CMP for both T_F64 and T_F32, plus IEEE-754 NaN unordered-compare
+; semantics for CMP. Self-checking: each CMP produces 0/1, all 17 checks are
+; summed as i32 so a single "Expected result:" comment can catch a wrong
+; answer in any one of them without needing 17 separate test programs.
+; Note: register indices stay under TX_MAX_REGS (64) — the x86 translator's
+; documented Phase 3 v1 narrowing (see simi_x86.h) — unlike the interpreter,
+; which has no such cap.
+; Expected result: 15
+.entry main
+main:
+    ENTER #48
+
+    ; ── f64: a=3.5, b=2.0 ──────────────────────────────────────────────
+    LOADI64 r0, #3.5f64, f64
+    LOADI64 r1, #2.0f64, f64
+    ADD r2, r0, r1, f64             ; 5.5
+    SUB r3, r0, r1, f64             ; 1.5
+    MUL r4, r0, r1, f64             ; 7.0
+    DIV r5, r0, r1, f64             ; 1.75
+    NEG r6, r0, f64                 ; -3.5
+
+    LOADI64 r7,  #5.5f64, f64
+    LOADI64 r8,  #1.5f64, f64
+    LOADI64 r9,  #7.0f64, f64
+    LOADI64 r10, #1.75f64, f64
+    LOADI64 r11, #-3.5f64, f64
+
+    CMP r12, r2, r7,  f64, EQ       ; add correct
+    CMP r13, r3, r8,  f64, EQ       ; sub correct
+    CMP r14, r4, r9,  f64, EQ       ; mul correct
+    CMP r15, r5, r10, f64, EQ       ; div correct
+    CMP r16, r6, r11, f64, EQ       ; neg correct
+    CMP r17, r0, r1,  f64, GT       ; 3.5 > 2.0
+    CMP r18, r1, r0,  f64, LT       ; 2.0 < 3.5
+    CMP r19, r0, r0,  f64, GE       ; reflexive
+    CMP r20, r0, r1,  f64, NE       ; 3.5 != 2.0
+
+    ; ── f32: a=3.5, b=2.0 ──────────────────────────────────────────────
+    LOADI64 r21, #3.5f32, f32
+    LOADI64 r22, #2.0f32, f32
+    ADD r23, r21, r22, f32          ; 5.5
+    SUB r24, r21, r22, f32          ; 1.5
+    MUL r25, r21, r22, f32          ; 7.0
+    DIV r26, r21, r22, f32          ; 1.75
+    NEG r27, r21, f32               ; -3.5
+
+    LOADI64 r28, #5.5f32, f32
+    LOADI64 r29, #1.5f32, f32
+    LOADI64 r30, #7.0f32, f32
+    LOADI64 r31, #1.75f32, f32
+    LOADI64 r32, #-3.5f32, f32
+
+    CMP r33, r23, r28, f32, EQ
+    CMP r34, r24, r29, f32, EQ
+    CMP r35, r25, r30, f32, EQ
+    CMP r36, r26, r31, f32, EQ
+    CMP r37, r27, r32, f32, EQ
+
+    ; ── NaN unordered-compare semantics (f64) ───────────────────────────
+    ; 0x7FF8000000000000 is a quiet NaN's raw bits, loaded as plain i64 and
+    ; reinterpreted as f64 by the CMP below (same bits, no conversion).
+    LOADI64 r38, #9221120237041090560, i64
+    CMP r39, r38, r0, f64, EQ       ; NaN == 3.5 must be 0
+    CMP r40, r38, r0, f64, NE       ; NaN != 3.5 must be 1 (NE = !EQ always)
+    CMP r41, r38, r0, f64, LT       ; NaN < 3.5 must be 0 (unordered, not true)
+
+    ; ── Sum every check (i32). All-pass total: 9 + 5 + (0 + 1 + 0) = 15. ─
+    ADD r42, r12, r13, i32
+    ADD r42, r42, r14, i32
+    ADD r42, r42, r15, i32
+    ADD r42, r42, r16, i32
+    ADD r42, r42, r17, i32
+    ADD r42, r42, r18, i32
+    ADD r42, r42, r19, i32
+    ADD r42, r42, r20, i32
+    ADD r42, r42, r33, i32
+    ADD r42, r42, r34, i32
+    ADD r42, r42, r35, i32
+    ADD r42, r42, r36, i32
+    ADD r42, r42, r37, i32
+    ADD r42, r42, r39, i32
+    ADD r42, r42, r40, i32
+    ADD r42, r42, r41, i32
+
+    MOV r0, r42, i32
+    RET

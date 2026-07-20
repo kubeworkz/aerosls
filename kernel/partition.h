@@ -1,6 +1,6 @@
 /*
  * partition.h — Phase 8 (v0.3) LPAR groundwork: partition-scoped single-
- * level store. See AeroSLS-TIMI-ISA-v0.1.md §15 for the design writeup.
+ * level store. See AeroSLS-SIMI-ISA-v0.1.md §15 for the design writeup.
  *
  * This is deliberately *groundwork*, not a hypervisor: there is one
  * physical kernel, one physical object_catalog[], one physical address
@@ -11,7 +11,7 @@
  * exactly), and the one comparison (object.partition_id vs. caller's
  * partition) that object_catalog.c's catalog_check_access() now performs
  * before any role-based logic runs. Every existing authority-checked call
- * path (DB select/insert/update/delete, grant/revoke, TIMI RESOLVE via
+ * path (DB select/insert/update/delete, grant/revoke, SIMI RESOLVE via
  * Phase 7) gets partition isolation for free through that one choke
  * point, without any of those call sites needing to know partitions
  * exist.
@@ -61,7 +61,7 @@ void partition_init(void);
 /* Defines a new partition, returns its id, or 0xFFFFFFFF if the table is
  * full or `name` doesn't fit PARTITION_NAME_LEN-1 bytes. Ids are handed
  * out as the table-slot index, so they're small and stable for a given
- * boot (no persistence yet — see AeroSLS-TIMI-ISA-v0.1.md §15's "what
+ * boot (no persistence yet — see AeroSLS-SIMI-ISA-v0.1.md §15's "what
  * Phase 8 deliberately did not do"). */
 uint32_t partition_create(const char* name);
 

@@ -1,0 +1,9 @@
+; add.simi — straight-line arithmetic. Expected result: 5
+.entry main
+main:
+    ENTER #4
+    LOADI r0, #2, i32
+    LOADI r1, #3, i32
+    ADD r2, r0, r1, i32
+    MOV r0, r2, i32
+    RET

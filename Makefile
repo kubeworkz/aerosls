@@ -35,9 +35,9 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/process.c arch/x86/user_paging.c \
               kernel/partition.c \
               kernel/loader.c \
-              kernel/timi_x86.c \
-              kernel/timi_runtime.c \
-              kernel/timi_translate.c \
+              kernel/simi_x86.c \
+              kernel/simi_runtime.c \
+              kernel/simi_translate.c \
               kernel/webapp.c \
               kernel/webapp_bundle.c \
               kernel/journal.c \
@@ -78,10 +78,13 @@ RV_CFLAGS   = -ffreestanding -O2 -Wall -Wextra -mcmodel=medany \
               -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections
 RV_LDFLAGS  = -T arch/riscv/linker_riscv.ld -nostdlib --gc-sections
 
-RV_ASM_SRC  = arch/riscv/boot_riscv.S arch/riscv/context_riscv.S arch/riscv/vector_state.S
+RV_ASM_SRC  = arch/riscv/boot_riscv.S arch/riscv/context_riscv.S arch/riscv/vector_state.S \
+              arch/riscv/trap_riscv.S
 RV_C_SRC    = kernel/kernel_riscv.c arch/riscv/walk_page_tables_riscv.c \
               kernel/frame_pool.c kernel/dashboard.c kernel/pte_migrate.c arch/riscv/sbi.c \
-              arch/riscv/plic.c arch/riscv/lazy_vector.c
+              arch/riscv/plic.c arch/riscv/lazy_vector.c \
+              kernel/simi_riscv.c kernel/object_catalog.c \
+              arch/riscv/user_paging_riscv.c arch/riscv/trap_riscv.c
 
 RV_OBJECTS  = $(RV_ASM_SRC:.S=.rv.o) $(RV_C_SRC:.c=.rv.o)
 RV_ELF      = sls_riscv_kernel.elf
@@ -183,17 +186,17 @@ user-programs: $(USER_BINS)
 
 .PHONY: user-programs
 
-# ── TIMI host toolchain ─────────────────────────────────────────────────────
-# Assembler/interpreter/disassembler/JIT-test for TIMI bytecode (tools/timi/).
-# Builds with the host cc — no cross-compiler needed. See tools/timi/README.md.
-timi-tools:
-	$(MAKE) -C tools/timi all
+# ── SIMI host toolchain ─────────────────────────────────────────────────────
+# Assembler/interpreter/disassembler/JIT-test for SIMI bytecode (tools/simi/).
+# Builds with the host cc — no cross-compiler needed. See tools/simi/README.md.
+simi-tools:
+	$(MAKE) -C tools/simi all
 
-timi-test: timi-tools
-	$(MAKE) -C tools/timi test
-	$(MAKE) -C tools/timi test-native
+simi-test: simi-tools
+	$(MAKE) -C tools/simi test
+	$(MAKE) -C tools/simi test-native
 
-.PHONY: timi-tools timi-test
+.PHONY: simi-tools simi-test
 
 bundle:
 	@echo "[BUNDLE] Generating kernel/webapp_bundle.c from slsos-sim/dist..."

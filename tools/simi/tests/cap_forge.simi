@@ -1,0 +1,55 @@
+; cap_forge.simi — Phase 7: capability/authority model (tagged, unforgeable
+; T_OBJREF references).
+;
+; Two paths to the SAME base_vaddr (0x2000 = "simi_add_test2" in every
+; environment's mock catalog — see simi_interp.c's g_mock_catalog):
+;   1. Legitimate: RESOLVE "simi_add_test2" -> r0, a real, tagged capability.
+;      OBJSIZE/OBJTYPE on it must return the real answers (303, type 1).
+;   2. Forged: LOADI r3, #8192 (0x2000), objref — declaring the TYPE field
+;      as objref does NOT make this a capability; it's just an integer that
+;      happens to equal a real object's address. No tag was ever set on r3
+;      (LOADI always clears the destination's tag). OBJSIZE/OBJTYPE on an
+;      untagged register must be rejected (0 / 0xFFFFFFFF) WITHOUT ever
+;      consulting the catalog about it — that's the actual security
+;      property Phase 7 adds; pre-Phase-7 this forged path would have
+;      returned the real object's size/type just like the legitimate one.
+;
+; Expected result: 3000304
+;   r1 = OBJSIZE(legit)  = 303
+;   r2 = OBJTYPE(legit)  = 1
+;   r8  = 1 iff OBJSIZE(forged) was correctly rejected (== 0)
+;   r10 = 1 iff OBJTYPE(forged) was correctly rejected (== 0xFFFFFFFF)
+;   result = r1 + r2 + r8*1000000 + r10*2000000
+;          = 303 + 1 + 1000000 + 2000000 = 3000304
+;   (if either rejection silently failed — i.e. the forged path leaked
+;   the real object's data — the corresponding million-scale term drops
+;   out and the result comes back nowhere near 3000304, impossible to
+;   mistake for a rounding difference.)
+
+.entry main
+main:
+    ENTER #16
+
+    ; ---- legitimate path ----
+    RESOLVE r0, "simi_add_test2"
+    OBJSIZE r1, r0, u64
+    OBJTYPE r2, r0, u64
+
+    ; ---- forged path ----
+    LOADI   r3, #8192, objref      ; same numeric value RESOLVE returned, but never tagged
+    OBJSIZE r4, r3, u64            ; must be rejected -> 0
+    OBJTYPE r5, r3, u64            ; must be rejected -> 0xFFFFFFFF
+
+    ; ---- check the rejections actually happened ----
+    LOADI   r9, #0, u64
+    CMP     r8, r4, r9, u64, EQ    ; r8 = (r4 == 0)
+    LOADI64 r6, #4294967295, u64
+    CMP     r10, r5, r6, u64, EQ  ; r10 = (r5 == 0xFFFFFFFF)
+
+    MUL     r11, r8, #1000000, u64
+    MUL     r12, r10, #2000000, u64
+
+    ADD     r13, r1, r2, u64
+    ADD     r14, r13, r11, u64
+    ADD     r0, r14, r12, u64
+    RET

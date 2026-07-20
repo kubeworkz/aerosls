@@ -1,0 +1,13 @@
+; rv64_boot_smoke.simi — Gap Remediation SIMI Phase 9 (sub-phase 9d): the
+; tiny program embedded into kernel/kernel_riscv.c's boot-time smoke test.
+; Deliberately trivial (no CALL, no memory, no RESOLVE) -- the point is to
+; prove simi_riscv_translate()'s OUTPUT is directly callable as real
+; machine code inside the actual freestanding RISC-V kernel binary, not
+; to exercise the translator's feature surface (that's tools/simi/tests/'s
+; job, and it already fully covers this same translator via rv64_exec.c).
+; Expected result: 42
+.entry main
+main:
+    ENTER #4
+    LOADI r0, #42, i32
+    RET

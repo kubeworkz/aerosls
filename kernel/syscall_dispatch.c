@@ -195,8 +195,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         loader_list(); return 0;
     // Gap Remediation Phase G: struct-based, replacing the old raw-string,
     // no-output-to-caller shape (see loader.h's own comment).
-    case SYS_SLS_TIMI_INFO:
-        return sys_sls_timi_info((struct SLSTimiInfoRequest*)arg);
+    case SYS_SLS_SIMI_INFO:
+        return sys_sls_simi_info((struct SLSSimiInfoRequest*)arg);
     case SYS_SLS_PROGRAM_SPAWN:
         return program_load((const char*)arg,
                             kernel_get_current_thread_id());

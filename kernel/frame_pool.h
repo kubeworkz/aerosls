@@ -15,7 +15,7 @@
  *     behavior. Every pre-Phase-13 caller (arch/{x86,riscv} page-table
  *     walkers, drivers/nvme*.c's controller queues, kernel/smp.c's AP
  *     bring-up stacks, kernel/lockfree_map.c's catalog index nodes,
- *     kernel/pte_migrate.c, kernel/timi_translate.c's shared activation
+ *     kernel/pte_migrate.c, kernel/simi_translate.c's shared activation
  *     cache) keeps compiling and behaving exactly as before, attributed to
  *     PARTITION_SYSTEM's usage counter for visibility but never
  *     quota-checked — the same "always-reachable regardless of partition"

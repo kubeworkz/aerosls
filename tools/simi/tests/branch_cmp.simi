@@ -1,0 +1,22 @@
+; branch_cmp.simi — exercises CMP relation codes and BC's INV modifier.
+; Expected result: 99
+.entry main
+main:
+    ENTER #8
+    LOADI r0, #5, i32
+    LOADI r1, #5, i32
+    CMP r2, r0, r1, i32, EQ
+    BC r2, is_equal
+    LOADI r0, #0, i32
+    RET
+is_equal:
+    LOADI r3, #1, i32
+    LOADI r4, #2, i32
+    CMP r5, r3, r4, i32, LT
+    BC r5, over, INV
+    LOADI r0, #99, i32
+    BR fin
+over:
+    LOADI r0, #0, i32
+fin:
+    RET

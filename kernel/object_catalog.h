@@ -14,7 +14,7 @@ typedef enum {
     OBJ_TYPE_WEB_APP          = 5,  // HTML/JS/CSS assets stored as key-value records
     OBJ_TYPE_JOURNAL          = 6,  // IBM i-style journal object
     OBJ_TYPE_PROGRAM          = 7,  // Executable program image: flat binary, ELF64,
-                                     // or TIMI bytecode (see loader.h — TIMI objects
+                                     // or SIMI bytecode (see loader.h — SIMI objects
                                      // aren't spawnable yet, pending the Phase 3
                                      // native translator)
     OBJ_TYPE_STREAM           = 8,  // Raw byte-stream "file" (read-only by default)

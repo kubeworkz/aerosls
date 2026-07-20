@@ -14,7 +14,7 @@
  * stub them. Still cheap enough to link and actually EXECUTE, giving
  * stronger verification than the compile-check-only precedent every prior
  * phase's kernel-side wiring has settled for (see
- * AeroSLS-TIMI-ISA-v0.1.md §15 for the write-up).
+ * AeroSLS-SIMI-ISA-v0.1.md §15 for the write-up).
  *
  * Not part of any Makefile target — a one-off verification artifact, built
  * and run directly:

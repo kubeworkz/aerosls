@@ -3,7 +3,7 @@
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "process.h"
-#include "timi_translate.h"
+#include "simi_translate.h"
 #include "../arch/x86/user_paging.h"
 #include "frame_pool.h"
 
@@ -53,27 +53,27 @@ static void ld_memcpy(void* d, const void* s, size_t n) {
     while (n--) *dd++ = *ss++;
 }
 
-// ─── TIMI object validation ────────────────────────────────────────────────────
+// ─── SIMI object validation ────────────────────────────────────────────────────
 // See loader.h for the format description. Bounds-checks the header's
 // declared counts against the actual buffer size before anything downstream
-// (loader_timi_info, and eventually the Phase 3 translator) walks the
+// (loader_simi_info, and eventually the Phase 3 translator) walks the
 // instruction/literal/entry arrays — a truncated or corrupted upload must
 // fail here, not read past the end of sb->data.
-int timi_validate(const uint8_t* data, uint32_t size, struct TimiObjectHeader* out_hdr) {
-    if (!data || !out_hdr || size < sizeof(struct TimiObjectHeader)) return 0;
+int simi_validate(const uint8_t* data, uint32_t size, struct SimiObjectHeader* out_hdr) {
+    if (!data || !out_hdr || size < sizeof(struct SimiObjectHeader)) return 0;
 
-    struct TimiObjectHeader hdr;
+    struct SimiObjectHeader hdr;
     ld_memcpy(&hdr, data, sizeof(hdr));
-    if (hdr.magic != TIMI_MAGIC) return 0;
+    if (hdr.magic != SIMI_MAGIC) return 0;
 
     // Compute the exact expected size and check it against what we actually
     // received. Do the arithmetic in 64-bit so a maliciously/corrupt large
     // count can't wrap a 32-bit sum back under `size` and slip past the check.
-    uint64_t expect = sizeof(struct TimiObjectHeader);
+    uint64_t expect = sizeof(struct SimiObjectHeader);
     expect += (uint64_t)hdr.num_instr    * 8;                        // uint64_t words
     expect += (uint64_t)hdr.num_literals * 8;                        // uint64_t words
-    expect += (uint64_t)hdr.num_entries  * sizeof(struct TimiEntryRec);
-    expect += (uint64_t)hdr.num_names    * sizeof(struct TimiNameRec); // v0.3
+    expect += (uint64_t)hdr.num_entries  * sizeof(struct SimiEntryRec);
+    expect += (uint64_t)hdr.num_names    * sizeof(struct SimiNameRec); // v0.3
 
     if (expect != (uint64_t)size) return 0;
 
@@ -84,7 +84,7 @@ int timi_validate(const uint8_t* data, uint32_t size, struct TimiObjectHeader* o
 // ─── binary_format_name ────────────────────────────────────────────────────────
 const char* binary_format_name(const struct ServiceBinary* sb) {
     if (!sb) return "?";
-    if (sb->is_timi) return "TIMI";
+    if (sb->is_simi) return "SIMI";
     if (sb->is_elf)  return "ELF64";
     return "flat";
 }
@@ -154,9 +154,9 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
 
     if (end > sb->size) sb->size = end;
 
-    // Detect ELF or TIMI magic on the first chunk. Mutually exclusive —
-    // ELF_MAGIC0 (0x7F) and TIMI_MAGIC's low byte ('1' = 0x31) never collide,
-    // but check ELF first and only fall through to TIMI if it didn't match,
+    // Detect ELF or SIMI magic on the first chunk. Mutually exclusive —
+    // ELF_MAGIC0 (0x7F) and SIMI_MAGIC's low byte ('1' = 0x31) never collide,
+    // but check ELF first and only fall through to SIMI if it didn't match,
     // matching the existing is_elf detection's structure.
     if (req->byte_offset == 0 && req->chunk_len >= 4) {
         sb->is_elf = (sb->data[0] == ELF_MAGIC0 &&
@@ -166,9 +166,9 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
         if (!sb->is_elf) {
             uint32_t magic;
             ld_memcpy(&magic, sb->data, 4);
-            sb->is_timi = (magic == TIMI_MAGIC);
+            sb->is_simi = (magic == SIMI_MAGIC);
         } else {
-            sb->is_timi = 0;
+            sb->is_simi = 0;
         }
     }
 
@@ -207,23 +207,23 @@ uint64_t loader_load_into_process(const char* object_name,
         return 0;
     }
 
-    // ── TIMI loader (Phase 3) ────────────────────────────────────────────────
-    // Validate, then hand off to timi_translate_and_map(), which runs the
-    // real x86-64 translator (kernel/timi_x86.c — byte-identical to the
-    // host toolchain's copy, verified there by timi-jit-test executing its
-    // output on real hardware; see AeroSLS-TIMI-ISA-v0.1.md §9) and maps
+    // ── SIMI loader (Phase 3) ────────────────────────────────────────────────
+    // Validate, then hand off to simi_translate_and_map(), which runs the
+    // real x86-64 translator (kernel/simi_x86.c — byte-identical to the
+    // host toolchain's copy, verified there by simi-jit-test executing its
+    // output on real hardware; see AeroSLS-SIMI-ISA-v0.1.md §9) and maps
     // the translated native code executable, exactly like the ELF64/flat
     // paths below map their bytes. Only `.entry main` is spawnable in this
-    // v1 — see timi_translate.c's header comment.
-    if (sb->is_timi) {
-        struct TimiObjectHeader hdr;
-        if (!timi_validate(sb->data, sb->size, &hdr)) {
+    // v1 — see simi_translate.c's header comment.
+    if (sb->is_simi) {
+        struct SimiObjectHeader hdr;
+        if (!simi_validate(sb->data, sb->size, &hdr)) {
             kernel_serial_printf(
-                "[LOADER] '%s': TIMI magic matched but header failed "
+                "[LOADER] '%s': SIMI magic matched but header failed "
                 "validation (corrupt or truncated upload).\n", object_name);
             return 0;
         }
-        return timi_translate_and_map(object_name, base_vaddr, pml4);
+        return simi_translate_and_map(object_name, base_vaddr, pml4);
     }
 
     // ── ELF64 loader ─────────────────────────────────────────────────────────
@@ -336,15 +336,15 @@ void loader_list(void) {
     kernel_serial_print("\n");
 }
 
-// ─── loader_timi_info_query ─────────────────────────────────────────────────
-// Gap Remediation Phase G: the real logic, extracted from loader_timi_info()
+// ─── loader_simi_info_query ─────────────────────────────────────────────────
+// Gap Remediation Phase G: the real logic, extracted from loader_simi_info()
 // (console version, below) so both the structured (syscall/HTTP) and
 // console callers share one source of truth instead of two independent
 // parses that could drift. Always fills *out (see loader.h's own comment on
 // the "no partial/garbage result" contract).
-int loader_timi_info_query(const char* object_name, struct TimiInfoResult* out) {
+int loader_simi_info_query(const char* object_name, struct SimiInfoResult* out) {
     if (!out) return 0;
-    out->status = TIMI_INFO_STATUS_NOT_FOUND;
+    out->status = SIMI_INFO_STATUS_NOT_FOUND;
     out->format_name[0] = '\0';
     out->num_instr = out->num_literals = out->num_entries = out->num_names = 0;
     out->entries_returned = 0; out->entries_truncated = 0;
@@ -362,77 +362,77 @@ int loader_timi_info_query(const char* object_name, struct TimiInfoResult* out) 
     }
     if (!sb) return 0;   // status already NOT_FOUND
 
-    if (!sb->is_timi) {
-        out->status = TIMI_INFO_STATUS_NOT_TIMI;
+    if (!sb->is_simi) {
+        out->status = SIMI_INFO_STATUS_NOT_SIMI;
         const char* fmt = binary_format_name(sb);
         int k = 0; while (fmt[k] && k < (int)sizeof(out->format_name) - 1) { out->format_name[k] = fmt[k]; k++; }
         out->format_name[k] = '\0';
         return 0;
     }
 
-    struct TimiObjectHeader hdr;
-    if (!timi_validate(sb->data, sb->size, &hdr)) {
-        out->status = TIMI_INFO_STATUS_CORRUPT;
+    struct SimiObjectHeader hdr;
+    if (!simi_validate(sb->data, sb->size, &hdr)) {
+        out->status = SIMI_INFO_STATUS_CORRUPT;
         return 0;
     }
 
-    out->status       = TIMI_INFO_STATUS_OK;
+    out->status       = SIMI_INFO_STATUS_OK;
     out->num_instr    = hdr.num_instr;
     out->num_literals = hdr.num_literals;
     out->num_entries  = hdr.num_entries;
     out->num_names    = hdr.num_names;
 
-    const struct TimiEntryRec* entries = (const struct TimiEntryRec*)
-        (sb->data + sizeof(struct TimiObjectHeader) +
+    const struct SimiEntryRec* entries = (const struct SimiEntryRec*)
+        (sb->data + sizeof(struct SimiObjectHeader) +
          (uint64_t)hdr.num_instr * 8 + (uint64_t)hdr.num_literals * 8);
-    uint32_t ecap = hdr.num_entries < TIMI_INFO_MAX_ENTRIES ? hdr.num_entries : TIMI_INFO_MAX_ENTRIES;
+    uint32_t ecap = hdr.num_entries < SIMI_INFO_MAX_ENTRIES ? hdr.num_entries : SIMI_INFO_MAX_ENTRIES;
     for (uint32_t i = 0; i < ecap; i++) out->entries[i] = entries[i];
     out->entries_returned  = ecap;
-    out->entries_truncated = hdr.num_entries > TIMI_INFO_MAX_ENTRIES;
+    out->entries_truncated = hdr.num_entries > SIMI_INFO_MAX_ENTRIES;
 
-    const struct TimiNameRec* names = (const struct TimiNameRec*)
-        ((const uint8_t*)entries + (uint64_t)hdr.num_entries * sizeof(struct TimiEntryRec));
-    uint32_t ncap = hdr.num_names < TIMI_INFO_MAX_NAMES ? hdr.num_names : TIMI_INFO_MAX_NAMES;
+    const struct SimiNameRec* names = (const struct SimiNameRec*)
+        ((const uint8_t*)entries + (uint64_t)hdr.num_entries * sizeof(struct SimiEntryRec));
+    uint32_t ncap = hdr.num_names < SIMI_INFO_MAX_NAMES ? hdr.num_names : SIMI_INFO_MAX_NAMES;
     for (uint32_t i = 0; i < ncap; i++) out->names[i] = names[i];
     out->names_returned  = ncap;
-    out->names_truncated = hdr.num_names > TIMI_INFO_MAX_NAMES;
+    out->names_truncated = hdr.num_names > SIMI_INFO_MAX_NAMES;
 
-    timi_activation_query(object_name, &out->activation);
+    simi_activation_query(object_name, &out->activation);
     return 1;
 }
 
-// ─── loader_timi_info ───────────────────────────────────────────────────────
-// Diagnostic dump for a TIMI object: header counts and exported entry-point
+// ─── loader_simi_info ───────────────────────────────────────────────────────
+// Diagnostic dump for a SIMI object: header counts and exported entry-point
 // names. Deliberately mirrors loader_list()'s table style. This is the
 // Phase 2 stand-in for a real disassembler/debugger — the host toolchain's
-// timi-dis is still the tool of record for a full instruction listing; this
+// simi-dis is still the tool of record for a full instruction listing; this
 // just confirms the kernel-side upload parsed the same object correctly.
-// Gap Remediation Phase G: now a thin wrapper over loader_timi_info_query()
+// Gap Remediation Phase G: now a thin wrapper over loader_simi_info_query()
 // above -- prints the exact same data the structured path returns, instead
 // of an independent parse.
-void loader_timi_info(const char* object_name) {
-    struct TimiInfoResult r;
-    loader_timi_info_query(object_name, &r);
+void loader_simi_info(const char* object_name) {
+    struct SimiInfoResult r;
+    loader_simi_info_query(object_name, &r);
 
-    if (r.status == TIMI_INFO_STATUS_NOT_FOUND) {
-        kernel_serial_printf("[LOADER] timi-info: '%s' not found.\n", object_name);
+    if (r.status == SIMI_INFO_STATUS_NOT_FOUND) {
+        kernel_serial_printf("[LOADER] simi-info: '%s' not found.\n", object_name);
         return;
     }
-    if (r.status == TIMI_INFO_STATUS_NOT_TIMI) {
+    if (r.status == SIMI_INFO_STATUS_NOT_SIMI) {
         kernel_serial_printf(
-            "[LOADER] timi-info: '%s' is not a TIMI object (format=%s).\n",
+            "[LOADER] simi-info: '%s' is not a SIMI object (format=%s).\n",
             object_name, r.format_name);
         return;
     }
-    if (r.status == TIMI_INFO_STATUS_CORRUPT) {
+    if (r.status == SIMI_INFO_STATUS_CORRUPT) {
         kernel_serial_printf(
-            "[LOADER] timi-info: '%s' has TIMI magic but failed header "
+            "[LOADER] simi-info: '%s' has SIMI magic but failed header "
             "validation (corrupt or truncated upload).\n", object_name);
         return;
     }
 
     kernel_serial_printf(
-        "\n[LOADER] TIMI object '%s'\n"
+        "\n[LOADER] SIMI object '%s'\n"
         "  instructions : %u\n"
         "  literals     : %u\n"
         "  entry points : %u\n"
@@ -463,14 +463,14 @@ void loader_timi_info(const char* object_name) {
         "v1 only translates the \".entry main\" entry point)\n\n");
 }
 
-// ─── sys_sls_timi_info ───────────────────────────────────────────────────────
+// ─── sys_sls_simi_info ───────────────────────────────────────────────────────
 // Gap Remediation Phase G: struct-based syscall wrapper, replacing the old
 // raw-const-char*-in/no-output-at-all shape (see loader.h's own comment on
-// SYS_SLS_TIMI_INFO for why this was safe to change outright).
-uint64_t sys_sls_timi_info(struct SLSTimiInfoRequest* req) {
+// SYS_SLS_SIMI_INFO for why this was safe to change outright).
+uint64_t sys_sls_simi_info(struct SLSSimiInfoRequest* req) {
     if (!req) return 1;
-    loader_timi_info_query(req->object_name, &req->result);
-    return req->result.status == TIMI_INFO_STATUS_OK ? 0 : 1;
+    loader_simi_info_query(req->object_name, &req->result);
+    return req->result.status == SIMI_INFO_STATUS_OK ? 0 : 1;
 }
 
 // ─── sys_sls_load ─────────────────────────────────────────────────────────────

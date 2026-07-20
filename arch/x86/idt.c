@@ -39,6 +39,13 @@ void init_idt(void) {
 
     // 0x8E: Present, Ring 0, 64-bit Interrupt Gate
     set_idt_gate( 6, (uint64_t)isr6_stub,  0x8E);  // #UD Invalid Opcode
+    // #NM Device Not Available — Gap Remediation SIMI Phase 10. Before this,
+    // any SSE/AVX instruction (kernel or, going forward, SIMI-JIT-emitted
+    // float codegen) executed after a context switch would trap here with
+    // no handler installed — an unhandled #NM with no IDT entry, the exact
+    // reason -mno-sse is load-bearing for this kernel's own C code today.
+    // See arch/x86/lazy_fpu.c and docs/AeroSLS-SIMI-ISA-v0.1.md §16 Phase 10.
+    set_idt_gate( 7, (uint64_t)isr7_stub,  0x8E);  // #NM Device Not Available
     set_idt_gate(11, (uint64_t)isr11_stub, 0x8E);  // #NP Segment Not Present
     set_idt_gate(12, (uint64_t)isr12_stub, 0x8E);  // #SS Stack-Segment Fault
     set_idt_gate(13, (uint64_t)isr13_stub, 0x8E);  // #GP General Protection

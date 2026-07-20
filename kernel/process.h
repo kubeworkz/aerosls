@@ -79,7 +79,7 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
 void process_exit(uint32_t exit_code);
 
 // Phase 7: find the Ring-3 process currently executing, for callers that
-// need to know "who is asking" (e.g. timi_runtime.c's authority-checked
+// need to know "who is asking" (e.g. simi_runtime.c's authority-checked
 // RESOLVE). Mirrors schedule_ring3()'s own scan for the running process
 // (active && state==PROC_RUNNING && kernel_rsp!=0 — kernel_rsp is only
 // nonzero while the kernel has actually entered that process via

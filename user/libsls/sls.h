@@ -24,8 +24,8 @@
 #define SLS_SYS_IPC_BIND        166   /* bind process to a user IPC port      */
 #define SLS_SYS_IPC_SEND        167   /* send message to any port             */
 #define SLS_SYS_IPC_RECV        168   /* non-blocking recv from user port     */
-#define SLS_SYS_TIMI_INFO       173   /* structured TIMI object introspection */
-/* Gap Remediation Phase G: TIMI/partition syscalls below were reachable from
+#define SLS_SYS_SIMI_INFO       173   /* structured SIMI object introspection */
+/* Gap Remediation Phase G: SIMI/partition syscalls below were reachable from
  * the shell (direct C call into the kernel, same address space) but had no
  * binding here for a real Ring-3 program built against this header and
  * trapping in via `syscall` — see this file's own top comment on the ABI
@@ -79,49 +79,49 @@ struct sls_record_req {
     char val [SLS_VAL_LEN ];   /* field value  */
 };
 
-/* ── TIMI introspection (Gap Remediation Phase G) ────────────────────────── */
-/* Layout MUST be identical to kernel/loader.h's TimiEntryRec/TimiNameRec/
- * TimiActivationStatus/TimiInfoResult/SLSTimiInfoRequest. TIMI_ENTRY_NAME_LEN
- * (32) and the TIMI_INFO_MAX_ENTRIES/NAMES cap (16) are inlined as literals
+/* ── SIMI introspection (Gap Remediation Phase G) ────────────────────────── */
+/* Layout MUST be identical to kernel/loader.h's SimiEntryRec/SimiNameRec/
+ * SimiActivationStatus/SimiInfoResult/SLSSimiInfoRequest. SIMI_ENTRY_NAME_LEN
+ * (32) and the SIMI_INFO_MAX_ENTRIES/NAMES cap (16) are inlined as literals
  * here rather than re-#defined, to avoid a second set of names for the same
  * constants in a header with no shared-generation step against the kernel. */
-#define SLS_TIMI_INFO_STATUS_OK        0
-#define SLS_TIMI_INFO_STATUS_NOT_FOUND 1
-#define SLS_TIMI_INFO_STATUS_NOT_TIMI  2
-#define SLS_TIMI_INFO_STATUS_CORRUPT   3
+#define SLS_SIMI_INFO_STATUS_OK        0
+#define SLS_SIMI_INFO_STATUS_NOT_FOUND 1
+#define SLS_SIMI_INFO_STATUS_NOT_SIMI  2
+#define SLS_SIMI_INFO_STATUS_CORRUPT   3
 
-struct sls_timi_entry_rec {
+struct sls_simi_entry_rec {
     char     name[32];
     uint32_t offset;
 } __attribute__((packed));
 
-struct sls_timi_name_rec {
+struct sls_simi_name_rec {
     char name[32];
 } __attribute__((packed));
 
-struct sls_timi_activation_status {
+struct sls_simi_activation_status {
     uint8_t  cached;
     uint32_t code_pages;
     uint32_t entry_offset;
     uint32_t content_hash;
 };
 
-struct sls_timi_info_result {
+struct sls_simi_info_result {
     uint32_t status;
     char     format_name[16];
     uint32_t num_instr, num_literals, num_entries, num_names;
-    struct sls_timi_entry_rec entries[16];
+    struct sls_simi_entry_rec entries[16];
     uint32_t entries_returned;
     uint8_t  entries_truncated;
-    struct sls_timi_name_rec  names[16];
+    struct sls_simi_name_rec  names[16];
     uint32_t names_returned;
     uint8_t  names_truncated;
-    struct sls_timi_activation_status activation;
+    struct sls_simi_activation_status activation;
 };
 
-struct sls_timi_info_req {
+struct sls_simi_info_req {
     char object_name[SLS_NAME_LEN];   /* [in]  must fit PROC_NAME_LEN (64) */
-    struct sls_timi_info_result result; /* [out] */
+    struct sls_simi_info_result result; /* [out] */
 };
 
 /* ── Partitions / LPAR (Gap Remediation Phase G) ─────────────────────────── */
@@ -330,19 +330,19 @@ static inline int sls_ipc_recv(uint16_t port, struct sls_ipc_msg *out) {
     return rc;
 }
 
-/* ── TIMI introspection (Gap Remediation Phase G) ────────────────────────── */
+/* ── SIMI introspection (Gap Remediation Phase G) ────────────────────────── */
 
-/* Query a TIMI object's header, entries, exported names, and activation-
+/* Query a SIMI object's header, entries, exported names, and activation-
  * cache status. Fills *out (always -- same "no partial result" contract as
- * the kernel's own loader_timi_info_query()) and returns 0 if
- * out->status == SLS_TIMI_INFO_STATUS_OK, 1 otherwise (the full detail is
+ * the kernel's own loader_simi_info_query()) and returns 0 if
+ * out->status == SLS_SIMI_INFO_STATUS_OK, 1 otherwise (the full detail is
  * always in out->status regardless of the return value). */
-static inline int sls_timi_info(const char *object_name,
-                                 struct sls_timi_info_result *out) {
-    struct sls_timi_info_req req;
+static inline int sls_simi_info(const char *object_name,
+                                 struct sls_simi_info_result *out) {
+    struct sls_simi_info_req req;
     sls_memset(&req, 0, sizeof(req));
     sls_strncpy(req.object_name, object_name, SLS_NAME_LEN - 1);
-    int rc = (int)_sls_syscall(SLS_SYS_TIMI_INFO, &req);
+    int rc = (int)_sls_syscall(SLS_SYS_SIMI_INFO, &req);
     if (out) *out = req.result;
     return rc;
 }
@@ -399,7 +399,7 @@ static inline int sls_partition_quota_set(uint32_t partition_id,
 /* List all defined partitions / per-partition usage+quota. Neither syscall
  * returns structured data to the caller (console-dump only, same as
  * SYS_SLS_PROC_LIST/SYS_SLS_OBJ_LIST) -- see loader.h's own comment on why
- * only loader_timi_info() got the structured-data treatment in Phase G,
+ * only loader_simi_info() got the structured-data treatment in Phase G,
  * not this pair. Kept here anyway so a native program can at least trigger
  * the dump without hand-rolling the trap. */
 static inline void sls_partition_list(void) {

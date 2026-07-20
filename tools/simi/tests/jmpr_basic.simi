@@ -1,0 +1,16 @@
+; jmpr_basic.simi — Gap Remediation SIMI Phase 14: basic JMPR jump-table
+; dispatch test. r1 holds the abstract pc of `target` (patched below to the
+; real instruction index once assembled/disassembled — hand-computed, no
+; label-literal support in the assembler yet, see simi_asm.c's LOADI64
+; case). Expected result: 222 (the JMPR must actually transfer control to
+; `target`, skipping the r0=111 dead path).
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #5, u64
+    JMPR r1
+    LOADI r0, #111, i32
+    RET
+target:
+    LOADI r0, #222, i32
+    RET

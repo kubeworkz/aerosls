@@ -1,0 +1,92 @@
+; aggregate_abi.simi — Gap Remediation SIMI Phase 14 Part A: verifies the
+; aggregate (struct-by-value) ABI convention documented in §4.8.1 --
+; aggregates <=8 bytes passed/returned by value in one r0-r7 slot,
+; aggregates >8 bytes passed by invisible reference (caller LEAs a
+; pointer to its own on-stack copy) and returned via a caller-supplied
+; sret pointer -- composed entirely from existing LEA/LOAD/STORE/PTRADD/
+; CALL/RET, zero new opcodes. r7 (the Phase 3 trampoline's scratch-
+; pointer convention, see mem_ops_native.simi) supplies real writable
+; memory for the on-stack aggregate copies.
+;
+; Test 1 (<=8 bytes, by value): pack (a=7,b=9) into one i64 register slot
+;   (a<<32 | b, via two SHL/SHR pairs rather than an AND mask so nothing
+;   here needs a 28-bit-immediate-exceeding literal); sum_packed unpacks
+;   and adds -> 16.
+; Test 2 (>8 bytes, by reference): a 3-element i64 struct {1,2,3} is built
+;   at [r7+0..16]; sum_struct3 is passed a pointer to it and adds the
+;   three fields via LOAD -> 6.
+; Test 3 (>8 bytes, sret): fill_struct3 is passed an sret pointer
+;   ([r7+24..40]) plus a scalar x=2, and STOREs {x*10,x*20,x*30} through
+;   it (classic sret lowering); main reads the three fields back and
+;   sums -> 120.
+; Expected result: 142 (16 + 6 + 120)
+.entry main
+
+sum_packed:
+    ENTER #8
+    MOV r1, r0, i64
+    SHR r2, r1, #32, u64      ; r2 = a (high 32 bits)
+    SHL r3, r1, #32, u64      ; r3 = packed<<32 -- drops a, keeps b at the top
+    SHR r4, r3, #32, u64      ; r4 = b, zero-extended back down (logical shift)
+    ADD r0, r2, r4, i64
+    RET
+
+sum_struct3:
+    ; r0 = pointer to 3 contiguous i64 fields (invisible-reference argument)
+    ENTER #8
+    LOAD r1, r0, #0, i64
+    LOAD r2, r0, #8, i64
+    LOAD r3, r0, #16, i64
+    ADD r4, r1, r2, i64
+    ADD r0, r4, r3, i64
+    RET
+
+fill_struct3:
+    ; r0 = sret pointer (3 contiguous i64 fields), r1 = scalar x
+    ENTER #8
+    LOADI r2, #10, i64
+    MUL r3, r1, r2, i64
+    STORE r3, r0, #0, i64
+    LOADI r2, #20, i64
+    MUL r3, r1, r2, i64
+    STORE r3, r0, #8, i64
+    LOADI r2, #30, i64
+    MUL r3, r1, r2, i64
+    STORE r3, r0, #16, i64
+    RET
+
+main:
+    ENTER #16
+
+    ; --- Test 1: small aggregate (<=8 bytes) passed by value ---
+    LOADI r0, #7, i64
+    LOADI r1, #9, i64
+    SHL r0, r0, #32, i64
+    OR r0, r0, r1, i64
+    CALL sum_packed
+    MOV r10, r0, i64          ; r10 = 16
+
+    ; --- Test 2: larger aggregate (>8 bytes) passed by reference ---
+    LOADI r1, #1, i64
+    STORE r1, r7, #0, i64
+    LOADI r1, #2, i64
+    STORE r1, r7, #8, i64
+    LOADI r1, #3, i64
+    STORE r1, r7, #16, i64
+    LEA r0, r7, #0
+    CALL sum_struct3
+    MOV r11, r0, i64          ; r11 = 6
+
+    ; --- Test 3: sret >8-byte return ---
+    LEA r0, r7, #24
+    LOADI r1, #2, i64
+    CALL fill_struct3
+    LOAD r2, r7, #24, i64
+    LOAD r3, r7, #32, i64
+    LOAD r4, r7, #40, i64
+    ADD r5, r2, r3, i64
+    ADD r12, r5, r4, i64      ; r12 = 120
+
+    ADD r13, r10, r11, i64
+    ADD r0, r13, r12, i64
+    RET

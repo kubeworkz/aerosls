@@ -5,7 +5,7 @@
  * "Findings addendum" for what's built here.
  *
  * Hand-rolled, not generated — matching this project's established style
- * (the TIMI assembler in Phase 1 is hand-rolled too). Zero dependency on
+ * (the SIMI assembler in Phase 1 is hand-rolled too). Zero dependency on
  * rowstore.h/row_index.h: this file only builds a `struct SqlStatement`
  * from text; it never looks up a table, evaluates anything, or touches the
  * kernel's actual data. That split is deliberate, not incidental — it's

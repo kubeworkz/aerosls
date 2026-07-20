@@ -1,6 +1,6 @@
 /*
  * partition.c — Phase 8 (v0.3) LPAR groundwork. See partition.h for the
- * contract and AeroSLS-TIMI-ISA-v0.1.md §15 for the design writeup.
+ * contract and AeroSLS-SIMI-ISA-v0.1.md §15 for the design writeup.
  *
  * Deliberately shaped to mirror object_catalog.c's existing role_table
  * pattern (find-or-insert-by-uid, active flag, linear scan over a small

@@ -16,7 +16,7 @@ static uint64_t physical_memory_bitmap[TOTAL_FRAMES / 64];
 /* Phase 13: per-partition frame accounting. PARTITION_SYSTEM's counter also
  * absorbs every unaccounted/kernel-infrastructure frame handed out via the
  * plain allocate_physical_ram_frame() path (page-table internals, NVMe
- * queues, SMP stacks, the shared TIMI activation cache, catalog index
+ * queues, SMP stacks, the shared SIMI activation cache, catalog index
  * nodes) — so partition_frame_usage[PARTITION_SYSTEM] is deliberately a
  * "total unaccounted + system tenant" number, not a pure per-tenant one.
  * See the Phase 13 findings addendum for the full call-site audit. Quota

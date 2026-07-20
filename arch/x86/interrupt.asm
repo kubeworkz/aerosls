@@ -2,11 +2,13 @@ bits 64
 global isr14_stub
 global isr32_stub
 global isr6_stub
+global isr7_stub
 global isr11_stub
 global isr12_stub
 global isr13_stub
 extern handle_page_fault
 extern handle_ring3_fault
+extern handle_device_not_available_fault
 extern timer_irq_handler
 extern schedule_ring3
 
@@ -181,3 +183,38 @@ FAULT_STUB_NOEC isr6_stub      ; #UD  Invalid Opcode
 FAULT_STUB_EC   isr11_stub     ; #NP  Segment Not Present
 FAULT_STUB_EC   isr12_stub     ; #SS  Stack-Segment Fault
 FAULT_STUB_EC   isr13_stub     ; #GP  General Protection Fault
+
+; ─── isr7_stub: #NM Device Not Available (Gap Remediation SIMI Phase 10) ────
+; Deliberately NOT built from FAULT_STUB_NOEC: that macro dispatches to the
+; generic handle_ring3_fault(error_code, cs, rip) path, which this trap must
+; never take -- #NM is not a fault to report/kill the offending code over,
+; it is the lazy-FPU mechanism's own normal, expected control-flow trigger
+; (see arch/x86/lazy_fpu.c). handle_device_not_available_fault() takes no
+; arguments and, on return via iretq, the CPU re-executes the exact
+; instruction that trapped -- now with FPU/AVX-512 state correctly loaded,
+; not with the trap treated as complete-and-abandoned the way a real fault
+; would be.
+isr7_stub:
+    push rbp
+    mov  rbp, rsp
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    call handle_device_not_available_fault
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rax
+    pop  rbp
+    iretq

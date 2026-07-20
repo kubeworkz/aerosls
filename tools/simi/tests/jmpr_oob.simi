@@ -1,0 +1,13 @@
+; jmpr_oob.simi — Gap Remediation SIMI Phase 14: deliberate out-of-range
+; JMPR target. Not part of the self-checking Expected-result suite (there
+; is no valid "expected result" — the whole point is that execution must
+; NOT produce one). Verified manually: the interpreter must die() with a
+; nonzero exit code, and the x86-native translator must fault (real #UD
+; via ud2) rather than transfer control to garbage. See run_jmpr_tests.sh.
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #999, u64
+    JMPR r1
+    LOADI r0, #111, i32
+    RET

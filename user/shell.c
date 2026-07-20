@@ -188,7 +188,7 @@ static void print_help(void) {
         "  upload <name> <hex>           write hex-encoded bytes to binary store\n"
         "  load <name>                   spawn process from uploaded binary\n"
         "  loader list                   show all binaries in the store\n"
-        "  timi info <name>               structured TIMI header/entries/names/\n"
+        "  simi info <name>               structured SIMI header/entries/names/\n"
         "                                   activation-cache dump (Gap Remediation Phase G)\n"
         "  -- Process Isolation (Phase B) --\n"
         "  proc list                     show all Ring-3 processes\n"
@@ -1122,27 +1122,27 @@ void sls_shell_loop(void) {
             do_syscall(172, 0);
         }
 
-        // ── Gap Remediation Phase G: timi info <name> ─────────────────────────
-        // First shell surface for SYS_SLS_TIMI_INFO (173) -- previously
-        // reachable only via loader_timi_info()'s own console dump, called
+        // ── Gap Remediation Phase G: simi info <name> ─────────────────────────
+        // First shell surface for SYS_SLS_SIMI_INFO (173) -- previously
+        // reachable only via loader_simi_info()'s own console dump, called
         // nowhere. Now struct-based (see loader.h): the syscall fills
         // req.result in place (single address space, no marshalling) and
         // this command formats it. Prefix offset via Python len(), not
         // hand-counted, per Phase F's own established practice.
-        else if (sh_starts(input_buffer, "timi info ")) {
-            struct SLSTimiInfoRequest req;
+        else if (sh_starts(input_buffer, "simi info ")) {
+            struct SLSSimiInfoRequest req;
             sh_copy(req.object_name, input_buffer + 10, sizeof(req.object_name));
-            do_syscall(SYS_SLS_TIMI_INFO, &req);
-            struct TimiInfoResult* r = &req.result;
-            if (r->status == TIMI_INFO_STATUS_NOT_FOUND) {
-                kernel_serial_printf("[TIMI] '%s' not found\n", req.object_name);
-            } else if (r->status == TIMI_INFO_STATUS_NOT_TIMI) {
-                kernel_serial_printf("[TIMI] '%s' is not a TIMI object (format: %s)\n",
+            do_syscall(SYS_SLS_SIMI_INFO, &req);
+            struct SimiInfoResult* r = &req.result;
+            if (r->status == SIMI_INFO_STATUS_NOT_FOUND) {
+                kernel_serial_printf("[SIMI] '%s' not found\n", req.object_name);
+            } else if (r->status == SIMI_INFO_STATUS_NOT_SIMI) {
+                kernel_serial_printf("[SIMI] '%s' is not a SIMI object (format: %s)\n",
                                      req.object_name, r->format_name);
-            } else if (r->status == TIMI_INFO_STATUS_CORRUPT) {
-                kernel_serial_printf("[TIMI] '%s' has a corrupt TIMI header\n", req.object_name);
+            } else if (r->status == SIMI_INFO_STATUS_CORRUPT) {
+                kernel_serial_printf("[SIMI] '%s' has a corrupt SIMI header\n", req.object_name);
             } else {
-                kernel_serial_printf("[TIMI] '%s': %u instr, %u literals, %u entries, %u names\n",
+                kernel_serial_printf("[SIMI] '%s': %u instr, %u literals, %u entries, %u names\n",
                                      req.object_name, r->num_instr, r->num_literals,
                                      r->num_entries, r->num_names);
                 for (uint32_t i = 0; i < r->entries_returned; i++) {

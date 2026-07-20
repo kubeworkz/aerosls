@@ -1,0 +1,70 @@
+; cap_call_ret.simi — Gap Remediation SIMI Phase 12: capability tag
+; propagation across CALL/RET.
+;
+; Two independent checks, isolated into separate calls so a failure in
+; one direction can't be confused with the other:
+;
+;   1. Argument direction: main RESOLVEs a real object into r0, CALLs
+;      check_arg passing it as the argument (r0, per the r0-r7 convention,
+;      §4.8). check_arg runs OBJSIZE on the r0 it received -- if Phase
+;      12's argument-tag propagation works, this returns the real size
+;      (303); if the tag arrived untagged (the pre-Phase-12 behavior),
+;      OBJSIZE rejects it and returns 0 instead, without ever consulting
+;      the catalog (see cap_forge.simi for that rejection path in
+;      isolation).
+;
+;   2. Return direction: main CALLs get_cap (no arguments), which
+;      RESOLVEs a *different* real object internally and returns the
+;      capability itself via r0. Back in main, OBJSIZE/OBJTYPE run
+;      directly on the value CALL just placed in r0 -- if Phase 12's
+;      return-tag propagation works, these succeed against the second
+;      object's real size/type (100 / 2); if not, they're rejected
+;      (0 / 0xFFFFFFFF) the same way any untagged register always is.
+;
+; Expected result: 2100303
+;   r1 = OBJSIZE(argument received by check_arg)  = 303
+;   r2 = OBJSIZE(capability returned by get_cap)  = 100
+;   r3 = OBJTYPE(capability returned by get_cap)  = 2
+;   result = r1 + r2*1000 + r3*1000000
+;          = 303 + 100000 + 2000000 = 2100303
+;   (a failure in EITHER direction changes a distinct term: argument-
+;   propagation failure zeroes the +303 term; return-propagation failure
+;   zeroes the size term and inflates the type term via
+;   0xFFFFFFFF*1000000 -- both land unmistakably far from 2100303, not a
+;   near-miss that could pass by accident.)
+;
+; cap_forge.simi (unmodified by this phase) remains the test that proves
+; a genuinely forged capability is still rejected -- this file proves the
+; opposite, complementary property: a REAL capability now survives a
+; call boundary it did not survive before Phase 12.
+
+.entry main
+
+check_arg:
+    ENTER #8
+    OBJSIZE r1, r0, u64
+    MOV     r0, r1, u64
+    RET
+
+get_cap:
+    ENTER #8
+    RESOLVE r0, "simi_verify3"     ; capability #2: base 0x3000, size 100, type 2 (DATA)
+    RET
+
+main:
+    ENTER #16
+    RESOLVE r0, "simi_add_test2"   ; capability #1: base 0x2000, size 303, type 1 (PROGRAM)
+    CALL    check_arg
+    MOV     r1, r0, u64            ; r1 = check_arg's result
+
+    CALL    get_cap
+    ; r0 now holds get_cap's returned value -- test whether ITS tag
+    ; survived the RET/CALL round trip.
+    OBJSIZE r2, r0, u64
+    OBJTYPE r3, r0, u64
+
+    MUL     r5, r2, #1000, u64
+    MUL     r6, r3, #1000000, u64
+    ADD     r7, r1, r5, u64
+    ADD     r0, r7, r6, u64
+    RET

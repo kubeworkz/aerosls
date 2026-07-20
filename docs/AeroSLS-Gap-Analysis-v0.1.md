@@ -2,7 +2,7 @@
 
 ## 0. Purpose and method
 
-Six roadmaps have been built and marked done across this project: the TIMI/SLIC instruction set and toolchain, the LPAR/partition subsystem, the RDBMS engine, and the Vector Store (including its HNSW stretch phase). Before starting `/slos-sim` — a new web frontend styled on IBM i Navigator — this document asks the obvious next question: what's actually usable today, end to end, versus what only exists as C code a host test can reach?
+Six roadmaps have been built and marked done across this project: the SIMI/SLIC instruction set and toolchain, the LPAR/partition subsystem, the RDBMS engine, and the Vector Store (including its HNSW stretch phase). Before starting `/slos-sim` — a new web frontend styled on IBM i Navigator — this document asks the obvious next question: what's actually usable today, end to end, versus what only exists as C code a host test can reach?
 
 This is not a re-litigation of any roadmap's own scope decisions. Every roadmap named its own deliberate cuts honestly in its own findings addenda, and those are respected here, not re-argued. This document instead looks for two different kinds of gap that don't show up phase-by-phase: (1) capabilities that exist in the kernel but that no live caller — shell, syscall from a real client, or HTTP — can actually reach, and (2) system-wide properties (does it boot, does anything persist, is anything secured) that only become visible once you stop looking at one phase at a time.
 
@@ -26,7 +26,7 @@ This is the most consistent finding across all four roadmaps, and it matters mos
 | Run SQL (SELECT/INSERT/UPDATE/DELETE/JOIN) | ✅ `sql_execute()` | ✅ `SYS_SLS_SQL_EXECUTE` | ✅ `sql <stmt>` | ❌ zero "sql" routes |
 | Create/manage a partition | ✅ `partition.c`, syscalls 210-216 all wired | ✅ | ❌ | ❌ |
 | List a partition's frame quota usage | ✅ `sys_sls_partition_quota_list()` | ❌ no syscall number assigned at all | ❌ | ❌ |
-| Inspect a loaded TIMI program's header/entry points | ✅ `loader_timi_info()` | ✅ `SYS_SLS_TIMI_INFO` | ❌ (serial-console print only, no return value to caller) | ❌ |
+| Inspect a loaded SIMI program's header/entry points | ✅ `loader_simi_info()` | ✅ `SYS_SLS_SIMI_INFO` | ❌ (serial-console print only, no return value to caller) | ❌ |
 | Resolve a vector search back to relational rows | ✅ `vec_join_resolve()` | ❌ | ❌ | ❌ |
 | Approximate (HNSW) vector search | ✅ `vec_index_search()` | ❌ | ❌ | ❌ |
 | Create/insert/search a vector collection (exact) | ✅ | ✅ `SYS_SLS_VEC_*` (221-224) | ✅ `vec create/insert/embed-insert/search` | ❌ zero "vec" routes |
@@ -36,18 +36,18 @@ Two of these (`rowstore_create_table()`, `sys_sls_partition_quota_list()`) are d
 
 **The practical consequence for `/slos-sim`, stated plainly: there is currently no way, over HTTP, to create a new table, run a SQL query, manage a partition, or touch the vector store in any way.** The existing HTTP API (see §5) is rich for the *legacy* catalog/process/program/journal/cursor/agent surface — genuinely useful groundwork — but it predates the RDBMS and Vector Store roadmaps entirely and was never extended to cover either.
 
-## 3. TIMI / SLIC toolchain
+## 3. SIMI / SLIC toolchain
 
-What's real and solid: a documented ISA (through v0.3, object-typed opcodes), a working assembler/interpreter/disassembler, two native translator targets (x86-64 wired into the kernel and execution-verified on real QEMU hardware at Phase 4; RV64 verified only at the host-toolchain level via a custom, admittedly-weaker decoder), capability tags, and authority-checked `RESOLVE`. Programs (including TIMI ones) upload and spawn transparently through the existing generic `/api/program/*` HTTP routes and shell commands — this part **is** reachable today.
+What's real and solid: a documented ISA (through v0.3, object-typed opcodes), a working assembler/interpreter/disassembler, two native translator targets (x86-64 wired into the kernel and execution-verified on real QEMU hardware at Phase 4; RV64 verified only at the host-toolchain level via a custom, admittedly-weaker decoder), capability tags, and authority-checked `RESOLVE`. Programs (including SIMI ones) upload and spawn transparently through the existing generic `/api/program/*` HTTP routes and shell commands — this part **is** reachable today.
 
 Concrete gaps, most to least significant for a frontend:
 
-- **No compiler exists that targets TIMI.** Every `.timi` file in the repo is hand-written assembly. `compiler/SLSAllocationPassV2.cpp` is an unrelated LLVM pass for native ELF globals. If the frontend's story is ever "write and run a program," there is currently no path from source text to TIMI bytecode other than hand assembly.
-- **Introspection writes to the serial console, not to a caller.** `loader_timi_info()` and the partition-list equivalent (§2) both `kernel_serial_printf` their output rather than filling a caller-supplied buffer — the same refactor every other `/api/*` handler in `net/http.c` already uses (a JSON-builder pattern) would need to be applied before either could back a frontend view.
+- **No compiler exists that targets SIMI.** Every `.simi` file in the repo is hand-written assembly. `compiler/SLSAllocationPassV2.cpp` is an unrelated LLVM pass for native ELF globals. If the frontend's story is ever "write and run a program," there is currently no path from source text to SIMI bytecode other than hand assembly.
+- **Introspection writes to the serial console, not to a caller.** `loader_simi_info()` and the partition-list equivalent (§2) both `kernel_serial_printf` their output rather than filling a caller-supplied buffer — the same refactor every other `/api/*` handler in `net/http.c` already uses (a JSON-builder pattern) would need to be applied before either could back a frontend view.
 - **The HTTP program-spawn path hardcodes `owner_uid = 0`** (`net/http.c`, `api_program_create`/`api_program_spawn_handler`) — bearer-token identity is extracted and threaded through for agent/workflow routes in the same file but never applied to program routes. Every program spawned via HTTP today runs as uid 0/`PARTITION_SYSTEM`, meaning Phase 9's partition-gated spawn permission model has zero effect through the surface a web frontend would use.
-- Unhandled `DIV`/`MOD`-by-zero traps at the kernel level (no ISR0 handler exists anywhere in the tree) — a running TIMI program hitting this will fault the machine, not fail cleanly.
+- Unhandled `DIV`/`MOD`-by-zero traps at the kernel level (no ISR0 handler exists anywhere in the tree) — a running SIMI program hitting this will fault the machine, not fail cleanly.
 - No capability propagation across `CALL`/`RET`, no capability revocation, a hard 64-register ceiling on the native translators (v1 narrowing from the ISA's own 1024), and orphaned code frames on re-upload (this kernel has no frame-free primitive at all — same root cause as the LPAR leak below).
-- `user/libsls/sls.h` (the userspace syscall binding library) exposes none of the TIMI or partition syscalls — a native program can't call `SYS_SLS_TIMI_INFO` or any `SYS_SLS_PARTITION_*` without hand-rolling the trap itself.
+- `user/libsls/sls.h` (the userspace syscall binding library) exposes none of the SIMI or partition syscalls — a native program can't call `SYS_SLS_SIMI_INFO` or any `SYS_SLS_PARTITION_*` without hand-rolling the trap itself.
 
 ## 4. LPAR / partition subsystem
 

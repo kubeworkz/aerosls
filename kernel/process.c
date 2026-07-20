@@ -335,7 +335,7 @@ void process_exit(uint32_t exit_code) {
         // a garbage RSP, page/general-protection fault, and eventually a
         // triple fault. Never triggered before because nothing in this
         // project had spawned, exited, and then spawned a second Ring-3
-        // process in the same boot session until real end-to-end TIMI
+        // process in the same boot session until real end-to-end SIMI
         // verification (Phase 4) actually exercised it. The extra swapgs
         // below restores the pre-syscall GS state exactly like
         // .syscall_return's own swapgs would have, before this path
@@ -524,7 +524,7 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
 // Phase 7: identical scan to the one schedule_ring3() does internally to
 // find "the process currently executing" — active, PROC_RUNNING, and
 // actually entered via kernel_enter_ring3 (kernel_rsp != 0). Used by
-// timi_runtime.c's authority-checked RESOLVE to find the calling
+// simi_runtime.c's authority-checked RESOLVE to find the calling
 // process's owner_uid. Returns NULL when called from pure kernel context
 // (no Ring-3 process running), which callers should treat as uid 0 /
 // ROLE_SYSTEM_KERNEL — always-passes, per catalog_check_access().

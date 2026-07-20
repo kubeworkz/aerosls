@@ -186,8 +186,82 @@ int verify_expanded_matrix_access(uint32_t uid, uint32_t gid,
     return uid == 0 ? 1 : 0;   // root always passes
 }
 
-// ─── Lazy FPU task struct stub ────────────────────────────────────────────────
-// lazy_fpu.c calls this to find the current task's FPU save buffer.
+// ─── Lazy FPU per-task state (Gap Remediation SIMI Phase 10) ──────────────────
+// lazy_fpu.c calls this to find the current task's AVX-512 save buffer.
+// This used to unconditionally return NULL. That comment claimed
+// "lazy_fpu.c guards against this," which is only true for the FIRST #NM
+// trap ever taken (fpu_hardware_owner and current_task both NULL, so
+// handle_device_not_available_fault()'s early-return fires and nothing
+// crashes). Every trap after that hits the exact same NULL==NULL early
+// return, unconditionally -- meaning no task's FPU/AVX-512 state was ever
+// actually saved or restored across a context switch. Not a crash, but
+// silent cross-task register-state leakage, which "guards against this"
+// was never actually true protection against.
+//
+// Fixed with a real, persistent per-thread-id side table, using
+// kernel_get_current_thread_id() (kernel/scheduler.c) as the current
+// execution identity -- the only one this kernel has today.
+//
+// arch/x86/scheduler_extended.h (the real struct ExtendedTask) is
+// deliberately NOT #included here, and not even via a bare extern of the
+// type: this file already #includes "process.h" above, which itself
+// #includes "scheduler.h" -- and scheduler.h's own `enum TaskState`
+// shares every enumerator name with scheduler_extended.h's `enum
+// TaskState` (TASK_READY/RUNNING/BLOCKED all collide; confirmed by
+// actually trying it first and hitting real "redeclaration of enumerator"
+// errors under the kernel's exact X86_CFLAGS, not assumed). C does not
+// allow two enums to redeclare the same enumerator names in one
+// translation unit, and process.h's existing include makes that
+// unavoidable here.
+//
+// struct ExtendedTaskShadow below is a byte-for-byte layout-compatible
+// mirror of scheduler_extended.h's real struct ExtendedTask (uint32_t id;
+// a 4-byte enum; uint64_t rsp; a 64-byte-aligned 2688-byte buffer) built
+// from plain integer types instead, so no enum needs to cross the
+// boundary at all. lazy_fpu.c's xsave/xrstor only ever touch the
+// avx512_state_buffer bytes through its own real struct ExtendedTask*
+// view of this SAME memory (kernel_get_current_task_struct() hands back
+// a `void*`, exactly as it always did) -- the two views only need to
+// agree on layout, not be the literal same named type.
+//
+// Honest scope note: this ties FPU/AVX-512 ownership to scheduler.c's
+// cooperative kernel-thread id space, not to a separate user-process
+// identity -- this kernel has no distinct "current user process"
+// accessor today (kernel/process.c has none). Correct and sufficient to
+// unblock Phase 10 (float opcodes); revisit if/when SIMI user processes
+// get their own distinct scheduling identity apart from this one.
+struct ExtendedTaskShadow {
+    uint32_t id;
+    uint32_t state;   /* enum TaskState's real width; value only ever set
+                        * to TASK_RUNNING's numeric constant (1) here,
+                        * never otherwise inspected by this file. */
+    uint64_t rsp;
+    __attribute__((aligned(64))) uint8_t avx512_state_buffer[2688];
+};
+
+extern uint32_t kernel_get_current_thread_id(void);
+
+#define FPU_TASK_STATES_MAX 64   /* mirrors kernel/scheduler.h's MAX_TASKS */
+static struct ExtendedTaskShadow g_fpu_task_states[FPU_TASK_STATES_MAX];
+static uint8_t                   g_fpu_task_state_used[FPU_TASK_STATES_MAX];
+
 void* kernel_get_current_task_struct(void) {
-    return 0;   // Returns NULL; lazy_fpu.c guards against this.
+    uint32_t tid = kernel_get_current_thread_id();
+    for (uint32_t i = 0; i < FPU_TASK_STATES_MAX; i++) {
+        if (g_fpu_task_state_used[i] && g_fpu_task_states[i].id == tid)
+            return &g_fpu_task_states[i];
+    }
+    for (uint32_t i = 0; i < FPU_TASK_STATES_MAX; i++) {
+        if (!g_fpu_task_state_used[i]) {
+            g_fpu_task_state_used[i] = 1;
+            g_fpu_task_states[i].id    = tid;
+            g_fpu_task_states[i].state = 1;   /* TASK_RUNNING */
+            g_fpu_task_states[i].rsp   = 0;
+            return &g_fpu_task_states[i];
+        }
+    }
+    return 0;   /* table full -- matches this kernel's established
+                 * static-array-exhaustion convention; lazy_fpu.c's own
+                 * NULL-guard (fpu_hardware_owner == current_task) still
+                 * applies here as a safety net, same as before this fix. */
 }
