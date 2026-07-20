@@ -288,7 +288,7 @@ Capability-based access control. Each object has a per-UID permission bitmask.
 | `grant <uid> <object> <perm>`  | Add permissions: `r`, `w`, `x`, `rw`, `rwx`  |
 | `revoke <uid> <object> <perm>` | Remove permissions                           |
 | `chmod <name> <mask_hex>`      | Set raw permission bitmask directly (legacy) |
-| `seal <name>`                  | Encrypt an object with a password            |
+| `seal <name> <password>`       | Derive+store a password-based key for an object (does NOT encrypt its data — see kernel/secure_api.c). Was an interactive two-line prompt; changed to a single line by the Kernel-Side Shell Refactor (docs/AeroSLS-Web-Terminal-Plan-v0.1.md §10.1) so the command works over both the serial console and the new `/api/shell/exec` HTTP route. |
 
 
 **Roles:** `SYSTEM_KERNEL` · `DB_ADMIN` · `APP_USER` · `GUEST`
@@ -500,6 +500,15 @@ Demo accounts:
 | `POST` | `/api/tx/begin`    | `APP_USER+` | Open a transaction |
 | `POST` | `/api/tx/commit`   | `APP_USER+` | Commit             |
 | `POST` | `/api/tx/rollback` | `APP_USER+` | Rollback           |
+
+
+#### Shell
+
+Note: this REST API section predates several routes documented elsewhere (`/api/sql`, `/api/tables`, `/api/vec/*`, `/api/partitions`, `/api/agent*`, `/api/workflow*`, ...) — it was already not a complete, continuously-maintained route list before this entry, so only the one route this section's own change added is listed here rather than attempting a full audit of the rest as part of an unrelated change.
+
+| Method | Path              | Auth        | Description                                                                                                                                                                                                                          |
+| ------ | ----------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/shell/exec` | `APP_USER+` | `{"command":"…"}` — runs the one command string through the *entire* serial-console dispatch (`sls_shell_execute()`, see docs/AeroSLS-Web-Terminal-Plan-v0.1.md §10). Returns `{"ok":bool,"output":"…"}`; `ok` means the command was recognized, not that the underlying operation succeeded — read `output` the same way you'd read the serial console. Shares session state (`current_session_uid`/`gid`/`current_tx_id`) with the physical serial console — one simulated machine, one live session. |
 
 
 #### Observability

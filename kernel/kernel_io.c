@@ -22,8 +22,38 @@ void serial_init(void) {
     outb(SERIAL_COM1_BASE + 4, 0x03); // RTS + DTR asserted
 }
 
+// ─── Output capture (see kernel_io.h's own header comment) ────────────────────
+static char*  capture_buf = 0;
+static size_t capture_len = 0;
+static size_t capture_cap = 0;
+
+void kernel_serial_capture_start(char* buf, size_t cap) {
+    capture_buf = buf;
+    capture_len = 0;
+    capture_cap = cap;
+    if (capture_cap > 0) capture_buf[0] = '\0';
+}
+
+size_t kernel_serial_capture_stop(void) {
+    size_t n = capture_len;
+    if (capture_buf && capture_cap > 0) {
+        size_t term = n < capture_cap - 1 ? n : capture_cap - 1;
+        capture_buf[term] = '\0';
+    }
+    capture_buf = 0;
+    capture_len = 0;
+    capture_cap = 0;
+    return n;
+}
+
 // ─── Output primitives ────────────────────────────────────────────────────────
 void kernel_serial_putchar(char c) {
+    if (capture_buf) {
+        // Bounds-checked append; leave room for the NUL capture_stop() writes.
+        if (capture_len + 1 < capture_cap) capture_buf[capture_len] = c;
+        capture_len++;
+        return;
+    }
     // Wait until Transmit Holding Register Empty (bit 5 of LSR)
     while (!(inb(SERIAL_COM1_BASE + 5) & 0x20))
         __asm__ volatile("pause");

@@ -60,6 +60,31 @@ void jb_str(JSONBuf* j, const char* key, const char* val) {
     jb_esc_str(j, val);
 }
 
+// jb_esc_str() above escapes '"' and '\' but not control characters -- fine
+// for every existing call site in this file (none of them ever carried
+// embedded newlines), but not fine for shell command output (Kernel-Side
+// Shell Refactor, docs/AeroSLS-Web-Terminal-Plan-v0.1.md §10.4), which
+// routinely spans multiple lines ("ls", "journal dump", "mqt list", ...) --
+// a raw '\n' inside a JSON string literal is invalid JSON and would break
+// JSON.parse() on the client. Deliberately a new, narrowly-used helper
+// rather than changing jb_esc_str() itself: that function has ~40 existing
+// call sites in this file, none of which need this, so fixing it in place
+// would be unscoped risk for zero benefit.
+static void jb_str_multiline(JSONBuf* j, const char* key, const char* val) {
+    jb_key(j, key);
+    jb_putc(j, '"');
+    while (*val) {
+        char c = *val++;
+        if      (c == '"')  { jb_putc(j, '\\'); jb_putc(j, '"'); }
+        else if (c == '\\') { jb_putc(j, '\\'); jb_putc(j, '\\'); }
+        else if (c == '\n') { jb_putc(j, '\\'); jb_putc(j, 'n'); }
+        else if (c == '\r') { jb_putc(j, '\\'); jb_putc(j, 'r'); }
+        else if (c == '\t') { jb_putc(j, '\\'); jb_putc(j, 't'); }
+        else jb_putc(j, c);
+    }
+    jb_putc(j, '"');
+}
+
 void jb_uint(JSONBuf* j, const char* key, uint64_t val) {
     jb_key(j, key);
     if (val == 0) { jb_putc(j, '0'); return; }
@@ -1350,6 +1375,40 @@ static void sql_row_to_json_cb(struct RowId id, const struct RowValues* v, void*
     }
     jb_arr_close(ctx->j);
 }
+// ─── Kernel-Side Shell Refactor (docs/AeroSLS-Web-Terminal-Plan-v0.1.md §10.4) ─
+// extern, not a new header -- matches how kernel.c declares sls_shell_loop()
+// today (a plain extern at the one call site, no shell.h for one function).
+extern int sls_shell_execute(const char* input, char* out_buf, size_t out_cap);
+
+// Must match the constant of the same name in user/shell.c's sls_shell_loop()
+// -- no shared header exists for this one value, so both copies carry this
+// cross-reference instead (see shell.c's own comment on the same constant).
+#define SHELL_EXEC_OUT_CAP 8192
+
+// Runs the FULL ~90-command shell.c dispatch, not a curated subset -- this
+// is what closes every command on §3's "Missing" list (login, role set,
+// grant, revoke, chmod, auth create/list/revoke, seal, write, demo,
+// upload, load, loader list, svc crash/restart, proc kill, ipc post/stat,
+// journal create/purge, tier demote/promote, vfree, workflow addstep,
+// webapp set/list/append) without 24 individual new routes -- see §10.6.
+// req_uid is unused: shell session state (current_session_uid/gid/
+// current_tx_id) is shared, global, file-scope state in shell.c, the same
+// single-simulated-machine model this app already has everywhere else
+// (one DEMO_TOKEN, no per-request session) -- see §10.3.
+static int api_shell_exec_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    (void)req_uid;
+    char command[256];
+    json_str(body, "command", command, sizeof(command));
+    static char shell_out[SHELL_EXEC_OUT_CAP];
+    int recognized = sls_shell_execute(command, shell_out, sizeof(shell_out));
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok", recognized ? "true" : "false"); jb_putc(&j, ',');
+    jb_str_multiline(&j, "output", shell_out);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 static int api_sql_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
@@ -2499,6 +2558,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/sql")) {
             blen = api_sql_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Kernel-Side Shell Refactor ──────────────────────────────────────
+        if (!strcmp(path, "/api/shell/exec")) {
+            blen = api_shell_exec_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Gap Remediation Phase C: Vector Store HTTP reachability ────────────

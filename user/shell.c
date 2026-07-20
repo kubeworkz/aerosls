@@ -275,7 +275,7 @@ static void print_help(void) {
         "  partition quota <partition_id> <frames>  set a frame quota (0=unlimited)\n"
         "  partition quotas                         list per-partition usage/quota\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
-        "  seal   <name>                  derive+store a password-based key for an\n"
+        "  seal   <name> <password>      derive+store a password-based key for an\n"
         "                                   object (does NOT encrypt its data -- see\n"
         "                                   kernel/secure_api.c's own header comment)\n"
         "  help                           show this message\n\n");
@@ -317,19 +317,31 @@ static int shell_index_scan_cb(const char* k, const char* v) {
     kernel_serial_print("\n"); return 1;
 }
 
-void sls_shell_loop(void) {
-    char input_buffer[256];
-    kernel_serial_print("\n--- Multi-User SLS Secure Shell Active ---\n");
-    kernel_serial_print("Type 'help' for available commands.\n\n");
-
-    while (1) {
-        if (current_tx_id)
-            kernel_serial_printf("uid:%u[tx:%lu]> ", current_session_uid,
-                                 current_tx_id);
-        else
-            kernel_serial_printf("uid:%u> ", current_session_uid);
-
-        read_line(input_buffer);
+// ─── Kernel-Side Shell Refactor (docs/AeroSLS-Web-Terminal-Plan-v0.1.md §10) ──
+// Pure string-in/string-out entry point into the same ~90-command dispatch
+// that used to live only inside sls_shell_loop()'s while(1) body. Output is
+// captured via kernel_serial_capture_start()/_stop() (kernel/kernel_io.c) --
+// the single choke point every kernel_serial_print()/printf() call in the
+// whole kernel already funnels through, so none of the 602 existing print
+// call sites across 38 files needed to change, only this one function
+// needed to exist. current_session_uid/current_session_gid/current_tx_id
+// stay as file-scope statics, shared between the serial console and every
+// call here -- one simulated machine, one live session, matching this
+// project's existing single-DEMO_TOKEN, no-per-request-session model
+// everywhere else (see §10.3 for the full rationale, not a new risk this
+// introduces).
+//
+// Returns 1 if input matched a known command (the printed text is whatever
+// that command produced -- this signals "recognized and ran," not "the
+// underlying operation succeeded"; most commands only communicate real
+// success/failure through their own printed text, exactly as they always
+// have for a human reading the serial console). Returns 0 for an
+// unrecognized non-empty command (out_buf holds the "Unknown command: ..."
+// message) or for empty/whitespace input (out_buf is empty, matching the
+// loop's own long-standing silent no-op for a blank line).
+int sls_shell_execute(const char* input_buffer, char* out_buf, size_t out_cap) {
+    int recognized = 1;
+    kernel_serial_capture_start(out_buf, out_cap);
 
         // ── help ──────────────────────────────────────────────────────────────
         if (sh_eq(input_buffer, "help")) {
@@ -1728,13 +1740,29 @@ void sls_shell_loop(void) {
             }
         }
 
-        // ── seal <name> ───────────────────────────────────────────────────────
+        // ── seal <name> <password> ───────────────────────────────────────────
+        // Kernel-Side Shell Refactor (docs/AeroSLS-Web-Terminal-Plan-v0.1.md
+        // §10.1): was an interactive two-line "Enter encryption password: "
+        // prompt (a second read_line() call) -- the only command in this
+        // entire file that ever read more than the one line it was given,
+        // which is incompatible with sls_shell_execute()'s single-line
+        // string-in/string-out contract below. The password is now the
+        // second token on the same line, for both the serial console and
+        // the web terminal (one shared function now services both, so the
+        // two entry points can't diverge). Costs nothing security-wise:
+        // kernel/secure_api.c's own header comment already states this
+        // command does NOT encrypt the object's data.
         else if (sh_starts(input_buffer, "seal ")) {
-            kernel_serial_print("Enter encryption password: ");
+            const char* p = input_buffer + 5;
+            char name[OBJECT_NAME_LEN];
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(name, p, nlen + 1 < OBJECT_NAME_LEN
+                             ? nlen + 1 : OBJECT_NAME_LEN);
+            p = sh_next(p);
             char pw[32];
-            read_line(pw);
+            sh_copy(pw, p, sizeof(pw));
             uint64_t obj_id = 0;
-            const char* name = input_buffer + 5;
             for (uint32_t i = 0; i < object_catalog_count; i++) {
                 if (object_catalog[i].active &&
                     sh_eq(object_catalog[i].name, name)) {
@@ -1744,6 +1772,8 @@ void sls_shell_loop(void) {
             }
             if (!obj_id) {
                 kernel_serial_printf("seal: Object '%s' not found.\n", name);
+            } else if (!pw[0]) {
+                kernel_serial_print("seal: password required (usage: seal <name> <password>).\n");
             } else {
                 struct SLSSealRequest sreq;
                 sreq.system_object_id = obj_id;
@@ -1760,6 +1790,38 @@ void sls_shell_loop(void) {
             kernel_serial_printf(
                 "Unknown command: '%s'. Type 'help' for usage.\n",
                 input_buffer);
+            recognized = 0;
         }
+        else {
+            recognized = 0;
+        }
+
+    kernel_serial_capture_stop();
+    return recognized;
+}
+
+// SHELL_EXEC_OUT_CAP must match the constant of the same name in
+// net/http.c's api_shell_exec_post() -- no shared header exists for this
+// one value (matching sls_shell_loop()'s own long-standing "just an extern
+// declaration at the call site" convention, not a new header for one
+// function), so both copies carry this cross-reference instead.
+#define SHELL_EXEC_OUT_CAP 8192
+
+void sls_shell_loop(void) {
+    char input_buffer[256];
+    static char output_buffer[SHELL_EXEC_OUT_CAP];
+    kernel_serial_print("\n--- Multi-User SLS Secure Shell Active ---\n");
+    kernel_serial_print("Type 'help' for available commands.\n\n");
+
+    while (1) {
+        if (current_tx_id)
+            kernel_serial_printf("uid:%u[tx:%lu]> ", current_session_uid,
+                                 current_tx_id);
+        else
+            kernel_serial_printf("uid:%u> ", current_session_uid);
+
+        read_line(input_buffer);
+        sls_shell_execute(input_buffer, output_buffer, sizeof(output_buffer));
+        kernel_serial_print(output_buffer);
     }
 }
