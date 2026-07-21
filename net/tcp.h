@@ -17,7 +17,25 @@ typedef enum {
 } TCPState;
 
 // ─── Per-connection buffers and state ────────────────────────────────────────
-#define TCP_MAX_CONNS     8
+// Bumped from 8 -> 24 (VectorStore Interface Roadmap Phase 4 verification
+// pass): this single pool is shared by every INBOUND http.c connection
+// (including the frontend's own recurring background polling of /api/
+// health, /api/services, /api/wal, /api/tiers, /api/objects, /api/metrics,
+// several requests firing every few seconds) and every OUTBOUND connection
+// the kernel itself opens, e.g. ollama_client.c's tcp_connect() to reach
+// Ollama. tcp_connect() just returns -1 ("no free slots") if none are free
+// -- with only 8 total, a handful of live browser polling connections could
+// starve out an outbound Ollama call entirely, which is exactly what live
+// testing reproduced: the first embed-insert succeeded before poll traffic
+// built up, then embed-search and a second embed-insert both failed with
+// ollama_status=-1 while Ollama itself was confirmed healthy and reachable
+// via curl -- the kernel simply had no slot left to open a new outbound
+// connection with. 24 gives real headroom over the ~6-8 concurrent inbound
+// pollers this frontend can generate, at the cost of ~2.3 MiB more static
+// RAM (each slot's rbuf[] below plus http.c's own per-slot HTTP_REQ_BUF_SZ
+// buffer) -- trivial on this host's available RAM, and a single #define,
+// not a redesign, matching this fix's own narrow scope.
+#define TCP_MAX_CONNS     24
 #define TCP_RECV_BUF_SZ   32768   /* 32 KiB — supports 16 KiB upload chunks (32 KiB hex) */
 #define TCP_SEND_BUF_SZ   8192
 
