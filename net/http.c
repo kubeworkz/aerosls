@@ -1,6 +1,7 @@
 #include "http.h"
 #include "tcp.h"
 #include "net.h"
+#include "dhcp.h"   // Navigator-Parity Gap Roadmap Phase 5a -- dhcp_is_bound() for GET /api/network/status
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
 #include "../kernel/net_event.h"  // Architectural Phase 1 -- net_event_hlt_wait() for the multiplexed HTTP loop
@@ -97,6 +98,38 @@ void jb_uint(JSONBuf* j, const char* key, uint64_t val) {
     char tmp[21]; int len = 0;
     while (val) { tmp[len++] = (char)('0' + val % 10); val /= 10; }
     for (int i = len-1; i >= 0; i--) jb_putc(j, tmp[i]);
+}
+
+// Navigator-Parity Gap Roadmap Phase 5a: dotted-decimal IPv4 formatter.
+// IPv4Addr is stored in network byte order throughout net.h/dhcp.c (see
+// dhcp.c's own boot-log print for the identical ntohl()-then-shift
+// convention this mirrors) -- no dotted-IP formatter existed anywhere in
+// this codebase before this route needed one.
+static void jb_ip(JSONBuf* j, const char* key, IPv4Addr ip_net_order) {
+    uint32_t ip = ntohl(ip_net_order);
+    char buf[16]; int p = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        uint8_t octet = (uint8_t)((ip >> shift) & 0xFF);
+        if (octet >= 100) { buf[p++] = (char)('0' + octet/100); octet %= 100; buf[p++] = (char)('0' + octet/10); octet %= 10; buf[p++] = (char)('0'+octet); }
+        else if (octet >= 10) { buf[p++] = (char)('0' + octet/10); octet %= 10; buf[p++] = (char)('0'+octet); }
+        else { buf[p++] = (char)('0'+octet); }
+        if (shift) buf[p++] = '.';
+    }
+    buf[p] = '\0';
+    jb_str(j, key, buf);
+}
+
+// Navigator-Parity Gap Roadmap Phase 5a: colon-separated MAC formatter.
+static void jb_mac(JSONBuf* j, const char* key, MACAddr mac) {
+    char buf[18]; int p = 0;
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 6; i++) {
+        buf[p++] = hexd[(mac.b[i] >> 4) & 0xF];
+        buf[p++] = hexd[mac.b[i] & 0xF];
+        if (i < 5) buf[p++] = ':';
+    }
+    buf[p] = '\0';
+    jb_str(j, key, buf);
 }
 
 static void jb_hex(JSONBuf* j, const char* key, uint64_t val) {
@@ -887,6 +920,61 @@ static int api_tiers_json(char* buf, int max) {
         }
         jb_arr_close(&j);
     }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/network/status — Navigator-Parity Gap Roadmap Phase 5a ──────────
+// Surfaces the e1000 interface's negotiated IP/gateway/subnet/MAC (net.h's
+// runtime globals, updated by dhcp.c) plus TCP connection-pool utilization
+// (tcp_conns[]/TCP_MAX_CONNS -- already a real, sized resource, no new
+// tracking needed). dhcp_bound distinguishes a real DHCP lease from the
+// KERNEL_STATIC_* config.h fallback, so this route doesn't overclaim a live
+// lease when none was ever granted.
+static const char* tcp_state_name(TCPState s) {
+    switch (s) {
+        case TCP_CLOSED:       return "CLOSED";
+        case TCP_LISTEN:       return "LISTEN";
+        case TCP_SYN_RECEIVED: return "SYN_RECEIVED";
+        case TCP_ESTABLISHED:  return "ESTABLISHED";
+        case TCP_CLOSE_WAIT:   return "CLOSE_WAIT";
+        case TCP_LAST_ACK:     return "LAST_ACK";
+        case TCP_FIN_WAIT:     return "FIN_WAIT";
+        case TCP_TIME_WAIT:    return "TIME_WAIT";
+        case TCP_SYN_SENT:     return "SYN_SENT";
+        default:               return "UNKNOWN";
+    }
+}
+
+static int api_network_status_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_ip(&j,  "ip",           net_my_ip);       jb_putc(&j, ',');
+    jb_ip(&j,  "gateway",      net_gw_ip);       jb_putc(&j, ',');
+    jb_ip(&j,  "subnet_mask",  net_subnet_mask); jb_putc(&j, ',');
+    jb_mac(&j, "mac",          net_my_mac);      jb_putc(&j, ',');
+    jb_str(&j, "dhcp_bound",   dhcp_is_bound() ? "true" : "false"); jb_putc(&j, ',');
+
+    uint32_t active = 0;
+    uint32_t by_state[TCP_SYN_SENT + 1]; // dense: one slot per TCPState value
+    for (uint32_t s = 0; s <= TCP_SYN_SENT; s++) by_state[s] = 0;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!tcp_conns[i].active) continue;
+        active++;
+        by_state[tcp_conns[i].state]++;
+    }
+    jb_obj_open(&j, "tcp_pool");
+    jb_uint(&j, "active",   active);        jb_putc(&j, ',');
+    jb_uint(&j, "capacity", TCP_MAX_CONNS); jb_putc(&j, ',');
+    jb_obj_open(&j, "by_state");
+    int first_state = 1;
+    for (uint32_t s = 0; s <= TCP_SYN_SENT; s++) {
+        if (!by_state[s]) continue;
+        if (!first_state) jb_putc(&j, ','); first_state = 0;
+        jb_uint(&j, tcp_state_name((TCPState)s), by_state[s]);
+    }
+    jb_obj_close(&j);
+    jb_obj_close(&j); /* tcp_pool */
+
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
@@ -2859,6 +2947,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/tiers")) {
             blen = api_tiers_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Navigator-Parity Gap Roadmap Phase 5a: network status ─────────────
+        if (!strcmp(path, "/api/network/status")) {
+            blen = api_network_status_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/processes")) {

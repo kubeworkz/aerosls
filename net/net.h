@@ -92,13 +92,17 @@ static inline uint16_t net_checksum(const void* data, size_t len) {
 }
 
 // ─── Our addresses ────────────────────────────────────────────────────────────
-// Both are runtime variables so DHCP (Phase H2) can update them without a
-// recompile.  Defaults come from include/config.h (KERNEL_STATIC_IP / _GW).
-// Use NET_MY_IP / NET_GW_IP as before — they now expand to the variables.
+// All three are runtime variables so DHCP (Phase H2, extended by Navigator-
+// Parity Gap Roadmap Phase 5a for the subnet mask) can update them without a
+// recompile.  Defaults come from include/config.h (KERNEL_STATIC_IP / _GW /
+// _SUBNET). Use NET_MY_IP / NET_GW_IP / NET_SUBNET_MASK — they expand to the
+// variables.
 extern IPv4Addr net_my_ip;
 extern IPv4Addr net_gw_ip;
-#define NET_MY_IP   (net_my_ip)
-#define NET_GW_IP   (net_gw_ip)
+extern IPv4Addr net_subnet_mask;
+#define NET_MY_IP        (net_my_ip)
+#define NET_GW_IP        (net_gw_ip)
+#define NET_SUBNET_MASK  (net_subnet_mask)
 
 // Runtime MAC address — filled from the NIC's EEPROM by e1000_init().
 // Zero until e1000_init() has run.

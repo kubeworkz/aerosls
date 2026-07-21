@@ -58,11 +58,16 @@ struct DHCPMessage {
 } __attribute__((packed));
 
 // ─── DHCP client state ────────────────────────────────────────────────────────
-static volatile uint8_t  dhcp_state       = 0;  // 0=idle,1=offered,2=acked
-static volatile uint32_t dhcp_offered_ip  = 0;
-static volatile uint32_t dhcp_server_id   = 0;
-static volatile uint32_t dhcp_offered_gw  = 0;
-static const uint32_t    dhcp_xid         = 0xAE524C53UL; // "SLSR" fixed XID
+static volatile uint8_t  dhcp_state         = 0;  // 0=idle,1=offered,2=acked
+static volatile uint32_t dhcp_offered_ip    = 0;
+static volatile uint32_t dhcp_server_id     = 0;
+static volatile uint32_t dhcp_offered_gw    = 0;
+// Navigator-Parity Gap Roadmap Phase 5a: previously there was no subnet
+// concept anywhere in this client at all -- dhcp_recv() never read
+// DHCP_OPT_SUBNET. Added following dhcp_offered_gw's exact pattern (offer
+// stashes it, ACK commits it to the real net.h global).
+static volatile uint32_t dhcp_offered_subnet = 0;
+static const uint32_t    dhcp_xid           = 0xAE524C53UL; // "SLSR" fixed XID
 
 // ─── Option helpers ───────────────────────────────────────────────────────────
 static uint8_t* opt_append(uint8_t* p, uint8_t tag, uint8_t len, uint32_t val) {
@@ -88,9 +93,10 @@ static void dhcp_recv(const uint8_t* data, uint16_t len, IPv4Addr src_ip) {
     if (msg->op != DHCP_OP_REPLY) return;
 
     // Parse options — they start immediately after the 240-byte fixed header
-    uint8_t  msg_type   = 0;
-    uint32_t server_id  = 0;
-    uint32_t offered_gw = 0;
+    uint8_t  msg_type       = 0;
+    uint32_t server_id      = 0;
+    uint32_t offered_gw     = 0;
+    uint32_t offered_subnet = 0;   // Navigator-Parity Gap Roadmap Phase 5a
     const uint8_t* opt = data + sizeof(struct DHCPMessage);
     const uint8_t* end = data + len;
     while (opt < end && *opt != DHCP_OPT_END) {
@@ -106,6 +112,12 @@ static void dhcp_recv(const uint8_t* data, uint16_t len, IPv4Addr src_ip) {
         if (tag == DHCP_OPT_ROUTER    && olen >= 4)
             offered_gw= ((uint32_t)opt[0]<<24)|((uint32_t)opt[1]<<16)|
                         ((uint32_t)opt[2]<<8) |opt[3];
+        // Navigator-Parity Gap Roadmap Phase 5a: DHCP_OPT_SUBNET (tag 1) was
+        // never read here before -- no subnet concept existed anywhere in
+        // this client.
+        if (tag == DHCP_OPT_SUBNET   && olen >= 4)
+            offered_subnet = ((uint32_t)opt[0]<<24)|((uint32_t)opt[1]<<16)|
+                             ((uint32_t)opt[2]<<8) |opt[3];
         opt += olen;
     }
 
@@ -113,15 +125,19 @@ static void dhcp_recv(const uint8_t* data, uint16_t len, IPv4Addr src_ip) {
         // Store offered IP (yiaddr is already in network byte order)
         dhcp_offered_ip = msg->yiaddr;
         dhcp_server_id  = htonl(server_id);   // back to network order
-        // Convert gateway to network order for storage
+        // Convert gateway/subnet to network order for storage
         if (offered_gw) {
             dhcp_offered_gw = htonl(offered_gw);
+        }
+        if (offered_subnet) {
+            dhcp_offered_subnet = htonl(offered_subnet);
         }
         dhcp_state = 1;  // OFFERED
     } else if (msg_type == DHCP_MSG_ACK && dhcp_state == 1) {
         // Commit the IP
         net_my_ip = msg->yiaddr;
         if (dhcp_offered_gw) net_gw_ip = dhcp_offered_gw;
+        if (dhcp_offered_subnet) net_subnet_mask = dhcp_offered_subnet;
         dhcp_state = 2;  // ACKED / BOUND
     }
 }
@@ -193,13 +209,22 @@ void dhcp_start(void) {
     udp_register(DHCP_CLIENT_PORT, 0);  // unregister callback
 
     if (dhcp_state == 2) {
-        // net_my_ip and net_gw_ip are now set; print them
+        // net_my_ip, net_gw_ip, and net_subnet_mask are now set; print them
         uint32_t ip = ntohl(net_my_ip);
         uint32_t gw = ntohl(net_gw_ip);
-        kernel_serial_printf("[DHCP] Bound: %u.%u.%u.%u  gw %u.%u.%u.%u\n",
+        uint32_t sm = ntohl(net_subnet_mask);
+        kernel_serial_printf(
+            "[DHCP] Bound: %u.%u.%u.%u  gw %u.%u.%u.%u  subnet %u.%u.%u.%u\n",
             (ip>>24)&0xFF, (ip>>16)&0xFF, (ip>>8)&0xFF, ip&0xFF,
-            (gw>>24)&0xFF, (gw>>16)&0xFF, (gw>>8)&0xFF, gw&0xFF);
+            (gw>>24)&0xFF, (gw>>16)&0xFF, (gw>>8)&0xFF, gw&0xFF,
+            (sm>>24)&0xFF, (sm>>16)&0xFF, (sm>>8)&0xFF, sm&0xFF);
     } else {
         kernel_serial_print("[DHCP] REQUEST timed out — using static IP.\n");
     }
+}
+
+// ─── dhcp_is_bound ────────────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 5a.
+int dhcp_is_bound(void) {
+    return dhcp_state == 2;
 }

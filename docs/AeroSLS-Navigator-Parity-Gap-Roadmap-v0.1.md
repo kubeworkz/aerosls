@@ -677,6 +677,91 @@ via Terminal and (if built in this phase) a Work Management panel.
 
 ## Phase 5 — Configurable network interfaces + storage-unit visibility
 
+### Further mapping done before implementation
+
+The original draft below (still preserved at the bottom of this section)
+assumed `dhcp.c`'s own state already covers IP/gateway/subnet, and that
+Phase 2's NVMe capacity capture would be new material for a `/api/disk`
+route. A closer read of `net/dhcp.c`, `net/tcp.h`, `drivers/nvme_admin.c`,
+and `kernel/object_catalog.h` before writing any code found two of those
+assumptions only partly true:
+
+- **Subnet mask isn't actually captured anywhere.** `dhcp.c`'s option
+  parser (`dhcp_recv()`) reads `DHCP_OPT_ROUTER` (tag 3) into
+  `dhcp_offered_gw`, but never reads `DHCP_OPT_SUBNET` (tag 1) at all — no
+  variable holds it. "Surfacing IP/gateway/subnet from dhcp.c's own state"
+  is two-thirds true; subnet needs a small new parser branch, not just a
+  read of something already sitting there.
+- **Disk capacity is already exposed.** Phase 2 put
+  `nvme_get_capacity_bytes()` into `GET /api/metrics` as
+  `disk_capacity_bytes` already. A separate `/api/disk` route as originally
+  drafted would mostly duplicate that unless it adds something new.
+- **Per-tier capacity doesn't exist anywhere today** — `kernel/tier_mgr.c`'s
+  `tier_stats[]` (surfaced via the existing `/api/tiers`) tracks only
+  access-count and idle-ticks per object, no byte accounting at all. It's
+  still cheap to build, though: every `SLSObjectEntry` (`object_catalog.h`)
+  already carries `size_pages` and `storage_tier`, so summing
+  `size_pages × 4096` grouped by tier over `object_catalog[]` is a few
+  lines against data that's already there — genuinely new computation, but
+  a small one.
+
+This splits the phase into smaller, independently-verifiable pieces rather
+than the two big bullets originally drafted:
+
+- **5a — Network status — DONE.** Added `DHCP_OPT_SUBNET` (tag 1) parsing
+  to `dhcp.c`'s `dhcp_recv()`, following `dhcp_offered_gw`'s exact
+  offer-then-commit pattern (`dhcp_offered_subnet` static, committed to the
+  new `net_subnet_mask` global on ACK). `net.h`/`net.c` gained
+  `net_subnet_mask` (default `KERNEL_STATIC_SUBNET` = 255.255.255.0,
+  `include/config.h`) alongside the existing `net_my_ip`/`net_gw_ip`.
+  `dhcp.h` gained `dhcp_is_bound()` so callers can tell a real DHCP lease
+  from the static fallback. New route `GET /api/network/status`
+  (`net/http.c`) returns `ip`/`gateway`/`subnet_mask` (new `jb_ip()`
+  dotted-decimal formatter) /`mac` (new `jb_mac()` colon-hex formatter)/
+  `dhcp_bound`, plus a `tcp_pool` object (`active`/`capacity` from
+  `tcp_conns[]`/`TCP_MAX_CONNS`, and a `by_state` breakdown using a new
+  `tcp_state_name()`). No dedicated host test was written for the two new
+  formatters or the state-tally loop — matching this codebase's existing
+  precedent that JSON-emitting HTTP route functions (`api_processes_json`,
+  `api_security_audit_json`, `api_tiers_json`, etc.) are verified by
+  compile-check plus a live pass, not a dedicated host test, reserved
+  instead for modules with real algorithmic risk (schedulers, security
+  logic, byte-math). The formatter logic was desk-checked by hand for
+  off-by-one/buffer-size correctness (`jb_ip`'s worst case is exactly 15
+  characters + NUL in a 16-byte buffer; `jb_mac`'s is exactly 17 + NUL in
+  18) before being left as-is; Phase 5b's per-tier byte aggregation still
+  gets a real host test as planned, since that one has actual new logic
+  worth verifying that way. Compile-check: zero new errors. Full
+  regression: 26/26 host tests still passing (unaffected, as expected —
+  none of them touch networking).
+- **5b — Storage status.** `GET /api/disk` combining the already-exposed
+  NVMe capacity with the new per-tier bytes-used/object-count aggregation
+  described above — the one genuinely new piece of math in this phase.
+- **5c — Terminal commands** for both (`net status`, `disk status`),
+  matching every prior phase's Terminal-first pattern.
+- **5d — Frontend panel: scoped out for this pass**, same call as Phase
+  4e — Terminal plus the two new HTTP routes satisfy "visibility" for v1;
+  a dedicated Network/Storage tab in `slsos-sim` is a reasonable follow-on,
+  not built here.
+- **5e — Host tests + compile-check + Makefile check + doc update +
+  present.**
+
+**Deliberately still out of scope for v1** (unchanged from the original
+draft): runtime-configurable IP/DNS/routing and true multi-disk/RAID
+management — these would require rearchitecting the network/storage
+stacks to read config from a mutable source rather than compile-time
+constants and boot-time DHCP negotiation, a substantially larger effort
+than the rest of this roadmap and better scoped as its own follow-on doc
+once the read-only visibility here proves useful.
+
+**Verification:** compile-check; a host test for the new per-tier
+byte-aggregation math (the one new computation in this phase); live pass
+confirming `/api/network/status` matches the kernel's own boot-log-reported
+DHCP lease (including the newly-captured subnet) and `/api/disk` matches
+real NVMe capacity plus the new per-tier totals.
+
+### Original Phase 5 scope (as first drafted, before the mapping above)
+
 **Goal:** this category is the largest gap in kind (compiled-in constants
 vs. administrable objects), so this phase is scoped deliberately light —
 visibility and a small amount of runtime configuration, not a full network

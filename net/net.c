@@ -10,6 +10,9 @@
 MACAddr  net_my_mac;                         // filled by e1000_init()
 IPv4Addr net_my_ip  = KERNEL_STATIC_IP;      // 10.0.2.15 by default
 IPv4Addr net_gw_ip  = KERNEL_STATIC_GW;      // 10.0.2.2  by default
+// Navigator-Parity Gap Roadmap Phase 5a: subnet mask, updated by DHCP
+// (dhcp.c's dhcp_recv()) the same way net_my_ip/net_gw_ip already are.
+IPv4Addr net_subnet_mask = KERNEL_STATIC_SUBNET;  // 255.255.255.0 by default
 
 // ─── Static packet buffer pool ───────────────────────────────────────────────
 static uint8_t  pkt_pool[NET_PKT_BUF_COUNT][NET_PKT_BUF_SIZE]

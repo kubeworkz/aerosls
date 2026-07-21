@@ -19,6 +19,14 @@
 // Default gateway for the subnet above (QEMU user-net gateway = 10.0.2.2).
 #define KERNEL_STATIC_GW  0x0202000AUL   // 10.0.2.2
 
+// Navigator-Parity Gap Roadmap Phase 5a: default subnet mask (QEMU user-net
+// default = 255.255.255.0 / a /24). Same byte-order convention as the two
+// constants above — [0xFF,0xFF,0xFF,0x00] → 0x00FFFFFFUL. Previously there
+// was no subnet concept anywhere in this codebase at all (dhcp.c's option
+// parser never read DHCP_OPT_SUBNET); this is a genuinely new value, not a
+// pre-existing constant that was simply unwired.
+#define KERNEL_STATIC_SUBNET  0x00FFFFFFUL   // 255.255.255.0
+
 // Kernel HTTP server port (guest-side; QEMU forwards host:3001 → guest:3000)
 #define KERNEL_HTTP_PORT  3000
 
