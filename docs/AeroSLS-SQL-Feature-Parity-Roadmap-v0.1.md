@@ -1,0 +1,404 @@
+# AeroSLS SQL Feature-Parity Roadmap v0.1
+
+## 0. Why this doc exists
+
+This doc scopes the gap between AeroSLS's SQL engine (`kernel/sql_parser.c`/
+`sql_exec.c`, Phases 16-24 of the RDBMS roadmap) and SQLite's SQL *surface
+area* — deliberately not its reliability/durability bar, which is a
+separate, much larger kind of effort (fuzzing, crash-injection testing,
+years of edge-case hardening) not addressed here. This doc is scoped to:
+if you sat down and wrote real SQL against AeroSLS today, what would you
+hit that SQLite wouldn't stop you on?
+
+Every gap below is read directly from `sql_parser.h`'s own header comment
+(which already documents its grammar and an explicit "out of scope" list —
+this doc mostly promotes that list into a phased plan) plus
+`row_constraint.h`, `rowstore.h`, and `object_catalog.h`, not assumed.
+
+**What already exists, real and working:** a hand-rolled lexer +
+recursive-descent parser for `SELECT`/`INSERT`/`UPDATE`/`DELETE`, a real
+`WHERE` predicate engine with `AND`/`OR` and standard precedence, `ORDER
+BY`/`LIMIT`, a two-table `INNER JOIN`, B-tree indexing, MVCC concurrency,
+transactions, and `UNIQUE`/`NOT NULL`/`RANGE`/`REFERENCE` constraints with
+real enforcement (`mvcc.c` calls into `row_constraint.c` on every write, not
+opt-in). That's a genuine relational core, not a toy.
+
+**The gaps, in the order this doc sequences them:**
+
+1. `GROUP BY`/`HAVING`/aggregate functions aren't in the SQL grammar at
+   all — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` only exist via a separate
+   `aggregate`/`mqt` command surface outside `sql_parse()`. You cannot
+   write `SELECT dept, COUNT(*) FROM employees GROUP BY dept` as SQL text
+   today — the single highest-value gap, since aggregate queries are
+   extremely common and this isn't a matter of missing polish, it's a
+   missing grammar production.
+2. `JOIN` is capped at exactly two tables, `INNER` only, no table aliases
+   (`sql_parser.h`'s own words: "explicitly out of scope: three-or-more-
+   table joins, OUTER JOIN... table aliasing"). `employees.id`, not `e.id`.
+3. The `WHERE`/`SET` expression language is minimal: no parenthesized
+   grouping beyond natural `AND`-before-`OR` precedence, no `IN (...)`, no
+   `LIKE`, no `IS NULL`/`IS NOT NULL`, no arithmetic. `comparison :=
+   column_ref compare_op literal` is the entire expression grammar today.
+4. There's no `NULL` as a real, representable value — `struct RowValues`
+   (`rowstore.h`) is fixed-width strings with no null bitmap or sentinel
+   type at all. `NOT NULL` constraint checking exists, but what it's
+   actually checking against isn't a true tri-state column value the way
+   SQLite has. No `BLOB` type either — the four column types are fixed at
+   `STRING`/`UINT64`/`FLOAT`/`BOOL` (`object_catalog.h`), not SQLite's
+   dynamic typing with type affinity.
+5. There's no DDL in SQL text, at all. `row_constraint.h`'s own comment
+   names this directly: "`sql_parser.c`'s grammar has no DDL at all
+   today — tables are created via the pre-existing `sys_sls_schema_set` +
+   `rowstore_create_table()` path." `CREATE TABLE`, `ALTER TABLE`, `DROP
+   TABLE`, `CREATE INDEX`, and constraint registration are all
+   direct-API-only, never `sql_parse()`-reachable.
+6. `INSERT` requires a full, explicit column list covering every column in
+   one row per statement — no multi-row `VALUES (...), (...), ...`, no
+   partial-column insert with defaults.
+7. No subqueries (scalar or `IN (SELECT ...)`), no views, no CTEs (`WITH`),
+   no `UNION`/`INTERSECT`/`EXCEPT`, no window functions, no triggers — all
+   explicitly named out of scope in `sql_parser.h`'s own comment and never
+   revisited since.
+
+---
+
+## Phase 1 — GROUP BY / HAVING / aggregate functions in core SQL grammar — DONE
+
+**Goal:** make `SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING
+COUNT(*) > 2` real SQL text, not a separate `aggregate`/`mqt` command.
+
+**What already exists and is reusable:** the `aggregate`/`mqt` command
+surface (`sql_exec.c` or wherever it currently lives — confirm exact file
+during implementation) already has working `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
+math and `group_by`/`having` filtering logic; this phase's job is mostly
+grammar (recognize `GROUP BY`/`HAVING` and aggregate-function-call syntax
+in `sql_parse()`, extend `struct SqlSelectStmt`) and wiring the parsed form
+into the planner/executor path that already knows how to do the
+computation, not reinventing the aggregation math.
+
+**What needs to be built:** `GROUP BY column_ref (',' column_ref)*` and
+`HAVING predicate` productions in `select_stmt`; recognizing
+`COUNT(*)`/`COUNT(col)`/`SUM(col)`/`AVG(col)`/`MIN(col)`/`MAX(col)` as
+valid `select_list` entries (a new AST node distinct from a plain
+`column_ref`, since it carries a function kind + optional argument);
+`sql_exec.c` executor support for grouping rows by key and evaluating
+`HAVING` against each group's aggregate result before emitting it.
+
+**Verification:** host test covering grouped aggregates over multiple
+groups, `HAVING` filtering some groups out, `COUNT(*)` vs `COUNT(col)`
+(the latter should exclude any not-really-NULL-yet-but-empty sentinel
+values consistently — flag any inconsistency found here rather than
+silently picking a convention); compile-check; regression sweep against
+the existing `aggregate`/`mqt` host tests to confirm they still pass
+unchanged (this phase adds a grammar path to the same math, it shouldn't
+change the existing one).
+
+### Scope correction made during implementation
+
+The original draft assumed the existing `aggregate`/`mqt` command surface
+(`kernel/aggregate.h`/`.c`, reachable via `POST /api/aggregate`) could be
+wired into as-is, with this phase mostly being grammar work over shared
+math. Reading `aggregate.c` directly disproved that: it operates
+exclusively on the legacy `object_records[]` KV model via field-name-suffix
+matching, and is structurally incompatible with the row-set model
+(`rowstore.h`/`RowValues`) that `sql_exec.c` actually executes queries
+against. This is the same "structural wall" `row_constraint.h`'s own header
+comment names for why `row_constraint.c` had to be built as a new parallel
+file next to legacy `constraint.c`, rather than extended — an established
+precedent in this codebase (`row_index.c` next to `index_mgr.c`, `mvcc.c`
+with no legacy analog). `exec_select_group()` in `sql_exec.c` is therefore
+a fresh implementation over the row-set model, not a call into
+`aggregate_exec()`. The existing `aggregate`/`mqt` KV-model command surface
+is untouched and still works exactly as before (confirmed via the
+unmodified `sql_exec_host_test`/`sql_join_host_test`/`sql_tx_host_test`/
+`sql_parser_host_test` all still passing unchanged).
+
+Grammar and executor design followed the same "bake canonical names into a
+synthetic result layout" pattern Phase 20's JOIN established (`table.column`
+qualified names baked into a query-time-only `RowTableLayout`): here,
+rendered aggregate-call text like `COUNT(*)`/`SUM(amount)` is baked into
+both the grouped result's synthetic column names and (for `HAVING`) the
+predicate's comparison `column_name`, so `predicate_eval()`,
+`compare_rows_by_column()`, and `cursor_open_rowset()` all "just work"
+unchanged — zero changes needed to `predicate.h`. `MIN`/`MAX` reuse the
+existing type-aware comparison logic via a new `compare_typed()` helper
+extracted from `compare_rows_by_column()`, so they work correctly on
+non-numeric columns (verified with a `STRING` column) and not just numbers.
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` were deliberately kept as ordinary
+identifiers, not reserved keywords — disambiguated purely by lookahead for
+an immediately-following `(` — matching real SQL practice and verified by
+a dedicated regression test confirming a column literally named `count`
+still parses as a plain column reference.
+
+One real gap was found by the host test, not by inspection: `ORDER BY`'s
+grammar had not been extended to accept aggregate-call syntax even though
+`HAVING`'s had, so `ORDER BY COUNT(*) DESC` failed to parse. Fixed by
+routing `ORDER BY`'s parsing through the same `parse_select_item()`
+machinery `HAVING` already used, discarding the function/arg parts it
+doesn't need.
+
+Single-column `GROUP BY` only (no multi-column grouping); `GROUP BY`
+combined with `JOIN` is an explicit, cleanly-rejected error
+(`SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED`) rather than attempted, since row-set
+JOIN's synthetic combined layout and GROUP BY's synthetic grouped layout
+were not designed to compose — left for a future phase if ever needed. No
+result-column aliasing (`COUNT(*) AS total`) — out of scope here, matches
+Phase 2's JOIN aliasing being its own separate phase.
+
+**Verification — actual results:** `tests/sql_group_phase1_host_test.c`
+(new, 34 checks) covers grouped `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` together,
+`MIN`/`MAX` on a `STRING` column, `HAVING` with both `COUNT` and `AVG`,
+bare aggregates with and without `GROUP BY` (including the zero-match case
+correctly still returning one row per SQL semantics, not an empty result),
+`ORDER BY`+`LIMIT` on a grouped/aggregate result, six distinct error paths
+(non-grouped/non-aggregated column, `SUM()` on a `STRING`, unknown `GROUP
+BY` column, `HAVING` referencing an aggregate not in the `SELECT` list,
+unknown `ORDER BY` column, `GROUP BY`+`JOIN`), parser-level checks
+(`SUM(*)` correctly rejected, `HAVING` without an aggregate correctly
+rejected at parse time), and the `count`-as-column-name regression. Full
+regression sweep (`tests/run_all.sh`): **28/28 host test files passing, 0
+failed** — includes the new file plus all four other `sql_*_host_test.c`
+files that link the modified `sql_parser.c`/`sql_exec.c` (`sql_exec_host_test`,
+`sql_join_host_test`, `sql_parser_host_test`, `sql_tx_host_test`), all
+unchanged. `net/http.c` compile-checked clean against the updated
+`sql_exec.h`/`sql_parser.h` (pre-existing, unrelated `-Wimplicit-function-
+declaration` warnings only — no errors, nothing touching the SQL/aggregate
+change surface).
+
+---
+
+## Phase 2 — N-way JOIN + table aliasing (+ OUTER JOIN)
+
+**Goal:** `SELECT e.name, d.name FROM employees e JOIN departments d ON
+e.dept_id = d.id JOIN salaries s ON s.emp_id = e.id` — chained joins with
+aliases, plus `LEFT JOIN` at minimum.
+
+**What already exists and is reusable:** Phase 20's two-table `INNER
+JOIN` already solved the hard part — qualified `table.column` resolution
+across two row sources and a real `ON` predicate. This phase generalizes
+that from "exactly two tables" to "a chain of `join_clause`s," and adds an
+alias table so `e.id` resolves to `employees.id` without new resolution
+logic, just an alias→real-name lookup ahead of the existing qualifier
+resolution.
+
+**What needs to be built:** `join_clause := (JOIN | LEFT JOIN) ident
+[AS ident] ON predicate (join_clause)*` (repeatable, not fixed at one);
+an alias map in `struct SqlSelectStmt`; executor changes to build a
+multi-way join result incrementally (chain nested-loop joins left to
+right — matching this codebase's consistent "smallest real version first"
+posture rather than a real join-order optimizer, which is Phase 6 in the
+reliability-adjacent sense but explicitly not attempted here); `LEFT
+JOIN` NULL-padding for unmatched left-side rows, which depends on Phase 4
+(real `NULL`) landing first or a documented interim sentinel.
+
+**Verification:** host test with a 3-table chain confirming correct
+row multiplication and column resolution; `LEFT JOIN` test confirming
+unmatched rows appear once with the right-side columns empty/NULL rather
+than being silently dropped; compile-check; regression sweep against the
+existing Phase 20 two-table-join host test (should be a strict subset of
+this phase's new behavior, not a behavior change).
+
+---
+
+## Phase 3 — WHERE/SET expression richness
+
+**Goal:** parenthesized grouping, `IN (...)`, `LIKE`, `IS NULL`/`IS NOT
+NULL`, and basic arithmetic (`+ - * /`) in `WHERE`/`SET`/`HAVING`.
+
+**What already exists and is reusable:** `predicate.h`'s `struct
+Predicate` with its `add_comparison`/`add_and`/`add_or` primitives
+(Phase 18) is the right extension point — parenthesized grouping is a
+parser-side tree-shape change (build a real predicate tree instead of the
+current flat `and_expr (OR and_expr)*` shape), not a new predicate
+runtime; `IN`/`LIKE`/`IS NULL` are new comparison *kinds* added to the
+same `struct Predicate` machinery, not a parallel system.
+
+**What needs to be built:** real parenthesized `predicate` grouping
+(currently absent per `sql_parser.h`'s own comment: "no explicit
+parenthesized grouping in this first cut"); `IN (literal, literal, ...)`
+and (once Phase 7's subqueries exist) `IN (SELECT ...)`; `LIKE` with `%`/`_`
+wildcards; `IS NULL`/`IS NOT NULL` (depends on Phase 4 landing real NULL
+first, or this phase and Phase 4 merge); a small arithmetic expression
+grammar for numeric columns in `WHERE`/`SET` (`price * 1.1 > 100`).
+
+**Verification:** host test per new predicate kind (grouping precedence,
+`IN` membership, `LIKE` wildcard matching including edge cases like empty
+pattern and literal `%`/`_` via escaping if scoped in, `IS NULL`
+including the NULL-representation decision from Phase 4); compile-check;
+regression sweep confirming existing flat `AND`/`OR` queries parse
+identically (this phase changes the predicate tree's *shape* capability,
+not its meaning for statements that don't use the new grouping).
+
+---
+
+## Phase 4 — Real NULL + BLOB, dynamic-typing groundwork
+
+**Goal:** `NULL` as a genuine third state distinct from `""`/`0`, and a
+`BLOB` column type — closing the type-system gap named in §0.4.
+
+**What already exists and is reusable:** `RowConstraintKind
+ROW_CONSTRAINT_NOT_NULL` already exists and is enforced
+(`row_constraint_check_write()`) — this phase needs to give it something
+real to check against instead of (presumably) an empty-string convention;
+confirm exactly what today's `NOT_NULL` check compares against during
+implementation before assuming it needs to change, since it may already
+be checking a convention this phase can just formalize rather than
+replace.
+
+**What needs to be built:** a null bitmap or sentinel byte added to
+`struct RowValues` (`rowstore.h`) — a real per-column "is this NULL"
+flag, not an encoding trick inside the existing fixed-width string slot;
+`SLSFieldType` (`object_catalog.h`) gains `FIELD_TYPE_BLOB`; parser/
+executor support for the `NULL` literal in `INSERT`/`UPDATE` and `IS
+NULL`/`IS NOT NULL` predicates (Phase 3); `field_type_name()` and every
+serializer touching `RowValues` (JSON routes in `net/http.c`, the
+Terminal's `sql`/`select` output formatting) updated to round-trip NULL
+correctly instead of rendering it as an empty string indistinguishable
+from a real empty string value.
+
+**Verification:** host test confirming NULL survives an INSERT → SELECT
+round-trip distinctly from an empty string / zero; `NOT NULL` constraint
+correctly rejects a real NULL insert (and, importantly, confirms it did
+*not* already silently work via the empty-string convention pre-phase —
+name explicitly whichever is true); compile-check across every touched
+serializer; regression sweep for `row_constraint_journal_host_test` and
+`rowstore_host_test` (both touch `RowValues` shape directly and are the
+most likely to break silently from a struct layout change).
+
+---
+
+## Phase 5 — DDL in SQL text (CREATE/ALTER/DROP TABLE, CREATE/DROP INDEX)
+
+**Goal:** `CREATE TABLE employees (id UINT64, name STRING)`, `ALTER TABLE
+employees ADD COLUMN dept STRING`, `DROP TABLE employees`, `CREATE INDEX
+idx1 ON employees (dept)` as real SQL text.
+
+**What already exists and is reusable:** every piece of machinery this
+phase needs already exists and works, per `row_constraint.h`'s own
+comment — `sys_sls_schema_set`/`rowstore_create_table()` for table
+creation, `row_index_create()` for indexes, `row_constraint_add_*()` for
+constraints. This phase is entirely new *grammar* that calls the same
+existing functions the direct-API/HTTP path already calls, not new
+storage-engine work — matching the exact gap that comment names as
+"a future 'make DDL live' phase."
+
+**What needs to be built:** `create_table_stmt`, `alter_table_stmt`
+(`ADD COLUMN` only for v1 — `DROP COLUMN`/`RENAME` are real storage-layout
+changes to `RowTableLayout` and can be scoped separately if `ADD COLUMN`
+alone proves insufficient), `drop_table_stmt`, `create_index_stmt`,
+`drop_index_stmt` productions in `sql_parser.c`; `sql_exec.c` dispatch for
+each straight into the existing functions named above; column-type
+keywords (`STRING`/`UINT64`/`FLOAT`/`BOOL`, plus `BLOB` if Phase 4
+landed first) recognized in `CREATE TABLE`'s column-definition list, and
+inline `UNIQUE`/`NOT NULL`/`REFERENCES table(col)` constraint syntax
+translated into the corresponding `row_constraint_add_*()` calls at
+`CREATE TABLE` time.
+
+**Verification:** host test creating a table via SQL text and confirming
+it's indistinguishable from one created via the direct API (same
+`RowTableLayout`, same queryable via `SELECT`); `ALTER TABLE ADD COLUMN`
+test confirming existing rows get a sensible default/NULL for the new
+column, not corruption; `DROP TABLE`/`DROP INDEX` test confirming clean
+teardown with no dangling `row_constraints[]`/`row_index` entries left
+pointing at a freed `table_object_id`; compile-check; full regression
+sweep (this phase touches the shared DDL functions every other phase's
+tests also call, so regressions here would be broad and worth catching
+early).
+
+---
+
+## Phase 6 — Multi-row INSERT + partial-column INSERT
+
+**Goal:** `INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')` and
+`INSERT INTO t (a) VALUES (1)` (other columns get NULL/default, not a
+parse error).
+
+**What already exists and is reusable:** `rowstore_row_insert()`
+(`rowstore.h`) already takes one `struct RowValues` per call — this phase
+is a parser/executor loop over multiple parsed value-tuples calling the
+existing single-row insert path once per row (a transaction-scoped loop,
+matching how `mvcc.c` already wraps individual writes), not a new bulk-
+insert primitive.
+
+**What needs to be built:** `VALUES '(' literal-list ')' (',' '('
+literal-list ')')*` grammar; partial-column INSERT filling any column not
+named in the statement with NULL (Phase 4) rather than requiring
+`rowstore_row_insert()`'s current all-columns-required contract to be
+satisfied by the caller — worth confirming during implementation whether
+that contract lives in `rowstore.c` itself or only in `sql_exec.c`'s
+caller-side assembly of the `RowValues`, since that determines whether
+this phase touches `rowstore.c` at all or stays entirely in the SQL layer.
+
+**Verification:** host test for multi-row insert (confirm all rows land,
+in order, in one statement); partial-column insert test confirming
+omitted columns are NULL, not zero-filled/corrupted; a mixed-transaction
+test (multi-row INSERT inside an explicit transaction, then rollback)
+confirming MVCC treats all rows from one statement as atomic together;
+compile-check; regression sweep.
+
+---
+
+## Phase 7 — Subqueries, views, CTEs, set operations
+
+**Goal:** the remaining, most SQLite-like-but-hardest gaps: scalar and
+`IN (SELECT ...)` subqueries, `CREATE VIEW`, `WITH` CTEs, and
+`UNION`/`INTERSECT`/`EXCEPT`.
+
+**Sequenced last, deliberately:** every one of these either depends on
+infrastructure from earlier phases (views need DDL from Phase 5;
+`IN (SELECT ...)` needs Phase 3's `IN` grammar already in place) or is a
+substantially bigger executor change than anything above — a subquery
+means the executor can recursively invoke itself and materialize an
+intermediate result set, which today's `sql_exec.c` has never needed to
+do (every existing query, including the two/N-table join, resolves
+directly against real stored tables, never against another query's
+output). This is the point where "extend the existing planner" stops
+being accurate framing and "build a real nested-execution model" starts
+being the honest one — worth scoping as its own follow-on doc once
+Phases 1-6 are in and there's a clearer read on how much of this is
+actually wanted, rather than committing to detailed sub-phases here for
+work that's still fairly speculative.
+
+**What's known now:** scalar subqueries (`WHERE dept_id = (SELECT id FROM
+departments WHERE name = 'Eng')`) are the smallest real slice — a
+subquery that must return exactly one row/column, executed once,
+substituted as a literal into the outer predicate; `IN (SELECT ...)` is
+the next smallest, since it reuses Phase 3's `IN` grammar with a subquery
+in place of a literal list; correlated subqueries, views, CTEs, and set
+operations are all bigger asks than a first cut needs to include and are
+left unscoped until the smaller slice ships and proves out the
+recursive-execution approach.
+
+**Verification (once scoped in detail):** whatever this phase becomes
+should follow the same bar as every phase above — host test, compile-
+check, full regression sweep — but the detailed test plan isn't written
+here since the implementation approach itself isn't committed yet.
+
+---
+
+## Suggested sequencing
+
+1. **Phase 1 (GROUP BY/aggregates)** first — highest real-world value,
+   almost entirely reuses existing aggregate math, smallest true
+   executor change of any phase here.
+2. **Phase 2 (N-way JOIN/aliasing)** next — independent of Phase 1,
+   directly extends Phase 20's existing two-table join rather than
+   replacing it.
+3. **Phase 3 (expression richness)** — benefits from being before Phase 4
+   (IS NULL needs somewhere to point) but its IN/LIKE/grouping/arithmetic
+   pieces are independently useful even before NULL lands.
+4. **Phase 4 (real NULL/BLOB)** — sequenced here because Phases 2's OUTER
+   JOIN and Phase 3's IS NULL both want it, and because it's a storage-
+   layout change worth landing before Phase 6's partial-column INSERT
+   needs something real to fill omitted columns with.
+5. **Phase 5 (DDL in SQL text)** — independent of Phases 1-4, could run
+   in parallel with any of them; sequenced fifth mostly because it's
+   pure grammar-over-existing-functions and lower risk than the phases
+   above, a good "breather" phase.
+6. **Phase 6 (multi-row/partial INSERT)** — depends on Phase 4 for
+   partial-column defaults to mean anything real.
+7. **Phase 7 (subqueries/views/CTEs/set ops)** last, both because it's
+   the biggest single jump in executor complexity and because it
+   benefits from every phase above already being in place (DDL for
+   views, IN for IN-subqueries, and a settled NULL representation for
+   correlated/outer-join-adjacent subquery results).

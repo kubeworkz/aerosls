@@ -37,15 +37,22 @@
  * PER_KEY, ROWSTORE_MAX_PAGES). SqlResult.truncated tells the caller when
  * more rows matched than fit.
  *
- * Explicitly out of scope, matching sql_parser.h: subqueries, views, GROUP
- * BY beyond mqt.c. INSERT requires every column to be specified (no NULL/
- * default support yet, matching rowstore_row_insert()'s own existing
- * contract). Column projection in SELECT is metadata-only in this first
- * cut: `SqlResult.columns[]` reports what was asked for, but the cursor's
- * materialized rows always carry the FULL underlying row (or, for a JOIN,
- * the full combined row — see below) — genuine column-level narrowing at
- * the storage/serialization layer is deferred, a deliberate scope
- * simplification (see the Findings addendum).
+ * Explicitly out of scope, matching sql_parser.h: subqueries, views.
+ * INSERT requires every column to be specified (no NULL/default support
+ * yet, matching rowstore_row_insert()'s own existing contract). Column
+ * projection in SELECT is metadata-only in this first cut: `SqlResult.
+ * columns[]` reports what was asked for, but the cursor's materialized
+ * rows always carry the FULL underlying row (or, for a JOIN, the full
+ * combined row — see below) — genuine column-level narrowing at the
+ * storage/serialization layer is deferred, a deliberate scope
+ * simplification (see the Findings addendum). GROUP BY was promoted out of
+ * this out-of-scope list by the SQL Feature-Parity Roadmap's Phase 1 (see
+ * sql_parser.h's own header comment) -- `exec_select_group()` (sql_exec.c)
+ * is a genuinely new grouping/aggregation executor over real RowValues
+ * rows, NOT a call into kernel/aggregate.h's `aggregate_exec()` (that
+ * module operates on the legacy object_records[] KV model exclusively and
+ * is structurally incompatible with row-set tables -- confirmed by
+ * reading it, not assumed).
  *
  * ─── Phase 20: two-table JOIN ─────────────────────────────────────────────
  * `exec_select_join()` (sql_exec.c) handles `FROM A JOIN B ON A.col=B.col`.
@@ -156,6 +163,9 @@ typedef enum {
     SQL_ERR_TXN_UNAVAILABLE,     // Phase 22: MVCC_MAX_TXNS concurrently active transactions already
     SQL_ERR_TXN_NOT_ACTIVE,      // Phase 22: sql_execute_tx()/sql_tx_commit()/sql_tx_rollback() given a bad/closed txn_id
     SQL_ERR_CONSTRAINT_VIOLATION, // Phase 23: row_constraint.c rejected the write/delete (UNIQUE, NOT NULL, RANGE, REFERENCE, or REFERENCED) -- see error_msg for which
+    // Phase 1 (SQL Feature-Parity Roadmap):
+    SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED, // GROUP BY/aggregate select list combined with JOIN in one statement -- a real, named scope cut, not an oversight (see sql_parser.h)
+    SQL_ERR_GROUP_BY_COLUMN_INVALID,   // a SELECT-list column under GROUP BY/aggregates is neither the GROUP BY column nor an aggregate call
     SQL_ERR_INTERNAL,
 } SqlErrorCode;
 

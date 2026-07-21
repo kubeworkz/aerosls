@@ -63,6 +63,47 @@ static int se_strcmp(const char* a, const char* b) {
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
 }
 
+// ─── Phase 1 (SQL Feature-Parity Roadmap): number-to-string formatting for
+// aggregate results (COUNT/SUM/AVG) -- RowValues is text-in/text-out
+// throughout this codebase (see rowstore.h), so a computed aggregate needs
+// to become a string before it can be a "row" the rest of this file's
+// existing machinery (predicate_eval for HAVING, compare_rows_by_column for
+// ORDER BY, cursor_open_rowset for the result) already knows how to handle
+// unchanged. ───────────────────────────────────────────────────────────────
+static void se_fmt_u64(char* out, uint32_t max, uint64_t v) {
+    char tmp[24]; int l = 0;
+    if (!v) tmp[l++] = '0';
+    else while (v) { tmp[l++] = (char)('0' + (v % 10)); v /= 10; }
+    uint32_t i = 0;
+    for (int k = l - 1; k >= 0 && i < max - 1; k--) out[i++] = tmp[k];
+    out[i] = '\0';
+}
+// Fixed-point, up to 6 fractional digits, trailing zeros trimmed -- matches
+// se_parse_f64()'s own simple decimal-only grammar (no exponents), so
+// every value this writes is guaranteed re-parseable by that function.
+static void se_fmt_f64(char* out, uint32_t max, double v) {
+    int neg = v < 0.0;
+    if (neg) v = -v;
+    uint64_t ip = (uint64_t)v;
+    double frac = v - (double)ip;
+    uint64_t fp = (uint64_t)(frac * 1000000.0 + 0.5);
+    if (fp >= 1000000ULL) { fp -= 1000000ULL; ip += 1; }
+    uint32_t i = 0;
+    if (neg && i < max - 1) out[i++] = '-';
+    char ipbuf[24]; se_fmt_u64(ipbuf, sizeof(ipbuf), ip);
+    for (uint32_t j = 0; ipbuf[j] && i < max - 1; j++) out[i++] = ipbuf[j];
+    if (fp > 0) {
+        char digits[6];
+        uint64_t t = fp;
+        for (int k = 5; k >= 0; k--) { digits[k] = (char)('0' + (t % 10)); t /= 10; }
+        int end = 6;
+        while (end > 1 && digits[end - 1] == '0') end--;   // trim trailing zeros, keep at least one digit
+        if (i < max - 1) out[i++] = '.';
+        for (int k = 0; k < end && i < max - 1; k++) out[i++] = digits[k];
+    }
+    out[i] = '\0';
+}
+
 // ─── Table / column lookup ───────────────────────────────────────────────
 static int find_table_catalog_index(const char* table_name) {
     for (uint32_t i = 0; i < object_catalog_count; i++) {
@@ -78,14 +119,15 @@ static uint32_t find_column_index(const struct RowTableLayout* layout, const cha
     return 0xFFFFFFFFu;
 }
 
-// Type-aware comparison between two rows' values for one column -- used by
-// ORDER BY. Unparseable values compare equal (0) rather than crashing or
-// producing an undefined order beyond "stays roughly where it was."
-static int compare_rows_by_column(const struct RowTableLayout* layout, uint32_t col,
-                                  const struct RowValues* a, const struct RowValues* b) {
-    const char* ta = a->values[col];
-    const char* tb = b->values[col];
-    switch (layout->column_types[col]) {
+// Type-aware comparison between two raw value strings of a given column
+// type -- shared by compare_rows_by_column() (ORDER BY, below) and Phase 1
+// (SQL Feature-Parity Roadmap)'s MIN/MAX aggregate tracking in
+// exec_select_group(), which has no two full RowValues rows to hand it,
+// only a "best value so far" string per group. Unparseable values compare
+// equal (0) rather than crashing or producing an undefined order beyond
+// "stays roughly where it was."
+static int compare_typed(SLSFieldType type, const char* ta, const char* tb) {
+    switch (type) {
         case FIELD_TYPE_UINT64: {
             uint64_t va, vb;
             if (se_parse_u64(ta, &va) || se_parse_u64(tb, &vb)) return 0;
@@ -105,6 +147,13 @@ static int compare_rows_by_column(const struct RowTableLayout* layout, uint32_t 
         default:
             return se_strcmp(ta, tb);
     }
+}
+
+// Type-aware comparison between two rows' values for one column -- used by
+// ORDER BY.
+static int compare_rows_by_column(const struct RowTableLayout* layout, uint32_t col,
+                                  const struct RowValues* a, const struct RowValues* b) {
+    return compare_typed(layout->column_types[col], a->values[col], b->values[col]);
 }
 
 // Walks a predicate tree confirming every comparison's column exists in
@@ -272,9 +321,34 @@ static SqlErrorCode map_mvcc_err(MvccError e) {
 // project's row-set path is safe under concurrent execution today.
 static struct RowValues g_select_scratch[CURSOR_MAX_ROWSET_ROWS];
 
+// ─── Phase 1 (SQL Feature-Parity Roadmap): GROUP BY / aggregate buckets ────
+// A fresh implementation over real RowValues rows -- NOT a call into
+// kernel/aggregate.h's aggregate_exec(), which operates on the legacy
+// object_records[] KV model exclusively and is structurally incompatible
+// with row-set tables (see sql_parser.h's own header comment for the full
+// rationale). SQL_MAX_GROUPS=64 matches kernel/aggregate.h's own
+// AGG_MAX_GROUPS sizing precedent for the same kind of bucket table.
+#define SQL_MAX_GROUPS 64
+struct sql_agg_bucket {
+    uint8_t  active;
+    char     group_key[RECORD_VAL_LEN];       // meaningful only when the query has an explicit GROUP BY
+    uint32_t count;
+    // Parallel to the SELECT list (s->columns[]/agg_fn[]/agg_arg[]), NOT to
+    // the source table's own columns -- one accumulator slot per
+    // SELECT-list item, since a single query can aggregate more than one
+    // column (`SELECT dept, SUM(salary), MAX(age) FROM ... GROUP BY dept`).
+    double   sum[ROWSTORE_MAX_COLUMNS];
+    uint8_t  has_data[ROWSTORE_MAX_COLUMNS];
+    char     min_val[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
+    char     max_val[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
+};
+static struct sql_agg_bucket g_agg_buckets[SQL_MAX_GROUPS];
+
 static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
+static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 
 static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    if (s->has_aggregates) { exec_select_group(txn_id, caller_uid, s, out); return; }
     if (s->has_join) { exec_select_join(txn_id, caller_uid, s, out); return; }
 
     int tidx = find_table_catalog_index(s->table_name);
@@ -564,6 +638,231 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         for (uint32_t i = 0; i < s->column_count; i++)
             se_strcpy(out->columns[i], s->columns[i], RECORD_KEY_LEN);
     }
+}
+
+// ─── Phase 1 (SQL Feature-Parity Roadmap): GROUP BY / HAVING / aggregates ──
+// Single table only (see sql_parser.h -- GROUP BY + JOIN in one statement
+// is a real, named scope cut, not an oversight). Validates everything
+// up-front against the SOURCE table layout and a synthetic per-group
+// RESULT layout (built from the SELECT list, before any row is scanned --
+// same "validate cheaply first, scan expensively second" discipline
+// exec_select()/exec_select_join() already follow), then does one
+// snapshot-consistent scan, bucketing matched rows by the GROUP BY column
+// (or a single implicit bucket for a bare aggregate with no GROUP BY at
+// all, e.g. `SELECT COUNT(*) FROM t`), then formats each surviving bucket
+// (after HAVING) into a real RowValues row so ORDER BY/LIMIT/cursor_open_
+// rowset() all work completely unchanged against the grouped result.
+static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    if (s->has_join) {
+        out->error = SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED;
+        se_strcpy(out->error_msg, "GROUP BY/aggregate functions combined with JOIN are not supported yet", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    int tidx = find_table_catalog_index(s->table_name);
+    if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
+    const struct RowTableLayout* layout = &table_headers[tidx].layout;
+
+    uint32_t group_col = 0xFFFFFFFFu;
+    if (s->has_group_by) {
+        group_col = find_column_index(layout, s->group_by);
+        if (group_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "GROUP BY column not found in table", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+
+    // Validate every SELECT-list item and resolve each aggregate's argument
+    // column against the SOURCE table layout (agg_col[i] is only meaningful
+    // when agg_fn[i] != SQL_AGG_NONE and the argument isn't COUNT's "*").
+    uint32_t agg_col[ROWSTORE_MAX_COLUMNS];
+    for (uint32_t i = 0; i < s->column_count; i++) {
+        if (s->agg_fn[i] == SQL_AGG_NONE) {
+            // Standard SQL rule: an ordinary column in the SELECT list
+            // under GROUP BY/aggregates must BE the GROUP BY column -- it
+            // can't just silently take its first-seen value per group.
+            if (!s->has_group_by || !se_streq(s->columns[i], s->group_by)) {
+                out->error = SQL_ERR_GROUP_BY_COLUMN_INVALID;
+                se_strcpy(out->error_msg, "SELECT column must be the GROUP BY column or an aggregate function", SQL_ERR_MSG_LEN);
+                return;
+            }
+            continue;
+        }
+        if (s->agg_fn[i] == SQL_AGG_COUNT && se_streq(s->agg_arg[i], "*")) continue;
+        uint32_t c = find_column_index(layout, s->agg_arg[i]);
+        if (c == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "aggregate function argument column not found in table", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if ((s->agg_fn[i] == SQL_AGG_SUM || s->agg_fn[i] == SQL_AGG_AVG) &&
+            layout->column_types[c] != FIELD_TYPE_UINT64 && layout->column_types[c] != FIELD_TYPE_FLOAT) {
+            out->error = SQL_ERR_VALUE_INVALID;
+            se_strcpy(out->error_msg, "SUM/AVG requires a UINT64 or FLOAT argument column", SQL_ERR_MSG_LEN);
+            return;
+        }
+        agg_col[i] = c;
+    }
+
+    // Build the synthetic per-group RESULT layout -- purely from the parsed
+    // statement + source layout types, no row data needed yet, matching
+    // exec_select_join()'s own "combined" layout precedent (a query-time-
+    // only construct, never persisted or paged, that every existing
+    // predicate_eval()/find_column_index()/compare_rows_by_column() call
+    // works against completely unchanged because the right names/types are
+    // just baked into it up front).
+    struct RowTableLayout group_layout;
+    se_memset(&group_layout, 0, sizeof(group_layout));
+    for (uint32_t i = 0; i < s->column_count; i++) {
+        se_strcpy(group_layout.column_names[i], s->columns[i], RECORD_KEY_LEN);
+        if (s->agg_fn[i] == SQL_AGG_NONE)            group_layout.column_types[i] = layout->column_types[group_col];
+        else if (s->agg_fn[i] == SQL_AGG_COUNT)      group_layout.column_types[i] = FIELD_TYPE_UINT64;
+        else if (s->agg_fn[i] == SQL_AGG_SUM ||
+                 s->agg_fn[i] == SQL_AGG_AVG)         group_layout.column_types[i] = FIELD_TYPE_FLOAT;
+        else /* MIN/MAX */                            group_layout.column_types[i] = layout->column_types[agg_col[i]];
+    }
+    group_layout.column_count = s->column_count;
+
+    uint32_t order_col = 0xFFFFFFFFu;
+    if (s->has_order_by) {
+        order_col = find_column_index(&group_layout, s->order_by);
+        if (order_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ORDER BY column not found in the grouped result (use the exact SELECT list label, e.g. COUNT(*))", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+    if (s->has_having && !predicate_columns_valid(&s->having, s->having.root, &group_layout)) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "HAVING clause references a column/aggregate not in the SELECT list", SQL_ERR_MSG_LEN);
+        return;
+    }
+    if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, layout)) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    // ── Scan (WHERE-filtered, snapshot-consistent -- same mvcc_find_
+    // matching_rows() every other exec_* function uses) + bucket ──────────
+    struct MvccRowId ids[CURSOR_MAX_ROWSET_ROWS];
+    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name,
+                                             s->has_where ? &s->where : NULL, layout,
+                                             ids, CURSOR_MAX_ROWSET_ROWS);
+    uint32_t n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
+    uint8_t row_truncated = (total > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
+
+    for (uint32_t gi = 0; gi < SQL_MAX_GROUPS; gi++) g_agg_buckets[gi].active = 0;
+    uint32_t group_count = 0;
+    uint8_t group_overflow = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        struct RowValues rv;
+        if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &rv) != MVCC_OK) continue;
+
+        const char* gk = s->has_group_by ? rv.values[group_col] : "";
+        struct sql_agg_bucket* b = 0;
+        for (uint32_t gi = 0; gi < group_count; gi++) {
+            if (g_agg_buckets[gi].active && se_streq(g_agg_buckets[gi].group_key, gk)) { b = &g_agg_buckets[gi]; break; }
+        }
+        if (!b) {
+            if (group_count >= SQL_MAX_GROUPS) { group_overflow = 1; continue; }
+            b = &g_agg_buckets[group_count++];
+            se_memset(b, 0, sizeof(*b));
+            se_strcpy(b->group_key, gk, RECORD_VAL_LEN);
+            b->active = 1;
+        }
+
+        b->count++;
+        for (uint32_t ci = 0; ci < s->column_count; ci++) {
+            if (s->agg_fn[ci] == SQL_AGG_NONE || s->agg_fn[ci] == SQL_AGG_COUNT) continue;   // COUNT already covered by b->count
+            const char* valstr = rv.values[agg_col[ci]];
+            if (s->agg_fn[ci] == SQL_AGG_MIN || s->agg_fn[ci] == SQL_AGG_MAX) {
+                SLSFieldType t = layout->column_types[agg_col[ci]];
+                if (!b->has_data[ci]) {
+                    se_strcpy(b->min_val[ci], valstr, RECORD_VAL_LEN);
+                    se_strcpy(b->max_val[ci], valstr, RECORD_VAL_LEN);
+                } else {
+                    if (compare_typed(t, valstr, b->min_val[ci]) < 0) se_strcpy(b->min_val[ci], valstr, RECORD_VAL_LEN);
+                    if (compare_typed(t, valstr, b->max_val[ci]) > 0) se_strcpy(b->max_val[ci], valstr, RECORD_VAL_LEN);
+                }
+                b->has_data[ci] = 1;
+                continue;
+            }
+            // SUM/AVG
+            double v;
+            if (se_parse_f64(valstr, &v)) continue;   // unparseable -- skip this value (fail-closed-per-value, not a whole-statement abort)
+            b->sum[ci] += v;
+            b->has_data[ci] = 1;
+        }
+    }
+
+    // A bare aggregate with no GROUP BY still reports exactly one result
+    // row even when zero source rows matched (`SELECT COUNT(*) FROM t
+    // WHERE false` is 1 row with count=0 in standard SQL, not an empty
+    // result set) -- GROUP BY with zero matches correctly reports zero
+    // groups instead, the real distinction between "one implicit group
+    // always exists" and "grouping happens over whatever rows existed."
+    if (group_count == 0 && !s->has_group_by) {
+        se_memset(&g_agg_buckets[0], 0, sizeof(g_agg_buckets[0]));
+        g_agg_buckets[0].active = 1;
+        group_count = 1;
+    }
+
+    // ── Format each surviving (post-HAVING) bucket into a real row ────────
+    uint32_t out_n = 0;
+    for (uint32_t gi = 0; gi < group_count; gi++) {
+        struct sql_agg_bucket* b = &g_agg_buckets[gi];
+        if (!b->active) continue;
+
+        struct RowValues row;
+        se_memset(&row, 0, sizeof(row));
+        row.count = group_layout.column_count;
+        for (uint32_t i = 0; i < s->column_count; i++) {
+            switch (s->agg_fn[i]) {
+                case SQL_AGG_NONE:  se_strcpy(row.values[i], b->group_key, RECORD_VAL_LEN); break;
+                case SQL_AGG_COUNT: se_fmt_u64(row.values[i], RECORD_VAL_LEN, b->count); break;
+                case SQL_AGG_SUM:   se_fmt_f64(row.values[i], RECORD_VAL_LEN, b->has_data[i] ? b->sum[i] : 0.0); break;
+                case SQL_AGG_AVG:   se_fmt_f64(row.values[i], RECORD_VAL_LEN, (b->has_data[i] && b->count > 0) ? b->sum[i] / (double)b->count : 0.0); break;
+                case SQL_AGG_MIN:   se_strcpy(row.values[i], b->has_data[i] ? b->min_val[i] : "", RECORD_VAL_LEN); break;
+                case SQL_AGG_MAX:   se_strcpy(row.values[i], b->has_data[i] ? b->max_val[i] : "", RECORD_VAL_LEN); break;
+            }
+        }
+
+        if (s->has_having && !predicate_eval(&s->having, &group_layout, &row)) continue;
+
+        if (out_n < CURSOR_MAX_ROWSET_ROWS) g_select_scratch[out_n] = row;
+        out_n++;
+    }
+
+    if (s->has_order_by) {
+        for (uint32_t i = 1; i < out_n && i < CURSOR_MAX_ROWSET_ROWS; i++) {
+            struct RowValues key = g_select_scratch[i];
+            int j = (int)i - 1;
+            while (j >= 0) {
+                int cmp = compare_rows_by_column(&group_layout, order_col, &g_select_scratch[j], &key);
+                int should_move = s->order_desc ? (cmp < 0) : (cmp > 0);
+                if (!should_move) break;
+                g_select_scratch[j + 1] = g_select_scratch[j];
+                j--;
+            }
+            g_select_scratch[j + 1] = key;
+        }
+    }
+
+    uint32_t final_n = out_n < CURSOR_MAX_ROWSET_ROWS ? out_n : CURSOR_MAX_ROWSET_ROWS;
+    if (s->has_limit && s->limit < final_n) final_n = s->limit;
+
+    uint32_t cid = cursor_open_rowset(s->table_name, g_select_scratch, final_n);
+
+    out->error      = SQL_ERR_NONE;
+    out->cursor_id  = cid;
+    out->row_count  = final_n;
+    out->truncated  = (row_truncated || group_overflow || out_n > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
+    out->column_count = group_layout.column_count;
+    for (uint32_t i = 0; i < group_layout.column_count; i++)
+        se_strcpy(out->columns[i], group_layout.column_names[i], RECORD_KEY_LEN);
 }
 
 static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlInsertStmt* s, struct SqlResult* out) {

@@ -42,6 +42,7 @@ typedef enum {
     TOK_KW_UPDATE, TOK_KW_SET,
     TOK_KW_DELETE,
     TOK_KW_JOIN, TOK_KW_ON,   // Phase 20
+    TOK_KW_GROUP, TOK_KW_HAVING,   // Phase 1 (SQL Feature-Parity Roadmap)
     TOK_KW_TRUE, TOK_KW_FALSE,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
     TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
@@ -69,6 +70,7 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"UPDATE", TOK_KW_UPDATE}, {"SET", TOK_KW_SET},
     {"DELETE", TOK_KW_DELETE},
     {"JOIN", TOK_KW_JOIN}, {"ON", TOK_KW_ON},
+    {"GROUP", TOK_KW_GROUP}, {"HAVING", TOK_KW_HAVING},
     {"TRUE", TOK_KW_TRUE}, {"FALSE", TOK_KW_FALSE},
 };
 #define KEYWORD_COUNT (sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
@@ -245,6 +247,88 @@ static int split_qualified(const char* in, char* qualifier, uint32_t qmax, char*
     return 1;
 }
 
+// ─── Phase 1 (SQL Feature-Parity Roadmap): aggregate function calls ────────
+// COUNT/SUM/AVG/MIN/MAX are deliberately NOT lexer keywords (matching real
+// SQL practice, and this file's own KEYWORDS[] table doesn't list them) --
+// they're ordinary TOK_IDENT tokens, disambiguated from a plain column_ref
+// purely by whether a '(' immediately follows. This means a table with an
+// actual column named "count" still parses fine as a plain column_ref, as
+// long as it's never itself followed by '(' -- the one case that would be
+// genuinely ambiguous doesn't arise in this grammar (a bare column_ref is
+// never followed by '(' in any valid statement).
+static SqlAggFunc match_agg_fn(const char* ident) {
+    if (sq_streq_ci(ident, "COUNT")) return SQL_AGG_COUNT;
+    if (sq_streq_ci(ident, "SUM"))   return SQL_AGG_SUM;
+    if (sq_streq_ci(ident, "AVG"))   return SQL_AGG_AVG;
+    if (sq_streq_ci(ident, "MIN"))   return SQL_AGG_MIN;
+    if (sq_streq_ci(ident, "MAX"))   return SQL_AGG_MAX;
+    return SQL_AGG_NONE;
+}
+
+// select_item := agg_call | column_ref -- shared by SELECT-list parsing and
+// HAVING comparison left-hand-side parsing (see sql_parser.h's header
+// comment on why HAVING needs this: it must be able to reference an
+// aggregate result by the exact same rendered label the SELECT list and
+// executor agree on). On success, *label holds the canonical rendered text
+// ("COUNT(*)", "SUM(amount)", or just the plain column name for a
+// non-aggregate item); *fn is SQL_AGG_NONE for a plain column_ref, else the
+// matched function with *arg holding its argument column name (or "*",
+// COUNT only).
+static int parse_select_item(struct SqlParser* p, char* label, uint32_t label_max,
+                             SqlAggFunc* fn, char* arg, uint32_t arg_max) {
+    *fn = SQL_AGG_NONE;
+    arg[0] = '\0';
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name or aggregate function"); return 0; }
+
+    char ident[RECORD_KEY_LEN];
+    sq_strcpy(ident, p->cur.text, RECORD_KEY_LEN);
+    SqlAggFunc maybe_fn = match_agg_fn(ident);
+
+    // One-token lookahead: save state, advance past `ident`, check whether
+    // '(' follows. Trivial to save/restore here since SqlLexer/SqlToken are
+    // plain value structs with no external state -- no real backtracking
+    // machinery needed, matching this parser's existing simplicity.
+    struct SqlLexer save_lx = p->lx;
+    struct SqlToken save_cur = p->cur;
+    advance(p);
+
+    if (maybe_fn != SQL_AGG_NONE && p->cur.kind == TOK_LPAREN) {
+        advance(p);   // consume '('
+        char argbuf[RECORD_KEY_LEN];
+        if (maybe_fn == SQL_AGG_COUNT && p->cur.kind == TOK_STAR) {
+            sq_strcpy(argbuf, "*", RECORD_KEY_LEN);
+            advance(p);
+        } else if (p->cur.kind == TOK_STAR) {
+            set_error(p, "only COUNT may take '*' as its argument");
+            return 0;
+        } else {
+            if (!parse_column_ref(p, argbuf, RECORD_KEY_LEN)) return 0;
+        }
+        if (!expect(p, TOK_RPAREN, "expected ')' after aggregate function argument")) return 0;
+
+        *fn = maybe_fn;
+        sq_strcpy(arg, argbuf, arg_max);
+
+        static const char* fn_text[] = { "", "COUNT", "SUM", "AVG", "MIN", "MAX" };
+        const char* fname = fn_text[maybe_fn];
+        uint32_t li = 0;
+        for (; fname[li] && li < label_max - 1; li++) label[li] = fname[li];
+        if (li < label_max - 1) label[li++] = '(';
+        for (uint32_t j = 0; argbuf[j] && li < label_max - 1; j++) label[li++] = argbuf[j];
+        if (li < label_max - 1) label[li++] = ')';
+        label[li] = '\0';
+        return 1;
+    }
+
+    // Not an aggregate call after all -- rewind to just after `ident` was
+    // first lexed (i.e. p->cur == ident again) and parse it as an ordinary
+    // column_ref, which may itself be "table.column".
+    p->lx  = save_lx;
+    p->cur = save_cur;
+    if (!parse_column_ref(p, label, label_max)) return 0;
+    return 1;
+}
+
 static int parse_literal(struct SqlParser* p, char* out, uint32_t max) {
     switch (p->cur.kind) {
         case TOK_NUMBER:
@@ -267,9 +351,23 @@ static int parse_literal(struct SqlParser* p, char* out, uint32_t max) {
 }
 
 // comparison := column_ref compare_op literal
-static uint32_t parse_comparison(struct SqlParser* p, struct Predicate* pred) {
+// Phase 1 (SQL Feature-Parity Roadmap): when allow_agg is set (HAVING
+// only -- see sql_parser.h), the left-hand side is parsed via
+// parse_select_item() instead of parse_column_ref(), so it may be an
+// aggregate call ("COUNT(*)") whose rendered label becomes the comparison
+// node's column_name -- exactly what a synthetic grouped-result layout's
+// own column names will be at exec time (sql_exec.c), so predicate_eval()
+// needs no changes at all to evaluate it. WHERE/SET's own comparisons
+// (allow_agg == 0) are completely unaffected -- byte-for-byte the
+// pre-Phase-1 behavior.
+static uint32_t parse_comparison(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
     char col[RECORD_KEY_LEN];
-    if (!parse_column_ref(p, col, RECORD_KEY_LEN)) return PREDICATE_INVALID_NODE;
+    if (allow_agg) {
+        SqlAggFunc fn; char arg[RECORD_KEY_LEN];
+        if (!parse_select_item(p, col, RECORD_KEY_LEN, &fn, arg, RECORD_KEY_LEN)) return PREDICATE_INVALID_NODE;
+    } else {
+        if (!parse_column_ref(p, col, RECORD_KEY_LEN)) return PREDICATE_INVALID_NODE;
+    }
 
     PredicateCompareOp op;
     if (!parse_compare_op(p, &op)) return PREDICATE_INVALID_NODE;
@@ -278,34 +376,34 @@ static uint32_t parse_comparison(struct SqlParser* p, struct Predicate* pred) {
     if (!parse_literal(p, lit, RECORD_VAL_LEN)) return PREDICATE_INVALID_NODE;
 
     uint32_t node = predicate_add_comparison(pred, col, op, lit);
-    if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE clause too complex (predicate node pool exhausted)");
+    if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)");
     return node;
 }
 
 // and_expr := comparison (AND comparison)*
-static uint32_t parse_and_expr(struct SqlParser* p, struct Predicate* pred) {
-    uint32_t left = parse_comparison(p, pred);
+static uint32_t parse_and_expr(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
+    uint32_t left = parse_comparison(p, pred, allow_agg);
     if (p->error) return PREDICATE_INVALID_NODE;
     while (p->cur.kind == TOK_KW_AND) {
         advance(p);
-        uint32_t right = parse_comparison(p, pred);
+        uint32_t right = parse_comparison(p, pred, allow_agg);
         if (p->error) return PREDICATE_INVALID_NODE;
         left = predicate_add_and(pred, left, right);
-        if (left == PREDICATE_INVALID_NODE) { set_error(p, "WHERE clause too complex (predicate node pool exhausted)"); return left; }
+        if (left == PREDICATE_INVALID_NODE) { set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)"); return left; }
     }
     return left;
 }
 
 // predicate := and_expr (OR and_expr)*  -- AND binds tighter than OR for free, no parens needed
-static uint32_t parse_predicate(struct SqlParser* p, struct Predicate* pred) {
-    uint32_t left = parse_and_expr(p, pred);
+static uint32_t parse_predicate(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
+    uint32_t left = parse_and_expr(p, pred, allow_agg);
     if (p->error) return PREDICATE_INVALID_NODE;
     while (p->cur.kind == TOK_KW_OR) {
         advance(p);
-        uint32_t right = parse_and_expr(p, pred);
+        uint32_t right = parse_and_expr(p, pred, allow_agg);
         if (p->error) return PREDICATE_INVALID_NODE;
         left = predicate_add_or(pred, left, right);
-        if (left == PREDICATE_INVALID_NODE) { set_error(p, "WHERE clause too complex (predicate node pool exhausted)"); return left; }
+        if (left == PREDICATE_INVALID_NODE) { set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)"); return left; }
     }
     return left;
 }
@@ -325,14 +423,20 @@ static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
         advance(p);
     } else {
         uint32_t n = 0;
+        int any_agg = 0;
         for (;;) {
             if (n >= ROWSTORE_MAX_COLUMNS) { set_error(p, "too many columns in SELECT list"); return; }
-            if (!parse_column_ref(p, s->columns[n], RECORD_KEY_LEN)) return;
+            SqlAggFunc fn; char arg[RECORD_KEY_LEN];
+            if (!parse_select_item(p, s->columns[n], RECORD_KEY_LEN, &fn, arg, RECORD_KEY_LEN)) return;
+            s->agg_fn[n] = fn;
+            sq_strcpy(s->agg_arg[n], arg, RECORD_KEY_LEN);
+            if (fn != SQL_AGG_NONE) any_agg = 1;
             n++;
             if (p->cur.kind != TOK_COMMA) break;
             advance(p);
         }
         s->column_count = n;
+        s->has_aggregates = (uint8_t)any_agg;
     }
 
     if (!expect(p, TOK_KW_FROM, "expected FROM")) return;
@@ -372,15 +476,49 @@ static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
     if (p->cur.kind == TOK_KW_WHERE) {
         advance(p);
         predicate_init(&s->where);
-        s->where.root = parse_predicate(p, &s->where);
+        s->where.root = parse_predicate(p, &s->where, 0);
         if (p->error) return;
         s->has_where = 1;
+    }
+
+    // Phase 1 (SQL Feature-Parity Roadmap): GROUP BY column_ref -- single
+    // column only (see sql_parser.h header comment). GROUP BY combined with
+    // JOIN is rejected by the executor (SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED),
+    // not here -- the parser doesn't need to know about that scope cut.
+    if (p->cur.kind == TOK_KW_GROUP) {
+        advance(p);
+        if (!expect(p, TOK_KW_BY, "expected BY after GROUP")) return;
+        if (!parse_column_ref(p, s->group_by, RECORD_KEY_LEN)) return;
+        s->has_group_by = 1;
+    }
+
+    // Phase 1: HAVING having_predicate -- only meaningful once the SELECT
+    // list has at least one aggregate call (checked here, not deferred to
+    // the executor, since a HAVING clause with nothing aggregated to filter
+    // on is a query-shape error, not a legitimately-empty-of-meaning one).
+    if (p->cur.kind == TOK_KW_HAVING) {
+        if (!s->has_aggregates) { set_error(p, "HAVING requires an aggregate function in the SELECT list"); return; }
+        advance(p);
+        predicate_init(&s->having);
+        s->having.root = parse_predicate(p, &s->having, 1);
+        if (p->error) return;
+        s->has_having = 1;
     }
 
     if (p->cur.kind == TOK_KW_ORDER) {
         advance(p);
         if (!expect(p, TOK_KW_BY, "expected BY after ORDER")) return;
-        if (!parse_column_ref(p, s->order_by, RECORD_KEY_LEN)) return;
+        // Phase 1 (SQL Feature-Parity Roadmap): ORDER BY accepts the same
+        // select_item shape as HAVING (agg_call | column_ref), rendered to
+        // the same canonical label ("COUNT(*)") -- needed so a grouped
+        // query can write `ORDER BY COUNT(*) DESC` and have it resolve
+        // against the synthetic grouped-result layout at exec time
+        // (sql_exec.c), the same trick HAVING already uses. For a plain
+        // (non-aggregate, non-join) query this is byte-for-byte the old
+        // parse_column_ref() behavior -- a bare identifier or "table.column"
+        // renders through parse_select_item()'s own fallback path unchanged.
+        SqlAggFunc fn; char arg[RECORD_KEY_LEN];
+        if (!parse_select_item(p, s->order_by, RECORD_KEY_LEN, &fn, arg, RECORD_KEY_LEN)) return;
         s->has_order_by = 1;
         s->order_desc = 0;
         if (p->cur.kind == TOK_KW_ASC) advance(p);
@@ -468,7 +606,7 @@ static void parse_update(struct SqlParser* p, struct SqlUpdateStmt* s) {
     if (p->cur.kind == TOK_KW_WHERE) {
         advance(p);
         predicate_init(&s->where);
-        s->where.root = parse_predicate(p, &s->where);
+        s->where.root = parse_predicate(p, &s->where, 0);
         if (p->error) return;
         s->has_where = 1;
     }
@@ -487,7 +625,7 @@ static void parse_delete(struct SqlParser* p, struct SqlDeleteStmt* s) {
     if (p->cur.kind == TOK_KW_WHERE) {
         advance(p);
         predicate_init(&s->where);
-        s->where.root = parse_predicate(p, &s->where);
+        s->where.root = parse_predicate(p, &s->where, 0);
         if (p->error) return;
         s->has_where = 1;
     }

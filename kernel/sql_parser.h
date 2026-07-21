@@ -16,9 +16,22 @@
  *
  * ─── Grammar (genuinely minimal, per the roadmap's own scope) ───────────────
  *   select_stmt := SELECT select_list FROM ident [join_clause] [WHERE predicate]
- *                  [ORDER BY column_ref [ASC|DESC]] [LIMIT number] [;]
- *   select_list := '*' | column_ref (',' column_ref)*
+ *                  [GROUP BY column_ref] [HAVING having_predicate]
+ *                  [ORDER BY select_item [ASC|DESC]] [LIMIT number] [;]
+ *   select_list := '*' | select_item (',' select_item)*
+ *   select_item := agg_call | column_ref
+ *   agg_call    := ident '(' ('*' | column_ref) ')'   -- ident must
+ *                  case-insensitively be COUNT/SUM/AVG/MIN/MAX; only COUNT
+ *                  may take '*'. These are NOT reserved keywords (matching
+ *                  real SQL practice) -- disambiguated purely by the
+ *                  following '(' token, so an ordinary column literally
+ *                  named "count" still parses fine as a plain column_ref as
+ *                  long as it isn't itself followed by '('.
  *   join_clause := JOIN ident ON column_ref '=' column_ref
+ *   having_predicate := same grammar as `predicate` below, except each
+ *                  comparison's left-hand side is a select_item (agg_call or
+ *                  column_ref), not a bare column_ref -- see the SQL
+ *                  Feature-Parity Roadmap Phase 1 note below.
  *   insert_stmt := INSERT INTO ident '(' ident (',' ident)* ')'
  *                  VALUES '(' literal (',' literal)* ')' [;]
  *   update_stmt := UPDATE ident SET ident '=' literal (',' ident '=' literal)*
@@ -55,13 +68,62 @@
  * the normal case there.
  *
  * Explicitly out of scope, per the roadmap: three-or-more-table joins,
- * OUTER JOIN, join reordering, hash/merge join, subqueries, views, GROUP
- * BY, arithmetic expressions, string functions, LIKE, IN lists,
- * parenthesized WHERE grouping (above), table aliasing (above). INSERT
- * requires an explicit column list covering every one of the table's
- * columns (no partial-row/NULL/default support yet — every value must be
- * supplied, matching rowstore_row_insert()'s own existing all-columns-
- * required contract).
+ * OUTER JOIN, join reordering, hash/merge join, subqueries, views,
+ * arithmetic expressions, string functions, LIKE, IN lists, parenthesized
+ * WHERE grouping (above), table aliasing (above). INSERT requires an
+ * explicit column list covering every one of the table's columns (no
+ * partial-row/NULL/default support yet — every value must be supplied,
+ * matching rowstore_row_insert()'s own existing all-columns-required
+ * contract).
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 1: GROUP BY / HAVING / aggregates ────
+ * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) GROUP BY is no longer
+ * out of scope, promoted from a separate `aggregate`/`mqt` command surface
+ * (kernel/aggregate.h) into real SQL grammar. That promotion turned out to
+ * be grammar-and-executor work only, NOT a reuse of aggregate.c's own
+ * math: aggregate_exec() operates entirely on the legacy object_records[]
+ * KV model (field-name-suffix matching against a single flattened record
+ * per object), which is structurally incompatible with rowstore.c's real
+ * per-row storage that sql_exec.c operates on — the same
+ * legacy-KV-vs-row-set wall row_constraint.h's own header comment names
+ * for Phase 23's constraint engine. sql_exec.c's grouping/aggregation
+ * logic is therefore a fresh implementation over real `RowValues` rows,
+ * not a call into aggregate.c.
+ *
+ * Deliberately narrower than full SQL, matching this whole roadmap's
+ * "smallest real version first" posture:
+ *   - GROUP BY accepts exactly one column (no composite multi-column
+ *     grouping yet — matching row_index.c's own single-column-index
+ *     precedent).
+ *   - GROUP BY combined with JOIN in the same statement is not supported
+ *     (SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED) — a real, named scope cut, not
+ *     an oversight.
+ *   - A SELECT list under GROUP BY (or under a bare aggregate with no
+ *     GROUP BY at all, e.g. `SELECT COUNT(*) FROM t`) may only name the
+ *     GROUP BY column itself or an aggregate call — an ordinary
+ *     non-aggregated, non-grouped column is a query error (matching
+ *     standard SQL's own "column must appear in GROUP BY or be
+ *     aggregated" rule), not silently taking its first-seen value.
+ *   - COUNT(col) does not yet distinguish NULL from a real value (there is
+ *     no true NULL representation until the roadmap's own Phase 4) — it
+ *     currently behaves identically to COUNT(*) over the matched rows.
+ *   - SUM/AVG require a UINT64 or FLOAT argument column (SQL_ERR_VALUE_
+ *     INVALID otherwise); MIN/MAX work on any column type, using the same
+ *     type-aware comparison ORDER BY already uses, so MIN/MAX over a
+ *     STRING or BOOL column is real and correct, not just numeric.
+ *   - No column aliasing (`AS`) — an aggregate select-item's output column
+ *     name is always its canonical rendered text, e.g. "COUNT(*)",
+ *     "SUM(amount)".
+ *
+ * HAVING reuses `struct Predicate`/`predicate_eval()` completely
+ * unchanged, the same trick Phase 20's JOIN used for qualified names: a
+ * HAVING comparison's left-hand side may be an aggregate call or a plain
+ * column ref (see `select_item` above), rendered to the exact same
+ * canonical text the SELECT list uses ("COUNT(*)" etc.) and evaluated
+ * against a synthetic one-row-per-group `RowTableLayout` built at exec
+ * time — so no predicate.h changes were needed at all. A HAVING clause
+ * referencing a column/aggregate that isn't in the SELECT list is a query
+ * error (SQL_ERR_COLUMN_NOT_FOUND), not silently-always-false.
  */
 #ifndef SQL_PARSER_H
 #define SQL_PARSER_H
@@ -83,6 +145,18 @@ typedef enum {
     SQL_STMT_INVALID,
 } SqlStmtKind;
 
+// Phase 1 (SQL Feature-Parity Roadmap): which aggregate function, if any, a
+// SELECT-list item or HAVING comparison's left-hand side is. SQL_AGG_NONE
+// means "plain column_ref" -- see sql_exec.c for the actual math.
+typedef enum {
+    SQL_AGG_NONE = 0,
+    SQL_AGG_COUNT,
+    SQL_AGG_SUM,
+    SQL_AGG_AVG,
+    SQL_AGG_MIN,
+    SQL_AGG_MAX,
+} SqlAggFunc;
+
 struct SqlSelectStmt {
     char     table_name[OBJECT_NAME_LEN];
 
@@ -101,8 +175,29 @@ struct SqlSelectStmt {
 
     uint8_t  select_all;                                       // '*'
     char     columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];     // meaningful iff !select_all; may be
-                                                                 // "table.column" qualified when has_join
+                                                                 // "table.column" qualified when has_join,
+                                                                 // or -- Phase 1 -- a rendered aggregate
+                                                                 // label ("COUNT(*)") when agg_fn[i] != SQL_AGG_NONE
     uint32_t column_count;
+
+    // ── Phase 1 (SQL Feature-Parity Roadmap): GROUP BY / HAVING / aggregates.
+    // agg_fn[i]/agg_arg[i] are parallel to columns[]/column_count above --
+    // meaningful only when !select_all. agg_fn[i]==SQL_AGG_NONE means
+    // columns[i] is a plain column_ref (byte-for-byte the pre-Phase-1
+    // behavior); otherwise agg_arg[i] holds the function's argument column
+    // name (or "*", COUNT only) and columns[i] holds the canonical rendered
+    // label ("COUNT(*)", "SUM(amount)") used both as the output column name
+    // and as what a HAVING clause must reference to mean this item. See the
+    // header comment above for the full scope (single-column GROUP BY only,
+    // no GROUP BY + JOIN, no aliasing). ─────────────────────────────────────
+    uint8_t    has_aggregates;   // 1 if select_all==0 and any agg_fn[i] != SQL_AGG_NONE
+    SqlAggFunc agg_fn[ROWSTORE_MAX_COLUMNS];
+    char       agg_arg[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
+    uint8_t    has_group_by;
+    char       group_by[RECORD_KEY_LEN];
+    uint8_t    has_having;
+    struct Predicate having;     // comparison column_names are rendered select_item labels (see above)
+
     uint8_t  has_where;
     struct Predicate where;                                     // comparison column_names may be qualified when has_join
     uint8_t  has_order_by;
