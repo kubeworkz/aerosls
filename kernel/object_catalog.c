@@ -18,6 +18,20 @@ extern uint64_t wal_stage(uint32_t thread_id, uint64_t object_id,
                            const char* old_value, const char* new_value);
 extern uint32_t kernel_get_current_thread_id(void);
 
+// Forward declaration -- VectorStore Interface Roadmap Phase 1. Notifies
+// vecstore.c (and, transitively, vec_index.c) that a catalog object is
+// about to be freed, so any vector-collection state and HNSW indexes built
+// over it are released too instead of orphaned -- confirmed via grep
+// before this fix that neither sys_sls_vfree() nor
+// catalog_vfree_partition() below ever touched vector_collections[]/
+// vec_indexes[] at all, permanently leaking a collection's slot and pages
+// every time vfree ran on one. A bare extern here (not a #include), same
+// convention as tier_notify_access() just above -- avoids a circular
+// header dependency, since vecstore.h already includes object_catalog.h
+// the other way around. A no-op call if the object being freed was never a
+// vector collection (see vecstore_notify_object_freed()'s own comment).
+extern void vecstore_notify_object_freed(const char* collection_name);
+
 // ─── Globals ──────────────────────────────────────────────────────────────────
 struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];
 struct SLSObjectRecord object_records[CATALOG_MAX_OBJECTS];
@@ -240,6 +254,13 @@ uint64_t sys_sls_vfree(const char* name) {
         kernel_serial_printf("[CATALOG] ERROR: Object '%s' not found.\n", name);
         return 1;
     }
+    // VectorStore Interface Roadmap Phase 1: must run BEFORE
+    // object_catalog[idx].active is cleared below -- vecstore_notify_
+    // object_freed() looks this object up by name through the same
+    // object_catalog[].active gate every vecstore.c entry point uses, so
+    // it would silently find nothing (and leak) if called after. A no-op
+    // if this object was never a vector collection.
+    vecstore_notify_object_freed(name);
     object_catalog[idx].active = 0;
     object_records[idx].field_count = 0;
     kernel_serial_printf("[CATALOG] vfree: '%s' released from address space.\n",
@@ -260,6 +281,9 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) {
         if (object_catalog[i].partition_id != partition_id) continue;
         kernel_serial_printf("[CATALOG] vfree (partition %u teardown): '%s'\n",
                              (unsigned)partition_id, object_catalog[i].name);
+        // VectorStore Interface Roadmap Phase 1: same ordering requirement
+        // as sys_sls_vfree() above -- must run before .active is cleared.
+        vecstore_notify_object_freed(object_catalog[i].name);
         object_catalog[i].active = 0;
         object_records[i].field_count = 0;
         freed++;

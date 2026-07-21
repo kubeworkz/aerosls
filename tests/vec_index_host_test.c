@@ -59,6 +59,13 @@ int ollama_embed(const struct OllamaEmbedRequest* req, struct OllamaEmbedRespons
 void persist_vecstore_headers(void) { }
 void persist_vec_index_defs(void) { }
 
+// VectorStore Interface Roadmap Phase 1: forward-declared exactly the way
+// object_catalog.c declares it (a bare extern, not a vecstore.h prototype
+// -- see that file's own comment on this convention, mirroring
+// tier_notify_access()). This test calls it directly as the unit under
+// test for Scenario 7 below.
+extern void vecstore_notify_object_freed(const char* collection_name);
+
 #define FAKE_NVME_MAX_FRAMES 512
 static struct { uint64_t lba; uint8_t data[4096]; int used; } g_fake_nvme[FAKE_NVME_MAX_FRAMES];
 void* io_sq = (void*)1;
@@ -87,6 +94,18 @@ static int g_fail = 0;
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \
     else          { printf("ok:   %s\n", msg); } \
 } while (0)
+
+// VectorStore Interface Roadmap Phase 3: small test-local helper -- Scenario
+// 6 (above) inlines this exact lookup-by-name loop once already; Scenarios
+// 8-9 (below) need the active_count it finds repeatedly enough to be worth
+// naming. Returns -1 if no active index has this name (a test-setup bug,
+// not a real scenario this suite otherwise exercises).
+static int vec_indexes_active_count_by_name(const char* name) {
+    for (int i = 0; i < VEC_INDEX_MAX; i++)
+        if (vec_indexes[i].active && strcmp(vec_indexes[i].index_name, name) == 0)
+            return (int)vec_indexes[i].active_count;
+    return -1;
+}
 
 // ─── This TEST file's own tiny xorshift32 -- deliberately separate from
 // vec_index.c's own internal PRNG (used for layer assignment, not test
@@ -317,6 +336,207 @@ int main(void) {
         struct VecMatch cos_result[1];
         CHECK(vec_index_search(1, "idx_cosine", &v, 1, 50, cos_result) == 1 && cos_result[0].external_id == 9999,
               "s5: idx_cosine's own search finds the point inserted into it, independent of idx_cluster");
+    }
+
+    /* ── Scenario 6: VectorStore Interface Roadmap Phase 1 -- vec_index_drop().
+     * Drops idx_cosine (leaves idx_cluster untouched) and confirms: the
+     * dropped index stops answering searches, its slot becomes reusable
+     * (a fresh vec_index_create() with the same name succeeds again), and
+     * the OTHER index over the same collection is completely unaffected. ─── */
+    {
+        struct VecValues probe;
+        probe.count = DIM;
+        for (int d = 0; d < DIM; d++) probe.values[d] = 2.0f * CLUSTER_SEP;
+        struct VecMatch before[1];
+        CHECK(vec_index_search(1, "idx_cosine", &probe, 1, 50, before) == 1,
+              "s6: setup -- idx_cosine answers a search before being dropped");
+
+        CHECK(vec_index_drop(1, "idx_cosine") == 0, "s6: vec_index_drop succeeds on an existing index");
+        CHECK(vec_index_drop(1, "idx_cosine") == 1, "s6: a second drop of the same (now-gone) name fails with 'not found' (1), not silently succeeding again");
+        CHECK(vec_index_drop(1, "does_not_exist") == 1, "s6: dropping a never-existing index name also fails with 1");
+
+        struct VecMatch after[1];
+        CHECK(vec_index_search(1, "idx_cosine", &probe, 1, 50, after) == 0,
+              "s6: idx_cosine no longer answers ANY search after being dropped");
+
+        CHECK(vec_index_create(1, "idx_cosine", "cluster_points", VEC_METRIC_COSINE) == 0,
+              "s6: the dropped slot is reusable -- creating a new index under the same name succeeds again");
+
+        struct VecMatch cluster_check[1];
+        CHECK(vec_index_search(1, "idx_cluster", &probe, 1, 100, cluster_check) == 1,
+              "s6: idx_cluster (the OTHER index over the same collection) is completely unaffected by idx_cosine's drop");
+    }
+
+    /* ── Scenario 7: VectorStore Interface Roadmap Phase 1 -- vecstore_
+     * notify_object_freed(). A dedicated, freshly-created collection +
+     * index (rather than reusing cluster_points/idx_cluster, which later
+     * scenarios don't run after this one but keeping this scenario fully
+     * self-contained is worth the small setup cost) -- confirms the
+     * function this whole phase's headline bug fix hinges on: after a
+     * simulated vfree, the collection becomes unreachable through every
+     * vecstore.c entry point AND any index built over it stops answering,
+     * rather than being silently orphaned (see object_catalog.c's own
+     * sys_sls_vfree()/catalog_vfree_partition() for the real caller --
+     * this test calls vecstore_notify_object_freed() directly, the same
+     * isolation boundary every other scenario in this file already uses
+     * for catalog_check_access(), since linking the real object_catalog.c
+     * here would pull in its full persist.h/journal.h/lock_mgr.h/etc.
+     * dependency graph for no benefit to what THIS function's own logic
+     * needs verified). ───────────────────────────────────────────────────── */
+    {
+        memset(&object_catalog[1], 0, sizeof(object_catalog[1]));
+        strcpy(object_catalog[1].name, "temp_collection");
+        object_catalog[1].type = OBJ_TYPE_DB_TABLE;
+        object_catalog[1].object_id = 0xF002;
+        object_catalog[1].active = 1;
+        object_catalog_count = 2;
+        CHECK(vecstore_create_collection("temp_collection", 4) == 0, "s7: setup -- temp_collection created");
+        CHECK(vec_index_create(1, "idx_temp", "temp_collection", VEC_METRIC_L2) == 0, "s7: setup -- index over temp_collection created");
+
+        struct VecValues v = { .count = 4, .values = {1.0f, 2.0f, 3.0f, 4.0f} };
+        struct VecId temp_id;
+        CHECK(vecstore_insert(1, "temp_collection", 42, &v, &temp_id) == 0, "s7: setup -- one vector inserted into temp_collection");
+
+        struct VecMatch pre[1];
+        CHECK(vecstore_search(1, "temp_collection", &v, VEC_METRIC_L2, 1, pre) == 1, "s7: setup -- temp_collection is searchable before being freed");
+        CHECK(vec_index_search(1, "idx_temp", &v, 1, 50, pre) == 1, "s7: setup -- idx_temp is searchable before being freed");
+
+        // The function under test -- called the same way object_catalog.c's
+        // fixed sys_sls_vfree() now calls it: BEFORE the catalog object's
+        // own .active flag would be cleared (object_catalog[1].active is
+        // deliberately left at 1 here, matching that exact call-order
+        // contract -- see vecstore_notify_object_freed()'s own header
+        // comment on why calling it after would silently find nothing).
+        vecstore_notify_object_freed("temp_collection");
+
+        uint64_t ext; struct VecValues got;
+        CHECK(vecstore_get(1, "temp_collection", temp_id, &ext, &got) == 1,
+              "s7: vecstore_get on the freed collection now fails (collection unreachable, not just the one vector)");
+        CHECK(vecstore_search(1, "temp_collection", &v, VEC_METRIC_L2, 1, pre) == 0,
+              "s7: vecstore_search on the freed collection now returns 0 matches (couldn't run at all, per the documented ambiguous-0 contract)");
+        CHECK(vecstore_collection_scan(1, "temp_collection", NULL, NULL) == 0,
+              "s7: vecstore_collection_scan on the freed collection visits 0 entries");
+        CHECK(vec_index_search(1, "idx_temp", &v, 1, 50, pre) == 0,
+              "s7: idx_temp (built over the now-freed collection) no longer answers searches either -- the index was deactivated too, not left dangling");
+
+        // Calling it again (e.g. a second vfree attempt, or vfree on a name
+        // that was never a vector collection in the first place) must be a
+        // harmless no-op, not a crash -- find_active_collection() returns
+        // -1 the second time since vector_collections[idx].active is
+        // already 0, and the function returns immediately per its own
+        // header comment.
+        vecstore_notify_object_freed("temp_collection");
+        vecstore_notify_object_freed("this_was_never_a_vector_collection");
+        CHECK(1, "s7: calling vecstore_notify_object_freed() again (already-freed) and on a name that was never a collection are both silent no-ops, not crashes");
+    }
+
+    /* ── Scenario 8: VectorStore Interface Roadmap Phase 3 -- backfill.
+     * A fresh collection populated BEFORE its index exists (the exact
+     * scenario vec_index.h's own header comment point 7 names as the gap):
+     * confirms the index really does start empty, then confirms
+     * vec_index_rebuild() closes that gap by finding every pre-existing
+     * vector via vecstore_collection_scan() and indexing it. Also exercises
+     * the two error paths (nonexistent index name, permission denied). ──── */
+    {
+        memset(&object_catalog[2], 0, sizeof(object_catalog[2]));
+        strcpy(object_catalog[2].name, "backfill_col");
+        object_catalog[2].type = OBJ_TYPE_DB_TABLE;
+        object_catalog[2].object_id = 0xF003;
+        object_catalog[2].active = 1;
+        object_catalog_count = 3;
+        CHECK(vecstore_create_collection("backfill_col", 3) == 0, "s8: setup -- backfill_col created");
+
+        struct VecId backfill_ids[5];
+        for (int i = 0; i < 5; i++) {
+            struct VecValues v;
+            v.count = 3;
+            v.values[0] = (float)i; v.values[1] = (float)i * 2; v.values[2] = (float)i * 3;
+            CHECK(vecstore_insert(1, "backfill_col", (uint64_t)(500 + i), &v, &backfill_ids[i]) == 0,
+                  "s8: setup -- a vector inserted into backfill_col BEFORE any index exists over it");
+        }
+
+        CHECK(vec_index_create(1, "idx_backfill", "backfill_col", VEC_METRIC_L2) == 0,
+              "s8: setup -- index created AFTER the collection was already populated");
+        CHECK(vec_indexes_active_count_by_name("idx_backfill") == 0,
+              "s8: the freshly created index starts empty despite the collection already having 5 live vectors -- the documented backfill gap, confirmed still real pre-rebuild");
+
+        struct VecValues probe0 = { .count = 3, .values = {0.0f, 0.0f, 0.0f} };
+        struct VecMatch empty_result[5];
+        CHECK(vec_index_search(1, "idx_backfill", &probe0, 5, 50, empty_result) == 0,
+              "s8: searching the empty, unrebuilt index finds nothing, even for a query matching a real stored point exactly");
+
+        CHECK(vec_index_rebuild(1, "does_not_exist") == 1, "s8: rebuilding a nonexistent index name fails with 1");
+        g_access_force_deny = 1;
+        CHECK(vec_index_rebuild(1, "idx_backfill") == 2, "s8: rebuilding with access denied fails with 2, and leaves the index untouched (still empty)");
+        g_access_force_deny = 0;
+
+        CHECK(vec_index_rebuild(1, "idx_backfill") == 0, "s8: vec_index_rebuild succeeds on the real, populated collection");
+        CHECK(vec_indexes_active_count_by_name("idx_backfill") == 5,
+              "s8: after rebuild, active_count reflects all 5 pre-existing vectors -- the backfill gap is closed");
+
+        struct VecMatch after_rebuild[1];
+        CHECK(vec_index_search(1, "idx_backfill", &probe0, 1, 50, after_rebuild) == 1 &&
+              after_rebuild[0].external_id == 500 && after_rebuild[0].distance < 0.001f,
+              "s8: the rebuilt index now finds a pre-existing vector (external_id=500) via a search, distance ~0 for its own exact values");
+    }
+
+    /* ── Scenario 9: VectorStore Interface Roadmap Phase 3 -- tombstone
+     * cleanup. Deletes a live, indexed vector (tombstoning its node, per
+     * vec_index_notify_delete()'s own existing behavior -- Scenario 4's
+     * own precedent), then rebuilds and confirms the rebuilt graph is
+     * genuinely CLEAN, not just "the deleted point no longer wins a
+     * search": no ACTIVE node's neighbor list, at any layer, references a
+     * tombstoned node_idx. This is the real difference rebuild makes over
+     * a bare vecstore_delete() -- vec_index.h's own header comment already
+     * names tombstoned-but-still-linked nodes as dead ends other live
+     * queries route through; a full rebuild regenerates the graph from
+     * only live data, so no such dead end can exist afterward. ──────────── */
+    {
+        struct VecValues probe1 = { .count = 3, .values = {1.0f, 2.0f, 3.0f} };
+        struct VecMatch victim[1];
+        CHECK(vec_index_search(1, "idx_backfill", &probe1, 1, 50, victim) == 1 && victim[0].external_id == 501,
+              "s9: setup -- located external_id=501 (inserted as point i=1 in Scenario 8) via search");
+
+        struct VecId victim_id = victim[0].id;
+        CHECK(vecstore_delete(1, "backfill_col", victim_id) == 0, "s9: setup -- deleted that vector (auto-maintenance tombstones its node in idx_backfill)");
+        CHECK(vec_indexes_active_count_by_name("idx_backfill") == 4,
+              "s9: active_count drops to 4 immediately after the delete, before any rebuild");
+
+        CHECK(vec_index_rebuild(1, "idx_backfill") == 0, "s9: vec_index_rebuild succeeds after the deletion");
+        CHECK(vec_indexes_active_count_by_name("idx_backfill") == 4,
+              "s9: active_count stays at 4 after rebuild -- the deleted point does not come back (vecstore_collection_scan() only visits live entries)");
+
+        struct VecMatch after[10];
+        uint32_t n = vec_index_search(1, "idx_backfill", &probe1, 10, 50, after);
+        int found_deleted = 0;
+        for (uint32_t i = 0; i < n; i++) if (after[i].external_id == 501) found_deleted = 1;
+        CHECK(!found_deleted, "s9: the deleted point's external_id never appears in the rebuilt index's search results");
+
+        // The real, structural check: walk every ACTIVE node belonging to
+        // idx_backfill and confirm every neighbor edge, at every layer,
+        // points to another ACTIVE node -- proving no dead-end edges to
+        // the deleted (or any pre-rebuild-tombstoned) node survived.
+        int backfill_slot = -1;
+        for (int i = 0; i < VEC_INDEX_MAX; i++)
+            if (vec_indexes[i].active && strcmp(vec_indexes[i].index_name, "idx_backfill") == 0) backfill_slot = i;
+        CHECK(backfill_slot >= 0, "s9: setup -- idx_backfill's slot located for direct graph inspection");
+
+        int clean = 1;
+        uint32_t active_nodes_checked = 0;
+        for (uint32_t n2 = 0; n2 < vec_index_next_free_node; n2++) {
+            if (vec_index_nodes[n2].index_id != (uint32_t)backfill_slot || !vec_index_nodes[n2].active) continue;
+            active_nodes_checked++;
+            for (uint32_t l = 0; l <= vec_index_nodes[n2].top_layer && l < VEC_INDEX_MAX_LAYERS; l++) {
+                for (uint32_t e = 0; e < vec_index_nodes[n2].neighbor_count[l]; e++) {
+                    uint32_t nb = vec_index_nodes[n2].neighbors[l][e];
+                    if (nb >= VEC_INDEX_MAX_NODES || !vec_index_nodes[nb].active || vec_index_nodes[nb].index_id != (uint32_t)backfill_slot) {
+                        clean = 0;
+                    }
+                }
+            }
+        }
+        CHECK(active_nodes_checked == 4, "s9: exactly 4 active nodes belong to idx_backfill post-rebuild (matches active_count)");
+        CHECK(clean, "s9: every active node's every neighbor edge, at every layer, points to another active node in the same index -- no dead-end edges survive a rebuild");
     }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");

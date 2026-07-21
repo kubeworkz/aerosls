@@ -30,11 +30,19 @@
  * vecstore_insert()/_delete() but never updated every host test's own
  * documented build line to match). Found here during Phase C's regression
  * sweep, fixed alongside Phase C's own vec_index.c/vecstore.c changes.
+ *
+ * VectorStore Interface Roadmap Phase 2 addendum (Scenarios 10-11): the same
+ * controllable ollama_embed() stub below now also exercises
+ * sys_sls_vec_embed_search() (vecstore.c) and sys_sls_vec_index_embed_search()
+ * (vec_index.c) -- both already-linked here, so no new build-line change was
+ * needed, only the new #include "kernel/vec_index.h" above for that second
+ * adapter's own request struct.
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "kernel/vecstore.h"
+#include "kernel/vec_index.h"   // VectorStore Interface Roadmap Phase 2 -- sys_sls_vec_index_embed_search()
 #include "user/permissions.h"
 #include <stdio.h>
 #include <string.h>
@@ -302,6 +310,158 @@ int main(void) {
         uint64_t rc = sys_sls_vec_embed_insert(&req);
         CHECK(rc != 0 && req.ollama_status == 0 && req.insert_status == 4,
               "s8: a max-sized (2048-dim) embedding is handled without crashing, fails cleanly on dimension mismatch");
+    }
+
+    /* ── Scenario 9: VectorStore Interface Roadmap Phase 1 -- sys_sls_vec_delete.
+     * Reuses points_id_a from Scenario 2 (still a live, undeleted vector at
+     * this point in the suite) -- confirms the adapter's status pass-through
+     * for both the success path and the two failure codes vecstore_delete()
+     * itself already defines (3 = bad/stale/already-deleted VecId), plus the
+     * one genuinely new behavior this adapter adds beyond a bare pass-
+     * through: req->status stays legible on a null-request guard. ────────── */
+    {
+        CHECK(sys_sls_vec_delete(NULL) == 1, "s9: sys_sls_vec_delete(NULL) fails cleanly (status 1), no crash");
+
+        struct SLSVecDeleteRequest req;
+        req.caller_uid = 1;
+        strcpy(req.collection_name, "points");
+        req.id = points_id_a;
+        uint64_t rc = sys_sls_vec_delete(&req);
+        CHECK(rc == 0 && req.status == 0, "s9: sys_sls_vec_delete succeeds on a real, live vector");
+
+        uint64_t got_ext; struct VecValues got_vals;
+        CHECK(vecstore_get(1, "points", points_id_a, &got_ext, &got_vals) == 3,
+              "s9: the deleted vector is confirmed gone via vecstore_get() (status 3 -- tombstoned)");
+
+        uint64_t rc2 = sys_sls_vec_delete(&req);
+        CHECK(rc2 != 0 && req.status == 3,
+              "s9: deleting the SAME VecId a second time reports status 3 (already deleted), matching vecstore_delete()'s own documented contract -- not silently 'succeeding' again");
+
+        struct SLSVecDeleteRequest bad_id = req;
+        bad_id.id.page_id = 0xFFFFFFF0u;   // structurally out of range for this collection's page pool
+        uint64_t rc3 = sys_sls_vec_delete(&bad_id);
+        CHECK(rc3 != 0 && bad_id.status == 3, "s9: an out-of-range VecId also reports status 3, not a crash or a different code");
+
+        struct SLSVecDeleteRequest bad_collection = req;
+        strcpy(bad_collection.collection_name, "no_such_collection");
+        uint64_t rc4 = sys_sls_vec_delete(&bad_collection);
+        CHECK(rc4 != 0 && bad_collection.status == 1, "s9: deleting from a nonexistent collection reports status 1, distinct from a bad-VecId (3)");
+    }
+
+    /* ── Scenario 10: VectorStore Interface Roadmap Phase 2 --
+     * sys_sls_vec_embed_search() (brute-force). Targets external_id=777
+     * (inserted in Scenario 5, values 9/8/7/6) rather than external_id=42
+     * (points_id_a) -- that one was deleted in Scenario 9 and is no longer
+     * a valid target to search for. ─────────────────────────────────────── */
+    {
+        g_ollama_force_fail = 0;
+        g_ollama_dim = 4;
+        g_ollama_vals[0] = 9.0f; g_ollama_vals[1] = 8.0f;
+        g_ollama_vals[2] = 7.0f; g_ollama_vals[3] = 6.0f;
+
+        struct SLSVecEmbedSearchRequest req;
+        req.caller_uid = 1;
+        strcpy(req.collection_name, "points");
+        strcpy(req.ollama_req.endpoint_ip, "127.0.0.1");
+        req.ollama_req.port = 11434;
+        strcpy(req.ollama_req.model, "nomic-embed-text");
+        strcpy(req.ollama_req.prompt, "find the 9,8,7,6 point");
+        req.metric = VEC_METRIC_L2;
+        req.k = 1;
+
+        int calls_before = g_ollama_calls;
+        uint64_t rc = sys_sls_vec_embed_search(&req);
+        CHECK(g_ollama_calls == calls_before + 1, "s10: sys_sls_vec_embed_search calls ollama_embed() exactly once");
+        CHECK(rc == 0 && req.ollama_status == 0, "s10: happy path reports syscall success and ollama_status 0");
+        CHECK(req.match_count == 1 && req.matches[0].external_id == 777 && req.matches[0].distance < 0.001f,
+              "s10: the embedded query finds external_id=777 (the exact point Ollama's stub reported), distance ~0");
+
+        // k-capping still functions once routed through the embed adapter --
+        // one assertion suffices since sys_sls_vec_search()'s own Scenario 4
+        // already proves the underlying capping logic exhaustively; this is
+        // about the adapter not accidentally bypassing it.
+        struct SLSVecEmbedSearchRequest big = req;
+        big.k = VEC_SEARCH_MAX_K + 1000;
+        rc = sys_sls_vec_embed_search(&big);
+        CHECK(rc == 0 && big.truncated == 1 && big.match_count <= VEC_SEARCH_MAX_K,
+              "s10: an oversized k is still capped correctly through the embed-search adapter");
+
+        // Ollama itself fails -- the search must never be attempted, and
+        // match_count must read 0 (not stale data from a prior call), same
+        // "never attempted, not just empty" distinction sys_sls_vec_embed_
+        // insert()'s own Scenario 6 already established for insert_status.
+        g_ollama_force_fail = 1;
+        struct SLSVecEmbedSearchRequest failing = req;
+        rc = sys_sls_vec_embed_search(&failing);
+        CHECK(rc != 0 && failing.ollama_status != 0, "s10: sys_sls_vec_embed_search reports failure when ollama_embed() fails");
+        CHECK(failing.match_count == 0, "s10: match_count is 0 (never attempted), not stale, when Ollama itself failed");
+        g_ollama_force_fail = 0;
+    }
+
+    /* ── Scenario 11: VectorStore Interface Roadmap Phase 2 --
+     * sys_sls_vec_index_embed_search() (HNSW). Needs its own fresh
+     * collection + index: an index only auto-maintains entries inserted
+     * AFTER it's created (vec_index.h's own documented backfill gap, not
+     * yet closed -- that's Phase 3), so vectors already in "points" from
+     * earlier scenarios would NOT appear in a freshly created index over
+     * it. ─────────────────────────────────────────────────────────────── */
+    {
+        make_object(2, "idx_search_col", 0xE003);
+        object_catalog_count = 3;
+
+        struct SLSVecCreateRequest cc;
+        cc.caller_uid = 1;
+        strcpy(cc.collection_name, "idx_search_col");
+        cc.dimension = 3;
+        CHECK(sys_sls_vec_create(&cc) == 0 && cc.status == 0, "s11: setup -- fresh collection for the HNSW embed-search test");
+
+        struct SLSVecIndexCreateRequest ic;
+        ic.caller_uid = 1;
+        strcpy(ic.index_name, "idx_search_test");
+        strcpy(ic.collection_name, "idx_search_col");
+        ic.metric = VEC_METRIC_L2;
+        CHECK(sys_sls_vec_index_create(&ic) == 0 && ic.status == 0, "s11: setup -- HNSW index created over the fresh collection");
+
+        // Inserted AFTER index creation -- auto-maintenance picks these up.
+        struct SLSVecInsertRequest ins;
+        ins.caller_uid = 1;
+        strcpy(ins.collection_name, "idx_search_col");
+        ins.values.count = 3;
+        ins.external_id = 1; ins.values.values[0]=1.0f; ins.values.values[1]=0.0f; ins.values.values[2]=0.0f;
+        CHECK(sys_sls_vec_insert(&ins) == 0, "s11: setup -- vector 1 inserted (auto-maintained into the index)");
+        ins.external_id = 2; ins.values.values[0]=0.0f; ins.values.values[1]=1.0f; ins.values.values[2]=0.0f;
+        CHECK(sys_sls_vec_insert(&ins) == 0, "s11: setup -- vector 2 inserted (auto-maintained into the index)");
+        ins.external_id = 3; ins.values.values[0]=5.0f; ins.values.values[1]=5.0f; ins.values.values[2]=5.0f;
+        CHECK(sys_sls_vec_insert(&ins) == 0, "s11: setup -- vector 3 inserted (auto-maintained into the index)");
+
+        g_ollama_force_fail = 0;
+        g_ollama_dim = 3;
+        g_ollama_vals[0] = 1.0f; g_ollama_vals[1] = 0.0f; g_ollama_vals[2] = 0.0f;
+
+        struct SLSVecIndexEmbedSearchRequest req;
+        req.caller_uid = 1;
+        strcpy(req.index_name, "idx_search_test");
+        strcpy(req.ollama_req.endpoint_ip, "127.0.0.1");
+        req.ollama_req.port = 11434;
+        strcpy(req.ollama_req.model, "nomic-embed-text");
+        strcpy(req.ollama_req.prompt, "find vector 1");
+        req.k = 1;
+        req.ef = 10;
+
+        int calls_before = g_ollama_calls;
+        uint64_t rc = sys_sls_vec_index_embed_search(&req);
+        CHECK(g_ollama_calls == calls_before + 1, "s11: sys_sls_vec_index_embed_search calls ollama_embed() exactly once");
+        CHECK(rc == 0 && req.ollama_status == 0, "s11: happy path reports syscall success and ollama_status 0");
+        CHECK(req.match_count == 1 && req.matches[0].external_id == 1 && req.matches[0].distance < 0.001f,
+              "s11: the embedded query finds external_id=1 (the exact point Ollama's stub reported) via the HNSW index");
+
+        // Ollama itself fails -- same never-attempted contract as Scenario 10.
+        g_ollama_force_fail = 1;
+        struct SLSVecIndexEmbedSearchRequest failing = req;
+        rc = sys_sls_vec_index_embed_search(&failing);
+        CHECK(rc != 0 && failing.ollama_status != 0, "s11: sys_sls_vec_index_embed_search reports failure when ollama_embed() fails");
+        CHECK(failing.match_count == 0, "s11: match_count is 0 (never attempted), not stale, when Ollama itself failed");
+        g_ollama_force_fail = 0;
     }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");

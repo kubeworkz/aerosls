@@ -500,6 +500,96 @@ uint64_t sys_sls_vec_search(struct SLSVecSearchRequest* req) {
     return 0;
 }
 
+// ─── VectorStore Interface Roadmap Phase 2: semantic (embed-then-search) ──
+// Same embed-first shape as sys_sls_vec_embed_insert() above -- embed
+// req->ollama_req.prompt via a real network round-trip, then, only if that
+// succeeded, call straight into the already-tested vecstore_search() with
+// the resulting vector. Deliberately does NOT reuse
+// sys_sls_vec_embed_insert()'s own body: the two adapters share the same
+// six-line embed-and-convert prefix by construction (both were written by
+// copying this shape, matching this roadmap's own Phase 2 scope note that
+// this is "copy-the-pattern-once, not restructure-existing-code" since no
+// shared helper currently exists to extract into), not by calling each
+// other or a common function -- introducing one now for two five-line call
+// sites would be more indirection than the duplication it removes.
+uint64_t sys_sls_vec_embed_search(struct SLSVecEmbedSearchRequest* req) {
+    if (!req) return 1;
+
+    struct OllamaEmbedResponse resp;
+    req->ollama_status = ollama_embed(&req->ollama_req, &resp);
+    if (req->ollama_status != 0) {
+        req->match_count = 0;   // never attempted -- distinct from "attempted, found nothing"
+        return 1;
+    }
+
+    uint32_t n = resp.dimension;
+    if (n > VECSTORE_MAX_DIMENSION) n = VECSTORE_MAX_DIMENSION;
+
+    struct VecValues query;
+    query.count = n;
+    for (uint32_t i = 0; i < n; i++) query.values[i] = resp.embedding[i];
+
+    uint32_t k = req->k;
+    req->truncated = (k > VEC_SEARCH_MAX_K) ? 1 : 0;
+    if (k > VEC_SEARCH_MAX_K) k = VEC_SEARCH_MAX_K;
+
+    // Same documented 0-is-ambiguous match_count contract sys_sls_vec_search()
+    // already carries, deliberately preserved rather than "fixed" here --
+    // ollama_status is what separates "Ollama never answered" from "Ollama
+    // answered fine, the search itself just found nothing," so this adapter
+    // still always returns syscall-success (0) once embedding succeeded.
+    req->match_count = vecstore_search(req->caller_uid, req->collection_name,
+                                       &query, req->metric, k, req->matches);
+    return 0;
+}
+
+// ─── VectorStore Interface Roadmap Phase 1: single-vector delete ──────────
+// Thin adapter, same shape as every other syscall wrapper in this file --
+// one line into the already-implemented vecstore_delete() (see this file's
+// vecstore_delete() above, which already does the real work: tombstone,
+// flush, persist, and vec_index_notify_delete() to keep any HNSW index
+// consistent).
+uint64_t sys_sls_vec_delete(struct SLSVecDeleteRequest* req) {
+    if (!req) return 1;
+    req->status = vecstore_delete(req->caller_uid, req->collection_name, req->id);
+    return (uint64_t)req->status;
+}
+
+// ─── VectorStore Interface Roadmap Phase 1: vfree-time cleanup ────────────
+// Called from object_catalog.c's sys_sls_vfree()/catalog_vfree_partition()
+// BEFORE either sets the catalog object's .active = 0 -- find_active_
+// collection() above requires object_catalog[i].active to still be true to
+// find the collection by name, so this must run first or it silently finds
+// nothing and leaks exactly the bug this function exists to close (see
+// docs/AeroSLS-VectorStore-Interface-Roadmap-v0.1.md Phase 1 for the full
+// investigation: confirmed via grep that object_catalog.c never touched
+// vector_collections[]/vec_indexes[] at all before this).
+//
+// A genuine no-op (not an error) if collection_name was never a vector
+// collection -- vfree() is the one generic "delete this object" path for
+// every object type in this kernel, so it must call this unconditionally,
+// and most objects freed are not vector collections at all.
+//
+// Declared here (not in vecstore.h) and forward-declared via a bare
+// `extern` in object_catalog.c instead -- matches this codebase's own
+// established convention for this exact kind of "notify a higher-layer
+// subsystem" call (see object_catalog.c's own tier_notify_access() extern,
+// tier_mgr.c). Avoids a circular header dependency too: vecstore.h already
+// includes object_catalog.h (the correct direction), so object_catalog.c/h
+// must not include vecstore.h back.
+void vecstore_notify_object_freed(const char* collection_name) {
+    int idx = find_active_collection(collection_name);
+    if (idx < 0) return;   // not a vector collection -- nothing to do
+
+    vector_collections[idx].active = 0;
+    persist_vecstore_headers();   // Gap Remediation Phase D
+
+    // Deactivate any HNSW index built over this collection too, same
+    // "don't leave a dangling reference" reasoning -- see vec_index.c's
+    // own vec_index_notify_collection_freed() for the node-tombstone loop.
+    vec_index_notify_collection_freed(collection_name);
+}
+
 // ─── Gap Remediation Phase C: collection enumeration ────────────────────────
 // Mirrors sys_sls_obj_list()'s own shape exactly (object_catalog.c) -- see
 // vecstore.h's own comment on this syscall.

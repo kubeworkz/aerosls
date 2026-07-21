@@ -406,6 +406,51 @@ uint64_t sys_sls_vec_insert(struct SLSVecInsertRequest* req);
 uint64_t sys_sls_vec_embed_insert(struct SLSVecEmbedInsertRequest* req);
 uint64_t sys_sls_vec_search(struct SLSVecSearchRequest* req);
 
+// ─── VectorStore Interface Roadmap Phase 1: single-vector delete ──────────
+// The live syscall/HTTP/Terminal path vecstore_delete() (already fully
+// implemented above -- tombstone + auto-maintenance into any HNSW index)
+// never had, mirroring the exact same "engine function exists, nothing
+// above the engine layer can reach it" gap SYS_SLS_VEC_CREATE (224) closed
+// for vecstore_create_collection() back in Phase 4 -- see that syscall's
+// own comment above for the precedent this follows.
+#define SYS_SLS_VEC_DELETE 231
+
+struct SLSVecDeleteRequest {
+    uint32_t     caller_uid;
+    char         collection_name[OBJECT_NAME_LEN];
+    struct VecId id;       // page_id/slot_index -- from a prior insert or search response
+    int          status;   // vecstore_delete()'s own return code (0 = success)
+};
+
+uint64_t sys_sls_vec_delete(struct SLSVecDeleteRequest* req);
+
+// ─── VectorStore Interface Roadmap Phase 2: semantic (embed-then-search) ──
+// Closes this roadmap's own #1-ranked gap: before this, searching "by
+// meaning" meant embedding a query somewhere else yourself and hand-pasting
+// a float array into SLSVecSearchRequest.query. sys_sls_vec_embed_search()
+// below is SLSVecEmbedInsertRequest's own embed-first shape, with the one
+// change its own doc comment names: swap the final vecstore_insert() call
+// for vecstore_search(). ollama_status is reported separately from the
+// search's own (already-ambiguous, already-documented) 0-could-mean-either-
+// thing match_count signal, matching SLSVecEmbedInsertRequest's own
+// ollama_status/insert_status split -- "Ollama never answered" must stay
+// distinguishable from "Ollama answered fine, zero matches came back."
+#define SYS_SLS_VEC_EMBED_SEARCH 234
+
+struct SLSVecEmbedSearchRequest {
+    uint32_t                  caller_uid;
+    char                      collection_name[OBJECT_NAME_LEN];
+    struct OllamaEmbedRequest ollama_req;               // endpoint_ip/port/model/prompt -- the query text to embed
+    VecMetric                 metric;
+    uint32_t                  k;                         // capped to VEC_SEARCH_MAX_K internally
+    struct VecMatch           matches[VEC_SEARCH_MAX_K];  // filled in only if ollama_status == 0
+    uint32_t                  match_count;                // filled in only if ollama_status == 0
+    uint8_t                   truncated;                  // 1 if the caller's k exceeded VEC_SEARCH_MAX_K
+    int                       ollama_status;               // ollama_embed()'s own return code; nonzero means search was never attempted
+};
+
+uint64_t sys_sls_vec_embed_search(struct SLSVecEmbedSearchRequest* req);
+
 // ─── Gap Remediation Phase C: collection enumeration ──────────────────────
 // Before this, a caller had to already know a collection's name -- there
 // was no way, at any level (syscall, shell, HTTP), to ask "what vector

@@ -380,6 +380,97 @@ void vec_index_notify_delete(const char* collection_name, struct VecId id) {
     }
 }
 
+// ─── VectorStore Interface Roadmap Phase 1: bulk deactivation ─────────────
+// See vec_index.h's own comment on this function. Same loop shape as
+// vec_index_notify_delete() above, generalized from "one matching VecId"
+// to "every node this index owns" -- reused by both
+// vecstore_notify_object_freed() (whole collection freed) and, indirectly,
+// vec_index_drop() below (single named index dropped) share this exact
+// per-index tombstone-everything body.
+static void vi_deactivate_index(uint32_t index_slot) {
+    for (uint32_t n = 0; n < vec_index_next_free_node; n++) {
+        struct VecIndexNode* node = &vec_index_nodes[n];
+        if (node->index_id != index_slot) continue;
+        node->active = 0;
+    }
+    vec_indexes[index_slot].active = 0;
+    vec_indexes[index_slot].active_count = 0;
+    persist_vec_index_defs();   // Gap Remediation Phase D
+}
+
+void vec_index_notify_collection_freed(const char* collection_name) {
+    for (uint32_t i = 0; i < VEC_INDEX_MAX; i++) {
+        if (!vec_indexes[i].active) continue;
+        if (!vi_streq(vec_indexes[i].collection_name, collection_name)) continue;
+        vi_deactivate_index(i);
+    }
+}
+
+int vec_index_drop(uint32_t caller_uid, const char* index_name) {
+    int slot = vi_find_index_slot(index_name);
+    if (slot < 0) return 1;
+    struct VecIndex* idx = &vec_indexes[slot];
+
+    if (catalog_check_access(caller_uid, idx->collection_name, PERM_WRITE) == 0) return 2;
+
+    vi_deactivate_index((uint32_t)slot);
+    return 0;
+}
+
+// ─── VectorStore Interface Roadmap Phase 3: rebuild/backfill ──────────────
+// Callback shape matches vecstore.c's own vs_search_cb -- one static ctx
+// struct, one static callback, one vecstore_collection_scan() call, same
+// three-piece pattern that file's search adapter already established for
+// "walk every live entry, do something with it."
+struct vi_rebuild_ctx {
+    struct VecIndex* idx;
+    uint32_t          idx_slot;
+    uint32_t          caller_uid;
+};
+
+static void vi_rebuild_cb(struct VecId id, uint64_t external_id,
+                          const struct VecValues* values, void* ctxp) {
+    struct vi_rebuild_ctx* ctx = (struct vi_rebuild_ctx*)ctxp;
+    vi_insert_into(ctx->idx, ctx->idx_slot, ctx->caller_uid, id, external_id, values);
+}
+
+// See this function's own prototype comment (vec_index.h) for the full
+// contract. Clear step reuses vi_deactivate_index()'s per-node tombstone
+// LOOP SHAPE but not that function itself -- vi_deactivate_index() also
+// sets vec_indexes[slot].active = 0 (a real drop), which rebuild must NOT
+// do, so this inlines the same loop rather than calling it and then
+// un-deactivating the index back to active (which would round-trip
+// through persist_vec_index_defs() twice and briefly make the index
+// invisible to any concurrent reader between the two calls -- avoided
+// entirely by never actually dropping it in the first place).
+int vec_index_rebuild(uint32_t caller_uid, const char* index_name) {
+    int slot = vi_find_index_slot(index_name);
+    if (slot < 0) return 1;
+    struct VecIndex* idx = &vec_indexes[slot];
+
+    if (catalog_check_access(caller_uid, idx->collection_name, PERM_WRITE) == 0) return 2;
+
+    for (uint32_t n = 0; n < vec_index_next_free_node; n++) {
+        struct VecIndexNode* node = &vec_index_nodes[n];
+        if (node->index_id != (uint32_t)slot) continue;
+        node->active = 0;
+    }
+    // Reset graph-entry state so the first re-inserted node below becomes
+    // the new entry point, exactly as it would for a freshly created,
+    // empty index (vec_index_create()'s own initial values) -- node_count
+    // is deliberately NOT reset here; see this function's own header
+    // comment (vec_index.h) for why.
+    idx->entry_point = VEC_INDEX_INVALID;
+    idx->top_layer = 0;
+    idx->active_count = 0;
+
+    struct vi_rebuild_ctx ctx = { idx, (uint32_t)slot, caller_uid };
+    vecstore_collection_scan(caller_uid, idx->collection_name, vi_rebuild_cb, &ctx);
+
+    persist_vec_index_defs();   // Gap Remediation Phase D
+    return 0;
+}
+
 uint32_t vec_index_search(uint32_t caller_uid, const char* index_name,
                           const struct VecValues* query, uint32_t k, uint32_t ef,
                           struct VecMatch* out) {
@@ -440,6 +531,55 @@ uint64_t sys_sls_vec_index_search(struct SLSVecIndexSearchRequest* req) {
     req->match_count = vec_index_search(req->caller_uid, req->index_name,
                                         &req->query, k, req->ef, req->matches);
     return 0;
+}
+
+// ─── VectorStore Interface Roadmap Phase 1: index drop ────────────────────
+// Thin adapter, same shape as the two above -- one line into vec_index_drop().
+uint64_t sys_sls_vec_index_drop(struct SLSVecIndexDropRequest* req) {
+    if (!req) return 1;
+    req->status = vec_index_drop(req->caller_uid, req->index_name);
+    return (uint64_t)req->status;
+}
+
+// ─── VectorStore Interface Roadmap Phase 2: semantic (embed-then-search) ──
+// HNSW counterpart to vecstore.c's own sys_sls_vec_embed_search() -- same
+// embed-first shape, calling vec_index_search() instead of vecstore_search()
+// as the final step. See that adapter's own comment for why this is a
+// deliberate second copy of the embed-and-convert prefix rather than a
+// shared helper.
+uint64_t sys_sls_vec_index_embed_search(struct SLSVecIndexEmbedSearchRequest* req) {
+    if (!req) return 1;
+
+    struct OllamaEmbedResponse resp;
+    req->ollama_status = ollama_embed(&req->ollama_req, &resp);
+    if (req->ollama_status != 0) {
+        req->match_count = 0;   // never attempted -- distinct from "attempted, found nothing"
+        return 1;
+    }
+
+    uint32_t n = resp.dimension;
+    if (n > VECSTORE_MAX_DIMENSION) n = VECSTORE_MAX_DIMENSION;
+
+    struct VecValues query;
+    query.count = n;
+    for (uint32_t i = 0; i < n; i++) query.values[i] = resp.embedding[i];
+
+    uint32_t k = req->k;
+    req->truncated = (k > VEC_SEARCH_MAX_K) ? 1 : 0;
+    if (k > VEC_SEARCH_MAX_K) k = VEC_SEARCH_MAX_K;
+
+    req->match_count = vec_index_search(req->caller_uid, req->index_name,
+                                        &query, k, req->ef, req->matches);
+    return 0;
+}
+
+// ─── VectorStore Interface Roadmap Phase 3: rebuild/backfill ──────────────
+// Thin adapter, same shape as sys_sls_vec_index_drop() -- one line into
+// vec_index_rebuild().
+uint64_t sys_sls_vec_index_rebuild(struct SLSVecIndexRebuildRequest* req) {
+    if (!req) return 1;
+    req->status = vec_index_rebuild(req->caller_uid, req->index_name);
+    return (uint64_t)req->status;
 }
 
 // ─── Gap Remediation Phase C: index enumeration ─────────────────────────────

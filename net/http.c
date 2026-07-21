@@ -601,7 +601,15 @@ static void http_options(int conn) {
     while (*sl) h[hp++] = *sl++;
     const char* co = g_cors_origin_hdr;
     while (*co) h[hp++] = *co++;
-    const char* rest = "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    // VectorStore Interface Roadmap Phase 1: DELETE added -- a browser
+    // preflights any DELETE request (and any request with a
+    // non-"simple" Content-Type like application/json) against this exact
+    // list before the real request is ever sent; leaving DELETE off here
+    // would have made the new /api/vec/* DELETE routes below completely
+    // unreachable from the Navigator SPA even though the routes themselves
+    // work fine when called directly (e.g. via curl or the Terminal's own
+    // authFetch(), neither of which triggers a CORS preflight).
+    const char* rest = "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                        "Content-Length: 0\r\n\r\n";
     while (*rest) h[hp++] = *rest++;
@@ -1943,6 +1951,148 @@ static int api_vec_index_search_post(const char* body, char* buf, int max, uint3
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── POST /api/vec/embed-search — VectorStore Interface Roadmap Phase 2 ────────
+// The route this whole roadmap's #1-ranked gap named: search by typing
+// query text instead of hand-pasting a float array. Body: {"collection":
+// "<name>", "endpoint_ip": "...", "port": N, "model": "...", "prompt":
+// "<query text>", "metric": "cosine"|"l2" (default cosine), "k": N}.
+// endpoint_ip/port/model default exactly the same way POST /api/vec/
+// embed-insert's own route already does, for consistency within this route
+// family. Response shape is POST /api/vec/search's own shape (ok/
+// match_count/truncated/matches[]) plus one extra field, ollama_status --
+// same reasoning as sys_sls_vec_embed_search()'s own struct comment: a
+// frontend needs to tell "Ollama never answered" apart from "Ollama
+// answered fine, zero matches came back" (both otherwise look like
+// match_count == 0).
+static int api_vec_embed_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecEmbedSearchRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
+    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "127.0.0.1");
+    int port = json_int(body, "port");
+    req.ollama_req.port = (uint16_t)(port ? port : 11434);
+    json_str_or_default(body, "model", req.ollama_req.model, OLLAMA_MODEL_LEN, "nomic-embed-text");
+    req.ollama_req.prompt[0] = '\0';
+    json_str(body, "prompt", req.ollama_req.prompt, OLLAMA_PROMPT_LEN);
+    char metric_s[16]; metric_s[0] = '\0';
+    json_str(body, "metric", metric_s, (int)sizeof(metric_s));
+    req.metric = (!strcmp(metric_s, "l2") || !strcmp(metric_s, "L2")) ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+    req.k = (uint32_t)json_int(body, "k");
+    if (!req.k) req.k = 10;
+    uint64_t rc = sys_sls_vec_embed_search(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "ollama_status", (uint64_t)req.ollama_status); jb_putc(&j,',');
+    jb_uint(&j, "match_count", req.match_count); jb_putc(&j,',');
+    jb_str(&j, "truncated", req.truncated ? "true" : "false"); jb_putc(&j,',');
+    jb_arr_open(&j, "matches");
+    uint32_t nshown = req.match_count < VEC_SEARCH_MAX_K ? req.match_count : VEC_SEARCH_MAX_K;
+    for (uint32_t i = 0; i < nshown; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "external_id", req.matches[i].external_id); jb_putc(&j, ',');
+        jb_uint(&j, "page_id", req.matches[i].id.page_id); jb_putc(&j, ',');
+        jb_uint(&j, "slot_index", req.matches[i].id.slot_index); jb_putc(&j, ',');
+        jb_key(&j, "distance");
+        {
+            double v = (double)req.matches[i].distance;
+            char fb[32]; int fn = 0;
+            if (v < 0) { fb[fn++] = '-'; v = -v; }
+            uint64_t ip = (uint64_t)v; double frac = v - (double)ip;
+            char ipb[24]; int il = 0;
+            if (!ip) ipb[il++] = '0'; else { uint64_t t = ip; while (t) { ipb[il++] = (char)('0'+t%10); t/=10; } }
+            for (int k = il-1; k >= 0; k--) fb[fn++] = ipb[k];
+            fb[fn++] = '.';
+            for (int d = 0; d < 6; d++) { frac *= 10.0; int digit = (int)frac; if (digit<0) digit=0; if (digit>9) digit=9; fb[fn++]=(char)('0'+digit); frac -= (double)digit; }
+            fb[fn] = '\0';
+            jb_raw(&j, fb);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/index/embed-search — VectorStore Interface Roadmap Phase 2 ──
+// HNSW counterpart to POST /api/vec/embed-search above. Body: {"index":
+// "<name>", "endpoint_ip": "...", "port": N, "model": "...", "prompt":
+// "<query text>", "k": N, "ef": N (default = k)}. No "metric" field -- same
+// as POST /api/vec/index/search's own body, since an HNSW index's metric is
+// fixed at index-creation time, not chosen per query.
+static int api_vec_index_embed_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecIndexEmbedSearchRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "index", req.index_name, OBJECT_NAME_LEN);
+    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "127.0.0.1");
+    int port = json_int(body, "port");
+    req.ollama_req.port = (uint16_t)(port ? port : 11434);
+    json_str_or_default(body, "model", req.ollama_req.model, OLLAMA_MODEL_LEN, "nomic-embed-text");
+    req.ollama_req.prompt[0] = '\0';
+    json_str(body, "prompt", req.ollama_req.prompt, OLLAMA_PROMPT_LEN);
+    req.k = (uint32_t)json_int(body, "k");
+    if (!req.k) req.k = 10;
+    req.ef = (uint32_t)json_int(body, "ef");
+    if (!req.ef) req.ef = req.k;
+    uint64_t rc = sys_sls_vec_index_embed_search(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "ollama_status", (uint64_t)req.ollama_status); jb_putc(&j,',');
+    jb_uint(&j, "match_count", req.match_count); jb_putc(&j,',');
+    jb_str(&j, "truncated", req.truncated ? "true" : "false"); jb_putc(&j,',');
+    jb_arr_open(&j, "matches");
+    uint32_t nshown = req.match_count < VEC_SEARCH_MAX_K ? req.match_count : VEC_SEARCH_MAX_K;
+    for (uint32_t i = 0; i < nshown; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "external_id", req.matches[i].external_id); jb_putc(&j, ',');
+        jb_uint(&j, "page_id", req.matches[i].id.page_id); jb_putc(&j, ',');
+        jb_uint(&j, "slot_index", req.matches[i].id.slot_index); jb_putc(&j, ',');
+        jb_key(&j, "distance");
+        {
+            double v = (double)req.matches[i].distance;
+            char fb[32]; int fn = 0;
+            if (v < 0) { fb[fn++] = '-'; v = -v; }
+            uint64_t ip = (uint64_t)v; double frac = v - (double)ip;
+            char ipb[24]; int il = 0;
+            if (!ip) ipb[il++] = '0'; else { uint64_t t = ip; while (t) { ipb[il++] = (char)('0'+t%10); t/=10; } }
+            for (int k = il-1; k >= 0; k--) fb[fn++] = ipb[k];
+            fb[fn++] = '.';
+            for (int d = 0; d < 6; d++) { frac *= 10.0; int digit = (int)frac; if (digit<0) digit=0; if (digit>9) digit=9; fb[fn++]=(char)('0'+digit); frac -= (double)digit; }
+            fb[fn] = '\0';
+            jb_raw(&j, fb);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/index/rebuild — VectorStore Interface Roadmap Phase 3 ──
+// Live path for vec_index_rebuild(): clears then repopulates a named HNSW
+// index's contents from its current, live collection state -- closes both
+// the never-backfills-an-existing-collection gap and cleans up tombstone
+// buildup from delete churn. Body: {"index": "<name>"} -- field name
+// "index" (not "name") matches this route family's own search routes'
+// convention (POST /api/vec/index/search's own body uses "index"), a
+// deliberate choice over matching DELETE /api/vec/indexes' "name" field --
+// see this phase's own roadmap doc writeup for why.
+static int api_vec_index_rebuild_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecIndexRebuildRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "index", req.index_name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_vec_index_rebuild(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── POST /api/vec/join — Gap Remediation Phase C ──────────────────────────────
 // Live path for vec_join_resolve() (Vector Store Phase 5), which had no
 // syscall/shell/HTTP surface at all before this pass. Body: {"table":
@@ -1991,6 +2141,66 @@ static int api_vec_join_post(const char* body, char* buf, int max, uint32_t req_
         jb_obj_close(&j);
     }
     jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── DELETE /api/vec/vector — VectorStore Interface Roadmap Phase 1 ───────
+// Live path for vecstore_delete() (already implemented since Vector Store
+// Phase 1/2, never had an HTTP route). Body: {"collection": "<name>",
+// "page_id": N, "slot_index": N} -- page_id/slot_index come from a prior
+// POST /api/vec/insert or /api/vec/search response, not from external_id
+// (VecId is a physical address, not keyed by external_id -- see
+// vecstore.h's own struct VecId comment).
+static int api_vec_delete(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecDeleteRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
+    req.id.page_id    = (uint32_t)json_int(body, "page_id");
+    req.id.slot_index = (uint32_t)json_int(body, "slot_index");
+    uint64_t rc = sys_sls_vec_delete(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── DELETE /api/vec/collections — VectorStore Interface Roadmap Phase 1 ──
+// Routes straight through sys_sls_vfree() -- the one generic "delete this
+// object" path every object type in this kernel already uses, now fixed
+// (object_catalog.c) to also release vector-collection state and any HNSW
+// indexes built over it, rather than a dedicated vecstore-only delete
+// syscall duplicating that logic. Body: {"name": "<collection>"}. Same
+// posture as the rest of this file's vfree-adjacent routes: no additional
+// ownership/role check beyond the standard "must be authenticated" gate
+// already applied to every DELETE route below -- sys_sls_vfree() itself
+// has never done owner/role gating for any object type, a pre-existing
+// gap out of scope for this roadmap to fix.
+static int api_vec_collection_delete(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN];
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_vfree(name);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", name);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── DELETE /api/vec/indexes — VectorStore Interface Roadmap Phase 1 ──────
+// Live path for vec_index_drop(). Body: {"name": "<index>"}.
+static int api_vec_index_delete(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecIndexDropRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.index_name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_vec_index_drop(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
@@ -2359,9 +2569,18 @@ static void http_route(int conn, char* req) {
     if (method[0] == 'O') { http_options(conn); return; }
 
     int is_post = (method[0] == 'P');
+    // VectorStore Interface Roadmap Phase 1: first real DELETE routes this
+    // server has ever had -- confirmed via grep before this that no method
+    // check for "DELETE" existed anywhere in this file. Before this fix, a
+    // DELETE request would have silently fallen into the `!is_post` GET
+    // branch below (passing its own bearer-token gate, then matching none
+    // of the GET routes and hitting the generic 404) rather than being
+    // routed to anything meaningful -- this makes it its own real branch
+    // instead, same shape as is_post.
+    int is_delete = (method[0] == 'D');
 
     // ── GET routes ────────────────────────────────────────────────────────────
-    if (!is_post) {
+    if (!is_post && !is_delete) {
         // Gap Remediation Phase E: bearer-token gate for GET routes, mirroring
         // the POST gate further below. Scoped to /api/* data routes only --
         // /auth/token and /auth/verify stay public (issuing or checking a
@@ -2710,6 +2929,20 @@ static void http_route(int conn, char* req) {
             blen = api_vec_index_search_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── VectorStore Interface Roadmap Phase 2: semantic (embed-then-search) ──
+        if (!strcmp(path, "/api/vec/embed-search")) {
+            blen = api_vec_embed_search_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/index/embed-search")) {
+            blen = api_vec_index_embed_search_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── VectorStore Interface Roadmap Phase 3: rebuild/backfill ──────────────
+        if (!strcmp(path, "/api/vec/index/rebuild")) {
+            blen = api_vec_index_rebuild_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         if (!strcmp(path, "/api/vec/join")) {
             blen = api_vec_join_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -3012,6 +3245,33 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/workflow/run")) {
             blen = api_workflow_run(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+    }
+
+    // ── DELETE routes — VectorStore Interface Roadmap Phase 1 ──────────────────
+    if (is_delete) {
+        // Same "must be authenticated" gate every POST route above already
+        // has -- no route in this branch is meant to be reachable by a
+        // guest, matching this whole file's established posture that only
+        // /api/health, /auth/token, and /auth/verify stay public.
+        uint32_t req_uid = 0; SLSRole req_role = ROLE_GUEST;
+        auth_http_extract(req, &req_uid, &req_role);
+        if (req_role == ROLE_GUEST) {
+            const char* e401 = "{\"error\":\"Unauthorized — include Authorization: Bearer <token>\"}";
+            http_respond(conn, 401, "application/json", e401, (int)strlen(e401));
+            return;
+        }
+        if (!strcmp(path, "/api/vec/vector")) {
+            blen = api_vec_delete(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/collections")) {
+            blen = api_vec_collection_delete(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/indexes")) {
+            blen = api_vec_index_delete(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
     }

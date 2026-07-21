@@ -120,6 +120,16 @@ uint64_t wal_stage(uint32_t thread_id, uint64_t object_id, const char* key,
 }
 uint32_t kernel_get_current_thread_id(void) { return 1; }
 
+// ─── vecstore.c stand-in (VectorStore Interface Roadmap Phase 1 -- another
+// of object_catalog.c's own forward-declared externs, same convention as
+// tx_get_active/wal_stage/kernel_get_current_thread_id above). This test's
+// own scenarios never valloc a vector-collection object, so this is a true
+// no-op -- but it must still resolve at link time now that sys_sls_vfree()/
+// catalog_vfree_partition() call it unconditionally. Not linking the real
+// vecstore.c here keeps this test's dependency graph exactly as narrow as
+// its own header comment already commits to. ─────────────────────────────
+void vecstore_notify_object_freed(const char* collection_name) { (void)collection_name; }
+
 // ─── lock_mgr.c / journal.c / index_mgr.c / mqt.c / constraint.c stand-ins --
 // call-tracked where useful, no-op otherwise. ──────────────────────────────
 int  lock_acquire(uint64_t tx_id, uint64_t object_id, const char* key, LockType type) {

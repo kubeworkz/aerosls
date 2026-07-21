@@ -309,6 +309,22 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_vec_index_list();
         return 0;
 
+    // ── VectorStore Interface Roadmap Phase 1: deletion ─────────────────────
+    case SYS_SLS_VEC_DELETE:
+        return sys_sls_vec_delete((struct SLSVecDeleteRequest*)arg);
+    case SYS_SLS_VEC_INDEX_DROP:
+        return sys_sls_vec_index_drop((struct SLSVecIndexDropRequest*)arg);
+
+    // ── VectorStore Interface Roadmap Phase 2: semantic (embed-then-search) ──
+    case SYS_SLS_VEC_EMBED_SEARCH:
+        return sys_sls_vec_embed_search((struct SLSVecEmbedSearchRequest*)arg);
+    case SYS_SLS_VEC_INDEX_EMBED_SEARCH:
+        return sys_sls_vec_index_embed_search((struct SLSVecIndexEmbedSearchRequest*)arg);
+
+    // ── VectorStore Interface Roadmap Phase 3: rebuild/backfill ─────────────
+    case SYS_SLS_VEC_INDEX_REBUILD:
+        return sys_sls_vec_index_rebuild((struct SLSVecIndexRebuildRequest*)arg);
+
     default:
         return 0;
     }

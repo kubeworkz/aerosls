@@ -116,6 +116,13 @@
  *    an existing collection is straightforward to add later (a
  *    vecstore_collection_scan() over the collection, feeding each entry
  *    through the same insert path) if a real caller needs it.
+ *    UPDATE — VectorStore Interface Roadmap Phase 3: that real caller
+ *    showed up. vec_index_create() ITSELF still doesn't auto-backfill (this
+ *    point's own original claim stays true, unchanged), but
+ *    vec_index_rebuild() (below) now exists as the explicit, separately-
+ *    invoked action that does exactly what this point predicted: a
+ *    vecstore_collection_scan() over the collection, feeding each entry
+ *    through the same insert path the auto-maintenance hook uses.
  */
 #ifndef VEC_INDEX_H
 #define VEC_INDEX_H
@@ -194,6 +201,41 @@ void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
                              const struct VecValues* values);
 void vec_index_notify_delete(const char* collection_name, struct VecId id);
 
+// ─── VectorStore Interface Roadmap Phase 1: deletion ──────────────────────
+// Bulk form of vec_index_notify_delete() above -- tombstones EVERY node
+// belonging to any index over collection_name (not one specific VecId),
+// then deactivates the index(es) themselves. Called from
+// vecstore_notify_object_freed() (vecstore.c) when the backing collection's
+// catalog object is being freed via vfree -- an index left pointing at a
+// freed collection would have vi_fetch_values() (vec_index.c) start
+// failing on every candidate during search (vecstore_get() properly gates
+// on the collection's own object_catalog[].active flag), a real but silent
+// failure mode this closes by deactivating the index outright instead.
+void vec_index_notify_collection_freed(const char* collection_name);
+
+// Drops one named index directly (a caller-invoked action, not an internal
+// auto-maintenance hook like the two functions above) -- tombstones every
+// node it owns, then deactivates the VecIndex slot. Gates on PERM_WRITE of
+// the underlying collection, matching vecstore_delete()'s own posture that
+// a destructive action requires write access (vec_index_create() only
+// requires PERM_READ, since creating an index doesn't mutate the
+// collection itself). Returns 0 on success, 1 if the index doesn't exist,
+// 2 if access is denied.
+int vec_index_drop(uint32_t caller_uid, const char* index_name);
+
+// ─── VectorStore Interface Roadmap Phase 3: rebuild/backfill ──────────────
+// Closes this header's own long-documented backfill gap (point 7 above): an
+// index created over an already-populated collection starts empty and
+// stays empty until this runs. Also doubles as tombstone cleanup for delete
+// churn -- this is a full clear-then-repopulate of the index's CONTENTS,
+// not a backfill-only-if-empty shortcut, and not a drop of the index
+// itself (unlike vec_index_drop() above, the index stays active and
+// reachable by name throughout). Gates on PERM_WRITE of the underlying
+// collection, matching vec_index_drop()'s own posture that a destructive
+// (contents-replacing) action needs write access. Returns 0 on success, 1
+// if the index doesn't exist, 2 if access is denied.
+int vec_index_rebuild(uint32_t caller_uid, const char* index_name);
+
 // ─── Query ────────────────────────────────────────────────────────────────
 // Approximate top-K nearest-neighbor search. ef controls the candidate
 // list size explored at layer 0 (raised to k if smaller; capped
@@ -252,5 +294,57 @@ uint64_t sys_sls_vec_index_search(struct SLSVecIndexSearchRequest* req);
 // "what HNSW indexes exist."
 #define SYS_SLS_VEC_INDEX_LIST 230
 void sys_sls_vec_index_list(void);
+
+// ─── VectorStore Interface Roadmap Phase 1: index drop ────────────────────
+// The live syscall/HTTP/Terminal path vec_index_drop() (above) never had --
+// same reachability-gap pattern SYS_SLS_VEC_INDEX_CREATE/SEARCH (227/228)
+// closed for the rest of this file back in Gap Remediation Phase C.
+#define SYS_SLS_VEC_INDEX_DROP 233
+
+struct SLSVecIndexDropRequest {
+    uint32_t caller_uid;
+    char     index_name[OBJECT_NAME_LEN];
+    int      status;   // vec_index_drop()'s own return code (0 = success)
+};
+
+uint64_t sys_sls_vec_index_drop(struct SLSVecIndexDropRequest* req);
+
+// ─── VectorStore Interface Roadmap Phase 2: semantic (embed-then-search) ──
+// HNSW counterpart to vecstore.h's own SYS_SLS_VEC_EMBED_SEARCH (234) --
+// same embed-first shape, swapping the final vecstore_search() call for
+// vec_index_search(). OllamaEmbedRequest/OllamaEmbedResponse are already
+// visible here via vecstore.h (included above), matching that header's own
+// "Phase 4 only" comment on why ollama_client.h reaches this file only
+// transitively, never a direct #include of its own.
+#define SYS_SLS_VEC_INDEX_EMBED_SEARCH 235
+
+struct SLSVecIndexEmbedSearchRequest {
+    uint32_t                  caller_uid;
+    char                      index_name[OBJECT_NAME_LEN];
+    struct OllamaEmbedRequest ollama_req;               // endpoint_ip/port/model/prompt -- the query text to embed
+    uint32_t                  k;                         // capped to VEC_SEARCH_MAX_K internally
+    uint32_t                  ef;
+    struct VecMatch           matches[VEC_SEARCH_MAX_K];  // filled in only if ollama_status == 0
+    uint32_t                  match_count;                // filled in only if ollama_status == 0
+    uint8_t                   truncated;                  // 1 if the caller's k exceeded VEC_SEARCH_MAX_K
+    int                       ollama_status;               // ollama_embed()'s own return code; nonzero means search was never attempted
+};
+
+uint64_t sys_sls_vec_index_embed_search(struct SLSVecIndexEmbedSearchRequest* req);
+
+// ─── VectorStore Interface Roadmap Phase 3: rebuild/backfill ──────────────
+// The live syscall/HTTP/Terminal path vec_index_rebuild() (above) never
+// had -- same reachability-gap pattern SYS_SLS_VEC_INDEX_DROP (233) closed
+// for that function back in Phase 1. Next free number after Phase 2's own
+// 234/235.
+#define SYS_SLS_VEC_INDEX_REBUILD 236
+
+struct SLSVecIndexRebuildRequest {
+    uint32_t caller_uid;
+    char     index_name[OBJECT_NAME_LEN];
+    int      status;   // vec_index_rebuild()'s own return code (0 = success)
+};
+
+uint64_t sys_sls_vec_index_rebuild(struct SLSVecIndexRebuildRequest* req);
 
 #endif /* VEC_INDEX_H */
