@@ -14,8 +14,13 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/auth_host_test tests/auth_host_test.c kernel/auth.c \
- *       kernel/secure_api.c
+ *       kernel/secure_api.c kernel/security_audit.c
  *   /tmp/auth_host_test
+ *
+ * kernel/security_audit.c added for Navigator-Parity Gap Roadmap Phase 3
+ * (auth.c now calls security_audit_log() on every invalid/expired token --
+ * the real logging module under test for that part, not a reimplementation,
+ * same "link the real file" convention as secure_api.c above).
  *
  * kernel/secure_api.c added for Architectural Phase 4 (account passwords --
  * auth.c now calls its derive_user_key()). This comment previously fell out
@@ -37,6 +42,7 @@
  * catalog-focused suite instead).
  */
 #include "kernel/auth.h"
+#include "kernel/security_audit.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -103,6 +109,14 @@ int main(void) {
     CHECK(auth_validate_token("0000000000000000000000000000000000", &uid, &role) == 0 &&
           uid == 0 && role == ROLE_GUEST,
           "s2: an unknown token fails validation, out_uid=0 out_role=GUEST");
+    /* Navigator-Parity Gap Roadmap Phase 3: the real security_audit.c linked
+     * above should have recorded this as a real AUTH_FAIL event. */
+    CHECK(security_audit_log_count == 1, "s2: the unknown-token failure was logged to the security audit trail");
+    CHECK(security_audit_log_count >= 1 &&
+          strcmp(security_audit_log_buf[0].action, "AUTH_FAIL") == 0 &&
+          security_audit_log_buf[0].uid == 0 &&
+          strcmp(security_audit_log_buf[0].detail, "00000000") == 0,
+          "s2: the audit entry previews only the token's first 8 chars, uid=0 (no resolved identity)");
 
     /* ── Scenario 3: a freshly runtime-issued token validates immediately
      * (elapsed == 0, well under the TTL). ───────────────────────────────── */
@@ -120,8 +134,13 @@ int main(void) {
      * (no_expiry) still pass unchanged. This is the core Phase E property:
      * TTL applies to session tokens, never to standing demo credentials. ── */
     kernel_tick_counter += AUTH_TOKEN_TTL_TICKS + 1;
+    uint32_t audit_count_before_s4 = security_audit_log_count;
     CHECK(auth_validate_token(tok, &uid, &role) == 0,
           "s4: the runtime token now fails validation once past AUTH_TOKEN_TTL_TICKS");
+    CHECK(security_audit_log_count == audit_count_before_s4 + 1 &&
+          strcmp(security_audit_log_buf[audit_count_before_s4].action, "AUTH_FAIL") == 0 &&
+          security_audit_log_buf[audit_count_before_s4].uid == 42,
+          "s4: the expired-token failure was logged with the real uid it belonged to (42), not 0");
     CHECK(auth_validate_token("deadbeef01234567cafebabe76543210", &uid, &role) == 1 &&
           uid == 1000 && role == ROLE_DB_ADMIN,
           "s4: dave's demo token still validates fine at the same tick -- no_expiry holds");

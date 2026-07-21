@@ -28,6 +28,9 @@
 #include "../kernel/vec_index.h"  // Gap Remediation Phase C -- SYS_SLS_VEC_INDEX_CREATE/SEARCH
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- SYS_SLS_PARTITION_CREATE/ASSIGN/LIST/DESTROY/PAUSE/RESUME
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- SYS_SLS_PARTITION_QUOTA_SET/QUOTA_LIST
+#include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- group profiles
+#include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
+#include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -182,6 +185,19 @@ static void print_help(void) {
         "  auth create <email> <uid> <role>  create a bearer token\n"
         "  auth list                         show token registry\n"
         "  auth revoke <email>               revoke all tokens for email\n"
+        "  -- Group Profiles (Navigator-Parity Phase 3) --\n"
+        "  group create <name> <role>       new group with an inherited role\n"
+        "  group add <name> <uid>           add uid as a member of a group\n"
+        "  group list                        list all group profiles\n"
+        "  -- Authorization Lists (Navigator-Parity Phase 3) --\n"
+        "  authlist create <name>                    new empty authorization list\n"
+        "  authlist grant obj <list> <obj> <perm>    attach {object,perm} to a list\n"
+        "  authlist grant uid <list> <uid>           add uid as a grantee\n"
+        "  authlist grant group <list> <group>       add group as a grantee\n"
+        "  authlist check <uid> <object> <perm>      test if a list would grant this\n"
+        "  authlist list                              list all authorization lists\n"
+        "  -- Security Audit Log (Navigator-Parity Phase 3) --\n"
+        "  audit list                        show the security audit trail\n"
         "  -- Web App Assets (Phase D) --\n"
         "  webapp set <obj> <path> <html>  store an asset (e.g. /hello.html)\n"
         "  webapp append <obj> <path> <s>  append content to an existing asset\n"
@@ -580,6 +596,137 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             if (status == 0) kernel_serial_print("Permissions matrix updated.\n");
             else kernel_serial_print(
                 "Security Violation: Only the object owner can alter permissions.\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: group create <name> <role> ──
+        else if (sh_starts(input_buffer, "group create ")) {
+            const char* p = input_buffer + 13;
+            char name[GROUP_NAME_LEN];
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(name, p, nlen + 1 < GROUP_NAME_LEN ? nlen + 1 : GROUP_NAME_LEN);
+            p = sh_next(p);
+            SLSRole role;
+            if      (sh_eq(p, "SYSTEM_KERNEL")) role = ROLE_SYSTEM_KERNEL;
+            else if (sh_eq(p, "DB_ADMIN"))      role = ROLE_DB_ADMIN;
+            else if (sh_eq(p, "APP_USER"))      role = ROLE_APP_USER;
+            else                                role = ROLE_GUEST;
+            struct SLSGroupCreateRequest req;
+            sh_copy(req.name, name, GROUP_NAME_LEN);
+            req.role = role;
+            uint64_t status = do_syscall(SYS_SLS_GROUP_CREATE, &req);
+            if (status == 0) kernel_serial_printf("Group '%s' created.\n", name);
+            else kernel_serial_print("Group creation failed (duplicate name or table full).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: group add <name> <uid> ──────
+        else if (sh_starts(input_buffer, "group add ")) {
+            const char* p = input_buffer + 10;
+            char name[GROUP_NAME_LEN];
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(name, p, nlen + 1 < GROUP_NAME_LEN ? nlen + 1 : GROUP_NAME_LEN);
+            p = sh_next(p);
+            struct SLSGroupAddMemberRequest req;
+            sh_copy(req.name, name, GROUP_NAME_LEN);
+            req.uid = sh_atoi(p);
+            uint64_t status = do_syscall(SYS_SLS_GROUP_ADD_MEMBER, &req);
+            if (status == 0) kernel_serial_printf("uid %u added to group '%s'.\n", req.uid, name);
+            else kernel_serial_print("Add-member failed (group not found, already a member, or list full).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: group list ───────────────────
+        else if (sh_eq(input_buffer, "group list")) {
+            do_syscall(SYS_SLS_GROUP_LIST, 0);
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: authlist create <name> ───────
+        else if (sh_starts(input_buffer, "authlist create ")) {
+            const char* p = input_buffer + 16;
+            struct SLSAuthListCreateRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ' && p[nlen] != '\0') nlen++;
+            sh_copy(req.name, p, nlen + 1 < AUTHLIST_NAME_LEN ? nlen + 1 : AUTHLIST_NAME_LEN);
+            uint64_t status = do_syscall(SYS_SLS_AUTHLIST_CREATE, &req);
+            if (status == 0) kernel_serial_printf("Authorization list '%s' created.\n", req.name);
+            else kernel_serial_print("Authorization-list creation failed (duplicate name or table full).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: authlist grant obj/uid/group ─
+        else if (sh_starts(input_buffer, "authlist grant obj ")) {
+            const char* p = input_buffer + 19;
+            struct SLSAuthListGrantRequest req;
+            req.kind = 0;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.list_name, p, nlen + 1 < AUTHLIST_NAME_LEN ? nlen + 1 : AUTHLIST_NAME_LEN);
+            p = sh_next(p);
+            size_t olen = 0;
+            while (p[olen] && p[olen] != ' ') olen++;
+            sh_copy(req.object_name, p, olen + 1 < OBJECT_NAME_LEN ? olen + 1 : OBJECT_NAME_LEN);
+            p = sh_next(p);
+            req.perm_mask = parse_perm_string(p);
+            uint64_t status = do_syscall(SYS_SLS_AUTHLIST_GRANT, &req);
+            if (status == 0) kernel_serial_printf("List '%s' now grants 0x%02x on '%s'.\n",
+                                                  req.list_name, req.perm_mask, req.object_name);
+            else kernel_serial_print("Grant failed (list not found or object table full).\n");
+        }
+        else if (sh_starts(input_buffer, "authlist grant uid ")) {
+            const char* p = input_buffer + 19;
+            struct SLSAuthListGrantRequest req;
+            req.kind = 1;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.list_name, p, nlen + 1 < AUTHLIST_NAME_LEN ? nlen + 1 : AUTHLIST_NAME_LEN);
+            p = sh_next(p);
+            req.grantee_uid = sh_atoi(p);
+            uint64_t status = do_syscall(SYS_SLS_AUTHLIST_GRANT, &req);
+            if (status == 0) kernel_serial_printf("uid %u added as grantee of '%s'.\n",
+                                                  req.grantee_uid, req.list_name);
+            else kernel_serial_print("Grant failed (list not found, already a grantee, or table full).\n");
+        }
+        else if (sh_starts(input_buffer, "authlist grant group ")) {
+            const char* p = input_buffer + 21;
+            struct SLSAuthListGrantRequest req;
+            req.kind = 2;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.list_name, p, nlen + 1 < AUTHLIST_NAME_LEN ? nlen + 1 : AUTHLIST_NAME_LEN);
+            p = sh_next(p);
+            size_t glen = 0;
+            while (p[glen] && p[glen] != ' ' && p[glen] != '\0') glen++;
+            sh_copy(req.grantee_group, p, glen + 1 < GROUP_NAME_LEN ? glen + 1 : GROUP_NAME_LEN);
+            uint64_t status = do_syscall(SYS_SLS_AUTHLIST_GRANT, &req);
+            if (status == 0) kernel_serial_printf("group '%s' added as grantee of '%s'.\n",
+                                                  req.grantee_group, req.list_name);
+            else kernel_serial_print("Grant failed (list not found, already a grantee, or table full).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: authlist check <uid> <object> <perm> ─
+        else if (sh_starts(input_buffer, "authlist check ")) {
+            const char* p = input_buffer + 15;
+            struct SLSAuthListCheckRequest req;
+            req.uid = sh_atoi(p);
+            p = sh_next(p);
+            size_t olen = 0;
+            while (p[olen] && p[olen] != ' ') olen++;
+            sh_copy(req.object_name, p, olen + 1 < OBJECT_NAME_LEN ? olen + 1 : OBJECT_NAME_LEN);
+            p = sh_next(p);
+            req.needed_perm = parse_perm_string(p);
+            uint64_t granted = do_syscall(SYS_SLS_AUTHLIST_CHECK, &req);
+            kernel_serial_printf("authlist check: uid=%u object='%s' perm=0x%02x -> %s\n",
+                                 req.uid, req.object_name, req.needed_perm,
+                                 granted ? "GRANTED" : "no matching list");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: authlist list ────────────────
+        else if (sh_eq(input_buffer, "authlist list")) {
+            do_syscall(SYS_SLS_AUTHLIST_LIST, 0);
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 3: audit list ───────────────────
+        else if (sh_eq(input_buffer, "audit list")) {
+            do_syscall(SYS_SLS_AUDIT_LIST, 0);
         }
 
         // ── Phase 3: tx begin ─────────────────────────────────────────────────

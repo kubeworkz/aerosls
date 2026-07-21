@@ -7,6 +7,16 @@
 #include "mqt.h"
 #include "partition.h"
 #include "../user/permissions.h"
+// Navigator-Parity Gap Roadmap Phase 3: group profiles, authorization
+// lists, and the security audit log. All three are separate, independently
+// testable modules (see each header's own comment); object_catalog.c only
+// needs to call into them from catalog_check_access()/sys_sls_role_set()
+// below, the same "own module, thin integration point" shape as
+// partition.h's partition_get_for_uid() call in catalog_check_access()
+// already established for Phase 8.
+#include "group_profile.h"
+#include "authlist.h"
+#include "security_audit.h"
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
 extern void tier_notify_access(uint64_t object_id);
@@ -137,36 +147,67 @@ int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_per
     // Owner always has full access to their own object
     if (e->owner_uid == uid) return 1;
 
-    // DB_ADMIN: full access to DB_TABLE and DB_INDEX
-    if (role == ROLE_DB_ADMIN) {
-        if (e->type == OBJ_TYPE_DB_TABLE || e->type == OBJ_TYPE_DB_INDEX)
-            return 1;
+    // Phase 3 (Navigator-Parity Gap Roadmap): the DB_ADMIN/APP_USER/GUEST
+    // rules that used to live inline here are now catalog_role_grants()
+    // (group_profile.c) — reused verbatim below for group-derived access, so
+    // there's exactly one copy of "what does this role allow" rather than a
+    // hand-duplicated second copy for groups.
+    if (catalog_role_grants(role, e, needed_perm)) return 1;
+
+    // Phase 3: group-derived access. Additive, evaluated independently of
+    // the caller's own role above — every active group uid is a member of
+    // gets the exact same role-grants-access check a moment ago ran for
+    // uid's individual role. A group can only ever add access, never
+    // restrict what the individual role check already allowed (that check
+    // already returned above if it passed).
+    //
+    // Deliberately runs BEFORE the GUEST hard-deny below, not after: an
+    // important real bug this test suite's own first draft caught --
+    // catalog_get_role() returns ROLE_GUEST for ANY uid with no role_table[]
+    // entry at all (its own documented default), which is exactly the
+    // common case for a uid that's only ever been granted access via group
+    // or authlist membership, never given an individual role. Running the
+    // GUEST hard-deny first would silently make group/authlist grants
+    // unreachable for every such uid -- defeating this entire phase's
+    // purpose. Groups/authlists must be checked before that hard-deny for
+    // GUEST to mean anything for the uids Phase 3 actually cares about.
+    for (int gi = 0; gi < GROUP_TABLE_MAX; gi++) {
+        if (!group_table[gi].active) continue;
+        if (!group_contains_uid(group_table[gi].name, uid)) continue;
+        if (catalog_role_grants(group_table[gi].group_role, e, needed_perm)) return 1;
     }
 
-    // APP_USER: read-only on DB_TABLE
-    if (role == ROLE_APP_USER) {
-        if (e->type == OBJ_TYPE_DB_TABLE && (needed_perm & PERM_READ))
-            return !(needed_perm & PERM_WRITE) && !(needed_perm & PERM_EXECUTE);
-    }
+    // Phase 3: authorization-list fallback. Same reasoning as the group
+    // check just above -- must run before the GUEST hard-deny, for the same
+    // "GUEST is also the default for every untouched uid" reason. The
+    // entire point of an authlist is to grant access independent of what
+    // the object's own perm_mask says, so it needs to be its own path.
+    if (authlist_check_access(uid, obj_name, needed_perm)) return 1;
 
-    // GUEST: read-only on HEAP_BLOB and STREAM only
+    // GUEST never falls through to the raw perm_mask fallback below —
+    // preserves this function's pre-Phase-3 behavior exactly for that one
+    // specific fallback (an unmatched GUEST request was always denied
+    // perm_mask escalation). Every other role's "no rule matched" result
+    // (including the one genuinely narrow edge case this refactor's own
+    // audit turned up: an APP_USER requesting combined READ+WRITE on a
+    // DB_TABLE, which catalog_role_grants() now answers with a plain 0
+    // instead of the old inline code's separate hard-return-0 for that one
+    // combination) is allowed to reach the perm_mask fallback below — no
+    // real caller in this codebase actually requests combined perm bits in
+    // one call (every rowstore.h/mvcc.h call site asks for PERM_READ or
+    // PERM_WRITE separately), so this is a theoretical behavior difference,
+    // not an observed one — named here rather than silently changed.
     if (role == ROLE_GUEST) {
-        if ((e->type == OBJ_TYPE_HEAP_BLOB || e->type == OBJ_TYPE_STREAM)
-                && needed_perm == PERM_READ)
-            return 1;
+        security_audit_log(uid, "ACCESS_DENIED", obj_name, 0);
         return 0;
     }
 
-    // APP_USER: read + execute on PROGRAM objects (can spawn, not modify)
-    if (role == ROLE_APP_USER) {
-        if (e->type == OBJ_TYPE_PROGRAM &&
-                (needed_perm & (PERM_READ | PERM_EXECUTE)) &&
-                !(needed_perm & PERM_WRITE))
-            return 1;
-    }
-
     // Fall back to stored per-object perm_mask
-    return (e->perm_mask & needed_perm) == needed_perm;
+    if ((e->perm_mask & needed_perm) == needed_perm) return 1;
+
+    // Phase 3: every path above failed — a real, final access denial.
+    security_audit_log(uid, "ACCESS_DENIED", obj_name, 0);
+    return 0;
 }
 
 // ─── Phase 1: valloc ─────────────────────────────────────────────────────────
@@ -367,6 +408,7 @@ uint64_t sys_sls_role_set(struct SLSRoleRequest* req) {
             role_table[i].role = req->role;
             kernel_serial_printf("[SECURITY] UID %u role updated to %s.\n",
                                  req->uid, role_name(req->role));
+            security_audit_log(req->uid, "ROLE_CHANGE", role_name(req->role), 1);
             persist_catalog();
             return 0;
         }
@@ -379,6 +421,7 @@ uint64_t sys_sls_role_set(struct SLSRoleRequest* req) {
             role_table[i].active = 1;
             kernel_serial_printf("[SECURITY] UID %u assigned role %s.\n",
                                  req->uid, role_name(req->role));
+            security_audit_log(req->uid, "ROLE_CHANGE", role_name(req->role), 1);
             persist_catalog();
             return 0;
         }

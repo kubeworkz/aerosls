@@ -18,6 +18,9 @@
 #include "rowstore.h"   // Gap Remediation Phase B -- SYS_SLS_ROWSTORE_CREATE_TABLE
 #include "vec_join.h"   // Gap Remediation Phase C -- SYS_SLS_VEC_JOIN
 #include "vec_index.h"  // Gap Remediation Phase C -- SYS_SLS_VEC_INDEX_CREATE/SEARCH
+#include "group_profile.h" // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_GROUP_*
+#include "authlist.h"      // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUTHLIST_*
+#include "security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUDIT_LIST
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -324,6 +327,28 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // ── VectorStore Interface Roadmap Phase 3: rebuild/backfill ─────────────
     case SYS_SLS_VEC_INDEX_REBUILD:
         return sys_sls_vec_index_rebuild((struct SLSVecIndexRebuildRequest*)arg);
+
+    // ── Navigator-Parity Gap Roadmap Phase 3: group profiles (237-239) ──────
+    case SYS_SLS_GROUP_CREATE:
+        return sys_sls_group_create((struct SLSGroupCreateRequest*)arg);
+    case SYS_SLS_GROUP_ADD_MEMBER:
+        return sys_sls_group_add_member((struct SLSGroupAddMemberRequest*)arg);
+    case SYS_SLS_GROUP_LIST:
+        group_list(); return 0;
+
+    // ── Navigator-Parity Gap Roadmap Phase 3: authorization lists (240-242) ─
+    case SYS_SLS_AUTHLIST_CREATE:
+        return sys_sls_authlist_create((struct SLSAuthListCreateRequest*)arg);
+    case SYS_SLS_AUTHLIST_GRANT:
+        return sys_sls_authlist_grant((struct SLSAuthListGrantRequest*)arg);
+    case SYS_SLS_AUTHLIST_CHECK:
+        return sys_sls_authlist_check((struct SLSAuthListCheckRequest*)arg);
+    case SYS_SLS_AUTHLIST_LIST:
+        authlist_list(); return 0;
+
+    // ── Navigator-Parity Gap Roadmap Phase 3: security audit log (243) ──────
+    case SYS_SLS_AUDIT_LIST:
+        sys_sls_audit_list(); return 0;
 
     default:
         return 0;

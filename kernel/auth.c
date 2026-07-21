@@ -2,6 +2,7 @@
 #include "kernel_io.h"
 #include "dashboard.h"     // for read_tsc()
 #include "secure_api.h"    // Architectural Phase 4 -- derive_user_key(), reused for account passwords
+#include "security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- logs invalid/expired token attempts
 
 struct LeaseToken auth_tokens[AUTH_MAX_TOKENS];
 
@@ -287,12 +288,49 @@ int auth_validate_token(const char* token, uint32_t* out_uid, SLSRole* out_role)
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
         if (!auth_tokens[i].active) continue;
         if (au_streq(auth_tokens[i].token, token)) {
-            if (au_token_expired(&auth_tokens[i])) break;  // expired -- fall through to failure
+            if (au_token_expired(&auth_tokens[i])) {
+                // Navigator-Parity Gap Roadmap Phase 3: a real, resolvable
+                // identity (we found the slot) presenting an expired token
+                // -- log it with the uid it would have been, then return
+                // failure directly. Deliberately NOT a `break` into the
+                // generic unknown-token log below -- an earlier version of
+                // this fix did exactly that and it double-logged every
+                // expired-token failure (once here with the real uid, once
+                // more from the fallback below with uid=0), caught by this
+                // phase's own host test asserting exactly one audit entry
+                // per failed validate_token() call.
+                char detail[32];
+                int dn = 0;
+                const char* pre = "expired token uid=";
+                while (pre[dn] && dn < (int)sizeof(detail)-1) { detail[dn]=pre[dn]; dn++; }
+                uint32_t u = auth_tokens[i].uid;
+                char tmp[12]; int tl=0;
+                if (!u) { tmp[tl++]='0'; } else { while(u && tl<11){tmp[tl++]=(char)('0'+u%10);u/=10;} }
+                for (int k=tl-1;k>=0 && dn<(int)sizeof(detail)-1;k--) detail[dn++]=tmp[k];
+                detail[dn]='\0';
+                security_audit_log(auth_tokens[i].uid, "AUTH_FAIL", detail, 0);
+                if (out_uid)  *out_uid  = 0;
+                if (out_role) *out_role = ROLE_GUEST;
+                return 0;
+            }
             if (out_uid)  *out_uid  = auth_tokens[i].uid;
             if (out_role) *out_role = auth_tokens[i].role;
             return 1;
         }
     }
+    // Navigator-Parity Gap Roadmap Phase 3: no active slot matched this
+    // token at all -- a genuinely unknown/garbage bearer token, not just an
+    // expired one (that case already logged and returned above). uid=0
+    // since there's no real identity to attribute this to; detail previews
+    // only the first 8 characters of the presented token, same "don't log
+    // the whole secret" posture sys_sls_auth_list() already uses for the
+    // token registry printout.
+    char tok_preview[10];
+    int tpn = 0;
+    while (token && token[tpn] && tpn < 8) { tok_preview[tpn] = token[tpn]; tpn++; }
+    tok_preview[tpn] = '\0';
+    security_audit_log(0, "AUTH_FAIL", tok_preview, 0);
+
     if (out_uid)  *out_uid  = 0;
     if (out_role) *out_role = ROLE_GUEST;
     return 0;

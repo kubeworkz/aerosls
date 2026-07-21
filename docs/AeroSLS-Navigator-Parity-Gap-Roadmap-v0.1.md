@@ -355,7 +355,122 @@ respond).
 
 ---
 
-## Phase 3 — Group profiles, authorization lists, security audit log
+## Phase 3 — Group profiles, authorization lists, security audit log — DONE
+
+### Scope correction made during implementation
+
+The original draft below assumed `catalog_check_access()`'s existing
+DB_ADMIN/APP_USER/GUEST rules could simply be "extended" in place for
+groups, and that `struct ExpandedMatrixEntry`'s pre-existing `gid` field
+(`user/permissions.h`) plus `ShellSession.gid` (`user/shell.c`) might be a
+head start on group membership. Investigation found neither claim held:
+
+- `ExpandedMatrixEntry` is never instantiated or looked up anywhere in the
+  real catalog code (only `docs/SLS-OS.md`'s own design draft uses it), and
+  `ShellSession.gid` is explicitly commented as "no per-request gid to seed
+  from; cosmetic only" at its one real call site (`net/http.c`). Group
+  membership was built entirely from scratch (`kernel/group_profile.c`),
+  not wired up from dormant fields.
+- A real, more serious bug was caught mid-implementation, not anticipated
+  in the original draft: `catalog_get_role()` returns `ROLE_GUEST` for
+  *any* uid with no `role_table[]` entry at all — its own documented
+  default. The first version of `catalog_check_access()`'s Phase 3 refactor
+  put the "GUEST never falls through" hard-deny *before* the new
+  group/authlist checks, which silently made group and authlist grants
+  unreachable for exactly the uids Phase 3 exists to help (anyone whose
+  *only* access comes from group/authlist membership, never an individual
+  role). This was caught by this phase's own host test
+  (`tests/security_phase3_host_test.c`) failing on first run, not by
+  inspection — see that test's own comments and `object_catalog.c`'s
+  current comment on the fix. Fixed by moving the group/authlist checks
+  ahead of the GUEST hard-deny, which now only gates the final raw
+  `perm_mask` fallback (preserving the one narrow pre-Phase-3 guarantee
+  that mattered: GUEST alone never gets escalated by an object's own
+  `perm_mask`).
+- The role-specific rules previously inlined in `catalog_check_access()`
+  were factored out into `catalog_role_grants()` (`group_profile.c`) so
+  both the caller's own role and every group they belong to are evaluated
+  through the exact same logic — one copy of "what does this role allow,"
+  not a hand-duplicated second copy for groups. This surfaced one genuinely
+  narrow behavior question (an APP_USER requesting combined READ+WRITE on
+  a DB_TABLE in one call used to hard-deny with no fallback; after the
+  refactor it can now reach the group/authlist/perm_mask fallbacks instead)
+  — named explicitly in the function's own comment rather than silently
+  changed; no real caller in this codebase ever requests combined perm
+  bits in one call, so this is a theoretical difference, not an observed
+  behavior change.
+- The authlist syscall surface grew from the originally-scoped three calls
+  to four: `SYS_SLS_AUTHLIST_LIST` (244) was added once it became clear the
+  Terminal needed a real way to list authorization lists too, mirroring
+  `SYS_SLS_GROUP_LIST`'s own existence next to `GROUP_CREATE`/
+  `ADD_MEMBER` — named rather than silently renumbering anything already
+  assigned.
+
+### What was built
+
+- **Group profiles** (`kernel/group_profile.h`/`.c`): a 64-entry
+  `group_table[]` (matching `role_table[ROLE_TABLE_MAX]`'s own sizing),
+  each entry a name, an inherited `SLSRole`, and up to 16 member uids.
+  `catalog_role_grants()` — the factored-out role-rule logic — is reused
+  identically for both a uid's own individual role and every group they
+  belong to. New syscalls: `SYS_SLS_GROUP_CREATE` (237), `_ADD_MEMBER`
+  (238), `_LIST` (239).
+- **Authorization lists** (`kernel/authlist.h`/`.c`): a 16-entry
+  `authlist_table[]`, each holding up to 8 `{object_name, perm_mask}`
+  grants and up to 16 direct uid grantees plus 8 grantee groups (grantee
+  groups resolve through `group_profile.c`'s `group_contains_uid()`, so a
+  uid can gain authlist access two levels removed — member of a group that
+  is itself a grantee of a list). New syscalls: `SYS_SLS_AUTHLIST_CREATE`
+  (240), a single kind-tagged `_GRANT` (241) covering all three grant
+  shapes (attach object, add uid grantee, add group grantee — a genuinely
+  new multi-purpose-request pattern for this codebase, named as such
+  rather than presented as an established convention), `_CHECK` (242), and
+  `_LIST` (244).
+- **Security audit log** (`kernel/security_audit.h`/`.c`): a flat,
+  bump-allocated 256-entry `security_audit_log_buf[]` (same
+  fill-then-stop-logging posture as `transaction.c`'s `wal_buffer[]` and
+  `auth.c`'s own token-slot precedent — no ring-buffer wraparound
+  invented for this). Records `AUTH_FAIL` (invalid or expired bearer
+  tokens, hooked into `auth_validate_token()`), `ROLE_CHANGE`
+  (`sys_sls_role_set()`), and `ACCESS_DENIED` (every final denial path in
+  `catalog_check_access()`). New syscall: `SYS_SLS_AUDIT_LIST` (243). New
+  route: `GET /api/security/audit` (plus `GET /api/security/groups` and
+  `GET /api/security/authlists` for listing, added alongside since they
+  were cheap and useful for the frontend).
+- **Frontend**: `App.tsx`'s existing poll loop now also fetches
+  `/api/security/audit` and diffs it into a capped, newest-first
+  `realAuditLog` array, passed to `SlsSecurityDashboard.tsx` as a new
+  `realAuditLog` prop. That component gained a fourth panel, "Live Kernel
+  Audit Trail," clearly labeled as real kernel data — deliberately a
+  *separate* panel from the existing simulated "Security Event Log," not
+  merged into it, so what's real and what's illustrative stay honestly
+  distinguishable (matching the Phase 1 finding that this component's
+  privilege simulator is an intentional, labeled teaching tool, not a bug
+  to be silently overwritten).
+- Terminal commands: `group create/add/list`, `authlist create/grant
+  obj|uid|group/check/list`, `audit list` — all wired into `user/shell.c`
+  alongside the existing `role set`/`grant`/`revoke` commands.
+
+**Verification performed:** a new host test
+(`tests/security_phase3_host_test.c`, 30 checks) links the real
+`object_catalog.c`/`group_profile.c`/`authlist.c`/`security_audit.c` and
+proves: a bare GUEST-role uid is denied and the denial is audited; role
+changes grant access and are themselves audited; group membership grants
+role-derived access without ever touching `role_table[]`; authorization
+lists grant scoped per-object access (including correctly denying a
+permission the list doesn't cover); the two-level group-via-authlist path
+works; and every distinct denial keeps landing in the real audit log, not
+just the first one. `tests/auth_host_test.c` was also extended (2 new
+checks) to prove `auth_validate_token()` logs exactly one audit entry per
+failure — an earlier draft of the fix double-logged every expired-token
+failure (once with the real uid, once more from the generic
+unknown-token path), caught by this test before it shipped, not after.
+Full regression sweep: 25/25 host tests passing, 0 failures. Kernel
+compile-check across every modified file: zero new errors, only
+pre-existing unrelated implicit-declaration warnings. Frontend typecheck
+(`npx tsc --noEmit`): clean.
+
+### Original Phase 3 scope (as first drafted, before the correction above)
 
 **Goal:** move security administration from "4 fixed roles" to something
 an operator can actually shape, and give Security Dashboard a real feed to

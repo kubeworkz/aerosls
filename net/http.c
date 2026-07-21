@@ -33,6 +33,9 @@
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- partition create/list/destroy/assign/pause/resume
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
+#include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
+#include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
+#include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -1695,6 +1698,92 @@ static int api_partition_quotas_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/security/audit — Navigator-Parity Gap Roadmap Phase 3 ───────────
+// This is the real backend SlsSecurityDashboard.tsx's "Security Event Log"
+// panel should read from -- see security_audit.h's own header comment. A
+// flat dump of every entry currently retained (bump-allocated, no reclaim --
+// see that header's comment on why), oldest first, same array-plus-count
+// shape api_wal_json() already uses for wal_buffer[]/wal_entry_count.
+static int api_security_audit_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "count", security_audit_log_count); jb_putc(&j, ',');
+    jb_uint(&j, "capacity", AUDIT_LOG_MAX); jb_putc(&j, ',');
+    jb_arr_open(&j, "entries");
+    for (uint32_t i = 0; i < security_audit_log_count; i++) {
+        struct SLSAuditEntry* e = &security_audit_log_buf[i];
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "id",      (uint32_t)e->id);   jb_putc(&j, ',');
+        jb_uint(&j, "tick",    (uint32_t)e->tick); jb_putc(&j, ',');
+        jb_uint(&j, "uid",     e->uid);            jb_putc(&j, ',');
+        jb_str(&j,  "action",  e->action);         jb_putc(&j, ',');
+        jb_str(&j,  "detail",  e->detail);         jb_putc(&j, ',');
+        jb_str(&j,  "granted", e->granted ? "true" : "false");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/security/groups — Navigator-Parity Gap Roadmap Phase 3 ──────────
+static int api_security_groups_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "groups");
+    int first = 1;
+    for (int i = 0; i < GROUP_TABLE_MAX; i++) {
+        if (!group_table[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j,  "name", group_table[i].name); jb_putc(&j, ',');
+        jb_str(&j,  "role", role_name(group_table[i].group_role)); jb_putc(&j, ',');
+        jb_uint(&j, "member_count", group_table[i].member_count); jb_putc(&j, ',');
+        jb_arr_open(&j, "members");
+        for (uint32_t m = 0; m < group_table[i].member_count; m++) {
+            if (m) jb_putc(&j, ',');
+            char numbuf[12]; int nl = 0; uint32_t v = group_table[i].member_uids[m];
+            if (!v) numbuf[nl++]='0'; else { char rev[12]; int rn=0; while(v){rev[rn++]=(char)('0'+v%10);v/=10;} while(rn) numbuf[nl++]=rev[--rn]; }
+            numbuf[nl]='\0';
+            jb_raw(&j, numbuf);
+        }
+        jb_arr_close(&j);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/security/authlists — Navigator-Parity Gap Roadmap Phase 3 ───────
+static int api_security_authlists_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "authlists");
+    int first = 1;
+    for (int i = 0; i < AUTHLIST_MAX; i++) {
+        struct SLSAuthListEntry* l = &authlist_table[i];
+        if (!l->active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j,  "name", l->name); jb_putc(&j, ',');
+        jb_arr_open(&j, "objects");
+        for (uint32_t k = 0; k < l->object_count; k++) {
+            if (!l->objects[k].active) continue;
+            if (k) jb_putc(&j, ',');
+            jb_obj_open(&j, 0);
+            jb_str(&j,  "name", l->objects[k].object_name); jb_putc(&j, ',');
+            jb_uint(&j, "perm_mask", l->objects[k].perm_mask);
+            jb_obj_close(&j);
+        }
+        jb_arr_close(&j); jb_putc(&j, ',');
+        jb_uint(&j, "grantee_uid_count", l->grantee_uid_count); jb_putc(&j, ',');
+        jb_uint(&j, "grantee_group_count", l->grantee_group_count);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── POST /api/partitions — Gap Remediation Phase F ────────────────────────────
 // Body: {"name": "<partition_name>"}. Thin wrapper over
 // sys_sls_partition_create(), the same shape as api_table_create_post().
@@ -2699,6 +2788,19 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/services")) {
             blen = api_services_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Navigator-Parity Gap Roadmap Phase 3: real security backend ────────
+        if (!strcmp(path, "/api/security/audit")) {
+            blen = api_security_audit_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/security/groups")) {
+            blen = api_security_groups_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/security/authlists")) {
+            blen = api_security_authlists_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/wal")) {

@@ -46,8 +46,18 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/legacy_rowstore_boundary_host_test tests/legacy_rowstore_boundary_host_test.c \
- *       kernel/object_catalog.c kernel/rowstore.c
+ *       kernel/object_catalog.c kernel/rowstore.c kernel/group_profile.c \
+ *       kernel/authlist.c kernel/security_audit.c
  *   /tmp/legacy_rowstore_boundary_host_test
+ *
+ * Navigator-Parity Gap Roadmap Phase 3 added group_profile.c/authlist.c/
+ * security_audit.c as real (not stubbed) dependencies of object_catalog.c's
+ * catalog_check_access()/sys_sls_role_set() -- linked here for the same
+ * reason partition_get_for_uid() already was (see this header's own comment
+ * above): they come for free with the real object_catalog.c under test, and
+ * are cheap, self-contained leaf modules, not part of the heavy dependency
+ * graph (transaction/WAL, locking, indexing, MQTs, constraints, journaling)
+ * this test otherwise stubs around.
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
@@ -76,6 +86,13 @@
 // define are declared here. ─────────────────────────────────────────────────
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
+
+// Navigator-Parity Gap Roadmap Phase 3: kernel/security_audit.c (linked for
+// real, see this file's own header comment) needs kernel_tick_counter --
+// same real-definition-not-a-stub convention tests/auth_host_test.c already
+// established for this exact global (kernel/timer.c itself isn't linked
+// here either, for the same "no LAPIC/IDT arch layer on a host build" reason).
+volatile uint64_t kernel_tick_counter = 0;
 
 // ─── kernel_io.h stand-ins ──────────────────────────────────────────────────
 void kernel_serial_print(const char* s) { (void)s; }
