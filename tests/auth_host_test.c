@@ -23,6 +23,18 @@
  * by tests/run_all.sh (Operational Phase A) actually running this comment's
  * command instead of a person's memory of it, which is the whole reason
  * that script reads the command from here rather than hardcoding its own copy.
+ *
+ * Gap fix (dual role-lookup bug): auth.c now also calls sys_sls_role_set()
+ * from its new auth_seed_default_roles() (kernel/object_catalog.c's real
+ * catalog authority API, not a reimplementation of it -- but object_catalog.c
+ * itself isn't linked here, since pulling it in would drag persist_catalog(),
+ * partition_get_for_uid(), tx_get_active()/wal_stage(), and friends into a
+ * suite that isn't about the object catalog. Stubbed below instead, same
+ * "stub the boundary, not the thing under test" convention
+ * vecstore_syscall_host_test.c already uses for catalog_check_access() --
+ * this suite is about auth.c correctly SEEDING all four demo accounts'
+ * roles, not about role_table[]'s own storage logic (that belongs to a
+ * catalog-focused suite instead).
  */
 #include "kernel/auth.h"
 #include <stdio.h>
@@ -54,6 +66,18 @@ int verify_expanded_matrix_access(uint32_t uid, uint32_t gid,
                                    uint64_t object_id, uint32_t needed_mask) {
     (void)uid; (void)gid; (void)object_id; (void)needed_mask;
     return 1;
+}
+
+/* Gap fix (dual role-lookup bug): sys_sls_role_set() stub -- see file header
+ * comment for why the real object_catalog.c isn't linked here. Records every
+ * call so Scenario 9 below can assert auth_seed_default_roles() drives it
+ * with the right (uid, role) pair for all four demo accounts, in order. */
+static struct SLSRoleRequest g_role_set_calls[8];
+static int g_role_set_call_count = 0;
+uint64_t sys_sls_role_set(struct SLSRoleRequest* req) {
+    if (g_role_set_call_count < 8) g_role_set_calls[g_role_set_call_count] = *req;
+    g_role_set_call_count++;
+    return 0;
 }
 
 static int g_fail = 0;
@@ -176,6 +200,27 @@ int main(void) {
     int dn2 = auth_http_issue("dave@gridworkz.com", "demo-dave", dresp2, (int)sizeof(dresp2));
     CHECK(dn2 > 0 && strstr(dresp2, "\"ok\":true") && strstr(dresp2, "deadbeef01234567cafebabe76543210"),
           "s8: dave's correct fixed demo password returns his real fixed demo token");
+
+    /* ── Scenario 9 (dual role-lookup bug fix): auth_seed_default_roles()
+     * grants each demo account a matching object-catalog authority role via
+     * sys_sls_role_set(), so catalog_check_access() (kernel/object_catalog.c)
+     * resolves them the same way auth_http_extract() already does above --
+     * closing the gap where a logged-in DB_ADMIN like dave silently got
+     * treated as ROLE_GUEST by every catalog-gated call (vecstore insert/
+     * search/delete, etc.) because nothing had ever called sys_sls_role_set()
+     * for the four standing demo accounts. ──────────────────────────────── */
+    g_role_set_call_count = 0;
+    auth_seed_default_roles();
+    CHECK(g_role_set_call_count == 4,
+          "s9: auth_seed_default_roles() calls sys_sls_role_set() exactly once per demo account");
+    CHECK(g_role_set_calls[0].uid == 1000 && g_role_set_calls[0].role == ROLE_DB_ADMIN,
+          "s9: dave (uid 1000) seeded as ROLE_DB_ADMIN");
+    CHECK(g_role_set_calls[1].uid == 1001 && g_role_set_calls[1].role == ROLE_APP_USER,
+          "s9: bob (uid 1001) seeded as ROLE_APP_USER");
+    CHECK(g_role_set_calls[2].uid == 1002 && g_role_set_calls[2].role == ROLE_DB_ADMIN,
+          "s9: carol (uid 1002) seeded as ROLE_DB_ADMIN");
+    CHECK(g_role_set_calls[3].uid == 1003 && g_role_set_calls[3].role == ROLE_GUEST,
+          "s9: guest (uid 1003) seeded as ROLE_GUEST");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

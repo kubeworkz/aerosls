@@ -303,6 +303,17 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
             }
         }
     }
+
+    // ── 7c. Seed default demo-account authority roles ──────────────────────
+    // Must run after persist_restore_all() above (step 7b), not from
+    // auth_init() (step 4f) -- see auth_seed_default_roles()'s own comment
+    // for why: role_table[] is restored by the same persist mechanism as
+    // object_catalog[], so seeding it any earlier would just get overwritten
+    // by that restore. Fixes catalog_check_access() silently treating every
+    // demo account as ROLE_GUEST (its default for an unregistered uid),
+    // which denied vector-store/table writes even for dave's DB_ADMIN token.
+    auth_seed_default_roles();
+
     kernel_serial_print(
         "----------------------------------------------------------------------------------\n"
         "[SLS] System ready. Launching secure shell...\n"

@@ -86,6 +86,13 @@ extern struct LeaseToken auth_tokens[AUTH_MAX_TOKENS];
 
 void  auth_init(void);
 
+// Grants the four auth_init() demo accounts a matching object-catalog
+// authority role (role_table[] in object_catalog.c) so catalog_check_access()
+// resolves them the same way auth_http_extract() already does. Must be
+// called AFTER persist_restore_all(), not from auth_init() itself -- see
+// this function's own comment in auth.c for why boot ordering matters here.
+void  auth_seed_default_roles(void);
+
 // Create a token for an email/uid/role — writes the 32-char hex token into
 // req->token if non-NULL.  Returns 1 on success, 0 on failure.
 int   auth_create_token(struct AuthCreateRequest* req, char* out_token);

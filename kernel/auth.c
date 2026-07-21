@@ -83,6 +83,20 @@ static int au_check_password(const struct LeaseToken* lt, const char* password, 
     return 1;
 }
 
+// ─── Demo account roster ────────────────────────────────────────────────────────
+// Shared by auth_init() (registers each account's bearer token, for login)
+// and auth_seed_default_roles() (grants each account's object-catalog
+// authority role, for the permission checks catalog_check_access() actually
+// runs -- see that function's own comment for why these are two separate
+// steps rather than one). One shared list so the two can't drift apart.
+struct DemoAccount { const char* email; uint32_t uid; SLSRole role; uint64_t seed; };
+static const struct DemoAccount g_demo_accounts[4] = {
+    { "dave@gridworkz.com",   1000, ROLE_DB_ADMIN,      0xDEADBEEF01234567ULL },
+    { "bob@vance.com",        1001, ROLE_APP_USER,      0xCAFEBABE76543210ULL },
+    { "carol@gridworkz.com",  1002, ROLE_DB_ADMIN,      0xFEEDF00DABCDEF01ULL },
+    { "guest@sandbox.com",    1003, ROLE_GUEST,         0xDEADC0DE99887766ULL },
+};
+
 // ─── auth_init ────────────────────────────────────────────────────────────────
 // Pre-register the four simulator demo accounts with deterministic tokens
 // (fixed seeds so they survive any TSC reading quirks).
@@ -91,13 +105,7 @@ static int au_check_password(const struct LeaseToken* lt, const char* password, 
 void auth_init(void) {
     for (int i = 0; i < AUTH_MAX_TOKENS; i++) auth_tokens[i].active = 0;
 
-    // Demo account definitions matching the simulator
-    struct { const char* email; uint32_t uid; SLSRole role; uint64_t seed; } demos[] = {
-        { "dave@gridworkz.com",   1000, ROLE_DB_ADMIN,      0xDEADBEEF01234567ULL },
-        { "bob@vance.com",        1001, ROLE_APP_USER,      0xCAFEBABE76543210ULL },
-        { "carol@gridworkz.com",  1002, ROLE_DB_ADMIN,      0xFEEDF00DABCDEF01ULL },
-        { "guest@sandbox.com",    1003, ROLE_GUEST,         0xDEADC0DE99887766ULL },
-    };
+    const struct DemoAccount* demos = g_demo_accounts;
 
     kernel_serial_print("[AUTH] Token Registry\n");
     kernel_serial_print(" Email                           UID   Role          Token                             Password\n");
@@ -163,6 +171,52 @@ void auth_init(void) {
         kernel_serial_print("\n");
     }
     kernel_serial_print("\n");
+}
+
+// ─── auth_seed_default_roles ───────────────────────────────────────────────────
+// Grants each of the four demo accounts above a matching object-catalog
+// authority role via sys_sls_role_set(). Deliberately NOT folded into
+// auth_init() itself, and deliberately called separately by kernel.c AFTER
+// persist_restore_all(), not before:
+//
+// Root cause this fixes: auth_tokens[] (this file) and role_table[]
+// (object_catalog.c) are two independent uid -> role lookups. HTTP requests
+// resolve identity via auth_http_extract(), which reads auth_tokens[] and
+// correctly reports e.g. dave as ROLE_DB_ADMIN for the 401 gate -- but every
+// catalog-gated operation (vecstore_insert/get/delete/collection_scan, and
+// anything else that calls catalog_check_access()) separately re-resolves
+// the caller's role via catalog_get_role(), which reads role_table[] instead.
+// Nothing ever populated role_table[] for these four accounts, so
+// catalog_get_role() fell through to its ROLE_GUEST default every time --
+// silently downgrading a logged-in DB_ADMIN to GUEST for authority purposes,
+// which only grants read access to HEAP_BLOB/STREAM objects. Any vector
+// collection or table the demo accounts don't personally own (owner_uid at
+// creation time is whatever POST /api/valloc hardcodes, not the caller) then
+// fails every write/read that routes through catalog_check_access() with a
+// permission-denied status, even though the account is a full admin.
+//
+// Boot ordering matters here: role_table[] is persisted/restored by the same
+// mechanism as object_catalog[] (persist_catalog()/persist_restore_all(),
+// see persist.c). auth_init() runs at boot step 4f, well before
+// persist_restore_all() runs at step 7b. Seeding role_table[] inside
+// auth_init() would just get silently overwritten the moment
+// persist_restore_all() restores whatever (empty) role_table[] was
+// previously persisted -- making the seed a no-op on every boot after the
+// first. Calling this function AFTER persist_restore_all() instead avoids
+// that race entirely: on a cold start it seeds role_table[] for real and
+// sys_sls_role_set()'s own persist_catalog() call saves it, so every later
+// boot's restore step loads the correct, already-seeded table; on a warm
+// start (already persisted correctly) sys_sls_role_set() finds the existing
+// active entry for each uid and just re-writes the same role, a harmless
+// idempotent no-op.
+void auth_seed_default_roles(void) {
+    for (int i = 0; i < 4; i++) {
+        struct SLSRoleRequest req;
+        req.uid  = g_demo_accounts[i].uid;
+        req.role = g_demo_accounts[i].role;
+        sys_sls_role_set(&req);
+    }
+    kernel_serial_print("[AUTH] Default demo account roles seeded in object-catalog role_table.\n");
 }
 
 // ─── auth_create_token ────────────────────────────────────────────────────────
