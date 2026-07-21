@@ -36,6 +36,7 @@
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
+#include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -904,6 +905,8 @@ static int api_processes_json(char* buf, int max) {
         jb_uint(&j, "pid",   pd->pid);                        jb_putc(&j, ',');
         jb_str(&j,  "name",  pd->name);                       jb_putc(&j, ',');
         jb_str(&j,  "state", proc_state_name(pd->state));     jb_putc(&j, ',');
+        // Navigator-Parity Gap Roadmap Phase 4: job priority tier.
+        jb_str(&j,  "priority", proc_priority_name(pd->priority)); jb_putc(&j, ',');
         jb_uint(&j, "uid",   pd->owner_uid);                  jb_putc(&j, ',');
         jb_hex(&j,  "rip",   pd->user_rip);
         jb_obj_close(&j);
@@ -1778,6 +1781,48 @@ static int api_security_authlists_json(char* buf, int max) {
         jb_arr_close(&j); jb_putc(&j, ',');
         jb_uint(&j, "grantee_uid_count", l->grantee_uid_count); jb_putc(&j, ',');
         jb_uint(&j, "grantee_group_count", l->grantee_group_count);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/workmgmt/msgqueues — Navigator-Parity Gap Roadmap Phase 4 ────────
+// Depth/contents-visible view of the fixed named-queue table (kernel/
+// msgqueue.h) -- the "make queues visible" gap the roadmap called out (the
+// underlying IPC bus, kernel/ipc.h, has never had any user-facing view at
+// all). Same array-plus-count JSON shape as the Phase 3 security routes
+// above. Messages themselves are included (not just depth) since a queue
+// this small (MQ_QUEUE_DEPTH=16) is cheap to dump in full and "visibility"
+// is the entire point of this route.
+static int api_workmgmt_msgqueues_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "queues");
+    int first = 1;
+    for (int i = 0; i < MQ_MAX; i++) {
+        struct SLSMsgQueueEntry* q = &mq_table[i];
+        if (!q->active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j,  "name",  q->name);          jb_putc(&j, ',');
+        jb_uint(&j, "depth", q->count);         jb_putc(&j, ',');
+        jb_uint(&j, "capacity", MQ_QUEUE_DEPTH); jb_putc(&j, ',');
+        jb_arr_open(&j, "messages");
+        // Oldest-first walk of the circular buffer's live entries, without
+        // consuming them -- this is a read-only visibility route, not
+        // mq_receive(); head/count are only ever advanced by an explicit
+        // 'mq receive' call or SYS_SLS_MQ_RECEIVE.
+        for (uint32_t k = 0; k < q->count; k++) {
+            uint32_t idx = (q->head + k) % MQ_QUEUE_DEPTH;
+            if (k) jb_putc(&j, ',');
+            jb_obj_open(&j, 0);
+            jb_uint(&j, "sender_uid", q->msgs[idx].sender_uid); jb_putc(&j, ',');
+            jb_uint(&j, "tick", (uint32_t)q->msgs[idx].tick);   jb_putc(&j, ',');
+            jb_str(&j,  "text", q->msgs[idx].text);
+            jb_obj_close(&j);
+        }
+        jb_arr_close(&j);
         jb_obj_close(&j);
     }
     jb_arr_close(&j);
@@ -2801,6 +2846,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/security/authlists")) {
             blen = api_security_authlists_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Navigator-Parity Gap Roadmap Phase 4: Work Management visibility ──
+        if (!strcmp(path, "/api/workmgmt/msgqueues")) {
+            blen = api_workmgmt_msgqueues_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/wal")) {

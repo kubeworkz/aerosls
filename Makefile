@@ -68,6 +68,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/group_profile.c \
               kernel/authlist.c \
               kernel/security_audit.c \
+              kernel/msgqueue.c \
               kernel/stubs.c
 
 X86_OBJECTS = $(X86_ASM_SRC:.asm=.x86.o) $(X86_C_SRC:.c=.x86.o) arch/x86/trampoline.o

@@ -31,6 +31,7 @@
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- group profiles
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
+#include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -213,6 +214,15 @@ static void print_help(void) {
         "  proc list                     show all Ring-3 processes\n"
         "  proc spawn <object>           create a process from SERVICE_PROCESS object\n"
         "  proc kill <pid>               terminate a running process\n"
+        "  -- Job Priority / Hold-Release (Navigator-Parity Phase 4) --\n"
+        "  proc hold <pid>                   hold a suspended (not running) job\n"
+        "  proc release <pid>                release a held job back to the run queue\n"
+        "  proc priority <pid> <high|normal|low>  set a job's scheduling tier\n"
+        "  -- Message Queues (Navigator-Parity Phase 4) --\n"
+        "  mq create <name>              create a named message queue\n"
+        "  mq send <name> <text...>      post a message to a queue\n"
+        "  mq receive <name>              dequeue the oldest message\n"
+        "  mq list                        list all message queues + depth\n"
         "  query <natural language text>  cognitive direct object scan\n"
         "  query scan                     export full catalog as JSON manifest\n"
         "  tier list                     show each object's current storage tier\n"
@@ -1397,6 +1407,77 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         else if (sh_starts(input_buffer, "proc kill ")) {
             uint32_t pid = sh_atoi(input_buffer + 10);
             do_syscall(SYS_SLS_PROC_KILL, (void*)(uintptr_t)pid);
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: proc hold <pid> ────────────
+        else if (sh_starts(input_buffer, "proc hold ")) {
+            uint32_t pid = sh_atoi(input_buffer + 10);
+            uint64_t status = do_syscall(SYS_SLS_PROC_HOLD, (void*)(uintptr_t)pid);
+            if (status == 0) kernel_serial_printf("PID %u held.\n", pid);
+            else kernel_serial_print(
+                "Hold failed (not found, running, already held, or zombie).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: proc release <pid> ─────────
+        else if (sh_starts(input_buffer, "proc release ")) {
+            uint32_t pid = sh_atoi(input_buffer + 13);
+            uint64_t status = do_syscall(SYS_SLS_PROC_RELEASE, (void*)(uintptr_t)pid);
+            if (status == 0) kernel_serial_printf("PID %u released.\n", pid);
+            else kernel_serial_print("Release failed (not found or not held).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: proc priority <pid> <tier> ──
+        else if (sh_starts(input_buffer, "proc priority ")) {
+            const char* p = input_buffer + 14;
+            struct SLSProcPrioritySetRequest req;
+            req.pid = sh_atoi(p);
+            p = sh_next(p);
+            if      (sh_eq(p, "high"))   req.priority = PROC_PRIO_HIGH;
+            else if (sh_eq(p, "low"))    req.priority = PROC_PRIO_LOW;
+            else                          req.priority = PROC_PRIO_NORMAL;
+            uint64_t status = do_syscall(SYS_SLS_PROC_PRIORITY_SET, &req);
+            if (status == 0) kernel_serial_printf("PID %u priority set to %s.\n",
+                                                  req.pid, proc_priority_name((ProcPriority)req.priority));
+            else kernel_serial_print("Priority set failed (PID not found).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: mq create <name> ───────────
+        else if (sh_starts(input_buffer, "mq create ")) {
+            struct SLSMQCreateRequest req;
+            sh_copy(req.name, input_buffer + 10, MQ_NAME_LEN);
+            uint64_t status = do_syscall(SYS_SLS_MQ_CREATE, &req);
+            if (status == 0) kernel_serial_printf("Message queue '%s' created.\n", req.name);
+            else kernel_serial_print("Queue creation failed (duplicate name or table full).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: mq send <name> <text...> ───
+        else if (sh_starts(input_buffer, "mq send ")) {
+            const char* p = input_buffer + 8;
+            struct SLSMQSendRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.name, p, nlen + 1 < MQ_NAME_LEN ? nlen + 1 : MQ_NAME_LEN);
+            p = sh_next(p);
+            req.sender_uid = current_session_uid;
+            sh_copy(req.text, p, MQ_MSG_TEXT_LEN);
+            uint64_t status = do_syscall(SYS_SLS_MQ_SEND, &req);
+            if (status == 0) kernel_serial_printf("Message sent to '%s'.\n", req.name);
+            else kernel_serial_print("Send failed (queue not found or full).\n");
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: mq receive <name> ──────────
+        else if (sh_starts(input_buffer, "mq receive ")) {
+            struct SLSMQReceiveRequest req;
+            sh_copy(req.name, input_buffer + 11, MQ_NAME_LEN);
+            do_syscall(SYS_SLS_MQ_RECEIVE, &req);
+            if (req.got) kernel_serial_printf("[%s] uid %u: %s\n",
+                                              req.name, req.msg.sender_uid, req.msg.text);
+            else kernel_serial_printf("Queue '%s' is empty (or does not exist).\n", req.name);
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 4: mq list ────────────────────
+        else if (sh_eq(input_buffer, "mq list")) {
+            do_syscall(SYS_SLS_MQ_LIST, 0);
         }
 
         // ── Phase 7: query scan (structured JSON manifest) ────────────────────

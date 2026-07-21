@@ -21,6 +21,7 @@
 #include "group_profile.h" // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_GROUP_*
 #include "authlist.h"      // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUTHLIST_*
 #include "security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUDIT_LIST
+#include "msgqueue.h"      // Navigator-Parity Gap Roadmap Phase 4 -- SYS_SLS_MQ_*
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -182,6 +183,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_proc_list(); return 0;
     case SYS_SLS_EXIT:
         process_exit((uint32_t)(uintptr_t)arg); return 0;
+
+    // ── Navigator-Parity Gap Roadmap Phase 4: hold/release/priority (245-247) ──
+    case SYS_SLS_PROC_HOLD:
+        return process_hold((uint32_t)(uintptr_t)arg) == 0 ? 0 : 1;
+    case SYS_SLS_PROC_RELEASE:
+        return process_release((uint32_t)(uintptr_t)arg) == 0 ? 0 : 1;
+    case SYS_SLS_PROC_PRIORITY_SET:
+        return sys_sls_proc_priority_set((struct SLSProcPrioritySetRequest*)arg);
 
     // ── Ring-3 debug output (165) ───────────────────────────────────────
     case 165: /* SYS_SLS_SERIAL_WRITE */
@@ -349,6 +358,16 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // ── Navigator-Parity Gap Roadmap Phase 3: security audit log (243) ──────
     case SYS_SLS_AUDIT_LIST:
         sys_sls_audit_list(); return 0;
+
+    // ── Navigator-Parity Gap Roadmap Phase 4: message queues (248-251) ──────
+    case SYS_SLS_MQ_CREATE:
+        return sys_sls_mq_create((struct SLSMQCreateRequest*)arg);
+    case SYS_SLS_MQ_SEND:
+        return sys_sls_mq_send((struct SLSMQSendRequest*)arg);
+    case SYS_SLS_MQ_RECEIVE:
+        return sys_sls_mq_receive((struct SLSMQReceiveRequest*)arg);
+    case SYS_SLS_MQ_LIST:
+        mq_list(); return 0;
 
     default:
         return 0;

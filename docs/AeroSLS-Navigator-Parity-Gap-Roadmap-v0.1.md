@@ -510,7 +510,134 @@ an authorization list, and confirming both the Terminal and
 
 ---
 
-## Phase 4 — Job priority/hold-release + message queue surface
+## Phase 4 — Job priority/hold-release + message queue surface — DONE
+
+### Scope correction made during implementation
+
+The original draft below assumed `schedule_ring3()` "already must skip
+non-`PROC_RUNNING` processes," so exposing `PROC_SUSPENDED` per-pid via new
+hold/release syscalls would be "exposing an existing state transition, not
+adding a new one." Investigation before writing any code found this claim
+factually wrong: `PROC_SUSPENDED` is not an idle/held state at all — it is
+the scheduler's own transient "not currently running, but eligible for the
+very next round-robin turn" state, set on *every* process on *every*
+preemption (`schedule_ring3()`, `process.c`) and actively scanned for as a
+scheduling candidate by both `pick_next_partition()` and
+`pick_next_process_in_partition()`. Reusing it directly for an
+operator-invoked hold would mean the "held" process gets picked up and
+resumed by the very next scheduler tick — the opposite of what hold means.
+Caught by reading the scheduler's actual logic, not by a test failing,
+since building the naive version first and discovering this at runtime
+wasn't worth the detour once the code was read closely.
+
+The fix: a new, distinct `PROC_HELD` `ProcState` value (`process.h`).
+Confirmed via grep across `process.c`/`syscall_dispatch.c`/every existing
+host test that every scheduler check tests `state == PROC_SUSPENDED` by
+exact value — so `PROC_HELD` is automatically and safely excluded from
+`pick_next_partition()`/`pick_next_process_in_partition()`/
+`schedule_ring3()` with zero changes to any of them, verified directly by
+this phase's own host test (`workmgmt_phase4_host_test.c`, scenario 6).
+
+A second, smaller correction: `process_hold()` is deliberately scoped to
+only accept a target already in `PROC_SUSPENDED` — not `PROC_RUNNING`.
+`schedule_ring3()` identifies "the process it must save and preempt" by
+scanning for `state == PROC_RUNNING`; flipping that same slot to
+`PROC_HELD` asynchronously from a syscall handler (not from inside the
+timer ISR) would make it invisible to that scan, and the process would
+never actually get preempted — a real correctness bug, not a style choice.
+Rather than build an unproven asynchronous-preemption path this pass
+doesn't need, holding the currently-*running* job returns a clear error
+(`-2`) telling the caller to retry once it yields its next turn. This is a
+real, honest scope narrowing (documented in `process.h`'s own comments),
+not silently dropped functionality — a job that isn't mid-quantum (the
+overwhelming common case for "hold this job") works exactly as scoped.
+
+Third: "message queues... layered on top of the existing IPC port bus"
+(the original draft's wording) turned out to mean "informed by its
+fixed-size-table conventions" once the actual shapes were compared.
+`kernel/ipc.h`'s user ports are numeric, bound 1:1 to a single owning pid,
+and carry structured opcode+payload records for service dispatch — a
+named, FIFO, multi-reader-capable text queue doesn't fit that shape
+without distorting it. Message queues (`kernel/msgqueue.h`/`.c`) are a new,
+independent, small fixed-size table instead — same bump-allocated,
+no-reclaim posture as `group_table[]`/`authlist_table[]`, but not built out
+of `ipc_queues[]`/`ipc_user_queues[]` directly. Named explicitly here
+rather than silently deviating from the roadmap's original wording.
+
+### What was built
+
+- **Job priority** (`process.h`/`process.c`): a 3-tier `ProcPriority` enum
+  (`PROC_PRIO_HIGH`/`_NORMAL`/`_LOW`), a new field on
+  `ProcessDescriptor` defaulting to `PROC_PRIO_NORMAL` at spawn (both
+  `process_create()` and `program_spawn()`). `pick_next_process_in_partition()`
+  now runs its existing per-partition round-robin cursor through three
+  passes — HIGH, then NORMAL, then LOW — so any runnable HIGH process
+  always gets a turn before any NORMAL one, and any NORMAL before any LOW,
+  while still round-robining fairly *within* whichever tier has runnable
+  work. When every process is the default NORMAL (any deployment that
+  never touches priority), the HIGH pass always finds nothing and falls
+  straight through to the NORMAL pass — byte-for-byte the pre-Phase-4 flat
+  round robin, confirmed by the new host test. New syscall:
+  `SYS_SLS_PROC_PRIORITY_SET` (247).
+- **Job hold/release** (`process.h`/`process.c`): the new `PROC_HELD`
+  state plus `process_hold()`/`process_release()`, scoped as described
+  above. `process_hold()` returns distinct codes for each rejection reason
+  (not found, currently running, already held, zombie); `process_release()`
+  returns a held process to `PROC_SUSPENDED` (not directly to
+  `PROC_RUNNING`) so it re-enters the exact same pool the scheduler already
+  scans, on the same fair basis as every other suspended process. New
+  syscalls: `SYS_SLS_PROC_HOLD` (245), `_RELEASE` (246).
+- **Message queues** (`kernel/msgqueue.h`/`.c`): an 8-queue fixed table
+  (`MQ_MAX`), each holding up to 16 messages (`MQ_QUEUE_DEPTH`) of sender
+  uid + tick + short text. Plain non-atomic circular buffer (unlike
+  `ipc.c`'s atomic queues, `mq_*` functions are only ever reached via
+  syscall dispatch, never from ISR context, so the lighter mechanism is the
+  right level). New syscalls: `SYS_SLS_MQ_CREATE` (248), `_SEND` (249),
+  `_RECEIVE` (250), `_LIST` (251).
+- **HTTP routes:** `/api/processes` now includes each process's `priority`
+  field. New route `GET /api/workmgmt/msgqueues` lists every queue's name,
+  depth, capacity, and full message contents (oldest-first, non-consuming
+  read) — the "make queues visible" gap the roadmap called out, since the
+  underlying IPC bus never had any user-facing view at all.
+- **Terminal commands:** `proc hold <pid>`, `proc release <pid>`,
+  `proc priority <pid> <high|normal|low>`, `mq create/send/receive/list` —
+  all wired into `user/shell.c` alongside the existing `proc list/spawn/
+  kill` commands.
+- **Makefile:** `kernel/msgqueue.c` added to `X86_C_SRC` in the same edit
+  that wrote the file — the previous phase's real build failure (three new
+  `.c` files never added to `X86_C_SRC`, only caught when the user's own
+  server build hit undefined-reference linker errors) made this an
+  explicit checklist item this time, not an afterthought.
+
+**Verification performed:** a new host test
+(`tests/workmgmt_phase4_host_test.c`) links the real `process.c` (via the
+same "`#include kernel/process.c` directly to reach its `static` scheduling
+helpers" technique `scheduler_fairness_host_test.c` established) and the
+real `kernel/msgqueue.c`, proving: a runnable HIGH-priority process is
+always chosen over runnable NORMAL/LOW ones and continues to be chosen on
+repeat ticks (strict priority, not a one-shot); excluding the current HIGH
+process correctly falls through to NORMAL, then to LOW once NORMAL is also
+excluded; an all-NORMAL deployment reduces exactly to the pre-Phase-4 flat
+round robin; `process_hold()`/`process_release()` return the correct
+success/failure code for every state (suspended, running, already-held,
+zombie, not-found) and a held process is genuinely invisible to the
+scheduler's candidate scan until released; `process_priority_set()`
+validates both pid and range; and message queues create/send/receive/list
+correctly including FIFO ordering, full-queue rejection (no silent
+overwrite), and fixed-table-full rejection. Full regression sweep: 26/26
+host tests passing (up from 25), 0 failures. Kernel compile-check across
+every modified/new file (`gcc -fsyntax-only`): zero new errors, only
+pre-existing unrelated implicit-declaration warnings already present
+before this phase.
+
+**Scoped out of this pass, honestly:** a Work Management frontend panel in
+`slsos-sim` (Phase 4e) — Terminal + the new HTTP routes cover the
+Navigator-parity gap for this pass; a dedicated UI panel is a reasonable
+follow-on but wasn't built here, matching the roadmap's own "(if scoped)"
+qualifier on that line item rather than silently expanding scope to
+include it.
+
+### Original Phase 4 scope (as first drafted, before the correction above)
 
 **Goal:** give Work Management real per-job control instead of only
 partition-level pause and unconditional kill.

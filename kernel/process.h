@@ -6,10 +6,32 @@
 #include "scheduler.h"   /* struct TaskContext */
 
 // ─── Process states ───────────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 4: added PROC_HELD as a *distinct* state
+// from PROC_SUSPENDED, not a reuse of it. Investigation before writing any
+// code here found that PROC_SUSPENDED is NOT an idle "operator hold" state --
+// it is the scheduler's own transient "not currently running, but eligible
+// for the very next round-robin turn" state, set on every single process on
+// every single preemption (schedule_ring3(), process.c) and actively scanned
+// for as a scheduling candidate by both pick_next_partition() and
+// pick_next_process_in_partition(). The original roadmap draft (see this
+// file's own Phase 4 section in the roadmap doc) assumed "schedule_ring3()
+// already must skip non-PROC_RUNNING processes, so exposing PROC_SUSPENDED
+// per-pid is exposing an existing state transition, not adding a new one" --
+// that's factually wrong about what the scheduler does: it does NOT skip
+// PROC_SUSPENDED, it actively resumes it. Reusing PROC_SUSPENDED directly for
+// an operator-invoked hold would mean the "held" process gets picked up and
+// resumed by the very next scheduler tick, defeating the entire point of a
+// hold. PROC_HELD is a new, distinct value specifically so every existing
+// scheduler check (which all test `state == PROC_SUSPENDED` by exact value,
+// confirmed via grep across process.c/syscall_dispatch.c/the host tests
+// before this was added) automatically and safely excludes it, with zero
+// changes needed to pick_next_partition()/pick_next_process_in_partition()/
+// schedule_ring3() themselves.
 typedef enum {
     PROC_RUNNING   = 0,
     PROC_SUSPENDED = 1,
     PROC_ZOMBIE    = 2,
+    PROC_HELD      = 3,
 } ProcState;
 
 static inline const char* proc_state_name(ProcState s) {
@@ -17,7 +39,35 @@ static inline const char* proc_state_name(ProcState s) {
         case PROC_RUNNING:   return "RUNNING";
         case PROC_SUSPENDED: return "SUSPENDED";
         case PROC_ZOMBIE:    return "ZOMBIE";
+        case PROC_HELD:      return "HELD";
         default:             return "UNKNOWN";
+    }
+}
+
+// ─── Job priority ─────────────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 4: coarse 3-tier priority, matching this
+// codebase's "smallest real version first" scoping pattern (same judgment
+// call as Phase 3's 3-syscall-then-4 authlist growth) rather than a full
+// weighted/decay scheduler. Consulted by pick_next_process_in_partition()
+// (process.c): within a partition, ALL runnable HIGH-priority processes are
+// offered a turn (round-robin among themselves) before any NORMAL process is
+// considered, and all NORMAL before any LOW -- strict priority scheduling
+// with round-robin fairness *within* each tier. Every process defaults to
+// PROC_PRIO_NORMAL at creation, so a deployment that never touches priority
+// behaves identically to the pre-Phase-4 flat round robin (verified by the
+// new host test).
+typedef enum {
+    PROC_PRIO_HIGH   = 0,
+    PROC_PRIO_NORMAL = 1,
+    PROC_PRIO_LOW    = 2,
+} ProcPriority;
+
+static inline const char* proc_priority_name(ProcPriority p) {
+    switch (p) {
+        case PROC_PRIO_HIGH:   return "HIGH";
+        case PROC_PRIO_NORMAL: return "NORMAL";
+        case PROC_PRIO_LOW:    return "LOW";
+        default:                return "UNKNOWN";
     }
 }
 
@@ -41,6 +91,11 @@ struct ProcessDescriptor {
     uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
                                        // at spawn time — see partition.h
     ProcState  state;
+    ProcPriority priority;             // Navigator-Parity Gap Roadmap Phase 4:
+                                       // defaults to PROC_PRIO_NORMAL at spawn
+                                       // (process_create()/program_spawn()) —
+                                       // see pick_next_process_in_partition()
+                                       // (process.c) for how this is consulted.
     uint8_t    active;
 };
 
@@ -49,6 +104,20 @@ struct ProcessDescriptor {
 #define SYS_SLS_PROC_KILL   161
 #define SYS_SLS_PROC_LIST   162
 #define SYS_SLS_EXIT        164  // Ring-3 self-exit; returns control to kernel
+
+// Navigator-Parity Gap Roadmap Phase 4: job priority + hold/release.
+// 245-247 are the next free numbers after Phase 3's own additions topped out
+// at 244 (SYS_SLS_AUTHLIST_LIST) -- confirmed via grep across every header
+// defining SYS_SLS_* before picking these.
+#define SYS_SLS_PROC_HOLD          245
+#define SYS_SLS_PROC_RELEASE       246
+#define SYS_SLS_PROC_PRIORITY_SET  247
+
+struct SLSProcPrioritySetRequest {
+    uint32_t pid;
+    uint32_t priority;   // ProcPriority value; validated in process_priority_set()
+};
+
 // ─── Syscall argument for process creation ────────────────────────────────────
 struct ProcCreateRequest {
     char     object_name[PROC_NAME_LEN];  // name of the SERVICE_PROCESS SLS object
@@ -68,6 +137,40 @@ void     sys_sls_proc_list(void);
 // process_kill() per-pid. Returns the number of processes killed. Called
 // from partition_destroy().
 uint32_t process_kill_partition(uint32_t partition_id);
+
+// ─── Navigator-Parity Gap Roadmap Phase 4: hold/release + priority ───────────
+// process_hold(): transitions an active process from PROC_SUSPENDED to the
+// new, distinct PROC_HELD state (see ProcState's comment above for why these
+// must not be the same value). Deliberately scoped to require the target
+// already be PROC_SUSPENDED -- NOT PROC_RUNNING. Holding the process that is
+// *currently executing on the CPU* would require schedule_ring3() to
+// recognize a state change that happened out from under it between timer
+// ticks; schedule_ring3() identifies "the process it must save and preempt"
+// by scanning for state == PROC_RUNNING, so flipping that same slot to
+// PROC_HELD asynchronously (from a syscall handler, not from inside the
+// timer ISR) would make it invisible to that scan and never get preempted at
+// all. Rather than add an unproven asynchronous-preemption path this pass
+// doesn't need, hold is scoped to "processes waiting for their next turn,"
+// which is already exactly what job hold means for a job that isn't
+// mid-quantum. Returns 0 on success, -1 if pid isn't found/active, -2 if pid
+// is running (right now, not eligible), -3 if pid is already held, -4 if pid
+// is a zombie.
+int process_hold(uint32_t pid);
+
+// process_release(): transitions a PROC_HELD process back to PROC_SUSPENDED
+// (its normal "waiting for next round-robin turn" state) -- not directly to
+// PROC_RUNNING; it simply re-enters the same pool pick_next_partition()/
+// pick_next_process_in_partition() already scan, and gets its next turn on
+// the same fair basis as every other suspended process. Returns 0 on
+// success, -1 if pid isn't found/active, -2 if pid isn't currently held.
+int process_release(uint32_t pid);
+
+// process_priority_set(): validates priority is one of the three
+// ProcPriority values and applies it to the matching active pid. Returns 0
+// on success, -1 if pid isn't found/active, -2 if priority is out of range.
+int process_priority_set(uint32_t pid, ProcPriority priority);
+
+uint64_t sys_sls_proc_priority_set(struct SLSProcPrioritySetRequest* req);
 
 // Spawn a Ring-3 process from an OBJ_TYPE_PROGRAM catalog object.
 // Identical pipeline to process_create() but accepts PROGRAM type,

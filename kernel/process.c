@@ -154,6 +154,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     pd->owner_uid       = req->owner_uid;
     pd->partition_id    = spawn_partition_id;   // Phase 9, resolved once at Phase 13
     pd->state           = PROC_RUNNING;
+    pd->priority        = PROC_PRIO_NORMAL;     // Phase 4 (Navigator-Parity): default tier
     pd->active          = 1;
     proc_count++;
 
@@ -277,6 +278,7 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid) {
     pd->owner_uid    = owner_uid;
     pd->partition_id = spawn_partition_id;   // Phase 9, resolved once at Phase 13
     pd->state        = PROC_RUNNING;
+    pd->priority     = PROC_PRIO_NORMAL;     // Phase 4 (Navigator-Parity): default tier
     pd->active       = 1;
     proc_count++;
 
@@ -442,17 +444,33 @@ static int pick_next_partition(uint32_t last_partition, uint32_t* out_partition)
 // process (the sole survivor in a single-process partition, after
 // excluding itself — schedule_ring3()'s existing "!next -> resume
 // current immediately" fallback handles that case, unchanged).
+// Navigator-Parity Gap Roadmap Phase 4: priority is layered on top of the
+// existing per-partition round-robin cursor rather than replacing it. Three
+// passes over the SAME cursor -- HIGH first, then NORMAL, then LOW -- so any
+// runnable HIGH-priority process in the partition is always offered a turn
+// before a NORMAL one gets considered, and any NORMAL before any LOW (strict
+// priority scheduling), while still round-robining fairly *within* whichever
+// tier actually has runnable work (the cursor only ever advances to the slot
+// that was chosen, so the next call resumes from there regardless of which
+// tier it came from). When every process in a partition is the default
+// PROC_PRIO_NORMAL (true for any deployment that never touches priority),
+// the HIGH pass always finds nothing and falls straight through to the
+// NORMAL pass, which is byte-for-byte the pre-Phase-4 scan -- confirmed by
+// the new host test asserting identical ordering when no priority is set.
 static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx) {
-    int start = g_last_index_in_partition[partition_id];
-    for (int step = 1; step <= PROC_MAX; step++) {
-        int idx = (start + step) % PROC_MAX;
-        if (idx == exclude_idx) continue;
-        if (proc_table[idx].active &&
-            proc_table[idx].state == PROC_SUSPENDED &&
-            proc_table[idx].kernel_rsp != 0 &&
-            proc_table[idx].partition_id == partition_id) {
-            g_last_index_in_partition[partition_id] = idx;
-            return idx;
+    for (int tier = PROC_PRIO_HIGH; tier <= PROC_PRIO_LOW; tier++) {
+        int start = g_last_index_in_partition[partition_id];
+        for (int step = 1; step <= PROC_MAX; step++) {
+            int idx = (start + step) % PROC_MAX;
+            if (idx == exclude_idx) continue;
+            if (proc_table[idx].active &&
+                proc_table[idx].state == PROC_SUSPENDED &&
+                proc_table[idx].kernel_rsp != 0 &&
+                proc_table[idx].partition_id == partition_id &&
+                proc_table[idx].priority == (ProcPriority)tier) {
+                g_last_index_in_partition[partition_id] = idx;
+                return idx;
+            }
         }
     }
     return -1;
@@ -574,21 +592,88 @@ uint32_t process_kill_partition(uint32_t partition_id) {
 void sys_sls_proc_list(void) {
     kernel_serial_printf(
         "\n[PROC] Process Table\n"
-        " %-5s  %-24s  %-10s  %-4s  %s\n"
-        " -----  ------------------------  ----------  ----  ------------------\n",
-        "PID", "Name", "State", "UID", "User RIP");
+        " %-5s  %-24s  %-10s  %-8s  %-4s  %s\n"
+        " -----  ------------------------  ----------  --------  ----  ------------------\n",
+        "PID", "Name", "State", "Priority", "UID", "User RIP");
 
     uint32_t shown = 0;
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
         if (!pd->active) continue;
         kernel_serial_printf(
-            " %-5u  %-24s  %-10s  %-4u  0x%016lx\n",
+            " %-5u  %-24s  %-10s  %-8s  %-4u  0x%016lx\n",
             pd->pid, pd->name,
             proc_state_name(pd->state),
+            proc_priority_name(pd->priority),
             pd->owner_uid, pd->user_rip);
         shown++;
     }
     if (!shown) kernel_serial_print(" (no processes)\n");
     kernel_serial_printf(" %u process(es).\n\n", shown);
+}
+
+// ─── process_hold / process_release / process_priority_set ───────────────────
+// Navigator-Parity Gap Roadmap Phase 4. See process.h's comments on
+// PROC_HELD and these three declarations for the full rationale (why hold is
+// scoped to PROC_SUSPENDED targets only, and why release lands back on
+// PROC_SUSPENDED rather than PROC_RUNNING).
+int process_hold(uint32_t pid) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active || proc_table[i].pid != pid) continue;
+        switch (proc_table[i].state) {
+            case PROC_SUSPENDED:
+                proc_table[i].state = PROC_HELD;
+                kernel_serial_printf("[PROC] PID %u held.\n", pid);
+                return 0;
+            case PROC_RUNNING:
+                kernel_serial_printf(
+                    "[PROC] hold: PID %u is currently running; retry once it "
+                    "yields its turn (hold cannot preempt the running job "
+                    "directly in this pass).\n", pid);
+                return -2;
+            case PROC_HELD:
+                kernel_serial_printf("[PROC] hold: PID %u is already held.\n", pid);
+                return -3;
+            case PROC_ZOMBIE:
+            default:
+                kernel_serial_printf("[PROC] hold: PID %u is not eligible.\n", pid);
+                return -4;
+        }
+    }
+    kernel_serial_printf("[PROC] hold: PID %u not found.\n", pid);
+    return -1;
+}
+
+int process_release(uint32_t pid) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active || proc_table[i].pid != pid) continue;
+        if (proc_table[i].state != PROC_HELD) {
+            kernel_serial_printf("[PROC] release: PID %u is not held.\n", pid);
+            return -2;
+        }
+        proc_table[i].state = PROC_SUSPENDED;
+        kernel_serial_printf("[PROC] PID %u released.\n", pid);
+        return 0;
+    }
+    kernel_serial_printf("[PROC] release: PID %u not found.\n", pid);
+    return -1;
+}
+
+int process_priority_set(uint32_t pid, ProcPriority priority) {
+    if (priority != PROC_PRIO_HIGH && priority != PROC_PRIO_NORMAL && priority != PROC_PRIO_LOW)
+        return -2;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active || proc_table[i].pid != pid) continue;
+        proc_table[i].priority = priority;
+        kernel_serial_printf("[PROC] PID %u priority set to %s.\n",
+                             pid, proc_priority_name(priority));
+        return 0;
+    }
+    kernel_serial_printf("[PROC] priority: PID %u not found.\n", pid);
+    return -1;
+}
+
+uint64_t sys_sls_proc_priority_set(struct SLSProcPrioritySetRequest* req) {
+    if (!req) return 1;
+    return process_priority_set(req->pid, (ProcPriority)req->priority) == 0 ? 0 : 1;
 }
