@@ -675,7 +675,7 @@ via Terminal and (if built in this phase) a Work Management panel.
 
 ---
 
-## Phase 5 — Configurable network interfaces + storage-unit visibility
+## Phase 5 — Configurable network interfaces + storage-unit visibility — DONE
 
 ### Further mapping done before implementation
 
@@ -778,12 +778,32 @@ than the two big bullets originally drafted:
   stub to that test (documented in its own header comment as "added later,
   never actually exercised by this test's scenarios"). Compile-check: zero
   new errors. Full regression: 27/27 passing again after the fix.
-- **5d — Frontend panel: scoped out for this pass**, same call as Phase
-  4e — Terminal plus the two new HTTP routes satisfy "visibility" for v1;
-  a dedicated Network/Storage tab in `slsos-sim` is a reasonable follow-on,
-  not built here.
+- **5d — Frontend panel: scoped out for this pass — DONE (decision
+  reconfirmed).** Same call as Phase 4e — Terminal (`net status`/`disk
+  status`) plus the two new HTTP routes (`GET /api/network/status`/`GET
+  /api/disk`) satisfy "visibility" for v1. Reconfirmed after 5a-5c actually
+  shipped, not just carried over from the original mapping: grepped
+  `slsos-sim/src` for any existing reference to network/disk status
+  (`network/status`, `/api/disk`, `NetworkStatus`, `DiskStatus`,
+  `StorageUnit`) and found none at all — no half-wired frontend code is
+  left dangling by this scope-out, and no existing UI silently breaks or
+  misrepresents anything by not surfacing this data yet (the Phase 1
+  "truth-in-UI" concern that motivated this whole roadmap doesn't apply
+  here, since nothing claims to show this today). A dedicated Network/
+  Storage tab in `slsos-sim` is a reasonable follow-on, not built here.
 - **5e — Host tests + compile-check + Makefile check + doc update +
-  present.**
+  present — DONE.** Final wrap-up sweep across all of 5a-5d's changes.
+  Full regression (`tests/run_all.sh`): 27/27 passing (unchanged from 5c's
+  post-fix count — 5d was a scope-out with no code, so it added nothing new
+  to run). Compile-check (`gcc -fsyntax-only`) across every file touched in
+  this phase — `net/net.c`, `net/dhcp.c`, `net/http.c`, `kernel/tier_mgr.c`,
+  `kernel/syscall_dispatch.c`, `user/shell.c` — zero errors in all six.
+  Makefile check: no new `.c` files were created anywhere in Phase 5 (only
+  edits to files already present in `X86_C_SRC`, plus the new
+  `tests/tier_capacity_phase5b_host_test.c`, which is a standalone host
+  test and isn't part of the kernel build), so no `Makefile` changes were
+  ever required — confirmed by grepping all six touched files' presence in
+  `X86_C_SRC` directly rather than assuming.
 
 **Deliberately still out of scope for v1** (unchanged from the original
 draft): runtime-configurable IP/DNS/routing and true multi-disk/RAID
@@ -793,11 +813,21 @@ constants and boot-time DHCP negotiation, a substantially larger effort
 than the rest of this roadmap and better scoped as its own follow-on doc
 once the read-only visibility here proves useful.
 
-**Verification:** compile-check; a host test for the new per-tier
-byte-aggregation math (the one new computation in this phase); live pass
-confirming `/api/network/status` matches the kernel's own boot-log-reported
-DHCP lease (including the newly-captured subnet) and `/api/disk` matches
-real NVMe capacity plus the new per-tier totals.
+**Verification (actual results):** compile-check clean (zero new errors)
+across all six files touched in 5a-5c; new host test
+`tests/tier_capacity_phase5b_host_test.c` (9 checks, Phase 5b's per-tier
+byte-aggregation math) passing; full regression 27/27 host tests passing as
+of the final 5e sweep; Makefile membership confirmed for all six touched
+files, no changes needed since no new `.c` files were added. One real
+regression was caught and fixed along the way (not just anticipated by
+planning): Phase 5c's new `nvme_get_capacity_bytes()` call inside
+`sys_sls_disk_status()` broke the 5b host test's link, caught by the
+regression sweep itself and fixed with a one-line stub (see 5c above). Live
+`/api/network/status` and `/api/disk` route verification (matching the
+kernel's own boot-log-reported DHCP lease and real NVMe capacity) was not
+re-run in this session beyond the desk-checks described in 5a/5b, since no
+QEMU boot was performed as part of 5e — worth a live pass before the next
+phase begins if that hasn't happened since.
 
 ### Original Phase 5 scope (as first drafted, before the mapping above)
 
