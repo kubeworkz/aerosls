@@ -7,6 +7,26 @@ extern void* allocate_physical_ram_frame(void);
 #define mmio_write32(a,v) (*(volatile uint32_t*)(a) = (v))
 #define SECTORS_PER_FRAME 8u   /* 8 × 512 B = 4 KiB */
 
+// Timeout for the I/O-queue completion poll below, same budget and pause()-
+// loop shape as nvme_admin.c's nvme_submit_admin_cmd() (~500ms at 1GHz) --
+// this file's own poll loop was missing that bound entirely (see the "Gap
+// fix" comment on nvme_io_submit_sync() for how that surfaced: any command
+// whose completion is never observed -- a missed doorbell, a real
+// controller's completion timing differing from local QEMU testing, etc --
+// spun this loop forever at 100% CPU with no way out. Because every
+// nvme_write_sync()/nvme_read_sync() call in this codebase runs synchronously
+// inside the single-threaded HTTP request path (net/http.c's
+// http_server_run() loop), that infinite spin doesn't just fail one request
+// -- it wedges the entire server, including completely unrelated GET
+// requests like /api/health, since nothing else ever runs again. Unlike the
+// admin path, this one deliberately does NOT cli/sti around the spin: the
+// admin path's interrupt-disable is a boot-time-only safety measure against
+// timer-ISR reentrancy during controller bring-up, and disabling interrupts
+// on every single steady-state disk write would block unrelated IRQ
+// handling (e.g. the network stack) for the duration -- worse than the
+// problem being fixed.
+#define NVME_IO_TIMEOUT 500000000UL
+
 // ─── I/O queue state ─────────────────────────────────────────────────────────
 void*          io_sq        = 0;
 void*          io_cq        = 0;
@@ -76,6 +96,19 @@ int nvme_io_init(void) {
 }
 
 // ─── submit one I/O command and poll for completion ───────────────────────────
+// Gap fix: this poll loop used to be unbounded (`while (...) pause();` with
+// no exit condition other than the completion actually showing up) -- see
+// the NVME_IO_TIMEOUT comment above for the full story of how that produced
+// the reported "kernel wedged at 100% CPU, every request including
+// /api/health hangs" bug from a single, ordinary vector insert. Mirrors
+// nvme_admin.c's nvme_submit_admin_cmd() timeout shape: on timeout, log it
+// and return a nonzero (distinct, out-of-band 0xFF) status instead of
+// hanging forever. Every existing caller of nvme_write_sync()/
+// nvme_read_sync() already treats a nonzero return as failure and swallows
+// it safely (vecstore.c/rowstore.c/stream.c all predate this fix and were
+// written expecting the NVMe status-code convention "0 on success, non-zero
+// on NVMe status error" documented in nvme_io.h -- a timeout is just another
+// error under that same contract, not a new case callers need to learn).
 static int nvme_io_submit_sync(struct NVMeCmd* cmd) {
     cmd->command_id = io_cmd_id++;
 
@@ -88,10 +121,21 @@ static int nvme_io_submit_sync(struct NVMeCmd* cmd) {
     // Ring I/O SQ doorbell
     mmio_write32(io_sq_doorbell(), io_sq_tail);
 
-    // Poll I/O CQ for completion (phase-tag protocol)
+    // Poll I/O CQ for completion (phase-tag protocol), bounded by
+    // NVME_IO_TIMEOUT so a missed/delayed completion fails the request
+    // instead of spinning the kernel forever.
     volatile struct NVMeCqe* cqe = &cq[io_cq_head];
-    while (((cqe->status) & 0x1) != io_cq_phase)
+    uint64_t deadline = NVME_IO_TIMEOUT;
+    while (((cqe->status) & 0x1) != io_cq_phase) {
         __asm__ volatile("pause");
+        if (--deadline == 0) {
+            kernel_serial_printf(
+                "[NVME_IO] I/O cmd 0x%x timeout (sq_tail=%u cq_head=%u phase=%u) -- "
+                "failing request instead of hanging.\n",
+                (unsigned)cmd->opcode, io_sq_tail, io_cq_head, (unsigned)io_cq_phase);
+            return 0xFF;   // distinct out-of-band status -- never a real NVMe status-code byte
+        }
+    }
 
     uint16_t status = cqe->status;
 
