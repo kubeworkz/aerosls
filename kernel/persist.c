@@ -40,9 +40,36 @@ static void p_memset(void* d, uint8_t v, uint32_t n) {
     while (n--) *p++ = v;
 }
 
+// Gap fix: every function below used to call nvme_write_sync()/
+// nvme_read_sync() unconditionally, with no check that the NVMe I/O queue
+// actually came up this boot. stream.c has always guarded its own NVMe call
+// with `(io_sq && io_cq) ? nvme_read_sync(...) : -1` for exactly this reason
+// (see nvme_io.h's own comment: io_sq/io_cq are NULL whenever nvme_io_init()
+// was never called, e.g. kernel.c's boot sequence skips it entirely when the
+// controller's MMIO BAR lands above the 4 GiB identity map) -- but every
+// persist_*() function in this file (persist_catalog(), persist_vecstore_
+// headers(), persist_rowstore_headers(), persist_partitions(), and everything
+// else routing through persist_write_array()/persist_read_array()/write_hdr()
+// below) never had that same guard. Concretely: on a boot where NVMe is
+// unavailable, io_sq/io_cq are NULL, so nvme_io_submit_sync() dereferenced
+// those NULLs and rang a "doorbell" at a bogus address derived from a
+// zeroed/never-set nvme_ctrl.mmio_base -- nothing real ever acknowledges it,
+// so the completion poll either (a) spun until NVME_IO_TIMEOUT (this
+// session's other fix, which stopped it from hanging the single-threaded
+// HTTP loop forever but still burned the full timeout for nothing), or (b)
+// by sheer luck read a few bytes of unrelated low memory that happened to
+// already satisfy the phase-tag check, silently "succeeding" without ever
+// writing anything real -- which is why persistence looked flaky (worked
+// once, hung the next time) rather than consistently broken. Guarding here,
+// once, at the three shared low-level helpers, protects every persist_*()
+// caller in one place instead of needing the same fix repeated at each of
+// their call sites.
+static int persist_nvme_available(void) { return io_sq && io_cq; }
+
 // Write `total_bytes` from `src` to successive 4-KiB NVMe frames starting at
 // `lba`.  Each frame is 8 NVMe 512-byte sectors.
 static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t lba) {
+    if (!persist_nvme_available()) return;
     const uint8_t* p = (const uint8_t*)src;
     uint32_t rem = total_bytes;
     while (rem > 0) {
@@ -59,6 +86,7 @@ static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t 
 // Read back `total_bytes` into `dst` from NVMe.  Stops silently on NVMe error
 // (the caller will detect corruption via the magic-number mismatch on next boot).
 static void persist_read_array(void* dst, uint32_t total_bytes, uint64_t lba) {
+    if (!persist_nvme_available()) return;
     uint8_t* d = (uint8_t*)dst;
     uint32_t rem = total_bytes;
     while (rem > 0) {
@@ -74,6 +102,7 @@ static void persist_read_array(void* dst, uint32_t total_bytes, uint64_t lba) {
 // Write a 4-KiB header frame: 8-byte magic + three uint32_t fields.
 static void write_hdr(uint64_t lba, uint64_t magic,
                       uint32_t v0, uint32_t v1, uint32_t v2) {
+    if (!persist_nvme_available()) return;
     p_memset(p_buf, 0, 4096);
     p_memcpy(p_buf +  0, &magic, 8);
     p_memcpy(p_buf +  8, &v0,   4);

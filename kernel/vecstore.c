@@ -94,8 +94,30 @@ static uint8_t* vecstore_load_page(uint32_t page_id) {
         // data on NVMe. Errors are swallowed the same way rowstore.c's
         // identical path does: the caller sees whatever's in the zeroed
         // frame, detectable as "no valid entries" rather than a crash.
-        vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
-        nvme_read_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8, frame);
+        //
+        // Gap fix: guard with (io_sq && io_cq) exactly like stream.c's
+        // identical check in stream_init() -- this file used to call
+        // nvme_read_sync()/nvme_write_sync() unconditionally, even on a
+        // boot where the NVMe I/O queue was never brought up (e.g. the
+        // controller's MMIO BAR landed above the 4 GiB identity map --
+        // see kernel.c's own boot-time branch, which skips
+        // init_nvme_controller()/nvme_io_init() entirely in that case,
+        // leaving io_sq/io_cq NULL and nvme_ctrl unpopulated). Without
+        // this guard, nvme_io_submit_sync() dereferenced those NULLs and
+        // rang a doorbell at a bogus address computed from a zeroed
+        // nvme_ctrl.mmio_base -- nothing real ever acknowledged it, so
+        // the completion-poll spun until NVME_IO_TIMEOUT before failing.
+        // That timeout (this session's other fix) stopped it from
+        // hanging the single-threaded HTTP loop forever, but every
+        // insert/flush on an MMIO-above-4GiB boot was still guaranteed to
+        // burn the full timeout for nothing. This guard restores the same
+        // graceful "RAM-only this boot" degradation stream.c already had.
+        if (io_sq && io_cq) {
+            vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
+            nvme_read_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8, frame);
+        } else {
+            vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
+        }
     } else {
         vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
         uint32_t invalid = VECSTORE_INVALID_PAGE;
@@ -106,8 +128,12 @@ static uint8_t* vecstore_load_page(uint32_t page_id) {
 }
 
 // Gap Remediation Phase D: mirrors rowstore.c's rowstore_flush_page().
+// Gap fix: same (io_sq && io_cq) guard as vecstore_load_page() above -- see
+// that function's comment for the full story. No-op (RAM-only, this boot)
+// rather than a doomed write when the NVMe I/O queue never came up.
 static void vecstore_flush_page(uint32_t page_id) {
     if (page_id >= VECSTORE_MAX_PAGES || !vec_pages[page_id]) return;
+    if (!(io_sq && io_cq)) return;
     nvme_write_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8, vec_pages[page_id]);
 }
 
