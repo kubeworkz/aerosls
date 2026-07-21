@@ -64,23 +64,61 @@
  * takes a layout (`predicate_eval()`, `predicate_columns_valid()`,
  * `find_column_index()`, `compare_rows_by_column()`) works against a
  * joined result completely unchanged — no join-aware branch was added to
- * any of them. The join itself is a plain nested-loop: for each row of A
- * (table_name, the FROM table — always the outer loop, no cost-based
- * side selection), the matching row(s) of B are found by constructing a
- * single-comparison `Predicate` (B.join_col = this A-row's join value) and
- * calling the SAME `sql_find_matching_rows()` the single-table path uses
- * — which means "indexed nested-loop join when Phase 17 has an index on
- * B's join column" falls out for free from code that already existed,
- * not from new index-selection logic written for this phase. WHERE
- * filtering happens AFTER the join, against the combined row — there is
- * no predicate pushdown into either side's scan before joining (a real,
- * named non-goal: decomposing a predicate by which table's columns it
- * references is a query-optimizer concern, out of scope per this
- * roadmap's Phase 22 framing). A combined row is still a plain
- * `RowValues` (capped at `ROWSTORE_MAX_COLUMNS` = 16 total columns across
- * BOTH tables) rather than a new wider type — SQL_ERR_JOIN_TOO_WIDE is
- * returned up front if the two tables' combined column count would
- * exceed that.
+ * any of them. WHERE filtering happens AFTER the join, against the
+ * combined row — there is no predicate pushdown into either side's scan
+ * before joining (a real, named non-goal: decomposing a predicate by
+ * which table's columns it references is a query-optimizer concern, out
+ * of scope per this roadmap's Phase 22 framing). A combined row is still
+ * a plain `RowValues` (capped at `ROWSTORE_MAX_COLUMNS` = 16 total
+ * columns across every joined table) rather than a new wider type —
+ * SQL_ERR_JOIN_TOO_WIDE is returned up front if the running combined
+ * column count would exceed that at any step.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 2: N-way JOIN + aliasing + LEFT JOIN ──
+ * `exec_select_join()` was generalized from "exactly two tables, streamed
+ * straight from a single nested-loop callback" into a real left-to-right
+ * chain over up to `SQL_MAX_JOINS` JOIN clauses (sql_parser.h), reusing
+ * every one of Phase 20's own ideas rather than replacing them:
+ *   - the FROM table is materialized into a scratch buffer first (a plain
+ *     `mvcc_table_scan()`, no WHERE pushdown, same as every other exec_*
+ *     path's first step);
+ *   - each JOIN clause then does exactly Phase 20's own per-row probe --
+ *     for every row currently in the scratch buffer, build a single-
+ *     comparison `Predicate` against the new table's join column and call
+ *     the SAME `mvcc_find_matching_rows()` every other path uses (so
+ *     "indexed nested-loop join when an index exists" still falls out for
+ *     free per step, subject to the same Phase 22 MVCC-routing caveat
+ *     already named for the two-table case) -- writing each match's
+ *     combined row into a second scratch buffer;
+ *   - the two scratch buffers ping-pong across steps (`g_select_scratch`/
+ *     `g_join_scratch_b`, both static — see the "static scratch buffers,
+ *     not stack locals" convention this file already established), with
+ *     the running `struct RowTableLayout` growing by one table's worth of
+ *     qualified columns per step, so the SAME "bake the right names into a
+ *     synthetic layout" trick still needs zero changes to
+ *     predicate_eval()/find_column_index()/compare_rows_by_column() for
+ *     any chain length;
+ *   - a column's qualifier throughout the WHOLE statement (ON/SELECT-list/
+ *     WHERE/ORDER BY) is the table's alias if one was given via AS, else
+ *     its real name — resolved by a plain `join_display_name()` helper,
+ *     not new lookup machinery; an ON clause's two qualifiers are resolved
+ *     by checking one side against the newly-joined table's own display
+ *     name and the other against `find_column_index()` on the RUNNING
+ *     layout built so far (which already contains every earlier table's
+ *     qualified columns) — a direct generalization of Phase 20's original
+ *     "check against exactly the two known table names" logic;
+ *   - WHERE filtering still happens exactly once, after the ENTIRE chain
+ *     is combined, against the final combined row — not once per step; no
+ *     per-step predicate pushdown, the same named non-goal carried forward
+ *     unchanged from a two-table chain to an N-table one.
+ * LEFT JOIN reuses this same per-step probe: when a scratch-buffer row has
+ * zero matches in the new table, the row is still emitted (not dropped),
+ * with the new table's columns filled via `fill_join_sentinel()` — a
+ * documented per-type placeholder (empty string / "0" / "false"), NOT a
+ * real NULL, since there's no true NULL representation yet (SQL
+ * Feature-Parity Roadmap Phase 4). Named explicitly here, not silently
+ * picked — revisit once Phase 4 lands real NULL. RIGHT/FULL OUTER JOIN are
+ * not implemented.
  *
  * --- Phase 22: every statement now runs inside a real MVCC transaction ---
  * Every SELECT/INSERT/UPDATE/DELETE/JOIN now executes against mvcc.c
@@ -157,8 +195,8 @@ typedef enum {
     SQL_ERR_COLUMN_COUNT_MISMATCH,
     SQL_ERR_VALUE_INVALID,
     SQL_ERR_ROW_NOT_FOUND,
-    SQL_ERR_JOIN_INVALID,        // Phase 20: ON clause qualifiers don't resolve to the two joined tables
-    SQL_ERR_JOIN_TOO_WIDE,       // Phase 20: combined column count would exceed ROWSTORE_MAX_COLUMNS
+    SQL_ERR_JOIN_INVALID,        // Phase 20/Phase 2: ON clause qualifiers don't resolve to the newly joined table + something already in the FROM/JOIN chain
+    SQL_ERR_JOIN_TOO_WIDE,       // Phase 20/Phase 2: running combined column count would exceed ROWSTORE_MAX_COLUMNS
     SQL_ERR_WRITE_CONFLICT,      // Phase 22: another transaction already has a pending or committed supersession
     SQL_ERR_TXN_UNAVAILABLE,     // Phase 22: MVCC_MAX_TXNS concurrently active transactions already
     SQL_ERR_TXN_NOT_ACTIVE,      // Phase 22: sql_execute_tx()/sql_tx_commit()/sql_tx_rollback() given a bad/closed txn_id

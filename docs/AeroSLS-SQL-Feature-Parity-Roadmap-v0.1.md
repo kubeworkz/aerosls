@@ -167,7 +167,7 @@ change surface).
 
 ---
 
-## Phase 2 — N-way JOIN + table aliasing (+ OUTER JOIN)
+## Phase 2 — N-way JOIN + table aliasing (+ OUTER JOIN) — DONE
 
 **Goal:** `SELECT e.name, d.name FROM employees e JOIN departments d ON
 e.dept_id = d.id JOIN salaries s ON s.emp_id = e.id` — chained joins with
@@ -197,6 +197,108 @@ unmatched rows appear once with the right-side columns empty/NULL rather
 than being silently dropped; compile-check; regression sweep against the
 existing Phase 20 two-table-join host test (should be a strict subset of
 this phase's new behavior, not a behavior change).
+
+### Scope correction made during implementation
+
+The original draft framed this as mostly a grammar/alias-map addition on
+top of Phase 20's existing two-table probe. Reading `exec_select_join()`
+directly showed that its actual join logic (`join_outer_cb()`, a single
+`mvcc_table_scan()` callback that both scanned table A and probed table B
+inline) was written specifically for exactly two tables and couldn't be
+parameterized to a third without restructuring — so this phase replaced it
+with a real left-to-right chain: the FROM table is materialized into a
+scratch buffer first, then each JOIN clause probes the new table once per
+row currently in that buffer, writing matches into a second scratch buffer
+that ping-pongs with the first across steps (`g_select_scratch`/
+`g_join_scratch_b`, both static, matching this file's existing "static
+scratch buffers, not stack locals" convention). The running combined
+`RowTableLayout` grows by one table's worth of qualified columns per step,
+so the same "bake the right names into a synthetic layout" trick Phase 20
+used for exactly two tables needed zero changes to work for any chain
+length — `predicate_eval()`/`find_column_index()`/`compare_rows_by_column()`
+are still completely join-chain-unaware.
+
+`SqlSelectStmt`'s old fixed `has_join`/`join_table`/`join_left_*`/
+`join_right_*` fields (sized for exactly one JOIN) were replaced with
+`join_count`/`joins[SQL_MAX_JOINS]` (a `struct SqlJoinClause` array) plus a
+`table_alias` field for the FROM table itself — a real struct-layout
+change, not additive, since the old fields had no room for a chain. Every
+consumer of those old field names (`sql_parser.c`, `sql_exec.c`) was
+updated together; nothing outside those two files touched them (confirmed
+by search before making the change), so this wasn't a breaking change to
+any external caller in practice.
+
+A real regression surfaced during verification, not by inspection: the
+first version of the generalized ON-clause resolution validated the
+"outer" side (the side referencing some table already earlier in the
+chain) with a single `find_column_index()` call against the running
+combined layout's flat qualified namespace. That collapses two genuinely
+different error conditions into one — "this qualifier doesn't name any
+table in the chain" (`SQL_ERR_JOIN_INVALID`) and "this qualifier is fine
+but that table has no such column" (`SQL_ERR_COLUMN_NOT_FOUND`) — because
+a nonexistent qualified name and a qualified name with a typo'd column
+both just fail to appear in the running layout's name list. The existing
+Phase 20 regression test (`sql_join_host_test.c`, kept unchanged as the
+backward-compatibility check) caught this immediately: its scenario 5
+"`ON clause column missing from its table fails cleanly
+(SQL_ERR_COLUMN_NOT_FOUND)`" check failed after the rewrite, reporting
+`SQL_ERR_JOIN_INVALID` instead. Fixed by tracking a small `chain[]` array
+of (display name → real per-table layout) pairs alongside the running
+combined layout, so the outer side can be validated in the same two
+separate steps Phase 20 originally used for its fixed pair: first "does
+this qualifier name a table in the chain at all," then "does that
+specific table's own real layout have this column" — restoring the
+original error distinction for chains of any length, not just two tables.
+
+Design decisions made explicit, matching this whole roadmap's "flag the
+limitation, don't silently pick a convention" posture:
+  - `SQL_MAX_JOINS = 3` (FROM + up to 3 JOINs = 4 tables total in one
+    statement) — a real, named ceiling, sized against
+    `ROWSTORE_MAX_COLUMNS = 16`'s own natural pressure rather than picked
+    arbitrarily.
+  - `AS` is optional, matching real SQL practice — a bare identifier
+    immediately after a table name is unambiguously an alias, since no
+    other production can start there (confirmed by enumerating every
+    token that can legally follow a FROM/JOIN table name — all keywords,
+    never a bare identifier).
+  - `LEFT JOIN` pads an unmatched row with a documented per-type sentinel
+    (`""`/`"0"`/`"false"`), not a real `NULL` — Phase 4 hasn't landed yet,
+    so this is the "documented interim sentinel" option the original
+    draft named as an alternative to blocking on Phase 4. Verified
+    directly in the new host test (a `LEFT JOIN` row's unmatched side
+    checked for the exact sentinel values, not just "doesn't crash").
+  - Once a table has an alias, only that alias may qualify it — never both
+    the alias and the real name in the same statement. This is what makes
+    a genuine self-join (`employees e1 JOIN employees e2 ON e1.mgr_id =
+    e2.id`) resolvable at all, and is exercised directly in the new host
+    test as its own scenario (a manager-lookup self-join), not just
+    asserted in prose.
+  - `RIGHT`/`FULL OUTER` JOIN remain out of scope, as originally planned.
+    `GROUP BY`/aggregates combined with any JOIN (not just a single one)
+    remains `SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED` — Phase 1's scope cut,
+    unchanged, now confirmed to still apply to the N-way case via a
+    dedicated regression check.
+
+**Verification — actual results:** `tests/sql_join2_phase2_host_test.c`
+(new, 30 checks) covers a 3-table aliased INNER JOIN chain; `LEFT JOIN`
+sentinel-padding for an unmatched row; a self-join via aliasing (manager
+lookup); `WHERE` applied once against the fully combined 3-table row;
+`ORDER BY DESC` + `LIMIT` on a joined chain result; the original Phase 20
+unaliased two-table syntax still parsing and executing unchanged; six
+error paths (unresolved ON qualifier, unknown joined table, combined
+column count exceeding `ROWSTORE_MAX_COLUMNS`, exceeding `SQL_MAX_JOINS`,
+`GROUP BY` + JOIN, permission denial through a chain); and parser-level
+checks (`LEFT OUTER JOIN` with `OUTER` as a no-op, implicit vs. explicit
+`AS` aliasing, multi-join `join_count`/alias capture). Full regression
+sweep (`tests/run_all.sh`): **29/29 host test files passing, 0 failed** —
+includes the new file, the original `sql_join_host_test.c` (24 checks,
+now correctly re-passing after the outer-side error-distinction fix
+above), and every other `sql_*_host_test.c`/`persist_rdbms_vecstore_host_test`
+file that links the modified `sql_parser.c`/`sql_exec.c`, all unchanged.
+`net/http.c` compile-checked clean against the updated `sql_exec.h`/
+`sql_parser.h` (same pre-existing, unrelated `-Wimplicit-function-
+declaration` warnings as Phase 1 — no errors, nothing touching the JOIN
+change surface).
 
 ---
 

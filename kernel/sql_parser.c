@@ -43,6 +43,7 @@ typedef enum {
     TOK_KW_DELETE,
     TOK_KW_JOIN, TOK_KW_ON,   // Phase 20
     TOK_KW_GROUP, TOK_KW_HAVING,   // Phase 1 (SQL Feature-Parity Roadmap)
+    TOK_KW_LEFT, TOK_KW_OUTER, TOK_KW_AS,   // Phase 2 (SQL Feature-Parity Roadmap)
     TOK_KW_TRUE, TOK_KW_FALSE,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
     TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
@@ -71,6 +72,7 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"DELETE", TOK_KW_DELETE},
     {"JOIN", TOK_KW_JOIN}, {"ON", TOK_KW_ON},
     {"GROUP", TOK_KW_GROUP}, {"HAVING", TOK_KW_HAVING},
+    {"LEFT", TOK_KW_LEFT}, {"OUTER", TOK_KW_OUTER}, {"AS", TOK_KW_AS},
     {"TRUE", TOK_KW_TRUE}, {"FALSE", TOK_KW_FALSE},
 };
 #define KEYWORD_COUNT (sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
@@ -245,6 +247,28 @@ static int split_qualified(const char* in, char* qualifier, uint32_t qmax, char*
     for (uint32_t i = dot + 1; in[i] && ci < cmax - 1; i++) col[ci++] = in[i];
     col[ci] = '\0';
     return 1;
+}
+
+// Phase 2 (SQL Feature-Parity Roadmap): parses an optional "[AS] ident"
+// alias following a table name in FROM/JOIN. AS is optional, matching real
+// SQL practice (see sql_parser.h) -- since no other production can start
+// with a bare identifier at this position (the only things that can follow
+// a FROM/JOIN table name are AS, JOIN, LEFT, WHERE, GROUP, HAVING, ORDER,
+// LIMIT, ';', or end of input -- all of which are keyword tokens, never
+// TOK_IDENT), a TOK_IDENT with no AS is unambiguously an alias, not
+// something needing a lookahead-and-rewind trick the way aggregate calls
+// did. alias_out[0] is left '\0' if no alias was given.
+static void parse_optional_alias(struct SqlParser* p, char* alias_out, uint32_t max) {
+    alias_out[0] = '\0';
+    if (p->cur.kind == TOK_KW_AS) {
+        advance(p);
+        if (p->cur.kind != TOK_IDENT) { set_error(p, "expected an alias name after AS"); return; }
+        sq_strcpy(alias_out, p->cur.text, max);
+        advance(p);
+    } else if (p->cur.kind == TOK_IDENT) {
+        sq_strcpy(alias_out, p->cur.text, max);
+        advance(p);
+    }
 }
 
 // ─── Phase 1 (SQL Feature-Parity Roadmap): aggregate function calls ────────
@@ -444,16 +468,40 @@ static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
     sq_strcpy(s->table_name, p->cur.text, OBJECT_NAME_LEN);
     advance(p);
 
-    // Phase 20: join_clause := JOIN ident ON column_ref '=' column_ref
-    // Both halves of the ON clause MUST be qualified ("table.column") --
-    // parse_column_ref() allows but doesn't require a qualifier in
-    // general, so that's enforced here specifically via split_qualified()
-    // rejecting an unqualified reference, not by the grammar rule itself.
-    if (p->cur.kind == TOK_KW_JOIN) {
-        advance(p);
+    // Phase 2 (SQL Feature-Parity Roadmap): the FROM table's own optional
+    // alias, parsed before any JOIN clauses -- see parse_optional_alias().
+    parse_optional_alias(p, s->table_alias, OBJECT_NAME_LEN);
+    if (p->error) return;
+
+    // Phase 20/Phase 2: join_clause := (JOIN | LEFT [OUTER] JOIN) ident
+    // [AS ident] ON column_ref '=' column_ref, repeated up to SQL_MAX_JOINS
+    // times (Phase 2 generalized Phase 20's single fixed JOIN into a real
+    // chain). Both halves of the ON clause MUST be qualified
+    // ("table.column" or "alias.column") -- parse_column_ref() allows but
+    // doesn't require a qualifier in general, so that's enforced here
+    // specifically via split_qualified() rejecting an unqualified
+    // reference, not by the grammar rule itself.
+    while (p->cur.kind == TOK_KW_JOIN || p->cur.kind == TOK_KW_LEFT) {
+        if (s->join_count >= SQL_MAX_JOINS) { set_error(p, "too many JOINs in one statement"); return; }
+        struct SqlJoinClause* jc = &s->joins[s->join_count];
+        jc->type = SQL_JOIN_INNER;
+        jc->alias[0] = '\0';
+
+        if (p->cur.kind == TOK_KW_LEFT) {
+            jc->type = SQL_JOIN_LEFT;
+            advance(p);
+            if (p->cur.kind == TOK_KW_OUTER) advance(p);   // "LEFT OUTER JOIN" -- OUTER is a no-op here
+            if (!expect(p, TOK_KW_JOIN, "expected JOIN after LEFT")) return;
+        } else {
+            advance(p);   // consume JOIN
+        }
+
         if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after JOIN"); return; }
-        sq_strcpy(s->join_table, p->cur.text, OBJECT_NAME_LEN);
+        sq_strcpy(jc->table, p->cur.text, OBJECT_NAME_LEN);
         advance(p);
+        parse_optional_alias(p, jc->alias, OBJECT_NAME_LEN);
+        if (p->error) return;
+
         if (!expect(p, TOK_KW_ON, "expected ON after JOIN table name")) return;
 
         char left[RECORD_KEY_LEN];
@@ -462,16 +510,17 @@ static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
         char right[RECORD_KEY_LEN];
         if (!parse_column_ref(p, right, RECORD_KEY_LEN)) return;
 
-        if (!split_qualified(left, s->join_left_qualifier, OBJECT_NAME_LEN, s->join_left_col, RECORD_KEY_LEN)) {
-            set_error(p, "ON clause's left side must be table.column");
+        if (!split_qualified(left, jc->on_left_qualifier, OBJECT_NAME_LEN, jc->on_left_col, RECORD_KEY_LEN)) {
+            set_error(p, "ON clause's left side must be table.column or alias.column");
             return;
         }
-        if (!split_qualified(right, s->join_right_qualifier, OBJECT_NAME_LEN, s->join_right_col, RECORD_KEY_LEN)) {
-            set_error(p, "ON clause's right side must be table.column");
+        if (!split_qualified(right, jc->on_right_qualifier, OBJECT_NAME_LEN, jc->on_right_col, RECORD_KEY_LEN)) {
+            set_error(p, "ON clause's right side must be table.column or alias.column");
             return;
         }
-        s->has_join = 1;
+        s->join_count++;
     }
+    s->has_join = (s->join_count > 0) ? 1 : 0;
 
     if (p->cur.kind == TOK_KW_WHERE) {
         advance(p);

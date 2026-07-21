@@ -15,8 +15,8 @@
  * planner/executor that actually runs a parsed statement.
  *
  * ─── Grammar (genuinely minimal, per the roadmap's own scope) ───────────────
- *   select_stmt := SELECT select_list FROM ident [join_clause] [WHERE predicate]
- *                  [GROUP BY column_ref] [HAVING having_predicate]
+ *   select_stmt := SELECT select_list FROM ident [AS ident] (join_clause)*
+ *                  [WHERE predicate] [GROUP BY column_ref] [HAVING having_predicate]
  *                  [ORDER BY select_item [ASC|DESC]] [LIMIT number] [;]
  *   select_list := '*' | select_item (',' select_item)*
  *   select_item := agg_call | column_ref
@@ -27,7 +27,12 @@
  *                  following '(' token, so an ordinary column literally
  *                  named "count" still parses fine as a plain column_ref as
  *                  long as it isn't itself followed by '('.
- *   join_clause := JOIN ident ON column_ref '=' column_ref
+ *   join_clause := (JOIN | LEFT [OUTER] JOIN) ident [AS ident]
+ *                  ON column_ref '=' column_ref
+ *                  -- SQL Feature-Parity Roadmap Phase 2: repeatable (up to
+ *                  SQL_MAX_JOINS times, chaining left to right) and
+ *                  aliasable; AS is optional, matching real SQL practice
+ *                  (see the Phase 2 note below).
  *   having_predicate := same grammar as `predicate` below, except each
  *                  comparison's left-hand side is a select_item (agg_call or
  *                  column_ref), not a bare column_ref -- see the SQL
@@ -46,7 +51,13 @@
  *                                            required in the ON clause,
  *                                            since bare column names in a
  *                                            joined result are ambiguous by
- *                                            construction -- see sql_exec.h)
+ *                                            construction -- see sql_exec.h).
+ *                                            Phase 2: the qualifier may be
+ *                                            either the table's real name or
+ *                                            its alias if one was given via
+ *                                            AS -- exactly as written, never
+ *                                            both at once (see the Phase 2
+ *                                            note below).
  *   literal     := number | 'string' | TRUE | FALSE
  *
  * `predicate` has no explicit parenthesized grouping in this first cut —
@@ -58,23 +69,23 @@
  * a `struct Predicate` (predicate.h, Phase 18) via its own add_comparison/
  * add_and/add_or primitives — no second expression-tree type invented.
  *
- * Phase 20's JOIN is deliberately narrow: exactly two tables (`FROM A JOIN
- * B ON ...`, no chaining a second JOIN onto the result), INNER JOIN only
- * (no LEFT/RIGHT/FULL OUTER), and no table aliasing -- ON/SELECT-list/
- * WHERE/ORDER BY column qualifiers must be the tables' own full names
- * (`employees.id`, not `e.id`). A `column_ref` is always allowed to be
- * qualified (`table.column`) even outside a JOIN, for grammar uniformity,
- * though a non-join query has no ambiguity to resolve and a bare name is
- * the normal case there.
+ * Phase 20's JOIN was originally narrower still: exactly two tables (`FROM
+ * A JOIN B ON ...`, no chaining), INNER JOIN only, no table aliasing --
+ * ON/SELECT-list/WHERE/ORDER BY column qualifiers had to be the tables' own
+ * full names (`employees.id`, not `e.id`). SQL Feature-Parity Roadmap
+ * Phase 2 (below) promoted three-or-more-table chaining, LEFT JOIN, and
+ * table aliasing out of that original scope list. A `column_ref` is always
+ * allowed to be qualified (`table.column`) even outside a JOIN, for grammar
+ * uniformity, though a non-join query has no ambiguity to resolve and a
+ * bare name is the normal case there.
  *
- * Explicitly out of scope, per the roadmap: three-or-more-table joins,
- * OUTER JOIN, join reordering, hash/merge join, subqueries, views,
+ * Explicitly out of scope, per the roadmap: RIGHT/FULL OUTER JOIN (Phase 2
+ * added LEFT only), join reordering, hash/merge join, subqueries, views,
  * arithmetic expressions, string functions, LIKE, IN lists, parenthesized
- * WHERE grouping (above), table aliasing (above). INSERT requires an
- * explicit column list covering every one of the table's columns (no
- * partial-row/NULL/default support yet — every value must be supplied,
- * matching rowstore_row_insert()'s own existing all-columns-required
- * contract).
+ * WHERE grouping (above). INSERT requires an explicit column list covering
+ * every one of the table's columns (no partial-row/NULL/default support
+ * yet — every value must be supplied, matching rowstore_row_insert()'s own
+ * existing all-columns-required contract).
  *
  * ─── SQL Feature-Parity Roadmap Phase 1: GROUP BY / HAVING / aggregates ────
  * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) GROUP BY is no longer
@@ -124,6 +135,50 @@
  * time — so no predicate.h changes were needed at all. A HAVING clause
  * referencing a column/aggregate that isn't in the SELECT list is a query
  * error (SQL_ERR_COLUMN_NOT_FOUND), not silently-always-false.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 2: N-way JOIN + aliasing + LEFT JOIN ──
+ * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) Generalizes Phase 20's
+ * exactly-two-tables, no-alias, INNER-only JOIN into a real chain, reusing
+ * every one of Phase 20's own ideas rather than replacing them — see
+ * sql_exec.h's header comment for the executor-side generalization (the
+ * "bake qualified names into a synthetic query-time layout" trick still
+ * needs zero changes to predicate_eval()/find_column_index()/
+ * compare_rows_by_column(), just a running layout that grows one table at a
+ * time instead of being built once for exactly two tables).
+ *
+ *   - Up to SQL_MAX_JOINS chained JOIN clauses (SQL_MAX_JOINS + 1 tables
+ *     total in one statement) — a real, named ceiling, not unlimited
+ *     chaining, sized against ROWSTORE_MAX_COLUMNS=16's own natural
+ *     pressure (a handful of narrow tables already saturates it).
+ *   - AS is optional (`FROM employees e` and `FROM employees AS e` both
+ *     parse identically) — matching real SQL practice. JOIN/LEFT/OUTER/AS
+ *     are now reserved keywords (a table or column literally named one of
+ *     these would break), the same kind of small, named regression risk
+ *     Phase 20 already accepted for JOIN/ON.
+ *   - Once a table has an alias, every qualifier referencing it throughout
+ *     the statement (SELECT list, ON, WHERE, ORDER BY) must use that
+ *     alias, not the real table name — never both at once. This is what
+ *     makes a genuine self-join (`FROM employees e1 JOIN employees e2 ON
+ *     e1.mgr_id = e2.id`) resolvable at all: without an alias, the same
+ *     physical table appearing twice would produce colliding qualified
+ *     column names in the combined layout with no way to disambiguate —
+ *     not specially detected or rejected here (a real, un-guarded edge
+ *     case, matching this whole roadmap's "smallest real version first"
+ *     posture), just naturally avoided by always aliasing a self-join, the
+ *     only sane way to write one anyway.
+ *   - LEFT JOIN pads an unmatched right-side row with a documented
+ *     per-type sentinel value (empty string / "0" / "false") rather than a
+ *     real NULL, since real NULL doesn't exist yet (SQL Feature-Parity
+ *     Roadmap Phase 4). Named explicitly here, not silently picked —
+ *     revisit once Phase 4 lands. RIGHT/FULL OUTER JOIN are not
+ *     implemented at all (see the out-of-scope list above).
+ *   - GROUP BY/aggregates combined with ANY JOIN (not just a single one)
+ *     remains SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED — Phase 1's scope cut,
+ *     unchanged, just now covering the general N-way case too.
+ *   - WHERE filtering still happens once, after the ENTIRE chain is
+ *     combined, against the fully joined row — no per-step predicate
+ *     pushdown, the same named non-goal Phase 20 already carried forward
+ *     unchanged from a two-table chain to an N-table one.
  */
 #ifndef SQL_PARSER_H
 #define SQL_PARSER_H
@@ -157,21 +212,49 @@ typedef enum {
     SQL_AGG_MAX,
 } SqlAggFunc;
 
+// Phase 2 (SQL Feature-Parity Roadmap): which JOIN kind a join_clause uses.
+// SQL_JOIN_INNER is the default (matches Phase 20's original INNER-only
+// behavior byte-for-byte when no LEFT keyword is written); SQL_JOIN_LEFT
+// pads an unmatched right-side row with a documented interim sentinel (see
+// sql_exec.c's fill_join_sentinel()) since there's no real NULL yet.
+typedef enum {
+    SQL_JOIN_INNER = 0,
+    SQL_JOIN_LEFT,
+} SqlJoinType;
+
+#define SQL_MAX_JOINS 3   // FROM + up to 3 JOINs = 4 tables total in one
+                          // statement -- a real, named ceiling (see the
+                          // Phase 2 header note above for why this size).
+
+// One link in a JOIN chain -- table/alias plus the ON clause's two
+// "qualifier.column" halves exactly as written (in whatever order the user
+// wrote them); the executor resolves which one refers to the newly joined
+// table vs. some table already earlier in the chain -- see sql_exec.h's
+// header comment for why parsing doesn't try to.
+struct SqlJoinClause {
+    SqlJoinType type;
+    char        table[OBJECT_NAME_LEN];
+    char        alias[OBJECT_NAME_LEN];              // empty string if no alias was given
+    char        on_left_qualifier[OBJECT_NAME_LEN];
+    char        on_left_col[RECORD_KEY_LEN];
+    char        on_right_qualifier[OBJECT_NAME_LEN];
+    char        on_right_col[RECORD_KEY_LEN];
+};
+
 struct SqlSelectStmt {
     char     table_name[OBJECT_NAME_LEN];
 
-    // ── Phase 20: JOIN (zero-default -- has_join==0 keeps every Phase 19
-    // query's behavior identical to before this phase). join_left_*/
-    // join_right_* hold the ON clause's two "qualifier.column" halves
-    // exactly as written (in whatever order the user wrote them); the
-    // executor resolves which one refers to table_name vs. join_table --
-    // see sql_exec.h's header comment for why parsing doesn't try to. ─────
-    uint8_t  has_join;
-    char     join_table[OBJECT_NAME_LEN];
-    char     join_left_qualifier[OBJECT_NAME_LEN];
-    char     join_left_col[RECORD_KEY_LEN];
-    char     join_right_qualifier[OBJECT_NAME_LEN];
-    char     join_right_col[RECORD_KEY_LEN];
+    // ── Phase 20/Phase 2 (SQL Feature-Parity Roadmap): JOIN (zero-default --
+    // has_join==0 keeps every non-JOIN query's behavior identical to before
+    // either phase). table_alias is the FROM table's own optional alias;
+    // joins[0..join_count) is the chain of JOIN clauses that follow it, in
+    // the order written. Phase 2 generalized Phase 20's fixed "exactly one
+    // JOIN, no alias" fields into this repeatable, aliasable form -- see
+    // sql_exec.h's header comment for the executor-side generalization. ────
+    uint8_t  has_join;                         // 1 iff join_count > 0
+    char     table_alias[OBJECT_NAME_LEN];     // alias for the FROM table itself, empty if none
+    uint32_t join_count;
+    struct SqlJoinClause joins[SQL_MAX_JOINS];
 
     uint8_t  select_all;                                       // '*'
     char     columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];     // meaningful iff !select_all; may be

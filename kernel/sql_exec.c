@@ -428,7 +428,8 @@ static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSe
     }
 }
 
-// ─── Phase 20: two-table JOIN ────────────────────────────────────────────
+// ─── Phase 20/Phase 2 (SQL Feature-Parity Roadmap): N-way JOIN + aliasing +
+// LEFT JOIN -- see sql_exec.h's header comment for the full design writeup.
 static void build_qualified_name(char* out, uint32_t max, const char* table, const char* col) {
     uint32_t i = 0;
     for (; table[i] && i < max - 1; i++) out[i] = table[i];
@@ -437,179 +438,314 @@ static void build_qualified_name(char* out, uint32_t max, const char* table, con
     out[i] = '\0';
 }
 
-// The ON clause's temporary single-comparison probe predicate (built once
-// per outer row of A, inside join_outer_cb below) is a struct Predicate --
-// several KB (32 nodes x a 256-byte literal each), same sizing concern as
-// g_stmt_scratch above. Reused/reinitialized per call via predicate_init(),
-// safe since execution is single-threaded/non-reentrant throughout this
-// file already (see the notes above).
-static struct Predicate g_join_probe_pred;
+// A table's qualifying identity throughout a statement: its alias if AS
+// gave it one, else its own real name -- Phase 20's original "qualifier
+// must be the table's own name" rule, generalized by one word.
+static const char* join_display_name(const char* table, const char* alias) {
+    return alias[0] ? alias : table;
+}
 
-struct join_ctx {
-    uint64_t                     txn_id;
-    uint32_t                     caller_uid;
-    const char*                  table_b_name;
-    uint32_t                     join_col_a;
-    uint32_t                     join_col_b;
-    const struct RowTableLayout* layout_a;
-    const struct RowTableLayout* layout_b;
-    const struct RowTableLayout* combined_layout;
-    const struct Predicate*      where;   // NULL if no WHERE clause
-    uint32_t                     count;   // total combined rows matched so far (may exceed CURSOR_MAX_ROWSET_ROWS)
-};
-
-// Called once per row of table A (the outer loop). Probes table B for
-// matching rows using the SAME mvcc_find_matching_rows() the single-table
-// path uses. Phase 22 note: since that planner no longer takes an
-// index-assisted short cut under MVCC routing (see sql_exec.h's header
-// comment), the join probe is now always a full, snapshot-consistent scan
-// of B per outer row too -- "indexed nested-loop join for free" no longer
-// applies once a query runs through a real transaction. Correctness is
-// unaffected; only this join's algorithmic complexity regressed, a real,
-// named consequence of this phase, not a silent one.
-static void join_outer_cb(struct MvccRowId id_a, const struct RowValues* row_a, void* ctxp) {
-    (void)id_a;
-    struct join_ctx* ctx = (struct join_ctx*)ctxp;
-
-    predicate_init(&g_join_probe_pred);
-    uint32_t probe_root = predicate_add_comparison(&g_join_probe_pred,
-        ctx->layout_b->column_names[ctx->join_col_b], PRED_OP_EQ, row_a->values[ctx->join_col_a]);
-    if (probe_root == PREDICATE_INVALID_NODE) return;   // shouldn't happen (one fresh node), fail closed if it ever does
-    g_join_probe_pred.root = probe_root;
-
-    struct MvccRowId matches[CURSOR_MAX_ROWSET_ROWS];
-    uint32_t total_b = mvcc_find_matching_rows(ctx->txn_id, ctx->caller_uid, ctx->table_b_name,
-                                               &g_join_probe_pred, ctx->layout_b, matches, CURSOR_MAX_ROWSET_ROWS);
-    uint32_t take_b = total_b < CURSOR_MAX_ROWSET_ROWS ? total_b : CURSOR_MAX_ROWSET_ROWS;
-
-    for (uint32_t i = 0; i < take_b; i++) {
-        struct RowValues row_b;
-        if (mvcc_row_get(ctx->txn_id, ctx->caller_uid, ctx->table_b_name, matches[i], &row_b) != MVCC_OK) continue;
-
-        struct RowValues combined;
-        se_memset(&combined, 0, sizeof(combined));
-        combined.count = ctx->combined_layout->column_count;
-        for (uint32_t c = 0; c < ctx->layout_a->column_count; c++)
-            se_strcpy(combined.values[c], row_a->values[c], RECORD_VAL_LEN);
-        for (uint32_t c = 0; c < ctx->layout_b->column_count; c++)
-            se_strcpy(combined.values[ctx->layout_a->column_count + c], row_b.values[c], RECORD_VAL_LEN);
-
-        if (ctx->where && !predicate_eval(ctx->where, ctx->combined_layout, &combined)) continue;
-
-        if (ctx->count < CURSOR_MAX_ROWSET_ROWS) g_select_scratch[ctx->count] = combined;
-        ctx->count++;
+// Phase 2: LEFT JOIN, no real NULL yet (SQL Feature-Parity Roadmap Phase 4
+// hasn't landed) -- an unmatched right-side row is padded with a
+// documented per-type sentinel value rather than blocking this phase on
+// Phase 4. NOT a real NULL: a STRING sentinel ("") is indistinguishable
+// from a genuine empty string, UINT64/FLOAT ("0") from a genuine zero,
+// BOOL ("false") from a genuine false -- named here explicitly, matching
+// this whole roadmap's "flag the limitation, don't silently pick a
+// convention" posture (the same honesty Phase 1 applied to COUNT(col) vs
+// COUNT(*)). Revisit once Phase 4 gives this something real to fill with.
+static void fill_join_sentinel(struct RowValues* row, uint32_t start, const struct RowTableLayout* seg) {
+    for (uint32_t i = 0; i < seg->column_count; i++) {
+        const char* sentinel;
+        switch (seg->column_types[i]) {
+            case FIELD_TYPE_UINT64: sentinel = "0";     break;
+            case FIELD_TYPE_FLOAT:  sentinel = "0";     break;
+            case FIELD_TYPE_BOOL:   sentinel = "false"; break;
+            case FIELD_TYPE_STRING:
+            default:                sentinel = "";      break;
+        }
+        se_strcpy(row->values[start + i], sentinel, RECORD_VAL_LEN);
     }
 }
 
+// The ON clause's temporary single-comparison probe predicate (built once
+// per outer row, per JOIN step) is a struct Predicate -- several KB (32
+// nodes x a 256-byte literal each), same sizing concern as g_stmt_scratch
+// above. Reused/reinitialized per call via predicate_init(), safe since
+// execution is single-threaded/non-reentrant throughout this file already
+// (see the notes above).
+static struct Predicate g_join_probe_pred;
+
+// Phase 2: the chain's second scratch buffer -- ping-pongs against
+// g_select_scratch across JOIN steps (step 0 reads the FROM table's rows
+// out of g_select_scratch and writes into this one, step 1 reads this one
+// and writes back into g_select_scratch, and so on), so no step ever reads
+// and writes the same buffer at once. Static for the same reason every
+// other per-query scratch buffer in this file is (see the notes above).
+static struct RowValues g_join_scratch_b[CURSOR_MAX_ROWSET_ROWS];
+
+struct join_from_collect_ctx {
+    struct RowValues* out;
+    uint32_t           count;   // total rows scanned so far (may exceed CURSOR_MAX_ROWSET_ROWS)
+    uint32_t           max;
+};
+static void join_from_collect_cb(struct MvccRowId id, const struct RowValues* values, void* ctxp) {
+    (void)id;
+    struct join_from_collect_ctx* ctx = (struct join_from_collect_ctx*)ctxp;
+    if (ctx->count < ctx->max) ctx->out[ctx->count] = *values;
+    ctx->count++;
+}
+
 static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
-    int tidx_a = find_table_catalog_index(s->table_name);
-    if (tidx_a < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "left table not found", SQL_ERR_MSG_LEN); return; }
-    int tidx_b = find_table_catalog_index(s->join_table);
-    if (tidx_b < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "joined table not found", SQL_ERR_MSG_LEN); return; }
+    int tidx0 = find_table_catalog_index(s->table_name);
+    if (tidx0 < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "FROM table not found", SQL_ERR_MSG_LEN); return; }
+    const struct RowTableLayout* layout0 = &table_headers[tidx0].layout;
+    const char* disp0 = join_display_name(s->table_name, s->table_alias);
 
-    const struct RowTableLayout* layout_a = &table_headers[tidx_a].layout;
-    const struct RowTableLayout* layout_b = &table_headers[tidx_b].layout;
-
-    if (layout_a->column_count + layout_b->column_count > ROWSTORE_MAX_COLUMNS) {
-        out->error = SQL_ERR_JOIN_TOO_WIDE;
-        se_strcpy(out->error_msg, "joined tables have too many combined columns", SQL_ERR_MSG_LEN);
-        return;
+    // Running combined layout, grown by one table's worth of qualified
+    // columns per JOIN step -- starts as just the FROM table's own columns,
+    // qualified by its display name (alias if given, else its real name).
+    struct RowTableLayout running;
+    se_memset(&running, 0, sizeof(running));
+    running.column_count = layout0->column_count;
+    for (uint32_t c = 0; c < layout0->column_count; c++) {
+        build_qualified_name(running.column_names[c], RECORD_KEY_LEN, disp0, layout0->column_names[c]);
+        running.column_types[c] = layout0->column_types[c];
     }
 
-    // Resolve the ON clause's two "qualifier.column" halves to A/B -- the
-    // parser captured them in whichever order the user wrote them (see
-    // sql_parser.h), so this accepts either "A.x = B.y" or "B.y = A.x".
-    int a_is_left;
-    if (se_streq(s->join_left_qualifier, s->table_name) && se_streq(s->join_right_qualifier, s->join_table)) {
-        a_is_left = 1;
-    } else if (se_streq(s->join_left_qualifier, s->join_table) && se_streq(s->join_right_qualifier, s->table_name)) {
-        a_is_left = 0;
-    } else {
-        out->error = SQL_ERR_JOIN_INVALID;
-        se_strcpy(out->error_msg, "ON clause qualifiers don't match the two joined tables", SQL_ERR_MSG_LEN);
-        return;
-    }
-    const char* col_a_name = a_is_left ? s->join_left_col : s->join_right_col;
-    const char* col_b_name = a_is_left ? s->join_right_col : s->join_left_col;
-    uint32_t join_col_a = find_column_index(layout_a, col_a_name);
-    uint32_t join_col_b = find_column_index(layout_b, col_b_name);
-    if (join_col_a == 0xFFFFFFFFu || join_col_b == 0xFFFFFFFFu) {
-        out->error = SQL_ERR_COLUMN_NOT_FOUND;
-        se_strcpy(out->error_msg, "ON clause column not found in the corresponding table", SQL_ERR_MSG_LEN);
-        return;
+    // Tracks each table's display name -> real (unqualified) layout, in
+    // chain order, so an ON clause's "outer" side (referencing some earlier
+    // table) can be validated in the same TWO separate steps Phase 20
+    // originally used for its fixed pair: first "does this qualifier name a
+    // table in the chain at all" (SQL_ERR_JOIN_INVALID if not), then "does
+    // that table actually have this column" (SQL_ERR_COLUMN_NOT_FOUND if
+    // not). Collapsing these into a single find_column_index() against
+    // `running`'s own flat qualified namespace would misreport a
+    // wrong-column-name typo as an unresolved-qualifier error instead -- a
+    // real distinction worth keeping, caught by the Phase 20 regression
+    // test still needing to pass unchanged after this generalization.
+    struct join_chain_entry { const char* display; const struct RowTableLayout* layout; };
+    struct join_chain_entry chain[SQL_MAX_JOINS + 1];
+    uint32_t chain_count = 1;
+    chain[0].display = disp0;
+    chain[0].layout  = layout0;
+
+    // Step 0: materialize the FROM table's own rows into buffer A
+    // (g_select_scratch) via a plain snapshot-consistent scan -- no WHERE
+    // pushdown here either, matching every JOIN step's own "WHERE applies
+    // once, at the very end" rule (see sql_exec.h).
+    struct RowValues* cur = g_select_scratch;
+    struct RowValues* nxt = g_join_scratch_b;
+    struct join_from_collect_ctx fc;
+    fc.out = cur; fc.count = 0; fc.max = CURSOR_MAX_ROWSET_ROWS;
+    mvcc_table_scan(txn_id, caller_uid, s->table_name, join_from_collect_cb, &fc);
+    uint32_t cur_n = fc.count < CURSOR_MAX_ROWSET_ROWS ? fc.count : CURSOR_MAX_ROWSET_ROWS;
+    uint8_t truncated = (fc.count > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
+
+    for (uint32_t ji = 0; ji < s->join_count; ji++) {
+        const struct SqlJoinClause* jc = &s->joins[ji];
+
+        int tidx = find_table_catalog_index(jc->table);
+        if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "joined table not found", SQL_ERR_MSG_LEN); return; }
+        const struct RowTableLayout* layout_new = &table_headers[tidx].layout;
+        const char* disp_new = join_display_name(jc->table, jc->alias);
+
+        if (running.column_count + layout_new->column_count > ROWSTORE_MAX_COLUMNS) {
+            out->error = SQL_ERR_JOIN_TOO_WIDE;
+            se_strcpy(out->error_msg, "joined tables have too many combined columns", SQL_ERR_MSG_LEN);
+            return;
+        }
+
+        // Resolve the ON clause's two "qualifier.column" halves: one side
+        // must be this NEW table's own display name (its own column), the
+        // other side must resolve against `running` -- the accumulated set
+        // of every table already earlier in the chain. This generalizes
+        // Phase 20's original "matches exactly one of the two known table
+        // names" check from a fixed pair to however many display names
+        // have accumulated so far, with zero new resolution machinery:
+        // `running`'s own column_names[] already IS that accumulated
+        // qualifier set.
+        int new_is_left;
+        if (se_streq(jc->on_left_qualifier, disp_new)) {
+            new_is_left = 1;
+        } else if (se_streq(jc->on_right_qualifier, disp_new)) {
+            new_is_left = 0;
+        } else {
+            out->error = SQL_ERR_JOIN_INVALID;
+            se_strcpy(out->error_msg, "ON clause does not reference the newly joined table (use its alias if it has one)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        const char* new_col_name    = new_is_left ? jc->on_left_col : jc->on_right_col;
+        const char* outer_qualifier = new_is_left ? jc->on_right_qualifier : jc->on_left_qualifier;
+        const char* outer_col_name  = new_is_left ? jc->on_right_col : jc->on_left_col;
+
+        uint32_t new_col = find_column_index(layout_new, new_col_name);
+        if (new_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ON clause column not found in the joined table", SQL_ERR_MSG_LEN);
+            return;
+        }
+
+        // Two-phase check on the outer side, matching the new side's own
+        // shape above: first find WHICH earlier table outer_qualifier
+        // names (SQL_ERR_JOIN_INVALID if none), then check that table's
+        // OWN real layout for outer_col_name (SQL_ERR_COLUMN_NOT_FOUND if
+        // absent) -- see the chain[] comment above for why this can't just
+        // be one find_column_index() call against `running`.
+        const struct RowTableLayout* outer_layout = 0;
+        for (uint32_t ct = 0; ct < chain_count; ct++) {
+            if (se_streq(chain[ct].display, outer_qualifier)) { outer_layout = chain[ct].layout; break; }
+        }
+        if (!outer_layout) {
+            out->error = SQL_ERR_JOIN_INVALID;
+            se_strcpy(out->error_msg, "ON clause's other side does not resolve to a table already in the FROM/JOIN chain", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (find_column_index(outer_layout, outer_col_name) == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ON clause column not found in the corresponding table", SQL_ERR_MSG_LEN);
+            return;
+        }
+        char outer_qualified[RECORD_KEY_LEN];
+        build_qualified_name(outer_qualified, RECORD_KEY_LEN, outer_qualifier, outer_col_name);
+        uint32_t outer_col = find_column_index(&running, outer_qualified);
+        // outer_col is now guaranteed found: outer_qualifier matched a known
+        // chain table above and outer_col_name exists in that table's real
+        // layout, so running's qualified name for it must be present too.
+
+        // Build this step's new running layout up front: every column
+        // `running` already had, then the new table's own columns
+        // qualified by its display name -- same "query-time-only
+        // construct, never persisted or paged" property every layout in
+        // this file has (see the Phase 20 note above).
+        struct RowTableLayout next_layout;
+        se_memset(&next_layout, 0, sizeof(next_layout));
+        next_layout.column_count = running.column_count + layout_new->column_count;
+        for (uint32_t c = 0; c < running.column_count; c++) {
+            se_strcpy(next_layout.column_names[c], running.column_names[c], RECORD_KEY_LEN);
+            next_layout.column_types[c] = running.column_types[c];
+        }
+        for (uint32_t c = 0; c < layout_new->column_count; c++) {
+            build_qualified_name(next_layout.column_names[running.column_count + c], RECORD_KEY_LEN, disp_new, layout_new->column_names[c]);
+            next_layout.column_types[running.column_count + c] = layout_new->column_types[c];
+        }
+
+        // Nested-loop probe: for every row accumulated so far, find the new
+        // table's matching row(s) via the SAME mvcc_find_matching_rows()
+        // every other path uses (Phase 22 note: no index-assisted short cut
+        // survives MVCC routing here either -- see sql_exec.h). A LEFT JOIN
+        // with zero matches still emits the outer row once, right side
+        // sentinel-filled; an INNER JOIN with zero matches drops it, same
+        // as Phase 20's original behavior.
+        uint32_t next_n = 0;
+        for (uint32_t r = 0; r < cur_n; r++) {
+            predicate_init(&g_join_probe_pred);
+            uint32_t probe_root = predicate_add_comparison(&g_join_probe_pred,
+                layout_new->column_names[new_col], PRED_OP_EQ, cur[r].values[outer_col]);
+
+            struct MvccRowId matches[CURSOR_MAX_ROWSET_ROWS];
+            uint32_t take_m = 0;
+            if (probe_root != PREDICATE_INVALID_NODE) {   // shouldn't happen (one fresh node), fail closed if it ever does
+                g_join_probe_pred.root = probe_root;
+                uint32_t total_m = mvcc_find_matching_rows(txn_id, caller_uid, jc->table,
+                                                            &g_join_probe_pred, layout_new, matches, CURSOR_MAX_ROWSET_ROWS);
+                take_m = total_m < CURSOR_MAX_ROWSET_ROWS ? total_m : CURSOR_MAX_ROWSET_ROWS;
+            }
+
+            if (take_m == 0) {
+                if (jc->type == SQL_JOIN_LEFT) {
+                    struct RowValues combined;
+                    se_memset(&combined, 0, sizeof(combined));
+                    combined.count = next_layout.column_count;
+                    for (uint32_t c = 0; c < running.column_count; c++)
+                        se_strcpy(combined.values[c], cur[r].values[c], RECORD_VAL_LEN);
+                    fill_join_sentinel(&combined, running.column_count, layout_new);
+                    if (next_n < CURSOR_MAX_ROWSET_ROWS) nxt[next_n] = combined;
+                    next_n++;
+                }
+                continue;
+            }
+            for (uint32_t m = 0; m < take_m; m++) {
+                struct RowValues row_new;
+                if (mvcc_row_get(txn_id, caller_uid, jc->table, matches[m], &row_new) != MVCC_OK) continue;
+
+                struct RowValues combined;
+                se_memset(&combined, 0, sizeof(combined));
+                combined.count = next_layout.column_count;
+                for (uint32_t c = 0; c < running.column_count; c++)
+                    se_strcpy(combined.values[c], cur[r].values[c], RECORD_VAL_LEN);
+                for (uint32_t c = 0; c < layout_new->column_count; c++)
+                    se_strcpy(combined.values[running.column_count + c], row_new.values[c], RECORD_VAL_LEN);
+
+                if (next_n < CURSOR_MAX_ROWSET_ROWS) nxt[next_n] = combined;
+                next_n++;
+            }
+        }
+        if (next_n > CURSOR_MAX_ROWSET_ROWS) truncated = 1;
+
+        struct RowValues* tmp = cur; cur = nxt; nxt = tmp;   // ping-pong buffers
+        cur_n = next_n < CURSOR_MAX_ROWSET_ROWS ? next_n : CURSOR_MAX_ROWSET_ROWS;
+        running = next_layout;
+
+        chain[chain_count].display = disp_new;
+        chain[chain_count].layout  = layout_new;
+        chain_count++;
     }
 
-    // Build the combined synthetic layout: every column from A then every
-    // column from B, renamed "tablename.column". row_width/rows_per_page
-    // are left zero -- this layout is a query-time-only construct (never
-    // persisted or paged), and neither field is read by any of
-    // predicate_eval()/find_column_index()/compare_rows_by_column(), the
-    // only consumers of a layout in this file.
-    struct RowTableLayout combined;
-    se_memset(&combined, 0, sizeof(combined));
-    combined.column_count = layout_a->column_count + layout_b->column_count;
-    for (uint32_t c = 0; c < layout_a->column_count; c++) {
-        build_qualified_name(combined.column_names[c], RECORD_KEY_LEN, s->table_name, layout_a->column_names[c]);
-        combined.column_types[c] = layout_a->column_types[c];
-    }
-    for (uint32_t c = 0; c < layout_b->column_count; c++) {
-        build_qualified_name(combined.column_names[layout_a->column_count + c], RECORD_KEY_LEN, s->join_table, layout_b->column_names[c]);
-        combined.column_types[layout_a->column_count + c] = layout_b->column_types[c];
+    // Every downstream step (WHERE filtering, ORDER BY's insertion sort,
+    // cursor_open_rowset()) operates on g_select_scratch by this file's own
+    // established convention -- copy back if the chain's final buffer
+    // landed in g_join_scratch_b instead (an even vs. odd number of JOIN
+    // steps).
+    if (cur != g_select_scratch) {
+        for (uint32_t i = 0; i < cur_n; i++) g_select_scratch[i] = cur[i];
+        cur = g_select_scratch;
     }
 
     if (!s->select_all) {
         for (uint32_t i = 0; i < s->column_count; i++) {
-            if (find_column_index(&combined, s->columns[i]) == 0xFFFFFFFFu) {
+            if (find_column_index(&running, s->columns[i]) == 0xFFFFFFFFu) {
                 out->error = SQL_ERR_COLUMN_NOT_FOUND;
-                se_strcpy(out->error_msg, "SELECT column not found in the joined result (use table.column)", SQL_ERR_MSG_LEN);
+                se_strcpy(out->error_msg, "SELECT column not found in the joined result (use table.column or alias.column)", SQL_ERR_MSG_LEN);
                 return;
             }
         }
     }
     uint32_t order_col = 0xFFFFFFFFu;
     if (s->has_order_by) {
-        order_col = find_column_index(&combined, s->order_by);
+        order_col = find_column_index(&running, s->order_by);
         if (order_col == 0xFFFFFFFFu) {
             out->error = SQL_ERR_COLUMN_NOT_FOUND;
-            se_strcpy(out->error_msg, "ORDER BY column not found in the joined result (use table.column)", SQL_ERR_MSG_LEN);
+            se_strcpy(out->error_msg, "ORDER BY column not found in the joined result (use table.column or alias.column)", SQL_ERR_MSG_LEN);
             return;
         }
     }
-    if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, &combined)) {
+    if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, &running)) {
         out->error = SQL_ERR_COLUMN_NOT_FOUND;
-        se_strcpy(out->error_msg, "WHERE clause references an unknown column (use table.column)", SQL_ERR_MSG_LEN);
+        se_strcpy(out->error_msg, "WHERE clause references an unknown column (use table.column or alias.column)", SQL_ERR_MSG_LEN);
         return;
     }
 
-    struct join_ctx ctx;
-    ctx.txn_id            = txn_id;
-    ctx.caller_uid        = caller_uid;
-    ctx.table_b_name      = s->join_table;
-    ctx.join_col_a       = join_col_a;
-    ctx.join_col_b       = join_col_b;
-    ctx.layout_a         = layout_a;
-    ctx.layout_b         = layout_b;
-    ctx.combined_layout  = &combined;
-    ctx.where            = s->has_where ? &s->where : NULL;
-    ctx.count            = 0;
-
-    // Nested-loop join: A is always the outer scan (the FROM table, no
-    // cost-based side selection -- see sql_exec.h). No WHERE pushdown into
-    // either side's scan before joining -- a real, named non-goal (query-
-    // optimizer territory, out of scope per this roadmap's own Phase 25
-    // framing), not an oversight. Phase 22: the outer scan is now
-    // snapshot-consistent (mvcc_table_scan()), not a raw physical scan.
-    mvcc_table_scan(txn_id, caller_uid, s->table_name, join_outer_cb, &ctx);
-
-    uint32_t n = ctx.count < CURSOR_MAX_ROWSET_ROWS ? ctx.count : CURSOR_MAX_ROWSET_ROWS;
-    out->truncated = (ctx.count > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
+    // WHERE filtering happens exactly once, here, against the FULLY
+    // combined chain -- not per JOIN step. No predicate pushdown, the same
+    // named non-goal Phase 20 already carried (see sql_exec.h).
+    if (s->has_where) {
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < cur_n; i++) {
+            if (predicate_eval(&s->where, &running, &g_select_scratch[i])) {
+                if (kept != i) g_select_scratch[kept] = g_select_scratch[i];
+                kept++;
+            }
+        }
+        cur_n = kept;
+    }
 
     if (s->has_order_by) {
-        for (uint32_t i = 1; i < n; i++) {
+        for (uint32_t i = 1; i < cur_n; i++) {
             struct RowValues key = g_select_scratch[i];
             int j = (int)i - 1;
             while (j >= 0) {
-                int cmp = compare_rows_by_column(&combined, order_col, &g_select_scratch[j], &key);
+                int cmp = compare_rows_by_column(&running, order_col, &g_select_scratch[j], &key);
                 int should_move = s->order_desc ? (cmp < 0) : (cmp > 0);
                 if (!should_move) break;
                 g_select_scratch[j + 1] = g_select_scratch[j];
@@ -619,20 +755,22 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         }
     }
 
-    if (s->has_limit && s->limit < n) n = s->limit;
+    if (s->has_limit && s->limit < cur_n) cur_n = s->limit;
 
     // table_name here is metadata-only (cursor.h's struct comment) -- a
-    // joined cursor's rows span two tables, so this just records where the
-    // query started, not an authoritative single-table identity.
-    uint32_t cid = cursor_open_rowset(s->table_name, g_select_scratch, n);
+    // joined cursor's rows span every table in the chain, so this just
+    // records where the query started, not an authoritative single-table
+    // identity.
+    uint32_t cid = cursor_open_rowset(s->table_name, g_select_scratch, cur_n);
 
     out->error     = SQL_ERR_NONE;
     out->cursor_id = cid;
-    out->row_count = n;
+    out->row_count = cur_n;
+    out->truncated = truncated;
     if (s->select_all) {
-        out->column_count = combined.column_count;
-        for (uint32_t i = 0; i < combined.column_count; i++)
-            se_strcpy(out->columns[i], combined.column_names[i], RECORD_KEY_LEN);
+        out->column_count = running.column_count;
+        for (uint32_t i = 0; i < running.column_count; i++)
+            se_strcpy(out->columns[i], running.column_names[i], RECORD_KEY_LEN);
     } else {
         out->column_count = s->column_count;
         for (uint32_t i = 0; i < s->column_count; i++)
