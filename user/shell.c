@@ -32,6 +32,7 @@
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
+#include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -223,6 +224,9 @@ static void print_help(void) {
         "  mq send <name> <text...>      post a message to a queue\n"
         "  mq receive <name>              dequeue the oldest message\n"
         "  mq list                        list all message queues + depth\n"
+        "  -- Network/Storage Status (Navigator-Parity Phase 5) --\n"
+        "  net status                     IP/gateway/subnet/MAC + TCP pool\n"
+        "  disk status                    NVMe capacity + per-tier bytes used\n"
         "  query <natural language text>  cognitive direct object scan\n"
         "  query scan                     export full catalog as JSON manifest\n"
         "  tier list                     show each object's current storage tier\n"
@@ -1478,6 +1482,16 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // ── Navigator-Parity Gap Roadmap Phase 4: mq list ────────────────────
         else if (sh_eq(input_buffer, "mq list")) {
             do_syscall(SYS_SLS_MQ_LIST, 0);
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 5c: net status ────────────────
+        else if (sh_eq(input_buffer, "net status")) {
+            do_syscall(SYS_SLS_NET_STATUS, 0);
+        }
+
+        // ── Navigator-Parity Gap Roadmap Phase 5c: disk status ───────────────
+        else if (sh_eq(input_buffer, "disk status")) {
+            do_syscall(SYS_SLS_DISK_STATUS, 0);
         }
 
         // ── Phase 7: query scan (structured JSON manifest) ────────────────────

@@ -8,7 +8,7 @@
 #include "../kernel/object_catalog.h"
 #include "../kernel/transaction.h"
 #include "../kernel/microkernel.h"
-#include "../kernel/tier_mgr.h"
+#include "../kernel/tier_mgr.h"      // also: Navigator-Parity Gap Roadmap Phase 5b -- tier_capacity_totals()
 #include "../kernel/webapp.h"
 #include "../kernel/bundle.h"
 #include "../kernel/journal.h"
@@ -974,6 +974,36 @@ static int api_network_status_json(char* buf, int max) {
     }
     jb_obj_close(&j);
     jb_obj_close(&j); /* tcp_pool */
+
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/disk — Navigator-Parity Gap Roadmap Phase 5b ────────────────────
+// Combines the already-exposed NVMe capacity (nvme_get_capacity_bytes(),
+// Phase 2, also present in /api/metrics as disk_capacity_bytes) with the
+// new per-tier bytes-used/object-count breakdown (tier_capacity_totals(),
+// tier_mgr.c) -- the one genuinely new computation in this phase. Tier keys
+// match /api/tiers's own naming ("l1_cache"/"l2_dram"/"l3_ssd") so the two
+// routes stay consistent for any client reading both.
+static int api_disk_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "capacity_bytes", nvme_get_capacity_bytes()); jb_putc(&j, ',');
+
+    uint64_t bytes_per_tier[TIER_MGR_TIER_COUNT];
+    uint32_t count_per_tier[TIER_MGR_TIER_COUNT];
+    tier_capacity_totals(bytes_per_tier, count_per_tier);
+
+    static const char* tier_keys[TIER_MGR_TIER_COUNT] = { "l1_cache", "l2_dram", "l3_ssd" };
+    jb_obj_open(&j, "tiers");
+    for (int t = 0; t < TIER_MGR_TIER_COUNT; t++) {
+        if (t) jb_putc(&j, ',');
+        jb_obj_open(&j, tier_keys[t]);
+        jb_uint(&j, "bytes_used",   bytes_per_tier[t]); jb_putc(&j, ',');
+        jb_uint(&j, "object_count", count_per_tier[t]);
+        jb_obj_close(&j);
+    }
+    jb_obj_close(&j); /* tiers */
 
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -2952,6 +2982,11 @@ static void http_route(int conn, char* req) {
         // ── Navigator-Parity Gap Roadmap Phase 5a: network status ─────────────
         if (!strcmp(path, "/api/network/status")) {
             blen = api_network_status_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Navigator-Parity Gap Roadmap Phase 5b: disk/storage status ────────
+        if (!strcmp(path, "/api/disk")) {
+            blen = api_disk_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/processes")) {

@@ -110,6 +110,25 @@ extern MACAddr  net_my_mac;
 
 #define NET_HTTP_PORT  KERNEL_HTTP_PORT
 
+// ─── Syscalls ─────────────────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 5c: this networking subsystem never had
+// a syscall surface of its own before -- everything reachable today goes
+// through net/http.c's own separate REST-route layer, not do_syscall(). This
+// is the first one, added purely so the interactive Terminal (user/shell.c)
+// can print the same status GET /api/network/status already exposes,
+// matching every other read-only "list/status" command in this codebase
+// (SYS_SLS_TIER_LIST, SYS_SLS_GROUP_LIST, SYS_SLS_MQ_LIST, ...), which all
+// go through do_syscall() even though they're purely diagnostic.
+// 252 is the next free number after Phase 4's own additions topped out at
+// 251 (SYS_SLS_MQ_LIST) -- confirmed via grep across every header defining
+// SYS_SLS_* before picking this.
+#define SYS_SLS_NET_STATUS 252
+
+// Prints the same data GET /api/network/status (net/http.c) reports --
+// IP/gateway/subnet/MAC, DHCP-bound flag, and TCP connection-pool stats --
+// to the serial console, mirroring sys_sls_tier_list()'s own style.
+void sys_sls_net_status(void);
+
 // ─── Packet buffer pool ───────────────────────────────────────────────────────
 #define NET_PKT_BUF_COUNT 64
 #define NET_PKT_BUF_SIZE  2048

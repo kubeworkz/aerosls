@@ -22,6 +22,7 @@
 #include "authlist.h"      // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUTHLIST_*
 #include "security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUDIT_LIST
 #include "msgqueue.h"      // Navigator-Parity Gap Roadmap Phase 4 -- SYS_SLS_MQ_*
+#include "../net/net.h"    // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -368,6 +369,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_mq_receive((struct SLSMQReceiveRequest*)arg);
     case SYS_SLS_MQ_LIST:
         mq_list(); return 0;
+
+    // ── Navigator-Parity Gap Roadmap Phase 5c: network/disk status (252-253) ──
+    case SYS_SLS_NET_STATUS:
+        sys_sls_net_status(); return 0;
+    case SYS_SLS_DISK_STATUS:
+        sys_sls_disk_status(); return 0;
 
     default:
         return 0;

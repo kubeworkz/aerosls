@@ -62,4 +62,34 @@ void     sys_sls_tier_list(void);
 uint64_t sys_sls_tier_promote(const char* name);
 uint64_t sys_sls_tier_demote(const char* name);
 
+// ─── Navigator-Parity Gap Roadmap Phase 5b: per-tier byte accounting ─────────
+// Previously nothing anywhere tracked bytes used per storage tier -- every
+// existing tier stat (TierStat above, surfaced via GET /api/tiers) is
+// access-count/idle-tick only. Real, already-there data makes this cheap:
+// every active SLSObjectEntry already carries size_pages and storage_tier
+// (object_catalog.h), so this just sums size_pages*4096 grouped by tier.
+// Deliberately a pure function of object_catalog[]/object_catalog_count
+// (no side effects, no dependency on tier_stats[]) so it's independently
+// host-testable without needing the rest of the tier manager's state.
+#define TIER_MGR_TIER_COUNT (STORAGE_TIER_L3_SSD + 1)   // 3: L1_CACHE, L2_DRAM, L3_SSD
+
+// Fills bytes_per_tier[t]/count_per_tier[t] (both arrays of length
+// TIER_MGR_TIER_COUNT, indexed by SLSStorageTier value) with the total bytes
+// (size_pages * 4096) and object count of every active catalog object
+// currently assigned to tier t. Both arrays are zeroed first, so callers
+// don't need to pre-clear them.
+void tier_capacity_totals(uint64_t bytes_per_tier[TIER_MGR_TIER_COUNT],
+                          uint32_t count_per_tier[TIER_MGR_TIER_COUNT]);
+
+// ─── Syscall ──────────────────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 5c: Terminal-facing twin of GET
+// /api/disk (net/http.c's api_disk_json()) -- same underlying data
+// (nvme_get_capacity_bytes() + tier_capacity_totals()), printed to the
+// serial console. 253 is the next free number after this same phase's own
+// SYS_SLS_NET_STATUS (252, net/net.h) -- confirmed via grep across every
+// header defining SYS_SLS_* before picking this.
+#define SYS_SLS_DISK_STATUS 253
+
+void sys_sls_disk_status(void);
+
 #endif /* TIER_MGR_H */

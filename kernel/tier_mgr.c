@@ -1,5 +1,6 @@
 #include "tier_mgr.h"
 #include "ipc.h"
+#include "../drivers/nvme_admin.h"   // Navigator-Parity Gap Roadmap Phase 5c -- nvme_get_capacity_bytes() for sys_sls_disk_status()
 
 struct TierStat tier_stats[TIER_MAX_TRACKED];
 static uint32_t  tier_tick_counter  = 0;
@@ -188,6 +189,47 @@ uint64_t sys_sls_tier_promote(const char* name) {
     }
     kernel_serial_printf("[TIER] tier promote: Object '%s' not found.\n", name);
     return 1;
+}
+
+// ─── tier_capacity_totals ─────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 5b — see tier_mgr.h's own comment for
+// why this is a new, pure, independently-testable function rather than
+// folded into sys_sls_tier_list()'s existing per-object printer.
+void tier_capacity_totals(uint64_t bytes_per_tier[TIER_MGR_TIER_COUNT],
+                          uint32_t count_per_tier[TIER_MGR_TIER_COUNT]) {
+    for (int t = 0; t < TIER_MGR_TIER_COUNT; t++) {
+        bytes_per_tier[t] = 0;
+        count_per_tier[t] = 0;
+    }
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        struct SLSObjectEntry* e = &object_catalog[i];
+        if (!e->active) continue;
+        int t = (int)e->storage_tier;
+        if (t < 0 || t >= TIER_MGR_TIER_COUNT) continue;   // defensive; every real tier value fits
+        bytes_per_tier[t] += (uint64_t)e->size_pages * 4096ULL;
+        count_per_tier[t] += 1;
+    }
+}
+
+// ─── sys_sls_disk_status ──────────────────────────────────────────────────────
+// Navigator-Parity Gap Roadmap Phase 5c.
+void sys_sls_disk_status(void) {
+    static const char* tier_keys[TIER_MGR_TIER_COUNT] = { "L1_CACHE", "L2_DRAM", "L3_SSD" };
+    uint64_t bytes_per_tier[TIER_MGR_TIER_COUNT];
+    uint32_t count_per_tier[TIER_MGR_TIER_COUNT];
+    tier_capacity_totals(bytes_per_tier, count_per_tier);
+
+    kernel_serial_printf(
+        "\n[DISK] Storage Status\n"
+        " NVMe Capacity: %llu bytes (~%llu MB)\n",
+        (unsigned long long)nvme_get_capacity_bytes(),
+        (unsigned long long)(nvme_get_capacity_bytes() / (1024 * 1024)));
+    kernel_serial_printf(" %-10s  %-16s  %s\n", "Tier", "Bytes Used", "Object Count");
+    for (int t = 0; t < TIER_MGR_TIER_COUNT; t++) {
+        kernel_serial_printf(" %-10s  %-16llu  %u\n",
+                             tier_keys[t], (unsigned long long)bytes_per_tier[t], count_per_tier[t]);
+    }
+    kernel_serial_print("\n");
 }
 
 // ─── sys_sls_tier_demote ──────────────────────────────────────────────────────

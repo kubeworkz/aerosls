@@ -734,11 +734,50 @@ than the two big bullets originally drafted:
   worth verifying that way. Compile-check: zero new errors. Full
   regression: 26/26 host tests still passing (unaffected, as expected —
   none of them touch networking).
-- **5b — Storage status.** `GET /api/disk` combining the already-exposed
-  NVMe capacity with the new per-tier bytes-used/object-count aggregation
-  described above — the one genuinely new piece of math in this phase.
-- **5c — Terminal commands** for both (`net status`, `disk status`),
-  matching every prior phase's Terminal-first pattern.
+- **5b — Storage status — DONE.** Added `tier_capacity_totals()`
+  (`kernel/tier_mgr.h`/`.c`) — a new, pure function of
+  `object_catalog[]`/`object_catalog_count` (no dependency on `tier_stats[]`
+  or anything else in the tier manager's mutable state, deliberately, so it
+  stays independently testable) that sums `size_pages * 4096` and counts
+  active objects grouped by `SLSStorageTier`, into caller-supplied
+  `TIER_MGR_TIER_COUNT`-sized (3) arrays. New route `GET /api/disk`
+  (`net/http.c`) combines this with the already-exposed
+  `nvme_get_capacity_bytes()` (Phase 2), returning `capacity_bytes` plus a
+  `tiers` object keyed `l1_cache`/`l2_dram`/`l3_ssd` (matching `/api/tiers`'s
+  own key naming) each with `bytes_used`/`object_count`. New host test
+  (`tests/tier_capacity_phase5b_host_test.c`, 9 checks) links the real
+  `tier_mgr.c` and proves: an empty catalog zeroes every tier rather than
+  leaving poison/garbage; per-tier byte math is correct for a simple
+  one-object-per-tier seed; multiple objects in the same tier sum correctly
+  while an inactive object is excluded from both the byte total and the
+  object count; and shrinking `object_catalog_count` back down (simulating
+  freed objects) is reflected immediately, proving this is a live
+  recomputation on every call rather than an accumulating counter that
+  could double-count over time. Compile-check: zero new errors. Full
+  regression: 27/27 host tests passing (up from 26). No new `.c` file was
+  added (`tier_mgr.c` was already in `X86_C_SRC`), so no Makefile change was
+  needed this time.
+- **5c — Terminal commands — DONE.** This networking subsystem had never
+  had a syscall surface at all before this (everything reachable went
+  through `net/http.c`'s separate REST layer) -- `SYS_SLS_NET_STATUS` (252)
+  is the first one, matching every existing read-only "list/status" command
+  in this codebase (`SYS_SLS_TIER_LIST`, `SYS_SLS_GROUP_LIST`,
+  `SYS_SLS_MQ_LIST`, ...) in going through `do_syscall()` even though it's
+  purely diagnostic. `net/net.c` gained `sys_sls_net_status()` (prints the
+  same IP/gateway/subnet/MAC/DHCP-bound/TCP-pool data as `GET /api/network/
+  status`, plus its own small `net_tcp_state_name()` copy rather than
+  sharing `http.c`'s static one — this codebase's established per-file
+  string-helper convention). `SYS_SLS_DISK_STATUS` (253,
+  `kernel/tier_mgr.h`/`.c`) does the same for `GET /api/disk`'s data.
+  `user/shell.c` gained `net status` and `disk status` commands + help
+  text. Wiring `nvme_get_capacity_bytes()` into `sys_sls_disk_status()`
+  broke `tests/tier_capacity_phase5b_host_test.c`'s link (that test never
+  stubbed NVMe, since `tier_capacity_totals()` itself has no NVMe
+  dependency) — caught immediately by the regression sweep, not by
+  inspection, and fixed by adding a one-line `nvme_get_capacity_bytes()`
+  stub to that test (documented in its own header comment as "added later,
+  never actually exercised by this test's scenarios"). Compile-check: zero
+  new errors. Full regression: 27/27 passing again after the fix.
 - **5d — Frontend panel: scoped out for this pass**, same call as Phase
   4e — Terminal plus the two new HTTP routes satisfy "visibility" for v1;
   a dedicated Network/Storage tab in `slsos-sim` is a reasonable follow-on,
