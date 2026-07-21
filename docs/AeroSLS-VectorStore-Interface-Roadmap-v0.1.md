@@ -504,7 +504,63 @@ tombstoned). Compile-check, doc update.
 
 ---
 
-## Phase 4 — Frontend: dedicated Vector Store tab
+## Phase 4 — Frontend: dedicated Vector Store tab — DONE
+
+Implemented exactly as scoped, plus one addition the live verification pass
+surfaced as a real gap against this phase's own acceptance criteria (see
+below): `SlsVectorStore.tsx` (`slsos-sim/src/components/`), wired into
+`App.tsx`'s sidebar under "Database" next to "DB Engine", with four panels
+matching the original scope — Collections (list/create/delete, two-step
+`ConfirmDeleteButton` reused from the existing shared pattern), Insert (raw
+vector / embed-text toggle), Search (raw vector / embed-text toggle,
+brute-force / HNSW-index toggle, results table with `external_id`/
+`distance`/`page_id`/`slot_index`), and Indexes (list/create/rebuild/drop).
+
+**Gap found during verification, closed in this same phase:** the original
+scope draft below listed "delete a vector... through the new UI" as part of
+Phase 4's own verification bar (line ~551), but the Search panel as first
+built had no delete control on its results rows — only Collections and
+Indexes had delete/drop buttons. Added `handleDeleteVector()` +
+`deleteVectorCollection()` + a new "Actions" column (per-row
+`ConfirmDeleteButton`) to the Search panel, resolving the backing collection
+name whichever way a result came from (brute-force target = the collection
+itself; HNSW target = the index's own `.collection` field) since deletion
+is keyed by the physical `page_id`/`slot_index` (`VecId`), not
+`external_id` — `vecstore.h`'s own struct comment already names why.
+
+**A real, unrelated bug the live pass exposed and fixed along the way:**
+manual browser testing of embed-insert/embed-search kept failing with
+`ollama_status=-1` despite Ollama itself being confirmed healthy
+(`systemctl status`, direct `curl` to `/api/embeddings` succeeding). Root
+cause, found via a `tcpdump -i lo` capture that caught zero packets during a
+request the kernel's own debug log showed completing a full TCP + HTTP
+cycle: AeroSLS runs as a full OS booted inside QEMU with usermode/SLIRP
+networking (boot log's own `[DHCP] Bound: 10.0.2.15 gw 10.0.2.2`), so
+`"127.0.0.1"` from inside the guest means the guest's own loopback, not the
+host's — a request to it can never reach a host-side Ollama at all. Fixed
+by changing the hardcoded default `endpoint_ip` from `"127.0.0.1"` to
+`"10.0.2.2"` (QEMU SLIRP's host-forwarding gateway) in three places:
+`net/http.c` (embed-insert/embed-search/index-embed-search route defaults),
+`user/shell.c` (`vec embed-insert` Terminal command default), and this
+tab's own Insert/Search panel defaults — still overridable per-request via
+the existing `endpoint_ip` field for any other topology. Not a Phase 4
+frontend bug per se, but it blocked this phase's own live verification bar
+entirely until found, so it's recorded here rather than silently fixed
+off-roadmap.
+
+**Verified live**, end to end, against the redeployed kernel, in this order:
+created a real `verify768` (dim 768) collection; embed-inserted two
+sentences via Ollama using the new `10.0.2.2` default with the endpoint
+field left untouched (confirming the code fix, not a manual per-request
+override); ran a free-text embed-search ("What is the capital city of
+France?") that correctly ranked the on-topic vector (distance 0.1026)
+far ahead of the unrelated one (distance 0.6104) — a genuine semantic
+match, not just an error-free empty result; used the new Search-panel
+delete-vector control to remove one result and confirmed it disappeared
+from the list; deleted the test collection via the Collections panel and
+confirmed it disappeared from `GET /api/vec/collections`. `npx tsc
+--noEmit -p .` clean throughout. All 24 kernel host-test binaries
+(`tests/run_all.sh`) still pass, including `ollama_client_host_test`.
 
 **Goal:** close the UI gap — give the VectorStore a real interface instead
 of Terminal-only access, following the same pattern `SlsDbEngine.tsx`
