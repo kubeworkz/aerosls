@@ -748,12 +748,19 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // search are dispatch-reachable but never actually reachable, since
         // nothing else in this codebase can create a vector collection).
         //
-        // embed-insert always targets a local Ollama instance
-        // (127.0.0.1:11434) rather than taking an endpoint per call -- a
-        // real, named first-cut simplification: this shell-demo surface has
-        // no caller needing more than one Ollama instance yet, and adding
-        // an endpoint argument to every "vec embed-insert" invocation would
-        // be friction with no real use today.
+        // embed-insert always targets Ollama at 10.0.2.2:11434 rather than
+        // taking an endpoint per call -- a real, named first-cut
+        // simplification: this shell-demo surface has no caller needing
+        // more than one Ollama instance yet, and adding an endpoint argument
+        // to every "vec embed-insert" invocation would be friction with no
+        // real use today. 10.0.2.2, not 127.0.0.1: this kernel is itself a
+        // full OS booted inside QEMU (see kernel.c's own DHCP-assigned
+        // 10.0.2.0/24 addressing), so "127.0.0.1" from in here is this
+        // guest's own loopback, not the host's -- it would never reach a
+        // host-side Ollama at all. 10.0.2.2 is QEMU usermode/SLIRP's own
+        // gateway address, which does reach the host -- confirmed live
+        // against this exact deployment (net/http.c's embed routes carry
+        // the fuller writeup of how this was diagnosed).
         else if (sh_starts(input_buffer, "vec create ")) {
             struct SLSVecCreateRequest req;
             req.caller_uid = current_session_uid;
@@ -799,7 +806,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             p = sh_token(p, idtok, sizeof(idtok));
             req.external_id = (uint64_t)sh_atoi(idtok);
             p = sh_token(p, req.ollama_req.model, sizeof(req.ollama_req.model));
-            sh_copy(req.ollama_req.endpoint_ip, "127.0.0.1", sizeof(req.ollama_req.endpoint_ip));
+            sh_copy(req.ollama_req.endpoint_ip, "10.0.2.2", sizeof(req.ollama_req.endpoint_ip));
             req.ollama_req.port = 11434;
             sh_copy(req.ollama_req.prompt, p, sizeof(req.ollama_req.prompt));
             uint64_t rc = do_syscall(SYS_SLS_VEC_EMBED_INSERT, &req);

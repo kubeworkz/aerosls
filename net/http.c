@@ -1800,9 +1800,20 @@ static int api_vec_insert_post(const char* body, char* buf, int max, uint32_t re
 // ─── POST /api/vec/embed-insert — Gap Remediation Phase C ──────────────────────
 // Body: {"collection": "<name>", "external_id": N, "endpoint_ip": "...",
 // "port": N, "model": "...", "prompt": "..."}. endpoint_ip/port default to
-// 127.0.0.1:11434 (local Ollama) if omitted, matching the shell command's
-// own "embed-insert always targets a local Ollama instance" convention
-// (user/shell.c).
+// 10.0.2.2:11434 if omitted -- NOT 127.0.0.1. This kernel is itself a full
+// OS booted inside QEMU (see boot log's own "[NET] e1000 ... [DHCP] Bound:
+// 10.0.2.15 gw 10.0.2.2" lines): "127.0.0.1" from in here means THIS guest's
+// own loopback, not the host machine's, so a request to it never reaches a
+// host-side Ollama at all -- confirmed live: the guest's outbound connect
+// completed and got a real HTTP response (404) even though a host-side
+// `tcpdump -i lo` during the same request captured nothing, proving the
+// traffic never left the guest. QEMU's own usermode/SLIRP networking (the
+// same DHCP-assigned 10.0.2.0/24 range above) exposes host-reachable
+// services at 10.0.2.2, the gateway address, which is what actually reaches
+// a host-side Ollama instance -- verified live against this exact box.
+// Still overridable per-request via endpoint_ip for any other topology
+// (Ollama on a different host/container), matching the shell command's own
+// convention (user/shell.c).
 static int api_vec_embed_insert_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
@@ -1810,7 +1821,7 @@ static int api_vec_embed_insert_post(const char* body, char* buf, int max, uint3
     req.caller_uid = req_uid;
     json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
     req.external_id = json_uint64(body, "external_id");
-    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "127.0.0.1");
+    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "10.0.2.2");
     int port = json_int(body, "port");
     req.ollama_req.port = (uint16_t)(port ? port : 11434);
     json_str_or_default(body, "model", req.ollama_req.model, OLLAMA_MODEL_LEN, "nomic-embed-text");
@@ -1970,7 +1981,7 @@ static int api_vec_embed_search_post(const char* body, char* buf, int max, uint3
     struct SLSVecEmbedSearchRequest req;
     req.caller_uid = req_uid;
     json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
-    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "127.0.0.1");
+    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "10.0.2.2");
     int port = json_int(body, "port");
     req.ollama_req.port = (uint16_t)(port ? port : 11434);
     json_str_or_default(body, "model", req.ollama_req.model, OLLAMA_MODEL_LEN, "nomic-embed-text");
@@ -2027,7 +2038,7 @@ static int api_vec_index_embed_search_post(const char* body, char* buf, int max,
     struct SLSVecIndexEmbedSearchRequest req;
     req.caller_uid = req_uid;
     json_str(body, "index", req.index_name, OBJECT_NAME_LEN);
-    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "127.0.0.1");
+    json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "10.0.2.2");
     int port = json_int(body, "port");
     req.ollama_req.port = (uint16_t)(port ? port : 11434);
     json_str_or_default(body, "model", req.ollama_req.model, OLLAMA_MODEL_LEN, "nomic-embed-text");
