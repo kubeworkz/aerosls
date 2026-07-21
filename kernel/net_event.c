@@ -2,6 +2,10 @@
 #include "../net/e1000.h"
 #include "kernel_io.h"
 
+// Navigator-Parity Gap Roadmap Phase 2: definition for the counter declared
+// (and incremented) in net_event.h's net_event_hlt_wait().
+volatile uint64_t cpu_idle_wait_count = 0;
+
 // net_poll_tick — called from timer_irq_handler() on every ~10 ms tick
 //
 // Drains the e1000 receive descriptor ring.  Each completed descriptor

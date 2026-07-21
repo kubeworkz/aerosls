@@ -93,7 +93,78 @@ most truth-in-UI and real operator value per unit of work.
 
 ---
 
-## Phase 1 — Wire real backend data into System Health + Security/User tabs
+## Phase 1 — Wire real backend data into System Health + Security/User tabs — DONE
+
+**Scope correction made during implementation:** this phase's original scope
+(above, preserved below) assumed all three frontend surfaces —
+`SlsSystemHealth.tsx`, `SlsSecurityDashboard.tsx`, `SlsUserPortal.tsx` — were
+broken dashboards misrepresenting real kernel state. A full read of all
+three during implementation (not just the excerpts the initial gap analysis
+had seen) showed this was only true for one of them:
+
+- `SlsSystemHealth.tsx`'s underlying `systemMetrics` data was **already
+  real** — `App.tsx` has had a genuine 5-second poll loop against
+  `/api/health`/`/api/metrics`/`/api/tiers`/`/api/objects` all along,
+  feeding real kernel state into this component. The only actual lie was
+  the "Compact & Optimize Memory" button, which locally faked a 75%
+  reduction in `pageFaultCount` — a value mapped from the kernel's real,
+  monotonically-increasing `total_promotions` counter — that the very next
+  5s poll tick would have silently overwritten anyway. A real, narrow bug.
+- `SlsSecurityDashboard.tsx` is explicitly labeled in its own UI as an
+  "Interactive Privilege Simulation" / "Security Context Simulator" for
+  exploring hypothetical object-ACL configurations against a self-contained
+  mock object model — it never claims to reflect live `object_catalog.c`
+  RBAC state, so it isn't the misrepresentation the original scope assumed.
+- `SlsUserPortal.tsx` is a complete, self-aware fictional SaaS billing
+  product simulator ("Sovereign Flat Memory Cloud // Infrastructure
+  Lease," explicitly-labeled "Simulated Balance," fake credits, lease
+  tiers, API key management) with no field-level correspondence to
+  `auth.c`'s real `LeaseToken` (no balance, no tiers, no API keys there) —
+  forcing real accounts into `DEFAULT_PORTAL_USERS` would break a coherent,
+  intentional feature rather than fix a lie.
+
+Given this, the user chose (via an in-session decision point) to narrow
+Phase 1 to the one real bug rather than rewire the two intentional
+simulators. **What was actually built:**
+
+- `App.tsx`: the poll loop's `poll` function was hoisted out of its
+  `useEffect` into its own `useCallback` (deps `[]`, unchanged behavior),
+  with a second, small `useEffect([poll])` left to call it immediately and
+  on the existing 5s interval. This lets `poll` be passed down as a real
+  "refresh now" callback rather than only being reachable from inside its
+  original closure.
+- `SlsSystemHealth.tsx`: the `setSystemMetrics` prop (only ever used by the
+  fake-improvement logic) was replaced with `onRefreshNow?: () => void |
+  Promise<void>` — `App.tsx`'s real `poll`. The "Compact & Optimize Memory"
+  button is now "Refresh Kernel Telemetry": same animated step sequence
+  (relabeled to describe the real `/api/health`/`/api/metrics` calls being
+  made instead of fictional "sector decompression"), but it now `await`s
+  the real `onRefreshNow()` and reports "Telemetry refreshed from live
+  kernel" — true regardless of whether the numbers moved — instead of
+  claiming a fabricated "System Health Restored to 100%!" improvement to a
+  counter that cannot legitimately decrease.
+
+**Deliberately not done, and why:** rewiring `SlsSecurityDashboard.tsx` to
+real `catalog_check_access()` state and `SlsUserPortal.tsx` to real
+`auth_tokens[]` accounts were both considered and explicitly declined for
+this phase — not because they're out of scope forever, but because neither
+component is dishonest about what it is today, and forcing real data into
+either would change their purpose (from "explore ACL concepts" /
+"SaaS billing demo" to "live admin panel") rather than fix a misrepresentation.
+If real-account visibility or live-RBAC visibility becomes a wanted feature
+later, it should be scoped as its own addition — e.g. a new, clearly-labeled
+panel — rather than retrofitted into these two.
+
+**Verification:** `npx tsc --noEmit -p .` clean; live browser pass against
+the redeployed kernel confirming the button now reads "Refresh Kernel
+Telemetry," clicking it shows "Telemetry refreshed from live kernel" (not
+the old false 100%-restored claim), and the underlying fault-rate/total-
+access numbers are unchanged by the click itself (only a real poll can move
+them now).
+
+---
+
+### Original Phase 1 scope (as first drafted, before the correction above)
 
 **Goal:** stop the frontend from showing invented numbers where real ones
 already exist. This is the cheapest, highest-value phase here: no new
@@ -138,7 +209,104 @@ same moment).
 
 ---
 
-## Phase 2 — Real CPU/RAM/disk performance metrics + trend history
+## Phase 2 — Real CPU/RAM/disk performance metrics + trend history — DONE
+
+### Scope correction made during implementation
+
+The original draft below (preserved under "Original Phase 2 scope") assumed
+three new kernel data sources would need to be built from nothing, plus a
+new kernel-side ring buffer for trend history. Investigation confirmed the
+first part but corrected the shape of the work, and the ring buffer was
+deliberately dropped:
+
+- **CPU:** `kernel/smp.c` indeed has no per-core busy/idle accounting. But
+  rather than building new scheduler-accounting state, this reuses
+  `kernel/net_event.h`'s pre-existing `net_event_hlt_wait()` — the real
+  `sti; hlt` CPU-yield already called throughout `net/http.c`'s main loop,
+  `net/tcp.c`, and `net/dhcp.c` whenever there's genuinely nothing to do
+  (its own header comment already documents the real "~100% spin-poll →
+  <1% hlt-wait" utilization drop this achieves). Added one cumulative
+  counter, `cpu_idle_wait_count`, incremented on every call. Named
+  explicitly as approximate, not exact — mirroring `AUTH_TOKEN_TTL_TICKS`'s
+  own precedent — since a single `hlt_wait()` can be woken by any
+  interrupt, not strictly one timer tick, and since this only measures the
+  BSP core's own loop: Core 1's `microkernel_service_poll()` loop in
+  `kernel/smp.c` never calls `net_event_hlt_wait()` and never truly idles
+  (confirmed by reading `ap_kernel_main()`'s fixed
+  `while(1) { flush_daemon_tick(); microkernel_service_poll(); kernel_sleep_ticks(10); }`
+  loop) — so this is a real but BSP-core-only signal, not whole-system CPU
+  utilization.
+- **RAM:** `frame_pool.c` had per-partition accounting
+  (`partition_get_frame_usage`/`_quota`) but no system-wide total/allocated
+  introspection. Added `frame_pool_total_frames()` (the bitmap's fixed
+  `TOTAL_FRAMES` capacity) and `frame_pool_allocated_count()` (a live
+  popcount over `physical_memory_bitmap`) to `frame_pool.c`/`.h`. The
+  popcount deliberately avoids `__builtin_popcountll` — this kernel builds
+  freestanding with no libgcc linked, and that builtin can lower to a
+  libgcc call depending on optimization level/target flags, the same class
+  of ABI pitfall already named and worked around elsewhere in this codebase
+  (see the float-return-ABI x86 cross-build fix). Uses a plain Kernighan
+  bit-counting loop instead.
+- **Disk:** the original draft assumed this would "extend" an
+  already-issued Identify-Namespace command path. Investigation found
+  `nvme_admin.h`/`.c` had zero Identify-related opcodes or functions before
+  this phase — only `CREATE_CQ`/`CREATE_SQ` existed. This was a genuinely
+  new admin command path, not an extension: added
+  `NVME_ADMIN_CMD_IDENTIFY (0x06)`, `nvme_identify_namespace(nsid)` (issues
+  the command, caches `NCAP` from the returned 4KB Identify Namespace Data
+  Structure), and `nvme_get_capacity_bytes()` (returns `NCAP * 512`,
+  assuming 512-byte logical blocks — deliberately not parsing the LBA
+  Format table for the real per-namespace sector size, matching
+  `nvme_io.c`'s own existing sector-size assumptions elsewhere in this
+  driver). Wired to run once at boot right after the admin queue comes up
+  in `kernel.c`, unconditionally (not nested inside the I/O-queue-success
+  branch), so disk-capacity reporting works even if I/O queue setup itself
+  fails.
+- **Ring buffer: dropped.** The original draft's "small ring buffer... so
+  the frontend can show a trend line" would have added new timer-driven
+  kernel state. Implementation instead lets the frontend keep its own
+  bounded rolling window over real 5-second-interval polls client-side —
+  the trend line is just as real (built from genuine samples, not
+  fabricated), with no new kernel state added. Named directly in
+  `api_metrics()`'s own comment as a "smallest real version first"
+  simplification.
+
+All five new values (`cpu_idle_ticks`, `cpu_total_ticks`,
+`ram_allocated_frames`, `ram_total_frames`, `disk_capacity_bytes`) are
+wired into the existing `GET /api/metrics` route, following the same
+"cumulative counter, diffed by the caller" convention already established
+by that route's `total_accesses`/`total_promotions` fields — `cpu_idle_ticks`/
+`cpu_total_ticks` are raw counters, not a pre-computed percentage, so a
+client diffing two consecutive polls gets a real windowed CPU busy% for
+that interval rather than an instantaneous (and noisier) one.
+
+`App.tsx`'s `poll()` now diffs consecutive `cpu_idle_ticks`/`cpu_total_ticks`
+samples (via a `useRef` holding the previous poll's raw values, clamped to
+0–100% since `net_event_hlt_wait()` can be called more than once per timer
+tick) into a windowed `cpuBusyPercent`, and passes `ram_allocated_frames`/
+`ram_total_frames`/`disk_capacity_bytes` straight through into
+`SlsSystemMetrics`. `SlsSystemHealth.tsx`'s telemetry popover now shows
+CPU BUSY, RAM USED (a simple ratio of the two frame counts), and DISK
+CAPACITY (formatted GB/MB) alongside the existing fault-rate figures.
+
+**What was NOT done:** a pre-existing, separate gap was found and
+deliberately not fixed in this pass — `kernel.c` calls
+`init_nvme_controller()`/`nvme_io_init()` via legacy implicit-int function
+declaration (no header, no forward declare for either). A proper
+`#include "../drivers/nvme_admin.h"` was added for this phase's own new
+function prototypes, but the other two pre-existing implicit declarations
+were left as-is and named in a code comment rather than silently expanded
+into an unrelated fix.
+
+**Verification performed:** `gcc -fsyntax-only` compile-check across
+`kernel.c`, `net_event.c`, `frame_pool.c`, `nvme_admin.c`, `net/http.c`,
+`user/shell.c` — zero new errors, only pre-existing unrelated implicit-
+declaration warnings and one `-Waddress-of-packed-member` warning matching
+an existing pattern already used identically in `nvme_io.c`. Full host
+test suite (`tests/run_all.sh`) — 24/24 passed, 0 failed, 0 skipped, no
+regressions. Frontend typecheck (`npx tsc --noEmit`) — clean.
+
+### Original Phase 2 scope (as first drafted, before the correction above)
 
 **Goal:** give System Health something real to show beyond tier-access
 counters — actual resource utilization, plus enough history to show a
@@ -149,7 +317,11 @@ counters and the rolling-average latency idiom
 (`average_fault_latency_cycles`, updated with a `(prev*7 + new)/8` decay —
 `dashboard.c:34-37`) are a real, working pattern for a lightweight rolling
 stat; the same idiom can back new CPU/RAM stats without inventing a new
-math approach.
+math approach. (Investigation during implementation found
+`dashboard_log_fault_start()`/`_end()` are never actually called anywhere
+in the codebase — this instrumentation is permanently zero, dead code, not
+a live pattern to build on. `net_event_hlt_wait()` and `frame_pool.c`'s
+bitmap were used instead; see the correction above.)
 
 **What needs to be built:**
 - CPU: `kernel/smp.c` has no per-core busy/idle accounting today. Simplest

@@ -159,3 +159,32 @@ void sys_sls_partition_quota_list(void)
     }
     kernel_serial_printf(" %d partition(s) with nonzero usage or a configured quota.\n\n", shown);
 }
+
+// ─── Navigator-Parity Gap Roadmap Phase 2: system-wide RAM introspection ──────
+// Distinct from the per-partition accounting above (partition_get_frame_usage()
+// etc.), which only ever tracks each tenant's own usage -- neither the
+// bitmap's real total capacity nor a live system-wide allocated count was
+// exposed anywhere before this. Portable bit-count (no __builtin_popcount*):
+// this kernel builds freestanding with no libgcc linked, and depending on
+// optimization level/target flags that builtin can lower to a libgcc call
+// (__popcountdi2) instead of inline instructions -- the same class of ABI
+// pitfall already named and worked around elsewhere in this codebase (see
+// the float-return-ABI x86 cross-build fix). A plain Kernighan loop is
+// exactly as portable as the bitmap it's counting.
+static uint64_t popcount64(uint64_t v) {
+    uint64_t count = 0;
+    while (v) { v &= (v - 1); count++; }
+    return count;
+}
+
+uint64_t frame_pool_total_frames(void) {
+    return TOTAL_FRAMES;
+}
+
+uint64_t frame_pool_allocated_count(void) {
+    uint64_t count = 0;
+    for (size_t i = 0; i < (TOTAL_FRAMES / 64); i++) {
+        count += popcount64(physical_memory_bitmap[i]);
+    }
+    return count;
+}

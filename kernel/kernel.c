@@ -38,6 +38,16 @@
 #include "../kernel/vecstore.h"
 #include "../kernel/vec_index.h"
 #include "persist.h"
+#include "../drivers/nvme_admin.h"  // Navigator-Parity Gap Roadmap Phase 2 --
+                                     // nvme_identify_namespace() prototype (this
+                                     // file previously called init_nvme_controller()/
+                                     // nvme_io_init() below via implicit int
+                                     // declaration with no header at all; adding
+                                     // this one include doesn't retroactively fix
+                                     // those two, which is a real, separate, pre-
+                                     // existing gap named here rather than
+                                     // silently left alone or over-broadly "fixed"
+                                     // by an unrelated header sweep in this phase)
 
 extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
@@ -283,6 +293,13 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
                     // Address is within the 4 GiB identity map — safe to access
                     if (init_nvme_controller(nvme_mmio)) {
                         kernel_serial_print("[NVME] Admin queue ready.\n");
+                        // Navigator-Parity Gap Roadmap Phase 2: only needs the
+                        // admin queue (not the I/O queue below), so this runs
+                        // unconditionally here rather than nested inside the
+                        // nvme_io_init() branch -- gives real disk-capacity
+                        // reporting even in the (currently unseen but
+                        // possible) case where I/O queue setup itself fails.
+                        nvme_identify_namespace(1);
                         if (nvme_io_init()) {
                             persist_restore_all();  // restore L2 catalog/records/schemas/programs
                             stream_init();

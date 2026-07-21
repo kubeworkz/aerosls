@@ -137,6 +137,15 @@ int partition_reset_frame_usage(uint32_t partition_id);
 /* Debug/introspection listing, mirrors sys_sls_partition_list()'s style. */
 void sys_sls_partition_quota_list(void);
 
+/* Navigator-Parity Gap Roadmap Phase 2: system-wide RAM introspection --
+ * distinct from partition_get_frame_usage()/_quota() above, which only ever
+ * report one partition's own accounting. frame_pool_total_frames() is the
+ * bitmap's fixed capacity (TOTAL_FRAMES); frame_pool_allocated_count() is a
+ * live popcount of physical_memory_bitmap, i.e. every frame currently
+ * allocated to anyone, system-wide, regardless of partition attribution. */
+uint64_t frame_pool_total_frames(void);
+uint64_t frame_pool_allocated_count(void);
+
 // ─── Syscalls ─────────────────────────────────────────────────────────────
 #define SYS_SLS_PARTITION_QUOTA_SET 213
 

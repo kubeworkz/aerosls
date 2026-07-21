@@ -32,6 +32,7 @@
 #include "../kernel/vec_index.h"  // Gap Remediation Phase C -- POST /api/vec/indexes, /api/vec/index/search
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- partition create/list/destroy/assign/pause/resume
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
+#include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -200,7 +201,19 @@ static int api_health(char* body, int max) {
 }
 
 // ─── GET /api/metrics ─────────────────────────────────────────────────────────
-// Live kernel instrumentation: access events, tier promotions, IPC latency.
+// Live kernel instrumentation: access events, tier promotions, IPC latency,
+// and (Navigator-Parity Gap Roadmap Phase 2) real CPU/RAM/disk figures.
+//
+// cpu_idle_ticks/cpu_total_ticks: cumulative counters, not a pre-computed
+// percentage -- the caller (SlsSystemHealth.tsx) diffs two consecutive polls
+// to get a windowed busy% for the period between them, the same "cumulative
+// counter, diff client-side" convention total_accesses/total_promotions
+// already established here. Deliberately no kernel-side ring buffer for
+// trend history (this phase's original scope draft below floated one): the
+// frontend already polls every 5s and can keep its own bounded rolling
+// window of real samples client-side just as easily, without adding new
+// timer-driven kernel state -- smallest real version, same posture every
+// prior phase in this codebase has taken.
 static int api_metrics(char* body, int max) {
     JSONBuf j = { body, 0, max };
     jb_obj_open(&j, 0);
@@ -208,7 +221,12 @@ static int api_metrics(char* body, int max) {
     jb_uint(&j, "total_promotions",  tier_total_promotions);     jb_putc(&j, ',');
     jb_uint(&j, "ipc_posted",        ipc_stats.total_posted);    jb_putc(&j, ',');
     jb_uint(&j, "ipc_dispatched",    ipc_stats.total_dispatched);jb_putc(&j, ',');
-    jb_uint(&j, "ipc_avg_latency_ns",ipc_stats.avg_latency_ns);
+    jb_uint(&j, "ipc_avg_latency_ns",ipc_stats.avg_latency_ns);  jb_putc(&j, ',');
+    jb_uint(&j, "cpu_idle_ticks",    cpu_idle_wait_count);       jb_putc(&j, ',');
+    jb_uint(&j, "cpu_total_ticks",   kernel_tick_counter);       jb_putc(&j, ',');
+    jb_uint(&j, "ram_allocated_frames", frame_pool_allocated_count()); jb_putc(&j, ',');
+    jb_uint(&j, "ram_total_frames",  frame_pool_total_frames()); jb_putc(&j, ',');
+    jb_uint(&j, "disk_capacity_bytes", nvme_get_capacity_bytes());
     jb_obj_close(&j);
     j.buf[j.pos] = '\0';
     return j.pos;
