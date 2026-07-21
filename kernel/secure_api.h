@@ -24,3 +24,10 @@ struct SLSSealRequest {
 // same primitive `seal` already uses, not a second scheme -- which is
 // what surfaced the missing prototype.
 void derive_user_key(const char* password, uint32_t len, uint32_t* out_key);
+
+// Shell-Command JSON-Promotion Roadmap: sys_sls_secure_seal() itself
+// (kernel/secure_api.c) was likewise only ever called from within its own
+// file before now -- net/http.c's new api_seal_post() route is the first
+// external caller, surfacing the same class of missing-prototype gap fixed
+// above for derive_user_key().
+uint64_t sys_sls_secure_seal(struct SLSSealRequest* req);

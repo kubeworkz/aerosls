@@ -38,6 +38,8 @@
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
+#include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
+#include "../kernel/secure_api.h"     // Shell-Command JSON-Promotion Roadmap -- struct SLSSealRequest
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
 static void jb_putc(JSONBuf* j, char c) {
@@ -2819,6 +2821,675 @@ static int api_workflow_run(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── Shell-Command JSON-Promotion Roadmap ──────────────────────────────────────
+// Promotes user/shell.c's remaining SHELL_FALLBACK_COMMANDS (slsos-sim's
+// shellCommands.ts) to real purpose-built JSON routes, matching every other
+// command already in that file's COMMANDS registry, instead of going
+// through POST /api/shell/exec's plain-text dispatch. Grouped below in the
+// same 5 groups as the roadmap doc: security/session, process/service/IPC,
+// journal/tier/object, webapp/workflow, legacy loader.
+
+// ─── Shared helpers ─────────────────────────────────────────────────────────
+// find object_id by name, mirroring the identical inline lookup loop that
+// user/shell.c's chmod/write/seal handlers each already carry independently
+// -- one shared helper here instead of three more copies.
+static uint64_t hp_find_object_id(const char* name) {
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (object_catalog[i].active && !strcmp(object_catalog[i].name, name))
+            return object_catalog[i].object_id;
+    }
+    return 0;
+}
+
+// Mirrors user/shell.c's parse_perm_string() exactly (lowercase r/w/x chars,
+// defaults to PERM_READ if none matched) so JSON callers can use the same
+// "rw"/"rwx" syntax shell users already do for grant/revoke.
+static uint32_t hp_parse_perm_string(const char* s) {
+    uint32_t m = 0;
+    for (; *s; s++) {
+        if (*s == 'r') m |= PERM_READ;
+        if (*s == 'w') m |= PERM_WRITE;
+        if (*s == 'x') m |= PERM_EXECUTE;
+    }
+    return m ? m : PERM_READ;
+}
+
+// Mirrors user/shell.c's parse_hex() exactly (accepts an optional "0x"/"0X"
+// prefix).
+static uint32_t hp_parse_hex(const char* s) {
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    uint32_t v = 0;
+    for (; *s; s++) {
+        uint8_t d;
+        if (*s >= '0' && *s <= '9') d = (uint8_t)(*s - '0');
+        else if (*s >= 'a' && *s <= 'f') d = (uint8_t)(*s - 'a' + 10);
+        else if (*s >= 'A' && *s <= 'F') d = (uint8_t)(*s - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+    }
+    return v;
+}
+
+// ─── Group 1: Security / session ───────────────────────────────────────────────
+
+// ─── GET /api/session/whoami ───────────────────────────────────────────────────
+// shell.c's "login <uid> <gid>" mutates a LOCAL session variable that only
+// exists for the native serial console (current_session_uid/gid) or, over
+// HTTP, a per-bearer-token ShellSession that api_shell_exec_post() forcibly
+// reseeds from the bearer token on EVERY call ("always reseed identity from
+// the bearer token, never trust stored state" -- see
+// http_shell_session_for()'s own comment further below). A dedicated route
+// that actually let a caller switch effective uid would reopen exactly the
+// privilege-escalation hole Architectural Phase 4 closed for auth
+// create/revoke, so this is deliberately read-only: it reflects the
+// caller's REAL bearer-token identity, which is the honest HTTP equivalent
+// of "who am I logged in as" -- not a state-mutating impersonation
+// endpoint. "login" itself stays effectively a no-op over HTTP (matches
+// syscall_dispatch.c's own SYS_SLS_SET_USER case comment: "shell updates
+// session vars itself; no-op here").
+static int api_session_whoami(uint32_t uid, SLSRole role, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "uid", uid); jb_putc(&j, ',');
+    jb_str(&j, "role", role_name(role));
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/role/set ─────────────────────────────────────────────────────
+// Body: {"uid": N, "role": "SYSTEM_KERNEL"|"DB_ADMIN"|"APP_USER"|"GUEST"}.
+static int api_role_set_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSRoleRequest req;
+    req.uid = (uint32_t)json_int(body, "uid");
+    char role_s[24]; role_s[0]='\0';
+    json_str(body, "role", role_s, sizeof(role_s));
+    if      (!strcmp(role_s, "SYSTEM_KERNEL")) req.role = ROLE_SYSTEM_KERNEL;
+    else if (!strcmp(role_s, "DB_ADMIN"))      req.role = ROLE_DB_ADMIN;
+    else if (!strcmp(role_s, "APP_USER"))      req.role = ROLE_APP_USER;
+    else                                        req.role = ROLE_GUEST;
+    uint64_t rc = sys_sls_role_set(&req);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/grant | /api/revoke ─────────────────────────────────────────
+// Body: {"uid": N, "object": "name", "perm": "rw"}. `is_grant` selects
+// sys_sls_grant()'s add/remove direction -- same one-function-two-routes
+// shape api_partition_pause_post() already established for pause/resume.
+static int api_grant_post(const char* body, char* buf, int max, int is_grant) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSGrantRequest req;
+    req.uid = (uint32_t)json_int(body, "uid");
+    req.object_name[0] = '\0';
+    json_str(body, "object", req.object_name, OBJECT_NAME_LEN);
+    char perm_s[8]; perm_s[0]='\0';
+    json_str(body, "perm", perm_s, sizeof(perm_s));
+    req.perm_delta = hp_parse_perm_string(perm_s);
+    uint64_t rc = sys_sls_grant(&req, is_grant);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/chmod ────────────────────────────────────────────────────────
+// Body: {"name": "obj", "mask": "0x1F"}. Inlines the same object_catalog
+// perm_mask update syscall_dispatch.c's SYS_SLS_CHMOD case does directly
+// (that case is inline in the dispatcher's switch, not a standalone
+// callable function -- see this codebase's established "inline manipulation
+// of extern kernel state when no function exists" pattern, same as
+// "workflow addstep" in Group 4 below).
+static int api_chmod_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    char mask_s[16]; mask_s[0]='\0';
+    json_str(body, "mask", mask_s, sizeof(mask_s));
+    uint32_t mask = hp_parse_hex(mask_s);
+    uint64_t obj_id = hp_find_object_id(name);
+    int found = 0;
+    if (obj_id) {
+        for (uint32_t i = 0; i < object_catalog_count; i++) {
+            if (object_catalog[i].active && object_catalog[i].object_id == obj_id) {
+                object_catalog[i].perm_mask = mask;
+                found = 1;
+                break;
+            }
+        }
+    }
+    jb_obj_open(&j,0); jb_str(&j,"ok", found?"true":"false");
+    if (!found) { jb_putc(&j,','); jb_str(&j,"error","object not found"); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/auth/create ──────────────────────────────────────────────────
+// Body: {"email","uid","role","password"}. Gated to DB_ADMIN+ callers, same
+// check user/shell.c's own "auth create" carries (Architectural Phase 4 --
+// see that command's own header comment for the privilege-escalation gap
+// this closes). Returns the plaintext token once, same as shell.c's own
+// "[AUTH] Token: ..." print -- there is no other way for a caller to learn
+// a freshly-created account's token.
+static int api_auth_create_post(const char* body, char* buf, int max, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct AuthCreateRequest req;
+    req.email[0] = '\0';
+    json_str(body, "email", req.email, AUTH_EMAIL_LEN);
+    req.uid = (uint32_t)json_int(body, "uid");
+    char role_s[24]; role_s[0]='\0';
+    json_str(body, "role", role_s, sizeof(role_s));
+    if      (!strcmp(role_s, "SYSTEM_KERNEL")) req.role = ROLE_SYSTEM_KERNEL;
+    else if (!strcmp(role_s, "DB_ADMIN"))      req.role = ROLE_DB_ADMIN;
+    else if (!strcmp(role_s, "APP_USER"))      req.role = ROLE_APP_USER;
+    else                                        req.role = ROLE_GUEST;
+    char pw[64]; pw[0]='\0';
+    json_str(body, "password", pw, sizeof(pw));
+    uint32_t plen = 0; while (pw[plen]) plen++;
+    for (uint32_t k = 0; k < plen && k < sizeof(req.password)-1; k++) req.password[k] = pw[k];
+    req.password[plen < sizeof(req.password)-1 ? plen : sizeof(req.password)-1] = '\0';
+    req.password_len = plen;
+    char tok[AUTH_TOKEN_LEN + 1];
+    int ok = auth_create_token(&req, tok);
+    jb_obj_open(&j,0); jb_str(&j,"ok", ok?"true":"false");
+    if (ok) { jb_putc(&j,','); jb_str(&j,"token", tok); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/auth/tokens ────────────────────────────────────────────────────
+// Mirrors sys_sls_auth_list()'s own "first 8 chars only" token-preview
+// convention (kernel/auth.c) rather than a fresh design -- never returns a
+// full live token over this route.
+static int api_auth_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "tokens");
+    int first = 1;
+    for (int i = 0; i < AUTH_MAX_TOKENS; i++) {
+        if (!auth_tokens[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        char preview[10];
+        int k = 0; for (; k < 8 && auth_tokens[i].token[k]; k++) preview[k] = auth_tokens[i].token[k];
+        preview[k] = '\0';
+        jb_obj_open(&j, 0);
+        jb_str(&j, "email", auth_tokens[i].email); jb_putc(&j, ',');
+        jb_uint(&j, "uid", auth_tokens[i].uid); jb_putc(&j, ',');
+        jb_str(&j, "role", role_name(auth_tokens[i].role)); jb_putc(&j, ',');
+        jb_str(&j, "token_preview", preview);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/auth/revoke ───────────────────────────────────────────────────
+// Body: {"email"}. Same DB_ADMIN+ gate as api_auth_create_post() above, for
+// the identical reason (Architectural Phase 4).
+static int api_auth_revoke_post(const char* body, char* buf, int max, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char email[AUTH_EMAIL_LEN]; email[0]='\0';
+    json_str(body, "email", email, AUTH_EMAIL_LEN);
+    int revoked = auth_revoke_by_email(email);
+    jb_obj_open(&j,0); jb_str(&j,"ok", revoked?"true":"false"); jb_putc(&j,',');
+    jb_uint(&j, "revoked", (uint32_t)revoked);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/seal ──────────────────────────────────────────────────────────
+// Body: {"name","password"}. See secure_api.h's own header comment: this
+// binds a password-derived key to the object, it does NOT encrypt the
+// object's stored data (Gap Remediation Phase E relabeled this honestly;
+// not repeated here as a fresh claim).
+static int api_seal_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    char pw[32]; pw[0]='\0';
+    json_str(body, "password", pw, sizeof(pw));
+    uint64_t obj_id = hp_find_object_id(name);
+    if (!obj_id || !pw[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error", !obj_id ? "object not found" : "password required");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    struct SLSSealRequest req;
+    req.system_object_id = obj_id;
+    uint32_t pwlen = 0; while (pw[pwlen]) pwlen++;
+    for (uint32_t k = 0; k < 32 && k < pwlen; k++) req.user_password[k] = pw[k];
+    req.password_len = pwlen < 32 ? pwlen : 31;
+    req.encryption_algorithm_flags = 1;
+    uint64_t rc = sys_sls_secure_seal(&req);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── Group 2: Process / service / IPC ──────────────────────────────────────────
+
+// ─── POST /api/svc/crash | /api/svc/restart ────────────────────────────────
+// Body: {"name"}.
+static int api_svc_crash_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[SVC_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, SVC_NAME_LEN);
+    uint64_t rc = sys_sls_svc_crash(name);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+static int api_svc_restart_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[SVC_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, SVC_NAME_LEN);
+    uint64_t rc = sys_sls_svc_restart(name);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/proc/kill ────────────────────────────────────────────────────
+// Body: {"pid"}. process_kill() (kernel/process.c) returns void, so this
+// checks proc_table[] for the pid first (same "confirm existence, then act"
+// approach api_chmod_post() above uses for its own void-returning inline
+// operation) to give the caller a real ok/error rather than always "true".
+static int api_proc_kill_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    uint32_t pid = (uint32_t)json_int(body, "pid");
+    int found = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid == pid) { found = 1; break; }
+    }
+    if (found) process_kill(pid);
+    jb_obj_open(&j,0); jb_str(&j,"ok", found?"true":"false");
+    if (!found) { jb_putc(&j,','); jb_str(&j,"error","pid not found"); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/ipc/post ─────────────────────────────────────────────────────
+// Body: {"service","opcode"}. opcode is a hex string ("0x0401"), matching
+// shell.c's own "ipc post <svc> <opcode_hex>" syntax -- resolves the target
+// service's port the same way shell.c does (linear scan of services[]),
+// since no by-name lookup function exists for it.
+static int api_ipc_post_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char svc_name[SVC_NAME_LEN]; svc_name[0]='\0';
+    json_str(body, "service", svc_name, SVC_NAME_LEN);
+    char opcode_s[16]; opcode_s[0]='\0';
+    json_str(body, "opcode", opcode_s, sizeof(opcode_s));
+    uint32_t opcode = hp_parse_hex(opcode_s);
+    uint16_t target_port = 0;
+    for (uint32_t i = 0; i < service_count; i++) {
+        if (!strcmp(services[i].name, svc_name)) { target_port = services[i].port; break; }
+    }
+    if (!target_port) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","service not found");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    struct IPCPostRequest req;
+    req.msg.src_port = 0x0000;
+    req.msg.dst_port = target_port;
+    req.msg.opcode = opcode;
+    req.msg.payload[0]=0; req.msg.payload[1]=0; req.msg.payload[2]=0; req.msg.payload[3]=0;
+    req.msg.reply_token = 0;
+    uint64_t rc = sys_sls_ipc_post(&req);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false"); jb_putc(&j,',');
+    jb_uint(&j, "port", target_port);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/ipc/stat ───────────────────────────────────────────────────────
+// shell.c's "ipc stat" is actually aliased to sys_sls_svc_list() in
+// syscall_dispatch.c's dispatcher ("combined view" -- see that case's own
+// comment), which would just duplicate the existing GET /api/services under
+// a different name. This route instead surfaces the real ipc_stats extern
+// struct (kernel/ipc.c) plus a per-queue depth breakdown via
+// ipc_queue_depth() -- genuinely distinct data that had no JSON route at
+// all before this, a more honest promotion of "ipc stat" than literally
+// mirroring shell.c's own aliasing quirk would have been.
+static int api_ipc_stat(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "total_posted", ipc_stats.total_posted); jb_putc(&j, ',');
+    jb_uint(&j, "total_dispatched", ipc_stats.total_dispatched); jb_putc(&j, ',');
+    jb_uint(&j, "total_dropped", ipc_stats.total_dropped); jb_putc(&j, ',');
+    jb_uint(&j, "avg_latency_ns", ipc_stats.avg_latency_ns); jb_putc(&j, ',');
+    jb_arr_open(&j, "queues");
+    for (int p = IPC_PORT_FIRST; p <= IPC_PORT_LAST; p++) {
+        if (p != IPC_PORT_FIRST) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_hex(&j, "port", (uint16_t)p); jb_putc(&j, ',');
+        jb_uint(&j, "depth", (uint32_t)ipc_queue_depth((uint16_t)p));
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── Group 3: Journal / tier / object ──────────────────────────────────────────
+
+// ─── POST /api/journal ───────────────────────────────────────────────────────
+// Body: {"name"}. Mirrors shell.c's "journal create <name>" exactly: a
+// valloc of an OBJ_TYPE_JOURNAL object with size_pages=1, perm_mask=0 --
+// genuinely just sys_sls_valloc() under a friendlier name/shape, not new
+// kernel behavior. (Distinct from journal_attach()/journal_detach(), which
+// already have their own /api/journal/attach and /api/journal/detach
+// routes from an earlier phase.)
+static int api_journal_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVallocRequest req;
+    req.name[0] = '\0';
+    json_str(body, "name", req.name, OBJECT_NAME_LEN);
+    if (!req.name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    req.type = OBJ_TYPE_JOURNAL;
+    req.size_pages = 1;
+    req.owner_uid = req_uid;
+    req.perm_mask = 0;
+    req.partition_id = 0;
+    uint64_t id = sys_sls_valloc(&req);
+    jb_obj_open(&j,0);
+    if (id) { jb_str(&j,"ok","true"); jb_putc(&j,','); jb_hex(&j,"object_id",id); }
+    else    { jb_str(&j,"ok","false"); jb_putc(&j,','); jb_str(&j,"error","valloc failed"); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/journal/purge ────────────────────────────────────────────────
+// Body: {"name"}. journal_purge() (kernel/journal.c) returns void and
+// shell.c's own "journal purge" prints nothing either way -- there is
+// genuinely no success/failure signal anywhere in this call today, so this
+// always reports ok:true rather than fabricating a check the underlying
+// function doesn't perform.
+static int api_journal_purge_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[64]; name[0]='\0';
+    json_str(body, "name", name, sizeof(name));
+    journal_purge(name);
+    jb_obj_open(&j,0); jb_str(&j,"ok","true");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/tier/promote | /api/tier/demote ─────────────────────────────
+// Body: {"name"}.
+static int api_tier_promote_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_tier_promote(name);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+static int api_tier_demote_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_tier_demote(name);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vfree ─────────────────────────────────────────────────────────
+// Body: {"name"}.
+static int api_vfree_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_vfree(name);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── Group 4: Webapp / workflow ────────────────────────────────────────────────
+
+// ─── POST /api/webapp/set | /api/webapp/append ─────────────────────────────
+// Body: {"obj","path","content"}. `is_append` selects
+// WebAppSetRequest.append -- same one-function-two-routes shape used
+// throughout this file (partition pause/resume, tier promote/demote, etc.).
+static int api_webapp_set_post(const char* body, char* buf, int max, int is_append) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct WebAppSetRequest req;
+    req.obj_name[0] = '\0'; req.path[0] = '\0'; req.content[0] = '\0';
+    json_str(body, "obj", req.obj_name, OBJECT_NAME_LEN);
+    json_str(body, "path", req.path, WEBAPP_PATH_LEN);
+    json_str(body, "content", req.content, WEBAPP_CONTENT_LEN);
+    uint32_t clen = 0; while (req.content[clen]) clen++;
+    req.content_len = clen;
+    req.append = (uint8_t)is_append;
+    uint64_t rc = sys_sls_webapp_set(&req);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/webapp/list?obj=<name> ────────────────────────────────────────
+// obj omitted or "*" lists every stored asset across every WEB_APP object,
+// matching sys_sls_webapp_list()'s own "*" convention (kernel/webapp.c) --
+// iterates the extern webapp_store[] directly rather than that function's
+// serial-print body, same pattern every other "list" route in this file
+// already uses.
+static int api_webapp_list(const char* obj_filter, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    int all = (!obj_filter || !obj_filter[0] || !strcmp(obj_filter, "*"));
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "assets");
+    int first = 1;
+    for (int i = 0; i < WEBAPP_MAX_ASSETS; i++) {
+        if (!webapp_store[i].active) continue;
+        if (!all && strcmp(webapp_store[i].obj_name, obj_filter)) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "obj", webapp_store[i].obj_name); jb_putc(&j, ',');
+        jb_str(&j, "path", webapp_store[i].path); jb_putc(&j, ',');
+        jb_str(&j, "mime", webapp_store[i].mime); jb_putc(&j, ',');
+        jb_uint(&j, "content_len", webapp_store[i].content_len);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/workflow/addstep ─────────────────────────────────────────────
+// Body: {"workflow","agent","in","out"}. Inlines the same workflow_table[]
+// mutation user/shell.c's own "workflow addstep" carries directly (no
+// standalone function exists for this -- same "inline manipulation of
+// extern kernel state" pattern api_chmod_post() above uses).
+static int api_workflow_addstep_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char wf_name[OBJECT_NAME_LEN]; wf_name[0]='\0';
+    json_str(body, "workflow", wf_name, OBJECT_NAME_LEN);
+    char agent[OBJECT_NAME_LEN]; agent[0]='\0';
+    json_str(body, "agent", agent, OBJECT_NAME_LEN);
+    char in_key[RECORD_KEY_LEN]; in_key[0]='\0';
+    json_str(body, "in", in_key, RECORD_KEY_LEN);
+    char out_key[RECORD_KEY_LEN]; out_key[0]='\0';
+    json_str(body, "out", out_key, RECORD_KEY_LEN);
+
+    int done = 0;
+    for (int wi = 0; wi < WORKFLOW_MAX; wi++) {
+        if (!workflow_table[wi].active || strcmp(workflow_table[wi].name, wf_name)) continue;
+        uint8_t s = workflow_table[wi].step_count;
+        if (s >= WORKFLOW_MAX_STEPS) {
+            jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+            jb_str(&j,"error","step table full");
+            jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+        }
+        // Manual copy loop rather than strncpy -- this file never includes
+        // <string.h> and relies on implicit strcmp/strlen declarations
+        // throughout, but strncpy specifically had no prior call site here,
+        // so it's avoided rather than adding a new implicit-declaration
+        // dependency.
+        { uint32_t ci = 0; while (agent[ci] && ci < OBJECT_NAME_LEN-1) { workflow_table[wi].steps[s].agent_name[ci] = agent[ci]; ci++; } workflow_table[wi].steps[s].agent_name[ci] = '\0'; }
+        { uint32_t ci = 0; while (in_key[ci] && ci < RECORD_KEY_LEN-1) { workflow_table[wi].steps[s].input_key[ci] = in_key[ci]; ci++; } workflow_table[wi].steps[s].input_key[ci] = '\0'; }
+        { uint32_t ci = 0; while (out_key[ci] && ci < RECORD_KEY_LEN-1) { workflow_table[wi].steps[s].output_key[ci] = out_key[ci]; ci++; } workflow_table[wi].steps[s].output_key[ci] = '\0'; }
+        workflow_table[wi].step_count++;
+        done = 1;
+        break;
+    }
+    jb_obj_open(&j,0); jb_str(&j,"ok", done?"true":"false");
+    if (!done) { jb_putc(&j,','); jb_str(&j,"error","workflow not found"); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── Group 5: Legacy loader ─────────────────────────────────────────────────────
+// All five of these are the older TIMI/SIMI-predecessor loader subsystem
+// (kernel/loader.h) plus one raw-pointer heap primitive (SYS_SLS_ALLOCATE) --
+// already explicitly labeled "legacy" in shellCommands.ts, superseded by
+// "program upload"/"stream upload" (loader.h's own newer object-catalog-
+// based upload flow, already promoted) and "insert"/"sql" for data writes.
+// Included in this pass per explicit user choice rather than skipped, but
+// nothing below grants any new capability -- every one of these was already
+// reachable at the same trust level through POST /api/shell/exec.
+
+// ─── POST /api/write ─────────────────────────────────────────────────────────
+// Body: {"name","payload"}. Legacy raw heap write -- finds the object's
+// mapped base_vaddr and writes the payload string directly into that
+// address. shell.c's "write" command reaches this via
+// do_syscall(SYS_SLS_ALLOCATE, ...), which syscall_dispatch.c actually
+// routes to its own `static sls_legacy_allocate()` (NOT kernel/stubs.c's
+// sys_sls_allocate() -- that function is undeclared in any header and
+// appears to be dead from this call path, reachable only via the raw
+// assembly syscall trampoline). sls_legacy_allocate() is itself `static`
+// with no header declaration, so its object_id-lookup body is replicated
+// inline here rather than called, matching this file's established
+// "inline manipulation of extern kernel state when no proper function
+// exists" pattern (see api_chmod_post, api_workflow_addstep_post). Since
+// AeroSLS is a single flat address space, the numeric base_vaddr is
+// directly usable as a pointer in this process too.
+static int api_write_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[OBJECT_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, OBJECT_NAME_LEN);
+    char payload[4096]; payload[0]='\0';
+    json_str(body, "payload", payload, sizeof(payload));
+    uint64_t base_vaddr = 0;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (object_catalog[i].active && !strcmp(object_catalog[i].name, name)) {
+            base_vaddr = object_catalog[i].base_vaddr;
+            break;
+        }
+    }
+    if (!base_vaddr) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","object not found");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    char* ptr = (char*)(uintptr_t)base_vaddr;
+    uint32_t i = 0; while (payload[i] && i < 4095) { ptr[i] = payload[i]; i++; }
+    ptr[i] = '\0';
+    jb_obj_open(&j,0); jb_str(&j,"ok","true");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/demo ──────────────────────────────────────────────────────────
+// Body: {"name"}. Writes the built-in demo binary (aerosls_demo_bin[]) to
+// the named object, then loads + spawns it -- exact mirror of shell.c's own
+// "demo <name>" (upload-then-load in one call).
+static int api_demo_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    static struct SLSUploadRequest req;
+    req.object_name[0] = '\0';
+    json_str(body, "name", req.object_name, PROC_NAME_LEN);
+    req.byte_offset = 0;
+    req.chunk_len = aerosls_demo_bin_size < UPLOAD_CHUNK_MAX ? aerosls_demo_bin_size : UPLOAD_CHUNK_MAX;
+    for (uint32_t i = 0; i < req.chunk_len; i++) req.chunk[i] = aerosls_demo_bin[i];
+    req.is_last = 1;
+    sys_sls_upload_binary(&req);
+    uint64_t entry = sys_sls_load(req.object_name, req_uid);
+    jb_obj_open(&j,0); jb_str(&j,"ok", entry!=0?"true":"false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/load ───────────────────────────────────────────────────────────
+// Body: {"name"}. Loads an already-uploaded binary (via "upload" below, or
+// the newer "program upload") and spawns it as a process.
+static int api_load_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    char name[PROC_NAME_LEN]; name[0]='\0';
+    json_str(body, "name", name, PROC_NAME_LEN);
+    uint64_t entry = sys_sls_load(name, req_uid);
+    jb_obj_open(&j,0); jb_str(&j,"ok", entry!=0?"true":"false"); jb_putc(&j,',');
+    jb_hex(&j, "entry_point", entry);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/loader/list ────────────────────────────────────────────────────
+// Iterates the extern service_binaries[] directly (kernel/loader.h), same
+// pattern every other "list" route in this file uses, rather than
+// loader_list()'s own serial-print body.
+static int api_loader_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "binaries");
+    int first = 1;
+    for (int i = 0; i < MAX_SERVICE_BINARIES; i++) {
+        if (!service_binaries[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "name", service_binaries[i].object_name); jb_putc(&j, ',');
+        jb_uint(&j, "size", service_binaries[i].size); jb_putc(&j, ',');
+        jb_str(&j, "format", binary_format_name(&service_binaries[i]));
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/upload ────────────────────────────────────────────────────────
+// Body: {"name","hex"}. Legacy single-shot loader upload (always
+// is_last=1, no offset/chunking support) -- note this ends up calling the
+// exact same sys_sls_upload_binary()/struct SLSUploadRequest the already-
+// existing POST /api/program/upload route does; "upload" is a strict
+// subset of that route's own chunked-upload capability, not new
+// functionality. Reuses that route's hex_decode() helper rather than
+// re-deriving hex parsing a third time in this file.
+static int api_upload_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    static struct SLSUploadRequest req;
+    req.object_name[0] = '\0';
+    json_str(body, "name", req.object_name, PROC_NAME_LEN);
+    static char hex_buf[UPLOAD_CHUNK_MAX * 2 + 4];
+    hex_buf[0] = '\0';
+    json_str(body, "hex", hex_buf, (int)sizeof(hex_buf));
+    req.byte_offset = 0;
+    req.chunk_len = (uint32_t)hex_decode(hex_buf, req.chunk, UPLOAD_CHUNK_MAX);
+    req.is_last = 1;
+    if (req.chunk_len == 0) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","hex decode produced zero bytes");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t rc = sys_sls_upload_binary(&req);
+    jb_obj_open(&j,0); jb_str(&j,"ok", rc==0?"true":"false"); jb_putc(&j,',');
+    jb_uint(&j, "bytes_written", req.chunk_len);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // req[] is a NUL-terminated string of the raw HTTP request.
 static void http_route(int conn, char* req) {
     // Parse: METHOD /path[?qs] HTTP/x.x
@@ -2882,6 +3553,36 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/auth/verify")) {
             blen = api_auth_verify(req, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Shell-Command JSON-Promotion Roadmap: new GET routes ───────────────
+        if (!strcmp(path, "/api/session/whoami")) {
+            // Re-extracts identity locally (get_uid/get_role above are scoped
+            // to the gate block right above, not visible down here) -- same
+            // "each dispatch section calls auth_http_extract() with its own
+            // local vars" pattern the POST and DELETE blocks below already
+            // use independently.
+            uint32_t who_uid = 0; SLSRole who_role = ROLE_GUEST;
+            auth_http_extract(req, &who_uid, &who_role);
+            blen = api_session_whoami(who_uid, who_role, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/auth/tokens")) {
+            blen = api_auth_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/ipc/stat")) {
+            blen = api_ipc_stat(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/webapp/list")) {
+            char obj_filter[OBJECT_NAME_LEN]; obj_filter[0] = '\0';
+            url_param(qs, "obj", obj_filter, OBJECT_NAME_LEN);
+            blen = api_webapp_list(obj_filter, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/loader/list")) {
+            blen = api_loader_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/health")) {
@@ -3554,6 +4255,105 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/workflow/run")) {
             blen = api_workflow_run(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+
+        // ── Shell-Command JSON-Promotion Roadmap: new POST routes ──────────────
+        // Group 1: security / session
+        if (!strcmp(path, "/api/role/set")) {
+            blen = api_role_set_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/grant")) {
+            blen = api_grant_post(body_ptr, resp_body, (int)sizeof(resp_body), 1);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/revoke")) {
+            blen = api_grant_post(body_ptr, resp_body, (int)sizeof(resp_body), 0);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/chmod")) {
+            blen = api_chmod_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/auth/create")) {
+            blen = api_auth_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/auth/revoke")) {
+            blen = api_auth_revoke_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/seal")) {
+            blen = api_seal_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // Group 2: process / service / IPC
+        if (!strcmp(path, "/api/svc/crash")) {
+            blen = api_svc_crash_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/svc/restart")) {
+            blen = api_svc_restart_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/proc/kill")) {
+            blen = api_proc_kill_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/ipc/post")) {
+            blen = api_ipc_post_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // Group 3: journal / tier / object
+        if (!strcmp(path, "/api/journal")) {
+            blen = api_journal_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/journal/purge")) {
+            blen = api_journal_purge_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/tier/promote")) {
+            blen = api_tier_promote_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/tier/demote")) {
+            blen = api_tier_demote_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vfree")) {
+            blen = api_vfree_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // Group 4: webapp / workflow
+        if (!strcmp(path, "/api/webapp/set")) {
+            blen = api_webapp_set_post(body_ptr, resp_body, (int)sizeof(resp_body), 0);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/webapp/append")) {
+            blen = api_webapp_set_post(body_ptr, resp_body, (int)sizeof(resp_body), 1);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/workflow/addstep")) {
+            blen = api_workflow_addstep_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // Group 5: legacy loader
+        if (!strcmp(path, "/api/write")) {
+            blen = api_write_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/demo")) {
+            blen = api_demo_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/load")) {
+            blen = api_load_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/upload")) {
+            blen = api_upload_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
     }
