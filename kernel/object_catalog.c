@@ -267,6 +267,13 @@ uint64_t sys_sls_valloc(struct SLSVallocRequest* req) {
     // partition other than its own).
     e->partition_id = req->partition_id ? req->partition_id
                                         : partition_get_for_uid(req->owner_uid);
+    // Database Namespace Roadmap Phase 1: a plain, unconditional copy --
+    // no owner-resolution defaulting needed here, unlike partition_id
+    // just above, because a database tag is a soft additive grant
+    // (Phase 3), never a hard boundary catalog_check_access() could lock
+    // an owner out from. 0 (NONE) if the caller doesn't set it, matching
+    // every pre-this-phase valloc call site by struct zero-init exactly.
+    e->database_id  = req->database_id;
     e->active       = 1;
 
     // Initialise an empty record store for this slot

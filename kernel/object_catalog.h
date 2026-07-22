@@ -96,6 +96,16 @@ struct SLSObjectEntry {
                                              // zero-init) and for every object that never opts
                                              // in: it keeps using the legacy single-record
                                              // object_records[] path exactly as before.
+    uint32_t       database_id;             // Database Namespace Roadmap Phase 1 — see
+                                             // database.h; 0 (NONE/unassigned) for every object
+                                             // predating this phase, by struct zero-init, and
+                                             // for every object that never opts in. A soft,
+                                             // additive permission/organization tag, NOT a hard
+                                             // isolation boundary like partition_id above — see
+                                             // database.h's own header comment for why this
+                                             // field's defaulting logic is a plain, unconditional
+                                             // copy rather than partition_id's owner-resolution
+                                             // dance.
 };
 
 // ─── Role Assignment Table ────────────────────────────────────────────────────
@@ -178,6 +188,12 @@ struct SLSVallocRequest {
                                    // in; 0 (PARTITION_SYSTEM/DEFAULT) if the caller
                                    // doesn't set it (zero-initialized request struct),
                                    // matching every pre-Phase-8 valloc call site exactly
+    uint32_t      database_id;    // Database Namespace Roadmap Phase 1: which database
+                                   // (if any) this object belongs to; 0 (NONE) if the
+                                   // caller doesn't set it — see database.h and
+                                   // SLSObjectEntry.database_id's own comment for why
+                                   // this is a plain copy, unlike partition_id's
+                                   // owner-resolution defaulting.
 };
 
 struct SLSRecordRequest {
