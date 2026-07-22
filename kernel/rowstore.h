@@ -240,6 +240,26 @@ struct SLSRowstoreCreateTableRequest {
 // return contract) -- req->status is always filled in either way.
 uint64_t sys_sls_rowstore_create_table(struct SLSRowstoreCreateTableRequest* req);
 
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): real DROP TABLE cleanup (not
+// just sys_sls_vfree()'s bare catalog deactivation) -- see rowstore.c's own
+// header comment on this function for the full scope writeup. Returns 0 on
+// success. Non-zero: 1 = table not found / not a row-set table. 2 =
+// permission denied (caller_uid needs PERM_WRITE).
+int rowstore_drop_table(uint32_t caller_uid, const char* table_name);
+
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): live ALTER TABLE ADD COLUMN --
+// a real storage-layout migration (row_width changes, every existing row
+// is rewritten into fresh pages, any row_index on this table is rebuilt).
+// See rowstore.c's own header comment on this function for the full scope
+// writeup, including ROWSTORE_ADD_COLUMN_MAX_ROWS and the "old pages
+// leaked, not reclaimed" limitation. Returns 0 on success. Non-zero: 1 =
+// table not found/not a row-set table. 2 = permission denied. 3 = column
+// name already exists. 4 = column/schema field capacity exhausted. 6 =
+// page pool exhausted during migration. 7 = row count exceeds
+// ROWSTORE_ADD_COLUMN_MAX_ROWS.
+int rowstore_add_column(uint32_t caller_uid, const char* table_name,
+                        const char* column_name, SLSFieldType column_type);
+
 // Row CRUD. Every call resolves table_name to a catalog entry and gates on
 // catalog_check_access() first (PERM_READ for get/scan, PERM_WRITE for
 // insert/update/delete) — see the header comment above for why this is a

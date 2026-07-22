@@ -335,6 +335,35 @@ MvccError mvcc_resolve_physical(uint64_t txn_id, uint32_t caller_uid, const char
 // posture for every other rebuild-on-boot step Phase D added.
 void mvcc_bootstrap_from_rowstore(void);
 
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): the single-table analog of
+// mvcc_bootstrap_from_rowstore() above, for kernel/rowstore.c's ALTER
+// TABLE ADD COLUMN migration (rowstore_add_column()). That migration gives
+// every row of the table a brand-new physical RowId (fresh pages, new
+// layout) -- any mvcc_versions[] entry recorded before the migration still
+// points at the old, now-abandoned physical location and would silently
+// read stale/misaligned data forever if left alone (confirmed by direct
+// trace: mvcc_row_get() resolves purely through the cached physical_id,
+// never re-derives it). Deliberately called from sql_exec.c's exec_alter_
+// table(), not from rowstore.c itself -- rowstore.c has never depended on
+// mvcc.h (mvcc.c depends on rowstore.h, not the other way around) and
+// every pre-Phase-5 host test that links rowstore.c without mvcc.c would
+// break at link time if that changed; sql_exec.c already depends on both
+// unconditionally, making it the natural, zero-new-dependency call site.
+//
+// Every existing mvcc_versions[] entry for table_object_id is deactivated
+// first (not reclaimed -- matches this file's pre-existing "no reclaim in
+// first cut" posture), then the table is rescanned via rowstore_table_
+// scan() and each row re-bootstrapped exactly like a cold boot's own
+// restore path would (xmin_committed=1, xmin_txn=0, "committed since
+// before time began"). A transaction with an in-flight (uncommitted)
+// write against this specific table at the moment ADD COLUMN runs would
+// lose that pending write's own version tracking -- named explicitly: DDL
+// is assumed to run without a concurrent writer against the same table,
+// the same "DDL is not itself transactional" posture sql_exec.c's own
+// exec_create_table() header comment already establishes for CREATE
+// TABLE's own multi-step, non-atomic flow.
+void mvcc_rebuild_versions_for_table(uint64_t table_object_id, const char* table_name);
+
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 // Zeroes the transaction table and version pool, resets both monotonic
 // counters (next txn_id, next logical_id) and the global commit-sequence

@@ -127,6 +127,19 @@ void row_index_init(void);
 int row_index_create(uint32_t caller_uid, const char* index_name,
                      const char* table_name, const char* column_name);
 
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): drops a previously-created
+// index. Deactivates the row_indexes[] slot (bump-allocated like every
+// other table here -- ROW_INDEX_MAX, ROW_CONSTRAINT_MAX -- "no reclaim in
+// first cut" is this whole subsystem's pre-existing, named posture, not a
+// new limitation introduced here: the B-tree node pool entries this
+// index's nodes occupied are simply abandoned, exactly like row_indexes[]
+// slots and row_constraints[] slots already are on every other "remove"
+// path in this codebase). Does NOT touch the underlying table's rows.
+// Returns 0 on success. Non-zero: 1 = index not found (or its table no
+// longer exists). 2 = permission denied (caller_uid needs PERM_WRITE on
+// the underlying table, matching row_index_create()'s own gate).
+int row_index_drop(uint32_t caller_uid, const char* index_name);
+
 // ─── Auto-maintenance hooks — called by kernel/rowstore.c after a successful
 // row mutation on a table that has one or more indexes defined. Not
 // separately access-gated: the mutation that triggered the call already

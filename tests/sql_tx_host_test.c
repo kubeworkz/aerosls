@@ -161,6 +161,17 @@ static void select_one(const char* where_val, char* out, uint32_t outmax) {
     else out[0] = '\0';
 }
 
+// ─── Phase 5 (SQL Feature-Parity Roadmap, DDL) stand-ins -- sql_exec.c's
+// new exec_create_table() now unconditionally calls sys_sls_valloc()/
+// sys_sls_schema_set(), and rowstore.c's new rowstore_drop_table() now
+// unconditionally calls sys_sls_vfree() (real object_catalog.c cleanup
+// this test doesn't link). This test never exercises CREATE/DROP TABLE
+// via SQL text at runtime, so failure-code no-ops are safe here -- see
+// tests/sql_ddl_phase5_host_test.c for the real coverage of these paths. ──
+uint64_t sys_sls_valloc(struct SLSVallocRequest* req) { (void)req; return 0; }
+uint64_t sys_sls_schema_set(struct SLSSchemaRequest* req) { (void)req; return 1; }
+uint64_t sys_sls_vfree(const char* name) { (void)name; return 1; }
+
 int main(void) {
     row_index_init();
     rowstore_init();

@@ -204,6 +204,15 @@ typedef enum {
     // Phase 1 (SQL Feature-Parity Roadmap):
     SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED, // GROUP BY/aggregate select list combined with JOIN in one statement -- a real, named scope cut, not an oversight (see sql_parser.h)
     SQL_ERR_GROUP_BY_COLUMN_INVALID,   // a SELECT-list column under GROUP BY/aggregates is neither the GROUP BY column nor an aggregate call
+    // Phase 5 (SQL Feature-Parity Roadmap): DDL. A catch-all for the
+    // structured, non-string error codes rowstore_create_table()/
+    // rowstore_drop_table()/rowstore_add_column()/row_index_create()/
+    // row_index_drop() already return (small ints, not their own enums) --
+    // error_msg carries the specific reason, matching this whole file's
+    // existing convention of mapping a lower-level int code into one
+    // SqlErrorCode plus a descriptive message rather than growing a new
+    // SqlErrorCode value per underlying function's every return code.
+    SQL_ERR_DDL_FAILED,
     SQL_ERR_INTERNAL,
 } SqlErrorCode;
 

@@ -8,6 +8,7 @@
 #include "cursor.h"
 #include "mvcc.h"
 #include "row_index.h"
+#include "row_constraint.h"   // Phase 5 (SQL Feature-Parity Roadmap, DDL): inline column constraints
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -1238,6 +1239,195 @@ static void exec_delete(uint64_t txn_id, uint32_t caller_uid, const struct SqlDe
     out->truncated     = (total > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
 }
 
+// ── Phase 5 (SQL Feature-Parity Roadmap): DDL executor dispatch. ───────────
+// None of these five take a txn_id -- DDL isn't a row-data mutation mvcc.c
+// wraps, it's a catalog/schema/index/constraint change that calls straight
+// into object_catalog.c/rowstore.c/row_index.c/row_constraint.c, exactly
+// like the pre-existing direct-API/HTTP path already does (see rowstore.c's
+// own rowstore_create_table()/rowstore_drop_table()/rowstore_add_column()
+// header comments). dispatch_stmt() still requires an active txn_id before
+// reaching any of these (see its own header comment) purely for uniformity
+// with every other statement kind, not because DDL itself is transactional.
+
+// CREATE TABLE chains the same three-step flow the pre-existing HTTP routes
+// already expose separately (POST /api/valloc -> POST /api/schema -> POST
+// /api/tables, see net/http.c's api_table_create_post()/api_schema_set_
+// post() header comments) into one SQL statement, then registers any
+// inline column constraints (NOT NULL/UNIQUE/REFERENCES) via row_
+// constraint_add_*() in column-definition order. If a later step fails
+// (schema_set, promotion, or a constraint registration), earlier steps are
+// NOT rolled back -- the table may be left partially defined (e.g. valloc'd
+// but not yet promoted, or promoted but missing a later inline constraint).
+// This matches this codebase's existing, established behavior for the
+// exact same multi-step flow over HTTP (api_schema_set_post()'s own header
+// comment: "Stops at the first column that fails ... rather than silently
+// applying a partial schema") -- not a new limitation introduced here, and
+// named explicitly rather than silently differing between the two paths.
+static void exec_create_table(uint32_t caller_uid, struct SqlCreateTableStmt* s, struct SqlResult* out) {
+    if (s->column_count == 0) {
+        out->error = SQL_ERR_DDL_FAILED;
+        se_strcpy(out->error_msg, "CREATE TABLE requires at least one column", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    struct SLSVallocRequest vreq;
+    se_memset(&vreq, 0, sizeof(vreq));
+    se_strcpy(vreq.name, s->table_name, OBJECT_NAME_LEN);
+    vreq.type         = OBJ_TYPE_DB_TABLE;
+    vreq.size_pages   = 1;
+    vreq.owner_uid    = caller_uid;
+    vreq.perm_mask    = 0;   // owner_uid always has full access -- catalog_check_access()
+    vreq.partition_id = 0;
+    uint64_t obj_id = sys_sls_valloc(&vreq);
+    if (!obj_id) {
+        out->error = SQL_ERR_DDL_FAILED;
+        se_strcpy(out->error_msg, "CREATE TABLE failed: table name already exists or catalog is full", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    for (uint32_t i = 0; i < s->column_count; i++) {
+        struct SLSSchemaRequest sreq;
+        se_strcpy(sreq.object_name, s->table_name, OBJECT_NAME_LEN);
+        se_strcpy(sreq.key, s->columns[i].name, RECORD_KEY_LEN);
+        sreq.type = s->columns[i].type;
+        if (sys_sls_schema_set(&sreq) != 0) {
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE TABLE failed while defining a column (schema_set)", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+
+    if (rowstore_create_table(s->table_name) != 0) {
+        out->error = SQL_ERR_DDL_FAILED;
+        se_strcpy(out->error_msg, "CREATE TABLE failed while promoting to a row-set table", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    for (uint32_t i = 0; i < s->column_count; i++) {
+        struct SqlColumnDef* c = &s->columns[i];
+        if (c->not_null && row_constraint_add_not_null(s->table_name, c->name) != ROW_CONSTRAINT_OK) {
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE TABLE: NOT NULL constraint registration failed", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (c->is_unique && row_constraint_add_unique(s->table_name, c->name) != ROW_CONSTRAINT_OK) {
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE TABLE: UNIQUE constraint registration failed", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (c->has_reference &&
+            row_constraint_add_reference(s->table_name, c->name, c->ref_table, c->ref_column) != ROW_CONSTRAINT_OK) {
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE TABLE: REFERENCES constraint registration failed", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+
+    out->error = SQL_ERR_NONE;
+}
+
+static void exec_alter_table(uint32_t caller_uid, struct SqlAlterTableStmt* s, struct SqlResult* out) {
+    int rc = rowstore_add_column(caller_uid, s->table_name, s->column_name, s->column_type);
+    switch (rc) {
+        case 0: {
+            // rowstore_add_column() gave every row a brand-new physical
+            // RowId (fresh pages, new layout) -- mvcc.c's own per-row
+            // version cache (mvcc_versions[]) still points at the old,
+            // now-abandoned physical locations unless explicitly rebuilt
+            // here. See mvcc.h's own header comment on mvcc_rebuild_
+            // versions_for_table() for why this lives here (sql_exec.c)
+            // rather than inside rowstore.c itself.
+            int tidx = -1;
+            for (uint32_t i = 0; i < object_catalog_count; i++) {
+                if (object_catalog[i].active && se_streq(object_catalog[i].name, s->table_name)) { tidx = (int)i; break; }
+            }
+            if (tidx >= 0) mvcc_rebuild_versions_for_table(object_catalog[tidx].object_id, s->table_name);
+            out->error = SQL_ERR_NONE;
+            return;
+        }
+        case 1:
+            out->error = SQL_ERR_TABLE_NOT_FOUND;
+            se_strcpy(out->error_msg, "ALTER TABLE: table not found or not a row-set table", SQL_ERR_MSG_LEN);
+            return;
+        case 2:
+            out->error = SQL_ERR_PERMISSION_DENIED;
+            se_strcpy(out->error_msg, "ALTER TABLE: permission denied", SQL_ERR_MSG_LEN);
+            return;
+        case 3:
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "ALTER TABLE: column name already exists", SQL_ERR_MSG_LEN);
+            return;
+        case 4:
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "ALTER TABLE: column/schema capacity exhausted", SQL_ERR_MSG_LEN);
+            return;
+        case 6:
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "ALTER TABLE: page pool exhausted during migration", SQL_ERR_MSG_LEN);
+            return;
+        case 7:
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "ALTER TABLE: too many existing rows to migrate in one call", SQL_ERR_MSG_LEN);
+            return;
+        default:
+            out->error = SQL_ERR_INTERNAL;
+            se_strcpy(out->error_msg, "ALTER TABLE: unexpected error", SQL_ERR_MSG_LEN);
+            return;
+    }
+}
+
+static void exec_drop_table(uint32_t caller_uid, struct SqlDropTableStmt* s, struct SqlResult* out) {
+    int rc = rowstore_drop_table(caller_uid, s->table_name);
+    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    if (rc == 2) {
+        out->error = SQL_ERR_PERMISSION_DENIED;
+        se_strcpy(out->error_msg, "DROP TABLE: permission denied", SQL_ERR_MSG_LEN);
+        return;
+    }
+    out->error = SQL_ERR_TABLE_NOT_FOUND;
+    se_strcpy(out->error_msg, "DROP TABLE: table not found or not a row-set table", SQL_ERR_MSG_LEN);
+}
+
+static void exec_create_index(uint32_t caller_uid, struct SqlCreateIndexStmt* s, struct SqlResult* out) {
+    int rc = row_index_create(caller_uid, s->index_name, s->table_name, s->column_name);
+    switch (rc) {
+        case 0:
+            out->error = SQL_ERR_NONE;
+            return;
+        case 1:
+            out->error = SQL_ERR_TABLE_NOT_FOUND;
+            se_strcpy(out->error_msg, "CREATE INDEX: table not found or not a row-set table", SQL_ERR_MSG_LEN);
+            return;
+        case 2:
+            out->error = SQL_ERR_PERMISSION_DENIED;
+            se_strcpy(out->error_msg, "CREATE INDEX: permission denied", SQL_ERR_MSG_LEN);
+            return;
+        case 3:
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "CREATE INDEX: column not found", SQL_ERR_MSG_LEN);
+            return;
+        case 4:
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE INDEX: index name already used or index capacity exhausted", SQL_ERR_MSG_LEN);
+            return;
+        default:
+            out->error = SQL_ERR_NONE;   // row_index_create()'s own rc==5 case is a logged warning, not a failure -- index was still created
+            return;
+    }
+}
+
+static void exec_drop_index(uint32_t caller_uid, struct SqlDropIndexStmt* s, struct SqlResult* out) {
+    int rc = row_index_drop(caller_uid, s->index_name);
+    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    if (rc == 2) {
+        out->error = SQL_ERR_PERMISSION_DENIED;
+        se_strcpy(out->error_msg, "DROP INDEX: permission denied", SQL_ERR_MSG_LEN);
+        return;
+    }
+    out->error = SQL_ERR_DDL_FAILED;
+    se_strcpy(out->error_msg, "DROP INDEX: index not found", SQL_ERR_MSG_LEN);
+}
+
 // See exec_select's own comment above on why this is static scratch, not a
 // stack-local: struct SqlStatement embeds a struct Predicate (32 nodes x a
 // 256-byte literal each), several KB on its own -- too large to put on a
@@ -1267,6 +1457,14 @@ static void dispatch_stmt(uint64_t txn_id, uint32_t caller_uid, struct SqlStatem
         case SQL_STMT_INSERT: exec_insert(txn_id, caller_uid, &stmt->u.insert, out); break;
         case SQL_STMT_UPDATE: exec_update(txn_id, caller_uid, &stmt->u.update, out); break;
         case SQL_STMT_DELETE: exec_delete(txn_id, caller_uid, &stmt->u.del,    out); break;
+        // Phase 5 (SQL Feature-Parity Roadmap): DDL -- (void)txn_id, none of
+        // these five touch mvcc.c (see the header comment right above
+        // exec_create_table() for why).
+        case SQL_STMT_CREATE_TABLE: exec_create_table(caller_uid, &stmt->u.create_table, out); break;
+        case SQL_STMT_ALTER_TABLE:  exec_alter_table(caller_uid, &stmt->u.alter_table,   out); break;
+        case SQL_STMT_DROP_TABLE:   exec_drop_table(caller_uid, &stmt->u.drop_table,     out); break;
+        case SQL_STMT_CREATE_INDEX: exec_create_index(caller_uid, &stmt->u.create_index, out); break;
+        case SQL_STMT_DROP_INDEX:   exec_drop_index(caller_uid, &stmt->u.drop_index,     out); break;
         default:
             out->error = SQL_ERR_INTERNAL;
             se_strcpy(out->error_msg, "unhandled statement kind", SQL_ERR_MSG_LEN);

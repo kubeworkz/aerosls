@@ -333,6 +333,12 @@ typedef enum {
     SQL_STMT_INSERT,
     SQL_STMT_UPDATE,
     SQL_STMT_DELETE,
+    // Phase 5 (SQL Feature-Parity Roadmap): DDL.
+    SQL_STMT_CREATE_TABLE,
+    SQL_STMT_ALTER_TABLE,
+    SQL_STMT_DROP_TABLE,
+    SQL_STMT_CREATE_INDEX,
+    SQL_STMT_DROP_INDEX,
     SQL_STMT_INVALID,
 } SqlStmtKind;
 
@@ -477,13 +483,69 @@ struct SqlDeleteStmt {
     struct Predicate where;
 };
 
+// ── Phase 5 (SQL Feature-Parity Roadmap): DDL. ──────────────────────────────
+// One column definition inside a CREATE TABLE's column list. Inline
+// constraint syntax (NOT NULL / UNIQUE / REFERENCES table(col)) is parsed
+// here and translated into row_constraint_add_*() calls at CREATE TABLE
+// exec time -- not a separate ALTER TABLE ADD CONSTRAINT statement (out of
+// scope; matches row_constraint.h's own "registration is a direct API
+// call" precedent, just reached from CREATE TABLE grammar instead of a
+// host test now). At most one of has_reference/is_unique/not_null combined
+// per column in this first cut -- a column CAN be both UNIQUE and NOT NULL
+// and REFERENCES all at once (they're independent flags, not mutually
+// exclusive), this comment just clarifies none of them are themselves
+// combinable with a second instance of themselves (e.g. two REFERENCES).
+struct SqlColumnDef {
+    char         name[RECORD_KEY_LEN];
+    SLSFieldType type;
+    uint8_t      not_null;
+    uint8_t      is_unique;
+    uint8_t      has_reference;
+    char         ref_table[OBJECT_NAME_LEN];
+    char         ref_column[RECORD_KEY_LEN];
+};
+
+struct SqlCreateTableStmt {
+    char     table_name[OBJECT_NAME_LEN];
+    struct SqlColumnDef columns[ROWSTORE_MAX_COLUMNS];
+    uint32_t column_count;
+};
+
+// ALTER TABLE ... ADD COLUMN only for v1 -- see rowstore.c's rowstore_add_
+// column() header comment for why DROP COLUMN/RENAME are real, separate,
+// bigger storage-layout undertakings scoped out of this phase.
+struct SqlAlterTableStmt {
+    char         table_name[OBJECT_NAME_LEN];
+    char         column_name[RECORD_KEY_LEN];
+    SLSFieldType column_type;
+};
+
+struct SqlDropTableStmt {
+    char table_name[OBJECT_NAME_LEN];
+};
+
+struct SqlCreateIndexStmt {
+    char index_name[OBJECT_NAME_LEN];
+    char table_name[OBJECT_NAME_LEN];
+    char column_name[RECORD_KEY_LEN];
+};
+
+struct SqlDropIndexStmt {
+    char index_name[OBJECT_NAME_LEN];
+};
+
 struct SqlStatement {
     SqlStmtKind kind;
     union {
-        struct SqlSelectStmt select;
-        struct SqlInsertStmt insert;
-        struct SqlUpdateStmt update;
-        struct SqlDeleteStmt del;
+        struct SqlSelectStmt      select;
+        struct SqlInsertStmt      insert;
+        struct SqlUpdateStmt      update;
+        struct SqlDeleteStmt      del;
+        struct SqlCreateTableStmt create_table;
+        struct SqlAlterTableStmt  alter_table;
+        struct SqlDropTableStmt   drop_table;
+        struct SqlCreateIndexStmt create_index;
+        struct SqlDropIndexStmt   drop_index;
     } u;
 };
 

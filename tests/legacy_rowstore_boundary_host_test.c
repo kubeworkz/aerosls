@@ -64,6 +64,8 @@
 #include "kernel/partition.h"
 #include "kernel/rowstore.h"
 #include "kernel/row_index.h"
+#include "kernel/row_constraint.h"
+#include "kernel/row_journal.h"
 #include "kernel/journal.h"
 #include "kernel/lock_mgr.h"
 #include "kernel/index_mgr.h"
@@ -118,6 +120,34 @@ void row_index_notify_delete(uint64_t table_object_id, struct RowId id,
                              const struct RowValues* values, const struct RowTableLayout* layout) {
     (void)table_object_id; (void)id; (void)values; (void)layout;
 }
+
+// ─── Phase 5 (SQL Feature-Parity Roadmap): rowstore.c's new
+// rowstore_drop_table()/rowstore_add_column() reference row_indexes[]/
+// row_constraints[]/row_journal_attachments[] and row_index_create()/
+// row_index_drop()/persist_row_index_defs()/persist_row_constraints()/
+// persist_row_journal() directly (real cross-subsystem cleanup, not just
+// the row-CRUD notify hooks above) -- this test never calls DROP TABLE/
+// ALTER TABLE ADD COLUMN (it only exercises rowstore_create_table()), so
+// these are all true no-ops/empty-array stand-ins, kept here rather than
+// linking the real row_index.c/row_constraint.c/row_journal.c files to
+// preserve this test's own stated narrow-dependency-graph design (see
+// header comment above). ────────────────────────────────────────────────
+struct RowIndex row_indexes[ROW_INDEX_MAX];
+struct RowConstraintDef row_constraints[ROW_CONSTRAINT_MAX];
+uint32_t row_constraint_count = 0;
+struct RowJournalAttachment row_journal_attachments[ROW_JOURNAL_MAX_ATTACHMENTS];
+uint32_t row_journal_attachment_count = 0;
+int row_index_create(uint32_t caller_uid, const char* index_name,
+                     const char* table_name, const char* column_name) {
+    (void)caller_uid; (void)index_name; (void)table_name; (void)column_name;
+    return 1;
+}
+int row_index_drop(uint32_t caller_uid, const char* index_name) {
+    (void)caller_uid; (void)index_name; return 1;
+}
+void persist_row_index_defs(void) {}
+void persist_row_constraints(void) {}
+void persist_row_journal(void) {}
 
 // ─── partition.c stand-in: uid 0 (kernel) short-circuits catalog_check_access()
 // before this is ever consulted; every other uid this test uses defaults to

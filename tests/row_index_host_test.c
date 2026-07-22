@@ -171,6 +171,13 @@ static struct RowValues row_of(uint64_t id, const char* name, int active, double
     return v;
 }
 
+// ─── Phase 5 (SQL Feature-Parity Roadmap, DDL) stand-in -- rowstore.c's
+// new rowstore_drop_table() now unconditionally calls sys_sls_vfree() (real
+// object_catalog.c cleanup this test doesn't link). This test never
+// exercises DROP TABLE, so a failure-code no-op is safe here -- see
+// tests/sql_ddl_phase5_host_test.c for real coverage of this path. ────────
+uint64_t sys_sls_vfree(const char* name) { (void)name; return 1; }
+
 int main(void) {
     make_employees_table();
     rowstore_create_table("employees");

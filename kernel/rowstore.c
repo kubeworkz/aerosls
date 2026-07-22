@@ -8,6 +8,8 @@
 #include "kernel_io.h"
 #include "persist.h"
 #include "row_index.h"
+#include "row_constraint.h"   // Phase 5 (SQL Feature-Parity Roadmap, DDL): rowstore_drop_table() cleanup
+#include "row_journal.h"      // Phase 5: rowstore_drop_table() cleanup
 #include "../drivers/nvme_io.h"
 #include "../user/permissions.h"
 #include <stddef.h>
@@ -335,6 +337,248 @@ uint64_t sys_sls_rowstore_create_table(struct SLSRowstoreCreateTableRequest* req
     if (!req) return 1;
     req->status = rowstore_create_table(req->table_name);
     return (uint64_t)req->status;
+}
+
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): drops a row-set table -- real
+// cleanup, not just sys_sls_vfree()'s bare catalog deactivation.
+// sys_sls_vfree() alone (object_catalog.c) only clears object_catalog[]
+// .active/object_records[] -- confirmed by direct read, not assumed -- it
+// has zero awareness of table_headers[], row_indexes[], row_constraints[],
+// or row_journal_attachments[], every one of which keys off this table's
+// object_id/name and would otherwise dangle forever after a bare vfree.
+// This function is the one real teardown path: deactivates every
+// row_indexes[]/row_constraints[]/row_journal_attachments[] entry that
+// references this table, deactivates table_headers[idx] itself, then
+// calls sys_sls_vfree() for the catalog-level cleanup it already does
+// correctly (vecstore notification, .active=0, persist_catalog()).
+//
+// Old page data is abandoned, not reclaimed -- matching this whole
+// subsystem's pre-existing "no reclaim in first cut" posture
+// (rowstore_alloc_page() has never freed a page; this isn't a new gap
+// DROP TABLE introduces).
+//
+// Deliberately does NOT check whether another table's REFERENCE
+// constraint still points at this one (unlike row_constraint_check_
+// delete()'s own RESTRICT semantics for individual row deletes) -- named
+// explicitly as an out-of-scope gap, not a silent one: dropping a table
+// still referenced by another table's FK leaves that FK's ref_table_
+// object_id dangling. A future phase could add the same RESTRICT check
+// row deletes already have.
+//
+// Returns 0 on success. Non-zero: 1 = table not found / not a row-set
+// table. 2 = permission denied (caller_uid needs PERM_WRITE).
+int rowstore_drop_table(uint32_t caller_uid, const char* table_name) {
+    int idx = find_active_table(table_name);
+    if (idx < 0) return 1;
+    if (!catalog_check_access(caller_uid, table_name, PERM_WRITE)) return 2;
+
+    uint64_t table_object_id = object_catalog[idx].object_id;
+
+    for (uint32_t i = 0; i < ROW_INDEX_MAX; i++) {
+        if (row_indexes[i].active && row_indexes[i].table_object_id == table_object_id)
+            row_indexes[i].active = 0;
+    }
+    for (uint32_t i = 0; i < ROW_CONSTRAINT_MAX; i++) {
+        if (row_constraints[i].active && row_constraints[i].table_object_id == table_object_id)
+            row_constraints[i].active = 0;
+    }
+    for (uint32_t i = 0; i < ROW_JOURNAL_MAX_ATTACHMENTS; i++) {
+        if (row_journal_attachments[i].active && rs_streq(row_journal_attachments[i].table_name, table_name))
+            row_journal_attachments[i].active = 0;
+    }
+
+    table_headers[idx].active = 0;
+    object_catalog[idx].uses_rowstore = 0;
+
+    persist_row_index_defs();
+    persist_row_constraints();
+    persist_row_journal();
+    persist_rowstore_headers();
+
+    kernel_serial_printf("[ROWSTORE] '%s' dropped: table_headers/row_indexes/row_constraints/"
+                         "row_journal_attachments cleaned up.\n", table_name);
+    sys_sls_vfree(table_name);   // clears object_catalog[idx].active, persists catalog
+    return 0;
+}
+
+// ROWSTORE_ADD_COLUMN_MAX_ROWS: a real, named bound on how many rows
+// rowstore_add_column() can migrate in one call -- see its own header
+// comment for why a full rewrite is unavoidable and why this codebase's
+// freestanding, no-dynamic-allocation kernel needs a fixed-size scratch
+// buffer rather than an unbounded one. Generous for this codebase's own
+// test/dev scale (existing host tests never exceed a few dozen rows per
+// table) but a real limit, not silently unbounded -- matching this whole
+// project's "narrow on purpose, name it" posture (row_index.h's own
+// BTREE_MAX_DUPES_PER_KEY is the same kind of named ceiling).
+#define ROWSTORE_ADD_COLUMN_MAX_ROWS 4096
+
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): adds a new column to an
+// existing row-set table, live. A real storage-layout migration, not a
+// cheap metadata-only change: row_width changes, and rowstore's page
+// format packs exactly rows_per_page rows of exactly row_width bytes each
+// per page (confirmed by direct read of rowstore_row_insert()'s slot
+// arithmetic) -- there is no way to widen a row in place. Every existing
+// row is re-read under the OLD layout, given a real NULL (Phase 4
+// null_mask bit set) for the new column, and rewritten into freshly
+// allocated pages at the NEW width. This also means every row's RowId
+// (page_id, slot_index) changes -- so any row_index defined on this table
+// is transparently rebuilt afterward (deactivate the old definition, then
+// call row_index_create() again with the same name/table/column, which
+// re-derives the whole B-tree from the migrated data) rather than trying
+// to incrementally patch stale (page_id, slot_index) references. This
+// reuses the exact rebuild-not-patch pattern persist.c's own boot-restore
+// path already established for indexes (see persist_restore_all()'s
+// row-index restore block).
+//
+// Old pages are abandoned, not freed, matching rowstore_drop_table()'s own
+// note just above -- this subsystem has no page-free/reuse mechanism at
+// all yet. This means ADD COLUMN leaks the old page allocation
+// permanently; named explicitly as a real, deliberate scope cut, not an
+// oversight. A future page-reclamation phase (mirroring frame_pool.c's
+// own Phase 13 physical memory quota work) would need to land before this
+// stops being acceptable for anything beyond dev/test scale.
+//
+// Returns: 0 success. 1 = table not found/not a row-set table. 2 =
+// permission denied. 3 = column name already exists on this table. 4 =
+// column_count already at ROWSTORE_MAX_COLUMNS, or the underlying
+// object_schemas[] field_count already at SCHEMA_MAX_FIELDS. 6 = page
+// pool exhausted during migration. 7 = row count exceeds
+// ROWSTORE_ADD_COLUMN_MAX_ROWS.
+static struct RowValues g_add_column_scratch[ROWSTORE_ADD_COLUMN_MAX_ROWS];
+static uint32_t         g_add_column_scratch_count;
+static uint8_t          g_add_column_scratch_overflow;
+
+static void add_column_collect_cb(struct RowId id, const struct RowValues* values, void* ctx) {
+    (void)id; (void)ctx;
+    if (g_add_column_scratch_count >= ROWSTORE_ADD_COLUMN_MAX_ROWS) {
+        g_add_column_scratch_overflow = 1;
+        return;
+    }
+    g_add_column_scratch[g_add_column_scratch_count++] = *values;
+}
+
+int rowstore_add_column(uint32_t caller_uid, const char* table_name,
+                        const char* column_name, SLSFieldType column_type) {
+    int idx = find_active_table(table_name);
+    if (idx < 0) return 1;
+    if (!catalog_check_access(caller_uid, table_name, PERM_WRITE)) return 2;
+
+    struct RowTableLayout* old_layout = &table_headers[idx].layout;
+    if (old_layout->column_count >= ROWSTORE_MAX_COLUMNS) return 4;
+    for (uint32_t c = 0; c < old_layout->column_count; c++)
+        if (rs_streq(old_layout->column_names[c], column_name)) return 3;
+
+    struct SLSObjectSchema* schema = &object_schemas[idx];
+    uint32_t free_field = SCHEMA_MAX_FIELDS;
+    for (uint32_t i = 0; i < SCHEMA_MAX_FIELDS; i++) {
+        if (!schema->fields[i].active) { if (free_field == SCHEMA_MAX_FIELDS) free_field = i; continue; }
+        if (rs_streq(schema->fields[i].key, column_name)) return 3;
+    }
+    if (free_field == SCHEMA_MAX_FIELDS) return 4;
+
+    // 1. Collect every existing row under the OLD layout, before anything
+    //    about the table's schema/layout changes.
+    g_add_column_scratch_count = 0;
+    g_add_column_scratch_overflow = 0;
+    rowstore_table_scan(0, table_name, add_column_collect_cb, 0);
+    if (g_add_column_scratch_overflow) return 7;
+
+    // 2. Add the new field to object_schemas[idx] directly -- bypassing
+    //    sys_sls_schema_set()'s own "row-set tables are frozen post-
+    //    promotion" guard on purpose: that guard exists because schema_set
+    //    has no idea how to migrate live row data, which is exactly the
+    //    gap this function closes. Direct object_schemas[] mutation from
+    //    inside rowstore.c matches this file's own existing precedent
+    //    (rowstore_create_table() above reads object_schemas[idx] directly
+    //    too, just never wrote to it before now).
+    rs_strcpy(schema->fields[free_field].key, column_name, RECORD_KEY_LEN);
+    schema->fields[free_field].type = column_type;
+    schema->fields[free_field].active = 1;
+    if (schema->field_count <= free_field) schema->field_count = free_field + 1;
+
+    // 3. Recompute the layout from the now-extended schema.
+    struct RowTableLayout new_layout;
+    if (compute_layout(schema, &new_layout)) {
+        // Roll back the schema field on failure -- leave the table exactly
+        // as it was, not half-migrated.
+        schema->fields[free_field].active = 0;
+        return 4;
+    }
+    uint32_t new_col = new_layout.column_count - 1;   // compute_layout() appends in schema-array order
+
+    // 4. Rewrite every collected row into a fresh page chain under the new
+    //    layout -- a scratch header, not table_headers[idx] itself, so the
+    //    live table stays queryable under its OLD layout/pages until the
+    //    swap at the very end.
+    struct RowTableHeader migrate_hdr;
+    rs_memset(&migrate_hdr, 0, sizeof(migrate_hdr));
+    migrate_hdr.object_id     = object_catalog[idx].object_id;
+    migrate_hdr.active        = 1;
+    migrate_hdr.layout        = new_layout;
+    migrate_hdr.first_page_id = ROWSTORE_INVALID_PAGE;
+    migrate_hdr.last_page_id  = ROWSTORE_INVALID_PAGE;
+
+    for (uint32_t i = 0; i < g_add_column_scratch_count; i++) {
+        struct RowValues v = g_add_column_scratch[i];
+        v.count = new_layout.column_count;
+        v.values[new_col][0] = '\0';
+        v.null_mask |= (uint16_t)(1u << new_col);   // existing rows get a real NULL for the new column
+
+        uint8_t row_buf[ROWSTORE_MAX_ROW_BYTES];
+        if (serialize_row(&new_layout, &v, row_buf)) continue;   // shouldn't happen -- old values were already valid
+
+        if (migrate_hdr.first_page_id == ROWSTORE_INVALID_PAGE ||
+            migrate_hdr.rows_in_last_page >= migrate_hdr.layout.rows_per_page) {
+            uint32_t new_page = rowstore_alloc_page();
+            if (new_page == ROWSTORE_INVALID_PAGE) return 6;
+            if (migrate_hdr.first_page_id == ROWSTORE_INVALID_PAGE) {
+                migrate_hdr.first_page_id = new_page;
+            } else {
+                uint8_t* prev = rowstore_load_page(migrate_hdr.last_page_id);
+                if (prev) { rs_memcpy(prev, &new_page, 4); rowstore_flush_page(migrate_hdr.last_page_id); }
+            }
+            migrate_hdr.last_page_id = new_page;
+            migrate_hdr.rows_in_last_page = 0;
+            migrate_hdr.page_count++;
+        }
+        uint8_t* page = rowstore_load_page(migrate_hdr.last_page_id);
+        if (!page) return 6;
+        uint32_t slot = migrate_hdr.rows_in_last_page;
+        uint8_t* slot_ptr = page + 4 + slot * migrate_hdr.layout.row_width;
+        rs_memcpy(slot_ptr, row_buf, migrate_hdr.layout.row_width);
+        rowstore_flush_page(migrate_hdr.last_page_id);
+        migrate_hdr.rows_in_last_page++;
+        migrate_hdr.row_count++;
+    }
+
+    // 5. Swap: the live table now points at the new layout/page chain.
+    table_headers[idx] = migrate_hdr;
+    persist_rowstore_headers();
+
+    kernel_serial_printf(
+        "[ROWSTORE] '%s': column '%s' added, %u row(s) migrated to row_width=%u.\n",
+        table_name, column_name, migrate_hdr.row_count, new_layout.row_width);
+
+    // 6. Rebuild any row_index defined on this table -- every row's RowId
+    //    just changed. Capture (name, column) pairs first (row_index_drop()
+    //    inside the loop would otherwise mutate row_indexes[] while a
+    //    second pass over it is still in flight).
+    char rebuild_name[ROW_INDEX_MAX][OBJECT_NAME_LEN];
+    char rebuild_col[ROW_INDEX_MAX][RECORD_KEY_LEN];
+    uint32_t rebuild_count = 0;
+    for (uint32_t i = 0; i < ROW_INDEX_MAX && rebuild_count < ROW_INDEX_MAX; i++) {
+        if (!row_indexes[i].active || row_indexes[i].table_object_id != migrate_hdr.object_id) continue;
+        rs_strcpy(rebuild_name[rebuild_count], row_indexes[i].index_name, OBJECT_NAME_LEN);
+        uint32_t ci = row_indexes[i].column_index;
+        rs_strcpy(rebuild_col[rebuild_count], ci < new_layout.column_count ? new_layout.column_names[ci] : "", RECORD_KEY_LEN);
+        rebuild_count++;
+    }
+    for (uint32_t i = 0; i < rebuild_count; i++) {
+        row_index_drop(0, rebuild_name[i]);
+        row_index_create(0, rebuild_name[i], table_name, rebuild_col[i]);
+    }
+
+    return 0;
 }
 
 // ─── Row CRUD ────────────────────────────────────────────────────────────────

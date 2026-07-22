@@ -47,6 +47,11 @@ typedef enum {
     TOK_KW_IN, TOK_KW_LIKE,   // Phase 3 (SQL Feature-Parity Roadmap)
     TOK_KW_IS, TOK_KW_NOT, TOK_KW_NULL,   // Phase 4 (SQL Feature-Parity Roadmap)
     TOK_KW_TRUE, TOK_KW_FALSE,
+    // Phase 5 (SQL Feature-Parity Roadmap): DDL.
+    TOK_KW_CREATE, TOK_KW_TABLE, TOK_KW_ALTER, TOK_KW_ADD, TOK_KW_COLUMN,
+    TOK_KW_DROP, TOK_KW_INDEX, TOK_KW_UNIQUE, TOK_KW_REFERENCES,
+    TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
+    TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
     TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
     TOK_PLUS, TOK_MINUS, TOK_SLASH,   // Phase 3 (SQL Feature-Parity Roadmap): arithmetic operators
@@ -79,6 +84,21 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"IN", TOK_KW_IN}, {"LIKE", TOK_KW_LIKE},
     {"IS", TOK_KW_IS}, {"NOT", TOK_KW_NOT}, {"NULL", TOK_KW_NULL},
     {"TRUE", TOK_KW_TRUE}, {"FALSE", TOK_KW_FALSE},
+    // Phase 5 (SQL Feature-Parity Roadmap): DDL.
+    {"CREATE", TOK_KW_CREATE}, {"TABLE", TOK_KW_TABLE},
+    {"ALTER", TOK_KW_ALTER}, {"ADD", TOK_KW_ADD}, {"COLUMN", TOK_KW_COLUMN},
+    {"DROP", TOK_KW_DROP}, {"INDEX", TOK_KW_INDEX},
+    {"UNIQUE", TOK_KW_UNIQUE}, {"REFERENCES", TOK_KW_REFERENCES},
+    // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
+    // keyword-lookup pass (same mechanism every other keyword uses), so a
+    // column named e.g. "string" would need... actually it can't be named
+    // that: matching this parser's existing keyword-shadowing behavior for
+    // every other reserved word (SELECT, FROM, etc.), a column/table name
+    // that collides with a type keyword is not expressible -- named here,
+    // not silently surprising.
+    {"STRING", TOK_KW_TYPE_STRING}, {"UINT64", TOK_KW_TYPE_UINT64},
+    {"FLOAT", TOK_KW_TYPE_FLOAT}, {"BOOL", TOK_KW_TYPE_BOOL},
+    {"BLOB", TOK_KW_TYPE_BLOB},
 };
 #define KEYWORD_COUNT (sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
 
@@ -953,6 +973,152 @@ static void parse_delete(struct SqlParser* p, struct SqlDeleteStmt* s) {
     finish_statement(p);
 }
 
+// ── Phase 5 (SQL Feature-Parity Roadmap): DDL grammar. ──────────────────────
+static int parse_type_kw(struct SqlParser* p, SLSFieldType* out) {
+    switch (p->cur.kind) {
+        case TOK_KW_TYPE_STRING: *out = FIELD_TYPE_STRING; break;
+        case TOK_KW_TYPE_UINT64: *out = FIELD_TYPE_UINT64; break;
+        case TOK_KW_TYPE_FLOAT:  *out = FIELD_TYPE_FLOAT;  break;
+        case TOK_KW_TYPE_BOOL:   *out = FIELD_TYPE_BOOL;   break;
+        case TOK_KW_TYPE_BLOB:   *out = FIELD_TYPE_BLOB;   break;
+        default: return 0;
+    }
+    advance(p);
+    return 1;
+}
+
+// One column_def: ident type_kw [inline constraints in any order/subset].
+// NOT NULL / UNIQUE / REFERENCES table(col) each parse independently and
+// may repeat-check in any order the user wrote them -- see SqlColumnDef's
+// own header comment in sql_parser.h for why a column can carry all three
+// (they're independent flags), and why a second instance of the SAME one
+// is simply never checked for (matching this parser's general "no
+// dedup/validation beyond what breaks the grammar" posture elsewhere).
+static void parse_column_def(struct SqlParser* p, struct SqlColumnDef* c) {
+    sq_memset(c, 0, sizeof(*c));
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name in CREATE TABLE's column list"); return; }
+    sq_strcpy(c->name, p->cur.text, RECORD_KEY_LEN);
+    advance(p);
+    if (!parse_type_kw(p, &c->type)) {
+        set_error(p, "expected a column type (STRING/UINT64/FLOAT/BOOL/BLOB)");
+        return;
+    }
+    for (;;) {
+        if (p->cur.kind == TOK_KW_NOT) {
+            advance(p);
+            if (!expect(p, TOK_KW_NULL, "expected NULL after NOT in a column definition")) return;
+            c->not_null = 1;
+            continue;
+        }
+        if (p->cur.kind == TOK_KW_UNIQUE) {
+            advance(p);
+            c->is_unique = 1;
+            continue;
+        }
+        if (p->cur.kind == TOK_KW_REFERENCES) {
+            advance(p);
+            if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after REFERENCES"); return; }
+            sq_strcpy(c->ref_table, p->cur.text, OBJECT_NAME_LEN);
+            advance(p);
+            if (!expect(p, TOK_LPAREN, "expected '(' after REFERENCES table name")) return;
+            if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name inside REFERENCES(...)"); return; }
+            sq_strcpy(c->ref_column, p->cur.text, RECORD_KEY_LEN);
+            advance(p);
+            if (!expect(p, TOK_RPAREN, "expected ')' after REFERENCES column name")) return;
+            c->has_reference = 1;
+            continue;
+        }
+        break;
+    }
+}
+
+// p->cur == TOK_KW_TABLE on entry -- CREATE was already consumed by
+// sql_parse()'s own dispatcher, which needed to peek past it to
+// disambiguate CREATE TABLE from CREATE INDEX (single-token lookahead).
+static void parse_create_table_body(struct SqlParser* p, struct SqlCreateTableStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume TABLE
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after CREATE TABLE"); return; }
+    sq_strcpy(s->table_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    if (!expect(p, TOK_LPAREN, "expected '(' after CREATE TABLE table name")) return;
+
+    uint32_t n = 0;
+    for (;;) {
+        if (n >= ROWSTORE_MAX_COLUMNS) { set_error(p, "too many columns"); return; }
+        parse_column_def(p, &s->columns[n]);
+        if (p->error) return;
+        n++;
+        if (p->cur.kind != TOK_COMMA) break;
+        advance(p);
+    }
+    s->column_count = n;
+    if (!expect(p, TOK_RPAREN, "expected ')' after CREATE TABLE column list")) return;
+    finish_statement(p);
+}
+
+// p->cur == TOK_KW_INDEX on entry (CREATE already consumed, see above).
+static void parse_create_index_body(struct SqlParser* p, struct SqlCreateIndexStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume INDEX
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected an index name after CREATE INDEX"); return; }
+    sq_strcpy(s->index_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    if (!expect(p, TOK_KW_ON, "expected ON after CREATE INDEX index name")) return;
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after ON"); return; }
+    sq_strcpy(s->table_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    if (!expect(p, TOK_LPAREN, "expected '(' after CREATE INDEX table name")) return;
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name inside CREATE INDEX (...)"); return; }
+    sq_strcpy(s->column_name, p->cur.text, RECORD_KEY_LEN);
+    advance(p);
+    if (!expect(p, TOK_RPAREN, "expected ')' after CREATE INDEX column name")) return;
+    finish_statement(p);
+}
+
+// p->cur == TOK_KW_TABLE on entry (DROP already consumed, mirroring
+// CREATE's own dispatcher-side disambiguation between TABLE/INDEX).
+static void parse_drop_table_body(struct SqlParser* p, struct SqlDropTableStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume TABLE
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after DROP TABLE"); return; }
+    sq_strcpy(s->table_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    finish_statement(p);
+}
+
+// p->cur == TOK_KW_INDEX on entry (DROP already consumed).
+static void parse_drop_index_body(struct SqlParser* p, struct SqlDropIndexStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume INDEX
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected an index name after DROP INDEX"); return; }
+    sq_strcpy(s->index_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    finish_statement(p);
+}
+
+// ALTER TABLE ... ADD COLUMN only -- no ambiguity to disambiguate (ALTER
+// always means ALTER TABLE in this grammar), so unlike CREATE/DROP above,
+// this one consumes ALTER itself, matching parse_delete()'s own pattern.
+static void parse_alter_table(struct SqlParser* p, struct SqlAlterTableStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume ALTER
+    if (!expect(p, TOK_KW_TABLE, "expected TABLE after ALTER")) return;
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after ALTER TABLE"); return; }
+    sq_strcpy(s->table_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    if (!expect(p, TOK_KW_ADD, "expected ADD after ALTER TABLE table name (only ADD COLUMN is supported)")) return;
+    if (!expect(p, TOK_KW_COLUMN, "expected COLUMN after ADD")) return;
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name after ADD COLUMN"); return; }
+    sq_strcpy(s->column_name, p->cur.text, RECORD_KEY_LEN);
+    advance(p);
+    if (!parse_type_kw(p, &s->column_type)) {
+        set_error(p, "expected a column type (STRING/UINT64/FLOAT/BOOL/BLOB)");
+        return;
+    }
+    finish_statement(p);
+}
+
 int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t err_max) {
     if (err && err_max) err[0] = '\0';
     if (!text || !out) {
@@ -979,9 +1145,45 @@ int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t er
         case TOK_KW_INSERT: out->kind = SQL_STMT_INSERT; parse_insert(&p, &out->u.insert); break;
         case TOK_KW_UPDATE: out->kind = SQL_STMT_UPDATE; parse_update(&p, &out->u.update); break;
         case TOK_KW_DELETE: out->kind = SQL_STMT_DELETE; parse_delete(&p, &out->u.del);   break;
+        // Phase 5 (SQL Feature-Parity Roadmap): DDL. CREATE and DROP each
+        // cover two statement shapes (TABLE vs INDEX) that this single-
+        // token-lookahead parser can't tell apart from the CREATE/DROP
+        // keyword alone -- consume it here, then dispatch on the next
+        // token, before out->kind can even be set.
+        case TOK_KW_CREATE:
+            advance(&p);   // consume CREATE
+            if (p.cur.kind == TOK_KW_TABLE) {
+                out->kind = SQL_STMT_CREATE_TABLE;
+                parse_create_table_body(&p, &out->u.create_table);
+            } else if (p.cur.kind == TOK_KW_INDEX) {
+                out->kind = SQL_STMT_CREATE_INDEX;
+                parse_create_index_body(&p, &out->u.create_index);
+            } else {
+                out->kind = SQL_STMT_INVALID;
+                set_error(&p, "expected TABLE or INDEX after CREATE");
+            }
+            break;
+        case TOK_KW_ALTER:
+            out->kind = SQL_STMT_ALTER_TABLE;
+            parse_alter_table(&p, &out->u.alter_table);
+            break;
+        case TOK_KW_DROP:
+            advance(&p);   // consume DROP
+            if (p.cur.kind == TOK_KW_TABLE) {
+                out->kind = SQL_STMT_DROP_TABLE;
+                parse_drop_table_body(&p, &out->u.drop_table);
+            } else if (p.cur.kind == TOK_KW_INDEX) {
+                out->kind = SQL_STMT_DROP_INDEX;
+                parse_drop_index_body(&p, &out->u.drop_index);
+            } else {
+                out->kind = SQL_STMT_INVALID;
+                set_error(&p, "expected TABLE or INDEX after DROP");
+            }
+            break;
         default:
             out->kind = SQL_STMT_INVALID;
-            set_error(&p, "unknown statement -- expected SELECT, INSERT, UPDATE, or DELETE");
+            set_error(&p, "unknown statement -- expected SELECT, INSERT, UPDATE, DELETE, "
+                          "CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, or DROP INDEX");
             break;
     }
 

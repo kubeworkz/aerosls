@@ -479,6 +479,17 @@ void mvcc_bootstrap_from_rowstore(void) {
     }
 }
 
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): see mvcc.h's own header
+// comment for the full "why this exists" writeup.
+void mvcc_rebuild_versions_for_table(uint64_t table_object_id, const char* table_name) {
+    for (uint32_t i = 0; i < mvcc_version_count; i++) {
+        if (mvcc_versions[i].active && mvcc_versions[i].table_object_id == table_object_id)
+            mvcc_versions[i].active = 0;
+    }
+    struct mv_bootstrap_ctx ctx = { table_object_id };
+    rowstore_table_scan(0, table_name, mv_bootstrap_cb, &ctx);
+}
+
 // ─── Phase 25: index-assisted planning entry point ─────────────────────────
 MvccError mvcc_resolve_physical(uint64_t txn_id, uint32_t caller_uid, const char* table_name,
                                 struct RowId physical_id,

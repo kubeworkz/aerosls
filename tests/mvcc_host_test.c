@@ -182,6 +182,17 @@ static void phys_count_cb(struct RowId id, const struct RowValues* v, void* ctxp
     (*count)++;
 }
 
+// ─── Phase 5 (SQL Feature-Parity Roadmap, DDL) stand-ins -- rowstore.c's
+// new rowstore_drop_table() now unconditionally calls sys_sls_vfree() (real
+// object_catalog.c cleanup this test doesn't link) and row_index_drop()
+// (not linked here since this test doesn't link the real row_index.c).
+// This test never exercises DROP TABLE, so failure-code no-ops are safe --
+// see tests/sql_ddl_phase5_host_test.c for real coverage of these paths. ──
+uint64_t sys_sls_vfree(const char* name) { (void)name; return 1; }
+int row_index_drop(uint32_t caller_uid, const char* index_name) {
+    (void)caller_uid; (void)index_name; return 1;
+}
+
 int main(void) {
     rowstore_init();
     mvcc_init();

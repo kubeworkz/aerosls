@@ -395,6 +395,27 @@ int row_index_create(uint32_t caller_uid, const char* index_name,
     return 0;
 }
 
+// Phase 5 (SQL Feature-Parity Roadmap, DDL): see row_index.h for the full
+// scope note (no node-pool reclaim, matching this file's own pre-existing
+// posture everywhere else).
+int row_index_drop(uint32_t caller_uid, const char* index_name) {
+    if (!index_name) return 1;
+    int slot = find_index_slot(index_name);
+    if (slot < 0) return 1;
+    struct RowIndex* idx = &row_indexes[slot];
+
+    int tidx = -1;
+    for (uint32_t i = 0; i < object_catalog_count; i++)
+        if (object_catalog[i].active && object_catalog[i].object_id == idx->table_object_id) { tidx = (int)i; break; }
+    if (tidx < 0) return 1;
+    if (!catalog_check_access(caller_uid, object_catalog[tidx].name, PERM_WRITE)) return 2;
+
+    idx->active = 0;
+    kernel_serial_printf("[ROW_INDEX] '%s' dropped.\n", index_name);
+    persist_row_index_defs();
+    return 0;
+}
+
 // ─── Auto-maintenance hooks ──────────────────────────────────────────────────
 static void for_each_index_on_table(uint64_t table_object_id,
                                     void (*fn)(struct RowIndex*, uint32_t, const struct RowValues*, struct RowId),

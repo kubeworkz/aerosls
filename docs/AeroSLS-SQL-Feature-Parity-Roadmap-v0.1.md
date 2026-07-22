@@ -616,7 +616,7 @@ phase — no errors).
 
 ---
 
-## Phase 5 — DDL in SQL text (CREATE/ALTER/DROP TABLE, CREATE/DROP INDEX)
+## Phase 5 — DDL in SQL text (CREATE/ALTER/DROP TABLE, CREATE/DROP INDEX) — DONE
 
 **Goal:** `CREATE TABLE employees (id UINT64, name STRING)`, `ALTER TABLE
 employees ADD COLUMN dept STRING`, `DROP TABLE employees`, `CREATE INDEX
@@ -653,6 +653,114 @@ pointing at a freed `table_object_id`; compile-check; full regression
 sweep (this phase touches the shared DDL functions every other phase's
 tests also call, so regressions here would be broad and worth catching
 early).
+
+### Scope correction made during implementation
+
+The original draft underestimated `ALTER TABLE ADD COLUMN` as pure
+grammar wiring onto `sys_sls_schema_set()`. Investigation found
+`sys_sls_schema_set()` has a **post-promotion freeze guard**: it rejects
+any schema change once `object_catalog[idx].uses_rowstore` is true (return
+code 4) — a deliberate boundary from Phase 24, not an oversight. Once a
+table is promoted to row-set storage its `row_width`/`rows_per_page` are
+computed once at `rowstore_create_table()`/`compute_layout()` time and
+baked into every page's fixed-width slot layout, so adding a column is
+architecturally incompatible with any in-place widening. `ADD COLUMN`
+therefore required a genuine new kernel function, `rowstore_add_column()`:
+collects every existing row via `rowstore_table_scan()`, writes the new
+field directly into `object_schemas[]` (bypassing the freeze guard
+deliberately, since this *is* the sanctioned mutation path now),
+recomputes the layout, and rewrites all rows into freshly allocated pages
+at the new width — existing rows get a real NULL in the new column, not
+garbage or corruption. Matching this whole subsystem's pre-existing "no
+reclaim in first cut" posture (`rowstore_alloc_page()` never frees pages;
+`row_indexes[]`/`row_constraints[]` are bump-allocated with no
+compaction), the old, narrower pages are simply abandoned after migration
+— a deliberate, named scope cut, not a silent leak.
+
+`DROP TABLE` had the same kind of gap: `sys_sls_vfree()` alone was
+confirmed via direct read to have zero awareness of row-set-specific
+state. A new `rowstore_drop_table()` was built to do the real cleanup —
+deactivating the matching `row_indexes[]`, `row_constraints[]`, and
+`row_journal_attachments[]` entries and `table_headers[]`/`uses_rowstore`
+before calling `sys_sls_vfree()` — so `DROP TABLE` doesn't leave dangling
+index/constraint/journal entries pointing at a freed `table_object_id`.
+A companion `row_index_drop()` was added to `row_index.c` (deactivates a
+named index's `row_indexes[]` slot; same no-reclaim posture as everything
+else in that subsystem) to support both `DROP INDEX` and the index-rebuild
+step below.
+
+Any index defined on a table is rebuilt (not patched) after `ADD COLUMN`'s
+page migration, reusing the exact drop-then-recreate pattern `persist.c`'s
+own boot-restore path already established for `row_index_create()`.
+Testing surfaced a real, previously-latent bug the same migration exposed
+in a second subsystem: `mvcc.c` caches `logical_id → physical_id` in its
+own `mvcc_versions[]` array at INSERT/UPDATE time, and `mvcc_row_get()`
+resolves purely through that cache — a raw rowstore-level page migration
+like `ADD COLUMN`'s is invisible to it unless told to rebuild. Caught
+concretely: a test asserting a migrated row's new column read back as
+NULL kept reading stale data from the old, abandoned physical page instead
+(misinterpreted under the new, wider layout). Fixed with a new
+`mvcc_rebuild_versions_for_table()` (mirrors `mvcc_bootstrap_from_rowstore()`'s
+own boot-restore pattern), called from `sql_exec.c`'s `exec_alter_table()`
+on success — deliberately **not** called from inside `rowstore_add_column()`
+itself, to preserve this codebase's existing layering discipline
+(`rowstore.c` has never depended on `mvcc.h`; the dependency runs the
+other way) and avoid silently breaking every pre-Phase-5 host test that
+links `rowstore.c` without `mvcc.c`.
+
+`CREATE TABLE`'s three-step chain (`sys_sls_valloc()` →
+`sys_sls_schema_set()` looped per column → `rowstore_create_table()`,
+plus inline constraint registration for `NOT NULL`/`UNIQUE`/`REFERENCES`)
+is **not transactional**: if a later step fails, earlier steps are not
+rolled back. This deliberately matches the pre-existing HTTP route's own
+established `api_schema_set_post()` behavior ("stop at first failure,
+don't unwind") rather than introducing new atomicity this codebase doesn't
+have anywhere else yet.
+
+**Verification — actual results:** `tests/sql_ddl_phase5_host_test.c`
+(new, 36 checks) covers `CREATE TABLE` with inline constraints and
+confirms they actually enforce; `CREATE INDEX` finding rows; `ALTER TABLE
+ADD COLUMN` migration correctness (existing rows get a real NULL in the
+new column, the table's index is rebuilt and still works); `DROP INDEX`
+genuinely stopping the index from being used; `DROP TABLE` leaving no
+dangling `row_constraints[]`/index entries; real permission-denial
+enforcement via genuine ownership/role checks (this test links the real
+`object_catalog.c`, unlike most prior DDL-adjacent tests which stub
+`catalog_check_access()`); and parser-level edge cases.
+
+Regression sweep initially broke 15 of the other 31 host test files —
+entirely link errors, not logic bugs — because `sql_exec.c`'s
+`exec_create_table()` and `rowstore.c`'s new `rowstore_drop_table()`/
+`rowstore_add_column()` now unconditionally reference `sys_sls_valloc`/
+`sys_sls_schema_set`/`sys_sls_vfree` (only defined in `object_catalog.c`)
+and, for `rowstore.c` specifically, `row_indexes[]`/`row_constraints[]`/
+`row_journal_attachments[]`/`row_index_create()`/`row_index_drop()`/the
+`persist_row_*()` functions. Every host test linking `sql_exec.c` and/or
+`rowstore.c` without those real files needed new stubs. Fixed per this
+codebase's established convention (stub, don't link, to keep each test's
+dependency graph as narrow as its own header comment commits to):
+`legacy_rowstore_boundary_host_test.c` (links the real `object_catalog.c`,
+so `sys_sls_valloc/schema_set/vfree` already resolved, but not
+`row_index.c`/`row_constraint.c`/`row_journal.c`) gained stub globals for
+`row_indexes[]`/`row_constraints[]`/`row_journal_attachments[]` and stub
+`row_index_create()`/`row_index_drop()`/`persist_row_index_defs()`/
+`persist_row_constraints()`/`persist_row_journal()`. Thirteen other files
+gained three new failure-code no-op stubs (`sys_sls_valloc()`/
+`sys_sls_schema_set()`/`sys_sls_vfree()`, or a subset — `mvcc_host_test`/
+`predicate_host_test`/`rowstore_host_test` only needed `sys_sls_vfree()`
+plus a stub `row_index_drop()`; `row_index_host_test`/
+`persist_rdbms_vecstore_host_test` only needed `sys_sls_vfree()`, since
+both already link the real `row_index.c`). None of these older tests
+exercise SQL-text `CREATE`/`DROP TABLE` at runtime, so no-op stubs are
+correct, not a gap — real coverage of those paths lives entirely in the
+new `sql_ddl_phase5_host_test.c`.
+
+Full regression sweep (`tests/run_all.sh`): **32/32 host test files
+passing, 0 failed** — includes the new file and all 14 stub fixes above.
+`net/http.c` compile-checked clean against the updated `rowstore.h`/
+`sql_parser.h`/`sql_exec.h`/`mvcc.h`/`row_index.h` (only the same
+pre-existing, unrelated implicit-function-declaration warnings seen in
+every prior phase — no errors).
 
 ---
 
