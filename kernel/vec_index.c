@@ -608,3 +608,177 @@ void sys_sls_vec_index_list(void) {
     }
     if (!shown) kernel_serial_print(" (no vector indexes defined)\n");
 }
+
+// ─── VectorStore Interface Roadmap follow-on: collection/index definition
+// export/import. See vec_index.h's own header comment for the full "why
+// this format, why this file, what's a named gap" writeup. ────────────────
+static int vse_append(char* buf, uint32_t* pos, uint32_t max, const char* src) {
+    uint32_t i = 0;
+    while (src[i]) {
+        if (*pos + 1 >= max) return 0;
+        buf[(*pos)++] = src[i++];
+    }
+    buf[*pos] = '\0';
+    return 1;
+}
+
+static int vse_append_uint(char* buf, uint32_t* pos, uint32_t max, uint32_t v) {
+    char digits[12];
+    int  n = 0;
+    if (v == 0) digits[n++] = '0';
+    while (v > 0) { digits[n++] = (char)('0' + (v % 10)); v /= 10; }
+    char rev[12];
+    for (int i = 0; i < n; i++) rev[i] = digits[n - 1 - i];
+    rev[n] = '\0';
+    return vse_append(buf, pos, max, rev);
+}
+
+uint32_t vec_schema_export(uint32_t caller_uid, char* out, uint32_t max) {
+    if (!out || max == 0) return 0;
+    uint32_t pos = 0;
+    out[0] = '\0';
+    int stop = 0;
+
+    if (!vse_append(out, &pos, max,
+        "# vector-store schema export -- collection/index DEFINITIONS ONLY, no vector data\n"))
+        return pos;
+
+    for (uint32_t i = 0; i < object_catalog_count && !stop; i++) {
+        if (!object_catalog[i].active || !vector_collections[i].active) continue;
+        if (!catalog_check_access(caller_uid, object_catalog[i].name, PERM_READ)) continue;
+        struct VecCollectionHeader* h = &vector_collections[i];
+
+        if (!vse_append(out, &pos, max, "COLLECTION ") ||
+            !vse_append(out, &pos, max, object_catalog[i].name) ||
+            !vse_append(out, &pos, max, " DIM ") ||
+            !vse_append_uint(out, &pos, max, h->dimension) ||
+            !vse_append(out, &pos, max, "\n")) { stop = 1; break; }
+
+        for (uint32_t k = 0; k < VEC_INDEX_MAX; k++) {
+            if (!vec_indexes[k].active) continue;
+            if (!vi_streq(vec_indexes[k].collection_name, object_catalog[i].name)) continue;
+            if (!vse_append(out, &pos, max, "INDEX ") ||
+                !vse_append(out, &pos, max, vec_indexes[k].index_name) ||
+                !vse_append(out, &pos, max, " ON ") ||
+                !vse_append(out, &pos, max, vec_indexes[k].collection_name) ||
+                !vse_append(out, &pos, max, " METRIC ") ||
+                !vse_append(out, &pos, max, vec_indexes[k].metric == VEC_METRIC_L2 ? "l2" : "cosine") ||
+                !vse_append(out, &pos, max, "\n")) { stop = 1; break; }
+        }
+    }
+    return pos;
+}
+
+// Advances past leading whitespace in `line` starting at `pos`, copies the
+// next whitespace-delimited token into `outbuf` (bounded, NUL-terminated),
+// and returns the new position. No quoting -- see vec_index.h's own header
+// comment for why that's an honest simplification here, not an oversight.
+static uint32_t vse_next_token(const char* line, uint32_t pos, char* outbuf, uint32_t outmax) {
+    while (line[pos] == ' ' || line[pos] == '\t') pos++;
+    uint32_t o = 0;
+    while (line[pos] && line[pos] != ' ' && line[pos] != '\t' && line[pos] != '\r') {
+        if (o + 1 < outmax) outbuf[o++] = line[pos];
+        pos++;
+    }
+    outbuf[o] = '\0';
+    return pos;
+}
+
+void vec_schema_import(uint32_t caller_uid, const char* text, struct VecSchemaImportResult* out) {
+    if (!out) return;
+    out->total = 0; out->succeeded = 0; out->failed = 0;
+    for (uint32_t i = 0; i < VEC_SCHEMA_IMPORT_MAX_LINES; i++) {
+        out->lines[i].ok = 0;
+        out->lines[i].offset = 0;
+        out->lines[i].error_msg[0] = '\0';
+    }
+    if (!text) return;
+
+    uint32_t i = 0;
+    while (text[i]) {
+        uint32_t line_start = i;
+        uint32_t j = i;
+        while (text[j] && text[j] != '\n') j++;
+        uint32_t line_len = j - i;
+
+        char line[256];
+        uint32_t copy_len = line_len < sizeof(line) - 1 ? line_len : (uint32_t)sizeof(line) - 1;
+        for (uint32_t k = 0; k < copy_len; k++) line[k] = text[line_start + k];
+        line[copy_len] = '\0';
+        i = text[j] ? j + 1 : j;
+
+        uint32_t p = 0;
+        while (line[p] == ' ' || line[p] == '\t' || line[p] == '\r') p++;
+        if (line[p] == '\0' || line[p] == '#') continue;   // blank or comment line -- not counted
+
+        out->total++;
+        uint32_t slot = out->total - 1;
+        struct VecSchemaImportLineResult* lr =
+            (slot < VEC_SCHEMA_IMPORT_MAX_LINES) ? &out->lines[slot] : 0;
+        if (lr) lr->offset = line_start;
+
+        char kw[OBJECT_NAME_LEN];
+        p = vse_next_token(line, p, kw, sizeof(kw));
+
+        int ok = 0;
+        const char* err = "";
+
+        if (vi_streq(kw, "COLLECTION")) {
+            char name[OBJECT_NAME_LEN], dimkw[16], dimval[16];
+            p = vse_next_token(line, p, name, sizeof(name));
+            p = vse_next_token(line, p, dimkw, sizeof(dimkw));
+            p = vse_next_token(line, p, dimval, sizeof(dimval));
+            if (name[0] == '\0' || !vi_streq(dimkw, "DIM") || dimval[0] == '\0') {
+                err = "malformed COLLECTION line (expected: COLLECTION <name> DIM <n>)";
+            } else {
+                uint32_t dim = 0; int bad_digit = 0;
+                for (uint32_t k = 0; dimval[k]; k++) {
+                    if (dimval[k] < '0' || dimval[k] > '9') { bad_digit = 1; break; }
+                    dim = dim * 10 + (uint32_t)(dimval[k] - '0');
+                }
+                if (bad_digit) {
+                    err = "malformed DIM value (not a non-negative integer)";
+                } else if (vecstore_create_collection(name, dim) == 0) {
+                    ok = 1;
+                } else {
+                    err = "vecstore_create_collection() failed (bad name/dimension, or a collection with this name already exists)";
+                }
+            }
+        } else if (vi_streq(kw, "INDEX")) {
+            char name[OBJECT_NAME_LEN], onkw[8], coll[OBJECT_NAME_LEN], metrickw[16], metricval[16];
+            p = vse_next_token(line, p, name, sizeof(name));
+            p = vse_next_token(line, p, onkw, sizeof(onkw));
+            p = vse_next_token(line, p, coll, sizeof(coll));
+            p = vse_next_token(line, p, metrickw, sizeof(metrickw));
+            p = vse_next_token(line, p, metricval, sizeof(metricval));
+            if (name[0] == '\0' || !vi_streq(onkw, "ON") || coll[0] == '\0' ||
+                !vi_streq(metrickw, "METRIC") || metricval[0] == '\0') {
+                err = "malformed INDEX line (expected: INDEX <name> ON <collection> METRIC <cosine|l2>)";
+            } else {
+                VecMetric metric = vi_streq(metricval, "l2") ? VEC_METRIC_L2 : VEC_METRIC_COSINE;
+                if (vec_index_create(caller_uid, name, coll, metric) == 0) {
+                    ok = 1;
+                } else {
+                    err = "vec_index_create() failed (collection not found, permission denied, or index name already used)";
+                }
+            }
+        } else {
+            err = "unrecognized line (expected a line starting with COLLECTION or INDEX)";
+        }
+
+        if (lr) { lr->ok = (uint8_t)ok; vi_strcpy(lr->error_msg, err, sizeof(lr->error_msg)); }
+        if (ok) out->succeeded++; else out->failed++;
+    }
+}
+
+uint64_t sys_sls_vec_schema_export(struct SLSVecSchemaExportRequest* req) {
+    if (!req) return 1;
+    req->bytes_written = vec_schema_export(req->caller_uid, req->out, sizeof(req->out));
+    return 0;
+}
+
+uint64_t sys_sls_vec_schema_import(struct SLSVecSchemaImportRequest* req) {
+    if (!req) return 1;
+    vec_schema_import(req->caller_uid, req->text, &req->result);
+    return req->result.failed == 0 ? 0 : 1;
+}

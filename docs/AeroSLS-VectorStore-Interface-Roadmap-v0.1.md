@@ -609,6 +609,283 @@ the live kernel) rather than just a typecheck.
 
 ---
 
+## Phase 5 — Collection/index definition export/import — DONE
+
+A follow-on beyond the original 4-phase roadmap above, scoped in direct
+response to a design question asked right after the SQL Feature-Parity
+Roadmap's own schema export/import shipped: "can we do the same thing for
+the VectorStore?" The honest answer reframed the question rather than
+reusing the SQL mechanism directly — vector collections and HNSW indexes
+aren't part of the SQL engine at all (no `CREATE COLLECTION` grammar
+exists, nor should it: `vecstore.c`/`vec_index.c` have always been a
+separate subsystem, reached through their own syscalls, not
+`sql_execute()`). What carries over is the underlying idea, not the
+mechanism: a collection's definition (name + dimension) and an index's
+definition (name + collection + metric) are exactly as small and
+replayable as a `CREATE TABLE`/`CREATE INDEX` statement, so export/import
+follows the same *shape* — plain, re-creatable text; import replays it
+through the real create functions; one bad line doesn't block the rest —
+using a small purpose-built grammar instead of SQL text, since none
+existed to reconstruct.
+
+### Scope
+
+- `vec_schema_export(caller_uid, out, max)` (`kernel/vec_index.c` — not
+  `vecstore.c`, since it needs to read both `vector_collections[]` and
+  `vec_indexes[]`, and `vec_index.h` already includes `vecstore.h`, the
+  correct one-directional layering): iterates every active collection
+  `caller_uid` has `PERM_READ` on, emitting `COLLECTION <name> DIM <n>`,
+  followed immediately by one `INDEX <name> ON <collection> METRIC
+  <cosine|l2>` line per active index on that collection.
+- `vec_schema_import(caller_uid, text, out)`: splits on `\n`, skips
+  blank/`#`-comment lines, and replays each remaining line through
+  `vecstore_create_collection()` or `vec_index_create()` depending on its
+  leading keyword, continuing past individual line failures.
+- New syscalls `SYS_SLS_VEC_SCHEMA_EXPORT` (256) and `SYS_SLS_VEC_SCHEMA_
+  IMPORT` (257) — confirmed as the next free numbers via a grep across
+  every existing `SYS_SLS_*` definition (highest prior was 255, `SYS_SLS_
+  SCHEMA_IMPORT`).
+- HTTP: `GET /api/vec/schema/export`, `POST /api/vec/schema/import`
+  (`net/http.c`).
+- Terminal: `vec schema export`, `vec schema import <text>` (`user/
+  shell.c`).
+
+### Real, named differences from the SQL version (not silently glossed over)
+
+1. **Definitions only — no vector data.** A collection or index recreated
+   from this export starts genuinely empty. Bulk vector-*data* export
+   (the embeddings themselves) is separately planned, deliberately not
+   bundled into this phase — flagged explicitly when this phase was
+   scoped, not discovered as an afterthought.
+2. **Collections have no metric of their own.** Confirmed directly from
+   `struct VecCollectionHeader`: no metric field exists anywhere in it —
+   only an index fixes a metric, at `vec_index_create()` time. A
+   collection with zero indexes (like this phase's own "images" host-test
+   fixture) exports with no metric information at all, because none
+   exists to lose, not because the exporter dropped it.
+3. **`vecstore_create_collection()` has no permission gate of its own.**
+   Confirmed directly: no `catalog_check_access()` call anywhere in it,
+   unlike every other `vecstore.c` entry point (insert/get/delete/scan all
+   gate on it). `vec_schema_import()` calls it exactly as-is — any caller
+   who can reach the import syscall can create new collections regardless
+   of role, exactly as true today calling `vec create` directly. Not a
+   gap this feature introduces or silently works around by inventing a
+   check the underlying primitive doesn't have; named here so a future
+   phase that adds `caller_uid`/a real gate to `vecstore_create_
+   collection()` itself knows to revisit this caller too. Export's own
+   read gate (`catalog_check_access(caller_uid, name, PERM_READ)` per
+   collection) reuses the same choke point `vec_index_create()` already
+   uses to gate index creation against its underlying collection — not a
+   new one invented for this feature.
+4. **No quoting.** Names are plain, space-free identifiers
+   (`OBJECT_NAME_LEN`), matching this whole codebase's existing
+   object-naming convention (the same assumption `user/shell.c`'s own
+   `sh_token()` whitespace-splitting already makes for every other
+   command). A real simplification versus `sql_schema_import()`'s
+   quote-aware `;`-splitter, but an honest one given the data — there's
+   no equivalent of a SQL string literal anywhere in this grammar for a
+   `;` (or anything else) to hide inside.
+
+### Frontend
+
+Export/Import buttons were added to the SQL Console's own toolbar
+(`slsos-sim/src/components/SlsDbEngine.tsx`) for the SQL version of this
+feature; the VectorStore tab is the natural next home for the same pair
+of buttons here, following the same pattern (download a `.txt`/plain-text
+dump on export, a file-picker + POST on import, a status banner
+reporting succeeded/failed counts) — not yet wired into the frontend as
+of this phase; the kernel/syscall/HTTP/Terminal reachability chain is
+complete and host-tested, matching every prior phase's own "backend
+first, frontend as a separate, explicitly named follow-up" posture where
+noted.
+
+**Host test:** `tests/vec_schema_export_import_host_test.c`, 30 checks,
+linking the REAL `kernel/vec_index.c` and `kernel/vecstore.c` (not a
+reimplementation of either) using `vec_index_host_test.c`'s own lighter
+scaffold — host-declare `object_catalog[]` directly and stub `catalog_
+check_access()` behind a controllable on/off flag — rather than `sql_
+schema_export_import_host_test.c`'s heavier "link the real object_
+catalog.c" one, since `vecstore_create_collection()`/`vec_index_create()`
+both resolve a plain name directly against `object_catalog[]` with no
+`sys_sls_valloc()`/`sys_sls_schema_set()`-equivalent multi-step chain to
+prove out. Covers: export reconstructing correct `COLLECTION`/`INDEX`
+text (including a collection with no index correctly carrying no metric
+information); a real round trip (export → drop both fixture collections
+via `vecstore_notify_object_freed()`, the same real cascade `sys_sls_
+vfree()` itself calls, which also verified the HNSW index was cascade-
+deactivated → import the exported text → verify both collections and the
+index exist again); a multi-line import with one deliberately malformed
+line in the middle, verifying total/succeeded/failed counts and that the
+lines before and after it still ran; comment/blank-line handling; an
+`INDEX` line naming a nonexistent collection failing cleanly (not a
+crash); and permission-gated export (with access denied, the export
+contains no `COLLECTION` lines at all).
+
+A real bug caught while writing this test, not anticipated during design:
+an early draft check for "no INDEX line references the index-less
+collection" searched for the substring `"ON images"` — a false-positive
+trap, since `"COLLECTION images"` itself ends in `"...ON images"`
+(`COLLECTI` + `ON` + `" images"`). Fixed by checking for `"images
+METRIC"` instead, a substring that only appears in a genuine `INDEX ...
+ON images METRIC ...` line. A test bug, not a bug in `vec_schema_
+export()` itself — worth recording so a future reader doesn't mistake the
+original assertion for a real finding about the exporter.
+
+**Full regression sweep: 36/36 host test files, 0 failed** (up from 35 —
+the new file). `net/http.c` and `kernel/vec_index.c` compile-checked
+clean.
+
+---
+
+## Phase 6 — Bulk vector DATA export/import — DONE
+
+The deferred half of Phase 5's own scope, named explicitly at the time
+("Bulk vector *data* export (the embeddings themselves) is separately
+planned future work, deliberately not bundled into this phase") and built
+as the direct next piece on request. Where Phase 5 covers a collection's
+*shape* (name + dimension, and any index built over it), this phase covers
+its *contents* — the actual `external_id` + float-vector pairs stored
+inside.
+
+### Scope
+
+- `vec_data_export(caller_uid, collection_name, out, max, result)`
+  (`kernel/vecstore.c`, not `vec_index.c` — pure vector-data dump/restore
+  only needs `vector_collections[]`/`vecstore_collection_scan()`/
+  `vecstore_insert()`, none of which require `vec_indexes[]`; putting a
+  vecstore-data-only feature in `vec_index.c` would invert that file's own
+  one-directional dependency on `vecstore.h` for no reason). Scoped to
+  **one collection per call**, deliberately unlike `vec_schema_export()`'s
+  "every readable collection at once" — vector data volume is vastly
+  larger than DDL-sized definitions, so batching every collection into one
+  buffer would make the buffer-size limit below even tighter than it
+  already is. Reuses `vecstore_collection_scan()` directly (already gates
+  `PERM_READ`, no parallel scan path), emitting one `VECTOR <collection>
+  <external_id> <v0> <v1> ... <v(dim-1)>` line per active entry. Reports
+  `vectors_written`/`vectors_total`/`truncated` explicitly in a result
+  struct rather than a single ambiguous byte count.
+- `vec_data_import(caller_uid, text, out)` (`kernel/vecstore.c`): splits on
+  `\n` (bounded by an explicit end index per line rather than copying each
+  line into a local buffer first — see "buffer size" below for why that
+  matters), skips blank/`#`-comment lines, and replays each `VECTOR` line
+  through `vecstore_insert()`, continuing past individual line failures.
+- New syscalls `SYS_SLS_VEC_DATA_EXPORT` (258) and `SYS_SLS_VEC_DATA_
+  IMPORT` (259) — confirmed as the next free numbers via a fresh grep
+  across every existing `SYS_SLS_*` definition (highest prior was 257,
+  `SYS_SLS_VEC_SCHEMA_IMPORT`, from Phase 5).
+- HTTP: `GET /api/vec/data/export/<collection>` (path-segment parameter,
+  matching the existing `/api/tables/<name>/schema` convention — no
+  query-string parsing infrastructure exists anywhere in `net/http.c`,
+  confirmed by grep before writing this route), `POST /api/vec/data/
+  import` (`net/http.c`).
+- Terminal: `vec data export <collection>`, `vec data import <text>`
+  (`user/shell.c`).
+
+### Design decisions worth recording
+
+1. **Buffer size: 8192, matching `SQL_SCHEMA_EXPORT_MAX_LEN`, and
+   genuinely tight at real embedding dimensions.** The request structs
+   these travel inside are used as local stack variables in `user/
+   shell.c` (mirroring its existing ~8KB `struct SLSSchemaExportRequest
+   req;` precedent) — a much larger embedded buffer risks a real kernel
+   stack overflow in the actual kernel build, not just a host test's much
+   larger process stack. Honest consequence: at real embedding dimensions
+   (this file's own model survey elsewhere cites 384–1024), a single
+   vector's line can approach or exceed this whole buffer on its own, so
+   `vec_data_export()` may fit only a handful of vectors — occasionally
+   zero — per call at those dimensions. `result->truncated` reports this
+   explicitly rather than hiding it. There is no cursor/offset resumption
+   mechanism in this first cut for walking a large collection across
+   multiple export calls — named as real, unsolved future work, not
+   silently glossed over.
+2. **No intermediate whole-line stack buffer during import.**
+   `vec_data_import()` tokenizes directly out of the caller's `text`
+   buffer between explicit `[pos, end)` bounds for each line, rather than
+   copying a line into a local array first (the pattern `vec_schema_
+   import()` uses, safe there because COLLECTION/INDEX lines are always
+   short). A `VECTOR` line can, at `VECSTORE_MAX_DIMENSION=2048`, be far
+   larger than any reasonable local stack array — this avoids that risk
+   entirely rather than picking an arbitrary "probably big enough" size.
+3. **No standalone float-serialization helper existed anywhere reusable**
+   in this codebase (confirmed by investigation before writing this
+   phase) — the only precedent was `rowstore.c`'s file-scope-only `rs_f64_
+   to_str()`/`rs_parse_f64()` (fixed 6-decimal, no exponent, `double`).
+   This phase adds a fresh `vecstore.c`-local `vs_f32_to_str()`/`vs_parse_
+   f32()` pair (matching that file's own `vs_` prefix convention), copying
+   the same fixed-6-decimal, no-exponent algorithm at `float` precision —
+   the correct native type for this file (see `vecstore.h`'s own comment
+   on why `float` not `double`), not extracted/shared from `rowstore.c`,
+   matching this codebase's established "each file keeps its own small
+   helpers" convention (`predicate.c`'s own separate `pe_parse_f64` copy
+   is the direct precedent).
+4. **Atomic per-line writes, not partial-then-rollback.** Each `VECTOR`
+   line is appended byte-by-byte directly into the output buffer; if any
+   piece doesn't fit, `*pos` is rolled back to where that line started
+   before returning, so the output buffer is always a clean, complete
+   `\0`-terminated prefix — never a half-written trailing vector. Verified
+   directly by the host test's truncation scenario.
+5. **Auto-indexing for free.** `vecstore_insert()` (already implemented
+   well before this phase) already calls `vec_index_notify_insert()`
+   unconditionally on every successful insert — so importing data into a
+   collection that already has an HNSW index (e.g. from a prior `vec_
+   schema_import()` `INDEX` line) is automatically indexed too, with zero
+   extra code in `vec_data_import()`. Verified directly by the host test's
+   scenario 3: create an index on an already-populated collection (no
+   retroactive indexing of pre-existing vectors — that's `vec_index_
+   rebuild()`'s separate job), import one *new* vector, then confirm `vec_
+   index_search()` finds it. This is why schema import must run *before*
+   data import when restoring both, mirroring the SQL roadmap's own
+   departments-before-employees `REFERENCES` ordering precedent.
+6. **Named gap: re-importing the same dump duplicates data (inherited,
+   not introduced here).** `vecstore_insert()` has never deduplicated on
+   `external_id` (`vecstore.h`'s own pre-existing comment: "uniqueness, if
+   wanted, is the caller's responsibility"). `vec_data_import()` calls
+   `vecstore_insert()` exactly as-is — running the same import twice
+   duplicates every vector rather than no-op'ing or overwriting. Verified
+   directly by the host test (scenario 9): importing the same line twice
+   grows `entry_count` by 2, not 1, and a scan confirms two distinct
+   entries carry the same `external_id`. Pre-existing behavior, named
+   here rather than silently inherited without comment.
+
+### Frontend
+
+Not yet wired into the VectorStore tab as of this phase, matching Phase
+5's own "backend first, frontend as a separate, explicitly named
+follow-up" posture — the kernel/syscall/HTTP/Terminal reachability chain
+is complete and host-tested.
+
+**Host test:** `tests/vec_data_export_import_host_test.c`, 42 checks,
+linking the REAL `kernel/vecstore.c` and `kernel/vec_index.c` (not a
+reimplementation of either), reusing `vec_schema_export_import_host_
+test.c`'s own lighter scaffold. Covers: export reconstructing the exact
+`VECTOR <collection> <external_id> <v0> ...` text for three fixture
+vectors (checked against their exact expected 6-decimal formatting,
+including negative and zero components); a real round trip (export →
+drop the collection via `vecstore_notify_object_freed()` → recreate it
+empty → reimport the captured text → verify all 3 vectors reappear with
+exactly their original float values via a fresh scan); the auto-indexing-
+for-free behavior described above; a multi-line import with one
+deliberately malformed component, verifying total/succeeded/failed counts
+and that the lines before and after it still ran; a dimension-mismatch
+line reported distinctly from a malformed-token failure; a line naming a
+nonexistent collection failing cleanly (not a crash); comment/blank-line
+handling; truncation behavior against a deliberately undersized output
+buffer, confirming the output remains a clean, complete prefix; the
+inherited external_id-non-dedup gap, confirmed directly; and permission-
+gated export.
+
+No bug was found in the feature itself while writing this test (unlike
+Phase 5's own "ON images" false-positive test bug, or the SQL roadmap's
+DROP TABLE mvcc bug) — the first full run passed clean, worth recording
+honestly rather than manufacturing a "gap found" narrative where none
+occurred.
+
+**Full regression sweep: 37/37 host test files, 0 failed** (up from 36 —
+the new file). `kernel/vecstore.c`, `kernel/syscall_dispatch.c`, `net/
+http.c`, and `user/shell.c` all compile-checked clean.
+
+---
+
 ## Suggested sequencing
 
 1. **Phase 1 (deletion)** first — it's fixing a bug that already exists

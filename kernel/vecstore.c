@@ -644,3 +644,294 @@ void sys_sls_vec_list(void) {
     }
     if (!shown) kernel_serial_print(" (no vector collections defined)\n");
 }
+
+// ─── VectorStore Interface Roadmap follow-on: bulk vector DATA export/
+// import. See vecstore.h's own header comment for the full "why this
+// format, why per-collection, why 8192 is genuinely tight, auto-indexing-
+// for-free, and the inherited external_id-dedup gap" writeup. ────────────
+
+static int vs_append(char* buf, uint32_t* pos, uint32_t max, const char* src) {
+    uint32_t i = 0;
+    while (src[i]) {
+        if (*pos + 1 >= max) return 0;
+        buf[(*pos)++] = src[i++];
+    }
+    buf[*pos] = '\0';
+    return 1;
+}
+
+static void vs_u64_to_str(uint64_t v, char* buf, uint32_t max) {
+    char tmp[24]; uint32_t l = 0;
+    if (!v) tmp[l++] = '0';
+    else while (v) { tmp[l++] = (char)('0' + (v % 10)); v /= 10; }
+    uint32_t n = 0;
+    for (int i = (int)l - 1; i >= 0 && n < max - 1; i--) buf[n++] = tmp[i];
+    buf[n] = '\0';
+}
+
+static void vs_strcpy(char* dst, const char* src, uint32_t max) {
+    uint32_t i = 0; for (; i < max - 1 && src[i]; i++) dst[i] = src[i]; dst[i] = '\0';
+}
+
+// Fixed 6-decimal-place formatter -- a fresh vecstore.c-local copy of
+// rowstore.c's rs_f64_to_str(), matching this codebase's established
+// "each file keeps its own small helpers" convention (predicate.c's own
+// separate pe_parse_f64 copy is the direct precedent for why this isn't
+// extracted/shared instead), adapted for float (this file's native
+// vector-component type -- see this file's own VecValues comment on why
+// float not double) rather than double. Not a general float printer --
+// just enough to round-trip a value written via vs_parse_f32() below.
+static void vs_f32_to_str(float v, char* buf, uint32_t max) {
+    uint32_t n = 0;
+    if (v < 0) { if (n < max - 1) buf[n++] = '-'; v = -v; }
+    uint64_t ip = (uint64_t)v;
+    float frac = v - (float)ip;
+    char ipbuf[24];
+    vs_u64_to_str(ip, ipbuf, sizeof(ipbuf));
+    for (uint32_t i = 0; ipbuf[i] && n < max - 1; i++) buf[n++] = ipbuf[i];
+    if (n < max - 1) buf[n++] = '.';
+    for (int d = 0; d < 6 && n < max - 1; d++) {
+        frac *= 10.0f;
+        int digit = (int)frac;
+        if (digit < 0) digit = 0;
+        if (digit > 9) digit = 9;
+        buf[n++] = (char)('0' + digit);
+        frac -= (float)digit;
+    }
+    buf[n] = '\0';
+}
+
+// Mirrors rowstore.c's own rs_parse_f64() exactly, just at float
+// precision -- no exponent/scientific-notation support, matching that
+// function's own documented scope.
+static int vs_parse_f32(const char* s, float* out) {
+    if (!s || !s[0]) return 1;
+    uint32_t i = 0;
+    int neg = 0;
+    if (s[i] == '-') { neg = 1; i++; }
+    if (!s[i]) return 1;
+    float v = 0.0f;
+    int saw_digit = 0;
+    for (; s[i] >= '0' && s[i] <= '9'; i++) { v = v * 10.0f + (float)(s[i] - '0'); saw_digit = 1; }
+    if (s[i] == '.') {
+        i++;
+        float frac = 0.1f;
+        for (; s[i] >= '0' && s[i] <= '9'; i++) { v += (float)(s[i] - '0') * frac; frac *= 0.1f; saw_digit = 1; }
+    }
+    if (s[i] != '\0' || !saw_digit) return 1;
+    *out = neg ? -v : v;
+    return 0;
+}
+
+static int vs_parse_u64(const char* s, uint64_t* out) {
+    if (!s || !s[0]) return 1;
+    uint64_t v = 0;
+    for (uint32_t i = 0; s[i]; i++) {
+        if (s[i] < '0' || s[i] > '9') return 1;
+        v = v * 10 + (uint64_t)(s[i] - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+// Bounded-by-explicit-end-index tokenizer -- unlike vec_index.c's own
+// vse_next_token() (which walks a NUL-terminated single-line buffer), this
+// one tokenizes directly out of the caller's full multi-line `text`
+// between [pos, end), so vec_data_import() below never needs to copy a
+// whole line into a local stack buffer first. That copy would otherwise
+// have to be sized for a worst-case VECTOR line (up to VECSTORE_MAX_
+// DIMENSION=2048 floats), a real stack-budget risk in the actual kernel
+// build -- see vecstore.h's own header comment on why VEC_DATA_EXPORT_
+// MAX_LEN itself is deliberately small for the same underlying reason.
+static uint32_t vs_next_token_bounded(const char* text, uint32_t pos, uint32_t end,
+                                      char* outbuf, uint32_t outmax) {
+    while (pos < end && (text[pos] == ' ' || text[pos] == '\t')) pos++;
+    uint32_t o = 0;
+    while (pos < end && text[pos] != ' ' && text[pos] != '\t' && text[pos] != '\r' && text[pos] != '\n') {
+        if (o + 1 < outmax) outbuf[o++] = text[pos];
+        pos++;
+    }
+    outbuf[o] = '\0';
+    return pos;
+}
+
+struct vd_export_ctx {
+    char*       buf;
+    uint32_t*   pos;
+    uint32_t    max;
+    const char* collection_name;
+    uint32_t    written;
+    uint32_t    total;
+    int         stop;   // 1 once the buffer is full -- avoids repeatedly retrying a doomed append
+};
+
+// Builds one "VECTOR <collection> <external_id> <v0> ... <v(n-1)>\n" line
+// directly into ctx->buf (no intermediate whole-line stack buffer -- see
+// vs_next_token_bounded()'s own comment on why that matters here). If the
+// line doesn't fully fit, rolls *ctx->pos back to where the line started
+// so a half-written vector is never left in the output -- the output
+// buffer's own bytes past the last successfully written line are always a
+// clean, complete '\0'-terminated prefix.
+static void vd_export_cb(struct VecId id, uint64_t external_id, const struct VecValues* values, void* ctxp) {
+    (void)id;
+    struct vd_export_ctx* ctx = (struct vd_export_ctx*)ctxp;
+    ctx->total++;
+    if (ctx->stop) return;   // buffer already full -- vectors_total above still stays honest
+
+    uint32_t line_start = *ctx->pos;
+    int ok = vs_append(ctx->buf, ctx->pos, ctx->max, "VECTOR ") &&
+             vs_append(ctx->buf, ctx->pos, ctx->max, ctx->collection_name) &&
+             vs_append(ctx->buf, ctx->pos, ctx->max, " ");
+    if (ok) {
+        char idbuf[24];
+        vs_u64_to_str(external_id, idbuf, sizeof(idbuf));
+        ok = vs_append(ctx->buf, ctx->pos, ctx->max, idbuf);
+    }
+    for (uint32_t i = 0; ok && i < values->count; i++) {
+        char fbuf[32];
+        vs_f32_to_str(values->values[i], fbuf, sizeof(fbuf));
+        ok = vs_append(ctx->buf, ctx->pos, ctx->max, " ") &&
+             vs_append(ctx->buf, ctx->pos, ctx->max, fbuf);
+    }
+    ok = ok && vs_append(ctx->buf, ctx->pos, ctx->max, "\n");
+
+    if (!ok) {
+        *ctx->pos = line_start;      // roll back this line's partial bytes
+        ctx->buf[*ctx->pos] = '\0';
+        ctx->stop = 1;
+        return;
+    }
+    ctx->written++;
+}
+
+uint32_t vec_data_export(uint32_t caller_uid, const char* collection_name,
+                         char* out, uint32_t max, struct VecDataExportResult* result) {
+    if (result) { result->bytes_written = 0; result->vectors_written = 0; result->vectors_total = 0; result->truncated = 0; }
+    if (!out || max == 0) return 0;
+    out[0] = '\0';
+    if (!collection_name) return 0;
+
+    // Explicit pre-check, purely so a nonexistent/denied collection
+    // returns a clean empty export rather than attempting the header-
+    // comment append first -- cosmetic, not a correctness difference
+    // (vecstore_collection_scan() below re-checks catalog_check_access()
+    // regardless, matching this codebase's "one real choke point"
+    // convention -- the same ambiguity vecstore_search()'s own header
+    // comment already names applies here too: 0 vectors_written can mean
+    // either "no such collection/denied" or "genuinely empty").
+    int idx = find_active_collection(collection_name);
+    if (idx < 0) return 0;
+    if (!catalog_check_access(caller_uid, collection_name, PERM_READ)) return 0;
+
+    uint32_t pos = 0;
+    if (!vs_append(out, &pos, max, "# vector-store data export -- collection ") ||
+        !vs_append(out, &pos, max, collection_name) ||
+        !vs_append(out, &pos, max, "\n")) {
+        if (result) { result->bytes_written = pos; result->truncated = 1; }
+        return pos;
+    }
+
+    struct vd_export_ctx ctx = { out, &pos, max, collection_name, 0, 0, 0 };
+    vecstore_collection_scan(caller_uid, collection_name, vd_export_cb, &ctx);
+
+    if (result) {
+        result->bytes_written   = pos;
+        result->vectors_written = ctx.written;
+        result->vectors_total   = ctx.total;
+        result->truncated       = (ctx.total > ctx.written) ? 1 : 0;
+    }
+    return pos;
+}
+
+void vec_data_import(uint32_t caller_uid, const char* text, struct VecDataImportResult* out) {
+    if (!out) return;
+    out->total = 0; out->succeeded = 0; out->failed = 0;
+    for (uint32_t i = 0; i < VEC_DATA_IMPORT_MAX_LINES; i++) {
+        out->lines[i].ok = 0;
+        out->lines[i].offset = 0;
+        out->lines[i].error_msg[0] = '\0';
+    }
+    if (!text) return;
+
+    uint32_t i = 0;
+    while (text[i]) {
+        uint32_t line_start = i;
+        uint32_t j = i;
+        while (text[j] && text[j] != '\n') j++;
+        uint32_t line_end = j;   // exclusive -- text[line_start..line_end) excludes the trailing '\n'
+        i = text[j] ? j + 1 : j;
+
+        uint32_t p = line_start;
+        while (p < line_end && (text[p] == ' ' || text[p] == '\t' || text[p] == '\r')) p++;
+        if (p >= line_end || text[p] == '#') continue;   // blank or comment line -- not counted
+
+        out->total++;
+        uint32_t slot = out->total - 1;
+        struct VecDataImportLineResult* lr =
+            (slot < VEC_DATA_IMPORT_MAX_LINES) ? &out->lines[slot] : 0;
+        if (lr) lr->offset = line_start;
+
+        char kw[16];
+        p = vs_next_token_bounded(text, p, line_end, kw, sizeof(kw));
+
+        int ok = 0;
+        const char* err = "";
+
+        if (!vs_streq(kw, "VECTOR")) {
+            err = "unrecognized line (expected a line starting with VECTOR)";
+        } else {
+            char coll[OBJECT_NAME_LEN], idtok[24];
+            p = vs_next_token_bounded(text, p, line_end, coll, sizeof(coll));
+            p = vs_next_token_bounded(text, p, line_end, idtok, sizeof(idtok));
+            uint64_t external_id = 0;
+            if (coll[0] == '\0' || idtok[0] == '\0' || vs_parse_u64(idtok, &external_id)) {
+                err = "malformed VECTOR line (expected: VECTOR <collection> <external_id> <v0> <v1> ...)";
+            } else {
+                struct VecValues values;
+                values.count = 0;
+                int bad = 0;
+                for (;;) {
+                    char tok[32];
+                    uint32_t next_p = vs_next_token_bounded(text, p, line_end, tok, sizeof(tok));
+                    if (tok[0] == '\0') break;   // no more tokens on this line
+                    p = next_p;
+                    if (values.count >= VECSTORE_MAX_DIMENSION) { bad = 1; break; }
+                    float f;
+                    if (vs_parse_f32(tok, &f)) { bad = 1; break; }
+                    values.values[values.count++] = f;
+                }
+                if (bad) {
+                    err = "malformed vector component (not a valid number, or more components than VECSTORE_MAX_DIMENSION)";
+                } else if (values.count == 0) {
+                    err = "VECTOR line has no vector components";
+                } else {
+                    struct VecId out_id;
+                    int rc = vecstore_insert(caller_uid, coll, external_id, &values, &out_id);
+                    switch (rc) {
+                        case 0: ok = 1; break;
+                        case 1: err = "collection not found (import schema definitions first, or check the name)"; break;
+                        case 2: err = "permission denied"; break;
+                        case 4: err = "dimension mismatch: this line's component count doesn't match the collection's dimension"; break;
+                        case 5: err = "vecstore_insert() failed: page pool exhausted"; break;
+                        default: err = "vecstore_insert() failed"; break;
+                    }
+                }
+            }
+        }
+
+        if (lr) { lr->ok = (uint8_t)ok; vs_strcpy(lr->error_msg, err, sizeof(lr->error_msg)); }
+        if (ok) out->succeeded++; else out->failed++;
+    }
+}
+
+uint64_t sys_sls_vec_data_export(struct SLSVecDataExportRequest* req) {
+    if (!req) return 1;
+    vec_data_export(req->caller_uid, req->collection_name, req->out, sizeof(req->out), &req->result);
+    return 0;
+}
+
+uint64_t sys_sls_vec_data_import(struct SLSVecDataImportRequest* req) {
+    if (!req) return 1;
+    vec_data_import(req->caller_uid, req->text, &req->result);
+    return req->result.failed == 0 ? 0 : 1;
+}

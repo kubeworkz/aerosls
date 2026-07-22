@@ -463,4 +463,111 @@ uint64_t sys_sls_vec_embed_search(struct SLSVecEmbedSearchRequest* req);
 #define SYS_SLS_VEC_LIST 229
 void sys_sls_vec_list(void);
 
+// ─── VectorStore Interface Roadmap follow-on: bulk vector DATA export/
+// import (the embeddings themselves, complementing vec_index.h's
+// definitions-only COLLECTION/INDEX export/import) ──────────────────────
+//
+// ─── Why this lives in vecstore.c/.h, not vec_index.c/.h ─────────────────
+// Pure vector-data dump/restore only needs vector_collections[]/
+// vecstore_collection_scan()/vecstore_insert() -- none of which require
+// vec_indexes[] at all. vec_index.c depends on vecstore.h (one direction
+// only); a vecstore-data-only feature living there would invert that
+// layering for no reason. The definitions feature needed vec_index.c
+// because an INDEX line has no vecstore.c-side representation at all --
+// vector DATA has no such asymmetry, so it belongs at this lower layer.
+//
+// ─── Format: "VECTOR <collection> <external_id> <v0> <v1> ... <v(dim-1)>"
+// ───────────────────────────────────────────────────────────────────────
+// One line per active (non-tombstoned) entry, visited in the same
+// physical scan order vecstore_collection_scan() already uses (reused
+// directly here -- already gates PERM_READ, no parallel scan path).
+// Deliberately scoped to ONE collection per call (unlike
+// vec_schema_export()'s "every readable collection at once") -- vector
+// data volume is vastly larger than DDL-sized definitions, so batching
+// every collection into one buffer would make the buffer-size limit below
+// even tighter than it already is; a caller wanting every collection's
+// data calls this once per collection instead.
+//
+// ─── Buffer size: 8192, and why that's genuinely tight ───────────────────
+// Matches SQL's own SQL_SCHEMA_EXPORT_MAX_LEN rather than something
+// larger, because the request structs below travel as LOCAL STACK
+// VARIABLES in user/shell.c (mirroring its existing ~8KB
+// struct SLSSchemaExportRequest req; precedent) -- a much bigger embedded
+// buffer risks a real kernel stack overflow in the actual kernel build,
+// not just a host test's much larger process stack. Honest consequence,
+// named rather than hidden: at real embedding dimensions (this file's own
+// model survey elsewhere in this header cites 384-1024), a single
+// vector's line can approach or exceed this whole buffer on its own, so
+// vec_data_export() may fit only a handful of vectors -- occasionally
+// zero -- per call at those dimensions. `result->truncated` reports this
+// explicitly. This first cut has no cursor/offset resumption mechanism
+// for calling export repeatedly to walk a large collection in chunks --
+// a caller must currently re-derive "what's already been exported" some
+// other way (e.g. by external_id) if a collection doesn't fit in one call.
+// Named as real, unsolved future work, not silently glossed over.
+//
+// ─── Auto-indexing for free ──────────────────────────────────────────────
+// vecstore_insert() (above) already calls vec_index_notify_insert()
+// unconditionally on every successful insert -- so importing data into a
+// collection that already has an HNSW index (e.g. from a prior
+// vec_schema_import() INDEX line) is automatically indexed too, with zero
+// extra code in vec_data_import() below. This is why schema import must
+// run BEFORE data import when restoring both, mirroring the SQL roadmap's
+// own departments-before-employees REFERENCES ordering precedent.
+//
+// ─── Named gap: re-importing the same dump duplicates data (inherited,
+// not introduced here) ────────────────────────────────────────────────────
+// vecstore_insert() has never deduplicated on external_id (see this
+// header's own VecId/insert comment above: "uniqueness, if wanted, is the
+// caller's responsibility"). vec_data_import() calls vecstore_insert()
+// exactly as-is -- running the same import twice duplicates every vector
+// rather than no-op'ing or overwriting. Pre-existing behavior, named here
+// rather than silently inherited without comment.
+#define VEC_DATA_EXPORT_MAX_LEN   8192
+#define VEC_DATA_IMPORT_MAX_LINES 256
+
+struct VecDataExportResult {
+    uint32_t bytes_written;
+    uint32_t vectors_written;   // how many VECTOR lines were actually emitted
+    uint32_t vectors_total;     // how many active entries the collection actually has
+    uint8_t  truncated;         // 1 if vectors_total > vectors_written (buffer ran out)
+};
+
+uint32_t vec_data_export(uint32_t caller_uid, const char* collection_name,
+                         char* out, uint32_t max, struct VecDataExportResult* result);
+
+struct VecDataImportLineResult {
+    uint32_t offset;
+    uint8_t  ok;
+    char     error_msg[64];
+};
+
+struct VecDataImportResult {
+    uint32_t total;
+    uint32_t succeeded;
+    uint32_t failed;
+    struct VecDataImportLineResult lines[VEC_DATA_IMPORT_MAX_LINES];
+};
+
+void vec_data_import(uint32_t caller_uid, const char* text, struct VecDataImportResult* out);
+
+#define SYS_SLS_VEC_DATA_EXPORT 258
+#define SYS_SLS_VEC_DATA_IMPORT 259
+
+struct SLSVecDataExportRequest {
+    uint32_t caller_uid;
+    char     collection_name[OBJECT_NAME_LEN];
+    char     out[VEC_DATA_EXPORT_MAX_LEN];
+    struct VecDataExportResult result;
+};
+
+struct SLSVecDataImportRequest {
+    uint32_t caller_uid;
+    char     text[VEC_DATA_EXPORT_MAX_LEN];
+    struct VecDataImportResult result;
+};
+
+uint64_t sys_sls_vec_data_export(struct SLSVecDataExportRequest* req);
+uint64_t sys_sls_vec_data_import(struct SLSVecDataImportRequest* req);
+
 #endif /* VECSTORE_H */

@@ -166,6 +166,12 @@ static void print_help(void) {
         "  -- Schema Import/Export (SQL Feature-Parity Roadmap, Phase 8) --\n"
         "  schema export                  dump CREATE TABLE/CREATE INDEX SQL for every readable table\n"
         "  schema import <sql>            run ';'-separated CREATE TABLE/INDEX statements\n"
+        "  -- VectorStore Schema Import/Export (definitions only, no vector data) --\n"
+        "  vec schema export              dump COLLECTION/INDEX definitions for every readable collection\n"
+        "  vec schema import <text>       run COLLECTION/INDEX definition lines\n"
+        "  -- VectorStore Data Import/Export (the embeddings themselves) --\n"
+        "  vec data export <collection>   dump VECTOR lines (external_id + floats) for one collection\n"
+        "  vec data import <text>         run VECTOR lines (import schema first if restoring both)\n"
         "  -- Security (Phase 2) --\n"
         "  role set <uid> <role>          assign role (SYSTEM_KERNEL|DB_ADMIN|\n"
         "                                              APP_USER|GUEST)\n"
@@ -845,6 +851,86 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                 struct SqlSchemaImportStmtResult* sr = &req.result.stmts[si];
                 if (sr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", si, sr->offset);
                 else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", si, sr->offset, sr->error_msg);
+            }
+        }
+
+        // ── VectorStore Interface Roadmap follow-on: collection/index
+        // definition export/import ──────────────────────────────────────────
+        // "vec schema export" prints COLLECTION/INDEX definition text for
+        // every collection current_session_uid can read (vec_schema_export(),
+        // vec_index.c) -- see vec_index.h's own comment on why this is a
+        // small purpose-built text grammar, not SQL or JSON, and definitions
+        // only, never vector data.
+        else if (sh_eq(input_buffer, "vec schema export")) {
+            struct SLSVecSchemaExportRequest req;
+            req.caller_uid = current_session_uid;
+            do_syscall(SYS_SLS_VEC_SCHEMA_EXPORT, &req);
+            kernel_serial_printf("[VEC_SCHEMA] %u byte(s):\n%s", req.bytes_written, req.out);
+        }
+        // "vec schema import <text>" -- one shell line, so multiple lines
+        // must be written on that one line separated by whatever the caller
+        // wants (there's no ';'  in this grammar); in practice this command
+        // is mainly useful for a single COLLECTION or INDEX line at a time
+        // from the shell, with the HTTP route (POST /api/vec/schema/import)
+        // handling real multi-line text from a file. Continues past
+        // individual line failures -- see vec_index.h's own comment on
+        // vec_schema_import() for why.
+        else if (sh_starts(input_buffer, "vec schema import ")) {
+            struct SLSVecSchemaImportRequest req;
+            req.caller_uid = current_session_uid;
+            sh_copy(req.text, input_buffer + 19, sizeof(req.text));
+            do_syscall(SYS_SLS_VEC_SCHEMA_IMPORT, &req);
+            kernel_serial_printf("[VEC_SCHEMA] import: %u total, %u succeeded, %u failed\n",
+                                 req.result.total, req.result.succeeded, req.result.failed);
+            uint32_t vshown = req.result.total < VEC_SCHEMA_IMPORT_MAX_LINES ? req.result.total : VEC_SCHEMA_IMPORT_MAX_LINES;
+            for (uint32_t vi = 0; vi < vshown; vi++) {
+                struct VecSchemaImportLineResult* lr = &req.result.lines[vi];
+                if (lr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", vi, lr->offset);
+                else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", vi, lr->offset, lr->error_msg);
+            }
+        }
+
+        // ── VectorStore Interface Roadmap follow-on: bulk vector DATA
+        // export/import -- complements the definitions-only pair directly
+        // above. "vec data export <collection>" prints "VECTOR <collection>
+        // <external_id> <v0> <v1> ..." lines for the one named collection
+        // current_session_uid can read (vec_data_export(), vecstore.c). See
+        // vecstore.h's own header comment on why VEC_DATA_EXPORT_MAX_LEN is
+        // genuinely tight at real embedding dimensions -- vectors_written/
+        // vectors_total/truncated are reported explicitly below rather than
+        // silently hidden.
+        else if (sh_starts(input_buffer, "vec data export ")) {
+            struct SLSVecDataExportRequest req;
+            req.caller_uid = current_session_uid;
+            sh_copy(req.collection_name, input_buffer + 17, sizeof(req.collection_name));
+            do_syscall(SYS_SLS_VEC_DATA_EXPORT, &req);
+            kernel_serial_printf(
+                "[VEC_DATA] %u byte(s), %u/%u vector(s) written%s:\n%s",
+                req.result.bytes_written, req.result.vectors_written, req.result.vectors_total,
+                req.result.truncated ? " (TRUNCATED -- buffer too small for the whole collection)" : "",
+                req.out);
+        }
+        // "vec data import <text>" -- one shell line, so multiple VECTOR
+        // lines must be written on that one line (no ';' in this grammar,
+        // matching "vec schema import"'s own precedent); in practice this
+        // command is mainly useful for a single VECTOR line at a time from
+        // the shell, with the HTTP route (POST /api/vec/data/import)
+        // handling real multi-line text from a file. Continues past
+        // individual line failures -- see vecstore.h's own comment on
+        // vec_data_import() for why, and for the inherited (not new)
+        // external_id-non-dedup gap this call carries.
+        else if (sh_starts(input_buffer, "vec data import ")) {
+            struct SLSVecDataImportRequest req;
+            req.caller_uid = current_session_uid;
+            sh_copy(req.text, input_buffer + 17, sizeof(req.text));
+            do_syscall(SYS_SLS_VEC_DATA_IMPORT, &req);
+            kernel_serial_printf("[VEC_DATA] import: %u total, %u succeeded, %u failed\n",
+                                 req.result.total, req.result.succeeded, req.result.failed);
+            uint32_t vdshown = req.result.total < VEC_DATA_IMPORT_MAX_LINES ? req.result.total : VEC_DATA_IMPORT_MAX_LINES;
+            for (uint32_t vdi = 0; vdi < vdshown; vdi++) {
+                struct VecDataImportLineResult* lr = &req.result.lines[vdi];
+                if (lr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", vdi, lr->offset);
+                else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", vdi, lr->offset, lr->error_msg);
             }
         }
 

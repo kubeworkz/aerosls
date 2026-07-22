@@ -383,6 +383,22 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_SCHEMA_IMPORT:
         return sys_sls_schema_import((struct SLSSchemaImportRequest*)arg);
 
+    // ── VectorStore Interface Roadmap follow-on: collection/index
+    // definition export/import (256-257) -- see vec_index.h's own comment
+    // on these two syscalls. ─────────────────────────────────────────────
+    case SYS_SLS_VEC_SCHEMA_EXPORT:
+        return sys_sls_vec_schema_export((struct SLSVecSchemaExportRequest*)arg);
+    case SYS_SLS_VEC_SCHEMA_IMPORT:
+        return sys_sls_vec_schema_import((struct SLSVecSchemaImportRequest*)arg);
+
+    // ─── VectorStore Interface Roadmap follow-on: bulk vector data
+    // export/import (258-259) -- see vecstore.h's own comment on these two
+    // syscalls. ─────────────────────────────────────────────────────────
+    case SYS_SLS_VEC_DATA_EXPORT:
+        return sys_sls_vec_data_export((struct SLSVecDataExportRequest*)arg);
+    case SYS_SLS_VEC_DATA_IMPORT:
+        return sys_sls_vec_data_import((struct SLSVecDataImportRequest*)arg);
+
     default:
         return 0;
     }

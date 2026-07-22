@@ -347,4 +347,123 @@ struct SLSVecIndexRebuildRequest {
 
 uint64_t sys_sls_vec_index_rebuild(struct SLSVecIndexRebuildRequest* req);
 
+// ─── VectorStore Interface Roadmap follow-on: collection/index definition
+// export/import ─────────────────────────────────────────────────────────
+// Mirrors the SQL Feature-Parity Roadmap's own schema export/import
+// (kernel/sql_exec.h's sql_schema_export()/sql_schema_import()) -- same
+// idea (plain, re-creatable text; import replays it through the real
+// create functions; one bad line doesn't block the rest of the batch) --
+// applied to this subsystem's own definitions instead of SQL text,
+// because there is no SQL grammar for vector collections/indexes to
+// reconstruct in the first place (confirmed: sql_parser.c has no CREATE
+// COLLECTION/CREATE VEC INDEX syntax at all, nor should it -- vecstore.c/
+// vec_index.c have always been a separate subsystem from the SQL engine,
+// reached through their own syscalls, not sql_execute()). The format is
+// this subsystem's own tiny, line-oriented grammar instead:
+//   COLLECTION <name> DIM <dimension>
+//   INDEX <name> ON <collection> METRIC <cosine|l2>
+// `#`-prefixed lines are comments, blank lines are skipped. Deliberately
+// neither a SQL dialect nor JSON: kernel code in this project has never
+// depended on net/http.c's JSON helpers (JSONBuf/jb_str() are a net-layer
+// concern, not a kernel one -- net/http.c wraps kernel-produced text in
+// JSON, kernel code never builds JSON itself, exactly like sql_schema_
+// export() already established for SQL text), and there's no existing
+// grammar this maps onto, so a small purpose-built one is the honest
+// choice here rather than forcing this into either existing format.
+// Lives in vec_index.c (not vecstore.c) because it needs to read BOTH
+// vector_collections[] and vec_indexes[] -- vec_index.h already includes
+// vecstore.h (one-directional), so vec_index.c can safely see both
+// without vecstore.c ever needing to depend on vec_index.h in return,
+// the same layering reasoning sql_exec.c's own header comment gives for
+// why mvcc_rebuild_versions_for_table() is called from sql_exec.c rather
+// than living inside rowstore.c.
+//
+// Named, real gaps (not silently glossed over):
+//   - Definitions only -- no vector DATA is included. A collection or
+//     index recreated from this export starts genuinely empty. Bulk
+//     vector-data export is separately planned future work, deliberately
+//     not bundled in here.
+//   - Collections have no metric of their own in this data model (only
+//     an index does, fixed at vec_index_create() time -- see struct
+//     VecIndex above) -- a collection with zero indexes exports with no
+//     metric information at all, because none exists to lose, not
+//     because the exporter dropped it.
+//   - vecstore_create_collection() itself takes no caller_uid and has no
+//     permission gate of its own (confirmed directly: no catalog_check_
+//     access() call anywhere in it, unlike every other vecstore.c entry
+//     point). vec_schema_import() calls it exactly as-is, so any caller
+//     who can reach the import syscall can create new collections
+//     regardless of role -- exactly as true today calling vec_create
+//     directly. Not a gap this feature introduces or silently works
+//     around by inventing a check the underlying primitive doesn't have;
+//     named here so a future phase that closes it (adding caller_uid to
+//     vecstore_create_collection() itself) knows to update this caller too.
+//   - Export's own read gate is catalog_check_access(caller_uid, name,
+//     PERM_READ) per collection, the same choke point vec_index_create()
+//     itself already uses to gate index creation against its underlying
+//     collection -- reused, not reinvented.
+//   - Names are plain, space-free identifiers (OBJECT_NAME_LEN), matching
+//     this whole codebase's existing object-naming convention (the same
+//     assumption user/shell.c's own sh_token() whitespace-splitting
+//     already makes for every other command) -- no quoting support is
+//     needed or provided, a real simplification versus sql_schema_
+//     import()'s quote-aware splitter, but an honest one given the data.
+#define VEC_SCHEMA_EXPORT_MAX_LEN   4096   // typical whole-store definition dump size; callers may pass a smaller max
+#define VEC_SCHEMA_IMPORT_MAX_LINES 64      // real, named ceiling on definition lines accepted in one import call
+
+struct VecSchemaImportLineResult {
+    uint32_t offset;        // byte offset into the submitted text where this line started
+    uint8_t  ok;
+    char     error_msg[64];  // meaningful iff !ok
+};
+
+struct VecSchemaImportResult {
+    uint32_t total;          // total non-blank, non-comment lines found (may exceed VEC_SCHEMA_IMPORT_MAX_LINES)
+    uint32_t succeeded;
+    uint32_t failed;
+    struct VecSchemaImportLineResult lines[VEC_SCHEMA_IMPORT_MAX_LINES];
+};
+
+// Reconstructs COLLECTION/INDEX definition text for every active vector
+// collection caller_uid has PERM_READ on (and every active index on each
+// one), writing into out (bounded by max, always NUL-terminated). Returns
+// the number of bytes written, excluding the NUL (0 if nothing was
+// exportable/readable).
+uint32_t vec_schema_export(uint32_t caller_uid, char* out, uint32_t max);
+
+// Splits text into lines, skips blank/comment ('#') lines, and runs each
+// remaining line through vecstore_create_collection()/vec_index_create()
+// depending on its leading keyword, in order, continuing past individual
+// line failures -- one bad line doesn't block the rest of the batch.
+// Always fills *out (zeroed first).
+void vec_schema_import(uint32_t caller_uid, const char* text, struct VecSchemaImportResult* out);
+
+// --- Syscall surface -- matches SYS_SLS_SCHEMA_EXPORT/IMPORT's own
+// established "caller_uid travels inside the request struct" convention.
+// 256/257 -- next free numbers after SYS_SLS_SCHEMA_IMPORT (255).
+#define SYS_SLS_VEC_SCHEMA_EXPORT 256
+#define SYS_SLS_VEC_SCHEMA_IMPORT 257
+
+struct SLSVecSchemaExportRequest {
+    uint32_t caller_uid;
+    char     out[VEC_SCHEMA_EXPORT_MAX_LEN];   // filled in by the call
+    uint32_t bytes_written;                     // filled in by the call
+};
+
+struct SLSVecSchemaImportRequest {
+    uint32_t caller_uid;
+    char     text[VEC_SCHEMA_EXPORT_MAX_LEN];
+    struct VecSchemaImportResult result;   // filled in by the call
+};
+
+// Returns 0 if req is non-NULL. req->bytes_written/out are always filled
+// in either way (0 bytes if caller_uid can't read any collection).
+uint64_t sys_sls_vec_schema_export(struct SLSVecSchemaExportRequest* req);
+
+// Returns 0 if every line in req->text succeeded, 1 if at least one
+// failed (matching sys_sls_schema_import()'s own 0/1 convention) --
+// req->result is always fully populated with the real per-line breakdown
+// either way.
+uint64_t sys_sls_vec_schema_import(struct SLSVecSchemaImportRequest* req);
+
 #endif /* VEC_INDEX_H */

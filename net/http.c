@@ -808,6 +808,52 @@ static int api_schema_export(uint32_t req_uid, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/vec/schema/export — VectorStore Interface Roadmap follow-on ─────
+// Reconstructs COLLECTION/INDEX definition text for every vector collection
+// req_uid can read (vec_schema_export(), vec_index.c) and returns it as one
+// multiline JSON string field, same convention api_schema_export() above
+// established for SQL text -- see vec_index.h's own header comment for why
+// this is a small purpose-built text grammar rather than SQL or JSON, and
+// for the named gap that this covers definitions only, never vector data.
+static int api_vec_schema_export(uint32_t req_uid, char* buf, int max) {
+    static char vec_out[VEC_SCHEMA_EXPORT_MAX_LEN];
+    uint32_t n = vec_schema_export(req_uid, vec_out, sizeof(vec_out));
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_str_multiline(&j, "text", vec_out);
+    jb_putc(&j, ',');
+    jb_uint(&j, "bytes", n);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/vec/data/export/<collection> — VectorStore Interface Roadmap
+// follow-on: bulk vector DATA export (complementing api_vec_schema_export()
+// above, which is definitions only) ─────────────────────────────────────────
+// Reconstructs "VECTOR <collection> <external_id> <v0> ..." lines for the
+// one named collection req_uid can read, via vec_data_export() (vecstore.c).
+// Path-segment parameter (not a query string) matches this codebase's own
+// established /api/tables/<name>/schema convention -- no query-string
+// parsing infrastructure exists anywhere in this file (confirmed by grep
+// before writing this route), so a path segment is the one real precedent
+// to follow rather than inventing a new parsing mechanism for this route
+// alone. Reports vectors_written/vectors_total/truncated explicitly --
+// see vecstore.h's own header comment on why VEC_DATA_EXPORT_MAX_LEN is
+// genuinely tight at real embedding dimensions, so truncation is a real,
+// expected outcome this response must surface, not hide.
+static int api_vec_data_export(uint32_t req_uid, const char* collection_name, char* buf, int max) {
+    static char vec_out[VEC_DATA_EXPORT_MAX_LEN];
+    struct VecDataExportResult res;
+    vec_data_export(req_uid, collection_name, vec_out, sizeof(vec_out), &res);
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_str_multiline(&j, "text", vec_out); jb_putc(&j, ',');
+    jb_uint(&j, "bytes", res.bytes_written); jb_putc(&j, ',');
+    jb_uint(&j, "vectors_written", res.vectors_written); jb_putc(&j, ',');
+    jb_uint(&j, "vectors_total", res.vectors_total); jb_putc(&j, ',');
+    jb_str(&j, "truncated", res.truncated ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/objects/<name> ──────────────────────────────────────────────────
 static int api_object_detail(const char* name, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -1773,6 +1819,95 @@ static int api_schema_import_post(const char* body, char* buf, int max, uint32_t
             jb_putc(&j, ',');
             jb_uint(&j, "error_code", (uint64_t)sr->error); jb_putc(&j, ',');
             jb_str(&j, "error", sr->error_msg);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/schema/import — VectorStore Interface Roadmap follow-on ────
+// Body: {"text": "<one or more newline-separated COLLECTION/INDEX lines>"}.
+// Runs the whole batch through vec_schema_import() (vec_index.c) under
+// req_uid, which skips blank/comment lines and replays each COLLECTION/
+// INDEX line through vecstore_create_collection()/vec_index_create(),
+// continuing past individual failures -- same "one bad line doesn't block
+// the rest" posture api_schema_import_post() above already established
+// for SQL text.
+static int api_vec_schema_import_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+
+    static char import_text[VEC_SCHEMA_EXPORT_MAX_LEN];
+    json_str(body, "text", import_text, sizeof(import_text));
+
+    struct VecSchemaImportResult res;
+    vec_schema_import(req_uid, import_text, &res);
+
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "total", res.total); jb_putc(&j, ',');
+    jb_uint(&j, "succeeded", res.succeeded); jb_putc(&j, ',');
+    jb_uint(&j, "failed", res.failed); jb_putc(&j, ',');
+    if (res.total > VEC_SCHEMA_IMPORT_MAX_LINES) {
+        jb_str(&j, "truncated", "true"); jb_putc(&j, ',');
+    }
+    jb_arr_open(&j, "lines");
+    uint32_t attempted = res.total < VEC_SCHEMA_IMPORT_MAX_LINES ? res.total : VEC_SCHEMA_IMPORT_MAX_LINES;
+    for (uint32_t i = 0; i < attempted; i++) {
+        if (i) jb_putc(&j, ',');
+        struct VecSchemaImportLineResult* lr = &res.lines[i];
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "offset", lr->offset); jb_putc(&j, ',');
+        jb_str(&j, "ok", lr->ok ? "true" : "false");
+        if (!lr->ok) {
+            jb_putc(&j, ',');
+            jb_str(&j, "error", lr->error_msg);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/data/import — VectorStore Interface Roadmap follow-on ──────
+// Body: {"text": "<one or more newline-separated VECTOR lines>"}. Runs the
+// whole batch through vec_data_import() (vecstore.c) under req_uid, which
+// skips blank/comment lines and replays each VECTOR line through
+// vecstore_insert(), continuing past individual failures -- same "one bad
+// line doesn't block the rest" posture api_vec_schema_import_post() above
+// already established. Import schema definitions FIRST if restoring both
+// (see vecstore.h's own header comment on why, and vec_index.h's own for
+// the definitions side) -- this route does not enforce that ordering
+// itself, matching vecstore_insert()'s own "collection must already
+// exist" precondition rather than adding a new one here.
+static int api_vec_data_import_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+
+    static char import_text[VEC_DATA_EXPORT_MAX_LEN];
+    json_str(body, "text", import_text, sizeof(import_text));
+
+    struct VecDataImportResult res;
+    vec_data_import(req_uid, import_text, &res);
+
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "total", res.total); jb_putc(&j, ',');
+    jb_uint(&j, "succeeded", res.succeeded); jb_putc(&j, ',');
+    jb_uint(&j, "failed", res.failed); jb_putc(&j, ',');
+    if (res.total > VEC_DATA_IMPORT_MAX_LINES) {
+        jb_str(&j, "truncated", "true"); jb_putc(&j, ',');
+    }
+    jb_arr_open(&j, "lines");
+    uint32_t attempted = res.total < VEC_DATA_IMPORT_MAX_LINES ? res.total : VEC_DATA_IMPORT_MAX_LINES;
+    for (uint32_t i = 0; i < attempted; i++) {
+        if (i) jb_putc(&j, ',');
+        struct VecDataImportLineResult* lr = &res.lines[i];
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "offset", lr->offset); jb_putc(&j, ',');
+        jb_str(&j, "ok", lr->ok ? "true" : "false");
+        if (!lr->ok) {
+            jb_putc(&j, ',');
+            jb_str(&j, "error", lr->error_msg);
         }
         jb_obj_close(&j);
     }
@@ -3711,6 +3846,25 @@ static void http_route(int conn, char* req) {
             blen = api_schema_export(exp_uid, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── VectorStore Interface Roadmap follow-on: GET /api/vec/schema/export ──
+        if (!strcmp(path, "/api/vec/schema/export")) {
+            uint32_t vexp_uid = 0; SLSRole vexp_role = ROLE_GUEST;
+            auth_http_extract(req, &vexp_uid, &vexp_role);
+            blen = api_vec_schema_export(vexp_uid, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── VectorStore Interface Roadmap follow-on: GET /api/vec/data/export/<collection> ──
+        if (str_find(path, "/api/vec/data/export/") == path) {
+            const char* cname = path + 21;   // after "/api/vec/data/export/"
+            if (cname[0]) {
+                uint32_t vdexp_uid = 0; SLSRole vdexp_role = ROLE_GUEST;
+                auth_http_extract(req, &vdexp_uid, &vdexp_role);
+                blen = api_vec_data_export(vdexp_uid, cname, resp_body, (int)sizeof(resp_body));
+                http_respond(conn, 200, "application/json", resp_body, blen); return;
+            }
+            const char* e = "{\"error\":\"missing collection name -- expected /api/vec/data/export/<collection>\"}";
+            http_respond(conn, 404, "application/json", e, (int)strlen(e)); return;
+        }
         if (str_find(path, "/api/tables/") == path) {
             const char* rest = path + 12;   // after "/api/tables/"
             const char* suffix = str_find(rest, "/schema");
@@ -3990,6 +4144,14 @@ static void http_route(int conn, char* req) {
         // ── SQL Feature-Parity Roadmap, Phase 8 follow-on ──────────────────────
         if (!strcmp(path, "/api/schema/import")) {
             blen = api_schema_import_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/schema/import")) {
+            blen = api_vec_schema_import_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/vec/data/import")) {
+            blen = api_vec_data_import_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Kernel-Side Shell Refactor ──────────────────────────────────────
