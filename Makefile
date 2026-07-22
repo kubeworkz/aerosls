@@ -24,7 +24,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               arch/x86/walk_page_tables_x86.c \
               kernel/lockfree_map.c drivers/ahci.c drivers/pci.c drivers/nvme.c drivers/nvme_admin.c \
               kernel/frame_pool.c kernel/dashboard.c user/shell.c kernel/smp.c drivers/io_prio.c \
-              net/consensus.c net/prefetch.c kernel/secure_api.c kernel/pte_migrate.c \
+              net/consensus.c net/dspp.c net/prefetch.c kernel/secure_api.c kernel/pte_migrate.c \
               kernel/timer.c kernel/flush_daemon.c \
               kernel/kernel_io.c kernel/syscall_dispatch.c \
               kernel/object_catalog.c kernel/transaction.c \

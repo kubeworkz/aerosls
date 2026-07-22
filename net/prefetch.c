@@ -41,6 +41,11 @@ void prefetch_worker_kernel_thread(void) {
             pf_packet.header.opcode = DSPP_PAGE_READ_REQ; // Remote Cache Read Request
             pf_packet.header.node_source_id = (uint16_t)cluster_local_node_id();
             pf_packet.header.transaction_id = 0x999;     // Token marker identifying prefetch frames
+            // Multi-Node Partition Scaling Roadmap Phase 5: sourced from
+            // the object catalog at packet-construction time, mirroring
+            // catalog_check_access()'s own partition_id resolution rather
+            // than re-deriving it a different way.
+            pf_packet.header.partition_id = dspp_resolve_partition_id(req->system_object_id);
 
             // Send packet onto the network. We do NOT block the scheduler here.
             // Core 3 passes the packet and instantly loops to handle other system operations.
