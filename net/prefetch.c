@@ -2,6 +2,7 @@
 #include "dspp.h"
 #include "../drivers/io_prio.h"
 #include "e1000.h"
+#include "consensus.h"   // Phase 1 (Multi-Node Partition Scaling Roadmap): cluster_local_node_id()
 
 extern uint64_t* walk_page_tables(uint64_t virtual_address);
 
@@ -38,7 +39,7 @@ void prefetch_worker_kernel_thread(void) {
             pf_packet.header.system_object_id = req->system_object_id;
             pf_packet.header.virtual_address = req->target_vaddr;
             pf_packet.header.opcode = DSPP_PAGE_READ_REQ; // Remote Cache Read Request
-            pf_packet.header.node_source_id = 1;
+            pf_packet.header.node_source_id = (uint16_t)cluster_local_node_id();
             pf_packet.header.transaction_id = 0x999;     // Token marker identifying prefetch frames
 
             // Send packet onto the network. We do NOT block the scheduler here.
