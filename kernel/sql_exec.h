@@ -288,4 +288,91 @@ struct SLSSqlRequest {
 // contract) -- req->result is always fully populated either way.
 uint64_t sys_sls_sql_execute(struct SLSSqlRequest* req);
 
+// ─── Schema import/export (SQL Feature-Parity Roadmap follow-on) ───────────
+// SQLite itself has no separate "schema file format" -- a schema is just
+// CREATE TABLE/CREATE INDEX SQL text stored in sqlite_master, and the
+// standard way to move a schema in or out is a plain .sql text dump. This
+// follows that same convention: export reconstructs real CREATE TABLE/
+// CREATE INDEX statements (re-parseable by this file's own sql_parse()),
+// import just runs a batch of statements through sql_execute() -- no new
+// executor path, no new file format, no new grammar.
+//
+// Known, named gaps (not silently glossed over -- see the roadmap doc's
+// own Phase 8 scope-correction writeup for the full reasoning):
+//   - RANGE constraints (row_constraint.h) have NO SQL syntax at all in
+//     this parser -- a table with one is exported with a `-- ` comment
+//     noting the gap, not silently dropped or fabricated as invalid SQL.
+//   - A CREATE TABLE that would exceed SQL_MAX_TEXT_LEN once fully
+//     reconstructed (many columns, each with inline NOT NULL/UNIQUE/
+//     REFERENCES) is skipped with a `-- ` comment rather than emitted as
+//     truncated, unparseable SQL that would only fail on re-import anyway.
+//   - A real SQLite .sql dump commonly uses syntax this parser doesn't
+//     have at all (PRIMARY KEY, CHECK, DEFAULT, AUTOINCREMENT, multi-
+//     column/UNIQUE indexes, CREATE VIEW) -- importing one isn't a
+//     guaranteed straight feed-through; unsupported statements simply fail
+//     that one statement (reported in the per-statement result) and every
+//     other statement in the batch still runs.
+#define SQL_SCHEMA_EXPORT_MAX_LEN   8192   // typical whole-database schema dump size; callers may pass a smaller `max`
+#define SQL_SCHEMA_IMPORT_MAX_STMTS 64     // real, named ceiling on statements accepted in one import call
+
+struct SqlSchemaImportStmtResult {
+    uint32_t     offset;         // byte offset into the submitted text where this statement started
+    uint8_t      ok;
+    SqlErrorCode error;          // meaningful iff !ok
+    char         error_msg[SQL_ERR_MSG_LEN];
+};
+
+struct SqlSchemaImportResult {
+    uint32_t total;              // total statements found in the text (may exceed SQL_SCHEMA_IMPORT_MAX_STMTS)
+    uint32_t succeeded;
+    uint32_t failed;
+    struct SqlSchemaImportStmtResult stmts[SQL_SCHEMA_IMPORT_MAX_STMTS];
+};
+
+// Reconstructs CREATE TABLE + CREATE INDEX SQL text for every active row-
+// set table caller_uid has PERM_READ on, writing into out (bounded by max,
+// always NUL-terminated). Returns the number of bytes written, excluding
+// the NUL (0 if nothing was exportable/readable). See the header comment
+// above for what's skipped (with a `-- ` comment explaining why) rather
+// than silently omitted.
+uint32_t sql_schema_export(uint32_t caller_uid, char* out, uint32_t max);
+
+// Splits sql_text on top-level ';' (quote-aware: a ';' inside a '...'
+// string literal is never treated as a statement boundary) and runs each
+// resulting statement through sql_execute() under caller_uid, in order,
+// continuing past individual statement failures -- one bad CREATE TABLE
+// doesn't block the other N good ones, matching common SQL-tooling import
+// behavior and useful specifically because DDL statements have no
+// dependency on each other completing. Always fills *out (zeroed first).
+void sql_schema_import(uint32_t caller_uid, const char* sql_text, struct SqlSchemaImportResult* out);
+
+// --- Syscall surface -- matches SYS_SLS_SQL_EXECUTE's own established
+// "caller_uid travels inside the request struct" convention, since
+// do_syscall() has no uid context of its own to supply. ---------------------
+#define SYS_SLS_SCHEMA_EXPORT 254
+#define SYS_SLS_SCHEMA_IMPORT 255
+
+struct SLSSchemaExportRequest {
+    uint32_t caller_uid;
+    char     sql_out[SQL_SCHEMA_EXPORT_MAX_LEN];   // filled in by the call
+    uint32_t bytes_written;                        // filled in by the call
+};
+
+struct SLSSchemaImportRequest {
+    uint32_t caller_uid;
+    char     sql_text[SQL_SCHEMA_EXPORT_MAX_LEN];
+    struct SqlSchemaImportResult result;   // filled in by the call
+};
+
+// Returns 0 if req is non-NULL. req->bytes_written/sql_out are always
+// filled in either way (0 bytes if caller_uid can't read any table).
+uint64_t sys_sls_schema_export(struct SLSSchemaExportRequest* req);
+
+// Returns 0 if every statement in req->sql_text succeeded, 1 if at least
+// one failed (matching sys_sls_sql_execute()'s own 0/1 convention) --
+// req->result is always fully populated with the real per-statement
+// breakdown either way, so a caller that wants partial-success detail
+// should read req->result directly rather than trust only the return code.
+uint64_t sys_sls_schema_import(struct SLSSchemaImportRequest* req);
+
 #endif /* SQL_EXEC_H */

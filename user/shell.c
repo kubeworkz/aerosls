@@ -163,6 +163,9 @@ static void print_help(void) {
         "  -- Schema (Phase 6) --\n"
         "  schema set <obj> <key> <type>  define field type (STRING|UINT64|FLOAT|BOOL)\n"
         "  schema show <object>           dump schema + live values\n"
+        "  -- Schema Import/Export (SQL Feature-Parity Roadmap, Phase 8) --\n"
+        "  schema export                  dump CREATE TABLE/CREATE INDEX SQL for every readable table\n"
+        "  schema import <sql>            run ';'-separated CREATE TABLE/INDEX statements\n"
         "  -- Security (Phase 2) --\n"
         "  role set <uid> <role>          assign role (SYSTEM_KERNEL|DB_ADMIN|\n"
         "                                              APP_USER|GUEST)\n"
@@ -807,6 +810,41 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                 cursor_close(req.result.cursor_id);
             } else {
                 kernel_serial_printf("[SQL] OK, %u row(s) affected\n", req.result.affected_rows);
+            }
+        }
+
+        // ── SQL Feature-Parity Roadmap, Phase 8 follow-on: schema export/import ──
+        // "schema export" prints CREATE TABLE/CREATE INDEX SQL text for
+        // every table current_session_uid can read (sql_schema_export(),
+        // sql_exec.c) -- the SQLite convention this feature follows: a
+        // schema is exported as plain re-runnable SQL text, not a new
+        // structured format. Distinct from the pre-existing "schema set"/
+        // "schema show" commands above, which are the unrelated legacy
+        // per-field KV schema, not this phase's row-set DDL reconstruction.
+        else if (sh_eq(input_buffer, "schema export")) {
+            struct SLSSchemaExportRequest req;
+            req.caller_uid = current_session_uid;
+            do_syscall(SYS_SLS_SCHEMA_EXPORT, &req);
+            kernel_serial_printf("[SCHEMA] %u byte(s):\n%s", req.bytes_written, req.sql_out);
+        }
+        // "schema import <sql>" -- one shell line, so multiple statements
+        // must be written ';'-separated on that one line (sql_schema_import()
+        // itself has no line-count limit; the shell's own single-line input
+        // is the real constraint here, not the kernel function). Continues
+        // past individual statement failures -- see sql_exec.h's own
+        // comment on sql_schema_import() for why.
+        else if (sh_starts(input_buffer, "schema import ")) {
+            struct SLSSchemaImportRequest req;
+            req.caller_uid = current_session_uid;
+            sh_copy(req.sql_text, input_buffer + 15, sizeof(req.sql_text));
+            do_syscall(SYS_SLS_SCHEMA_IMPORT, &req);
+            kernel_serial_printf("[SCHEMA] import: %u total, %u succeeded, %u failed\n",
+                                 req.result.total, req.result.succeeded, req.result.failed);
+            uint32_t shown = req.result.total < SQL_SCHEMA_IMPORT_MAX_STMTS ? req.result.total : SQL_SCHEMA_IMPORT_MAX_STMTS;
+            for (uint32_t si = 0; si < shown; si++) {
+                struct SqlSchemaImportStmtResult* sr = &req.result.stmts[si];
+                if (sr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", si, sr->offset);
+                else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", si, sr->offset, sr->error_msg);
             }
         }
 

@@ -364,6 +364,25 @@ void mvcc_bootstrap_from_rowstore(void);
 // TABLE's own multi-step, non-atomic flow.
 void mvcc_rebuild_versions_for_table(uint64_t table_object_id, const char* table_name);
 
+// Schema Import/Export follow-on (post-roadmap Phase 8): deactivates every
+// mvcc_versions[] entry for table_object_id -- no rescan, unlike
+// mvcc_rebuild_versions_for_table() above, because the table is gone, not
+// migrated. A real, previously-silent gap this fix closes: table_object_id
+// is a deterministic hash of the table's NAME (see object_catalog.c's
+// sys_sls_valloc(), fnv1a(req->name, ...)), not a bump-allocated counter --
+// so a future CREATE TABLE reusing the same name gets the exact same
+// object_id. rowstore_drop_table() itself already deactivates row_
+// indexes[]/row_constraints[]/row_journal_attachments[]/table_headers[] for
+// the dropped table but has never touched mvcc_versions[] (rowstore.c has
+// never depended on mvcc.h, same layering reason mvcc_rebuild_versions_
+// for_table() above is called from sql_exec.c rather than rowstore.c
+// itself) -- without this call, those stale-but-still-active versions
+// would resurrect as ghost rows the instant a same-named table is
+// recreated. Called from sql_exec.c's exec_drop_table(), which captures
+// table_object_id before rowstore_drop_table() deactivates the catalog
+// entry it's read from.
+void mvcc_notify_table_dropped(uint64_t table_object_id);
+
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 // Zeroes the transaction table and version pool, resets both monotonic
 // counters (next txn_id, next logical_id) and the global commit-sequence

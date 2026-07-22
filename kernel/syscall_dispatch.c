@@ -376,6 +376,13 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_DISK_STATUS:
         sys_sls_disk_status(); return 0;
 
+    // ── SQL Feature-Parity Roadmap, Phase 8 follow-on: schema import/export
+    // (254-255) -- see sql_exec.h's own comment on these two syscalls. ───────
+    case SYS_SLS_SCHEMA_EXPORT:
+        return sys_sls_schema_export((struct SLSSchemaExportRequest*)arg);
+    case SYS_SLS_SCHEMA_IMPORT:
+        return sys_sls_schema_import((struct SLSSchemaImportRequest*)arg);
+
     default:
         return 0;
     }

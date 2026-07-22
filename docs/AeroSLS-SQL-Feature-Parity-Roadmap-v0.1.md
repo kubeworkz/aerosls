@@ -1073,6 +1073,165 @@ all DONE.
 
 ---
 
+## Phase 8 — Schema import/export — DONE
+
+A natural follow-on beyond the original 7-phase roadmap above, scoped in
+direct response to a design question: "if we were to import/export schema
+files, would that follow the SQLite format?" The honest answer turned out
+to reframe the question rather than answer it as asked — real SQLite has
+no separate schema *file* format at all. A schema is just literal `CREATE
+TABLE`/`CREATE INDEX` SQL text stored in `sqlite_master`, and the standard
+way to move a schema in or out is a plain `.sql` text dump. This phase
+follows that same convention: export reconstructs real, re-parseable
+`CREATE TABLE`/`CREATE INDEX` statements; import just runs a batch of
+statements through the existing `sql_execute()` — no new executor path, no
+new file format, no new grammar.
+
+### Scope
+
+- `sql_schema_export(caller_uid, out, max)` (`kernel/sql_exec.c`):
+  iterates every active row-set table `caller_uid` has `PERM_READ` on,
+  reconstructing its `CREATE TABLE` text (cross-referencing
+  `row_constraints[]` for inline `NOT NULL`/`UNIQUE`/`REFERENCES`) plus a
+  `CREATE INDEX` line per active `row_indexes[]` entry on that table.
+- `sql_schema_import(caller_uid, sql_text, out)`: splits `sql_text` on
+  top-level `;` (quote-aware — a `;` inside a `'...'` literal is never a
+  boundary) and runs each statement through `sql_execute()` in order,
+  continuing past individual failures so one bad statement doesn't block
+  the rest of the batch.
+- New syscalls `SYS_SLS_SCHEMA_EXPORT` (254) and `SYS_SLS_SCHEMA_IMPORT`
+  (255) — confirmed unused via a grep across every existing `SYS_SLS_*`
+  definition before assigning them (highest prior was 253).
+- HTTP: `GET /api/schema/export`, `POST /api/schema/import` (`net/http.c`).
+- Terminal: `schema export`, `schema import <sql>` (`user/shell.c`).
+
+### Three real, named gaps (not silently glossed over)
+
+1. **RANGE constraints have no SQL syntax at all.** `parse_column_def()`
+   only ever recognized `NOT NULL`/`UNIQUE`/`REFERENCES` inline — a RANGE
+   constraint (`row_constraint.h`) was never expressible in this grammar,
+   roadmap or no roadmap. Export doesn't fabricate invalid syntax or
+   silently drop the constraint; it emits the table's `CREATE TABLE` as
+   normal, followed by a `-- note: table 'x' also has a RANGE constraint
+   with no SQL syntax in this parser and could not be exported` comment.
+2. **A reconstructed `CREATE TABLE` can genuinely exceed
+   `SQL_MAX_TEXT_LEN` (512).** Real risk given `ROWSTORE_MAX_COLUMNS=16`
+   and how verbose a `REFERENCES table(column)` clause gets once several
+   columns carry one. Rather than emit truncated, unparseable SQL that
+   would only fail on re-import anyway, that one table is skipped with a
+   `-- skipped table 'x': reconstructed CREATE TABLE would exceed
+   SQL_MAX_TEXT_LEN` comment; every other table still exports normally.
+3. **A real SQLite `.sql` dump commonly uses syntax this parser doesn't
+   have at all** (`PRIMARY KEY`, `CHECK`, `DEFAULT`, `AUTOINCREMENT`,
+   multi-column/`UNIQUE` indexes, `CREATE VIEW`). Importing a genuine
+   SQLite dump isn't a guaranteed straight feed-through — named here
+   rather than implied as a solved problem. Unsupported statements simply
+   fail that one statement (reported in the per-statement result), and
+   every other statement in the batch still runs.
+
+### Scope correction made during implementation
+
+Two real bugs were caught before/while writing the round-trip host test,
+not discovered by a user report after the fact:
+
+**Bug 1 — comment lines glued onto the next statement.** `sql_schema_
+export()`'s own `-- note:`/`-- skipped:` comment lines have no trailing
+`;`. The first cut of `sql_schema_import()`'s splitter only tracked quotes
+and split on `;`, so a comment line would get concatenated onto the front
+of the next real statement's text — and since this lexer has zero comment
+syntax of its own, the merged text would fail to parse. Caught by
+reasoning through the round-trip scenario before writing any test code,
+not by a failing test. Fixed by rewriting the whitespace/`;`-skip section
+at the top of the import loop into a small loop that also detects and
+skips `-- ...` comment lines (scanning to the next `\n`) before attempting
+to capture a statement, re-skipping whitespace/`;`/further comments after
+each one. Verified via the new host test's scenario 5 (a comment line with
+no trailing `;`, immediately followed by an `INSERT` containing a quoted
+`;`, both handled correctly — 2 real statements found, not 3, and the
+quoted `;` didn't split the `INSERT` in two).
+
+**Bug 2 — DROP TABLE left ghost rows for a same-named recreate (found by
+the round-trip test itself, not anticipated during design).** The
+scenario 3 round trip (export → `DROP TABLE` both fixture tables → import
+→ verify recreated) initially failed: the freshly re-`CREATE`d
+`departments` table came back with the *old* seed row still in it, despite
+being a brand-new table. Root cause, traced directly rather than guessed:
+`object_catalog.c`'s `sys_sls_valloc()` derives a table's `object_id` as
+`fnv1a(name, ...)` — a deterministic hash of the table's *name*, not a
+bump-allocated counter. `rowstore_drop_table()` already deactivates every
+`row_indexes[]`/`row_constraints[]`/`row_journal_attachments[]`/
+`table_headers[]` entry for the dropped table, but had never touched
+`mvcc.c`'s own per-row version cache (`mvcc_versions[]`) — confirmed by
+direct read, not assumed. Because `mvcc_table_scan()` matches purely on
+`table_object_id`, and a same-named table recreated after `DROP TABLE`
+gets the *identical* `object_id` (same name → same hash), the old,
+never-deactivated `mvcc_versions[]` entries from before the drop
+immediately became visible again as "real" rows of the new table's very
+first scan — silent, and would have affected any `DROP TABLE` + `CREATE
+TABLE` sequence reusing a name, not just schema import specifically.
+
+Fixed with a new `mvcc_notify_table_dropped(table_object_id)`
+(`kernel/mvcc.h`/`.c`), factored out of the existing `mvcc_rebuild_
+versions_for_table()`'s own deactivation loop (that function already did
+half of this — deactivate, then rescan and rebuild — for `ALTER TABLE ADD
+COLUMN`'s migration; `DROP TABLE` only needs the deactivate half, since
+the table is gone, not migrated). Wired into `sql_exec.c`'s `exec_drop_
+table()`, matching this codebase's own established layering precedent
+(`exec_alter_table()`'s pre-existing comment on why the `mvcc_rebuild_
+versions_for_table()` call lives in `sql_exec.c` rather than inside
+`rowstore.c`: `rowstore.c` has never depended on `mvcc.h`, since `mvcc.c`
+depends on `rowstore.h` and not the other way around, and every
+pre-existing host test that links `rowstore.c` without `mvcc.c` would
+break at link time if that changed). `exec_drop_table()` now captures the
+table's `object_id` from the catalog *before* calling `rowstore_drop_
+table()` (which deactivates that catalog entry), then calls `mvcc_notify_
+table_dropped()` on success. Verified via the new host test's scenario 3
+(h through l): the re-imported `departments` comes back genuinely empty,
+its `REFERENCES` constraint correctly rejects a `dept_id` that doesn't
+exist yet, and a fully valid row inserts cleanly once re-seeded. Full
+regression sweep re-run after this fix — no other host test (including
+`mvcc_host_test`, `sql_ddl_phase5_host_test`, `sql_tx_host_test`) 
+regressed.
+
+### Reachability chain
+
+`sql_schema_export()`/`sql_schema_import()` (`kernel/sql_exec.c`) →
+`SYS_SLS_SCHEMA_EXPORT`/`SYS_SLS_SCHEMA_IMPORT` (254/255) →
+`syscall_dispatch.c` case → `schema export`/`schema import <sql>`
+(`user/shell.c`, via `do_syscall()`) → `GET /api/schema/export`/`POST
+/api/schema/import` (`net/http.c`). Deliberately built out in full rather
+than left as a kernel-only capability, matching every "Gap Remediation"
+phase earlier in this whole effort that existed specifically to fix
+"built but not made syscall/HTTP/shell reachable" gaps — this phase
+avoided creating a fresh instance of that same gap from the start.
+
+**Host test:** `tests/sql_schema_export_import_host_test.c`, 44 checks,
+linking the REAL `kernel/object_catalog.c` (and its real fake-NVMe-backed
+`persist.c`) rather than stubbing it — the first Phase 8 host test to need
+this, since a genuine round trip only has real effect through the
+genuine `sys_sls_valloc()`/`sys_sls_schema_set()`/`rowstore_create_
+table()` chain. Covers: export reconstructing correct `CREATE TABLE`
+text (including inline `NOT NULL`/`UNIQUE`/`REFERENCES`) and `CREATE
+INDEX` text, verified both by substring match and by re-parsing the
+verbatim exported bytes; a RANGE-constrained table still exporting its
+`CREATE TABLE` with a `-- note:` comment naming the gap; a real round trip
+(export → `DROP TABLE` both fixture tables → import the exported text →
+verify both tables exist again with working constraints, including the
+DROP TABLE ghost-row bug fix above); a multi-statement import with one
+deliberately malformed statement in the middle, verifying total/succeeded/
+failed counts and that the statements before and after it still ran; the
+comment/quote-aware splitter's two edge cases (a `-- ` comment line with
+no trailing `;`, and a `;` inside a quoted string literal); and
+permission-gated export (a caller without `PERM_READ` has that table
+silently absent from their own export, not a crash or a leak).
+
+**Full regression sweep: 35/35 host test files, 0 failed** (up from 34 —
+the new file). `net/http.c` compile-checked clean. `kernel/mvcc.c` and
+`kernel/sql_exec.c` (both touched by the DROP TABLE fix above)
+compile-checked clean as well.
+
+---
+
 ## Suggested sequencing
 
 1. **Phase 1 (GROUP BY/aggregates)** first — highest real-world value,

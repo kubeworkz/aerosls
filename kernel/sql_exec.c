@@ -9,6 +9,7 @@
 #include "mvcc.h"
 #include "row_index.h"
 #include "row_constraint.h"   // Phase 5 (SQL Feature-Parity Roadmap, DDL): inline column constraints
+#include "../user/permissions.h"   // Phase 8 follow-on (schema export/import): PERM_READ
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -1422,8 +1423,29 @@ static void exec_alter_table(uint32_t caller_uid, struct SqlAlterTableStmt* s, s
 }
 
 static void exec_drop_table(uint32_t caller_uid, struct SqlDropTableStmt* s, struct SqlResult* out) {
+    // Capture the real object_id before rowstore_drop_table() deactivates
+    // the catalog entry -- needed below to clean up mvcc.c's own per-row
+    // version cache. See mvcc.h's mvcc_notify_table_dropped() header
+    // comment for the full "why this matters" writeup (short version:
+    // table_object_id is a deterministic hash of the table's NAME, so a
+    // future CREATE TABLE reusing this name would otherwise resurrect
+    // these rows as ghost data).
+    uint64_t table_object_id = 0;
+    int found_before_drop = 0;
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (object_catalog[i].active && se_streq(object_catalog[i].name, s->table_name)) {
+            table_object_id = object_catalog[i].object_id;
+            found_before_drop = 1;
+            break;
+        }
+    }
+
     int rc = rowstore_drop_table(caller_uid, s->table_name);
-    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    if (rc == 0) {
+        if (found_before_drop) mvcc_notify_table_dropped(table_object_id);
+        out->error = SQL_ERR_NONE;
+        return;
+    }
     if (rc == 2) {
         out->error = SQL_ERR_PERMISSION_DENIED;
         se_strcpy(out->error_msg, "DROP TABLE: permission denied", SQL_ERR_MSG_LEN);
@@ -1749,4 +1771,234 @@ int sql_tx_rollback(uint64_t txn_id, uint32_t caller_uid) {
 uint64_t sys_sls_sql_execute(struct SLSSqlRequest* req) {
     if (!req) return 1;
     return (uint64_t)sql_execute(req->caller_uid, req->sql_text, &req->result);
+}
+
+// ─── Schema import/export (SQL Feature-Parity Roadmap follow-on) ───────────
+// See sql_exec.h's own header comment for the full design writeup: this
+// mirrors SQLite's own "schema is just SQL text" convention (there is no
+// separate schema FILE format even in real SQLite -- CREATE TABLE/CREATE
+// INDEX text stored in sqlite_master, dumped/reloaded as plain SQL) rather
+// than inventing a new structured format, and it reuses this file's own
+// sql_execute()/sql_parse() for both directions instead of adding a new
+// executor path.
+
+// Bounded append: writes src onto the end of buf[0..*pos), bounded by max
+// (always leaves room for the NUL this file's other buffer-building
+// functions -- e.g. build_insert_row_values() -- rely on being present).
+// Returns 0 the moment there's no room left, so a caller chaining several
+// appends together can just OR the results and bail out on the first 0
+// without needing to separately re-check *pos itself.
+static int se_append(char* buf, uint32_t* pos, uint32_t max, const char* src) {
+    uint32_t i = 0;
+    while (src[i]) {
+        if (*pos + 1 >= max) return 0;
+        buf[(*pos)++] = src[i++];
+    }
+    buf[*pos] = '\0';
+    return 1;
+}
+
+// Reconstructs ONE table's CREATE TABLE statement (inline NOT NULL/UNIQUE/
+// REFERENCES per column, cross-referenced from row_constraints[] by
+// table_object_id + column_index) into stmt_out. *out_has_range is set to
+// 1 if the table ALSO has a RANGE constraint on some column -- RANGE has
+// no SQL syntax at all in this parser (parse_column_def() only recognizes
+// NOT NULL/UNIQUE/REFERENCES), so it can never be included in the
+// statement text; the caller reports it separately rather than silently
+// dropping it. Returns the statement's text length (including the
+// trailing ';'), or 0 if it didn't fit in stmt_max at all.
+static uint32_t se_build_create_table(uint32_t catalog_idx, char* stmt_out, uint32_t stmt_max, uint8_t* out_has_range) {
+    struct SLSObjectEntry* e = &object_catalog[catalog_idx];
+    struct RowTableLayout* layout = &table_headers[catalog_idx].layout;
+    uint64_t table_oid = e->object_id;
+    uint32_t pos = 0;
+    *out_has_range = 0;
+
+    if (!se_append(stmt_out, &pos, stmt_max, "CREATE TABLE ")) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, e->name)) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, " (")) return 0;
+
+    for (uint32_t c = 0; c < layout->column_count; c++) {
+        if (c && !se_append(stmt_out, &pos, stmt_max, ", ")) return 0;
+        if (!se_append(stmt_out, &pos, stmt_max, layout->column_names[c])) return 0;
+        if (!se_append(stmt_out, &pos, stmt_max, " ")) return 0;
+        if (!se_append(stmt_out, &pos, stmt_max, field_type_name(layout->column_types[c]))) return 0;
+
+        for (uint32_t k = 0; k < row_constraint_count; k++) {
+            struct RowConstraintDef* rc = &row_constraints[k];
+            if (!rc->active || rc->table_object_id != table_oid || rc->column_index != c) continue;
+            if (rc->kind == ROW_CONSTRAINT_NOT_NULL) {
+                if (!se_append(stmt_out, &pos, stmt_max, " NOT NULL")) return 0;
+            } else if (rc->kind == ROW_CONSTRAINT_UNIQUE) {
+                if (!se_append(stmt_out, &pos, stmt_max, " UNIQUE")) return 0;
+            } else if (rc->kind == ROW_CONSTRAINT_REFERENCE) {
+                if (!se_append(stmt_out, &pos, stmt_max, " REFERENCES ")) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, rc->ref_table_name)) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, "(")) return 0;
+                // ref_column_index indexes the REFERENCED table's own
+                // layout, not this table's -- look it up by name rather
+                // than assuming any relationship to `c`.
+                int ref_idx = find_table_catalog_index(rc->ref_table_name);
+                if (ref_idx >= 0 && rc->ref_column_index < table_headers[ref_idx].layout.column_count) {
+                    if (!se_append(stmt_out, &pos, stmt_max, table_headers[ref_idx].layout.column_names[rc->ref_column_index])) return 0;
+                }
+                if (!se_append(stmt_out, &pos, stmt_max, ")")) return 0;
+            } else if (rc->kind == ROW_CONSTRAINT_RANGE) {
+                *out_has_range = 1;   // reported by the caller -- see header comment, no SQL syntax exists for this
+            }
+        }
+    }
+    if (!se_append(stmt_out, &pos, stmt_max, ");")) return 0;
+    return pos;
+}
+
+// Reconstructs one CREATE INDEX statement for row_indexes[idx_slot] (must
+// already be known active and belong to table_headers[catalog_idx]).
+// Returns the statement's text length, or 0 if it didn't fit or the
+// index's own column_index is stale (shouldn't happen -- guarded anyway).
+static uint32_t se_build_create_index(uint32_t idx_slot, uint32_t catalog_idx, char* stmt_out, uint32_t stmt_max) {
+    struct RowIndex* ri = &row_indexes[idx_slot];
+    struct RowTableLayout* layout = &table_headers[catalog_idx].layout;
+    uint32_t pos = 0;
+    if (ri->column_index >= layout->column_count) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, "CREATE INDEX ")) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, ri->index_name)) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, " ON ")) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, object_catalog[catalog_idx].name)) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, "(")) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, layout->column_names[ri->column_index])) return 0;
+    if (!se_append(stmt_out, &pos, stmt_max, ");")) return 0;
+    return pos;
+}
+
+uint32_t sql_schema_export(uint32_t caller_uid, char* out, uint32_t max) {
+    if (!out || max == 0) return 0;
+    uint32_t pos = 0;
+    out[0] = '\0';
+    int stop = 0;
+
+    for (uint32_t i = 0; i < object_catalog_count && !stop; i++) {
+        struct SLSObjectEntry* e = &object_catalog[i];
+        if (!e->active || !e->uses_rowstore) continue;
+        // Schema-only export still needs a real gate: without this, any
+        // caller could enumerate every table's column names/types/
+        // constraints regardless of catalog_check_access() -- the same
+        // PERM_READ a SELECT against the table's own rows would require.
+        if (!catalog_check_access(caller_uid, e->name, PERM_READ)) continue;
+
+        char stmt[640];   // comfortably above SQL_MAX_TEXT_LEN=512 so the length check below is the real gate, not this buffer
+        uint8_t has_range = 0;
+        uint32_t slen = se_build_create_table(i, stmt, sizeof(stmt), &has_range);
+        if (slen == 0 || slen > SQL_MAX_TEXT_LEN) {
+            // Emitted as a visible comment, not silently dropped -- see
+            // sql_exec.h's own header note on why a too-long CREATE TABLE
+            // is never truncated into invalid SQL instead.
+            if (!se_append(out, &pos, max, "-- skipped table '") ||
+                !se_append(out, &pos, max, e->name) ||
+                !se_append(out, &pos, max, "': reconstructed CREATE TABLE would exceed SQL_MAX_TEXT_LEN\n")) { stop = 1; break; }
+            continue;
+        }
+        if (!se_append(out, &pos, max, stmt) || !se_append(out, &pos, max, "\n")) { stop = 1; break; }
+        if (has_range) {
+            if (!se_append(out, &pos, max, "-- note: table '") ||
+                !se_append(out, &pos, max, e->name) ||
+                !se_append(out, &pos, max, "' also has a RANGE constraint with no SQL syntax in this parser and could not be exported\n")) { stop = 1; break; }
+        }
+
+        for (uint32_t k = 0; k < ROW_INDEX_MAX; k++) {
+            if (!row_indexes[k].active || row_indexes[k].table_object_id != e->object_id) continue;
+            char istmt[256];
+            uint32_t ilen = se_build_create_index(k, i, istmt, sizeof(istmt));
+            if (ilen == 0) continue;   // stale slot, shouldn't happen -- skip quietly rather than fail the whole export
+            if (!se_append(out, &pos, max, istmt) || !se_append(out, &pos, max, "\n")) { stop = 1; break; }
+        }
+    }
+    return pos;
+}
+
+void sql_schema_import(uint32_t caller_uid, const char* sql_text, struct SqlSchemaImportResult* out) {
+    se_memset(out, 0, sizeof(*out));
+    if (!out) return;
+    if (!sql_text) return;
+
+    uint32_t len = 0;
+    while (sql_text[len]) len++;
+
+    uint32_t i = 0;
+    while (i < len) {
+        // Skip leading whitespace and empty (';;'-style) segments, AND any
+        // `-- ...` comment lines, so `offset` always points at the
+        // statement's own first real character. This matters specifically
+        // because sql_schema_export() emits `-- skipped:`/`-- note:`
+        // comment lines with no trailing ';' of their own (they're
+        // documentation, not statements) -- without stripping them here
+        // first, a comment line would otherwise get glued onto the FRONT
+        // of the next real statement's text (there's nothing else to stop
+        // at until that statement's own ';'), corrupting it. This lexer
+        // has no comment syntax at all (see sql_parser.c), so that glued
+        // text would fail to parse -- comment-skipping has to happen here,
+        // one level up, before any text ever reaches sql_execute().
+        for (;;) {
+            while (i < len && (sql_text[i] == ' ' || sql_text[i] == '\t' ||
+                               sql_text[i] == '\n' || sql_text[i] == '\r' || sql_text[i] == ';')) i++;
+            if (i + 1 < len && sql_text[i] == '-' && sql_text[i + 1] == '-') {
+                while (i < len && sql_text[i] != '\n') i++;
+                continue;   // loop back to strip whitespace/';' and any further comment lines
+            }
+            break;
+        }
+        if (i >= len) break;
+
+        uint32_t start = i;
+        uint8_t in_quote = 0;
+        while (i < len) {
+            char c = sql_text[i];
+            if (c == '\'') in_quote = (uint8_t)!in_quote;
+            else if (c == ';' && !in_quote) break;
+            i++;
+        }
+        uint32_t stmt_len = i - start;
+        if (i < len) i++;   // consume the ';' itself; running off the end with no trailing ';' is fine too
+
+        if (stmt_len == 0) continue;
+
+        out->total++;
+        if (out->total > SQL_SCHEMA_IMPORT_MAX_STMTS) continue;   // still counted in ->total so a caller can detect truncation; just not attempted
+
+        char stmt_buf[SQL_MAX_TEXT_LEN + 8];
+        uint32_t copy_len = stmt_len < sizeof(stmt_buf) - 1 ? stmt_len : sizeof(stmt_buf) - 1;
+        for (uint32_t j = 0; j < copy_len; j++) stmt_buf[j] = sql_text[start + j];
+        stmt_buf[copy_len] = '\0';
+
+        struct SqlSchemaImportStmtResult* sr = &out->stmts[out->total - 1];
+        sr->offset = start;
+        struct SqlResult r;
+        int rc = sql_execute(caller_uid, stmt_buf, &r);
+        if (rc == 0) {
+            sr->ok = 1;
+            out->succeeded++;
+            // A stray SELECT inside an otherwise-DDL import batch would
+            // otherwise leak one of only CURSOR_MAX==8 open-cursor slots
+            // for a result nobody asked to read back -- same fail-safe
+            // posture Phase 7's exec_subquery_column() already applies.
+            if (r.kind == SQL_STMT_SELECT) cursor_close(r.cursor_id);
+        } else {
+            sr->ok = 0;
+            sr->error = r.error;
+            se_strcpy(sr->error_msg, r.error_msg, SQL_ERR_MSG_LEN);
+            out->failed++;
+        }
+    }
+}
+
+uint64_t sys_sls_schema_export(struct SLSSchemaExportRequest* req) {
+    if (!req) return 1;
+    req->bytes_written = sql_schema_export(req->caller_uid, req->sql_out, sizeof(req->sql_out));
+    return 0;
+}
+
+uint64_t sys_sls_schema_import(struct SLSSchemaImportRequest* req) {
+    if (!req) return 1;
+    sql_schema_import(req->caller_uid, req->sql_text, &req->result);
+    return req->result.failed > 0 ? 1 : 0;
 }

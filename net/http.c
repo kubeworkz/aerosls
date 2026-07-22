@@ -788,6 +788,26 @@ static int api_table_schema(const char* name, char* buf, int max) {
     j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/schema/export — SQL Feature-Parity Roadmap, Phase 8 follow-on ───
+// Reconstructs CREATE TABLE/CREATE INDEX SQL text for every row-set table
+// req_uid can read (sql_schema_export(), sql_exec.c) and returns it as one
+// multiline JSON string field -- the SQLite convention this phase follows:
+// a schema is exported as plain SQL text, not a new structured format. See
+// sql_exec.h's own header comment for what's skipped (with a `-- ` comment
+// explaining why) rather than silently dropped: RANGE constraints (no SQL
+// syntax exists for them in this parser) and any single CREATE TABLE that
+// would exceed SQL_MAX_TEXT_LEN once fully reconstructed.
+static int api_schema_export(uint32_t req_uid, char* buf, int max) {
+    static char sql_out[SQL_SCHEMA_EXPORT_MAX_LEN];
+    uint32_t n = sql_schema_export(req_uid, sql_out, sizeof(sql_out));
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_str_multiline(&j, "sql", sql_out);
+    jb_putc(&j, ',');
+    jb_uint(&j, "bytes", n);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/objects/<name> ──────────────────────────────────────────────────
 static int api_object_detail(const char* name, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -1713,6 +1733,50 @@ static int api_sql_post(const char* body, char* buf, int max, uint32_t req_uid) 
     } else {
         jb_uint(&j, "affected_rows", req.result.affected_rows);
     }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/schema/import — SQL Feature-Parity Roadmap, Phase 8 follow-on ──
+// Body: {"sql": "<one or more ';'-separated statements>"}. Runs the whole
+// batch through sql_schema_import() (sql_exec.c) under req_uid, which
+// splits on top-level ';' (quote-aware) and executes each statement via
+// sql_execute(), continuing past individual failures rather than aborting
+// the batch -- so importing a real SQLite-style dump that uses syntax this
+// parser doesn't support (PRIMARY KEY, CHECK, DEFAULT, CREATE VIEW, ...)
+// fails just that one statement and reports why, not the whole import.
+static int api_schema_import_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+
+    static char import_text[SQL_SCHEMA_EXPORT_MAX_LEN];
+    json_str(body, "sql", import_text, sizeof(import_text));
+
+    struct SqlSchemaImportResult res;
+    sql_schema_import(req_uid, import_text, &res);
+
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "total", res.total); jb_putc(&j, ',');
+    jb_uint(&j, "succeeded", res.succeeded); jb_putc(&j, ',');
+    jb_uint(&j, "failed", res.failed); jb_putc(&j, ',');
+    if (res.total > SQL_SCHEMA_IMPORT_MAX_STMTS) {
+        jb_str(&j, "truncated", "true"); jb_putc(&j, ',');
+    }
+    jb_arr_open(&j, "statements");
+    uint32_t attempted = res.total < SQL_SCHEMA_IMPORT_MAX_STMTS ? res.total : SQL_SCHEMA_IMPORT_MAX_STMTS;
+    for (uint32_t i = 0; i < attempted; i++) {
+        if (i) jb_putc(&j, ',');
+        struct SqlSchemaImportStmtResult* sr = &res.stmts[i];
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "offset", sr->offset); jb_putc(&j, ',');
+        jb_str(&j, "ok", sr->ok ? "true" : "false");
+        if (!sr->ok) {
+            jb_putc(&j, ',');
+            jb_uint(&j, "error_code", (uint64_t)sr->error); jb_putc(&j, ',');
+            jb_str(&j, "error", sr->error_msg);
+        }
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
@@ -3640,6 +3704,13 @@ static void http_route(int conn, char* req) {
             blen = api_tables_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── SQL Feature-Parity Roadmap, Phase 8 follow-on: GET /api/schema/export ──
+        if (!strcmp(path, "/api/schema/export")) {
+            uint32_t exp_uid = 0; SLSRole exp_role = ROLE_GUEST;
+            auth_http_extract(req, &exp_uid, &exp_role);
+            blen = api_schema_export(exp_uid, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         if (str_find(path, "/api/tables/") == path) {
             const char* rest = path + 12;   // after "/api/tables/"
             const char* suffix = str_find(rest, "/schema");
@@ -3914,6 +3985,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/sql")) {
             blen = api_sql_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── SQL Feature-Parity Roadmap, Phase 8 follow-on ──────────────────────
+        if (!strcmp(path, "/api/schema/import")) {
+            blen = api_schema_import_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Kernel-Side Shell Refactor ──────────────────────────────────────
