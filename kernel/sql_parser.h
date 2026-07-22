@@ -38,13 +38,21 @@
  *                  column_ref), not a bare column_ref -- see the SQL
  *                  Feature-Parity Roadmap Phase 1 note below.
  *   insert_stmt := INSERT INTO ident '(' ident (',' ident)* ')'
- *                  VALUES '(' insert_value (',' insert_value)* ')' [;]
+ *                  VALUES '(' insert_value (',' insert_value)* ')'
+ *                  (',' '(' insert_value (',' insert_value)* ')')* [;]
+ *                  -- SQL Feature-Parity Roadmap Phase 6: VALUES may repeat
+ *                  additional parenthesized tuples (multi-row INSERT), up
+ *                  to SQL_INSERT_MAX_EXTRA_ROWS extra beyond the first (see
+ *                  the Phase 6 note below); every tuple must independently
+ *                  have exactly as many values as the column list has
+ *                  columns (per-tuple arity is still checked, unchanged).
  *   insert_value := literal | NULL   -- SQL Feature-Parity Roadmap Phase 4:
  *                  a column's value may now be the literal NULL keyword,
  *                  not just a typed literal (see the Phase 4 note below).
- *                  Every column must still be named in the column list --
- *                  omitting a column entirely (partial-row/default-value
- *                  INSERT) remains unsupported.
+ *                  SQL Feature-Parity Roadmap Phase 6: a column NOT named in
+ *                  the column list is no longer a parse/exec error -- it is
+ *                  filled with NULL for every row (partial-column INSERT;
+ *                  see the Phase 6 note below).
  *   update_stmt := UPDATE ident SET ident '=' set_value (',' ident '=' set_value)*
  *                  [WHERE predicate] [;]
  *   set_value   := literal | arith_expr | NULL   -- SQL Feature-Parity
@@ -315,6 +323,43 @@
  *     support here -- `price * NULL` is not a parseable expression; `NULL`
  *     is only a value position (`INSERT`/`SET`) or tested via `IS [NOT]
  *     NULL`, never an arithmetic operand.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 6: multi-row + partial-column INSERT ──
+ *   - Multi-row: `SqlInsertStmt` keeps its original `values[]`/`is_null[]`
+ *     fields as row 0 (byte-for-byte the pre-Phase-6 shape) and adds
+ *     `extra_values[][]`/`extra_is_null[][]` + `extra_row_count` for any
+ *     additional `VALUES` tuples -- the same "parallel array, zero-default,
+ *     byte-compatible when unused" convention as every prior phase
+ *     (`extra_row_count == 0` for any ordinary single-tuple INSERT keeps
+ *     every pre-Phase-6 caller/test reading `.values[i]`/`.is_null[i]`
+ *     directly unaffected). `SQL_INSERT_MAX_EXTRA_ROWS` (7, so 8 rows
+ *     total per statement) is a real, named ceiling -- chosen to keep
+ *     `sizeof(struct SqlInsertStmt)` from exceeding `sizeof(struct
+ *     SqlSelectStmt)`, which already sets `struct SqlStatement`'s union
+ *     footprint; this is a modest ergonomic feature for a handful of rows
+ *     per statement, not a bulk-loader primitive (`sql_execute()`'s
+ *     512-byte `SQL_MAX_TEXT_LEN` input cap makes a much larger row count
+ *     impractical to type as one statement anyway).
+ *   - Partial-column: a column omitted from `INSERT INTO t (col, ...)`'s
+ *     column list is no longer a parse or exec error. This needed NO new
+ *     parser field -- `count` (the named-column count) simply may now be
+ *     less than the table's full column count, and `sql_exec.c`'s
+ *     `exec_insert()` fills any table column not present in the statement
+ *     with a real NULL (Phase 4's `null_mask`) instead of rejecting the
+ *     statement. Investigation confirmed the "every column must be named"
+ *     contract lived entirely in `sql_exec.c` -- `rowstore_row_insert()`/
+ *     `mvcc_row_insert()` always took a fully-populated `RowValues` and
+ *     never themselves enforced which columns the caller supplied -- so
+ *     this phase is purely a `sql_parser.c`/`sql_exec.c` change, confirming
+ *     the roadmap draft's own open question.
+ *   - Atomicity: a multi-row INSERT's rows are NOT given any new
+ *     transaction plumbing. `sql_execute()` already wraps one whole
+ *     statement in a single `mvcc_begin()`/`mvcc_commit()`/
+ *     `mvcc_rollback()` (Phase 22); `exec_insert()` just loops over its
+ *     rows against the SAME already-open `txn_id` and stops at the first
+ *     failure, so a mid-statement failure rolls back every row the
+ *     statement had already inserted for free, via the exact mechanism
+ *     that already rolls back a single failed INSERT today.
  */
 #ifndef SQL_PARSER_H
 #define SQL_PARSER_H
@@ -432,11 +477,17 @@ struct SqlSelectStmt {
     uint32_t limit;
 };
 
+// Phase 6 (SQL Feature-Parity Roadmap): a real, named ceiling on additional
+// VALUES tuples beyond row 0 -- see this header's own Phase 6 note above for
+// the sizeof(SqlSelectStmt)-parity rationale.
+#define SQL_INSERT_MAX_EXTRA_ROWS 7
+
 struct SqlInsertStmt {
     char     table_name[OBJECT_NAME_LEN];
     char     columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
-    char     values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];   // meaningful iff !is_null[i]
-    uint32_t count;   // columns/values pair count -- must equal the table's full column count at exec time
+    char     values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];   // meaningful iff !is_null[i]; row 0 -- see Phase 6 note
+    uint32_t count;   // columns/values pair count -- the NAMED column count; Phase 6: may now be LESS than
+                      // the table's full column count (partial-column INSERT fills the rest with NULL at exec time)
 
     // Phase 4 (SQL Feature-Parity Roadmap): parallel to values[] above, not
     // a replacement -- zero-default (is_null[i]==0 for every i) keeps every
@@ -444,6 +495,19 @@ struct SqlInsertStmt {
     // as before. See rowstore.h/predicate.h for the null_mask machinery
     // this feeds.
     uint8_t  is_null[ROWSTORE_MAX_COLUMNS];
+
+    // Phase 6 (SQL Feature-Parity Roadmap): additional VALUES tuples for a
+    // multi-row INSERT (VALUES (...), (...), ...), purely additive --
+    // extra_row_count==0 (the zero default) keeps every pre-Phase-6 INSERT
+    // byte-for-byte identical, using only the row-0 fields above exactly as
+    // before. Each extra_values[r]/extra_is_null[r] pair is shaped exactly
+    // like values[]/is_null[] above and is keyed against the SAME columns[]
+    // list (one column list per statement, shared by every tuple -- matching
+    // standard SQL's own `INSERT ... (cols) VALUES (...), (...)` grammar).
+    // See this header's own Phase 6 note above for the ceiling rationale.
+    uint32_t extra_row_count;
+    char     extra_values[SQL_INSERT_MAX_EXTRA_ROWS][ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
+    uint8_t  extra_is_null[SQL_INSERT_MAX_EXTRA_ROWS][ROWSTORE_MAX_COLUMNS];
 };
 
 struct SqlUpdateStmt {

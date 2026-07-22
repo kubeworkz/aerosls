@@ -229,8 +229,14 @@ struct SqlResult {
     uint32_t column_count;
 
     // INSERT/UPDATE/DELETE:
-    uint32_t          affected_rows;
-    struct MvccRowId  inserted_id;   // INSERT only (Phase 22: logical id, not a physical RowId -- see header note)
+    uint32_t          affected_rows;   // Phase 6 (SQL Feature-Parity Roadmap): for a multi-row INSERT, the
+                                        // number of rows actually inserted before any failure (0 on a fully
+                                        // failed statement, since sql_execute()'s wrapping transaction rolls
+                                        // the whole statement back -- see sql_parser.h's Phase 6 note)
+    struct MvccRowId  inserted_id;     // INSERT only (Phase 22: logical id, not a physical RowId -- see header
+                                        // note). Phase 6: for a multi-row INSERT this is the LAST row's id,
+                                        // matching common SQL client convention (e.g. LAST_INSERT_ID) -- callers
+                                        // that need every inserted row's id should SELECT them back afterward.
 };
 
 // Parses sql_text and executes it against real row-set tables, now wrapped

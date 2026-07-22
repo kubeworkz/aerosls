@@ -764,7 +764,7 @@ every prior phase — no errors).
 
 ---
 
-## Phase 6 — Multi-row INSERT + partial-column INSERT
+## Phase 6 — Multi-row INSERT + partial-column INSERT — DONE
 
 **Goal:** `INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')` and
 `INSERT INTO t (a) VALUES (1)` (other columns get NULL/default, not a
@@ -793,9 +793,111 @@ test (multi-row INSERT inside an explicit transaction, then rollback)
 confirming MVCC treats all rows from one statement as atomic together;
 compile-check; regression sweep.
 
+### Scope correction made during implementation
+
+Investigation confirmed the draft's own open question cleanly: the "every
+column must be named" contract lived entirely in `sql_exec.c`'s
+`exec_insert()` (`if (s->count != layout->column_count) ...`), never in
+`rowstore_row_insert()`/`mvcc_row_insert()` — both always accepted
+whatever `RowValues` the caller handed them, with no enforcement of which
+columns the SQL text actually named. Phase 6 therefore stayed entirely in
+the SQL layer (`sql_parser.c`/`sql_parser.h`/`sql_exec.c`/`sql_exec.h`),
+touching neither `rowstore.c` nor `mvcc.c` — exactly as the roadmap draft
+predicted this outcome would look like.
+
+`SqlInsertStmt` kept its original `values[]`/`is_null[]` fields as row 0,
+byte-for-byte identical to every pre-Phase-6 caller, and added
+`extra_values[]`/`extra_is_null[]`/`extra_row_count` for additional
+`VALUES` tuples — the same "parallel array, zero-default, byte-compatible
+when unused" convention every prior phase in this roadmap has used. A
+real, named ceiling (`SQL_INSERT_MAX_EXTRA_ROWS = 7`, so 8 rows total per
+statement) was chosen to keep `sizeof(struct SqlInsertStmt)` from
+exceeding `sizeof(struct SqlSelectStmt)`, which already sets `struct
+SqlStatement`'s union footprint — this is scoped as a modest ergonomic
+feature for a handful of rows per statement, not a bulk-loader primitive,
+consistent with the 512-byte `SQL_MAX_TEXT_LEN` input cap already making a
+much larger row count impractical to type as one statement.
+
+Partial-column INSERT needed no new parser field at all: `count` (the
+named-column count) simply may now be less than the table's full column
+count, and `exec_insert()` fills any table column absent from the
+statement with a real NULL (Phase 4's `null_mask`) rather than rejecting
+it. The executor was restructured around a new `build_insert_row_values()`
+helper (shared by every row in a multi-row statement, since all tuples use
+the same column list) that resolves each named column's index once and
+marks every *unnamed* column NULL — explicit-NULL and omitted-column both
+resolve to the same real null bit, deliberately indistinguishable at the
+storage layer. Naming *more* columns than the table has remains a real,
+distinct error (`SQL_ERR_COLUMN_COUNT_MISMATCH`) — Phase 6 only relaxed
+"fewer," never "more."
+
+Multi-row atomicity needed **no new transaction plumbing**: `sql_execute()`
+already wraps one whole statement in a single `mvcc_begin()`/
+`mvcc_commit()`/`mvcc_rollback()` (Phase 22). `exec_insert()` simply loops
+its rows against the same already-open `txn_id` and stops at the first
+failure; the existing autocommit wrapper then rolls back every row the
+statement had already inserted, for free, via the exact mechanism that
+already rolled back a single failed INSERT before this phase. This was
+verified concretely, not just reasoned about: a constraint violation on
+the *second* tuple of a 3-row batch was confirmed to roll back the *first*
+tuple's already-inserted row too, and the same held for an explicit
+`sql_execute_tx()`/`sql_tx_rollback()` transaction wrapping a multi-row
+INSERT.
+
+`SqlResult.inserted_id` keeps its pre-Phase-6 single-`MvccRowId` shape
+rather than growing an array — for a multi-row INSERT it now reports the
+*last* row's id, matching common SQL client convention (e.g.
+`LAST_INSERT_ID`). `affected_rows` reports the count of rows actually
+inserted before any failure. Callers that need every inserted row's id
+back are expected to `SELECT` them afterward, matching how this codebase
+has consistently avoided growing wire-format arrays for what would
+otherwise be a rare need.
+
+**Verification — actual results:** `tests/sql_insert_phase6_host_test.c`
+(new, 49 checks) covers a 3-row INSERT landing every row in order;
+partial-column INSERT with omitted columns confirmed as real NULL (not
+zero-filled); multi-row + partial-column + explicit-NULL combined in one
+statement; a mid-batch `UNIQUE` violation rolling back the *entire*
+autocommit statement including already-inserted earlier rows (confirmed
+by re-querying for genuine absence, not just a reported error); the same
+atomicity under an explicit `sql_execute_tx()` transaction, both on
+rollback and on commit; parser-level checks (`extra_row_count` correctness,
+a later tuple's wrong arity still failing to parse, naming more columns
+than the table has still rejected as `SQL_ERR_COLUMN_COUNT_MISMATCH`
+distinct from a same-count-but-wrong-name `SQL_ERR_COLUMN_NOT_FOUND`, and
+an ordinary single-row INSERT still parsing with `extra_row_count == 0`);
+and permission denial failing a multi-row INSERT cleanly with no partial
+row left behind.
+
+Regression sweep surfaced two real, expected fallout failures from the
+deliberate "partial-column INSERT is no longer an error" behavior change
+— both pre-existing tests that had asserted the OLD "missing a column is
+rejected" behavior as a real check, now stale by design, not a bug: in
+`sql_exec_host_test.c`, scenario 2's `INSERT INTO employees (id, name)
+VALUES (99, 'x')` (omitting `active`) used to correctly fail and now
+correctly succeeds; the check was repointed at the still-real "naming more
+columns than the table has" error instead of being deleted, preserving
+the original `SQL_ERR_COLUMN_COUNT_MISMATCH` assertion under its accurate
+new condition. The same fix was applied to `sql_tx_host_test.c`'s
+scenario 2. Both fixes were verified to not just silence the failure but
+restore a real, still-meaningful check — the old row-count-mismatch
+assertion is preserved, just triggered by the opposite (still-erroring)
+condition, and downstream row-count assertions elsewhere in both files
+were confirmed unaffected since the fix avoids ever actually inserting the
+row (the too-many-columns case fails before any row is written).
+
+Full regression sweep (`tests/run_all.sh`): **33/33 host test files
+passing, 0 failed** — includes the new file and both fixes above.
+`net/http.c` compile-checked clean against the updated `sql_parser.h`/
+`sql_exec.h` (only the same pre-existing, unrelated implicit-function-
+declaration warnings seen in every prior phase — no errors); its SQL
+route needed no changes at all, since it already passes raw SQL text
+through to `sql_execute()` and serializes `SqlResult` generically
+(`affected_rows` already existed as a JSON field).
+
 ---
 
-## Phase 7 — Subqueries, views, CTEs, set operations
+## Phase 7 — Subqueries, views, CTEs, set operations — DONE
 
 **Goal:** the remaining, most SQLite-like-but-hardest gaps: scalar and
 `IN (SELECT ...)` subqueries, `CREATE VIEW`, `WITH` CTEs, and
@@ -830,6 +932,144 @@ recursive-execution approach.
 should follow the same bar as every phase above — host test, compile-
 check, full regression sweep — but the detailed test plan isn't written
 here since the implementation approach itself isn't committed yet.
+
+### Scope correction made during implementation
+
+The "smallest real slice" framing above held exactly as written: this
+phase shipped non-correlated scalar and `IN (SELECT ...)` subqueries in a
+plain (non-JOIN, non-aggregate) SELECT/UPDATE/DELETE's WHERE clause.
+`CREATE VIEW`, `WITH` CTEs, `UNION`/`INTERSECT`/`EXCEPT`, and correlated
+subqueries remain entirely unscoped — named, not silently dropped — and
+are the natural seed for a follow-on doc if wanted.
+
+**The "recursive execution model" concern above was real but smaller than
+feared.** The actual blocker wasn't recursion in general — it was that
+`sql_exec.c` already had exactly two non-reentrant static scratch globals
+(`g_stmt_scratch` holding the outer statement's own parsed fields for the
+whole rest of `dispatch_stmt()`'s call, and `g_select_scratch` holding
+whatever SELECT is currently materializing its result rows) that a naive
+"just call `sql_execute()` again for the subquery" implementation would
+have silently clobbered mid-flight. The fix was two dedicated, separate
+static scratch buffers — one per translation unit, at the exact point
+each is needed:
+
+- `kernel/sql_parser.c`: `g_subquery_skip_scratch` (a `struct
+  SqlStatement`), used ONLY at parse time to validate an embedded
+  subquery's shape (must parse as `SQL_STMT_SELECT`, `!has_join`,
+  `!has_aggregates`, exactly one selected column) via a throwaway
+  `sql_parse()` call on the captured raw text. A `g_subquery_validating`
+  re-entrancy guard rejects a subquery containing another nested subquery
+  with a clean "nested subqueries are not supported" parse error, rather
+  than letting the inner validation's own `sql_parse()` call recursively
+  clobber the outer validation's still-in-progress result in the same
+  static buffer — this is what actually enforces "one level of subquery
+  only," not a grammar restriction.
+- `kernel/sql_exec.c`: `g_subquery_stmt_scratch` (a second, independent
+  `struct SqlStatement`), used ONLY at exec time by `exec_subquery_column()`
+  to re-parse a subquery's raw text right before running it — kept
+  entirely separate from `g_stmt_scratch` so resolving a subquery never
+  overwrites the outer statement's own in-progress WHERE clause (the
+  exact corruption a naive shared-scratch design would have caused, and
+  the reason `resolve_predicate_subqueries()` cannot simply call
+  `sql_execute()`/`sql_execute_tx()` recursively).
+
+**Subqueries are raw TEXT, not parsed structs, in the predicate pool.**
+`predicate.h` gained `Predicate.subqueries[PREDICATE_MAX_SUBQUERIES=3][256]`
+— each slot holds the subquery's original SQL text, re-parsed once at
+resolve time — rather than embedding a full parsed `SqlSelectStmt` (~34KB)
+per reference, which would have made `PREDICATE_MAX_NODES=32`-sized
+predicate pools far too expensive. This is a direct continuation of the
+codebase's existing "text is the interchange format, re-parse when
+needed" convention (there has never been a compiled-query cache anywhere
+in this codebase; `sql_execute()` always re-parses from scratch on every
+call) rather than a new pattern invented for this phase.
+
+**`IN (SELECT ...)` desugars into the same OR-chain a literal `IN`-list
+already builds, at RESOLVE time instead of parse time.** The parser emits
+a transient marker (`PRED_OP_IN_SUBQUERY`, `uses_subquery=1`,
+`subquery_index` pointing into `Predicate.subqueries[]`) and defers
+building the chain until `resolve_predicate_subqueries()` runs, since the
+number of OR branches depends on how many rows the subquery actually
+returns — unknowable at parse time. Resolution reuses
+`predicate_add_comparison()`/`predicate_add_or()` unchanged, then copies
+the freshly-built chain's ROOT NODE CONTENT back into the marker node's
+own slot index (`pred->nodes[i] = pred->nodes[acc]`) so every existing
+parent AND/OR node's `left`/`right` reference to index `i` stays valid
+with no new "reparent" primitive needed — the newly-allocated `acc` slot
+is simply abandoned, this codebase's established bump-allocated-pool
+convention (`row_indexes[]`, `row_constraints[]`, rowstore pages all work
+the same way: no reclaim in the first cut). A zero-row `IN (SELECT ...)`
+resolves to a new `PRED_OP_FALSE` op (standard SQL: `IN` against an empty
+set is always false) rather than an empty OR-chain, which would have had
+no valid root node index to install.
+
+**A scalar subquery returning zero rows resolves to `PRED_OP_FALSE`, not
+an error or a NULL-comparison special case.** Standard SQL treats
+comparing against an empty scalar subquery result as UNKNOWN, which
+`WHERE` treats as false — the same simplification this codebase's NULL
+handling already makes elsewhere (Phase 4). A scalar subquery returning
+MORE than one row IS a genuine error (`SQL_ERR_VALUE_INVALID`, an
+existing error code — no new `SqlErrorCode` value was needed anywhere in
+this phase), aborting the whole statement before any row is scanned,
+matching this file's existing "statement-level atomicity" posture.
+
+**`exec_subquery_column()` deliberately bypasses `exec_select()` and the
+cursor layer entirely**, calling `mvcc_find_matching_rows()`/
+`mvcc_row_get()` directly — the same two calls `exec_select()` itself
+uses internally. A subquery's result is consumed immediately and
+completely by `resolve_predicate_subqueries()`, so materializing it as a
+real cursor would burn one of only `CURSOR_MAX==8` simultaneously-open
+slots for no reason, and risk exactly the "silent pool exhaustion" bug
+Phase 6 already hit once (`cursor_open_rowset()` returning 0 as both a
+legitimate id and its own failure sentinel).
+
+**Resolution is wired into `dispatch_stmt()`, not into `exec_select()`/
+`exec_update()`/`exec_delete()` themselves**, gated on
+`has_where && !has_join && !has_aggregates` for SELECT (UPDATE/DELETE have
+no JOIN/aggregate concept to gate on, just `has_where`) — this is what
+makes "`exec_select_join()`/`exec_select_group()`/HAVING never resolve
+subqueries" true by construction rather than by convention: those
+functions are never even called with an unresolved marker still needing
+resolution attempted, because `dispatch_stmt()` only calls
+`resolve_predicate_subqueries()` on the plain paths before dispatching.
+A subquery marker written inside a JOIN's WHERE or a HAVING clause still
+PARSES fine (the same `parse_comparison_tail()` handles both positions
+regardless of statement shape) but fails closed at eval time via
+`eval_comparison()`'s defensive `uses_subquery`/`PRED_OP_IN_SUBQUERY`
+check — verified directly in the new host test (scenario 9: a subquery
+inside a JOIN's WHERE runs cleanly and matches zero rows, not a crash and
+not "matches everything").
+
+**Host test:** `tests/sql_subquery_phase7_host_test.c`, 34 checks across
+11 scenarios, linked against the real `sql_exec.c`/`sql_parser.c`/
+`predicate.c`/`row_index.c`/`rowstore.c`/`persist.c`/`cursor.c`/`mvcc.c`/
+`row_constraint.c`/`row_journal.c`. Covers: scalar subquery in a plain
+SELECT's WHERE; `IN (SELECT ...)` in a plain SELECT's WHERE; scalar
+subquery in UPDATE's WHERE (verified via re-SELECT that only the intended
+row changed); `IN (SELECT ...)` in DELETE's WHERE (verified via re-SELECT
+that only the intended row is gone); a zero-row `IN (SELECT ...)`
+resolving to no matches, not an error; a zero-row scalar subquery
+resolving to no matches, not an error; a >1-row scalar subquery rejected
+with `SQL_ERR_VALUE_INVALID`; four unsupported subquery shapes
+(multi-column, aggregate, JOIN, nested) all rejected at PARSE time before
+any execution is attempted; a subquery inside a JOIN's WHERE failing
+closed instead of crashing or matching everything; a subquery AND'd with
+an ordinary literal condition (proving the marker-node content-copy trick
+doesn't corrupt the parent AND node's `left`/`right` references); and
+permission denial on a subquery's own table resolving to zero rows
+cleanly rather than a crash or a false grant (the same fail-safe posture
+`sql_join_host_test.c`'s own scenario 7 already established for JOINs).
+
+**Full regression sweep: 34/34 host test files, 0 failed** (up from 33 —
+the new file). `net/http.c` compile-checked clean against the updated
+`predicate.h`/`sql_parser.h`/`sql_exec.h` (only the same pre-existing,
+unrelated warnings seen in every prior phase — misleading-indentation and
+one implicit `strcmp` declaration, none touching this phase's changes);
+its SQL route needed no changes at all, since it already passes raw SQL
+text through to `sql_execute()` and serializes `SqlResult` generically.
+
+This closes out the SQL Feature-Parity Roadmap — Phases 1 through 7 are
+all DONE.
 
 ---
 

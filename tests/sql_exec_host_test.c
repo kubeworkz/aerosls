@@ -193,9 +193,13 @@ int main(void) {
     CHECK(r.affected_rows == 1 && r.kind == SQL_STMT_INSERT, "scenario 1: last INSERT reports affected_rows=1");
 
     /* ── Scenario 2: INSERT error paths ───────────────────────────────────── */
-    CHECK(sql_execute(1, "INSERT INTO employees (id, name) VALUES (99, 'x')", &r) == 1 &&
+    // SQL Feature-Parity Roadmap Phase 6: INSERT omitting a column is no
+    // longer an error -- the omitted column is filled with a real NULL
+    // (partial-column INSERT). This check now exercises the opposite,
+    // still-real error: naming MORE columns than the table has.
+    CHECK(sql_execute(1, "INSERT INTO employees (id, name, active, bogus) VALUES (99, 'x', TRUE, 'y')", &r) == 1 &&
           r.error == SQL_ERR_COLUMN_COUNT_MISMATCH,
-          "scenario 2: INSERT missing a required column fails cleanly (column count mismatch)");
+          "scenario 2: INSERT naming more columns than the table has fails cleanly (column count mismatch)");
     CHECK(sql_execute(1, "INSERT INTO employees (id, name, no_such_col) VALUES (99, 'x', 'y')", &r) == 1 &&
           r.error == SQL_ERR_COLUMN_NOT_FOUND,
           "scenario 2: INSERT naming an unknown column fails cleanly");

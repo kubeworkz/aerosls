@@ -1013,23 +1013,60 @@ static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct
         se_strcpy(out->columns[i], group_layout.column_names[i], RECORD_KEY_LEN);
 }
 
+// Phase 6 (SQL Feature-Parity Roadmap): builds one row's RowValues from a
+// single VALUES tuple's raw text/is_null arrays (shared col_idx[]/ccount
+// resolved once by the caller, since every tuple in one INSERT statement
+// uses the SAME column list). Any table column NOT present in col_idx[]
+// (partial-column INSERT) is left NULL -- values is zero-initialized and
+// then only named columns are overwritten, so an unseen column's null_mask
+// bit is set explicitly here rather than relying on zero-init alone, since
+// a real "no value provided" column must be indistinguishable from an
+// explicit `NULL` literal (both are the real Phase 4 null_mask bit).
+static void build_insert_row_values(const struct RowTableLayout* layout, const uint32_t* col_idx, uint32_t ccount,
+                                    const char values_text[][RECORD_VAL_LEN], const uint8_t* is_null,
+                                    struct RowValues* out_values) {
+    se_memset(out_values, 0, sizeof(*out_values));
+    out_values->count = layout->column_count;
+    uint8_t seen[ROWSTORE_MAX_COLUMNS];
+    se_memset(seen, 0, sizeof(seen));
+
+    for (uint32_t i = 0; i < ccount; i++) {
+        uint32_t col = col_idx[i];
+        // Phase 4 (SQL Feature-Parity Roadmap): a NULL value sets the real
+        // null_mask bit instead of storing empty text -- see rowstore.h's
+        // Phase 4 note.
+        if (is_null[i]) {
+            out_values->null_mask |= (uint16_t)(1u << col);
+            out_values->values[col][0] = '\0';
+        } else {
+            se_strcpy(out_values->values[col], values_text[i], RECORD_VAL_LEN);
+        }
+        seen[col] = 1;
+    }
+    // Phase 6 (SQL Feature-Parity Roadmap): any table column not named in
+    // this INSERT's column list is a real NULL, not zero-filled/corrupted --
+    // see sql_parser.h's Phase 6 note on why this needed no new parser field.
+    for (uint32_t c = 0; c < layout->column_count; c++) {
+        if (!seen[c]) out_values->null_mask |= (uint16_t)(1u << c);
+    }
+}
+
 static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlInsertStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
     if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
 
-    if (s->count != layout->column_count) {
+    // Phase 6 (SQL Feature-Parity Roadmap): the column list may now name
+    // FEWER columns than the table has (partial-column INSERT) -- it may
+    // never name MORE (that's always a real error, matching every column
+    // count check elsewhere in this codebase). Resolved once, shared by
+    // every VALUES tuple in this statement.
+    if (s->count > layout->column_count) {
         out->error = SQL_ERR_COLUMN_COUNT_MISMATCH;
-        se_strcpy(out->error_msg, "INSERT must specify every column (no partial-row/default support yet)", SQL_ERR_MSG_LEN);
+        se_strcpy(out->error_msg, "INSERT names more columns than the table has", SQL_ERR_MSG_LEN);
         return;
     }
-
-    struct RowValues values;
-    se_memset(&values, 0, sizeof(values));
-    values.count = layout->column_count;
-    uint8_t seen[ROWSTORE_MAX_COLUMNS];
-    se_memset(seen, 0, sizeof(seen));
-
+    uint32_t col_idx[ROWSTORE_MAX_COLUMNS];
     for (uint32_t i = 0; i < s->count; i++) {
         uint32_t col = find_column_index(layout, s->columns[i]);
         if (col == 0xFFFFFFFFu) {
@@ -1037,37 +1074,45 @@ static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlIn
             se_strcpy(out->error_msg, "INSERT column not found in table", SQL_ERR_MSG_LEN);
             return;
         }
-        // Phase 4 (SQL Feature-Parity Roadmap): a NULL value sets the real
-        // null_mask bit instead of storing empty text -- see rowstore.h's
-        // Phase 4 note.
-        if (s->is_null[i]) {
-            values.null_mask |= (uint16_t)(1u << col);
-            values.values[col][0] = '\0';
-        } else {
-            se_strcpy(values.values[col], s->values[i], RECORD_VAL_LEN);
-        }
-        seen[col] = 1;
-    }
-    for (uint32_t c = 0; c < layout->column_count; c++) {
-        if (!seen[c]) {
-            out->error = SQL_ERR_COLUMN_COUNT_MISMATCH;
-            se_strcpy(out->error_msg, "INSERT is missing a required column", SQL_ERR_MSG_LEN);
-            return;
-        }
+        col_idx[i] = col;
     }
 
-    struct MvccRowId new_id;
-    MvccError rc = mvcc_row_insert(txn_id, caller_uid, s->table_name, &values, &new_id);
-    if (rc != MVCC_OK) {
-        out->error = map_mvcc_err(rc);
-        se_strcpy(out->error_msg, out->error == SQL_ERR_CONSTRAINT_VIOLATION
-                  ? "INSERT violates a UNIQUE, NOT NULL, RANGE, or REFERENCE constraint"
-                  : "INSERT rejected by the row store", SQL_ERR_MSG_LEN);
-        return;
+    // Phase 6 (SQL Feature-Parity Roadmap): row 0 plus any extra_values[]
+    // tuples (multi-row INSERT) -- looped against the SAME already-open
+    // txn_id, so a mid-loop failure lets sql_execute()'s existing
+    // begin/commit/rollback wrapping (Phase 22) roll back every row this
+    // statement already inserted, for free -- see sql_parser.h's Phase 6
+    // note on why no new transaction plumbing was needed here.
+    uint32_t total_rows = 1 + s->extra_row_count;
+    uint32_t inserted    = 0;
+    struct MvccRowId last_id;
+    se_memset(&last_id, 0, sizeof(last_id));
+
+    for (uint32_t r = 0; r < total_rows; r++) {
+        struct RowValues values;
+        if (r == 0) {
+            build_insert_row_values(layout, col_idx, s->count, s->values, s->is_null, &values);
+        } else {
+            build_insert_row_values(layout, col_idx, s->count, s->extra_values[r - 1], s->extra_is_null[r - 1], &values);
+        }
+
+        struct MvccRowId new_id;
+        MvccError rc = mvcc_row_insert(txn_id, caller_uid, s->table_name, &values, &new_id);
+        if (rc != MVCC_OK) {
+            out->error = map_mvcc_err(rc);
+            se_strcpy(out->error_msg, out->error == SQL_ERR_CONSTRAINT_VIOLATION
+                      ? "INSERT violates a UNIQUE, NOT NULL, RANGE, or REFERENCE constraint"
+                      : "INSERT rejected by the row store", SQL_ERR_MSG_LEN);
+            out->affected_rows = inserted;
+            return;
+        }
+        inserted++;
+        last_id = new_id;
     }
+
     out->error         = SQL_ERR_NONE;
-    out->affected_rows = 1;
-    out->inserted_id   = new_id;
+    out->affected_rows = inserted;
+    out->inserted_id   = last_id;   // last row's id -- see sql_exec.h's Phase 6 note on multi-row inserted_id semantics
 }
 
 static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUpdateStmt* s, struct SqlResult* out) {
@@ -1428,6 +1473,175 @@ static void exec_drop_index(uint32_t caller_uid, struct SqlDropIndexStmt* s, str
     se_strcpy(out->error_msg, "DROP INDEX: index not found", SQL_ERR_MSG_LEN);
 }
 
+// ─── Phase 7 (SQL Feature-Parity Roadmap): non-correlated subquery
+// resolution -- see predicate.h's own Phase 7 note for the full design.
+// This is the piece that turns a parsed-but-unresolved `uses_subquery`
+// marker node into an ordinary, already-resolved comparison node before
+// predicate_eval() ever sees it for real row filtering. ────────────────────
+
+// Dedicated EXEC-TIME-ONLY scratch for re-parsing an embedded subquery's
+// raw text -- deliberately separate from g_stmt_scratch below. Reusing
+// g_stmt_scratch here would be a real bug, not just untidy: g_stmt_scratch
+// holds the OUTER statement's own still-in-progress parsed fields (e.g. its
+// WHERE predicate, which is exactly what's being resolved right now) for
+// the whole rest of dispatch_stmt()'s call -- overwriting it mid-resolution
+// would corrupt the outer statement out from under itself. Also distinct
+// from sql_parser.c's own g_subquery_skip_scratch (parse-time-only shape
+// validation, a different translation unit, never linked to this one's
+// lifetime).
+static struct SqlStatement g_subquery_stmt_scratch;
+
+// Raw-text result values extracted from one subquery's single projected
+// column, up to CURSOR_MAX_ROWSET_ROWS of them (matching the cap every
+// other row-materializing path in this file already uses). Static, not a
+// stack local, for the same reason g_select_scratch is: this-sized a
+// buffer doesn't belong on a freestanding kernel's stack.
+static char g_subquery_result_text[CURSOR_MAX_ROWSET_ROWS][RECORD_VAL_LEN];
+
+// Re-parses and executes an already parse-time-validated (single-column,
+// non-JOIN, non-aggregate) embedded subquery's raw text, extracting its
+// projected column's values into g_subquery_result_text[0..*out_count).
+// Deliberately does NOT go through exec_select()/cursor_open_rowset(): a
+// subquery result is consumed immediately and entirely by
+// resolve_predicate_subqueries() below, so materializing it as a real
+// cursor would burn one of only CURSOR_MAX==8 simultaneously-open-cursor
+// slots for no reason (and risk the exact "silent pool exhaustion" bug
+// Phase 6 hit once already) -- calling mvcc_find_matching_rows()/
+// mvcc_row_get() directly, the same two calls exec_select() itself uses
+// internally, gets the same rows with no cursor involved at all.
+// Returns 1 on success (0 rows is a legitimate, successful result -- see
+// the IN-with-empty-set and scalar-empty-comparison handling in
+// resolve_predicate_subqueries()), 0 on a genuine execution error
+// (out->error/error_msg already set) -- expected only for a reason that
+// couldn't have been caught at parse-time validation, e.g. the subquery's
+// table having been DROPped between parse time and now.
+static int exec_subquery_column(uint64_t txn_id, uint32_t caller_uid, const char* raw_text,
+                                 struct SqlResult* out, uint32_t* out_count) {
+    char perr[SQL_ERR_MSG_LEN];
+    if (sql_parse(raw_text, &g_subquery_stmt_scratch, perr, SQL_ERR_MSG_LEN) != 0 ||
+        g_subquery_stmt_scratch.kind != SQL_STMT_SELECT) {
+        out->error = SQL_ERR_INTERNAL;
+        se_strcpy(out->error_msg, "internal error: subquery failed to re-parse at exec time", SQL_ERR_MSG_LEN);
+        return 0;
+    }
+    struct SqlSelectStmt* sq = &g_subquery_stmt_scratch.u.select;
+
+    int tidx = find_table_catalog_index(sq->table_name);
+    if (tidx < 0) {
+        out->error = SQL_ERR_TABLE_NOT_FOUND;
+        se_strcpy(out->error_msg, "subquery references a table that no longer exists", SQL_ERR_MSG_LEN);
+        return 0;
+    }
+    const struct RowTableLayout* layout = &table_headers[tidx].layout;
+    uint32_t col_idx = find_column_index(layout, sq->columns[0]);
+    if (col_idx == 0xFFFFFFFFu) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "subquery's selected column no longer exists in its table", SQL_ERR_MSG_LEN);
+        return 0;
+    }
+    if (sq->has_where && !predicate_columns_valid(&sq->where, sq->where.root, layout)) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "subquery's WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
+        return 0;
+    }
+
+    struct MvccRowId ids[CURSOR_MAX_ROWSET_ROWS];
+    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, sq->table_name,
+                                             sq->has_where ? &sq->where : NULL, layout,
+                                             ids, CURSOR_MAX_ROWSET_ROWS);
+    uint32_t n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
+
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        struct RowValues row;
+        if (mvcc_row_get(txn_id, caller_uid, sq->table_name, ids[i], &row) != MVCC_OK) continue;
+        se_strcpy(g_subquery_result_text[count], row.values[col_idx], RECORD_VAL_LEN);
+        count++;
+    }
+    *out_count = count;
+    return 1;
+}
+
+// Resolves every uses_subquery marker node in `pred` IN PLACE, before the
+// caller's own row scan runs. A scalar comparison ("= (SELECT ...)", "> ...
+// etc) gets its node's literal filled in directly; `IN (SELECT ...)`
+// desugars into the same OR-chain-of-EQ shape the parser already builds
+// for a literal IN-list, reusing predicate_add_comparison()/
+// predicate_add_or() and copying the final chain's root node CONTENT back
+// into the marker node's own slot index (pred->nodes[i] = pred->nodes[acc])
+// so every existing AND/OR parent reference to node i stays valid with no
+// new "reparent" primitive needed -- the freshly-allocated `acc` slot is
+// simply abandoned, this file's usual bump-allocated-pool convention.
+// Returns 1 on success (including "no subqueries present" -- the common,
+// byte-for-byte-free case, and "subquery legitimately returned 0 rows"),
+// 0 on a genuine resolution error (out->error/error_msg already set; the
+// caller should abort the whole statement without scanning any rows).
+static int resolve_predicate_subqueries(uint64_t txn_id, uint32_t caller_uid, struct Predicate* pred, struct SqlResult* out) {
+    if (pred->subquery_count == 0) return 1;
+    for (uint32_t i = 0; i < pred->node_count; i++) {
+        struct PredicateNode* n = &pred->nodes[i];
+        if (n->kind != PRED_NODE_COMPARISON || !n->uses_subquery) continue;
+        if (n->subquery_index >= pred->subquery_count) {
+            out->error = SQL_ERR_INTERNAL;
+            se_strcpy(out->error_msg, "internal error: invalid subquery index", SQL_ERR_MSG_LEN);
+            return 0;
+        }
+
+        uint32_t rcount = 0;
+        if (!exec_subquery_column(txn_id, caller_uid, pred->subqueries[n->subquery_index], out, &rcount)) return 0;
+
+        if (n->op == PRED_OP_IN_SUBQUERY) {
+            if (rcount == 0) {
+                // Standard SQL: IN against an empty set is always false --
+                // no value can ever equal "nothing".
+                n->op = PRED_OP_FALSE;
+                n->uses_subquery = 0;
+                continue;
+            }
+            char col_name[RECORD_KEY_LEN];
+            se_strcpy(col_name, n->column_name, RECORD_KEY_LEN);
+            uint32_t acc = PREDICATE_INVALID_NODE;
+            for (uint32_t r = 0; r < rcount; r++) {
+                uint32_t eqn = predicate_add_comparison(pred, col_name, PRED_OP_EQ, g_subquery_result_text[r]);
+                if (eqn == PREDICATE_INVALID_NODE) {
+                    out->error = SQL_ERR_INTERNAL;
+                    se_strcpy(out->error_msg, "IN (SELECT ...) result too large (predicate node pool exhausted)", SQL_ERR_MSG_LEN);
+                    return 0;
+                }
+                acc = (acc == PREDICATE_INVALID_NODE) ? eqn : predicate_add_or(pred, acc, eqn);
+                if (acc == PREDICATE_INVALID_NODE) {
+                    out->error = SQL_ERR_INTERNAL;
+                    se_strcpy(out->error_msg, "IN (SELECT ...) result too large (predicate node pool exhausted)", SQL_ERR_MSG_LEN);
+                    return 0;
+                }
+            }
+            // n may be a stale pointer after the predicate_add_* calls grew
+            // pred->node_count -- pred->nodes[] itself never moves (fixed
+            // array), so re-deref by index rather than trust the pointer.
+            pred->nodes[i] = pred->nodes[acc];
+        } else {
+            // Scalar comparison.
+            if (rcount > 1) {
+                out->error = SQL_ERR_VALUE_INVALID;
+                se_strcpy(out->error_msg, "subquery returned more than one row for a scalar comparison", SQL_ERR_MSG_LEN);
+                return 0;
+            }
+            if (rcount == 0) {
+                // Comparing against an empty scalar subquery result is
+                // UNKNOWN in standard SQL, which WHERE treats as false --
+                // the same simplification this codebase's NULL handling
+                // already makes elsewhere (predicate.h Phase 4).
+                pred->nodes[i].op = PRED_OP_FALSE;
+                pred->nodes[i].uses_subquery = 0;
+            } else {
+                se_strcpy(pred->nodes[i].literal, g_subquery_result_text[0], RECORD_VAL_LEN);
+                pred->nodes[i].uses_subquery = 0;
+            }
+        }
+    }
+    return 1;
+}
+
 // See exec_select's own comment above on why this is static scratch, not a
 // stack-local: struct SqlStatement embeds a struct Predicate (32 nodes x a
 // 256-byte literal each), several KB on its own -- too large to put on a
@@ -1452,6 +1666,21 @@ static void dispatch_stmt(uint64_t txn_id, uint32_t caller_uid, struct SqlStatem
         se_strcpy(out->error_msg, "transaction is not active", SQL_ERR_MSG_LEN);
         return;
     }
+    // Phase 7 (SQL Feature-Parity Roadmap): resolve any embedded subqueries
+    // in a PLAIN (non-JOIN, non-aggregate) SELECT/UPDATE/DELETE's WHERE
+    // clause before that statement's own row scan runs -- see predicate.h's
+    // Phase 7 note and resolve_predicate_subqueries()'s own comment above
+    // for why exec_select_join()/exec_select_group()/HAVING are deliberately
+    // excluded here (an unresolved marker there fails closed instead).
+    if (stmt->kind == SQL_STMT_SELECT && stmt->u.select.has_where &&
+        !stmt->u.select.has_join && !stmt->u.select.has_aggregates) {
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.select.where, out)) return;
+    } else if (stmt->kind == SQL_STMT_UPDATE && stmt->u.update.has_where) {
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.update.where, out)) return;
+    } else if (stmt->kind == SQL_STMT_DELETE && stmt->u.del.has_where) {
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.del.where, out)) return;
+    }
+
     switch (stmt->kind) {
         case SQL_STMT_SELECT: exec_select(txn_id, caller_uid, &stmt->u.select, out); break;
         case SQL_STMT_INSERT: exec_insert(txn_id, caller_uid, &stmt->u.insert, out); break;

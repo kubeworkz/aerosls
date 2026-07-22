@@ -61,6 +61,15 @@ typedef enum {
 struct SqlToken {
     SqlTokenKind kind;
     char text[RECORD_VAL_LEN];
+    // Phase 7 (SQL Feature-Parity Roadmap): the offset into the lexer's
+    // src[] where this token's own raw text begins (after any leading
+    // whitespace, before any subsequent one) -- set uniformly for every
+    // token kind in lex_next() below. Lets a caller capture an exact raw
+    // source substring between two tokens (used to extract an embedded
+    // subquery's original SQL text, since a subquery is re-parsed and
+    // executed from text at exec time rather than carried as a parsed
+    // struct -- see predicate.h's Phase 7 note on why).
+    uint32_t src_start;
 };
 
 struct SqlLexer {
@@ -109,6 +118,10 @@ static struct SqlToken lex_next(struct SqlLexer* lx) {
         if (ws == ' ' || ws == '\t' || ws == '\n' || ws == '\r') { lx->pos++; continue; }
         break;
     }
+    // Phase 7 (SQL Feature-Parity Roadmap): recorded AFTER the whitespace
+    // skip above, for every token kind including TOK_EOF -- see SqlToken's
+    // own field comment.
+    t.src_start = lx->pos;
     if (lx->pos >= lx->len) { t.kind = TOK_EOF; return t; }
 
     char c = lx->src[lx->pos];
@@ -494,12 +507,119 @@ static int parse_arith_op_token(struct SqlParser* p, PredArithOp* out) {
     return 1;
 }
 
+// Phase 7 (SQL Feature-Parity Roadmap): parse_select_body is defined much
+// later in this file (it's the full SELECT grammar), but parse_comparison_tail
+// below -- defined here, well before it -- needs to invoke a full nested
+// SELECT parse (via sql_parse(), declared in sql_parser.h) to validate an
+// embedded subquery's shape. sql_parse() itself is already visible via the
+// header; this forward declaration is only needed because the *validation*
+// path below reads SqlSelectStmt fields by first constructing a full
+// SqlStatement via sql_parse(), which doesn't require parse_select_body's
+// own declaration at all -- kept here anyway as a forward reference for
+// clarity/symmetry with parse_insert_value's forward declaration above.
+static void parse_select_body(struct SqlParser* p, struct SqlSelectStmt* s);
+
+// Phase 7 (SQL Feature-Parity Roadmap): dedicated PARSE-TIME-ONLY scratch
+// for validating an embedded subquery's shape (via a throwaway sql_parse()
+// call) -- deliberately separate from BOTH g_stmt_scratch (sql_parser.c has
+// no such global; that's sql_exec.c's) and the Phase 7 runtime resolution
+// scratch that sql_exec.c will add for actually *executing* a subquery at
+// exec time. This one only ever lives for the duration of one
+// try_parse_embedded_subquery() call. Static (not a ~34KB stack local)
+// because kernel code paths keep stack frames small by convention.
+static struct SqlStatement g_subquery_skip_scratch;
+
+// Guards against a subquery containing ANOTHER embedded subquery: the
+// validation parse below (sql_parse() on the captured raw text) reuses this
+// same file's parse_comparison_tail() / try_parse_embedded_subquery()
+// machinery, which would otherwise recurse into a SECOND sql_parse() call
+// still targeting the SAME static g_subquery_skip_scratch -- clobbering the
+// outer validation's in-progress result. Scope is deliberately "one level of
+// subquery only" (see predicate.h's Phase 7 note), so a nested attempt is
+// rejected as a parse error instead of being recursively validated.
+static int g_subquery_validating = 0;
+
+// Attempts to parse an embedded, parenthesized SELECT starting at the
+// CURRENT '(' token (not yet consumed). Three outcomes:
+//   1 -- p->cur was '(' immediately followed by SELECT; the subquery text
+//        was captured, validated (must be a plain, non-JOIN, non-aggregate,
+//        single-column SELECT), and registered via predicate_add_subquery();
+//        *out_subq_idx is set and the parser is positioned just past the
+//        closing ')'.
+//   0 -- p->cur was NOT '(' followed by SELECT; parser state is rewound to
+//        exactly what it was on entry, so the caller can fall through to its
+//        normal (non-subquery) parsing path with no side effects.
+//  -1 -- p->cur WAS '(' SELECT, but the subquery is malformed or unsupported
+//        in shape; set_error() has already been called.
+static int try_parse_embedded_subquery(struct SqlParser* p, struct Predicate* pred, uint32_t* out_subq_idx) {
+    if (p->cur.kind != TOK_LPAREN) return 0;
+    struct SqlLexer save_lx = p->lx;
+    struct SqlToken save_cur = p->cur;
+    advance(p);   // consume '('
+    if (p->cur.kind != TOK_KW_SELECT) {
+        p->lx  = save_lx;
+        p->cur = save_cur;
+        return 0;
+    }
+
+    // Token-level paren-depth-aware skip from SELECT to its matching ')',
+    // capturing the raw source span [start, end) -- everything between the
+    // two parens, i.e. the subquery's own SQL text with no wrapping parens.
+    uint32_t start = p->cur.src_start;
+    uint32_t depth = 1;
+    for (;;) {
+        if (p->cur.kind == TOK_EOF) { set_error(p, "unterminated subquery: missing ')'"); return -1; }
+        if (p->cur.kind == TOK_LPAREN) { depth++; advance(p); continue; }
+        if (p->cur.kind == TOK_RPAREN) {
+            depth--;
+            if (depth == 0) break;   // this ')' is the subquery's own closer
+            advance(p);
+            continue;
+        }
+        advance(p);
+    }
+    uint32_t end = p->cur.src_start;   // src_start of the matching ')'
+
+    char raw[PREDICATE_SUBQUERY_TEXT_LEN];
+    if (end < start || (end - start) >= PREDICATE_SUBQUERY_TEXT_LEN) {
+        set_error(p, "subquery too long");
+        return -1;
+    }
+    uint32_t n = end - start;
+    for (uint32_t i = 0; i < n; i++) raw[i] = p->lx.src[start + i];
+    raw[n] = '\0';
+
+    if (!expect(p, TOK_RPAREN, "expected ')' after subquery")) return -1;
+
+    if (g_subquery_validating) {
+        set_error(p, "nested subqueries are not supported");
+        return -1;
+    }
+    g_subquery_validating = 1;
+    char verr[SQL_ERR_MSG_LEN];
+    int perr = sql_parse(raw, &g_subquery_skip_scratch, verr, SQL_ERR_MSG_LEN);
+    g_subquery_validating = 0;
+
+    if (perr) { set_error(p, "invalid subquery: unable to parse"); return -1; }
+    if (g_subquery_skip_scratch.kind != SQL_STMT_SELECT) { set_error(p, "subquery must be a SELECT"); return -1; }
+    struct SqlSelectStmt* sq = &g_subquery_skip_scratch.u.select;
+    if (sq->has_join)       { set_error(p, "subquery with JOIN is not supported"); return -1; }
+    if (sq->has_aggregates) { set_error(p, "subquery with an aggregate is not supported"); return -1; }
+    if (sq->select_all || sq->column_count != 1) { set_error(p, "subquery must select exactly one column"); return -1; }
+
+    uint32_t idx = predicate_add_subquery(pred, raw);
+    if (idx == PREDICATE_INVALID_NODE) { set_error(p, "too many subqueries in one statement"); return -1; }
+    *out_subq_idx = idx;
+    return 1;
+}
+
 // comparison's shared tail, given an already-parsed plain (non-arithmetic)
 // left-hand side string `col` -- either a bare column_ref (WHERE) or a
 // rendered select_item label (HAVING, see the allow_agg note below). Phase
 // 1's plain-comparison shape; Phase 3 (SQL Feature-Parity Roadmap) adds IN
 // and LIKE here, since both apply equally to a WHERE column_ref or a
-// HAVING select_item label with no special-casing needed.
+// HAVING select_item label with no special-casing needed. Phase 7 adds
+// scalar/IN subqueries, both routed through try_parse_embedded_subquery().
 static uint32_t parse_comparison_tail(struct SqlParser* p, struct Predicate* pred, const char* col) {
     // Phase 4 (SQL Feature-Parity Roadmap): IS [NOT] NULL. No literal to
     // parse -- predicate_add_comparison()'s literal param is simply unused
@@ -515,6 +635,19 @@ static uint32_t parse_comparison_tail(struct SqlParser* p, struct Predicate* pre
     }
     if (p->cur.kind == TOK_KW_IN) {
         advance(p);
+        // Phase 7 (SQL Feature-Parity Roadmap): IN (SELECT ...) -- tried
+        // first, since p->cur is the still-unconsumed '(' that both this and
+        // the literal-list path below share. A non-subquery '(' rewinds
+        // cleanly and falls through to the pre-Phase-7 literal-list parse.
+        uint32_t subq_idx;
+        int sr = try_parse_embedded_subquery(p, pred, &subq_idx);
+        if (sr < 0) return PREDICATE_INVALID_NODE;
+        if (sr > 0) {
+            uint32_t node = predicate_add_comparison(pred, col, PRED_OP_IN_SUBQUERY, "");
+            if (node == PREDICATE_INVALID_NODE) { set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)"); return PREDICATE_INVALID_NODE; }
+            predicate_mark_subquery(pred, node, subq_idx);
+            return node;
+        }
         if (!expect(p, TOK_LPAREN, "expected '(' after IN")) return PREDICATE_INVALID_NODE;
         // IN (a, b, c) desugars to (col = a) OR (col = b) OR (col = c) at
         // parse time -- see predicate.h's Phase 3 note for why this needed
@@ -543,6 +676,18 @@ static uint32_t parse_comparison_tail(struct SqlParser* p, struct Predicate* pre
     }
     PredicateCompareOp op;
     if (!parse_compare_op(p, &op)) return PREDICATE_INVALID_NODE;
+    // Phase 7 (SQL Feature-Parity Roadmap): scalar subquery RHS ("= (SELECT
+    // ...)"), tried before parse_literal() since a bare '(' is otherwise
+    // always a literal-parse error (parse_literal() never accepts parens).
+    uint32_t subq_idx;
+    int sr = try_parse_embedded_subquery(p, pred, &subq_idx);
+    if (sr < 0) return PREDICATE_INVALID_NODE;
+    if (sr > 0) {
+        uint32_t node = predicate_add_comparison(pred, col, op, "");
+        if (node == PREDICATE_INVALID_NODE) { set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)"); return PREDICATE_INVALID_NODE; }
+        predicate_mark_subquery(pred, node, subq_idx);
+        return node;
+    }
     char lit[RECORD_VAL_LEN];
     if (!parse_literal(p, lit, RECORD_VAL_LEN)) return PREDICATE_INVALID_NODE;
     uint32_t node = predicate_add_comparison(pred, col, op, lit);
@@ -668,7 +813,14 @@ static void finish_statement(struct SqlParser* p) {
     if (p->cur.kind != TOK_EOF) set_error(p, "unexpected trailing tokens after statement");
 }
 
-static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
+// Phase 7 (SQL Feature-Parity Roadmap): the actual SELECT grammar, split out
+// from parse_select() below so a subquery (embedded inside a WHERE/HAVING
+// comparison, parsed by parse_comparison_tail()) can reuse it directly --
+// unlike a top-level statement, a subquery is followed by ')' and possibly
+// more of the OUTER statement, never EOF/';', so it must NOT call
+// finish_statement() itself (parse_select() below still does, for the
+// top-level case).
+static void parse_select_body(struct SqlParser* p, struct SqlSelectStmt* s) {
     sq_memset(s, 0, sizeof(*s));
     advance(p);   // consume SELECT
 
@@ -813,7 +965,10 @@ static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
         s->has_limit = 1;
         advance(p);
     }
+}
 
+static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
+    parse_select_body(p, s);
     finish_statement(p);
 }
 
@@ -838,6 +993,10 @@ static void parse_insert(struct SqlParser* p, struct SqlInsertStmt* s) {
     if (!expect(p, TOK_RPAREN, "expected ')' after column list")) return;
 
     if (!expect(p, TOK_KW_VALUES, "expected VALUES")) return;
+
+    // Phase 6 (SQL Feature-Parity Roadmap): row 0's tuple parses into the
+    // original values[]/is_null[] fields, byte-compatible with every
+    // pre-Phase-6 caller -- see sql_parser.h's Phase 6 note.
     if (!expect(p, TOK_LPAREN, "expected '(' after VALUES")) return;
     uint32_t vcount = 0;
     for (;;) {
@@ -852,9 +1011,38 @@ static void parse_insert(struct SqlParser* p, struct SqlInsertStmt* s) {
         advance(p);
     }
     if (!expect(p, TOK_RPAREN, "expected ')' after value list")) return;
-
     if (vcount != ccount) { set_error(p, "column count doesn't match value count"); return; }
     s->count = ccount;
+
+    // Phase 6 (SQL Feature-Parity Roadmap): any further ", (...)" tuples are
+    // additional rows (multi-row INSERT), each independently checked against
+    // the SAME column count (ccount) and stored in extra_values[]/
+    // extra_is_null[], bounded by SQL_INSERT_MAX_EXTRA_ROWS.
+    s->extra_row_count = 0;
+    while (p->cur.kind == TOK_COMMA) {
+        advance(p);   // consume ','
+        if (!expect(p, TOK_LPAREN, "expected '(' to start the next VALUES tuple")) return;
+        if (s->extra_row_count >= SQL_INSERT_MAX_EXTRA_ROWS) {
+            set_error(p, "too many VALUES tuples in one INSERT");
+            return;
+        }
+        uint32_t r = s->extra_row_count;
+        uint32_t evcount = 0;
+        for (;;) {
+            char lit[RECORD_VAL_LEN];
+            uint8_t is_null;
+            if (!parse_insert_value(p, lit, RECORD_VAL_LEN, &is_null)) return;
+            if (evcount >= ROWSTORE_MAX_COLUMNS) { set_error(p, "too many values"); return; }
+            sq_strcpy(s->extra_values[r][evcount], lit, RECORD_VAL_LEN);
+            s->extra_is_null[r][evcount] = is_null;
+            evcount++;
+            if (p->cur.kind != TOK_COMMA) break;
+            advance(p);
+        }
+        if (!expect(p, TOK_RPAREN, "expected ')' after value list")) return;
+        if (evcount != ccount) { set_error(p, "column count doesn't match value count"); return; }
+        s->extra_row_count++;
+    }
 
     finish_statement(p);
 }

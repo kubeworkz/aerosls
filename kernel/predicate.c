@@ -63,6 +63,7 @@ static int pe_strcmp(const char* a, const char* b) {
 void predicate_init(struct Predicate* p) {
     p->node_count = 0;
     p->root = PREDICATE_INVALID_NODE;
+    p->subquery_count = 0;   // Phase 7 (SQL Feature-Parity Roadmap)
 }
 
 uint32_t predicate_add_comparison(struct Predicate* p, const char* column_name,
@@ -75,6 +76,8 @@ uint32_t predicate_add_comparison(struct Predicate* p, const char* column_name,
     pe_strcpy(n->literal, literal ? literal : "", RECORD_VAL_LEN);
     n->left = PREDICATE_INVALID_NODE;
     n->right = PREDICATE_INVALID_NODE;
+    n->uses_subquery = 0;   // Phase 7 (SQL Feature-Parity Roadmap): zero default, see predicate.h
+    n->subquery_index = 0;
     return p->node_count++;
 }
 
@@ -87,6 +90,8 @@ static uint32_t add_logical(struct Predicate* p, PredicateNodeKind kind, uint32_
     n->literal[0] = '\0';
     n->left = left;
     n->right = right;
+    n->uses_subquery = 0;
+    n->subquery_index = 0;
     return p->node_count++;
 }
 
@@ -112,7 +117,27 @@ uint32_t predicate_add_arith_comparison(struct Predicate* p, struct PredArithOpe
     n->arith_op2 = op2;
     n->left = PREDICATE_INVALID_NODE;
     n->right = PREDICATE_INVALID_NODE;
+    n->uses_subquery = 0;
+    n->subquery_index = 0;
     return p->node_count++;
+}
+
+// Phase 7 (SQL Feature-Parity Roadmap): see predicate.h.
+uint32_t predicate_add_subquery(struct Predicate* p, const char* raw_text) {
+    if (!p || !raw_text || p->subquery_count >= PREDICATE_MAX_SUBQUERIES) return PREDICATE_INVALID_NODE;
+    uint32_t len = 0;
+    while (raw_text[len]) len++;
+    if (len >= PREDICATE_SUBQUERY_TEXT_LEN) return PREDICATE_INVALID_NODE;
+    pe_strcpy(p->subqueries[p->subquery_count], raw_text, PREDICATE_SUBQUERY_TEXT_LEN);
+    return p->subquery_count++;
+}
+
+void predicate_mark_subquery(struct Predicate* p, uint32_t node_idx, uint32_t subq_idx) {
+    if (!p || node_idx >= p->node_count) return;
+    struct PredicateNode* n = &p->nodes[node_idx];
+    if (n->kind != PRED_NODE_COMPARISON) return;
+    n->uses_subquery = 1;
+    n->subquery_index = subq_idx;
 }
 
 // ─── Type-aware comparison ───────────────────────────────────────────────
@@ -238,6 +263,18 @@ int predicate_eval_arith(const struct RowTableLayout* layout, const struct RowVa
 
 static int eval_comparison(const struct PredicateNode* n, const struct RowTableLayout* layout,
                            const struct RowValues* row) {
+    // Phase 7 (SQL Feature-Parity Roadmap): a node whose value should have
+    // come from a subquery but was never resolved (sql_exec.c's
+    // resolve_predicate_subqueries() didn't run for this predicate -- e.g.
+    // a JOIN's WHERE or a HAVING clause, both a named scope cut -- see
+    // predicate.h's Phase 7 note) fails closed rather than comparing
+    // against an empty/garbage literal. PRED_OP_IN_SUBQUERY should never
+    // reach here unresolved either (the resolve step always desugars it
+    // into a real OR-chain or PRED_OP_FALSE), but is checked explicitly
+    // rather than relying only on uses_subquery/the switch's default case.
+    if (n->uses_subquery || n->op == PRED_OP_IN_SUBQUERY) return 0;
+    if (n->op == PRED_OP_FALSE) return 0;
+
     // Phase 4 (SQL Feature-Parity Roadmap): IS NULL / IS NOT NULL -- the
     // one place that deliberately wants to know the null_mask bit directly
     // rather than failing closed because of it.

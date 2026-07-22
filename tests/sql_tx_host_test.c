@@ -191,9 +191,13 @@ int main(void) {
 
     /* ── Scenario 2: an autocommit statement that ERRORS leaves no partial
      * effect (rolled back, not just reported as an error). ──────────────── */
-    CHECK(sql_execute(1, "INSERT INTO accounts (id, name) VALUES (2, 'incomplete')", &r) == 1 &&
+    // SQL Feature-Parity Roadmap Phase 6: INSERT omitting a column is no
+    // longer an error -- the omitted column is filled with a real NULL
+    // (partial-column INSERT). This check now exercises the opposite,
+    // still-real error: naming MORE columns than the table has.
+    CHECK(sql_execute(1, "INSERT INTO accounts (id, name, tag, bogus) VALUES (2, 'incomplete', 'x', 'y')", &r) == 1 &&
           r.error == SQL_ERR_COLUMN_COUNT_MISMATCH,
-          "s2: an invalid INSERT (missing a column) is rejected");
+          "s2: an invalid INSERT (too many columns) is rejected");
     CHECK(sql_execute(1, "SELECT name FROM accounts WHERE id = 2", &r) == 0 && r.row_count == 0,
           "s2: no partial row exists after the rejected INSERT -- confirms the failed autocommit txn rolled back cleanly");
 

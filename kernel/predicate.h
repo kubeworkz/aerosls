@@ -95,6 +95,64 @@
  * existing boolean WHERE evaluation, the same simplification this whole
  * roadmap has made consistently rather than introducing a third boolean
  * state throughout the evaluator for one phase's benefit.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 7: non-correlated subqueries ─────────
+ * Scalar subqueries (`WHERE dept_id = (SELECT id FROM departments WHERE
+ * name = 'Eng')`) and `IN (SELECT ...)`. This file stores the RAW SQL TEXT
+ * of each subquery a Predicate references (`subqueries[]` below), not a
+ * parsed/nested statement -- a parsed `struct SqlSelectStmt` is ~34KB
+ * (`sql_parser.h`), so storing text (a few hundred bytes) and re-parsing it
+ * once at resolve time matches this whole codebase's existing "text is the
+ * interchange format, re-parse when needed" convention (`sql_execute()`
+ * itself always re-parses from scratch on every call; there is no compiled-
+ * query cache anywhere in this project) far more cheaply than embedding a
+ * nested struct would. `PredicateNode` gained `uses_subquery`/
+ * `subquery_index` (not a new node kind -- `kind` stays `PRED_NODE_
+ * COMPARISON`, matching every prior phase's "reuse the leaf shape, add a
+ * flag/op" pattern): a scalar-subquery node keeps its real, already-parsed
+ * comparison `op` (EQ/NE/LT/...), just with `literal` unresolved until exec
+ * time; an `IN (SELECT ...)` node uses the new marker op `PRED_OP_IN_
+ * SUBQUERY` since (unlike a literal IN-list, which desugars into an OR-
+ * chain entirely at PARSE time) the subquery's row values aren't known
+ * until execution.
+ *
+ * This file (predicate.c/.h) does NOT execute subqueries itself -- doing so
+ * would require calling back into `sql_exec.c`'s `exec_select()`/`mvcc.c`,
+ * which predicate.c has never depended on (the dependency runs the other
+ * way: sql_exec.c depends on predicate.h), the same layering this project
+ * preserved when Phase 5's `mvcc_rebuild_versions_for_table()` fix was
+ * deliberately placed in sql_exec.c rather than rowstore.c. Instead,
+ * `sql_exec.c` gets a new resolve step (`resolve_predicate_subqueries()`)
+ * that runs BEFORE the outer statement's own row scan begins: it executes
+ * each referenced subquery exactly once via the ordinary `exec_select()`
+ * path, then rewrites the Predicate in place -- filling a scalar node's
+ * `literal` directly, or (for `PRED_OP_IN_SUBQUERY`) desugaring the result
+ * rows into the SAME `(col = a) OR (col = b) OR ...` shape a literal IN-
+ * list already builds, reusing `predicate_add_comparison()`/
+ * `predicate_add_or()` unchanged. By the time `predicate_eval()` ever runs
+ * for real row filtering, every node is an ordinary, already-resolved
+ * comparison -- this file's own evaluation code needed almost no changes
+ * (only a defensive fail-closed check for the case a node somehow reaches
+ * evaluation still unresolved, and the new `PRED_OP_FALSE`/`PRED_OP_
+ * IN_SUBQUERY` op handling below).
+ *
+ * **Explicitly out of scope, named rather than silently unsupported**:
+ * CORRELATED subqueries (a subquery referencing the OUTER row's own
+ * columns) are not detected or specially handled -- the subquery's WHERE
+ * resolves purely against ITS OWN table's layout, exactly like any other
+ * SELECT, so a query that LOOKS correlated either fails closed with
+ * `SQL_ERR_COLUMN_NOT_FOUND` (the outer column doesn't exist in the
+ * subquery's own table) or, if the subquery's table happens to have a
+ * same-named column, silently resolves against THAT column instead --
+ * genuinely different, real SQL semantics, not this feature's target.
+ * Subqueries are resolved only inside a PLAIN (non-JOIN, non-aggregate)
+ * SELECT/UPDATE/DELETE's WHERE clause (`sql_exec.c`'s `exec_select_join()`/
+ * `exec_select_group()` and any HAVING clause never call the resolve step)
+ * -- a subquery written there fails closed (evaluates false) rather than
+ * being silently ignored or crashing, since `uses_subquery` staying set
+ * unresolved is exactly the defensive case `predicate_eval()` now guards.
+ * `CREATE VIEW`, `WITH` CTEs, and `UNION`/`INTERSECT`/`EXCEPT` remain
+ * entirely unscoped, matching the roadmap doc's own Phase 7 framing.
  */
 #ifndef PREDICATE_H
 #define PREDICATE_H
@@ -116,6 +174,18 @@ typedef enum {
     PRED_OP_LIKE,   // Phase 3 (SQL Feature-Parity Roadmap): STRING columns only, '%'/'_' wildcards, no ESCAPE
     PRED_OP_IS_NULL,      // Phase 4 (SQL Feature-Parity Roadmap): column_name set, literal unused
     PRED_OP_IS_NOT_NULL,  // Phase 4 (SQL Feature-Parity Roadmap): column_name set, literal unused
+    // Phase 7 (SQL Feature-Parity Roadmap): transient marker for `col IN
+    // (SELECT ...)` -- always resolved away by sql_exec.c's
+    // resolve_predicate_subqueries() into a real OR-chain (or PRED_OP_FALSE
+    // for a zero-row result) before predicate_eval() runs for real; if it's
+    // ever evaluated unresolved (a real bug, or a scope-cut path like a
+    // JOIN's WHERE), it fails closed -- see eval_comparison().
+    PRED_OP_IN_SUBQUERY,
+    // Phase 7: an unconditionally-false comparison -- what an `IN (SELECT
+    // ...)` node becomes when the subquery returns zero rows (no value can
+    // ever equal "nothing"), matching standard SQL's own IN-with-empty-set
+    // semantics. column_name/literal unused.
+    PRED_OP_FALSE,
 } PredicateCompareOp;
 
 typedef enum {
@@ -171,6 +241,14 @@ struct PredicateNode {
     // meaningful when kind == PRED_NODE_AND / PRED_NODE_OR
     uint32_t left;
     uint32_t right;
+    // Phase 7 (SQL Feature-Parity Roadmap): meaningful when kind ==
+    // PRED_NODE_COMPARISON and this leaf's value comes from a subquery
+    // instead of a literal typed directly in the SQL text. uses_subquery==0
+    // (the zero default) keeps every pre-Phase-7 comparison node byte-for-
+    // byte identical. subquery_index indexes this node's owning
+    // Predicate.subqueries[] (below) -- see this header's own Phase 7 note.
+    uint8_t  uses_subquery;
+    uint32_t subquery_index;
 };
 
 // ─── A predicate: a small fixed pool of nodes plus a root index. An empty
@@ -178,10 +256,27 @@ struct PredicateNode {
 // leaves it in) evaluates to true for every row -- the standard "no WHERE
 // clause matches everything" SQL semantic, and the useful default for
 // predicate_table_scan() below. ───────────────────────────────────────────
+// Phase 7 (SQL Feature-Parity Roadmap): a real, small, named ceiling on how
+// many distinct subqueries one WHERE clause may reference -- non-correlated
+// scalar/IN subqueries are a modest ergonomic feature here, not a general
+// nested-query engine (see this header's own Phase 7 note above), and each
+// slot costs PREDICATE_SUBQUERY_TEXT_LEN bytes of raw text regardless of
+// whether it's used, so this stays deliberately small. Sized independently
+// of sql_parser.h's SQL_MAX_TEXT_LEN (predicate.h must not depend on
+// sql_parser.h -- that dependency already runs the other way) but intended
+// to comfortably fit any realistic single-table, no-join, no-aggregate
+// SELECT text.
+#define PREDICATE_MAX_SUBQUERIES     3
+#define PREDICATE_SUBQUERY_TEXT_LEN  256
+
 struct Predicate {
     struct PredicateNode nodes[PREDICATE_MAX_NODES];
     uint32_t             node_count;
     uint32_t             root;
+    // Phase 7: raw SQL text of each subquery this predicate's nodes
+    // reference by subquery_index -- see this header's own Phase 7 note.
+    char     subqueries[PREDICATE_MAX_SUBQUERIES][PREDICATE_SUBQUERY_TEXT_LEN];
+    uint32_t subquery_count;
 };
 
 void predicate_init(struct Predicate* p);
@@ -197,6 +292,20 @@ uint32_t predicate_add_comparison(struct Predicate* p, const char* column_name,
 // index is out of range.
 uint32_t predicate_add_and(struct Predicate* p, uint32_t left, uint32_t right);
 uint32_t predicate_add_or(struct Predicate* p, uint32_t left, uint32_t right);
+
+// Phase 7 (SQL Feature-Parity Roadmap): appends raw subquery text to p's
+// subqueries[] pool; returns its index, or PREDICATE_INVALID_NODE if
+// PREDICATE_MAX_SUBQUERIES is exhausted or text is too long for
+// PREDICATE_SUBQUERY_TEXT_LEN. Called by the parser once per embedded
+// subquery it encounters.
+uint32_t predicate_add_subquery(struct Predicate* p, const char* raw_text);
+
+// Phase 7: marks an already-added PRED_NODE_COMPARISON leaf (node_idx, as
+// returned by predicate_add_comparison()) as needing subquery resolution --
+// sets uses_subquery=1/subquery_index=subq_idx on that node. Does nothing
+// (silently) if node_idx is out of range or not a comparison leaf, since
+// every call site already controls exactly which node it just added.
+void predicate_mark_subquery(struct Predicate* p, uint32_t node_idx, uint32_t subq_idx);
 
 // Phase 3 (SQL Feature-Parity Roadmap): appends an arithmetic-comparison
 // leaf (`op1 [arith_op op2] cmp_op literal`) -- see the header comment
