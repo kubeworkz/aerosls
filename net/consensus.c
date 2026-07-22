@@ -2,7 +2,7 @@
 #include "dspp.h"
 
 #include "e1000.h"
-#include "kernel_io.h"
+#include "../kernel/kernel_io.h"
 
 extern void update_page_table_permissions_globally(uint32_t force_read_only);
 
