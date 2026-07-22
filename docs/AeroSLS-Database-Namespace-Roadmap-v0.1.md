@@ -520,20 +520,87 @@ sweep after all fixes: **40/40 host test files passed, 0 failed** (up
 from 39 — the new Phase 3 file itself, plus the two additionally
 link-fixed files, all present and passing).
 
-### Phase 4 — Syscalls + HTTP + Terminal reachability
+### Phase 4 — Syscalls + HTTP + Terminal reachability — DONE
 
-**Scope:** new syscalls for create/drop/list/grant-uid/grant-group
-(next free numbers to be reconfirmed via a fresh grep at implementation
-time — 260+ as of this doc's own writing, immediately following this
-session's `SYS_SLS_VEC_DATA_IMPORT = 259`). HTTP routes mirroring the
-`group`/`authlist` JSON route shapes already established
-(`net/http.c`). Terminal commands per §1.5's exact list, plus `print_help()`
-entries under a new "Database Namespace & Access" heading.
+**Scope as built:** six syscalls, not five — `SYS_SLS_DATABASE_CREATE`
+(260) / `_DROP` (261) / `_LIST` (262) / `_GRANT_UID` (263) /
+`_GRANT_GROUP` (264) / `_CHECK` (265), reconfirmed via a fresh grep across
+every `kernel/*.h` `SYS_SLS_*` define at implementation time (259, `SYS_
+SLS_VEC_DATA_IMPORT`, was still the genuine max — the doc's own earlier
+guess held). The 6th number closes a real discrepancy this doc's own §1.5
+left open: `database.h`'s own Phase 3 header comment on `database_check_
+access()` had already promised a `database check` Terminal command "same
+as `SYS_SLS_AUTHLIST_CHECK`", but §1.5's own 5-item sketch never listed
+one. Rather than silently picking a side, this phase closes the loop by
+adding it — `authlist` has both the syscall and the Terminal command, so
+the precedent clearly supports it, and the C function
+(`database_check_access()`) already existed with nothing left to build
+beyond the syscall/Terminal wrapper. Request structs and `sys_sls_
+database_*()` wrappers live in `database.h`/`database.c` (not a separate
+file), matching `group_profile.h`/`authlist.h`'s own "syscall numbers next
+to the structs, in the subsystem header" convention. All five
+create/drop/grant-uid/grant-group/check wrappers collapse their internal
+function's richer return code to a plain 0/1 (`_LIST` returns void, prints
+via `database_list()` directly) — the same coarsening every existing
+`SYS_SLS_GROUP_*`/`SYS_SLS_AUTHLIST_*` wrapper already does, not a new
+convention. `sys_sls_database_check()` resolves its request's `db_name` to
+a `database_id` via `database_find_id()` itself (0/unknown resolves
+cleanly to "not granted", matching `database_check_access()`'s own
+already-tested 0-database_id behavior, not a separate error path).
 
-**Verification:** full regression sweep (`bash tests/run_all.sh`),
-confirming every syscall number is genuinely unused and every new host
-test file passes alongside all pre-existing ones — the same bar every
-phase this session has already met.
+Dispatch wiring: six new `case` labels in `kernel/syscall_dispatch.c`,
+immediately after `SYS_SLS_VEC_DATA_IMPORT`'s own case, mirroring the
+existing `SYS_SLS_GROUP_*`/`SYS_SLS_AUTHLIST_*` block's exact shape
+(a plain cast-and-call for five of them, a direct `database_list(); return
+0;` for the list case, matching `SYS_SLS_GROUP_LIST`'s own pattern).
+
+HTTP: investigation before implementation turned up that `group`/
+`authlist` do NOT actually have dedicated JSON POST routes for their own
+create/grant/check operations today — only a read-only `GET /api/security/
+groups` and `GET /api/security/authlists`, both added in the Navigator-
+Parity Gap Roadmap. Mutating group/authlist operations are reachable only
+through the generic `/api/shell/exec` text passthrough; a separate,
+already-named "Shell-Command JSON-Promotion Roadmap" promoted *other*
+command families (grant/revoke, chmod, partitions, webapp, workflow,
+journal, tier, object) to dedicated JSON routes, but never group/authlist.
+So "HTTP routes mirroring the group/authlist JSON route shapes already
+established" is honored precisely as scoped: one new read-only route,
+`GET /api/security/databases` (`api_security_databases_json()`,
+`net/http.c`), listing every active database's name/`database_id`/
+`owner_uid` plus (if a grant entry exists for that `database_id`) its
+grantee-uid-count/grantee-group-count/`perm_mask` summary — mirroring
+`api_security_groups_json()`/`api_security_authlists_json()`'s exact
+shape. `database create`/`drop`/`grant uid`/`grant group`/`check` remain
+`/api/shell/exec`-only, at full parity with `group`/`authlist` today, not
+a gap introduced by this phase. Dedicated POST routes for these would be
+*going beyond* current group/authlist parity, not mirroring it — noted
+here rather than built speculatively.
+
+Terminal: `database create <name>` / `drop <name>` / `list` / `grant uid
+<name> <uid> <perm>` / `grant group <name> <group> <perm>` / `check <name>
+<uid> <perm>` added to `user/shell.c`'s command dispatcher, in the exact
+`sh_starts()`/`sh_eq()` prefix-match style every existing command uses,
+immediately after the `authlist list` block. `create`/`drop` thread
+`current_session_uid` as `caller_uid` (the same uid source every other
+uid-taking command in this file already uses — confirmed by grep before
+writing this, not `sess->uid` directly, which only the top of the
+dispatcher itself touches). A new "`-- Database Namespace & Access (Phase
+4) --`" heading with all six command lines was added to `print_help()`,
+positioned after the "Authorization Lists" heading and before "Security
+Audit Log", matching every other heading's banner style.
+
+**Verification:** `bash tests/run_all.sh` full regression sweep — 40/40
+host test files still pass unchanged (none of them link `syscall_
+dispatch.c`/`net/http.c`/`user/shell.c`, so this phase's changes create no
+new ripple into the host-test suite at all). Each of the five touched/new
+files (`kernel/database.h`, `kernel/database.c`, `kernel/syscall_
+dispatch.c`, `net/http.c`, `user/shell.c`) was individually compile-
+checked with `gcc -fsyntax-only` (the established substitute for a full
+`x86_64-elf-gcc` cross-build, which isn't available in this environment) —
+no new errors, only pre-existing style warnings already present before
+this phase's edits (missing-include implicit-declaration warnings that
+predate this work, confirmed by checking they reference lines this phase
+never touched).
 
 ### Phase 5 — Frontend (deferred until Phase 1-4 are live, per this
 session's own established "backend first" posture)

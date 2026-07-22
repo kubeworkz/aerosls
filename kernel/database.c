@@ -262,3 +262,38 @@ int database_check_access(uint32_t uid, uint32_t database_id, uint32_t needed_pe
     }
     return 0;
 }
+
+// ─── Syscall wrappers (Phase 4) ─────────────────────────────────────────
+// Same "null-check req, forward fields, collapse to 0/1" shape as
+// sys_sls_group_create()/sys_sls_authlist_create() etc. (group_profile.c/
+// authlist.c) -- no new convention introduced here.
+uint64_t sys_sls_database_create(struct SLSDatabaseCreateRequest* req) {
+    if (!req) return 1;
+    return database_create(req->caller_uid, req->name) == 0 ? 0 : 1;
+}
+
+uint64_t sys_sls_database_drop(struct SLSDatabaseDropRequest* req) {
+    if (!req) return 1;
+    return database_drop(req->caller_uid, req->name) == 0 ? 0 : 1;
+}
+
+uint64_t sys_sls_database_grant_uid(struct SLSDatabaseGrantUidRequest* req) {
+    if (!req) return 1;
+    return database_grant_uid(req->db_name, req->uid, req->perm_mask) == 0 ? 0 : 1;
+}
+
+uint64_t sys_sls_database_grant_group(struct SLSDatabaseGrantGroupRequest* req) {
+    if (!req) return 1;
+    return database_grant_group(req->db_name, req->group_name, req->perm_mask) == 0 ? 0 : 1;
+}
+
+// Resolves db_name -> database_id via database_find_id() (0 if unknown --
+// database_check_access() already treats database_id 0 as "nothing to
+// check", so an unknown name cleanly reports "not granted" rather than a
+// separate error path, matching this request struct's own header comment
+// in database.h).
+uint64_t sys_sls_database_check(struct SLSDatabaseCheckRequest* req) {
+    if (!req) return 0;
+    uint32_t database_id = database_find_id(req->db_name);
+    return database_check_access(req->uid, database_id, req->needed_perm) ? 1 : 0;
+}

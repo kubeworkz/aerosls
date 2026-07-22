@@ -187,4 +187,73 @@ int database_grant_group(const char* db_name, const char* group_name, uint32_t p
 // SYS_SLS_AUTHLIST_CHECK does for authlist_check_access()).
 int database_check_access(uint32_t uid, uint32_t database_id, uint32_t needed_perm);
 
+// ─── Syscalls (Phase 4) ─────────────────────────────────────────────────────
+// 260-265, immediately following Phase 8 follow-on's SYS_SLS_VEC_DATA_IMPORT
+// = 259 (kernel/vecstore.h) -- confirmed via a fresh grep across every
+// kernel/*.h SYS_SLS_* define before picking these, matching this whole
+// codebase's own "reconfirm the next free number at implementation time,
+// don't trust an older doc's guess" convention.
+//
+// Six numbers, not five -- database_check_access()'s own header comment
+// above already promised a `database check` Terminal command "same as
+// SYS_SLS_AUTHLIST_CHECK does for authlist_check_access()", closing that
+// loop here rather than leaving the promise and the roadmap doc's own
+// original 5-item §1.5 sketch in silent disagreement (see this phase's
+// roadmap doc write-up for the explicit note).
+#define SYS_SLS_DATABASE_CREATE     260
+#define SYS_SLS_DATABASE_DROP       261
+#define SYS_SLS_DATABASE_LIST       262
+#define SYS_SLS_DATABASE_GRANT_UID  263
+#define SYS_SLS_DATABASE_GRANT_GROUP 264
+#define SYS_SLS_DATABASE_CHECK      265
+
+struct SLSDatabaseCreateRequest {
+    char     name[DATABASE_NAME_LEN];
+    uint32_t caller_uid;
+};
+
+struct SLSDatabaseDropRequest {
+    char     name[DATABASE_NAME_LEN];
+    uint32_t caller_uid;
+};
+
+struct SLSDatabaseGrantUidRequest {
+    char     db_name[DATABASE_NAME_LEN];
+    uint32_t uid;
+    uint32_t perm_mask;
+};
+
+struct SLSDatabaseGrantGroupRequest {
+    char     db_name[DATABASE_NAME_LEN];
+    char     group_name[GROUP_NAME_LEN];
+    uint32_t perm_mask;
+};
+
+// Takes a database NAME (not a raw database_id) -- an operator asking
+// "would uid X get perm Y on database Z" thinks in names, exactly like
+// SYS_SLS_AUTHLIST_CHECK's own object_name-based request. Resolves the
+// name to a database_id via database_find_id() inside sys_sls_database_
+// check() itself (0/not-found resolves to database_id 0, which database_
+// check_access() already treats as "nothing to check" -- so an unknown
+// name cleanly reports "not granted" rather than a separate error path).
+struct SLSDatabaseCheckRequest {
+    uint32_t uid;
+    char     db_name[DATABASE_NAME_LEN];
+    uint32_t needed_perm;
+};
+
+// Thin wrappers, same shape as sys_sls_group_create()/sys_sls_authlist_
+// create() etc. -- 0=success/granted, 1=failure, matching this codebase's
+// existing convention that a syscall's return doesn't need a richer error
+// code than the internal function it forwards to already provides (the
+// internal function's own richer rc, e.g. database_drop()'s 1/2/3, is
+// still available to any caller reaching these C functions directly; the
+// syscall boundary only ever needs a coarser 0/1 the way every other
+// SYS_SLS_* wrapper in this codebase already collapses to).
+uint64_t sys_sls_database_create(struct SLSDatabaseCreateRequest* req);
+uint64_t sys_sls_database_drop(struct SLSDatabaseDropRequest* req);
+uint64_t sys_sls_database_grant_uid(struct SLSDatabaseGrantUidRequest* req);
+uint64_t sys_sls_database_grant_group(struct SLSDatabaseGrantGroupRequest* req);
+uint64_t sys_sls_database_check(struct SLSDatabaseCheckRequest* req);
+
 #endif /* DATABASE_H */

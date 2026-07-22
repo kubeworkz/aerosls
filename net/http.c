@@ -37,6 +37,7 @@
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
+#include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- GET /api/security/databases
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
 #include "../kernel/secure_api.h"     // Shell-Command JSON-Promotion Roadmap -- struct SLSSealRequest
@@ -2110,6 +2111,43 @@ static int api_security_authlists_json(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/security/databases — Database Namespace & Access Roadmap
+// Phase 4 ──────────────────────────────────────────────────────────────────
+// Mirrors api_security_groups_json()/api_security_authlists_json()'s own
+// shape exactly: one object per active database, plus (if a grant entry
+// exists for that database_id) its grant summary -- database.h's own
+// struct SLSDatabaseGrant is one entry per database_id (Phase 3's own
+// design, see database.h), so at most one grant object per database here,
+// not an array of grants.
+static int api_security_databases_json(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "databases");
+    int first = 1;
+    for (int i = 0; i < DATABASE_MAX; i++) {
+        struct SLSDatabaseEntry* d = &databases[i];
+        if (!d->active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str(&j,  "name", d->name); jb_putc(&j, ',');
+        jb_uint(&j, "database_id", d->database_id); jb_putc(&j, ',');
+        jb_uint(&j, "owner_uid", d->owner_uid); jb_putc(&j, ',');
+
+        struct SLSDatabaseGrant* g = 0;
+        for (int k = 0; k < DATABASE_GRANT_MAX; k++) {
+            if (database_grants[k].active && database_grants[k].database_id == d->database_id) {
+                g = &database_grants[k]; break;
+            }
+        }
+        jb_uint(&j, "grantee_uid_count", g ? g->grantee_uid_count : 0); jb_putc(&j, ',');
+        jb_uint(&j, "grantee_group_count", g ? g->grantee_group_count : 0); jb_putc(&j, ',');
+        jb_uint(&j, "grant_perm_mask", g ? g->perm_mask : 0);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/workmgmt/msgqueues — Navigator-Parity Gap Roadmap Phase 4 ────────
 // Depth/contents-visible view of the fixed named-queue table (kernel/
 // msgqueue.h) -- the "make queues visible" gap the roadmap called out (the
@@ -3897,6 +3935,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/security/authlists")) {
             blen = api_security_authlists_json(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/security/databases")) {
+            blen = api_security_databases_json(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Navigator-Parity Gap Roadmap Phase 4: Work Management visibility ──

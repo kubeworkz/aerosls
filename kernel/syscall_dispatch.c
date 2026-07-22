@@ -23,6 +23,7 @@
 #include "security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- SYS_SLS_AUDIT_LIST
 #include "msgqueue.h"      // Navigator-Parity Gap Roadmap Phase 4 -- SYS_SLS_MQ_*
 #include "../net/net.h"    // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
+#include "database.h"      // Database Namespace & Access Roadmap Phase 4 -- SYS_SLS_DATABASE_*
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -398,6 +399,20 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_vec_data_export((struct SLSVecDataExportRequest*)arg);
     case SYS_SLS_VEC_DATA_IMPORT:
         return sys_sls_vec_data_import((struct SLSVecDataImportRequest*)arg);
+
+    // ─── Database Namespace & Access Roadmap Phase 4 (260-265) ──────────────
+    case SYS_SLS_DATABASE_CREATE:
+        return sys_sls_database_create((struct SLSDatabaseCreateRequest*)arg);
+    case SYS_SLS_DATABASE_DROP:
+        return sys_sls_database_drop((struct SLSDatabaseDropRequest*)arg);
+    case SYS_SLS_DATABASE_LIST:
+        database_list(); return 0;
+    case SYS_SLS_DATABASE_GRANT_UID:
+        return sys_sls_database_grant_uid((struct SLSDatabaseGrantUidRequest*)arg);
+    case SYS_SLS_DATABASE_GRANT_GROUP:
+        return sys_sls_database_grant_group((struct SLSDatabaseGrantGroupRequest*)arg);
+    case SYS_SLS_DATABASE_CHECK:
+        return sys_sls_database_check((struct SLSDatabaseCheckRequest*)arg);
 
     default:
         return 0;

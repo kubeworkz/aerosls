@@ -30,6 +30,7 @@
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- SYS_SLS_PARTITION_QUOTA_SET/QUOTA_LIST
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- group profiles
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
+#include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- database create/drop/list/grant/check
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
@@ -207,6 +208,13 @@ static void print_help(void) {
         "  authlist grant group <list> <group>       add group as a grantee\n"
         "  authlist check <uid> <object> <perm>      test if a list would grant this\n"
         "  authlist list                              list all authorization lists\n"
+        "  -- Database Namespace & Access (Phase 4) --\n"
+        "  database create <name>                      new database (permission/organizational tag)\n"
+        "  database drop <name>                        drop a database (refuses if a table is still tagged)\n"
+        "  database list                                list all databases\n"
+        "  database grant uid <name> <uid> <perm>      grant a uid access to a database's tables\n"
+        "  database grant group <name> <group> <perm>  grant a group access to a database's tables\n"
+        "  database check <name> <uid> <perm>          test if a database grant would grant this\n"
         "  -- Security Audit Log (Navigator-Parity Phase 3) --\n"
         "  audit list                        show the security audit trail\n"
         "  -- Web App Assets (Phase D) --\n"
@@ -745,6 +753,89 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // ── Navigator-Parity Gap Roadmap Phase 3: authlist list ────────────────
         else if (sh_eq(input_buffer, "authlist list")) {
             do_syscall(SYS_SLS_AUTHLIST_LIST, 0);
+        }
+
+        // ── Database Namespace & Access Roadmap Phase 4: database create <name> ─
+        else if (sh_starts(input_buffer, "database create ")) {
+            const char* p = input_buffer + 17;
+            struct SLSDatabaseCreateRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ' && p[nlen] != '\0') nlen++;
+            sh_copy(req.name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            req.caller_uid = current_session_uid;
+            uint64_t status = do_syscall(SYS_SLS_DATABASE_CREATE, &req);
+            if (status == 0) kernel_serial_printf("Database '%s' created.\n", req.name);
+            else kernel_serial_print("Database creation failed (bad/duplicate name or table full).\n");
+        }
+
+        // ── Database Namespace & Access Roadmap Phase 4: database drop <name> ──
+        else if (sh_starts(input_buffer, "database drop ")) {
+            const char* p = input_buffer + 15;
+            struct SLSDatabaseDropRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ' && p[nlen] != '\0') nlen++;
+            sh_copy(req.name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            req.caller_uid = current_session_uid;
+            uint64_t status = do_syscall(SYS_SLS_DATABASE_DROP, &req);
+            if (status == 0) kernel_serial_printf("Database '%s' dropped.\n", req.name);
+            else kernel_serial_print(
+                "Database drop failed (not found, permission denied, or a table is still tagged with it).\n");
+        }
+
+        // ── Database Namespace & Access Roadmap Phase 4: database list ─────────
+        else if (sh_eq(input_buffer, "database list")) {
+            do_syscall(SYS_SLS_DATABASE_LIST, 0);
+        }
+
+        // ── Database Namespace & Access Roadmap Phase 4: database grant uid/group ─
+        else if (sh_starts(input_buffer, "database grant uid ")) {
+            const char* p = input_buffer + 20;
+            struct SLSDatabaseGrantUidRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.db_name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            p = sh_next(p);
+            req.uid = sh_atoi(p);
+            p = sh_next(p);
+            req.perm_mask = parse_perm_string(p);
+            uint64_t status = do_syscall(SYS_SLS_DATABASE_GRANT_UID, &req);
+            if (status == 0) kernel_serial_printf("Database '%s' now grants 0x%02x to uid %u.\n",
+                                                  req.db_name, req.perm_mask, req.uid);
+            else kernel_serial_print("Grant failed (database not found or grantee table full).\n");
+        }
+        else if (sh_starts(input_buffer, "database grant group ")) {
+            const char* p = input_buffer + 22;
+            struct SLSDatabaseGrantGroupRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.db_name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            p = sh_next(p);
+            size_t glen = 0;
+            while (p[glen] && p[glen] != ' ' && p[glen] != '\0') glen++;
+            sh_copy(req.group_name, p, glen + 1 < GROUP_NAME_LEN ? glen + 1 : GROUP_NAME_LEN);
+            p = sh_next(p);
+            req.perm_mask = parse_perm_string(p);
+            uint64_t status = do_syscall(SYS_SLS_DATABASE_GRANT_GROUP, &req);
+            if (status == 0) kernel_serial_printf("Database '%s' now grants 0x%02x to group '%s'.\n",
+                                                  req.db_name, req.perm_mask, req.group_name);
+            else kernel_serial_print("Grant failed (database not found or grantee table full).\n");
+        }
+
+        // ── Database Namespace & Access Roadmap Phase 4: database check <name> <uid> <perm> ─
+        else if (sh_starts(input_buffer, "database check ")) {
+            const char* p = input_buffer + 16;
+            struct SLSDatabaseCheckRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.db_name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            p = sh_next(p);
+            req.uid = sh_atoi(p);
+            p = sh_next(p);
+            req.needed_perm = parse_perm_string(p);
+            uint64_t granted = do_syscall(SYS_SLS_DATABASE_CHECK, &req);
+            kernel_serial_printf("database check: db='%s' uid=%u perm=0x%02x -> %s\n",
+                                 req.db_name, req.uid, req.needed_perm,
+                                 granted ? "GRANTED" : "no matching grant");
         }
 
         // ── Navigator-Parity Gap Roadmap Phase 3: audit list ───────────────────
