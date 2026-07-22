@@ -3,6 +3,25 @@
 
 #include <stdint.h>
 
+/* Forward declaration only (not a full `#include "dspp.h"`): dspp.h has no
+ * include guard of its own, so pulling it in here would double-define
+ * every struct in it for any .c file that -- like consensus.c itself --
+ * already includes both headers separately. A plain incomplete-type
+ * forward declaration composes safely regardless of include order, and
+ * MUST come before the first function prototype anywhere in this header
+ * that takes a `struct DSPPFullPagePacket*` parameter (Phase 4's new
+ * process_partition_consensus_packet() below, as well as Phase 1's
+ * original process_consensus_packet() further down) -- declaring a struct
+ * tag for the first time inside a function prototype's own parameter list,
+ * rather than at file scope like this, creates a SECOND, incompatible tag
+ * scoped only to that one parameter list, which then conflicts with the
+ * real one dspp.h defines once both headers are included together. This is
+ * a real bug Phase 1 hit and fixed once already (see its own findings
+ * addendum) -- moved to the very top of the file here so no future
+ * addition below can silently reintroduce it by being declared before
+ * this forward declaration used to appear. */
+struct DSPPFullPagePacket;
+
 enum NodeRole {
     ROLE_FOLLOWER,
     ROLE_CANDIDATE,
@@ -32,7 +51,158 @@ struct ConsensusMessage {
     uint32_t candidate_id;
     uint32_t last_log_index;
     uint32_t vote_granted; // 1 = Yes, 0 = No
+    uint32_t partition_id; /* Multi-Node Partition Scaling Roadmap Phase 4:
+                             * which partition this message's lease election
+                             * is about. Only meaningful for the three
+                             * DSPP_CMD_PARTITION_* opcodes below -- Phase 1's
+                             * original cluster-wide REQUEST_VOTE/VOTE_REPLY/
+                             * HEARTBEAT traffic never populates or reads this
+                             * field. This struct is always carried inside a
+                             * struct DSPPFullPagePacket's 4KB payload_4kb
+                             * buffer (never marshaled byte-for-byte across a
+                             * real wire boundary anywhere in this codebase
+                             * today -- cluster_init() is still never called
+                             * at boot, per Phase 1's own findings), so
+                             * growing it here is free: no existing deployed
+                             * node could be running an older layout to
+                             * misparse against. */
 } __attribute__((packed));
+
+/* Multi-Node Partition Scaling Roadmap Phase 4: partition-scoped write
+ * leases, layered ALONGSIDE Phase 1's cluster-wide election mechanism
+ * above, not replacing it. Cluster membership -- "which nodes exist," the
+ * roster, the majority quorum threshold -- stays exactly what Phase 1
+ * built: that's a real, node-level, cluster-wide question, independent of
+ * any one partition. What this phase adds on top is a separate question
+ * asked once per partition P: "which node currently holds the write lease
+ * for P" -- agreed via the same request-vote/heartbeat message SHAPE
+ * (struct ConsensusMessage, now carrying partition_id above) but under
+ * distinct opcodes and its own per-partition state, since collapsing the
+ * two into Phase 1's single term/role would mean one partition's lease
+ * churn forces an unrelated cluster-membership re-election -- not what "P's
+ * write lease moved to a different node" should imply. See the roadmap
+ * doc's own §7 for the full design writeup. */
+#define DSPP_CMD_PARTITION_REQUEST_VOTE 0x13
+#define DSPP_CMD_PARTITION_VOTE_REPLY   0x14
+#define DSPP_CMD_PARTITION_HEARTBEAT    0x15
+
+/* PARTITION_LEASE_MAX deliberately mirrors kernel/partition.h's
+ * PARTITION_MAX (16) as an independent constant rather than #include-ing
+ * that header here: net/ already has kernel/ headers included INTO it one
+ * layer up (kernel/partition.c includes ../net/consensus.h, established in
+ * Phase 2), and this project keeps that dependency strictly one-directional
+ * -- net/ headers do not reach back into kernel/ headers for shared
+ * constants, the same discipline CLUSTER_NODE_MAX above already follows as
+ * its own independent constant. */
+#define PARTITION_LEASE_MAX 16
+
+struct PartitionLease {
+    uint32_t      partition_id;
+    uint32_t      term;
+    uint32_t      voted_for;              /* node_id this node voted for in
+                                            * partition_id's CURRENT term */
+    enum NodeRole role;                   /* this node's role for THIS
+                                            * partition's lease -- unrelated
+                                            * to local_cluster_state.role,
+                                            * which is this node's role in
+                                            * the cluster-wide membership
+                                            * election Phase 1 built */
+    uint32_t      heartbeat_ticks_elapsed;
+    uint32_t      accumulated_votes;      /* Phase 4: per-partition vote
+                                            * count while CANDIDATE. Can't be
+                                            * a single `static` local the way
+                                            * Phase 1's process_consensus_
+                                            * packet() uses for its ONE
+                                            * cluster-wide election -- with
+                                            * PARTITION_LEASE_MAX partitions
+                                            * potentially campaigning
+                                            * concurrently at different
+                                            * terms, one shared counter would
+                                            * conflate votes meant for
+                                            * entirely different partitions'
+                                            * elections. */
+    uint8_t       active;
+};
+
+/* No validation against kernel/partition.c's partition_table[] -- this
+ * table accepts any partition_id value, the same "doesn't require the
+ * partition to actually exist yet" posture frame_pool.h's partition_set_
+ * frame_quota() already documents for the identical reason: a lease can
+ * usefully be pre-established before a partition is created, and requiring
+ * validation would mean net/consensus.c reaching back into kernel/
+ * partition.c -- the circular, wrong-direction dependency the comment above
+ * PARTITION_LEASE_MAX already explains this project avoids. */
+extern struct PartitionLease partition_lease_table[PARTITION_LEASE_MAX];
+
+/* Creates or resets partition_id's lease row: term=0, role=FOLLOWER,
+ * voted_for=0, heartbeat_ticks_elapsed=0, accumulated_votes=1 (self),
+ * active=1. Find-existing-row-or-create-new-row, the same table shape
+ * kernel/partition.c's partition_set_owner_node() already established for
+ * partition_owner_table[] in Phase 2. Returns 0 on success, 1 if the table
+ * is full and partition_id has no existing row to reset. */
+int partition_lease_init(uint32_t partition_id);
+
+/* This node's role for partition_id's lease. Returns ROLE_FOLLOWER if no
+ * lease row exists yet for partition_id -- the honest "never contested"
+ * default. Deliberately NOT "assume LEADER/writable by default" the way
+ * partition_is_local()'s 0==0 comparison one layer down in kernel/
+ * partition.c defaults to locally-owned: a partition that has never had a
+ * real election must never be treated as though this node already holds
+ * its write lease, or every node in an actual multi-node deployment would
+ * independently and simultaneously believe itself the writer for every
+ * unleased partition -- see partition_holds_write_lease() below, which is
+ * the function anything gating a real write should actually call. */
+enum NodeRole partition_lease_get_role(uint32_t partition_id);
+
+/* Returns 0 if no lease row exists yet for partition_id. */
+uint32_t partition_lease_get_term(uint32_t partition_id);
+
+/* 1 if this node's role for partition_id is ROLE_LEADER (this node may
+ * currently accept writes for partition_id), 0 otherwise -- FOLLOWER,
+ * CANDIDATE, or no lease row at all. This is the function Phase 6
+ * (migration) and any future write-path gating actually need; partition_
+ * lease_get_role() above is the lower-level accessor it's built on. */
+int partition_holds_write_lease(uint32_t partition_id);
+
+/* Per-partition analogue of check_consensus_heartbeat_tick(): if this node
+ * holds the LEADER role for partition_id, broadcasts a
+ * DSPP_CMD_PARTITION_HEARTBEAT carrying partition_id; otherwise tracks
+ * silence and calls partition_lease_trigger_election() after the same
+ * 150-tick threshold Phase 1's cluster-wide mechanism uses. No-ops if no
+ * lease row exists yet for partition_id (nothing to tick). */
+void partition_lease_heartbeat_tick(uint32_t partition_id);
+
+/* Ticks every currently-active row in partition_lease_table[] via
+ * partition_lease_heartbeat_tick() above. Mirrors check_consensus_
+ * heartbeat_tick()'s own "called every 10ms by the kernel timer interrupt
+ * handler" comment as the single entry point a future boot-time timer
+ * wiring phase would call -- same "not actually wired into the real timer
+ * yet" honesty caveat Phase 1's own heartbeat function carries (see its
+ * findings addendum). */
+void check_partition_lease_heartbeat_tick(void);
+
+/* Per-partition analogue of trigger_kernel_election_campaign(): moves
+ * partition_id's lease to CANDIDATE, increments its term, votes for self,
+ * strips write access to JUST partition_id's objects via update_page_
+ * table_permissions_for_partition(partition_id, 1) -- not every SLS object
+ * on the node, the all-or-nothing behavior this phase's whole point is to
+ * narrow -- and broadcasts a DSPP_CMD_PARTITION_REQUEST_VOTE carrying
+ * partition_id. Creates a fresh lease row first if partition_id has none
+ * yet (mirrors partition_lease_init()'s find-or-create posture). */
+void partition_lease_trigger_election(uint32_t partition_id);
+
+/* Per-partition analogue of process_consensus_packet(): reads partition_id
+ * out of the ConsensusMessage payload and routes DSPP_CMD_PARTITION_
+ * HEARTBEAT/REQUEST_VOTE/VOTE_REPLY to that specific partition's lease row,
+ * not the single global local_cluster_state Phase 1's mechanism uses.
+ * Creates a fresh lease row first if partition_id has none yet, the same
+ * as partition_lease_trigger_election() above (an incoming REQUEST_VOTE
+ * for a partition this node has never leased before must still be able to
+ * vote on it). Dispatches purely on packet->header.opcode -- callers are
+ * responsible for routing DSPP_CMD_PARTITION_* opcodes here and Phase 1's
+ * original three opcodes to process_consensus_packet() instead, the same
+ * way any future RX dispatcher would need to distinguish them. */
+void process_partition_consensus_packet(struct DSPPFullPagePacket* packet);
 
 /* Phase 1: local_cluster_state used to be a `static struct ClusterNode`
  * defined directly in this header, with a hardcoded initializer --
@@ -119,13 +289,8 @@ uint32_t cluster_active_node_count(void);
 void check_consensus_heartbeat_tick(void);
 void trigger_kernel_election_campaign(void);
 
-/* Forward declaration only (not a full `#include "dspp.h"`): dspp.h has
- * no include guard of its own, so pulling it in here would double-define
- * every struct in it for any .c file that -- like consensus.c itself --
- * already includes both headers separately. A plain incomplete-type
- * forward declaration is enough for a pointer parameter and composes
- * safely regardless of include order. */
-struct DSPPFullPagePacket;
+/* struct DSPPFullPagePacket's forward declaration lives at the very top of
+ * this file now -- see the comment there. */
 void process_consensus_packet(struct DSPPFullPagePacket* packet);
 
 #endif

@@ -5,6 +5,12 @@
 #include "../kernel/kernel_io.h"
 
 extern void update_page_table_permissions_globally(uint32_t force_read_only);
+/* Multi-Node Partition Scaling Roadmap Phase 4: partition-scoped sibling of
+ * the extern above -- see kernel/stubs.c for both. Deliberately a separate
+ * function, not update_page_table_permissions_globally(partition_id, ...),
+ * to avoid changing that extern's signature out from under Phase 1's
+ * still-real, still-tested global-strip call sites below. */
+extern void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t force_read_only);
 
 /* Phase 1 (Multi-Node Partition Scaling Roadmap): single, real definition
  * of the cluster state and roster -- see consensus.h's header comment for
@@ -186,6 +192,211 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet) {
                 update_page_table_permissions_globally(0);
                 kernel_serial_printf("[CONSENSUS] Quorum stable. Node %u elected LEADER for term %d.\n",
                                       (unsigned)local_cluster_state.node_id, local_cluster_state.current_term);
+            }
+        }
+    }
+}
+
+// ─── Multi-Node Partition Scaling Roadmap Phase 4: partition-scoped write
+// leases -- see consensus.h's own comment block for the full design
+// rationale on why this is a SEPARATE table/mechanism layered alongside
+// local_cluster_state/cluster_roster above, not a replacement for them. ──
+
+struct PartitionLease partition_lease_table[PARTITION_LEASE_MAX];
+
+static struct PartitionLease* find_lease_row(uint32_t partition_id) {
+    for (uint32_t i = 0; i < PARTITION_LEASE_MAX; i++) {
+        if (partition_lease_table[i].active && partition_lease_table[i].partition_id == partition_id)
+            return &partition_lease_table[i];
+    }
+    return 0;
+}
+
+int partition_lease_init(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    if (!row) {
+        for (uint32_t i = 0; i < PARTITION_LEASE_MAX; i++) {
+            if (!partition_lease_table[i].active) { row = &partition_lease_table[i]; break; }
+        }
+        if (!row) {
+            kernel_serial_printf(
+                "[CONSENSUS] ERROR: partition lease table full, cannot init partition %u.\n",
+                (unsigned)partition_id);
+            return 1;
+        }
+    }
+
+    row->partition_id            = partition_id;
+    row->term                    = 0;
+    row->voted_for                = 0;
+    row->role                    = ROLE_FOLLOWER;
+    row->heartbeat_ticks_elapsed = 0;
+    row->accumulated_votes       = 1;   /* self, matches trigger_election's own reset */
+    row->active                  = 1;
+
+    kernel_serial_printf("[CONSENSUS] partition %u lease initialised (FOLLOWER, term=0).\n",
+                          (unsigned)partition_id);
+    return 0;
+}
+
+enum NodeRole partition_lease_get_role(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    return row ? row->role : ROLE_FOLLOWER;
+}
+
+uint32_t partition_lease_get_term(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    return row ? row->term : 0;
+}
+
+int partition_holds_write_lease(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    return (row && row->role == ROLE_LEADER) ? 1 : 0;
+}
+
+void partition_lease_trigger_election(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    if (!row) {
+        if (partition_lease_init(partition_id) != 0) return;   /* table full -- nothing to campaign with */
+        row = find_lease_row(partition_id);
+    }
+
+    row->role              = ROLE_CANDIDATE;
+    row->term++;
+    row->voted_for          = local_cluster_state.node_id;   /* vote for self */
+    row->accumulated_votes = 1;                                /* fresh election, own vote counted */
+
+    // Split-brain mitigation, now scoped to JUST this partition's objects --
+    // not update_page_table_permissions_globally(1)'s all-or-nothing strip,
+    // the exact narrowing this whole phase exists to make real.
+    update_page_table_permissions_for_partition(partition_id, 1);
+
+    struct DSPPFullPagePacket vote_req;
+    vote_req.header.magic         = DSPP_MAGIC;
+    vote_req.header.opcode        = DSPP_CMD_PARTITION_REQUEST_VOTE;
+    vote_req.header.node_source_id = (uint16_t)local_cluster_state.node_id;
+    vote_req.header.transaction_id = row->term;
+
+    struct ConsensusMessage* msg = (struct ConsensusMessage*)vote_req.payload_4kb;
+    msg->term          = row->term;
+    msg->candidate_id  = local_cluster_state.node_id;
+    msg->partition_id  = partition_id;
+    msg->vote_granted  = 0;
+    msg->last_log_index = 0;
+
+    kernel_serial_printf(
+        "[CONSENSUS] partition %u: node %u campaigning for write lease, term %u.\n",
+        (unsigned)partition_id, (unsigned)local_cluster_state.node_id, (unsigned)row->term);
+    e1000_transmit_packet(&vote_req, sizeof(struct DSPPFullPagePacket));
+}
+
+void partition_lease_heartbeat_tick(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    if (!row) return;   /* no lease established for this partition yet -- nothing to tick */
+
+    if (row->role == ROLE_LEADER) {
+        // LEADER for this partition: broadcast a periodic heartbeat
+        // carrying partition_id -- unlike Phase 1's cluster-wide HEARTBEAT
+        // (a bare struct DSPPPacketHeader), this needs the full 4KB packet
+        // since only the ConsensusMessage payload has room for partition_id;
+        // DSPPPacketHeader itself has no such field (that's Phase 5's job).
+        struct DSPPFullPagePacket hb_packet;
+        hb_packet.header.magic         = DSPP_MAGIC;
+        hb_packet.header.opcode        = DSPP_CMD_PARTITION_HEARTBEAT;
+        hb_packet.header.node_source_id = (uint16_t)local_cluster_state.node_id;
+        hb_packet.header.transaction_id = row->term;
+
+        struct ConsensusMessage* msg = (struct ConsensusMessage*)hb_packet.payload_4kb;
+        msg->term          = row->term;
+        msg->candidate_id  = local_cluster_state.node_id;
+        msg->partition_id  = partition_id;
+        msg->vote_granted  = 0;
+        msg->last_log_index = 0;
+
+        e1000_transmit_packet(&hb_packet, sizeof(struct DSPPFullPagePacket));
+    } else {
+        // FOLLOWER/CANDIDATE for this partition: track silence, same
+        // 150-tick threshold Phase 1's cluster-wide mechanism uses.
+        row->heartbeat_ticks_elapsed++;
+
+        if (row->heartbeat_ticks_elapsed > 150) {
+            row->heartbeat_ticks_elapsed = 0;
+            partition_lease_trigger_election(partition_id);
+        }
+    }
+}
+
+void check_partition_lease_heartbeat_tick(void) {
+    for (uint32_t i = 0; i < PARTITION_LEASE_MAX; i++) {
+        if (partition_lease_table[i].active)
+            partition_lease_heartbeat_tick(partition_lease_table[i].partition_id);
+    }
+}
+
+void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) {
+    struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
+    uint32_t partition_id = msg->partition_id;
+
+    struct PartitionLease* row = find_lease_row(partition_id);
+    if (!row) {
+        // An incoming request about a partition this node has never leased
+        // before must still be able to participate -- mirrors partition_
+        // lease_trigger_election()'s own find-or-create posture.
+        if (partition_lease_init(partition_id) != 0) return;   /* table full */
+        row = find_lease_row(partition_id);
+    }
+
+    if (packet->header.opcode == DSPP_CMD_PARTITION_HEARTBEAT) {
+        if (msg->term >= row->term) {
+            row->term                    = msg->term;
+            row->role                    = ROLE_FOLLOWER;
+            row->heartbeat_ticks_elapsed = 0;
+        }
+        return;
+    }
+
+    if (packet->header.opcode == DSPP_CMD_PARTITION_REQUEST_VOTE) {
+        struct DSPPFullPagePacket reply;
+        reply.header.magic         = DSPP_MAGIC;
+        reply.header.opcode        = DSPP_CMD_PARTITION_VOTE_REPLY;
+        reply.header.node_source_id = (uint16_t)local_cluster_state.node_id;
+
+        struct ConsensusMessage* reply_msg = (struct ConsensusMessage*)reply.payload_4kb;
+        reply_msg->term         = row->term;
+        reply_msg->partition_id = partition_id;
+        reply_msg->candidate_id = local_cluster_state.node_id;
+
+        if (msg->term > row->term) {
+            row->term       = msg->term;
+            row->role       = ROLE_FOLLOWER;
+            row->voted_for  = msg->candidate_id;
+            reply_msg->vote_granted = 1;   // Approve candidate
+        } else {
+            reply_msg->vote_granted = 0;   // Deny candidate
+        }
+
+        e1000_transmit_packet(&reply, sizeof(struct DSPPFullPagePacket));
+        return;
+    }
+
+    if (packet->header.opcode == DSPP_CMD_PARTITION_VOTE_REPLY && row->role == ROLE_CANDIDATE) {
+        if (msg->term == row->term && msg->vote_granted) {
+            row->accumulated_votes++;
+
+            if (row->accumulated_votes >= local_cluster_state.stable_quorum_threshold) {
+                // QUORUM ACHIEVED for THIS partition's lease -- reuses
+                // Phase 1's roster-derived quorum (the same cluster nodes
+                // are being asked, just about a different question), rather
+                // than inventing a second majority concept.
+                row->role              = ROLE_LEADER;
+                row->accumulated_votes = 1;
+
+                // Restore write authorization to JUST this partition's
+                // objects -- the narrowing this whole phase exists for.
+                update_page_table_permissions_for_partition(partition_id, 0);
+                kernel_serial_printf(
+                    "[CONSENSUS] partition %u: quorum stable, node %u elected LEADER (write lease) for term %u.\n",
+                    (unsigned)partition_id, (unsigned)local_cluster_state.node_id, (unsigned)row->term);
             }
         }
     }

@@ -171,6 +171,21 @@ void update_page_table_permissions_globally(uint32_t force_read_only) {
     // Deferred until page table management is complete.
 }
 
+// Multi-Node Partition Scaling Roadmap Phase 4: partition-scoped sibling of
+// the stub above, called by consensus.c's new per-partition lease election/
+// heartbeat logic (net/consensus.c) instead of the global one -- narrows
+// split-brain write-stripping to just the objects of the partition whose
+// lease is being contested/regained, not every SLS object on the node.
+// Still a stub for the identical reason the global one is: real
+// implementation means iterating page tables (this time filtered to the
+// given partition's processes only) and clearing/restoring PTE_WRITABLE,
+// deferred until page table management is complete. Both stubs will need
+// real bodies together, not one before the other.
+void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t force_read_only) {
+    (void)partition_id;
+    (void)force_read_only;
+}
+
 // ─── Security matrix verification stub ───────────────────────────────────────
 // Called by secure_api.c to check OWNER capability.
 int verify_expanded_matrix_access(uint32_t uid, uint32_t gid,
