@@ -83,6 +83,12 @@ void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
 // test never calls CREATE/DROP DATABASE, so the return value is a pure
 // linkability stub, not exercised by any scenario below.
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
+// Database Namespace & Access Roadmap Phase 3: kernel/database.c's
+// database_check_access() calls group_contains_uid() (group_profile.c) to
+// resolve grantee groups -- this test never calls any database-grant
+// function either, so this is a pure linkability stub, not exercised by
+// any scenario below.
+int group_contains_uid(const char* name, uint32_t uid) { (void)name; (void)uid; return 0; }
 
 /* Gap Remediation Phase D: persist.c's new restore blocks 9-10 reference
  * vecstore.c/vec_index.c's own globals/functions, neither of which is

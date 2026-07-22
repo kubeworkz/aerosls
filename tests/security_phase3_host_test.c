@@ -18,8 +18,19 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/security_phase3_host_test tests/security_phase3_host_test.c \
  *       kernel/object_catalog.c kernel/group_profile.c kernel/authlist.c \
- *       kernel/security_audit.c
+ *       kernel/security_audit.c kernel/database.c
  *   /tmp/security_phase3_host_test
+ *
+ * Database Namespace & Access Roadmap Phase 3 update: catalog_check_
+ * access() now calls straight into kernel/database.c's database_check_
+ * access() (a no-op for every object here, since none of this test's own
+ * seeded objects ever get a database_id -- object_catalog.h's own
+ * SLSObjectEntry.database_id zero-defaults, matching every pre-Phase-3
+ * object), so this test's link line now includes kernel/database.c. Every
+ * scenario below is run completely unmodified from before this addition,
+ * to prove the new database-grant path is genuinely additive and didn't
+ * regress role/group/authlist -- see tests/database_grant_phase3_host_
+ * test.c for the sibling test that actually exercises database grants.
  */
 #include "kernel/object_catalog.h"
 #include "kernel/partition.h"

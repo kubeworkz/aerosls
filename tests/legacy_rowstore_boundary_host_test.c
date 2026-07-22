@@ -47,8 +47,14 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/legacy_rowstore_boundary_host_test tests/legacy_rowstore_boundary_host_test.c \
  *       kernel/object_catalog.c kernel/rowstore.c kernel/group_profile.c \
- *       kernel/authlist.c kernel/security_audit.c
+ *       kernel/authlist.c kernel/security_audit.c kernel/database.c
  *   /tmp/legacy_rowstore_boundary_host_test
+ *
+ * Database Namespace & Access Roadmap Phase 3 update: catalog_check_
+ * access() now calls straight into kernel/database.c's database_check_
+ * access() too (a no-op here -- this test's seeded objects never get a
+ * database_id), so this test's link line now includes it, same reasoning
+ * as group_profile.c/authlist.c/security_audit.c above.
  *
  * Navigator-Parity Gap Roadmap Phase 3 added group_profile.c/authlist.c/
  * security_audit.c as real (not stubbed) dependencies of object_catalog.c's

@@ -52,6 +52,10 @@ void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
 // test never calls CREATE/DROP DATABASE, so the return value is a pure
 // linkability stub, not exercised by any scenario below.
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
+// Database Namespace & Access Roadmap Phase 3: kernel/database.c's
+// database_check_access() calls group_contains_uid() (group_profile.c) --
+// pure linkability stub, not exercised by any scenario below.
+int group_contains_uid(const char* name, uint32_t uid) { (void)name; (void)uid; return 0; }
 
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;

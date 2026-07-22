@@ -126,3 +126,139 @@ uint32_t database_find_id(const char* name) {
     int idx = find_database_idx(name);
     return idx < 0 ? 0 : databases[idx].database_id;
 }
+
+// ─── Phase 3: grants ────────────────────────────────────────────────────
+struct SLSDatabaseGrant database_grants[DATABASE_GRANT_MAX];
+uint32_t                database_grant_count = 0;
+
+// Finds this database's existing grant entry, if any -- one entry per
+// database_id (not per grant call), matching authlist_grant_object()'s own
+// "update in place if already attached" convention rather than authlist's
+// separate per-object-per-list entries (a database has exactly one grant
+// scope, unlike an authlist's many object grants).
+static int find_grant_idx(uint32_t database_id) {
+    for (int i = 0; i < DATABASE_GRANT_MAX; i++) {
+        if (database_grants[i].active && database_grants[i].database_id == database_id) return i;
+    }
+    return -1;
+}
+
+// Finds (or creates, on first grant for this database_id) the grant entry
+// to add a grantee to. Returns NULL if the grant table is genuinely full
+// and no entry for this database_id already exists.
+static struct SLSDatabaseGrant* find_or_create_grant(uint32_t database_id) {
+    int idx = find_grant_idx(database_id);
+    if (idx >= 0) return &database_grants[idx];
+
+    for (int i = 0; i < DATABASE_GRANT_MAX; i++) {
+        if (!database_grants[i].active) {
+            struct SLSDatabaseGrant* g = &database_grants[i];
+            g->database_id         = database_id;
+            g->perm_mask            = 0;
+            g->grantee_uid_count    = 0;
+            g->grantee_group_count  = 0;
+            g->active               = 1;
+            if ((uint32_t)(i + 1) > database_grant_count) database_grant_count = (uint32_t)(i + 1);
+            return g;
+        }
+    }
+    return 0;
+}
+
+int database_grant_uid(const char* db_name, uint32_t uid, uint32_t perm_mask) {
+    int db_idx = find_database_idx(db_name);
+    if (db_idx < 0) {
+        kernel_serial_printf("[DATABASE] ERROR: database '%s' not found.\n", db_name);
+        return 1;
+    }
+    uint32_t database_id = databases[db_idx].database_id;
+
+    struct SLSDatabaseGrant* g = find_or_create_grant(database_id);
+    if (!g) {
+        kernel_serial_print("[DATABASE] ERROR: database grant table full.\n");
+        return 2;
+    }
+
+    // perm_mask is ONE shared field on the whole grant entry (see
+    // database.h's own struct SLSDatabaseGrant comment) -- every call sets
+    // it, whether uid is a brand-new grantee or already one, exactly
+    // mirroring how every grantee of an authlist shares that list's own
+    // set of object grants uniformly. This is a real, named simplification
+    // vs. per-grantee permission levels, not an oversight.
+    g->perm_mask = perm_mask;
+
+    for (uint32_t i = 0; i < g->grantee_uid_count; i++) {
+        if (g->grantee_uids[i] == uid) {
+            kernel_serial_printf("[DATABASE] '%s': updated grant for uid %u to 0x%02x.\n",
+                                 db_name, uid, perm_mask);
+            return 0;
+        }
+    }
+    if (g->grantee_uid_count >= DATABASE_GRANT_MAX_UIDS) {
+        kernel_serial_printf("[DATABASE] ERROR: '%s' grantee-uid table full.\n", db_name);
+        return 2;
+    }
+    g->grantee_uids[g->grantee_uid_count++] = uid;
+    kernel_serial_printf("[DATABASE] '%s': granted 0x%02x to uid %u.\n", db_name, perm_mask, uid);
+    return 0;
+}
+
+int database_grant_group(const char* db_name, const char* group_name, uint32_t perm_mask) {
+    int db_idx = find_database_idx(db_name);
+    if (db_idx < 0) {
+        kernel_serial_printf("[DATABASE] ERROR: database '%s' not found.\n", db_name);
+        return 1;
+    }
+    uint32_t database_id = databases[db_idx].database_id;
+
+    struct SLSDatabaseGrant* g = find_or_create_grant(database_id);
+    if (!g) {
+        kernel_serial_print("[DATABASE] ERROR: database grant table full.\n");
+        return 2;
+    }
+
+    // perm_mask is ONE shared field on the whole grant entry -- see
+    // database_grant_uid()'s own comment above for the full reasoning.
+    g->perm_mask = perm_mask;
+
+    for (uint32_t i = 0; i < g->grantee_group_count; i++) {
+        if (db_streq(g->grantee_groups[i], group_name)) {
+            kernel_serial_printf("[DATABASE] '%s': updated grant for group '%s' to 0x%02x.\n",
+                                 db_name, group_name, perm_mask);
+            return 0;
+        }
+    }
+    if (g->grantee_group_count >= DATABASE_GRANT_MAX_GROUPS) {
+        kernel_serial_printf("[DATABASE] ERROR: '%s' grantee-group table full.\n", db_name);
+        return 2;
+    }
+    db_strncpy(g->grantee_groups[g->grantee_group_count++], group_name, GROUP_NAME_LEN);
+    g->perm_mask |= perm_mask;
+    kernel_serial_printf("[DATABASE] '%s': granted 0x%02x to group '%s'.\n", db_name, perm_mask, group_name);
+    return 0;
+}
+
+// ─── database_check_access ──────────────────────────────────────────────
+// Called from catalog_check_access() (object_catalog.c), alongside the
+// group/authlist block, before the GUEST hard-deny -- see roadmap doc
+// §1.4 for the exact placement reasoning (a uid with no individual role
+// defaults to ROLE_GUEST, so any additive grant source must run before
+// that hard-deny or it's silently unreachable for exactly the uids this
+// feature is meant to serve).
+int database_check_access(uint32_t uid, uint32_t database_id, uint32_t needed_perm) {
+    if (database_id == 0) return 0;   // untagged object — nothing to check
+
+    int idx = find_grant_idx(database_id);
+    if (idx < 0) return 0;
+    struct SLSDatabaseGrant* g = &database_grants[idx];
+
+    if ((g->perm_mask & needed_perm) != needed_perm) return 0;
+
+    for (uint32_t i = 0; i < g->grantee_uid_count; i++) {
+        if (g->grantee_uids[i] == uid) return 1;
+    }
+    for (uint32_t i = 0; i < g->grantee_group_count; i++) {
+        if (group_contains_uid(g->grantee_groups[i], uid)) return 1;
+    }
+    return 0;
+}

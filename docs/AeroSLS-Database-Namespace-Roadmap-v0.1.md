@@ -441,22 +441,84 @@ DATABASE`. Full sweep after the fix: **39/39 host test files passed, 0
 failed** (up from 38 — the new Phase 2 file itself, plus the 13
 link-fixed files, all present and passing).
 
-### Phase 3 — Database-scoped grants + `catalog_check_access()` wiring
+### Phase 3 — Database-scoped grants + `catalog_check_access()` wiring — DONE
 
-**Scope:** `struct SLSDatabaseGrant` + `database_grant_uid()`/
-`database_grant_group()`/`database_check_access()` (§1.4). Wire
-`database_check_access()` into `catalog_check_access()` at the position
-named in §1.4 (alongside the group/authlist block, before the GUEST
-hard-deny).
+**Scope as built:** `struct SLSDatabaseGrant` (`database.h`) exactly as
+sketched in §1.4 — `database_id` + one shared `perm_mask` + a fixed
+grantee-uid array + a fixed grantee-group-name array, sized identically to
+`authlist.h`'s own `AUTHLIST_MAX`/`AUTHLIST_MAX_GRANTEE_UIDS`/
+`AUTHLIST_MAX_GRANTEE_GROUPS`. `database_grant_uid()`/`database_grant_group()`
+take no `caller_uid`/permission gate of their own — matches `group_create()`/
+`authlist_grant_uid()`/`authlist_grant_group()`'s own already-named
+"no gate, a future Terminal/HTTP role gate is the right place if it
+matters" posture exactly, not a new decision. Both return `0`=success
+(matching `database_create()`/`database_drop()`'s own Phase 1 convention,
+not `authlist`'s `1`=success), `1`=database name not found, `2`=grantee
+table full. A fresh `SLSDatabaseGrant` entry is created on a database's
+first grant and reused/updated in place on every later grant to that same
+database (`find_or_create_grant()`), one entry per `database_id` — never
+per grant call.
 
-**Verification:** host test proving the additive-OR contract directly:
-a uid with no individual role (defaults to GUEST) gains access to a table
-purely via a database grant; a uid outside the grant gets denied; a
-database grant never overrides an explicit owner/role denial path that
-doesn't exist (there is none — grants are purely additive, matching
-group/authlist's own already-tested behavior) confirmed by re-running
-the existing `security_phase3_host_test.c` unmodified to prove this
-addition doesn't regress any existing group/authlist/role scenario.
+**A real, named design property** (not a bug): `perm_mask` is ONE shared
+field per database grant entry, applying uniformly to every grantee (uid
+or group) of that grant — mirroring how every grantee of an `authlist`
+already shares that list's own set of object grants uniformly. A later
+`database_grant_uid()`/`database_grant_group()` call on the same database
+overwrites `perm_mask` for every existing grantee too, not just the newly
+named one. This is a real simplification versus per-grantee permission
+levels (the roadmap's own §1.4 sketch only ever specified one `perm_mask`
+field on the struct), named explicitly here rather than silently
+discovered later.
+
+`database_check_access(uid, database_id, needed_perm)` returns 0
+immediately for `database_id == 0` (untagged — nothing to check), then
+checks the one grant entry for that `database_id`: `perm_mask` must cover
+`needed_perm`, and `uid` must be a direct grantee or a member (via
+`group_contains_uid()`) of one of the grantee groups.
+
+**`catalog_check_access()` wiring** (`object_catalog.c`): one new call,
+`database_check_access(uid, e->database_id, needed_perm)`, inserted
+immediately after the existing `authlist_check_access()` fallback and
+before the `ROLE_GUEST` hard-deny — the exact position §1.4 named, for the
+identical reason the group/authlist checks already there give in their own
+comments (a uid with no individual role defaults to `ROLE_GUEST`, so any
+additive grant source must run before that hard-deny or it's silently
+unreachable for exactly the uids it's meant to serve).
+
+**Verification:** `tests/database_grant_phase3_host_test.c` (new, 18
+checks, all passed clean on the first run) — links the REAL, unmodified
+`kernel/object_catalog.c`, `kernel/database.c`, `kernel/group_profile.c`,
+`kernel/authlist.c`, `kernel/security_audit.c` (the same scaffold
+`security_phase3_host_test.c` already established), not a reimplementation
+of any of them. Proves the headline additive-OR contract directly: a
+grant made against a *database* (before a table even existed) is honored
+the moment a table is tagged with that `database_id`; a bare-GUEST uid
+(no `role_table[]` entry, no group, no authlist) gains access purely via
+the database grant; an unrelated uid outside the grant stays denied; a
+grantee *group* works identically to a grantee uid (two levels of
+indirection: uid → group → database grant → object, mirroring authlist's
+own grantee-group mechanism); granting a nonexistent database name fails
+cleanly; and a denial still reaches the real security audit log unchanged.
+`security_phase3_host_test.c` itself was re-run completely unmodified
+(only its own "Build and run:" link line gained `kernel/database.c`) and
+still passes all 30 of its original checks, confirming the new database
+grant path is genuinely additive and didn't regress role/group/authlist.
+
+**Regression:** wiring `database_check_access()` into `object_catalog.c`
+broke two more host test files that link the real `object_catalog.c`
+without also linking `kernel/database.c`
+(`legacy_rowstore_boundary_host_test.c`, fixed by adding
+`kernel/database.c` to its link line, which already links
+`group_profile.c`/`authlist.c` so no additional stub was needed), and
+adding `group_contains_uid()` as a genuine (non-stubbed) call inside
+`database.c` broke link for every one of Phase 2's 11 lighter-scaffold
+host tests plus `database_host_test.c` itself (12 files total) — fixed by
+adding a minimal `group_contains_uid()` linkability stub to each,
+alongside the `catalog_get_role()` stub Phase 2 already added there, since
+none of those tests' own scenarios exercise database grants either. Full
+sweep after all fixes: **40/40 host test files passed, 0 failed** (up
+from 39 — the new Phase 3 file itself, plus the two additionally
+link-fixed files, all present and passing).
 
 ### Phase 4 — Syscalls + HTTP + Terminal reachability
 

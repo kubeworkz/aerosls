@@ -85,9 +85,21 @@
 #define DATABASE_H
 
 #include <stdint.h>
+#include "group_profile.h"   // GROUP_NAME_LEN, group_contains_uid()
 
 #define DATABASE_NAME_LEN   32
 #define DATABASE_MAX        32
+
+// ─── Database Namespace & Access Roadmap Phase 3: grants ───────────────────
+// See roadmap doc §1.4 for the full "why a new struct, not a mode flag on
+// SLSAuthListEntry" reasoning. Sizes mirror authlist.h's own
+// AUTHLIST_MAX/AUTHLIST_MAX_GRANTEE_UIDS/AUTHLIST_MAX_GRANTEE_GROUPS
+// exactly -- same "how many distinct grant entries/grantees does a small
+// simulated deployment plausibly need" judgment call, not a new sizing
+// philosophy.
+#define DATABASE_GRANT_MAX           64
+#define DATABASE_GRANT_MAX_UIDS      16
+#define DATABASE_GRANT_MAX_GROUPS     8
 
 struct SLSDatabaseEntry {
     uint32_t database_id;   // bump-allocated, 1.. ; 0 reserved for NONE/unassigned — never fnv1a(name)
@@ -96,8 +108,27 @@ struct SLSDatabaseEntry {
     uint8_t  active;
 };
 
+// A grant is keyed by database_id (not name) -- once created, a grant
+// stays valid even if nothing else references the name again, and (per
+// §1.2's own bump-id reasoning) a DROP+recreate under the same name never
+// silently reattaches an old grant to the new database, since the new
+// database gets a genuinely different id. Grant-only in this phase (no
+// revoke), matching authlist.c/group_profile.c's own current posture --
+// named in the roadmap doc's §1.9 rather than silently omitted.
+struct SLSDatabaseGrant {
+    uint32_t database_id;
+    uint32_t perm_mask;
+    uint32_t grantee_uids[DATABASE_GRANT_MAX_UIDS];
+    uint32_t grantee_uid_count;
+    char     grantee_groups[DATABASE_GRANT_MAX_GROUPS][GROUP_NAME_LEN];
+    uint32_t grantee_group_count;
+    uint8_t  active;
+};
+
 extern struct SLSDatabaseEntry databases[DATABASE_MAX];
 extern uint32_t                database_next_id;   // bump allocator cursor; starts at 1, never reused
+extern struct SLSDatabaseGrant  database_grants[DATABASE_GRANT_MAX];
+extern uint32_t                 database_grant_count;   // high-water mark, mirrors object_catalog_count's own bump style
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 //
@@ -121,5 +152,39 @@ void database_list(void);
 // found" (from this lookup) by construction — database_id 0 is never
 // assigned to a real database, since database_next_id starts at 1.
 uint32_t database_find_id(const char* name);
+
+// ─── Grants (Phase 3) ───────────────────────────────────────────────────────
+//
+// No caller_uid/permission gate on either grant function -- matches
+// group_create()/authlist_grant_uid()/authlist_grant_group()'s own
+// existing, already-named posture exactly (none of those three gate on a
+// caller either): a future Terminal/HTTP-level role gate (e.g. requiring
+// ROLE_DB_ADMIN) is the right place to add that restriction if it turns
+// out to matter, not invented speculatively here (same reasoning
+// database.h's own database_create() comment already gives).
+//
+// database_grant_uid()/database_grant_group() return codes:
+//   0 = success
+//   1 = db_name not found (not a real, active database)
+//   2 = grantee-uid/grantee-group table full for this database's grant
+//       entry (a fresh grant entry is created on first grant per database,
+//       reused/updated in place on subsequent grants to the same database
+//       -- mirrors authlist_grant_object()'s own "update in place if
+//       already attached" convention)
+int database_grant_uid(const char* db_name, uint32_t uid, uint32_t perm_mask);
+int database_grant_group(const char* db_name, const char* group_name, uint32_t perm_mask);
+
+// Returns 1 if uid is granted needed_perm on database_id via ANY active
+// database grant -- either as a direct grantee, or as a member of one of
+// the grant's grantee groups (via group_contains_uid()). Returns 0 if
+// database_id is 0 (NONE/unassigned -- an untagged object has no database
+// grant to check) or if no grant matches. This is the real function
+// catalog_check_access() (object_catalog.c) calls directly, mirroring
+// authlist_check_access()'s own "internal function object_catalog.c calls
+// straight through" shape -- no syscall wrapper needed for this one since
+// it's never called directly by an operator (Phase 4 adds a `database
+// check` Terminal command as a thin wrapper around the same logic, same as
+// SYS_SLS_AUTHLIST_CHECK does for authlist_check_access()).
+int database_check_access(uint32_t uid, uint32_t database_id, uint32_t needed_perm);
 
 #endif /* DATABASE_H */

@@ -41,6 +41,13 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 static SLSRole g_role_override = ROLE_APP_USER;
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return g_role_override; }
 
+// Database Namespace & Access Roadmap Phase 3: database_check_access()
+// (not exercised by this Phase 1 test -- see database_grant_phase3_host_
+// test.c for that) calls group_contains_uid() unconditionally inside
+// database.c's compiled object file, so it must resolve at link time even
+// though this test never reaches it. Pure linkability stub.
+int group_contains_uid(const char* name, uint32_t uid) { (void)name; (void)uid; return 0; }
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \

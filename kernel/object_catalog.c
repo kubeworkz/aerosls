@@ -17,6 +17,7 @@
 #include "group_profile.h"
 #include "authlist.h"
 #include "security_audit.h"
+#include "database.h"   // Database Namespace & Access Roadmap Phase 3: database_check_access()
 
 // Forward declaration — avoids pulling the full tier_mgr.h include graph into this file
 extern void tier_notify_access(uint64_t object_id);
@@ -183,6 +184,17 @@ int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_per
     // entire point of an authlist is to grant access independent of what
     // the object's own perm_mask says, so it needs to be its own path.
     if (authlist_check_access(uid, obj_name, needed_perm)) return 1;
+
+    // Database Namespace & Access Roadmap Phase 3: database-scoped grant
+    // fallback. Same "must run before the GUEST hard-deny" reasoning as
+    // group/authlist just above -- a uid with no individual role defaults
+    // to ROLE_GUEST, so this additive grant source would be silently
+    // unreachable for exactly the uids it's meant to serve if it ran after
+    // that hard-deny. database_check_access() itself returns 0 immediately
+    // for e->database_id == 0 (an untagged object), so this is a no-op for
+    // every object created before this feature existed or never assigned
+    // to a database via CREATE TABLE ... IN DATABASE.
+    if (database_check_access(uid, e->database_id, needed_perm)) return 1;
 
     // GUEST never falls through to the raw perm_mask fallback below —
     // preserves this function's pre-Phase-3 behavior exactly for that one
