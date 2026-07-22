@@ -44,9 +44,11 @@ typedef enum {
     TOK_KW_JOIN, TOK_KW_ON,   // Phase 20
     TOK_KW_GROUP, TOK_KW_HAVING,   // Phase 1 (SQL Feature-Parity Roadmap)
     TOK_KW_LEFT, TOK_KW_OUTER, TOK_KW_AS,   // Phase 2 (SQL Feature-Parity Roadmap)
+    TOK_KW_IN, TOK_KW_LIKE,   // Phase 3 (SQL Feature-Parity Roadmap)
     TOK_KW_TRUE, TOK_KW_FALSE,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
     TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
+    TOK_PLUS, TOK_MINUS, TOK_SLASH,   // Phase 3 (SQL Feature-Parity Roadmap): arithmetic operators
     TOK_ERROR,
 } SqlTokenKind;
 
@@ -73,6 +75,7 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"JOIN", TOK_KW_JOIN}, {"ON", TOK_KW_ON},
     {"GROUP", TOK_KW_GROUP}, {"HAVING", TOK_KW_HAVING},
     {"LEFT", TOK_KW_LEFT}, {"OUTER", TOK_KW_OUTER}, {"AS", TOK_KW_AS},
+    {"IN", TOK_KW_IN}, {"LIKE", TOK_KW_LIKE},
     {"TRUE", TOK_KW_TRUE}, {"FALSE", TOK_KW_FALSE},
 };
 #define KEYWORD_COUNT (sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
@@ -89,8 +92,15 @@ static struct SqlToken lex_next(struct SqlLexer* lx) {
     char c = lx->src[lx->pos];
 
     // number: digit, or '-' immediately followed by a digit (a leading
-    // sign is part of the literal -- there is no subtraction operator in
-    // this grammar, no arithmetic expressions per scope).
+    // sign is part of the literal). Phase 3 (SQL Feature-Parity Roadmap)
+    // added a real MINUS operator token below, but this rule still checked
+    // FIRST and unchanged -- so `-` immediately followed by a digit is
+    // ALWAYS a negative-number literal, regardless of context, exactly as
+    // before Phase 3. This means subtracting a positive numeric literal
+    // needs a space after the minus sign (`price - 1`, not `price -1` or
+    // `price-1`) to parse as subtraction rather than a single negative-
+    // number token -- a real, named limitation, see sql_parser.h's Phase 3
+    // note. Subtracting a column (`price - discount`) is unaffected.
     if (sq_is_digit(c) || (c == '-' && lx->pos + 1 < lx->len && sq_is_digit(lx->src[lx->pos + 1]))) {
         uint32_t start = lx->pos;
         if (c == '-') lx->pos++;
@@ -152,6 +162,13 @@ static struct SqlToken lex_next(struct SqlLexer* lx) {
         case ';': lx->pos++; t.kind = TOK_SEMI;   return t;
         case '.': lx->pos++; t.kind = TOK_DOT;    return t;   // Phase 20: table.column qualifiers
         case '=': lx->pos++; t.kind = TOK_EQ;     return t;
+        // Phase 3 (SQL Feature-Parity Roadmap): arithmetic operators. '-'
+        // only reaches here when NOT immediately followed by a digit (the
+        // negative-number-literal rule above already claimed that case) --
+        // see this file's Phase 3 note on the resulting minor limitation.
+        case '+': lx->pos++; t.kind = TOK_PLUS;   return t;
+        case '-': lx->pos++; t.kind = TOK_MINUS;  return t;
+        case '/': lx->pos++; t.kind = TOK_SLASH;  return t;
         case '!':
             if (lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '=') { lx->pos += 2; t.kind = TOK_NE; return t; }
             lx->pos++; t.kind = TOK_ERROR; return t;
@@ -374,43 +391,200 @@ static int parse_literal(struct SqlParser* p, char* out, uint32_t max) {
     }
 }
 
-// comparison := column_ref compare_op literal
+static int sq_contains_dot(const char* s) {
+    for (; *s; s++) if (*s == '.') return 1;
+    return 0;
+}
+
+// Phase 3 (SQL Feature-Parity Roadmap): arith_operand := ident | number.
+// A column reference *usable in arithmetic* is always a single unqualified
+// identifier, never "table.column" (see sql_parser.h's Phase 3 note on why
+// arithmetic is scoped to single-table WHERE/SET, not JOIN chains) -- but
+// this function is also the one-operand lookahead parse_comparison() uses
+// to read comparison_lhs BEFORE it knows whether the statement is even
+// going to turn out arithmetic, and comparison_lhs must still accept a
+// plain qualified column ("e.name") for the byte-compatible non-arithmetic
+// path a JOIN's WHERE clause depends on. So this DOES consume an optional
+// ".ident" suffix here (byte-identical to parse_column_ref's own handling)
+// -- callers that care whether the result is arithmetic-eligible check
+// sq_contains_dot(out->text) themselves and skip the arithmetic-operator
+// lookahead for a qualified result, since "e.price * 2" is out of scope
+// and correctly falls through to a plain (and then likely erroring, which
+// is fine -- it's unsupported syntax) comparison_tail call instead.
+static int parse_arith_operand(struct SqlParser* p, struct PredArithOperand* out) {
+    if (p->cur.kind == TOK_IDENT) {
+        out->is_column = 1;
+        char first[RECORD_KEY_LEN];
+        sq_strcpy(first, p->cur.text, RECORD_KEY_LEN);
+        advance(p);
+        if (p->cur.kind == TOK_DOT) {
+            advance(p);
+            if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name after '.'"); return 0; }
+            uint32_t i = 0;
+            for (; first[i] && i < RECORD_KEY_LEN - 1; i++) out->text[i] = first[i];
+            if (i < RECORD_KEY_LEN - 1) out->text[i++] = '.';
+            for (uint32_t j = 0; p->cur.text[j] && i < RECORD_KEY_LEN - 1; j++) out->text[i++] = p->cur.text[j];
+            out->text[i] = '\0';
+            advance(p);
+        } else {
+            sq_strcpy(out->text, first, RECORD_KEY_LEN);
+        }
+        return 1;
+    }
+    if (p->cur.kind == TOK_NUMBER) {
+        out->is_column = 0;
+        sq_strcpy(out->text, p->cur.text, RECORD_KEY_LEN);
+        advance(p);
+        return 1;
+    }
+    set_error(p, "expected a column name or number");
+    return 0;
+}
+
+static int parse_arith_op_token(struct SqlParser* p, PredArithOp* out) {
+    switch (p->cur.kind) {
+        case TOK_PLUS:  *out = PRED_ARITH_ADD; break;
+        case TOK_MINUS: *out = PRED_ARITH_SUB; break;
+        case TOK_STAR:  *out = PRED_ARITH_MUL; break;
+        case TOK_SLASH: *out = PRED_ARITH_DIV; break;
+        default: return 0;
+    }
+    return 1;
+}
+
+// comparison's shared tail, given an already-parsed plain (non-arithmetic)
+// left-hand side string `col` -- either a bare column_ref (WHERE) or a
+// rendered select_item label (HAVING, see the allow_agg note below). Phase
+// 1's plain-comparison shape; Phase 3 (SQL Feature-Parity Roadmap) adds IN
+// and LIKE here, since both apply equally to a WHERE column_ref or a
+// HAVING select_item label with no special-casing needed.
+static uint32_t parse_comparison_tail(struct SqlParser* p, struct Predicate* pred, const char* col) {
+    if (p->cur.kind == TOK_KW_IN) {
+        advance(p);
+        if (!expect(p, TOK_LPAREN, "expected '(' after IN")) return PREDICATE_INVALID_NODE;
+        // IN (a, b, c) desugars to (col = a) OR (col = b) OR (col = c) at
+        // parse time -- see predicate.h's Phase 3 note for why this needed
+        // no predicate.h/.c changes at all.
+        uint32_t acc = PREDICATE_INVALID_NODE;
+        for (;;) {
+            char lit[RECORD_VAL_LEN];
+            if (!parse_literal(p, lit, RECORD_VAL_LEN)) return PREDICATE_INVALID_NODE;
+            uint32_t eqn = predicate_add_comparison(pred, col, PRED_OP_EQ, lit);
+            if (eqn == PREDICATE_INVALID_NODE) { set_error(p, "IN list too long (predicate node pool exhausted)"); return PREDICATE_INVALID_NODE; }
+            acc = (acc == PREDICATE_INVALID_NODE) ? eqn : predicate_add_or(pred, acc, eqn);
+            if (acc == PREDICATE_INVALID_NODE) { set_error(p, "IN list too long (predicate node pool exhausted)"); return PREDICATE_INVALID_NODE; }
+            if (p->cur.kind != TOK_COMMA) break;
+            advance(p);
+        }
+        if (!expect(p, TOK_RPAREN, "expected ')' after IN list")) return PREDICATE_INVALID_NODE;
+        return acc;
+    }
+    if (p->cur.kind == TOK_KW_LIKE) {
+        advance(p);
+        char pat[RECORD_VAL_LEN];
+        if (!parse_literal(p, pat, RECORD_VAL_LEN)) return PREDICATE_INVALID_NODE;
+        uint32_t node = predicate_add_comparison(pred, col, PRED_OP_LIKE, pat);
+        if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)");
+        return node;
+    }
+    PredicateCompareOp op;
+    if (!parse_compare_op(p, &op)) return PREDICATE_INVALID_NODE;
+    char lit[RECORD_VAL_LEN];
+    if (!parse_literal(p, lit, RECORD_VAL_LEN)) return PREDICATE_INVALID_NODE;
+    uint32_t node = predicate_add_comparison(pred, col, op, lit);
+    if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)");
+    return node;
+}
+
+// comparison := comparison_lhs (compare_op literal | IN '(' literal-list ')' | LIKE literal)
 // Phase 1 (SQL Feature-Parity Roadmap): when allow_agg is set (HAVING
 // only -- see sql_parser.h), the left-hand side is parsed via
 // parse_select_item() instead of parse_column_ref(), so it may be an
 // aggregate call ("COUNT(*)") whose rendered label becomes the comparison
 // node's column_name -- exactly what a synthetic grouped-result layout's
 // own column names will be at exec time (sql_exec.c), so predicate_eval()
-// needs no changes at all to evaluate it. WHERE/SET's own comparisons
-// (allow_agg == 0) are completely unaffected -- byte-for-byte the
-// pre-Phase-1 behavior.
+// needs no changes at all to evaluate it.
+// Phase 3 (SQL Feature-Parity Roadmap): when allow_agg is NOT set (plain
+// WHERE/SET comparisons only -- HAVING never reaches this branch), the
+// left-hand side may instead be a single arithmetic expression
+// (arith_operand [('+'|'-'|'*'|'/') arith_operand]) -- disambiguated by a
+// one-operand lookahead: parse the first operand, then check whether an
+// arithmetic operator follows. No operator following, AND the operand was
+// a plain column (not a number), falls through to the byte-for-byte
+// pre-Phase-3 shape via parse_comparison_tail().
 static uint32_t parse_comparison(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
-    char col[RECORD_KEY_LEN];
     if (allow_agg) {
+        char col[RECORD_KEY_LEN];
         SqlAggFunc fn; char arg[RECORD_KEY_LEN];
         if (!parse_select_item(p, col, RECORD_KEY_LEN, &fn, arg, RECORD_KEY_LEN)) return PREDICATE_INVALID_NODE;
-    } else {
-        if (!parse_column_ref(p, col, RECORD_KEY_LEN)) return PREDICATE_INVALID_NODE;
+        return parse_comparison_tail(p, pred, col);
     }
 
-    PredicateCompareOp op;
-    if (!parse_compare_op(p, &op)) return PREDICATE_INVALID_NODE;
+    struct PredArithOperand op1;
+    if (!parse_arith_operand(p, &op1)) return PREDICATE_INVALID_NODE;
 
+    // Phase 3 fix: a qualified column ("table.column", e.g. from a JOIN's
+    // WHERE clause) is never a valid arithmetic operand -- go straight to
+    // the byte-compatible comparison_tail path without even attempting the
+    // arithmetic-operator lookahead, restoring pre-Phase-3 behavior for
+    // every qualified WHERE comparison exactly.
+    if (op1.is_column && sq_contains_dot(op1.text)) {
+        return parse_comparison_tail(p, pred, op1.text);
+    }
+
+    PredArithOp arith_op;
+    if (!parse_arith_op_token(p, &arith_op)) {
+        // No arithmetic operator follows -- op1 must have been a plain
+        // column (a bare number here isn't a valid WHERE/SET left-hand
+        // side, e.g. "5 = 5" isn't a query this grammar needs to support).
+        if (!op1.is_column) { set_error(p, "expected a column reference or arithmetic expression"); return PREDICATE_INVALID_NODE; }
+        return parse_comparison_tail(p, pred, op1.text);
+    }
+    advance(p);   // consume the operator token
+    struct PredArithOperand op2;
+    if (!parse_arith_operand(p, &op2)) return PREDICATE_INVALID_NODE;
+
+    // Arithmetic comparisons don't get IN/LIKE (see sql_parser.h's Phase 3
+    // note) -- always compare_op literal.
+    PredicateCompareOp cop;
+    if (!parse_compare_op(p, &cop)) return PREDICATE_INVALID_NODE;
     char lit[RECORD_VAL_LEN];
     if (!parse_literal(p, lit, RECORD_VAL_LEN)) return PREDICATE_INVALID_NODE;
-
-    uint32_t node = predicate_add_comparison(pred, col, op, lit);
-    if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)");
+    uint32_t node = predicate_add_arith_comparison(pred, op1, arith_op, op2, cop, lit);
+    if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE clause too complex (predicate node pool exhausted)");
     return node;
 }
 
-// and_expr := comparison (AND comparison)*
+// Forward declaration -- predicate_primary (Phase 3, below) recurses back
+// into parse_predicate() for a parenthesized group.
+static uint32_t parse_predicate(struct SqlParser* p, struct Predicate* pred, int allow_agg);
+
+// predicate_primary := '(' predicate ')' | comparison -- Phase 3 (SQL
+// Feature-Parity Roadmap): the ONLY grammar change parenthesized grouping
+// needed. predicate.c's eval_node() already recurses through an
+// arbitrarily-nested AND/OR tree; it was always this parser that only ever
+// built a flat and_expr (OR and_expr)* shape, never nested by explicit
+// parens. A comparison never itself starts with '(' (parse_arith_operand()
+// only accepts an identifier or a number), so there's no ambiguity between
+// the two alternatives here.
+static uint32_t parse_predicate_primary(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
+    if (p->cur.kind == TOK_LPAREN) {
+        advance(p);
+        uint32_t inner = parse_predicate(p, pred, allow_agg);
+        if (p->error) return PREDICATE_INVALID_NODE;
+        if (!expect(p, TOK_RPAREN, "expected ')' to close grouped predicate")) return PREDICATE_INVALID_NODE;
+        return inner;
+    }
+    return parse_comparison(p, pred, allow_agg);
+}
+
+// and_expr := predicate_primary (AND predicate_primary)*
 static uint32_t parse_and_expr(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
-    uint32_t left = parse_comparison(p, pred, allow_agg);
+    uint32_t left = parse_predicate_primary(p, pred, allow_agg);
     if (p->error) return PREDICATE_INVALID_NODE;
     while (p->cur.kind == TOK_KW_AND) {
         advance(p);
-        uint32_t right = parse_comparison(p, pred, allow_agg);
+        uint32_t right = parse_predicate_primary(p, pred, allow_agg);
         if (p->error) return PREDICATE_INVALID_NODE;
         left = predicate_add_and(pred, left, right);
         if (left == PREDICATE_INVALID_NODE) { set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)"); return left; }
@@ -418,7 +592,9 @@ static uint32_t parse_and_expr(struct SqlParser* p, struct Predicate* pred, int 
     return left;
 }
 
-// predicate := and_expr (OR and_expr)*  -- AND binds tighter than OR for free, no parens needed
+// predicate := and_expr (OR and_expr)*  -- AND binds tighter than OR for
+// free whenever no parens are written; explicit parens (predicate_primary,
+// above) let a query override that natural precedence.
 static uint32_t parse_predicate(struct SqlParser* p, struct Predicate* pred, int allow_agg) {
     uint32_t left = parse_and_expr(p, pred, allow_agg);
     if (p->error) return PREDICATE_INVALID_NODE;
@@ -626,6 +802,41 @@ static void parse_insert(struct SqlParser* p, struct SqlInsertStmt* s) {
     finish_statement(p);
 }
 
+// Phase 3 (SQL Feature-Parity Roadmap): SET column = value, where value is
+// either a plain literal (byte-for-byte the pre-Phase-3 shape, *is_arith
+// left 0) or a single arithmetic expression (e.g. `price = price * 1.1`).
+// A literal STRING/TRUE/FALSE token is never an arithmetic operand, so
+// those short-circuit straight to parse_literal() unchanged. A NUMBER or
+// an identifier needs a one-operand lookahead (parse_arith_operand()) to
+// tell whether an operator follows; no operator following a NUMBER operand
+// is just that plain numeric literal (also byte-for-byte the pre-Phase-3
+// shape); no operator following a COLUMN operand is a query error (a bare
+// "SET x = y" copy-another-column shorthand isn't supported).
+static int parse_set_value(struct SqlParser* p, char* lit_out, uint32_t lit_max, uint8_t* is_arith,
+                           struct PredArithOperand* op1, PredArithOp* arith_op, struct PredArithOperand* op2) {
+    *is_arith = 0;
+    if (p->cur.kind == TOK_STRING || p->cur.kind == TOK_KW_TRUE || p->cur.kind == TOK_KW_FALSE) {
+        return parse_literal(p, lit_out, lit_max);
+    }
+
+    struct PredArithOperand o1;
+    if (!parse_arith_operand(p, &o1)) return 0;
+
+    PredArithOp aop;
+    if (!parse_arith_op_token(p, &aop)) {
+        if (o1.is_column) { set_error(p, "SET value must be a literal or an arithmetic expression"); return 0; }
+        sq_strcpy(lit_out, o1.text, lit_max);   // plain NUMBER literal -- pre-Phase-3 shape
+        return 1;
+    }
+    advance(p);
+    struct PredArithOperand o2;
+    if (!parse_arith_operand(p, &o2)) return 0;
+
+    *is_arith = 1;
+    *op1 = o1; *arith_op = aop; *op2 = o2;
+    return 1;
+}
+
 static void parse_update(struct SqlParser* p, struct SqlUpdateStmt* s) {
     sq_memset(s, 0, sizeof(*s));
     advance(p);   // consume UPDATE
@@ -642,10 +853,23 @@ static void parse_update(struct SqlParser* p, struct SqlUpdateStmt* s) {
         sq_strcpy(col, p->cur.text, RECORD_KEY_LEN);
         advance(p);
         if (!expect(p, TOK_EQ, "expected '=' in SET clause")) return;
+
         char lit[RECORD_VAL_LEN];
-        if (!parse_literal(p, lit, RECORD_VAL_LEN)) return;
+        uint8_t is_arith;
+        struct PredArithOperand ao1, ao2;
+        PredArithOp aop;
+        if (!parse_set_value(p, lit, RECORD_VAL_LEN, &is_arith, &ao1, &aop, &ao2)) return;
+
         sq_strcpy(s->set_columns[n], col, RECORD_KEY_LEN);
-        sq_strcpy(s->set_values[n], lit, RECORD_VAL_LEN);
+        s->set_is_arith[n] = is_arith;
+        if (is_arith) {
+            s->set_arith_op1[n] = ao1;
+            s->set_arith_op[n]  = aop;
+            s->set_arith_op2[n] = ao2;
+            s->set_values[n][0] = '\0';
+        } else {
+            sq_strcpy(s->set_values[n], lit, RECORD_VAL_LEN);
+        }
         n++;
         if (p->cur.kind != TOK_COMMA) break;
         advance(p);

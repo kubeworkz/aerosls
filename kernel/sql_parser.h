@@ -39,12 +39,35 @@
  *                  Feature-Parity Roadmap Phase 1 note below.
  *   insert_stmt := INSERT INTO ident '(' ident (',' ident)* ')'
  *                  VALUES '(' literal (',' literal)* ')' [;]
- *   update_stmt := UPDATE ident SET ident '=' literal (',' ident '=' literal)*
+ *   update_stmt := UPDATE ident SET ident '=' set_value (',' ident '=' set_value)*
  *                  [WHERE predicate] [;]
+ *   set_value   := literal | arith_expr   -- SQL Feature-Parity Roadmap
+ *                  Phase 3: a plain literal is still the byte-for-byte
+ *                  pre-Phase-3 shape; arith_expr (below) lets a SET value
+ *                  reference the row's OWN current column values (e.g.
+ *                  `SET price = price * 1.1`) -- see the Phase 3 note below.
  *   delete_stmt := DELETE FROM ident [WHERE predicate] [;]
  *   predicate   := and_expr (OR and_expr)*
- *   and_expr    := comparison (AND comparison)*
- *   comparison  := column_ref compare_op literal
+ *   and_expr    := predicate_primary (AND predicate_primary)*
+ *   predicate_primary := '(' predicate ')' | comparison   -- SQL
+ *                  Feature-Parity Roadmap Phase 3: parenthesized grouping,
+ *                  see the Phase 3 note below.
+ *   comparison  := comparison_lhs compare_op literal
+ *                | column_ref IN '(' literal (',' literal)* ')'
+ *                | column_ref LIKE literal
+ *   comparison_lhs := arith_expr   -- plain WHERE/HAVING comparisons only
+ *                  (not HAVING's own select_item form below); a bare
+ *                  column_ref with no arithmetic operator is arith_expr's
+ *                  own single-operand case, byte-for-byte the pre-Phase-3
+ *                  shape.
+ *   arith_expr  := arith_operand [('+' | '-' | '*' | '/') arith_operand]
+ *                  -- SQL Feature-Parity Roadmap Phase 3: AT MOST ONE
+ *                  arithmetic operation, not a full precedence-climbing
+ *                  expression grammar -- see the Phase 3 note below.
+ *   arith_operand := ident | number   -- a column reference here is always
+ *                  a single unqualified identifier, never "table.column"
+ *                  (arithmetic is scoped to single-table WHERE/SET, not
+ *                  JOIN chains -- see the Phase 3 note below).
  *   compare_op  := '=' | '!=' | '<>' | '<' | '>' | '<=' | '>='
  *   column_ref  := ident ['.' ident]      -- Phase 20: "table.column" when
  *                                            qualifying is needed (always
@@ -60,14 +83,14 @@
  *                                            note below).
  *   literal     := number | 'string' | TRUE | FALSE
  *
- * `predicate` has no explicit parenthesized grouping in this first cut —
- * AND binds tighter than OR (standard SQL operator precedence), which
- * `and_expr` nested inside `predicate` already gives for free without
- * needing user-supplied parens; only EXPLICIT grouping beyond that natural
- * precedence is deferred, matching this roadmap's stated non-goal of a
- * full SQL expression language. The predicate itself is built directly as
+ * `predicate` now supports explicit parenthesized grouping (SQL
+ * Feature-Parity Roadmap Phase 3, below) -- AND still binds tighter than OR
+ * (standard SQL operator precedence) for free whenever no parens are
+ * written, exactly as before; parens let a query override that natural
+ * precedence explicitly. The predicate itself is still built directly as
  * a `struct Predicate` (predicate.h, Phase 18) via its own add_comparison/
- * add_and/add_or primitives — no second expression-tree type invented.
+ * add_and/add_or primitives (plus Phase 3's add_arith_comparison) — no
+ * second expression-tree type invented.
  *
  * Phase 20's JOIN was originally narrower still: exactly two tables (`FROM
  * A JOIN B ON ...`, no chaining), INNER JOIN only, no table aliasing --
@@ -81,11 +104,14 @@
  *
  * Explicitly out of scope, per the roadmap: RIGHT/FULL OUTER JOIN (Phase 2
  * added LEFT only), join reordering, hash/merge join, subqueries, views,
- * arithmetic expressions, string functions, LIKE, IN lists, parenthesized
- * WHERE grouping (above). INSERT requires an explicit column list covering
- * every one of the table's columns (no partial-row/NULL/default support
- * yet — every value must be supplied, matching rowstore_row_insert()'s own
- * existing all-columns-required contract).
+ * string functions, `IS NULL`/`IS NOT NULL` (deferred to Phase 4's real
+ * NULL, not built here -- see the Phase 3 note below), `NOT IN`, `ESCAPE`
+ * for LIKE. Arithmetic expressions, LIKE, IN lists, and parenthesized
+ * WHERE grouping were promoted out of this list by Phase 3 (below).
+ * INSERT requires an explicit column list covering every one of the
+ * table's columns (no partial-row/NULL/default support yet — every value
+ * must be supplied, matching rowstore_row_insert()'s own existing
+ * all-columns-required contract).
  *
  * ─── SQL Feature-Parity Roadmap Phase 1: GROUP BY / HAVING / aggregates ────
  * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) GROUP BY is no longer
@@ -179,6 +205,66 @@
  *     combined, against the fully joined row — no per-step predicate
  *     pushdown, the same named non-goal Phase 20 already carried forward
  *     unchanged from a two-table chain to an N-table one.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 3: WHERE/SET expression richness ─────
+ * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) Promotes parenthesized
+ * grouping, `IN (...)`, `LIKE`, and single-operation arithmetic
+ * (`+ - * /`) out of the out-of-scope list above. See predicate.h's own
+ * Phase 3 header note for how each is evaluated -- this file only covers
+ * the grammar/parsing side.
+ *
+ *   - Parenthesized grouping needed no new AST/predicate concept: a
+ *     `predicate_primary` is either `'(' predicate ')'` (recursing back into
+ *     the same `parse_predicate()`) or a plain `comparison` -- the ONLY
+ *     grammar change grouping needed, since predicate.c's tree evaluator
+ *     already handled arbitrarily-nested AND/OR.
+ *   - `IN (a, b, c)` desugars at PARSE time into `(col = a) OR (col = b) OR
+ *     (col = c)` -- no new predicate node kind. A long IN list can exhaust
+ *     `PREDICATE_MAX_NODES` (32) exactly like a long chain of explicit
+ *     ORs would -- a real, documented cap, not silently truncated (the same
+ *     "WHERE/HAVING clause too complex" error every other node-pool
+ *     exhaustion in this file already reports). `NOT IN` is not
+ *     implemented.
+ *   - `LIKE` is available on any plain (non-arithmetic) comparison LHS, in
+ *     both WHERE and HAVING -- `'%'` (any sequence) and `'_'` (one
+ *     character) wildcards, STRING columns only (fails closed, not a type
+ *     coercion, against any other column type), no `ESCAPE` clause.
+ *   - Arithmetic (`arith_expr`, see the grammar above) is available on a
+ *     plain WHERE comparison's left-hand side only -- NOT HAVING's (an
+ *     aggregate's rendered label isn't an arithmetic operand in this first
+ *     cut) and NOT inside a JOIN's ON clause or a qualified `table.column`
+ *     context (arithmetic operands are always a single unqualified
+ *     identifier). At most ONE operation, not a full expression grammar --
+ *     `price * 1.1 > 100` parses; `price * 1.1 + tax > 100` does not (a
+ *     real, named ceiling, matching this whole roadmap's "smallest real
+ *     version first" posture). The SAME arith_expr grammar also gives
+ *     `UPDATE ... SET column = arith_expr` (e.g. `SET price = price *
+ *     1.1`), evaluated per row against that row's OWN pre-UPDATE snapshot
+ *     -- when a statement has
+ *     multiple SET assignments, every arithmetic expression is computed
+ *     from the row as it was BEFORE the statement, not chained sequentially
+ *     (`SET a = a + 1, b = a` -- `b` sees `a`'s OLD value), matching
+ *     standard SQL semantics, not implementation-order-dependent behavior.
+ *   - A real lexer wrinkle, inherited rather than introduced by this phase:
+ *     the pre-existing number-literal rule treats a `-` immediately
+ *     followed by a digit as part of a negative-number literal regardless
+ *     of context (there was no MINUS operator token before this phase to
+ *     disambiguate against). This phase adds `+`/`-`/`/` as real operator
+ *     tokens (`*` already existed), but ONLY when `-` is NOT immediately
+ *     followed by a digit -- so subtracting a positive numeric literal
+ *     needs a space after the minus sign (`price - 1` parses as
+ *     subtraction; `price -1` and `price-1` both still lex as a single
+ *     negative-number token, same as every literal negative number
+ *     elsewhere in this grammar already did, and fail to parse as
+ *     intended). Subtracting a COLUMN (`price - discount`) is unaffected,
+ *     since a column reference never starts with a digit. Named here
+ *     explicitly rather than silently traded away -- fixing it properly
+ *     would mean moving negative-literal handling from the lexer into
+ *     every `parse_literal()` call site, a larger change than this phase's
+ *     own scope justifies.
+ *   - `IS NULL`/`IS NOT NULL` is explicitly NOT built here, deferred
+ *     whole to Phase 4 (real NULL) rather than building against a NULL
+ *     representation that doesn't exist yet.
  */
 #ifndef SQL_PARSER_H
 #define SQL_PARSER_H
@@ -300,8 +386,22 @@ struct SqlInsertStmt {
 struct SqlUpdateStmt {
     char     table_name[OBJECT_NAME_LEN];
     char     set_columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
-    char     set_values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
+    char     set_values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];   // meaningful iff !set_is_arith[i] (byte-for-byte pre-Phase-3 shape)
     uint32_t set_count;
+
+    // ── Phase 3 (SQL Feature-Parity Roadmap): SET column = arith_expr
+    // (e.g. `SET price = price * 1.1`), evaluated per row at UPDATE time
+    // against that row's OWN pre-UPDATE values. Purely additive, parallel
+    // to set_columns[]/set_values[] above (not a replacement) -- zero-
+    // default (set_is_arith[i]==0 for every i) keeps every pre-Phase-3
+    // UPDATE statement byte-for-byte identical, using set_values[i]
+    // exactly as before. See predicate.h for the shared PredArithOperand/
+    // PredArithOp/predicate_eval_arith() machinery this reuses. ──────────
+    uint8_t                 set_is_arith[ROWSTORE_MAX_COLUMNS];
+    struct PredArithOperand set_arith_op1[ROWSTORE_MAX_COLUMNS];
+    PredArithOp              set_arith_op[ROWSTORE_MAX_COLUMNS];
+    struct PredArithOperand set_arith_op2[ROWSTORE_MAX_COLUMNS];   // unused when set_arith_op[i] == PRED_ARITH_NONE
+
     uint8_t  has_where;
     struct Predicate where;
 };

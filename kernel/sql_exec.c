@@ -170,6 +170,15 @@ static int predicate_columns_valid(const struct Predicate* pred, uint32_t idx,
     if (idx >= pred->node_count) return 0;
     const struct PredicateNode* n = &pred->nodes[idx];
     if (n->kind == PRED_NODE_COMPARISON) return find_column_index(layout, n->column_name) != 0xFFFFFFFFu;
+    // Phase 3 (SQL Feature-Parity Roadmap): an arithmetic-comparison leaf
+    // has no bare column_name (see predicate.h) -- validate each operand
+    // that IS a column reference instead; a numeric-literal operand needs
+    // no column lookup at all.
+    if (n->kind == PRED_NODE_ARITH_COMPARISON) {
+        if (n->arith_op1.is_column && find_column_index(layout, n->arith_op1.text) == 0xFFFFFFFFu) return 0;
+        if (n->arith_op != PRED_ARITH_NONE && n->arith_op2.is_column && find_column_index(layout, n->arith_op2.text) == 0xFFFFFFFFu) return 0;
+        return 1;
+    }
     return predicate_columns_valid(pred, n->left, layout) && predicate_columns_valid(pred, n->right, layout);
 }
 
@@ -1067,6 +1076,24 @@ static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUp
         }
         set_cols[i] = col;
     }
+    // Phase 3 (SQL Feature-Parity Roadmap): validate every arithmetic SET
+    // value's column operand(s) up front -- same "validate cheaply first,
+    // scan expensively second" discipline every other exec_* function in
+    // this file already follows for WHERE/ORDER BY/SELECT-list columns.
+    for (uint32_t i = 0; i < s->set_count; i++) {
+        if (!s->set_is_arith[i]) continue;
+        if (s->set_arith_op1[i].is_column && find_column_index(layout, s->set_arith_op1[i].text) == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "SET arithmetic expression references an unknown column", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (s->set_arith_op[i] != PRED_ARITH_NONE && s->set_arith_op2[i].is_column &&
+            find_column_index(layout, s->set_arith_op2[i].text) == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "SET arithmetic expression references an unknown column", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
     if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, layout)) {
         out->error = SQL_ERR_COLUMN_NOT_FOUND;
         se_strcpy(out->error_msg, "WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
@@ -1090,8 +1117,40 @@ static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUp
     for (uint32_t i = 0; i < n; i++) {
         struct RowValues rv;
         if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &rv) != MVCC_OK) continue;
+
+        // Phase 3 (SQL Feature-Parity Roadmap): compute every SET value into
+        // a scratch array FIRST, from the pristine pre-UPDATE `rv` snapshot,
+        // before applying ANY of them. This matters when a statement has
+        // multiple SET assignments and one arithmetic expression references
+        // a column another assignment is also setting (e.g. `SET a = a + 1,
+        // b = a`) -- standard SQL semantics require `b` to see `a`'s value
+        // as it was BEFORE this statement, not an implementation-order-
+        // dependent intermediate value. Evaluating against `rv` here (never
+        // against a partially-mutated copy) guarantees that.
+        char new_values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
+        int  bad_arith = 0;
+        for (uint32_t j = 0; j < s->set_count; j++) {
+            if (!s->set_is_arith[j]) {
+                se_strcpy(new_values[j], s->set_values[j], RECORD_VAL_LEN);
+                continue;
+            }
+            double result;
+            if (predicate_eval_arith(layout, &rv, s->set_arith_op1[j], s->set_arith_op[j],
+                                      s->set_arith_op2[j], &result) != 0) {
+                bad_arith = 1;
+                break;
+            }
+            se_fmt_f64(new_values[j], RECORD_VAL_LEN, result);
+        }
+        if (bad_arith) {
+            out->error = SQL_ERR_VALUE_INVALID;
+            se_strcpy(out->error_msg, "SET arithmetic expression could not be evaluated for a matched row "
+                      "(non-numeric operand or division by zero)", SQL_ERR_MSG_LEN);
+            out->affected_rows = 0;
+            return;
+        }
         for (uint32_t j = 0; j < s->set_count; j++)
-            se_strcpy(rv.values[set_cols[j]], s->set_values[j], RECORD_VAL_LEN);
+            se_strcpy(rv.values[set_cols[j]], new_values[j], RECORD_VAL_LEN);
         MvccError rc = mvcc_row_update(txn_id, caller_uid, s->table_name, ids[i], &rv);
         // Phase 23 fix: this used to special-case only MVCC_ERR_WRITE_CONFLICT
         // and silently drop any other non-OK rc (constraint violations

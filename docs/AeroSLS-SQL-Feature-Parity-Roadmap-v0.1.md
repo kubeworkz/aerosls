@@ -302,7 +302,7 @@ change surface).
 
 ---
 
-## Phase 3 — WHERE/SET expression richness
+## Phase 3 — WHERE/SET expression richness — DONE
 
 **Goal:** parenthesized grouping, `IN (...)`, `LIKE`, `IS NULL`/`IS NOT
 NULL`, and basic arithmetic (`+ - * /`) in `WHERE`/`SET`/`HAVING`.
@@ -330,6 +330,128 @@ including the NULL-representation decision from Phase 4); compile-check;
 regression sweep confirming existing flat `AND`/`OR` queries parse
 identically (this phase changes the predicate tree's *shape* capability,
 not its meaning for statements that don't use the new grouping).
+
+### Scope correction made during implementation
+
+Three of the four planned features needed **zero runtime changes** to
+`predicate.c` — only `sql_parser.c` grammar work — confirming the original
+draft's instinct that these are parser-side additions, not new predicate
+machinery: parenthesized grouping reuses `eval_node()`'s existing recursion
+through an arbitrarily-nested `AND`/`OR` tree (it was always the parser
+that only ever built a flat shape); `IN (a, b, c)` desugars at parse time
+into `(col = a) OR (col = b) OR (col = c)` via the already-existing
+`predicate_add_comparison()`/`predicate_add_or()` primitives, no new node
+kind; `LIKE` is a new `PRED_OP_LIKE` value on the existing
+`PredicateCompareOp` enum, not a new node kind either (`%`/`_` wildcards
+only, `STRING` columns only — fails closed, no coercion, for non-`STRING`
+columns; no `ESCAPE` clause). Arithmetic (`+ - * /`) is the one genuinely
+new piece of machinery: a new `PRED_NODE_ARITH_COMPARISON` node kind,
+deliberately scoped to **at most one operation** per comparison (not a
+full precedence-climbing expression grammar) — `operand [+-*/] operand
+compare_op literal` — where each operand is a single unqualified
+identifier or numeric literal. Division by zero and non-numeric column
+operands (`STRING`/`BOOL`) both fail closed (comparison evaluates false,
+not a crash or `inf`/`NaN`). Arithmetic is available in plain `WHERE`
+comparisons and `UPDATE ... SET` values; it is explicitly NOT available on
+`HAVING`'s aggregate-label comparison form, and NOT inside `ON` clauses.
+
+`IS NULL`/`IS NOT NULL` was **deliberately deferred whole to Phase 4**,
+not built here and not merged — the original draft named "depends on
+Phase 4 landing real NULL first, or this phase and Phase 4 merge" as the
+two options; this phase chose to stay narrower rather than build against
+a `NULL` representation that doesn't exist yet. `NOT IN` and `LIKE`'s
+`ESCAPE` clause are likewise named out of scope, not oversights (both
+verified via a dedicated parser-level test confirming they fail to parse
+cleanly rather than silently misbehaving).
+
+A real, if narrow, **lexer ambiguity** was found and deliberately left
+narrow rather than fixed more invasively: the pre-existing number-literal
+rule (`-` immediately followed by a digit → a single negative-number
+token) is checked before the new `+`/`-`/`/` operator tokens, unconditionally.
+This means `price - 1` (space on both sides of `-`) parses correctly as
+subtraction, but `price -1` or `price-1` (no space between `-` and the
+digit) still lex as a single negative-number token and fail to parse as
+subtraction. Fixing this properly would mean moving negative-literal
+parsing out of the lexer and into every `parse_literal()` call site — many
+call sites, meaningfully higher regression risk for a rarely-hit edge
+case — so this phase named the limitation explicitly instead of guessing.
+Subtracting a column (`price - discount`) is unaffected, since columns
+never start with a digit.
+
+A real **regression was caught during verification**, not by inspection:
+the one-operand lookahead `parse_comparison()` needs to disambiguate a
+plain column reference from the start of an arithmetic expression
+(`parse_arith_operand()`) was written to accept only a single unqualified
+`TOK_IDENT` — silently breaking every qualified `table.column`/`alias.column`
+reference on a plain `WHERE` comparison's left-hand side, since
+`e.name != 'alice'` would parse `e` as the operand and leave `.name !=
+'alice'` unconsumed. This didn't show up in this phase's own new host test
+(which only exercises single-table queries), but the full regression sweep
+caught it immediately: `sql_join2_phase2_host_test.c` scenario 4 and three
+scenarios in `sql_join_host_test.c` (the Phase 20 regression test) started
+failing — every one of them a `WHERE` clause with a qualified column name
+on a joined query. Fixed by teaching `parse_arith_operand()` to also
+consume an optional `.ident` qualifier suffix (byte-identical to
+`parse_column_ref()`'s own dot-handling), then having `parse_comparison()`
+check for a `.` in the parsed operand text and — when present — skip the
+arithmetic-operator lookahead entirely and fall straight through to the
+byte-compatible `parse_comparison_tail()` path, restoring pre-Phase-3
+behavior for every qualified `WHERE` comparison exactly. (A qualified
+column was never meant to be a valid arithmetic operand per this phase's
+own scope — the fix only restores the *non*-arithmetic path for qualified
+names, it doesn't extend arithmetic to JOINs.)
+
+Design decisions made explicit, matching this whole roadmap's "flag the
+limitation, don't silently pick a convention" posture:
+  - `UPDATE ... SET` arithmetic reuses the exact same `PredArithOperand`/
+    `PredArithOp`/`predicate_eval_arith()` machinery as `WHERE`, via new
+    additive parallel arrays on `SqlUpdateStmt` (`set_is_arith[]`/
+    `set_arith_op1[]`/`set_arith_op[]`/`set_arith_op2[]`) added alongside
+    the untouched pre-existing `set_columns[]`/`set_values[]`/`set_count`
+    — specifically so `tests/sql_parser_host_test.c`'s direct reads of
+    those original fields keep working unchanged.
+  - When an `UPDATE` has multiple `SET` assignments, every arithmetic
+    expression is computed from the row **as it was before the
+    statement** — a pristine pre-`UPDATE` snapshot — not chained in
+    left-to-right order. `SET a = a + 1, b = a` sees `b` get `a`'s OLD
+    value, matching standard SQL semantics rather than implementation-
+    order-dependent behavior. Implemented by computing every `SET`
+    value into a scratch array first (all reads against the untouched
+    fetched row), then applying the whole scratch array to the row only
+    after every value is computed.
+  - An arithmetic `SET` failing to evaluate (non-numeric operand,
+    division by zero) aborts the whole statement with
+    `SQL_ERR_VALUE_INVALID` and zero affected rows — matching this
+    function's existing write-conflict/constraint-violation "fail
+    cleanly, no partial effects" posture, not a partial update.
+  - `try_index_assisted_eq()` needed no changes at all: its existing guard
+    (`n->kind != PRED_NODE_COMPARISON || n->op != PRED_OP_EQ`) already
+    correctly declines the index fast-path for both new cases
+    (`PRED_NODE_ARITH_COMPARISON` is the wrong kind, `PRED_OP_LIKE` is the
+    wrong op), falling back to a full scan safely — confirmed by reading
+    the guard directly, not just assumed.
+
+**Verification — actual results:** `tests/sql_expr_phase3_host_test.c`
+(new, 34 checks) covers parenthesized grouping actually changing
+precedence versus the same clause ungrouped (not just parsing); `IN`
+membership including zero-match and single-value cases; `LIKE` with `%`
+and `_` wildcards, a non-matching pattern, and LIKE against a non-`STRING`
+column failing closed; arithmetic `WHERE` comparisons (`price * 2 > 40`,
+`price + 5 = 15`) and division-by-zero failing closed; arithmetic `SET`
+(`price = price * 1.1`), a multi-assignment `UPDATE` mixing one arithmetic
+and one literal `SET`, and the pre-`UPDATE`-snapshot old-value semantic;
+an arithmetic `SET` referencing a non-numeric column failing closed with
+`SQL_ERR_VALUE_INVALID`; parser-level checks confirming `NOT IN`, `IS
+NULL`, and multi-operation arithmetic all correctly fail to parse (named
+out-of-scope items, not silent misbehavior); and permission denial
+propagating cleanly through the new `LIKE`/arithmetic predicate kinds.
+Full regression sweep (`tests/run_all.sh`): **30/30 host test files
+passing, 0 failed** — includes the new file and, after the qualified-
+column regression fix above, every JOIN test (`sql_join_host_test.c`,
+`sql_join2_phase2_host_test.c`) and every other `sql_*_host_test.c` file
+unchanged. `net/http.c` compile-checked clean against the updated
+`sql_exec.h`/`sql_parser.h`/`predicate.h` (same pre-existing, unrelated
+`-Wimplicit-function-declaration` warnings as Phases 1 and 2 — no errors).
 
 ---
 

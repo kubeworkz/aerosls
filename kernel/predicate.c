@@ -97,6 +97,24 @@ uint32_t predicate_add_or(struct Predicate* p, uint32_t left, uint32_t right) {
     return add_logical(p, PRED_NODE_OR, left, right);
 }
 
+// Phase 3 (SQL Feature-Parity Roadmap): see predicate.h.
+uint32_t predicate_add_arith_comparison(struct Predicate* p, struct PredArithOperand op1,
+                                        PredArithOp arith_op, struct PredArithOperand op2,
+                                        PredicateCompareOp cmp_op, const char* literal) {
+    if (!p || p->node_count >= PREDICATE_MAX_NODES) return PREDICATE_INVALID_NODE;
+    struct PredicateNode* n = &p->nodes[p->node_count];
+    n->kind = PRED_NODE_ARITH_COMPARISON;
+    n->column_name[0] = '\0';
+    n->op = cmp_op;
+    pe_strcpy(n->literal, literal ? literal : "", RECORD_VAL_LEN);
+    n->arith_op1 = op1;
+    n->arith_op  = arith_op;
+    n->arith_op2 = op2;
+    n->left = PREDICATE_INVALID_NODE;
+    n->right = PREDICATE_INVALID_NODE;
+    return p->node_count++;
+}
+
 // ─── Type-aware comparison ───────────────────────────────────────────────
 // Resolves column_name against layout, parses both the row's stored text
 // value and the predicate's literal text according to the column's
@@ -137,8 +155,115 @@ static int compare_typed(const struct RowTableLayout* layout, const struct RowVa
     }
 }
 
+// Phase 3 (SQL Feature-Parity Roadmap): '%' matches any sequence (including
+// empty), '_' matches exactly one character, no ESCAPE clause (a literal
+// '%'/'_' in the pattern can't be matched in this first cut -- see
+// predicate.h). Iterative two-pointer matcher (the classic wildcard-match
+// algorithm), not recursive, keeping stack depth bounded regardless of
+// pattern/text length -- this codebase's usual freestanding-kernel caution.
+static int pe_like_match(const char* pattern, const char* text) {
+    uint32_t plen = pe_strlen(pattern), tlen = pe_strlen(text);
+    uint32_t pi = 0, ti = 0;
+    uint32_t star_p = 0xFFFFFFFFu, star_t = 0;
+    while (ti < tlen) {
+        if (pi < plen && (pattern[pi] == '_' || pattern[pi] == text[ti])) {
+            pi++; ti++;
+        } else if (pi < plen && pattern[pi] == '%') {
+            star_p = pi; star_t = ti; pi++;
+        } else if (star_p != 0xFFFFFFFFu) {
+            pi = star_p + 1; star_t++; ti = star_t;
+        } else {
+            return 0;
+        }
+    }
+    while (pi < plen && pattern[pi] == '%') pi++;
+    return pi == plen;
+}
+
+// Phase 3: resolves one arithmetic operand to a double -- a numeric literal
+// parses directly; a column operand must resolve against layout and be a
+// UINT64/FLOAT column (STRING/BOOL fail closed, no numeric coercion
+// invented for them). Returns 0 on success (fills *out), 1 on any failure.
+static int resolve_arith_operand(const struct RowTableLayout* layout, const struct RowValues* row,
+                                 struct PredArithOperand op, double* out) {
+    if (!op.is_column) return pe_parse_f64(op.text, out);
+    uint32_t col = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < layout->column_count; i++) {
+        if (pe_streq(layout->column_names[i], op.text)) { col = i; break; }
+    }
+    if (col == 0xFFFFFFFFu || col >= row->count) return 1;
+    switch (layout->column_types[col]) {
+        case FIELD_TYPE_UINT64: {
+            uint64_t v;
+            if (pe_parse_u64(row->values[col], &v)) return 1;
+            *out = (double)v;
+            return 0;
+        }
+        case FIELD_TYPE_FLOAT:
+            return pe_parse_f64(row->values[col], out);
+        case FIELD_TYPE_STRING:
+        case FIELD_TYPE_BOOL:
+        default:
+            return 1;   // not numeric -- fail closed, no coercion
+    }
+}
+
+int predicate_eval_arith(const struct RowTableLayout* layout, const struct RowValues* row,
+                         struct PredArithOperand op1, PredArithOp arith_op, struct PredArithOperand op2,
+                         double* out) {
+    if (!layout || !row) return 1;
+    double a;
+    if (resolve_arith_operand(layout, row, op1, &a)) return 1;
+    if (arith_op == PRED_ARITH_NONE) { *out = a; return 0; }
+    double b;
+    if (resolve_arith_operand(layout, row, op2, &b)) return 1;
+    switch (arith_op) {
+        case PRED_ARITH_ADD: *out = a + b; return 0;
+        case PRED_ARITH_SUB: *out = a - b; return 0;
+        case PRED_ARITH_MUL: *out = a * b; return 0;
+        case PRED_ARITH_DIV:
+            if (b == 0.0) return 1;   // division by zero fails closed, not inf/NaN
+            *out = a / b;
+            return 0;
+        default: return 1;
+    }
+}
+
 static int eval_comparison(const struct PredicateNode* n, const struct RowTableLayout* layout,
                            const struct RowValues* row) {
+    // Phase 3: arithmetic-comparison leaf -- the left-hand side is a
+    // computed double, not a typed row value, so it's always compared
+    // numerically against the (also-numeric) literal, never via
+    // compare_typed()'s column-type-aware string/bool/etc. paths.
+    if (n->kind == PRED_NODE_ARITH_COMPARISON) {
+        double lhs;
+        if (predicate_eval_arith(layout, row, n->arith_op1, n->arith_op, n->arith_op2, &lhs)) return 0;
+        double rhs;
+        if (pe_parse_f64(n->literal, &rhs)) return 0;
+        int cmp = (lhs > rhs) - (lhs < rhs);
+        switch (n->op) {
+            case PRED_OP_EQ: return cmp == 0;
+            case PRED_OP_NE: return cmp != 0;
+            case PRED_OP_LT: return cmp <  0;
+            case PRED_OP_GT: return cmp >  0;
+            case PRED_OP_LE: return cmp <= 0;
+            case PRED_OP_GE: return cmp >= 0;
+            default:         return 0;
+        }
+    }
+
+    // Phase 3: LIKE -- STRING columns only (fail closed otherwise), pattern
+    // matching instead of compare_typed()'s ordering comparison.
+    if (n->op == PRED_OP_LIKE) {
+        uint32_t col = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < layout->column_count; i++) {
+            if (pe_streq(layout->column_names[i], n->column_name)) { col = i; break; }
+        }
+        if (col == 0xFFFFFFFFu || col >= row->count) return 0;
+        if (layout->column_types[col] != FIELD_TYPE_STRING) return 0;
+        return pe_like_match(n->literal, row->values[col]);
+    }
+
     int fail = 0;
     int cmp = compare_typed(layout, row, n->column_name, n->literal, &fail);
     if (fail) return 0;   // unresolvable column / unparseable literal -- fail closed
@@ -158,10 +283,11 @@ static int eval_node(const struct Predicate* p, uint32_t idx, const struct RowTa
     if (idx >= p->node_count) return 0;   // malformed tree -- fail closed, not a crash
     const struct PredicateNode* n = &p->nodes[idx];
     switch (n->kind) {
-        case PRED_NODE_COMPARISON: return eval_comparison(n, layout, row);
-        case PRED_NODE_AND:        return eval_node(p, n->left, layout, row) && eval_node(p, n->right, layout, row);
-        case PRED_NODE_OR:         return eval_node(p, n->left, layout, row) || eval_node(p, n->right, layout, row);
-        default:                   return 0;
+        case PRED_NODE_COMPARISON:        return eval_comparison(n, layout, row);
+        case PRED_NODE_ARITH_COMPARISON:  return eval_comparison(n, layout, row);
+        case PRED_NODE_AND:               return eval_node(p, n->left, layout, row) && eval_node(p, n->right, layout, row);
+        case PRED_NODE_OR:                return eval_node(p, n->left, layout, row) || eval_node(p, n->right, layout, row);
+        default:                          return 0;
     }
 }
 

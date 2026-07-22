@@ -35,6 +35,50 @@
  * decide table-scan vs. index-scan; that's Phase 19's job, once it exists
  * to make the choice. This phase only proves the predicate itself is
  * correct and that a full-table scan can be filtered by one.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 3: WHERE/SET expression richness ─────
+ * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) Promotes three of the
+ * four items this file's own header comment above named out of scope:
+ * parenthesized grouping, `IN (...)`, and `LIKE`. Arithmetic (`+ - * /`) is
+ * also added, in `WHERE`/`HAVING` comparisons and `UPDATE ... SET`. `IS
+ * NULL`/`IS NOT NULL` is deliberately NOT included here -- the roadmap
+ * named it as depending on real `NULL` (Phase 4) or a merge with this
+ * phase; this phase chose to stay narrower and defer it to Phase 4 outright
+ * rather than build against a NULL representation that doesn't exist yet.
+ *
+ * Each addition reuses this file's EXISTING machinery rather than inventing
+ * a parallel system, matching this whole roadmap's posture:
+ *   - Parenthesized grouping needed ZERO changes here. `eval_node()` below
+ *     already recurses through an arbitrarily-shaped AND/OR tree -- it was
+ *     always the PARSER (sql_parser.c) that only ever built a flat
+ *     `and_expr (OR and_expr)*` shape, never nested by explicit parens.
+ *     Grouping is a pure parser-side change (parenthesized predicate
+ *     recursively calls back into the same predicate-parsing entry point).
+ *   - `IN (a, b, c)` needed ZERO changes here either -- it desugars at
+ *     PARSE time into `(col = a) OR (col = b) OR (col = c)` using the
+ *     already-existing `predicate_add_comparison()`/`predicate_add_or()`
+ *     primitives, not a new node kind. `NOT IN` is not implemented.
+ *   - `LIKE` reuses the existing `PRED_NODE_COMPARISON` leaf shape
+ *     unchanged (a new `PRED_OP_LIKE` value for the existing `op` field is
+ *     the only change to that struct) -- `%`/`_` wildcard matching against
+ *     the row's STRING-typed column value; a `LIKE` against a non-STRING
+ *     column fails closed (false), not a type coercion. No `ESCAPE` clause
+ *     in this first cut, so a literal `%`/`_` in the pattern can't be
+ *     matched -- named here, not silently dropped.
+ *   - Arithmetic is the one genuinely new node kind (`PRED_NODE_ARITH_
+ *     COMPARISON`) and the one genuinely new evaluation path
+ *     (`predicate_eval_arith()`), since a computed numeric value has no
+ *     existing primitive to reuse. Deliberately narrow: at most ONE
+ *     arithmetic operation (`operand [+-*\/] operand`, not a full
+ *     precedence-climbing expression grammar), each operand a plain
+ *     unqualified column reference or a numeric literal (no `table.column`
+ *     qualifiers -- arithmetic is scoped to single-table WHERE/SET, not
+ *     JOIN chains). A UINT64/FLOAT column resolves to its numeric value; a
+ *     STRING/BOOL column operand fails closed. Division by zero fails
+ *     closed (the comparison is false), not `inf`/`NaN`. `predicate_eval_
+ *     arith()` is exported specifically so `sql_exec.c`'s `UPDATE ... SET
+ *     col = expr` support (e.g. `SET price = price * 1.1`) can reuse the
+ *     exact same operand-resolution logic instead of a second copy.
  */
 #ifndef PREDICATE_H
 #define PREDICATE_H
@@ -53,23 +97,59 @@ typedef enum {
     PRED_OP_GT,
     PRED_OP_LE,
     PRED_OP_GE,
+    PRED_OP_LIKE,   // Phase 3 (SQL Feature-Parity Roadmap): STRING columns only, '%'/'_' wildcards, no ESCAPE
 } PredicateCompareOp;
 
 typedef enum {
     PRED_NODE_COMPARISON = 0,
     PRED_NODE_AND,
     PRED_NODE_OR,
+    PRED_NODE_ARITH_COMPARISON,   // Phase 3 (SQL Feature-Parity Roadmap): see below
 } PredicateNodeKind;
 
-// ─── One node — either a typed comparison leaf or an AND/OR combinator. ────
+// Phase 3 (SQL Feature-Parity Roadmap): one operand of a small arithmetic
+// expression -- either a plain unqualified column reference (resolved
+// against the row/layout at eval time) or a numeric literal, exactly as
+// written by the parser. text[] holds whichever text is appropriate;
+// RECORD_KEY_LEN is plenty for either (column names are already capped
+// there, and a numeric literal is always short).
+struct PredArithOperand {
+    uint8_t is_column;
+    char    text[RECORD_KEY_LEN];
+};
+
+// Phase 3: which arithmetic operation combines two operands. PRED_ARITH_
+// NONE means "just operand1, no operation" -- used by predicate_eval_arith()
+// callers (like sql_exec.c's UPDATE ... SET) that want a single-operand
+// value (a plain column copy or literal) through the same evaluation path.
+typedef enum {
+    PRED_ARITH_NONE = 0,
+    PRED_ARITH_ADD,
+    PRED_ARITH_SUB,
+    PRED_ARITH_MUL,
+    PRED_ARITH_DIV,
+} PredArithOp;
+
+// ─── One node — either a typed comparison leaf, an arithmetic-comparison
+// leaf (Phase 3), or an AND/OR combinator. ──────────────────────────────────
 struct PredicateNode {
     PredicateNodeKind kind;
-    // meaningful when kind == PRED_NODE_COMPARISON
+    // meaningful when kind == PRED_NODE_COMPARISON or PRED_NODE_ARITH_COMPARISON
+    // (both use `op` as the comparison operator and `literal` as the
+    // right-hand-side text; only PRED_NODE_COMPARISON uses column_name --
+    // PRED_NODE_ARITH_COMPARISON's left-hand side is arith_op1/arith_op/
+    // arith_op2 below instead of a bare column name)
     char               column_name[RECORD_KEY_LEN];
     PredicateCompareOp op;
     char               literal[RECORD_VAL_LEN];   // text, matching RowValues' own
                                                     // "everything is text at the API
                                                     // boundary" convention
+    // meaningful when kind == PRED_NODE_ARITH_COMPARISON (Phase 3): the
+    // left-hand side is arith_op1 [arith_op arith_op2] instead of a bare
+    // column_name -- see predicate_eval_arith() below.
+    struct PredArithOperand arith_op1;
+    PredArithOp              arith_op;
+    struct PredArithOperand arith_op2;   // unused when arith_op == PRED_ARITH_NONE
     // meaningful when kind == PRED_NODE_AND / PRED_NODE_OR
     uint32_t left;
     uint32_t right;
@@ -99,6 +179,29 @@ uint32_t predicate_add_comparison(struct Predicate* p, const char* column_name,
 // index is out of range.
 uint32_t predicate_add_and(struct Predicate* p, uint32_t left, uint32_t right);
 uint32_t predicate_add_or(struct Predicate* p, uint32_t left, uint32_t right);
+
+// Phase 3 (SQL Feature-Parity Roadmap): appends an arithmetic-comparison
+// leaf (`op1 [arith_op op2] cmp_op literal`) -- see the header comment
+// above. Returns its node index, or PREDICATE_INVALID_NODE if the node
+// pool is exhausted, same convention as predicate_add_comparison().
+uint32_t predicate_add_arith_comparison(struct Predicate* p, struct PredArithOperand op1,
+                                        PredArithOp arith_op, struct PredArithOperand op2,
+                                        PredicateCompareOp cmp_op, const char* literal);
+
+// Phase 3: resolves and computes a small arithmetic expression (op1
+// [arith_op op2]) against one row -- shared by this file's own
+// PRED_NODE_ARITH_COMPARISON evaluation (below) and sql_exec.c's
+// UPDATE ... SET column = expr support, so both use exactly the same
+// operand-resolution logic rather than two copies. Returns 0 on success
+// (fills *out), 1 if a column operand doesn't resolve against layout, its
+// column type isn't numeric (UINT64/FLOAT), its stored text fails to
+// parse, a literal operand's text fails to parse, or (arith_op ==
+// PRED_ARITH_DIV) op2 evaluates to exactly zero -- fail-closed in every
+// case, the caller decides what that means (a false comparison, or a
+// query error for UPDATE ... SET).
+int predicate_eval_arith(const struct RowTableLayout* layout, const struct RowValues* row,
+                         struct PredArithOperand op1, PredArithOp arith_op, struct PredArithOperand op2,
+                         double* out);
 
 // ─── Evaluation ─────────────────────────────────────────────────────────────
 // Evaluates p against one row, given its table's layout (for column name ->
