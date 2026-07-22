@@ -25,6 +25,20 @@ static uint64_t physical_memory_bitmap[TOTAL_FRAMES / 64];
 static uint64_t partition_frame_usage[PARTITION_MAX];
 static uint64_t partition_frame_quota[PARTITION_MAX];
 
+/* Multi-Node Partition Scaling Roadmap Phase 3: real per-frame ownership,
+ * one byte per physical frame, alongside the aggregate-only counter above.
+ * BSS zero-init means every entry starts as PARTITION_SYSTEM (0) by
+ * default -- indistinguishable, by value alone, from "genuinely allocated
+ * to PARTITION_SYSTEM." That ambiguity is safe by construction: every
+ * reader of this array (partition_reclaim_all_frames() below) also checks
+ * physical_memory_bitmap's real allocated bit before ever acting on a
+ * frame_owner[] value, so a never-allocated frame's default-0 owner tag is
+ * never mistaken for a real, live PARTITION_SYSTEM allocation -- the same
+ * "0 is honest, verify before trusting" discipline partition_owner_table[]
+ * uses one layer up in kernel/partition.c. See frame_pool.h's own comment
+ * on partition_reclaim_all_frames() for the full design writeup. */
+static uint8_t frame_owner[TOTAL_FRAMES];
+
 static void *alloc_raw_frame(void)
 {
     // Start at frame 1 (skip frame 0: address 0x0 == NULL in C)
@@ -50,7 +64,13 @@ static void *alloc_raw_frame(void)
 void *allocate_physical_ram_frame(void)
 {
     void *frame = alloc_raw_frame();
-    if (frame) partition_frame_usage[PARTITION_SYSTEM]++;
+    if (frame) {
+        partition_frame_usage[PARTITION_SYSTEM]++;
+        // Multi-Node Partition Scaling Roadmap Phase 3: tag the owner the
+        // same way the usage counter already attributes this path -- see
+        // frame_owner[]'s own comment above.
+        frame_owner[(uint64_t)(uintptr_t)frame / FRAME_SIZE] = (uint8_t)PARTITION_SYSTEM;
+    }
     return frame;
 }
 
@@ -67,7 +87,13 @@ void *allocate_physical_ram_frame_for_partition(uint32_t partition_id)
     }
 
     void *frame = alloc_raw_frame();
-    if (frame) partition_frame_usage[partition_id]++;
+    if (frame) {
+        partition_frame_usage[partition_id]++;
+        // Multi-Node Partition Scaling Roadmap Phase 3: real per-frame
+        // ownership tag -- this is what makes partition_reclaim_all_
+        // frames() below possible for frames allocated through this path.
+        frame_owner[(uint64_t)(uintptr_t)frame / FRAME_SIZE] = (uint8_t)partition_id;
+    }
     return frame;
 }
 
@@ -85,6 +111,12 @@ static int free_raw_frame(void* addr) {
     int    bit  = (int)(frame_index % 64);
     if (!(physical_memory_bitmap[word] & (1ULL << bit))) return 1;  // not allocated -- double free or bogus
     physical_memory_bitmap[word] &= ~(1ULL << bit);
+    // Multi-Node Partition Scaling Roadmap Phase 3: reset the owner tag
+    // back to the default (0/PARTITION_SYSTEM, indistinguishable from
+    // "never allocated" by value alone -- see frame_owner[]'s own comment
+    // on why that's safe) so a freed frame never carries a stale owner
+    // into whatever the next allocate_*() call reuses it for.
+    frame_owner[frame_index] = (uint8_t)PARTITION_SYSTEM;
     return 0;
 }
 
@@ -133,6 +165,42 @@ int partition_reset_frame_usage(uint32_t partition_id)
                          "this does not reclaim physical frames).\n",
                          (unsigned)partition_id);
     return 0;
+}
+
+uint32_t partition_reclaim_all_frames(uint32_t partition_id)
+{
+    if (partition_id >= PARTITION_MAX) return 0xFFFFFFFFu;
+
+    uint32_t freed = 0;
+    // Start at frame 1, same skip-frame-0 discipline as alloc_raw_frame()/
+    // free_raw_frame() (frame 0 = address 0x0 = NULL, never handed out).
+    for (uint64_t frame_index = 1; frame_index < TOTAL_FRAMES; frame_index++) {
+        if (frame_owner[frame_index] != (uint8_t)partition_id) continue;
+        size_t word = frame_index / 64;
+        int    bit  = (int)(frame_index % 64);
+        // Defensive, matches this project's discipline everywhere else in
+        // this file: an owner tag without the bitmap bit actually set
+        // shouldn't happen (free_raw_frame() always clears both together),
+        // but this never trusts frame_owner[] alone as proof of a live
+        // allocation -- see frame_owner[]'s own comment on why the BSS-
+        // zero default value is otherwise ambiguous with PARTITION_SYSTEM.
+        if (!(physical_memory_bitmap[word] & (1ULL << bit))) continue;
+        physical_memory_bitmap[word] &= ~(1ULL << bit);
+        frame_owner[frame_index] = (uint8_t)PARTITION_SYSTEM;
+        freed++;
+    }
+    // Real reclamation happened above -- this reset is now truthful (every
+    // frame that made up the old count has actually been freed), not just
+    // an accounting fiction the way the old partition_destroy() call site
+    // used to leave it.
+    partition_frame_usage[partition_id] = 0;
+
+    kernel_serial_printf(
+        "[QUOTA] partition %u: %u physical frame(s) actually reclaimed "
+        "(bitmap cleared, not just the usage counter -- Multi-Node "
+        "Partition Scaling Roadmap Phase 3).\n",
+        (unsigned)partition_id, (unsigned)freed);
+    return freed;
 }
 
 uint64_t sys_sls_partition_quota_set(struct SLSPartitionQuotaSetRequest* req)

@@ -212,17 +212,23 @@ int partition_destroy(uint32_t partition_id) {
     // (object_catalog.c, mirrors sys_sls_vfree()'s own per-entry actions).
     uint32_t freed_objects = catalog_vfree_partition(partition_id);
 
-    // Step 3: reset frame-usage accounting. ACCOUNTING ONLY -- the underlying
-    // physical frames are not actually reclaimed by this call. Gap
-    // Remediation Phase F added a real free_physical_ram_frame_for_partition()
-    // primitive (frame_pool.h) but does NOT call it here: this partition's
-    // held frames aren't tracked as individual addresses anywhere (only an
-    // aggregate count), so there's no list of frames to pass it. See
-    // frame_pool.h's own comment on free_physical_ram_frame() for the full
-    // explanation, including why a naive page-table walk to recover that
-    // list would itself be unsafe with this kernel's current
-    // user_clone_page_table() design.
-    partition_reset_frame_usage(partition_id);
+    // Step 3 (Multi-Node Partition Scaling Roadmap Phase 3): really reclaim
+    // this partition's physical frames, not just reset the usage counter.
+    // frame_pool.c now tracks a real per-frame owner tag, populated at both
+    // allocate_physical_ram_frame_for_partition() call sites (process.c's
+    // three, loader.c's two -- the ones LPAR Phase 13 already made
+    // partition-aware at allocation time), so partition_reclaim_all_
+    // frames() can walk every frame this partition actually holds and free
+    // each one for real -- closing the gap LPAR Phase 14's own findings
+    // named here (see the LPAR roadmap's §8 addendum) without needing the
+    // separate, still-unsafe per-process page-table walker also named
+    // there: this never touches a process's page table, only frame_pool.c's
+    // own ownership tracking. See frame_pool.h's own comment on
+    // partition_reclaim_all_frames() for the full design writeup, including
+    // the frames this still does NOT reclaim (unaccounted/kernel-
+    // infrastructure allocations, permanently attributed to
+    // PARTITION_SYSTEM, which can never itself be destroyed).
+    uint32_t frames_reclaimed = partition_reclaim_all_frames(partition_id);
 
     // Step 4: clear every uid assignment pointing at this partition. Those
     // uids fall back to PARTITION_DEFAULT automatically the next time
@@ -257,9 +263,10 @@ int partition_destroy(uint32_t partition_id) {
 
     kernel_serial_printf(
         "[PARTITION] destroyed partition %u: %u process(es) killed, "
-        "%u object(s) freed, %u uid assignment(s) cleared.\n",
+        "%u object(s) freed, %u uid assignment(s) cleared, %u physical "
+        "frame(s) reclaimed.\n",
         (unsigned)partition_id, (unsigned)killed, (unsigned)freed_objects,
-        (unsigned)cleared_assignments);
+        (unsigned)cleared_assignments, (unsigned)frames_reclaimed);
 
     persist_partitions();   // Phase 10 -- partition_table[]/partition_assign_table[] mutated
     return 0;

@@ -80,12 +80,16 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) {
     g_vfree_partition_last_arg = partition_id;
     return 3;   /* pretend value, only used to confirm it's plumbed through if needed */
 }
-static int      g_reset_usage_calls = 0;
-static uint32_t g_reset_usage_last_arg = 0xFFFFFFFFu;
-int partition_reset_frame_usage(uint32_t partition_id) {
-    g_reset_usage_calls++;
-    g_reset_usage_last_arg = partition_id;
-    return 0;
+/* Multi-Node Partition Scaling Roadmap Phase 3: partition_destroy() now
+ * calls partition_reclaim_all_frames() instead of partition_reset_frame_
+ * usage() at this step -- same call-tracking-stub technique, just tracking
+ * the new function's calls instead of the old one's. */
+static int      g_reclaim_calls = 0;
+static uint32_t g_reclaim_last_arg = 0xFFFFFFFFu;
+uint32_t partition_reclaim_all_frames(uint32_t partition_id) {
+    g_reclaim_calls++;
+    g_reclaim_last_arg = partition_id;
+    return 7;   /* pretend value, only used to confirm it's plumbed through into the log line if needed */
 }
 uint32_t cluster_local_node_id(void) { return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 
@@ -266,14 +270,14 @@ int main(void) {
     proc_count = 3;
 
     g_vfree_partition_calls = 0;
-    g_reset_usage_calls = 0;
+    g_reclaim_calls = 0;
     int rc = partition_destroy(tid);
     CHECK(rc == 0, "scenario 7: partition_destroy succeeds for a real, active, non-system partition");
     CHECK(!proc_table[0].active && !proc_table[1].active, "scenario 7: both of the destroyed partition's processes are now inactive (real process_kill_partition(), not a stub)");
     CHECK(proc_table[2].active && proc_table[2].partition_id == PARTITION_SYSTEM, "scenario 7: the unrelated PARTITION_SYSTEM process survives destroy untouched");
     CHECK(proc_count == 1, "scenario 7: proc_count reflects exactly the 2 real kills");
     CHECK(g_vfree_partition_calls == 1 && g_vfree_partition_last_arg == tid, "scenario 7: catalog_vfree_partition was called exactly once, with the destroyed partition's id");
-    CHECK(g_reset_usage_calls == 1 && g_reset_usage_last_arg == tid, "scenario 7: partition_reset_frame_usage was called exactly once, with the destroyed partition's id");
+    CHECK(g_reclaim_calls == 1 && g_reclaim_last_arg == tid, "scenario 7: partition_reclaim_all_frames was called exactly once, with the destroyed partition's id (Multi-Node Partition Scaling Roadmap Phase 3 -- replaces the old partition_reset_frame_usage() call site)");
     CHECK(partition_get_for_uid(50) == PARTITION_DEFAULT, "scenario 7: uid 50's assignment was cleared -- resolves back to PARTITION_DEFAULT, exactly as if never assigned");
     CHECK(partition_is_paused(tid) == 0, "scenario 7: destroy also clears any stale pause flag on the freed slot");
 

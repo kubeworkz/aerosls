@@ -95,44 +95,74 @@ uint64_t partition_get_frame_quota(uint32_t partition_id);
  * instead, mirroring the accounted alloc path -- fails (returns 1, bitmap
  * untouched) if partition_id is out of range.
  *
- * NEITHER is currently called from partition_destroy(). See that function's
- * own comment (kernel/partition.c) and the Phase F findings addendum for
- * why: frame_pool.c only ever tracked an aggregate per-partition frame
- * COUNT, never which individual physical frames belong to which partition
- * or which process, so partition_destroy() has no list of addresses to
- * pass here. Building that list would mean walking each of the partition's
- * processes' own page tables at teardown -- and this investigation found
- * that doing so naively would be actively dangerous, not just unbuilt:
- * user_clone_page_table() (arch/x86/user_paging.c) currently clones a new
- * process's PML4 by copying all 512 raw entries from the running kernel's
- * own PML4, meaning a freshly-cloned process's page table can point at
- * intermediate PDPT/PD/PT frames it doesn't itself own and never allocated
- * -- a walker that frees everything reachable from a process's own PML4
- * without first distinguishing "this process's own mappings" from
- * "inherited-by-copy-at-clone-time" entries would free live kernel/shared
- * page-table frames out from under the rest of the system. That's a real,
- * separate, larger project (a correct per-process mapping walker, doubled
- * for both the x86 and RISC-V arch targets this kernel supports) -- named
- * here rather than attempted unsafely in this pass. This phase closes the
- * narrower, concretely-scoped gap the roadmap named: frame_pool.c now HAS a
- * free primitive, for the first time, available to any future caller that
- * does have a specific frame address in hand. */
+ * Multi-Node Partition Scaling Roadmap Phase 3: NEITHER of these two
+ * single-frame primitives is called from partition_destroy() -- it uses
+ * the bulk partition_reclaim_all_frames() below instead, which is built on
+ * top of the same free_raw_frame()-equivalent bitmap-clearing logic these
+ * two use, applied to every frame this partition holds rather than one
+ * address at a time. See partition_reclaim_all_frames()'s own comment for
+ * why a real per-frame owner map makes that safe without needing the
+ * per-process page-table walker described below. */
 int free_physical_ram_frame(void* frame);
 int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id);
 
 /* Phase 14 (LPAR): resets partition_id's frame-usage counter to 0.
- * ACCOUNTING-LEVEL RECLAMATION ONLY — this does NOT clear any bits in the
- * underlying physical bitmap. frame_pool.c only ever tracked an aggregate
- * per-partition frame COUNT (Phase 13's scope), never which individual
- * physical frames belong to which partition, so there is no way to know
- * which bitmap bits to clear. The frames a destroyed partition once held
- * remain permanently marked allocated in physical_memory_bitmap; this call
- * only lets a future allocate_physical_ram_frame_for_partition() against
- * this (possibly reused) partition_id start counting from zero again. See
- * the Phase 14 findings addendum for the full implication. Returns 0 on
- * success, 1 if partition_id is out of range. Called from
- * partition_destroy(). */
+ * ACCOUNTING-LEVEL RESET ONLY — this does NOT clear any bits in the
+ * underlying physical bitmap. As of Multi-Node Partition Scaling Roadmap
+ * Phase 3, partition_destroy() no longer calls this function directly --
+ * it calls partition_reclaim_all_frames() instead, which does real bitmap
+ * reclamation AND zeroes this same counter as part of that (truthfully,
+ * since by then the frames are actually gone, not just uncounted). This
+ * function is kept as a still-valid, lower-level primitive for any future
+ * caller that genuinely wants an accounting-only reset without touching
+ * the bitmap (e.g. correcting a counter known to have drifted for reasons
+ * unrelated to the frames themselves), and remains exactly what it always
+ * was -- see the Phase 14 findings addendum for the original rationale.
+ * Returns 0 on success, 1 if partition_id is out of range. */
 int partition_reset_frame_usage(uint32_t partition_id);
+
+/* Multi-Node Partition Scaling Roadmap Phase 3: real per-partition physical
+ * frame reclamation, closing the gap LPAR Phase 14's own findings named
+ * ("arguably its own phase") and this roadmap's §2 design principle 2
+ * treated as a prerequisite gate before migration (Phase 6) makes the same
+ * leak run on a per-migration clock instead of a per-partition-lifetime one.
+ *
+ * frame_pool.c now keeps a real per-frame owner map (frame_owner[], one
+ * byte per physical frame) alongside the existing bitmap and the Phase 13
+ * aggregate usage COUNTER -- populated at both accounted allocation call
+ * sites (allocate_physical_ram_frame() attributes to PARTITION_SYSTEM,
+ * allocate_physical_ram_frame_for_partition() attributes to the real
+ * caller-supplied partition_id) and cleared back out whenever a frame is
+ * freed through any of the free_* entry points above. This is deliberately
+ * scoped to the frames LPAR Phase 13 already made partition-aware at
+ * allocation time -- process.c's three call sites and loader.c's two -- not
+ * a re-audit of every allocate_physical_ram_frame() call site in the tree;
+ * frames handed out through the plain, unaccounted path (page-table
+ * internals, NVMe queues, SMP stacks, the shared SIMI activation cache,
+ * catalog index nodes) are attributed to PARTITION_SYSTEM the same as
+ * before and are never reclaimed per-partition, since PARTITION_SYSTEM can
+ * never itself be destroyed (partition_destroy() rejects it outright).
+ *
+ * partition_reclaim_all_frames(partition_id) walks the owner map, clears
+ * the bitmap bit and owner tag for every frame this specific partition_id
+ * owns, and zeroes the usage counter once real reclamation is done. This is
+ * safe WITHOUT needing the per-process page-table walker the Phase F
+ * comment above (and the LPAR Phase 14 findings addendum) named as its own,
+ * separate, larger, and currently-unsafe project: this function never
+ * touches any process's page table at all, it only consults frame_pool.c's
+ * own tracking structures for frames that were specifically tagged with a
+ * real partition_id at allocation time. It does not, and cannot, reclaim a
+ * frame a process's page table merely *points at* without frame_pool.c
+ * itself having attributed that frame to the partition being destroyed --
+ * that broader page-table-walker gap (inherited/copied PML4 entries from
+ * user_clone_page_table()'s current design) remains exactly as unresolved
+ * and exactly as named as it was before this phase.
+ *
+ * Returns the number of frames actually reclaimed (0 or more -- 0 is a
+ * legitimate answer for a partition that never allocated through the
+ * accounted path), or 0xFFFFFFFFu if partition_id is out of range, mirroring
+ * partition_create()'s own out-of-range sentinel convention. */
+uint32_t partition_reclaim_all_frames(uint32_t partition_id);
 
 /* Debug/introspection listing, mirrors sys_sls_partition_list()'s style. */
 void sys_sls_partition_quota_list(void);

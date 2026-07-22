@@ -193,6 +193,59 @@ int main(void) {
     CHECK(free_physical_ram_frame(f11) == 0, "scenario 11: unaccounted free succeeds");
     CHECK(partition_get_frame_usage(PARTITION_SYSTEM) == sys_usage_before, "scenario 11: PARTITION_SYSTEM's usage decremented back to where it started");
 
+    /* ── Scenario 12 (Multi-Node Partition Scaling Roadmap Phase 3):
+     * partition_reclaim_all_frames() -- real bulk per-partition physical
+     * frame reclamation, the opposite of scenario 8's proof that
+     * partition_reset_frame_usage() is accounting-only. This is the
+     * mechanism partition_destroy() now uses instead. ─────────────────── */
+    CHECK(partition_get_frame_usage(5) == 0, "scenario 12: partition 5 starts clean");
+    void* r5[4];
+    for (int i = 0; i < 4; i++) {
+        r5[i] = allocate_physical_ram_frame_for_partition(5);
+        CHECK(r5[i] != NULL, "scenario 12: partition 5 allocates a frame to be bulk-reclaimed");
+    }
+    CHECK(partition_get_frame_usage(5) == 4, "scenario 12: partition 5's usage is 4 before reclaim");
+
+    /* An unrelated partition's frame, allocated in between, must survive
+     * partition 5's reclaim completely untouched -- proves the reclaim is
+     * scoped to the exact partition_id given, not a blanket sweep. */
+    void* other = allocate_physical_ram_frame_for_partition(6);
+    CHECK(other != NULL, "scenario 12: an unrelated partition (6) allocates one frame in between");
+
+    uint32_t reclaimed = partition_reclaim_all_frames(5);
+    CHECK(reclaimed == 4, "scenario 12: exactly the 4 frames partition 5 actually held are reported reclaimed");
+    CHECK(partition_get_frame_usage(5) == 0, "scenario 12: partition 5's usage counter reads 0 after the real reclaim");
+
+    /* Real reclaim, not accounting-only: the SAME 4 physical addresses come
+     * back out on the next 4 allocations -- at this point in the test they
+     * are the ONLY free slots in the whole bitmap (everything lower was
+     * already permanently consumed by earlier scenarios), so first-fit
+     * allocation returning them is a direct, causal proof of a real free,
+     * not a coincidence. */
+    int reclaimed_are_real = 1;
+    for (int i = 0; i < 4; i++) {
+        void* back = allocate_physical_ram_frame_for_partition(5);
+        int matched = 0;
+        for (int j = 0; j < 4; j++) if (back == r5[j]) matched = 1;
+        if (!matched) reclaimed_are_real = 0;
+    }
+    CHECK(reclaimed_are_real, "scenario 12: the 4 reclaimed addresses are genuinely back in the free pool -- real bitmap reclamation, not an accounting fiction");
+
+    CHECK(partition_get_frame_usage(6) == 1, "scenario 12: partition 6's single frame survived partition 5's reclaim completely untouched");
+    CHECK(free_physical_ram_frame_for_partition(other, 6) == 0, "scenario 12: partition 6's surviving frame is still validly freeable afterward -- proves its bitmap bit was never touched by partition 5's reclaim");
+
+    CHECK(partition_reclaim_all_frames(999) == 0xFFFFFFFFu, "scenario 12: reclaiming an out-of-range partition_id returns the sentinel, touches nothing");
+    CHECK(partition_reclaim_all_frames(8) == 0, "scenario 12: reclaiming a partition that never allocated anything returns 0 -- legitimate 'nothing to reclaim', not an error");
+    /* The verification loop just above re-allocated 4 frames to partition 5
+     * (to prove they were genuinely back in the free pool) -- so partition
+     * 5 legitimately holds 4 frames again here, not 0. Reclaiming it a
+     * second time is idempotent in the sense that matters: it correctly
+     * reclaims exactly what's really there right now, not a stale count
+     * left over from the first reclaim. */
+    CHECK(partition_reclaim_all_frames(5) == 4, "scenario 12: reclaiming partition 5 again correctly reclaims the 4 frames it re-acquired during the verification loop above, not 0 and not a stale/doubled count");
+    CHECK(partition_get_frame_usage(5) == 0, "scenario 12: partition 5's usage is 0 again after this second reclaim");
+    CHECK(partition_reclaim_all_frames(5) == 0, "scenario 12: a THIRD reclaim, now genuinely empty, correctly returns 0 -- no error, no underflow");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }
