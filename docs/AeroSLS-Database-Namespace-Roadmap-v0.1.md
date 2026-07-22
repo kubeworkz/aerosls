@@ -602,16 +602,72 @@ this phase's edits (missing-include implicit-declaration warnings that
 predate this work, confirmed by checking they reference lines this phase
 never touched).
 
-### Phase 5 — Frontend (deferred until Phase 1-4 are live, per this
-session's own established "backend first" posture)
+### Phase 5 — Frontend — DONE
 
-**Scope (tentative, not yet designed in detail):** a small "Databases"
-panel in `slsos-sim` — likely inside `SlsDbEngine.tsx` alongside the SQL
-Console/Tables Browser, listing databases, their tables, and their
-grants, with create/drop/grant forms mirroring the Collections panel
-pattern already used in `SlsVectorStore.tsx`. Exact placement and scope
-to be revisited once Phases 1-4 are real and the shape of what's worth
-surfacing is clearer.
+**Design as built:** a 7th sub-tab, "Databases", added to `SlsDbEngine.
+tsx`'s existing `DB_TABS` array/sub-tab bar (same pattern SQL Console/
+Schema Explorer/etc. already use — no new top-level sidebar entry, no
+`App.tsx` changes needed). This confirms the roadmap's own placement
+guess from the tentative scope note above; what didn't survive contact
+with the real Phase 4 surface was the "mirror the Collections panel
+pattern" plan for the mutation forms — see below.
+
+**Investigation finding that reshaped the plan:** `SlsVectorStore.tsx`'s
+CollectionsPanel (the named pattern to mirror) turned out to hit
+dedicated JSON routes (`GET/POST/DELETE /api/vec/collections`), which
+databases don't have — Phase 4 deliberately scoped database's HTTP
+surface to exactly one `GET /api/security/databases` read route, leaving
+create/drop/grant/check reachable only via `POST /api/shell/exec`
+(genuine parity with group/authlist today, per Phase 4's own writeup). A
+second finding sharpened this further: `SlsSecurityDashboard.tsx` (the
+obvious place to look for prior art on a shell/exec-only mutation form,
+since group/authlist have the identical constraint) turned out to have
+*no* mutation UI at all — it's a read-only audit-log table. The
+Shell-Command JSON-Promotion Roadmap had already **deleted** this
+project's old `POST /api/shell/exec` fallback plumbing entirely once
+every command family it covered got a dedicated JSON route — and
+group/authlist/database were never in that promoted list. So
+`DatabasesPanel` is the first UI component in this codebase to call
+`POST /api/shell/exec` directly; there was no existing wrapper to reuse.
+
+**What was built** (`slsos-sim/src/components/SlsDbEngine.tsx`):
+- `shellExec(command)` — a small fresh helper: JSON body `{ command }`,
+  response `{ ok: "true"|"false", output: <raw kernel-printed text> }`.
+  `ok` reflects whether `sls_shell_execute()` recognized the command, not
+  whether the operation itself succeeded, so `output` is surfaced to the
+  user verbatim (flash message / `<pre>` block) rather than re-parsed —
+  there's no structured success/failure field to parse.
+- `DatabasesPanel`: a list table (`GET /api/security/databases` —
+  name/database_id/owner_uid/grantee_uid_count/grantee_group_count/
+  grant_perm_mask) styled identically to CollectionsPanel's own table
+  (same header/row Tailwind classes), with a `ConfirmDropButton` — a
+  local copy of `SlsVectorStore.tsx`'s two-step arm/confirm delete
+  pattern, since `SlsDbEngine.tsx` had no destructive-action control of
+  its own to reuse before this phase.
+- Create Database form (`database create <name>`) and Grant Access form
+  (`database grant uid|group <db> <uid|group> <perm>`, uid/group toggled
+  via radio buttons) styled to match CollectionsPanel's Create Collection
+  card.
+- A `DbPermPicker` — three checkboxes (Read/Write/Execute) that build the
+  same bitmask `user/permissions.h` defines (`PERM_READ=1, PERM_WRITE=2,
+  PERM_EXECUTE=4`), reused for both the grant form and a Check Access
+  panel (`database check <db> <uid> <perm>`) that echoes the kernel's
+  check-result text — this last panel goes beyond the roadmap's original
+  "list + create/drop/grant forms" scope, added because Phase 4 already
+  built the `database check` Terminal command and a bare grant form gives
+  no way to verify a grant actually took effect without switching to the
+  Terminal tab.
+
+**Verification:** `npx tsc --noEmit` — zero errors. No host-test or
+kernel-side changes in this phase (frontend-only), so no regression
+sweep was needed; the 40/40 kernel host-test suite is unaffected. A live
+browser click-through pass was not performed in this environment (no
+running `slsos-sim` dev server / backend instance available in this
+sandbox to click against) — noted honestly as a scope limitation, same
+as `x86_64-elf-gcc`'s unavailability was named explicitly in Phase 4.
+
+This closes the Database Namespace & Access Roadmap — all five phases
+are now done.
 
 ---
 
