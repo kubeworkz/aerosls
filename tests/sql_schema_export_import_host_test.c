@@ -56,6 +56,7 @@
 // real object_catalog.c linked below). ──────────────────────────────────────
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
+struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 volatile uint64_t kernel_tick_counter = 0;
 
 // ─── kernel_io.h stand-ins ──────────────────────────────────────────────────

@@ -45,6 +45,7 @@ struct SLSObjectRecord object_records[CATALOG_MAX_OBJECTS];
 struct ServiceBinary   service_binaries[MAX_SERVICE_BINARIES];
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
+struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 struct SLSIndex        index_store[INDEX_MAX];
 uint32_t               index_count = 0;
 void catalog_after_restore(void) { /* no-op for this test */ }

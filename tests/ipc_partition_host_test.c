@@ -56,6 +56,7 @@ void persist_partitions(void) { /* Phase 10's persistence hook — irrelevant he
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 int partition_reset_frame_usage(uint32_t partition_id) { (void)partition_id; return 0; }
+uint32_t cluster_local_node_id(void) { return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \

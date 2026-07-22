@@ -94,6 +94,7 @@
 // define are declared here. ─────────────────────────────────────────────────
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
+struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 
 // Navigator-Parity Gap Roadmap Phase 3: kernel/security_audit.c (linked for
 // real, see this file's own header comment) needs kernel_tick_counter --

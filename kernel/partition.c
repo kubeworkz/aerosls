@@ -15,9 +15,11 @@
 #include "process.h"
 #include "object_catalog.h"
 #include "frame_pool.h"
+#include "../net/consensus.h"   // Multi-Node Partition Scaling Roadmap Phase 2 -- cluster_local_node_id()
 
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
+struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];
 
 /* Phase 14 (LPAR): pause/resume state. Deliberately kept as separate,
  * ephemeral runtime state rather than a field on struct SLSPartitionEntry
@@ -40,6 +42,7 @@ static int pt_strlen(const char* s) { int n = 0; while (s[n]) n++; return n; }
 void partition_init(void) {
     for (int i = 0; i < PARTITION_MAX; i++) partition_table[i].active = 0;
     for (int i = 0; i < PARTITION_ASSIGN_MAX; i++) partition_assign_table[i].active = 0;
+    for (int i = 0; i < PARTITION_MAX; i++) partition_owner_table[i].active = 0;   // Phase 2 (Multi-Node)
 
     /* Slot 0 == PARTITION_SYSTEM, pre-populated and permanent — this is
      * the partition every pre-existing object/uid is already implicitly
@@ -49,6 +52,16 @@ void partition_init(void) {
     partition_table[0].partition_id = PARTITION_SYSTEM;
     pt_strcpy(partition_table[0].name, "system", PARTITION_NAME_LEN);
     partition_table[0].active = 1;
+
+    /* Phase 2 (Multi-Node Partition Scaling Roadmap): PARTITION_SYSTEM is
+     * owned by whichever node this is, per cluster_local_node_id() --
+     * node id 0 (the Phase 1 uninitialized sentinel) on every deployment
+     * that hasn't called cluster_init(), which is every deployment today.
+     * See partition.h's own comment on why that's the correct, honest
+     * default rather than a fabricated claim of real ownership. */
+    partition_owner_table[0].partition_id = PARTITION_SYSTEM;
+    partition_owner_table[0].node_id      = cluster_local_node_id();
+    partition_owner_table[0].active       = 1;
 
     kernel_serial_print("[PARTITION] LPAR groundwork initialised (1 partition: system).\n");
 }
@@ -60,8 +73,17 @@ uint32_t partition_create(const char* name) {
             partition_table[i].partition_id = (uint32_t)i;
             pt_strcpy(partition_table[i].name, name, PARTITION_NAME_LEN);
             partition_table[i].active = 1;
-            kernel_serial_printf("[PARTITION] created '%s' (id=%u).\n", name, (unsigned)i);
-            persist_partitions();   // Phase 10
+
+            /* Phase 2 (Multi-Node): a newly created partition is owned by
+             * this node by default -- see the header comment on why this
+             * is a correct no-op for single-node deployments. */
+            partition_owner_table[i].partition_id = (uint32_t)i;
+            partition_owner_table[i].node_id      = cluster_local_node_id();
+            partition_owner_table[i].active       = 1;
+
+            kernel_serial_printf("[PARTITION] created '%s' (id=%u, owner node=%u).\n",
+                                 name, (unsigned)i, (unsigned)partition_owner_table[i].node_id);
+            persist_partitions();   // Phase 10 (now also covers partition_owner_table[], Phase 2)
             return (uint32_t)i;
         }
     }
@@ -121,6 +143,54 @@ uint32_t partition_get_for_uid(uint32_t uid) {
     return PARTITION_DEFAULT;
 }
 
+// ─── Multi-Node Partition Scaling Roadmap, Phase 2: ownership & node pinning ──
+uint32_t partition_get_owner_node(uint32_t partition_id) {
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (partition_owner_table[i].active && partition_owner_table[i].partition_id == partition_id)
+            return partition_owner_table[i].node_id;
+    }
+    return 0;   /* no ownership row -- see partition.h's comment on why 0 is the honest answer */
+}
+
+int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
+    if (!partition_id_valid(partition_id)) {
+        kernel_serial_printf(
+            "[PARTITION] ERROR: cannot set owner -- partition id %u is not an "
+            "active, defined partition.\n", (unsigned)partition_id);
+        return 1;
+    }
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (partition_owner_table[i].active && partition_owner_table[i].partition_id == partition_id) {
+            partition_owner_table[i].node_id = node_id;
+            kernel_serial_printf("[PARTITION] partition %u ownership set to node %u.\n",
+                                 (unsigned)partition_id, (unsigned)node_id);
+            persist_partitions();
+            return 0;
+        }
+    }
+    /* No existing row (shouldn't normally happen -- partition_create()/
+     * partition_init() always create one -- but handled rather than
+     * silently dropped, e.g. for a partition restored from a pre-Phase-2
+     * persisted snapshot that predates this table). */
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (!partition_owner_table[i].active) {
+            partition_owner_table[i].partition_id = partition_id;
+            partition_owner_table[i].node_id      = node_id;
+            partition_owner_table[i].active       = 1;
+            kernel_serial_printf("[PARTITION] partition %u ownership row created, set to node %u.\n",
+                                 (unsigned)partition_id, (unsigned)node_id);
+            persist_partitions();
+            return 0;
+        }
+    }
+    kernel_serial_print("[PARTITION] ERROR: owner table full.\n");
+    return 1;
+}
+
+int partition_is_local(uint32_t partition_id) {
+    return partition_get_owner_node(partition_id) == cluster_local_node_id();
+}
+
 // ─── Phase 14 (LPAR): partition lifecycle ──────────────────────────────────
 int partition_destroy(uint32_t partition_id) {
     if (partition_id == PARTITION_SYSTEM) {
@@ -171,9 +241,19 @@ int partition_destroy(uint32_t partition_id) {
     // Step 5: deactivate the table entry itself, freeing the slot for a
     // future partition_create(), and clear any stale pause flag so a
     // reused slot doesn't inherit "paused" from a previous partition that
-    // happened to occupy the same id.
+    // happened to occupy the same id. Also clears the Phase 2 (Multi-Node)
+    // ownership row for the same reason -- a reused partition id must not
+    // inherit a stale owner node from whatever partition previously held
+    // that slot; partition_create() stamps a fresh one when the slot is
+    // reused.
     partition_table[partition_id].active = 0;
     partition_paused[partition_id] = 0;
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (partition_owner_table[i].active && partition_owner_table[i].partition_id == partition_id) {
+            partition_owner_table[i].active = 0;
+            break;
+        }
+    }
 
     kernel_serial_printf(
         "[PARTITION] destroyed partition %u: %u process(es) killed, "

@@ -178,14 +178,29 @@ void persist_programs(void) {
 // object_catalog[]/role_table[] — partition_table[]/partition_assign_table[]
 // are that same pair's sibling (defined-partitions table + uid-assignment
 // table), so the persistence shape matches on purpose.
+//
+// Multi-Node Partition Scaling Roadmap, Phase 2: also writes
+// partition_owner_table[] as a third array under the same header, using
+// write_hdr()'s previously-unused v2 size slot (Phase 10 always passed 0
+// there -- see the restore block's own comment on why this is safe for
+// old snapshots). Ownership needs to survive a reboot the same way
+// partition identity itself does: partition_table[]/partition_assign_
+// table[] are restored directly into the arrays by persist_restore_all(),
+// bypassing partition_create() entirely, so if ownership were only ever
+// stamped inside partition_create() (as Phase 2's own scope note first
+// suggested), every restored partition would come back with NO ownership
+// row at all after a reboot -- a real, silent regression for the one
+// property this whole roadmap exists to make durable.
 void persist_partitions(void) {
     if (!io_sq || !io_cq) return;
     uint32_t part_bytes   = (uint32_t)sizeof(partition_table);
     uint32_t assign_bytes = (uint32_t)sizeof(partition_assign_table);
+    uint32_t owner_bytes  = (uint32_t)sizeof(partition_owner_table);
     write_hdr(PERSIST_PART_HDR_LBA, PERSIST_MAGIC_PART,
-              part_bytes, assign_bytes, 0);
+              part_bytes, assign_bytes, owner_bytes);
     persist_write_array(partition_table,        part_bytes,   PERSIST_PART_ENT_LBA);
     persist_write_array(partition_assign_table, assign_bytes, PERSIST_PART_ASSIGN_LBA);
+    persist_write_array(partition_owner_table,  owner_bytes,  PERSIST_PART_OWNER_LBA);
     kernel_serial_print("[PERSIST] Partitions snapshot written.\n");
 }
 
@@ -369,14 +384,36 @@ void persist_restore_all(void) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
         if (magic == PERSIST_MAGIC_PART) {
-            uint32_t part_bytes, assign_bytes;
+            uint32_t part_bytes, assign_bytes, owner_bytes;
             p_memcpy(&part_bytes,   p_buf +  8, 4);
             p_memcpy(&assign_bytes, p_buf + 12, 4);
+            p_memcpy(&owner_bytes,  p_buf + 16, 4);   // Phase 2 (Multi-Node) -- 0 on any snapshot written before this phase
             if (part_bytes   == (uint32_t)sizeof(partition_table) &&
                 assign_bytes == (uint32_t)sizeof(partition_assign_table)) {
                 persist_read_array(partition_table,        part_bytes,   PERSIST_PART_ENT_LBA);
                 persist_read_array(partition_assign_table, assign_bytes, PERSIST_PART_ASSIGN_LBA);
                 kernel_serial_print("[PERSIST] Partitions restored from NVMe.\n");
+
+                // Phase 2 (Multi-Node Partition Scaling Roadmap): ownership
+                // rows are only restorable from a snapshot that was itself
+                // written by Phase-2-or-later code (owner_bytes matches the
+                // current struct's real size). A snapshot written before
+                // this phase has owner_bytes==0 (write_hdr()'s v2 slot was
+                // always passed 0 previously) -- there's no valid data at
+                // PERSIST_PART_OWNER_LBA to read in that case, so the
+                // owner table is deliberately left at whatever
+                // partition_init() already set for it (every partition
+                // just-restored above then reads as owned by whichever
+                // node this boot is, via partition_get_owner_node()'s own
+                // "no row -> 0" fallback) rather than reading garbage.
+                if (owner_bytes == (uint32_t)sizeof(partition_owner_table)) {
+                    persist_read_array(partition_owner_table, owner_bytes, PERSIST_PART_OWNER_LBA);
+                    kernel_serial_print("[PERSIST] Partition ownership restored from NVMe.\n");
+                } else {
+                    kernel_serial_print(
+                        "[PERSIST] Partition ownership: snapshot predates Phase 2 (or size "
+                        "mismatch) -- ownership left at boot defaults.\n");
+                }
             } else {
                 kernel_serial_print("[PERSIST] Partitions: struct size mismatch — cold start.\n");
             }

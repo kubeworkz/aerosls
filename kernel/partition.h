@@ -52,6 +52,19 @@ struct SLSPartitionAssign {
 extern struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 extern struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
 
+/* Multi-Node Partition Scaling Roadmap, Phase 2: which node owns a given
+ * partition. Kept as its own table, the same "separate table, not a field
+ * bolted onto struct SLSPartitionEntry" shape partition_assign_table[]
+ * already established for uid->partition assignment -- so a future
+ * migration phase can hand off ownership with a single row update, never
+ * touching partition identity (name, active flag) itself. */
+struct SLSPartitionOwner {
+    uint32_t partition_id;
+    uint32_t node_id;
+    uint8_t  active;
+};
+extern struct SLSPartitionOwner partition_owner_table[PARTITION_MAX];
+
 /* Pre-populates partition_table[0] as PARTITION_SYSTEM ("system", active).
  * Everything else starts zeroed/inactive — no assignment is required for
  * existing behavior to keep working, see the top comment. Called once
@@ -82,6 +95,43 @@ uint32_t partition_get_for_uid(uint32_t uid);
 
 /* Debug/introspection listing, mirrors sys_sls_obj_list()'s style. */
 void sys_sls_partition_list(void);
+
+/* ─── Multi-Node Partition Scaling Roadmap, Phase 2: ownership & node
+ * pinning ────────────────────────────────────────────────────────────────
+ * partition_create() (and partition_init() for PARTITION_SYSTEM) stamp a
+ * new partition's owner as cluster_local_node_id() (net/consensus.h,
+ * Phase 1) by default -- so on a system that never calls cluster_init()
+ * (every deployment today; Phase 1 deliberately didn't wire that call
+ * into boot), that default is node id 0, the same "uninitialized"
+ * sentinel cluster_local_node_id() itself returns before cluster_init()
+ * runs. Both sides of partition_is_local()'s comparison read that same
+ * sentinel in that case, so every partition reads as locally owned --
+ * the correct, honest behavior for a single-kernel-instance deployment
+ * that hasn't opted into cluster identity at all, not a false claim of
+ * real multi-node awareness. */
+
+/* Returns the node_id that owns partition_id, or 0 if no ownership row
+ * exists for it (0 doubles as both "unowned" and the Phase 1
+ * uninitialized-node sentinel -- see above; never fails for an
+ * out-of-range/inactive partition_id, mirroring partition_get_for_uid()'s
+ * own never-fails posture). */
+uint32_t partition_get_owner_node(uint32_t partition_id);
+
+/* Sets/overwrites which node owns partition_id. Returns 0 on success, 1
+ * if partition_id isn't a currently-active, defined partition. This is
+ * deliberately just a table write -- no side effects (killing processes,
+ * moving pages, revoking a consensus lease) are attempted here. A future
+ * migration phase orchestrates those separately and calls this only as
+ * its final ownership-handoff step. */
+int partition_set_owner_node(uint32_t partition_id, uint32_t node_id);
+
+/* The local/remote decision point this phase exists to establish: 1 if
+ * partition_id is owned by this node (cluster_local_node_id()), 0
+ * otherwise -- including for an unowned or undefined partition_id. What a
+ * future phase does with a "0" answer (forward the request, deny it,
+ * queue it) is deliberately NOT decided here -- see the roadmap doc's own
+ * Phase 2 scope note. */
+int partition_is_local(uint32_t partition_id);
 
 /* ─── Phase 14 (LPAR): partition lifecycle ──────────────────────────────────
  * partition_destroy() is real teardown, not just a table row removal:

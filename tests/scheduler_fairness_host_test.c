@@ -87,6 +87,7 @@ int partition_reset_frame_usage(uint32_t partition_id) {
     g_reset_usage_last_arg = partition_id;
     return 0;
 }
+uint32_t cluster_local_node_id(void) { return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 
 /* Pull in process.c itself — this is what makes pick_next_partition()/
  * pick_next_process_in_partition() (both `static`) reachable from this

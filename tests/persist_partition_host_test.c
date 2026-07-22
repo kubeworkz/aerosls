@@ -112,6 +112,8 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 int partition_reset_frame_usage(uint32_t partition_id) { (void)partition_id; return 0; }
+static uint32_t g_fake_local_node_id = 0;   /* Multi-Node Partition Scaling Roadmap Phase 2 — settable */
+uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
 
 /* ─── Fake NVMe: an in-memory map from frame-aligned LBA to 4KiB bytes ── */
 #define FAKE_NVME_MAX_FRAMES 64
@@ -184,6 +186,63 @@ int main(void) {
     CHECK(strcmp(partition_table[pid_a].name, "tenant-a") == 0, "tenant-a's name string survived the round trip");
     CHECK(strcmp(partition_table[pid_b].name, "tenant-b") == 0, "tenant-b's name string survived the round trip");
     CHECK(partition_table[pid_a].active == 1, "tenant-a still marked active after restore");
+
+    /* ── Multi-Node Partition Scaling Roadmap Phase 2: ownership round trip ──
+     * partition_create() above already stamped both tenants' owner rows at
+     * node 0 (g_fake_local_node_id's starting value). Pin tenant-a to a
+     * different node, then prove that pin survives a simulated reboot the
+     * same way name/active/assignment state already does above. ────────── */
+    CHECK(partition_get_owner_node(pid_a) == 0, "tenant-a's owner defaults to node 0 pre-pin (post first restore)");
+    CHECK(partition_set_owner_node(pid_a, 9) == 0, "pin tenant-a to node 9 (persists automatically via persist_partitions())");
+    CHECK(partition_get_owner_node(pid_a) == 9, "tenant-a's owner reads back as node 9 before 'reboot'");
+    CHECK(partition_get_owner_node(pid_b) == 0, "tenant-b's owner untouched by tenant-a's pin, still node 0 before 'reboot'");
+
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_assign_table, 0, sizeof(partition_assign_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+    partition_init();
+    CHECK(partition_get_owner_node(pid_a) == 0,
+          "post-'reboot', pre-restore: tenant-a's owner pin genuinely wiped (reads back 0, the 'no row' default)");
+
+    persist_restore_all();
+    CHECK(partition_get_owner_node(pid_a) == 9, "tenant-a's owner pin (node 9) restored after 'reboot'");
+    CHECK(partition_get_owner_node(pid_b) == 0, "tenant-b's owner (node 0) also correctly restored after 'reboot'");
+    g_fake_local_node_id = 9;
+    CHECK(partition_is_local(pid_a) == 1, "tenant-a reads as local post-restore once cluster_local_node_id() also reports node 9");
+    CHECK(partition_is_local(pid_b) == 0, "tenant-b correctly reads as remote post-restore (owner 0 != local node 9)");
+    g_fake_local_node_id = 0;   /* restore default for the rest of this test */
+
+    /* ── Backward-compat guard: a snapshot written by pre-Phase-2 code always
+     * had write_hdr()'s v2 slot (owner_bytes) as 0 -- stomp just that field
+     * (header offset +16, matching persist.c's own p_memcpy(&owner_bytes,
+     * p_buf + 16, 4) read) while leaving the magic and the other two size
+     * fields intact, and confirm restore still loads partition_table[]/
+     * partition_assign_table[] normally but leaves the FRESH partition_
+     * init() owner stamps alone rather than reading stale/garbage bytes
+     * from PERSIST_PART_OWNER_LBA. ───────────────────────────────────────── */
+    for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++) {
+        if (g_fake_nvme[i].used && g_fake_nvme[i].lba == PERSIST_PART_HDR_LBA) {
+            memset(g_fake_nvme[i].data + 16, 0, 4);   /* owner_bytes -> 0, simulating a pre-Phase-2 snapshot */
+        }
+    }
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_assign_table, 0, sizeof(partition_assign_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+    g_fake_local_node_id = 3;
+    partition_init();
+    persist_restore_all();
+    CHECK(partition_get_for_uid(42) == pid_a,
+          "backward-compat snapshot (owner_bytes==0): partition_table[]/assign_table[] still restore normally");
+    /* partition_init() only stamps a fresh owner row for slot 0
+     * (PARTITION_SYSTEM) -- tenant-a's row (a different slot) is never
+     * re-created by anything in this cold-restore path, since restore
+     * correctly declines to read it from the mismatched-size snapshot. */
+    CHECK(partition_get_owner_node(PARTITION_SYSTEM) == 3,
+          "backward-compat snapshot: PARTITION_SYSTEM's owner is partition_init()'s fresh stamp (current cluster_local_node_id(), 3), left alone by the skipped restore");
+    CHECK(partition_get_owner_node(pid_a) == 0,
+          "backward-compat snapshot: tenant-a's owner is NOT read from the stale/absent PERSIST_PART_OWNER_LBA data -- "
+          "it reads back 0 (no row), not tenant-a's old pin of node 9 and not garbage");
+    g_fake_local_node_id = 0;   /* restore default for the remaining checks below */
 
     /* ── Struct-size mismatch guard: corrupt the header's magic and
      * confirm restore treats it as a cold start rather than restoring

@@ -59,6 +59,7 @@
 // sql_ddl_phase5_host_test.c's own established convention). ────────────────
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
+struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 volatile uint64_t kernel_tick_counter = 0;   // security_audit.c dependency
 
 // ─── kernel_io.h stand-ins ──────────────────────────────────────────────────

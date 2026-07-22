@@ -29,7 +29,11 @@
 //  LBA 5792  PERSIST_PART_HDR_LBA    1 frame — partitions header
 //  LBA 5800  PERSIST_PART_ENT_LBA    1 frame — partition_table[16]        (~640 B)
 //  LBA 5808  PERSIST_PART_ASSIGN_LBA 1 frame — partition_assign_table[64] (~768 B)
-//  (end LBA 5816)
+//  LBA 5816  PERSIST_PART_OWNER_LBA  1 frame — partition_owner_table[16]  (~192 B)
+//            (Multi-Node Partition Scaling Roadmap Phase 2 -- fits exactly in
+//            the 1-frame gap this region already had before the next region's
+//            header at 5824, no shift of anything downstream needed)
+//  (end LBA 5824)
 //
 //  LBA 5824  PERSIST_ROWSTORE_HDR_LBA  1 frame  — row-store header (Phase 16)
 //  LBA 5832  PERSIST_ROWSTORE_ENT_LBA ~38 frames — table_headers[128] (~150 KiB)
@@ -96,6 +100,7 @@
 #define PERSIST_PART_HDR_LBA    5792ULL
 #define PERSIST_PART_ENT_LBA    5800ULL
 #define PERSIST_PART_ASSIGN_LBA 5808ULL
+#define PERSIST_PART_OWNER_LBA  5816ULL   /* Multi-Node Partition Scaling Roadmap Phase 2 */
 
 #define PERSIST_ROWSTORE_HDR_LBA 5824ULL
 #define PERSIST_ROWSTORE_ENT_LBA 5832ULL

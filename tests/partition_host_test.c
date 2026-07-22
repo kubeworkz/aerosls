@@ -16,6 +16,16 @@
  * phase's kernel-side wiring has settled for (see
  * AeroSLS-SIMI-ISA-v0.1.md §15 for the write-up).
  *
+ * Multi-Node Partition Scaling Roadmap Phase 2 added partition_get_owner_
+ * node()/partition_set_owner_node()/partition_is_local(), plus ownership-
+ * table stamping inside partition_create()/partition_init()/partition_
+ * destroy(). Rather than link the real net/consensus.c just to drive
+ * cluster_local_node_id() (a much heavier dependency for a partition-
+ * focused test), this file stubs it as a *settable* fake — g_fake_local_
+ * node_id below — so partition_is_local()'s real comparison logic still
+ * executes against multiple real node-id values, not just the single
+ * fixed 0 every other partition.c-linking host test stubs it to.
+ *
  * Not part of any Makefile target — a one-off verification artifact, built
  * and run directly:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -o /tmp/partition_host_test \
@@ -34,6 +44,8 @@ void persist_partitions(void) { /* Phase 10's persistence hook — irrelevant he
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 int partition_reset_frame_usage(uint32_t partition_id) { (void)partition_id; return 0; }
+static uint32_t g_fake_local_node_id = 0;   /* Multi-Node Partition Scaling Roadmap Phase 2 — settable */
+uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -64,6 +76,50 @@ int main(void) {
     CHECK(partition_assign_uid(42, pid_b) == 0, "reassign uid 42 -> tenant-b succeeds (update in place)");
     CHECK(partition_get_for_uid(42) == pid_b, "uid 42 now resolves to tenant-b, not stuck on tenant-a");
 
+    /* ── Multi-Node Partition Scaling Roadmap Phase 2: ownership & pinning ── */
+    CHECK(partition_get_owner_node(PARTITION_SYSTEM) == 0,
+          "PARTITION_SYSTEM's owner defaults to node 0 (cluster_local_node_id() stub starts at 0)");
+    CHECK(partition_get_owner_node(pid_a) == 0,
+          "newly created tenant-a's owner also defaults to node 0 (partition_create() stamps cluster_local_node_id() at create time)");
+    CHECK(partition_is_local(pid_a) == 1,
+          "tenant-a reads as local: owner(0) == cluster_local_node_id()(0), the honest single-node default");
+
+    g_fake_local_node_id = 5;
+    CHECK(partition_is_local(pid_a) == 0,
+          "tenant-a no longer reads as local once cluster_local_node_id() reports a different node (5) than its owner (0)");
+    CHECK(partition_set_owner_node(pid_a, 5) == 0, "explicitly pin tenant-a to node 5 succeeds");
+    CHECK(partition_get_owner_node(pid_a) == 5, "tenant-a's owner now reads back as node 5 (update-existing-row branch)");
+    CHECK(partition_is_local(pid_a) == 1,
+          "tenant-a reads as local again now that its owner(5) matches cluster_local_node_id()(5)");
+
+    g_fake_local_node_id = 0;
+    CHECK(partition_is_local(pid_a) == 0,
+          "tenant-a reads as remote once cluster_local_node_id() flips back to 0 while its owner stays pinned at 5 — proves a real re-read, not a cached/stale comparison");
+    CHECK(partition_set_owner_node(pid_a, 0) == 0,
+          "un-pin tenant-a back to node 0 succeeds (still the update-existing-row branch, not a duplicate insert)");
+    CHECK(partition_is_local(pid_a) == 1, "tenant-a local again after un-pin");
+    CHECK(partition_get_owner_node(pid_b) == 0,
+          "tenant-b's owner untouched by any of tenant-a's pinning above (rows are independent)");
+
+    CHECK(partition_get_owner_node(0xDEADBEEF) == 0,
+          "owner lookup on an undefined partition id returns 0 (no row found), not garbage");
+    CHECK(partition_set_owner_node(0xDEADBEEF, 5) != 0,
+          "cannot pin an undefined partition id — rejected by the same partition_id_valid() gate every other mutator uses");
+
+    /* ── partition_destroy() must clear the owner row, not just table/assign
+     * rows — a slot reused by a later partition_create() must not inherit a
+     * stale owner from whatever partition previously held that id. ─────── */
+    uint32_t pid_c = partition_create("tenant-c");
+    CHECK(pid_c != 0xFFFFFFFFu, "tenant-c created for the destroy/reuse check");
+    CHECK(partition_set_owner_node(pid_c, 7) == 0, "tenant-c pinned to node 7");
+    CHECK(partition_destroy(pid_c) == 0, "tenant-c destroyed");
+    CHECK(partition_get_owner_node(pid_c) == 0,
+          "after destroy, the old slot's owner lookup reads back 0 (row deactivated), not the stale node 7");
+    uint32_t pid_c2 = partition_create("tenant-c-reborn");
+    CHECK(pid_c2 == pid_c, "the freed slot is reused by the next partition_create() (same id as tenant-c)");
+    CHECK(partition_get_owner_node(pid_c2) == g_fake_local_node_id,
+          "the reused slot gets a FRESH owner stamp from partition_create() (current cluster_local_node_id()), not tenant-c's old pin of node 7");
+
     /* ── Rejections ────────────────────────────────────────────────────── */
     CHECK(partition_assign_uid(0, pid_a) != 0, "cannot reassign uid 0 (kernel) — rejected");
     CHECK(partition_get_for_uid(0) == PARTITION_SYSTEM, "uid 0 still PARTITION_SYSTEM after rejected attempt");
@@ -85,9 +141,11 @@ int main(void) {
         created++;
         if (created > PARTITION_MAX + 4) { printf("FAIL: partition_create never reports full\n"); g_fail++; break; }
     }
-    /* slot 0 is PARTITION_SYSTEM; 2 were already created above (tenant-a/b);
-     * remaining free slots = PARTITION_MAX - 1 - 2 */
-    CHECK(created == PARTITION_MAX - 3, "partition table fills to exactly PARTITION_MAX (accounting for system + 2 earlier)");
+    /* slot 0 is PARTITION_SYSTEM; 3 were already created above and still
+     * active (tenant-a, tenant-b, tenant-c-reborn — tenant-c's original
+     * slot was destroyed then immediately reused, so it's still exactly
+     * one active slot, not two); remaining free slots = PARTITION_MAX - 1 - 3 */
+    CHECK(created == PARTITION_MAX - 4, "partition table fills to exactly PARTITION_MAX (accounting for system + 3 earlier)");
     CHECK(partition_create("one-too-many") == 0xFFFFFFFFu, "partition_create fails once table is full");
 
     /* ── Capacity: fill the assignment table, confirm updates still work
