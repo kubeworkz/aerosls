@@ -10,6 +10,7 @@
 #include "row_index.h"
 #include "row_constraint.h"   // Phase 5 (SQL Feature-Parity Roadmap, DDL): inline column constraints
 #include "../user/permissions.h"   // Phase 8 follow-on (schema export/import): PERM_READ
+#include "database.h"   // Database Namespace & Access Roadmap Phase 2: CREATE/DROP DATABASE, IN DATABASE tagging
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -1316,6 +1317,22 @@ static void exec_create_table(uint32_t caller_uid, struct SqlCreateTableStmt* s,
         return;
     }
 
+    // Database Namespace & Access Roadmap Phase 2: resolve the optional "IN
+    // DATABASE <name>" clause to a real database_id BEFORE valloc'ing
+    // anything -- same posture as REFERENCES validation (sql_parser.h's own
+    // has_database/database_name comment): resolution happens at EXEC time,
+    // not parse time, and a bad name must fail cleanly with nothing
+    // partially created, not stamp a 0/NONE tag silently.
+    uint32_t resolved_database_id = 0;
+    if (s->has_database) {
+        resolved_database_id = database_find_id(s->database_name);
+        if (resolved_database_id == 0) {
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE TABLE: IN DATABASE names a database that does not exist", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+
     struct SLSVallocRequest vreq;
     se_memset(&vreq, 0, sizeof(vreq));
     se_strcpy(vreq.name, s->table_name, OBJECT_NAME_LEN);
@@ -1324,6 +1341,7 @@ static void exec_create_table(uint32_t caller_uid, struct SqlCreateTableStmt* s,
     vreq.owner_uid    = caller_uid;
     vreq.perm_mask    = 0;   // owner_uid always has full access -- catalog_check_access()
     vreq.partition_id = 0;
+    vreq.database_id  = resolved_database_id;   // 0 (NONE) unless IN DATABASE was present and resolved above
     uint64_t obj_id = sys_sls_valloc(&vreq);
     if (!obj_id) {
         out->error = SQL_ERR_DDL_FAILED;
@@ -1493,6 +1511,36 @@ static void exec_drop_index(uint32_t caller_uid, struct SqlDropIndexStmt* s, str
     }
     out->error = SQL_ERR_DDL_FAILED;
     se_strcpy(out->error_msg, "DROP INDEX: index not found", SQL_ERR_MSG_LEN);
+}
+
+// ─── Database Namespace & Access Roadmap Phase 2 ───────────────────────────
+// Thin wrappers straight into kernel/database.c's own lifecycle -- mirrors
+// exec_drop_table()/exec_drop_index()'s own shape exactly. No SQL GRANT
+// exists anywhere in this codebase (roadmap doc §1.5), so these two are the
+// entire SQL-reachable surface for databases; grants stay Terminal/HTTP-only
+// (Phase 3, not yet built).
+static void exec_create_database(uint32_t caller_uid, struct SqlCreateDatabaseStmt* s, struct SqlResult* out) {
+    int rc = database_create(caller_uid, s->database_name);
+    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    out->error = SQL_ERR_DDL_FAILED;
+    se_strcpy(out->error_msg, "CREATE DATABASE failed: bad/empty/too-long name, duplicate name, or database table is full", SQL_ERR_MSG_LEN);
+}
+
+static void exec_drop_database(uint32_t caller_uid, struct SqlDropDatabaseStmt* s, struct SqlResult* out) {
+    int rc = database_drop(caller_uid, s->database_name);
+    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    if (rc == 2) {
+        out->error = SQL_ERR_PERMISSION_DENIED;
+        se_strcpy(out->error_msg, "DROP DATABASE: permission denied", SQL_ERR_MSG_LEN);
+        return;
+    }
+    if (rc == 3) {
+        out->error = SQL_ERR_DDL_FAILED;
+        se_strcpy(out->error_msg, "DROP DATABASE: still has one or more tables tagged with it -- no CASCADE, reassign or drop those tables first", SQL_ERR_MSG_LEN);
+        return;
+    }
+    out->error = SQL_ERR_DDL_FAILED;
+    se_strcpy(out->error_msg, "DROP DATABASE: database not found", SQL_ERR_MSG_LEN);
 }
 
 // ─── Phase 7 (SQL Feature-Parity Roadmap): non-correlated subquery
@@ -1716,6 +1764,12 @@ static void dispatch_stmt(uint64_t txn_id, uint32_t caller_uid, struct SqlStatem
         case SQL_STMT_DROP_TABLE:   exec_drop_table(caller_uid, &stmt->u.drop_table,     out); break;
         case SQL_STMT_CREATE_INDEX: exec_create_index(caller_uid, &stmt->u.create_index, out); break;
         case SQL_STMT_DROP_INDEX:   exec_drop_index(caller_uid, &stmt->u.drop_index,     out); break;
+        // Database Namespace & Access Roadmap Phase 2 -- see the header
+        // comment right above exec_create_database() for why these are
+        // thin wrappers, and sql_parser.h's SqlCreateDatabaseStmt/
+        // SqlDropDatabaseStmt comments for why there's no ALTER DATABASE.
+        case SQL_STMT_CREATE_DATABASE: exec_create_database(caller_uid, &stmt->u.create_database, out); break;
+        case SQL_STMT_DROP_DATABASE:   exec_drop_database(caller_uid, &stmt->u.drop_database,     out); break;
         default:
             out->error = SQL_ERR_INTERNAL;
             se_strcpy(out->error_msg, "unhandled statement kind", SQL_ERR_MSG_LEN);

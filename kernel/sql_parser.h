@@ -384,6 +384,13 @@ typedef enum {
     SQL_STMT_DROP_TABLE,
     SQL_STMT_CREATE_INDEX,
     SQL_STMT_DROP_INDEX,
+    // Database Namespace & Access Roadmap Phase 2: CREATE DATABASE/DROP
+    // DATABASE join the DDL surface above -- see kernel/database.h for the
+    // lifecycle these two call straight into, and this header's own
+    // SqlCreateDatabaseStmt/SqlDropDatabaseStmt comments below for why
+    // there's no ALTER DATABASE, no LIST-as-SQL, and no CASCADE.
+    SQL_STMT_CREATE_DATABASE,
+    SQL_STMT_DROP_DATABASE,
     SQL_STMT_INVALID,
 } SqlStmtKind;
 
@@ -573,6 +580,32 @@ struct SqlCreateTableStmt {
     char     table_name[OBJECT_NAME_LEN];
     struct SqlColumnDef columns[ROWSTORE_MAX_COLUMNS];
     uint32_t column_count;
+
+    // ── Database Namespace & Access Roadmap Phase 2: optional trailing
+    // "IN DATABASE <name>" clause -- purely additive, has_database==0 (the
+    // zero default) keeps every pre-Phase-2 CREATE TABLE statement byte-
+    // for-byte identical, tagging the new table's database_id as 0/NONE
+    // exactly as before this phase existed. Resolved to a real
+    // database_id at EXEC time via database_find_id() (kernel/database.c),
+    // not at parse time -- the parser accepts the syntax unconditionally,
+    // matching how a REFERENCES table name is validated at exec time too,
+    // not here. ──────────────────────────────────────────────────────────
+    uint8_t  has_database;
+    char     database_name[OBJECT_NAME_LEN];
+};
+
+// Database Namespace & Access Roadmap Phase 2. No ALTER DATABASE (a
+// database's only mutable property today is its own existence -- nothing
+// to alter), no CASCADE field on the drop (kernel/database.c's own
+// database_drop() refuses outright if any table is still tagged with it,
+// per the roadmap doc's §1.6 -- a real, named v1 limitation, not solved
+// by adding a flag here that the engine doesn't implement).
+struct SqlCreateDatabaseStmt {
+    char database_name[OBJECT_NAME_LEN];
+};
+
+struct SqlDropDatabaseStmt {
+    char database_name[OBJECT_NAME_LEN];
 };
 
 // ALTER TABLE ... ADD COLUMN only for v1 -- see rowstore.c's rowstore_add_
@@ -610,6 +643,8 @@ struct SqlStatement {
         struct SqlDropTableStmt   drop_table;
         struct SqlCreateIndexStmt create_index;
         struct SqlDropIndexStmt   drop_index;
+        struct SqlCreateDatabaseStmt create_database;
+        struct SqlDropDatabaseStmt   drop_database;
     } u;
 };
 

@@ -50,6 +50,7 @@ typedef enum {
     // Phase 5 (SQL Feature-Parity Roadmap): DDL.
     TOK_KW_CREATE, TOK_KW_TABLE, TOK_KW_ALTER, TOK_KW_ADD, TOK_KW_COLUMN,
     TOK_KW_DROP, TOK_KW_INDEX, TOK_KW_UNIQUE, TOK_KW_REFERENCES,
+    TOK_KW_DATABASE,   // Database Namespace & Access Roadmap Phase 2
     TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
     TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
@@ -98,6 +99,8 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"ALTER", TOK_KW_ALTER}, {"ADD", TOK_KW_ADD}, {"COLUMN", TOK_KW_COLUMN},
     {"DROP", TOK_KW_DROP}, {"INDEX", TOK_KW_INDEX},
     {"UNIQUE", TOK_KW_UNIQUE}, {"REFERENCES", TOK_KW_REFERENCES},
+    // Database Namespace & Access Roadmap Phase 2.
+    {"DATABASE", TOK_KW_DATABASE},
     // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
     // keyword-lookup pass (same mechanism every other keyword uses), so a
     // column named e.g. "string" would need... actually it can't be named
@@ -1242,6 +1245,22 @@ static void parse_create_table_body(struct SqlParser* p, struct SqlCreateTableSt
     }
     s->column_count = n;
     if (!expect(p, TOK_RPAREN, "expected ')' after CREATE TABLE column list")) return;
+
+    // Database Namespace & Access Roadmap Phase 2: optional trailing "IN
+    // DATABASE <name>" clause -- reuses TOK_KW_IN (already used for the
+    // IN (...) predicate-list grammar elsewhere in this file; one keyword,
+    // two grammar positions, consistent with how this parser already
+    // reuses tokens contextually). Absent for every pre-Phase-2 CREATE
+    // TABLE statement, so this is purely additive.
+    if (p->cur.kind == TOK_KW_IN) {
+        advance(p);   // consume IN
+        if (!expect(p, TOK_KW_DATABASE, "expected DATABASE after IN")) return;
+        if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a database name after IN DATABASE"); return; }
+        sq_strcpy(s->database_name, p->cur.text, OBJECT_NAME_LEN);
+        s->has_database = 1;
+        advance(p);
+    }
+
     finish_statement(p);
 }
 
@@ -1281,6 +1300,28 @@ static void parse_drop_index_body(struct SqlParser* p, struct SqlDropIndexStmt* 
     advance(p);   // consume INDEX
     if (p->cur.kind != TOK_IDENT) { set_error(p, "expected an index name after DROP INDEX"); return; }
     sq_strcpy(s->index_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    finish_statement(p);
+}
+
+// ── Database Namespace & Access Roadmap Phase 2 ─────────────────────────────
+// p->cur == TOK_KW_DATABASE on entry (CREATE already consumed by sql_parse()'s
+// own dispatcher, mirroring how it already disambiguates TABLE vs INDEX).
+static void parse_create_database_body(struct SqlParser* p, struct SqlCreateDatabaseStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume DATABASE
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a database name after CREATE DATABASE"); return; }
+    sq_strcpy(s->database_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    finish_statement(p);
+}
+
+// p->cur == TOK_KW_DATABASE on entry (DROP already consumed).
+static void parse_drop_database_body(struct SqlParser* p, struct SqlDropDatabaseStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume DATABASE
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a database name after DROP DATABASE"); return; }
+    sq_strcpy(s->database_name, p->cur.text, OBJECT_NAME_LEN);
     advance(p);
     finish_statement(p);
 }
@@ -1346,9 +1387,13 @@ int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t er
             } else if (p.cur.kind == TOK_KW_INDEX) {
                 out->kind = SQL_STMT_CREATE_INDEX;
                 parse_create_index_body(&p, &out->u.create_index);
+            } else if (p.cur.kind == TOK_KW_DATABASE) {
+                // Database Namespace & Access Roadmap Phase 2.
+                out->kind = SQL_STMT_CREATE_DATABASE;
+                parse_create_database_body(&p, &out->u.create_database);
             } else {
                 out->kind = SQL_STMT_INVALID;
-                set_error(&p, "expected TABLE or INDEX after CREATE");
+                set_error(&p, "expected TABLE, INDEX, or DATABASE after CREATE");
             }
             break;
         case TOK_KW_ALTER:
@@ -1363,15 +1408,20 @@ int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t er
             } else if (p.cur.kind == TOK_KW_INDEX) {
                 out->kind = SQL_STMT_DROP_INDEX;
                 parse_drop_index_body(&p, &out->u.drop_index);
+            } else if (p.cur.kind == TOK_KW_DATABASE) {
+                // Database Namespace & Access Roadmap Phase 2.
+                out->kind = SQL_STMT_DROP_DATABASE;
+                parse_drop_database_body(&p, &out->u.drop_database);
             } else {
                 out->kind = SQL_STMT_INVALID;
-                set_error(&p, "expected TABLE or INDEX after DROP");
+                set_error(&p, "expected TABLE, INDEX, or DATABASE after DROP");
             }
             break;
         default:
             out->kind = SQL_STMT_INVALID;
             set_error(&p, "unknown statement -- expected SELECT, INSERT, UPDATE, DELETE, "
-                          "CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, or DROP INDEX");
+                          "CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, "
+                          "CREATE DATABASE, or DROP DATABASE");
             break;
     }
 

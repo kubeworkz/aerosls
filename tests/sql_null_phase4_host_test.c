@@ -15,7 +15,7 @@
  *       -o /tmp/sql_null_phase4_host_test tests/sql_null_phase4_host_test.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
  *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
- *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c
+ *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c kernel/database.c
  *   /tmp/sql_null_phase4_host_test
  */
 #include "kernel/object_catalog.h"
@@ -51,6 +51,11 @@ void catalog_after_restore(void) { /* no-op for this test */ }
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
+// Database Namespace & Access Roadmap Phase 2: kernel/database.c's
+// database_drop() calls catalog_get_role() for its permission gate -- this
+// test never calls CREATE/DROP DATABASE, so the return value is a pure
+// linkability stub, not exercised by any scenario below.
+SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 
 /* Same vecstore/vec_index link-satisfying stubs the other sql_*_host_test.c
  * files use (this suite is scoped to the RDBMS layer, not vector storage). */

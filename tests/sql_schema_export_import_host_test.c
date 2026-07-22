@@ -17,8 +17,13 @@
  *       kernel/row_constraint.c kernel/row_journal.c kernel/persist.c \
  *       kernel/cursor.c kernel/mvcc.c kernel/predicate.c \
  *       kernel/sql_parser.c kernel/sql_exec.c kernel/group_profile.c \
- *       kernel/authlist.c kernel/security_audit.c
+ *       kernel/authlist.c kernel/security_audit.c kernel/database.c
  *   /tmp/sql_schema_export_import_host_test
+ *
+ * Database Namespace & Access Roadmap Phase 2 update: sql_exec.c's DDL
+ * executors now call straight into kernel/database.c, so this test's link
+ * line now includes it. No stub needed -- this file already links the real
+ * kernel/object_catalog.c, which provides catalog_get_role().
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"

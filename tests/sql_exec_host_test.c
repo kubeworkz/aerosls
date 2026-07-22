@@ -25,8 +25,17 @@
  *       -o /tmp/sql_exec_host_test tests/sql_exec_host_test.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
  *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
- *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c
+ *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c kernel/database.c
  *   /tmp/sql_exec_host_test
+ *
+ * Database Namespace & Access Roadmap Phase 2 update: sql_exec.c's
+ * exec_create_table()/exec_create_database()/exec_drop_database() now call
+ * straight into kernel/database.c (database_find_id()/_create()/_drop()),
+ * so this test's link line now includes it and this file adds a minimal
+ * catalog_get_role() stub below (database_drop()'s own permission gate
+ * dependency) -- none of this test's own scenarios exercise CREATE/DROP
+ * DATABASE or IN DATABASE, so the stub's exact return value doesn't affect
+ * any existing check, only linkability.
  *
  * Phase 23 update: mvcc.c now calls into kernel/row_constraint.c/
  * kernel/row_journal.c automatically, so this test's link line now
@@ -69,6 +78,11 @@ void catalog_after_restore(void) { /* no-op for this test */ }
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
+// Database Namespace & Access Roadmap Phase 2: kernel/database.c's
+// database_drop() calls catalog_get_role() for its permission gate -- this
+// test never calls CREATE/DROP DATABASE, so the return value is a pure
+// linkability stub, not exercised by any scenario below.
+SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 
 /* Gap Remediation Phase D: persist.c's new restore blocks 9-10 reference
  * vecstore.c/vec_index.c's own globals/functions, neither of which is

@@ -367,27 +367,79 @@ the new file). `kernel/database.c` and `kernel/object_catalog.c` (with
 its new `database_id` field and `sys_sls_valloc()` wiring) both compile-
 checked clean.
 
-### Phase 2 — SQL grammar: `CREATE DATABASE`/`DROP DATABASE`/`IN DATABASE`
+### Phase 2 — SQL grammar: `CREATE DATABASE`/`DROP DATABASE`/`IN DATABASE` — DONE
 
-**Scope:** new `TOK_KW_DATABASE` keyword, `SQL_STMT_CREATE_DATABASE`/
-`SQL_STMT_DROP_DATABASE` statement kinds, and the optional `IN DATABASE
-<name>` clause on `CREATE TABLE` (§1.5). Executor wiring in `sql_exec.c`
-calls straight into Phase 1's `database_create()`/`database_drop()`, and
-stamps `database_id` onto the newly created table's catalog entry when
-`IN DATABASE` is present — the exact integration point inside whichever
-function currently creates/derives that catalog entry for `CREATE TABLE`
-needs to be confirmed by investigation at implementation time (this doc
-scopes the design, not the exact call site), matching this whole
-project's own "investigate current implementation first" convention at
-the start of every phase.
+**Scope as built:** new `TOK_KW_DATABASE` keyword (`sql_parser.c`'s
+`KEYWORDS[]`), `SQL_STMT_CREATE_DATABASE`/`SQL_STMT_DROP_DATABASE`
+statement kinds, `struct SqlCreateDatabaseStmt`/`struct SqlDropDatabaseStmt`
+(just a `database_name[OBJECT_NAME_LEN]` each — no `ALTER DATABASE`, no
+`CASCADE` field, per §1.6/§1.7), and the optional `IN DATABASE <name>`
+clause on `CREATE TABLE` (`has_database`/`database_name` added to `struct
+SqlCreateTableStmt`, zero-defaulted so every pre-Phase-2 `CREATE TABLE`
+statement is byte-for-byte unaffected). `IN DATABASE` reuses the existing
+`TOK_KW_IN` token exactly as §1.5 scoped — one keyword, two grammar
+positions (the pre-existing `IN (...)` predicate-list grammar, and this
+new trailing clause after a `CREATE TABLE` column list).
 
-**Verification:** parser host test (tokens/grammar for all three new
-productions, including rejecting `IN DATABASE` on a nonexistent
-database name — resolved at exec time, not parse time, matching how
-`REFERENCES` constraint validation already works: the parser accepts the
-syntax, the executor validates the reference) + exec host test (real
-`CREATE DATABASE`/`CREATE TABLE ... IN DATABASE`/`DROP DATABASE`
-round trip against the real `database.c` and `object_catalog.c`).
+**The exact integration point** (left open by this doc's original
+sketch, now confirmed): `exec_create_table()` in `sql_exec.c` resolves
+`s->database_name` to a real `database_id` via `database_find_id()`
+*before* calling `sys_sls_valloc()` — if `has_database` is set and the
+name doesn't resolve, the whole statement fails cleanly with
+`SQL_ERR_DDL_FAILED` and nothing is valloc'd (no partial catalog entry
+left behind, matching this codebase's existing "fail before the first
+side effect" DDL convention). If it resolves, the id is copied straight
+into `struct SLSVallocRequest.database_id`, which Phase 1's
+`sys_sls_valloc()` already copies unconditionally onto the new
+`SLSObjectEntry` (no owner-resolution defaulting, per §1.3). This mirrors
+`REFERENCES` constraint validation's own posture exactly: the parser
+accepts the syntax unconditionally, the executor validates the reference
+at exec time.
+
+`exec_create_database()`/`exec_drop_database()` are thin wrappers —
+straight passthroughs to Phase 1's `database_create()`/`database_drop()`,
+mapping their return codes onto `SQL_ERR_NONE`/`SQL_ERR_PERMISSION_DENIED`
+(rc 2, from `database_drop()`)/`SQL_ERR_DDL_FAILED` (everything else,
+including rc 3's "still has tables tagged with it" refusal). No SQL
+`GRANT` exists anywhere in this codebase, so these two statements are the
+entire SQL-reachable surface for databases in this phase, exactly as
+§1.5 scoped — database grants stay Terminal/HTTP-only (Phase 3, not yet
+built).
+
+**Verification:** `tests/sql_database_phase2_host_test.c` (new, 24
+checks, all passed clean on the first run) — links the REAL, unmodified
+`kernel/database.c` (Phase 1), `kernel/object_catalog.c`,
+`kernel/sql_parser.c`, and `kernel/sql_exec.c` (the same real-catalog
+scaffold `sql_ddl_phase5_host_test.c` established), not a
+reimplementation of any of them. Scenarios: `CREATE DATABASE`/`DROP
+DATABASE` via SQL text including duplicate-name and unknown-name
+failure; `CREATE TABLE ... IN DATABASE` tagging the *real* catalog
+entry's `database_id` to match the *real* database's `database_id`
+(reading `object_catalog[]` directly, not just checking `sql_execute()`'s
+return code); a plain `CREATE TABLE` with no `IN DATABASE` leaving
+`database_id` at 0/NONE (purely additive, never a forced default); `IN
+DATABASE` naming a nonexistent database failing at exec time with
+nothing partially created, while the parser itself still parses the
+statement cleanly (confirming the resolution genuinely happens in
+`sql_exec.c`, not `sql_parser.c`); `DROP DATABASE` refusing over SQL
+while a table is still tagged with it, then succeeding once that table
+is dropped (proving the SQL surface reaches the exact same real
+`database_drop()` refusal Phase 1's own host test already exercised
+directly); and parser-level checks for every malformed variant (`CREATE
+DATABASE`/`DROP DATABASE` with no name, `IN DATABASE` with no name, `IN`
+not followed by `DATABASE`).
+
+**Regression:** adding `kernel/database.c` to `sql_exec.c`'s dependency
+graph broke the link step of every other host test that links
+`sql_exec.c` without also linking `kernel/database.c` (13 files) — fixed
+by adding `kernel/database.c` to each one's own "Build and run:" link
+line, and (for the 11 that don't already link the real
+`kernel/object_catalog.c`) a minimal `catalog_get_role()` linkability
+stub, since `database_drop()`'s permission gate calls it unconditionally
+even though none of those tests' own scenarios exercise `CREATE`/`DROP
+DATABASE`. Full sweep after the fix: **39/39 host test files passed, 0
+failed** (up from 38 — the new Phase 2 file itself, plus the 13
+link-fixed files, all present and passing).
 
 ### Phase 3 — Database-scoped grants + `catalog_check_access()` wiring
 
