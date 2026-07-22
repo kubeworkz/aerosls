@@ -46,6 +46,7 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; re
 uint32_t partition_reclaim_all_frames(uint32_t partition_id) { (void)partition_id; return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 3 -- replaces partition_reset_frame_usage() at partition_destroy()'s call site */
 static uint32_t g_fake_local_node_id = 0;   /* Multi-Node Partition Scaling Roadmap Phase 2 — settable */
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
+int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }   /* Multi-Node Partition Scaling Roadmap Phase 6 -- not exercised by this test, safe "nothing to relinquish" stub */
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \

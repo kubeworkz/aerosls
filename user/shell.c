@@ -324,6 +324,10 @@ static void print_help(void) {
         "  partition resume <partition_id>          resume scheduling this partition\n"
         "  partition quota <partition_id> <frames>  set a frame quota (0=unlimited)\n"
         "  partition quotas                         list per-partition usage/quota\n"
+        "  partition migrate <partition_id> <dest_node_id>  cold-migrate ownership to\n"
+        "                                            another node (Multi-Node Phase 6;\n"
+        "                                            pauses, hands off, reclaims frames --\n"
+        "                                            leaves it paused, see shell help text)\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name> <password>      derive+store a password-based key for an\n"
         "                                   object (does NOT encrypt its data -- see\n"
@@ -1093,6 +1097,21 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint32_t pid = sh_atoi(input_buffer + 17);
             uint64_t rc = do_syscall(SYS_SLS_PARTITION_RESUME, (void*)(uintptr_t)pid);
             kernel_serial_printf("[PARTITION] resume %u -> %s\n", pid, rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_starts(input_buffer, "partition migrate ")) {
+            // Multi-Node Partition Scaling Roadmap Phase 6: cold migration.
+            // Same two-token request-struct shape "partition assign " above
+            // already established for a pair of uint32_t args.
+            struct SLSPartitionMigrateRequest req;
+            const char* p = input_buffer + 18;
+            char pidtok[16], desttok[16];
+            p = sh_token(p, pidtok, sizeof(pidtok));
+            sh_token(p, desttok, sizeof(desttok));
+            req.partition_id  = sh_atoi(pidtok);
+            req.dest_node_id  = sh_atoi(desttok);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_MIGRATE, &req);
+            kernel_serial_printf("[PARTITION] migrate partition=%u -> node=%u -> %s\n",
+                                 req.partition_id, req.dest_node_id, rc == 0 ? "OK" : "FAILED");
         }
         else if (sh_starts(input_buffer, "partition quota ")) {
             struct SLSPartitionQuotaSetRequest req;

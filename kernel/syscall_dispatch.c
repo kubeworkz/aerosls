@@ -275,6 +275,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_PARTITION_RESUME:
         return sys_sls_partition_resume((uint32_t)(uintptr_t)arg);
 
+    // ── Multi-Node Partition Scaling Roadmap, Phase 6: cold migration (218) ──
+    case SYS_SLS_PARTITION_MIGRATE:
+        return sys_sls_partition_migrate((struct SLSPartitionMigrateRequest*)arg);
+
     // ── Phase 22: SQL engine, live at last (220) ────────────────────────────
     // The first dispatch-reachable entry point into Phases 19-22's SQL
     // engine -- sql_execute() was previously callable only from its own

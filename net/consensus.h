@@ -191,6 +191,31 @@ void check_partition_lease_heartbeat_tick(void);
  * yet (mirrors partition_lease_init()'s find-or-create posture). */
 void partition_lease_trigger_election(uint32_t partition_id);
 
+/* Multi-Node Partition Scaling Roadmap Phase 6 (cold migration): the
+ * voluntary opposite of partition_lease_trigger_election() -- relinquishes
+ * THIS node's lease claim for partition_id rather than campaigning for one.
+ * Sets role=FOLLOWER, voted_for=0, accumulated_votes=1, heartbeat_ticks_
+ * elapsed=0 on the existing row; does NOT bump term (stepping down isn't
+ * itself a new term -- the destination node's own future election, if any,
+ * advances the term when it actually campaigns, the same way Raft never
+ * needs an outgoing leader to manufacture a term bump for itself). Returns
+ * 0 if an active lease row existed and was stepped down, 1 if partition_id
+ * had no lease row at all -- "nothing to step down from" is a normal,
+ * non-error outcome for a partition that was never contested on this node,
+ * not a failure; callers that care (Phase 6's partition_migrate()) can use
+ * the return value purely for logging, not as a gate.
+ *
+ * Deliberately local-only, transmits nothing: unlike partition_lease_
+ * trigger_election()'s REQUEST_VOTE broadcast, there is no DSPP_CMD_
+ * PARTITION_* opcode for "I am voluntarily stepping down" and no RX
+ * dispatcher anywhere in this codebase that would receive one if there
+ * were (Phase 5's own finding, unchanged) -- so this only ever updates
+ * local state. A real multi-node deployment's destination node would
+ * simply call partition_lease_trigger_election() itself once it observes
+ * (via Phase 2's now-updated partition_owner_table[], not a pushed
+ * message) that it owns partition_id and no one is heartbeating it. */
+int partition_lease_step_down(uint32_t partition_id);
+
 /* Per-partition analogue of process_consensus_packet(): reads partition_id
  * out of the ConsensusMessage payload and routes DSPP_CMD_PARTITION_
  * HEARTBEAT/REQUEST_VOTE/VOTE_REPLY to that specific partition's lease row,

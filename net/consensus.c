@@ -290,6 +290,29 @@ void partition_lease_trigger_election(uint32_t partition_id) {
     e1000_transmit_packet(&vote_req, sizeof(struct DSPPFullPagePacket));
 }
 
+int partition_lease_step_down(uint32_t partition_id) {
+    struct PartitionLease* row = find_lease_row(partition_id);
+    if (!row) {
+        kernel_serial_printf(
+            "[CONSENSUS] partition %u: step-down requested but no lease row exists -- "
+            "nothing to relinquish.\n", (unsigned)partition_id);
+        return 1;
+    }
+
+    enum NodeRole prior_role = row->role;
+    row->role                    = ROLE_FOLLOWER;
+    row->voted_for                = 0;
+    row->accumulated_votes       = 1;
+    row->heartbeat_ticks_elapsed = 0;
+
+    kernel_serial_printf(
+        "[CONSENSUS] partition %u: node %u voluntarily stepped down from %s -- lease relinquished (term %u unchanged).\n",
+        (unsigned)partition_id, (unsigned)local_cluster_state.node_id,
+        prior_role == ROLE_LEADER ? "LEADER" : (prior_role == ROLE_CANDIDATE ? "CANDIDATE" : "FOLLOWER"),
+        (unsigned)row->term);
+    return 0;
+}
+
 void partition_lease_heartbeat_tick(uint32_t partition_id) {
     struct PartitionLease* row = find_lease_row(partition_id);
     if (!row) return;   /* no lease established for this partition yet -- nothing to tick */

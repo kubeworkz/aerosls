@@ -303,6 +303,113 @@ int partition_is_paused(uint32_t partition_id) {
     return partition_paused[partition_id];
 }
 
+// ─── Multi-Node Partition Scaling Roadmap, Phase 6: cold partition migration ──
+int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
+    if (partition_id == PARTITION_SYSTEM) {
+        kernel_serial_print("[PARTITION] ERROR: PARTITION_SYSTEM can never be migrated.\n");
+        return 1;
+    }
+    if (!partition_id_valid(partition_id)) {
+        kernel_serial_printf(
+            "[PARTITION] ERROR: cannot migrate -- partition id %u is not an "
+            "active, defined partition.\n", (unsigned)partition_id);
+        return 1;
+    }
+    if (dest_node_id == 0) {
+        // 0 is the reserved "uninitialized" sentinel (Phase 1) -- migrating
+        // TO it is almost certainly a caller bug, not a real destination
+        // identity, the same rigor PARTITION_SYSTEM's own guard above gets.
+        kernel_serial_print(
+            "[PARTITION] ERROR: cannot migrate to node 0 -- that is the "
+            "reserved 'uninitialized' sentinel (Phase 1), not a real "
+            "destination node.\n");
+        return 1;
+    }
+    uint32_t source_node_id = partition_get_owner_node(partition_id);
+    if (dest_node_id == source_node_id) {
+        kernel_serial_printf(
+            "[PARTITION] ERROR: partition %u is already owned by node %u -- "
+            "nothing to migrate.\n", (unsigned)partition_id, (unsigned)dest_node_id);
+        return 1;
+    }
+
+    // Step 1 (LPAR Phase 14): pause -- excludes the partition from scheduling
+    // for the duration of the move. Reuses partition_pause() directly rather
+    // than re-deriving the same runtime flag a second way.
+    partition_pause(partition_id);
+
+    // Step 2 (Multi-Node Phase 4/6): relinquish this node's write-lease claim
+    // for partition_id, if any was ever held. Deliberately voluntary and
+    // local-only -- see net/consensus.h's own comment on partition_lease_
+    // step_down() for why this doesn't transmit a handoff message (no RX
+    // dispatcher exists anywhere in this codebase to receive one).
+    int lease_existed = (partition_lease_step_down(partition_id) == 0);
+
+    // Step 3 (Multi-Node Phase 5) -- deliberately NOT called here, named
+    // rather than silently skipped. net/dspp.c's dspp_page_read_allowed()/
+    // _write_allowed() are per-packet GATING checks ("should this request be
+    // serviced right now"), not an object-catalog reassignment mechanism --
+    // there is no function anywhere in net/dspp.c that moves or retags a
+    // catalog object's partition_id, because no object-to-physical-frame
+    // resolution plumbing exists to move (see dspp.h's own findings
+    // addendum). A partition's catalog objects (kernel/object_catalog.c)
+    // keep their existing object_id/partition_id completely unchanged by a
+    // migrate() call -- Step 4 below, the ownership-table update, is what
+    // makes dspp_page_read_allowed()/_write_allowed() on the NEW owner node
+    // start returning true. This function does not copy or move any object
+    // data; "migration" here means the ownership record moves, consistent
+    // with this whole roadmap's "groundwork, not a hypervisor" posture (see
+    // partition.h's own top-of-file comment).
+
+    // Step 4 (Multi-Node Phase 2): the actual, load-bearing ownership
+    // handoff -- a pure table write that already persists internally
+    // (persist_partitions(), Phase 10). Frames are deliberately NOT
+    // reclaimed unless this succeeds: reclaiming this node's physical
+    // frames before ownership has genuinely moved would free memory a
+    // partition that STILL thinks it's locally owned here might still be
+    // using -- the same "don't reclaim until the state that justifies it is
+    // real" discipline partition_destroy()'s own step ordering follows.
+    if (partition_set_owner_node(partition_id, dest_node_id) != 0) {
+        kernel_serial_printf(
+            "[PARTITION] ERROR: migration of partition %u aborted -- "
+            "ownership reassignment failed. Partition remains paused; "
+            "frames were NOT reclaimed since ownership never actually moved.\n",
+            (unsigned)partition_id);
+        return 1;
+    }
+
+    // Step 5 (Multi-Node Phase 3): only now, after ownership has genuinely
+    // moved, is it correct to free this node's physical frames -- reuses
+    // the same real reclamation partition_destroy() already established,
+    // not a second implementation.
+    uint32_t frames_reclaimed = partition_reclaim_all_frames(partition_id);
+
+    // Step 6 ("resume on the destination"), deliberately NOT done here: this
+    // function runs entirely on the SOURCE node. Calling partition_resume()
+    // at this point would resume the partition on the node that no longer
+    // owns it -- partition_is_local(partition_id) is now false here (see
+    // Step 4 above). Real resumption on the destination node would require
+    // THAT node to itself notice the ownership change and act, which needs
+    // a wire protocol this codebase doesn't have (no RX dispatcher for any
+    // DSPP opcode -- Phase 5's own finding, unchanged by this phase). The
+    // partition is intentionally left PAUSED when this function returns --
+    // named honestly here rather than silently resuming it on the wrong node.
+    kernel_serial_printf(
+        "[PARTITION] migrated partition %u: node %u -> node %u. Lease "
+        "relinquished=%s, %u physical frame(s) reclaimed. Partition remains "
+        "PAUSED -- resume must happen on the destination node.\n",
+        (unsigned)partition_id, (unsigned)source_node_id, (unsigned)dest_node_id,
+        lease_existed ? "yes" : "no (none was held)",
+        (unsigned)frames_reclaimed);
+
+    return 0;
+}
+
+uint64_t sys_sls_partition_migrate(struct SLSPartitionMigrateRequest* req) {
+    if (!req) return 1;
+    return (uint64_t)partition_migrate(req->partition_id, req->dest_node_id);
+}
+
 uint64_t sys_sls_partition_destroy(uint32_t partition_id) {
     return (uint64_t)partition_destroy(partition_id);
 }

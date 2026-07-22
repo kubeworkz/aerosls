@@ -162,6 +162,36 @@ int partition_resume(uint32_t partition_id);
  * partition_get_for_uid()'s posture). Consulted by pick_next_partition(). */
 int partition_is_paused(uint32_t partition_id);
 
+/* ─── Multi-Node Partition Scaling Roadmap, Phase 6: cold partition
+ * migration ─────────────────────────────────────────────────────────────
+ * Orchestrates a full ownership handoff of partition_id from this node to
+ * dest_node_id, reusing every real primitive the roadmap's earlier phases
+ * already built rather than re-deriving any of them: partition_pause()
+ * (Phase 14) freezes scheduling for the duration of the move,
+ * partition_lease_step_down() (net/consensus.h, Phase 6's own small
+ * addition alongside Phase 4's lease API) relinquishes this node's write
+ * claim, partition_set_owner_node() (Phase 2) performs the actual,
+ * load-bearing ownership handoff, and partition_reclaim_all_frames()
+ * (Phase 3) frees this node's physical frames once ownership has genuinely
+ * moved -- in that order, and only in that order: frames are deliberately
+ * NOT reclaimed unless the ownership handoff itself succeeds (see the .c
+ * file's own comment on why reclaiming before a failed handoff would be
+ * actively wrong).
+ *
+ * Explicitly COLD only: the partition is left PAUSED (not resumed) when
+ * this function returns, on purpose -- see the .c file's own comment on
+ * why resuming here, on the SOURCE node, after ownership has already moved
+ * to dest_node_id would resume it on the wrong node. Real resumption on the
+ * destination is out of scope for what a single kernel instance running
+ * this function can itself perform (no RX dispatcher/wire protocol exists
+ * for a destination node to be notified -- Phase 5's own finding, still
+ * true here).
+ *
+ * Returns 0 on success, 1 on any validation failure (PARTITION_SYSTEM,
+ * unknown/inactive partition_id, dest_node_id==0, or dest_node_id already
+ * the current owner) or if the ownership handoff itself fails. */
+int partition_migrate(uint32_t partition_id, uint32_t dest_node_id);
+
 // ─── Syscalls ─────────────────────────────────────────────────────────────
 #define SYS_SLS_PARTITION_CREATE  210
 #define SYS_SLS_PARTITION_ASSIGN  211
@@ -169,6 +199,7 @@ int partition_is_paused(uint32_t partition_id);
 #define SYS_SLS_PARTITION_DESTROY 214
 #define SYS_SLS_PARTITION_PAUSE   215
 #define SYS_SLS_PARTITION_RESUME  216
+#define SYS_SLS_PARTITION_MIGRATE 218
 
 struct SLSPartitionCreateRequest {
     char name[PARTITION_NAME_LEN];
@@ -176,6 +207,10 @@ struct SLSPartitionCreateRequest {
 struct SLSPartitionAssignRequest {
     uint32_t uid;
     uint32_t partition_id;
+};
+struct SLSPartitionMigrateRequest {
+    uint32_t partition_id;
+    uint32_t dest_node_id;
 };
 
 /* Thin syscall wrappers, same shape as sys_sls_role_set()/sys_sls_valloc()
@@ -190,5 +225,9 @@ uint64_t sys_sls_partition_assign(struct SLSPartitionAssignRequest* req);
 uint64_t sys_sls_partition_destroy(uint32_t partition_id);
 uint64_t sys_sls_partition_pause(uint32_t partition_id);
 uint64_t sys_sls_partition_resume(uint32_t partition_id);
+
+/* Phase 6: request-struct wrapper, same shape as sys_sls_partition_assign()
+ * -- two uint32_t args don't fit do_syscall()'s single-arg ABI directly. */
+uint64_t sys_sls_partition_migrate(struct SLSPartitionMigrateRequest* req);
 
 #endif /* PARTITION_H */
