@@ -200,7 +200,8 @@ static void scan_cb(struct RowId id, const struct RowValues* values, void* ctx) 
 
 /* ─── Test fixture: one "employees" table, 3 columns ────────────────────
  * id UINT64 (8B), name STRING (64B), active BOOL (1B) -> row_width =
- * 1(tombstone)+8+64+1 = 74B -> rows_per_page = (4096-4)/74 = 55. */
+ * 3(tombstone+null_mask, Phase 4)+8+64+1 = 76B -> rows_per_page =
+ * (4096-4)/76 = 53. */
 static void make_employees_table(void) {
     memset(&object_catalog[0], 0, sizeof(object_catalog[0]));
     strcpy(object_catalog[0].name, "employees");
@@ -238,8 +239,12 @@ int main(void) {
     CHECK(object_catalog[0].uses_rowstore == 1, "scenario 1: uses_rowstore flag set on the catalog entry");
     CHECK(table_headers[0].active == 1, "scenario 1: table header marked active");
     CHECK(table_headers[0].layout.column_count == 3, "scenario 1: layout has 3 columns");
-    CHECK(table_headers[0].layout.row_width == 74, "scenario 1: row_width computed correctly (1 + 8 + 64 + 1 = 74)");
-    CHECK(table_headers[0].layout.rows_per_page == 55, "scenario 1: rows_per_page computed correctly ((4096-4)/74 = 55)");
+    // Phase 4 (SQL Feature-Parity Roadmap): row offset now starts at byte 3
+    // (1 tombstone + 2 null_mask bytes), not byte 1 -- see rowstore.h's
+    // Phase 4 note. row_width is 2 bytes wider than its pre-Phase-4 value,
+    // which also shifts rows_per_page down.
+    CHECK(table_headers[0].layout.row_width == 76, "scenario 1: row_width computed correctly (3 + 8 + 64 + 1 = 76)");
+    CHECK(table_headers[0].layout.rows_per_page == 53, "scenario 1: rows_per_page computed correctly ((4096-4)/76 = 53)");
     CHECK(rowstore_create_table("employees") == 1, "scenario 1: creating it a second time fails (already a row-set table)");
 
     /* ── Scenario 2: insert enough rows to span two pages, confirming real
@@ -253,9 +258,9 @@ int main(void) {
     }
     CHECK(inserted == 60, "scenario 2: all 60 inserts succeed");
     CHECK(table_headers[0].row_count == 60, "scenario 2: row_count reflects all 60");
-    CHECK(table_headers[0].page_count == 2, "scenario 2: 60 rows at 55/page correctly spans exactly 2 pages");
-    CHECK(ids[0].page_id == ids[54].page_id, "scenario 2: rows 0-54 (55 rows) share the first page");
-    CHECK(ids[55].page_id != ids[0].page_id, "scenario 2: row 55 lands on a NEW page, not overflowing the first");
+    CHECK(table_headers[0].page_count == 2, "scenario 2: 60 rows at 53/page correctly spans exactly 2 pages");
+    CHECK(ids[0].page_id == ids[52].page_id, "scenario 2: rows 0-52 (53 rows) share the first page");
+    CHECK(ids[53].page_id != ids[0].page_id, "scenario 2: row 53 lands on a NEW page, not overflowing the first");
     CHECK(g_access_calls > 0 && g_access_last_perm == PERM_WRITE, "scenario 2: insert gates on catalog_check_access() with PERM_WRITE");
 
     /* ── Scenario 3: get every row back, confirm round-trip correctness

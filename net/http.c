@@ -1597,7 +1597,11 @@ static void sql_row_to_json_cb(struct RowId id, const struct RowValues* v, void*
     jb_arr_open(ctx->j, 0);
     for (uint32_t i = 0; i < v->count; i++) {
         if (i) jb_putc(ctx->j, ',');
-        jb_esc_str(ctx->j, v->values[i]);
+        // Phase 4 (SQL Feature-Parity Roadmap): a real NULL column now
+        // round-trips as JSON `null`, not an indistinguishable empty
+        // string -- the round-trip guarantee this phase exists to give.
+        if (v->null_mask & (1u << i)) jb_raw(ctx->j, "null");
+        else                          jb_esc_str(ctx->j, v->values[i]);
     }
     jb_arr_close(ctx->j);
 }
@@ -2418,7 +2422,10 @@ static int api_vec_join_post(const char* body, char* buf, int max, uint32_t req_
         jb_arr_open(&j, "row");
         for (uint32_t c = 0; c < req.results[i].row.count; c++) {
             if (c) jb_putc(&j, ',');
-            jb_esc_str(&j, req.results[i].row.values[c]);
+            // Phase 4 (SQL Feature-Parity Roadmap): same real-null
+            // round-trip as sql_row_to_json_cb() above.
+            if (req.results[i].row.null_mask & (1u << c)) jb_raw(&j, "null");
+            else jb_esc_str(&j, req.results[i].row.values[c]);
         }
         jb_arr_close(&j);
         jb_obj_close(&j);

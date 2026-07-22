@@ -184,6 +184,7 @@ int main(void) {
     for (int i = 0; i < 5; i++) {
         struct RowValues v;
         v.count = 2;
+        v.null_mask = 0;   // Phase 4: real values, no NULL columns
         snprintf(v.values[0], RECORD_VAL_LEN, "%d", i + 1);
         snprintf(v.values[1], RECORD_VAL_LEN, "employee%d", i + 1);
         MvccError e = mvcc_row_insert(txn1, 1, "employees", &v, &row_ids[i]);
@@ -277,18 +278,25 @@ int main(void) {
 
     struct RowValues dup;
     dup.count = 2;
+    dup.null_mask = 0;                 // Phase 4: real values, no NULL columns
     strcpy(dup.values[0], "3");        // id=3 already exists -- should violate UNIQUE
     strcpy(dup.values[1], "someone");
     RowConstraintResult rr = row_constraint_check_write(txn2, 1, object_catalog[0].object_id, &dup, 0);
     CHECK(rr == ROW_CONSTRAINT_VIOLATION_UNIQUE,
           "restore: restored UNIQUE constraint still rejects a duplicate id=3 after 'reboot'");
+    // Phase 4: NOT NULL is checked against the real null_mask bit now, not an
+    // empty-string convention -- an empty STRING in values[1] is no longer
+    // itself a NOT NULL violation (see rowstore.h's Phase 4 note), so this
+    // must set the null_mask bit for column 1 to actually represent NULL.
     struct RowValues nullname;
     nullname.count = 2;
+    nullname.null_mask = (uint16_t)(1u << 1);
     strcpy(nullname.values[0], "999");
     nullname.values[1][0] = '\0';
     rr = row_constraint_check_write(txn2, 1, object_catalog[0].object_id, &nullname, 0);
     CHECK(rr == ROW_CONSTRAINT_VIOLATION_NOT_NULL,
-          "restore: restored NOT NULL constraint still rejects an empty name after 'reboot'");
+          "restore: restored NOT NULL constraint still rejects a real NULL name after 'reboot' "
+          "(Phase 4: uses null_mask, not empty-string convention)");
 
     /* ── 8: row-set B-tree index -- rebuild-on-boot ──────────────────────── */
     n = row_index_lookup(0, "idx_emp_id", "3", found, 4);

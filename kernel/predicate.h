@@ -79,6 +79,22 @@
  *     arith()` is exported specifically so `sql_exec.c`'s `UPDATE ... SET
  *     col = expr` support (e.g. `SET price = price * 1.1`) can reuse the
  *     exact same operand-resolution logic instead of a second copy.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 4: real NULL ──────────────────────────
+ * `rowstore.h`'s `struct RowValues` gained a real `null_mask` this phase --
+ * see that header's own Phase 4 note for the storage-layer design. This
+ * file's job is evaluation: `PRED_OP_IS_NULL`/`PRED_OP_IS_NOT_NULL` are two
+ * new comparison ops on the EXISTING `PRED_NODE_COMPARISON` leaf shape (no
+ * new node kind -- `column_name` is set exactly like an ordinary comparison,
+ * `literal` is unused/empty), matching this file's own established "reuse
+ * the leaf shape, add an op" pattern from Phase 3's `LIKE`. Every OTHER
+ * comparison kind (`compare_typed()`'s ordinary path, `LIKE`, arithmetic's
+ * operand resolution) now checks `null_mask` first and fails closed (the
+ * comparison is false) when the column is NULL -- collapsing SQL's real
+ * three-valued (`TRUE`/`FALSE`/`UNKNOWN`) logic down to this codebase's
+ * existing boolean WHERE evaluation, the same simplification this whole
+ * roadmap has made consistently rather than introducing a third boolean
+ * state throughout the evaluator for one phase's benefit.
  */
 #ifndef PREDICATE_H
 #define PREDICATE_H
@@ -98,6 +114,8 @@ typedef enum {
     PRED_OP_LE,
     PRED_OP_GE,
     PRED_OP_LIKE,   // Phase 3 (SQL Feature-Parity Roadmap): STRING columns only, '%'/'_' wildcards, no ESCAPE
+    PRED_OP_IS_NULL,      // Phase 4 (SQL Feature-Parity Roadmap): column_name set, literal unused
+    PRED_OP_IS_NOT_NULL,  // Phase 4 (SQL Feature-Parity Roadmap): column_name set, literal unused
 } PredicateCompareOp;
 
 typedef enum {

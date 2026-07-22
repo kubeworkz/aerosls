@@ -129,6 +129,10 @@ static int compare_typed(const struct RowTableLayout* layout, const struct RowVa
         if (pe_streq(layout->column_names[i], column_name)) { col = i; break; }
     }
     if (col == 0xFFFFFFFFu || col >= row->count) { *fail = 1; return 0; }
+    // Phase 4 (SQL Feature-Parity Roadmap): a NULL column compared against
+    // anything is unknown, collapsed to "fail closed" like every other
+    // unresolvable comparison in this function.
+    if (row->null_mask & (1u << col)) { *fail = 1; return 0; }
 
     const char* row_text = row->values[col];
     switch (layout->column_types[col]) {
@@ -192,6 +196,9 @@ static int resolve_arith_operand(const struct RowTableLayout* layout, const stru
         if (pe_streq(layout->column_names[i], op.text)) { col = i; break; }
     }
     if (col == 0xFFFFFFFFu || col >= row->count) return 1;
+    // Phase 4: a NULL column has no numeric value to resolve -- fail closed,
+    // same as every other unresolvable arithmetic operand.
+    if (row->null_mask & (1u << col)) return 1;
     switch (layout->column_types[col]) {
         case FIELD_TYPE_UINT64: {
             uint64_t v;
@@ -231,6 +238,19 @@ int predicate_eval_arith(const struct RowTableLayout* layout, const struct RowVa
 
 static int eval_comparison(const struct PredicateNode* n, const struct RowTableLayout* layout,
                            const struct RowValues* row) {
+    // Phase 4 (SQL Feature-Parity Roadmap): IS NULL / IS NOT NULL -- the
+    // one place that deliberately wants to know the null_mask bit directly
+    // rather than failing closed because of it.
+    if (n->op == PRED_OP_IS_NULL || n->op == PRED_OP_IS_NOT_NULL) {
+        uint32_t col = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < layout->column_count; i++) {
+            if (pe_streq(layout->column_names[i], n->column_name)) { col = i; break; }
+        }
+        if (col == 0xFFFFFFFFu || col >= row->count) return 0;   // unresolvable column -- fail closed
+        int is_null = (row->null_mask & (1u << col)) ? 1 : 0;
+        return (n->op == PRED_OP_IS_NULL) ? is_null : !is_null;
+    }
+
     // Phase 3: arithmetic-comparison leaf -- the left-hand side is a
     // computed double, not a typed row value, so it's always compared
     // numerically against the (also-numeric) literal, never via
@@ -261,6 +281,8 @@ static int eval_comparison(const struct PredicateNode* n, const struct RowTableL
         }
         if (col == 0xFFFFFFFFu || col >= row->count) return 0;
         if (layout->column_types[col] != FIELD_TYPE_STRING) return 0;
+        // Phase 4: a NULL column has no text to pattern-match -- fail closed.
+        if (row->null_mask & (1u << col)) return 0;
         return pe_like_match(n->literal, row->values[col]);
     }
 

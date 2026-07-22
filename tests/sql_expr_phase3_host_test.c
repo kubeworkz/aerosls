@@ -308,8 +308,11 @@ int main(void) {
               "scenario 7: a trivially-parenthesized single comparison parses fine");
         CHECK(sql_parse("SELECT * FROM products WHERE id NOT IN (1,2)", &stmt, err, sizeof(err)) == 1,
               "scenario 7b: NOT IN is not implemented -- fails to parse cleanly (named out-of-scope item)");
-        CHECK(sql_parse("SELECT * FROM products WHERE name IS NULL", &stmt, err, sizeof(err)) == 1,
-              "scenario 7c: IS NULL is deferred to Phase 4 -- fails to parse cleanly (named out-of-scope item)");
+        // Phase 4 promoted IS NULL out of scope-cut status and implemented it
+        // for real (see sql_null_phase4_host_test.c) -- this now parses fine,
+        // updated from the Phase 3 assertion that it failed to parse.
+        CHECK(sql_parse("SELECT * FROM products WHERE name IS NULL", &stmt, err, sizeof(err)) == 0,
+              "scenario 7c: IS NULL now parses cleanly (Phase 4 implemented it -- was out-of-scope in Phase 3)");
         CHECK(sql_parse("SELECT * FROM products WHERE price > (id + 1) * 2", &stmt, err, sizeof(err)) == 1,
               "scenario 7d: multi-operation arithmetic (more than one +-*/ per comparison) is out of scope -- fails to parse");
     }

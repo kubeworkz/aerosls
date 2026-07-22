@@ -455,7 +455,7 @@ unchanged. `net/http.c` compile-checked clean against the updated
 
 ---
 
-## Phase 4 — Real NULL + BLOB, dynamic-typing groundwork
+## Phase 4 — Real NULL + BLOB, dynamic-typing groundwork — DONE
 
 **Goal:** `NULL` as a genuine third state distinct from `""`/`0`, and a
 `BLOB` column type — closing the type-system gap named in §0.4.
@@ -488,6 +488,131 @@ name explicitly whichever is true); compile-check across every touched
 serializer; regression sweep for `row_constraint_journal_host_test` and
 `rowstore_host_test` (both touch `RowValues` shape directly and are the
 most likely to break silently from a struct layout change).
+
+### Scope correction made during implementation
+
+Investigation confirmed the "presumably an empty-string convention"
+hedge in the original draft was exactly right: pre-Phase-4, `NOT_NULL`/
+`UNIQUE`/`RANGE`/`REFERENCE` all checked `strlen(val) == 0` against the
+fixed-width string slot — there was no real NULL anywhere in the
+codebase, just an overloaded empty string standing in for it. This phase
+replaced that convention with a genuine third state rather than
+formalizing it: `struct RowValues` (`rowstore.h`) gained a `uint16_t
+null_mask` bitmap (bit *c* set ⇒ column *c* is really NULL), which is a
+**one-way, on-disk row-format change** (row width +2 bytes — byte 0 is
+still the tombstone, bytes 1–2 are now the null mask, column data starts
+at byte 3 instead of byte 1). This has no migration path and none was
+built, matching the exact precedent set by Phase 2's JOIN struct-layout
+change and every prior Vector Store roadmap phase that changed an
+on-disk shape: acceptable because this is a research/dev codebase with
+no real deployed data, and named explicitly here rather than silently
+shipped.
+
+Because the old `strlen(val) == 0` check conflated "empty string" and
+"NULL," fixing it to read the real `null_mask` bit is a genuine,
+intentional **behavior correction**, not just a refactor: `UNIQUE`
+previously allowed two rows with an empty-string value in a UNIQUE
+column to silently coexist (both looked like "NULL" and were exempted);
+now a real empty string is a normal, comparable value and only an actual
+NULL is exempt. `RANGE` previously would have tried to numeric-parse an
+empty string and failed the range check; now a real NULL vacuously
+passes RANGE (matching standard SQL constraint semantics), while an
+empty string is checked as a real value. `REFERENCE` got the same
+correction on both the write-side FK check and the delete-side
+referenced-row scan. This was caught concretely, not just reasoned
+about: `row_constraint_journal_host_test.c`'s own scenario 3 asserted
+that an empty-string tag violates `NOT NULL` — true only under the old
+convention — and needed rewriting to use a real `NULL` literal, with a
+new companion scenario 3b added confirming an empty string is *not* a
+`NOT NULL` violation post-fix.
+
+SQL's tri-valued logic (`TRUE`/`FALSE`/`UNKNOWN`) was deliberately
+**not** implemented in full. Instead, NULL operands collapse to this
+codebase's existing "fail closed" pattern already used throughout
+`predicate.c` for unresolvable columns and literals: NULL in an ordinary
+comparison, `LIKE`, or arithmetic operand always makes the containing
+comparison evaluate false. The one deliberate exception is `IS NULL`/
+`IS NOT NULL`, which inspect the `null_mask` bit directly rather than
+failing closed — matching standard SQL's own special-casing of that one
+operator pair. `= NULL` was deliberately **not** given special meaning
+(only the dedicated `IS [NOT] NULL` operator resolves NULL), verified by
+a parser-level test confirming `WHERE col = NULL` fails to parse
+cleanly, sidestepping the ambiguity standard SQL itself warns against.
+
+`IS NULL`/`IS NOT NULL` reused Phase 3's "reuse the leaf shape, add an
+op" precedent exactly: `PRED_OP_IS_NULL`/`PRED_OP_IS_NOT_NULL` are new
+values on the existing `PRED_NODE_COMPARISON` leaf (no new node kind).
+`NULL` as an `INSERT`/`UPDATE` value follows Phase 3's additive-
+parallel-array convention: `SqlInsertStmt.is_null[]` parallel to
+`values[]`, `SqlUpdateStmt.set_is_null[]` parallel to `set_values[]`/
+`set_is_arith[]` — every pre-Phase-4 statement's original fields are
+untouched, so `tests/sql_parser_host_test.c`'s direct field reads keep
+working unchanged.
+
+`BLOB` scope was kept deliberately narrow: `FIELD_TYPE_BLOB` is stored
+and compared exactly like `STRING` (same 64-byte inline slot, same
+text-in/text-out API boundary). There is no true large-object/TOAST
+overflow mechanism and no base64/binary-safe encoding at the SQL text
+layer — it exists purely so a schema can name its intent ("this is
+binary data") distinctly from `STRING`, not as a new storage class.
+
+**Explicitly out of scope, named rather than silently dropped:**
+LEFT JOIN's sentinel-padding (`""`/`"0"`/`"false"`, from Phase 2) was
+**not** retrofitted to use real NULL — revisiting already-tested JOIN
+code was judged higher regression risk than benefit for this phase.
+Aggregate functions (`SUM`/`AVG`/`COUNT`, Phase 1) do **not** skip NULL
+columns the standard-SQL way. The frontend (`slsos-sim`) has no NULL-
+aware rendering — only the JSON API round-trip guarantee (`null` in
+JSON, via `net/http.c`'s per-column serializer) is this phase's actual
+wire-format deliverable.
+
+**Verification — actual results:** `tests/sql_null_phase4_host_test.c`
+(new, 37 checks) covers a real NULL INSERT → SELECT round-trip distinct
+from empty string/zero; `NOT NULL` rejecting a real NULL while an empty
+STRING passes (the corrected behavior, not the old convention); `UNIQUE`
+no longer treating two empty strings as both-NULL-exempt; `RANGE`
+vacuously passing for NULL; `REFERENCE` exempting NULL on both insert
+and delete paths; `IS NULL`/`IS NOT NULL` in `WHERE`; NULL failing closed
+in `=`, arithmetic, and `LIKE`; `UPDATE ... SET col = NULL` and back to a
+real value; a `BLOB` column round-trip; and parser-level checks (`=
+NULL` fails to parse, `is_null[]`/`set_is_null[]` set correctly).
+
+Regression sweep surfaced three real, expected fallout failures from the
+row-format and constraint-semantics changes — all investigated and
+fixed, not silently patched over: `rowstore_host_test.c` hardcoded
+`row_width == 74`/`rows_per_page == 55` and specific row-index page-
+boundary assertions computed from the pre-Phase-4 layout; updated to the
+new `row_width == 76`/`rows_per_page == 53` and the corresponding
+boundary rows. `row_constraint_journal_host_test.c`'s scenario 3 (see
+above) was corrected to test real NULL instead of empty-string, plus a
+new scenario 3b; this fix's own test-data change then exposed an
+**unrelated authoring bug** — the replacement row used `id=30`, which
+collided with a *different*, pre-existing scenario 12 that also inserts
+`id=30` inside a rollback test, so scenario 12's post-rollback SELECT
+found the still-present row from scenario 3b's insert instead of a
+truly-absent row. Fixed by moving scenario 3b to an unused id; confirmed
+this was a test-authoring collision, not a kernel bug, by re-running
+clean afterward. `persist_rdbms_vecstore_host_test.c` built `struct
+RowValues` values directly on the stack (bypassing the parser/executor
+entirely) and relied on the same old empty-string-as-NULL convention for
+one assertion, plus left `null_mask` uninitialized (reading stack
+garbage) in three other hand-built `RowValues` — a real latent bug this
+phase's struct change exposed rather than caused, since a zero-init
+convention happened to mask it before `null_mask` existed. Fixed by
+explicitly initializing `null_mask` in every hand-built `RowValues` in
+that file and updating the NOT NULL assertion to set the real null bit
+instead of relying on an empty string. A fourth failure,
+`sql_expr_phase3_host_test.c` scenario 7c, was Phase 3's own regression
+test asserting `IS NULL` "fails to parse cleanly (named out-of-scope
+item)" — correct when Phase 3 shipped, false now that Phase 4 promoted
+`IS NULL` out of scope-cut status; updated to assert it parses cleanly.
+
+Full regression sweep (`tests/run_all.sh`): **31/31 host test files
+passing, 0 failed** — includes the new file and all four fixes above.
+`net/http.c` compile-checked clean against the updated `rowstore.h`/
+`predicate.h`/`sql_parser.h`/`sql_exec.h` (only the same pre-existing,
+unrelated implicit-function-declaration warnings seen in every prior
+phase — no errors).
 
 ---
 

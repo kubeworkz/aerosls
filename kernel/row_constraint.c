@@ -12,7 +12,11 @@
 // own small copies, matching this codebase's established convention: rs_*
 // in rowstore.c, ri_* in row_index.c, pe_* in predicate.c, se_*/mv_*
 // elsewhere, rc_* here). ────────────────────────────────────────────────────
-static uint32_t rc_strlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
+// Phase 4 (SQL Feature-Parity Roadmap): rc_strlen() (an `strlen(val) == 0`
+// empty-string-as-NULL convention helper) is no longer used anywhere in
+// this file -- every NULL check below now reads the real null_mask flag
+// instead (see row_constraint_check_write()'s Phase 4 note). Removed
+// rather than left as dead code.
 static int rc_streq(const char* a, const char* b) {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
     return *a == *b;
@@ -176,6 +180,11 @@ static void rc_unique_scan_cb(struct MvccRowId id, const struct RowValues* v, vo
     struct rc_unique_ctx* ctx = (struct rc_unique_ctx*)ctxp;
     if (ctx->found) return;
     if (id.logical_id == ctx->exclude_logical_id) return;
+    // Phase 4 (SQL Feature-Parity Roadmap): a NULL in the scanned row can
+    // never be a duplicate of anything (standard SQL UNIQUE semantics) --
+    // without this check, a NULL column's now-empty text would incorrectly
+    // collide with a real empty-STRING candidate value.
+    if (v->null_mask & (1u << ctx->col)) return;
     if (rc_strcmp(v->values[ctx->col], ctx->candidate) == 0) ctx->found = 1;
 }
 
@@ -184,6 +193,9 @@ static void rc_ref_scan_cb(struct MvccRowId id, const struct RowValues* v, void*
     (void)id;
     struct rc_ref_ctx* ctx = (struct rc_ref_ctx*)ctxp;
     if (ctx->found) return;
+    // Phase 4: a NULL column in the scanned row can never satisfy a
+    // REFERENCE match either.
+    if (v->null_mask & (1u << ctx->col)) return;
     if (rc_strcmp(v->values[ctx->col], ctx->candidate) == 0) ctx->found = 1;
 }
 
@@ -196,13 +208,22 @@ RowConstraintResult row_constraint_check_write(uint64_t txn_id, uint32_t caller_
         if (!c->active || c->table_object_id != table_object_id) continue;
         if (c->column_index >= values->count) continue;   // defensive -- shouldn't happen, column count is schema-fixed
         const char* val = values->values[c->column_index];
+        // Phase 4 (SQL Feature-Parity Roadmap): the real null_mask flag,
+        // replacing this function's old `rc_strlen(val) == 0` convention
+        // (which couldn't distinguish NULL from a real empty STRING value).
+        int is_null = (values->null_mask & (1u << c->column_index)) ? 1 : 0;
 
         switch (c->kind) {
             case ROW_CONSTRAINT_NOT_NULL:
-                if (rc_strlen(val) == 0) return ROW_CONSTRAINT_VIOLATION_NOT_NULL;
+                if (is_null) return ROW_CONSTRAINT_VIOLATION_NOT_NULL;
                 break;
 
             case ROW_CONSTRAINT_RANGE: {
+                // A NULL value trivially satisfies RANGE -- standard SQL
+                // constraint semantics (a constraint's condition is only
+                // evaluated against a present value; NULL makes it
+                // vacuously true, not violated).
+                if (is_null) break;
                 int fail = 0;
                 int tidx = rc_find_table_index(c->table_name);
                 SLSFieldType t = (tidx >= 0) ? table_headers[tidx].layout.column_types[c->column_index] : FIELD_TYPE_STRING;
@@ -212,11 +233,14 @@ RowConstraintResult row_constraint_check_write(uint64_t txn_id, uint32_t caller_
             }
 
             case ROW_CONSTRAINT_UNIQUE: {
-                // A NULL/empty value is never compared for uniqueness --
-                // matches standard SQL UNIQUE semantics (multiple NULLs
-                // are allowed even in a UNIQUE column) and sidesteps this
-                // first cut needing its own NULL-handling rule beyond that.
-                if (rc_strlen(val) == 0) break;
+                // A real NULL is never compared for uniqueness -- matches
+                // standard SQL UNIQUE semantics (multiple NULLs are allowed
+                // even in a UNIQUE column). Phase 4: this now correctly
+                // treats a real empty STRING value as a comparable, non-
+                // exempt candidate -- the old `strlen(val) == 0` check
+                // conflated the two, a genuine behavior fix as a side
+                // effect of no longer doing so.
+                if (is_null) break;
                 struct rc_unique_ctx ctx = { c->column_index, val, exclude_logical_id, 0 };
                 mvcc_table_scan(txn_id, caller_uid, c->table_name, rc_unique_scan_cb, &ctx);
                 if (ctx.found) return ROW_CONSTRAINT_VIOLATION_UNIQUE;
@@ -224,7 +248,7 @@ RowConstraintResult row_constraint_check_write(uint64_t txn_id, uint32_t caller_
             }
 
             case ROW_CONSTRAINT_REFERENCE: {
-                if (rc_strlen(val) == 0) break;   // a NULL FK column is not required to reference anything
+                if (is_null) break;   // a NULL FK column is not required to reference anything
                 struct rc_ref_ctx ctx = { c->ref_column_index, val, 0 };
                 mvcc_table_scan(txn_id, caller_uid, c->ref_table_name, rc_ref_scan_cb, &ctx);
                 if (!ctx.found) return ROW_CONSTRAINT_VIOLATION_REFERENCE;
@@ -256,7 +280,7 @@ RowConstraintResult row_constraint_check_delete(uint64_t txn_id, uint32_t caller
         if (!c->active || c->kind != ROW_CONSTRAINT_REFERENCE || c->ref_table_object_id != table_object_id) continue;
         if (c->ref_column_index >= values.count) continue;
         const char* ref_val = values.values[c->ref_column_index];
-        if (rc_strlen(ref_val) == 0) continue;
+        if (values.null_mask & (1u << c->ref_column_index)) continue;   // Phase 4: real null_mask, not strlen==0
 
         struct rc_ref_ctx ctx = { c->column_index, ref_val, 0 };
         mvcc_table_scan(txn_id, caller_uid, c->table_name, rc_ref_scan_cb, &ctx);

@@ -44,6 +44,58 @@
  * gave its own analogous gap in process spawning before Phase 9 fixed it).
  * Row-set tables are new functionality with no existing callers to break,
  * so they get the check from day one instead.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 4: real NULL + BLOB ──────────────────
+ * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) Before this phase, every
+ * column always held SOME text -- "no NULL/default support yet" was
+ * `exec_insert()`'s own comment (sql_exec.c), and `ROW_CONSTRAINT_NOT_NULL`
+ * (row_constraint.c) actually checked `strlen(val) == 0`, an empty-string
+ * convention indistinguishable from a real empty STRING value. This phase
+ * adds a genuine per-column NULL flag: `struct RowValues` gains a
+ * `null_mask` (bit c set => column c's `values[c]` text is meaningless,
+ * the column IS NULL), and the on-disk row layout (`serialize_row()`/
+ * `deserialize_row()` in rowstore.c) persists that mask directly instead of
+ * inventing a magic string sentinel a real column value could collide with.
+ *
+ * Two extra bytes are reserved in every row slot right after the tombstone
+ * byte (`offset` starts at 3, not 1) to hold the mask -- a real row-width
+ * change, not additive-only, since it moves every column's on-disk byte
+ * offset. This is a one-way format change with no migration path for any
+ * previously-persisted `sls_storage.img`: acceptable because this is a
+ * research/dev codebase with no real deployed data (matching this whole
+ * roadmap's precedent -- Phase 2's JOIN struct-layout change and multiple
+ * Vector Store roadmap phases made the same call before it, always named
+ * explicitly rather than silently).
+ *
+ * NULL participates in comparisons/constraints the standard SQL way,
+ * collapsed to this codebase's existing boolean (not tri-valued) WHERE
+ * evaluation: a NULL column compared, LIKE-matched, or used as an
+ * arithmetic operand always evaluates the containing comparison to false
+ * ("fail closed", predicate.c) -- the one exception being the new `IS
+ * NULL`/`IS NOT NULL` operators, which exist specifically to test the flag
+ * directly. `NOT_NULL`/`RANGE`/`UNIQUE`/`REFERENCE` constraints
+ * (row_constraint.c) all now check the real flag instead of the old
+ * `strlen(val) == 0` convention -- notably, `UNIQUE` now correctly treats a
+ * real empty STRING value as comparable-for-uniqueness (only a true NULL is
+ * exempt, matching standard SQL), a genuine behavior fix this phase makes
+ * as a side effect of no longer conflating the two.
+ *
+ * Explicitly OUT OF SCOPE this phase (see the roadmap doc's own Phase 4
+ * writeup and this file's implementation for what was actually decided,
+ * not assumed): `LEFT JOIN`'s unmatched-row sentinel padding
+ * (`""`/`"0"`/`"false"`, sql_exec.c Phase 2) is NOT retrofitted to use real
+ * NULL here -- Phase 2 named that as a future Phase-4 cleanup, but
+ * revisiting already-tested JOIN code was judged higher regression risk
+ * than benefit for this phase's scope, so it's named again as still not
+ * done, not silently dropped. Aggregate functions (`SUM`/`AVG`/`COUNT`,
+ * Phase 1) do not skip NULL columns the standard SQL way -- they still
+ * treat every row's value textually exactly as before; NULL-aware
+ * aggregation is a real, separate piece of work not attempted here.
+ * Frontend (`slsos-sim`) NULL rendering is untouched -- the JSON API now
+ * emits a real `null` for a NULL column (see `net/http.c`'s Phase 4 note)
+ * and that is this phase's actual round-trip guarantee; how a UI chooses to
+ * display that `null` is a separate concern this SQL-engine-scoped roadmap
+ * doesn't reach into, matching every prior phase's kernel-only footprint.
  */
 #ifndef ROWSTORE_H
 #define ROWSTORE_H
@@ -62,10 +114,11 @@
 #define ROWSTORE_MAX_PAGES    262144   // 1 GiB of row data reserved, first cut (see LBA layout below)
 #define ROWSTORE_INVALID_PAGE 0xFFFFFFFFu
 
-// Max bytes one serialized row can occupy: 1 tombstone byte + up to 16
-// columns of up to 64 bytes each (STRING is the widest type). Used to size
-// a stack scratch buffer in rowstore.c — never persisted directly.
-#define ROWSTORE_MAX_ROW_BYTES (1 + ROWSTORE_MAX_COLUMNS * ROWSTORE_STRING_LEN)
+// Max bytes one serialized row can occupy: 1 tombstone byte + 2 null-mask
+// bytes (Phase 4) + up to 16 columns of up to 64 bytes each (STRING/BLOB
+// are the widest types). Used to size a stack scratch buffer in
+// rowstore.c — never persisted directly.
+#define ROWSTORE_MAX_ROW_BYTES (3 + ROWSTORE_MAX_COLUMNS * ROWSTORE_STRING_LEN)
 
 // ─── On-disk layout (sls_storage.img) — bulk row page data ─────────────────
 // Separate from persist.h's small-struct-array regions on purpose (this is
@@ -85,6 +138,14 @@
 // parses/formats according to each column's SLSFieldType internally.
 struct RowValues {
     uint32_t count;
+    // Phase 4 (SQL Feature-Parity Roadmap): bit c set => column c is a real
+    // SQL NULL, and values[c]'s text content is meaningless (by convention
+    // left as an empty string, never read by anything that checks this bit
+    // first). ROWSTORE_MAX_COLUMNS=16 fits exactly in 16 bits. Zero-valued
+    // by any existing `= {0}`/memset-to-zero construction, so every
+    // pre-Phase-4 code path that never touches this field keeps its
+    // original "nothing is NULL" behavior automatically.
+    uint16_t null_mask;
     char     values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
 };
 

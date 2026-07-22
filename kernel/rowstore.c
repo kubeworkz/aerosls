@@ -117,7 +117,10 @@ static uint32_t column_width(SLSFieldType t) {
         case FIELD_TYPE_UINT64: return 8;
         case FIELD_TYPE_FLOAT:  return 8;
         case FIELD_TYPE_BOOL:   return 1;
-        case FIELD_TYPE_STRING: default: return ROWSTORE_STRING_LEN;
+        // Phase 4: BLOB is stored exactly like STRING in this first cut --
+        // same inline slot width, no separate large-object path. See
+        // rowstore.h's Phase 4 note.
+        case FIELD_TYPE_STRING: case FIELD_TYPE_BLOB: default: return ROWSTORE_STRING_LEN;
     }
 }
 
@@ -129,7 +132,10 @@ static int compute_layout(struct SLSObjectSchema* schema, struct RowTableLayout*
 
     rs_memset(out, 0, sizeof(*out));
     uint32_t col = 0;
-    uint32_t offset = 1;   // byte 0 of every row slot is the tombstone/active flag
+    // Phase 4: byte 0 of every row slot is the tombstone/active flag, bytes
+    // 1-2 are the null_mask (little-endian uint16_t) -- see rowstore.h's
+    // Phase 4 note. Column data starts at byte 3, not byte 1.
+    uint32_t offset = 3;
     for (uint32_t i = 0; i < SCHEMA_MAX_FIELDS; i++) {
         if (!schema->fields[i].active) continue;
         out->column_types[col] = schema->fields[i].type;
@@ -149,8 +155,22 @@ static int compute_layout(struct SLSObjectSchema* schema, struct RowTableLayout*
 static int serialize_row(const struct RowTableLayout* layout,
                          const struct RowValues* values, uint8_t* out /* row_width bytes */) {
     out[0] = 1;   // active
+    // Phase 4: persist the null_mask into bytes 1-2 (little-endian), same
+    // convention rs_memcpy-of-a-fixed-width-value already uses elsewhere in
+    // this file for UINT64/FLOAT columns.
+    out[1] = (uint8_t)(values->null_mask & 0xFF);
+    out[2] = (uint8_t)((values->null_mask >> 8) & 0xFF);
     for (uint32_t c = 0; c < layout->column_count; c++) {
         uint8_t* dst = out + layout->column_offset[c];
+        // Phase 4: a NULL column's text is never parsed -- it may be
+        // anything (typically empty) and is meaningless once null_mask
+        // says so. Zero the slot instead so a stale/garbage byte pattern
+        // never survives into a future read that (incorrectly) ignores
+        // the mask.
+        if (values->null_mask & (1u << c)) {
+            rs_memset(dst, 0, column_width(layout->column_types[c]));
+            continue;
+        }
         const char* text = values->values[c];
         switch (layout->column_types[c]) {
             case FIELD_TYPE_UINT64: {
@@ -166,6 +186,7 @@ static int serialize_row(const struct RowTableLayout* layout,
                 dst[0] = v; break;
             }
             case FIELD_TYPE_STRING:
+            case FIELD_TYPE_BLOB:
             default: {
                 uint32_t len = rs_strlen(text);
                 if (len >= ROWSTORE_STRING_LEN) return 1;   // reject, never silently truncate
@@ -181,9 +202,17 @@ static int serialize_row(const struct RowTableLayout* layout,
 static void deserialize_row(const struct RowTableLayout* layout,
                             const uint8_t* row, struct RowValues* out) {
     out->count = layout->column_count;
+    // Phase 4: read the null_mask back out of bytes 1-2.
+    out->null_mask = (uint16_t)row[1] | ((uint16_t)row[2] << 8);
     for (uint32_t c = 0; c < layout->column_count; c++) {
         const uint8_t* src = row + layout->column_offset[c];
         char* dst = out->values[c];
+        // Phase 4: a NULL column's underlying bytes were zeroed at write
+        // time and are never type-decoded -- decoding a zeroed UINT64/FLOAT
+        // slot would misleadingly print "0"/"0.0", indistinguishable from a
+        // real stored zero. Leave the text empty; callers must check
+        // null_mask, not infer NULL-ness from the text.
+        if (out->null_mask & (1u << c)) { dst[0] = '\0'; continue; }
         switch (layout->column_types[c]) {
             case FIELD_TYPE_UINT64: {
                 uint64_t v; rs_memcpy(&v, src, 8); rs_u64_to_str(v, dst, RECORD_VAL_LEN); break;
@@ -195,6 +224,7 @@ static void deserialize_row(const struct RowTableLayout* layout,
                 rs_strcpy(dst, src[0] ? "true" : "false", RECORD_VAL_LEN); break;
             }
             case FIELD_TYPE_STRING:
+            case FIELD_TYPE_BLOB:
             default: {
                 rs_strcpy(dst, (const char*)src, RECORD_VAL_LEN); break;
             }

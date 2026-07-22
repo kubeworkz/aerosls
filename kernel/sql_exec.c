@@ -1019,7 +1019,7 @@ static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlIn
 
     if (s->count != layout->column_count) {
         out->error = SQL_ERR_COLUMN_COUNT_MISMATCH;
-        se_strcpy(out->error_msg, "INSERT must specify every column (no NULL/default support yet)", SQL_ERR_MSG_LEN);
+        se_strcpy(out->error_msg, "INSERT must specify every column (no partial-row/default support yet)", SQL_ERR_MSG_LEN);
         return;
     }
 
@@ -1036,7 +1036,15 @@ static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlIn
             se_strcpy(out->error_msg, "INSERT column not found in table", SQL_ERR_MSG_LEN);
             return;
         }
-        se_strcpy(values.values[col], s->values[i], RECORD_VAL_LEN);
+        // Phase 4 (SQL Feature-Parity Roadmap): a NULL value sets the real
+        // null_mask bit instead of storing empty text -- see rowstore.h's
+        // Phase 4 note.
+        if (s->is_null[i]) {
+            values.null_mask |= (uint16_t)(1u << col);
+            values.values[col][0] = '\0';
+        } else {
+            se_strcpy(values.values[col], s->values[i], RECORD_VAL_LEN);
+        }
         seen[col] = 1;
     }
     for (uint32_t c = 0; c < layout->column_count; c++) {
@@ -1149,8 +1157,16 @@ static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUp
             out->affected_rows = 0;
             return;
         }
-        for (uint32_t j = 0; j < s->set_count; j++)
+        for (uint32_t j = 0; j < s->set_count; j++) {
             se_strcpy(rv.values[set_cols[j]], new_values[j], RECORD_VAL_LEN);
+            // Phase 4 (SQL Feature-Parity Roadmap): SET col = NULL sets the
+            // real null_mask bit; any OTHER SET value (literal or
+            // arithmetic) clears it -- a column being freshly written a
+            // real value is no longer NULL even if it was before this
+            // statement.
+            if (s->set_is_null[j]) rv.null_mask |= (uint16_t)(1u << set_cols[j]);
+            else                   rv.null_mask &= (uint16_t)~(1u << set_cols[j]);
+        }
         MvccError rc = mvcc_row_update(txn_id, caller_uid, s->table_name, ids[i], &rv);
         // Phase 23 fix: this used to special-case only MVCC_ERR_WRITE_CONFLICT
         // and silently drop any other non-OK rc (constraint violations

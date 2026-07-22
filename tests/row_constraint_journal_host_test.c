@@ -218,11 +218,25 @@ int main(void) {
           "s2: the rejected INSERT left no partial row -- autocommit rolled back cleanly");
 
     /* ── Scenario 3: NOT NULL violation on INSERT (column present, value
-     * empty -- INSERT still requires every column, per sql_exec.c's own
-     * no-default-support rule; NOT NULL is about the VALUE being empty). ──── */
-    CHECK(sql_execute(1, "INSERT INTO accounts (id, name, tag) VALUES (3, 'bob', '')", &r) == 1 &&
+     * NULL -- INSERT still requires every column, per sql_exec.c's own
+     * no-partial-row-support rule; NOT NULL is about the VALUE being a real
+     * SQL NULL). SQL Feature-Parity Roadmap Phase 4 note: before Phase 4,
+     * this codebase had no real NULL representation, so NOT NULL was
+     * checked via `strlen(val) == 0` -- an empty STRING and NULL were
+     * indistinguishable, and this scenario used an empty-string tag as the
+     * closest available stand-in for "NULL". Phase 4 added a real NULL
+     * literal and a real null_mask, so this scenario now uses the actual
+     * NULL keyword, and a companion check right after confirms the
+     * corrected behavior: a real empty STRING is no longer treated as a
+     * NOT NULL violation (see rowstore.h's Phase 4 note -- a genuine,
+     * intentional behavior fix, not a regression). ─────────────────────── */
+    CHECK(sql_execute(1, "INSERT INTO accounts (id, name, tag) VALUES (3, 'bob', NULL)", &r) == 1 &&
           r.error == SQL_ERR_CONSTRAINT_VIOLATION,
-          "s3: INSERT with an empty tag violates NOT NULL and is rejected");
+          "s3: INSERT with a NULL tag violates NOT NULL and is rejected");
+    CHECK(sql_execute(1, "INSERT INTO accounts (id, name, tag) VALUES (4, 'bobby', '')", &r) == 0 &&
+          r.error == SQL_ERR_NONE,
+          "s3b: Phase 4 correction -- INSERT with a real empty-STRING tag ('') is NOT a NOT NULL "
+          "violation (only an actual NULL is), unlike the pre-Phase-4 strlen==0 convention");
 
     /* ── Scenario 4: RANGE violation on INSERT (id outside 1..1000). ───────── */
     CHECK(sql_execute(1, "INSERT INTO accounts (id, name, tag) VALUES (9999, 'carol', 'z')", &r) == 1 &&

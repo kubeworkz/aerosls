@@ -45,6 +45,7 @@ typedef enum {
     TOK_KW_GROUP, TOK_KW_HAVING,   // Phase 1 (SQL Feature-Parity Roadmap)
     TOK_KW_LEFT, TOK_KW_OUTER, TOK_KW_AS,   // Phase 2 (SQL Feature-Parity Roadmap)
     TOK_KW_IN, TOK_KW_LIKE,   // Phase 3 (SQL Feature-Parity Roadmap)
+    TOK_KW_IS, TOK_KW_NOT, TOK_KW_NULL,   // Phase 4 (SQL Feature-Parity Roadmap)
     TOK_KW_TRUE, TOK_KW_FALSE,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
     TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
@@ -76,6 +77,7 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"GROUP", TOK_KW_GROUP}, {"HAVING", TOK_KW_HAVING},
     {"LEFT", TOK_KW_LEFT}, {"OUTER", TOK_KW_OUTER}, {"AS", TOK_KW_AS},
     {"IN", TOK_KW_IN}, {"LIKE", TOK_KW_LIKE},
+    {"IS", TOK_KW_IS}, {"NOT", TOK_KW_NOT}, {"NULL", TOK_KW_NULL},
     {"TRUE", TOK_KW_TRUE}, {"FALSE", TOK_KW_FALSE},
 };
 #define KEYWORD_COUNT (sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
@@ -370,6 +372,15 @@ static int parse_select_item(struct SqlParser* p, char* label, uint32_t label_ma
     return 1;
 }
 
+// Phase 4 (SQL Feature-Parity Roadmap): INSERT's VALUES list entries -- a
+// plain literal (byte-for-byte the pre-Phase-4 shape) or the NULL keyword.
+// Separate from parse_literal() itself (rather than teaching that function
+// to accept NULL) because parse_literal()'s other call sites -- IN list
+// entries, LIKE patterns, comparison RHS literals -- deliberately do NOT
+// accept a bare NULL (see sql_parser.h's Phase 4 note on why `= NULL`/`IN
+// (NULL)` aren't given special meaning).
+static int parse_insert_value(struct SqlParser* p, char* out, uint32_t max, uint8_t* is_null);
+
 static int parse_literal(struct SqlParser* p, char* out, uint32_t max) {
     switch (p->cur.kind) {
         case TOK_NUMBER:
@@ -389,6 +400,17 @@ static int parse_literal(struct SqlParser* p, char* out, uint32_t max) {
             set_error(p, "expected a literal value (number, 'string', TRUE, or FALSE)");
             return 0;
     }
+}
+
+static int parse_insert_value(struct SqlParser* p, char* out, uint32_t max, uint8_t* is_null) {
+    if (p->cur.kind == TOK_KW_NULL) {
+        *is_null = 1;
+        out[0] = '\0';
+        advance(p);
+        return 1;
+    }
+    *is_null = 0;
+    return parse_literal(p, out, max);
 }
 
 static int sq_contains_dot(const char* s) {
@@ -459,6 +481,18 @@ static int parse_arith_op_token(struct SqlParser* p, PredArithOp* out) {
 // and LIKE here, since both apply equally to a WHERE column_ref or a
 // HAVING select_item label with no special-casing needed.
 static uint32_t parse_comparison_tail(struct SqlParser* p, struct Predicate* pred, const char* col) {
+    // Phase 4 (SQL Feature-Parity Roadmap): IS [NOT] NULL. No literal to
+    // parse -- predicate_add_comparison()'s literal param is simply unused
+    // for these two ops (see predicate.h).
+    if (p->cur.kind == TOK_KW_IS) {
+        advance(p);
+        int is_not = 0;
+        if (p->cur.kind == TOK_KW_NOT) { is_not = 1; advance(p); }
+        if (!expect(p, TOK_KW_NULL, "expected NULL after IS/IS NOT")) return PREDICATE_INVALID_NODE;
+        uint32_t node = predicate_add_comparison(pred, col, is_not ? PRED_OP_IS_NOT_NULL : PRED_OP_IS_NULL, "");
+        if (node == PREDICATE_INVALID_NODE) set_error(p, "WHERE/HAVING clause too complex (predicate node pool exhausted)");
+        return node;
+    }
     if (p->cur.kind == TOK_KW_IN) {
         advance(p);
         if (!expect(p, TOK_LPAREN, "expected '(' after IN")) return PREDICATE_INVALID_NODE;
@@ -788,9 +822,12 @@ static void parse_insert(struct SqlParser* p, struct SqlInsertStmt* s) {
     uint32_t vcount = 0;
     for (;;) {
         char lit[RECORD_VAL_LEN];
-        if (!parse_literal(p, lit, RECORD_VAL_LEN)) return;
+        uint8_t is_null;
+        if (!parse_insert_value(p, lit, RECORD_VAL_LEN, &is_null)) return;
         if (vcount >= ROWSTORE_MAX_COLUMNS) { set_error(p, "too many values"); return; }
-        sq_strcpy(s->values[vcount++], lit, RECORD_VAL_LEN);
+        sq_strcpy(s->values[vcount], lit, RECORD_VAL_LEN);
+        s->is_null[vcount] = is_null;
+        vcount++;
         if (p->cur.kind != TOK_COMMA) break;
         advance(p);
     }
@@ -813,8 +850,17 @@ static void parse_insert(struct SqlParser* p, struct SqlInsertStmt* s) {
 // shape); no operator following a COLUMN operand is a query error (a bare
 // "SET x = y" copy-another-column shorthand isn't supported).
 static int parse_set_value(struct SqlParser* p, char* lit_out, uint32_t lit_max, uint8_t* is_arith,
-                           struct PredArithOperand* op1, PredArithOp* arith_op, struct PredArithOperand* op2) {
+                           struct PredArithOperand* op1, PredArithOp* arith_op, struct PredArithOperand* op2,
+                           uint8_t* is_null) {
     *is_arith = 0;
+    *is_null = 0;
+    // Phase 4 (SQL Feature-Parity Roadmap): SET column = NULL.
+    if (p->cur.kind == TOK_KW_NULL) {
+        *is_null = 1;
+        lit_out[0] = '\0';
+        advance(p);
+        return 1;
+    }
     if (p->cur.kind == TOK_STRING || p->cur.kind == TOK_KW_TRUE || p->cur.kind == TOK_KW_FALSE) {
         return parse_literal(p, lit_out, lit_max);
     }
@@ -855,13 +901,14 @@ static void parse_update(struct SqlParser* p, struct SqlUpdateStmt* s) {
         if (!expect(p, TOK_EQ, "expected '=' in SET clause")) return;
 
         char lit[RECORD_VAL_LEN];
-        uint8_t is_arith;
+        uint8_t is_arith, is_null;
         struct PredArithOperand ao1, ao2;
         PredArithOp aop;
-        if (!parse_set_value(p, lit, RECORD_VAL_LEN, &is_arith, &ao1, &aop, &ao2)) return;
+        if (!parse_set_value(p, lit, RECORD_VAL_LEN, &is_arith, &ao1, &aop, &ao2, &is_null)) return;
 
         sq_strcpy(s->set_columns[n], col, RECORD_KEY_LEN);
         s->set_is_arith[n] = is_arith;
+        s->set_is_null[n]  = is_null;
         if (is_arith) {
             s->set_arith_op1[n] = ao1;
             s->set_arith_op[n]  = aop;

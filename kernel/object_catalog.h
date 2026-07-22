@@ -113,6 +113,16 @@ typedef enum {
     FIELD_TYPE_UINT64 = 1,
     FIELD_TYPE_FLOAT  = 2,
     FIELD_TYPE_BOOL   = 3,
+    // Phase 4 (SQL Feature-Parity Roadmap): BLOB is deliberately narrow in
+    // this first cut -- opaque bytes stored/compared exactly like STRING
+    // (same ROWSTORE_STRING_LEN=64-byte inline slot, same text-in/text-out
+    // API boundary as every other column type in this codebase), not a
+    // real large-object/TOAST-style overflow mechanism. No base64 or binary-
+    // safe encoding is added at the SQL text layer either -- see rowstore.h's
+    // Phase 4 note for the full scope writeup. A real BLOB column exists
+    // purely so schemas can name the intent distinctly from STRING; it does
+    // not yet unlock any capability STRING didn't already have.
+    FIELD_TYPE_BLOB   = 4,
 } SLSFieldType;
 
 static inline const char* field_type_name(SLSFieldType t) {
@@ -121,6 +131,7 @@ static inline const char* field_type_name(SLSFieldType t) {
         case FIELD_TYPE_UINT64: return "UINT64";
         case FIELD_TYPE_FLOAT:  return "FLOAT";
         case FIELD_TYPE_BOOL:   return "BOOL";
+        case FIELD_TYPE_BLOB:   return "BLOB";
         default:                return "?";
     }
 }

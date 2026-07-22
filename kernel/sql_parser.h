@@ -38,14 +38,22 @@
  *                  column_ref), not a bare column_ref -- see the SQL
  *                  Feature-Parity Roadmap Phase 1 note below.
  *   insert_stmt := INSERT INTO ident '(' ident (',' ident)* ')'
- *                  VALUES '(' literal (',' literal)* ')' [;]
+ *                  VALUES '(' insert_value (',' insert_value)* ')' [;]
+ *   insert_value := literal | NULL   -- SQL Feature-Parity Roadmap Phase 4:
+ *                  a column's value may now be the literal NULL keyword,
+ *                  not just a typed literal (see the Phase 4 note below).
+ *                  Every column must still be named in the column list --
+ *                  omitting a column entirely (partial-row/default-value
+ *                  INSERT) remains unsupported.
  *   update_stmt := UPDATE ident SET ident '=' set_value (',' ident '=' set_value)*
  *                  [WHERE predicate] [;]
- *   set_value   := literal | arith_expr   -- SQL Feature-Parity Roadmap
- *                  Phase 3: a plain literal is still the byte-for-byte
- *                  pre-Phase-3 shape; arith_expr (below) lets a SET value
- *                  reference the row's OWN current column values (e.g.
- *                  `SET price = price * 1.1`) -- see the Phase 3 note below.
+ *   set_value   := literal | arith_expr | NULL   -- SQL Feature-Parity
+ *                  Roadmap Phase 3: a plain literal is still the byte-for-
+ *                  byte pre-Phase-3 shape; arith_expr (below) lets a SET
+ *                  value reference the row's OWN current column values
+ *                  (e.g. `SET price = price * 1.1`) -- see the Phase 3 note
+ *                  below. Phase 4 adds the bare NULL keyword as a third
+ *                  option (`SET middle_name = NULL`).
  *   delete_stmt := DELETE FROM ident [WHERE predicate] [;]
  *   predicate   := and_expr (OR and_expr)*
  *   and_expr    := predicate_primary (AND predicate_primary)*
@@ -55,6 +63,11 @@
  *   comparison  := comparison_lhs compare_op literal
  *                | column_ref IN '(' literal (',' literal)* ')'
  *                | column_ref LIKE literal
+ *                | column_ref IS [NOT] NULL   -- SQL Feature-Parity Roadmap
+ *                  Phase 4: see the Phase 4 note below. Available on a
+ *                  plain column_ref only (not comparison_lhs's arith_expr
+ *                  form) -- `price + 1 IS NULL` isn't meaningful syntax
+ *                  this grammar accepts.
  *   comparison_lhs := arith_expr   -- plain WHERE/HAVING comparisons only
  *                  (not HAVING's own select_item form below); a bare
  *                  column_ref with no arithmetic operator is arith_expr's
@@ -104,14 +117,16 @@
  *
  * Explicitly out of scope, per the roadmap: RIGHT/FULL OUTER JOIN (Phase 2
  * added LEFT only), join reordering, hash/merge join, subqueries, views,
- * string functions, `IS NULL`/`IS NOT NULL` (deferred to Phase 4's real
- * NULL, not built here -- see the Phase 3 note below), `NOT IN`, `ESCAPE`
- * for LIKE. Arithmetic expressions, LIKE, IN lists, and parenthesized
- * WHERE grouping were promoted out of this list by Phase 3 (below).
+ * string functions, `NOT IN`, `ESCAPE` for LIKE. Arithmetic expressions,
+ * LIKE, IN lists, and parenthesized WHERE grouping were promoted out of
+ * this list by Phase 3 (below); `IS NULL`/`IS NOT NULL` and a real `NULL`
+ * literal were promoted out of this list by Phase 4 (below).
  * INSERT requires an explicit column list covering every one of the
- * table's columns (no partial-row/NULL/default support yet — every value
- * must be supplied, matching rowstore_row_insert()'s own existing
- * all-columns-required contract).
+ * table's columns (partial-row/default-value INSERT is still not
+ * supported — every column must be named — but Phase 4 lets any named
+ * column's value be the literal NULL, matching rowstore_row_insert()'s
+ * own existing all-columns-required contract while finally giving a real
+ * way to populate a column with nothing).
  *
  * ─── SQL Feature-Parity Roadmap Phase 1: GROUP BY / HAVING / aggregates ────
  * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) GROUP BY is no longer
@@ -265,6 +280,41 @@
  *   - `IS NULL`/`IS NOT NULL` is explicitly NOT built here, deferred
  *     whole to Phase 4 (real NULL) rather than building against a NULL
  *     representation that doesn't exist yet.
+ *
+ * ─── SQL Feature-Parity Roadmap Phase 4: real NULL ──────────────────────────
+ * (docs/AeroSLS-SQL-Feature-Parity-Roadmap-v0.1.md) Builds on top of what
+ * Phase 3 deliberately left out: a real `NULL` literal in `INSERT`/`UPDATE
+ * ... SET`, and `IS NULL`/`IS NOT NULL` in `WHERE`/`HAVING`. See
+ * `rowstore.h`'s own Phase 4 note for the storage-layer design (a real
+ * per-column `null_mask`, not a magic-string convention) and `predicate.h`'s
+ * for the evaluation-layer design.
+ *
+ *   - `IS NULL`/`IS NOT NULL` reuses the existing `PRED_NODE_COMPARISON`
+ *     leaf shape unchanged (two new `PredicateCompareOp` values,
+ *     `PRED_OP_IS_NULL`/`PRED_OP_IS_NOT_NULL`, on the SAME struct shape) --
+ *     the same "reuse the leaf, add an op" pattern `LIKE` used in Phase 3.
+ *     Parsed in `parse_comparison_tail()`, the shared WHERE/HAVING tail, so
+ *     both a plain WHERE column and a HAVING aggregate label can use it
+ *     (`HAVING COUNT(*) IS NULL` parses, though it's always false in
+ *     practice since this codebase's aggregates never produce NULL).
+ *     `=NULL`/`!=NULL` are deliberately NOT given special meaning here --
+ *     only the dedicated `IS [NOT] NULL` operator resolves NULL, matching
+ *     standard SQL's own distinction (`col = NULL` is legal SQL syntax in
+ *     some dialects but is defined to always evaluate to unknown/false,
+ *     never true, which this parser sidesteps entirely by not accepting a
+ *     bare `NULL` as an ordinary comparison literal at all).
+ *   - The `NULL` keyword IS accepted as an `INSERT ... VALUES` value and an
+ *     `UPDATE ... SET` value (a new parallel `is_null[]`/`set_is_null[]`
+ *     array on `SqlInsertStmt`/`SqlUpdateStmt`, additive alongside the
+ *     existing `values[]`/`set_values[]` text arrays, matching every prior
+ *     phase's "parallel array, zero-default, byte-compatible when unused"
+ *     convention). `INSERT` still requires every column to be named in the
+ *     column list -- `NULL` is a value you write explicitly, not an
+ *     implicit default for an omitted column.
+ *   - Arithmetic's `arith_expr` (Phase 3) does NOT gain NULL-operand
+ *     support here -- `price * NULL` is not a parseable expression; `NULL`
+ *     is only a value position (`INSERT`/`SET`) or tested via `IS [NOT]
+ *     NULL`, never an arithmetic operand.
  */
 #ifndef SQL_PARSER_H
 #define SQL_PARSER_H
@@ -379,8 +429,15 @@ struct SqlSelectStmt {
 struct SqlInsertStmt {
     char     table_name[OBJECT_NAME_LEN];
     char     columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
-    char     values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
+    char     values[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];   // meaningful iff !is_null[i]
     uint32_t count;   // columns/values pair count -- must equal the table's full column count at exec time
+
+    // Phase 4 (SQL Feature-Parity Roadmap): parallel to values[] above, not
+    // a replacement -- zero-default (is_null[i]==0 for every i) keeps every
+    // pre-Phase-4 INSERT byte-for-byte identical, using values[i] exactly
+    // as before. See rowstore.h/predicate.h for the null_mask machinery
+    // this feeds.
+    uint8_t  is_null[ROWSTORE_MAX_COLUMNS];
 };
 
 struct SqlUpdateStmt {
@@ -401,6 +458,14 @@ struct SqlUpdateStmt {
     struct PredArithOperand set_arith_op1[ROWSTORE_MAX_COLUMNS];
     PredArithOp              set_arith_op[ROWSTORE_MAX_COLUMNS];
     struct PredArithOperand set_arith_op2[ROWSTORE_MAX_COLUMNS];   // unused when set_arith_op[i] == PRED_ARITH_NONE
+
+    // ── Phase 4 (SQL Feature-Parity Roadmap): SET column = NULL. Another
+    // additive parallel array, same convention as set_is_arith[] above --
+    // zero-default keeps every pre-Phase-4 UPDATE byte-for-byte identical.
+    // A SET value is exactly one of: a plain literal (set_values[i]), an
+    // arithmetic expression (set_is_arith[i]), or NULL (set_is_null[i]) --
+    // mutually exclusive by construction in parse_set_value(). ───────────
+    uint8_t  set_is_null[ROWSTORE_MAX_COLUMNS];
 
     uint8_t  has_where;
     struct Predicate where;
