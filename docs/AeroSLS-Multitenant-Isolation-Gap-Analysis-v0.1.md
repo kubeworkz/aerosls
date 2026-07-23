@@ -229,7 +229,7 @@ Implemented: a burst-style weighted round robin, extending `kernel/process.c`'s 
 
 **What this does not close.** Capacity resizing (`PARTITION_MAX`/`PARTITION_ASSIGN_MAX`/`TCP_MAX_CONNS`), grouped alongside CPU scheduling under §5 item 8/§7 item 8's original framing, remains open — it is pure `#define` sizing work that the doc has consistently held should wait for a real target tenant count (a business input, not a code gap) rather than be guessed at here.
 
-**Status:** §5 item 8 and §7 item 8 closed for weighted CPU scheduling specifically. Capacity resizing (§5 item 9) remains the one open item in this document's original priority list. Storage isolation (§5 item 2 / §7 item 5) — see §15 below for Phase 1's closure; Phases 2–3 of that roadmap remain open.
+**Status:** §5 item 8 and §7 item 8 closed for weighted CPU scheduling specifically. Capacity resizing (§5 item 9) remains the one open item in this document's original priority list. Storage isolation (§5 item 2 / §7 item 5) — see §15/§16 below for Phase 1 and Phase 2's closure; Phase 3 of that roadmap remains open.
 
 ## 15. Findings addendum: storage isolation, Phase 1 (§5 item 2 / §7 item 5) — Phase 1 closed, Phases 2–3 open
 
@@ -239,4 +239,12 @@ Implemented: `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` Phase 1 — a comb
 
 **Verification.** New `tests/storage_quota_host_test.c` (9 scenarios, 45 checks) plus new scenarios in `tests/rowstore_host_test.c` and `tests/vecstore_host_test.c` proving each subsystem's real call site threads the right `partition_id` through and denies cleanly at quota. Full detail, mechanism, and the two resolved open-question decisions are written up in `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` §6, not duplicated here. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions.
 
-**Status:** Storage Isolation Roadmap Phase 1 closed. Phase 2 (byte-level usage export) and Phase 3 (real per-tenant LBA sub-ranges, deliberately deferred until a dedicated-storage tier is an actual product decision) remain open — §5 item 2 / §7 item 5 stay open overall until at least Phase 2 lands, but the specific "unbounded, unquota'd disk consumption" risk named in §3 is closed for rowstore + vecstore.
+**Status:** Storage Isolation Roadmap Phase 1 closed. Phase 2 (byte-level usage export) closed too — see §16. Phase 3 (real per-tenant LBA sub-ranges, deliberately deferred until a dedicated-storage tier is an actual product decision) remains open — the specific "unbounded, unquota'd disk consumption" risk named in §3 is closed for rowstore + vecstore, and as of Phase 2 that same real accounting data is now externally visible per-partition too.
+
+## 16. Findings addendum: storage isolation, Phase 2 (§5 item 2 / §7 item 5) — byte-level usage export closed
+
+Implemented: `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` Phase 2 — Phase 1's real per-partition page counters (`kernel/storage_quota.c`) are now exposed as bytes, per-partition, on the existing disk-status reporting path: `kernel/tier_mgr.c`'s `sys_sls_disk_status()` gained a new printed section, and `net/http.c`'s `GET /api/disk` (`api_disk_json()`) gained a matching `"partitions"` JSON array (`partition_id`/`disk_bytes_used`/`disk_bytes_quota`). No new syscall, no new persisted state: `usage_metering.h`'s `struct SLSUsageEntry` was deliberately left untouched, since `storage_quota.c` is already the single source of truth for this data as of Phase 1 — mirroring it into a second array would itself be the "second, parallel metering mechanism" that struct's own header comment warns against. Full mechanism and the design-fork writeup live in `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` §7, not duplicated here.
+
+**Verification.** `tests/tier_capacity_phase5b_host_test.c` extended with a new scenario proving the real `sys_sls_disk_status()` runs to completion against real `storage_quota.c` data (a smoke test — no serial-capture mechanism exists in this suite to assert printed byte values directly). `net/http.c` remains too heavy to host-test (per `tests/http_rate_limit_host_test.c`'s own established rationale); the new JSON code was verified via a clean `gcc -fsyntax-only` pass instead. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions.
+
+**Status:** Storage Isolation Roadmap Phase 2 closed. Phase 3 remains the only open phase of that roadmap.

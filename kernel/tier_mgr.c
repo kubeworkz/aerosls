@@ -1,6 +1,7 @@
 #include "tier_mgr.h"
 #include "ipc.h"
 #include "../drivers/nvme_admin.h"   // Navigator-Parity Gap Roadmap Phase 5c -- nvme_get_capacity_bytes() for sys_sls_disk_status()
+#include "storage_quota.h"           // Storage Isolation Roadmap Phase 2 -- per-partition byte usage/quota in sys_sls_disk_status()
 
 struct TierStat tier_stats[TIER_MAX_TRACKED];
 static uint32_t  tier_tick_counter  = 0;
@@ -212,7 +213,15 @@ void tier_capacity_totals(uint64_t bytes_per_tier[TIER_MGR_TIER_COUNT],
 }
 
 // ─── sys_sls_disk_status ──────────────────────────────────────────────────────
-// Navigator-Parity Gap Roadmap Phase 5c.
+// Navigator-Parity Gap Roadmap Phase 5c. Extended by Storage Isolation
+// Roadmap Phase 2 with a per-partition byte-level breakdown, appended after
+// the existing system-wide tier table -- exactly the "expose Phase 1's
+// counters via the existing sys_sls_disk_status()/tier-totals reporting
+// path, broken out per-partition" ask (roadmap doc §4 item 2). The
+// underlying counters (storage_quota.c) already exist and are already the
+// single source of truth for on-disk page usage as of Phase 1; this just
+// converts pages -> bytes (x 4096) and prints them here too, rather than
+// introducing a second, parallel accounting mechanism.
 void sys_sls_disk_status(void) {
     static const char* tier_keys[TIER_MGR_TIER_COUNT] = { "L1_CACHE", "L2_DRAM", "L3_SSD" };
     uint64_t bytes_per_tier[TIER_MGR_TIER_COUNT];
@@ -229,6 +238,24 @@ void sys_sls_disk_status(void) {
         kernel_serial_printf(" %-10s  %-16llu  %u\n",
                              tier_keys[t], (unsigned long long)bytes_per_tier[t], count_per_tier[t]);
     }
+
+    kernel_serial_print("\n Per-Partition Storage Usage (rowstore+vecstore, bytes):\n");
+    kernel_serial_printf(" %-10s  %-16s  %s\n", "Partition", "Bytes Used", "Bytes Quota");
+    int shown = 0;
+    for (uint32_t p = 0; p < PARTITION_MAX; p++) {
+        uint64_t page_usage = storage_get_page_usage(p);
+        uint64_t page_quota = storage_get_page_quota(p);
+        if (page_usage == 0 && page_quota == 0) continue;   // same skip rule as sys_sls_partition_storage_quota_list()
+        uint64_t bytes_used  = page_usage * 4096ULL;
+        if (page_quota == 0) {
+            kernel_serial_printf(" %-10u  %-16llu  unlimited\n", p, (unsigned long long)bytes_used);
+        } else {
+            kernel_serial_printf(" %-10u  %-16llu  %llu\n", p, (unsigned long long)bytes_used,
+                                 (unsigned long long)(page_quota * 4096ULL));
+        }
+        shown++;
+    }
+    kernel_serial_printf(" %d partition(s) with nonzero disk usage or a configured quota.\n", shown);
     kernel_serial_print("\n");
 }
 

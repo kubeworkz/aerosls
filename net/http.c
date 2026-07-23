@@ -1082,6 +1082,14 @@ static int api_network_status_json(char* buf, int max) {
 // tier_mgr.c) -- the one genuinely new computation in this phase. Tier keys
 // match /api/tiers's own naming ("l1_cache"/"l2_dram"/"l3_ssd") so the two
 // routes stay consistent for any client reading both.
+//
+// Storage Isolation Roadmap Phase 2 adds a "partitions" array here too:
+// storage_quota.c's Phase 1 counters (rowstore+vecstore combined on-disk
+// pages), converted to bytes and broken out per-partition, on this same
+// route -- the JSON twin of sys_sls_disk_status()'s new serial section.
+// No new syscall: storage_get_page_usage()/_quota() are already directly
+// callable, the same way api_partition_storagequotas_list() already reads
+// them in pages; this just re-exposes them in bytes, next to disk capacity.
 static int api_disk_json(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     jb_obj_open(&j, 0);
@@ -1101,6 +1109,22 @@ static int api_disk_json(char* buf, int max) {
         jb_obj_close(&j);
     }
     jb_obj_close(&j); /* tiers */
+    jb_putc(&j, ',');
+
+    jb_arr_open(&j, "partitions");
+    int first = 1;
+    for (uint32_t p = 0; p < PARTITION_MAX; p++) {
+        uint64_t page_usage = storage_get_page_usage(p);
+        uint64_t page_quota = storage_get_page_quota(p);
+        if (page_usage == 0 && page_quota == 0) continue;   // same skip rule as api_partition_storagequotas_list()
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id",      p); jb_putc(&j, ',');
+        jb_uint(&j, "disk_bytes_used",   page_usage * 4096ULL); jb_putc(&j, ',');
+        jb_uint(&j, "disk_bytes_quota",  page_quota * 4096ULL);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j); /* partitions */
 
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }

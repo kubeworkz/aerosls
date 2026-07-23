@@ -17,15 +17,24 @@
  * below, same as every other host test in this suite that links a file with
  * unrelated print/IPC dependencies.
  *
+ * Storage Isolation Roadmap Phase 2 added a real call into kernel/storage_
+ * quota.c's storage_get_page_usage()/storage_get_page_quota() inside tier_
+ * mgr.c's sys_sls_disk_status() (same translation unit as tier_capacity_
+ * totals(), so it's a new link-time dependency here even though this test
+ * never calls sys_sls_disk_status() itself in most scenarios) -- linked for
+ * real below, same posture as every other file in this suite that picked
+ * up storage_quota.c as a dependency in Phase 1.
+ *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/tier_capacity_phase5b_host_test \
- *       tests/tier_capacity_phase5b_host_test.c kernel/tier_mgr.c
+ *       tests/tier_capacity_phase5b_host_test.c kernel/tier_mgr.c kernel/storage_quota.c
  *   /tmp/tier_capacity_phase5b_host_test
  */
 #include "kernel/tier_mgr.h"
 #include "kernel/object_catalog.h"
 #include "kernel/ipc.h"
+#include "kernel/storage_quota.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -112,6 +121,21 @@ int main(void) {
     tier_capacity_totals(bytes, counts);
     CHECK(bytes[STORAGE_TIER_L1_CACHE] == 2ULL * 4096 && counts[STORAGE_TIER_L1_CACHE] == 1,
           "s4: shrinking object_catalog_count back down drops the scenario-3 addition -- no stale accumulation");
+
+    /* ── Scenario 5: Storage Isolation Roadmap Phase 2 -- sys_sls_disk_status()
+     * now also walks storage_quota.c's real per-partition page counters and
+     * prints a byte-level breakdown. kernel_serial_printf is stubbed to a
+     * no-op above (same as every other host test in this suite -- there's no
+     * serial-capture mechanism to assert against), so this is a smoke test:
+     * it proves the new code path links and runs to completion against a mix
+     * of zero-usage, real-usage, and quota-configured partitions without
+     * crashing, mirroring storage_quota_host_test.c's own Scenario 9 for
+     * sys_sls_partition_storage_quota_list(). ─────────────────────────────── */
+    CHECK(storage_set_page_quota(2, 10) == 0, "s5: partition 2 gets a page quota of 10 (bytes = 40960)");
+    CHECK(storage_page_reserve(2) == 0, "s5: partition 2 reserves 1 page (bytes_used = 4096)");
+    CHECK(storage_page_reserve(6) == 0, "s5: partition 6 reserves 1 page with no quota configured (unlimited)");
+    sys_sls_disk_status();
+    CHECK(1, "s5: sys_sls_disk_status() runs to completion with real storage_quota.c data linked in, no crash");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
