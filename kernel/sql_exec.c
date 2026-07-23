@@ -459,26 +459,18 @@ static const char* join_display_name(const char* table, const char* alias) {
     return alias[0] ? alias : table;
 }
 
-// Phase 2: LEFT JOIN, no real NULL yet (SQL Feature-Parity Roadmap Phase 4
-// hasn't landed) -- an unmatched right-side row is padded with a
-// documented per-type sentinel value rather than blocking this phase on
-// Phase 4. NOT a real NULL: a STRING sentinel ("") is indistinguishable
-// from a genuine empty string, UINT64/FLOAT ("0") from a genuine zero,
-// BOOL ("false") from a genuine false -- named here explicitly, matching
-// this whole roadmap's "flag the limitation, don't silently pick a
-// convention" posture (the same honesty Phase 1 applied to COUNT(col) vs
-// COUNT(*)). Revisit once Phase 4 gives this something real to fill with.
-static void fill_join_sentinel(struct RowValues* row, uint32_t start, const struct RowTableLayout* seg) {
-    for (uint32_t i = 0; i < seg->column_count; i++) {
-        const char* sentinel;
-        switch (seg->column_types[i]) {
-            case FIELD_TYPE_UINT64: sentinel = "0";     break;
-            case FIELD_TYPE_FLOAT:  sentinel = "0";     break;
-            case FIELD_TYPE_BOOL:   sentinel = "false"; break;
-            case FIELD_TYPE_STRING:
-            default:                sentinel = "";      break;
-        }
-        se_strcpy(row->values[start + i], sentinel, RECORD_VAL_LEN);
+// Query-Surface Roadmap Phase 2: an unmatched side's columns are now
+// padded with REAL Phase-4 NULLs (null_mask bits + empty text), replacing
+// the original per-type sentinels ("0"/"false"/"") that predated real
+// NULL and were indistinguishable from genuine values -- the correction
+// that makes IS NULL find padded rows, which FULL OUTER's whole purpose
+// (surfacing the unmatched) depends on. A deliberate behavior change to
+// existing LEFT JOIN output, named plainly: padded columns stop
+// masquerading as zeros/empty strings.
+static void fill_join_null_pad(struct RowValues* row, uint32_t start, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        row->values[start + i][0] = '\0';
+        row->null_mask |= (1u << (start + i));
     }
 }
 
@@ -510,9 +502,79 @@ static void join_from_collect_cb(struct MvccRowId id, const struct RowValues* va
     ctx->count++;
 }
 
-static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+// Query-Surface Roadmap Phase 2: copies src's first src_count columns into
+// dst starting at dst_start, carrying each source column's real null_mask
+// bit along with its text -- the piece the original sentinel-based padding
+// never needed, since sentinels made every combined column "non-NULL" by
+// construction. Without this, a genuinely-NULL source column (e.g. a
+// nullable field that was never a join key) would silently read back as
+// non-NULL empty text in the combined row.
+static void copy_row_segment(struct RowValues* dst, uint32_t dst_start, const struct RowValues* src, uint32_t src_count) {
+    for (uint32_t c = 0; c < src_count; c++) {
+        se_strcpy(dst->values[dst_start + c], src->values[c], RECORD_VAL_LEN);
+        if (src->null_mask & (1u << c)) dst->null_mask |= (1u << (dst_start + c));
+    }
+}
+
+// Query-Surface Roadmap Phase 2: RIGHT/FULL OUTER's anti-pass needs to know
+// which of the newly-joined table's rows were matched by ANY outer row
+// during the main nested-loop probe below, so it can emit the rest with the
+// accumulated (outer) side NULL-padded. This is a matched-set rather than a
+// literal operand swap: `cur` is a synthetic in-memory row set (not a real
+// table) once a step is past the first JOIN, so it can't be probed via
+// mvcc_find_matching_rows the way jc->table can -- scanning jc->table once
+// more and checking membership here is the cheapest way to get the same
+// "right side preserved" result with the existing per-step machinery.
+static int join_id_matched(const struct MvccRowId* ids, uint32_t n, struct MvccRowId id) {
+    for (uint32_t i = 0; i < n; i++) if (ids[i].logical_id == id.logical_id) return 1;
+    return 0;
+}
+
+struct join_right_anti_ctx {
+    struct RowValues*         out;
+    uint32_t*                 n_io;
+    uint32_t                  max;
+    uint32_t                  running_col_count;
+    uint32_t                  new_col_count;
+    const struct MvccRowId*   matched_ids;
+    uint32_t                  matched_count;
+    uint8_t*                  truncated;
+};
+static void join_right_anti_cb(struct MvccRowId id, const struct RowValues* values, void* ctxp) {
+    struct join_right_anti_ctx* ctx = (struct join_right_anti_ctx*)ctxp;
+    if (join_id_matched(ctx->matched_ids, ctx->matched_count, id)) return;
+    struct RowValues combined;
+    se_memset(&combined, 0, sizeof(combined));
+    combined.count = ctx->running_col_count + ctx->new_col_count;
+    fill_join_null_pad(&combined, 0, ctx->running_col_count);
+    copy_row_segment(&combined, ctx->running_col_count, values, ctx->new_col_count);
+    if (*ctx->n_io < ctx->max) ctx->out[*ctx->n_io] = combined;
+    else *ctx->truncated = 1;
+    (*ctx->n_io)++;
+}
+
+// Query-Surface Roadmap Phase 2: scratch set of the newly-joined table's
+// row ids matched by at least one outer row this step -- static for the
+// same single-threaded/non-reentrant reason every other per-query scratch
+// buffer in this file is (see the notes above), reset (via matched_count)
+// at the top of each RIGHT/FULL step rather than re-declared.
+static struct MvccRowId g_join_matched_ids[CURSOR_MAX_ROWSET_ROWS];
+
+// Query-Surface Roadmap Phase 1: the join chain's materialization stage,
+// factored out of exec_select_join() so exec_select_group() can feed its
+// aggregate bucketing from a JOINed row source too -- the refactor that
+// retires SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED. Runs the FROM scan + every
+// nested-loop JOIN step, leaving the combined rows in g_select_scratch
+// [0..*n_out) under the fully qualified *running_out layout. Returns 0 on
+// success; on failure fills out->error/error_msg and returns 1. WHERE is
+// deliberately NOT applied here -- both callers apply it against the
+// combined layout afterward, preserving the established "WHERE applies
+// once, at the very end" rule.
+static int join_materialize(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s,
+                            struct SqlResult* out, struct RowTableLayout* running_out,
+                            uint32_t* n_out, uint8_t* truncated_out) {
     int tidx0 = find_table_catalog_index(s->table_name);
-    if (tidx0 < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "FROM table not found", SQL_ERR_MSG_LEN); return; }
+    if (tidx0 < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "FROM table not found", SQL_ERR_MSG_LEN); return 1; }
     const struct RowTableLayout* layout0 = &table_headers[tidx0].layout;
     const char* disp0 = join_display_name(s->table_name, s->table_alias);
 
@@ -560,14 +622,14 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         const struct SqlJoinClause* jc = &s->joins[ji];
 
         int tidx = find_table_catalog_index(jc->table);
-        if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "joined table not found", SQL_ERR_MSG_LEN); return; }
+        if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "joined table not found", SQL_ERR_MSG_LEN); return 1; }
         const struct RowTableLayout* layout_new = &table_headers[tidx].layout;
         const char* disp_new = join_display_name(jc->table, jc->alias);
 
         if (running.column_count + layout_new->column_count > ROWSTORE_MAX_COLUMNS) {
             out->error = SQL_ERR_JOIN_TOO_WIDE;
             se_strcpy(out->error_msg, "joined tables have too many combined columns", SQL_ERR_MSG_LEN);
-            return;
+            return 1;
         }
 
         // Resolve the ON clause's two "qualifier.column" halves: one side
@@ -587,7 +649,7 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         } else {
             out->error = SQL_ERR_JOIN_INVALID;
             se_strcpy(out->error_msg, "ON clause does not reference the newly joined table (use its alias if it has one)", SQL_ERR_MSG_LEN);
-            return;
+            return 1;
         }
         const char* new_col_name    = new_is_left ? jc->on_left_col : jc->on_right_col;
         const char* outer_qualifier = new_is_left ? jc->on_right_qualifier : jc->on_left_qualifier;
@@ -597,7 +659,7 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         if (new_col == 0xFFFFFFFFu) {
             out->error = SQL_ERR_COLUMN_NOT_FOUND;
             se_strcpy(out->error_msg, "ON clause column not found in the joined table", SQL_ERR_MSG_LEN);
-            return;
+            return 1;
         }
 
         // Two-phase check on the outer side, matching the new side's own
@@ -613,12 +675,12 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         if (!outer_layout) {
             out->error = SQL_ERR_JOIN_INVALID;
             se_strcpy(out->error_msg, "ON clause's other side does not resolve to a table already in the FROM/JOIN chain", SQL_ERR_MSG_LEN);
-            return;
+            return 1;
         }
         if (find_column_index(outer_layout, outer_col_name) == 0xFFFFFFFFu) {
             out->error = SQL_ERR_COLUMN_NOT_FOUND;
             se_strcpy(out->error_msg, "ON clause column not found in the corresponding table", SQL_ERR_MSG_LEN);
-            return;
+            return 1;
         }
         char outer_qualified[RECORD_KEY_LEN];
         build_qualified_name(outer_qualified, RECORD_KEY_LEN, outer_qualifier, outer_col_name);
@@ -651,29 +713,57 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         // with zero matches still emits the outer row once, right side
         // sentinel-filled; an INNER JOIN with zero matches drops it, same
         // as Phase 20's original behavior.
+        // Query-Surface Roadmap Phase 2: RIGHT/FULL need every unmatched row
+        // of jc->table preserved (accumulated side NULL-padded), which the
+        // main outer-driven loop below can't produce on its own -- it only
+        // ever sees jc->table rows that DID match something. need_right_pass
+        // records which jc->table rows matched as the loop runs, then an
+        // anti-pass after the loop emits everything that never did.
+        uint8_t need_right_pass = (jc->type == SQL_JOIN_RIGHT || jc->type == SQL_JOIN_FULL);
+        uint32_t matched_count = 0;
+
         uint32_t next_n = 0;
         for (uint32_t r = 0; r < cur_n; r++) {
-            predicate_init(&g_join_probe_pred);
-            uint32_t probe_root = predicate_add_comparison(&g_join_probe_pred,
-                layout_new->column_names[new_col], PRED_OP_EQ, cur[r].values[outer_col]);
-
             struct MvccRowId matches[CURSOR_MAX_ROWSET_ROWS];
             uint32_t take_m = 0;
-            if (probe_root != PREDICATE_INVALID_NODE) {   // shouldn't happen (one fresh node), fail closed if it ever does
-                g_join_probe_pred.root = probe_root;
-                uint32_t total_m = mvcc_find_matching_rows(txn_id, caller_uid, jc->table,
-                                                            &g_join_probe_pred, layout_new, matches, CURSOR_MAX_ROWSET_ROWS);
-                take_m = total_m < CURSOR_MAX_ROWSET_ROWS ? total_m : CURSOR_MAX_ROWSET_ROWS;
+
+            // Standard SQL NULL semantics: a NULL join key never equals
+            // anything, not even another NULL -- an outer row whose join
+            // column is genuinely NULL never probe-matches, same as if the
+            // probe ran and found zero rows. Skipping the probe entirely
+            // also avoids querying jc->table with a meaningless empty-text
+            // literal for what NULL's placeholder value[] content happens
+            // to be.
+            uint8_t outer_key_is_null = (cur[r].null_mask & (1u << outer_col)) != 0;
+            if (!outer_key_is_null) {
+                predicate_init(&g_join_probe_pred);
+                uint32_t probe_root = predicate_add_comparison(&g_join_probe_pred,
+                    layout_new->column_names[new_col], PRED_OP_EQ, cur[r].values[outer_col]);
+                if (probe_root != PREDICATE_INVALID_NODE) {   // shouldn't happen (one fresh node), fail closed if it ever does
+                    g_join_probe_pred.root = probe_root;
+                    uint32_t total_m = mvcc_find_matching_rows(txn_id, caller_uid, jc->table,
+                                                                &g_join_probe_pred, layout_new, matches, CURSOR_MAX_ROWSET_ROWS);
+                    take_m = total_m < CURSOR_MAX_ROWSET_ROWS ? total_m : CURSOR_MAX_ROWSET_ROWS;
+                }
+            }
+
+            if (need_right_pass) {
+                for (uint32_t m = 0; m < take_m; m++) {
+                    if (matched_count < CURSOR_MAX_ROWSET_ROWS && !join_id_matched(g_join_matched_ids, matched_count, matches[m]))
+                        g_join_matched_ids[matched_count++] = matches[m];
+                }
             }
 
             if (take_m == 0) {
-                if (jc->type == SQL_JOIN_LEFT) {
+                // LEFT and FULL both preserve an unmatched outer row (right
+                // side NULL-padded); RIGHT drops it here -- its unmatched
+                // rows come from jc->table instead, via the anti-pass below.
+                if (jc->type == SQL_JOIN_LEFT || jc->type == SQL_JOIN_FULL) {
                     struct RowValues combined;
                     se_memset(&combined, 0, sizeof(combined));
                     combined.count = next_layout.column_count;
-                    for (uint32_t c = 0; c < running.column_count; c++)
-                        se_strcpy(combined.values[c], cur[r].values[c], RECORD_VAL_LEN);
-                    fill_join_sentinel(&combined, running.column_count, layout_new);
+                    copy_row_segment(&combined, 0, &cur[r], running.column_count);
+                    fill_join_null_pad(&combined, running.column_count, layout_new->column_count);
                     if (next_n < CURSOR_MAX_ROWSET_ROWS) nxt[next_n] = combined;
                     next_n++;
                 }
@@ -686,14 +776,25 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
                 struct RowValues combined;
                 se_memset(&combined, 0, sizeof(combined));
                 combined.count = next_layout.column_count;
-                for (uint32_t c = 0; c < running.column_count; c++)
-                    se_strcpy(combined.values[c], cur[r].values[c], RECORD_VAL_LEN);
-                for (uint32_t c = 0; c < layout_new->column_count; c++)
-                    se_strcpy(combined.values[running.column_count + c], row_new.values[c], RECORD_VAL_LEN);
+                copy_row_segment(&combined, 0, &cur[r], running.column_count);
+                copy_row_segment(&combined, running.column_count, &row_new, layout_new->column_count);
 
                 if (next_n < CURSOR_MAX_ROWSET_ROWS) nxt[next_n] = combined;
                 next_n++;
             }
+        }
+
+        if (need_right_pass) {
+            struct join_right_anti_ctx actx;
+            actx.out = nxt;
+            actx.n_io = &next_n;
+            actx.max = CURSOR_MAX_ROWSET_ROWS;
+            actx.running_col_count = running.column_count;
+            actx.new_col_count = layout_new->column_count;
+            actx.matched_ids = g_join_matched_ids;
+            actx.matched_count = matched_count;
+            actx.truncated = &truncated;
+            mvcc_table_scan(txn_id, caller_uid, jc->table, join_right_anti_cb, &actx);
         }
         if (next_n > CURSOR_MAX_ROWSET_ROWS) truncated = 1;
 
@@ -715,6 +816,18 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
         for (uint32_t i = 0; i < cur_n; i++) g_select_scratch[i] = cur[i];
         cur = g_select_scratch;
     }
+
+    *running_out   = running;
+    *n_out          = cur_n;
+    *truncated_out = truncated;
+    return 0;
+}
+
+static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    struct RowTableLayout running;
+    uint32_t cur_n = 0;
+    uint8_t truncated = 0;
+    if (join_materialize(txn_id, caller_uid, s, out, &running, &cur_n, &truncated)) return;
 
     if (!s->select_all) {
         for (uint32_t i = 0; i < s->column_count; i++) {
@@ -793,9 +906,10 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
 }
 
 // ─── Phase 1 (SQL Feature-Parity Roadmap): GROUP BY / HAVING / aggregates ──
-// Single table only (see sql_parser.h -- GROUP BY + JOIN in one statement
-// is a real, named scope cut, not an oversight). Validates everything
-// up-front against the SOURCE table layout and a synthetic per-group
+// Originally single-table only; Query-Surface Roadmap Phase 1 added the
+// JOIN-sourced mode (see the comment inside), retiring that scope cut.
+// Validates everything up-front against the SOURCE layout (the table's
+// own, or the join's combined qualified one) and a synthetic per-group
 // RESULT layout (built from the SELECT list, before any row is scanned --
 // same "validate cheaply first, scan expensively second" discipline
 // exec_select()/exec_select_join() already follow), then does one
@@ -805,22 +919,58 @@ static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct 
 // (after HAVING) into a real RowValues row so ORDER BY/LIMIT/cursor_open_
 // rowset() all work completely unchanged against the grouped result.
 static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
-    if (s->has_join) {
-        out->error = SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED;
-        se_strcpy(out->error_msg, "GROUP BY/aggregate functions combined with JOIN are not supported yet", SQL_ERR_MSG_LEN);
-        return;
-    }
+    // ── Query-Surface Roadmap Phase 1: the aggregate path now has TWO row
+    // sources instead of rejecting JOIN outright (the old SQL_ERR_GROUP_BY_
+    // JOIN_UNSUPPORTED, retired here). Single-table mode keeps the exact
+    // original shape: validate against the table's own layout, then one
+    // WHERE-pushed mvcc scan feeds the bucketing. Join mode first
+    // materializes the combined rows via join_materialize() (the same
+    // pipeline exec_select_join() itself runs, factored out), applies WHERE
+    // against the combined qualified layout afterward (the join path's own
+    // "WHERE once, at the very end" rule), and then the IDENTICAL bucketing
+    // /HAVING/format/ORDER BY code runs against those rows -- one aggregate
+    // implementation, two sources, not a second copy. ──────────────────────
+    struct RowTableLayout join_layout;
+    const struct RowTableLayout* layout;
+    uint32_t src_n = 0;
+    uint8_t src_truncated = 0;
+    const int from_join = s->has_join ? 1 : 0;
 
-    int tidx = find_table_catalog_index(s->table_name);
-    if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
-    const struct RowTableLayout* layout = &table_headers[tidx].layout;
+    if (from_join) {
+        if (join_materialize(txn_id, caller_uid, s, out, &join_layout, &src_n, &src_truncated)) return;
+        layout = &join_layout;
+        // WHERE: validated and applied against the COMBINED rows, before
+        // bucketing -- same semantics as the single-table path's pushed-
+        // down WHERE (rows are filtered before aggregation either way).
+        if (s->has_where) {
+            if (!predicate_columns_valid(&s->where, s->where.root, layout)) {
+                out->error = SQL_ERR_COLUMN_NOT_FOUND;
+                se_strcpy(out->error_msg, "WHERE clause references an unknown column (use table.column or alias.column)", SQL_ERR_MSG_LEN);
+                return;
+            }
+            uint32_t kept = 0;
+            for (uint32_t i = 0; i < src_n; i++) {
+                if (predicate_eval(&s->where, layout, &g_select_scratch[i])) {
+                    if (kept != i) g_select_scratch[kept] = g_select_scratch[i];
+                    kept++;
+                }
+            }
+            src_n = kept;
+        }
+    } else {
+        int tidx = find_table_catalog_index(s->table_name);
+        if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
+        layout = &table_headers[tidx].layout;
+    }
 
     uint32_t group_col = 0xFFFFFFFFu;
     if (s->has_group_by) {
         group_col = find_column_index(layout, s->group_by);
         if (group_col == 0xFFFFFFFFu) {
             out->error = SQL_ERR_COLUMN_NOT_FOUND;
-            se_strcpy(out->error_msg, "GROUP BY column not found in table", SQL_ERR_MSG_LEN);
+            se_strcpy(out->error_msg, from_join
+                      ? "GROUP BY column not found in the joined result (use table.column or alias.column)"
+                      : "GROUP BY column not found in table", SQL_ERR_MSG_LEN);
             return;
         }
     }
@@ -845,7 +995,9 @@ static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct
         uint32_t c = find_column_index(layout, s->agg_arg[i]);
         if (c == 0xFFFFFFFFu) {
             out->error = SQL_ERR_COLUMN_NOT_FOUND;
-            se_strcpy(out->error_msg, "aggregate function argument column not found in table", SQL_ERR_MSG_LEN);
+            se_strcpy(out->error_msg, from_join
+                      ? "aggregate function argument column not found in the joined result (use table.column or alias.column)"
+                      : "aggregate function argument column not found in table", SQL_ERR_MSG_LEN);
             return;
         }
         if ((s->agg_fn[i] == SQL_AGG_SUM || s->agg_fn[i] == SQL_AGG_AVG) &&
@@ -890,28 +1042,48 @@ static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct
         se_strcpy(out->error_msg, "HAVING clause references a column/aggregate not in the SELECT list", SQL_ERR_MSG_LEN);
         return;
     }
-    if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, layout)) {
+    // Join mode already validated AND applied WHERE against the combined
+    // rows up top -- only the single-table path validates + pushes it into
+    // the scan here.
+    if (!from_join && s->has_where && !predicate_columns_valid(&s->where, s->where.root, layout)) {
         out->error = SQL_ERR_COLUMN_NOT_FOUND;
         se_strcpy(out->error_msg, "WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
         return;
     }
 
-    // ── Scan (WHERE-filtered, snapshot-consistent -- same mvcc_find_
-    // matching_rows() every other exec_* function uses) + bucket ──────────
+    // ── Row source + bucket. Single-table: WHERE-filtered snapshot scan
+    // (same mvcc_find_matching_rows() every other exec_* uses). Join: the
+    // combined rows already materialized (and WHERE-filtered) in
+    // g_select_scratch[0..src_n) by the block up top. ─────────────────────
     struct MvccRowId ids[CURSOR_MAX_ROWSET_ROWS];
-    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name,
-                                             s->has_where ? &s->where : NULL, layout,
-                                             ids, CURSOR_MAX_ROWSET_ROWS);
-    uint32_t n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
-    uint8_t row_truncated = (total > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
+    uint32_t n;
+    uint8_t row_truncated;
+    if (from_join) {
+        n = src_n;
+        row_truncated = src_truncated;
+    } else {
+        uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name,
+                                                 s->has_where ? &s->where : NULL, layout,
+                                                 ids, CURSOR_MAX_ROWSET_ROWS);
+        n = total < CURSOR_MAX_ROWSET_ROWS ? total : CURSOR_MAX_ROWSET_ROWS;
+        row_truncated = (total > CURSOR_MAX_ROWSET_ROWS) ? 1 : 0;
+    }
 
     for (uint32_t gi = 0; gi < SQL_MAX_GROUPS; gi++) g_agg_buckets[gi].active = 0;
     uint32_t group_count = 0;
     uint8_t group_overflow = 0;
 
+    // Join mode reads source rows straight out of g_select_scratch --
+    // safe even though the format stage below ALSO writes g_select_scratch,
+    // because bucketing fully completes (all state accumulated into
+    // g_agg_buckets[]) before the first formatted group row is written.
     for (uint32_t i = 0; i < n; i++) {
         struct RowValues rv;
-        if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &rv) != MVCC_OK) continue;
+        if (from_join) {
+            rv = g_select_scratch[i];
+        } else if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &rv) != MVCC_OK) {
+            continue;
+        }
 
         const char* gk = s->has_group_by ? rv.values[group_col] : "";
         struct sql_agg_bucket* b = 0;

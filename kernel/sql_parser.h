@@ -414,6 +414,8 @@ typedef enum {
 typedef enum {
     SQL_JOIN_INNER = 0,
     SQL_JOIN_LEFT,
+    SQL_JOIN_RIGHT,   // Query-Surface Roadmap Phase 2: inner pass + right-anti-pass (unmatched right rows, left side NULL-padded)
+    SQL_JOIN_FULL,    // Query-Surface Roadmap Phase 2: LEFT behavior + the same right-anti-pass
 } SqlJoinType;
 
 #define SQL_MAX_JOINS 3   // FROM + up to 3 JOINs = 4 tables total in one

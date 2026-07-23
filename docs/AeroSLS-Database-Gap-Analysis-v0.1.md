@@ -274,8 +274,11 @@ see 2.1 for where it chafes).
 6. **§2.7 RANGE/CHECK SQL syntax** — **DONE** (see §2.7's closure
    addendum).
 7. **§2.4/2.5 query-surface items** (views/CTEs/set ops; GROUP BY over
-   JOIN) — the big-ticket work, each deserving its own scoping pass, in
-   whichever order a real workload demands.
+   JOIN) — **SCOPED**: see
+   `AeroSLS-SQL-Query-Surface-Roadmap-v0.1.md` (7 phases: GROUP BY over
+   JOIN; real-NULL padding + RIGHT/FULL OUTER; depth-2 reentrancy
+   groundwork; set operations; views; CTEs; correlated subqueries
+   deliberately unscheduled).
 
 Items in §3.3/§3.4 are watch-items, not action items, until something in
 1-7 or real usage forces them.

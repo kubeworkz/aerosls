@@ -53,6 +53,7 @@ typedef enum {
     TOK_KW_DATABASE,   // Database Namespace & Access Roadmap Phase 2
     TOK_KW_CASCADE, TOK_KW_RESTRICT,   // Cascading phase: DROP DATABASE ... CASCADE, ON DELETE actions
     TOK_KW_CHECK, TOK_KW_BETWEEN,      // Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi)
+    TOK_KW_RIGHT, TOK_KW_FULL,         // Query-Surface Roadmap Phase 2: RIGHT/FULL OUTER JOIN
     TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
     TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
@@ -113,6 +114,9 @@ static const struct KeywordEntry KEYWORDS[] = {
     // CASCADE/RESTRICT above: columns/tables named "check"/"between" are no
     // longer expressible.
     {"CHECK", TOK_KW_CHECK}, {"BETWEEN", TOK_KW_BETWEEN},
+    // Query-Surface Roadmap Phase 2. Same shadowing note again: columns/
+    // tables named "right"/"full" are no longer expressible.
+    {"RIGHT", TOK_KW_RIGHT}, {"FULL", TOK_KW_FULL},
     // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
     // keyword-lookup pass (same mechanism every other keyword uses), so a
     // column named e.g. "string" would need... actually it can't be named
@@ -878,17 +882,23 @@ static void parse_select_body(struct SqlParser* p, struct SqlSelectStmt* s) {
     // doesn't require a qualifier in general, so that's enforced here
     // specifically via split_qualified() rejecting an unqualified
     // reference, not by the grammar rule itself.
-    while (p->cur.kind == TOK_KW_JOIN || p->cur.kind == TOK_KW_LEFT) {
+    while (p->cur.kind == TOK_KW_JOIN || p->cur.kind == TOK_KW_LEFT ||
+           p->cur.kind == TOK_KW_RIGHT || p->cur.kind == TOK_KW_FULL) {
         if (s->join_count >= SQL_MAX_JOINS) { set_error(p, "too many JOINs in one statement"); return; }
         struct SqlJoinClause* jc = &s->joins[s->join_count];
         jc->type = SQL_JOIN_INNER;
         jc->alias[0] = '\0';
 
-        if (p->cur.kind == TOK_KW_LEFT) {
-            jc->type = SQL_JOIN_LEFT;
+        if (p->cur.kind == TOK_KW_LEFT || p->cur.kind == TOK_KW_RIGHT || p->cur.kind == TOK_KW_FULL) {
+            // Query-Surface Roadmap Phase 2: RIGHT/FULL join the LEFT
+            // keyword's existing shape exactly -- optional no-op OUTER,
+            // then JOIN required.
+            jc->type = (p->cur.kind == TOK_KW_LEFT)  ? SQL_JOIN_LEFT
+                     : (p->cur.kind == TOK_KW_RIGHT) ? SQL_JOIN_RIGHT
+                     :                                  SQL_JOIN_FULL;
             advance(p);
-            if (p->cur.kind == TOK_KW_OUTER) advance(p);   // "LEFT OUTER JOIN" -- OUTER is a no-op here
-            if (!expect(p, TOK_KW_JOIN, "expected JOIN after LEFT")) return;
+            if (p->cur.kind == TOK_KW_OUTER) advance(p);   // "<kind> OUTER JOIN" -- OUTER is a no-op here
+            if (!expect(p, TOK_KW_JOIN, "expected JOIN after LEFT/RIGHT/FULL")) return;
         } else {
             advance(p);   // consume JOIN
         }

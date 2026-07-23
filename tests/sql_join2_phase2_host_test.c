@@ -257,12 +257,32 @@ int main(void) {
         cursor_fetch_rows(r.cursor_id, 100, collectN_cb, &ctx);
         /* order: alice, bob, carol, dave */
         CHECK(ctx.count == 4 && strcmp(ctx.vals[3][0], "dave") == 0, "scenario 2: dave is the 4th row (ORDER BY e.name)");
-        CHECK(strcmp(ctx.vals[3][1], "0") == 0 && strcmp(ctx.vals[3][2], "") == 0,
-              "scenario 2: dave's unmatched department columns are sentinel-filled (\"0\"/\"\"), not dropped or garbage");
+        CHECK(strcmp(ctx.vals[3][1], "") == 0 && strcmp(ctx.vals[3][2], "") == 0,
+              "scenario 2 (Query-Surface Phase 2): dave's unmatched department columns are real-NULL-padded (empty text), not the old type sentinels");
         CHECK(strcmp(ctx.vals[0][1], "1") == 0 && strcmp(ctx.vals[0][2], "Engineering") == 0,
-              "scenario 2: alice's real department still resolves correctly alongside dave's sentinel row");
+              "scenario 2: alice's real department still resolves correctly alongside dave's padded row");
         cursor_close(r.cursor_id);
     }
+
+    /* ── Scenario 2b (Query-Surface Roadmap Phase 2): the LEFT-padded columns
+     * are now REAL NULLs -- IS NULL must find them, which the old per-type
+     * sentinels ("0"/"false"/"") could never do (a sentinel is
+     * indistinguishable from a genuine value to IS NULL). This is the whole
+     * point of Phase 2's padding change. ────────────────────────────────── */
+    CHECK(sql_execute(1, "SELECT e.name FROM employees e LEFT JOIN departments d ON e.dept_id = d.id "
+                        "WHERE d.id IS NULL", &r) == 0 && r.row_count == 1,
+          "scenario 2b: IS NULL finds exactly dave's LEFT-padded row");
+    {
+        struct collectN_ctx ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.ncols = 1; ctx.idx[0] = 1;
+        cursor_fetch_rows(r.cursor_id, 100, collectN_cb, &ctx);
+        CHECK(ctx.count == 1 && strcmp(ctx.vals[0][0], "dave") == 0, "scenario 2b: the IS NULL match is dave");
+        cursor_close(r.cursor_id);
+    }
+    CHECK(sql_execute(1, "SELECT e.name FROM employees e LEFT JOIN departments d ON e.dept_id = d.id "
+                        "WHERE d.id IS NOT NULL", &r) == 0 && r.row_count == 3,
+          "scenario 2b: IS NOT NULL keeps the 3 genuinely-matched rows (alice, bob, carol)");
+    cursor_close(r.cursor_id);
 
     /* ── Scenario 3: self-join with aliases (manager lookup) -- the
      * motivating case for aliasing: the same physical table appears twice,
@@ -361,13 +381,16 @@ int main(void) {
               "scenario 7: a 5th table (4 JOINs, exceeding SQL_MAX_JOINS=3) is a PARSE error, not silently truncated");
     }
 
-    /* ── Scenario 8: GROUP BY/aggregates combined with a multi-table JOIN
-     * remains a named scope cut (Phase 1's rule, unchanged for the N-way
-     * case). ──────────────────────────────────────────────────────────────── */
+    /* ── Scenario 8 (flipped by Query-Surface Roadmap Phase 1): GROUP BY/
+     * aggregates combined with a JOIN now WORKS -- the old scope cut is
+     * retired. The dedicated coverage lives in sql_group_phase1_host_
+     * test.c scenario 10; this just proves the N-way join path here isn't
+     * rejected anymore. ────────────────────────────────────────────────────── */
     CHECK(sql_execute(1, "SELECT e.dept_id, COUNT(*) FROM employees e "
-                        "JOIN departments d ON e.dept_id = d.id GROUP BY e.dept_id", &r) == 1 &&
-          r.error == SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED,
-          "scenario 8: GROUP BY/aggregates combined with a JOIN still fails cleanly (SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED)");
+                        "JOIN departments d ON e.dept_id = d.id GROUP BY e.dept_id", &r) == 0 &&
+          r.error == SQL_ERR_NONE && r.row_count > 0,
+          "scenario 8: GROUP BY/aggregates combined with a JOIN now succeeds (UNSUPPORTED rejection retired)");
+    cursor_close(r.cursor_id);
 
     /* ── Scenario 9: parser-level checks (sql_parse() directly, no exec). ── */
     {
@@ -399,6 +422,103 @@ int main(void) {
                         "JOIN projects p ON e.id = p.emp_id", &r) == 0 && r.row_count == 0,
           "scenario 10: permission denial makes a chained JOIN return 0 rows cleanly, not a crash");
     g_access_force_deny = 0;
+
+    /* ── Scenario 11 (Query-Surface Roadmap Phase 2): RIGHT JOIN is the
+     * mirror of LEFT -- every department is preserved even with no matching
+     * employee (Marketing has none), while dave's dangling dept_id=99 is
+     * correctly DROPPED (RIGHT doesn't preserve unmatched LEFT/outer rows,
+     * only unmatched RIGHT/new-table rows). ───────────────────────────────── */
+    CHECK(sql_execute(1, "SELECT e.name, d.title FROM employees e "
+                        "RIGHT JOIN departments d ON e.dept_id = d.id "
+                        "ORDER BY d.title", &r) == 0,
+          "scenario 11: RIGHT JOIN succeeds");
+    CHECK(r.row_count == 4, "scenario 11: 3 matched (alice/bob->Eng, carol->Sales) + 1 right-anti (Marketing, unmatched) = 4; dave dropped");
+    {
+        /* combined layout: 0=e.id,1=e.name,2=e.dept_id,3=e.mgr_id,4=d.id,5=d.title */
+        struct collectN_ctx ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.ncols = 2; ctx.idx[0] = 1; ctx.idx[1] = 5;
+        cursor_fetch_rows(r.cursor_id, 100, collectN_cb, &ctx);
+        int saw_marketing_padded = 0, dave_present = 0;
+        for (uint32_t i = 0; i < ctx.count; i++) {
+            if (strcmp(ctx.vals[i][1], "Marketing") == 0 && ctx.vals[i][0][0] == '\0') saw_marketing_padded = 1;
+            if (strcmp(ctx.vals[i][0], "dave") == 0) dave_present = 1;
+        }
+        CHECK(saw_marketing_padded, "scenario 11: Marketing's row has e.name real-NULL-padded (empty), not dropped");
+        CHECK(!dave_present, "scenario 11: dave (dangling dept_id) does not appear -- RIGHT drops unmatched outer rows");
+        cursor_close(r.cursor_id);
+    }
+    CHECK(sql_execute(1, "SELECT d.title FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id "
+                        "WHERE e.id IS NULL", &r) == 0 && r.row_count == 1,
+          "scenario 11: IS NULL on the padded outer side finds exactly Marketing's right-anti row");
+    cursor_close(r.cursor_id);
+
+    /* ── Scenario 12 (Query-Surface Roadmap Phase 2): FULL OUTER JOIN finds
+     * BOTH sides' orphans -- dave (unmatched employee) AND Marketing
+     * (unmatched department), on top of the 3 real matches. ──────────────── */
+    CHECK(sql_execute(1, "SELECT e.name, d.title FROM employees e "
+                        "FULL OUTER JOIN departments d ON e.dept_id = d.id", &r) == 0,
+          "scenario 12: FULL OUTER JOIN succeeds");
+    CHECK(r.row_count == 5, "scenario 12: 3 matched + dave (left-anti) + Marketing (right-anti) = 5");
+    {
+        struct collectN_ctx ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.ncols = 2; ctx.idx[0] = 1; ctx.idx[1] = 5;
+        cursor_fetch_rows(r.cursor_id, 100, collectN_cb, &ctx);
+        int dave_padded = 0, marketing_padded = 0;
+        for (uint32_t i = 0; i < ctx.count; i++) {
+            if (strcmp(ctx.vals[i][0], "dave") == 0 && ctx.vals[i][1][0] == '\0') dave_padded = 1;
+            if (strcmp(ctx.vals[i][1], "Marketing") == 0 && ctx.vals[i][0][0] == '\0') marketing_padded = 1;
+        }
+        CHECK(dave_padded, "scenario 12: dave's row has d.title real-NULL-padded (left-anti, from the LEFT-style pass)");
+        CHECK(marketing_padded, "scenario 12: Marketing's row has e.name real-NULL-padded (right-anti pass)");
+        cursor_close(r.cursor_id);
+    }
+    CHECK(sql_execute(1, "SELECT e.name, d.title FROM employees e "
+                        "FULL OUTER JOIN departments d ON e.dept_id = d.id "
+                        "WHERE e.id IS NULL OR d.id IS NULL", &r) == 0 && r.row_count == 2,
+          "scenario 12: WHERE ... IS NULL isolates exactly the two orphan rows on either side");
+    cursor_close(r.cursor_id);
+
+    /* ── Scenario 13 (Query-Surface Roadmap Phase 2): a NULL join key never
+     * matches anything, not even coincidentally -- erin has a genuinely NULL
+     * dept_id (not a dangling FK like dave's), and must come out padded via
+     * the LEFT branch exactly like a real non-match, never crashing or
+     * mismatching against some department by accident. ───────────────────── */
+    CHECK(sql_execute(1, "INSERT INTO employees (id, name, dept_id, mgr_id) VALUES (5, 'erin', NULL, 1)", &r) == 0,
+          "scenario 13 setup: erin inserted with a genuinely NULL dept_id");
+    CHECK(sql_execute(1, "SELECT e.name, d.title FROM employees e LEFT JOIN departments d ON e.dept_id = d.id "
+                        "WHERE e.name = 'erin'", &r) == 0 && r.row_count == 1,
+          "scenario 13: erin's NULL join key still produces exactly one LEFT-padded row");
+    {
+        struct collectN_ctx ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.ncols = 1; ctx.idx[0] = 5;
+        cursor_fetch_rows(r.cursor_id, 100, collectN_cb, &ctx);
+        CHECK(ctx.count == 1 && ctx.vals[0][0][0] == '\0', "scenario 13: erin's d.title is real-NULL-padded, not accidentally matched");
+        cursor_close(r.cursor_id);
+    }
+    CHECK(sql_execute(1, "DELETE FROM employees WHERE name = 'erin'", &r) == 0,
+          "scenario 13 cleanup: erin removed so later row-count assumptions elsewhere stay valid");
+
+    /* ── Scenario 14: parser-level checks for RIGHT/FULL OUTER JOIN. ──────── */
+    {
+        struct SqlStatement stmt;
+        char err[SQL_ERR_MSG_LEN];
+        CHECK(sql_parse("SELECT * FROM employees RIGHT JOIN departments ON employees.dept_id = departments.id",
+                        &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.select.join_count == 1 && stmt.u.select.joins[0].type == SQL_JOIN_RIGHT,
+              "scenario 14: bare RIGHT JOIN parses and sets SQL_JOIN_RIGHT");
+        CHECK(sql_parse("SELECT * FROM employees RIGHT OUTER JOIN departments ON employees.dept_id = departments.id",
+                        &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.select.joins[0].type == SQL_JOIN_RIGHT,
+              "scenario 14: RIGHT OUTER JOIN parses (OUTER is a no-op) and sets SQL_JOIN_RIGHT");
+        CHECK(sql_parse("SELECT * FROM employees FULL JOIN departments ON employees.dept_id = departments.id",
+                        &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.select.joins[0].type == SQL_JOIN_FULL,
+              "scenario 14: bare FULL JOIN parses and sets SQL_JOIN_FULL");
+        CHECK(sql_parse("SELECT * FROM employees FULL OUTER JOIN departments ON employees.dept_id = departments.id",
+                        &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.select.joins[0].type == SQL_JOIN_FULL,
+              "scenario 14: FULL OUTER JOIN parses (OUTER is a no-op) and sets SQL_JOIN_FULL");
+    }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

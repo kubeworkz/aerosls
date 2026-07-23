@@ -310,9 +310,14 @@ int main(void) {
     CHECK(sql_execute(1, "SELECT dept, COUNT(*) FROM employees GROUP BY dept ORDER BY bogus", &r) == 1 &&
           r.error == SQL_ERR_COLUMN_NOT_FOUND,
           "scenario 8: ORDER BY an unknown column against the grouped result fails cleanly");
+    /* Query-Surface Roadmap Phase 1 flipped this check's polarity: GROUP
+     * BY + JOIN is no longer a scope cut (see scenario 10 below for the
+     * real coverage) -- a join against a NONEXISTENT table now surfaces
+     * the join pipeline's own honest error instead of the retired
+     * SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED blanket rejection. */
     CHECK(sql_execute(1, "SELECT dept, COUNT(*) FROM employees JOIN nope ON employees.id = nope.id GROUP BY dept", &r) == 1 &&
-          r.error == SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED,
-          "scenario 8: GROUP BY combined with JOIN fails cleanly (named scope cut, not a crash)");
+          r.error == SQL_ERR_TABLE_NOT_FOUND,
+          "scenario 8: GROUP BY + JOIN against an unknown table reports TABLE_NOT_FOUND (the UNSUPPORTED rejection is retired)");
 
     /* ── Scenario 9: parser-level checks (sql_parse() directly, no exec). ── */
     {
@@ -337,6 +342,106 @@ int main(void) {
     sql_execute(1, "INSERT INTO counters (count) VALUES (42)", &r);
     CHECK(sql_execute(1, "SELECT count FROM counters", &r) == 0 && r.row_count == 1,
           "scenario 9b: a column literally named 'count' still parses as a plain column_ref, not a broken aggregate call");
+    cursor_close(r.cursor_id);
+
+    /* ══ Scenario 10 (Query-Surface Roadmap Phase 1): GROUP BY/aggregates
+     * over JOIN -- the retired scope cut, now real. Fixtures: departments
+     * maps each employees.dept to a region; regions maps each region to a
+     * country (for the three-table chain). All columns in join mode are
+     * qualified (t.col or alias.col), including GROUP BY and aggregate
+     * arguments -- the combined layout's own namespace. ═══════════════════ */
+    {
+        const char* cols[2] = {"dname", "region"};
+        SLSFieldType types[2] = {FIELD_TYPE_STRING, FIELD_TYPE_STRING};
+        make_table("departments", 0xF003, 2, cols, types);
+    }
+    sql_execute(1, "INSERT INTO departments (dname, region) VALUES ('Eng', 'West')", &r);
+    sql_execute(1, "INSERT INTO departments (dname, region) VALUES ('Sales', 'East')", &r);
+    sql_execute(1, "INSERT INTO departments (dname, region) VALUES ('Marketing', 'East')", &r);
+    {
+        const char* cols[2] = {"rname", "country"};
+        SLSFieldType types[2] = {FIELD_TYPE_STRING, FIELD_TYPE_STRING};
+        make_table("regions", 0xF004, 2, cols, types);
+    }
+    sql_execute(1, "INSERT INTO regions (rname, country) VALUES ('West', 'US')", &r);
+    sql_execute(1, "INSERT INTO regions (rname, country) VALUES ('East', 'EU')", &r);
+    CHECK(r.error == SQL_ERR_NONE, "scenario 10: join fixtures inserted");
+
+    /* 10a: COUNT(*) grouped by a column from the JOINED table (not FROM). */
+    CHECK(sql_execute(1, "SELECT d.region, COUNT(*) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept "
+                        "GROUP BY d.region ORDER BY d.region", &r) == 0 && r.row_count == 2,
+          "scenario 10a: COUNT(*) GROUP BY a joined-table column succeeds with 2 groups");
+    {
+        struct collect_ctx ctx = {{{0}}, {{0}}, 0};
+        cursor_fetch_rows(r.cursor_id, 100, collect_cb, &ctx);
+        CHECK(ctx.count == 2 &&
+              strcmp(ctx.col0[0], "East") == 0 && strcmp(ctx.col1[0], "4") == 0 &&
+              strcmp(ctx.col0[1], "West") == 0 && strcmp(ctx.col1[1], "2") == 0,
+              "scenario 10a: East=4 (3 Sales + 1 Marketing), West=2 (Eng) -- real join-then-group counts");
+        cursor_close(r.cursor_id);
+    }
+
+    /* 10b: SUM of a FROM-table column grouped by a joined-table column. */
+    CHECK(sql_execute(1, "SELECT d.region, SUM(e.salary) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept "
+                        "GROUP BY d.region ORDER BY d.region", &r) == 0 && r.row_count == 2,
+          "scenario 10b: SUM(e.salary) grouped by d.region succeeds");
+    {
+        struct collect_ctx ctx = {{{0}}, {{0}}, 0};
+        cursor_fetch_rows(r.cursor_id, 100, collect_cb, &ctx);
+        CHECK(ctx.count == 2 &&
+              strcmp(ctx.col1[0], "270000") == 0 && strcmp(ctx.col1[1], "175000") == 0,
+              "scenario 10b: East sum=270000, West sum=175000");
+        cursor_close(r.cursor_id);
+    }
+
+    /* 10c: HAVING over the join-sourced aggregate. */
+    CHECK(sql_execute(1, "SELECT d.region, COUNT(*) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept "
+                        "GROUP BY d.region HAVING COUNT(*) > 2", &r) == 0 && r.row_count == 1,
+          "scenario 10c: HAVING COUNT(*) > 2 keeps only East (4)");
+    cursor_close(r.cursor_id);
+
+    /* 10d: WHERE filters the COMBINED rows before aggregation. */
+    CHECK(sql_execute(1, "SELECT d.region, COUNT(*) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept "
+                        "WHERE e.salary > 69000 GROUP BY d.region ORDER BY d.region", &r) == 0 && r.row_count == 2,
+          "scenario 10d: WHERE over combined rows applies before bucketing");
+    {
+        struct collect_ctx ctx = {{{0}}, {{0}}, 0};
+        cursor_fetch_rows(r.cursor_id, 100, collect_cb, &ctx);
+        CHECK(ctx.count == 2 &&
+              strcmp(ctx.col1[0], "2") == 0 && strcmp(ctx.col1[1], "2") == 0,
+              "scenario 10d: East=2 (carol, dave), West=2 (alice, bob) after the salary filter");
+        cursor_close(r.cursor_id);
+    }
+
+    /* 10e: three-table chain, grouped by the LAST table's column. */
+    CHECK(sql_execute(1, "SELECT r.country, COUNT(*) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept "
+                        "JOIN regions AS r ON r.rname = d.region "
+                        "GROUP BY r.country ORDER BY r.country", &r) == 0 && r.row_count == 2,
+          "scenario 10e: a three-table chain aggregates too");
+    {
+        struct collect_ctx ctx = {{{0}}, {{0}}, 0};
+        cursor_fetch_rows(r.cursor_id, 100, collect_cb, &ctx);
+        CHECK(ctx.count == 2 &&
+              strcmp(ctx.col0[0], "EU") == 0 && strcmp(ctx.col1[0], "4") == 0 &&
+              strcmp(ctx.col0[1], "US") == 0 && strcmp(ctx.col1[1], "2") == 0,
+              "scenario 10e: EU=4, US=2 through the full e->d->r chain");
+        cursor_close(r.cursor_id);
+    }
+
+    /* 10f: error paths in join mode use qualified-name-aware messages. */
+    CHECK(sql_execute(1, "SELECT d.region, SUM(salary) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept GROUP BY d.region", &r) == 1 &&
+          r.error == SQL_ERR_COLUMN_NOT_FOUND,
+          "scenario 10f: an UNQUALIFIED aggregate argument fails in join mode -- combined columns are t.col, named loud");
+    CHECK(sql_execute(1, "SELECT d.bogus, COUNT(*) FROM employees AS e "
+                        "JOIN departments AS d ON d.dname = e.dept GROUP BY d.bogus", &r) == 1 &&
+          r.error == SQL_ERR_COLUMN_NOT_FOUND,
+          "scenario 10f: an unknown qualified GROUP BY column fails cleanly in join mode");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
