@@ -155,7 +155,7 @@ static void make_embeddings_collection(uint32_t idx, uint32_t dimension) {
     object_catalog[idx].type = OBJ_TYPE_DB_TABLE;
     object_catalog[idx].object_id = 0xE802;
     object_catalog[idx].active = 1;
-    vecstore_create_collection("employee_embeddings", dimension);
+    vecstore_create_collection(1, "employee_embeddings", dimension);
 }
 
 /* ─── The collector this test exercises vec_join_resolve() with -- pairs

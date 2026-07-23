@@ -129,8 +129,8 @@ int main(void) {
      * so "images" should export with no metric information at all). ────── */
     add_catalog_entry("docs", 0xD001);
     add_catalog_entry("images", 0xD002);
-    CHECK(vecstore_create_collection("docs", 128) == 0, "fixture: create 'docs' collection (dim 128)");
-    CHECK(vecstore_create_collection("images", 512) == 0, "fixture: create 'images' collection (dim 512, no index)");
+    CHECK(vecstore_create_collection(1, "docs", 128) == 0, "fixture: create 'docs' collection (dim 128)");
+    CHECK(vecstore_create_collection(1, "images", 512) == 0, "fixture: create 'images' collection (dim 512, no index)");
     CHECK(vec_index_create(1, "idx_docs", "docs", VEC_METRIC_COSINE) == 0,
           "fixture: create HNSW index 'idx_docs' on 'docs' (cosine)");
 

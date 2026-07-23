@@ -388,16 +388,16 @@ uint64_t sys_sls_vec_index_rebuild(struct SLSVecIndexRebuildRequest* req);
 //     VecIndex above) -- a collection with zero indexes exports with no
 //     metric information at all, because none exists to lose, not
 //     because the exporter dropped it.
-//   - vecstore_create_collection() itself takes no caller_uid and has no
-//     permission gate of its own (confirmed directly: no catalog_check_
-//     access() call anywhere in it, unlike every other vecstore.c entry
-//     point). vec_schema_import() calls it exactly as-is, so any caller
-//     who can reach the import syscall can create new collections
-//     regardless of role -- exactly as true today calling vec_create
-//     directly. Not a gap this feature introduces or silently works
-//     around by inventing a check the underlying primitive doesn't have;
-//     named here so a future phase that closes it (adding caller_uid to
-//     vecstore_create_collection() itself) knows to update this caller too.
+//   - CLOSED (VectorStore Gap Analysis §1.2): vecstore_create_collection()
+//     used to take no caller_uid and have no permission gate of its own
+//     (confirmed at the time: no catalog_check_access() call anywhere in
+//     it, unlike every other vecstore.c entry point). It now takes
+//     caller_uid and gates on catalog_check_access(..., PERM_WRITE), the
+//     same level vecstore_insert()/vecstore_delete() use -- this call
+//     site was updated to thread this function's own caller_uid through,
+//     so a caller without write access to a target catalog object can no
+//     longer create a collection over it via a COLLECTION import line,
+//     matching the direct-vec_create path's own (now real) gate.
 //   - Export's own read gate is catalog_check_access(caller_uid, name,
 //     PERM_READ) per collection, the same choke point vec_index_create()
 //     itself already uses to gate index creation against its underlying

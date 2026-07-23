@@ -145,7 +145,7 @@ void vecstore_init(void) {
     kernel_serial_print("[VECSTORE] Vector store engine initialised.\n");
 }
 
-int vecstore_create_collection(const char* collection_name, uint32_t dimension) {
+int vecstore_create_collection(uint32_t caller_uid, const char* collection_name, uint32_t dimension) {
     if (dimension == 0 || dimension > VECSTORE_MAX_DIMENSION) return 1;
 
     int idx = -1;
@@ -154,6 +154,12 @@ int vecstore_create_collection(const char* collection_name, uint32_t dimension) 
         if (vs_streq(object_catalog[i].name, collection_name)) { idx = (int)i; break; }
     }
     if (idx < 0) return 1;
+    // VectorStore Gap Analysis §1.2 (closed): the one entry point in this
+    // file that used to have no catalog_check_access() gate at all --
+    // every other one (insert/get/delete/scan below) already gates on it.
+    // PERM_WRITE, matching insert/delete's own level: promoting a catalog
+    // object to a vector collection mutates it.
+    if (!catalog_check_access(caller_uid, collection_name, PERM_WRITE)) return 2;
     if (vector_collections[idx].active) return 1;   // already a vector collection
 
     struct VecCollectionHeader* h = &vector_collections[idx];
@@ -192,6 +198,44 @@ static void vs_read_entry(const uint8_t* slot, uint64_t* out_external_id, struct
     vs_memcpy(out->values, slot + 9, dimension * 4);
 }
 
+// ─── VectorStore Gap Analysis §1.3: opt-in external_id uniqueness ─────────
+// Internal helper -- walks every active (non-tombstoned) entry in a
+// collection looking for a matching external_id, same physical (page, then
+// slot) traversal vecstore_collection_scan() above already uses, but
+// without a callback indirection or its own catalog_check_access() call
+// (the caller -- vecstore_insert() below -- already gated access before
+// this runs). Returns 1 on a hit, 0 if the whole collection was walked
+// with no match.
+static int vs_external_id_exists(struct VecCollectionHeader* h, uint64_t external_id) {
+    uint32_t page_id = h->first_page_id;
+    while (page_id != VECSTORE_INVALID_PAGE) {
+        uint8_t* page = vecstore_load_page(page_id);
+        if (!page) break;
+        uint32_t next_page; vs_memcpy(&next_page, page, 4);
+        uint32_t limit = (page_id == h->last_page_id) ? h->entries_in_last_page : h->entries_per_page;
+        for (uint32_t s = 0; s < limit; s++) {
+            uint8_t* slot = page + 4 + s * h->entry_width;
+            if (!slot[0]) continue;   // tombstoned -- a deleted entry's external_id is free to reuse
+            uint64_t ext_id;
+            vs_memcpy(&ext_id, slot + 1, 8);
+            if (ext_id == external_id) return 1;
+        }
+        page_id = next_page;
+    }
+    return 0;
+}
+
+int vecstore_set_unique_external_id(uint32_t caller_uid, const char* collection_name, int enabled) {
+    int idx = find_active_collection(collection_name);
+    if (idx < 0) return 1;
+    if (!catalog_check_access(caller_uid, collection_name, PERM_WRITE)) return 2;
+    vector_collections[idx].unique_external_id = enabled ? 1 : 0;
+    persist_vecstore_headers();   // matches every other header-mutating call's own persistence convention
+    kernel_serial_printf("[VECSTORE] '%s' external_id uniqueness -> %s\n",
+                         collection_name, enabled ? "ON" : "OFF");
+    return 0;
+}
+
 // ─── Vector CRUD ─────────────────────────────────────────────────────────────
 int vecstore_insert(uint32_t caller_uid, const char* collection_name,
                     uint64_t external_id, const struct VecValues* values,
@@ -202,6 +246,11 @@ int vecstore_insert(uint32_t caller_uid, const char* collection_name,
     struct VecCollectionHeader* h = &vector_collections[idx];
     if (!catalog_check_access(caller_uid, collection_name, PERM_WRITE)) return 2;
     if (values->count != h->dimension) return 4;
+    // VectorStore Gap Analysis §1.3 (closed): opt-in only -- a collection
+    // that never called vecstore_set_unique_external_id() has this flag at
+    // its zero-initialized default (off), so this branch never runs and
+    // behavior is byte-for-byte unchanged from before this fix existed.
+    if (h->unique_external_id && vs_external_id_exists(h, external_id)) return 6;
 
     if (h->first_page_id == VECSTORE_INVALID_PAGE ||
         h->entries_in_last_page >= h->entries_per_page) {
@@ -463,7 +512,15 @@ uint32_t vecstore_search(uint32_t caller_uid, const char* collection_name,
 
 uint64_t sys_sls_vec_create(struct SLSVecCreateRequest* req) {
     if (!req) return 1;
-    req->status = vecstore_create_collection(req->collection_name, req->dimension);
+    req->status = vecstore_create_collection(req->caller_uid, req->collection_name, req->dimension);
+    return (uint64_t)req->status;
+}
+
+// VectorStore Gap Analysis §1.3 follow-on: same thin-adapter shape as every
+// other syscall on this page.
+uint64_t sys_sls_vec_set_unique(struct SLSVecSetUniqueRequest* req) {
+    if (!req) return 1;
+    req->status = vecstore_set_unique_external_id(req->caller_uid, req->collection_name, req->enabled);
     return (uint64_t)req->status;
 }
 
@@ -763,6 +820,12 @@ struct vd_export_ctx {
     uint32_t    written;
     uint32_t    total;
     int         stop;   // 1 once the buffer is full -- avoids repeatedly retrying a doomed append
+    // VectorStore Gap Analysis §1.4 (closed): the first `skip` entries this
+    // scan visits are counted into `total` exactly like every other entry,
+    // but never serialized -- see vec_data_export()'s own header comment
+    // and vecstore.h's matching one for the full resumption-across-calls
+    // design this implements.
+    uint32_t    skip;
 };
 
 // Builds one "VECTOR <collection> <external_id> <v0> ... <v(n-1)>\n" line
@@ -777,6 +840,7 @@ static void vd_export_cb(struct VecId id, uint64_t external_id, const struct Vec
     struct vd_export_ctx* ctx = (struct vd_export_ctx*)ctxp;
     ctx->total++;
     if (ctx->stop) return;   // buffer already full -- vectors_total above still stays honest
+    if (ctx->total <= ctx->skip) return;   // §1.4: still within the skipped prefix -- counted, not written
 
     uint32_t line_start = *ctx->pos;
     int ok = vs_append(ctx->buf, ctx->pos, ctx->max, "VECTOR ") &&
@@ -805,8 +869,12 @@ static void vd_export_cb(struct VecId id, uint64_t external_id, const struct Vec
 }
 
 uint32_t vec_data_export(uint32_t caller_uid, const char* collection_name,
-                         char* out, uint32_t max, struct VecDataExportResult* result) {
-    if (result) { result->bytes_written = 0; result->vectors_written = 0; result->vectors_total = 0; result->truncated = 0; }
+                         uint32_t skip_count, char* out, uint32_t max,
+                         struct VecDataExportResult* result) {
+    if (result) {
+        result->bytes_written = 0; result->vectors_written = 0; result->vectors_total = 0;
+        result->truncated = 0; result->entries_remaining = 0;
+    }
     if (!out || max == 0) return 0;
     out[0] = '\0';
     if (!collection_name) return 0;
@@ -831,14 +899,19 @@ uint32_t vec_data_export(uint32_t caller_uid, const char* collection_name,
         return pos;
     }
 
-    struct vd_export_ctx ctx = { out, &pos, max, collection_name, 0, 0, 0 };
+    struct vd_export_ctx ctx = { out, &pos, max, collection_name, 0, 0, 0, skip_count };
     vecstore_collection_scan(caller_uid, collection_name, vd_export_cb, &ctx);
 
     if (result) {
         result->bytes_written   = pos;
         result->vectors_written = ctx.written;
         result->vectors_total   = ctx.total;
-        result->truncated       = (ctx.total > ctx.written) ? 1 : 0;
+        // §1.4: accounts for skip_count now, not just this call's own
+        // vectors_written -- "how much of the WHOLE collection has this
+        // call plus everything before it covered."
+        uint32_t covered = skip_count + ctx.written;
+        result->entries_remaining = (covered < ctx.total) ? (ctx.total - covered) : 0;
+        result->truncated       = (result->entries_remaining > 0) ? 1 : 0;
     }
     return pos;
 }
@@ -913,6 +986,7 @@ void vec_data_import(uint32_t caller_uid, const char* text, struct VecDataImport
                         case 2: err = "permission denied"; break;
                         case 4: err = "dimension mismatch: this line's component count doesn't match the collection's dimension"; break;
                         case 5: err = "vecstore_insert() failed: page pool exhausted"; break;
+                        case 6: err = "duplicate external_id rejected (collection has uniqueness enabled, VectorStore Gap Analysis §1.3)"; break;
                         default: err = "vecstore_insert() failed"; break;
                     }
                 }
@@ -926,7 +1000,7 @@ void vec_data_import(uint32_t caller_uid, const char* text, struct VecDataImport
 
 uint64_t sys_sls_vec_data_export(struct SLSVecDataExportRequest* req) {
     if (!req) return 1;
-    vec_data_export(req->caller_uid, req->collection_name, req->out, sizeof(req->out), &req->result);
+    vec_data_export(req->caller_uid, req->collection_name, req->skip_count, req->out, sizeof(req->out), &req->result);
     return 0;
 }
 

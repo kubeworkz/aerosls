@@ -136,7 +136,7 @@ int main(void) {
 
     /* ── Fixture: one collection "docs" (dim=4), three inserted vectors. ── */
     add_catalog_entry("docs", 0xD001);
-    CHECK(vecstore_create_collection("docs", 4) == 0, "fixture: create 'docs' collection (dim 4)");
+    CHECK(vecstore_create_collection(1, "docs", 4) == 0, "fixture: create 'docs' collection (dim 4)");
 
     struct VecValues v1 = { 4, { 1.5f, -2.25f, 3.0f, 0.0f } };
     struct VecValues v2 = { 4, { 10.0f, 20.5f, -30.0f, 0.25f } };
@@ -148,11 +148,13 @@ int main(void) {
 
     /* ── Scenario 1: export reconstructs correct VECTOR lines. ─────────── */
     memset(&er, 0, sizeof(er));
-    uint32_t n = vec_data_export(1, "docs", out, sizeof(out), &er);
+    uint32_t n = vec_data_export(1, "docs", 0, out, sizeof(out), &er);
     CHECK(n > 0, "scenario 1: vec_data_export() returns a nonzero byte count");
     CHECK(er.bytes_written == n, "scenario 1b: result->bytes_written matches the return value");
     CHECK(er.vectors_written == 3 && er.vectors_total == 3 && er.truncated == 0,
           "scenario 1c: all 3 vectors written, none truncated");
+    CHECK(er.entries_remaining == 0,
+          "scenario 1h: entries_remaining is 0 -- this one call already covered the whole collection");
     CHECK(strstr(out, "VECTOR docs 1001 1.500000 -2.250000 3.000000 0.000000") != NULL,
           "scenario 1d: export includes the exact 'VECTOR docs 1001 ...' line for vector 1001");
     CHECK(strstr(out, "VECTOR docs 1002 10.000000 20.500000 -30.000000 0.250000") != NULL,
@@ -174,7 +176,7 @@ int main(void) {
     vecstore_notify_object_freed("docs");
     CHECK(vector_collections[0].active == 0, "scenario 2: 'docs' is genuinely dropped (inactive)");
 
-    CHECK(vecstore_create_collection("docs", 4) == 0, "scenario 2b: 'docs' recreated fresh (dim 4, empty)");
+    CHECK(vecstore_create_collection(1, "docs", 4) == 0, "scenario 2b: 'docs' recreated fresh (dim 4, empty)");
     CHECK(vector_collections[0].entry_count == 0, "scenario 2c: freshly recreated 'docs' has zero entries");
 
     memset(&ir, 0, sizeof(ir));
@@ -277,13 +279,66 @@ int main(void) {
     static char small_out[80];
     struct VecDataExportResult er2;
     memset(&er2, 0, sizeof(er2));
-    uint32_t n8 = vec_data_export(1, "docs", small_out, sizeof(small_out), &er2);
+    uint32_t n8 = vec_data_export(1, "docs", 0, small_out, sizeof(small_out), &er2);
     CHECK(er2.truncated == 1, "scenario 8: a too-small buffer is honestly reported as truncated");
     CHECK(er2.vectors_written < er2.vectors_total,
           "scenario 8b: fewer vectors were written than the collection actually has");
     CHECK(strlen(small_out) == n8 && n8 == er2.bytes_written,
           "scenario 8c: the truncated output is still a clean, complete NUL-terminated prefix "
           "(no half-written trailing line)");
+    CHECK(er2.entries_remaining == er2.vectors_total - er2.vectors_written,
+          "scenario 8d: entries_remaining accounts for exactly what this call didn't cover "
+          "(skip_count was 0, so it's simply vectors_total - vectors_written here)");
+
+    /* ── Scenario 8e (VectorStore Gap Analysis §1.4, closed): pagination --
+     * walking the SAME too-small buffer repeatedly, advancing skip_count by
+     * each call's own vectors_written, must eventually reach entries_
+     * remaining == 0 and, across every call combined, visit every external_
+     * id in the collection exactly once (no duplicates, no omissions) --
+     * proving the resumption contract vec_data_export()'s own header
+     * comment describes, not just that truncation is reported honestly. ─── */
+    // A dedicated, differently-sized buffer from small_out[80] above:
+    // 150 bytes fits the ~47-byte header comment plus exactly one ~54-56-
+    // byte VECTOR line per call (not two), which both guarantees real
+    // progress every call (unlike small_out[80], which fits header-only
+    // and legitimately writes 0 vectors on its own -- a valid, separately-
+    // covered degenerate case, not this scenario's concern) and still
+    // forces several pages across 'docs'' several entries by this point.
+    uint32_t total_before_pagination = vector_collections[0].entry_count;
+    uint32_t skip = 0, pages = 0, seen_total = 0;
+    uint64_t seen_ids[64]; uint32_t seen_count = 0;
+    for (;;) {
+        struct VecDataExportResult per;
+        memset(&per, 0, sizeof(per));
+        static char page_out[150];
+        vec_data_export(1, "docs", skip, page_out, sizeof(page_out), &per);
+        CHECK(per.vectors_written > 0 || per.vectors_total == 0,
+              "scenario 8e: every page (while entries remain) writes at least one vector "
+              "-- an infinite no-progress loop would mean the resumption contract is broken");
+        // Parse out each VECTOR line's external_id from this page's text,
+        // recording it so the whole walk's coverage can be checked below.
+        const char* p = page_out;
+        while ((p = strstr(p, "VECTOR docs ")) != NULL) {
+            p += 12;
+            uint64_t eid = 0;
+            while (*p >= '0' && *p <= '9') { eid = eid * 10 + (uint64_t)(*p - '0'); p++; }
+            if (seen_count < 64) seen_ids[seen_count++] = eid;
+        }
+        seen_total += per.vectors_written;
+        skip += per.vectors_written;
+        pages++;
+        if (per.entries_remaining == 0 || per.vectors_written == 0 || pages > 20) break;
+    }
+    CHECK(seen_total == total_before_pagination,
+          "scenario 8f: paginating across enough calls visits every entry in the collection exactly once "
+          "(seen_total matches the collection's own entry_count)");
+    CHECK(pages > 1, "scenario 8g: the too-small buffer genuinely forced more than one page "
+                     "(not a degenerate single-call pass)");
+    int dup_found = 0;
+    for (uint32_t a = 0; a < seen_count && !dup_found; a++)
+        for (uint32_t b = a + 1; b < seen_count; b++)
+            if (seen_ids[a] == seen_ids[b]) { dup_found = 1; break; }
+    CHECK(!dup_found, "scenario 8h: no external_id was seen twice across the whole paginated walk");
 
     /* ── Scenario 9: re-importing the same VECTOR line twice duplicates the
      * vector rather than overwriting it -- vecstore_insert() has never
@@ -313,13 +368,13 @@ int main(void) {
     g_access_force_deny = 1;
     struct VecDataExportResult er10;
     memset(&er10, 0, sizeof(er10));
-    uint32_t n10 = vec_data_export(1, "docs", out, sizeof(out), &er10);
+    uint32_t n10 = vec_data_export(1, "docs", 0, out, sizeof(out), &er10);
     CHECK(n10 == 0 && er10.vectors_written == 0,
           "scenario 10: with access denied, export produces zero bytes and zero vectors");
     g_access_force_deny = 0;
     struct VecDataExportResult er10b;
     memset(&er10b, 0, sizeof(er10b));
-    uint32_t n10b = vec_data_export(1, "docs", out, sizeof(out), &er10b);
+    uint32_t n10b = vec_data_export(1, "docs", 0, out, sizeof(out), &er10b);
     CHECK(n10b > 0 && er10b.vectors_written > 0,
           "scenario 10b: with access restored, export is non-trivial again");
 

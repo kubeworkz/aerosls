@@ -101,7 +101,7 @@ int main(void) {
     object_catalog[0].active    = 1;
     object_catalog_count = 1;
 
-    CHECK(vecstore_create_collection("points", 2) == 0, "setup: create_collection(dimension=2) succeeds");
+    CHECK(vecstore_create_collection(1, "points", 2) == 0, "setup: create_collection(dimension=2) succeeds");
 
     // A=(1,0) [identical to the query], B=(2,1), C=(0,3), D=(-2,0), E=(5,1).
     // Hand-computed expected distances from query=(1,0) -- see file header
@@ -193,7 +193,7 @@ int main(void) {
     object_catalog[1].object_id = 0xD002;
     object_catalog[1].active    = 1;
     object_catalog_count = 2;
-    vecstore_create_collection("empty_collection", 2);
+    vecstore_create_collection(1, "empty_collection", 2);
     CHECK(vecstore_search(1, "empty_collection", &query, VEC_METRIC_L2, 5, dummy) == 0,
           "s7: searching a real but genuinely empty collection returns 0 (not an error, just no matches)");
 

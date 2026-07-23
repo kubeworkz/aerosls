@@ -147,7 +147,7 @@ int main(void) {
     object_catalog[0].object_id = 0xF001;
     object_catalog[0].active = 1;
     object_catalog_count = 1;
-    CHECK(vecstore_create_collection("cluster_points", DIM) == 0, "setup: collection created");
+    CHECK(vecstore_create_collection(1, "cluster_points", DIM) == 0, "setup: collection created");
     CHECK(vec_index_create(1, "idx_cluster", "cluster_points", VEC_METRIC_L2) == 0,
           "setup: HNSW index created (empty, before any data)");
 
@@ -390,7 +390,7 @@ int main(void) {
         object_catalog[1].object_id = 0xF002;
         object_catalog[1].active = 1;
         object_catalog_count = 2;
-        CHECK(vecstore_create_collection("temp_collection", 4) == 0, "s7: setup -- temp_collection created");
+        CHECK(vecstore_create_collection(1, "temp_collection", 4) == 0, "s7: setup -- temp_collection created");
         CHECK(vec_index_create(1, "idx_temp", "temp_collection", VEC_METRIC_L2) == 0, "s7: setup -- index over temp_collection created");
 
         struct VecValues v = { .count = 4, .values = {1.0f, 2.0f, 3.0f, 4.0f} };
@@ -444,7 +444,7 @@ int main(void) {
         object_catalog[2].object_id = 0xF003;
         object_catalog[2].active = 1;
         object_catalog_count = 3;
-        CHECK(vecstore_create_collection("backfill_col", 3) == 0, "s8: setup -- backfill_col created");
+        CHECK(vecstore_create_collection(1, "backfill_col", 3) == 0, "s8: setup -- backfill_col created");
 
         struct VecId backfill_ids[5];
         for (int i = 0; i < 5; i++) {

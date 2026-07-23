@@ -142,20 +142,20 @@ int main(void) {
     vecstore_init();
 
     /* ── Scenario 1: create_collection against a nonexistent object fails. ── */
-    CHECK(vecstore_create_collection("no_such_object", 4) == 1,
+    CHECK(vecstore_create_collection(1, "no_such_object", 4) == 1,
           "s1: create_collection against a nonexistent catalog object fails");
 
     make_object(0, "embeddings", 0xC001);
     object_catalog_count = 1;
 
     /* ── Scenario 2: dimension bounds are enforced. ─────────────────────────── */
-    CHECK(vecstore_create_collection("embeddings", 0) == 1, "s2: dimension=0 is rejected");
-    CHECK(vecstore_create_collection("embeddings", VECSTORE_MAX_DIMENSION + 1) == 1,
+    CHECK(vecstore_create_collection(1, "embeddings", 0) == 1, "s2: dimension=0 is rejected");
+    CHECK(vecstore_create_collection(1, "embeddings", VECSTORE_MAX_DIMENSION + 1) == 1,
           "s2: dimension > VECSTORE_MAX_DIMENSION is rejected");
 
     /* ── Scenario 3: a real create_collection succeeds and computes a
      * sane layout. ──────────────────────────────────────────────────────────── */
-    CHECK(vecstore_create_collection("embeddings", 4) == 0, "s3: create_collection(dimension=4) succeeds");
+    CHECK(vecstore_create_collection(1, "embeddings", 4) == 0, "s3: create_collection(dimension=4) succeeds");
     CHECK(vector_collections[0].active == 1, "s3: vector_collections[0].active is set");
     CHECK(vector_collections[0].dimension == 4, "s3: dimension recorded correctly");
     CHECK(vector_collections[0].entry_width == 1 + 8 + 4 * 4, "s3: entry_width = tombstone + external_id + 4 floats");
@@ -164,7 +164,7 @@ int main(void) {
 
     /* ── Scenario 4: re-promoting the same object fails (idempotency, no
      * catalog flag involved -- see vecstore.h's own header comment). ──────── */
-    CHECK(vecstore_create_collection("embeddings", 8) == 1, "s4: re-promoting an already-promoted object fails");
+    CHECK(vecstore_create_collection(1, "embeddings", 8) == 1, "s4: re-promoting an already-promoted object fails");
 
     /* ── Scenario 5: insert rejects a values->count mismatch. ───────────────── */
     struct VecValues bad = { .count = 3, .values = {1.0f, 2.0f, 3.0f} };
@@ -239,7 +239,7 @@ int main(void) {
      * without needing hundreds of inserts to trigger it. ───────────────────── */
     make_object(1, "wide_vectors", 0xC002);
     object_catalog_count = 2;
-    CHECK(vecstore_create_collection("wide_vectors", 800) == 0, "s12: create_collection(dimension=800) succeeds");
+    CHECK(vecstore_create_collection(1, "wide_vectors", 800) == 0, "s12: create_collection(dimension=800) succeeds");
     CHECK(vector_collections[1].entries_per_page == 1, "s12: a dimension=800 collection packs exactly 1 entry/page");
 
     struct VecValues wide_a, wide_b, wide_c;
@@ -264,6 +264,51 @@ int main(void) {
     vecstore_delete(1, "wide_vectors", wa);
     CHECK(vector_collections[1].entry_count == 2, "s13: wide_vectors' own entry_count reflects its own delete");
     CHECK(vector_collections[0].entry_count == 2, "s13: embeddings' entry_count is unaffected by wide_vectors' delete");
+
+    /* ── Scenario 14 (VectorStore Gap Analysis §1.3): opt-in external_id
+     * uniqueness -- off by default, toggled on/off, dedup rejects a repeat,
+     * a tombstoned external_id is free to reuse, and toggling off again
+     * un-blocks it without touching any existing rows. ──────────────────── */
+    make_object(2, "unique_test", 0xC003);
+    object_catalog_count = 3;
+    CHECK(vecstore_create_collection(1, "unique_test", 4) == 0, "s14: create_collection(unique_test) succeeds");
+    CHECK(vector_collections[2].unique_external_id == 0,
+          "s14: unique_external_id defaults to 0 (off) on a freshly created collection");
+
+    struct VecValues u1 = { 4, {1,1,1,1} };
+    struct VecId u1id;
+    CHECK(vecstore_insert(1, "unique_test", 7, &u1, &u1id) == 0,
+          "s14: insert with external_id=7 succeeds while uniqueness is off");
+    CHECK(vecstore_insert(1, "unique_test", 7, &u1, &u1id) == 0,
+          "s14: a second insert with the SAME external_id=7 also succeeds while uniqueness is off (pre-existing, unchanged default behavior)");
+
+    CHECK(vecstore_set_unique_external_id(1, "no_such_object", 1) == 1,
+          "s14: set_unique_external_id against a nonexistent collection fails (1)");
+    CHECK(vecstore_set_unique_external_id(1, "unique_test", 1) == 0,
+          "s14: set_unique_external_id(unique_test, on) succeeds");
+    CHECK(vector_collections[2].unique_external_id == 1, "s14: unique_external_id is now 1 (on)");
+
+    CHECK(vecstore_insert(1, "unique_test", 7, &u1, &u1id) == 6,
+          "s14: inserting external_id=7 AGAIN now that uniqueness is on is rejected (6) -- two copies already exist from before it was turned on");
+    struct VecValues u2 = { 4, {2,2,2,2} };
+    struct VecId u2id;
+    CHECK(vecstore_insert(1, "unique_test", 8, &u2, &u2id) == 0,
+          "s14: inserting a genuinely new external_id=8 still succeeds with uniqueness on");
+    CHECK(vecstore_insert(1, "unique_test", 8, &u2, &u2id) == 6,
+          "s14: re-inserting external_id=8 is rejected (6)");
+
+    CHECK(vecstore_delete(1, "unique_test", u2id) == 0, "s14: delete of external_id=8's entry succeeds");
+    CHECK(vecstore_insert(1, "unique_test", 8, &u2, &u2id) == 0,
+          "s14: external_id=8 is free to reuse immediately after its only live entry was tombstoned");
+
+    g_access_force_deny = 1;
+    CHECK(vecstore_set_unique_external_id(1, "unique_test", 0) == 2,
+          "s14: set_unique_external_id is denied when catalog_check_access() refuses (2)");
+    g_access_force_deny = 0;
+    CHECK(vecstore_set_unique_external_id(1, "unique_test", 0) == 0, "s14: set_unique_external_id(unique_test, off) succeeds");
+    CHECK(vector_collections[2].unique_external_id == 0, "s14: unique_external_id is back to 0 (off)");
+    CHECK(vecstore_insert(1, "unique_test", 7, &u1, &u1id) == 0,
+          "s14: external_id=7 (already duplicated twice above) can be inserted again once uniqueness is back off -- turning it off never scans or deletes existing rows");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

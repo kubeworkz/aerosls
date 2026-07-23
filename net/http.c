@@ -434,6 +434,18 @@ static int str_ncmp2(const char* a, const char* b, int n) {
     return 0;
 }
 
+// Parses a plain decimal uint32 out of a raw (non-JSON) path segment --
+// VectorStore Gap Analysis §1.4's own "/skip/<N>" path segment is this
+// file's first path-segment parameter that isn't a name/identifier, so
+// json_int()'s own digit-scanning loop (which expects a `"key":` prefix
+// it doesn't have here) doesn't apply; this is that same loop's body,
+// reused directly against a bare string instead.
+static uint32_t path_parse_u32(const char* s) {
+    uint32_t v = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (uint32_t)(*s - '0'); s++; }
+    return v;
+}
+
 // Locate the HTTP request body (after the blank line \r\n\r\n)
 static const char* http_body(const char* req) {
     for (const char* p = req; p[0]; p++)
@@ -827,30 +839,42 @@ static int api_vec_schema_export(uint32_t req_uid, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-// ─── GET /api/vec/data/export/<collection> — VectorStore Interface Roadmap
-// follow-on: bulk vector DATA export (complementing api_vec_schema_export()
-// above, which is definitions only) ─────────────────────────────────────────
+// ─── GET /api/vec/data/export/<collection>[/skip/<N>] — VectorStore
+// Interface Roadmap follow-on: bulk vector DATA export (complementing
+// api_vec_schema_export() above, which is definitions only) ────────────────
 // Reconstructs "VECTOR <collection> <external_id> <v0> ..." lines for the
 // one named collection req_uid can read, via vec_data_export() (vecstore.c).
-// Path-segment parameter (not a query string) matches this codebase's own
+// Path-segment parameters (not a query string) match this codebase's own
 // established /api/tables/<name>/schema convention -- no query-string
 // parsing infrastructure exists anywhere in this file (confirmed by grep
 // before writing this route), so a path segment is the one real precedent
 // to follow rather than inventing a new parsing mechanism for this route
-// alone. Reports vectors_written/vectors_total/truncated explicitly --
-// see vecstore.h's own header comment on why VEC_DATA_EXPORT_MAX_LEN is
-// genuinely tight at real embedding dimensions, so truncation is a real,
-// expected outcome this response must surface, not hide.
-static int api_vec_data_export(uint32_t req_uid, const char* collection_name, char* buf, int max) {
+// alone. Reports vectors_written/vectors_total/truncated/entries_remaining
+// explicitly -- see vecstore.h's own header comment on why VEC_DATA_EXPORT_
+// MAX_LEN is genuinely tight at real embedding dimensions, so truncation
+// (and needing more than one call to get everything) is a real, expected
+// outcome this response must surface, not hide.
+//
+// VectorStore Gap Analysis §1.4 (closed): the optional trailing "/skip/<N>"
+// segment carries skip_count through to vec_data_export() -- see that
+// function's own header comment (vecstore.h) for the full resumption
+// design. "/skip/" is a literal marker, not a generic query-string parser:
+// collection names are OBJECT_NAME_LEN plain identifiers that can never
+// contain a '/' themselves, so splitting the path on the LAST occurrence of
+// "/skip/" unambiguously separates the two segments without needing any
+// new parsing infrastructure.
+static int api_vec_data_export(uint32_t req_uid, const char* collection_name,
+                                uint32_t skip_count, char* buf, int max) {
     static char vec_out[VEC_DATA_EXPORT_MAX_LEN];
     struct VecDataExportResult res;
-    vec_data_export(req_uid, collection_name, vec_out, sizeof(vec_out), &res);
+    vec_data_export(req_uid, collection_name, skip_count, vec_out, sizeof(vec_out), &res);
     JSONBuf j = { buf, 0, max };
     jb_obj_open(&j, 0);
     jb_str_multiline(&j, "text", vec_out); jb_putc(&j, ',');
     jb_uint(&j, "bytes", res.bytes_written); jb_putc(&j, ',');
     jb_uint(&j, "vectors_written", res.vectors_written); jb_putc(&j, ',');
     jb_uint(&j, "vectors_total", res.vectors_total); jb_putc(&j, ',');
+    jb_uint(&j, "entries_remaining", res.entries_remaining); jb_putc(&j, ',');
     jb_str(&j, "truncated", res.truncated ? "true" : "false");
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -2287,6 +2311,36 @@ static int api_vec_create_post(const char* body, char* buf, int max, uint32_t re
     jb_obj_open(&j,0);
     jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
     jb_str(&j, "name", req.collection_name); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/vec/collections/unique — VectorStore Gap Analysis §1.3 ─────────
+// Live path for vecstore_set_unique_external_id() -- toggles opt-in
+// external_id deduplication on an already-created collection. Body:
+// {"name": "<collection>", "enabled": 1} (or 0). Deliberately an integer,
+// not a JSON boolean literal: json_int() (this file's only integer
+// extractor, confirmed by grep -- there is no separate json_bool() anywhere
+// in this codebase) only scans decimal digit characters, so a literal
+// "true"/"false" would silently parse as 0 every time, which would make
+// "enabled": true a silent no-op bug baked into the wire format on day
+// one. Every existing route in this file that takes a 0/1-shaped flag
+// already keeps this same integer-only convention for the same reason
+// (confirmed by grep across this file's own json_int() call sites before
+// writing this comment) -- this route follows it rather than being the
+// first to assume JSON-boolean support that doesn't exist here.
+static int api_vec_set_unique_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSVecSetUniqueRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.collection_name, OBJECT_NAME_LEN);
+    req.enabled = json_int(body, "enabled");
+    uint64_t rc = sys_sls_vec_set_unique(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", req.collection_name); jb_putc(&j,',');
+    jb_str(&j, "enabled", req.enabled ? "true" : "false"); jb_putc(&j,',');
     jb_uint(&j, "status", (uint64_t)req.status);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -3891,16 +3945,34 @@ static void http_route(int conn, char* req) {
             blen = api_vec_schema_export(vexp_uid, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        // ── VectorStore Interface Roadmap follow-on: GET /api/vec/data/export/<collection> ──
+        // ── VectorStore Interface Roadmap follow-on: GET /api/vec/data/export/
+        // <collection>[/skip/<N>] -- the optional "/skip/<N>" suffix is
+        // VectorStore Gap Analysis §1.4 (closed); see api_vec_data_export()'s
+        // own comment above for why this is a path segment, not a query
+        // string, and why splitting on the "/skip/" marker is unambiguous. ──
         if (str_find(path, "/api/vec/data/export/") == path) {
-            const char* cname = path + 21;   // after "/api/vec/data/export/"
+            const char* rest = path + 21;   // after "/api/vec/data/export/"
+            char cname[OBJECT_NAME_LEN]; cname[0] = '\0';
+            uint32_t skip_count = 0;
+            const char* skip_marker = str_find(rest, "/skip/");
+            if (skip_marker) {
+                uint32_t n = (uint32_t)(skip_marker - rest);
+                if (n >= OBJECT_NAME_LEN) n = OBJECT_NAME_LEN - 1;
+                for (uint32_t k = 0; k < n; k++) cname[k] = rest[k];
+                cname[n] = '\0';
+                skip_count = path_parse_u32(skip_marker + 6);   // 6 == strlen("/skip/")
+            } else {
+                uint32_t n = 0;
+                while (rest[n] && n < OBJECT_NAME_LEN - 1) { cname[n] = rest[n]; n++; }
+                cname[n] = '\0';
+            }
             if (cname[0]) {
                 uint32_t vdexp_uid = 0; SLSRole vdexp_role = ROLE_GUEST;
                 auth_http_extract(req, &vdexp_uid, &vdexp_role);
-                blen = api_vec_data_export(vdexp_uid, cname, resp_body, (int)sizeof(resp_body));
+                blen = api_vec_data_export(vdexp_uid, cname, skip_count, resp_body, (int)sizeof(resp_body));
                 http_respond(conn, 200, "application/json", resp_body, blen); return;
             }
-            const char* e = "{\"error\":\"missing collection name -- expected /api/vec/data/export/<collection>\"}";
+            const char* e = "{\"error\":\"missing collection name -- expected /api/vec/data/export/<collection>[/skip/<N>]\"}";
             http_respond(conn, 404, "application/json", e, (int)strlen(e)); return;
         }
         if (str_find(path, "/api/tables/") == path) {
@@ -4204,6 +4276,11 @@ static void http_route(int conn, char* req) {
         // ── Gap Remediation Phase C: Vector Store HTTP reachability ────────────
         if (!strcmp(path, "/api/vec/collections")) {
             blen = api_vec_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── VectorStore Gap Analysis §1.3 ───────────────────────────────────────
+        if (!strcmp(path, "/api/vec/collections/unique")) {
+            blen = api_vec_set_unique_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/vec/insert")) {

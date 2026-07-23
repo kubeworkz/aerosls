@@ -738,10 +738,17 @@ void vec_schema_import(uint32_t caller_uid, const char* text, struct VecSchemaIm
                 }
                 if (bad_digit) {
                     err = "malformed DIM value (not a non-negative integer)";
-                } else if (vecstore_create_collection(name, dim) == 0) {
+                } else if (vecstore_create_collection(caller_uid, name, dim) == 0) {
                     ok = 1;
                 } else {
-                    err = "vecstore_create_collection() failed (bad name/dimension, or a collection with this name already exists)";
+                    // VectorStore Gap Analysis §1.2 (closed): vecstore_
+                    // create_collection() can now also fail with 2 (access
+                    // denied) rather than only 1 (bad name/dimension/already
+                    // exists) -- the message stays generic here since this
+                    // parser doesn't thread the numeric return code out
+                    // separately, matching this loop's own existing
+                    // one-error-message-per-line-kind posture.
+                    err = "vecstore_create_collection() failed (bad name/dimension, access denied, or a collection with this name already exists)";
                 }
             }
         } else if (vi_streq(kw, "INDEX")) {

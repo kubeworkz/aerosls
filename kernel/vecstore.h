@@ -167,6 +167,17 @@ struct VecCollectionHeader {
     uint32_t first_page_id;      // VECSTORE_INVALID_PAGE = none yet
     uint32_t last_page_id;       // append target
     uint32_t entries_in_last_page;
+    // VectorStore Gap Analysis §1.3 (closed): opt-in external_id uniqueness,
+    // off by default (0 = every collection created before this field existed,
+    // and every one created after unless explicitly turned on, keeps the
+    // original "caller's responsibility" behavior -- see vecstore_insert()'s
+    // header comment). Toggled only via vecstore_set_unique_external_id(),
+    // never as a vecstore_create_collection() parameter -- mirrors row_
+    // constraint.c's own "constraints are added, not baked into CREATE TABLE"
+    // shape (row_constraint_add_unique()) rather than SQL's inline UNIQUE
+    // column syntax, since this subsystem has no schema-definition statement
+    // of its own to attach the flag to in the first place.
+    uint8_t  unique_external_id;
 };
 
 extern struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
@@ -188,8 +199,18 @@ void vecstore_init(void);
 // (no schema step required -- see header comment). dimension must be in
 // [1, VECSTORE_MAX_DIMENSION]. Returns 0 on success; 1 if the object
 // doesn't exist, already has a vector collection, or dimension is out of
-// range.
-int vecstore_create_collection(const char* collection_name, uint32_t dimension);
+// range; 2 if catalog_check_access() denies caller_uid PERM_WRITE on the
+// catalog object.
+//
+// VectorStore Gap Analysis §1.2 (closed): caller_uid was added here --
+// this was the one entry point in this file with no catalog_check_access()
+// gate at all (every other one -- insert/get/delete/scan below -- already
+// had it), confirmed by grep before this fix. Gated on PERM_WRITE, the
+// same level vecstore_insert()/vecstore_delete() already use, since
+// promoting a catalog object to a vector collection mutates it. See
+// vec_index.h's own now-CLOSED §1.2 note (near vec_schema_import()) for
+// the other call site this same fix updated.
+int vecstore_create_collection(uint32_t caller_uid, const char* collection_name, uint32_t dimension);
 
 // Vector CRUD. Every call resolves collection_name to a catalog entry and
 // gates on catalog_check_access() first (PERM_READ for get/scan,
@@ -204,21 +225,47 @@ int vecstore_create_collection(const char* collection_name, uint32_t dimension);
 //   3 = entry not found (bad/stale VecId, or already deleted)
 //   4 = values->count doesn't match the collection's dimension
 //   5 = page pool exhausted (insert only)
+//   6 = duplicate external_id rejected (insert only -- see VectorStore Gap
+//       Analysis §1.3 below; only possible if the collection has opted in
+//       via vecstore_set_unique_external_id())
 //
 // external_id is caller-supplied and opaque to this subsystem -- the
 // correlation key a caller uses to join a search result back to a
-// relational row (Vector Store Roadmap Phase 5). Not validated or
-// interpreted here in any way -- any uint64_t is accepted, including 0
-// and duplicate values across different entries (uniqueness, if wanted,
-// is the caller's responsibility, matching this whole roadmap's "first
-// cut, not the general case" posture -- a real constraint layer here,
-// mirroring row_constraint.c, is future work if it turns out to matter).
+// relational row (Vector Store Roadmap Phase 5). By default not validated
+// or interpreted here in any way -- any uint64_t is accepted, including 0
+// and duplicate values across different entries, matching this whole
+// roadmap's original "first cut, not the general case" posture.
+//
+// VectorStore Gap Analysis §1.3 (closed): uniqueness is now available, but
+// stays strictly opt-in per collection (see VecCollectionHeader.unique_
+// external_id and vecstore_set_unique_external_id() below) rather than a
+// change to this default -- every caller who never asks for it keeps the
+// exact original "caller's own responsibility" behavior byte-for-byte, and
+// existing collections created before this field existed default to 0
+// (off) automatically. When a collection HAS opted in, vecstore_insert()
+// full-scans its own active entries for a matching external_id before
+// writing the new one and returns 6 without touching storage if found --
+// same real cost profile row_constraint.c's own rc_unique_scan_cb() already
+// accepts for row-set UNIQUE columns (a full table/collection scan per
+// write), not a new trade-off invented here.
 int vecstore_insert(uint32_t caller_uid, const char* collection_name,
                     uint64_t external_id, const struct VecValues* values,
                     struct VecId* out_id);
 int vecstore_get(uint32_t caller_uid, const char* collection_name,
                  struct VecId id, uint64_t* out_external_id, struct VecValues* out);
 int vecstore_delete(uint32_t caller_uid, const char* collection_name, struct VecId id);
+
+// ─── VectorStore Gap Analysis §1.3: opt-in external_id uniqueness ─────────
+// Turns per-collection external_id deduplication on (enabled=1) or back off
+// (enabled=0) for an already-created vector collection. Gated on catalog_
+// check_access(..., PERM_WRITE), the same level vecstore_create_collection()
+// itself now uses (§1.2) -- toggling a constraint mutates the collection's
+// own behavior, same justification. Returns 0 on success, 1 if the
+// collection doesn't exist, 2 if access is denied. Turning this off never
+// deletes or scans existing entries -- any duplicates already present from
+// before the flag was enabled (or from while it was off) are left exactly
+// as they are; the flag only changes what happens on the NEXT insert.
+int vecstore_set_unique_external_id(uint32_t caller_uid, const char* collection_name, int enabled);
 
 // Full-collection scan in physical (page, then slot) order, invoking cb()
 // for every active (non-tombstoned) entry -- the primitive Phase 2's
@@ -500,11 +547,30 @@ void sys_sls_vec_list(void);
 // vector's line can approach or exceed this whole buffer on its own, so
 // vec_data_export() may fit only a handful of vectors -- occasionally
 // zero -- per call at those dimensions. `result->truncated` reports this
-// explicitly. This first cut has no cursor/offset resumption mechanism
-// for calling export repeatedly to walk a large collection in chunks --
-// a caller must currently re-derive "what's already been exported" some
-// other way (e.g. by external_id) if a collection doesn't fit in one call.
-// Named as real, unsolved future work, not silently glossed over.
+// explicitly.
+//
+// VectorStore Gap Analysis §1.4 (closed): the "no cursor/offset resumption
+// mechanism" this paragraph used to name as unsolved future work is now a
+// plain `skip_count` parameter -- vec_data_export() skips the first
+// `skip_count` active entries in the collection's own physical (page, then
+// slot) scan order without writing them, then fills the buffer starting
+// from the next one. `result->entries_remaining` reports how many entries
+// are left uncounted-for after this call (`vectors_total - skip_count -
+// vectors_written`, floored at 0); a caller walks a whole collection by
+// starting at skip_count=0 and, after each call, setting the next
+// skip_count to `skip_count + result->vectors_written`, stopping once
+// `entries_remaining` reaches 0. Ordering is stable across calls only so
+// long as nothing is inserted into or deleted from the collection between
+// them (the same "physical scan order, not a stable logical order"
+// property vecstore_collection_scan() itself already has -- no new
+// ordering guarantee is invented here). Named honestly: this costs an
+// O(collection size) full scan on EVERY call, including the ones near the
+// end that write only a handful of entries -- skipped entries are still
+// visited and counted, just not serialized -- because vecstore_collection_
+// scan() has no random-access-by-ordinal primitive of its own to skip
+// ahead more cheaply. Correct, but not the cheapest possible resumption
+// mechanism; fine for a v1 fix, worth revisiting only if a real workload's
+// collection sizes make repeated full scans a measured problem.
 //
 // ─── Auto-indexing for free ──────────────────────────────────────────────
 // vecstore_insert() (above) already calls vec_index_notify_insert()
@@ -516,25 +582,42 @@ void sys_sls_vec_list(void);
 // own departments-before-employees REFERENCES ordering precedent.
 //
 // ─── Named gap: re-importing the same dump duplicates data (inherited,
-// not introduced here) ────────────────────────────────────────────────────
-// vecstore_insert() has never deduplicated on external_id (see this
-// header's own VecId/insert comment above: "uniqueness, if wanted, is the
-// caller's responsibility"). vec_data_import() calls vecstore_insert()
-// exactly as-is -- running the same import twice duplicates every vector
-// rather than no-op'ing or overwriting. Pre-existing behavior, named here
-// rather than silently inherited without comment.
+// not introduced here) — mitigated by VectorStore Gap Analysis §1.3 ───────
+// vecstore_insert() never deduplicated on external_id by default (see this
+// header's own VecId/insert comment above), and vec_data_import() calls
+// vecstore_insert() exactly as-is -- running the same import twice against
+// a collection that has NOT opted into vecstore_set_unique_external_id()
+// still duplicates every vector rather than no-op'ing or overwriting,
+// exactly as before. Not a silent behavior change: a caller who wants
+// re-import safety now has a real, opt-in way to get it (turn uniqueness
+// on before importing; duplicate VECTOR lines then come back as per-line
+// failures in VecDataImportResult.lines[], reported the same honest way
+// any other per-line failure already is), but the default posture for a
+// collection that never asks is unchanged.
 #define VEC_DATA_EXPORT_MAX_LEN   8192
 #define VEC_DATA_IMPORT_MAX_LINES 256
 
 struct VecDataExportResult {
     uint32_t bytes_written;
     uint32_t vectors_written;   // how many VECTOR lines were actually emitted
-    uint32_t vectors_total;     // how many active entries the collection actually has
-    uint8_t  truncated;         // 1 if vectors_total > vectors_written (buffer ran out)
+    uint32_t vectors_total;     // how many active entries the collection actually has (whole
+                                // collection, unaffected by skip_count -- see §1.4 below)
+    uint8_t  truncated;         // 1 if skip_count + vectors_written < vectors_total (buffer ran
+                                // out before reaching the end -- see entries_remaining below)
+    // VectorStore Gap Analysis §1.4 (closed): vectors_total - skip_count -
+    // vectors_written, floored at 0. 0 means this call reached the end of
+    // the collection; nonzero means another call with skip_count advanced
+    // by this call's own vectors_written would fetch more.
+    uint32_t entries_remaining;
 };
 
+// skip_count: see VectorStore Gap Analysis §1.4 (closed) above VEC_DATA_
+// EXPORT_MAX_LEN's own header comment -- 0 on a first call, then advanced
+// by the previous call's own vectors_written to resume a walk across a
+// collection too large for one call's buffer.
 uint32_t vec_data_export(uint32_t caller_uid, const char* collection_name,
-                         char* out, uint32_t max, struct VecDataExportResult* result);
+                         uint32_t skip_count, char* out, uint32_t max,
+                         struct VecDataExportResult* result);
 
 struct VecDataImportLineResult {
     uint32_t offset;
@@ -557,6 +640,7 @@ void vec_data_import(uint32_t caller_uid, const char* text, struct VecDataImport
 struct SLSVecDataExportRequest {
     uint32_t caller_uid;
     char     collection_name[OBJECT_NAME_LEN];
+    uint32_t skip_count;   // VectorStore Gap Analysis §1.4 (closed) -- 0 on a first call
     char     out[VEC_DATA_EXPORT_MAX_LEN];
     struct VecDataExportResult result;
 };
@@ -569,5 +653,20 @@ struct SLSVecDataImportRequest {
 
 uint64_t sys_sls_vec_data_export(struct SLSVecDataExportRequest* req);
 uint64_t sys_sls_vec_data_import(struct SLSVecDataImportRequest* req);
+
+// ─── VectorStore Gap Analysis §1.3 follow-on: syscall/HTTP/shell reachability
+// for vecstore_set_unique_external_id() ────────────────────────────────────
+// 268 -- next free syscall number after SYS_SLS_DATABASE_REVOKE_GROUP (267,
+// database.h), confirmed by grep across every kernel/*.h before picking it.
+#define SYS_SLS_VEC_SET_UNIQUE 268
+
+struct SLSVecSetUniqueRequest {
+    uint32_t caller_uid;
+    char     collection_name[OBJECT_NAME_LEN];
+    int      enabled;   // 0 = off, nonzero = on
+    int      status;    // vecstore_set_unique_external_id()'s own return code (0 = success)
+};
+
+uint64_t sys_sls_vec_set_unique(struct SLSVecSetUniqueRequest* req);
 
 #endif /* VECSTORE_H */

@@ -663,20 +663,20 @@ existed to reconstruct.
    collection with zero indexes (like this phase's own "images" host-test
    fixture) exports with no metric information at all, because none
    exists to lose, not because the exporter dropped it.
-3. **`vecstore_create_collection()` has no permission gate of its own.**
-   Confirmed directly: no `catalog_check_access()` call anywhere in it,
-   unlike every other `vecstore.c` entry point (insert/get/delete/scan all
-   gate on it). `vec_schema_import()` calls it exactly as-is — any caller
-   who can reach the import syscall can create new collections regardless
-   of role, exactly as true today calling `vec create` directly. Not a
-   gap this feature introduces or silently works around by inventing a
-   check the underlying primitive doesn't have; named here so a future
-   phase that adds `caller_uid`/a real gate to `vecstore_create_
-   collection()` itself knows to revisit this caller too. Export's own
-   read gate (`catalog_check_access(caller_uid, name, PERM_READ)` per
-   collection) reuses the same choke point `vec_index_create()` already
-   uses to gate index creation against its underlying collection — not a
-   new one invented for this feature.
+3. **`vecstore_create_collection()` has no permission gate of its own —
+   CLOSED (VectorStore Gap Analysis §1.2).** At the time this phase
+   shipped, confirmed directly: no `catalog_check_access()` call anywhere
+   in it, unlike every other `vecstore.c` entry point (insert/get/delete/
+   scan all gate on it), and `vec_schema_import()` called it exactly
+   as-is. A later pass (Gap Analysis §1.2) added a `caller_uid` parameter
+   and a `catalog_check_access(..., PERM_WRITE)` gate — the same level
+   `vecstore_insert()`/`vecstore_delete()` use — and updated this call
+   site (and `sys_sls_vec_create()`, and all direct test call sites) to
+   thread a real `caller_uid` through. Export's own read gate
+   (`catalog_check_access(caller_uid, name, PERM_READ)` per collection)
+   was unaffected — it already reused the same choke point
+   `vec_index_create()` uses to gate index creation against its
+   underlying collection.
 4. **No quoting.** Names are plain, space-free identifiers
    (`OBJECT_NAME_LEN`), matching this whole codebase's existing
    object-naming convention (the same assumption `user/shell.c`'s own
@@ -794,10 +794,17 @@ inside.
    vector's line can approach or exceed this whole buffer on its own, so
    `vec_data_export()` may fit only a handful of vectors — occasionally
    zero — per call at those dimensions. `result->truncated` reports this
-   explicitly rather than hiding it. There is no cursor/offset resumption
-   mechanism in this first cut for walking a large collection across
-   multiple export calls — named as real, unsolved future work, not
-   silently glossed over.
+   explicitly rather than hiding it. This first cut had no cursor/offset
+   resumption mechanism for walking a large collection across multiple
+   export calls — named as real, unsolved future work at the time, later
+   closed by VectorStore Gap Analysis §1.4: `vec_data_export()` gained a
+   `skip_count` parameter and `result->entries_remaining`, reachable via
+   an optional `/skip/<N>` HTTP path segment and an optional trailing
+   shell/syscall argument, and the VectorStore tab's own Data export
+   button now loops on it automatically rather than handing back a
+   silent partial file. See that gap doc's own §1.4 entry for the full
+   design and its honestly-named cost trade-off (each page still costs an
+   `O(collection size)` scan, not `O(page size)`).
 2. **No intermediate whole-line stack buffer during import.**
    `vec_data_import()` tokenizes directly out of the caller's `text`
    buffer between explicit `[pos, end)` bounds for each line, rather than
@@ -837,15 +844,21 @@ inside.
    data import when restoring both, mirroring the SQL roadmap's own
    departments-before-employees `REFERENCES` ordering precedent.
 6. **Named gap: re-importing the same dump duplicates data (inherited,
-   not introduced here).** `vecstore_insert()` has never deduplicated on
-   `external_id` (`vecstore.h`'s own pre-existing comment: "uniqueness, if
-   wanted, is the caller's responsibility"). `vec_data_import()` calls
+   not introduced here) — mitigated by VectorStore Gap Analysis §1.3
+   (closed).** `vecstore_insert()` had never deduplicated on `external_id`
+   (`vecstore.h`'s own pre-existing comment: "uniqueness, if wanted, is
+   the caller's responsibility"), and `vec_data_import()` called
    `vecstore_insert()` exactly as-is — running the same import twice
-   duplicates every vector rather than no-op'ing or overwriting. Verified
+   duplicated every vector rather than no-op'ing or overwriting. Verified
    directly by the host test (scenario 9): importing the same line twice
-   grows `entry_count` by 2, not 1, and a scan confirms two distinct
-   entries carry the same `external_id`. Pre-existing behavior, named
-   here rather than silently inherited without comment.
+   grew `entry_count` by 2, not 1, and a scan confirmed two distinct
+   entries carried the same `external_id`. A real, still-open gap at the
+   time this phase shipped, later closed by a genuine opt-in fix (see the
+   Gap Analysis doc's own §1.3): `vecstore_set_unique_external_id()` lets
+   a collection turn on `external_id` uniqueness, at which point a repeat
+   import is rejected line-by-line (return code 6) rather than silently
+   duplicated — but the default for a collection that never opts in is
+   still exactly this original behavior, unchanged.
 
 ### Frontend
 

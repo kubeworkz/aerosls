@@ -171,7 +171,8 @@ static void print_help(void) {
         "  vec schema export              dump COLLECTION/INDEX definitions for every readable collection\n"
         "  vec schema import <text>       run COLLECTION/INDEX definition lines\n"
         "  -- VectorStore Data Import/Export (the embeddings themselves) --\n"
-        "  vec data export <collection>   dump VECTOR lines (external_id + floats) for one collection\n"
+        "  vec data export <collection> [skip]   dump VECTOR lines (external_id + floats);\n"
+        "                                   skip resumes a walk once entries_remaining > 0\n"
         "  vec data import <text>         run VECTOR lines (import schema first if restoring both)\n"
         "  -- Security (Phase 2) --\n"
         "  role set <uid> <role>          assign role (SYSTEM_KERNEL|DB_ADMIN|\n"
@@ -316,6 +317,8 @@ static void print_help(void) {
         "  vec insert <name> <ext_id> <v0> <v1> ...       insert a raw vector\n"
         "  vec embed-insert <name> <ext_id> <model> <text...>  embed via local Ollama, then store\n"
         "  vec search <name> cosine|l2 <k> <v0> <v1> ...  top-k nearest neighbors\n"
+        "  -- Vector Store (Gap Analysis §1.3: opt-in external_id uniqueness) --\n"
+        "  vec collection unique <name> <on|off>   toggle external_id dedup on insert\n"
         "  -- Partitions / LPAR (Phases 8/13/14, Gap Remediation Phase F) --\n"
         "  partition create <name>                 define a new partition\n"
         "  partition list                          list all defined partitions\n"
@@ -1021,22 +1024,33 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
 
         // ── VectorStore Interface Roadmap follow-on: bulk vector DATA
         // export/import -- complements the definitions-only pair directly
-        // above. "vec data export <collection>" prints "VECTOR <collection>
-        // <external_id> <v0> <v1> ..." lines for the one named collection
-        // current_session_uid can read (vec_data_export(), vecstore.c). See
-        // vecstore.h's own header comment on why VEC_DATA_EXPORT_MAX_LEN is
-        // genuinely tight at real embedding dimensions -- vectors_written/
-        // vectors_total/truncated are reported explicitly below rather than
-        // silently hidden.
+        // above. "vec data export <collection> [skip]" prints "VECTOR
+        // <collection> <external_id> <v0> <v1> ..." lines for the one named
+        // collection current_session_uid can read (vec_data_export(),
+        // vecstore.c). See vecstore.h's own header comment on why VEC_DATA_
+        // EXPORT_MAX_LEN is genuinely tight at real embedding dimensions --
+        // vectors_written/vectors_total/truncated/entries_remaining are
+        // reported explicitly below rather than silently hidden.
+        //
+        // VectorStore Gap Analysis §1.4 (closed): the optional trailing
+        // [skip] token (0 if omitted) resumes a walk across a collection
+        // too large for one call -- entries_remaining tells the caller
+        // whether to run this again with skip advanced by this call's own
+        // vectors_written.
         else if (sh_starts(input_buffer, "vec data export ")) {
             struct SLSVecDataExportRequest req;
             req.caller_uid = current_session_uid;
-            sh_copy(req.collection_name, input_buffer + 17, sizeof(req.collection_name));
+            const char* p = input_buffer + 17;
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            char skiptok[16];
+            sh_token(p, skiptok, sizeof(skiptok));
+            req.skip_count = skiptok[0] ? (uint32_t)sh_atoi(skiptok) : 0;
             do_syscall(SYS_SLS_VEC_DATA_EXPORT, &req);
             kernel_serial_printf(
-                "[VEC_DATA] %u byte(s), %u/%u vector(s) written%s:\n%s",
-                req.result.bytes_written, req.result.vectors_written, req.result.vectors_total,
-                req.result.truncated ? " (TRUNCATED -- buffer too small for the whole collection)" : "",
+                "[VEC_DATA] skip=%u: %u byte(s), %u/%u vector(s) written, %u remaining%s:\n%s",
+                req.skip_count, req.result.bytes_written, req.result.vectors_written, req.result.vectors_total,
+                req.result.entries_remaining,
+                req.result.truncated ? " (more to fetch -- rerun with skip advanced by vectors_written)" : "",
                 req.out);
         }
         // "vec data import <text>" -- one shell line, so multiple VECTOR
@@ -1199,6 +1213,29 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint64_t rc = do_syscall(SYS_SLS_VEC_CREATE, &req);
             kernel_serial_printf("[VEC] create '%s' dim=%u -> %s (status %d)\n",
                                  req.collection_name, req.dimension,
+                                 rc == 0 ? "OK" : "FAILED", req.status);
+        }
+        // ── VectorStore Gap Analysis §1.3 follow-on: vec collection unique
+        // <name> <on|off> ──────────────────────────────────────────────────
+        // Live surface for vecstore_set_unique_external_id() -- toggles
+        // opt-in external_id deduplication for an already-created
+        // collection. Off by default for every collection (old and new
+        // alike, since VecCollectionHeader.unique_external_id zero-
+        // initializes), matching the same "syscall/shell/HTTP reachability
+        // for an engine primitive that would otherwise be dead code" gap
+        // pattern every other "vec "-prefixed command on this page already
+        // closed for its own engine function.
+        else if (sh_starts(input_buffer, "vec collection unique ")) {
+            struct SLSVecSetUniqueRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 22;
+            p = sh_token(p, req.collection_name, sizeof(req.collection_name));
+            char onoff[8];
+            sh_token(p, onoff, sizeof(onoff));
+            req.enabled = sh_eq(onoff, "on") ? 1 : 0;
+            uint64_t rc = do_syscall(SYS_SLS_VEC_SET_UNIQUE, &req);
+            kernel_serial_printf("[VEC] collection '%s' unique external_id -> %s -> %s (status %d)\n",
+                                 req.collection_name, req.enabled ? "ON" : "OFF",
                                  rc == 0 ? "OK" : "FAILED", req.status);
         }
         else if (sh_starts(input_buffer, "vec insert ")) {
