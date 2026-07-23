@@ -205,20 +205,81 @@ LEFT-padded rows now match `IS NULL` (the flipped expectation is the
 test), RIGHT equivalence to the mirrored LEFT, FULL OUTER finding both
 sides' orphans.
 
-### Phase 3 — Depth-2 executor reentrancy (the enabler, no user-visible feature)
+### Phase 3 — Depth-2 executor reentrancy (the enabler, no user-visible feature) — DONE
 
-**Scope.** A single explicit nesting depth counter and depth-indexed
-banks (size 2) for exactly the scratch a nested SELECT touches:
-`g_stmt_scratch`, the select/join ping-pong buffers, `g_agg_buckets`,
-`g_join_probe_pred`. ~2× BSS cost of those statics (~100KB-class, cheap
-against the existing budget — `RowJournalEntry` alone spends 130KB);
-depth >2 fails loud with a distinct error, never recurses silently.
-Phase 7's subquery scratch is deliberately NOT banked here — subqueries
-stay pre-resolved at depth 0 (their existing design), and a nested
-branch containing its own subquery is rejected in v1 rather than
-speculatively supported. This phase ships with an internal-only test
-(a nested `dispatch_stmt` call proving the outer statement survives)
-and changes zero observable behavior.
+**Findings addendum (as built).** Landed exactly as scoped, via macro
+indirection rather than threading a bank index through every call site.
+`g_stmt_scratch`, `g_select_scratch`, `g_join_scratch_b`, `g_agg_buckets`,
+and `g_join_probe_pred` each became a `_bank[SQL_EXEC_MAX_DEPTH]` array
+sitting behind an object-like macro of the buffer's OLD name (e.g.
+`#define g_select_scratch (g_select_scratch_bank[g_exec_depth])`) — every
+existing reference throughout the file, dozens of them across
+`exec_select`/`join_materialize`/`exec_select_group`, kept compiling
+completely unchanged, since `g_select_scratch[i]` textually becomes
+`g_select_scratch_bank[g_exec_depth][i]`, still a valid expression. A
+grep for local variables/parameters shadowing any of the five names
+confirmed this was safe before writing it. `SQL_EXEC_MAX_DEPTH` is 2:
+depth 0 is the top-level statement, depth 1 is one nested statement
+inside it. `sql_exec_depth_enter()`/`sql_exec_depth_leave()` (both
+static, internal) are the pair a future nested caller must use
+symmetrically; entering a third level returns 0 and sets the new
+`SQL_ERR_NESTING_TOO_DEEP` (`sql_exec.h`) rather than wrapping around and
+reusing bank[1] while it's still live.
+
+`g_join_matched_ids` (Query-Surface Phase 2's RIGHT/FULL anti-pass set)
+was deliberately left unbanked alongside the subquery scratch the
+original scope already named — it's entirely populated and consumed
+within one synchronous join step, never live across a recursive
+dispatch call, so banking it would add BSS cost for a hazard that
+doesn't exist. `dispatch_stmt()` itself needed zero changes: it already
+took its statement via a pointer parameter rather than touching
+`g_stmt_scratch` directly, so depth management lives entirely at the
+call boundary (whoever recurses into `sql_execute_tx()`/`dispatch_stmt()`
+calls `sql_exec_depth_enter()` first), not inside the dispatcher.
+
+Since Phase 3 has no real production nested-call site yet (that's Phase
+4's UNION), the internal-only test needed its own entry point to drive
+real nesting through these statics: `sql_exec_test_phase3_nesting()` and
+`sql_exec_test_phase3_depth_exceeded()`, both non-static but declared in
+sql_exec.h under an explicit "TEST-ONLY, not part of the public SQL
+surface" header — no shell/HTTP/syscall path reaches either. The nesting
+test parses an outer statement into bank[0], snapshots its kind and FROM
+table name, runs a wholly unrelated statement to full completion at
+depth 1, returns to depth 0, verifies the snapshot survived byte-for-byte,
+and only then dispatches the outer statement for real — so the test
+checks actual correct query output, not just "didn't crash."
+
+**Verification.** New `sql_exec_depth_phase3_host_test.c`, 14 checks.
+Scenario 1: a JOIN+GROUP BY outer statement (exercising
+`g_select_scratch`/`g_join_scratch_b`/`g_join_probe_pred`/`g_agg_buckets`
+together) survives an unrelated plain SELECT running to completion at
+depth 1 in between parse and dispatch — verified via the outer's actual
+fetched rows (`COUNT(*)` per group), not just its row count. Scenario 2:
+roles swapped, proving the banking isn't order-dependent. Scenario 3:
+a third nesting level is rejected with `SQL_ERR_NESTING_TOO_DEEP`.
+Scenario 4: an ordinary top-level query still works right after the
+depth-exceeded probe, proving no leaked depth state. Scenario 5: plain
+single-level dispatch (the overwhelming majority of all existing
+queries) is unaffected — same JOIN+GROUP BY query, no nesting touched,
+byte-identical result. Full regression sweep: 44/44 (43 prior + this new
+file); `sql_exec.c` and `sql_exec.h` both clean under the `-I`-flagged
+and zero-flag (`-ffreestanding`, matching `X86_CFLAGS`) compile-check
+styles. Zero observable behavior change to any existing single-level
+query, confirmed by the full suite staying green with no other test
+file touched.
+
+**Original scope (as planned).** A single explicit nesting depth counter
+and depth-indexed banks (size 2) for exactly the scratch a nested SELECT
+touches: `g_stmt_scratch`, the select/join ping-pong buffers,
+`g_agg_buckets`, `g_join_probe_pred`. ~2× BSS cost of those statics
+(~100KB-class, cheap against the existing budget — `RowJournalEntry`
+alone spends 130KB); depth >2 fails loud with a distinct error, never
+recurses silently. Phase 7's subquery scratch is deliberately NOT banked
+here — subqueries stay pre-resolved at depth 0 (their existing design),
+and a nested branch containing its own subquery is rejected in v1 rather
+than speculatively supported. This phase ships with an internal-only
+test (a nested `dispatch_stmt` call proving the outer statement
+survives) and changes zero observable behavior.
 
 ### Phase 4 — UNION / UNION ALL / INTERSECT / EXCEPT — depends on Phase 3
 
@@ -302,7 +363,7 @@ which Phase 1 makes aggregatable).
 
 Phases 1 and 2 first, in either order — both are self-contained executor
 work with no reentrancy dependency, and each closes a named Gap-Analysis
-item outright. **Both are now DONE.** Phase 3 next (pure groundwork). Phases 4 and 5 follow in
+item outright. **All three (1, 2, 3) are now DONE.** Phases 4 and 5 follow in
 either order (both depend only on 3); Phase 6 after 5 (shares its
 resolve hook). Phase 7 deliberately unscheduled — revisit after 4-6 land
 and real usage shows what's still missing.

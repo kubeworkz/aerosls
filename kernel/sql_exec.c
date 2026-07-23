@@ -67,6 +67,78 @@ static int se_strcmp(const char* a, const char* b) {
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
 }
 
+// ─── Query-Surface Roadmap Phase 3: depth-indexed scratch banking ─────────
+// This whole file has always been "non-reentrant for now" (see the note on
+// g_stmt_scratch below) -- every per-query static scratch buffer is a
+// single instance, safe only because nothing ever recursively calls back
+// into dispatch_stmt() while an outer call is still mid-use of its own
+// buffers. Phase 4's UNION right branch, and Phase 5/6's view/CTE
+// expansion, are all about to need exactly that recursive call (run a
+// nested SELECT to a materialized result while the outer statement's own
+// materialization is still needed for the merge/substitution step) -- this
+// section is the enabler, landed on its own with zero observable behavior
+// change so those phases have somewhere real to plug into.
+//
+// The fix is depth-indexed banking, not a bigger single buffer: g_exec_depth
+// tracks which of exactly 2 banked slots is "live" for whoever is currently
+// executing (0 = the top-level statement, 1 = one nested statement inside
+// it). Each banked buffer keeps its original name as an object-like macro
+// expanding to `_bank[g_exec_depth]` -- every existing reference throughout
+// this file (there are dozens, across exec_select/join_materialize/
+// exec_select_group/dispatch_stmt) keeps working completely unchanged,
+// because `g_select_scratch[i]` textually becomes
+// `g_select_scratch_bank[g_exec_depth][i]`, still a valid expression. This
+// is a deliberate, narrow use of macro-shadowing specifically because
+// rewriting every call site to thread a bank index through dozens of
+// function signatures would be a much larger, much riskier diff for the
+// exact same result.
+//
+// Banked here: g_stmt_scratch, g_select_scratch, g_join_scratch_b,
+// g_agg_buckets, g_join_probe_pred -- the scope the roadmap names
+// explicitly. Deliberately NOT banked: g_subquery_stmt_scratch/
+// g_subquery_result_text (Phase 7's subquery machinery resolves fully at
+// the top of dispatch_stmt(), before any nested exec runs -- there is no
+// window where it's live across a recursive dispatch_stmt() call, so
+// banking it would add BSS cost for a hazard that doesn't exist); and
+// g_join_matched_ids (Query-Surface Phase 2's RIGHT/FULL anti-pass set,
+// entirely populated and consumed within one synchronous join step of
+// join_materialize() -- a JOIN's ON/WHERE clauses never themselves invoke
+// nested statement dispatch, so it's never live across a recursive call
+// either, same reasoning as the subquery scratch).
+//
+// sql_exec_depth_enter()/_leave() are the pair a future nested caller
+// (Phase 4's UNION, Phase 5/6's view/CTE expansion) must use symmetrically
+// around its own recursive dispatch_stmt() call -- enter before, leave
+// after, exactly like the internal reentrancy test below does manually
+// (Phase 3 adds no real nested call site of its own; that's Phase 4+).
+// SQL_EXEC_MAX_DEPTH banked slots means depths 0 and 1 are valid; a would-be
+// depth-2 call fails loud via SQL_ERR_NESTING_TOO_DEEP rather than silently
+// wrapping around and reusing depth-1's still-in-progress buffers out from
+// under it -- the same "denial looks like absence" bug class this project
+// names every time a near-miss of it is found, avoided here by construction
+// before any real caller exists to trigger it.
+#define SQL_EXEC_MAX_DEPTH 2
+static uint32_t g_exec_depth = 0;
+
+// Returns 1 and increments g_exec_depth on success; returns 0 (out->error/
+// error_msg already set to SQL_ERR_NESTING_TOO_DEEP) if no banked slot is
+// left. Callers MUST pair a successful enter with exactly one
+// sql_exec_depth_leave() call, including on every early-return error path
+// after entering -- same discipline this file already applies to
+// txn_id/cursor lifetimes elsewhere.
+static int sql_exec_depth_enter(struct SqlResult* out) {
+    if (g_exec_depth + 1 >= SQL_EXEC_MAX_DEPTH) {
+        out->error = SQL_ERR_NESTING_TOO_DEEP;
+        se_strcpy(out->error_msg, "SQL statement nesting too deep (max 1 level of nested SELECT)", SQL_ERR_MSG_LEN);
+        return 0;
+    }
+    g_exec_depth++;
+    return 1;
+}
+static void sql_exec_depth_leave(void) {
+    g_exec_depth--;
+}
+
 // ─── Phase 1 (SQL Feature-Parity Roadmap): number-to-string formatting for
 // aggregate results (COUNT/SUM/AVG) -- RowValues is text-in/text-out
 // throughout this codebase (see rowstore.h), so a computed aggregate needs
@@ -333,7 +405,11 @@ static SqlErrorCode map_mvcc_err(MvccError e) {
 // makes below. This is a real, documented consequence of Phase 21 (real
 // concurrency control) not existing yet, not an oversight: nothing in this
 // project's row-set path is safe under concurrent execution today.
-static struct RowValues g_select_scratch[CURSOR_MAX_ROWSET_ROWS];
+// Query-Surface Roadmap Phase 3: banked (see the depth-indexed scratch
+// banking note above) so a nested SELECT at depth 1 gets its own
+// materialization buffer instead of overwriting the outer statement's.
+static struct RowValues g_select_scratch_bank[SQL_EXEC_MAX_DEPTH][CURSOR_MAX_ROWSET_ROWS];
+#define g_select_scratch (g_select_scratch_bank[g_exec_depth])
 
 // ─── Phase 1 (SQL Feature-Parity Roadmap): GROUP BY / aggregate buckets ────
 // A fresh implementation over real RowValues rows -- NOT a call into
@@ -356,7 +432,10 @@ struct sql_agg_bucket {
     char     min_val[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
     char     max_val[ROWSTORE_MAX_COLUMNS][RECORD_VAL_LEN];
 };
-static struct sql_agg_bucket g_agg_buckets[SQL_MAX_GROUPS];
+// Query-Surface Roadmap Phase 3: banked, same reasoning as
+// g_select_scratch above.
+static struct sql_agg_bucket g_agg_buckets_bank[SQL_EXEC_MAX_DEPTH][SQL_MAX_GROUPS];
+#define g_agg_buckets (g_agg_buckets_bank[g_exec_depth])
 
 static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
@@ -480,7 +559,10 @@ static void fill_join_null_pad(struct RowValues* row, uint32_t start, uint32_t c
 // above. Reused/reinitialized per call via predicate_init(), safe since
 // execution is single-threaded/non-reentrant throughout this file already
 // (see the notes above).
-static struct Predicate g_join_probe_pred;
+// Query-Surface Roadmap Phase 3: banked, same reasoning as g_select_scratch
+// above.
+static struct Predicate g_join_probe_pred_bank[SQL_EXEC_MAX_DEPTH];
+#define g_join_probe_pred (g_join_probe_pred_bank[g_exec_depth])
 
 // Phase 2: the chain's second scratch buffer -- ping-pongs against
 // g_select_scratch across JOIN steps (step 0 reads the FROM table's rows
@@ -488,7 +570,10 @@ static struct Predicate g_join_probe_pred;
 // and writes back into g_select_scratch, and so on), so no step ever reads
 // and writes the same buffer at once. Static for the same reason every
 // other per-query scratch buffer in this file is (see the notes above).
-static struct RowValues g_join_scratch_b[CURSOR_MAX_ROWSET_ROWS];
+// Query-Surface Roadmap Phase 3: banked, same reasoning as g_select_scratch
+// above.
+static struct RowValues g_join_scratch_b_bank[SQL_EXEC_MAX_DEPTH][CURSOR_MAX_ROWSET_ROWS];
+#define g_join_scratch_b (g_join_scratch_b_bank[g_exec_depth])
 
 struct join_from_collect_ctx {
     struct RowValues* out;
@@ -1993,7 +2078,17 @@ static int resolve_predicate_subqueries(uint64_t txn_id, uint32_t caller_uid, st
 // stack-local: struct SqlStatement embeds a struct Predicate (32 nodes x a
 // 256-byte literal each), several KB on its own -- too large to put on a
 // freestanding kernel's stack repeatedly, same reasoning, same tradeoff.
-static struct SqlStatement g_stmt_scratch;
+// Query-Surface Roadmap Phase 3: banked -- this is the one that matters
+// most. sql_execute_tx() parses into g_stmt_scratch and hands dispatch_stmt()
+// a POINTER into it; every exec_* function reads through that pointer for
+// the statement's whole execution. A future nested sql_execute_tx() call
+// (made from inside an exec_* function at depth 0, e.g. Phase 4's UNION
+// running its right branch) reparsing into an unbanked single instance
+// would corrupt the outer statement's own still-in-use fields out from
+// under its own live pointer -- banked, the nested call's parse lands in
+// bank[1] while the outer's pointer keeps referencing bank[0] untouched.
+static struct SqlStatement g_stmt_scratch_bank[SQL_EXEC_MAX_DEPTH];
+#define g_stmt_scratch (g_stmt_scratch_bank[g_exec_depth])
 
 // Runs ONE already-parsed statement against an already-open txn_id -- the
 // shared core both sql_execute() (autocommit) and sql_execute_tx()
@@ -2067,6 +2162,85 @@ int sql_execute_tx(uint64_t txn_id, uint32_t caller_uid, const char* sql_text, s
 
     dispatch_stmt(txn_id, caller_uid, &g_stmt_scratch, out);
     return out->error == SQL_ERR_NONE ? 0 : 1;
+}
+
+// Query-Surface Roadmap Phase 3: internal-only proof of the depth-indexed
+// banking above, called by tests/sql_exec_depth_phase3_host_test.c. NOT
+// part of the public SQL surface -- no shell/HTTP/syscall entry point
+// reaches this, and it exists purely so a host test can drive real
+// nesting through the actual static internals (g_stmt_scratch,
+// dispatch_stmt(), g_exec_depth) that a black-box caller of sql_execute()/
+// sql_execute_tx() alone could never reach or corrupt on purpose.
+//
+// Parses `outer_sql` into depth 0's g_stmt_scratch bank and snapshots two
+// representative fields (kind, FROM table name) BEFORE any nested work --
+// then, still at depth 0 with the outer statement parsed but not yet
+// dispatched, enters depth 1 and runs `inner_sql` to full completion via
+// an entirely ordinary sql_execute_tx() call (its own parse, its own
+// dispatch, its own cursor) -- exactly the shape a future Phase 4 UNION
+// right branch or Phase 5/6 view/CTE expansion will use. Leaves depth 1,
+// re-checks the outer snapshot survived byte-for-byte, and only THEN
+// dispatches the outer statement for real -- so the caller's `outer_out`
+// reflects the outer statement's true, uncorrupted result, not just a
+// "didn't crash" signal.
+//
+// Returns 1 if the outer statement's own execution succeeded (SQL_ERR_NONE)
+// AND its pre/post-nesting snapshot matched; 0 otherwise, with the specific
+// failure already recorded in whichever of outer_out/inner_out caused it
+// (parse failure, depth-enter failure, snapshot mismatch, or the outer
+// statement's own dispatch error).
+int sql_exec_test_phase3_nesting(uint64_t txn_id, uint32_t caller_uid,
+                                  const char* outer_sql, const char* inner_sql,
+                                  struct SqlResult* outer_out, struct SqlResult* inner_out) {
+    se_memset(outer_out, 0, sizeof(*outer_out));
+    se_memset(inner_out, 0, sizeof(*inner_out));
+
+    char err[SQL_ERR_MSG_LEN];
+    if (sql_parse(outer_sql, &g_stmt_scratch, err, sizeof(err)) != 0) {
+        outer_out->kind  = SQL_STMT_INVALID;
+        outer_out->error = SQL_ERR_PARSE;
+        se_strcpy(outer_out->error_msg, err, SQL_ERR_MSG_LEN);
+        return 0;
+    }
+    SqlStmtKind outer_kind_before = g_stmt_scratch.kind;
+    char outer_table_before[OBJECT_NAME_LEN];
+    se_strcpy(outer_table_before, g_stmt_scratch.u.select.table_name, OBJECT_NAME_LEN);
+
+    if (!sql_exec_depth_enter(outer_out)) return 0;
+    sql_execute_tx(txn_id, caller_uid, inner_sql, inner_out);
+    sql_exec_depth_leave();
+
+    // Back at depth 0 -- g_stmt_scratch macro-resolves to bank[0] again.
+    // Prove it's untouched before trusting it for the real dispatch below.
+    if (g_stmt_scratch.kind != outer_kind_before ||
+        !se_streq(g_stmt_scratch.u.select.table_name, outer_table_before)) {
+        outer_out->error = SQL_ERR_INTERNAL;
+        se_strcpy(outer_out->error_msg,
+                  "Phase 3 banking failed: outer g_stmt_scratch was corrupted by the nested call",
+                  SQL_ERR_MSG_LEN);
+        return 0;
+    }
+
+    dispatch_stmt(txn_id, caller_uid, &g_stmt_scratch, outer_out);
+    return outer_out->error == SQL_ERR_NONE;
+}
+
+// Companion to sql_exec_test_phase3_nesting() above: proves the fail-loud
+// path directly -- entering a second nested level (depth 1 -> 2) must be
+// rejected with SQL_ERR_NESTING_TOO_DEEP, not silently wrap around and
+// reuse bank[1] while it's still the live "depth 1" bank. Always leaves
+// depth back at 0 before returning, regardless of outcome, so it's safe to
+// call from a test without leaking depth state into later checks.
+int sql_exec_test_phase3_depth_exceeded(struct SqlResult* scratch_out) {
+    struct SqlResult r1, r2;
+    se_memset(&r1, 0, sizeof(r1));
+    se_memset(&r2, 0, sizeof(r2));
+    int enter1 = sql_exec_depth_enter(&r1);   // depth 0 -> 1, should succeed
+    int enter2 = sql_exec_depth_enter(&r2);   // depth 1 -> 2, should fail
+    if (enter2) sql_exec_depth_leave();       // unwind if it unexpectedly succeeded
+    if (enter1) sql_exec_depth_leave();       // unwind the first enter
+    if (scratch_out) *scratch_out = r2;
+    return enter1 && !enter2 && r2.error == SQL_ERR_NESTING_TOO_DEEP;
 }
 
 int sql_execute(uint32_t caller_uid, const char* sql_text, struct SqlResult* out) {

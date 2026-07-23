@@ -213,6 +213,13 @@ typedef enum {
     // SqlErrorCode plus a descriptive message rather than growing a new
     // SqlErrorCode value per underlying function's every return code.
     SQL_ERR_DDL_FAILED,
+    // Query-Surface Roadmap Phase 3: dispatch_stmt() recursed past the
+    // depth-indexed scratch banks it has room for (2: depth 0 = the
+    // top-level statement, depth 1 = one nested statement inside it --
+    // Phase 4's UNION right branch, Phase 5/6's view/CTE expansion). Fails
+    // loud here rather than letting a would-be depth-2 caller silently
+    // reuse depth-1's still-in-progress buffers out from under it.
+    SQL_ERR_NESTING_TOO_DEEP,
     SQL_ERR_INTERNAL,
 } SqlErrorCode;
 
@@ -267,6 +274,20 @@ int      sql_tx_rollback(uint64_t txn_id, uint32_t caller_uid);
 // caller decides whether to retry the statement or abandon the whole
 // transaction via sql_tx_rollback().
 int sql_execute_tx(uint64_t txn_id, uint32_t caller_uid, const char* sql_text, struct SqlResult* out);
+
+// ─── Query-Surface Roadmap Phase 3: TEST-ONLY, not part of the public SQL
+// surface -- no shell/HTTP/syscall entry point calls either of these.
+// Declared here only so tests/sql_exec_depth_phase3_host_test.c (linking
+// the real sql_exec.c, not a reimplementation) can drive real nesting
+// through the depth-indexed scratch banking (g_stmt_scratch/
+// g_select_scratch/g_join_scratch_b/g_agg_buckets/g_join_probe_pred) that
+// a black-box caller of sql_execute()/sql_execute_tx() alone has no way to
+// exercise or corrupt on purpose. See sql_exec.c's own header comments on
+// each for exactly what they prove. ─────────────────────────────────────
+int sql_exec_test_phase3_nesting(uint64_t txn_id, uint32_t caller_uid,
+                                  const char* outer_sql, const char* inner_sql,
+                                  struct SqlResult* outer_out, struct SqlResult* inner_out);
+int sql_exec_test_phase3_depth_exceeded(struct SqlResult* scratch_out);
 
 // --- Phase 22: syscall surface ----------------------------------------------
 // SYS_SLS_SQL_EXECUTE (220) -- the first live, dispatch-reachable entry
