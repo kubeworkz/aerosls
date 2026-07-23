@@ -112,9 +112,10 @@ struct SLSDatabaseEntry {
 // stays valid even if nothing else references the name again, and (per
 // §1.2's own bump-id reasoning) a DROP+recreate under the same name never
 // silently reattaches an old grant to the new database, since the new
-// database gets a genuinely different id. Grant-only in this phase (no
-// revoke), matching authlist.c/group_profile.c's own current posture --
-// named in the roadmap doc's §1.9 rather than silently omitted.
+// database gets a genuinely different id. Originally grant-only (§1.9);
+// Database Gap Analysis §2.1 closed that: database_revoke_uid()/
+// database_revoke_group() below remove a grantee, deactivating the whole
+// grant entry when its last grantee (either kind) is removed.
 struct SLSDatabaseGrant {
     uint32_t database_id;
     uint32_t perm_mask;
@@ -174,6 +175,31 @@ uint32_t database_find_id(const char* name);
 int database_grant_uid(const char* db_name, uint32_t uid, uint32_t perm_mask);
 int database_grant_group(const char* db_name, const char* group_name, uint32_t perm_mask);
 
+// ─── Revoke (Database Gap Analysis §2.1) ────────────────────────────────────
+// The removal half §1.9 originally deferred. Same no-caller-gate posture as
+// the grant functions above (and for the same reason -- a future Terminal/
+// HTTP-level role gate is the right place for that restriction, applied to
+// grant and revoke together, not one before the other).
+//
+// Removes uid/group_name from the database's grant entry, compacting the
+// grantee array in place (order preserved -- a shift, not a swap-with-last,
+// so `database list`-style output stays stable). When the LAST grantee of
+// either kind is removed, the whole grant entry is deactivated -- an empty
+// grant with a lingering stale perm_mask would otherwise silently spring
+// back to life with old permissions on the next grant call (find_or_create
+// reuses the entry in place). The shared per-database perm_mask itself is
+// NOT narrowed by a revoke -- that's §1.4's one-mask-per-database design,
+// unchanged here (gap doc §2.1 names it as the deeper, separate limit).
+//
+// Return codes:
+//   0 = success
+//   1 = db_name not found (not a real, active database)
+//   2 = no grant entry exists for this database, or uid/group_name is not
+//       currently a grantee of it -- "nothing to revoke" is reported
+//       distinctly, not collapsed into success
+int database_revoke_uid(const char* db_name, uint32_t uid);
+int database_revoke_group(const char* db_name, const char* group_name);
+
 // Returns 1 if uid is granted needed_perm on database_id via ANY active
 // database grant -- either as a direct grantee, or as a member of one of
 // the grant's grantee groups (via group_contains_uid()). Returns 0 if
@@ -206,6 +232,11 @@ int database_check_access(uint32_t uid, uint32_t database_id, uint32_t needed_pe
 #define SYS_SLS_DATABASE_GRANT_UID  263
 #define SYS_SLS_DATABASE_GRANT_GROUP 264
 #define SYS_SLS_DATABASE_CHECK      265
+// Database Gap Analysis §2.1: revoke (266-267, next free after 265 --
+// reconfirmed by a fresh grep across every SYS_SLS_* define, per this
+// codebase's own numbering convention).
+#define SYS_SLS_DATABASE_REVOKE_UID   266
+#define SYS_SLS_DATABASE_REVOKE_GROUP 267
 
 struct SLSDatabaseCreateRequest {
     char     name[DATABASE_NAME_LEN];
@@ -227,6 +258,19 @@ struct SLSDatabaseGrantGroupRequest {
     char     db_name[DATABASE_NAME_LEN];
     char     group_name[GROUP_NAME_LEN];
     uint32_t perm_mask;
+};
+
+// Database Gap Analysis §2.1: revoke requests -- the grant requests minus
+// perm_mask (a revoke removes the grantee outright; there is no partial-
+// permission revoke under §1.4's one-shared-mask-per-database design).
+struct SLSDatabaseRevokeUidRequest {
+    char     db_name[DATABASE_NAME_LEN];
+    uint32_t uid;
+};
+
+struct SLSDatabaseRevokeGroupRequest {
+    char     db_name[DATABASE_NAME_LEN];
+    char     group_name[GROUP_NAME_LEN];
 };
 
 // Takes a database NAME (not a raw database_id) -- an operator asking
@@ -255,5 +299,7 @@ uint64_t sys_sls_database_drop(struct SLSDatabaseDropRequest* req);
 uint64_t sys_sls_database_grant_uid(struct SLSDatabaseGrantUidRequest* req);
 uint64_t sys_sls_database_grant_group(struct SLSDatabaseGrantGroupRequest* req);
 uint64_t sys_sls_database_check(struct SLSDatabaseCheckRequest* req);
+uint64_t sys_sls_database_revoke_uid(struct SLSDatabaseRevokeUidRequest* req);     // Database Gap Analysis §2.1
+uint64_t sys_sls_database_revoke_group(struct SLSDatabaseRevokeGroupRequest* req); // Database Gap Analysis §2.1
 
 #endif /* DATABASE_H */

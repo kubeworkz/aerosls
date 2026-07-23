@@ -415,6 +415,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_database_grant_uid((struct SLSDatabaseGrantUidRequest*)arg);
     case SYS_SLS_DATABASE_GRANT_GROUP:
         return sys_sls_database_grant_group((struct SLSDatabaseGrantGroupRequest*)arg);
+    // ── Database Gap Analysis §2.1: revoke (266-267) ─────────────────────
+    case SYS_SLS_DATABASE_REVOKE_UID:
+        return sys_sls_database_revoke_uid((struct SLSDatabaseRevokeUidRequest*)arg);
+    case SYS_SLS_DATABASE_REVOKE_GROUP:
+        return sys_sls_database_revoke_group((struct SLSDatabaseRevokeGroupRequest*)arg);
     case SYS_SLS_DATABASE_CHECK:
         return sys_sls_database_check((struct SLSDatabaseCheckRequest*)arg);
 

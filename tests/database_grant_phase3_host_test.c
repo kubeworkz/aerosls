@@ -199,6 +199,45 @@ int main(void) {
     CHECK(security_audit_log_count == audit_count_before + 1,
           "s6: this denial was logged to the real security audit trail");
 
+    /* ── Scenario 7 (Database Gap Analysis §2.1): REVOKE -- the removal
+     * half §1.9 originally deferred, exercised against the exact grant
+     * state scenarios 1-4 built up (uid 5000 + group 'finance_readers'
+     * both grantees of 'reports'). ─────────────────────────────────────────── */
+    CHECK(database_revoke_uid("reports", 5000) == 0,
+          "s7: database_revoke_uid() removes uid 5000 from 'reports'");
+    CHECK(catalog_check_access(5000, "sales_2024", PERM_READ) == 0,
+          "s7: uid 5000 is DENIED on 'sales_2024' immediately after the revoke -- access genuinely gone");
+    CHECK(catalog_check_access(6000, "sales_2024", PERM_READ) == 1,
+          "s7: uid 6000 (via the grantee group) is completely unaffected by 5000's revoke -- scoped removal, not a grant wipe");
+    CHECK(database_revoke_uid("reports", 5000) == 2,
+          "s7: revoking the same uid again reports 'nothing to revoke' (rc=2), not silent success");
+    CHECK(database_revoke_uid("no_such_db", 5000) == 1,
+          "s7: revoking on an unknown database name fails cleanly (rc=1)");
+    CHECK(database_revoke_group("reports", "no_such_group") == 2,
+          "s7: revoking a group that was never a grantee reports rc=2");
+
+    /* ── Scenario 8 (§2.1): revoking the LAST grantee deactivates the
+     * whole grant entry -- so a later re-grant starts fresh instead of
+     * silently resurrecting the old entry's stale perm_mask. ──────────────── */
+    CHECK(database_revoke_group("reports", "finance_readers") == 0,
+          "s8: database_revoke_group() removes the last remaining grantee");
+    CHECK(catalog_check_access(6000, "sales_2024", PERM_READ) == 0,
+          "s8: uid 6000 is now denied too -- no grantees remain");
+    {
+        uint32_t reports_dbid = database_find_id("reports");
+        int any_active_grant = 0;
+        for (uint32_t i = 0; i < DATABASE_GRANT_MAX; i++)
+            if (database_grants[i].active && database_grants[i].database_id == reports_dbid)
+                any_active_grant = 1;
+        CHECK(!any_active_grant,
+              "s8: the grant entry itself was deactivated when its last grantee left -- no stale perm_mask lingers");
+    }
+    CHECK(database_grant_uid("reports", 7000, PERM_WRITE) == 0 &&
+          catalog_check_access(7000, "sales_2024", PERM_WRITE) == 1,
+          "s8: a fresh grant after full revocation works from a clean slate (WRITE granted and honored)");
+    CHECK(catalog_check_access(5000, "sales_2024", PERM_READ) == 0,
+          "s8: and the long-revoked uid 5000 did NOT come back with it");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

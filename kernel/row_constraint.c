@@ -116,7 +116,21 @@ static RowConstraintResult rc_add(RowConstraintKind kind, const char* table_name
     uint32_t col = rc_find_column_index(layout, column_name);
     if (col == 0xFFFFFFFFu) return ROW_CONSTRAINT_ERR_COLUMN_NOT_FOUND;
 
-    if (row_constraint_count >= ROW_CONSTRAINT_MAX) return ROW_CONSTRAINT_ERR_POOL_FULL;
+    // Database Gap Analysis §3.1: find-free-slot-first, not bump-only.
+    // rowstore_drop_table() deactivates a dropped table's constraint
+    // entries in place, but this function previously only ever appended at
+    // row_constraint_count++ -- so deactivated slots leaked permanently
+    // and repeated create-with-constraints/drop cycles exhausted the pool
+    // until reboot. Now scans for the first inactive slot exactly the way
+    // row_index_create() always has for row_indexes[]; row_constraint_
+    // count stays a high-water mark (every iteration loop in this file
+    // bounds on it, and persist_row_constraints() stores it), only growing
+    // when a genuinely fresh slot past it is taken.
+    int slot = -1;
+    for (uint32_t i = 0; i < ROW_CONSTRAINT_MAX; i++) {
+        if (!row_constraints[i].active) { slot = (int)i; break; }
+    }
+    if (slot < 0) return ROW_CONSTRAINT_ERR_POOL_FULL;
 
     uint64_t ref_table_object_id = 0;
     uint32_t ref_col = 0;
@@ -141,7 +155,8 @@ static RowConstraintResult rc_add(RowConstraintKind kind, const char* table_name
         if (fail) return ROW_CONSTRAINT_ERR_RANGE_INVALID;
     }
 
-    struct RowConstraintDef* c = &row_constraints[row_constraint_count++];
+    struct RowConstraintDef* c = &row_constraints[slot];
+    if ((uint32_t)(slot + 1) > row_constraint_count) row_constraint_count = (uint32_t)(slot + 1);
     c->active = 1;
     c->kind = kind;
     c->table_object_id = object_catalog[tidx].object_id;

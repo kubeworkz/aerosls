@@ -250,6 +250,78 @@ int database_grant_group(const char* db_name, const char* group_name, uint32_t p
     return 0;
 }
 
+// ─── Revoke (Database Gap Analysis §2.1) ────────────────────────────────
+// See database.h's own comment block for the full semantics (compact-in-
+// place, deactivate-on-last-grantee, shared perm_mask untouched).
+
+// Shared tail for both revoke functions: deactivate the grant entry if
+// its last grantee of either kind was just removed, then persist. A
+// deactivated entry's slot is reusable by find_or_create_grant()'s
+// existing !active scan -- no new reclaim mechanism needed.
+static void db_revoke_finish(struct SLSDatabaseGrant* g, const char* db_name) {
+    if (g->grantee_uid_count == 0 && g->grantee_group_count == 0) {
+        g->active = 0;
+        kernel_serial_printf(
+            "[DATABASE] '%s': last grantee revoked -- grant entry deactivated "
+            "(a future grant starts fresh, no stale perm_mask lingers).\n", db_name);
+    }
+    persist_databases();   // Database Gap Analysis §1
+}
+
+int database_revoke_uid(const char* db_name, uint32_t uid) {
+    int db_idx = find_database_idx(db_name);
+    if (db_idx < 0) {
+        kernel_serial_printf("[DATABASE] ERROR: database '%s' not found.\n", db_name);
+        return 1;
+    }
+    int gidx = find_grant_idx(databases[db_idx].database_id);
+    if (gidx < 0) {
+        kernel_serial_printf("[DATABASE] '%s': no grant entry exists -- nothing to revoke.\n", db_name);
+        return 2;
+    }
+    struct SLSDatabaseGrant* g = &database_grants[gidx];
+
+    for (uint32_t i = 0; i < g->grantee_uid_count; i++) {
+        if (g->grantee_uids[i] != uid) continue;
+        // Order-preserving shift, not swap-with-last -- see database.h.
+        for (uint32_t k = i; k + 1 < g->grantee_uid_count; k++)
+            g->grantee_uids[k] = g->grantee_uids[k + 1];
+        g->grantee_uid_count--;
+        kernel_serial_printf("[DATABASE] '%s': revoked uid %u.\n", db_name, uid);
+        db_revoke_finish(g, db_name);
+        return 0;
+    }
+    kernel_serial_printf("[DATABASE] '%s': uid %u is not a grantee -- nothing to revoke.\n", db_name, uid);
+    return 2;
+}
+
+int database_revoke_group(const char* db_name, const char* group_name) {
+    int db_idx = find_database_idx(db_name);
+    if (db_idx < 0) {
+        kernel_serial_printf("[DATABASE] ERROR: database '%s' not found.\n", db_name);
+        return 1;
+    }
+    int gidx = find_grant_idx(databases[db_idx].database_id);
+    if (gidx < 0) {
+        kernel_serial_printf("[DATABASE] '%s': no grant entry exists -- nothing to revoke.\n", db_name);
+        return 2;
+    }
+    struct SLSDatabaseGrant* g = &database_grants[gidx];
+
+    for (uint32_t i = 0; i < g->grantee_group_count; i++) {
+        if (!db_streq(g->grantee_groups[i], group_name)) continue;
+        for (uint32_t k = i; k + 1 < g->grantee_group_count; k++)
+            db_strncpy(g->grantee_groups[k], g->grantee_groups[k + 1], GROUP_NAME_LEN);
+        g->grantee_group_count--;
+        kernel_serial_printf("[DATABASE] '%s': revoked group '%s'.\n", db_name, group_name);
+        db_revoke_finish(g, db_name);
+        return 0;
+    }
+    kernel_serial_printf("[DATABASE] '%s': group '%s' is not a grantee -- nothing to revoke.\n",
+                         db_name, group_name);
+    return 2;
+}
+
 // ─── database_check_access ──────────────────────────────────────────────
 // Called from catalog_check_access() (object_catalog.c), alongside the
 // group/authlist block, before the GUEST hard-deny -- see roadmap doc
@@ -297,6 +369,19 @@ uint64_t sys_sls_database_grant_uid(struct SLSDatabaseGrantUidRequest* req) {
 uint64_t sys_sls_database_grant_group(struct SLSDatabaseGrantGroupRequest* req) {
     if (!req) return 1;
     return database_grant_group(req->db_name, req->group_name, req->perm_mask) == 0 ? 0 : 1;
+}
+
+// Database Gap Analysis §2.1 -- same 0/1-collapse convention as every
+// other wrapper here; the richer 1/2 distinction stays available to
+// direct C callers of database_revoke_uid()/_group().
+uint64_t sys_sls_database_revoke_uid(struct SLSDatabaseRevokeUidRequest* req) {
+    if (!req) return 1;
+    return database_revoke_uid(req->db_name, req->uid) == 0 ? 0 : 1;
+}
+
+uint64_t sys_sls_database_revoke_group(struct SLSDatabaseRevokeGroupRequest* req) {
+    if (!req) return 1;
+    return database_revoke_group(req->db_name, req->group_name) == 0 ? 0 : 1;
 }
 
 // Resolves db_name -> database_id via database_find_id() (0 if unknown --

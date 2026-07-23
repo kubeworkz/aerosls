@@ -88,13 +88,30 @@ that half is security-layer scope, not this doc's.)
 
 ## 2. Functional gaps a real user hits
 
-**2.1 — No `REVOKE` for database grants (§1.9, deliberate but now the
-sharpest auth gap).** Grants are strictly additive with no removal API at
-any layer — kernel, syscall, HTTP, Terminal, or SQL. Worse, `perm_mask`
-is one shared field per database (every grant call overwrites it for ALL
-grantees), so the only way to narrow one uid's access is to... not exist.
-A `database_revoke_uid/_group()` pair is mechanical to add; the shared-
-perm-mask design (a named simplification) is the deeper limit.
+**2.1 — No `REVOKE` for database grants — CLOSED (Gap 3 remediation, as
+built).** `database_revoke_uid()`/`database_revoke_group()` now exist at
+every layer the grant surface exists at: kernel functions (order-
+preserving in-place compaction; distinct rc=2 "nothing to revoke" rather
+than collapsing into success), syscalls 266-267 + dispatch, and
+`database revoke uid/group` Terminal commands — grants never had an HTTP
+mutation route, so revoke deliberately doesn't either (matching
+surfaces, not exceeding them). Removing the LAST grantee of either kind
+deactivates the whole grant entry, so a later re-grant starts from a
+clean slate instead of silently resurrecting a stale shared `perm_mask`
+(tested explicitly). Revokes persist via Gap 1's `persist_databases()`.
+Verified with 12 new checks in `database_grant_phase3_host_test.c`
+(scenarios 7-8): real revoke through the real `catalog_check_access()`
+chain, scoped removal (co-grantees unaffected), double-revoke and
+unknown-name/group error paths, last-grantee entry deactivation, and
+fresh-grant-after-full-revocation. Found and fixed in passing: both
+pre-existing `database grant uid/group` Terminal commands had prefix-
+length off-by-ones (+20/+22 vs real strlen 19/21) silently eating the
+database name's first character — the exact hand-counted-offset bug
+class `user/shell.c`'s own comments already warned about once. The
+shared one-`perm_mask`-per-database design (§1.4) remains unchanged and
+remains the deeper limit: there is still no per-grantee permission
+narrowing, only whole-grantee removal — a revoke removes you outright.
+The original finding is kept below in §5's ordering for the record.
 
 **2.2 — No SQL `GRANT`/`REVOKE` (§1.5).** Grants are Terminal/HTTP-only.
 Fine as a decision, but combined with 2.1 the full grant lifecycle is
@@ -141,14 +158,21 @@ asymmetry is worth naming as the follow-on to the cascading phase.
 
 ## 3. Capacity & lifecycle limits
 
-**3.1 — Constraint pool slots leak on `DROP TABLE`.** `rowstore_drop_
-table()` deactivates a dropped table's `row_constraints[]` entries, but
-`rc_add()` is a pure bump allocator (`row_constraints[row_constraint_
-count++]`) that never scans for deactivated slots — unlike
-`row_index_create()`, which does reuse free slots (confirmed by direct
-read of both). Repeated create-with-constraints/drop cycles exhaust
-`ROW_CONSTRAINT_MAX` (64) permanently until reboot. One-line-class fix:
-give `rc_add()` the same find-free-slot-first scan its sibling has.
+**3.1 — Constraint pool slots leak on `DROP TABLE` — CLOSED (Gap 2
+remediation, as built).** `rc_add()` now scans `row_constraints[]` for
+the first inactive slot before allocating, exactly the find-free-slot-
+first shape `row_index_create()` always had; `row_constraint_count`
+stays a high-water mark (every iteration loop and `persist_row_
+constraints()` bound on it), growing only when a genuinely fresh slot
+past it is taken. Verified in `row_constraint_journal_host_test.c`
+scenario 18: deactivate a slot in place (byte-for-byte what `rowstore_
+drop_table()`'s cleanup loop does), register a new constraint, assert it
+landed in the reused slot with the count unchanged, and confirm the
+slot-reused constraint genuinely enforces through a real SQL INSERT
+rejection. Original finding, for the record: `rc_add()` was a pure bump
+allocator (`row_constraints[row_constraint_count++]`) that never scanned
+for deactivated slots, so repeated create-with-constraints/drop cycles
+exhausted `ROW_CONSTRAINT_MAX` (64) permanently until reboot.
 
 **3.2 — No constraint removal API at all.** Constraints die only with
 their table. No `ALTER TABLE DROP CONSTRAINT`, no direct-API removal. A
@@ -195,10 +219,12 @@ see 2.1 for where it chafes).
 
 1. **§1 database persistence** — ~~the only silent-corruption-class item~~
    **DONE** (see §1's closure addendum).
-2. **§3.1 constraint slot reuse** — one-line-class fix for a permanent
-   resource leak.
-3. **§2.1 `REVOKE`** (kernel + Terminal/HTTP), with §2.2 SQL grammar
-   optionally riding along.
+2. **§3.1 constraint slot reuse** — **DONE** (see §3.1's closure
+   addendum).
+3. **§2.1 `REVOKE`** — **DONE** (see §2.1's closure addendum). §2.2's
+   SQL `GRANT`/`REVOKE` grammar did NOT ride along — grants stay
+   Terminal-only per §1.5's standing decision, now consistently for both
+   directions.
 4. **§2.3 `ALTER TABLE ... SET DATABASE`** — cheapest functional win.
 5. **§2.8 ON UPDATE FK asymmetry** — at minimum a RESTRICT-style check
    on parent-key updates, closing the silent-orphan hole; full ON UPDATE

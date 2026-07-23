@@ -98,7 +98,9 @@
 #include "rowstore.h"
 
 // ─── Limits ─────────────────────────────────────────────────────────────────
-#define ROW_CONSTRAINT_MAX 64   // total constraints across every row-set table, bump-allocated, no reclaim
+#define ROW_CONSTRAINT_MAX 64   // total constraints across every row-set table. Database Gap Analysis
+                                 // §3.1: registration now reuses slots DROP TABLE deactivated (find-
+                                 // free-slot-first, same as row_indexes[]) -- no longer bump-only/no-reclaim
 #define ROW_CASCADE_MAX_ROWS  64   // child rows one delete may cascade to, per constraint (collect-then-act buffer)
 #define ROW_CASCADE_MAX_DEPTH  8   // FK chain depth before a circular/degenerate chain fails cleanly
 

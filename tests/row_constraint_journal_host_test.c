@@ -510,6 +510,36 @@ int main(void) {
         CHECK(nrows == 0, "s17: the child row was NOT left nulled-out -- statement atomicity held through the failed cascade");
     }
 
+    /* ── Scenario 18 (Database Gap Analysis §3.1): constraint pool slot
+     * reuse. rowstore_drop_table() deactivates a dropped table's
+     * constraint entries in place (rowstore.c literally sets active=0 on
+     * matching rows -- simulated identically here rather than driving a
+     * full DROP TABLE, whose sys_sls_vfree dependency this test stubs);
+     * registration must then REUSE that slot instead of bump-allocating
+     * past it, or repeated create/drop cycles exhaust the 64-slot pool
+     * permanently. Before this fix, rc_add() was bump-only and this
+     * scenario's slot/count assertions would both fail. ─────────────────── */
+    {
+        uint32_t count_before = row_constraint_count;
+        CHECK(count_before >= 2, "s18: at least two constraints registered by earlier scenarios (precondition)");
+
+        /* Deactivate slot 1 in place -- byte-for-byte what rowstore_drop_
+         * table()'s cleanup loop does to a dropped table's entries. */
+        row_constraints[1].active = 0;
+
+        CHECK(row_constraint_add_unique("customers", "name") == ROW_CONSTRAINT_OK,
+              "s18: a new constraint registers successfully after a slot was deactivated");
+        CHECK(row_constraints[1].active == 1 &&
+              row_constraints[1].kind == ROW_CONSTRAINT_UNIQUE &&
+              strcmp(row_constraints[1].table_name, "customers") == 0,
+              "s18: the new constraint REUSED deactivated slot 1 -- not appended past it");
+        CHECK(row_constraint_count == count_before,
+              "s18: row_constraint_count (the high-water mark) did not grow -- the pool no longer leaks on drop/re-create cycles");
+        CHECK(sql_execute(1, "INSERT INTO customers (id, name) VALUES (60, 'globex')", &r) == 1 &&
+              r.error == SQL_ERR_CONSTRAINT_VIOLATION,
+              "s18: the slot-reused UNIQUE constraint genuinely enforces ('globex' survives from s14 -- 'acme' itself was cascade-deleted there)");
+    }
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

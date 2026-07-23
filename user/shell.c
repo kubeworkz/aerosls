@@ -214,6 +214,8 @@ static void print_help(void) {
         "  database list                                list all databases\n"
         "  database grant uid <name> <uid> <perm>      grant a uid access to a database's tables\n"
         "  database grant group <name> <group> <perm>  grant a group access to a database's tables\n"
+        "  database revoke uid <name> <uid>            remove a uid from a database's grant\n"
+        "  database revoke group <name> <group>        remove a group from a database's grant\n"
         "  database check <name> <uid> <perm>          test if a database grant would grant this\n"
         "  -- Security Audit Log (Navigator-Parity Phase 3) --\n"
         "  audit list                        show the security audit trail\n"
@@ -793,7 +795,8 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
 
         // ── Database Namespace & Access Roadmap Phase 4: database grant uid/group ─
         else if (sh_starts(input_buffer, "database grant uid ")) {
-            const char* p = input_buffer + 20;
+            // Off-by-one fixed during Gap Analysis Â§2.1 (revoke) work: prefix strlen is 19, not 20 -- the old +20 ate the db name's first character. Same hand-counting bug class this file already documented once.
+            const char* p = input_buffer + 19;
             struct SLSDatabaseGrantUidRequest req;
             size_t nlen = 0;
             while (p[nlen] && p[nlen] != ' ') nlen++;
@@ -808,7 +811,8 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             else kernel_serial_print("Grant failed (database not found or grantee table full).\n");
         }
         else if (sh_starts(input_buffer, "database grant group ")) {
-            const char* p = input_buffer + 22;
+            // Off-by-one fixed during Gap Analysis Â§2.1 work: strlen is 21, not 22 (see grant uid above).
+            const char* p = input_buffer + 21;
             struct SLSDatabaseGrantGroupRequest req;
             size_t nlen = 0;
             while (p[nlen] && p[nlen] != ' ') nlen++;
@@ -823,6 +827,36 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             if (status == 0) kernel_serial_printf("Database '%s' now grants 0x%02x to group '%s'.\n",
                                                   req.db_name, req.perm_mask, req.group_name);
             else kernel_serial_print("Grant failed (database not found or grantee table full).\n");
+        }
+
+        // ── Database Gap Analysis §2.1: database revoke uid/group ──────────
+        else if (sh_starts(input_buffer, "database revoke uid ")) {
+            const char* p = input_buffer + 20;   /* strlen computed programmatically, per this file's own convention */
+            struct SLSDatabaseRevokeUidRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.db_name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            p = sh_next(p);
+            req.uid = sh_atoi(p);
+            uint64_t status = do_syscall(SYS_SLS_DATABASE_REVOKE_UID, &req);
+            if (status == 0) kernel_serial_printf("Database '%s' no longer grants to uid %u.\n",
+                                                  req.db_name, req.uid);
+            else kernel_serial_print("Revoke failed (database not found, or uid was not a grantee).\n");
+        }
+        else if (sh_starts(input_buffer, "database revoke group ")) {
+            const char* p = input_buffer + 22;   /* strlen computed programmatically */
+            struct SLSDatabaseRevokeGroupRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ') nlen++;
+            sh_copy(req.db_name, p, nlen + 1 < DATABASE_NAME_LEN ? nlen + 1 : DATABASE_NAME_LEN);
+            p = sh_next(p);
+            size_t glen = 0;
+            while (p[glen] && p[glen] != ' ' && p[glen] != '\0') glen++;
+            sh_copy(req.group_name, p, glen + 1 < GROUP_NAME_LEN ? glen + 1 : GROUP_NAME_LEN);
+            uint64_t status = do_syscall(SYS_SLS_DATABASE_REVOKE_GROUP, &req);
+            if (status == 0) kernel_serial_printf("Database '%s' no longer grants to group '%s'.\n",
+                                                  req.db_name, req.group_name);
+            else kernel_serial_print("Revoke failed (database not found, or group was not a grantee).\n");
         }
 
         // ── Database Namespace & Access Roadmap Phase 4: database check <name> <uid> <perm> ─
