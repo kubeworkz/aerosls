@@ -68,6 +68,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/group_profile.c \
               kernel/authlist.c \
               kernel/database.c \
+              kernel/view.c \
               kernel/security_audit.c \
               kernel/msgqueue.c \
               kernel/stubs.c

@@ -12,6 +12,7 @@
 #include "../user/permissions.h"   // Phase 8 follow-on (schema export/import): PERM_READ
 #include "database.h"   // Database Namespace & Access Roadmap Phase 2: CREATE/DROP DATABASE, IN DATABASE tagging
 #include "persist.h"    // Database Gap Analysis §2.3: persist_catalog() after ALTER TABLE ... SET DATABASE retags
+#include "view.h"       // Query-Surface Roadmap Phase 5: CREATE/DROP VIEW, FROM-a-view resolution
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -440,8 +441,33 @@ static struct sql_agg_bucket g_agg_buckets_bank[SQL_EXEC_MAX_DEPTH][SQL_MAX_GROU
 static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 static void exec_select_set_op(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
+static void exec_select_view(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out, int view_idx);
+static void exec_select_cte(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 
 static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    // Query-Surface Roadmap Phase 6: WITH ... AS (...) CTE resolution --
+    // checked FIRST, ahead of set-op/aggregate/JOIN dispatch below AND
+    // ahead of find_table_catalog_index()/view_find_index() further down,
+    // because a CTE must shadow a same-named real TABLE or VIEW (standard
+    // SQL scoping) -- the OPPOSITE precedence from Phase 5's views, which
+    // only ever win as a fallback once a real table lookup has already
+    // failed (see view.h's own namespace-collision note). v1 is exactly
+    // as narrow as views: a CTE may only be the sole FROM source of a
+    // plain query, never combined with a JOIN/aggregates/a set operator
+    // in the SAME statement -- caught here, in ONE place, before any of
+    // those three dispatch away below, which is why (unlike views) there
+    // is no separate "aggregates over a CTE" gap to name: this check
+    // already covers it.
+    if (s->has_cte && se_streq(s->table_name, s->cte_name)) {
+        if (s->has_join || s->has_aggregates || s->has_set_op) {
+            out->error = SQL_ERR_CTE_SCOPE_UNSUPPORTED;
+            se_strcpy(out->error_msg, "a CTE cannot be combined with JOIN, aggregates, or a set operator (v1 scope cut) -- only a plain SELECT ... FROM <cte-name> [WHERE/ORDER BY/LIMIT] is supported", SQL_ERR_MSG_LEN);
+            return;
+        }
+        exec_select_cte(txn_id, caller_uid, s, out);
+        return;
+    }
+
     // Query-Surface Roadmap Phase 4: checked first, ahead of aggregates/
     // JOIN -- a set-op statement's LEFT branch (this same struct, minus
     // has_set_op/has_order_by/has_limit) can itself be a JOIN or aggregate
@@ -452,7 +478,25 @@ static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSe
     if (s->has_join) { exec_select_join(txn_id, caller_uid, s, out); return; }
 
     int tidx = find_table_catalog_index(s->table_name);
-    if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
+    if (tidx < 0) {
+        // Query-Surface Roadmap Phase 5: a real TABLE always wins this
+        // resolution when both a table and a view somehow share a name
+        // (see view.h's own namespace-collision note) -- the view registry
+        // is only ever consulted here, as a fallback, never ahead of
+        // find_table_catalog_index(). has_join/has_aggregates/has_set_op
+        // were already checked and dispatched away above, so this is
+        // exactly the "FROM v [WHERE...] [ORDER BY...] [LIMIT n]" v1 shape
+        // the roadmap doc specs -- a view referenced from a JOIN or under
+        // aggregates never reaches this fallback at all (see
+        // join_materialize()'s own explicit SQL_ERR_VIEW_IN_JOIN_UNSUPPORTED
+        // check, and exec_select_group()'s FROM-table resolution, which
+        // has no such fallback and so still reports plain TABLE_NOT_FOUND
+        // for a view name under GROUP BY -- a real, named gap: "SELECT ...
+        // FROM view GROUP BY ..." isn't supported, only plain queries are).
+        int vidx = view_find_index(s->table_name);
+        if (vidx >= 0) { exec_select_view(txn_id, caller_uid, s, out, vidx); return; }
+        out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return;
+    }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
 
     if (!s->select_all) {
@@ -720,6 +764,340 @@ static void exec_select_set_op(uint64_t txn_id, uint32_t caller_uid, const struc
     for (uint32_t i = 0; i < left_column_count; i++) se_strcpy(out->columns[i], left_columns[i], RECORD_KEY_LEN);
 }
 
+// ─── Query-Surface Roadmap Phase 5: CREATE VIEW / DROP VIEW (query side) ───
+// Not banked, for the same "provably never live across a nested call"
+// reasoning as g_setop_left_scratch/_right_scratch/_merge_scratch just
+// above: every write into g_view_scratch happens strictly AFTER the one
+// nested sql_execute_tx() call this function makes has already returned
+// (sql_exec_depth_leave() runs first), and nothing after that point in
+// this function recurses into dispatch_stmt() again -- predicate_eval()/
+// compare_rows_by_column() are pure functions, not nested statement
+// dispatch.
+static struct RowValues g_view_scratch[CURSOR_MAX_ROWSET_ROWS];
+
+// Executes a view's own stored SELECT at depth+1 (Query-Surface Roadmap
+// Phase 3's banking), then applies THIS statement's own outer
+// projection/WHERE/ORDER BY/LIMIT over the materialized result -- the
+// "capture-and-reparse-at-exec, compose the outer clauses on top" shape
+// the roadmap doc specs for views. `view_idx` is the caller's
+// already-resolved views[] index (exec_select() looked it up via
+// view_find_index() before calling this, so this function never repeats
+// that lookup).
+//
+// Permission: invoker's-rights -- the view's own stored text runs under
+// caller_uid (the CALLER, not views[view_idx].owner_uid, which is never
+// even read here) -- see view.h's own header comment for why this is the
+// simpler, safer first cut.
+//
+// Views of views: NOT specially detected here -- caught for free by the
+// SAME sql_exec_depth_enter() call below. This function's own nested
+// sql_execute_tx() runs the view's body one level deeper than whatever
+// depth exec_select_view() itself was called at; if that body's own FROM
+// also names a view, resolving IT recurses into exec_select_view() again,
+// which needs one level deeper still -- SQL_EXEC_MAX_DEPTH=2 (depths 0
+// and 1 only) refuses that second enter with SQL_ERR_NESTING_TOO_DEEP, a
+// real, loud, named rejection, not a bespoke "views of views" check.
+//
+// Column TYPES for the outer WHERE/ORDER BY are a real, named
+// simplification: the inner SqlResult only reports column NAMES
+// (out->columns[]), never types (see sql_exec.h's own SqlResult comment),
+// so the synthetic outer layout built below types every column as
+// FIELD_TYPE_STRING -- an outer `WHERE age > 30` over a view compares
+// TEXT lexicographically, not numerically. Equality/IN/LIKE/IS NULL and
+// column-name validation are all unaffected (STRING comparison already IS
+// se_strcmp() for those, see compare_typed() above). Exactly the same
+// simplification Query-Surface Roadmap Phase 4's own set-op ORDER BY
+// already accepted, for the same underlying reason: a materialized,
+// re-executed result has no single "true" per-column type once JOINs/
+// aggregates/set-ops/views are in play -- named here, not silently
+// glossed over.
+static void exec_select_view(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out, int view_idx) {
+    char view_sql[VIEW_SQL_TEXT_LEN];
+    se_strcpy(view_sql, views[view_idx].sql_text, VIEW_SQL_TEXT_LEN);
+
+    if (!sql_exec_depth_enter(out)) return;
+    struct SqlResult view_out;
+    se_memset(&view_out, 0, sizeof(view_out));
+    sql_execute_tx(txn_id, caller_uid, view_sql, &view_out);
+    sql_exec_depth_leave();
+
+    if (view_out.error != SQL_ERR_NONE) {
+        // The view's own text failed at THIS exec time -- e.g. a table it
+        // references was dropped after CREATE VIEW's own parse-time check
+        // passed. Propagate the REAL underlying error rather than
+        // wrapping it in a generic one, the same "denial looks like
+        // absence" bug class this project avoids everywhere else
+        // (Query-Surface Roadmap Phase 4's own set-op right-branch
+        // propagation is the direct precedent) -- this is exactly the
+        // roadmap doc's own "view text that no longer parses ... failing
+        // loud at query time" verification case.
+        *out = view_out;
+        return;
+    }
+    if (view_out.kind != SQL_STMT_SELECT) {
+        // Shouldn't happen -- CREATE VIEW's own parse-time validation
+        // already confirmed this text parses as a SELECT; fail closed if
+        // it ever does anyway, same posture as exec_select_set_op()'s
+        // identical check.
+        out->error = SQL_ERR_INTERNAL;
+        se_strcpy(out->error_msg, "internal error: view definition did not re-parse as a SELECT", SQL_ERR_MSG_LEN);
+        cursor_close(view_out.cursor_id);
+        return;
+    }
+
+    // Reuses the same generic row-collection callback exec_select_set_op()
+    // defined above (struct setop_row_ctx/setop_row_collect_cb) -- it's a
+    // plain "copy fetched rows into a caller-supplied buffer" helper with
+    // nothing set-op-specific about it.
+    struct setop_row_ctx ctx;
+    ctx.out = g_view_scratch; ctx.count = 0; ctx.max = CURSOR_MAX_ROWSET_ROWS;
+    cursor_fetch_rows(view_out.cursor_id, CURSOR_MAX_ROWSET_ROWS, setop_row_collect_cb, &ctx);
+    uint32_t n = ctx.count < CURSOR_MAX_ROWSET_ROWS ? ctx.count : CURSOR_MAX_ROWSET_ROWS;
+    uint8_t truncated = (uint8_t)(view_out.truncated || (ctx.count > CURSOR_MAX_ROWSET_ROWS));
+    uint32_t view_column_count = view_out.column_count;
+    char view_columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
+    for (uint32_t i = 0; i < view_column_count; i++) se_strcpy(view_columns[i], view_out.columns[i], RECORD_KEY_LEN);
+    cursor_close(view_out.cursor_id);
+
+    // Synthetic ALL-STRING layout -- see this function's own header
+    // comment above for why. column_offset/row_width/rows_per_page are
+    // left zeroed: nothing below reads them (only column_count/
+    // column_types/column_names are used by find_column_index()/
+    // predicate_columns_valid()/predicate_eval()/compare_rows_by_column()
+    // -- the storage-layout fields are irrelevant to a result set that's
+    // never written back to a table, the same reasoning join_materialize()'s
+    // own synthetic `running` layout already relies on).
+    struct RowTableLayout layout;
+    se_memset(&layout, 0, sizeof(layout));
+    layout.column_count = view_column_count;
+    for (uint32_t i = 0; i < view_column_count; i++) {
+        layout.column_types[i] = FIELD_TYPE_STRING;
+        se_strcpy(layout.column_names[i], view_columns[i], RECORD_KEY_LEN);
+    }
+
+    if (!s->select_all) {
+        for (uint32_t i = 0; i < s->column_count; i++) {
+            if (find_column_index(&layout, s->columns[i]) == 0xFFFFFFFFu) {
+                out->error = SQL_ERR_COLUMN_NOT_FOUND;
+                se_strcpy(out->error_msg, "SELECT column not found in view", SQL_ERR_MSG_LEN);
+                return;
+            }
+        }
+    }
+    uint32_t order_col = 0xFFFFFFFFu;
+    if (s->has_order_by) {
+        order_col = find_column_index(&layout, s->order_by);
+        if (order_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ORDER BY column not found in view", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+    if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, &layout)) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    // Outer WHERE: filter the already-materialized rows in place --
+    // there's no real table to scan (mvcc_find_matching_rows() doesn't
+    // apply here), just predicate_eval() per already-fetched row. This is
+    // genuinely new to views: neither a plain SELECT nor a set operator
+    // has an "outer WHERE over an already-materialized result" step
+    // today.
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (s->has_where && !predicate_eval(&s->where, &layout, &g_view_scratch[i])) continue;
+        if (m != i) g_view_scratch[m] = g_view_scratch[i];
+        m++;
+    }
+    n = m;
+
+    if (s->has_order_by) {
+        // Insertion sort, same shape exec_select()'s own ORDER BY uses.
+        for (uint32_t i = 1; i < n; i++) {
+            struct RowValues key = g_view_scratch[i];
+            int j = (int)i - 1;
+            while (j >= 0) {
+                int cmp = compare_rows_by_column(&layout, order_col, &g_view_scratch[j], &key);
+                int should_move = s->order_desc ? (cmp < 0) : (cmp > 0);
+                if (!should_move) break;
+                g_view_scratch[j + 1] = g_view_scratch[j];
+                j--;
+            }
+            g_view_scratch[j + 1] = key;
+        }
+    }
+
+    if (s->has_limit && s->limit < n) n = s->limit;
+
+    uint32_t cid = cursor_open_rowset(s->table_name, g_view_scratch, n);
+
+    out->error        = SQL_ERR_NONE;
+    out->cursor_id     = cid;
+    out->row_count     = n;
+    out->truncated     = truncated;
+    if (s->select_all) {
+        out->column_count = view_column_count;
+        for (uint32_t i = 0; i < view_column_count; i++) se_strcpy(out->columns[i], view_columns[i], RECORD_KEY_LEN);
+    } else {
+        out->column_count = s->column_count;
+        for (uint32_t i = 0; i < s->column_count; i++) se_strcpy(out->columns[i], s->columns[i], RECORD_KEY_LEN);
+    }
+}
+
+// ─── Query-Surface Roadmap Phase 6: WITH <name> AS (<select...>) ───────────
+// Not banked, same "provably never live across a nested call" reasoning as
+// g_view_scratch above.
+static struct RowValues g_cte_scratch[CURSOR_MAX_ROWSET_ROWS];
+
+// Executes a CTE's own captured body at depth+1, then applies THIS
+// statement's own outer projection/WHERE/ORDER BY/LIMIT over the
+// materialized result -- structurally identical to exec_select_view()
+// above (same synthetic all-STRING RowTableLayout simplification for the
+// outer WHERE/ORDER BY, same real-error propagation instead of a wrapped
+// generic one -- see that function's own header comment for the reasoning
+// behind both, not repeated here). The one real difference: there is no
+// registry lookup (no views[]/view_idx) -- s->cte_text is already this
+// statement's own captured body, read directly off `s`.
+//
+// CTE-over-a-view depth budget: a CTE body that itself references a view
+// resolves the SAME SQL_EXEC_MAX_DEPTH=2 guard exec_select_view() uses for
+// views-of-views -- this function enters depth+1 to run cte_text; if
+// THAT body's own FROM names a view, resolving it enters depth+1 again,
+// one level deeper than the 2-deep budget allows, so it fails loud with
+// SQL_ERR_NESTING_TOO_DEEP, not a bespoke check here.
+//
+// Non-recursive by construction, not by a dedicated check: a CTE body
+// that names its OWN cte_name (`WITH x AS (SELECT * FROM x) SELECT * FROM
+// x`) re-parses via an entirely fresh, independent sql_execute_tx() call
+// at exec time -- that fresh parse has no memory of being "inside" a CTE
+// named x, so its own `FROM x` resolves via the ordinary find_table_
+// catalog_index()/view_find_index() path, finds neither (a CTE is never
+// registered anywhere global -- see sql_parser.h's own Phase 6 note), and
+// fails loud with a plain SQL_ERR_TABLE_NOT_FOUND rather than looping. A
+// CTE referencing WITH again inside its own captured text at PARSE time
+// is refused earlier still, by the SAME g_cte_validating reentrancy guard
+// sql_parser.c's parse_with_select() uses.
+static void exec_select_cte(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    char cte_sql[SQL_CTE_TEXT_LEN];
+    se_strcpy(cte_sql, s->cte_text, SQL_CTE_TEXT_LEN);
+
+    if (!sql_exec_depth_enter(out)) return;
+    struct SqlResult cte_out;
+    se_memset(&cte_out, 0, sizeof(cte_out));
+    sql_execute_tx(txn_id, caller_uid, cte_sql, &cte_out);
+    sql_exec_depth_leave();
+
+    if (cte_out.error != SQL_ERR_NONE) {
+        // The CTE's own body failed at THIS exec time (e.g. a table it
+        // references was dropped between statements). Propagate the REAL
+        // underlying error rather than wrapping it in a generic one, same
+        // "denial looks like absence" avoidance as exec_select_view()'s
+        // identical propagation.
+        *out = cte_out;
+        return;
+    }
+    if (cte_out.kind != SQL_STMT_SELECT) {
+        // Shouldn't happen -- parse-time eager validation already
+        // confirmed cte_text parses as a SELECT; fail closed if it ever
+        // does anyway, same posture as exec_select_view()'s identical check.
+        out->error = SQL_ERR_INTERNAL;
+        se_strcpy(out->error_msg, "internal error: CTE body did not re-parse as a SELECT", SQL_ERR_MSG_LEN);
+        cursor_close(cte_out.cursor_id);
+        return;
+    }
+
+    // Reuses the same generic row-collection callback exec_select_set_op()/
+    // exec_select_view() already use -- nothing CTE-specific about it.
+    struct setop_row_ctx ctx;
+    ctx.out = g_cte_scratch; ctx.count = 0; ctx.max = CURSOR_MAX_ROWSET_ROWS;
+    cursor_fetch_rows(cte_out.cursor_id, CURSOR_MAX_ROWSET_ROWS, setop_row_collect_cb, &ctx);
+    uint32_t n = ctx.count < CURSOR_MAX_ROWSET_ROWS ? ctx.count : CURSOR_MAX_ROWSET_ROWS;
+    uint8_t truncated = (uint8_t)(cte_out.truncated || (ctx.count > CURSOR_MAX_ROWSET_ROWS));
+    uint32_t cte_column_count = cte_out.column_count;
+    char cte_columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
+    for (uint32_t i = 0; i < cte_column_count; i++) se_strcpy(cte_columns[i], cte_out.columns[i], RECORD_KEY_LEN);
+    cursor_close(cte_out.cursor_id);
+
+    // Synthetic ALL-STRING layout -- see exec_select_view()'s own header
+    // comment for why (the inner SqlResult reports column NAMES only,
+    // never types).
+    struct RowTableLayout layout;
+    se_memset(&layout, 0, sizeof(layout));
+    layout.column_count = cte_column_count;
+    for (uint32_t i = 0; i < cte_column_count; i++) {
+        layout.column_types[i] = FIELD_TYPE_STRING;
+        se_strcpy(layout.column_names[i], cte_columns[i], RECORD_KEY_LEN);
+    }
+
+    if (!s->select_all) {
+        for (uint32_t i = 0; i < s->column_count; i++) {
+            if (find_column_index(&layout, s->columns[i]) == 0xFFFFFFFFu) {
+                out->error = SQL_ERR_COLUMN_NOT_FOUND;
+                se_strcpy(out->error_msg, "SELECT column not found in CTE", SQL_ERR_MSG_LEN);
+                return;
+            }
+        }
+    }
+    uint32_t order_col = 0xFFFFFFFFu;
+    if (s->has_order_by) {
+        order_col = find_column_index(&layout, s->order_by);
+        if (order_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ORDER BY column not found in CTE", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+    if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, &layout)) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    // Outer WHERE: filter the already-materialized rows in place, same
+    // shape as exec_select_view()'s identical step.
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (s->has_where && !predicate_eval(&s->where, &layout, &g_cte_scratch[i])) continue;
+        if (m != i) g_cte_scratch[m] = g_cte_scratch[i];
+        m++;
+    }
+    n = m;
+
+    if (s->has_order_by) {
+        // Insertion sort, same shape exec_select()/exec_select_view() use.
+        for (uint32_t i = 1; i < n; i++) {
+            struct RowValues key = g_cte_scratch[i];
+            int j = (int)i - 1;
+            while (j >= 0) {
+                int cmp = compare_rows_by_column(&layout, order_col, &g_cte_scratch[j], &key);
+                int should_move = s->order_desc ? (cmp < 0) : (cmp > 0);
+                if (!should_move) break;
+                g_cte_scratch[j + 1] = g_cte_scratch[j];
+                j--;
+            }
+            g_cte_scratch[j + 1] = key;
+        }
+    }
+
+    if (s->has_limit && s->limit < n) n = s->limit;
+
+    uint32_t cid = cursor_open_rowset(s->table_name, g_cte_scratch, n);
+
+    out->error        = SQL_ERR_NONE;
+    out->cursor_id    = cid;
+    out->row_count    = n;
+    out->truncated    = truncated;
+    if (s->select_all) {
+        out->column_count = cte_column_count;
+        for (uint32_t i = 0; i < cte_column_count; i++) se_strcpy(out->columns[i], cte_columns[i], RECORD_KEY_LEN);
+    } else {
+        out->column_count = s->column_count;
+        for (uint32_t i = 0; i < s->column_count; i++) se_strcpy(out->columns[i], s->columns[i], RECORD_KEY_LEN);
+    }
+}
+
 // ─── Phase 20/Phase 2 (SQL Feature-Parity Roadmap): N-way JOIN + aliasing +
 // LEFT JOIN -- see sql_exec.h's header comment for the full design writeup.
 static void build_qualified_name(char* out, uint32_t max, const char* table, const char* col) {
@@ -858,7 +1236,20 @@ static int join_materialize(uint64_t txn_id, uint32_t caller_uid, const struct S
                             struct SqlResult* out, struct RowTableLayout* running_out,
                             uint32_t* n_out, uint8_t* truncated_out) {
     int tidx0 = find_table_catalog_index(s->table_name);
-    if (tidx0 < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "FROM table not found", SQL_ERR_MSG_LEN); return 1; }
+    if (tidx0 < 0) {
+        // Query-Surface Roadmap Phase 5: a view name referenced as the
+        // FROM source of a JOIN chain is a real, named v1 rejection (see
+        // view.h's own header comment) -- distinct wording from plain
+        // "table not found" so the caller knows exactly why, matching
+        // this file's established convention for every other named scope
+        // cut (SQL_ERR_GROUP_BY_JOIN_UNSUPPORTED etc.).
+        if (view_find_index(s->table_name) >= 0) {
+            out->error = SQL_ERR_VIEW_IN_JOIN_UNSUPPORTED;
+            se_strcpy(out->error_msg, "a view cannot be the FROM source of a JOIN (v1 scope cut)", SQL_ERR_MSG_LEN);
+            return 1;
+        }
+        out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "FROM table not found", SQL_ERR_MSG_LEN); return 1;
+    }
     const struct RowTableLayout* layout0 = &table_headers[tidx0].layout;
     const char* disp0 = join_display_name(s->table_name, s->table_alias);
 
@@ -906,7 +1297,29 @@ static int join_materialize(uint64_t txn_id, uint32_t caller_uid, const struct S
         const struct SqlJoinClause* jc = &s->joins[ji];
 
         int tidx = find_table_catalog_index(jc->table);
-        if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "joined table not found", SQL_ERR_MSG_LEN); return 1; }
+        if (tidx < 0) {
+            // Query-Surface Roadmap Phase 6: a CTE named on the JOIN side
+            // is the same v1 rejection as a view on the JOIN side, but
+            // only needs checking HERE, not mirrored at the FROM-source
+            // check above the way the view check is: exec_select() itself
+            // already rejects a CTE-matching FROM table_name combined
+            // with has_join before join_materialize() is ever called (see
+            // exec_select()'s own top-of-function check), so only a JOIN
+            // clause's OWN table name can still reach this point unrejected.
+            if (s->has_cte && se_streq(jc->table, s->cte_name)) {
+                out->error = SQL_ERR_CTE_SCOPE_UNSUPPORTED;
+                se_strcpy(out->error_msg, "a CTE cannot be JOIN'd (v1 scope cut)", SQL_ERR_MSG_LEN);
+                return 1;
+            }
+            // Same v1 rejection as the FROM-source check above, for a
+            // view named on the JOIN side instead.
+            if (view_find_index(jc->table) >= 0) {
+                out->error = SQL_ERR_VIEW_IN_JOIN_UNSUPPORTED;
+                se_strcpy(out->error_msg, "a view cannot be JOIN'd (v1 scope cut)", SQL_ERR_MSG_LEN);
+                return 1;
+            }
+            out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "joined table not found", SQL_ERR_MSG_LEN); return 1;
+        }
         const struct RowTableLayout* layout_new = &table_headers[tidx].layout;
         const char* disp_new = join_display_name(jc->table, jc->alias);
 
@@ -1513,7 +1926,17 @@ static void build_insert_row_values(const struct RowTableLayout* layout, const u
 
 static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlInsertStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
-    if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
+    if (tidx < 0) {
+        // Query-Surface Roadmap Phase 5: INSERT/UPDATE/DELETE through a
+        // view is a real, named v1 rejection (views are read-only) -- see
+        // view.h's own header comment.
+        if (view_find_index(s->table_name) >= 0) {
+            out->error = SQL_ERR_DML_THROUGH_VIEW_UNSUPPORTED;
+            se_strcpy(out->error_msg, "cannot INSERT into a view (views are read-only in v1)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return;
+    }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
 
     // Phase 6 (SQL Feature-Parity Roadmap): the column list may now name
@@ -1577,7 +2000,15 @@ static void exec_insert(uint64_t txn_id, uint32_t caller_uid, const struct SqlIn
 
 static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUpdateStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
-    if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
+    if (tidx < 0) {
+        // Query-Surface Roadmap Phase 5: same v1 rejection as exec_insert().
+        if (view_find_index(s->table_name) >= 0) {
+            out->error = SQL_ERR_DML_THROUGH_VIEW_UNSUPPORTED;
+            se_strcpy(out->error_msg, "cannot UPDATE a view (views are read-only in v1)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return;
+    }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
 
     uint32_t set_cols[ROWSTORE_MAX_COLUMNS];
@@ -1704,7 +2135,15 @@ static void exec_update(uint64_t txn_id, uint32_t caller_uid, const struct SqlUp
 
 static void exec_delete(uint64_t txn_id, uint32_t caller_uid, const struct SqlDeleteStmt* s, struct SqlResult* out) {
     int tidx = find_table_catalog_index(s->table_name);
-    if (tidx < 0) { out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return; }
+    if (tidx < 0) {
+        // Query-Surface Roadmap Phase 5: same v1 rejection as exec_insert().
+        if (view_find_index(s->table_name) >= 0) {
+            out->error = SQL_ERR_DML_THROUGH_VIEW_UNSUPPORTED;
+            se_strcpy(out->error_msg, "cannot DELETE from a view (views are read-only in v1)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return;
+    }
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
     if (s->has_where && !predicate_columns_valid(&s->where, s->where.root, layout)) {
         out->error = SQL_ERR_COLUMN_NOT_FOUND;
@@ -2104,6 +2543,33 @@ static void exec_drop_database(uint32_t caller_uid, struct SqlDropDatabaseStmt* 
     se_strcpy(out->error_msg, "DROP DATABASE: database not found", SQL_ERR_MSG_LEN);
 }
 
+// ─── Query-Surface Roadmap Phase 5: CREATE VIEW / DROP VIEW (DDL side) ─────
+// Thin wrappers straight into kernel/view.c's own lifecycle -- mirrors
+// exec_create_database()/exec_drop_database()'s own shape exactly. The
+// captured sql_text has ALREADY been validated as a parseable SELECT by
+// sql_parser.c's own g_view_skip_scratch/g_view_validating guard at parse
+// time (see sql_parser.h's SqlCreateViewStmt comment); view_create() below
+// re-checks name/text-length/namespace-collision constraints only, not
+// grammar.
+static void exec_create_view(uint32_t caller_uid, struct SqlCreateViewStmt* s, struct SqlResult* out) {
+    int rc = view_create(caller_uid, s->view_name, s->sql_text);
+    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    out->error = SQL_ERR_DDL_FAILED;
+    se_strcpy(out->error_msg, "CREATE VIEW failed: bad/empty/too-long name, a table already has this name, duplicate view name, or the view table is full", SQL_ERR_MSG_LEN);
+}
+
+static void exec_drop_view(uint32_t caller_uid, struct SqlDropViewStmt* s, struct SqlResult* out) {
+    int rc = view_drop(caller_uid, s->view_name);
+    if (rc == 0) { out->error = SQL_ERR_NONE; return; }
+    if (rc == 2) {
+        out->error = SQL_ERR_PERMISSION_DENIED;
+        se_strcpy(out->error_msg, "DROP VIEW: permission denied", SQL_ERR_MSG_LEN);
+        return;
+    }
+    out->error = SQL_ERR_DDL_FAILED;
+    se_strcpy(out->error_msg, "DROP VIEW: view not found", SQL_ERR_MSG_LEN);
+}
+
 // ─── Phase 7 (SQL Feature-Parity Roadmap): non-correlated subquery
 // resolution -- see predicate.h's own Phase 7 note for the full design.
 // This is the piece that turns a parsed-but-unresolved `uses_subquery`
@@ -2341,6 +2807,11 @@ static void dispatch_stmt(uint64_t txn_id, uint32_t caller_uid, struct SqlStatem
         // SqlDropDatabaseStmt comments for why there's no ALTER DATABASE.
         case SQL_STMT_CREATE_DATABASE: exec_create_database(caller_uid, &stmt->u.create_database, out); break;
         case SQL_STMT_DROP_DATABASE:   exec_drop_database(caller_uid, &stmt->u.drop_database,     out); break;
+        // Query-Surface Roadmap Phase 5 -- see the header comment right
+        // above exec_create_view() for why these are thin wrappers, and
+        // exec_select()'s own view-resolution fallback for the query side.
+        case SQL_STMT_CREATE_VIEW: exec_create_view(caller_uid, &stmt->u.create_view, out); break;
+        case SQL_STMT_DROP_VIEW:   exec_drop_view(caller_uid, &stmt->u.drop_view,     out); break;
         default:
             out->error = SQL_ERR_INTERNAL;
             se_strcpy(out->error_msg, "unhandled statement kind", SQL_ERR_MSG_LEN);

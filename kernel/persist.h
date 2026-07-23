@@ -100,7 +100,21 @@
 //  LBA 6696  PERSIST_DATABASE_ENT_LBA    1 frame  — databases[32] (~1.4 KiB)
 //  LBA 6704  PERSIST_DATABASE_GRANT_LBA  6 frames — database_grants[64] (~21.25 KiB)
 //            direct restore — pure definitions, no derived state
-//  (end LBA 6752 — comfortably clear of STREAM_DIR_LBA 8192)
+//  (end LBA 6752)
+//
+//  Query-Surface Roadmap Phase 5 (kernel/view.h): views[] had zero
+//  persistence at all -- a CREATE VIEW survived only until the next
+//  reboot. Pure definitions, no derived state (unlike row_index/vec_index,
+//  there's nothing to rebuild -- a view's own stored SELECT text is
+//  re-parsed fresh on every query anyway, see sql_exec.c's
+//  exec_select_view()), so this is a direct restore, mirroring
+//  persist_databases()'s own shape one region down. Frame count from real
+//  sizeof(): SLSViewDef=584B*16=9.125KiB -> 3 frames.
+//
+//  LBA 6752  PERSIST_VIEW_HDR_LBA  1 frame  — views header
+//  LBA 6760  PERSIST_VIEW_ENT_LBA  3 frames — views[16] (~9.1 KiB)
+//            direct restore — pure definitions, no derived state
+//  (end LBA 6784 — comfortably clear of STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
@@ -145,6 +159,10 @@
 #define PERSIST_DATABASE_ENT_LBA   6696ULL
 #define PERSIST_DATABASE_GRANT_LBA 6704ULL
 
+// ─── Query-Surface Roadmap Phase 5 ──────────────────────────────────────────
+#define PERSIST_VIEW_HDR_LBA 6752ULL
+#define PERSIST_VIEW_ENT_LBA 6760ULL
+
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.
 #define PERSIST_MAGIC_CAT            0xCAFE000000000001ULL
@@ -159,6 +177,7 @@
 #define PERSIST_MAGIC_VEC_INDEX      0xCAFE00000000000AULL
 #define PERSIST_MAGIC_ROW_JOURNAL    0xCAFE00000000000BULL
 #define PERSIST_MAGIC_DATABASE       0xCAFE00000000000CULL   /* Database Gap Analysis §1 */
+#define PERSIST_MAGIC_VIEW           0xCAFE00000000000DULL   /* Query-Surface Roadmap Phase 5 */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -255,5 +274,12 @@ void persist_row_journal(void);
 // the same derived-not-stored treatment row_journal_attachment_count
 // already gets.
 void persist_databases(void);
+
+// Snapshot views[] → NVMe. Query-Surface Roadmap Phase 5: call after every
+// successful view_create()/view_drop(). Pure definitions, direct restore --
+// no bump-allocated id and no derived state to recompute (unlike
+// persist_databases()'s database_next_id), so the header carries only the
+// array's own byte size, nothing else.
+void persist_views(void);
 
 #endif /* PERSIST_H */

@@ -20,7 +20,7 @@
  *       -o /tmp/vec_join_host_test tests/vec_join_host_test.c \
  *       kernel/vec_join.c kernel/vecstore.c kernel/vec_index.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
- *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
+ *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/view.c kernel/cursor.c \
  *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c kernel/database.c
  *   /tmp/vec_join_host_test
  *

@@ -30,7 +30,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/sql_ddl_phase5_host_test tests/sql_ddl_phase5_host_test.c \
  *       kernel/object_catalog.c kernel/rowstore.c kernel/row_index.c \
- *       kernel/row_constraint.c kernel/row_journal.c kernel/persist.c \
+ *       kernel/row_constraint.c kernel/row_journal.c kernel/persist.c kernel/view.c \
  *       kernel/cursor.c kernel/mvcc.c kernel/predicate.c \
  *       kernel/sql_parser.c kernel/sql_exec.c kernel/group_profile.c \
  *       kernel/authlist.c kernel/security_audit.c kernel/database.c

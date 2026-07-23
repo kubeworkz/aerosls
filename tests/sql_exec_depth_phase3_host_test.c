@@ -23,7 +23,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/sql_exec_depth_phase3_host_test tests/sql_exec_depth_phase3_host_test.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
- *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/cursor.c \
+ *       kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/view.c kernel/cursor.c \
  *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c kernel/database.c
  *   /tmp/sql_exec_depth_phase3_host_test
  */

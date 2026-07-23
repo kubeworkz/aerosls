@@ -20,7 +20,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/persist_partition_host_test \
- *       tests/persist_partition_host_test.c kernel/persist.c kernel/partition.c
+ *       tests/persist_partition_host_test.c kernel/persist.c kernel/view.c kernel/partition.c
  *   /tmp/persist_partition_host_test
  */
 #include "kernel/object_catalog.h"
@@ -100,6 +100,11 @@ void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
  * call these purely for diagnostic serial output, no test-relevant
  * behavior depends on them. */
 void kernel_serial_print(const char* s) { (void)s; }
+// Query-Surface Roadmap Phase 5: kernel/view.c's view_drop() calls catalog_get_role()
+// for its owner-or-kernel permission gate (same call view.c's own header comment
+// says mirrors database_drop()'s). This test has no interest in role semantics --
+// same minimal stub sql_setop_phase4_host_test.c etc. already use.
+SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 /* Database Gap Analysis Gap 1: persist.c now snapshots/restores the database
  * subsystem globals -- defined here as zero-state dummies rather than linking
  * the real kernel/database.c (whose group/catalog dependency graph this test

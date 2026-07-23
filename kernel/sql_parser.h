@@ -391,6 +391,16 @@ typedef enum {
     // there's no ALTER DATABASE, no LIST-as-SQL, and no CASCADE.
     SQL_STMT_CREATE_DATABASE,
     SQL_STMT_DROP_DATABASE,
+    // Query-Surface Roadmap Phase 5: CREATE VIEW/DROP VIEW join the DDL
+    // surface above -- see kernel/view.h for the registry lifecycle these
+    // two call straight into. Unlike CREATE DATABASE, there is no separate
+    // syscall surface for views (see view.h's own header comment) -- both
+    // statements, and every SELECT that queries a view, are reachable
+    // exclusively through the existing SYS_SLS_SQL_EXECUTE surface, the
+    // same "just another SQL statement" posture Phase 4's UNION/INTERSECT/
+    // EXCEPT already established (no new syscalls there either).
+    SQL_STMT_CREATE_VIEW,
+    SQL_STMT_DROP_VIEW,
     SQL_STMT_INVALID,
 } SqlStmtKind;
 
@@ -445,6 +455,22 @@ typedef enum {
 // constant (not a fresh magic number) keeps that invariant visible at
 // every use site.
 #define SQL_SETOP_RHS_TEXT_LEN SQL_MAX_TEXT_LEN
+
+// Query-Surface Roadmap Phase 5: a CREATE VIEW's captured "AS <select...>"
+// tail is, exactly like Phase 4's set-op right branch above, always a
+// suffix of the CREATE VIEW statement's own input text -- so it can never
+// exceed SQL_MAX_TEXT_LEN either, and reuses that same constant for the
+// same reason (see kernel/view.h's own header comment for the full
+// storage-decision writeup, including why this superseded an early 1024
+// sketch).
+#define SQL_VIEW_TEXT_LEN SQL_MAX_TEXT_LEN
+
+// Query-Surface Roadmap Phase 6: a WITH <name> AS (<select...>)' captured
+// body is, exactly like Phase 4's set-op right branch and Phase 5's view
+// body, always a substring of the WHOLE statement's own input text -- so
+// it can never exceed SQL_MAX_TEXT_LEN either, and reuses that same
+// constant for the same reason.
+#define SQL_CTE_TEXT_LEN SQL_MAX_TEXT_LEN
 
 // One link in a JOIN chain -- table/alias plus the ON clause's two
 // "qualifier.column" halves exactly as written (in whatever order the user
@@ -523,6 +549,27 @@ struct SqlSelectStmt {
     uint8_t      has_set_op;
     SqlSetOpKind set_op;
     char         set_op_rhs_text[SQL_SETOP_RHS_TEXT_LEN];
+
+    // ── Query-Surface Roadmap Phase 6: WITH <name> AS (<select...>) prefix
+    // (zero-default -- has_cte==0 keeps every pre-Phase-6 SELECT byte-for-
+    // byte identical). cte_text is the raw, unparsed body captured from
+    // between the WITH clause's own parens -- the same capture-and-
+    // reparse-at-exec convention as set_op_rhs_text above and Phase 5's
+    // view body -- re-parsed and validated as a plain SELECT at PARSE time
+    // (sql_parser.c's g_cte_skip_scratch/g_cte_validating reentrancy guard)
+    // and again at EXEC time (sql_exec.c's exec_select_cte()). A CTE is
+    // scoped to exactly this ONE statement -- there is no registry, unlike
+    // views[] -- and SHADOWS a same-named real TABLE or VIEW when THIS
+    // statement's own FROM clause names it: sql_exec.c's exec_select()
+    // checks has_cte BEFORE find_table_catalog_index()/view_find_index(),
+    // the opposite precedence from how a view only ever wins as a
+    // fallback (see SQL_VIEW_TEXT_LEN's own note above). v1 is exactly as
+    // narrow as views: a CTE may only be the sole FROM source of a plain
+    // query, never combined with a JOIN/aggregates/a set operator, nor
+    // referenced from a JOIN clause, in the same statement. ─────────────
+    uint8_t has_cte;
+    char    cte_name[OBJECT_NAME_LEN];
+    char    cte_text[SQL_CTE_TEXT_LEN];
 };
 
 // Phase 6 (SQL Feature-Parity Roadmap): a real, named ceiling on additional
@@ -669,6 +716,23 @@ struct SqlDropDatabaseStmt {
     uint8_t cascade;   // Cascading phase: DROP DATABASE <name> CASCADE
 };
 
+// Query-Surface Roadmap Phase 5: CREATE VIEW <name> AS <select...>. sql_text
+// is the raw source text captured from right after AS through the
+// statement's own terminator (top-level ';'/EOF), re-parsed and validated
+// as a plain SELECT at PARSE time (sql_parser.c's own g_view_skip_scratch/
+// g_view_validating reentrancy guard, mirroring Phase 4's set-op capture)
+// and again at every EXEC time (sql_exec.c's exec_select_view()) -- the
+// same "capture-and-reparse-at-exec" convention this whole roadmap reuses
+// from Phase 7's subqueries, not a linked/embedded struct SqlSelectStmt.
+struct SqlCreateViewStmt {
+    char view_name[OBJECT_NAME_LEN];
+    char sql_text[SQL_VIEW_TEXT_LEN];
+};
+
+struct SqlDropViewStmt {
+    char view_name[OBJECT_NAME_LEN];
+};
+
 // Two forms as of Database Gap Analysis §2.3 (previously ADD COLUMN only):
 //   ALTER TABLE t ADD COLUMN <col> <type>     -- alter_kind 0 (the zero
 //                                                default, so every
@@ -726,6 +790,8 @@ struct SqlStatement {
         struct SqlDropIndexStmt   drop_index;
         struct SqlCreateDatabaseStmt create_database;
         struct SqlDropDatabaseStmt   drop_database;
+        struct SqlCreateViewStmt     create_view;
+        struct SqlDropViewStmt       drop_view;
     } u;
 };
 

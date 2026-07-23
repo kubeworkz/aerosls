@@ -23,6 +23,7 @@
 #include "vec_index.h"       // Gap Remediation Phase D
 #include "mvcc.h"            // Gap Remediation Phase D -- mvcc_bootstrap_from_rowstore()
 #include "database.h"        // Database Gap Analysis §1 -- databases[]/database_grants[]/database_next_id
+#include "view.h"            // Query-Surface Roadmap Phase 5 -- views[]
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -312,6 +313,18 @@ void persist_databases(void) {
     persist_write_array(databases,       db_bytes,    PERSIST_DATABASE_ENT_LBA);
     persist_write_array(database_grants, grant_bytes, PERSIST_DATABASE_GRANT_LBA);
     kernel_serial_print("[PERSIST] Databases snapshot written.\n");
+}
+
+// persist_views — Query-Surface Roadmap Phase 5. views[] is pure
+// definitions with no derived state at all (no bump-allocated id like
+// databases[]'s database_next_id, no rebuild-on-boot step like row_index/
+// vec_index) -- the header carries just the array's own byte size.
+void persist_views(void) {
+    if (!io_sq || !io_cq) return;
+    uint32_t view_bytes = (uint32_t)sizeof(views);
+    write_hdr(PERSIST_VIEW_HDR_LBA, PERSIST_MAGIC_VIEW, view_bytes, 0, 0);
+    persist_write_array(views, view_bytes, PERSIST_VIEW_ENT_LBA);
+    kernel_serial_print("[PERSIST] Views snapshot written.\n");
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -685,6 +698,31 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[PERSIST] Databases: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 13. Views (Query-Surface Roadmap Phase 5) ───────────────────────────
+    // Direct restore -- pure definitions, no derived state at all (unlike
+    // block 12's database_next_id/database_grant_count, there's nothing
+    // else to recompute here). On a size-mismatched or absent snapshot this
+    // cold-starts with an empty views[] -- logged rather than silent.
+    if (nvme_read_sync(PERSIST_VIEW_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_VIEW) {
+            uint32_t view_bytes;
+            p_memcpy(&view_bytes, p_buf + 8, 4);
+            if (view_bytes == (uint32_t)sizeof(views)) {
+                persist_read_array(views, view_bytes, PERSIST_VIEW_ENT_LBA);
+                uint32_t vcount = 0;
+                for (uint32_t i = 0; i < VIEW_MAX; i++)
+                    if (views[i].active) vcount++;
+                kernel_serial_printf("[PERSIST] Views restored: %u defined.\n", vcount);
+            } else {
+                kernel_serial_print("[PERSIST] Views: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Views: no snapshot — cold start.\n");
         }
     }
 }

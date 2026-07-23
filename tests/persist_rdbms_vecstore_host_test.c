@@ -41,7 +41,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/persist_rdbms_vecstore_host_test \
  *       tests/persist_rdbms_vecstore_host_test.c \
- *       kernel/persist.c kernel/rowstore.c kernel/row_index.c kernel/mvcc.c \
+ *       kernel/persist.c kernel/view.c kernel/rowstore.c kernel/row_index.c kernel/mvcc.c \
  *       kernel/row_constraint.c kernel/row_journal.c kernel/vecstore.c \
  *       kernel/vec_index.c
  *   /tmp/persist_rdbms_vecstore_host_test
@@ -80,6 +80,11 @@ struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node 
 void catalog_after_restore(void) { /* no-op for this test */ }
 
 void kernel_serial_print(const char* s) { (void)s; }
+// Query-Surface Roadmap Phase 5: kernel/view.c's view_drop() calls catalog_get_role()
+// for its owner-or-kernel permission gate (same call view.c's own header comment
+// says mirrors database_drop()'s). This test has no interest in role semantics --
+// same minimal stub sql_setop_phase4_host_test.c etc. already use.
+SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 /* Database Gap Analysis Gap 1: persist.c now snapshots/restores the database
  * subsystem globals -- defined here as zero-state dummies rather than linking
  * the real kernel/database.c (whose group/catalog dependency graph this test

@@ -24,7 +24,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/rowstore_host_test \
- *       tests/rowstore_host_test.c kernel/rowstore.c kernel/persist.c
+ *       tests/rowstore_host_test.c kernel/rowstore.c kernel/persist.c kernel/view.c
  *   /tmp/rowstore_host_test
  */
 #include "kernel/object_catalog.h"
@@ -107,6 +107,11 @@ uint32_t                    row_journal_attachment_count = 0;
 void mvcc_bootstrap_from_rowstore(void) { /* no-op -- mvcc.c isn't linked here */ }
 
 void kernel_serial_print(const char* s) { (void)s; }
+// Query-Surface Roadmap Phase 5: kernel/view.c's view_drop() calls catalog_get_role()
+// for its owner-or-kernel permission gate (same call view.c's own header comment
+// says mirrors database_drop()'s). This test has no interest in role semantics --
+// same minimal stub sql_setop_phase4_host_test.c etc. already use.
+SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 /* Database Gap Analysis Gap 1: persist.c now snapshots/restores the database
  * subsystem globals -- defined here as zero-state dummies rather than linking
  * the real kernel/database.c (whose group/catalog dependency graph this test

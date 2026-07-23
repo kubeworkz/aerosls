@@ -37,7 +37,11 @@
  * PER_KEY, ROWSTORE_MAX_PAGES). SqlResult.truncated tells the caller when
  * more rows matched than fit.
  *
- * Explicitly out of scope, matching sql_parser.h: subqueries, views.
+ * Explicitly out of scope as of this original writeup: subqueries, views --
+ * both since promoted into real, narrower-scoped features (subqueries by
+ * the SQL Feature-Parity Roadmap's Phase 7; views by the Query-Surface
+ * Roadmap's Phase 5, see kernel/view.h) rather than staying out of scope
+ * forever.
  * INSERT requires every column to be specified (no NULL/default support
  * yet, matching rowstore_row_insert()'s own existing contract). Column
  * projection in SELECT is metadata-only in this first cut: `SqlResult.
@@ -220,6 +224,41 @@ typedef enum {
     // loud here rather than letting a would-be depth-2 caller silently
     // reuse depth-1's still-in-progress buffers out from under it.
     SQL_ERR_NESTING_TOO_DEEP,
+    // Query-Surface Roadmap Phase 5: CREATE VIEW / DROP VIEW's own two v1
+    // rejections, each given a distinctly-worded error rather than being
+    // collapsed into SQL_ERR_TABLE_NOT_FOUND (which is technically what a
+    // view name gives find_table_catalog_index() today) -- naming exactly
+    // why a view reference was refused, matching how SQL_ERR_GROUP_BY_
+    // JOIN_UNSUPPORTED already names its own scope cut instead of letting
+    // it surface as a misleading generic error. A third v1 rejection,
+    // views of views, is NOT given its own code here: it's caught for
+    // free by the SAME SQL_ERR_NESTING_TOO_DEEP depth guard above (a
+    // view's own SELECT runs at depth 1; a view referencing another view
+    // would need depth 2, which SQL_EXEC_MAX_DEPTH=2 already refuses loud)
+    // -- see sql_exec.c's exec_select_view().
+    SQL_ERR_VIEW_IN_JOIN_UNSUPPORTED,      // a view name was referenced as a JOIN'd table (FROM or JOIN clause) -- v1 only supports a view as the sole, un-joined FROM source
+    SQL_ERR_DML_THROUGH_VIEW_UNSUPPORTED,  // INSERT/UPDATE/DELETE targeted a view name -- v1 views are read-only
+    // Query-Surface Roadmap Phase 6: WITH <name> AS (<select...>) CTEs.
+    // ONE code covers every v1 scope cut (mirroring the two-messages-one-
+    // code shape SQL_ERR_VIEW_IN_JOIN_UNSUPPORTED already uses above),
+    // because sql_exec.c's exec_select() catches JOIN/aggregates/a set
+    // operator combined with a CTE-matching FROM table_name all in ONE
+    // place, before any of those three would otherwise dispatch away --
+    // unlike views, which have no single choke point and so still report
+    // a plain SQL_ERR_TABLE_NOT_FOUND for e.g. "view GROUP BY" (a real,
+    // named gap noted in exec_select()'s own comment). The second call
+    // site is join_materialize(), for a CTE referenced on the JOIN side of
+    // a query whose OWN FROM source is something else. Two rejections NOT
+    // given their own code here, matching the views-of-views precedent
+    // exactly: a CTE that itself references a view needing one nesting
+    // level deeper than SQL_EXEC_MAX_DEPTH allows is caught for free by
+    // the SAME SQL_ERR_NESTING_TOO_DEEP guard (see sql_exec.c's
+    // exec_select_cte()); and DML through a CTE name has no rejection
+    // code at all because it's structurally unreachable in this grammar
+    // -- WITH only ever prefixes a SELECT (sql_parser.c's parse_with_
+    // select()), so a CTE's has_cte/cte_name fields never exist on an
+    // INSERT/UPDATE/DELETE statement in the first place.
+    SQL_ERR_CTE_SCOPE_UNSUPPORTED,
     SQL_ERR_INTERNAL,
 } SqlErrorCode;
 
@@ -328,8 +367,9 @@ uint64_t sys_sls_sql_execute(struct SLSSqlRequest* req);
 //     REFERENCES) is skipped with a `-- ` comment rather than emitted as
 //     truncated, unparseable SQL that would only fail on re-import anyway.
 //   - A real SQLite .sql dump commonly uses syntax this parser doesn't
-//     have at all (PRIMARY KEY, CHECK, DEFAULT, AUTOINCREMENT, multi-
-//     column/UNIQUE indexes, CREATE VIEW) -- importing one isn't a
+//     have at all (PRIMARY KEY, DEFAULT, AUTOINCREMENT, multi-column/
+//     UNIQUE indexes -- CREATE VIEW moved OUT of this list as of the
+//     Query-Surface Roadmap's Phase 5) -- importing one isn't a
 //     guaranteed straight feed-through; unsupported statements simply fail
 //     that one statement (reported in the per-statement result) and every
 //     other statement in the batch still runs.

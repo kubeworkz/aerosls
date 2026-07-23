@@ -55,6 +55,8 @@ typedef enum {
     TOK_KW_CHECK, TOK_KW_BETWEEN,      // Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi)
     TOK_KW_RIGHT, TOK_KW_FULL,         // Query-Surface Roadmap Phase 2: RIGHT/FULL OUTER JOIN
     TOK_KW_UNION, TOK_KW_INTERSECT, TOK_KW_EXCEPT, TOK_KW_ALL,   // Query-Surface Roadmap Phase 4: set operators
+    TOK_KW_VIEW,   // Query-Surface Roadmap Phase 5: CREATE VIEW / DROP VIEW
+    TOK_KW_WITH,   // Query-Surface Roadmap Phase 6: WITH <name> AS (<select...>)
     TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
     TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
@@ -123,6 +125,14 @@ static const struct KeywordEntry KEYWORDS[] = {
     // no longer expressible.
     {"UNION", TOK_KW_UNION}, {"INTERSECT", TOK_KW_INTERSECT},
     {"EXCEPT", TOK_KW_EXCEPT}, {"ALL", TOK_KW_ALL},
+    // Query-Surface Roadmap Phase 5: CREATE VIEW / DROP VIEW. Same
+    // shadowing note again: a column/table named "view" is no longer
+    // expressible.
+    {"VIEW", TOK_KW_VIEW},
+    // Query-Surface Roadmap Phase 6: WITH <name> AS (<select...>). Same
+    // shadowing note again: a column/table named "with" is no longer
+    // expressible.
+    {"WITH", TOK_KW_WITH},
     // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
     // keyword-lookup pass (same mechanism every other keyword uses), so a
     // column named e.g. "string" would need... actually it can't be named
@@ -1090,6 +1100,97 @@ static void parse_select(struct SqlParser* p, struct SqlSelectStmt* s) {
     finish_statement(p);
 }
 
+// Query-Surface Roadmap Phase 6: reentrancy guard for CREATE VIEW/set-op's
+// own eager-validation trick, applied to WITH's captured body -- same
+// shape as g_view_skip_scratch/g_view_validating and g_setop_skip_scratch/
+// g_setop_validating.
+static struct SqlStatement g_cte_skip_scratch;
+static int g_cte_validating = 0;
+
+// p->cur == TOK_KW_WITH on entry. `WITH <name> AS (<select...>) SELECT
+// ...` -- captures the parenthesized body's raw text verbatim (same
+// capture-and-reparse-at-exec convention as CREATE VIEW's AS-tail and the
+// set operator's right-branch text), eagerly validates it parses as a
+// plain SELECT, THEN parses the rest of the statement as an entirely
+// ordinary SELECT via parse_select_body() -- which itself sq_memset()s
+// `s` at its own top (see parse_select_body() above), so the captured
+// name/text are kept in locals until after that call returns, and only
+// then copied onto the now-populated struct's has_cte/cte_name/cte_text
+// fields. This is what makes "CTE shadows a same-named real table"
+// (standard SQL scoping) fall out for free at exec time: has_cte/cte_name
+// are just additive fields on the SAME struct find_table_catalog_index()/
+// view_find_index() already resolve s->table_name against -- see
+// sql_exec.c's exec_select() for the resolution order.
+static void parse_with_select(struct SqlParser* p, struct SqlSelectStmt* s) {
+    advance(p);   // consume WITH
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a name after WITH"); return; }
+    char cte_name[OBJECT_NAME_LEN];
+    sq_strcpy(cte_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    if (!expect(p, TOK_KW_AS, "expected AS after WITH name")) return;
+    if (!expect(p, TOK_LPAREN, "expected '(' after WITH name AS")) return;
+
+    // Depth starts at 1 -- the opening '(' just consumed above is already
+    // accounted for, so the first UNMATCHED ')' (depth back to 0) is the
+    // one that closes the CTE body: captured (not included in the text),
+    // then consumed itself, exactly mirroring parse_create_view_body()'s
+    // depth-aware skip but stopping at a matching paren instead of a
+    // top-level ';'/EOF (a CTE body is always parenthesized, unlike a
+    // view's AS-tail which runs to the statement's own end).
+    uint32_t start = p->cur.src_start;
+    uint32_t depth = 1;
+    for (;;) {
+        if (p->cur.kind == TOK_EOF) { set_error(p, "expected ')' to close WITH ... AS (...)"); return; }
+        if (p->cur.kind == TOK_LPAREN) { depth++; advance(p); continue; }
+        if (p->cur.kind == TOK_RPAREN) {
+            depth--;
+            if (depth == 0) break;
+            advance(p);
+            continue;
+        }
+        advance(p);
+        if (p->error) return;
+    }
+    uint32_t end = p->cur.src_start;
+    if (end <= start) { set_error(p, "WITH ... AS (...) body must not be empty"); return; }
+    uint32_t n = end - start;
+    if (n >= SQL_CTE_TEXT_LEN) { set_error(p, "CTE definition is too long"); return; }
+    char cte_text[SQL_CTE_TEXT_LEN];
+    for (uint32_t i = 0; i < n; i++) cte_text[i] = p->lx.src[start + i];
+    cte_text[n] = '\0';
+    advance(p);   // consume the closing ')'
+
+    // Eager validation, same throwaway-parse-plus-reentrancy-flag pattern
+    // as CREATE VIEW/the set operator's own right branch: the captured
+    // body must itself parse as a plain SELECT before this WITH clause is
+    // considered syntactically valid at all. A CTE body that references
+    // WITH again (nested or self-referential) is refused right here, by
+    // this SAME guard -- non-recursive by construction, not a dedicated
+    // recursion check.
+    if (g_cte_validating) {
+        set_error(p, "nested WITH ... AS definitions are not supported");
+        return;
+    }
+    g_cte_validating = 1;
+    char verr[SQL_ERR_MSG_LEN];
+    int perr = sql_parse(cte_text, &g_cte_skip_scratch, verr, SQL_ERR_MSG_LEN);
+    g_cte_validating = 0;
+    if (perr || g_cte_skip_scratch.kind != SQL_STMT_SELECT) {
+        set_error(p, "WITH ... AS (...) body failed to parse as a SELECT statement");
+        return;
+    }
+
+    if (p->cur.kind != TOK_KW_SELECT) { set_error(p, "expected SELECT after WITH ... AS (...)"); return; }
+    parse_select_body(p, s);   // sq_memset()s s, then parses the outer SELECT fresh
+    if (p->error) return;
+
+    s->has_cte = 1;
+    sq_strcpy(s->cte_name, cte_name, OBJECT_NAME_LEN);
+    sq_strcpy(s->cte_text, cte_text, SQL_CTE_TEXT_LEN);
+
+    finish_statement(p);
+}
+
 static void parse_insert(struct SqlParser* p, struct SqlInsertStmt* s) {
     sq_memset(s, 0, sizeof(*s));
     advance(p);   // consume INSERT
@@ -1506,6 +1607,91 @@ static void parse_drop_database_body(struct SqlParser* p, struct SqlDropDatabase
     finish_statement(p);
 }
 
+// ── Query-Surface Roadmap Phase 5: CREATE VIEW / DROP VIEW ──────────────────
+// Dedicated PARSE-TIME-ONLY scratch for eagerly validating a view
+// definition's captured text (via a throwaway sql_parse() call), mirroring
+// g_setop_skip_scratch/g_setop_validating above exactly -- same "one level
+// only, reject nested attempts as a parse error" posture. A CREATE VIEW
+// whose own body contains another CREATE VIEW isn't valid SQL to begin
+// with (nothing in this grammar lets a SELECT embed a CREATE VIEW), so in
+// practice g_view_validating only ever guards against g_setop_validating's
+// exact class of hazard -- reentering THIS guard from within itself never
+// actually happens, but the guard costs nothing and keeps the pattern
+// uniform across every capture-and-reparse site in this file.
+static struct SqlStatement g_view_skip_scratch;
+static int g_view_validating = 0;
+
+// p->cur == TOK_KW_VIEW on entry (CREATE already consumed by sql_parse()'s
+// own dispatcher, mirroring how it already disambiguates TABLE/INDEX/
+// DATABASE).
+static void parse_create_view_body(struct SqlParser* p, struct SqlCreateViewStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume VIEW
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a view name after CREATE VIEW"); return; }
+    sq_strcpy(s->view_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    if (!expect(p, TOK_KW_AS, "expected AS after view name")) return;
+
+    // Token-level paren-depth-aware skip, mirroring the set-op RHS capture
+    // in parse_select_body() above -- simpler here, since a view's
+    // definition IS the rest of the statement: there's no ORDER BY/LIMIT
+    // that could belong to this CREATE VIEW statement itself (those belong
+    // to the SELECT inside the captured text, or to a later query FROM the
+    // view), so the only stop condition is a top-level (depth 0) ';'/EOF.
+    // Depth tracking still guards against a nested subquery's own ')'
+    // inside the view's WHERE clause being mistaken for anything, the same
+    // defensive posture as every other capture site in this file.
+    uint32_t start = p->cur.src_start;
+    uint32_t depth = 0;
+    for (;;) {
+        if (p->cur.kind == TOK_EOF) break;
+        if (p->cur.kind == TOK_LPAREN) { depth++; advance(p); continue; }
+        if (p->cur.kind == TOK_RPAREN) { if (depth > 0) depth--; advance(p); continue; }
+        if (depth == 0 && p->cur.kind == TOK_SEMI) break;
+        advance(p);
+        if (p->error) return;
+    }
+    uint32_t end = p->cur.src_start;
+    if (end <= start) { set_error(p, "expected a SELECT statement after AS"); return; }
+    uint32_t n = end - start;
+    if (n >= SQL_VIEW_TEXT_LEN) { set_error(p, "view definition is too long"); return; }
+    for (uint32_t i = 0; i < n; i++) s->sql_text[i] = p->lx.src[start + i];
+    s->sql_text[n] = '\0';
+
+    // Eager validation, mirroring the set-op RHS's own throwaway-parse
+    // convention: the captured text must itself parse as a plain SELECT
+    // before CREATE VIEW is considered syntactically valid at all -- this
+    // is what the roadmap doc calls out as "validated by a parse-only
+    // check at create time." A table the view references not existing yet
+    // is NOT checked here (that's exec time's job, exactly like every
+    // other table-name reference in this parser), only that the text is
+    // grammatically a SELECT.
+    if (g_view_validating) {
+        set_error(p, "nested CREATE VIEW definitions are not supported");
+        return;
+    }
+    g_view_validating = 1;
+    char verr[SQL_ERR_MSG_LEN];
+    int perr = sql_parse(s->sql_text, &g_view_skip_scratch, verr, SQL_ERR_MSG_LEN);
+    g_view_validating = 0;
+    if (perr || g_view_skip_scratch.kind != SQL_STMT_SELECT) {
+        set_error(p, "view definition failed to parse as a SELECT statement");
+        return;
+    }
+
+    finish_statement(p);
+}
+
+// p->cur == TOK_KW_VIEW on entry (DROP already consumed).
+static void parse_drop_view_body(struct SqlParser* p, struct SqlDropViewStmt* s) {
+    sq_memset(s, 0, sizeof(*s));
+    advance(p);   // consume VIEW
+    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a view name after DROP VIEW"); return; }
+    sq_strcpy(s->view_name, p->cur.text, OBJECT_NAME_LEN);
+    advance(p);
+    finish_statement(p);
+}
+
 // ALTER always means ALTER TABLE in this grammar (no ambiguity to
 // disambiguate), so unlike CREATE/DROP above, this one consumes ALTER
 // itself, matching parse_delete()'s own pattern. Two forms as of Database
@@ -1574,6 +1760,10 @@ int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t er
     sq_memset(out, 0, sizeof(*out));
     switch (p.cur.kind) {
         case TOK_KW_SELECT: out->kind = SQL_STMT_SELECT; parse_select(&p, &out->u.select); break;
+        // Query-Surface Roadmap Phase 6: WITH <name> AS (<select...>)
+        // SELECT ... -- still SQL_STMT_SELECT (no new SqlStmtKind), just
+        // with has_cte/cte_name/cte_text populated on the same struct.
+        case TOK_KW_WITH: out->kind = SQL_STMT_SELECT; parse_with_select(&p, &out->u.select); break;
         case TOK_KW_INSERT: out->kind = SQL_STMT_INSERT; parse_insert(&p, &out->u.insert); break;
         case TOK_KW_UPDATE: out->kind = SQL_STMT_UPDATE; parse_update(&p, &out->u.update); break;
         case TOK_KW_DELETE: out->kind = SQL_STMT_DELETE; parse_delete(&p, &out->u.del);   break;
@@ -1594,9 +1784,13 @@ int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t er
                 // Database Namespace & Access Roadmap Phase 2.
                 out->kind = SQL_STMT_CREATE_DATABASE;
                 parse_create_database_body(&p, &out->u.create_database);
+            } else if (p.cur.kind == TOK_KW_VIEW) {
+                // Query-Surface Roadmap Phase 5.
+                out->kind = SQL_STMT_CREATE_VIEW;
+                parse_create_view_body(&p, &out->u.create_view);
             } else {
                 out->kind = SQL_STMT_INVALID;
-                set_error(&p, "expected TABLE, INDEX, or DATABASE after CREATE");
+                set_error(&p, "expected TABLE, INDEX, DATABASE, or VIEW after CREATE");
             }
             break;
         case TOK_KW_ALTER:
@@ -1615,16 +1809,20 @@ int sql_parse(const char* text, struct SqlStatement* out, char* err, uint32_t er
                 // Database Namespace & Access Roadmap Phase 2.
                 out->kind = SQL_STMT_DROP_DATABASE;
                 parse_drop_database_body(&p, &out->u.drop_database);
+            } else if (p.cur.kind == TOK_KW_VIEW) {
+                // Query-Surface Roadmap Phase 5.
+                out->kind = SQL_STMT_DROP_VIEW;
+                parse_drop_view_body(&p, &out->u.drop_view);
             } else {
                 out->kind = SQL_STMT_INVALID;
-                set_error(&p, "expected TABLE, INDEX, or DATABASE after DROP");
+                set_error(&p, "expected TABLE, INDEX, DATABASE, or VIEW after DROP");
             }
             break;
         default:
             out->kind = SQL_STMT_INVALID;
             set_error(&p, "unknown statement -- expected SELECT, INSERT, UPDATE, DELETE, "
                           "CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, "
-                          "CREATE DATABASE, or DROP DATABASE");
+                          "CREATE DATABASE, DROP DATABASE, CREATE VIEW, or DROP VIEW");
             break;
     }
 

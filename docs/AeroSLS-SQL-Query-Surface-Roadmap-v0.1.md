@@ -379,47 +379,250 @@ result only.
 vs ALL, column-count mismatch rejection, ORDER BY over the merged set,
 and a both-branches-near-cap truncation case.
 
-### Phase 5 — CREATE VIEW / DROP VIEW — depends on Phase 3
+### Phase 5 — CREATE VIEW / DROP VIEW — depends on Phase 3 — DONE
 
-**Storage decision (recommended): a dedicated view registry**, not
-object-record reuse — `RECORD_VAL_LEN`=256 can't hold a real SELECT
-text (investigation §7). `struct SLSViewDef { name[OBJECT_NAME_LEN];
-sql_text[1024]; owner_uid; active; }`, `VIEW_MAX` 16, its own
-`PERSIST_MAGIC_VIEW` region (the Gap-1 pattern, mechanical to add).
+**Findings addendum (as built).** Landed exactly as scoped, with one
+storage refinement discovered during implementation: `sql_text[1024]`
+in the original sketch became `VIEW_SQL_TEXT_LEN` = `SQL_MAX_TEXT_LEN`
+(512, same reasoning as `SQL_SETOP_RHS_TEXT_LEN` — the captured tail
+is always a suffix of the whole input's own cap and can never exceed
+it, so a separate 1024 magic number was never needed). New
+`kernel/view.h`/`view.c` — `struct SLSViewDef { name[OBJECT_NAME_LEN];
+sql_text[VIEW_SQL_TEXT_LEN]; owner_uid; active; }`, `VIEW_MAX` 16 —
+mirrors `database.c`'s shape exactly, including its own
+`find_table_name_collision()` guard (CREATE VIEW cannot shadow an
+existing rowstore table; the reverse — CREATE TABLE later shadowing an
+existing view — is a named, harmless gap since table resolution always
+wins). Persistence is the plain Gap-1 pattern: `PERSIST_MAGIC_VIEW`,
+`PERSIST_VIEW_HDR_LBA`/`PERSIST_VIEW_ENT_LBA`, a `persist_views()`
+writer, and a restore block (13th and last) in `persist_restore_all()`.
 
-**Scope.** `CREATE VIEW v AS <select...>` stores the tail text verbatim
-(validated by a parse-only check at create time); `DROP VIEW v` removes
-it. Query side, v1 is deliberately narrow: `SELECT ... FROM v [WHERE
-...] [ORDER BY ...] [LIMIT n]` where `v` resolves to a view executes the
-stored text at depth 1, then applies the outer projection/WHERE/ORDER
-BY/LIMIT over the materialized result. Views inside JOINs, views of
-views, and INSERT/UPDATE/DELETE through views are all rejected loud in
-v1 — each is a real follow-on, not an oversight. Permission: executing
-a view runs the stored text under the CALLER's uid (invoker's-rights,
-the simpler and safer first cut; definer's-rights named as the
-alternative not taken).
+Parser: `TOK_KW_VIEW` joined the keyword table; `parse_create_view_body()`
+reuses the same capture-and-reparse-at-exec convention Phase 4 and
+Phase 7 established — a paren-depth-aware token skip captures the raw
+`AS <select...>` tail verbatim, then a throwaway `sql_parse()` call
+behind a `g_view_validating` reentrancy guard eagerly rejects anything
+that isn't a real `SELECT` at CREATE time. `parse_drop_view_body()` is
+a one-liner by comparison.
 
-**Verification.** New host test: create/query/drop round trip, outer
-WHERE-over-view, view text that no longer parses (underlying table
-dropped) failing loud at query time, persistence round trip via the
-fake-NVMe harness, and each v1 rejection case.
+Exec: `exec_select()`'s table-resolution fallback tries
+`view_find_index()` after `find_table_catalog_index()` comes up empty,
+and hands off to `exec_select_view()`, which enters Phase 3's depth
+bank, runs the view's own stored SELECT as a genuinely nested
+`sql_execute_tx()` call, leaves the bank, then composes the outer
+WHERE/ORDER BY/LIMIT over the materialized result — reusing
+`setop_row_collect_cb` from the Phase 4 set-op code above it rather
+than writing a second row-collection helper. Two mechanisms fall out
+for free rather than needing bespoke detection code: a view's inner
+error (e.g. `SQL_ERR_TABLE_NOT_FOUND` when the underlying table was
+dropped after the view was created) propagates as-is instead of being
+wrapped, avoiding the "denial looks like absence" bug class named
+repeatedly elsewhere in this project; and views-of-views fail loud with
+the existing `SQL_ERR_NESTING_TOO_DEEP` — a view-of-a-view needs 2
+levels of nesting, which exceeds Phase 3's 2-deep depth budget, so no
+dedicated view-of-view check was needed. Views in JOINs
+(`SQL_ERR_VIEW_IN_JOIN_UNSUPPORTED`) and DML through views
+(`SQL_ERR_DML_THROUGH_VIEW_UNSUPPORTED`) are each a small, explicit
+check at the existing `tidx < 0` fallback points in `join_materialize()`
+/ `exec_insert()`/`exec_update()`/`exec_delete()`, ahead of the generic
+`SQL_ERR_TABLE_NOT_FOUND`. Permission landed exactly as scoped:
+invoker's-rights (the view's stored SELECT runs under the CALLER's
+uid, not the owner's).
 
-### Phase 6 — WITH (non-recursive, single CTE) — depends on Phases 3 & 5
+One real, named v1 simplification not explicitly called out in the
+original scope, same bug class as Phase 4's own ORDER BY note: since
+`struct SqlResult` reports column NAMES only (no types), the outer
+WHERE/ORDER BY validation against a view's result builds a synthetic
+all-`FIELD_TYPE_STRING` `RowTableLayout` — so an outer `ORDER BY` over
+a numeric column of a view sorts lexicographically, not numerically.
+Confirmed honestly in the test (scenario 2c) rather than worked around.
+Also confirmed directly: this codebase's column projection is
+metadata-only everywhere (`out->columns[]` reports what was asked for,
+but materialized rows always carry the full underlying row) — true for
+views exactly like every other query path, and worth naming since it
+is easy to miss when reading `exec_select_view()` for the first time.
 
-**Scope.** `WITH name AS (<select...>) SELECT ... FROM name ...` is
-exactly a statement-scoped view: the parser captures the CTE body's raw
-text span; the executor materializes it at depth 1, then the outer
-SELECT runs with `name` resolving to the materialized rowset through
-the same resolve-hook Phase 5 adds for views (one mechanism, two
-sources). One CTE per statement, non-recursive, not referencable from
-JOINs in v1 — same narrowness posture as Phase 5's query side, widened
-only when something needs it. `WITH RECURSIVE` is a non-goal for this
-whole roadmap, named here once.
+**Verification.** New `sql_view_phase5_host_test.c`, 52 checks: create/
+query/drop round trip; outer WHERE/ORDER BY/LIMIT composed over a view
+(including the documented lexicographic-ORDER-BY simplification above);
+a view whose underlying table is dropped after creation failing loud
+at query time with the real error, not a silent empty result; every v1
+rejection (view in JOIN as FROM source and as JOIN side, view-of-view,
+INSERT/UPDATE/DELETE through a view); CREATE VIEW validation (table-
+name collision, duplicate view name, non-SELECT or empty AS-body parse
+errors); DROP VIEW not-found and permission-denied (non-owner/non-
+kernel rejected, owner can still drop under a non-kernel role); and a
+real persistence round trip through the fake-NVMe harness (view text
+and owner_uid survive byte-for-byte, and the restored view is genuinely
+queryable afterward, not just present as inert bytes).
 
-**Verification.** Extend Phase 5's view test (shared machinery): CTE
-shadowing a real table name (CTE wins, standard scoping), CTE over a
-view (depth budget respected or rejected loud — decide at
-implementation against the real depth accounting).
+That last check surfaced a real finding, worth recording since it cost
+real debugging time: the test's first attempt returned every matching
+row doubled after the restore. Instrumentation proved the duplication
+was not view-specific — a plain, view-free `SELECT * FROM employees
+WHERE dept = 'eng'` issued right after `persist_restore_all()` doubled
+up the same way. Root cause: `mvcc_bootstrap_from_rowstore()`'s own
+header comment already says it plainly — "NOT idempotent — calling
+this twice would create duplicate versions of the same physical rows;
+`persist_restore_all()` is the only correct call site." The real boot
+sequence (`kernel.c`) calls `mvcc_init()` before `persist_restore_all()`
+runs; the test originally simulated "reboot" by wiping only `views[]`,
+leaving the process's already-live `mvcc_versions[]` entries (from the
+fixture rows inserted earlier via `sql_execute()`) in place, so
+`persist_restore_all()`'s internal `mvcc_bootstrap_from_rowstore()`
+call registered a second, redundant version for every already-live row
+on top of the ones still there. Not a kernel bug — a missing-reset gap
+in the test's own "reboot" simulation, fixed by calling `mvcc_init()`
+immediately before `persist_restore_all()`, matching the real boot
+ordering. Full regression sweep: 46/46 (45 prior + this new file);
+`view.h`/`view.c`, `persist.h`/`.c`, `sql_parser.h`/`.c`, and
+`sql_exec.h`/`.c` all clean under both the `-I`-flagged and zero-flag
+(`-ffreestanding`, matching `X86_CFLAGS`) compile-check styles. 22
+pre-existing host tests needed `kernel/view.c` added to their own
+"Build and run" link lines (the new `sql_exec.c`/`persist.c`
+dependency wasn't previously linked anywhere); 6 of those also needed
+a `catalog_get_role()` stub added, since they don't otherwise link
+`database.c`.
+
+**Original scope (as planned).** Storage decision (recommended): a
+dedicated view registry, not object-record reuse —
+`RECORD_VAL_LEN`=256 can't hold a real SELECT text (investigation §7).
+`struct SLSViewDef { name[OBJECT_NAME_LEN]; sql_text[1024]; owner_uid;
+active; }`, `VIEW_MAX` 16, its own `PERSIST_MAGIC_VIEW` region (the
+Gap-1 pattern, mechanical to add).
+
+`CREATE VIEW v AS <select...>` stores the tail text verbatim (validated
+by a parse-only check at create time); `DROP VIEW v` removes it. Query
+side, v1 is deliberately narrow: `SELECT ... FROM v [WHERE ...] [ORDER
+BY ...] [LIMIT n]` where `v` resolves to a view executes the stored
+text at depth 1, then applies the outer projection/WHERE/ORDER BY/LIMIT
+over the materialized result. Views inside JOINs, views of views, and
+INSERT/UPDATE/DELETE through views are all rejected loud in v1 — each
+is a real follow-on, not an oversight. Permission: executing a view
+runs the stored text under the CALLER's uid (invoker's-rights, the
+simpler and safer first cut; definer's-rights named as the alternative
+not taken).
+
+New host test: create/query/drop round trip, outer WHERE-over-view,
+view text that no longer parses (underlying table dropped) failing
+loud at query time, persistence round trip via the fake-NVMe harness,
+and each v1 rejection case.
+
+### Phase 6 — WITH (non-recursive, single CTE) — depends on Phases 3 & 5 — DONE
+
+**Findings addendum (as built).** Landed exactly as scoped, with the two
+open questions the original scope left for implementation time both
+resolved and verified. `struct SqlSelectStmt` gained `has_cte`/
+`cte_name[OBJECT_NAME_LEN]`/`cte_text[SQL_CTE_TEXT_LEN]`
+(`SQL_CTE_TEXT_LEN` is `SQL_MAX_TEXT_LEN`, the same non-fresh-magic-
+number reasoning as `SQL_SETOP_RHS_TEXT_LEN`/`SQL_VIEW_TEXT_LEN` — the
+captured body is always a substring of the whole input). `TOK_KW_WITH`
+joined the keyword table with the project's standard reserved-word-
+shadowing note.
+
+Parser: `parse_with_select()` (`p->cur == TOK_KW_WITH` on entry) consumes
+`WITH <name> AS (`, then does a paren-depth-aware capture starting at
+depth 1 (the opening paren already consumed) down to the matching close
+— the same capture style `parse_create_view_body()` uses, but stopping
+at a balanced `)` instead of a top-level `;`/EOF, since a CTE body is
+always parenthesized while a view's AS-tail runs to the statement's own
+end. Eager validation reuses the exact throwaway-parse-plus-reentrancy-
+flag pattern (`g_cte_skip_scratch`/`g_cte_validating`) as CREATE VIEW and
+the set operator's own right branch. The real subtlety: `parse_select_
+body()` (which parses the OUTER select) `sq_memset()`s its target struct
+at its own top, so `parse_with_select()` keeps the captured name/text in
+LOCAL buffers until after that call returns, then copies them onto the
+now-populated struct's `has_cte`/`cte_name`/`cte_text` fields — get the
+ordering backwards and the memset silently erases the capture. A CTE
+body containing another `WITH` (nested or self-referential) is refused
+at PARSE time by the SAME `g_cte_validating` guard, for free — no
+dedicated recursion check needed there.
+
+Exec: `exec_select()` checks `has_cte` FIRST, ahead of set-op/aggregate/
+JOIN dispatch AND ahead of `find_table_catalog_index()`/
+`view_find_index()` — the OPPOSITE precedence from Phase 5's views,
+which only ever win as a fallback once a real table lookup has already
+failed. This single check is what makes "a CTE shadows a same-named
+real TABLE" (standard SQL scoping) work, and — a real, deliberate
+improvement over the view precedent, not just a mirror of it — it also
+catches JOIN/aggregates/a set operator combined with a CTE-matching FROM
+table_name all in ONE place, before any of those three would otherwise
+dispatch away. Views have no single choke point for this and so still
+report a plain `SQL_ERR_TABLE_NOT_FOUND` for e.g. "view GROUP BY" (a
+named gap in Phase 5's own code comment); CTEs get one consistently-
+worded rejection (`SQL_ERR_CTE_SCOPE_UNSUPPORTED`) instead. The SECOND
+call site for that same error code is `join_materialize()`, for a CTE
+referenced on the JOIN side of a query whose own FROM source is
+something else (`FROM other JOIN cte_name ON ...`) — the mirrored
+FROM-source check the view precedent needed at this same call site
+turned out to be unreachable dead code for CTEs, since `exec_select()`'s
+own top-of-function check already rejects that combination earlier;
+the code comment at the JOIN-side check explains why no mirror was
+added. `exec_select_cte()` itself is structurally identical to
+`exec_select_view()` (same synthetic all-`FIELD_TYPE_STRING`
+`RowTableLayout` simplification for the outer WHERE/ORDER BY, same
+real-error propagation instead of a wrapped generic one) — reusing that
+function's own header comment's reasoning rather than repeating it, with
+one difference: there is no registry lookup, since `cte_text` is already
+sitting on the statement struct being executed.
+
+Both of the roadmap's own open questions resolved and verified directly:
+a CTE over a view fails loud with the SAME `SQL_ERR_NESTING_TOO_DEEP`
+depth guard views-of-views uses (the CTE body's nested execution runs at
+depth 1; if THAT body's own FROM names a view, resolving it needs depth
+2, one past the 2-deep budget) — not a bespoke check, exactly the "views
+of views" precedent reused rather than re-invented. And non-recursion is
+enforced structurally, not by a dedicated runtime check: a CTE body that
+names its OWN `cte_name` re-parses via an entirely fresh, independent
+nested `sql_execute_tx()` call at exec time that has no memory of being
+"inside" a CTE named `x`, so its own `FROM x` resolves via the ordinary
+table/view lookup, finds neither (a CTE is never registered anywhere
+global), and fails loud with a plain `SQL_ERR_TABLE_NOT_FOUND` rather
+than looping or crashing.
+
+**Verification.** New `sql_cte_phase6_host_test.c`, 33 checks, reusing
+`sql_view_phase5_host_test.c`'s fixture/stub scaffolding (still linking
+`view.c`/`persist.c`, since one scenario exercises a CTE whose own body
+queries a view): the basic `WITH ... SELECT` round trip; outer WHERE/
+ORDER BY/LIMIT composed over a no-inner-WHERE CTE plus the same loud-
+error-on-unknown-column checks views got; a CTE named `employees`
+shadowing the real `employees` table (the CTE's own body legitimately
+queries the real table under the hood, the outer query sees only the
+CTE's narrower result, and a later ordinary query with no WITH prefix
+still sees the real table's full data — the shadow is scoped to its own
+statement only); all four v1 combined-scope rejections (JOIN as FROM
+source, JOIN on the JOIN side, aggregates, a set operator), all
+`SQL_ERR_CTE_SCOPE_UNSUPPORTED`; a CTE over a view failing loud with
+`SQL_ERR_NESTING_TOO_DEEP`; a self-referencing CTE body failing loud as
+a plain unknown table, not a hang; a nested `WITH` inside a CTE body
+rejected at parse time; and parser-level checks confirming `has_cte`/
+`cte_name`/`cte_text` capture, empty-body/non-SELECT-body/missing-
+trailing-SELECT parse errors, and that an ordinary WITH-less SELECT
+still parses with `has_cte == 0` (zero-default, byte-for-byte pre-
+Phase-6 behavior). No debugging needed this round — every check passed
+on the first build, unlike Phase 5's own persistence-round-trip
+surprise. Full regression sweep: 47/47 (46 prior + this new file); no
+pre-existing host test needed any link-line changes (unlike Phase 5's
+22-file sweep), since CTEs added no new linked source file — everything
+lives in the already-linked `sql_parser.c`/`sql_exec.c`.
+`sql_parser.h`/`.c` and `sql_exec.h`/`.c` all clean under both the
+`-I`-flagged and zero-flag (`-ffreestanding`, matching `X86_CFLAGS`)
+compile-check styles.
+
+**Original scope (as planned).** `WITH name AS (<select...>) SELECT ...
+FROM name ...` is exactly a statement-scoped view: the parser captures
+the CTE body's raw text span; the executor materializes it at depth 1,
+then the outer SELECT runs with `name` resolving to the materialized
+rowset through the same resolve-hook Phase 5 adds for views (one
+mechanism, two sources). One CTE per statement, non-recursive, not
+referencable from JOINs in v1 — same narrowness posture as Phase 5's
+query side, widened only when something needs it. `WITH RECURSIVE` is a
+non-goal for this whole roadmap, named here once.
+
+Extend Phase 5's view test (shared machinery): CTE shadowing a real
+table name (CTE wins, standard scoping), CTE over a view (depth budget
+respected or rejected loud — decide at implementation against the real
+depth accounting).
 
 ### Phase 7 — Correlated subqueries — last, and honestly may stay deferred
 
@@ -441,10 +644,10 @@ which Phase 1 makes aggregatable).
 
 Phases 1 and 2 first, in either order — both are self-contained executor
 work with no reentrancy dependency, and each closes a named Gap-Analysis
-item outright. **Phases 1-4 are now DONE.** Phase 5 next (depends only
-on 3, independent of 4); Phase 6 after 5 (shares its resolve hook).
-Phase 7 deliberately unscheduled — revisit after 4-6 land and real usage
-shows what's still missing.
+item outright. **Phases 1-6 are now DONE.** Phase 7 (correlated
+subqueries) deliberately unscheduled — the roadmap's own recommendation
+is to leave it unstarted until a real query needs it, since Phases 4-6
+already cover most practical uses.
 
 ## 4. Non-goals for this whole roadmap
 
