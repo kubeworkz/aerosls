@@ -113,6 +113,7 @@ int mqt_create(const char* mqt_name,
     vreq.owner_uid  = 0;
     vreq.perm_mask  = 0;
     vreq.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+    vreq.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
     if (!sys_sls_valloc(&vreq)) {
         kernel_serial_print("[MQT] failed to allocate result table\n");
         return 1;

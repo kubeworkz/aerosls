@@ -150,12 +150,13 @@ static void print_help(void) {
         "  -- Session --\n"
         "  login <uid> <gid>              change session credentials\n"
         "  -- Object Catalog (Phase 1) --\n"
-        "  valloc <name> <type> <pages>   allocate named persistent object\n"
+        "  valloc <name> <type> <pages> [database]   allocate named persistent object\n"
         "                                   type: 0=SYSTEM_META 1=DB_TABLE\n"
         "                                         2=DB_INDEX    3=HEAP_BLOB\n"
         "  vfree  <name>                  release a named object\n"
         "  ls objects                     list all catalog entries\n"
         "  stat   <name>                  show full details for an object\n"
+        "  object set database <name> <database|none>  retag any catalog object's database\n"
         "  -- DB Records (Phase 1) --\n"
         "  insert <object> <key> <value>  add a new record field\n"
         "  update <object> <key> <value>  modify a field (stages to WAL if tx open)\n"
@@ -450,6 +451,15 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             req.owner_uid  = current_session_uid;
             req.perm_mask  = PERM_RWX;
             req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+            // VectorStore Gap Analysis §3: this field was left unset here
+            // (uninitialized stack garbage) until this fix -- every valloc
+            // call site except sql_exec.c's CREATE TABLE path had the same
+            // bug. 0 (NONE) unless a trailing database name token follows.
+            req.database_id = 0;
+            char dbtok[OBJECT_NAME_LEN];
+            const char* dp = sh_next(sh_next(sh_next(input_buffer + 7)));
+            sh_token(dp, dbtok, sizeof(dbtok));
+            if (dbtok[0]) req.database_id = database_find_id(dbtok);
             do_syscall(SYS_SLS_VALLOC, &req);
         }
 
@@ -1238,6 +1248,28 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                                  req.collection_name, req.enabled ? "ON" : "OFF",
                                  rc == 0 ? "OK" : "FAILED", req.status);
         }
+        // ── VectorStore Gap Analysis §3: object set database <name> <database|none>
+        // Generic retag, reaching any catalog object (including an already-
+        // promoted vector collection, which has no ALTER verb of its own).
+        // "none" clears the tag back to 0. See catalog_set_database()'s own
+        // header comment (kernel/object_catalog.c) for why this closes §3's
+        // access-control question for free: catalog_check_access() already
+        // runs database_check_access() against this same field for every
+        // vecstore.c CRUD call.
+        else if (sh_starts(input_buffer, "object set database ")) {
+            struct SLSSetDatabaseRequest req;
+            req.caller_uid = current_session_uid;
+            const char* p = input_buffer + 21;
+            p = sh_token(p, req.object_name, sizeof(req.object_name));
+            char dbtok[OBJECT_NAME_LEN];
+            sh_token(p, dbtok, sizeof(dbtok));
+            if (sh_eq(dbtok, "none")) dbtok[0] = '\0';
+            sh_copy(req.database_name, dbtok, sizeof(req.database_name));
+            uint64_t rc = do_syscall(SYS_SLS_OBJECT_SET_DATABASE, &req);
+            kernel_serial_printf("[CATALOG] object '%s' set database -> '%s' -> %s (status %d)\n",
+                                 req.object_name, dbtok[0] ? dbtok : "(none)",
+                                 rc == 0 ? "OK" : "FAILED", req.status);
+        }
         else if (sh_starts(input_buffer, "vec insert ")) {
             struct SLSVecInsertRequest req;
             req.caller_uid = current_session_uid;
@@ -1455,6 +1487,9 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             req.owner_uid  = current_session_uid;
             req.perm_mask  = 0;
             req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+            // VectorStore Gap Analysis §3: was left unset (uninitialized
+            // stack garbage) until this fix.
+            req.database_id = 0;
             sys_sls_valloc(&req);
             kernel_serial_printf("[JOURNAL] Created journal '%s'.\n", name);
         }

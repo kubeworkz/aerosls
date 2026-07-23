@@ -1281,6 +1281,7 @@ static int api_program_create(const char* body, char* buf, int max) {
     req.owner_uid = 0;
     req.perm_mask = PERM_READ | PERM_EXECUTE | PERM_OWNER;
     req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+    req.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
     req.type      = OBJ_TYPE_PROGRAM;
     req.name[0]   = '\0';
     json_str(body, "name", req.name, OBJECT_NAME_LEN);
@@ -1558,6 +1559,21 @@ static int api_valloc_post(const char* body, char* buf, int max) {
     struct SLSVallocRequest req;
     req.owner_uid = 0; req.perm_mask = 0;
     req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+    // VectorStore Gap Analysis §3: database_id was left unset here
+    // (uninitialized stack garbage) until this fix -- every valloc call
+    // site except sql_exec.c's CREATE TABLE path had the same bug. 0 (NONE)
+    // unless an optional "database" name is given, resolved the same way
+    // sql_exec.c's "IN DATABASE" clause does. This is also the direct path
+    // a vector collection's underlying catalog object goes through (see
+    // api_vec_create_post()'s own comment on requiring POST /api/valloc
+    // first) -- tagging it here means catalog_check_access()'s existing
+    // database_check_access() fallback already covers the resulting vector
+    // collection for free, no vecstore.c changes needed.
+    req.database_id = 0;
+    char dbname[OBJECT_NAME_LEN];
+    dbname[0] = '\0';
+    json_str(body, "database", dbname, OBJECT_NAME_LEN);
+    if (dbname[0]) req.database_id = database_find_id(dbname);
     json_str(body, "name", req.name, OBJECT_NAME_LEN);
     req.type       = (SLSObjectType)json_int(body, "type");
     req.size_pages = (uint32_t)json_int(body, "pages");
@@ -2341,6 +2357,33 @@ static int api_vec_set_unique_post(const char* body, char* buf, int max, uint32_
     jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
     jb_str(&j, "name", req.collection_name); jb_putc(&j,',');
     jb_str(&j, "enabled", req.enabled ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "status", (uint64_t)req.status);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/objects/database — VectorStore Gap Analysis §3 ─────────────────
+// Live path for catalog_set_database(): a generic, object-type-agnostic
+// retag reaching any catalog object, including an already-promoted vector
+// collection (which has no ALTER verb of its own but shares object_catalog[]
+// with SQL tables). Body: {"name": "<object>", "database": "<database>"} --
+// omit or send an empty "database" to clear the tag back to 0 (NONE).
+// catalog_check_access()'s existing database_check_access() fallback
+// already runs against this same field for every vecstore.c CRUD call, so
+// this route is enough to move a vector collection into (or out of) a
+// database's grant list with zero vecstore.c changes.
+static int api_object_set_database_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSSetDatabaseRequest req;
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.object_name, OBJECT_NAME_LEN);
+    req.database_name[0] = '\0';
+    json_str(body, "database", req.database_name, OBJECT_NAME_LEN);
+    uint64_t rc = sys_sls_object_set_database(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    jb_str(&j, "name", req.object_name); jb_putc(&j,',');
+    jb_str(&j, "database", req.database_name[0] ? req.database_name : "(none)"); jb_putc(&j,',');
     jb_uint(&j, "status", (uint64_t)req.status);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -3502,6 +3545,7 @@ static int api_journal_create_post(const char* body, char* buf, int max, uint32_
     req.owner_uid = req_uid;
     req.perm_mask = 0;
     req.partition_id = 0;
+    req.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
     uint64_t id = sys_sls_valloc(&req);
     jb_obj_open(&j,0);
     if (id) { jb_str(&j,"ok","true"); jb_putc(&j,','); jb_hex(&j,"object_id",id); }
@@ -4281,6 +4325,11 @@ static void http_route(int conn, char* req) {
         // ── VectorStore Gap Analysis §1.3 ───────────────────────────────────────
         if (!strcmp(path, "/api/vec/collections/unique")) {
             blen = api_vec_set_unique_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── VectorStore Gap Analysis §3 ─────────────────────────────────────────
+        if (!strcmp(path, "/api/objects/database")) {
+            blen = api_object_set_database_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/vec/insert")) {

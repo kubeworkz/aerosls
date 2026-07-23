@@ -329,6 +329,54 @@ uint64_t sys_sls_vfree(const char* name) {
     return 0;
 }
 
+// ─── VectorStore Gap Analysis §3: catalog_set_database ────────────────────────
+// A generic, object-type-agnostic version of the ALTER TABLE ... SET
+// DATABASE retag sql_exec.c's exec_alter_table() already does for row-set
+// tables (kernel/sql_exec.c ~line 2337) -- same direct object_catalog[]
+// write, same catalog_check_access() PERM_WRITE gate, same "takes effect
+// immediately because catalog_check_access() reads database_id live"
+// property, just without sql_exec.c's own uses_rowstore restriction, so it
+// also reaches vector collections, journals, streams, agents, or any other
+// catalog object type. This is the missing half of VectorStore Gap
+// Analysis §3: a vector collection is always promoted from a pre-existing
+// object_catalog[] entry (vecstore_create_collection() finds it by name),
+// and catalog_check_access() already runs database_check_access() against
+// that same entry's database_id for every vecstore.c CRUD call -- so
+// retagging an object here is enough to move an already-created vector
+// collection into (or out of) a database's grant list with zero vecstore.c
+// changes, exactly like it already does for SQL tables.
+//
+// database_name may be empty/NULL to explicitly clear the tag back to 0
+// (NONE) -- distinguished from "not found" by checking the string first
+// rather than treating database_find_id()'s own 0-for-not-found return as
+// ambiguous with 0-for-NONE.
+//
+// Return: 0 ok, 1 object not found, 2 access denied (PERM_WRITE), 3 named
+// database not found. Denial (2) is never allowed to look like absence
+// (1) or a bad database name (3) -- same "denial looks like absence" bug
+// class this codebase has fixed elsewhere (VectorStore Gap Analysis §1.2/
+// §1.3's own header comments).
+int catalog_set_database(uint32_t caller_uid, const char* obj_name, const char* database_name) {
+    int idx = find_by_name(obj_name);
+    if (idx < 0) return 1;
+    if (!catalog_check_access(caller_uid, obj_name, PERM_WRITE)) return 2;
+    uint32_t new_db_id = 0;
+    if (database_name && database_name[0]) {
+        new_db_id = database_find_id(database_name);
+        if (new_db_id == 0) return 3;
+    }
+    object_catalog[idx].database_id = new_db_id;
+    persist_catalog();   // the tag lives on the catalog entry -- catalog snapshot, not the database one
+    kernel_serial_printf("[CATALOG] '%s' database_id -> %u\n", obj_name, new_db_id);
+    return 0;
+}
+
+uint64_t sys_sls_object_set_database(struct SLSSetDatabaseRequest* req) {
+    if (!req) return 1;
+    req->status = catalog_set_database(req->caller_uid, req->object_name, req->database_name);
+    return (uint64_t)req->status;
+}
+
 // ─── Phase 14 (LPAR): catalog_vfree_partition ─────────────────────────────────
 // Destroys every active catalog object whose partition_id matches, mirroring
 // sys_sls_vfree()'s exact per-entry actions (active=0, field_count=0) but

@@ -238,6 +238,77 @@ int main(void) {
     CHECK(catalog_check_access(5000, "sales_2024", PERM_READ) == 0,
           "s8: and the long-revoked uid 5000 did NOT come back with it");
 
+    /* ── Scenario 9 (VectorStore Gap Analysis §3): a plain sys_sls_valloc()
+     * call -- the SAME generic entry point a vector collection's underlying
+     * catalog object is always created through (vecstore_create_collection()
+     * finds it by name in object_catalog[], see kernel/vecstore.c) -- with
+     * an explicit database_id tags the new object correctly, and
+     * catalog_check_access()'s existing database check applies identically
+     * to a REAL valloc'd entry as it does to seed_object()'s hand-built
+     * ones above, proving §3's "already free" access-control claim end to
+     * end with zero vecstore-specific code involved. Also proves the §3
+     * Part A fix: database_id is no longer left as uninitialized stack
+     * garbage by this call. ────────────────────────────────────────────────── */
+    CHECK(database_create(1, "vectors_db") == 0, "s9: database_create('vectors_db')");
+    uint32_t vdb_id = database_find_id("vectors_db");
+    CHECK(vdb_id != 0, "s9: 'vectors_db' resolves to a real database_id");
+    CHECK(database_grant_uid("vectors_db", 8000, PERM_READ) == 0,
+          "s9: uid 8000 granted READ on 'vectors_db'");
+    CHECK(catalog_get_role(8000) == ROLE_GUEST, "s9: uid 8000 has no individual role (bare GUEST)");
+    struct SLSVallocRequest vreq;
+    memset(&vreq, 0, sizeof(vreq));
+    strcpy(vreq.name, "vc_underlying");
+    vreq.type         = OBJ_TYPE_DB_TABLE;
+    vreq.size_pages   = 1;
+    vreq.owner_uid    = 0;
+    vreq.perm_mask    = 0;
+    vreq.partition_id = 0;
+    vreq.database_id  = vdb_id;   /* the §3 Part B fix -- real valloc-time database tagging */
+    uint64_t new_obj_id = sys_sls_valloc(&vreq);
+    CHECK(new_obj_id != 0, "s9: sys_sls_valloc() succeeds for 'vc_underlying'");
+    CHECK(catalog_check_access(8000, "vc_underlying", PERM_READ) == 1,
+          "s9: uid 8000 -- a bare GUEST -- passes on the brand-new valloc'd object PURELY via "
+          "the 'vectors_db' grant, proving a real valloc() call (not just seed_object()) threads "
+          "database_id correctly end to end");
+    CHECK(catalog_check_access(9999, "vc_underlying", PERM_READ) == 0,
+          "s9: an unrelated uid is still denied on the same object");
+
+    /* ── Scenario 10 (§3 Part C): catalog_set_database() -- the missing
+     * "retag after creation" primitive, reaching an object created WITHOUT
+     * a database tag (mirroring an object created before this feature
+     * existed, or a vector collection promoted from an untagged catalog
+     * entry). ───────────────────────────────────────────────────────────────── */
+    seed_object(2, "untagged_vc", 0);
+    object_catalog_count = 3;
+    CHECK(catalog_check_access(8000, "untagged_vc", PERM_READ) == 0,
+          "s10: uid 8000 is denied on 'untagged_vc' before any retag -- database_id is still 0");
+    CHECK(catalog_set_database(0, "untagged_vc", "vectors_db") == 0,
+          "s10: catalog_set_database() (called as kernel uid 0) retags 'untagged_vc' into 'vectors_db'");
+    CHECK(object_catalog[2].database_id == vdb_id,
+          "s10: object_catalog[]'s database_id field was actually updated");
+    CHECK(catalog_check_access(8000, "untagged_vc", PERM_READ) == 1,
+          "s10: uid 8000 NOW passes -- the retag took effect immediately, matching "
+          "ALTER TABLE ... SET DATABASE's own 'reads database_id live' property, with zero "
+          "vecstore-specific code involved");
+
+    /* ── Scenario 11 (§3 Part C): permission gate + error codes -- denial
+     * must never look like absence or a bad database name. ─────────────────── */
+    CHECK(catalog_set_database(9999, "untagged_vc", "vectors_db") == 2,
+          "s11: a uid with no PERM_WRITE on the object is denied (rc=2), not silently 'not found'");
+    CHECK(catalog_set_database(0, "no_such_object", "vectors_db") == 1,
+          "s11: retagging a nonexistent object fails cleanly (rc=1)");
+    CHECK(catalog_set_database(0, "untagged_vc", "no_such_database") == 3,
+          "s11: retagging into a nonexistent database fails cleanly (rc=3)");
+    CHECK(object_catalog[2].database_id == vdb_id,
+          "s11: the failed rc=3 attempt left database_id untouched (no partial mutation)");
+
+    /* ── Scenario 12 (§3 Part C): clearing the tag back to NONE. ─────────────── */
+    CHECK(catalog_set_database(0, "untagged_vc", "") == 0,
+          "s12: an empty database name clears the tag back to 0 (NONE)");
+    CHECK(object_catalog[2].database_id == 0, "s12: database_id is genuinely back to 0");
+    CHECK(catalog_check_access(8000, "untagged_vc", PERM_READ) == 0,
+          "s12: uid 8000 is denied again -- the grant no longer applies once the tag is cleared");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

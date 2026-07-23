@@ -219,6 +219,19 @@ struct SLSGrantRequest {
     uint32_t perm_delta;           // bits to add (grant) or remove (revoke)
 };
 
+// VectorStore Gap Analysis §3: generic, object-type-agnostic version of
+// ALTER TABLE ... SET DATABASE (sql_exec.c's own exec_alter_table()), so
+// any catalog object -- including a vector collection, which has no ALTER
+// verb of its own but shares object_catalog[] with SQL tables -- can be
+// tagged/retagged/cleared after creation. database_name empty clears the
+// tag back to 0 (NONE).
+struct SLSSetDatabaseRequest {
+    uint32_t caller_uid;
+    char     object_name[OBJECT_NAME_LEN];
+    char     database_name[OBJECT_NAME_LEN];
+    int      status;   // 0 ok, 1 not found, 2 access denied, 3 database not found
+};
+
 // ─── Syscall Numbers ──────────────────────────────────────────────────────────
 #define SYS_SLS_ALLOCATE    105
 #define SYS_SLS_VALLOC      110
@@ -238,6 +251,7 @@ struct SLSGrantRequest {
 #define SYS_SLS_PROC_KILL       161
 #define SYS_SLS_PROC_LIST       162
 #define SYS_SLS_PROGRAM_SPAWN   163   // spawn an OBJ_TYPE_PROGRAM object as a process
+#define SYS_SLS_OBJECT_SET_DATABASE 269   // VectorStore Gap Analysis §3 -- next free number after SYS_SLS_VEC_SET_UNIQUE (268)
 
 // ─── Public Catalog API ───────────────────────────────────────────────────────
 extern struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];
@@ -266,6 +280,11 @@ void     sys_sls_schema_show(const char* name);
 // Role check called by other subsystems (transaction, secure_api)
 int      catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_perm);
 SLSRole  catalog_get_role(uint32_t uid);
+
+// VectorStore Gap Analysis §3: generic catalog-object database retag +
+// its thin syscall adapter.
+int      catalog_set_database(uint32_t caller_uid, const char* obj_name, const char* database_name);
+uint64_t sys_sls_object_set_database(struct SLSSetDatabaseRequest* req);
 
 // Called by persist.c after restoring the catalog from NVMe to recalculate
 // the next_obj_vaddr watermark from the restored base_vaddr + size_pages values.

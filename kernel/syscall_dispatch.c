@@ -303,6 +303,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // uniqueness (268) -- see vecstore.h's own comment on this syscall. ────
     case SYS_SLS_VEC_SET_UNIQUE:
         return sys_sls_vec_set_unique((struct SLSVecSetUniqueRequest*)arg);
+    case SYS_SLS_OBJECT_SET_DATABASE:
+        return sys_sls_object_set_database((struct SLSSetDatabaseRequest*)arg);
     case SYS_SLS_VEC_INSERT:
         return sys_sls_vec_insert((struct SLSVecInsertRequest*)arg);
     case SYS_SLS_VEC_EMBED_INSERT:

@@ -111,6 +111,7 @@ uint64_t sys_sls_agent_create(struct AgentCreateRequest* req) {
     vr.owner_uid  = req->owner_uid;
     vr.perm_mask  = 0x7;
     vr.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+    vr.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
     uint64_t obj_id = sys_sls_valloc(&vr);
     if (!obj_id) {
         kernel_serial_printf("[AGENT] CREATE failed: catalog valloc error for '%s'\n", req->name);
@@ -153,6 +154,7 @@ uint64_t sys_sls_agent_create(struct AgentCreateRequest* req) {
         mv.owner_uid  = req->owner_uid;
         mv.perm_mask  = 0x7;
         mv.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+        mv.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
         uint64_t mem_id = sys_sls_valloc(&mv);
         if (mem_id) {
             ag->memory_table_id = mem_id;
@@ -458,6 +460,7 @@ uint64_t sys_sls_workflow_create(struct WorkflowCreateRequest* req) {
     vr.owner_uid  = req->owner_uid;
     vr.perm_mask  = 0x7;
     vr.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+    vr.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
     uint64_t obj_id = sys_sls_valloc(&vr);
     if (!obj_id) {
         kernel_serial_printf("[WORKFLOW] CREATE failed: catalog valloc error for '%s'\n", req->name);

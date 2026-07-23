@@ -141,6 +141,7 @@ void stream_init(void) {
                     req.owner_uid  = 0;
                     req.perm_mask  = PERM_READ | PERM_OWNER;
                     req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+                    req.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
                     sys_sls_valloc(&req);
                     // Metadata records are re-inserted so DB hooks see them
                     struct SLSRecordRequest mr;
@@ -212,6 +213,7 @@ int stream_create(const char* name, const char* mime_type) {
             req.owner_uid  = 0;
             req.perm_mask  = PERM_READ | PERM_OWNER;
             req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
+            req.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
             uint64_t id = sys_sls_valloc(&req);
             if (id) {
                 struct SLSRecordRequest mr;

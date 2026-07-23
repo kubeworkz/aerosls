@@ -249,22 +249,78 @@ order is ever refactored without noticing the implicit dependency.
 
 ## 3. Cross-roadmap gap: the VectorStore sits entirely outside the database namespace
 
-Not named in either VectorStore roadmap phase, found during this
-analysis by checking whether `struct VecCollectionHeader` carries any of
-the same namespacing the Database Namespace & Access Roadmap (Phases 1-5,
-DONE) added to every SQL table. It doesn't: confirmed by grep,
-`kernel/vecstore.h` has no `database_id` field, no `database_grants[]`
-equivalent, nothing resembling `USE DATABASE` scoping. Every relational
-table now belongs to a database with its own grant list
-(`kernel/database.c`); every vector collection is still global and flat,
-reachable and creatable by any caller with catalog access, regardless of
-which "database" a related SQL schema lives in. This is a real
-architectural asymmetry between the two data-storage subsystems this
-kernel now has, not a bug — nothing is broken — but a multi-tenant or
-multi-database deployment that expects `vec_join.c`'s relational joins to
-respect the same per-database isolation its SQL side of the join already
-enforces would find the vector side of that join has no such boundary at
-all.
+**Closed** (narrower than originally feared — see below). A vector
+collection is never a standalone struct: `vecstore_create_collection()`
+always promotes a pre-existing `object_catalog[]` entry (found by name),
+and every `vecstore.c` CRUD entry point (insert/get/delete/scan/create/
+set_unique) already gates through `catalog_check_access(caller_uid,
+collection_name, PERM_*)` — the exact same choke point every SQL table
+uses. `catalog_check_access()` itself already runs
+`database_check_access(uid, e->database_id, needed_perm)` against that
+same shared entry's `database_id` field (Database Namespace & Access
+Roadmap Phase 3, `object_catalog.c` line ~197). So the access-control
+mechanism was never actually missing: once a vector collection's
+underlying catalog object carries a `database_id`, it is already
+database-scoped, with zero `vecstore.c` changes. This was proven directly
+by extending `tests/database_grant_phase3_host_test.c` (new Scenarios
+9-12): a `sys_sls_valloc()`-created object tagged with a real
+`database_id`, and a `catalog_check_access()` check against it, both
+running through the exact same code every vector collection's own
+`catalog_check_access()` calls already use.
+
+What was genuinely missing, found while tracing this end to end:
+
+- **A live bug, not scoped to vectors at all**: `struct SLSVallocRequest`
+  gained a `database_id` field when the Database Namespace Roadmap shipped,
+  with a header comment saying it's "0 (NONE) if the caller doesn't set it
+  — matching every pre-Phase-8 valloc call site's zero-initialized request
+  struct" convention. That convention was violated: of the 11
+  `SLSVallocRequest` construction sites across the codebase, only
+  `sql_exec.c`'s own `CREATE TABLE` path (`se_memset(&vreq, 0, ...)`)
+  actually zeroed it. The other 10 — `user/shell.c`'s `valloc` and
+  `journal create` commands, `net/http.c`'s `POST /api/valloc`, `POST
+  /api/program/create`, and `POST /api/journal` routes, and three call
+  sites each in `kernel/agent.c` (agent/memory-table/workflow creation),
+  one in `kernel/mqt.c`, and two in `kernel/stream.c` — left `database_id`
+  as uninitialized stack garbage on every object they created. Fixed by
+  explicitly zeroing it at all 10 sites.
+- **No way to assign a database at creation time or after the fact**: the
+  vector-collection-facing surface (`POST /api/valloc`, native shell
+  `valloc`) had no way to set a nonzero `database_id`, and there was no
+  generic equivalent of `ALTER TABLE ... SET DATABASE` (`sql_exec.c`'s
+  `exec_alter_table()`, database-gap-analysis §2.3) for non-table catalog
+  objects. Closed two ways: `POST /api/valloc` and native shell `valloc`
+  both gained an optional trailing database name, resolved via
+  `database_find_id()` the same way `IN DATABASE` does; and a new generic
+  primitive, `catalog_set_database()` (`kernel/object_catalog.c`), mirrors
+  `exec_alter_table()`'s direct `object_catalog[].database_id` write and
+  `catalog_check_access()` PERM_WRITE gate but drops its `uses_rowstore`
+  restriction, so it reaches any catalog object — including an
+  already-promoted vector collection, which has no `ALTER` verb of its
+  own. Reachable via `SYS_SLS_OBJECT_SET_DATABASE` (269), native shell
+  `object set database <name> <database|none>`, `POST
+  /api/objects/database`, and the web Terminal's `object set database`
+  command.
+
+**Original finding (closed above), kept for the record.** Not named in
+either VectorStore roadmap phase, found during this analysis by checking
+whether `struct VecCollectionHeader` carries any of the same namespacing
+the Database Namespace & Access Roadmap (Phases 1-5, DONE) added to every
+SQL table. It doesn't: confirmed by grep, `kernel/vecstore.h` has no
+`database_id` field, no `database_grants[]` equivalent, nothing
+resembling `USE DATABASE` scoping. Every relational table now belongs to
+a database with its own grant list (`kernel/database.c`); every vector
+collection is still global and flat, reachable and creatable by any
+caller with catalog access, regardless of which "database" a related SQL
+schema lives in. This is a real architectural asymmetry between the two
+data-storage subsystems this kernel now has, not a bug — nothing is
+broken — but a multi-tenant or multi-database deployment that expects
+`vec_join.c`'s relational joins to respect the same per-database
+isolation its SQL side of the join already enforces would find the
+vector side of that join has no such boundary at all. (As it turns out,
+the boundary was already there at the access-control layer — the gap was
+the assignment surface and the valloc-time bug, not a missing
+enforcement mechanism.)
 
 ## 4. Named, deliberate scope cuts — reasonable to leave alone
 
@@ -298,10 +354,11 @@ all.
    separate finding (four commands that were never ported to the web
    Terminal at all) rather than closing it silently.
 3. ~~**§1.2** (permission gate on collection creation)~~ — **CLOSED.**
-4. **§3** (database-namespace parity) — the biggest single piece of new
-   design work in this list, and only worth scoping if a real multi-
-   database vector workload is anticipated; everything else here is a
-   fix, this one is a feature.
+4. ~~**§3** (database-namespace parity)~~ — **CLOSED.** Turned out to be a
+   much smaller fix than feared, not a feature: access control was
+   already free via the shared `catalog_check_access()` choke point; the
+   real gaps were a live uninitialized-`database_id` bug (10 call sites)
+   and a missing assignment surface, both closed.
 5. ~~**§1.3** (opt-in `external_id` uniqueness)~~ — **CLOSED.**
 6. ~~**§1.4** (pagination for bulk data export)~~ — **CLOSED.**
 7. **New, small: port `vec schema export/import`/`vec data export/
