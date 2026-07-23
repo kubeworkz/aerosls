@@ -51,6 +51,11 @@ void tier_notify_access(uint64_t object_id) { (void)object_id; }
 
 // ─── partition.c stand-in ───────────────────────────────────────────────────
 uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
+// Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: see
+// legacy_rowstore_boundary_host_test.c's identical stub for the full
+// rationale -- a permissive fake satisfies group_profile.c/authlist.c's
+// new dependency on tenant.c without linking the real tenant.c.
+int tenant_caller_may_administer(uint32_t caller_uid, uint32_t partition_id) { (void)caller_uid; (void)partition_id; return 1; }
 
 // ─── transaction.c stand-ins ────────────────────────────────────────────────
 uint64_t tx_get_active(uint32_t thread_id) { (void)thread_id; return 0; }
@@ -163,9 +168,9 @@ int main(void) {
      * of the 'reports' database grant. Two levels of indirection: uid ->
      * group -> database grant -> object, mirroring authlist's own grantee-
      * group mechanism exactly. ──────────────────────────────────────────────── */
-    CHECK(group_create("finance_readers", ROLE_GUEST) == 1,
+    CHECK(group_create(0, "finance_readers", ROLE_GUEST) == 1,
           "s4: group_create() for a GUEST-role group (grants nothing by itself)");
-    CHECK(group_add_member("finance_readers", 6000) == 1, "s4: uid 6000 joins 'finance_readers'");
+    CHECK(group_add_member(0, "finance_readers", 6000) == 1, "s4: uid 6000 joins 'finance_readers'");
     CHECK(catalog_check_access(6000, "sales_2024", PERM_READ) == 0,
           "s4: uid 6000 is still denied -- group membership alone (GUEST role) grants nothing");
     CHECK(database_grant_group("reports", "finance_readers", PERM_READ) == 0,

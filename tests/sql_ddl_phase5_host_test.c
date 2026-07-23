@@ -93,6 +93,11 @@ void tier_notify_access(uint64_t object_id) { (void)object_id; }
 // ─── partition.c stand-in: every uid this test uses defaults to partition 0,
 // matching partition_get_for_uid()'s own documented default. ───────────────
 uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
+// Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: see
+// legacy_rowstore_boundary_host_test.c's identical stub for the full
+// rationale -- a permissive fake satisfies group_profile.c/authlist.c's
+// new dependency on tenant.c without linking the real tenant.c.
+int tenant_caller_may_administer(uint32_t caller_uid, uint32_t partition_id) { (void)caller_uid; (void)partition_id; return 1; }
 
 // ─── transaction.c stand-ins (object_catalog.c's own forward-declared
 // externs) -- tx_get_active() always reports "no open transaction" so every

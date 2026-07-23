@@ -1,6 +1,9 @@
 #include "authlist.h"
 #include "kernel_io.h"
 #include "../user/permissions.h"
+#include "object_catalog.h"   // object_catalog[]/object_catalog_count -- Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4
+#include "partition.h"         // partition_get_for_uid()
+#include "tenant.h"             // tenant_caller_may_administer()
 
 // ─── String helpers (same small local-copy convention as group_profile.c's
 // gp_* / auth.c's au_* / object_catalog.c's cat_*) ──────────────────────────
@@ -25,9 +28,37 @@ static int find_authlist_idx(const char* name) {
     return -1;
 }
 
+// ─── find_object_partition_id ───────────────────────────────────────────────
+// Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: authlist_grant_
+// object() needs to know which partition the named catalog object belongs
+// to, to refuse attaching a grant scoped to another tenant's object.
+// object_catalog[] is the real, extern catalog array (object_catalog.h) --
+// this is a direct scan, the same O(n) posture find_authlist_idx() itself
+// already has (AUTHLIST_MAX/CATALOG_MAX_OBJECTS are both small, fixed,
+// simulated-deployment-sized tables, not a hot path).
+static int find_object_partition_id(const char* obj_name, uint32_t* out_partition_id) {
+    for (uint32_t i = 0; i < object_catalog_count; i++) {
+        if (object_catalog[i].active && al_streq(object_catalog[i].name, obj_name)) {
+            if (out_partition_id) *out_partition_id = object_catalog[i].partition_id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // ─── authlist_create ────────────────────────────────────────────────────────
-int authlist_create(const char* name) {
+// Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: authlist_create()
+// used to take no caller_uid and have zero permission gate, exactly like
+// group_create() before this same fix -- see group_profile.c's own comment
+// for the full rationale, identical here.
+int authlist_create(uint32_t caller_uid, const char* name) {
     if (!name || !name[0]) return 0;
+    uint32_t partition_id = partition_get_for_uid(caller_uid);
+    if (!tenant_caller_may_administer(caller_uid, partition_id)) {
+        kernel_serial_printf("[AUTHLIST] ERROR: uid %u may not administer partition %u's RBAC.\n",
+                             caller_uid, partition_id);
+        return 0;
+    }
     if (find_authlist_idx(name) >= 0) {
         kernel_serial_printf("[AUTHLIST] ERROR: List '%s' already exists.\n", name);
         return 0;
@@ -40,8 +71,9 @@ int authlist_create(const char* name) {
             l->grantee_uid_count   = 0;
             l->grantee_group_count = 0;
             l->active              = 1;
+            l->partition_id        = partition_id;
             if ((uint32_t)(i + 1) > authlist_table_count) authlist_table_count = (uint32_t)(i + 1);
-            kernel_serial_printf("[AUTHLIST] Created list '%s'.\n", name);
+            kernel_serial_printf("[AUTHLIST] Created list '%s' (partition_id=%u).\n", name, partition_id);
             return 1;
         }
     }
@@ -50,13 +82,28 @@ int authlist_create(const char* name) {
 }
 
 // ─── authlist_grant_object ──────────────────────────────────────────────────
-int authlist_grant_object(const char* list_name, const char* object_name, uint32_t perm_mask) {
+int authlist_grant_object(uint32_t caller_uid, const char* list_name, const char* object_name, uint32_t perm_mask) {
     int idx = find_authlist_idx(list_name);
     if (idx < 0) {
         kernel_serial_printf("[AUTHLIST] ERROR: List '%s' not found.\n", list_name);
         return 0;
     }
     struct SLSAuthListEntry* l = &authlist_table[idx];
+    if (!tenant_caller_may_administer(caller_uid, l->partition_id)) {
+        kernel_serial_printf("[AUTHLIST] ERROR: uid %u may not administer list '%s' (partition %u).\n",
+                             caller_uid, list_name, l->partition_id);
+        return 0;
+    }
+    uint32_t obj_partition_id;
+    if (!find_object_partition_id(object_name, &obj_partition_id)) {
+        kernel_serial_printf("[AUTHLIST] ERROR: object '%s' not found.\n", object_name);
+        return 0;
+    }
+    if (obj_partition_id != l->partition_id) {
+        kernel_serial_printf("[AUTHLIST] ERROR: object '%s' (partition %u) does not belong to the partition (%u) list '%s' is scoped to -- cross-tenant grant refused.\n",
+                             object_name, obj_partition_id, l->partition_id, list_name);
+        return 0;
+    }
 
     // Update in place if this object is already attached.
     for (uint32_t i = 0; i < l->object_count; i++) {
@@ -81,13 +128,23 @@ int authlist_grant_object(const char* list_name, const char* object_name, uint32
 }
 
 // ─── authlist_grant_uid ─────────────────────────────────────────────────────
-int authlist_grant_uid(const char* list_name, uint32_t uid) {
+int authlist_grant_uid(uint32_t caller_uid, const char* list_name, uint32_t uid) {
     int idx = find_authlist_idx(list_name);
     if (idx < 0) {
         kernel_serial_printf("[AUTHLIST] ERROR: List '%s' not found.\n", list_name);
         return 0;
     }
     struct SLSAuthListEntry* l = &authlist_table[idx];
+    if (!tenant_caller_may_administer(caller_uid, l->partition_id)) {
+        kernel_serial_printf("[AUTHLIST] ERROR: uid %u may not administer list '%s' (partition %u).\n",
+                             caller_uid, list_name, l->partition_id);
+        return 0;
+    }
+    if (partition_get_for_uid(uid) != l->partition_id) {
+        kernel_serial_printf("[AUTHLIST] ERROR: uid %u is not in the partition (%u) list '%s' is scoped to -- cross-tenant grantee refused.\n",
+                             uid, l->partition_id, list_name);
+        return 0;
+    }
     for (uint32_t i = 0; i < l->grantee_uid_count; i++) {
         if (l->grantee_uids[i] == uid) {
             kernel_serial_printf("[AUTHLIST] uid %u is already a grantee of '%s'.\n", uid, list_name);
@@ -104,13 +161,28 @@ int authlist_grant_uid(const char* list_name, uint32_t uid) {
 }
 
 // ─── authlist_grant_group ───────────────────────────────────────────────────
-int authlist_grant_group(const char* list_name, const char* group_name) {
+int authlist_grant_group(uint32_t caller_uid, const char* list_name, const char* group_name) {
     int idx = find_authlist_idx(list_name);
     if (idx < 0) {
         kernel_serial_printf("[AUTHLIST] ERROR: List '%s' not found.\n", list_name);
         return 0;
     }
     struct SLSAuthListEntry* l = &authlist_table[idx];
+    if (!tenant_caller_may_administer(caller_uid, l->partition_id)) {
+        kernel_serial_printf("[AUTHLIST] ERROR: uid %u may not administer list '%s' (partition %u).\n",
+                             caller_uid, list_name, l->partition_id);
+        return 0;
+    }
+    uint32_t group_partition_id;
+    if (!group_get_partition_id(group_name, &group_partition_id)) {
+        kernel_serial_printf("[AUTHLIST] ERROR: group '%s' not found.\n", group_name);
+        return 0;
+    }
+    if (group_partition_id != l->partition_id) {
+        kernel_serial_printf("[AUTHLIST] ERROR: group '%s' (partition %u) does not belong to the partition (%u) list '%s' is scoped to -- cross-tenant grantee refused.\n",
+                             group_name, group_partition_id, l->partition_id, list_name);
+        return 0;
+    }
     for (uint32_t i = 0; i < l->grantee_group_count; i++) {
         if (al_streq(l->grantee_groups[i], group_name)) {
             kernel_serial_printf("[AUTHLIST] group '%s' is already a grantee of '%s'.\n",
@@ -178,15 +250,15 @@ void authlist_list(void) {
 // ─── Syscall wrappers ────────────────────────────────────────────────────────
 uint64_t sys_sls_authlist_create(struct SLSAuthListCreateRequest* req) {
     if (!req) return 1;
-    return authlist_create(req->name) ? 0 : 1;
+    return authlist_create(req->caller_uid, req->name) ? 0 : 1;
 }
 
 uint64_t sys_sls_authlist_grant(struct SLSAuthListGrantRequest* req) {
     if (!req) return 1;
     switch (req->kind) {
-        case 0:  return authlist_grant_object(req->list_name, req->object_name, req->perm_mask) ? 0 : 1;
-        case 1:  return authlist_grant_uid(req->list_name, req->grantee_uid) ? 0 : 1;
-        case 2:  return authlist_grant_group(req->list_name, req->grantee_group) ? 0 : 1;
+        case 0:  return authlist_grant_object(req->caller_uid, req->list_name, req->object_name, req->perm_mask) ? 0 : 1;
+        case 1:  return authlist_grant_uid(req->caller_uid, req->list_name, req->grantee_uid) ? 0 : 1;
+        case 2:  return authlist_grant_group(req->caller_uid, req->list_name, req->grantee_group) ? 0 : 1;
         default: return 1;
     }
 }

@@ -56,33 +56,49 @@ struct SLSAuthListEntry {
     char     grantee_groups[AUTHLIST_MAX_GRANTEE_GROUPS][GROUP_NAME_LEN];
     uint32_t grantee_group_count;
     uint8_t  active;
+    // Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: same
+    // creation-time-stamped scope as group_profile.h's SLSGroupEntry --
+    // see that struct's own comment. authlist_create()/authlist_grant_*()
+    // now gate on tenant_caller_may_administer() and require every object/
+    // uid/group attached to a list to belong to the same partition as the
+    // list itself (see authlist.c for the full rationale).
+    uint32_t partition_id;
 };
 
 extern struct SLSAuthListEntry authlist_table[AUTHLIST_MAX];
 extern uint32_t                authlist_table_count;
 
-// Creates a new empty authorization list. Returns 1 on success, 0 if the
-// name is taken or the table is full.
-int authlist_create(const char* name);
+// Creates a new empty authorization list, scoped to caller_uid's own
+// partition. Returns 1 on success, 0 if the name is taken, the table is
+// full, or caller_uid is not allowed to administer RBAC primitives for its
+// own partition (tenant_caller_may_administer(), tenant.h) -- Multitenant
+// Isolation Gap Analysis §5 item 5 / §7 item 4.
+int authlist_create(uint32_t caller_uid, const char* name);
 
 // Attaches (or updates, if already present) an {object_name, perm_mask}
 // entry on the named list. Returns 1 on success, 0 if the list doesn't
-// exist or its object-entry table is full.
-int authlist_grant_object(const char* list_name, const char* object_name, uint32_t perm_mask);
+// exist, caller_uid may not administer the list's partition, object_name
+// doesn't exist or belongs to a different partition than the list
+// (attaching a grant on another tenant's object is refused outright), or
+// the object-entry table is full.
+int authlist_grant_object(uint32_t caller_uid, const char* list_name, const char* object_name, uint32_t perm_mask);
 
 // Adds uid as a direct grantee of the named list. Returns 1 on success, 0 if
-// the list doesn't exist, uid is already a grantee, or the grantee list is full.
-int authlist_grant_uid(const char* list_name, uint32_t uid);
+// the list doesn't exist, caller_uid may not administer the list's
+// partition, uid's own partition doesn't match the list's (cross-tenant
+// grantees are refused outright), uid is already a grantee, or the grantee
+// list is full.
+int authlist_grant_uid(uint32_t caller_uid, const char* list_name, uint32_t uid);
 
 // Adds group_name as a grantee of the named list -- every current and future
 // member of that group inherits this list's grants. Returns 1 on success, 0
-// if the list doesn't exist or the grantee-group list is full. Does NOT
-// require group_name to already exist as a real group (mirrors
-// partition_set_frame_quota()'s own "can be pre-configured before creation"
-// posture) -- group_contains_uid() simply returns 0 for a group that was
-// never created, so an authlist grantee-group entry pointing at a
-// not-yet-created group is harmless, just inert until the group exists.
-int authlist_grant_group(const char* list_name, const char* group_name);
+// if the list doesn't exist, caller_uid may not administer the list's
+// partition, group_name doesn't exist or belongs to a different partition
+// than the list (unlike the pre-Phase-3-scoping behavior, group_name MUST
+// already exist as a real group now -- its partition has to be checked, so
+// the "can be pre-configured before creation" allowance this function used
+// to document no longer applies), or the grantee-group list is full.
+int authlist_grant_group(uint32_t caller_uid, const char* list_name, const char* group_name);
 
 // Returns 1 if uid is granted `needed_perm` on `obj_name` via ANY active
 // authorization list -- either as a direct grantee, or as a member of one of
@@ -109,7 +125,8 @@ void authlist_list(void);
 #define SYS_SLS_AUTHLIST_LIST   244
 
 struct SLSAuthListCreateRequest {
-    char name[AUTHLIST_NAME_LEN];
+    char     name[AUTHLIST_NAME_LEN];
+    uint32_t caller_uid;   // Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4
 };
 
 // kind: 0 = attach object (object_name + perm_mask used), 1 = add grantee
@@ -121,6 +138,7 @@ struct SLSAuthListGrantRequest {
     uint32_t perm_mask;
     uint32_t grantee_uid;
     char     grantee_group[GROUP_NAME_LEN];
+    uint32_t caller_uid;   // Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4
 };
 
 struct SLSAuthListCheckRequest {

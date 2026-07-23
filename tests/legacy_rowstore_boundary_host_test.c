@@ -161,6 +161,14 @@ void persist_row_journal(void) {}
 // before this is ever consulted; every other uid this test uses defaults to
 // partition 0, matching partition_get_for_uid()'s own documented default. ──
 uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
+// Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: group_profile.c/
+// authlist.c now gate group_create()/authlist_create()/etc. behind
+// tenant.c's tenant_caller_may_administer(), which this test doesn't link
+// kernel/tenant.c for (this test isn't exercising RBAC scoping, just
+// linking group_profile.c/authlist.c as catalog_check_access()'s own
+// dependencies) -- a permissive fake satisfies the symbol without pulling
+// in tenant.c's own partition_create()/database_create() dependency chain.
+int tenant_caller_may_administer(uint32_t caller_uid, uint32_t partition_id) { (void)caller_uid; (void)partition_id; return 1; }
 
 // ─── transaction.c stand-ins (object_catalog.c's own forward-declared
 // externs) -- tx_get_active() always reports "no open transaction" so every

@@ -72,6 +72,11 @@ void tier_notify_access(uint64_t object_id) { (void)object_id; }
 // never exercises cross-partition denial (that's LPAR-phase territory, not
 // Phase 3's). ────────────────────────────────────────────────────────────────
 uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
+// Multitenant Isolation Gap Analysis §5 item 5 / §7 item 4: see
+// legacy_rowstore_boundary_host_test.c's identical stub for the full
+// rationale -- a permissive fake satisfies group_profile.c/authlist.c's
+// new dependency on tenant.c without linking the real tenant.c.
+int tenant_caller_may_administer(uint32_t caller_uid, uint32_t partition_id) { (void)caller_uid; (void)partition_id; return 1; }
 
 // ─── transaction.c stand-ins (object_catalog.c's own forward-declared
 // externs) -- never actually reached since this test doesn't call sys_sls_
@@ -183,10 +188,10 @@ int main(void) {
     // through role_table[] at all. ───────────────────────────────────────────
     CHECK(catalog_check_access(6000, "ledger", PERM_READ) == 0,
           "s3: uid 6000 is denied before joining any group (sanity baseline)");
-    CHECK(group_create("finance_admins", ROLE_DB_ADMIN) == 1, "s3: group_create() succeeds");
-    CHECK(group_create("finance_admins", ROLE_DB_ADMIN) == 0,
+    CHECK(group_create(0, "finance_admins", ROLE_DB_ADMIN) == 1, "s3: group_create() succeeds");
+    CHECK(group_create(0, "finance_admins", ROLE_DB_ADMIN) == 0,
           "s3: creating a duplicate group name fails");
-    CHECK(group_add_member("finance_admins", 6000) == 1, "s3: group_add_member() adds uid 6000");
+    CHECK(group_add_member(0, "finance_admins", 6000) == 1, "s3: group_add_member() adds uid 6000");
     CHECK(group_contains_uid("finance_admins", 6000) == 1,
           "s3: group_contains_uid() reports uid 6000 as a member");
     CHECK(group_contains_uid("finance_admins", 7000) == 0,
@@ -201,11 +206,11 @@ int main(void) {
     // an authlist. ───────────────────────────────────────────────────────────
     CHECK(catalog_check_access(8000, "ledger", PERM_READ) == 0,
           "s4: uid 8000 is denied before any authlist grant (sanity baseline)");
-    CHECK(authlist_create("ledger_readers") == 1, "s4: authlist_create() succeeds");
-    CHECK(authlist_create("ledger_readers") == 0, "s4: creating a duplicate authlist name fails");
-    CHECK(authlist_grant_object("ledger_readers", "ledger", PERM_READ) == 1,
+    CHECK(authlist_create(0, "ledger_readers") == 1, "s4: authlist_create() succeeds");
+    CHECK(authlist_create(0, "ledger_readers") == 0, "s4: creating a duplicate authlist name fails");
+    CHECK(authlist_grant_object(0, "ledger_readers", "ledger", PERM_READ) == 1,
           "s4: authlist_grant_object() attaches {ledger, PERM_READ} to the list");
-    CHECK(authlist_grant_uid("ledger_readers", 8000) == 1,
+    CHECK(authlist_grant_uid(0, "ledger_readers", 8000) == 1,
           "s4: authlist_grant_uid() adds uid 8000 as a direct grantee");
     CHECK(authlist_check_access(8000, "ledger", PERM_READ) == 1,
           "s4: authlist_check_access() confirms uid 8000 is granted READ on 'ledger'");
@@ -219,13 +224,13 @@ int main(void) {
     // ── Scenario 5: authlist grantee GROUPS -- uid 9000 is a member of a
     // group that is itself a grantee of an authlist (two levels of
     // indirection: uid -> group -> authlist -> object). ─────────────────────
-    CHECK(group_create("auditors", ROLE_GUEST) == 1,
+    CHECK(group_create(0, "auditors", ROLE_GUEST) == 1,
           "s5: group_create() for a GUEST-role group (the group itself grants nothing on its "
           "own -- only the authlist grantee-group link should matter here)");
-    CHECK(group_add_member("auditors", 9000) == 1, "s5: uid 9000 joins the 'auditors' group");
+    CHECK(group_add_member(0, "auditors", 9000) == 1, "s5: uid 9000 joins the 'auditors' group");
     CHECK(catalog_check_access(9000, "ledger", PERM_READ) == 0,
           "s5: uid 9000 is still denied -- a GUEST-role group grants nothing by itself");
-    CHECK(authlist_grant_group("ledger_readers", "auditors") == 1,
+    CHECK(authlist_grant_group(0, "ledger_readers", "auditors") == 1,
           "s5: authlist_grant_group() adds 'auditors' as a grantee group of 'ledger_readers'");
     CHECK(catalog_check_access(9000, "ledger", PERM_READ) == 1,
           "s5: uid 9000 now passes -- granted via group membership in an authlist grantee group");

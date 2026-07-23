@@ -668,6 +668,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             struct SLSGroupCreateRequest req;
             sh_copy(req.name, name, GROUP_NAME_LEN);
             req.role = role;
+            req.caller_uid = current_session_uid;
             uint64_t status = do_syscall(SYS_SLS_GROUP_CREATE, &req);
             if (status == 0) kernel_serial_printf("Group '%s' created.\n", name);
             else kernel_serial_print("Group creation failed (duplicate name or table full).\n");
@@ -684,6 +685,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             struct SLSGroupAddMemberRequest req;
             sh_copy(req.name, name, GROUP_NAME_LEN);
             req.uid = sh_atoi(p);
+            req.caller_uid = current_session_uid;
             uint64_t status = do_syscall(SYS_SLS_GROUP_ADD_MEMBER, &req);
             if (status == 0) kernel_serial_printf("uid %u added to group '%s'.\n", req.uid, name);
             else kernel_serial_print("Add-member failed (group not found, already a member, or list full).\n");
@@ -701,6 +703,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             size_t nlen = 0;
             while (p[nlen] && p[nlen] != ' ' && p[nlen] != '\0') nlen++;
             sh_copy(req.name, p, nlen + 1 < AUTHLIST_NAME_LEN ? nlen + 1 : AUTHLIST_NAME_LEN);
+            req.caller_uid = current_session_uid;
             uint64_t status = do_syscall(SYS_SLS_AUTHLIST_CREATE, &req);
             if (status == 0) kernel_serial_printf("Authorization list '%s' created.\n", req.name);
             else kernel_serial_print("Authorization-list creation failed (duplicate name or table full).\n");
@@ -720,6 +723,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             sh_copy(req.object_name, p, olen + 1 < OBJECT_NAME_LEN ? olen + 1 : OBJECT_NAME_LEN);
             p = sh_next(p);
             req.perm_mask = parse_perm_string(p);
+            req.caller_uid = current_session_uid;
             uint64_t status = do_syscall(SYS_SLS_AUTHLIST_GRANT, &req);
             if (status == 0) kernel_serial_printf("List '%s' now grants 0x%02x on '%s'.\n",
                                                   req.list_name, req.perm_mask, req.object_name);
@@ -734,6 +738,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             sh_copy(req.list_name, p, nlen + 1 < AUTHLIST_NAME_LEN ? nlen + 1 : AUTHLIST_NAME_LEN);
             p = sh_next(p);
             req.grantee_uid = sh_atoi(p);
+            req.caller_uid = current_session_uid;
             uint64_t status = do_syscall(SYS_SLS_AUTHLIST_GRANT, &req);
             if (status == 0) kernel_serial_printf("uid %u added as grantee of '%s'.\n",
                                                   req.grantee_uid, req.list_name);
@@ -750,6 +755,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             size_t glen = 0;
             while (p[glen] && p[glen] != ' ' && p[glen] != '\0') glen++;
             sh_copy(req.grantee_group, p, glen + 1 < GROUP_NAME_LEN ? glen + 1 : GROUP_NAME_LEN);
+            req.caller_uid = current_session_uid;
             uint64_t status = do_syscall(SYS_SLS_AUTHLIST_GRANT, &req);
             if (status == 0) kernel_serial_printf("group '%s' added as grantee of '%s'.\n",
                                                   req.grantee_group, req.list_name);

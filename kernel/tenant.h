@@ -125,6 +125,50 @@ uint32_t tenant_find_id(const char* name);
 uint32_t tenant_find_by_partition(uint32_t partition_id);
 uint32_t tenant_find_by_database(uint32_t database_id);
 
+// ─── Tenant-scoped RBAC administration gate (Multitenant Isolation Gap
+// Analysis §5 item 5 / §7 item 4) ───────────────────────────────────────────
+//
+// group_profile.c's group_create()/group_add_member() and authlist.c's
+// authlist_create()/authlist_grant_*() had NO permission gate at all before
+// this — any uid, with zero identity checking, could call them via
+// do_syscall() and create a group/authlist naming ANY role, any member uid,
+// any object. That's not a partition-boundary leak in the access-check sense
+// (catalog_check_access()'s own e->partition_id != partition_get_for_uid(uid)
+// hard boundary at the top of that function still applies to every actual
+// object access a group/authlist grant enables), but it is exactly the "a
+// customer needs to administer their own users without needing global
+// authority" gap the doc names: there was no way for a tenant's own owner to
+// manage groups/authlists scoped to just their tenant, and conversely
+// nothing stopped one tenant's caller from naming another tenant's uids as
+// members/grantees of a group/authlist that (while ultimately harmless
+// against object access, per the boundary above) still leaks tenant
+// membership information and clutters a shared, unscoped global namespace.
+//
+// This lives in tenant.c, not duplicated once each in group_profile.c and
+// authlist.c, because "who administers this tenant" is tenant.c's own
+// concept — it already owns tenants[].owner_uid, the answer to exactly this
+// question. Returns 1 if caller_uid may administer (create/manage groups,
+// authorization lists, and other tenant-scoped RBAC primitives for)
+// partition_id:
+//   - caller_uid's role (object_catalog.c's catalog_get_role()) is
+//     ROLE_SYSTEM_KERNEL — mirrors catalog_check_access()'s own
+//     kernel-always-passes rule; matches every other admin gate in this
+//     codebase.
+//   - partition_id == PARTITION_SYSTEM: no single tenant owns the system
+//     partition by definition (it's the default for uid 0 and every uid
+//     never assigned to a tenant) — only a global ROLE_DB_ADMIN caller may
+//     administer it, the same system-wide admin authority that already
+//     existed before tenants did.
+//   - otherwise: caller_uid must be the exact owner_uid stamped on the
+//     tenant record whose partition_id matches (tenant_find_by_partition()
+//     + a linear scan of tenants[], mirroring tenant_find_by_partition()'s
+//     own O(n) posture — TENANT_MAX is 32, this isn't a hot path). A
+//     partition with no tenant record at all (e.g. one created directly via
+//     partition_create() before tenant_create() ever ran) has no self-
+//     service owner and is denied — the honest answer, not a silent
+//     fallback to some other authority.
+int tenant_caller_may_administer(uint32_t caller_uid, uint32_t partition_id);
+
 // ─── Syscalls ─────────────────────────────────────────────────────────────
 // 270-271, immediately following object_catalog.h's SYS_SLS_OBJECT_SET_
 // DATABASE = 269 -- confirmed via a fresh grep across every kernel/*.h

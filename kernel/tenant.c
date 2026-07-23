@@ -7,6 +7,7 @@
 #include "database.h"
 #include "kernel_io.h"
 #include "persist.h"   // persist_tenants()
+#include "object_catalog.h"   // SLSRole, catalog_get_role() -- for tenant_caller_may_administer()
 
 struct SLSTenantEntry tenants[TENANT_MAX];
 uint32_t              tenant_next_id = 1;   // 0 reserved for NONE — see tenant.h's own comment
@@ -131,6 +132,28 @@ uint32_t tenant_find_by_database(uint32_t database_id) {
     if (database_id == 0) return 0;   // 0 is NONE/unassigned on the database side too -- never a real match
     for (int i = 0; i < TENANT_MAX; i++) {
         if (tenants[i].active && tenants[i].database_id == database_id) return tenants[i].tenant_id;
+    }
+    return 0;
+}
+
+// ─── tenant_caller_may_administer ───────────────────────────────────────
+// See tenant.h for the full design writeup.
+int tenant_caller_may_administer(uint32_t caller_uid, uint32_t partition_id) {
+    SLSRole role = catalog_get_role(caller_uid);
+    if (role == ROLE_SYSTEM_KERNEL) return 1;
+
+    if (partition_id == PARTITION_SYSTEM) {
+        // No single tenant owns the system partition by definition -- only
+        // a global admin may administer RBAC primitives scoped to it.
+        return role == ROLE_DB_ADMIN;
+    }
+
+    uint32_t tid = tenant_find_by_partition(partition_id);
+    if (tid == 0) return 0;   // no tenant record claims this partition -- no self-service owner exists
+    for (int i = 0; i < TENANT_MAX; i++) {
+        if (tenants[i].active && tenants[i].tenant_id == tid) {
+            return tenants[i].owner_uid == caller_uid;
+        }
     }
     return 0;
 }
