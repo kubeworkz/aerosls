@@ -11,6 +11,7 @@
 #include "row_constraint.h"   // Phase 5 (SQL Feature-Parity Roadmap, DDL): inline column constraints
 #include "../user/permissions.h"   // Phase 8 follow-on (schema export/import): PERM_READ
 #include "database.h"   // Database Namespace & Access Roadmap Phase 2: CREATE/DROP DATABASE, IN DATABASE tagging
+#include "persist.h"    // Database Gap Analysis §2.3: persist_catalog() after ALTER TABLE ... SET DATABASE retags
 #include <stddef.h>
 
 // ─── String / parsing helpers (no libc — each kernel source file keeps its
@@ -1395,6 +1396,47 @@ static void exec_create_table(uint32_t caller_uid, struct SqlCreateTableStmt* s,
 }
 
 static void exec_alter_table(uint32_t caller_uid, struct SqlAlterTableStmt* s, struct SqlResult* out) {
+    // ── Database Gap Analysis §2.3: ALTER TABLE ... SET DATABASE ────────
+    // A pure catalog-metadata retag -- no storage is touched, no rows
+    // move. Gated through catalog_check_access() with PERM_WRITE (the
+    // established per-object choke point) rather than a bespoke owner
+    // check. The new tag takes effect on the next access check
+    // immediately (catalog_check_access() reads database_id live), so a
+    // table moved into a granted database becomes reachable to that
+    // database's grantees with no further step -- and §1.6's "empty a
+    // database" friction (drop tables outright) is finally closed with a
+    // reassignment path.
+    if (s->alter_kind == 1) {
+        uint32_t new_db_id = 0;
+        if (!s->database_none) {
+            new_db_id = database_find_id(s->database_name);
+            if (new_db_id == 0) {
+                out->error = SQL_ERR_DDL_FAILED;
+                se_strcpy(out->error_msg, "ALTER TABLE SET DATABASE: database not found", SQL_ERR_MSG_LEN);
+                return;
+            }
+        }
+        int tidx = -1;
+        for (uint32_t i = 0; i < object_catalog_count; i++) {
+            if (object_catalog[i].active && object_catalog[i].uses_rowstore &&
+                se_streq(object_catalog[i].name, s->table_name)) { tidx = (int)i; break; }
+        }
+        if (tidx < 0) {
+            out->error = SQL_ERR_TABLE_NOT_FOUND;
+            se_strcpy(out->error_msg, "ALTER TABLE SET DATABASE: table not found or not a row-set table", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (!catalog_check_access(caller_uid, s->table_name, PERM_WRITE)) {
+            out->error = SQL_ERR_PERMISSION_DENIED;
+            se_strcpy(out->error_msg, "ALTER TABLE SET DATABASE: permission denied", SQL_ERR_MSG_LEN);
+            return;
+        }
+        object_catalog[tidx].database_id = new_db_id;
+        persist_catalog();   // the tag lives on the catalog entry -- catalog snapshot, not the database one
+        out->error = SQL_ERR_NONE;
+        return;
+    }
+
     int rc = rowstore_add_column(caller_uid, s->table_name, s->column_name, s->column_type);
     switch (rc) {
         case 0: {

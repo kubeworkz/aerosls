@@ -275,14 +275,19 @@ There is deliberately no `ALTER TABLE ... SET DATABASE` in v1 either
 means dropping its tables outright, not reassigning them elsewhere. Named
 as real, current friction, not hidden.
 
-### 1.7 — No `ALTER TABLE ... SET DATABASE`
+### 1.7 — No `ALTER TABLE ... SET DATABASE` — CLOSED (Database Gap Analysis Gap 4)
 
-A table's database assignment is fixed at `CREATE TABLE ... IN DATABASE`
-time only, in this first cut. Reassignment after creation is out of
-scope — a real, explicit gap for future work, not a limitation implied
-by anything structural (unlike §1.1's namespace-scope cut, this one is
-purely "not built yet, would be easy to add: extend `ALTER TABLE`'s
-existing grammar with one more clause").
+Originally: a table's database assignment was fixed at `CREATE TABLE ...
+IN DATABASE` time only — named as "not built yet, would be easy to add:
+extend `ALTER TABLE`'s existing grammar with one more clause." That is
+now exactly what happened: `ALTER TABLE t SET DATABASE <name>` reassigns
+the tag, `ALTER TABLE t SET DATABASE NULL` untags (database_id back to
+0/NONE). Pure catalog-metadata retag, gated through
+`catalog_check_access()`, persisted with the catalog snapshot; access
+follows the tag live. See the Database Gap Analysis doc's §2.3 closure
+addendum for the full as-built write-up. This also softens §1.6's
+"empty a database means dropping its tables outright" note — reassignment
+now exists as the third option alongside drop and CASCADE.
 
 ### 1.8 — Cross-database `JOIN` is not restricted (a non-goal, not a gap)
 

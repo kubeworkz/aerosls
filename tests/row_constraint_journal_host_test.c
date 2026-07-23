@@ -540,6 +540,45 @@ int main(void) {
               "s18: the slot-reused UNIQUE constraint genuinely enforces ('globex' survives from s14 -- 'acme' itself was cascade-deleted there)");
     }
 
+    /* ── Scenario 19 (Database Gap Analysis §2.8): parent-key UPDATE
+     * RESTRICT -- the update-side half of REFERENCE enforcement. State
+     * entering this scenario: orders row 200 (from s13) has account_id=10,
+     * referencing accounts row id=10 ('daniel'); orders.account_id
+     * REFERENCES accounts.id was registered back in the reg block. Before
+     * this fix, rewriting accounts.id=10 to another value silently
+     * orphaned order 200. ─────────────────────────────────────────────────── */
+    {
+        SELECT_COUNT("SELECT * FROM orders WHERE account_id = 10", nrows);
+        CHECK(nrows == 1, "s19: precondition -- order 200 still references account 10");
+
+        CHECK(sql_execute(1, "UPDATE accounts SET id = 999 WHERE id = 10", &r) == 1 &&
+              r.error == SQL_ERR_CONSTRAINT_VIOLATION && r.affected_rows == 0,
+              "s19: rewriting a referenced parent key is REJECTED while a child still points at it (the silent-orphan hole, closed)");
+        SELECT_COUNT("SELECT * FROM accounts WHERE id = 10", nrows);
+        CHECK(nrows == 1, "s19: the parent row is unchanged after the rejected update");
+
+        CHECK(sql_execute(1, "UPDATE accounts SET name = 'danny' WHERE id = 10", &r) == 0 && r.affected_rows == 1,
+              "s19: updating a NON-key column of the same referenced parent still succeeds -- no child scan blocks it");
+
+        CHECK(sql_execute(1, "UPDATE accounts SET id = 998 WHERE id = 11", &r) == 0 && r.affected_rows == 1,
+              "s19: rewriting an UNREFERENCED row's key succeeds -- the check scans for actual children, not just constraint existence");
+
+        CHECK(sql_execute(1, "DELETE FROM orders WHERE id = 200", &r) == 0 && r.affected_rows == 1,
+              "s19: the referencing order is deleted");
+        CHECK(sql_execute(1, "UPDATE accounts SET id = 999 WHERE id = 10", &r) == 0 && r.affected_rows == 1,
+              "s19: the same parent-key rewrite succeeds once nothing references the old value");
+
+        /* Update-side is RESTRICT for EVERY constraint regardless of its
+         * ON DELETE action -- customers id=2 ('globex') has invoice 12
+         * under an ON DELETE CASCADE constraint, but there is no ON UPDATE
+         * CASCADE: the key rewrite must still be blocked, not cascaded. */
+        CHECK(sql_execute(1, "UPDATE customers SET id = 97 WHERE id = 2", &r) == 1 &&
+              r.error == SQL_ERR_CONSTRAINT_VIOLATION,
+              "s19: a CASCADE-on-delete parent's key rewrite is still RESTRICT-blocked -- ON UPDATE actions deliberately don't exist");
+        SELECT_COUNT("SELECT * FROM invoices WHERE id = 12", nrows);
+        CHECK(nrows == 1, "s19: and the invoice was neither orphaned nor cascade-touched by the rejected update");
+    }
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

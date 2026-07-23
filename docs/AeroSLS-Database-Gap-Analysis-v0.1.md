@@ -117,12 +117,26 @@ The original finding is kept below in §5's ordering for the record.
 Fine as a decision, but combined with 2.1 the full grant lifecycle is
 unmanageable from SQL entirely.
 
-**2.3 — No `ALTER TABLE ... SET DATABASE` (§1.7).** A table's database
-assignment is fixed at creation. §1.6's own text names the consequence:
-"empty a database" means dropping tables outright (or now, CASCADE).
-The roadmap itself calls this "purely not built yet, would be easy to
-add: extend `ALTER TABLE`'s existing grammar with one more clause."
-Cheapest high-value item in this list.
+**2.3 — No `ALTER TABLE ... SET DATABASE` — CLOSED (Gap 4 remediation,
+as built).** `ALTER TABLE t SET DATABASE <name>` reassigns a row-set
+table's database tag; `ALTER TABLE t SET DATABASE NULL` untags it
+(database_id back to 0/NONE — reusing the existing NULL keyword,
+semantically "no database," rather than inventing a NONE keyword that
+would shadow another identifier). `SqlAlterTableStmt` gained an
+`alter_kind` discriminator (zero-default = ADD COLUMN, so every
+pre-existing statement parses byte-identically). The executor branch is
+a pure catalog-metadata retag — no storage touched, no rows moved —
+gated through `catalog_check_access()` (PERM_WRITE) and persisted via
+`persist_catalog()` (the tag lives on the catalog entry, so it's the
+catalog snapshot's job, not Gap 1's database one). Access follows the
+tag live in both directions, proven by test: a `dst` grantee gains
+access the moment a table moves in, and loses it the moment the table
+is untagged. §1.6/§1.7's "empty a database means dropping its tables
+outright" friction is closed with a real reassignment path — verified
+end-to-end (refuse-drop → reassign → drop succeeds) in
+`sql_database_phase2_host_test.c` scenario 8 (13 new checks, including
+unknown-database/unknown-table error paths and full parser coverage of
+both forms plus the ADD COLUMN zero-default).
 
 **2.4 — Views, CTEs, set operations, correlated subqueries (SQL parity
 Phase 7's own honest cut).** Phase 7 shipped non-correlated scalar and
@@ -148,13 +162,26 @@ them (named in the export's own output, but still a loss). A `CHECK
 (col BETWEEN x AND y)`-shaped grammar clause would close both the DDL
 gap and the round-trip gap at once.
 
-**2.8 — FK actions are delete-side only.** `ON UPDATE
-CASCADE`/`SET NULL` don't exist (the parser explicitly rejects `ON
-UPDATE`, tested). Updating a parent's referenced key while children
-point at it is currently allowed and silently orphans them — the write-
-side REFERENCE check validates the *child's* new value on child writes,
-but nothing re-validates children when the *parent's* key changes. That
-asymmetry is worth naming as the follow-on to the cascading phase.
+**2.8 — FK actions are delete-side only — SILENT-ORPHAN HALF CLOSED
+(Gap 5 remediation, as built).** The dangerous half of this asymmetry is
+fixed: `row_constraint_check_parent_update()` runs from
+`mvcc_row_update()` alongside the existing outbound-FK check, and blocks
+(RESTRICT, `VIOLATION_REFERENCED`) any update that rewrites a referenced
+parent's key column while children still point at the old value. The
+check is precise, not blanket: updates to non-key columns of a
+referenced parent pass with no child scan, an unchanged key passes, a
+NULL old key passes (nothing can reference NULL), and a key rewrite on a
+row with no actual children succeeds — all tested (9 new checks,
+scenario 19 of `row_constraint_journal_host_test.c`), including the
+before/after pair (blocked while referenced, succeeds after the child is
+deleted). RESTRICT applies to EVERY constraint regardless of its
+`on_delete_action` — a CASCADE-on-delete parent's key rewrite is still
+blocked, not cascaded (tested), because `ON UPDATE CASCADE`/`SET NULL`
+actions remain deliberately unbuilt (the parser still rejects `ON
+UPDATE` outright): `on_delete_action` governs deletes only, and full
+update-side actions stay a named deferral per this section's original
+"only if wanted" framing — no longer a correctness hole, now purely a
+convenience feature waiting for a real workload to ask.
 
 ## 3. Capacity & lifecycle limits
 
@@ -225,10 +252,11 @@ see 2.1 for where it chafes).
    SQL `GRANT`/`REVOKE` grammar did NOT ride along — grants stay
    Terminal-only per §1.5's standing decision, now consistently for both
    directions.
-4. **§2.3 `ALTER TABLE ... SET DATABASE`** — cheapest functional win.
-5. **§2.8 ON UPDATE FK asymmetry** — at minimum a RESTRICT-style check
-   on parent-key updates, closing the silent-orphan hole; full ON UPDATE
-   actions only if wanted.
+4. **§2.3 `ALTER TABLE ... SET DATABASE`** — **DONE** (see §2.3's
+   closure addendum).
+5. **§2.8 ON UPDATE FK asymmetry** — **DONE** (the RESTRICT minimum; see
+   §2.8's closure addendum — full ON UPDATE actions remain a named
+   deferral, now convenience-only rather than a correctness hole).
 6. **§2.7 RANGE/CHECK SQL syntax** — closes a schema round-trip loss.
 7. **§2.4/2.5 query-surface items** (views/CTEs/set ops; GROUP BY over
    JOIN) — the big-ticket work, each deserving its own scoping pass, in

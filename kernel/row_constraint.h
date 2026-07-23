@@ -220,4 +220,33 @@ RowConstraintResult row_constraint_check_delete(uint64_t txn_id, uint32_t caller
                                                 const char* table_name, uint64_t table_object_id,
                                                 struct RowId physical_id);
 
+// Database Gap Analysis §2.8: the update-side half of REFERENCE
+// enforcement, closing a real asymmetry -- the write-side check above
+// validates a CHILD row's outbound FK value on child writes, and check_
+// delete() protects a referenced PARENT row from deletion, but nothing
+// re-validated children when the PARENT'S OWN key column changed: an
+// UPDATE rewriting a referenced key silently orphaned every child still
+// pointing at the old value.
+//
+// Called automatically by mvcc_row_update() (mvcc.c) alongside check_
+// write(). For each REFERENCE constraint targeting table_object_id:
+// fetches the pre-update row (physical_id), and if the referenced column's
+// value actually CHANGES in new_values (differs, or becomes NULL), scans
+// the child table for rows still referencing the OLD value -- returning
+// VIOLATION_REFERENCED if any exist. An update that doesn't touch the
+// referenced column (or sets it to the identical value) passes without
+// any child scan. Same cheap short-circuit as check_delete() when no
+// REFERENCE targets the table at all.
+//
+// Deliberately RESTRICT-only, for EVERY constraint regardless of its
+// on_delete_action: ON UPDATE CASCADE/SET NULL actions do not exist in
+// this codebase (the parser rejects `ON UPDATE ...` outright, tested) --
+// a constraint's on_delete_action governs deletes only, and update-side
+// actions remain a named, deliberate deferral (gap doc §2.8: "full ON
+// UPDATE actions only if wanted"), not an oversight.
+RowConstraintResult row_constraint_check_parent_update(uint64_t txn_id, uint32_t caller_uid,
+                                                       const char* table_name, uint64_t table_object_id,
+                                                       struct RowId physical_id,
+                                                       const struct RowValues* new_values);
+
 #endif /* ROW_CONSTRAINT_H */

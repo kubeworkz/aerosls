@@ -1365,9 +1365,13 @@ static void parse_drop_database_body(struct SqlParser* p, struct SqlDropDatabase
     finish_statement(p);
 }
 
-// ALTER TABLE ... ADD COLUMN only -- no ambiguity to disambiguate (ALTER
-// always means ALTER TABLE in this grammar), so unlike CREATE/DROP above,
-// this one consumes ALTER itself, matching parse_delete()'s own pattern.
+// ALTER always means ALTER TABLE in this grammar (no ambiguity to
+// disambiguate), so unlike CREATE/DROP above, this one consumes ALTER
+// itself, matching parse_delete()'s own pattern. Two forms as of Database
+// Gap Analysis §2.3: ADD COLUMN (the original), and SET DATABASE
+// <name>|NULL (reusing TOK_KW_SET/TOK_KW_NULL from their UPDATE-SET /
+// NULL-literal grammar positions -- the same contextual keyword reuse
+// convention IN and ON already follow in this file).
 static void parse_alter_table(struct SqlParser* p, struct SqlAlterTableStmt* s) {
     sq_memset(s, 0, sizeof(*s));
     advance(p);   // consume ALTER
@@ -1375,7 +1379,26 @@ static void parse_alter_table(struct SqlParser* p, struct SqlAlterTableStmt* s) 
     if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a table name after ALTER TABLE"); return; }
     sq_strcpy(s->table_name, p->cur.text, OBJECT_NAME_LEN);
     advance(p);
-    if (!expect(p, TOK_KW_ADD, "expected ADD after ALTER TABLE table name (only ADD COLUMN is supported)")) return;
+
+    if (p->cur.kind == TOK_KW_SET) {
+        advance(p);   // consume SET
+        if (!expect(p, TOK_KW_DATABASE, "expected DATABASE after SET in ALTER TABLE (only SET DATABASE is supported)")) return;
+        s->alter_kind = 1;
+        if (p->cur.kind == TOK_KW_NULL) {
+            s->database_none = 1;   // untag -- database_id back to 0/NONE
+            advance(p);
+        } else if (p->cur.kind == TOK_IDENT) {
+            sq_strcpy(s->database_name, p->cur.text, OBJECT_NAME_LEN);
+            advance(p);
+        } else {
+            set_error(p, "expected a database name (or NULL to untag) after SET DATABASE");
+            return;
+        }
+        finish_statement(p);
+        return;
+    }
+
+    if (!expect(p, TOK_KW_ADD, "expected ADD or SET after ALTER TABLE table name (only ADD COLUMN and SET DATABASE are supported)")) return;
     if (!expect(p, TOK_KW_COLUMN, "expected COLUMN after ADD")) return;
     if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name after ADD COLUMN"); return; }
     sq_strcpy(s->column_name, p->cur.text, RECORD_KEY_LEN);

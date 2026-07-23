@@ -350,6 +350,17 @@ MvccError mvcc_row_update(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     RowConstraintResult cres = row_constraint_check_write(txn_id, caller_uid, old->table_object_id, values, id.logical_id);
     if (cres != ROW_CONSTRAINT_OK) return map_constraint_violation(cres);
 
+    // Database Gap Analysis §2.8: the update-side half of REFERENCE
+    // enforcement -- check_write() above validated this row's own OUTBOUND
+    // FK values; this validates the INBOUND direction: if this row is a
+    // referenced PARENT and its key column is changing, children still
+    // pointing at the old value block the update (RESTRICT), closing the
+    // silent-orphan hole where a parent key could be rewritten out from
+    // under its children.
+    RowConstraintResult pres = row_constraint_check_parent_update(txn_id, caller_uid, table_name,
+                                                                  old->table_object_id, old->physical_id, values);
+    if (pres != ROW_CONSTRAINT_OK) return map_constraint_violation(pres);
+
     // Phase 23: fetch the pre-update row for the journal's before-image --
     // best-effort (a failed fetch here is unusual, since this transaction
     // just proved the row visible via mv_find_visible_version() above, but

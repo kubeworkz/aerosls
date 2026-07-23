@@ -314,6 +314,50 @@ static void rc_collect_scan_cb(struct MvccRowId id, const struct RowValues* v, v
 // counter can never be racing another in-flight delete's.
 static uint32_t rc_cascade_depth = 0;
 
+// Database Gap Analysis §2.8 -- see row_constraint.h's own comment for the
+// full design (update-side REFERENCE enforcement, RESTRICT-only).
+RowConstraintResult row_constraint_check_parent_update(uint64_t txn_id, uint32_t caller_uid,
+                                                       const char* table_name, uint64_t table_object_id,
+                                                       struct RowId physical_id,
+                                                       const struct RowValues* new_values) {
+    // Cheap common case, same shape as check_delete()'s: nothing references
+    // this table, so no key change here can orphan anything.
+    int any_ref = 0;
+    for (uint32_t i = 0; i < row_constraint_count; i++) {
+        if (row_constraints[i].active && row_constraints[i].kind == ROW_CONSTRAINT_REFERENCE &&
+            row_constraints[i].ref_table_object_id == table_object_id) { any_ref = 1; break; }
+    }
+    if (!any_ref) return ROW_CONSTRAINT_OK;
+
+    struct RowValues old;
+    if (rowstore_row_get(caller_uid, table_name, physical_id, &old) != 0) return ROW_CONSTRAINT_OK;   // row already gone -- nothing to protect
+
+    for (uint32_t i = 0; i < row_constraint_count; i++) {
+        struct RowConstraintDef* c = &row_constraints[i];
+        if (!c->active || c->kind != ROW_CONSTRAINT_REFERENCE || c->ref_table_object_id != table_object_id) continue;
+        uint32_t col = c->ref_column_index;
+        if (col >= old.count || col >= new_values->count) continue;
+
+        // A NULL old key can never be referenced (rc_ref_scan_cb's own
+        // NULL-never-matches rule) -- whatever it changes to, no child is
+        // orphaned by this constraint.
+        if (old.null_mask & (1u << col)) continue;
+
+        // Key unchanged (non-NULL -> identical non-NULL value)? No child's
+        // reference breaks -- pass without scanning.
+        int new_is_null = (new_values->null_mask & (1u << col)) ? 1 : 0;
+        if (!new_is_null && rc_strcmp(old.values[col], new_values->values[col]) == 0) continue;
+
+        // The referenced key genuinely changes -- block if any child still
+        // points at the OLD value (RESTRICT; see the header on why this
+        // applies regardless of the constraint's on_delete_action).
+        struct rc_ref_ctx ctx = { c->column_index, old.values[col], 0 };
+        mvcc_table_scan(txn_id, caller_uid, c->table_name, rc_ref_scan_cb, &ctx);
+        if (ctx.found) return ROW_CONSTRAINT_VIOLATION_REFERENCED;
+    }
+    return ROW_CONSTRAINT_OK;
+}
+
 RowConstraintResult row_constraint_check_delete(uint64_t txn_id, uint32_t caller_uid,
                                                 const char* table_name, uint64_t table_object_id,
                                                 struct RowId physical_id) {

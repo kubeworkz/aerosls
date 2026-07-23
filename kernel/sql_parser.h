@@ -619,13 +619,33 @@ struct SqlDropDatabaseStmt {
     uint8_t cascade;   // Cascading phase: DROP DATABASE <name> CASCADE
 };
 
-// ALTER TABLE ... ADD COLUMN only for v1 -- see rowstore.c's rowstore_add_
-// column() header comment for why DROP COLUMN/RENAME are real, separate,
-// bigger storage-layout undertakings scoped out of this phase.
+// Two forms as of Database Gap Analysis §2.3 (previously ADD COLUMN only):
+//   ALTER TABLE t ADD COLUMN <col> <type>     -- alter_kind 0 (the zero
+//                                                default, so every
+//                                                pre-§2.3 statement parses
+//                                                byte-identically)
+//   ALTER TABLE t SET DATABASE <name>         -- alter_kind 1: reassign the
+//                                                table's database tag
+//   ALTER TABLE t SET DATABASE NULL           -- alter_kind 1 with
+//                                                database_none=1: untag
+//                                                (database_id back to
+//                                                0/NONE). Reuses the
+//                                                existing NULL keyword --
+//                                                semantically "no
+//                                                database" -- rather than
+//                                                inventing a NONE keyword
+//                                                that would shadow another
+//                                                identifier.
+// DROP COLUMN/RENAME remain out of scope -- see rowstore.c's rowstore_add_
+// column() header comment for why those are real, separate, bigger
+// storage-layout undertakings.
 struct SqlAlterTableStmt {
     char         table_name[OBJECT_NAME_LEN];
-    char         column_name[RECORD_KEY_LEN];
-    SLSFieldType column_type;
+    uint8_t      alter_kind;     // 0 = ADD COLUMN, 1 = SET DATABASE
+    char         column_name[RECORD_KEY_LEN];   // ADD COLUMN only
+    SLSFieldType column_type;                    // ADD COLUMN only
+    char         database_name[OBJECT_NAME_LEN]; // SET DATABASE only
+    uint8_t      database_none;                  // SET DATABASE NULL -- untag
 };
 
 struct SqlDropTableStmt {

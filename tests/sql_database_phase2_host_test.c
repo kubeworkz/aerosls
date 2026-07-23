@@ -338,6 +338,64 @@ int main(void) {
               "scenario 7h: ON UPDATE is rejected -- only ON DELETE actions are supported, named in the error not silently ignored");
     }
 
+    /* ── Scenario 8 (Database Gap Analysis §2.3): ALTER TABLE ... SET
+     * DATABASE -- reassign and untag, end to end through the real SQL
+     * path. Closes §1.6's original "empty a database means dropping its
+     * tables outright" friction with a real reassignment path. ────────────── */
+    CHECK(sql_execute(0, "CREATE DATABASE src", &r) == 0 &&
+          sql_execute(0, "CREATE DATABASE dst", &r) == 0,
+          "scenario 8: two databases created");
+    CHECK(sql_execute(0, "CREATE TABLE movable (id UINT64) IN DATABASE src", &r) == 0,
+          "scenario 8b: table created tagged with 'src'");
+    CHECK(sql_execute(0, "DROP DATABASE src", &r) == 1,
+          "scenario 8c: 'src' can't be dropped while 'movable' is tagged with it");
+    CHECK(sql_execute(0, "ALTER TABLE movable SET DATABASE dst", &r) == 0 && r.error == SQL_ERR_NONE,
+          "scenario 8d: ALTER TABLE ... SET DATABASE reassigns the tag");
+    CHECK(sql_execute(0, "DROP DATABASE src", &r) == 0,
+          "scenario 8e: 'src' drops cleanly now that its only table moved out -- the §1.6 friction, closed");
+    {
+        uint32_t dst_id = database_find_id("dst");
+        int found = 0;
+        for (uint32_t i = 0; i < object_catalog_count; i++)
+            if (object_catalog[i].active && strcmp(object_catalog[i].name, "movable") == 0 &&
+                object_catalog[i].database_id == dst_id) found = 1;
+        CHECK(found, "scenario 8f: 'movable' is genuinely tagged with 'dst''s real database_id now");
+    }
+    /* Access follows the tag live: grant on 'dst', check a bare-GUEST uid
+     * gains access to the moved-in table through the real access chain. */
+    CHECK(database_grant_uid("dst", 8000, PERM_READ) == 0 &&
+          catalog_check_access(8000, "movable", PERM_READ) == 1,
+          "scenario 8g: a 'dst' grantee can read the moved-in table -- access follows the tag with no extra step");
+    CHECK(sql_execute(0, "ALTER TABLE movable SET DATABASE NULL", &r) == 0 && r.error == SQL_ERR_NONE,
+          "scenario 8h: SET DATABASE NULL untags the table (database_id back to 0/NONE)");
+    CHECK(catalog_check_access(8000, "movable", PERM_READ) == 0,
+          "scenario 8i: the 'dst' grantee loses access the moment the table is untagged -- live in both directions");
+    CHECK(sql_execute(0, "DROP DATABASE dst", &r) == 0,
+          "scenario 8j: 'dst' drops cleanly after the untag; the table itself lives on, just untagged");
+    CHECK(sql_execute(0, "ALTER TABLE movable SET DATABASE nosuchdb", &r) == 1 && r.error == SQL_ERR_DDL_FAILED,
+          "scenario 8k: SET DATABASE naming an unknown database fails cleanly, tag unchanged");
+    CHECK(sql_execute(0, "ALTER TABLE nosuchtable SET DATABASE NULL", &r) == 1 && r.error == SQL_ERR_TABLE_NOT_FOUND,
+          "scenario 8l: SET DATABASE on an unknown table fails cleanly");
+    {
+        struct SqlStatement stmt;
+        char err[SQL_ERR_MSG_LEN];
+        CHECK(sql_parse("ALTER TABLE t SET DATABASE analytics", &stmt, err, sizeof(err)) == 0 &&
+              stmt.kind == SQL_STMT_ALTER_TABLE && stmt.u.alter_table.alter_kind == 1 &&
+              strcmp(stmt.u.alter_table.database_name, "analytics") == 0 &&
+              stmt.u.alter_table.database_none == 0,
+              "scenario 8m: parser -- SET DATABASE <name> fills alter_kind=1 + name");
+        CHECK(sql_parse("ALTER TABLE t SET DATABASE NULL", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.alter_table.alter_kind == 1 && stmt.u.alter_table.database_none == 1,
+              "scenario 8n: parser -- SET DATABASE NULL sets database_none");
+        CHECK(sql_parse("ALTER TABLE t ADD COLUMN c UINT64", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.alter_table.alter_kind == 0,
+              "scenario 8o: parser -- plain ADD COLUMN still parses with alter_kind 0 (zero-default, pre-gap-2.3 statements unchanged)");
+        CHECK(sql_parse("ALTER TABLE t SET DATABASE", &stmt, err, sizeof(err)) == 1,
+              "scenario 8p: parser -- SET DATABASE with no name fails to parse");
+        CHECK(sql_parse("ALTER TABLE t SET COLUMN x", &stmt, err, sizeof(err)) == 1,
+              "scenario 8q: parser -- SET followed by anything but DATABASE fails to parse");
+    }
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }
