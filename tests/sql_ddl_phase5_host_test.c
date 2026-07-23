@@ -384,7 +384,46 @@ int main(void) {
               "scenario 8f: a plain CREATE INDEX parses");
         CHECK(sql_parse("CREATE VIEW v AS SELECT 1", &stmt, err, sizeof(err)) == 1,
               "scenario 8g: CREATE VIEW (never implemented, named out-of-scope) fails to parse cleanly");
+
+        /* Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi). */
+        CHECK(sql_parse("CREATE TABLE t (a UINT64 CHECK (a BETWEEN 1 AND 100))", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[0].has_range == 1 &&
+              strcmp(stmt.u.create_table.columns[0].range_min, "1") == 0 &&
+              strcmp(stmt.u.create_table.columns[0].range_max, "100") == 0,
+              "scenario 8h: CHECK (col BETWEEN lo AND hi) parses with both bounds captured");
+        CHECK(sql_parse("CREATE TABLE t (a STRING CHECK (a BETWEEN 'aaa' AND 'mmm'))", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[0].has_range == 1 &&
+              strcmp(stmt.u.create_table.columns[0].range_min, "aaa") == 0,
+              "scenario 8i: string bounds parse too (quotes stripped by the lexer, as with every literal)");
+        CHECK(sql_parse("CREATE TABLE t (a UINT64 NOT NULL CHECK (a BETWEEN 1 AND 9) UNIQUE)", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[0].not_null && stmt.u.create_table.columns[0].is_unique &&
+              stmt.u.create_table.columns[0].has_range,
+              "scenario 8j: CHECK composes with NOT NULL/UNIQUE in any order, like every other inline constraint");
+        CHECK(sql_parse("CREATE TABLE t (a UINT64, b UINT64 CHECK (a BETWEEN 1 AND 9))", &stmt, err, sizeof(err)) == 1,
+              "scenario 8k: CHECK naming a DIFFERENT column than the one being defined fails to parse -- only same-column checks are supported, rejected loud not misapplied");
+        CHECK(sql_parse("CREATE TABLE t (a UINT64 CHECK (a BETWEEN 1))", &stmt, err, sizeof(err)) == 1,
+              "scenario 8l: CHECK missing the AND upper bound fails to parse");
+        CHECK(sql_parse("CREATE TABLE t (a UINT64 CHECK a BETWEEN 1 AND 9)", &stmt, err, sizeof(err)) == 1,
+              "scenario 8m: CHECK without parentheses fails to parse");
     }
+
+    /* ── Scenario 9 (Database Gap Analysis §2.7): CHECK end to end through
+     * the real executor -- registration + enforcement + registration-time
+     * bound validation. ───────────────────────────────────────────────────── */
+    CHECK(sql_execute(1, "CREATE TABLE gauges (id UINT64, pct UINT64 CHECK (pct BETWEEN 0 AND 100))", &r) == 0 &&
+          r.error == SQL_ERR_NONE,
+          "scenario 9: CREATE TABLE with a CHECK clause executes -- the RANGE constraint registers via DDL at last");
+    CHECK(sql_execute(1, "INSERT INTO gauges (id, pct) VALUES (1, 55)", &r) == 0,
+          "scenario 9b: in-range INSERT passes");
+    CHECK(sql_execute(1, "INSERT INTO gauges (id, pct) VALUES (2, 101)", &r) == 1 &&
+          r.error == SQL_ERR_CONSTRAINT_VIOLATION,
+          "scenario 9c: out-of-range INSERT is rejected by the DDL-registered RANGE constraint");
+    CHECK(sql_execute(1, "UPDATE gauges SET pct = 200 WHERE id = 1", &r) == 1 &&
+          r.error == SQL_ERR_CONSTRAINT_VIOLATION,
+          "scenario 9d: out-of-range UPDATE is rejected too");
+    CHECK(sql_execute(1, "CREATE TABLE badbounds (id UINT64 CHECK (id BETWEEN 'x' AND 'y'))", &r) == 1 &&
+          r.error == SQL_ERR_DDL_FAILED,
+          "scenario 9e: bounds that don't parse against the column's type fail at CREATE time (add_range's ERR_RANGE_INVALID surfaced), not silently at first insert");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

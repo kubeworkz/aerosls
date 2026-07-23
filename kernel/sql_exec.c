@@ -1381,6 +1381,15 @@ static void exec_create_table(uint32_t caller_uid, struct SqlCreateTableStmt* s,
             se_strcpy(out->error_msg, "CREATE TABLE: UNIQUE constraint registration failed", SQL_ERR_MSG_LEN);
             return;
         }
+        if (c->has_range &&
+            row_constraint_add_range(s->table_name, c->name, c->range_min, c->range_max) != ROW_CONSTRAINT_OK) {
+            // Database Gap Analysis §2.7 -- registration-time validation
+            // (unparseable bounds vs. the column's type, ERR_RANGE_INVALID)
+            // happens inside add_range() itself, surfacing here.
+            out->error = SQL_ERR_DDL_FAILED;
+            se_strcpy(out->error_msg, "CREATE TABLE: CHECK (BETWEEN) constraint registration failed (bounds may not parse against the column's type)", SQL_ERR_MSG_LEN);
+            return;
+        }
         if (c->has_reference &&
             row_constraint_add_reference_action(s->table_name, c->name, c->ref_table, c->ref_column,
                                                 (RowOnDeleteAction)c->on_delete_action) != ROW_CONSTRAINT_OK) {
@@ -1949,20 +1958,18 @@ static int se_append(char* buf, uint32_t* pos, uint32_t max, const char* src) {
 }
 
 // Reconstructs ONE table's CREATE TABLE statement (inline NOT NULL/UNIQUE/
-// REFERENCES per column, cross-referenced from row_constraints[] by
-// table_object_id + column_index) into stmt_out. *out_has_range is set to
-// 1 if the table ALSO has a RANGE constraint on some column -- RANGE has
-// no SQL syntax at all in this parser (parse_column_def() only recognizes
-// NOT NULL/UNIQUE/REFERENCES), so it can never be included in the
-// statement text; the caller reports it separately rather than silently
-// dropping it. Returns the statement's text length (including the
-// trailing ';'), or 0 if it didn't fit in stmt_max at all.
-static uint32_t se_build_create_table(uint32_t catalog_idx, char* stmt_out, uint32_t stmt_max, uint8_t* out_has_range) {
+// REFERENCES/CHECK-BETWEEN per column, cross-referenced from
+// row_constraints[] by table_object_id + column_index) into stmt_out.
+// Database Gap Analysis §2.7: RANGE constraints now export as real,
+// reconstructable CHECK (col BETWEEN lo AND hi) clauses -- the old
+// out_has_range/"-- note:" lossy-export plumbing is gone. Returns the
+// statement's text length (including the trailing ';'), or 0 if it didn't
+// fit in stmt_max at all.
+static uint32_t se_build_create_table(uint32_t catalog_idx, char* stmt_out, uint32_t stmt_max) {
     struct SLSObjectEntry* e = &object_catalog[catalog_idx];
     struct RowTableLayout* layout = &table_headers[catalog_idx].layout;
     uint64_t table_oid = e->object_id;
     uint32_t pos = 0;
-    *out_has_range = 0;
 
     if (!se_append(stmt_out, &pos, stmt_max, "CREATE TABLE ")) return 0;
     if (!se_append(stmt_out, &pos, stmt_max, e->name)) return 0;
@@ -2005,7 +2012,24 @@ static uint32_t se_build_create_table(uint32_t catalog_idx, char* stmt_out, uint
                     if (!se_append(stmt_out, &pos, stmt_max, " ON DELETE SET NULL")) return 0;
                 }
             } else if (rc->kind == ROW_CONSTRAINT_RANGE) {
-                *out_has_range = 1;   // reported by the caller -- see header comment, no SQL syntax exists for this
+                // Database Gap Analysis §2.7: RANGE now has real SQL syntax
+                // (CHECK ... BETWEEN), so it exports as a reconstructable
+                // clause instead of the old lossy "-- note:" -- closing the
+                // round-trip loss this function's own header used to name.
+                // STRING bounds are re-quoted (the lexer strips quotes at
+                // parse time); numeric bounds emit bare.
+                int is_str = (layout->column_types[c] == FIELD_TYPE_STRING);
+                if (!se_append(stmt_out, &pos, stmt_max, " CHECK (")) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, layout->column_names[c])) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, " BETWEEN ")) return 0;
+                if (is_str && !se_append(stmt_out, &pos, stmt_max, "'")) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, rc->literal_min)) return 0;
+                if (is_str && !se_append(stmt_out, &pos, stmt_max, "'")) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, " AND ")) return 0;
+                if (is_str && !se_append(stmt_out, &pos, stmt_max, "'")) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, rc->literal_max)) return 0;
+                if (is_str && !se_append(stmt_out, &pos, stmt_max, "'")) return 0;
+                if (!se_append(stmt_out, &pos, stmt_max, ")")) return 0;
             }
         }
     }
@@ -2048,8 +2072,7 @@ uint32_t sql_schema_export(uint32_t caller_uid, char* out, uint32_t max) {
         if (!catalog_check_access(caller_uid, e->name, PERM_READ)) continue;
 
         char stmt[640];   // comfortably above SQL_MAX_TEXT_LEN=512 so the length check below is the real gate, not this buffer
-        uint8_t has_range = 0;
-        uint32_t slen = se_build_create_table(i, stmt, sizeof(stmt), &has_range);
+        uint32_t slen = se_build_create_table(i, stmt, sizeof(stmt));
         if (slen == 0 || slen > SQL_MAX_TEXT_LEN) {
             // Emitted as a visible comment, not silently dropped -- see
             // sql_exec.h's own header note on why a too-long CREATE TABLE
@@ -2060,11 +2083,9 @@ uint32_t sql_schema_export(uint32_t caller_uid, char* out, uint32_t max) {
             continue;
         }
         if (!se_append(out, &pos, max, stmt) || !se_append(out, &pos, max, "\n")) { stop = 1; break; }
-        if (has_range) {
-            if (!se_append(out, &pos, max, "-- note: table '") ||
-                !se_append(out, &pos, max, e->name) ||
-                !se_append(out, &pos, max, "' also has a RANGE constraint with no SQL syntax in this parser and could not be exported\n")) { stop = 1; break; }
-        }
+        // Database Gap Analysis §2.7: the old `has_range`/"-- note:" lossy-
+        // export block is gone -- RANGE constraints now export inline as
+        // real CHECK (col BETWEEN lo AND hi) clauses inside `stmt` itself.
 
         for (uint32_t k = 0; k < ROW_INDEX_MAX; k++) {
             if (!row_indexes[k].active || row_indexes[k].table_object_id != e->object_id) continue;
@@ -2090,7 +2111,8 @@ void sql_schema_import(uint32_t caller_uid, const char* sql_text, struct SqlSche
         // Skip leading whitespace and empty (';;'-style) segments, AND any
         // `-- ...` comment lines, so `offset` always points at the
         // statement's own first real character. This matters specifically
-        // because sql_schema_export() emits `-- skipped:`/`-- note:`
+        // because sql_schema_export() emits `-- skipped:` (the `-- note:`
+        // RANGE case became a real CHECK clause in Gap Analysis §2.7)
         // comment lines with no trailing ';' of their own (they're
         // documentation, not statements) -- without stripping them here
         // first, a comment line would otherwise get glued onto the FRONT

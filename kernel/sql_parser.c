@@ -52,6 +52,7 @@ typedef enum {
     TOK_KW_DROP, TOK_KW_INDEX, TOK_KW_UNIQUE, TOK_KW_REFERENCES,
     TOK_KW_DATABASE,   // Database Namespace & Access Roadmap Phase 2
     TOK_KW_CASCADE, TOK_KW_RESTRICT,   // Cascading phase: DROP DATABASE ... CASCADE, ON DELETE actions
+    TOK_KW_CHECK, TOK_KW_BETWEEN,      // Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi)
     TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
     TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
@@ -108,6 +109,10 @@ static const struct KeywordEntry KEYWORDS[] = {
     // reserved word (see the type-keyword comment below) -- named here,
     // not silently surprising.
     {"CASCADE", TOK_KW_CASCADE}, {"RESTRICT", TOK_KW_RESTRICT},
+    // Database Gap Analysis §2.7. Same reserved-word shadowing note as
+    // CASCADE/RESTRICT above: columns/tables named "check"/"between" are no
+    // longer expressible.
+    {"CHECK", TOK_KW_CHECK}, {"BETWEEN", TOK_KW_BETWEEN},
     // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
     // keyword-lookup pass (same mechanism every other keyword uses), so a
     // column named e.g. "string" would need... actually it can't be named
@@ -1211,6 +1216,39 @@ static void parse_column_def(struct SqlParser* p, struct SqlColumnDef* c) {
         if (p->cur.kind == TOK_KW_UNIQUE) {
             advance(p);
             c->is_unique = 1;
+            continue;
+        }
+        // Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi) --
+        // finally gives row_constraint.c's RANGE constraint real SQL
+        // syntax (it was registration-API-only since Phase 23, and schema
+        // export could only emit a lossy "-- note:" for it). Only the
+        // same-column BETWEEN shape is supported -- the inner column name
+        // must match the column being defined (validated right here, not
+        // silently accepted-and-misapplied), matching row_constraint.c's
+        // own single-column RANGE model exactly. General CHECK expressions
+        // remain out of scope, same as Phase 23's original non-goal.
+        if (p->cur.kind == TOK_KW_CHECK) {
+            advance(p);
+            if (!expect(p, TOK_LPAREN, "expected '(' after CHECK")) return;
+            if (p->cur.kind != TOK_IDENT || !sq_streq_ci(p->cur.text, c->name)) {
+                set_error(p, "CHECK must reference the column being defined (only same-column BETWEEN checks are supported)");
+                return;
+            }
+            advance(p);
+            if (!expect(p, TOK_KW_BETWEEN, "expected BETWEEN inside CHECK(...)")) return;
+            if (p->cur.kind != TOK_NUMBER && p->cur.kind != TOK_STRING) {
+                set_error(p, "expected a number or string literal as CHECK's lower bound"); return;
+            }
+            sq_strcpy(c->range_min, p->cur.text, RECORD_VAL_LEN);
+            advance(p);
+            if (!expect(p, TOK_KW_AND, "expected AND between CHECK's bounds")) return;
+            if (p->cur.kind != TOK_NUMBER && p->cur.kind != TOK_STRING) {
+                set_error(p, "expected a number or string literal as CHECK's upper bound"); return;
+            }
+            sq_strcpy(c->range_max, p->cur.text, RECORD_VAL_LEN);
+            advance(p);
+            if (!expect(p, TOK_RPAREN, "expected ')' after CHECK's upper bound")) return;
+            c->has_range = 1;
             continue;
         }
         if (p->cur.kind == TOK_KW_REFERENCES) {

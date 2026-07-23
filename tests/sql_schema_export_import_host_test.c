@@ -231,24 +231,48 @@ int main(void) {
               "scenario 1i: the verbatim exported employees CREATE TABLE line parses cleanly with all 4 columns");
     }
 
-    /* ── Scenario 2: a table with a RANGE constraint gets a `-- note:`
-     * comment and the table is still otherwise exportable. ─────────────────── */
-    CHECK(sql_execute(0, "CREATE TABLE metrics (id UINT64, val UINT64)", &r) == 0 && r.error == SQL_ERR_NONE,
-          "scenario 2: CREATE TABLE metrics succeeds");
-    {
-        /* row_constraint.h's RANGE constraint has no SQL syntax -- add it
-         * directly through the real row_constraint.c API (table_name/
-         * column_name, resolved against the table's real layout internally),
-         * matching how the kernel itself would register one outside of SQL DDL. */
-        RowConstraintResult rc = row_constraint_add_range("metrics", "val", "0", "100");
-        CHECK(rc == ROW_CONSTRAINT_OK, "scenario 2b: row_constraint_add_range() on metrics.val succeeds");
-    }
+    /* ── Scenario 2 (rewritten for Database Gap Analysis §2.7): a table
+     * with a RANGE constraint now exports it as a REAL, reconstructable
+     * CHECK (col BETWEEN lo AND hi) clause -- the old `-- note:` lossy
+     * path this scenario originally asserted is gone. The constraint is
+     * created via SQL DDL here (the syntax §2.7 added), and the full
+     * round trip is proven: export -> drop -> import -> enforcement. ──────── */
+    CHECK(sql_execute(0, "CREATE TABLE metrics (id UINT64, val UINT64 CHECK (val BETWEEN 0 AND 100))", &r) == 0 &&
+          r.error == SQL_ERR_NONE,
+          "scenario 2: CREATE TABLE with an inline CHECK (BETWEEN) clause succeeds -- RANGE finally has SQL syntax");
+    CHECK(sql_execute(0, "INSERT INTO metrics (id, val) VALUES (1, 50)", &r) == 0,
+          "scenario 2b: an in-range INSERT passes the CHECK");
+    CHECK(sql_execute(0, "INSERT INTO metrics (id, val) VALUES (2, 500)", &r) == 1 &&
+          r.error == SQL_ERR_CONSTRAINT_VIOLATION,
+          "scenario 2c: an out-of-range INSERT is rejected -- the DDL-registered RANGE genuinely enforces");
     uint32_t n2 = sql_schema_export(0, out, sizeof(out));
-    CHECK(n2 > 0, "scenario 2d: export still succeeds with a RANGE-constrained table present");
-    CHECK(strstr(out, "CREATE TABLE metrics") != NULL,
-          "scenario 2e: metrics' CREATE TABLE (sans the RANGE constraint) is still exported");
-    CHECK(strstr(out, "RANGE constraint") != NULL,
-          "scenario 2f: export emits a `-- note:` comment naming the unexportable RANGE constraint");
+    CHECK(n2 > 0, "scenario 2d: export succeeds with a RANGE-constrained table present");
+    CHECK(strstr(out, "CHECK (val BETWEEN 0 AND 100)") != NULL,
+          "scenario 2e: export emits the real, reconstructable CHECK clause inline");
+    CHECK(strstr(out, "RANGE constraint") == NULL,
+          "scenario 2f: the old lossy `-- note:` for RANGE is gone -- nothing left unexportable");
+    {
+        /* Round trip: drop, import the captured export, re-verify
+         * enforcement -- the loss §2.7 named, now provably closed. */
+        static char captured[SQL_SCHEMA_EXPORT_MAX_LEN];
+        strncpy(captured, out, sizeof(captured) - 1);
+        captured[sizeof(captured) - 1] = '\0';
+        CHECK(sql_execute(0, "DROP TABLE metrics", &r) == 0, "scenario 2g: metrics dropped for the round trip");
+        struct SqlSchemaImportResult ir;
+        sql_schema_import(0, captured, &ir);
+        /* The captured export also contains scenario 1's departments/
+         * employees fixtures, which were NOT dropped -- their duplicate
+         * CREATEs correctly fail on re-import. What matters here is that
+         * metrics' own CHECK-carrying statement succeeded (proven for real
+         * by 2i/2j's enforcement below), so assert progress, not
+         * zero-failures. */
+        CHECK(ir.succeeded >= 1, "scenario 2h: at least metrics' own CREATE (the dropped table) imported successfully");
+        CHECK(sql_execute(0, "INSERT INTO metrics (id, val) VALUES (3, 999)", &r) == 1 &&
+              r.error == SQL_ERR_CONSTRAINT_VIOLATION,
+              "scenario 2i: the re-imported table REJECTS an out-of-range INSERT -- the RANGE constraint survived the round trip");
+        CHECK(sql_execute(0, "INSERT INTO metrics (id, val) VALUES (3, 99)", &r) == 0,
+              "scenario 2j: and still accepts an in-range one");
+    }
 
     /* ── Scenario 3: real round trip -- export, DROP both fixture tables,
      * import the exported text, verify both tables exist again with the

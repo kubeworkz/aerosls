@@ -155,12 +155,26 @@ shape. Named in Phases 1/2, still open.
 own comment names DROP COLUMN/RENAME as "real, separate, bigger
 storage-layout undertakings."
 
-**2.7 — `RANGE` constraints have no SQL syntax.** Registerable only via
-the direct API; `sql_schema_export()` emits a `-- note:` comment rather
-than a reconstructable statement, so a schema round-trip silently loses
-them (named in the export's own output, but still a loss). A `CHECK
-(col BETWEEN x AND y)`-shaped grammar clause would close both the DDL
-gap and the round-trip gap at once.
+**2.7 — `RANGE` constraints have no SQL syntax — CLOSED (Gap 6
+remediation, as built).** `CHECK (col BETWEEN lo AND hi)` now exists as
+an inline column clause in CREATE TABLE (new CHECK/BETWEEN reserved
+keywords; AND reused). Only the same-column BETWEEN shape is supported —
+the inner column name must match the column being defined, validated at
+parse time and rejected loud rather than silently misapplied, matching
+`row_constraint.c`'s own single-column RANGE model; general CHECK
+expressions remain Phase 23's original non-goal. The executor registers
+it via the existing `row_constraint_add_range()`, so registration-time
+bound validation (unparseable bounds vs. the column's type) surfaces at
+CREATE time, not first insert (tested). `sql_schema_export()` now emits
+the clause inline as reconstructable SQL — the `-- note:` lossy-export
+path and its `out_has_range` plumbing are deleted, with STRING bounds
+re-quoted and numeric bounds bare. Verified both directions: DDL →
+enforcement (in-range passes, out-of-range INSERT and UPDATE rejected)
+in `sql_ddl_phase5_host_test.c` (scenarios 8h-8m parser, 9 executor),
+and the full round-trip loss closed in
+`sql_schema_export_import_host_test.c`'s rewritten scenario 2 (create
+via DDL → export contains the CHECK clause, no note → drop → import →
+the re-imported table still rejects out-of-range inserts).
 
 **2.8 — FK actions are delete-side only — SILENT-ORPHAN HALF CLOSED
 (Gap 5 remediation, as built).** The dangerous half of this asymmetry is
@@ -257,7 +271,8 @@ see 2.1 for where it chafes).
 5. **§2.8 ON UPDATE FK asymmetry** — **DONE** (the RESTRICT minimum; see
    §2.8's closure addendum — full ON UPDATE actions remain a named
    deferral, now convenience-only rather than a correctness hole).
-6. **§2.7 RANGE/CHECK SQL syntax** — closes a schema round-trip loss.
+6. **§2.7 RANGE/CHECK SQL syntax** — **DONE** (see §2.7's closure
+   addendum).
 7. **§2.4/2.5 query-surface items** (views/CTEs/set ops; GROUP BY over
    JOIN) — the big-ticket work, each deserving its own scoping pass, in
    whichever order a real workload demands.

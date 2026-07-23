@@ -584,6 +584,15 @@ struct SqlColumnDef {
                                       // the enum name (the parser has no
                                       // other dependency on it); sql_exec.c,
                                       // which includes both, casts.
+    // Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi) -- the SQL
+    // spelling of row_constraint.c's RANGE constraint. Bounds kept as raw
+    // literal text (numbers unquoted, strings unquoted by the lexer) --
+    // row_constraint_add_range() takes text literals and does its own
+    // type-aware validation at registration time, so the parser stays
+    // dumb about types here, same as INSERT's own literal handling.
+    uint8_t      has_range;
+    char         range_min[RECORD_VAL_LEN];
+    char         range_max[RECORD_VAL_LEN];
 };
 
 struct SqlCreateTableStmt {
