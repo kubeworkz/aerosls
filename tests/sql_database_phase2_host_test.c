@@ -288,6 +288,56 @@ int main(void) {
               "scenario 5g: a plain CREATE TABLE with no IN DATABASE clause parses with has_database == 0");
     }
 
+    /* ── Scenario 6 (Cascading phase): DROP DATABASE ... CASCADE, end to
+     * end through the real SQL path -- the §1.6 "no CASCADE in v1"
+     * limitation, closed. ─────────────────────────────────────────────────── */
+    CHECK(sql_execute(0, "CREATE DATABASE crm", &r) == 0, "scenario 6: CREATE DATABASE crm succeeds");
+    CHECK(sql_execute(0, "CREATE TABLE leads (id UINT64) IN DATABASE crm", &r) == 0,
+          "scenario 6b: first tagged table created");
+    CHECK(sql_execute(0, "CREATE TABLE deals (id UINT64) IN DATABASE crm", &r) == 0,
+          "scenario 6c: second tagged table created");
+    CHECK(sql_execute(0, "DROP DATABASE crm", &r) == 1 && r.error == SQL_ERR_DDL_FAILED,
+          "scenario 6d: a plain DROP DATABASE still refuses while tables are tagged -- the pre-cascading default is unchanged");
+    CHECK(sql_execute(0, "DROP DATABASE crm CASCADE", &r) == 0 && r.error == SQL_ERR_NONE,
+          "scenario 6e: DROP DATABASE crm CASCADE succeeds where the plain drop refused");
+    CHECK(database_find_id("crm") == 0, "scenario 6f: 'crm' is genuinely gone");
+    CHECK(sql_execute(0, "SELECT * FROM leads", &r) == 1,
+          "scenario 6g: 'leads' was genuinely dropped by the cascade, not just detached");
+    CHECK(sql_execute(0, "SELECT * FROM deals", &r) == 1,
+          "scenario 6h: 'deals' was genuinely dropped by the cascade too");
+    CHECK(sql_execute(0, "CREATE TABLE leads (id UINT64)", &r) == 0,
+          "scenario 6i: the dropped table's name is reusable -- the cascade went through the real DROP TABLE path (catalog slot freed, mvcc ghost-row fix included)");
+
+    /* ── Scenario 7 (Cascading phase): parser-level checks for the new
+     * grammar -- DROP DATABASE CASCADE and REFERENCES ... ON DELETE. ────────── */
+    {
+        struct SqlStatement stmt;
+        char err[SQL_ERR_MSG_LEN];
+        CHECK(sql_parse("DROP DATABASE analytics CASCADE", &stmt, err, sizeof(err)) == 0 &&
+              stmt.kind == SQL_STMT_DROP_DATABASE && stmt.u.drop_database.cascade == 1,
+              "scenario 7: DROP DATABASE ... CASCADE parses with cascade == 1");
+        CHECK(sql_parse("DROP DATABASE analytics", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.drop_database.cascade == 0,
+              "scenario 7b: a plain DROP DATABASE parses with cascade == 0 -- purely additive");
+        CHECK(sql_parse("CREATE TABLE c (id UINT64, p_id UINT64 REFERENCES p(id) ON DELETE CASCADE)", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[1].has_reference == 1 &&
+              stmt.u.create_table.columns[1].on_delete_action == 1,
+              "scenario 7c: REFERENCES ... ON DELETE CASCADE parses (action 1)");
+        CHECK(sql_parse("CREATE TABLE c (id UINT64, p_id UINT64 REFERENCES p(id) ON DELETE SET NULL)", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[1].on_delete_action == 2,
+              "scenario 7d: REFERENCES ... ON DELETE SET NULL parses (action 2)");
+        CHECK(sql_parse("CREATE TABLE c (id UINT64, p_id UINT64 REFERENCES p(id) ON DELETE RESTRICT)", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[1].on_delete_action == 0,
+              "scenario 7e: REFERENCES ... ON DELETE RESTRICT parses as the explicit default (action 0)");
+        CHECK(sql_parse("CREATE TABLE c (id UINT64, p_id UINT64 REFERENCES p(id))", &stmt, err, sizeof(err)) == 0 &&
+              stmt.u.create_table.columns[1].on_delete_action == 0,
+              "scenario 7f: REFERENCES with no ON DELETE clause defaults to RESTRICT (action 0) -- pre-cascading statements unchanged");
+        CHECK(sql_parse("CREATE TABLE c (id UINT64, p_id UINT64 REFERENCES p(id) ON DELETE)", &stmt, err, sizeof(err)) == 1,
+              "scenario 7g: ON DELETE with no action fails to parse");
+        CHECK(sql_parse("CREATE TABLE c (id UINT64, p_id UINT64 REFERENCES p(id) ON UPDATE CASCADE)", &stmt, err, sizeof(err)) == 1,
+              "scenario 7h: ON UPDATE is rejected -- only ON DELETE actions are supported, named in the error not silently ignored");
+    }
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

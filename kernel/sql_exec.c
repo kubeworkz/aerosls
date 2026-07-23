@@ -318,7 +318,8 @@ static SqlErrorCode map_mvcc_err(MvccError e) {
         case MVCC_ERR_CONSTRAINT_NOT_NULL:
         case MVCC_ERR_CONSTRAINT_RANGE:
         case MVCC_ERR_CONSTRAINT_REFERENCE:
-        case MVCC_ERR_CONSTRAINT_REFERENCED:  return SQL_ERR_CONSTRAINT_VIOLATION;
+        case MVCC_ERR_CONSTRAINT_REFERENCED:
+        case MVCC_ERR_CASCADE_FAILED:         return SQL_ERR_CONSTRAINT_VIOLATION;   // Cascading phase -- same collapse
         default:                         return SQL_ERR_INTERNAL;
     }
 }
@@ -1380,7 +1381,10 @@ static void exec_create_table(uint32_t caller_uid, struct SqlCreateTableStmt* s,
             return;
         }
         if (c->has_reference &&
-            row_constraint_add_reference(s->table_name, c->name, c->ref_table, c->ref_column) != ROW_CONSTRAINT_OK) {
+            row_constraint_add_reference_action(s->table_name, c->name, c->ref_table, c->ref_column,
+                                                (RowOnDeleteAction)c->on_delete_action) != ROW_CONSTRAINT_OK) {
+            // Cascading phase: carries the parsed ON DELETE action through
+            // (0/absent == RESTRICT, identical to the old add_reference()).
             out->error = SQL_ERR_DDL_FAILED;
             se_strcpy(out->error_msg, "CREATE TABLE: REFERENCES constraint registration failed", SQL_ERR_MSG_LEN);
             return;
@@ -1440,7 +1444,13 @@ static void exec_alter_table(uint32_t caller_uid, struct SqlAlterTableStmt* s, s
     }
 }
 
-static void exec_drop_table(uint32_t caller_uid, struct SqlDropTableStmt* s, struct SqlResult* out) {
+// The real drop-one-table sequence (object_id capture -> rowstore_drop_
+// table() -> mvcc_notify_table_dropped()), factored out of exec_drop_
+// table() so DROP DATABASE ... CASCADE (Cascading phase, below) drops each
+// child table through the exact same path -- including the Phase 8
+// ghost-row fix -- rather than a second, drift-prone copy. Returns
+// rowstore_drop_table()'s own rc (0 ok, 2 permission, else not-found).
+static int drop_one_table_by_name(uint32_t caller_uid, const char* table_name) {
     // Capture the real object_id before rowstore_drop_table() deactivates
     // the catalog entry -- needed below to clean up mvcc.c's own per-row
     // version cache. See mvcc.h's mvcc_notify_table_dropped() header
@@ -1451,16 +1461,21 @@ static void exec_drop_table(uint32_t caller_uid, struct SqlDropTableStmt* s, str
     uint64_t table_object_id = 0;
     int found_before_drop = 0;
     for (uint32_t i = 0; i < object_catalog_count; i++) {
-        if (object_catalog[i].active && se_streq(object_catalog[i].name, s->table_name)) {
+        if (object_catalog[i].active && se_streq(object_catalog[i].name, table_name)) {
             table_object_id = object_catalog[i].object_id;
             found_before_drop = 1;
             break;
         }
     }
 
-    int rc = rowstore_drop_table(caller_uid, s->table_name);
+    int rc = rowstore_drop_table(caller_uid, table_name);
+    if (rc == 0 && found_before_drop) mvcc_notify_table_dropped(table_object_id);
+    return rc;
+}
+
+static void exec_drop_table(uint32_t caller_uid, struct SqlDropTableStmt* s, struct SqlResult* out) {
+    int rc = drop_one_table_by_name(caller_uid, s->table_name);
     if (rc == 0) {
-        if (found_before_drop) mvcc_notify_table_dropped(table_object_id);
         out->error = SQL_ERR_NONE;
         return;
     }
@@ -1528,6 +1543,45 @@ static void exec_create_database(uint32_t caller_uid, struct SqlCreateDatabaseSt
 
 static void exec_drop_database(uint32_t caller_uid, struct SqlDropDatabaseStmt* s, struct SqlResult* out) {
     int rc = database_drop(caller_uid, s->database_name);
+
+    // ── Cascading phase: DROP DATABASE ... CASCADE ──────────────────────
+    // Implemented HERE, at the executor layer, as drop-the-children-then-
+    // retry -- deliberately NOT by adding a cascade flag inside
+    // database_drop() itself. rc==3 ("still has tables") can only be
+    // returned AFTER database_drop()'s own permission gate passed (rc==2
+    // fires first), so retry-after-emptying reuses that gate and the
+    // emptiness check completely unchanged -- no second copy of either.
+    // Each child table is dropped through drop_one_table_by_name() (the
+    // exact same path a direct DROP TABLE takes, including the Phase 8
+    // mvcc ghost-row fix), which enforces the caller's own per-table
+    // permission: a database owner who lacks rights on some table inside
+    // it gets a partial-failure error, with already-dropped siblings NOT
+    // resurrected -- DDL is not transactional anywhere in this engine
+    // (CREATE TABLE's own multi-step sequence has the same property),
+    // named honestly rather than papered over.
+    if (rc == 3 && s->cascade) {
+        uint32_t db_id = database_find_id(s->database_name);
+        for (uint32_t i = 0; i < object_catalog_count; i++) {
+            if (!object_catalog[i].active || object_catalog[i].database_id != db_id) continue;
+            int drc = drop_one_table_by_name(caller_uid, object_catalog[i].name);
+            if (drc != 0) {
+                out->error = drc == 2 ? SQL_ERR_PERMISSION_DENIED : SQL_ERR_DDL_FAILED;
+                se_strcpy(out->error_msg,
+                          drc == 2
+                              ? "DROP DATABASE CASCADE: permission denied on a table inside the database (tables dropped before this one stay dropped -- DDL is not transactional)"
+                              : "DROP DATABASE CASCADE: failed dropping a table inside the database (a non-row-set object may be tagged with this database id)",
+                          SQL_ERR_MSG_LEN);
+                return;
+            }
+            // drop_one_table_by_name() deactivated this catalog slot in
+            // place (object_catalog[] is a fixed array, never compacted),
+            // so continuing the same index scan is safe -- no restart
+            // needed, matching catalog_vfree_partition()'s own in-place
+            // deactivation-during-scan pattern.
+        }
+        rc = database_drop(caller_uid, s->database_name);   // now-empty retry through the same gate
+    }
+
     if (rc == 0) { out->error = SQL_ERR_NONE; return; }
     if (rc == 2) {
         out->error = SQL_ERR_PERMISSION_DENIED;
@@ -1536,7 +1590,7 @@ static void exec_drop_database(uint32_t caller_uid, struct SqlDropDatabaseStmt* 
     }
     if (rc == 3) {
         out->error = SQL_ERR_DDL_FAILED;
-        se_strcpy(out->error_msg, "DROP DATABASE: still has one or more tables tagged with it -- no CASCADE, reassign or drop those tables first", SQL_ERR_MSG_LEN);
+        se_strcpy(out->error_msg, "DROP DATABASE: still has one or more tables tagged with it -- drop or reassign them first, or use DROP DATABASE <name> CASCADE", SQL_ERR_MSG_LEN);
         return;
     }
     out->error = SQL_ERR_DDL_FAILED;
@@ -1897,6 +1951,17 @@ static uint32_t se_build_create_table(uint32_t catalog_idx, char* stmt_out, uint
                     if (!se_append(stmt_out, &pos, stmt_max, table_headers[ref_idx].layout.column_names[rc->ref_column_index])) return 0;
                 }
                 if (!se_append(stmt_out, &pos, stmt_max, ")")) return 0;
+                // Cascading phase: emit the ON DELETE action so a schema
+                // export/import round-trip preserves it. RESTRICT (the
+                // default) is deliberately NOT emitted -- a plain
+                // REFERENCES clause already means RESTRICT on re-import,
+                // and omitting it keeps every pre-cascading export
+                // byte-for-byte identical.
+                if (rc->on_delete_action == ROW_ONDELETE_CASCADE) {
+                    if (!se_append(stmt_out, &pos, stmt_max, " ON DELETE CASCADE")) return 0;
+                } else if (rc->on_delete_action == ROW_ONDELETE_SET_NULL) {
+                    if (!se_append(stmt_out, &pos, stmt_max, " ON DELETE SET NULL")) return 0;
+                }
             } else if (rc->kind == ROW_CONSTRAINT_RANGE) {
                 *out_has_range = 1;   // reported by the caller -- see header comment, no SQL syntax exists for this
             }

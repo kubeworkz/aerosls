@@ -19,7 +19,8 @@
  * Build and run:
  *   gcc -std=c11 -I . -I kernel -I drivers -I net \
  *       tests/dspp_phase5_host_test.c net/dspp.c kernel/partition.c net/consensus.c \
- *       -o /tmp/dspp_phase5_host_test && /tmp/dspp_phase5_host_test
+ *       -o /tmp/dspp_phase5_host_test
+ *   /tmp/dspp_phase5_host_test
  */
 #include <stdio.h>
 #include <stdint.h>

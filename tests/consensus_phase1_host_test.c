@@ -34,7 +34,8 @@
  * Build and run:
  *   gcc -std=c11 -I . -I kernel -I drivers -I net \
  *       tests/consensus_phase1_host_test.c net/consensus.c \
- *       -o /tmp/consensus_phase1_host_test && /tmp/consensus_phase1_host_test
+ *       -o /tmp/consensus_phase1_host_test
+ *   /tmp/consensus_phase1_host_test
  */
 #include <stdio.h>
 #include <stdint.h>

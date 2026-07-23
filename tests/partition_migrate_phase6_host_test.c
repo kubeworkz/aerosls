@@ -28,7 +28,8 @@
  * Build and run:
  *   gcc -std=c11 -Wall -Wextra -I . -I kernel -I drivers -I net \
  *       tests/partition_migrate_phase6_host_test.c kernel/partition.c net/consensus.c \
- *       -o /tmp/partition_migrate_phase6_host_test && /tmp/partition_migrate_phase6_host_test
+ *       -o /tmp/partition_migrate_phase6_host_test
+ *   /tmp/partition_migrate_phase6_host_test
  */
 #include <stdio.h>
 #include <stdint.h>

@@ -205,6 +205,7 @@ static MvccError map_constraint_violation(RowConstraintResult r) {
         case ROW_CONSTRAINT_VIOLATION_RANGE:      return MVCC_ERR_CONSTRAINT_RANGE;
         case ROW_CONSTRAINT_VIOLATION_REFERENCE:  return MVCC_ERR_CONSTRAINT_REFERENCE;
         case ROW_CONSTRAINT_VIOLATION_REFERENCED: return MVCC_ERR_CONSTRAINT_REFERENCED;
+        case ROW_CONSTRAINT_CASCADE_FAILED:       return MVCC_ERR_CASCADE_FAILED;   // Cascading phase
         default:                                  return MVCC_OK;
     }
 }

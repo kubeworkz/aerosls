@@ -234,19 +234,44 @@ No `LIST DATABASES` SQL statement — plain listing is Terminal/HTTP-only
 list`'s own established precedent that enumeration never needs SQL
 grammar.
 
-### 1.6 — `DROP DATABASE` semantics: refuse if non-empty, no `CASCADE`
+### 1.6 — `DROP DATABASE` semantics: refuse if non-empty, no `CASCADE` — CLOSED (cascading phase)
 
-**Decision: `database_drop()` returns a distinct "database still has
-tables assigned" error rather than silently orphaning or cascading.** No
-`CASCADE` keyword in v1 — a real, named simplification versus a full SQL
-engine's `DROP DATABASE ... CASCADE`, deferred rather than built
-speculatively before a real workload asks for it (this project's
-repeatedly-stated posture, most recently named in `vec_index.h`'s own
-"started ahead of its own gate" callout, applied here in the opposite
-direction: don't build the cascade path until something needs it). An
-operator must explicitly reassign or drop every table tagged with a
-database's id first. There is deliberately no `ALTER TABLE ... SET
-DATABASE` in v1 either (§1.7) — meaning in practice, "empty a database"
+**Original v1 decision: `database_drop()` returns a distinct "database
+still has tables assigned" error rather than silently orphaning or
+cascading.** No `CASCADE` keyword in v1 — a real, named simplification
+versus a full SQL engine's `DROP DATABASE ... CASCADE`, deferred rather
+than built speculatively before a real workload asks for it (this
+project's repeatedly-stated posture, most recently named in
+`vec_index.h`'s own "started ahead of its own gate" callout, applied here
+in the opposite direction: don't build the cascade path until something
+needs it). An operator must explicitly reassign or drop every table
+tagged with a database's id first.
+
+**Cascading-phase addendum (as built): `DROP DATABASE <name> CASCADE` now
+exists.** The plain `DROP DATABASE` keeps the refuse-if-non-empty
+behavior above byte-for-byte (the parser's `cascade` flag zero-defaults),
+so nothing pre-cascading changed. The implementation deliberately lives
+in `sql_exec.c`'s `exec_drop_database()`, NOT inside `database_drop()`
+itself: `database_drop()`'s rc==3 ("still has tables") can only be
+returned after its own permission gate has already passed (rc==2 fires
+first), so the executor's drop-the-children-then-retry loop reuses that
+gate and the emptiness check completely unchanged — `kernel/database.c`
+needed zero edits for this feature. Each child table is dropped through
+the same factored-out `drop_one_table_by_name()` path a direct `DROP
+TABLE` takes (including the mvcc ghost-row fix), which also enforces the
+caller's own per-table permission: a database owner lacking rights on
+some table inside it gets a partial-failure error with already-dropped
+siblings staying dropped — DDL is not transactional anywhere in this
+engine (CREATE TABLE's own multi-step sequence has the same property),
+named honestly rather than papered over. Verified end-to-end in
+`tests/sql_database_phase2_host_test.c` (scenarios 6-7): refuse-then-
+cascade-succeeds, both tables genuinely dropped (not detached), dropped
+names reusable, plus parser coverage for the new grammar. The related FK
+`ON DELETE CASCADE`/`SET NULL` actions landed in the same cascading
+phase — see the RDBMS roadmap's Phase 23 addendum for that half.
+
+There is deliberately no `ALTER TABLE ... SET DATABASE` in v1 either
+(§1.7) — meaning in practice, "empty a database" without CASCADE still
 means dropping its tables outright, not reassigning them elsewhere. Named
 as real, current friction, not hidden.
 

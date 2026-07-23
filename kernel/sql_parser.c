@@ -51,6 +51,7 @@ typedef enum {
     TOK_KW_CREATE, TOK_KW_TABLE, TOK_KW_ALTER, TOK_KW_ADD, TOK_KW_COLUMN,
     TOK_KW_DROP, TOK_KW_INDEX, TOK_KW_UNIQUE, TOK_KW_REFERENCES,
     TOK_KW_DATABASE,   // Database Namespace & Access Roadmap Phase 2
+    TOK_KW_CASCADE, TOK_KW_RESTRICT,   // Cascading phase: DROP DATABASE ... CASCADE, ON DELETE actions
     TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
     TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
@@ -101,6 +102,12 @@ static const struct KeywordEntry KEYWORDS[] = {
     {"UNIQUE", TOK_KW_UNIQUE}, {"REFERENCES", TOK_KW_REFERENCES},
     // Database Namespace & Access Roadmap Phase 2.
     {"DATABASE", TOK_KW_DATABASE},
+    // Cascading phase. Reserved-word shadowing note: a column/table named
+    // "cascade" or "restrict" is no longer expressible, matching this
+    // parser's existing keyword-shadowing behavior for every other
+    // reserved word (see the type-keyword comment below) -- named here,
+    // not silently surprising.
+    {"CASCADE", TOK_KW_CASCADE}, {"RESTRICT", TOK_KW_RESTRICT},
     // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
     // keyword-lookup pass (same mechanism every other keyword uses), so a
     // column named e.g. "string" would need... actually it can't be named
@@ -1217,6 +1224,32 @@ static void parse_column_def(struct SqlParser* p, struct SqlColumnDef* c) {
             advance(p);
             if (!expect(p, TOK_RPAREN, "expected ')' after REFERENCES column name")) return;
             c->has_reference = 1;
+            // Cascading phase: optional ON DELETE CASCADE | SET NULL |
+            // RESTRICT immediately after REFERENCES table(col). Absent ==
+            // RESTRICT (on_delete_action's zero default), keeping every
+            // pre-cascading CREATE TABLE statement byte-for-byte identical
+            // in behavior. TOK_KW_ON and TOK_KW_SET are reused from their
+            // existing JOIN-ON / UPDATE-SET grammar positions -- one
+            // keyword, two grammar positions, the same contextual-reuse
+            // convention IN already follows in this file.
+            if (p->cur.kind == TOK_KW_ON) {
+                advance(p);
+                if (!expect(p, TOK_KW_DELETE, "expected DELETE after ON in a REFERENCES clause (only ON DELETE actions are supported)")) return;
+                if (p->cur.kind == TOK_KW_CASCADE) {
+                    c->on_delete_action = 1;   // ROW_ONDELETE_CASCADE -- see sql_parser.h's SqlColumnDef comment
+                    advance(p);
+                } else if (p->cur.kind == TOK_KW_SET) {
+                    advance(p);
+                    if (!expect(p, TOK_KW_NULL, "expected NULL after SET in ON DELETE SET NULL")) return;
+                    c->on_delete_action = 2;   // ROW_ONDELETE_SET_NULL
+                } else if (p->cur.kind == TOK_KW_RESTRICT) {
+                    c->on_delete_action = 0;   // ROW_ONDELETE_RESTRICT -- explicit spelling of the default
+                    advance(p);
+                } else {
+                    set_error(p, "expected CASCADE, SET NULL, or RESTRICT after ON DELETE");
+                    return;
+                }
+            }
             continue;
         }
         break;
@@ -1323,6 +1356,12 @@ static void parse_drop_database_body(struct SqlParser* p, struct SqlDropDatabase
     if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a database name after DROP DATABASE"); return; }
     sq_strcpy(s->database_name, p->cur.text, OBJECT_NAME_LEN);
     advance(p);
+    // Cascading phase: optional trailing CASCADE. Absent == the refuse-if-
+    // non-empty behavior §1.6 originally specced, unchanged.
+    if (p->cur.kind == TOK_KW_CASCADE) {
+        s->cascade = 1;
+        advance(p);
+    }
     finish_statement(p);
 }
 

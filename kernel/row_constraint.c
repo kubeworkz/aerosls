@@ -108,7 +108,8 @@ void row_constraint_init(void) {
 // ─── Registration ─────────────────────────────────────────────────────────
 static RowConstraintResult rc_add(RowConstraintKind kind, const char* table_name, const char* column_name,
                                   const char* lo, const char* hi,
-                                  const char* ref_table_name, const char* ref_column_name) {
+                                  const char* ref_table_name, const char* ref_column_name,
+                                  RowOnDeleteAction on_delete_action) {
     int tidx = rc_find_table_index(table_name);
     if (tidx < 0) return ROW_CONSTRAINT_ERR_TABLE_NOT_FOUND;
     const struct RowTableLayout* layout = &table_headers[tidx].layout;
@@ -154,24 +155,32 @@ static RowConstraintResult rc_add(RowConstraintKind kind, const char* table_name
     c->ref_table_name[0] = '\0';
     if (ref_table_name) rc_strcpy(c->ref_table_name, ref_table_name, OBJECT_NAME_LEN);
     c->ref_column_index = ref_col;
+    c->on_delete_action = (uint8_t)on_delete_action;   // Cascading phase -- 0 (RESTRICT) for every non-REFERENCE kind
 
     persist_row_constraints();   // Gap Remediation Phase D
     return ROW_CONSTRAINT_OK;
 }
 
 RowConstraintResult row_constraint_add_unique(const char* table_name, const char* column_name) {
-    return rc_add(ROW_CONSTRAINT_UNIQUE, table_name, column_name, NULL, NULL, NULL, NULL);
+    return rc_add(ROW_CONSTRAINT_UNIQUE, table_name, column_name, NULL, NULL, NULL, NULL, ROW_ONDELETE_RESTRICT);
 }
 RowConstraintResult row_constraint_add_not_null(const char* table_name, const char* column_name) {
-    return rc_add(ROW_CONSTRAINT_NOT_NULL, table_name, column_name, NULL, NULL, NULL, NULL);
+    return rc_add(ROW_CONSTRAINT_NOT_NULL, table_name, column_name, NULL, NULL, NULL, NULL, ROW_ONDELETE_RESTRICT);
 }
 RowConstraintResult row_constraint_add_range(const char* table_name, const char* column_name,
                                              const char* min_literal, const char* max_literal) {
-    return rc_add(ROW_CONSTRAINT_RANGE, table_name, column_name, min_literal, max_literal, NULL, NULL);
+    return rc_add(ROW_CONSTRAINT_RANGE, table_name, column_name, min_literal, max_literal, NULL, NULL, ROW_ONDELETE_RESTRICT);
 }
 RowConstraintResult row_constraint_add_reference(const char* table_name, const char* column_name,
                                                  const char* ref_table_name, const char* ref_column_name) {
-    return rc_add(ROW_CONSTRAINT_REFERENCE, table_name, column_name, NULL, NULL, ref_table_name, ref_column_name);
+    // Cascading phase: kept as a thin RESTRICT wrapper -- see the header's
+    // own comment on why this survives instead of being replaced.
+    return rc_add(ROW_CONSTRAINT_REFERENCE, table_name, column_name, NULL, NULL, ref_table_name, ref_column_name, ROW_ONDELETE_RESTRICT);
+}
+RowConstraintResult row_constraint_add_reference_action(const char* table_name, const char* column_name,
+                                                        const char* ref_table_name, const char* ref_column_name,
+                                                        RowOnDeleteAction on_delete_action) {
+    return rc_add(ROW_CONSTRAINT_REFERENCE, table_name, column_name, NULL, NULL, ref_table_name, ref_column_name, on_delete_action);
 }
 
 // ─── Runtime checks ───────────────────────────────────────────────────────
@@ -259,6 +268,37 @@ RowConstraintResult row_constraint_check_write(uint64_t txn_id, uint32_t caller_
     return ROW_CONSTRAINT_OK;
 }
 
+// ─── Cascading phase: collect-then-act child row gathering ────────────────
+// Collects the logical ids of every child row whose FK column matches the
+// parent's value -- deliberately does NOT mutate anything during the scan
+// (a SET NULL's mvcc_row_update() appends to the very mvcc_versions[]
+// array mvcc_table_scan() iterates; see the header's cascading section).
+struct rc_collect_ctx {
+    uint32_t col;
+    const char* candidate;
+    uint64_t ids[ROW_CASCADE_MAX_ROWS];
+    uint32_t count;
+    int overflow;
+};
+static void rc_collect_scan_cb(struct MvccRowId id, const struct RowValues* v, void* ctxp) {
+    struct rc_collect_ctx* ctx = (struct rc_collect_ctx*)ctxp;
+    if (ctx->overflow) return;
+    if (v->null_mask & (1u << ctx->col)) return;   // NULL FK never matches (Phase 4 semantics)
+    if (rc_strcmp(v->values[ctx->col], ctx->candidate) != 0) return;
+    if (ctx->count >= ROW_CASCADE_MAX_ROWS) { ctx->overflow = 1; return; }
+    ctx->ids[ctx->count++] = id.logical_id;
+}
+
+// Depth guard for CASCADE chains: mvcc_row_delete() on a child row re-enters
+// row_constraint_check_delete() for the child's own table, which is exactly
+// how multi-level FK chains cascade correctly -- but also exactly how a
+// circular FK chain (A references B references A) would recurse forever.
+// A plain static counter (not per-transaction) is sufficient: this whole
+// engine is single-threaded per call path (no concurrent SQL execution --
+// sql_exec.c's own static-scratch design already relies on this), so the
+// counter can never be racing another in-flight delete's.
+static uint32_t rc_cascade_depth = 0;
+
 RowConstraintResult row_constraint_check_delete(uint64_t txn_id, uint32_t caller_uid,
                                                 const char* table_name, uint64_t table_object_id,
                                                 struct RowId physical_id) {
@@ -282,9 +322,61 @@ RowConstraintResult row_constraint_check_delete(uint64_t txn_id, uint32_t caller
         const char* ref_val = values.values[c->ref_column_index];
         if (values.null_mask & (1u << c->ref_column_index)) continue;   // Phase 4: real null_mask, not strlen==0
 
-        struct rc_ref_ctx ctx = { c->column_index, ref_val, 0 };
-        mvcc_table_scan(txn_id, caller_uid, c->table_name, rc_ref_scan_cb, &ctx);
-        if (ctx.found) return ROW_CONSTRAINT_VIOLATION_REFERENCED;
+        // ── RESTRICT (the unchanged pre-cascading path, zero default) ──
+        if (c->on_delete_action == ROW_ONDELETE_RESTRICT) {
+            struct rc_ref_ctx ctx = { c->column_index, ref_val, 0 };
+            mvcc_table_scan(txn_id, caller_uid, c->table_name, rc_ref_scan_cb, &ctx);
+            if (ctx.found) return ROW_CONSTRAINT_VIOLATION_REFERENCED;
+            continue;
+        }
+
+        // ── CASCADE / SET NULL: collect the child rows first, then act ──
+        struct rc_collect_ctx cctx;
+        cctx.col = c->column_index;
+        cctx.candidate = ref_val;
+        cctx.count = 0;
+        cctx.overflow = 0;
+        mvcc_table_scan(txn_id, caller_uid, c->table_name, rc_collect_scan_cb, &cctx);
+        if (cctx.overflow) return ROW_CONSTRAINT_CASCADE_FAILED;   // > ROW_CASCADE_MAX_ROWS children -- fail whole delete cleanly
+        if (cctx.count == 0) continue;                              // nothing references this row via this constraint
+
+        if (c->on_delete_action == ROW_ONDELETE_CASCADE) {
+            if (rc_cascade_depth >= ROW_CASCADE_MAX_DEPTH) return ROW_CONSTRAINT_CASCADE_FAILED;
+            rc_cascade_depth++;
+            for (uint32_t k = 0; k < cctx.count; k++) {
+                struct MvccRowId child = { cctx.ids[k] };
+                // The REAL delete path -- the child's own constraints
+                // (including further cascades) run exactly as if the child
+                // were deleted directly. MVCC_ERR_ROW_NOT_VISIBLE is
+                // tolerated: an earlier iteration (or an earlier
+                // constraint's cascade) may have already deleted this
+                // child within this same transaction.
+                MvccError de = mvcc_row_delete(txn_id, caller_uid, c->table_name, child);
+                if (de != MVCC_OK && de != MVCC_ERR_ROW_NOT_VISIBLE) {
+                    rc_cascade_depth--;
+                    return ROW_CONSTRAINT_CASCADE_FAILED;
+                }
+            }
+            rc_cascade_depth--;
+            continue;
+        }
+
+        // ── SET NULL ──
+        for (uint32_t k = 0; k < cctx.count; k++) {
+            struct MvccRowId child = { cctx.ids[k] };
+            struct RowValues child_vals;
+            MvccError ge = mvcc_row_get(txn_id, caller_uid, c->table_name, child, &child_vals);
+            if (ge == MVCC_ERR_ROW_NOT_VISIBLE) continue;   // already gone this txn -- nothing to null out
+            if (ge != MVCC_OK) return ROW_CONSTRAINT_CASCADE_FAILED;
+            child_vals.null_mask |= (1u << c->column_index);   // real NULL, Phase 4 semantics
+            child_vals.values[c->column_index][0] = '\0';
+            // The REAL update path -- runs row_constraint_check_write() on
+            // the child as usual, so SET NULL against a column that also
+            // carries NOT NULL correctly fails the whole delete (standard
+            // SQL behavior), for free.
+            MvccError ue = mvcc_row_update(txn_id, caller_uid, c->table_name, child, &child_vals);
+            if (ue != MVCC_OK) return ROW_CONSTRAINT_CASCADE_FAILED;
+        }
     }
     return ROW_CONSTRAINT_OK;
 }

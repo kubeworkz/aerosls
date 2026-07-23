@@ -61,12 +61,35 @@
  *
  * ─── First-cut scope, matching this roadmap's own explicit non-goals ────
  * No CHECK constraints beyond RANGE's plain min/max shape (matching
- * legacy constraint.c's own RANGE precedent). No cascading FOREIGN KEY
- * actions (ON DELETE CASCADE/SET NULL) — a REFERENCE constraint's DELETE-
- * side check (row_constraint_check_delete()) is plain RESTRICT: block the
- * delete if any other table's REFERENCE constraint still points at this
- * row, full stop, never delete-then-fix-up. No composite (multi-column)
+ * legacy constraint.c's own RANGE precedent). No composite (multi-column)
  * constraints, matching Phase 17's own single-column-index precedent.
+ *
+ * ─── Cascading phase: ON DELETE CASCADE / SET NULL ──────────────────────
+ * Phase 23's original "no cascading FOREIGN KEY actions" non-goal is now
+ * closed: each REFERENCE constraint carries an on_delete_action
+ * (RowOnDeleteAction below). RESTRICT (the zero default -- every
+ * pre-cascading constraint, including any restored from an old persisted
+ * snapshot, keeps its exact prior behavior by construction) blocks the
+ * delete as before. CASCADE deletes the referencing (child) rows through
+ * the REAL mvcc_row_delete() path -- meaning each cascaded delete runs its
+ * own constraint checks too, so multi-level FK chains cascade recursively
+ * (bounded by ROW_CASCADE_MAX_DEPTH to make a circular FK chain a clean
+ * error instead of unbounded recursion). SET NULL rewrites each child
+ * row's FK column to a real NULL (null_mask bit, Phase 4 semantics)
+ * through the REAL mvcc_row_update() path -- so a SET NULL action on a
+ * column that also carries NOT NULL correctly fails the whole delete
+ * (standard SQL behavior), for free, because the update's own
+ * row_constraint_check_write() runs as usual. All child mutations happen
+ * inside the SAME transaction as the triggering delete, so a later
+ * rollback undoes the cascade along with everything else -- no separate
+ * cascade-undo machinery needed or built.
+ *
+ * Child rows are collected FIRST (bounded scan, ROW_CASCADE_MAX_ROWS per
+ * constraint), THEN mutated -- never mutated mid-scan, since a SET NULL's
+ * mvcc_row_update() appends new versions to the very mvcc_versions[]
+ * array mvcc_table_scan() is iterating. Overflowing either bound returns
+ * ROW_CONSTRAINT_CASCADE_FAILED (the whole delete fails cleanly, nothing
+ * partially applied that the transaction's own rollback can't undo).
  */
 #ifndef ROW_CONSTRAINT_H
 #define ROW_CONSTRAINT_H
@@ -76,6 +99,8 @@
 
 // ─── Limits ─────────────────────────────────────────────────────────────────
 #define ROW_CONSTRAINT_MAX 64   // total constraints across every row-set table, bump-allocated, no reclaim
+#define ROW_CASCADE_MAX_ROWS  64   // child rows one delete may cascade to, per constraint (collect-then-act buffer)
+#define ROW_CASCADE_MAX_DEPTH  8   // FK chain depth before a circular/degenerate chain fails cleanly
 
 typedef enum {
     ROW_CONSTRAINT_UNIQUE = 0,
@@ -83,6 +108,17 @@ typedef enum {
     ROW_CONSTRAINT_RANGE,
     ROW_CONSTRAINT_REFERENCE,
 } RowConstraintKind;
+
+// Cascading phase: what deleting a row in the REFERENCED (parent) table
+// does to rows in the referencing (child) table. RESTRICT deliberately = 0
+// so every pre-cascading RowConstraintDef -- zero-initialized, or restored
+// from an old persisted snapshot -- keeps Phase 23's exact block-the-delete
+// behavior without any migration step.
+typedef enum {
+    ROW_ONDELETE_RESTRICT = 0,
+    ROW_ONDELETE_CASCADE,
+    ROW_ONDELETE_SET_NULL,
+} RowOnDeleteAction;
 
 typedef enum {
     ROW_CONSTRAINT_OK = 0,
@@ -98,6 +134,11 @@ typedef enum {
     ROW_CONSTRAINT_VIOLATION_RANGE,
     ROW_CONSTRAINT_VIOLATION_REFERENCE,      // INSERT/UPDATE: FK value doesn't match any row in the referenced table
     ROW_CONSTRAINT_VIOLATION_REFERENCED,     // DELETE: this row is still referenced by another table (RESTRICT)
+    ROW_CONSTRAINT_CASCADE_FAILED,           // Cascading phase: a CASCADE/SET NULL action itself failed (child
+                                              // mutation error, ROW_CASCADE_MAX_ROWS/_MAX_DEPTH exceeded, or a
+                                              // SET NULL hit a NOT NULL constraint on the FK column). The whole
+                                              // delete fails; the caller's transaction rollback undoes any
+                                              // partially-applied child mutations.
 } RowConstraintResult;
 
 struct RowConstraintDef {
@@ -111,6 +152,14 @@ struct RowConstraintDef {
     uint64_t          ref_table_object_id;           // REFERENCE only
     char              ref_table_name[OBJECT_NAME_LEN]; // REFERENCE only
     uint32_t          ref_column_index;              // REFERENCE only
+    uint8_t           on_delete_action;              // REFERENCE only -- RowOnDeleteAction. 0 == RESTRICT
+                                                      // by construction (see the enum's own comment), so a
+                                                      // pre-cascading persisted snapshot restored into this
+                                                      // grown struct... doesn't happen at all, actually:
+                                                      // persist.c's restore path rejects a size-mismatched
+                                                      // snapshot outright ("struct size mismatch -- cold
+                                                      // start"), the same clean fallback every prior struct
+                                                      // growth in this codebase already relies on.
 };
 
 extern struct RowConstraintDef row_constraints[ROW_CONSTRAINT_MAX];
@@ -127,6 +176,15 @@ RowConstraintResult row_constraint_add_range(const char* table_name, const char*
                                              const char* min_literal, const char* max_literal);
 RowConstraintResult row_constraint_add_reference(const char* table_name, const char* column_name,
                                                  const char* ref_table_name, const char* ref_column_name);
+
+// Cascading phase: like row_constraint_add_reference() but with an explicit
+// ON DELETE action. row_constraint_add_reference() itself is now a thin
+// RESTRICT wrapper around this -- kept rather than removed so every
+// pre-cascading caller (tests, schema import) keeps its exact behavior
+// with zero edits.
+RowConstraintResult row_constraint_add_reference_action(const char* table_name, const char* column_name,
+                                                        const char* ref_table_name, const char* ref_column_name,
+                                                        RowOnDeleteAction on_delete_action);
 
 // Called automatically by mvcc_row_insert()/mvcc_row_update() (mvcc.c)
 // before any physical write happens. Checks every active constraint
@@ -147,6 +205,15 @@ RowConstraintResult row_constraint_check_write(uint64_t txn_id, uint32_t caller_
 // applied. Short-circuits to ROW_CONSTRAINT_OK immediately, without
 // fetching the row's values at all, if no REFERENCE constraint anywhere
 // targets table_object_id -- the common case, kept cheap.
+//
+// Cascading phase: this is now check-AND-apply, not check-only -- for each
+// REFERENCE constraint targeting table_object_id, its on_delete_action
+// decides: RESTRICT returns VIOLATION_REFERENCED exactly as before (the
+// unchanged zero-default path); CASCADE deletes the referencing child rows
+// via the real mvcc_row_delete() (recursively, depth-capped); SET NULL
+// rewrites each child row's FK column to NULL via the real
+// mvcc_row_update(). See the header comment's cascading section for the
+// full design (collect-then-act, same-transaction, rollback-safe).
 RowConstraintResult row_constraint_check_delete(uint64_t txn_id, uint32_t caller_uid,
                                                 const char* table_name, uint64_t table_object_id,
                                                 struct RowId physical_id);

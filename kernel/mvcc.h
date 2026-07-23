@@ -174,6 +174,9 @@ typedef enum {
     MVCC_ERR_CONSTRAINT_RANGE,       // Phase 23: a RANGE constraint would be violated
     MVCC_ERR_CONSTRAINT_REFERENCE,   // Phase 23: a REFERENCE (FK) value doesn't match any row in the referenced table
     MVCC_ERR_CONSTRAINT_REFERENCED,  // Phase 23: can't delete -- this row is still referenced by another table
+    MVCC_ERR_CASCADE_FAILED,         // Cascading phase: an ON DELETE CASCADE/SET NULL action itself failed
+                                      // (child mutation error, cascade row/depth cap exceeded, or SET NULL vs
+                                      // NOT NULL) -- see row_constraint.h's ROW_CONSTRAINT_CASCADE_FAILED
 } MvccError;
 
 // A logical row's stable identity across however many physical versions it

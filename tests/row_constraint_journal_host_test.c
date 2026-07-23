@@ -171,6 +171,47 @@ static void make_tables(void) {
     rowstore_create_table("orders");
 }
 
+// Cascading phase: five more tables for the ON DELETE CASCADE / SET NULL
+// scenarios (s14-s17). Fresh tables rather than reusing accounts/orders,
+// because orders.account_id already carries a RESTRICT REFERENCE from the
+// registration block above and row_constraints[] has no removal API
+// (bump-allocated by design) -- a second, differently-actioned constraint
+// on the SAME column pair would leave both active, with RESTRICT firing
+// first and masking the cascade under test.
+static void make_cascade_tables(void) {
+    static const struct { const char* name; uint64_t oid;
+                          const char* c0; const char* c1; const char* c2; } defs[] = {
+        { "customers", 0xA103, "id", "name",        NULL   },
+        { "invoices",  0xA104, "id", "customer_id", "memo" },
+        { "lines",     0xA105, "id", "invoice_id",  "qty"  },
+        { "notes",     0xA106, "id", "customer_id", "body" },
+        { "strict",    0xA107, "id", "customer_id", "body" },
+    };
+    for (int t = 0; t < 5; t++) {
+        int i = 2 + t;
+        memset(&object_catalog[i], 0, sizeof(object_catalog[i]));
+        strcpy(object_catalog[i].name, defs[t].name);
+        object_catalog[i].type = OBJ_TYPE_DB_TABLE;
+        object_catalog[i].object_id = defs[t].oid;
+        object_catalog[i].active = 1;
+
+        memset(&object_schemas[i], 0, sizeof(object_schemas[i]));
+        strcpy(object_schemas[i].fields[0].key, defs[t].c0);
+        object_schemas[i].fields[0].type = FIELD_TYPE_UINT64; object_schemas[i].fields[0].active = 1;
+        strcpy(object_schemas[i].fields[1].key, defs[t].c1);
+        object_schemas[i].fields[1].type = defs[t].c2 ? FIELD_TYPE_UINT64 : FIELD_TYPE_STRING;
+        object_schemas[i].fields[1].active = 1;
+        object_schemas[i].field_count = 2;
+        if (defs[t].c2) {
+            strcpy(object_schemas[i].fields[2].key, defs[t].c2);
+            object_schemas[i].fields[2].type = FIELD_TYPE_STRING; object_schemas[i].fields[2].active = 1;
+            object_schemas[i].field_count = 3;
+        }
+        object_catalog_count = (uint32_t)(i + 1);   // visible BEFORE rowstore_create_table(), same as make_tables()
+        rowstore_create_table(defs[t].name);
+    }
+}
+
 // Fetches one column's value for the (single) row matching an id WHERE
 // clause via a fresh autocommit SELECT -- mirrors sql_tx_host_test.c's own
 // select_one() helper, including its "column projection is metadata-only"
@@ -368,6 +409,105 @@ int main(void) {
         CHECK(r.error == SQL_ERR_NONE, "s13: the INSERT itself still succeeds once detached");
         CHECK(row_journal_entry_count == before_count,
               "s13: a detached table's mutation writes NO journal entry");
+    }
+
+    /* ══ Cascading phase: ON DELETE CASCADE / SET NULL (s14-s17) ═══════════ */
+    make_cascade_tables();
+    // CURSOR_MAX is only 8 and every SELECT allocates one -- the scenarios
+    // above leak a few (harmlessly, they stay under the pool), but these
+    // new scenarios run enough SELECT checks to exhaust it, so each one
+    // closes its cursor via this helper instead of leaking.
+    #define SELECT_COUNT(sql_text, rowcount_out) do { \
+        struct SqlResult sr_; \
+        sql_execute(1, (sql_text), &sr_); \
+        (rowcount_out) = sr_.row_count; \
+        cursor_close(sr_.cursor_id); \
+    } while (0)
+    uint32_t nrows;
+    CHECK(row_constraint_add_reference_action("invoices", "customer_id", "customers", "id", ROW_ONDELETE_CASCADE) == ROW_CONSTRAINT_OK,
+          "reg2: REFERENCE(invoices.customer_id -> customers.id) ON DELETE CASCADE registers");
+    CHECK(row_constraint_add_reference_action("lines", "invoice_id", "invoices", "id", ROW_ONDELETE_CASCADE) == ROW_CONSTRAINT_OK,
+          "reg2: REFERENCE(lines.invoice_id -> invoices.id) ON DELETE CASCADE registers (second level of the chain)");
+    CHECK(row_constraint_add_reference_action("notes", "customer_id", "customers", "id", ROW_ONDELETE_SET_NULL) == ROW_CONSTRAINT_OK,
+          "reg2: REFERENCE(notes.customer_id -> customers.id) ON DELETE SET NULL registers");
+    CHECK(row_constraint_add_reference_action("strict", "customer_id", "customers", "id", ROW_ONDELETE_SET_NULL) == ROW_CONSTRAINT_OK,
+          "reg2: REFERENCE(strict.customer_id -> customers.id) ON DELETE SET NULL registers");
+    CHECK(row_constraint_add_not_null("strict", "customer_id") == ROW_CONSTRAINT_OK,
+          "reg2: NOT NULL(strict.customer_id) registers -- the deliberate SET NULL/NOT NULL conflict for s17");
+
+    /* ── Scenario 14: multi-level ON DELETE CASCADE through the REAL
+     * delete path -- customers -> invoices -> lines, two levels deep, with
+     * an unrelated sibling proving the cascade is scoped, not a table wipe. ── */
+    {
+        sql_execute(1, "INSERT INTO customers (id, name) VALUES (1, 'acme')", &r);
+        sql_execute(1, "INSERT INTO customers (id, name) VALUES (2, 'globex')", &r);
+        sql_execute(1, "INSERT INTO invoices (id, customer_id, memo) VALUES (10, 1, 'inv-a')", &r);
+        sql_execute(1, "INSERT INTO invoices (id, customer_id, memo) VALUES (11, 1, 'inv-b')", &r);
+        sql_execute(1, "INSERT INTO invoices (id, customer_id, memo) VALUES (12, 2, 'inv-c')", &r);
+        sql_execute(1, "INSERT INTO lines (id, invoice_id, qty) VALUES (100, 10, '3')", &r);
+        CHECK(r.error == SQL_ERR_NONE, "s14: setup rows all inserted");
+
+        CHECK(sql_execute(1, "DELETE FROM customers WHERE id = 1", &r) == 0 && r.affected_rows == 1,
+              "s14: DELETE of a customer with CASCADE-referencing invoices SUCCEEDS (pre-cascading this was s6's RESTRICT rejection)");
+        SELECT_COUNT("SELECT * FROM invoices WHERE customer_id = 1", nrows);
+        CHECK(nrows == 0, "s14: both of customer 1's invoices were cascade-deleted");
+        SELECT_COUNT("SELECT * FROM lines WHERE id = 100", nrows);
+        CHECK(nrows == 0, "s14: the line under invoice 10 was cascade-deleted too -- the chain really recursed a second level");
+        SELECT_COUNT("SELECT * FROM invoices WHERE id = 12", nrows);
+        CHECK(nrows == 1, "s14: customer 2's invoice is completely untouched -- the cascade was scoped to the deleted parent's children only");
+    }
+
+    /* ── Scenario 15: ON DELETE SET NULL -- the child row survives, its FK
+     * column becomes a REAL SQL NULL (null_mask, Phase 4 semantics). ──────── */
+    {
+        sql_execute(1, "INSERT INTO customers (id, name) VALUES (3, 'initech')", &r);
+        sql_execute(1, "INSERT INTO notes (id, customer_id, body) VALUES (20, 3, 'call back')", &r);
+        CHECK(sql_execute(1, "DELETE FROM customers WHERE id = 3", &r) == 0 && r.affected_rows == 1,
+              "s15: DELETE of a customer with a SET NULL-referencing note succeeds");
+        SELECT_COUNT("SELECT * FROM notes WHERE id = 20", nrows);
+        CHECK(nrows == 1, "s15: the note itself survives the parent's deletion");
+        SELECT_COUNT("SELECT * FROM notes WHERE customer_id IS NULL", nrows);
+        CHECK(nrows == 1, "s15: its customer_id is now a real SQL NULL (IS NULL matches -- null_mask, not empty-string)");
+        {
+            char body[64];
+            select_col("notes", "20", 2, body, sizeof(body));
+            CHECK(strcmp(body, "call back") == 0, "s15: the note's OTHER columns are untouched by the SET NULL rewrite");
+        }
+    }
+
+    /* ── Scenario 16: a rolled-back transaction undoes the cascade along
+     * with the parent delete -- no separate cascade-undo machinery, just
+     * MVCC doing its job on the child mutations made under the same txn. ──── */
+    {
+        sql_execute(1, "INSERT INTO customers (id, name) VALUES (5, 'hooli')", &r);
+        sql_execute(1, "INSERT INTO invoices (id, customer_id, memo) VALUES (50, 5, 'inv-x')", &r);
+        uint64_t tx = sql_tx_begin();
+        CHECK(sql_execute_tx(tx, 1, "DELETE FROM customers WHERE id = 5", &r) == 0,
+              "s16: cascading DELETE succeeds inside an explicit transaction");
+        CHECK(sql_execute_tx(tx, 1, "SELECT * FROM invoices WHERE id = 50", &r) == 0 && r.row_count == 0,
+              "s16: inside the transaction, the cascade-deleted invoice is already gone (read-your-own-writes)");
+        cursor_close(r.cursor_id);
+        CHECK(sql_tx_rollback(tx, 1) == 0, "s16: rollback succeeds");
+        SELECT_COUNT("SELECT * FROM customers WHERE id = 5", nrows);
+        CHECK(nrows == 1, "s16: after rollback the customer is back");
+        SELECT_COUNT("SELECT * FROM invoices WHERE id = 50", nrows);
+        CHECK(nrows == 1, "s16: and the cascade-deleted invoice is back too -- the cascade rolled back with the transaction");
+    }
+
+    /* ── Scenario 17: SET NULL against a NOT NULL FK column fails the whole
+     * delete -- standard SQL behavior, obtained for free because the child
+     * rewrite goes through the real mvcc_row_update() constraint check. ────── */
+    {
+        sql_execute(1, "INSERT INTO customers (id, name) VALUES (4, 'umbrella')", &r);
+        sql_execute(1, "INSERT INTO strict (id, customer_id, body) VALUES (30, 4, 'pinned')", &r);
+        CHECK(r.error == SQL_ERR_NONE, "s17: setup rows inserted (strict.customer_id NOT NULL is satisfied)");
+        CHECK(sql_execute(1, "DELETE FROM customers WHERE id = 4", &r) == 1 &&
+              r.error == SQL_ERR_CONSTRAINT_VIOLATION && r.affected_rows == 0,
+              "s17: DELETE whose SET NULL action would violate the child's NOT NULL is rejected whole");
+        SELECT_COUNT("SELECT * FROM customers WHERE id = 4", nrows);
+        CHECK(nrows == 1, "s17: the parent row still exists after the rejected delete");
+        SELECT_COUNT("SELECT * FROM strict WHERE customer_id IS NULL", nrows);
+        CHECK(nrows == 0, "s17: the child row was NOT left nulled-out -- statement atomicity held through the failed cascade");
     }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");

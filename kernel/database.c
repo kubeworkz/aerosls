@@ -83,9 +83,14 @@ int database_drop(uint32_t caller_uid, const char* name) {
         return 2;
     }
 
-    // No CASCADE in this phase (roadmap doc §1.6) — refuse rather than
-    // orphan or silently detach any table still tagged with this
-    // database's id.
+    // Refuse rather than orphan or silently detach any table still tagged
+    // with this database's id. Cascading phase note: DROP DATABASE ...
+    // CASCADE now exists, but deliberately NOT here -- sql_exec.c's
+    // exec_drop_database() implements it as drop-the-children-then-retry,
+    // reusing this function's own permission gate (rc==2 above fires
+    // before this rc==3 check ever can) and this emptiness check
+    // completely unchanged. This function itself always refuses when
+    // non-empty, exactly as §1.6 originally specced.
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         if (object_catalog[i].active && object_catalog[i].database_id == d->database_id) {
             kernel_serial_printf(

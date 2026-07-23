@@ -574,6 +574,16 @@ struct SqlColumnDef {
     uint8_t      has_reference;
     char         ref_table[OBJECT_NAME_LEN];
     char         ref_column[RECORD_KEY_LEN];
+    uint8_t      on_delete_action;   // Cascading phase: 0=RESTRICT (default,
+                                      // also what an absent ON DELETE clause
+                                      // means), 1=CASCADE, 2=SET NULL.
+                                      // Numerically identical to row_
+                                      // constraint.h's RowOnDeleteAction --
+                                      // this header deliberately doesn't
+                                      // #include row_constraint.h just for
+                                      // the enum name (the parser has no
+                                      // other dependency on it); sql_exec.c,
+                                      // which includes both, casts.
 };
 
 struct SqlCreateTableStmt {
@@ -596,16 +606,17 @@ struct SqlCreateTableStmt {
 
 // Database Namespace & Access Roadmap Phase 2. No ALTER DATABASE (a
 // database's only mutable property today is its own existence -- nothing
-// to alter), no CASCADE field on the drop (kernel/database.c's own
-// database_drop() refuses outright if any table is still tagged with it,
-// per the roadmap doc's §1.6 -- a real, named v1 limitation, not solved
-// by adding a flag here that the engine doesn't implement).
+// to alter). Cascading phase: the drop now carries a real cascade flag --
+// §1.6's original "no CASCADE in v1" limitation is closed; cascade==0 (the
+// zero default, and what a plain DROP DATABASE parses to) keeps the
+// original refuse-if-non-empty behavior exactly.
 struct SqlCreateDatabaseStmt {
     char database_name[OBJECT_NAME_LEN];
 };
 
 struct SqlDropDatabaseStmt {
-    char database_name[OBJECT_NAME_LEN];
+    char    database_name[OBJECT_NAME_LEN];
+    uint8_t cascade;   // Cascading phase: DROP DATABASE <name> CASCADE
 };
 
 // ALTER TABLE ... ADD COLUMN only for v1 -- see rowstore.c's rowstore_add_
