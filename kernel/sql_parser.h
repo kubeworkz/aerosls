@@ -422,6 +422,30 @@ typedef enum {
                           // statement -- a real, named ceiling (see the
                           // Phase 2 header note above for why this size).
 
+// Query-Surface Roadmap Phase 4: UNION / UNION ALL / INTERSECT / EXCEPT.
+// SQL_SETOP_NONE (0) is the default, keeping every pre-Phase-4 SELECT's
+// behavior identical. The right branch is captured as raw source text
+// (set_op_rhs_text on struct SqlSelectStmt below) and re-parsed at exec
+// time, the exact "capture-and-reparse-at-exec" convention Phase 7
+// established for embedded subqueries -- deliberately NOT a linked list
+// of embedded struct SqlSelectStmt (each ~34KB), the struct-chaining trap
+// the roadmap doc names explicitly. One set operator per statement in v1
+// (no "A UNION B UNION C" chains) -- the parser rejects a second set-op
+// keyword found while capturing the first one's right branch.
+typedef enum {
+    SQL_SETOP_NONE = 0,
+    SQL_SETOP_UNION,
+    SQL_SETOP_UNION_ALL,
+    SQL_SETOP_INTERSECT,
+    SQL_SETOP_EXCEPT,
+} SqlSetOpKind;
+
+// The right branch's raw text is always a suffix of the whole statement's
+// own input, so it can never exceed SQL_MAX_TEXT_LEN -- reusing that
+// constant (not a fresh magic number) keeps that invariant visible at
+// every use site.
+#define SQL_SETOP_RHS_TEXT_LEN SQL_MAX_TEXT_LEN
+
 // One link in a JOIN chain -- table/alias plus the ON clause's two
 // "qualifier.column" halves exactly as written (in whatever order the user
 // wrote them); the executor resolves which one refers to the newly joined
@@ -484,6 +508,21 @@ struct SqlSelectStmt {
     uint8_t  order_desc;                                        // 0 = ASC (default), 1 = DESC
     uint8_t  has_limit;
     uint32_t limit;
+
+    // ── Query-Surface Roadmap Phase 4: set operators (zero-default --
+    // has_set_op==0 keeps every pre-Phase-4 SELECT's behavior identical).
+    // When set, THIS struct is the LEFT branch; set_op_rhs_text is the
+    // right branch's raw, unparsed SQL text (captured from the original
+    // source, not reconstructed from tokens -- see sql_parser.c's
+    // parse_select_body() for the capture logic, which mirrors Phase 7's
+    // try_parse_embedded_subquery()). has_order_by/order_by/has_limit/
+    // limit above apply to the MERGED result, not either branch alone --
+    // the parser only lets a trailing ORDER BY/LIMIT populate those fields
+    // (see the capture logic's own comment for exactly where it stops
+    // capturing the right branch's text to make this true). ──────────────
+    uint8_t      has_set_op;
+    SqlSetOpKind set_op;
+    char         set_op_rhs_text[SQL_SETOP_RHS_TEXT_LEN];
 };
 
 // Phase 6 (SQL Feature-Parity Roadmap): a real, named ceiling on additional

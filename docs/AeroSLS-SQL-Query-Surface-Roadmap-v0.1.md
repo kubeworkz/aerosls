@@ -281,11 +281,89 @@ than speculatively supported. This phase ships with an internal-only
 test (a nested `dispatch_stmt` call proving the outer statement
 survives) and changes zero observable behavior.
 
-### Phase 4 — UNION / UNION ALL / INTERSECT / EXCEPT — depends on Phase 3
+### Phase 4 — UNION / UNION ALL / INTERSECT / EXCEPT — depends on Phase 3 — DONE
 
-**Scope.** Parser: a trailing set-op token after a complete SELECT
-captures the *raw text span* of the right branch (the same
-capture-and-reparse-at-exec convention Phase 7 established for
+**Findings addendum (as built).** Landed exactly as scoped, with one
+grammar refinement discovered during implementation. `SqlSelectStmt`
+gained `has_set_op`/`set_op` (`SqlSetOpKind`, `sql_parser.h`) and a
+`set_op_rhs_text[SQL_SETOP_RHS_TEXT_LEN]` buffer (`SQL_SETOP_RHS_TEXT_LEN`
+is literally `SQL_MAX_TEXT_LEN`, not a fresh magic number, since the
+right branch's text is always a suffix of the whole input and can never
+exceed it). `UNION`/`INTERSECT`/`EXCEPT`/`ALL` joined the keyword table
+with the project's standard reserved-word-shadowing note.
+
+The refinement: the capture point sits in `parse_select_body()` between
+HAVING and ORDER BY, so a trailing `ORDER BY`/`LIMIT` falls straight
+through to the SAME unmodified code that already parses those two
+clauses — landing on the OUTER statement's own fields by construction,
+never the right branch's, with zero new parsing logic for "which
+statement does this ORDER BY belong to." The raw-text capture itself
+mirrors `try_parse_embedded_subquery()`'s paren-depth-aware token skip,
+but stops at a top-level (depth 0) `;`/EOF/`ORDER`/`LIMIT` instead of a
+matching `)` — and rejects a second top-level set-op keyword outright
+("chained set operators are not supported (one per statement in v1)"),
+which is also what makes chaining structurally impossible to reach at
+exec time: any input that would trigger `exec_select_set_op()`
+recursing into its own right branch gets rejected at the OUTER
+statement's own parse time first, before exec ever runs. Eager
+validation reuses the exact `g_subquery_skip_scratch`/
+`g_subquery_validating`-style throwaway-parse-plus-reentrancy-flag
+pattern (`g_setop_skip_scratch`/`g_setop_validating`).
+
+Exec side: `exec_select_set_op()` runs the left branch through the
+ordinary `exec_select()` dispatch (so a JOIN or aggregate query works as
+the left branch for free, proven by scenario 9), fetches its rows via
+`cursor_fetch_rows()`, then calls `sql_exec_depth_enter()` and runs the
+right branch as a genuinely ordinary NESTED `sql_execute_tx()` call at
+depth 1 — this is Phase 3's banking paying off exactly as that phase's
+own comments predicted: the left branch's `g_select_scratch`/
+`g_join_scratch_b`/`g_agg_buckets`/`g_join_probe_pred` at depth 0 are
+untouched by whatever the right branch's own JOIN/aggregate/WHERE logic
+does at depth 1, with zero new plumbing beyond calling
+`sql_exec_depth_enter()`/`_leave()` around the nested call. Three new
+scratch buffers (`g_setop_left_scratch`/`_right_scratch`/
+`_merge_scratch`) are deliberately NOT depth-banked, using the same
+"provably never live across a nested call" reasoning already used to
+justify not banking the subquery scratch and Query-Surface Phase 2's
+`g_join_matched_ids` — a set-op statement can never be reached from
+within its own right branch's execution (see the chaining-rejection
+point above), so no two `exec_select_set_op()` frames can ever be
+simultaneously mid-flight.
+
+A real, named v1 simplification not explicitly called out in the
+original scope: ORDER BY over a set operator's merged result compares
+values as plain text regardless of either branch's declared column
+type (via `se_strcmp()`, not `compare_rows_by_column()` and its
+`RowTableLayout`/type machinery) — a merged column's "true" type has no
+single answer once JOINs/aggregates on either side are in play, so v1
+doesn't invent one. Row equality for UNION/INTERSECT/EXCEPT dedup
+treats two NULLs at the same position as equal (set-membership
+semantics, explicitly distinguished in the code from WHERE's own
+NULL-never-equals-anything predicate semantics).
+
+**Verification.** New `sql_setop_phase4_host_test.c`, 30 checks, fixture
+built around one deliberately-overlapping row (`carol`/`eng`, identical
+in both `employees_ny` and `employees_sf`) so every operator's dedup/
+membership behavior is independently checkable. UNION dedups it (5
+rows, not 6); UNION ALL keeps both copies (6 rows); INTERSECT returns
+exactly the shared row; EXCEPT returns the left side minus the overlap
+(2 rows). ORDER BY + LIMIT over a UNION's merged result sorts correctly
+and truncates correctly. Column-count mismatch rejected with
+`SQL_ERR_COLUMN_COUNT_MISMATCH`. A chained `A UNION B UNION C` is a
+parse error, not silent misinterpretation. Parser-level checks confirm
+all four operators set the right `SqlSetOpKind`, and that a trailing
+`ORDER BY DESC LIMIT n` lands on the outer statement's own fields. A
+JOIN as the set-op's own left branch executes correctly. A
+both-branches-near-cap case (150 + 150 = 300 rows via `UNION ALL`)
+truncates honestly at 256 with `truncated=1` set, never silently
+dropped or overflowed. Full regression sweep: 45/45 (44 prior + this
+new file); `sql_exec.c`, `sql_exec.h`, and `sql_parser.c`/`.h` all clean
+under the `-I`-flagged and zero-flag (`-ffreestanding`, matching
+`X86_CFLAGS`) compile-check styles.
+
+**Original scope (as planned).** Parser: a trailing set-op token after a
+complete SELECT captures the *raw text span* of the right branch (the
+same capture-and-reparse-at-exec convention Phase 7 established for
 subqueries — deliberately NOT a linked list of embedded `SqlSelectStmt`,
 which at ~34KB each is exactly the struct-chaining trap the
 investigation flagged). One set-op per statement in v1 (no
@@ -297,9 +375,9 @@ mismatch between branches is a loud error; column NAMES follow the left
 branch (standard SQL posture). ORDER BY/LIMIT apply to the merged
 result only.
 
-**Verification.** New host test: all four operators, dedup vs ALL,
-column-count mismatch rejection, ORDER BY over the merged set, and a
-both-branches-near-cap truncation case.
+**Verification (as planned).** New host test: all four operators, dedup
+vs ALL, column-count mismatch rejection, ORDER BY over the merged set,
+and a both-branches-near-cap truncation case.
 
 ### Phase 5 — CREATE VIEW / DROP VIEW — depends on Phase 3
 
@@ -363,10 +441,10 @@ which Phase 1 makes aggregatable).
 
 Phases 1 and 2 first, in either order — both are self-contained executor
 work with no reentrancy dependency, and each closes a named Gap-Analysis
-item outright. **All three (1, 2, 3) are now DONE.** Phases 4 and 5 follow in
-either order (both depend only on 3); Phase 6 after 5 (shares its
-resolve hook). Phase 7 deliberately unscheduled — revisit after 4-6 land
-and real usage shows what's still missing.
+item outright. **Phases 1-4 are now DONE.** Phase 5 next (depends only
+on 3, independent of 4); Phase 6 after 5 (shares its resolve hook).
+Phase 7 deliberately unscheduled — revisit after 4-6 land and real usage
+shows what's still missing.
 
 ## 4. Non-goals for this whole roadmap
 

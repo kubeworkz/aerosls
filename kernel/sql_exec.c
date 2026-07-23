@@ -439,8 +439,15 @@ static struct sql_agg_bucket g_agg_buckets_bank[SQL_EXEC_MAX_DEPTH][SQL_MAX_GROU
 
 static void exec_select_join(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
+static void exec_select_set_op(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 
 static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    // Query-Surface Roadmap Phase 4: checked first, ahead of aggregates/
+    // JOIN -- a set-op statement's LEFT branch (this same struct, minus
+    // has_set_op/has_order_by/has_limit) can itself be a JOIN or aggregate
+    // query, so exec_select_set_op() re-enters exec_select() for that left
+    // branch rather than duplicating this dispatch.
+    if (s->has_set_op) { exec_select_set_op(txn_id, caller_uid, s, out); return; }
     if (s->has_aggregates) { exec_select_group(txn_id, caller_uid, s, out); return; }
     if (s->has_join) { exec_select_join(txn_id, caller_uid, s, out); return; }
 
@@ -519,6 +526,198 @@ static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSe
         for (uint32_t i = 0; i < s->column_count; i++)
             se_strcpy(out->columns[i], s->columns[i], RECORD_KEY_LEN);
     }
+}
+
+// ─── Query-Surface Roadmap Phase 4: UNION / UNION ALL / INTERSECT / EXCEPT ─
+// Not banked (unlike g_select_scratch/g_agg_buckets/etc. above): a set-op
+// statement can never be reached from within its own right branch's
+// execution, because the parser rejects a second top-level set-op keyword
+// while capturing the first one's raw text (see sql_parser.c's
+// parse_select_body()) -- so no input could ever reach exec time with a
+// right branch that itself triggers exec_select_set_op() again. Exactly
+// the same "provably never live across a nested call" reasoning that
+// already justifies leaving g_subquery_stmt_scratch and g_join_matched_ids
+// unbanked (see the depth-banking note above).
+static struct RowValues g_setop_left_scratch[CURSOR_MAX_ROWSET_ROWS];
+static struct RowValues g_setop_right_scratch[CURSOR_MAX_ROWSET_ROWS];
+static struct RowValues g_setop_merge_scratch[CURSOR_MAX_ROWSET_ROWS];
+
+struct setop_row_ctx {
+    struct RowValues* out;
+    uint32_t           count;   // total rows scanned so far (may exceed max)
+    uint32_t           max;
+};
+static void setop_row_collect_cb(struct RowId id, const struct RowValues* v, void* ctxp) {
+    (void)id;
+    struct setop_row_ctx* ctx = (struct setop_row_ctx*)ctxp;
+    if (ctx->count < ctx->max) ctx->out[ctx->count] = *v;
+    ctx->count++;
+}
+
+// Row equality for dedup/membership (UNION/INTERSECT/EXCEPT), NOT the same
+// thing as WHERE's own NULL != NULL predicate semantics -- two NULLs at the
+// same column position count as equal here, matching every other engine's
+// UNION/INTERSECT/EXCEPT convention that treats a row's NULLs as a
+// comparable part of its identity for set-membership purposes even though
+// a predicate's NULL is never "true" against anything, including itself.
+static int setop_rows_equal(const struct RowValues* a, const struct RowValues* b) {
+    if (a->count != b->count) return 0;
+    for (uint32_t i = 0; i < a->count; i++) {
+        int a_null = (a->null_mask & (1u << i)) != 0;
+        int b_null = (b->null_mask & (1u << i)) != 0;
+        if (a_null != b_null) return 0;
+        if (!a_null && !se_streq(a->values[i], b->values[i])) return 0;
+    }
+    return 1;
+}
+
+// Runs the LEFT branch (this same statement, minus set-op/ORDER BY/LIMIT --
+// those apply to the merged result only), then the RIGHT branch (the raw
+// text captured at parse time, re-parsed and dispatched as an entirely
+// ordinary NESTED statement at depth 1 -- Query-Surface Roadmap Phase 3's
+// banking is exactly what makes this safe: the left branch's own
+// g_select_scratch/g_join_scratch_b/g_agg_buckets/g_join_probe_pred at
+// depth 0 are untouched by whatever the right branch's own JOIN/aggregate/
+// WHERE logic does at depth 1, even though both branches may use every one
+// of those buffers internally). Column-count mismatch between branches is
+// a loud error; column NAMES (and, in this v1, effective ORDER BY
+// comparison behavior -- see below) follow the LEFT branch, standard SQL
+// posture. Both branches, and the final merge, are capped at
+// CURSOR_MAX_ROWSET_ROWS (256) -- the same "documented cap, not silent/
+// unbounded" posture this file already applies to every other rowset.
+static void exec_select_set_op(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    struct SqlSelectStmt left = *s;
+    left.has_set_op   = 0;
+    left.has_order_by = 0;
+    left.has_limit    = 0;
+
+    struct SqlResult left_out;
+    se_memset(&left_out, 0, sizeof(left_out));
+    exec_select(txn_id, caller_uid, &left, &left_out);
+    if (left_out.error != SQL_ERR_NONE) { *out = left_out; return; }
+
+    struct setop_row_ctx lctx;
+    lctx.out = g_setop_left_scratch; lctx.count = 0; lctx.max = CURSOR_MAX_ROWSET_ROWS;
+    cursor_fetch_rows(left_out.cursor_id, CURSOR_MAX_ROWSET_ROWS, setop_row_collect_cb, &lctx);
+    uint32_t left_n = lctx.count < CURSOR_MAX_ROWSET_ROWS ? lctx.count : CURSOR_MAX_ROWSET_ROWS;
+    uint8_t  truncated = left_out.truncated;
+    uint32_t left_column_count = left_out.column_count;
+    char left_columns[ROWSTORE_MAX_COLUMNS][RECORD_KEY_LEN];
+    for (uint32_t i = 0; i < left_column_count; i++) se_strcpy(left_columns[i], left_out.columns[i], RECORD_KEY_LEN);
+    cursor_close(left_out.cursor_id);
+
+    if (!sql_exec_depth_enter(out)) return;
+    struct SqlResult right_out;
+    sql_execute_tx(txn_id, caller_uid, s->set_op_rhs_text, &right_out);
+    sql_exec_depth_leave();
+
+    if (right_out.error != SQL_ERR_NONE) { *out = right_out; return; }
+    if (right_out.kind != SQL_STMT_SELECT) {
+        // Shouldn't happen -- parse-time validation (sql_parser.c) already
+        // confirmed the captured text is a plain SELECT; fail closed if it
+        // ever does (e.g. a table dropped and namesake DDL text persisted
+        // some other way between parse and exec, though nothing in this
+        // engine actually allows that today).
+        out->error = SQL_ERR_INTERNAL;
+        se_strcpy(out->error_msg, "internal error: set operator's right branch did not re-parse as a SELECT", SQL_ERR_MSG_LEN);
+        cursor_close(right_out.cursor_id);
+        return;
+    }
+    if (right_out.column_count != left_column_count) {
+        out->error = SQL_ERR_COLUMN_COUNT_MISMATCH;
+        se_strcpy(out->error_msg, "the two sides of a set operator must select the same number of columns", SQL_ERR_MSG_LEN);
+        cursor_close(right_out.cursor_id);
+        return;
+    }
+
+    struct setop_row_ctx rctx;
+    rctx.out = g_setop_right_scratch; rctx.count = 0; rctx.max = CURSOR_MAX_ROWSET_ROWS;
+    cursor_fetch_rows(right_out.cursor_id, CURSOR_MAX_ROWSET_ROWS, setop_row_collect_cb, &rctx);
+    uint32_t right_n = rctx.count < CURSOR_MAX_ROWSET_ROWS ? rctx.count : CURSOR_MAX_ROWSET_ROWS;
+    if (right_out.truncated) truncated = 1;
+    cursor_close(right_out.cursor_id);
+
+    // Merge per the operator's own membership rule. O(n^2) row/membership
+    // compare, honest at the 256-row cap -- same posture as UNION's own
+    // dedup the roadmap doc names explicitly.
+    uint32_t merged_n = 0;
+    if (s->set_op == SQL_SETOP_UNION_ALL) {
+        for (uint32_t i = 0; i < left_n && merged_n < CURSOR_MAX_ROWSET_ROWS; i++) g_setop_merge_scratch[merged_n++] = g_setop_left_scratch[i];
+        for (uint32_t i = 0; i < right_n && merged_n < CURSOR_MAX_ROWSET_ROWS; i++) g_setop_merge_scratch[merged_n++] = g_setop_right_scratch[i];
+        if (left_n + right_n > CURSOR_MAX_ROWSET_ROWS) truncated = 1;
+    } else if (s->set_op == SQL_SETOP_UNION) {
+        for (uint32_t i = 0; i < left_n && merged_n < CURSOR_MAX_ROWSET_ROWS; i++) {
+            int dup = 0;
+            for (uint32_t j = 0; j < merged_n; j++) if (setop_rows_equal(&g_setop_left_scratch[i], &g_setop_merge_scratch[j])) { dup = 1; break; }
+            if (!dup) g_setop_merge_scratch[merged_n++] = g_setop_left_scratch[i];
+        }
+        for (uint32_t i = 0; i < right_n && merged_n < CURSOR_MAX_ROWSET_ROWS; i++) {
+            int dup = 0;
+            for (uint32_t j = 0; j < merged_n; j++) if (setop_rows_equal(&g_setop_right_scratch[i], &g_setop_merge_scratch[j])) { dup = 1; break; }
+            if (!dup) g_setop_merge_scratch[merged_n++] = g_setop_right_scratch[i];
+        }
+    } else if (s->set_op == SQL_SETOP_INTERSECT) {
+        for (uint32_t i = 0; i < left_n && merged_n < CURSOR_MAX_ROWSET_ROWS; i++) {
+            int found = 0;
+            for (uint32_t j = 0; j < right_n; j++) if (setop_rows_equal(&g_setop_left_scratch[i], &g_setop_right_scratch[j])) { found = 1; break; }
+            if (!found) continue;
+            int dup = 0;
+            for (uint32_t k = 0; k < merged_n; k++) if (setop_rows_equal(&g_setop_left_scratch[i], &g_setop_merge_scratch[k])) { dup = 1; break; }
+            if (!dup) g_setop_merge_scratch[merged_n++] = g_setop_left_scratch[i];
+        }
+    } else {   // SQL_SETOP_EXCEPT
+        for (uint32_t i = 0; i < left_n && merged_n < CURSOR_MAX_ROWSET_ROWS; i++) {
+            int found = 0;
+            for (uint32_t j = 0; j < right_n; j++) if (setop_rows_equal(&g_setop_left_scratch[i], &g_setop_right_scratch[j])) { found = 1; break; }
+            if (found) continue;
+            int dup = 0;
+            for (uint32_t k = 0; k < merged_n; k++) if (setop_rows_equal(&g_setop_left_scratch[i], &g_setop_merge_scratch[k])) { dup = 1; break; }
+            if (!dup) g_setop_merge_scratch[merged_n++] = g_setop_left_scratch[i];
+        }
+    }
+
+    // ORDER BY / LIMIT apply to the merged result only -- s's own fields,
+    // never either branch's (sql_parser.h's Phase 4 note on why the parser
+    // only lets a trailing ORDER BY/LIMIT land here). Column NAMES follow
+    // the left branch per the roadmap's own scope; v1 also compares as
+    // plain text regardless of either branch's declared column type -- a
+    // real, named simplification (not an oversight), since a merged
+    // column's "true" type has no single answer once JOINs/aggregates on
+    // either side are in play.
+    if (s->has_order_by) {
+        uint32_t order_col = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < left_column_count; i++) {
+            if (se_streq(left_columns[i], s->order_by)) { order_col = i; break; }
+        }
+        if (order_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ORDER BY column not found in the set operator's result (column names follow the left branch)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        for (uint32_t i = 1; i < merged_n; i++) {
+            struct RowValues key = g_setop_merge_scratch[i];
+            int j = (int)i - 1;
+            while (j >= 0) {
+                int cmp = se_strcmp(g_setop_merge_scratch[j].values[order_col], key.values[order_col]);
+                int should_move = s->order_desc ? (cmp < 0) : (cmp > 0);
+                if (!should_move) break;
+                g_setop_merge_scratch[j + 1] = g_setop_merge_scratch[j];
+                j--;
+            }
+            g_setop_merge_scratch[j + 1] = key;
+        }
+    }
+
+    if (s->has_limit && s->limit < merged_n) merged_n = s->limit;
+
+    uint32_t cid = cursor_open_rowset(s->table_name, g_setop_merge_scratch, merged_n);
+
+    out->error         = SQL_ERR_NONE;
+    out->cursor_id     = cid;
+    out->row_count     = merged_n;
+    out->truncated     = truncated;
+    out->column_count  = left_column_count;
+    for (uint32_t i = 0; i < left_column_count; i++) se_strcpy(out->columns[i], left_columns[i], RECORD_KEY_LEN);
 }
 
 // ─── Phase 20/Phase 2 (SQL Feature-Parity Roadmap): N-way JOIN + aliasing +

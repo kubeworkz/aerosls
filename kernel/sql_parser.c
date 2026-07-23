@@ -54,6 +54,7 @@ typedef enum {
     TOK_KW_CASCADE, TOK_KW_RESTRICT,   // Cascading phase: DROP DATABASE ... CASCADE, ON DELETE actions
     TOK_KW_CHECK, TOK_KW_BETWEEN,      // Database Gap Analysis §2.7: CHECK (col BETWEEN lo AND hi)
     TOK_KW_RIGHT, TOK_KW_FULL,         // Query-Surface Roadmap Phase 2: RIGHT/FULL OUTER JOIN
+    TOK_KW_UNION, TOK_KW_INTERSECT, TOK_KW_EXCEPT, TOK_KW_ALL,   // Query-Surface Roadmap Phase 4: set operators
     TOK_KW_TYPE_STRING, TOK_KW_TYPE_UINT64, TOK_KW_TYPE_FLOAT,
     TOK_KW_TYPE_BOOL, TOK_KW_TYPE_BLOB,
     TOK_STAR, TOK_COMMA, TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_DOT,
@@ -117,6 +118,11 @@ static const struct KeywordEntry KEYWORDS[] = {
     // Query-Surface Roadmap Phase 2. Same shadowing note again: columns/
     // tables named "right"/"full" are no longer expressible.
     {"RIGHT", TOK_KW_RIGHT}, {"FULL", TOK_KW_FULL},
+    // Query-Surface Roadmap Phase 4: set operators. Same shadowing note
+    // again: columns/tables named "union"/"intersect"/"except"/"all" are
+    // no longer expressible.
+    {"UNION", TOK_KW_UNION}, {"INTERSECT", TOK_KW_INTERSECT},
+    {"EXCEPT", TOK_KW_EXCEPT}, {"ALL", TOK_KW_ALL},
     // Column-type keywords -- checked ahead of TOK_IDENT in the lexer's own
     // keyword-lookup pass (same mechanism every other keyword uses), so a
     // column named e.g. "string" would need... actually it can't be named
@@ -832,6 +838,16 @@ static void finish_statement(struct SqlParser* p) {
     if (p->cur.kind != TOK_EOF) set_error(p, "unexpected trailing tokens after statement");
 }
 
+// Query-Surface Roadmap Phase 4: dedicated PARSE-TIME-ONLY scratch for
+// eagerly validating a set operator's captured right-branch text (via a
+// throwaway sql_parse() call), mirroring g_subquery_skip_scratch/
+// g_subquery_validating above exactly -- same reasoning, same "one level
+// only, reject nested attempts as a parse error" posture. Static (not a
+// ~34KB stack local) for the same reason every other scratch in this file
+// is.
+static struct SqlStatement g_setop_skip_scratch;
+static int g_setop_validating = 0;
+
 // Phase 7 (SQL Feature-Parity Roadmap): the actual SELECT grammar, split out
 // from parse_select() below so a subquery (embedded inside a WHERE/HAVING
 // comparison, parsed by parse_comparison_tail()) can reuse it directly --
@@ -959,6 +975,83 @@ static void parse_select_body(struct SqlParser* p, struct SqlSelectStmt* s) {
         s->having.root = parse_predicate(p, &s->having, 1);
         if (p->error) return;
         s->has_having = 1;
+    }
+
+    // Query-Surface Roadmap Phase 4: UNION / UNION ALL / INTERSECT / EXCEPT.
+    // Checked here (after HAVING, before ORDER BY/LIMIT) so a trailing
+    // ORDER BY/LIMIT keeps falling straight through to the existing code
+    // below UNCHANGED and lands on THIS statement's own has_order_by/
+    // order_by/has_limit/limit fields -- which is exactly what "ORDER BY/
+    // LIMIT apply to the merged result only" means here: they're never
+    // captured as part of the right branch's text, they're parsed as this
+    // (left/outer) statement's own trailing clauses, same as always.
+    if (p->cur.kind == TOK_KW_UNION || p->cur.kind == TOK_KW_INTERSECT || p->cur.kind == TOK_KW_EXCEPT) {
+        SqlSetOpKind kind;
+        if (p->cur.kind == TOK_KW_UNION) {
+            advance(p);
+            if (p->cur.kind == TOK_KW_ALL) { kind = SQL_SETOP_UNION_ALL; advance(p); }
+            else kind = SQL_SETOP_UNION;
+        } else if (p->cur.kind == TOK_KW_INTERSECT) {
+            kind = SQL_SETOP_INTERSECT;
+            advance(p);
+        } else {
+            kind = SQL_SETOP_EXCEPT;
+            advance(p);
+        }
+
+        // Token-level paren-depth-aware skip, mirroring
+        // try_parse_embedded_subquery()'s own capture above -- but instead
+        // of looking for a matching ')', this looks for the right branch's
+        // OWN end: a top-level (depth 0) ';'/EOF, a top-level ORDER/LIMIT
+        // (which belong to the MERGED result, not this branch -- standard
+        // SQL doesn't allow a bare set-op operand its own ORDER BY/LIMIT
+        // either), or a top-level second set-op keyword (rejected outright
+        // -- "one per statement in v1", named in sql_parser.h). Depth
+        // tracking also means a nested subquery's OWN "(SELECT ... ORDER
+        // BY ...)" inside the right branch's WHERE clause is correctly
+        // skipped over rather than mistaken for the outer boundary.
+        uint32_t start = p->cur.src_start;
+        uint32_t depth = 0;
+        for (;;) {
+            if (p->cur.kind == TOK_EOF) break;
+            if (p->cur.kind == TOK_LPAREN) { depth++; advance(p); continue; }
+            if (p->cur.kind == TOK_RPAREN) { if (depth > 0) depth--; advance(p); continue; }
+            if (depth == 0 && (p->cur.kind == TOK_SEMI || p->cur.kind == TOK_KW_ORDER || p->cur.kind == TOK_KW_LIMIT)) break;
+            if (depth == 0 && (p->cur.kind == TOK_KW_UNION || p->cur.kind == TOK_KW_INTERSECT || p->cur.kind == TOK_KW_EXCEPT)) {
+                set_error(p, "chained set operators are not supported (one per statement in v1)");
+                return;
+            }
+            advance(p);
+            if (p->error) return;
+        }
+        uint32_t end = p->cur.src_start;
+        if (end <= start) { set_error(p, "expected a SELECT statement after the set operator"); return; }
+        uint32_t n = end - start;
+        if (n >= SQL_SETOP_RHS_TEXT_LEN) { set_error(p, "right side of set operator is too long"); return; }
+        for (uint32_t i = 0; i < n; i++) s->set_op_rhs_text[i] = p->lx.src[start + i];
+        s->set_op_rhs_text[n] = '\0';
+
+        // Eager validation, mirroring try_parse_embedded_subquery()'s own
+        // throwaway-parse convention: the captured text must itself parse
+        // as a plain SELECT before this statement is considered
+        // syntactically valid at all -- catches empty/garbage text and a
+        // non-SELECT statement kind immediately, with a clear error, rather
+        // than deferring to a confusing exec-time failure.
+        if (g_setop_validating) {
+            set_error(p, "nested set operators are not supported");
+            return;
+        }
+        g_setop_validating = 1;
+        char verr[SQL_ERR_MSG_LEN];
+        int perr = sql_parse(s->set_op_rhs_text, &g_setop_skip_scratch, verr, SQL_ERR_MSG_LEN);
+        g_setop_validating = 0;
+        if (perr || g_setop_skip_scratch.kind != SQL_STMT_SELECT) {
+            set_error(p, "right side of set operator failed to parse as a SELECT statement");
+            return;
+        }
+
+        s->set_op     = kind;
+        s->has_set_op = 1;
     }
 
     if (p->cur.kind == TOK_KW_ORDER) {
