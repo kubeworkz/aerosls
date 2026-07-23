@@ -23,6 +23,27 @@ static int vi_streq(const char* a, const char* b) {
     return *a == *b;
 }
 
+// ─── VectorStore Gap Analysis §4 follow-on: same name-format gate
+// object_catalog.c's cat_valid_name() applies to object/collection names,
+// duplicated here (not shared via a header) per this codebase's own
+// established convention of small per-file string helpers (see
+// ollama_client.h's own header comment on why oc_* duplicates rather than
+// shares net/inference.c's near-identical helpers). Index names are a
+// separate namespace from object_catalog -- they never go through
+// sys_sls_valloc() -- so this is the one real choke point for THIS
+// namespace, not a parallel/duplicated policy: an index name containing a
+// space or control character would corrupt vec_schema_export/import's
+// space-delimited "INDEX <name> ON <collection> METRIC <metric>" line the
+// same way an unvalidated collection name would.
+static int vi_valid_name(const char* name) {
+    if (!name || !name[0]) return 0;
+    for (const char* p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x20) return 0;
+    }
+    return 1;
+}
+
 // ─── PRNG -- xorshift32. No PRNG existed anywhere in this kernel before
 // this phase (confirmed by grep before writing this); a hand-rolled one
 // is genuinely new machinery, same category as Phase 3's JSON parser or
@@ -310,6 +331,31 @@ static void vi_insert_into(struct VecIndex* idx, uint32_t idx_slot, uint32_t cal
     }
 }
 
+// ─── VectorStore Interface Roadmap Phase 3 / Gap Analysis §4 follow-on:
+// shared scan-and-insert pair for backfilling an index from its
+// collection's existing entries. Callback shape matches vecstore.c's own
+// vs_search_cb -- one static ctx struct, one static callback, one
+// vecstore_collection_scan() call, same three-piece pattern that file's
+// search adapter already established for "walk every live entry, do
+// something with it." Moved above vec_index_create() (was originally
+// defined only for vec_index_rebuild()'s use, further down this file) so
+// vec_index_create() can reuse it too, for the SAME reason: both
+// "create a fresh index" and "rebuild an existing one" boil down to
+// "insert every current entry in the collection into this index," and
+// this codebase's own "one real choke point" convention says that belongs
+// in one shared helper, not two copies.
+struct vi_rebuild_ctx {
+    struct VecIndex* idx;
+    uint32_t          idx_slot;
+    uint32_t          caller_uid;
+};
+
+static void vi_rebuild_cb(struct VecId id, uint64_t external_id,
+                          const struct VecValues* values, void* ctxp) {
+    struct vi_rebuild_ctx* ctx = (struct vi_rebuild_ctx*)ctxp;
+    vi_insert_into(ctx->idx, ctx->idx_slot, ctx->caller_uid, id, external_id, values);
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────
 
 void vec_index_init(void) {
@@ -327,6 +373,7 @@ void vec_index_init(void) {
 int vec_index_create(uint32_t caller_uid, const char* index_name,
                      const char* collection_name, VecMetric metric) {
     if (!index_name || !collection_name) return 1;
+    if (!vi_valid_name(index_name)) return 1;   // see vi_valid_name()'s own comment above
 
     int cidx = vi_find_collection_index(collection_name);
     if (cidx < 0 || !vector_collections[cidx].active) return 1;
@@ -350,6 +397,23 @@ int vec_index_create(uint32_t caller_uid, const char* index_name,
     idx->node_count = 0;
     idx->active_count = 0;
     idx->active = 1;
+
+    // VectorStore Gap Analysis §4 follow-on: backfill from every entry
+    // already in the collection, not just ones inserted after this point
+    // (the auto-maintenance hook, vec_index_notify_insert(), only ever
+    // covers the latter). Kept at this function's own existing PERM_READ
+    // gate above, unchanged -- vecstore_collection_scan() itself only
+    // requires PERM_READ (confirmed by reading it directly), and every
+    // write below lands in idx's own freshly allocated node slots, never
+    // in the collection -- so, unlike vec_index_rebuild()'s PERM_WRITE
+    // gate (which exists because THAT function tombstones an EXISTING
+    // index's prior contents, a real destructive action a brand-new,
+    // empty index never has), nothing here needs a stronger permission
+    // than "read the collection." idx->active is already 1 above so a
+    // concurrent reader sees a genuinely empty-then-filling index rather
+    // than a moment where the index doesn't exist at all.
+    struct vi_rebuild_ctx bctx = { idx, (uint32_t)free_slot, caller_uid };
+    vecstore_collection_scan(caller_uid, collection_name, vi_rebuild_cb, &bctx);
 
     persist_vec_index_defs();   // Gap Remediation Phase D
     return 0;
@@ -418,23 +482,9 @@ int vec_index_drop(uint32_t caller_uid, const char* index_name) {
 }
 
 // ─── VectorStore Interface Roadmap Phase 3: rebuild/backfill ──────────────
-// Callback shape matches vecstore.c's own vs_search_cb -- one static ctx
-// struct, one static callback, one vecstore_collection_scan() call, same
-// three-piece pattern that file's search adapter already established for
-// "walk every live entry, do something with it."
-struct vi_rebuild_ctx {
-    struct VecIndex* idx;
-    uint32_t          idx_slot;
-    uint32_t          caller_uid;
-};
-
-static void vi_rebuild_cb(struct VecId id, uint64_t external_id,
-                          const struct VecValues* values, void* ctxp) {
-    struct vi_rebuild_ctx* ctx = (struct vi_rebuild_ctx*)ctxp;
-    vi_insert_into(ctx->idx, ctx->idx_slot, ctx->caller_uid, id, external_id, values);
-}
-
-// See this function's own prototype comment (vec_index.h) for the full
+// vi_rebuild_ctx/vi_rebuild_cb now live above, next to vec_index_create()
+// (which reuses them too as of Gap Analysis §4) -- see that block's own
+// comment for why. See this function's own prototype comment (vec_index.h) for the full
 // contract. Clear step reuses vi_deactivate_index()'s per-node tombstone
 // LOOP SHAPE but not that function itself -- vi_deactivate_index() also
 // sets vec_indexes[slot].active = 0 (a real drop), which rebuild must NOT

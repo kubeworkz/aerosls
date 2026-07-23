@@ -93,6 +93,35 @@ static void cat_strncpy(char* dst, const char* src, size_t n) {
     dst[i] = '\0';
 }
 
+// ─── VectorStore Gap Analysis §4 follow-on: enforce the "plain, space-free
+// identifier" assumption that vec_schema_export/import's and
+// vec_data_export/import's space-delimited grammars (kernel/vec_index.c,
+// kernel/vecstore.c) already documented as their own justification for
+// having no quoting mechanism -- confirmed by direct investigation that the
+// assumption was never actually enforced anywhere: native shell's own
+// sh_token() whitespace-splitting parser can't PRODUCE a name with an
+// embedded space, but POST /api/valloc's json_str() (net/http.c) copies any
+// character verbatim between quotes, including spaces and control
+// characters, so a name created via the HTTP path could silently corrupt a
+// later schema/data export round-trip. This is the one real choke point
+// for object/collection names (sys_sls_valloc() below); vec_index_create()
+// (kernel/vec_index.c) has its own duplicate check for index names, a
+// separate namespace not routed through sys_sls_valloc(). Rejects (does
+// not sanitize/truncate) any name containing a space, tab, CR, LF, or other
+// C0 control character -- same "reject cleanly, don't silently mangle"
+// posture this codebase uses elsewhere for bad input. Empty names are also
+// rejected (existing callers already separately check this, kept here too
+// so this function alone is a complete name-format gate for the sole other
+// call site added by this fix, vec_index_create()).
+static int cat_valid_name(const char* name) {
+    if (!name || !name[0]) return 0;
+    for (const char* p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x20) return 0;   // C0 control chars + space (0x20)
+    }
+    return 1;
+}
+
 // ─── FNV-1a hash (matches generate_unique_object_id in lockfree_map) ──────────
 static uint64_t fnv1a(const char* s, size_t len) {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -226,6 +255,17 @@ int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_per
 uint64_t sys_sls_valloc(struct SLSVallocRequest* req) {
     if (!req || req->name[0] == '\0' || req->size_pages == 0)
         return 0;
+
+    // VectorStore Gap Analysis §4 follow-on -- see cat_valid_name()'s own
+    // comment above for why this is enforced here, at the one real
+    // creation choke point for object/collection names, rather than added
+    // as quoting/escaping to every space-delimited export/import grammar
+    // that reads a name back out later.
+    if (!cat_valid_name(req->name)) {
+        kernel_serial_printf("[CATALOG] ERROR: invalid name '%s' (no spaces or control characters allowed).\n",
+                             req->name);
+        return 0;
+    }
 
     uint64_t obj_id = fnv1a(req->name, cat_strlen(req->name));
 

@@ -123,6 +123,23 @@
  *    invoked action that does exactly what this point predicted: a
  *    vecstore_collection_scan() over the collection, feeding each entry
  *    through the same insert path the auto-maintenance hook uses.
+ *    UPDATE 2 — VectorStore Gap Analysis §4: this point's own original
+ *    claim finally stops being true. Re-investigated (not blindly
+ *    "fixed"): a caller creating an index over an already-populated
+ *    collection and getting back something that silently, permanently
+ *    excludes every pre-existing vector unless they separately know to
+ *    call vec_index_rebuild() is a real, surprising footgun, not a
+ *    reasonable scope cut — nothing about "index creation" implies
+ *    "except the data already there." vec_index_create() now backfills
+ *    automatically (reusing vi_rebuild_ctx/vi_rebuild_cb, moved up next to
+ *    it in vec_index.c), staying at its own existing PERM_READ gate the
+ *    whole time (see the call site's own comment for why that's still
+ *    correct and doesn't need to become PERM_WRITE). vec_index_rebuild()
+ *    itself is unchanged and still the right tool for "wipe and rebuild an
+ *    EXISTING index" (e.g. after a metric change made externally, or to
+ *    repair suspected corruption) — this update only removes the
+ *    surprise from the create path, it doesn't remove rebuild's own
+ *    reason to exist.
  */
 #ifndef VEC_INDEX_H
 #define VEC_INDEX_H
@@ -179,12 +196,22 @@ extern struct VecIndex vec_indexes[VEC_INDEX_MAX];
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 void vec_index_init(void);
 
-// Creates a new, empty HNSW index over an already-created vector
-// collection (vecstore_create_collection() already called). Does NOT
-// backfill existing entries -- see header comment point 7.
-// Returns 0 on success. 1 = collection not found, 2 = permission denied
-// (PERM_READ on collection_name), 3 = index_name already used or
-// VEC_INDEX_MAX exhausted.
+// Creates a new HNSW index over an already-created vector collection
+// (vecstore_create_collection() already called), then immediately
+// backfills it from every entry already in the collection -- see header
+// comment point 7 for the full history (this used to leave a freshly
+// created index empty; VectorStore Gap Analysis §4 named that as a real,
+// surprising gap and this now closes it, gated at this function's own
+// existing PERM_READ check, unchanged -- see vec_index.c's own comment at
+// the call site for why backfilling here doesn't need PERM_WRITE the way
+// vec_index_rebuild()'s own re-population of an ALREADY-populated index
+// does).
+// Returns 0 on success. 1 = collection not found or index_name is empty/
+// contains a space or control character (VectorStore Gap Analysis §4:
+// this codebase's export/import grammars are space-delimited with no
+// quoting, so a name has to be a plain identifier to round-trip), 2 =
+// permission denied (PERM_READ on collection_name), 3 = index_name
+// already used or VEC_INDEX_MAX exhausted.
 int vec_index_create(uint32_t caller_uid, const char* index_name,
                      const char* collection_name, VecMetric metric);
 

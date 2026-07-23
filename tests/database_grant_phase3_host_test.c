@@ -309,6 +309,47 @@ int main(void) {
     CHECK(catalog_check_access(8000, "untagged_vc", PERM_READ) == 0,
           "s12: uid 8000 is denied again -- the grant no longer applies once the tag is cleared");
 
+    /* ── Scenario 13 (VectorStore Gap Analysis §4): sys_sls_valloc() now
+     * rejects a name containing a space, tab, or control character instead
+     * of silently accepting it -- closing the round-trip corruption risk
+     * this gap analysis item identified: vec_schema_export/import's and
+     * vec_data_export/import's space-delimited grammars (kernel/vec_index.c,
+     * kernel/vecstore.c) have no quoting mechanism, so a name with an
+     * embedded space would corrupt on re-import. Native shell's own
+     * sh_token() parser can never PRODUCE such a name, but POST /api/valloc's
+     * json_str() (net/http.c) copies any character verbatim -- this is the
+     * one real choke point that now closes that path for every caller,
+     * HTTP included, not just a vecstore-specific check. ──────────────────── */
+    {
+        struct SLSVallocRequest bad;
+        memset(&bad, 0, sizeof(bad));
+        strcpy(bad.name, "has a space");
+        bad.type = OBJ_TYPE_DB_TABLE;
+        bad.size_pages = 1;
+        CHECK(sys_sls_valloc(&bad) == 0, "s13: a name with an embedded space is rejected (rc=0), not silently created");
+        CHECK(object_catalog_count == 3, "s13: the rejected space-containing name did not add a new catalog entry");
+
+        memset(&bad, 0, sizeof(bad));
+        bad.name[0] = 'a'; bad.name[1] = '\t'; bad.name[2] = 'b'; bad.name[3] = '\0';
+        bad.type = OBJ_TYPE_DB_TABLE;
+        bad.size_pages = 1;
+        CHECK(sys_sls_valloc(&bad) == 0, "s13: a name with an embedded tab is rejected the same way");
+
+        memset(&bad, 0, sizeof(bad));
+        bad.name[0] = 'a'; bad.name[1] = '\n'; bad.name[2] = '\0';
+        bad.type = OBJ_TYPE_DB_TABLE;
+        bad.size_pages = 1;
+        CHECK(sys_sls_valloc(&bad) == 0, "s13: a name with an embedded newline is rejected the same way");
+
+        struct SLSVallocRequest good;
+        memset(&good, 0, sizeof(good));
+        strcpy(good.name, "plain_identifier_123");
+        good.type = OBJ_TYPE_DB_TABLE;
+        good.size_pages = 1;
+        CHECK(sys_sls_valloc(&good) != 0, "s13: a plain, space-free name is completely unaffected and still succeeds");
+        CHECK(object_catalog_count == 4, "s13: the valid name DID add exactly one new catalog entry");
+    }
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

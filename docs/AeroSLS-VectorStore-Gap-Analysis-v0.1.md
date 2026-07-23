@@ -15,9 +15,12 @@ VectorStore subsystem (`kernel/vecstore.c`, `kernel/vec_index.c`,
 
 Findings are grouped by severity: §1 is functional gaps a real user would
 hit; §2 is test-coverage limits that have accumulated across phases; §3
-is a cross-roadmap gap this subsystem never got folded into; §4 is named,
-deliberate scope cuts that remain reasonable to leave alone. Within each
-group, items are ordered by recommended priority.
+is a cross-roadmap gap this subsystem never got folded into; §4 was
+originally four named, deliberate scope cuts -- re-investigated in a
+follow-on pass, three turned out to be real, worth-fixing gaps after all
+(now addressed) and one was re-affirmed as still a genuine, correct
+design choice. Within each group, items are ordered by recommended
+priority.
 
 ## 1. Functional gaps
 
@@ -325,25 +328,98 @@ enforcement mechanism.)
 ## 4. Named, deliberate scope cuts — reasonable to leave alone
 
 - **Collections have no metric of their own** (only an index fixes a
-  metric) — a real `VecCollectionHeader` design choice, not a gap; a
-  collection with zero indexes correctly exports with no metric
-  information because none exists.
-- **No quoting in the schema/data export grammars** — matches this
-  codebase's plain, space-free `OBJECT_NAME_LEN` identifier convention
-  throughout; there's no equivalent of a SQL string literal in this
-  grammar for anything to hide inside.
-- **Rebuild is a synchronous, opt-in scan**, never automatic on `vec
-  index create` — acceptable at AeroSLS's current scale, named as
-  unverified-at-large-scale rather than re-measured, but deliberately
-  kept explicit and visible rather than a surprise stall.
-- **No live-Ollama-instance test has ever been run** for any embed-
-  related path (`ollama_client_host_test.c`, and every phase's embed-
-  search/embed-insert scenarios) — every host test uses a mocked
-  embedding response, consistent with `ollama_client.c`'s own original
-  honesty note that this was never verified against a live instance in
-  this environment. The one live verification that did happen (Phase 4's
-  manual browser pass) used a real Ollama instance and passed, but that
-  was a one-time manual check, not a repeatable automated one.
+  metric) — **re-investigated, re-affirmed: still a real design choice,
+  not a gap.** `vecstore_search()` (brute-force, exact) takes its metric
+  as a per-call parameter precisely so one collection can be queried under
+  L2 today and cosine tomorrow without any schema change; pinning a
+  metric to the collection would only take away that flexibility, not add
+  anything. An HNSW index (`vec_index_create()`) is a different story on
+  purpose: the graph itself is metric-dependent — its neighbor edges are
+  literally "closest under metric M" — so metric has to be fixed at
+  index-creation time, and it correctly lives on `struct VecIndex`
+  (`idx->metric`), not the collection. A collection with zero indexes
+  exports with no metric information because none exists to lose, not
+  because the exporter dropped it. No code change; this bullet's original
+  claim holds up under a second look.
+- ~~**No quoting in the schema/data export grammars**~~ — **Addressed.**
+  Re-investigation found this reasoning was half right: the grammars
+  genuinely don't need quoting *if* every name actually is a plain,
+  space-free identifier — but that assumption was never enforced
+  anywhere. `user/shell.c`'s `sh_token()` parser can't produce a name
+  containing a space, but `POST /api/valloc`'s `json_str()` (`net/http.c`)
+  copies any character verbatim out of a JSON string body, including
+  spaces and control characters — so a collection or object created over
+  HTTP with an embedded space would silently corrupt on the next
+  `vec_schema_export()`/`vec_data_export()` round-trip (the space would be
+  misread as an extra token boundary by `vse_next_token()`/
+  `vs_next_token_bounded()` on import). Rather than add quoting/escaping
+  to two separate grammars, the fix enforces the assumption itself at the
+  two real name-creation choke points: `sys_sls_valloc()`
+  (`kernel/object_catalog.c`, covers every object/collection name,
+  including the HTTP path) and `vec_index_create()`
+  (`kernel/vec_index.c`, covers index names, a separate namespace that
+  never goes through `sys_sls_valloc()`). Both now reject a name that's
+  empty or contains a space, tab, CR, LF, or other C0 control character,
+  cleanly (return 0/1, matching each function's own existing bad-input
+  convention) rather than silently accepting it. This strengthens, not
+  reverses, the original reasoning: "no quoting needed because names are
+  plain identifiers" is now an enforced invariant instead of an unchecked
+  assumption. Covered by new host-test scenarios in
+  `tests/database_grant_phase3_host_test.c` (Scenario 13) and
+  `tests/vec_index_host_test.c` (Scenario 8b).
+- ~~**Rebuild is a synchronous, opt-in scan**, never automatic on `vec
+  index create`~~ — **Addressed.** Re-investigation concluded the
+  original "acceptable at AeroSLS's current scale" framing undersold a
+  real, surprising footgun: a caller creating an index over an
+  already-populated collection got back something that silently,
+  permanently excluded every pre-existing vector unless they separately
+  knew to call `vec_index_rebuild()` — nothing about "creating an index"
+  implies "except the data already there." `vec_index_create()`
+  (`kernel/vec_index.c`) now backfills automatically (synchronously, not
+  async — per this fix's explicit scope), reusing the same
+  `vecstore_collection_scan()` + insert path `vec_index_rebuild()` already
+  used, moved earlier in the file so both functions share it (this
+  codebase's "one real choke point" convention). This stays at
+  `vec_index_create()`'s own existing `PERM_READ` gate, unchanged:
+  `vecstore_collection_scan()` itself only ever requires `PERM_READ`
+  (confirmed directly), and every write from the backfill lands in the
+  new index's own freshly allocated node slots, never in the collection —
+  unlike `vec_index_rebuild()`'s `PERM_WRITE` gate, which exists because
+  THAT function tombstones an *existing* index's prior contents, a real
+  destructive action a brand-new, empty index never has. `vec_index_
+  rebuild()` itself is unchanged and still the right tool for wiping and
+  rebuilding an *existing* index (e.g. after suspected corruption, or a
+  large batch of deletes). Covered by updated/new host-test scenarios in
+  `tests/vec_index_host_test.c` (Scenarios 5 and 8, updated; Scenario 8b,
+  new).
+- ~~**No live-Ollama-instance test has ever been run**~~ — **Addressed.**
+  `tests/ollama_client_live_host_test.c` now exists: it links the REAL,
+  unmodified `net/ollama_client.c` (same as `ollama_client_host_test.c`
+  does) but replaces that file's canned-bytes `tcp_connect()`/`tcp_send()`/
+  `tcp_recv()`/`tcp_close()` stubs with real POSIX-socket implementations
+  at that exact same API boundary — the only thing that changes is the
+  transport underneath `ollama_embed()`, which stays completely unaware
+  it's talking to real sockets instead of this kernel's own e1000/ARP
+  stack. It's self-skipping, not a hard CI gate: a short non-blocking
+  connect probe runs first, and if nothing answers at the configured
+  endpoint (`OLLAMA_LIVE_HOST`/`PORT`, default `127.0.0.1:11434`) it
+  prints `SKIP` and exits 0 — this development sandbox has no reachable
+  Ollama instance, confirmed the same way the original mocked test's own
+  header comment already documented, so `tests/run_all.sh`'s own
+  regression sweep reports this file as a clean pass via that SKIP path
+  today. `OLLAMA_LIVE_REQUIRE=1` promotes an unreachable endpoint to a
+  hard failure for an environment that's expected to always have one.
+  All four code paths were verified directly against a real local test
+  HTTP server standing in for Ollama during this work: full success
+  (`ALL CHECKS PASSED`, real embedding parsed off a real socket), a
+  reachable-but-non-2xx response (treated as a pass for "wire format
+  round-tripped against a genuine server," distinct from "model not
+  pulled"), the default unreachable-SKIP path (exit 0), and the
+  `OLLAMA_LIVE_REQUIRE=1` hard-fail path (exit 1). This closes the
+  automation gap honestly, without requiring this specific sandboxed
+  environment to have a live Ollama instance available — the
+  infrastructure is real and repeatable; running it against a genuine
+  Ollama server is a `git pull` + one command away for anyone who has one.
 
 ## 5. Suggested priority if any of this gets picked up
 
@@ -361,7 +437,13 @@ enforcement mechanism.)
    and a missing assignment surface, both closed.
 5. ~~**§1.3** (opt-in `external_id` uniqueness)~~ — **CLOSED.**
 6. ~~**§1.4** (pagination for bulk data export)~~ — **CLOSED.**
-7. **New, small: port `vec schema export/import`/`vec data export/
+7. ~~**§4** (the 3 re-investigated scope cuts: live-Ollama test, name
+   validation, auto-backfill)~~ — **CLOSED.** Live-Ollama test
+   infrastructure built; name-validation gap and auto-backfill footgun
+   both found to be real on re-investigation and fixed; the fourth item
+   (collections having no metric of their own) was re-affirmed as a
+   correct design choice, not a gap.
+8. **New, small: port `vec schema export/import`/`vec data export/
    import` to the web Terminal** (found during §2's own pass) — low
    priority, since the same functionality is already reachable via the
    VectorStore tab's own buttons (§1.1) and the kernel-native shell; only

@@ -136,11 +136,13 @@ int main(void) {
     vec_index_init();
 
     /* ── Setup: register the collection + a real HNSW index BEFORE any
-     * data exists -- matching vec_index_create()'s own documented "no
-     * backfill" contract (vec_index.h header comment point 7): the index
-     * is meant to be created up front and populated via the auto-
-     * maintenance hook as data is inserted, not retrofitted onto an
-     * already-populated collection. ─────────────────────────────────────── */
+     * data exists. This is still the more common real-world ordering (an
+     * index defined at collection-creation time, then populated as data
+     * arrives via the auto-maintenance hook) -- Scenarios 5 and 8/8b below
+     * separately cover the OTHER ordering, an index created AFTER a
+     * collection is already populated, which Gap Analysis §4 changed
+     * vec_index_create() to auto-backfill from rather than start empty
+     * (vec_index.h header comment point 7's UPDATE 2). ────────────────────── */
     memset(&object_catalog[0], 0, sizeof(object_catalog[0]));
     strcpy(object_catalog[0].name, "cluster_points");
     object_catalog[0].type = OBJ_TYPE_DB_TABLE;
@@ -311,10 +313,23 @@ int main(void) {
 
     /* ── Scenario 5: a second index on the same collection, different
      * metric (cosine), sharing the same node pool -- confirms index_id
-     * tagging keeps the two graphs independent. ─────────────────────────────── */
+     * tagging keeps the two graphs independent. Also exercises Gap
+     * Analysis §4's auto-backfill on a collection that's ALREADY populated
+     * at create time (cluster_points has N_POINTS-1 live entries here,
+     * after scenario 4's earlier deletion) -- distinct from Scenario 8's
+     * dedicated backfill coverage, which uses a small, hand-countable
+     * dataset; this scenario proves auto-backfill also holds at a much
+     * larger scale (hundreds of entries) and alongside a second, unrelated
+     * pre-existing index over the same collection. ──────────────────────────── */
     {
         CHECK(vec_index_create(1, "idx_cosine", "cluster_points", VEC_METRIC_COSINE) == 0,
               "s5: a second index on the same collection, different metric, is created");
+        int cosine_slot = -1;
+        for (int i = 0; i < VEC_INDEX_MAX; i++) if (vec_indexes[i].active && strcmp(vec_indexes[i].index_name, "idx_cosine") == 0) cosine_slot = i;
+        CHECK(cosine_slot >= 0 && vec_indexes[cosine_slot].active_count == (uint32_t)(N_POINTS - 1),
+              "s5: Gap Analysis §4 -- idx_cosine auto-backfilled from cluster_points' N_POINTS-1 already-live entries "
+              "(one fewer than N_POINTS because scenario 4 already deleted one) immediately at create time, before any new insert");
+
         struct VecValues v;
         v.count = DIM;
         for (int d = 0; d < DIM; d++) v.values[d] = 2.0f * CLUSTER_SEP + test_jitter(JITTER_MAG);
@@ -322,16 +337,13 @@ int main(void) {
         CHECK(vecstore_insert(1, "cluster_points", 9999, &v, &new_id) == 0,
               "s5: a new insert after the second index exists succeeds");
         // Both indexes should have picked up the new point via the SAME
-        // auto-maintenance call. idx_cluster's own active_count nets back
-        // to exactly N_POINTS here, not N_POINTS+1 -- scenario 4 already
-        // deleted one point from idx_cluster (300 -> 299) before this new
-        // insert (299 -> 300); idx_cosine didn't exist yet during that
-        // deletion, so it's unaffected by it.
+        // auto-maintenance call -- both now land on exactly N_POINTS:
+        // idx_cluster via its usual net-of-scenario-4's-deletion path,
+        // idx_cosine via its own fresh backfill (N_POINTS-1) plus this one
+        // new insert.
         CHECK(vec_indexes[0].active_count == N_POINTS, "s5: idx_cluster (L2) also grew by the new insert (net of scenario 4's earlier deletion)");
-        int cosine_slot = -1;
-        for (int i = 0; i < VEC_INDEX_MAX; i++) if (vec_indexes[i].active && strcmp(vec_indexes[i].index_name, "idx_cosine") == 0) cosine_slot = i;
-        CHECK(cosine_slot >= 0 && vec_indexes[cosine_slot].active_count == 1,
-              "s5: idx_cosine (empty until now) grew to exactly 1 -- both indexes maintained independently from one insert");
+        CHECK(vec_indexes[cosine_slot].active_count == (uint32_t)N_POINTS,
+              "s5: idx_cosine reaches exactly N_POINTS too -- its own backfill plus this one shared auto-maintenance insert, maintained independently of idx_cluster");
 
         struct VecMatch cos_result[1];
         CHECK(vec_index_search(1, "idx_cosine", &v, 1, 50, cos_result) == 1 && cos_result[0].external_id == 9999,
@@ -430,13 +442,17 @@ int main(void) {
         CHECK(1, "s7: calling vecstore_notify_object_freed() again (already-freed) and on a name that was never a collection are both silent no-ops, not crashes");
     }
 
-    /* ── Scenario 8: VectorStore Interface Roadmap Phase 3 -- backfill.
-     * A fresh collection populated BEFORE its index exists (the exact
-     * scenario vec_index.h's own header comment point 7 names as the gap):
-     * confirms the index really does start empty, then confirms
-     * vec_index_rebuild() closes that gap by finding every pre-existing
-     * vector via vecstore_collection_scan() and indexing it. Also exercises
-     * the two error paths (nonexistent index name, permission denied). ──── */
+    /* ── Scenario 8: VectorStore Interface Roadmap Phase 3 / Gap Analysis §4
+     * -- backfill. A fresh collection populated BEFORE its index exists
+     * (the exact scenario vec_index.h's own header comment point 7 named
+     * as a gap): as of Gap Analysis §4, vec_index_create() now backfills
+     * automatically, so the freshly created index should be immediately
+     * populated and immediately searchable -- no separate vec_index_rebuild()
+     * call required. vec_index_rebuild() itself is unchanged and still
+     * exercised here for its own real purpose (re-populating an ALREADY-
+     * populated index, e.g. Scenario 9's tombstone-cleanup case below),
+     * including its two error paths (nonexistent index name, permission
+     * denied). ─────────────────────────────────────────────────────────────── */
     {
         memset(&object_catalog[2], 0, sizeof(object_catalog[2]));
         strcpy(object_catalog[2].name, "backfill_col");
@@ -457,27 +473,53 @@ int main(void) {
 
         CHECK(vec_index_create(1, "idx_backfill", "backfill_col", VEC_METRIC_L2) == 0,
               "s8: setup -- index created AFTER the collection was already populated");
-        CHECK(vec_indexes_active_count_by_name("idx_backfill") == 0,
-              "s8: the freshly created index starts empty despite the collection already having 5 live vectors -- the documented backfill gap, confirmed still real pre-rebuild");
+        CHECK(vec_indexes_active_count_by_name("idx_backfill") == 5,
+              "s8: Gap Analysis §4 -- the freshly created index is ALREADY populated with all 5 pre-existing vectors, no rebuild needed");
 
         struct VecValues probe0 = { .count = 3, .values = {0.0f, 0.0f, 0.0f} };
-        struct VecMatch empty_result[5];
-        CHECK(vec_index_search(1, "idx_backfill", &probe0, 5, 50, empty_result) == 0,
-              "s8: searching the empty, unrebuilt index finds nothing, even for a query matching a real stored point exactly");
+        struct VecMatch immediate[1];
+        CHECK(vec_index_search(1, "idx_backfill", &probe0, 1, 50, immediate) == 1 &&
+              immediate[0].external_id == 500 && immediate[0].distance < 0.001f,
+              "s8: searching the just-created index immediately finds a pre-existing vector (external_id=500), distance ~0 for its own exact values");
 
         CHECK(vec_index_rebuild(1, "does_not_exist") == 1, "s8: rebuilding a nonexistent index name fails with 1");
         g_access_force_deny = 1;
-        CHECK(vec_index_rebuild(1, "idx_backfill") == 2, "s8: rebuilding with access denied fails with 2, and leaves the index untouched (still empty)");
+        CHECK(vec_index_rebuild(1, "idx_backfill") == 2, "s8: rebuilding with access denied fails with 2, and leaves the index untouched (still 5)");
         g_access_force_deny = 0;
 
-        CHECK(vec_index_rebuild(1, "idx_backfill") == 0, "s8: vec_index_rebuild succeeds on the real, populated collection");
+        CHECK(vec_index_rebuild(1, "idx_backfill") == 0, "s8: vec_index_rebuild ALSO still works directly, re-populating an already-populated index from scratch");
         CHECK(vec_indexes_active_count_by_name("idx_backfill") == 5,
-              "s8: after rebuild, active_count reflects all 5 pre-existing vectors -- the backfill gap is closed");
+              "s8: after an explicit rebuild, active_count is still exactly 5 -- no duplication, same 5 entries re-derived from the collection");
 
         struct VecMatch after_rebuild[1];
         CHECK(vec_index_search(1, "idx_backfill", &probe0, 1, 50, after_rebuild) == 1 &&
               after_rebuild[0].external_id == 500 && after_rebuild[0].distance < 0.001f,
-              "s8: the rebuilt index now finds a pre-existing vector (external_id=500) via a search, distance ~0 for its own exact values");
+              "s8: the explicitly-rebuilt index still finds the same pre-existing vector (external_id=500) via a search, distance ~0");
+    }
+
+    /* ── Scenario 8b: VectorStore Gap Analysis §4 -- vec_index_create()
+     * rejects an index_name containing a space or control character, the
+     * same round-trip-corruption risk cat_valid_name() closes for
+     * object/collection names in object_catalog.c's sys_sls_valloc(), but
+     * enforced here directly since index names are their own separate
+     * namespace that never goes through sys_sls_valloc(). ────────────────── */
+    {
+        int before_count = 0;
+        for (int i = 0; i < VEC_INDEX_MAX; i++) if (vec_indexes[i].active) before_count++;
+
+        CHECK(vec_index_create(1, "has a space", "backfill_col", VEC_METRIC_L2) == 1,
+              "s8b: an index_name with an embedded space is rejected (rc=1), not silently created");
+        CHECK(vec_index_create(1, "", "backfill_col", VEC_METRIC_L2) == 1,
+              "s8b: an empty index_name is rejected the same way");
+
+        int after_count = 0;
+        for (int i = 0; i < VEC_INDEX_MAX; i++) if (vec_indexes[i].active) after_count++;
+        CHECK(before_count == after_count, "s8b: neither rejected attempt actually created a new index slot");
+
+        CHECK(vec_index_create(1, "idx_plain_name_123", "backfill_col", VEC_METRIC_L2) == 0,
+              "s8b: a plain, space-free index_name is completely unaffected and still succeeds");
+        CHECK(vec_indexes_active_count_by_name("idx_plain_name_123") == 5,
+              "s8b: the valid new index also auto-backfilled from backfill_col's 5 existing entries, same as Scenario 8");
     }
 
     /* ── Scenario 9: VectorStore Interface Roadmap Phase 3 -- tombstone
