@@ -33,11 +33,22 @@ struct StreamEntry {
     uint32_t  frames_used;
     uint64_t  lba_base;  // first LBA on NVMe for this stream's data
     uint8_t   active;
+    // Multitenant Isolation Gap Analysis §5 item 3 / §7 item 3: owner_uid
+    // and partition_id, stamped at stream_create() time and never
+    // reassigned afterward (mirrors object_catalog's own "owner is fixed
+    // at creation" posture). Every frame this stream ever allocates
+    // (stream_write_chunk()'s initial write AND stream_lazy_load_frame()'s
+    // post-reboot reload) is charged against partition_id via
+    // allocate_physical_ram_frame_for_partition() -- see stream.c's own
+    // comment on why this, not the plain unaccounted
+    // allocate_physical_ram_frame() every prior version of this file used.
+    uint32_t  owner_uid;
+    uint32_t  partition_id;
 };
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 void               stream_init(void);
-int                stream_create(const char* name, const char* mime_type);
+int                stream_create(uint32_t caller_uid, const char* name, const char* mime_type);
 int                stream_write_chunk(const char* name,
                                       const uint8_t* chunk, uint32_t len,
                                       uint32_t offset, uint8_t is_last);

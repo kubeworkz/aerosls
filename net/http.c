@@ -1515,7 +1515,12 @@ static void http_respond_program_binary(int conn, struct ServiceBinary* sb) {
 }
 
 // ─── POST /api/stream/create ──────────────────────────────────────────────────
-static int api_stream_create(const char* body, char* buf, int max) {
+// Multitenant Isolation Gap Analysis §5 item 3: req_uid now threaded
+// through to stream_create() as the real caller identity (was silently
+// dropped -- every stream was created as owner_uid 0 regardless of who
+// actually authenticated the request), matching every other creation
+// route's own "caller_uid comes from the auth gate, never the request body" posture.
+static int api_stream_create(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j={buf,0,max};
     if (!body){jb_obj_open(&j,0);jb_str(&j,"error","missing body");jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;}
     char sname[STREAM_NAME_LEN], smime[STREAM_MIME_LEN];
@@ -1523,7 +1528,7 @@ static int api_stream_create(const char* body, char* buf, int max) {
     json_str(body,"name",sname,STREAM_NAME_LEN);
     json_str(body,"mime",smime,STREAM_MIME_LEN);
     if (!sname[0]){jb_obj_open(&j,0);jb_str(&j,"ok","false");jb_putc(&j,',');jb_str(&j,"error","name required");jb_obj_close(&j);j.buf[j.pos]='\0';return j.pos;}
-    int rc=stream_create(sname,smime);
+    int rc=stream_create(req_uid,sname,smime);
     jb_obj_open(&j,0);
     jb_str(&j,"ok",rc==0?"true":"false");jb_putc(&j,',');
     jb_str(&j,"name",sname);
@@ -4680,7 +4685,7 @@ static void http_route(int conn, char* req) {
         }
         // ── POST /api/stream/create|upload ──────────────────────────────────────
         if (!strcmp(path, "/api/stream/create")) {
-            blen = api_stream_create(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_stream_create(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/stream/upload")) {

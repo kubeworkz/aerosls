@@ -1,10 +1,10 @@
 #include "stream.h"
 #include "kernel_io.h"
 #include "object_catalog.h"
+#include "partition.h"        // Multitenant Isolation Gap Analysis §5 item 3 -- partition_get_for_uid()
+#include "frame_pool.h"        // Multitenant Isolation Gap Analysis §5 item 3 -- allocate_physical_ram_frame_for_partition()
 #include "../user/permissions.h"
 #include "../drivers/nvme_io.h"
-
-extern void* allocate_physical_ram_frame(void);
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 struct StreamEntry stream_store[STREAM_MAX];
@@ -47,7 +47,9 @@ static void st_uint_to_str(uint64_t v, char* out, int max) {
 //       128-131: size (uint32)
 //       132-139: lba_base (uint64)
 //       140:    active (uint8)
-//       141-447: padding
+//       141-144: owner_uid (uint32) -- Multitenant Isolation Gap Analysis §5 item 3
+//       145-148: partition_id (uint32) -- Multitenant Isolation Gap Analysis §5 item 3
+//       149-447: padding
 
 #define DIR_MAGIC   0x5853525453534C53ULL  // "SLSSTRMX" little-endian
 #define DIR_VERSION 1u
@@ -70,6 +72,9 @@ static void dir_write_entry(int slot) {
     uint64_t lb = se->lba_base;
     for (int b=0;b<8;b++) entry[132+b] = (uint8_t)(lb >> (b*8));
     entry[140] = se->active;
+    uint32_t ou = se->owner_uid, pid = se->partition_id;
+    for (int b=0;b<4;b++) entry[141+b] = (uint8_t)(ou  >> (b*8));
+    for (int b=0;b<4;b++) entry[145+b] = (uint8_t)(pid >> (b*8));
 }
 
 static void dir_read_entry(int slot) {
@@ -85,6 +90,14 @@ static void dir_read_entry(int slot) {
     for (int b=0;b<8;b++) lb |= ((uint64_t)entry[132+b]) << (b*8);
     se->lba_base   = lb;
     se->active     = entry[140];
+    se->owner_uid = (uint32_t)entry[141]
+                  | ((uint32_t)entry[142] << 8)
+                  | ((uint32_t)entry[143] << 16)
+                  | ((uint32_t)entry[144] << 24);
+    se->partition_id = (uint32_t)entry[145]
+                      | ((uint32_t)entry[146] << 8)
+                      | ((uint32_t)entry[147] << 16)
+                      | ((uint32_t)entry[148] << 24);
     se->frames_used = 0;
     for (int f=0;f<STREAM_MAX_FRAMES;f++) se->frames[f] = 0;
 }
@@ -138,7 +151,7 @@ void stream_init(void) {
                     st_strncpy(req.name, stream_store[i].name, OBJECT_NAME_LEN);
                     req.type       = OBJ_TYPE_STREAM;
                     req.size_pages = 1;
-                    req.owner_uid  = 0;
+                    req.owner_uid  = stream_store[i].owner_uid;   // Multitenant Isolation Gap Analysis §5 item 3 -- was hardcoded 0
                     req.perm_mask  = PERM_READ | PERM_OWNER;
                     req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
                     req.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
@@ -185,7 +198,16 @@ struct StreamEntry* stream_find(const char* name) {
 }
 
 // ─── stream_create ───────────────────────────────────────────────────────────
-int stream_create(const char* name, const char* mime_type) {
+// Multitenant Isolation Gap Analysis §5 item 3 / §7 item 3: caller_uid is now
+// a real parameter, not silently dropped. Stamped onto the StreamEntry as
+// owner_uid, and resolved via partition_get_for_uid() into partition_id --
+// every frame this stream ever allocates (here and in stream_write_chunk()/
+// stream_lazy_load_frame()) is charged against that partition's quota via
+// allocate_physical_ram_frame_for_partition(), closing the gap LPAR Phase
+// 13's own findings named and left open: stream/blob storage was the one
+// unaccounted, unbounded physical-memory consumer any authenticated caller
+// could drive without limit.
+int stream_create(uint32_t caller_uid, const char* name, const char* mime_type) {
     if (!name || !name[0]) return 1;
     if (stream_find(name)) {
         kernel_serial_printf("[STREAM] create: '%s' already exists.\n", name);
@@ -203,6 +225,8 @@ int stream_create(const char* name, const char* mime_type) {
             stream_store[i].active      = 1;
             stream_store[i].lba_base    = STREAM_DATA_LBA_BASE
                                         + (uint64_t)i * STREAM_SECTORS_PER_SLOT;
+            stream_store[i].owner_uid    = caller_uid;
+            stream_store[i].partition_id = partition_get_for_uid(caller_uid);
             for (int f=0;f<STREAM_MAX_FRAMES;f++) stream_store[i].frames[f]=0;
 
             // Register in catalog + seed metadata records
@@ -210,7 +234,7 @@ int stream_create(const char* name, const char* mime_type) {
             st_strncpy(req.name, name, OBJECT_NAME_LEN);
             req.type       = OBJ_TYPE_STREAM;
             req.size_pages = 1;
-            req.owner_uid  = 0;
+            req.owner_uid  = caller_uid;   // Multitenant Isolation Gap Analysis §5 item 3 -- was hardcoded 0
             req.perm_mask  = PERM_READ | PERM_OWNER;
             req.partition_id = 0;   // Phase 8: 0 = default to owner_uid's own partition
             req.database_id = 0;    // VectorStore Gap Analysis §3: was uninitialized stack garbage until this fix
@@ -261,10 +285,14 @@ int stream_write_chunk(const char* name, const uint8_t* chunk,
         uint32_t frame_idx = abs_byte / 4096;
         uint32_t frame_off = abs_byte % 4096;
 
-        // Allocate frame if needed
+        // Allocate frame if needed -- charged against this stream's owning
+        // partition (Multitenant Isolation Gap Analysis §5 item 3), so a
+        // configured frame quota (partition_set_frame_quota()) now actually
+        // bounds stream/blob growth the same way it already bounds process
+        // stack/code and loader segment growth.
         if (!se->frames[frame_idx]) {
-            void* frame = allocate_physical_ram_frame();
-            if (!frame) { kernel_serial_print("[STREAM] OOM.\n"); return 3; }
+            void* frame = allocate_physical_ram_frame_for_partition(se->partition_id);
+            if (!frame) { kernel_serial_print("[STREAM] OOM or quota exceeded.\n"); return 3; }
             st_memset(frame, 0, 4096);
             se->frames[frame_idx] = (uint8_t*)frame;
             if (frame_idx + 1 > se->frames_used)
@@ -317,7 +345,10 @@ int stream_write_chunk(const char* name, const uint8_t* chunk,
 // ─── stream_lazy_load_frame ───────────────────────────────────────────────────
 // Called by http_respond_stream when a frame is NULL (post-reboot lazy load).
 uint8_t* stream_lazy_load_frame(struct StreamEntry* se, uint32_t frame_idx) {
-    void* frame = allocate_physical_ram_frame();
+    // Multitenant Isolation Gap Analysis §5 item 3: post-reboot reload is
+    // still a real physical allocation -- charge it against the stream's
+    // owning partition just like the initial write, not the unaccounted path.
+    void* frame = allocate_physical_ram_frame_for_partition(se->partition_id);
     if (!frame) return 0;
     uint64_t lba = se->lba_base + (uint64_t)frame_idx * 8;
     int rc = nvme_read_sync(lba, frame);
@@ -349,7 +380,9 @@ int stream_list_json(char* buf, int max) {
         SK("name");      SQ(stream_store[i].name);       SC(',');
         SK("mime_type"); SQ(stream_store[i].mime_type);   SC(',');
         SK("size");      SU(stream_store[i].size);        SC(',');
-        SK("frames");    SU(stream_store[i].frames_used);
+        SK("frames");    SU(stream_store[i].frames_used); SC(',');
+        SK("owner_uid");     SU(stream_store[i].owner_uid);     SC(',');   // Multitenant Isolation Gap Analysis §5 item 3
+        SK("partition_id");  SU(stream_store[i].partition_id);
         SC('}');
     }
     SC(']'); SC('}');
