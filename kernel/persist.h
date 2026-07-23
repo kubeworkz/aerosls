@@ -82,7 +82,25 @@
 //            direct restore — an audit trail is inherently historical, not a
 //            derived structure that can be rebuilt from current row state
 //            (see Phase D's own findings addendum)
-//  (end LBA 6672 — comfortably clear of STREAM_DIR_LBA 8192)
+//  (end LBA 6672)
+//
+//  Database Gap Analysis §1 (docs/AeroSLS-Database-Gap-Analysis-v0.1.md):
+//  databases[]/database_grants[]/database_next_id were the one database-
+//  layer state cluster with zero persistence — tagged tables' database_id
+//  survived reboot (catalog persistence, block 1) while the databases they
+//  point at vanished AND database_next_id reset to 1, silently re-issuing
+//  ids that stale persisted tags still reference — defeating §1.2's own
+//  never-reuse-ids design through the persistence hole. Frame counts from
+//  real sizeof(): SLSDatabaseEntry=44B*32=1.4KiB, SLSDatabaseGrant=340B*64
+//  =21.25KiB. database_next_id rides in the header's third uint32 field
+//  (the same header-carried-scalar trick persist_row_constraints() already
+//  uses for row_constraint_count).
+//
+//  LBA 6688  PERSIST_DATABASE_HDR_LBA    1 frame  — databases header (+ next_id)
+//  LBA 6696  PERSIST_DATABASE_ENT_LBA    1 frame  — databases[32] (~1.4 KiB)
+//  LBA 6704  PERSIST_DATABASE_GRANT_LBA  6 frames — database_grants[64] (~21.25 KiB)
+//            direct restore — pure definitions, no derived state
+//  (end LBA 6752 — comfortably clear of STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
@@ -122,6 +140,11 @@
 #define PERSIST_ROW_JOURNAL_ENT_LBA    6384ULL
 #define PERSIST_ROW_JOURNAL_ATTACH_LBA 6664ULL
 
+// ─── Database Gap Analysis §1 ───────────────────────────────────────────────
+#define PERSIST_DATABASE_HDR_LBA   6688ULL
+#define PERSIST_DATABASE_ENT_LBA   6696ULL
+#define PERSIST_DATABASE_GRANT_LBA 6704ULL
+
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.
 #define PERSIST_MAGIC_CAT            0xCAFE000000000001ULL
@@ -135,6 +158,7 @@
 #define PERSIST_MAGIC_VECSTORE       0xCAFE000000000009ULL
 #define PERSIST_MAGIC_VEC_INDEX      0xCAFE00000000000AULL
 #define PERSIST_MAGIC_ROW_JOURNAL    0xCAFE00000000000BULL
+#define PERSIST_MAGIC_DATABASE       0xCAFE00000000000CULL   /* Database Gap Analysis §1 */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -217,5 +241,19 @@ void persist_vec_index_defs(void);
 // full-array-rewrite-per-mutation, matching persist_records()'s own
 // established trade-off for a small-enough struct array.
 void persist_row_journal(void);
+
+// Snapshot databases[] + database_grants[] + database_next_id → NVMe.
+// Database Gap Analysis §1: call after every successful database_create()/
+// database_drop()/database_grant_uid()/database_grant_group(). Pure
+// definitions, no derived state — direct restore. database_next_id rides
+// in the header (see the LBA layout comment above); restoring it is the
+// load-bearing part — without it, a fresh boot's bump allocator re-issues
+// ids that stale persisted database_id tags still reference, the silent-
+// reattachment failure §1.2 (Database Namespace roadmap) exists to prevent.
+// database_grant_count is deliberately NOT persisted — it's a high-water
+// mark recomputed from the restored array's active flags at restore time,
+// the same derived-not-stored treatment row_journal_attachment_count
+// already gets.
+void persist_databases(void);
 
 #endif /* PERSIST_H */

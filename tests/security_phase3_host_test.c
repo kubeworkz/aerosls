@@ -60,6 +60,7 @@ volatile uint64_t kernel_tick_counter = 0;
 
 // ─── kernel_io.h stand-ins ──────────────────────────────────────────────────
 void kernel_serial_print(const char* s) { (void)s; }
+void persist_databases(void) { /* Database Gap Analysis Gap 1 -- database.c now persists after every mutation; no-op here, same as every other persist_* stub in these tests */ }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
 

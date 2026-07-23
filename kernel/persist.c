@@ -22,6 +22,7 @@
 #include "vecstore.h"        // Gap Remediation Phase D
 #include "vec_index.h"       // Gap Remediation Phase D
 #include "mvcc.h"            // Gap Remediation Phase D -- mvcc_bootstrap_from_rowstore()
+#include "database.h"        // Database Gap Analysis §1 -- databases[]/database_grants[]/database_next_id
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -289,6 +290,28 @@ void persist_row_journal(void) {
     persist_write_array(row_journal_buffer, buf_bytes, PERSIST_ROW_JOURNAL_ENT_LBA);
     persist_write_array(row_journal_attachments, attach_bytes, PERSIST_ROW_JOURNAL_ATTACH_LBA);
     kernel_serial_print("[PERSIST] Row journal snapshot written.\n");
+}
+
+// ─── Database Gap Analysis §1 ───────────────────────────────────────────────
+
+// persist_databases — databases[] + database_grants[] + database_next_id.
+// Pure definitions, direct restore. database_next_id rides in the header's
+// third field (the same header-carried-scalar trick persist_row_
+// constraints() uses for row_constraint_count) -- restoring it is the
+// load-bearing half of this function: without it a fresh boot's bump
+// allocator re-issues ids that stale persisted database_id tags (block 1's
+// catalog restore keeps those alive) still reference -- the silent-
+// reattachment failure the Namespace roadmap's §1.2 never-reuse design
+// exists to prevent, previously defeated by this exact persistence hole.
+void persist_databases(void) {
+    if (!io_sq || !io_cq) return;
+    uint32_t db_bytes    = (uint32_t)sizeof(databases);
+    uint32_t grant_bytes = (uint32_t)sizeof(database_grants);
+    write_hdr(PERSIST_DATABASE_HDR_LBA, PERSIST_MAGIC_DATABASE,
+              db_bytes, grant_bytes, database_next_id);
+    persist_write_array(databases,       db_bytes,    PERSIST_DATABASE_ENT_LBA);
+    persist_write_array(database_grants, grant_bytes, PERSIST_DATABASE_GRANT_LBA);
+    kernel_serial_print("[PERSIST] Databases snapshot written.\n");
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -623,6 +646,45 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[PERSIST] Row journal: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 12. Databases (Database Gap Analysis §1) ────────────────────────────
+    // Direct restore -- pure definitions, no derived state. Restoring
+    // database_next_id from the header is the load-bearing part (see
+    // persist_databases()'s own comment). database_grant_count is a
+    // high-water mark recomputed from the restored array's active flags,
+    // the same derived-not-stored treatment row_journal_attachment_count
+    // gets in block 11 above. On a size-mismatched or absent snapshot this
+    // cold-starts with database_next_id at its compile-time initial value
+    // (1) -- exactly the pre-Gap-1 behavior, no worse, and the mismatch is
+    // logged rather than silent.
+    if (nvme_read_sync(PERSIST_DATABASE_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_DATABASE) {
+            uint32_t db_bytes, grant_bytes, next_id;
+            p_memcpy(&db_bytes,    p_buf +  8, 4);
+            p_memcpy(&grant_bytes, p_buf + 12, 4);
+            p_memcpy(&next_id,     p_buf + 16, 4);
+            if (db_bytes    == (uint32_t)sizeof(databases) &&
+                grant_bytes == (uint32_t)sizeof(database_grants)) {
+                persist_read_array(databases,       db_bytes,    PERSIST_DATABASE_ENT_LBA);
+                persist_read_array(database_grants, grant_bytes, PERSIST_DATABASE_GRANT_LBA);
+                database_next_id = next_id;
+                uint32_t gcount = 0, dcount = 0;
+                for (uint32_t i = 0; i < DATABASE_GRANT_MAX; i++)
+                    if (database_grants[i].active && (i + 1) > gcount) gcount = i + 1;
+                database_grant_count = gcount;
+                for (uint32_t i = 0; i < DATABASE_MAX; i++)
+                    if (databases[i].active) dcount++;
+                kernel_serial_printf("[PERSIST] Databases restored: %u defined, next_id=%u.\n",
+                                     dcount, next_id);
+            } else {
+                kernel_serial_print("[PERSIST] Databases: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Databases: no snapshot — cold start.\n");
         }
     }
 }

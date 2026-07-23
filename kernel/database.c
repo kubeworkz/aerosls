@@ -5,6 +5,7 @@
 #include "database.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
+#include "persist.h"   // Database Gap Analysis §1 -- persist_databases()
 
 struct SLSDatabaseEntry databases[DATABASE_MAX];
 uint32_t                database_next_id = 1;   // 0 reserved for NONE — see database.h's own comment
@@ -62,6 +63,7 @@ int database_create(uint32_t caller_uid, const char* name) {
 
     kernel_serial_printf("[DATABASE] Created database '%s' (id=%u, owner_uid=%u).\n",
                          d->name, d->database_id, d->owner_uid);
+    persist_databases();   // Database Gap Analysis §1
     return 0;
 }
 
@@ -103,6 +105,7 @@ int database_drop(uint32_t caller_uid, const char* name) {
 
     d->active = 0;
     kernel_serial_printf("[DATABASE] Dropped database '%s' (id=%u).\n", name, d->database_id);
+    persist_databases();   // Database Gap Analysis §1
     return 0;
 }
 
@@ -196,6 +199,7 @@ int database_grant_uid(const char* db_name, uint32_t uid, uint32_t perm_mask) {
         if (g->grantee_uids[i] == uid) {
             kernel_serial_printf("[DATABASE] '%s': updated grant for uid %u to 0x%02x.\n",
                                  db_name, uid, perm_mask);
+            persist_databases();   // Database Gap Analysis §1 -- perm_mask changed above
             return 0;
         }
     }
@@ -205,6 +209,7 @@ int database_grant_uid(const char* db_name, uint32_t uid, uint32_t perm_mask) {
     }
     g->grantee_uids[g->grantee_uid_count++] = uid;
     kernel_serial_printf("[DATABASE] '%s': granted 0x%02x to uid %u.\n", db_name, perm_mask, uid);
+    persist_databases();   // Database Gap Analysis §1
     return 0;
 }
 
@@ -230,6 +235,7 @@ int database_grant_group(const char* db_name, const char* group_name, uint32_t p
         if (db_streq(g->grantee_groups[i], group_name)) {
             kernel_serial_printf("[DATABASE] '%s': updated grant for group '%s' to 0x%02x.\n",
                                  db_name, group_name, perm_mask);
+            persist_databases();   // Database Gap Analysis §1 -- perm_mask changed above
             return 0;
         }
     }
@@ -240,6 +246,7 @@ int database_grant_group(const char* db_name, const char* group_name, uint32_t p
     db_strncpy(g->grantee_groups[g->grantee_group_count++], group_name, GROUP_NAME_LEN);
     g->perm_mask |= perm_mask;
     kernel_serial_printf("[DATABASE] '%s': granted 0x%02x to group '%s'.\n", db_name, perm_mask, group_name);
+    persist_databases();   // Database Gap Analysis §1
     return 0;
 }
 

@@ -31,6 +31,7 @@ struct SLSObjectEntry object_catalog[CATALOG_MAX_OBJECTS];
 uint32_t              object_catalog_count = 0;
 
 void kernel_serial_print(const char* s) { (void)s; }
+void persist_databases(void) { /* Database Gap Analysis Gap 1 -- database.c now persists after every mutation; no-op here, same as every other persist_* stub in these tests */ }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
 // Controllable stub -- defaults to ROLE_APP_USER (an ordinary, non-owner,

@@ -80,6 +80,16 @@ struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node 
 void catalog_after_restore(void) { /* no-op for this test */ }
 
 void kernel_serial_print(const char* s) { (void)s; }
+/* Database Gap Analysis Gap 1: persist.c now snapshots/restores the database
+ * subsystem globals -- defined here as zero-state dummies rather than linking
+ * the real kernel/database.c (whose group/catalog dependency graph this test
+ * has no interest in), the same dummy-globals pattern these tests already use
+ * for object_catalog[] et al. */
+#include "kernel/database.h"
+struct SLSDatabaseEntry databases[DATABASE_MAX];
+struct SLSDatabaseGrant database_grants[DATABASE_GRANT_MAX];
+uint32_t database_next_id = 1;
+uint32_t database_grant_count = 0;
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
 
@@ -363,6 +373,65 @@ int main(void) {
     persist_restore_all();
     CHECK(vecstore_get(1, "embeddings", vid[2], &ext_id, &vv) != 0,
           "corrupted vecstore magic: restore correctly refuses to load, collection stays cold-start empty");
+
+    /* ── Database Gap Analysis Gap 1: databases[]/database_grants[]/
+     * database_next_id round trip through the REAL persist_databases() and
+     * persist_restore_all() block 12. The globals here are this test's own
+     * dummies (kernel/database.c isn't linked -- see their definition
+     * comment), populated directly, exactly the persist-layer-not-
+     * subsystem-layer focus every other scenario in this file has. The
+     * next_id restoration is the load-bearing assertion: it's the half
+     * that closes §1's silent-reattachment bug, not just a convenience. ── */
+    {
+        memset(databases, 0, sizeof(databases));
+        memset(database_grants, 0, sizeof(database_grants));
+        strcpy(databases[0].name, "app");
+        databases[0].database_id = 7;
+        databases[0].owner_uid   = 42;
+        databases[0].active      = 1;
+        database_next_id = 8;   /* as if ids 1..7 were handed out this "boot" */
+
+        database_grants[2].database_id      = 7;   /* deliberately NOT slot 0 -- proves grant_count recompute finds the high-water mark */
+        database_grants[2].perm_mask         = 0x3;
+        database_grants[2].grantee_uid_count = 1;
+        database_grants[2].grantee_uids[0]   = 99;
+        database_grants[2].active            = 1;
+        database_grant_count = 3;
+
+        persist_databases();   /* the real writer, persist.c */
+
+        /* "Reboot": wipe the live state back to compile-time defaults. */
+        memset(databases, 0, sizeof(databases));
+        memset(database_grants, 0, sizeof(database_grants));
+        database_next_id    = 1;
+        database_grant_count = 0;
+
+        persist_restore_all();
+
+        CHECK(databases[0].active && strcmp(databases[0].name, "app") == 0 &&
+              databases[0].database_id == 7 && databases[0].owner_uid == 42,
+              "db restore: the database definition survived the reboot intact");
+        CHECK(database_next_id == 8,
+              "db restore: database_next_id restored to 8 -- a post-reboot CREATE DATABASE can no longer re-issue id 1..7 over stale persisted tags (the Gap 1 bug, closed)");
+        CHECK(database_grants[2].active && database_grants[2].database_id == 7 &&
+              database_grants[2].grantee_uid_count == 1 && database_grants[2].grantee_uids[0] == 99 &&
+              database_grants[2].perm_mask == 0x3,
+              "db restore: the grant entry survived, in its original slot, grantee and perm intact");
+        CHECK(database_grant_count == 3,
+              "db restore: database_grant_count recomputed from active flags as the high-water mark (3), not naively counted (1)");
+
+        /* Size-mismatch guard for this region too -- stomp the magic, wipe,
+         * re-restore: must cold-start with next_id back at 1, the exact
+         * pre-Gap-1 behavior, no worse. */
+        for (int i = 0; i < FAKE_NVME_MAX_FRAMES; i++)
+            if (g_fake_nvme[i].used && g_fake_nvme[i].lba == PERSIST_DATABASE_HDR_LBA)
+                memset(g_fake_nvme[i].data, 0xFF, 8);
+        memset(databases, 0, sizeof(databases));
+        database_next_id = 1;
+        persist_restore_all();
+        CHECK(!databases[0].active && database_next_id == 1,
+              "corrupted database magic: restore correctly refuses, clean cold start (next_id stays 1)");
+    }
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

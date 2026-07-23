@@ -55,6 +55,16 @@ struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];   /* Multi-Node 
 void catalog_after_restore(void) { /* no-op for this test */ }
 
 void kernel_serial_print(const char* s) { (void)s; }
+/* Database Gap Analysis Gap 1: persist.c now snapshots/restores the database
+ * subsystem globals -- defined here as zero-state dummies rather than linking
+ * the real kernel/database.c (whose group/catalog dependency graph this test
+ * has no interest in), the same dummy-globals pattern these tests already use
+ * for object_catalog[] et al. */
+#include "kernel/database.h"
+struct SLSDatabaseEntry databases[DATABASE_MAX];
+struct SLSDatabaseGrant database_grants[DATABASE_GRANT_MAX];
+uint32_t database_next_id = 1;
+uint32_t database_grant_count = 0;
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
 /* Phase 17 (relational layer): rowstore.c's insert/update/delete
