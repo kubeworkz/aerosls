@@ -1,6 +1,7 @@
 #include "http.h"
 #include "tcp.h"
 #include "net.h"
+#include "http_rate_limit.h"   // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1
 #include "dhcp.h"   // Navigator-Parity Gap Roadmap Phase 5a -- dhcp_is_bound() for GET /api/network/status
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
@@ -3892,6 +3893,11 @@ static void http_route(int conn, char* req) {
                 http_respond(conn, 401, "application/json", e401, (int)strlen(e401));
                 return;
             }
+            if (!http_partition_rate_check(get_uid)) {
+                const char* e429 = "{\"error\":\"Rate limit exceeded for this partition — try again shortly\"}";
+                http_respond(conn, 429, "application/json", e429, (int)strlen(e429));
+                return;
+            }
         }
         if (!strcmp(path, "/auth/verify")) {
             blen = api_auth_verify(req, resp_body, (int)sizeof(resp_body));
@@ -4281,7 +4287,13 @@ static void http_route(int conn, char* req) {
             http_respond(conn, 401, "application/json", e401,
                          (int)strlen(e401));
             return;
-        }        if (!strcmp(path, "/api/valloc")) {
+        }
+        if (!http_partition_rate_check(req_uid)) {
+            const char* e429 = "{\"error\":\"Rate limit exceeded for this partition — try again shortly\"}";
+            http_respond(conn, 429, "application/json", e429, (int)strlen(e429));
+            return;
+        }
+        if (!strcmp(path, "/api/valloc")) {
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
@@ -4782,6 +4794,11 @@ static void http_route(int conn, char* req) {
         if (req_role == ROLE_GUEST) {
             const char* e401 = "{\"error\":\"Unauthorized — include Authorization: Bearer <token>\"}";
             http_respond(conn, 401, "application/json", e401, (int)strlen(e401));
+            return;
+        }
+        if (!http_partition_rate_check(req_uid)) {
+            const char* e429 = "{\"error\":\"Rate limit exceeded for this partition — try again shortly\"}";
+            http_respond(conn, 429, "application/json", e429, (int)strlen(e429));
             return;
         }
         if (!strcmp(path, "/api/vec/vector")) {

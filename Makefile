@@ -30,7 +30,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/object_catalog.c kernel/transaction.c \
               kernel/ipc.c kernel/microkernel.c \
               kernel/tier_mgr.c kernel/query_engine.c \
-              net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
+              net/net.c net/arp.c net/ipv4.c net/tcp.c net/http.c net/http_rate_limit.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
               net/ollama_client.c \
               kernel/process.c arch/x86/user_paging.c \
               kernel/partition.c \
