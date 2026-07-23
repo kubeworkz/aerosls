@@ -114,7 +114,19 @@
 //  LBA 6752  PERSIST_VIEW_HDR_LBA  1 frame  — views header
 //  LBA 6760  PERSIST_VIEW_ENT_LBA  3 frames — views[16] (~9.1 KiB)
 //            direct restore — pure definitions, no derived state
-//  (end LBA 6784 — comfortably clear of STREAM_DIR_LBA 8192)
+//
+//  Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2: tenants[] --
+//  the identity that unifies partition_id and database_id. Pure
+//  definitions, direct restore, same shape as persist_databases() one
+//  region up -- tenant_next_id rides in the header's third field exactly
+//  like database_next_id does, for the identical reason (a fresh boot's
+//  bump allocator must not re-issue an id a stale persisted tenant_id
+//  reference still holds). Frame count from real sizeof():
+//  SLSTenantEntry ~48B*32=1.5KiB -> 1 frame.
+//
+//  LBA 6784  PERSIST_TENANT_HDR_LBA  1 frame — tenants header (+ next_id)
+//  LBA 6792  PERSIST_TENANT_ENT_LBA  1 frame — tenants[32] (~1.5 KiB)
+//  (end LBA 6800 — comfortably clear of STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
@@ -163,6 +175,9 @@
 #define PERSIST_VIEW_HDR_LBA 6752ULL
 #define PERSIST_VIEW_ENT_LBA 6760ULL
 
+#define PERSIST_TENANT_HDR_LBA 6784ULL
+#define PERSIST_TENANT_ENT_LBA 6792ULL
+
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.
 #define PERSIST_MAGIC_CAT            0xCAFE000000000001ULL
@@ -178,6 +193,7 @@
 #define PERSIST_MAGIC_ROW_JOURNAL    0xCAFE00000000000BULL
 #define PERSIST_MAGIC_DATABASE       0xCAFE00000000000CULL   /* Database Gap Analysis §1 */
 #define PERSIST_MAGIC_VIEW           0xCAFE00000000000DULL   /* Query-Surface Roadmap Phase 5 */
+#define PERSIST_MAGIC_TENANT         0xCAFE00000000000EULL   /* Multitenant Isolation Gap Analysis §5 item 1 */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -281,5 +297,12 @@ void persist_databases(void);
 // persist_databases()'s database_next_id), so the header carries only the
 // array's own byte size, nothing else.
 void persist_views(void);
+
+// Snapshot tenants[] + tenant_next_id → NVMe. Multitenant Isolation Gap
+// Analysis §5 item 1: call after every successful tenant_create(). Pure
+// definitions, no derived state — direct restore, same shape as
+// persist_databases(). tenant_next_id rides in the header for the same
+// reason database_next_id does there — see the LBA layout comment above.
+void persist_tenants(void);
 
 #endif /* PERSIST_H */

@@ -24,6 +24,7 @@
 #include "msgqueue.h"      // Navigator-Parity Gap Roadmap Phase 4 -- SYS_SLS_MQ_*
 #include "../net/net.h"    // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
 #include "database.h"      // Database Namespace & Access Roadmap Phase 4 -- SYS_SLS_DATABASE_*
+#include "tenant.h"        // Multitenant Isolation Gap Analysis §5 item 1 -- SYS_SLS_TENANT_*
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -428,6 +429,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_database_revoke_group((struct SLSDatabaseRevokeGroupRequest*)arg);
     case SYS_SLS_DATABASE_CHECK:
         return sys_sls_database_check((struct SLSDatabaseCheckRequest*)arg);
+
+    // ─── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2 (270-271) ──
+    case SYS_SLS_TENANT_CREATE:
+        return sys_sls_tenant_create((struct SLSTenantCreateRequest*)arg);
+    case SYS_SLS_TENANT_LIST:
+        tenant_list(); return 0;
 
     default:
         return 0;

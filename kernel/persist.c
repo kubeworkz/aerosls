@@ -24,6 +24,7 @@
 #include "mvcc.h"            // Gap Remediation Phase D -- mvcc_bootstrap_from_rowstore()
 #include "database.h"        // Database Gap Analysis §1 -- databases[]/database_grants[]/database_next_id
 #include "view.h"            // Query-Surface Roadmap Phase 5 -- views[]
+#include "tenant.h"           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -325,6 +326,23 @@ void persist_views(void) {
     write_hdr(PERSIST_VIEW_HDR_LBA, PERSIST_MAGIC_VIEW, view_bytes, 0, 0);
     persist_write_array(views, view_bytes, PERSIST_VIEW_ENT_LBA);
     kernel_serial_print("[PERSIST] Views snapshot written.\n");
+}
+
+// ─── Multitenant Isolation Gap Analysis §5 item 1 ───────────────────────────
+
+// persist_tenants — tenants[] + tenant_next_id. Pure definitions, direct
+// restore, same shape as persist_databases() -- tenant_next_id rides in
+// the header's third field for the identical reason database_next_id
+// does there (see that function's own comment): a fresh boot's bump
+// allocator must not re-issue an id a stale persisted tenant_id
+// reference still holds.
+void persist_tenants(void) {
+    if (!io_sq || !io_cq) return;
+    uint32_t tenant_bytes = (uint32_t)sizeof(tenants);
+    write_hdr(PERSIST_TENANT_HDR_LBA, PERSIST_MAGIC_TENANT,
+              tenant_bytes, 0, tenant_next_id);
+    persist_write_array(tenants, tenant_bytes, PERSIST_TENANT_ENT_LBA);
+    kernel_serial_print("[PERSIST] Tenants snapshot written.\n");
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -723,6 +741,37 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[PERSIST] Views: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 14. Tenants (Multitenant Isolation Gap Analysis §5 item 1) ─────────
+    // Direct restore -- pure definitions, no derived state beyond
+    // tenant_next_id itself (the load-bearing part, same reason as block
+    // 12's database_next_id: a fresh boot's bump allocator must not
+    // re-issue an id a stale persisted tenant_id reference still holds).
+    // On a size-mismatched or absent snapshot this cold-starts with an
+    // empty tenants[] and tenant_next_id at its compile-time initial
+    // value (1) -- logged rather than silent.
+    if (nvme_read_sync(PERSIST_TENANT_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_TENANT) {
+            uint32_t tenant_bytes, next_id;
+            p_memcpy(&tenant_bytes, p_buf +  8, 4);
+            p_memcpy(&next_id,      p_buf + 16, 4);
+            if (tenant_bytes == (uint32_t)sizeof(tenants)) {
+                persist_read_array(tenants, tenant_bytes, PERSIST_TENANT_ENT_LBA);
+                tenant_next_id = next_id;
+                uint32_t tcount = 0;
+                for (uint32_t i = 0; i < TENANT_MAX; i++)
+                    if (tenants[i].active) tcount++;
+                kernel_serial_printf("[PERSIST] Tenants restored: %u defined, next_id=%u.\n",
+                                     tcount, next_id);
+            } else {
+                kernel_serial_print("[PERSIST] Tenants: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Tenants: no snapshot — cold start.\n");
         }
     }
 }

@@ -31,6 +31,7 @@
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- group profiles
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- database create/drop/list/grant/check
+#include "../kernel/tenant.h"          // Multitenant Isolation Gap Analysis §5 item 1 -- tenant create/list
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
@@ -219,6 +220,9 @@ static void print_help(void) {
         "  database revoke uid <name> <uid>            remove a uid from a database's grant\n"
         "  database revoke group <name> <group>        remove a group from a database's grant\n"
         "  database check <name> <uid> <perm>          test if a database grant would grant this\n"
+        "  -- Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2 --\n"
+        "  tenant create <name>                        create a partition+database as one unified tenant\n"
+        "  tenant list                                  list all tenants\n"
         "  -- Security Audit Log (Navigator-Parity Phase 3) --\n"
         "  audit list                        show the security audit trail\n"
         "  -- Web App Assets (Phase D) --\n"
@@ -785,6 +789,28 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint64_t status = do_syscall(SYS_SLS_DATABASE_CREATE, &req);
             if (status == 0) kernel_serial_printf("Database '%s' created.\n", req.name);
             else kernel_serial_print("Database creation failed (bad/duplicate name or table full).\n");
+        }
+
+        // ── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2:
+        // tenant create <name> — unified tenant_create(), atomically
+        // provisions a partition + database for the name and assigns the
+        // caller into the new partition. ────────────────────────────────────
+        else if (sh_starts(input_buffer, "tenant create ")) {
+            const char* p = input_buffer + 14;
+            struct SLSTenantCreateRequest req;
+            size_t nlen = 0;
+            while (p[nlen] && p[nlen] != ' ' && p[nlen] != '\0') nlen++;
+            sh_copy(req.name, p, nlen + 1 < TENANT_NAME_LEN ? nlen + 1 : TENANT_NAME_LEN);
+            req.caller_uid = current_session_uid;
+            uint64_t tenant_id = do_syscall(SYS_SLS_TENANT_CREATE, &req);
+            if (tenant_id != 0) kernel_serial_printf("Tenant '%s' created (id=%llu).\n", req.name, (unsigned long long)tenant_id);
+            else kernel_serial_print(
+                "Tenant creation failed (bad/duplicate name, tenant table full, partition table full, or database name collision).\n");
+        }
+
+        // ── Multitenant Isolation Gap Analysis §5 item 1: tenant list ───────────
+        else if (sh_eq(input_buffer, "tenant list")) {
+            do_syscall(SYS_SLS_TENANT_LIST, 0);
         }
 
         // ── Database Namespace & Access Roadmap Phase 4: database drop <name> ──

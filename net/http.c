@@ -39,6 +39,7 @@
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- GET /api/security/databases
+#include "../kernel/tenant.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
 #include "../kernel/secure_api.h"     // Shell-Command JSON-Promotion Roadmap -- struct SLSSealRequest
@@ -2310,6 +2311,56 @@ static int api_partition_quota_post(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/tenants — Multitenant Isolation Gap Analysis §5 item 1 /
+// §7 item 2 ──────────────────────────────────────────────────────────────
+// Enumerates defined tenants -- reads tenants[] directly, same "read
+// kernel state" idiom as api_partitions_list() above.
+static int api_tenants_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "tenants");
+    int first = 1;
+    for (uint32_t i = 0; i < TENANT_MAX; i++) {
+        if (!tenants[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "id", tenants[i].tenant_id); jb_putc(&j, ',');
+        jb_str(&j, "name", tenants[i].name); jb_putc(&j, ',');
+        jb_uint(&j, "partition_id", tenants[i].partition_id); jb_putc(&j, ',');
+        jb_uint(&j, "database_id", tenants[i].database_id); jb_putc(&j, ',');
+        jb_uint(&j, "owner_uid", tenants[i].owner_uid);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/tenants — Multitenant Isolation Gap Analysis §5 item 1 /
+// §7 item 2 ──────────────────────────────────────────────────────────────
+// Body: {"name": "<tenant_name>"}. Thin wrapper over sys_sls_tenant_
+// create(), the same shape api_partition_create_post() above already
+// established. caller_uid is the authenticated req_uid, not a client-
+// supplied field -- matches api_vec_create_post()'s own "caller_uid comes
+// from the auth gate, never the request body" posture.
+static int api_tenant_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSTenantCreateRequest req;
+    req.name[0] = '\0';
+    req.caller_uid = req_uid;
+    json_str(body, "name", req.name, TENANT_NAME_LEN);
+    if (!req.name[0]) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","name required"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint64_t tenant_id = sys_sls_tenant_create(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", tenant_id != 0 ? "true" : "false"); jb_putc(&j,',');
+    jb_uint(&j, "tenant_id", (uint32_t)tenant_id);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── POST /api/vec/collections — Gap Remediation Phase C ──────────────────────
 // The live path Vector Store Phase 4's SYS_SLS_VEC_CREATE never had over
 // HTTP -- syscall/shell-reachable since Phase 4, zero HTTP routes for any
@@ -3971,6 +4022,11 @@ static void http_route(int conn, char* req) {
             blen = api_partition_quotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Multitenant Isolation Gap Analysis §5 item 1: GET /api/tenants ─────
+        if (!strcmp(path, "/api/tenants")) {
+            blen = api_tenants_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Gap Remediation Phase G: GET /api/simi/<name> ──────────────────────
         if (str_find(path, "/api/simi/") == path) {
             blen = api_simi_info(path + 10, resp_body, (int)sizeof(resp_body));
@@ -4614,6 +4670,12 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/partition/quota")) {
             blen = api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2:
+        // POST /api/tenants — unified tenant_create(). ─────────────────────────
+        if (!strcmp(path, "/api/tenants")) {
+            blen = api_tenant_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── POST /api/stream/create|upload ──────────────────────────────────────
