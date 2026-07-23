@@ -122,6 +122,31 @@ uint32_t predicate_add_arith_comparison(struct Predicate* p, struct PredArithOpe
     return p->node_count++;
 }
 
+// Query-Surface Roadmap Phase 7: a plain, case-insensitive, token-
+// boundary-checked scan for "OUTER." somewhere in text -- see predicate.h's
+// own Phase 7 addendum for why this is deliberately textual, not real
+// parsing. "Boundary-checked" means the character immediately before the
+// match (if any) is not itself an identifier character, so this does not
+// false-positive on e.g. "SOUTER.x" or "MY_OUTER.x". Does NOT check what
+// follows "OUTER." is a valid identifier -- that's sql_exec.c's
+// substitute_outer_refs()'s job at exec time, which fails loud on a
+// malformed reference rather than this detection pass silently accepting
+// or rejecting it.
+static int pe_char_is_ident(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+static int pe_text_has_outer_ref(const char* text) {
+    uint32_t len = pe_strlen(text);
+    for (uint32_t i = 0; i + 6 <= len; i++) {
+        if (i > 0 && pe_char_is_ident(text[i - 1])) continue;
+        char c0 = text[i], c1 = text[i+1], c2 = text[i+2], c3 = text[i+3], c4 = text[i+4];
+        if (c0 == 'o' || c0 == 'O') { if (c1=='u'||c1=='U') { if (c2=='t'||c2=='T') { if (c3=='e'||c3=='E') { if (c4=='r'||c4=='R') {
+            if (text[i + 5] == '.') return 1;
+        }}}}}
+    }
+    return 0;
+}
+
 // Phase 7 (SQL Feature-Parity Roadmap): see predicate.h.
 uint32_t predicate_add_subquery(struct Predicate* p, const char* raw_text) {
     if (!p || !raw_text || p->subquery_count >= PREDICATE_MAX_SUBQUERIES) return PREDICATE_INVALID_NODE;
@@ -129,6 +154,10 @@ uint32_t predicate_add_subquery(struct Predicate* p, const char* raw_text) {
     while (raw_text[len]) len++;
     if (len >= PREDICATE_SUBQUERY_TEXT_LEN) return PREDICATE_INVALID_NODE;
     pe_strcpy(p->subqueries[p->subquery_count], raw_text, PREDICATE_SUBQUERY_TEXT_LEN);
+    // Query-Surface Roadmap Phase 7: detected once, here, at ADD time --
+    // see this file's own pe_text_has_outer_ref() and predicate.h's Phase 7
+    // addendum.
+    p->subquery_is_correlated[p->subquery_count] = (uint8_t)pe_text_has_outer_ref(raw_text);
     return p->subquery_count++;
 }
 
@@ -138,6 +167,17 @@ void predicate_mark_subquery(struct Predicate* p, uint32_t node_idx, uint32_t su
     if (n->kind != PRED_NODE_COMPARISON) return;
     n->uses_subquery = 1;
     n->subquery_index = subq_idx;
+}
+
+// Query-Surface Roadmap Phase 7: see predicate.h.
+int predicate_has_correlated_subquery(const struct Predicate* p) {
+    if (!p) return 0;
+    for (uint32_t i = 0; i < p->node_count; i++) {
+        const struct PredicateNode* n = &p->nodes[i];
+        if (n->kind != PRED_NODE_COMPARISON || !n->uses_subquery) continue;
+        if (n->subquery_index < p->subquery_count && p->subquery_is_correlated[n->subquery_index]) return 1;
+    }
+    return 0;
 }
 
 // ─── Type-aware comparison ───────────────────────────────────────────────

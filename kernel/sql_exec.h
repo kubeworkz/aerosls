@@ -259,6 +259,19 @@ typedef enum {
     // select()), so a CTE's has_cte/cte_name fields never exist on an
     // INSERT/UPDATE/DELETE statement in the first place.
     SQL_ERR_CTE_SCOPE_UNSUPPORTED,
+    // Query-Surface Roadmap Phase 7: correlated subqueries. v1 is SELECT-
+    // only and plain-query-only (no JOIN/aggregates/set operator/CTE) --
+    // exec_select()'s own top-of-function check catches all four combined
+    // cases with this one code (mirroring SQL_ERR_CTE_SCOPE_UNSUPPORTED's
+    // own single-choke-point shape), and exec_update()/exec_delete() each
+    // give the SAME code for a correlated marker found at all, since
+    // correlated UPDATE/DELETE isn't attempted in v1. Deliberately a LOUD
+    // rejection rather than reusing the older, quieter "unresolved
+    // subquery marker fails closed to false" fallback a NON-correlated
+    // subquery under JOIN/GROUP BY still gets (see predicate.h's own
+    // Phase 7 non-correlated note) -- see predicate.h's correlated-
+    // subquery addendum for the full reasoning.
+    SQL_ERR_CORRELATED_SUBQUERY_UNSUPPORTED,
     SQL_ERR_INTERNAL,
 } SqlErrorCode;
 

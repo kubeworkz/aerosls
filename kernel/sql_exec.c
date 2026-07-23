@@ -24,6 +24,10 @@ static int se_streq(const char* a, const char* b) {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
     return *a == *b;
 }
+// Query-Surface Roadmap Phase 7: needed by substitute_outer_refs() below.
+static uint32_t se_strlen(const char* s) {
+    uint32_t n = 0; while (s[n]) n++; return n;
+}
 static void se_memset(void* d, uint8_t v, uint32_t n) {
     uint8_t* p = (uint8_t*)d; while (n--) *p++ = v;
 }
@@ -443,8 +447,28 @@ static void exec_select_group(uint64_t txn_id, uint32_t caller_uid, const struct
 static void exec_select_set_op(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 static void exec_select_view(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out, int view_idx);
 static void exec_select_cte(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
+static void exec_select_correlated(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out);
 
 static void exec_select(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    // Query-Surface Roadmap Phase 7: correlated subqueries. Checked FIRST,
+    // ahead of the CTE check below (and everything after it), since a
+    // correlated subquery needs the narrowest possible query shape (its
+    // own dedicated per-outer-row path, bypassing set-op/aggregate/JOIN/
+    // CTE dispatch entirely) -- combining it with ANY of those four is a
+    // real, named v1 scope cut, given a LOUD, distinctly-worded rejection
+    // here rather than silently reusing the older "unresolved subquery
+    // marker fails closed to false" fallback a non-correlated subquery
+    // under JOIN/GROUP BY still gets (see predicate.h's Phase 7 notes).
+    if (s->has_where && predicate_has_correlated_subquery(&s->where)) {
+        if (s->has_join || s->has_aggregates || s->has_set_op || s->has_cte) {
+            out->error = SQL_ERR_CORRELATED_SUBQUERY_UNSUPPORTED;
+            se_strcpy(out->error_msg, "a correlated subquery cannot be combined with JOIN, aggregates, a set operator, or a CTE (v1 scope cut) -- only a plain SELECT ... FROM <table> WHERE ... is supported", SQL_ERR_MSG_LEN);
+            return;
+        }
+        exec_select_correlated(txn_id, caller_uid, s, out);
+        return;
+    }
+
     // Query-Surface Roadmap Phase 6: WITH ... AS (...) CTE resolution --
     // checked FIRST, ahead of set-op/aggregate/JOIN dispatch below AND
     // ahead of find_table_catalog_index()/view_find_index() further down,
@@ -2659,6 +2683,101 @@ static int exec_subquery_column(uint64_t txn_id, uint32_t caller_uid, const char
     return 1;
 }
 
+// ─── Query-Surface Roadmap Phase 7: correlated-subquery textual splice ─────
+// See predicate.h's own Phase 7 addendum for the full design. These two
+// helpers turn "OUTER.<column>" occurrences in a subquery's raw text into
+// that column's actual value from the CURRENT outer row, producing text
+// that is then handed to exec_subquery_column() completely unchanged --
+// one execution path serves both correlated and non-correlated subqueries.
+
+// Formats one outer-row value for splicing into subquery text: STRING/BLOB
+// values are single-quoted with embedded quotes doubled (matching this
+// codebase's own string-literal lexing convention in sql_parser.c's
+// lex_next()); every other type is copied unquoted, matching how a numeric/
+// bool literal is normally written. Returns the number of bytes written
+// (excluding the terminator).
+static uint32_t format_value_for_splice(char* out, uint32_t max, SLSFieldType type, const char* value) {
+    uint32_t oi = 0;
+    if (type == FIELD_TYPE_STRING || type == FIELD_TYPE_BLOB) {
+        if (oi < max - 1) out[oi++] = '\'';
+        for (uint32_t i = 0; value[i] && oi < max - 2; i++) {
+            if (value[i] == '\'' && oi < max - 2) out[oi++] = '\'';
+            out[oi++] = value[i];
+        }
+        if (oi < max - 1) out[oi++] = '\'';
+    } else {
+        for (uint32_t i = 0; value[i] && oi < max - 1; i++) out[oi++] = value[i];
+    }
+    out[oi] = '\0';
+    return oi;
+}
+
+// A plain char classifier, matching sql_parser.c's own identifier-character
+// rule -- used only for the token-boundary check after a splice below (this
+// file has no lexer of its own to reuse).
+static int se_char_is_ident(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// Copies subq_text into out_text, replacing every token-boundary-checked
+// "OUTER.<ident>" occurrence with that column's value from outer_row (per
+// outer_layout's own column type). Returns 1 on success; 0 with out->error/
+// error_msg already set on an unknown OUTER column (SQL_ERR_COLUMN_NOT_
+// FOUND -- a real, named error, not a silent empty match) or an output
+// buffer overflow (SQL_ERR_INTERNAL). An "OUTER." not followed by an
+// identifier is copied through unchanged -- predicate.c's own detection
+// pass already confirmed a bare "OUTER." exists somewhere in this text (or
+// this function would never be called), so a malformed one here just falls
+// through to the re-parse below failing as an ordinary syntax error.
+static int substitute_outer_refs(const char* subq_text, const struct RowTableLayout* outer_layout,
+                                 const struct RowValues* outer_row, char* out_text, uint32_t out_max,
+                                 struct SqlResult* out) {
+    uint32_t len = se_strlen(subq_text);
+    uint32_t si = 0, oi = 0;
+    while (si < len) {
+        int boundary_ok = (si == 0) || !se_char_is_ident(subq_text[si - 1]);
+        int is_outer = boundary_ok && si + 6 <= len &&
+            (subq_text[si]=='o'||subq_text[si]=='O') && (subq_text[si+1]=='u'||subq_text[si+1]=='U') &&
+            (subq_text[si+2]=='t'||subq_text[si+2]=='T') && (subq_text[si+3]=='e'||subq_text[si+3]=='E') &&
+            (subq_text[si+4]=='r'||subq_text[si+4]=='R') && subq_text[si+5]=='.';
+        if (is_outer) {
+            uint32_t j = si + 6;
+            uint32_t col_start = j;
+            while (j < len && se_char_is_ident(subq_text[j])) j++;
+            if (j == col_start) {
+                if (oi >= out_max - 1) { out->error = SQL_ERR_INTERNAL; se_strcpy(out->error_msg, "correlated subquery substitution too long", SQL_ERR_MSG_LEN); return 0; }
+                out_text[oi++] = subq_text[si++];
+                continue;
+            }
+            char col_name[RECORD_KEY_LEN];
+            uint32_t clen = j - col_start; if (clen >= RECORD_KEY_LEN) clen = RECORD_KEY_LEN - 1;
+            for (uint32_t k = 0; k < clen; k++) col_name[k] = subq_text[col_start + k];
+            col_name[clen] = '\0';
+
+            uint32_t cidx = find_column_index(outer_layout, col_name);
+            if (cidx == 0xFFFFFFFFu) {
+                out->error = SQL_ERR_COLUMN_NOT_FOUND;
+                se_strcpy(out->error_msg, "correlated subquery references an unknown outer column (OUTER.<name>)", SQL_ERR_MSG_LEN);
+                return 0;
+            }
+            char formatted[RECORD_VAL_LEN * 2 + 4];
+            uint32_t flen = format_value_for_splice(formatted, sizeof(formatted), outer_layout->column_types[cidx], outer_row->values[cidx]);
+            if (oi + flen >= out_max) {
+                out->error = SQL_ERR_INTERNAL;
+                se_strcpy(out->error_msg, "correlated subquery substitution too long", SQL_ERR_MSG_LEN);
+                return 0;
+            }
+            for (uint32_t k = 0; k < flen; k++) out_text[oi++] = formatted[k];
+            si = j;
+            continue;
+        }
+        if (oi >= out_max - 1) { out->error = SQL_ERR_INTERNAL; se_strcpy(out->error_msg, "correlated subquery substitution too long", SQL_ERR_MSG_LEN); return 0; }
+        out_text[oi++] = subq_text[si++];
+    }
+    out_text[oi] = '\0';
+    return 1;
+}
+
 // Resolves every uses_subquery marker node in `pred` IN PLACE, before the
 // caller's own row scan runs. A scalar comparison ("= (SELECT ...)", "> ...
 // etc) gets its node's literal filled in directly; `IN (SELECT ...)`
@@ -2673,7 +2792,21 @@ static int exec_subquery_column(uint64_t txn_id, uint32_t caller_uid, const char
 // byte-for-byte-free case, and "subquery legitimately returned 0 rows"),
 // 0 on a genuine resolution error (out->error/error_msg already set; the
 // caller should abort the whole statement without scanning any rows).
-static int resolve_predicate_subqueries(uint64_t txn_id, uint32_t caller_uid, struct Predicate* pred, struct SqlResult* out) {
+//
+// Query-Surface Roadmap Phase 7: outer_layout/outer_row are new, additive
+// parameters -- NULL/NULL (the byte-for-byte pre-Phase-7 call shape) from
+// dispatch_stmt()'s own top-level, once-only call site means "not running
+// per outer row yet": a CORRELATED node (pred->subquery_is_correlated[...])
+// is deliberately SKIPPED (left unresolved) in that case rather than
+// erroring, since it genuinely cannot be resolved without a specific row --
+// exec_select_correlated() below is what supplies a real outer_row, calling
+// this SAME function once per candidate row against a fresh copy of the
+// predicate. A non-correlated node is completely unaffected by any of
+// this -- resolved exactly as before regardless of whether outer_row is
+// NULL, so this refactor changes zero behavior for every pre-Phase-7 query.
+static int resolve_predicate_subqueries(uint64_t txn_id, uint32_t caller_uid, struct Predicate* pred,
+                                        const struct RowTableLayout* outer_layout, const struct RowValues* outer_row,
+                                        struct SqlResult* out) {
     if (pred->subquery_count == 0) return 1;
     for (uint32_t i = 0; i < pred->node_count; i++) {
         struct PredicateNode* n = &pred->nodes[i];
@@ -2684,8 +2817,18 @@ static int resolve_predicate_subqueries(uint64_t txn_id, uint32_t caller_uid, st
             return 0;
         }
 
+        int correlated = pred->subquery_is_correlated[n->subquery_index];
+        if (correlated && !outer_row) continue;   // deferred to the per-outer-row pass (see comment above)
+
+        const char* text_to_run = pred->subqueries[n->subquery_index];
+        char subst[PREDICATE_SUBQUERY_TEXT_LEN];
+        if (correlated) {
+            if (!substitute_outer_refs(text_to_run, outer_layout, outer_row, subst, PREDICATE_SUBQUERY_TEXT_LEN, out)) return 0;
+            text_to_run = subst;
+        }
+
         uint32_t rcount = 0;
-        if (!exec_subquery_column(txn_id, caller_uid, pred->subqueries[n->subquery_index], out, &rcount)) return 0;
+        if (!exec_subquery_column(txn_id, caller_uid, text_to_run, out, &rcount)) return 0;
 
         if (n->op == PRED_OP_IN_SUBQUERY) {
             if (rcount == 0) {
@@ -2739,6 +2882,126 @@ static int resolve_predicate_subqueries(uint64_t txn_id, uint32_t caller_uid, st
     return 1;
 }
 
+// ─── Query-Surface Roadmap Phase 7: correlated subqueries (query side) ─────
+// Not banked, same "provably never live across a nested call" reasoning as
+// g_view_scratch/g_cte_scratch above -- exec_subquery_column() (the only
+// thing resolve_predicate_subqueries() calls per candidate row) is a leaf
+// call that never recurses into dispatch_stmt()/sql_execute_tx() at all
+// (see its own header comment: it calls mvcc_find_matching_rows()/
+// mvcc_row_get() directly), so correlated-subquery resolution never
+// interacts with Phase 3's depth banking at all.
+static struct RowValues g_correlated_scratch[CURSOR_MAX_ROWSET_ROWS];
+static struct Predicate g_correlated_pred_scratch;
+
+// A real, named ceiling on how many outer-table rows get tested against a
+// correlated subquery, matching the roadmap doc's own "capped at a small
+// outer-row budget (e.g. first 64 rows, loud truncation)" v1 posture: a
+// correlated predicate can't be pushed down into mvcc_find_matching_rows()
+// the way an ordinary WHERE is (there IS no single fixed comparison value
+// until a specific outer row's own columns are spliced in), so this bounds
+// the cost at O(budget x subquery-cost) rather than O(all-rows x
+// subquery-cost) -- a real, honest v1 limitation, not silently unbounded.
+#define SQL_CORRELATED_MAX_OUTER_ROWS 64
+
+// Executes a plain (no JOIN/aggregates/set operator/CTE -- exec_select()'s
+// own top-of-function check already rejected any of those combined with a
+// correlated marker before this function is ever called) SELECT whose
+// WHERE contains at least one correlated subquery. Fetches up to
+// SQL_CORRELATED_MAX_OUTER_ROWS candidate rows with NO predicate pushed
+// down, then re-resolves a FRESH COPY of the WHERE predicate against EACH
+// candidate row in turn (g_correlated_pred_scratch = s->where, then
+// resolve_predicate_subqueries(..., layout, &row, ...) -- the SAME function
+// dispatch_stmt()'s own once-only call uses, just now supplied a real
+// outer_row so a correlated marker actually gets spliced-and-executed
+// instead of skipped), then predicate_eval()s the resolved copy against
+// that row. A fresh copy is required every iteration because resolving
+// mutates the predicate in place (see resolve_predicate_subqueries()'s own
+// header comment) -- reusing s->where directly across rows would corrupt
+// it after the first one.
+static void exec_select_correlated(uint64_t txn_id, uint32_t caller_uid, const struct SqlSelectStmt* s, struct SqlResult* out) {
+    int tidx = find_table_catalog_index(s->table_name);
+    if (tidx < 0) {
+        out->error = SQL_ERR_TABLE_NOT_FOUND; se_strcpy(out->error_msg, "table not found", SQL_ERR_MSG_LEN); return;
+    }
+    const struct RowTableLayout* layout = &table_headers[tidx].layout;
+
+    if (!s->select_all) {
+        for (uint32_t i = 0; i < s->column_count; i++) {
+            if (find_column_index(layout, s->columns[i]) == 0xFFFFFFFFu) {
+                out->error = SQL_ERR_COLUMN_NOT_FOUND;
+                se_strcpy(out->error_msg, "SELECT column not found in table", SQL_ERR_MSG_LEN);
+                return;
+            }
+        }
+    }
+    uint32_t order_col = 0xFFFFFFFFu;
+    if (s->has_order_by) {
+        order_col = find_column_index(layout, s->order_by);
+        if (order_col == 0xFFFFFFFFu) {
+            out->error = SQL_ERR_COLUMN_NOT_FOUND;
+            se_strcpy(out->error_msg, "ORDER BY column not found in table", SQL_ERR_MSG_LEN);
+            return;
+        }
+    }
+    if (!predicate_columns_valid(&s->where, s->where.root, layout)) {
+        out->error = SQL_ERR_COLUMN_NOT_FOUND;
+        se_strcpy(out->error_msg, "WHERE clause references an unknown column", SQL_ERR_MSG_LEN);
+        return;
+    }
+
+    struct MvccRowId ids[SQL_CORRELATED_MAX_OUTER_ROWS];
+    uint32_t total = mvcc_find_matching_rows(txn_id, caller_uid, s->table_name, NULL, layout,
+                                             ids, SQL_CORRELATED_MAX_OUTER_ROWS);
+    uint32_t candidate_n = total < SQL_CORRELATED_MAX_OUTER_ROWS ? total : SQL_CORRELATED_MAX_OUTER_ROWS;
+    uint8_t truncated = (total > SQL_CORRELATED_MAX_OUTER_ROWS) ? 1 : 0;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < candidate_n && n < CURSOR_MAX_ROWSET_ROWS; i++) {
+        struct RowValues row;
+        if (mvcc_row_get(txn_id, caller_uid, s->table_name, ids[i], &row) != MVCC_OK) continue;
+
+        g_correlated_pred_scratch = s->where;
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &g_correlated_pred_scratch, layout, &row, out)) return;
+
+        if (predicate_eval(&g_correlated_pred_scratch, layout, &row)) {
+            g_correlated_scratch[n] = row;
+            n++;
+        }
+    }
+
+    if (s->has_order_by) {
+        // Insertion sort, same shape exec_select()'s own ORDER BY uses.
+        for (uint32_t i = 1; i < n; i++) {
+            struct RowValues key = g_correlated_scratch[i];
+            int j = (int)i - 1;
+            while (j >= 0) {
+                int cmp = compare_rows_by_column(layout, order_col, &g_correlated_scratch[j], &key);
+                int should_move = s->order_desc ? (cmp < 0) : (cmp > 0);
+                if (!should_move) break;
+                g_correlated_scratch[j + 1] = g_correlated_scratch[j];
+                j--;
+            }
+            g_correlated_scratch[j + 1] = key;
+        }
+    }
+
+    if (s->has_limit && s->limit < n) n = s->limit;
+
+    uint32_t cid = cursor_open_rowset(s->table_name, g_correlated_scratch, n);
+
+    out->error       = SQL_ERR_NONE;
+    out->cursor_id   = cid;
+    out->row_count   = n;
+    out->truncated   = truncated;
+    if (s->select_all) {
+        out->column_count = layout->column_count;
+        for (uint32_t i = 0; i < layout->column_count; i++) se_strcpy(out->columns[i], layout->column_names[i], RECORD_KEY_LEN);
+    } else {
+        out->column_count = s->column_count;
+        for (uint32_t i = 0; i < s->column_count; i++) se_strcpy(out->columns[i], s->columns[i], RECORD_KEY_LEN);
+    }
+}
+
 // See exec_select's own comment above on why this is static scratch, not a
 // stack-local: struct SqlStatement embeds a struct Predicate (32 nodes x a
 // 256-byte literal each), several KB on its own -- too large to put on a
@@ -2779,13 +3042,30 @@ static void dispatch_stmt(uint64_t txn_id, uint32_t caller_uid, struct SqlStatem
     // Phase 7 note and resolve_predicate_subqueries()'s own comment above
     // for why exec_select_join()/exec_select_group()/HAVING are deliberately
     // excluded here (an unresolved marker there fails closed instead).
+    //
+    // Query-Surface Roadmap Phase 7: outer_layout/outer_row are passed NULL/
+    // NULL at this top-level, once-only call site -- a CORRELATED marker is
+    // deliberately left unresolved here (see resolve_predicate_subqueries()'s
+    // own updated comment) rather than erroring, since exec_select() (for
+    // SELECT) or the loud rejections just below (for UPDATE/DELETE) are what
+    // decide what to do with it next.
     if (stmt->kind == SQL_STMT_SELECT && stmt->u.select.has_where &&
         !stmt->u.select.has_join && !stmt->u.select.has_aggregates) {
-        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.select.where, out)) return;
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.select.where, NULL, NULL, out)) return;
     } else if (stmt->kind == SQL_STMT_UPDATE && stmt->u.update.has_where) {
-        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.update.where, out)) return;
+        if (predicate_has_correlated_subquery(&stmt->u.update.where)) {
+            out->error = SQL_ERR_CORRELATED_SUBQUERY_UNSUPPORTED;
+            se_strcpy(out->error_msg, "a correlated subquery is not supported in UPDATE ... WHERE (v1 scope cut -- SELECT only)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.update.where, NULL, NULL, out)) return;
     } else if (stmt->kind == SQL_STMT_DELETE && stmt->u.del.has_where) {
-        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.del.where, out)) return;
+        if (predicate_has_correlated_subquery(&stmt->u.del.where)) {
+            out->error = SQL_ERR_CORRELATED_SUBQUERY_UNSUPPORTED;
+            se_strcpy(out->error_msg, "a correlated subquery is not supported in DELETE ... WHERE (v1 scope cut -- SELECT only)", SQL_ERR_MSG_LEN);
+            return;
+        }
+        if (!resolve_predicate_subqueries(txn_id, caller_uid, &stmt->u.del.where, NULL, NULL, out)) return;
     }
 
     switch (stmt->kind) {

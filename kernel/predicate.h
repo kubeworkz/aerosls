@@ -153,6 +153,54 @@
  * unresolved is exactly the defensive case `predicate_eval()` now guards.
  * `CREATE VIEW`, `WITH` CTEs, and `UNION`/`INTERSECT`/`EXCEPT` remain
  * entirely unscoped, matching the roadmap doc's own Phase 7 framing.
+ *
+ * ─── Query-Surface Roadmap Phase 7: correlated subqueries ──────────────────
+ * Promotes exactly the case the paragraph above named as out of scope: a
+ * subquery whose own WHERE references the OUTER row's own column, written
+ * as `OUTER.<column>` (e.g. `WHERE salary > (SELECT AVG(salary) FROM
+ * employees e2 WHERE e2.dept = OUTER.dept)`). This is deliberately a
+ * TEXTUAL substitution feature, not real scoped name resolution: `OUTER.
+ * <column>` is never parsed as SQL grammar at all (no new token, no new
+ * `column_ref` form) -- it is detected by a plain, case-insensitive,
+ * token-boundary-checked substring scan over the subquery's own already-
+ * captured raw text (`predicate_add_subquery()` below runs this scan once,
+ * at ADD time, storing the result in the new `subquery_is_correlated[]`
+ * array below, parallel to `subqueries[]`), and at EXEC time (kernel/
+ * sql_exec.c) `OUTER.<column>` occurrences are textually replaced with
+ * that column's ACTUAL VALUE from the current outer row (quoted per its
+ * SLSFieldType, matching this codebase's `'` `''`-escaping convention)
+ * before the resulting, now-ordinary text is re-parsed and executed via
+ * the SAME `exec_subquery_column()` the non-correlated path already uses
+ * -- one execution path serves both non-correlated (a plain literal
+ * splice never occurs) and correlated (a literal splice happens first)
+ * subqueries. This is the "honest v1" the roadmap doc itself specs:
+ * `outer.col` spliced into the subquery text per row, executed once per
+ * outer row (capped at a small, real, named budget --
+ * `SQL_CORRELATED_MAX_OUTER_ROWS` in sql_exec.c -- rather than an
+ * unbounded O(rows x subquery-cost) scan), not a general correlated-
+ * subquery planner with any notion of indexing or rewrite-to-JOIN.
+ *
+ * A correlated subquery cannot be resolved ONCE before the outer scan the
+ * way `resolve_predicate_subqueries()` resolves a non-correlated one --
+ * it needs a DIFFERENT outer row's value on every evaluation. This file
+ * stays exactly as ignorant of that as it was of subqueries generally
+ * (see the paragraph above): `subquery_is_correlated[]` is pure metadata
+ * sql_exec.c reads to decide HOW to resolve a marker node, not something
+ * predicate.c ever acts on itself. `predicate_has_correlated_subquery()`
+ * below is the one new accessor, letting sql_exec.c ask "does this WHERE
+ * need the per-row path" without reaching into `Predicate`'s internals
+ * directly (matching this file's existing thin-accessor convention).
+ *
+ * Scope, deliberately as narrow as the non-correlated feature was: v1 is
+ * SELECT-only (kernel/sql_exec.c's `exec_update()`/`exec_delete()`
+ * reject a correlated marker outright rather than attempting a per-row
+ * mutation loop), and only a PLAIN SELECT (no JOIN, no aggregates, no
+ * set operator, no CTE) -- combining any of those with a correlated
+ * subquery is a real, named, LOUD rejection
+ * (`SQL_ERR_CORRELATED_SUBQUERY_UNSUPPORTED`), not the older, quieter
+ * "unresolved marker fails closed to false" fallback the non-correlated
+ * feature's own JOIN/GROUP BY gap still uses -- a NEW feature earns a
+ * clear error instead of silently reusing that defensive fallback.
  */
 #ifndef PREDICATE_H
 #define PREDICATE_H
@@ -277,6 +325,13 @@ struct Predicate {
     // reference by subquery_index -- see this header's own Phase 7 note.
     char     subqueries[PREDICATE_MAX_SUBQUERIES][PREDICATE_SUBQUERY_TEXT_LEN];
     uint32_t subquery_count;
+    // Query-Surface Roadmap Phase 7: parallel to subqueries[] above --
+    // subquery_is_correlated[i]!=0 iff subqueries[i]'s raw text contains an
+    // OUTER.<column> reference, set once by predicate_add_subquery() at ADD
+    // time (see this header's own Phase 7 addendum above). Zero-default
+    // (every pre-this-phase Predicate never had a correlated subquery, so
+    // this array is simply never inspected by old code paths).
+    uint8_t  subquery_is_correlated[PREDICATE_MAX_SUBQUERIES];
 };
 
 void predicate_init(struct Predicate* p);
@@ -306,6 +361,13 @@ uint32_t predicate_add_subquery(struct Predicate* p, const char* raw_text);
 // (silently) if node_idx is out of range or not a comparison leaf, since
 // every call site already controls exactly which node it just added.
 void predicate_mark_subquery(struct Predicate* p, uint32_t node_idx, uint32_t subq_idx);
+
+// Query-Surface Roadmap Phase 7: 1 iff `p` contains at least one
+// PRED_NODE_COMPARISON leaf with uses_subquery set whose owning subquery is
+// correlated (subquery_is_correlated[subquery_index] != 0), else 0. Lets
+// sql_exec.c decide whether a WHERE clause needs the per-outer-row
+// resolution path without reaching into Predicate's internals directly.
+int predicate_has_correlated_subquery(const struct Predicate* p);
 
 // Phase 3 (SQL Feature-Parity Roadmap): appends an arithmetic-comparison
 // leaf (`op1 [arith_op op2] cmp_op literal`) -- see the header comment

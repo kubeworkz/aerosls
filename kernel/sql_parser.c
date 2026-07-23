@@ -299,7 +299,25 @@ static int parse_compare_op(struct SqlParser* p, PredicateCompareOp* out) {
 // name baked into that same string "just works" with zero changes to
 // either of those files).
 static int parse_column_ref(struct SqlParser* p, char* out, uint32_t max) {
-    if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name"); return 0; }
+    // Query-Surface Roadmap Phase 7: TOK_KW_OUTER is accepted here alongside
+    // TOK_IDENT, purely so "OUTER.<column>" (the correlated-subquery marker
+    // -- see predicate.h/predicate.c's pe_text_has_outer_ref() and
+    // sql_exec.c's substitute_outer_refs()) can round-trip through this
+    // file's own eager re-parse of a captured subquery body (try_parse_
+    // embedded_subquery() calls sql_parse() on the raw text once, purely to
+    // validate shape, before predicate_add_subquery() ever runs its textual
+    // scan). Without this, "OUTER" -- reserved since Phase 2 for "LEFT/RIGHT
+    // OUTER JOIN" -- lexes as TOK_KW_OUTER, not TOK_IDENT, and the eager
+    // parse would reject every correlated subquery outright before the
+    // correlation marker is ever recognized as such. Safe to widen here
+    // unconditionally: parse_column_ref() is never called in a position
+    // where a bare "OUTER" keyword is expected (the JOIN-clause "OUTER" is
+    // consumed directly by its own p->cur.kind == TOK_KW_OUTER check in the
+    // join-clause parser, never routed through here), so this cannot shadow
+    // or break that usage. p->cur.text still holds the literal "OUTER" text
+    // regardless of token kind, since lex_next() only overwrites .kind on a
+    // keyword match and leaves .text as scanned.
+    if (p->cur.kind != TOK_IDENT && p->cur.kind != TOK_KW_OUTER) { set_error(p, "expected a column name"); return 0; }
     char first[RECORD_KEY_LEN];
     sq_strcpy(first, p->cur.text, RECORD_KEY_LEN);
     advance(p);
@@ -450,6 +468,38 @@ static int parse_select_item(struct SqlParser* p, char* label, uint32_t label_ma
 static int parse_insert_value(struct SqlParser* p, char* out, uint32_t max, uint8_t* is_null);
 
 static int parse_literal(struct SqlParser* p, char* out, uint32_t max) {
+    // Query-Surface Roadmap Phase 7: "OUTER.<column>" -- the correlated-
+    // subquery marker -- is accepted here as a literal-shaped value too,
+    // stored verbatim as text (e.g. "OUTER.dept"), so that a comparison
+    // like "dept = OUTER.dept" inside a captured subquery body can survive
+    // this file's own eager re-parse (try_parse_embedded_subquery() calls
+    // sql_parse() on the raw subquery text once, purely to validate shape,
+    // before predicate_add_subquery()'s textual scan ever runs). Without
+    // this, the RHS of that comparison has nowhere to go: OUTER lexes as
+    // TOK_KW_OUTER (reserved since Phase 2 for "LEFT/RIGHT OUTER JOIN"),
+    // which none of the cases below accept, so the eager parse would reject
+    // every correlated subquery outright before correlation is ever
+    // detected. The stored "OUTER.<column>" text is never evaluated as an
+    // ordinary literal -- see predicate.c's pe_text_has_outer_ref() (marks
+    // the whole subquery correlated) and sql_exec.c's substitute_outer_refs()
+    // (does the real per-row textual splice at exec time, directly on the
+    // subquery's raw source text, independently of this parsed-and-discarded
+    // validation copy).
+    if (p->cur.kind == TOK_KW_OUTER) {
+        char first[RECORD_KEY_LEN];
+        sq_strcpy(first, p->cur.text, RECORD_KEY_LEN);
+        advance(p);
+        if (p->cur.kind != TOK_DOT) { set_error(p, "expected '.' after OUTER"); return 0; }
+        advance(p);
+        if (p->cur.kind != TOK_IDENT) { set_error(p, "expected a column name after 'OUTER.'"); return 0; }
+        uint32_t i = 0;
+        for (; first[i] && i < max - 1; i++) out[i] = first[i];
+        if (i < max - 1) out[i++] = '.';
+        for (uint32_t j = 0; p->cur.text[j] && i < max - 1; j++) out[i++] = p->cur.text[j];
+        out[i] = '\0';
+        advance(p);
+        return 1;
+    }
     switch (p->cur.kind) {
         case TOK_NUMBER:
         case TOK_STRING:

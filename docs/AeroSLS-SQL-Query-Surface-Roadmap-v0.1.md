@@ -624,30 +624,138 @@ table name (CTE wins, standard scoping), CTE over a view (depth budget
 respected or rejected loud — decide at implementation against the real
 depth accounting).
 
-### Phase 7 — Correlated subqueries — last, and honestly may stay deferred
+### Phase 7 — Correlated subqueries — DONE
 
-**Why last.** Phase 7 (parity roadmap) pre-resolves subqueries ONCE
-before the outer scan against fixed text — correlation breaks every
-part of that: the subquery text needs per-outer-row binding
-substitution, re-execution N times (a real O(rows × subquery-cost)
-multiplier with no indexes to soften it), and reentrant subquery
-scratch (deliberately excluded from Phase 3's banks). The honest v1, if
-wanted: textual binding substitution (`outer.col` spliced into the
-subquery text per row) executing at depth 1 per outer row, capped at a
-small outer-row budget (e.g. first 64 rows, loud truncation) to keep
-the quadratic cost named and bounded. **Recommendation: leave this
-phase unstarted until a real query needs it** — Phases 4-6 cover most
-practical uses (a correlated EXISTS is often re-expressible as a JOIN,
-which Phase 1 makes aggregatable).
+**Why last (original reasoning, kept as historical record).** Phase 7
+(parity roadmap) pre-resolves subqueries ONCE before the outer scan
+against fixed text — correlation breaks every part of that: the
+subquery text needs per-outer-row binding substitution, re-execution N
+times (a real O(rows × subquery-cost) multiplier with no indexes to
+soften it), and reentrant subquery scratch (deliberately excluded from
+Phase 3's banks). The honest v1, if wanted: textual binding
+substitution (`outer.col` spliced into the subquery text per row)
+executing at depth 1 per outer row, capped at a small outer-row budget
+(e.g. first 64 rows, loud truncation) to keep the quadratic cost named
+and bounded. **Recommendation: leave this phase unstarted until a real
+query needs it** — Phases 4-6 cover most practical uses (a correlated
+EXISTS is often re-expressible as a JOIN, which Phase 1 makes
+aggregatable). The user explicitly requested this phase anyway, so it
+was implemented per the plan above rather than left deferred.
+
+#### Findings addendum (as built)
+
+**Marker and detection.** `OUTER.<column>` (case-insensitive) is the
+correlation marker, matching the plan's `outer.col` almost exactly
+(capitalized for visual distinction from a real table alias).
+Detection lives ENTIRELY in `predicate.c`: `pe_text_has_outer_ref()`
+does a plain, token-boundary-checked substring scan over a subquery's
+captured raw text (no lexer, no grammar) at `predicate_add_subquery()`
+time, setting a new parallel array `subquery_is_correlated[]` in
+`struct Predicate` once and for all. This confirms the roadmap's own
+implicit assumption that correlation is a text-level property, not a
+grammar-level one — zero grammar rules were added to detect it.
+`predicate_has_correlated_subquery()` is the public accessor
+`exec_select()`/`exec_update()`/`exec_delete()` all use to decide
+whether their combined-scope rejection applies.
+
+**A real collision, found only by writing the test.** The marker
+design assumed `OUTER.<column>` would "never be parsed as real SQL
+grammar" — true for the DETECTION pass, but not for the EAGER
+VALIDATION pass every embedded subquery already goes through
+(`try_parse_embedded_subquery()` calls a real, throwaway `sql_parse()`
+on the captured subquery text purely to check its shape: SELECT-only,
+single column, no JOIN/aggregate — this predates Phase 7's correlation
+work, going back to the original scalar/IN subquery Phase 7 of the SQL
+Feature-Parity Roadmap). `OUTER` has been a reserved keyword
+(`TOK_KW_OUTER`) since Phase 2 of that same roadmap, for `LEFT/RIGHT
+OUTER JOIN` — so `OUTER.dept` lexes as a keyword token, not
+`TOK_IDENT`, and neither `parse_column_ref()` (qualified-column LHS)
+nor `parse_literal()` (comparison RHS — the far more common position,
+`dept = OUTER.dept`) accepted it. Every correlated subquery failed
+eager validation and the whole outer statement was rejected as a parse
+error, before `predicate_add_subquery()` — and therefore
+`pe_text_has_outer_ref()` — ever ran. This was caught by the new host
+test (every scenario failed identically on the first run) rather than
+in design or code review, and fixed by widening both functions to
+accept `TOK_KW_OUTER` as a base identifier (`OUTER.<ident>` stored
+verbatim as text, same as any other qualified reference or literal) —
+safe because `parse_column_ref()`/`parse_literal()` are never called in
+the one spot (`LEFT/RIGHT/FULL [OUTER] JOIN`'s own keyword check) where
+a bare `OUTER` keyword is actually expected. The real per-row
+substitution at exec time (`substitute_outer_refs()`, see below) never
+depends on this eager-validation parse succeeding for the RIGHT
+reasons — it operates on the raw captured text directly — but the
+eager validation still has to parse the text at all once, for its
+JOIN/aggregate/column-count shape checks, and that's what was broken.
+
+**Per-row textual splice, not real grammar, at exec time either.**
+`substitute_outer_refs()` (sql_exec.c) scans a subquery's raw text for
+token-boundary-checked `OUTER.<ident>` occurrences and replaces each
+with the current outer row's actual value — quoted per the outer
+column's own type (`format_value_for_splice()`: STRING/BLOB get
+`'...'` with embedded quotes doubled, matching `sql_parser.c`'s own
+string-literal lexing convention; everything else copied unquoted).
+The resulting ordinary SQL text is handed to `exec_subquery_column()`
+completely unchanged — the SAME function non-correlated subqueries
+already used, so correlated and non-correlated subqueries share one
+execution path with zero duplication. An unknown `OUTER.<column>`
+fails loud with `SQL_ERR_COLUMN_NOT_FOUND` naming the reference, not a
+silent empty match.
+
+**Per-outer-row re-resolution.** `resolve_predicate_subqueries()`
+gained two additive parameters, `outer_layout`/`outer_row`, both
+`NULL` from `dispatch_stmt()`'s original once-only call site — a
+correlated marker is deliberately SKIPPED (left unresolved) when
+`outer_row` is `NULL` rather than erroring, since it genuinely can't be
+resolved without a specific row yet. `exec_select_correlated()` (new)
+supplies the real row: fetches up to `SQL_CORRELATED_MAX_OUTER_ROWS`
+(64) candidate rows with NO predicate pushed down (there is no single
+fixed comparison value until a specific row's columns are spliced in),
+then for each candidate copies `s->where` into a fresh scratch
+predicate and calls `resolve_predicate_subqueries()` again with that
+row supplied, then `predicate_eval()`s the resolved copy. A fresh copy
+per row is required because resolving mutates the predicate in place
+(the same convention Phase 7's original IN-desugaring already
+established) — reusing the statement's own `s->where` across rows
+would corrupt it after the first one. `truncated=1` fires honestly when
+the underlying table has more than 64 rows, matching the roadmap's own
+"loud truncation" requirement — verified directly (a dedicated 70-row
+table, budget caps at exactly 64 tested, `truncated=1`).
+
+**Combined-scope rejection — one choke point, same as Phase 6.**
+`exec_select()`'s very first check (ahead of even the Phase 6 CTE
+check) is `predicate_has_correlated_subquery(&s->where)`; if true AND
+any of JOIN/aggregates/set-op/CTE is also present, one error code
+(`SQL_ERR_CORRELATED_SUBQUERY_UNSUPPORTED`) rejects loud before any of
+those subsystems' own machinery runs. `dispatch_stmt()` adds the same
+rejection outright for UPDATE/DELETE (correlated subqueries are
+SELECT-only in v1) ahead of its existing once-only
+`resolve_predicate_subqueries()` call. All four combined-scope
+rejections plus both UPDATE/DELETE rejections are covered by the new
+host test, and confirmed to be genuine no-ops (the table is provably
+untouched afterward).
+
+**Verification.** New `tests/sql_correlated_subquery_qs7_host_test.c`
+(20 checks): correlated `IN (SELECT ...)` and correlated scalar
+subquery (a deliberate self-matching tautology, chosen to prove
+two-separate-`OUTER.<col>`-splices-in-one-pass works, since every row's
+dept+salary pair is unique in the fixture), ORDER BY/LIMIT composing
+over a correlated result, all four combined-scope rejections, both
+UPDATE/DELETE rejections, the 64-row truncation budget, an unknown
+`OUTER.<column>` failing loud, and — the actual regression check that
+matters most — confirming an ordinary non-correlated subquery is
+`predicate_has_correlated_subquery() == 0` and still resolves via the
+original once-only path, unaffected by any of the above. Full 48-file
+regression suite (batched in 3 groups of 16 due to the ~80s total
+runtime exceeding a single tool call's timeout) passes 100%, including
+`sql_subquery_phase7_host_test`'s own 35 pre-existing checks unchanged.
 
 ## 3. Suggested sequencing
 
 Phases 1 and 2 first, in either order — both are self-contained executor
 work with no reentrancy dependency, and each closes a named Gap-Analysis
-item outright. **Phases 1-6 are now DONE.** Phase 7 (correlated
-subqueries) deliberately unscheduled — the roadmap's own recommendation
-is to leave it unstarted until a real query needs it, since Phases 4-6
-already cover most practical uses.
+item outright. **Phases 1-7 are now DONE.** Nothing further is scoped
+in this roadmap.
 
 ## 4. Non-goals for this whole roadmap
 
