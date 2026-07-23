@@ -93,6 +93,7 @@
 
 #include <stdint.h>
 #include "object_catalog.h"
+#include "partition.h"   // Storage Isolation Roadmap Phase 3 -- PARTITION_MAX sizes the per-partition page sub-ranges below
 #include "../net/ollama_client.h"   // Phase 4 only -- see the §6 syscall-surface
                                       // comment below for why this is the one
                                       // place vecstore.c/.h is allowed to know
@@ -126,6 +127,13 @@
 // 4,724,288 -- comfortably inside the 10 GiB disk image's 20,971,520-sector
 // budget (see Makefile).
 #define VECSTORE_LBA_BASE  4200000ULL
+
+// ─── Storage Isolation Roadmap Phase 3: real per-partition page sub-ranges ──
+// Mirrors ROWSTORE_PAGES_PER_PARTITION (rowstore.h) exactly -- see that
+// file's header comment for the full design writeup, which applies here
+// unchanged. VECSTORE_MAX_PAGES / PARTITION_MAX = 65536 / 16 = 4096 exactly
+// (16 MiB per partition, today).
+#define VECSTORE_PAGES_PER_PARTITION (VECSTORE_MAX_PAGES / PARTITION_MAX)
 
 // Max bytes one serialized entry can occupy: 1 tombstone byte + 8-byte
 // external_id + up to VECSTORE_MAX_DIMENSION floats. Used to size a stack
@@ -186,8 +194,19 @@ extern struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 // rowstore.c's rowstore_next_free_page_id (two independent subsystems,
 // two independent pools, matching the roadmap's own "new parallel
 // subsystem, not an extension" principle all the way down to allocator
-// state, not just the top-level API).
+// state, not just the top-level API). Storage Isolation Roadmap Phase 3:
+// now a global high-water mark across all partitions' own sub-ranges, not
+// literally "the" cursor anymore -- see rowstore.h's identical comment on
+// rowstore_next_free_page_id for the full reasoning, which applies here
+// unchanged.
 extern uint32_t vecstore_next_free_page_id;
+
+// Per-partition bump-allocator cursor, mirroring rowstore_partition_cursor[]
+// exactly (rowstore.h) -- vecstore_partition_cursor[p] is the next free
+// page_id within partition p's own [p * VECSTORE_PAGES_PER_PARTITION,
+// (p+1) * VECSTORE_PAGES_PER_PARTITION) sub-range. NOT static: persist.c's
+// restore block pokes it directly on restore.
+extern uint32_t vecstore_partition_cursor[PARTITION_MAX];
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────
 // Zeroes vector_collections[]/the in-RAM page-pointer cache and resets the

@@ -17,6 +17,10 @@
 
 struct RowTableHeader table_headers[ROWSTORE_MAX_TABLES];
 uint32_t              rowstore_next_free_page_id = 0;
+// Storage Isolation Roadmap Phase 3: per-partition page sub-range cursors --
+// see rowstore.h's header comment for the full design. Initialized by
+// rowstore_init() below.
+uint32_t              rowstore_partition_cursor[PARTITION_MAX];
 
 // RAM cache of loaded pages — NULL = not loaded. Not persisted directly;
 // pages restore lazily on first access, mirroring stream.c's frames[].
@@ -267,33 +271,47 @@ static void rowstore_flush_page(uint32_t page_id) {
     nvme_write_sync(ROWSTORE_LBA_BASE + (uint64_t)page_id * 8, row_pages[page_id]);
 }
 
-// Allocates a brand-new page from the shared bump-allocator pool. No
-// reclaim in this first cut -- see rowstore.h's design comment.
+// Allocates a brand-new page from partition_id's OWN reserved sub-range of
+// the page pool. No reclaim in this first cut -- see rowstore.h's design
+// comment.
 //
-// Storage Isolation Roadmap Phase 1: now quota-checked via storage_quota.c's
+// Storage Isolation Roadmap Phase 1: quota-checked via storage_quota.c's
 // combined rowstore+vecstore per-partition page budget. The check happens
-// FIRST, before the cursor advances or any RAM frame is touched -- same
+// FIRST, before either cursor advances or any RAM frame is touched -- same
 // "denial before any side effect" posture as allocate_physical_ram_frame_
-// for_partition(). partition_id comes from the caller (the owning object_
-// catalog entry), not resolved here, matching how every other quota-checked
-// allocator in this codebase takes the id as a parameter rather than
-// re-deriving it.
+// for_partition().
+//
+// Storage Isolation Roadmap Phase 3: the pool-exhaustion check below is now
+// per-partition, not global -- a page_id is drawn from and bounds-checked
+// against partition_id's own [start, start + ROWSTORE_PAGES_PER_PARTITION)
+// sub-range (rowstore_partition_cursor[partition_id]), real physical
+// isolation rather than a shared elastic pool. partition_id comes from the
+// caller (the owning object_catalog entry), not resolved here, matching
+// every other quota-checked allocator in this codebase. rowstore_next_free_
+// page_id (the old flat cursor) is kept as a running high-water mark across
+// all partitions -- rowstore_load_page() and the row_get/update/delete
+// boundary checks only ever needed "has this page_id been allocated by
+// anyone," never partition attribution, so that contract is preserved
+// unchanged.
 static uint32_t rowstore_alloc_page(uint32_t partition_id) {
-    if (rowstore_next_free_page_id >= ROWSTORE_MAX_PAGES) return ROWSTORE_INVALID_PAGE;
+    if (partition_id >= PARTITION_MAX) return ROWSTORE_INVALID_PAGE;   // fail closed, same posture as storage_quota.c
+    uint32_t range_end = (partition_id + 1) * ROWSTORE_PAGES_PER_PARTITION;
+    if (rowstore_partition_cursor[partition_id] >= range_end) return ROWSTORE_INVALID_PAGE;   // this partition's own slice is full
     if (storage_page_reserve(partition_id)) return ROWSTORE_INVALID_PAGE;   // over quota -- fail cleanly, cursor untouched
-    uint32_t id = rowstore_next_free_page_id;
+    uint32_t id = rowstore_partition_cursor[partition_id];
 
     uint8_t* frame = (uint8_t*)allocate_physical_ram_frame();
     if (!frame) {
         storage_page_release(partition_id, 1);   // roll back the reservation -- this page never actually happened
-        return ROWSTORE_INVALID_PAGE;   // don't advance the cursor on failure
+        return ROWSTORE_INVALID_PAGE;   // don't advance either cursor on failure
     }
     rs_memset(frame, 0, ROWSTORE_PAGE_SIZE);
     uint32_t invalid = ROWSTORE_INVALID_PAGE;
     rs_memcpy(frame, &invalid, 4);
     row_pages[id] = frame;
 
-    rowstore_next_free_page_id++;
+    rowstore_partition_cursor[partition_id]++;
+    if (id + 1 > rowstore_next_free_page_id) rowstore_next_free_page_id = id + 1;   // keep the global high-water mark accurate
     return id;
 }
 
@@ -312,6 +330,13 @@ void rowstore_init(void) {
     rs_memset(table_headers, 0, sizeof(table_headers));
     rs_memset(row_pages, 0, sizeof(row_pages));
     rowstore_next_free_page_id = 0;
+    // Storage Isolation Roadmap Phase 3: each partition's cursor starts at
+    // the beginning of its OWN sub-range, not at 0 -- cold-start default,
+    // overwritten by persist.c's restore block if a real Phase-3-format
+    // snapshot exists (see persist_restore_all()'s block 6).
+    for (uint32_t p = 0; p < PARTITION_MAX; p++) {
+        rowstore_partition_cursor[p] = p * ROWSTORE_PAGES_PER_PARTITION;
+    }
     kernel_serial_print("[ROWSTORE] Row-set storage engine initialised.\n");
 }
 

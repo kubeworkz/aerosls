@@ -102,6 +102,7 @@
 
 #include <stdint.h>
 #include "object_catalog.h"
+#include "partition.h"   // Storage Isolation Roadmap Phase 3 -- PARTITION_MAX sizes the per-partition page sub-ranges below
 
 // ─── Limits ─────────────────────────────────────────────────────────────────
 #define ROWSTORE_MAX_TABLES   CATALOG_MAX_OBJECTS  // index-aligned with object_catalog[]
@@ -131,6 +132,39 @@
 // persist.h's PERSIST_ROWSTORE_HDR_LBA/PERSIST_ROWSTORE_ENT_LBA instead —
 // see persist.h.
 #define ROWSTORE_LBA_BASE  2000000ULL   // ROWSTORE_MAX_PAGES * 8 sectors reserved from here
+
+// ─── Storage Isolation Roadmap Phase 3: real per-partition page sub-ranges ──
+// Phases 1-2 (storage_quota.c) were accounting only -- a partition's pages
+// were still scattered arbitrarily across the one shared ROWSTORE_MAX_PAGES
+// pool. Phase 3 makes the isolation physically real: the page_id space is
+// split into PARTITION_MAX equal, contiguous, fixed sub-ranges at compile
+// time, and partition p's rowstore pages are drawn ONLY from
+// [p * ROWSTORE_PAGES_PER_PARTITION, (p+1) * ROWSTORE_PAGES_PER_PARTITION) --
+// never from any other partition's slice. This requires ROWSTORE_MAX_PAGES
+// to divide evenly by PARTITION_MAX (262144 / 16 = 16384 exactly, 64 MiB per
+// partition, today) -- if either constant ever changes without preserving
+// that divisibility, the remainder pages silently become permanently
+// unreachable by any partition (not a crash, just wasted tail space) rather
+// than a hard build error, so whoever changes either constant should
+// recheck this.
+//
+// This is a genuinely different, stricter ceiling than storage_quota.c's
+// own configurable page_quota: a Phase 1 quota set ABOVE a partition's
+// physical sub-range capacity is not an error, it just never binds -- the
+// physical sub-range boundary is always the tighter of the two in that
+// case. This is intentional, not a bug: one is a soft, admin-configurable
+// accounting limit; the other is a hard, structural reservation. See
+// docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md §8 for the full writeup.
+#define ROWSTORE_PAGES_PER_PARTITION (ROWSTORE_MAX_PAGES / PARTITION_MAX)
+
+// Per-partition bump-allocator cursor -- rowstore_partition_cursor[p] is the
+// next free page_id within partition p's own sub-range (starts at
+// p * ROWSTORE_PAGES_PER_PARTITION, set by rowstore_init(), and only ever
+// increases, matching the single flat cursor's own "no reclaim in this
+// first cut" posture, just now scoped per partition). NOT static, matching
+// rowstore_next_free_page_id's own existing convention immediately below --
+// persist.c's restore block writes it directly on restore.
+extern uint32_t rowstore_partition_cursor[PARTITION_MAX];
 
 // ─── Row values at the API boundary ─────────────────────────────────────────
 // Everything is text in and text out, matching this codebase's existing
@@ -183,11 +217,18 @@ struct RowTableHeader {
 
 extern struct RowTableHeader table_headers[ROWSTORE_MAX_TABLES];
 
-// The page-pool bump allocator's cursor — every page_id below this has been
-// allocated at some point (this boot or a prior one) and may have real data
-// on NVMe; every page_id at or above it has never been touched. NOT static:
-// persist.c's restore block (Phase 16, "block 6") writes it directly on
-// restore, matching every other subsystem's globals persist.c already pokes.
+// Global high-water mark across EVERY partition's own sub-range (Storage
+// Isolation Roadmap Phase 3 turned this from "the" bump-allocator cursor
+// into a plain upper bound: rowstore_alloc_page() now bumps the per-
+// partition rowstore_partition_cursor[] above instead) — every page_id
+// below this has been allocated by SOME partition at some point (this boot
+// or a prior one) and may have real data on NVMe; every page_id at or above
+// it has never been touched by anyone. Still exactly what rowstore_load_
+// page() and the row_get/update/delete boundary checks need: a defensive
+// "has this page_id ever been allocated at all" bound, which never needed
+// partition attribution in the first place. NOT static: persist.c's restore
+// block (Phase 16, "block 6") writes it directly on restore, matching every
+// other subsystem's globals persist.c already pokes.
 extern uint32_t rowstore_next_free_page_id;
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────

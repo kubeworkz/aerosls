@@ -239,7 +239,7 @@ Implemented: `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` Phase 1 — a comb
 
 **Verification.** New `tests/storage_quota_host_test.c` (9 scenarios, 45 checks) plus new scenarios in `tests/rowstore_host_test.c` and `tests/vecstore_host_test.c` proving each subsystem's real call site threads the right `partition_id` through and denies cleanly at quota. Full detail, mechanism, and the two resolved open-question decisions are written up in `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` §6, not duplicated here. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions.
 
-**Status:** Storage Isolation Roadmap Phase 1 closed. Phase 2 (byte-level usage export) closed too — see §16. Phase 3 (real per-tenant LBA sub-ranges, deliberately deferred until a dedicated-storage tier is an actual product decision) remains open — the specific "unbounded, unquota'd disk consumption" risk named in §3 is closed for rowstore + vecstore, and as of Phase 2 that same real accounting data is now externally visible per-partition too.
+**Status:** Storage Isolation Roadmap Phases 1, 2, and 3 are all now closed — see §17 for Phase 3. §5 item 2 / §7 item 5 are closed.
 
 ## 16. Findings addendum: storage isolation, Phase 2 (§5 item 2 / §7 item 5) — byte-level usage export closed
 
@@ -247,4 +247,16 @@ Implemented: `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` Phase 2 — Phase 
 
 **Verification.** `tests/tier_capacity_phase5b_host_test.c` extended with a new scenario proving the real `sys_sls_disk_status()` runs to completion against real `storage_quota.c` data (a smoke test — no serial-capture mechanism exists in this suite to assert printed byte values directly). `net/http.c` remains too heavy to host-test (per `tests/http_rate_limit_host_test.c`'s own established rationale); the new JSON code was verified via a clean `gcc -fsyntax-only` pass instead. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions.
 
-**Status:** Storage Isolation Roadmap Phase 2 closed. Phase 3 remains the only open phase of that roadmap.
+**Status:** Storage Isolation Roadmap Phase 2 closed. Phase 3 closed too — see §17.
+
+## 17. Findings addendum: storage isolation, Phase 3 (§5 item 2 / §7 item 5) — real per-partition page sub-ranges closed
+
+A dedicated-storage tier became an actual product decision, ending Phase 3's design-only deferral. Implemented: `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` Phase 3 — the rowstore/vecstore page_id space is now split into `PARTITION_MAX` fixed, contiguous, per-partition sub-ranges (`kernel/rowstore.c`'s `rowstore_partition_cursor[]`, `kernel/vecstore.c`'s `vecstore_partition_cursor[]`), so a partition's on-disk pages are physically confined to its own reserved slice rather than merely accounted for within a shared pool. This is the change that finally makes §3's original finding — *"No partitioning at all... There is no per-tenant NVMe region"* — false rather than merely mitigated: a per-tenant NVMe region now genuinely exists for rowstore and vecstore data.
+
+**What changes about §3/§15's own prior finding.** §15 (Phase 1's own addendum) said plainly: "The 'No partitioning at all... per-tenant NVMe region' half remains exactly as true as it was: a partition's pages are still scattered arbitrarily within the shared LBA pools, never contiguous or reserved." That is now closed. A partition's rowstore/vecstore pages are contiguous-by-construction within its own reserved sub-range, never interleaved with any other partition's.
+
+**Persistence and quota interaction.** Two new small persisted arrays (`PERSIST_ROWSTORE_PARTCURSOR_LBA`/`PERSIST_VECSTORE_PARTCURSOR_LBA`) carry each partition's own cursor across reboot, gated by a one-way format-version marker so a pre-Phase-3 snapshot correctly falls back to cold-start sub-range defaults rather than trusting stale/absent data. Storage Isolation Phase 1's configurable page_quota now sits beneath a second, hard, physical ceiling (the sub-range size itself) — a quota configured above that physical capacity simply never binds. Full detail in `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md` §8, not duplicated here.
+
+**Verification.** New scenarios in `tests/rowstore_host_test.c` and `tests/vecstore_host_test.c` prove disjoint per-partition page ranges, independent exhaustion (one partition's slice can be full while a different partition allocates normally), and persistence round-trip correctness for the new per-partition cursor arrays. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions.
+
+**Status:** Storage Isolation Roadmap is now fully closed (Phases 1, 2, and 3). §5 item 2 / §7 item 5 are closed.

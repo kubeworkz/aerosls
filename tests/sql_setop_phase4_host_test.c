@@ -58,6 +58,7 @@ int group_contains_uid(const char* name, uint32_t uid) { (void)name; (void)uid; 
 
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
+uint32_t                   vecstore_partition_cursor[PARTITION_MAX] = {0};
 struct VecIndex             vec_indexes[VEC_INDEX_MAX];
 int vec_index_create(uint32_t caller_uid, const char* index_name,
                      const char* collection_name, VecMetric metric) {

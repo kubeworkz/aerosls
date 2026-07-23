@@ -126,6 +126,7 @@ struct RowJournalAttachment row_journal_attachments[ROW_JOURNAL_MAX_ATTACHMENTS]
 uint32_t                    row_journal_attachment_count = 0;
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
+uint32_t                   vecstore_partition_cursor[PARTITION_MAX] = {0};
 struct RowIndex          row_indexes[ROW_INDEX_MAX];
 struct VecIndex             vec_indexes[VEC_INDEX_MAX];
 void mvcc_bootstrap_from_rowstore(void) { }

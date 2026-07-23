@@ -59,6 +59,7 @@ void catalog_after_restore(void) { /* no-op for this test */ }
 struct RowTableHeader table_headers[ROWSTORE_MAX_TABLES];
 uint32_t               rowstore_next_free_page_id = 0;
 
+uint32_t               rowstore_partition_cursor[PARTITION_MAX] = {0};
 /* Gap Remediation Phase D (found while regression-sweeping for Phase F --
  * this file was missed during Phase D's own sweep of every persist.c-
  * linking host test): persist.c's restore blocks 6b-11 reference row_
@@ -77,6 +78,7 @@ struct RowJournalAttachment row_journal_attachments[ROW_JOURNAL_MAX_ATTACHMENTS]
 uint32_t                    row_journal_attachment_count = 0;
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
+uint32_t                   vecstore_partition_cursor[PARTITION_MAX] = {0};
 struct VecIndex             vec_indexes[VEC_INDEX_MAX];
 void mvcc_bootstrap_from_rowstore(void) { }
 int row_index_create(uint32_t caller_uid, const char* index_name,

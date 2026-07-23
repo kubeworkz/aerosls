@@ -209,16 +209,24 @@ void persist_partitions(void) {
 
 // ─── persist_rowstore_headers ─────────────────────────────────────────────────
 // Phase 16 (relational layer). Writes table_headers[] plus the page-pool
-// bump-allocator cursor (rowstore_next_free_page_id, stashed in the header
+// high-water mark (rowstore_next_free_page_id, stashed in the header
 // frame's v1 slot — same "steal a uint32 slot in write_hdr()" trick this
 // file has no dedicated pattern for otherwise). Row PAGE data is NOT
 // written here — see persist.h's comment on this function.
+//
+// Storage Isolation Roadmap Phase 3: also writes rowstore_partition_cursor[]
+// (the real per-partition sub-range state) to its own new LBA region, and
+// stashes PERSIST_STORAGE_ISOLATION_PHASE3_MARK in the header's v2 slot
+// (previously always 0) so a restore can tell this snapshot includes it —
+// see persist.h's LBA layout comment for the full reasoning.
 void persist_rowstore_headers(void) {
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(table_headers);
     write_hdr(PERSIST_ROWSTORE_HDR_LBA, PERSIST_MAGIC_ROWSTORE,
-              hdr_bytes, rowstore_next_free_page_id, 0);
+              hdr_bytes, rowstore_next_free_page_id, PERSIST_STORAGE_ISOLATION_PHASE3_MARK);
     persist_write_array(table_headers, hdr_bytes, PERSIST_ROWSTORE_ENT_LBA);
+    persist_write_array(rowstore_partition_cursor, (uint32_t)sizeof(rowstore_partition_cursor),
+                        PERSIST_ROWSTORE_PARTCURSOR_LBA);
     kernel_serial_print("[PERSIST] Row-store table headers snapshot written.\n");
 }
 
@@ -256,12 +264,17 @@ void persist_row_index_defs(void) {
 // directly-managed NVMe region -- see VECSTORE_LBA_BASE, vecstore.h).
 // Called after every successful vecstore_create_collection() / vecstore_
 // insert() / vecstore_delete().
+// Storage Isolation Roadmap Phase 3: also writes vecstore_partition_cursor[]
+// and stashes the same format-version marker in the header's v2 slot --
+// mirrors persist_rowstore_headers()'s own Phase 3 addition exactly.
 void persist_vecstore_headers(void) {
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(vector_collections);
     write_hdr(PERSIST_VECSTORE_HDR_LBA, PERSIST_MAGIC_VECSTORE,
-              hdr_bytes, vecstore_next_free_page_id, 0);
+              hdr_bytes, vecstore_next_free_page_id, PERSIST_STORAGE_ISOLATION_PHASE3_MARK);
     persist_write_array(vector_collections, hdr_bytes, PERSIST_VECSTORE_ENT_LBA);
+    persist_write_array(vecstore_partition_cursor, (uint32_t)sizeof(vecstore_partition_cursor),
+                        PERSIST_VECSTORE_PARTCURSOR_LBA);
     kernel_serial_print("[PERSIST] Vecstore collection headers snapshot written.\n");
 }
 
@@ -488,13 +501,30 @@ void persist_restore_all(void) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
         if (magic == PERSIST_MAGIC_ROWSTORE) {
-            uint32_t hdr_bytes, next_page;
+            uint32_t hdr_bytes, next_page, part_mark;
             p_memcpy(&hdr_bytes, p_buf +  8, 4);
             p_memcpy(&next_page, p_buf + 12, 4);
+            p_memcpy(&part_mark, p_buf + 16, 4);
             if (hdr_bytes == (uint32_t)sizeof(table_headers)) {
                 persist_read_array(table_headers, hdr_bytes, PERSIST_ROWSTORE_ENT_LBA);
                 rowstore_next_free_page_id = next_page;
-                kernel_serial_print("[PERSIST] Row-store table headers restored from NVMe.\n");
+                // Storage Isolation Roadmap Phase 3: only trust the per-
+                // partition cursor array on a snapshot actually written by
+                // Phase-3-aware code -- an older snapshot's page ownership
+                // predates sub-ranges entirely and cannot be reattributed
+                // (one-way format change, see persist.h's LBA layout
+                // comment). rowstore_init() has already left every
+                // partition's cursor at its own cold-start sub-range start,
+                // which is the correct, safe fallback here.
+                if (part_mark == PERSIST_STORAGE_ISOLATION_PHASE3_MARK) {
+                    persist_read_array(rowstore_partition_cursor, (uint32_t)sizeof(rowstore_partition_cursor),
+                                       PERSIST_ROWSTORE_PARTCURSOR_LBA);
+                    kernel_serial_print("[PERSIST] Row-store table headers + per-partition page cursors restored from NVMe.\n");
+                } else {
+                    kernel_serial_print(
+                        "[PERSIST] Row-store table headers restored from NVMe (pre-Phase-3 snapshot -- "
+                        "per-partition page cursors reset to cold-start sub-range starts).\n");
+                }
             } else {
                 kernel_serial_print("[PERSIST] Row-store: struct size mismatch — cold start.\n");
             }
@@ -596,13 +626,25 @@ void persist_restore_all(void) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
         if (magic == PERSIST_MAGIC_VECSTORE) {
-            uint32_t hdr_bytes, next_page;
+            uint32_t hdr_bytes, next_page, part_mark;
             p_memcpy(&hdr_bytes, p_buf +  8, 4);
             p_memcpy(&next_page, p_buf + 12, 4);
+            p_memcpy(&part_mark, p_buf + 16, 4);
             if (hdr_bytes == (uint32_t)sizeof(vector_collections)) {
                 persist_read_array(vector_collections, hdr_bytes, PERSIST_VECSTORE_ENT_LBA);
                 vecstore_next_free_page_id = next_page;
-                kernel_serial_print("[PERSIST] Vecstore collection headers restored from NVMe.\n");
+                // Storage Isolation Roadmap Phase 3: same format-version
+                // gate as the rowstore restore block above -- see its
+                // comment for the full reasoning.
+                if (part_mark == PERSIST_STORAGE_ISOLATION_PHASE3_MARK) {
+                    persist_read_array(vecstore_partition_cursor, (uint32_t)sizeof(vecstore_partition_cursor),
+                                       PERSIST_VECSTORE_PARTCURSOR_LBA);
+                    kernel_serial_print("[PERSIST] Vecstore collection headers + per-partition page cursors restored from NVMe.\n");
+                } else {
+                    kernel_serial_print(
+                        "[PERSIST] Vecstore collection headers restored from NVMe (pre-Phase-3 snapshot -- "
+                        "per-partition page cursors reset to cold-start sub-range starts).\n");
+                }
             } else {
                 kernel_serial_print("[PERSIST] Vecstore: struct size mismatch — cold start.\n");
             }

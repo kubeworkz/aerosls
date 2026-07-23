@@ -337,6 +337,48 @@ int main(void) {
     CHECK(storage_get_page_usage(13) == 1, "s15: partition 13's usage is UNCHANGED by the denied attempt, not accidentally double-counted or left dangling");
     CHECK(storage_set_page_quota(13, 0) == 0, "s15: resetting partition 13 back to unlimited (0) so it doesn't affect any later scenario in this file");
 
+    /* ── Scenario 16 (Storage Isolation Roadmap Phase 3): real per-partition
+     * physical page sub-ranges, mirroring rowstore_host_test.c's own
+     * scenario 9. Reuses "wide_vectors" (entries_per_page=1, so every
+     * insert genuinely forces a brand-new page -- no state hacking needed)
+     * for partition A, and a fresh "wide_vectors_b" collection with the
+     * same narrow shape for partition B. Neither partition 7 nor 9 was
+     * touched by any earlier scenario in this file. ────────────────────── */
+    object_catalog[1].partition_id = 7;   /* "wide_vectors" -- partition A for this scenario */
+    make_object(3, "wide_vectors_b", 0xC004);
+    object_catalog[3].partition_id = 9;   /* partition B */
+    object_catalog_count = 4;
+    CHECK(vecstore_create_collection(1, "wide_vectors_b", 800) == 0, "s16: wide_vectors_b (dimension=800) created");
+
+    struct VecValues vA; vA.count = 800; for (uint32_t i = 0; i < 800; i++) vA.values[i] = (float)i;
+    struct VecId idA;
+    CHECK(vecstore_insert(1, "wide_vectors", 10, &vA, &idA) == 0, "s16: insert into wide_vectors (partition 7) succeeds");
+
+    struct VecValues vB; vB.count = 800; for (uint32_t i = 0; i < 800; i++) vB.values[i] = (float)(i + 1);
+    struct VecId idB;
+    CHECK(vecstore_insert(1, "wide_vectors_b", 20, &vB, &idB) == 0, "s16: insert into wide_vectors_b (partition 9) succeeds");
+
+    CHECK(idA.page_id >= 7 * VECSTORE_PAGES_PER_PARTITION && idA.page_id < 8 * VECSTORE_PAGES_PER_PARTITION,
+          "s16: wide_vectors' page_id lands inside partition 7's own reserved sub-range, not anywhere else");
+    CHECK(idB.page_id >= 9 * VECSTORE_PAGES_PER_PARTITION && idB.page_id < 10 * VECSTORE_PAGES_PER_PARTITION,
+          "s16: wide_vectors_b's page_id lands inside partition 9's own reserved sub-range, not anywhere else");
+    CHECK(idA.page_id != idB.page_id, "s16: the two partitions' pages are never the same page_id -- disjoint ranges, not just disjoint by luck");
+
+    /* Force partition 7's own sub-range to look completely full. */
+    vecstore_partition_cursor[7] = 8 * VECSTORE_PAGES_PER_PARTITION;
+    struct VecValues vA2; vA2.count = 800; for (uint32_t i = 0; i < 800; i++) vA2.values[i] = (float)(i + 2);
+    struct VecId idA2;
+    CHECK(vecstore_insert(1, "wide_vectors", 11, &vA2, &idA2) == 5, "s16: wide_vectors (partition 7) is denied once its OWN sub-range is exhausted (5)");
+
+    /* Partition 9 must be completely unaffected -- real physical isolation,
+     * not one shared ceiling with a different name. */
+    struct VecValues vB2; vB2.count = 800; for (uint32_t i = 0; i < 800; i++) vB2.values[i] = (float)(i + 3);
+    struct VecId idB2;
+    CHECK(vecstore_insert(1, "wide_vectors_b", 21, &vB2, &idB2) == 0,
+          "s16: wide_vectors_b (partition 9) still allocates a fresh page normally -- partition 7's exhaustion has zero effect on it");
+    CHECK(idB2.page_id >= 9 * VECSTORE_PAGES_PER_PARTITION && idB2.page_id < 10 * VECSTORE_PAGES_PER_PARTITION,
+          "s16: wide_vectors_b's 2nd page is still inside its own sub-range");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

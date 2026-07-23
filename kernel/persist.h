@@ -126,7 +126,33 @@
 //
 //  LBA 6784  PERSIST_TENANT_HDR_LBA  1 frame — tenants header (+ next_id)
 //  LBA 6792  PERSIST_TENANT_ENT_LBA  1 frame — tenants[32] (~1.5 KiB)
-//  (end LBA 6800 — comfortably clear of STREAM_DIR_LBA 8192)
+//  (end LBA 6800)
+//
+//  Storage Isolation Roadmap Phase 3: real per-partition page sub-ranges.
+//  rowstore_partition_cursor[]/vecstore_partition_cursor[] (kernel/
+//  rowstore.c, kernel/vecstore.c) are the one genuinely new piece of state
+//  this phase needs to survive a reboot correctly -- without it, a restored
+//  boot would forget how far each partition's own sub-range had already
+//  been consumed and could re-issue an already-live page_id. Placed after
+//  the last existing region (not squeezed into any approximate mid-layout
+//  gap) for the same reason every prior addition to this file picked the
+//  end of the list: no risk of miscalculating an existing region's exact
+//  frame count. Deliberately reuses PERSIST_ROWSTORE_HDR/VECSTORE_HDR's own
+//  existing header frame (the v2 field, previously always 0) as a one-way
+//  format-version marker rather than adding two more header frames --
+//  PERSIST_STORAGE_ISOLATION_PHASE3_MARK in that field means "this snapshot
+//  was written by Phase-3-aware code and the array at the LBA below is
+//  real"; its absence (any snapshot from before this phase) means restore
+//  correctly falls back to each partition's cold-start sub-range start
+//  instead of trusting whatever raw bytes happen to sit at a LBA nothing
+//  ever wrote before. One-way format change, no migration path for a
+//  pre-Phase-3 image's row/vector page ownership -- same accepted trade-off
+//  this codebase's own prior one-way format changes documented explicitly
+//  (e.g. SQL Feature-Parity Roadmap Phase 4's row-width change).
+//
+//  LBA 6816  PERSIST_ROWSTORE_PARTCURSOR_LBA  1 frame — rowstore_partition_cursor[16] (64 B)
+//  LBA 6824  PERSIST_VECSTORE_PARTCURSOR_LBA  1 frame — vecstore_partition_cursor[16] (64 B)
+//  (end LBA 6832 — comfortably clear of STREAM_DIR_LBA 8192)
 
 #define PERSIST_CAT_HDR_LBA   1024ULL
 #define PERSIST_CAT_ENT_LBA   1032ULL
@@ -177,6 +203,15 @@
 
 #define PERSIST_TENANT_HDR_LBA 6784ULL
 #define PERSIST_TENANT_ENT_LBA 6792ULL
+
+// ─── Storage Isolation Roadmap Phase 3 ──────────────────────────────────────
+#define PERSIST_ROWSTORE_PARTCURSOR_LBA 6816ULL
+#define PERSIST_VECSTORE_PARTCURSOR_LBA 6824ULL
+
+// One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
+// PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously
+// always 0) -- see the LBA layout comment above for the full reasoning.
+#define PERSIST_STORAGE_ISOLATION_PHASE3_MARK 0x50334C42UL   /* "P3LB" */
 
 // ─── Snapshot magic values ────────────────────────────────────────────────────
 // Distinct per-subsystem so a stale/partial write on one region is detectable.

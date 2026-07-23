@@ -72,6 +72,7 @@ void catalog_after_restore(void) { /* no-op for this test */ }
  * above for the five earlier subsystems. */
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
+uint32_t                   vecstore_partition_cursor[PARTITION_MAX] = {0};
 struct VecIndex             vec_indexes[VEC_INDEX_MAX];
 int vec_index_create(uint32_t caller_uid, const char* index_name,
                      const char* collection_name, VecMetric metric) {
@@ -264,6 +265,18 @@ int row_index_drop(uint32_t caller_uid, const char* index_name) {
 }
 
 int main(void) {
+    /* Storage Isolation Roadmap Phase 3: rowstore_init() must run once
+     * before any allocation, exactly like the real kernel boot sequence
+     * (kernel.c) does -- it's what sets every partition's cursor to its OWN
+     * sub-range start (rowstore_partition_cursor[p] = p * ROWSTORE_PAGES_
+     * PER_PARTITION), which plain BSS-zero does NOT give you for p > 0.
+     * Every scenario below this line through scenario 8 only ever uses
+     * partition 0 (whose sub-range happens to start at 0, so this call
+     * changes nothing observable for them) or partition 12 (quota-only
+     * checks, no page_id range assertions) -- scenario 9 is the first one
+     * that actually depends on this being called. */
+    rowstore_init();
+
     /* ── Scenario 1: create_table validates and computes the right layout ── */
     make_employees_table();
     CHECK(rowstore_create_table("nonexistent") == 1, "scenario 1: creating a row-set table on a nonexistent object fails cleanly");
@@ -356,16 +369,23 @@ int main(void) {
     CHECK(rowstore_row_get(1, "employees", bad_id, NULL) == 3, "scenario 6: out-of-range page_id in a RowId rejected (3)");
 
     /* ── Scenario 7: page pool exhaustion, forced deterministically rather
-     * than by actually allocating a quarter million pages. ──────────────── */
+     * than by actually allocating a quarter million pages.
+     *
+     * Storage Isolation Roadmap Phase 3: rowstore_alloc_page()'s pool-
+     * exhaustion check is now per-partition (rowstore_partition_cursor[]),
+     * not the flat rowstore_next_free_page_id high-water mark -- so this
+     * scenario now forces partition 0's ("tiny" defaults to partition_id 0,
+     * object_catalog[] is zeroed by make_employees_table()) own sub-range
+     * cursor to its range_end instead. ─────────────────────────────────── */
     make_employees_table();
     strcpy(object_catalog[0].name, "tiny");
     object_catalog[0].object_id = 0xE402;
     rowstore_create_table("tiny");
-    uint32_t saved_cursor = rowstore_next_free_page_id;
-    rowstore_next_free_page_id = ROWSTORE_MAX_PAGES;   /* simulate a full pool */
+    uint32_t saved_cursor = rowstore_partition_cursor[0];
+    rowstore_partition_cursor[0] = ROWSTORE_PAGES_PER_PARTITION;   /* simulate partition 0's own slice being full */
     struct RowValues v7 = row_of(1, "x", 0);
-    CHECK(rowstore_row_insert(1, "tiny", &v7, NULL) == 6, "scenario 7: insert into an empty table with an exhausted page pool fails cleanly (6)");
-    rowstore_next_free_page_id = saved_cursor;   /* restore for the round-trip scenario below */
+    CHECK(rowstore_row_insert(1, "tiny", &v7, NULL) == 6, "scenario 7: insert into an empty table with partition 0's own page sub-range exhausted fails cleanly (6)");
+    rowstore_partition_cursor[0] = saved_cursor;   /* restore for the round-trip scenario below */
 
     /* ── Scenario 7b (Storage Isolation Roadmap Phase 1): rowstore_alloc_
      * page() is now quota-checked via storage_quota.c, keyed on the
@@ -435,6 +455,84 @@ int main(void) {
           "scenario 8: row A's actual data survived the round trip, read via a lazily-restored page from the fake NVMe");
     CHECK(rc_b == 0 && strcmp(out_b.values[0], "43") == 0 && strcmp(out_b.values[1], "dave") == 0,
           "scenario 8: row B's actual data survived the round trip too");
+
+    /* ── Scenario 9 (Storage Isolation Roadmap Phase 3): real per-partition
+     * physical page sub-ranges. Two tables in two different partitions get
+     * pages from disjoint, non-overlapping ranges; one partition's own
+     * slice can run out while a completely different partition is
+     * untouched (real physical isolation, not one shared elastic pool
+     * wearing a quota's name); and the new per-partition cursor array
+     * survives a real persist_rowstore_headers()/persist_restore_all()
+     * round trip via the new PARTCURSOR LBA region and the
+     * PERSIST_STORAGE_ISOLATION_PHASE3_MARK format-version gate. ───────── */
+    memset(&object_catalog[0], 0, sizeof(object_catalog[0]));
+    strcpy(object_catalog[0].name, "partA");
+    object_catalog[0].type       = OBJ_TYPE_DB_TABLE;
+    object_catalog[0].object_id  = 0xA001;
+    object_catalog[0].active     = 1;
+    object_catalog[0].partition_id = 3;
+    memset(&object_schemas[0], 0, sizeof(object_schemas[0]));
+    strcpy(object_schemas[0].fields[0].key, "id");
+    object_schemas[0].fields[0].type   = FIELD_TYPE_UINT64;
+    object_schemas[0].fields[0].active = 1;
+    object_schemas[0].field_count = 1;
+
+    memset(&object_catalog[1], 0, sizeof(object_catalog[1]));
+    strcpy(object_catalog[1].name, "partB");
+    object_catalog[1].type       = OBJ_TYPE_DB_TABLE;
+    object_catalog[1].object_id  = 0xB001;
+    object_catalog[1].active     = 1;
+    object_catalog[1].partition_id = 5;
+    memset(&object_schemas[1], 0, sizeof(object_schemas[1]));
+    strcpy(object_schemas[1].fields[0].key, "id");
+    object_schemas[1].fields[0].type   = FIELD_TYPE_UINT64;
+    object_schemas[1].fields[0].active = 1;
+    object_schemas[1].field_count = 1;
+    object_catalog_count = 2;
+
+    CHECK(rowstore_create_table("partA") == 0, "scenario 9: partA table (partition 3) created");
+    CHECK(rowstore_create_table("partB") == 0, "scenario 9: partB table (partition 5) created");
+
+    struct RowValues one_col; memset(&one_col, 0, sizeof(one_col));
+    one_col.count = 1; strcpy(one_col.values[0], "1");
+
+    struct RowId ridA, ridB;
+    CHECK(rowstore_row_insert(1, "partA", &one_col, &ridA) == 0, "scenario 9: insert into partA succeeds");
+    CHECK(rowstore_row_insert(1, "partB", &one_col, &ridB) == 0, "scenario 9: insert into partB succeeds");
+
+    CHECK(ridA.page_id >= 3 * ROWSTORE_PAGES_PER_PARTITION && ridA.page_id < 4 * ROWSTORE_PAGES_PER_PARTITION,
+          "scenario 9: partA's page_id lands inside partition 3's own reserved sub-range, not anywhere else");
+    CHECK(ridB.page_id >= 5 * ROWSTORE_PAGES_PER_PARTITION && ridB.page_id < 6 * ROWSTORE_PAGES_PER_PARTITION,
+          "scenario 9: partB's page_id lands inside partition 5's own reserved sub-range, not anywhere else");
+    CHECK(ridA.page_id != ridB.page_id, "scenario 9: the two partitions' pages are never the same page_id -- disjoint ranges, not just disjoint by luck");
+
+    /* Force partition 3's own sub-range to look completely full. */
+    rowstore_partition_cursor[3] = 4 * ROWSTORE_PAGES_PER_PARTITION;
+    table_headers[0].rows_in_last_page = table_headers[0].layout.rows_per_page;   /* force "partA needs a new page" */
+    struct RowId ridA2;
+    CHECK(rowstore_row_insert(1, "partA", &one_col, &ridA2) == 6, "scenario 9: partA (partition 3) is denied once its OWN sub-range is exhausted (6)");
+
+    /* Partition 5 must be completely unaffected -- proves this is real
+     * physical isolation, not one shared ceiling with a different name. */
+    table_headers[1].rows_in_last_page = table_headers[1].layout.rows_per_page;   /* force "partB needs a new page" too */
+    struct RowId ridB2;
+    CHECK(rowstore_row_insert(1, "partB", &one_col, &ridB2) == 0, "scenario 9: partB (partition 5) still allocates a fresh page normally -- partition 3's exhaustion has zero effect on it");
+    CHECK(ridB2.page_id >= 5 * ROWSTORE_PAGES_PER_PARTITION && ridB2.page_id < 6 * ROWSTORE_PAGES_PER_PARTITION,
+          "scenario 9: partB's 2nd page is still inside its own sub-range");
+
+    /* ── Persistence round trip for the new per-partition cursor array. ── */
+    persist_catalog();           /* real function -- keeps the catalog snapshot consistent with table_headers[] below */
+    persist_rowstore_headers();  /* real function -- writes table_headers[]/rowstore_next_free_page_id/rowstore_partition_cursor[] + the Phase 3 format mark */
+    uint32_t expected_p3_cursor = rowstore_partition_cursor[3];
+    uint32_t expected_p5_cursor = rowstore_partition_cursor[5];
+
+    rowstore_init();   /* simulate a fresh boot: every partition's cursor resets to its own cold-start sub-range start */
+    CHECK(rowstore_partition_cursor[3] == 3 * ROWSTORE_PAGES_PER_PARTITION,
+          "scenario 9: post-'reboot', pre-restore: partition 3's cursor is back at its cold-start default");
+
+    persist_restore_all();   /* real function -- restores table_headers[]/rowstore_next_free_page_id, and (Phase 3) rowstore_partition_cursor[] since the format mark is present */
+    CHECK(rowstore_partition_cursor[3] == expected_p3_cursor, "scenario 9: partition 3's page cursor survived a real persist/restore round trip");
+    CHECK(rowstore_partition_cursor[5] == expected_p5_cursor, "scenario 9: partition 5's page cursor survived the same round trip, independently");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

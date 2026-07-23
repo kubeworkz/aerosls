@@ -18,6 +18,10 @@
 
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
+// Storage Isolation Roadmap Phase 3: per-partition page sub-range cursors --
+// see vecstore.h's header comment for the full design. Initialized by
+// vecstore_init() below.
+uint32_t                   vecstore_partition_cursor[PARTITION_MAX];
 
 // RAM-cached page pointers -- NULL = not resident this boot. Gap
 // Remediation Phase D: this is no longer purely RAM-only (see vecstore.h's
@@ -66,24 +70,33 @@ static int find_active_collection(const char* name) {
 // alloc_page() now is -- both subsystems share ONE combined per-partition
 // page budget via storage_quota.c (identical 4 KiB page size), so this and
 // rowstore_alloc_page() are simply the two callers into that one shared
-// accounting layer. Denial happens before the cursor advances or any RAM
+// accounting layer. Denial happens before either cursor advances or any RAM
 // frame is touched.
+//
+// Storage Isolation Roadmap Phase 3: the pool-exhaustion check is now per-
+// partition, not global -- mirrors rowstore_alloc_page()'s own Phase 3
+// rewrite exactly (see that function's header comment for the full
+// reasoning, which applies here unchanged): partition_id's own reserved
+// sub-range, real physical isolation instead of one shared elastic pool.
 static uint32_t vecstore_alloc_page(uint32_t partition_id) {
-    if (vecstore_next_free_page_id >= VECSTORE_MAX_PAGES) return VECSTORE_INVALID_PAGE;
+    if (partition_id >= PARTITION_MAX) return VECSTORE_INVALID_PAGE;   // fail closed, same posture as storage_quota.c
+    uint32_t range_end = (partition_id + 1) * VECSTORE_PAGES_PER_PARTITION;
+    if (vecstore_partition_cursor[partition_id] >= range_end) return VECSTORE_INVALID_PAGE;   // this partition's own slice is full
     if (storage_page_reserve(partition_id)) return VECSTORE_INVALID_PAGE;   // over quota -- fail cleanly, cursor untouched
-    uint32_t id = vecstore_next_free_page_id;
+    uint32_t id = vecstore_partition_cursor[partition_id];
 
     uint8_t* frame = (uint8_t*)allocate_physical_ram_frame();
     if (!frame) {
         storage_page_release(partition_id, 1);   // roll back the reservation -- this page never actually happened
-        return VECSTORE_INVALID_PAGE;   // don't advance the cursor on failure
+        return VECSTORE_INVALID_PAGE;   // don't advance either cursor on failure
     }
     vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
     uint32_t invalid = VECSTORE_INVALID_PAGE;
     vs_memcpy(frame, &invalid, 4);
     vec_pages[id] = frame;
 
-    vecstore_next_free_page_id++;
+    vecstore_partition_cursor[partition_id]++;
+    if (id + 1 > vecstore_next_free_page_id) vecstore_next_free_page_id = id + 1;   // keep the global high-water mark accurate
     return id;
 }
 
@@ -153,6 +166,12 @@ void vecstore_init(void) {
     vs_memset(vector_collections, 0, sizeof(vector_collections));
     vs_memset(vec_pages, 0, sizeof(vec_pages));
     vecstore_next_free_page_id = 0;
+    // Storage Isolation Roadmap Phase 3: each partition's cursor starts at
+    // the beginning of its OWN sub-range -- cold-start default, overwritten
+    // by persist.c's restore block if a real Phase-3-format snapshot exists.
+    for (uint32_t p = 0; p < PARTITION_MAX; p++) {
+        vecstore_partition_cursor[p] = p * VECSTORE_PAGES_PER_PARTITION;
+    }
     kernel_serial_print("[VECSTORE] Vector store engine initialised.\n");
 }
 

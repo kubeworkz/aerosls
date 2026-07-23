@@ -118,6 +118,7 @@ uint32_t kernel_get_current_thread_id(void) { return 1; }
 void vecstore_notify_object_freed(const char* collection_name) { (void)collection_name; }
 struct VecCollectionHeader vector_collections[VECSTORE_MAX_COLLECTIONS];
 uint32_t                   vecstore_next_free_page_id = 0;
+uint32_t                   vecstore_partition_cursor[PARTITION_MAX] = {0};
 struct VecIndex            vec_indexes[VEC_INDEX_MAX];
 int vec_index_create(uint32_t caller_uid, const char* index_name,
                      const char* collection_name, VecMetric metric) {
