@@ -31,7 +31,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/vec_schema_export_import_host_test \
  *       tests/vec_schema_export_import_host_test.c \
- *       kernel/vec_index.c kernel/vecstore.c
+ *       kernel/vec_index.c kernel/vecstore.c kernel/storage_quota.c
  *   /tmp/vec_schema_export_import_host_test
  */
 #include "kernel/object_catalog.h"

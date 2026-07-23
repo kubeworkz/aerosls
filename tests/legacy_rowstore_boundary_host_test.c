@@ -46,7 +46,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/legacy_rowstore_boundary_host_test tests/legacy_rowstore_boundary_host_test.c \
- *       kernel/object_catalog.c kernel/rowstore.c kernel/group_profile.c \
+ *       kernel/object_catalog.c kernel/rowstore.c kernel/storage_quota.c kernel/group_profile.c \
  *       kernel/authlist.c kernel/security_audit.c kernel/database.c
  *   /tmp/legacy_rowstore_boundary_host_test
  *

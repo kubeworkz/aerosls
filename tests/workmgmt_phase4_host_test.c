@@ -35,6 +35,7 @@
  * Identical set to scheduler_fairness_host_test.c's own stubs — see that
  * file's header comment for why each one is safe to fake here. */
 void kernel_serial_print(const char* s) { (void)s; }
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void* allocate_physical_ram_frame(void) { return (void*)0x1000; }
 uint64_t loader_load_into_process(const char* object_name, uint64_t base_vaddr, uint64_t* pml4, uint32_t partition_id) {

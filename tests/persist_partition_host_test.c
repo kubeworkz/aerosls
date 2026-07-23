@@ -104,6 +104,7 @@ void vec_index_notify_insert(uint32_t caller_uid, const char* collection_name,
  * call these purely for diagnostic serial output, no test-relevant
  * behavior depends on them. */
 void kernel_serial_print(const char* s) { (void)s; }
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
 // Query-Surface Roadmap Phase 5: kernel/view.c's view_drop() calls catalog_get_role()
 // for its owner-or-kernel permission gate (same call view.c's own header comment
 // says mirrors database_drop()'s). This test has no interest in role semantics --

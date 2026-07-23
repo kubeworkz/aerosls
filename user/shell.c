@@ -28,6 +28,7 @@
 #include "../kernel/vec_index.h"  // Gap Remediation Phase C -- SYS_SLS_VEC_INDEX_CREATE/SEARCH
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- SYS_SLS_PARTITION_CREATE/ASSIGN/LIST/DESTROY/PAUSE/RESUME
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- SYS_SLS_PARTITION_QUOTA_SET/QUOTA_LIST
+#include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- group profiles
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- database create/drop/list/grant/check
@@ -337,6 +338,10 @@ static void print_help(void) {
         "  partition resume <partition_id>          resume scheduling this partition\n"
         "  partition quota <partition_id> <frames>  set a frame quota (0=unlimited)\n"
         "  partition quotas                         list per-partition usage/quota\n"
+        "  partition cpuweight set <id> <weight>    set CPU scheduling weight (0=default 1)\n"
+        "  partition cpuweights                     list per-partition CPU weights\n"
+        "  partition storagequota set <id> <pages>  set on-disk page quota, rowstore+vecstore combined (0=unlimited)\n"
+        "  partition storagequotas                  list per-partition on-disk page usage/quota\n"
         "  partition migrate <partition_id> <dest_node_id>  cold-migrate ownership to\n"
         "                                            another node (Multi-Node Phase 6;\n"
         "                                            pauses, hands off, reclaims frames --\n"
@@ -1226,6 +1231,42 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
         else if (sh_eq(input_buffer, "partition quotas")) {
             do_syscall(SYS_SLS_PARTITION_QUOTA_LIST, 0);
+        }
+        // ── Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: weighted
+        // CPU scheduling ─────────────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "partition cpuweight set ")) {
+            struct SLSPartitionCpuWeightSetRequest req;
+            const char* p = input_buffer + 24;
+            char pidtok[16], wtok[16];
+            p = sh_token(p, pidtok, sizeof(pidtok));
+            sh_token(p, wtok, sizeof(wtok));
+            req.partition_id = sh_atoi(pidtok);
+            req.weight        = (uint32_t)sh_atoi(wtok);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_CPU_WEIGHT_SET, &req);
+            kernel_serial_printf("[PARTITION] cpuweight partition=%u weight=%u -> %s\n",
+                                 req.partition_id, req.weight,
+                                 rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_eq(input_buffer, "partition cpuweights")) {
+            do_syscall(SYS_SLS_PARTITION_CPU_WEIGHT_LIST, 0);
+        }
+        // ── Storage Isolation Roadmap Phase 1: per-partition on-disk page
+        // quota (rowstore+vecstore combined) ────────────────────────────────
+        else if (sh_starts(input_buffer, "partition storagequota set ")) {
+            struct SLSPartitionStorageQuotaSetRequest req;
+            const char* p = input_buffer + 27;
+            char pidtok[16], qtok[24];
+            p = sh_token(p, pidtok, sizeof(pidtok));
+            sh_token(p, qtok, sizeof(qtok));
+            req.partition_id = sh_atoi(pidtok);
+            req.page_quota    = (uint64_t)sh_atoi(qtok);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_STORAGE_QUOTA_SET, &req);
+            kernel_serial_printf("[PARTITION] storagequota partition=%u pages=%llu -> %s\n",
+                                 req.partition_id, (unsigned long long)req.page_quota,
+                                 rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_eq(input_buffer, "partition storagequotas")) {
+            do_syscall(SYS_SLS_PARTITION_STORAGE_QUOTA_LIST, 0);
         }
 
         // ── Vector Store Roadmap Phase 4: vec create/insert/embed-insert/

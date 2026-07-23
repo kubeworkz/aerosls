@@ -118,6 +118,20 @@ struct SLSProcPrioritySetRequest {
     uint32_t priority;   // ProcPriority value; validated in process_priority_set()
 };
 
+// Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: weighted
+// per-partition CPU scheduling. 273/274 are the next free numbers after
+// usage_metering.h's SYS_SLS_USAGE_REPORT = 272 -- confirmed via a fresh
+// grep across every kernel/*.h and net/*.h SYS_SLS_* define before picking
+// these, matching this codebase's own "reconfirm the next free number at
+// implementation time" convention.
+#define SYS_SLS_PARTITION_CPU_WEIGHT_SET  273
+#define SYS_SLS_PARTITION_CPU_WEIGHT_LIST 274
+
+struct SLSPartitionCpuWeightSetRequest {
+    uint32_t partition_id;
+    uint32_t weight;   // 0 = reset to the default (1); validated in partition_set_cpu_weight()
+};
+
 // ─── Syscall argument for process creation ────────────────────────────────────
 struct ProcCreateRequest {
     char     object_name[PROC_NAME_LEN];  // name of the SERVICE_PROCESS SLS object
@@ -171,6 +185,45 @@ int process_release(uint32_t pid);
 int process_priority_set(uint32_t pid, ProcPriority priority);
 
 uint64_t sys_sls_proc_priority_set(struct SLSProcPrioritySetRequest* req);
+
+// ─── Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: weighted
+// per-partition CPU scheduling ─────────────────────────────────────────────
+// LPAR Phase 12 built round-robin partition fairness deliberately scoped to
+// "starvation prevention," not proportional fairness -- every partition
+// gets an equal number of turns regardless of weight. This closes that gap
+// with a real, if simple, weighted-round-robin mechanism: pick_next_
+// partition() (process.c) grants a partition `weight` CONSECUTIVE turns
+// (as long as it still has runnable work) before rotating to the next
+// candidate in the ring, instead of always rotating after exactly one turn.
+// A partition's weight defaults to 1 (BSS-zero-init on partition_cpu_weight[]
+// means "unset", interpreted as 1, the same "0 means the neutral/default
+// case" idiom partition_set_frame_quota() uses for "0 = unlimited") -- so a
+// deployment that never calls partition_set_cpu_weight() at all reduces,
+// by construction, to the exact pre-existing round-robin behavior, not an
+// approximation of it. This is a burst-style weighted round robin (a
+// weight-3 partition gets 3 turns in a row, then yields), not a smooth
+// proportional/CFS-style interleave -- named honestly as the simpler of the
+// two, matching this whole roadmap's "groundwork, not a hypervisor"
+// posture (see partition.h's own top-of-file comment) the same way LPAR
+// Phase 12 itself was honest about not building full weighted fair
+// queueing.
+//
+// Sets partition_id's CPU scheduling weight. Returns 0 on success, 1 if
+// partition_id is out of range ([0, PARTITION_MAX)). Does not validate that
+// partition_id was actually partition_create()'d -- mirrors partition_set_
+// frame_quota()'s own "never fails, every id maps to something" posture,
+// since a weight can usefully be pre-configured before a partition exists.
+int partition_set_cpu_weight(uint32_t partition_id, uint32_t weight);
+
+// Introspection. Returns 1 (the default weight) for an out-of-range
+// partition_id or one that was never explicitly configured -- deliberately
+// NOT a sentinel-style "invalid" value the way partition_get_frame_quota()
+// uses 0xFFFF...F, since 1 IS the honest, correct answer for "what weight
+// does this partition currently schedule at" in both cases.
+uint32_t partition_get_cpu_weight(uint32_t partition_id);
+
+uint64_t sys_sls_partition_cpu_weight_set(struct SLSPartitionCpuWeightSetRequest* req);
+void     sys_sls_partition_cpu_weight_list(void);
 
 // Spawn a Ring-3 process from an OBJ_TYPE_PROGRAM catalog object.
 // Identical pipeline to process_create() but accepts PROGRAM type,

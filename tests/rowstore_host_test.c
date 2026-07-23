@@ -24,13 +24,14 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/rowstore_host_test \
- *       tests/rowstore_host_test.c kernel/rowstore.c kernel/persist.c kernel/view.c
+ *       tests/rowstore_host_test.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/view.c
  *   /tmp/rowstore_host_test
  */
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "kernel/rowstore.h"
+#include "kernel/storage_quota.h"
 #include "kernel/vecstore.h"
 #include "kernel/vec_index.h"
 #include "kernel/row_index.h"
@@ -365,6 +366,30 @@ int main(void) {
     struct RowValues v7 = row_of(1, "x", 0);
     CHECK(rowstore_row_insert(1, "tiny", &v7, NULL) == 6, "scenario 7: insert into an empty table with an exhausted page pool fails cleanly (6)");
     rowstore_next_free_page_id = saved_cursor;   /* restore for the round-trip scenario below */
+
+    /* ── Scenario 7b (Storage Isolation Roadmap Phase 1): rowstore_alloc_
+     * page() is now quota-checked via storage_quota.c, keyed on the
+     * INSERTING table's real object_catalog[idx].partition_id -- not a
+     * stand-in, the actual field this test's "tiny" table already carries.
+     * Denial happens before the page pool cursor advances or any RAM frame
+     * is touched, distinct from scenario 7's pool-exhaustion path above. ── */
+    object_catalog[0].partition_id = 12;   /* "tiny" table's owning partition, for this scenario only */
+    CHECK(storage_get_page_usage(12) == 0, "scenario 7b: partition 12 starts with no on-disk page usage");
+    CHECK(storage_set_page_quota(12, 1) == 0, "scenario 7b: partition 12's combined rowstore+vecstore page quota set to 1");
+    struct RowValues v7b_a = row_of(2, "y", 0);
+    CHECK(rowstore_row_insert(1, "tiny", &v7b_a, NULL) == 0, "scenario 7b: the 1st insert into 'tiny' (still empty since scenario 7's earlier attempt never got past the pool-exhaustion check) succeeds -- exactly at partition 12's quota of 1");
+    CHECK(storage_get_page_usage(12) == 1, "scenario 7b: storage_quota.c's own counter reflects the 1 page this insert actually consumed");
+    /* Force "this page is now full" directly (same direct-state-manipulation
+     * technique scenario 7 above already uses for rowstore_next_free_page_id)
+     * rather than actually inserting 53 rows, so the NEXT insert genuinely
+     * needs a fresh page -- and therefore a fresh quota-checked reservation. */
+    table_headers[0].rows_in_last_page = table_headers[0].layout.rows_per_page;
+    uint32_t cursor_before_denial = rowstore_next_free_page_id;
+    struct RowValues v7b_b = row_of(3, "z", 0);
+    CHECK(rowstore_row_insert(1, "tiny", &v7b_b, NULL) == 6, "scenario 7b: a 2nd insert needing a NEW page is denied (6) -- partition 12 is now over its storage quota, even though the global page pool (scenario 7's separate concern) is nowhere near exhausted");
+    CHECK(rowstore_next_free_page_id == cursor_before_denial, "scenario 7b: the shared bump-allocator cursor did NOT advance on the quota-denied attempt -- denial happens before any side effect, same posture as every other quota boundary check in this project");
+    CHECK(storage_get_page_usage(12) == 1, "scenario 7b: partition 12's usage is UNCHANGED by the denied attempt, not accidentally double-counted or left dangling");
+    CHECK(storage_set_page_quota(12, 0) == 0, "scenario 7b: resetting partition 12 back to unlimited (0) so it doesn't affect any later scenario in this file");
 
     /* ── Scenario 8: restart-simulating round trip — write real rows,
      * flip the persisted uses_rowstore flag via a real persist_catalog()

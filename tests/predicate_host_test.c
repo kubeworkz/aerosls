@@ -21,7 +21,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/predicate_host_test \
- *       tests/predicate_host_test.c kernel/predicate.c kernel/rowstore.c kernel/persist.c kernel/view.c
+ *       tests/predicate_host_test.c kernel/predicate.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/view.c
  *   /tmp/predicate_host_test
  */
 #include "kernel/object_catalog.h"

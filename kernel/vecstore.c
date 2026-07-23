@@ -5,6 +5,7 @@
 #include "vecstore.h"
 #include "object_catalog.h"
 #include "frame_pool.h"
+#include "storage_quota.h"    // Storage Isolation Roadmap Phase 1: per-partition on-disk page quota
 #include "kernel_io.h"
 #include "persist.h"     // Gap Remediation Phase D -- persist_vecstore_headers()
 #include "../user/permissions.h"
@@ -61,12 +62,22 @@ static int find_active_collection(const char* name) {
 // same crash-window trade-off rowstore_alloc_page() already accepts (the
 // page becomes "real" on NVMe only once vecstore_flush_page() is first
 // called on it, matching this file's own new insert-path ordering below).
-static uint32_t vecstore_alloc_page(void) {
+// Storage Isolation Roadmap Phase 1: quota-checked the same way rowstore_
+// alloc_page() now is -- both subsystems share ONE combined per-partition
+// page budget via storage_quota.c (identical 4 KiB page size), so this and
+// rowstore_alloc_page() are simply the two callers into that one shared
+// accounting layer. Denial happens before the cursor advances or any RAM
+// frame is touched.
+static uint32_t vecstore_alloc_page(uint32_t partition_id) {
     if (vecstore_next_free_page_id >= VECSTORE_MAX_PAGES) return VECSTORE_INVALID_PAGE;
+    if (storage_page_reserve(partition_id)) return VECSTORE_INVALID_PAGE;   // over quota -- fail cleanly, cursor untouched
     uint32_t id = vecstore_next_free_page_id;
 
     uint8_t* frame = (uint8_t*)allocate_physical_ram_frame();
-    if (!frame) return VECSTORE_INVALID_PAGE;   // don't advance the cursor on failure
+    if (!frame) {
+        storage_page_release(partition_id, 1);   // roll back the reservation -- this page never actually happened
+        return VECSTORE_INVALID_PAGE;   // don't advance the cursor on failure
+    }
     vs_memset(frame, 0, VECSTORE_PAGE_SIZE);
     uint32_t invalid = VECSTORE_INVALID_PAGE;
     vs_memcpy(frame, &invalid, 4);
@@ -254,7 +265,7 @@ int vecstore_insert(uint32_t caller_uid, const char* collection_name,
 
     if (h->first_page_id == VECSTORE_INVALID_PAGE ||
         h->entries_in_last_page >= h->entries_per_page) {
-        uint32_t new_page = vecstore_alloc_page();
+        uint32_t new_page = vecstore_alloc_page(object_catalog[idx].partition_id);
         if (new_page == VECSTORE_INVALID_PAGE) return 5;
 
         if (h->first_page_id == VECSTORE_INVALID_PAGE) {

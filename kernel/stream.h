@@ -58,6 +58,24 @@ int                stream_list_json(char* buf, int max);
 // Called by http_respond_stream when se->frames[i] is NULL after reboot.
 uint8_t*           stream_lazy_load_frame(struct StreamEntry* se, uint32_t frame_idx);
 
+// Multi-Node Partition Scaling Roadmap Phase 6 addendum ("real migration
+// data movement", Multitenant Isolation Gap Analysis §7 item 7): relocates
+// every active stream slot owned by partition_id to a fresh STREAM_MAX
+// slot, physically copying its on-disk bytes page-by-page (not just
+// reassigning a pointer) and verifying each page by reading the
+// destination back and comparing it against the source before retiring the
+// original slot. "dest_node_id" is accepted but not yet load-bearing --
+// AeroSLS has exactly one shared NVMe image and no real second node's
+// storage exists in any deployment today (cluster_init() is never called
+// from a real boot path), so "destination" honestly means a fresh slot
+// within the same shared pool, not a different machine. See stream.c's own
+// header comment on this function for the full rationale. Returns the
+// count of slots successfully relocated; a short count relative to the
+// partition's total active-slot count means relocation stopped partway
+// (out of free slots, or a copy/verify failure) and should be treated as a
+// partial, not total, migration.
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id);
+
 extern struct StreamEntry stream_store[STREAM_MAX];
 
 #endif /* STREAM_H */

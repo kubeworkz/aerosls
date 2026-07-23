@@ -16,6 +16,7 @@
 #include "object_catalog.h"
 #include "frame_pool.h"
 #include "../net/consensus.h"   // Multi-Node Partition Scaling Roadmap Phase 2 -- cluster_local_node_id()
+#include "stream.h"              // Multi-Node Phase 6 addendum -- stream_relocate_partition() (real migration data movement)
 
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
@@ -345,21 +346,31 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // dispatcher exists anywhere in this codebase to receive one).
     int lease_existed = (partition_lease_step_down(partition_id) == 0);
 
-    // Step 3 (Multi-Node Phase 5) -- deliberately NOT called here, named
-    // rather than silently skipped. net/dspp.c's dspp_page_read_allowed()/
+    // Step 3 (Multi-Node Phase 5): net/dspp.c's dspp_page_read_allowed()/
     // _write_allowed() are per-packet GATING checks ("should this request be
     // serviced right now"), not an object-catalog reassignment mechanism --
     // there is no function anywhere in net/dspp.c that moves or retags a
     // catalog object's partition_id, because no object-to-physical-frame
-    // resolution plumbing exists to move (see dspp.h's own findings
-    // addendum). A partition's catalog objects (kernel/object_catalog.c)
-    // keep their existing object_id/partition_id completely unchanged by a
-    // migrate() call -- Step 4 below, the ownership-table update, is what
-    // makes dspp_page_read_allowed()/_write_allowed() on the NEW owner node
-    // start returning true. This function does not copy or move any object
-    // data; "migration" here means the ownership record moves, consistent
-    // with this whole roadmap's "groundwork, not a hypervisor" posture (see
-    // partition.h's own top-of-file comment).
+    // resolution plumbing exists to move rowstore/vecstore table pages yet
+    // (that is Storage Isolation Roadmap Phase 1's job -- per-partition page
+    // indexing, not yet built -- a real prerequisite dependency, not an
+    // oversight here). A partition's catalog objects (kernel/object_catalog.c)
+    // therefore still keep their existing object_id/partition_id completely
+    // unchanged by a migrate() call -- Step 4 below, the ownership-table
+    // update, is what makes dspp_page_read_allowed()/_write_allowed() on the
+    // NEW owner node start returning true.
+    //
+    // What DOES move now (Multi-Node Phase 6 addendum -- real migration data
+    // movement, Multitenant Isolation Gap Analysis §7 item 7): this
+    // partition's stream/blob storage. stream_relocate_partition()
+    // physically copies each of this partition's stream slots' on-disk
+    // bytes to a fresh slot and verifies every page byte-for-byte before
+    // retiring the original -- the first genuine byte-copy step this
+    // function has ever performed. Scoped to streams only for the reason
+    // above; rowstore/vecstore table data still only moves in the
+    // ownership-record sense described above until Storage Isolation Phase
+    // 1 lands.
+    int streams_relocated = stream_relocate_partition(partition_id, dest_node_id);
 
     // Step 4 (Multi-Node Phase 2): the actual, load-bearing ownership
     // handoff -- a pure table write that already persists internally
@@ -396,10 +407,12 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // named honestly here rather than silently resuming it on the wrong node.
     kernel_serial_printf(
         "[PARTITION] migrated partition %u: node %u -> node %u. Lease "
-        "relinquished=%s, %u physical frame(s) reclaimed. Partition remains "
-        "PAUSED -- resume must happen on the destination node.\n",
+        "relinquished=%s, %d stream(s) relocated and byte-verified, %u "
+        "physical frame(s) reclaimed. Partition remains PAUSED -- resume "
+        "must happen on the destination node.\n",
         (unsigned)partition_id, (unsigned)source_node_id, (unsigned)dest_node_id,
         lease_existed ? "yes" : "no (none was held)",
+        streams_relocated,
         (unsigned)frames_reclaimed);
 
     return 0;

@@ -53,6 +53,13 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_partitions(void) {}
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+/* Multi-Node Phase 6 addendum (real migration data movement, Multitenant
+ * Isolation Gap Analysis §7 item 7) -- stream relocation gets its own
+ * dedicated coverage in tests/migration_data_movement_host_test.c, which
+ * links the real kernel/stream.c; this file stays focused on lease/
+ * ownership orchestration, so this is a permissive "nothing to relocate"
+ * stub, same technique as this file's other dependency stubs above. */
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }
 
 /* Phase 3 frame reclamation -- call-tracking stub, the scheduler_fairness_
  * host_test.c technique the roadmap's own Phase 6 verification plan names. */

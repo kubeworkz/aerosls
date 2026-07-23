@@ -15,7 +15,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/vecstore_search_host_test tests/vecstore_search_host_test.c \
- *       kernel/vecstore.c kernel/vec_index.c
+ *       kernel/vecstore.c kernel/storage_quota.c kernel/vec_index.c
  *   /tmp/vecstore_search_host_test
  *
  * Gap Remediation Phase D note: this link line was missing kernel/vec_

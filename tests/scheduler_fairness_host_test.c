@@ -40,6 +40,7 @@
  * (process.c includes those same headers, so a mismatch would be a
  * compile error, not a silent bug). */
 void kernel_serial_print(const char* s) { (void)s; }
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void* allocate_physical_ram_frame(void) { return (void*)0x1000; }
 uint64_t loader_load_into_process(const char* object_name, uint64_t base_vaddr, uint64_t* pml4, uint32_t partition_id) {
@@ -292,6 +293,78 @@ int main(void) {
      * it should succeed, not fail. */
     CHECK(partition_destroy(tid) == 0, "scenario 7: destroying the reused slot (now 'tenant-b') succeeds -- it's a real, active partition again");
     CHECK(partition_destroy(tid) == 1, "scenario 7: destroying it a SECOND time (now truly empty, nothing occupies the slot) fails cleanly -- not a double-free crash");
+
+    /* ── Scenario 8 (Multitenant Isolation Gap Analysis §5/§7 item 8): weighted
+     * CPU scheduling. Real partition_set_cpu_weight()/partition_get_cpu_weight()
+     * and the modified pick_next_partition() (all linked as real source, not
+     * stubs). Partition 2 gets weight=3, partition 5 stays at the implicit
+     * default weight=1 -- confirm partition 2 receives exactly 3x partition
+     * 5's consecutive turns, deterministically, over whole rounds. ────────── */
+    for (int i = 0; i < PARTITION_MAX; i++) partition_cpu_weight[i] = 0;   /* clean slate -- don't inherit state from any earlier scenario */
+    g_partition_turns_remaining = 0;
+
+    CHECK(partition_get_cpu_weight(2) == 1, "scenario 8: an unconfigured partition reports the default weight of 1");
+    CHECK(partition_set_cpu_weight(2, 3) == 0, "scenario 8: setting partition 2's weight to 3 succeeds");
+    CHECK(partition_get_cpu_weight(2) == 3, "scenario 8: partition 2 now reports weight 3");
+    CHECK(partition_set_cpu_weight(PARTITION_MAX, 5) == 1, "scenario 8: setting a weight on an out-of-range partition id fails cleanly");
+    CHECK(partition_get_cpu_weight(PARTITION_MAX) == 1, "scenario 8: an out-of-range partition id reads back as the safe default (1), never a garbage/OOB value");
+
+    reset_proc_table();
+    add_runnable(0, 900, 2);   /* partition 2: weight 3 */
+    add_runnable(1, 901, 5);   /* partition 5: weight 1 (default) */
+
+    int turns_a = 0, turns_b = 0;
+    int cur8 = 0;
+    uint32_t lastp8 = 5;   /* start "as if" partition 5 just ran, so the first rotation search is unbiased toward partition 2 */
+    for (int tick = 0; tick < 16; tick++) {
+        uint32_t chosen8;
+        int found8 = pick_next_partition(lastp8, &chosen8);
+        CHECK(found8, "scenario 8: a runnable partition is always found across all 16 ticks");
+        if (!found8) break;
+        int idx8 = pick_next_process_in_partition(chosen8, cur8);
+        if (idx8 < 0) idx8 = cur8;   /* single process per partition -- pick_next_process_in_partition legitimately returns -1 here; reuse the known slot */
+        if (chosen8 == 2) turns_a++; else if (chosen8 == 5) turns_b++;
+        cur8 = idx8;
+        lastp8 = chosen8;
+    }
+    printf("   (scenario 8 tallies over 16 ticks: partition 2 (weight 3) turns=%d, partition 5 (weight 1) turns=%d)\n", turns_a, turns_b);
+    CHECK(turns_a + turns_b == 16, "scenario 8: every tick landed on one of the two configured partitions");
+    CHECK(turns_a == 3 * turns_b, "scenario 8: partition 2 (weight 3) gets exactly 3x partition 5's (weight 1) consecutive turns, deterministically");
+
+    /* Reset back to weight=0 (default) confirms the "0 == reset to default" convention. */
+    CHECK(partition_set_cpu_weight(2, 0) == 0, "scenario 8: setting weight to 0 succeeds (0 == reset to default)");
+    CHECK(partition_get_cpu_weight(2) == 1, "scenario 8: after resetting to 0, partition 2 reads back as the default weight 1");
+    for (int i = 0; i < PARTITION_MAX; i++) partition_cpu_weight[i] = 0;   /* leave clean for any future scenario */
+    g_partition_turns_remaining = 0;
+
+    /* ── Scenario 9: re-run Scenario 1's exact flow now that the weighted-
+     * scheduling code path exists, proving the default-weight-everywhere case
+     * is byte-for-byte unchanged (g_partition_turns_remaining never becomes
+     * nonzero when every partition is at the implicit default weight 1). ─── */
+    reset_proc_table();
+    add_runnable(0, 100, PARTITION_SYSTEM);
+    add_runnable(1, 101, PARTITION_SYSTEM);
+    add_runnable(2, 102, PARTITION_SYSTEM);
+    add_runnable(3, 103, PARTITION_SYSTEM);
+    add_runnable(4, 104, PARTITION_SYSTEM);
+    add_runnable(5, 200, 7);
+    int partition_turns9[2] = {0, 0};
+    int current_idx9 = 0;
+    uint32_t last_partition9 = PARTITION_SYSTEM;
+    for (int tick = 0; tick < 20; tick++) {
+        uint32_t chosen9;
+        int found9 = pick_next_partition(last_partition9, &chosen9);
+        if (!found9) break;
+        int next_idx9 = pick_next_process_in_partition(chosen9, current_idx9);
+        if (next_idx9 < 0) break;
+        if (chosen9 == PARTITION_SYSTEM) partition_turns9[0]++; else partition_turns9[1]++;
+        current_idx9 = next_idx9;
+        last_partition9 = chosen9;
+    }
+    int diff9 = partition_turns9[0] - partition_turns9[1];
+    if (diff9 < 0) diff9 = -diff9;
+    CHECK(diff9 <= 1, "scenario 9: with no weights configured anywhere, behavior reproduces scenario 1's fair (not proportional) split exactly");
+    CHECK(g_partition_turns_remaining == 0, "scenario 9: g_partition_turns_remaining never becomes nonzero when every partition sits at the default weight 1 (backward-compatibility guarantee, verified directly)");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

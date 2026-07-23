@@ -16,7 +16,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/row_index_host_test \
- *       tests/row_index_host_test.c kernel/row_index.c kernel/rowstore.c kernel/persist.c kernel/view.c
+ *       tests/row_index_host_test.c kernel/row_index.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/view.c
  *   /tmp/row_index_host_test
  */
 #include "kernel/object_catalog.h"

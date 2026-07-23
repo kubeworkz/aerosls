@@ -19,6 +19,31 @@ static uint32_t next_pid = 100;   // PIDs start above the microkernel service PI
 // resets it, doesn't need a forward declaration.
 static int g_last_index_in_partition[PARTITION_MAX];
 
+// Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: per-partition
+// CPU scheduling weight, 0 = unset/default (interpreted as weight 1) --
+// see process.h's own header comment on partition_set_cpu_weight() for the
+// full design note. BSS zero-init, same "0 is the safe do-nothing default"
+// posture partition_frame_quota[] (frame_pool.c) already established.
+static uint32_t partition_cpu_weight[PARTITION_MAX];
+
+// How many MORE consecutive turns g_last_partition_scheduled is still
+// entitled to before pick_next_partition() must rotate to the next
+// candidate. 0 (its BSS-zero-init value) means "no remaining turns owed" --
+// with every partition at the default weight of 1, this counter is set to
+// (weight - 1) = 0 every time a partition is picked and therefore NEVER
+// becomes nonzero, so the weighted branch below never fires and the
+// original, unweighted round-robin sequence is reproduced exactly.
+static uint32_t g_partition_turns_remaining;
+
+// Effective weight for scheduling purposes: an explicit 0 (never configured,
+// or explicitly reset) reads as the neutral default of 1, never 0 itself --
+// a partition can never be starved to zero turns per sweep by weight alone.
+static uint32_t effective_cpu_weight(uint32_t partition_id) {
+    if (partition_id >= PARTITION_MAX) return 1;
+    uint32_t w = partition_cpu_weight[partition_id];
+    return w == 0 ? 1 : w;
+}
+
 // Virtual address at which user process code is mapped.
 // Must be a canonical user-space address (bit 47 = 0, bits 63:48 = 0).
 // x86-64 canonical user range: 0x0000000000000000 – 0x00007FFFFFFFFFFF.
@@ -391,6 +416,33 @@ static uint32_t g_last_partition_scheduled = PARTITION_SYSTEM;
 // *out_partition on success, 0 if no partition has anything runnable
 // (mirrors the pre-Phase-12 "!next" fallback one level up).
 static int pick_next_partition(uint32_t last_partition, uint32_t* out_partition) {
+    // Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: weighted CPU
+    // scheduling. Before rotating to the NEXT candidate in the ring, first
+    // check whether last_partition itself is still owed consecutive turns
+    // under its configured weight (g_partition_turns_remaining > 0) -- if
+    // so, and it's not paused, and it still has a runnable process, give it
+    // another turn right now instead of moving on. At the default weight
+    // (1, effective_cpu_weight()'s neutral case) g_partition_turns_remaining
+    // is always 0 here, so this branch never fires and the function falls
+    // straight through to the original, unweighted rotation below --
+    // reproducing the pre-existing behavior exactly, not approximately.
+    if (g_partition_turns_remaining > 0 && !partition_is_paused(last_partition)) {
+        for (int i = 0; i < PROC_MAX; i++) {
+            if (proc_table[i].active &&
+                proc_table[i].state == PROC_SUSPENDED &&
+                proc_table[i].kernel_rsp != 0 &&
+                proc_table[i].partition_id == last_partition) {
+                *out_partition = last_partition;
+                g_partition_turns_remaining--;
+                return 1;
+            }
+        }
+        // last_partition has nothing left to run -- it forfeits any
+        // remaining owed turns (they don't carry over to whatever gets
+        // picked next) and the normal rotation below takes over.
+        g_partition_turns_remaining = 0;
+    }
+
     for (uint32_t p = 1; p <= PARTITION_MAX; p++) {
         uint32_t candidate = (last_partition + p) % PARTITION_MAX;
         // Phase 14 (LPAR): a paused partition is skipped entirely, without
@@ -404,6 +456,9 @@ static int pick_next_partition(uint32_t last_partition, uint32_t* out_partition)
                 proc_table[i].kernel_rsp != 0 &&
                 proc_table[i].partition_id == candidate) {
                 *out_partition = candidate;
+                // This turn is turn #1 of candidate's weight-many turns --
+                // it owes (weight - 1) MORE before the next rotation.
+                g_partition_turns_remaining = effective_cpu_weight(candidate) - 1;
                 return 1;
             }
         }
@@ -676,4 +731,37 @@ int process_priority_set(uint32_t pid, ProcPriority priority) {
 uint64_t sys_sls_proc_priority_set(struct SLSProcPrioritySetRequest* req) {
     if (!req) return 1;
     return process_priority_set(req->pid, (ProcPriority)req->priority) == 0 ? 0 : 1;
+}
+
+// ─── Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: weighted
+// per-partition CPU scheduling ─────────────────────────────────────────────
+// See process.h's header comment on these two functions for the full
+// design note (burst-style weighted round robin, weight 0 = default 1).
+int partition_set_cpu_weight(uint32_t partition_id, uint32_t weight) {
+    if (partition_id >= PARTITION_MAX) return 1;
+    partition_cpu_weight[partition_id] = weight;
+    kernel_serial_printf("[SCHED] partition %u: CPU weight set to %u%s\n",
+                         partition_id, weight,
+                         weight == 0 ? " (0 == default weight 1)" : "");
+    return 0;
+}
+
+uint32_t partition_get_cpu_weight(uint32_t partition_id) {
+    return effective_cpu_weight(partition_id);
+}
+
+uint64_t sys_sls_partition_cpu_weight_set(struct SLSPartitionCpuWeightSetRequest* req) {
+    if (!req) return 1;
+    return (uint64_t)partition_set_cpu_weight(req->partition_id, req->weight);
+}
+
+void sys_sls_partition_cpu_weight_list(void) {
+    kernel_serial_print("\n[SCHED] Per-partition CPU scheduling weight:\n");
+    int shown = 0;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        if (partition_cpu_weight[i] == 0) continue;   // still at the unconfigured default -- nothing interesting to report
+        kernel_serial_printf(" partition %u: weight=%u\n", i, partition_cpu_weight[i]);
+        shown++;
+    }
+    kernel_serial_printf(" %d partition(s) with an explicitly configured weight (all others schedule at the default weight of 1).\n\n", shown);
 }

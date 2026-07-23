@@ -362,6 +362,148 @@ uint8_t* stream_lazy_load_frame(struct StreamEntry* se, uint32_t frame_idx) {
     return (uint8_t*)frame;
 }
 
+// ─── stream_relocate_partition ────────────────────────────────────────────────
+// Multi-Node Partition Scaling Roadmap Phase 6 addendum ("real migration
+// data movement", Multitenant Isolation Gap Analysis §7 item 7): the real,
+// previously-nonexistent byte-copy step kernel/partition.c's partition_
+// migrate() explicitly disclaimed until now ("This function does not copy
+// or move any object data"). For every active slot owned by partition_id,
+// physically copies its on-disk bytes (page by page, up to frames_used) to
+// a fresh destination slot within the same STREAM_MAX pool, verifies each
+// page by reading it back and byte-comparing it against what was read from
+// the source, then retires the source slot only after every page verified
+// clean. "A fresh slot in the same pool" rather than "a different
+// machine's storage" is the honest scope here, not a shortcut: AeroSLS has
+// exactly one shared NVMe image, and cluster_init() is never invoked from
+// any real boot path (confirmed by search -- only host tests call it), so
+// there is no second node's physical storage to move bytes onto yet. This
+// is the real, general-purpose relocate-and-verify primitive a future
+// actual cross-machine transport would still need to run on its sending
+// side before putting bytes on a wire this codebase does not have.
+//
+// Deliberately scoped to stream/blob storage only, not rowstore/vecstore
+// table pages: streams already carry a definite owner_uid/partition_id per
+// slot (Multitenant Isolation Gap Analysis §5 item 3) with self-contained,
+// individually relocatable byte ranges, while rowstore.c/vecstore.c have no
+// per-partition page indexing at all yet -- that is Storage Isolation
+// Roadmap Phase 1's job (not yet built), a real prerequisite dependency,
+// not an oversight here.
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) {
+    (void)dest_node_id;  // not yet load-bearing -- see header comment above
+    if (!(io_sq && io_cq)) return 0;  // no NVMe -- nothing to relocate, honest no-op
+
+    static uint8_t __attribute__((aligned(4096))) reloc_src_page[4096];
+    static uint8_t __attribute__((aligned(4096))) reloc_verify_page[4096];
+
+    // Tracks which slots were already used as a RELOCATION DESTINATION this
+    // call. Without this, a stream copied from slot i to a later slot
+    // dst > i would still be sitting there, active, with partition_id still
+    // matching, when the outer loop's index i later reaches dst -- and get
+    // "relocated" a second time (to yet another slot), potentially
+    // ping-ponging a stream back toward a lower-numbered slot including,
+    // worst case, straight back into its own original slot. That bug was
+    // caught by this function's own host test (migration_data_movement_
+    // host_test.c) reporting an inflated relocated count and a stream that
+    // ended up in the exact slot it started in -- this flag is the fix:
+    // once a slot has been written to as a destination in this call, it is
+    // never treated as a fresh source, even though its active flag and
+    // partition_id both now legitimately match.
+    uint8_t already_dst[STREAM_MAX];
+    for (int k = 0; k < STREAM_MAX; k++) already_dst[k] = 0;
+
+    int relocated = 0;
+    for (int i = 0; i < STREAM_MAX; i++) {
+        if (already_dst[i]) continue;
+        struct StreamEntry* src = &stream_store[i];
+        if (!src->active || src->partition_id != partition_id) continue;
+
+        int dst = -1;
+        for (int j = 0; j < STREAM_MAX; j++) {
+            if (j == i || stream_store[j].active) continue;
+            dst = j;
+            break;
+        }
+        if (dst < 0) {
+            kernel_serial_printf(
+                "[STREAM] relocate: no free slot for partition %u's stream "
+                "'%s' -- stopping with %d slot(s) relocated so far.\n",
+                (unsigned)partition_id, src->name, relocated);
+            return relocated;
+        }
+
+        uint64_t src_lba = src->lba_base;
+        uint64_t dst_lba = STREAM_DATA_LBA_BASE
+                          + (uint64_t)dst * STREAM_SECTORS_PER_SLOT;
+        uint32_t pages = src->frames_used;
+        int ok = 1;
+        for (uint32_t p = 0; p < pages; p++) {
+            uint64_t slba = src_lba + (uint64_t)p * 8;
+            uint64_t dlba = dst_lba + (uint64_t)p * 8;
+            if (nvme_read_sync(slba, reloc_src_page) != 0)    { ok = 0; break; }
+            if (nvme_write_sync(dlba, reloc_src_page) != 0)   { ok = 0; break; }
+            if (nvme_read_sync(dlba, reloc_verify_page) != 0) { ok = 0; break; }
+            int match = 1;
+            for (uint32_t b = 0; b < 4096; b++) {
+                if (reloc_src_page[b] != reloc_verify_page[b]) { match = 0; break; }
+            }
+            if (!match) { ok = 0; break; }
+        }
+        if (!ok) {
+            kernel_serial_printf(
+                "[STREAM] relocate: copy/verify failed for partition %u's "
+                "stream '%s' -- source left intact, stopping with %d slot(s) "
+                "relocated so far.\n",
+                (unsigned)partition_id, src->name, relocated);
+            return relocated;
+        }
+
+        // Every page verified byte-for-byte on NVMe -- take over identity in
+        // the destination slot.
+        struct StreamEntry* d = &stream_store[dst];
+        st_strncpy(d->name, src->name, STREAM_NAME_LEN);
+        st_strncpy(d->mime_type, src->mime_type, STREAM_MIME_LEN);
+        d->size          = src->size;
+        d->frames_used   = src->frames_used;
+        d->lba_base      = dst_lba;
+        d->active        = 1;
+        d->owner_uid     = src->owner_uid;
+        d->partition_id  = src->partition_id;
+        for (uint32_t f = 0; f < STREAM_MAX_FRAMES; f++) d->frames[f] = 0;
+        // RAM frame pointers intentionally not copied -- they're a cache of
+        // already-loaded pages, not source-of-truth data. The destination
+        // slot lazily reloads from its own new LBA range the same way any
+        // other slot does, via stream_lazy_load_frame().
+        already_dst[dst] = 1;  // never re-relocate this slot within this same call -- see the flag's own declaration comment above
+
+        kernel_serial_printf(
+            "[STREAM] relocate: partition %u's stream '%s' moved slot %d -> "
+            "%d (%u page(s) copied and verified byte-for-byte).\n",
+            (unsigned)partition_id, src->name, i, dst, pages);
+
+        // Retire the source slot. Any RAM frame pointers it still had cached
+        // are just dropped here, not individually freed -- partition_
+        // migrate()'s own next step (partition_reclaim_all_frames()) reclaims
+        // every physical frame this partition owns via frame_owner[]
+        // tracking, independent of which stream slot referenced them, so
+        // there is no double-free or leak risk in leaving that to the
+        // caller's subsequent step.
+        st_memset(src->name, 0, STREAM_NAME_LEN);
+        st_memset(src->mime_type, 0, STREAM_MIME_LEN);
+        src->size         = 0;
+        src->frames_used  = 0;
+        src->lba_base     = 0;
+        src->active       = 0;
+        src->owner_uid    = 0;
+        src->partition_id = 0;
+        for (uint32_t f = 0; f < STREAM_MAX_FRAMES; f++) src->frames[f] = 0;
+
+        relocated++;
+    }
+
+    if (relocated > 0) stream_persist_directory();
+    return relocated;
+}
+
 // ─── stream_list_json ────────────────────────────────────────────────────────
 int stream_list_json(char* buf, int max) {
     int pos=0;

@@ -27,7 +27,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/vecstore_host_test tests/vecstore_host_test.c \
- *       kernel/vecstore.c kernel/vec_index.c
+ *       kernel/vecstore.c kernel/storage_quota.c kernel/vec_index.c
  *   /tmp/vecstore_host_test
  *
  * Gap Remediation Phase D note: this link line was missing kernel/vec_
@@ -44,6 +44,7 @@
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "kernel/vecstore.h"
+#include "kernel/storage_quota.h"
 #include "user/permissions.h"
 #include <stdio.h>
 #include <string.h>
@@ -309,6 +310,32 @@ int main(void) {
     CHECK(vector_collections[2].unique_external_id == 0, "s14: unique_external_id is back to 0 (off)");
     CHECK(vecstore_insert(1, "unique_test", 7, &u1, &u1id) == 0,
           "s14: external_id=7 (already duplicated twice above) can be inserted again once uniqueness is back off -- turning it off never scans or deletes existing rows");
+
+    /* ── Scenario 15 (Storage Isolation Roadmap Phase 1): vecstore_alloc_
+     * page() is now quota-checked via storage_quota.c, keyed on the
+     * inserting collection's real object_catalog[idx].partition_id -- the
+     * same combined rowstore+vecstore budget rowstore_host_test.c's own new
+     * scenario 7b exercises from the other subsystem. Reuses "wide_vectors"
+     * (dimension=800, entries_per_page=1, scenario 12 above) since every
+     * single insert into it genuinely forces a brand-new page -- no need to
+     * hand-manipulate internal state to force the "next insert needs a
+     * fresh page" condition the way rowstore's own test had to. ─────────── */
+    object_catalog[1].partition_id = 13;   /* "wide_vectors" collection's owning partition, for this scenario only */
+    CHECK(storage_get_page_usage(13) == 0, "s15: partition 13 starts with no on-disk page usage");
+    CHECK(storage_set_page_quota(13, 1) == 0, "s15: partition 13's combined rowstore+vecstore page quota set to 1");
+    struct VecValues wide_d; wide_d.count = 800;
+    for (uint32_t i = 0; i < 800; i++) wide_d.values[i] = (float)i;
+    struct VecId wd;
+    CHECK(vecstore_insert(1, "wide_vectors", 4, &wide_d, &wd) == 0, "s15: an insert needing exactly 1 new page succeeds -- exactly at partition 13's quota of 1");
+    CHECK(storage_get_page_usage(13) == 1, "s15: storage_quota.c's own counter reflects the 1 page this insert actually consumed");
+    uint32_t page_count_before_denial = vector_collections[1].page_count;
+    struct VecValues wide_e; wide_e.count = 800;
+    for (uint32_t i = 0; i < 800; i++) wide_e.values[i] = (float)(i + 1);
+    struct VecId we;
+    CHECK(vecstore_insert(1, "wide_vectors", 5, &wide_e, &we) == 5, "s15: a 2nd insert needing ANOTHER new page is denied (5, vecstore's own 'page allocation failed' code) -- partition 13 is now over its storage quota, even though the global vecstore page pool is nowhere near exhausted");
+    CHECK(vector_collections[1].page_count == page_count_before_denial, "s15: page_count did NOT advance on the quota-denied attempt -- denial happens before any side effect, same posture as every other quota boundary check in this project");
+    CHECK(storage_get_page_usage(13) == 1, "s15: partition 13's usage is UNCHANGED by the denied attempt, not accidentally double-counted or left dangling");
+    CHECK(storage_set_page_quota(13, 0) == 0, "s15: resetting partition 13 back to unlimited (0) so it doesn't affect any later scenario in this file");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

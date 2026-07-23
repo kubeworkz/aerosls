@@ -13,6 +13,7 @@
 #include "../kernel/secure_api.h"
 #include "partition.h"
 #include "frame_pool.h"
+#include "storage_quota.h"   // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
 #include "sql_exec.h"
 #include "vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
 #include "rowstore.h"   // Gap Remediation Phase B -- SYS_SLS_ROWSTORE_CREATE_TABLE
@@ -440,6 +441,18 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // ─── Multitenant Isolation Gap Analysis §5 item 6 / §7 item 6 (272) ──────
     case SYS_SLS_USAGE_REPORT:
         sys_sls_usage_report(); return 0;
+
+    // ─── Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8 (273-274) ──
+    case SYS_SLS_PARTITION_CPU_WEIGHT_SET:
+        return sys_sls_partition_cpu_weight_set((struct SLSPartitionCpuWeightSetRequest*)arg);
+    case SYS_SLS_PARTITION_CPU_WEIGHT_LIST:
+        sys_sls_partition_cpu_weight_list(); return 0;
+
+    // ─── Storage Isolation Roadmap Phase 1 (275-276) ─────────────────────────
+    case SYS_SLS_PARTITION_STORAGE_QUOTA_SET:
+        return sys_sls_partition_storage_quota_set((struct SLSPartitionStorageQuotaSetRequest*)arg);
+    case SYS_SLS_PARTITION_STORAGE_QUOTA_LIST:
+        sys_sls_partition_storage_quota_list(); return 0;
 
     default:
         return 0;

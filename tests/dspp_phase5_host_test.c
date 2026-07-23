@@ -52,6 +52,7 @@ static void add_fake_object(uint64_t object_id, uint32_t partition_id) {
 
 /* ─── Stubs for kernel/partition.c's dependencies (Phase 8/10/14 precedent) ── */
 void kernel_serial_print(const char* s) { (void)s; }
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_partitions(void) { /* Phase 10's persistence hook — irrelevant here */ }
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }

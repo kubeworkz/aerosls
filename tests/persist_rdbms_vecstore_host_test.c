@@ -41,7 +41,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/persist_rdbms_vecstore_host_test \
  *       tests/persist_rdbms_vecstore_host_test.c \
- *       kernel/persist.c kernel/view.c kernel/rowstore.c kernel/row_index.c kernel/mvcc.c \
+ *       kernel/persist.c kernel/view.c kernel/rowstore.c kernel/storage_quota.c kernel/row_index.c kernel/mvcc.c \
  *       kernel/row_constraint.c kernel/row_journal.c kernel/vecstore.c \
  *       kernel/vec_index.c
  *   /tmp/persist_rdbms_vecstore_host_test

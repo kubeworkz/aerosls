@@ -5,6 +5,7 @@
 #include "rowstore.h"
 #include "object_catalog.h"
 #include "frame_pool.h"
+#include "storage_quota.h"    // Storage Isolation Roadmap Phase 1: per-partition on-disk page quota
 #include "kernel_io.h"
 #include "persist.h"
 #include "row_index.h"
@@ -268,12 +269,25 @@ static void rowstore_flush_page(uint32_t page_id) {
 
 // Allocates a brand-new page from the shared bump-allocator pool. No
 // reclaim in this first cut -- see rowstore.h's design comment.
-static uint32_t rowstore_alloc_page(void) {
+//
+// Storage Isolation Roadmap Phase 1: now quota-checked via storage_quota.c's
+// combined rowstore+vecstore per-partition page budget. The check happens
+// FIRST, before the cursor advances or any RAM frame is touched -- same
+// "denial before any side effect" posture as allocate_physical_ram_frame_
+// for_partition(). partition_id comes from the caller (the owning object_
+// catalog entry), not resolved here, matching how every other quota-checked
+// allocator in this codebase takes the id as a parameter rather than
+// re-deriving it.
+static uint32_t rowstore_alloc_page(uint32_t partition_id) {
     if (rowstore_next_free_page_id >= ROWSTORE_MAX_PAGES) return ROWSTORE_INVALID_PAGE;
+    if (storage_page_reserve(partition_id)) return ROWSTORE_INVALID_PAGE;   // over quota -- fail cleanly, cursor untouched
     uint32_t id = rowstore_next_free_page_id;
 
     uint8_t* frame = (uint8_t*)allocate_physical_ram_frame();
-    if (!frame) return ROWSTORE_INVALID_PAGE;   // don't advance the cursor on failure
+    if (!frame) {
+        storage_page_release(partition_id, 1);   // roll back the reservation -- this page never actually happened
+        return ROWSTORE_INVALID_PAGE;   // don't advance the cursor on failure
+    }
     rs_memset(frame, 0, ROWSTORE_PAGE_SIZE);
     uint32_t invalid = ROWSTORE_INVALID_PAGE;
     rs_memcpy(frame, &invalid, 4);
@@ -529,7 +543,7 @@ int rowstore_add_column(uint32_t caller_uid, const char* table_name,
 
         if (migrate_hdr.first_page_id == ROWSTORE_INVALID_PAGE ||
             migrate_hdr.rows_in_last_page >= migrate_hdr.layout.rows_per_page) {
-            uint32_t new_page = rowstore_alloc_page();
+            uint32_t new_page = rowstore_alloc_page(object_catalog[idx].partition_id);
             if (new_page == ROWSTORE_INVALID_PAGE) return 6;
             if (migrate_hdr.first_page_id == ROWSTORE_INVALID_PAGE) {
                 migrate_hdr.first_page_id = new_page;
@@ -596,7 +610,7 @@ int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
 
     if (h->first_page_id == ROWSTORE_INVALID_PAGE ||
         h->rows_in_last_page >= h->layout.rows_per_page) {
-        uint32_t new_page = rowstore_alloc_page();
+        uint32_t new_page = rowstore_alloc_page(object_catalog[idx].partition_id);
         if (new_page == ROWSTORE_INVALID_PAGE) return 6;
 
         if (h->first_page_id == ROWSTORE_INVALID_PAGE) {

@@ -34,6 +34,7 @@
 #include "../kernel/vec_index.h"  // Gap Remediation Phase C -- POST /api/vec/indexes, /api/vec/index/search
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- partition create/list/destroy/assign/pause/resume
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
+#include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- GET /api/partition/storagequotas, POST /api/partition/storagequota
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
@@ -2317,6 +2318,79 @@ static int api_partition_quota_post(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/partition/cpuweights, POST /api/partition/cpuweight ──────────
+// Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8: weighted CPU
+// scheduling. Mirrors api_partition_quotas_list()/api_partition_quota_post()
+// exactly, just reading/writing partition_get_cpu_weight()/partition_set_
+// cpu_weight() (kernel/process.c) instead of the frame-quota pair.
+static int api_partition_cpuweights_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "cpuweights");
+    int first = 1;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        uint32_t weight = partition_get_cpu_weight(i);
+        if (weight == 1) continue;   // still at the unconfigured default -- nothing interesting to report, mirrors sys_sls_partition_cpu_weight_list()'s own skip rule
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", i); jb_putc(&j, ',');
+        jb_uint(&j, "weight", weight);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_partition_cpuweight_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSPartitionCpuWeightSetRequest req;
+    req.partition_id = (uint32_t)json_int(body, "partition_id");
+    req.weight       = (uint32_t)json_int(body, "weight");
+    uint64_t rc = sys_sls_partition_cpu_weight_set(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/partition/storagequotas, POST /api/partition/storagequota ───
+// Storage Isolation Roadmap Phase 1: per-partition on-disk page quota
+// (rowstore+vecstore combined, see storage_quota.h). Mirrors api_partition_
+// quotas_list()/api_partition_quota_post() exactly, just reading/writing
+// storage_get_page_usage()/_quota()/storage_set_page_quota() (kernel/
+// storage_quota.c) instead of the RAM frame-quota pair.
+static int api_partition_storagequotas_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "storagequotas");
+    int first = 1;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        uint64_t usage = storage_get_page_usage(i);
+        uint64_t quota = storage_get_page_quota(i);
+        if (usage == 0 && quota == 0) continue;   // nothing interesting to report, mirrors sys_sls_partition_storage_quota_list()'s own skip rule
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", i); jb_putc(&j, ',');
+        jb_uint(&j, "page_usage", usage); jb_putc(&j, ',');
+        jb_uint(&j, "page_quota", quota);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_partition_storagequota_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSPartitionStorageQuotaSetRequest req;
+    req.partition_id = (uint32_t)json_int(body, "partition_id");
+    req.page_quota   = json_uint64(body, "page_quota");
+    uint64_t rc = sys_sls_partition_storage_quota_set(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/usage — Multitenant Isolation Gap Analysis §5 item 6 /
 // §7 item 6 ──────────────────────────────────────────────────────────────
 // Enumerates every active partition's cumulative usage counters -- reads
@@ -4061,6 +4135,16 @@ static void http_route(int conn, char* req) {
             blen = api_partition_quotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Multitenant Isolation Gap Analysis §5 item 8: GET /api/partition/cpuweights ──
+        if (!strcmp(path, "/api/partition/cpuweights")) {
+            blen = api_partition_cpuweights_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Storage Isolation Roadmap Phase 1: GET /api/partition/storagequotas ──
+        if (!strcmp(path, "/api/partition/storagequotas")) {
+            blen = api_partition_storagequotas_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Multitenant Isolation Gap Analysis §5 item 6: GET /api/usage ───────
         if (!strcmp(path, "/api/usage")) {
             blen = api_usage_report(resp_body, (int)sizeof(resp_body));
@@ -4715,6 +4799,14 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/partition/quota")) {
             blen = api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/cpuweight")) {
+            blen = api_partition_cpuweight_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/storagequota")) {
+            blen = api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2:
