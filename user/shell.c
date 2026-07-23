@@ -32,6 +32,7 @@
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- database create/drop/list/grant/check
 #include "../kernel/tenant.h"          // Multitenant Isolation Gap Analysis §5 item 1 -- tenant create/list
+#include "../kernel/usage_metering.h"  // Multitenant Isolation Gap Analysis §5 item 6 -- usage report
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
@@ -223,6 +224,8 @@ static void print_help(void) {
         "  -- Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2 --\n"
         "  tenant create <name>                        create a partition+database as one unified tenant\n"
         "  tenant list                                  list all tenants\n"
+        "  -- Multitenant Isolation Gap Analysis §5 item 6 / §7 item 6 --\n"
+        "  usage report                                 show per-partition usage metering report\n"
         "  -- Security Audit Log (Navigator-Parity Phase 3) --\n"
         "  audit list                        show the security audit trail\n"
         "  -- Web App Assets (Phase D) --\n"
@@ -817,6 +820,11 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // ── Multitenant Isolation Gap Analysis §5 item 1: tenant list ───────────
         else if (sh_eq(input_buffer, "tenant list")) {
             do_syscall(SYS_SLS_TENANT_LIST, 0);
+        }
+
+        // ── Multitenant Isolation Gap Analysis §5 item 6: usage report ──────────
+        else if (sh_eq(input_buffer, "usage report")) {
+            do_syscall(SYS_SLS_USAGE_REPORT, 0);
         }
 
         // ── Database Namespace & Access Roadmap Phase 4: database drop <name> ──

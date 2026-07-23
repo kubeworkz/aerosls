@@ -7,6 +7,7 @@
 
 extern void tier_mgr_init(void);
 extern void tier_mgr_tick(void);
+extern void usage_metering_tick(void); // Multitenant Isolation Gap Analysis §5 item 6
 
 struct ServiceDescriptor services[MAX_SERVICES];
 uint32_t                 service_count = 0;
@@ -279,6 +280,8 @@ void microkernel_service_poll(void) {
 
     // Periodic tier evaluation: promote hot objects, demote cold ones
     tier_mgr_tick();
+    // Multitenant Isolation Gap Analysis §5 item 6: sample per-partition usage
+    usage_metering_tick();
     // (E) Fire any scheduled agent runs
     agent_scheduler_tick();
 }

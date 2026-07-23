@@ -40,6 +40,7 @@
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- GET /api/security/databases
 #include "../kernel/tenant.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
+#include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
 #include "../kernel/secure_api.h"     // Shell-Command JSON-Promotion Roadmap -- struct SLSSealRequest
@@ -2316,6 +2317,33 @@ static int api_partition_quota_post(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/usage — Multitenant Isolation Gap Analysis §5 item 6 /
+// §7 item 6 ──────────────────────────────────────────────────────────────
+// Enumerates every active partition's cumulative usage counters -- reads
+// partition_table[]/usage_table[] directly, same "read kernel state"
+// idiom as api_tenants_list() below. frames_now is a live gauge (current
+// frame usage), included alongside the two cumulative totals for context,
+// not itself part of the cumulative record -- see usage_metering.h.
+static int api_usage_report(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "partitions");
+    int first = 1;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        if (!partition_table[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", partition_table[i].partition_id); jb_putc(&j, ',');
+        jb_str(&j, "name", partition_table[i].name); jb_putc(&j, ',');
+        jb_uint(&j, "http_requests_total", usage_metering_get_requests(partition_table[i].partition_id)); jb_putc(&j, ',');
+        jb_uint(&j, "frame_ticks_total", usage_metering_get_frame_ticks(partition_table[i].partition_id)); jb_putc(&j, ',');
+        jb_uint(&j, "frames_now", partition_get_frame_usage(partition_table[i].partition_id));
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/tenants — Multitenant Isolation Gap Analysis §5 item 1 /
 // §7 item 2 ──────────────────────────────────────────────────────────────
 // Enumerates defined tenants -- reads tenants[] directly, same "read
@@ -3954,6 +3982,12 @@ static void http_route(int conn, char* req) {
                 http_respond(conn, 429, "application/json", e429, (int)strlen(e429));
                 return;
             }
+            // Multitenant Isolation Gap Analysis §5 item 6 / §7 item 6: record
+            // this request against the caller's partition's cumulative usage
+            // total -- deliberately separate from http_partition_rate_check()'s
+            // own window counter above, which resets and is unsuitable for a
+            // running usage total. See usage_metering.h's own header comment.
+            usage_metering_record_request(get_uid);
         }
         if (!strcmp(path, "/auth/verify")) {
             blen = api_auth_verify(req, resp_body, (int)sizeof(resp_body));
@@ -4025,6 +4059,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/partition/quotas")) {
             blen = api_partition_quotas_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Multitenant Isolation Gap Analysis §5 item 6: GET /api/usage ───────
+        if (!strcmp(path, "/api/usage")) {
+            blen = api_usage_report(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Multitenant Isolation Gap Analysis §5 item 1: GET /api/tenants ─────
@@ -4354,6 +4393,7 @@ static void http_route(int conn, char* req) {
             http_respond(conn, 429, "application/json", e429, (int)strlen(e429));
             return;
         }
+        usage_metering_record_request(req_uid);   // §5 item 6 / §7 item 6 -- see the GET-route site above for the full comment
         if (!strcmp(path, "/api/valloc")) {
             blen = api_valloc_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -4868,6 +4908,7 @@ static void http_route(int conn, char* req) {
             http_respond(conn, 429, "application/json", e429, (int)strlen(e429));
             return;
         }
+        usage_metering_record_request(req_uid);   // §5 item 6 / §7 item 6 -- see the GET-route site above for the full comment
         if (!strcmp(path, "/api/vec/vector")) {
             blen = api_vec_delete(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
