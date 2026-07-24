@@ -2416,6 +2416,49 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/partition/connquotas, POST /api/partition/connquota ─────────
+// Network Fairness Phase 2 (Multitenant Isolation Gap Analysis §19): this
+// mechanism (net/tcp_quota.c) shipped with a syscall and a shell command
+// but no HTTP route, discovered as a gap when the frontend dashboard went
+// looking for it. Mirrors api_partition_cpuweights_list()/_post() exactly,
+// just reading/writing tcp_partition_get_conn_usage()/_quota()/
+// sys_sls_partition_conn_quota_set() (net/tcp_quota.c) instead of the CPU-
+// weight pair. Unlike cpuweight's "1 == default, skip" rule, both usage and
+// quota are meaningful at 0 (0 usage is a normal idle partition, 0 quota is
+// the real "unlimited" default) -- so the skip rule here matches storage-
+// quota's own "skip only if literally nothing to report" shape instead.
+static int api_partition_connquotas_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "connquotas");
+    int first = 1;
+    for (uint32_t i = 0; i < PARTITION_MAX; i++) {
+        uint16_t usage = tcp_partition_get_conn_usage(i);
+        uint16_t quota = tcp_partition_get_conn_quota(i);
+        if (usage == 0 && quota == 0) continue;   // nothing interesting to report, mirrors api_partition_storagequotas_list()'s own skip rule
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", i); jb_putc(&j, ',');
+        jb_uint(&j, "conn_usage", usage); jb_putc(&j, ',');
+        jb_uint(&j, "conn_quota", quota);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_partition_connquota_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
+    struct SLSPartitionConnQuotaSetRequest req;
+    req.partition_id = (uint32_t)json_int(body, "partition_id");
+    req.quota        = (uint16_t)json_int(body, "quota");
+    uint64_t rc = sys_sls_partition_conn_quota_set(&req);
+    jb_obj_open(&j,0);
+    jb_str(&j, "ok", rc == 0 ? "true" : "false");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/usage — Multitenant Isolation Gap Analysis §5 item 6 /
 // §7 item 6 ──────────────────────────────────────────────────────────────
 // Enumerates every active partition's cumulative usage counters -- reads
@@ -4170,6 +4213,11 @@ static void http_route(int conn, char* req) {
             blen = api_partition_storagequotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Network Fairness Phase 2: GET /api/partition/connquotas ────────────
+        if (!strcmp(path, "/api/partition/connquotas")) {
+            blen = api_partition_connquotas_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Multitenant Isolation Gap Analysis §5 item 6: GET /api/usage ───────
         if (!strcmp(path, "/api/usage")) {
             blen = api_usage_report(resp_body, (int)sizeof(resp_body));
@@ -4832,6 +4880,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/partition/storagequota")) {
             blen = api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/partition/connquota")) {
+            blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2:
