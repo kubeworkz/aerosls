@@ -2,6 +2,18 @@
 
 ---
 
+## **0. What's Inside**
+
+Beyond the original single-level-storage object model (catalog, records, streams, programs — covered in the rest of this README), AeroSLS now also has:
+
+- **Multi-tenancy** — a `partition_id` tag enforced at catalog access, process spawn, IPC ports, scheduling, and frame/storage/connection quotas, plus a `tenant create` operation that atomically provisions a partition + a database namespace together. `database`/`group`/`authlist` commands add grantable, RBAC-scoped namespaces and reusable object-permission bundles on top.
+- **Resource isolation** — per-partition RAM frame quotas, weighted CPU scheduling, on-disk storage quotas (with a real, physically-reserved per-partition disk sub-range underneath), and per-partition concurrent-connection quotas (distinct from request-rate limiting).
+- **Real cross-node data movement** — a genuine DSPP wire protocol with Ethernet framing and a receive-side dispatcher (`net/dspp.c`) moves stream/blob data between real, networked kernel instances, not just between local disk slots. `run-two-nodes.sh` (repo root) boots two real QEMU instances pre-wired to test this.
+
+The full shell-command and REST-API reference — including every route mentioned above — lives in **[`docs/COMMANDS.md`](docs/COMMANDS.md)**; this README stays focused on getting a single instance built, booted, and reachable.
+
+---
+
 ## **1. Build & Run Guide**
 
 This section covers everything needed to compile AeroSLS, boot it in QEMU, and connect the Navigator to the live kernel's REST API.
@@ -140,6 +152,18 @@ pkill -f qemu-system-x86_64
 
 ---
 
+### Step 7 (optional): Testing real cross-node data movement
+
+A single instance is single-node by default — `cluster init` (see `docs/COMMANDS.md`) is never called automatically, so `partition migrate` takes the same-disk relocate path unless a real node identity has been set. To test the real DSPP wire protocol between two actual, networked kernel instances instead of one:
+
+```bash
+./run-two-nodes.sh
+```
+
+This builds the ISO once, boots two QEMU instances with separate disk images and their e1000 NICs connected directly to each other, and prints the exact `cluster init <id>` commands to run in each console. See the script's own header comment and `docs/AeroSLS-Multi-Node-Partition-Scaling-Roadmap-v0.1.md`'s Phase 7 addendum for the full mechanism.
+
+---
+
 ## **2. Real Hardware**
 
 AeroSLS boots on any x86-64 machine with an Intel e1000/e1000e NIC (available as a ~$10 PCIe card, or built into many server boards).
@@ -188,6 +212,7 @@ The DHCP client still runs first and wins if a server responds. The static value
 
 ## **3. API Reference**
 
+This is the core object-store surface only — enough to get data in and out of a fresh boot. **Every route, across every feature area (partitions, tenants, databases, storage/CPU/connection quotas, vector store, SQL engine, cluster identity, and more), is documented in [`docs/COMMANDS.md`](docs/COMMANDS.md).**
 
 | Method | Endpoint              | Description                                |
 | ------ | --------------------- | ------------------------------------------ |
@@ -219,6 +244,7 @@ Demo tokens (no real password check):
 | `carol@gridworkz.com` | `DB_ADMIN` | `feedf00dabcdef0112345678deadc0de` |
 | `guest@sandbox.com`   | `GUEST`    | `deadc0de9988776655443322aabbccdd` |
 
+> Creating a partition or a tenant (`POST /api/partitions`, `POST /api/tenants`) requires `DB_ADMIN` or higher — `bob@vance.com`'s `APP_USER` token can read every partition/tenant route but not create one. Every other partition/tenant write route (assign, destroy, pause/resume, quotas) only requires `APP_USER+`, unchanged.
 
 ---
 
