@@ -97,6 +97,40 @@ int cluster_register_peer(uint32_t node_id) {
 uint32_t cluster_local_node_id(void)     { return local_cluster_state.node_id; }
 uint32_t cluster_active_node_count(void) { return local_cluster_state.active_nodes_count; }
 
+// ─── Syscalls: operator-driven node identity configuration ────────────
+// See consensus.h's own header comment on SYS_SLS_CLUSTER_INIT for the
+// full rationale -- this closes the "cluster_init() is never called from
+// any real boot path" gap via a real, live-boot-reachable operator command
+// rather than a boot-time cmdline parser (a valid alternative, not
+// attempted here).
+uint64_t sys_sls_cluster_init(uint32_t node_id) {
+    return (uint64_t)cluster_init(node_id);
+}
+
+static const char* consensus_role_name(enum NodeRole r) {
+    switch (r) {
+        case ROLE_LEADER:    return "LEADER";
+        case ROLE_CANDIDATE: return "CANDIDATE";
+        case ROLE_FOLLOWER:  default: return "FOLLOWER";
+    }
+}
+
+void sys_sls_cluster_status(void) {
+    kernel_serial_printf(
+        "[CONSENSUS] node_id=%u role=%s term=%u active_nodes=%u quorum=%u roster=%u\n",
+        (unsigned)local_cluster_state.node_id,
+        consensus_role_name(local_cluster_state.role),
+        (unsigned)local_cluster_state.current_term,
+        (unsigned)local_cluster_state.active_nodes_count,
+        (unsigned)local_cluster_state.stable_quorum_threshold,
+        (unsigned)cluster_roster_count);
+    if (local_cluster_state.node_id == 0) {
+        kernel_serial_print("[CONSENSUS] node_id 0 means cluster_init() has not been called on this "
+                             "boot -- partition_migrate() will take the same-disk relocate path, "
+                             "not the cross-node DSPP wire path. Run 'cluster init <id>' first.\n");
+    }
+}
+
 // Executed every 10ms by the kernel timer interrupt handler on Core 3
 void check_consensus_heartbeat_tick(void) {
     if (local_cluster_state.role == ROLE_LEADER) {

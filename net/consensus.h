@@ -320,6 +320,41 @@ uint32_t cluster_active_node_count(void);
 void check_consensus_heartbeat_tick(void);
 void trigger_kernel_election_campaign(void);
 
+/* ─── Syscalls: operator-driven node identity configuration ────────────
+ * This header's own comment above (on cluster_init()/cluster_register_
+ * peer()) named the boot-time config-source question as "deliberately NOT
+ * part of this phase" and listed three candidate mechanisms: a command
+ * line arg, an NVMe-persisted config block, a build-time constant. None of
+ * them existed, and neither did any real call to cluster_init() from any
+ * boot path -- confirmed by a repo-wide grep before this addendum, every
+ * existing call site was in a host test file. A real multiboot2 command-line
+ * parser remains a valid, more automatic alternative for a later phase;
+ * this addendum instead closes the gap via the accessor comment's own
+ * forward-looking note two paragraphs up ("a future cluster-status HTTP/
+ * shell surface"): an operator types a real command on a real boot's
+ * serial console and the node's identity genuinely changes, with no ISO
+ * rebuild required to test a different node id. Named as the mechanism
+ * actually built, not silently implied to be the only possible one. */
+#define SYS_SLS_CLUSTER_INIT   279
+#define SYS_SLS_CLUSTER_STATUS 280
+
+/* Thin syscall wrapper over cluster_init() above. arg is the raw node_id,
+ * passed directly rather than via a request struct -- matches sys_sls_
+ * partition_destroy()/_pause()/_resume()'s own single-uint32_t ABI shape
+ * (kernel/partition.c), the established precedent for a syscall that only
+ * ever needs one value. Returns cluster_init()'s own 0 (success) / 1
+ * (rejected -- node_id was 0, the reserved sentinel). */
+uint64_t sys_sls_cluster_init(uint32_t node_id);
+
+/* Prints this node's current identity/role/roster size to the serial
+ * console -- mirrors sys_sls_partition_list()'s own "list/status prints
+ * directly, returns nothing decoded" convention (kernel/partition.c) so a
+ * human operator watching the serial console can confirm cluster_init()
+ * actually took effect. Safe to call before cluster_init() -- reports
+ * node_id 0 (uninitialized), the same BSS-zero-safe default every other
+ * accessor in this file already has. */
+void sys_sls_cluster_status(void);
+
 /* struct DSPPFullPagePacket's forward declaration lives at the very top of
  * this file now -- see the comment there. */
 void process_consensus_packet(struct DSPPFullPagePacket* packet);

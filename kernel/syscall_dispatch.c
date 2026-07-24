@@ -28,6 +28,7 @@
 #include "database.h"      // Database Namespace & Access Roadmap Phase 4 -- SYS_SLS_DATABASE_*
 #include "tenant.h"        // Multitenant Isolation Gap Analysis §5 item 1 -- SYS_SLS_TENANT_*
 #include "usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- SYS_SLS_USAGE_REPORT
+#include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -282,6 +283,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // ── Multi-Node Partition Scaling Roadmap, Phase 6: cold migration (218) ──
     case SYS_SLS_PARTITION_MIGRATE:
         return sys_sls_partition_migrate((struct SLSPartitionMigrateRequest*)arg);
+
+    // ── Multi-Node Partition Scaling Roadmap, Phase 7 addendum: operator-
+    // driven node identity (279-280) -- closes the "cluster_init() is never
+    // called from any real boot path" gap. Single-uint32_t ABI, same shape
+    // as SYS_SLS_PARTITION_DESTROY/_PAUSE/_RESUME above. ─────────────────
+    case SYS_SLS_CLUSTER_INIT:
+        return sys_sls_cluster_init((uint32_t)(uintptr_t)arg);
+    case SYS_SLS_CLUSTER_STATUS:
+        sys_sls_cluster_status(); return 0;
 
     // ── Phase 22: SQL engine, live at last (220) ────────────────────────────
     // The first dispatch-reachable entry point into Phases 19-22's SQL

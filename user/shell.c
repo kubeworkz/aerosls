@@ -38,6 +38,7 @@
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
+#include "../net/consensus.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -347,6 +348,15 @@ static void print_help(void) {
         "                                            another node (Multi-Node Phase 6;\n"
         "                                            pauses, hands off, reclaims frames --\n"
         "                                            leaves it paused, see shell help text)\n"
+        "  partition connquota set <id> <quota>     set max concurrent inbound\n"
+        "                                            connections for a partition (0=unlimited)\n"
+        "  partition connquotas                     list per-partition connection usage/quota\n"
+        "  -- Cluster / cross-node identity (Multi-Node Phase 7 addendum) --\n"
+        "  cluster init <node_id>                   set THIS boot's real node identity\n"
+        "                                            (required before partition migrate\n"
+        "                                            will take the cross-node wire path\n"
+        "                                            instead of the same-disk relocate path)\n"
+        "  cluster status                            print node_id/role/term/roster to serial\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name> <password>      derive+store a password-based key for an\n"
         "                                   object (does NOT encrypt its data -- see\n"
@@ -1216,6 +1226,19 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint64_t rc = do_syscall(SYS_SLS_PARTITION_MIGRATE, &req);
             kernel_serial_printf("[PARTITION] migrate partition=%u -> node=%u -> %s\n",
                                  req.partition_id, req.dest_node_id, rc == 0 ? "OK" : "FAILED");
+        }
+        // ── Multi-Node Partition Scaling Roadmap Phase 7 addendum: operator-
+        // driven node identity. Single-uint32_t arg, same "sh_atoi + cast to
+        // void* via uintptr_t" shape "partition destroy "/"partition pause "
+        // above already established for a one-value syscall. ────────────────
+        else if (sh_starts(input_buffer, "cluster init ")) {
+            uint32_t node_id = sh_atoi(input_buffer + 13);
+            uint64_t rc = do_syscall(SYS_SLS_CLUSTER_INIT, (void*)(uintptr_t)node_id);
+            kernel_serial_printf("[CLUSTER] init node_id=%u -> %s\n", node_id,
+                                 rc == 0 ? "OK" : "FAILED (node_id 0 is reserved)");
+        }
+        else if (sh_eq(input_buffer, "cluster status")) {
+            do_syscall(SYS_SLS_CLUSTER_STATUS, 0);
         }
         else if (sh_starts(input_buffer, "partition quota ")) {
             struct SLSPartitionQuotaSetRequest req;

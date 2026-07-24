@@ -382,6 +382,21 @@ int main(void) {
     check_partition_lease_heartbeat_tick();
     CHECK(transmit_call_count == 1, "check_partition_lease_heartbeat_tick(): exactly one transmission -- only partition 5's LEADER heartbeat, not one per active row");
 
+    /* Scenario 20: sys_sls_cluster_init()/sys_sls_cluster_status() --
+     * Multi-Node Partition Scaling Roadmap Phase 7 addendum. These are thin
+     * syscall wrappers, but this is the first real caller of either outside
+     * consensus.c itself (kernel/syscall_dispatch.c's dispatch cases are
+     * one-line pass-throughs, not independently interesting to test), so
+     * worth confirming directly rather than trusting the wrapper by
+     * inspection alone. */
+    uint64_t src = sys_sls_cluster_init(0);
+    CHECK(src == 1, "sys_sls_cluster_init(0) rejects the reserved sentinel, same as calling cluster_init(0) directly");
+    src = sys_sls_cluster_init(99);
+    CHECK(src == 0, "sys_sls_cluster_init(99) succeeds");
+    CHECK(cluster_local_node_id() == 99, "sys_sls_cluster_init() really flipped this node's real identity to 99 -- not a no-op wrapper");
+    sys_sls_cluster_status();   /* smoke test -- prints to the kernel_serial_printf stub above, nothing to assert on the string itself */
+    CHECK(1, "sys_sls_cluster_status() completed without crashing at node_id=99 (its role/term/roster branch)");
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }
