@@ -1,8 +1,10 @@
 #include "prefetch.h"
 #include "dspp.h"
 #include "../drivers/io_prio.h"
-#include "e1000.h"
 #include "consensus.h"   // Phase 1 (Multi-Node Partition Scaling Roadmap): cluster_local_node_id()
+// Multi-Node Partition Scaling Roadmap Phase 7: this file's send site now
+// goes through dspp_transmit_raw() (net/dspp.c) for real Ethernet framing --
+// e1000.h is no longer included directly here.
 
 extern uint64_t* walk_page_tables(uint64_t virtual_address);
 
@@ -49,7 +51,7 @@ void prefetch_worker_kernel_thread(void) {
 
             // Send packet onto the network. We do NOT block the scheduler here.
             // Core 3 passes the packet and instantly loops to handle other system operations.
-            e1000_transmit_packet(&pf_packet, sizeof(struct DSPPFullPagePacket));
+            dspp_transmit_raw(&pf_packet, sizeof(struct DSPPFullPagePacket));
 
             req->active = 0; // Free the software queue slot
             pf_pipeline.head = (h + 1) % PREFETCH_QUEUE_DEPTH;

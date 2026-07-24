@@ -68,6 +68,30 @@ uint32_t partition_reclaim_all_frames(uint32_t partition_id) { (void)partition_i
 uint32_t cluster_local_node_id(void) { return 0; }
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }
 
+/* Multi-Node Phase 7 addendum (real cross-node data movement): kernel/
+ * stream.c now calls into net/dspp.c's dspp_migrate_send_begin()/_page()
+ * from its new stream_migrate_send_partition() -- dead code from this
+ * test's perspective, since cluster_local_node_id() is stubbed to 0 above,
+ * meaning kernel/partition.c's partition_migrate() always takes the OLD
+ * stream_relocate_partition() branch this file exists to test, never the
+ * new one. net/dspp.c itself is deliberately NOT linked here (it would
+ * pull in object_catalog[]/e1000_transmit_packet()/net_my_mac stubs this
+ * same-disk-relocate-focused test has no interest in) -- permissive no-op
+ * stubs instead, the same judgment call this file's own header comment
+ * already applies to net/consensus.c's real lease machinery. */
+void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+                              uint32_t partition_id, const char* name,
+                              const char* mime_type, uint64_t size,
+                              uint32_t frames_used, uint32_t owner_uid) {
+    (void)transfer_id; (void)node_dest_id; (void)partition_id; (void)name;
+    (void)mime_type; (void)size; (void)frames_used; (void)owner_uid;
+}
+void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
+                             uint32_t partition_id, uint32_t page_index,
+                             const uint8_t* page_data) {
+    (void)transfer_id; (void)node_dest_id; (void)partition_id; (void)page_index; (void)page_data;
+}
+
 uint64_t sys_sls_valloc(struct SLSVallocRequest* req) { (void)req; return 1; }
 uint64_t sys_sls_insert(struct SLSRecordRequest* req) { (void)req; return 0; }
 uint64_t sys_sls_update(struct SLSRecordRequest* req) { (void)req; return 0; }

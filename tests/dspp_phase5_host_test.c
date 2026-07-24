@@ -30,6 +30,7 @@
 #include "kernel/partition.h"
 #include "net/consensus.h"
 #include "net/dspp.h"
+#include "net/net.h"   /* Multi-Node Partition Scaling Roadmap Phase 7 -- MACAddr, for this file's net_my_mac stand-in below */
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -53,6 +54,7 @@ static void add_fake_object(uint64_t object_id, uint32_t partition_id) {
 /* ─── Stubs for kernel/partition.c's dependencies (Phase 8/10/14 precedent) ── */
 void kernel_serial_print(const char* s) { (void)s; }
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
+int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 7 addendum (real cross-node data movement) -- not exercised by this test, permissive "nothing to send" stub, sibling of the stream_relocate_partition() stub above (kernel/partition.c now calls whichever of the two applies depending on cluster_local_node_id()) */
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_partitions(void) { /* Phase 10's persistence hook — irrelevant here */ }
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
@@ -66,6 +68,27 @@ void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t
 }
 static int transmit_call_count = 0;
 void e1000_transmit_packet(void* buf, uint16_t size) { (void)buf; (void)size; transmit_call_count++; }
+
+/* ─── Stubs for net/dspp.c's Phase 7 dependencies ──────────────────────────
+ * This test links the real net/dspp.c (for its Phase 5 routing logic,
+ * process_dspp_page_packet() etc.) which now also contains Phase 7's
+ * dspp_transmit_raw()/dspp_migrate_rx() -- neither exercised by this
+ * routing-focused test, but both compiled into the same object file, so
+ * their own real dependencies (net_my_mac, kernel/stream.c's migrate
+ * receive functions) must still resolve at link time. */
+MACAddr net_my_mac;   /* net/net.c's real global -- not linked here, plain zero-init stand-in is fine since nothing in this test transmits a migrate packet */
+int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
+                               const char* name, const char* mime_type,
+                               uint64_t size, uint32_t frames_used,
+                               uint32_t owner_uid) {
+    (void)transfer_id; (void)partition_id; (void)name; (void)mime_type;
+    (void)size; (void)frames_used; (void)owner_uid;
+    return 1;   /* "no free slot" -- not exercised by this test, permissive-denial stub (kernel/stream.c not linked) */
+}
+int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index, const uint8_t* page_data) {
+    (void)transfer_id; (void)page_index; (void)page_data;
+    return 1;   /* "unknown transfer" -- not exercised by this test */
+}
 
 int main(void) {
     partition_init();

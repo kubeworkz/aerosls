@@ -1,7 +1,10 @@
 #include "consensus.h"
 #include "dspp.h"
 
-#include "e1000.h"
+// Multi-Node Partition Scaling Roadmap Phase 7: every send site in this file
+// now goes through dspp_transmit_raw() (net/dspp.c), which adds the real
+// Ethernet framing this file's own direct e1000_transmit_packet() calls
+// never had -- e1000.h is no longer included directly here.
 #include "../kernel/kernel_io.h"
 
 extern void update_page_table_permissions_globally(uint32_t force_read_only);
@@ -104,7 +107,7 @@ void check_consensus_heartbeat_tick(void) {
         hb_packet.node_source_id = (uint16_t)local_cluster_state.node_id;
         hb_packet.transaction_id = local_cluster_state.current_term;
 
-        e1000_transmit_packet(&hb_packet, sizeof(struct DSPPPacketHeader));
+        dspp_transmit_raw(&hb_packet, sizeof(struct DSPPPacketHeader));
     }
     else {
         // FOLLOWER/CANDIDATE: Track silence threshold
@@ -139,7 +142,7 @@ void trigger_kernel_election_campaign(void) {
 
     kernel_serial_printf("[CONSENSUS] Terms timeout. Node %u campaigning for Term election: %d\n",
                           (unsigned)local_cluster_state.node_id, local_cluster_state.current_term);
-    e1000_transmit_packet(&vote_req, sizeof(struct DSPPFullPagePacket));
+    dspp_transmit_raw(&vote_req, sizeof(struct DSPPFullPagePacket));
 }
 
 // Processing interface extending our existing 'handle_network_rx_interrupt_packet' handler
@@ -174,7 +177,7 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet) {
             reply_msg->vote_granted = 0; // Deny candidate
         }
 
-        e1000_transmit_packet(&reply, sizeof(struct DSPPFullPagePacket));
+        dspp_transmit_raw(&reply, sizeof(struct DSPPFullPagePacket));
     }
 
     else if (packet->header.opcode == DSPP_CMD_VOTE_REPLY && local_cluster_state.role == ROLE_CANDIDATE) {
@@ -287,7 +290,7 @@ void partition_lease_trigger_election(uint32_t partition_id) {
     kernel_serial_printf(
         "[CONSENSUS] partition %u: node %u campaigning for write lease, term %u.\n",
         (unsigned)partition_id, (unsigned)local_cluster_state.node_id, (unsigned)row->term);
-    e1000_transmit_packet(&vote_req, sizeof(struct DSPPFullPagePacket));
+    dspp_transmit_raw(&vote_req, sizeof(struct DSPPFullPagePacket));
 }
 
 int partition_lease_step_down(uint32_t partition_id) {
@@ -336,7 +339,7 @@ void partition_lease_heartbeat_tick(uint32_t partition_id) {
         msg->vote_granted  = 0;
         msg->last_log_index = 0;
 
-        e1000_transmit_packet(&hb_packet, sizeof(struct DSPPFullPagePacket));
+        dspp_transmit_raw(&hb_packet, sizeof(struct DSPPFullPagePacket));
     } else {
         // FOLLOWER/CANDIDATE for this partition: track silence, same
         // 150-tick threshold Phase 1's cluster-wide mechanism uses.
@@ -398,7 +401,7 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) {
             reply_msg->vote_granted = 0;   // Deny candidate
         }
 
-        e1000_transmit_packet(&reply, sizeof(struct DSPPFullPagePacket));
+        dspp_transmit_raw(&reply, sizeof(struct DSPPFullPagePacket));
         return;
     }
 

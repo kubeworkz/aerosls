@@ -5,9 +5,18 @@
 #include "frame_pool.h"        // Multitenant Isolation Gap Analysis §5 item 3 -- allocate_physical_ram_frame_for_partition()
 #include "../user/permissions.h"
 #include "../drivers/nvme_io.h"
+#include "../net/dspp.h"   // Multi-Node Partition Scaling Roadmap Phase 7 -- dspp_migrate_send_begin()/_page()
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 struct StreamEntry stream_store[STREAM_MAX];
+
+// Forward declaration: stream_relocate_partition() (below) and this phase's
+// new stream_migrate_send_partition() both call this shared retire helper,
+// but it's defined alongside the new Phase 7 functions further down the
+// file (kept next to its other new callers rather than moved to the very
+// top out of context) -- forward-declared here so stream_relocate_
+// partition() (which appears first in the file) can call it.
+static void stream_retire_slot(struct StreamEntry* s);
 
 // ─── String / memory helpers ─────────────────────────────────────────────────
 static size_t st_strlen(const char* s) { size_t n=0; while(s[n]) n++; return n; }
@@ -487,21 +496,207 @@ int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) {
         // tracking, independent of which stream slot referenced them, so
         // there is no double-free or leak risk in leaving that to the
         // caller's subsequent step.
-        st_memset(src->name, 0, STREAM_NAME_LEN);
-        st_memset(src->mime_type, 0, STREAM_MIME_LEN);
-        src->size         = 0;
-        src->frames_used  = 0;
-        src->lba_base     = 0;
-        src->active       = 0;
-        src->owner_uid    = 0;
-        src->partition_id = 0;
-        for (uint32_t f = 0; f < STREAM_MAX_FRAMES; f++) src->frames[f] = 0;
+        stream_retire_slot(src);
 
         relocated++;
     }
 
     if (relocated > 0) stream_persist_directory();
     return relocated;
+}
+
+// ─── Multi-Node Partition Scaling Roadmap Phase 7: real cross-node data
+// movement ────────────────────────────────────────────────────────────────
+// See net/dspp.h's own Phase 7 header comment for the full design writeup
+// (wire format, why fire-and-forget, why streams only). The three
+// functions below are this file's half of that work; net/dspp.c owns the
+// wire encode/decode and calls into these.
+
+// Zeroes a slot's fields back to the cold-start default, mirroring
+// stream_create()'s own reverse (nothing has ever explicitly done this
+// before this phase -- stream_relocate_partition()'s retire step and both
+// new functions below all need the identical reset, so it's a shared
+// helper rather than three copies of the same seven-field zero-out).
+static void stream_retire_slot(struct StreamEntry* s) {
+    st_memset(s->name, 0, STREAM_NAME_LEN);
+    st_memset(s->mime_type, 0, STREAM_MIME_LEN);
+    s->size         = 0;
+    s->frames_used  = 0;
+    s->lba_base     = 0;
+    s->active       = 0;
+    s->owner_uid    = 0;
+    s->partition_id = 0;
+    for (uint32_t f = 0; f < STREAM_MAX_FRAMES; f++) s->frames[f] = 0;
+}
+
+int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) {
+    if (!(io_sq && io_cq)) return 0;  // no NVMe -- nothing to send, honest no-op
+
+    static uint8_t __attribute__((aligned(4096))) migrate_send_page_buf[4096];
+
+    int sent = 0;
+    for (int i = 0; i < STREAM_MAX; i++) {
+        struct StreamEntry* src = &stream_store[i];
+        if (!src->active || src->partition_id != partition_id) continue;
+
+        // Unique for the lifetime of this one synchronous migrate call --
+        // partition_migrate() runs its steps one at a time, never
+        // concurrently, so a given slot index can never be mid-migration
+        // twice at once. Not intended to be globally unique across reboots
+        // or unrelated migrations (nothing on the receive side needs that;
+        // see stream_migrate_recv_begin()'s own comment).
+        uint64_t transfer_id = ((uint64_t)partition_id << 32) | (uint64_t)i;
+
+        dspp_migrate_send_begin(transfer_id, dest_node_id, partition_id,
+                                src->name, src->mime_type, src->size,
+                                src->frames_used, src->owner_uid);
+
+        uint64_t src_lba = src->lba_base;
+        for (uint32_t p = 0; p < src->frames_used; p++) {
+            uint64_t slba = src_lba + (uint64_t)p * 8;
+            if (nvme_read_sync(slba, migrate_send_page_buf) != 0) {
+                kernel_serial_printf(
+                    "[STREAM] migrate: read failed for partition %u's stream "
+                    "'%s' page %u -- stopping with %d slot(s) sent so far. "
+                    "Source left intact (fire-and-forget send, no partial "
+                    "retirement).\n",
+                    (unsigned)partition_id, src->name, (unsigned)p, sent);
+                return sent;
+            }
+            dspp_migrate_send_page(transfer_id, dest_node_id, partition_id,
+                                   p, migrate_send_page_buf);
+        }
+
+        kernel_serial_printf(
+            "[STREAM] migrate: partition %u's stream '%s' (slot %d, %u "
+            "page(s)) sent to node %u -- fire-and-forget, BEGIN_ACK/PAGE_ACK "
+            "not waited on.\n",
+            (unsigned)partition_id, src->name, i, src->frames_used,
+            (unsigned)dest_node_id);
+
+        stream_retire_slot(src);
+        sent++;
+    }
+
+    if (sent > 0) stream_persist_directory();
+    return sent;
+}
+
+// Small table correlating an in-flight incoming migration's transfer_id to
+// the local slot receiving it, and how many of that slot's pages have
+// arrived so far. Sized STREAM_MAX -- at most one migration per slot can
+// possibly be in flight at once, the same ceiling stream_store[] itself has.
+#define STREAM_MIGRATE_INFLIGHT_MAX STREAM_MAX
+struct StreamMigrateInflight {
+    uint64_t transfer_id;
+    int      slot;
+    uint32_t received_pages;
+    uint8_t  active;
+};
+static struct StreamMigrateInflight migrate_inflight[STREAM_MIGRATE_INFLIGHT_MAX];
+
+int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
+                               const char* name, const char* mime_type,
+                               uint64_t size, uint32_t frames_used,
+                               uint32_t owner_uid) {
+    int dst = -1;
+    for (int j = 0; j < STREAM_MAX; j++) {
+        if (!stream_store[j].active) { dst = j; break; }
+    }
+    if (dst < 0) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: no free local slot for incoming stream "
+            "'%s' (transfer %llu) -- denied.\n",
+            name, (unsigned long long)transfer_id);
+        return 1;
+    }
+
+    int inflight_idx = -1;
+    for (int k = 0; k < STREAM_MIGRATE_INFLIGHT_MAX; k++) {
+        if (!migrate_inflight[k].active) { inflight_idx = k; break; }
+    }
+    if (inflight_idx < 0) {
+        // Can't actually happen -- this table is exactly STREAM_MAX-sized
+        // and a free stream_store[] slot was just found above, so at least
+        // one inflight row must also be free. Defensive only.
+        kernel_serial_print("[STREAM] migrate recv: inflight table unexpectedly full -- denied.\n");
+        return 1;
+    }
+
+    struct StreamEntry* d = &stream_store[dst];
+    st_strncpy(d->name, name, STREAM_NAME_LEN);
+    st_strncpy(d->mime_type, mime_type, STREAM_MIME_LEN);
+    d->size         = (uint32_t)size;
+    d->frames_used  = frames_used;
+    d->lba_base     = STREAM_DATA_LBA_BASE + (uint64_t)dst * STREAM_SECTORS_PER_SLOT;
+    d->active       = 1;
+    d->owner_uid    = owner_uid;
+    d->partition_id = partition_id;
+    for (uint32_t f = 0; f < STREAM_MAX_FRAMES; f++) d->frames[f] = 0;
+
+    migrate_inflight[inflight_idx].transfer_id    = transfer_id;
+    migrate_inflight[inflight_idx].slot           = dst;
+    migrate_inflight[inflight_idx].received_pages = 0;
+    migrate_inflight[inflight_idx].active         = 1;
+
+    kernel_serial_printf(
+        "[STREAM] migrate recv: allocated local slot %d for incoming stream "
+        "'%s' (transfer %llu, %u page(s) expected).\n",
+        dst, name, (unsigned long long)transfer_id, frames_used);
+    return 0;
+}
+
+int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
+                              const uint8_t* page_data) {
+    if (!(io_sq && io_cq)) return 1;
+
+    int inflight_idx = -1;
+    for (int k = 0; k < STREAM_MIGRATE_INFLIGHT_MAX; k++) {
+        if (migrate_inflight[k].active && migrate_inflight[k].transfer_id == transfer_id) {
+            inflight_idx = k; break;
+        }
+    }
+    if (inflight_idx < 0) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: page for unknown transfer %llu -- dropped.\n",
+            (unsigned long long)transfer_id);
+        return 1;
+    }
+
+    struct StreamMigrateInflight* mi = &migrate_inflight[inflight_idx];
+    struct StreamEntry* d = &stream_store[mi->slot];
+    if (page_index >= d->frames_used) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: page_index %u out of range for transfer "
+            "%llu's %u expected page(s) -- dropped.\n",
+            (unsigned)page_index, (unsigned long long)transfer_id, d->frames_used);
+        return 1;
+    }
+
+    static uint8_t __attribute__((aligned(4096))) migrate_recv_verify_buf[4096];
+    uint64_t dlba = d->lba_base + (uint64_t)page_index * 8;
+    if (nvme_write_sync(dlba, page_data) != 0) return 1;
+    if (nvme_read_sync(dlba, migrate_recv_verify_buf) != 0) return 1;
+    for (uint32_t b = 0; b < 4096; b++) {
+        if (migrate_recv_verify_buf[b] != page_data[b]) {
+            kernel_serial_printf(
+                "[STREAM] migrate recv: page %u verify mismatch for transfer "
+                "%llu -- write did not survive readback.\n",
+                (unsigned)page_index, (unsigned long long)transfer_id);
+            return 1;
+        }
+    }
+
+    mi->received_pages++;
+    if (mi->received_pages >= d->frames_used) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: transfer %llu complete (%u page(s)) -- "
+            "stream '%s' now fully received in local slot %d.\n",
+            (unsigned long long)transfer_id, d->frames_used, d->name, mi->slot);
+        mi->active = 0;   // this inflight row is free for a future migration
+        stream_persist_directory();
+    }
+    return 0;
 }
 
 // ─── stream_list_json ────────────────────────────────────────────────────────

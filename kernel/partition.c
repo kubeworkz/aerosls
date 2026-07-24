@@ -362,15 +362,28 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     //
     // What DOES move now (Multi-Node Phase 6 addendum -- real migration data
     // movement, Multitenant Isolation Gap Analysis §7 item 7): this
-    // partition's stream/blob storage. stream_relocate_partition()
-    // physically copies each of this partition's stream slots' on-disk
-    // bytes to a fresh slot and verifies every page byte-for-byte before
-    // retiring the original -- the first genuine byte-copy step this
-    // function has ever performed. Scoped to streams only for the reason
-    // above; rowstore/vecstore table data still only moves in the
+    // partition's stream/blob storage. Scoped to streams only for the
+    // reason above; rowstore/vecstore table data still only moves in the
     // ownership-record sense described above until Storage Isolation Phase
     // 1 lands.
-    int streams_relocated = stream_relocate_partition(partition_id, dest_node_id);
+    //
+    // Phase 7 addendum (real cross-node data movement): which primitive
+    // actually runs depends on whether a real cluster is configured.
+    // cluster_local_node_id() == 0 is Phase 1's own "uninitialized"
+    // sentinel -- cluster_init() is never called from any real boot path
+    // today (every existing deployment and all 58+ pre-Phase-7 host tests),
+    // so this is the default, common case, and it keeps stream_relocate_
+    // partition()'s exact prior behavior completely unchanged: a same-disk
+    // relocate to a fresh slot, since there is genuinely nowhere else to
+    // send the bytes without a real cluster. Once cluster_init() HAS been
+    // called with a real node id, stream_migrate_send_partition() takes
+    // over instead -- the real DSPP-wire push to dest_node_id's own storage
+    // (net/dspp.c/kernel/stream.c, this phase's new code). Both return the
+    // identical "count of slots moved" convention, so the logging and
+    // return-value handling below needs no branch of its own.
+    int streams_relocated = (cluster_local_node_id() != 0)
+        ? stream_migrate_send_partition(partition_id, dest_node_id)
+        : stream_relocate_partition(partition_id, dest_node_id);
 
     // Step 4 (Multi-Node Phase 2): the actual, load-bearing ownership
     // handoff -- a pure table write that already persists internally
@@ -400,14 +413,21 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // at this point would resume the partition on the node that no longer
     // owns it -- partition_is_local(partition_id) is now false here (see
     // Step 4 above). Real resumption on the destination node would require
-    // THAT node to itself notice the ownership change and act, which needs
-    // a wire protocol this codebase doesn't have (no RX dispatcher for any
-    // DSPP opcode -- Phase 5's own finding, unchanged by this phase). The
-    // partition is intentionally left PAUSED when this function returns --
-    // named honestly here rather than silently resuming it on the wrong node.
+    // THAT node to itself notice the ownership change and act. Phase 7
+    // (real cross-node data movement) DID add a genuine, live DSPP RX
+    // dispatcher (net/net.c's ETHERTYPE_DSPP branch, net/dspp.c's
+    // dspp_rx_dispatch()) -- Phase 5's own "no RX dispatcher exists at all"
+    // finding no longer holds unconditionally -- but no opcode or handler
+    // for "a partition's ownership changed, notice and resume it" exists in
+    // that new protocol; only stream-data migration (DSPP_MIGRATE_*) and
+    // consensus/lease traffic are wired up. Resuming on the destination
+    // remains a real, separate, not-yet-built piece of work, honestly
+    // named as such rather than conflated with "no transport exists yet"
+    // now that one genuinely does for a different purpose. The partition is
+    // intentionally left PAUSED when this function returns.
     kernel_serial_printf(
         "[PARTITION] migrated partition %u: node %u -> node %u. Lease "
-        "relinquished=%s, %d stream(s) relocated and byte-verified, %u "
+        "relinquished=%s, %d stream(s) relocated/sent and byte-verified, %u "
         "physical frame(s) reclaimed. Partition remains PAUSED -- resume "
         "must happen on the destination node.\n",
         (unsigned)partition_id, (unsigned)source_node_id, (unsigned)dest_node_id,

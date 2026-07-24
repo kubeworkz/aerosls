@@ -19,6 +19,19 @@ static inline uint32_t ntohl(uint32_t x) { return htonl(x); }
 // ─── Ethernet ─────────────────────────────────────────────────────────────────
 #define ETHERTYPE_ARP   0x0806
 #define ETHERTYPE_IPV4  0x0800
+// Multi-Node Partition Scaling Roadmap Phase 7 (cross-node data movement):
+// every existing DSPP send site (net/consensus.c, net/prefetch.c) previously
+// called e1000_transmit_packet() directly on a raw struct DSPPPacketHeader/
+// DSPPFullPagePacket with NO Ethernet framing at all -- no dst/src MAC, no
+// ethertype. On real hardware this could never arrive as a well-formed frame
+// for net_rx_dispatch() (below) to route by ethertype in the first place, a
+// deeper pre-existing gap than "no RX branch exists yet" (Phase 5's own
+// finding) -- there was nothing valid to branch ON. 0x88B5 is one of the two
+// IEEE-reserved "local experimental ethertype" values (0x88B5/0x88B6,
+// IEEE 802 Std 802-2014 Annex G), the correct real-world choice for a
+// custom, non-standardized protocol like this one rather than an
+// arbitrary/possibly-colliding value.
+#define ETHERTYPE_DSPP  0x88B5
 #define ETH_HDR_LEN     14
 
 struct EthernetHeader {

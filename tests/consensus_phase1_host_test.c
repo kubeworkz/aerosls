@@ -72,10 +72,22 @@ void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t
 static uint8_t  last_packet[8192];
 static uint16_t last_packet_size = 0;
 static int      transmit_call_count = 0;
-void e1000_transmit_packet(void* buf, uint16_t size) {
+/* Multi-Node Partition Scaling Roadmap Phase 7: every send site in net/
+ * consensus.c now goes through net/dspp.c's dspp_transmit_raw() instead of
+ * calling e1000_transmit_packet() directly (that indirection is what adds
+ * real Ethernet framing on a genuine boot -- see dspp.c's own header
+ * comment). net/dspp.c itself is deliberately NOT linked into this
+ * consensus-focused test (it would pull in object_catalog[]/kernel/
+ * stream.c dependencies this file has no interest in), so this stub takes
+ * dspp_transmit_raw()'s place directly, capturing the exact same raw DSPP
+ * payload bytes every existing assertion below already checks -- the
+ * framing dspp_transmit_raw() would have added around them is irrelevant
+ * to what this test verifies (DSPP field values, not L2 framing), so
+ * skipping it here changes nothing this file actually asserts on. */
+void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
     transmit_call_count++;
-    if (size <= sizeof(last_packet)) memcpy(last_packet, buf, size);
-    last_packet_size = size;
+    if (dspp_len <= sizeof(last_packet)) memcpy(last_packet, dspp_payload, dspp_len);
+    last_packet_size = dspp_len;
 }
 
 int main(void) {

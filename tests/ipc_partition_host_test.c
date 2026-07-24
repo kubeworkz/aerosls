@@ -46,6 +46,7 @@ static void add_fake_process(uint32_t pid, uint32_t partition_id) {
 
 void kernel_serial_print(const char* s) { (void)s; }
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
+int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 7 addendum (real cross-node data movement) -- not exercised by this test, permissive "nothing to send" stub, sibling of the stream_relocate_partition() stub above (kernel/partition.c now calls whichever of the two applies depending on cluster_local_node_id()) */
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_partitions(void) { /* Phase 10's persistence hook — irrelevant here */ }
 

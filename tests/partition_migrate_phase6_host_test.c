@@ -59,7 +59,24 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; re
  * links the real kernel/stream.c; this file stays focused on lease/
  * ownership orchestration, so this is a permissive "nothing to relocate"
  * stub, same technique as this file's other dependency stubs above. */
-int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }
+/* Multi-Node Phase 7 addendum (real cross-node data movement): kernel/
+ * partition.c's partition_migrate() now branches between these two based
+ * on cluster_local_node_id() -- call-counting stubs (not plain no-ops)
+ * specifically so Scenario 6 below can prove WHICH one a real migration
+ * actually invokes, not just that migration succeeds either way. This
+ * file's own cluster_init(1) call at the very top of main() means
+ * cluster_local_node_id() reads back nonzero for this entire test, so
+ * every migration here (Scenarios 3, 4, 6) is expected to take the NEW
+ * stream_migrate_send_partition() branch -- the OLD stream_relocate_
+ * partition() branch (taken when no real cluster is configured, the
+ * default posture every other pre-Phase-7 test in this suite keeps) gets
+ * its own dedicated proof in tests/partition_migrate_default_path_host_
+ * test.c, a fresh process where cluster_init() is deliberately never
+ * called at all. */
+static int relocate_calls = 0;
+static int migrate_send_calls = 0;
+int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; relocate_calls++; return 0; }
+int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; migrate_send_calls++; return 0; }
 
 /* Phase 3 frame reclamation -- call-tracking stub, the scheduler_fairness_
  * host_test.c technique the roadmap's own Phase 6 verification plan names. */
@@ -77,7 +94,13 @@ void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t
     (void)partition_id; (void)force_read_only;
 }
 static int transmit_call_count = 0;
-void e1000_transmit_packet(void* buf, uint16_t size) { (void)buf; (void)size; transmit_call_count++; }
+/* Multi-Node Partition Scaling Roadmap Phase 7: net/consensus.c's send
+ * sites now go through net/dspp.c's dspp_transmit_raw() rather than
+ * calling e1000_transmit_packet() directly -- net/dspp.c is not linked
+ * into this lease/ownership-orchestration-focused test, so this stub
+ * takes its place, preserving the exact same call-counting Scenario 5
+ * below already asserts on. */
+void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) { (void)dspp_payload; (void)dspp_len; transmit_call_count++; }
 
 int main(void) {
     partition_init();
@@ -166,6 +189,24 @@ int main(void) {
      * transmission counted here came from the two REQUEST_VOTE broadcasts
      * in Scenario 2's elections, not from either migration. ─────────────── */
     CHECK(transmit_call_count == 2, "exactly 2 real packets were transmitted total, both from Scenario 2's two elections -- partition_migrate() itself transmits nothing");
+
+    /* ── Scenario 6: Multi-Node Phase 7 addendum -- proves partition_
+     * migrate() actually branches on cluster_local_node_id(), not just that
+     * SOME stream-moving function gets called. This file's cluster_init(1)
+     * call means a real cluster has been configured this entire test, so
+     * BOTH of Scenario 3's and Scenario 4's migrations above should
+     * already have taken the new cross-node path -- verified retroactively
+     * here, then a third migration confirms the pattern holds going
+     * forward too. ─────────────────────────────────────────────────────── */
+    CHECK(migrate_send_calls == 2, "Scenarios 3 and 4's two migrations both took the NEW stream_migrate_send_partition() path (a real cluster is configured throughout this file)");
+    CHECK(relocate_calls == 0, "the OLD stream_relocate_partition() path was never taken anywhere in this file -- see partition_migrate_default_path_host_test.c for that path's own dedicated proof");
+
+    uint32_t pid_c = partition_create("tenant-c");
+    CHECK(pid_c != 0xFFFFFFFFu, "a third partition created for Scenario 6");
+    rc = partition_migrate(pid_c, 42);
+    CHECK(rc == 0, "migrating tenant-c succeeds");
+    CHECK(migrate_send_calls == 3, "a third migration, still under the same configured cluster, took the new cross-node path too");
+    CHECK(relocate_calls == 0, "and still never fell back to the old same-disk path");
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

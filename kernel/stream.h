@@ -76,6 +76,68 @@ uint8_t*           stream_lazy_load_frame(struct StreamEntry* se, uint32_t frame
 // partial, not total, migration.
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id);
 
+// ─── Multi-Node Partition Scaling Roadmap Phase 7: real cross-node data
+// movement ────────────────────────────────────────────────────────────────
+// stream_relocate_partition() above is kept exactly as-is (still the right
+// primitive when no real cluster is configured -- see kernel/partition.c's
+// partition_migrate(), which now branches between the two). These three
+// functions are the genuinely new cross-machine path, used only once a real
+// cluster exists (cluster_init() has actually been called with a nonzero
+// local node id -- see net/consensus.h). "Node" here can be, and in this
+// dev environment's own verification is, a second simulated node (a second
+// independent stream_store[]-equivalent state and fake NVMe image in a host
+// test) rather than literally different physical hardware -- the real code
+// below is identical either way; only what backs stream_store[]/nvme_*_sync
+// differs between "two real machines" and "one host test process reused
+// sequentially for both roles." See net/dspp.h's own Phase 7 header comment
+// for the full design writeup (wire format, fire-and-forget scope decision).
+
+// Sender-side: for every active stream slot owned by partition_id, sends
+// its full metadata (DSPP_MIGRATE_BEGIN_REQ) and every populated page
+// (DSPP_MIGRATE_PAGE_REQ) to dest_node_id over the real DSPP wire (net/
+// dspp.c), then retires the local slot -- the same retire-to-zero fields
+// stream_relocate_partition() already uses, factored into a shared static
+// helper so both functions apply the identical reset. Fire-and-forget: does
+// not wait for or verify BEGIN_ACK/PAGE_ACK before retiring the source, a
+// disclosed limitation (see dspp.h's own scope note) rather than a full
+// reliable-transport handshake -- a dropped packet on an unreliable link
+// could lose data in this first cut. Returns the count of slots sent.
+int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id);
+
+// Receiver-side, called by net/dspp.c's dspp_migrate_rx() when a
+// DSPP_MIGRATE_BEGIN_REQ addressed to this node arrives: finds a free local
+// stream_store[] slot, stamps its metadata, and records transfer_id -> slot
+// in a small internal table so subsequent stream_migrate_recv_page() calls
+// for the same transfer_id know where to write. The slot is marked active
+// immediately (visible in stream_list_json()/stream_find() right away,
+// matching how a fresh stream_create() is also visible before any bytes
+// have actually been written) but its data is only as complete as however
+// many pages have arrived so far -- callers reading a frame before its page
+// arrives get whatever stream_lazy_load_frame() returns for a page never
+// written to this slot's LBA range (matches this codebase's existing
+// "denial looks like absence" posture rather than a new pending/visible
+// distinction). Returns 0 on success, 1 if no free slot exists (this node's
+// own STREAM_MAX pool is full).
+int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
+                               const char* name, const char* mime_type,
+                               uint64_t size, uint32_t frames_used,
+                               uint32_t owner_uid);
+
+// Receiver-side, called by net/dspp.c's dspp_migrate_rx() for each
+// DSPP_MIGRATE_PAGE_REQ: looks up transfer_id's slot (from stream_migrate_
+// recv_begin() above), writes page_data to that slot's own LBA range at
+// page_index via nvme_write_sync(), then reads it back and byte-compares --
+// the identical copy-then-verify discipline stream_relocate_partition()
+// already established, just receiving bytes from the wire instead of
+// reading them from a source LBA. Once every one of the slot's frames_used
+// pages has arrived, calls stream_persist_directory() so the newly-received
+// stream survives this node's own reboot. Returns 0 on success, 1 if
+// transfer_id is unknown (no matching stream_migrate_recv_begin() call), if
+// page_index is out of range for that slot's frames_used, or on any NVMe
+// read/write/verify failure.
+int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
+                              const uint8_t* page_data);
+
 extern struct StreamEntry stream_store[STREAM_MAX];
 
 #endif /* STREAM_H */

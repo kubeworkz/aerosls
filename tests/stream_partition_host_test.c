@@ -78,6 +78,28 @@ uint32_t partition_reclaim_all_frames(uint32_t partition_id) { (void)partition_i
 uint32_t cluster_local_node_id(void) { return 0; }
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }
 
+/* Multi-Node Partition Scaling Roadmap Phase 7 (real cross-node data
+ * movement): kernel/stream.c's new stream_migrate_send_partition() calls
+ * into net/dspp.c's dspp_migrate_send_begin()/_page() -- dead code from
+ * this test's perspective (cluster_local_node_id() is stubbed to 0 above,
+ * so nothing here ever takes that branch), but the symbols still must
+ * resolve at link time since net/dspp.c itself is not linked into this
+ * ownership/quota-focused test. Permissive no-op stubs, same judgment call
+ * this file already applies to cluster_local_node_id/partition_lease_
+ * step_down above. */
+void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+                              uint32_t partition_id, const char* name,
+                              const char* mime_type, uint64_t size,
+                              uint32_t frames_used, uint32_t owner_uid) {
+    (void)transfer_id; (void)node_dest_id; (void)partition_id; (void)name;
+    (void)mime_type; (void)size; (void)frames_used; (void)owner_uid;
+}
+void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
+                             uint32_t partition_id, uint32_t page_index,
+                             const uint8_t* page_data) {
+    (void)transfer_id; (void)node_dest_id; (void)partition_id; (void)page_index; (void)page_data;
+}
+
 void* io_sq = 0;
 void* io_cq = 0;
 int nvme_read_sync(uint64_t slba, void* buf) { (void)slba; (void)buf; return -1; }

@@ -3,6 +3,7 @@
 #include "ipv4.h"
 #include "tcp.h"    // Navigator-Parity Gap Roadmap Phase 5c -- tcp_conns[]/TCP_MAX_CONNS for sys_sls_net_status()
 #include "dhcp.h"   // Navigator-Parity Gap Roadmap Phase 5c -- dhcp_is_bound() for sys_sls_net_status()
+#include "dspp.h"   // Multi-Node Partition Scaling Roadmap Phase 7 -- dspp_rx_dispatch(), the real DSPP receive path
 #include "../kernel/kernel_io.h"
 
 // ─── Runtime network identity ─────────────────────────────────────────────────
@@ -54,6 +55,17 @@ void net_rx_dispatch(void* frame, uint16_t len) {
     } else if (et == ETHERTYPE_IPV4) {
         if (len >= ETH_HDR_LEN + (int)sizeof(struct IPv4Header))
             ipv4_handle_packet(eth, (struct IPv4Header*)((uint8_t*)frame + ETH_HDR_LEN));
+    } else if (et == ETHERTYPE_DSPP) {
+        // Multi-Node Partition Scaling Roadmap Phase 7: the real DSPP
+        // receive branch that never existed before this phase (Phase 5's
+        // own finding, restated three times across this codebase's docs:
+        // "no RX dispatcher for ANY DSPP opcode exists anywhere"). See
+        // net/dspp.c's dspp_rx_dispatch() for the actual opcode routing --
+        // this branch's only job, matching the ARP/IPv4 branches' own
+        // shape exactly, is stripping the Ethernet header and handing the
+        // remaining bytes off with a length bound already checked.
+        if (len > ETH_HDR_LEN)
+            dspp_rx_dispatch((uint8_t*)frame + ETH_HDR_LEN, (uint16_t)(len - ETH_HDR_LEN));
     }
 }
 
