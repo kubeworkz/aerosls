@@ -2267,8 +2267,20 @@ static int api_workmgmt_msgqueues_json(char* buf, int max) {
 // ─── POST /api/partitions — Gap Remediation Phase F ────────────────────────────
 // Body: {"name": "<partition_name>"}. Thin wrapper over
 // sys_sls_partition_create(), the same shape as api_table_create_post().
-static int api_partition_create_post(const char* body, char* buf, int max) {
+// req_role gate added when a gap-analysis pass found this route (and
+// api_tenant_create_post() below) reachable by any authenticated,
+// non-GUEST role -- unlike api_auth_create_post()/_revoke_post(), which
+// already required DB_ADMIN or higher. Creating a partition is exactly the
+// kind of tenancy-administration action those two already treat as
+// privileged, so this reuses their identical gate and error shape rather
+// than inventing a new one.
+static int api_partition_create_post(const char* body, char* buf, int max, SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionCreateRequest req;
     req.name[0] = '\0';
@@ -2517,8 +2529,19 @@ static int api_tenants_list(char* buf, int max) {
 // established. caller_uid is the authenticated req_uid, not a client-
 // supplied field -- matches api_vec_create_post()'s own "caller_uid comes
 // from the auth gate, never the request body" posture.
-static int api_tenant_create_post(const char* body, char* buf, int max, uint32_t req_uid) {
+// req_role gate: same DB_ADMIN+ requirement as api_partition_create_post()
+// above, for the same reason (see that function's own comment) --
+// tenant_create() itself calls partition_create() as its own Step 1
+// (kernel/tenant.c), so leaving this route open to APP_USER would have
+// simply been a second, unguarded way to reach the exact privileged
+// operation this pass just closed off directly.
+static int api_tenant_create_post(const char* body, char* buf, int max, uint32_t req_uid, SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSTenantCreateRequest req;
     req.name[0] = '\0';
@@ -4851,7 +4874,7 @@ static void http_route(int conn, char* req) {
         // wired at the dispatch layer; this is the first HTTP surface for any
         // of them. ────────────────────────────────────────────────────────────
         if (!strcmp(path, "/api/partitions")) {
-            blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/assign")) {
@@ -4889,7 +4912,7 @@ static void http_route(int conn, char* req) {
         // ── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2:
         // POST /api/tenants — unified tenant_create(). ─────────────────────────
         if (!strcmp(path, "/api/tenants")) {
-            blen = api_tenant_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            blen = api_tenant_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid, req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── POST /api/stream/create|upload ──────────────────────────────────────
