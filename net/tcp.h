@@ -34,6 +34,40 @@ typedef enum {
 // total at 512 slots (up from ~2.3 MiB at 24), a real, deliberate footprint
 // increase for real tenant scale, not a side effect to discover later.
 #define TCP_MAX_CONNS     512
+
+// Network Fairness Phase 2 (Multitenant Isolation Gap Analysis §5 item 4 /
+// §7 item 1, connection-level half): inbound/outbound pool separation.
+// net/http_rate_limit.h's own header comment documents a REAL prior
+// starvation incident where inbound frontend polling traffic exhausted
+// every tcp_conns[] slot and left net/ollama_client.c's/net/inference.c's
+// own outbound tcp_connect() calls with nothing free (the reason
+// TCP_MAX_CONNS went 8->24 in the first place). Raising TCP_MAX_CONNS to
+// 512 (capacity sizing pass) made that incident far less likely but did
+// not make it impossible -- a large enough burst of inbound tenant
+// connections can still, in principle, claim every slot before either of
+// this kernel's own two outbound callers gets a turn.
+//
+// Fix: split the single flat array into two disjoint, non-overlapping
+// index ranges instead of one shared pool searched by everyone --
+// slots [0, TCP_INBOUND_MAX_CONNS) for inbound (tcp_listen()'s accept
+// path and tcp_handle_segment()'s SYN handler), slots
+// [TCP_INBOUND_MAX_CONNS, TCP_MAX_CONNS) reserved exclusively for
+// outbound (tcp_connect()). Neither side can ever borrow from the
+// other's range, so an inbound burst can no longer starve outbound calls
+// (or vice versa) no matter how saturated either side gets. 16 reserved
+// outbound slots is deliberately generous headroom over this kernel's
+// only two current outbound callers (net/ollama_client.c, net/
+// inference.c), each of which opens exactly one connection per call with
+// no concurrency need identified -- a small, fixed, disclosed cost
+// against a 512-slot pool, not a silently-chosen number.
+//
+// This is pool separation only, not per-tenant fairness within the
+// inbound pool -- that's a separate mechanism (net/tcp_quota.h) layered
+// on top, since only the inbound side ever has a partition_id to
+// attribute (see that header's own comment for why).
+#define TCP_OUTBOUND_RESERVED_CONNS 16
+#define TCP_INBOUND_MAX_CONNS  (TCP_MAX_CONNS - TCP_OUTBOUND_RESERVED_CONNS)
+
 #define TCP_RECV_BUF_SZ   32768   /* 32 KiB — supports 16 KiB upload chunks (32 KiB hex) */
 #define TCP_SEND_BUF_SZ   8192
 

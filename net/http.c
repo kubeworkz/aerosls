@@ -2,6 +2,7 @@
 #include "tcp.h"
 #include "net.h"
 #include "http_rate_limit.h"   // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1
+#include "tcp_quota.h"         // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1, Network Fairness Phase 2
 #include "dhcp.h"   // Navigator-Parity Gap Roadmap Phase 5a -- dhcp_is_bound() for GET /api/network/status
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
@@ -5085,6 +5086,13 @@ static void http_route(int conn, char* req) {
 
 struct HttpConnState {
     uint8_t  in_use;   // 1 while we're accumulating this connection's request
+    // Network Fairness Phase 2: 1 once this connection has been attributed
+    // to a partition's connection quota (net/tcp_quota.h) -- set the first
+    // sweep an Authorization header is found in the accumulating buffer,
+    // well before the request necessarily finishes (a slow body upload
+    // must not be able to hide from quota accounting). Reset to 0 whenever
+    // this slot is reclaimed for a new connection, alongside in_use.
+    uint8_t  attributed;
     int      len;
     uint64_t last_activity_tick;
     char     buf[HTTP_REQ_BUF_SZ];
@@ -5116,6 +5124,7 @@ static int http_request_ready(const char* buf, int len, int cap) {
 
 void http_server_run(void) {
     tcp_init();
+    tcp_quota_init();   // Network Fairness Phase 2 -- must run before any connection is accepted, see tcp_quota.h
     int listen_fd = tcp_listen(NET_HTTP_PORT);
     if (listen_fd < 0) {
         kernel_serial_print("[HTTP] Failed to bind port 3000.\n");
@@ -5125,7 +5134,7 @@ void http_server_run(void) {
                          "GET http://10.0.2.15:3000/api/scan\n",
                          NET_HTTP_PORT);
 
-    for (int i = 0; i < TCP_MAX_CONNS; i++) http_conns[i].in_use = 0;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) { http_conns[i].in_use = 0; http_conns[i].attributed = 0; }
 
     for (;;) {
         int did_work = 0;
@@ -5139,6 +5148,7 @@ void http_server_run(void) {
             if (c->active && c->local_port == tcp_conns[listen_fd].local_port &&
                 c->state == TCP_ESTABLISHED && !http_conns[i].in_use) {
                 http_conns[i].in_use = 1;
+                http_conns[i].attributed = 0;   // Network Fairness Phase 2 -- fresh occupant of this slot, not yet quota-attributed
                 http_conns[i].len   = 0;
                 http_conns[i].last_activity_tick = kernel_tick_counter;
                 did_work = 1;
@@ -5164,6 +5174,36 @@ void http_server_run(void) {
                 did_work = 1;
             }
 
+            // Network Fairness Phase 2: attribute this connection to its
+            // partition's connection quota as soon as an Authorization
+            // header is readable, not at dispatch -- see tcp_quota.h's own
+            // comment for why waiting for the full (possibly slow) request
+            // body would defeat the point. Guarded on hc->len > 0 so this
+            // never scans a freshly-picked-up slot's buffer before any real
+            // byte has been received and null-terminated into it (this
+            // array is reused across connections and isn't cleared at
+            // pickup, only hc->len is).
+            if (!hc->attributed && hc->len > 0) {
+                uint32_t early_uid; SLSRole early_role;
+                if (auth_http_extract(hc->buf, &early_uid, &early_role)) {
+                    if (!tcp_conn_attribute(i, early_uid)) {
+                        // Partition already at its concurrent connection
+                        // quota -- refuse now rather than let this
+                        // connection keep occupying a shared inbound slot
+                        // for however long the rest of its (possibly slow)
+                        // body takes to arrive.
+                        did_work = 1;
+                        const char* e429c = "{\"error\":\"Too many concurrent connections for this partition — try again shortly\"}";
+                        http_respond(i, 429, "application/json", e429c, (int)strlen(e429c));
+                        tcp_close(i);
+                        hc->in_use = 0;
+                        hc->attributed = 0;
+                        continue;
+                    }
+                    hc->attributed = 1;
+                }
+            }
+
             int peer_done = (!c->active || c->state == TCP_CLOSE_WAIT || c->state == TCP_CLOSED);
             int ready = hc->len > 0 && http_request_ready(hc->buf, hc->len, (int)sizeof(hc->buf));
 
@@ -5172,6 +5212,8 @@ void http_server_run(void) {
                 if (hc->len > 0) http_route(i, hc->buf);
                 tcp_close(i);
                 hc->in_use = 0;
+                tcp_conn_release(i);   // Network Fairness Phase 2 -- safe no-op if never attributed
+                hc->attributed = 0;
                 continue;
             }
 
@@ -5179,6 +5221,8 @@ void http_server_run(void) {
                 did_work = 1;
                 tcp_close(i);
                 hc->in_use = 0;
+                tcp_conn_release(i);   // Network Fairness Phase 2 -- safe no-op if never attributed
+                hc->attributed = 0;
             }
         }
 

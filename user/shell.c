@@ -29,6 +29,7 @@
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- SYS_SLS_PARTITION_CREATE/ASSIGN/LIST/DESTROY/PAUSE/RESUME
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- SYS_SLS_PARTITION_QUOTA_SET/QUOTA_LIST
 #include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
+#include "../net/tcp_quota.h"        // Network Fairness Phase 2 -- SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- group profiles
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- authorization lists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- database create/drop/list/grant/check
@@ -1267,6 +1268,24 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
         else if (sh_eq(input_buffer, "partition storagequotas")) {
             do_syscall(SYS_SLS_PARTITION_STORAGE_QUOTA_LIST, 0);
+        }
+        // ── Network Fairness Phase 2: per-partition concurrent inbound
+        // connection quota ───────────────────────────────────────────────
+        else if (sh_starts(input_buffer, "partition connquota set ")) {
+            struct SLSPartitionConnQuotaSetRequest req;
+            const char* p = input_buffer + 24;
+            char pidtok[16], qtok[16];
+            p = sh_token(p, pidtok, sizeof(pidtok));
+            sh_token(p, qtok, sizeof(qtok));
+            req.partition_id = sh_atoi(pidtok);
+            req.quota         = (uint16_t)sh_atoi(qtok);
+            uint64_t rc = do_syscall(SYS_SLS_PARTITION_CONN_QUOTA_SET, &req);
+            kernel_serial_printf("[PARTITION] connquota partition=%u quota=%u -> %s\n",
+                                 req.partition_id, req.quota,
+                                 rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_eq(input_buffer, "partition connquotas")) {
+            do_syscall(SYS_SLS_PARTITION_CONN_QUOTA_LIST, 0);
         }
 
         // ── Vector Store Roadmap Phase 4: vec create/insert/embed-insert/

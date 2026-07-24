@@ -120,12 +120,15 @@ void tcp_handle_segment(struct IPv4Header* ip, struct TCPHeader* seg,
 
     // ── SYN: new connection on a listening port ──────────────────────────────
     if (!found && listener && (flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
-        // Find a free slot for the new connection
+        // Find a free slot for the new connection. Network Fairness Phase 2:
+        // scoped to the inbound pool only (net/tcp.h) -- a SYN is always
+        // inbound traffic, so it must never consume one of the slots
+        // reserved for this kernel's own outbound tcp_connect() calls.
         struct TCPConn* nc = 0;
-        for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        for (int i = 0; i < TCP_INBOUND_MAX_CONNS; i++) {
             if (!tcp_conns[i].active) { nc = &tcp_conns[i]; break; }
         }
-        if (!nc) return;  // no free slots
+        if (!nc) return;  // no free inbound slots
 
         nc->active      = 1;
         nc->state       = TCP_SYN_RECEIVED;
@@ -228,7 +231,12 @@ void tcp_handle_segment(struct IPv4Header* ip, struct TCPHeader* seg,
 // ─── Public socket-facing API ─────────────────────────────────────────────────
 
 int tcp_listen(uint16_t port) {
-    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    // Network Fairness Phase 2: a listening socket is itself an inbound-pool
+    // resource (it occupies a slot other inbound connections get matched
+    // against in tcp_handle_segment()'s scan), so it draws from the same
+    // inbound range the SYN handler above does, never the outbound-reserved
+    // tail of tcp_conns[].
+    for (int i = 0; i < TCP_INBOUND_MAX_CONNS; i++) {
         if (!tcp_conns[i].active) {
             tcp_conns[i].active     = 1;
             tcp_conns[i].state      = TCP_LISTEN;
@@ -347,13 +355,20 @@ int tcp_connect(IPv4Addr dst_ip, uint16_t dst_port) {
         }
     }
 
-    // 2. Find a free connection slot.
+    // 2. Find a free connection slot. Network Fairness Phase 2: outbound
+    // opens (this function) are scoped to the reserved outbound tail of
+    // tcp_conns[] (net/tcp.h) -- never the inbound pool -- so a burst of
+    // inbound tenant traffic filling every inbound slot can no longer
+    // starve this call the way it did before TCP_MAX_CONNS's history
+    // (net/tcp.h's own comment: the original 8->24 bump was a direct fix
+    // for exactly that starvation, and 512 alone doesn't make it
+    // impossible, only less likely -- true separation does).
     struct TCPConn* nc = 0;
-    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    for (int i = TCP_INBOUND_MAX_CONNS; i < TCP_MAX_CONNS; i++) {
         if (!tcp_conns[i].active) { nc = &tcp_conns[i]; break; }
     }
     if (!nc) {
-        kernel_serial_printf("[TCP] connect: no free slots\n");
+        kernel_serial_printf("[TCP] connect: no free outbound slots\n");
         return -1;
     }
 
