@@ -87,14 +87,20 @@ struct ConsensusMessage {
 #define DSPP_CMD_PARTITION_HEARTBEAT    0x15
 
 /* PARTITION_LEASE_MAX deliberately mirrors kernel/partition.h's
- * PARTITION_MAX (16) as an independent constant rather than #include-ing
- * that header here: net/ already has kernel/ headers included INTO it one
- * layer up (kernel/partition.c includes ../net/consensus.h, established in
- * Phase 2), and this project keeps that dependency strictly one-directional
- * -- net/ headers do not reach back into kernel/ headers for shared
- * constants, the same discipline CLUSTER_NODE_MAX above already follows as
- * its own independent constant. */
-#define PARTITION_LEASE_MAX 16
+ * PARTITION_MAX (256, raised for the Multitenant Isolation Gap Analysis §5
+ * item 9 capacity-sizing pass) as an independent constant rather than
+ * #include-ing that header here: net/ already has kernel/ headers included
+ * INTO it one layer up (kernel/partition.c includes ../net/consensus.h,
+ * established in Phase 2), and this project keeps that dependency strictly
+ * one-directional -- net/ headers do not reach back into kernel/ headers
+ * for shared constants, the same discipline CLUSTER_NODE_MAX above already
+ * follows as its own independent constant. Kept numerically in lockstep
+ * with PARTITION_MAX deliberately: this table is a linear-scan, fail-closed
+ * pool (not indexed by partition_id), so leaving it at the old value would
+ * have silently capped write-lease-capable partitions at 16 regardless of
+ * how high PARTITION_MAX climbed -- a real functional regression against
+ * the whole point of the resize, not a compile-time concern. */
+#define PARTITION_LEASE_MAX 256
 
 struct PartitionLease {
     uint32_t      partition_id;

@@ -186,10 +186,22 @@ int main(void) {
     }
 
     /* ── Scenario H: partition capacity genuinely runs out eventually
-     * (PARTITION_MAX=16, minus PARTITION_SYSTEM's own permanent slot 0),
-     * and when it does, tenant_create() reports rc=2 and creates NEITHER a
-     * database NOR a tenant row for that final, failed name -- step 1
-     * failing must short-circuit before step 2 ever runs. ─────────────────── */
+     * (PARTITION_MAX=256, minus PARTITION_SYSTEM's own permanent slot 0 =
+     * 255 usable), and when it does, tenant_create() reports rc=2 and
+     * creates NEITHER a database NOR a tenant row for that final, failed
+     * name -- step 1 failing must short-circuit before step 2 ever runs.
+     *
+     * Multitenant Isolation Gap Analysis §5 item 9 (capacity sizing):
+     * TENANT_MAX and DATABASE_MAX were raised to 256 in lockstep with
+     * PARTITION_MAX (see kernel/tenant.h's/kernel/database.h's own comments
+     * on why), so this scenario still proves what it always proved --
+     * partition_create()'s reserved slot 0 makes it, not TENANT_MAX/
+     * DATABASE_MAX, the tighter ceiling by exactly one slot (255 vs 256
+     * usable), so rc=2 (partition table full) still fires first, not rc=1
+     * (tenant table full). If TENANT_MAX/DATABASE_MAX are ever raised
+     * without raising PARTITION_MAX in lockstep, or vice versa, this
+     * scenario's rc==2 assertion is exactly what would catch that drifting
+     * out of sync. ──────────────────────────────────────────────────────── */
     {
         int rc = 0;
         char name[TENANT_NAME_LEN];

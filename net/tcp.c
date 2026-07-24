@@ -13,7 +13,7 @@ void tcp_init(void) {
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         tcp_conns[i].active = 0;
         tcp_conns[i].state  = TCP_CLOSED;
-        tcp_conns[i].conn_id = (uint8_t)i;
+        tcp_conns[i].conn_id = (uint16_t)i;
     }
 }
 

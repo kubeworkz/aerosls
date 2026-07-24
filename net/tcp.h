@@ -17,25 +17,23 @@ typedef enum {
 } TCPState;
 
 // ─── Per-connection buffers and state ────────────────────────────────────────
-// Bumped from 8 -> 24 (VectorStore Interface Roadmap Phase 4 verification
-// pass): this single pool is shared by every INBOUND http.c connection
-// (including the frontend's own recurring background polling of /api/
-// health, /api/services, /api/wal, /api/tiers, /api/objects, /api/metrics,
-// several requests firing every few seconds) and every OUTBOUND connection
-// the kernel itself opens, e.g. ollama_client.c's tcp_connect() to reach
-// Ollama. tcp_connect() just returns -1 ("no free slots") if none are free
-// -- with only 8 total, a handful of live browser polling connections could
-// starve out an outbound Ollama call entirely, which is exactly what live
-// testing reproduced: the first embed-insert succeeded before poll traffic
-// built up, then embed-search and a second embed-insert both failed with
-// ollama_status=-1 while Ollama itself was confirmed healthy and reachable
-// via curl -- the kernel simply had no slot left to open a new outbound
-// connection with. 24 gives real headroom over the ~6-8 concurrent inbound
-// pollers this frontend can generate, at the cost of ~2.3 MiB more static
-// RAM (each slot's rbuf[] below plus http.c's own per-slot HTTP_REQ_BUF_SZ
-// buffer) -- trivial on this host's available RAM, and a single #define,
-// not a redesign, matching this fix's own narrow scope.
-#define TCP_MAX_CONNS     24
+// History: 8 -> 24 (VectorStore Interface Roadmap Phase 4 verification pass,
+// fixing a real starvation bug where inbound frontend polling traffic could
+// exhaust every slot and leave ollama_client.c's own outbound tcp_connect()
+// with nothing free). 24 -> 512 (Multitenant Isolation Gap Analysis §5 item
+// 9 / §7 item 8, capacity sizing for a real ~256-tenant deployment): this
+// single pool is still shared by every INBOUND http.c connection AND every
+// OUTBOUND connection the kernel itself opens, and §8's own findings
+// addendum on network fairness already named this shared-pool structure as
+// the reason a per-tenant CONNECTION quota isn't implemented yet (see that
+// addendum) -- 512 buys real headroom for many concurrent tenants' inbound
+// traffic without starving outbound calls again, but does not by itself fix
+// the "one shared, un-partitioned, cluster-wide pool" gap network fairness
+// Phase 2 addresses separately. Static RAM cost: each slot's rbuf[] below
+// plus http.c's own per-slot HTTP_REQ_BUF_SZ buffer -- roughly 46-47 MiB
+// total at 512 slots (up from ~2.3 MiB at 24), a real, deliberate footprint
+// increase for real tenant scale, not a side effect to discover later.
+#define TCP_MAX_CONNS     512
 #define TCP_RECV_BUF_SZ   32768   /* 32 KiB — supports 16 KiB upload chunks (32 KiB hex) */
 #define TCP_SEND_BUF_SZ   8192
 
@@ -55,7 +53,14 @@ struct TCPConn {
     uint32_t rbuf_used;
 
     uint8_t  active;
-    uint8_t  conn_id;        // index into tcp_conns[]
+    // Multitenant Isolation Gap Analysis §5 item 9: widened from uint8_t to
+    // uint16_t when TCP_MAX_CONNS crossed 256 -- a uint8_t index would have
+    // silently wrapped modulo 256 (slot 256 aliasing slot 0's conn_id, etc.)
+    // the moment the pool grew past exactly the size that bug needed to go
+    // unnoticed. Nothing currently reads this field back for lookup
+    // (confirmed by search — only ever written), but it's a real latent
+    // landmine fixed here rather than left for the next person to rediscover.
+    uint16_t conn_id;        // index into tcp_conns[]
 };
 
 extern struct TCPConn tcp_conns[TCP_MAX_CONNS];

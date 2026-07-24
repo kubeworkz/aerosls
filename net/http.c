@@ -5077,7 +5077,7 @@ static void http_route(int conn, char* req) {
 // ~10s at the timer's documented ~100 Hz (kernel/auth.c's AUTH_TOKEN_TTL_TICKS
 // comment establishes the same tick-rate reasoning) -- long enough for a real
 // slow client, short enough that an abandoned half-open connection doesn't
-// tie up one of only TCP_MAX_CONNS (8) slots indefinitely. That's a new
+// tie up one of only TCP_MAX_CONNS (512) slots indefinitely. That's a new
 // failure mode this loop introduces (the old loop had no notion of "wasted
 // slot" since it only ever tracked one connection at a time) and needs a
 // guard now that many connections can be tracked at once.

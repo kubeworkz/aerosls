@@ -79,7 +79,17 @@
 #include <stdint.h>
 
 #define TENANT_NAME_LEN 32
-#define TENANT_MAX      32   // mirrors DATABASE_MAX -- same "how many distinct tenants does a small simulated deployment plausibly need" judgment call
+// Multitenant Isolation Gap Analysis §5 item 9 (capacity sizing): raised in
+// lockstep with kernel/partition.h's PARTITION_MAX (16 -> 256). tenant_
+// create() is this codebase's real go-forward provisioning path (§9 of
+// that doc) and its step-1 partition_create() check would otherwise become
+// unreachable dead capacity -- leaving TENANT_MAX at its old value while
+// PARTITION_MAX climbed to 256 would have silently made TENANT_MAX (not
+// PARTITION_MAX) the binding ceiling on real tenant count, defeating the
+// entire point of the resize. Mirrors DATABASE_MAX below for the same
+// "one tenant, one partition, one database" 1:1 relationship tenant_
+// create() itself enforces.
+#define TENANT_MAX      256
 
 struct SLSTenantEntry {
     uint32_t tenant_id;      // bump-allocated, 1.. ; 0 reserved for NONE/not found — never derived from partition_id or database_id

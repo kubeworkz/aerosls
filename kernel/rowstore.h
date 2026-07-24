@@ -141,12 +141,16 @@
 // time, and partition p's rowstore pages are drawn ONLY from
 // [p * ROWSTORE_PAGES_PER_PARTITION, (p+1) * ROWSTORE_PAGES_PER_PARTITION) --
 // never from any other partition's slice. This requires ROWSTORE_MAX_PAGES
-// to divide evenly by PARTITION_MAX (262144 / 16 = 16384 exactly, 64 MiB per
-// partition, today) -- if either constant ever changes without preserving
-// that divisibility, the remainder pages silently become permanently
-// unreachable by any partition (not a crash, just wasted tail space) rather
-// than a hard build error, so whoever changes either constant should
-// recheck this.
+// to divide evenly by PARTITION_MAX (262144 / 256 = 1024 exactly, 4 MiB per
+// partition, as of the Multitenant Isolation Gap Analysis §5 item 9
+// capacity-sizing pass that raised PARTITION_MAX from 16 to 256 -- down
+// from 64 MiB/partition at the old value, a disclosed trade-off since
+// ROWSTORE_MAX_PAGES/the 10 GiB disk image were deliberately NOT grown in
+// that same pass; see that doc's own findings addendum for this phase) --
+// if either constant ever changes without preserving that divisibility,
+// the remainder pages silently become permanently unreachable by any
+// partition (not a crash, just wasted tail space) rather than a hard build
+// error, so whoever changes either constant should recheck this.
 //
 // This is a genuinely different, stricter ceiling than storage_quota.c's
 // own configurable page_quota: a Phase 1 quota set ABOVE a partition's

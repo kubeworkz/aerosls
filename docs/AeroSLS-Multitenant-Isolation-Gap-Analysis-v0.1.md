@@ -70,13 +70,13 @@ Nothing stops these two axes from being assigned inconsistently for the same rea
 
 ## 4. Capacity ceilings that block real scale, independent of the isolation-completeness question
 
-Even if every gap above were closed, three compiled-in constants cap how many real customers this architecture could hold *today*, all trivially raisable in isolation but each is also a signal that these tables were sized for a development sandbox, not a multi-tenant deployment, and a real leasing rollout needs to decide real numbers, not inherit these by accident:
+**[Closed — see §18]** Even if every gap above were closed, three compiled-in constants cap how many real customers this architecture could hold, all trivially raisable in isolation but each is also a signal that these tables were sized for a development sandbox, not a multi-tenant deployment, and a real leasing rollout needs to decide real numbers, not inherit these by accident. As of §18 these have been raised to a deliberate "medium ~256 tenant" target:
 
-- `PARTITION_MAX = 16` (`kernel/partition.h`) — 16 partitions, system-wide, full stop. The Multi-Node roadmap's own §1 already calls this "an arbitrary array size chosen to match `PROC_MAX`, trivially raised" — true, but 16 concurrent tenants (or fewer, once system/reserved partitions are subtracted) is not a real ceiling to launch a leasing product against.
-- `PARTITION_ASSIGN_MAX = 64` — 64 total `uid → partition` assignments, **across every tenant combined**, not per tenant. A single customer with a 20-person team already consumes a third of the entire system's user-assignment capacity.
-- `TCP_MAX_CONNS = 24` — already flagged in §3 as a shared-resource gap; it's also a hard scale ceiling independent of isolation, since even a single-tenant deployment would struggle at 24 concurrent connections.
+- `PARTITION_MAX` — was 16, now 256 (`kernel/partition.h`). The Multi-Node roadmap's own §1 already calls the old value "an arbitrary array size chosen to match `PROC_MAX`, trivially raised" — true, and it has now been raised to a real self-serve SaaS launch ceiling.
+- `PARTITION_ASSIGN_MAX` — was 64, now 4096 — total `uid → partition` assignments, **across every tenant combined**, not per tenant (~16 users/tenant average across 256 tenants).
+- `TCP_MAX_CONNS` — was 24, now 512 — already flagged in §3 as a shared-resource gap; it's also a hard scale ceiling independent of isolation. Raising it also surfaced and fixed a latent `uint8_t` truncation bug in `struct TCPConn.conn_id` (see §18).
 
-None of these require new architecture to fix — they're `#define`s — but they need to be sized deliberately as part of whatever tiering model gets chosen, not left at their current development-sandbox defaults.
+None of these required new architecture to fix — they're `#define`s — but §18 documents everything else that had to move in lockstep (persisted-state LBA layout, several other tenant-count-keyed constants) and what was deliberately left as a disclosed trade-off (per-partition storage sub-range size).
 
 ## 5. What "leasing address space and services" actually requires that doesn't exist yet
 
@@ -90,7 +90,7 @@ Framed directly against the user's stated goal — leasing AeroSLS to real custo
 6. **[Closed — see §12] Usage metering.** A new subsystem, not an extension of an existing one — nothing today counts and exports per-partition consumption over time. This is a hard prerequisite for any usage-based billing, and a soft prerequisite even for flat-rate tiers (you still need to prove SLA compliance and detect abuse).
 7. **[Closed — see §13] Real data movement for migration**, closing the gap named twice in the Multi-Node roadmap, before a dedicated-node tier can be sold honestly — "records move" is not "your data moved."
 8. **[Closed — see §14] Weighted/proportional CPU scheduling**, if any tier wants to sell a CPU guarantee stronger than "won't be starved" (Phase 12's own explicit, honest scope cut). Capacity resizing, grouped under this same item, remains open — see item 9.
-9. **Deliberate capacity sizing** for `PARTITION_MAX`/`PARTITION_ASSIGN_MAX`/`TCP_MAX_CONNS` (and an audit for any other similarly-sized fixed table not surfaced by this pass) against a real target tenant count, not the current development defaults.
+9. **[Closed — see §18] Deliberate capacity sizing** for `PARTITION_MAX`/`PARTITION_ASSIGN_MAX`/`TCP_MAX_CONNS` (and an audit for any other similarly-sized fixed table not surfaced by this pass) against a real target tenant count, not the current development defaults.
 
 ## 6. A first-cut tiering model this inventory naturally supports
 
@@ -109,7 +109,7 @@ Not a commitment, offered as a starting frame for the architecture conversation 
 5. **[Scoped — see `docs/AeroSLS-Storage-Isolation-Roadmap-v0.1.md`] Storage isolation (§5.2)** — large, foundational for any data-isolation claim; scoped into its own dedicated roadmap doc the way LPAR and Multi-Node each got one, given its size. Phase 1 of that doc (per-partition LBA quota accounting, mirroring LPAR Phase 13's frame quota exactly) is a concrete, immediately-implementable next step; real physical per-tenant LBA sub-ranges are deliberately deferred to a later phase, not attempted until a dedicated-storage tier is an actual product decision.
 6. **[Closed — see §12] Usage metering (§5.6)** — can be built in parallel with the above once a stable tenant identity (item 2) exists to key metering records on; genuinely new subsystem, not an extension.
 7. **[Closed — see §13] Real migration data movement (§5.7)** — gates the dedicated-node tier specifically; can be deferred until that tier is actually being sold, the same "don't build ahead of a concrete need" discipline the LPAR roadmap itself used to correctly close out nested partitions (§9 of that doc).
-8. **[Closed — see §14] Weighted CPU scheduling (§5.8)** and **capacity resizing (§5.9)** — lower urgency individually, but item 9 in particular should be revisited the moment any concrete target tenant count exists, since it's pure sizing work with no design risk.
+8. **[Closed — see §14] Weighted CPU scheduling (§5.8)** and **[Closed — see §18] capacity resizing (§5.9)** — lower urgency individually, but item 9 in particular should be revisited the moment any concrete target tenant count exists, since it's pure sizing work with no design risk.
 
 ## 8. Findings addendum: Network fairness, Phase 1 (§5 item 4 / §7 item 1) — partially closed
 
@@ -260,3 +260,28 @@ A dedicated-storage tier became an actual product decision, ending Phase 3's des
 **Verification.** New scenarios in `tests/rowstore_host_test.c` and `tests/vecstore_host_test.c` prove disjoint per-partition page ranges, independent exhaustion (one partition's slice can be full while a different partition allocates normally), and persistence round-trip correctness for the new per-partition cursor arrays. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions.
 
 **Status:** Storage Isolation Roadmap is now fully closed (Phases 1, 2, and 3). §5 item 2 / §7 item 5 are closed.
+
+## 18. Findings addendum: deliberate capacity sizing (§4 / §5 item 9 / §7 item 8) — closed
+
+§4's own framing was explicit: these constants were development-sandbox defaults, and "a real leasing rollout needs to decide real numbers, not inherit these by accident." A concrete target — "medium," roughly 256 tenants — is now that real number, and every constant that would otherwise have silently become the new binding ceiling, or stayed an under-scaled independent mirror, was raised in lockstep rather than just the three named in §4.
+
+**Constants changed.**
+
+- `PARTITION_MAX` (`kernel/partition.h`): 16 → 256.
+- `PARTITION_ASSIGN_MAX` (`kernel/partition.h`): 64 → 4096 (~16 users/tenant average across 256 tenants).
+- `TCP_MAX_CONNS` (`net/tcp.h`): 24 → 512.
+- `PARTITION_LEASE_MAX` (`net/consensus.h`): 16 → 256 — a linear-scan fail-closed lease pool, not indexed by `partition_id`, that would otherwise silently cap write-lease-capable partitions at 16 regardless of `PARTITION_MAX`.
+- `TENANT_MAX` (`kernel/tenant.h`): 32 → 256 — `tenant_create()` is the real go-forward provisioning path (§9) and would otherwise become the silent binding ceiling on tenant count even after `PARTITION_MAX` was raised.
+- `DATABASE_MAX` (`kernel/database.h`): 32 → 256, and `DATABASE_GRANT_MAX`: 64 → 1024 (same reasoning as `TENANT_MAX`; `DATABASE_GRANT_MAX_UIDS`/`DATABASE_GRANT_MAX_GROUPS`, per-grant sub-limits unrelated to tenant count, were left unchanged).
+
+**A latent bug the resize surfaced, not caused.** `struct TCPConn.conn_id` (`net/tcp.h`) was `uint8_t`, which would have silently wrapped modulo 256 once `TCP_MAX_CONNS` exceeded 256. Widened to `uint16_t` (`net/tcp.h`, `net/tcp.c`'s `tcp_init()`). Nothing currently reads this field back for lookup, but it was a real landmine left for whenever something eventually does.
+
+**The corruption risk this pass caught before it shipped.** `kernel/persist.c`'s `persist_write_array()`/`persist_read_array()` have no bounds or overlap check of their own — they walk forward from a given LBA trusting the caller. `kernel/persist.h`'s LBA layout had, in several places, exactly zero slack between the end of one region and the next region's header. Raising `PARTITION_MAX`/`PARTITION_ASSIGN_MAX`/`DATABASE_MAX`/`DATABASE_GRANT_MAX`/`TENANT_MAX` grows `partition_table[]`, `partition_assign_table[]`, `databases[]`, `database_grants[]`, and `tenants[]` well past their old 1-frame allotments — without remediation, a grown region's write would have silently overwritten the next region's still-in-flight data, corrupting unrelated subsystems' persisted state on the very first boot after the resize. `kernel/persist.h`'s entire LBA layout from `PERSIST_PART_HDR_LBA` onward was rewritten with exact `sizeof()`-verified frame counts and a deliberate 1-frame safety gap inserted after every region, so a future resize of any one constant can no longer silently corrupt its neighbor. Final layout ends at LBA 7568, comfortably clear of `STREAM_DIR_LBA` (8192) with 78 frames of margin. Regions before `PERSIST_PART_HDR_LBA` (catalog/records/schemas/programs) are untouched. `kernel/persist.c`'s call sites needed no logic changes — they only reference the named `PERSIST_*_LBA` constants, not hardcoded offsets.
+
+**Disclosed trade-off, not a silent side effect.** `ROWSTORE_MAX_PAGES`/`VECSTORE_MAX_PAGES` (and the underlying 10 GiB disk image) were deliberately *not* grown alongside `PARTITION_MAX`, so each partition's guaranteed physical storage sub-range (Storage Isolation Phase 3, §17) now divides the same disk 256 ways instead of 16: rowstore per-partition capacity drops from 64 MiB to 4 MiB, vecstore from 16 MiB to 1 MiB. Both still divide evenly — no unreachable-page bug — and this is documented directly in `kernel/rowstore.h`/`kernel/vecstore.h`, not silently accepted. Raising the disk image size itself is a separate, larger decision left for whenever real per-tenant storage capacity requirements are known.
+
+**RAM footprint, also a deliberate input, not a silent side effect.** Growing `TCP_MAX_CONNS` from 24 to 512 grows `tcp_conns[]` (each carrying a 32 KiB `rbuf[]`) and `net/http.c`'s `http_conns[TCP_MAX_CONNS]` (each 64 KiB) by roughly 46–47 MiB combined — a real, named cost of the new connection ceiling, not something that happened by accident.
+
+**Verification.** `tests/tenant_host_test.c` Scenario H's `CHECK(rc == 2, ...)` capacity-exhaustion assertion was checked by hand against the exact loop bounds in `kernel/tenant.c` and `kernel/partition.c`: `partition_create()` reserves slot 0 for `PARTITION_SYSTEM` (`for (int i = 1; i < PARTITION_MAX; i++)`), so it still has exactly one fewer usable slot (255) than `TENANT_MAX`/`DATABASE_MAX` (256) even after all three were raised to the same nominal value — `partition_create()` remains the tighter, correctly-reported ceiling, and only the test's explanatory comment needed updating, not its logic or expected return code. Full regression: `tests/run_all.sh`, 56/56 host tests passing, zero regressions (run in four batches of 14 in this sandbox, no functional difference from a single pass).
+
+**Status:** §4 and §5 item 9 / §7 item 8 (deliberate capacity sizing) are closed.

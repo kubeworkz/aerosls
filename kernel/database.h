@@ -88,16 +88,22 @@
 #include "group_profile.h"   // GROUP_NAME_LEN, group_contains_uid()
 
 #define DATABASE_NAME_LEN   32
-#define DATABASE_MAX        32
+// Multitenant Isolation Gap Analysis §5 item 9 (capacity sizing): raised in
+// lockstep with PARTITION_MAX/TENANT_MAX (kernel/partition.h, kernel/
+// tenant.h) -- tenant_create() provisions one database per tenant, so
+// leaving DATABASE_MAX at its old value would have made it (not
+// PARTITION_MAX) the binding ceiling on real tenant count.
+#define DATABASE_MAX        256
 
 // ─── Database Namespace & Access Roadmap Phase 3: grants ───────────────────
 // See roadmap doc §1.4 for the full "why a new struct, not a mode flag on
-// SLSAuthListEntry" reasoning. Sizes mirror authlist.h's own
-// AUTHLIST_MAX/AUTHLIST_MAX_GRANTEE_UIDS/AUTHLIST_MAX_GRANTEE_GROUPS
-// exactly -- same "how many distinct grant entries/grantees does a small
-// simulated deployment plausibly need" judgment call, not a new sizing
-// philosophy.
-#define DATABASE_GRANT_MAX           64
+// SLSAuthListEntry" reasoning. DATABASE_GRANT_MAX raised alongside DATABASE_
+// MAX above (roughly 4 grants/tenant average across 256 tenants, the same
+// per-tenant-multiplier judgment call PARTITION_ASSIGN_MAX uses relative to
+// PARTITION_MAX) -- the grantee-count sub-limits are unrelated to tenant
+// count (they cap how many uids/groups one single grant can name) and are
+// left unchanged.
+#define DATABASE_GRANT_MAX           1024
 #define DATABASE_GRANT_MAX_UIDS      16
 #define DATABASE_GRANT_MAX_GROUPS     8
 

@@ -33,8 +33,18 @@
                                  * also where every object starts out — see the
                                  * top comment on why this equals DEFAULT. */
 #define PARTITION_DEFAULT  0   /* unassigned uids resolve here */
-#define PARTITION_MAX         16   /* defined partitions, small fixed table like PROC_MAX */
-#define PARTITION_ASSIGN_MAX  64   /* uid -> partition assignments, mirrors ROLE_TABLE_MAX */
+// Multitenant Isolation Gap Analysis §5 item 9 / §7 item 8 (capacity sizing):
+// raised from the original 16/64 development-sandbox defaults to a real
+// "medium ~256 tenant" self-serve SaaS launch target, a deliberate business
+// input rather than an inherited default -- see docs/AeroSLS-Multitenant-
+// Isolation-Gap-Analysis-v0.1.md's own findings addendum for this phase for
+// the full list of what else had to move in lockstep (persist.h's LBA
+// layout, TENANT_MAX/DATABASE_MAX/PARTITION_LEASE_MAX, TCP_MAX_CONNS) and
+// what was deliberately left as a disclosed trade-off (rowstore/vecstore's
+// per-partition storage sub-range size, which now divides a still-10 GiB
+// disk image 256 ways instead of 16).
+#define PARTITION_MAX         256  /* defined partitions -- sized for ~256 real tenants */
+#define PARTITION_ASSIGN_MAX  4096 /* uid -> partition assignments, ~16 users/tenant average across 256 tenants */
 #define PARTITION_NAME_LEN    32
 
 struct SLSPartitionEntry {

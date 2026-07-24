@@ -130,9 +130,11 @@
 
 // ─── Storage Isolation Roadmap Phase 3: real per-partition page sub-ranges ──
 // Mirrors ROWSTORE_PAGES_PER_PARTITION (rowstore.h) exactly -- see that
-// file's header comment for the full design writeup, which applies here
-// unchanged. VECSTORE_MAX_PAGES / PARTITION_MAX = 65536 / 16 = 4096 exactly
-// (16 MiB per partition, today).
+// file's header comment for the full design writeup, including the
+// Multitenant Isolation Gap Analysis §5 item 9 capacity-sizing trade-off,
+// which applies here unchanged. VECSTORE_MAX_PAGES / PARTITION_MAX =
+// 65536 / 256 = 256 exactly (1 MiB per partition, down from 16 MiB at the
+// old PARTITION_MAX=16).
 #define VECSTORE_PAGES_PER_PARTITION (VECSTORE_MAX_PAGES / PARTITION_MAX)
 
 // Max bytes one serialized entry can occupy: 1 tombstone byte + 8-byte
