@@ -8746,3 +8746,1001 @@ The migration and adoption strategy provides:
 This strategy ensures that adopting AeroSLS is not a leap of faith but a calculated, incremental journey with clear milestones and measurable returns. Organizations can start small, prove value quickly, and expand adoption based on demonstrated success rather than promises.
 
 The combination of SIMI's hardware independence with this pragmatic adoption approach positions AeroSLS to succeed where many new technologies fail - not because the technology is better (though it is), but because the path to adoption is clear, low-risk, and rewarding.
+
+## **Phase 1: Minimum Viable SIMI Runtime (Weeks 1-4)**
+
+### **Step 1: Project Setup**
+
+bash
+
+```
+# Create the workspace
+mkdir aerosls-compiler
+cd aerosls-compiler
+git init
+
+# Initialize Rust workspace
+cat > Cargo.toml << 'EOF'
+[workspace]
+members = [
+    "crates/simi-core",      # Core SIMI types and IR
+    "crates/simi-parser",    # AeroSLS language parser
+    "crates/simi-compiler",  # IR generation and optimization
+    "crates/simi-runtime",   # Runtime execution engine
+    "crates/simi-cli",       # Command-line interface
+    "crates/simi-wasm",      # WASM backend
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+EOF
+
+# Create crate directories
+for crate in simi-core simi-parser simi-compiler simi-runtime simi-cli simi-wasm; do
+    cargo init --lib crates/$crate
+done
+
+cargo init --bin crates/simi-cli
+```
+
+### **Step 2: Core SIMI Types (Week 1)**
+
+rust
+
+```
+// crates/simi-core/src/lib.rs
+// This is the foundation - everything depends on these types
+
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+
+/// SIMI Module - the top-level compilation unit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimiModule {
+    pub header: ModuleHeader,
+    pub types: TypeRegistry,
+    pub services: Vec<ServiceDefinition>,
+    pub pipelines: Vec<Pipeline>,
+    pub state: Vec<StateDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleHeader {
+    pub name: String,
+    pub version: (u16, u16), // (major, minor)
+    pub source: String,
+}
+
+/// Service Definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceDefinition {
+    pub name: String,
+    pub version: String,
+    pub endpoints: Vec<Endpoint>,
+    pub state_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Endpoint {
+    pub name: String,
+    pub method: HttpMethod,
+    pub path: String,
+    pub input_type: TypeId,
+    pub output_type: TypeId,
+    pub pipeline: Pipeline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HttpMethod {
+    Get, Post, Put, Delete, Patch,
+}
+
+/// Pipeline - the core processing abstraction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pipeline {
+    pub name: String,
+    pub stages: Vec<PipelineStage>,
+    pub input_type: TypeId,
+    pub output_type: TypeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStage {
+    pub operation: StageOperation,
+    pub placement: PlacementHint,
+    pub parallelism: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StageOperation {
+    Map(MapOperation),
+    Filter(FilterOperation),
+    Reduce(ReduceOperation),
+    Window(WindowOperation),
+    StateAccess(StateOperation),
+    ServiceCall(ServiceCallOperation),
+    FanOut(FanOutOperation),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MapOperation {
+    pub function: String,
+    pub arguments: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterOperation {
+    pub predicate: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReduceOperation {
+    pub reducer: String,
+    pub initial_value: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowOperation {
+    pub window_type: WindowType,
+    pub size: u64,
+    pub operation: Box<StageOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowType {
+    Tumbling,
+    Sliding,
+    Session,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateOperation {
+    pub state_id: String,
+    pub operation: StateOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StateOp {
+    Get { key: Value },
+    Put { key: Value, value: Value },
+    Delete { key: Value },
+    Scan { prefix: Value, limit: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceCallOperation {
+    pub service: String,
+    pub method: String,
+    pub payload: Value,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanOutOperation {
+    pub targets: Vec<String>,
+    pub aggregation: AggregationStrategy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AggregationStrategy {
+    First,
+    All,
+    Merge,
+}
+
+/// Values
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Array(Vec<Value>),
+    Object(HashMap<String, Value>),
+    Timestamp(u64),
+}
+
+/// Types
+pub type TypeId = String;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRegistry {
+    types: HashMap<TypeId, SimiType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SimiType {
+    Int,
+    Float,
+    String,
+    Bool,
+    Bytes,
+    Timestamp,
+    Array(Box<SimiType>),
+    Object(HashMap<String, SimiType>),
+    Optional(Box<SimiType>),
+    Stream(Box<SimiType>),
+}
+
+/// State Definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateDefinition {
+    pub id: String,
+    pub state_type: StateType,
+    pub key_type: SimiType,
+    pub value_type: SimiType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StateType {
+    KeyValue,
+    Counter,
+    Set,
+    Queue,
+}
+
+/// Placement Hints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlacementHint {
+    Any,
+    DataLocal,
+    ComputeOptimized,
+    Affinity(Vec<String>),
+}
+```
+
+### **Step 3: AeroSLS Parser (Week 2)**
+
+rust
+
+```
+// crates/simi-parser/src/lib.rs
+// A simple parser for a subset of AeroSLS
+
+use simi_core::*;
+use pest::Parser;
+use pest_derive::Parser;
+
+#[derive(Parser)]
+#[grammar = "aerosls.pest"]
+pub struct AeroSLSParser;
+
+pub fn parse_source(source: &str) -> Result<SimiModule, ParseError> {
+    let pairs = AeroSLSParser::parse(Rule::module, source)
+        .map_err(|e| ParseError::Syntax(e.to_string()))?;
+    
+    let mut module = SimiModule {
+        header: ModuleHeader {
+            name: String::new(),
+            version: (0, 1),
+            source: source.to_string(),
+        },
+        types: TypeRegistry::default(),
+        services: Vec::new(),
+        pipelines: Vec::new(),
+        state: Vec::new(),
+    };
+    
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::service_def => {
+                let service = parse_service(pair)?;
+                module.services.push(service);
+            }
+            Rule::pipeline_def => {
+                let pipeline = parse_pipeline(pair)?;
+                module.pipelines.push(pipeline);
+            }
+            Rule::state_def => {
+                let state = parse_state(pair)?;
+                module.state.push(state);
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(module)
+}
+
+fn parse_service(pair: pest::iterators::Pair<Rule>) -> Result<ServiceDefinition, ParseError> {
+    // Parse service definition
+    // This is simplified - real parser would handle all syntax
+    todo!("Implement service parsing")
+}
+
+fn parse_pipeline(pair: pest::iterators::Pair<Rule>) -> Result<Pipeline, ParseError> {
+    // Parse pipeline definition
+    todo!("Implement pipeline parsing")
+}
+```
+
+Create the PEG grammar:
+
+pest
+
+```
+// crates/simi-parser/src/aerosls.pest
+
+module = { SOI ~ (service_def | pipeline_def | state_def)* ~ EOI }
+
+service_def = {
+    "service" ~ identifier ~ "{"
+        ~ "version:" ~ string ~ ","
+        ~ "endpoint" ~ endpoint_def*
+        ~ "state" ~ "{" ~ state_ref* ~ "}"
+    ~ "}"
+}
+
+endpoint_def = {
+    identifier ~ "(" ~ parameter_list ~ ")" ~ "->" ~ type_ref
+    ~ pipeline_block
+}
+
+pipeline_def = {
+    "pipeline" ~ identifier ~ "(" ~ parameter_list ~ ")"
+    ~ "{" ~ pipeline_stage* ~ "}"
+}
+
+pipeline_stage = {
+    map_stage | filter_stage | reduce_stage | state_stage
+}
+
+map_stage = {
+    "map" ~ function_call
+}
+
+filter_stage = {
+    "filter" ~ expression
+}
+
+reduce_stage = {
+    "reduce" ~ function_call ~ "with" ~ value
+}
+
+state_stage = {
+    "state" ~ identifier ~ "." ~ state_operation
+}
+
+state_operation = {
+    get_operation | put_operation
+}
+
+get_operation = {
+    "get" ~ "(" ~ expression ~ ")"
+}
+
+put_operation = {
+    "put" ~ "(" ~ expression ~ "," ~ expression ~ ")"
+}
+
+function_call = {
+    identifier ~ "(" ~ argument_list? ~ ")"
+}
+
+argument_list = {
+    expression ~ ("," ~ expression)*
+}
+
+expression = {
+    value | identifier | function_call | binary_op
+}
+
+binary_op = {
+    expression ~ operator ~ expression
+}
+
+operator = {
+    "+" | "-" | "*" | "/" | ">" | "<" | "==" | "&&" | "||"
+}
+
+value = {
+    number | string | bool | array | object
+}
+
+number = @{ int | float }
+int = { "-"? ~ ASCII_DIGIT+ }
+float = { "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+string = { "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+bool = { "true" | "false" }
+
+array = { "[" ~ value* ~ "]" }
+object = { "{" ~ (string ~ ":" ~ value)* ~ "}" }
+
+identifier = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+type_ref = { identifier }
+state_ref = { identifier }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+```
+
+### **Step 4: SIMI Runtime (Week 3-4)**
+
+rust
+
+```
+// crates/simi-runtime/src/lib.rs
+// A minimal runtime that can execute SIMI pipelines
+
+use simi_core::*;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+use async_trait::async_trait;
+
+/// The main runtime that executes SIMI modules
+pub struct SimiRuntime {
+    services: HashMap<String, Arc<Service>>,
+    state_stores: HashMap<String, Arc<dyn StateStore>>,
+    service_registry: Arc<ServiceRegistry>,
+}
+
+impl SimiRuntime {
+    pub fn new() -> Self {
+        SimiRuntime {
+            services: HashMap::new(),
+            state_stores: HashMap::new(),
+            service_registry: Arc::new(ServiceRegistry::new()),
+        }
+    }
+    
+    /// Load a compiled SIMI module
+    pub async fn load_module(&mut self, module: SimiModule) -> Result<()> {
+        // Register state stores
+        for state_def in &module.state {
+            let store: Arc<dyn StateStore> = match state_def.state_type {
+                StateType::KeyValue => Arc::new(InMemoryStore::new()),
+                StateType::Counter => Arc::new(CounterStore::new()),
+                _ => Arc::new(InMemoryStore::new()),
+            };
+            self.state_stores.insert(state_def.id.clone(), store);
+        }
+        
+        // Register services
+        for service_def in &module.services {
+            let service = Service::new(
+                service_def.clone(),
+                self.state_stores.clone(),
+                self.service_registry.clone(),
+            );
+            self.services.insert(service_def.name.clone(), Arc::new(service));
+        }
+        
+        Ok(())
+    }
+    
+    /// Start the runtime and begin serving requests
+    pub async fn start(&self, port: u16) -> Result<()> {
+        // Start HTTP server
+        let app = self.create_router();
+        
+        println!("🚀 SIMI Runtime starting on port {}", port);
+        axum::Server::bind(&format!("0.0.0.0:{}", port).parse()?)
+            .serve(app.into_make_service())
+            .await?;
+        
+        Ok(())
+    }
+    
+    fn create_router(&self) -> axum::Router {
+        let mut router = axum::Router::new();
+        
+        // Add routes for each service endpoint
+        for (service_name, service) in &self.services {
+            for endpoint in &service.definition.endpoints {
+                let path = format!("/{}{}", service_name, endpoint.path);
+                let service = service.clone();
+                
+                let handler = move |body: axum::Json<Value>| {
+                    let service = service.clone();
+                    async move {
+                        match service.handle_request(&endpoint.name, body.0).await {
+                            Ok(response) => Ok(axum::Json(response)),
+                            Err(e) => Err((
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                e.to_string(),
+                            )),
+                        }
+                    }
+                };
+                
+                router = router.route(&path, axum::routing::post(handler));
+            }
+        }
+        
+        // Health check
+        router = router.route("/health", axum::routing::get(|| async { "OK" }));
+        
+        router
+    }
+}
+
+/// A service instance that can handle requests
+struct Service {
+    definition: ServiceDefinition,
+    state_stores: HashMap<String, Arc<dyn StateStore>>,
+    service_registry: Arc<ServiceRegistry>,
+}
+
+impl Service {
+    fn new(
+        definition: ServiceDefinition,
+        state_stores: HashMap<String, Arc<dyn StateStore>>,
+        service_registry: Arc<ServiceRegistry>,
+    ) -> Self {
+        Service {
+            definition,
+            state_stores,
+            service_registry,
+        }
+    }
+    
+    async fn handle_request(
+        &self,
+        endpoint_name: &str,
+        input: Value,
+    ) -> Result<Value> {
+        // Find the endpoint
+        let endpoint = self.definition.endpoints.iter()
+            .find(|e| e.name == endpoint_name)
+            .ok_or_else(|| anyhow::anyhow!("Endpoint not found: {}", endpoint_name))?;
+        
+        // Execute the pipeline
+        self.execute_pipeline(&endpoint.pipeline, input).await
+    }
+    
+    async fn execute_pipeline(
+        &self,
+        pipeline: &Pipeline,
+        mut data: Value,
+    ) -> Result<Value> {
+        for stage in &pipeline.stages {
+            data = self.execute_stage(stage, data).await?;
+        }
+        Ok(data)
+    }
+    
+    async fn execute_stage(
+        &self,
+        stage: &PipelineStage,
+        data: Value,
+    ) -> Result<Value> {
+        match &stage.operation {
+            StageOperation::Map(map_op) => {
+                self.execute_map(map_op, data).await
+            }
+            StageOperation::Filter(filter_op) => {
+                self.execute_filter(filter_op, data).await
+            }
+            StageOperation::StateAccess(state_op) => {
+                self.execute_state_operation(state_op).await
+            }
+            StageOperation::ServiceCall(svc_op) => {
+                self.execute_service_call(svc_op).await
+            }
+            StageOperation::Reduce(reduce_op) => {
+                self.execute_reduce(reduce_op, data).await
+            }
+            _ => Ok(data), // Not implemented yet
+        }
+    }
+    
+    async fn execute_map(
+        &self,
+        op: &MapOperation,
+        data: Value,
+    ) -> Result<Value> {
+        // For MVP, support basic transformations
+        match op.function.as_str() {
+            "uppercase" => match data {
+                Value::String(s) => Ok(Value::String(s.to_uppercase())),
+                _ => Err(anyhow::anyhow!("uppercase requires string input")),
+            },
+            "length" => match &data {
+                Value::String(s) => Ok(Value::Int(s.len() as i64)),
+                Value::Array(arr) => Ok(Value::Int(arr.len() as i64)),
+                _ => Err(anyhow::anyhow!("length requires string or array")),
+            },
+            "double" => match data {
+                Value::Int(n) => Ok(Value::Int(n * 2)),
+                Value::Float(n) => Ok(Value::Float(n * 2.0)),
+                _ => Err(anyhow::anyhow!("double requires numeric input")),
+            },
+            _ => Ok(data), // Identity for unknown functions
+        }
+    }
+    
+    async fn execute_filter(
+        &self,
+        op: &FilterOperation,
+        data: Value,
+    ) -> Result<Value> {
+        // For MVP, support basic predicates
+        match op.predicate.as_str() {
+            "is_positive" => match data {
+                Value::Int(n) => {
+                    if n > 0 {
+                        Ok(Value::Int(n))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                _ => Ok(Value::Null),
+            },
+            "is_valid" => {
+                match &data {
+                    Value::Null => Ok(Value::Null),
+                    Value::String(s) if s.is_empty() => Ok(Value::Null),
+                    _ => Ok(data),
+                }
+            }
+            _ => Ok(data), // Pass through for unknown predicates
+        }
+    }
+    
+    async fn execute_state_operation(
+        &self,
+        op: &StateOperation,
+    ) -> Result<Value> {
+        let store = self.state_stores.get(&op.state_id)
+            .ok_or_else(|| anyhow::anyhow!("State store not found: {}", op.state_id))?;
+        
+        match &op.operation {
+            StateOp::Get { key } => {
+                store.get(&serialize_value(key)).await
+            }
+            StateOp::Put { key, value } => {
+                store.put(
+                    serialize_value(key),
+                    serialize_value(value),
+                ).await?;
+                Ok(Value::Null)
+            }
+            StateOp::Delete { key } => {
+                store.delete(&serialize_value(key)).await?;
+                Ok(Value::Null)
+            }
+            _ => Err(anyhow::anyhow!("Operation not implemented")),
+        }
+    }
+    
+    async fn execute_service_call(
+        &self,
+        op: &ServiceCallOperation,
+    ) -> Result<Value> {
+        self.service_registry.call(
+            &op.service,
+            &op.method,
+            op.payload.clone(),
+            op.timeout_ms,
+        ).await
+    }
+    
+    async fn execute_reduce(
+        &self,
+        op: &ReduceOperation,
+        data: Value,
+    ) -> Result<Value> {
+        match &data {
+            Value::Array(items) => {
+                match op.reducer.as_str() {
+                    "sum" => {
+                        let total = items.iter().fold(0i64, |acc, item| {
+                            match item {
+                                Value::Int(n) => acc + n,
+                                _ => acc,
+                            }
+                        });
+                        Ok(Value::Int(total))
+                    }
+                    "count" => {
+                        Ok(Value::Int(items.len() as i64))
+                    }
+                    _ => Ok(data),
+                }
+            }
+            _ => Ok(data),
+        }
+    }
+}
+
+/// In-memory state store for MVP
+#[derive(Debug)]
+struct InMemoryStore {
+    data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl InMemoryStore {
+    fn new() -> Self {
+        InMemoryStore {
+            data: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl StateStore for InMemoryStore {
+    async fn get(&self, key: &[u8]) -> Result<Value> {
+        let data = self.data.read().await;
+        match data.get(key) {
+            Some(value) => Ok(deserialize_value(value)),
+            None => Ok(Value::Null),
+        }
+    }
+    
+    async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let mut data = self.data.write().await;
+        data.insert(key, value);
+        Ok(())
+    }
+    
+    async fn delete(&self, key: &[u8]) -> Result<()> {
+        let mut data = self.data.write().await;
+        data.remove(key);
+        Ok(())
+    }
+}
+
+#[async_trait]
+trait StateStore: Send + Sync {
+    async fn get(&self, key: &[u8]) -> Result<Value>;
+    async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()>;
+    async fn delete(&self, key: &[u8]) -> Result<()>;
+}
+
+/// Simple service registry for service-to-service calls
+struct ServiceRegistry {
+    services: RwLock<HashMap<String, String>>, // service name -> URL
+}
+
+impl ServiceRegistry {
+    fn new() -> Self {
+        ServiceRegistry {
+            services: RwLock::new(HashMap::new()),
+        }
+    }
+    
+    async fn call(
+        &self,
+        service: &str,
+        method: &str,
+        payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let services = self.services.read().await;
+        let url = services.get(service)
+            .ok_or_else(|| anyhow::anyhow!("Service not found: {}", service))?;
+        
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/{}", url, method))
+            .json(&payload)
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .send()
+            .await?;
+        
+        let value: Value = response.json().await?;
+        Ok(value)
+    }
+}
+
+// Utility functions
+fn serialize_value(value: &Value) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_default()
+}
+
+fn deserialize_value(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).unwrap_or(Value::Null)
+}
+```
+
+### **Step 5: CLI Tool**
+
+rust
+
+```
+// crates/simi-cli/src/main.rs
+use clap::{Parser, Subcommand};
+use simi_parser;
+use simi_runtime::SimiRuntime;
+
+#[derive(Parser)]
+#[command(name = "simi")]
+#[command(about = "AeroSLS SIMI Runtime CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a SIMI application
+    Run {
+        /// Path to the AeroSLS source file
+        file: String,
+        
+        /// Port to listen on
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
+    
+    /// Parse and validate a source file
+    Check {
+        /// Path to the AeroSLS source file
+        file: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Commands::Run { file, port } => {
+            println!("📦 Loading: {}", file);
+            
+            // Parse the source file
+            let source = std::fs::read_to_string(&file)?;
+            let module = simi_parser::parse_source(&source)?;
+            
+            println!("✅ Parsed successfully");
+            println!("   Services: {:?}", module.services.iter().map(|s| &s.name).collect::<Vec<_>>());
+            println!("   Pipelines: {:?}", module.pipelines.iter().map(|p| &p.name).collect::<Vec<_>>());
+            
+            // Create and start runtime
+            let mut runtime = SimiRuntime::new();
+            runtime.load_module(module).await?;
+            runtime.start(port).await?;
+        }
+        Commands::Check { file } => {
+            let source = std::fs::read_to_string(&file)?;
+            match simi_parser::parse_source(&source) {
+                Ok(module) => {
+                    println!("✅ Valid AeroSLS");
+                    println!("   Module: {}", module.header.name);
+                    println!("   Services: {}", module.services.len());
+                    println!("   Pipelines: {}", module.pipelines.len());
+                }
+                Err(e) => {
+                    eprintln!("❌ Parse error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+```
+
+### **Step 6: Example Application**
+
+aerosls
+
+```
+// examples/hello-service.simi
+// A simple AeroSLS service
+
+service HelloService {
+    version: "0.1.0"
+    
+    state {
+        messages: KeyValue<String, Message>
+    }
+    
+    endpoint greet(name: String) -> String {
+        pipeline {
+            map uppercase
+            state messages.put("last_greeting", value)
+            map format_greeting
+        }
+    }
+    
+    endpoint get_last_greeting() -> String {
+        pipeline {
+            state messages.get("last_greeting")
+            map extract_greeting
+        }
+    }
+}
+
+// Function definitions (for MVP, these would be built-in or WASM modules)
+function uppercase(input: String) -> String {
+    input.to_uppercase()
+}
+
+function format_greeting(name: String) -> String {
+    format!("Hello, {}! Welcome to AeroSLS!", name)
+}
+
+function extract_greeting(msg: Message) -> String {
+    msg.content
+}
+```
+
+### **Step 7: Build and Run**
+
+bash
+
+```
+# Build the project
+cargo build --release
+
+# Run the example
+./target/release/simi-cli run examples/hello-service.simi
+
+# In another terminal, test the service
+curl -X POST http://localhost:8080/HelloService/greet \
+  -H "Content-Type: application/json" \
+  -d '"World"'
+
+# Response: "HELLO, WORLD! WELCOME TO AEROSLS!"
+
+curl -X POST http://localhost:8080/HelloService/get_last_greeting \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Response: "HELLO, WORLD! WELCOME TO AEROSLS!"
+```
+
+## **Next Steps Beyond MVP**
+
+After getting this MVP running, here's the prioritized roadmap:
+
+### **Week 5-6: Type System**
+
+rust
+
+```
+// Add proper type checking
+pub struct TypeChecker {
+    type_registry: TypeRegistry,
+    errors: Vec<TypeError>,
+}
+
+impl TypeChecker {
+    pub fn check_module(&mut self, module: &SimiModule) -> Result<()> {
+        // Validate type compatibility across pipeline stages
+        // Check state operation types
+        // Verify service call types
+        todo!("Implement type checking")
+    }
+}
+```
+
+### **Week 7-8: WASM Backend**
+
+rust
+
+```
+// crates/simi-wasm/src/lib.rs
+pub struct WasmBackend;
+
+impl WasmBackend {
+    pub fn compile(module: &SimiModule) -> Result<Vec<u8>> {
+        // Generate WASM bytecode from SIMI IR
+        todo!("Implement WASM compilation")
+    }
+}
+```
+
+### **Week 9-12: Distributed Features**
+
+- Add Redis state backend
+- Implement service discovery
+- Add circuit breakers
+- Basic service mesh
+
+The key is to start simple and iterate. The MVP gives you:
+
+1. A working parser for a subset of AeroSLS
+2. An in-memory runtime that can execute pipelines
+3. HTTP endpoints for services
+4. Basic state management
+5. A CLI tool for development
+
+From here, you can gradually add the sophisticated features we designed - type checking, optimization passes, distributed state, etc. The important thing is to have something running that demonstrates the core value proposition: hardware-independent service definitions that "just work."
