@@ -2966,7 +2966,7 @@ The SIMI optimizer achieves remarkable improvements by understanding the semanti
 
 rust
 
-```
+```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeGenLevel {
     Debug,          // Fast compilation, debuggable code
@@ -3946,7 +3946,7 @@ impl InterpreterBackend {
 
 rust
 
-```
+```rust
 struct SIMIBuilder {
     module: SIMIModule,
     optimization_level: OptimizationLevel,
