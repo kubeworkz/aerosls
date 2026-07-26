@@ -394,7 +394,7 @@ service UnifiedUI {
         
         // Priority order
         priority: [InterfaceType] = [
-            InterfaceType::DesktopApp,  // If available
+            InterfaceType::DesktopApp,   // If available
             InterfaceType::WebBrowser,   // Always available
             InterfaceType::Terminal,     // Always available
             InterfaceType::MobileApp,    // If on same network
