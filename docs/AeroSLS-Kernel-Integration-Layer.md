@@ -187,7 +187,7 @@ impl KernelRuntime {
         }
     }
     
-    /// Deploy a SIMI service to the kernel
+    /// Deploy a SIMI service to the AeroSLS kernel
     pub async fn deploy_service(
         &self,
         module: &SimiModule,
