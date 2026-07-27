@@ -2211,6 +2211,8 @@ The beauty is that these local applications can later become distributed service
 
 ---
 
+## Market Opportunities
+
 We'll focus on systems where the SIMI-inspired hardware independence provides genuine competitive advantages.
 
 ## High-Value Replacement Targets
