@@ -3644,3 +3644,751 @@ fn benchmark_kernel_vs_userspace() {
 - Kernel DB: 0.1-0.5ms per scan (no bottleneck!)
 
 This is the killer feature that competitors can't match - they're stuck with userspace databases that are an order of magnitude slower.
+
+---
+
+## Complete Docker Setup for AeroLogix
+
+### 1. Cloud Dockerfile (API + Dashboard)
+
+```plaintext
+# Dockerfile.cloud
+# Multi-stage build for AeroLogix Cloud Deployment
+
+# Stage 1: Build
+FROM rust:1.75-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace manifests
+COPY Cargo.toml Cargo.lock ./
+COPY crates/aerologix-core/Cargo.toml crates/aerologix-core/
+COPY crates/aerologix-api/Cargo.toml crates/aerologix-api/
+COPY crates/aerologix-ml/Cargo.toml crates/aerologix-ml/
+COPY crates/aerologix-cli/Cargo.toml crates/aerologix-cli/
+
+# Create dummy source files for dependency resolution
+RUN mkdir -p crates/aerologix-core/src && \
+    echo "pub fn dummy() {}" > crates/aerologix-core/src/lib.rs && \
+    mkdir -p crates/aerologix-api/src && \
+    echo "pub fn dummy() {}" > crates/aerologix-api/src/lib.rs && \
+    mkdir -p crates/aerologix-ml/src && \
+    echo "pub fn dummy() {}" > crates/aerologix-ml/src/lib.rs && \
+    mkdir -p crates/aerologix-cli/src && \
+    echo "fn main() {}" > crates/aerologix-cli/src/main.rs
+
+# Build dependencies (this layer is cached)
+RUN cargo build --release -p aerologix-api
+RUN cargo build --release -p aerologix-cli
+
+# Copy actual source
+COPY crates/ crates/
+COPY services/ services/
+
+# Build with real source
+RUN touch crates/aerologix-core/src/lib.rs && \
+    touch crates/aerologix-api/src/lib.rs && \
+    touch crates/aerologix-cli/src/main.rs && \
+    cargo build --release -p aerologix-api && \
+    cargo build --release -p aerologix-cli
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash aerologix && \
+    mkdir -p /app /data /config && \
+    chown -R aerologix:aerologix /app /data /config
+
+WORKDIR /app
+
+# Copy binaries
+COPY --from=builder /build/target/release/aerologix-api /app/
+COPY --from=builder /build/target/release/aerologix-cli /app/
+
+# Copy configuration
+COPY config/cloud.yaml /config/aerologix.yaml
+COPY services/ /app/services/
+
+# Copy entrypoint
+COPY scripts/docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh
+
+USER aerologix
+
+EXPOSE 8080 9090
+
+ENV RUST_LOG=info
+ENV AEROLOGIX_ENV=production
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["serve", "--port", "8080"]
+```
+
+### 2. Edge Dockerfile (with Kernel Integration)
+
+```plaintext
+# Dockerfile.edge
+# Edge deployment with kernel database access
+
+# Stage 1: Build for edge
+FROM rust:1.75-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy source
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY edge/ edge/
+
+# Build edge runtime
+RUN cargo build --release \
+    -p aerologix-edge \
+    --features "kernel-db,offline-first"
+
+# Stage 2: Edge runtime
+FROM debian:bookworm-slim AS edge
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    i2c-tools \
+    usbutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user
+RUN useradd -m -s /bin/bash aerologix && \
+    mkdir -p /app /data /backup /var/lib/aerologix && \
+    chown -R aerologix:aerologix /app /data /backup /var/lib/aerologix
+
+WORKDIR /app
+
+# Copy binaries
+COPY --from=builder /build/target/release/aerologix-edge /app/
+COPY --from=builder /build/target/release/aerologix-cli /app/
+
+# Copy edge configuration
+COPY edge/config/ /app/config/
+COPY services/ /app/services/
+
+# Copy edge scripts
+COPY edge/scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
+
+# Copy kernel module (if running on host kernel)
+# COPY kernel/aerosls-kernel.ko /lib/modules/
+
+USER aerologix
+
+EXPOSE 8081
+
+ENV RUST_LOG=info
+ENV EDGE_MODE=true
+ENV KERNEL_DB_PATH=/var/lib/aerologix/edge.db
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD curl -f http://localhost:8081/health || exit 1
+
+ENTRYPOINT ["/app/scripts/edge-entrypoint.sh"]
+CMD ["serve", "--port", "8081", "--edge-mode"]
+```
+
+### 3. Kernel-Integrated Dockerfile (Runs with AeroSLS Kernel)
+
+```plaintext
+# Dockerfile.kernel
+# Runs AeroLogix directly on AeroSLS kernel in QEMU
+
+# Stage 1: Build kernel image with AeroLogix baked in
+FROM rust:1.75-slim-bookworm AS kernel-builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    nasm \
+    xorriso \
+    grub-pc-bin \
+    grub-common \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /kernel
+
+# Copy kernel source
+COPY kernel/ /kernel/
+
+# Copy AeroLogix services
+COPY services/ /kernel/services/
+
+# Build kernel with integrated AeroLogix
+RUN make clean && \
+    make -j$(nproc) \
+    KERNEL_FEATURES="db,net,simi" \
+    EMBEDDED_SERVICES="/kernel/services/warehouse.simi,/kernel/services/fleet.simi"
+
+# Stage 2: Create bootable image
+FROM alpine:latest AS image-builder
+
+RUN apk add --no-cache \
+    qemu-system-x86_64 \
+    qemu-img
+
+WORKDIR /image
+
+# Copy kernel binary
+COPY --from=kernel-builder /kernel/build/aerosls-kernel.bin /image/
+
+# Create disk image with database
+RUN qemu-img create -f raw disk.img 1G && \
+    mkfs.ext2 disk.img && \
+    mkdir -p /mnt/disk && \
+    mount -o loop disk.img /mnt/disk && \
+    mkdir -p /mnt/disk/data /mnt/disk/backup && \
+    umount /mnt/disk
+
+# Create QEMU launch script
+RUN echo '#!/bin/sh\n\
+qemu-system-x86_64 \
+    -kernel /image/aerosls-kernel.bin \
+    -m 512M \
+    -smp 2 \
+    -drive file=/image/disk.img,format=raw \
+    -netdev user,id=net0,hostfwd=tcp::8081-:8081 \
+    -device virtio-net-pci,netdev=net0 \
+    -nographic \
+    -no-reboot' > /image/launch.sh && \
+    chmod +x /image/launch.sh
+
+# Stage 3: Final image
+FROM alpine:latest
+
+RUN apk add --no-cache \
+    qemu-system-x86_64 \
+    curl
+
+COPY --from=image-builder /image/ /opt/aerologix/
+
+EXPOSE 8081
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD curl -f http://localhost:8081/health || exit 1
+
+ENTRYPOINT ["/opt/aerologix/launch.sh"]
+
+```
+
+### 4. Entrypoint Scripts
+
+```bash
+#!/bin/bash
+# scripts/docker-entrypoint.sh
+# Cloud entrypoint
+
+set -e
+
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║              AeroLogix Cloud Platform                    ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
+
+# Wait for dependencies
+echo "⏳ Waiting for dependencies..."
+wait-for-it.sh postgres:5432 -t 60 -- echo "  ✅ PostgreSQL ready"
+wait-for-it.sh redis:6379 -t 30 -- echo "  ✅ Redis ready"
+
+# Run database migrations
+echo "📊 Running database migrations..."
+/app/aerologix-cli db migrate
+
+# Start the application
+echo "🚀 Starting AeroLogix Cloud..."
+exec /app/aerologix-api "$@"
+```
+
+```bash
+#!/bin/bash
+# edge/scripts/edge-entrypoint.sh
+# Edge entrypoint
+
+set -e
+
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║              AeroLogix Edge Runtime                      ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
+
+# Detect hardware
+echo "🔍 Detecting hardware..."
+HARDWARE=$(/app/aerologix-cli hardware detect)
+echo "  Hardware: ${HARDWARE}"
+
+# Check kernel database
+if [ -c /dev/aerosls-kernel ]; then
+    echo "  ✅ Kernel database device found"
+    DB_MODE="kernel"
+else
+    echo "  ⚠️  Kernel database not available, using userspace mode"
+    DB_MODE="userspace"
+fi
+
+# Check connectivity
+if curl -s -f "${CLOUD_ENDPOINT}/health" > /dev/null 2>&1; then
+    echo "  ✅ Cloud connectivity: ONLINE"
+    CONN_MODE="connected"
+else
+    echo "  📡 Cloud connectivity: OFFLINE (operating in local mode)"
+    CONN_MODE="offline"
+fi
+
+# Initialize database
+if [ "$DB_MODE" = "kernel" ]; then
+    echo "📊 Initializing kernel database..."
+    /app/aerologix-cli db init --mode kernel --path "${KERNEL_DB_PATH:-/var/lib/aerologix/edge.db}"
+else
+    echo "📊 Initializing userspace database..."
+    /app/aerologix-cli db init --mode userspace --path "/data/aerologix.db"
+fi
+
+# Restore from backup if available
+if [ -f /backup/latest.db ]; then
+    echo "💾 Restoring from backup..."
+    /app/aerologix-cli db restore /backup/latest.db
+fi
+
+# Start edge runtime
+echo "🚀 Starting AeroLogix Edge..."
+exec /app/aerologix-edge "$@"
+```
+
+### 5. Docker Compose (Complete Stack)
+
+```plaintext
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Cloud API
+  aerologix-cloud:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloud
+    image: aerologix/cloud:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgres://aerologix:${DB_PASSWORD}@postgres:5432/aerologix
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - AEROLOGIX_ENV=production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - cloud_data:/data
+      - ./config/cloud.yaml:/config/aerologix.yaml:ro
+    networks:
+      - aerologix-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Edge Simulator 1 (Warehouse A)
+  aerologix-edge-warehouse-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.edge
+    image: aerologix/edge:latest
+    ports:
+      - "8081:8081"
+    environment:
+      - CLOUD_ENDPOINT=http://aerologix-cloud:8080
+      - EDGE_ID=warehouse-a
+      - EDGE_NAME=Chicago Distribution Center
+      - KERNEL_DB_PATH=/var/lib/aerologix/edge.db
+      - RUST_LOG=info
+    depends_on:
+      aerologix-cloud:
+        condition: service_healthy
+    volumes:
+      - edge_data_wh_a:/data
+      - edge_db_wh_a:/var/lib/aerologix
+    devices:
+      - /dev/aerosls-kernel:/dev/aerosls-kernel  # Optional kernel device
+    networks:
+      - aerologix-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Edge Simulator 2 (Warehouse B)
+  aerologix-edge-warehouse-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.edge
+    image: aerologix/edge:latest
+    ports:
+      - "8082:8081"
+    environment:
+      - CLOUD_ENDPOINT=http://aerologix-cloud:8080
+      - EDGE_ID=warehouse-b
+      - EDGE_NAME=Dallas Fulfillment Center
+      - KERNEL_DB_PATH=/var/lib/aerologix/edge.db
+      - SIMULATE_OFFLINE=true  # Simulate periodic offline
+    depends_on:
+      aerologix-cloud:
+        condition: service_healthy
+    volumes:
+      - edge_data_wh_b:/data
+      - edge_db_wh_b:/var/lib/aerologix
+    networks:
+      - aerologix-net
+
+  # Vehicle Edge Simulator
+  aerologix-edge-vehicle:
+    build:
+      context: .
+      dockerfile: Dockerfile.edge
+    image: aerologix/edge:latest
+    ports:
+      - "8083:8081"
+    environment:
+      - CLOUD_ENDPOINT=http://aerologix-cloud:8080
+      - EDGE_ID=vehicle-001
+      - EDGE_NAME=Delivery Truck 001
+      - VEHICLE_MODE=true
+      - GPS_ENABLED=true
+      - KERNEL_DB_PATH=/var/lib/aerologix/edge.db
+    volumes:
+      - edge_data_vehicle:/data
+      - edge_db_vehicle:/var/lib/aerologix
+    networks:
+      - aerologix-net
+
+  # QEMU Kernel Instance
+  aerologix-kernel:
+    build:
+      context: .
+      dockerfile: Dockerfile.kernel
+    image: aerologix/kernel:latest
+    ports:
+      - "8090:8081"
+    environment:
+      - KERNEL_MEMORY=512M
+      - KERNEL_SMP=2
+    devices:
+      - /dev/kvm:/dev/kvm  # KVM acceleration
+    networks:
+      - aerologix-net
+    profiles:
+      - kernel  # Only start with: docker-compose --profile kernel up
+
+  # Database
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aerologix
+      POSTGRES_USER: aerologix
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - aerologix-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aerologix"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Cache
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - aerologix-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Message Queue
+  nats:
+    image: nats:2-alpine
+    command: -js -m 8222
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    networks:
+      - aerologix-net
+    profiles:
+      - full
+
+  # Observability
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - aerologix-net
+    profiles:
+      - monitoring
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - aerologix-net
+    profiles:
+      - monitoring
+
+volumes:
+  cloud_data:
+  postgres_data:
+  redis_data:
+  grafana_data:
+  prometheus_data:
+  edge_data_wh_a:
+  edge_db_wh_a:
+  edge_data_wh_b:
+  edge_db_wh_b:
+  edge_data_vehicle:
+  edge_db_vehicle:
+
+networks:
+  aerologix-net:
+    driver: bridge
+```
+
+### 6. Makefile for Complete Build
+
+```plaintext
+# Makefile
+.PHONY: build test run clean deploy
+
+# Build targets
+build-cloud:
+	docker build -f Dockerfile.cloud -t aerologix/cloud:latest .
+
+build-edge:
+	docker build -f Dockerfile.edge -t aerologix/edge:latest .
+
+build-kernel:
+	docker build -f Dockerfile.kernel -t aerologix/kernel:latest .
+
+build-all: build-cloud build-edge
+
+# Run targets
+run-cloud:
+	docker-compose up aerologix-cloud postgres redis
+
+run-edge:
+	docker-compose up aerologix-edge-warehouse-a
+
+run-full:
+	docker-compose up -d
+
+run-kernel:
+	docker-compose --profile kernel up aerologix-kernel
+
+run-with-monitoring:
+	docker-compose --profile monitoring up -d
+
+# Development
+dev:
+	cargo watch -x 'run -p aerologix-cli -- serve'
+
+dev-edge:
+	EDGE_MODE=true cargo run -p aerologix-edge
+
+# Testing
+test:
+	cargo test --all-features
+
+test-integration:
+	docker-compose -f docker-compose.test.yml up --abort-on-container-exit
+
+benchmark:
+	cargo bench
+
+# Database
+db-migrate:
+	cargo run -p aerologix-cli -- db migrate
+
+db-reset:
+	cargo run -p aerologix-cli -- db reset
+
+# Deployment
+deploy-cloud:
+	./scripts/deploy-cloud.sh
+
+deploy-edge:
+	./scripts/deploy-edge.sh
+
+# Cleanup
+clean:
+	cargo clean
+	docker-compose down -v
+	rm -rf target/
+
+# Help
+help:
+	@echo "AeroLogix Build System"
+	@echo ""
+	@echo "Build Targets:"
+	@echo "  build-cloud    - Build cloud Docker image"
+	@echo "  build-edge     - Build edge Docker image"
+	@echo "  build-kernel   - Build kernel Docker image"
+	@echo "  build-all      - Build all images"
+	@echo ""
+	@echo "Run Targets:"
+	@echo "  run-cloud      - Run cloud stack"
+	@echo "  run-edge       - Run edge instance"
+	@echo "  run-full       - Run complete stack"
+	@echo "  run-kernel     - Run with kernel in QEMU"
+	@echo "  run-monitoring - Run with Grafana/Prometheus"
+	@echo ""
+	@echo "Development:"
+	@echo "  dev            - Run in development mode"
+	@echo "  test           - Run all tests"
+	@echo "  benchmark      - Run benchmarks"
+```
+
+### 7. Deployment Scripts
+
+```bash
+# scripts/deploy-edge.sh
+# Deploy AeroLogix edge to a device
+
+set -e
+
+DEVICE_IP="${1:?Usage: $0 <device-ip> [device-type]}"
+DEVICE_TYPE="${2:-warehouse-server}"
+
+echo "📡 Deploying AeroLogix Edge to ${DEVICE_IP} (${DEVICE_TYPE})"
+
+# Build edge image
+echo "🔨 Building edge image..."
+docker build -f Dockerfile.edge -t aerologix/edge:latest .
+
+# Save image
+echo "💾 Saving image..."
+docker save aerologix/edge:latest | gzip > aerologix-edge.tar.gz
+
+# Copy to device
+echo "📤 Copying to device..."
+scp aerologix-edge.tar.gz "aerologix@${DEVICE_IP}:/tmp/"
+scp docker-compose.edge.yml "aerologix@${DEVICE_IP}:~/aerologix/"
+scp edge/config/${DEVICE_TYPE}.yaml "aerologix@${DEVICE_IP}:~/aerologix/config/"
+
+# Load and start on device
+echo "🚀 Starting on device..."
+ssh "aerologix@${DEVICE_IP}" << 'EOF'
+    cd ~/aerologix
+    docker load < /tmp/aerologix-edge.tar.gz
+    docker-compose -f docker-compose.edge.yml up -d
+    rm /tmp/aerologix-edge.tar.gz
+EOF
+
+echo "✅ Edge deployment complete!"
+echo "   Check status: ssh aerologix@${DEVICE_IP} 'docker-compose logs -f'"
+```
+
+### 8. Quick Start
+
+```bash
+# 1. Clone and build
+git clone https://github.com/kubeworkz/aerologix
+cd aerologix
+
+# 2. Start complete stack (cloud + edge)
+docker-compose up -d
+
+# 3. Check status
+docker-compose ps
+
+# 4. View logs
+docker-compose logs -f aerologix-cloud
+docker-compose logs -f aerologix-edge-warehouse-a
+
+# 5. Access services
+open http://localhost:8080/dashboard  # Cloud dashboard
+open http://localhost:8081/dashboard  # Edge dashboard
+open http://localhost:3000            # Grafana (if enabled)
+
+# 6. Run with kernel (optional)
+docker-compose --profile kernel up aerologix-kernel
+
+# 7. Scale edges
+docker-compose up -d --scale aerologix-edge-warehouse=5
+
+# 8. Simulate offline mode
+docker-compose exec aerologix-edge-warehouse-a \
+    aerologix-cli simulate offline --duration 5m
+
+# 9. Generate demo data
+docker-compose exec aerologix-cloud \
+    aerologix-cli simulate --orders-per-hour 1000 --duration 1h
+```
+
+#### The Docker setup gives you:
+
+1. **Cloud Image**: Full API server with PostgreSQL, Redis, monitoring
+2. **Edge Image**: Lightweight runtime with kernel DB access
+3. **Kernel Image**: Complete QEMU VM with AeroSLS kernel baked in
+4. **Docker Compose**: One-command full stack deployment
+5. **Scaling**: Scale edges horizontally with docker-compose scale
+6. **Offline Simulation**: Test offline behavior easily
+7. **Monitoring**: Optional Grafana/Prometheus stack
+8. **Development**: Hot-reload development mode
+
+#### The edge Dockerfile is particularly important because it:
+
+- Detects if kernel database is available
+- Falls back to userspace if not
+- Handles offline/online transitions
+- Supports hardware integration (scanners, GPS)
+- Minimal footprint for edge devices
