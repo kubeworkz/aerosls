@@ -7413,18 +7413,18 @@ bash
 # CLI tools for community
 simi registry search "recommendation engine"
 # ┌────────────────────────────────────────────────────┐
-# │ Search Results: "recommendation engine"             │
+# │ Search Results: "recommendation engine"            │
 # ├────────────────────────────────────────────────────┤
 # │ 🥇 recommendation-engine v1.0.0                    │
-# │    Quality: 95% | Downloads: 10k | ⭐ 245           │
-# │    By: kubeworkz | Updated: 2 days ago              │
-# │                                                     │
-# │ 🥈 simple-recommender v2.1.0                        │
-# │    Quality: 87% | Downloads: 5k | ⭐ 123            │
-# │    By: community | Updated: 1 week ago              │
-# │                                                     │
-# │ 🥉 ml-recommendations v1.5.0                        │
-# │    Quality: 82% | Downloads: 2k | ⭐ 89             │
+# │    Quality: 95% | Downloads: 10k | ⭐ 245          │
+# │    By: kubeworkz | Updated: 2 days ago             │
+# │                                                    │
+# │ 🥈 simple-recommender v2.1.0                       │
+# │    Quality: 87% | Downloads: 5k | ⭐ 123           │
+# │    By: community | Updated: 1 week ago             │
+# │                                                    │
+# │ 🥉 ml-recommendations v1.5.0                       │
+# │    Quality: 82% | Downloads: 2k | ⭐ 89            │
 # │    By: ml-team | Updated: 2 weeks ago              │
 # └────────────────────────────────────────────────────┘
 

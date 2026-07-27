@@ -4764,7 +4764,7 @@ cat > "${root}/LICENSE" << 'EOF'
 
 MIT License
 
-Copyright (c) 2024 AeroLogix
+Copyright (c) 2026 AeroLogix
 
 Permission is hereby granted, free of charge, to any person obtaining a copy  
 
