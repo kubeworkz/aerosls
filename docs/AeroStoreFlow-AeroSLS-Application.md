@@ -2,7 +2,7 @@
 
 ### **Architecture Overview**
 
-![deepseek_mermaid_20260727_d968c8](./images/deepseek_mermaid_20260727_d968c8.png)
+![mermaid_20260727_d968c8](./images/mermaid_20260727_d968c8.png)
 
 ### **Core Application Components**
 
@@ -341,7 +341,7 @@ async def monitor_store_health():
 
 ### **Implementation Timeline**
 
-![deepseek_mermaid_20260727_6110a5](./images/deepseek_mermaid_20260727_6110a5.png)
+![mermaid_20260727_6110a5](./images/mermaid_20260727_6110a5.png)
 
 ### **Key Performance Indicators**
 
