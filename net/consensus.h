@@ -305,6 +305,10 @@ int cluster_register_peer(uint32_t node_id);
  * use these rather than reaching into local_cluster_state directly, the
  * same accessor-over-raw-struct-access convention partition.c's own
  * partition_get_for_uid() already established. */
+/* Human-readable role, for the cluster-status console line and the
+ * cluster-view HTTP surface. */
+const char* consensus_role_name(enum NodeRole r);
+
 uint32_t cluster_local_node_id(void);
 uint32_t cluster_active_node_count(void);
 

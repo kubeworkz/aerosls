@@ -1,3 +1,55 @@
+> ## Status: superseded in part — read this first
+>
+> This document was written before Orchestration Plan Phases 4–7. It
+> describes a Kubernetes-shaped **separate control-plane process**: cluster
+> objects, node roles, a scheduler, an `aeroslsctl`. A decision has since
+> been taken not to build it that way, and the reasoning matters more than
+> the conclusion.
+>
+> **Kubernetes needs a control plane because Linux knows nothing about
+> clusters. This kernel does.** Phases 4–7 put the service registry, the
+> reconciler, the circuit breakers and workload restarts *inside the
+> kernel*, replicated over DSPP. There is no etcd, no apiserver, no
+> scheduler daemon, because the things those components exist to provide
+> are already in the kernel and already distributed.
+>
+> Building the userspace control plane below would therefore create a
+> **second source of truth** for state the kernel already owns
+> authoritatively — the same mistake Phase 4 avoided by deriving a
+> service's node from its partition rather than storing a copy of it.
+>
+> What was actually missing was not a control plane but a cluster-wide
+> **view** of one. That is now `GET /api/cluster` and `GET /api/nodes`
+> (`net/http.c`), served by **any node**, because every node holds the
+> roster and the replicated registry. No control-plane node means no new
+> single point of failure and no bootstrap ordering problem — an advantage
+> the design below would have spent.
+>
+> ### What in this document is still live
+>
+> | Concept here | Status |
+> | --- | --- |
+> | Cluster/node/workload objects | **Built, in-kernel** — `workload.c`, `service_registry.c`, `consensus.c` |
+> | Reconciliation toward desired state | **Built** — Phase 5, AP-core sweep + BSP drain |
+> | Health, circuit breaking, metrics | **Built** — Phase 6, `service_mesh.c` |
+> | Restart policies + backoff | **Built** — Phase 7, `never` / `on-failure` / `always` |
+> | Separate control-plane process | **Not being built** — see above |
+> | `NODE_ROLE_CONTROL_PLANE` | **Not being built** — every node can serve the view |
+> | Cross-node scheduler / placement | **Still absent, still wanted** — nothing chooses which node a workload lands on |
+> | `aeroslsctl` CLI | **Still wanted, and cheap** — the shell already has every command; a CLI would be a thin REST client. Orthogonal to the UI question |
+> | YAML workload manifests | **Still wanted** — `workload declare` is imperative; a manifest applied by the reconciler would suit the declarative model better |
+>
+> The frontend at `/slsos-sim` is the control-plane UI. Its 16 panels are
+> per-node views; a node selector in the Cluster tab repoints all of them,
+> routed through `authFetch()` — the single choke point every kernel call
+> already passes through.
+>
+> **One honest consequence:** the kernel deals in node *IDs*, not
+> addresses, because DSPP is L2 broadcast and deliberately never needed an
+> address book. So the UI must be told where each node listens
+> (`AEROSLS_NODES="1=http://host:3001,2=..."`). That is configuration, not
+> something the cluster can be asked for.
+
 ## **AeroSLS Control Plane Architecture**
 
 **AeroSLS Control Plane** - a complete management interface that rivals Kubernetes but leverages SLS's unique capabilities.

@@ -44,6 +44,7 @@
 #include "../kernel/tenant.h"
 #include "../kernel/service_registry.h"
 #include "../kernel/service_mesh.h"
+#include "consensus.h"
 #include "../kernel/workload.h"
 #include "../kernel/workload_ctx.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
 #include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
@@ -2434,6 +2435,124 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
 
 
 
+
+// ─── Cluster view (control-plane surface) ─────────────────────────────────
+// GET /api/cluster — the roster and this node's consensus state.
+// GET /api/nodes   — what is genuinely known about every node, and no more.
+//
+// ─── Why this lives in the kernel rather than a separate control plane ───
+// Kubernetes needs a control-plane process because Linux knows nothing
+// about clusters. This kernel does: the service registry, the reconciler,
+// the circuit breakers and workload restarts are all in-kernel and
+// replicated over DSPP (Orchestration Plan Phases 4-7). A userspace
+// aggregator would be a SECOND source of truth for state the kernel
+// already owns authoritatively -- the same mistake Phase 4 avoided by
+// deriving a service's node from its partition rather than storing it.
+//
+// The consequence worth keeping: because every node holds the roster and
+// the replicated registry, ANY node can answer these. There is no
+// control-plane node, so there is no new single point of failure and no
+// bootstrap ordering problem.
+//
+// ─── What one node can and cannot honestly report ────────────────────────
+// KNOWN cluster-wide, and returned here:
+//   - the roster: which node ids are members
+//   - partition ownership: partition_owner_table[] is the authority for
+//     where a partition lives, and partition_migrate() keeps it current
+//   - services: the registry replicates, and every entry carries the node
+//     that owns it (see service_registry.h)
+// NOT known about a peer, and deliberately NOT invented here:
+//   - its memory, its workloads, its breakers, its uptime. None of that
+//     is replicated. A peer is reported as id + membership only, and the
+//     caller drills into that node's own /api/* for the rest. Returning a
+//     fabricated or stale figure would be worse than returning nothing.
+static int api_cluster_view(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_uint(&j, "node_id", cluster_local_node_id());                    jb_putc(&j, ',');
+    jb_str (&j, "role", consensus_role_name(local_cluster_state.role)); jb_putc(&j, ',');
+    jb_uint(&j, "term", local_cluster_state.current_term);              jb_putc(&j, ',');
+    jb_uint(&j, "active_nodes", local_cluster_state.active_nodes_count);jb_putc(&j, ',');
+    jb_uint(&j, "quorum_threshold", local_cluster_state.stable_quorum_threshold);
+    jb_putc(&j, ',');
+    /* node_id 0 is Phase 1's "cluster_init() was never called" sentinel.
+     * Reported explicitly so a UI can say "this node is standalone"
+     * rather than drawing a one-node cluster that does not exist. */
+    jb_str (&j, "initialised", cluster_local_node_id() != 0 ? "true" : "false");
+    jb_putc(&j, ',');
+    jb_arr_open(&j, "roster");
+    int first = 1;
+    for (uint32_t i = 0; i < CLUSTER_NODE_MAX; i++) {
+        if (!cluster_roster[i].active) continue;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "node_id", cluster_roster[i].node_id); jb_putc(&j, ',');
+        jb_str (&j, "self", "false");
+        jb_obj_close(&j);
+    }
+    if (cluster_local_node_id() != 0) {
+        if (!first) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "node_id", cluster_local_node_id()); jb_putc(&j, ',');
+        jb_str (&j, "self", "true");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_cluster_nodes(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    uint32_t me = cluster_local_node_id();
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "nodes");
+    int first = 1;
+
+    /* Self, in full: this is the only node whose detail is first-hand. */
+    if (me != 0) {
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "node_id", me);                                    jb_putc(&j, ',');
+        jb_str (&j, "self", "true");                                   jb_putc(&j, ',');
+        jb_str (&j, "detail", "first-hand");                           jb_putc(&j, ',');
+        jb_str (&j, "role", consensus_role_name(local_cluster_state.role)); jb_putc(&j, ',');
+        uint32_t owned = 0;
+        for (uint32_t pi = 0; pi < PARTITION_MAX; pi++)
+            if (partition_owner_table[pi].active &&
+                partition_owner_table[pi].node_id == me) owned++;
+        jb_uint(&j, "partitions_owned", owned);                        jb_putc(&j, ',');
+        jb_uint(&j, "services_local", service_registry_count());       jb_putc(&j, ',');
+        jb_uint(&j, "workloads", workload_count());                    jb_putc(&j, ',');
+        jb_uint(&j, "live_contexts", wlctx_count());
+        jb_obj_close(&j);
+        first = 0;
+    }
+
+    /* Peers: membership and what the replicated registry says they own.
+     * Everything else about them is genuinely unknown from here. */
+    for (uint32_t i = 0; i < CLUSTER_NODE_MAX; i++) {
+        if (!cluster_roster[i].active) continue;
+        uint32_t nid = cluster_roster[i].node_id;
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "node_id", nid);        jb_putc(&j, ',');
+        jb_str (&j, "self", "false");       jb_putc(&j, ',');
+        /* Named so a UI does not render a peer's blanks as zeroes. */
+        jb_str (&j, "detail", "membership-only"); jb_putc(&j, ',');
+        uint32_t owned = 0;
+        for (uint32_t pi = 0; pi < PARTITION_MAX; pi++)
+            if (partition_owner_table[pi].active &&
+                partition_owner_table[pi].node_id == nid) owned++;
+        jb_uint(&j, "partitions_owned", owned);   jb_putc(&j, ',');
+        uint32_t svcs = 0;
+        for (uint32_t si = 0; si < SERVICE_REMOTE_MAX; si++)
+            if (services_remote[si].active && services_remote[si].node_id == nid) svcs++;
+        jb_uint(&j, "services_announced", svcs);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── Orchestration Plan Phase 6: GET /api/mesh ────────────────────────────
 static int api_mesh_list(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -4462,6 +4581,15 @@ static void http_route(int conn, char* req) {
         // ── Network Fairness Phase 2: GET /api/partition/connquotas ────────────
         if (!strcmp(path, "/api/partition/connquotas")) {
             blen = api_partition_connquotas_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Cluster view: GET /api/cluster, GET /api/nodes ─────────────────────
+        if (!strcmp(path, "/api/cluster")) {
+            blen = api_cluster_view(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/nodes")) {
+            blen = api_cluster_nodes(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Orchestration Plan Phase 6: GET /api/mesh ──────────────────────────

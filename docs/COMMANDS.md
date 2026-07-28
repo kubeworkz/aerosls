@@ -553,6 +553,21 @@ Sets this boot's real node identity for distributed operation — required befor
 
 ---
 
+### Cluster View (control-plane surface)
+
+Served by **any** node — every node holds the roster and the replicated service registry, so there is no control-plane node to point at.
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/cluster` | This node's id, role, term, active-node count, quorum threshold, and the roster. `initialised: false` means `cluster init` has not been run — the node is standalone |
+| `GET /api/nodes` | Every known node. `detail: "first-hand"` for this one; `"membership-only"` for peers |
+
+**What a peer's entry does and does not contain.** Partition ownership and announced services *are* known cluster-wide — `partition_owner_table[]` is the authority for where a partition lives, and the service registry replicates. A peer's workloads, live contexts, memory and breakers are **not** replicated and are returned absent rather than as zeroes; select that node to read them from the node itself.
+
+The frontend routes per-node calls as `/node/<id>/api/...`. Because the kernel deals in node IDs and not addresses (DSPP is L2 broadcast and needs no address book), the UI is told where each node listens via `AEROSLS_NODES="1=http://host:3001,2=http://host2:3001"`. Unset means the previous single-kernel behaviour.
+
+---
+
 ### Service Registry (Orchestration Plan Phase 4)
 
 Name → partition/node/endpoint resolution. The **node is not stored** — it is derived from the partition's current owner on every lookup, so `service resolve` after a `partition migrate` reports the new node with nothing having been updated. Registration and removal require `DB_ADMIN` or higher; resolution is not role-gated. Registrations are dropped automatically when their partition is destroyed.

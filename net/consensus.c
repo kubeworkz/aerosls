@@ -107,7 +107,9 @@ uint64_t sys_sls_cluster_init(uint32_t node_id) {
     return (uint64_t)cluster_init(node_id);
 }
 
-static const char* consensus_role_name(enum NodeRole r) {
+/* Was static until the cluster-view HTTP surface needed it -- exactly the
+ * "future cluster-status HTTP/shell surface" this header anticipated. */
+const char* consensus_role_name(enum NodeRole r) {
     switch (r) {
         case ROLE_LEADER:    return "LEADER";
         case ROLE_CANDIDATE: return "CANDIDATE";
