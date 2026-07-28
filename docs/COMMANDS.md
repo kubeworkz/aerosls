@@ -1,10 +1,57 @@
 # AeroSLS Command Reference
 
-AeroSLS exposes three command surfaces:
+AeroSLS exposes four command surfaces:
 
 1. **Serial Shell** — interactive shell on COM1, reached via a USB-UART adapter on real hardware or the QEMU `-serial` flag.
-2. **REST API** — HTTP/JSON served on port 3000 from the running kernel.
-3. **Build Commands** — Makefile targets for compile, test, and hardware bundle generation.
+2. **REST API** — HTTP/JSON served by the kernel on port **3000**. Under `make x86-run` QEMU forwards host **3001** → guest 3000 (`Makefile:144`), so from your own machine the address is `localhost:3001`.
+3. **`aeroslsctl`** — a command-line client over that REST API. See below.
+4. **Build Commands** — Makefile targets for compile, test, and hardware bundle generation.
+
+---
+
+## aeroslsctl
+
+`tools/aeroslsctl` — stdlib Python 3, no dependencies, same conventions as `utils/*.py` (`--host localhost:3001`, `--token`, DB_ADMIN by default).
+
+```bash
+tools/aeroslsctl cluster status
+tools/aeroslsctl nodes
+tools/aeroslsctl workloads
+tools/aeroslsctl workload declare --name api --partition 1 --restart on-failure
+tools/aeroslsctl shell partition migrate 1 2
+```
+
+It holds no state and caches nothing — every answer comes from the node named by `--host`. There is no `aeroslsctl` view of the cluster that could drift from the kernel's, because the tool has no view of its own. To ask a different node, point `--host` at it.
+
+### Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | the node did it |
+| `1`  | the node was unreachable, or returned non-2xx / non-JSON |
+| `2`  | the node answered and **refused** |
+
+The 1/2 split is the point: a script can tell "the node is down" from "the node said no." This matters more than it looks, because **the kernel returns HTTP 200 for refusals**, carrying `{"ok":"false"}` — and that `"false"` is a JSON *string*, not a boolean. Both of the obvious client checks are therefore wrong:
+
+```python
+if resp.status == 200:   # true even when the call was refused
+if data.get("ok"):       # "false" is a non-empty str -> truthy
+```
+
+Either one reports success on every rejection. Any other client written against this API needs the same guard (`_refused()` in the CLI; `tests/aeroslsctl_host_test.py` scenario 1 is the regression).
+
+### Coverage
+
+First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services`, `workloads`, `workload declare`, `mesh`, `partitions`, `reconcile`, `health`. The kernel serves ~146 routes in total; the rest are reached through two passthroughs that cannot fall out of sync because they don't wrap anything:
+
+- `aeroslsctl shell <any shell command>` → `POST /api/shell/exec`
+- `aeroslsctl raw GET|POST <path> [--body JSON]` → any route
+
+`workloads scale`, `workloads logs`, `workloads exec` and `nodes drain` are described in `docs/AeroSLS-Control-Plane.md` but **were never built** — there is no replica count, no log ring, no per-workload exec and no drain protocol. The CLI does not stub them; asking for one prints what is missing and what to use instead.
+
+### Reaching a two-node cluster
+
+`aeroslsctl` works against a single node under `make x86-run`. It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate. Use the serial consoles for the two-node walkthrough, as that script's own instructions do.
 
 ---
 
@@ -934,7 +981,15 @@ All write routes require `APP_USER+`. Read routes are open.
 | `GET`    | `/api/partition/connquotas`          | `APP_USER+`      | List concurrent-connection quotas — `{connquotas:[{partition_id, conn_usage, conn_quota}]}`                       |
 | `POST`   | `/api/partition/connquota`           | `APP_USER+`      | `{"partition_id":N,"quota":N}`                                                                                     |
 
-**Not reachable over HTTP:** `partition migrate` (shell/syscall only — see the Serial Shell section above). `cluster init` **is** now reachable, via `POST /api/cluster/init`; see `run-two-nodes.sh` at the repo root for booting the nodes themselves.
+**Correction — everything here IS reachable over HTTP.** An earlier revision of this file said `partition migrate` was "shell/syscall only". That was wrong, and had been for as long as `POST /api/shell/exec` has existed: that route runs the *full* `sls_shell_execute()` dispatch (`user/shell.c:443`), and wraps it in `kernel_serial_capture_start()`, so a command's serial output is captured into the JSON response rather than lost to the console. Anything you can type at the serial prompt you can also POST:
+
+```
+aeroslsctl shell partition migrate 1 2
+curl -X POST localhost:3001/api/shell/exec -H "Authorization: Bearer $TOK" \
+     -d '{"command":"partition migrate 1 2"}'
+```
+
+`cluster init` additionally has its own typed route, `POST /api/cluster/init`. See `run-two-nodes.sh` at the repo root for booting the nodes themselves — that part is still not something the kernel can do for you.
 
 #### Tenants
 

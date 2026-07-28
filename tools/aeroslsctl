@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+aeroslsctl — command-line control for an AeroSLS node or cluster.
+
+  aeroslsctl cluster status
+  aeroslsctl workloads
+  aeroslsctl workload declare --name api --partition 1 --restart on-failure
+  aeroslsctl shell partition migrate 1 2
+
+─── What this is, and what it deliberately is not ────────────────────────
+A thin REST client over the API the kernel already serves. It holds no
+state, caches nothing, and makes no decisions -- every answer below comes
+from the node named by --host. That matters for a clustered system: there
+is no "aeroslsctl view" of the cluster that could drift from the kernel's,
+because this program has no view of its own.
+
+It covers the ORCHESTRATION surface (cluster, nodes, services, workloads,
+mesh, partitions, reconcile) as first-class verbs. The kernel serves ~146
+routes in total; wrapping all of them by hand would be a second API to
+keep in sync, and it would rot. Everything else is reachable through two
+honest escape hatches that cannot rot because they pass through:
+
+  aeroslsctl shell <any shell command>   -- the full ~90-command shell
+  aeroslsctl raw GET /api/whatever       -- any route, any method
+
+─── Commands the design docs promise that DO NOT EXIST ───────────────────
+docs/AeroSLS-Control-Plane.md sketches `workloads scale`, `workloads logs`,
+`workloads exec` and `nodes drain`. None of them are built -- there is no
+replica count to scale, no log ring to tail, no per-workload exec, and no
+drain protocol. This CLI does not stub them. Asking for one prints what is
+missing and what to use instead, because a command that silently no-ops is
+worse than one that is absent.
+
+─── The trap this client exists to not fall into ─────────────────────────
+The kernel answers HTTP 200 for refusals, carrying {"ok":"false"} in the
+body -- and "false" there is a JSON *string*, not a boolean. So both of
+the obvious client checks are wrong:
+
+    if resp.status == 200:        # true even when the call was refused
+    if data.get("ok"):            # "false" is a non-empty str -> truthy
+
+Either one reports success on every rejection the kernel makes. The check
+lives in _refused() below and is the reason this file has a test.
+
+Conventions match utils/*.py: stdlib only, --host localhost:3001, and the
+DB_ADMIN bearer token as the default.
+"""
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_HOST = "localhost:3001"
+DEFAULT_TOKEN = "deadbeef01234567cafebabe76543210"  # dave@gridworkz.com — DB_ADMIN
+
+EXIT_OK = 0
+EXIT_TRANSPORT = 1  # could not reach the node, or it returned non-2xx
+EXIT_REFUSED = 2    # the node answered, and said no
+
+# Promised in the design docs, never built. Mapped to the honest
+# alternative rather than to a stub. See module docstring.
+NOT_BUILT = {
+    "scale": "no replica count exists — a workload is one context, not a set. "
+             "Declare another workload.",
+    "logs":  "no log ring exists — the kernel writes to serial. "
+             "Use `aeroslsctl shell <cmd>` and read its captured output.",
+    "exec":  "no per-workload exec exists. `aeroslsctl shell` runs in the "
+             "node's shell, not inside a workload.",
+    "drain": "no drain protocol exists. Migrate the partitions off the node "
+             "individually: `aeroslsctl shell partition migrate <pid> <node>`.",
+}
+
+
+# ─── transport ────────────────────────────────────────────────────────────
+
+def _url(host: str, path: str) -> str:
+    host = host.rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = "http://" + host
+    return host + path
+
+
+def _request(args, method: str, path: str, payload=None) -> dict:
+    req = urllib.request.Request(_url(args.host, path), method=method)
+    req.add_header("Authorization", f"Bearer {args.token}")
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data=body, timeout=args.timeout) as r:
+            raw = r.read().decode(errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace").strip()
+        _die(f"HTTP {exc.code} from {args.host}{path}: {detail or exc.reason}")
+    except urllib.error.URLError as exc:
+        _die(f"cannot reach {args.host}: {exc.reason}")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # A kernel that answers non-JSON is a kernel bug worth seeing whole,
+        # so show the payload rather than a parser complaint about byte 0.
+        _die(f"non-JSON response from {args.host}{path}: {raw[:400]}")
+
+
+def _die(msg: str, code: int = EXIT_TRANSPORT):
+    print(f"aeroslsctl: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _refused(d: dict) -> bool:
+    """True when the node answered and declined.
+
+    Three shapes are in play across the ~146 routes: an explicit
+    {"ok": "true"|"false"} string pair, a bare {"error": "..."} with no ok
+    field at all, and a plain data object with neither. Only the last is a
+    success. Tolerates a real JSON bool too, so this stays correct if a
+    handler is ever cleaned up to emit one.
+    """
+    ok = d.get("ok")
+    if isinstance(ok, bool):
+        return not ok
+    if isinstance(ok, str):
+        return ok.strip().lower() not in ("true", "1", "yes")
+    return bool(d.get("error"))
+
+
+def _emit(args, data: dict, table=None) -> int:
+    """Render, then map the node's answer onto an exit status.
+
+    Scripts branch on $?, so a refusal must not exit 0 no matter how it is
+    rendered. Both paths run through _refused().
+    """
+    refused = _refused(data)
+    if args.json or table is None:
+        print(json.dumps(data, indent=2))
+    elif refused:
+        print(f"refused: {data.get('error') or data.get('detail') or 'no reason given'}",
+              file=sys.stderr)
+    else:
+        table()
+    if refused and not args.json:
+        return EXIT_REFUSED
+    return EXIT_REFUSED if refused else EXIT_OK
+
+
+# ─── rendering ────────────────────────────────────────────────────────────
+
+def _table(rows, columns):
+    """Fixed-width columns. Missing keys print '—', never 0.
+
+    The distinction is load-bearing in this system: /api/nodes omits the
+    counters a node cannot know about its peers (they are not replicated),
+    and printing 0 for "unknown" would invent a fact. Same rule the cluster
+    panel follows.
+    """
+    if not rows:
+        print("(none)")
+        return
+    hdr = [c.replace("_", " ") for c in columns]
+    cells = [[_cell(r.get(c)) for c in columns] for r in rows]
+    width = [max(len(hdr[i]), *(len(c[i]) for c in cells)) for i in range(len(columns))]
+    print("  ".join(h.upper().ljust(width[i]) for i, h in enumerate(hdr)))
+    for row in cells:
+        print("  ".join(row[i].ljust(width[i]) for i in range(len(columns))))
+
+
+def _cell(v) -> str:
+    if v is None:
+        return "—"
+    return str(v)
+
+
+# ─── commands ─────────────────────────────────────────────────────────────
+
+def cmd_cluster(args):
+    if args.action == "status":
+        d = _request(args, "GET", "/api/cluster")
+
+        def show():
+            if str(d.get("initialised")).lower() != "true":
+                print("standalone — no cluster formed (node_id 0 is the "
+                      "'uninitialised' sentinel)")
+                print("form one with: aeroslsctl cluster init <id>")
+                return
+            for k in ("node_id", "role", "term", "active_nodes", "quorum_threshold"):
+                print(f"{k.replace('_',' '):18} {_cell(d.get(k))}")
+            roster = d.get("roster") or []
+            print(f"\nroster ({len(roster)})")
+            _table(roster, ["node_id", "self"])
+        return _emit(args, d, show)
+
+    if args.action == "init":
+        # cluster_init() resets term, role and roster -- it is a fresh start,
+        # not a merge (consensus.h). On a node already in a working cluster
+        # that silently drops it out, so make the operator mean it.
+        if not args.yes:
+            d = _request(args, "GET", "/api/cluster")
+            if str(d.get("initialised")).lower() == "true":
+                _die(f"node is already in a cluster (id {d.get('node_id')}, "
+                     f"term {d.get('term')}). Re-initialising RESETS its term, "
+                     f"role and roster and drops it out of that cluster. "
+                     f"Pass --yes if that is what you want.", EXIT_REFUSED)
+        d = _request(args, "POST", "/api/cluster/init", {"node_id": args.node_id})
+        return _emit(args, d, lambda: print(d.get("detail") or "ok"))
+
+    d = _request(args, "POST", "/api/cluster/peer", {"node_id": args.node_id})
+    return _emit(args, d, lambda: print(d.get("detail") or "ok"))
+
+
+def cmd_nodes(args):
+    d = _request(args, "GET", "/api/nodes")
+    rows = d.get("nodes") or []
+
+    def show():
+        _table(rows, ["node_id", "self", "role", "detail", "partitions_owned",
+                      "services_local", "services_announced", "workloads",
+                      "live_contexts"])
+        if any(r.get("detail") != "first-hand" for r in rows):
+            print("\n— means this node cannot know that figure about a peer "
+                  "(not replicated).\n  Point --host at the node to read it "
+                  "first-hand.")
+    return _emit(args, d, show)
+
+
+def cmd_services(args):
+    if args.action == "resolve":
+        d = _request(args, "GET", f"/api/service/resolve/{args.name}")
+        return _emit(args, d, lambda: _table([d], ["partition_id", "node_id",
+                                                   "endpoint_port"]))
+    if args.action == "declare":
+        d = _request(args, "POST", "/api/service", {
+            "name": args.name,
+            "partition_id": args.partition,
+            "endpoint_kind": args.kind,
+            "endpoint_port": args.port,
+        })
+        return _emit(args, d, lambda: print("declared"))
+
+    d = _request(args, "GET", "/api/services")
+    return _emit(args, d, lambda: _table(d.get("services") or [],
+                                         ["name", "partition_id", "node_id",
+                                          "endpoint_port", "health", "serving",
+                                          "is_local"]))
+
+
+def cmd_workloads(args):
+    d = _request(args, "GET", "/api/workloads")
+
+    def show():
+        _table(d.get("workloads") or [],
+               ["name", "partition_id", "desired", "restart_policy",
+                "restart_count", "restarts_total", "endpoint_port"])
+        qd, dr = d.get("queue_depth"), d.get("queue_dropped")
+        print(f"\nintent queue depth {_cell(qd)}, dropped {_cell(dr)}"
+              f"{'   <-- non-zero: reconciler is not draining' if dr else ''}")
+    return _emit(args, d, show)
+
+
+def cmd_workload(args):
+    d = _request(args, "POST", "/api/workload", {
+        "name": args.name,
+        "partition_id": args.partition,
+        "desired": args.desired,
+        "service_name": args.service or "",
+        "endpoint_kind": args.kind,
+        "endpoint_port": args.port,
+        "program_name": args.program or "",
+        "entry_name": args.entry or "",
+        "restart_policy": args.restart,
+    })
+    return _emit(args, d, lambda: print("declared"))
+
+
+def cmd_mesh(args):
+    d = _request(args, "GET", "/api/mesh")
+    return _emit(args, d, lambda: _table(d.get("breakers") or [],
+                                         ["name", "state", "consecutive_failures",
+                                          "successes", "failures", "trips",
+                                          "calls_permitted", "calls_refused"]))
+
+
+def cmd_partitions(args):
+    d = _request(args, "GET", "/api/partitions")
+    return _emit(args, d, lambda: _table(d.get("partitions") or [],
+                                         ["id", "name", "state", "frame_usage",
+                                          "frame_quota"]))
+
+
+def cmd_reconcile(args):
+    d = _request(args, "POST", "/api/reconcile",
+                 {"enabled": "true" if args.state == "on" else "false"})
+    return _emit(args, d, lambda: print(f"reconciler {d.get('reconciler')}"))
+
+
+def cmd_shell(args):
+    """Passthrough to the node's own shell.
+
+    This is how the commands with no REST route of their own are reached --
+    `partition migrate` above all. sls_shell_execute() wraps the dispatch in
+    kernel_serial_capture_start(), so output that would go to the serial
+    console comes back in the response body instead. The shell re-checks
+    permissions per command against the bearer token's uid; this client is
+    not the thing deciding what you may run.
+    """
+    command = " ".join(args.words)
+    d = _request(args, "POST", "/api/shell/exec", {"command": command})
+
+    def show():
+        out = (d.get("output") or "").rstrip()
+        if out:
+            print(out)
+        if str(d.get("recognized")).lower() == "false":
+            print(f"(the node did not recognise: {command})", file=sys.stderr)
+    rc = _emit(args, d, show)
+    # An unrecognised command is a user error, not a node refusal, and the
+    # node reports it with recognized=false rather than ok=false.
+    if str(d.get("recognized")).lower() == "false":
+        return EXIT_REFUSED
+    return rc
+
+
+def cmd_raw(args):
+    payload = None
+    if args.body:
+        try:
+            payload = json.loads(args.body)
+        except json.JSONDecodeError as exc:
+            _die(f"--body is not valid JSON: {exc}")
+    path = args.path if args.path.startswith("/") else "/" + args.path
+    d = _request(args, args.method.upper(), path, payload)
+    print(json.dumps(d, indent=2))
+    return EXIT_REFUSED if _refused(d) else EXIT_OK
+
+
+def cmd_health(args):
+    d = _request(args, "GET", "/api/health")
+    return _emit(args, d, lambda: print(json.dumps(d, indent=2)))
+
+
+# ─── argument parsing ─────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="aeroslsctl",
+        description="Control an AeroSLS node or cluster over its REST API.",
+        epilog="Every answer comes from the node named by --host; this tool "
+               "holds no state of its own. Exit 0 ok, 1 unreachable, "
+               "2 refused by the node.")
+    p.add_argument("--host", default=DEFAULT_HOST,
+                   help=f"node API address (default: {DEFAULT_HOST}). "
+                        "Point it at a different node to ask that node.")
+    p.add_argument("--token", default=DEFAULT_TOKEN, help="bearer token")
+    p.add_argument("--timeout", type=float, default=15.0)
+    p.add_argument("--json", action="store_true",
+                   help="print the node's raw JSON instead of a table")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("cluster", help="cluster identity and membership")
+    cs = c.add_subparsers(dest="action", required=True)
+    cs.add_parser("status")
+    ci = cs.add_parser("init", help="set THIS node's id (resets term/role/roster)")
+    ci.add_argument("node_id", type=int)
+    ci.add_argument("--yes", action="store_true",
+                    help="proceed even if the node is already in a cluster")
+    cp = cs.add_parser("peer", help="register a peer into the roster")
+    cp.add_argument("node_id", type=int)
+    c.set_defaults(func=cmd_cluster)
+
+    n = sub.add_parser("nodes", help="every node this one knows about")
+    n.set_defaults(func=cmd_nodes)
+
+    s = sub.add_parser("services", help="the service registry")
+    ss = s.add_subparsers(dest="action")
+    sr = ss.add_parser("resolve"); sr.add_argument("name")
+    sd = ss.add_parser("declare")
+    sd.add_argument("--name", required=True)
+    sd.add_argument("--partition", type=int, required=True)
+    sd.add_argument("--kind", default="tcp", choices=["tcp", "ipc"])
+    sd.add_argument("--port", type=int, default=0)
+    s.set_defaults(func=cmd_services)
+
+    w = sub.add_parser("workloads", help="declared workloads + reconciler queue")
+    w.set_defaults(func=cmd_workloads)
+
+    wd = sub.add_parser("workload", help="declare a workload")
+    wds = wd.add_subparsers(dest="action", required=True)
+    d = wds.add_parser("declare")
+    d.add_argument("--name", required=True)
+    d.add_argument("--partition", type=int, required=True)
+    d.add_argument("--desired", default="running", choices=["running", "stopped"])
+    d.add_argument("--service", default="")
+    d.add_argument("--kind", default="tcp", choices=["tcp", "ipc"])
+    d.add_argument("--port", type=int, default=0)
+    d.add_argument("--program", default="")
+    d.add_argument("--entry", default="")
+    d.add_argument("--restart", default="never",
+                   choices=["never", "on-failure", "always"],
+                   help="on-failure restarts a TRAP but not a clean HALT")
+    wd.set_defaults(func=cmd_workload)
+
+    m = sub.add_parser("mesh", help="circuit breakers and per-service metrics")
+    m.set_defaults(func=cmd_mesh)
+
+    pa = sub.add_parser("partitions"); pa.set_defaults(func=cmd_partitions)
+
+    r = sub.add_parser("reconcile", help="turn the reconciler on or off")
+    r.add_argument("state", choices=["on", "off"])
+    r.set_defaults(func=cmd_reconcile)
+
+    sh = sub.add_parser("shell",
+                        help="run any command in the node's shell "
+                             "(this is how `partition migrate` is reached)")
+    sh.add_argument("words", nargs=argparse.REMAINDER)
+    sh.set_defaults(func=cmd_shell)
+
+    rw = sub.add_parser("raw", help="call any route directly")
+    rw.add_argument("method", choices=["GET", "POST", "get", "post"])
+    rw.add_argument("path")
+    rw.add_argument("--body", help="JSON request body")
+    rw.set_defaults(func=cmd_raw)
+
+    h = sub.add_parser("health"); h.set_defaults(func=cmd_health)
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Intercept the four documented-but-nonexistent verbs before argparse
+    # rejects them as unknown. "Unknown command" would send someone to the
+    # design doc that promised it, which is exactly the wrong direction.
+    for i, tok in enumerate(argv):
+        if tok in NOT_BUILT and i > 0 and not argv[i - 1].startswith("-"):
+            print(f"aeroslsctl: `{argv[i-1]} {tok}` is described in "
+                  f"docs/AeroSLS-Control-Plane.md but is not built.\n"
+                  f"  {NOT_BUILT[tok]}", file=sys.stderr)
+            return EXIT_REFUSED
+
+    args = build_parser().parse_args(argv)
+    if args.cmd == "shell" and not args.words:
+        _die("shell needs a command, e.g. `aeroslsctl shell cluster status`")
+    return args.func(args) or EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

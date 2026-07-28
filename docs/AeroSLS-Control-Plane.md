@@ -38,7 +38,7 @@
 > | Cross-node scheduler / placement | **Still absent, still wanted** — nothing chooses which node a workload lands on |
 > | Cluster formation from the UI | **Built** — `POST /api/cluster/init` / `/api/cluster/peer` wrap syscalls 279/280, which were previously serial-console only |
 > | Node *provisioning* (booting a machine) | **Not built, and not a kernel capability** — see below |
-> | `aeroslsctl` CLI | **Still wanted, and cheap** — the shell already has every command; a CLI would be a thin REST client. Orthogonal to the UI question |
+> | `aeroslsctl` CLI | **Built** — `tools/aeroslsctl`, stdlib Python, no dependencies. Orchestration verbs plus `shell` and `raw` passthroughs. Tested in `tests/aeroslsctl_host_test.py` against a stub kernel |
 > | YAML workload manifests | **Still wanted** — `workload declare` is imperative; a manifest applied by the reconciler would suit the declarative model better |
 >
 > The frontend at `/slsos-sim` is the control-plane UI. Its 16 panels are
@@ -1360,6 +1360,16 @@ void aerosls_scheduler_score_nodes(aerosls_cluster_t *cluster,
 
 ```bash
 #!/bin/bash
+> **⚠ The sketch below is aspirational and was never implemented as written.**
+> The real tool is `tools/aeroslsctl` (Python, not bash). Four verbs in this
+> sketch have no implementation behind them anywhere in the kernel and were
+> deliberately NOT stubbed: `workloads scale` (no replica count exists — a
+> workload is one context, not a set), `workloads logs` (no log ring; the
+> kernel writes to serial), `workloads exec` (no per-workload exec), and
+> `nodes drain` (no drain protocol; migrate partitions individually).
+> Asking the real CLI for any of them prints that explanation rather than
+> failing as an unknown command. See `docs/COMMANDS.md`.
+
 # aeroslsctl - AeroSLS Control CLI (like kubectl)
 
 AEROSLS_API="${AEROSLS_API:-https://localhost:6443}"
