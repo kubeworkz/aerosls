@@ -16,7 +16,8 @@
 #include "object_catalog.h"
 #include "frame_pool.h"
 #include "../net/consensus.h"   // Multi-Node Partition Scaling Roadmap Phase 2 -- cluster_local_node_id()
-#include "stream.h"              // Multi-Node Phase 6 addendum -- stream_relocate_partition() (real migration data movement)
+#include "stream.h"             // Multi-Node Phase 6 addendum -- stream_relocate_partition() (real migration data movement)
+#include "simi_ctx_migrate.h"   // PEC Phase 3 -- simi_ctx_migrate_send_partition()
 
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
@@ -385,6 +386,32 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
         ? stream_migrate_send_partition(partition_id, dest_node_id)
         : stream_relocate_partition(partition_id, dest_node_id);
 
+    // Step 3b (Persistent Execution Contexts, Phase 3): move this
+    // partition's RUNNING computations, not just its data at rest. A
+    // checkpointed SIMI context is pushed over the same DSPP transport
+    // and resumes on dest_node_id at the exact instruction it stopped at
+    // (kernel/simi_ctx_migrate.c).
+    //
+    // Same cluster_local_node_id() != 0 condition as the stream move
+    // above, and for the same reason: without a real cluster identity
+    // there is nowhere to send anything. Unlike streams there is no
+    // same-disk fallback -- relocating a context to a different slot on
+    // the same node is not a migration of anything, so the else branch is
+    // genuinely nothing rather than a busy no-op.
+    //
+    // HONEST SCOPE: the registry this iterates is real, but nothing in
+    // this kernel registers contexts into it yet -- no scheduler or
+    // service runtime owns long-lived contexts (see
+    // kernel/simi_ctx_migrate.h). So this moves zero contexts on every
+    // current boot. The transport, checkpointing and resume path are all
+    // proven end-to-end by tests/simi_ctx_migrate_host_test.c; what is
+    // missing is a producer of live contexts, which is named work rather
+    // than an oversight here. Wired now so the capability is reachable
+    // from the system the moment that producer exists.
+    uint32_t contexts_migrated = (cluster_local_node_id() != 0)
+        ? simi_ctx_migrate_send_partition(partition_id, dest_node_id)
+        : 0;
+
     // Step 4 (Multi-Node Phase 2): the actual, load-bearing ownership
     // handoff -- a pure table write that already persists internally
     // (persist_partitions(), Phase 10). Frames are deliberately NOT
@@ -428,11 +455,13 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     kernel_serial_printf(
         "[PARTITION] migrated partition %u: node %u -> node %u. Lease "
         "relinquished=%s, %d stream(s) relocated/sent and byte-verified, %u "
-        "physical frame(s) reclaimed. Partition remains PAUSED -- resume "
-        "must happen on the destination node.\n",
+        "live context(s) checkpointed and sent, %u physical frame(s) "
+        "reclaimed. Partition remains PAUSED -- resume must happen on the "
+        "destination node.\n",
         (unsigned)partition_id, (unsigned)source_node_id, (unsigned)dest_node_id,
         lease_existed ? "yes" : "no (none was held)",
         streams_relocated,
+        (unsigned)contexts_migrated,
         (unsigned)frames_reclaimed);
 
     return 0;

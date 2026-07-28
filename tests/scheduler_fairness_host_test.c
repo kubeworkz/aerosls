@@ -101,6 +101,17 @@ int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; retur
  * test's main(), and gives us the REAL proc_table[]/proc_count globals
  * process.c defines, rather than redefining our own. */
 #include "kernel/process.c"
+#include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
+/* ─── PEC Phase 3 stub: kernel/partition.c's context-migration step ────
+ * FAITHFUL, not a no-op. The real simi_ctx_migrate_send_partition()
+ * walks the live-context registry and sends whatever belongs to the
+ * partition; this test registers no contexts, so the real function would
+ * walk an empty registry and return 0 -- exactly what this returns. */
+uint32_t simi_ctx_migrate_send_partition(uint32_t partition_id, uint32_t dest_node) {
+    (void)partition_id; (void)dest_node; return 0;
+}
+
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \

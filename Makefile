@@ -40,6 +40,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/simi_translate.c \
               kernel/simi_interp.c \
               kernel/simi_ckpt.c \
+              kernel/simi_ctx_migrate.c \
               kernel/webapp.c \
               kernel/webapp_bundle.c \
               kernel/journal.c \

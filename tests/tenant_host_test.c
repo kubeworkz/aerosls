@@ -40,6 +40,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
+/* ─── PEC Phase 3 stub: kernel/partition.c's context-migration step ────
+ * FAITHFUL, not a no-op. The real simi_ctx_migrate_send_partition()
+ * walks the live-context registry and sends whatever belongs to the
+ * partition; this test registers no contexts, so the real function would
+ * walk an empty registry and return 0 -- exactly what this returns. */
+uint32_t simi_ctx_migrate_send_partition(uint32_t partition_id, uint32_t dest_node) {
+    (void)partition_id; (void)dest_node; return 0;
+}
+
 
 /* ─── Stubs for partition.c's external dependencies ───────────────────── */
 void kernel_serial_print(const char* s) { (void)s; }

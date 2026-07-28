@@ -38,6 +38,35 @@
 #include "kernel/partition.h"
 #include "net/consensus.h"
 #include "net/dspp.h"   /* full struct DSPPFullPagePacket definition -- consensus.h only forward-declares it */
+#include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
+/* ─── PEC Phase 3 stub: kernel/partition.c's context-migration step ────
+ * FAITHFUL, not a no-op. The real simi_ctx_migrate_send_partition()
+ * walks the live-context registry and sends whatever belongs to the
+ * partition; this test registers no contexts, so the real function would
+ * walk an empty registry and return 0 -- exactly what this returns. */
+uint32_t simi_ctx_migrate_send_partition(uint32_t partition_id, uint32_t dest_node) {
+    (void)partition_id; (void)dest_node; return 0;
+}
+
+/* ─── PEC Phase 3 stubs: net/dspp.c's context-migration receive path ───
+ * FAITHFUL. This test never sends CTX_* opcodes, so these are not
+ * reached; and were one to arrive, the real receiver with no registered
+ * program image returns exactly SIMI_CTXMIG_ERR_NO_PROGRAM. Full
+ * coverage of this path lives in tests/simi_ctx_migrate_host_test.c. */
+SimiCtxMigStatus simi_ctx_migrate_recv_begin(uint64_t tid, const char* name,
+                                             uint64_t total_bytes,
+                                             uint32_t total_chunks,
+                                             uint64_t program_hash) {
+    (void)tid; (void)name; (void)total_bytes; (void)total_chunks; (void)program_hash;
+    return SIMI_CTXMIG_ERR_NO_PROGRAM;
+}
+SimiCtxMigStatus simi_ctx_migrate_recv_chunk(uint64_t tid, uint32_t idx,
+                                             const uint8_t* data, uint32_t n) {
+    (void)tid; (void)idx; (void)data; (void)n;
+    return SIMI_CTXMIG_ERR_NO_TRANSFER;
+}
+
 
 static int checks_passed = 0;
 static int checks_failed = 0;

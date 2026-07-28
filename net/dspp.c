@@ -11,6 +11,7 @@
 #include "../kernel/object_catalog.h"
 #include "../kernel/partition.h"
 #include "../kernel/stream.h"   // Multi-Node Partition Scaling Roadmap Phase 7 -- stream_migrate_recv_begin()/_page()
+#include "../kernel/simi_ctx_migrate.h"  // PEC Phase 3 -- simi_ctx_migrate_recv_begin()/_chunk()
 #include "../kernel/kernel_io.h"
 
 uint32_t dspp_resolve_partition_id(uint64_t system_object_id) {
@@ -225,12 +226,156 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
     // silently discarded, not misrouted.
 }
 
+/* ─── Live execution-context migration (PEC Phase 3) ──────────────────
+ * Wire encode/decode only; kernel/simi_ctx_migrate.c owns what the bytes
+ * mean, exactly as kernel/stream.c does for the stream family above.
+ *
+ * These static assertions enforce the prefix-compatibility contract
+ * documented in dspp.h: dspp_rx_dispatch() must read magic, opcode and
+ * node_dest_id out of a buffer BEFORE it knows which of the two migrate
+ * headers it holds, so those fields must sit at identical offsets. Left
+ * to a comment this would drift the first time either struct is edited,
+ * and the symptom would be misrouted or silently dropped packets rather
+ * than anything that points at the cause. As a static assert it is a
+ * compile error instead. */
+#define DSPP_SAME_OFFSET(f) \
+    _Static_assert(__builtin_offsetof(struct DSPPCtxMigrateHeader, f) == \
+                   __builtin_offsetof(struct DSPPMigrateHeader, f), \
+                   "DSPP migrate header prefix drifted: " #f)
+DSPP_SAME_OFFSET(magic);
+DSPP_SAME_OFFSET(opcode);
+DSPP_SAME_OFFSET(node_source_id);
+DSPP_SAME_OFFSET(node_dest_id);
+DSPP_SAME_OFFSET(transfer_id);
+DSPP_SAME_OFFSET(partition_id);
+DSPP_SAME_OFFSET(status);
+/* chunk_index deliberately overlays page_index -- same offset, same
+ * meaning (which piece of the transfer this is), different name. */
+_Static_assert(__builtin_offsetof(struct DSPPCtxMigrateHeader, chunk_index) ==
+               __builtin_offsetof(struct DSPPMigrateHeader, page_index),
+               "DSPP migrate header prefix drifted: chunk_index/page_index");
+#undef DSPP_SAME_OFFSET
+
+static void dspp_ctx_hdr_init(struct DSPPCtxMigrateHeader* h, uint16_t opcode,
+                              uint64_t transfer_id, uint32_t node_dest_id,
+                              uint32_t partition_id, uint32_t chunk_index) {
+    h->magic          = DSPP_MIGRATE_MAGIC;
+    h->opcode         = opcode;
+    h->node_source_id = (uint16_t)cluster_local_node_id();
+    h->node_dest_id   = node_dest_id;
+    h->transfer_id    = transfer_id;
+    h->partition_id   = partition_id;
+    h->chunk_index    = chunk_index;
+    h->status         = 0;
+    /* Tail zeroed rather than left as stack garbage, matching
+     * dspp_migrate_send_page()'s treatment of the stream-only fields. */
+    h->ctx_name[0]    = '\0';
+    h->total_bytes    = 0;
+    h->total_chunks   = 0;
+    h->chunk_bytes    = 0;
+    h->program_hash   = 0;
+}
+
+void dspp_ctx_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+                                 uint32_t partition_id, const char* ctx_name,
+                                 uint64_t total_bytes, uint32_t total_chunks,
+                                 uint64_t program_hash) {
+    struct DSPPCtxMigrateHeader req;
+    dspp_ctx_hdr_init(&req, DSPP_MIGRATE_CTX_BEGIN_REQ, transfer_id,
+                      node_dest_id, partition_id, 0);
+    dspp_strncpy(req.ctx_name, ctx_name ? ctx_name : "", sizeof(req.ctx_name));
+    req.total_bytes  = total_bytes;
+    req.total_chunks = total_chunks;
+    req.program_hash = program_hash;
+
+    dspp_transmit_raw(&req, (uint16_t)sizeof(req));
+}
+
+void dspp_ctx_migrate_send_chunk(uint64_t transfer_id, uint32_t node_dest_id,
+                                 uint32_t partition_id, uint32_t chunk_index,
+                                 const uint8_t* data, uint32_t chunk_bytes) {
+    if (!data || chunk_bytes == 0 || chunk_bytes > DSPP_CTX_CHUNK_BYTES) return;
+
+    struct DSPPCtxMigrateChunkPacket pkt;
+    dspp_ctx_hdr_init(&pkt.header, DSPP_MIGRATE_CTX_CHUNK_REQ, transfer_id,
+                      node_dest_id, partition_id, chunk_index);
+    pkt.header.chunk_bytes = chunk_bytes;
+
+    dspp_memcpy(pkt.chunk_data, data, chunk_bytes);
+    /* The final chunk is short. Zero the remainder rather than shipping
+     * whatever was on the stack: the trailing bytes are outside
+     * chunk_bytes and so never reassembled, but they would otherwise put
+     * unrelated kernel memory on the wire. */
+    for (uint32_t i = chunk_bytes; i < DSPP_CTX_CHUNK_BYTES; i++)
+        pkt.chunk_data[i] = 0;
+
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
+static void dspp_ctx_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
+                                      uint64_t transfer_id, uint32_t partition_id,
+                                      uint32_t chunk_index, uint8_t status) {
+    struct DSPPCtxMigrateHeader ack;
+    dspp_ctx_hdr_init(&ack, opcode, transfer_id, reply_to_node,
+                      partition_id, chunk_index);
+    ack.node_dest_id = reply_to_node;
+    ack.status       = status;
+
+    dspp_transmit_raw(&ack, (uint16_t)sizeof(ack));
+}
+
+void dspp_ctx_migrate_rx(struct DSPPCtxMigrateChunkPacket* packet, uint16_t len) {
+    if (!packet || len < sizeof(struct DSPPCtxMigrateHeader)) return;
+    struct DSPPCtxMigrateHeader* h = &packet->header;
+
+    /* Same self-filter, same reasoning, as dspp_migrate_rx(). */
+    if (h->node_dest_id != cluster_local_node_id()) return;
+
+    if (h->opcode == DSPP_MIGRATE_CTX_BEGIN_REQ) {
+        SimiCtxMigStatus rc = simi_ctx_migrate_recv_begin(
+            h->transfer_id, h->ctx_name, h->total_bytes,
+            h->total_chunks, h->program_hash);
+        dspp_ctx_migrate_send_ack(DSPP_MIGRATE_CTX_BEGIN_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id, 0, (uint8_t)rc);
+        return;
+    }
+
+    if (h->opcode == DSPP_MIGRATE_CTX_CHUNK_REQ) {
+        if (len < sizeof(struct DSPPCtxMigrateChunkPacket)) return;  // truncated -- chunk_data not actually present
+        SimiCtxMigStatus rc = simi_ctx_migrate_recv_chunk(
+            h->transfer_id, h->chunk_index, packet->chunk_data, h->chunk_bytes);
+        dspp_ctx_migrate_send_ack(DSPP_MIGRATE_CTX_CHUNK_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id,
+                                  h->chunk_index, (uint8_t)rc);
+        return;
+    }
+
+    // CTX_BEGIN_ACK/CTX_CHUNK_ACK: no-op, as with the stream family.
+}
+
 void dspp_rx_dispatch(void* buf, uint16_t len) {
     if (!buf || len < sizeof(uint64_t)) return;
     uint64_t magic;
     dspp_memcpy(&magic, buf, sizeof(magic));
 
     if (magic == DSPP_MIGRATE_MAGIC) {
+        /* Two header layouts share this magic, and they are different
+         * SIZES -- a context header is smaller than a stream one. So the
+         * minimum-length check has to come AFTER reading the opcode, not
+         * before: gating the whole family on sizeof(DSPPMigrateHeader)
+         * would silently drop every legitimate context BEGIN packet for
+         * being "too short". Reading opcode first is safe precisely
+         * because of the prefix-compatibility asserts above. */
+        if (len < sizeof(uint64_t) + sizeof(uint16_t)) return;
+        uint16_t opcode;
+        dspp_memcpy(&opcode, (uint8_t*)buf + sizeof(uint64_t), sizeof(opcode));
+
+        if (opcode >= DSPP_MIGRATE_CTX_BEGIN_REQ && opcode <= DSPP_MIGRATE_CTX_CHUNK_ACK) {
+            if (len < sizeof(struct DSPPCtxMigrateHeader)) return;
+            dspp_ctx_migrate_rx((struct DSPPCtxMigrateChunkPacket*)buf, len);
+            return;
+        }
+
         if (len < sizeof(struct DSPPMigrateHeader)) return;
         dspp_migrate_rx((struct DSPPMigratePagePacket*)buf, len);
         return;

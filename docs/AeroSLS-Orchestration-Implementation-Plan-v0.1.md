@@ -206,7 +206,11 @@ Worth stating plainly because it generalises: a checkpoint test that only compar
 
 **Not done in Phase 2:** no storage binding and no syscall/shell surface yet — checkpoints exist as byte buffers only. Phase 3 needs the bytes, not a filing system, so wiring them into a stream object is better done alongside the operator-facing surface than speculatively now.
 
-### Phase 3 — Migrate a live context across nodes
+### Phase 3 — Migrate a live context across nodes — **DONE**
+
+> **Built and passing.** `kernel/simi_ctx_migrate.{c,h}` + `net/dspp.{c,h}` (new CTX opcode family) + `tests/simi_ctx_migrate_host_test.c` (78 checks). Full regression 69/69. As-built notes in §Phase 3 Findings below.
+
+### Phase 3 (original scope)
 
 **Deliverable:** a running computation moves node-to-node and resumes.
 
@@ -217,6 +221,32 @@ Worth stating plainly because it generalises: a checkpoint test that only compar
 **Risk: moderate**, mostly integration. The transport, framing and receive dispatcher are built and tested; this adds a payload type.
 
 **This is the demo.** A computation halfway through a loop on node 1, resuming on node 2 with the loop counter intact.
+
+### Phase 3 Findings (as built)
+
+**The demo works.** `loop_sum` runs 29 of its 58 instructions on node 1, is checkpointed, chunked across 19 real Ethernet-framed DSPP packets, reassembled on node 2, and runs the remaining 29 instructions there — producing `55`, the same answer as an uninterrupted single-node run, in the same total step count. No work lost, none repeated.
+
+**1. A second header on the same magic, not new fields on the old one.** `DSPPMigrateHeader`'s tail is stream-specific (name, MIME type, size, frames used, owner uid) and meaningless for a context, which instead needs total length, chunk count and a program hash. `DSPPCtxMigrateHeader` is a separate 121-byte struct sharing `DSPP_MIGRATE_MAGIC` so the dispatcher still treats both as one family.
+
+**2. The bug that design choice created, and the guard against it.** The dispatcher must read magic, opcode and `node_dest_id` *before* it knows which header it holds. The first implementation gated the whole family on `len < sizeof(DSPPMigrateHeader)` (177 bytes) — and a context header is only **121**, so every legitimate context BEGIN was silently dropped as "too short". Fixed by reading the opcode first and applying the right minimum per family. The prefix-compatibility that makes that safe is now enforced by `_Static_assert` on every shared field offset in `net/dspp.c`: reordering either struct's prefix is a **compile error naming the drifted field**, rather than a wire bug whose only symptom is misrouted packets. Verified by deliberately reordering the prefix and confirming the build fails.
+
+**3. Chunking was necessary, and it is where the real hazards live.** A checkpoint is ~74 KB against a 4 KiB packet, so BEGIN + N chunks. The non-obvious requirements, each with a test:
+   - Track **which** chunks arrived, not how many — counting alone lets a duplicate substitute for a missing chunk and completes a transfer with a hole in it. A hole is undetectable afterwards: the checksum simply fails with no indication why.
+   - Only the **last** chunk may be short; a short interior chunk leaves a zero gap the length arithmetic still considers covered.
+   - `total_chunks` must equal what `total_bytes` implies, or the two numbers disagree and either can index the bitmap.
+   - Reject an unknown program hash at **BEGIN**, not at the last chunk — otherwise 74 KB is reassembled before discovering the receiver cannot run it.
+
+**4. Mutation testing found a vacuous assertion.** The test checks that a short final chunk's unused tail is zeroed rather than leaking kernel stack. It passed *with the zeroing loop removed*, because `loop_sum` leaves nearly all 64 KiB of its flat memory zero — so the leftover bytes were zeros regardless. Fixed by poisoning the context's memory with a non-zero pattern before checkpointing. All eleven mutations tried are now caught; the reordered-prefix mutation is caught at compile time.
+
+**5. `partition_migrate()` is wired, and honestly inert.** Step 3b calls `simi_ctx_migrate_send_partition()` next to the existing stream move, under the same `cluster_local_node_id() != 0` condition (no cluster identity, nowhere to send). There is no same-disk fallback, because relocating a context to another slot on the same node migrates nothing.
+
+   **The gap this exposed, stated plainly:** nothing in this kernel owns long-lived execution contexts. No scheduler or service runtime holds them; the interpreter runs a context its caller owns. So the registry `partition_migrate()` iterates is real and really iterated, but **empty on every current boot**, and the partition path moves zero contexts. The transport, checkpointing, chunking and resume are all proven end-to-end by the host test — what is missing is a *producer* of live contexts. That is named work (it belongs with Phase 5's workload objects), not an oversight. It is wired now so the capability is reachable from the system the moment that producer exists, rather than only from a test.
+
+**6. No same-disk fallback and no retransmission.** Fire-and-forget, matching the stream path and for the same reason (`kernel/net_event.h`'s blocking wait uses privileged `sti; hlt`). The receiver *does* ACK every packet, carrying a refusal reason, so retry can be added later without another wire-format change — but nothing reads ACKs yet. A genuinely dropped chunk therefore leaves a transfer incomplete; the test verifies this is detected and refused rather than restoring a partial context.
+
+**Verification ceiling:** all of the above is host-verified. `x86_64-elf-gcc` is not available in this environment, so the full kernel link was not run; every touched file was compiled clean at `-O2` under the Makefile's exact freestanding flag set. Two *simulated* nodes in one process — real packet loss, reordering beyond what the test injects, and NIC behaviour remain unverified.
+
+**Not done in Phase 3:** one inbound transfer at a time (a second is refused with a distinct status, not silently corrupted); a raised limit is an array, not a redesign. No syscall or shell surface — migration is reachable only through `partition_migrate()`, which is the honest place for it until contexts have an owner.
 
 ### Phase 4 — Service registry (unblocks the rest)
 
@@ -246,11 +276,14 @@ Circuit breaking, health state, per-service metrics over IPC (local) and DSPP (c
 
 ```
 Phase 1 (interpreter) ─→ Phase 2 (checkpoint) ─→ Phase 3 (live migration)  ← the differentiator
+   DONE                     DONE                    DONE
                                                           │
 Phase 4 (registry) ───────────────────────────────────────┴─→ Phase 5 (workloads) ─→ Phase 6 (mesh)
 ```
 
 Phases 1–3 are the research bet; 4–6 are the orchestration surface. They are independent, so if PEC stalls the platform work continues.
+
+**The research bet is now settled: a live computation genuinely moves between nodes and resumes.** What Phases 1–3 did *not* produce is anything that creates long-lived contexts — see §Phase 3 Findings item 5. That producer is the substance of Phase 5, which makes Phase 5 the phase that turns a proven capability into a used one, rather than more surface area.
 
 **If only one thing is done: Phases 1–3.** Phase 4 is more *useful*; Phases 1–3 are what makes AeroSLS something other than a smaller Kubernetes.
 

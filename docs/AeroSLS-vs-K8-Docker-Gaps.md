@@ -846,6 +846,7 @@ type TraceConfig struct {
 | Persistent storage (PV/PVC) | ✅ Volumes | ✅ | ✅ **Obsoleted by SLS** — objects/streams are persistent by construction, checksummed, crash-consistent | `kernel/object_catalog.c`, `stream.c`, `persist.c` | N/A — see "irrelevant" list |
 | Stateful workloads | ❌ | ✅ StatefulSets | ✅ **Default** — everything is stateful | same | N/A |
 | Workload migration | ❌ | ⚠️ | ✅ **Built** — `partition_migrate()` with real cross-node byte movement over DSPP | `kernel/partition.c`, `stream.c`, `net/dspp.c` | Done |
+| **Live execution migration** | ❌ | ⚠️ Container checkpointing is alpha and forensic-oriented; a *running* pod cannot be moved and resumed | ✅ **Built — no Docker/K8s equivalent.** A mid-execution SIMI context is checkpointed, chunked over DSPP, and resumes on another node at the exact instruction, with registers, call frames and memory intact | `kernel/simi_ctx_migrate.c`, `simi_ckpt.c`, `simi_interp.c`, `net/dspp.c` | ⚠️ **Capability proven; nothing creates long-lived contexts yet** — needs Phase 5's workload objects to produce them |
 | Drain / cordon | ❌ | ✅ | ✅ **Built** — `partition_pause()` / `_resume()` | `kernel/partition.c` | Done |
 | Cluster membership | ❌ | ✅ | ✅ **Built** — `cluster_init()`, peer roster | `net/consensus.c` | Done |
 | Leader election / leases | ❌ | ✅ | ✅ **Built** — per-partition Raft-lite write leases | `net/consensus.c` | Done |

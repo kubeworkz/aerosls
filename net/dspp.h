@@ -221,6 +221,79 @@ struct DSPPMigratePagePacket {
     uint8_t                  page_data[4096];
 } __attribute__((packed));
 
+/* ─── Live execution-context migration (PEC Phase 3) ──────────────────
+ * Moving a RUNNING computation to another node, not just its data. The
+ * stream family above moves bytes at rest; this moves a checkpoint of a
+ * mid-execution SIMI context (kernel/simi_ckpt.h), so the receiving node
+ * resumes the program at the exact instruction the sender stopped at.
+ *
+ * ─── Why a separate header struct rather than new fields ──────────────
+ * DSPPMigrateHeader's tail is stream-specific (name, mime type, size,
+ * frames_used, owner_uid) and means nothing for a context; a context needs
+ * different metadata (total length, chunk count, program hash). Bolting
+ * both sets onto one struct would grow every migrate packet and invite
+ * reading a field that is meaningless for the opcode in hand.
+ *
+ * These opcodes therefore share DSPP_MIGRATE_MAGIC -- so dspp_rx_dispatch()
+ * still routes them as one family -- but carry their own header.
+ *
+ * THE CONTRACT THAT MAKES THAT SAFE: the dispatcher must read magic,
+ * opcode and node_dest_id BEFORE it can know which header struct it is
+ * looking at. So the leading fields of both headers are laid out
+ * identically, up to and including `status`. That is not a coincidence to
+ * be preserved by memory -- net/dspp.c static-asserts every shared
+ * offset, so changing either struct's prefix is a compile error rather
+ * than a wire-format bug that only shows up as misrouted packets. */
+enum DSPPCtxMigrateOpcode {
+    DSPP_MIGRATE_CTX_BEGIN_REQ = 5,  // sender -> receiver: a context is arriving; here is its size and program
+    DSPP_MIGRATE_CTX_BEGIN_ACK = 6,  // receiver -> sender: ready (status=0) or refused (status!=0)
+    DSPP_MIGRATE_CTX_CHUNK_REQ = 7,  // sender -> receiver: one chunk of the checkpoint byte stream
+    DSPP_MIGRATE_CTX_CHUNK_ACK = 8   // receiver -> sender: chunk stored; status!=0 on the final chunk means the restore failed
+};
+
+#define DSPP_CTX_CHUNK_BYTES 4096
+#define DSPP_CTX_NAME_LEN    64
+
+struct DSPPCtxMigrateHeader {
+    /* ── Prefix: byte-identical layout to struct DSPPMigrateHeader ──── */
+    uint64_t magic;             // DSPP_MIGRATE_MAGIC
+    uint16_t opcode;            // enum DSPPCtxMigrateOpcode
+    uint16_t node_source_id;
+    uint32_t node_dest_id;      // self-filtered on receipt, as with the stream family
+    uint64_t transfer_id;
+    uint32_t partition_id;
+    uint32_t chunk_index;       // aligns with DSPPMigrateHeader::page_index
+    uint8_t  status;
+    /* ── Context-specific tail ──────────────────────────────────────── */
+    char     ctx_name[DSPP_CTX_NAME_LEN];  // meaningful on BEGIN_REQ
+    uint64_t total_bytes;                  // full checkpoint length (BEGIN_REQ)
+    uint32_t total_chunks;                 // ceil(total_bytes / DSPP_CTX_CHUNK_BYTES) (BEGIN_REQ)
+    uint32_t chunk_bytes;                  // live bytes in THIS chunk (CHUNK_REQ; last one is short)
+    uint64_t program_hash;                 // simi_ckpt_program_hash() -- receiver must hold the same image
+} __attribute__((packed));
+
+struct DSPPCtxMigrateChunkPacket {
+    struct DSPPCtxMigrateHeader header;
+    uint8_t                     chunk_data[DSPP_CTX_CHUNK_BYTES];
+} __attribute__((packed));
+
+/* Sender-side. Both are fire-and-forget, exactly like their stream
+ * counterparts and for the same reason (kernel/net_event.h's blocking
+ * wait contains privileged `sti; hlt` and cannot be used here). */
+void dspp_ctx_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+                                 uint32_t partition_id, const char* ctx_name,
+                                 uint64_t total_bytes, uint32_t total_chunks,
+                                 uint64_t program_hash);
+
+void dspp_ctx_migrate_send_chunk(uint64_t transfer_id, uint32_t node_dest_id,
+                                 uint32_t partition_id, uint32_t chunk_index,
+                                 const uint8_t* data, uint32_t chunk_bytes);
+
+/* Receiver-side, reached from dspp_rx_dispatch() for the CTX opcodes.
+ * Self-filters on node_dest_id first, then routes BEGIN_REQ/CHUNK_REQ into
+ * kernel/simi_ctx_migrate.c and ACKs each. */
+void dspp_ctx_migrate_rx(struct DSPPCtxMigrateChunkPacket* packet, uint16_t len);
+
 /* Wraps dspp_len bytes at dspp_payload in a broadcast Ethernet frame
  * (ethertype ETHERTYPE_DSPP, net/net.h) and transmits it -- the one real
  * framing helper every DSPP send site (old and new) now goes through
