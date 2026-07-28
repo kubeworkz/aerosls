@@ -51,6 +51,14 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdlib.h>
+
+/* ─── Phase 6 breaker stub ────────────────────────────────────────────
+ * FAITHFUL: service_resolve() now reports the breaker state, and a
+ * service with no recorded failures is CLOSED -- which is every service
+ * in these tests, none of which report outcomes. Full breaker coverage is
+ * in tests/service_mesh_host_test.c. */
+int service_breaker_state(const char* n) { (void)n; return 0; /* CB_CLOSED */ }
+
 /* Endpoint-liveness probe sources. FAITHFUL: this test declares no
  * services at all, so nothing is ever probed; and a node with nothing
  * listening and no supervised IPC owner is exactly this situation. */

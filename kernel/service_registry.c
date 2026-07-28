@@ -14,6 +14,7 @@
 #include "../net/dspp.h"       /* dspp_service_announce()/_withdraw() */
 #include "timer.h"             /* kernel_tick_counter */
 #include "microkernel.h"        /* mk_ipc_port_state() -- IPC endpoint liveness */
+#include "service_mesh.h"      /* service_breaker_state() -- Phase 6 */
 #include "../net/tcp.h"        /* tcp_port_is_listening() -- TCP endpoint liveness */
 
 struct SLSServiceEntry  services_registry[SERVICE_MAX];
@@ -243,6 +244,12 @@ SLSServiceStatus service_resolve(const char* name, struct SLSServiceLocation* ou
         out->is_remote = 1;
         out->health    = (uint8_t)h;
         out->serving   = r->serving;   /* as the owning node last reported it */
+        /* The breaker is LOCAL: it records this node's experience of
+         * calling that service. A remote entry carries the owning node's
+         * endpoint verdict but not its breaker -- a service healthy from
+         * there may still be unreachable from here, and that is precisely
+         * what a local breaker is for. */
+        out->breaker   = (uint8_t)service_breaker_state(name);
         return SVC_REG_OK;
     }
 
@@ -264,6 +271,7 @@ SLSServiceStatus service_resolve(const char* name, struct SLSServiceLocation* ou
      * on the AP core during reconciliation and must not read tcp_conns[]
      * while the BSP is mutating it. */
     out->serving   = e->serving;
+    out->breaker   = (uint8_t)service_breaker_state(name);
 
     return SVC_REG_OK;
 }

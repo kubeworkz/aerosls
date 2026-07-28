@@ -36,6 +36,14 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+/* ─── Phase 6 breaker stub ────────────────────────────────────────────
+ * FAITHFUL: service_resolve() now reports the breaker state, and a
+ * service with no recorded failures is CLOSED -- which is every service
+ * in these tests, none of which report outcomes. Full breaker coverage is
+ * in tests/service_mesh_host_test.c. */
+int service_breaker_state(const char* n) { (void)n; return 0; /* CB_CLOSED */ }
+
+
 /* ─── Endpoint-liveness probe sources ─────────────────────────────────
  * The real ones read tcp_conns[] (16 MiB) and the microkernel's
  * services[]. Settable stand-ins here so the probe's LOGIC can be driven

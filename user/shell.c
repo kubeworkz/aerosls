@@ -40,6 +40,7 @@
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
 #include "../net/consensus.h"
 #include "../kernel/service_registry.h"
+#include "../kernel/service_mesh.h"
 #include "../kernel/workload.h"
 #include "../kernel/workload_ctx.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 
@@ -364,6 +365,8 @@ static void print_help(void) {
         "  service unregister <name>                 remove a registration\n"
         "  service resolve <name>                    name -> partition/node/endpoint\n"
         "  service list                              print every registration to serial\n"
+        "  mesh list                                 circuit-breaker state + per-service metrics\n"
+        "  mesh reset <name>                         force a breaker closed without waiting the cooldown\n"
         "  workload declare <name> <pid> <running|stopped> [svc <name> <ipc|tcp> <port>]  declare desired state\n"
         "  workload delete <name>                    remove a declaration\n"
         "  workload list                             print declarations + reconciler state\n"
@@ -1304,13 +1307,14 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint64_t rc = do_syscall(SYS_SLS_SERVICE_RESOLVE, &req);
             if (rc == SVC_REG_OK) {
                 kernel_serial_printf(
-                    "[SERVICE] '%s' -> partition %u, node %u, %s port %u (%s, %s, endpoint %s)\n",
+                    "[SERVICE] '%s' -> partition %u, node %u, %s port %u (%s, %s, endpoint %s, breaker %s)\n",
                     loc.name, (unsigned)loc.partition_id, (unsigned)loc.node_id,
                     loc.endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc",
                     (unsigned)loc.endpoint_port,
                     loc.is_local ? "local" : "remote",
                     service_health_name((SLSServiceHealth)loc.health),
-                    service_serving_name((SLSServiceServing)loc.serving));
+                    service_serving_name((SLSServiceServing)loc.serving),
+                    breaker_state_name((SLSBreakerState)loc.breaker));
             } else {
                 kernel_serial_printf("[SERVICE] resolve '%s' -> %s\n", req.name,
                                      service_status_name((SLSServiceStatus)rc));
@@ -1318,6 +1322,15 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
         else if (sh_eq(input_buffer, "service list")) {
             do_syscall(SYS_SLS_SERVICE_LIST, 0);
+        }
+        else if (sh_eq(input_buffer, "mesh list")) {
+            sys_sls_mesh_list();
+        }
+        else if (sh_starts(input_buffer, "mesh reset ")) {
+            char nm[SERVICE_NAME_LEN];
+            sh_token(input_buffer + 11, nm, sizeof(nm));
+            kernel_serial_printf("[MESH] reset '%s' -> %s\n", nm,
+                                 service_breaker_reset(nm) == 0 ? "closed" : "no such service");
         }
 
         // ── Orchestration Plan Phase 5: declarative workloads ───────────

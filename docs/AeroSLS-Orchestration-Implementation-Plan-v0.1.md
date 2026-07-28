@@ -390,9 +390,29 @@ Eight mutations tried against the probe logic, all caught — including DEGRADED
 
 **What is still not closed:** a process that is alive and holding its port but whose *handler* has wedged reports UP. Catching that needs an application-level probe — send something, require an answer — which is a different mechanism and is not built. UNKNOWN is returned honestly for an IPC port with no supervised owner rather than guessed. `wlctx_step_all()` also advances every context by a fixed budget with no fairness or priority; that is a scheduler, and naming it is not the same as having one.
 
-### Phase 6 — Mesh policy (optional)
+### Phase 6 — Mesh policy — **DONE**
+
+> **Built and passing.** `kernel/service_mesh.{c,h}` + `tests/service_mesh_host_test.c` (46 checks). Full regression 75/75. As-built notes in §Phase 6 Findings below.
+
+### Phase 6 (original scope)
 
 Circuit breaking, health state, per-service metrics over IPC (local) and DSPP (cross-node). Concepts from `AeroSLS-Service-Mesh.md`; **not** its `pthread`/socket implementation.
+
+### Phase 6 Findings (as built)
+
+**The headline: this phase closed the gap Phase 4 said it could not.** Phase 4 ended with "a process alive and holding its port but whose handler has wedged reports up — that needs an application-level probe, which is not built." That turned out to be wrong, in a useful way. `ipc_post()` already returns `-2` and increments `ipc_stats.total_dropped` when a queue is full, and **a queue only fills because nobody is draining it**. The signal supposedly requiring a new protocol was already being measured; it just was not being read. `mesh_observe_local()` now reads it, and scenario 5 of the host test proves the case end to end: the endpoint probe still reports UP (process alive, port bound, watchdog happy) while the breaker trips on queue saturation.
+
+**Three failure sources, two of them needing no cooperation.** The mesh document's breaker is fed by an explicit health-check thread. This one is fed by (1) the endpoint probe already built for Phase 4's TTL work, (2) IPC queue saturation, and (3) explicit `service_report_success()`/`_failure()` for what the kernel genuinely cannot see — a TCP service that accepts a connection and then answers wrongly. Only the third needs a caller to participate, and it is labelled as such rather than dressed up.
+
+**Admission is a separate, deliberately mutating call.** `service_resolve()` reports the breaker state and nothing more — the registry reports, it does not hide, the same posture a DOWN service gets. But HALF_OPEN must admit **exactly one** trial and re-close the gate until that trial's outcome is known, which is a state transition and cannot live inside a lookup callers make for all sorts of reasons. Hence `service_call_permitted()`, the one place that moves a breaker between OPEN and HALF_OPEN. A second caller during a trial is refused; a herd into a service that is probably still broken is the thing a breaker exists to prevent.
+
+**A design flaw the test found.** The first version had `service_report_failure()` stamp the trip from the global `kernel_tick_counter` while `service_call_permitted()` compared against a passed-in `now` — two clocks driving one state machine, so a breaker could be admitted straight back to HALF_OPEN because its recorded open-time came from a different reading than the one being compared. Now every function here that touches time takes `now` as a parameter. One state machine, one clock.
+
+Smaller decisions worth naming: a threshold of 5 rather than 1, because a breaker that trips on a single dropped message under a burst makes the system *less* available; a healthy observation resets the consecutive count but does **not** close a breaker, since only a real trial call can establish that the service is answering again; and an unknown service reports CLOSED and is permitted, because refusing on "no history" would break every service before its first outcome was ever reported.
+
+Nine mutations tried against the state machine, all caught — including admitting a herd in HALF_OPEN, skipping the cooldown, ignoring queue saturation, and letting a healthy observation close the breaker.
+
+**Not done:** breakers are per-node and local by design — a remote entry carries the owning node's endpoint verdict but not its breaker, because a service healthy *there* may still be unreachable *from here*, which is exactly what a local breaker is for. No retry, no timeout, no request hedging: those need a request/response call path, and DSPP is fire-and-forget with no responses at all. No per-service latency histogram; the microkernel tracks a rolling latency for its own five services and nothing generalises that yet.
 
 ### Interlude — the whole-image link check, and what it found
 
@@ -419,7 +439,7 @@ Allocation #256 returns the multiboot header. Process spawn and `loader.c` take 
 
 The reservation logic is split into `frame_pool_reserve_below(end_addr)` so it can be tested: a linker symbol has no address a host test can choose, and an untestable boot-path reservation is precisely what was wrong here to begin with. `tests/frame_pool_reserve_host_test.c` (23 checks) opens with a **negative control** that reproduces the unreserved allocator and shows allocation #256 really does return `0x100000` — without which "allocations are above the kernel now" would not distinguish a fix from a coincidence. Seven mutations tried, all caught.
 
-**Still unverified:** no `nasm`, so the six `.asm` objects are not in this link; no QEMU, so nothing has been booted. The fix is correct by construction and by host test, not by observation on hardware.
+**Since resolved:** a clean image boot was subsequently confirmed on a production server. That retires the ceiling every phase above had been carrying — the full toolchain link (including the `.asm` objects), the 117 MiB `.bss`, and the frame-pool reservation are all now observed working on real hardware, not merely host-verified. The host-only caveats in the earlier Findings sections predate that and should be read in this light.
 
 ## 5. Sequencing
 

@@ -84,6 +84,7 @@ struct SLSServiceLocation {
     uint8_t  is_remote;         /* answered from the replicated cache, not this node's own table */
     uint8_t  health;            /* SLSServiceHealth -- is this INFORMATION current? */
     uint8_t  serving;           /* SLSServiceServing -- is the ENDPOINT accepting? */
+    uint8_t  breaker;           /* SLSBreakerState -- would a call be admitted? (Phase 6) */
 };
 
 typedef enum {

@@ -14,6 +14,7 @@
 #include "frame_pool.h"
 #include "partition.h"
 #include "service_registry.h"
+#include "service_mesh.h"
 #include "workload.h"
 #include "workload_ctx.h"
 #include "loader.h"
@@ -170,6 +171,7 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // ── 4c-bis. LPAR groundwork: partition table (Phase 8) ─────────────────
     partition_init();
     service_registry_init();   // Orchestration Plan Phase 4 -- name -> partition/node/endpoint
+    mesh_init();               // Orchestration Plan Phase 6 -- circuit breakers
     workload_init();           // Orchestration Plan Phase 5 -- declarative workloads (reconciler OFF by default)
     wlctx_init();              // live execution contexts -- the producer partition_migrate() needs
 

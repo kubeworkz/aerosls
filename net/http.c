@@ -43,6 +43,7 @@
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- GET /api/security/databases
 #include "../kernel/tenant.h"
 #include "../kernel/service_registry.h"
+#include "../kernel/service_mesh.h"
 #include "../kernel/workload.h"
 #include "../kernel/workload_ctx.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
 #include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
@@ -2433,6 +2434,31 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
 
 
 
+// ─── Orchestration Plan Phase 6: GET /api/mesh ────────────────────────────
+static int api_mesh_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "breakers");
+    int first = 1;
+    for (uint32_t i = 0; i < MESH_MAX_SERVICES; i++) {
+        if (!mesh_entries[i].active) continue;
+        struct SLSMeshEntry* e = &mesh_entries[i];
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str (&j, "name", e->name);                                        jb_putc(&j, ',');
+        jb_str (&j, "state", breaker_state_name((SLSBreakerState)e->state)); jb_putc(&j, ',');
+        jb_uint(&j, "consecutive_failures", e->consecutive_failures);        jb_putc(&j, ',');
+        jb_uint(&j, "successes", e->successes);                              jb_putc(&j, ',');
+        jb_uint(&j, "failures", e->failures);                                jb_putc(&j, ',');
+        jb_uint(&j, "trips", e->trips);                                      jb_putc(&j, ',');
+        jb_uint(&j, "calls_permitted", e->calls_permitted);                  jb_putc(&j, ',');
+        jb_uint(&j, "calls_refused", e->calls_refused);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── Orchestration Plan Phase 5: declarative workloads ────────────────────
 // GET /api/workloads, POST /api/workload, POST /api/reconcile
 static int api_workloads_list(char* buf, int max) {
@@ -2575,6 +2601,8 @@ static int api_service_resolve(const char* name, char* buf, int max) {
         jb_str (&j, "is_remote", loc.is_remote ? "true" : "false"); jb_putc(&j, ',');
         jb_str (&j, "health", service_health_name((SLSServiceHealth)loc.health)); jb_putc(&j, ',');
         jb_str (&j, "serving", service_serving_name((SLSServiceServing)loc.serving));
+        jb_putc(&j, ',');
+        jb_str (&j, "breaker", breaker_state_name((SLSBreakerState)loc.breaker));
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -4424,6 +4452,11 @@ static void http_route(int conn, char* req) {
             blen = api_partition_connquotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Orchestration Plan Phase 6: GET /api/mesh ──────────────────────────
+        if (!strcmp(path, "/api/mesh")) {
+            blen = api_mesh_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Orchestration Plan Phase 5: GET /api/workloads ─────────────────────
         if (!strcmp(path, "/api/workloads")) {
             blen = api_workloads_list(resp_body, (int)sizeof(resp_body));
@@ -5536,6 +5569,11 @@ void http_server_run(void) {
          * or not this ever runs. */
         service_heartbeat_tick(kernel_tick_counter);
         service_remote_expire(kernel_tick_counter);
+        /* Phase 6: feed the endpoint probe and IPC queue depth into the
+         * breakers. AFTER the heartbeat, deliberately -- the heartbeat is
+         * what re-probes, so running first would judge breakers on the
+         * previous interval's observation. */
+        mesh_observe_local(kernel_tick_counter);
 
         // Nothing needed attention anywhere this sweep -- halt until the
         // next timer tick instead of busy-spinning (same idiom tcp_accept()/

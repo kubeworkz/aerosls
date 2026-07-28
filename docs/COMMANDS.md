@@ -595,7 +595,24 @@ REST equivalents: `GET /api/workloads`, `POST /api/workload`, `POST /api/reconci
 
 `service resolve` shows all of it: `'api' -> partition 3, node 2, tcp port 8080 (remote, fresh, endpoint up)`.
 
-**Not covered:** a process alive and holding its port but with a wedged handler reports `up`. That needs an application-level probe, which does not exist.
+A wedged handler — process alive, port bound, watchdog happy, but nothing draining its queue — reports `up` to the probe but **trips its circuit breaker** on IPC queue saturation (see below).
+
+---
+
+### Circuit Breakers (Orchestration Plan Phase 6)
+
+Each service carries a three-state breaker: `closed` (calls flow), `open` (calls refused), `half-open` (exactly one trial call admitted). It opens after 5 consecutive failures and admits a trial after ~10 s; a trial that succeeds closes it, one that fails re-opens it immediately.
+
+Failures come from three places, and two need no cooperation: the endpoint probe (process died), IPC queue saturation (handler wedged), and explicit reports from callers for anything the kernel cannot see. `service resolve` shows the breaker state alongside health and serving.
+
+| Command | Description |
+| --- | --- |
+| `mesh list` | Every breaker: state, consecutive/total failures, successes, trips, calls permitted and refused |
+| `mesh reset <name>` | Force a breaker closed without waiting out the cooldown. Clears the state, **not** the recorded history |
+
+REST: `GET /api/mesh`.
+
+Breakers are per-node: a remote entry carries the owning node's endpoint verdict but not its breaker, because a service healthy there may still be unreachable from here.
 
 **Operational note:** the reconciler sweeps on the AP core and queues anything that writes to disk for the BSP, which drains it in the HTTP server loop and on every shell command. On a boot with **no NIC** the HTTP loop never runs, so queued work applies only when an operator types a command — convergence is not autonomous in that configuration.
 
