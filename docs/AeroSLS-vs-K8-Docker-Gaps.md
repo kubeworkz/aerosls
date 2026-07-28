@@ -858,7 +858,7 @@ type TraceConfig struct {
 | CLI / API | ✅ docker | ✅ kubectl | ✅ **Built** — 156 shell command branches, 131 REST routes | `user/shell.c`, `net/http.c` | Naming polish only |
 | Horizontal scaling | ❌ | ✅ | ✅ **Built** — cross-node partition migration | `kernel/partition.c` | Done |
 | Edge computing | ❌ | ⚠️ K3s | ✅ **Core** | — | Done |
-| **Service discovery** | ❌ | ✅ | ❌ **ABSENT — the one real gap.** `services[]` is capped at 8, boot-populated, supervises 5 internal services; nothing resolves a name to a partition/node at runtime | `kernel/microkernel.c` | ✅ **Build this first** |
+| **Service discovery** | ❌ | ✅ | ✅ **Built** — `service_registry.c`: name → partition/endpoint, with the node **derived** from the partition's current owner, so resolution follows `partition_migrate()` with no reconciliation. `services[]` (8, boot-populated) remains internal-service supervision, unchanged | `kernel/service_registry.c` | ⚠️ Per-node registry; cross-node replication is Phase 5 work |
 | Declarative workload spec | ⚠️ Compose | ✅ Deployment | ❌ Absent | — | ✅ High — fits as an SLS object + reconcile loop |
 | Service mesh policy | ❌ | ✅ Istio | ⚠️ **Substrate only** — IPC/MQ local, DSPP cross-node; no circuit breaking or policy layer | `kernel/ipc.c`, `net/dspp.c` | ⚠️ Medium — build on substrate, not Envoy |
 | Network policies (src/dst ACL) | ❌ | ✅ | ❌ Absent | — | ⚠️ Medium |

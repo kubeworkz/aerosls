@@ -18,6 +18,7 @@
 #include "../net/consensus.h"   // Multi-Node Partition Scaling Roadmap Phase 2 -- cluster_local_node_id()
 #include "stream.h"             // Multi-Node Phase 6 addendum -- stream_relocate_partition() (real migration data movement)
 #include "simi_ctx_migrate.h"   // PEC Phase 3 -- simi_ctx_migrate_send_partition()
+#include "service_registry.h"  // Orchestration Plan Phase 4 -- service_unregister_partition()
 
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
@@ -98,6 +99,12 @@ static int partition_id_valid(uint32_t partition_id) {
     if (partition_id >= PARTITION_MAX) return 0;
     return partition_table[partition_id].active;
 }
+
+/* Public wrapper over the same check (Orchestration Plan Phase 4).
+ * kernel/service_registry.c needs "is this an active, defined partition"
+ * before accepting a registration; a thin wrapper keeps one source of
+ * truth rather than a second copy of the rule that could drift. */
+int partition_exists(uint32_t partition_id) { return partition_id_valid(partition_id); }
 
 int partition_assign_uid(uint32_t uid, uint32_t partition_id) {
     if (uid == 0) {
@@ -231,6 +238,16 @@ int partition_destroy(uint32_t partition_id) {
     // infrastructure allocations, permanently attributed to
     // PARTITION_SYSTEM, which can never itself be destroyed).
     uint32_t frames_reclaimed = partition_reclaim_all_frames(partition_id);
+
+    // Step 3b (Orchestration Plan Phase 4): drop this partition's service
+    // registrations. A registration resolves name -> partition -> node, so
+    // one left behind for a destroyed partition would keep resolving --
+    // handing callers the owner node of a partition that no longer exists,
+    // which is a confidently wrong answer rather than an honest "no such
+    // service". Dropped here rather than left to expire because the
+    // registry has no expiry: it is authoritative, not a cache.
+    uint32_t services_dropped = service_unregister_partition(partition_id);
+    (void)services_dropped;
 
     // Step 4: clear every uid assignment pointing at this partition. Those
     // uids fall back to PARTITION_DEFAULT automatically the next time

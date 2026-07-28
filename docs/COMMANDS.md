@@ -553,6 +553,21 @@ Sets this boot's real node identity for distributed operation — required befor
 
 ---
 
+### Service Registry (Orchestration Plan Phase 4)
+
+Name → partition/node/endpoint resolution. The **node is not stored** — it is derived from the partition's current owner on every lookup, so `service resolve` after a `partition migrate` reports the new node with nothing having been updated. Registration and removal require `DB_ADMIN` or higher; resolution is not role-gated. Registrations are dropped automatically when their partition is destroyed.
+
+| Command | Description |
+| --- | --- |
+| `service register <name> <partition_id> <ipc\|tcp> <port>` | Register (or update in place) a service in a partition. Refuses an undefined partition, port 0, an empty or over-long name |
+| `service unregister <name>` | Remove a registration |
+| `service resolve <name>` | Print partition, **current** node, endpoint kind/port, and whether it is local |
+| `service list` | Print every registration, each with its partition's current owner node |
+
+REST equivalents: `GET /api/services`, `GET /api/service/resolve/<name>`, `POST /api/service` (`{"name","partition_id","endpoint_kind":"tcp"|"ipc","endpoint_port"}`, DB_ADMIN-gated).
+
+---
+
 ### Network & Disk Status (Navigator-Parity Gap Roadmap Phase 5c, Storage Isolation Roadmap)
 
 

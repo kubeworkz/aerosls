@@ -50,6 +50,7 @@
 #include "kernel/vecstore.h"
 #include "kernel/vec_index.h"
 #include "kernel/tenant.h"
+#include "kernel/service_registry.h"
 #include "kernel/database.h"
 #include "kernel/view.h"
 #include "kernel/stream.h"
@@ -139,6 +140,9 @@ static struct Region regions[] = {
         ARR("rowstore_partition_cursor", PERSIST_ROWSTORE_PARTCURSOR_LBA, rowstore_partition_cursor) }, 1 },
     { "vecstore_partcursor", 1, {
         ARR("vecstore_partition_cursor", PERSIST_VECSTORE_PARTCURSOR_LBA, vecstore_partition_cursor) }, 1 },
+    { "services", 1, {
+        HDR("services", PERSIST_SERVICE_HDR_LBA),
+        ARR("services_registry", PERSIST_SERVICE_ENT_LBA, services_registry) }, 2 },
 };
 #define NREGIONS ((int)(sizeof(regions)/sizeof(regions[0])))
 

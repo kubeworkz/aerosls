@@ -12,6 +12,7 @@
 #include "../kernel/auth.h"
 #include "../kernel/secure_api.h"
 #include "partition.h"
+#include "service_registry.h"   // Orchestration Plan Phase 4
 #include "frame_pool.h"
 #include "storage_quota.h"   // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
 #include "../net/tcp_quota.h" // Network Fairness Phase 2 -- SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST
@@ -292,6 +293,20 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_cluster_init((uint32_t)(uintptr_t)arg);
     case SYS_SLS_CLUSTER_STATUS:
         sys_sls_cluster_status(); return 0;
+
+    // ── Orchestration Plan Phase 4: service registry (281-284) ──────────
+    // name -> partition/node/endpoint resolution. The node is NOT stored;
+    // RESOLVE derives it from partition_owner_table[] each time, so a
+    // lookup after partition_migrate() returns the new node with nothing
+    // to invalidate (kernel/service_registry.h).
+    case SYS_SLS_SERVICE_REGISTER:
+        return sys_sls_service_register((struct SLSServiceRegisterRequest*)arg);
+    case SYS_SLS_SERVICE_UNREGISTER:
+        return sys_sls_service_unregister((struct SLSServiceRegisterRequest*)arg);
+    case SYS_SLS_SERVICE_RESOLVE:
+        return sys_sls_service_resolve((struct SLSServiceResolveRequest*)arg);
+    case SYS_SLS_SERVICE_LIST:
+        sys_sls_service_list(); return 0;
 
     // ── Phase 22: SQL engine, live at last (220) ────────────────────────────
     // The first dispatch-reachable entry point into Phases 19-22's SQL

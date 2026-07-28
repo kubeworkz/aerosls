@@ -34,6 +34,7 @@
 #include "kernel/view.h"
 #include "kernel/mvcc.h"
 #include "user/permissions.h"
+#include "kernel/service_registry.h"
 #include "kernel/tenant.h"      // Multitenant Isolation Gap Analysis §5 item 1 -- persist.c now references tenants[]/tenant_next_id; this test doesn't exercise tenant_create() itself so the bare storage (not kernel/tenant.c's functions) is enough to satisfy the linker,
 // the same "declare the extern array directly" convention this file already uses for object_catalog[] etc. above.
 struct SLSTenantEntry tenants[TENANT_MAX];
@@ -42,6 +43,15 @@ uint32_t              tenant_next_id = 1;
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+/* ─── Orchestration Plan Phase 4: services_registry[] ─────────────────
+ * kernel/persist.c now snapshots and restores this array, so every test
+ * linking persist.c must provide it. A real, zero-initialised definition
+ * rather than a stub: an empty registry is exactly what these tests have,
+ * and persist.c reads and writes the actual bytes. The registry's own
+ * behaviour is covered by tests/service_registry_host_test.c. */
+struct SLSServiceEntry services_registry[SERVICE_MAX];
+
 
 struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];
 uint32_t               object_catalog_count = 0;

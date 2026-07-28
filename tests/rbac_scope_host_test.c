@@ -67,6 +67,19 @@
 #include <stdint.h>
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* ─── Orchestration Plan Phase 4 stub: partition_destroy()'s registry
+ * cleanup. FAITHFUL, not a no-op: the real
+ * service_unregister_partition() drops every registration belonging to
+ * the partition and returns how many it dropped; this test registers no
+ * services, so the real function would find none and return 0 -- exactly
+ * what this returns. Full coverage of the real one, including that
+ * partition_destroy() genuinely invokes it, is in
+ * tests/service_registry_host_test.c. */
+uint32_t service_unregister_partition(uint32_t partition_id) {
+    (void)partition_id; return 0;
+}
+
+
 /* ─── PEC Phase 3 stub: kernel/partition.c's context-migration step ────
  * FAITHFUL, not a no-op. The real simi_ctx_migrate_send_partition()
  * walks the live-context registry and sends whatever belongs to the

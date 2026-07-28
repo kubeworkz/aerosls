@@ -119,6 +119,7 @@ SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
  * has no interest in), the same dummy-globals pattern these tests already use
  * for object_catalog[] et al. */
 #include "kernel/database.h"
+#include "kernel/service_registry.h"
 struct SLSDatabaseEntry databases[DATABASE_MAX];
 struct SLSDatabaseGrant database_grants[DATABASE_GRANT_MAX];
 uint32_t database_next_id = 1;
@@ -203,6 +204,28 @@ int nvme_flush_sync(void) {
 
 #include "kernel/persist.h"   /* self-contained (just <stdint.h>), safe to include here */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
+/* ─── Orchestration Plan Phase 4: services_registry[] ─────────────────
+ * kernel/persist.c now snapshots and restores this array, so every test
+ * linking persist.c must provide it. A real, zero-initialised definition
+ * rather than a stub: an empty registry is exactly what these tests have,
+ * and persist.c reads and writes the actual bytes. The registry's own
+ * behaviour is covered by tests/service_registry_host_test.c. */
+struct SLSServiceEntry services_registry[SERVICE_MAX];
+
+
+/* ─── Orchestration Plan Phase 4 stub: partition_destroy()'s registry
+ * cleanup. FAITHFUL, not a no-op: the real
+ * service_unregister_partition() drops every registration belonging to
+ * the partition and returns how many it dropped; this test registers no
+ * services, so the real function would find none and return 0 -- exactly
+ * what this returns. Full coverage of the real one, including that
+ * partition_destroy() genuinely invokes it, is in
+ * tests/service_registry_host_test.c. */
+uint32_t service_unregister_partition(uint32_t partition_id) {
+    (void)partition_id; return 0;
+}
+
 
 /* ─── PEC Phase 3 stub: kernel/partition.c's context-migration step ────
  * FAITHFUL, not a no-op. The real simi_ctx_migrate_send_partition()

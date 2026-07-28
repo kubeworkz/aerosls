@@ -70,6 +70,16 @@ SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
  * has no interest in), the same dummy-globals pattern these tests already use
  * for object_catalog[] et al. */
 #include "kernel/database.h"
+#include "kernel/service_registry.h"
+
+/* ─── Orchestration Plan Phase 4: services_registry[] ─────────────────
+ * kernel/persist.c now snapshots and restores this array, so every test
+ * linking persist.c must provide it. A real, zero-initialised definition
+ * rather than a stub: an empty registry is exactly what these tests have,
+ * and persist.c reads and writes the actual bytes. The registry's own
+ * behaviour is covered by tests/service_registry_host_test.c. */
+struct SLSServiceEntry services_registry[SERVICE_MAX];
+
 struct SLSDatabaseEntry databases[DATABASE_MAX];
 struct SLSDatabaseGrant database_grants[DATABASE_GRANT_MAX];
 uint32_t database_next_id = 1;

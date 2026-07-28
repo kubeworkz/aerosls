@@ -46,10 +46,20 @@
 #include "kernel/vecstore.h"
 #include "kernel/storage_quota.h"
 #include "user/permissions.h"
+#include "kernel/service_registry.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+/* ─── Orchestration Plan Phase 4: services_registry[] ─────────────────
+ * kernel/persist.c now snapshots and restores this array, so every test
+ * linking persist.c must provide it. A real, zero-initialised definition
+ * rather than a stub: an empty registry is exactly what these tests have,
+ * and persist.c reads and writes the actual bytes. The registry's own
+ * behaviour is covered by tests/service_registry_host_test.c. */
+struct SLSServiceEntry services_registry[SERVICE_MAX];
+
 
 struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];
 uint32_t               object_catalog_count = 0;

@@ -248,7 +248,11 @@ Worth stating plainly because it generalises: a checkpoint test that only compar
 
 **Not done in Phase 3:** one inbound transfer at a time (a second is refused with a distinct status, not silently corrupted); a raised limit is an array, not a redesign. No syscall or shell surface — migration is reachable only through `partition_migrate()`, which is the honest place for it until contexts have an owner.
 
-### Phase 4 — Service registry (unblocks the rest)
+### Phase 4 — Service registry (unblocks the rest) — **DONE**
+
+> **Built and passing.** `kernel/service_registry.{c,h}` + persist region + syscalls 281–284 + 4 shell commands + 3 REST routes + `tests/service_registry_host_test.c` (46 checks). Full regression 70/70. As-built notes in §Phase 4 Findings below.
+
+### Phase 4 (original scope)
 
 **Deliverable:** name → partition/node/endpoint resolution.
 
@@ -257,6 +261,28 @@ Worth stating plainly because it generalises: a checkpoint test that only compar
 - Replaces nothing: `services[MAX_SERVICES]` (8, boot-populated, `kernel/microkernel.c`) stays as internal-service supervision.
 
 **Risk: low.** Small and additive.
+
+### Phase 4 Findings (as built)
+
+**1. "A registration is a catalog object" was wrong, and checking it produced a better design.** `struct SLSObjectEntry` has name, `partition_id`, `owner_uid`, `owner_role` and `perm_mask` — but nowhere to put an **endpoint**, which is the entire point of a registration. Making it a catalog object would mean adding service-specific fields to a 128-entry struct shared by every object type and persisted on every boot, to serve one caller. So this is a dedicated `services_registry[64]` table, the idiom `partition_owner_table[]` and `tenants[]` already use. The salvageable half of the claim was kept: registrations carry `owner_uid`/`partition_id` and gate through `catalog_get_role()`, so RBAC really is the existing mechanism rather than a second permission system.
+
+**2. The node is NOT stored — and that is the design.** A registration records name → **partition**. `node_id` is derived at resolve time via `partition_get_owner_node()`.
+
+   `partition_migrate()` already updates `partition_owner_table[]` (its Step 4). Storing a node id here would be a second copy of a fact that already moves, stale the instant a partition migrated, requiring a reconciliation loop to chase it — which is precisely the machinery Kubernetes needs and this design gets to not build.
+
+   **The consequence is the phase's best property: service resolution follows partition migration automatically.** Scenario 3 of the host test runs the *real* `partition_migrate()` and re-resolves: the lookup reports the new node, `is_local` flips correctly, and **zero writes happen to the registry** — asserted by counting `persist_services()` calls. Mutation testing confirms the test is real: caching the node instead of deriving it fails 5 checks.
+
+**3. Destruction is the converse, and needed wiring.** A registration pointing at a destroyed partition would resolve to the owner node of a partition that no longer exists — a confidently wrong answer, worse than "no such service." `partition_destroy()` Step 3b now calls `service_unregister_partition()`. Dropped rather than expired because the registry is authoritative, not a cache.
+
+**4. Resolution is deliberately not role-gated.** Registration and removal require `DB_ADMIN`; looking up where something lives does not — the same posture `partition_get_owner_node()` takes. Both directions are asserted, and gating reads is one of the eight mutations the test catches.
+
+**5. A stray line found in `persist_restore_all()`.** A `persist_region_commit()` call sat inside the tenant cold-start branch, left over from the crash-consistency work. Assessed honestly: `p_region_open` is 0 throughout restore (nothing calls `stage_hdr()` there, and `persist_scan_regions()` only reads), so it returned at its first line — **dead code, not live corruption**. Removed anyway: it implies a write happens during restore, and it would fire at the wrong moment the first time any restore block staged something.
+
+**6. Blast radius, as usual.** One new symbol in `partition.c` needed faithful stubs in 16 tests; `persist.c` snapshotting the new array needed a real (zero-initialised) definition in 29. Faithful in both cases — an empty registry returning 0 is exactly what the real code does under those tests' conditions, not a convenient lie.
+
+**Verification ceiling:** host-verified only; `x86_64-elf-gcc` is unavailable here, so no full kernel link — every touched file compiles clean at `-O2` under the Makefile's exact freestanding flags. The new persist region's placement is checked by `tests/persist_lba_layout_host_test.c`, and that check was confirmed to genuinely fail for two deliberately-overlapping placements rather than passing by default. The REST and shell surfaces are compile-verified but not exercised against a running kernel.
+
+**Not done in Phase 4:** no health checking or TTL — a registration is a static fact until changed, not a liveness signal (`kernel/microkernel.c`'s watchdog remains the only liveness mechanism, and only for the 5 internal services). No cross-node registry replication: each node holds its own registry, so a name registered on node 1 does not resolve on node 2. That is a real limit and the natural companion to Phase 5's reconciliation, not something to bolt on here.
 
 ### Phase 5 — Declarative workload objects + reconciliation
 
@@ -279,6 +305,7 @@ Phase 1 (interpreter) ─→ Phase 2 (checkpoint) ─→ Phase 3 (live migration
    DONE                     DONE                    DONE
                                                           │
 Phase 4 (registry) ───────────────────────────────────────┴─→ Phase 5 (workloads) ─→ Phase 6 (mesh)
+   DONE
 ```
 
 Phases 1–3 are the research bet; 4–6 are the orchestration surface. They are independent, so if PEC stalls the platform work continues.

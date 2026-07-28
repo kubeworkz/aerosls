@@ -41,7 +41,8 @@
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- GET /api/security/databases
-#include "../kernel/tenant.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
+#include "../kernel/tenant.h"
+#include "../kernel/service_registry.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
 #include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
@@ -2428,6 +2429,90 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+
+// ─── Orchestration Plan Phase 4: service registry ─────────────────────────
+// GET /api/services, GET /api/service/resolve?name=..., POST /api/service
+//
+// `node_id` in these responses is DERIVED from the partition's current
+// owner on every request, never stored (kernel/service_registry.h). So a
+// GET issued after a partition migrates reports the new node with nothing
+// here having been updated or invalidated.
+static int api_services_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "services");
+    int first = 1;
+    for (uint32_t i = 0; i < SERVICE_MAX; i++) {
+        if (!services_registry[i].active) continue;
+        struct SLSServiceEntry* e = &services_registry[i];
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str (&j, "name", e->name);                                jb_putc(&j, ',');
+        jb_uint(&j, "partition_id", e->partition_id);                jb_putc(&j, ',');
+        jb_uint(&j, "node_id", partition_get_owner_node(e->partition_id)); jb_putc(&j, ',');
+        jb_str (&j, "endpoint_kind", e->endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc");
+        jb_putc(&j, ',');
+        jb_uint(&j, "endpoint_port", e->endpoint_port);              jb_putc(&j, ',');
+        jb_uint(&j, "owner_uid", e->owner_uid);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_service_resolve(const char* name, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    struct SLSServiceLocation loc;
+    SLSServiceStatus rc = service_resolve(name, &loc);
+    jb_obj_open(&j, 0);
+    if (rc != SVC_REG_OK) {
+        jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", service_status_name(rc));
+    } else {
+        jb_str (&j, "ok", "true");                       jb_putc(&j, ',');
+        jb_str (&j, "name", loc.name);                   jb_putc(&j, ',');
+        jb_uint(&j, "partition_id", loc.partition_id);   jb_putc(&j, ',');
+        jb_uint(&j, "node_id", loc.node_id);             jb_putc(&j, ',');
+        jb_str (&j, "endpoint_kind", loc.endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc");
+        jb_putc(&j, ',');
+        jb_uint(&j, "endpoint_port", loc.endpoint_port); jb_putc(&j, ',');
+        jb_str (&j, "is_local", loc.is_local ? "true" : "false");
+    }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_service_post(const char* body, char* buf, int max,
+                            uint32_t req_uid, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    if (!body) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    /* Same DB_ADMIN gate the partition/tenant creation endpoints carry.
+     * service_register() re-checks via catalog_get_role() -- this is the
+     * HTTP-layer half, not the only one. */
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    char name[SERVICE_NAME_LEN]; name[0] = '\0';
+    json_str(body, "name", name, (int)sizeof(name));
+    char kind[8]; kind[0] = '\0';
+    json_str(body, "endpoint_kind", kind, (int)sizeof(kind));
+    SLSServiceEndpointKind k =
+        (kind[0]=='t' && kind[1]=='c' && kind[2]=='p') ? SVC_ENDPOINT_TCP : SVC_ENDPOINT_IPC;
+
+    SLSServiceStatus rc = service_register(req_uid, name,
+                                           (uint32_t)json_int(body, "partition_id"),
+                                           k, (uint32_t)json_int(body, "endpoint_port"));
+    jb_str(&j, "ok", rc == SVC_REG_OK ? "true" : "false");
+    if (rc != SVC_REG_OK) { jb_putc(&j, ','); jb_str(&j, "error", service_status_name(rc)); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── GET /api/partition/connquotas, POST /api/partition/connquota ─────────
 // Network Fairness Phase 2 (Multitenant Isolation Gap Analysis §19): this
 // mechanism (net/tcp_quota.c) shipped with a syscall and a shell command
@@ -4241,6 +4326,16 @@ static void http_route(int conn, char* req) {
             blen = api_partition_connquotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Orchestration Plan Phase 4: GET /api/services ──────────────────────
+        if (!strcmp(path, "/api/services")) {
+            blen = api_services_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Orchestration Plan Phase 4: GET /api/service/resolve/<name> ────────
+        if (str_find(path, "/api/service/resolve/") == path) {
+            blen = api_service_resolve(path + 21, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Multitenant Isolation Gap Analysis §5 item 6: GET /api/usage ───────
         if (!strcmp(path, "/api/usage")) {
             blen = api_usage_report(resp_body, (int)sizeof(resp_body));
@@ -4907,6 +5002,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/partition/connquota")) {
             blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Orchestration Plan Phase 4: POST /api/service ──────────────────────
+        if (!strcmp(path, "/api/service")) {
+            blen = api_service_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid, req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Multitenant Isolation Gap Analysis §5 item 1 / §7 item 2:

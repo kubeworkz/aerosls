@@ -143,6 +143,11 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id);
  * Phase 2 scope note. */
 int partition_is_local(uint32_t partition_id);
 
+/* "Is this an active, defined partition?" (Orchestration Plan Phase 4)
+ * PARTITION_SYSTEM always is. Public wrapper over the check
+ * partition_create()/_destroy()/_migrate() already apply internally. */
+int partition_exists(uint32_t partition_id);
+
 /* ─── Phase 14 (LPAR): partition lifecycle ──────────────────────────────────
  * partition_destroy() is real teardown, not just a table row removal:
  * kills every process in partition_id (process_kill_partition()), vfrees

@@ -24,7 +24,8 @@
 #include "mvcc.h"            // Gap Remediation Phase D -- mvcc_bootstrap_from_rowstore()
 #include "database.h"        // Database Gap Analysis §1 -- databases[]/database_grants[]/database_next_id
 #include "view.h"            // Query-Surface Roadmap Phase 5 -- views[]
-#include "tenant.h"           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
+#include "tenant.h"
+#include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -496,6 +497,8 @@ static const struct PersistRegionSpec p_region_specs[] = {
       1, { { PERSIST_VIEW_ENT_LBA, (uint32_t)sizeof(views) } } },
     { PERSIST_TENANT_HDR_LBA, PERSIST_MAGIC_TENANT,
       1, { { PERSIST_TENANT_ENT_LBA, (uint32_t)sizeof(tenants) } } },
+    { PERSIST_SERVICE_HDR_LBA, PERSIST_MAGIC_SERVICE,
+      1, { { PERSIST_SERVICE_ENT_LBA, (uint32_t)sizeof(services_registry) } } },
 };
 #define P_REGION_COUNT ((int)(sizeof(p_region_specs)/sizeof(p_region_specs[0])))
 
@@ -639,6 +642,7 @@ static void persist_vec_backfill_cb(struct VecId id, uint64_t external_id,
 #define PERSIST_PEND_DATABASE      (1u << 11)
 #define PERSIST_PEND_VIEW          (1u << 12)
 #define PERSIST_PEND_TENANT        (1u << 13)
+#define PERSIST_PEND_SERVICE       (1u << 14)   /* Orchestration Plan Phase 4 */
 
 static uint32_t persist_defer_depth   = 0;
 static uint32_t persist_pending_mask  = 0;
@@ -679,6 +683,7 @@ void persist_defer_end(void) {
     if (pend & PERSIST_PEND_DATABASE)      persist_databases();
     if (pend & PERSIST_PEND_VIEW)          persist_views();
     if (pend & PERSIST_PEND_TENANT)        persist_tenants();
+    if (pend & PERSIST_PEND_SERVICE)       persist_services();
 }
 
 // ─── persist_catalog ─────────────────────────────────────────────────────────
@@ -952,6 +957,22 @@ void persist_tenants(void) {
     persist_write_array(tenants, tenant_bytes, PERSIST_TENANT_ENT_LBA);
     persist_region_commit();
     kernel_serial_print("[PERSIST] Tenants snapshot written.\n");
+}
+
+// persist_services — services_registry[] (Orchestration Plan Phase 4).
+// Pure definitions, direct restore, same shape as persist_tenants(). No
+// header-carried scalar: registrations are keyed by NAME, not by a bump-
+// allocated id, so there is no next_id whose reuse would alias a stale
+// reference -- the reason persist_tenants()/persist_databases() need that
+// third header field does not arise here.
+void persist_services(void) {
+    if (persist_defer_note(PERSIST_PEND_SERVICE)) return;
+    if (!io_sq || !io_cq) return;
+    uint32_t svc_bytes = (uint32_t)sizeof(services_registry);
+    stage_hdr(PERSIST_SERVICE_HDR_LBA, PERSIST_MAGIC_SERVICE, svc_bytes, 0, 0);
+    persist_write_array(services_registry, svc_bytes, PERSIST_SERVICE_ENT_LBA);
+    persist_region_commit();
+    kernel_serial_print("[PERSIST] Service registry snapshot written.\n");
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -1424,8 +1445,36 @@ void persist_restore_all(void) {
                 kernel_serial_print("[PERSIST] Tenants: struct size mismatch — cold start.\n");
             }
         } else {
-    persist_region_commit();
             kernel_serial_print("[PERSIST] Tenants: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 15. Service registry (Orchestration Plan Phase 4) ──────────────────
+    // Direct restore -- pure definitions, and notably NO derived state to
+    // rebuild: a registration stores name -> partition, and the node id is
+    // recomputed from partition_owner_table[] on every resolve (see
+    // service_registry.h). So a restored registry is correct the instant it
+    // loads, even if the partition it points at moved to a different node
+    // while this machine was down -- there is no stale cached location to
+    // invalidate, because none was ever stored.
+    if (nvme_read_sync(PERSIST_SERVICE_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_SERVICE && persist_region_trusted(PERSIST_MAGIC_SERVICE)) {
+            uint32_t svc_bytes;
+            p_memcpy(&svc_bytes, p_buf + 8, 4);
+            if (svc_bytes == (uint32_t)sizeof(services_registry)) {
+                persist_read_array(services_registry, svc_bytes, PERSIST_SERVICE_ENT_LBA);
+                uint32_t scount = 0;
+                for (uint32_t i = 0; i < SERVICE_MAX; i++)
+                    if (services_registry[i].active) scount++;
+                kernel_serial_printf("[PERSIST] Service registry restored: %u registration(s).\n",
+                                     scount);
+            } else {
+                kernel_serial_print("[PERSIST] Service registry: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Service registry: no snapshot — cold start.\n");
         }
     }
 }

@@ -234,6 +234,16 @@
 #define PERSIST_ROWSTORE_PARTCURSOR_LBA 7536ULL
 #define PERSIST_VECSTORE_PARTCURSOR_LBA 7552ULL
 
+// ─── Orchestration Plan Phase 4 (service registry) ──────────────────────────
+// services_registry[] is 64 x 80 = 5120 B = 2 frames = 16 sectors, so the
+// entry array spans 7584..7600. Placed after the last in-use region
+// (VECSTORE_PARTCURSOR ends at 7560) with this layout's 1-frame safety gap
+// on each side. tests/persist_lba_layout_host_test.c enforces both the gap
+// and the no-overlap invariant -- see that file for why this is checked by
+// a test rather than trusted to arithmetic done once.
+#define PERSIST_SERVICE_HDR_LBA         7568ULL
+#define PERSIST_SERVICE_ENT_LBA         7584ULL
+
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously
 // always 0) -- see the LBA layout comment above for the full reasoning.
@@ -255,6 +265,7 @@
 #define PERSIST_MAGIC_DATABASE       0xCAFE00000000000CULL   /* Database Gap Analysis §1 */
 #define PERSIST_MAGIC_VIEW           0xCAFE00000000000DULL   /* Query-Surface Roadmap Phase 5 */
 #define PERSIST_MAGIC_TENANT         0xCAFE00000000000EULL   /* Multitenant Isolation Gap Analysis §5 item 1 */
+#define PERSIST_MAGIC_SERVICE        0xCAFE00000000000FULL   /* Orchestration Plan Phase 4 (service registry) */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -365,6 +376,7 @@ void persist_views(void);
 // persist_databases(). tenant_next_id rides in the header for the same
 // reason database_next_id does there — see the LBA layout comment above.
 void persist_tenants(void);
+void persist_services(void);   /* Orchestration Plan Phase 4 -- services_registry[] */
 
 /* ─── Deferred / batched persistence ──────────────────────────────────────
  * Every persist_*() above rewrites its entire region: persist_records()

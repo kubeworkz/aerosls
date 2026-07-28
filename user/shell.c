@@ -38,7 +38,8 @@
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- audit log
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
-#include "../net/consensus.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
+#include "../net/consensus.h"
+#include "../kernel/service_registry.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -357,6 +358,10 @@ static void print_help(void) {
         "                                            will take the cross-node wire path\n"
         "                                            instead of the same-disk relocate path)\n"
         "  cluster status                            print node_id/role/term/roster to serial\n"
+        "  service register <name> <pid> <ipc|tcp> <port>  register a service in a partition\n"
+        "  service unregister <name>                 remove a registration\n"
+        "  service resolve <name>                    name -> partition/node/endpoint\n"
+        "  service list                              print every registration to serial\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name> <password>      derive+store a password-based key for an\n"
         "                                   object (does NOT encrypt its data -- see\n"
@@ -1239,6 +1244,63 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
         else if (sh_eq(input_buffer, "cluster status")) {
             do_syscall(SYS_SLS_CLUSTER_STATUS, 0);
+        }
+
+        // ── Orchestration Plan Phase 4: service registry ────────────────
+        // "resolve" is the interesting one: it prints the node, which is
+        // DERIVED from the partition's current owner rather than stored,
+        // so resolving after "partition migrate" shows the new node with
+        // nothing having been updated here (kernel/service_registry.h).
+        else if (sh_starts(input_buffer, "service register ")) {
+            struct SLSServiceRegisterRequest req;
+            const char* p = input_buffer + 17;
+            char nametok[SERVICE_NAME_LEN], pidtok[16], kindtok[8], porttok[16];
+            p = sh_token(p, nametok,  sizeof(nametok));
+            p = sh_token(p, pidtok,   sizeof(pidtok));
+            p = sh_token(p, kindtok,  sizeof(kindtok));
+            sh_token(p, porttok, sizeof(porttok));
+            for (int i = 0; i < SERVICE_NAME_LEN; i++) req.name[i] = nametok[i];
+            req.caller_uid    = 0;   /* shell runs as the kernel uid, as elsewhere here */
+            req.partition_id  = sh_atoi(pidtok);
+            req.endpoint_kind = sh_eq(kindtok, "tcp") ? SVC_ENDPOINT_TCP : SVC_ENDPOINT_IPC;
+            req.endpoint_port = sh_atoi(porttok);
+            uint64_t rc = do_syscall(SYS_SLS_SERVICE_REGISTER, &req);
+            kernel_serial_printf("[SERVICE] register '%s' -> %s\n", req.name,
+                                 service_status_name((SLSServiceStatus)rc));
+        }
+        else if (sh_starts(input_buffer, "service unregister ")) {
+            struct SLSServiceRegisterRequest req;
+            const char* p = input_buffer + 19;
+            char nametok[SERVICE_NAME_LEN];
+            sh_token(p, nametok, sizeof(nametok));
+            for (int i = 0; i < SERVICE_NAME_LEN; i++) req.name[i] = nametok[i];
+            req.caller_uid = 0;
+            uint64_t rc = do_syscall(SYS_SLS_SERVICE_UNREGISTER, &req);
+            kernel_serial_printf("[SERVICE] unregister '%s' -> %s\n", req.name,
+                                 service_status_name((SLSServiceStatus)rc));
+        }
+        else if (sh_starts(input_buffer, "service resolve ")) {
+            struct SLSServiceResolveRequest req;
+            struct SLSServiceLocation loc;
+            const char* p = input_buffer + 16;
+            char nametok[SERVICE_NAME_LEN];
+            sh_token(p, nametok, sizeof(nametok));
+            for (int i = 0; i < SERVICE_NAME_LEN; i++) req.name[i] = nametok[i];
+            req.out = &loc;
+            uint64_t rc = do_syscall(SYS_SLS_SERVICE_RESOLVE, &req);
+            if (rc == SVC_REG_OK) {
+                kernel_serial_printf(
+                    "[SERVICE] '%s' -> partition %u, node %u, %s port %u%s\n",
+                    loc.name, (unsigned)loc.partition_id, (unsigned)loc.node_id,
+                    loc.endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc",
+                    (unsigned)loc.endpoint_port, loc.is_local ? " (local)" : " (remote)");
+            } else {
+                kernel_serial_printf("[SERVICE] resolve '%s' -> %s\n", req.name,
+                                     service_status_name((SLSServiceStatus)rc));
+            }
+        }
+        else if (sh_eq(input_buffer, "service list")) {
+            do_syscall(SYS_SLS_SERVICE_LIST, 0);
         }
         else if (sh_starts(input_buffer, "partition quota ")) {
             struct SLSPartitionQuotaSetRequest req;

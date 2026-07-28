@@ -12,6 +12,7 @@
 #include "timer.h"
 #include "process.h"
 #include "partition.h"
+#include "service_registry.h"
 #include "loader.h"
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
@@ -146,6 +147,7 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4c-bis. LPAR groundwork: partition table (Phase 8) ─────────────────
     partition_init();
+    service_registry_init();   // Orchestration Plan Phase 4 -- name -> partition/node/endpoint
 
     // ── 4d. Service binary loader ───────────────────────────────────────────
     loader_init();
