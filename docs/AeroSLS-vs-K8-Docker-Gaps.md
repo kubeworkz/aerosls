@@ -1,3 +1,15 @@
+# AeroSLS vs Kubernetes / Docker — Gap Analysis
+
+> ### ⚠️ Read this first
+>
+> **Three sections of this document have been corrected against the source tree** — the *Feature Comparison Matrix*, the *Implementation Roadmap*, and the *Recommendation Summary*. Each now carries a verified version, with the original retained beneath it in a collapsed block for provenance.
+>
+> The earlier text predated the LPAR, Multitenant-Isolation, Storage-Isolation, Network-Fairness and Multi-Node Partition Scaling phases. It marked shipped, tested capabilities — multi-tenancy, resource quotas, RBAC, persistent storage — as ❌ Critical and scheduled them as future work.
+>
+> **Verified position: 21 of the surveyed capabilities are built** (66 host tests passing), **one real gap exists** (service discovery), five are genuine lower-priority gaps, and two — a container runtime and an Envoy-style sidecar mesh — are categorically inapplicable to a freestanding kernel with no Linux userspace.
+>
+> The narrative sections between the corrected ones have **not** been re-verified line by line; treat their specific claims about current capability with the same caution. The analysis behind the corrections is in `AeroSLS-K8s-Convergence-Architectural-Review-v0.1.md`.
+
 ## **Current AeroSLS Architecture Analysis**
 
 ## **Gap Analysis & Required Features**
@@ -820,6 +832,46 @@ type TraceConfig struct {
 
 ## **Feature Comparison Matrix**
 
+> **Corrected against the source tree.** The original version of this matrix (retained below for provenance) predated the LPAR, Multitenant-Isolation, Storage-Isolation, Network-Fairness and Multi-Node Partition Scaling phases, and marked several shipped capabilities as ❌ Critical. Every ✅ row below was verified by locating the named symbol in compiled kernel code; every ❌ row was verified as genuinely absent (searched, and false-positive hits in comments discarded). Test coverage as of this pass: 66 host tests passing. See `AeroSLS-K8s-Convergence-Architectural-Review-v0.1.md` for the fuller analysis.
+
+| Feature | Docker | Kubernetes | **AeroSLS (verified)** | Where it lives | Still needed? |
+| --- | --- | --- | --- | --- | --- |
+| Multi-tenancy | ❌ | ✅ Namespaces | ✅ **Built** — `partition_id` (256), tenants, database namespaces | `kernel/partition.c`, `tenant.c`, `database.c` | Done |
+| Resource quotas — memory | ❌ | ✅ | ✅ **Built** — per-partition RAM frame quota | `kernel/frame_pool.c` | Done |
+| Resource quotas — CPU | ❌ | ✅ | ✅ **Built** — weighted CPU scheduling | `kernel/process.c` | Done |
+| Resource quotas — storage | ❌ | ✅ | ✅ **Built** — page quota *plus physically reserved per-partition disk sub-ranges* | `kernel/storage_quota.c`, `rowstore.c` | Done |
+| Resource quotas — connections | ❌ | ⚠️ | ✅ **Built** — per-partition concurrent inbound conn quota | `net/tcp_quota.c` | Done |
+| Rate limiting | ❌ | ⚠️ | ✅ **Built** — per-partition request-rate window | `net/http_rate_limit.c` | Done |
+| RBAC | ❌ | ✅ | ✅ **Built** — roles, group profiles, authorization lists, database grants | `kernel/auth.c`, `group_profile.c`, `authlist.c` | Done |
+| Persistent storage (PV/PVC) | ✅ Volumes | ✅ | ✅ **Obsoleted by SLS** — objects/streams are persistent by construction, checksummed, crash-consistent | `kernel/object_catalog.c`, `stream.c`, `persist.c` | N/A — see "irrelevant" list |
+| Stateful workloads | ❌ | ✅ StatefulSets | ✅ **Default** — everything is stateful | same | N/A |
+| Workload migration | ❌ | ⚠️ | ✅ **Built** — `partition_migrate()` with real cross-node byte movement over DSPP | `kernel/partition.c`, `stream.c`, `net/dspp.c` | Done |
+| Drain / cordon | ❌ | ✅ | ✅ **Built** — `partition_pause()` / `_resume()` | `kernel/partition.c` | Done |
+| Cluster membership | ❌ | ✅ | ✅ **Built** — `cluster_init()`, peer roster | `net/consensus.c` | Done |
+| Leader election / leases | ❌ | ✅ | ✅ **Built** — per-partition Raft-lite write leases | `net/consensus.c` | Done |
+| Liveness probe + restart | ⚠️ | ✅ | ✅ **Built** — microkernel watchdog, crash/restart | `kernel/microkernel.c` | Done |
+| Audit logging | ❌ | ✅ | ✅ **Built** | `kernel/security_audit.c` | Done |
+| Secret management | ❌ | ✅ | ✅ **Built** — `sys_sls_secure_seal()` key derivation | `kernel/secure_api.c` | Done |
+| Observability / metrics | ❌ | ✅ Prometheus | ✅ **Built** — per-partition usage metering, `/api/metrics`, disk/network status | `kernel/usage_metering.c`, `net/http.c` | Scrape format optional |
+| Message bus / queues | ❌ | ⚠️ | ✅ **Built** — IPC ports + message queues | `kernel/ipc.c`, `msgqueue.c` | Done |
+| CLI / API | ✅ docker | ✅ kubectl | ✅ **Built** — 156 shell command branches, 131 REST routes | `user/shell.c`, `net/http.c` | Naming polish only |
+| Horizontal scaling | ❌ | ✅ | ✅ **Built** — cross-node partition migration | `kernel/partition.c` | Done |
+| Edge computing | ❌ | ⚠️ K3s | ✅ **Core** | — | Done |
+| **Service discovery** | ❌ | ✅ | ❌ **ABSENT — the one real gap.** `services[]` is capped at 8, boot-populated, supervises 5 internal services; nothing resolves a name to a partition/node at runtime | `kernel/microkernel.c` | ✅ **Build this first** |
+| Declarative workload spec | ⚠️ Compose | ✅ Deployment | ❌ Absent | — | ✅ High — fits as an SLS object + reconcile loop |
+| Service mesh policy | ❌ | ✅ Istio | ⚠️ **Substrate only** — IPC/MQ local, DSPP cross-node; no circuit breaking or policy layer | `kernel/ipc.c`, `net/dspp.c` | ⚠️ Medium — build on substrate, not Envoy |
+| Network policies (src/dst ACL) | ❌ | ✅ | ❌ Absent | — | ⚠️ Medium |
+| Auto-scaling (HPA/VPA) | ❌ | ✅ | ❌ Absent | — | ⚠️ Low — needs the reconcile loop first |
+| Package manager | ❌ | ✅ Helm | ❌ Absent | — | ⚠️ Low |
+| API gateway / ingress rules | ❌ | ✅ | ❌ Absent (routes are compiled in) | `net/http.c` | ⚠️ Low |
+| **Container runtime** | ✅ | ✅ CRI | ❌ **Not applicable** — needs Linux namespaces/cgroups; AeroSLS *is* the kernel | — | ❌ **Remove from roadmap** |
+| **Envoy / sidecar mesh** | ❌ | ✅ | ❌ **Not applicable** — no userspace host process model | — | ❌ **Remove from roadmap** |
+
+**Summary: 21 built, 1 critical gap (service discovery), 5 genuine lower-priority gaps, 2 categorically inapplicable.**
+
+<details>
+<summary><strong>Superseded original matrix</strong> (retained for provenance — do not plan from this)</summary>
+
 ```plaintext
 Feature	                  Docker	Kubernetes	    Current AeroSLS	Required for Parity
 Container Runtime	  ✅	        ✅ (via CRI)	    ❌	                ✅ Critical
@@ -844,7 +896,70 @@ Horizontal Scaling	  ❌	        ✅	            ✅	                Already Hav
 Edge Computing	          ❌	        ⚠️ (K3s)	    ✅ (Core)	        Already Have
 ```
 
+</details>
+
 ## **Implementation Roadmap**
+
+> **Revised.** The original roadmap (retained below) scheduled RBAC, namespace isolation, multi-tenancy with quotas, StatefulSets and persistent volumes as future work — all of which are built and tested. It also led with a container runtime and an Envoy mesh, neither of which can exist on a freestanding kernel with no Linux userspace. Planning from it would have funded finished work while the one real gap went unaddressed.
+
+```plaintext
+roadmap:
+  phase1_orchestration_surface:
+    scope: "The substrate is done; this is the surface over it"
+    features:
+      - Service registry + discovery      # THE gap: name -> partition/node/endpoint
+      - Declarative workload objects      # an SLS object type, not a YAML file on disk
+      - Reconciliation loop               # poll on the AP core, beside tier_mgr_tick()
+    outcome: "Declarative deployment and resolution, entirely in-kernel"
+    note: "Everything here composes with existing primitives. No new subsystems."
+
+  phase2_mesh_policy:
+    depends_on: phase1
+    features:
+      - Circuit breaking + health state on the existing IPC/DSPP substrate
+      - Per-service metrics (extends usage_metering.c)
+      - Network policy: per-partition source/destination ACLs
+    outcome: "Mesh semantics without a sidecar or a proxy process"
+    note: "Take the CONCEPTS from AeroSLS-Service-Mesh.md; its pthread/socket
+           implementation targets Linux userspace and cannot be linked here."
+
+  phase3_scaling_and_packaging:
+    depends_on: phase2
+    features:
+      - Auto-scaling driven by the reconcile loop + existing usage metering
+      - Workload packaging/versioning (Helm-analogue over SLS objects)
+      - Prometheus-compatible scrape format over the existing /api/metrics
+    outcome: "Elastic, packaged, externally observable"
+
+  research_track_persistent_execution:
+    parallel: true
+    features:
+      - Resumable computation checkpointed on SIMI's bytecode VM
+    outcome: "Genuinely novel: no cold start, resume mid-computation"
+    note: "Concept from AeroSLS-Persistent-Execution-Contexts.md, RE-TARGETED.
+           That doc's ucontext/setjmp approach requires libc and cannot work in
+           the kernel; SIMI already has a serialisable program counter and is
+           in-tree (kernel/simi_runtime.c, simi_translate.c, simi_x86.c)."
+
+  removed_from_roadmap:
+    - Container runtime (containerd/CRI-O)   # needs Linux namespaces+cgroups; AeroSLS is the kernel
+    - Envoy-based service mesh               # needs a userspace host process model
+    - PersistentVolumes / PVCs / CSI drivers # SLS makes the concept meaningless
+    - StatefulSets                           # everything is stateful by default
+    - Volume snapshots / init containers     # see "Things That Become IRRELEVANT" below
+
+  already_complete:
+    - Multi-tenancy, namespaces, partition isolation
+    - Resource quotas: memory, CPU, storage, connections, request rate
+    - RBAC, groups, authorization lists, audit logging, secrets
+    - Persistent storage, crash-consistent + checksummed
+    - Workload migration incl. real cross-node data movement
+    - Cluster membership, leader election, liveness+restart
+    - CLI and REST API surface
+```
+
+<details>
+<summary><strong>Superseded original roadmap</strong> (retained for provenance — do not plan from this)</summary>
 
 ```plaintext
 roadmap:
@@ -889,6 +1004,8 @@ roadmap:
     outcome: "Complete platform ecosystem"
 ```
 
+</details>
+
 ## **Key Differentiators to Maintain**
 
 While adding K8s/Docker features, AeroSLS must maintain its advantages:
@@ -900,6 +1017,24 @@ While adding K8s/Docker features, AeroSLS must maintain its advantages:
 5. **Cost Optimization**: Keep intelligent scaling and resource management
 
 ## **Recommendation Summary**
+
+> **Revised against the source tree.** Items 3–8 of the original list (below) are built. Item 1 is inapplicable. Only item 2 survives, and only in a form that discards its proposed implementation.
+
+**What is actually left to do, in order:**
+
+1. **Service discovery / registry.** The only verified gap in the parity list. `services[]` in `kernel/microkernel.c` is capped at 8, boot-populated, and supervises five internal kernel services — nothing resolves a logical name to a partition/node/endpoint at runtime. It is small, it fits the object-catalog model (so it inherits persistence, partition ownership and RBAC for free), and both the mesh and declarative-workload ideas depend on it. **Start here.**
+2. **Declarative workload objects + a reconciliation loop.** The workload YAML in `AeroSLS-Control-Plane.md` is the right idea in the wrong place: as a kernel concept, a workload definition is an SLS object, applying it is a syscall, and reconciliation is a poll on the AP core beside `tier_mgr_tick()`. This is what would make the system *feel* Kubernetes-like at the smallest cost — no separate control-plane binary.
+3. **Mesh policy on the existing substrate.** Circuit breaking, health state and per-service metrics over IPC (local) and DSPP (cross-node). Take the concepts from `AeroSLS-Service-Mesh.md`; discard its `pthread`/socket implementation, which targets Linux userspace.
+4. **Network policies**, then **auto-scaling** (needs the reconcile loop first), then **packaging**. Lower priority, and each is smaller once 1–2 exist.
+
+**What to stop planning for:** a container runtime and an Envoy-style sidecar mesh. Both require Linux namespaces, cgroups and a userspace host process — AeroSLS *is* the kernel. This is not a difficulty ranking; the substrate does not exist and will not.
+
+**On the framing.** "Kubernetes evolved, not Kubernetes lite" is right, and this document's own *Things That Become IRRELEVANT* section is the strongest idea in it. Most of Kubernetes' complexity compensates for two assumptions AeroSLS does not make — that processes are ephemeral, and that state lives somewhere else. Remove those and much of the design collapses to nothing.
+
+The honest position is not that AeroSLS needs to catch up. On isolation and quotas it is arguably **ahead**: quotas are enforced against physically reserved disk sub-ranges and real frame accounting, not cgroup accounting over a shared filesystem. What is missing is the *orchestration surface* — discovery, declarative specs, a reconcile loop — which is far less work than the original roadmap implied, precisely because the substrate underneath it is finished.
+
+<details>
+<summary><strong>Superseded original recommendations</strong> (retained for provenance)</summary>
 
 To truly rival K8s and Docker, AeroSLS needs to:
 
@@ -913,6 +1048,8 @@ To truly rival K8s and Docker, AeroSLS needs to:
 8. **Develop full-featured CLI** for operations
 
 The key is to implement these while maintaining AeroSLS's simplicity and edge-computing advantages. Rather than becoming "Kubernetes lite," AeroSLS should become "Kubernetes evolved" - taking the best concepts but reimagining them for the edge computing era.
+
+</details>
 
 ---
 
