@@ -36,6 +36,8 @@
 > | Separate control-plane process | **Not being built** — see above |
 > | `NODE_ROLE_CONTROL_PLANE` | **Not being built** — every node can serve the view |
 > | Cross-node scheduler / placement | **Still absent, still wanted** — nothing chooses which node a workload lands on |
+> | Cluster formation from the UI | **Built** — `POST /api/cluster/init` / `/api/cluster/peer` wrap syscalls 279/280, which were previously serial-console only |
+> | Node *provisioning* (booting a machine) | **Not built, and not a kernel capability** — see below |
 > | `aeroslsctl` CLI | **Still wanted, and cheap** — the shell already has every command; a CLI would be a thin REST client. Orthogonal to the UI question |
 > | YAML workload manifests | **Still wanted** — `workload declare` is imperative; a manifest applied by the reconciler would suit the declarative model better |
 >
@@ -43,6 +45,23 @@
 > per-node views; a node selector in the Cluster tab repoints all of them,
 > routed through `authFetch()` — the single choke point every kernel call
 > already passes through.
+>
+> ### Forming a cluster vs. provisioning one
+>
+> The UI can now *form* a cluster from nodes that are already running. It
+> cannot *boot* one, and that distinction is structural rather than a
+> missing feature: a kernel cannot start another kernel, so provisioning
+> can only come from something outside — the dev server, which currently
+> executes no host processes at all.
+>
+> Adding that is possible (`run-two-nodes.sh` already has a working QEMU
+> recipe) but it is a different class of capability, and it must not sit
+> behind the current auth. `DEMO_TOKEN` in `src/lib/apiFetch.ts` is a
+> hardcoded constant in **client-side** code — it ships in the browser
+> bundle and is not a secret. A launcher gated on it would be a remote
+> code execution surface. If a lab launcher is wanted, it needs its own
+> explicit opt-in flag, off by default, and ideally a real auth story
+> first.
 >
 > **One honest consequence:** the kernel deals in node *IDs*, not
 > addresses, because DSPP is L2 broadcast and deliberately never needed an

@@ -2436,6 +2436,70 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
 
 
 
+
+/* ─── POST /api/cluster/init, POST /api/cluster/peer ───────────────────
+ * Forming a cluster from the control-plane UI. Both wrap syscalls that
+ * have existed since the Multi-Node roadmap's Phase 7 addendum but were
+ * reachable only from the serial console, which meant cluster formation
+ * was the one operator task the web surface could not do at all.
+ *
+ * These FORM a cluster out of nodes that are already running. Nothing
+ * here boots a machine -- a kernel cannot start another kernel, and the
+ * only component that could (the dev server) does not execute host
+ * processes and deliberately still does not.
+ *
+ * DB_ADMIN-gated, like every other mutation. Worth stating plainly why
+ * that matters more here than elsewhere: cluster_init() RESETS this
+ * node's term, role and roster (see consensus.h -- re-init is a fresh
+ * start, not a merge), so calling it on a node already in a working
+ * cluster drops it out of that cluster. It is not a read-modify-write. */
+static int api_cluster_init_post(const char* body, char* buf, int max, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint32_t node_id = body ? (uint32_t)json_int(body, "node_id") : 0;
+    uint64_t rc = sys_sls_cluster_init(node_id);
+    jb_str (&j, "ok", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    if (rc != 0) {
+        /* The only rejection cluster_init() has: 0 is the reserved
+         * "uninitialised" sentinel, so it cannot also be a real id. */
+        jb_str(&j, "error", "node_id 0 is the reserved uninitialised sentinel");
+        jb_putc(&j, ',');
+    }
+    jb_uint(&j, "node_id", cluster_local_node_id());
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_cluster_peer_post(const char* body, char* buf, int max, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint32_t node_id = body ? (uint32_t)json_int(body, "node_id") : 0;
+    int rc = cluster_register_peer(node_id);
+    /* cluster_register_peer()'s return codes are informative, not just
+     * pass/fail -- "already active" is a successful no-op, not an error,
+     * and an operator re-adding a peer should be told that rather than
+     * shown a failure. */
+    const char* detail =
+        rc ==  0 ? "added" :
+        rc ==  1 ? "already a member (no-op)" :
+        rc ==  2 ? "re-activated a previously registered peer" :
+        rc == -1 ? "invalid node id (0, or this node's own id)" :
+                   "roster full";
+    jb_str (&j, "ok", rc >= 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str (&j, "detail", detail);                 jb_putc(&j, ',');
+    jb_uint(&j, "active_nodes", cluster_active_node_count());
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── Cluster view (control-plane surface) ─────────────────────────────────
 // GET /api/cluster — the roster and this node's consensus state.
 // GET /api/nodes   — what is genuinely known about every node, and no more.
@@ -5278,6 +5342,15 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/partition/connquota")) {
             blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── Cluster formation: POST /api/cluster/init, /api/cluster/peer ───────
+        if (!strcmp(path, "/api/cluster/init")) {
+            blen = api_cluster_init_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/cluster/peer")) {
+            blen = api_cluster_peer_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Orchestration Plan Phase 5: POST /api/workload, /api/reconcile ─────

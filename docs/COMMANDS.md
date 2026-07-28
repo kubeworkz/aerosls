@@ -561,6 +561,12 @@ Served by **any** node — every node holds the roster and the replicated servic
 | --- | --- |
 | `GET /api/cluster` | This node's id, role, term, active-node count, quorum threshold, and the roster. `initialised: false` means `cluster init` has not been run — the node is standalone |
 | `GET /api/nodes` | Every known node. `detail: "first-hand"` for this one; `"membership-only"` for peers |
+| `POST /api/cluster/init` | `{"node_id":N}` — set this node's identity. DB_ADMIN |
+| `POST /api/cluster/peer` | `{"node_id":N}` — register a peer into the roster. DB_ADMIN |
+
+**These FORM a cluster; they do not boot one.** A kernel cannot start another kernel, and the dev server deliberately executes no host processes. Start each node yourself (`run-two-nodes.sh`), then join them from the Cluster panel or these endpoints.
+
+**`cluster/init` is a reset, not a merge.** It clears this node's term, role and roster (`consensus.h`), so calling it on a node already in a working cluster drops it out of that cluster. `cluster/peer` reports its outcome in `detail` — "added", "already a member (no-op)", "re-activated", "invalid node id", "roster full" — because re-registering an existing peer is a successful no-op, not a failure.
 
 **What a peer's entry does and does not contain.** Partition ownership and announced services *are* known cluster-wide — `partition_owner_table[]` is the authority for where a partition lives, and the service registry replicates. A peer's workloads, live contexts, memory and breakers are **not** replicated and are returned absent rather than as zeroes; select that node to read them from the node itself.
 
@@ -928,7 +934,7 @@ All write routes require `APP_USER+`. Read routes are open.
 | `GET`    | `/api/partition/connquotas`          | `APP_USER+`      | List concurrent-connection quotas — `{connquotas:[{partition_id, conn_usage, conn_quota}]}`                       |
 | `POST`   | `/api/partition/connquota`           | `APP_USER+`      | `{"partition_id":N,"quota":N}`                                                                                     |
 
-**Not reachable over HTTP:** `partition migrate` (shell/syscall only — see the Serial Shell section above) and `cluster init`/`cluster status` (same, and see `run-two-nodes.sh` at the repo root for real two-node testing).
+**Not reachable over HTTP:** `partition migrate` (shell/syscall only — see the Serial Shell section above). `cluster init` **is** now reachable, via `POST /api/cluster/init`; see `run-two-nodes.sh` at the repo root for booting the nodes themselves.
 
 #### Tenants
 
