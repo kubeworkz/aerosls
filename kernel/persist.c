@@ -42,6 +42,12 @@ static void p_memset(void* d, uint8_t v, uint32_t n) {
     uint8_t* p = (uint8_t*)d;
     while (n--) *p++ = v;
 }
+static int p_memcmp(const void* a, const void* b, uint32_t n) {
+    const uint8_t* x = (const uint8_t*)a;
+    const uint8_t* y = (const uint8_t*)b;
+    while (n--) { if (*x != *y) return 1; x++; y++; }
+    return 0;
+}
 
 // Gap fix: every function below used to call nvme_write_sync()/
 // nvme_read_sync() unconditionally, with no check that the NVMe I/O queue
@@ -69,20 +75,213 @@ static void p_memset(void* d, uint8_t v, uint32_t n) {
 // their call sites.
 static int persist_nvme_available(void) { return io_sq && io_cq; }
 
+// ─── Multi-page batching staging buffer ──────────────────────────────────────
+// Both array helpers below used to issue one 4 KiB NVMe command per frame,
+// each preceded by a full-page memset and a memcpy through the single p_buf --
+// so persist_records() alone was 323 synchronous submit-and-poll round trips
+// plus 323 page-sized memsets. nvme_write_pages_sync()/nvme_read_pages_sync()
+// (drivers/nvme_io.c) now move up to NVME_MAX_PAGES_PER_XFER pages per
+// command via a real PRP list, cutting that to ceil(322/32) + 1 = 12.
+//
+// Why stage through a buffer at all rather than DMA straight out of the
+// caller's array: a PRP list requires the whole transfer to start 4 KiB
+// aligned, and none of the persisted arrays (object_records[], databases[],
+// ...) carry an alignment attribute -- they are ordinary globals. Copying
+// into this page-aligned, physically contiguous scratch buffer satisfies
+// that requirement without touching a single array declaration across the
+// codebase. The copy is one large sequential memcpy per batch, replacing the
+// per-frame memset+memcpy pair it supersedes, so it is strictly less CPU work
+// than before, not more.
+static uint8_t __attribute__((aligned(4096)))
+       p_batch[NVME_MAX_PAGES_PER_XFER * NVME_PAGE_SIZE];
+
 // Write `total_bytes` from `src` to successive 4-KiB NVMe frames starting at
-// `lba`.  Each frame is 8 NVMe 512-byte sectors.
+// `lba`.  Each frame is 8 NVMe 512-byte sectors. Full pages go out in
+// multi-page batches; only a trailing partial frame still needs the
+// zero-padded single-page path (the on-disk image must have that tail
+// zero-filled rather than carrying whatever followed the array in memory).
 static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t lba) {
     if (!persist_nvme_available()) return;
     const uint8_t* p = (const uint8_t*)src;
-    uint32_t rem = total_bytes;
-    while (rem > 0) {
-        uint32_t chunk = rem < 4096u ? rem : 4096u;
-        p_memset(p_buf, 0, 4096);
-        p_memcpy(p_buf, p, chunk);
+
+    uint32_t full_pages = total_bytes / NVME_PAGE_SIZE;
+    uint32_t tail_bytes = total_bytes % NVME_PAGE_SIZE;
+
+    while (full_pages > 0) {
+        uint32_t batch = full_pages < NVME_MAX_PAGES_PER_XFER
+                       ? full_pages : NVME_MAX_PAGES_PER_XFER;
+        uint32_t bytes = batch * NVME_PAGE_SIZE;
+        p_memcpy(p_batch, p, bytes);
+        nvme_write_pages_sync(lba, p_batch, batch);
+        p          += bytes;
+        lba        += (uint64_t)batch * NVME_SECTORS_PER_PAGE;
+        full_pages -= batch;
+    }
+
+    if (tail_bytes > 0) {
+        p_memset(p_buf, 0, NVME_PAGE_SIZE);
+        p_memcpy(p_buf, p, tail_bytes);
         nvme_write_sync(lba, p_buf);
-        p   += chunk;
-        rem -= chunk;
-        lba += 8;   // advance by 8 sectors (= 1 frame)
+    }
+}
+
+// ─── Shadow-compare writes (write only the frames that actually changed) ─────
+// persist_write_array() above still writes every frame of its region. For
+// object_records[] that is 1.26 MiB to change as little as one 321-byte
+// SLSRecordField -- roughly 4,100x write amplification (see the scoping doc).
+// Multi-page batching cut the COMMAND count for that; it did not reduce the
+// BYTES, which is what costs SSD wear and memory bandwidth.
+//
+// ─── Why a shadow copy rather than dirty marks at the mutation sites ────
+// The scoping doc originally proposed having each mutation site mark the byte
+// range it touched, and named the risk plainly: a MISSED mark means a change
+// that lives in RAM, is never written, and silently vanishes on reboot --
+// invisible until someone notices absent data, and easy to reintroduce later
+// when a new mutation site is added and the mark is forgotten.
+//
+// Comparing against a shadow copy removes that entire failure class by
+// construction. Dirtiness is DERIVED FROM THE BYTES, not asserted by a
+// caller, so there is no mark to forget: any mutation, from any call site,
+// present or future, is detected. It also needs zero call-site changes.
+//
+// The cost is one shadow buffer per covered region plus a sequential compare
+// pass per write. That compare is memory-bandwidth work measured in
+// microseconds against NVMe round trips measured in tens of microseconds
+// each, and Option A's batching already made these calls infrequent -- so it
+// is a clearly favourable trade, and a much safer one than the alternative.
+//
+// Correctness rests on one invariant: the shadow must equal what is actually
+// on disk for the region. That holds because PERSIST_REC_ENT_LBA has exactly
+// one writer (this function) and one reader (persist_restore_all()), verified
+// by grep before this was built. If a second writer to a shadowed region is
+// ever added, it MUST call persist_shadow_invalidate() or the shadow becomes
+// stale-optimistic and real changes will be skipped. The verify mode below
+// exists to catch exactly that class of mistake in testing.
+//
+// Scoped deliberately to object_records[] for now: at 322 frames it is both
+// the largest region and the only one on the per-mutation hot path. The other
+// thirteen are 1-89 frames and keep the unconditional whole-region write. The
+// helper below is region-agnostic, so opting another region in is adding a
+// shadow buffer and a flag, not new logic.
+static uint8_t p_shadow_records[sizeof(object_records)];
+static int     p_shadow_records_valid = 0;
+
+// Diagnostics/tests: how many 4 KiB frames the last shadow-compared write
+// actually put on the wire.
+static uint32_t p_last_frames_written = 0;
+uint32_t persist_last_frames_written(void) { return p_last_frames_written; }
+
+// Verify mode: after a shadow-compared write, read the ENTIRE region back and
+// compare it against memory, so a skipped-but-needed frame fails loudly here
+// instead of silently surviving until the next boot. Off by default (it costs
+// a full-region read per write); intended for tests and for bring-up after
+// any change to a shadowed region's write path.
+static int p_verify_mode = 0;
+void persist_verify_set(int on) { p_verify_mode = on ? 1 : 0; }
+int  persist_verify_get(void)   { return p_verify_mode; }
+
+// Force the next write of every shadowed region to be a full write. Called
+// after restore-from-disk paths and available as an escape hatch whenever the
+// on-disk image may no longer match the shadow (format-version mismatch, a
+// newly added second writer, a failed write).
+void persist_shadow_invalidate(void) { p_shadow_records_valid = 0; }
+
+// Reads the whole region back off NVMe and compares against memory. Returns
+// the number of differing frames (0 == disk and memory agree).
+static uint32_t persist_verify_region(const void* src, uint32_t total_bytes, uint64_t lba) {
+    const uint8_t* p = (const uint8_t*)src;
+    uint32_t frames = (total_bytes + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
+    uint32_t bad = 0;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (nvme_read_sync(lba + (uint64_t)f * NVME_SECTORS_PER_PAGE, p_buf) != 0) { bad++; continue; }
+        uint32_t off  = f * NVME_PAGE_SIZE;
+        uint32_t span = (total_bytes - off) < NVME_PAGE_SIZE ? (total_bytes - off) : NVME_PAGE_SIZE;
+        if (p_memcmp(p_buf, p + off, span) != 0) bad++;
+    }
+    return bad;
+}
+
+// Writes only the frames whose contents differ from `shadow`, coalescing
+// CONSECUTIVE dirty frames into single multi-page commands (so this composes
+// with the batching above rather than undoing it). Updates the shadow to
+// match what was written.
+static void persist_write_array_diffed(const void* src, uint32_t total_bytes, uint64_t lba,
+                                       uint8_t* shadow, int* shadow_valid) {
+    if (!persist_nvme_available()) return;
+
+    // Cold start, or the shadow was explicitly invalidated: the on-disk image
+    // may be absent, stale, or from another kernel build, so nothing can be
+    // safely skipped. Write everything, then the shadow is trustworthy.
+    if (!*shadow_valid) {
+        persist_write_array(src, total_bytes, lba);
+        p_memcpy(shadow, src, total_bytes);
+        *shadow_valid = 1;
+        p_last_frames_written = (total_bytes + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
+        return;
+    }
+
+    const uint8_t* p = (const uint8_t*)src;
+    uint32_t full_pages = total_bytes / NVME_PAGE_SIZE;
+    uint32_t tail_bytes = total_bytes % NVME_PAGE_SIZE;
+    uint32_t written    = 0;
+
+    uint32_t run_start = 0;   // first page index of the current dirty run
+    uint32_t run_len   = 0;
+
+    for (uint32_t pg = 0; pg <= full_pages; pg++) {
+        int dirty = 0;
+        if (pg < full_pages) {
+            dirty = p_memcmp(p + (uint32_t)pg * NVME_PAGE_SIZE,
+                             shadow + (uint32_t)pg * NVME_PAGE_SIZE,
+                             NVME_PAGE_SIZE) != 0;
+        }
+        // pg == full_pages is a sentinel pass that flushes any trailing run.
+        if (dirty) {
+            if (run_len == 0) run_start = pg;
+            run_len++;
+            if (run_len < NVME_MAX_PAGES_PER_XFER) continue;
+        } else if (run_len == 0) {
+            continue;
+        }
+        // Flush the accumulated run.
+        uint32_t bytes = run_len * NVME_PAGE_SIZE;
+        p_memcpy(p_batch, p + run_start * NVME_PAGE_SIZE, bytes);
+        nvme_write_pages_sync(lba + (uint64_t)run_start * NVME_SECTORS_PER_PAGE,
+                              p_batch, run_len);
+        written += run_len;
+        run_len  = 0;
+    }
+
+    // Trailing partial frame: compare only the live bytes, but write the
+    // zero-padded full frame, matching persist_write_array()'s own contract
+    // that the on-disk tail is zero-filled rather than carrying whatever
+    // followed the array in memory.
+    if (tail_bytes > 0) {
+        uint32_t off = full_pages * NVME_PAGE_SIZE;
+        if (p_memcmp(p + off, shadow + off, tail_bytes) != 0) {
+            p_memset(p_buf, 0, NVME_PAGE_SIZE);
+            p_memcpy(p_buf, p + off, tail_bytes);
+            nvme_write_sync(lba + (uint64_t)full_pages * NVME_SECTORS_PER_PAGE, p_buf);
+            written++;
+        }
+    }
+
+    // Shadow now mirrors the on-disk image.
+    p_memcpy(shadow, src, total_bytes);
+    p_last_frames_written = written;
+
+    if (p_verify_mode) {
+        uint32_t bad = persist_verify_region(src, total_bytes, lba);
+        if (bad != 0) {
+            kernel_serial_printf(
+                "[PERSIST] VERIFY FAILED: %u frame(s) on disk differ from memory at LBA %lu "
+                "-- a needed write was skipped. Forcing a full rewrite.\n",
+                (unsigned)bad, (unsigned long)lba);
+            *shadow_valid = 0;               /* next write repairs it in full */
+            persist_write_array(src, total_bytes, lba);
+            p_memcpy(shadow, src, total_bytes);
+            *shadow_valid = 1;
+        }
     }
 }
 
@@ -91,14 +290,24 @@ static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t 
 static void persist_read_array(void* dst, uint32_t total_bytes, uint64_t lba) {
     if (!persist_nvme_available()) return;
     uint8_t* d = (uint8_t*)dst;
-    uint32_t rem = total_bytes;
-    while (rem > 0) {
+
+    uint32_t full_pages = total_bytes / NVME_PAGE_SIZE;
+    uint32_t tail_bytes = total_bytes % NVME_PAGE_SIZE;
+
+    while (full_pages > 0) {
+        uint32_t batch = full_pages < NVME_MAX_PAGES_PER_XFER
+                       ? full_pages : NVME_MAX_PAGES_PER_XFER;
+        uint32_t bytes = batch * NVME_PAGE_SIZE;
+        if (nvme_read_pages_sync(lba, p_batch, batch) != 0) return;
+        p_memcpy(d, p_batch, bytes);
+        d          += bytes;
+        lba        += (uint64_t)batch * NVME_SECTORS_PER_PAGE;
+        full_pages -= batch;
+    }
+
+    if (tail_bytes > 0) {
         if (nvme_read_sync(lba, p_buf) != 0) return;
-        uint32_t chunk = rem < 4096u ? rem : 4096u;
-        p_memcpy(d, p_buf, chunk);
-        d   += chunk;
-        rem -= chunk;
-        lba += 8;
+        p_memcpy(d, p_buf, tail_bytes);
     }
 }
 
@@ -129,9 +338,101 @@ static void persist_vec_backfill_cb(struct VecId id, uint64_t external_id,
     vec_index_notify_insert(0, ctx->collection_name, id, external_id, values);
 }
 
+// ─── Deferred / batched persistence ──────────────────────────────────────────
+// Every persist_*() below rewrites its whole region -- persist_records() alone
+// costs 323 synchronous 4 KiB NVMe commands (1.26 MiB) per call. That is
+// tolerable once per operation, but sys_sls_tx_commit() (kernel/transaction.c)
+// applies its staged WAL entries by calling sys_sls_update() in a loop, and
+// each of those lands on the direct-write path and calls persist_records()
+// again -- so committing N operations wrote N * 1.26 MiB where one write of
+// the final state would have been equivalent.
+//
+// This is a batching bracket, not a new persistence policy: between
+// persist_defer_begin() and the matching persist_defer_end(), a persist_*()
+// call records that its region needs writing and returns; persist_defer_end()
+// then performs exactly one real write per distinct region that was touched.
+// The end state on disk is byte-for-byte what the un-batched sequence would
+// have produced, because every persist_*() writes the *current* contents of
+// its array rather than a delta -- writing it once at the end of a batch and
+// writing it after every step differ only in how many times the same final
+// bytes are written. Nothing is skipped, and no durability window is
+// introduced beyond the duration of the bracket itself.
+//
+// Nestable (depth-counted) so a caller inside an already-deferred region does
+// not flush early. Unbalanced persist_defer_end() calls are ignored rather
+// than underflowing the depth.
+//
+// Deliberately NOT wired into flush_daemon_tick(): that runs on Core 1
+// (kernel/smp.c's ap_kernel_main()), while every persist_*() caller today --
+// both http_server_run() and sls_shell_loop(), see kernel/kernel.c's own
+// "8. HTTP server" block -- runs on the BSP. persist.c's p_buf is a single
+// shared static staging buffer with no lock, so moving persist writes onto
+// the AP would race the BSP's own persist calls and tear the staging buffer.
+// A cross-core deferred flush needs locking this kernel does not have; the
+// batching bracket below gets the large win (N->1 per transaction) without
+// touching the concurrency model at all. The same manual batching idea is
+// already precedented in kernel/object_catalog.c's vfree-partition loop
+// ("batched into one persist_catalog() call at the end instead of one per").
+#define PERSIST_PEND_CAT           (1u <<  0)
+#define PERSIST_PEND_REC           (1u <<  1)
+#define PERSIST_PEND_SCH           (1u <<  2)
+#define PERSIST_PEND_PROG          (1u <<  3)
+#define PERSIST_PEND_PART          (1u <<  4)
+#define PERSIST_PEND_ROWSTORE      (1u <<  5)
+#define PERSIST_PEND_ROWCONSTRAINT (1u <<  6)
+#define PERSIST_PEND_ROWINDEX      (1u <<  7)
+#define PERSIST_PEND_VECSTORE      (1u <<  8)
+#define PERSIST_PEND_VECINDEX      (1u <<  9)
+#define PERSIST_PEND_ROWJOURNAL    (1u << 10)
+#define PERSIST_PEND_DATABASE      (1u << 11)
+#define PERSIST_PEND_VIEW          (1u << 12)
+#define PERSIST_PEND_TENANT        (1u << 13)
+
+static uint32_t persist_defer_depth   = 0;
+static uint32_t persist_pending_mask  = 0;
+
+// Returns 1 if the caller should defer (and records the region as pending),
+// 0 if it should write immediately. Every persist_*() calls this first.
+static int persist_defer_note(uint32_t region_bit) {
+    if (persist_defer_depth == 0) return 0;
+    persist_pending_mask |= region_bit;
+    return 1;
+}
+
+void persist_defer_begin(void) { persist_defer_depth++; }
+
+int persist_defer_active(void) { return persist_defer_depth != 0; }
+
+uint32_t persist_defer_pending_mask(void) { return persist_pending_mask; }
+
+void persist_defer_end(void) {
+    if (persist_defer_depth == 0) return;      /* unbalanced -- ignore, don't underflow */
+    if (--persist_defer_depth != 0) return;    /* still inside an outer bracket */
+
+    uint32_t pend = persist_pending_mask;
+    persist_pending_mask = 0;                  /* cleared first: the calls below re-enter
+                                                * persist_*() with depth now 0, so they
+                                                * write for real rather than re-marking */
+    if (pend & PERSIST_PEND_CAT)           persist_catalog();
+    if (pend & PERSIST_PEND_REC)           persist_records();
+    if (pend & PERSIST_PEND_SCH)           persist_schemas();
+    if (pend & PERSIST_PEND_PROG)          persist_programs();
+    if (pend & PERSIST_PEND_PART)          persist_partitions();
+    if (pend & PERSIST_PEND_ROWSTORE)      persist_rowstore_headers();
+    if (pend & PERSIST_PEND_ROWCONSTRAINT) persist_row_constraints();
+    if (pend & PERSIST_PEND_ROWINDEX)      persist_row_index_defs();
+    if (pend & PERSIST_PEND_VECSTORE)      persist_vecstore_headers();
+    if (pend & PERSIST_PEND_VECINDEX)      persist_vec_index_defs();
+    if (pend & PERSIST_PEND_ROWJOURNAL)    persist_row_journal();
+    if (pend & PERSIST_PEND_DATABASE)      persist_databases();
+    if (pend & PERSIST_PEND_VIEW)          persist_views();
+    if (pend & PERSIST_PEND_TENANT)        persist_tenants();
+}
+
 // ─── persist_catalog ─────────────────────────────────────────────────────────
 // Writes object_catalog[] and role_table[].  Called after valloc/vfree/role_set.
 void persist_catalog(void) {
+    if (persist_defer_note(PERSIST_PEND_CAT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t cat_bytes  = (uint32_t)sizeof(object_catalog);
     uint32_t role_bytes = (uint32_t)sizeof(role_table);
@@ -144,17 +445,33 @@ void persist_catalog(void) {
 
 // ─── persist_records ─────────────────────────────────────────────────────────
 // Writes the full object_records[] array.  Called after direct insert/update/delete.
-// Note: writes ~232 KiB (57 NVMe frames) — acceptable for a research kernel.
+//
+// Cost, corrected: this comment previously read "~232 KiB (57 NVMe frames) --
+// acceptable for a research kernel." That figure was stale by 5.6x; it
+// described an older, narrower struct SLSRecordField and was never updated
+// when the field widened. The real cost is sizeof(object_records) =
+// 128 * 10,284 B = 1,316,352 B = 322 data frames + 1 header frame = 323
+// separate synchronous 4 KiB NVMe commands, per call -- and this is called
+// once per direct insert/update/delete, to change as little as one 321-byte
+// SLSRecordField. persist.h's own LBA layout table (322 frames) is the
+// accurate reference and always was; only this comment disagreed with it.
+// See docs/AeroSLS-Persist-Write-Amplification-Scoping-v0.1.md.
 void persist_records(void) {
+    if (persist_defer_note(PERSIST_PEND_REC)) return;
     if (!io_sq || !io_cq) return;
     uint32_t rec_bytes = (uint32_t)sizeof(object_records);
     write_hdr(PERSIST_REC_HDR_LBA, PERSIST_MAGIC_REC, rec_bytes, 0, 0);
-    persist_write_array(object_records, rec_bytes, PERSIST_REC_ENT_LBA);
+    // Shadow-compared: writes only the frames whose bytes actually changed
+    // since the last write. See persist_write_array_diffed() for why this is
+    // a shadow copy rather than caller-supplied dirty marks.
+    persist_write_array_diffed(object_records, rec_bytes, PERSIST_REC_ENT_LBA,
+                               p_shadow_records, &p_shadow_records_valid);
     kernel_serial_print("[PERSIST] Records snapshot written.\n");
 }
 
 // ─── persist_schemas ─────────────────────────────────────────────────────────
 void persist_schemas(void) {
+    if (persist_defer_note(PERSIST_PEND_SCH)) return;
     if (!io_sq || !io_cq) return;
     uint32_t sch_bytes = (uint32_t)sizeof(object_schemas);
     write_hdr(PERSIST_SCH_HDR_LBA, PERSIST_MAGIC_SCH, sch_bytes, 0, 0);
@@ -167,6 +484,7 @@ void persist_schemas(void) {
 // Called after the final upload chunk (is_last=1) so only complete binaries
 // are snapshotted.
 void persist_programs(void) {
+    if (persist_defer_note(PERSIST_PEND_PROG)) return;
     if (!io_sq || !io_cq) return;
     uint32_t prog_bytes = (uint32_t)sizeof(service_binaries);
     write_hdr(PERSIST_PROG_HDR_LBA, PERSIST_MAGIC_PROG, prog_bytes, 0, 0);
@@ -195,6 +513,7 @@ void persist_programs(void) {
 // row at all after a reboot -- a real, silent regression for the one
 // property this whole roadmap exists to make durable.
 void persist_partitions(void) {
+    if (persist_defer_note(PERSIST_PEND_PART)) return;
     if (!io_sq || !io_cq) return;
     uint32_t part_bytes   = (uint32_t)sizeof(partition_table);
     uint32_t assign_bytes = (uint32_t)sizeof(partition_assign_table);
@@ -220,6 +539,7 @@ void persist_partitions(void) {
 // (previously always 0) so a restore can tell this snapshot includes it —
 // see persist.h's LBA layout comment for the full reasoning.
 void persist_rowstore_headers(void) {
+    if (persist_defer_note(PERSIST_PEND_ROWSTORE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(table_headers);
     write_hdr(PERSIST_ROWSTORE_HDR_LBA, PERSIST_MAGIC_ROWSTORE,
@@ -236,6 +556,7 @@ void persist_rowstore_headers(void) {
 // persist.h's own comment). Called after every successful row_constraint_
 // add_unique/_not_null/_range/_reference().
 void persist_row_constraints(void) {
+    if (persist_defer_note(PERSIST_PEND_ROWCONSTRAINT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(row_constraints);
     write_hdr(PERSIST_ROW_CONSTRAINT_HDR_LBA, PERSIST_MAGIC_ROW_CONSTRAINT,
@@ -252,6 +573,7 @@ void persist_row_constraints(void) {
 // never persisted at all -- see PERSIST_ROW_INDEX_HDR_LBA's own comment in
 // persist.h). Called after every successful row_index_create().
 void persist_row_index_defs(void) {
+    if (persist_defer_note(PERSIST_PEND_ROWINDEX)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(row_indexes);
     write_hdr(PERSIST_ROW_INDEX_HDR_LBA, PERSIST_MAGIC_ROW_INDEX, bytes, 0, 0);
@@ -268,6 +590,7 @@ void persist_row_index_defs(void) {
 // and stashes the same format-version marker in the header's v2 slot --
 // mirrors persist_rowstore_headers()'s own Phase 3 addition exactly.
 void persist_vecstore_headers(void) {
+    if (persist_defer_note(PERSIST_PEND_VECSTORE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(vector_collections);
     write_hdr(PERSIST_VECSTORE_HDR_LBA, PERSIST_MAGIC_VECSTORE,
@@ -283,6 +606,7 @@ void persist_vecstore_headers(void) {
 // row_index_create() above, mirrored here for vec_index_create(). Called
 // after every successful vec_index_create().
 void persist_vec_index_defs(void) {
+    if (persist_defer_note(PERSIST_PEND_VECINDEX)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(vec_indexes);
     write_hdr(PERSIST_VEC_INDEX_HDR_LBA, PERSIST_MAGIC_VEC_INDEX, bytes, 0, 0);
@@ -297,6 +621,7 @@ void persist_vec_index_defs(void) {
 // row_journal_notify_insert/update/delete() and row_journal_commit_tx()/
 // _rollback_tx().
 void persist_row_journal(void) {
+    if (persist_defer_note(PERSIST_PEND_ROWJOURNAL)) return;
     if (!io_sq || !io_cq) return;
     uint32_t buf_bytes    = (uint32_t)sizeof(row_journal_buffer);
     uint32_t attach_bytes = (uint32_t)sizeof(row_journal_attachments);
@@ -319,6 +644,7 @@ void persist_row_journal(void) {
 // reattachment failure the Namespace roadmap's §1.2 never-reuse design
 // exists to prevent, previously defeated by this exact persistence hole.
 void persist_databases(void) {
+    if (persist_defer_note(PERSIST_PEND_DATABASE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t db_bytes    = (uint32_t)sizeof(databases);
     uint32_t grant_bytes = (uint32_t)sizeof(database_grants);
@@ -334,6 +660,7 @@ void persist_databases(void) {
 // databases[]'s database_next_id, no rebuild-on-boot step like row_index/
 // vec_index) -- the header carries just the array's own byte size.
 void persist_views(void) {
+    if (persist_defer_note(PERSIST_PEND_VIEW)) return;
     if (!io_sq || !io_cq) return;
     uint32_t view_bytes = (uint32_t)sizeof(views);
     write_hdr(PERSIST_VIEW_HDR_LBA, PERSIST_MAGIC_VIEW, view_bytes, 0, 0);
@@ -350,6 +677,7 @@ void persist_views(void) {
 // allocator must not re-issue an id a stale persisted tenant_id
 // reference still holds.
 void persist_tenants(void) {
+    if (persist_defer_note(PERSIST_PEND_TENANT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t tenant_bytes = (uint32_t)sizeof(tenants);
     write_hdr(PERSIST_TENANT_HDR_LBA, PERSIST_MAGIC_TENANT,
@@ -400,6 +728,17 @@ void persist_restore_all(void) {
             p_memcpy(&rec_bytes, p_buf + 8, 4);
             if (rec_bytes == (uint32_t)sizeof(object_records)) {
                 persist_read_array(object_records, rec_bytes, PERSIST_REC_ENT_LBA);
+                // Seed the shadow: at this exact point the on-disk image and
+                // memory are identical by construction (we just read one into
+                // the other), which is precisely the invariant the shadow
+                // encodes. Doing this lets the first post-boot write diff
+                // properly instead of rewriting all 322 frames. Deliberately
+                // NOT done on the size-mismatch/cold-start branches below --
+                // there the shadow stays invalid, so the first write is a
+                // full one, which is the correct conservative behaviour when
+                // the on-disk contents are unknown or from another build.
+                p_memcpy(p_shadow_records, object_records, rec_bytes);
+                p_shadow_records_valid = 1;
                 kernel_serial_print("[PERSIST] Records restored from NVMe.\n");
             } else {
                 kernel_serial_print("[PERSIST] Records: struct size mismatch — cold start.\n");

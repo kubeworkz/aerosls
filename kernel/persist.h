@@ -366,4 +366,82 @@ void persist_views(void);
 // reason database_next_id does there — see the LBA layout comment above.
 void persist_tenants(void);
 
+/* ─── Deferred / batched persistence ──────────────────────────────────────
+ * Every persist_*() above rewrites its entire region: persist_records()
+ * alone is 323 synchronous 4 KiB NVMe commands (1.26 MiB) per call, and it
+ * is called once per direct insert/update/delete. sys_sls_tx_commit()
+ * (kernel/transaction.c) applies its staged WAL entries by calling
+ * sys_sls_update() in a loop -- each iteration taking the direct-write path
+ * and paying that cost again -- so an N-operation commit wrote N * 1.26 MiB
+ * to reach a final state that one write would have produced.
+ *
+ * persist_defer_begin() / persist_defer_end() bracket a batch. Inside the
+ * bracket a persist_*() call marks its region pending and returns; the
+ * matching persist_defer_end() issues exactly one real write per distinct
+ * region touched. This is safe to reason about because persist_*() always
+ * writes the CURRENT contents of its array rather than a delta -- so
+ * writing once at the end of a batch and writing after every step produce
+ * byte-identical results on disk. Nothing is dropped and no durability
+ * window is added beyond the bracket's own duration.
+ *
+ * Nestable: brackets are depth-counted, so an inner bracket does not flush
+ * early. An unbalanced persist_defer_end() is ignored rather than
+ * underflowing.
+ *
+ * Scope note, deliberate: this is NOT wired into flush_daemon_tick(). That
+ * runs on Core 1 (kernel/smp.c), whereas every persist_*() caller today
+ * runs on the BSP (kernel/kernel.c runs both http_server_run() and
+ * sls_shell_loop() there). persist.c's p_buf DMA staging buffer is a single
+ * shared static with no lock, so moving persist writes onto the AP would
+ * race the BSP's and tear the buffer. Cross-core deferred flushing needs
+ * locking this kernel does not have; see
+ * docs/AeroSLS-Persist-Write-Amplification-Scoping-v0.1.md.
+ */
+void     persist_defer_begin(void);
+void     persist_defer_end(void);
+
+/* Introspection, for tests and diagnostics. */
+int      persist_defer_active(void);
+uint32_t persist_defer_pending_mask(void);
+
+/* ─── Shadow-compare writes ───────────────────────────────────────────────
+ * Batching (above) reduced how many COMMANDS a snapshot costs; it did not
+ * reduce the BYTES. persist_records() still rewrote all 1.26 MiB of
+ * object_records[] to change as little as one 321-byte field. It now writes
+ * only the 4 KiB frames whose contents actually differ from the previous
+ * write, coalescing consecutive dirty frames into multi-page commands.
+ *
+ * Dirtiness is derived by comparing against a shadow copy, NOT from marks
+ * supplied by mutation sites. That is the load-bearing design choice: a
+ * missed mark would mean a change that lives in RAM, is never written, and
+ * silently vanishes on reboot -- invisible until someone notices absent
+ * data. Deriving it from the bytes makes that failure impossible and needs
+ * no cooperation from any current or future call site.
+ *
+ * The invariant this rests on is that the shadow matches what is on disk.
+ * Today that holds because each shadowed region has exactly one writer.
+ * ANY new writer to a shadowed region must call persist_shadow_invalidate(),
+ * or real changes will be silently skipped.
+ *
+ * Currently applied to object_records[] only -- the largest region (322
+ * frames) and the only one on the per-mutation hot path.
+ */
+
+/* Forces the next write of every shadowed region to be a full write. Call
+ * after any path that changes a shadowed region's on-disk image outside
+ * persist_*(), or when the image may be from a different kernel build. */
+void     persist_shadow_invalidate(void);
+
+/* Verify mode: after each shadow-compared write, read the whole region back
+ * and compare against memory, logging loudly and self-repairing with a full
+ * rewrite on divergence. Off by default (costs a full-region read per
+ * write). Intended for tests and for bring-up after changing a shadowed
+ * region's write path -- it turns "a needed write was skipped" from a
+ * silent, reboot-surviving data loss into an immediate, visible failure. */
+void     persist_verify_set(int on);
+int      persist_verify_get(void);
+
+/* Frames actually put on the wire by the last shadow-compared write. */
+uint32_t persist_last_frames_written(void);
+
 #endif /* PERSIST_H */

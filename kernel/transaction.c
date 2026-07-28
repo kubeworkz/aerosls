@@ -3,6 +3,7 @@
 #include "journal.h"
 #include "lock_mgr.h"
 #include "mqt.h"
+#include "persist.h"   // persist_defer_begin()/_end() -- batch the commit apply loop's snapshot writes
 
 // ─── WAL In-RAM Buffer ────────────────────────────────────────────────────────
 struct WALEntry wal_buffer[WAL_MAX_ENTRIES];
@@ -103,6 +104,17 @@ uint64_t sys_sls_tx_commit(uint32_t thread_id) {
     uint32_t wal_count       = ctx->wal_count;
     ctx->active = 0;
 
+    // Batch the apply loop's persistence. Each sys_sls_update() below takes
+    // the direct-write path (ctx->active was cleared above precisely so it
+    // would), and that path ends in persist_records() -- 323 synchronous
+    // 4 KiB NVMe commands, 1.26 MiB, every iteration. Committing N operations
+    // therefore wrote N * 1.26 MiB to arrive at a final array state that a
+    // single write produces identically, since persist_records() always
+    // writes the whole current array rather than a delta. The bracket defers
+    // those writes and issues one per touched region at persist_defer_end()
+    // below -- same bytes on disk, N-to-1 fewer writes. See persist.h.
+    persist_defer_begin();
+
     uint32_t committed = 0;
     for (uint32_t i = wal_start; i < wal_start + wal_count; i++) {
         if (wal_buffer[i].state == WAL_STATE_PENDING) {
@@ -149,6 +161,12 @@ uint64_t sys_sls_tx_commit(uint32_t thread_id) {
             }
         }
     }
+
+    // Closes the bracket opened before the apply loop. Deliberately placed
+    // after journal_commit_tx() and the MQT refresh loop as well, so any
+    // region those touch (row journal, records via an MQT rebuild) is folded
+    // into the same single flush rather than escaping it.
+    persist_defer_end();
 
     return 0;
 }

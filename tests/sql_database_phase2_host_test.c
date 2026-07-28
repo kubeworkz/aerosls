@@ -182,6 +182,27 @@ int nvme_read_sync(uint64_t lba, void* buf) {
     return 1;
 }
 
+/* Multi-page NVMe transfers (drivers/nvme_io.h): kernel/persist.c's array
+ * helpers now batch full pages into one command instead of issuing one per
+ * frame. This test fakes the NVMe layer rather than linking drivers/nvme_io.c,
+ * so it needs these two symbols. Deliberately implemented as a faithful loop
+ * over the single-page fakes above rather than a no-op stub -- the bytes still
+ * land in the fake store exactly where the real driver would put them, so
+ * every existing assertion in this file keeps verifying real behaviour through
+ * the new code path instead of being silently bypassed. */
+int nvme_write_pages_sync(uint64_t slba, const void* buf, uint32_t page_count) {
+    for (uint32_t i = 0; i < page_count; i++)
+        if (nvme_write_sync(slba + (uint64_t)i * 8, (const uint8_t*)buf + (size_t)i * 4096) != 0)
+            return 1;
+    return 0;
+}
+int nvme_read_pages_sync(uint64_t slba, void* buf, uint32_t page_count) {
+    for (uint32_t i = 0; i < page_count; i++)
+        if (nvme_read_sync(slba + (uint64_t)i * 8, (uint8_t*)buf + (size_t)i * 4096) != 0)
+            return 1;
+    return 0;
+}
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \

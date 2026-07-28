@@ -30,6 +30,19 @@ extern void* allocate_physical_ram_frame(void);
 // ─── I/O queue state ─────────────────────────────────────────────────────────
 void*          io_sq        = 0;
 void*          io_cq        = 0;
+// One 4 KiB page holding up to 512 PRP list entries, allocated once at
+// nvme_io_init() alongside the queues. Reused by every multi-page transfer --
+// safe because this driver is strictly synchronous (one command outstanding
+// at a time, see nvme_io_submit_sync()'s poll loop), so no second transfer
+// can be building a list while the controller is still reading this one.
+// If queue depth ever exceeds 1, this becomes per-outstanding-command state
+// and must be reallocated accordingly.
+static uint64_t* io_prp_list = 0;
+
+// Forward declaration: the multi-page helpers below are defined above
+// nvme_io_submit_sync()'s own definition (they sit next to nvme_io_init(),
+// where the PRP list page they depend on is allocated).
+static int nvme_io_submit_sync(struct NVMeCmd* cmd);
 static uint16_t        io_sq_tail   = 0;
 static uint16_t        io_cq_head   = 0;
 static uint16_t        io_cq_phase  = 1;    // phase tag starts at 1
@@ -91,8 +104,90 @@ int nvme_io_init(void) {
         return 0;
     }
 
+    // --- Allocate the shared PRP list page for multi-page transfers ---
+    // Failure here is non-fatal: single-page transfers never touch the list,
+    // and the multi-page functions below check for it and fail cleanly, so a
+    // caller simply falls back to the per-page path rather than the whole
+    // driver refusing to come up.
+    io_prp_list = (uint64_t*)allocate_physical_ram_frame();
+    if (io_prp_list) {
+        for (int i = 0; i < 4096 / 8; i++) io_prp_list[i] = 0;
+        kernel_serial_print("[NVME_IO] PRP list page ready (multi-page transfers enabled).\n");
+    } else {
+        kernel_serial_print("[NVME_IO] WARNING: no PRP list page; multi-page transfers disabled.\n");
+    }
+
     kernel_serial_print("[NVME_IO] I/O queue pair 1 ready (64 entries, 4-KiB PRP).\n");
     return 1;
+}
+
+// ─── nvme_build_prp ───────────────────────────────────────────────────────────
+// Pure address arithmetic -- see nvme_io.h for why this is separated out.
+int nvme_build_prp(uint64_t buf_phys, uint32_t page_count,
+                   uint64_t* prp_list_page,
+                   uint64_t* out_prp1, uint64_t* out_prp2) {
+    if (!out_prp1 || !out_prp2) return 1;
+    if (page_count == 0 || page_count > NVME_MAX_PAGES_PER_XFER) return 1;
+    // Every PRP entry after the first must have a zero offset, so the whole
+    // buffer has to start page-aligned for a list to describe it correctly.
+    if (buf_phys & (NVME_PAGE_SIZE - 1)) return 1;
+
+    *out_prp1 = buf_phys;
+
+    if (page_count == 1) {
+        *out_prp2 = 0;                                   /* unused for a single page */
+        return 0;
+    }
+    if (page_count == 2) {
+        *out_prp2 = buf_phys + NVME_PAGE_SIZE;           /* second page directly, no list */
+        return 0;
+    }
+
+    if (!prp_list_page) return 1;                        /* list needed but not provided */
+
+    // page_count > 2: prp2 points at a list of the remaining (page_count - 1)
+    // pages. A 4 KiB page holds 512 entries; NVME_MAX_PAGES_PER_XFER (32) is
+    // far below that, so the multi-page-list chaining case cannot arise here.
+    for (uint32_t i = 0; i + 1 < page_count; i++) {
+        prp_list_page[i] = buf_phys + (uint64_t)(i + 1) * NVME_PAGE_SIZE;
+    }
+    *out_prp2 = (uint64_t)(uintptr_t)prp_list_page;
+    return 0;
+}
+
+// ─── multi-page read/write ────────────────────────────────────────────────────
+static int nvme_pages_sync(uint64_t slba, const void* buf,
+                           uint32_t page_count, uint8_t opcode) {
+    if (page_count == 0) return 0;                       /* nothing to do */
+    if (page_count > NVME_MAX_PAGES_PER_XFER) return 0xFE;
+    if (!io_sq || !io_cq) return 0xFD;
+
+    uint64_t prp1 = 0, prp2 = 0;
+    if (nvme_build_prp((uint64_t)(uintptr_t)buf, page_count,
+                       io_prp_list, &prp1, &prp2) != 0) {
+        return 0xFC;   /* bad alignment/args, or >2 pages with no list page */
+    }
+
+    struct NVMeCmd cmd;
+    uint32_t* p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = opcode;
+    cmd.nsid   = NVME_NSID;
+    cmd.prp1   = prp1;
+    cmd.prp2   = prp2;
+    cmd.cdw10  = (uint32_t)(slba & 0xFFFFFFFFu);
+    cmd.cdw11  = (uint32_t)(slba >> 32);
+    // NLB is 0-based: this many 512-byte sectors, minus one.
+    cmd.cdw12  = page_count * NVME_SECTORS_PER_PAGE - 1;
+    return nvme_io_submit_sync(&cmd);
+}
+
+int nvme_read_pages_sync(uint64_t slba, void* buf, uint32_t page_count) {
+    return nvme_pages_sync(slba, buf, page_count, NVME_NVM_READ);
+}
+
+int nvme_write_pages_sync(uint64_t slba, const void* buf, uint32_t page_count) {
+    return nvme_pages_sync(slba, buf, page_count, NVME_NVM_WRITE);
 }
 
 // ─── submit one I/O command and poll for completion ───────────────────────────
