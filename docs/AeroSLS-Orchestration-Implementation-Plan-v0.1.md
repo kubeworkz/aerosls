@@ -159,7 +159,11 @@ Also verified: traps are terminal (a re-run returns the same trap and retires **
 
 **Not done in Phase 1:** the interpreter is not yet reachable from the loader or any syscall — nothing selects interpreted mode at runtime yet. It is compiled into the image and fully tested, but dormant, in the same sense Phase 1 and Phase 4 of the Multi-Node roadmap landed real primitives before anything called them. Wiring the mode selector belongs with Phase 2, where there is finally a reason to choose it.
 
-### Phase 2 — Checkpoint / restore
+### Phase 2 — Checkpoint / restore — **DONE**
+
+> **Built and passing.** `kernel/simi_ckpt.{c,h}` + `tests/simi_ckpt_host_test.c` (29 checks). Full regression 68/68. As-built notes in §Phase 2 Findings below.
+
+### Phase 2 (original scope)
 
 **Deliverable:** `sls_ctx_checkpoint(ctx_id)` / `sls_ctx_restore(ctx_id)`, persisting a `SimiContext` as an SLS object.
 
@@ -171,6 +175,36 @@ Also verified: traps are terminal (a re-run returns the same trap and retires **
 **Tests:** checkpoint mid-loop → restore → verify identical final result vs. an uninterrupted run. Checkpoint at every instruction of a small program and verify all N restores converge. That exhaustive form is the analogue of the persist shadow test's per-record sweep, and it is the one that catches state you forgot to save.
 
 **Risk: low-moderate.** The failure mode — silently omitting a field from the serialiser — is caught by the exhaustive restore test.
+
+### Phase 2 Findings (as built)
+
+**Scope changed in one important way: this is a pure serialiser, not a storage layer.** The plan said "persisting a `SimiContext` as an SLS object." What landed is `simi_ckpt_save()` / `simi_ckpt_load()` converting a context to and from a flat byte buffer, with no I/O at all. Three reasons, and the third is the one that matters:
+
+1. The dangerous failure here is **omission**, and a pure function is exhaustively testable without a disk.
+2. Storage stays open — a stream object is the natural home (streams already have NVMe backing, a reboot-surviving directory, partition ownership).
+3. **Phase 3 moves exactly these bytes.** Had serialisation been entangled with local storage, cross-node migration would need a second, parallel implementation. It now does not.
+
+Same instinct as isolating `nvme_build_prp()`: separate the part where a mistake corrupts something silently, then test that part hard.
+
+**A hazard found while designing the format.** The program image is deliberately *not* in the checkpoint — it is immutable and would dominate the payload. But `pc` is an instruction **index**, so restoring against a different image would resume at a valid-looking index in unrelated code, with every other field still plausible. The header therefore carries a hash over the instruction stream, literal pool and name pool (all three, because `RESOLVE` takes a name-pool index and `LOADI64` a literal index — same instructions with different pools is a different program to a resumed `pc`). Mismatches are refused.
+
+The format validates, in order: magic, format version, buffer length, **ISA fingerprint**, struct layout, program hash, payload checksum — and writes nothing into the destination context until all of them pass, so a rejected restore leaves a live context byte-identical rather than half-overwritten. The ISA-fingerprint check reuses Phase 1's drift guard for a second purpose: a build that renumbered opcodes would resume a context executing something else entirely.
+
+**The test caught a real weakness in itself.** The exhaustive scenario originally compared only the *final result* after resuming from each boundary. Injecting a deliberate bug — "forget to restore `pc`" — **passed 29/29**, because `loop_sum` restarted from the top re-initialises its accumulators and recomputes 55 either way. End-result equivalence is not state completeness.
+
+The check is now **field-level identity**: the restored context must be byte-identical to the saved one, at every boundary. Re-running the mutations against the strengthened test:
+
+| Injected bug | Result-only test | Identity test |
+| --- | --- | --- |
+| Drop `pc` on restore | **passed (missed it)** | **caught** |
+| Write one fewer live frame | caught | caught |
+| Drop `steps` (non-behavioural) | not tried | **caught** |
+
+Worth stating plainly because it generalises: a checkpoint test that only compares outcomes will miss any field a given program happens not to depend on. The right assertion is that the restored state *is* the saved state.
+
+**Verification.** 29 checks: exact size accounting (depth-1 = **74,848 B / 19 NVMe frames**, one command); checkpoint-and-restore at **all 58 instruction boundaries** into a deliberately poisoned destination, each byte-identical and each finishing correctly; all nine rejection paths including a genuine checkpoint of a *different* program refused against this one; verify-before-commit; a halted context round-tripping as halted rather than runnable; and mid-call-frame state surviving with only live frames written. Clean compile with `-I` flags and without, zero warnings. Regression 68/68.
+
+**Not done in Phase 2:** no storage binding and no syscall/shell surface yet — checkpoints exist as byte buffers only. Phase 3 needs the bytes, not a filing system, so wiring them into a stream object is better done alongside the operator-facing surface than speculatively now.
 
 ### Phase 3 — Migrate a live context across nodes
 
