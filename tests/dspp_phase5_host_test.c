@@ -33,6 +33,18 @@
 #include "net/net.h"   /* Multi-Node Partition Scaling Roadmap Phase 7 -- MACAddr, for this file's net_my_mac stand-in below */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* ─── Orchestration Phase 4 gap: registry replication receive ─────────
+ * FAITHFUL: no announcement is ever fed to this test's dispatcher, so
+ * these are unreached; and the real ones would simply cache an entry that
+ * nothing here resolves. Covered by tests/service_registry_host_test.c
+ * and tests/cross_node_migration_host_test.c. */
+void service_remote_learn(const char* n, uint32_t nid, uint32_t p,
+                          uint8_t k, uint32_t e, uint32_t u) {
+    (void)n; (void)nid; (void)p; (void)k; (void)e; (void)u;
+}
+void service_remote_forget(const char* n, uint32_t nid) { (void)n; (void)nid; }
+
+
 /* ─── Orchestration Plan Phase 4 stub: partition_destroy()'s registry
  * cleanup. FAITHFUL, not a no-op: the real
  * service_unregister_partition() drops every registration belonging to

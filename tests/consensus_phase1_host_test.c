@@ -45,6 +45,18 @@
 #include "../net/dspp.h"
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* ─── Orchestration Phase 4 gap: registry replication receive ─────────
+ * FAITHFUL: no announcement is ever fed to this test's dispatcher, so
+ * these are unreached; and the real ones would simply cache an entry that
+ * nothing here resolves. Covered by tests/service_registry_host_test.c
+ * and tests/cross_node_migration_host_test.c. */
+void service_remote_learn(const char* n, uint32_t nid, uint32_t p,
+                          uint8_t k, uint32_t e, uint32_t u) {
+    (void)n; (void)nid; (void)p; (void)k; (void)e; (void)u;
+}
+void service_remote_forget(const char* n, uint32_t nid) { (void)n; (void)nid; }
+
+
 /* ─── PEC Phase 3 stubs: net/dspp.c's context-migration receive path ───
  * FAITHFUL. This test never sends CTX_* opcodes, so these are not
  * reached; and were one to arrive, the real receiver with no registered

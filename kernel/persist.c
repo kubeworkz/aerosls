@@ -25,7 +25,8 @@
 #include "database.h"        // Database Gap Analysis §1 -- databases[]/database_grants[]/database_next_id
 #include "view.h"            // Query-Surface Roadmap Phase 5 -- views[]
 #include "tenant.h"
-#include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
+#include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]
+#include "workload.h"            // Orchestration Plan Phase 5 -- workloads[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -499,6 +500,8 @@ static const struct PersistRegionSpec p_region_specs[] = {
       1, { { PERSIST_TENANT_ENT_LBA, (uint32_t)sizeof(tenants) } } },
     { PERSIST_SERVICE_HDR_LBA, PERSIST_MAGIC_SERVICE,
       1, { { PERSIST_SERVICE_ENT_LBA, (uint32_t)sizeof(services_registry) } } },
+    { PERSIST_WORKLOAD_HDR_LBA, PERSIST_MAGIC_WORKLOAD,
+      1, { { PERSIST_WORKLOAD_ENT_LBA, (uint32_t)sizeof(workloads) } } },
 };
 #define P_REGION_COUNT ((int)(sizeof(p_region_specs)/sizeof(p_region_specs[0])))
 
@@ -643,6 +646,7 @@ static void persist_vec_backfill_cb(struct VecId id, uint64_t external_id,
 #define PERSIST_PEND_VIEW          (1u << 12)
 #define PERSIST_PEND_TENANT        (1u << 13)
 #define PERSIST_PEND_SERVICE       (1u << 14)   /* Orchestration Plan Phase 4 */
+#define PERSIST_PEND_WORKLOAD      (1u << 15)   /* Orchestration Plan Phase 5 */
 
 static uint32_t persist_defer_depth   = 0;
 static uint32_t persist_pending_mask  = 0;
@@ -684,6 +688,7 @@ void persist_defer_end(void) {
     if (pend & PERSIST_PEND_VIEW)          persist_views();
     if (pend & PERSIST_PEND_TENANT)        persist_tenants();
     if (pend & PERSIST_PEND_SERVICE)       persist_services();
+    if (pend & PERSIST_PEND_WORKLOAD)      persist_workloads();
 }
 
 // ─── persist_catalog ─────────────────────────────────────────────────────────
@@ -973,6 +978,21 @@ void persist_services(void) {
     persist_write_array(services_registry, svc_bytes, PERSIST_SERVICE_ENT_LBA);
     persist_region_commit();
     kernel_serial_print("[PERSIST] Service registry snapshot written.\n");
+}
+
+// persist_workloads — workloads[] (Orchestration Plan Phase 5). Pure
+// declarations. The OBSERVED fields (actions_taken/converged) ride along
+// rather than being stripped: they are cheap, and an operator reading
+// "actions=17" after a reboot learns something true about the declaration's
+// history. They are not desired state and nothing reconciles against them.
+void persist_workloads(void) {
+    if (persist_defer_note(PERSIST_PEND_WORKLOAD)) return;
+    if (!io_sq || !io_cq) return;
+    uint32_t wl_bytes = (uint32_t)sizeof(workloads);
+    stage_hdr(PERSIST_WORKLOAD_HDR_LBA, PERSIST_MAGIC_WORKLOAD, wl_bytes, 0, 0);
+    persist_write_array(workloads, wl_bytes, PERSIST_WORKLOAD_ENT_LBA);
+    persist_region_commit();
+    kernel_serial_print("[PERSIST] Workload declarations snapshot written.\n");
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -1475,6 +1495,32 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[PERSIST] Service registry: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 16. Declarative workloads (Orchestration Plan Phase 5) ─────────────
+    // Direct restore. The reconciler is OFF by default and is not enabled
+    // here: restoring a declaration is not the same as deciding to start
+    // acting on it autonomously, and a reboot is the worst moment to begin
+    // converging without an operator having asked.
+    if (nvme_read_sync(PERSIST_WORKLOAD_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_WORKLOAD && persist_region_trusted(PERSIST_MAGIC_WORKLOAD)) {
+            uint32_t wl_bytes;
+            p_memcpy(&wl_bytes, p_buf + 8, 4);
+            if (wl_bytes == (uint32_t)sizeof(workloads)) {
+                persist_read_array(workloads, wl_bytes, PERSIST_WORKLOAD_ENT_LBA);
+                uint32_t wcount = 0;
+                for (uint32_t i = 0; i < WORKLOAD_MAX; i++)
+                    if (workloads[i].active) wcount++;
+                kernel_serial_printf("[PERSIST] Workloads restored: %u declaration(s) (reconciler stays OFF).\n",
+                                     wcount);
+            } else {
+                kernel_serial_print("[PERSIST] Workloads: struct size mismatch — cold start.\n");
+            }
+        } else {
+            kernel_serial_print("[PERSIST] Workloads: no snapshot — cold start.\n");
         }
     }
 }

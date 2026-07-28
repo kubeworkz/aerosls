@@ -244,6 +244,13 @@
 #define PERSIST_SERVICE_HDR_LBA         7568ULL
 #define PERSIST_SERVICE_ENT_LBA         7584ULL
 
+// ─── Orchestration Plan Phase 5 (declarative workloads) ─────────────────────
+// workloads[] is 32 x 148 = 4736 B = 2 frames = 16 sectors, spanning
+// 7624..7640. The SERVICE entry array ends at 7600; 1-frame gap each side,
+// enforced by tests/persist_lba_layout_host_test.c.
+#define PERSIST_WORKLOAD_HDR_LBA        7608ULL
+#define PERSIST_WORKLOAD_ENT_LBA        7624ULL
+
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously
 // always 0) -- see the LBA layout comment above for the full reasoning.
@@ -266,6 +273,7 @@
 #define PERSIST_MAGIC_VIEW           0xCAFE00000000000DULL   /* Query-Surface Roadmap Phase 5 */
 #define PERSIST_MAGIC_TENANT         0xCAFE00000000000EULL   /* Multitenant Isolation Gap Analysis §5 item 1 */
 #define PERSIST_MAGIC_SERVICE        0xCAFE00000000000FULL   /* Orchestration Plan Phase 4 (service registry) */
+#define PERSIST_MAGIC_WORKLOAD       0xCAFE000000000010ULL   /* Orchestration Plan Phase 5 (declarative workloads) */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -377,6 +385,7 @@ void persist_views(void);
 // reason database_next_id does there — see the LBA layout comment above.
 void persist_tenants(void);
 void persist_services(void);   /* Orchestration Plan Phase 4 -- services_registry[] */
+void persist_workloads(void);  /* Orchestration Plan Phase 5 -- workloads[] */
 
 /* ─── Deferred / batched persistence ──────────────────────────────────────
  * Every persist_*() above rewrites its entire region: persist_records()

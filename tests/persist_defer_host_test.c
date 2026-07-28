@@ -53,10 +53,20 @@
 #include "kernel/database.h"
 #include "kernel/persist.h"
 #include "kernel/service_registry.h"
+#include "kernel/workload.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
+/* ─── Orchestration Plan Phase 5: workloads[] ─────────────────────────
+ * kernel/persist.c now snapshots and restores this array too, so every
+ * test linking persist.c must define it. Real and zero-initialised (=
+ * no declarations), which is exactly these tests' situation; persist.c
+ * reads and writes the actual bytes. Reconciler behaviour is covered by
+ * tests/workload_reconcile_host_test.c. */
+struct SLSWorkloadEntry workloads[WORKLOAD_MAX];
+
 
 /* ─── Orchestration Plan Phase 4: services_registry[] ─────────────────
  * kernel/persist.c now snapshots and restores this array, so every test

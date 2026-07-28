@@ -11,8 +11,11 @@
 #include "../arch/x86/isr_stubs.h"
 #include "timer.h"
 #include "process.h"
+#include "frame_pool.h"
 #include "partition.h"
 #include "service_registry.h"
+#include "workload.h"
+#include "workload_ctx.h"
 #include "loader.h"
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
@@ -54,8 +57,9 @@ extern void sls_shell_loop(void);
 extern void boot_application_processors(uint8_t apic_id);
 
 // ─── Multiboot2 memory map + hardware diagnostics ────────────────────────────
-static void print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
+static uint64_t print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
     // 1. Verify magic
+    uint64_t top_usable = 0;   /* highest end-of-RAM seen in the mmap */
     if (mb2_magic != (uint32_t)MULTIBOOT2_MAGIC) {
         kernel_serial_printf("[MB2] WARNING: bad magic 0x%x (expected 0x36d76289)\n",
                              mb2_magic);
@@ -96,7 +100,14 @@ static void print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
                 const char* tname = (e->type <= 5) ? types[e->type] : "?";
                 kernel_serial_printf("[HW]   %016lx + %8lu KiB  %s\n",
                     e->base_addr, (uint32_t)(e->length / 1024), tname);
-                if (e->type == MB2_MEM_AVAILABLE) usable_bytes += e->length;
+                if (e->type == MB2_MEM_AVAILABLE) {
+                    usable_bytes += e->length;
+                    /* Track the TOP of usable RAM, not the sum: the frame
+                     * allocator indexes by physical address, and a summed
+                     * total says nothing about where the holes are. */
+                    uint64_t region_end = e->base_addr + e->length;
+                    if (region_end > top_usable) top_usable = region_end;
+                }
                 e = (const struct mb2_mmap_entry*)((const uint8_t*)e + mm->entry_size);
             }
         }
@@ -105,6 +116,7 @@ static void print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
     if (usable_bytes)
         kernel_serial_printf("[HW] Usable RAM: %u MiB\n",
                              (uint32_t)(usable_bytes >> 20));
+    return top_usable;
 }
 
 #ifdef __cplusplus
@@ -128,7 +140,17 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     init_idt();
 
     // ── 2b. Hardware info (CPU + memory map from multiboot2) ──────────────────
-    print_hw_info(mb2_magic, mb2_phys);
+    /* Reserve the kernel image BEFORE anything can allocate. Without this
+     * the allocator hands out the kernel's own .text/.data/.bss as free
+     * pages -- see frame_pool.h. This must stay ahead of process_init(),
+     * partition_init() and loader_init() below, all of which allocate. */
+    frame_pool_init();
+
+    uint64_t top_usable = print_hw_info(mb2_magic, mb2_phys);
+    /* ...and bound the top, so the pool never offers memory the machine
+     * does not have. The bitmap spans a fixed 4 GiB regardless of the
+     * real amount installed. */
+    frame_pool_limit_ram(top_usable);
 
     // ── 3. Local APIC + timer IRQ ──────────────────────────────────────────
     init_local_apic_registers();
@@ -148,6 +170,8 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // ── 4c-bis. LPAR groundwork: partition table (Phase 8) ─────────────────
     partition_init();
     service_registry_init();   // Orchestration Plan Phase 4 -- name -> partition/node/endpoint
+    workload_init();           // Orchestration Plan Phase 5 -- declarative workloads (reconciler OFF by default)
+    wlctx_init();              // live execution contexts -- the producer partition_migrate() needs
 
     // ── 4d. Service binary loader ───────────────────────────────────────────
     loader_init();

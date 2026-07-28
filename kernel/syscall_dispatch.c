@@ -13,6 +13,7 @@
 #include "../kernel/secure_api.h"
 #include "partition.h"
 #include "service_registry.h"   // Orchestration Plan Phase 4
+#include "workload.h"            // Orchestration Plan Phase 5
 #include "frame_pool.h"
 #include "storage_quota.h"   // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
 #include "../net/tcp_quota.h" // Network Fairness Phase 2 -- SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST
@@ -307,6 +308,16 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_service_resolve((struct SLSServiceResolveRequest*)arg);
     case SYS_SLS_SERVICE_LIST:
         sys_sls_service_list(); return 0;
+
+    // ── Orchestration Plan Phase 5: declarative workloads (285-288) ─────
+    case SYS_SLS_WORKLOAD_DECLARE:
+        return sys_sls_workload_declare((struct SLSWorkloadDeclareRequest*)arg);
+    case SYS_SLS_WORKLOAD_DELETE:
+        return sys_sls_workload_delete((struct SLSWorkloadDeclareRequest*)arg);
+    case SYS_SLS_WORKLOAD_LIST:
+        sys_sls_workload_list(); return 0;
+    case SYS_SLS_RECONCILE_ENABLE:
+        return sys_sls_reconcile_enable((uint32_t)(uintptr_t)arg);
 
     // ── Phase 22: SQL engine, live at last (220) ────────────────────────────
     // The first dispatch-reachable entry point into Phases 19-22's SQL

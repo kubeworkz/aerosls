@@ -846,7 +846,7 @@ type TraceConfig struct {
 | Persistent storage (PV/PVC) | ✅ Volumes | ✅ | ✅ **Obsoleted by SLS** — objects/streams are persistent by construction, checksummed, crash-consistent | `kernel/object_catalog.c`, `stream.c`, `persist.c` | N/A — see "irrelevant" list |
 | Stateful workloads | ❌ | ✅ StatefulSets | ✅ **Default** — everything is stateful | same | N/A |
 | Workload migration | ❌ | ⚠️ | ✅ **Built** — `partition_migrate()` with real cross-node byte movement over DSPP | `kernel/partition.c`, `stream.c`, `net/dspp.c` | Done |
-| **Live execution migration** | ❌ | ⚠️ Container checkpointing is alpha and forensic-oriented; a *running* pod cannot be moved and resumed | ✅ **Built — no Docker/K8s equivalent.** A mid-execution SIMI context is checkpointed, chunked over DSPP, and resumes on another node at the exact instruction, with registers, call frames and memory intact | `kernel/simi_ctx_migrate.c`, `simi_ckpt.c`, `simi_interp.c`, `net/dspp.c` | ⚠️ **Capability proven; nothing creates long-lived contexts yet** — needs Phase 5's workload objects to produce them |
+| **Live execution migration** | ❌ | ⚠️ Container checkpointing is alpha and forensic-oriented; a *running* pod cannot be moved and resumed | ✅ **Built and reachable — no Docker/K8s equivalent.** Declare a workload with a program; it becomes a live context that `partition_migrate()` checkpoints, chunks over DSPP, and resumes on another node at the exact instruction, registers and memory intact | `kernel/workload_ctx.c`, `simi_ctx_migrate.c`, `simi_ckpt.c`, `simi_interp.c` | ⚠️ Fixed step budget, no scheduling or fairness between contexts |
 | Drain / cordon | ❌ | ✅ | ✅ **Built** — `partition_pause()` / `_resume()` | `kernel/partition.c` | Done |
 | Cluster membership | ❌ | ✅ | ✅ **Built** — `cluster_init()`, peer roster | `net/consensus.c` | Done |
 | Leader election / leases | ❌ | ✅ | ✅ **Built** — per-partition Raft-lite write leases | `net/consensus.c` | Done |
@@ -858,11 +858,11 @@ type TraceConfig struct {
 | CLI / API | ✅ docker | ✅ kubectl | ✅ **Built** — 156 shell command branches, 131 REST routes | `user/shell.c`, `net/http.c` | Naming polish only |
 | Horizontal scaling | ❌ | ✅ | ✅ **Built** — cross-node partition migration | `kernel/partition.c` | Done |
 | Edge computing | ❌ | ⚠️ K3s | ✅ **Core** | — | Done |
-| **Service discovery** | ❌ | ✅ | ✅ **Built** — `service_registry.c`: name → partition/endpoint, with the node **derived** from the partition's current owner, so resolution follows `partition_migrate()` with no reconciliation. `services[]` (8, boot-populated) remains internal-service supervision, unchanged | `kernel/service_registry.c` | ⚠️ Per-node registry; cross-node replication is Phase 5 work |
-| Declarative workload spec | ⚠️ Compose | ✅ Deployment | ❌ Absent | — | ✅ High — fits as an SLS object + reconcile loop |
+| **Service discovery** | ❌ | ✅ | ✅ **Built** — `service_registry.c`: name → partition/endpoint, node **derived** from the partition's current owner so resolution follows `partition_migrate()` with no reconciliation. Replicated cluster-wide over DSPP with a ~5 s heartbeat and fresh/stale/expired TTL; expiry is enforced at lookup so a dead node stops attracting traffic even if no sweep has run. Each node probes its OWN endpoints (TCP LISTEN / microkernel watchdog) and ships the verdict on the heartbeat, so `serving` and `health` are reported separately; local entries always outrank remote ones | `kernel/service_registry.c`, `net/dspp.c` | ⚠️ No application-level probe — a wedged handler still holding its port reports up |
+| Declarative workload spec | ⚠️ Compose | ✅ Deployment | ✅ **Built** — `workloads[32]` declare partition + desired state + service + **program**; a bounded reconciler converges on all four | `kernel/workload.c`, `workload_ctx.c` | ⚠️ No restarts/scaling (needs a workload liveness signal) |
 | Service mesh policy | ❌ | ✅ Istio | ⚠️ **Substrate only** — IPC/MQ local, DSPP cross-node; no circuit breaking or policy layer | `kernel/ipc.c`, `net/dspp.c` | ⚠️ Medium — build on substrate, not Envoy |
 | Network policies (src/dst ACL) | ❌ | ✅ | ❌ Absent | — | ⚠️ Medium |
-| Auto-scaling (HPA/VPA) | ❌ | ✅ | ❌ Absent | — | ⚠️ Low — needs the reconcile loop first |
+| Auto-scaling (HPA/VPA) | ❌ | ✅ | ❌ Absent | — | ⚠️ Low — the reconcile loop now exists, but scaling also needs a liveness/load signal |
 | Package manager | ❌ | ✅ Helm | ❌ Absent | — | ⚠️ Low |
 | API gateway / ingress rules | ❌ | ✅ | ❌ Absent (routes are compiled in) | `net/http.c` | ⚠️ Low |
 | **Container runtime** | ✅ | ✅ CRI | ❌ **Not applicable** — needs Linux namespaces/cgroups; AeroSLS *is* the kernel | — | ❌ **Remove from roadmap** |

@@ -19,6 +19,15 @@
 #include <stdio.h>
 #include <stdint.h>
 
+/* kernel/frame_pool.c now reserves the kernel image before allocating
+ * (the linker provides this symbol; see frame_pool.h). Its ADDRESS is the
+ * value, so a host test cannot choose it -- and does not need to: these
+ * tests never call frame_pool_init(), only the allocator itself. This
+ * definition exists purely to satisfy the link. Reservation behaviour is
+ * covered by tests/frame_pool_reserve_host_test.c. */
+char _kernel_image_end[1];
+
+
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 

@@ -109,6 +109,12 @@ void tcp_handle_segment(struct IPv4Header* ip, struct TCPHeader* seg, uint16_t s
 int  tcp_listen(uint16_t port);             // returns conn_id or -1
 int  tcp_accept(int listen_id);             // blocks until connection; returns new conn_id
 int  tcp_connect(IPv4Addr dst_ip, uint16_t dst_port); // active open; returns conn_id or -1
+
+/* Is anything actually accepting on `port`? (Service-registry endpoint
+ * liveness.) Lives here rather than in the registry because tcp_conns[] is
+ * 16 MiB and belongs to this file; exporting one predicate keeps the
+ * registry -- and every host test that links it -- free of that. */
+int  tcp_port_is_listening(uint16_t port);
 int  tcp_send(int conn_id, const void* buf, uint32_t len);
 int  tcp_recv(int conn_id, void* buf, uint16_t max_len);  // returns bytes read
 void tcp_close(int conn_id);

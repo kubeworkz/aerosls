@@ -404,3 +404,20 @@ int tcp_connect(IPv4Addr dst_ip, uint16_t dst_port) {
     kernel_serial_printf("[TCP] connect: timeout waiting for SYN-ACK\n");
     return -1;
 }
+
+/* ─── Endpoint liveness ───────────────────────────────────────────────
+ * A LISTEN socket on this port means something has bound it and is
+ * accepting. That is a real observation, not an inference: if the process
+ * that owned it died, its slot would no longer be active and in LISTEN.
+ *
+ * What it does NOT tell you is whether the thing behind the socket is
+ * still answering -- a wedged handler keeps the listener bound. See
+ * service_registry.h on where that limit is stated. */
+int tcp_port_is_listening(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!tcp_conns[i].active) continue;
+        if (tcp_conns[i].state != TCP_LISTEN) continue;
+        if (tcp_conns[i].local_port == port) return 1;
+    }
+    return 0;
+}

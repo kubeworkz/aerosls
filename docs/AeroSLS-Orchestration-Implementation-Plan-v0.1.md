@@ -284,7 +284,11 @@ Worth stating plainly because it generalises: a checkpoint test that only compar
 
 **Not done in Phase 4:** no health checking or TTL — a registration is a static fact until changed, not a liveness signal (`kernel/microkernel.c`'s watchdog remains the only liveness mechanism, and only for the 5 internal services). No cross-node registry replication: each node holds its own registry, so a name registered on node 1 does not resolve on node 2. That is a real limit and the natural companion to Phase 5's reconciliation, not something to bolt on here.
 
-### Phase 5 — Declarative workload objects + reconciliation
+### Phase 5 — Declarative workload objects + reconciliation — **DONE**
+
+> **Built and passing.** `kernel/workload.{c,h}` + persist region + syscalls 285–288 + 4 shell commands + 3 REST routes + `tests/workload_reconcile_host_test.c` (71 checks). Full regression 71/71. As-built notes in §Phase 5 Findings below.
+
+### Phase 5 (original scope)
 
 **Deliverable:** declare desired state; the kernel converges on it.
 
@@ -294,9 +298,128 @@ Worth stating plainly because it generalises: a checkpoint test that only compar
 
 **Risk: moderate** — the first thing in this system that acts autonomously. Bound it: reconcile a small, explicit set of conditions, log every action, and make it disableable.
 
+### Phase 5 Findings (as built)
+
+**1. The concurrency constraint was right, and it forces the queue.** The alternative — run the whole reconciler on the BSP and persist directly — was examined and rejected on evidence, not preference: the BSP's foreground loop is `http_server_run()`, entered **only when a NIC is present**; without one the BSP falls through to `sls_shell_loop()`, which blocks in `read_line()` and has no idle point at all. The AP core's `ap_kernel_main()` is the only loop that reliably ticks. So the reconciler sweeps on the AP core, applies directly only what does *not* persist, and hands the rest to the BSP through a single-producer/single-consumer ring.
+
+   The invariant is asserted, not just documented: scenario 5 counts `persist_*()` calls and requires **zero** from `reconcile_tick()`, then requires exactly one from `reconcile_drain()`. Mutating the sweep to persist directly fails 4 checks.
+
+**2. The ring is sized so one sweep cannot overflow it.** Pass 2 emits at most one intent per workload, so `WL_INTENT_MAX >= WORKLOAD_MAX` means overflow signals exactly one condition — *the BSP stopped draining* — rather than routine busyness. That makes the dropped counter diagnostic instead of noise. Both properties are `_Static_assert`ed, because shrinking the ring or growing the workload table would otherwise break them silently. The test provokes overflow the way it can really happen (repeated sweeps with no drain), confirms it is counted, and confirms convergence still completes afterwards — dropped intents are re-derived because the sweep reads *actual* state rather than trusting a past enqueue.
+
+**3. The bug the test found: shared partitions oscillated.** The first version decided partition run-state per workload. Two workloads in one partition with opposite desired states then fought — each sweep, one paused it and the other resumed it, forever, and the reconciler never settled. A reconciler that never settles has no error message; the production symptom is just wear.
+
+   Fixed with **union semantics**: a partition runs if *any* active workload in it wants to run. Deterministic, order-independent, and it matches what the words mean — a partition has to be up for anything in it to run. A STOPPED workload still withdraws its own service; what it cannot do is take the partition down from under its neighbours.
+
+   **Mutation testing then found the test was too weak to prove the fix.** Replacing the union with "last declaration in table order wins" still passed, because the scenario happened to declare the STOPPED workload at a *lower* index. Strengthened with a third workload declared after the running one, exercising the opposite order. Also caught this way: a hard-coded `converged = 1` passed everything, because nothing asserted the flag is ever *false*.
+
+**4. `actions_taken` changed meaning, and the field says so.** After the union refactor it counts only actions attributable to one workload — its own service registration. Partition pause/resume is shared and is deliberately not charged to an arbitrary member.
+
+**5. Reconciliation is OFF at boot, including after a restore.** Restoring a declaration is not the same as deciding to start acting on it, and a reboot is the worst moment to begin converging unasked. The restore path says so explicitly.
+
+**Verification ceiling:** host-verified only; no `x86_64-elf-gcc` here, so no full kernel link — every touched file compiles clean at `-O2` under the Makefile's exact freestanding flags. Critically, **the AP/BSP split itself is not exercised concurrently**: the test calls `reconcile_tick()` and `reconcile_drain()` from one thread in sequence. It proves the *separation of duties* (the sweep performs no persisting calls) but not the ring's memory ordering under genuine concurrent access on two cores. That would need a real two-core run, and is the main thing this phase has not proven.
+
+**Not done in Phase 5:** no restarts, scaling, health-based action or scheduling — all need a liveness signal that does not exist for workloads (`microkernel.c`'s watchdog covers only the 5 internal services).
+
+### Phase 5 Gap Closure (follow-on)
+
+The three things Phase 5 shipped without were taken as their own piece of work. All three are now closed; regression **73/73**.
+
+**Gap 1 — the ring was never tested concurrently.** `tests/reconcile_ring_concurrency_host_test.c` now runs the real enqueue/drain protocol from two OS threads at 400,000 intents, checking no-loss, no-duplication, ordering, tearing (each probe carries its sequence in five redundant fields plus a derived 64-byte string) and exact accounting. The ring genuinely filled 15,151 times, so it was contended, not serial.
+
+**The ceiling was then measured rather than guessed at**, by mutating the ring and re-running:
+
+| Mutation | Result |
+| --- | --- |
+| publish head *before* writing the slot | CAUGHT |
+| advance tail *before* copying the slot out | CAUGHT |
+| fullness test off by one (overwrite a live slot) | CAUGHT |
+| replace every `__atomic` with a plain access | **SURVIVED** |
+
+So it catches the structural bugs and does **not** catch missing barriers — x86-64's TSO makes acquire/release on a plain load/store free. A barrier-free ring is indistinguishable here and would still be wrong on the RISC-V target this codebase also builds. That residual gap is real; ThreadSanitizer is the right tool and does not run in this environment ("unexpected memory mapping"). The barriers are correct by review, not by test.
+
+**Gap 2 — nothing created live contexts.** `kernel/workload_ctx.{c,h}`: a workload can now declare a **program**, and the reconciler instantiates it as a live interpreted context and calls `simi_ctx_register()`. `tests/workload_ctx_host_test.c` runs the whole path — declare → reconcile → instantiate → execute partway → `partition_migrate()` → replay the real captured packets as node 2 → resume — and gets `55` in 29 + 29 steps.
+
+The load-bearing assertion is the **negative control**: scenario 1 shows the same migration call moving *zero* contexts beforehand, so "it moved one" afterwards means something. Images are copied into naturally-aligned per-slot storage because a `.tmo`'s instruction stream sits at byte offset 20, which would make a `uint64_t*` misaligned — tolerated on x86, a fault on RISC-V.
+
+Mutation testing found the test masking a real defect: it registered the program image itself on the receiving side, so deleting `wlctx_start()`'s `register_image()` call survived. Removed that crutch; all eight mutations now caught.
+
+**Gap 3 — the registry was per-node.** A third DSPP opcode family (`DSPP_SVC_ANNOUNCE`/`WITHDRAW`) replicates registrations. It **announces rather than queries** — a request/response would need a reply timeout, and every blocking wait here routes through `net_event.h`'s privileged `sti; hlt`. So each node broadcasts what it owns and caches what it hears, and a resolve stays a purely local lookup with no network round trip on the hot path.
+
+Remote entries live in their own table, which makes two properties structural rather than remembered: **local always wins** (a remote announcement can never shadow a service running here), and **remote entries are never persisted** (restoring a stale cache would resurrect services that moved or vanished while this node was down). Only the announcing node may withdraw its own entry.
+
+The prefix-compatibility `_Static_assert`s were extended to the third header and verified by deliberately reordering it — a compile error naming the drifted field.
+
+**Gap 3a — TTL and health (follow-on).** The item above named the remaining hole: a node that dies silently never withdraws anything, because withdrawal requires it to *send*, so its services would resolve forever on every other node. Now closed.
+
+Each node re-announces what it owns every ~5 s; a cached entry ages through three states rather than two, because a binary alive/dead would delete a service the instant one heartbeat was late and give an operator no warning:
+
+| State | Age | Behaviour |
+| --- | --- | --- |
+| FRESH | < 2 heartbeats | resolves normally |
+| STALE | < TTL (~20 s) | **still resolves** — overdue is a warning, not a deletion |
+| EXPIRED | ≥ TTL | does not resolve |
+
+TTL is four heartbeats deliberately: a single dropped announcement is normal on a broadcast protocol with no retransmission, and must not evict a healthy service.
+
+**The design decision that matters: expiry is checked at LOOKUP, not by the sweep.** `service_resolve()` evaluates freshness itself, so an entry past TTL stops resolving whether or not a sweep has run. The sweep only reclaims slots. That makes correctness independent of sweep scheduling — which matters concretely, because on a NIC-less boot the BSP loop that runs it never executes at all. A test asserts exactly this: past TTL, with the slot still occupied and nothing swept, the lookup still refuses.
+
+The heartbeat transmits, so it runs on the **BSP only** — the NIC TX path cannot be driven from two cores at once. It also fires once immediately on the first call rather than waiting a full interval, so a freshly booted node is discoverable in milliseconds. Local registrations never age: this node is authoritative for its own.
+
+**Mutation testing found one hole.** Age arithmetic saturates at zero because `kernel_tick_counter` is incremented by whichever core takes the timer IRQ, so a reading can land marginally *behind* a stamp; an unsigned subtraction would wrap to an astronomical age and instantly expire a healthy entry. Removing the saturation **survived the whole suite** — nothing ever moved the clock backwards. Added that case; all seven mutations now caught.
+
+**Gap 3b — endpoint liveness (follow-on).** The item above named its own limit: TTL is liveness by *absence of announcement*, which is node-level. A node whose kernel is fine but whose service has died keeps heartbeating, and keeps resolving FRESH. Now addressed.
+
+**The design turn: the owning node probes its OWN endpoints and reports the verdict in its heartbeat.** No node ever probes another's. That matters — a cross-node probe needs a request/response with a timeout, and no blocking wait is usable from these paths. Riding the existing announcement costs one byte and no new round trip.
+
+What is actually observed, in both cases from state the kernel already maintains:
+
+| Endpoint | Observation | Source |
+| --- | --- | --- |
+| TCP | is a socket LISTENing on that port? | `tcp_conns[]`, via `tcp_port_is_listening()` |
+| IPC | what does the watchdog say about the service owning that port? | `services[]`, via `mk_ipc_port_state()` |
+
+The IPC case is the strongest signal in the system: `microkernel_service_poll()`'s watchdog maintains ONLINE/CRASHED from real crash and restart events, so the answer is observed rather than inferred. **DEGRADED counts as DOWN** — routing to a degraded service on the strength of "it hasn't fully crashed yet" is how a degraded service becomes an outage.
+
+**`serving` is a separate field from `health`, deliberately.** They answer different questions — "is the endpoint accepting?" versus "is this information current?" — and collapsing them would lose the distinction between *"I have not heard lately"* and *"I have heard, and it is down"*, which are opposite situations for anyone deciding whether to route or to page someone. A test asserts the independence directly: STALE + UP, and FRESH + DOWN, are both reachable and both meaningful.
+
+Two smaller decisions: registration probes immediately rather than waiting up to a heartbeat, so an operator who registers a service and asks about it gets the truth. And a DOWN service still **resolves** — the registry reports, it does not hide; hiding it would make "gone" and "broken" indistinguishable to a caller.
+
+Layering note: the two probes live in the files that own the data (`net/tcp.c`, `kernel/microkernel.c`) and are exported as one predicate each. `tcp_conns[]` alone is 16 MiB; pulling it into the registry would have dragged it into every host test that links the registry.
+
+Eight mutations tried against the probe logic, all caught — including DEGRADED-as-UP, guessing UP for an unowned IPC port, and announcing without probing first.
+
+**What is still not closed:** a process that is alive and holding its port but whose *handler* has wedged reports UP. Catching that needs an application-level probe — send something, require an answer — which is a different mechanism and is not built. UNKNOWN is returned honestly for an IPC port with no supervised owner rather than guessed. `wlctx_step_all()` also advances every context by a fixed budget with no fairness or priority; that is a scheduler, and naming it is not the same as having one.
+
 ### Phase 6 — Mesh policy (optional)
 
 Circuit breaking, health state, per-service metrics over IPC (local) and DSPP (cross-node). Concepts from `AeroSLS-Service-Mesh.md`; **not** its `pthread`/socket implementation.
+
+### Interlude — the whole-image link check, and what it found
+
+Five phases plus three gap closures had been built, all host-verified, and the kernel had **never once been linked as a whole image**. Every phase carried the same ceiling note. Before starting Phase 6 that was finally done: all 94 C translation units compiled under the Makefile's exact freestanding flags and linked against the real `arch/x86/linker.ld`.
+
+**The link itself is clean** — zero duplicate symbols, zero genuinely-missing symbols (the only undefined is `_start`, which lives in `boot.asm`). Verified two ways: the linker's own output, and independently by differencing all-undefined against all-defined across the 94 objects and subtracting the `.asm`-provided allowlist. `nasm` and `qemu-system-x86_64` are absent in this environment, so the assembly objects and an actual boot remain unverified.
+
+**It found a live bug in the physical frame allocator.**
+
+`.bss` totals **117 MiB**, so the image occupies physical **1 MiB → 119.5 MiB**. Meanwhile `physical_memory_bitmap[]` lives in `.bss` — it boots all-zero, meaning *every frame marked free*, including the kernel's own. There was no `frame_pool_init()` anywhere; nothing reserved the image, nothing read the multiboot memory map (which was parsed, but only to print it). `alloc_raw_frame()` started at physical frame 1 and walked upward, and `boot.asm` identity-maps 0–4 GiB, so a caller's write went straight through the returned pointer into the running image:
+
+| Frames | Address | What is actually there |
+| --- | --- | --- |
+| 1–159 | 0x1000–0x9FFFF | conventional RAM — genuinely usable |
+| 160–191 | 0xA0000–0xBFFFF | VGA framebuffer; `0xB8000` is the text buffer `vga.c` writes to |
+| 192–255 | 0xC0000–0xFFFFF | BIOS ROM shadow — not RAM |
+| **256–30592** | **0x100000–0x7780C40** | **the kernel's own .text/.rodata/.data/.bss** |
+
+Allocation #256 returns the multiboot header. Process spawn and `loader.c` take several frames each.
+
+**Pre-existing, not introduced by this track.** `alloc_raw_frame()` has always started at frame 1 with no reservation. The 4.2 MiB of `.bss` added across Phases 3–5 is 3.6% of the 117 MiB total — the dominant consumers are `http_conns` (32 MiB), `g_add_column_scratch` (16 MiB) and `tcp_conns` (16 MiB). This work widened an already-wide window rather than opening it.
+
+**The fix.** `linker.ld` gained `_kernel_image_end` (it previously exported no end-of-image symbol at all, so the allocator had no way to ask). `frame_pool_init()` reserves one contiguous span from 0 up to it — which covers frame 0, low RAM, the VGA hole, the ROM shadow and the whole image in a single rule. Giving up the 640 KiB of genuinely usable conventional RAM costs 0.5% of a 128 MiB machine and removes every question about which parts of low memory are safe. `frame_pool_limit_ram()` additionally reserves everything above the top of real RAM, taken from the multiboot mmap the boot path already walks — the bitmap spans a fixed 4 GiB regardless of what is installed, so without it a 256 MiB machine would be handed a page at 3 GiB.
+
+The reservation logic is split into `frame_pool_reserve_below(end_addr)` so it can be tested: a linker symbol has no address a host test can choose, and an untestable boot-path reservation is precisely what was wrong here to begin with. `tests/frame_pool_reserve_host_test.c` (23 checks) opens with a **negative control** that reproduces the unreserved allocator and shows allocation #256 really does return `0x100000` — without which "allocations are above the kernel now" would not distinguish a fix from a coincidence. Seven mutations tried, all caught.
+
+**Still unverified:** no `nasm`, so the six `.asm` objects are not in this link; no QEMU, so nothing has been booted. The fix is correct by construction and by host test, not by observation on hardware.
 
 ## 5. Sequencing
 
@@ -305,7 +428,7 @@ Phase 1 (interpreter) ─→ Phase 2 (checkpoint) ─→ Phase 3 (live migration
    DONE                     DONE                    DONE
                                                           │
 Phase 4 (registry) ───────────────────────────────────────┴─→ Phase 5 (workloads) ─→ Phase 6 (mesh)
-   DONE
+   DONE                                                          DONE
 ```
 
 Phases 1–3 are the research bet; 4–6 are the orchestration surface. They are independent, so if PEC stalls the platform work continues.

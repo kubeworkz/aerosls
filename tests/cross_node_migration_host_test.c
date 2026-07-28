@@ -99,6 +99,27 @@ int partition_holds_write_lease(uint32_t partition_id) { (void)partition_id; ret
 void process_consensus_packet(struct DSPPFullPagePacket* packet) { (void)packet; }
 void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) { (void)packet; }
 
+/* ─── Service-replication receive side, as OBSERVABLE stubs ───────────
+ * A THIRD header now shares DSPP_MIGRATE_MAGIC. The dispatcher has to
+ * tell all three apart by opcode before it can apply any length check --
+ * and the service header is a different size again. Recording what
+ * arrives is what makes a misroute visible rather than silent. */
+static int learn_calls = 0, forget_calls = 0;
+static char last_learned[64];
+static uint32_t last_node, last_part, last_port;
+static uint8_t last_serving;
+void service_remote_learn(const char* name, uint32_t node_id, uint32_t partition_id,
+                          uint8_t kind, uint32_t port, uint32_t uid, uint8_t serving) {
+    (void)kind; (void)uid;
+    last_serving = serving;
+    learn_calls++;
+    for (int i = 0; i < 64; i++) { last_learned[i] = name[i]; if (!name[i]) break; }
+    last_node = node_id; last_part = partition_id; last_port = port;
+}
+void service_remote_forget(const char* name, uint32_t node_id) {
+    (void)name; (void)node_id; forget_calls++;
+}
+
 /* ─── The one fake this whole test hinges on: settable node identity ─────
  * Real node A and node B are two different processes each with their own
  * real cluster_local_node_id() reading their own compiled-in identity.
@@ -309,6 +330,68 @@ int main(void) {
         memset(garbage, 0x41, sizeof(garbage));
         dspp_rx_dispatch(garbage, sizeof(garbage));
         CHECK(captured_frame_count == frame_count_before, "an unrecognized magic value produces no transmitted ACK and no crash");
+    }
+
+    /* ═══ Service-registry replication over the wire ═══════════════════
+     * The THIRD opcode family on this magic. Checks that it round-trips
+     * through the REAL dspp_service_announce() -> dspp_rx_dispatch()
+     * path, and -- just as important -- that adding it did not break the
+     * routing of the families that were already here. */
+    printf("\n-- Service-registry replication --\n");
+    {
+        captured_frame_count = 0;
+        g_fake_local_node_id = 4;
+        dspp_service_announce("cart", 12, 1 /*TCP*/, 8080, 3, 0 /*SVC_SERVING_UP*/);
+        CHECK(captured_frame_count == 1, "an announcement is one broadcast frame");
+
+        struct DSPPServiceHeader* h =
+            (struct DSPPServiceHeader*)(captured_frame[0] + ETH_HDR_LEN);
+        CHECK(h->magic == DSPP_MIGRATE_MAGIC, "it carries the shared family magic");
+        CHECK(h->opcode == DSPP_SVC_ANNOUNCE, "...with the ANNOUNCE opcode");
+        CHECK(h->node_source_id == 4, "...stamped with this node's id");
+        CHECK(h->node_dest_id == 0, "...and broadcast (dest 0), not point-to-point");
+
+        g_fake_local_node_id = 9;
+        learn_calls = forget_calls = 0;
+        dspp_rx_dispatch(captured_frame[0] + ETH_HDR_LEN,
+                         (uint16_t)(captured_frame_len[0] - ETH_HDR_LEN));
+        CHECK(learn_calls == 1, "another node learns it");
+        CHECK(last_node == 4 && last_part == 12 && last_port == 8080,
+              "...with the announcing node, partition and endpoint intact");
+        CHECK(last_serving == 0,
+              "...and the owning node's own endpoint-liveness verdict rides along");
+
+        g_fake_local_node_id = 4;
+        learn_calls = 0;
+        dspp_rx_dispatch(captured_frame[0] + ETH_HDR_LEN,
+                         (uint16_t)(captured_frame_len[0] - ETH_HDR_LEN));
+        CHECK(learn_calls == 0,
+              "the ANNOUNCING node ignores its own broadcast -- it would shadow the local entry");
+
+        captured_frame_count = 0;
+        dspp_service_withdraw("cart");
+        g_fake_local_node_id = 9;
+        forget_calls = 0;
+        dspp_rx_dispatch(captured_frame[0] + ETH_HDR_LEN,
+                         (uint16_t)(captured_frame_len[0] - ETH_HDR_LEN));
+        CHECK(forget_calls == 1, "a withdraw reaches the other node");
+
+        captured_frame_count = 0;
+        g_fake_local_node_id = 0;
+        dspp_service_announce("ghost", 1, 1, 80, 0, 0);
+        CHECK(captured_frame_count == 0,
+              "a node with no cluster identity announces nothing -- node 0 is the sentinel");
+
+        /* And the pre-existing family still routes correctly. */
+        g_fake_local_node_id = 1;
+        captured_frame_count = 0;
+        dspp_migrate_send_begin(1, 2, 3, "s", "text/plain", 4096, 1, 0);
+        g_fake_local_node_id = 2;
+        learn_calls = forget_calls = 0;
+        dspp_rx_dispatch(captured_frame[0] + ETH_HDR_LEN,
+                         (uint16_t)(captured_frame_len[0] - ETH_HDR_LEN));
+        CHECK(learn_calls == 0 && forget_calls == 0,
+              "a STREAM migrate packet never reaches the replication handler");
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

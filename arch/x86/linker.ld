@@ -33,4 +33,16 @@ SECTIONS
         *(.bss)
         *(.bootstrap_stack)
     }
+
+    /* End of the loaded kernel image, in PHYSICAL address terms (paging is
+     * an identity map for 0-4 GiB, so physical == virtual here).
+     *
+     * This exists because kernel/frame_pool.c needs to know where the
+     * kernel stops before it can avoid handing the kernel's own memory out
+     * as free pages. Before this symbol existed there was no way for it to
+     * ask, and it did not: alloc_raw_frame() started at physical frame 1
+     * and walked upward straight through .text, .rodata, .data and 117 MiB
+     * of .bss. See frame_pool_init(). */
+    . = ALIGN(4096);
+    PROVIDE(_kernel_image_end = .);
 }

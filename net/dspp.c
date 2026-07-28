@@ -254,6 +254,18 @@ DSPP_SAME_OFFSET(status);
 _Static_assert(__builtin_offsetof(struct DSPPCtxMigrateHeader, chunk_index) ==
                __builtin_offsetof(struct DSPPMigrateHeader, page_index),
                "DSPP migrate header prefix drifted: chunk_index/page_index");
+#define DSPP_SVC_SAME_OFFSET(f) \
+    _Static_assert(__builtin_offsetof(struct DSPPServiceHeader, f) == \
+                   __builtin_offsetof(struct DSPPMigrateHeader, f), \
+                   "DSPP service header prefix drifted: " #f)
+DSPP_SVC_SAME_OFFSET(magic);
+DSPP_SVC_SAME_OFFSET(opcode);
+DSPP_SVC_SAME_OFFSET(node_source_id);
+DSPP_SVC_SAME_OFFSET(node_dest_id);
+DSPP_SVC_SAME_OFFSET(transfer_id);
+DSPP_SVC_SAME_OFFSET(partition_id);
+DSPP_SVC_SAME_OFFSET(status);
+#undef DSPP_SVC_SAME_OFFSET
 #undef DSPP_SAME_OFFSET
 
 static void dspp_ctx_hdr_init(struct DSPPCtxMigrateHeader* h, uint16_t opcode,
@@ -353,6 +365,66 @@ void dspp_ctx_migrate_rx(struct DSPPCtxMigrateChunkPacket* packet, uint16_t len)
     // CTX_BEGIN_ACK/CTX_CHUNK_ACK: no-op, as with the stream family.
 }
 
+
+/* ─── Service-registry replication ────────────────────────────────────
+ * See dspp.h for why this announces rather than queries, and why remote
+ * entries live in their own table. */
+static void dspp_svc_send(uint16_t opcode, const char* name, uint32_t partition_id,
+                          uint8_t endpoint_kind, uint32_t endpoint_port,
+                          uint32_t owner_uid, uint8_t serving) {
+    struct DSPPServiceHeader h;
+    h.magic          = DSPP_MIGRATE_MAGIC;
+    h.opcode         = opcode;
+    h.node_source_id = (uint16_t)cluster_local_node_id();
+    h.node_dest_id   = 0;              /* broadcast -- everyone caches this */
+    h.transfer_id    = 0;
+    h.partition_id   = partition_id;
+    h.chunk_index    = 0;
+    h.status         = 0;
+    dspp_strncpy(h.service_name, name ? name : "", sizeof(h.service_name));
+    h.endpoint_port  = endpoint_port;
+    h.endpoint_kind  = endpoint_kind;
+    h.owner_uid      = owner_uid;
+    h.serving        = serving;
+
+    dspp_transmit_raw(&h, (uint16_t)sizeof(h));
+}
+
+void dspp_service_announce(const char* name, uint32_t partition_id,
+                           uint8_t endpoint_kind, uint32_t endpoint_port,
+                           uint32_t owner_uid, uint8_t serving) {
+    /* Silent on a node with no cluster identity. node id 0 is Phase 1's
+     * "uninitialized" sentinel, so announcing would tell the segment a
+     * service belongs to a node that does not exist -- worse than saying
+     * nothing, because a listener would cache it. */
+    if (cluster_local_node_id() == 0) return;
+    dspp_svc_send(DSPP_SVC_ANNOUNCE, name, partition_id, endpoint_kind,
+                  endpoint_port, owner_uid, serving);
+}
+
+void dspp_service_withdraw(const char* name) {
+    if (cluster_local_node_id() == 0) return;
+    dspp_svc_send(DSPP_SVC_WITHDRAW, name, 0, 0, 0, 0, 0);
+}
+
+void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len) {
+    if (!h || len < sizeof(struct DSPPServiceHeader)) return;
+
+    /* Ignore our own broadcast. Unlike the migrate families this is not
+     * addressed to anyone, so the self-filter is on the SOURCE: caching
+     * our own announcement as a remote entry would shadow the local one
+     * it came from. */
+    if (h->node_source_id == (uint16_t)cluster_local_node_id()) return;
+
+    if (h->opcode == DSPP_SVC_ANNOUNCE) {
+        service_remote_learn(h->service_name, h->node_source_id, h->partition_id,
+                             h->endpoint_kind, h->endpoint_port, h->owner_uid,
+                             h->serving);
+    } else if (h->opcode == DSPP_SVC_WITHDRAW) {
+        service_remote_forget(h->service_name, h->node_source_id);
+    }
+}
+
 void dspp_rx_dispatch(void* buf, uint16_t len) {
     if (!buf || len < sizeof(uint64_t)) return;
     uint64_t magic;
@@ -369,6 +441,12 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
         if (len < sizeof(uint64_t) + sizeof(uint16_t)) return;
         uint16_t opcode;
         dspp_memcpy(&opcode, (uint8_t*)buf + sizeof(uint64_t), sizeof(opcode));
+
+        if (opcode == DSPP_SVC_ANNOUNCE || opcode == DSPP_SVC_WITHDRAW) {
+            if (len < sizeof(struct DSPPServiceHeader)) return;
+            dspp_service_rx((struct DSPPServiceHeader*)buf, len);
+            return;
+        }
 
         if (opcode >= DSPP_MIGRATE_CTX_BEGIN_REQ && opcode <= DSPP_MIGRATE_CTX_CHUNK_ACK) {
             if (len < sizeof(struct DSPPCtxMigrateHeader)) return;

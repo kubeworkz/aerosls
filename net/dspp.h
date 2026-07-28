@@ -294,6 +294,65 @@ void dspp_ctx_migrate_send_chunk(uint64_t transfer_id, uint32_t node_dest_id,
  * kernel/simi_ctx_migrate.c and ACKs each. */
 void dspp_ctx_migrate_rx(struct DSPPCtxMigrateChunkPacket* packet, uint16_t len);
 
+/* ─── Service-registry replication (Orchestration Plan Phase 4 gap) ────
+ * Phase 4 shipped a per-node registry: a name registered on node 1 did
+ * not resolve on node 2. This announces registrations to the cluster so
+ * it does.
+ *
+ * ─── Announce, do not query ───────────────────────────────────────────
+ * A request/response "who has this name?" would need a reply timeout, and
+ * every blocking wait in this codebase routes through kernel/net_event.h,
+ * whose privileged `sti; hlt` cannot be used from the paths that would
+ * call it. So this is the same fire-and-forget shape the two migrate
+ * families already use: each node ANNOUNCES what it owns, and every other
+ * node caches what it hears. A resolve is then always a local lookup,
+ * with no network round trip on the hot path at all.
+ *
+ * ─── Why remote entries are a separate table ──────────────────────────
+ * A cached remote registration is not the same kind of fact as a local
+ * one. It is another node's truth, it is not authoritative here, and it
+ * must never be persisted -- restoring a stale cache from disk would
+ * resurrect services that may have moved or vanished while this node was
+ * down. Keeping them apart makes "local wins, and only local persists" a
+ * property of the data structure rather than a rule to remember.
+ *
+ * Broadcast to the whole segment (node_dest_id 0 == "everyone"), unlike
+ * the migrate families which are point-to-point and self-filter. */
+enum DSPPServiceOpcode {
+    DSPP_SVC_ANNOUNCE = 9,   /* "I own this name, here is where it lives" */
+    DSPP_SVC_WITHDRAW = 10,  /* "I no longer own this name" */
+};
+
+struct DSPPServiceHeader {
+    /* Same prefix layout as both migrate headers -- static-asserted in
+     * dspp.c, for the same dispatcher reason. */
+    uint64_t magic;             /* DSPP_MIGRATE_MAGIC (shared family) */
+    uint16_t opcode;
+    uint16_t node_source_id;
+    uint32_t node_dest_id;      /* 0 == broadcast to the segment */
+    uint64_t transfer_id;       /* unused; keeps the prefix identical */
+    uint32_t partition_id;
+    uint32_t chunk_index;       /* unused */
+    uint8_t  status;
+    /* ── Service-specific tail ─────────────────────────────────────── */
+    char     service_name[DSPP_CTX_NAME_LEN];
+    uint32_t endpoint_port;
+    uint8_t  endpoint_kind;
+    uint32_t owner_uid;
+    /* SLSServiceServing, as the ANNOUNCING node probed its own endpoint.
+     * Riding the heartbeat rather than being asked for: a cross-node probe
+     * would need a request/response with a timeout, and no blocking wait
+     * is usable from these paths (see this file's own note on
+     * net_event.h). One byte and no extra round trip. */
+    uint8_t  serving;
+} __attribute__((packed));
+
+void dspp_service_announce(const char* name, uint32_t partition_id,
+                           uint8_t endpoint_kind, uint32_t endpoint_port,
+                           uint32_t owner_uid, uint8_t serving);
+void dspp_service_withdraw(const char* name);
+void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len);
+
 /* Wraps dspp_len bytes at dspp_payload in a broadcast Ethernet frame
  * (ethertype ETHERTYPE_DSPP, net/net.h) and transmits it -- the one real
  * framing helper every DSPP send site (old and new) now goes through

@@ -1,4 +1,5 @@
 #include "microkernel.h"
+#include "workload.h"
 #include "ipc.h"
 #include "object_catalog.h"
 #include "transaction.h"
@@ -280,6 +281,14 @@ void microkernel_service_poll(void) {
 
     // Periodic tier evaluation: promote hot objects, demote cold ones
     tier_mgr_tick();
+    // Orchestration Plan Phase 5: converge declared workloads toward their
+    // desired state. Runs HERE, on the AP core, because this is the only
+    // loop that reliably ticks -- the BSP's is http_server_run(), entered
+    // only when a NIC exists, and it otherwise blocks in the shell's
+    // read_line(). reconcile_tick() therefore performs only non-persisting
+    // actions itself and queues the rest for the BSP; it must never be
+    // changed to call persist_*() directly. See kernel/workload.h.
+    reconcile_tick();
     // Multitenant Isolation Gap Analysis §5 item 6: sample per-partition usage
     usage_metering_tick();
     // (E) Fire any scheduled agent runs
@@ -457,4 +466,13 @@ void mk_post_agent_kill(const char* name) {
         .payload  = { (uint64_t)(uintptr_t)name, 0, 0, 0 }
     };
     ipc_post(IPC_PORT_AGENTMGR, &m);
+}
+
+int mk_ipc_port_state(uint16_t port) {
+    for (uint32_t i = 0; i < service_count && i < MAX_SERVICES; i++) {
+        if (!services[i].active) continue;
+        if (services[i].port != port) continue;
+        return (int)services[i].state;
+    }
+    return -1;   /* not a supervised service port -- honestly unknown */
 }

@@ -39,6 +39,73 @@ static uint64_t partition_frame_quota[PARTITION_MAX];
  * on partition_reclaim_all_frames() for the full design writeup. */
 static uint8_t frame_owner[TOTAL_FRAMES];
 
+/* ─── Boot-time reservation ───────────────────────────────────────────
+ * See frame_pool.h for the full account of what went wrong without this. */
+
+/* Provided by arch/x86/linker.ld. Its ADDRESS is the end of the loaded
+ * image; the object itself is never read, which is why it is declared as
+ * an array (taking &x of a zero-sized extern is the portable idiom). */
+extern char _kernel_image_end[];
+
+static uint64_t frames_reserved = 0;
+
+static void fp_mark_used(uint64_t frame_index) {
+    if (frame_index >= TOTAL_FRAMES) return;
+    uint64_t word = frame_index / 64, bit = frame_index % 64;
+    if (physical_memory_bitmap[word] & (1ULL << bit)) return;   /* already */
+    physical_memory_bitmap[word] |= (1ULL << bit);
+    frames_reserved++;
+}
+
+void frame_pool_reserve_below(uint64_t end_addr) {
+    /* Round UP: a partially-occupied final frame is still occupied. */
+    uint64_t last = (end_addr + FRAME_SIZE - 1) / FRAME_SIZE;
+    if (last > TOTAL_FRAMES) last = TOTAL_FRAMES;
+    for (uint64_t f = 0; f < last; f++) fp_mark_used(f);
+}
+
+void frame_pool_init(void) {
+    uint64_t end = (uint64_t)(uintptr_t)_kernel_image_end;
+    frame_pool_reserve_below(end);
+    kernel_serial_printf(
+        "[FRAME] reserved %llu frames (%llu MiB) below the kernel image end "
+        "0x%llx -- allocator now starts above the kernel.\n",
+        (unsigned long long)frames_reserved,
+        (unsigned long long)((frames_reserved * FRAME_SIZE) >> 20),
+        (unsigned long long)end);
+}
+
+void frame_pool_limit_ram(uint64_t top_addr) {
+    if (top_addr == 0) {
+        kernel_serial_print("[FRAME] no usable-RAM top reported -- pool left at its "
+                            "compile-time 4 GiB span (see frame_pool.h).\n");
+        return;
+    }
+    uint64_t first_absent = top_addr / FRAME_SIZE;   /* round DOWN: a partial frame at the top is not usable */
+    if (first_absent >= TOTAL_FRAMES) return;        /* machine has at least as much RAM as we track */
+
+    uint64_t before = frames_reserved;
+    for (uint64_t f = first_absent; f < TOTAL_FRAMES; f++) fp_mark_used(f);
+    kernel_serial_printf(
+        "[FRAME] reserved %llu frames above 0x%llx -- that memory does not exist.\n",
+        (unsigned long long)(frames_reserved - before),
+        (unsigned long long)top_addr);
+}
+
+uint64_t frame_pool_reserved_count(void) { return frames_reserved; }
+
+int frame_pool_is_reserved(uint64_t frame_index) {
+    if (frame_index >= TOTAL_FRAMES) return 1;   /* outside the pool: never allocatable */
+    return (physical_memory_bitmap[frame_index / 64] >> (frame_index % 64)) & 1ULL;
+}
+
+void frame_pool_reset(void) {
+    for (size_t i = 0; i < (TOTAL_FRAMES / 64); i++) physical_memory_bitmap[i] = 0;
+    for (size_t i = 0; i < TOTAL_FRAMES; i++) frame_owner[i] = 0;
+    frames_reserved = 0;
+}
+
+
 static void *alloc_raw_frame(void)
 {
     // Start at frame 1 (skip frame 0: address 0x0 == NULL in C)

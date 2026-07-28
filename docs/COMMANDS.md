@@ -568,6 +568,39 @@ REST equivalents: `GET /api/services`, `GET /api/service/resolve/<name>`, `POST 
 
 ---
 
+### Declarative Workloads & Reconciler (Orchestration Plan Phase 5)
+
+Declare desired state; the kernel converges on it. **The reconciler is OFF at boot** — including after a reboot that restores declarations — and must be switched on deliberately. It reconciles exactly four conditions and logs every action.
+
+A partition runs if **any** active workload in it wants to run (union semantics), so two workloads sharing a partition with opposite desired states do not fight. Each workload's own declared service is reconciled independently.
+
+| Command | Description |
+| --- | --- |
+| `workload declare <name> <partition_id> <running\|stopped> [svc <name> <ipc\|tcp> <port>]` | Declare, or update in place. The `svc …` clause is optional; a workload may declare no service |
+| `workload delete <name>` | Remove a declaration |
+| `workload list` | Declarations, per-entry action counts and converged flags, plus reconciler state and intent-queue depth/drops |
+| `reconcile on` / `reconcile off` | Enable or disable autonomous convergence |
+| `context list` | Live execution contexts: pc, retired steps, status |
+| `context step <budget>` | Advance every live context by up to `<budget>` instructions |
+
+Add `prog <object> [entry]` to a declaration to make the workload a **running computation**: `workload declare job 3 running prog loopsum main`. The reconciler then instantiates the uploaded SIMI program as a live context and registers it for migration — which is what makes `partition migrate` move real work rather than only data.
+
+REST equivalents: `GET /api/workloads`, `POST /api/workload`, `POST /api/reconcile` (`{"enabled":"true"}`), all DB_ADMIN-gated except the GET.
+
+**Service discovery is cluster-wide.** Registering announces the name over DSPP; other nodes cache it and can resolve it. A local registration always outranks a cached remote one, and cached entries are never persisted (a stale cache restored from disk would resurrect services that moved while this node was down).
+
+**Cached entries expire.** Each node re-announces what it owns every ~5 s. A remote entry reports `fresh` (< 2 heartbeats), `stale` (overdue but **still resolving** — a warning) or `expired` (≥ ~20 s, stops resolving). Local registrations never age.
+
+**Endpoints are probed, and that is reported separately.** `health` says whether the *information* is current; `serving` says whether the *endpoint* is accepting — `up`, `down`, or `unknown`. They are independent: `stale + up` means "the last thing we heard was good, but we haven't heard lately"; `fresh + down` means "we know, and it's broken". Each node probes only its own endpoints (a TCP port must have a LISTEN socket; an IPC port is judged by the microkernel watchdog, where DEGRADED counts as down) and ships the verdict on its heartbeat. A `down` service still resolves — the registry reports rather than hides.
+
+`service resolve` shows all of it: `'api' -> partition 3, node 2, tcp port 8080 (remote, fresh, endpoint up)`.
+
+**Not covered:** a process alive and holding its port but with a wedged handler reports `up`. That needs an application-level probe, which does not exist.
+
+**Operational note:** the reconciler sweeps on the AP core and queues anything that writes to disk for the BSP, which drains it in the HTTP server loop and on every shell command. On a boot with **no NIC** the HTTP loop never runs, so queued work applies only when an operator types a command — convergence is not autonomous in that configuration.
+
+---
+
 ### Network & Disk Status (Navigator-Parity Gap Roadmap Phase 5c, Storage Isolation Roadmap)
 
 

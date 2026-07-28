@@ -50,6 +50,7 @@
 #include "kernel/persist.h"
 #include "user/permissions.h"
 #include "kernel/service_registry.h"
+#include "kernel/workload.h"
 #include "kernel/tenant.h"      // Multitenant Isolation Gap Analysis §5 item 1 -- persist.c now references tenants[]/tenant_next_id; this test doesn't exercise tenant_create() itself so the bare storage (not kernel/tenant.c's functions) is enough to satisfy the linker,
 // the same "declare the extern array directly" convention this file already uses for object_catalog[] etc. above.
 struct SLSTenantEntry tenants[TENANT_MAX];
@@ -58,6 +59,15 @@ uint32_t              tenant_next_id = 1;
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+/* ─── Orchestration Plan Phase 5: workloads[] ─────────────────────────
+ * kernel/persist.c now snapshots and restores this array too, so every
+ * test linking persist.c must define it. Real and zero-initialised (=
+ * no declarations), which is exactly these tests' situation; persist.c
+ * reads and writes the actual bytes. Reconciler behaviour is covered by
+ * tests/workload_reconcile_host_test.c. */
+struct SLSWorkloadEntry workloads[WORKLOAD_MAX];
+
 
 /* ─── Orchestration Plan Phase 4: services_registry[] ─────────────────
  * kernel/persist.c now snapshots and restores this array, so every test

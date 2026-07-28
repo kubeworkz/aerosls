@@ -42,7 +42,9 @@
 #include "../kernel/authlist.h"       // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/authlists
 #include "../kernel/database.h"       // Database Namespace & Access Roadmap Phase 4 -- GET /api/security/databases
 #include "../kernel/tenant.h"
-#include "../kernel/service_registry.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
+#include "../kernel/service_registry.h"
+#include "../kernel/workload.h"
+#include "../kernel/workload_ctx.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
 #include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
@@ -2430,6 +2432,96 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
 }
 
 
+
+// ─── Orchestration Plan Phase 5: declarative workloads ────────────────────
+// GET /api/workloads, POST /api/workload, POST /api/reconcile
+static int api_workloads_list(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_str (&j, "reconciler", reconcile_is_enabled() ? "on" : "off"); jb_putc(&j, ',');
+    jb_uint(&j, "queue_depth",   reconcile_queue_depth());            jb_putc(&j, ',');
+    jb_uint(&j, "queue_dropped", reconcile_queue_dropped());          jb_putc(&j, ',');
+    jb_arr_open(&j, "workloads");
+    int first = 1;
+    for (uint32_t i = 0; i < WORKLOAD_MAX; i++) {
+        if (!workloads[i].active) continue;
+        struct SLSWorkloadEntry* w = &workloads[i];
+        if (!first) jb_putc(&j, ','); first = 0;
+        jb_obj_open(&j, 0);
+        jb_str (&j, "name", w->name);                                   jb_putc(&j, ',');
+        jb_uint(&j, "partition_id", w->partition_id);                   jb_putc(&j, ',');
+        jb_str (&j, "desired", w->desired_state == WL_DESIRED_RUNNING ? "running" : "stopped");
+        jb_putc(&j, ',');
+        jb_str (&j, "service_name", w->service_name);                   jb_putc(&j, ',');
+        jb_str (&j, "endpoint_kind", w->endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc");
+        jb_putc(&j, ',');
+        jb_uint(&j, "endpoint_port", w->endpoint_port);                 jb_putc(&j, ',');
+        jb_str (&j, "program_name", w->program_name);                   jb_putc(&j, ',');
+        jb_str (&j, "context_live", wlctx_has(w->name) ? "true" : "false"); jb_putc(&j, ',');
+        jb_uint(&j, "actions_taken", w->actions_taken);                 jb_putc(&j, ',');
+        jb_str (&j, "converged", w->converged ? "true" : "false");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_workload_post(const char* body, char* buf, int max,
+                             uint32_t req_uid, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    if (!body) {
+        jb_str(&j,"ok","false"); jb_putc(&j,','); jb_str(&j,"error","missing body");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    char name[WORKLOAD_NAME_LEN]; name[0] = '\0';
+    json_str(body, "name", name, (int)sizeof(name));
+    char desired[16]; desired[0] = '\0';
+    json_str(body, "desired", desired, (int)sizeof(desired));
+    char svc[SERVICE_NAME_LEN]; svc[0] = '\0';
+    json_str(body, "service_name", svc, (int)sizeof(svc));
+    char kind[8]; kind[0] = '\0';
+    json_str(body, "endpoint_kind", kind, (int)sizeof(kind));
+
+    SLSWorkloadDesired d = (desired[0]=='r') ? WL_DESIRED_RUNNING : WL_DESIRED_STOPPED;
+    SLSServiceEndpointKind k = (kind[0]=='i') ? SVC_ENDPOINT_IPC : SVC_ENDPOINT_TCP;
+
+    char prog[WORKLOAD_NAME_LEN]; prog[0] = '\0';
+    json_str(body, "program_name", prog, (int)sizeof(prog));
+    char entry[32]; entry[0] = '\0';
+    json_str(body, "entry_name", entry, (int)sizeof(entry));
+
+    SLSWorkloadStatus rc = workload_declare(req_uid, name,
+                                            (uint32_t)json_int(body, "partition_id"),
+                                            d, svc, k,
+                                            (uint32_t)json_int(body, "endpoint_port"),
+                                            prog, entry);
+    jb_str(&j, "ok", rc == WL_OK ? "true" : "false");
+    if (rc != WL_OK) { jb_putc(&j, ','); jb_str(&j, "error", workload_status_name(rc)); }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+static int api_reconcile_post(const char* body, char* buf, int max, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    char on[8]; on[0] = '\0';
+    if (body) json_str(body, "enabled", on, (int)sizeof(on));
+    reconcile_set_enabled(on[0] == 't' || on[0] == '1');
+    jb_str(&j, "ok", "true"); jb_putc(&j, ',');
+    jb_str(&j, "reconciler", reconcile_is_enabled() ? "on" : "off");
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── Orchestration Plan Phase 4: service registry ─────────────────────────
 // GET /api/services, GET /api/service/resolve?name=..., POST /api/service
 //
@@ -2440,6 +2532,7 @@ static int api_partition_storagequota_post(const char* body, char* buf, int max)
 static int api_services_list(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     jb_obj_open(&j, 0);
+    jb_uint(&j, "remote_cached", service_remote_count()); jb_putc(&j, ',');
     jb_arr_open(&j, "services");
     int first = 1;
     for (uint32_t i = 0; i < SERVICE_MAX; i++) {
@@ -2453,6 +2546,8 @@ static int api_services_list(char* buf, int max) {
         jb_str (&j, "endpoint_kind", e->endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc");
         jb_putc(&j, ',');
         jb_uint(&j, "endpoint_port", e->endpoint_port);              jb_putc(&j, ',');
+        jb_str (&j, "serving", service_serving_name((SLSServiceServing)e->serving));
+        jb_putc(&j, ',');
         jb_uint(&j, "owner_uid", e->owner_uid);
         jb_obj_close(&j);
     }
@@ -2476,7 +2571,10 @@ static int api_service_resolve(const char* name, char* buf, int max) {
         jb_str (&j, "endpoint_kind", loc.endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc");
         jb_putc(&j, ',');
         jb_uint(&j, "endpoint_port", loc.endpoint_port); jb_putc(&j, ',');
-        jb_str (&j, "is_local", loc.is_local ? "true" : "false");
+        jb_str (&j, "is_local", loc.is_local ? "true" : "false");  jb_putc(&j, ',');
+        jb_str (&j, "is_remote", loc.is_remote ? "true" : "false"); jb_putc(&j, ',');
+        jb_str (&j, "health", service_health_name((SLSServiceHealth)loc.health)); jb_putc(&j, ',');
+        jb_str (&j, "serving", service_serving_name((SLSServiceServing)loc.serving));
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -4326,6 +4424,11 @@ static void http_route(int conn, char* req) {
             blen = api_partition_connquotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Orchestration Plan Phase 5: GET /api/workloads ─────────────────────
+        if (!strcmp(path, "/api/workloads")) {
+            blen = api_workloads_list(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Orchestration Plan Phase 4: GET /api/services ──────────────────────
         if (!strcmp(path, "/api/services")) {
             blen = api_services_list(resp_body, (int)sizeof(resp_body));
@@ -5004,6 +5107,15 @@ static void http_route(int conn, char* req) {
             blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── Orchestration Plan Phase 5: POST /api/workload, /api/reconcile ─────
+        if (!strcmp(path, "/api/workload")) {
+            blen = api_workload_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid, req_role);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/reconcile")) {
+            blen = api_reconcile_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
         // ── Orchestration Plan Phase 4: POST /api/service ──────────────────────
         if (!strcmp(path, "/api/service")) {
             blen = api_service_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid, req_role);
@@ -5400,6 +5512,30 @@ void http_server_run(void) {
                 hc->attributed = 0;
             }
         }
+
+        // Orchestration Plan Phase 5: apply anything the AP-core reconciler
+        // queued. This is the BSP, so persist_*() is safe here and is
+        // exactly why the queue exists (kernel/workload.h).
+        if (reconcile_drain()) did_work = 1;
+        /* Advance live execution contexts. BSP only -- the interpreter's
+         * RESOLVE/OBJSIZE opcodes read the object catalog, which the AP
+         * core must not race (kernel/workload_ctx.h). Small budget: this
+         * shares the loop with request service. */
+        if (wlctx_step_all(2000)) did_work = 1;
+
+        /* Registry replication upkeep, BSP-side.
+         *
+         * The heartbeat TRANSMITS, so it must live here and not in the
+         * AP-core sweep: the NIC TX path is not safe to drive from two
+         * cores at once, and this loop already owns it.
+         *
+         * The expiry pass is pure memory and could run anywhere; it is
+         * here purely to keep both halves of the same mechanism in one
+         * place. It only reclaims slots -- service_resolve() checks
+         * freshness itself, so an entry past TTL stops resolving whether
+         * or not this ever runs. */
+        service_heartbeat_tick(kernel_tick_counter);
+        service_remote_expire(kernel_tick_counter);
 
         // Nothing needed attention anywhere this sweep -- halt until the
         // next timer tick instead of busy-spinning (same idiom tcp_accept()/

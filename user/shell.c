@@ -39,7 +39,9 @@
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
 #include "../net/consensus.h"
-#include "../kernel/service_registry.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
+#include "../kernel/service_registry.h"
+#include "../kernel/workload.h"
+#include "../kernel/workload_ctx.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -362,6 +364,12 @@ static void print_help(void) {
         "  service unregister <name>                 remove a registration\n"
         "  service resolve <name>                    name -> partition/node/endpoint\n"
         "  service list                              print every registration to serial\n"
+        "  workload declare <name> <pid> <running|stopped> [svc <name> <ipc|tcp> <port>]  declare desired state\n"
+        "  workload delete <name>                    remove a declaration\n"
+        "  workload list                             print declarations + reconciler state\n"
+        "  reconcile on|off                          enable/disable autonomous convergence (OFF at boot)\n"
+        "  context list                              live execution contexts (pc/steps/status)\n"
+        "  context step <budget>                     advance every live context by up to <budget> instructions\n"
         "  write  <name> <payload>        direct heap write (no tx, legacy)\n"
         "  seal   <name> <password>      derive+store a password-based key for an\n"
         "                                   object (does NOT encrypt its data -- see\n"
@@ -430,6 +438,12 @@ static int shell_index_scan_cb(const char* k, const char* v) {
 int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                       char* out_buf, size_t out_cap) {
     int recognized = 1;
+    // Orchestration Plan Phase 5: the shell runs on the BSP, so this is a
+    // safe place to apply queued reconciler intents. It is the ONLY drain
+    // point on a NIC-less boot, where http_server_run() never runs -- see
+    // kernel/workload.h's stated limitation.
+    reconcile_drain();
+
     kernel_serial_capture_start(out_buf, out_cap);
 
     // Architectural Phase 2: local copies of what used to be file-scope
@@ -1290,10 +1304,13 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint64_t rc = do_syscall(SYS_SLS_SERVICE_RESOLVE, &req);
             if (rc == SVC_REG_OK) {
                 kernel_serial_printf(
-                    "[SERVICE] '%s' -> partition %u, node %u, %s port %u%s\n",
+                    "[SERVICE] '%s' -> partition %u, node %u, %s port %u (%s, %s, endpoint %s)\n",
                     loc.name, (unsigned)loc.partition_id, (unsigned)loc.node_id,
                     loc.endpoint_kind == SVC_ENDPOINT_TCP ? "tcp" : "ipc",
-                    (unsigned)loc.endpoint_port, loc.is_local ? " (local)" : " (remote)");
+                    (unsigned)loc.endpoint_port,
+                    loc.is_local ? "local" : "remote",
+                    service_health_name((SLSServiceHealth)loc.health),
+                    service_serving_name((SLSServiceServing)loc.serving));
             } else {
                 kernel_serial_printf("[SERVICE] resolve '%s' -> %s\n", req.name,
                                      service_status_name((SLSServiceStatus)rc));
@@ -1301,6 +1318,78 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
         else if (sh_eq(input_buffer, "service list")) {
             do_syscall(SYS_SLS_SERVICE_LIST, 0);
+        }
+
+        // ── Orchestration Plan Phase 5: declarative workloads ───────────
+        else if (sh_starts(input_buffer, "workload declare ")) {
+            struct SLSWorkloadDeclareRequest req;
+            const char* p = input_buffer + 17;
+            char nametok[WORKLOAD_NAME_LEN], pidtok[16], statetok[16];
+            p = sh_token(p, nametok,  sizeof(nametok));
+            p = sh_token(p, pidtok,   sizeof(pidtok));
+            p = sh_token(p, statetok, sizeof(statetok));
+            for (int i = 0; i < WORKLOAD_NAME_LEN; i++) req.name[i] = nametok[i];
+            req.caller_uid    = 0;
+            req.partition_id  = sh_atoi(pidtok);
+            req.desired_state = sh_eq(statetok, "running") ? WL_DESIRED_RUNNING : WL_DESIRED_STOPPED;
+            req.service_name[0] = '\0';
+            req.endpoint_kind   = SVC_ENDPOINT_TCP;
+            req.endpoint_port   = 0;
+            req.program_name[0] = '\0';
+            req.entry_name[0]   = '\0';
+            /* Optional trailing "svc <name> <ipc|tcp> <port>". */
+            char kw[8];
+            p = sh_token(p, kw, sizeof(kw));
+            if (sh_eq(kw, "svc")) {
+                char svctok[SERVICE_NAME_LEN], kindtok[8], porttok[16];
+                p = sh_token(p, svctok,  sizeof(svctok));
+                p = sh_token(p, kindtok, sizeof(kindtok));
+                sh_token(p, porttok, sizeof(porttok));
+                for (int i = 0; i < SERVICE_NAME_LEN; i++) req.service_name[i] = svctok[i];
+                req.endpoint_kind = sh_eq(kindtok, "ipc") ? SVC_ENDPOINT_IPC : SVC_ENDPOINT_TCP;
+                req.endpoint_port = sh_atoi(porttok);
+                p = sh_token(p, kw, sizeof(kw));
+            }
+            /* Optional trailing "prog <object> [entry]". This is what makes
+             * the workload a RUNNING COMPUTATION rather than just a
+             * partition + service -- and therefore migratable. */
+            if (sh_eq(kw, "prog")) {
+                char progtok[WORKLOAD_NAME_LEN], entrytok[32];
+                p = sh_token(p, progtok, sizeof(progtok));
+                sh_token(p, entrytok, sizeof(entrytok));
+                for (int i = 0; i < WORKLOAD_NAME_LEN; i++) req.program_name[i] = progtok[i];
+                for (int i = 0; i < 32; i++) req.entry_name[i] = entrytok[i];
+            }
+            uint64_t rc = do_syscall(SYS_SLS_WORKLOAD_DECLARE, &req);
+            kernel_serial_printf("[WORKLOAD] declare '%s' -> %s\n", req.name,
+                                 workload_status_name((SLSWorkloadStatus)rc));
+        }
+        else if (sh_starts(input_buffer, "workload delete ")) {
+            struct SLSWorkloadDeclareRequest req;
+            char nametok[WORKLOAD_NAME_LEN];
+            sh_token(input_buffer + 16, nametok, sizeof(nametok));
+            for (int i = 0; i < WORKLOAD_NAME_LEN; i++) req.name[i] = nametok[i];
+            req.caller_uid = 0;
+            uint64_t rc = do_syscall(SYS_SLS_WORKLOAD_DELETE, &req);
+            kernel_serial_printf("[WORKLOAD] delete '%s' -> %s\n", req.name,
+                                 workload_status_name((SLSWorkloadStatus)rc));
+        }
+        else if (sh_eq(input_buffer, "workload list")) {
+            do_syscall(SYS_SLS_WORKLOAD_LIST, 0);
+        }
+        else if (sh_eq(input_buffer, "context list")) {
+            wlctx_list();
+        }
+        else if (sh_starts(input_buffer, "context step ")) {
+            uint64_t budget = (uint64_t)sh_atoi(input_buffer + 13);
+            if (budget == 0) budget = 1000;
+            uint32_t n = wlctx_step_all(budget);
+            kernel_serial_printf("[WLCTX] stepped %u context(s) by up to %llu instructions.\n",
+                                 n, (unsigned long long)budget);
+        }
+        else if (sh_eq(input_buffer, "reconcile on") || sh_eq(input_buffer, "reconcile off")) {
+            uint32_t on = sh_eq(input_buffer, "reconcile on") ? 1u : 0u;
+            do_syscall(SYS_SLS_RECONCILE_ENABLE, (void*)(uintptr_t)on);
         }
         else if (sh_starts(input_buffer, "partition quota ")) {
             struct SLSPartitionQuotaSetRequest req;

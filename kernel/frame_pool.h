@@ -46,6 +46,61 @@
 
 #define FRAME_SIZE 4096
 
+/* ─── Boot-time reservation ───────────────────────────────────────────
+ * MUST be called before the first allocation. Without it the allocator
+ * hands out the kernel's own memory.
+ *
+ * physical_memory_bitmap[] lives in .bss, so it boots all-zero == every
+ * frame free -- including the frames the kernel itself occupies. Nothing
+ * reserved them, and alloc_raw_frame() starts at physical frame 1 and
+ * walks upward, so allocation #256 returned 0x100000: the kernel's own
+ * .text. Paging is an identity map for 0-4 GiB, so the caller then wrote
+ * through that pointer straight into the running image.
+ *
+ * This was found by linking the whole kernel image for the first time and
+ * comparing where it ends (~119.5 MiB, dominated by 117 MiB of .bss)
+ * against where the allocator starts (frame 1).
+ *
+ * What gets reserved, and why it is one contiguous span rather than a
+ * careful map of holes:
+ *
+ *   frame 0            0x00000000  NULL -- already skipped, now explicit
+ *   0x1000  - 0x9FFFF  conventional RAM below the VGA hole
+ *   0xA0000 - 0xBFFFF  VGA framebuffer; 0xB8000 is the text buffer vga.c writes to
+ *   0xC0000 - 0xFFFFF  BIOS ROM shadow -- not RAM at all
+ *   0x100000- _end     the kernel image itself
+ *
+ * Only the first 640 KiB of that is genuinely usable RAM being given up.
+ * Reserving it costs 0.5% of a 128 MiB machine and removes every question
+ * about which parts of low memory are safe -- a trade this kernel can
+ * afford and a distinction it has no reason to want to get right. */
+void frame_pool_init(void);
+
+/* The testable primitive frame_pool_init() is a wrapper over: reserve
+ * every frame below `end_addr`. Split out because the linker symbol has
+ * no address a host test can choose, and an untestable boot-path
+ * reservation is exactly the kind of thing that was wrong here in the
+ * first place. Idempotent. */
+void frame_pool_reserve_below(uint64_t end_addr);
+
+/* Marks every frame at or above `top_addr` as used, so the allocator
+ * never hands out memory the machine does not have. Call after reading
+ * the multiboot memory map. Passing 0 means "unknown" and is a no-op --
+ * the bitmap already spans a fixed 4 GiB regardless of real RAM, so
+ * without this a 512 MiB machine would happily be handed a page at 3 GiB. */
+void frame_pool_limit_ram(uint64_t top_addr);
+
+/* Introspection for the boot log and the host test. */
+uint64_t frame_pool_reserved_count(void);
+int      frame_pool_is_reserved(uint64_t frame_index);
+
+/* Clears the bitmap back to its boot state (every frame free, nothing
+ * reserved). Exists for the host test, which has to reproduce the
+ * UNRESERVED allocator as a negative control -- without being able to
+ * show the bug, "it is fixed now" would be unfalsifiable. Not called
+ * from any kernel path. */
+void     frame_pool_reset(void);
+
 /* Unaccounted allocation path — see the header comment above for exactly
  * which subsystems stay on this path and why. Never quota-checked; can
  * still return 0 on genuine physical OOM. */

@@ -51,12 +51,22 @@
 #include "kernel/vec_index.h"
 #include "kernel/tenant.h"
 #include "kernel/service_registry.h"
+#include "kernel/workload.h"
 #include "kernel/database.h"
 #include "kernel/view.h"
 #include "kernel/stream.h"
 #include "kernel/persist.h"
 #include <stdio.h>
 #include <stdint.h>
+
+/* ─── Orchestration Plan Phase 5: workloads[] ─────────────────────────
+ * kernel/persist.c now snapshots and restores this array too, so every
+ * test linking persist.c must define it. Real and zero-initialised (=
+ * no declarations), which is exactly these tests' situation; persist.c
+ * reads and writes the actual bytes. Reconciler behaviour is covered by
+ * tests/workload_reconcile_host_test.c. */
+struct SLSWorkloadEntry workloads[WORKLOAD_MAX];
+
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -143,6 +153,9 @@ static struct Region regions[] = {
     { "services", 1, {
         HDR("services", PERSIST_SERVICE_HDR_LBA),
         ARR("services_registry", PERSIST_SERVICE_ENT_LBA, services_registry) }, 2 },
+    { "workloads", 1, {
+        HDR("workloads", PERSIST_WORKLOAD_HDR_LBA),
+        ARR("workloads", PERSIST_WORKLOAD_ENT_LBA, workloads) }, 2 },
 };
 #define NREGIONS ((int)(sizeof(regions)/sizeof(regions[0])))
 

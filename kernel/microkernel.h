@@ -52,6 +52,15 @@ extern uint32_t                 service_count;
 void     microkernel_init(void);
 void     microkernel_service_poll(void);
 
+/* State of the service owning IPC `port` (service-registry endpoint
+ * liveness). Returns SVC_STATE_ONLINE / _DEGRADED / _CRASHED, or -1 if no
+ * supervised service owns that port.
+ *
+ * This is the strongest liveness signal in the kernel: the watchdog in
+ * microkernel_service_poll() maintains it from real crash/restart events,
+ * so for an IPC endpoint the answer is observed, not guessed. */
+int      mk_ipc_port_state(uint16_t port);
+
 // Syscall handlers
 void     sys_sls_svc_list(void);
 uint64_t sys_sls_svc_crash(const char* name);
