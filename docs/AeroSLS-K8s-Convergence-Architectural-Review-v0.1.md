@@ -82,9 +82,15 @@ This is the most interesting concept in the new docs and the one with the strong
 
 AeroSLS already has the *state* half: partitions pause/resume, objects and streams persist, and a migrating partition's data physically moves. What it lacks is the *continuation* half — resuming a computation mid-instruction.
 
-The doc reaches for `ucontext`/`setjmp`, which cannot work in the kernel. But AeroSLS has something better suited that the doc does not mention: **SIMI**, its own bytecode ISA, already in the tree (`kernel/simi_runtime.c`, `simi_translate.c`, `simi_x86.c`, `simi_riscv.c`) and syscall-reachable via `SYS_SLS_SIMI_INFO`. A bytecode interpreter has an explicit, serialisable program counter and operand stack — checkpointing one is tractable in a way that checkpointing native x86-64 with `ucontext` is not.
+The doc reaches for `ucontext`/`setjmp`, which cannot work in the kernel. But AeroSLS has something better suited that the doc does not mention: **SIMI**, its own bytecode ISA, already in the tree (`kernel/simi_runtime.c`, `simi_translate.c`, `simi_x86.c`, `simi_riscv.c`) and syscall-reachable via `SYS_SLS_SIMI_INFO`.
 
-**Recommendation:** keep the concept, re-target it onto SIMI, and drop the `ucontext` approach. This is a research-grade capability and genuinely differentiating; it is also a large project and should not be started before §3.1.
+> **Correction (added after reading the runtime).** The sentence originally here — *"a bytecode interpreter has an explicit, serialisable program counter, so checkpointing one is tractable"* — needs splitting in two. The **ISA** does have such a model, and a working reference interpreter exists at `tools/simi/simi_interp.c`. But the **kernel does not interpret SIMI**: `simi_translate.c` AOT-translates to native x86-64 and enters it at a RIP, and `simi_runtime.c` is three callback helpers, not a VM. Checkpointing the path SIMI runs on in-kernel today is therefore exactly as hard as checkpointing any native code.
+>
+> The recommendation survives, but the work is larger than implied: the reference interpreter must be **ported into the kernel as a second, checkpointable execution mode** alongside translation. That is a bounded job — 499 lines, 31 opcodes, and its only libc uses are `fprintf`/`strcmp` — and the interpreter's state (`pc` as an array index, a plain-integer register file, an explicit frame array, flat memory) is genuinely textbook-serialisable. A typical checkpoint computes to ~100 KiB, which is one NVMe command given the multi-page transfer work already done.
+>
+> Full analysis and phased plan: `AeroSLS-Orchestration-Implementation-Plan-v0.1.md`.
+
+**Recommendation:** keep the concept, re-target it onto SIMI, and drop the `ucontext` approach. This is a research-grade capability and genuinely differentiating; it is also a large project and should not be started before §3.1 — **except** that §3.1 and the PEC track are independent, so they can proceed in parallel if there is appetite for both.
 
 ### 3.3 Service mesh — the substrate exists, the implementation does not transfer
 
