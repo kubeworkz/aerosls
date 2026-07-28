@@ -441,14 +441,38 @@ The reservation logic is split into `frame_pool_reserve_below(end_addr)` so it c
 
 **Since resolved:** a clean image boot was subsequently confirmed on a production server. That retires the ceiling every phase above had been carrying — the full toolchain link (including the `.asm` objects), the 117 MiB `.bss`, and the frame-pool reservation are all now observed working on real hardware, not merely host-verified. The host-only caveats in the earlier Findings sections predate that and should be read in this light.
 
+### Phase 7 — Self-healing restarts — **DONE**
+
+> **Built and passing.** `kernel/workload.{c,h}` restart policy + backoff, `kernel/workload_ctx.{c,h}` restart primitive, `tests/workload_restart_host_test.c` (44 checks). Full regression 76/76.
+
+Not in the original plan — the plan ended at Phase 6. This was added because Phase 6 finished the one thing restarts were waiting on, and because a reconciler that converges *configuration* but cannot fix a *broken* workload is only half of what "declarative" means to an operator.
+
+**A correction to what Phase 5 claimed.** Phase 5 closed with "no restarts ... all need a liveness signal that does not exist for workloads." That was too broad. A CONTEXT's liveness signal — its `SimiStatus` — existed from Phase 1; context restarts could have been built then. What genuinely did not exist was liveness for a SERVICE endpoint, which Phase 6 added. The blanket claim covered both and was only true of one.
+
+**The distinction the phase turns on: HALTED is not failure.** A context that returned from its top-level frame *finished*. Restarting it turns a batch job into an infinite loop — and nothing observable can decide whether that is wrong, because it depends entirely on what the operator meant. So the operator says, via a restart policy:
+
+| Policy | TRAP_* | HALTED |
+| --- | --- | --- |
+| `never` (default) | leave it | leave it |
+| `on-failure` | restart | **leave it — completion** |
+| `always` | restart | restart — a service should not return |
+
+`never` is the default, so every declaration written before this phase behaves exactly as it did, and the first thing the kernel does autonomously on a user's behalf stays opt-in — the same posture the reconciler itself takes. An out-of-range policy value clamps to `never` rather than being trusted: a caller that got this wrong must not thereby opt into autonomous restarts.
+
+**The hazard, and its bound.** A crash-looping workload must not be able to burn the machine. Attempts are spaced by exponential backoff (~1 s doubling to a ~30 s cap) and stop entirely after 10, at which point the workload is marked given-up and the decision is announced **once** — re-logging it every sweep for the rest of uptime would bury every other console message. An operator re-arms it with `workload retry`, or by re-declaring, and neither erases the lifetime restart count. A stable run longer than the reset window returns the budget, so a workload that fails once a month never exhausts its ten attempts.
+
+**Two things the tests found.** The backoff was off by one doubling — the first retry waited 2× base instead of base, delaying every recovery from a transient for no reason; fixed in the code, not the expectation. And mutation testing found three holes in the test itself: the backoff's *growth* was invisible because every check advanced the clock by the maximum; an out-of-range policy was never passed; and the give-up flag was behaviourally identical to the attempt count, so ignoring it survived — the flag's real job is suppressing repeat announcements, which the test now observes by counting log lines. All nine mutations are caught.
+
+**Not done:** restarts are driven by context terminal state only. Breaker state is *reported* on the workload but does not trigger a restart, because the causal link between a workload's context and its service endpoint is assumed rather than verified — a breaker open on a TCP endpoint the context has nothing to do with would make restarting it destructive rather than corrective. Nothing restarts a service that has no context; for the five internal services the microkernel watchdog already does that, and for anything else there is no process this kernel owns to restart.
+
 ## 5. Sequencing
 
 ```
 Phase 1 (interpreter) ─→ Phase 2 (checkpoint) ─→ Phase 3 (live migration)  ← the differentiator
    DONE                     DONE                    DONE
                                                           │
-Phase 4 (registry) ───────────────────────────────────────┴─→ Phase 5 (workloads) ─→ Phase 6 (mesh)
-   DONE                                                          DONE
+Phase 4 (registry) ───────────────────────────────────────┴─→ Phase 5 (workloads) ─→ Phase 6 (mesh) ─→ Phase 7 (self-healing)
+   DONE                                                          DONE                    DONE              DONE
 ```
 
 Phases 1–3 are the research bet; 4–6 are the orchestration surface. They are independent, so if PEC stalls the platform work continues.

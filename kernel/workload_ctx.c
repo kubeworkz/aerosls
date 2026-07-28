@@ -44,6 +44,7 @@ const char* wlctx_status_name(WLCtxStatus s) {
 struct WLCtxSlot {
     uint8_t  active;
     char     workload[WLCTX_NAME_LEN];
+    char     entry[32];           /* remembered so wlctx_restart() can re-enter it */
     uint32_t partition_id;
 
     struct SimiContext ctx;
@@ -79,6 +80,11 @@ uint32_t wlctx_count(void) {
 struct SimiContext* wlctx_get(const char* workload) {
     struct WLCtxSlot* s = wc_find(workload);
     return s ? &s->ctx : 0;
+}
+
+int wlctx_status_of(const char* workload) {
+    struct WLCtxSlot* s = wc_find(workload);
+    return s ? (int)s->ctx.status : -1;
 }
 
 /* ─── .tmo parse ──────────────────────────────────────────────────────
@@ -158,6 +164,7 @@ WLCtxStatus wlctx_start(const char* workload, const uint8_t* image,
         return WLCTX_ERR_NO_ENTRY;
 
     wc_strcpy(s->workload, workload, WLCTX_NAME_LEN);
+    wc_strcpy(s->entry, entry ? entry : "main", (int)sizeof(s->entry));
     s->partition_id = partition_id;
     s->active       = 1;
 
@@ -182,6 +189,25 @@ WLCtxStatus wlctx_stop(const char* workload) {
     simi_ctx_unregister(&s->ctx);
     s->active = 0;
     kernel_serial_printf("[WLCTX] '%s' stopped.\n", workload);
+    return WLCTX_OK;
+}
+
+WLCtxStatus wlctx_restart(const char* workload) {
+    struct WLCtxSlot* s = wc_find(workload);
+    if (!s) return WLCTX_ERR_NOT_FOUND;
+
+    /* Re-enter the SAME already-parsed image rather than re-reading and
+     * re-parsing the .tmo. The image is immutable and still in this slot;
+     * re-parsing would be slower, could fail on a binary that has since
+     * been overwritten, and would lose the registration this slot already
+     * holds. simi_interp_init() zeroes every field of the context, so
+     * nothing survives from the failed run. */
+    if (simi_interp_init(&s->ctx, &s->obj, s->entry) != 0) {
+        kernel_serial_printf("[WLCTX] '%s': restart failed -- entry '%s' no longer resolves.\n",
+                             s->workload, s->entry);
+        return WLCTX_ERR_NO_ENTRY;
+    }
+    kernel_serial_printf("[WLCTX] '%s' restarted at entry '%s'.\n", s->workload, s->entry);
     return WLCTX_OK;
 }
 

@@ -76,6 +76,50 @@ typedef enum {
     WL_DESIRED_RUNNING = 1,
 } SLSWorkloadDesired;
 
+/* ─── Restart policy (Phase 7) ────────────────────────────────────────
+ * The distinction this exists to make: **a context that HALTED is not a
+ * context that failed.** It returned from its top-level frame -- it
+ * finished. Restarting it turns a batch job into an infinite loop, and no
+ * amount of health signalling can tell you whether that is wrong, because
+ * it depends entirely on what the operator meant. So the operator says.
+ *
+ * A correction to what Phase 5 claimed, while we are here. Phase 5 closed
+ * with "no restarts ... all need a liveness signal that does not exist for
+ * workloads." That was too broad. A CONTEXT's liveness signal -- its
+ * SimiStatus -- existed from Phase 1; restarts for context-backed
+ * workloads could have been built then. What genuinely did not exist was
+ * liveness for a SERVICE endpoint, which Phase 6 added. The blanket claim
+ * covered both and was only true of one.
+ *
+ * NEVER is the default, so every declaration written before this phase
+ * keeps its exact previous behaviour, and so the first thing this kernel
+ * does autonomously on a user's behalf is opt-in -- the same posture the
+ * reconciler itself takes. */
+typedef enum {
+    WL_RESTART_NEVER      = 0,  /* terminal is terminal; the operator decides */
+    WL_RESTART_ON_FAILURE = 1,  /* restart on TRAP_*; a clean HALT is completion */
+    WL_RESTART_ALWAYS     = 2,  /* restart on TRAP_* or HALT -- a service should not return */
+} SLSWorkloadRestartPolicy;
+
+const char* workload_restart_policy_name(SLSWorkloadRestartPolicy p);
+
+/* Give up after this many restarts. A crash-looping workload must not be
+ * able to burn the machine indefinitely, and something that has failed
+ * ten times in a row needs a human, not an eleventh attempt. */
+#define WL_RESTART_MAX_ATTEMPTS 10
+
+/* Exponential backoff between attempts: ~1 s doubling to a ~30 s cap at
+ * the ~100 Hz kernel tick. Without a delay a tight crash loop restarts as
+ * fast as the sweep runs. */
+#define WL_BACKOFF_BASE_TICKS   100u
+#define WL_BACKOFF_MAX_TICKS    3000u
+
+/* Run this long without going terminal and the backoff -- and the attempt
+ * count -- reset. Otherwise a workload that fails once a week would
+ * eventually exhaust its ten attempts and give up on a system that is
+ * essentially healthy. */
+#define WL_STABLE_RESET_TICKS   6000u
+
 struct SLSWorkloadEntry {
     char     name[WORKLOAD_NAME_LEN];
     uint32_t partition_id;
@@ -97,7 +141,15 @@ struct SLSWorkloadEntry {
     char     entry_name[32];
 
     uint8_t  desired_state;      /* SLSWorkloadDesired */
+    uint8_t  restart_policy;     /* SLSWorkloadRestartPolicy */
     uint8_t  active;
+
+    /* ── Restart bookkeeping (Phase 7) ── */
+    uint32_t restart_count;      /* attempts since the last stable period */
+    uint32_t restarts_total;     /* lifetime, never reset -- the operator's record */
+    uint64_t last_restart_tick;
+    uint64_t started_tick;       /* when the current context was (re)started */
+    uint8_t  gave_up;            /* hit WL_RESTART_MAX_ATTEMPTS; no longer retried */
 
     /* Observed, for operator visibility. Not part of desired state.
      *
@@ -138,7 +190,8 @@ SLSWorkloadStatus workload_declare(uint32_t caller_uid, const char* name,
                                    SLSServiceEndpointKind kind,
                                    uint32_t endpoint_port,
                                    const char* program_name,
-                                   const char* entry_name);
+                                   const char* entry_name,
+                                   SLSWorkloadRestartPolicy restart_policy);
 
 SLSWorkloadStatus workload_delete(uint32_t caller_uid, const char* name);
 uint32_t          workload_count(void);
@@ -160,6 +213,11 @@ uint32_t reconcile_tick(void);
 /* Drains queued intents and applies them. MUST be called only from the
  * BSP -- it calls persist_*() by design. Returns intents applied. */
 uint32_t reconcile_drain(void);
+
+/* Clears the give-up flag and the attempt count so a workload the
+ * reconciler abandoned will be tried again. For an operator who has
+ * fixed whatever was crashing it. Returns 0 on success. */
+int workload_clear_giveup(const char* name);
 
 /* Resolves an uploaded program image by object name. Defined in
  * workload.c against loader.c's service_binaries[]; declared here so the
@@ -210,6 +268,7 @@ struct SLSWorkloadDeclareRequest {
     uint32_t endpoint_port;
     char     program_name[WORKLOAD_NAME_LEN];
     char     entry_name[32];
+    uint32_t restart_policy;
 };
 
 #define SYS_SLS_WORKLOAD_DECLARE   285

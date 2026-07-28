@@ -86,6 +86,28 @@ int      wlctx_has(const char* workload);
 uint32_t wlctx_count(void);
 struct SimiContext* wlctx_get(const char* workload);
 
+/* ─── Terminal-state query, for the restart reconciler ────────────────
+ * Returns the context's SimiStatus, or -1 if there is no live context.
+ *
+ * A context is TERMINAL when it is not SIMI_STATUS_OK: it has either
+ * HALTED (returned from its top-level frame) or hit a TRAP_*. The
+ * distinction matters enormously and is NOT made here -- HALTED is a
+ * program that finished, and restarting it would turn a batch job into an
+ * infinite loop. Only the workload's restart policy decides what to do
+ * about each (kernel/workload.h).
+ *
+ * Read from the AP-core reconcile sweep while the BSP may be stepping.
+ * That is a single aligned enum load, so it cannot tear; the worst case
+ * is reading the previous value and acting one sweep later, which is
+ * harmless because the sweep is idempotent and re-runs. Same posture as
+ * wlctx_has(), which the sweep already calls. */
+int wlctx_status_of(const char* workload);
+
+/* Stops and re-creates a context from the same program and entry point,
+ * discarding its execution state. BSP only. Returns WLCTX_OK, or
+ * WLCTX_ERR_NOT_FOUND if there is no such live context. */
+WLCtxStatus wlctx_restart(const char* workload);
+
 /* Advances every live, still-runnable context by at most `budget`
  * instructions. Returns how many were actually stepped.
  *

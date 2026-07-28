@@ -850,7 +850,7 @@ type TraceConfig struct {
 | Drain / cordon | ❌ | ✅ | ✅ **Built** — `partition_pause()` / `_resume()` | `kernel/partition.c` | Done |
 | Cluster membership | ❌ | ✅ | ✅ **Built** — `cluster_init()`, peer roster | `net/consensus.c` | Done |
 | Leader election / leases | ❌ | ✅ | ✅ **Built** — per-partition Raft-lite write leases | `net/consensus.c` | Done |
-| Liveness probe + restart | ⚠️ | ✅ | ✅ **Built** — microkernel watchdog, crash/restart | `kernel/microkernel.c` | Done |
+| Liveness probe + restart | ⚠️ | ✅ | ✅ **Built** — microkernel watchdog for internal services; declarative workloads restart on context trap/halt per policy, with exponential backoff and a give-up limit | `kernel/microkernel.c`, `kernel/workload.c` | Done |
 | Audit logging | ❌ | ✅ | ✅ **Built** | `kernel/security_audit.c` | Done |
 | Secret management | ❌ | ✅ | ✅ **Built** — `sys_sls_secure_seal()` key derivation | `kernel/secure_api.c` | Done |
 | Observability / metrics | ❌ | ✅ Prometheus | ✅ **Built** — per-partition usage metering, `/api/metrics`, disk/network status | `kernel/usage_metering.c`, `net/http.c` | Scrape format optional |
@@ -859,7 +859,7 @@ type TraceConfig struct {
 | Horizontal scaling | ❌ | ✅ | ✅ **Built** — cross-node partition migration | `kernel/partition.c` | Done |
 | Edge computing | ❌ | ⚠️ K3s | ✅ **Core** | — | Done |
 | **Service discovery** | ❌ | ✅ | ✅ **Built** — `service_registry.c`: name → partition/endpoint, node **derived** from the partition's current owner so resolution follows `partition_migrate()` with no reconciliation. Replicated cluster-wide over DSPP with a ~5 s heartbeat and fresh/stale/expired TTL; expiry is enforced at lookup so a dead node stops attracting traffic even if no sweep has run. Each node probes its OWN endpoints (TCP LISTEN / microkernel watchdog) and ships the verdict on the heartbeat, so `serving` and `health` are reported separately; local entries always outrank remote ones | `kernel/service_registry.c`, `net/dspp.c` | ✅ Wedged handlers now caught via IPC queue saturation (Phase 6) |
-| Declarative workload spec | ⚠️ Compose | ✅ Deployment | ✅ **Built** — `workloads[32]` declare partition + desired state + service + **program**; a bounded reconciler converges on all four | `kernel/workload.c`, `workload_ctx.c` | ⚠️ No restarts/scaling (needs a workload liveness signal) |
+| Declarative workload spec | ⚠️ Compose | ✅ Deployment | ✅ **Built** — `workloads[32]` declare partition + desired state + service + **program**; a bounded reconciler converges on all four | `kernel/workload.c`, `workload_ctx.c` | ⚠️ No scaling (needs a load signal); restarts done in Phase 7 |
 | Service mesh policy | ❌ | ✅ Istio | ✅ **Built** — three-state circuit breaker per service, fed by endpoint probe, IPC queue saturation and explicit outcome reports; per-service metrics | `kernel/service_mesh.c` | ⚠️ No retry/timeout/hedging — needs a request-response call path; DSPP is fire-and-forget |
 | Network policies (src/dst ACL) | ❌ | ✅ | ❌ Absent | — | ⚠️ Medium |
 | Auto-scaling (HPA/VPA) | ❌ | ✅ | ❌ Absent | — | ⚠️ Low — the reconcile loop now exists, but scaling also needs a liveness/load signal |

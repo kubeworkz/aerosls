@@ -113,6 +113,11 @@ int         wlctx_start(const char* w, const unsigned char* i, uint32_t n,
     (void)w; (void)i; (void)n; (void)e; (void)p; return 0;
 }
 int         wlctx_stop(const char* w) { (void)w; return 0; }
+/* Phase 7 restart seam. FAITHFUL: no workload here declares a program, so
+ * there is never a live context to have a status. -1 is exactly what the
+ * real one returns for that. */
+int         wlctx_status_of(const char* w) { (void)w; return -1; }
+int         wlctx_restart(const char* w) { (void)w; return 0; }
 const unsigned char* workload_find_program(const char* n, uint32_t* sz) {
     (void)n; (void)sz; return 0;
 }

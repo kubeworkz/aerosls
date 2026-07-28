@@ -369,6 +369,8 @@ static void print_help(void) {
         "  mesh reset <name>                         force a breaker closed without waiting the cooldown\n"
         "  workload declare <name> <pid> <running|stopped> [svc <name> <ipc|tcp> <port>]  declare desired state\n"
         "  workload delete <name>                    remove a declaration\n"
+        "     ... [prog <object> [entry]] [restart never|on-failure|always]\n"
+        "  workload retry <name>                     re-arm a workload the reconciler gave up on\n"
         "  workload list                             print declarations + reconciler state\n"
         "  reconcile on|off                          enable/disable autonomous convergence (OFF at boot)\n"
         "  context list                              live execution contexts (pc/steps/status)\n"
@@ -1350,6 +1352,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             req.endpoint_port   = 0;
             req.program_name[0] = '\0';
             req.entry_name[0]   = '\0';
+            req.restart_policy  = WL_RESTART_NEVER;
             /* Optional trailing "svc <name> <ipc|tcp> <port>". */
             char kw[8];
             p = sh_token(p, kw, sizeof(kw));
@@ -1372,6 +1375,15 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                 sh_token(p, entrytok, sizeof(entrytok));
                 for (int i = 0; i < WORKLOAD_NAME_LEN; i++) req.program_name[i] = progtok[i];
                 for (int i = 0; i < 32; i++) req.entry_name[i] = entrytok[i];
+                p = sh_token(p, kw, sizeof(kw));
+            }
+            /* Optional trailing "restart never|on-failure|always". */
+            if (sh_eq(kw, "restart")) {
+                char poltok[16];
+                sh_token(p, poltok, sizeof(poltok));
+                req.restart_policy = sh_eq(poltok, "always")     ? WL_RESTART_ALWAYS
+                                   : sh_eq(poltok, "on-failure") ? WL_RESTART_ON_FAILURE
+                                   : WL_RESTART_NEVER;
             }
             uint64_t rc = do_syscall(SYS_SLS_WORKLOAD_DECLARE, &req);
             kernel_serial_printf("[WORKLOAD] declare '%s' -> %s\n", req.name,
@@ -1389,6 +1401,12 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
         else if (sh_eq(input_buffer, "workload list")) {
             do_syscall(SYS_SLS_WORKLOAD_LIST, 0);
+        }
+        else if (sh_starts(input_buffer, "workload retry ")) {
+            char nm[WORKLOAD_NAME_LEN];
+            sh_token(input_buffer + 15, nm, sizeof(nm));
+            kernel_serial_printf("[WORKLOAD] retry '%s' -> %s\n", nm,
+                                 workload_clear_giveup(nm) == 0 ? "re-armed" : "no such workload");
         }
         else if (sh_eq(input_buffer, "context list")) {
             wlctx_list();

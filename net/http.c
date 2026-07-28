@@ -2484,6 +2484,12 @@ static int api_workloads_list(char* buf, int max) {
         jb_uint(&j, "endpoint_port", w->endpoint_port);                 jb_putc(&j, ',');
         jb_str (&j, "program_name", w->program_name);                   jb_putc(&j, ',');
         jb_str (&j, "context_live", wlctx_has(w->name) ? "true" : "false"); jb_putc(&j, ',');
+        jb_str (&j, "restart_policy",
+                workload_restart_policy_name((SLSWorkloadRestartPolicy)w->restart_policy));
+        jb_putc(&j, ',');
+        jb_uint(&j, "restart_count", w->restart_count);   jb_putc(&j, ',');
+        jb_uint(&j, "restarts_total", w->restarts_total); jb_putc(&j, ',');
+        jb_str (&j, "gave_up", w->gave_up ? "true" : "false"); jb_putc(&j, ',');
         jb_uint(&j, "actions_taken", w->actions_taken);                 jb_putc(&j, ',');
         jb_str (&j, "converged", w->converged ? "true" : "false");
         jb_obj_close(&j);
@@ -2522,11 +2528,17 @@ static int api_workload_post(const char* body, char* buf, int max,
     char entry[32]; entry[0] = '\0';
     json_str(body, "entry_name", entry, (int)sizeof(entry));
 
+    char pol[16]; pol[0] = '\0';
+    json_str(body, "restart_policy", pol, (int)sizeof(pol));
+    SLSWorkloadRestartPolicy rp = (pol[0]=='a') ? WL_RESTART_ALWAYS
+                                : (pol[0]=='o') ? WL_RESTART_ON_FAILURE
+                                : WL_RESTART_NEVER;
+
     SLSWorkloadStatus rc = workload_declare(req_uid, name,
                                             (uint32_t)json_int(body, "partition_id"),
                                             d, svc, k,
                                             (uint32_t)json_int(body, "endpoint_port"),
-                                            prog, entry);
+                                            prog, entry, rp);
     jb_str(&j, "ok", rc == WL_OK ? "true" : "false");
     if (rc != WL_OK) { jb_putc(&j, ','); jb_str(&j, "error", workload_status_name(rc)); }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;

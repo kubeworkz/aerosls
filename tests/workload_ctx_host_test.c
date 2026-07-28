@@ -233,7 +233,7 @@ int main(void) {
         reconcile_set_enabled(1);
         CHECK(workload_declare(0, "sumjob", papp, WL_DESIRED_RUNNING,
                                "", SVC_ENDPOINT_TCP, 0,
-                               "loopsum", "main") == WL_OK,
+                               "loopsum", "main", WL_RESTART_NEVER) == WL_OK,
               "a workload is declared WITH a program");
 
         CHECK(!wlctx_has("sumjob"), "no context exists yet -- declaring is not doing");
@@ -342,7 +342,7 @@ int main(void) {
         g_local_node = 1;
         partition_owner_table[papp].node_id = 1;
         CHECK(workload_declare(0, "sumjob", papp, WL_DESIRED_STOPPED,
-                               "", SVC_ENDPOINT_TCP, 0, "loopsum", "main") == WL_OK,
+                               "", SVC_ENDPOINT_TCP, 0, "loopsum", "main", WL_RESTART_NEVER) == WL_OK,
               "the workload is flipped to STOPPED");
         for (int i = 0; i < 5 && cycle(); i++) { }
         CHECK(!wlctx_has("sumjob"), "its live context is torn down");

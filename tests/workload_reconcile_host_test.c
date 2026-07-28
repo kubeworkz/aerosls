@@ -123,6 +123,11 @@ int         wlctx_start(const char* w, const unsigned char* i, uint32_t n,
     (void)w; (void)i; (void)n; (void)e; (void)p; return 0;
 }
 int         wlctx_stop(const char* w) { (void)w; return 0; }
+/* Phase 7 restart seam. FAITHFUL: no workload here declares a program, so
+ * there is never a live context to have a status. -1 is exactly what the
+ * real one returns for that. */
+int         wlctx_status_of(const char* w) { (void)w; return -1; }
+int         wlctx_restart(const char* w) { (void)w; return 0; }
 /* FAITHFUL: no program is uploaded in this test, so the real lookup
  * would find nothing and return 0 -- exactly what this returns. */
 const unsigned char* workload_find_program(const char* n, uint32_t* sz) {
@@ -156,7 +161,7 @@ int main(void) {
               "the reconciler is DISABLED at init -- something autonomous is opt-in");
 
         CHECK(workload_declare(0, "api", papi, WL_DESIRED_RUNNING, "api-svc",
-                               SVC_ENDPOINT_TCP, 8080, "", "") == WL_OK,
+                               SVC_ENDPOINT_TCP, 8080, "", "", WL_RESTART_NEVER) == WL_OK,
               "a workload is declared");
         partition_pause(papi);
 
@@ -293,7 +298,7 @@ int main(void) {
             sv[0]='s'; sv[1]='v';
             sv[2]=(char)('0'+(i/10)%10); sv[3]=(char)('0'+i%10); sv[4]='\0';
             if (workload_declare(0, nm, papi, WL_DESIRED_RUNNING, sv, SVC_ENDPOINT_TCP,
-                                 (uint32_t)(1000+i), "", "") == WL_OK) declared++;
+                                 (uint32_t)(1000+i), "", "", WL_RESTART_NEVER) == WL_OK) declared++;
         }
         CHECK(declared == WORKLOAD_MAX, "a full table of workloads is declared");
 
@@ -340,12 +345,12 @@ int main(void) {
         uint32_t psolo = partition_create("solo");
 
         CHECK(workload_declare(0, "only", psolo, WL_DESIRED_RUNNING, "only-svc",
-                               SVC_ENDPOINT_TCP, 8080, "", "") == WL_OK, "a lone workload wants RUNNING");
+                               SVC_ENDPOINT_TCP, 8080, "", "", WL_RESTART_NEVER) == WL_OK, "a lone workload wants RUNNING");
         for (int i = 0; i < 5 && cycle(); i++) { }
         CHECK(!partition_is_paused(psolo), "its partition is running");
 
         CHECK(workload_declare(0, "only", psolo, WL_DESIRED_STOPPED, "only-svc",
-                               SVC_ENDPOINT_TCP, 8080, "", "") == WL_OK, "it is flipped to STOPPED");
+                               SVC_ENDPOINT_TCP, 8080, "", "", WL_RESTART_NEVER) == WL_OK, "it is flipped to STOPPED");
         for (int i = 0; i < 5 && cycle(); i++) { }
         CHECK(partition_is_paused(psolo), "the partition is paused");
         struct SLSServiceLocation loc;
@@ -355,7 +360,7 @@ int main(void) {
 
         /* Two workloads, one partition, opposite desires. */
         CHECK(workload_declare(0, "peer", psolo, WL_DESIRED_RUNNING, "peer-svc",
-                               SVC_ENDPOINT_TCP, 8081, "", "") == WL_OK,
+                               SVC_ENDPOINT_TCP, 8081, "", "", WL_RESTART_NEVER) == WL_OK,
               "a SECOND workload in the same partition wants RUNNING");
         for (int i = 0; i < 5 && cycle(); i++) { }
         CHECK(!partition_is_paused(psolo),
@@ -378,7 +383,7 @@ int main(void) {
          * AFTER the running one exercises the opposite order, where
          * last-wins gives the wrong answer. */
         CHECK(workload_declare(0, "zlast", psolo, WL_DESIRED_STOPPED, "zlast-svc",
-                               SVC_ENDPOINT_TCP, 8082, "", "") == WL_OK,
+                               SVC_ENDPOINT_TCP, 8082, "", "", WL_RESTART_NEVER) == WL_OK,
               "a THIRD workload, wanting STOPPED, is declared after the running one");
         for (int i = 0; i < 5 && cycle(); i++) { }
         CHECK(!partition_is_paused(psolo),
@@ -397,7 +402,7 @@ int main(void) {
         service_registry_init();
         uint32_t pdoom = partition_create("doomed");
         CHECK(workload_declare(0, "ghost", pdoom, WL_DESIRED_RUNNING, "ghost-svc",
-                               SVC_ENDPOINT_TCP, 7000, "", "") == WL_OK,
+                               SVC_ENDPOINT_TCP, 7000, "", "", WL_RESTART_NEVER) == WL_OK,
               "a workload is declared in a partition");
         for (int i = 0; i < 5 && cycle(); i++) { }
         CHECK(cycle() == 0, "it converges");
@@ -414,15 +419,15 @@ int main(void) {
     /* ═══ Scenario 9: declaration validation ══════════════════════════ */
     printf("\n-- Scenario 9: declarations are validated up front --\n");
     {
-        CHECK(workload_declare(0, "", papi, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "") == WL_ERR_NAME, "an empty name is refused");
-        CHECK(workload_declare(0, "bad", 250, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "") == WL_ERR_PARTITION, "an undefined partition is refused");
-        CHECK(workload_declare(0, "halfsvc", papi, WL_DESIRED_RUNNING, "s", SVC_ENDPOINT_TCP, 0, "", "") == WL_ERR_ENDPOINT,
+        CHECK(workload_declare(0, "", papi, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_ERR_NAME, "an empty name is refused");
+        CHECK(workload_declare(0, "bad", 250, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_ERR_PARTITION, "an undefined partition is refused");
+        CHECK(workload_declare(0, "halfsvc", papi, WL_DESIRED_RUNNING, "s", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_ERR_ENDPOINT,
               "a service name with no port is refused -- it could never converge");
-        CHECK(workload_declare(0, "nosvc", papi, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "") == WL_OK,
+        CHECK(workload_declare(0, "nosvc", papi, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_OK,
               "a workload declaring NO service is legal");
 
         g_role = ROLE_APP_USER;
-        CHECK(workload_declare(3, "sneaky", papi, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "") == WL_ERR_PERM, "APP_USER cannot declare a workload");
+        CHECK(workload_declare(3, "sneaky", papi, WL_DESIRED_RUNNING, "", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_ERR_PERM, "APP_USER cannot declare a workload");
         CHECK(workload_delete(3, "nosvc") == WL_ERR_PERM, "...nor delete one");
         g_role = ROLE_SYSTEM_KERNEL;
 
@@ -431,7 +436,7 @@ int main(void) {
 
         persist_workloads_calls = 0;
         CHECK(workload_declare(0, "persisted", papi, WL_DESIRED_STOPPED, "",
-                               SVC_ENDPOINT_TCP, 0, "", "") == WL_OK, "a declaration succeeds");
+                               SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_OK, "a declaration succeeds");
         CHECK(persist_workloads_calls == 1,
               "declarations persist immediately -- a declarative spec that vanishes on reboot is not declarative");
         CHECK(workload_delete(0, "persisted") == WL_OK && persist_workloads_calls == 2,
@@ -448,11 +453,11 @@ int main(void) {
             nm[0]='w';
             nm[1]=(char)('0'+(i/100)%10); nm[2]=(char)('0'+(i/10)%10); nm[3]=(char)('0'+i%10);
             nm[4]='\0';
-            if (workload_declare(0, nm, papi, WL_DESIRED_STOPPED, "", SVC_ENDPOINT_TCP, 0, "", "") == WL_OK)
+            if (workload_declare(0, nm, papi, WL_DESIRED_STOPPED, "", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_OK)
                 ok++;
         }
         CHECK(ok == WORKLOAD_MAX, "the table fills to exactly WORKLOAD_MAX");
-        CHECK(workload_declare(0, "extra", papi, WL_DESIRED_STOPPED, "", SVC_ENDPOINT_TCP, 0, "", "") == WL_ERR_FULL, "one more is refused with a distinct status");
+        CHECK(workload_declare(0, "extra", papi, WL_DESIRED_STOPPED, "", SVC_ENDPOINT_TCP, 0, "", "", WL_RESTART_NEVER) == WL_ERR_FULL, "one more is refused with a distinct status");
     }
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);

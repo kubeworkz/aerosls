@@ -10,6 +10,7 @@
 #include "partition.h"
 #include "persist.h"
 #include "workload_ctx.h"
+#include "timer.h"
 #include "kernel_io.h"
 
 struct SLSWorkloadEntry workloads[WORKLOAD_MAX];
@@ -22,6 +23,15 @@ static int wl_streq(const char* a, const char* b) {
 static int wl_strlen(const char* s) { int n = 0; while (s && s[n]) n++; return n; }
 static void wl_strcpy(char* d, const char* s, int n) {
     int i; for (i = 0; i < n - 1 && s && s[i]; i++) d[i] = s[i]; d[i] = '\0';
+}
+
+const char* workload_restart_policy_name(SLSWorkloadRestartPolicy p) {
+    switch (p) {
+        case WL_RESTART_NEVER:      return "never";
+        case WL_RESTART_ON_FAILURE: return "on-failure";
+        case WL_RESTART_ALWAYS:     return "always";
+        default:                    return "never";
+    }
 }
 
 const char* workload_status_name(SLSWorkloadStatus s) {
@@ -56,6 +66,32 @@ uint32_t workload_count(void) {
     return n;
 }
 
+/* Saturating age, for the same reason service_registry.c's sr_age() has
+ * one: kernel_tick_counter is incremented by whichever core takes the
+ * timer IRQ, so a reading can land behind a stamp. An unsigned
+ * subtraction would wrap to an enormous age and fire a restart instantly,
+ * defeating the backoff entirely. */
+static uint64_t wl_age(uint64_t now, uint64_t stamped) {
+    return (now > stamped) ? (now - stamped) : 0;
+}
+
+/* Exponential backoff before the NEXT attempt, given how many have
+ * already been made. Doubles per attempt to a cap:
+ *
+ *   attempts made:  1      2      3      4    ...
+ *   wait before
+ *   the next:       base   2x     4x     8x   ... capped at MAX
+ *
+ * The loop starts at 1, not 0, so the FIRST retry waits `base` rather
+ * than 2x. That matters: a transient fault should be retried quickly, and
+ * starting a doubling sequence one step in delays every recovery for no
+ * reason. The test caught this -- it had been off by one doubling. */
+static uint64_t wl_backoff(uint32_t attempts_made) {
+    uint64_t b = WL_BACKOFF_BASE_TICKS;
+    for (uint32_t i = 1; i < attempts_made && b < (uint64_t)WL_BACKOFF_MAX_TICKS; i++) b *= 2;
+    return b > (uint64_t)WL_BACKOFF_MAX_TICKS ? (uint64_t)WL_BACKOFF_MAX_TICKS : b;
+}
+
 static int wl_may_mutate(uint32_t caller_uid) {
     return catalog_get_role(caller_uid) <= ROLE_DB_ADMIN;
 }
@@ -67,7 +103,8 @@ SLSWorkloadStatus workload_declare(uint32_t caller_uid, const char* name,
                                    SLSServiceEndpointKind kind,
                                    uint32_t endpoint_port,
                                    const char* program_name,
-                                   const char* entry_name) {
+                                   const char* entry_name,
+                                   SLSWorkloadRestartPolicy restart_policy) {
     int len = wl_strlen(name);
     if (len == 0 || len >= WORKLOAD_NAME_LEN) return WL_ERR_NAME;
     if (!wl_may_mutate(caller_uid))           return WL_ERR_PERM;
@@ -91,6 +128,9 @@ SLSWorkloadStatus workload_declare(uint32_t caller_uid, const char* name,
             wl_strcpy(e->name, name, WORKLOAD_NAME_LEN);
             e->active        = 1;
             e->actions_taken = 0;
+            e->restart_count = e->restarts_total = 0;
+            e->last_restart_tick = e->started_tick = 0;
+            e->gave_up = 0;
             break;
         }
         if (!e) return WL_ERR_FULL;
@@ -104,6 +144,16 @@ SLSWorkloadStatus workload_declare(uint32_t caller_uid, const char* name,
     wl_strcpy(e->program_name, program_name ? program_name : "", WORKLOAD_NAME_LEN);
     wl_strcpy(e->entry_name, (entry_name && entry_name[0]) ? entry_name : "main",
               (int)sizeof(e->entry_name));
+    /* An unrecognised policy value becomes NEVER rather than something
+     * more eager: a caller that got this wrong should not thereby opt into
+     * autonomous restarts. */
+    e->restart_policy = (restart_policy == WL_RESTART_ON_FAILURE ||
+                         restart_policy == WL_RESTART_ALWAYS)
+                        ? (uint8_t)restart_policy : (uint8_t)WL_RESTART_NEVER;
+    /* Re-declaring is an operator intervention: clear the give-up so a
+     * corrected declaration is actually retried. */
+    e->gave_up       = 0;
+    e->restart_count = 0;
     e->converged     = 0;   /* newly declared/changed -- not yet known converged */
 
     kernel_serial_printf("[WORKLOAD] declared '%s': partition %u, desired=%s%s.\n",
@@ -122,6 +172,15 @@ SLSWorkloadStatus workload_delete(uint32_t caller_uid, const char* name) {
     kernel_serial_printf("[WORKLOAD] deleted '%s'.\n", name);
     persist_workloads();
     return WL_OK;
+}
+
+int workload_clear_giveup(const char* name) {
+    struct SLSWorkloadEntry* e = workload_find(name);
+    if (!e) return 1;
+    e->gave_up       = 0;
+    e->restart_count = 0;
+    kernel_serial_printf("[WORKLOAD] '%s': give-up cleared, restarts re-armed.\n", e->name);
+    return 0;
 }
 
 /* ─── Intent ring (AP produces, BSP consumes) ─────────────────────────
@@ -144,6 +203,11 @@ SLSWorkloadStatus workload_delete(uint32_t caller_uid, const char* name) {
  * intent. Adding the context intent doubled the real bound, and the
  * compile error was what said so -- rather than the property quietly
  * becoming false and overflow starting to mean nothing in particular. */
+/* Still 2 after Phase 7 added CTX_RESTART: the three context intents
+ * (start / restart / stop) sit in one if/else-if chain and are mutually
+ * exclusive, so a workload emits at most one service intent and at most
+ * one context intent per sweep. Re-derived deliberately rather than
+ * assumed -- this assert already caught the bound going stale once. */
 #define WL_INTENTS_PER_WORKLOAD 2
 _Static_assert(WL_INTENT_MAX >= WL_INTENTS_PER_WORKLOAD * WORKLOAD_MAX,
                "intent ring must absorb a full sweep; see the note above");
@@ -160,6 +224,7 @@ typedef enum {
      * -- the same reason the service actions do. */
     WL_INTENT_CTX_START,
     WL_INTENT_CTX_STOP,
+    WL_INTENT_CTX_RESTART,
 } WLIntentKind;
 
 struct WLIntent {
@@ -248,6 +313,12 @@ uint32_t reconcile_drain(void) {
             wlctx_stop(in.workload_name);
             applied++; continue;
         }
+        if (in.kind == WL_INTENT_CTX_RESTART) {
+            WLCtxStatus rc = wlctx_restart(in.workload_name);
+            kernel_serial_printf("[RECONCILE] restart context '%s' -> %s\n",
+                                 in.workload_name, wlctx_status_name(rc));
+            applied++; continue;
+        }
 
         if (in.kind == WL_INTENT_REGISTER_SERVICE) {
             SLSServiceStatus rc = service_register(in.caller_uid, in.service_name,
@@ -323,6 +394,7 @@ uint32_t reconcile_drain_probe(uint32_t* out_seq, uint32_t max) {
  * it is idempotent and safe to re-run after a dropped intent. */
 uint32_t reconcile_tick(void) {
     if (!wl_reconcile_on) return 0;
+    const uint64_t now = kernel_tick_counter;
 
     uint32_t actions = 0;
 
@@ -454,7 +526,80 @@ uint32_t reconcile_tick(void) {
                 wl_strcpy(in.program_name, w->program_name, WORKLOAD_NAME_LEN);
                 wl_strcpy(in.entry_name, w->entry_name, (int)sizeof(in.entry_name));
                 wl_enqueue(&in);
+                w->started_tick = now;   /* the stability window starts here */
                 actions++;
+            } else if (w->desired_state == WL_DESIRED_RUNNING && live) {
+                /* ── Restart (Phase 7) ─────────────────────────────────
+                 * The context exists. Is it still running, and if not,
+                 * does the operator want it back? */
+                int st = wlctx_status_of(w->name);
+
+                /* SIMI_STATUS_OK == still executing. Nothing to do, and
+                 * this is where a stable run earns back its attempts. */
+                if (st == (int)SIMI_STATUS_OK) {
+                    if (w->restart_count > 0 && w->started_tick &&
+                        wl_age(now, w->started_tick) >= (uint64_t)WL_STABLE_RESET_TICKS) {
+                        kernel_serial_printf(
+                            "[RECONCILE] '%s' stable for %u ticks -- restart budget reset.\n",
+                            w->name, (unsigned)WL_STABLE_RESET_TICKS);
+                        w->restart_count = 0;
+                    }
+                } else if (st >= 0 && w->gave_up) {
+                    /* Already abandoned. Deliberately silent: re-logging
+                     * "GIVING UP" on every sweep for the rest of uptime
+                     * would bury every other message on the console. The
+                     * flag exists so the decision is announced exactly
+                     * once and then reported on demand, not repeated. */
+                } else if (st >= 0) {
+                    /* Terminal. THE distinction: HALTED means the program
+                     * RETURNED -- it finished. Restarting it on that basis
+                     * turns a batch job into an infinite loop, so only an
+                     * explicit ALWAYS does. A TRAP is a genuine fault. */
+                    int is_failure = (st != (int)SIMI_STATUS_HALTED);
+                    int want =
+                        (w->restart_policy == WL_RESTART_ALWAYS) ||
+                        (w->restart_policy == WL_RESTART_ON_FAILURE && is_failure);
+
+                    if (want) {
+                        if (w->restart_count >= WL_RESTART_MAX_ATTEMPTS) {
+                            /* Give up ONCE, loudly, and stop. Something
+                             * that has failed this many times needs a
+                             * human, not an eleventh attempt -- and a
+                             * crash loop must not be able to burn the
+                             * machine for the rest of its uptime. */
+                            w->gave_up = 1;
+                            kernel_serial_printf(
+                                "[RECONCILE] '%s' GIVING UP after %u restarts -- "
+                                "no further attempts until re-declared or cleared.\n",
+                                w->name, (unsigned)w->restart_count);
+                        } else if (wl_age(now, w->last_restart_tick) >= wl_backoff(w->restart_count)
+                                   || w->last_restart_tick == 0) {
+                            struct WLIntent in;
+                            in.kind         = WL_INTENT_CTX_RESTART;
+                            in.caller_uid   = 0;
+                            in.partition_id = w->partition_id;
+                            in.endpoint_port = 0; in.endpoint_kind = 0;
+                            in.service_name[0] = '\0';
+                            wl_strcpy(in.workload_name, w->name, WORKLOAD_NAME_LEN);
+                            wl_strcpy(in.program_name, w->program_name, WORKLOAD_NAME_LEN);
+                            wl_strcpy(in.entry_name, w->entry_name, (int)sizeof(in.entry_name));
+                            wl_enqueue(&in);
+                            w->restart_count++;
+                            w->restarts_total++;
+                            w->last_restart_tick = now;
+                            w->started_tick      = now;
+                            kernel_serial_printf(
+                                "[RECONCILE] '%s' %s -- restart %u/%u queued.\n",
+                                w->name, is_failure ? "trapped" : "halted",
+                                (unsigned)w->restart_count, WL_RESTART_MAX_ATTEMPTS);
+                            actions++;
+                        }
+                        /* else: inside the backoff window -- deliberately
+                         * NOT counted as an action, so a workload waiting
+                         * out its backoff still reports converged rather
+                         * than making the whole sweep look busy. */
+                    }
+                }
             } else if (w->desired_state == WL_DESIRED_STOPPED && live) {
                 struct WLIntent in;
                 in.kind         = WL_INTENT_CTX_STOP;
@@ -487,12 +632,17 @@ void sys_sls_workload_list(void) {
     for (int i = 0; i < WORKLOAD_MAX; i++) {
         if (!workloads[i].active) continue;
         struct SLSWorkloadEntry* w = &workloads[i];
-        kernel_serial_printf("  %-20s partition=%u desired=%-7s service=%-16s actions=%u %s\n",
-                             w->name, (unsigned)w->partition_id,
-                             w->desired_state == WL_DESIRED_RUNNING ? "RUNNING" : "STOPPED",
-                             w->service_name[0] ? w->service_name : "-",
-                             (unsigned)w->actions_taken,
-                             w->converged ? "[converged]" : "[pending]");
+        kernel_serial_printf(
+            "  %-18s partition=%u desired=%-7s prog=%-12s restart=%-10s "
+            "tries=%u/%u total=%u%s %s\n",
+            w->name, (unsigned)w->partition_id,
+            w->desired_state == WL_DESIRED_RUNNING ? "RUNNING" : "STOPPED",
+            w->program_name[0] ? w->program_name : "-",
+            workload_restart_policy_name((SLSWorkloadRestartPolicy)w->restart_policy),
+            (unsigned)w->restart_count, WL_RESTART_MAX_ATTEMPTS,
+            (unsigned)w->restarts_total,
+            w->gave_up ? " [GAVE UP]" : "",
+            w->converged ? "[converged]" : "[pending]");
     }
 }
 
@@ -504,7 +654,8 @@ uint64_t sys_sls_workload_declare(struct SLSWorkloadDeclareRequest* req) {
                                       req->service_name,
                                       (SLSServiceEndpointKind)req->endpoint_kind,
                                       req->endpoint_port,
-                                      req->program_name, req->entry_name);
+                                      req->program_name, req->entry_name,
+                                      (SLSWorkloadRestartPolicy)req->restart_policy);
 }
 
 uint64_t sys_sls_workload_delete(struct SLSWorkloadDeclareRequest* req) {

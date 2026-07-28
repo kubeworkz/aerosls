@@ -580,8 +580,13 @@ A partition runs if **any** active workload in it wants to run (union semantics)
 | `workload delete <name>` | Remove a declaration |
 | `workload list` | Declarations, per-entry action counts and converged flags, plus reconciler state and intent-queue depth/drops |
 | `reconcile on` / `reconcile off` | Enable or disable autonomous convergence |
+| `workload retry <name>` | Re-arm a workload the reconciler gave up on restarting |
 | `context list` | Live execution contexts: pc, retired steps, status |
 | `context step <budget>` | Advance every live context by up to `<budget>` instructions |
+
+Add `restart never|on-failure|always` to a declaration to enable **self-healing**. A context that TRAPs is a failure; a context that HALTs *finished*, so `on-failure` leaves it alone and only `always` restarts it — restarting a completed batch job would loop it forever. Default is `never`, so existing declarations are unaffected.
+
+Attempts back off exponentially (~1 s doubling to ~30 s) and stop after 10, after which the workload is marked `[GAVE UP]` and announced once. `workload retry <name>` or re-declaring re-arms it; neither erases the lifetime restart count. A workload that runs stably for long enough gets its budget back.
 
 Add `prog <object> [entry]` to a declaration to make the workload a **running computation**: `workload declare job 3 running prog loopsum main`. The reconciler then instantiates the uploaded SIMI program as a live context and registers it for migration — which is what makes `partition migrate` move real work rather than only data.
 
