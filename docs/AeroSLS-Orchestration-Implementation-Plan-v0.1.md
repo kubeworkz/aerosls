@@ -99,7 +99,9 @@ Kubernetes cannot do this because a container's state is the Linux kernel's proc
 
 Effort figures are **judgement, not measurement**. Each phase ends green with a full regression pass, per this project's standing practice.
 
-### Phase 1 — Interpreter in-kernel (foundation)
+### Phase 1 — Interpreter in-kernel (foundation) — **DONE**
+
+> **Built and passing.** `kernel/simi_interp.{c,h}` + `tests/simi_interp_host_test.c` (27 checks). Full regression 67/67. As-built notes in §Phase 1 Findings below.
 
 **Deliverable:** `kernel/simi_interp.c`, a freestanding port of the reference interpreter, selectable as an alternative to translation.
 
@@ -110,7 +112,52 @@ Effort figures are **judgement, not measurement**. Each phase ends green with a 
 
 **Risk: low.** Bounded, mechanical, and directly testable — a host test can link the real interpreter and run programs, no QEMU needed.
 
-**Honest cost:** interpreted SIMI will be perhaps an order of magnitude slower than translated. That is the price of checkpointability and should be stated in the docs as a deliberate trade, not discovered later.
+**Honest cost — now measured, not guessed.** See §4.0 below: interpretation costs **3–9×**, not the order-of-magnitude-plus that was assumed. This is a deliberate per-workload trade and should be documented as such.
+
+### Phase 0 — Kill-criterion measurement (DONE)
+
+Before committing to Phase 1, the risk that would invalidate the whole track — "interpretation is too slow to be useful" — was measured on the host, using the existing toolchain. No kernel code was needed.
+
+Both paths were run on identical programs and **produced identical results**, which is what makes the comparison meaningful:
+
+| Workload | Interpreter (`simi-run`) | Translated (x86 JIT) | **Ratio** |
+| --- | --- | --- | --- |
+| Arithmetic-heavy — 1M-iteration sum loop | 12.20 ms | 1.42 ms | **8.6×** |
+| Call-heavy — 200k CALL/RET | 11.20 ms | 3.57 ms | **3.1×** |
+
+Method: `simi-run` timings are medians of 7 runs with process startup (measured separately against a trivial program, ~9 ms) subtracted; translated timings are the bench harness's own `clock_gettime` measurement averaged over 200 calls, excluding translation.
+
+**Against a 50× kill criterion, the worst case is 8.6×. The risk is retired.**
+
+Two observations worth carrying forward:
+
+- **Call-heavy code narrows the gap to 3.1×**, and call-heavy is precisely the shape PEC cares about — the frame stack is what gets checkpointed. The JIT's advantage is largest on tight register arithmetic, which is where its allocator pays off; it has much less to offer across a CALL boundary.
+- This is the **unoptimised reference interpreter**. It was written for clarity and cross-validation, not speed. A kernel port has room to improve, not just to regress.
+
+Caveats, stated plainly: measured on host x86-64 Linux rather than the kernel; both programs are small and arithmetic/call shaped, with memory-heavy and object-op workloads unmeasured; and a kernel port's numbers may differ. The conclusion — that the ratio is single-digit rather than catastrophic — is robust to all of those, which is what the decision actually turned on.
+
+### Phase 1 Findings (as built)
+
+**What landed.** `kernel/simi_interp.h` defines `struct SimiContext` — the whole execution state as plain data — and `kernel/simi_interp.c` is the freestanding interpreter over it. Added to `Makefile`'s `X86_C_SRC`, so it ships in the kernel image. Compiles clean with `-I` flags and with none (matching the real `X86_CFLAGS` shape), zero errors, **zero warnings**.
+
+**Cross-validation is complete, not sampled.** The test runs the **entire 17-program corpus** — all 16 integer programs match the reference's results exactly, and the one float program is refused rather than approximated.
+
+**Three things worth recording because they changed the design:**
+
+1. **The expected-value table is generated, not transcribed.** The first hand-written version had `branch_cmp` as 1 when the reference says 99 — surfacing as a "the port is wrong" failure that was actually a wrong test. The table is now produced by running `simi-run` across the corpus. A test whose oracle is hand-copied from comments is a test that can be wrong in the same direction as the code.
+
+2. **Float ops trap, deliberately.** The reference's float helpers return `double`/`float` **by value** — precisely the construct that broke this project's cross-compile once before (`vecstore.c`: *"SSE register return with SSE disabled"*). That much is avoidable with out-parameters. What is not avoidable: with `-mno-sse`, x86-64 falls back to x87, whose 80-bit intermediates can differ in the last bit from the SSE arithmetic the reference and JIT both use — so bit-exact cross-validation would silently stop holding for float programs. Trapping is the honest option, and the test **asserts the refusal**, so a future change that starts computing floats slightly differently fails rather than passes quietly. Revisit when SIMD enablement lands.
+
+3. **The ISA copy is guarded against drift.** `kernel/simi_x86.h` sets the convention — *"Duplicated (not #included) so this file has zero dependency on either tree"* — and the first draft of this header violated it by including `tools/simi/simi_isa.h`, which also dragged host-only name tables into the kernel build. It now mirrors the definitions like `simi_x86.c` does. Duplication is only safe if divergence is caught, so `simi_interp_isa_fingerprint()` packs the numbering as the kernel TU sees it, and the test — the one place both definitions legitimately coexist, in separate TUs — compares it against the authoritative header. `simi_x86.c` has the same exposure today protected only by a comment; this is slightly stricter.
+
+**The two properties Phase 2 depends on are proven, not assumed:**
+
+- **Resumability.** Running `loop_sum` in slices of *every* budget from 1 to 40 gives the identical result to one uninterrupted run — including **single-instruction slices**, i.e. a potential checkpoint boundary between every pair of instructions, on taken branches and across CALL/RET.
+- **State completeness.** A raw `memcpy` of a mid-execution context into a fresh struct resumes to the identical result. That is checkpoint/restore in miniature, minus the disk, and it directly validates the claim that `struct SimiContext` *is* the execution state.
+
+Also verified: traps are terminal (a re-run returns the same trap and retires **zero** additional instructions, so a scheduler polling runnable contexts cannot resurrect a dead one), and a depth-1 context's live bytes are **74,808 B (19 NVMe frames)** against a 361,000 B full struct — confirming §2.1's sizing and that checkpoints pay for depth actually used.
+
+**Not done in Phase 1:** the interpreter is not yet reachable from the loader or any syscall — nothing selects interpreted mode at runtime yet. It is compiled into the image and fully tested, but dormant, in the same sense Phase 1 and Phase 4 of the Multi-Node roadmap landed real primitives before anything called them. Wiring the mode selector belongs with Phase 2, where there is finally a reason to choose it.
 
 ### Phase 2 — Checkpoint / restore
 
@@ -177,7 +224,7 @@ Phases 1–3 are the research bet; 4–6 are the orchestration surface. They are
 
 | Risk | Severity | Mitigation / kill criterion |
 | --- | --- | --- |
-| Interpreted SIMI too slow to be useful | Medium | Measure at Phase 1. Frame as a per-workload choice. **Kill criterion:** if interpretation is >50× translated, the checkpointable path is a toy — reconsider translator-assisted checkpointing at explicit yield points instead. |
+| ~~Interpreted SIMI too slow to be useful~~ | ~~Medium~~ → **RETIRED** | **Measured (§Phase 0): 8.6× on arithmetic, 3.1× on call-heavy, against a 50× kill criterion.** Both paths verified to produce identical results. No longer a project risk; remains a per-workload performance note. |
 | Checkpoint omits state | High if it ships | Exhaustive checkpoint-at-every-instruction test (Phase 2). This is a data-loss class, so the test is not optional. |
 | Reconciler races persistence on the AP core | High | §4 Phase 5. Named up front rather than discovered. |
 | Format drift between checkpoint versions | Medium | Magic + ISA version, refuse mismatches. Precedent: `PERSIST_MAGIC_*`. |
@@ -196,4 +243,6 @@ The SIMI machine-model description, the 499-line/31-opcode counts, the libc depe
 
 The §3 "already built" table reflects work completed and regression-tested earlier in this project (66 host tests passing).
 
-**Effort and risk ratings are judgement.** No prototype was built for this plan, and the "order of magnitude slower" figure for interpretation is an expectation, not a measurement — Phase 1 exists partly to replace it with a real number.
+**Effort and risk ratings are judgement**, with one exception: the interpretation-speed figures in Phase 0 are a real measurement, taken on host x86-64 Linux using the existing `tools/simi` toolchain (`simi-run` vs `bench_harness.c` + `simi_x86.c` — the same translator the kernel uses). Both paths were verified to produce identical results on identical inputs. Those numbers do not carry over to kernel-side performance unchanged; what they establish is the *ratio*, which is what the kill criterion was about.
+
+No other prototype was built for this plan, and no kernel code was written.
