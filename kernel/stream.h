@@ -140,4 +140,12 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
 
 extern struct StreamEntry stream_store[STREAM_MAX];
 
+/* Flushes every populated frame of `se` to its own LBA, returning the count
+ * written. Extracted from stream_write_chunk()'s is_last branch so its
+ * run-batching index arithmetic can be tested directly -- batching a loop
+ * that writes to computed LBAs is exactly where an off-by-one silently
+ * misplaces data instead of crashing. See the definition's own comment and
+ * tests/stream_gather_flush_host_test.c. */
+uint32_t stream_flush_frames(struct StreamEntry* se);
+
 #endif /* STREAM_H */

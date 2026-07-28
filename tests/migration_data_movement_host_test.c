@@ -140,6 +140,22 @@ int nvme_read_sync(uint64_t slba, void* buf) {
     memcpy(buf, fake_page[idx], 4096);
     return 0;
 }
+int nvme_write_pages_gather_sync(uint64_t slba, const void* const* pages, uint32_t page_count) {
+    /* Scatter-gather transfer (drivers/nvme_io.h): kernel/stream.c batches a
+     * stream's scattered frame-pool frames into one command per contiguous LBA
+     * run. Faithful loop over the single-page fake above rather than a no-op,
+     * so the bytes still land at exactly the LBAs the real driver would use --
+     * every existing assertion in this file keeps verifying real behaviour
+     * through the new path. */
+    for (uint32_t i = 0; i < page_count; i++)
+        if (nvme_write_sync(slba + (uint64_t)i * 8, pages[i]) != 0) return 1;
+    return 0;
+}
+int nvme_read_pages_gather_sync(uint64_t slba, void* const* pages, uint32_t page_count) {
+    for (uint32_t i = 0; i < page_count; i++)
+        if (nvme_read_sync(slba + (uint64_t)i * 8, pages[i]) != 0) return 1;
+    return 0;
+}
 int nvme_write_sync(uint64_t slba, const void* buf) {
     if (g_write_fail_after == 0) { g_write_fail_after = -1; return -1; }
     if (g_write_fail_after > 0) g_write_fail_after--;

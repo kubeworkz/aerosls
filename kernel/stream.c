@@ -276,6 +276,64 @@ int stream_create(uint32_t caller_uid, const char* name, const char* mime_type) 
 }
 
 // ─── stream_write_chunk ──────────────────────────────────────────────────────
+// ─── stream_flush_frames ─────────────────────────────────────────────────────
+// Flushes every populated frame of `se` to its own LBA, returning how many
+// were written.
+//
+// This used to issue one 4 KiB command per frame -- up to STREAM_MAX_FRAMES
+// (16,384) synchronous submit-and-poll round trips for a single 64 MiB
+// stream. A stream's pages are separately allocated frame-pool frames, so
+// they are scattered in memory and cannot be described by the contiguous
+// multi-page path; but a PRP list is natively a scatter list, so
+// nvme_write_pages_gather_sync() (drivers/nvme_io.c) describes them to the
+// controller directly with no copying at all.
+//
+// Batching walks runs of CONSECUTIVE populated frames: one NVMe command
+// covers one contiguous LBA range, so a NULL frame (a hole that was never
+// written) must END the current run rather than be skipped over -- writing
+// across a hole would shift every later frame onto the wrong LBA.
+//
+// Extracted from stream_write_chunk()'s is_last branch so this index
+// arithmetic can be tested directly (tests/stream_gather_flush_host_test.c).
+// Batching LBA-computing loops is exactly where an off-by-one does not crash
+// but silently misplaces data, so it is worth having under test on its own.
+uint32_t stream_flush_frames(struct StreamEntry* se) {
+    uint32_t flushed = 0;
+    const void* run[NVME_MAX_PAGES_PER_XFER];
+    uint32_t    run_len   = 0;
+    uint32_t    run_start = 0;
+
+    // fi runs one past the end: that final pass carries have==0 and so
+    // flushes any still-open run.
+    for (uint32_t fi = 0; fi <= se->frames_used; fi++) {
+        int have = (fi < se->frames_used) && (se->frames[fi] != 0);
+
+        if (have) {
+            if (run_len == 0) run_start = fi;
+            run[run_len++] = se->frames[fi];
+        }
+
+        // Evaluated AFTER the append, so the frame that fills a batch goes
+        // out with that batch exactly once -- an earlier draft flushed and
+        // then re-seeded the next run with the same frame, writing it twice
+        // and shifting every later frame one LBA early.
+        int must_flush = (run_len == NVME_MAX_PAGES_PER_XFER) ||
+                         (!have && run_len > 0);
+        if (!must_flush) continue;
+
+        uint64_t lba = se->lba_base + (uint64_t)run_start * 8;
+        int rc = nvme_write_pages_gather_sync(lba, run, run_len);
+        if (rc) {
+            kernel_serial_printf("[STREAM] NVMe write frames %u..%u failed rc=%d\n",
+                                 run_start, run_start + run_len - 1, rc);
+        } else {
+            flushed += run_len;
+        }
+        run_len = 0;
+    }
+    return flushed;
+}
+
 int stream_write_chunk(const char* name, const uint8_t* chunk,
                         uint32_t len, uint32_t offset, uint8_t is_last) {
     struct StreamEntry* se = stream_find(name);
@@ -317,19 +375,7 @@ int stream_write_chunk(const char* name, const uint8_t* chunk,
     if (offset + len > se->size) se->size = offset + len;
 
     if (is_last) {
-        // Flush all populated frames to NVMe synchronously
-        uint32_t flushed = 0;
-        for (uint32_t fi = 0; fi < se->frames_used; fi++) {
-            if (!se->frames[fi]) continue;
-            uint64_t lba = se->lba_base + (uint64_t)fi * 8;
-            int rc = nvme_write_sync(lba, se->frames[fi]);
-            if (rc) {
-                kernel_serial_printf("[STREAM] NVMe write frame %u failed rc=%d\n",
-                                     fi, rc);
-            } else {
-                flushed++;
-            }
-        }
+        uint32_t flushed = stream_flush_frames(se);
         // Update metadata records
         struct SLSRecordRequest mr;
         int j;

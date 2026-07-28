@@ -10,6 +10,7 @@
 #define NVME_NSID           1
 
 // NVMe NVM command opcodes
+#define NVME_NVM_FLUSH      0x00
 #define NVME_NVM_WRITE      0x01
 #define NVME_NVM_READ       0x02
 
@@ -76,6 +77,24 @@ int  nvme_write_sync(uint64_t slba, const void* buf);
 int nvme_read_pages_sync(uint64_t slba, void* buf, uint32_t page_count);
 int nvme_write_pages_sync(uint64_t slba, const void* buf, uint32_t page_count);
 
+// ─── Durability barrier ──────────────────────────────────────────────────────
+// Issues an NVM Flush, committing the controller's volatile write cache to
+// non-volatile media. Until this returns, a completed nvme_write_*_sync() is
+// only durable against a process/kernel restart -- NOT against power loss,
+// because the controller is free to have acknowledged the write while it
+// still sits in a volatile cache.
+//
+// No flush command was issued anywhere in this codebase before this was
+// added, so every "persisted" write carried that caveat silently. Callers
+// that need a real ordering guarantee (write A must reach media before write
+// B) must call this between them; see kernel/persist.c's region commit, which
+// uses it to guarantee a region's data is durable before the header that
+// validates it becomes durable.
+//
+// Returns 0 on success, non-zero on NVMe status error (including 0xFD if the
+// I/O queue was never created, matching the multi-page functions above).
+int nvme_flush_sync(void);
+
 // Pure PRP-address arithmetic, exposed for host testing.
 //
 // Split out deliberately: nvme_io.c's submit path does raw MMIO doorbell
@@ -94,5 +113,35 @@ int nvme_write_pages_sync(uint64_t slba, const void* buf, uint32_t page_count);
 int nvme_build_prp(uint64_t buf_phys, uint32_t page_count,
                    uint64_t* prp_list_page,
                    uint64_t* out_prp1, uint64_t* out_prp2);
+
+// ─── Scatter-gather transfers ────────────────────────────────────────────────
+// The functions above require one physically contiguous buffer. Several
+// callers do not have one: kernel/stream.c holds each 4 KiB page of a stream
+// as a separately allocated frame-pool frame (`se->frames[]`), so flushing a
+// stream meant one command per frame -- up to STREAM_MAX_FRAMES (16,384) of
+// them for a single 64 MiB stream.
+//
+// No copying is needed to fix that. A PRP list is natively a scatter list:
+// every entry is an independent page address, and nothing requires them to be
+// consecutive. The gather variants below take an array of page pointers and
+// describe them to the controller directly.
+//
+// The pages must each be 4 KiB aligned (frame-pool frames always are), but
+// need no relationship to each other in memory. They DO map to a contiguous
+// LBA range on disk -- one NVMe command writes one run of logical blocks --
+// so callers with holes in their page array must issue one call per
+// contiguous run.
+//
+// page_count of 0 is a no-op returning success; above NVME_MAX_PAGES_PER_XFER
+// is rejected rather than truncated. Returns 0 on success.
+int nvme_read_pages_gather_sync(uint64_t slba, void* const* pages, uint32_t page_count);
+int nvme_write_pages_gather_sync(uint64_t slba, const void* const* pages, uint32_t page_count);
+
+// Pure PRP arithmetic for the gather case, exposed for host testing for the
+// same reason nvme_build_prp() is: a wrong entry makes the controller DMA a
+// page it was never told to touch.
+int nvme_build_prp_gather(const void* const* pages, uint32_t page_count,
+                          uint64_t* prp_list_page,
+                          uint64_t* out_prp1, uint64_t* out_prp2);
 
 #endif /* NVME_IO_H */

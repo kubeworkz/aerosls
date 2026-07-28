@@ -190,6 +190,79 @@ int nvme_write_pages_sync(uint64_t slba, const void* buf, uint32_t page_count) {
     return nvme_pages_sync(slba, buf, page_count, NVME_NVM_WRITE);
 }
 
+// ─── nvme_build_prp_gather ────────────────────────────────────────────────────
+// Same contract as nvme_build_prp(), but the pages are supplied individually
+// rather than derived from one base address. See nvme_io.h for why this needs
+// no copying: a PRP list is already a scatter list.
+int nvme_build_prp_gather(const void* const* pages, uint32_t page_count,
+                          uint64_t* prp_list_page,
+                          uint64_t* out_prp1, uint64_t* out_prp2) {
+    if (!out_prp1 || !out_prp2 || !pages) return 1;
+    if (page_count == 0 || page_count > NVME_MAX_PAGES_PER_XFER) return 1;
+
+    // Every entry must be a real, page-aligned address: an unaligned or NULL
+    // page would make the controller DMA somewhere it was never told to.
+    for (uint32_t i = 0; i < page_count; i++) {
+        if (!pages[i]) return 1;
+        if (((uint64_t)(uintptr_t)pages[i]) & (NVME_PAGE_SIZE - 1)) return 1;
+    }
+
+    *out_prp1 = (uint64_t)(uintptr_t)pages[0];
+
+    if (page_count == 1) { *out_prp2 = 0; return 0; }
+    if (page_count == 2) { *out_prp2 = (uint64_t)(uintptr_t)pages[1]; return 0; }
+
+    if (!prp_list_page) return 1;
+    for (uint32_t i = 0; i + 1 < page_count; i++)
+        prp_list_page[i] = (uint64_t)(uintptr_t)pages[i + 1];
+    *out_prp2 = (uint64_t)(uintptr_t)prp_list_page;
+    return 0;
+}
+
+static int nvme_pages_gather_sync(uint64_t slba, const void* const* pages,
+                                  uint32_t page_count, uint8_t opcode) {
+    if (page_count == 0) return 0;
+    if (page_count > NVME_MAX_PAGES_PER_XFER) return 0xFE;
+    if (!io_sq || !io_cq) return 0xFD;
+
+    uint64_t prp1 = 0, prp2 = 0;
+    if (nvme_build_prp_gather(pages, page_count, io_prp_list, &prp1, &prp2) != 0)
+        return 0xFC;
+
+    struct NVMeCmd cmd;
+    uint32_t* p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = opcode;
+    cmd.nsid   = NVME_NSID;
+    cmd.prp1   = prp1;
+    cmd.prp2   = prp2;
+    cmd.cdw10  = (uint32_t)(slba & 0xFFFFFFFFu);
+    cmd.cdw11  = (uint32_t)(slba >> 32);
+    cmd.cdw12  = page_count * NVME_SECTORS_PER_PAGE - 1;
+    return nvme_io_submit_sync(&cmd);
+}
+
+int nvme_read_pages_gather_sync(uint64_t slba, void* const* pages, uint32_t page_count) {
+    return nvme_pages_gather_sync(slba, (const void* const*)pages, page_count, NVME_NVM_READ);
+}
+int nvme_write_pages_gather_sync(uint64_t slba, const void* const* pages, uint32_t page_count) {
+    return nvme_pages_gather_sync(slba, pages, page_count, NVME_NVM_WRITE);
+}
+
+// ─── nvme_flush_sync ──────────────────────────────────────────────────────────
+// NVM Flush (opcode 0x00): commits the controller's volatile write cache to
+// non-volatile media. Takes no data buffer, so no PRP entries are set.
+int nvme_flush_sync(void) {
+    if (!io_sq || !io_cq) return 0xFD;
+
+    struct NVMeCmd cmd;
+    uint32_t* p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = NVME_NVM_FLUSH;
+    cmd.nsid   = NVME_NSID;
+    return nvme_io_submit_sync(&cmd);
+}
+
 // ─── submit one I/O command and poll for completion ───────────────────────────
 // Gap fix: this poll loop used to be unbounded (`while (...) pause();` with
 // no exit condition other than the completion actually showing up) -- see

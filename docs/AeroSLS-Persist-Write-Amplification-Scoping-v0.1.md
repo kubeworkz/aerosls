@@ -347,6 +347,162 @@ Compile-check: `kernel/persist.c` clean with `-I` flags and with none, zero erro
 **Options A, B, and C are closed.** §4's sequencing is complete except step 5 (Option D, append-only log), which remains unscheduled and is now clearly unnecessary for the foreseeable term — A+B+C together took a single-field update from 323 commands / 1.26 MiB to 2 commands / 8 KiB.
 
 Still open, unchanged by any of this work:
-- §3's pre-existing hazards: header-written-before-data with no checksum or torn-write detection, and no NVMe flush/FUA command anywhere (so a completed write is not a power-loss durability guarantee).
+- §3's pre-existing hazards: header-written-before-data with no checksum or torn-write detection, and no NVMe flush/FUA command anywhere (so a completed write is not a power-loss durability guarantee). **Closed in §9.**
 - The stream paths (§7.4) — they pass scattered frame-pool frames and need a gather path of their own.
 - The other thirteen persisted regions still write in full; extending shadow comparison to them is now mechanical, and worth doing only if any becomes hot.
+
+---
+
+## 9. Findings addendum: §3's hazards closed — and a live corruption bug they uncovered
+
+§3's two pre-existing hazards are fixed. Doing so also surfaced something considerably more serious than either of them.
+
+### 9.1 The bug this work found: 24 wrong LBA constants, 10 overlapping regions
+
+Adding checksums immediately failed verification on two regions in an existing, previously-passing test. The cause was not the new code.
+
+**`kernel/persist.h`'s LBA `#define`s did not match `kernel/persist.h`'s own documented layout table — 24 of 35 disagreed.** The capacity-sizing pass (Gap Analysis §18) rewrote the layout *comments* — carefully, with `sizeof()`-verified frame counts and a deliberate 1-frame safety gap after every region — but **never updated the actual constants**. The result was ten pairs of overlapping regions, silently corrupting each other on every write:
+
+```
+PERSIST_DATABASE_ENT_LBA   [6696,6720)  overlaps  PERSIST_DATABASE_GRANT_LBA [6704,7384)
+PERSIST_DATABASE_GRANT_LBA [6704,7384)  overlaps  PERSIST_VIEW_ENT_LBA       [6760,6784)
+PERSIST_DATABASE_GRANT_LBA [6704,7384)  overlaps  PERSIST_TENANT_ENT_LBA     [6792,6824)
+PERSIST_PART_ASSIGN_LBA    [5808,5904)  overlaps  PERSIST_ROWSTORE_ENT_LBA   [5832,6136)
+   ... 6 more
+```
+
+Concretely: writing `database_grants[]` overwrote two of the three frames holding `databases[]`. Writing the partition assignment table overwrote the row-store table headers. This is precisely the failure mode §18 was written to prevent, and its own prose describes as *"a silent on-disk data-corruption time bomb the moment any of those constants grew."* The constants grew; the bomb went off; nothing detected it.
+
+**Why no test caught it for so long:** the surviving frame in each overlap happens to be the *first* one, and every existing test only asserts on low-indexed entries — `databases[0]`, `database_grants[2]` — which live in exactly the bytes that survive. The tests passed on luck, not correctness. Data above roughly index 93 in `databases[]` was being destroyed on every write, invisibly.
+
+Fixed by setting all 24 constants to the documented values. Verified with an overlap checker built from the real `#define`s and real `sizeof()`s: **zero overlaps**, all regions inside the intended envelope, clear of `STREAM_DIR_LBA`. That checker is now a permanent host test — see §10.
+
+This is the strongest argument available for having done the checksum work at all: it converted a silent, years-old corruption bug into an immediate, loud test failure the first time it ran.
+
+### 9.2 Torn-write detection
+
+Three changes that only work together:
+
+1. **The header now carries an FNV-1a checksum of its region's data** (header offset 24). Hand-rolled and file-local, matching this codebase's per-file helper convention; non-cryptographic is the right tool for detecting an interrupted write.
+2. **The header is written LAST.** A crash before it lands leaves the *previous* header, whose checksum will not match the partially-rewritten data — so the torn state is detected rather than trusted.
+3. **Verification happens BEFORE loading.** `persist_read_array()` loads straight into live arrays, so verifying afterwards would already have polluted kernel state. Every region is now scanned up front, streamed off disk and checksummed *without being retained*, and only regions that verify are allowed to load.
+
+This **fails closed**: a mismatch cold-starts that region rather than loading torn data. It is detection, not recovery — recovering a previous good copy would need A/B double-buffering of every region, which the LBA layout has nowhere near enough slack for (78 spare frames against 679 in use). Named as a limit rather than implied.
+
+Backward compatibility: the checksum field is additive, so headers written by an older build have zero there and are accepted exactly as before. Rejecting them would discard every existing snapshot. The honest cost — such images get no torn-write protection until rewritten — is asserted in the test, not just documented.
+
+### 9.3 Durability ordering
+
+`nvme_flush_sync()` (NVM Flush, opcode 0x00) was added to the driver; no flush command existed anywhere in the codebase before, so every "persisted" write was only durable against a process restart, never against power loss.
+
+Region commit now runs **data → flush → header → flush**. The first barrier is what makes the checksum meaningful: without it the controller could commit the header before the data it vouches for, reopening the exact window being closed. The second means the region is genuinely on media when the call returns.
+
+### 9.4 Verification
+
+New `tests/persist_crash_consistency_host_test.c` — **13 checks**, real execution against the unmodified `kernel/persist.c`, with a fake NVMe that records an **operation log** so ordering can be asserted rather than assumed:
+
+- A torn data frame is detected, and — the load-bearing assertion — **the live array is left exactly as the caller had it**, proving verification precedes loading.
+- A stale header over newer data is rejected too (the reverse ordering failure).
+- Ordering asserted from the op log: data frames written before the header, a flush *between* them, and a second flush after.
+- A pre-checksum image still loads; a torn pre-checksum image loads its corrupt bytes **undetected** — the documented limitation, asserted rather than assumed; and rewriting the region restores protection.
+
+`tests/persist_rdbms_vecstore_host_test.c` began failing 4 checks when checksums landed. Investigation showed this was **the new code correctly reporting real corruption**, not a test problem — it passes again now that the LBA constants are fixed, and it is the test that led to §9.1.
+
+One bug was introduced and caught during this work: the region scanner initially shared `p_buf` with the restore blocks, clobbering the header a block had just read and making every region look size-mismatched. It now has its own buffer. The crash-consistency test caught it on its first run.
+
+Blast radius: `nvme_flush_sync()` needed a stub in the 28 host tests that fake the NVMe layer — same faithful-stub convention as §7.3.
+
+Compile-check: `kernel/persist.c`, `drivers/nvme_io.c`, `kernel/transaction.c` all clean with `-I` flags and with none, zero errors. Full regression: **64/64 host tests passing**, zero regressions.
+
+**Not verified:** as throughout, no real-hardware run. Torn writes are simulated by damaging frames underneath persist.c, which is what an interrupted write leaves behind, but an actual power-loss test on real hardware is out of reach here. `nvme_flush_sync()`'s real behaviour against a physical controller's volatile cache is compile-checked and reviewed only.
+
+### 9.5 Status
+
+§3 is closed. Remaining open items:
+
+- The LBA overlap checker is now permanent — **see §10.**
+- The stream paths (§7.4) — scattered frame-pool frames, need a gather path.
+- Recovery (as opposed to detection) of a torn region would need A/B region double-buffering and a larger LBA envelope.
+- The other thirteen regions still write in full (§8.6).
+
+---
+
+## 10. Findings addendum: the layout guard is permanent
+
+`tests/persist_lba_layout_host_test.c` — 6 checks. §9.5 called this the highest-value follow-up in the document; it is done.
+
+### 10.1 Why this shape
+
+Everything is derived from the **real `#define` values and real `sizeof()`s**, never from a transcription. That is the whole point: §9.1 happened precisely because a hand-maintained description (the comment table) and the actual constants drifted apart. A test that re-encoded the expected LBAs by hand would be a third copy to drift. Deriving from the code means changing any governing constant — `PARTITION_MAX`, `DATABASE_GRANT_MAX`, `RECORD_VAL_LEN` — without moving the LBAs to match fails here rather than corrupting a disk.
+
+It links no `.c` file at all: `sizeof()` on an extern array with a known bound is a compile-time constant, so the headers suffice. The test is therefore free of the persistence layer's dependency graph and runs instantly.
+
+### 10.2 What it asserts
+
+- **No two extents overlap**, compared pairwise across every region, **headers included** — the original corruption had a data array landing on both another array and a neighbouring region's header.
+- **Envelope**: every extent ends below `STREAM_DIR_LBA` and starts at or above the first region. Overflow past the stream directory would corrupt an unrelated subsystem. (Current margin: 79 frames.)
+- **The documented 1-frame safety gap** really exists between regions from `partitions` onward. persist.h *claims* this gap; zero-slack adjacency is what made the original bug possible, so the claim is now enforced rather than trusted.
+- **Two named regression guards** for the specific historical failures — `database_grants[]` starting 16 sectors inside `databases[]`, and `partition_assign_table[]` running straight through `table_headers[]` — so a recurrence reads as *that bug* rather than an anonymous overlap.
+- On failure it prints the full derived layout, so the output is diagnosable without re-deriving anything by hand.
+
+### 10.3 The test was verified to actually fail
+
+A guard that has never failed is not known to work. The original bug was reintroduced deliberately (`PERSIST_DATABASE_GRANT_LBA` 6760 → 6704) and the test caught it: **4 overlaps reported with exact LBA ranges**, both the general overlap check and the named `database_grants` regression guard failing, exit code non-zero. The constant was then restored and the test passes again.
+
+Full regression: **65/65 host tests passing**, zero regressions.
+
+### 10.4 Residual limitation, named
+
+This guards the *static layout*. It cannot catch a caller passing a wrong LBA at a call site — e.g. `persist_write_array(x, n, PERSIST_VIEW_ENT_LBA)` inside `persist_tenants()`. The checksum work (§9) covers that case from the other direction, since such a write would land outside the region the checksum then verifies. Between the two, both the layout and its use are now watched; neither alone would be sufficient.
+
+---
+
+## 11. Findings addendum: remaining items closed out
+
+The three items left open across §7.4, §8.6 and §9.5. Two were built; one is a deliberate decision not to build, recorded with its trigger.
+
+### 11.1 Stream gather path — built
+
+`stream_write_chunk()`'s `is_last` flush issued one 4 KiB command per frame: up to **STREAM_MAX_FRAMES (16,384)** synchronous round trips for one 64 MiB stream. §7.4 deferred this because a stream's pages are separately allocated frame-pool frames — scattered in memory, so the contiguous multi-page path cannot describe them.
+
+That framing turned out to be too pessimistic. **A PRP list is natively a scatter list**: every entry is an independent page address with no requirement that they be consecutive. So no copying and no staging buffer is needed — `nvme_build_prp_gather()` / `nvme_write_pages_gather_sync()` (`drivers/nvme_io.c`) describe the scattered frames to the controller directly.
+
+Batching walks runs of **consecutive populated frames**, because one NVMe command covers one contiguous *LBA* range. A NULL frame (a hole never written) must therefore end the current run rather than be skipped — writing across a hole would shift every later frame onto the wrong LBA.
+
+Measured: **103 frames flush in 4 commands instead of 103** — a 25.8× reduction, and the ratio improves with stream size up to the 32-page cap.
+
+The flush loop was extracted into `stream_flush_frames()` so the index arithmetic could be tested in isolation. That was not cosmetic: **the first draft had a real bug** — the frame that filled a batch was written with that batch *and* re-seeded into the next run, so it went to disk twice and every later frame landed one LBA early. Batching a loop that writes to computed LBAs is precisely where an off-by-one does not crash; it silently misplaces data that only surfaces on read-back. It was caught by writing the test.
+
+`tests/stream_gather_flush_host_test.c` — 13 checks, all asserting **where bytes land**, not just command counts: contiguous runs, a run of exactly the batch limit, **one past the batch limit** (the named regression guard for that bug), a hole splitting a run with nothing written into the hole, four-batch runs, and the empty case.
+
+### 11.2 Shadow-compare extended to the two hot regions — built
+
+§8.6 left eleven regions writing in full, "worth doing only if any becomes hot." Two already were, per §1.1: `persist_rowstore_headers()` (40 frames, every row insert/delete) and `persist_row_journal()` (35 frames, every journaled mutation). A single SQL row insert into a journaled table paid 75 whole-region frames.
+
+Both now shadow-compare their large array, on the same mechanism as `object_records[]`.
+
+**The other eleven are deliberately left alone**, and that is the substantive half of this item. They are administrative — create-database, create-view, create-tenant, schema-set, program-upload — written a handful of times per boot, not per mutation. Shadowing all of them would cost roughly **1.4 MiB of additional BSS** to optimise operations nobody performs in a loop. The mechanism is region-agnostic, so opting one in later is adding a buffer and a flag; this is a reversible judgement about which regions are hot, not a structural limit.
+
+Their shadows are left invalid after restore rather than seeded (unlike `object_records[]`), so the first write per boot is a full one. Conservative and correct; the cost is one extra full write per region per boot.
+
+### 11.3 A/B torn-region recovery — deliberately not built
+
+§9.2 delivered *detection*: a torn region is caught and cold-started rather than silently loaded. Recovery — actually restoring the previous good copy — needs A/B double-buffering, and this is a decision not to build it.
+
+**The arithmetic.** Double-buffering means a second copy of every region: **~679 additional frames**. The layout currently has **79 frames** of margin before `STREAM_DIR_LBA`. It does not fit, and cannot be made to fit by rearrangement — closing the gap requires moving `STREAM_DIR_LBA` and everything above it, which is a disk-layout redesign with a migration path for existing images, not a tuning change.
+
+**Why the residual risk is proportionate.** Before this work, a torn write produced *silent corruption loaded into live kernel state*. It now produces a *detected, reported, single-region cold start* — the failure mode moved from "wrong data trusted indefinitely" to "known data loss, announced." That is the larger share of the available benefit, and it came at a fraction of the cost. Additionally, `nvme_flush_sync()` narrows the window itself: the data is on media before the header that validates it, so the interval in which a crash can tear a region is now bounded by one flush rather than by an unbounded controller cache.
+
+**The trigger for revisiting.** If a disk-layout redesign happens for any other reason — the 10 GiB image growing, the stream region moving, adding a region that no longer fits — A/B double-buffering should be designed in at that point, when the envelope is being reconsidered anyway. Doing it now would mean forcing that redesign for this feature alone, which is not warranted.
+
+### 11.4 Verification
+
+Blast radius: the three tests linking `kernel/stream.c` that fake the NVMe layer needed gather stubs, again as faithful loops over the single-page fake so their existing assertions keep exercising the new path.
+
+Full regression: **66/66 host tests passing**, zero regressions. `kernel/persist.c`, `kernel/stream.c` and `drivers/nvme_io.c` compile clean with `-I` flags and with none, zero errors.
+
+### 11.5 Status
+
+Every item raised in this document is now closed or has a recorded decision. Cumulative effect on a single-field update: **323 commands / 1.26 MiB → 2 commands / 8 KiB**. A 20-operation transaction commit: **6,460 commands → 13**. A 64 MiB stream flush: **16,384 commands → 512**. Alongside that, one live data-corruption bug found and fixed (§9.1), and two guards added that would have caught it (§9, §10).
+
+Unchanged and still true: none of this has been measured in wall-clock terms or run on real hardware, for the standing reason that this environment cannot build or boot the kernel. Every figure above is an exact operation or byte count.

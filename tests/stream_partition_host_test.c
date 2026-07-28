@@ -126,6 +126,22 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
     fake_usage[partition_id]++;
     return frame;
 }
+int nvme_write_pages_gather_sync(uint64_t slba, const void* const* pages, uint32_t page_count) {
+    /* Scatter-gather transfer (drivers/nvme_io.h): kernel/stream.c batches a
+     * stream's scattered frame-pool frames into one command per contiguous LBA
+     * run. Faithful loop over the single-page fake above rather than a no-op,
+     * so the bytes still land at exactly the LBAs the real driver would use --
+     * every existing assertion in this file keeps verifying real behaviour
+     * through the new path. */
+    for (uint32_t i = 0; i < page_count; i++)
+        if (nvme_write_sync(slba + (uint64_t)i * 8, pages[i]) != 0) return 1;
+    return 0;
+}
+int nvme_read_pages_gather_sync(uint64_t slba, void* const* pages, uint32_t page_count) {
+    for (uint32_t i = 0; i < page_count; i++)
+        if (nvme_read_sync(slba + (uint64_t)i * 8, pages[i]) != 0) return 1;
+    return 0;
+}
 int partition_set_frame_quota(uint32_t partition_id, uint64_t frame_quota) {
     if (partition_id >= PARTITION_MAX) return 1;
     fake_quota[partition_id] = frame_quota;

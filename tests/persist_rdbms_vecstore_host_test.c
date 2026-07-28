@@ -162,6 +162,16 @@ int nvme_read_pages_sync(uint64_t slba, void* buf, uint32_t page_count) {
             return 1;
     return 0;
 }
+int nvme_flush_sync(void) {
+    /* Durability barrier (drivers/nvme_io.h): kernel/persist.c issues one
+     * before and one after each region header so the data reaches media
+     * before the header validating it does. This fake store is already
+     * synchronous and non-volatile for the test's purposes, so there is
+     * nothing to force -- success is the faithful answer. Tests that care
+     * about ORDERING record the call instead; see
+     * tests/persist_crash_consistency_host_test.c. */
+    return 0;
+}
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \

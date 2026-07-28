@@ -49,6 +49,30 @@ static int p_memcmp(const void* a, const void* b, uint32_t n) {
     return 0;
 }
 
+// ─── Region checksums (crash/torn-write detection) ───────────────────────────
+// FNV-1a, 64-bit. Hand-rolled and local to this file, matching this codebase's
+// established per-file helper convention (p_memcpy/p_memset above, tn_* in
+// tenant.c, db_* in database.c) rather than reaching into transaction.c's
+// static CRC32. Table-free and trivially auditable; this detects accidental
+// corruption from an interrupted write, not adversarial tampering, so a
+// non-cryptographic checksum is the right tool.
+#define P_FNV_OFFSET 1469598103934665603ULL
+#define P_FNV_PRIME  1099511628211ULL
+
+/* Running region-write state -- see the crash-consistency block below for
+ * what these mean and why the header is written last. */
+static uint64_t p_region_hdr_lba   = 0;
+static uint64_t p_region_hdr_magic = 0;
+static uint32_t p_region_v0 = 0, p_region_v1 = 0, p_region_v2 = 0;
+static uint64_t p_region_csum      = 0;
+static int      p_region_open      = 0;
+
+static uint64_t p_csum_fold(uint64_t h, const void* data, uint32_t n) {
+    const uint8_t* p = (const uint8_t*)data;
+    while (n--) { h ^= (uint64_t)(*p++); h *= P_FNV_PRIME; }
+    return h;
+}
+
 // Gap fix: every function below used to call nvme_write_sync()/
 // nvme_read_sync() unconditionally, with no check that the NVMe I/O queue
 // actually came up this boot. stream.c has always guarded its own NVMe call
@@ -58,7 +82,7 @@ static int p_memcmp(const void* a, const void* b, uint32_t n) {
 // controller's MMIO BAR lands above the 4 GiB identity map) -- but every
 // persist_*() function in this file (persist_catalog(), persist_vecstore_
 // headers(), persist_rowstore_headers(), persist_partitions(), and everything
-// else routing through persist_write_array()/persist_read_array()/write_hdr()
+// else routing through persist_write_array()/persist_read_array()/stage_hdr()
 // below) never had that same guard. Concretely: on a boot where NVMe is
 // unavailable, io_sq/io_cq are NULL, so nvme_io_submit_sync() dereferenced
 // those NULLs and rang a "doorbell" at a bogus address derived from a
@@ -101,6 +125,10 @@ static uint8_t __attribute__((aligned(4096)))
 // zero-padded single-page path (the on-disk image must have that tail
 // zero-filled rather than carrying whatever followed the array in memory).
 static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t lba) {
+    // Fold before the availability check so the checksum reflects the region's
+    // logical content regardless of whether NVMe is up, keeping multi-array
+    // regions consistent.
+    if (p_region_open) p_region_csum = p_csum_fold(p_region_csum, src, total_bytes);
     if (!persist_nvme_available()) return;
     const uint8_t* p = (const uint8_t*)src;
 
@@ -166,6 +194,24 @@ static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t 
 static uint8_t p_shadow_records[sizeof(object_records)];
 static int     p_shadow_records_valid = 0;
 
+// The other two per-mutation hot regions. Both are written on every row
+// insert/delete or journaled mutation (kernel/rowstore.c:664/747,
+// kernel/row_journal.c:119/149/161), so a single SQL row insert into a
+// journaled table paid 40 + 35 = 75 whole-region frames before this.
+//
+// The remaining ELEVEN persisted regions are deliberately NOT shadowed.
+// They are administrative -- written on create-database, create-view,
+// create-tenant, schema-set, program-upload -- not per mutation, and range
+// from 1 to 89 frames. Shadowing all of them would cost roughly 1.4 MiB of
+// additional BSS to optimise operations a human performs a handful of times
+// per boot. Deciding not to is the point: the mechanism is region-agnostic
+// and opting one in later is adding a buffer and a flag, so this is a
+// reversible judgement about which regions are hot, not a limitation.
+static uint8_t p_shadow_rowstore[sizeof(table_headers)];
+static int     p_shadow_rowstore_valid = 0;
+static uint8_t p_shadow_rowjournal[sizeof(row_journal_buffer)];
+static int     p_shadow_rowjournal_valid = 0;
+
 // Diagnostics/tests: how many 4 KiB frames the last shadow-compared write
 // actually put on the wire.
 static uint32_t p_last_frames_written = 0;
@@ -184,7 +230,11 @@ int  persist_verify_get(void)   { return p_verify_mode; }
 // after restore-from-disk paths and available as an escape hatch whenever the
 // on-disk image may no longer match the shadow (format-version mismatch, a
 // newly added second writer, a failed write).
-void persist_shadow_invalidate(void) { p_shadow_records_valid = 0; }
+void persist_shadow_invalidate(void) {
+    p_shadow_records_valid    = 0;
+    p_shadow_rowstore_valid   = 0;
+    p_shadow_rowjournal_valid = 0;
+}
 
 // Reads the whole region back off NVMe and compares against memory. Returns
 // the number of differing frames (0 == disk and memory agree).
@@ -207,13 +257,20 @@ static uint32_t persist_verify_region(const void* src, uint32_t total_bytes, uin
 // match what was written.
 static void persist_write_array_diffed(const void* src, uint32_t total_bytes, uint64_t lba,
                                        uint8_t* shadow, int* shadow_valid) {
+    // Checksum covers the region's whole logical content, not just the frames
+    // this call happens to write -- shadow-compare skips clean frames, but the
+    // on-disk image still contains all of it.
+    if (p_region_open) p_region_csum = p_csum_fold(p_region_csum, src, total_bytes);
     if (!persist_nvme_available()) return;
 
     // Cold start, or the shadow was explicitly invalidated: the on-disk image
     // may be absent, stale, or from another kernel build, so nothing can be
     // safely skipped. Write everything, then the shadow is trustworthy.
     if (!*shadow_valid) {
+        int reopen = p_region_open;
+        p_region_open = 0;              /* already folded above -- don't double-count */
         persist_write_array(src, total_bytes, lba);
+        p_region_open = reopen;
         p_memcpy(shadow, src, total_bytes);
         *shadow_valid = 1;
         p_last_frames_written = (total_bytes + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
@@ -278,7 +335,10 @@ static void persist_write_array_diffed(const void* src, uint32_t total_bytes, ui
                 "-- a needed write was skipped. Forcing a full rewrite.\n",
                 (unsigned)bad, (unsigned long)lba);
             *shadow_valid = 0;               /* next write repairs it in full */
+            int reopen2 = p_region_open;
+            p_region_open = 0;           /* already folded above */
             persist_write_array(src, total_bytes, lba);
+            p_region_open = reopen2;
             p_memcpy(shadow, src, total_bytes);
             *shadow_valid = 1;
         }
@@ -311,16 +371,208 @@ static void persist_read_array(void* dst, uint32_t total_bytes, uint64_t lba) {
     }
 }
 
-// Write a 4-KiB header frame: 8-byte magic + three uint32_t fields.
-static void write_hdr(uint64_t lba, uint64_t magic,
+// ─── Crash consistency: checksummed header, written AFTER its data ───────────
+// The original order was header first, then data, with the restore side
+// checking only the magic value and the recorded size. A crash partway
+// through a multi-frame data write therefore left a VALID header pointing at
+// a half-old, half-new array, and the next boot accepted it silently. There
+// was no checksum, no generation counter, and no torn-write detection
+// anywhere in the persistence layer. See §3 of
+// docs/AeroSLS-Persist-Write-Amplification-Scoping-v0.1.md.
+//
+// The fix is two changes that only work together:
+//
+//   1. The header is now written LAST, and carries a checksum of the region's
+//      data. A crash before the header lands leaves the PREVIOUS header, whose
+//      checksum will not match the partially-rewritten data -- so the torn
+//      state is detected at restore instead of trusted.
+//   2. An NVM Flush separates the two, so the data is durable on media before
+//      the header that validates it becomes durable. Without the barrier the
+//      controller could commit them in the opposite order and reintroduce
+//      exactly the window being closed.
+//
+// This fails CLOSED: a detected mismatch means that region cold-starts rather
+// than loading torn data. It is detection, not recovery -- recovering the
+// previous good copy would need A/B double-buffering of every region, which
+// the current LBA layout has nowhere near enough slack for (78 frames spare
+// against 679 in use).
+//
+// stage_hdr() records what the header will say and resets the running
+// checksum; persist_write_array*() folds each array it writes into that
+// checksum; persist_region_commit() performs the barrier-header-barrier
+// sequence. Every persist_*() below therefore reads: stage, write arrays,
+// commit.
+
+// Byte offset of the checksum within the 4 KiB header frame. Chosen past the
+// existing magic(8) + v0/v1/v2(12) = 20 bytes, so this is a purely ADDITIVE
+// format change: a header written before this existed has zeros here, which
+// the restore side treats as "no checksum recorded" and accepts exactly as it
+// did before. One-way upgrade, same accepted trade-off this codebase's other
+// one-way format changes documented (see PERSIST_STORAGE_ISOLATION_PHASE3_MARK
+// in persist.h).
+#define P_HDR_CSUM_OFF 24
+
+static void stage_hdr(uint64_t lba, uint64_t magic,
                       uint32_t v0, uint32_t v1, uint32_t v2) {
+    p_region_hdr_lba   = lba;
+    p_region_hdr_magic = magic;
+    p_region_v0 = v0; p_region_v1 = v1; p_region_v2 = v2;
+    p_region_csum = P_FNV_OFFSET;
+    p_region_open = 1;
+}
+
+static void persist_region_commit(void) {
+    if (!p_region_open) return;
+    p_region_open = 0;
     if (!persist_nvme_available()) return;
+
+    // Barrier 1: every data frame of this region reaches media before the
+    // header that vouches for it is even submitted.
+    nvme_flush_sync();
+
+    uint64_t csum = p_region_csum;
+    if (csum == 0) csum = 1;   /* 0 is the "no checksum recorded" sentinel */
+
     p_memset(p_buf, 0, 4096);
-    p_memcpy(p_buf +  0, &magic, 8);
-    p_memcpy(p_buf +  8, &v0,   4);
-    p_memcpy(p_buf + 12, &v1,   4);
-    p_memcpy(p_buf + 16, &v2,   4);
-    nvme_write_sync(lba, p_buf);
+    p_memcpy(p_buf +  0, &p_region_hdr_magic, 8);
+    p_memcpy(p_buf +  8, &p_region_v0, 4);
+    p_memcpy(p_buf + 12, &p_region_v1, 4);
+    p_memcpy(p_buf + 16, &p_region_v2, 4);
+    p_memcpy(p_buf + P_HDR_CSUM_OFF, &csum, 8);
+    nvme_write_sync(p_region_hdr_lba, p_buf);
+
+    // Barrier 2: the region is genuinely durable when this returns, rather
+    // than merely acknowledged by a volatile controller cache.
+    nvme_flush_sync();
+}
+
+
+// ─── Restore-side verification: check BEFORE loading ─────────────────────────
+// persist_read_array() loads straight into the live arrays, so verifying after
+// the fact would already have polluted kernel state with torn data. Instead
+// every region is scanned once up front: its data is streamed off disk and
+// checksummed WITHOUT being retained anywhere, and only regions whose checksum
+// matches their header are then allowed to load.
+//
+// The span table below must list exactly the arrays each persist_*() writes,
+// in the same order, because the write side folds them into the checksum in
+// that order. It was extracted mechanically from those functions rather than
+// transcribed by hand; a mismatch would surface immediately as every region
+// failing verification on the first boot after a write.
+#define P_MAX_SPANS 3
+struct PersistRegionSpec {
+    uint64_t hdr_lba;
+    uint64_t magic;
+    int      nspans;
+    struct { uint64_t lba; uint32_t bytes; } spans[P_MAX_SPANS];
+};
+
+static const struct PersistRegionSpec p_region_specs[] = {
+    { PERSIST_CAT_HDR_LBA, PERSIST_MAGIC_CAT,
+      2, { { PERSIST_CAT_ENT_LBA, (uint32_t)sizeof(object_catalog) }, { PERSIST_ROLE_ENT_LBA, (uint32_t)sizeof(role_table) } } },
+    { PERSIST_REC_HDR_LBA, PERSIST_MAGIC_REC,
+      1, { { PERSIST_REC_ENT_LBA, (uint32_t)sizeof(object_records) } } },
+    { PERSIST_SCH_HDR_LBA, PERSIST_MAGIC_SCH,
+      1, { { PERSIST_SCH_ENT_LBA, (uint32_t)sizeof(object_schemas) } } },
+    { PERSIST_PROG_HDR_LBA, PERSIST_MAGIC_PROG,
+      1, { { PERSIST_PROG_DAT_LBA, (uint32_t)sizeof(service_binaries) } } },
+    { PERSIST_PART_HDR_LBA, PERSIST_MAGIC_PART,
+      3, { { PERSIST_PART_ENT_LBA, (uint32_t)sizeof(partition_table) }, { PERSIST_PART_ASSIGN_LBA, (uint32_t)sizeof(partition_assign_table) }, { PERSIST_PART_OWNER_LBA, (uint32_t)sizeof(partition_owner_table) } } },
+    { PERSIST_ROWSTORE_HDR_LBA, PERSIST_MAGIC_ROWSTORE,
+      2, { { PERSIST_ROWSTORE_ENT_LBA, (uint32_t)sizeof(table_headers) }, { PERSIST_ROWSTORE_PARTCURSOR_LBA, (uint32_t)sizeof(rowstore_partition_cursor) } } },
+    { PERSIST_ROW_CONSTRAINT_HDR_LBA, PERSIST_MAGIC_ROW_CONSTRAINT,
+      1, { { PERSIST_ROW_CONSTRAINT_ENT_LBA, (uint32_t)sizeof(row_constraints) } } },
+    { PERSIST_ROW_INDEX_HDR_LBA, PERSIST_MAGIC_ROW_INDEX,
+      1, { { PERSIST_ROW_INDEX_ENT_LBA, (uint32_t)sizeof(row_indexes) } } },
+    { PERSIST_VECSTORE_HDR_LBA, PERSIST_MAGIC_VECSTORE,
+      2, { { PERSIST_VECSTORE_ENT_LBA, (uint32_t)sizeof(vector_collections) }, { PERSIST_VECSTORE_PARTCURSOR_LBA, (uint32_t)sizeof(vecstore_partition_cursor) } } },
+    { PERSIST_VEC_INDEX_HDR_LBA, PERSIST_MAGIC_VEC_INDEX,
+      1, { { PERSIST_VEC_INDEX_ENT_LBA, (uint32_t)sizeof(vec_indexes) } } },
+    { PERSIST_ROW_JOURNAL_HDR_LBA, PERSIST_MAGIC_ROW_JOURNAL,
+      2, { { PERSIST_ROW_JOURNAL_ENT_LBA, (uint32_t)sizeof(row_journal_buffer) }, { PERSIST_ROW_JOURNAL_ATTACH_LBA, (uint32_t)sizeof(row_journal_attachments) } } },
+    { PERSIST_DATABASE_HDR_LBA, PERSIST_MAGIC_DATABASE,
+      2, { { PERSIST_DATABASE_ENT_LBA, (uint32_t)sizeof(databases) }, { PERSIST_DATABASE_GRANT_LBA, (uint32_t)sizeof(database_grants) } } },
+    { PERSIST_VIEW_HDR_LBA, PERSIST_MAGIC_VIEW,
+      1, { { PERSIST_VIEW_ENT_LBA, (uint32_t)sizeof(views) } } },
+    { PERSIST_TENANT_HDR_LBA, PERSIST_MAGIC_TENANT,
+      1, { { PERSIST_TENANT_ENT_LBA, (uint32_t)sizeof(tenants) } } },
+};
+#define P_REGION_COUNT ((int)(sizeof(p_region_specs)/sizeof(p_region_specs[0])))
+
+// Bit i set == region i's on-disk image was verified (or predates checksums).
+static uint32_t p_trusted_mask = 0;
+static int      p_scan_done    = 0;
+
+// Dedicated scratch frame for the scan. Deliberately NOT p_buf: each restore
+// block reads its header into p_buf and then reads fields out of it AFTER
+// calling persist_region_trusted(), so a scan sharing p_buf would clobber the
+// caller's header mid-block and make every region look size-mismatched. (That
+// is not hypothetical -- it is exactly what the first run of
+// tests/persist_crash_consistency_host_test.c caught.)
+static uint8_t __attribute__((aligned(4096))) p_scan_buf[4096];
+
+// Streams one span off disk, folding it into the running checksum without
+// retaining it. Returns 0 on success, 1 if any frame could not be read.
+static int p_csum_span_from_disk(uint64_t lba, uint32_t bytes, uint64_t* h) {
+    uint32_t rem = bytes;
+    while (rem > 0) {
+        uint32_t chunk = rem < NVME_PAGE_SIZE ? rem : NVME_PAGE_SIZE;
+        if (nvme_read_sync(lba, p_scan_buf) != 0) return 1;
+        *h = p_csum_fold(*h, p_scan_buf, chunk);
+        rem -= chunk;
+        lba += NVME_SECTORS_PER_PAGE;
+    }
+    return 0;
+}
+
+// Scans every region once, recording which are safe to load.
+static void persist_scan_regions(void) {
+    p_trusted_mask = 0;
+    p_scan_done    = 1;
+    if (!persist_nvme_available()) return;
+
+    for (int i = 0; i < P_REGION_COUNT; i++) {
+        const struct PersistRegionSpec* r = &p_region_specs[i];
+        if (nvme_read_sync(r->hdr_lba, p_scan_buf) != 0) continue;
+
+        uint64_t magic = 0, stored = 0;
+        p_memcpy(&magic, p_scan_buf, 8);
+        if (magic != r->magic) continue;      /* absent or foreign -- cold start regardless */
+        p_memcpy(&stored, p_scan_buf + P_HDR_CSUM_OFF, 8);
+
+        if (stored == 0) {
+            /* Header predates checksums (one-way, additive format change).
+             * Accepted exactly as before -- rejecting it would discard every
+             * image written by an older build. Such an image simply has no
+             * torn-write protection until it is next rewritten. */
+            p_trusted_mask |= (1u << i);
+            continue;
+        }
+
+        uint64_t h = P_FNV_OFFSET;
+        int io_ok = 1;
+        for (int sp = 0; sp < r->nspans && io_ok; sp++)
+            if (p_csum_span_from_disk(r->spans[sp].lba, r->spans[sp].bytes, &h) != 0) io_ok = 0;
+        if (h == 0) h = 1;                    /* mirrors the write side's sentinel guard */
+
+        if (io_ok && h == stored) {
+            p_trusted_mask |= (1u << i);
+        } else {
+            kernel_serial_printf(
+                "[PERSIST] Region at LBA %lu FAILED checksum -- torn or interrupted write "
+                "detected; cold-starting this region rather than loading corrupt state.\n",
+                (unsigned long)r->hdr_lba);
+        }
+    }
+}
+
+// True if this region's on-disk image may be loaded. Keyed on the magic value
+// so each restore block needs exactly one extra condition.
+static int persist_region_trusted(uint64_t magic) {
+    if (!p_scan_done) persist_scan_regions();
+    for (int i = 0; i < P_REGION_COUNT; i++)
+        if (p_region_specs[i].magic == magic) return (p_trusted_mask & (1u << i)) != 0;
+    return 1;   /* unknown region: unchanged behaviour */
 }
 
 // ─── Gap Remediation Phase D: HNSW backfill helper ───────────────────────────
@@ -436,10 +688,11 @@ void persist_catalog(void) {
     if (!io_sq || !io_cq) return;
     uint32_t cat_bytes  = (uint32_t)sizeof(object_catalog);
     uint32_t role_bytes = (uint32_t)sizeof(role_table);
-    write_hdr(PERSIST_CAT_HDR_LBA, PERSIST_MAGIC_CAT,
+    stage_hdr(PERSIST_CAT_HDR_LBA, PERSIST_MAGIC_CAT,
               object_catalog_count, cat_bytes, role_bytes);
     persist_write_array(object_catalog, cat_bytes,  PERSIST_CAT_ENT_LBA);
     persist_write_array(role_table,     role_bytes, PERSIST_ROLE_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Catalog snapshot written.\n");
 }
 
@@ -460,12 +713,13 @@ void persist_records(void) {
     if (persist_defer_note(PERSIST_PEND_REC)) return;
     if (!io_sq || !io_cq) return;
     uint32_t rec_bytes = (uint32_t)sizeof(object_records);
-    write_hdr(PERSIST_REC_HDR_LBA, PERSIST_MAGIC_REC, rec_bytes, 0, 0);
+    stage_hdr(PERSIST_REC_HDR_LBA, PERSIST_MAGIC_REC, rec_bytes, 0, 0);
     // Shadow-compared: writes only the frames whose bytes actually changed
     // since the last write. See persist_write_array_diffed() for why this is
     // a shadow copy rather than caller-supplied dirty marks.
     persist_write_array_diffed(object_records, rec_bytes, PERSIST_REC_ENT_LBA,
                                p_shadow_records, &p_shadow_records_valid);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Records snapshot written.\n");
 }
 
@@ -474,8 +728,9 @@ void persist_schemas(void) {
     if (persist_defer_note(PERSIST_PEND_SCH)) return;
     if (!io_sq || !io_cq) return;
     uint32_t sch_bytes = (uint32_t)sizeof(object_schemas);
-    write_hdr(PERSIST_SCH_HDR_LBA, PERSIST_MAGIC_SCH, sch_bytes, 0, 0);
+    stage_hdr(PERSIST_SCH_HDR_LBA, PERSIST_MAGIC_SCH, sch_bytes, 0, 0);
     persist_write_array(object_schemas, sch_bytes, PERSIST_SCH_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Schemas snapshot written.\n");
 }
 
@@ -487,8 +742,9 @@ void persist_programs(void) {
     if (persist_defer_note(PERSIST_PEND_PROG)) return;
     if (!io_sq || !io_cq) return;
     uint32_t prog_bytes = (uint32_t)sizeof(service_binaries);
-    write_hdr(PERSIST_PROG_HDR_LBA, PERSIST_MAGIC_PROG, prog_bytes, 0, 0);
+    stage_hdr(PERSIST_PROG_HDR_LBA, PERSIST_MAGIC_PROG, prog_bytes, 0, 0);
     persist_write_array(service_binaries, prog_bytes, PERSIST_PROG_DAT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Programs snapshot written.\n");
 }
 
@@ -502,7 +758,7 @@ void persist_programs(void) {
 //
 // Multi-Node Partition Scaling Roadmap, Phase 2: also writes
 // partition_owner_table[] as a third array under the same header, using
-// write_hdr()'s previously-unused v2 size slot (Phase 10 always passed 0
+// stage_hdr()'s previously-unused v2 size slot (Phase 10 always passed 0
 // there -- see the restore block's own comment on why this is safe for
 // old snapshots). Ownership needs to survive a reboot the same way
 // partition identity itself does: partition_table[]/partition_assign_
@@ -518,18 +774,19 @@ void persist_partitions(void) {
     uint32_t part_bytes   = (uint32_t)sizeof(partition_table);
     uint32_t assign_bytes = (uint32_t)sizeof(partition_assign_table);
     uint32_t owner_bytes  = (uint32_t)sizeof(partition_owner_table);
-    write_hdr(PERSIST_PART_HDR_LBA, PERSIST_MAGIC_PART,
+    stage_hdr(PERSIST_PART_HDR_LBA, PERSIST_MAGIC_PART,
               part_bytes, assign_bytes, owner_bytes);
     persist_write_array(partition_table,        part_bytes,   PERSIST_PART_ENT_LBA);
     persist_write_array(partition_assign_table, assign_bytes, PERSIST_PART_ASSIGN_LBA);
     persist_write_array(partition_owner_table,  owner_bytes,  PERSIST_PART_OWNER_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Partitions snapshot written.\n");
 }
 
 // ─── persist_rowstore_headers ─────────────────────────────────────────────────
 // Phase 16 (relational layer). Writes table_headers[] plus the page-pool
 // high-water mark (rowstore_next_free_page_id, stashed in the header
-// frame's v1 slot — same "steal a uint32 slot in write_hdr()" trick this
+// frame's v1 slot — same "steal a uint32 slot in stage_hdr()" trick this
 // file has no dedicated pattern for otherwise). Row PAGE data is NOT
 // written here — see persist.h's comment on this function.
 //
@@ -542,11 +799,13 @@ void persist_rowstore_headers(void) {
     if (persist_defer_note(PERSIST_PEND_ROWSTORE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(table_headers);
-    write_hdr(PERSIST_ROWSTORE_HDR_LBA, PERSIST_MAGIC_ROWSTORE,
+    stage_hdr(PERSIST_ROWSTORE_HDR_LBA, PERSIST_MAGIC_ROWSTORE,
               hdr_bytes, rowstore_next_free_page_id, PERSIST_STORAGE_ISOLATION_PHASE3_MARK);
-    persist_write_array(table_headers, hdr_bytes, PERSIST_ROWSTORE_ENT_LBA);
+    persist_write_array_diffed(table_headers, hdr_bytes, PERSIST_ROWSTORE_ENT_LBA,
+                               p_shadow_rowstore, &p_shadow_rowstore_valid);
     persist_write_array(rowstore_partition_cursor, (uint32_t)sizeof(rowstore_partition_cursor),
                         PERSIST_ROWSTORE_PARTCURSOR_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Row-store table headers snapshot written.\n");
 }
 
@@ -559,9 +818,10 @@ void persist_row_constraints(void) {
     if (persist_defer_note(PERSIST_PEND_ROWCONSTRAINT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(row_constraints);
-    write_hdr(PERSIST_ROW_CONSTRAINT_HDR_LBA, PERSIST_MAGIC_ROW_CONSTRAINT,
+    stage_hdr(PERSIST_ROW_CONSTRAINT_HDR_LBA, PERSIST_MAGIC_ROW_CONSTRAINT,
               row_constraint_count, bytes, 0);
     persist_write_array(row_constraints, bytes, PERSIST_ROW_CONSTRAINT_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Row constraints snapshot written.\n");
 }
 
@@ -576,8 +836,9 @@ void persist_row_index_defs(void) {
     if (persist_defer_note(PERSIST_PEND_ROWINDEX)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(row_indexes);
-    write_hdr(PERSIST_ROW_INDEX_HDR_LBA, PERSIST_MAGIC_ROW_INDEX, bytes, 0, 0);
+    stage_hdr(PERSIST_ROW_INDEX_HDR_LBA, PERSIST_MAGIC_ROW_INDEX, bytes, 0, 0);
     persist_write_array(row_indexes, bytes, PERSIST_ROW_INDEX_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Row index definitions snapshot written.\n");
 }
 
@@ -593,11 +854,12 @@ void persist_vecstore_headers(void) {
     if (persist_defer_note(PERSIST_PEND_VECSTORE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(vector_collections);
-    write_hdr(PERSIST_VECSTORE_HDR_LBA, PERSIST_MAGIC_VECSTORE,
+    stage_hdr(PERSIST_VECSTORE_HDR_LBA, PERSIST_MAGIC_VECSTORE,
               hdr_bytes, vecstore_next_free_page_id, PERSIST_STORAGE_ISOLATION_PHASE3_MARK);
     persist_write_array(vector_collections, hdr_bytes, PERSIST_VECSTORE_ENT_LBA);
     persist_write_array(vecstore_partition_cursor, (uint32_t)sizeof(vecstore_partition_cursor),
                         PERSIST_VECSTORE_PARTCURSOR_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Vecstore collection headers snapshot written.\n");
 }
 
@@ -609,8 +871,9 @@ void persist_vec_index_defs(void) {
     if (persist_defer_note(PERSIST_PEND_VECINDEX)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(vec_indexes);
-    write_hdr(PERSIST_VEC_INDEX_HDR_LBA, PERSIST_MAGIC_VEC_INDEX, bytes, 0, 0);
+    stage_hdr(PERSIST_VEC_INDEX_HDR_LBA, PERSIST_MAGIC_VEC_INDEX, bytes, 0, 0);
     persist_write_array(vec_indexes, bytes, PERSIST_VEC_INDEX_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Vec index definitions snapshot written.\n");
 }
 
@@ -625,10 +888,12 @@ void persist_row_journal(void) {
     if (!io_sq || !io_cq) return;
     uint32_t buf_bytes    = (uint32_t)sizeof(row_journal_buffer);
     uint32_t attach_bytes = (uint32_t)sizeof(row_journal_attachments);
-    write_hdr(PERSIST_ROW_JOURNAL_HDR_LBA, PERSIST_MAGIC_ROW_JOURNAL,
+    stage_hdr(PERSIST_ROW_JOURNAL_HDR_LBA, PERSIST_MAGIC_ROW_JOURNAL,
               buf_bytes, row_journal_entry_count, attach_bytes);
-    persist_write_array(row_journal_buffer, buf_bytes, PERSIST_ROW_JOURNAL_ENT_LBA);
+    persist_write_array_diffed(row_journal_buffer, buf_bytes, PERSIST_ROW_JOURNAL_ENT_LBA,
+                               p_shadow_rowjournal, &p_shadow_rowjournal_valid);
     persist_write_array(row_journal_attachments, attach_bytes, PERSIST_ROW_JOURNAL_ATTACH_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Row journal snapshot written.\n");
 }
 
@@ -648,10 +913,11 @@ void persist_databases(void) {
     if (!io_sq || !io_cq) return;
     uint32_t db_bytes    = (uint32_t)sizeof(databases);
     uint32_t grant_bytes = (uint32_t)sizeof(database_grants);
-    write_hdr(PERSIST_DATABASE_HDR_LBA, PERSIST_MAGIC_DATABASE,
+    stage_hdr(PERSIST_DATABASE_HDR_LBA, PERSIST_MAGIC_DATABASE,
               db_bytes, grant_bytes, database_next_id);
     persist_write_array(databases,       db_bytes,    PERSIST_DATABASE_ENT_LBA);
     persist_write_array(database_grants, grant_bytes, PERSIST_DATABASE_GRANT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Databases snapshot written.\n");
 }
 
@@ -663,8 +929,9 @@ void persist_views(void) {
     if (persist_defer_note(PERSIST_PEND_VIEW)) return;
     if (!io_sq || !io_cq) return;
     uint32_t view_bytes = (uint32_t)sizeof(views);
-    write_hdr(PERSIST_VIEW_HDR_LBA, PERSIST_MAGIC_VIEW, view_bytes, 0, 0);
+    stage_hdr(PERSIST_VIEW_HDR_LBA, PERSIST_MAGIC_VIEW, view_bytes, 0, 0);
     persist_write_array(views, view_bytes, PERSIST_VIEW_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Views snapshot written.\n");
 }
 
@@ -680,9 +947,10 @@ void persist_tenants(void) {
     if (persist_defer_note(PERSIST_PEND_TENANT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t tenant_bytes = (uint32_t)sizeof(tenants);
-    write_hdr(PERSIST_TENANT_HDR_LBA, PERSIST_MAGIC_TENANT,
+    stage_hdr(PERSIST_TENANT_HDR_LBA, PERSIST_MAGIC_TENANT,
               tenant_bytes, 0, tenant_next_id);
     persist_write_array(tenants, tenant_bytes, PERSIST_TENANT_ENT_LBA);
+    persist_region_commit();
     kernel_serial_print("[PERSIST] Tenants snapshot written.\n");
 }
 
@@ -692,13 +960,17 @@ void persist_tenants(void) {
 // a cold start for that subsystem while others may still restore successfully.
 // Struct-size validation catches format changes between kernel builds.
 void persist_restore_all(void) {
+    // Fresh scan per call: the trusted mask describes the CURRENT on-disk image,
+    // and a caller may legitimately restore more than once (host tests do).
+    p_scan_done = 0;
+    persist_scan_regions();
     if (!io_sq || !io_cq) return;
 
     // ── 1. Catalog + role table ───────────────────────────────────────────────
     if (nvme_read_sync(PERSIST_CAT_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_CAT) {
+        if (magic == PERSIST_MAGIC_CAT && persist_region_trusted(PERSIST_MAGIC_CAT)) {
             uint32_t cat_count, cat_bytes, role_bytes;
             p_memcpy(&cat_count,  p_buf +  8, 4);
             p_memcpy(&cat_bytes,  p_buf + 12, 4);
@@ -723,7 +995,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_REC_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_REC) {
+        if (magic == PERSIST_MAGIC_REC && persist_region_trusted(PERSIST_MAGIC_REC)) {
             uint32_t rec_bytes;
             p_memcpy(&rec_bytes, p_buf + 8, 4);
             if (rec_bytes == (uint32_t)sizeof(object_records)) {
@@ -750,7 +1022,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_SCH_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_SCH) {
+        if (magic == PERSIST_MAGIC_SCH && persist_region_trusted(PERSIST_MAGIC_SCH)) {
             uint32_t sch_bytes;
             p_memcpy(&sch_bytes, p_buf + 8, 4);
             if (sch_bytes == (uint32_t)sizeof(object_schemas)) {
@@ -766,7 +1038,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_PROG_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_PROG) {
+        if (magic == PERSIST_MAGIC_PROG && persist_region_trusted(PERSIST_MAGIC_PROG)) {
             uint32_t prog_bytes;
             p_memcpy(&prog_bytes, p_buf + 8, 4);
             if (prog_bytes == (uint32_t)sizeof(service_binaries)) {
@@ -789,7 +1061,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_PART_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_PART) {
+        if (magic == PERSIST_MAGIC_PART && persist_region_trusted(PERSIST_MAGIC_PART)) {
             uint32_t part_bytes, assign_bytes, owner_bytes;
             p_memcpy(&part_bytes,   p_buf +  8, 4);
             p_memcpy(&assign_bytes, p_buf + 12, 4);
@@ -804,7 +1076,7 @@ void persist_restore_all(void) {
                 // rows are only restorable from a snapshot that was itself
                 // written by Phase-2-or-later code (owner_bytes matches the
                 // current struct's real size). A snapshot written before
-                // this phase has owner_bytes==0 (write_hdr()'s v2 slot was
+                // this phase has owner_bytes==0 (stage_hdr()'s v2 slot was
                 // always passed 0 previously) -- there's no valid data at
                 // PERSIST_PART_OWNER_LBA to read in that case, so the
                 // owner table is deliberately left at whatever
@@ -839,7 +1111,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_ROWSTORE_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_ROWSTORE) {
+        if (magic == PERSIST_MAGIC_ROWSTORE && persist_region_trusted(PERSIST_MAGIC_ROWSTORE)) {
             uint32_t hdr_bytes, next_page, part_mark;
             p_memcpy(&hdr_bytes, p_buf +  8, 4);
             p_memcpy(&next_page, p_buf + 12, 4);
@@ -895,7 +1167,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_ROW_CONSTRAINT_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_ROW_CONSTRAINT) {
+        if (magic == PERSIST_MAGIC_ROW_CONSTRAINT && persist_region_trusted(PERSIST_MAGIC_ROW_CONSTRAINT)) {
             uint32_t count, bytes;
             p_memcpy(&count, p_buf +  8, 4);
             p_memcpy(&bytes, p_buf + 12, 4);
@@ -926,7 +1198,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_ROW_INDEX_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_ROW_INDEX) {
+        if (magic == PERSIST_MAGIC_ROW_INDEX && persist_region_trusted(PERSIST_MAGIC_ROW_INDEX)) {
             uint32_t bytes;
             p_memcpy(&bytes, p_buf + 8, 4);
             if (bytes == (uint32_t)sizeof(row_indexes)) {
@@ -964,7 +1236,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_VECSTORE_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_VECSTORE) {
+        if (magic == PERSIST_MAGIC_VECSTORE && persist_region_trusted(PERSIST_MAGIC_VECSTORE)) {
             uint32_t hdr_bytes, next_page, part_mark;
             p_memcpy(&hdr_bytes, p_buf +  8, 4);
             p_memcpy(&next_page, p_buf + 12, 4);
@@ -1005,7 +1277,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_VEC_INDEX_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_VEC_INDEX) {
+        if (magic == PERSIST_MAGIC_VEC_INDEX && persist_region_trusted(PERSIST_MAGIC_VEC_INDEX)) {
             uint32_t bytes;
             p_memcpy(&bytes, p_buf + 8, 4);
             if (bytes == (uint32_t)sizeof(vec_indexes)) {
@@ -1037,7 +1309,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_ROW_JOURNAL_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_ROW_JOURNAL) {
+        if (magic == PERSIST_MAGIC_ROW_JOURNAL && persist_region_trusted(PERSIST_MAGIC_ROW_JOURNAL)) {
             uint32_t buf_bytes, entry_count, attach_bytes;
             p_memcpy(&buf_bytes,    p_buf +  8, 4);
             p_memcpy(&entry_count,  p_buf + 12, 4);
@@ -1074,7 +1346,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_DATABASE_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_DATABASE) {
+        if (magic == PERSIST_MAGIC_DATABASE && persist_region_trusted(PERSIST_MAGIC_DATABASE)) {
             uint32_t db_bytes, grant_bytes, next_id;
             p_memcpy(&db_bytes,    p_buf +  8, 4);
             p_memcpy(&grant_bytes, p_buf + 12, 4);
@@ -1108,7 +1380,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_VIEW_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_VIEW) {
+        if (magic == PERSIST_MAGIC_VIEW && persist_region_trusted(PERSIST_MAGIC_VIEW)) {
             uint32_t view_bytes;
             p_memcpy(&view_bytes, p_buf + 8, 4);
             if (view_bytes == (uint32_t)sizeof(views)) {
@@ -1136,7 +1408,7 @@ void persist_restore_all(void) {
     if (nvme_read_sync(PERSIST_TENANT_HDR_LBA, p_buf) == 0) {
         uint64_t magic = 0;
         p_memcpy(&magic, p_buf, 8);
-        if (magic == PERSIST_MAGIC_TENANT) {
+        if (magic == PERSIST_MAGIC_TENANT && persist_region_trusted(PERSIST_MAGIC_TENANT)) {
             uint32_t tenant_bytes, next_id;
             p_memcpy(&tenant_bytes, p_buf +  8, 4);
             p_memcpy(&next_id,      p_buf + 16, 4);
@@ -1152,6 +1424,7 @@ void persist_restore_all(void) {
                 kernel_serial_print("[PERSIST] Tenants: struct size mismatch — cold start.\n");
             }
         } else {
+    persist_region_commit();
             kernel_serial_print("[PERSIST] Tenants: no snapshot — cold start.\n");
         }
     }
