@@ -91,6 +91,30 @@ static void dir_write_entry(int slot) {
     uint32_t ou = se->owner_uid, pid = se->partition_id;
     for (int b=0;b<4;b++) entry[141+b] = (uint8_t)(ou  >> (b*8));
     for (int b=0;b<4;b++) entry[145+b] = (uint8_t)(pid >> (b*8));
+
+    /* ─── frames_used, which this entry did not persist ────────────────────
+     * `size` was written and `frames_used` was not, and dir_read_entry()
+     * then set frames_used to 0 unconditionally. So every reboot produced a
+     * stream claiming N bytes and zero pages -- two fields describing the
+     * same data, disagreeing.
+     *
+     * The consequence was silent and total: frames_used bounds every page
+     * loop in this file, so a restored stream relocated nothing, migrated
+     * nothing, and reported success at each step. A real 8 KiB stream
+     * survived a restart as "size 8192, frames 0" and its migration moved
+     * no bytes while printing OK.
+     *
+     * frames_used counts DISK pages within lba_base's range (see
+     * stream_migrate_send_partition's `src_lba + p * 8`), so it is durable
+     * and belongs here. se->frames[] is the opposite -- volatile RAM frame
+     * addresses -- and correctly stays out of the snapshot.
+     *
+     * Offset 149 of a 448-byte entry: the entry is memset to 0 above, so a
+     * snapshot written by the old code reads 0 here, which is exactly the
+     * behaviour it already had. No DIR_VERSION bump is needed, and no
+     * existing snapshot is invalidated. */
+    uint32_t fu = se->frames_used;
+    for (int b=0;b<4;b++) entry[149+b] = (uint8_t)(fu >> (b*8));
 }
 
 static void dir_read_entry(int slot) {
@@ -114,11 +138,51 @@ static void dir_read_entry(int slot) {
                       | ((uint32_t)entry[146] << 8)
                       | ((uint32_t)entry[147] << 16)
                       | ((uint32_t)entry[148] << 24);
-    se->frames_used = 0;
+    se->frames_used = (uint32_t)entry[149]
+                    | ((uint32_t)entry[150] << 8)
+                    | ((uint32_t)entry[151] << 16)
+                    | ((uint32_t)entry[152] << 24);
+
+    /* ─── Repairing a snapshot written before frames_used was persisted ────
+     * Such a snapshot reads 0 here while carrying a real byte count, and
+     * every page loop in this file is bounded by frames_used -- so the data
+     * on disk would stay there, unreachable and unmovable, with every
+     * operation reporting success over zero pages.
+     *
+     * Deriving the count from `size` recovers it exactly: pages are filled
+     * contiguously from lba_base, so ceil(size / 4096) is how many the
+     * stream occupies. This is a genuine repair, not a guess, and it is
+     * announced rather than done quietly -- a field silently changing during
+     * restore is precisely the kind of thing that should be visible in a
+     * boot log. */
+    if (se->active && se->frames_used == 0 && se->size > 0) {
+        se->frames_used = (uint32_t)((se->size + 4095u) / 4096u);
+        kernel_serial_printf(
+            "[STREAM] '%s': snapshot carried size %u with no page count "
+            "(written before frames_used was persisted) -- recovered %u page(s) "
+            "from the byte count.\n",
+            se->name, (unsigned)se->size, (unsigned)se->frames_used);
+    }
+
+    /* se->frames[] holds VOLATILE physical RAM frame addresses, which cannot
+     * survive a reboot and must not be restored. Zeroing them is correct;
+     * zeroing frames_used alongside them was the bug. */
     for (int f=0;f<STREAM_MAX_FRAMES;f++) se->frames[f] = 0;
 }
 
-static void stream_persist_directory(void) {
+/* Deliberately NOT static: a host test needs to round-trip the directory
+ * through this REAL writer and the REAL reader in stream_init().
+ *
+ * That round trip is the test this suite did not have, and its absence is
+ * exactly why `frames_used` went unpersisted unnoticed for so long: every
+ * existing scenario builds stream_store[] directly in memory, so no test
+ * ever took the path where a missing field could show up. A test that
+ * reimplemented the writer would have reproduced the same omission and
+ * passed cheerfully.
+ *
+ * Declared in stream.h so this is a stated interface rather than a silently
+ * dropped `static` for a reader to puzzle over. */
+void stream_persist_directory(void) {
     // Update header in dir_buf
     uint64_t magic   = DIR_MAGIC;
     uint32_t version = DIR_VERSION;

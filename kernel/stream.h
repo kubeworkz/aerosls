@@ -150,6 +150,13 @@ int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
 int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
                               uint32_t frag_index, const uint8_t* frag_data);
 
+/* Writes the 4 KiB stream directory to NVMe. Called internally after every
+ * mutation; exposed so a host test can round-trip the directory through this
+ * real writer and stream_init()'s real reader. The absence of that round-trip
+ * test is why `frames_used` was silently dropped from the snapshot -- see the
+ * comment on this function in stream.c. */
+void stream_persist_directory(void);
+
 extern struct StreamEntry stream_store[STREAM_MAX];
 
 /* Flushes every populated frame of `se` to its own LBA, returning the count

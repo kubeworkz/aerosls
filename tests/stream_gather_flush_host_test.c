@@ -134,6 +134,9 @@ static int frame_at(struct StreamEntry* se, uint32_t fi, uint8_t expect) {
     for (int i = 0; i < 4096; i++) if (buf[i] != expect) return 0;
     return 1;
 }
+static void wl_strcpy_test(char* d, const char* s, size_t cap) {
+    size_t i; for (i = 0; i + 1 < cap && s[i]; i++) d[i] = s[i]; d[i] = '\0';
+}
 static void reset_disk(void) { memset(disk, 0, sizeof(disk)); g_cmds = 0; g_pages = 0; }
 
 /* Drives the real flush by calling stream_write_chunk() with is_last -- but
@@ -249,6 +252,144 @@ int main(void) {
     se = prep(0, -1, 0x60);
     stream_flush_frames(se);
     CHECK(g_cmds == 0, "an empty stream issues no commands at all");
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * frames_used SURVIVES A REBOOT
+     *
+     * ─── The bug ────────────────────────────────────────────────────────
+     * dir_write_entry() persisted name, mime, size, lba_base, active,
+     * owner_uid and partition_id -- but NOT frames_used. dir_read_entry()
+     * then ended with `se->frames_used = 0;` unconditionally.
+     *
+     * So every restart produced a stream carrying a real byte count and a
+     * page count of zero: two fields describing the same data, disagreeing.
+     * And because frames_used bounds every page loop in stream.c, the
+     * restored stream relocated nothing, migrated nothing, and reported
+     * success at each step over zero pages.
+     *
+     * Found on a real cluster: an 8 KiB stream came back from a reboot as
+     * "size 8192, frames 0", and its migration printed OK having moved no
+     * bytes at all. Nothing in this suite noticed, because every scenario
+     * above builds stream_store[] in memory via prep() and never round-trips
+     * the directory through the disk.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- the directory round-trip --\n");
+    {
+        reset_disk();
+        struct StreamEntry* se = &stream_store[0];
+        memset(stream_store, 0, sizeof(stream_store));
+        se->active       = 1;
+        se->lba_base     = STREAM_DATA_LBA_BASE;
+        se->size         = 8192;
+        se->frames_used  = 2;
+        se->owner_uid    = 1000;
+        se->partition_id = 7;
+        wl_strcpy_test(se->name,      "payload.bin", sizeof(se->name));
+        wl_strcpy_test(se->mime_type, "application/octet-stream", sizeof(se->mime_type));
+
+        /* Persist through the real writer, then wipe RAM exactly as a reboot
+         * does and reload through the real reader. */
+        stream_persist_directory();
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+
+        se = &stream_store[0];
+        CHECK(se->active == 1,            "the stream came back from the directory");
+        CHECK(se->size == 8192,           "its byte count survived (it always did)");
+        CHECK(se->frames_used == 2,
+              "*** and its PAGE count survived too -- the two no longer disagree ***");
+        CHECK(se->partition_id == 7,      "partition_id survived");
+        CHECK(se->owner_uid == 1000,      "owner_uid survived");
+        CHECK(se->lba_base == STREAM_DATA_LBA_BASE, "lba_base survived");
+
+        /* ─── Read the persisted BYTES, not just the restored struct ────────
+         * Asserting frames_used == 2 after the round trip is not enough, and
+         * a mutation proved it: with the field left out of the snapshot the
+         * reader gets 0 and the size-based REPAIR then derives 2 -- so the
+         * assertion passes whether or not the field was ever written. The
+         * repair masks the very bug it exists to recover from.
+         *
+         * So this checks the directory page itself: 4 bytes at offset 149 of
+         * entry 0, past the 512-byte header. That is true only if the writer
+         * really wrote it. */
+        {
+            uint8_t dir[4096];
+            CHECK(nvme_read_sync(STREAM_DIR_LBA, dir) == 0, "the directory page is readable");
+            const uint8_t* e0 = dir + 512;      /* DIR_HDR_SIZE */
+            uint32_t on_disk = (uint32_t)e0[149]
+                             | ((uint32_t)e0[150] << 8)
+                             | ((uint32_t)e0[151] << 16)
+                             | ((uint32_t)e0[152] << 24);
+            CHECK(on_disk == 2,
+                  "*** frames_used is genuinely IN the snapshot bytes -- not merely "
+                  "reconstructed by the repair path ***");
+        }
+
+        /* frames[] must NOT survive: those are volatile physical RAM
+         * addresses. Zeroing them is correct -- zeroing frames_used
+         * alongside them was the bug. */
+        int all_null = 1;
+        for (uint32_t f = 0; f < se->frames_used; f++) if (se->frames[f]) all_null = 0;
+        CHECK(all_null,
+              "*** frames[] is NOT restored -- volatile RAM addresses must not "
+              "survive a reboot, which is why frames_used looked safe to zero ***");
+    }
+
+    /* A snapshot written before frames_used was persisted reads 0 there, and
+     * is repaired from the byte count rather than left unreachable. This is
+     * what recovers data already on disk from the buggy version. */
+    {
+        reset_disk();
+        memset(stream_store, 0, sizeof(stream_store));
+        struct StreamEntry* se = &stream_store[0];
+        se->active      = 1;
+        se->lba_base    = STREAM_DATA_LBA_BASE;
+        se->size        = 8192;
+        se->frames_used = 0;          /* exactly what the old writer produced */
+        wl_strcpy_test(se->name, "legacy.bin", sizeof(se->name));
+
+        stream_persist_directory();
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+
+        se = &stream_store[0];
+        CHECK(se->frames_used == 2,
+              "*** an old snapshot's page count is RECOVERED from its size "
+              "(8192 -> 2 pages), so data already on disk is reachable again ***");
+
+        /* A size that is NOT a whole number of pages. 8192 divides exactly,
+         * so it cannot tell rounding up from truncating -- and a mutation
+         * swapping ceil for trunc survived the check above. 8193 bytes
+         * occupies three pages; truncation would report two and leave the
+         * last page unreachable, losing the tail of every stream whose length
+         * is not a multiple of 4096, which is most of them. */
+        reset_disk();
+        memset(stream_store, 0, sizeof(stream_store));
+        se = &stream_store[0];
+        se->active = 1; se->lba_base = STREAM_DATA_LBA_BASE;
+        se->size = 8193; se->frames_used = 0;
+        wl_strcpy_test(se->name, "odd.bin", sizeof(se->name));
+        stream_persist_directory();
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+        CHECK(stream_store[0].frames_used == 3,
+              "*** 8193 bytes recovers as THREE pages -- the repair rounds up, so a "
+              "partial final page is not left unreachable ***");
+
+        /* And a genuinely empty stream is not given phantom pages. */
+        reset_disk();
+        memset(stream_store, 0, sizeof(stream_store));
+        se = &stream_store[0];
+        se->active = 1; se->lba_base = STREAM_DATA_LBA_BASE;
+        se->size = 0; se->frames_used = 0;
+        wl_strcpy_test(se->name, "empty.bin", sizeof(se->name));
+        stream_persist_directory();
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+        CHECK(stream_store[0].frames_used == 0,
+              "*** a truly empty stream stays at zero pages -- the repair keys on "
+              "size, not on absence ***");
+    }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

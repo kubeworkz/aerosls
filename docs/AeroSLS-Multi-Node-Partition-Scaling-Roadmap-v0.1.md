@@ -619,6 +619,43 @@ So `docs/COMMANDS.md` now carries worked `raw` examples with literal methods, a 
 
 That checker has a deliberate subtlety worth recording: its first version simply banned the strings `--method` and `stream list`, and failed against the very section written to prevent the mistake. **A counter-example is good documentation.** The check now requires those strings to appear only in a context marked as wrong, rather than forbidding them.
 
+## 9h. `frames_used` did not survive a reboot
+
+A stream written with 8 KiB came back from a restart as:
+
+```
+"size": 8192,  "frames": 0
+```
+
+Two fields describing the same data, disagreeing. `dir_write_entry()` persisted name, mime, size, lba_base, active, owner_uid and partition_id — **not `frames_used`** — and `dir_read_entry()` ended with `se->frames_used = 0;` unconditionally.
+
+`frames_used` bounds every page loop in `kernel/stream.c`. So a restored stream relocated nothing, migrated nothing, and reported success at each step over zero pages. The bytes stayed on disk at `lba_base`, unreachable and unmovable.
+
+**Why zeroing it looked reasonable.** The adjacent `frames[]` array holds volatile physical RAM addresses which genuinely cannot survive a reboot, so it must be zeroed. `frames_used` sits beside it and was zeroed along with it — but it counts *disk pages* within `lba_base`'s range (`stream_migrate_send_partition()`'s `src_lba + p * 8`), which is durable data.
+
+Persisted at offset 149 of a 448-byte entry with 149 bytes in use. No `DIR_VERSION` bump: the entry is `memset` to zero before writing, so an old snapshot reads 0 there — exactly its existing behaviour — and no existing snapshot is invalidated.
+
+**Plus a repair, announced rather than silent.** An old snapshot carries a real byte count and no page count, so `frames_used` is derived as `ceil(size / 4096)` — pages fill contiguously from `lba_base`, making this exact recovery rather than a guess. It logs when it fires, because a field changing during restore is precisely the thing that should be visible in a boot log.
+
+### The test the suite did not have, and the trap in writing it
+
+Every existing scenario built `stream_store[]` directly in memory via a helper. **No test ever round-tripped the directory through the real writer and the real reader**, so the only code path where a missing field could surface was never taken. `stream_persist_directory()` is no longer `static`, declared in `stream.h` with that reason stated, specifically so the round trip is testable — a test that reimplemented the writer would have reproduced the same omission and passed.
+
+Three mutations survived the first version of that test, and two are instructive:
+
+- **The repair masked the bug it recovers from.** With `frames_used` left out of the snapshot, the reader gets 0, the repair derives 2 from `size`, and `frames_used == 2` passes either way. The fix is to assert on the persisted *bytes* — 4 bytes at offset 149 of the directory page — which is true only if the writer really wrote them.
+- **8192 divides exactly by 4096**, so the round-trip case could not tell rounding up from truncating. A separate 8193-byte case makes it three pages; truncation would report two and leave the tail of every non-page-multiple stream unreachable, which is most of them.
+
+The third mutation — removing the `size > 0` guard on the repair — survived because it is semantically equivalent: `ceil(0/4096)` is 0, so the guard is defensive rather than load-bearing. Recorded as an equivalent mutant rather than chased with a contrived test.
+
+25 checks in `stream_gather_flush_host_test.c`, 3/3 non-equivalent mutations caught. Full suite 80/80, link 97/97.
+
+### Operator visibility, added in the same pass
+
+Partition ownership had no read surface at all: `partition list` printed id and name, `/api/partitions` printed quotas, `/api/nodes` printed a count rather than a mapping. Since `partition_migrate()` refuses a destination that already owns the partition, and only the owner holds data to send, the one field governing whether a migration can proceed was discoverable **only by attempting one and reading the error**. Three separate debugging cycles went to that.
+
+`partition list` and `/api/partitions` now report `owner_node`, and `aeroslsctl partitions` places it second rather than last. `docs/COMMANDS.md` states the two non-guessable rules next to `partition migrate`: a stream's partition is stamped at creation and `partition assign` is not retroactive, so the order `create → assign → create the stream` is mandatory.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.
