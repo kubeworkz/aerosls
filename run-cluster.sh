@@ -33,14 +33,14 @@
 # before any protocol handler sees them; without it each node would
 # process its own gratuitous ARP for 10.0.2.15, an address they all share.
 #
-# ─── What this still cannot give you ───────────────────────────────────
-# A control path. Each node has one NIC, spent on the segment above
-# (net/e1000.c binds a single NIC -- a second sits dead on the PCI bus),
-# so there is no host port forward and no aeroslsctl. The serial consoles
-# show boot output but no prompt, because kernel.c enters http_server_run()
-# and never returns when a NIC is present. Nodes self-identify at boot,
-# which is what made a cluster worth launching at all; driving one
-# afterwards is still open. See the plan doc's §0.
+# ─── Driving a node ────────────────────────────────────────────────────
+# Attach to a node's console and you get a shell prompt. That took work:
+# kernel.c enters http_server_run() and never returns when a NIC is
+# present, so sls_shell_loop() is unreachable on a networked boot -- the
+# HTTP loop now polls the serial port between sweeps instead
+# (kernel/console.c). There is still no aeroslsctl here: each node has one
+# NIC, spent on the segment above, and net/e1000.c binds a single NIC, so
+# no host port forward is possible.
 #
 # ─── Security ──────────────────────────────────────────────────────────
 # Consoles bind 127.0.0.1 only. Treat each as a root login should a prompt
@@ -330,11 +330,10 @@ EOF
 for i in $(seq 1 "$NODES"); do echo "        node $i:  $ATTACH $(node_con "$i")"; done
 cat <<EOF
 
-    Those consoles show boot output but no prompt: kernel.c enters
-    http_server_run() and never returns when a NIC is present, so
-    sls_shell_loop() is unreachable on a networked boot. Look for
-    "[BOOT] node identity <i> taken from the command line" to confirm
-    each node came up as itself.
+    Each console gives you a shell prompt. Look for
+    "[BOOT] node identity <i> taken from the command line" to confirm the
+    node came up as itself, then try "cluster status" -- on a formed
+    cluster the roster should list every node on the segment.
 
 ==> Ctrl-C stops the cluster, or run './run-cluster.sh --stop' elsewhere.
 EOF

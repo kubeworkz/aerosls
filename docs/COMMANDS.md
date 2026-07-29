@@ -68,7 +68,7 @@ Supersedes `run-two-nodes.sh`, which its point-to-point netdev capped at exactly
 
 A partial failure is not left half-up: if any node fails to start, every node that *did* come up is torn down and the launcher exits non-zero, naming each failure with QEMU's own stderr.
 
-The same control-path caveat applies as below — consoles show boot output but no prompt. Look for `[BOOT] node identity <i> taken from the command line` to confirm each node came up as itself.
+Consoles are interactive: attach and you get a shell prompt. Look for `[BOOT] node identity <i> taken from the command line` to confirm each node came up as itself, then drive it with `cluster status`, `partition migrate` and the rest.
 
 ---
 
@@ -79,7 +79,9 @@ The same control-path caveat applies as below — consoles show boot output but 
 
 `aeroslsctl` works against a single node under `make x86-run` (host 3001 → guest 3000). It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate.
 
-**Correction, and a live blocker.** An earlier revision of this section said to drive the two-node walkthrough from each node's serial console. That is wrong, and the reason is worth stating because it affects any networked boot:
+**Resolved (was: a live blocker).** A networked node now has a working console — `http_server_run()` polls the serial port between sweeps and runs the same shell dispatch, against the same session, that the physical console uses. Attach with `telnet 127.0.0.1 <port>` and you get a prompt. The analysis below explains why this needed building at all.
+
+**Original note.** An earlier revision of this section said to drive the two-node walkthrough from each node's serial console. That is wrong, and the reason is worth stating because it affects any networked boot:
 
 ```c
 /* kernel/kernel.c:372 */
@@ -89,7 +91,7 @@ if (e1000_mmio_base) {
 sls_shell_loop();       // only reached when there is NO NIC
 ```
 
-**`sls_shell_loop()` is never called on a node that has a NIC.** `run-two-nodes.sh` gives every node an e1000 — that is the whole point of it — so the console shows boot output and then no prompt, ever. Combined with the single-NIC driver (no host port forward possible) and the absence of a keyboard driver, **those nodes currently have no control path at all**, and the two-node walkthrough has never been executable.
+**`sls_shell_loop()` is never called on a node that has a NIC** — which is why the console had to be driven from the HTTP loop instead. `run-two-nodes.sh` gives every node an e1000 — that is the whole point of it — so the console shows boot output and then no prompt, ever. Combined with the single-NIC driver (no host port forward possible) and the absence of a keyboard driver, **those nodes currently have no control path at all**, and the two-node walkthrough has never been executable.
 
 The consoles are still worth attaching to read boot output:
 

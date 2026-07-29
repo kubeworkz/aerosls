@@ -2751,21 +2751,42 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
 // function), so both copies carry this cross-reference instead.
 #define SHELL_EXEC_OUT_CAP 8192
 
-void sls_shell_loop(void) {
-    char input_buffer[256];
-    static char output_buffer[SHELL_EXEC_OUT_CAP];
+/* One prompt implementation, used by both the blocking loop below and the
+ * polled console in http_server_run(). Two copies would drift, and the
+ * transaction marker is exactly the sort of detail that drifts. */
+void sls_console_prompt(void) {
+    if (serial_session.tx_id)
+        kernel_serial_printf("uid:%u[tx:%lu]> ", serial_session.uid,
+                             serial_session.tx_id);
+    else
+        kernel_serial_printf("uid:%u> ", serial_session.uid);
+}
+
+void sls_console_banner(void) {
     kernel_serial_print("\n--- Multi-User SLS Secure Shell Active ---\n");
     kernel_serial_print("Type 'help' for available commands.\n\n");
+}
+
+/* Runs one line against the SAME serial_session the blocking loop uses.
+ *
+ * Sharing the session is the point, not an economy: it carries uid/gid and
+ * tx_id, so a transaction opened from the polled console and committed
+ * from the blocking one -- or the reverse, if a boot ever reaches both --
+ * is the same transaction. A second session would silently be a second
+ * identity with its own open transaction. */
+void sls_console_execute_line(const char* line) {
+    static char output_buffer[SHELL_EXEC_OUT_CAP];
+    sls_shell_execute(line, &serial_session, output_buffer, sizeof(output_buffer));
+    kernel_serial_print(output_buffer);
+}
+
+void sls_shell_loop(void) {
+    char input_buffer[256];
+    sls_console_banner();
 
     while (1) {
-        if (serial_session.tx_id)
-            kernel_serial_printf("uid:%u[tx:%lu]> ", serial_session.uid,
-                                 serial_session.tx_id);
-        else
-            kernel_serial_printf("uid:%u> ", serial_session.uid);
-
+        sls_console_prompt();
         read_line(input_buffer);
-        sls_shell_execute(input_buffer, &serial_session, output_buffer, sizeof(output_buffer));
-        kernel_serial_print(output_buffer);
+        sls_console_execute_line(input_buffer);
     }
 }

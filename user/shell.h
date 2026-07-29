@@ -41,6 +41,16 @@ struct ShellSession {
 // the command would normally print to the serial console into out_buf
 // instead. Returns 1 if the command was recognized, 0 otherwise (see
 // shell.c's own comment on sls_shell_execute() for the full contract).
+/* ─── The console the HTTP loop drives ────────────────────────────────────
+ * kernel.c enters http_server_run() and never returns when a NIC is
+ * present, so sls_shell_loop() below is unreachable on a networked boot.
+ * These three let that loop present the same console between sweeps,
+ * against the same session, so a clustered node has a control path at all.
+ */
+void sls_console_banner(void);
+void sls_console_prompt(void);
+void sls_console_execute_line(const char* line);
+
 int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                       char* out_buf, size_t out_cap);
 

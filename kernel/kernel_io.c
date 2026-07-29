@@ -183,6 +183,23 @@ void kernel_serial_printf(const char* fmt, ...) {
     va_end(ap);
 }
 
+// ─── Non-blocking console: the hardware half ──────────────────────────────────
+// The line editor itself lives in kernel/console.c, deliberately: this file
+// defines its own `static inline` inb()/outb(), so anything here executes real
+// port I/O and cannot be exercised in a host process (it faults). Keeping the
+// editing rules in a TU with no port access is what makes them testable --
+// same split as boot_params.c's parser versus its multiboot2 tag walk.
+#define CONSOLE_DRAIN_MAX 64   // bytes per poll; bounds a paste-flood's hold
+                               // on the HTTP loop
+
+int serial_console_poll(char* out, size_t cap) {
+    for (int n = 0; n < CONSOLE_DRAIN_MAX; n++) {
+        if (!(inb(SERIAL_COM1_BASE + 5) & 0x01)) return 0;   /* FIFO empty */
+        if (console_feed((char)inb(SERIAL_COM1_BASE), out, cap)) return 1;
+    }
+    return 0;
+}
+
 // ─── read_line ────────────────────────────────────────────────────────────────
 // Blocks until ENTER is pressed, echoes typed characters, stores in buf.
 void read_line(char* buf) {

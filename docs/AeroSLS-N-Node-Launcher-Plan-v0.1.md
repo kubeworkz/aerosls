@@ -2,11 +2,34 @@
 
 **Goal.** Replace `run-two-nodes.sh` with `run-cluster.sh`, taking a node count and a per-node size, detecting the host's capacity, and refusing or right-sizing rather than thrashing the machine.
 
-**Status.** Phases 1–3 built (§4); Phase 4 (capacity auto-sizing) and 5 (retiring `run-two-nodes.sh`) remain. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
+**Status.** Phases 1–3 built, plus §0's blocker now **fully closed** — a networked node has a working console. Phase 4 (capacity auto-sizing) and 5 (retiring `run-two-nodes.sh`) remain. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
 
 ---
 
-## 0. The blocker: these nodes have no way in
+## 0. The blocker: these nodes have no way in — **CLOSED**
+
+> **Resolved.** Both halves are done. Nodes self-identify at boot (0a,
+> `kernel/boot_params.c`), and the HTTP loop now presents the serial console
+> between sweeps (0c, `kernel/console.c` + `net/http.c`), so a clustered node
+> has a prompt for the first time. `tests/console_feed_host_test.c`, 23
+> checks, 7/7 mutations caught.
+>
+> 0c turned out far cheaper than this section estimated. The hard part was
+> assumed to be plumbing the shell into the HTTP loop — but `POST
+> /api/shell/exec` already ran `sls_shell_execute()` from that very loop, so
+> the dispatch, the session and the output capture all existed. The only
+> missing piece was a line editor that can be fed one byte at a time, since
+> `read_line()` owns the CPU until ENTER.
+>
+> One deliberate choice: the polled console shares `serial_session` with the
+> blocking loop rather than creating its own. That session carries uid, gid
+> and `tx_id` — a second one would silently be a second identity with its own
+> open transaction.
+>
+> The original analysis follows, since the reasoning about *why* each route
+> was or was not available is still what governs the design.
+
+## 0 (original analysis). The blocker: these nodes have no way in
 
 This has to come first, because building a launcher for N undrivable nodes would be wasted work.
 
@@ -27,7 +50,7 @@ Cross that with the other two facts already established:
 | Way in | Status |
 | ------ | ------ |
 | QEMU graphics window | No PS/2 driver anywhere; `read_line()` polls `inb(SERIAL_COM1_BASE)` (`kernel/kernel_io.c:187`). A window renders VGA and accepts nothing. |
-| Serial console | Reaches the UART fine and shows boot output — but no prompt is ever printed, because `sls_shell_loop()` is never called. |
+| Serial console | ~~No prompt, because `sls_shell_loop()` is never called.~~ **Fixed** — `http_server_run()` polls `serial_console_poll()` each sweep and runs the same dispatch against the same session. |
 | HTTP / `aeroslsctl` | No host port forward, and can't have one: `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so a second NIC sits dead on the bus. |
 
 **So the two-node walkthrough has never been executable**, and the telnet console added in the previous change shows boot output but never a prompt. That correction belongs in `COMMANDS.md` and the roadmap addendum regardless of whether the rest of this plan proceeds.
@@ -156,6 +179,12 @@ Assume 4 cores, ~15 GB available, 109 GB free (from the `xorriso` output in the 
 | **6** *(optional)* | §0c multiplex the serial console into the HTTP loop | Interactive shell on a networked node |
 
 Phases 3 and 4 are testable **without a multi-node machine at all**, using the stub-QEMU approach: the sizing arithmetic and the argv construction are pure functions of detected inputs, and faking those inputs is trivial. That matters, since the sandbox has no QEMU.
+
+### What closing §0 turned up
+
+**A file that was never in the build.** `kernel/boot_params.c` shipped in Phase 1 without being added to `X86_C_SRC`, so `make x86-iso` would have failed on an undefined `boot_params_scan_mb2()`. Everything that was supposed to catch that looked elsewhere: it compiled clean standalone, its host test passed 49 checks, and the whole-image link check passed — because that check **globs the tree** for `.c` files rather than reading the Makefile. It happily linked a file the real build would never compile.
+
+The durable fix is `tests/makefile_sources_check.sh`, whose only job is comparing those two lists, with an explicit exclusion table so "we meant to leave that out" has to say why. It was verified by removing the entry again and watching it fail. The whole-image link check now also takes its file list *from the Makefile* rather than from a glob.
 
 ### What Phase 3 turned up
 

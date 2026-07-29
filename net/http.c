@@ -7,6 +7,7 @@
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
 #include "../kernel/smp.h"       // smp_uniprocessor_tick() -- single-CPU fallback
+#include "../user/shell.h"      // the console this loop drives between sweeps
 #include "../kernel/net_event.h"  // Architectural Phase 1 -- net_event_hlt_wait() for the multiplexed HTTP loop
 #include "../kernel/object_catalog.h"
 #include "../kernel/transaction.h"
@@ -5659,6 +5660,11 @@ static int http_request_ready(const char* buf, int len, int cap) {
 void http_server_run(void) {
     tcp_init();
     tcp_quota_init();   // Network Fairness Phase 2 -- must run before any connection is accepted, see tcp_quota.h
+    /* Announce the console immediately. An operator attaching to a node's
+     * serial port should see a prompt, not silence that looks like a hang
+     * until they guess that typing does something. */
+    sls_console_banner();
+    sls_console_prompt();
     int listen_fd = tcp_listen(NET_HTTP_PORT);
     if (listen_fd < 0) {
         kernel_serial_print("[HTTP] Failed to bind port 3000.\n");
@@ -5798,6 +5804,26 @@ void http_server_run(void) {
          * what re-probes, so running first would judge breakers on the
          * previous interval's observation. */
         mesh_observe_local(kernel_tick_counter);
+
+        /* ── The console ────────────────────────────────────────────────
+         * This loop never returns, so sls_shell_loop() is unreachable on
+         * any boot that found a NIC (kernel.c). Without this a clustered
+         * node has NO control path: no keyboard driver, and no host port
+         * forward possible because net/e1000.c binds a single NIC. Polling
+         * here is what gives it a prompt.
+         *
+         * Same session and same dispatch the physical console uses, so
+         * this is not a second, weaker shell -- and no wider than the
+         * already-existing POST /api/shell/exec, which runs the same
+         * sls_shell_execute() from this same loop. */
+        {
+            static char console_line[256];
+            if (serial_console_poll(console_line, sizeof(console_line))) {
+                sls_console_execute_line(console_line);
+                sls_console_prompt();
+                did_work = 1;
+            }
+        }
 
         // Nothing needed attention anywhere this sweep -- halt until the
         // next timer tick instead of busy-spinning (same idiom tcp_accept()/

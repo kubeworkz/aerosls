@@ -168,7 +168,7 @@ telnet 127.0.0.1 12341   # node A   (Ctrl-] then "quit" to detach)
 telnet 127.0.0.1 12342   # node B
 ```
 
-Those consoles currently show **boot output only, not a prompt**: `kernel/kernel.c:372` enters `http_server_run()` and never returns when a NIC is present, so `sls_shell_loop()` is not reached on a networked boot. Combined with the single-NIC driver (no host port forward) this means the two-node cluster has no control path yet. See `docs/AeroSLS-N-Node-Launcher-Plan-v0.1.md` §0. Single-node work under `make x86-run` is unaffected. See the script's own header comment and `docs/AeroSLS-Multi-Node-Partition-Scaling-Roadmap-v0.1.md`'s Phase 7 addendum for the full mechanism.
+Each console gives you a **shell prompt**. That needed building: `kernel.c` enters `http_server_run()` and never returns when a NIC is present, so `sls_shell_loop()` is unreachable on a networked boot — the HTTP loop now polls the serial port between sweeps (`kernel/console.c`). Nodes also self-identify at boot from `node=<n>` on the kernel command line, so no `cluster init` step is needed. See the script's own header comment and `docs/AeroSLS-Multi-Node-Partition-Scaling-Roadmap-v0.1.md`'s Phase 7 addendum for the full mechanism.
 
 ---
 

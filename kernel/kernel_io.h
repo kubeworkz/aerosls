@@ -35,6 +35,35 @@ size_t kernel_serial_capture_stop(void);   // NUL-terminates buf, returns length
 // Blocking read of one line from COM1 into buf (max 255 chars + NUL)
 void read_line(char* buf);
 
+/* ─── Non-blocking console, for the loop that cannot block ────────────────
+ * read_line() above spins on the UART until ENTER. That is fine for
+ * sls_shell_loop(), which has nothing else to do -- but kernel.c enters
+ * http_server_run() and never returns when a NIC is present, so on a
+ * networked boot the blocking reader is never reached and the console
+ * shows output with no prompt, ever. A cluster node had no control path at
+ * all: no keyboard driver, and no host port forward available because
+ * net/e1000.c binds a single NIC.
+ *
+ * These two give the HTTP loop a console it can poll between sweeps.
+ */
+
+/* Feed ONE received byte. Returns 1 when `c` completed a line, in which
+ * case the line (without its terminator) is written to `out`; 0 otherwise.
+ *
+ * Pure apart from echo -- no port I/O -- so the editing rules are testable
+ * without a UART. Handles CR and LF, backspace and DEL, and silently
+ * refuses input past the line limit rather than wrapping: the echo stops,
+ * which is the operator's signal, and a truncated command that ran anyway
+ * would be worse than one that visibly did not fit. */
+int console_feed(char c, char* out, size_t cap);
+
+/* Drain whatever the UART has, up to a bounded number of bytes, feeding
+ * each to console_feed(). Returns 1 as soon as a line completes -- any
+ * remaining bytes stay in the FIFO for the next call. The bound matters:
+ * without it a paste of a large block would hold the HTTP loop for as long
+ * as bytes kept arriving. */
+int serial_console_poll(char* out, size_t cap);
+
 // Print message to serial and halt all cores
 void kernel_panic(const char* msg);
 
