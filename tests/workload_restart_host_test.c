@@ -124,6 +124,13 @@ static void drive_to_trap(const char* wl) {
     wlctx_step_all(4);
 }
 
+/* Paired with the relocate/send stubs: a test that stands in "nothing to
+ * relocate" must also stand in "nothing to count", or partition_migrate()
+ * sees 0 sent against a non-zero expectation and aborts every migration.
+ * FAITHFUL -- this test registers no streams, so the real function would
+ * also return 0. */
+int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+
 int main(void) {
     printf("=== Phase 7: self-healing restarts ===\n\n");
     printf("      (threshold %u attempts, backoff %u..%u ticks, stable reset %u)\n\n",

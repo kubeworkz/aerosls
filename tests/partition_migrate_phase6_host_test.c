@@ -137,7 +137,16 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; re
 static int relocate_calls = 0;
 static int migrate_send_calls = 0;
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; relocate_calls++; return 0; }
-int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; migrate_send_calls++; return 0; }
+/* Paired with the relocate/send stubs above: a test that stands in "nothing
+ * to relocate" must also stand in "nothing to count", or partition_migrate()
+ * sees 0 sent against a non-zero expectation and aborts every migration.
+ * FAITHFUL -- these tests register no streams, so the real function would
+ * also return 0. */
+static int g_streams_present  = 0;   /* how many streams the partition has */
+static int g_streams_confirmed = 0;  /* how many the destination confirmed */
+int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return g_streams_present; }
+
+int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; migrate_send_calls++; return g_streams_confirmed; }
 
 /* Phase 3 frame reclamation -- call-tracking stub, the scheduler_fairness_
  * host_test.c technique the roadmap's own Phase 6 verification plan names. */
@@ -278,6 +287,78 @@ int main(void) {
     CHECK(rc == 0, "migrating tenant-c succeeds");
     CHECK(migrate_send_calls == 3, "a third migration, still under the same configured cluster, took the new cross-node path too");
     CHECK(relocate_calls == 0, "and still never fell back to the old same-disk path");
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * A FAILED STREAM TRANSFER MUST NOT HAND OVER OWNERSHIP
+     *
+     * ─── What was observed on a live four-node cluster ──────────────────
+     *   page 0 of 'fresh.bin' NOT confirmed after 4 attempt(s)
+     *     (destination refused) -- transfer abandoned, source slot left intact
+     *   partition 4 ownership set to node 2
+     *   2 physical frame(s) actually reclaimed
+     *   migrate partition=4 -> node=2 -> OK
+     *
+     * The stream layer did its job: it refused to retire the source. Then
+     * partition_migrate() transferred ownership and reclaimed frames anyway,
+     * and reported OK. The data was on node 1; the ownership record said
+     * node 2. A cluster disagreeing with itself, reported as success.
+     *
+     * ─── Why it was invisible ───────────────────────────────────────────
+     * stream_migrate_send_partition() returns only what it managed to send.
+     * 0 is both the correct answer for a partition with no streams and the
+     * symptom of a destination refusing everything -- and every test until
+     * now stubbed it as 0 for the FORMER reason, so the latter never
+     * appeared. The expected count is what separates them.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- a failed stream transfer aborts the migration --\n");
+    {
+        uint32_t p = partition_create("abort-me");
+        CHECK(p != 0xFFFFFFFFu, "a partition to try migrating (setup)");
+        CHECK(partition_get_owner_node(p) == 1, "owned by this node, id 1 (setup)");
+
+        /* Two streams present, NONE confirmed by the destination. */
+        g_streams_present   = 2;
+        g_streams_confirmed = 0;
+        int rc = partition_migrate(p, 2);
+
+        CHECK(rc == 1,
+              "*** the migration FAILS rather than reporting OK ***");
+        CHECK(partition_get_owner_node(p) == 1,
+              "*** ownership stays with this node -- the data is still here ***");
+
+        /* Retryable: the partition is paused but still local, so fixing the
+         * destination and running it again is a valid recovery. Proceeding
+         * would have made the retry impossible (already owned elsewhere). */
+        g_streams_confirmed = 2;
+        CHECK(partition_migrate(p, 2) == 0,
+              "*** and a retry succeeds once the destination confirms -- the failure "
+              "left a recoverable state, not a wedged one ***");
+        CHECK(partition_get_owner_node(p) == 2, "...ownership moves on the successful attempt");
+    }
+
+    /* A partial transfer is a failure too: some streams across, some not, is
+     * the state most likely to be mistaken for success. */
+    {
+        uint32_t p = partition_create("partial");
+        g_streams_present   = 3;
+        g_streams_confirmed = 2;      /* one short */
+        CHECK(partition_migrate(p, 2) == 1,
+              "*** 2 of 3 streams confirmed is a FAILURE, not a partial success ***");
+        CHECK(partition_get_owner_node(p) == 1, "...and ownership does not move");
+    }
+
+    /* An genuinely empty partition still migrates: 0 of 0 is success, and
+     * conflating it with 0 of N is the bug this guard exists to avoid. */
+    {
+        uint32_t p = partition_create("empty-ok");
+        g_streams_present   = 0;
+        g_streams_confirmed = 0;
+        CHECK(partition_migrate(p, 2) == 0,
+              "*** a partition with NO streams migrates fine -- 0 of 0 is not a "
+              "failure, which is the distinction the expected count buys ***");
+        CHECK(partition_get_owner_node(p) == 2, "...and its ownership moves");
+    }
+    g_streams_present = 0; g_streams_confirmed = 0;
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

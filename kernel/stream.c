@@ -182,6 +182,20 @@ static void dir_read_entry(int slot) {
  *
  * Declared in stream.h so this is a stated interface rather than a silently
  * dropped `static` for a reader to puzzle over. */
+/* How many active stream slots belong to partition_id.
+ *
+ * partition_migrate() needs this to tell "moved everything" from "moved
+ * nothing because the destination refused", which it previously could not:
+ * stream_migrate_send_partition() returns only the count it managed to send,
+ * and 0 is both the correct answer for an empty partition and the symptom of
+ * a total failure. Comparing against the expected count separates them. */
+int stream_count_for_partition(uint32_t partition_id) {
+    int n = 0;
+    for (int i = 0; i < STREAM_MAX; i++)
+        if (stream_store[i].active && stream_store[i].partition_id == partition_id) n++;
+    return n;
+}
+
 void stream_persist_directory(void) {
     // Update header in dir_buf
     uint64_t magic   = DIR_MAGIC;
@@ -965,7 +979,17 @@ static void migrate_stage_reset(struct StreamMigrateInflight* mi, uint32_t page_
 
 int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
                               uint32_t frag_index, const uint8_t* frag_data) {
-    if (!(io_sq && io_cq)) return 1;
+    /* Also formerly silent. A node with no usable NVMe queues refuses every
+     * page of every transfer, which from the sender's side is
+     * indistinguishable from a protocol fault -- and is the single most
+     * likely cause of a destination refusing everything. */
+    if (!(io_sq && io_cq)) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: no NVMe I/O queues on this node -- refusing page %u "
+            "of transfer %llu. Nothing can be received until storage is up.\n",
+            (unsigned)page_index, (unsigned long long)transfer_id);
+        return 1;
+    }
     if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) {
         kernel_serial_printf(
             "[STREAM] migrate recv: fragment index %u out of range (max %u) -- dropped.\n",
@@ -1030,8 +1054,34 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
     const uint8_t* page_data = mi->staged;
     static uint8_t __attribute__((aligned(4096))) migrate_recv_verify_buf[4096];
     uint64_t dlba = d->lba_base + (uint64_t)page_index * 8;
-    if (nvme_write_sync(dlba, page_data) != 0) return 1;
-    if (nvme_read_sync(dlba, migrate_recv_verify_buf) != 0) return 1;
+    /* ─── These two used to fail silently ─────────────────────────────────
+     * They returned 1, which dspp_migrate_rx() turns into a non-zero ACK
+     * status, which the sender reports as "(destination refused)". Every
+     * other refusal path in this function logs a specific reason; these did
+     * not, so a real migration failure reached the operator as a refusal
+     * with no explanation and no way to tell an NVMe fault from a protocol
+     * one. Diagnosing it required reading the source.
+     *
+     * The LBA is included because "the write failed" and "the write failed
+     * at this address" are different amounts of information when the
+     * suspicion is an LBA-range collision between slots. */
+    if (nvme_write_sync(dlba, page_data) != 0) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: NVMe WRITE failed for page %u of transfer %llu "
+            "at LBA %llu -- refusing the page.\n",
+            (unsigned)page_index, (unsigned long long)transfer_id,
+            (unsigned long long)dlba);
+        return 1;
+    }
+    if (nvme_read_sync(dlba, migrate_recv_verify_buf) != 0) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: NVMe READBACK failed for page %u of transfer %llu "
+            "at LBA %llu -- the write may have landed but cannot be verified, so "
+            "the page is refused rather than assumed good.\n",
+            (unsigned)page_index, (unsigned long long)transfer_id,
+            (unsigned long long)dlba);
+        return 1;
+    }
     for (uint32_t b = 0; b < 4096; b++) {
         if (migrate_recv_verify_buf[b] != page_data[b]) {
             kernel_serial_printf(

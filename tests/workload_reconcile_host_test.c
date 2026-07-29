@@ -144,6 +144,13 @@ static uint32_t cycle(void) {
     return acted;
 }
 
+/* Paired with the relocate/send stubs: a test that stands in "nothing to
+ * relocate" must also stand in "nothing to count", or partition_migrate()
+ * sees 0 sent against a non-zero expectation and aborts every migration.
+ * FAITHFUL -- this test registers no streams, so the real function would
+ * also return 0. */
+int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+
 int main(void) {
     printf("=== Declarative workloads + bounded reconciler ===\n\n");
 

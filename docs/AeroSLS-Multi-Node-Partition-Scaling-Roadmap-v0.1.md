@@ -706,6 +706,51 @@ Every single one presented as success. None printed an error. Four of the seven 
 
 The reusable rule, since it has now cost seven bugs: **in a distributed or persistent system, assert on the far side of the boundary you are crossing.** Not that the frame was sent — that it arrived. Not that the field was set — that it was written. Not that the API was called — that the state changed where it needed to.
 
+## 9j. A refused transfer handed over ownership anyway
+
+The first migration that actually had data to move produced this:
+
+```
+page 0 of 'fresh.bin' NOT confirmed after 4 attempt(s) (destination refused)
+  -- transfer abandoned, source slot 0 left intact.
+partition 4 ownership set to node 2.
+2 physical frame(s) actually reclaimed.
+migrated partition 4: ... 0 stream(s) sent and confirmed ...
+migrate partition=4 -> node=2 -> OK
+```
+
+The stream layer behaved correctly — it refused to retire the source. Then `partition_migrate()` transferred ownership, reclaimed the source's frames, and reported **OK**. The data was on node 1; the ownership record pointed at node 2. A cluster disagreeing with itself, announced as success.
+
+### Why the failure was invisible to the caller
+
+`stream_migrate_send_partition()` returns only the count it managed to send. **`0` is both the correct answer for a partition with no streams and the symptom of a destination refusing everything** — and nothing distinguished them. `partition_migrate()` took the number and proceeded unconditionally.
+
+Worse, the frame-reclaim comment already said *"deliberately NOT reclaimed unless this succeeds"* — but "this" meant the ownership table write, not the data transfer. The discipline was stated and applied to the wrong step.
+
+`stream_count_for_partition()` supplies the expected count, taken **before** anything moves. A shortfall aborts before the ownership handoff, leaving the partition paused, locally owned, with its data intact — a state a retry can recover from. Proceeding is not recoverable by retrying, because the second attempt finds the partition already owned elsewhere.
+
+### And the refusal had no reason attached
+
+Three paths in `stream_migrate_recv_page()` returned failure with no log line: no NVMe I/O queues, a failed page write, and a failed verification readback. Every *other* refusal path logged a specific reason. So a real failure reached the operator as `(destination refused)` and nothing more — the only way to narrow it was to read the source. All three now name themselves, and the write/readback messages carry the LBA, because "the write failed" and "the write failed at this address" are different amounts of information when an LBA-range collision is the suspicion.
+
+### Verification
+
+`partition_migrate_phase6_host_test.c`, 46 checks. The two stubs are now settable, which is what makes the distinction testable at all: previously both were hardcoded to 0 for the *empty-partition* reason, so the refusal case had no way to appear.
+
+Three cases, and the third is the one that makes the guard correct rather than merely strict:
+
+- 2 streams present, 0 confirmed → migration **fails**, ownership stays, and a retry succeeds once the destination confirms.
+- 3 present, 2 confirmed → **also a failure**. A partial transfer is the state most easily mistaken for success.
+- 0 present, 0 confirmed → **succeeds**. An empty partition still migrates; conflating `0 of 0` with `0 of N` is precisely the bug.
+
+2/2 mutations caught, including one that aborts only on total failure and lets a partial one through.
+
+### Nineteen test files needed a new stub, and that is the interesting part
+
+Adding `stream_count_for_partition()` broke the build of every test that links `kernel/partition.c` without `kernel/stream.c`. Each got the stub with its reasoning stated — and the reasoning is load-bearing rather than boilerplate: a test that stands in *"nothing to relocate"* **must** also stand in *"nothing to count"*, or `partition_migrate()` sees 0 sent against a non-zero expectation and aborts every migration in that file. Returning 0 from both is what keeps the pair coherent.
+
+Two scripted insertions went wrong on the way: one regex required a single space after `int` and silently skipped a file with two, and one matched a multi-line function's opening line and inserted the stub *inside* the function body. Both were caught by the build rather than by review, which is the argument for compiling after every mechanical edit rather than at the end of a batch.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

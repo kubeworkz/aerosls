@@ -76,6 +76,14 @@ uint8_t*           stream_lazy_load_frame(struct StreamEntry* se, uint32_t frame
 // partial, not total, migration.
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id);
 
+/* Count of active stream slots belonging to partition_id. partition_migrate()
+ * compares this against what stream_migrate_send_partition() actually sent, so
+ * that "0 sent" from an empty partition can be told apart from "0 sent"
+ * because the destination refused everything -- previously indistinguishable,
+ * and the reason a failed migration transferred ownership anyway. */
+int stream_count_for_partition(uint32_t partition_id);
+
+
 // ─── Multi-Node Partition Scaling Roadmap Phase 7: real cross-node data
 // movement ────────────────────────────────────────────────────────────────
 // stream_relocate_partition() above is kept exactly as-is (still the right
@@ -97,11 +105,20 @@ int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id);
 // (DSPP_MIGRATE_PAGE_REQ) to dest_node_id over the real DSPP wire (net/
 // dspp.c), then retires the local slot -- the same retire-to-zero fields
 // stream_relocate_partition() already uses, factored into a shared static
-// helper so both functions apply the identical reset. Fire-and-forget: does
-// not wait for or verify BEGIN_ACK/PAGE_ACK before retiring the source, a
-// disclosed limitation (see dspp.h's own scope note) rather than a full
-// reliable-transport handshake -- a dropped packet on an unreliable link
-// could lose data in this first cut. Returns the count of slots sent.
+// helper so both functions apply the identical reset.
+//
+// NO LONGER fire-and-forget, and this comment used to say it was: the sender
+// now waits for a BEGIN_ACK before sending pages, waits for a per-fragment
+// PAGE_ACK per page, retransmits only the fragments that were not
+// acknowledged, and retires the source slot ONLY if every page was confirmed.
+// An unconfirmed transfer leaves the source intact and says why. See
+// net/dspp.h's "Sender-side ACK tracking" block for the budget and the
+// stalled-clock bound.
+//
+// Returns the count of slots successfully sent AND confirmed. Compare it
+// against stream_count_for_partition() to tell a complete move from a partial
+// one -- 0 means "nothing to send" or "everything refused", and the caller
+// needs to distinguish those.
 int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id);
 
 // Receiver-side, called by net/dspp.c's dspp_migrate_rx() when a

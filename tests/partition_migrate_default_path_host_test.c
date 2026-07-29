@@ -93,6 +93,13 @@ static int migrate_send_calls = 0;
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) {
     (void)partition_id; (void)dest_node_id; relocate_calls++; return 0;
 }
+/* Paired with the relocate/send stubs: a test that stands in "nothing to
+ * relocate" must also stand in "nothing to count", or partition_migrate()
+ * sees 0 sent against a non-zero expectation and aborts every migration.
+ * FAITHFUL -- this test registers no streams, so the real function would
+ * also return 0. */
+int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+
 int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) {
     (void)partition_id; (void)dest_node_id; migrate_send_calls++; return 0;
 }

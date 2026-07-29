@@ -399,9 +399,44 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // (net/dspp.c/kernel/stream.c, this phase's new code). Both return the
     // identical "count of slots moved" convention, so the logging and
     // return-value handling below needs no branch of its own.
+    /* ─── How many streams SHOULD move, counted before anything moves ──────
+     * stream_migrate_send_partition() returns only what it managed to send,
+     * and 0 is both the right answer for an empty partition and the symptom
+     * of a destination refusing everything. Without the expected count those
+     * two are indistinguishable -- which is exactly how a migration that
+     * transferred no data went on to hand over ownership and report OK.
+     *
+     * Observed on a live cluster: page 0 was refused, the source slot was
+     * correctly left intact, and then this function moved ownership to the
+     * destination and reclaimed the source's frames anyway. The data was on
+     * one node and the ownership record pointed at another. */
+    int streams_expected = stream_count_for_partition(partition_id);
+
     int streams_relocated = (cluster_local_node_id() != 0)
         ? stream_migrate_send_partition(partition_id, dest_node_id)
         : stream_relocate_partition(partition_id, dest_node_id);
+
+    /* ─── Abort before the ownership handoff if the data did not follow ─────
+     * Ownership is what makes the destination authoritative. Handing it over
+     * while the bytes are still here produces a cluster that disagrees with
+     * itself, and the operator finds out by reading a stream that is not
+     * where its partition says it should be.
+     *
+     * Returning here leaves the partition PAUSED and still owned locally,
+     * with its data intact. That is a recoverable state: fix whatever the
+     * destination was complaining about and run the migration again. The
+     * alternative -- proceeding -- is not recoverable by retrying, because
+     * the second attempt would find the partition already owned elsewhere. */
+    if (streams_relocated < streams_expected) {
+        kernel_serial_printf(
+            "[PARTITION] ERROR: migrate ABORTED for partition %u -- %d of %d stream(s) "
+            "were confirmed by node %u. Ownership NOT transferred and no frames "
+            "reclaimed; the partition stays here, paused, with its data intact. "
+            "Check node %u's log for the refusal reason, then retry.\n",
+            (unsigned)partition_id, streams_relocated, streams_expected,
+            (unsigned)dest_node_id, (unsigned)dest_node_id);
+        return 1;
+    }
 
     // Step 3b (Persistent Execution Contexts, Phase 3): move this
     // partition's RUNNING computations, not just its data at rest. A

@@ -92,6 +92,12 @@ uint32_t process_kill_partition(uint32_t p)  { (void)p; return 0; }
 uint32_t partition_reclaim_all_frames(uint32_t p) { (void)p; return 0; }
 int  stream_relocate_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }
 int  stream_migrate_send_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }
+/* Paired with the relocate/send stubs: a test that stands in "nothing to
+ * relocate" must also stand in "nothing to count", or partition_migrate()
+ * sees 0 sent against a non-zero expectation and aborts every migration.
+ * FAITHFUL -- this test registers no streams, so the real function would
+ * also return 0. */
+int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t simi_ctx_migrate_send_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }
 void dspp_service_announce(const char* n, uint32_t p, uint8_t k, uint32_t e,
                            uint32_t u, uint8_t sv) {

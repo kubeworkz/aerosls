@@ -155,6 +155,13 @@ void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 int stream_relocate_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }
+/* Paired with the relocate/send stubs above: a test that stands in "nothing
+ * to relocate" must also stand in "nothing to count", or partition_migrate()
+ * sees 0 sent against a non-zero expectation and aborts every migration.
+ * FAITHFUL -- these tests register no streams, so the real function would
+ * also return 0. */
+int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+
 int stream_migrate_send_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }
 static uint32_t g_fake_local_node_id = 0;
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
