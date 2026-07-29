@@ -169,6 +169,8 @@ telnet 127.0.0.1 12341   # node A   (Ctrl-] then "quit" to detach)
 telnet 127.0.0.1 12342   # node B
 ```
 
+Each node also has a **URL**: node *i* is `http://localhost:3000+i`, so `aeroslsctl --host localhost:3004` drives node 4. That works because every node now gets two NICs — a management one on an isolated NAT with a host port forward, and the cluster one on the shared multicast segment carrying DSPP.
+
 Each console gives you a **shell prompt**. That needed building: `kernel.c` enters `http_server_run()` and never returns when a NIC is present, so `sls_shell_loop()` is unreachable on a networked boot — the HTTP loop now polls the serial port between sweeps (`kernel/console.c`). Nodes also self-identify at boot from `node=<n>` on the kernel command line, so no `cluster init` step is needed. See the script's own header comment and `docs/AeroSLS-Multi-Node-Partition-Scaling-Roadmap-v0.1.md`'s Phase 7 addendum for the full mechanism.
 
 ---

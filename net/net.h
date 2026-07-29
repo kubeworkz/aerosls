@@ -157,6 +157,9 @@ void  net_free_buf(void* buf);
 
 // ─── Top-level receive dispatcher ─────────────────────────────────────────────
 // Called from e1000 interrupt handler / poll loop with the raw frame bytes.
-void net_rx_dispatch(void* frame, uint16_t len);
+/* `ifindex` is the interface the frame arrived on. It is not decoration:
+ * the self-echo guard must compare against THAT interface's MAC, or a frame
+ * sent by NIC A gets dropped on NIC B for matching the wrong address. */
+void net_rx_dispatch(void* frame, uint16_t len, int ifindex);
 
 #endif /* NET_H */

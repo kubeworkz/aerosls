@@ -72,6 +72,23 @@
 int boot_params_find_uint(const char* cmdline, const char* key, uint32_t* out);
 
 /*
+ * Find `key=<token>` in `cmdline` and copy the token to `out`.
+ *
+ * Same whole-token matching and same refusal-over-guessing rules as
+ * boot_params_find_uint(): the key must start the string or follow a space
+ * and be followed by '=', and the value runs to the next space or the end.
+ * Returns 1 on success with `out` NUL-terminated, 0 otherwise (key absent,
+ * no '=', empty value, or a value that will not fit).
+ *
+ * A value too long is a FAILURE, not a truncation. `nic0=clus` silently
+ * accepted as `nic0=cluster` would put DSPP on the wrong wire, and a
+ * truncated role name that still matched something is exactly the class of
+ * bug the uint parser already refuses.
+ */
+int boot_params_find_str(const char* cmdline, const char* key,
+                         char* out, int cap);
+
+/*
  * Walk the multiboot2 tag list at `mb2_phys` for the boot command line
  * (tag type 1) and copy it into an internal buffer.
  *

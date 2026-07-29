@@ -38,6 +38,7 @@
  *   /tmp/workload_ctx_host_test
  */
 #include "kernel/workload.h"
+#include "net/e1000.h"   /* NicRole */
 #include "kernel/workload_ctx.h"
 #include "kernel/simi_ctx_migrate.h"
 #include "kernel/service_registry.h"
@@ -145,7 +146,11 @@ static uint16_t cap_len[MAX_FRAMES];
 static int      cap_count = 0;
 static int      capturing = 1;
 
-void e1000_transmit_packet(void* buf, uint16_t size) {
+/* Multi-NIC Phase 2: renamed, and now carries the role. Body unchanged;
+ * the role is recorded alongside so DSPP's interface choice is assertable. */
+static NicRole last_tx_role = NIC_ROLE_NONE;
+void e1000_transmit(NicRole role, void* buf, uint16_t size) {
+    last_tx_role = role;
     if (!capturing || cap_count >= MAX_FRAMES) return;
     if (size > FRAME_CAP) size = (uint16_t)FRAME_CAP;
     memcpy(cap_buf[cap_count], buf, size);

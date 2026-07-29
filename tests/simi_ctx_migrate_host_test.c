@@ -43,6 +43,7 @@
  *   /tmp/simi_ctx_migrate_host_test
  */
 #include "tools/simi/simi_isa.h"
+#include "net/e1000.h"   /* NicRole */
 #include "tools/simi/simi_obj.h"
 #include "kernel/simi_interp.h"
 #include "kernel/simi_ckpt.h"
@@ -161,7 +162,12 @@ static int      ack_count = 0;
 static uint8_t  last_ack_status = 0xFF;
 static uint16_t last_ack_opcode = 0;
 
-void e1000_transmit_packet(void* buf, uint16_t size) {
+/* Multi-NIC Phase 2: renamed, and now carries the role. The capture body
+ * below is unchanged; the role is recorded alongside it so this test can
+ * also assert DSPP left by the CLUSTER interface. */
+static NicRole last_tx_role = NIC_ROLE_NONE;
+void e1000_transmit(NicRole role, void* buf, uint16_t size) {
+    last_tx_role = role;
     if (!capturing) {
         /* An ACK from the simulated receiver. Nothing reads these in
          * production yet (fire-and-forget), but they carry the refusal

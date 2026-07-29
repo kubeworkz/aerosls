@@ -295,8 +295,19 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
         // Scan bus 0 for e1000 (Intel vendor 8086, device 100e/10d3/107c).
         // Store both the MMIO base and the PCI slot so e1000_init can use
         // the correct slot for Bus Master Enable without another scan.
-        uint8_t found_slot = 0;
-        for (int slot = 0; slot < 32; slot++) {
+        /* Multi-NIC Phase 3: collect EVERY e1000, not the first. This loop
+         * used to `break` on the first match, which is the whole reason a
+         * second -device e1000 sat dead on the bus.
+         *
+         * Roles by enumeration order for now, and the order is what QEMU's
+         * -device sequence produces: the first card is management, the
+         * second is the cluster segment. With ONE card it takes both, so
+         * every existing single-NIC node is unaffected -- which is every
+         * node today. Phase 4 replaces this with an explicit `nicN=` on the
+         * kernel command line; until then the ordering is a documented
+         * convention, not a discovery. */
+        int found = 0;
+        for (int slot = 0; slot < 32 && found < E1000_MAX_NICS; slot++) {
             uint32_t vid_did = pci_read_config(0, (uint8_t)slot, 0, 0x00);
             if (vid_did == 0xFFFFFFFF) continue;
             uint32_t vid = vid_did & 0xFFFF;
@@ -308,19 +319,27 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
                 uint64_t base = (uint64_t)(bar0 & 0xFFFFFFF0);
                 if (is64) base |= ((uint64_t)bar1 << 32);
                 if ((bar0 & 0x1) == 0 && base != 0) {
-                    e1000_mmio_base = base;
-                    found_slot      = (uint8_t)slot;
-                    kernel_serial_printf("[NET] e1000 at PCI slot %d MMIO 0x%lx\n",
-                                         slot, base);
-                    break;
+                    kernel_serial_printf("[NET] e1000 #%d at PCI slot %d MMIO 0x%lx\n",
+                                         found, slot, base);
+                    e1000_init(found, base, (uint8_t)slot, 0 /* roles set below */);
+                    found++;
                 }
             }
         }
-        if (e1000_mmio_base) {
-            e1000_init(e1000_mmio_base, found_slot);
+
+        if (found > 0) {
+            /* Assign roles now that the count is known -- a single card has
+             * to hold both, and that cannot be decided mid-scan. */
+            /* Command line first (`nic0=mgmt nic1=cluster`), enumeration
+             * order only when none was given. */
+            if (e1000_assign_roles(found, boot_params_cmdline()))
+                kernel_serial_print("[NET] NIC roles taken from the command line.\n");
+            else if (found > 1)
+                kernel_serial_print("[NET] NIC roles by enumeration order "
+                                    "(no nicN= given): nic0=mgmt nic1=cluster.\n");
             net_init();   // sends gratuitous ARP
             dhcp_start(); // DISCOVER → OFFER → REQUEST → ACK; updates net_my_ip
-            kernel_serial_print("[NET] e1000 RX/TX rings online.\n");
+            kernel_serial_printf("[NET] %d e1000 interface(s) online.\n", found);
         } else {
             kernel_serial_print("[NET] e1000 not found — network disabled.\n");
         }
@@ -396,7 +415,10 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // microkernel_service_poll() from smp.c.  Kick the HTTP server on the BSP
     // as a foreground loop only if the NIC is present; otherwise fall through
     // to the shell.
-    if (e1000_mmio_base) {
+    /* Was `if (e1000_mmio_base)`, a global the driver no longer keeps now
+     * that it holds one struct per interface. Same question, asked of the
+     * driver instead of a variable it happened to export. */
+    if (e1000_nic_count() > 0) {
         http_server_run();  // does not return — serves REST API on port 3000
     }
 

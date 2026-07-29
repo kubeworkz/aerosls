@@ -17,8 +17,10 @@ volatile uint64_t cpu_idle_wait_count = 0;
 // calling loop.  No explicit "ready" flags are needed — the TCP receive
 // ring buffer IS the synchronisation point.
 void net_poll_tick(void) {
-    // Guard: skip if the NIC has not been initialised yet
-    if (!e1000_mmio_base) return;
+    // Guard: skip until at least one interface is up. Was a test of the
+    // driver's exported e1000_mmio_base, which no longer exists now that
+    // there is one struct per interface rather than one global base.
+    if (e1000_nic_count() == 0) return;
 
     e1000_poll_rx();
 }

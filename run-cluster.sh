@@ -22,6 +22,16 @@
 # cluster_local_node_id() early in boot, while net_my_mac does not exist
 # until e1000_init() far below it.
 #
+# ─── Two NICs per node, and why their PCI slots are pinned ─────────────
+# nic0 is management (slirp NAT + hostfwd, so the node has a URL); nic1 is
+# the cluster segment. The kernel is told which is which explicitly, via
+# `nic0=mgmt nic1=cluster` on its command line -- but "nic0" there means
+# "the first e1000 the PCI scan finds", i.e. the lowest slot. QEMU does not
+# promise that -device order equals slot order, so both cards carry an
+# explicit addr=. Without it a bus reordering would silently put DSPP on
+# the NAT and HTTP on the cluster wire -- both would "work" in the sense of
+# not erroring, and nothing would reach anything.
+#
 # ─── One shared L2 segment ─────────────────────────────────────────────
 # Every node joins the same `-netdev socket,mcast=` group. No host
 # privileges, no bridge, and unlike the old listen/connect pair there is
@@ -58,8 +68,10 @@ PID_FILE="$CLUSTER_DIR/cluster.pids"
 
 MCAST_GROUP="${AEROSLS_MCAST:-239.192.152.40}"
 MCAST_PORT="${AEROSLS_MCAST_PORT:-12340}"
-CON_BASE="${AEROSLS_CON_BASE:-12340}"  # node i's console is CON_BASE + i
-MAC_PREFIX="52:54:00:AE:51"
+CON_BASE="${AEROSLS_CON_BASE:-12340}"   # node i's console is CON_BASE + i
+HTTP_BASE="${AEROSLS_HTTP_BASE:-3000}"  # node i's REST API is HTTP_BASE + i
+MAC_PREFIX="52:54:00:AE:51"             # cluster NIC:    ...:51:0<i>
+MGMT_MAC_PREFIX="52:54:00:AE:52"        # management NIC: ...:52:0<i>
 
 NODES=2
 NODES_GIVEN=0
@@ -340,8 +352,10 @@ else
     DISPLAY_BACKEND="none"
 fi
 
-node_mac()  { printf '%s:%02x' "$MAC_PREFIX" "$1"; }
-node_con()  { echo $(( CON_BASE + $1 )); }
+node_mac()      { printf '%s:%02x' "$MAC_PREFIX" "$1"; }
+node_mgmt_mac() { printf '%s:%02x' "$MGMT_MAC_PREFIX" "$1"; }
+node_con()      { echo $(( CON_BASE + $1 )); }
+node_http()     { echo $(( HTTP_BASE + $1 )); }
 node_iso()  { echo "$CLUSTER_DIR/node$1.iso"; }
 node_img()  { echo "$CLUSTER_DIR/node$1.img"; }
 node_log()  { echo "$CLUSTER_DIR/node$1.log"; }
@@ -351,17 +365,30 @@ node_log()  { echo "$CLUSTER_DIR/node$1.log"; }
 # that build the argv separately would be two things to keep in step.
 node_argv() {
     local i="$1"
-    printf '%s\n' \
-        "$QEMU" \
-        -cdrom "$(node_iso "$i")" \
-        -drive "id=disk,file=$(node_img "$i"),if=none,format=raw" \
-        -device "nvme,drive=disk,serial=slsdev$i" \
-        -netdev "socket,id=net0,mcast=$MCAST_GROUP:$MCAST_PORT,localaddr=127.0.0.1" \
-        -device "e1000,netdev=net0,mac=$(node_mac "$i")" \
-        -vga std -display "$DISPLAY_BACKEND" -monitor none \
-        -chardev "socket,id=con0,host=127.0.0.1,port=$(node_con "$i"),server=on,wait=off,telnet=on,logfile=$(node_log "$i")" \
-        -serial chardev:con0 \
-        -m "$RAM" -smp "$SMP" -boot d
+    local -a a=()
+
+    a+=("$QEMU")
+    a+=(-cdrom "$(node_iso "$i")")
+    a+=(-drive "id=disk,file=$(node_img "$i"),if=none,format=raw")
+    a+=(-device "nvme,drive=disk,serial=slsdev$i")
+
+    # nic0 -- MANAGEMENT. Its own isolated slirp NAT, so the guest address
+    # never meets a peer, plus a host port forward that gives this node a
+    # URL. slirp also runs a DHCP server, which is why net/dhcp.c finally
+    # gets a lease here instead of timing out to the compiled-in default.
+    a+=(-netdev "user,id=mgmt0,hostfwd=tcp:127.0.0.1:$(node_http "$i")-:3000")
+    a+=(-device "e1000,netdev=mgmt0,mac=$(node_mgmt_mac "$i"),addr=0x4")
+
+    # nic1 -- CLUSTER. The shared multicast L2 segment carrying DSPP.
+    a+=(-netdev "socket,id=net0,mcast=$MCAST_GROUP:$MCAST_PORT,localaddr=127.0.0.1")
+    a+=(-device "e1000,netdev=net0,mac=$(node_mac "$i"),addr=0x5")
+
+    a+=(-vga std -display "$DISPLAY_BACKEND" -monitor none)
+    a+=(-chardev "socket,id=con0,host=127.0.0.1,port=$(node_con "$i"),server=on,wait=off,telnet=on,logfile=$(node_log "$i")")
+    a+=(-serial chardev:con0)
+    a+=(-m "$RAM" -smp "$SMP" -boot d)
+
+    printf '%s\n' "${a[@]}"
 }
 
 echo "==> Cluster plan"
@@ -370,17 +397,23 @@ echo "      per node         $RAM RAM, $SMP vCPU"
 echo "      segment          $MCAST_GROUP:$MCAST_PORT (shared, all nodes)"
 echo "      display          $DISPLAY_BACKEND"
 echo "      consoles         $(node_con 1)..$(node_con "$NODES") on 127.0.0.1"
+echo "      REST API         http://localhost:$(node_http 1)..$(node_http "$NODES")"
 
 # Only CONSOLE ports are checked. The segment port is bound by every node
 # on purpose -- that shared bind IS the segment -- so treating it as a
 # clash would refuse a launch working exactly as designed.
 for i in $(seq 1 "$NODES"); do
-    p="$(node_con "$i")"
-    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$p "; then
-        echo "error: console port $p (node $i) is already in use." >&2
-        echo "       Set AEROSLS_CON_BASE, or stop whatever holds it." >&2
-        exit 1
-    fi
+    for spec in "console:$(node_con "$i"):AEROSLS_CON_BASE" \
+                "REST API:$(node_http "$i"):AEROSLS_HTTP_BASE"; do
+        what="${spec%%:*}"; rest="${spec#*:}"; p="${rest%%:*}"; var="${rest#*:}"
+        if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$p "; then
+            echo "error: $what port $p (node $i) is already in use." >&2
+            echo "       Set $var, or stop whatever holds it." >&2
+            echo "       Note: 'make x86-run' forwards host 3001, which collides" >&2
+            echo "       with node 1's REST port by default." >&2
+            exit 1
+        fi
+    done
 done
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -413,7 +446,7 @@ set timeout=0
 set default=0
 menuentry "AeroSLS — cluster node $i" {
     insmod multiboot2
-    multiboot2 /boot/$X86_BIN node=$i
+    multiboot2 /boot/$X86_BIN node=$i nic0=mgmt nic1=cluster
     boot
 }
 EOF
@@ -491,6 +524,14 @@ done
 
 if command -v telnet >/dev/null 2>&1; then ATTACH="telnet 127.0.0.1"; else ATTACH="nc 127.0.0.1"; fi
 
+# The address book slsos-sim needs, emitted rather than left to be typed --
+# a hand-written one with a wrong port silently shows another node's data.
+NODES_ENV=""
+for i in $(seq 1 "$NODES"); do
+    [ -n "$NODES_ENV" ] && NODES_ENV="$NODES_ENV,"
+    NODES_ENV="$NODES_ENV$i=http://localhost:$(node_http "$i")"
+done
+
 cat <<EOF
 
 ==> $NODES nodes up and confirmed running.
@@ -506,6 +547,12 @@ cat <<EOF
     "[BOOT] node identity <i> taken from the command line" to confirm the
     node came up as itself, then try "cluster status" -- on a formed
     cluster the roster should list every node on the segment.
+
+    Point the dashboard at the cluster by exporting this before
+    'npm run dev' in slsos-sim -- the /node/<id> proxy is already there,
+    and an id NOT in this list is refused rather than served by node 1:
+
+        export AEROSLS_NODES="$NODES_ENV"
 
 ==> Ctrl-C stops the cluster, or run './run-cluster.sh --stop' elsewhere.
 EOF

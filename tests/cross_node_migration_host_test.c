@@ -39,6 +39,7 @@
  *   /tmp/cross_node_migration_host_test
  */
 #include "kernel/stream.h"
+#include "net/e1000.h"   /* NicRole */
 #include "kernel/partition.h"
 #include "kernel/frame_pool.h"
 #include "kernel/object_catalog.h"
@@ -143,7 +144,13 @@ MACAddr net_my_mac;
 static uint8_t  captured_frame[MAX_CAPTURED_FRAMES][ETH_HDR_LEN + sizeof(struct DSPPMigratePagePacket)];
 static uint16_t captured_frame_len[MAX_CAPTURED_FRAMES];
 static int      captured_frame_count = 0;
-void e1000_transmit_packet(void* buf, uint16_t size) {
+/* Multi-NIC Phase 2 renamed this and gave it a role. The capture is
+ * unchanged -- this test's point is that the captured bytes replay through
+ * the receive path -- but the role is recorded too, so it can also assert
+ * DSPP leaves by the CLUSTER interface rather than the management one. */
+static NicRole last_tx_role = NIC_ROLE_NONE;
+void e1000_transmit(NicRole role, void* buf, uint16_t size) {
+    last_tx_role = role;
     if (captured_frame_count >= MAX_CAPTURED_FRAMES) return;
     if (size > sizeof(captured_frame[0])) { size = (uint16_t)sizeof(captured_frame[0]); }
     memcpy(captured_frame[captured_frame_count], buf, size);

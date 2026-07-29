@@ -70,6 +70,33 @@ int boot_params_find_uint(const char* cmdline, const char* key, uint32_t* out) {
     return 0;
 }
 
+int boot_params_find_str(const char* cmdline, const char* key,
+                         char* out, int cap) {
+    if (!cmdline || !key || !out || cap <= 1 || key[0] == '\0') return 0;
+
+    for (int i = 0; cmdline[i] != '\0'; i++) {
+        if (i != 0 && cmdline[i - 1] != ' ') continue;      /* whole token */
+
+        int klen = bp_key_matches(&cmdline[i], key);
+        if (klen == 0) continue;
+        if (cmdline[i + klen] != '=') continue;
+
+        const char* v = &cmdline[i + klen + 1];
+        int n = 0;
+        while (v[n] != '\0' && v[n] != ' ') n++;
+        if (n == 0) return 0;                                /* "key=" */
+
+        /* Refuse rather than truncate. A clipped role name that still
+         * parsed would put traffic on the wrong interface silently. */
+        if (n > cap - 1) return 0;
+
+        for (int j = 0; j < n; j++) out[j] = v[j];
+        out[n] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 void boot_params_scan_mb2(uint32_t mb2_magic, uint32_t mb2_phys) {
     bp_cmdline[0] = '\0';
 

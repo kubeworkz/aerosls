@@ -1,4 +1,5 @@
 #include "net.h"
+#include "e1000.h"   /* e1000_nic_mac() -- per-interface self-echo guard */
 #include "arp.h"
 #include "ipv4.h"
 #include "tcp.h"    // Navigator-Parity Gap Roadmap Phase 5c -- tcp_conns[]/TCP_MAX_CONNS for sys_sls_net_status()
@@ -72,19 +73,25 @@ uint64_t net_self_echo_dropped = 0;
  * so "our MAC" is not yet a fact, and a zero comparison would be matching
  * on ignorance rather than identity.
  */
-static int net_frame_is_self(const struct EthernetHeader* eth) {
+static int net_frame_is_self(const struct EthernetHeader* eth, int ifindex) {
+    /* THIS interface's MAC, not a global one. With one NIC the two are the
+     * same and behaviour is unchanged; with two, using the global would drop
+     * legitimate traffic from the peer interface. */
+    const MACAddr* mine = e1000_nic_mac(ifindex);
+    if (!mine) mine = &net_my_mac;   /* before any bind, or an unknown index */
+
     int known = 0;
-    for (int i = 0; i < 6; i++) if (net_my_mac.b[i]) { known = 1; break; }
+    for (int i = 0; i < 6; i++) if (mine->b[i]) { known = 1; break; }
     if (!known) return 0;
-    for (int i = 0; i < 6; i++) if (eth->src.b[i] != net_my_mac.b[i]) return 0;
+    for (int i = 0; i < 6; i++) if (eth->src.b[i] != mine->b[i]) return 0;
     return 1;
 }
 
-void net_rx_dispatch(void* frame, uint16_t len) {
+void net_rx_dispatch(void* frame, uint16_t len, int ifindex) {
     if (len < ETH_HDR_LEN) return;
     struct EthernetHeader* eth = (struct EthernetHeader*)frame;
 
-    if (net_frame_is_self(eth)) { net_self_echo_dropped++; return; }
+    if (net_frame_is_self(eth, ifindex)) { net_self_echo_dropped++; return; }
 
     uint16_t et = ntohs(eth->ethertype);
 

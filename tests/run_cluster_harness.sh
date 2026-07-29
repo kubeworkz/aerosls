@@ -420,6 +420,58 @@ s.bind(('',12340)); time.sleep(8)" 2>/dev/null &
     run timeout 20 ./run-cluster.sh --stop >/dev/null; launch_wait_exit
 fi
 
+# ═══ 11: two NICs per node (Multi-NIC Phase 5) ═══════════════════════════
+echo
+echo "-- 11: management NIC + per-node URL --"
+export STUB_ARGV_LOG="$T/argv11.txt"; : > "$STUB_ARGV_LOG"
+export STUB_GRUB_LOG="$T/grub11.txt"; : > "$STUB_GRUB_LOG"
+launch_bg 3 --nodes 3
+OUT="$(cat "$T/launch.out")"
+ARGV="$(cat "$T/argv11.txt")"
+GRUB="$(cat "$T/grub11.txt")"
+
+check "$(has '3 nodes up and confirmed running' "$OUT")" "3 nodes come up"
+check "$([ "$(grep -oE 'e1000,netdev=' "$T/argv11.txt" | wc -l)" = 6 ] && echo yes || echo no)"       "*** each of the 3 nodes gets TWO e1000s ***"
+check "$([ "$(grep -oE 'hostfwd=tcp:127\.0\.0\.1:300[0-9]' "$T/argv11.txt" | sort -u | wc -l)" = 3 ] && echo yes || echo no)"       "*** three DISTINCT host ports -- node i is reachable at 3000+i ***"
+check "$(has 'hostfwd=tcp:127.0.0.1:3003-:3000' "$ARGV")"       "*** node 3's URL is localhost:3003, forwarding to the guest's 3000 ***"
+check "$(has '127.0.0.1:300' "$ARGV")"       "*** the forward binds loopback, not 0.0.0.0 ***"
+
+# The kernel is told which card is which; the PCI slots are pinned so that
+# instruction matches reality.
+check "$(hasall "$GRUB" 'nic0=mgmt' 'nic1=cluster')"       "*** each node's grub.cfg names the roles explicitly ***"
+check "$(hasall "$ARGV" 'netdev=mgmt0' 'addr=0x4' 'netdev=net0' 'addr=0x5')"       "*** ...and both cards pin a PCI slot, so nic0 really is the mgmt one ***"
+
+# Distinct MACs across BOTH cards of all three nodes -- 6 in total. The
+# self-echo guard keys on these, so a collision would drop real traffic.
+check "$([ "$(grep -oE 'mac=52:54:00:AE:5[12]:[0-9a-f]{2}' "$T/argv11.txt" | sort -u | wc -l)" = 6 ] && echo yes || echo no)"       "*** all 6 interfaces have distinct MACs ***"
+
+check "$(has 'REST API         http://localhost:3001..3003' "$OUT")"       "the plan states the URLs"
+run timeout 20 ./run-cluster.sh --stop >/dev/null; launch_wait_exit
+
+# ═══ 11b: the launcher hands over the dashboard's address book ═══════════
+# A hand-typed AEROSLS_NODES with one wrong port shows another node's data
+# under the wrong heading, so the launcher emits it rather than describing
+# it. The ports here must match the hostfwd ports above.
+check "$(has 'export AEROSLS_NODES="1=http://localhost:3001,2=http://localhost:3002,3=http://localhost:3003"' "$OUT")"       "*** the exact AEROSLS_NODES string is printed, ready to paste ***"
+
+# ═══ 12: an HTTP port in use is caught, and named as such ════════════════
+echo
+echo "-- 12: a busy REST port --"
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',3002)); s.listen(1); time.sleep(6)" 2>/dev/null &
+    HOLDER=$!
+    sleep 1
+    OUT="$(run timeout 20 ./run-cluster.sh --nodes 3)"
+    kill "$HOLDER" 2>/dev/null || true
+    check "$(has 'REST API port 3002' "$OUT")"           "*** a held REST port is refused and named ***"
+    check "$(has 'node 2' "$OUT")" "...along with whose it is"
+    check "$(has 'make x86-run' "$OUT")"           "*** ...and warns about the collision an operator will actually hit ***"
+    check "$(hasnt 'Building the kernel' "$OUT")" "caught before building"
+fi
+
 echo
 echo "=========================================="
 echo "passed=$passed failed=$failed"

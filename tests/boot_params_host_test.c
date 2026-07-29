@@ -221,6 +221,42 @@ int main(void) {
         CHECK(!boot_params_find_uint("node=1", "", &v), "an empty key matches nothing");
     }
 
+    /* ═══ 1b: boot_params_find_str ════════════════════════════════════════
+     * Added for `nicN=mgmt|cluster` (Multi-NIC Phase 4). Same rules as the
+     * uint parser, and one that matters more here: an over-long value is
+     * REFUSED, never truncated. A clipped role name that still parses as a
+     * valid role would put DSPP on the management wire silently. */
+    printf("\n-- 1b: boot_params_find_str --\n");
+    {
+        char v[16];
+        CHECK(boot_params_find_str("nic0=cluster", "nic0", v, sizeof(v)) &&
+              !strcmp(v, "cluster"), "a bare key=token parses");
+        CHECK(boot_params_find_str("node=1 nic1=mgmt quiet", "nic1", v, sizeof(v)) &&
+              !strcmp(v, "mgmt"), "a token mid-line parses, stopping at the space");
+        CHECK(!boot_params_find_str("nic0=cluster", "nic1", v, sizeof(v)),
+              "an absent key is rejected");
+        CHECK(!boot_params_find_str("nic0=", "nic0", v, sizeof(v)), "an empty value is rejected");
+        CHECK(!boot_params_find_str("xnic0=mgmt", "nic0", v, sizeof(v)),
+              "*** whole-token matching: 'xnic0' is not 'nic0' ***");
+        CHECK(!boot_params_find_str("nic0mgmt", "nic0", v, sizeof(v)),
+              "...and the '=' is required");
+
+        /* THE one. cap 8 leaves room for 7 characters, and "cluster" is
+         * exactly 7 -- so a truncating parser would turn "clusterX" into a
+         * perfectly valid role name and put traffic on the wrong wire. */
+        char small[8];
+        CHECK(!boot_params_find_str("nic0=clusterX", "nic0", small, sizeof(small)),
+              "*** 'clusterX' is REFUSED, not truncated to the valid 'cluster' ***");
+        CHECK(boot_params_find_str("nic0=cluster", "nic0", small, sizeof(small)) &&
+              !strcmp(small, "cluster"),
+              "...while a value that exactly fits still parses");
+
+        CHECK(!boot_params_find_str(NULL, "nic0", v, sizeof(v)), "a NULL cmdline is safe");
+        CHECK(!boot_params_find_str("nic0=mgmt", NULL, v, sizeof(v)), "a NULL key is safe");
+        CHECK(!boot_params_find_str("nic0=mgmt", "nic0", NULL, sizeof(v)), "a NULL out is safe");
+        CHECK(!boot_params_find_str("nic0=mgmt", "nic0", v, 1), "a cap of 1 holds no token");
+    }
+
     /* ═══ 2: the multiboot2 tag walk ══════════════════════════════════════ */
     printf("\n-- 2: reading the command line out of the tag list --\n");
     {

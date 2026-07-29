@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include "kernel/object_catalog.h"
+#include "net/e1000.h"   /* NicRole */
 #include "kernel/partition.h"
 #include "net/consensus.h"
 #include "net/dspp.h"
@@ -120,8 +121,14 @@ void update_page_table_permissions_globally(uint32_t force_read_only) { (void)fo
 void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t force_read_only) {
     (void)partition_id; (void)force_read_only;
 }
+/* Multi-NIC Phase 2 renamed this and gave it a role. Recording the role
+ * rather than discarding it turns a link fix into a real assertion: DSPP
+ * must leave by the CLUSTER interface, never the management one. */
 static int transmit_call_count = 0;
-void e1000_transmit_packet(void* buf, uint16_t size) { (void)buf; (void)size; transmit_call_count++; }
+static NicRole last_tx_role = NIC_ROLE_NONE;
+void e1000_transmit(NicRole role, void* buf, uint16_t size) {
+    (void)buf; (void)size; transmit_call_count++; last_tx_role = role;
+}
 
 /* ─── Stubs for net/dspp.c's Phase 7 dependencies ──────────────────────────
  * This test links the real net/dspp.c (for its Phase 5 routing logic,

@@ -81,7 +81,7 @@ void udp_send(IPv4Addr src_ip, IPv4Addr dst_ip,
     for (uint16_t i = 0; i < dlen; i++) dat[i] = ((const uint8_t*)data)[i];
 
     uint16_t frame_len = (uint16_t)(ETH_HDR_LEN + sizeof(*ip) + udp_total);
-    e1000_transmit_packet(pkt, frame_len);
+    e1000_transmit(NIC_ROLE_MGMT, pkt, frame_len);
     net_free_buf(pkt);
 }
 

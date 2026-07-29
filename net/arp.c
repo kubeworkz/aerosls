@@ -70,7 +70,7 @@ static void arp_send(uint16_t op, MACAddr dst_mac, IPv4Addr dst_ip) {
     arp->target_mac = dst_mac;
     arp->target_ip  = dst_ip;
 
-    e1000_transmit_packet(pkt, (uint16_t)(ETH_HDR_LEN + sizeof(struct ARPPacket)));
+    e1000_transmit(NIC_ROLE_MGMT, pkt, (uint16_t)(ETH_HDR_LEN + sizeof(struct ARPPacket)));
     net_free_buf(pkt);
 }
 

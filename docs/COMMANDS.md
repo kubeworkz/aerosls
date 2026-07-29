@@ -86,8 +86,16 @@ Replaces the retired `run-two-nodes.sh`, which its point-to-point netdev capped 
 | Segment | One shared `-netdev socket,mcast=239.192.152.40:12340`. No launch ordering — nodes join independently. |
 | Per node | 1 GiB RAM, 1 vCPU, 10 G sparse disk, console on `12340 + i` |
 | Artefacts | `cluster/node<i>.{iso,img,log}`, `cluster/cluster.pids` |
+| **REST API** | **`http://localhost:3000+i`** — node 4 is `http://localhost:3004` |
+| NICs per node | Two: management (slirp NAT + `hostfwd`, carries HTTP/ARP/TCP) and cluster (the multicast segment, carries DSPP only) |
 
 A partial failure is not left half-up: if any node fails to start, every node that *did* come up is torn down and the launcher exits non-zero, naming each failure with QEMU's own stderr.
+
+**The dashboard can follow the cluster.** `run-cluster.sh` prints the exact `AEROSLS_NODES` line to export before `npm run dev` in `slsos-sim`; the node selector in the Cluster panel then points every other panel at whichever node you pick. An id that is not in that list is **refused**, not served by node 1 — a panel showing one machine's numbers under another's name is worse than one that says it cannot reach the node.
+
+**Each node has a URL.** `aeroslsctl --host localhost:3004` drives node 4, and `curl localhost:3004/api/cluster` works. The management NIC sits on its own isolated slirp NAT, which also runs a DHCP server — so `net/dhcp.c` gets a real lease there instead of timing out to the compiled-in `10.0.2.15`.
+
+Note that `make x86-run` forwards host **3001**, which is node 1's REST port. The launcher refuses rather than colliding; set `AEROSLS_HTTP_BASE` to move the range.
 
 Consoles are interactive: attach and you get a shell prompt. Look for `[BOOT] node identity <i> taken from the command line` to confirm each node came up as itself, then drive it with `cluster status`, `partition migrate` and the rest.
 

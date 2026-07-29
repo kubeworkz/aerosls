@@ -119,7 +119,10 @@ void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
     eth->ethertype = htons(ETHERTYPE_DSPP);
     dspp_memcpy(frame_buf + ETH_HDR_LEN, dspp_payload, dspp_len);
 
-    e1000_transmit_packet(frame_buf, (uint16_t)(ETH_HDR_LEN + dspp_len));
+    /* DSPP is L2-only and belongs on the cluster segment, never the
+     * management NIC -- see net/e1000.h on why this is a role and not a
+     * route. */
+    e1000_transmit(NIC_ROLE_CLUSTER, frame_buf, (uint16_t)(ETH_HDR_LEN + dspp_len));
 }
 
 void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,

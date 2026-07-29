@@ -61,7 +61,7 @@ void ipv4_send(IPv4Addr dst_ip, uint8_t proto, void* payload, uint16_t plen) {
     for (uint16_t i = 0; i < plen; i++) dat[i] = ((uint8_t*)payload)[i];
 
     uint16_t total = (uint16_t)(ETH_HDR_LEN + sizeof(struct IPv4Header) + plen);
-    e1000_transmit_packet(pkt, total);
+    e1000_transmit(NIC_ROLE_MGMT, pkt, total);
     net_free_buf(pkt);
 }
 
