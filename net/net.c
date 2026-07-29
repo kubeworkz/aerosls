@@ -44,9 +44,48 @@ void net_free_buf(void* buf) {
 }
 
 // ─── Top-level receive dispatcher ─────────────────────────────────────────────
+/* ─── Self-echo guard ──────────────────────────────────────────────────────
+ * Count of frames dropped because we sent them ourselves. Exposed rather
+ * than silent: on a shared segment this should tick steadily, and a flat
+ * zero is the symptom of a node that is NOT actually on the segment with
+ * the others -- a useful thing to be able to check.
+ */
+uint64_t net_self_echo_dropped = 0;
+
+/* True when this frame carries our own source MAC.
+ *
+ * Point-to-point `-netdev socket,listen/connect` never delivered a node its
+ * own transmissions, so nothing needed this. A shared multicast segment
+ * does: QEMU forces IP_MULTICAST_LOOP on precisely so that several
+ * instances on one host can see each other, and the price is that every
+ * sender also hears itself.
+ *
+ * DSPP already survives that on its own -- the migrate families filter on
+ * node_dest_id and the service family on node_source_id -- but ARP and IPv4
+ * do not, and they are the ones that matter here: every node compiles in
+ * the same static IP (10.0.2.15, include/config.h), so a node hearing its
+ * own gratuitous ARP sees an announcement of its own address from somewhere
+ * else on the wire. Dropping at the Ethernet layer kills the whole class
+ * once rather than teaching each protocol the same lesson.
+ *
+ * Skipped while net_my_mac is still all-zero -- e1000_init() has not run,
+ * so "our MAC" is not yet a fact, and a zero comparison would be matching
+ * on ignorance rather than identity.
+ */
+static int net_frame_is_self(const struct EthernetHeader* eth) {
+    int known = 0;
+    for (int i = 0; i < 6; i++) if (net_my_mac.b[i]) { known = 1; break; }
+    if (!known) return 0;
+    for (int i = 0; i < 6; i++) if (eth->src.b[i] != net_my_mac.b[i]) return 0;
+    return 1;
+}
+
 void net_rx_dispatch(void* frame, uint16_t len) {
     if (len < ETH_HDR_LEN) return;
     struct EthernetHeader* eth = (struct EthernetHeader*)frame;
+
+    if (net_frame_is_self(eth)) { net_self_echo_dropped++; return; }
+
     uint16_t et = ntohs(eth->ethertype);
 
     if (et == ETHERTYPE_ARP) {

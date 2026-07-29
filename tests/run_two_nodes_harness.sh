@@ -90,6 +90,14 @@ check "$(hasnt '-serial file:' "$ARGV")" \
       "the output-only serial sink is gone"
 check "$(has 'host=127.0.0.1' "$ARGV")" \
       "*** the console binds loopback only, never 0.0.0.0 ***"
+check "$(has 'mcast=' "$ARGV")" \
+      "*** the netdev is a SHARED multicast segment, not point-to-point ***"
+check "$(hasnt 'listen=:' "$ARGV")" \
+      "...the listen/connect pair that capped the cluster at two nodes is gone"
+check "$(hasnt 'connect=127.0.0.1:1234' "$ARGV")" \
+      "...on both sides"
+check "$(has 'smp 1' "$ARGV")" \
+      "*** one vCPU per node -- a second buys a spinning AP loop, not throughput ***"
 
 # ═══ 2: a dead node must be reported as dead ═════════════════════════════
 # The original bug. Forcing gtk on the stub makes QEMU exit immediately,
@@ -142,6 +150,29 @@ time.sleep(6)" 2>/dev/null &
           "a held console port is refused with a usable message"
     check "$(hasnt 'stub make' "$OUT")" \
           "*** ...and it is caught BEFORE spending minutes building an ISO ***"
+fi
+
+# ═══ 6: the multicast port is SHARED, and must not be treated as a clash ══
+# Every node binds the group's port -- that shared bind is the segment. The
+# old point-to-point listener genuinely was exclusive, so this check had to
+# change with the netdev.
+echo
+echo "-- 6: the segment port is shared by design --"
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import socket,time,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('',12340))
+time.sleep(6)" 2>/dev/null &
+    HOLDER=$!
+    sleep 1
+    OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY timeout 8 ./run-two-nodes.sh 2>&1)" || true
+    kill "$HOLDER" 2>/dev/null || true
+    check "$(hasnt 'already in use' "$OUT")" \
+          "*** something already on the group port does NOT block the launch ***"
+    check "$(has 'Both nodes are up' "$OUT")" \
+          "...the cluster still forms"
 else
     echo "skip: python3 unavailable"
 fi

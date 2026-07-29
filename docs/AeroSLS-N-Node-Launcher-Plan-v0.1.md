@@ -2,7 +2,7 @@
 
 **Goal.** Replace `run-two-nodes.sh` with `run-cluster.sh`, taking a node count and a per-node size, detecting the host's capacity, and refusing or right-sizing rather than thrashing the machine.
 
-**Status.** Phase 1 built (§4); the rest is plan. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
+**Status.** Phases 1–3 built (§4); Phase 4 (capacity auto-sizing) and 5 (retiring `run-two-nodes.sh`) remain. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
 
 ---
 
@@ -47,7 +47,7 @@ It also reframes the goal. Typing `cluster init <id>` into eight consoles was ne
 | # | Constraint | Source | Consequence |
 | - | ---------- | ------ | ----------- |
 | 1 | `#define CLUSTER_NODE_MAX 8` | `net/consensus.h:273` | **N ≤ 8**, full stop. Raising it means a roster resize and a persist-layout review. |
-| 2 | DSPP is L2 broadcast to `ff:ff:ff:ff:ff:ff` with self-filtering | `net/dspp.c:116`, `:379` | A **shared broadcast segment** works for N peers. `-netdev socket,listen/connect` is strictly point-to-point and must be replaced by `-netdev socket,mcast=`. |
+| 2 | DSPP is L2 broadcast to `ff:ff:ff:ff:ff:ff` with self-filtering | `net/dspp.c:116`, `:379` | ✅ Done — every node now joins one `-netdev socket,mcast=` segment. The old `listen=`/`connect=` pair was point-to-point and capped the cluster at exactly two. |
 | 3 | ~~Exactly one AP is started~~ → **`-smp 1` is now supported** | `kernel/smp.{c,h}` | Was `-smp 2` minimum. The AP wait is now bounded and the BSP drives the service loop when there is no AP. |
 | 4 | ~~The AP loop "never idles at all"~~ → **resolved by running single-core** | `kernel/net_event.h:29-30` | On `-smp 1` the spinning half does not exist, and the BSP's loop already `hlt`-waits. **An idle node now costs ~0 CPU.** Sizing is memory-bound. |
 | 5 | Kernel image ends at `0x7781000` ≈ 119.5 MiB | linker `_kernel_image_end` | RAM floor is well above a toy VM. |
@@ -66,6 +66,16 @@ Constraint 4 was the surprise, and it dominated everything: `net_event.h` credit
 Running `reconcile_tick()` on the BSP is *safer*, not merely acceptable: it is documented as queueing persist work rather than calling `persist_*()` directly precisely because it normally runs on the AP. Same core for producer and consumer means the SPSC ring degenerates to a plain queue and the race cannot occur.
 
 Verified by `tests/smp_uniprocessor_host_test.c` (16 checks, 5/5 mutations caught), which links the real `smp.c`.
+
+### What Phase 2 turned up
+
+Moving to a shared segment introduced an input class the stack had never seen. QEMU forces `IP_MULTICAST_LOOP` on for `socket,mcast=` sockets — deliberately, so several instances on one host can hear each other — which means **every node also receives its own transmissions**. Point-to-point mode never did that.
+
+DSPP already survived it: the migrate families filter on `node_dest_id`, the service family on `node_source_id`. ARP did not, and ARP was the real exposure — every node compiles in the same static IP (`10.0.2.15`), because DHCP times out on a segment with no server. A node hearing its own gratuitous ARP is hearing its own address claimed from elsewhere on the wire.
+
+The fix is one guard in `net_rx_dispatch()`, at the Ethernet layer, before the ethertype demux: drop frames carrying our own source MAC, and count them. Teaching each protocol the same lesson separately would have left the next one to learn it the hard way. It is skipped while `net_my_mac` is still all-zero — before `e1000_init()`, "our MAC" is not yet a fact, and comparing against zero would be matching on ignorance.
+
+A second consequence, easy to miss: the launcher's port pre-flight used to include the segment port. With mcast that port is bound by **every** node on purpose — the shared bind *is* the segment — so checking it would refuse a launch that is working exactly as designed. It now checks only the console ports, and the harness pins that.
 
 ---
 
@@ -139,13 +149,23 @@ Assume 4 cores, ~15 GB available, 109 GB free (from the `xorriso` output in the 
 | Phase | Work | Gate |
 | ----- | ---- | ---- |
 | **1** | ✅ **DONE** — `kernel/boot_params.{c,h}`: multiboot2 cmdline tag reader + `node=<n>` → `cluster_init()`, called before `partition_init()` | `tests/boot_params_host_test.c`, 49 checks, 7/7 mutations caught. Whole-image link clean. 77/77 suite green |
-| **2** | Switch the netdev to `-netdev socket,mcast=`; confirm DSPP still flows with 2 nodes | Existing two-node migrate walkthrough, now non-interactive |
-| **3** | `run-cluster.sh`: N nodes, port allocation, per-node liveness, `--stop`, `--dry-run` | Stub-QEMU harness extended to N (the `run_two_nodes_harness.sh` pattern) |
+| **2** | ✅ **DONE** — `-netdev socket,mcast=239.192.152.40:12340` on every node; self-echo guard in `net_rx_dispatch()` | `tests/net_self_echo_host_test.c` 14 checks, 5/5 mutations caught; harness 24 checks. Link clean, 79/79 suite green |
+| **3** | ✅ **DONE** — `run-cluster.sh`: N nodes, per-node ISO carrying `node=<i>`, port allocation, one-pass liveness, `--stop`, `--dry-run` | `tests/run_cluster_harness.sh` 43 checks, 5/5 mutations caught |
 | **4** | Capacity detection + auto-sizing + the reasoning output | Harness with faked `/proc/meminfo` and `nproc` — the arithmetic is testable without a big machine |
 | **5** | Retire `run-two-nodes.sh` as `run-cluster.sh --nodes 2`; update `COMMANDS.md`, `README.md`, roadmap | Full doc pass |
 | **6** *(optional)* | §0c multiplex the serial console into the HTTP loop | Interactive shell on a networked node |
 
 Phases 3 and 4 are testable **without a multi-node machine at all**, using the stub-QEMU approach: the sizing arithmetic and the argv construction are pure functions of detected inputs, and faking those inputs is trivial. That matters, since the sandbox has no QEMU.
+
+### What Phase 3 turned up
+
+Two things worth recording, both about *waiting*.
+
+**The per-node settle was serialised for a reason that no longer existed.** `run-two-nodes.sh` waited after each launch because its point-to-point netdev required the listener to be bound before the other side connected — QEMU's connect side does not retry. A multicast segment has no such ordering: every node joins independently. Carrying the pattern forward would have cost `N × 2s` to learn nothing, so the launcher now starts everything and settles once. It also reports **every** failed node rather than the first, because when several die they usually die of the same cause and seeing one of five sends you to the wrong node.
+
+**The node cap is read from `net/consensus.h`, not hardcoded.** `cluster_init()` refuses an id above `CLUSTER_NODE_MAX` and the node stays STANDALONE — so a launcher with its own stale copy of the number would happily start nodes that boot, look fine, and never join. The harness proves the coupling by raising the cap in a scratch copy of the header and watching the launcher's limit move with it.
+
+The harness also caught a bug in itself worth noting, because it is a trap for any shell test: a stub that runs `sleep 300` without `exec` leaves an orphaned `sleep` holding the caller's captured stdout pipe when the wrapper is killed, hanging the command substitution for the full 300 seconds. Real QEMU is a single killable process; `exec` makes the stub behave the same way.
 
 ---
 

@@ -157,7 +157,8 @@ pkill -f qemu-system-x86_64
 A single instance is single-node by default — `cluster init` (see `docs/COMMANDS.md`) is never called automatically, so `partition migrate` takes the same-disk relocate path unless a real node identity has been set. To test the real DSPP wire protocol between two actual, networked kernel instances instead of one:
 
 ```bash
-./run-two-nodes.sh
+./run-cluster.sh --nodes 4     # N nodes, 1..8
+./run-two-nodes.sh             # the older two-node script
 ```
 
 This builds the ISO once, boots two QEMU instances with separate disk images and their e1000 NICs connected directly to each other, and prints the exact `cluster init <id>` commands to run in each console. It works headless — no display required. Each node's console is a loopback socket you attach from another terminal:

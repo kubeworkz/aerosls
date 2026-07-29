@@ -32,21 +32,30 @@
 #      you attach a terminal to, which is interactive AND still writes the
 #      same log file via the chardev's own logfile= option.
 #
-# ─── Why -netdev socket instead of a bridge/tap ────────────────────────
+# ─── Why -netdev socket,mcast instead of a bridge/tap ──────────────────
 # The Makefile's own x86-run target uses `-netdev user` (QEMU's built-in
 # NAT), which deliberately ISOLATES each VM from every other VM -- that's
 # exactly why two instances booted via `make x86-run` twice would never see
 # each other's Ethernet frames at all, regardless of cluster_init(). A real
 # bridge or tap device would also work and is more "real," but needs root/
 # admin privileges and host-specific setup (a Linux bridge, or Windows/Mac
-# equivalents) this script can't assume. QEMU's `-netdev socket` mode opens
-# a plain TCP socket directly between the two QEMU processes' own e1000
-# NICs -- no host privileges, no bridge config, works identically on
-# Linux/macOS/WSL2. One side listens, the other connects; whichever raw
-# Ethernet frames one instance's e1000 transmits arrive at the other's,
-# exactly like a real point-to-point cable between two machines' NICs would
-# deliver them -- realistic enough for what this test actually needs to
-# prove.
+# equivalents) this script can't assume.
+#
+# QEMU's `-netdev socket,mcast=` puts every instance on ONE shared L2
+# segment with no host privileges and no bridge config. It replaced the
+# earlier `listen=`/`connect=` pair, which was strictly point-to-point and
+# therefore capped at exactly two nodes -- see
+# docs/AeroSLS-N-Node-Launcher-Plan-v0.1.md Phase 2. DSPP is L2 broadcast
+# with node self-filtering (net/dspp.c), so a shared segment is what it
+# actually wants.
+#
+# ONE CONSEQUENCE WORTH KNOWING: QEMU forces IP_MULTICAST_LOOP on for mcast
+# sockets, precisely so several instances on the same host can hear each
+# other -- which means every node also hears ITSELF. Point-to-point mode
+# never did that. net_rx_dispatch() (net/net.c) drops frames carrying our
+# own source MAC before any protocol handler sees them; without that, each
+# node would process its own gratuitous ARP for 10.0.2.15, an address every
+# node shares. Covered by tests/net_self_echo_host_test.c.
 #
 # ─── Why these nodes have no HTTP, and so no aeroslsctl ────────────────
 # Each node gets exactly ONE NIC, spent on the DSPP link above. That is
@@ -117,8 +126,15 @@
 #   AEROSLS_RAM=<size>             RAM per node (default 4G)
 #   AEROSLS_DISPLAY=gtk|sdl|none   force a display backend
 #   AEROSLS_CON_A / AEROSLS_CON_B  console ports (default 12341 / 12342)
+#   AEROSLS_MCAST=<addr>           L2 segment multicast group
+#                                  (default 239.192.152.40, RFC 2365 site-local)
 #
 # Stop both instances with Ctrl-C in this terminal.
+
+# ─── Superseded by run-cluster.sh ──────────────────────────────────────
+# ./run-cluster.sh --nodes 2 does everything this does and is not capped at
+# two. This script is kept for now because its walkthrough is referenced
+# from the roadmap doc; it will be retired once that is repointed.
 
 set -euo pipefail
 
@@ -132,7 +148,11 @@ IMG_A="sls_storage_nodeA.img"
 IMG_B="sls_storage_nodeB.img"
 LOG_A="sls_kernel_debug_nodeA.log"
 LOG_B="sls_kernel_debug_nodeB.log"
-SOCKET_PORT=12340                      # node A <-> node B DSPP link. Arbitrary, unprivileged;
+# Shared L2 segment. 239.x.x.x is the administratively-scoped (site-local)
+# multicast range -- RFC 2365 -- so this stays off any real network even if
+# the host has a route out. Every node joins the same group.
+MCAST_GROUP="${AEROSLS_MCAST:-239.192.152.40}"
+SOCKET_PORT=12340                      # the group's port. Arbitrary, unprivileged;
                                         # change if something else already uses it.
 CON_PORT_A="${AEROSLS_CON_A:-12341}"   # node A serial console
 CON_PORT_B="${AEROSLS_CON_B:-12342}"   # node B serial console
@@ -174,10 +194,17 @@ else
 fi
 echo "==> Display backend: $DISPLAY_BACKEND"
 
-for port in "$CON_PORT_A" "$CON_PORT_B" "$SOCKET_PORT"; do
+# Only the CONSOLE ports are checked. $SOCKET_PORT is deliberately absent:
+# it is the multicast group's UDP port, which every node binds on purpose --
+# that shared bind IS the segment. Checking it would refuse a launch that is
+# working exactly as designed, and it was in this list before the netdev
+# changed from point-to-point, where the old TCP listener genuinely was
+# exclusive.
+for port in "$CON_PORT_A" "$CON_PORT_B"; do
     if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$port "; then
-        echo "error: port $port is already in use. Set AEROSLS_CON_A/AEROSLS_CON_B," >&2
-        echo "       or stop whatever is holding it (perhaps an earlier run)." >&2
+        echo "error: console port $port is already in use. Set AEROSLS_CON_A/" >&2
+        echo "       AEROSLS_CON_B, or stop whatever is holding it (perhaps an" >&2
+        echo "       earlier run)." >&2
         exit 1
     fi
 done
@@ -234,18 +261,21 @@ assert_alive() {
     fi
 }
 
-echo "==> Launching node A (DSPP listen :$SOCKET_PORT, console :$CON_PORT_A, mac=$MAC_A)..."
+echo "==> Launching node A (segment $MCAST_GROUP:$SOCKET_PORT, console :$CON_PORT_A, mac=$MAC_A)..."
 launch_node "$IMG_A" slsdevA \
-    "socket,id=net0,listen=:$SOCKET_PORT" "$MAC_A" "$CON_PORT_A" "$LOG_A" "$ERR_A"
+    "socket,id=net0,mcast=$MCAST_GROUP:$SOCKET_PORT,localaddr=127.0.0.1" \
+    "$MAC_A" "$CON_PORT_A" "$LOG_A" "$ERR_A"
 NODE_A_PID="$LAUNCHED_PID"
-# Node A's socket listener must be bound before node B tries to connect --
-# QEMU's socket netdev connect side does not retry. The liveness probe's
-# own sleep covers that wait.
+# The listen-before-connect ordering constraint is gone: with mcast both
+# nodes join the same group independently and neither waits on the other,
+# so launch order no longer matters. The probe below is now purely a
+# liveness check.
 assert_alive "$NODE_A_PID" "node A" "$ERR_A"
 
-echo "==> Launching node B (DSPP connect :$SOCKET_PORT, console :$CON_PORT_B, mac=$MAC_B)..."
+echo "==> Launching node B (segment $MCAST_GROUP:$SOCKET_PORT, console :$CON_PORT_B, mac=$MAC_B)..."
 launch_node "$IMG_B" slsdevB \
-    "socket,id=net0,connect=127.0.0.1:$SOCKET_PORT" "$MAC_B" "$CON_PORT_B" "$LOG_B" "$ERR_B"
+    "socket,id=net0,mcast=$MCAST_GROUP:$SOCKET_PORT,localaddr=127.0.0.1" \
+    "$MAC_B" "$CON_PORT_B" "$LOG_B" "$ERR_B"
 NODE_B_PID="$LAUNCHED_PID"
 assert_alive "$NODE_B_PID" "node B" "$ERR_B"
 

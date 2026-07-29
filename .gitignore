@@ -20,3 +20,8 @@ sls_storage_rv64.img
 
 # Packet captures
 *.pcap
+
+# run-cluster.sh's per-node artefacts: ISOs, disk images, serial logs and the
+# pid file. *.iso/*.img above already cover most of it; this catches the
+# whole directory including cluster.pids and node<i>.log.
+cluster/

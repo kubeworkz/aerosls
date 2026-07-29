@@ -110,6 +110,11 @@ static inline uint16_t net_checksum(const void* data, size_t len) {
 // recompile.  Defaults come from include/config.h (KERNEL_STATIC_IP / _GW /
 // _SUBNET). Use NET_MY_IP / NET_GW_IP / NET_SUBNET_MASK — they expand to the
 // variables.
+/* Frames dropped by net_rx_dispatch() because we transmitted them
+ * ourselves. Only ever non-zero on a shared segment (QEMU
+ * `-netdev socket,mcast=`), where loopback is forced on -- see net.c. */
+extern uint64_t net_self_echo_dropped;
+
 extern IPv4Addr net_my_ip;
 extern IPv4Addr net_gw_ip;
 extern IPv4Addr net_subnet_mask;

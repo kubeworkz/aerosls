@@ -49,7 +49,33 @@ First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services
 
 `workloads scale`, `workloads logs`, `workloads exec` and `nodes drain` are described in `docs/AeroSLS-Control-Plane.md` but **were never built** — there is no replica count, no log ring, no per-workload exec and no drain protocol. The CLI does not stub them; asking for one prints what is missing and what to use instead.
 
+### run-cluster.sh — N nodes
+
+```bash
+./run-cluster.sh --nodes 4          # boot a 4-node cluster
+./run-cluster.sh --nodes 3 --dry-run # print the plan and each node's QEMU argv
+./run-cluster.sh --stop              # tear it down
+```
+
+Supersedes `run-two-nodes.sh`, which its point-to-point netdev capped at exactly two. Nodes are numbered 1..N and **self-identify at boot** — no `cluster init` step — because each gets its own ISO carrying `node=<i>` on the kernel command line.
+
+| | |
+| --- | --- |
+| Node cap | Read from `CLUSTER_NODE_MAX` in `net/consensus.h` (8), not hardcoded. A higher id would be refused by `cluster_init()` and the node would boot STANDALONE, looking healthy. |
+| Segment | One shared `-netdev socket,mcast=239.192.152.40:12340`. No launch ordering — nodes join independently. |
+| Per node | 1 GiB RAM, 1 vCPU, 10 G sparse disk, console on `12340 + i` |
+| Artefacts | `cluster/node<i>.{iso,img,log}`, `cluster/cluster.pids` |
+
+A partial failure is not left half-up: if any node fails to start, every node that *did* come up is torn down and the launcher exits non-zero, naming each failure with QEMU's own stderr.
+
+The same control-path caveat applies as below — consoles show boot output but no prompt. Look for `[BOOT] node identity <i> taken from the command line` to confirm each node came up as itself.
+
+---
+
 ### Reaching a two-node cluster
+
+**Topology note.** Nodes now share one L2 segment (`-netdev socket,mcast=`) instead of a point-to-point `listen`/`connect` pair, so the cluster is no longer capped at two. QEMU forces multicast loopback on for that mode, so each node also receives its own frames; `net_rx_dispatch()` drops them by source MAC and counts them in `net_self_echo_dropped`. A steady non-zero count is normal and healthy — a flat zero means the node is not actually on the segment with the others.
+
 
 `aeroslsctl` works against a single node under `make x86-run` (host 3001 → guest 3000). It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate.
 
