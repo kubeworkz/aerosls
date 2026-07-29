@@ -317,7 +317,39 @@ static int nvme_io_submit_sync(struct NVMeCmd* cmd) {
 }
 
 // ─── nvme_read_sync ───────────────────────────────────────────────────────────
+/* ─── Every 4 KiB single-page transfer needs a PAGE-ALIGNED buffer ─────────
+ * These two functions put the buffer address straight into PRP1 and leave
+ * PRP2 zero. That is only correct for a page-aligned buffer: a 4096-byte
+ * transfer from an unaligned address spans two physical pages, the second of
+ * which requires PRP2, and without it the controller moves only as far as the
+ * end of the first page.
+ *
+ * The failure is silent and looks like data corruption rather than an error.
+ * nvme_build_prp() has always rejected unaligned buffers for the multi-page
+ * path; the single-page path checked nothing, so an unaligned caller got a
+ * short transfer and a success return.
+ *
+ * That cost a real migration: kernel/stream.c staged a received page in a
+ * buffer inside a struct (no alignment attribute), wrote it, read it back,
+ * and reported "write did not survive readback" -- with the actual fault four
+ * layers away from the message. Refusing loudly here is what turns that into
+ * a one-line diagnosis.
+ *
+ * Returns 0xFC, the same "bad alignment/args" code nvme_build_prp()'s callers
+ * already surface, rather than inventing a second convention. */
+static int nvme_buf_aligned(const void* buf, const char* op) {
+    if (!buf || ((uintptr_t)buf & (NVME_PAGE_SIZE - 1)) == 0) return 1;
+    kernel_serial_printf(
+        "[NVME_IO] %s REFUSED: buffer %p is not 4 KiB-aligned. A single-page "
+        "transfer from an unaligned address needs PRP2, which this path does "
+        "not set -- the transfer would be short and would look like "
+        "corruption. Align the caller's buffer.\n",
+        op, buf);
+    return 0;
+}
+
 int nvme_read_sync(uint64_t slba, void* buf) {
+    if (!nvme_buf_aligned(buf, "READ")) return 0xFC;
     struct NVMeCmd cmd;
     uint32_t* p = (uint32_t*)&cmd;
     for (int i = 0; i < 16; i++) p[i] = 0;
@@ -332,6 +364,7 @@ int nvme_read_sync(uint64_t slba, void* buf) {
 
 // ─── nvme_write_sync ──────────────────────────────────────────────────────────
 int nvme_write_sync(uint64_t slba, const void* buf) {
+    if (!nvme_buf_aligned(buf, "WRITE")) return 0xFC;
     struct NVMeCmd cmd;
     uint32_t* p = (uint32_t*)&cmd;
     for (int i = 0; i < 16; i++) p[i] = 0;

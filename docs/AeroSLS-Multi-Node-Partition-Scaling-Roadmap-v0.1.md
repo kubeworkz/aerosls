@@ -751,6 +751,43 @@ Adding `stream_count_for_partition()` broke the build of every test that links `
 
 Two scripted insertions went wrong on the way: one regex required a single space after `int` and silently skipped a file with two, and one matched a multi-line function's opening line and inserted the stub *inside* the function body. Both were caught by the build rather than by review, which is the argument for compiling after every mechanical edit rather than at the end of a batch.
 
+## 9k. The refusal, traced: an unaligned NVMe buffer
+
+§9j gave the refusal a voice. Node 2's log then said exactly what was wrong:
+
+```
+[STREAM] migrate recv: page 0 verify mismatch for transfer 17179869184
+         -- write did not survive readback.
+```
+
+The write returned success, the readback returned success, and the bytes differed. Copy-then-verify earning its cost.
+
+### The cause, four layers from the message
+
+`nvme_write_sync()` puts the buffer address in **PRP1 and leaves PRP2 zero** (`drivers/nvme_io.c`). For a 4096-byte transfer that is only valid from a page-aligned buffer: an unaligned address spans two physical pages, the second requires PRP2, and without it the controller moves data only as far as the end of the first page.
+
+§9d's fragment staging buffer was a plain `uint8_t staged[4096]` **field inside `struct StreamMigrateInflight`** — no alignment attribute, and no reason to expect any. The verify buffer a few lines below it had carried `__attribute__((aligned(4096)))` all along, for precisely this reason. The staging buffer was added later without it, and nothing connected the two.
+
+Fixed by holding the staging pages as a separate `aligned(4096)` array rather than an aligned struct member: an aligned member would silently pad every inflight row to 8 KiB and leave the next reader wondering why the struct doubled.
+
+### The guard that should have existed, and what it immediately found
+
+`nvme_build_prp()` has always rejected unaligned buffers for the multi-page path. The single-page path checked **nothing** — so an unaligned caller received a short transfer and a success return. That is the worst possible contract: silent partial writes that surface as data corruption somewhere else entirely.
+
+`nvme_write_sync()` and `nvme_read_sync()` now refuse an unaligned buffer, naming the address and the reason, and return the same `0xFC` "bad alignment/args" code the multi-page path already used.
+
+**Adding it surfaced a second latent case within minutes.** `dir_buf` — the buffer for every stream-directory read and write in `kernel/stream.c` — was also unaligned. The directory had been persisting correctly only because GCC happens to give a 4096-byte static array generous alignment on this target. Nothing guaranteed it. A change in declaration order, or a different compiler, would have turned stream persistence into silent partial writes.
+
+A full audit of every buffer reaching these two functions found the rest sound: `p_buf`, `p_scan_buf`, `migrate_send_page_buf`, `reloc_src_page` and `reloc_verify_page` were already aligned, and `row_pages`/`vec_pages` hold frame-pool pointers, which are page allocations by construction.
+
+### What this one says about the others
+
+This is the seventh bug in the chain and the first whose *symptom* was in the right place. Every earlier one presented as success; this one presented as a verify mismatch, one layer above its cause, because someone had previously spent the cost of a readback comparison on every received page.
+
+The pattern is worth stating alongside §9i's rule: **a check that costs something at runtime is how a fault four layers down becomes a one-line diagnosis.** The verify read looked like paranoia — write it, then read it back and compare, on every single page. It is the only reason this took one log line to find rather than a bisect.
+
+Full suite 80/80, whole-image link 97/97, 12 asm-provided undefineds unchanged.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

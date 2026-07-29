@@ -72,7 +72,21 @@ static void st_uint_to_str(uint64_t v, char* out, int max) {
 #define DIR_HDR_SIZE 512u
 #define DIR_ENTRY_SIZE 448u  /* (4096 - 512) / 8 = 448 bytes per entry */
 
-static uint8_t dir_buf[4096];  /* static 4-KiB directory buffer */
+/* 4 KiB-ALIGNED, which it was not, and that was luck rather than design.
+ *
+ * This buffer is the sole argument to nvme_write_sync(STREAM_DIR_LBA, dir_buf)
+ * and its matching read, and a single-page NVMe transfer requires a
+ * page-aligned buffer -- an unaligned one spans two pages, needs PRP2, and
+ * the driver's single-page path does not set it (drivers/nvme_io.c). GCC
+ * happens to give a 4096-byte static array generous alignment on this target,
+ * so the stream directory persisted correctly; nothing guaranteed it, and a
+ * change in declaration order or a different compiler could have turned
+ * stream persistence into silent partial writes.
+ *
+ * Found by adding the alignment guard to the driver: the guard would have
+ * started refusing every directory write, which is a far better outcome than
+ * the corruption it was added to catch, but the fix is to align the buffer. */
+static uint8_t __attribute__((aligned(4096))) dir_buf[4096];
 
 static void dir_write_entry(int slot) {
     struct StreamEntry* se = &stream_store[slot];
@@ -880,12 +894,36 @@ struct StreamMigrateInflight {
      * leave a genuinely half-written page on disk if a fragment were lost.
      * A page that is either fully written or not written at all is the
      * better failure mode for storage. */
-    uint32_t staged_page;                              /* which page_index staged[] holds */
+    uint32_t staged_page;                              /* which page_index the staging page holds */
     uint8_t  staged_valid;                             /* 0 before the first fragment */
     uint8_t  frag_present[DSPP_MIGRATE_FRAGS_PER_PAGE];
     uint32_t frags_seen;
-    uint8_t  staged[4096];
 };
+
+/* ─── The staging pages, 4 KiB-ALIGNED and deliberately outside the struct ──
+ *
+ * These started life as a plain `uint8_t staged[4096]` field inside the row
+ * above, and that cost a real migration.
+ *
+ * nvme_write_sync() puts the buffer address straight into PRP1 and leaves
+ * PRP2 zero (drivers/nvme_io.c). For a 4096-byte transfer that is only valid
+ * if the buffer is page-aligned: an unaligned buffer spans two physical
+ * pages, the second needs PRP2, and without it the controller transfers only
+ * as far as the end of the first page. The write "succeeds", the readback
+ * succeeds, and the bytes do not match.
+ *
+ * Which is exactly what a live four-node cluster reported:
+ *   [STREAM] migrate recv: page 0 verify mismatch for transfer ...
+ *            -- write did not survive readback.
+ *
+ * The verify buffer further down this file already carried
+ * __attribute__((aligned(4096))) for this reason; the staging buffer was
+ * added later without it. Held as a separate aligned array rather than an
+ * aligned struct member so the requirement is stated where it can be seen --
+ * an aligned member would silently pad every row to 8 KiB and leave the next
+ * reader wondering why the struct doubled. */
+static uint8_t migrate_staged[STREAM_MIGRATE_INFLIGHT_MAX][4096]
+    __attribute__((aligned(4096)));
 static struct StreamMigrateInflight migrate_inflight[STREAM_MIGRATE_INFLIGHT_MAX];
 
 int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
@@ -1041,8 +1079,9 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
 
     /* Idempotent: a duplicate fragment overwrites identical bytes and is
      * not counted twice, so it cannot fake a complete page. */
+    uint8_t* staging = migrate_staged[inflight_idx];
     for (uint32_t b = 0; b < DSPP_MIGRATE_FRAG_BYTES; b++)
-        mi->staged[frag_index * DSPP_MIGRATE_FRAG_BYTES + b] = frag_data[b];
+        staging[frag_index * DSPP_MIGRATE_FRAG_BYTES + b] = frag_data[b];
     if (!mi->frag_present[frag_index]) {
         mi->frag_present[frag_index] = 1;
         mi->frags_seen++;
@@ -1051,7 +1090,7 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
     /* Not whole yet -- nothing goes to disk. */
     if (mi->frags_seen < DSPP_MIGRATE_FRAGS_PER_PAGE) return 0;
 
-    const uint8_t* page_data = mi->staged;
+    const uint8_t* page_data = staging;
     static uint8_t __attribute__((aligned(4096))) migrate_recv_verify_buf[4096];
     uint64_t dlba = d->lba_base + (uint64_t)page_index * 8;
     /* ─── These two used to fail silently ─────────────────────────────────
