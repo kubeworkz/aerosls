@@ -62,6 +62,8 @@ CON_BASE="${AEROSLS_CON_BASE:-12340}"  # node i's console is CON_BASE + i
 MAC_PREFIX="52:54:00:AE:51"
 
 NODES=2
+NODES_GIVEN=0
+FORCE=0
 RAM="${AEROSLS_RAM:-1G}"
 SMP="${AEROSLS_SMP:-1}"
 DRY_RUN=0
@@ -84,20 +86,28 @@ usage() {
 usage: run-cluster.sh [options]
 
   --nodes N     number of nodes, 1..$NODE_MAX (default $NODES)
+  --nodes auto  as many as this host can hold, with the reasoning printed
+  --force       launch an explicit --nodes even if it exceeds capacity
   --ram SIZE    RAM per node, QEMU syntax (default $RAM)
   --smp N       vCPUs per node (default $SMP)
   --dry-run     print the plan and each node's QEMU argv; build and launch nothing
   --stop        stop a cluster started earlier, then exit
+  --force       proceed past a capacity refusal
   -h, --help    this
 
 environment: AEROSLS_MCAST, AEROSLS_MCAST_PORT, AEROSLS_CON_BASE,
              AEROSLS_RAM, AEROSLS_SMP, AEROSLS_DISPLAY, AEROSLS_SETTLE
+
+capacity overrides (also how the sizing is tested):
+             AEROSLS_HOST_CORES, AEROSLS_HOST_MEM_MB, AEROSLS_HOST_DISK_MB,
+             AEROSLS_HOST_RESERVE_MB (default 2048, left for the host)
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --nodes)   NODES="${2:-}"; shift 2 ;;
+        --nodes)   NODES="${2:-}"; NODES_GIVEN=1; shift 2 ;;
+        --force)   FORCE=1; shift ;;
         --ram)     RAM="${2:-}";   shift 2 ;;
         --smp)     SMP="${2:-}";   shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -129,13 +139,174 @@ if [ "$DO_STOP" -eq 1 ]; then
     exit 0
 fi
 
+# ─── Host capacity ─────────────────────────────────────────────────────
+# Every figure below is DETECTED, and every one can be overridden -- both
+# because that is how the arithmetic gets tested without a big machine, and
+# because an operator on a shared box has better information than df does.
+RESERVE_MB="${AEROSLS_HOST_RESERVE_MB:-2048}"
+# Overridable so the DETECTION can be tested, not just the arithmetic around
+# it. nproc and df are already stubbable through PATH; this file is not, and
+# leaving it hardcoded meant the one line that has to say MemAvailable rather
+# than MemTotal was never exercised.
+MEMINFO="${AEROSLS_MEMINFO:-/proc/meminfo}"
+
+detect_cores() {
+    if [ -n "${AEROSLS_HOST_CORES:-}" ]; then echo "$AEROSLS_HOST_CORES"; return; fi
+    nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo ""
+}
+detect_mem_mb() {
+    if [ -n "${AEROSLS_HOST_MEM_MB:-}" ]; then echo "$AEROSLS_HOST_MEM_MB"; return; fi
+    # MemAvailable, not MemTotal: the host is already using some of it, and
+    # sizing against the total is how you end up swapping.
+    local kb
+    kb="$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9]\+\) kB/\1/p' "$MEMINFO" 2>/dev/null | head -1)"
+    [ -n "$kb" ] && echo $(( kb / 1024 )) || echo ""
+}
+detect_disk_mb() {
+    if [ -n "${AEROSLS_HOST_DISK_MB:-}" ]; then echo "$AEROSLS_HOST_DISK_MB"; return; fi
+    local kb; kb="$(df -Pk . 2>/dev/null | awk 'NR==2 {print $4}')"
+    [ -n "$kb" ] && echo $(( kb / 1024 )) || echo ""
+}
+
+# "1G", "512M", "2048" (bare = MiB) -> MiB. Rejects anything else rather
+# than guessing, because a misread size silently changes the node count.
+size_to_mb() {
+    local n
+    case "$1" in
+        *[Gg]) n="${1%[Gg]}"
+               # Validate BEFORE the arithmetic: "1.5G" would otherwise reach
+               # $(( 1.5 * 1024 )), which is a bash error, not a size.
+               case "$n" in ''|*[!0-9]*) echo ""; return ;; esac
+               echo $(( n * 1024 )) ;;
+        *[Mm]) n="${1%[Mm]}"
+               case "$n" in ''|*[!0-9]*) echo ""; return ;; esac
+               echo "$n" ;;
+        ''|*[!0-9]*) echo "" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+HOST_CORES="$(detect_cores)"
+HOST_MEM_MB="$(detect_mem_mb)"
+HOST_DISK_MB="$(detect_disk_mb)"
+RAM_MB="$(size_to_mb "$RAM")"
+
+if [ -z "$RAM_MB" ] || [ "$RAM_MB" -lt 1 ] 2>/dev/null; then
+    echo "error: --ram '$RAM' is not a size I understand (try 1G, 512M, 2048)." >&2
+    exit 1
+fi
+
+# The kernel image ends around 119.5 MiB (_kernel_image_end), so below a
+# couple of hundred the frame pool has almost nothing above it. Refuse
+# rather than let a node boot into an allocator with no free frames.
+RAM_FLOOR_MB=256
+if [ "$RAM_MB" -lt "$RAM_FLOOR_MB" ]; then
+    echo "error: --ram ${RAM_MB}M is below the ${RAM_FLOOR_MB}M floor." >&2
+    echo "       The kernel image alone ends near 120 MiB (_kernel_image_end)," >&2
+    echo "       so the frame pool would have almost nothing above it." >&2
+    exit 1
+fi
+
+# ─── The bounds ────────────────────────────────────────────────────────
+# RAM, disk and the roster cap are HARD. CPU is ADVISORY, and that
+# distinction is the whole point of the model.
+#
+# An idle node costs almost no CPU: with -smp 1 there is no application
+# processor, and the AP's loop was the one that never idled -- it spun in
+# kernel_sleep_ticks() rather than halting (kernel/smp.h). The BSP's HTTP
+# loop yields through net_event_hlt_wait(). So a mostly-idle cluster is
+# bounded by memory, not cores. A node under real load still wants a core,
+# which is what the advisory number is for.
+N_RAM=""; N_DISK=""; N_CPU_BUSY=""
+[ -n "$HOST_MEM_MB" ]  && N_RAM="$(( (HOST_MEM_MB - RESERVE_MB) / RAM_MB ))"
+[ -n "$N_RAM" ] && [ "$N_RAM" -lt 0 ] && N_RAM=0
+# Disk is budgeted on the 10 G VIRTUAL size, not observed growth. The images
+# are sparse and start near zero, so this is pessimistic on purpose: running
+# a host out of disk underneath a live cluster is worse than launching one
+# node fewer.
+DISK_PER_NODE_MB=10240
+[ -n "$HOST_DISK_MB" ] && N_DISK="$(( (HOST_DISK_MB - 2048) / DISK_PER_NODE_MB ))"
+[ -n "$N_DISK" ] && [ "$N_DISK" -lt 0 ] && N_DISK=0
+[ -n "$HOST_CORES" ] && N_CPU_BUSY="$(( HOST_CORES - 1 ))"
+[ -n "$N_CPU_BUSY" ] && [ "$N_CPU_BUSY" -lt 1 ] && N_CPU_BUSY=1
+
+CAPACITY="$NODE_MAX"; BINDING="the roster cap (CLUSTER_NODE_MAX)"
+if [ -n "$N_RAM" ]  && [ "$N_RAM"  -lt "$CAPACITY" ]; then CAPACITY="$N_RAM";  BINDING="memory"; fi
+if [ -n "$N_DISK" ] && [ "$N_DISK" -lt "$CAPACITY" ]; then CAPACITY="$N_DISK"; BINDING="free disk"; fi
+
+fmt() { [ -n "$1" ] && echo "$1" || echo "unknown"; }
+echo "==> Host capacity"
+echo "      cores              $(fmt "$HOST_CORES")"
+echo "      memory available   $(fmt "$HOST_MEM_MB") MiB   (reserving $RESERVE_MB for the host)"
+echo "      free disk          $(fmt "$HOST_DISK_MB") MiB"
+if [ -w /dev/kvm ] 2>/dev/null; then
+    echo "      KVM                yes"
+else
+    echo "      KVM                NO -- QEMU will emulate, roughly an order of"
+    echo "                         magnitude slower. Node count is not the limit here."
+fi
+echo "==> Fits at ${RAM_MB} MiB / ${SMP} vCPU per node"
+echo "      by memory          $(fmt "$N_RAM")"
+echo "      by free disk       $(fmt "$N_DISK")   (10 GiB virtual each; sparse, so pessimistic)"
+echo "      roster cap         $NODE_MAX"
+echo "      => capacity $CAPACITY, bound by $BINDING"
+if [ -n "$N_CPU_BUSY" ]; then
+    echo "      CPU (advisory)     $N_CPU_BUSY busy nodes at once; idle nodes halt and cost"
+    echo "                         almost nothing, so this is not a hard limit"
+fi
+
+if [ "$NODES" = "auto" ]; then
+    if [ -z "$HOST_MEM_MB" ] && [ -z "$HOST_DISK_MB" ]; then
+        echo "error: --nodes auto needs host figures, and none could be detected." >&2
+        echo "       /proc/meminfo and df both came back empty (non-Linux host?)." >&2
+        echo "       Give an explicit --nodes, or set AEROSLS_HOST_MEM_MB." >&2
+        exit 1
+    fi
+    if [ "$CAPACITY" -lt 1 ]; then
+        # Reporting this as "out of range 1..8" would blame the roster cap
+        # for what is actually a small host, and send the reader to the
+        # wrong file.
+        echo >&2
+        echo "error: this host has room for 0 nodes at ${RAM_MB} MiB each ($BINDING)." >&2
+        if [ -n "$HOST_MEM_MB" ]; then
+            largest=$(( HOST_MEM_MB - RESERVE_MB ))
+            [ "$largest" -lt 0 ] && largest=0
+            echo "       ${HOST_MEM_MB} MiB available, less ${RESERVE_MB} reserved for the host," >&2
+            echo "       leaves ${largest} MiB -- not one node's worth." >&2
+            if [ "$largest" -ge "$RAM_FLOOR_MB" ]; then
+                echo "       A single node would fit at --ram ${largest}M." >&2
+            else
+                echo "       Even the ${RAM_FLOOR_MB}M floor does not fit; free memory," >&2
+                echo "       or lower AEROSLS_HOST_RESERVE_MB if $RESERVE_MB is too cautious." >&2
+            fi
+        fi
+        exit 1
+    fi
+    NODES="$CAPACITY"
+    echo "==> --nodes auto -> $NODES"
+fi
+
 case "$NODES" in
-    ''|*[!0-9]*) echo "error: --nodes must be a whole number, got '$NODES'" >&2; exit 1 ;;
+    ''|*[!0-9]*) echo "error: --nodes must be a whole number or 'auto', got '$NODES'" >&2; exit 1 ;;
 esac
+
+# The ABSOLUTE limit first. CLUSTER_NODE_MAX is a protocol constant, not a
+# property of this machine -- 9 nodes is impossible everywhere, and calling
+# that "capacity" would send someone looking for a bigger host. --force does
+# not apply: the roster genuinely has no ninth slot.
 if [ "$NODES" -lt 1 ] || [ "$NODES" -gt "$NODE_MAX" ]; then
     echo "error: --nodes $NODES is out of range 1..$NODE_MAX." >&2
     echo "       The cap is CLUSTER_NODE_MAX in net/consensus.h: cluster_init()" >&2
     echo "       refuses a higher id, so those nodes would boot and never join." >&2
+    echo "       This is a protocol limit, not this host's -- no machine holds more." >&2
+    exit 1
+fi
+
+# THEN the host limit. Refused, not quietly clamped: asking for 8 and
+# silently getting 3 is the outcome that wastes an afternoon.
+if [ "$NODES_GIVEN" -eq 1 ] && [ "$NODES" -gt "$CAPACITY" ] && [ "$FORCE" -eq 0 ]; then
+    echo "error: --nodes $NODES exceeds this host's capacity of $CAPACITY ($BINDING)." >&2
+    echo "       Lower --nodes or --ram, or pass --force to try anyway." >&2
     exit 1
 fi
 

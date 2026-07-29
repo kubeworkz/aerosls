@@ -104,6 +104,16 @@ export PATH="$T/bin:$PATH"
 # execs and sleeps, or exits immediately.
 export AEROSLS_SETTLE=1
 
+# Model a host with room to spare. Scenarios 1-7 test the launcher's
+# MECHANICS -- ports, ISOs, teardown -- and would otherwise be gated by
+# whatever machine happens to run this suite. (They were, the first time
+# capacity checking landed: this sandbox has ~2.5 GiB available, so every
+# multi-node scenario was correctly refused.) Scenario 8 overrides these
+# per-case to test the sizing itself.
+export AEROSLS_HOST_CORES=8
+export AEROSLS_HOST_MEM_MB=32000
+export AEROSLS_HOST_DISK_MB=200000
+
 run() { (cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY "$@" 2>&1); }
 
 # Starts the launcher in the BACKGROUND and waits for it to report N nodes.
@@ -164,6 +174,8 @@ check "$(has 'CLUSTER_NODE_MAX' "$OUT")" "...naming where the cap comes from"
 check "$(has 'never join' "$OUT")" \
       "*** ...and why it matters: cluster_init() would refuse the id and the "\
 "node would boot STANDALONE, looking fine ***"
+check "$(has 'protocol limit, not this host' "$OUT")" \
+      "*** ...distinguished from a host limit -- no machine holds 9 ***"
 check "$([ "$RC" -ne 0 ] && echo yes || echo no)" "exits non-zero"
 
 OUT="$(run timeout 20 ./run-cluster.sh --nodes 0 --dry-run)"
@@ -273,6 +285,99 @@ s.bind(('127.0.0.1',12342)); s.listen(1); time.sleep(6)" 2>/dev/null &
     check "$(hasnt 'Building the kernel' "$OUT")" \
           "*** ...and caught BEFORE building anything ***"
 fi
+
+# ═══ 8: capacity sizing ══════════════════════════════════════════════════
+# Pure arithmetic over detected inputs, which is exactly why it is testable
+# without a big machine: the detection is overridable, so a 4-core/15 GiB
+# server can be modelled here.
+echo
+echo "-- 8: host capacity and --nodes auto --"
+SERVER="AEROSLS_HOST_CORES=4 AEROSLS_HOST_MEM_MB=15000 AEROSLS_HOST_DISK_MB=109000"
+
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_CORES=4 \
+      AEROSLS_HOST_MEM_MB=15000 AEROSLS_HOST_DISK_MB=109000 \
+      timeout 20 ./run-cluster.sh --nodes auto --dry-run 2>&1)"
+check "$(has 'auto -> 8' "$OUT")"       "*** a 4-core/15 GiB host sizes to 8 nodes ***"
+check "$(has 'bound by the roster cap' "$OUT")"       "*** ...bound by CLUSTER_NODE_MAX, not by the hardware ***"
+check "$(has 'by memory          12' "$OUT")" "the memory bound is shown (12)"
+check "$(has 'CPU (advisory)' "$OUT")"       "*** CPU is ADVISORY, not a hard bound -- idle nodes halt ***"
+check "$(has '3 busy nodes' "$OUT")"       "...and says how many could be busy at once, which is the real risk"
+
+# Memory binding rather than the roster cap.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_CORES=8 \
+      AEROSLS_HOST_MEM_MB=6000 AEROSLS_HOST_DISK_MB=109000 \
+      timeout 20 ./run-cluster.sh --nodes auto --dry-run 2>&1)"
+check "$(has 'auto -> 3' "$OUT")" "a 6 GiB host sizes to 3 at 1 GiB each"
+check "$(has 'bound by memory' "$OUT")" "...and names memory as the binding constraint"
+
+# Disk binding -- the one an operator would not guess.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_CORES=8 \
+      AEROSLS_HOST_MEM_MB=64000 AEROSLS_HOST_DISK_MB=25000 \
+      timeout 20 ./run-cluster.sh --nodes auto --dry-run 2>&1)"
+check "$(has 'auto -> 2' "$OUT")" "plenty of RAM but little disk sizes to 2"
+check "$(has 'bound by free disk' "$OUT")" "...and names disk"
+
+# An explicit count over capacity is refused, not clamped.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_CORES=8 \
+      AEROSLS_HOST_MEM_MB=6000 AEROSLS_HOST_DISK_MB=109000 \
+      timeout 20 ./run-cluster.sh --nodes 8 --dry-run 2>&1)"; RC=$?
+check "$(has 'exceeds this host' "$OUT")"       "*** an explicit 8 on a 3-node host is REFUSED ***"
+check "$(hasnt 'nodes            8' "$OUT")"       "*** ...not silently clamped to 3, which would waste an afternoon ***"
+check "$([ "$RC" -ne 0 ] && echo yes || echo no)" "exits non-zero"
+
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_CORES=8 \
+      AEROSLS_HOST_MEM_MB=6000 AEROSLS_HOST_DISK_MB=109000 \
+      timeout 20 ./run-cluster.sh --nodes 8 --force --dry-run 2>&1)"
+check "$(has 'nodes            8' "$OUT")" "--force proceeds anyway"
+
+# A host too small for even one node must blame the host, not the roster.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_MEM_MB=2500 \
+      AEROSLS_HOST_DISK_MB=109000 timeout 20 ./run-cluster.sh --nodes auto --dry-run 2>&1)"
+check "$(has 'room for 0 nodes' "$OUT")" "a host too small says so plainly"
+check "$(hasnt 'CLUSTER_NODE_MAX' "$OUT")"       "*** ...and does NOT blame the roster cap, which would send you to the ""wrong file ***"
+check "$(has 'would fit at --ram 452M' "$OUT")"       "*** ...it computes a size that WOULD work ***"
+
+# ...and that suggestion has to be true.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_MEM_MB=2500 \
+      AEROSLS_HOST_DISK_MB=109000 timeout 20 ./run-cluster.sh --nodes auto --ram 452M --dry-run 2>&1)"
+check "$(has 'auto -> 1' "$OUT")"       "*** ...and taking the suggestion actually works ***"
+
+# ═══ 8b: detection itself, not just the arithmetic over it ═══════════════
+# The overrides above short-circuit detect_mem_mb() entirely, so without
+# this the one line that must read MemAvailable rather than MemTotal was
+# never executed -- and a mutation swapping them survived the whole suite.
+echo
+echo "-- 8b: reading the host's real figures --"
+cat > "$T/meminfo.fake" <<'MEMEOF'
+MemTotal:       32000000 kB
+MemFree:          500000 kB
+MemAvailable:    6000000 kB
+Buffers:          100000 kB
+MEMEOF
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY -u AEROSLS_HOST_MEM_MB \
+      AEROSLS_MEMINFO="$T/meminfo.fake" AEROSLS_HOST_CORES=8 \
+      AEROSLS_HOST_DISK_MB=200000 timeout 20 ./run-cluster.sh --nodes auto --dry-run 2>&1)"
+check "$(has 'memory available   5859' "$OUT")"       "*** MemAvailable is read, not MemTotal -- 5859 MiB, not 30517 ***"
+check "$(has 'auto -> 3' "$OUT")"       "*** ...so it sizes to 3, not the 29 MemTotal would have allowed ***"
+
+# The reserve is subtracted, not ignored.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY -u AEROSLS_HOST_MEM_MB \
+      AEROSLS_MEMINFO="$T/meminfo.fake" AEROSLS_HOST_CORES=8 \
+      AEROSLS_HOST_DISK_MB=200000 AEROSLS_HOST_RESERVE_MB=0 \
+      timeout 20 ./run-cluster.sh --nodes auto --dry-run 2>&1)"
+check "$(has 'auto -> 5' "$OUT")"       "*** dropping the host reserve to 0 raises it 3 -> 5, so it IS subtracted ***"
+
+# ═══ 9: --ram parsing and the floor ══════════════════════════════════════
+echo
+echo "-- 9: --ram --"
+OUT="$(run timeout 20 ./run-cluster.sh --nodes 1 --ram 200M --dry-run)"
+check "$(has 'below the 256M floor' "$OUT")"       "*** below the floor is refused -- the kernel image alone is ~120 MiB ***"
+check "$(has '_kernel_image_end' "$OUT")" "...naming where the floor comes from"
+OUT="$(run timeout 20 ./run-cluster.sh --nodes 1 --ram 1.5G --dry-run)"
+check "$(has 'not a size I understand' "$OUT")"       "a size that cannot be parsed is refused, not guessed at"
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_MEM_MB=64000 \
+      AEROSLS_HOST_DISK_MB=109000 timeout 20 ./run-cluster.sh --nodes 1 --ram 2G --dry-run 2>&1)"
+check "$(has '2048 MiB / 1 vCPU' "$OUT")" "2G is read as 2048 MiB"
 
 echo
 echo "=========================================="

@@ -2,7 +2,7 @@
 
 **Goal.** Replace `run-two-nodes.sh` with `run-cluster.sh`, taking a node count and a per-node size, detecting the host's capacity, and refusing or right-sizing rather than thrashing the machine.
 
-**Status.** Phases 1–3 built, plus §0's blocker now **fully closed** — a networked node has a working console. Phase 4 (capacity auto-sizing) and 5 (retiring `run-two-nodes.sh`) remain. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
+**Status.** Phases 1–4 built, plus §0's blocker now **fully closed** — a networked node has a working console. Only Phase 5 (retiring `run-two-nodes.sh`) remains. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
 
 ---
 
@@ -174,7 +174,7 @@ Assume 4 cores, ~15 GB available, 109 GB free (from the `xorriso` output in the 
 | **1** | ✅ **DONE** — `kernel/boot_params.{c,h}`: multiboot2 cmdline tag reader + `node=<n>` → `cluster_init()`, called before `partition_init()` | `tests/boot_params_host_test.c`, 49 checks, 7/7 mutations caught. Whole-image link clean. 77/77 suite green |
 | **2** | ✅ **DONE** — `-netdev socket,mcast=239.192.152.40:12340` on every node; self-echo guard in `net_rx_dispatch()` | `tests/net_self_echo_host_test.c` 14 checks, 5/5 mutations caught; harness 24 checks. Link clean, 79/79 suite green |
 | **3** | ✅ **DONE** — `run-cluster.sh`: N nodes, per-node ISO carrying `node=<i>`, port allocation, one-pass liveness, `--stop`, `--dry-run` | `tests/run_cluster_harness.sh` 43 checks, 5/5 mutations caught |
-| **4** | Capacity detection + auto-sizing + the reasoning output | Harness with faked `/proc/meminfo` and `nproc` — the arithmetic is testable without a big machine |
+| **4** | ✅ **DONE** — capacity detection, `--nodes auto`, per-resource bounds with the binding one named | Harness scenarios 8/8b/9, 22 checks, faked `/proc/meminfo`; 65 total, mutations caught |
 | **5** | Retire `run-two-nodes.sh` as `run-cluster.sh --nodes 2`; update `COMMANDS.md`, `README.md`, roadmap | Full doc pass |
 | **6** *(optional)* | §0c multiplex the serial console into the HTTP loop | Interactive shell on a networked node |
 
@@ -185,6 +185,14 @@ Phases 3 and 4 are testable **without a multi-node machine at all**, using the s
 **A file that was never in the build.** `kernel/boot_params.c` shipped in Phase 1 without being added to `X86_C_SRC`, so `make x86-iso` would have failed on an undefined `boot_params_scan_mb2()`. Everything that was supposed to catch that looked elsewhere: it compiled clean standalone, its host test passed 49 checks, and the whole-image link check passed — because that check **globs the tree** for `.c` files rather than reading the Makefile. It happily linked a file the real build would never compile.
 
 The durable fix is `tests/makefile_sources_check.sh`, whose only job is comparing those two lists, with an explicit exclusion table so "we meant to leave that out" has to say why. It was verified by removing the entry again and watching it fail. The whole-image link check now also takes its file list *from the Makefile* rather than from a glob.
+
+### What Phase 4 turned up
+
+**CPU is advisory, and saying so is the point.** RAM, disk and the roster cap are hard bounds; cores are not, because after uniprocessor support an idle node halts and costs almost nothing. Folding cores into the hard minimum would have reproduced the old "3 nodes" answer that was only ever true when the AP spun. The launcher prints the busy-node figure separately and says it is not a limit — the real risk is *N busy at once*, not N existing.
+
+**An absolute limit must not be reported as a host limit.** The first version checked capacity before the roster range, so `--nodes 9` came back as "exceeds this host's capacity of 8" — inviting someone to go find a bigger machine for a number no machine can serve. The range check now runs first and says so explicitly. Harness scenario 2 caught it.
+
+**Overrides that short-circuit detection also short-circuit its tests.** The harness sets `AEROSLS_HOST_MEM_MB`, so `detect_mem_mb()` never ran, and a mutation swapping `MemAvailable` for `MemTotal` survived the entire suite — the one line whose whole job is that distinction. `/proc/meminfo` is now behind `AEROSLS_MEMINFO` so a fixture can be pointed at it, and scenario 8b exercises the reading rather than the arithmetic over it. Worth generalising: an override added for testability can remove the thing it was meant to test.
 
 ### What Phase 3 turned up
 

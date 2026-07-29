@@ -52,10 +52,31 @@ First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services
 ### run-cluster.sh — N nodes
 
 ```bash
-./run-cluster.sh --nodes 4          # boot a 4-node cluster
+./run-cluster.sh --nodes 4           # boot a 4-node cluster
+./run-cluster.sh --nodes auto        # as many as this host holds
 ./run-cluster.sh --nodes 3 --dry-run # print the plan and each node's QEMU argv
 ./run-cluster.sh --stop              # tear it down
 ```
+
+It reports the host's capacity on every run and names the binding constraint:
+
+```
+==> Host capacity
+      cores              4
+      memory available   15000 MiB   (reserving 2048 for the host)
+      free disk          109000 MiB
+==> Fits at 1024 MiB / 1 vCPU per node
+      by memory          12
+      by free disk       10   (10 GiB virtual each; sparse, so pessimistic)
+      roster cap         8
+      => capacity 8, bound by the roster cap (CLUSTER_NODE_MAX)
+      CPU (advisory)     3 busy nodes at once; idle nodes halt and cost
+                         almost nothing, so this is not a hard limit
+```
+
+**CPU is advisory, not a bound.** An idle node halts — with `-smp 1` there is no AP, and the AP's loop was the one that spun rather than halting. So a mostly-idle cluster is limited by memory. A node under load still wants a core, which is what that figure is for.
+
+An explicit `--nodes` over capacity is **refused, not clamped** (`--force` overrides). Exceeding `CLUSTER_NODE_MAX` is refused separately and cannot be forced — that is a protocol limit, not this host's.
 
 Supersedes `run-two-nodes.sh`, which its point-to-point netdev capped at exactly two. Nodes are numbered 1..N and **self-identify at boot** — no `cluster init` step — because each gets its own ISO carrying `node=<i>` on the kernel command line.
 
