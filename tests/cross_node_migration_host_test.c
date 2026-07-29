@@ -186,6 +186,9 @@ static int      loss_times     = 0;   /* how many times to drop it */
 static int      loss_applied   = 0;   /* how many times it actually was */
 static int      nack_everything = 0;  /* model a destination with no free slot */
 static int      ack_count_page = 0;   /* PAGE_ACKs this stub generated */
+static int      begin_loss_times   = 0;  /* how many BEGIN frames to swallow */
+static int      begin_loss_applied = 0;
+static int      begin_ack_count    = 0;  /* BEGIN_ACKs this stub generated */
 
 void e1000_transmit(NicRole role, void* buf, uint16_t size) {
     last_tx_role = role;
@@ -204,6 +207,24 @@ void e1000_transmit(NicRole role, void* buf, uint16_t size) {
     struct DSPPMigrateHeader* h =
         (struct DSPPMigrateHeader*)((uint8_t*)buf + ETH_HDR_LEN);
     if (h->magic != DSPP_MIGRATE_MAGIC) return;
+
+    /* The BEGIN is waited on now, so a stub that ignored it would model a
+     * destination that never allocates a slot -- and every migration here
+     * would (correctly) abandon. Answering it is what a live peer does. */
+    if (h->opcode == DSPP_MIGRATE_BEGIN_REQ) {
+        if (nack_everything) {
+            dspp_migrate_note_ack(h->transfer_id, DSPP_MIGRATE_BEGIN_ACK, 0, 0, 1);
+            return;
+        }
+        if (begin_loss_times > 0 && begin_loss_applied < begin_loss_times) {
+            begin_loss_applied++;
+            return;   /* the BEGIN "never arrived" */
+        }
+        begin_ack_count++;
+        dspp_migrate_note_ack(h->transfer_id, DSPP_MIGRATE_BEGIN_ACK, 0, 0, 0);
+        return;
+    }
+
     if (h->opcode != DSPP_MIGRATE_PAGE_REQ) return;
 
     if (nack_everything) {
@@ -689,6 +710,7 @@ int main(void) {
         for (uint32_t q = 0; q < (uint32_t)(pages); q++)                      \
             nvme_write_sync(s->lba_base + (uint64_t)q * 8, pg);               \
         captured_frame_count = 0; ack_count_page = 0; loss_applied = 0;       \
+        begin_loss_applied = 0; begin_ack_count = 0;                          \
         stream_migrate_send_partition(91, 2);                                 \
     })
 
@@ -771,9 +793,68 @@ int main(void) {
               "-- no speculative retransmission ***");
         CHECK(stream_store[0].active == 0, "...and completes, retiring the source");
     }
+    /* ── 6: an EMPTY stream is not retired until the BEGIN is acknowledged.
+     *
+     * ─── The hole this closes ───────────────────────────────────────────
+     * `stream_confirmed` started true and the page loop ran `frames_used`
+     * times -- so a stream with zero pages skipped the loop entirely and was
+     * retired having confirmed nothing at all. The exact fire-and-forget
+     * deletion that waiting for ACKs was added to prevent, surviving in the
+     * empty case.
+     *
+     * Found on a real cluster, not here: migrating a freshly created stream
+     * printed "0 page(s) ... every page acknowledged", which is vacuously
+     * true over zero pages and reads like a successful transfer. */
+    {
+        loss_page = -1; loss_times = 0; nack_everything = 0;
+        begin_loss_times = 0;
+        SETUP_SEND(0, 0x00);          /* zero pages */
+
+        CHECK(begin_ack_count == 1, "the destination acknowledged the BEGIN");
+        CHECK(captured_frame_count == 1,
+              "an empty stream sends exactly one frame -- the BEGIN, no pages");
+        CHECK(stream_store[0].active == 0,
+              "*** an empty stream IS retired once the BEGIN is acknowledged ***");
+    }
+
+    /* ── 7: an empty stream whose BEGIN is never acknowledged is NOT retired.
+     * The half that was broken. With no pages there are no page ACKs, so the
+     * BEGIN_ACK is the only evidence that exists. */
+    {
+        loss_page = -1; loss_times = 0; nack_everything = 0;
+        begin_loss_times = 1000;      /* never acknowledge it */
+        SETUP_SEND(0, 0x00);
+        begin_loss_times = 0;
+
+        CHECK(begin_ack_count == 0, "the destination never acknowledged the BEGIN");
+        CHECK(stream_store[0].active == 1,
+              "*** the source slot survives -- an unconfirmed empty stream is not "
+              "deleted on faith ***");
+        CHECK(captured_frame_count == (int)DSPP_MIGRATE_MAX_ATTEMPTS,
+              "*** and the BEGIN was RETRANSMITTED the full budget of attempts ***");
+    }
+
+    /* ── 8: a BEGIN lost once is retried and the transfer then completes.
+     * Proves the retry is real rather than just a give-up path -- and covers
+     * the gap the old design named: a lost BEGIN used to make every
+     * subsequent page be refused as an unknown transfer. */
+    {
+        loss_page = -1; loss_times = 0; nack_everything = 0;
+        begin_loss_times = 1;
+        SETUP_SEND(1, 0xB8);
+        begin_loss_times = 0;
+
+        CHECK(begin_loss_applied == 1, "the first BEGIN really was swallowed");
+        CHECK(begin_ack_count == 1, "the retry was acknowledged");
+        CHECK(stream_store[0].active == 0,
+              "*** a stream whose BEGIN needed retrying still completes ***");
+        CHECK(captured_frame_count == 2 + DSPP_MIGRATE_FRAGS_PER_PAGE,
+              "*** two BEGINs plus one page's fragments -- the retry cost one frame, "
+              "not a restart ***");
+    }
     #undef SETUP_SEND
 
-    /* ── 6: the ACK record ignores what it is not waiting for.
+    /* ── 9: the ACK record ignores what it is not waiting for.
      *
      * Driven directly rather than through a migration, because the failure
      * needs an ACK that a correct destination would never send at that

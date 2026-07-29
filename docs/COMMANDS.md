@@ -47,6 +47,32 @@ First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services
 - `aeroslsctl shell <any shell command>` → `POST /api/shell/exec`
 - `aeroslsctl raw GET|POST <path> [--body JSON]` → any route
 
+**`raw` takes the method as a positional argument, before the path.** There is no `--method` flag. This is spelled out with worked examples because the line above, read quickly, invites `raw /api/streams` — which fails with an argparse error rather than doing anything useful:
+
+```bash
+# right
+tools/aeroslsctl --host localhost:3001 raw GET /api/streams
+tools/aeroslsctl --host localhost:3001 raw POST /api/stream/create \
+  --body '{"name":"report.pdf","mime":"application/pdf"}'
+
+# wrong -- argparse rejects both
+tools/aeroslsctl raw /api/streams                       # method missing
+tools/aeroslsctl raw /api/streams --method GET          # no such flag
+```
+
+**There is no `stream` shell command.** Streams are created, written and listed over REST only — `GET /api/streams`, `POST /api/stream/create`, `POST /api/stream/upload`. Nothing in `user/shell.c`'s dispatch begins with `stream`, so `shell "stream list"` is refused as an unrecognised command.
+
+**Body field names are the parser's, not the obvious ones.** `POST /api/stream/upload` reads `hex` — hex-encoded bytes, up to `UPLOAD_CHUNK_MAX` (16 KiB binary, 32 KiB of hex) per request — plus optional `offset` and `last`. A body using `data` gets `{"ok":"false","error":"name and hex required"}`:
+
+```bash
+# 8 KiB of 0xAB -> two 4 KiB pages, so a later migration has something to move
+HEX=$(printf 'ab%.0s' $(seq 1 8192))
+tools/aeroslsctl --host localhost:3001 raw POST /api/stream/upload \
+  --body "{\"name\":\"payload.bin\",\"hex\":\"$HEX\",\"offset\":0,\"last\":1}"
+```
+
+`tests/commands_doc_check.sh` verifies this section against `user/shell.c`'s dispatch, `tools/aeroslsctl`'s argparse definitions and the `raw` usage form, so the three mistakes above become a test failure rather than an operator's afternoon.
+
 `workloads scale`, `workloads logs`, `workloads exec` and `nodes drain` are described in `docs/AeroSLS-Control-Plane.md` but **were never built** — there is no replica count, no log ring, no per-workload exec and no drain protocol. The CLI does not stub them; asking for one prints what is missing and what to use instead.
 
 ### run-cluster.sh — N nodes
@@ -589,6 +615,7 @@ A `database_id` groups tables under a named, grantable namespace — distinct fr
 | Command                                              | Description                                         |
 | ----------------------------------------------------- | ---------------------------------------------------- |
 | `database create <name>`                              | Create a database namespace                         |
+| `database drop <name>`                                | Remove a database namespace                          |
 | `database list`                                       | List all databases                                   |
 | `database grant uid <db_name> <uid> <perm>`           | Grant a uid direct access                            |
 | `database grant group <db_name> <group_name> <perm>`  | Grant a group access                                 |

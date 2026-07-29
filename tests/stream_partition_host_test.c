@@ -209,6 +209,8 @@ void dspp_migrate_send_frag(uint64_t t, uint32_t n, uint32_t p, uint32_t pg,
     (void)t; (void)n; (void)p; (void)pg; (void)f; (void)d;
 }
 void dspp_migrate_arm_page(uint64_t t, uint32_t p) { (void)t; (void)p; }
+void dspp_migrate_arm_begin(uint64_t t) { (void)t; }
+int  dspp_migrate_begin_acked(void) { return 1; }   /* FAITHFUL: see the note above */
 int  dspp_migrate_page_acked(void) { return 1; }
 int  dspp_migrate_frag_acked(uint32_t f) { (void)f; return 1; }
 int  dspp_migrate_nacked(void)     { return 0; }

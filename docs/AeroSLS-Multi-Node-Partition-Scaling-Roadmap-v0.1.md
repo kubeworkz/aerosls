@@ -588,6 +588,37 @@ Four separate bugs stood between a wired heartbeat and a working election, and e
 
 Each fix revealed the next, and each revealed one presented as a *plausible* state: FOLLOWER at term 0, then CANDIDATE forever, then FOLLOWER with a racing term. None of them printed an error. The general lesson, stated once here rather than four times above: **in a distributed protocol, the failure mode is silence, and every layer that can silently drop a message needs a test that proves the message got through — not a test that proves the sender sent it.**
 
+## 9g. The empty stream: retired on faith
+
+The first real `partition migrate` on a working cluster printed:
+
+```
+[STREAM] migrate: partition 1's stream 'report.pdf' (slot 0, 0 page(s))
+         CONFIRMED received by node 2 -- every page acknowledged.
+```
+
+**Zero pages.** "Every page acknowledged" is vacuously true over none, and it reads like a successful data transfer.
+
+`stream_confirmed` was initialised to `1` and the page loop ran `frames_used` times, so a stream with no pages skipped the loop entirely and fell straight through to `stream_retire_slot()`. The source was deleted having confirmed **nothing whatsoever** — precisely the fire-and-forget deletion §9e was written to prevent, surviving in the empty case.
+
+§9e had also argued, in `dspp.h`, that no separate `BEGIN_ACK` wait was needed because a `PAGE_ACK` proves the BEGIN landed. That holds only when there is at least one page. The reasoning was correct and the scope of its validity was not checked.
+
+**Fixed by waiting on the BEGIN unconditionally.** One round trip per *stream*, not per page. It removes the special case, and closes the other gap the old note named: a lost BEGIN is now retransmitted rather than causing every subsequent page to be refused as belonging to an unknown transfer.
+
+Two log lines also overclaimed and now don't. An empty stream says so explicitly instead of borrowing the language of a page transfer, and `partition.c`'s summary says "sent and confirmed by the destination" rather than "byte-verified" — zero bytes were verified.
+
+`cross_node_migration_host_test.c` is **107 checks**: an empty stream is retired only once the BEGIN is acknowledged; an unacknowledged one leaves the source active with the BEGIN retransmitted the full budget; and a BEGIN lost once is retried and the transfer completes, costing one extra frame rather than a restart. 3/3 mutations caught.
+
+### The operator-facing half, which was my error not the kernel's
+
+Four commands handed over in that session did not work: `stream list` (no `stream` command exists in the dispatch at all), `aeroslsctl raw /api/streams` (method is positional and comes first), `--method POST` (not a flag), and an upload body using `data` where the parser reads `hex`.
+
+The uncomfortable part: **`raw GET|POST <path> [--body JSON]` was already documented correctly** in `docs/COMMANDS.md`, and 164 of 165 shell commands were documented. The grammar being written down did not prevent the mistake, because a bullet-list grammar gets skimmed. What was missing was something pasteable.
+
+So `docs/COMMANDS.md` now carries worked `raw` examples with literal methods, a right/wrong pair, the `hex` field with a real 8 KiB invocation, and an explicit statement that no `stream` shell command exists. `tests/commands_doc_check.sh` verifies all of it against `user/shell.c`'s dispatch (both matchers — missing `sh_eq` while writing that check hid 47 commands and made the doc look full of phantoms) and `tools/aeroslsctl`'s argparse definitions.
+
+That checker has a deliberate subtlety worth recording: its first version simply banned the strings `--method` and `stream list`, and failed against the very section written to prevent the mistake. **A counter-example is good documentation.** The check now requires those strings to appear only in a context marked as wrong, rather than forbidding them.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

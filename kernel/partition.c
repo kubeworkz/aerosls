@@ -469,9 +469,15 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // named as such rather than conflated with "no transport exists yet"
     // now that one genuinely does for a different purpose. The partition is
     // intentionally left PAUSED when this function returns.
+    /* "byte-verified" was unconditional, and a stream with no pages verifies
+     * no bytes -- so migrating an empty stream reported byte verification
+     * that never happened. Say "confirmed by the destination", which is true
+     * in both cases: kernel/stream.c waits for a BEGIN_ACK even when there
+     * are no pages, and per-page ACKs plus a readback comparison when there
+     * are. The per-stream line from stream.c states which of the two applied. */
     kernel_serial_printf(
         "[PARTITION] migrated partition %u: node %u -> node %u. Lease "
-        "relinquished=%s, %d stream(s) relocated/sent and byte-verified, %u "
+        "relinquished=%s, %d stream(s) sent and confirmed by the destination, %u "
         "live context(s) checkpointed and sent, %u physical frame(s) "
         "reclaimed. Partition remains PAUSED -- resume must happen on the "
         "destination node.\n",

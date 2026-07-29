@@ -388,9 +388,20 @@ static void dspp_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
 static volatile uint64_t ack_transfer_id = 0;
 static volatile uint32_t ack_page_index  = 0;
 static volatile uint8_t  ack_armed       = 0;
+static volatile uint8_t  ack_begin_seen  = 0;
 static volatile uint8_t  ack_frag_seen[DSPP_MIGRATE_FRAGS_PER_PAGE];
 static volatile uint32_t ack_frag_count  = 0;
 static volatile uint8_t  ack_nack_seen   = 0;   /* a non-zero status arrived */
+
+void dspp_migrate_arm_begin(uint64_t transfer_id) {
+    ack_armed = 0;
+    ack_transfer_id = transfer_id;
+    ack_begin_seen  = 0;
+    ack_nack_seen   = 0;
+    ack_armed = 1;
+}
+
+int dspp_migrate_begin_acked(void) { return ack_begin_seen ? 1 : 0; }
 
 void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index) {
     ack_armed = 0;                     /* disarm while mutating */
@@ -413,9 +424,7 @@ void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,
 
     if (status != 0) { ack_nack_seen = 1; return; }
 
-    /* A BEGIN_ACK with status 0 needs no recording: nothing waits on it (see
-     * dspp.h). A non-zero one was already captured as a refusal above. */
-    if (opcode == DSPP_MIGRATE_BEGIN_ACK) return;
+    if (opcode == DSPP_MIGRATE_BEGIN_ACK) { ack_begin_seen = 1; return; }
     if (page_index != ack_page_index) return;
     if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return;
     if (!ack_frag_seen[frag_index]) {

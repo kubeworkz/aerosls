@@ -137,6 +137,8 @@ void dspp_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
 void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index) {
     (void)transfer_id; (void)page_index;
 }
+void dspp_migrate_arm_begin(uint64_t t) { (void)t; }
+int  dspp_migrate_begin_acked(void) { return 1; }   /* FAITHFUL: see the note above */
 int  dspp_migrate_page_acked(void) { return 1; }
 int  dspp_migrate_frag_acked(uint32_t f) { (void)f; return 1; }
 int  dspp_migrate_nacked(void)     { return 0; }

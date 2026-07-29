@@ -526,13 +526,26 @@ void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
  * duplicate from a previous retransmit round could satisfy the current
  * page's completion check with fragments that were never sent for it.
  *
- * There is deliberately no separate wait on BEGIN_ACK. A PAGE_ACK with
- * status 0 already proves the BEGIN landed, because stream_migrate_recv_page()
- * refuses any page for a transfer it has no inflight row for. The cost of
- * that simplification, named rather than hidden: if the BEGIN frame itself
- * is lost, every page is refused, the sender sees a refusal and aborts
- * instead of retrying the BEGIN. The transfer fails safely -- the source is
- * left intact -- but it fails where a BEGIN retry would have succeeded. */
+ * ─── The BEGIN is waited on too, and originally was not ──────────────────
+ * This header used to argue that no separate BEGIN_ACK wait was needed: a
+ * PAGE_ACK with status 0 already proves the BEGIN landed, because
+ * stream_migrate_recv_page() refuses a page for a transfer it has no
+ * inflight row for.
+ *
+ * That reasoning holds only when there is at least one page. A stream with
+ * frames_used == 0 sends no pages, collects no ACKs, and -- because the
+ * sender's `stream_confirmed` flag started out true and the page loop simply
+ * never ran -- was retired having confirmed nothing whatsoever. Exactly the
+ * fire-and-forget deletion that waiting for ACKs was introduced to prevent,
+ * surviving in the empty case. Found by migrating a freshly created stream
+ * on a real cluster and noticing "0 page(s) ... every page acknowledged".
+ *
+ * Waiting on the BEGIN unconditionally costs one round trip per STREAM (not
+ * per page), removes that special case entirely, and closes the other gap
+ * the old note named: a lost BEGIN is now retransmitted rather than causing
+ * every subsequent page to be refused. */
+void dspp_migrate_arm_begin(uint64_t transfer_id);
+int  dspp_migrate_begin_acked(void);
 void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index);
 void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,
                            uint32_t page_index, uint32_t frag_index,

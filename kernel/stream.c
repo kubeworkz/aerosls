@@ -600,9 +600,54 @@ int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) 
         // see stream_migrate_recv_begin()'s own comment).
         uint64_t transfer_id = ((uint64_t)partition_id << 32) | (uint64_t)i;
 
-        dspp_migrate_send_begin(transfer_id, dest_node_id, partition_id,
-                                src->name, src->mime_type, src->size,
-                                src->frames_used, src->owner_uid);
+        /* ── Confirm the BEGIN before sending anything else ───────────────
+         * The destination must have allocated a slot before pages can land,
+         * and -- for a stream with no pages at all -- this is the ONLY
+         * confirmation that will ever exist. Without it, `stream_confirmed`
+         * started true, the page loop never ran, and an empty stream was
+         * retired on faith: the source slot deleted with no evidence the
+         * destination had ever heard of it. See net/dspp.h.
+         *
+         * Waiting here also means a lost BEGIN is retransmitted rather than
+         * causing every subsequent page to be refused as belonging to an
+         * unknown transfer. */
+        int begin_ok = 0;
+        dspp_migrate_arm_begin(transfer_id);
+        for (uint32_t attempt = 0; attempt < DSPP_MIGRATE_MAX_ATTEMPTS; attempt++) {
+            dspp_migrate_send_begin(transfer_id, dest_node_id, partition_id,
+                                    src->name, src->mime_type, src->size,
+                                    src->frames_used, src->owner_uid);
+
+            uint64_t deadline  = kernel_tick_counter + DSPP_MIGRATE_ACK_TIMEOUT_TICKS;
+            uint64_t last_tick = kernel_tick_counter;
+            uint32_t stalled   = 0;
+            while (kernel_tick_counter < deadline) {
+                if (dspp_migrate_begin_acked()) { begin_ok = 1; break; }
+                if (dspp_migrate_nacked()) break;      /* refused: no slot free */
+                if (kernel_tick_counter != last_tick) { last_tick = kernel_tick_counter; stalled = 0; }
+                else if (++stalled > DSPP_MIGRATE_STALL_SPINS) {
+                    kernel_serial_print(
+                        "[STREAM] migrate: tick counter not advancing while awaiting BEGIN_ACK "
+                        "-- timer ISR stopped? Abandoning rather than spinning forever.\n");
+                    break;
+                }
+                __asm__ volatile("pause");
+            }
+            if (begin_ok || dspp_migrate_nacked()) break;
+            kernel_serial_printf(
+                "[STREAM] migrate: BEGIN for '%s' unacknowledged after attempt %u -- resending.\n",
+                src->name, (unsigned)attempt + 1u);
+        }
+        dspp_migrate_disarm();
+
+        if (!begin_ok) {
+            kernel_serial_printf(
+                "[STREAM] migrate: node %u never acknowledged the BEGIN for '%s'%s -- "
+                "transfer abandoned, source slot %d left intact.\n",
+                (unsigned)dest_node_id, src->name,
+                dspp_migrate_nacked() ? " (refused: no slot available)" : "", i);
+            continue;   /* leave src->active alone */
+        }
 
         uint64_t src_lba = src->lba_base;
         int stream_confirmed = 1;
@@ -694,11 +739,24 @@ int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) 
 
         if (!stream_confirmed) continue;   /* leave src->active alone */
 
-        kernel_serial_printf(
-            "[STREAM] migrate: partition %u's stream '%s' (slot %d, %u "
-            "page(s)) CONFIRMED received by node %u -- every page acknowledged.\n",
-            (unsigned)partition_id, src->name, i, src->frames_used,
-            (unsigned)dest_node_id);
+        /* Distinguishes the two confirmations, because they are not the same
+         * claim. "every page acknowledged" over ZERO pages is vacuously true
+         * and reads as a successful data transfer when nothing moved -- which
+         * is precisely how the empty-stream hole went unnoticed on a real
+         * cluster. An empty stream now says so. */
+        if (src->frames_used == 0) {
+            kernel_serial_printf(
+                "[STREAM] migrate: partition %u's stream '%s' (slot %d) is EMPTY -- "
+                "node %u acknowledged the BEGIN, so the slot exists there; no pages "
+                "to transfer and none claimed.\n",
+                (unsigned)partition_id, src->name, i, (unsigned)dest_node_id);
+        } else {
+            kernel_serial_printf(
+                "[STREAM] migrate: partition %u's stream '%s' (slot %d, %u "
+                "page(s)) CONFIRMED received by node %u -- every page acknowledged.\n",
+                (unsigned)partition_id, src->name, i, src->frames_used,
+                (unsigned)dest_node_id);
+        }
 
         /* ─── Retirement is now conditional, and that is the point ─────────
          * This used to run unconditionally, immediately after the last frame
