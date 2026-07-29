@@ -2,11 +2,15 @@
 #include <stddef.h>
 #include "../arch/x86/lapic.h"
 #include "microkernel.h"
+#include "smp.h"
 
 extern void* allocate_physical_ram_frame(void);
 extern void ap_kernel_main(void);
 extern void flush_daemon_tick(void);
 extern void kernel_sleep_ticks(uint32_t ticks);
+extern void kernel_serial_print(const char* s);
+extern void kernel_serial_printf(const char* fmt, ...);
+extern volatile uint64_t kernel_tick_counter;
 
 extern uint8_t trampoline_start;
 extern uint8_t trampoline_end;
@@ -15,7 +19,7 @@ extern uint64_t gdt_ptr;
 // Global tracking structure used for multicore handshakes
 volatile uint32_t ap_bootstrap_lock = 0;
 
-void boot_application_processors(uint8_t target_apic_id) {
+int boot_application_processors(uint8_t target_apic_id) {
     // 1. Copy our flat assembly binary payload to physical target location 0x08000
     uint8_t* dest = (uint8_t*)0x08000;
     uint8_t* src  = &trampoline_start;
@@ -57,10 +61,44 @@ void boot_application_processors(uint8_t target_apic_id) {
     lapic_write(LAPIC_REG_ICR_HIGH, (uint32_t)target_apic_id << 24);
     lapic_write(LAPIC_REG_ICR_LOW,  0x00004608); 
 
-    // Wait for the AP to safely enter ap_kernel_main and clear the lock flag
+    /* Wait for the AP to enter ap_kernel_main and set the flag -- but with
+     * a deadline. This was an unbounded `while (ap_bootstrap_lock == 0)`
+     * spin, which meant that booting with `-smp 1` (no APIC id 1 to answer
+     * the SIPI) hung the kernel here forever, silently, before any of the
+     * subsystems below had started. A machine with one CPU is a supported
+     * configuration; failing to find a second one is not an error. */
+    uint64_t deadline = kernel_tick_counter + AP_BOOT_TIMEOUT_TICKS;
     while (ap_bootstrap_lock == 0) {
+        if (kernel_tick_counter >= deadline) {
+            kernel_serial_printf(
+                "[SMP] no AP answered at APIC id %u within %u ticks -- running "
+                "UNIPROCESSOR; the BSP will drive the service loop itself.\n",
+                (unsigned)target_apic_id, (unsigned)AP_BOOT_TIMEOUT_TICKS);
+            return 0;
+        }
         __asm__ volatile("pause");
     }
+    kernel_serial_printf("[SMP] AP at APIC id %u online.\n",
+                         (unsigned)target_apic_id);
+    return 1;
+}
+
+int smp_ap_online(void) {
+    return __atomic_load_n(&ap_bootstrap_lock, __ATOMIC_SEQ_CST) != 0;
+}
+
+void smp_uniprocessor_tick(void) {
+    /* Checked live, not latched at boot: if an AP turns up late -- past the
+     * timeout -- it resumes ownership of this work and the BSP stops, so
+     * the two can never both be driving it. */
+    if (smp_ap_online()) return;
+
+    static uint64_t next_due = 0;
+    if (kernel_tick_counter < next_due) return;
+    next_due = kernel_tick_counter + SMP_UNI_TICK_INTERVAL;
+
+    flush_daemon_tick();
+    microkernel_service_poll();
 }
 
 // Executed concurrently by Core 1 and Core 2 when they leave the trampoline

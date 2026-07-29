@@ -78,7 +78,18 @@
 #       telnet 127.0.0.1 12341     # node A   (Ctrl-] then "quit" to detach)
 #       telnet 127.0.0.1 12342     # node B
 #
-#   Once each AeroSLS shell prompt appears:
+#   ── KNOWN BLOCKER: those consoles show boot output but NO PROMPT ────
+#   kernel/kernel.c:372 enters http_server_run() and never returns when a
+#   NIC is present, so sls_shell_loop() is not reached on a networked boot
+#   -- and every node here has an e1000 by design. Together with the
+#   single-NIC driver (no host port forward possible) and the absence of a
+#   keyboard driver, these nodes currently have NO control path, and the
+#   walkthrough below has never actually been executable. Attaching a
+#   console is still useful for reading boot output.
+#
+#   The fix is boot-time node identity rather than typing into a console;
+#   see docs/AeroSLS-N-Node-Launcher-Plan-v0.1.md §0. Once that lands, the
+#   intended sequence is:
 #       node A:  cluster init 1
 #       node B:  cluster init 2
 #       (either) cluster status     -- confirms node_id/role/roster
@@ -94,6 +105,16 @@
 #   # expect on the wire).
 #
 # Environment overrides:
+#   AEROSLS_SMP=<n>                vCPUs per node (default 1). One is enough
+#                                  and is the cheap choice: the kernel starts
+#                                  at most ONE application processor, and that
+#                                  AP's loop never idles -- it spins in
+#                                  kernel_sleep_ticks() rather than halting, so
+#                                  a second vCPU costs a full host core whether
+#                                  the node is busy or not. On -smp 1 the BSP
+#                                  runs that work from its own idle points and
+#                                  halts between sweeps. See kernel/smp.h.
+#   AEROSLS_RAM=<size>             RAM per node (default 4G)
 #   AEROSLS_DISPLAY=gtk|sdl|none   force a display backend
 #   AEROSLS_CON_A / AEROSLS_CON_B  console ports (default 12341 / 12342)
 #
@@ -193,7 +214,7 @@ launch_node() {
         -vga std -display "$DISPLAY_BACKEND" -monitor none \
         -chardev socket,id=con0,host=127.0.0.1,port="$con_port",server=on,wait=off,telnet=on,logfile="$log" \
         -serial chardev:con0 \
-        -m 4G -smp 4 -boot d </dev/null 2>"$errfile" &
+        -m "${AEROSLS_RAM:-4G}" -smp "${AEROSLS_SMP:-1}" -boot d </dev/null 2>"$errfile" &
     LAUNCHED_PID=$!
 }
 

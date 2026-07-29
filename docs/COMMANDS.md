@@ -53,14 +53,28 @@ First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services
 
 `aeroslsctl` works against a single node under `make x86-run` (host 3001 → guest 3000). It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate.
 
-For the two-node walkthrough, use each node's serial console instead. `run-two-nodes.sh` exposes them as listening sockets on loopback:
+**Correction, and a live blocker.** An earlier revision of this section said to drive the two-node walkthrough from each node's serial console. That is wrong, and the reason is worth stating because it affects any networked boot:
+
+```c
+/* kernel/kernel.c:372 */
+if (e1000_mmio_base) {
+    http_server_run();  // does not return — serves REST API on port 3000
+}
+sls_shell_loop();       // only reached when there is NO NIC
+```
+
+**`sls_shell_loop()` is never called on a node that has a NIC.** `run-two-nodes.sh` gives every node an e1000 — that is the whole point of it — so the console shows boot output and then no prompt, ever. Combined with the single-NIC driver (no host port forward possible) and the absence of a keyboard driver, **those nodes currently have no control path at all**, and the two-node walkthrough has never been executable.
+
+The consoles are still worth attaching to read boot output:
 
 ```
 telnet 127.0.0.1 12341     # node A   (Ctrl-] then "quit" to detach)
 telnet 127.0.0.1 12342     # node B
 ```
 
-That console is a full shell, so it reaches strictly more than the REST API does. Treat the port as equivalent to a root login: it binds 127.0.0.1 only, and on a shared or internet-facing box should be tunnelled over SSH rather than firewalled open.
+Treat the port as equivalent to a root login should a shell ever appear on it: it binds 127.0.0.1 only, and on a shared or internet-facing box should be tunnelled over SSH rather than firewalled open.
+
+The fix is nodes that self-identify at boot rather than being told to over a console — see `docs/AeroSLS-N-Node-Launcher-Plan-v0.1.md` §0. Single-node work under `make x86-run` is unaffected: there the REST API is reachable on `localhost:3001` and `aeroslsctl` works normally.
 
 ---
 

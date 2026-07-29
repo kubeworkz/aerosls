@@ -1,4 +1,5 @@
 #include "kernel_io.h"
+#include "smp.h"
 #include "../arch/x86/vga.h"
 
 // ─── x86 Port I/O ─────────────────────────────────────────────────────────────
@@ -187,9 +188,17 @@ void kernel_serial_printf(const char* fmt, ...) {
 void read_line(char* buf) {
     int i = 0;
     for (;;) {
-        // Wait for Data Ready bit in Line Status Register
-        while (!(inb(SERIAL_COM1_BASE + 5) & 0x01))
+        /* Wait for Data Ready bit in Line Status Register.
+         *
+         * On a single-CPU boot with no NIC this poll IS the BSP's idle
+         * loop -- http_server_run() is never entered, so without this call
+         * the reconciler, flush daemon and tier manager would never run at
+         * all while sitting at a prompt. No-op when an AP is online, and
+         * self-rate-limiting either way (kernel/smp.h). */
+        while (!(inb(SERIAL_COM1_BASE + 5) & 0x01)) {
+            smp_uniprocessor_tick();
             __asm__ volatile("pause");
+        }
 
         char c = (char)inb(SERIAL_COM1_BASE);
 

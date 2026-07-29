@@ -6,6 +6,7 @@
 #include "dhcp.h"   // Navigator-Parity Gap Roadmap Phase 5a -- dhcp_is_bound() for GET /api/network/status
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
+#include "../kernel/smp.h"       // smp_uniprocessor_tick() -- single-CPU fallback
 #include "../kernel/net_event.h"  // Architectural Phase 1 -- net_event_hlt_wait() for the multiplexed HTTP loop
 #include "../kernel/object_catalog.h"
 #include "../kernel/transaction.h"
@@ -5758,6 +5759,16 @@ void http_server_run(void) {
                 hc->attributed = 0;
             }
         }
+
+        /* Single-CPU fallback: with no AP there is nobody else running
+         * flush_daemon_tick()/microkernel_service_poll(), so the BSP does
+         * it. A no-op whenever an AP is online (kernel/smp.h).
+         *
+         * Deliberately BEFORE reconcile_drain(): this is what runs
+         * reconcile_tick(), and draining immediately after means anything
+         * it queues is applied in the same sweep rather than waiting for
+         * the next one. */
+        smp_uniprocessor_tick();
 
         // Orchestration Plan Phase 5: apply anything the AP-core reconciler
         // queued. This is the BSP, so persist_*() is safe here and is

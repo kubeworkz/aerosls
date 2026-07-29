@@ -12,6 +12,8 @@
 #include "timer.h"
 #include "process.h"
 #include "frame_pool.h"
+#include "boot_params.h"   // boot-time cluster identity (node=<n>)
+#include "smp.h"           // AP bring-up + the uniprocessor fallback
 #include "partition.h"
 #include "service_registry.h"
 #include "service_mesh.h"
@@ -55,7 +57,7 @@
                                      // by an unrelated header sweep in this phase)
 
 extern void sls_shell_loop(void);
-extern void boot_application_processors(uint8_t apic_id);
+
 
 // ─── Multiboot2 memory map + hardware diagnostics ────────────────────────────
 static uint64_t print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
@@ -64,7 +66,12 @@ static uint64_t print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
     if (mb2_magic != (uint32_t)MULTIBOOT2_MAGIC) {
         kernel_serial_printf("[MB2] WARNING: bad magic 0x%x (expected 0x36d76289)\n",
                              mb2_magic);
-        return;
+        /* Was a bare `return;` in a uint64_t function -- a constraint
+         * violation the build's -w flag hid, handing frame_pool_limit_ram()
+         * an indeterminate value on the one path where the memory map is
+         * unavailable. 0 is the documented "no usable-RAM top reported"
+         * sentinel that function already handles. */
+        return 0;
     }
 
     // 2. CPU vendor string via CPUID leaf 0
@@ -147,6 +154,12 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
      * partition_init() and loader_init() below, all of which allocate. */
     frame_pool_init();
 
+    /* Capture the boot command line before anything consults it. This is a
+     * separate, earlier walk than print_hw_info()'s below: identity has to
+     * be settled before partition_init(), and print_hw_info() runs here only
+     * for the memory map. */
+    boot_params_scan_mb2(mb2_magic, mb2_phys);
+
     uint64_t top_usable = print_hw_info(mb2_magic, mb2_phys);
     /* ...and bound the top, so the pool never offers memory the machine
      * does not have. The bitmap spans a fixed 4 GiB regardless of the
@@ -167,6 +180,17 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4c. Process manager ────────────────────────────────────────────
     process_init();
+
+    /* ── 4c-ante. Cluster identity, from the boot command line ─────────────
+     * This MUST precede partition_init(), which stamps PARTITION_SYSTEM's
+     * owner with cluster_local_node_id() (kernel/partition.c:66). Resolve
+     * identity afterwards and partition 0 is recorded as owned by node 0
+     * while the node believes it is node 3 -- every ownership check
+     * downstream then reads that split wrongly.
+     *
+     * Reading the MAC instead was rejected for exactly this reason: it does
+     * not exist until e1000_init(), far below. See boot_params.h. */
+    boot_params_apply_node_identity();
 
     // ── 4c-bis. LPAR groundwork: partition table (Phase 8) ─────────────────
     partition_init();
@@ -258,6 +282,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 6. Boot Application Processor (Core 1) ─────────────────────────
     kernel_serial_print("[BSP] Waking Core 1...\n");
+    /* Returns 0 on a single-CPU machine rather than spinning forever, which
+     * is what it used to do -- see smp.h. Everything below works either way;
+     * the BSP picks up the AP's periodic work from its own idle points. */
     boot_application_processors(1);
     kernel_serial_print("[BSP] Core 1 online.\n");
 
