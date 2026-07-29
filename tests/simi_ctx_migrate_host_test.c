@@ -114,37 +114,6 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* p, uint64_t n
  * branch is unreached here. */
 volatile uint64_t kernel_tick_counter = 0;
 
-/* ─── This test raises the link limit, deliberately ───────────────────────
- * struct DSPPCtxMigrateChunkPacket is 4217 bytes and cannot cross a
- * standard Ethernet segment. That is real and unfixed -- see net/dspp.h,
- * and the roadmap doc's section on it.
- *
- * But nothing this file tests is about the link. Chunk reassembly, index
- * ordering, duplicate rejection, corruption detection and short-final-chunk
- * handling are all properties of the layer ABOVE it, and they will be
- * exactly as correct (or not) whichever way the MTU problem is eventually
- * solved. Raising dspp_max_wire_payload here keeps that coverage intact
- * rather than deleting it or rewriting every scenario to hand-build frames.
- *
- * The danger with a seam like this is that it silently disables the
- * property it was added around, so this is stated plainly: the link limit
- * itself is asserted by tests/dspp_phase5_host_test.c Scenarios 9-10 and
- * tests/cross_node_migration_host_test.c Scenario 1, and NEITHER of those
- * touches this variable. If this file ever starts being cited as evidence
- * that context migration works over a real wire, it is being misread. */
-static void raise_link_limit_for_protocol_tests(void) {
-    /* Sized to the LARGEST DSPP packet family, not just the context one:
-     * a dispatcher-routing scenario below feeds a stream PAGE packet (4273
-     * B, bigger than a context chunk's 4217) to prove the two families stay
-     * distinguishable. Sizing off only the family this file is named after
-     * left that one scenario failing -- the same "size off whichever struct
-     * is actually larger" mistake net/dspp.c's own frame buffer records
-     * having made once already. */
-    size_t biggest = sizeof(struct DSPPCtxMigrateChunkPacket);
-    if (sizeof(struct DSPPMigratePagePacket) > biggest) biggest = sizeof(struct DSPPMigratePagePacket);
-    if (sizeof(struct DSPPFullPagePacket)    > biggest) biggest = sizeof(struct DSPPFullPagePacket);
-    dspp_max_wire_payload = (uint16_t)biggest;
-}
 
 /* ─── The stream migrate handlers, as OBSERVABLE stubs ─────────────────
  * Deliberately not the real kernel/stream.c. Both header families share
@@ -163,8 +132,8 @@ int stream_migrate_recv_begin(uint64_t tid, uint32_t pid, const char* name,
     (void)frames_used; (void)owner_uid;
     stream_begin_calls++; return 0;
 }
-int stream_migrate_recv_page(uint64_t tid, uint32_t idx, const uint8_t* data) {
-    (void)tid; (void)idx; (void)data;
+int stream_migrate_recv_page(uint64_t tid, uint32_t idx, uint32_t frag, const uint8_t* data) {
+    (void)tid; (void)idx; (void)frag; (void)data;
     stream_page_calls++; return 0;
 }
 
@@ -181,7 +150,23 @@ MACAddr net_my_mac;
  * During the send phase, every frame is recorded. During replay the
  * receiver emits ACKs through this same path; those are counted
  * separately rather than polluting the capture being replayed. */
-#define MAX_FRAMES 64
+/* ─── Capture depth, derived rather than guessed ──────────────────────────
+ * This was `#define MAX_FRAMES 64`, and it broke the moment
+ * DSPP_CTX_CHUNK_BYTES dropped from 4096 to a size that fits an Ethernet
+ * frame: a full checkpoint is ~66 KiB, so the chunk count quadrupled past
+ * 64, e1000_transmit() silently stopped recording beyond that, and
+ * reassembly could never complete. The symptom was four failing assertions
+ * about a context that "did not arrive" -- nothing to do with the receive
+ * path, everything to do with the test's own buffer.
+ *
+ * Derived from the same constants the real chunk_present[] in
+ * kernel/simi_ctx_migrate.c derives its size from, so a future change to
+ * the chunk size or the interpreter's memory cannot silently truncate the
+ * capture again. */
+#define MAX_CKPT_BYTES ((unsigned)(sizeof(struct SimiCkptHeader) \
+                      + SIMI_MAX_FRAMES * sizeof(struct SimiFrame) \
+                      + SIMI_MEM_SIZE))
+#define MAX_FRAMES ((MAX_CKPT_BYTES / DSPP_CTX_CHUNK_BYTES) + 8)
 /* Sized to the LARGER of the two packet families, via the same
  * compile-time ternary dspp_transmit_raw() itself uses -- scenario 3
  * replays real STREAM packets too, and those are bigger (a stream header
@@ -286,7 +271,6 @@ static uint32_t migrate(struct SimiContext* src, const SimiObject* image_for_b,
 
 int main(void) {
     printf("=== PEC Phase 3: live context migration across nodes ===\n\n");
-    raise_link_limit_for_protocol_tests();   /* see the note above -- NOT a claim the link carries these */
 
     SimiObject obj = {0};
     if (simi_obj_read("tools/simi/tests/loop_sum.tmo", &obj) != 0) {
@@ -429,7 +413,13 @@ int main(void) {
         stream_begin_calls = stream_page_calls = 0;
         replay_all();
         CHECK(stream_begin_calls == 1, "a stream BEGIN still routes to the stream handler");
-        CHECK(stream_page_calls == 1,  "a stream PAGE still routes to the stream handler");
+        /* One page is DSPP_MIGRATE_FRAGS_PER_PAGE frames now that a 4 KiB
+         * page is sliced to fit the link, so the handler is reached once per
+         * fragment. Written against the constant rather than a literal 4:
+         * what matters here is that stream frames route to the STREAM
+         * handler and not the context one, whatever the slice count is. */
+        CHECK(stream_page_calls == DSPP_MIGRATE_FRAGS_PER_PAGE,
+              "every fragment of a stream PAGE still routes to the stream handler");
     }
 
     /* ═══ Scenario 4: self-filtering ══════════════════════════════════ */

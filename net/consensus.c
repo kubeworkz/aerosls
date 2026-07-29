@@ -283,7 +283,6 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
         reply.header.node_source_id = (uint16_t)local_cluster_state.node_id;
 
         struct ConsensusMessage* reply_msg = (struct ConsensusMessage*)reply.payload_4kb;
-        reply_msg->term = local_cluster_state.current_term;
 
         if (msg->term > local_cluster_state.current_term) {
             local_cluster_state.current_term = msg->term;
@@ -298,6 +297,22 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
         } else {
             reply_msg->vote_granted = 0; // Deny candidate
         }
+
+        /* Stamped AFTER the branch above, deliberately, and this line is the
+         * whole election.
+         *
+         * It used to sit before the `if`, so a granting voter replied with
+         * the term it held BEFORE adopting the candidate's. The candidate
+         * counts a reply only when msg->term == its own current_term, so
+         * every granted vote arrived one term stale and was discarded. Votes
+         * were cast correctly and thrown away on receipt: four nodes, all
+         * willing, none ever reaching quorum, each campaigning again on
+         * timeout. A cluster reporting CANDIDATE forever with no error
+         * anywhere.
+         *
+         * A denial still carries this node's unchanged current_term, which
+         * is what a candidate needs to see that it is behind. */
+        reply_msg->term = local_cluster_state.current_term;
 
         dspp_transmit_raw(&reply, CONSENSUS_WIRE_LEN);
     }
@@ -537,7 +552,6 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint6
         reply.header.node_source_id = (uint16_t)local_cluster_state.node_id;
 
         struct ConsensusMessage* reply_msg = (struct ConsensusMessage*)reply.payload_4kb;
-        reply_msg->term         = row->term;
         reply_msg->partition_id = partition_id;
         reply_msg->candidate_id = local_cluster_state.node_id;
 
@@ -552,6 +566,13 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint6
         } else {
             reply_msg->vote_granted = 0;   // Deny candidate
         }
+
+        /* AFTER the branch, for the same reason as the cluster-wide handler:
+         * a granted vote stamped with the pre-update term is discarded by the
+         * candidate, which requires msg->term == its own row->term. Same bug,
+         * same one-line ordering, in the mechanism that actually gates
+         * writes. */
+        reply_msg->term = row->term;
 
         dspp_transmit_raw(&reply, CONSENSUS_WIRE_LEN);
         return;

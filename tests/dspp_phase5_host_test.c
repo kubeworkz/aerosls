@@ -160,8 +160,9 @@ int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
     (void)size; (void)frames_used; (void)owner_uid;
     return 1;   /* "no free slot" -- not exercised by this test, permissive-denial stub (kernel/stream.c not linked) */
 }
-int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index, const uint8_t* page_data) {
-    (void)transfer_id; (void)page_index; (void)page_data;
+int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
+                             uint32_t frag_index, const uint8_t* frag_data) {
+    (void)transfer_id; (void)page_index; (void)frag_index; (void)frag_data;
     return 1;   /* "unknown transfer" -- not exercised by this test */
 }
 
@@ -313,23 +314,52 @@ int main(void) {
               "*** one byte over is refused ***");
     }
 
-    /* Scenario 10: the 4 KB page family is STILL undeliverable, and this
-     * test says so out loud rather than leaving it to be rediscovered.
+    /* Scenario 10: EVERY packet family this protocol sends fits the link.
      *
-     * Deliberately asserting the broken state: shrinking the consensus
-     * messages fixed the election, not the page transfer. These structs
-     * genuinely carry a 4 KB page and need jumbo frames or protocol-level
-     * fragmentation. If a later change makes them deliverable, this check
-     * fails and whoever did it updates the record. */
+     * ─── This check previously asserted the opposite ─────────────────────
+     * It read `sizeof(DSPPMigratePagePacket) > DSPP_MAX_WIRE_PAYLOAD` with
+     * the message "KNOWN GAP", deliberately pinning the broken state so
+     * that whoever fixed it would be forced to come here and update the
+     * record rather than leave a stale claim behind. That worked: closing
+     * the gap by fragmentation failed exactly these two checks.
+     *
+     * Both 4 KB families now slice their payload -- DSPP_MIGRATE_FRAG_BYTES
+     * for stream pages, DSPP_CTX_CHUNK_BYTES for context checkpoints --
+     * with reassembly on the far side.
+     *
+     * net/dspp.c static-asserts the same properties at compile time, which
+     * is the stronger guard. These runtime checks are kept because they
+     * name WHY in a place a reader of the test output will see it. */
     {
-        CHECK(sizeof(struct DSPPMigratePagePacket) > DSPP_MAX_WIRE_PAYLOAD,
-              "KNOWN GAP: DSPPMigratePagePacket still exceeds the link MTU -- "
-              "cross-node page transfer cannot complete on a standard segment");
-        CHECK(sizeof(struct DSPPCtxMigrateChunkPacket) > DSPP_MAX_WIRE_PAYLOAD,
-              "KNOWN GAP: DSPPCtxMigrateChunkPacket likewise");
+        CHECK(sizeof(struct DSPPMigratePagePacket) <= DSPP_MAX_WIRE_PAYLOAD,
+              "*** a stream page FRAGMENT fits the link ***");
+        CHECK(sizeof(struct DSPPCtxMigrateChunkPacket) <= DSPP_MAX_WIRE_PAYLOAD,
+              "*** a context checkpoint CHUNK fits the link ***");
         CHECK(sizeof(struct DSPPMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
-              "...though the migrate BEGIN header does fit -- which is why a "
-              "migration appears to start and then silently moves nothing");
+              "...as does the migrate BEGIN header, as it always did");
+        CHECK(sizeof(struct DSPPPacketHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+              "...and the bare consensus header");
+        CHECK(sizeof(struct DSPPServiceHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+              "...and a service announcement");
+
+        /* The one family still oversized, and why that is now correct
+         * rather than a gap: DSPPFullPagePacket is legitimately 4132 bytes,
+         * but every live sender transmits only its 56-byte prefix
+         * (CONSENSUS_WIRE_LEN, net/consensus.c). The unused tail exists
+         * because ConsensusMessage had to live somewhere. If DSPP_PAGE_*_REQ
+         * is ever implemented it will have to fragment like the two
+         * families above; until then the runtime guard in
+         * dspp_transmit_raw() would catch any attempt to send it whole. */
+        CHECK(sizeof(struct DSPPFullPagePacket) > DSPP_MAX_WIRE_PAYLOAD,
+              "DSPPFullPagePacket is still oversized -- but no live sender "
+              "transmits more than its 56-byte prefix");
+
+        /* Exact division is what lets frag_index alone locate a slice. */
+        CHECK(4096 % DSPP_MIGRATE_FRAG_BYTES == 0,
+              "*** the fragment size divides a 4 KiB page exactly -- so no "
+              "per-fragment length field is needed ***");
+        CHECK(DSPP_MIGRATE_FRAGS_PER_PAGE * DSPP_MIGRATE_FRAG_BYTES == 4096,
+              "...and the fragment count covers the whole page, with nothing left over");
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

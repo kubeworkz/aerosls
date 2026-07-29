@@ -638,6 +638,25 @@ struct StreamMigrateInflight {
     int      slot;
     uint32_t received_pages;
     uint8_t  active;
+
+    /* ── Page reassembly ────────────────────────────────────────────────
+     * A 4 KiB page arrives as DSPP_MIGRATE_FRAGS_PER_PAGE separate frames
+     * (net/dspp.h), because a whole page does not fit an Ethernet frame.
+     * Fragments accumulate here and the page is written to NVMe only once
+     * all of them are present -- one write and one verify read per page,
+     * the same disk cost as before the split.
+     *
+     * Staging in RAM rather than read-modify-writing the destination LBA
+     * per fragment: the latter needs no state at all and tolerates any
+     * arrival order, but costs a read and a write per fragment, and would
+     * leave a genuinely half-written page on disk if a fragment were lost.
+     * A page that is either fully written or not written at all is the
+     * better failure mode for storage. */
+    uint32_t staged_page;                              /* which page_index staged[] holds */
+    uint8_t  staged_valid;                             /* 0 before the first fragment */
+    uint8_t  frag_present[DSPP_MIGRATE_FRAGS_PER_PAGE];
+    uint32_t frags_seen;
+    uint8_t  staged[4096];
 };
 static struct StreamMigrateInflight migrate_inflight[STREAM_MIGRATE_INFLIGHT_MAX];
 
@@ -692,9 +711,26 @@ int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
     return 0;
 }
 
+/* Discards whatever is staged and starts collecting `page_index` fresh.
+ * Kept separate because the "a new page began before the last one finished"
+ * path has to do exactly this AND report, and silently sharing the reset
+ * with the normal path is how that report gets dropped later. */
+static void migrate_stage_reset(struct StreamMigrateInflight* mi, uint32_t page_index) {
+    mi->staged_page  = page_index;
+    mi->staged_valid = 1;
+    mi->frags_seen   = 0;
+    for (uint32_t i = 0; i < DSPP_MIGRATE_FRAGS_PER_PAGE; i++) mi->frag_present[i] = 0;
+}
+
 int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
-                              const uint8_t* page_data) {
+                              uint32_t frag_index, const uint8_t* frag_data) {
     if (!(io_sq && io_cq)) return 1;
+    if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) {
+        kernel_serial_printf(
+            "[STREAM] migrate recv: fragment index %u out of range (max %u) -- dropped.\n",
+            (unsigned)frag_index, (unsigned)DSPP_MIGRATE_FRAGS_PER_PAGE - 1u);
+        return 1;
+    }
 
     int inflight_idx = -1;
     for (int k = 0; k < STREAM_MIGRATE_INFLIGHT_MAX; k++) {
@@ -719,6 +755,38 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
         return 1;
     }
 
+    /* ── Stage the fragment ────────────────────────────────────────────
+     * A fragment for a different page than the one in hand means the
+     * sender moved on. On a single sender over one L2 segment that only
+     * happens if a fragment was lost, so the half-collected page is
+     * abandoned rather than written -- and said out loud, because a stream
+     * silently missing 4 KiB in the middle is exactly the kind of quiet
+     * wrongness this protocol has already produced once. */
+    if (!mi->staged_valid || mi->staged_page != page_index) {
+        if (mi->staged_valid && mi->frags_seen < DSPP_MIGRATE_FRAGS_PER_PAGE) {
+            kernel_serial_printf(
+                "[STREAM] migrate recv: page %u abandoned with %u/%u fragments when "
+                "page %u began -- transfer %llu will not complete.\n",
+                (unsigned)mi->staged_page, (unsigned)mi->frags_seen,
+                (unsigned)DSPP_MIGRATE_FRAGS_PER_PAGE, (unsigned)page_index,
+                (unsigned long long)transfer_id);
+        }
+        migrate_stage_reset(mi, page_index);
+    }
+
+    /* Idempotent: a duplicate fragment overwrites identical bytes and is
+     * not counted twice, so it cannot fake a complete page. */
+    for (uint32_t b = 0; b < DSPP_MIGRATE_FRAG_BYTES; b++)
+        mi->staged[frag_index * DSPP_MIGRATE_FRAG_BYTES + b] = frag_data[b];
+    if (!mi->frag_present[frag_index]) {
+        mi->frag_present[frag_index] = 1;
+        mi->frags_seen++;
+    }
+
+    /* Not whole yet -- nothing goes to disk. */
+    if (mi->frags_seen < DSPP_MIGRATE_FRAGS_PER_PAGE) return 0;
+
+    const uint8_t* page_data = mi->staged;
     static uint8_t __attribute__((aligned(4096))) migrate_recv_verify_buf[4096];
     uint64_t dlba = d->lba_base + (uint64_t)page_index * 8;
     if (nvme_write_sync(dlba, page_data) != 0) return 1;
@@ -733,6 +801,11 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
         }
     }
 
+    /* The page is on disk and verified. Retire the staging state so a
+     * duplicate of its LAST fragment cannot re-run this block and count the
+     * same page twice -- which would let a transfer report complete while a
+     * later page was still missing. */
+    mi->staged_valid = 0;
     mi->received_pages++;
     if (mi->received_pages >= d->frames_used) {
         kernel_serial_printf(

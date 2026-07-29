@@ -41,6 +41,44 @@ uint16_t dspp_max_wire_payload = DSPP_MAX_WIRE_PAYLOAD;
 _Static_assert(DSPP_MAX_WIRE_PAYLOAD == DSPP_LINK_MTU - ETH_HDR_LEN,
                "DSPP_MAX_WIRE_PAYLOAD has drifted from DSPP_LINK_MTU - ETH_HDR_LEN");
 
+/* ─── Every packet this protocol sends must fit the link ──────────────────
+ * Enforced here, at compile time, because the alternative is what actually
+ * happened: three whole message families silently undeliverable for several
+ * phases, with a healthy-looking cluster and passing tests. A frame that
+ * cannot arrive is not a performance problem to be discovered in profiling,
+ * it is a correctness problem that presents as silence.
+ *
+ * Anything added to a header, or any chunk size raised for throughput, now
+ * breaks the build here rather than the cluster in the field. */
+_Static_assert(sizeof(struct DSPPPacketHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPPPacketHeader does not fit an Ethernet frame");
+_Static_assert(sizeof(struct DSPPServiceHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPPServiceHeader does not fit an Ethernet frame");
+_Static_assert(sizeof(struct DSPPMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPPMigrateHeader does not fit an Ethernet frame");
+_Static_assert(sizeof(struct DSPPCtxMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPPCtxMigrateHeader does not fit an Ethernet frame");
+_Static_assert(sizeof(struct DSPPCtxMigrateChunkPacket) <= DSPP_MAX_WIRE_PAYLOAD,
+               "a context chunk does not fit an Ethernet frame -- lower DSPP_CTX_CHUNK_BYTES");
+_Static_assert(sizeof(struct DSPPMigratePagePacket) <= DSPP_MAX_WIRE_PAYLOAD,
+               "a page fragment does not fit an Ethernet frame -- lower DSPP_MIGRATE_FRAG_BYTES");
+
+/* frag_index alone locates a slice only if the division is exact. A
+ * fragment size that did not divide 4096 would need a length field per
+ * fragment, exactly as the context family carries chunk_bytes for its
+ * arbitrary-length checkpoints. */
+_Static_assert(4096 % DSPP_MIGRATE_FRAG_BYTES == 0,
+               "DSPP_MIGRATE_FRAG_BYTES must divide a 4 KiB page exactly");
+
+/* The one family still too large. DSPPFullPagePacket carries consensus
+ * messages (which now transmit only their first 56 bytes -- see
+ * CONSENSUS_WIRE_LEN in net/consensus.c) and the DSPP_PAGE_*_REQ opcodes,
+ * whose page-move plumbing was never built. Deliberately NOT asserted: the
+ * struct is legitimately 4132 bytes and every live sender already sends a
+ * short prefix of it. If DSPP_PAGE_*_REQ is ever implemented it will need
+ * fragmenting like the two families above, and dspp_transmit_raw()'s
+ * runtime guard will say so loudly rather than the frames vanishing. */
+
 uint32_t dspp_resolve_partition_id(uint64_t system_object_id) {
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         if (object_catalog[i].active && object_catalog[i].object_id == system_object_id)
@@ -218,9 +256,17 @@ void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
     pkt.header.stream_size         = 0;
     pkt.header.stream_frames_used  = 0;
     pkt.header.stream_owner_uid    = 0;
-    dspp_memcpy(pkt.page_data, page_data, 4096);
 
-    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+    /* One page, DSPP_MIGRATE_FRAGS_PER_PAGE frames. The slicing lives here
+     * rather than in stream_migrate_send_partition() so that caller keeps
+     * thinking in whole pages -- it reads a page off NVMe and hands it over;
+     * how many frames that takes is the wire's problem, not storage's. */
+    for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++) {
+        pkt.header.frag_index = f;
+        dspp_memcpy(pkt.page_data, page_data + (f * DSPP_MIGRATE_FRAG_BYTES),
+                    DSPP_MIGRATE_FRAG_BYTES);
+        dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+    }
 }
 
 // Sends a DSPP_MIGRATE_BEGIN_ACK/PAGE_ACK back to whoever sent us the
@@ -271,7 +317,8 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
 
     if (h->opcode == DSPP_MIGRATE_PAGE_REQ) {
         if (len < sizeof(struct DSPPMigratePagePacket)) return;  // truncated -- page_data not actually present
-        int rc = stream_migrate_recv_page(h->transfer_id, h->page_index, packet->page_data);
+        int rc = stream_migrate_recv_page(h->transfer_id, h->page_index,
+                                          h->frag_index, packet->page_data);
         dspp_migrate_send_ack(DSPP_MIGRATE_PAGE_ACK, h->node_source_id,
                               h->transfer_id, h->partition_id, h->page_index,
                               (uint8_t)(rc == 0 ? 0 : 1));

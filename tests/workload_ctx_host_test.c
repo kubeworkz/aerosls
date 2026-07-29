@@ -77,6 +77,7 @@ volatile uint64_t kernel_tick_counter = 0;
 
 
 
+
 static int checks_passed = 0;
 static int checks_failed = 0;
 #define CHECK(cond, msg) do { \
@@ -112,8 +113,8 @@ int  stream_migrate_recv_begin(uint64_t t, uint32_t p, const char* n, const char
                                uint64_t s, uint32_t f, uint32_t o) {
     (void)t;(void)p;(void)n;(void)m;(void)s;(void)f;(void)o; return 0;
 }
-int  stream_migrate_recv_page(uint64_t t, uint32_t i, const uint8_t* d) {
-    (void)t;(void)i;(void)d; return 0;
+int  stream_migrate_recv_page(uint64_t t, uint32_t i, uint32_t f, const uint8_t* d) {
+    (void)t;(void)i;(void)f;(void)d; return 0;
 }
 
 static uint32_t g_local_node = 1;
@@ -136,7 +137,23 @@ static uint32_t g_image_size = 0;
 struct ServiceBinary service_binaries[MAX_SERVICE_BINARIES];
 
 /* ─── Packet capture, as in the Phase 3 test ─────────────────────────── */
-#define MAX_FRAMES 64
+/* ─── Capture depth, derived rather than guessed ──────────────────────────
+ * This was `#define MAX_FRAMES 64`, and it broke the moment
+ * DSPP_CTX_CHUNK_BYTES dropped from 4096 to a size that fits an Ethernet
+ * frame: a full checkpoint is ~66 KiB, so the chunk count quadrupled past
+ * 64, e1000_transmit() silently stopped recording beyond that, and
+ * reassembly could never complete. The symptom was four failing assertions
+ * about a context that "did not arrive" -- nothing to do with the receive
+ * path, everything to do with the test's own buffer.
+ *
+ * Derived from the same constants the real chunk_present[] in
+ * kernel/simi_ctx_migrate.c derives its size from, so a future change to
+ * the chunk size or the interpreter's memory cannot silently truncate the
+ * capture again. */
+#define MAX_CKPT_BYTES ((unsigned)(sizeof(struct SimiCkptHeader) \
+                      + SIMI_MAX_FRAMES * sizeof(struct SimiFrame) \
+                      + SIMI_MEM_SIZE))
+#define MAX_FRAMES ((MAX_CKPT_BYTES / DSPP_CTX_CHUNK_BYTES) + 8)
 #define FRAME_CAP  (ETH_HDR_LEN + (sizeof(struct DSPPCtxMigrateChunkPacket) > \
                                    sizeof(struct DSPPMigratePagePacket) \
                                  ? sizeof(struct DSPPCtxMigrateChunkPacket) \

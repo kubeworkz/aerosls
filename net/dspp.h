@@ -214,11 +214,31 @@ struct DSPPMigrateHeader {
     uint64_t stream_size;             // meaningful only for BEGIN_REQ
     uint32_t stream_frames_used;      // meaningful only for BEGIN_REQ
     uint32_t stream_owner_uid;        // meaningful only for BEGIN_REQ
+    uint32_t frag_index;              // which slice of page_index this is (PAGE_REQ/PAGE_ACK)
 } __attribute__((packed));
+
+/* ─── A 4 KiB page does not fit an Ethernet frame, so it goes in slices ───
+ *
+ * This packet used to carry page_data[4096], making it 4273 bytes -- almost
+ * three times the link payload. Every page frame was therefore dropped, and
+ * cross-node stream migration transferred nothing while appearing to start
+ * (the 177-byte BEGIN header fits, so a migration announced itself and then
+ * went quiet).
+ *
+ * 1024 matches DSPP_CTX_CHUNK_BYTES deliberately: two families slicing at
+ * different sizes for no reason is a thing to get wrong later. It divides
+ * 4096 exactly, which is what lets frag_index alone locate a slice -- no
+ * per-fragment length field is needed, unlike the context family, whose
+ * checkpoints are of arbitrary length and so must carry chunk_bytes.
+ *
+ * The resulting packet is 181 + 1024 = 1205 bytes. net/dspp.c static-asserts
+ * both that it fits the link and that the division is exact. */
+#define DSPP_MIGRATE_FRAG_BYTES 1024
+#define DSPP_MIGRATE_FRAGS_PER_PAGE (4096 / DSPP_MIGRATE_FRAG_BYTES)
 
 struct DSPPMigratePagePacket {
     struct DSPPMigrateHeader header;
-    uint8_t                  page_data[4096];
+    uint8_t                  page_data[DSPP_MIGRATE_FRAG_BYTES];
 } __attribute__((packed));
 
 /* ─── Live execution-context migration (PEC Phase 3) ──────────────────
@@ -251,7 +271,24 @@ enum DSPPCtxMigrateOpcode {
     DSPP_MIGRATE_CTX_CHUNK_ACK = 8   // receiver -> sender: chunk stored; status!=0 on the final chunk means the restore failed
 };
 
-#define DSPP_CTX_CHUNK_BYTES 4096
+/* ─── Chunk size: chosen to fit an Ethernet frame, not a memory page ──────
+ *
+ * This was 4096, which made struct DSPPCtxMigrateChunkPacket 4217 bytes --
+ * nearly three times what the link carries, so not one chunk of a live
+ * context ever arrived anywhere. Live context migration appeared to start
+ * (the 121-byte BEGIN header fits) and then moved nothing.
+ *
+ * 4096 was never a requirement. It matched the page size out of habit; a
+ * checkpoint is a flat byte stream and this protocol already carries
+ * chunk_index/total_chunks/chunk_bytes and reassembles on the far side, so
+ * the size is free to be whatever the wire prefers.
+ *
+ * 1024 rather than the 1365 that would just fit (1486 wire payload minus a
+ * 121-byte header): a power of two divides a 4 KiB checkpoint evenly, and
+ * the ~340 bytes of slack means adding a field to the header below cannot
+ * silently push the packet over the limit. The _Static_assert in net/dspp.c
+ * enforces that regardless. */
+#define DSPP_CTX_CHUNK_BYTES 1024
 #define DSPP_CTX_NAME_LEN    64
 
 struct DSPPCtxMigrateHeader {
@@ -460,9 +497,12 @@ void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
                               const char* mime_type, uint64_t size,
                               uint32_t frames_used, uint32_t owner_uid);
 
-/* Sender-side: builds and transmits one DSPP_MIGRATE_PAGE_REQ carrying one
- * 4KiB page. Called once per page by kernel/stream.c's stream_migrate_
- * send_partition(). Fire-and-forget, same as dspp_migrate_send_begin(). */
+/* Sender-side: transmits one 4 KiB page as DSPP_MIGRATE_FRAGS_PER_PAGE
+ * separate DSPP_MIGRATE_PAGE_REQ frames, each carrying
+ * DSPP_MIGRATE_FRAG_BYTES of it and its own frag_index. Called once per
+ * page by kernel/stream.c's stream_migrate_send_partition(); the slicing is
+ * this function's business, so that caller still thinks in whole pages.
+ * Fire-and-forget, same as dspp_migrate_send_begin(). */
 void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
                              uint32_t partition_id, uint32_t page_index,
                              const uint8_t* page_data);

@@ -932,6 +932,90 @@ int main(void) {
         CHECK(last_packet_size + 14 <= 1500, "*** PARTITION_HEARTBEAT fits ***");
     }
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * Scenario 33: A GRANTED VOTE IS ACTUALLY COUNTED.
+     *
+     * ─── The bug ────────────────────────────────────────────────────────
+     * process_consensus_packet() built its VOTE_REPLY like this:
+     *
+     *     reply_msg->term = local_cluster_state.current_term;   // OLD term
+     *     if (msg->term > local_cluster_state.current_term) {
+     *         local_cluster_state.current_term = msg->term;     // now updated
+     *         reply_msg->vote_granted = 1;
+     *
+     * So a node that granted a vote replied carrying the term it held
+     * BEFORE adopting the candidate's. The candidate counts a reply only
+     * when msg->term == its own current_term -- which is the new one. Every
+     * granted vote arrived exactly one term stale and was thrown away.
+     *
+     * Four nodes, every one of them willing to vote, none ever reaching
+     * quorum. Each campaigns, gets three yesses, counts zero, times out,
+     * campaigns again. `cluster status` reads CANDIDATE with a climbing
+     * term and no error anywhere in the log.
+     *
+     * ─── Why every earlier scenario missed it ───────────────────────────
+     * They drive ONE node's handlers with hand-built packets, asserting
+     * that a REQUEST_VOTE produces a reply and that a reply with the right
+     * term is counted. Both halves were individually correct. What no test
+     * did was take the reply one node really emits and feed it to the
+     * candidate that really asked -- the round trip, where the mismatch
+     * lives. That is what this does.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- a vote survives the round trip --\n");
+    {
+        /* Node 2, a follower at term 0, receives node 1's REQUEST_VOTE for
+         * term 1 and replies. We capture what it really sends. */
+        cluster_init(2);
+        cluster_register_peer(1);
+        cluster_register_peer(3);
+        now_ticks = 100000;
+
+        struct DSPPFullPagePacket rv;
+        memset(&rv, 0, sizeof(rv));
+        rv.header.magic  = DSPP_MAGIC;
+        rv.header.opcode = DSPP_CMD_REQUEST_VOTE;
+        {
+            struct ConsensusMessage* m = (struct ConsensusMessage*)rv.payload_4kb;
+            m->term = 1;
+            m->candidate_id = 1;
+        }
+        transmit_call_count = 0;
+        process_consensus_packet(&rv, now_ticks);
+        CHECK(transmit_call_count == 1, "node 2 replied to the vote request");
+
+        /* Keep node 2's real reply bytes before switching identity. */
+        struct DSPPFullPagePacket captured_reply;
+        memset(&captured_reply, 0, sizeof(captured_reply));
+        memcpy(&captured_reply, last_packet, last_packet_size);
+        captured_reply.header.opcode = DSPP_CMD_VOTE_REPLY;
+        {
+            struct ConsensusMessage* rm = (struct ConsensusMessage*)captured_reply.payload_4kb;
+            CHECK(rm->vote_granted == 1, "node 2 granted the vote (term 1 > its term 0)");
+            CHECK(rm->term == 1,
+                  "*** the reply carries the term the vote was cast IN (1), "
+                  "not the voter's pre-update term (0) ***");
+        }
+
+        /* Now become node 1, the candidate that asked, at term 1 -- and feed
+         * it the reply node 2 genuinely produced. */
+        cluster_init(1);
+        cluster_register_peer(2);
+        cluster_register_peer(3);
+        now_ticks = 100100;
+        trigger_kernel_election_campaign(now_ticks);
+        CHECK(local_cluster_state.current_term == 1, "node 1 is campaigning at term 1");
+        CHECK(local_cluster_state.accumulated_votes == 1, "starting from its own vote only");
+
+        process_consensus_packet(&captured_reply, now_ticks);
+        CHECK(local_cluster_state.accumulated_votes == 2,
+              "*** node 2's real reply was COUNTED -- the round trip works ***");
+
+        /* Quorum of 3 nodes is 2, so that vote should have decided it. */
+        CHECK(local_cluster_state.role == ROLE_LEADER,
+              "*** and with quorum reached, node 1 is LEADER -- an election "
+              "actually completes end to end ***");
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }

@@ -129,7 +129,7 @@ Both `frame_pool.c` and `partition.c` compile cleanly under `gcc -Wall -Wextra -
 
 ## 7. Phase 4 — Partition-scoped consensus leases — DONE
 
-**Why this is the largest structural change in this roadmap.** Consensus today has no seam to attach partition-level meaning to. `local_cluster_state` is one global term/role/vote per node; the entire practical effect of losing quorum is a single global flip (`update_page_table_permissions_globally(1)`, `net/consensus.c:32-39`) stripping write access from every SLS object process-wide, all-or-nothing. There is no per-object, per-partition, or per-anything-except-the-whole-node granularity in the Raft-lite implementation as it stands.
+**Why this is the largest structural change in this roadmap.** Consensus today has no seam to attach partition-level meaning to. `local_cluster_state` is one global term/role/vote per node; the entire practical effect of losing quorum is a single global flip (`update_page_table_permissions_globally(1)`, called from `trigger_kernel_election_campaign()` in `net/consensus.c`) stripping write access from every SLS object process-wide, all-or-nothing. There is no per-object, per-partition, or per-anything-except-the-whole-node granularity in the Raft-lite implementation as it stands.
 
 **Scope.**
 - Extend the leadership/term concept from "one role per node" to "one lease per partition per node" — i.e., which node currently holds write-ownership of partition *P*, agreed via the same request-vote/heartbeat message shapes (`ConsensusMessage`) already defined, just scoped to a partition rather than the whole cluster.
@@ -311,7 +311,158 @@ Whole-image link clean (97/97 TUs, 12 remaining undefined symbols all asm/linker
 
 ### What this still does not do
 
-A leader is now elected, and that is a real end-to-end proof the multicast segment carries DSPP both ways — a `REQUEST_VOTE` has to leave one node and a `VOTE_REPLY` come back for it to happen at all. But the leader does not yet *do* anything: there is no log replication, and `dspp_page_write_allowed()` now opens for a lease holder that still has no page-move plumbing behind it. `update_page_table_permissions_globally()` and its per-partition sibling remain stubs in `kernel/stubs.c`, so the split-brain write-strip is still bookkeeping rather than enforcement. Named here so "the cluster elects a leader" is not mistaken for "the cluster replicates."
+> **Correction, written after the next real run.** This section originally opened *"A leader is now elected, and that is a real end-to-end proof the multicast segment carries DSPP both ways."* That was wrong. No leader was elected. The cluster went from `FOLLOWER`/term 0 forever to `CANDIDATE` with a term climbing once per election timeout forever — a different failure wearing more convincing clothes. Two further bugs stood between the wired-up tick and an actual election, and §9c is the account of them. The paragraph is left standing below because the *reasoning* in it was sound: a completed election really would have been proof of a working round trip. The mistake was asserting the conclusion before watching it happen on the four-node cluster.
+
+A leader being elected is a real end-to-end proof the multicast segment carries DSPP both ways — a `REQUEST_VOTE` has to leave one node and a `VOTE_REPLY` come back for it to happen at all. But the leader does not *do* anything yet: there is no log replication, and `dspp_page_write_allowed()` now opens for a lease holder that still has no page-move plumbing behind it. `update_page_table_permissions_globally()` and its per-partition sibling remain stubs in `kernel/stubs.c`, so the split-brain write-strip is still bookkeeping rather than enforcement. Named here so "the cluster elects a leader" is not mistaken for "the cluster replicates."
+
+## 9c. Two more bugs between a wired heartbeat and an actual election
+
+§9b wired the tick and declared victory. The four-node cluster then reported:
+
+```
+role   CANDIDATE
+term   86
+active nodes 4   quorum threshold 3
+```
+
+Correct numbers, no errors, no leader — and a term climbing once per 1.75-second election timeout. Two independent bugs, found in that order.
+
+### Bug 1: the 4 KB DSPP families cannot cross an Ethernet segment
+
+`struct DSPPFullPagePacket` is **4132 bytes**. A `REQUEST_VOTE` transmitted all of it, because `struct ConsensusMessage` (20 bytes) lives in that struct's `payload_4kb` field and every send site passed `sizeof(struct DSPPFullPagePacket)`. With 14 bytes of Ethernet header that is 4146 on a link whose MTU is 1500.
+
+Three independent reasons it cannot work, each sufficient on its own:
+
+| Layer | |
+| --- | --- |
+| TX | 4146 bytes in a single EOP descriptor on a 1500-byte link |
+| RX (MAC) | `net/e1000.c` sets `RCTL = EN\|BAM\|UPE\|MPE`. **LPE — long packet enable, bit 5 — is clear**, so the MAC discards anything over 1522 bytes before a descriptor ever sees it |
+| RX (driver) | `E1000_RX_BUF_SIZE` is 2048 and `e1000_poll_rx()` treats one descriptor as one whole frame — no EOP check, no chaining, no reassembly |
+
+Measured sizes, and what each means:
+
+```
+DSPPPacketHeader             36 B   fits   <- cluster HEARTBEAT, the one that worked
+DSPPServiceHeader           107 B   fits   <- service announce/withdraw
+DSPPCtxMigrateHeader        121 B   fits   <- context migrate BEGIN
+DSPPMigrateHeader           177 B   fits   <- stream migrate BEGIN
+DSPPFullPagePacket         4132 B   DROPPED  <- votes, all PARTITION_*, PAGE_READ/WRITE_REQ
+DSPPCtxMigrateChunkPacket  4217 B   DROPPED  <- the context payload
+DSPPMigratePagePacket      4273 B   DROPPED  <- the stream payload
+```
+
+The blast radius is wider than the election. **Cross-node `partition migrate` has never moved a byte of payload over a real wire, and neither has live context migration.** In both, the BEGIN header fits and every packet after it is dropped — so a migration appears to start and then silently transfers nothing. Phase 7 and PEC Phase 3 were both signed off on this basis.
+
+**Fixed for consensus, unfixed for pages.** Consensus messages have no business being 4 KB: `CONSENSUS_WIRE_LEN` is now `sizeof(DSPPPacketHeader) + sizeof(ConsensusMessage)` = **56 bytes**, at all five send sites, with a `_Static_assert` so a future field addition breaks the build rather than silently resuming undeliverable frames. Receivers needed no change — `dspp_rx_dispatch()` admits anything ≥ 36 bytes and both handlers read only the leading `ConsensusMessage`.
+
+`dspp_transmit_raw()` now refuses anything over `DSPP_MAX_WIRE_PAYLOAD` (1486), counts it in `dspp_tx_oversize_dropped`, and logs it throttled (first occurrence, then every 1000th — it sits under a per-page loop). The counter is surfaced in `/api/cluster` as `dspp_oversize_dropped`, deliberately alongside role and term: *CANDIDATE + climbing term + rising drops* is a different diagnosis from *CANDIDATE + climbing term + zero drops*, and this failure previously presented as neither.
+
+Refusing at the DSPP layer rather than in the driver is the point. `e1000_transmit()` would take the descriptor, return success, and the frame would simply never be seen by anyone.
+
+### Bug 2: every granted vote was discarded on arrival
+
+With frames finally crossing, the cluster still sat at `CANDIDATE`. `process_consensus_packet()` built its reply like this:
+
+```c
+reply_msg->term = local_cluster_state.current_term;      /* the OLD term */
+if (msg->term > local_cluster_state.current_term) {
+    local_cluster_state.current_term = msg->term;        /* now updated */
+    reply_msg->vote_granted = 1;
+```
+
+A node granting a vote replied carrying the term it held **before** adopting the candidate's. The candidate counts a reply only when `msg->term == local_cluster_state.current_term` — the new one. Every granted vote arrived exactly one term stale and was thrown away.
+
+Four nodes, every one voting yes, none ever reaching quorum. Each campaigns, receives three grants, counts zero, times out, campaigns again. One line moved below the branch fixes it. The partition-lease handler had the identical ordering, in the mechanism that actually gates writes.
+
+### Why the test suite could not have caught either
+
+Both failures live in the same blind spot, and it is structural rather than an oversight:
+
+- **Every DSPP host test calls `dspp_rx_dispatch()` with a buffer already in memory.** The wire is the one part the strategy cannot reach. Worse, `cross_node_migration_host_test.c`'s `e1000_transmit()` stub accepted 4287-byte frames without complaint — *more permissive than the hardware it stood in for* — so the oversize assertion didn't merely go untested, it actively passed.
+- **Every consensus scenario drove one node's handlers with hand-built packets.** "A REQUEST_VOTE produces a reply" passed. "A reply with the right term is counted" passed. Both halves were correct in isolation. Nothing took the reply one node *really* emits and fed it to the candidate that *really* asked.
+
+The general lesson, which has now cost this project twice: **a stub that is more permissive than the thing it replaces converts a real failure into a passing test**, and testing two halves of a round trip separately proves nothing about the round trip.
+
+### What was added
+
+| | |
+| --- | --- |
+| `consensus_phase1_host_test.c` | **148 checks** (88 at the start of this work). Scenario 32 asserts every consensus send site fits an Ethernet frame, reading what the site actually passed rather than a constant. Scenario 33 is the full round trip: node 2's real reply bytes, fed to node 1 as the candidate that asked, ending in `ROLE_LEADER`. |
+| `dspp_phase5_host_test.c` | 31 checks. The MTU boundary on both sides — exactly at the limit is accepted, one byte over is refused and counted — plus Scenario 10, which asserts the *broken* state of the 4 KB families so a later fix has to update the record rather than quietly diverge from it. |
+| `cross_node_migration_host_test.c` | Scenario 1 rewritten to the truth: one BEGIN frame reaches the driver, both page packets are refused and counted. The byte-for-byte receive proof is preserved by rebuilding the page frames from node A's real disk. |
+
+**18 mutations, all caught** across the session's two sweeps, including three that survived their first run and are the reason three scenarios exist at all.
+
+### The testability seam, and its hazard
+
+`dspp_max_wire_payload` is a variable, not a constant. No kernel code assigns to it. It exists so `simi_ctx_migrate_host_test.c` and `workload_ctx_host_test.c` — which test chunk reassembly, ordering, duplicate rejection and migration *orchestration*, all link-independent — can keep their coverage instead of being deleted or rewritten to hand-build every packet.
+
+This project has already learned once that an override added for testability can remove the property it was added around, so it is written down in three places: the two files that use it say plainly that passing is **not** evidence a context crosses a real wire, and both name the tests that assert the link limit and never touch the variable.
+
+### Closed by fragmentation — §9d
+
+## 9d. Fragmentation: every DSPP family now fits an Ethernet frame
+
+§9c left the two 4 KB families undeliverable and named the choice: jumbo frames or protocol-level fragmentation. Fragmentation won, and the reasoning is worth keeping because the obvious industry answer pointed the other way.
+
+### Why the usual case against fragmentation does not apply here
+
+The standard argument — one IP header per fragment, router-mediated reassembly, CPU cost, DF-bit black-holing, one lost fragment discarding the chain — is about **IP** fragmentation. DSPP has no IP layer at all; §0 of `docs/AeroSLS-Multi-NIC-Plan-v0.1.md` establishes that it is pure L2 with zero references to IP anywhere in `net/dspp.c`. So:
+
+- A fragment carries the same 121–181 byte DSPP header it already carried, not an added IP header.
+- There are no routers. It is one broadcast segment.
+- Reassembly happens in this kernel, where it can be tested.
+- Nothing sets a DF bit, so nothing black-holes.
+
+And the decisive fact: **half the work already existed.** `DSPP_CTX_CHUNK_BYTES` was a single constant. Context migration already carried `chunk_index`, `total_chunks` and `chunk_bytes`, with a reassembly buffer, a presence bitmap, duplicate rejection, out-of-order tolerance and short-final-chunk validation — 78 tests behind it. The chunk size had simply been set to 4096 to match a memory page, for no reason the protocol required.
+
+The case *for* jumbo also weakened on inspection. It is not a flag flip: `DSPPMigratePagePacket` was 4273 bytes, so 4096-byte RX buffers do not fit it either — it needs `BSEX` and 8192, quadrupling RX buffer memory. And the cluster segment is `-netdev socket,mcast=`, which wraps Ethernet frames in UDP; an oversized frame becomes a datagram the **host kernel** IP-fragments. Jumbo would not have eliminated fragmentation, only moved it somewhere unmeasurable, and made the design depend on host behaviour the moment nodes span two machines.
+
+### What changed
+
+| | |
+| --- | --- |
+| `DSPP_CTX_CHUNK_BYTES` | 4096 → **1024**. One constant. Chunk packet 4217 → 1145 bytes. |
+| `DSPP_MIGRATE_FRAG_BYTES` | **new, 1024**. `DSPPMigratePagePacket` carries a slice, not a page: 4273 → 1205 bytes. |
+| `DSPPMigrateHeader` | gains `frag_index` in its stream-specific **tail**, so the prefix contract with `DSPPCtxMigrateHeader` is untouched. 177 → 181 bytes. |
+| `dspp_migrate_send_page()` | emits `DSPP_MIGRATE_FRAGS_PER_PAGE` frames. The slicing lives here so `stream_migrate_send_partition()` still thinks in whole pages. |
+| `stream_migrate_recv_page()` | takes a fragment. Stages into the inflight row with a presence bitmap; writes the page to NVMe only when all fragments are present. |
+
+1024 for both, deliberately: two families slicing at different sizes for no reason is a thing to get wrong later. It divides 4096 exactly, which is what lets `frag_index` alone locate a slice — no per-fragment length field, unlike the context family whose checkpoints are of arbitrary length.
+
+**Staging in RAM rather than read-modify-writing the destination LBA per fragment.** RMW needs no state and tolerates any arrival order, but costs a read and a write per fragment and would leave a genuinely half-written 4 KiB block on disk if a fragment were lost. A page that is either fully written or not written at all is the better failure mode for storage. Disk cost is unchanged: still one write and one verify read per page.
+
+### Compile-time enforcement, because runtime silence was the original bug
+
+`net/dspp.c` now static-asserts that **every** packet family fits `DSPP_MAX_WIRE_PAYLOAD`, plus that the fragment size divides a page exactly. Anything added to a header, or any chunk size raised for throughput, now breaks the build rather than the cluster.
+
+`DSPPFullPagePacket` is deliberately **not** asserted and remains 4132 bytes. Every live sender transmits only its 56-byte prefix; the unused tail exists because `ConsensusMessage` had to live somewhere. If `DSPP_PAGE_*_REQ` is ever implemented it will need fragmenting too, and `dspp_transmit_raw()`'s runtime guard will say so.
+
+### The test-only MTU seam is gone
+
+§9c introduced `dspp_max_wire_payload` as a variable so two tests exercising layers above the link could keep their coverage. With every family fitting, nothing needs to raise it — both `raise_link_limit_*()` helpers are deleted. The variable remains (the runtime guard reads it) but has no writer anywhere, tests included. A seam that stops being needed and stays anyway is how the next person concludes the limit is negotiable.
+
+### Verification
+
+**Full suite 80/80.** `cross_node_migration_host_test.c` **73 checks**, and it is a genuine end-to-end wire test again: Scenario 1 replays real captured fragment frames rather than the hand-rebuilt substitutes §9c needed, and asserts on the length of every frame handed to the driver, not on a struct size.
+
+**6 of 6 mutations caught**, two only after the sweep found them surviving:
+
+- *Duplicate fragments double-counted* survived everything. Nothing checked that a duplicate cannot stand in for a missing fragment — which would write a page with a hole in it.
+- *Staging not retired after a page completes* survived even its first purpose-built check. The check asserted "page 1 is absent", which was true either way; the bug's real effect is that the **transfer** retires early, so a legitimately-sent page 1 is later rejected as belonging to an unknown transfer. Asserting that page 1 still lands is what catches it.
+
+That second one is the sharper lesson: an assertion about something *not* happening often holds for reasons unrelated to the property under test. The useful assertion was that the system still works, not that the damage is absent.
+
+### Two coupled constants this shook loose
+
+- `tests/simi_ctx_migrate_host_test.c` and `tests/workload_ctx_host_test.c` both had `#define MAX_FRAMES 64`. A checkpoint is ~66 KiB, so quartering the chunk size pushed the count past 64, `e1000_transmit()` silently stopped recording, and reassembly could never complete — presenting as four failures about a context that "did not arrive", nothing to do with the receive path. Both are now derived from `SIMI_MAX_FRAMES`/`SIMI_MEM_SIZE`/`DSPP_CTX_CHUNK_BYTES`, the same discipline the real `chunk_present[]` in `kernel/simi_ctx_migrate.c` already used.
+- An ACK assertion indexed `acks_before + 2` to mean "the second page's ACK". With four frames per page, index 2 is page 0's second fragment. Now derived from the frame count.
+
+### Still open
+
+`partition migrate` can now move data across nodes on a standard segment. What remains from §9b is unchanged: the elected leader does no log replication, and `update_page_table_permissions_globally()` and its per-partition sibling are still stubs in `kernel/stubs.c`, so the split-brain write-strip remains bookkeeping rather than enforcement.
+
+There is also no retransmission. This protocol is fire-and-forget by design, so a dropped fragment leaves a page unwritten and a transfer incomplete — detected and logged, never silently completed. Adding reliability is a separate decision from making frames fit, and is not attempted here.
 
 ## 10. Live/hot migration — deferred, not scoped
 

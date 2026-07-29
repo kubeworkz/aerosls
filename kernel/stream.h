@@ -135,8 +135,20 @@ int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
 // transfer_id is unknown (no matching stream_migrate_recv_begin() call), if
 // page_index is out of range for that slot's frames_used, or on any NVMe
 // read/write/verify failure.
+//
+// Takes ONE FRAGMENT, not a whole page. A 4 KiB page does not fit an
+// Ethernet frame, so it arrives as DSPP_MIGRATE_FRAGS_PER_PAGE frames
+// (net/dspp.h); fragments are staged in the inflight row and the page is
+// written to NVMe only once all of them are present. So most calls do no
+// disk I/O at all and return 0 having simply banked a fragment -- a return
+// of 0 means "accepted", not "the page is now durable".
+//
+// Duplicate fragments are idempotent and are not double-counted. Fragments
+// of one page may arrive in any order. A fragment for a NEW page while the
+// current one is incomplete abandons the incomplete page with a log line,
+// rather than writing a partially-filled 4 KiB block to disk.
 int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
-                              const uint8_t* page_data);
+                              uint32_t frag_index, const uint8_t* frag_data);
 
 extern struct StreamEntry stream_store[STREAM_MAX];
 
