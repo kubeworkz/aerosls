@@ -693,6 +693,24 @@ Real resource and execution isolation within one kernel — a `partition_id` tag
 | `partition connquotas`                                       | List per-partition connection usage/quota                                                                                |
 | `partition migrate <partition_id> <dest_node_id>`             | Cold-migrate a partition's ownership (and, for stream/blob data, the actual bytes) to another cluster node — pauses, hands off the lease, moves stream data over the real DSPP wire protocol if `cluster init` has been run on this boot (same-disk relocate otherwise), reclaims frames, leaves the partition **paused** on success |
 
+### Two rules that are not guessable, and cost real time when missed
+
+**A stream's partition is stamped when the stream is created, and never changes.** `stream_create()` calls `partition_get_for_uid(caller_uid)` once and stores the result. `partition assign` is **not retroactive** — reassigning a uid moves nothing that already exists. So the order is fixed:
+
+```
+partition create   ->   partition assign <uid> <id>   ->   create the stream
+```
+
+Get that backwards and the stream sits in whatever partition the uid mapped to at the time (partition 0 by default), while the partition you meant to fill stays empty. `partition migrate` then succeeds having moved nothing, and reports `0 stream(s)`. Check with `GET /api/streams` and compare each stream's `partition_id` against the partition you intend to migrate — that field is the authority, not the most recent `partition assign`.
+
+**`partition migrate` needs the owner node, so look before you migrate.** It refuses a destination that already owns the partition, and only the owning node holds data to send. `partition list` and `GET /api/partitions` both report `owner_node` (they did not until this was added — the value used to be discoverable only by attempting a migration and reading the error):
+
+```bash
+tools/aeroslsctl --host localhost:3001 partitions        # id, owner_node, name, ...
+tools/aeroslsctl --host localhost:3001 shell "partition list"
+```
+
+Partition 0 (`system`) can never be migrated — `PARTITION_SYSTEM can never be migrated` is a hard refusal, not a quota.
 
 ---
 

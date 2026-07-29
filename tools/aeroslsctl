@@ -295,9 +295,13 @@ def cmd_mesh(args):
 
 def cmd_partitions(args):
     d = _request(args, "GET", "/api/partitions")
+    # owner_node is second, right after the id: it is the field that decides
+    # whether `partition migrate` can proceed, and it had no read surface at
+    # all until it was added here and to `partition list`. Putting it at the
+    # far right of a five-column table would have kept it effectively hidden.
     return _emit(args, d, lambda: _table(d.get("partitions") or [],
-                                         ["id", "name", "state", "frame_usage",
-                                          "frame_quota"]))
+                                         ["id", "owner_node", "name", "state",
+                                          "frame_usage", "frame_quota"]))
 
 
 def cmd_reconcile(args):

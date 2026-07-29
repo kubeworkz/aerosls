@@ -516,16 +516,33 @@ uint64_t sys_sls_partition_assign(struct SLSPartitionAssignRequest* req) {
 }
 
 void sys_sls_partition_list(void) {
+    /* ─── The owner node is shown, and used not to be ─────────────────────
+     * partition_migrate() refuses when the destination already owns the
+     * partition, and only the owning node holds the data to send. So the
+     * owner is the single field that decides whether a migration can
+     * proceed -- and it had no read surface anywhere: not here, not in
+     * /api/partitions (quotas only), not in /api/nodes (a count, not a
+     * mapping). The only way to learn it was to attempt a migration and
+     * read the error, which cost real operator time more than once.
+     *
+     * "this node" is marked explicitly rather than left to be inferred from
+     * a bare id, because that comparison is exactly what a reader gets
+     * wrong when several nodes are open in different terminals. */
+    uint32_t me = cluster_local_node_id();
     kernel_serial_print("\n[PARTITION] Defined partitions:\n");
     int shown = 0;
     for (int i = 0; i < PARTITION_MAX; i++) {
         if (!partition_table[i].active) continue;
-        kernel_serial_printf("  id=%-3u  name=%s\n",
+        uint32_t owner = partition_get_owner_node(partition_table[i].partition_id);
+        kernel_serial_printf("  id=%-3u  owner=node %-3u%s  name=%s\n",
                              (unsigned)partition_table[i].partition_id,
+                             (unsigned)owner,
+                             owner == me ? " (this node)" : "           ",
                              partition_table[i].name);
         shown++;
     }
-    kernel_serial_printf(" %u partition(s) total.\n\n", (unsigned)shown);
+    kernel_serial_printf(" %u partition(s) total. This node is node %u.\n\n",
+                         (unsigned)shown, (unsigned)me);
 
     kernel_serial_print("[PARTITION] UID assignments:\n");
     int nassign = 0;

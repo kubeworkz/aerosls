@@ -2073,6 +2073,14 @@ static int api_partitions_list(char* buf, int max) {
         jb_obj_open(&j, 0);
         jb_uint(&j, "id", partition_table[i].partition_id); jb_putc(&j, ',');
         jb_str(&j, "name", partition_table[i].name); jb_putc(&j, ',');
+        /* The owner node, which nothing exposed before. partition_migrate()
+         * refuses a destination that already owns the partition, and only the
+         * owner holds the data to send -- so this is the field that decides
+         * whether a migration is possible, and it was discoverable only by
+         * attempting one and reading the error. See the same addition to
+         * `partition list` in kernel/partition.c. */
+        jb_uint(&j, "owner_node", partition_get_owner_node(partition_table[i].partition_id));
+        jb_putc(&j, ',');
         jb_uint(&j, "frame_usage", (uint32_t)partition_get_frame_usage(i)); jb_putc(&j, ',');
         uint64_t quota = partition_get_frame_quota(i);
         jb_uint(&j, "frame_quota", (uint32_t)quota); jb_putc(&j, ',');
