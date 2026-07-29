@@ -54,7 +54,7 @@
 > can only come from something outside — the dev server, which currently
 > executes no host processes at all.
 >
-> Adding that is possible (`run-two-nodes.sh` already has a working QEMU
+> Adding that is possible (`run-cluster.sh` already has a working QEMU
 > recipe) but it is a different class of capability, and it must not sit
 > behind the current auth. `DEMO_TOKEN` in `src/lib/apiFetch.ts` is a
 > hardcoded constant in **client-side** code — it ships in the browser

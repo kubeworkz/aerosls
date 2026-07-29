@@ -8,7 +8,7 @@ Beyond the original single-level-storage object model (catalog, records, streams
 
 - **Multi-tenancy** — a `partition_id` tag enforced at catalog access, process spawn, IPC ports, scheduling, and frame/storage/connection quotas, plus a `tenant create` operation that atomically provisions a partition + a database namespace together. `database`/`group`/`authlist` commands add grantable, RBAC-scoped namespaces and reusable object-permission bundles on top.
 - **Resource isolation** — per-partition RAM frame quotas, weighted CPU scheduling, on-disk storage quotas (with a real, physically-reserved per-partition disk sub-range underneath), and per-partition concurrent-connection quotas (distinct from request-rate limiting).
-- **Real cross-node data movement** — a genuine DSPP wire protocol with Ethernet framing and a receive-side dispatcher (`net/dspp.c`) moves stream/blob data between real, networked kernel instances, not just between local disk slots. `run-two-nodes.sh` (repo root) boots two real QEMU instances pre-wired to test this.
+- **Real cross-node data movement** — a genuine DSPP wire protocol with Ethernet framing and a receive-side dispatcher (`net/dspp.c`) moves stream/blob data between real, networked kernel instances, not just between local disk slots. `run-cluster.sh` (repo root) boots an N-node cluster pre-wired to test this.
 
 The full shell-command and REST-API reference — including every route mentioned above — lives in **[`docs/COMMANDS.md`](docs/COMMANDS.md)**; this README stays focused on getting a single instance built, booted, and reachable.
 
@@ -158,7 +158,8 @@ A single instance is single-node by default — `cluster init` (see `docs/COMMAN
 
 ```bash
 ./run-cluster.sh --nodes 4     # N nodes, 1..8
-./run-two-nodes.sh             # the older two-node script
+./run-cluster.sh --nodes auto  # as many as this host holds
+./run-cluster.sh --stop        # tear it down
 ```
 
 This builds the ISO once, boots two QEMU instances with separate disk images and their e1000 NICs connected directly to each other, and prints the exact `cluster init <id>` commands to run in each console. It works headless — no display required. Each node's console is a loopback socket you attach from another terminal:

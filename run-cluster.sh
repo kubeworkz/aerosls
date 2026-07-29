@@ -92,7 +92,6 @@ usage: run-cluster.sh [options]
   --smp N       vCPUs per node (default $SMP)
   --dry-run     print the plan and each node's QEMU argv; build and launch nothing
   --stop        stop a cluster started earlier, then exit
-  --force       proceed past a capacity refusal
   -h, --help    this
 
 environment: AEROSLS_MCAST, AEROSLS_MCAST_PORT, AEROSLS_CON_BASE,
@@ -138,6 +137,10 @@ if [ "$DO_STOP" -eq 1 ]; then
     echo "==> stopped $stopped, already gone $gone."
     exit 0
 fi
+
+# A hard prerequisite, checked before anything is computed: a capacity
+# report is not useful to someone who cannot launch anything.
+command -v "$QEMU" >/dev/null 2>&1 || { echo "error: $QEMU not found." >&2; exit 1; }
 
 # ─── Host capacity ─────────────────────────────────────────────────────
 # Every figure below is DETECTED, and every one can be overridden -- both
@@ -309,8 +312,6 @@ if [ "$NODES_GIVEN" -eq 1 ] && [ "$NODES" -gt "$CAPACITY" ] && [ "$FORCE" -eq 0 
     echo "       Lower --nodes or --ram, or pass --force to try anyway." >&2
     exit 1
 fi
-
-command -v "$QEMU" >/dev/null 2>&1 || { echo "error: $QEMU not found." >&2; exit 1; }
 
 if [ -f "$PID_FILE" ]; then
     live=0

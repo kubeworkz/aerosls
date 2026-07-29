@@ -2,7 +2,7 @@
 
 **Goal.** Replace `run-two-nodes.sh` with `run-cluster.sh`, taking a node count and a per-node size, detecting the host's capacity, and refusing or right-sizing rather than thrashing the machine.
 
-**Status.** Phases 1–4 built, plus §0's blocker now **fully closed** — a networked node has a working console. Only Phase 5 (retiring `run-two-nodes.sh`) remains. §0's blocker is now half-closed — a node can be *told* who it is at boot, but still has no interactive console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
+**Status.** **Complete.** All five phases built, and §0's blocker fully closed — a networked node self-identifies at boot and has a working console. Every constraint in §1 was read out of the tree, with file and line, rather than assumed.
 
 ---
 
@@ -33,7 +33,7 @@
 
 This has to come first, because building a launcher for N undrivable nodes would be wasted work.
 
-`kernel/kernel.c:372`:
+`kernel.c`'s final dispatch:
 
 ```c
 if (e1000_mmio_base) {
@@ -49,7 +49,7 @@ Cross that with the other two facts already established:
 
 | Way in | Status |
 | ------ | ------ |
-| QEMU graphics window | No PS/2 driver anywhere; `read_line()` polls `inb(SERIAL_COM1_BASE)` (`kernel/kernel_io.c:187`). A window renders VGA and accepts nothing. |
+| QEMU graphics window | No PS/2 driver anywhere; `read_line()` polls `inb(SERIAL_COM1_BASE)` (`read_line()` in `kernel/kernel_io.c`). A window renders VGA and accepts nothing. |
 | Serial console | ~~No prompt, because `sls_shell_loop()` is never called.~~ **Fixed** — `http_server_run()` polls `serial_console_poll()` each sweep and runs the same dispatch against the same session. |
 | HTTP / `aeroslsctl` | No host port forward, and can't have one: `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so a second NIC sits dead on the bus. |
 
@@ -175,7 +175,7 @@ Assume 4 cores, ~15 GB available, 109 GB free (from the `xorriso` output in the 
 | **2** | ✅ **DONE** — `-netdev socket,mcast=239.192.152.40:12340` on every node; self-echo guard in `net_rx_dispatch()` | `tests/net_self_echo_host_test.c` 14 checks, 5/5 mutations caught; harness 24 checks. Link clean, 79/79 suite green |
 | **3** | ✅ **DONE** — `run-cluster.sh`: N nodes, per-node ISO carrying `node=<i>`, port allocation, one-pass liveness, `--stop`, `--dry-run` | `tests/run_cluster_harness.sh` 43 checks, 5/5 mutations caught |
 | **4** | ✅ **DONE** — capacity detection, `--nodes auto`, per-resource bounds with the binding one named | Harness scenarios 8/8b/9, 22 checks, faked `/proc/meminfo`; 65 total, mutations caught |
-| **5** | Retire `run-two-nodes.sh` as `run-cluster.sh --nodes 2`; update `COMMANDS.md`, `README.md`, roadmap | Full doc pass |
+| **5** | ✅ **DONE** — `run-two-nodes.sh` and its harness removed, their unique checks ported into `run_cluster_harness.sh` first; every reference repointed | 75 harness checks; doc pass verified against the code |
 | **6** *(optional)* | §0c multiplex the serial console into the HTTP loop | Interactive shell on a networked node |
 
 Phases 3 and 4 are testable **without a multi-node machine at all**, using the stub-QEMU approach: the sizing arithmetic and the argv construction are pure functions of detected inputs, and faking those inputs is trivial. That matters, since the sandbox has no QEMU.
@@ -185,6 +185,14 @@ Phases 3 and 4 are testable **without a multi-node machine at all**, using the s
 **A file that was never in the build.** `kernel/boot_params.c` shipped in Phase 1 without being added to `X86_C_SRC`, so `make x86-iso` would have failed on an undefined `boot_params_scan_mb2()`. Everything that was supposed to catch that looked elsewhere: it compiled clean standalone, its host test passed 49 checks, and the whole-image link check passed — because that check **globs the tree** for `.c` files rather than reading the Makefile. It happily linked a file the real build would never compile.
 
 The durable fix is `tests/makefile_sources_check.sh`, whose only job is comparing those two lists, with an explicit exclusion table so "we meant to leave that out" has to say why. It was verified by removing the entry again and watching it fail. The whole-image link check now also takes its file list *from the Makefile* rather than from a glob.
+
+### What Phase 5 turned up
+
+**Retiring a script must not retire its tests.** `run_two_nodes_harness.sh` held three checks with no equivalent in the cluster harness: the `AEROSLS_DISPLAY` override, the shared-segment port that must *not* be treated as a clash, and the gtk-failure path — the actual failure originally reported from the server. Those moved first, as scenario 10, and only then were the two files removed. Deleting them together would have quietly dropped coverage of the one bug this whole effort started from.
+
+**Line-number citations rot, and they rotted here.** `kernel/kernel.c:372` and `kernel/kernel_io.c:187` were both wrong by the end of the session — the files had grown by 28 and 18 lines under my own edits. Both now cite the function instead, which does not move. A sweep re-verified all 26 remaining `file:line` citations across the docs; the rest still resolve.
+
+**A status line that contradicted itself.** The plan's header simultaneously claimed "only Phase 5 remains" and "§0's blocker is now half-closed", the second being leftover text from two edits earlier. Worth noting because it is the failure mode of incremental doc updates: new text lands, old text survives beside it, and both look authored.
 
 ### What Phase 4 turned up
 

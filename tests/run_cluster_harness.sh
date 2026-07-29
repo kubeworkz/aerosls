@@ -379,6 +379,47 @@ OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_MEM_MB=64000 \
       AEROSLS_HOST_DISK_MB=109000 timeout 20 ./run-cluster.sh --nodes 1 --ram 2G --dry-run 2>&1)"
 check "$(has '2048 MiB / 1 vCPU' "$OUT")" "2G is read as 2048 MiB"
 
+# ═══ 10: inherited from run_two_nodes_harness.sh ═════════════════════════
+# That harness is retired (run-two-nodes.sh with it), so its checks that
+# had no equivalent here move rather than disappear. Retiring a script by
+# dropping its tests is how a regression gets in quietly.
+echo
+echo "-- 10: carried over from the retired two-node harness --"
+
+# The failure originally reported from the server: gtk forced on a host
+# with no display. Scenario 5 covers partial failure via STUB_FAIL_NODE;
+# this covers the real-world cause, where EVERY node dies of the same thing.
+OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_DISPLAY=gtk \
+      timeout 25 ./run-cluster.sh --nodes 3 2>&1)"; RC=$?
+check "$(has 'gtk initialization failed' "$OUT")"       "*** the originally reported failure: QEMU's own stderr is surfaced ***"
+check "$(has '3 of 3 node' "$OUT")"       "*** ...and ALL three are reported, not just the first ***"
+check "$(hasnt 'nodes up and confirmed running' "$OUT")" "success is not claimed"
+check "$([ "$RC" -ne 0 ] && echo yes || echo no)" "exits non-zero"
+
+# An explicit backend beats autodetection, even where one would be found.
+OUT="$(cd "$T" && DISPLAY=:0 AEROSLS_DISPLAY=none timeout 20 \
+      ./run-cluster.sh --nodes 2 --dry-run 2>&1)"
+check "$(has 'display          none' "$OUT")"       "AEROSLS_DISPLAY overrides autodetection even when DISPLAY is set"
+
+# The segment port is bound by EVERY node on purpose -- that shared bind is
+# the segment. Treating it as a clash would refuse a launch that is working
+# exactly as designed.
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import socket,time
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('',12340)); time.sleep(8)" 2>/dev/null &
+    HOLDER=$!
+    sleep 1
+    launch_bg 2 --nodes 2
+    OUT="$(cat "$T/launch.out")"
+    kill "$HOLDER" 2>/dev/null || true
+    check "$(hasnt 'already in use' "$OUT")"           "*** something already on the segment port does NOT block a launch ***"
+    check "$(has '2 nodes up and confirmed running' "$OUT")" "...the cluster forms"
+    run timeout 20 ./run-cluster.sh --stop >/dev/null; launch_wait_exit
+fi
+
 echo
 echo "=========================================="
 echo "passed=$passed failed=$failed"

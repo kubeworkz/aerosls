@@ -78,7 +78,7 @@ It reports the host's capacity on every run and names the binding constraint:
 
 An explicit `--nodes` over capacity is **refused, not clamped** (`--force` overrides). Exceeding `CLUSTER_NODE_MAX` is refused separately and cannot be forced — that is a protocol limit, not this host's.
 
-Supersedes `run-two-nodes.sh`, which its point-to-point netdev capped at exactly two. Nodes are numbered 1..N and **self-identify at boot** — no `cluster init` step — because each gets its own ISO carrying `node=<i>` on the kernel command line.
+Replaces the retired `run-two-nodes.sh`, which its point-to-point netdev capped at exactly two. Nodes are numbered 1..N and **self-identify at boot** — no `cluster init` step — because each gets its own ISO carrying `node=<i>` on the kernel command line.
 
 | | |
 | --- | --- |
@@ -98,21 +98,21 @@ Consoles are interactive: attach and you get a shell prompt. Look for `[BOOT] no
 **Topology note.** Nodes now share one L2 segment (`-netdev socket,mcast=`) instead of a point-to-point `listen`/`connect` pair, so the cluster is no longer capped at two. QEMU forces multicast loopback on for that mode, so each node also receives its own frames; `net_rx_dispatch()` drops them by source MAC and counts them in `net_self_echo_dropped`. A steady non-zero count is normal and healthy — a flat zero means the node is not actually on the segment with the others.
 
 
-`aeroslsctl` works against a single node under `make x86-run` (host 3001 → guest 3000). It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate.
+`aeroslsctl` works against a single node under `make x86-run` (host 3001 → guest 3000). It **cannot** reach either node launched by `run-cluster.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate.
 
 **Resolved (was: a live blocker).** A networked node now has a working console — `http_server_run()` polls the serial port between sweeps and runs the same shell dispatch, against the same session, that the physical console uses. Attach with `telnet 127.0.0.1 <port>` and you get a prompt. The analysis below explains why this needed building at all.
 
 **Original note.** An earlier revision of this section said to drive the two-node walkthrough from each node's serial console. That is wrong, and the reason is worth stating because it affects any networked boot:
 
 ```c
-/* kernel/kernel.c:372 */
+/* kernel.c's final dispatch */
 if (e1000_mmio_base) {
     http_server_run();  // does not return — serves REST API on port 3000
 }
 sls_shell_loop();       // only reached when there is NO NIC
 ```
 
-**`sls_shell_loop()` is never called on a node that has a NIC** — which is why the console had to be driven from the HTTP loop instead. `run-two-nodes.sh` gives every node an e1000 — that is the whole point of it — so the console shows boot output and then no prompt, ever. Combined with the single-NIC driver (no host port forward possible) and the absence of a keyboard driver, **those nodes currently have no control path at all**, and the two-node walkthrough has never been executable.
+**`sls_shell_loop()` is never called on a node that has a NIC** — which is why the console had to be driven from the HTTP loop instead. `run-cluster.sh` gives every node an e1000 — that is the whole point of it — so the console shows boot output and then no prompt, ever. Combined with the single-NIC driver (no host port forward possible) and the absence of a keyboard driver, **those nodes currently have no control path at all**, and the two-node walkthrough has never been executable.
 
 The consoles are still worth attaching to read boot output:
 
@@ -131,7 +131,7 @@ The fix is nodes that self-identify at boot rather than being told to over a con
 
 Connect at 38400 baud on COM1. The prompt shows `uid:<id>[tx:<n>]>`  when a transaction is open, otherwise `uid:<id>>` .
 
-**This shell is serial-only.** `read_line()` (`kernel/kernel_io.c`) polls `inb(SERIAL_COM1_BASE)` and there is no PS/2 keyboard driver in the tree, so a QEMU graphics window renders VGA output but cannot accept a keystroke. Under QEMU the console must therefore be something you can *write* to — `-serial mon:stdio`, or a socket chardev as `run-two-nodes.sh` uses. `-serial file:` is output-only and gives you no way in.
+**This shell is serial-only.** `read_line()` (`kernel/kernel_io.c`) polls `inb(SERIAL_COM1_BASE)` and there is no PS/2 keyboard driver in the tree, so a QEMU graphics window renders VGA output but cannot accept a keystroke. Under QEMU the console must therefore be something you can *write* to — `-serial mon:stdio`, or a socket chardev as `run-cluster.sh` uses. `-serial file:` is output-only and gives you no way in.
 
 ```
 uid:0> help
@@ -663,7 +663,7 @@ Real resource and execution isolation within one kernel — a `partition_id` tag
 
 ### Cluster / Cross-Node Identity (Multi-Node Partition Scaling Roadmap Phase 7 addendum)
 
-Sets this boot's real node identity for distributed operation — required before `partition migrate` will take the real cross-node wire path instead of the default same-disk relocate path. Not reachable over the REST API today (shell/syscall only) — see `run-two-nodes.sh` at the repo root for a script that boots two real, networked instances to test this for real.
+Sets this boot's real node identity for distributed operation — required before `partition migrate` will take the real cross-node wire path instead of the default same-disk relocate path. Not reachable over the REST API today (shell/syscall only) — see `run-cluster.sh` at the repo root for a script that boots real, networked instances to test this for real.
 
 
 | Command                    | Description                                                                                       |
@@ -685,7 +685,7 @@ Served by **any** node — every node holds the roster and the replicated servic
 | `POST /api/cluster/init` | `{"node_id":N}` — set this node's identity. DB_ADMIN |
 | `POST /api/cluster/peer` | `{"node_id":N}` — register a peer into the roster. DB_ADMIN |
 
-**These FORM a cluster; they do not boot one.** A kernel cannot start another kernel, and the dev server deliberately executes no host processes. Start each node yourself (`run-two-nodes.sh`), then join them from the Cluster panel or these endpoints.
+**These FORM a cluster; they do not boot one.** A kernel cannot start another kernel, and the dev server deliberately executes no host processes. Start each node yourself (`run-cluster.sh`), then join them from the Cluster panel or these endpoints.
 
 **`cluster/init` is a reset, not a merge.** It clears this node's term, role and roster (`consensus.h`), so calling it on a node already in a working cluster drops it out of that cluster. `cluster/peer` reports its outcome in `detail` — "added", "already a member (no-op)", "re-activated", "invalid node id", "roster full" — because re-registering an existing peer is a successful no-op, not a failure.
 
@@ -1063,7 +1063,7 @@ curl -X POST localhost:3001/api/shell/exec -H "Authorization: Bearer $TOK" \
      -d '{"command":"partition migrate 1 2"}'
 ```
 
-`cluster init` additionally has its own typed route, `POST /api/cluster/init`. See `run-two-nodes.sh` at the repo root for booting the nodes themselves — that part is still not something the kernel can do for you.
+`cluster init` additionally has its own typed route, `POST /api/cluster/init`. See `run-cluster.sh` at the repo root for booting the nodes themselves — that part is still not something the kernel can do for you.
 
 #### Tenants
 
@@ -1150,7 +1150,7 @@ Run from the repository root.
 | ---------------- | ----------------------------------------------------------------- |
 | `make x86-iso`   | Compile kernel + link + generate UEFI/BIOS bootable ISO           |
 | `make x86-run`   | Build ISO and boot in QEMU with display (interactive)             |
-| `./run-two-nodes.sh` | Build the ISO once, then boot **two** real QEMU instances with their e1000 NICs socket-connected directly to each other (no bridge/tap needed) — for testing real cross-node data movement (Multi-Node Partition Scaling Roadmap Phase 7), see `cluster init`/`cluster status` above. Prints the exact commands to run in each instance's console. |
+| `./run-cluster.sh --nodes N` | Build one ISO per node, then boot **N** real QEMU instances on a shared multicast L2 segment — for testing real cross-node data movement (Multi-Node Partition Scaling Roadmap Phase 7). Each node self-identifies from `node=<i>` on its kernel command line, so no `cluster init` is needed. `--nodes auto` sizes to the host; `--stop` tears it down. Replaces the retired `run-two-nodes.sh`. |
 | `make bundle`    | Rebuild `slsos-sim` UI and regenerate `kernel/webapp_bundle.c`    |
 | `make riscv-elf` | Compile RISC-V kernel ELF                                         |
 | `make riscv-run` | Build RISC-V ELF and boot in QEMU virt                            |
