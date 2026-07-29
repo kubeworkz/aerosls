@@ -526,6 +526,68 @@ Full suite **80/80**; whole-image link 97/97 with the 12 asm/linker-provided und
 
 No BEGIN retry (above). No reordering tolerance beyond what the fragment bitmap gives. And the budget is fixed rather than adaptive — a link with real latency would want the timeout derived from observed round-trip times rather than a constant, which is a measurement problem this has no instrumentation for yet.
 
+## 9f. Split brain: a broadcast vote counted by everyone
+
+§9c fixed vote *counting* and the cluster stopped reporting CANDIDATE forever. It reported FOLLOWER instead — and the term went from **48 to 553 between two consecutive `cluster status` calls**. Hundreds of elections a minute.
+
+Node 1 was FOLLOWER, so it was not campaigning; it was *adopting* terms from others. Something else was campaigning continuously.
+
+### Bug 1: a vote reply named no candidate
+
+DSPP is pure L2 broadcast — there is no node-to-MAC table, so every frame reaches every node (`dspp_transmit_raw()`). A `VOTE_REPLY` therefore arrives at **every** candidate, not just the one it answers.
+
+`reply_msg->candidate_id` was never assigned. Worse, `reply` was a stack `struct DSPPFullPagePacket` that was never zeroed, so the field carried whatever bytes happened to be on the stack — and `CONSENSUS_WIRE_LEN` puts the first 20 bytes of `payload_4kb` on the wire, making this an information leak as well as a correctness bug.
+
+The reply handler then counted **any** granted reply at its own term:
+
+```c
+if (msg->term == local_cluster_state.current_term && msg->vote_granted) {
+    local_cluster_state.accumulated_votes++;
+```
+
+So two nodes campaigning at the same term both counted the same three grants, both reached quorum, and **both became LEADER**. On a cluster whose entire purpose is preventing that.
+
+The per-partition lease had the same bug with an extra twist: it *did* set `candidate_id`, to `local_cluster_state.node_id` — the **voter's** own id. Not merely useless to the receiver but actively wrong in the field the handler needs. And that mechanism gates writes, so two nodes could each hold one partition's write lease and each believe `dspp_page_write_allowed()` was true for it.
+
+### Bug 2: `>=` let two leaders depose each other
+
+```c
+if (packet->header.transaction_id >= local_cluster_state.current_term) {
+    local_cluster_state.current_term = packet->header.transaction_id;
+    local_cluster_state.role = ROLE_FOLLOWER;
+```
+
+A LEADER receiving another node's heartbeat at its **own** term demoted itself. With two same-term leaders from Bug 1, they demoted each other on their first beats, leaving nobody leading — so every node timed out, campaigned, and the term ran away. That is the 48 → 553.
+
+Now split three ways, because the three cases genuinely differ:
+
+| Heartbeat term | Action |
+| --- | --- |
+| lower than ours | ignore entirely — stale |
+| **equal** | reset the watchdog; a CANDIDATE yields, a LEADER **keeps** leadership |
+| higher | adopt the term and stand down whatever we were |
+
+Resetting the watchdog on an equal term is essential and easy to lose: that is the *normal* case, the leader beating at the term we already hold. A follower that ignored it would time out and depose a healthy leader.
+
+### Verification
+
+`consensus_phase1_host_test.c` is now **169 checks**. Scenarios 34–36 are the new ones, and they needed a shape no previous scenario had: **two simultaneous candidates.** Every earlier scenario has exactly one, so a reply meant for someone else never existed to be miscounted — which is why 148 passing checks did not notice.
+
+**7 of 7 mutations caught**, one only after a second attempt: removing the "is this vote for me" check from the *partition* handler survived Scenarios 34–35, because those cover only the cluster-wide election. Scenario 36 now drives the lease directly — votes granted to node 2 must not give node 1 the write lease, and a lease holder must not relinquish on an equal-term heartbeat.
+
+Five existing tests hand-built `VOTE_REPLY` packets without naming a candidate, which is now something no real voter produces; each was corrected with the reason stated in place. Full suite **80/80**, whole-image link 97/97, 12 asm-provided undefineds unchanged.
+
+### The pattern across §9c–§9f
+
+Four separate bugs stood between a wired heartbeat and a working election, and each was hidden by the one in front of it:
+
+1. The tick had no caller — nothing ran.
+2. Vote frames were 4132 bytes and could not cross the link — nothing arrived.
+3. The reply carried a stale term — arrivals were discarded.
+4. The reply named no candidate — arrivals were counted by everyone.
+
+Each fix revealed the next, and each revealed one presented as a *plausible* state: FOLLOWER at term 0, then CANDIDATE forever, then FOLLOWER with a racing term. None of them printed an error. The general lesson, stated once here rather than four times above: **in a distributed protocol, the failure mode is silence, and every layer that can silently drop a message needs a test that proves the message got through — not a test that proves the sender sent it.**
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

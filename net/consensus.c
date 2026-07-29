@@ -267,22 +267,78 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
 
     if (packet->header.opcode == DSPP_CMD_HEARTBEAT) {
-        // Reset local watch dogs
-        if (packet->header.transaction_id >= local_cluster_state.current_term) {
-            local_cluster_state.current_term = packet->header.transaction_id;
+        uint32_t hb_term = packet->header.transaction_id;
+        if (hb_term < local_cluster_state.current_term) return;   /* stale */
+
+        /* Resetting the watchdog is right for ANY term at least ours: an
+         * equal-term heartbeat is the normal case -- the leader beating at
+         * the term we already hold -- and a follower that ignored it would
+         * time out and depose a healthy leader. */
+        local_cluster_state.last_heartbeat_tick = now;
+
+        if (hb_term > local_cluster_state.current_term) {
+            /* Genuinely ahead: adopt it and stand down whatever we were. */
+            local_cluster_state.current_term = hb_term;
             local_cluster_state.role = ROLE_FOLLOWER;
-            local_cluster_state.last_heartbeat_tick = now;
+            return;
         }
+
+        /* ─── Equal term: a LEADER must NOT stand down here ────────────────
+         * This used to be `>=`, demoting unconditionally. So a leader that
+         * received another node's heartbeat at its OWN term immediately
+         * became a follower.
+         *
+         * Combined with the broadcast vote-counting bug above -- which let
+         * two nodes lead the same term -- the two leaders demoted each other
+         * on their first heartbeats, leaving nobody leading. Every node then
+         * timed out and campaigned, and the term climbed by hundreds per
+         * minute. A real cluster went from term 48 to 553 between two
+         * consecutive `cluster status` calls.
+         *
+         * With the vote fix, two same-term leaders can no longer arise, so
+         * this branch should be unreachable for a LEADER. It is written
+         * defensively rather than asserted: standing down on an equal term is
+         * the behaviour that turns one stray frame into a cluster-wide
+         * election storm, and a CANDIDATE stepping aside for a leader at the
+         * same term is correct and still happens. */
+        if (local_cluster_state.role == ROLE_CANDIDATE)
+            local_cluster_state.role = ROLE_FOLLOWER;
         return;
     }
 
     if (packet->header.opcode == DSPP_CMD_REQUEST_VOTE) {
+        /* Zeroed, not left as whatever was on the stack. CONSENSUS_WIRE_LEN
+         * puts the first 20 bytes of payload_4kb on the wire, so an
+         * uninitialised reply transmitted 20 bytes of this node's stack to
+         * every peer -- wrong values in fields the receiver reads, and a
+         * small information leak besides. dspp_migrate_send_ack() zeroes its
+         * unused fields explicitly for the same reason. */
         struct DSPPFullPagePacket reply;
+        for (uint32_t z = 0; z < sizeof(struct DSPPPacketHeader); z++)
+            ((uint8_t*)&reply)[z] = 0;
+        for (uint32_t z = 0; z < sizeof(struct ConsensusMessage); z++)
+            reply.payload_4kb[z] = 0;
+
         reply.header.magic = DSPP_MAGIC;
         reply.header.opcode = DSPP_CMD_VOTE_REPLY;
         reply.header.node_source_id = (uint16_t)local_cluster_state.node_id;
 
         struct ConsensusMessage* reply_msg = (struct ConsensusMessage*)reply.payload_4kb;
+
+        /* ─── WHO the vote is for, which nothing recorded before ───────────
+         * DSPP is pure L2 broadcast: there is no node-to-MAC table, so every
+         * frame reaches every node (see dspp_transmit_raw()). A VOTE_REPLY
+         * therefore arrives at every candidate, not just the one it answers.
+         *
+         * With no candidate named, the reply handler below counted ANY
+         * granted reply at its own term. Two nodes campaigning at the same
+         * term both counted the same three grants, both reached quorum, and
+         * both became LEADER -- textbook split brain, on a cluster whose
+         * whole purpose is to prevent exactly that.
+         *
+         * Carrying the candidate's id costs a field that already existed on
+         * the struct and was simply never assigned. */
+        reply_msg->candidate_id = msg->candidate_id;
 
         if (msg->term > local_cluster_state.current_term) {
             local_cluster_state.current_term = msg->term;
@@ -318,6 +374,13 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
     }
 
     else if (packet->header.opcode == DSPP_CMD_VOTE_REPLY && local_cluster_state.role == ROLE_CANDIDATE) {
+        /* The vote must be FOR THIS NODE. On a broadcast segment every
+         * candidate receives every reply, so without this a vote granted to
+         * node 2 was also counted by nodes 3 and 4 -- and two candidates at
+         * one term could both declare quorum and both lead. See the
+         * candidate_id assignment in the REQUEST_VOTE branch above. */
+        if (msg->candidate_id != local_cluster_state.node_id) return;
+
         if (msg->term == local_cluster_state.current_term && msg->vote_granted) {
             local_cluster_state.accumulated_votes++;
 
@@ -537,23 +600,48 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint6
     }
 
     if (packet->header.opcode == DSPP_CMD_PARTITION_HEARTBEAT) {
-        if (msg->term >= row->term) {
-            row->term                = msg->term;
-            row->role                = ROLE_FOLLOWER;
-            row->last_heartbeat_tick = now;
+        if (msg->term < row->term) return;                 /* stale */
+        row->last_heartbeat_tick = now;                    /* equal term is the normal case */
+        if (msg->term > row->term) {
+            row->term = msg->term;
+            row->role = ROLE_FOLLOWER;
+            return;
         }
+        /* Equal term: a lease HOLDER must not relinquish. Same reasoning as
+         * the cluster-wide handler above -- `>=` made a leader stand down for
+         * a peer at its own term, which turns one frame into an election
+         * storm. Here it would also mean two nodes trading a WRITE lease back
+         * and forth, which is worse than churn. */
+        if (row->role == ROLE_CANDIDATE) row->role = ROLE_FOLLOWER;
         return;
     }
 
     if (packet->header.opcode == DSPP_CMD_PARTITION_REQUEST_VOTE) {
+        /* Zeroed for the same reason as the cluster-wide reply: the first 20
+         * bytes of payload_4kb go on the wire, and an uninitialised struct
+         * puts stack contents there. */
         struct DSPPFullPagePacket reply;
+        for (uint32_t z = 0; z < sizeof(struct DSPPPacketHeader); z++)
+            ((uint8_t*)&reply)[z] = 0;
+        for (uint32_t z = 0; z < sizeof(struct ConsensusMessage); z++)
+            reply.payload_4kb[z] = 0;
+
         reply.header.magic         = DSPP_MAGIC;
         reply.header.opcode        = DSPP_CMD_PARTITION_VOTE_REPLY;
         reply.header.node_source_id = (uint16_t)local_cluster_state.node_id;
 
         struct ConsensusMessage* reply_msg = (struct ConsensusMessage*)reply.payload_4kb;
         reply_msg->partition_id = partition_id;
-        reply_msg->candidate_id = local_cluster_state.node_id;
+        /* The CANDIDATE being voted for, not this voter.
+         *
+         * This used to be `local_cluster_state.node_id` -- the replying
+         * node's own id -- which is not merely useless to the receiver but
+         * actively misleading: it named the voter in a field the reply
+         * handler needs for "was this vote for me". DSPP broadcasts, so
+         * without a correct value every candidate at this term counted this
+         * grant, and two nodes could both take the write lease for one
+         * partition. */
+        reply_msg->candidate_id = msg->candidate_id;
 
         if (msg->term > row->term) {
             row->term       = msg->term;
@@ -579,6 +667,11 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint6
     }
 
     if (packet->header.opcode == DSPP_CMD_PARTITION_VOTE_REPLY && row->role == ROLE_CANDIDATE) {
+        /* For THIS node, or not counted -- see the cluster-wide equivalent.
+         * Without it, a grant to another candidate counted here too, and two
+         * nodes could each believe they hold this partition's write lease. */
+        if (msg->candidate_id != local_cluster_state.node_id) return;
+
         if (msg->term == row->term && msg->vote_granted) {
             row->accumulated_votes++;
 

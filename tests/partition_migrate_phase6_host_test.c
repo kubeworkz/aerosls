@@ -195,6 +195,11 @@ int main(void) {
         m->partition_id = pid_a;
         m->term         = partition_lease_get_term(pid_a);
         m->vote_granted = 1;
+        /* A real voter names the candidate it voted for: DSPP broadcasts,
+         * so every candidate sees every reply and an unnamed grant would
+         * be counted by all of them -- letting two nodes hold one
+         * partition's write lease. Hand-built replies must match. */
+        m->candidate_id = cluster_local_node_id();
         process_partition_consensus_packet(&incoming, TEST_NOW);
     }
     CHECK(partition_lease_get_role(pid_a) == ROLE_LEADER, "tenant-a's lease reached quorum (1) and is now LEADER");
@@ -216,6 +221,11 @@ int main(void) {
         m->partition_id = pid_a;
         m->term         = partition_lease_get_term(pid_a);
         m->vote_granted = 1;
+        /* A real voter names the candidate it voted for: DSPP broadcasts,
+         * so every candidate sees every reply and an unnamed grant would
+         * be counted by all of them -- letting two nodes hold one
+         * partition's write lease. Hand-built replies must match. */
+        m->candidate_id = cluster_local_node_id();
         process_partition_consensus_packet(&incoming, TEST_NOW);
     }
     CHECK(partition_holds_write_lease(pid_a) == 1, "tenant-a holds its write lease again, ready for a real migration test");

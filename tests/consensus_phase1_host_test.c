@@ -348,6 +348,10 @@ int main(void) {
         m->partition_id = 5;
         m->term = 1;
         m->vote_granted = 1;
+        /* A real voter names the candidate it voted for -- broadcast means
+         * every candidate sees every reply, so an unnamed grant would be
+         * counted by all of them. Hand-built replies must match. */
+        m->candidate_id = local_cluster_state.node_id;
 
         partition_perm_calls = 0;
         process_partition_consensus_packet(&incoming, T_NOW);
@@ -698,6 +702,11 @@ int main(void) {
             struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
             vm->term = local_cluster_state.current_term;
             vm->vote_granted = 1;
+            /* A real voter now names the candidate it voted for: on a
+             * broadcast segment every candidate sees every reply, so a
+             * reply that names nobody would be counted by all of them.
+             * Hand-built replies must do what a real one does. */
+            vm->candidate_id = local_cluster_state.node_id;
             process_consensus_packet(&vr, now_ticks);
         }
         CHECK(local_cluster_state.accumulated_votes == 2, "one grant: self + 1 = 2, short of quorum 3");
@@ -729,6 +738,11 @@ int main(void) {
             struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
             vm->term = local_cluster_state.current_term;
             vm->vote_granted = 1;
+            /* A real voter now names the candidate it voted for: on a
+             * broadcast segment every candidate sees every reply, so a
+             * reply that names nobody would be counted by all of them.
+             * Hand-built replies must do what a real one does. */
+            vm->candidate_id = local_cluster_state.node_id;
             process_consensus_packet(&vr, now_ticks);
         }
         CHECK(local_cluster_state.role == ROLE_LEADER,
@@ -819,6 +833,7 @@ int main(void) {
         vm->partition_id = 88;
         vm->term = partition_lease_get_term(88);
         vm->vote_granted = 1;
+        vm->candidate_id = local_cluster_state.node_id;
         process_partition_consensus_packet(&vr, now_ticks);
         CHECK(partition_lease_get_role(88) == ROLE_LEADER, "partition 88 holds the lease (setup)");
 
@@ -1014,6 +1029,205 @@ int main(void) {
         CHECK(local_cluster_state.role == ROLE_LEADER,
               "*** and with quorum reached, node 1 is LEADER -- an election "
               "actually completes end to end ***");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * Scenario 34: TWO NODES CANNOT LEAD THE SAME TERM.
+     *
+     * ─── The bug ────────────────────────────────────────────────────────
+     * DSPP is pure L2 broadcast -- no node-to-MAC table exists, so every
+     * frame reaches every node. A VOTE_REPLY therefore arrives at every
+     * candidate, not only the one it answers.
+     *
+     * The reply never named a candidate: `reply_msg->candidate_id` was left
+     * unassigned in a stack struct that was never zeroed, so it carried
+     * whatever bytes were on the stack. And the reply handler counted ANY
+     * granted reply at its own term.
+     *
+     * So two nodes campaigning at the same term both counted the same
+     * grants, both reached quorum, and both became LEADER. Then the
+     * heartbeat handler's `>=` made each demote the other on its first beat
+     * -- leaving nobody leading, every node timing out, and the term
+     * climbing without bound. A real four-node cluster went from term 48 to
+     * 553 between two consecutive `cluster status` calls.
+     *
+     * ─── Why nothing caught it ──────────────────────────────────────────
+     * Every scenario above has ONE candidate. A reply meant for someone else
+     * never existed to be miscounted. The bug needs two simultaneous
+     * candidates, which only a broadcast medium produces -- and the tests
+     * hand replies straight to one node.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- two nodes cannot lead one term --\n");
+    {
+        /* This node is 1, campaigning at term 1 in a 3-node cluster (quorum 2). */
+        cluster_init(1);
+        cluster_register_peer(2);
+        cluster_register_peer(3);
+        now_ticks = 200000;
+        trigger_kernel_election_campaign(now_ticks);
+        CHECK(local_cluster_state.role == ROLE_CANDIDATE, "node 1 is campaigning (setup)");
+        CHECK(local_cluster_state.accumulated_votes == 1, "with its own vote only");
+
+        /* Node 2 is ALSO campaigning at term 1 and node 3 grants ITS vote.
+         * That reply is broadcast, so node 1 receives it. It must not count. */
+        struct DSPPFullPagePacket vr;
+        memset(&vr, 0, sizeof(vr));
+        vr.header.magic  = DSPP_MAGIC;
+        vr.header.opcode = DSPP_CMD_VOTE_REPLY;
+        vr.header.node_source_id = 3;                 /* node 3 is the voter */
+        {
+            struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
+            vm->term         = local_cluster_state.current_term;   /* same term */
+            vm->vote_granted = 1;
+            vm->candidate_id = 2;                     /* ...but for NODE 2 */
+        }
+        process_consensus_packet(&vr, now_ticks);
+        CHECK(local_cluster_state.accumulated_votes == 1,
+              "*** a vote granted to node 2 is NOT counted by node 1 ***");
+        CHECK(local_cluster_state.role == ROLE_CANDIDATE,
+              "*** so node 1 does not reach quorum on someone else's vote, and two "
+              "nodes cannot both lead term 1 ***");
+
+        /* Several more of them still must not add up to a majority. */
+        for (int i = 0; i < 5; i++) process_consensus_packet(&vr, now_ticks);
+        CHECK(local_cluster_state.role == ROLE_CANDIDATE,
+              "...nor do six of them");
+
+        /* Node 1's OWN vote still works, so this is a filter and not a wall. */
+        {
+            struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
+            vm->candidate_id = 1;
+        }
+        process_consensus_packet(&vr, now_ticks);
+        CHECK(local_cluster_state.role == ROLE_LEADER,
+              "*** a vote actually granted to node 1 DOES count, and elects it ***");
+    }
+
+    /* Scenario 35: a LEADER does not stand down for an equal-term heartbeat.
+     *
+     * The amplifier. `>=` in the heartbeat handler made a leader demote
+     * itself on any peer's beat at its own term, so a single stray frame
+     * could vacate the leadership and start a cluster-wide election. A
+     * CANDIDATE stepping aside at an equal term is correct and must still
+     * happen -- that is how a losing candidate yields. */
+    {
+        CHECK(local_cluster_state.role == ROLE_LEADER, "node 1 is leader (from above)");
+        uint32_t term_now = local_cluster_state.current_term;
+
+        struct DSPPFullPagePacket hb;
+        memset(&hb, 0, sizeof(hb));
+        hb.header.magic  = DSPP_MAGIC;
+        hb.header.opcode = DSPP_CMD_HEARTBEAT;
+        hb.header.node_source_id = 2;
+        hb.header.transaction_id = term_now;          /* EQUAL term */
+        process_consensus_packet(&hb, now_ticks);
+        CHECK(local_cluster_state.role == ROLE_LEADER,
+              "*** a LEADER stays leader on an equal-term heartbeat ***");
+        CHECK(local_cluster_state.current_term == term_now, "...and its term is unchanged");
+
+        /* A CANDIDATE at the same term DOES yield. */
+        local_cluster_state.role = ROLE_CANDIDATE;
+        process_consensus_packet(&hb, now_ticks);
+        CHECK(local_cluster_state.role == ROLE_FOLLOWER,
+              "*** but a CANDIDATE yields to a leader at the same term ***");
+
+        /* A strictly higher term deposes even a leader -- that is Raft. */
+        local_cluster_state.role = ROLE_LEADER;
+        hb.header.transaction_id = term_now + 1;
+        process_consensus_packet(&hb, now_ticks);
+        CHECK(local_cluster_state.role == ROLE_FOLLOWER,
+              "*** a HIGHER term does depose a leader ***");
+        CHECK(local_cluster_state.current_term == term_now + 1, "...and it adopts that term");
+
+        /* A stale heartbeat changes nothing. */
+        uint32_t after = local_cluster_state.current_term;
+        hb.header.transaction_id = after - 1;
+        process_consensus_packet(&hb, now_ticks);
+        CHECK(local_cluster_state.current_term == after,
+              "a stale heartbeat does not move the term backwards");
+    }
+
+    /* Scenario 36: the same guard on the PARTITION lease -- which matters
+     * more, because this is the one that gates writes.
+     *
+     * Scenarios 34-35 cover the cluster-wide election. A mutation removing
+     * the identical "is this vote for me" check from the per-partition
+     * handler survived them all, because nothing here had ever fed a
+     * partition vote-reply naming a different candidate.
+     *
+     * Two nodes holding one partition's write lease means two nodes each
+     * believing dspp_page_write_allowed() is true for it. That is the exact
+     * outcome the lease exists to prevent. */
+    printf("\n-- and on the write lease --\n");
+    {
+        cluster_init(1);
+        cluster_register_peer(2);
+        cluster_register_peer(3);
+        now_ticks = 210000;
+        partition_lease_init(64);
+        partition_lease_trigger_election(64, now_ticks);
+        CHECK(partition_lease_get_role(64) == ROLE_CANDIDATE, "node 1 campaigns for partition 64's lease");
+        CHECK(partition_holds_write_lease(64) == 0, "and does not hold it yet");
+
+        /* Node 3 grants ITS vote to node 2, for the same partition and term.
+         * Broadcast, so node 1 sees it. */
+        struct DSPPFullPagePacket pv;
+        memset(&pv, 0, sizeof(pv));
+        pv.header.magic  = DSPP_MAGIC;
+        pv.header.opcode = DSPP_CMD_PARTITION_VOTE_REPLY;
+        pv.header.node_source_id = 3;
+        {
+            struct ConsensusMessage* pm = (struct ConsensusMessage*)pv.payload_4kb;
+            pm->partition_id = 64;
+            pm->term         = partition_lease_get_term(64);
+            pm->vote_granted = 1;
+            pm->candidate_id = 2;            /* for NODE 2, not us */
+        }
+        for (int i = 0; i < 6; i++) process_partition_consensus_packet(&pv, now_ticks);
+        CHECK(partition_lease_get_role(64) == ROLE_CANDIDATE,
+              "*** votes granted to node 2 do not promote node 1 ***");
+        CHECK(partition_holds_write_lease(64) == 0,
+              "*** so two nodes cannot both hold partition 64's WRITE lease ***");
+
+        /* And node 1's own vote does work. */
+        {
+            struct ConsensusMessage* pm = (struct ConsensusMessage*)pv.payload_4kb;
+            pm->candidate_id = 1;
+        }
+        process_partition_consensus_packet(&pv, now_ticks);
+        CHECK(partition_holds_write_lease(64) == 1,
+              "*** a vote granted to node 1 does give it the lease ***");
+
+        /* And the lease HOLDER must not relinquish on an equal-term
+         * heartbeat -- the partition analogue of Scenario 35. `>=` here
+         * meant two nodes trading a write lease back and forth on every
+         * beat, which is worse than the cluster-wide churn: it is a window
+         * where neither believes it holds the lease and writes are refused,
+         * alternating with windows where both might. */
+        uint32_t lease_term = partition_lease_get_term(64);
+        struct DSPPFullPagePacket ph;
+        memset(&ph, 0, sizeof(ph));
+        ph.header.magic  = DSPP_MAGIC;
+        ph.header.opcode = DSPP_CMD_PARTITION_HEARTBEAT;
+        ph.header.node_source_id = 2;
+        {
+            struct ConsensusMessage* pm = (struct ConsensusMessage*)ph.payload_4kb;
+            pm->partition_id = 64;
+            pm->term         = lease_term;      /* EQUAL */
+        }
+        process_partition_consensus_packet(&ph, now_ticks);
+        CHECK(partition_holds_write_lease(64) == 1,
+              "*** the lease holder KEEPS the lease on an equal-term heartbeat ***");
+        CHECK(partition_lease_get_term(64) == lease_term, "...and the term is unchanged");
+
+        /* A higher term does take it away. */
+        {
+            struct ConsensusMessage* pm = (struct ConsensusMessage*)ph.payload_4kb;
+            pm->term = lease_term + 1;
+        }
+        process_partition_consensus_packet(&ph, now_ticks);
+        CHECK(partition_holds_write_lease(64) == 0,
+              "*** but a HIGHER term does take the lease away ***");
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

@@ -252,6 +252,40 @@ def main():
     check("not draining" in out,
           "*** a non-zero dropped count is called out, not just printed ***")
 
+    # ─── A refusal must surface whatever the kernel actually said ──────────
+    #
+    # /api/shell/exec answers an unrecognised command with
+    # {"ok":"false","output":"<what the shell printed>"} and NO error field.
+    # The renderer consulted only `error` and `detail`, so a mistyped command
+    # printed "refused: no reason given" while the kernel's own explanation
+    # sat in the discarded response. That is worse than an obscure message:
+    # it tells the operator there is nothing to find out.
+    print("\n-- a refusal surfaces the kernel's own words --")
+    ROUTES[("POST", "/api/shell/exec")] = (200, {
+        "ok": "false", "output": "unknown command: stream list"})
+    rc, out, err = run("shell", "stream list")
+    check(rc == 2, "an unrecognised shell command still exits REFUSED (2)")
+    check("no reason given" not in err,
+          "*** it does NOT say 'no reason given' when the kernel explained ***")
+    check("unknown command" in err,
+          "*** the kernel's own output is what gets printed ***")
+
+    ROUTES[("POST", "/api/shell/exec")] = (200, {
+        "ok": "false", "error": "too many concurrent shell sessions"})
+    rc, out, err = run("shell", "ls")
+    check("too many concurrent" in err,
+          "an explicit error field still takes precedence over output")
+
+    ROUTES[("POST", "/api/shell/exec")] = (200, {"ok": "false"})
+    rc, out, err = run("shell", "ls")
+    check("no reason given" in err,
+          "...and the placeholder remains for a refusal that genuinely says nothing")
+
+    ROUTES[("POST", "/api/shell/exec")] = (200, {"ok": "false", "output": "   \n  "})
+    rc, out, err = run("shell", "ls")
+    check("no reason given" in err,
+          "whitespace-only output is not mistaken for an explanation")
+
     print(f"\n{'='*58}")
     print(f"passed={passed} failed={failed}")
     return 1 if failed else 0

@@ -137,8 +137,19 @@ def _emit(args, data: dict, table=None) -> int:
     if args.json or table is None:
         print(json.dumps(data, indent=2))
     elif refused:
-        print(f"refused: {data.get('error') or data.get('detail') or 'no reason given'}",
-              file=sys.stderr)
+        # `output` matters as much as `error`, and used to be dropped.
+        #
+        # /api/shell/exec answers an unrecognised command with
+        # {"ok":"false","output":"<whatever the shell printed>"} and NO error
+        # field -- so a mistyped command produced the maximally unhelpful
+        # "refused: no reason given" while the kernel's actual explanation sat
+        # in the response being discarded. Any refusal that carries text
+        # should show that text; inventing a placeholder is the last resort,
+        # not the second.
+        why = (data.get("error") or data.get("detail")
+               or (data.get("output") or "").strip()
+               or data.get("message") or "no reason given")
+        print(f"refused: {why}", file=sys.stderr)
     else:
         table()
     if refused and not args.json:
