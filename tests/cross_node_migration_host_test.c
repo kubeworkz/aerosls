@@ -159,13 +159,71 @@ static int      captured_frame_count = 0;
  * the receive path -- but the role is recorded too, so it can also assert
  * DSPP leaves by the CLUSTER interface rather than the management one. */
 static NicRole last_tx_role = NIC_ROLE_NONE;
+/* ─── The destination, answering in real time ─────────────────────────────
+ * The sender now WAITS for a PAGE_ACK before moving on, and gives up if one
+ * never comes. So a stub that only records frames is no longer a faithful
+ * stand-in for a peer -- it models a peer that has crashed, and every
+ * migration would (correctly) abort.
+ *
+ * This stub therefore answers: on seeing a PAGE_REQ it calls
+ * dspp_migrate_note_ack(), which is exactly what the real timer ISR does
+ * when a genuine ACK arrives while the BSP spins. Interception is at the
+ * driver rather than by replaying frames afterwards because the reply has to
+ * happen DURING the send, which is the whole point of a request/response
+ * exchange.
+ *
+ * It also advances kernel_tick_counter, standing in for the LAPIC tick that
+ * would be running on real hardware. Without that the sender's deadline
+ * never elapses and a deliberately-dropped fragment would hang the test
+ * rather than time out. */
+static void wl_strcpy_test(char* d, const char* s, unsigned cap) {
+    unsigned i; for (i = 0; i + 1 < cap && s[i]; i++) d[i] = s[i]; d[i] = '\0';
+}
+
+static int      loss_page      = -1;  /* page to drop a fragment of, -1 = none */
+static uint32_t loss_frag      = 0;   /* which fragment of it */
+static int      loss_times     = 0;   /* how many times to drop it */
+static int      loss_applied   = 0;   /* how many times it actually was */
+static int      nack_everything = 0;  /* model a destination with no free slot */
+static int      ack_count_page = 0;   /* PAGE_ACKs this stub generated */
+
 void e1000_transmit(NicRole role, void* buf, uint16_t size) {
     last_tx_role = role;
-    if (captured_frame_count >= MAX_CAPTURED_FRAMES) return;
-    if (size > sizeof(captured_frame[0])) { size = (uint16_t)sizeof(captured_frame[0]); }
-    memcpy(captured_frame[captured_frame_count], buf, size);
-    captured_frame_len[captured_frame_count] = size;
-    captured_frame_count++;
+    if (captured_frame_count < MAX_CAPTURED_FRAMES) {
+        uint16_t n = size;
+        if (n > sizeof(captured_frame[0])) n = (uint16_t)sizeof(captured_frame[0]);
+        memcpy(captured_frame[captured_frame_count], buf, n);
+        captured_frame_len[captured_frame_count] = n;
+        captured_frame_count++;
+    }
+
+    /* Time passes while frames are on the wire. */
+    kernel_tick_counter += 1;
+
+    if (size < ETH_HDR_LEN + sizeof(struct DSPPMigrateHeader)) return;
+    struct DSPPMigrateHeader* h =
+        (struct DSPPMigrateHeader*)((uint8_t*)buf + ETH_HDR_LEN);
+    if (h->magic != DSPP_MIGRATE_MAGIC) return;
+    if (h->opcode != DSPP_MIGRATE_PAGE_REQ) return;
+
+    if (nack_everything) {
+        dspp_migrate_note_ack(h->transfer_id, DSPP_MIGRATE_PAGE_ACK,
+                              h->page_index, h->frag_index, 1 /* refused */);
+        return;
+    }
+
+    /* Deliberate loss: swallow the chosen fragment the chosen number of
+     * times, then let it through -- which is what makes the RETRANSMISSION
+     * observable rather than just the give-up path. */
+    if ((int)h->page_index == loss_page && h->frag_index == loss_frag &&
+        loss_applied < loss_times) {
+        loss_applied++;
+        return;   /* no ACK: this frame "never arrived" */
+    }
+
+    ack_count_page++;
+    dspp_migrate_note_ack(h->transfer_id, DSPP_MIGRATE_PAGE_ACK,
+                          h->page_index, h->frag_index, 0);
 }
 
 /* ─── Stateful fake NVMe (identical technique to tests/migration_data_
@@ -602,6 +660,186 @@ int main(void) {
               "*** page 1 still lands after duplicates of page 0 -- the transfer was "
               "NOT retired early by a page being counted twice ***");
         #undef MAKE_FRAG
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * RETRANSMISSION
+     *
+     * Until now this protocol was fire-and-forget: the sender handed frames
+     * to the NIC and retired the source slot immediately, whether or not
+     * anything arrived. Combined with a wire that silently dropped every
+     * page frame (roadmap §9c), a migration deleted the original and
+     * delivered nothing.
+     *
+     * The three properties below are what make that safe, and each is
+     * asserted against a deliberately lossy destination rather than by
+     * inspection.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- retransmission --\n");
+
+    /* Helper: stand up one node-A stream of `pages` pages and migrate it. */
+    #define SETUP_SEND(pages, fillbyte) ({                                    \
+        g_fake_local_node_id = 1;                                             \
+        memset(stream_store, 0, sizeof(stream_store));                        \
+        struct StreamEntry* s = &stream_store[0];                             \
+        s->active = 1; s->frames_used = (pages); s->lba_base = 4096;          \
+        s->partition_id = 91; s->owner_uid = 500; s->size = (pages) * 4096;   \
+        wl_strcpy_test(s->name, "retx.bin", sizeof(s->name));                 \
+        uint8_t pg[4096]; memset(pg, (fillbyte), sizeof(pg));                 \
+        for (uint32_t q = 0; q < (uint32_t)(pages); q++)                      \
+            nvme_write_sync(s->lba_base + (uint64_t)q * 8, pg);               \
+        captured_frame_count = 0; ack_count_page = 0; loss_applied = 0;       \
+        stream_migrate_send_partition(91, 2);                                 \
+    })
+
+    /* ── 1: a dropped fragment is RESENT, and the transfer still completes.
+     * The single most important property: loss is survivable, not fatal. */
+    {
+        loss_page = 0; loss_frag = 2; loss_times = 1; nack_everything = 0;
+        int frames_before_first_loss = 0; (void)frames_before_first_loss;
+        SETUP_SEND(1, 0xC3);
+
+        CHECK(loss_applied == 1, "the destination really did swallow one fragment");
+        CHECK(captured_frame_count > 1 + DSPP_MIGRATE_FRAGS_PER_PAGE,
+              "*** MORE frames went out than a clean send needs -- the lost fragment "
+              "was retransmitted ***");
+        CHECK(stream_store[0].active == 0,
+              "*** and the transfer still COMPLETED: the source was retired, so every "
+              "page was confirmed despite the loss ***");
+    }
+
+    /* ── 2: only the missing fragment is resent, not the whole page.
+     * Resending everything on any loss multiplies traffic by the fragment
+     * count on precisely the link that is already dropping frames. */
+    {
+        loss_page = 0; loss_frag = 1; loss_times = 1; nack_everything = 0;
+        SETUP_SEND(1, 0xD4);
+
+        /* A clean send is 1 BEGIN + FRAGS frames. One lost fragment should
+         * add exactly one more, not another full page's worth. */
+        const int clean = 1 + DSPP_MIGRATE_FRAGS_PER_PAGE;
+        CHECK(captured_frame_count == clean + 1,
+              "*** exactly ONE extra frame -- the retransmit is per-fragment, not "
+              "per-page ***");
+        CHECK(captured_frame_count < clean + DSPP_MIGRATE_FRAGS_PER_PAGE,
+              "...definitively fewer than resending the whole page would take");
+    }
+
+    /* ── 3: an unrecoverable transfer leaves the source ALONE.
+     * The property that makes retransmission worth having. A destination
+     * that never confirms must not cost the operator their data. */
+    {
+        loss_page = 0; loss_frag = 0; loss_times = 1000; nack_everything = 0;
+        SETUP_SEND(1, 0xE5);
+
+        CHECK(stream_store[0].active == 1,
+              "*** the source slot is STILL ACTIVE -- an unconfirmed migration does "
+              "not delete the original ***");
+        CHECK(stream_store[0].frames_used == 1 && stream_store[0].lba_base == 4096,
+              "...and its bookkeeping is untouched, so the data is still reachable");
+        uint8_t still[4096];
+        CHECK(nvme_read_sync(4096, still) == 0 && still[0] == 0xE5,
+              "...and the bytes are still on the source's own disk");
+    }
+
+    /* ── 4: a REFUSAL is not retried.
+     * A non-zero ACK status means the destination cannot take this page --
+     * no free slot, bad index. Resending an identical request cannot change
+     * that answer, so the budget must not be spent on it. */
+    {
+        loss_page = -1; loss_times = 0; nack_everything = 1;
+        SETUP_SEND(1, 0xF6);
+        nack_everything = 0;
+
+        const int clean = 1 + DSPP_MIGRATE_FRAGS_PER_PAGE;
+        CHECK(captured_frame_count <= clean,
+              "*** a refused page is NOT retransmitted -- no frames beyond the first "
+              "attempt ***");
+        CHECK(stream_store[0].active == 1,
+              "...and a refused transfer likewise leaves the source intact");
+    }
+
+    /* ── 5: the clean case did not get slower.
+     * A retransmit path that resends on every page even when nothing was
+     * lost would be invisible in the tests above -- they all inject loss. */
+    {
+        loss_page = -1; loss_times = 0; nack_everything = 0;
+        SETUP_SEND(2, 0xA7);
+
+        CHECK(captured_frame_count == 1 + 2 * DSPP_MIGRATE_FRAGS_PER_PAGE,
+              "*** a lossless two-page send transmits exactly BEGIN + pages x fragments "
+              "-- no speculative retransmission ***");
+        CHECK(stream_store[0].active == 0, "...and completes, retiring the source");
+    }
+    #undef SETUP_SEND
+
+    /* ── 6: the ACK record ignores what it is not waiting for.
+     *
+     * Driven directly rather than through a migration, because the failure
+     * needs an ACK that a correct destination would never send at that
+     * moment -- a stale one from a previous retransmit round, or one for a
+     * different page. Scenarios 1-5 have a single transfer sending pages in
+     * order, so they never produce either, and mutations removing both
+     * guards survived all of them.
+     *
+     * Why it matters: a late duplicate satisfying the CURRENT page's
+     * completion check means the sender believes a page landed when its
+     * fragments were never acknowledged -- and then retires the source. */
+    printf("\n-- the ACK record ignores mismatches --\n");
+    {
+        dspp_migrate_arm_page(0xAAAA, 7);
+
+        /* Right transfer, WRONG page: a stale ACK from page 6's round. */
+        for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++)
+            dspp_migrate_note_ack(0xAAAA, DSPP_MIGRATE_PAGE_ACK, 6, f, 0);
+        CHECK(!dspp_migrate_page_acked(),
+              "*** ACKs for a different PAGE do not complete the armed one ***");
+
+        /* Right page, WRONG transfer: a leftover from an earlier migration. */
+        for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++)
+            dspp_migrate_note_ack(0xBBBB, DSPP_MIGRATE_PAGE_ACK, 7, f, 0);
+        CHECK(!dspp_migrate_page_acked(),
+              "*** ACKs for a different TRANSFER do not complete it either ***");
+
+        /* Out-of-range fragment indices must be rejected, and enough of them
+         * to reach the completion threshold is what makes that testable. A
+         * single one only increments the count by one, which cannot complete
+         * a page on its own -- so a test feeding one passes even with the
+         * bounds check removed, which is exactly what happened first time.
+         * (The out-of-bounds write is undefined behaviour regardless; the
+         * miscounted completion is the observable symptom.) */
+        for (uint32_t bad = 0; bad < DSPP_MIGRATE_FRAGS_PER_PAGE + 4; bad++)
+            dspp_migrate_note_ack(0xAAAA, DSPP_MIGRATE_PAGE_ACK, 7,
+                                  DSPP_MIGRATE_FRAGS_PER_PAGE + bad, 0);
+        CHECK(!dspp_migrate_page_acked(),
+              "*** out-of-range frag_index values are rejected, however many arrive -- "
+              "they cannot count toward completing the page ***");
+
+        /* The genuine article completes it. */
+        for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++) {
+            CHECK(!dspp_migrate_page_acked() || f + 1 == DSPP_MIGRATE_FRAGS_PER_PAGE,
+                  f == 0 ? "not complete before any matching ACK arrives" : "...nor partway");
+            dspp_migrate_note_ack(0xAAAA, DSPP_MIGRATE_PAGE_ACK, 7, f, 0);
+        }
+        CHECK(dspp_migrate_page_acked(),
+              "*** the matching transfer's own ACKs DO complete it ***");
+
+        /* Disarmed, nothing is recorded -- so an ACK arriving after the
+         * sender moved on cannot affect the next page. */
+        dspp_migrate_disarm();
+        dspp_migrate_arm_page(0xCCCC, 0);
+        dspp_migrate_note_ack(0xAAAA, DSPP_MIGRATE_PAGE_ACK, 7, 0, 0);
+        CHECK(!dspp_migrate_page_acked(),
+              "a late ACK for the previous page does not carry into the next one");
+
+        /* A refusal is recorded distinctly from a loss. */
+        dspp_migrate_arm_page(0xDDDD, 0);
+        CHECK(!dspp_migrate_nacked(), "a freshly armed page is not nacked");
+        dspp_migrate_note_ack(0xDDDD, DSPP_MIGRATE_PAGE_ACK, 0, 0, 1 /* refused */);
+        CHECK(dspp_migrate_nacked(), "*** a non-zero ACK status records a REFUSAL ***");
+        CHECK(!dspp_migrate_page_acked(),
+              "...and a refusal does not also count as an acknowledgement");
+        dspp_migrate_disarm();
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

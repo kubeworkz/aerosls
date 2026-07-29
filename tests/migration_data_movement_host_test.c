@@ -115,6 +115,39 @@ void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
                              const uint8_t* page_data) {
     (void)transfer_id; (void)node_dest_id; (void)partition_id; (void)page_index; (void)page_data;
 }
+void dspp_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
+                            uint32_t partition_id, uint32_t page_index,
+                            uint32_t frag_index, const uint8_t* page_data) {
+    (void)transfer_id; (void)node_dest_id; (void)partition_id;
+    (void)page_index; (void)frag_index; (void)page_data;
+}
+
+/* ─── Retransmission stubs: a destination that acknowledges ───────────────
+ * stream_migrate_send_partition() now waits for a PAGE_ACK per page and
+ * abandons the transfer -- leaving the source intact -- if none arrives.
+ *
+ * FAITHFUL as "always acknowledged", not merely convenient. This file tests
+ * the SAME-NODE relocate path and the local bookkeeping around migration;
+ * it deliberately does not link net/dspp.c and has no wire at all. Modelling
+ * a peer that never answers would make every send here abandon, which would
+ * be testing the give-up path by accident rather than what this file is for.
+ * Loss, retransmission and give-up have dedicated coverage in
+ * tests/cross_node_migration_host_test.c, which drives a real lossy
+ * destination. */
+void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index) {
+    (void)transfer_id; (void)page_index;
+}
+int  dspp_migrate_page_acked(void) { return 1; }
+int  dspp_migrate_frag_acked(uint32_t f) { (void)f; return 1; }
+int  dspp_migrate_nacked(void)     { return 0; }
+void dspp_migrate_disarm(void)     { }
+void dspp_migrate_note_ack(uint64_t t, uint16_t o, uint32_t p, uint32_t f, uint8_t s) {
+    (void)t; (void)o; (void)p; (void)f; (void)s;
+}
+
+/* The ACK wait times against the LAPIC tick. Nothing here waits (the stub
+ * above acknowledges immediately), so a frozen clock is faithful. */
+volatile uint64_t kernel_tick_counter = 0;
 
 uint64_t sys_sls_valloc(struct SLSVallocRequest* req) { (void)req; return 1; }
 uint64_t sys_sls_insert(struct SLSRecordRequest* req) { (void)req; return 0; }

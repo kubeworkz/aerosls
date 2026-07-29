@@ -33,6 +33,13 @@ uint64_t dspp_tx_oversize_dropped = 0;
 /* See dspp.h. No kernel code assigns to this -- grep before adding one. */
 uint16_t dspp_max_wire_payload = DSPP_MAX_WIRE_PAYLOAD;
 
+/* Frames dropped because dspp_transmit_raw() was already building one when
+ * the timer ISR re-entered it. See the guard in that function. Non-zero is
+ * not an error -- the dropped frame is always an ACK, which retransmission
+ * covers -- but a large or growing number means the send path is being
+ * interrupted constantly and is worth looking at. */
+uint64_t dspp_tx_reentrant_dropped = 0;
+
 /* dspp.h has to spell DSPP_MAX_WIRE_PAYLOAD as a literal (it cannot include
  * net.h for ETH_HDR_LEN). This is where the two are held together: if
  * either the MTU or the Ethernet header size ever changes, the build stops
@@ -199,6 +206,36 @@ void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
         return;
     }
 
+    /* ─── Re-entrancy guard on frame_buf ─────────────────────────────────
+     * frame_buf is a single static buffer, and this function is reachable
+     * from BOTH the BSP and the timer ISR: net_poll_tick() (kernel/timer.c)
+     * calls e1000_poll_rx() -> net_rx_dispatch() -> dspp_rx_dispatch() ->
+     * dspp_migrate_rx() -> dspp_migrate_send_ack() -> here. If that fires
+     * while the BSP is midway through building a frame, the ISR overwrites
+     * the buffer and the BSP transmits a corrupted or mixed-up packet.
+     *
+     * Latent for as long as senders were fire-and-forget: nothing spent
+     * measurable time inside this function. Retransmission changes that --
+     * the sender now waits for ACKs with interrupts enabled, which is
+     * exactly the window where the ISR arrives mid-send.
+     *
+     * Dropping the nested frame rather than buffering it is deliberate. The
+     * nested caller is always an ACK, and this protocol already tolerates a
+     * lost ACK: the sender's retransmit timer covers it. Corrupting an
+     * in-progress frame is not similarly recoverable. e1000_poll_rx() guards
+     * its own re-entrancy the same way, for the same reason.
+     *
+     * `volatile` and not an atomic: the two claimants are one core and its
+     * own interrupt handler, never two cores, so there is no cross-CPU race
+     * to order -- an interrupt cannot land between the read and the write of
+     * a single-instruction store on the same core. */
+    static volatile uint8_t tx_in_progress = 0;
+    if (tx_in_progress) {
+        dspp_tx_reentrant_dropped++;
+        return;
+    }
+    tx_in_progress = 1;
+
     struct EthernetHeader* eth = (struct EthernetHeader*)frame_buf;
     // Broadcast destination -- see this function's own header comment
     // (dspp.h) on why: no node-id-to-MAC resolution table exists anywhere
@@ -215,6 +252,7 @@ void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
      * management NIC -- see net/e1000.h on why this is a role and not a
      * route. */
     e1000_transmit(NIC_ROLE_CLUSTER, frame_buf, (uint16_t)(ETH_HDR_LEN + dspp_len));
+    tx_in_progress = 0;
 }
 
 void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
@@ -269,13 +307,42 @@ void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
     }
 }
 
+/* Deliberately a separate function rather than a flag on the one above.
+ * Retransmission resends INDIVIDUAL fragments -- resending a whole page
+ * because one slice went missing would multiply traffic by the fragment
+ * count on exactly the link that is already dropping frames. */
+void dspp_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
+                            uint32_t partition_id, uint32_t page_index,
+                            uint32_t frag_index, const uint8_t* page_data) {
+    if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return;
+    struct DSPPMigratePagePacket pkt;
+    pkt.header.magic          = DSPP_MIGRATE_MAGIC;
+    pkt.header.opcode         = DSPP_MIGRATE_PAGE_REQ;
+    pkt.header.node_source_id = (uint16_t)cluster_local_node_id();
+    pkt.header.node_dest_id   = node_dest_id;
+    pkt.header.transfer_id    = transfer_id;
+    pkt.header.partition_id   = partition_id;
+    pkt.header.page_index     = page_index;
+    pkt.header.frag_index     = frag_index;
+    pkt.header.status         = 0;
+    pkt.header.stream_name[0]      = '\0';
+    pkt.header.stream_mime_type[0] = '\0';
+    pkt.header.stream_size         = 0;
+    pkt.header.stream_frames_used  = 0;
+    pkt.header.stream_owner_uid    = 0;
+    dspp_memcpy(pkt.page_data, page_data + (frag_index * DSPP_MIGRATE_FRAG_BYTES),
+                DSPP_MIGRATE_FRAG_BYTES);
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
 // Sends a DSPP_MIGRATE_BEGIN_ACK/PAGE_ACK back to whoever sent us the
 // request just processed -- addressed to their node_source_id, which
 // becomes our node_dest_id for the reply, the same source/dest swap every
 // request/reply protocol uses.
 static void dspp_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
                                    uint64_t transfer_id, uint32_t partition_id,
-                                   uint32_t page_index, uint8_t status) {
+                                   uint32_t page_index, uint32_t frag_index,
+                                   uint8_t status) {
     struct DSPPMigrateHeader ack;
     ack.magic           = DSPP_MIGRATE_MAGIC;
     ack.opcode          = opcode;
@@ -284,6 +351,12 @@ static void dspp_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
     ack.transfer_id     = transfer_id;
     ack.partition_id    = partition_id;
     ack.page_index      = page_index;
+    /* Without this the ACK says "some fragment of page N arrived" and a
+     * sender retransmitting cannot tell WHICH -- so it would either resend
+     * the whole page on any loss, or track nothing and resend nothing. The
+     * field already existed on the header for the request direction; the ACK
+     * simply never populated it. */
+    ack.frag_index      = frag_index;
     ack.status          = status;
     ack.stream_name[0]      = '\0';
     ack.stream_mime_type[0] = '\0';
@@ -293,6 +366,71 @@ static void dspp_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
 
     dspp_transmit_raw(&ack, (uint16_t)sizeof(ack));
 }
+
+/* ─── Sender-side outstanding-ACK record ──────────────────────────────────
+ *
+ * One record, not a table: stream_migrate_send_partition() is synchronous
+ * and partition_migrate() runs its steps one at a time, so exactly one page
+ * is ever in flight from this node. A table would imply a concurrency that
+ * does not exist and would need eviction rules to match.
+ *
+ * Every field is volatile because the ISR writes them and the BSP reads them
+ * in a spin loop; without it the compiler is entitled to hoist the read out
+ * of the loop and spin forever on a stale value. That is not a theoretical
+ * concern -- it is the classic form of this bug.
+ *
+ * No lock. The ISR only ever sets bits and increments; the BSP clears the
+ * whole record before arming it, and does so before any frame for the new
+ * page has been sent, so there is no window where the two disagree about
+ * which page is in flight. On a single core an interrupt cannot interleave
+ * within a single store.
+ */
+static volatile uint64_t ack_transfer_id = 0;
+static volatile uint32_t ack_page_index  = 0;
+static volatile uint8_t  ack_armed       = 0;
+static volatile uint8_t  ack_frag_seen[DSPP_MIGRATE_FRAGS_PER_PAGE];
+static volatile uint32_t ack_frag_count  = 0;
+static volatile uint8_t  ack_nack_seen   = 0;   /* a non-zero status arrived */
+
+void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index) {
+    ack_armed = 0;                     /* disarm while mutating */
+    ack_transfer_id = transfer_id;
+    ack_page_index  = page_index;
+    ack_frag_count  = 0;
+    ack_nack_seen   = 0;
+    for (uint32_t i = 0; i < DSPP_MIGRATE_FRAGS_PER_PAGE; i++) ack_frag_seen[i] = 0;
+    ack_armed = 1;
+}
+
+void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,
+                           uint32_t page_index, uint32_t frag_index,
+                           uint8_t status) {
+    /* An ACK for a transfer or page we are not currently waiting on is a
+     * late duplicate from a previous round. Ignoring it is required, not
+     * merely tidy: counting it would let a stale ACK satisfy the current
+     * page's completion check. */
+    if (!ack_armed || transfer_id != ack_transfer_id) return;
+
+    if (status != 0) { ack_nack_seen = 1; return; }
+
+    /* A BEGIN_ACK with status 0 needs no recording: nothing waits on it (see
+     * dspp.h). A non-zero one was already captured as a refusal above. */
+    if (opcode == DSPP_MIGRATE_BEGIN_ACK) return;
+    if (page_index != ack_page_index) return;
+    if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return;
+    if (!ack_frag_seen[frag_index]) {
+        ack_frag_seen[frag_index] = 1;
+        ack_frag_count++;
+    }
+}
+
+int dspp_migrate_page_acked(void)  { return ack_frag_count >= DSPP_MIGRATE_FRAGS_PER_PAGE; }
+int dspp_migrate_frag_acked(uint32_t frag_index) {
+    if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return 0;
+    return ack_frag_seen[frag_index] ? 1 : 0;
+}
+int dspp_migrate_nacked(void) { return ack_nack_seen ? 1 : 0; }
+void dspp_migrate_disarm(void) { ack_armed = 0; }
 
 void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
     if (!packet || len < sizeof(struct DSPPMigrateHeader)) return;
@@ -310,7 +448,7 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
                                             h->stream_size, h->stream_frames_used,
                                             h->stream_owner_uid);
         dspp_migrate_send_ack(DSPP_MIGRATE_BEGIN_ACK, h->node_source_id,
-                              h->transfer_id, h->partition_id, 0,
+                              h->transfer_id, h->partition_id, 0, 0,
                               (uint8_t)(rc == 0 ? 0 : 1));
         return;
     }
@@ -321,13 +459,25 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
                                           h->frag_index, packet->page_data);
         dspp_migrate_send_ack(DSPP_MIGRATE_PAGE_ACK, h->node_source_id,
                               h->transfer_id, h->partition_id, h->page_index,
-                              (uint8_t)(rc == 0 ? 0 : 1));
+                              h->frag_index, (uint8_t)(rc == 0 ? 0 : 1));
         return;
     }
 
-    // DSPP_MIGRATE_BEGIN_ACK/PAGE_ACK: honestly a no-op here -- see this
-    // file's own "fire-and-forget" scope note in dspp.h. Received and
-    // silently discarded, not misrouted.
+    /* ─── The sender side of the conversation ─────────────────────────────
+     * These two used to be discarded with a comment saying so honestly.
+     * Recording them is what makes retransmission possible: the sender needs
+     * to know which fragments actually landed, and this is the only signal
+     * that carries that.
+     *
+     * Written from the TIMER ISR (net_poll_tick -> ... -> here) while the BSP
+     * spins in dspp_migrate_await_page(). That is the whole mechanism -- the
+     * BSP could not otherwise make progress, since it is the thread doing
+     * the waiting. Hence `volatile` on the record below. */
+    if (h->opcode == DSPP_MIGRATE_BEGIN_ACK || h->opcode == DSPP_MIGRATE_PAGE_ACK) {
+        dspp_migrate_note_ack(h->transfer_id, h->opcode, h->page_index,
+                              h->frag_index, h->status);
+        return;
+    }
 }
 
 /* ─── Live execution-context migration (PEC Phase 3) ──────────────────

@@ -195,6 +195,29 @@ static int g_fail = 0;
     else          { printf("ok:   %s\n", msg); } \
 } while (0)
 
+/* ─── Retransmission stubs ────────────────────────────────────────────────
+ * stream_migrate_send_partition() now waits for a per-page PAGE_ACK and
+ * abandons the transfer -- leaving the source intact -- if none arrives.
+ *
+ * FAITHFUL as "always acknowledged", not merely convenient: this file does
+ * not link net/dspp.c and has no wire, so modelling a silent peer would make
+ * every send here abandon and turn this into an accidental test of the
+ * give-up path. Loss, retransmission and give-up are covered directly by
+ * tests/cross_node_migration_host_test.c against a real lossy destination. */
+void dspp_migrate_send_frag(uint64_t t, uint32_t n, uint32_t p, uint32_t pg,
+                            uint32_t f, const uint8_t* d) {
+    (void)t; (void)n; (void)p; (void)pg; (void)f; (void)d;
+}
+void dspp_migrate_arm_page(uint64_t t, uint32_t p) { (void)t; (void)p; }
+int  dspp_migrate_page_acked(void) { return 1; }
+int  dspp_migrate_frag_acked(uint32_t f) { (void)f; return 1; }
+int  dspp_migrate_nacked(void)     { return 0; }
+void dspp_migrate_disarm(void)     { }
+
+/* The ACK wait times against the LAPIC tick. Nothing waits here (the stub
+ * above acknowledges at once), so a frozen clock is faithful. */
+volatile uint64_t kernel_tick_counter = 0;
+
 int main(void) {
     partition_init();
     stream_init();   // cold start (io_sq/io_cq are NULL) -- just zeroes stream_store[]

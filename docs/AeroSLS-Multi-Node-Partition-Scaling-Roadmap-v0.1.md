@@ -462,7 +462,69 @@ That second one is the sharper lesson: an assertion about something *not* happen
 
 `partition migrate` can now move data across nodes on a standard segment. What remains from §9b is unchanged: the elected leader does no log replication, and `update_page_table_permissions_globally()` and its per-partition sibling are still stubs in `kernel/stubs.c`, so the split-brain write-strip remains bookkeeping rather than enforcement.
 
-There is also no retransmission. This protocol is fire-and-forget by design, so a dropped fragment leaves a page unwritten and a transfer incomplete — detected and logged, never silently completed. Adding reliability is a separate decision from making frames fit, and is not attempted here.
+Retransmission is addressed in §9e.
+
+## 9e. Retransmission, and the retirement bug it exposed
+
+§9d made frames deliverable. It did not make delivery *reliable*: the sender still handed frames to the NIC and moved on, so a single dropped fragment left a page unwritten.
+
+### The bug that made this urgent rather than nice-to-have
+
+`stream_migrate_send_partition()` retired the source slot **unconditionally**, immediately after the last frame was queued. Combine that with §9c's silently-dropped page frames and a migration *deleted the original and delivered nothing* — the worst available outcome, with no error anywhere.
+
+So retransmission without changing that is pointless: retrying a page and then deleting the source regardless is only a slower way to lose data. Retirement is now conditional on every page of the stream being acknowledged. Anything else leaves the source intact and says why.
+
+### How a synchronous sender can wait at all
+
+This looked impossible at first: `partition_migrate()` is synchronous and runs on the BSP, so a sender that blocks for an ACK appears to block the thread that would deliver it.
+
+It does not, and the reason is that **RX is driven by the timer ISR, not the HTTP sweep**. `kernel/timer.c`'s handler calls `net_poll_tick()` → `e1000_poll_rx()` → `net_rx_dispatch()` → `dspp_rx_dispatch()`. So a spin with interrupts enabled *is* progress — the same arrangement `kernel_sleep_ticks()` already depends on. Establishing that before designing anything is what kept this simple; had RX been sweep-driven, the whole thing would have needed an asynchronous retry queue.
+
+### What was built
+
+| | |
+| --- | --- |
+| ACKs identify a fragment | `dspp_migrate_send_ack()` set `page_index` but never `frag_index`, so a sender could not tell *which* slice landed. One field. |
+| Sender-side ACK record | `BEGIN_ACK`/`PAGE_ACK` were received and discarded (dspp.h said so, honestly). Now recorded in a single `volatile` record — written by the ISR, read by the spinning BSP. |
+| Per-fragment retransmit | `dspp_migrate_send_frag()` resends one slice. Resending a whole page on any loss would multiply traffic by the fragment count on exactly the link already dropping frames. |
+| Budget | `DSPP_MIGRATE_ACK_TIMEOUT_TICKS` 25 (250 ms) × `DSPP_MIGRATE_MAX_ATTEMPTS` 4 — about a second per page before the transfer is declared failed. |
+| Conditional retirement | The source is retired only when every page is confirmed. |
+
+A single record rather than a table, because exactly one page is ever in flight — `partition_migrate()` is synchronous. A table would imply concurrency that does not exist and would need eviction rules to match.
+
+**A refusal is not a loss.** A non-zero ACK status means the destination *cannot* take this page — no free slot, index out of range. Resending an identical request cannot change that answer, so the sender aborts immediately instead of burning the budget. Distinguishing the two is what stops a full-disk destination from triggering a retransmit storm.
+
+**There is deliberately no separate wait on `BEGIN_ACK`.** A `PAGE_ACK` with status 0 already proves the BEGIN landed, because `stream_migrate_recv_page()` refuses any page for a transfer it has no inflight row for. The cost, named rather than hidden: if the BEGIN frame itself is lost, every page is refused and the sender aborts where a BEGIN retry would have succeeded. It fails safely — the source survives — but it fails.
+
+### Two hazards found while building it
+
+**1. `dspp_transmit_raw()` builds into a single `static frame_buf`, and the timer ISR can reach it.** `net_poll_tick()` → … → `dspp_migrate_send_ack()` → `dspp_transmit_raw()`, while the BSP is midway through building a frame. Latent for as long as senders were fire-and-forget — nothing spent measurable time in that function. Waiting for ACKs with interrupts enabled is precisely the window that surfaces it. Now guarded, dropping the nested frame and counting it in `dspp_tx_reentrant_dropped`: the nested caller is always an ACK, and a lost ACK is what retransmission is *for*, whereas a corrupted in-progress frame is not recoverable. `e1000_poll_rx()` guards its own re-entrancy the same way.
+
+**2. Waiting on `kernel_tick_counter` hangs the node if the clock stops.** Interrupts disabled by a caller, the LAPIC timer not yet calibrated, a fault in the handler — and `while (tick < deadline)` never terminates. This kernel has been bitten by exactly that shape before: `boot_application_processors()` spun unbounded on an AP that never came up and hung every `-smp 1` boot.
+
+A plain iteration cap cannot serve, because any value short enough to be useful in a host test is far shorter than 25 real ticks and would fire first on real hardware, silently converting the timeout into "spin N times". So the second bound is on the clock being **stalled**: if `DSPP_MIGRATE_STALL_SPINS` pass without `kernel_tick_counter` changing *at all*, the clock is not running and no further waiting will help. On real hardware the tick advances every ~10 ms so the counter resets long before it trips — it is a safety net, not part of the timing. In a host test with a static clock it trips at once, which is what makes the timeout path testable without waiting real seconds.
+
+That second one was found by the test hanging, not by review.
+
+### Verification
+
+`cross_node_migration_host_test.c` is now **97 checks**, and its `e1000_transmit()` stub is a *live destination*: it calls `dspp_migrate_note_ack()` on seeing a `PAGE_REQ` — which is exactly what the real timer ISR does — and advances the tick. A record-only stub had become an unfaithful stand-in the moment the sender started waiting: it models a crashed peer, and every migration would correctly abort.
+
+Five loss scenarios: a dropped fragment is retransmitted and the transfer still completes; only the missing fragment is resent (exactly one extra frame, not a page's worth); an unrecoverable transfer leaves the source active with its bytes still on disk; a refusal is not retried; and a lossless send transmits no speculative extras.
+
+**8 of 8 mutations caught, three only after being sharpened:**
+
+- *Keep retrying a refusal* survived — because I had mutated a latency optimisation (the inner-loop check) rather than the guard that does the work (the outer one). My mistake, not a test gap.
+- *Accept ACKs for the wrong transfer* and *for the wrong page* both survived every loss scenario. Those scenarios have one transfer sending pages in order, so a mismatched ACK never occurs. Scenario 6 now drives `dspp_migrate_note_ack()` directly with stale and cross-transfer ACKs.
+- *Out-of-range `frag_index` not rejected* survived a test that fed **one** bad index — one increment cannot reach the completion threshold, so the check passed with the bounds check removed. Feeding enough to cross the threshold catches it.
+
+That last one is the same lesson as §9d's staging mutation, in a new costume: **a guard is only tested at the multiplicity where its absence changes the outcome.**
+
+Full suite **80/80**; whole-image link 97/97 with the 12 asm/linker-provided undefineds unchanged. Three tests that link `kernel/stream.c` without `net/dspp.c` needed retransmission stubs — each documented as faithfully "always acknowledged", with the reason stated: they have no wire, so modelling a silent peer would turn them into accidental tests of the give-up path.
+
+### Still open
+
+No BEGIN retry (above). No reordering tolerance beyond what the fragment bitmap gives. And the budget is fixed rather than adaptive — a link with real latency would want the timeout derived from observed round-trip times rather than a constant, which is a measurement problem this has no instrumentation for yet.
 
 ## 10. Live/hot migration — deferred, not scoped
 

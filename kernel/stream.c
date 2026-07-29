@@ -7,6 +7,13 @@
 #include "../drivers/nvme_io.h"
 #include "../net/dspp.h"   // Multi-Node Partition Scaling Roadmap Phase 7 -- dspp_migrate_send_begin()/_page()
 
+/* Retransmission times its ACK waits against the LAPIC tick (~100 Hz), not
+ * against a loop counter -- the same discipline net/consensus.h's election
+ * timing documents, for the same reason. Declared extern rather than by
+ * including timer.h so a host test can define its own and drive time
+ * explicitly, which is exactly what testing a timeout requires. */
+extern volatile uint64_t kernel_tick_counter;
+
 // ─── Store ───────────────────────────────────────────────────────────────────
 struct StreamEntry stream_store[STREAM_MAX];
 
@@ -598,28 +605,113 @@ int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) 
                                 src->frames_used, src->owner_uid);
 
         uint64_t src_lba = src->lba_base;
+        int stream_confirmed = 1;
         for (uint32_t p = 0; p < src->frames_used; p++) {
             uint64_t slba = src_lba + (uint64_t)p * 8;
             if (nvme_read_sync(slba, migrate_send_page_buf) != 0) {
                 kernel_serial_printf(
                     "[STREAM] migrate: read failed for partition %u's stream "
                     "'%s' page %u -- stopping with %d slot(s) sent so far. "
-                    "Source left intact (fire-and-forget send, no partial "
-                    "retirement).\n",
+                    "Source left intact.\n",
                     (unsigned)partition_id, src->name, (unsigned)p, sent);
                 return sent;
             }
+
+            /* ── Send, then confirm, retransmitting what did not land ─────
+             * The wait works because the ACKs are delivered by the TIMER
+             * ISR, not by this thread: kernel/timer.c's handler calls
+             * net_poll_tick() -> e1000_poll_rx() -> dspp_rx_dispatch() ->
+             * dspp_migrate_note_ack(). Spinning here with interrupts enabled
+             * is therefore progress, not deadlock -- the same arrangement
+             * kernel_sleep_ticks() depends on.
+             *
+             * Only the missing fragments are resent. Resending a whole page
+             * because one slice was lost would multiply traffic by the
+             * fragment count on precisely the link already dropping frames. */
+            dspp_migrate_arm_page(transfer_id, p);
             dspp_migrate_send_page(transfer_id, dest_node_id, partition_id,
                                    p, migrate_send_page_buf);
+
+            int page_ok = 0;
+            for (uint32_t attempt = 0; attempt < DSPP_MIGRATE_MAX_ATTEMPTS; attempt++) {
+                uint64_t deadline = kernel_tick_counter + DSPP_MIGRATE_ACK_TIMEOUT_TICKS;
+                /* Two bounds, not one. The deadline is the real timeout; the
+                 * stall counter is insurance against the clock not running at
+                 * all, which would otherwise hang the node here (see
+                 * DSPP_MIGRATE_STALL_SPINS in net/dspp.h). */
+                uint64_t last_tick = kernel_tick_counter;
+                uint32_t stalled   = 0;
+                while (kernel_tick_counter < deadline) {
+                    if (dspp_migrate_page_acked()) { page_ok = 1; break; }
+                    /* A non-zero status is a REFUSAL (no slot, bad index),
+                     * not a loss. Retrying an identical request cannot
+                     * change the answer, so stop immediately rather than
+                     * burning the whole budget on it. */
+                    if (dspp_migrate_nacked()) break;
+
+                    if (kernel_tick_counter != last_tick) {
+                        last_tick = kernel_tick_counter;
+                        stalled = 0;
+                    } else if (++stalled > DSPP_MIGRATE_STALL_SPINS) {
+                        kernel_serial_print(
+                            "[STREAM] migrate: tick counter is not advancing -- timer ISR "
+                            "stopped? Abandoning the wait rather than spinning forever.\n");
+                        break;
+                    }
+                    __asm__ volatile("pause");
+                }
+                if (page_ok || dspp_migrate_nacked()) break;
+
+                /* Timed out. Resend only the unacknowledged slices. */
+                uint32_t resent = 0;
+                for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++) {
+                    if (dspp_migrate_frag_acked(f)) continue;
+                    dspp_migrate_send_frag(transfer_id, dest_node_id, partition_id,
+                                           p, f, migrate_send_page_buf);
+                    resent++;
+                }
+                kernel_serial_printf(
+                    "[STREAM] migrate: page %u of '%s' unacknowledged after attempt %u "
+                    "-- retransmitting %u of %u fragment(s).\n",
+                    (unsigned)p, src->name, (unsigned)attempt + 1u,
+                    (unsigned)resent, (unsigned)DSPP_MIGRATE_FRAGS_PER_PAGE);
+            }
+            dspp_migrate_disarm();
+
+            if (!page_ok) {
+                /* The destination never confirmed this page. Abandon the
+                 * stream and -- critically -- do NOT retire the source. See
+                 * the retirement decision below. */
+                kernel_serial_printf(
+                    "[STREAM] migrate: page %u of '%s' NOT confirmed after %u attempt(s)%s "
+                    "-- transfer abandoned, source slot %d left intact.\n",
+                    (unsigned)p, src->name, (unsigned)DSPP_MIGRATE_MAX_ATTEMPTS,
+                    dspp_migrate_nacked() ? " (destination refused)" : "", i);
+                stream_confirmed = 0;
+                break;
+            }
         }
+
+        if (!stream_confirmed) continue;   /* leave src->active alone */
 
         kernel_serial_printf(
             "[STREAM] migrate: partition %u's stream '%s' (slot %d, %u "
-            "page(s)) sent to node %u -- fire-and-forget, BEGIN_ACK/PAGE_ACK "
-            "not waited on.\n",
+            "page(s)) CONFIRMED received by node %u -- every page acknowledged.\n",
             (unsigned)partition_id, src->name, i, src->frames_used,
             (unsigned)dest_node_id);
 
+        /* ─── Retirement is now conditional, and that is the point ─────────
+         * This used to run unconditionally, immediately after the last frame
+         * was handed to the NIC. Combined with a wire that silently dropped
+         * every page frame (see the roadmap's §9c), that meant a migration
+         * deleted the source and delivered nothing -- the worst possible
+         * outcome, and invisible.
+         *
+         * Retransmission would be pointless without this change: retrying a
+         * page and then deleting the original regardless is just a slower way
+         * to lose data. Reaching here means every page of this stream was
+         * acknowledged by the destination, so the source copy is genuinely
+         * redundant. Any other outcome leaves it alone and reports why. */
         stream_retire_slot(src);
         sent++;
     }

@@ -462,6 +462,13 @@ extern uint64_t dspp_tx_oversize_dropped;
  * ever gains a writer outside tests/, that is a bug. */
 extern uint16_t dspp_max_wire_payload;
 
+/* Frames dropped because the timer ISR re-entered dspp_transmit_raw() while
+ * the BSP was building one. Always an ACK (that is the only thing the RX
+ * path transmits), and a lost ACK is covered by the sender's retransmit
+ * timer -- so this is informational, not a fault. See the guard in
+ * net/dspp.c for why dropping beats buffering. */
+extern uint64_t dspp_tx_reentrant_dropped;
+
 void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len);
 
 /* The real DSPP receive entry point, called from net/net.c's
@@ -496,6 +503,94 @@ void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
                               uint32_t partition_id, const char* name,
                               const char* mime_type, uint64_t size,
                               uint32_t frames_used, uint32_t owner_uid);
+
+/* ─── Sender-side ACK tracking (retransmission) ───────────────────────────
+ *
+ * DSPP_MIGRATE_BEGIN_ACK / PAGE_ACK used to be received and discarded, and
+ * dspp.h said so honestly under "fire-and-forget". They are now recorded, so
+ * a sender can tell which fragments landed and resend only the ones that did
+ * not.
+ *
+ * ─── How the waiting works, since it looks impossible at first glance ────
+ * kernel/stream.c's sender is synchronous: it spins waiting for ACKs. The
+ * ACKs are delivered by the TIMER ISR -- kernel/timer.c's timer_irq_handler()
+ * calls net_poll_tick(), which drains the NIC and lands in
+ * dspp_migrate_note_ack() below. So the waiting thread is not the thread
+ * making progress, and a spin with interrupts enabled is not a deadlock.
+ * That is the same arrangement kernel_sleep_ticks() relies on.
+ *
+ * Exactly one page is ever in flight (partition_migrate() is synchronous),
+ * so this is a single record rather than a table. Arm it, send, wait, read.
+ *
+ * A late ACK for a page no longer being awaited is ignored -- otherwise a
+ * duplicate from a previous retransmit round could satisfy the current
+ * page's completion check with fragments that were never sent for it.
+ *
+ * There is deliberately no separate wait on BEGIN_ACK. A PAGE_ACK with
+ * status 0 already proves the BEGIN landed, because stream_migrate_recv_page()
+ * refuses any page for a transfer it has no inflight row for. The cost of
+ * that simplification, named rather than hidden: if the BEGIN frame itself
+ * is lost, every page is refused, the sender sees a refusal and aborts
+ * instead of retrying the BEGIN. The transfer fails safely -- the source is
+ * left intact -- but it fails where a BEGIN retry would have succeeded. */
+void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index);
+void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,
+                           uint32_t page_index, uint32_t frag_index,
+                           uint8_t status);
+int  dspp_migrate_page_acked(void);
+int  dspp_migrate_frag_acked(uint32_t frag_index);
+/* 1 if any ACK for the armed transfer reported a non-zero status. That is a
+ * REFUSAL, not a loss -- the destination has no slot, or the page index was
+ * out of range. Retrying cannot help, so the sender aborts instead. */
+int  dspp_migrate_nacked(void);
+void dspp_migrate_disarm(void);
+
+/* ─── Retransmission budget ───────────────────────────────────────────────
+ * Timeouts are in kernel_tick_counter units (~100 Hz, kernel/timer.c), the
+ * same clock net/consensus.h's election timing uses and for the same reason:
+ * the waiting loop's iteration count says nothing about elapsed time.
+ *
+ * 25 ticks is 250 ms per attempt -- generous for a local segment where a
+ * round trip is sub-millisecond, and deliberately so: the cost of waiting
+ * too long is a slow migration, while the cost of giving up too early is a
+ * retransmit storm on a link that is already struggling.
+ *
+ * 4 attempts, so a page has ~1 second to land before the transfer is
+ * declared failed. A transfer that cannot get one page across in a second
+ * on a local segment has something wrong with it that more retries will not
+ * fix. */
+#define DSPP_MIGRATE_ACK_TIMEOUT_TICKS 25u
+#define DSPP_MIGRATE_MAX_ATTEMPTS       4u
+
+/* ─── The second bound: what if the clock itself stops? ───────────────────
+ * Waiting on kernel_tick_counter assumes the timer ISR is running. If it is
+ * not -- interrupts disabled by a caller, the LAPIC timer not yet
+ * calibrated, a fault in the handler -- then `while (tick < deadline)` never
+ * terminates and the migration hangs the node. This kernel has already been
+ * bitten by exactly that shape once: boot_application_processors() spun
+ * unbounded waiting for an AP that never came up, and hung every `-smp 1`
+ * boot until it was given a bound.
+ *
+ * A plain iteration cap cannot serve, because any value short enough to be
+ * useful in a host test is far shorter than 25 real ticks and would fire
+ * first on real hardware, silently converting the timeout into "spin 100000
+ * times". So the bound is on the clock being STALLED rather than on
+ * iterations outright: if this many spins pass without kernel_tick_counter
+ * changing AT ALL, the clock is not running and no amount of further waiting
+ * will help.
+ *
+ * On real hardware the tick advances every ~10 ms, so the counter resets
+ * long before this trips -- it is a safety net, not part of the timing. In a
+ * host test with a static clock it trips at once, which is what makes the
+ * timeout path testable without waiting real seconds. */
+#define DSPP_MIGRATE_STALL_SPINS   200000u
+
+/* Sender-side: transmits ONE fragment of a page. Used by the retransmit
+ * path to resend just the slices that were not acknowledged, rather than the
+ * whole page. */
+void dspp_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
+                            uint32_t partition_id, uint32_t page_index,
+                            uint32_t frag_index, const uint8_t* page_data);
 
 /* Sender-side: transmits one 4 KiB page as DSPP_MIGRATE_FRAGS_PER_PAGE
  * separate DSPP_MIGRATE_PAGE_REQ frames, each carrying
