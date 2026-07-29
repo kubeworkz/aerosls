@@ -160,7 +160,14 @@ A single instance is single-node by default — `cluster init` (see `docs/COMMAN
 ./run-two-nodes.sh
 ```
 
-This builds the ISO once, boots two QEMU instances with separate disk images and their e1000 NICs connected directly to each other, and prints the exact `cluster init <id>` commands to run in each console. See the script's own header comment and `docs/AeroSLS-Multi-Node-Partition-Scaling-Roadmap-v0.1.md`'s Phase 7 addendum for the full mechanism.
+This builds the ISO once, boots two QEMU instances with separate disk images and their e1000 NICs connected directly to each other, and prints the exact `cluster init <id>` commands to run in each console. It works headless — no display required. Each node's console is a loopback socket you attach from another terminal:
+
+```bash
+telnet 127.0.0.1 12341   # node A   (Ctrl-] then "quit" to detach)
+telnet 127.0.0.1 12342   # node B
+```
+
+That console is the only way in, on any host: this kernel's shell is serial-only and there is no keyboard driver, so a QEMU graphics window shows output but accepts no input. See the script's own header comment and `docs/AeroSLS-Multi-Node-Partition-Scaling-Roadmap-v0.1.md`'s Phase 7 addendum for the full mechanism.
 
 ---
 

@@ -51,13 +51,24 @@ First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services
 
 ### Reaching a two-node cluster
 
-`aeroslsctl` works against a single node under `make x86-run`. It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate. Use the serial consoles for the two-node walkthrough, as that script's own instructions do.
+`aeroslsctl` works against a single node under `make x86-run` (host 3001 → guest 3000). It **cannot** reach either node launched by `run-two-nodes.sh`, and this is structural rather than an oversight in that script: those nodes use `-netdev socket` so they can exchange raw Ethernet frames for DSPP, and there is no host port forward. Adding a second NIC would not fix it — `net/e1000.c` keeps one global tx/rx ring pair and a single `e1000_pci_slot`, so the driver binds exactly one NIC. Giving a node a host-facing NIC would cost it the DSPP link the script exists to demonstrate.
+
+For the two-node walkthrough, use each node's serial console instead. `run-two-nodes.sh` exposes them as listening sockets on loopback:
+
+```
+telnet 127.0.0.1 12341     # node A   (Ctrl-] then "quit" to detach)
+telnet 127.0.0.1 12342     # node B
+```
+
+That console is a full shell, so it reaches strictly more than the REST API does. Treat the port as equivalent to a root login: it binds 127.0.0.1 only, and on a shared or internet-facing box should be tunnelled over SSH rather than firewalled open.
 
 ---
 
 ## Serial Shell
 
 Connect at 38400 baud on COM1. The prompt shows `uid:<id>[tx:<n>]>`  when a transaction is open, otherwise `uid:<id>>` .
+
+**This shell is serial-only.** `read_line()` (`kernel/kernel_io.c`) polls `inb(SERIAL_COM1_BASE)` and there is no PS/2 keyboard driver in the tree, so a QEMU graphics window renders VGA output but cannot accept a keystroke. Under QEMU the console must therefore be something you can *write* to — `-serial mon:stdio`, or a socket chardev as `run-two-nodes.sh` uses. `-serial file:` is output-only and gives you no way in.
 
 ```
 uid:0> help
