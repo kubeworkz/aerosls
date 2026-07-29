@@ -40,6 +40,13 @@
 #include "net/dspp.h"   /* full struct DSPPFullPagePacket definition -- consensus.h only forward-declares it */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* Consensus entry points now take a kernel_tick_counter reading: election
+ * timeouts are wall-clock, not call counts (net/consensus.h, "Election
+ * timing"). This test is about MIGRATION, not timing, so one fixed reading
+ * past LEADER_HEARTBEAT_TICKS suffices. Timing is covered by
+ * tests/consensus_phase1_host_test.c, Scenarios 21-31. */
+#define TEST_NOW 1000u
+
 /* ─── Orchestration Phase 4 gap: registry replication receive ─────────
  * FAITHFUL: no announcement is ever fed to this test's dispatcher, so
  * these are unreached; and the real ones would simply cache an entry that
@@ -178,7 +185,7 @@ int main(void) {
      * migration -- covers both its "nothing to step down" and "real
      * step-down" outcomes directly, not just through partition_migrate(). ── */
     CHECK(partition_lease_step_down(pid_b) == 1, "stepping down a partition with no lease row at all returns 1 (nothing to relinquish)");
-    partition_lease_trigger_election(pid_a);
+    partition_lease_trigger_election(pid_a, TEST_NOW);
     {
         struct DSPPFullPagePacket incoming;
         memset(&incoming, 0, sizeof(incoming));
@@ -188,7 +195,7 @@ int main(void) {
         m->partition_id = pid_a;
         m->term         = partition_lease_get_term(pid_a);
         m->vote_granted = 1;
-        process_partition_consensus_packet(&incoming);
+        process_partition_consensus_packet(&incoming, TEST_NOW);
     }
     CHECK(partition_lease_get_role(pid_a) == ROLE_LEADER, "tenant-a's lease reached quorum (1) and is now LEADER");
     CHECK(partition_holds_write_lease(pid_a) == 1, "tenant-a genuinely holds its own write lease before migration");
@@ -199,7 +206,7 @@ int main(void) {
      * lease to relinquish as part of the orchestration, not an already-
      * stepped-down no-op -- proves partition_migrate() itself drives this,
      * not that the lease just happened to already be down. */
-    partition_lease_trigger_election(pid_a);
+    partition_lease_trigger_election(pid_a, TEST_NOW);
     {
         struct DSPPFullPagePacket incoming;
         memset(&incoming, 0, sizeof(incoming));
@@ -209,7 +216,7 @@ int main(void) {
         m->partition_id = pid_a;
         m->term         = partition_lease_get_term(pid_a);
         m->vote_granted = 1;
-        process_partition_consensus_packet(&incoming);
+        process_partition_consensus_packet(&incoming, TEST_NOW);
     }
     CHECK(partition_holds_write_lease(pid_a) == 1, "tenant-a holds its write lease again, ready for a real migration test");
 

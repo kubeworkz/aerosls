@@ -28,6 +28,65 @@ enum NodeRole {
     ROLE_LEADER
 };
 
+/* ─── Election timing ──────────────────────────────────────────────────────
+ *
+ * Every threshold below is measured in kernel_tick_counter units, which the
+ * LAPIC timer IRQ advances at ~100 Hz (kernel/timer.c -- see init_timer()'s
+ * own "exact rate is calibration-dependent" caveat, and auth.h, which
+ * already relies on the same ~100 Hz for token TTL).
+ *
+ * WHY THAT MATTERS, and why this block exists at all. Both heartbeat ticks
+ * used to count their own CALLS: `heartbeat_ticks_elapsed++` per invocation,
+ * campaign at 150. That is only a 1.5-second timeout if the caller runs at
+ * exactly 100 Hz, and the caller does not -- the ticks are driven from the
+ * BSP's HTTP sweep (net/http.c), which spins as fast as the request load
+ * lets it. Counting calls there means the timeout is however long 150
+ * sweeps happen to take: milliseconds when idle, many seconds under load,
+ * and different on every node. Anchoring to kernel_tick_counter makes 150
+ * mean 1.5 seconds no matter who calls, or how often -- which is what the
+ * original constant was always documented to mean.
+ *
+ * Callers therefore pass `now` rather than the tick reading the clock
+ * itself, matching service_heartbeat_tick(kernel_tick_counter) in
+ * kernel/service_registry.h. It keeps net/consensus.c free of a
+ * kernel_tick_counter extern and lets a host test drive time explicitly. */
+#define CONSENSUS_TICK_HZ            100u
+
+/* Base election timeout: 1.5 s of silence before a FOLLOWER campaigns. */
+#define ELECTION_TIMEOUT_BASE_TICKS  150u
+
+/* Per-node stagger, 250 ms. Raft randomises the election timeout so that
+ * symmetric nodes do not all campaign on the same instant and split the
+ * vote. This kernel has something better than randomness available: every
+ * node already carries a unique, stable id from `node=N` on the boot
+ * command line (kernel/boot_params.h). Deriving the offset from that is
+ * deterministic -- so a host test can assert the exact tick a given node
+ * campaigns on -- and it cannot collide, which random backoff can.
+ *
+ * The cost, stated plainly: node 1 always campaigns first, so leadership
+ * has a fixed priority order rather than going to whichever node happens
+ * to notice first. A flapping node 1 will repeatedly take leadership back
+ * from a stable node 2. That is the trade real Raft's randomisation buys
+ * out of, and if it ever bites, this is the constant to revisit. For a
+ * cluster capped at CLUSTER_NODE_MAX=8 it is the better deal: 250 ms is
+ * far longer than a vote round-trip on a local segment, so the first
+ * candidate wins outright and no split vote occurs at all. */
+#define ELECTION_STAGGER_TICKS        25u
+
+/* Leader heartbeat interval, 300 ms -- five per election timeout window.
+ *
+ * Rate-limiting the LEADER branch is not an optimisation, it is the other
+ * half of the same bug: that branch transmitted on EVERY call, which was
+ * sane at a fixed 100 Hz and becomes a broadcast storm the moment the
+ * caller is a busy loop. Raft's requirement is only that the heartbeat
+ * interval sit comfortably below the election timeout; 5x is ample margin
+ * for a segment that loses the occasional frame. */
+#define LEADER_HEARTBEAT_TICKS        30u
+
+/* consensus_election_timeout() computes this node's staggered deadline. It
+ * is defined further down, immediately after CLUSTER_NODE_MAX, because it
+ * takes the modulus from that constant rather than repeating the literal. */
+
 struct ClusterNode {
     uint32_t node_id;                 /* Phase 1 (Multi-Node Partition Scaling
                                         * Roadmap): this node's real identity.
@@ -38,7 +97,33 @@ struct ClusterNode {
     enum NodeRole role;
     uint32_t active_nodes_count;
     uint32_t stable_quorum_threshold;
-    uint32_t heartbeat_ticks_elapsed;
+
+    /* kernel_tick_counter at the last heartbeat this node ACCEPTED (or at
+     * the last campaign it started). Replaces a `heartbeat_ticks_elapsed`
+     * counter that was incremented once per call -- see the "Election
+     * timing" block above for why a call count could not express a
+     * 1.5-second timeout once the caller stopped being a 100 Hz timer. */
+    uint64_t last_heartbeat_tick;
+
+    /* kernel_tick_counter at the last heartbeat this node SENT as LEADER.
+     * Separate from the field above because they measure opposite
+     * directions: one is "when did I last hear from the leader", the other
+     * "when did I last speak as one". A leader needs both -- it rate-limits
+     * its own transmissions with this, and still honours an incoming
+     * higher-term heartbeat via the other. */
+    uint64_t last_beat_sent_tick;
+
+    /* Votes accumulated in the CURRENT campaign, self included.
+     *
+     * Was a function-local `static uint32_t accumulated_votes = 1;` inside
+     * process_consensus_packet(), reset only on reaching quorum -- so a
+     * campaign that FAILED left its votes banked, and the next campaign
+     * started pre-loaded and could reach "quorum" on fewer real votes than
+     * the threshold. Unreachable while nothing drove elections; a live
+     * split-brain risk the moment something did. Phase 4's per-partition
+     * lease already had this right (struct PartitionLease below); this is
+     * the cluster-wide half catching up. */
+    uint32_t accumulated_votes;
 };
 
 // Extends the DSPP protocol opcodes designed previously
@@ -113,12 +198,20 @@ struct PartitionLease {
                                             * which is this node's role in
                                             * the cluster-wide membership
                                             * election Phase 1 built */
-    uint32_t      heartbeat_ticks_elapsed;
+    uint64_t      last_heartbeat_tick;    /* kernel_tick_counter at the last
+                                            * PARTITION_HEARTBEAT accepted for
+                                            * this partition, or at its last
+                                            * campaign. Same call-count-to-
+                                            * wall-clock correction as struct
+                                            * ClusterNode above. */
+    uint64_t      last_beat_sent_tick;    /* kernel_tick_counter at the last
+                                            * heartbeat sent as this
+                                            * partition's LEADER. */
     uint32_t      accumulated_votes;      /* Phase 4: per-partition vote
                                             * count while CANDIDATE. Can't be
                                             * a single `static` local the way
                                             * Phase 1's process_consensus_
-                                            * packet() uses for its ONE
+                                            * packet() used to for its ONE
                                             * cluster-wide election -- with
                                             * PARTITION_LEASE_MAX partitions
                                             * potentially campaigning
@@ -141,7 +234,7 @@ struct PartitionLease {
 extern struct PartitionLease partition_lease_table[PARTITION_LEASE_MAX];
 
 /* Creates or resets partition_id's lease row: term=0, role=FOLLOWER,
- * voted_for=0, heartbeat_ticks_elapsed=0, accumulated_votes=1 (self),
+ * voted_for=0, both heartbeat timestamps 0, accumulated_votes=1 (self),
  * active=1. Find-existing-row-or-create-new-row, the same table shape
  * kernel/partition.c's partition_set_owner_node() already established for
  * partition_owner_table[] in Phase 2. Returns 0 on success, 1 if the table
@@ -172,20 +265,24 @@ int partition_holds_write_lease(uint32_t partition_id);
 
 /* Per-partition analogue of check_consensus_heartbeat_tick(): if this node
  * holds the LEADER role for partition_id, broadcasts a
- * DSPP_CMD_PARTITION_HEARTBEAT carrying partition_id; otherwise tracks
- * silence and calls partition_lease_trigger_election() after the same
- * 150-tick threshold Phase 1's cluster-wide mechanism uses. No-ops if no
- * lease row exists yet for partition_id (nothing to tick). */
-void partition_lease_heartbeat_tick(uint32_t partition_id);
+ * DSPP_CMD_PARTITION_HEARTBEAT carrying partition_id -- rate-limited to one
+ * per LEADER_HEARTBEAT_TICKS; otherwise measures silence against
+ * consensus_election_timeout() and calls partition_lease_trigger_election()
+ * once it is exceeded. No-ops if no lease row exists yet for partition_id
+ * (nothing to tick).
+ *
+ * `now` is a kernel_tick_counter reading, supplied by the caller. */
+void partition_lease_heartbeat_tick(uint32_t partition_id, uint64_t now);
 
 /* Ticks every currently-active row in partition_lease_table[] via
- * partition_lease_heartbeat_tick() above. Mirrors check_consensus_
- * heartbeat_tick()'s own "called every 10ms by the kernel timer interrupt
- * handler" comment as the single entry point a future boot-time timer
- * wiring phase would call -- same "not actually wired into the real timer
- * yet" honesty caveat Phase 1's own heartbeat function carries (see its
- * findings addendum). */
-void check_partition_lease_heartbeat_tick(void);
+ * partition_lease_heartbeat_tick() above.
+ *
+ * Driven from the BSP's HTTP sweep in net/http.c, alongside
+ * service_heartbeat_tick() and mesh_observe_local(). It TRANSMITS, so it
+ * belongs on the BSP with the other senders and must not be called from the
+ * AP core -- the NIC TX path is not safe to drive from two cores at once
+ * (the same constraint kernel/workload.h documents for the reconciler). */
+void check_partition_lease_heartbeat_tick(uint64_t now);
 
 /* Per-partition analogue of trigger_kernel_election_campaign(): moves
  * partition_id's lease to CANDIDATE, increments its term, votes for self,
@@ -194,14 +291,19 @@ void check_partition_lease_heartbeat_tick(void);
  * on the node, the all-or-nothing behavior this phase's whole point is to
  * narrow -- and broadcasts a DSPP_CMD_PARTITION_REQUEST_VOTE carrying
  * partition_id. Creates a fresh lease row first if partition_id has none
- * yet (mirrors partition_lease_init()'s find-or-create posture). */
-void partition_lease_trigger_election(uint32_t partition_id);
+ * yet (mirrors partition_lease_init()'s find-or-create posture).
+ *
+ * `now` stamps last_heartbeat_tick so the fresh CANDIDATE measures its next
+ * timeout from the campaign it just started. Omitting that is not a cosmetic
+ * slip: the row would still read as silent, campaign again on the very next
+ * tick, and run the term counter away at sweep rate. */
+void partition_lease_trigger_election(uint32_t partition_id, uint64_t now);
 
 /* Multi-Node Partition Scaling Roadmap Phase 6 (cold migration): the
  * voluntary opposite of partition_lease_trigger_election() -- relinquishes
  * THIS node's lease claim for partition_id rather than campaigning for one.
- * Sets role=FOLLOWER, voted_for=0, accumulated_votes=1, heartbeat_ticks_
- * elapsed=0 on the existing row; does NOT bump term (stepping down isn't
+ * Sets role=FOLLOWER, voted_for=0, accumulated_votes=1 on the existing row
+ * and clears its heartbeat timestamps; does NOT bump term (stepping down isn't
  * itself a new term -- the destination node's own future election, if any,
  * advances the term when it actually campaigns, the same way Raft never
  * needs an outgoing leader to manufacture a term bump for itself). Returns
@@ -233,7 +335,7 @@ int partition_lease_step_down(uint32_t partition_id);
  * responsible for routing DSPP_CMD_PARTITION_* opcodes here and Phase 1's
  * original three opcodes to process_consensus_packet() instead, the same
  * way any future RX dispatcher would need to distinguish them. */
-void process_partition_consensus_packet(struct DSPPFullPagePacket* packet);
+void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now);
 
 /* Phase 1: local_cluster_state used to be a `static struct ClusterNode`
  * defined directly in this header, with a hardcoded initializer --
@@ -271,6 +373,24 @@ extern struct ClusterNode local_cluster_state;
  * existing heartbeat silence timer in consensus.c -- both explicitly out
  * of scope here. */
 #define CLUSTER_NODE_MAX 8
+
+/* This node's election timeout, in kernel_tick_counter units: the base
+ * threshold plus a per-node stagger. See the "Election timing" block at the
+ * top of this header for why the offset comes from the node id rather than
+ * from randomness, and what that trade costs.
+ *
+ * The modulus is CLUSTER_NODE_MAX rather than a repeated literal 8 -- ids
+ * are validated against the roster elsewhere, but an out-of-range id
+ * reaching here must still produce a bounded timeout rather than a wildly
+ * distant one that would look like a hung election.
+ *
+ * node_id 0 (cluster_init() never ran) gets exactly the base timeout. Such
+ * a node has an empty roster and quorum 1, so it is not campaigning against
+ * anyone regardless. */
+static inline uint64_t consensus_election_timeout(uint32_t node_id) {
+    return (uint64_t)ELECTION_TIMEOUT_BASE_TICKS +
+           (uint64_t)(node_id % CLUSTER_NODE_MAX) * (uint64_t)ELECTION_STAGGER_TICKS;
+}
 
 struct ClusterPeer {
     uint32_t node_id;
@@ -321,8 +441,20 @@ uint32_t cluster_active_node_count(void);
  * warnings. Declared properly now rather than left for whichever future
  * phase wires the heartbeat timer/RX dispatch into the kernel boot
  * sequence to rediscover. */
-void check_consensus_heartbeat_tick(void);
-void trigger_kernel_election_campaign(void);
+
+/* The cluster-wide membership heartbeat. As LEADER, broadcasts a
+ * DSPP_CMD_HEARTBEAT at most once per LEADER_HEARTBEAT_TICKS. Otherwise
+ * measures silence since last_heartbeat_tick and campaigns once
+ * consensus_election_timeout() is exceeded.
+ *
+ * `now` is a kernel_tick_counter reading. Driven from the BSP's HTTP sweep
+ * (net/http.c) -- NOT, despite what this function's own comment in
+ * consensus.c claimed for several phases, "every 10ms by the kernel timer
+ * interrupt handler on Core 3". Nothing called it at all until that wiring
+ * landed, which is why every node sat at term 0 / FOLLOWER indefinitely and
+ * partition_holds_write_lease() was permanently false. */
+void check_consensus_heartbeat_tick(uint64_t now);
+void trigger_kernel_election_campaign(uint64_t now);
 
 /* ─── Syscalls: operator-driven node identity configuration ────────────
  * This header's own comment above (on cluster_init()/cluster_register_
@@ -361,6 +493,6 @@ void sys_sls_cluster_status(void);
 
 /* struct DSPPFullPagePacket's forward declaration lives at the very top of
  * this file now -- see the comment there. */
-void process_consensus_packet(struct DSPPFullPagePacket* packet);
+void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now);
 
 #endif

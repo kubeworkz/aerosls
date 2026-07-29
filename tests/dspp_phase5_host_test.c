@@ -34,6 +34,19 @@
 #include "net/net.h"   /* Multi-Node Partition Scaling Roadmap Phase 7 -- MACAddr, for this file's net_my_mac stand-in below */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* The consensus entry points take a kernel_tick_counter reading, because
+ * election timeouts are measured in wall-clock ticks rather than call
+ * counts (net/consensus.h, "Election timing"). This test is about DSPP's
+ * partition ROUTING, not about timing, so a single fixed reading is
+ * enough -- it just has to be past LEADER_HEARTBEAT_TICKS so nothing here
+ * trips the heartbeat rate limiter. Timing itself is covered by
+ * tests/consensus_phase1_host_test.c, Scenarios 21-31. */
+#define TEST_NOW 1000u
+
+/* net/dspp.c reads this directly to timestamp the consensus packets it
+ * routes. Held constant for the reason above. */
+volatile uint64_t kernel_tick_counter = TEST_NOW;
+
 /* ─── Orchestration Phase 4 gap: registry replication receive ─────────
  * FAITHFUL: no announcement is ever fed to this test's dispatcher, so
  * these are unreached; and the real ones would simply cache an entry that
@@ -183,7 +196,7 @@ int main(void) {
      * granted VOTE_REPLY is enough) — dspp_page_write_allowed() must then
      * flip to true, proving it's reading Phase 4's real state, not a
      * cached/stale value. ──────────────────────────────────────────────── */
-    partition_lease_trigger_election(pid_a);
+    partition_lease_trigger_election(pid_a, TEST_NOW);
     CHECK(partition_lease_get_role(pid_a) == ROLE_CANDIDATE, "tenant-a's lease election is underway");
     {
         struct DSPPFullPagePacket incoming;
@@ -194,7 +207,7 @@ int main(void) {
         m->partition_id = pid_a;
         m->term         = partition_lease_get_term(pid_a);
         m->vote_granted = 1;
-        process_partition_consensus_packet(&incoming);
+        process_partition_consensus_packet(&incoming, TEST_NOW);
     }
     CHECK(partition_lease_get_role(pid_a) == ROLE_LEADER, "tenant-a's lease reached quorum (1) and is now LEADER");
     CHECK(dspp_page_write_allowed(pid_a) == 1, "tenant-a is local AND holds the write lease — write now allowed");

@@ -50,7 +50,9 @@ int cluster_init(uint32_t local_node_id) {
     local_cluster_state.current_term           = 0;
     local_cluster_state.voted_for               = 0;
     local_cluster_state.role                    = ROLE_FOLLOWER;
-    local_cluster_state.heartbeat_ticks_elapsed = 0;
+    local_cluster_state.last_heartbeat_tick     = 0;
+    local_cluster_state.last_beat_sent_tick     = 0;
+    local_cluster_state.accumulated_votes       = 1;   /* self */
 
     for (uint32_t i = 0; i < CLUSTER_NODE_MAX; i++) cluster_roster[i].active = 0;
     cluster_roster_count = 0;
@@ -133,10 +135,36 @@ void sys_sls_cluster_status(void) {
     }
 }
 
-// Executed every 10ms by the kernel timer interrupt handler on Core 3
-void check_consensus_heartbeat_tick(void) {
+/* Driven from the BSP's HTTP sweep (net/http.c), NOT from the timer IRQ.
+ *
+ * This comment used to read "Executed every 10ms by the kernel timer
+ * interrupt handler on Core 3". That was never true: a repo-wide grep found
+ * no caller anywhere in the kernel -- only this definition, the header
+ * prototype, and one host test. consensus.h's own comment on
+ * check_partition_lease_heartbeat_tick() was honest about it ("not actually
+ * wired into the real timer yet"); this one contradicted it and read as
+ * settled fact, which is how it survived several phases.
+ *
+ * The visible symptom was a cluster that looked healthy: every node
+ * reporting FOLLOWER at term 0 forever, no leader ever elected, and
+ * therefore partition_holds_write_lease() false for every partition and
+ * dspp_page_write_allowed() (net/dspp.c) permanently closed.
+ *
+ * `now` is a kernel_tick_counter reading passed by the caller, matching
+ * service_heartbeat_tick(kernel_tick_counter) in the same sweep. Both
+ * branches below depend on it being wall-clock rather than a call count --
+ * see the "Election timing" block in consensus.h. */
+void check_consensus_heartbeat_tick(uint64_t now) {
     if (local_cluster_state.role == ROLE_LEADER) {
-        // LEADER: Broadcast periodic heartbeats to maintain authority
+        /* LEADER: broadcast periodic heartbeats to maintain authority.
+         *
+         * Rate-limited. Unconditional transmission here was tolerable when
+         * the caller was believed to be a 100 Hz timer; from a sweep that
+         * spins as fast as the request load allows, it is a broadcast storm
+         * on a shared segment every other node has to receive and parse. */
+        if (now - local_cluster_state.last_beat_sent_tick < LEADER_HEARTBEAT_TICKS) return;
+        local_cluster_state.last_beat_sent_tick = now;
+
         struct DSPPPacketHeader hb_packet;
         hb_packet.magic = DSPP_MAGIC;
         hb_packet.opcode = DSPP_CMD_HEARTBEAT;
@@ -146,21 +174,41 @@ void check_consensus_heartbeat_tick(void) {
         dspp_transmit_raw(&hb_packet, sizeof(struct DSPPPacketHeader));
     }
     else {
-        // FOLLOWER/CANDIDATE: Track silence threshold
-        local_cluster_state.heartbeat_ticks_elapsed++;
+        /* FOLLOWER/CANDIDATE: measure silence against wall-clock ticks.
+         *
+         * A node that has never heard anything has last_heartbeat_tick 0,
+         * so on a freshly booted node this elapses from boot -- which is
+         * the intent: nobody is leading, somebody should campaign. */
+        uint64_t silent_for = now - local_cluster_state.last_heartbeat_tick;
 
-        if (local_cluster_state.heartbeat_ticks_elapsed > 150) { // 1.5 seconds of network silence
-            // NETWORK SEVERED / LEADER CRASHED: Trigger an Election Phase
-            local_cluster_state.heartbeat_ticks_elapsed = 0;
-            trigger_kernel_election_campaign();
+        if (silent_for > consensus_election_timeout(local_cluster_state.node_id)) {
+            /* NETWORK SEVERED / LEADER CRASHED / nobody ever led: campaign.
+             * trigger_kernel_election_campaign() re-stamps
+             * last_heartbeat_tick, so the next timeout is measured from
+             * this campaign rather than firing again on the very next
+             * sweep. */
+            trigger_kernel_election_campaign(now);
         }
     }
 }
 
-void trigger_kernel_election_campaign(void) {
+void trigger_kernel_election_campaign(uint64_t now) {
     local_cluster_state.role = ROLE_CANDIDATE;
     local_cluster_state.current_term++;
     local_cluster_state.voted_for = local_cluster_state.node_id; // Vote for self
+
+    /* Restart the clock on this campaign. Without this the CANDIDATE still
+     * reads as silent and re-campaigns on the next tick, incrementing the
+     * term every sweep -- a term counter running away at loop speed, which
+     * on a real segment also invalidates every in-flight vote reply. */
+    local_cluster_state.last_heartbeat_tick = now;
+
+    /* Fresh election, own vote only. Previously a function-local `static`
+     * in process_consensus_packet() that was reset ONLY on winning, so a
+     * failed campaign's votes carried into the next one and quorum could be
+     * declared on fewer real votes than the threshold. Matches what
+     * partition_lease_trigger_election() below has always done. */
+    local_cluster_state.accumulated_votes = 1;
 
     // Split-Brain Mitigation: Strip local memory pages of write authorizations instantly
     // Restricts the local node to safe, non-mutating read operations while split
@@ -182,7 +230,12 @@ void trigger_kernel_election_campaign(void) {
 }
 
 // Processing interface extending our existing 'handle_network_rx_interrupt_packet' handler
-void process_consensus_packet(struct DSPPFullPagePacket* packet) {
+//
+// `now` is a kernel_tick_counter reading, needed because accepting a
+// heartbeat restarts this node's election timer and that timer is now
+// wall-clock rather than a call count. Supplied by the RX path
+// (dspp_rx_dispatch(), net/dspp.c).
+void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
 
     if (packet->header.opcode == DSPP_CMD_HEARTBEAT) {
@@ -190,7 +243,7 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet) {
         if (packet->header.transaction_id >= local_cluster_state.current_term) {
             local_cluster_state.current_term = packet->header.transaction_id;
             local_cluster_state.role = ROLE_FOLLOWER;
-            local_cluster_state.heartbeat_ticks_elapsed = 0;
+            local_cluster_state.last_heartbeat_tick = now;
         }
         return;
     }
@@ -208,6 +261,11 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet) {
             local_cluster_state.current_term = msg->term;
             local_cluster_state.role = ROLE_FOLLOWER;
             local_cluster_state.voted_for = msg->candidate_id;
+            /* Granting a vote also restarts this node's own election timer.
+             * Without it, every follower that just voted would time out and
+             * campaign against the candidate it is still waiting on --
+             * turning one election into a term-inflation race. */
+            local_cluster_state.last_heartbeat_tick = now;
             reply_msg->vote_granted = 1; // Approve candidate
         } else {
             reply_msg->vote_granted = 0; // Deny candidate
@@ -217,15 +275,28 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet) {
     }
 
     else if (packet->header.opcode == DSPP_CMD_VOTE_REPLY && local_cluster_state.role == ROLE_CANDIDATE) {
-        static uint32_t accumulated_votes = 1; // Start with own vote
-
         if (msg->term == local_cluster_state.current_term && msg->vote_granted) {
-            accumulated_votes++;
+            local_cluster_state.accumulated_votes++;
 
-            if (accumulated_votes >= local_cluster_state.stable_quorum_threshold) {
+            if (local_cluster_state.accumulated_votes >= local_cluster_state.stable_quorum_threshold) {
                 // QUORUM ACHIEVED: Promote node safely to Leader status
                 local_cluster_state.role = ROLE_LEADER;
-                accumulated_votes = 1;
+
+                /* Send the authority-asserting heartbeat on the very next
+                 * tick rather than up to LEADER_HEARTBEAT_TICKS later: the
+                 * followers that just voted are counting down their own
+                 * timeouts, and the new leader's first heartbeat is what
+                 * stops them campaigning.
+                 *
+                 * Written as a saturating subtraction rather than a bare
+                 * `now - LEADER_HEARTBEAT_TICKS`. Unsigned wraparound would
+                 * in fact still compare correctly here, but relying on that
+                 * is not worth the reader's double-take. The clamped case
+                 * (now < 30, i.e. the first 300 ms of a boot) cannot occur
+                 * anyway: winning an election requires having first waited
+                 * out an election timeout of at least 150 ticks. */
+                local_cluster_state.last_beat_sent_tick =
+                    (now >= LEADER_HEARTBEAT_TICKS) ? (now - LEADER_HEARTBEAT_TICKS) : 0;
 
                 // Restore full Read-Write authorizations down into Process page tables
                 update_page_table_permissions_globally(0);
@@ -269,7 +340,8 @@ int partition_lease_init(uint32_t partition_id) {
     row->term                    = 0;
     row->voted_for                = 0;
     row->role                    = ROLE_FOLLOWER;
-    row->heartbeat_ticks_elapsed = 0;
+    row->last_heartbeat_tick     = 0;
+    row->last_beat_sent_tick     = 0;
     row->accumulated_votes       = 1;   /* self, matches trigger_election's own reset */
     row->active                  = 1;
 
@@ -293,7 +365,7 @@ int partition_holds_write_lease(uint32_t partition_id) {
     return (row && row->role == ROLE_LEADER) ? 1 : 0;
 }
 
-void partition_lease_trigger_election(uint32_t partition_id) {
+void partition_lease_trigger_election(uint32_t partition_id, uint64_t now) {
     struct PartitionLease* row = find_lease_row(partition_id);
     if (!row) {
         if (partition_lease_init(partition_id) != 0) return;   /* table full -- nothing to campaign with */
@@ -304,6 +376,10 @@ void partition_lease_trigger_election(uint32_t partition_id) {
     row->term++;
     row->voted_for          = local_cluster_state.node_id;   /* vote for self */
     row->accumulated_votes = 1;                                /* fresh election, own vote counted */
+    row->last_heartbeat_tick = now;   /* measure the next timeout from THIS campaign,
+                                        * not from the last heartbeat -- otherwise the
+                                        * row re-campaigns every tick and its term runs
+                                        * away at sweep rate. */
 
     // Split-brain mitigation, now scoped to JUST this partition's objects --
     // not update_page_table_permissions_globally(1)'s all-or-nothing strip,
@@ -342,7 +418,8 @@ int partition_lease_step_down(uint32_t partition_id) {
     row->role                    = ROLE_FOLLOWER;
     row->voted_for                = 0;
     row->accumulated_votes       = 1;
-    row->heartbeat_ticks_elapsed = 0;
+    row->last_heartbeat_tick     = 0;
+    row->last_beat_sent_tick     = 0;
 
     kernel_serial_printf(
         "[CONSENSUS] partition %u: node %u voluntarily stepped down from %s -- lease relinquished (term %u unchanged).\n",
@@ -352,11 +429,18 @@ int partition_lease_step_down(uint32_t partition_id) {
     return 0;
 }
 
-void partition_lease_heartbeat_tick(uint32_t partition_id) {
+void partition_lease_heartbeat_tick(uint32_t partition_id, uint64_t now) {
     struct PartitionLease* row = find_lease_row(partition_id);
     if (!row) return;   /* no lease established for this partition yet -- nothing to tick */
 
     if (row->role == ROLE_LEADER) {
+        /* Rate-limited exactly as the cluster-wide heartbeat is, and it
+         * matters more here: check_partition_lease_heartbeat_tick() walks
+         * every active row, so an unthrottled send would put one 4 KB frame
+         * per leased partition on the wire per sweep. */
+        if (now - row->last_beat_sent_tick < LEADER_HEARTBEAT_TICKS) return;
+        row->last_beat_sent_tick = now;
+
         // LEADER for this partition: broadcast a periodic heartbeat
         // carrying partition_id -- unlike Phase 1's cluster-wide HEARTBEAT
         // (a bare struct DSPPPacketHeader), this needs the full 4KB packet
@@ -377,25 +461,26 @@ void partition_lease_heartbeat_tick(uint32_t partition_id) {
 
         dspp_transmit_raw(&hb_packet, sizeof(struct DSPPFullPagePacket));
     } else {
-        // FOLLOWER/CANDIDATE for this partition: track silence, same
-        // 150-tick threshold Phase 1's cluster-wide mechanism uses.
-        row->heartbeat_ticks_elapsed++;
-
-        if (row->heartbeat_ticks_elapsed > 150) {
-            row->heartbeat_ticks_elapsed = 0;
-            partition_lease_trigger_election(partition_id);
+        // FOLLOWER/CANDIDATE for this partition: measure silence against
+        // wall-clock ticks, using the same staggered threshold Phase 1's
+        // cluster-wide mechanism uses.
+        if (now - row->last_heartbeat_tick >
+                consensus_election_timeout(local_cluster_state.node_id)) {
+            /* trigger re-stamps last_heartbeat_tick. */
+            partition_lease_trigger_election(partition_id, now);
         }
     }
 }
 
-void check_partition_lease_heartbeat_tick(void) {
+void check_partition_lease_heartbeat_tick(uint64_t now) {
     for (uint32_t i = 0; i < PARTITION_LEASE_MAX; i++) {
         if (partition_lease_table[i].active)
-            partition_lease_heartbeat_tick(partition_lease_table[i].partition_id);
+            partition_lease_heartbeat_tick(partition_lease_table[i].partition_id, now);
     }
 }
 
-void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) {
+/* `now` is a kernel_tick_counter reading -- see process_consensus_packet(). */
+void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
     uint32_t partition_id = msg->partition_id;
 
@@ -410,9 +495,9 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) {
 
     if (packet->header.opcode == DSPP_CMD_PARTITION_HEARTBEAT) {
         if (msg->term >= row->term) {
-            row->term                    = msg->term;
-            row->role                    = ROLE_FOLLOWER;
-            row->heartbeat_ticks_elapsed = 0;
+            row->term                = msg->term;
+            row->role                = ROLE_FOLLOWER;
+            row->last_heartbeat_tick = now;
         }
         return;
     }
@@ -432,6 +517,9 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) {
             row->term       = msg->term;
             row->role       = ROLE_FOLLOWER;
             row->voted_for  = msg->candidate_id;
+            /* Voting restarts this row's own timer -- see the cluster-wide
+             * equivalent in process_consensus_packet(). */
+            row->last_heartbeat_tick = now;
             reply_msg->vote_granted = 1;   // Approve candidate
         } else {
             reply_msg->vote_granted = 0;   // Deny candidate
@@ -452,6 +540,11 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) {
                 // than inventing a second majority concept.
                 row->role              = ROLE_LEADER;
                 row->accumulated_votes = 1;
+                /* Assert authority on the next tick, not up to
+                 * LEADER_HEARTBEAT_TICKS later -- see the cluster-wide
+                 * equivalent for why, and for why this saturates. */
+                row->last_beat_sent_tick =
+                    (now >= LEADER_HEARTBEAT_TICKS) ? (now - LEADER_HEARTBEAT_TICKS) : 0;
 
                 // Restore write authorization to JUST this partition's
                 // objects -- the narrowing this whole phase exists for.

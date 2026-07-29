@@ -31,8 +31,13 @@
  * real transmitted-packet inspection (now including the new partition_id
  * field), not just accessor return values.
  *
+ * Scenarios 21-31 cover ELECTION TIMING, added when both heartbeat ticks
+ * were finally wired to a real caller. Until then neither ran at all, and
+ * both counted their own invocations rather than elapsed time -- see the
+ * block above Scenario 21 for the full account.
+ *
  * Build and run:
- *   gcc -std=c11 -I . -I kernel -I drivers -I net \
+ *   gcc -std=c11 -Wall -Wextra -I . -I kernel -I drivers -I net \
  *       tests/consensus_phase1_host_test.c net/consensus.c \
  *       -o /tmp/consensus_phase1_host_test
  *   /tmp/consensus_phase1_host_test
@@ -44,6 +49,20 @@
 #include "../net/consensus.h"
 #include "../net/dspp.h"
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
+/* ─── Simulated wall clock ────────────────────────────────────────────────
+ * Every consensus entry point now takes a kernel_tick_counter reading
+ * instead of counting its own calls (net/consensus.h, "Election timing").
+ * The scenarios below that predate that change do not care what the reading
+ * is, only that it is stable and past the rate-limit window, so they pass
+ * T_NOW. The scenarios that DO care about timing drive `now_ticks` directly
+ * -- which is the point of taking time as a parameter: a host test can make
+ * 1.5 seconds pass without waiting 1.5 seconds.
+ *
+ * Starts well past LEADER_HEARTBEAT_TICKS so a first heartbeat is never
+ * suppressed by the rate limiter for want of elapsed time. */
+static uint64_t now_ticks = 1000;
+#define T_NOW (now_ticks)
 
 /* ─── Orchestration Phase 4 gap: registry replication receive ─────────
  * FAITHFUL: no announcement is ever fed to this test's dispatcher, so
@@ -188,7 +207,7 @@ int main(void) {
      * REQUEST_VOTE path) and inspects the actual transmitted packet. */
     cluster_init(55);
     transmit_call_count = 0;
-    trigger_kernel_election_campaign();
+    trigger_kernel_election_campaign(T_NOW);
     CHECK(transmit_call_count == 1, "trigger_kernel_election_campaign should transmit exactly one packet");
     {
         struct DSPPFullPagePacket* sent = (struct DSPPFullPagePacket*)last_packet;
@@ -206,7 +225,7 @@ int main(void) {
      * full election. */
     local_cluster_state.role = ROLE_LEADER;
     transmit_call_count = 0;
-    check_consensus_heartbeat_tick();
+    check_consensus_heartbeat_tick(T_NOW);
     CHECK(transmit_call_count == 1, "LEADER heartbeat tick should transmit exactly one packet");
     {
         struct DSPPPacketHeader* hb = (struct DSPPPacketHeader*)last_packet;
@@ -228,7 +247,7 @@ int main(void) {
         m->term = 2;
         m->candidate_id = 999; /* some other node campaigning */
         transmit_call_count = 0;
-        process_consensus_packet(&incoming);
+        process_consensus_packet(&incoming, T_NOW);
         CHECK(transmit_call_count == 1, "receiving REQUEST_VOTE should transmit exactly one VOTE_REPLY");
         struct DSPPFullPagePacket* reply = (struct DSPPFullPagePacket*)last_packet;
         CHECK(reply->header.node_source_id == 55, "VOTE_REPLY packet's node_source_id should be the real node id (55)");
@@ -269,7 +288,7 @@ int main(void) {
      * that stub uninstrumented; the call-tracked one below is the proof). */
     transmit_call_count = 0;
     partition_perm_calls = 0;
-    partition_lease_trigger_election(5);
+    partition_lease_trigger_election(5, T_NOW);
     CHECK(partition_lease_get_role(5) == ROLE_CANDIDATE, "partition 5 is CANDIDATE after triggering its election");
     CHECK(partition_lease_get_term(5) == 1, "partition 5's term incremented to 1");
     CHECK(transmit_call_count == 1, "triggering partition 5's election transmits exactly one packet");
@@ -294,7 +313,7 @@ int main(void) {
      * design, would have created). */
     transmit_call_count = 0;
     partition_perm_calls = 0;
-    partition_lease_trigger_election(6);
+    partition_lease_trigger_election(6, T_NOW);
     CHECK(partition_lease_get_role(6) == ROLE_CANDIDATE, "partition 6 is CANDIDATE after its own election trigger");
     CHECK(partition_lease_get_term(6) == 1, "partition 6's own term is 1, independent of partition 5's term");
     CHECK(partition_perm_last_partition_id == 6, "the page-table-permission call for partition 6's election is scoped to 6, not 5");
@@ -331,11 +350,11 @@ int main(void) {
         m->vote_granted = 1;
 
         partition_perm_calls = 0;
-        process_partition_consensus_packet(&incoming);
+        process_partition_consensus_packet(&incoming, T_NOW);
         CHECK(partition_lease_get_role(5) == ROLE_CANDIDATE, "one external granted vote (total 2, quorum 3) is NOT enough -- partition 5 still CANDIDATE");
         CHECK(partition_perm_calls == 0, "no page-table-permission call yet -- quorum not reached");
 
-        process_partition_consensus_packet(&incoming);   /* a second granted VOTE_REPLY */
+        process_partition_consensus_packet(&incoming, T_NOW);   /* a second granted VOTE_REPLY */
         CHECK(partition_lease_get_role(5) == ROLE_LEADER, "second external granted vote (total 3) reaches quorum -- partition 5 promoted to LEADER");
         CHECK(partition_holds_write_lease(5) == 1, "partition_holds_write_lease(5) now correctly reports true");
         CHECK(partition_perm_calls == 1, "page-table-permission stub called exactly once, on the quorum-achieving vote");
@@ -351,7 +370,7 @@ int main(void) {
      * Phase 1's cluster-wide heartbeat which only ever sends a bare
      * DSPPPacketHeader (no partition_id field exists there). */
     transmit_call_count = 0;
-    partition_lease_heartbeat_tick(5);
+    partition_lease_heartbeat_tick(5, T_NOW);
     CHECK(transmit_call_count == 1, "LEADER heartbeat tick for partition 5 transmits exactly one packet");
     {
         struct DSPPFullPagePacket* hb = (struct DSPPFullPagePacket*)last_packet;
@@ -374,7 +393,7 @@ int main(void) {
         struct ConsensusMessage* m = (struct ConsensusMessage*)incoming.payload_4kb;
         m->partition_id = 6;
         m->term = 5;
-        process_partition_consensus_packet(&incoming);
+        process_partition_consensus_packet(&incoming, T_NOW);
         CHECK(partition_lease_get_role(6) == ROLE_FOLLOWER, "partition 6 demoted to FOLLOWER on receiving a HEARTBEAT for its lease");
         CHECK(partition_lease_get_term(6) == 5, "partition 6's term catches up to the heartbeat's term (5)");
     }
@@ -395,7 +414,7 @@ int main(void) {
         m->term = 1;
         m->candidate_id = 301;
         transmit_call_count = 0;
-        process_partition_consensus_packet(&incoming);
+        process_partition_consensus_packet(&incoming, T_NOW);
         CHECK(transmit_call_count == 1, "REQUEST_VOTE for a never-before-seen partition (9) still transmits exactly one VOTE_REPLY");
         struct DSPPFullPagePacket* reply = (struct DSPPFullPagePacket*)last_packet;
         CHECK(reply->header.opcode == DSPP_CMD_PARTITION_VOTE_REPLY, "the reply is a PARTITION_VOTE_REPLY");
@@ -409,9 +428,16 @@ int main(void) {
      * currently-active row -- with partitions 5 (LEADER), 6 (FOLLOWER), and
      * 9 (FOLLOWER) all active, exactly 3 ticks happen. Partition 5 (the
      * only LEADER) transmits its heartbeat; 6 and 9 are FOLLOWER so they
-     * only increment silence counters, no transmission. */
+     * only measure silence, no transmission.
+     *
+     * The clock has to advance past LEADER_HEARTBEAT_TICKS first: Scenario
+     * 16 already sent partition 5's heartbeat at the current reading, and
+     * the rate limiter would (correctly) suppress a second one at the same
+     * instant. Advancing by exactly the interval is deliberate -- it also
+     * proves the limiter re-opens rather than latching shut. */
+    now_ticks += LEADER_HEARTBEAT_TICKS;
     transmit_call_count = 0;
-    check_partition_lease_heartbeat_tick();
+    check_partition_lease_heartbeat_tick(T_NOW);
     CHECK(transmit_call_count == 1, "check_partition_lease_heartbeat_tick(): exactly one transmission -- only partition 5's LEADER heartbeat, not one per active row");
 
     /* Scenario 20: sys_sls_cluster_init()/sys_sls_cluster_status() --
@@ -428,6 +454,391 @@ int main(void) {
     CHECK(cluster_local_node_id() == 99, "sys_sls_cluster_init() really flipped this node's real identity to 99 -- not a no-op wrapper");
     sys_sls_cluster_status();   /* smoke test -- prints to the kernel_serial_printf stub above, nothing to assert on the string itself */
     CHECK(1, "sys_sls_cluster_status() completed without crashing at node_id=99 (its role/term/roster branch)");
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * ELECTION TIMING
+     *
+     * ─── The bug these exist to keep fixed ──────────────────────────────
+     * check_consensus_heartbeat_tick() had NO caller in the kernel. Its own
+     * comment said "Executed every 10ms by the kernel timer interrupt
+     * handler on Core 3"; a repo-wide grep found only the definition, the
+     * prototype, and this file. Every node therefore sat at term 0 /
+     * FOLLOWER forever, no leader was ever elected, and
+     * partition_holds_write_lease() was false for every partition -- which
+     * left dspp_page_write_allowed() (net/dspp.c) permanently closed.
+     *
+     * On a dashboard that reads as a healthy cluster. It is not.
+     *
+     * Wiring it to the BSP's HTTP sweep fixed the "never runs" half and
+     * exposed the other half: the sweep is a busy loop, not a 100 Hz timer,
+     * so a threshold counted in CALLS means nothing. Everything below is
+     * about the tick being correct when driven at an arbitrary rate.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- election timing --\n");
+
+    /* Scenario 21: the timeout is WALL CLOCK, not a call count.
+     *
+     * The old code campaigned on the 151st call regardless of elapsed time.
+     * Ten thousand calls at a standstill clock must produce no campaign at
+     * all: on a fast sweep that is a fraction of a second of real time, and
+     * a node that campaigns then is fighting a leader that is very much
+     * alive. */
+    {
+        cluster_init(1);
+        now_ticks = 5000;
+        local_cluster_state.last_heartbeat_tick = now_ticks;
+        uint32_t term_before = local_cluster_state.current_term;
+        transmit_call_count = 0;
+        for (int i = 0; i < 10000; i++) check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.current_term == term_before,
+              "*** 10000 ticks at a FROZEN clock cause no campaign -- the timeout is elapsed time, not call count ***");
+        CHECK(transmit_call_count == 0, "...and nothing is transmitted");
+        CHECK(local_cluster_state.role == ROLE_FOLLOWER, "...and the node stays FOLLOWER");
+    }
+
+    /* Scenario 22: one call after the timeout DOES campaign. The mirror of
+     * 21 -- a test that only proved "does not fire" would also pass against
+     * a tick that never fires at all, which is precisely the bug. */
+    {
+        cluster_init(1);
+        now_ticks = 5000;
+        local_cluster_state.last_heartbeat_tick = now_ticks;
+        uint64_t timeout = consensus_election_timeout(1);
+
+        now_ticks += timeout;         /* exactly at the threshold: not yet */
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.role == ROLE_FOLLOWER,
+              "at exactly the timeout the node has not yet campaigned (strict >)");
+
+        now_ticks += 1;               /* one tick past */
+        transmit_call_count = 0;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.role == ROLE_CANDIDATE,
+              "*** one tick past the timeout, a SINGLE call campaigns ***");
+        CHECK(local_cluster_state.current_term == 1, "...bumping the term exactly once");
+        CHECK(transmit_call_count == 1, "...and transmitting exactly one REQUEST_VOTE");
+    }
+
+    /* Scenario 23: a CANDIDATE does not re-campaign every tick.
+     *
+     * This is the failure mode that made the whole change risky. If
+     * trigger_kernel_election_campaign() does not restamp the timer, the
+     * row still reads as silent on the next call, campaigns again, and the
+     * term counter runs away at sweep speed -- thousands of terms a second,
+     * every one invalidating the vote replies still in flight for the last.
+     * The node would never win an election it kept restarting. */
+    {
+        uint32_t term_after_first = local_cluster_state.current_term;
+        transmit_call_count = 0;
+        for (int i = 0; i < 500; i++) check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.current_term == term_after_first,
+              "*** 500 further calls at the same instant do NOT bump the term again ***");
+        CHECK(transmit_call_count == 0, "...and send no further REQUEST_VOTEs");
+
+        /* It must still retry eventually -- a candidate whose election was
+         * lost to a dropped packet has to campaign again, or the cluster
+         * deadlocks with everyone waiting. */
+        now_ticks += consensus_election_timeout(1) + 1;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.current_term == term_after_first + 1,
+              "*** but a full timeout later it DOES retry -- a lost election is not a deadlock ***");
+    }
+
+    /* Scenario 24: the per-node stagger.
+     *
+     * Four symmetric nodes campaigning on the same instant split the vote.
+     * Raft randomises; this derives the offset from the node id, so the
+     * ordering is deterministic and a test can assert it exactly. */
+    {
+        CHECK(consensus_election_timeout(1) < consensus_election_timeout(2),
+              "*** node 1's timeout is shorter than node 2's -- they do not campaign together ***");
+        CHECK(consensus_election_timeout(2) < consensus_election_timeout(3), "...and 2 before 3");
+        CHECK(consensus_election_timeout(3) < consensus_election_timeout(4), "...and 3 before 4");
+        CHECK(consensus_election_timeout(2) - consensus_election_timeout(1) == ELECTION_STAGGER_TICKS,
+              "consecutive ids are exactly ELECTION_STAGGER_TICKS apart");
+        CHECK(consensus_election_timeout(1) >= ELECTION_TIMEOUT_BASE_TICKS,
+              "no node campaigns sooner than the base timeout");
+        CHECK(consensus_election_timeout(0) == ELECTION_TIMEOUT_BASE_TICKS,
+              "an uninitialised node (id 0) gets exactly the base timeout");
+
+        /* The gap has to be big enough for a vote round trip, or staggering
+         * buys nothing and the split vote happens anyway. */
+        CHECK(ELECTION_STAGGER_TICKS >= 10,
+              "the stagger is at least 100ms -- long enough for a vote round trip on a local segment");
+
+        /* An out-of-range id must still produce a bounded timeout rather
+         * than one so distant it looks like a hung election. */
+        CHECK(consensus_election_timeout(4000000000u) <=
+                  ELECTION_TIMEOUT_BASE_TICKS + 8 * ELECTION_STAGGER_TICKS,
+              "*** a wildly out-of-range node id still yields a bounded timeout ***");
+    }
+
+    /* Scenario 25: the LEADER heartbeat is rate-limited.
+     *
+     * The other half of the same bug. This branch transmitted on every
+     * call, which was fine at a believed 100 Hz and is a broadcast storm
+     * from a busy loop -- every frame of which every other node on the
+     * segment has to receive and parse. */
+    {
+        cluster_init(1);
+        now_ticks = 9000;
+        local_cluster_state.role = ROLE_LEADER;
+        local_cluster_state.last_beat_sent_tick = now_ticks;
+
+        transmit_call_count = 0;
+        for (int i = 0; i < 1000; i++) check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 0,
+              "*** 1000 LEADER ticks inside one heartbeat interval transmit NOTHING ***");
+
+        now_ticks += LEADER_HEARTBEAT_TICKS;
+        transmit_call_count = 0;
+        for (int i = 0; i < 1000; i++) check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 1,
+              "*** once the interval elapses, exactly ONE heartbeat goes out, not 1000 ***");
+
+        /* Rate-limiting must not become "stops heartbeating": a leader that
+         * goes quiet is a leader the followers will depose. */
+        now_ticks += LEADER_HEARTBEAT_TICKS;
+        transmit_call_count = 0;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 1, "...and again the next interval -- the limiter does not latch shut");
+
+        CHECK(LEADER_HEARTBEAT_TICKS < ELECTION_TIMEOUT_BASE_TICKS,
+              "*** the heartbeat interval is shorter than the election timeout -- "
+              "otherwise a healthy leader gets deposed between its own beats ***");
+    }
+
+    /* Scenario 26: an accepted heartbeat restarts the follower's timer.
+     *
+     * Without this a follower deposes a leader it is actively hearing from. */
+    {
+        cluster_init(1);
+        now_ticks = 20000;
+        local_cluster_state.last_heartbeat_tick = now_ticks;
+        local_cluster_state.current_term = 3;
+
+        /* Advance almost to the deadline, then take a heartbeat. */
+        now_ticks += consensus_election_timeout(1);
+        struct DSPPFullPagePacket hb;
+        memset(&hb, 0, sizeof(hb));
+        hb.header.magic = DSPP_MAGIC;
+        hb.header.opcode = DSPP_CMD_HEARTBEAT;
+        hb.header.transaction_id = 3;
+        process_consensus_packet(&hb, now_ticks);
+        CHECK(local_cluster_state.last_heartbeat_tick == now_ticks,
+              "an accepted HEARTBEAT stamps the timer with the current reading");
+
+        /* Now push past what WOULD have been the deadline had the heartbeat
+         * not landed. No campaign, because the clock restarted. */
+        now_ticks += consensus_election_timeout(1) - 1;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.role == ROLE_FOLLOWER,
+              "*** a node hearing heartbeats never campaigns against a live leader ***");
+        CHECK(local_cluster_state.current_term == 3, "...and its term is untouched");
+    }
+
+    /* Scenario 27: granting a vote also restarts the timer.
+     *
+     * A follower that votes and then immediately times out campaigns
+     * against the very candidate it just endorsed, at a higher term --
+     * which invalidates its own vote. Every node doing that turns one
+     * election into an unbounded term-inflation race that elects nobody. */
+    {
+        cluster_init(1);
+        now_ticks = 30000;
+        local_cluster_state.last_heartbeat_tick = now_ticks;
+        local_cluster_state.current_term = 2;
+
+        now_ticks += consensus_election_timeout(1);   /* right at the edge */
+        struct DSPPFullPagePacket rv;
+        memset(&rv, 0, sizeof(rv));
+        rv.header.magic = DSPP_MAGIC;
+        rv.header.opcode = DSPP_CMD_REQUEST_VOTE;
+        struct ConsensusMessage* m = (struct ConsensusMessage*)rv.payload_4kb;
+        m->term = 3;
+        m->candidate_id = 2;
+        process_consensus_packet(&rv, now_ticks);
+        CHECK(local_cluster_state.voted_for == 2, "the vote is recorded for node 2");
+        CHECK(local_cluster_state.last_heartbeat_tick == now_ticks,
+              "*** granting a vote restarts this node's own election timer ***");
+
+        now_ticks += 1;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.role == ROLE_FOLLOWER,
+              "*** so it does not immediately campaign against the candidate it just voted for ***");
+    }
+
+    /* Scenario 28: a failed campaign does not bank its votes.
+     *
+     * accumulated_votes was a function-local `static` reset ONLY on
+     * reaching quorum. A campaign that fell short left its votes in place,
+     * so the NEXT campaign started pre-loaded and could declare quorum on
+     * fewer real votes than the threshold -- two nodes each believing they
+     * had a majority. Phase 4's per-partition lease always got this right;
+     * the cluster-wide half did not. */
+    {
+        cluster_init(1);
+        cluster_register_peer(2);
+        cluster_register_peer(3);
+        cluster_register_peer(4);
+        CHECK(local_cluster_state.stable_quorum_threshold == 3,
+              "4 nodes -> quorum of 3 (setup check)");
+
+        /* A campaign that gets ONE grant -- two votes counting self, short
+         * of the quorum of 3 -- then times out and campaigns again. The
+         * retry must start from one vote, not from the failed campaign's
+         * two. */
+        now_ticks = 50000;
+        trigger_kernel_election_campaign(now_ticks);
+        {
+            struct DSPPFullPagePacket vr;
+            memset(&vr, 0, sizeof(vr));
+            vr.header.magic = DSPP_MAGIC;
+            vr.header.opcode = DSPP_CMD_VOTE_REPLY;
+            struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
+            vm->term = local_cluster_state.current_term;
+            vm->vote_granted = 1;
+            process_consensus_packet(&vr, now_ticks);
+        }
+        CHECK(local_cluster_state.accumulated_votes == 2, "one grant: self + 1 = 2, short of quorum 3");
+        CHECK(local_cluster_state.role == ROLE_CANDIDATE, "...so still CANDIDATE, not elected");
+
+        now_ticks += consensus_election_timeout(1) + 1;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(local_cluster_state.accumulated_votes == 1,
+              "*** the retry campaign starts from ONE vote (self), not from the failed campaign's two ***");
+        CHECK(local_cluster_state.role == ROLE_CANDIDATE, "...and it is a fresh campaign");
+    }
+
+    /* Scenario 29: winning schedules the first heartbeat immediately.
+     *
+     * The followers that just voted are counting down their own timeouts.
+     * If the new leader waits a full LEADER_HEARTBEAT_TICKS before its
+     * first beat, it burns part of the window it needs to hold them. */
+    {
+        cluster_init(1);
+        cluster_register_peer(2);
+        cluster_register_peer(3);
+        now_ticks = 60000;
+        trigger_kernel_election_campaign(now_ticks);
+        for (int v = 0; v < 2; v++) {
+            struct DSPPFullPagePacket vr;
+            memset(&vr, 0, sizeof(vr));
+            vr.header.magic = DSPP_MAGIC;
+            vr.header.opcode = DSPP_CMD_VOTE_REPLY;
+            struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
+            vm->term = local_cluster_state.current_term;
+            vm->vote_granted = 1;
+            process_consensus_packet(&vr, now_ticks);
+        }
+        CHECK(local_cluster_state.role == ROLE_LEADER,
+              "self + 2 grants reaches quorum 2 of 3 -- elected LEADER");
+
+        transmit_call_count = 0;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 1,
+              "*** the new leader's first heartbeat goes out on the very next tick, "
+              "not one interval later ***");
+    }
+
+    /* Scenario 30: the per-partition lease has the same timer discipline.
+     *
+     * Everything above tests the cluster-wide election. The lease mechanism
+     * is a separate table with its own terms and its own timers, and it is
+     * the one that actually gates writes (partition_holds_write_lease() ->
+     * dspp_page_write_allowed()). A mutation that stopped
+     * PARTITION_HEARTBEAT from restarting a lease row's timer survived the
+     * whole suite until this scenario existed -- Scenario 17 checks the
+     * demotion and the term catch-up, but never looked at the clock. */
+    {
+        cluster_init(1);
+        cluster_register_peer(2);
+        now_ticks = 70000;
+        partition_lease_init(77);
+        partition_lease_trigger_election(77, now_ticks);
+        CHECK(partition_lease_get_role(77) == ROLE_CANDIDATE, "partition 77 is campaigning (setup)");
+
+        /* A heartbeat from the real lease holder, at a term at least ours. */
+        now_ticks += consensus_election_timeout(1);
+        struct DSPPFullPagePacket hb;
+        memset(&hb, 0, sizeof(hb));
+        hb.header.magic = DSPP_MAGIC;
+        hb.header.opcode = DSPP_CMD_PARTITION_HEARTBEAT;
+        struct ConsensusMessage* m = (struct ConsensusMessage*)hb.payload_4kb;
+        m->partition_id = 77;
+        m->term = partition_lease_get_term(77);
+        process_partition_consensus_packet(&hb, now_ticks);
+        CHECK(partition_lease_get_role(77) == ROLE_FOLLOWER, "partition 77 stands down to FOLLOWER");
+
+        /* Past the original deadline, but not past the restarted one. A row
+         * that ignored the heartbeat's timestamp would campaign here --
+         * against a lease holder it is actively hearing from, which is how
+         * two nodes end up both believing they may write to partition 77. */
+        uint32_t term_before = partition_lease_get_term(77);
+        now_ticks += consensus_election_timeout(1) - 1;
+        transmit_call_count = 0;
+        check_partition_lease_heartbeat_tick(now_ticks);
+        CHECK(partition_lease_get_term(77) == term_before,
+              "*** a PARTITION_HEARTBEAT restarts the lease timer -- no campaign against a live holder ***");
+        CHECK(partition_lease_get_role(77) == ROLE_FOLLOWER, "...and the row stays FOLLOWER");
+        CHECK(partition_holds_write_lease(77) == 0,
+              "...and does NOT believe it may write -- the whole point of the lease");
+
+        /* And it must still campaign once the holder genuinely goes quiet. */
+        now_ticks += consensus_election_timeout(1) + 2;
+        check_partition_lease_heartbeat_tick(now_ticks);
+        CHECK(partition_lease_get_term(77) == term_before + 1,
+              "*** but real silence past the timeout DOES start a fresh campaign ***");
+
+        /* ...exactly once. The sweep calls this function on every pass, so
+         * a campaign that fails to restamp its own row re-campaigns on each
+         * one and inflates the term at loop speed. Checking a single call
+         * cannot see that; 500 can. */
+        uint32_t term_campaigning = partition_lease_get_term(77);
+        for (int i = 0; i < 500; i++) check_partition_lease_heartbeat_tick(now_ticks);
+        CHECK(partition_lease_get_term(77) == term_campaigning,
+              "*** 500 sweeps at the same instant do NOT inflate the lease term ***");
+    }
+
+    /* Scenario 31: the per-partition LEADER heartbeat is rate-limited too.
+     *
+     * Worse here than cluster-wide: check_partition_lease_heartbeat_tick()
+     * walks every active row, so an unthrottled send puts one 4 KB frame
+     * per leased partition on the wire per sweep. */
+    {
+        cluster_init(1);
+        cluster_register_peer(2);
+        now_ticks = 80000;
+        partition_lease_init(88);
+        partition_lease_trigger_election(88, now_ticks);
+        struct DSPPFullPagePacket vr;
+        memset(&vr, 0, sizeof(vr));
+        vr.header.magic = DSPP_MAGIC;
+        vr.header.opcode = DSPP_CMD_PARTITION_VOTE_REPLY;
+        struct ConsensusMessage* vm = (struct ConsensusMessage*)vr.payload_4kb;
+        vm->partition_id = 88;
+        vm->term = partition_lease_get_term(88);
+        vm->vote_granted = 1;
+        process_partition_consensus_packet(&vr, now_ticks);
+        CHECK(partition_lease_get_role(88) == ROLE_LEADER, "partition 88 holds the lease (setup)");
+
+        /* The win schedules an immediate first beat, so take that one first. */
+        transmit_call_count = 0;
+        partition_lease_heartbeat_tick(88, now_ticks);
+        CHECK(transmit_call_count == 1, "the new lease holder beats immediately on winning");
+
+        transmit_call_count = 0;
+        for (int i = 0; i < 1000; i++) partition_lease_heartbeat_tick(88, now_ticks);
+        CHECK(transmit_call_count == 0,
+              "*** 1000 further ticks inside one interval transmit NOTHING -- "
+              "no per-sweep 4KB broadcast per leased partition ***");
+
+        now_ticks += LEADER_HEARTBEAT_TICKS;
+        transmit_call_count = 0;
+        for (int i = 0; i < 1000; i++) partition_lease_heartbeat_tick(88, now_ticks);
+        CHECK(transmit_call_count == 1,
+              "*** once the interval elapses, exactly ONE beat, not 1000 ***");
+    }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

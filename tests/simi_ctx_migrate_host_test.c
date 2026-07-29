@@ -104,8 +104,15 @@ struct SLSObjectEntry object_catalog[CATALOG_MAX_OBJECTS];
 uint32_t               object_catalog_count = 0;
 int partition_is_local(uint32_t p) { (void)p; return 1; }
 int partition_holds_write_lease(uint32_t p) { (void)p; return 1; }
-void process_consensus_packet(struct DSPPFullPagePacket* p) { (void)p; }
-void process_partition_consensus_packet(struct DSPPFullPagePacket* p) { (void)p; }
+/* Both now take a kernel_tick_counter reading -- accepting a heartbeat or
+ * granting a vote restarts a wall-clock election timer (net/consensus.h).
+ * FAITHFUL as no-ops: this test drives context migration, never consensus. */
+void process_consensus_packet(struct DSPPFullPagePacket* p, uint64_t now) { (void)p; (void)now; }
+void process_partition_consensus_packet(struct DSPPFullPagePacket* p, uint64_t now) { (void)p; (void)now; }
+
+/* net/dspp.c reads this to timestamp consensus packets it routes; that
+ * branch is unreached here. */
+volatile uint64_t kernel_tick_counter = 0;
 
 /* ─── The stream migrate handlers, as OBSERVABLE stubs ─────────────────
  * Deliberately not the real kernel/stream.c. Both header families share

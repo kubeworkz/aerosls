@@ -14,6 +14,18 @@
 #include "../kernel/simi_ctx_migrate.h"  // PEC Phase 3 -- simi_ctx_migrate_recv_begin()/_chunk()
 #include "../kernel/kernel_io.h"
 
+/* The consensus handlers below need a wall-clock reading to restart election
+ * timers on an accepted heartbeat or a granted vote (net/consensus.h's
+ * "Election timing" block explains why a call count will not do).
+ *
+ * Declared extern here rather than threaded down as a parameter from
+ * net_rx_dispatch(): the RX path is three layers deep (e1000_poll_rx ->
+ * net_rx_dispatch -> here), none of the intermediate layers has any use for
+ * the value, and widening all of them would break the existing self-echo
+ * host test for no benefit. kernel/journal.c reads the counter the same way
+ * for the same reason. */
+extern volatile uint64_t kernel_tick_counter;
+
 uint32_t dspp_resolve_partition_id(uint64_t system_object_id) {
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         if (object_catalog[i].active && object_catalog[i].object_id == system_object_id)
@@ -470,12 +482,12 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
         case DSPP_CMD_REQUEST_VOTE:
         case DSPP_CMD_VOTE_REPLY:
         case DSPP_CMD_HEARTBEAT:
-            process_consensus_packet(pkt);
+            process_consensus_packet(pkt, kernel_tick_counter);
             return;
         case DSPP_CMD_PARTITION_REQUEST_VOTE:
         case DSPP_CMD_PARTITION_VOTE_REPLY:
         case DSPP_CMD_PARTITION_HEARTBEAT:
-            process_partition_consensus_packet(pkt);
+            process_partition_consensus_packet(pkt, kernel_tick_counter);
             return;
         case DSPP_PAGE_READ_REQ:
         case DSPP_PAGE_WRITE_REQ:

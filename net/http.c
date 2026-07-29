@@ -5799,6 +5799,31 @@ void http_server_run(void) {
          * or not this ever runs. */
         service_heartbeat_tick(kernel_tick_counter);
         service_remote_expire(kernel_tick_counter);
+
+        /* Consensus: the cluster-wide membership heartbeat and the
+         * per-partition write leases.
+         *
+         * ─── Why these are here, and were not anywhere ──────────────────
+         * Both had NO caller in the kernel. check_consensus_heartbeat_tick()
+         * carried a comment claiming it ran "every 10ms by the kernel timer
+         * interrupt handler on Core 3"; a repo-wide grep found only its
+         * definition, its prototype and one host test. The result was a
+         * cluster that looked healthy and was inert: every node FOLLOWER at
+         * term 0 forever, no leader ever elected, and therefore
+         * partition_holds_write_lease() false for every partition and
+         * dspp_page_write_allowed() (net/dspp.c) permanently closed.
+         *
+         * They belong on the BSP sweep rather than the AP tick because both
+         * TRANSMIT, and the NIC TX path is not safe to drive from two cores
+         * at once -- the same reason service_heartbeat_tick() above sits
+         * here rather than in reconcile_tick().
+         *
+         * The sweep rate is load-dependent and unbounded, so neither
+         * function may count its own calls: both take kernel_tick_counter
+         * and measure real elapsed time against it. See net/consensus.h's
+         * "Election timing" block. */
+        check_consensus_heartbeat_tick(kernel_tick_counter);
+        check_partition_lease_heartbeat_tick(kernel_tick_counter);
         /* Phase 6: feed the endpoint probe and IPC queue depth into the
          * breakers. AFTER the heartbeat, deliberately -- the heartbeat is
          * what re-probes, so running first would judge breakers on the

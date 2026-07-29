@@ -64,7 +64,7 @@ Weighted/proportional-fair CPU scheduling across partitions (LPAR Phase 12 built
 
 `net/consensus.c` and `net/prefetch.c` additionally compile cleanly under `gcc -Wall -Wextra -std=c11 -fsyntax-only` with zero new warnings — one pre-existing warning (`trigger_kernel_election_campaign` called before its own definition further down the same file, with no forward declaration) was confirmed to predate this phase's edits (same function ordering existed in the original file) and was left alone, consistent with this project's convention of not fixing unrelated pre-existing warnings while touching a file for an unrelated reason. Full regression sweep: `bash tests/run_all.sh` — 41/41 host test files pass (40 pre-existing, unmodified, plus this phase's new one), confirming Phase 1's changes are genuinely additive and didn't disturb anything downstream (a repo-wide grep confirmed `net/consensus.c` and `net/prefetch.c` are the only two files that include `net/consensus.h`, so no third file could have been affected either way).
 
-**What this phase deliberately did not do, named rather than silently skipped:** neither `check_consensus_heartbeat_tick()` (the 10ms timer hook) nor `prefetch_worker_kernel_thread()` is called from anywhere in this codebase — confirmed by a repo-wide grep before this phase started, and unchanged by it. This whole distributed layer is compiled into the kernel image but dormant at boot; nothing wires the heartbeat timer into the interrupt/timer infrastructure, and nothing decides where a real node's `node_id` and initial peer list come from at boot (a command-line arg, an NVMe-persisted config block, a build-time constant — all still open). `cluster_init()`/`cluster_register_peer()` are real, tested, and ready to be called by whatever future phase makes that boot-time wiring decision, but this phase deliberately didn't invent a config source just to have something call them — that's a separate, larger design question than "replace the hardcoded literal with a real, settable one," the same distinction LPAR Phase 9 drew when it scoped process-level partitioning tightly rather than also building every downstream consumer of `partition_id` in the same pass.
+**What this phase deliberately did not do, named rather than silently skipped** *(the heartbeat half of this is now closed — see §9b, which also covers why leaving it open for four phases was worse than it looked)***:** neither `check_consensus_heartbeat_tick()` (the 10ms timer hook) nor `prefetch_worker_kernel_thread()` is called from anywhere in this codebase — confirmed by a repo-wide grep before this phase started, and unchanged by it. This whole distributed layer is compiled into the kernel image but dormant at boot; nothing wires the heartbeat timer into the interrupt/timer infrastructure, and nothing decides where a real node's `node_id` and initial peer list come from at boot (a command-line arg, an NVMe-persisted config block, a build-time constant — all still open). `cluster_init()`/`cluster_register_peer()` are real, tested, and ready to be called by whatever future phase makes that boot-time wiring decision, but this phase deliberately didn't invent a config source just to have something call them — that's a separate, larger design question than "replace the hardcoded literal with a real, settable one," the same distinction LPAR Phase 9 drew when it scoped process-level partitioning tightly rather than also building every downstream consumer of `partition_id` in the same pass.
 
 ## 5. Phase 2 — Partition ownership & node pinning — DONE
 
@@ -152,7 +152,7 @@ Both `net/consensus.c` and `kernel/stubs.c` compile cleanly under `gcc -Wall -We
 
 Full regression sweep: `bash tests/run_all.sh` — 41/41 host test files pass (unchanged count — this phase extended an existing test file rather than adding a new one, the same pattern Phase 2's `partition_host_test.c`/`persist_partition_host_test.c` and Phase 3's `frame_quota_host_test.c` extensions used). A repo-wide grep confirmed `net/consensus.c`, `net/prefetch.c`, and `kernel/partition.c` remain the only real (non-test) files including `net/consensus.h`, and both `net/prefetch.c` and `kernel/partition.c` were independently re-verified to still compile cleanly under the zero-`-I`-flags check above — this phase's header changes didn't disturb either.
 
-**What this phase deliberately did not do, named rather than silently skipped.** No RX dispatcher exists anywhere in this codebase that actually routes incoming DSPP packets to `process_partition_consensus_packet()` vs. `process_consensus_packet()` vs. any of DSPP's own page-mirroring handlers based on `header.opcode` — confirmed unwired before this phase and unchanged by it, the same "compiled into the kernel image but dormant, nothing decides who calls it" honesty caveat Phase 1's own findings gave `check_consensus_heartbeat_tick()`/`process_consensus_packet()`. `update_page_table_permissions_for_partition()` remains a stub with no real body, same as its Phase 1 sibling — real enforcement (walking a specific partition's processes' page tables and actually clearing/restoring `PTE_WRITABLE`) is deferred until page table management is complete, a pre-existing gap this phase narrows the *scope* of but does not close. No leader-to-leader conflict resolution beyond what Raft-lite's term comparison already provides — this phase reuses that mechanism per-partition exactly as-is, it doesn't harden it. Full per-partition Raft log replication remains explicitly out of scope for v1, per this phase's own scope bullets — a lease only answers "which node may currently write," not "what has been durably agreed," which is what Phase 6 (migration) actually needs and all this phase set out to provide.
+**What this phase deliberately did not do, named rather than silently skipped.** No RX dispatcher exists anywhere in this codebase that actually routes incoming DSPP packets to `process_partition_consensus_packet()` vs. `process_consensus_packet()` vs. any of DSPP's own page-mirroring handlers based on `header.opcode` — confirmed unwired before this phase and unchanged by it, the same "compiled into the kernel image but dormant, nothing decides who calls it" honesty caveat Phase 1's own findings gave `check_consensus_heartbeat_tick()`/`process_consensus_packet()`. **Both are now closed:** Phase 7 built the RX dispatcher (`dspp_rx_dispatch()`, §9a) and §9b wired the heartbeat ticks to the BSP sweep. The lease mechanism is live. `update_page_table_permissions_for_partition()` remains a stub with no real body, same as its Phase 1 sibling — real enforcement (walking a specific partition's processes' page tables and actually clearing/restoring `PTE_WRITABLE`) is deferred until page table management is complete, a pre-existing gap this phase narrows the *scope* of but does not close. No leader-to-leader conflict resolution beyond what Raft-lite's term comparison already provides — this phase reuses that mechanism per-partition exactly as-is, it doesn't harden it. Full per-partition Raft log replication remains explicitly out of scope for v1, per this phase's own scope bullets — a lease only answers "which node may currently write," not "what has been durably agreed," which is what Phase 6 (migration) actually needs and all this phase set out to provide.
 
 ## 8. Phase 5 — Partition-aware DSPP routing — DONE
 
@@ -245,6 +245,73 @@ Closed via the mechanism the accessor comment's own forward-looking note already
 Its successor is exercised by `tests/run_cluster_harness.sh`, which puts a stub `qemu-system-x86_64` on `PATH` — one that reproduces the reported gtk failure — and drives the real script through the paths that broke: 75 checks, and mutation-tested by reintroducing each bug. That harness also found a fourth, of its own making: capturing the PID via `PID=$(launch_node ...)` runs the launch in a command substitution, and bash fires `EXIT` traps when such a subshell finishes, deleting the stderr capture the error report then needed. `cluster_register_peer()` is not required for the migrate path itself to work — DSPP migrate frames are self-filtered by destination node id, not by roster membership — only `cluster_init()` needs to have actually run.
 
 Verified: `tests/consensus_phase1_host_test.c` Scenario 20 (4 new checks, 88 total, up from 84) proves `sys_sls_cluster_init()` genuinely flips `cluster_local_node_id()` (not a no-op wrapper) and correctly rejects the reserved sentinel, and that `sys_sls_cluster_status()` runs to completion. `net/consensus.c` compiles clean under `gcc -fsyntax-only` both with and without `-I` flags (matching the real Makefile's `X86_CFLAGS`); `kernel/syscall_dispatch.c` and `user/shell.c` compile clean the same way, zero new errors. Full regression: 60/60 host tests passing, zero regressions.
+
+## 9b. The heartbeat was never wired, and the timeout could not have worked once it was
+
+**Found by running a real four-node cluster and reading its status output.** `tools/aeroslsctl --host localhost:3001 cluster status` reported `role FOLLOWER`, `term 0`, `active nodes 4`, `quorum threshold 3`. Every number is correct. The cluster is also completely inert, and nothing on that screen says so.
+
+### The finding
+
+`check_consensus_heartbeat_tick()` had **no caller anywhere in the kernel**. A repo-wide grep returned its definition, its prototype in `consensus.h`, and one host test. Its own comment read:
+
+```c
+// Executed every 10ms by the kernel timer interrupt handler on Core 3
+```
+
+That was never true. There is no Core 3 (`docs/AeroSLS-LLM-Inference-Feasibility-v0.1.md` §2.5 already recorded the same fiction about `prefetch_worker_kernel_thread()`), and the LAPIC timer ISR calls nothing of the sort. `check_partition_lease_heartbeat_tick()` was in the same position — though *its* header comment in `consensus.h` was honest, carrying a "not actually wired into the real timer yet" caveat. The two comments contradicted each other for four phases, and the confident one won every code review.
+
+Consequences, in order:
+
+- No node ever reaches the silence threshold, so no node ever campaigns.
+- No campaign means no leader, ever. Every node stays `FOLLOWER` at `term 0` indefinitely — which reads exactly like a healthy freshly-started cluster.
+- Nothing calls `partition_lease_init()` outside `consensus.c`, so no lease row exists, so `partition_holds_write_lease()` returns 0 for every partition.
+- Therefore `dspp_page_write_allowed()` (`net/dspp.c`) is permanently false.
+
+The practical blast radius today is small, because the page-move plumbing that gate protects was never built either (`dspp.c` says so in the `READ_REQ` branch), and `partition_migrate()` takes the stream path without consulting a lease. But "the safety gate is stuck closed and nothing notices because the thing it guards is also missing" is not a state to leave undocumented.
+
+### The second bug, which the fix exposed
+
+Wiring the ticks to a caller is one line each. Doing it *correctly* is not, because both functions were written against an assumption that no longer holds.
+
+The natural home is the BSP's HTTP sweep in `net/http.c`, next to `service_heartbeat_tick()` — both **transmit**, and the NIC TX path is not safe to drive from two cores at once, the same constraint `kernel/workload.h` documents for the reconciler. But that sweep is a busy loop whose rate depends on request load. Against it:
+
+- `heartbeat_ticks_elapsed++` counted **calls**, not time. The `150` threshold meant "1.5 seconds" only at exactly 100 Hz. From the sweep it means "150 sweeps" — milliseconds when idle, many seconds under load, and a different duration on every node.
+- The `ROLE_LEADER` branch transmitted on **every** call. Sane at 100 Hz; a broadcast storm from a busy loop, every frame of which every other node on the shared segment must receive and parse.
+
+Both are now anchored to `kernel_tick_counter`, which the LAPIC timer advances at ~100 Hz (`kernel/timer.c`; `kernel/auth.h` already depends on the same rate for token TTL). The constants keep their original documented meanings for the first time. Callers pass `now` rather than the tick reading the clock itself, matching `service_heartbeat_tick(kernel_tick_counter)` — it keeps `consensus.c` free of an extern and lets a host test make 1.5 seconds pass without waiting 1.5 seconds.
+
+### Election timing (`net/consensus.h`)
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `ELECTION_TIMEOUT_BASE_TICKS` | 150 | 1.5 s of silence before a FOLLOWER campaigns |
+| `ELECTION_STAGGER_TICKS` | 25 | 250 ms per node id, via `consensus_election_timeout()` |
+| `LEADER_HEARTBEAT_TICKS` | 30 | 300 ms — five heartbeats per election window |
+
+**The stagger replaces Raft's randomised timeout, and the trade is deliberate.** Raft randomises because its nodes are otherwise symmetric and would split the vote by campaigning together. This kernel already has something randomness cannot offer: a unique, stable node id from `node=N` on the boot command line (`kernel/boot_params.h`). Deriving the offset from it is deterministic — a host test can assert the exact tick a given node campaigns on — and it cannot collide, which random backoff can. The cost, stated plainly: node 1 always campaigns first, so leadership follows a fixed priority order, and a flapping node 1 will repeatedly take leadership back from a stable node 2. That is precisely what Raft's randomisation buys out of. For a cluster capped at `CLUSTER_NODE_MAX=8` on a local segment where 250 ms is far longer than a vote round trip, the first candidate simply wins and no split vote occurs at all.
+
+### Three further bugs found while testing this
+
+1. **`accumulated_votes` was a function-local `static`** in `process_consensus_packet()`, reset **only on reaching quorum**. A campaign that fell short left its votes banked, so the next campaign started pre-loaded and could declare quorum on fewer real votes than the threshold — two nodes each believing they held a majority. Unreachable while nothing drove elections; a live split-brain risk the moment something did. Phase 4's per-partition lease always had this right; the cluster-wide half did not. Now a field on `struct ClusterNode`, reset by `trigger_kernel_election_campaign()`.
+2. **A campaign that does not restamp its own timer re-campaigns every tick**, inflating the term at sweep speed and invalidating every vote reply still in flight for the previous term. The node would never win an election it kept restarting.
+3. **Granting a vote must restart the voter's timer.** Otherwise a follower that votes then immediately times out campaigns against the very candidate it just endorsed, at a higher term, invalidating its own vote — one election becoming an unbounded term-inflation race that elects nobody.
+
+### Verification
+
+`tests/consensus_phase1_host_test.c` Scenarios 21–31, **134 checks total** (up from 88). The two that matter most are a matched pair: 10 000 ticks at a frozen clock cause *no* campaign, and one tick past the deadline causes exactly one. A test with only the first would also pass against a tick that never fires — which is the original bug.
+
+**10 of 10 mutations caught**, and two of them survived the first sweep and are the reason two scenarios exist at all:
+
+- A mutation stopping `PARTITION_HEARTBEAT` from restarting a lease row's timer survived the entire suite. Scenario 17 checked the demotion and the term catch-up but never looked at the clock. Scenario 30 now does.
+- A mutation removing the per-partition leader's rate limit survived, because Scenario 19 called the tick *once* — and once is indistinguishable throttled or not. Scenario 31 calls it 1000 times.
+
+The recurring lesson, again: a property is only tested at the call count and buffer size where it can actually go wrong.
+
+Whole-image link clean (97/97 TUs, 12 remaining undefined symbols all asm/linker-provided, unchanged). Full regression **80/80 host tests**. Five test files needed signature updates for the new `now` parameter (`dspp_phase5`, `cross_node_migration`, `partition_migrate_phase6`, `simi_ctx_migrate`, and the consensus test itself); each got a stated reason for its fixed clock reading rather than a bare `0`.
+
+### What this still does not do
+
+A leader is now elected, and that is a real end-to-end proof the multicast segment carries DSPP both ways — a `REQUEST_VOTE` has to leave one node and a `VOTE_REPLY` come back for it to happen at all. But the leader does not yet *do* anything: there is no log replication, and `dspp_page_write_allowed()` now opens for a lease holder that still has no page-move plumbing behind it. `update_page_table_permissions_globally()` and its per-partition sibling remain stubs in `kernel/stubs.c`, so the split-brain write-strip is still bookkeeping rather than enforcement. Named here so "the cluster elects a leader" is not mistaken for "the cluster replicates."
 
 ## 10. Live/hot migration — deferred, not scoped
 

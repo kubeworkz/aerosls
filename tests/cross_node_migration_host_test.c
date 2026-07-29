@@ -97,8 +97,18 @@ struct SLSObjectEntry object_catalog[CATALOG_MAX_OBJECTS];
 uint32_t               object_catalog_count = 0;
 int partition_is_local(uint32_t partition_id) { (void)partition_id; return 1; }
 int partition_holds_write_lease(uint32_t partition_id) { (void)partition_id; return 1; }
-void process_consensus_packet(struct DSPPFullPagePacket* packet) { (void)packet; }
-void process_partition_consensus_packet(struct DSPPFullPagePacket* packet) { (void)packet; }
+/* Both now take a kernel_tick_counter reading: accepting a heartbeat or
+ * granting a vote restarts an election timer that measures wall-clock
+ * ticks rather than call counts (net/consensus.h, "Election timing").
+ * FAITHFUL as no-ops here -- this test drives the migration opcodes, never
+ * the consensus ones, so neither body is reached. */
+void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) { (void)packet; (void)now; }
+void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) { (void)packet; (void)now; }
+
+/* net/dspp.c reads this to timestamp consensus packets it routes. Held at
+ * 0 because this test never exercises that branch; a consensus test would
+ * need to drive it (see tests/consensus_phase1_host_test.c's now_ticks). */
+volatile uint64_t kernel_tick_counter = 0;
 
 /* ─── Service-replication receive side, as OBSERVABLE stubs ───────────
  * A THIRD header now shares DSPP_MIGRATE_MAGIC. The dispatcher has to
