@@ -139,8 +139,9 @@ void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t
  * must leave by the CLUSTER interface, never the management one. */
 static int transmit_call_count = 0;
 static NicRole last_tx_role = NIC_ROLE_NONE;
+static uint16_t last_tx_size = 0;   /* full frame incl. Ethernet header */
 void e1000_transmit(NicRole role, void* buf, uint16_t size) {
-    (void)buf; (void)size; transmit_call_count++; last_tx_role = role;
+    (void)buf; transmit_call_count++; last_tx_role = role; last_tx_size = size;
 }
 
 /* ─── Stubs for net/dspp.c's Phase 7 dependencies ──────────────────────────
@@ -251,6 +252,85 @@ int main(void) {
         CHECK(process_dspp_page_packet(&req) == 0, "an unrelated opcode (READ_ACK) is not serviced by process_dspp_page_packet");
     }
     CHECK(transmit_call_count == 1, "exactly 1 real packet was transmitted total -- partition_lease_trigger_election()'s own REQUEST_VOTE in Scenario 4. Feeding the VOTE_REPLY in that same scenario does not itself transmit (a granted vote just updates local state), and process_dspp_page_packet() never transmits either (no page-move plumbing exists, by design)");
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * FRAME SIZE vs THE LINK
+     *
+     * ─── The bug these exist to keep fixed ──────────────────────────────
+     * A four-node cluster ran with every node reporting CANDIDATE and a
+     * term climbing once per election timeout, forever. The cause was not
+     * in the consensus logic: struct DSPPFullPagePacket is 4132 bytes, and
+     * every REQUEST_VOTE / VOTE_REPLY transmitted all of it -- nearly three
+     * times the 1500-byte Ethernet MTU. The frames left the NIC and reached
+     * nobody. The meaningful content was 56 bytes.
+     *
+     * Nothing caught it because this test, and every other host test of
+     * DSPP, calls dspp_rx_dispatch() with a buffer already in memory. The
+     * wire is the one part the strategy cannot reach, so the size limit has
+     * to be asserted directly on what the send path hands the driver.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- frame size vs the link --\n");
+
+    /* Scenario 8: the REQUEST_VOTE that really went out fits a frame. This
+     * reads last_tx_size from the e1000 stub, i.e. what the driver was
+     * actually handed, not what the send site intended. */
+    CHECK(last_tx_size > 0, "the stub captured a real transmitted frame size");
+    CHECK(last_tx_size <= DSPP_LINK_MTU,
+          "*** the PARTITION_REQUEST_VOTE frame fits a standard Ethernet frame ***");
+    CHECK(last_tx_size < 200,
+          "*** ...and is tens of bytes, not thousands -- it does not carry an unused 4KB payload ***");
+
+    /* Scenario 9: an oversize payload is REFUSED and COUNTED, never handed
+     * to the driver.
+     *
+     * Reaching the driver is the failure mode that hid this for so long:
+     * e1000_transmit() takes the descriptor, returns success, and the frame
+     * evaporates. Silence is indistinguishable from a healthy idle link. */
+    {
+        static uint8_t big[DSPP_MAX_WIRE_PAYLOAD + 64];
+        memset(big, 0, sizeof(big));
+        uint64_t before_count = dspp_tx_oversize_dropped;
+        int      before_tx    = transmit_call_count;
+
+        dspp_transmit_raw(big, (uint16_t)sizeof(big));
+        CHECK(transmit_call_count == before_tx,
+              "*** an over-MTU payload never reaches the driver ***");
+        CHECK(dspp_tx_oversize_dropped == before_count + 1,
+              "*** ...and is COUNTED, so a stuck cluster has a number to point at ***");
+
+        /* The boundary, both sides. A limit that is off by one byte in the
+         * permissive direction still emits undeliverable frames. */
+        before_tx = transmit_call_count;
+        dspp_transmit_raw(big, (uint16_t)DSPP_MAX_WIRE_PAYLOAD);
+        CHECK(transmit_call_count == before_tx + 1,
+              "exactly DSPP_MAX_WIRE_PAYLOAD is accepted");
+        CHECK(last_tx_size == DSPP_LINK_MTU,
+              "...and lands exactly on the MTU once the Ethernet header is added");
+
+        before_tx = transmit_call_count;
+        dspp_transmit_raw(big, (uint16_t)(DSPP_MAX_WIRE_PAYLOAD + 1));
+        CHECK(transmit_call_count == before_tx,
+              "*** one byte over is refused ***");
+    }
+
+    /* Scenario 10: the 4 KB page family is STILL undeliverable, and this
+     * test says so out loud rather than leaving it to be rediscovered.
+     *
+     * Deliberately asserting the broken state: shrinking the consensus
+     * messages fixed the election, not the page transfer. These structs
+     * genuinely carry a 4 KB page and need jumbo frames or protocol-level
+     * fragmentation. If a later change makes them deliverable, this check
+     * fails and whoever did it updates the record. */
+    {
+        CHECK(sizeof(struct DSPPMigratePagePacket) > DSPP_MAX_WIRE_PAYLOAD,
+              "KNOWN GAP: DSPPMigratePagePacket still exceeds the link MTU -- "
+              "cross-node page transfer cannot complete on a standard segment");
+        CHECK(sizeof(struct DSPPCtxMigrateChunkPacket) > DSPP_MAX_WIRE_PAYLOAD,
+              "KNOWN GAP: DSPPCtxMigrateChunkPacket likewise");
+        CHECK(sizeof(struct DSPPMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+              "...though the migrate BEGIN header does fit -- which is why a "
+              "migration appears to start and then silently moves nothing");
+    }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

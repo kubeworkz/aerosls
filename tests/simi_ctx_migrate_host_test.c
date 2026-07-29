@@ -114,6 +114,38 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* p, uint64_t n
  * branch is unreached here. */
 volatile uint64_t kernel_tick_counter = 0;
 
+/* ─── This test raises the link limit, deliberately ───────────────────────
+ * struct DSPPCtxMigrateChunkPacket is 4217 bytes and cannot cross a
+ * standard Ethernet segment. That is real and unfixed -- see net/dspp.h,
+ * and the roadmap doc's section on it.
+ *
+ * But nothing this file tests is about the link. Chunk reassembly, index
+ * ordering, duplicate rejection, corruption detection and short-final-chunk
+ * handling are all properties of the layer ABOVE it, and they will be
+ * exactly as correct (or not) whichever way the MTU problem is eventually
+ * solved. Raising dspp_max_wire_payload here keeps that coverage intact
+ * rather than deleting it or rewriting every scenario to hand-build frames.
+ *
+ * The danger with a seam like this is that it silently disables the
+ * property it was added around, so this is stated plainly: the link limit
+ * itself is asserted by tests/dspp_phase5_host_test.c Scenarios 9-10 and
+ * tests/cross_node_migration_host_test.c Scenario 1, and NEITHER of those
+ * touches this variable. If this file ever starts being cited as evidence
+ * that context migration works over a real wire, it is being misread. */
+static void raise_link_limit_for_protocol_tests(void) {
+    /* Sized to the LARGEST DSPP packet family, not just the context one:
+     * a dispatcher-routing scenario below feeds a stream PAGE packet (4273
+     * B, bigger than a context chunk's 4217) to prove the two families stay
+     * distinguishable. Sizing off only the family this file is named after
+     * left that one scenario failing -- the same "size off whichever struct
+     * is actually larger" mistake net/dspp.c's own frame buffer records
+     * having made once already. */
+    size_t biggest = sizeof(struct DSPPCtxMigrateChunkPacket);
+    if (sizeof(struct DSPPMigratePagePacket) > biggest) biggest = sizeof(struct DSPPMigratePagePacket);
+    if (sizeof(struct DSPPFullPagePacket)    > biggest) biggest = sizeof(struct DSPPFullPagePacket);
+    dspp_max_wire_payload = (uint16_t)biggest;
+}
+
 /* ─── The stream migrate handlers, as OBSERVABLE stubs ─────────────────
  * Deliberately not the real kernel/stream.c. Both header families share
  * DSPP_MIGRATE_MAGIC, so the dispatcher has to tell them apart by opcode
@@ -254,6 +286,7 @@ static uint32_t migrate(struct SimiContext* src, const SimiObject* image_for_b,
 
 int main(void) {
     printf("=== PEC Phase 3: live context migration across nodes ===\n\n");
+    raise_link_limit_for_protocol_tests();   /* see the note above -- NOT a claim the link carries these */
 
     SimiObject obj = {0};
     if (simi_obj_read("tools/simi/tests/loop_sum.tmo", &obj) != 0) {

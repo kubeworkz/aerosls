@@ -23,6 +23,34 @@ struct ClusterNode  local_cluster_state = {0};
 struct ClusterPeer  cluster_roster[CLUSTER_NODE_MAX];
 uint32_t             cluster_roster_count = 0;
 
+/* ─── How much of a consensus packet actually goes on the wire ────────────
+ *
+ * Every send site below builds a struct DSPPFullPagePacket and used to
+ * transmit sizeof(that) -- 4132 bytes -- when the meaningful content is a
+ * 36-byte DSPPPacketHeader followed by a 20-byte ConsensusMessage. The
+ * other 4076 bytes are the unused tail of payload_4kb, a field this family
+ * of opcodes only borrows because ConsensusMessage had to live somewhere.
+ *
+ * That was not merely wasteful, it was fatal: 4132 + 14 bytes of Ethernet
+ * header is nearly three times the 1500-byte link MTU, so no REQUEST_VOTE
+ * or VOTE_REPLY ever reached another node. Nodes campaigned, heard nothing
+ * back, timed out, and campaigned again -- a cluster reporting CANDIDATE
+ * with a term climbing once per election timeout, indefinitely. The
+ * cluster-wide HEARTBEAT was the one consensus message that worked, and
+ * only because it sends a bare DSPPPacketHeader.
+ *
+ * Receivers are unaffected: dspp_rx_dispatch() admits anything at least
+ * sizeof(struct DSPPPacketHeader), and both handlers read only the leading
+ * ConsensusMessage out of payload_4kb. */
+#define CONSENSUS_WIRE_LEN \
+    ((uint16_t)(sizeof(struct DSPPPacketHeader) + sizeof(struct ConsensusMessage)))
+
+/* If a future field pushes ConsensusMessage past the link MTU this must
+ * fail at compile time, not by silently resuming the old behaviour of
+ * emitting frames that go nowhere. */
+_Static_assert(CONSENSUS_WIRE_LEN <= DSPP_MAX_WIRE_PAYLOAD,
+               "a consensus packet no longer fits a standard Ethernet frame");
+
 /* Recomputes active_nodes_count/stable_quorum_threshold from the roster's
  * real, current size. Called after every membership change rather than
  * kept incrementally in sync, the same "recompute the derived field from
@@ -226,7 +254,7 @@ void trigger_kernel_election_campaign(uint64_t now) {
 
     kernel_serial_printf("[CONSENSUS] Terms timeout. Node %u campaigning for Term election: %d\n",
                           (unsigned)local_cluster_state.node_id, local_cluster_state.current_term);
-    dspp_transmit_raw(&vote_req, sizeof(struct DSPPFullPagePacket));
+    dspp_transmit_raw(&vote_req, CONSENSUS_WIRE_LEN);
 }
 
 // Processing interface extending our existing 'handle_network_rx_interrupt_packet' handler
@@ -271,7 +299,7 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
             reply_msg->vote_granted = 0; // Deny candidate
         }
 
-        dspp_transmit_raw(&reply, sizeof(struct DSPPFullPagePacket));
+        dspp_transmit_raw(&reply, CONSENSUS_WIRE_LEN);
     }
 
     else if (packet->header.opcode == DSPP_CMD_VOTE_REPLY && local_cluster_state.role == ROLE_CANDIDATE) {
@@ -402,7 +430,7 @@ void partition_lease_trigger_election(uint32_t partition_id, uint64_t now) {
     kernel_serial_printf(
         "[CONSENSUS] partition %u: node %u campaigning for write lease, term %u.\n",
         (unsigned)partition_id, (unsigned)local_cluster_state.node_id, (unsigned)row->term);
-    dspp_transmit_raw(&vote_req, sizeof(struct DSPPFullPagePacket));
+    dspp_transmit_raw(&vote_req, CONSENSUS_WIRE_LEN);
 }
 
 int partition_lease_step_down(uint32_t partition_id) {
@@ -459,7 +487,7 @@ void partition_lease_heartbeat_tick(uint32_t partition_id, uint64_t now) {
         msg->vote_granted  = 0;
         msg->last_log_index = 0;
 
-        dspp_transmit_raw(&hb_packet, sizeof(struct DSPPFullPagePacket));
+        dspp_transmit_raw(&hb_packet, CONSENSUS_WIRE_LEN);
     } else {
         // FOLLOWER/CANDIDATE for this partition: measure silence against
         // wall-clock ticks, using the same staggered threshold Phase 1's
@@ -525,7 +553,7 @@ void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint6
             reply_msg->vote_granted = 0;   // Deny candidate
         }
 
-        dspp_transmit_raw(&reply, sizeof(struct DSPPFullPagePacket));
+        dspp_transmit_raw(&reply, CONSENSUS_WIRE_LEN);
         return;
     }
 

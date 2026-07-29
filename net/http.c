@@ -47,6 +47,12 @@
 #include "../kernel/service_registry.h"
 #include "../kernel/service_mesh.h"
 #include "consensus.h"
+/* Declared here rather than by including dspp.h: that header has no include
+ * guard of its own (see its note on struct DSPPFullPagePacket), so pulling
+ * it in alongside consensus.h double-defines every struct in it. A scalar
+ * extern composes safely -- the same reason consensus.h forward-declares
+ * struct DSPPFullPagePacket instead of including the header. */
+extern uint64_t dspp_tx_oversize_dropped;   /* net/dspp.c */
 #include "../kernel/workload.h"
 #include "../kernel/workload_ctx.h"         // Multitenant Isolation Gap Analysis §5 item 1 -- GET/POST /api/tenants
 #include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
@@ -2540,6 +2546,14 @@ static int api_cluster_view(char* buf, int max) {
     jb_uint(&j, "term", local_cluster_state.current_term);              jb_putc(&j, ',');
     jb_uint(&j, "active_nodes", local_cluster_state.active_nodes_count);jb_putc(&j, ',');
     jb_uint(&j, "quorum_threshold", local_cluster_state.stable_quorum_threshold);
+    jb_putc(&j, ',');
+    /* Non-zero means some DSPP message is too large for the link and is
+     * being refused rather than delivered (net/dspp.h). Surfaced right next
+     * to role/term because that is the pairing that diagnoses a stuck
+     * cluster: CANDIDATE with a climbing term AND a rising drop count is
+     * "my votes are not reaching anyone", which otherwise looks identical
+     * to "my peers are refusing to vote for me". */
+    jb_uint(&j, "dspp_oversize_dropped", (uint32_t)dspp_tx_oversize_dropped);
     jb_putc(&j, ',');
     /* node_id 0 is Phase 1's "cluster_init() was never called" sentinel.
      * Reported explicitly so a UI can say "this node is standalone"

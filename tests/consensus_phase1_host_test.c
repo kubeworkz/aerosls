@@ -840,6 +840,98 @@ int main(void) {
               "*** once the interval elapses, exactly ONE beat, not 1000 ***");
     }
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * Scenario 32: EVERY consensus send site fits an Ethernet frame.
+     *
+     * ─── The bug ────────────────────────────────────────────────────────
+     * All five non-heartbeat send sites transmitted sizeof(struct
+     * DSPPFullPagePacket) -- 4132 bytes, because ConsensusMessage lives in
+     * that struct's payload_4kb field and the send sites passed the whole
+     * struct. With 14 bytes of Ethernet header that is 4146 on a link whose
+     * MTU is 1500, and the receiving e1000 has RCTL.LPE clear (so it
+     * discards anything over 1522) with 2048-byte buffers and no descriptor
+     * chaining in e1000_poll_rx().
+     *
+     * So no REQUEST_VOTE and no VOTE_REPLY ever arrived anywhere. A real
+     * four-node cluster ran for minutes with every node CANDIDATE and the
+     * term climbing once per election timeout. Every scenario above passed
+     * throughout -- they drive the handlers directly and never touch a wire.
+     *
+     * The cluster-wide HEARTBEAT was the one message that worked, and only
+     * by accident: it sends a bare 36-byte DSPPPacketHeader.
+     *
+     * Asserting on last_packet_size (what the send site actually passed to
+     * dspp_transmit_raw) rather than on a constant is the point -- a future
+     * edit that reintroduces sizeof(struct DSPPFullPagePacket) at any one of
+     * the five sites fails here.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- every consensus frame fits the link --\n");
+    {
+        cluster_init(3);
+        cluster_register_peer(4);
+        now_ticks = 90000;
+
+        /* 1. cluster-wide REQUEST_VOTE */
+        trigger_kernel_election_campaign(now_ticks);
+        CHECK(last_packet_size + 14 <= 1500,
+              "*** REQUEST_VOTE fits an Ethernet frame ***");
+        CHECK(last_packet_size < 200,
+              "*** ...at tens of bytes, not the 4132 of a full page packet ***");
+
+        /* 2. cluster-wide VOTE_REPLY */
+        {
+            struct DSPPFullPagePacket rv;
+            memset(&rv, 0, sizeof(rv));
+            rv.header.magic  = DSPP_MAGIC;
+            rv.header.opcode = DSPP_CMD_REQUEST_VOTE;
+            struct ConsensusMessage* m = (struct ConsensusMessage*)rv.payload_4kb;
+            m->term = local_cluster_state.current_term + 5;
+            m->candidate_id = 4;
+            process_consensus_packet(&rv, now_ticks);
+            CHECK(last_packet_size + 14 <= 1500, "*** VOTE_REPLY fits ***");
+        }
+
+        /* 3. cluster-wide HEARTBEAT (was always fine -- proven, not assumed) */
+        local_cluster_state.role = ROLE_LEADER;
+        local_cluster_state.last_beat_sent_tick = 0;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(last_packet_size + 14 <= 1500, "HEARTBEAT fits");
+
+        /* 4. PARTITION_REQUEST_VOTE */
+        partition_lease_init(41);
+        partition_lease_trigger_election(41, now_ticks);
+        CHECK(last_packet_size + 14 <= 1500, "*** PARTITION_REQUEST_VOTE fits ***");
+
+        /* 5. PARTITION_VOTE_REPLY */
+        {
+            struct DSPPFullPagePacket pv;
+            memset(&pv, 0, sizeof(pv));
+            pv.header.magic  = DSPP_MAGIC;
+            pv.header.opcode = DSPP_CMD_PARTITION_REQUEST_VOTE;
+            struct ConsensusMessage* m = (struct ConsensusMessage*)pv.payload_4kb;
+            m->partition_id = 42;
+            m->term = 9;
+            m->candidate_id = 4;
+            process_partition_consensus_packet(&pv, now_ticks);
+            CHECK(last_packet_size + 14 <= 1500, "*** PARTITION_VOTE_REPLY fits ***");
+        }
+
+        /* 6. PARTITION_HEARTBEAT -- the one whose oversize was least
+         *    obvious, since a bare header would have been enough had
+         *    partition_id fitted in DSPPPacketHeader. */
+        partition_lease_init(43);
+        {
+            struct PartitionLease* r = 0;
+            for (uint32_t i = 0; i < PARTITION_LEASE_MAX; i++)
+                if (partition_lease_table[i].active &&
+                    partition_lease_table[i].partition_id == 43) r = &partition_lease_table[i];
+            r->role = ROLE_LEADER;
+            r->last_beat_sent_tick = 0;
+        }
+        partition_lease_heartbeat_tick(43, now_ticks);
+        CHECK(last_packet_size + 14 <= 1500, "*** PARTITION_HEARTBEAT fits ***");
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }

@@ -26,6 +26,21 @@
  * for the same reason. */
 extern volatile uint64_t kernel_tick_counter;
 
+/* See dspp.h. Non-zero means some DSPP message is structurally too large
+ * for this link. */
+uint64_t dspp_tx_oversize_dropped = 0;
+
+/* See dspp.h. No kernel code assigns to this -- grep before adding one. */
+uint16_t dspp_max_wire_payload = DSPP_MAX_WIRE_PAYLOAD;
+
+/* dspp.h has to spell DSPP_MAX_WIRE_PAYLOAD as a literal (it cannot include
+ * net.h for ETH_HDR_LEN). This is where the two are held together: if
+ * either the MTU or the Ethernet header size ever changes, the build stops
+ * rather than the limit quietly becoming wrong in the direction that emits
+ * undeliverable frames again. */
+_Static_assert(DSPP_MAX_WIRE_PAYLOAD == DSPP_LINK_MTU - ETH_HDR_LEN,
+               "DSPP_MAX_WIRE_PAYLOAD has drifted from DSPP_LINK_MTU - ETH_HDR_LEN");
+
 uint32_t dspp_resolve_partition_id(uint64_t system_object_id) {
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         if (object_catalog[i].active && object_catalog[i].object_id == system_object_id)
@@ -116,6 +131,33 @@ void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
     if ((uint32_t)dspp_len > sizeof(frame_buf) - ETH_HDR_LEN) {
         kernel_serial_printf("[DSPP] transmit_raw: dspp_len %u exceeds max frame payload -- dropped, not truncated.\n",
                              (unsigned)dspp_len);
+        return;
+    }
+
+    /* The link limit, which is far below the buffer limit above and is the
+     * one that actually decides whether a frame arrives. See dspp.h for the
+     * full account -- briefly: without RCTL.LPE the receiving e1000 discards
+     * anything over 1522 bytes, and e1000_poll_rx() has no descriptor
+     * chaining, so a 4 KB frame has nowhere to land regardless.
+     *
+     * Refusing here rather than at the driver is deliberate. e1000_transmit()
+     * would hand the descriptor to hardware and return success; the frame
+     * would simply never be seen by anyone. A cluster that cannot converge
+     * because its votes evaporate is far harder to diagnose than a counter
+     * that says so. */
+    if ((uint32_t)dspp_len > dspp_max_wire_payload) {
+        dspp_tx_oversize_dropped++;
+        /* Logged only on the first occurrence and then every 1000th: this
+         * sits under a per-page transfer loop, so an unthrottled print
+         * would bury the console and slow the very path being diagnosed. */
+        if (dspp_tx_oversize_dropped == 1 || (dspp_tx_oversize_dropped % 1000) == 0) {
+            kernel_serial_printf(
+                "[DSPP] opcode payload of %u B exceeds the %u B link MTU -- dropped (%llu total). "
+                "This message cannot cross an Ethernet segment without jumbo frames or "
+                "protocol-level fragmentation.\n",
+                (unsigned)dspp_len, (unsigned)dspp_max_wire_payload,
+                (unsigned long long)dspp_tx_oversize_dropped);
+        }
         return;
     }
 

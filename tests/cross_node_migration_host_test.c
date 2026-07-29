@@ -251,10 +251,35 @@ int main(void) {
      * data-movement mechanics from migration orchestration, which already
      * has its own dedicated coverage (tests/partition_migrate_phase6_
      * host_test.c). ─────────────────────────────────────────────────────── */
+    uint64_t node_a_lba_base = stream_store[0].lba_base;   /* kept: the fake disk outlives the slot */
+    uint64_t oversize_before = dspp_tx_oversize_dropped;
     int sent = stream_migrate_send_partition(77, 2);   /* dest_node_id = 2, i.e. "node B" */
     CHECK(sent == 1, "stream_migrate_send_partition() reports exactly 1 stream sent");
     CHECK(stream_store[0].active == 0, "node A's local slot was retired immediately after sending (fire-and-forget)");
-    CHECK(captured_frame_count == 3, "exactly 3 real Ethernet-framed DSPP packets were transmitted: 1 BEGIN_REQ + 2 PAGE_REQ (fire-and-forget -- no wait for ACKs)");
+
+    /* ─── This assertion used to read `captured_frame_count == 3` ─────────
+     * It was wrong, and it was wrong in the most expensive way: it passed.
+     *
+     * struct DSPPMigratePagePacket is 4273 bytes. Plus an Ethernet header
+     * that is 4287 on a link whose MTU is 1500, and the receiving e1000 has
+     * RCTL.LPE clear (discarding anything over 1522) with 2048-byte buffers
+     * and no descriptor chaining in e1000_poll_rx(). Those two page frames
+     * could never have arrived anywhere. The old assertion passed only
+     * because this file's e1000_transmit() stub is more permissive than the
+     * hardware it stands in for -- it accepted 4287 bytes without complaint.
+     *
+     * dspp_transmit_raw() now refuses anything over the link MTU and counts
+     * it, so the send path reports the truth: the BEGIN header (177 B) goes
+     * out, and both page packets are refused.
+     *
+     * Scenario 2 below still proves the RECEIVE path reconstructs the data
+     * byte-for-byte. That code is correct and always was; what does not
+     * exist is a way to get the bytes to it. Fixing that needs either jumbo
+     * frames or protocol-level fragmentation -- see the roadmap doc. */
+    CHECK(captured_frame_count == 1,
+          "*** only the BEGIN_REQ (177 B) reaches the driver -- it is the one migrate frame that fits ***");
+    CHECK(dspp_tx_oversize_dropped == oversize_before + 2,
+          "*** both 4273-byte PAGE_REQs were REFUSED and COUNTED, not handed to a driver that would drop them silently ***");
 
     /* Decode the captured BEGIN_REQ frame directly to confirm real wire
      * content, not just a transmit count. */
@@ -268,17 +293,44 @@ int main(void) {
         CHECK(h->stream_frames_used == 2, "captured frame 0: carries the real frame count");
         CHECK(h->stream_owner_uid == 500, "captured frame 0: carries the real owner_uid");
     }
-    {
-        struct DSPPMigratePagePacket* p = (struct DSPPMigratePagePacket*)(captured_frame[1] + ETH_HDR_LEN);
-        CHECK(p->header.opcode == DSPP_MIGRATE_PAGE_REQ, "captured frame 1: real DSPP_MIGRATE_PAGE_REQ opcode");
-        CHECK(p->header.page_index == 0, "captured frame 1: page_index 0");
-        CHECK(p->page_data[0] == 0xAA && p->page_data[4095] == 0xAA, "captured frame 1: carries page 0's real byte content on the wire");
+    /* ─── The page frames the send path WOULD emit, rebuilt here ──────────
+     * They no longer reach the e1000 stub, so there is nothing to capture.
+     * Reconstructing them is what keeps Scenario 2's byte-for-byte proof
+     * alive: the receive path is correct and independently worth testing,
+     * and it will be exactly what runs once the link can carry these.
+     *
+     * The page BYTES still come from node A's real fake disk via the real
+     * nvme_read_sync(), not from a literal in this file -- so the
+     * end-to-end "node B's disk holds node A's exact bytes" claim below is
+     * still about real data, only the transport is stood in for.
+     *
+     * The header fields mirror dspp_migrate_send_page() in net/dspp.c. If
+     * that function's wire format changes, this diverges and Scenario 2
+     * fails -- which is the correct signal, since the two must agree. */
+    struct DSPPMigratePagePacket synth[2];
+    /* transfer_id is taken from the BEGIN frame that really went out, not
+     * invented: stream_migrate_recv_page() looks its inflight row up by that
+     * id and drops anything it cannot correlate. Getting this wrong is how
+     * the first draft of this rebuild failed -- a good failure, since it is
+     * exactly what a real sender that muddled the id would hit. */
+    uint64_t real_transfer_id =
+        ((struct DSPPMigrateHeader*)(captured_frame[0] + ETH_HDR_LEN))->transfer_id;
+    for (int pg = 0; pg < 2; pg++) {
+        memset(&synth[pg], 0, sizeof(synth[pg]));
+        synth[pg].header.magic          = DSPP_MIGRATE_MAGIC;
+        synth[pg].header.opcode         = DSPP_MIGRATE_PAGE_REQ;
+        synth[pg].header.node_source_id = 1;
+        synth[pg].header.node_dest_id   = 2;
+        synth[pg].header.transfer_id    = real_transfer_id;
+        synth[pg].header.partition_id   = 77;
+        synth[pg].header.page_index     = (uint32_t)pg;
+        CHECK(nvme_read_sync(node_a_lba_base + (uint64_t)pg * 8, synth[pg].page_data) == 0,
+              pg == 0 ? "rebuilt page 0 read back from node A's real disk"
+                      : "rebuilt page 1 read back from node A's real disk");
     }
-    {
-        struct DSPPMigratePagePacket* p = (struct DSPPMigratePagePacket*)(captured_frame[2] + ETH_HDR_LEN);
-        CHECK(p->header.page_index == 1, "captured frame 2: page_index 1");
-        CHECK(p->page_data[0] == 0xBB, "captured frame 2: carries page 1's real byte content on the wire");
-    }
+    CHECK(synth[0].page_data[0] == 0xAA && synth[0].page_data[4095] == 0xAA,
+          "rebuilt page 0 carries node A's real byte content");
+    CHECK(synth[1].page_data[0] == 0xBB, "rebuilt page 1 carries node A's real byte content");
 
     /* ── Scenario 2: switch to "node B" (id 2) -- fresh, empty bookkeeping,
      * same underlying fake disk (see header comment on why that's correct
@@ -293,8 +345,10 @@ int main(void) {
     CHECK(stream_store[0].partition_id == 77, "node B's new slot has the real partition_id from the wire");
     CHECK(stream_store[0].owner_uid == 500, "node B's new slot has the real owner_uid from the wire");
 
-    deliver_captured_frame(1);   /* PAGE_REQ page 0 -> stream_migrate_recv_page() */
-    deliver_captured_frame(2);   /* PAGE_REQ page 1 -> stream_migrate_recv_page() */
+    /* The rebuilt page frames, straight into the real dispatcher -- the same
+     * entry point net_rx_dispatch() uses once the Ethernet header is off. */
+    dspp_rx_dispatch(&synth[0], (uint16_t)sizeof(synth[0]));
+    dspp_rx_dispatch(&synth[1], (uint16_t)sizeof(synth[1]));
 
     CHECK(captured_frame_count == acks_before + 3, "node B transmitted exactly 3 ACKs back (1 BEGIN_ACK + 2 PAGE_ACK) -- the receive path is genuinely bidirectional, not one-way-blind, even though node A's send didn't wait for them");
 

@@ -370,7 +370,61 @@ void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len);
  * real bug where sizing off only the older, smaller struct silently
  * dropped every migrate-family page packet); a caller passing more still
  * is a programming error and the packet is dropped rather than
- * overflowing that buffer. */
+ * overflowing that buffer.
+ *
+ * ─── AND it must fit the link, which is a separate, smaller limit ────────
+ * The buffer-overflow check above was the only size guard for several
+ * phases, and it let every 4 KB DSPP message through -- to an Ethernet
+ * segment that cannot carry one. A standard frame tops out at 1500 bytes of
+ * payload; e1000 will not receive more than 1522 total unless RCTL.LPE is
+ * set (it is not, net/e1000.c), and the RX buffers are 2048 bytes with no
+ * descriptor chaining in e1000_poll_rx(), so a long frame has nowhere to
+ * land even if the MAC accepted it.
+ *
+ * The symptom was a four-node cluster whose nodes campaigned forever: a
+ * REQUEST_VOTE is a struct DSPPFullPagePacket (4132 bytes) purely because
+ * struct ConsensusMessage was placed in its payload_4kb field, so every
+ * vote request left the NIC and landed nowhere, and every node sat at
+ * CANDIDATE with a term climbing once per election timeout.
+ *
+ * No host test caught it because every one of them calls
+ * dspp_rx_dispatch() with a buffer already in memory. The wire is the exact
+ * part the test strategy structurally cannot reach, so the guard has to be
+ * in the code rather than in a test of the code. */
+#define DSPP_LINK_MTU          1500u
+/* 1500 - ETH_HDR_LEN(14). Spelled as a literal rather than derived, because
+ * dspp.h deliberately does not #include net.h -- it has no include guard of
+ * its own (see the note on struct DSPPFullPagePacket), so pulling headers in
+ * here breaks any translation unit that includes both. net/dspp.c carries a
+ * _Static_assert that this stays equal to DSPP_LINK_MTU - ETH_HDR_LEN, so
+ * the two cannot drift apart silently. */
+#define DSPP_MAX_WIRE_PAYLOAD  1486u
+
+/* Frames refused for exceeding DSPP_MAX_WIRE_PAYLOAD. Non-zero means some
+ * DSPP message is structurally undeliverable on this link -- as of today
+ * that is the 4 KB page-transfer family (DSPPMigratePagePacket,
+ * DSPPCtxMigrateChunkPacket, DSPP_PAGE_*_REQ), which needs either jumbo
+ * frames or protocol-level fragmentation. Counted and logged rather than
+ * dropped quietly: this failure previously presented as a healthy-looking
+ * cluster that simply never converged. */
+extern uint64_t dspp_tx_oversize_dropped;
+
+/* The limit dspp_transmit_raw() actually enforces. Initialised to
+ * DSPP_MAX_WIRE_PAYLOAD and NEVER written by kernel code -- there is no
+ * code path in the kernel that assigns to it, deliberately.
+ *
+ * It exists as a variable solely so a host test exercising a protocol layer
+ * ABOVE the link (chunk reassembly, ordering, duplicate rejection -- all of
+ * which are link-independent) can simulate a link that could carry its
+ * frames, instead of rewriting the test to hand-build every packet.
+ *
+ * The hazard with a seam like this is that it quietly removes the property
+ * it was added around, so: the two tests that assert the link limit itself
+ * -- dspp_phase5_host_test.c Scenarios 9-10 and cross_node_migration_host_
+ * test.c Scenario 1 -- must never touch it, and say so in place. If this
+ * ever gains a writer outside tests/, that is a bug. */
+extern uint16_t dspp_max_wire_payload;
+
 void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len);
 
 /* The real DSPP receive entry point, called from net/net.c's
