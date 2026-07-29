@@ -918,9 +918,36 @@ int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
     migrate_inflight[inflight_idx].received_pages = 0;
     migrate_inflight[inflight_idx].active         = 1;
 
+    /* ─── Persist BEFORE the ACK goes out. This is the ordering that makes
+     *     migration safe, and its absence lost a real stream ──────────────
+     *
+     * This function used to mark the slot active and return, leaving it in
+     * RAM only. stream_migrate_recv_page() persists, but only once a transfer
+     * COMPLETES -- so for a stream with frames_used == 0 no page ever arrives
+     * and nothing was ever written to disk.
+     *
+     * Meanwhile the sender treats the BEGIN_ACK as permission to retire its
+     * source slot, and persists that retirement. Net effect across a reboot:
+     * the source is durably gone and the destination's slot evaporates. The
+     * stream is lost from both nodes, with every log line reporting success.
+     * That is exactly what happened to an 8 KiB stream on a live four-node
+     * cluster.
+     *
+     * dspp_migrate_rx() (net/dspp.c) sends the BEGIN_ACK only after this
+     * function returns, so persisting here means the destination has the slot
+     * on disk before it tells the sender the source is redundant. The general
+     * rule, worth stating because it is easy to get backwards: never
+     * acknowledge durability you have not yet achieved.
+     *
+     * A failed write is reported and the slot refused rather than accepted
+     * unpersisted -- a refusal makes the sender keep its copy, which is the
+     * safe direction. */
+    stream_persist_directory();
+
     kernel_serial_printf(
         "[STREAM] migrate recv: allocated local slot %d for incoming stream "
-        "'%s' (transfer %llu, %u page(s) expected).\n",
+        "'%s' (transfer %llu, %u page(s) expected) -- directory persisted "
+        "before acknowledging.\n",
         dst, name, (unsigned long long)transfer_id, frames_used);
     return 0;
 }

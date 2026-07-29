@@ -656,6 +656,56 @@ Partition ownership had no read surface at all: `partition list` printed id and 
 
 `partition list` and `/api/partitions` now report `owner_node`, and `aeroslsctl partitions` places it second rather than last. `docs/COMMANDS.md` states the two non-guessable rules next to `partition migrate`: a stream's partition is stamped at creation and `partition assign` is not retroactive, so the order `create → assign → create the stream` is mandatory.
 
+## 9i. Migration lost a stream — acknowledging durability not yet achieved
+
+After §9h, a reboot produced this:
+
+```
+node 1: {"streams": []}
+node 3: {"streams": []}
+```
+
+The stream was gone from both nodes. Not corrupted, not stranded — **destroyed by a successful migration**, with every log line reporting OK.
+
+### The ordering that was backwards
+
+`stream_migrate_recv_begin()` allocated a slot, stamped its metadata, set `active = 1`, and returned. The only persist on the receive side lived in `stream_migrate_recv_page()`, and only on transfer *completion* — so a stream with `frames_used == 0` was never written to disk at all.
+
+The sender, meanwhile, treats the `BEGIN_ACK` as permission to retire its source, and persists that retirement. So across a reboot:
+
+| | |
+| --- | --- |
+| source node | slot retired, **durably** |
+| destination node | slot existed in RAM only, **gone** |
+
+`dspp_migrate_rx()` sends the ACK *after* `stream_migrate_recv_begin()` returns, so persisting inside that function puts the write before the acknowledgement. One line, and the rule it encodes is the general one: **never acknowledge durability you have not yet achieved.**
+
+A failed write now refuses the slot rather than accepting it unpersisted — a refusal makes the sender keep its copy, which is the safe direction to fail.
+
+### Why the test suite could not see it
+
+The receive path was well covered: `cross_node_migration_host_test.c` proved node B's slot had the right name, mime, owner, partition and byte-for-byte page content. Every one of those assertions read `stream_store[]` — **the in-RAM slot, which was always correct.** Nothing asked whether the slot was on disk.
+
+The new check reads the directory page from the fake NVMe instead, which is true only if `recv_begin` wrote it. 111 checks, and the mutation removing the persist is caught.
+
+### This closes a chain of five
+
+§9c through §9i were one fault repeated at five layers, each hidden behind the one in front:
+
+| | what looked fine |
+| --- | --- |
+| §9b | the tick had no caller — nothing ran |
+| §9c | vote frames were 4132 bytes — nothing arrived |
+| §9c | replies carried a stale term — arrivals were discarded |
+| §9f | replies named no candidate — arrivals were counted by everyone |
+| §9g | an empty stream was retired with no confirmation |
+| §9h | `frames_used` was dropped from the snapshot |
+| §9i | the received slot was never persisted |
+
+Every single one presented as success. None printed an error. Four of the seven were found by *running the thing on real hardware*, not by review and not by the host suite — and in each case the suite had coverage that looked thorough while testing the wrong side of the boundary: the sender rather than the wire, the struct rather than the disk, the grammar rather than the paste.
+
+The reusable rule, since it has now cost seven bugs: **in a distributed or persistent system, assert on the far side of the boundary you are crossing.** Not that the frame was sent — that it arrived. Not that the field was set — that it was written. Not that the API was called — that the state changed where it needed to.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

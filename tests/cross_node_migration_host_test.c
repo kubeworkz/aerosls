@@ -297,6 +297,14 @@ int nvme_write_sync(uint64_t slba, const void* buf) {
  * the way net/net.c's net_rx_dispatch() would -- strips the Ethernet
  * header and hands the rest to dspp_rx_dispatch(), the real function, not
  * a reimplementation of its routing logic. */
+/* Clears the fake disk page that backs the stream directory, so a scenario
+ * can assert that recv_begin WROTE it rather than that it happened to
+ * already contain something from an earlier scenario. */
+static void reset_disk_dir(void) {
+    static uint8_t zero[4096];
+    nvme_write_sync(STREAM_DIR_LBA, zero);
+}
+
 static void deliver_captured_frame(int i) {
     struct EthernetHeader* eth = (struct EthernetHeader*)captured_frame[i];
     CHECK(ntohs(eth->ethertype) == ETHERTYPE_DSPP, "captured frame really is Ethernet-framed with ETHERTYPE_DSPP, not a bare struct with no L2 framing");
@@ -853,6 +861,45 @@ int main(void) {
               "not a restart ***");
     }
     #undef SETUP_SEND
+
+    /* ── 8b: the destination's slot is ON DISK before the BEGIN is ACKed.
+     *
+     * ─── The data-loss bug ──────────────────────────────────────────────
+     * stream_migrate_recv_begin() marked the slot active and returned. The
+     * only persist on the receive side was in stream_migrate_recv_page(), and
+     * only on transfer COMPLETION -- so a stream with zero pages was never
+     * written to disk at all.
+     *
+     * The sender, meanwhile, treats the BEGIN_ACK as permission to retire its
+     * source and persists that. Across a reboot the source is durably gone
+     * and the destination's slot evaporates: the stream is lost from both
+     * nodes while every log line says OK. That happened to a real 8 KiB
+     * stream on a live cluster.
+     *
+     * Asserting on the DIRECTORY PAGE rather than on stream_store[] is the
+     * whole point -- the in-RAM slot was always correct. */
+    {
+        reset_disk_dir();
+        g_fake_local_node_id = 2;
+        memset(stream_store, 0, sizeof(stream_store));
+
+        int rc = stream_migrate_recv_begin(0xD15C, 55, "durable.bin",
+                                           "application/octet-stream",
+                                           8192, 2, 500);
+        CHECK(rc == 0, "the destination accepted the incoming stream");
+        CHECK(stream_store[0].active == 1, "and it is live in RAM (this always worked)");
+
+        uint8_t dir[4096];
+        CHECK(nvme_read_sync(STREAM_DIR_LBA, dir) == 0,
+              "*** the stream directory was WRITTEN TO DISK by recv_begin ***");
+        if (dir[512] != 0) {
+            CHECK(dir[512] == 'd',
+                  "*** ...carrying the received stream's name, so it survives a reboot "
+                  "even before any page arrives ***");
+        } else {
+            CHECK(0, "the persisted directory entry is empty -- the slot was not saved");
+        }
+    }
 
     /* ── 9: the ACK record ignores what it is not waiting for.
      *
