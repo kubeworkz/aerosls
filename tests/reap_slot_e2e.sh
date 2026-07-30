@@ -81,6 +81,39 @@ print(f"   ok: node {d.get('node_id')} {d.get('role')} term {d.get('term')}, "
       f"{d.get('active_nodes')} active, quorum {d.get('quorum_threshold')}")
 PY
 
+# ─── 0b. everything needed to restart the destination, captured UP FRONT ───
+# This used to sit in step 7, after a 1 MiB upload -- so the run below wasted
+# all of that work before discovering it could not proceed. A gate belongs
+# before the side effects it protects, not after.
+#
+# And the argv comes from /proc, not from `run-cluster.sh --dry-run`. --dry-run
+# refuses to run at all while a cluster is up, which is precisely when this
+# needs it. Reading the command line of the process we are about to kill is
+# also strictly better than re-deriving it: it is what is ACTUALLY running,
+# including whatever RAM/SMP autosizing chose on this host, so the restarted
+# node cannot silently differ from the one that was killed.
+step "0b. capture node $DST_NODE's identity before touching anything"
+DST_PID="$(awk -v n="$DST_NODE" '$1==n{print $2}' "$CLUSTER_DIR/cluster.pids" 2>/dev/null)"
+[ -n "$DST_PID" ] || die "no pid for node $DST_NODE in $CLUSTER_DIR/cluster.pids"
+kill -0 "$DST_PID" 2>/dev/null || die "node $DST_NODE (pid $DST_PID) is not running"
+
+mapfile -t -d '' DST_ARGV < "/proc/$DST_PID/cmdline" \
+    || die "cannot read /proc/$DST_PID/cmdline"
+[ "${#DST_ARGV[@]}" -gt 3 ] || die "node $DST_NODE's argv came back with only ${#DST_ARGV[@]} element(s)"
+case "${DST_ARGV[0]}" in
+    *qemu*) ;;
+    *) die "pid $DST_PID does not look like QEMU (argv[0]='${DST_ARGV[0]}') --
+       refusing to relaunch something unidentified" ;;
+esac
+echo "   node $DST_NODE = pid $DST_PID, ${#DST_ARGV[@]} argv elements, ${DST_ARGV[0]##*/}"
+
+# The disk image has to survive the kill: it is what carries the persisted
+# incoming=1 slot across the restart. If it were recreated the reap would have
+# nothing to find and this test would silently pass for the wrong reason.
+IMG="$CLUSTER_DIR/node$DST_NODE.img"
+[ -f "$IMG" ] || die "$IMG does not exist -- the persisted slot has nowhere to live"
+echo "   disk image $IMG present ($(du -h "$IMG" | cut -f1)), will be reused"
+
 # ─── 1. partition FIRST, then the uid mapping, then the stream ─────────────
 step "1. create the partition (name only -- the id is assigned)"
 src shell partition create "$PART_NAME" || die "partition create failed"
@@ -143,19 +176,6 @@ echo "   owner_node = $OWNER"
 
 # ─── 7. interrupt the transfer ─────────────────────────────────────────────
 step "7. start the migration to node $DST_NODE, then kill it after ${KILL_AFTER}s"
-DST_PID="$(awk -v n="$DST_NODE" '$1==n{print $2}' "$CLUSTER_DIR/cluster.pids" 2>/dev/null)"
-[ -n "$DST_PID" ] || die "no pid for node $DST_NODE in $CLUSTER_DIR/cluster.pids"
-
-# Capture node 2's argv BEFORE killing it -- --dry-run launches nothing, and
-# the disk image is reused, which is what carries the persisted incoming slot
-# across the restart.
-mapfile -t DST_ARGV < <(./run-cluster.sh --nodes "$NODES" --dry-run \
-    | awk -v n="  node $DST_NODE " '
-        index($0,n)==1 {f=1; next}
-        /^  node [0-9]+ / {f=0}
-        f && NF {sub(/^ +/,""); print}')
-[ "${#DST_ARGV[@]}" -gt 3 ] || die "could not extract node $DST_NODE's argv from --dry-run"
-
 src shell partition migrate "$PID" "$DST_NODE" > "$CLUSTER_DIR/migrate.out" 2>&1 &
 MIG=$!
 sleep "$KILL_AFTER"
@@ -178,8 +198,36 @@ echo "   ok: source still holds '$STREAM'"
 # ─── 9. restart the destination and look for the reap ──────────────────────
 step "9. restart node $DST_NODE (its log is truncated, so the reap will be at the top)"
 "${DST_ARGV[@]}" </dev/null >/dev/null 2>"$CLUSTER_DIR/node$DST_NODE.stderr" &
-echo "   relaunched as pid $!"
-sleep 12
+NEW_PID=$!
+echo "   relaunched as pid $NEW_PID"
+
+# Keep cluster.pids honest, or './run-cluster.sh --stop' later kills the pid we
+# just replaced and leaves this node running -- and the next launch then refuses
+# to start, blaming "nodes from a previous run".
+if [ -f "$CLUSTER_DIR/cluster.pids" ]; then
+    awk -v n="$DST_NODE" -v p="$NEW_PID" \
+        '$1==n {print n, p; next} {print}' "$CLUSTER_DIR/cluster.pids" \
+        > "$CLUSTER_DIR/cluster.pids.new" \
+        && mv "$CLUSTER_DIR/cluster.pids.new" "$CLUSTER_DIR/cluster.pids"
+    echo "   cluster.pids updated, so --stop still works"
+fi
+
+# Wait for it to answer rather than sleeping a guessed interval. A fixed sleep
+# either wastes time or reports "no reap found" for a node that had not finished
+# booting -- which is a wrong answer, not a slow one.
+printf '   waiting for node %s on port %s' "$DST_NODE" "$DST_PORT"
+BOOTED=0
+for _ in $(seq 1 40); do
+    if "$CTL" --host "localhost:$DST_PORT" raw GET /api/cluster >/dev/null 2>&1; then
+        BOOTED=1; break
+    fi
+    kill -0 "$NEW_PID" 2>/dev/null || die "node $DST_NODE died during boot. stderr:
+$(sed 's/^/       /' "$CLUSTER_DIR/node$DST_NODE.stderr" | tail -5)"
+    printf '.'; sleep 1
+done
+echo
+[ "$BOOTED" -eq 1 ] || die "node $DST_NODE never answered on port $DST_PORT after 40s"
+echo "   node $DST_NODE is up"
 
 step "10. RESULT"
 LOG="$CLUSTER_DIR/node$DST_NODE.log"
