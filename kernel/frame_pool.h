@@ -100,6 +100,26 @@ void frame_pool_limit_ram(uint64_t top_addr);
  * the allocator. */
 int frame_pool_frame_is_machine_owned(uint64_t frame_index);
 
+/* Reserves every frame overlapping [lo_addr, hi_addr). frame_pool_init() uses
+ * it to reserve the bootstrap stack by its own exported bounds rather than
+ * trusting that _kernel_image_end happens to sit above it. */
+void frame_pool_reserve_range(uint64_t lo_addr, uint64_t hi_addr);
+
+/* True if `addr` (when nonzero) falls inside the 4 KiB frame at frame_base.
+ * alloc_raw_frame() uses it against the live stack pointer so the allocator can
+ * never return the memory it is running on. Exposed for testing. */
+int fp_frame_contains(uint64_t frame_base, uint64_t addr);
+
+/* Count of frames withheld because they held the live kernel stack. Nonzero
+ * means a boot reservation was wrong -- the value is a bug report, not a
+ * statistic. */
+extern uint64_t frame_pool_live_stack_withheld;
+
+/* Test seam: when nonzero, the allocator treats this as the live stack pointer
+ * instead of reading rsp. Zero in production and never written by the kernel.
+ * See its definition for why an untestable guard was the worse option. */
+extern uint64_t frame_pool_test_sp_override;
+
 /* Introspection for the boot log and the host test. */
 uint64_t frame_pool_reserved_count(void);
 int      frame_pool_is_reserved(uint64_t frame_index);

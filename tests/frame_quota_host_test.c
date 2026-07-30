@@ -27,6 +27,14 @@
  * covered by tests/frame_pool_reserve_host_test.c. */
 char _kernel_image_end[1];
 
+/* arch/x86/boot.asm's exported bootstrap-stack bounds, which frame_pool_init()
+ * now reserves by name rather than trusting _kernel_image_end to cover. Only
+ * needed to satisfy the link here: this file tests quota accounting and never
+ * calls frame_pool_init(). See frame_pool_reserve_host_test.c for why the
+ * adjacency of these two symbols cannot be reproduced honestly in C. */
+char stack_bottom[16];
+char stack_top[16];
+
 
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }

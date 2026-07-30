@@ -106,9 +106,53 @@ void frame_pool_reserve_below(uint64_t end_addr) {
     if (last > reserved_below) reserved_below = last;
 }
 
+void frame_pool_reserve_range(uint64_t lo_addr, uint64_t hi_addr) {
+    /* Not redundant with the loop bound below. For an inverted range spanning
+     * frames, first > last leaves the loop empty anyway -- but an inverted
+     * range WITHIN one frame rounds to first == N, last == N + 1 and would
+     * reserve that frame for a range that describes no memory. */
+    if (hi_addr <= lo_addr) return;
+    uint64_t first = lo_addr / FRAME_SIZE;                       /* round DOWN */
+    uint64_t last  = (hi_addr + FRAME_SIZE - 1) / FRAME_SIZE;    /* round UP   */
+    if (last > TOTAL_FRAMES) last = TOTAL_FRAMES;
+    for (uint64_t f = first; f < last; f++) fp_mark_used(f);
+    if (last > reserved_below && first == 0) reserved_below = last;
+}
+
+/* The bootstrap stack, from arch/x86/boot.asm. Their ADDRESSES are the bounds. */
+extern char stack_bottom[], stack_top[];
+
 void frame_pool_init(void) {
     uint64_t end = (uint64_t)(uintptr_t)_kernel_image_end;
     frame_pool_reserve_below(end);
+
+    /* ─── Verify, do not assume, that the stack is inside that ────────────
+     * The linker script puts .bootstrap_stack last inside .bss and then
+     * defines _kernel_image_end above it, so reserving below the image end
+     * covers the stack. That is a property of a linker script that nothing
+     * checked, across a section name that appears in exactly one place, and
+     * the cost of it being wrong is the allocator handing out the memory the
+     * kernel is standing on -- which corrupts the return address of whatever
+     * runs next and surfaces as a #GP on a poisoned rip, several layers away
+     * from the write that caused it.
+     *
+     * So the stack is reserved AGAIN by its own exported bounds. If that adds
+     * frames, the image-end reservation did not cover it and we say so
+     * loudly, because at that point every other assumption resting on
+     * _kernel_image_end is suspect too. */
+    uint64_t sb = (uint64_t)(uintptr_t)stack_bottom;
+    uint64_t stp = (uint64_t)(uintptr_t)stack_top;
+    uint64_t before_stack = frames_reserved;
+    frame_pool_reserve_range(sb, stp);
+    if (frames_reserved != before_stack) {
+        kernel_serial_printf(
+            "[FRAME] *** ERROR: the bootstrap stack [0x%llx,0x%llx) was NOT covered by the "
+            "kernel image end 0x%llx -- %llu frame(s) of live kernel stack were allocatable. "
+            "Reserved now, but the linker script and _kernel_image_end disagree and every "
+            "other bound derived from it should be re-checked. ***\n",
+            (unsigned long long)sb, (unsigned long long)stp, (unsigned long long)end,
+            (unsigned long long)(frames_reserved - before_stack));
+    }
     kernel_serial_printf(
         "[FRAME] reserved %llu frames (%llu MiB) below the kernel image end "
         "0x%llx -- allocator now starts above the kernel.\n",
@@ -151,6 +195,38 @@ void frame_pool_reset(void) {
 }
 
 
+/* The caller's own stack pointer. The allocator must never return the frame
+ * this is sitting in: doing so lets the next write of tenant data land on the
+ * kernel's live stack, and the failure surfaces as a corrupted return address
+ * in unrelated code long after the allocation. One compare per allocation to
+ * make that specific catastrophe impossible rather than merely unlikely. */
+/* Test seam. Zero in production (BSS), and nothing in the kernel ever writes
+ * it. It exists because the withhold path below is otherwise unreachable from
+ * a host test: the fake allocator hands out addresses derived from the frame
+ * index (0x1000, 0x2000, ...) while the host's real stack pointer lives far
+ * above them, so "no frame contained my stack" is true no matter what the
+ * guard does. A mutation deleting the guard outright passed a 45-check suite.
+ *
+ * A test-only global in production code is a smell. An untested guard against
+ * the kernel handing out its own live stack is worse, so this is the trade
+ * being made deliberately and in writing. */
+uint64_t frame_pool_test_sp_override = 0;
+
+static inline uint64_t fp_current_sp(void) {
+    if (frame_pool_test_sp_override) return frame_pool_test_sp_override;
+#if defined(__x86_64__)
+    uint64_t sp; __asm__ volatile("mov %%rsp, %0" : "=r"(sp)); return sp;
+#else
+    return 0;
+#endif
+}
+
+int fp_frame_contains(uint64_t frame_base, uint64_t addr) {
+    return addr != 0 && addr >= frame_base && addr < frame_base + FRAME_SIZE;
+}
+
+uint64_t frame_pool_live_stack_withheld = 0;
+
 static void *alloc_raw_frame(void)
 {
     // Start at frame 1 (skip frame 0: address 0x0 == NULL in C)
@@ -164,8 +240,24 @@ static void *alloc_raw_frame(void)
                 if (i == 0 && bit == 0) continue;
                 if (!(physical_memory_bitmap[i] & (1ULL << bit)))
                 {
+                    uint64_t base = (uint64_t)(((i * 64) + bit) * 4096);
+                    /* Last line of defence. If the reservations above were
+                     * right this never fires; if it does, the reservation was
+                     * wrong and this is the only thing between a tenant's
+                     * upload and the kernel's own return addresses. */
+                    if (fp_frame_contains(base, fp_current_sp())) {
+                        physical_memory_bitmap[i] |= (1ULL << bit);  /* withhold, do not reuse */
+                        frames_reserved++;
+                        frame_pool_live_stack_withheld++;
+                        kernel_serial_printf(
+                            "[FRAME] *** WITHHELD frame 0x%llx: it contains the LIVE KERNEL "
+                            "STACK. Handing it out would have let the next write land on a "
+                            "return address. The boot reservation missed it -- see "
+                            "frame_pool_init(). ***\n", (unsigned long long)base);
+                        continue;
+                    }
                     physical_memory_bitmap[i] |= (1ULL << bit);
-                    return (void *)(((i * 64) + bit) * 4096);
+                    return (void *)(uintptr_t)base;
                 }
             }
         }

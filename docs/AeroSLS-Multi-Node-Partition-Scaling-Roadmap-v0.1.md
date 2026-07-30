@@ -986,6 +986,42 @@ Guarded anyway, at the function that would do the damage: two watermarks bound t
 
 The overflowing writer is still unidentified. What the second dump added is that it is almost certainly *not* a local array, and the search should move to whatever can write a page-sized region: DMA targets, and any path that treats a frame pointer as scratch. The next dump's `POISON RUN` line will say whether the run stops inside the stack or runs to the top, and those two answers point in different directions.
 
+## 9p. The measurement lands: the whole live stack, and a guard my own test could not fail
+
+```
+[STREAM] CORRUPTION: 'big.bin' -- the caller's name buffer no longer matches the catalog
+copy (first difference at byte 0) after flushing 12 frame(s) of 49152 byte(s).
+[FAULT] POISON RUN: 0x077f7920 .. 0x077f8000 = 1760 byte(s) of 0xcd, starting AT
+[FAULT] the interrupted rsp and running UP through the live caller frames.
+[FAULT] The run reaches the TOP OF THE STACK.
+```
+
+The tripwire fires first and names the stage — right after `stream_flush_frames()`, differing at byte 0 — and then the run measures **1760 bytes, the entire live stack, to the last byte**. Nothing survives. §9o's reading is confirmed: a local array would stop where its overrun stopped and leave the outer frames readable. This is a page-sized write landing on the stack.
+
+The stack's top page is `0x077f7000`, and its top is exactly `_kernel_image_end`, because the linker script puts `.bootstrap_stack` last inside `.bss` and defines the image end above it. `frame_pool_init()` reserves everything below the image end, so the stack is covered — **as a consequence of one line in one linker script, checked by nothing.**
+
+Two changes:
+
+**The stack is now reserved by its own bounds.** `frame_pool_init()` reserves below `_kernel_image_end` as before, and then reserves `[stack_bottom, stack_top)` again from the symbols `boot.asm` exports. If that adds frames, the first reservation did not cover the stack, and it says so loudly — at that point every other bound derived from `_kernel_image_end` is suspect too. Redundant when the layout is right; the only thing standing between a tenant upload and the kernel's return addresses when it is not.
+
+**The allocator never returns the frame it is standing on.** One compare against `rsp` per allocation. If it fires, the frame is withheld, counted, and named. This is the check that would have turned this entire investigation into a single log line.
+
+### The mutation that survived
+
+M14 deleted the live-stack guard outright and the 45-check suite passed.
+
+The host allocator returns addresses derived from the frame index — `0x1000`, `0x2000` — while the host's real `rsp` sits up around `0x7fff…`. "No frame handed out contained my stack pointer" is true whatever the guard does. I had written a test that could not fail, for the one guard that stands between a tenant's payload and total memory corruption, in the same session that named this failure mode three times.
+
+Fixed with a test seam: `frame_pool_test_sp_override`, zero in production and never written by the kernel. A test-only global in production code is a smell; an untested guard against this is worse, and the trade is now made deliberately and in writing rather than by omission. The test points the allocator at an address inside a frame it is about to hand out, then asserts the frame was skipped, the withholding was *counted* (a silent refusal is its own bug), the neighbours on both sides were still returned (surgical, not a stall), and the withheld frame stayed marked used so the scan does not spin on it.
+
+M19 also survived — the inverted-range early return looked redundant because `first > last` empties the loop. It is not: an inverted range *within a single frame* rounds to `first == N, last == N+1` and would reserve a frame for a range describing no memory. The guard is load-bearing; the test was missing the case.
+
+`frame_pool_reserve_host_test.c` 24 → 49 checks, 8/8 mutations after the two rewrites. Eleven other host tests that link `frame_pool.c` now stub the two stack symbols. The C-only link check is at 14 undefined, `stack_bottom`/`stack_top` being the two asm-provided additions.
+
+### Where this leaves the hunt
+
+Still not identified: what writes a page of payload onto a reserved frame. The two fixes above close the paths where the *allocator* could have handed the stack out. If the fault recurs with the reservations in place and no `WITHHELD` or `ERROR` line, then nothing went through the allocator at all and the writer is a raw pointer or a DMA target that never consulted it — which is a different and shorter list.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

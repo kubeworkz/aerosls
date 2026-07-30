@@ -213,6 +213,16 @@ int nvme_flush_sync(void) {
 #include "kernel/persist.h"   /* self-contained (just <stdint.h>), safe to include here */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* arch/x86/boot.asm's exported bootstrap-stack bounds. frame_pool_init() now
+ * reserves [stack_bottom, stack_top) by name instead of trusting
+ * _kernel_image_end to cover it, so every test that links frame_pool.c has to
+ * supply them. This file does not call frame_pool_init(); see
+ * frame_pool_reserve_host_test.c for why the adjacency of these two symbols
+ * cannot be reproduced honestly in C. */
+char stack_bottom[16];
+char stack_top[16];
+
+
 /* ─── Orchestration Plan Phase 5: workloads[] ─────────────────────────
  * kernel/persist.c now snapshots and restores this array too, so every
  * test linking persist.c must define it. Real and zero-initialised (=

@@ -52,6 +52,22 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
  * argument -- this definition only exists to satisfy the link. */
 char _kernel_image_end[1];
 
+/* arch/x86/boot.asm exports these as the two ends of one 64 KiB region, an
+ * adjacency the linker script establishes and that C cannot reproduce: two
+ * separate objects have no guaranteed order or spacing. They exist here only
+ * to satisfy the link.
+ *
+ * So frame_pool_init() is deliberately NOT exercised by this test, and that is
+ * a real gap stated rather than papered over -- a stub where stack_top happens
+ * to land below stack_bottom would make frame_pool_reserve_range() take its
+ * inverted-range early return and the test would pass having reserved nothing.
+ * What IS tested is frame_pool_reserve_range() against explicit bounds, which
+ * is the whole substance of the change; frame_pool_init() only supplies the
+ * two addresses. The wiring itself is checked at runtime by the [FRAME] ERROR
+ * line it prints when the image-end reservation fails to cover the stack. */
+char stack_bottom[16];
+char stack_top[16];
+
 /* Mirrors the real image layout closely enough to be meaningful: the
  * measured link put the end at 0x7781000 (119.5 MiB). */
 #define FAKE_IMAGE_END   0x7781000ULL
@@ -253,6 +269,106 @@ int main(void) {
               "*** reclaiming a real tenant still frees exactly its frame ***");
         CHECK(!frame_pool_is_reserved(tenant_idx),
               "...and that frame really is back in the pool");
+    }
+
+    /* ─── Reserving the stack by its own bounds ────────────────────────────
+     * frame_pool_init() reserves below _kernel_image_end and then reserves
+     * [stack_bottom, stack_top) AGAIN. The second reservation is redundant
+     * exactly as long as the linker script keeps .bootstrap_stack inside .bss
+     * below the image end -- a property of one line in one file that nothing
+     * verified, whose cost when wrong is the allocator handing out the memory
+     * the kernel is running on. */
+    {
+        frame_pool_reset();
+        /* A stack deliberately placed ABOVE the "image end", i.e. the layout
+         * the redundant reservation exists to survive. */
+        frame_pool_reserve_below(64 * 1024);              /* frames 0..15  */
+        frame_pool_reserve_range(128 * 1024, 192 * 1024); /* frames 32..47 */
+
+        CHECK(frame_pool_is_reserved(32) && frame_pool_is_reserved(47),
+              "*** an explicit range reserves every frame it overlaps ***");
+        CHECK(!frame_pool_is_reserved(31) && !frame_pool_is_reserved(48),
+              "...and nothing outside it");
+
+        /* Partial frames at either end are still occupied. */
+        frame_pool_reset();
+        frame_pool_reserve_range(4096 * 5 + 100, 4096 * 7 + 1);
+        CHECK(frame_pool_is_reserved(5) && frame_pool_is_reserved(6) &&
+              frame_pool_is_reserved(7),
+              "*** a range starting mid-frame and ending mid-frame reserves both "
+              "partial frames, not just the whole ones between ***");
+        CHECK(!frame_pool_is_reserved(4) && !frame_pool_is_reserved(8),
+              "...and stops there");
+
+        frame_pool_reset();
+        frame_pool_reserve_range(8192, 8192);
+        CHECK(frame_pool_reserved_count() == 0, "an empty range reserves nothing");
+        frame_pool_reserve_range(16384, 8192);
+        CHECK(frame_pool_reserved_count() == 0,
+              "*** an inverted range spanning frames reserves nothing rather than "
+              "wrapping to a gigantic loop ***");
+        /* The case the loop bound does NOT cover on its own: inverted, but both
+         * ends inside one frame, so rounding gives first == 5, last == 6 and a
+         * range describing no memory would reserve a frame. */
+        frame_pool_reserve_range(4096 * 5 + 100, 4096 * 5 + 50);
+        CHECK(frame_pool_reserved_count() == 0,
+              "*** an inverted range WITHIN a single frame reserves nothing -- the "
+              "early return is load-bearing, not decorative ***");
+    }
+
+    /* ─── Never hand out the frame we are standing on ──────────────────────
+     * The last line of defence. If the reservations are right this is dead
+     * code; when they are not, it is the only thing between a tenant's upload
+     * and the kernel's own return addresses -- which is precisely the failure
+     * that produced 1760 bytes of payload where the live stack used to be. */
+    {
+        CHECK(fp_frame_contains(0x1000, 0x1000) &&
+              fp_frame_contains(0x1000, 0x1FFF),
+              "*** a frame contains its own first and last byte ***");
+        CHECK(!fp_frame_contains(0x1000, 0x0FFF) &&
+              !fp_frame_contains(0x1000, 0x2000),
+              "*** ...and neither the byte below nor the first byte of the next "
+              "frame -- both off-by-ones would misreport which frame holds the stack ***");
+        CHECK(!fp_frame_contains(0x1000, 0),
+              "a zero address matches nothing, so a platform that cannot read its "
+              "stack pointer disables the check instead of withholding frame 0");
+
+        /* The real assertion, and it needs the seam. The fake allocator returns
+         * addresses derived from the frame index while the host's actual rsp is
+         * far above them, so checking against the true stack pointer can never
+         * fail -- an earlier version of this did exactly that and a mutation
+         * deleting the guard sailed through. Point the allocator at an address
+         * inside a frame it is about to hand out, and the guard becomes
+         * reachable. */
+        frame_pool_reset();
+        frame_pool_reserve_below(0);          /* nothing reserved: worst case */
+        uint64_t pretend_sp = 3 * 4096 + 0x100;      /* inside frame 3 */
+        frame_pool_test_sp_override = pretend_sp;
+        uint64_t withheld_before = frame_pool_live_stack_withheld;
+
+        int handed_out_own_stack = 0, saw_frame_2 = 0, saw_frame_4 = 0;
+        for (int i = 0; i < 8; i++) {
+            void* f = allocate_physical_ram_frame();
+            if (!f) break;
+            uint64_t base = (uint64_t)(uintptr_t)f;
+            if (fp_frame_contains(base, pretend_sp)) handed_out_own_stack = 1;
+            if (base == 2 * 4096) saw_frame_2 = 1;
+            if (base == 4 * 4096) saw_frame_4 = 1;
+        }
+        frame_pool_test_sp_override = 0;
+
+        CHECK(!handed_out_own_stack,
+              "*** with NOTHING reserved, the allocator still never returns the frame "
+              "holding the live stack ***");
+        CHECK(frame_pool_live_stack_withheld == withheld_before + 1,
+              "*** ...it counted the withholding, so the refusal is reported and not "
+              "silent ***");
+        CHECK(saw_frame_2 && saw_frame_4,
+              "*** ...and it skipped ONLY that frame -- the neighbours on both sides "
+              "were still handed out, so the guard is surgical rather than a stall ***");
+        CHECK(frame_pool_is_reserved(3),
+              "...the withheld frame stays marked used, so the scan does not return "
+              "to it on the next allocation and spin");
     }
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);

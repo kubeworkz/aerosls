@@ -40,6 +40,16 @@
 #include "net/dspp.h"   /* full struct DSPPFullPagePacket definition -- consensus.h only forward-declares it */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
+/* arch/x86/boot.asm's exported bootstrap-stack bounds. frame_pool_init() now
+ * reserves [stack_bottom, stack_top) by name instead of trusting
+ * _kernel_image_end to cover it, so every test that links frame_pool.c has to
+ * supply them. This file does not call frame_pool_init(); see
+ * frame_pool_reserve_host_test.c for why the adjacency of these two symbols
+ * cannot be reproduced honestly in C. */
+char stack_bottom[16];
+char stack_top[16];
+
+
 /* Consensus entry points now take a kernel_tick_counter reading: election
  * timeouts are wall-clock, not call counts (net/consensus.h, "Election
  * timing"). This test is about MIGRATION, not timing, so one fixed reading
