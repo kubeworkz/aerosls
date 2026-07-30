@@ -1130,6 +1130,47 @@ Every other wildcard was widened in the same pass, because they were the same la
 
 That is the sixth instance in this session of a check that could not fail, and the pattern is now unmistakable: every one of them passed the first time it was run, and every one was found by deliberately breaking the thing it was supposed to be watching. **A check that has never been observed to fail has not been tested — it has only been executed.**
 
+## 9t. The roster only ever pointed one way
+
+With the stack fixed and no warnings on any node, the output still said this:
+
+```
+node 1: LEADER,   term 1, active nodes 4, quorum 3, roster 4
+node 2: FOLLOWER, term 1, active nodes 1, quorum 1, roster 1
+node 3: FOLLOWER, term 1, active nodes 1, quorum 1, roster 1
+node 4: FOLLOWER, term 1, active nodes 1, quorum 1, roster 1
+```
+
+`cluster_register_peer()` had **one** caller in the entire kernel: `POST /api/cluster/peer`. Nothing in the receive path registered anybody, and `run-cluster.sh` never peered the nodes at all — so a roster was whatever an operator had POSTed, in one direction.
+
+The followers were at the leader's term and FOLLOWER, so heartbeats were arriving and the term was propagating correctly. The leader was simply never added to their rosters. **Kill node 1 and all three time out, campaign, and each elects itself with a quorum of one** — four single-node clusters, each believing it holds every lease. The same split-brain §9f closed, reached by a completely different route.
+
+That is the third occurrence of this exact shape: the function is correct and nothing calls it on the path that matters. §9b was `check_consensus_heartbeat_tick()`.
+
+### Auto-register, with the trust surface written down
+
+Any consensus frame from a node id proves that node exists and is talking, so the id is noted before the opcode is even examined — a stale-term heartbeat or a vote reply addressed to someone else still teaches the roster, which the early returns would otherwise skip.
+
+Split across the interrupt boundary, because the receive path *is* the timer ISR (`timer.c` → `net_poll_tick` → `e1000_poll_rx` → `dspp_rx_dispatch`) and `cluster_register_peer()` mutates the roster the BSP reads while serving `/api/cluster`. So `cluster_note_peer_seen()` is ISR-safe and does nothing but set a bit in one word; `cluster_drain_discovered_peers()` is BSP-only and does the registration, called from the same sweep as the consensus ticks. Same producer/consumer discipline the AP reconciler already uses.
+
+**The trust surface, stated rather than skipped:** the cluster segment is unauthenticated L2 broadcast. Anything on it can assert a node id and be believed, which inflates `active_nodes` and therefore the quorum threshold — and a quorum that cannot be met stalls elections. That is a real denial of service. It is accepted deliberately: the roster is bounded by `CLUSTER_NODE_MAX`, every auto-registration is logged as learned-from-the-wire rather than operator-driven, and `peers_autodiscovered` is on `/api/cluster` so a roster growing on its own is visible without reading a console. Authenticating DSPP is separate work and none of the above is a substitute for it.
+
+### A leak the test found by accident
+
+`cluster_init()` empties the roster — and did not empty the pending-peer queue. So forming a new cluster would silently re-absorb the previous membership on the next sweep, quorum recomputed to match, nothing saying why.
+
+It surfaced because the 186-check suite had been feeding consensus packets through 176 earlier checks, so the queue was full of their senders and the first drain after a re-init registered all of them at once. That was the test noticing a real defect, not the test being dirty — and it is now asserted directly: note a peer, re-init, drain, expect nothing.
+
+### Three mutations survived, all of them my tests being loose
+
+- **Self is registered.** Deleting the self-check in `cluster_note_peer_seen()` changed nothing observable, because `cluster_register_peer()` rejects self too. The difference is an ERROR line *per heartbeat* on a broadcast segment, which is the actual reason the guard is there — so the test now counts ERROR lines and asserts silence.
+- **Out-of-range ids folded instead of dropped.** Folding 65 onto bit 0 registers node 1 — the wrong peer, worse than missing one. The test couldn't see it because node 1 was already in the roster, so the fold returned "already active". Now run against a clean roster.
+- **The drain read the mask without clearing it.** Invisible, because registration is idempotent: re-processing the same ids every sweep returns "already active" every time and looks identical from outside. Needed a seam — `cluster_pending_peer_mask_for_test()` — to assert the queue is actually emptied.
+
+186 checks in `consensus_phase1_host_test.c` (169 → 186), 6/6 mutations after those three rewrites.
+
+That is the seventh, eighth and ninth instance in this session of a check that could not fail. The common factor in every single one: **the assertion was true for a reason other than the one being tested**, and the only way to find out was to break the code and watch.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

@@ -420,6 +420,30 @@ int cluster_init(uint32_t local_node_id);
  *  -2  = roster full (CLUSTER_NODE_MAX reached) */
 int cluster_register_peer(uint32_t node_id);
 
+/* ─── Peer discovery from the wire ─────────────────────────────────────────
+ * cluster_note_peer_seen() is ISR-SAFE and does nothing but set a bit: the
+ * receive path runs in the timer interrupt, and cluster_register_peer() mutates
+ * the roster the BSP is reading. cluster_drain_discovered_peers() is BSP-ONLY
+ * and does the actual registration; call it from the same sweep as
+ * check_consensus_heartbeat_tick(). Returns the number newly registered.
+ *
+ * Together they close the gap where cluster_register_peer() had exactly one
+ * caller -- POST /api/cluster/peer -- so followers never learned their leader
+ * and sat at quorum 1, one node failure away from four single-node clusters.
+ * See the definition in consensus.c for the full account, including the
+ * unauthenticated-broadcast trust surface this accepts. */
+void     cluster_note_peer_seen(uint32_t node_id);
+uint32_t cluster_drain_discovered_peers(void);
+
+/* Running count of peers registered from wire traffic rather than by an
+ * operator. Surfaced on /api/cluster: a roster growing on its own is something
+ * an operator should be able to see without reading the console. */
+extern uint64_t cluster_peers_autodiscovered;
+
+/* Contents of the not-yet-drained peer queue. Test-only: see the definition
+ * for why the drain's clearing of it needs a seam to be observable at all. */
+uint64_t cluster_pending_peer_mask_for_test(void);
+
 /* Accessors -- callers outside consensus.c (a future cluster-status
  * HTTP/shell surface, or a later phase's per-partition lease logic) should
  * use these rather than reaching into local_cluster_state directly, the

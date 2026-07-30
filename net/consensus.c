@@ -68,6 +68,12 @@ static void cluster_recompute_quorum(void) {
         (local_cluster_state.active_nodes_count / 2) + 1;        /* majority */
 }
 
+/* Peers heard on the wire but not yet registered. Written by the receive ISR
+ * (cluster_note_peer_seen), drained by the BSP sweep. Declared up here because
+ * cluster_init() has to be able to clear it -- see below. */
+static volatile uint64_t pending_peer_mask = 0;   /* bit (id-1) for ids 1..64 */
+uint64_t cluster_peers_autodiscovered = 0;
+
 int cluster_init(uint32_t local_node_id) {
     if (local_node_id == 0) {
         kernel_serial_print("[CONSENSUS] ERROR: node id 0 is reserved (uninitialized sentinel).\n");
@@ -84,6 +90,19 @@ int cluster_init(uint32_t local_node_id) {
 
     for (uint32_t i = 0; i < CLUSTER_NODE_MAX; i++) cluster_roster[i].active = 0;
     cluster_roster_count = 0;
+
+    /* Discard peers heard before this call. cluster_init() means "form a new
+     * cluster as node N", and it deliberately empties the roster -- so leaving
+     * a queue of previously-heard node ids to be drained into the fresh roster
+     * a moment later would silently undo that. The old membership would
+     * reappear on the next BSP sweep, with the quorum recomputed to match, and
+     * nothing would say why.
+     *
+     * Found by a host test whose 176 earlier checks had been processing
+     * consensus packets all along: the queue was still full of their senders,
+     * so the first drain after a re-init registered all of them at once. That
+     * was the test noticing a real leak, not the test being dirty. */
+    __atomic_store_n(&pending_peer_mask, 0ULL, __ATOMIC_RELAXED);
 
     cluster_recompute_quorum();   /* self only: active_nodes_count=1, quorum=1 */
 
@@ -122,6 +141,88 @@ int cluster_register_peer(uint32_t node_id) {
                           (unsigned)local_cluster_state.active_nodes_count,
                           (unsigned)local_cluster_state.stable_quorum_threshold);
     return 0;
+}
+
+/* ─── Learning peers from the wire ─────────────────────────────────────────
+ * cluster_register_peer() above had exactly ONE caller in the whole kernel:
+ * POST /api/cluster/peer. Nothing in the receive path ever registered anybody,
+ * and run-cluster.sh never peered the nodes at all, so a roster was whatever an
+ * operator had POSTed -- in one direction only.
+ *
+ * The observed result on a real 4-node cluster: node 1 held all four, and nodes
+ * 2, 3 and 4 each held only themselves with `quorum threshold 1`. They were
+ * FOLLOWER at the leader's term, so heartbeats were arriving and the term was
+ * propagating correctly -- but the leader was never added to their rosters.
+ * Kill node 1 and all three time out, campaign, and each elects itself with a
+ * quorum of one: four single-node clusters, each believing it holds every
+ * lease. The same split-brain the vote-candidate fix closed, reached by a
+ * different route.
+ *
+ * ─── Why a deferred queue and not a direct call ────────────────────────────
+ * The receive path runs in the timer ISR (kernel/timer.c -> net_poll_tick ->
+ * e1000_poll_rx -> dspp_rx_dispatch). cluster_register_peer() mutates
+ * cluster_roster[] and recomputes the quorum, both of which the BSP reads while
+ * serving /api/cluster. Calling it from the ISR would tear those reads. So the
+ * ISR only records that an id was SEEN, in one word, and the BSP sweep drains
+ * it -- the same producer/consumer split the AP reconciler already uses.
+ *
+ * ─── The trust surface, stated plainly ─────────────────────────────────────
+ * The cluster segment is unauthenticated L2 broadcast. Anything on it can
+ * assert a node id and be believed, which inflates active_nodes and therefore
+ * the quorum threshold, and a quorum that cannot be met stalls elections. That
+ * is a real denial-of-service and it is accepted deliberately here rather than
+ * overlooked: the roster is bounded by CLUSTER_NODE_MAX so the damage is
+ * bounded too, every auto-registration is logged with its source, and the
+ * running count is exposed on /api/cluster so an operator can see the roster
+ * growing without having asked for it. Authenticating DSPP is a separate piece
+ * of work and this comment is not a substitute for it. */
+
+void cluster_note_peer_seen(uint32_t node_id) {
+    /* ISR context. One atomic OR, no roster access, no logging. Ids outside
+     * 1..64 are dropped rather than folded into the mask -- silently mapping a
+     * large id onto some other node's bit would register the WRONG peer, which
+     * is worse than not registering at all. */
+    if (node_id == 0 || node_id > 64) return;
+    if (node_id == local_cluster_state.node_id) return;   /* plain read, never written by the ISR */
+    __atomic_fetch_or(&pending_peer_mask, 1ULL << (node_id - 1), __ATOMIC_RELAXED);
+}
+
+/* The pending queue's contents, for testing only. Exposed because the drain's
+ * clearing of it is otherwise unobservable: cluster_register_peer() is
+ * idempotent, so a drain that read the mask without clearing would re-process
+ * the same ids every sweep, get "already active" every time, and look
+ * identical from outside. A mutation replacing the exchange with a plain load
+ * passed the whole suite. */
+uint64_t cluster_pending_peer_mask_for_test(void) {
+    return __atomic_load_n(&pending_peer_mask, __ATOMIC_RELAXED);
+}
+
+uint32_t cluster_drain_discovered_peers(void) {
+    /* BSP only. Exchange-to-zero so an id noted between the read and the clear
+     * is not lost -- it stays set and is picked up on the next sweep. */
+    uint64_t seen = __atomic_exchange_n(&pending_peer_mask, 0ULL, __ATOMIC_RELAXED);
+    if (seen == 0) return 0;
+
+    uint32_t registered = 0;
+    for (uint32_t bit = 0; bit < 64; bit++) {
+        if (!(seen & (1ULL << bit))) continue;
+        uint32_t id = bit + 1;
+
+        /* Already-active peers return 1 and log nothing, so a steady cluster
+         * does not spam the console once per heartbeat. */
+        int rc = cluster_register_peer(id);
+        if (rc == 0 || rc == 2) {
+            cluster_peers_autodiscovered++;
+            registered++;
+            kernel_serial_printf(
+                "[CONSENSUS] node %u learned from the wire, not from an operator -- "
+                "auto-registered (%s). Roster is now %u node(s), quorum %u.\n",
+                (unsigned)id, rc == 2 ? "re-activated" : "new",
+                (unsigned)local_cluster_state.active_nodes_count,
+                (unsigned)local_cluster_state.stable_quorum_threshold);
+        }
+    }
+    return registered;
 }
 
 uint32_t cluster_local_node_id(void)     { return local_cluster_state.node_id; }
@@ -265,6 +366,12 @@ void trigger_kernel_election_campaign(uint64_t now) {
 // (dspp_rx_dispatch(), net/dspp.c).
 void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
+
+    /* Any consensus traffic from a node id proves that node exists and is
+     * talking. Noted before the opcode is even examined, so a stale-term
+     * heartbeat or a vote reply addressed to someone else still teaches us the
+     * roster -- the early returns below would otherwise skip it. */
+    cluster_note_peer_seen((uint32_t)packet->header.node_source_id);
 
     if (packet->header.opcode == DSPP_CMD_HEARTBEAT) {
         uint32_t hb_term = packet->header.transaction_id;
@@ -587,6 +694,12 @@ void check_partition_lease_heartbeat_tick(uint64_t now) {
 
 /* `now` is a kernel_tick_counter reading -- see process_consensus_packet(). */
 void process_partition_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
+
+    /* Any consensus traffic from a node id proves that node exists and is
+     * talking. Noted before the opcode is even examined, so a stale-term
+     * heartbeat or a vote reply addressed to someone else still teaches us the
+     * roster -- the early returns below would otherwise skip it. */
+    cluster_note_peer_seen((uint32_t)packet->header.node_source_id);
     struct ConsensusMessage* msg = (struct ConsensusMessage*)packet->payload_4kb;
     uint32_t partition_id = msg->partition_id;
 

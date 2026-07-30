@@ -2578,6 +2578,8 @@ static int api_cluster_view(char* buf, int max) {
     jb_putc(&j, ',');
     jb_uint(&j, "stack_frames_withheld", (uint32_t)frame_pool_live_stack_withheld);
     jb_putc(&j, ',');
+    jb_uint(&j, "peers_autodiscovered", (uint32_t)cluster_peers_autodiscovered);
+    jb_putc(&j, ',');
     /* node_id 0 is Phase 1's "cluster_init() was never called" sentinel.
      * Reported explicitly so a UI can say "this node is standalone"
      * rather than drawing a one-node cluster that does not exist. */
@@ -5861,6 +5863,10 @@ void http_server_run(void) {
          * "Election timing" block. */
         check_consensus_heartbeat_tick(kernel_tick_counter);
         check_partition_lease_heartbeat_tick(kernel_tick_counter);
+        /* BSP-only half of peer discovery. The ISR that receives consensus
+         * frames only sets a bit; the roster mutation has to happen here,
+         * where nothing is reading it concurrently. */
+        cluster_drain_discovered_peers();
         /* Phase 6: feed the endpoint probe and IPC queue depth into the
          * breakers. AFTER the heartbeat, deliberately -- the heartbeat is
          * what re-probes, so running first would judge breakers on the

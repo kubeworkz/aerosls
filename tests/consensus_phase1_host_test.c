@@ -104,7 +104,18 @@ static int checks_failed = 0;
 
 /* --- Stubs for consensus.c's extern dependencies --- */
 void kernel_serial_print(const char* s) { (void)s; }
-void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
+/* Counts ERROR lines. cluster_register_peer() rejects id 0 and self with an
+ * ERROR log, so the note-side guards in cluster_note_peer_seen() look redundant
+ * from the roster's point of view -- a mutation deleting the self-check passed
+ * the whole suite, because the roster ended up identical either way. The
+ * difference is a console line per heartbeat on a broadcast segment, which is
+ * the actual reason the guard is there, so it is what gets asserted. */
+static int serial_error_lines = 0;
+void kernel_serial_printf(const char* fmt, ...) {
+    if (fmt) { const char* p = fmt;
+        for (; *p; p++)
+            if (p[0]=='E'&&p[1]=='R'&&p[2]=='R'&&p[3]=='O'&&p[4]=='R') { serial_error_lines++; break; } }
+}
 void update_page_table_permissions_globally(uint32_t force_read_only) { (void)force_read_only; }
 
 /* Phase 4: call-tracked, unlike the global stub above -- Scenario 13 below
@@ -1228,6 +1239,120 @@ int main(void) {
         process_partition_consensus_packet(&ph, now_ticks);
         CHECK(partition_holds_write_lease(64) == 0,
               "*** but a HIGHER term does take the lease away ***");
+    }
+
+    /* ─── Peer discovery from the wire ─────────────────────────────────────
+     * cluster_register_peer() had one caller: POST /api/cluster/peer. On a real
+     * 4-node cluster node 1 held all four while nodes 2, 3 and 4 each held only
+     * themselves at quorum 1 -- FOLLOWER at the leader's term, so heartbeats
+     * were arriving and the term propagated, but the leader was never rostered.
+     * One node failure from four single-node clusters each claiming every
+     * lease. */
+    {
+        /* Note a peer, then re-init BEFORE draining: cluster_init() empties the
+         * roster, so a queue of previously-heard ids must be dropped too or the
+         * old membership silently reappears on the next sweep with the quorum
+         * recomputed to match. This is also what the 176 checks above were
+         * doing by accident -- they had been feeding consensus packets all
+         * along, and the first drain after a re-init picked up every one of
+         * their senders. */
+        cluster_init(9);
+        cluster_note_peer_seen(5);
+        cluster_init(2);                      /* fresh node, empty roster */
+        CHECK(cluster_drain_discovered_peers() == 0,
+              "*** cluster_init() discards peers heard before it -- forming a new "
+              "cluster must not re-absorb the old membership ***");
+        CHECK(cluster_active_node_count() == 1,
+              "a freshly initialised node knows only itself");
+
+        /* A leader's heartbeat carries its id in the DSPP header. */
+        struct DSPPFullPagePacket hb;
+        hb.header.magic          = DSPP_MAGIC;
+        hb.header.opcode         = DSPP_CMD_HEARTBEAT;
+        hb.header.node_source_id = 1;
+        hb.header.transaction_id = 7;
+        process_consensus_packet(&hb, 500);
+
+        CHECK(cluster_active_node_count() == 1,
+              "*** receiving it does NOT touch the roster yet -- the receive path "
+              "is the timer ISR and the roster is read by the BSP ***");
+        CHECK(cluster_pending_peer_mask_for_test() != 0,
+              "...but it IS queued, waiting for the BSP");
+        CHECK(cluster_drain_discovered_peers() == 1,
+              "*** the BSP drain is what registers it ***");
+        CHECK(cluster_pending_peer_mask_for_test() == 0,
+              "*** the drain CLEARS the queue -- registration is idempotent, so a "
+              "drain that only read it would re-process the same ids every sweep "
+              "and look identical from outside ***");
+        CHECK(cluster_active_node_count() == 2,
+              "...and now the follower knows its leader");
+        CHECK(cluster_peers_autodiscovered == 1,
+              "...counted, so a roster growing on its own is visible on /api/cluster");
+
+        /* Idempotent: a steady cluster must not re-register once per heartbeat. */
+        process_consensus_packet(&hb, 530);
+        CHECK(cluster_drain_discovered_peers() == 0,
+              "*** a peer already active is not re-registered -- otherwise every "
+              "heartbeat would log and recount forever ***");
+        CHECK(cluster_active_node_count() == 2, "...and the count is unchanged");
+
+        /* A STALE-term heartbeat still teaches the roster. The opcode handler
+         * returns early on a stale term, so noting the sender has to happen
+         * before that -- this is the case that ordering gets wrong. */
+        struct DSPPFullPagePacket stale = hb;
+        stale.header.node_source_id = 3;
+        stale.header.transaction_id = 1;          /* below our current term */
+        process_consensus_packet(&stale, 560);
+        CHECK(cluster_drain_discovered_peers() == 1 && cluster_active_node_count() == 3,
+              "*** a STALE-term heartbeat still registers its sender -- the sender is "
+              "noted before the opcode is examined, so the early return cannot skip it ***");
+
+        /* Self must never be registered, whatever the wire says. */
+        struct DSPPFullPagePacket selfhb = hb;
+        selfhb.header.node_source_id = 2;         /* us */
+        int err_before = serial_error_lines;
+        process_consensus_packet(&selfhb, 590);
+        CHECK(cluster_drain_discovered_peers() == 0 && cluster_active_node_count() == 3,
+              "*** a frame claiming OUR id registers nothing -- self in the roster "
+              "would double-count us into the quorum ***");
+        CHECK(serial_error_lines == err_before,
+              "*** ...and does so SILENTLY: it is dropped before "
+              "cluster_register_peer(), which would log an ERROR for it once per "
+              "heartbeat forever on a broadcast segment ***");
+
+        /* Id 0 is the uninitialised sentinel and must not become a peer. */
+        struct DSPPFullPagePacket zero = hb;
+        zero.header.node_source_id = 0;
+        process_consensus_packet(&zero, 620);
+        CHECK(cluster_drain_discovered_peers() == 0,
+              "...and neither does node id 0, the 'cluster_init was never called' sentinel");
+
+        /* An id the single-word mask cannot represent is DROPPED, not folded.
+         * Folding 65 onto bit 0 would register node 1 -- the wrong peer, which
+         * is worse than missing one.
+         *
+         * Re-initialised first, so node 1 is NOT already in the roster. With it
+         * present, a fold to id 1 returns "already active", registers nothing,
+         * and the check passes while the bug is live -- which is exactly what
+         * happened to the first version of this. */
+        cluster_init(2);
+        CHECK(cluster_active_node_count() == 1, "clean roster: node 1 is absent");
+        struct DSPPFullPagePacket big = hb;
+        big.header.node_source_id = 65;
+        process_consensus_packet(&big, 650);
+        CHECK(cluster_drain_discovered_peers() == 0 && cluster_active_node_count() == 1,
+              "*** an id outside 1..64 is dropped rather than folded onto another "
+              "node's bit -- folding 65 would have registered node 1 ***");
+
+        /* Restore a 3-node roster for the quorum assertion below. */
+        cluster_note_peer_seen(1); cluster_note_peer_seen(3);
+        cluster_drain_discovered_peers();
+
+        /* The quorum must actually move with the roster -- registering peers
+         * that do not change the threshold would leave the split-brain open. */
+        CHECK(local_cluster_state.stable_quorum_threshold == 2,
+              "*** 3 active nodes gives a quorum of 2, so the follower can no longer "
+              "elect itself alone ***");
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
