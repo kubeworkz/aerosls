@@ -1022,6 +1022,44 @@ M19 also survived — the inverted-range early return looked redundant because `
 
 Still not identified: what writes a page of payload onto a reserved frame. The two fixes above close the paths where the *allocator* could have handed the stack out. If the fault recurs with the reservations in place and no `WITHHELD` or `ERROR` line, then nothing went through the allocator at all and the writer is a raw pointer or a DMA target that never consulted it — which is a different and shorter list.
 
+## 9q. It works — and neither guard fired, which is the part worth writing down
+
+```
+[STREAM] 'big.bin': 262144 bytes, 64 frames flushed to NVMe.
+```
+
+256 KiB, 64 frames, name intact, no fault. Five times the frame count of the run that died, on a path that had failed at twelve.
+
+**No `WITHHELD` line and no `[FRAME] *** ERROR` line appeared.** So neither new guard fired, and therefore neither is demonstrably what fixed it. The honest reading of this run is *the symptom is gone and the mechanism was never identified*. Adding code grew `.bss` and moved the stack a page each rebuild — `0x077e7000` → `0x077e8000` between two of these runs — so a plausible explanation is that the target moved rather than the bug being closed. A symptom that moves can move back.
+
+Three things are nonetheless true and worth keeping:
+
+- `partition_reclaim_all_frames(PARTITION_SYSTEM)` would have freed the kernel image. Latent, but real, and now guarded.
+- The linker script's placement of `.bootstrap_stack` was load-bearing and unchecked. Now reserved by its own exported bounds, with a boot line either way.
+- The allocator could return the frame holding its own live stack. Now it cannot.
+
+### An absence is not a measurement
+
+"No error printed at boot" is indistinguishable from a log that scrolled, a chardev that truncated on restart, or a check that never ran. The two facts this investigation now depends on are therefore values rather than silences, exposed on `/api/cluster`:
+
+```
+stack_reserved         must be true   -- re-swept, all 16 frames, at request time
+stack_covered_at_boot  must be true   -- the image-end reservation really did cover the stack
+stack_frames_withheld  must be 0      -- a nonzero count is a bug report, not a statistic
+```
+
+`frame_pool_init()` now also prints an affirmative confirmation naming the frame range, not just an error on mismatch.
+
+### Two more mutations survived first
+
+**M22** deleted the "has init run" guard from `frame_pool_stack_still_reserved()` and the 54-check suite passed. After `frame_pool_reset()` frame 0 is free, so the uninitialised `lo == hi == 0` sweep returned "not reserved" for entirely the wrong reason. The test now reserves frame 0 first, so only the guard can produce the right answer.
+
+**M25** deleted the line clearing the stack bounds in `frame_pool_reset()` and also passed — every other check set the bounds itself immediately after resetting, so staleness could never show. The new case sets them *before* the reset and never re-sets them.
+
+Both are the same shape as M14 in §9p and as the three in §9h/§9i/§9j: **a test that arranges the world so the guard's absence cannot change the answer.** Five instances now, and the tell is consistent — the assertion and the setup are too close together, so the setup satisfies the assertion on its own.
+
+`frame_pool_reserve_host_test.c` 24 → 58 checks, 11/11 mutations.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

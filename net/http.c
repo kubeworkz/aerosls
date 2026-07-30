@@ -2563,6 +2563,21 @@ static int api_cluster_view(char* buf, int max) {
      * to "my peers are refusing to vote for me". */
     jb_uint(&j, "dspp_oversize_dropped", (uint32_t)dspp_tx_oversize_dropped);
     jb_putc(&j, ',');
+    /* Memory-integrity signals. These are here rather than in a debug corner
+     * because their healthy value is a positive statement, not an absence:
+     * "no [FRAME] error scrolled past at boot" is indistinguishable from a
+     * truncated log or a check that never ran, and the failure they cover is
+     * the allocator handing out the kernel's own live stack -- which surfaces
+     * as a #GP on a return address made of somebody's payload, several layers
+     * away from the write. stack_reserved must be true and
+     * stack_frames_withheld must be 0 on a healthy node; a nonzero withheld
+     * count is a bug report, not a statistic. */
+    jb_str (&j, "stack_reserved", frame_pool_stack_still_reserved() ? "true" : "false");
+    jb_putc(&j, ',');
+    jb_str (&j, "stack_covered_at_boot", frame_pool_stack_covered ? "true" : "false");
+    jb_putc(&j, ',');
+    jb_uint(&j, "stack_frames_withheld", (uint32_t)frame_pool_live_stack_withheld);
+    jb_putc(&j, ',');
     /* node_id 0 is Phase 1's "cluster_init() was never called" sentinel.
      * Reported explicitly so a UI can say "this node is standalone"
      * rather than drawing a one-node cluster that does not exist. */

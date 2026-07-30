@@ -371,6 +371,67 @@ int main(void) {
               "to it on the next allocation and spin");
     }
 
+    /* ─── "No error at boot" made assertable ───────────────────────────────
+     * The run that finally succeeded printed neither a WITHHELD line nor a
+     * [FRAME] ERROR line -- which is exactly as consistent with "both guards
+     * are healthy" as with "neither ran". An absence cannot tell those apart,
+     * so the state is now a value. */
+    {
+        frame_pool_reset();
+        /* Frame 0 deliberately reserved. Without that the uninitialised
+         * lo == hi == 0 sweep would check frame 0, find it free and return
+         * "not reserved" for the wrong reason -- and a mutation deleting the
+         * has-init-run guard passed a 54-check suite exactly that way. With
+         * frame 0 reserved, only the guard can produce the right answer. */
+        frame_pool_reserve_below(64 * 1024);
+        CHECK(frame_pool_is_reserved(0), "frame 0 is reserved, so the sweep would say yes");
+        CHECK(!frame_pool_stack_still_reserved(),
+              "*** before init has run, the predicate reports NOT reserved rather "
+              "than vacuously true -- an unrun check must not read as a pass ***");
+
+        /* Stand in for what frame_pool_init() does with the real symbols. */
+        frame_pool_stack_lo_frame = 4;
+        frame_pool_stack_hi_frame = 15;
+        CHECK(frame_pool_stack_still_reserved(),
+              "*** with the stack frames reserved, it reports reserved ***");
+
+        /* The detection that matters: something clears one of them later. */
+        frame_pool_reset();
+        frame_pool_reserve_range(4 * 4096, 16 * 4096);
+        frame_pool_stack_lo_frame = 4;
+        frame_pool_stack_hi_frame = 15;
+        CHECK(frame_pool_stack_still_reserved(), "...still reserved after an explicit range");
+        free_physical_ram_frame((void*)(uintptr_t)(9 * 4096));  /* un-reserve one, mid-range */
+        CHECK(!frame_pool_stack_still_reserved(),
+              "*** freeing ONE frame in the middle of the stack is detected -- the "
+              "check covers every frame, not just the ends ***");
+
+        frame_pool_reset();
+        frame_pool_reserve_range(4 * 4096, 16 * 4096);
+        frame_pool_stack_lo_frame = 4; frame_pool_stack_hi_frame = 15;
+        free_physical_ram_frame((void*)(uintptr_t)(15 * 4096)); /* the last one */
+        CHECK(!frame_pool_stack_still_reserved(),
+              "...including the topmost frame, which an exclusive bound would miss");
+
+        /* State must not leak across a reset. Every other check in this block
+         * sets the bounds itself immediately after resetting, so a reset that
+         * left them stale would never show -- which is how the mutation
+         * deleting that line survived. Here the bounds are set BEFORE the
+         * reset and never re-set, so only a reset that clears them gives the
+         * right answer. */
+        frame_pool_reserve_range(4 * 4096, 16 * 4096);
+        frame_pool_stack_lo_frame = 4; frame_pool_stack_hi_frame = 15;
+        CHECK(frame_pool_stack_still_reserved(), "bounds set and frames reserved");
+        frame_pool_reset();
+        frame_pool_reserve_below(64 * 1024);   /* frames 0..15 reserved again */
+        CHECK(frame_pool_is_reserved(4) && frame_pool_is_reserved(15),
+              "...and after a reset those same frames are reserved once more");
+        CHECK(!frame_pool_stack_still_reserved(),
+              "*** but the predicate still reports NOT reserved: reset cleared the "
+              "bounds, so this is a fresh pool whose init has not run rather than "
+              "the previous pool's answer ***");
+    }
+
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;
 }

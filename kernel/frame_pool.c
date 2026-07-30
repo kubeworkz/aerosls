@@ -143,6 +143,7 @@ void frame_pool_init(void) {
     uint64_t sb = (uint64_t)(uintptr_t)stack_bottom;
     uint64_t stp = (uint64_t)(uintptr_t)stack_top;
     uint64_t before_stack = frames_reserved;
+    int stack_covered_by_image_end;
     frame_pool_reserve_range(sb, stp);
     if (frames_reserved != before_stack) {
         kernel_serial_printf(
@@ -152,7 +153,24 @@ void frame_pool_init(void) {
             "other bound derived from it should be re-checked. ***\n",
             (unsigned long long)sb, (unsigned long long)stp, (unsigned long long)end,
             (unsigned long long)(frames_reserved - before_stack));
+        stack_covered_by_image_end = 0;
+    } else {
+        stack_covered_by_image_end = 1;
+        kernel_serial_printf(
+            "[FRAME] bootstrap stack [0x%llx,0x%llx) confirmed inside the reserved "
+            "region -- frames %llu..%llu are the kernel's own stack and are not "
+            "allocatable.\n",
+            (unsigned long long)sb, (unsigned long long)stp,
+            (unsigned long long)(sb / FRAME_SIZE),
+            (unsigned long long)((stp - 1) / FRAME_SIZE));
     }
+    frame_pool_stack_covered = stack_covered_by_image_end;
+
+    /* Re-checkable afterwards, not just at boot: if anything ever clears these
+     * bits the stack becomes allocatable again, and the first symptom of that
+     * is a return address made of somebody's payload. */
+    frame_pool_stack_lo_frame = sb / FRAME_SIZE;
+    frame_pool_stack_hi_frame = (stp - 1) / FRAME_SIZE;
     kernel_serial_printf(
         "[FRAME] reserved %llu frames (%llu MiB) below the kernel image end "
         "0x%llx -- allocator now starts above the kernel.\n",
@@ -192,6 +210,9 @@ void frame_pool_reset(void) {
     frames_reserved = 0;
     reserved_below  = 0;
     reserved_above  = TOTAL_FRAMES;
+    frame_pool_stack_lo_frame = 0;
+    frame_pool_stack_hi_frame = 0;
+    frame_pool_stack_covered  = 0;
 }
 
 
@@ -226,6 +247,24 @@ int fp_frame_contains(uint64_t frame_base, uint64_t addr) {
 }
 
 uint64_t frame_pool_live_stack_withheld = 0;
+
+/* 1 once frame_pool_init() has confirmed the bootstrap stack really was inside
+ * the image-end reservation. Exposed because "no error was printed at boot" is
+ * an absence, and absences are indistinguishable from a log that scrolled, a
+ * chardev that truncated, or a check that never ran. This makes it a value
+ * something can assert on afterwards. */
+int frame_pool_stack_covered = 0;
+uint64_t frame_pool_stack_lo_frame = 0;
+uint64_t frame_pool_stack_hi_frame = 0;
+
+/* Nonzero if every frame of the bootstrap stack is still marked reserved.
+ * Cheap enough to call from a status endpoint: the stack is 16 frames. */
+int frame_pool_stack_still_reserved(void) {
+    if (frame_pool_stack_hi_frame == 0) return 0;   /* init has not run */
+    for (uint64_t f = frame_pool_stack_lo_frame; f <= frame_pool_stack_hi_frame; f++)
+        if (!frame_pool_is_reserved(f)) return 0;
+    return 1;
+}
 
 static void *alloc_raw_frame(void)
 {

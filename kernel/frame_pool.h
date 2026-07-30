@@ -120,6 +120,15 @@ extern uint64_t frame_pool_live_stack_withheld;
  * See its definition for why an untestable guard was the worse option. */
 extern uint64_t frame_pool_test_sp_override;
 
+/* Boot-time confirmation that the bootstrap stack really was inside the
+ * _kernel_image_end reservation, and a predicate that re-checks it at any
+ * time. "No error printed at boot" is an absence -- indistinguishable from a
+ * truncated log or a check that never ran -- so these make it assertable. */
+extern int      frame_pool_stack_covered;
+extern uint64_t frame_pool_stack_lo_frame;
+extern uint64_t frame_pool_stack_hi_frame;
+int frame_pool_stack_still_reserved(void);
+
 /* Introspection for the boot log and the host test. */
 uint64_t frame_pool_reserved_count(void);
 int      frame_pool_is_reserved(uint64_t frame_index);
