@@ -56,4 +56,51 @@ static inline int fault_noncanonical(uint64_t v) {
     return !(hi == 0ULL || hi == 0x1FFFFULL);
 }
 
+/* ─── Locating the interrupt frame ────────────────────────────────────────
+ * x86-64 always pushes SS:RSP on an interrupt, even at the same privilege
+ * level, so the frame is exactly five qwords: RIP, CS, RFLAGS, RSP, SS. Given
+ * a value already known to be the saved RIP and CS (the handler receives both
+ * as arguments), the frame can be found by scanning upward from the handler's
+ * own frame for that adjacent pair.
+ *
+ * Scanning rather than computing an offset is deliberate. The offset depends
+ * on what the assembly stub pushed and on whatever prologue the compiler chose
+ * for the handler that day, and an offset that silently goes stale prints
+ * confident nonsense at exactly the moment nobody can afford to double-check
+ * it. A search either finds the pair or reports that it did not.
+ *
+ * Returns a pointer to the saved-RIP slot, or 0 if no match is in range. */
+static inline const uint64_t* fault_find_iret_frame(const uint64_t* from,
+                                                    const uint64_t* limit,
+                                                    uint64_t saved_rip,
+                                                    uint64_t saved_cs) {
+    for (const uint64_t* p = from; p + 1 < limit; p++)
+        if (p[0] == saved_rip && p[1] == saved_cs) return p;
+    return 0;
+}
+
+/* ─── Extent of a poison run ──────────────────────────────────────────────
+ * Given a stack address known to hold `pattern`, walks DOWNWARD (toward lower
+ * addresses, i.e. into the region the faulting epilogue already popped, which
+ * nothing has overwritten) for as long as the qwords keep matching, and
+ * returns the lowest matching address.
+ *
+ * This is the measurement that names the bug. An overflowing buffer writes
+ * upward from its own base through the saved registers and return address
+ * above it, so the bottom of the poison run is the base of the buffer and the
+ * length of the run is how far it overran. A run of about 4096 bytes is a page
+ * buffer; about 1024, a DSPP fragment; 64, a name field. One number, and the
+ * candidate list collapses.
+ *
+ * `floor` bounds the walk so a stack full of the pattern cannot send it off
+ * the end of mapped memory -- this runs when memory is already known-bad, and
+ * a diagnostic that faults while diagnosing a fault teaches nothing. */
+static inline const uint64_t* fault_poison_run_base(const uint64_t* known,
+                                                    const uint64_t* floor,
+                                                    uint64_t pattern) {
+    const uint64_t* p = known;
+    while (p > floor && p[-1] == pattern) p--;
+    return p;
+}
+
 #endif /* FAULT_REPORT_H */

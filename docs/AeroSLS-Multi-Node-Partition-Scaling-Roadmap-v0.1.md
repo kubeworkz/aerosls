@@ -912,6 +912,42 @@ Both are cheap and both are permanent. This is the same trade as §9j's readback
 
 `grep REFUSED cluster/node1.log` returned nothing, so the NVMe alignment guard from §9j never fired — this is not a regression from that work. Every previous upload was small enough not to reach it.
 
+## 9n. What the first dump established — and the three qwords it stopped short of
+
+The instrumented build reproduced the fault and printed the stack. Decoding it against the x86-64 interrupt frame, which is always five qwords (RIP, CS, RFLAGS, RSP, SS) even at the same privilege level:
+
+```
+0x077f68e8: cdcdcdcdcdcdcdcd   <- saved rbp of the interrupted code
+0x077f68f0: 0000000000000000   <- error code, 0
+0x077f68f8: cdcdcdcdcdcdcdcd   <- saved RIP        ┐
+0x077f6900: 0000000000000008   <- CS = 0x8         │ the iret frame
+0x077f6908: 0000000000000206   <- RFLAGS           ┘
+```
+
+Both the interrupted **RIP and RBP** are the payload byte. Two *adjacent* poisoned qwords, in the `[saved rbp][return address]` order a `pop rbp; ret` epilogue reads them. So the corruption is contiguous and it covers exactly a frame boundary — which is what an overflowing local array does, writing upward from its own base through the saved registers above it.
+
+Working backwards from the epilogue: `ret` popped from `0x077f6918`, `pop rbp` from `0x077f6910`, leaving RSP at `0x077f6920`. **The smashed pair was at `0x077f6910`, so the overflowing buffer ends there** and extends downward.
+
+And that is where the dump ran out. It printed sixteen qwords anchored at the *handler's* frame, and the interrupted RSP — `rip_slot[3]`, three qwords past the last line printed — is the anchor everything else hangs off. The dump was aimed at the wrong end of the problem: it showed the handler's own printf scratch in detail and stopped just before the stack that faulted.
+
+### Second pass: measure the run, don't eyeball it
+
+The dump now anchors on the interrupted RSP, found by scanning upward for the `rip`/`cs` pair the handler already receives as arguments — a search rather than a hardcoded offset, because the offset depends on what the assembly stub pushed and on whichever prologue the compiler picked that day, and an offset that silently goes stale prints confident nonsense at exactly the moment nobody can afford to check it. If the pair isn't found it says so and dumps nothing.
+
+The addition that should end this is **`POISON RUN`**. From the smashed pair the handler walks downward — into the region the epilogue already popped, which nothing has since overwritten — for as long as the qwords keep matching, and prints the run's base and its length:
+
+> the LOW end is the base of the buffer that overran, and the length is how far it wrote.
+
+One number. ~4096 bytes is a page buffer; ~1024 a DSPP fragment; 64 a name field. The candidate list collapses to whatever local array of about that size was on the stack.
+
+`stack_bottom`/`stack_top` are now exported from `boot.asm` so the dump can also state how deep the frame was and refuse to read an RSP outside the stack — a dump whose bounds are unknown cannot tell "three frames down" from "about to run off the bottom", and those want different investigations. Preliminary arithmetic from the first dump puts the faulting frame under ~1.8 KiB from the top of the 64 KiB stack, so this is *not* stack exhaustion.
+
+31 checks in `fault_report_host_test.c` (18 → 31), 8/8 mutations caught. The four new ones are all bounds: letting the frame scan read one past its limit, matching on `rip` without `cs`, dropping the floor from the poison walk, and putting it off by one. The floor matters more than it looks — this code runs on a stack that is *already* known-bad, and a diagnostic that faults while diagnosing a fault teaches nothing.
+
+Also eliminated this pass: `kernel_serial_printf` emits character by character with no output buffer at all, and `emit_uint`'s `tmp[22]` is safe for the only two bases the switch can reach. It appears on all three corrupted log lines and it is not the writer.
+
+The C-only link check now reports **14** undefined symbols rather than 12; the two additions are `stack_bottom` and `stack_top`, both `global` in `arch/x86/boot.asm`, which is the same asm-provided category as the other twelve.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

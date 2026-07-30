@@ -98,6 +98,89 @@ int main(void) {
           "*** a non-poisoned non-canonical value is still reported as the "
           "smashed-pointer case ***");
 
+    /* ─── Locating the interrupt frame ────────────────────────────────── */
+    printf("\n-- finding the interrupt frame by its rip/cs pair --\n");
+    {
+        /* A plausible handler stack: some prologue junk, then the five-qword
+         * frame x86-64 pushes on every interrupt. */
+        uint64_t stk[16] = {
+            0x0000000007000000ULL, 0x000000000010029aULL, 0x000000000000000cULL,
+            0x0000000000000000ULL,                       /* error code */
+            0xcdcdcdcdcdcdcdcdULL,                       /* [4] RIP */
+            0x0000000000000008ULL,                       /* [5] CS */
+            0x0000000000000206ULL,                       /* [6] RFLAGS */
+            0x0000000007ff6920ULL,                       /* [7] RSP  <- the prize */
+            0x0000000000000010ULL,                       /* [8] SS */
+            0, 0, 0, 0, 0, 0, 0
+        };
+        const uint64_t* f = fault_find_iret_frame(stk, stk + 16,
+                                                  0xcdcdcdcdcdcdcdcdULL, 0x8ULL);
+        CHECK(f == &stk[4],
+              "*** the frame is found by the adjacent rip/cs pair ***");
+        CHECK(f && f[3] == 0x0000000007ff6920ULL,
+              "*** ...and rip_slot[3] really is the interrupted rsp -- the value the "
+              "first version of this dump stopped three qwords short of ***");
+
+        CHECK(fault_find_iret_frame(stk, stk + 16, 0xdeadbeefULL, 0x8ULL) == 0,
+              "*** a rip that is not on the stack returns 0 rather than a guess ***");
+        CHECK(fault_find_iret_frame(stk, stk + 16, 0xcdcdcdcdcdcdcdcdULL, 0x1BULL) == 0,
+              "...a matching rip with the WRONG cs is not accepted -- the pair is the "
+              "signature, not the rip alone");
+        CHECK(fault_find_iret_frame(stk + 5, stk + 16, 0xcdcdcdcdcdcdcdcdULL, 0x8ULL) == 0,
+              "...searching from past the frame does not find it (the scan is upward "
+              "only, so it can never report a frame below the handler)");
+
+        /* The last qword in range cannot be a frame start: reading its CS would
+         * be an over-read. The bound has to exclude it. */
+        uint64_t edge[2] = { 0xcdcdcdcdcdcdcdcdULL, 0x8ULL };
+        CHECK(fault_find_iret_frame(edge, edge + 1, 0xcdcdcdcdcdcdcdcdULL, 0x8ULL) == 0,
+              "*** a candidate whose CS would fall outside the limit is rejected, not "
+              "read past the end ***");
+        CHECK(fault_find_iret_frame(edge, edge + 2, 0xcdcdcdcdcdcdcdcdULL, 0x8ULL) == edge,
+              "...and is accepted once the limit actually covers the pair");
+    }
+
+    /* ─── Measuring the overrun ───────────────────────────────────────── */
+    printf("\n-- the poison run, which is what names the buffer --\n");
+    {
+        /* A 4 KiB page buffer that overran into the frame above it: 512 qwords
+         * of payload, then the smashed [saved rbp][return address] pair, and
+         * real stack contents below the buffer's base. */
+        enum { N = 600, BASE = 40, TOP = BASE + 512 };
+        static uint64_t stk[N];
+        for (int i = 0; i < N; i++) stk[i] = 0x1111111111111111ULL * (uint64_t)(i + 1);
+        for (int i = BASE; i < TOP + 2; i++) stk[i] = 0xcdcdcdcdcdcdcdcdULL;
+
+        /* sp is where the epilogue left it: just past the popped pair. */
+        const uint64_t* sp = &stk[TOP + 2];
+        const uint64_t* base = fault_poison_run_base(sp - 1, stk, 0xcdcdcdcdcdcdcdcdULL);
+        CHECK(base == &stk[BASE],
+              "*** the run's low end is the base of the overflowing buffer ***");
+        CHECK((const char*)sp - (const char*)base == (512 + 2) * 8,
+              "*** ...and its length measures the overrun: 4096 bytes of buffer plus "
+              "the 16 bytes of frame it destroyed ***");
+
+        /* A single poisoned qword is a run of one -- an overwrite that reached
+         * exactly the return address and no further. */
+        for (int i = 0; i < N; i++) stk[i] = 0x2222222222222222ULL;
+        stk[100] = 0xcdcdcdcdcdcdcdcdULL;
+        CHECK(fault_poison_run_base(&stk[100], stk, 0xcdcdcdcdcdcdcdcdULL) == &stk[100],
+              "*** a lone poisoned qword reports itself, not the qword below it ***");
+
+        /* The floor must hold even when everything below is the pattern -- this
+         * runs on a stack that is already known-bad, so walking off the bottom
+         * would mean faulting while diagnosing a fault. */
+        for (int i = 0; i < N; i++) stk[i] = 0xcdcdcdcdcdcdcdcdULL;
+        CHECK(fault_poison_run_base(&stk[N - 1], stk, 0xcdcdcdcdcdcdcdcdULL) == stk,
+              "*** an all-poison stack stops exactly at the floor ***");
+        CHECK(fault_poison_run_base(&stk[N - 1], &stk[300], 0xcdcdcdcdcdcdcdcdULL)
+                  == &stk[300],
+              "...and at a raised floor, so the bound is the argument and not a "
+              "coincidence of the data");
+        CHECK(fault_poison_run_base(stk, stk, 0xcdcdcdcdcdcdcdcdULL) == stk,
+              "...starting at the floor reads nothing below it");
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }

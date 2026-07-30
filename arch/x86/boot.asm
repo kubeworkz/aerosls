@@ -23,6 +23,12 @@ multiboot_end:
 ; ─── Bootstrap stack (64 KiB) ─────────────────────────────────────────────────
 section .bootstrap_stack, nobits
 align 16
+; Exported so the fault handler can say how deep the stack was and whether the
+; addresses it is dumping are even inside it. A stack dump whose bounds are
+; unknown cannot distinguish "three frames down" from "about to run off the
+; bottom", and those want completely different investigations.
+global stack_bottom
+global stack_top
 stack_bottom: resb 4096 * 16
 stack_top:
 

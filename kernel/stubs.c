@@ -78,17 +78,78 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
     for (;;) __asm__ volatile("hlt");
 }
 
-/* Dumps the qwords around the interrupted stack. The saved return address the
- * CPU choked on is in here, and so are its neighbours -- which is what
- * identifies the overflowing buffer, because the poison runs contiguously from
- * wherever the overrun began up through the frame it destroyed. Bounded to a
- * fixed window and read-only, so it cannot itself make a bad situation worse. */
-static void fault_dump_stack(const char* what) {
-    unsigned long* sp = (unsigned long*)__builtin_frame_address(0);
-    kernel_serial_printf("[FAULT] %s (16 qwords from %p, low address first):\n", what, (void*)sp);
-    for (int i = 0; i < 16; i += 2)
-        kernel_serial_printf("[FAULT]   %p: %016lx %016lx\n",
-                             (void*)(sp + i), sp[i], sp[i + 1]);
+/* The bootstrap stack, from arch/x86/boot.asm. Their ADDRESSES are the bounds;
+ * the objects are never read. */
+extern char stack_bottom[], stack_top[];
+
+/* Dumps the interrupted stack, anchored at the interrupted RSP rather than at
+ * the handler's own frame -- the first version anchored at the handler and
+ * stopped three qwords short of the one value that mattered.
+ *
+ * `rip_slot` points at the saved RIP in the interrupt frame, so the five-qword
+ * frame is rip_slot[0..4] = RIP, CS, RFLAGS, RSP, SS, and rip_slot[3] is the
+ * stack pointer the interrupted code had. Everything at and above that is the
+ * live stack of whatever was running; everything below it, down to the
+ * overflowing buffer, is the region its epilogue already popped and which
+ * nothing has since overwritten. */
+static void fault_dump_stack(const uint64_t* rip_slot) {
+    const uint64_t* lo = (const uint64_t*)(void*)stack_bottom;
+    const uint64_t* hi = (const uint64_t*)(void*)stack_top;
+
+    if (!rip_slot) {
+        kernel_serial_print(
+            "[FAULT] could not locate the interrupt frame -- no rip/cs pair matching the\n"
+            "[FAULT] reported values was found on the handler's stack. Dump skipped rather\n"
+            "[FAULT] than printed from a guessed offset.\n");
+        return;
+    }
+
+    uint64_t irq_rip    = rip_slot[0];
+    uint64_t irq_rsp    = rip_slot[3];
+    uint64_t irq_rflags = rip_slot[2];
+    const uint64_t* sp  = (const uint64_t*)(uintptr_t)irq_rsp;
+
+    kernel_serial_printf("[FAULT] interrupted rsp=0x%016lx  rflags=0x%lx\n",
+                         (unsigned long)irq_rsp, (unsigned long)irq_rflags);
+
+    if (sp < lo || sp > hi) {
+        kernel_serial_printf(
+            "[FAULT] that rsp is OUTSIDE the bootstrap stack [%p,%p) -- the stack pointer\n"
+            "[FAULT] itself was corrupted, or this fault came from a core with its own\n"
+            "[FAULT] stack. Not dumping memory at an address that may not be mapped.\n",
+            (void*)lo, (void*)hi);
+        return;
+    }
+    kernel_serial_printf(
+        "[FAULT] stack is [%p,%p), 64 KiB; the interrupted frame was %lu byte(s) deep.\n",
+        (void*)lo, (void*)hi, (unsigned long)((const char*)hi - (const char*)sp));
+
+    /* The measurement that names the buffer. */
+    int poison = fault_poison_byte(irq_rip);
+    if (poison >= 0 && sp > lo && sp[-1] == irq_rip) {
+        const uint64_t* base = fault_poison_run_base(sp - 1, lo, irq_rip);
+        unsigned long run = (unsigned long)((const char*)sp - (const char*)base);
+        kernel_serial_printf(
+            "[FAULT] POISON RUN: 0x%016lx .. 0x%016lx = %lu byte(s) of 0x%02x, ending at\n"
+            "[FAULT] the smashed frame. The LOW end is the base of the buffer that overran,\n"
+            "[FAULT] and %lu is how far it wrote. Look for a local array of about that size\n"
+            "[FAULT] in whatever was on the stack here.\n",
+            (unsigned long)(uintptr_t)base, (unsigned long)(uintptr_t)(sp - 1),
+            run, (unsigned)poison, run);
+    }
+
+    /* Window straddling the boundary: 8 qwords below the interrupted rsp (the
+     * popped, poisoned region) and 16 above (the frames still live). Where the
+     * two stop looking alike is the top of the overrun. */
+    const uint64_t* from = (sp - 8 < lo) ? lo : sp - 8;
+    const uint64_t* to   = (sp + 16 > hi) ? hi : sp + 16;
+    kernel_serial_printf("[FAULT] stack %p..%p (interrupted rsp marked >>):\n",
+                         (void*)from, (void*)to);
+    for (const uint64_t* p = from; p < to; p += 2)
+        kernel_serial_printf("[FAULT] %s %p: %016lx %016lx\n",
+                             (p == sp) ? ">>" : "  ", (void*)p,
+                             (unsigned long)p[0],
+                             (unsigned long)((p + 1 < to) ? p[1] : 0));
 }
 
 static void fault_explain(unsigned long saved_rip) {
@@ -119,7 +180,15 @@ void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsign
         "\n[FAULT] Kernel fault  cs=0x%lx  error=0x%lx  rip=0x%016lx  — Halting.\n",
         saved_cs, error_code, saved_rip);
     fault_explain(saved_rip);
-    fault_dump_stack("stack at the fault");
+    /* Search upward from this frame for the rip/cs pair the CPU pushed. 64
+     * qwords is far more than any stub prologue and still nowhere near the
+     * top of the stack. */
+    {
+        const uint64_t* base = (const uint64_t*)__builtin_frame_address(0);
+        fault_dump_stack(fault_find_iret_frame(base, base + 64,
+                                               (uint64_t)saved_rip,
+                                               (uint64_t)saved_cs));
+    }
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }
