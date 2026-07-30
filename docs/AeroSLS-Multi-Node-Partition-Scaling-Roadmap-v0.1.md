@@ -860,6 +860,58 @@ Fixed by reading the directory page and asserting byte 140 of entry 0 is zero. �
 
 `aeroslsctl raw` decoded every response with `errors="replace"` and died with `non-JSON response` plus a screen of U+FFFD — holding the requested bytes and refusing to hand them over, which is why verifying the migration needed curl. It now passes a non-JSON body through verbatim when stdout is redirected, and on a terminal prints size, content type and the first 16 bytes as hex to *stderr* instead of wrecking the session — following curl's own "Binary output can mess up your terminal" precedent. 55 checks.
 
+## 9m. A kernel fault the kernel could not explain — and an investigation that came up empty
+
+The REAPED-slot recipe from §9l needs a stream too large to arrive in one request, so the test uploaded 16 chunks of 16 KiB (`UPLOAD_CHUNK_MAX`, the documented maximum). Two chunks succeeded. Every request after that timed out. Node 1 was still running — `Sl+`, 2.8% CPU — and its log ended:
+
+```
+[DB] UPDATE: Object '<hundreds of replacement characters>' not found.
+[STREAM] '<garbage>%': 49152 bytes, 12 frames flushed to NVMe.
+
+[FAULT] Kernel fault  cs=0x8  error=0x0  rip=0xcdcdcdcdcdcdcdcd  — Halting.
+```
+
+`0xCD` is the payload byte (`'cd' * 16384`). Stream data was written over a return address, and the stream's *name* — a stack array in `api_stream_upload()`, live in a frame above `stream_write_chunk()`'s — was already destroyed one line earlier. An overflowing local buffer, writing upward through its own frame's saved return address and on into its caller's.
+
+**What the line actually says.** Two mechanical facts, both of which cost real time to re-derive by hand:
+
+- `0xcdcdcdcdcdcdcdcd` is **non-canonical** — bits 63:48 are not a sign-extension of bit 47 — so the CPU never fetched from it. The `#GP` was raised while *loading* `rip`, which is why the error code is `0` with no selector. Without that, `error=0x0` reads like a nondescript protection fault and the search begins in the wrong subsystem.
+- The value is one byte repeated eight times, so it is **data**, and the byte identifies the writer.
+
+### What was eliminated, by reading
+
+Every candidate on the path was checked and cleared:
+
+| Suspect | Verdict |
+| --- | --- |
+| `stream_flush_frames()`'s `run[NVME_MAX_PAGES_PER_XFER]` | Correct. `NVME_MAX_PAGES_PER_XFER` is 32, the append-then-check ordering caps the written index at 31, `run_len` is reset on every path, and this run only reached 12 frames. |
+| Stream directory layout | Exact. `DIR_HDR_SIZE 512 + 8 × DIR_ENTRY_SIZE 448 = 4096`, and the highest field offset in use is 153. |
+| `hex_decode`, `json_str`, `st_strncpy` | All bounded; all NUL-terminate. `st_hex`/`st_chunk` are `static` and correctly sized for a 32 KiB hex body. |
+| `lba_base` on a reused slot | Set in `stream_create()`; a stale zero would have written the stream over LBA 0. It doesn't. |
+| PRP list overrun | `io_prp_list` is a dedicated 4 KiB page — 512 entries against a 32-page ceiling. |
+| `OBJECT_NAME_LEN` vs `STREAM_NAME_LEN` | Both 64. No cross-buffer size mismatch. |
+| The linker script placing sections above `_kernel_image_end` | Cleared by linking a probe object against the real `arch/x86/linker.ld`: GCC emits `.rodata.str1.8`, `.eh_frame` and `.note.gnu.property`, none of which the script names, and ld places all three *inside* the image, before `.data`/`.bss`. `.bootstrap_stack` is inside `.bss`, so the 64 KiB boot stack is reserved. |
+
+**The overflowing buffer was not found.** That is stated plainly rather than dressed up: reading the path did not produce the answer, and there is no reproduction here — the sandbox has no cross-compiler and no cluster. Guessing a fix would have been worse than saying so.
+
+### So the next occurrence diagnoses itself
+
+Three changes, none of them speculative:
+
+`kernel/fault_report.h` — the two predicates above, so the kernel states both facts instead of leaving them to be re-derived. `handle_ring3_fault()` now names a non-canonical `rip`, names the repeated byte when there is one, and dumps 16 qwords of the interrupted stack. **That dump is the actual diagnostic**: the poison runs contiguously from wherever the overrun began up through the frame it destroyed, so the boundary between real stack contents and payload is where the overflowing buffer ends. One line becomes a location.
+
+`stream_write_chunk()` — a tripwire. `name` is caller storage; `se->name` is the same string in `static stream_store[]`. `stream_find()` matched them, so a disagreement after the flush means the caller's stack was written over. On mismatch it logs which stage and refuses, because every line after that point feeds `name` to `printf` and `sys_sls_update()`, and an unterminated pointer through those is how a memory bug becomes an unbounded read. `se->name` is used for the report — the copy that cannot have come from the smashed frame.
+
+Both are cheap and both are permanent. This is the same trade as §9j's readback comparison, which is the only reason the NVMe alignment fault took one log line to find rather than an afternoon.
+
+18 checks in the new `fault_report_host_test.c`, 8 added to `stream_gather_flush_host_test.c` (34 → 42), 4/4 mutations caught. The mutations worth naming are the two bounds ones: shortening the name compare by one byte, and lengthening it by one. Both fail, because each scenario is sentinel-guarded on both sides — this predicate runs when memory is *already* known-bad, so a version of it that walks off the end of a name whose terminator was destroyed would turn a detected corruption into a second, worse one.
+
+### The uncomfortable part
+
+`tests/stream_gather_flush_host_test.c` was written specifically for this function and had 34 checks. It did not catch this. Every prior test wrote 8 KiB in a single chunk — two pages — and this run reached twelve. Restating the rule from §9f in its sharpest form: **a guard is only tested at the multiplicity where its absence changes the outcome.** 34 checks at two pages say nothing about twelve, and the count was reassuring in a way the coverage did not earn.
+
+`grep REFUSED cluster/node1.log` returned nothing, so the NVMe alignment guard from §9j never fired — this is not a regression from that work. Every previous upload was small enough not to reach it.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

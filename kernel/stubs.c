@@ -12,6 +12,7 @@
 #include "kernel_io.h"
 #include "object_catalog.h"
 #include "process.h"
+#include "fault_report.h"
 
 // ─── C-library string functions (freestanding replacements) ──────────────────
 
@@ -77,6 +78,34 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
     for (;;) __asm__ volatile("hlt");
 }
 
+/* Dumps the qwords around the interrupted stack. The saved return address the
+ * CPU choked on is in here, and so are its neighbours -- which is what
+ * identifies the overflowing buffer, because the poison runs contiguously from
+ * wherever the overrun began up through the frame it destroyed. Bounded to a
+ * fixed window and read-only, so it cannot itself make a bad situation worse. */
+static void fault_dump_stack(const char* what) {
+    unsigned long* sp = (unsigned long*)__builtin_frame_address(0);
+    kernel_serial_printf("[FAULT] %s (16 qwords from %p, low address first):\n", what, (void*)sp);
+    for (int i = 0; i < 16; i += 2)
+        kernel_serial_printf("[FAULT]   %p: %016lx %016lx\n",
+                             (void*)(sp + i), sp[i], sp[i + 1]);
+}
+
+static void fault_explain(unsigned long saved_rip) {
+    int poison = fault_poison_byte(saved_rip);
+    if (fault_noncanonical(saved_rip))
+        kernel_serial_print(
+            "[FAULT] rip is NON-CANONICAL -- the CPU never fetched from it. This is a\n"
+            "[FAULT] return address (or indirect target) that was overwritten, not a\n"
+            "[FAULT] bad jump: #GP(0) is raised while loading rip, hence error=0x0.\n");
+    if (poison >= 0)
+        kernel_serial_printf(
+            "[FAULT] rip is the byte 0x%02x repeated 8 times -- it is DATA, and that byte\n"
+            "[FAULT] identifies the writer. Search the payload of whatever was in flight\n"
+            "[FAULT] for 0x%02x; the buffer holding it is the one that overran.\n",
+            (unsigned)poison, (unsigned)poison);
+}
+
 // ─── General Ring-3 fault handler (#UD/#GP/#SS/#NP) ─────────────────────────
 // saved_cs bits 0-1 = CPL; CPL==3 → Ring-3 → kill process.  Else panic.
 void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsigned long saved_rip) {
@@ -89,6 +118,8 @@ void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsign
     kernel_serial_printf(
         "\n[FAULT] Kernel fault  cs=0x%lx  error=0x%lx  rip=0x%016lx  — Halting.\n",
         saved_cs, error_code, saved_rip);
+    fault_explain(saved_rip);
+    fault_dump_stack("stack at the fault");
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }

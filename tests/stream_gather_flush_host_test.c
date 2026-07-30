@@ -484,6 +484,67 @@ int main(void) {
         CHECK(probe.active == 0, "...and the slot really is retired");
     }
 
+    /* ─── The caller-name tripwire ─────────────────────────────────────────
+     * stream_write_chunk()'s is_last branch compares the caller's name buffer
+     * against the catalog copy before feeding it to printf and
+     * sys_sls_update(). It is there because a real node smashed the caller's
+     * stack during a 48 KiB upload: the name printed as hundreds of bytes of
+     * garbage and the next return raised #GP(0) on 0xcdcdcdcdcdcdcdcd -- the
+     * uploaded payload byte, eight times over.
+     *
+     * The assertions that matter are the BOUNDS, not the happy path. This
+     * predicate runs when memory is already known-bad, so a version of it that
+     * walks off the end of a name whose terminator was destroyed would turn a
+     * detected corruption into a second, worse one. Each case below is
+     * sentinel-guarded on both sides so an over-read is a failure here rather
+     * than a mystery in production. */
+    {
+        struct StreamEntry se;
+        memset(&se, 0, sizeof(se));
+        wl_strcpy_test(se.name, "reap-test.bin", sizeof(se.name));
+
+        CHECK(stream_name_diff_index("reap-test.bin", &se) == -1,
+              "*** identical names report no difference ***");
+        CHECK(stream_name_diff_index("Xeap-test.bin", &se) == 0,
+              "...a difference in byte 0 is reported at index 0");
+        CHECK(stream_name_diff_index("reap-Test.bin", &se) == 5,
+              "...a difference mid-name is reported at its exact index");
+        CHECK(stream_name_diff_index("reap-test.bi", &se) == 12,
+              "*** a TRUNCATED caller name is caught at the byte that vanished ***");
+        CHECK(stream_name_diff_index("reap-test.binX", &se) == 13,
+              "...and an over-long one at the byte past the terminator");
+        CHECK(stream_name_diff_index(0, &se) == -1 &&
+              stream_name_diff_index("reap-test.bin", 0) == -1,
+              "...null arguments do not dereference");
+
+        /* An unterminated caller buffer -- exactly what a stack smash
+         * produces, and what made the original fault print hundreds of
+         * characters. Both sides are full-width and equal, so the predicate
+         * must return -1 having read STREAM_NAME_LEN bytes and NOT ONE MORE.
+         * The guard byte after each buffer differs between the two, so any
+         * read past the field would be visible as a spurious difference at
+         * index STREAM_NAME_LEN. */
+        struct { char name[STREAM_NAME_LEN]; char guard; } caller;
+        struct StreamEntry full;
+        memset(&full, 0, sizeof(full));
+        memset(caller.name, 'A', STREAM_NAME_LEN);
+        memset(full.name,   'A', STREAM_NAME_LEN);
+        caller.guard = (char)0x11;   /* deliberately unequal to full's next byte */
+
+        CHECK(stream_name_diff_index(caller.name, &full) == -1,
+              "*** an UNTERMINATED name equal across all 64 bytes reports no "
+              "difference, and the compare stops at the field boundary ***");
+
+        /* Same shape, but the payload byte from the real incident, differing
+         * only in the very last byte of the field. Reading exactly
+         * STREAM_NAME_LEN bytes is what finds it; reading fewer misses it. */
+        memset(caller.name, (char)0xCD, STREAM_NAME_LEN);
+        memset(full.name,   (char)0xCD, STREAM_NAME_LEN);
+        caller.name[STREAM_NAME_LEN - 1] = (char)0x00;
+        CHECK(stream_name_diff_index(caller.name, &full) == STREAM_NAME_LEN - 1,
+              "*** a difference in the LAST byte of the field is still found ***");
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }

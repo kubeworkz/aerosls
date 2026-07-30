@@ -449,6 +449,23 @@ int stream_create(uint32_t caller_uid, const char* name, const char* mime_type) 
 // arithmetic can be tested directly (tests/stream_gather_flush_host_test.c).
 // Batching LBA-computing loops is exactly where an off-by-one does not crash
 // but silently misplaces data, so it is worth having under test on its own.
+/* Index of the first byte at which the caller's name buffer disagrees with the
+ * catalog's own copy, or -1 if they agree. See stream_write_chunk()'s is_last
+ * branch for why this comparison is worth making at all.
+ *
+ * Reads at most STREAM_NAME_LEN bytes from each side and stops at the first
+ * shared NUL. That bound is the whole point: this runs when memory is already
+ * suspect, so it must not itself be the thing that walks off the end of a
+ * buffer whose terminator was destroyed. */
+int stream_name_diff_index(const char* caller_name, const struct StreamEntry* se) {
+    if (!caller_name || !se) return -1;
+    for (int k = 0; k < STREAM_NAME_LEN; k++) {
+        if (caller_name[k] != se->name[k]) return k;
+        if (!caller_name[k]) return -1;      /* both terminated, both equal */
+    }
+    return -1;                                /* equal across the full field */
+}
+
 uint32_t stream_flush_frames(struct StreamEntry* se) {
     uint32_t flushed = 0;
     const void* run[NVME_MAX_PAGES_PER_XFER];
@@ -528,6 +545,42 @@ int stream_write_chunk(const char* name, const uint8_t* chunk,
 
     if (is_last) {
         uint32_t flushed = stream_flush_frames(se);
+
+        /* ─── Tripwire on the caller's name buffer ─────────────────────────
+         * `name` is the caller's storage -- in the live path a stack array in
+         * net/http.c's api_stream_upload(). `se->name` is the same string in
+         * stream_store[], which is static: stream_find() matched them, so any
+         * later disagreement means one of them was written over, and only one
+         * of the two is on a stack.
+         *
+         * This exists because that is exactly what happened, and the first
+         * sign of it was a %s printing hundreds of bytes of garbage followed
+         * by #GP(0) on a return address made of payload. The corruption was
+         * silent right up to the point it was fatal, and it was fatal several
+         * frames away from wherever the overrun actually was. Comparing here
+         * -- immediately after the only nontrivial work this branch does --
+         * says "the name was intact going in and is not now" while the
+         * evidence is still on the stack for handle_ring3_fault()'s dump, and
+         * names the stage rather than leaving it to be inferred from a
+         * corpse.
+         *
+         * On a mismatch we refuse rather than continue: every line after this
+         * point feeds `name` to printf and to sys_sls_update(), and running
+         * an unterminated pointer through those is how a memory bug becomes
+         * an unbounded read. se->name is used for the report because it is
+         * the copy that cannot have come from the smashed frame. */
+        int diff = stream_name_diff_index(name, se);
+        if (diff >= 0) {
+            kernel_serial_printf(
+                "[STREAM] CORRUPTION: '%s' -- the caller's name buffer no longer matches "
+                "the catalog copy (first difference at byte %d) after flushing %u frame(s) "
+                "of %u byte(s). It matched on entry, so something wrote over the caller's "
+                "stack between then and now. Refusing to touch the metadata records with "
+                "it. Frames ARE on disk; only the record update is skipped.\n",
+                se->name, diff, flushed, se->size);
+            return 4;
+        }
+
         // Update metadata records
         struct SLSRecordRequest mr;
         int j;

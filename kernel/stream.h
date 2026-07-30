@@ -208,4 +208,15 @@ extern struct StreamEntry stream_store[STREAM_MAX];
  * tests/stream_gather_flush_host_test.c. */
 uint32_t stream_flush_frames(struct StreamEntry* se);
 
+/* Index of the first byte where the caller's name buffer disagrees with the
+ * catalog copy in `se`, or -1 if they agree. stream_write_chunk() calls this
+ * after flushing and refuses to touch the metadata records on a mismatch:
+ * `name` is caller storage (a stack array in net/http.c's api_stream_upload()
+ * on the live path) while se->name lives in static stream_store[], so a
+ * disagreement that was not there at stream_find() time means the caller's
+ * stack was written over. Exposed for testing because the bound -- never
+ * reading past STREAM_NAME_LEN on either side, even when the terminator is
+ * the thing that got destroyed -- is the part that has to be right. */
+int stream_name_diff_index(const char* caller_name, const struct StreamEntry* se);
+
 #endif /* STREAM_H */
