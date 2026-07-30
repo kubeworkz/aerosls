@@ -1030,7 +1030,9 @@ Still not identified: what writes a page of payload onto a reserved frame. The t
 
 256 KiB, 64 frames, name intact, no fault. Five times the frame count of the run that died, on a path that had failed at twelve.
 
-**No `WITHHELD` line and no `[FRAME] *** ERROR` line appeared.** So neither new guard fired, and therefore neither is demonstrably what fixed it. The honest reading of this run is *the symptom is gone and the mechanism was never identified*. Adding code grew `.bss` and moved the stack a page each rebuild — `0x077e7000` → `0x077e8000` between two of these runs — so a plausible explanation is that the target moved rather than the bug being closed. A symptom that moves can move back.
+**No `WITHHELD` line and no `[FRAME] *** ERROR` line appeared** in the excerpt, and I concluded from that that neither guard had fired, that neither was demonstrably the fix, and that the likeliest explanation was the target moving as `.bss` grew rather than the bug being closed.
+
+> **That conclusion was wrong, and it was wrong for the reason this whole section is about.** The excerpt was a slice of a scrolling console, and I read the absence of a line in it as the absence of the event. The very next section records what the *counter* said.
 
 Three things are nonetheless true and worth keeping:
 
@@ -1059,6 +1061,74 @@ stack_frames_withheld  must be 0      -- a nonzero count is a bug report, not a 
 Both are the same shape as M14 in §9p and as the three in §9h/§9i/§9j: **a test that arranges the world so the guard's absence cannot change the answer.** Five instances now, and the tell is consistent — the assertion and the setup are too close together, so the setup satisfies the assertion on its own.
 
 `frame_pool_reserve_host_test.c` 24 → 58 checks, 11/11 mutations.
+
+## 9r. The counter answers it: the kernel's own stack was allocatable
+
+All four nodes, first thing after the fix shipped:
+
+```
+warnings
+  stack_covered_at_boot false  (the image-end reservation did not cover the stack at boot)
+```
+
+`stack_covered_at_boot` is false exactly when `frame_pool_reserve_range(stack_bottom, stack_top)` marked frames that `frame_pool_reserve_below(_kernel_image_end)` had left free. **The bootstrap stack was outside the reservation. The allocator could hand out the memory the kernel was running on.**
+
+That closes the chain end to end:
+
+1. `allocate_physical_ram_frame_for_partition()` returns a frame inside `[stack_bottom, stack_top)`.
+2. `stream_write_chunk()` does `st_memset(frame, 0, 4096)` and then copies payload into it.
+3. The live stack becomes `0xCD` — all 1760 bytes of it, to the top, which is what §9p measured and what no local array could have produced.
+4. The next `ret` loads a non-canonical address and raises `#GP(0)`.
+5. The 256 KiB upload in §9q succeeded because the redundant reservation had, by then, taken the stack out of the pool.
+
+The linker script's `*(.bootstrap_stack)` inside `.bss`, below `_kernel_image_end`, is not doing what it reads as doing. The boot-time `[FRAME] *** ERROR` line carries the three addresses needed to say precisely why, and that is the next thing to look at — but the reservation is correct either way now, because it no longer depends on the answer.
+
+### The methodological point, which is the whole session in one line
+
+§9q had this evidence in hand and drew the opposite conclusion. It reasoned from a console excerpt in which no `[FRAME] *** ERROR` appeared, and treated *not seeing the line* as *the line not existing*. The console had scrolled.
+
+The counter that overturned it was added in the same commit, for exactly this reason, with this written next to it:
+
+> "No error printed at boot" is an absence — indistinguishable from a truncated log or a check that never ran.
+
+The instrumentation was right and the conclusion drawn five minutes earlier was wrong, because one was a measurement and the other was an eyeball on a scrollback buffer. **Assert on the far side of the boundary you are crossing** has been the rule for this entire investigation; this is the instance where the boundary was the terminal.
+
+## 9s. One line of a linker script
+
+```
+[FRAME] *** ERROR: the bootstrap stack [0x77e8000,0x77f8000) was NOT covered by
+the kernel image end 0x77e8000 -- 16 frame(s) of live kernel stack were allocatable.
+```
+
+`_kernel_image_end` **is** `stack_bottom`, to the byte. The entire 64 KiB stack was above the reservation.
+
+`arch/x86/linker.ld` had `*(.bootstrap_stack)` nested inside the `.bss` output section. On the real build that wildcard did not match, so the section became an orphan — and ld places orphans after the output section they most resemble, which is after the `. = ALIGN(4096); PROVIDE(_kernel_image_end = .)` statement, because statements between output sections are evaluated at their script position while orphans are inserted into the list afterwards. The symbol was computed at the end of `.bss` and the stack was then laid down immediately above it.
+
+The whole chain, from the top:
+
+1. 16 frames of live kernel stack sit above `_kernel_image_end` and are free in the bitmap.
+2. `alloc_raw_frame()` scans from frame 1 upward and eventually reaches them.
+3. `stream_write_chunk()` gets one, `st_memset`s it to zero, and copies payload in.
+4. The live stack becomes `0xCD` to its last byte — 1760 of 1760, which §9p measured and which no local array could produce.
+5. The next `ret` loads a non-canonical address; `#GP(0)`, `rip = 0xcdcdcdcdcdcdcdcd`.
+
+Nine sections of investigation, and the defect is that one wildcard is in the wrong scope.
+
+### The fix, twice over
+
+`.bootstrap_stack` is now its own top-level output section, declared above the `PROVIDE`. That helps two independent ways: the wildcard is no longer nested where an enclosing section's attributes matter, and — more robustly — **ld places an orphan into an existing output section of the same name automatically.** So even being wrong about NASM's exact section flags or spelling no longer costs the kernel its stack.
+
+Every other wildcard was widened in the same pass, because they were the same latent bug: `*(.text)` → `*(.text .text.*)`, `*(.rodata)` → `*(.rodata .rodata.*)` (GCC emits string literals as `.rodata.str1.1`/`.str1.8`, so the bare name matched almost nothing), `*(.data)` → `*(.data .data.*)`, `*(.bss)` → `*(.bss .bss.*)`, and `*(.COMMON)` → `*(COMMON)` — the leading dot had been matching a section name that does not exist, harmless only because `-fno-common` is GCC's default since GCC 10.
+
+`tests/kernel_image_end_check.sh` asserts the invariant against the linked image: no `SHF_ALLOC` section may end above `_kernel_image_end`, the stack must be strictly inside it, and `stack_bottom == _kernel_image_end` is called out by name as the signature of this bug. It is a shell script rather than a host test on purpose — the invariant is a property of ld's placement decisions, and asserting it anywhere but against the real ELF would be asserting something else. With no image present it exits **2** and prints "NOT RUN (this is a gap, not a pass)", because a build check that quietly succeeds when it did not run is worse than no check.
+
+### Two things I got wrong even here
+
+**The production failure is not reproducible on the dev host.** This box's `ld` places the same orphan *below* the assignment — a binutils version difference. So the honest negative control had to be a deliberately-broken linker script that computes the symbol before the stack section, which reproduces the exact shape (`_kernel_image_end == stack_bottom`, 16 frames) and makes the checker fail. Validating the checker against a synthetic bad image is legitimate; claiming the production script had been proven fixed here would not be.
+
+**My own checker had a parsing bug that made a third of it vacuous.** `readelf -SW` writes the section index as `[ 4]` for one digit and `[10]` for two, so awk splits the former into two fields and every column after it shifts by one. The generic "no allocated section above the image end" sweep read the wrong columns, matched no flags, and **passed on the bad image**. The two stack-specific checks caught it; the sweep written to catch the general case did not. Fixed by stripping the bracketed index with sed first, and confirmed by re-running both images.
+
+That is the sixth instance in this session of a check that could not fail, and the pattern is now unmistakable: every one of them passed the first time it was run, and every one was found by deliberately breaking the thing it was supposed to be watching. **A check that has never been observed to fail has not been tested — it has only been executed.**
 
 ## 10. Live/hot migration — deferred, not scoped
 
