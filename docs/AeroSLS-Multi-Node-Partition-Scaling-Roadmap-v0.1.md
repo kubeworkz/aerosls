@@ -806,13 +806,37 @@ Verified the only way that means anything — by fetching the bytes:
 
 Two pages, eight fragments, per-fragment ACKs, byte-verified on write, on a standard 1500-byte segment. §9b through §9k closed.
 
-### A correction: node 2 was not a phantom
+### Node 2 IS corrupt, and the corruption locates the fault exactly
 
-§9j's failed transfer left node 2 with a slot, and this document (and I) called it *metadata for data that never arrived*. It was not. Fetching node 2's bytes returned all 8192 of them, correct.
+This section briefly claimed the opposite. The sequence is worth keeping, because the mistake in the middle of it is instructive.
 
-The reason is an ordering detail I had not accounted for: **the refusal happens after the write.** `stream_migrate_recv_page()` writes the page, reads it back, compares, and returns failure on mismatch — with the data already on disk. So the destination held correct bytes while the sender was told the page was refused. Under QEMU the unaligned write evidently landed intact, because QEMU's NVMe model does not enforce the PRP page-boundary rule that real hardware would; only the comparison went wrong.
+§9j's failed transfer left node 2 with a slot. It was first called a phantom — metadata for data that never arrived. Then `xxd | head -3` on node 2 showed `abab abab…` and `wc -c` showed 8192, so the claim was retracted: the data looked intact. **That retraction was drawn from 48 bytes out of 8192, and `wc -c` reports the `size` field rather than verified content.** 0.6% of the data, generalised to all of it — the exact weak-verification mistake this document spends §9c–§9k naming.
 
-**Why the comparison failed while the bytes were correct is unresolved.** It is recorded here as an open question rather than given an invented explanation. It no longer blocks anything, and the alignment fault it pointed at was real and is fixed.
+Hashing both copies settles it:
+
+```
+node 2: 50905e0c45b07a6c1f43b18cd2212750
+node 3: 8c060927e5afba716d0b7e6127e9973b
+```
+
+And the boundary names the mechanism:
+
+```
+$ od -An -tx1 -j 4032 -N 96      # node 2
+ ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab
+ ab ab ab ab ab ab ab ab ab ab ab ab 00 00 00 00
+ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+The `0xAB` run stops at byte **4060**. `4060 + 36 = 4096`. PRP1 sat at page offset 36 — a plausible offset for `staged` within `struct StreamMigrateInflight` given its preceding fields — supplied 4060 bytes to the end of that physical page, and the remaining 36 required PRP2, which `nvme_write_sync()` leaves zero. Page 1 was never sent, because the sender aborted on the refusal. So node 2 holds 4060 correct bytes and 4132 zeros.
+
+**A refinement on the spec, too.** The NVMe requirement that PRP entries be page-aligned and offset-free applies to PRP *list* pointers and chained entries. **PRP1 for a data transfer is explicitly permitted a non-zero offset.** So this was never an `Invalid PRP Offset` violation and QEMU's tightened validation would not have flagged it as one; the fault is a *missing PRP2* for a transfer spanning two pages. An earlier draft of this section blamed QEMU for not enforcing the page-boundary rule, which mischaracterised both the spec and the emulator.
+
+### Two things this leaves
+
+The `incoming` flag below would catch this case if it happened now — the transfer aborted, so the flag would still be set and the slot reaped at boot. **It will not catch node 2's existing slot**, which was persisted before the flag existed and therefore reads `incoming = 0`. Clearing it needs a fresh disk image for that node.
+
+And the ordering detail that made the confusion possible is real and worth knowing: **the refusal happens after the write.** `stream_migrate_recv_page()` writes, reads back, compares, and returns failure on mismatch with the bytes already on disk. A refused page is not an unwritten page.
 
 ### The hazard was real even though that instance was not
 
