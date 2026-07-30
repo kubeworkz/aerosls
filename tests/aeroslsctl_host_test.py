@@ -186,6 +186,56 @@ def main():
     check("standalone" in out and "no cluster formed" in out,
           "status calls an uninitialised node standalone, not a 1-node cluster")
 
+    # ═══ 4b: health signals the endpoint returns must actually be SHOWN ═══
+    # /api/cluster carried dspp_oversize_dropped and the three stack_* fields
+    # while cmd_cluster printed a fixed five-key list and dropped them. A
+    # diagnostic nobody looks at is not a diagnostic -- and these are the two
+    # facts a memory-corruption investigation depends on, so "no error scrolled
+    # past at boot" needs to be a value someone can read back.
+    print("\n-- 4b: unhealthy counters surface in cluster status --")
+    healthy = {"initialised": "true", "node_id": 1, "role": "LEADER", "term": 3,
+               "active_nodes": 4, "quorum_threshold": 3, "roster": [],
+               "dspp_oversize_dropped": 0, "stack_frames_withheld": 0,
+               "stack_reserved": "true", "stack_covered_at_boot": "true"}
+
+    ROUTES[("GET", "/api/cluster")] = (200, dict(healthy))
+    rc, out, _ = run("cluster", "status")
+    check(rc == 0 and "warnings" not in out,
+          "*** a healthy node prints NO warnings block -- the signal is silence, so "
+          "it stays worth reading ***")
+
+    bad = dict(healthy); bad["stack_frames_withheld"] = 2
+    ROUTES[("GET", "/api/cluster")] = (200, bad)
+    rc, out, _ = run("cluster", "status")
+    check(rc == 0 and "stack_frames_withheld" in out and "live stack" in out,
+          "*** a withheld frame is reported, and says what it means -- the allocator "
+          "was offered the kernel's own stack ***")
+
+    bad = dict(healthy); bad["stack_reserved"] = "false"
+    ROUTES[("GET", "/api/cluster")] = (200, bad)
+    rc, out, _ = run("cluster", "status")
+    check(rc == 0 and "stack_reserved" in out and "no longer fully reserved" in out,
+          "*** stack_reserved false is reported -- false is the alarming value here, "
+          "so it must not be treated like an absent field ***")
+
+    bad = dict(healthy); bad["dspp_oversize_dropped"] = 17
+    ROUTES[("GET", "/api/cluster")] = (200, bad)
+    rc, out, _ = run("cluster", "status")
+    check(rc == 0 and "dspp_oversize_dropped" in out and "MTU" in out,
+          "an oversize-frame count is reported alongside, distinguishing 'my frames "
+          "are too big' from 'my peers will not vote for me'")
+
+    # An older node that predates these fields must not be reported as broken.
+    ROUTES[("GET", "/api/cluster")] = (200, {
+        "initialised": "true", "node_id": 1, "role": "FOLLOWER", "term": 3,
+        "active_nodes": 4, "quorum_threshold": 3, "roster": []})
+    rc, out, _ = run("cluster", "status")
+    check(rc == 0 and "warnings" not in out,
+          "*** a node that returns none of these fields is quiet, not alarming -- "
+          "missing and false are different answers ***")
+
+    ROUTES[("GET", "/api/cluster")] = (200, {"initialised": "false", "node_id": 0})
+
     # ═══ 5: informative peer codes survive the round trip ═════════════════
     print("\n-- 5: 'already a member' is a success, not a failure --")
     ROUTES[("POST", "/api/cluster/peer")] = (200, {

@@ -200,6 +200,15 @@ def _cell(v) -> str:
 
 # ─── commands ─────────────────────────────────────────────────────────────
 
+def _num(v):
+    """int(v) for anything that survives it, else 0. Used to decide whether a
+    counter is worth showing: absent, None, "" and "0" all mean 'quiet'."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 def cmd_cluster(args):
     if args.action == "status":
         d = _request(args, "GET", "/api/cluster")
@@ -212,6 +221,29 @@ def cmd_cluster(args):
                 return
             for k in ("node_id", "role", "term", "active_nodes", "quorum_threshold"):
                 print(f"{k.replace('_',' '):18} {_cell(d.get(k))}")
+
+            # Health signals the endpoint already returned and this command used
+            # to drop on the floor. A diagnostic nobody looks at is not a
+            # diagnostic: dspp_oversize_dropped tells "my frames are too big for
+            # the wire" apart from "my peers won't vote for me", and the three
+            # stack_* fields make "no [FRAME] error scrolled past at boot" into
+            # a value rather than an absence. Printed only when they say
+            # something -- a healthy node stays quiet, an unhealthy one cannot.
+            warn = []
+            if _num(d.get("dspp_oversize_dropped")):
+                warn.append(f"dspp_oversize_dropped {_cell(d.get('dspp_oversize_dropped'))}"
+                            "  (frames exceeded the link MTU and were not sent)")
+            if _num(d.get("stack_frames_withheld")):
+                warn.append(f"stack_frames_withheld {_cell(d.get('stack_frames_withheld'))}"
+                            "  (allocator was offered the kernel's own live stack)")
+            for key, label in (("stack_reserved", "the bootstrap stack is no longer fully reserved"),
+                               ("stack_covered_at_boot", "the image-end reservation did not cover the stack at boot")):
+                if key in d and str(d.get(key)).lower() == "false":
+                    warn.append(f"{key} false  ({label})")
+            if warn:
+                print("\nwarnings")
+                for w in warn:
+                    print(f"  {w}")
             roster = d.get("roster") or []
             print(f"\nroster ({len(roster)})")
             _table(roster, ["node_id", "self"])
