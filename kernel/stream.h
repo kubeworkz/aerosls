@@ -44,6 +44,24 @@ struct StreamEntry {
     // allocate_physical_ram_frame() every prior version of this file used.
     uint32_t  owner_uid;
     uint32_t  partition_id;
+
+    /* ─── Set while a cross-node transfer is filling this slot ─────────────
+     * stream_migrate_recv_begin() persists the slot BEFORE any page arrives,
+     * which it must -- otherwise a stream with no pages is lost when the
+     * destination reboots (see net/dspp.h). The cost of that ordering is a
+     * window in which a durable slot describes data that has not arrived, and
+     * nothing distinguished it from a complete stream: same name, same size,
+     * same frame count, all persisted, over empty LBAs.
+     *
+     * This flag closes the window. Set by recv_begin, cleared only when the
+     * final page has been written and verified, and persisted either way. A
+     * slot found set at boot is an interrupted transfer.
+     *
+     * Reaping such a slot is safe rather than merely convenient: the SENDER
+     * retires its source only on full confirmation, so an unconfirmed
+     * transfer means the original still exists somewhere. The partial copy is
+     * redundant by construction. */
+    uint8_t   incoming;
 };
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -173,6 +191,12 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
  * test is why `frames_used` was silently dropped from the snapshot -- see the
  * comment on this function in stream.c. */
 void stream_persist_directory(void);
+
+/* Clears every field of a slot. Exposed so a host test can assert that -- an
+ * omitted field here means a reused slot inherits stale state, and the
+ * transfer flag in particular would get it reaped as an interrupted migration
+ * it was never part of. */
+void stream_retire_slot_for_test(struct StreamEntry* s);
 
 extern struct StreamEntry stream_store[STREAM_MAX];
 

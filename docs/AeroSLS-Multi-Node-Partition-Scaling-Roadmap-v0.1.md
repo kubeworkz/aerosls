@@ -788,6 +788,54 @@ The pattern is worth stating alongside §9i's rule: **a check that costs somethi
 
 Full suite 80/80, whole-image link 97/97, 12 asm-provided undefineds unchanged.
 
+## 9l. The migration works — and a correction
+
+`fresh.bin`, 8192 bytes, node 1 → node 3:
+
+```
+[STREAM] migrate: partition 4's stream 'fresh.bin' (slot 0, 2 page(s))
+         CONFIRMED received by node 3 -- every page acknowledged.
+```
+
+Verified the only way that means anything — by fetching the bytes:
+
+```
+00000000: abab abab abab abab abab abab abab abab
+8192
+```
+
+Two pages, eight fragments, per-fragment ACKs, byte-verified on write, on a standard 1500-byte segment. §9b through §9k closed.
+
+### A correction: node 2 was not a phantom
+
+§9j's failed transfer left node 2 with a slot, and this document (and I) called it *metadata for data that never arrived*. It was not. Fetching node 2's bytes returned all 8192 of them, correct.
+
+The reason is an ordering detail I had not accounted for: **the refusal happens after the write.** `stream_migrate_recv_page()` writes the page, reads it back, compares, and returns failure on mismatch — with the data already on disk. So the destination held correct bytes while the sender was told the page was refused. Under QEMU the unaligned write evidently landed intact, because QEMU's NVMe model does not enforce the PRP page-boundary rule that real hardware would; only the comparison went wrong.
+
+**Why the comparison failed while the bytes were correct is unresolved.** It is recorded here as an open question rather than given an invented explanation. It no longer blocks anything, and the alignment fault it pointed at was real and is fixed.
+
+### The hazard was real even though that instance was not
+
+Persisting the received slot at BEGIN (§9i) is necessary — without it an empty stream is lost — but it creates a genuine window: a durable slot describing data that has not arrived, indistinguishable from a complete stream. A transfer interrupted between BEGIN and its final page leaves exactly that, and `/api/streams` cannot tell the difference.
+
+`struct StreamEntry` now carries an `incoming` flag, persisted at directory offset 153. Set by `recv_begin` **before** the persist — marking it afterwards would leave a crash window producing the very slot the flag exists to prevent. Cleared only once the final page is written and verified.
+
+At boot, a slot found flagged is **reaped**, per-slot and announced. That is safe by construction rather than by hope: the sender retires its source only on full confirmation, so an unfinished transfer means the original still exists on the sending node. Keeping the fragment would leave two nodes claiming one stream, one of them wrongly.
+
+Three places had to clear the flag, and two were easy to miss: `stream_retire_slot()` (or a slot reused by `stream_create()` inherits it and gets reaped for a transfer it was never part of), `stream_init()`'s zeroing loop, and `stream_create()` explicitly.
+
+### The same test weakness, a third time
+
+34 checks in `stream_gather_flush_host_test.c`, 5/5 mutations caught — but the mutation removing the *write-back* after a reap survived the first version, for the third time in this session and in the identical shape:
+
+> the check asserted the slot was gone after a second boot, which is true whether the reap was persisted **or** simply repeated. An unpersisted reap re-runs on every boot forever and the directory never settles.
+
+Fixed by reading the directory page and asserting byte 140 of entry 0 is zero. §9h's `frames_used` mutation and §9j's `page 1 is absent` check failed the same way: **a test that observes restored state cannot see whether state was written.** Same rule as §9i, now with three instances behind it — assert on the far side of the boundary you crossed.
+
+### And the CLI stopped withholding what it fetched
+
+`aeroslsctl raw` decoded every response with `errors="replace"` and died with `non-JSON response` plus a screen of U+FFFD — holding the requested bytes and refusing to hand them over, which is why verifying the migration needed curl. It now passes a non-JSON body through verbatim when stdout is redirected, and on a terminal prints size, content type and the first 16 bytes as hex to *stderr* instead of wrecking the session — following curl's own "Binary output can mess up your terminal" precedent. 55 checks.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

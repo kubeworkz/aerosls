@@ -129,6 +129,11 @@ static void dir_write_entry(int slot) {
      * existing snapshot is invalidated. */
     uint32_t fu = se->frames_used;
     for (int b=0;b<4;b++) entry[149+b] = (uint8_t)(fu >> (b*8));
+
+    /* An in-progress cross-node transfer. Persisted so a reboot mid-transfer
+     * can tell a partially-filled slot from a complete stream -- see the
+     * field's comment in stream.h. */
+    entry[153] = se->incoming;
 }
 
 static void dir_read_entry(int slot) {
@@ -156,6 +161,7 @@ static void dir_read_entry(int slot) {
                     | ((uint32_t)entry[150] << 8)
                     | ((uint32_t)entry[151] << 16)
                     | ((uint32_t)entry[152] << 24);
+    se->incoming = entry[153];
 
     /* ─── Repairing a snapshot written before frames_used was persisted ────
      * Such a snapshot reads 0 here while carrying a real byte count, and
@@ -235,6 +241,7 @@ void stream_init(void) {
         stream_store[i].size        = 0;
         stream_store[i].frames_used = 0;
         stream_store[i].lba_base    = 0;
+        stream_store[i].incoming    = 0;
         for (int f=0;f<STREAM_MAX_FRAMES;f++) stream_store[i].frames[f]=0;
     }
 
@@ -251,8 +258,39 @@ void stream_init(void) {
                            | ((uint32_t)dir_buf[15] << 24);
             kernel_serial_printf(
                 "[STREAM] Restoring %u stream(s) from NVMe directory.\n", count);
+            int reaped = 0;
             for (int i=0;i<STREAM_MAX;i++) {
                 dir_read_entry(i);
+
+                /* ─── An interrupted cross-node transfer ────────────────────
+                 * recv_begin() persists the slot before any page arrives (it
+                 * must -- see net/dspp.h), so a crash or reboot between BEGIN
+                 * and the final page leaves a durable slot describing data
+                 * that never landed. Left alone it is indistinguishable from
+                 * a complete stream: same name, same size, same frame count,
+                 * over empty or half-written LBAs.
+                 *
+                 * Reaped rather than kept, and that is safe by construction:
+                 * the SENDER retires its source only once every page is
+                 * confirmed, so an unfinished transfer means the original is
+                 * still on the sending node. Keeping the fragment would leave
+                 * two nodes claiming one stream, one of them wrongly.
+                 *
+                 * Announced per slot. A stream vanishing across a reboot must
+                 * never be something an operator has to infer. */
+                if (stream_store[i].active && stream_store[i].incoming) {
+                    kernel_serial_printf(
+                        "[STREAM] REAPED slot %d ('%s', %u byte(s) expected): an incoming "
+                        "migration was interrupted before its last page arrived, so this "
+                        "copy is incomplete. The sending node still holds the original -- "
+                        "it only retires a stream once every page is acknowledged. Retry "
+                        "the migration.\n",
+                        i, stream_store[i].name, (unsigned)stream_store[i].size);
+                    stream_retire_slot(&stream_store[i]);
+                    reaped++;
+                    continue;
+                }
+
                 if (stream_store[i].active) {
                     // Re-register in object catalog so REST API sees it
                     struct SLSVallocRequest req;
@@ -286,6 +324,15 @@ void stream_init(void) {
                     kernel_serial_printf("[STREAM] Restored '%s' (%u bytes)\n",
                                          stream_store[i].name, stream_store[i].size);
                 }
+            }
+            /* Persist once if anything was reaped, so the reap is durable --
+             * otherwise the same incomplete slot reappears on the next boot
+             * and gets reaped again, forever. */
+            if (reaped > 0) {
+                kernel_serial_printf(
+                    "[STREAM] %d interrupted transfer(s) reaped; rewriting the directory.\n",
+                    reaped);
+                stream_persist_directory();
             }
         } else {
             kernel_serial_print("[STREAM] No directory on NVMe — cold start.\n");
@@ -331,6 +378,12 @@ int stream_create(uint32_t caller_uid, const char* name, const char* mime_type) 
             stream_store[i].size        = 0;
             stream_store[i].frames_used = 0;
             stream_store[i].active      = 1;
+            /* A locally created stream is complete by definition -- there is
+             * no transfer filling it. Set explicitly rather than relying on
+             * the slot having been zeroed, because a slot reused after a
+             * retire would otherwise inherit whatever flag it last held and
+             * be reaped at the next boot as an interrupted transfer. */
+            stream_store[i].incoming    = 0;
             stream_store[i].lba_base    = STREAM_DATA_LBA_BASE
                                         + (uint64_t)i * STREAM_SECTORS_PER_SLOT;
             stream_store[i].owner_uid    = caller_uid;
@@ -662,6 +715,12 @@ int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) {
 // before this phase -- stream_relocate_partition()'s retire step and both
 // new functions below all need the identical reset, so it's a shared
 // helper rather than three copies of the same seven-field zero-out).
+/* Exposed for a host test, for the same reason stream_persist_directory() is:
+ * "retiring clears every field" is a property with a real bug behind it (an
+ * inherited transfer flag would get a reused slot reaped), and a test that
+ * reimplemented the reset would reproduce whatever it omitted. */
+void stream_retire_slot_for_test(struct StreamEntry* s) { stream_retire_slot(s); }
+
 static void stream_retire_slot(struct StreamEntry* s) {
     st_memset(s->name, 0, STREAM_NAME_LEN);
     st_memset(s->mime_type, 0, STREAM_MIME_LEN);
@@ -671,6 +730,12 @@ static void stream_retire_slot(struct StreamEntry* s) {
     s->active       = 0;
     s->owner_uid    = 0;
     s->partition_id = 0;
+    /* A retired slot is not a transfer in progress. Missing this would leave
+     * a reaped or migrated-away slot flagged, so the next boot would "reap"
+     * an empty slot and rewrite the directory for nothing -- and, worse, a
+     * slot later reused by stream_create() would inherit the flag and be
+     * reaped as an interrupted transfer it never was. */
+    s->incoming     = 0;
     for (uint32_t f = 0; f < STREAM_MAX_FRAMES; f++) s->frames[f] = 0;
 }
 
@@ -994,6 +1059,12 @@ int stream_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
      * A failed write is reported and the slot refused rather than accepted
      * unpersisted -- a refusal makes the sender keep its copy, which is the
      * safe direction. */
+    /* Marked BEFORE the persist below, so the slot lands on disk already
+     * flagged as partially-filled. Persisting it clean and marking afterwards
+     * would leave a window where a crash produces exactly the
+     * indistinguishable-from-complete slot this flag exists to prevent. */
+    d->incoming = 1;
+
     stream_persist_directory();
 
     kernel_serial_printf(
@@ -1143,6 +1214,10 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
             "stream '%s' now fully received in local slot %d.\n",
             (unsigned long long)transfer_id, d->frames_used, d->name, mi->slot);
         mi->active = 0;   // this inflight row is free for a future migration
+        /* Every page is written and verified, so the slot is a complete
+         * stream now and no longer an interrupted transfer. Cleared before
+         * the persist so the on-disk state and the claim agree. */
+        d->incoming = 0;
         stream_persist_directory();
     }
     return 0;

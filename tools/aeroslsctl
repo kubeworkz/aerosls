@@ -82,7 +82,15 @@ def _url(host: str, path: str) -> str:
     return host + path
 
 
-def _request(args, method: str, path: str, payload=None) -> dict:
+def _request_bytes(args, method: str, path: str, payload=None):
+    """The byte-level core. Returns (body_bytes, content_type).
+
+    Split out from _request() because not every route answers JSON.
+    GET /api/stream/<name> returns the stream's raw content, and decoding it
+    with errors="replace" destroyed it -- every non-UTF8 byte became U+FFFD,
+    so the CLI held the bytes and could only show mojibake. Fetching an 8 KiB
+    binary stream had to be done with curl instead.
+    """
     req = urllib.request.Request(_url(args.host, path), method=method)
     req.add_header("Authorization", f"Bearer {args.token}")
     body = None
@@ -91,17 +99,23 @@ def _request(args, method: str, path: str, payload=None) -> dict:
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, data=body, timeout=args.timeout) as r:
-            raw = r.read().decode(errors="replace")
+            return r.read(), (r.headers.get("Content-Type") or "")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace").strip()
         _die(f"HTTP {exc.code} from {args.host}{path}: {detail or exc.reason}")
     except urllib.error.URLError as exc:
         _die(f"cannot reach {args.host}: {exc.reason}")
+
+
+def _request(args, method: str, path: str, payload=None) -> dict:
+    raw_bytes, _ = _request_bytes(args, method, path, payload)
+    raw = raw_bytes.decode(errors="replace")
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # A kernel that answers non-JSON is a kernel bug worth seeing whole,
-        # so show the payload rather than a parser complaint about byte 0.
+        # Every route the typed subcommands use answers JSON, so a non-JSON
+        # body here really is a kernel bug worth seeing whole. `raw` handles
+        # the legitimate binary case itself -- see cmd_raw().
         _die(f"non-JSON response from {args.host}{path}: {raw[:400]}")
 
 
@@ -345,7 +359,36 @@ def cmd_raw(args):
         except json.JSONDecodeError as exc:
             _die(f"--body is not valid JSON: {exc}")
     path = args.path if args.path.startswith("/") else "/" + args.path
-    d = _request(args, args.method.upper(), path, payload)
+    raw_bytes, ctype = _request_bytes(args, args.method.upper(), path, payload)
+
+    try:
+        d = json.loads(raw_bytes.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # ─── A non-JSON body is legitimate here, and used to be an error ────
+        # GET /api/stream/<name> returns the stream's own bytes. `raw` used to
+        # decode with errors="replace" and then die with "non-JSON response"
+        # followed by a screen of U+FFFD -- holding the requested content and
+        # refusing to hand it over. Verifying a migrated 8 KiB stream required
+        # dropping to curl.
+        #
+        # Redirected or piped, the bytes pass through verbatim, so
+        # `raw GET /api/stream/x > x` works. On a terminal they are NOT spewed:
+        # 8 KiB of binary will wreck a session, and curl's own
+        # "Binary output can mess up your terminal" precedent is the right one
+        # to copy. The summary goes to stderr so it never contaminates a
+        # redirect.
+        if sys.stdout.isatty():
+            head = raw_bytes[:16].hex(" ")
+            print(f"{len(raw_bytes)} bytes of non-JSON body"
+                  + (f" (Content-Type: {ctype})" if ctype else "")
+                  + f"\nfirst 16 bytes: {head}"
+                  + "\nnot printed to a terminal -- redirect to a file, or pipe"
+                    " to xxd/hexdump, to get the bytes.",
+                  file=sys.stderr)
+        else:
+            sys.stdout.buffer.write(raw_bytes)
+        return EXIT_OK
+
     print(json.dumps(d, indent=2))
     return EXIT_REFUSED if _refused(d) else EXIT_OK
 

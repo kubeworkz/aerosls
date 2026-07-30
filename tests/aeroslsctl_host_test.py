@@ -286,6 +286,37 @@ def main():
     check("no reason given" in err,
           "whitespace-only output is not mistaken for an explanation")
 
+    # ─── A binary body is passed through, not rejected ─────────────────────
+    #
+    # GET /api/stream/<name> returns a stream's own bytes. `raw` used to decode
+    # every response with errors="replace" and then die with "non-JSON
+    # response" plus a screenful of U+FFFD -- it HAD the bytes and would not
+    # hand them over. Verifying a migrated 8 KiB stream required curl.
+    #
+    # The stub serves raw bytes when the payload is a bytes object, which the
+    # handler already supports.
+    print("\n-- raw passes a binary body through --")
+    BIN = bytes([0xAB]) * 8192
+    ROUTES[("GET", "/api/stream/fresh.bin")] = (200, BIN)
+
+    # Not a tty under subprocess.run, so the bytes go to stdout verbatim.
+    cmd = [sys.executable, CTL, "--host", HOST, "raw", "GET", "/api/stream/fresh.bin"]
+    p2 = subprocess.run(cmd, capture_output=True, timeout=30)
+    check(p2.returncode == 0, "a binary body is not an error")
+    check(len(p2.stdout) == 8192,
+          "*** all 8192 bytes come through -- the CLI no longer withholds the "
+          "content it fetched ***")
+    check(p2.stdout == BIN,
+          "*** and they are byte-identical: nothing was replaced or re-encoded ***")
+    check(b"non-JSON" not in p2.stderr,
+          "...and it does not report a non-JSON error for a legitimate binary route")
+
+    # A JSON body on the same subcommand still parses and still refuses.
+    ROUTES[("GET", "/api/streams")] = (200, {"ok": "false", "error": "nope"})
+    rc, out, err = run("raw", "GET", "/api/streams")
+    check(rc == 2, "a JSON refusal on raw still exits REFUSED")
+    check("nope" in out or "nope" in err, "...and still shows the reason")
+
     print(f"\n{'='*58}")
     print(f"passed={passed} failed={failed}")
     return 1 if failed else 0

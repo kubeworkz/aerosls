@@ -391,6 +391,99 @@ int main(void) {
               "size, not on absence ***");
     }
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * AN INTERRUPTED TRANSFER IS REAPED, NOT INHERITED
+     *
+     * stream_migrate_recv_begin() persists the destination's slot BEFORE any
+     * page arrives -- it must, or a stream with no pages is lost when the
+     * destination reboots. The cost is a window where a durable slot
+     * describes data that has not landed, and nothing distinguished it from a
+     * complete stream: same name, same size, same frame count, over empty
+     * LBAs. A real cluster produced exactly that pair, and the two were
+     * indistinguishable from /api/streams.
+     *
+     * Reaping is safe by construction: the SENDER retires its source only
+     * once every page is acknowledged, so an unfinished transfer means the
+     * original still exists on the sending node.
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n-- an interrupted transfer is reaped at boot --\n");
+    {
+        reset_disk();
+        memset(stream_store, 0, sizeof(stream_store));
+        struct StreamEntry* se = &stream_store[0];
+        se->active      = 1;
+        se->lba_base    = STREAM_DATA_LBA_BASE;
+        se->size        = 8192;
+        se->frames_used = 2;
+        se->incoming    = 1;          /* a transfer that never finished */
+        wl_strcpy_test(se->name, "half.bin", sizeof(se->name));
+
+        stream_persist_directory();
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+
+        CHECK(stream_store[0].active == 0,
+              "*** the interrupted slot is GONE after a reboot, not presented as a "
+              "complete stream ***");
+
+        /* And durably so. Reading the DIRECTORY BYTES, not the restored slot:
+         * a second stream_init() would find the slot gone either way -- if the
+         * reap was never persisted it simply gets reaped again, forever, and
+         * the directory never settles. A mutation removing the write-back
+         * survived exactly that weaker check.
+         *
+         * Third time this shape has appeared in this session: assert on the
+         * far side of the boundary you crossed. Offset 140 of entry 0 is
+         * `active`; past the 512-byte header. */
+        uint8_t dir[4096];
+        CHECK(nvme_read_sync(STREAM_DIR_LBA, dir) == 0, "the directory page is readable");
+        CHECK(dir[512 + 140] == 0,
+              "*** the reap was WRITTEN BACK -- the on-disk slot is inactive, so it is "
+              "not re-reaped on every subsequent boot ***");
+
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+        CHECK(stream_store[0].active == 0, "...and a second boot still sees nothing there");
+    }
+
+    /* A COMPLETE stream must survive. The reap keys on the flag, so a
+     * mutation that reaps unconditionally would pass the check above while
+     * destroying every stream on every boot. */
+    {
+        reset_disk();
+        memset(stream_store, 0, sizeof(stream_store));
+        struct StreamEntry* se = &stream_store[0];
+        se->active      = 1;
+        se->lba_base    = STREAM_DATA_LBA_BASE;
+        se->size        = 8192;
+        se->frames_used = 2;
+        se->incoming    = 0;          /* finished, or created locally */
+        wl_strcpy_test(se->name, "whole.bin", sizeof(se->name));
+
+        stream_persist_directory();
+        memset(stream_store, 0, sizeof(stream_store));
+        stream_init();
+
+        CHECK(stream_store[0].active == 1,
+              "*** a COMPLETE stream survives the same boot path ***");
+        CHECK(stream_store[0].frames_used == 2, "...with its page count");
+        CHECK(stream_store[0].incoming == 0,   "...and still not flagged");
+    }
+
+    /* A retired slot must not leave the flag set: a slot later reused by
+     * stream_create() would inherit it and be reaped as an interrupted
+     * transfer it never was. */
+    {
+        struct StreamEntry probe;
+        memset(&probe, 0xFF, sizeof(probe));   /* every field dirty */
+        probe.active = 1; probe.incoming = 1;
+        stream_retire_slot_for_test(&probe);
+        CHECK(probe.incoming == 0,
+              "*** retiring a slot clears the transfer flag, so a reused slot is not "
+              "reaped for a transfer that never happened ***");
+        CHECK(probe.active == 0, "...and the slot really is retired");
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }
