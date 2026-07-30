@@ -103,4 +103,33 @@ static inline const uint64_t* fault_poison_run_base(const uint64_t* known,
     return p;
 }
 
+/* The other end of the same run: walks UPWARD from `known` and returns the
+ * first address that does NOT match. The returned pointer is one past the run,
+ * so the run is [known, result).
+ *
+ * Both directions are needed, and the first version of this header only had
+ * one. It anchored the walk at the qword below the interrupted rsp on the
+ * theory that a local array overflows upward into the frame above it, so the
+ * damage would be below the return point. Two things were wrong with that.
+ *
+ * The hardware wrote there. An interrupt pushes its five-qword frame starting
+ * at the interrupted rsp and going DOWN, so the slots immediately below it --
+ * including the very one the faulting `ret` had just popped -- are overwritten
+ * with RIP, CS, RFLAGS, RSP and SS before the handler ever runs. Reading them
+ * back reports the CPU's own values as if they were program data.
+ *
+ * And the interesting direction is up. Memory at and above the interrupted rsp
+ * is the live stack of every frame that had not yet returned, and the hardware
+ * does not touch it. If that is full of payload, the run's top edge is the
+ * first surviving frame -- and if the run reaches the top of the stack, then
+ * nothing survived, which is a different bug entirely from a local array
+ * running off its end. */
+static inline const uint64_t* fault_poison_run_end(const uint64_t* known,
+                                                   const uint64_t* ceiling,
+                                                   uint64_t pattern) {
+    const uint64_t* p = known;
+    while (p < ceiling && p[0] == pattern) p++;
+    return p;
+}
+
 #endif /* FAULT_REPORT_H */

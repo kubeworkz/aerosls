@@ -948,6 +948,44 @@ Also eliminated this pass: `kernel_serial_printf` emits character by character w
 
 The C-only link check now reports **14** undefined symbols rather than 12; the two additions are `stack_bottom` and `stack_top`, both `global` in `arch/x86/boot.asm`, which is the same asm-provided category as the other twelve.
 
+## 9o. The dump inverts the model, and my own instrumentation had the bug
+
+Second run, and it says something different from what the first pass concluded:
+
+```
+[FAULT] stack is [0x077e7000,0x077f7000), 64 KiB; the interrupted frame was 1760 byte(s) deep.
+[FAULT]    0x077f6910: 00000000077f6920 0000000000000010
+[FAULT] >> 0x077f6920: cdcdcdcdcdcdcdcd cdcdcdcdcdcdcdcd
+[FAULT]    0x077f6930: cdcdcdcdcdcdcdcd cdcdcdcdcdcdcdcd
+   ... every qword to the end of the window ...
+```
+
+**No `POISON RUN` line printed, and that was my bug.** The scan was gated on `sp[-1] == irq_rip`, and `0x077f6918` reads `0x10` — that is **SS**. An interrupt pushes its five-qword frame starting at the interrupted rsp and going *down*, so the hardware writes over the very slot the faulting `ret` had just popped. The check was reading the CPU's own frame back and asking whether it looked like program data.
+
+**And the poison is above the interrupted rsp, not below it.** §9n reasoned that a local array overflows upward into its caller, so the damage would sit below the return point; the region above rsp is the live stack of every frame that had *not* returned, and all of it is payload. A local array cannot do that — it stops where its overrun stops and leaves the outer frames readable.
+
+The scan now walks upward from the interrupted rsp, and says explicitly which case it found: a run that ends inside the stack prints the first surviving qword (a return address identifying the outermost frame the overrun reached, with the writer below it), while a run that reaches the top of the stack prints that nothing survived, names the top stack page, and points at the frame allocator and DMA rather than at a local array.
+
+31 checks in `fault_report_host_test.c`, 8/8 mutations.
+
+### What that pointed at, and what it did not
+
+The stack is `[0x077e7000, 0x077f7000)` — its top is exactly `_kernel_image_end`, since `.bootstrap_stack` is the last thing in `.bss`. So "the whole stack is payload" makes the frame allocator the obvious suspect, and looking there turned up a real defect:
+
+`frame_owner[]` is a `uint8_t` and `PARTITION_MAX` is **256**, so every value it can hold names a real partition and there is no spare tag for *the machine owns this*. Boot reservations leave the BSS-zero default, which reads as `PARTITION_SYSTEM`. `partition_reclaim_all_frames()` frees a frame when the owner tag matches **and** the bitmap bit is set — and `fp_mark_used()` sets the bitmap bit. So reclaiming `PARTITION_SYSTEM` would walk the reservation and free the kernel's own `.text`, `.data`, `.bss`, page tables and 64 KiB bootstrap stack into the allocator.
+
+`frame_owner[]`'s own comment anticipated this ambiguity and concluded it was "safe by construction: every reader also checks the bitmap bit." That reasoning is true of a *never-allocated* frame and false of a *reserved* one. The bit distinguishes allocated from free; it says nothing about tenant-owned versus machine-owned, which is the distinction that mattered. The comment is corrected in place.
+
+**This is not the fault.** Both call sites — `partition_destroy()` and `partition_migrate()` — refuse `PARTITION_SYSTEM` and return before reaching the reclaim, which I checked rather than assumed. It is a landmine one call site away from arming, not the thing that crashed node 1, and saying otherwise because it fits the shape would repeat §9l's mistake.
+
+Guarded anyway, at the function that would do the damage: two watermarks bound the reserved regions and `frame_pool_frame_is_machine_owned()` excludes them from reclamation. "Unreachable" is a property of two call sites that could gain a third, and the failure mode is the kernel handing out its own running stack as scratch.
+
+`frame_pool_reserve_host_test.c` 24 → 35 checks, 5/5 mutations — including removing the guard (the original bug), covering only one of the two reserved regions, and making it so broad that tenant reclaim silently becomes a no-op.
+
+### Still open
+
+The overflowing writer is still unidentified. What the second dump added is that it is almost certainly *not* a local array, and the search should move to whatever can write a page-sized region: DMA targets, and any path that treats a frame pointer as scratch. The next dump's `POISON RUN` line will say whether the run stops inside the stack or runs to the top, and those two answers point in different directions.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.

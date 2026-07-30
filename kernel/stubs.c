@@ -124,32 +124,63 @@ static void fault_dump_stack(const uint64_t* rip_slot) {
         "[FAULT] stack is [%p,%p), 64 KiB; the interrupted frame was %lu byte(s) deep.\n",
         (void*)lo, (void*)hi, (unsigned long)((const char*)hi - (const char*)sp));
 
-    /* The measurement that names the buffer. */
+    /* ─── The measurement ──────────────────────────────────────────────
+     * Scanned UPWARD from the interrupted rsp. Below it is the five-qword
+     * frame the CPU just pushed, which sits on top of whatever the faulting
+     * epilogue had popped -- reading down there reports the hardware's own
+     * RIP/CS/RFLAGS/RSP/SS back as if they were program data, which is exactly
+     * what the first version of this did.
+     *
+     * At and above rsp is the live stack of every frame that had not returned
+     * yet, untouched by the interrupt. */
     int poison = fault_poison_byte(irq_rip);
-    if (poison >= 0 && sp > lo && sp[-1] == irq_rip) {
-        const uint64_t* base = fault_poison_run_base(sp - 1, lo, irq_rip);
-        unsigned long run = (unsigned long)((const char*)sp - (const char*)base);
+    const uint64_t* end = sp;
+    if (poison >= 0 && sp < hi && sp[0] == irq_rip) {
+        end = fault_poison_run_end(sp, hi, irq_rip);
+        unsigned long run = (unsigned long)((const char*)end - (const char*)sp);
         kernel_serial_printf(
-            "[FAULT] POISON RUN: 0x%016lx .. 0x%016lx = %lu byte(s) of 0x%02x, ending at\n"
-            "[FAULT] the smashed frame. The LOW end is the base of the buffer that overran,\n"
-            "[FAULT] and %lu is how far it wrote. Look for a local array of about that size\n"
-            "[FAULT] in whatever was on the stack here.\n",
-            (unsigned long)(uintptr_t)base, (unsigned long)(uintptr_t)(sp - 1),
-            run, (unsigned)poison, run);
+            "[FAULT] POISON RUN: 0x%016lx .. 0x%016lx = %lu byte(s) of 0x%02x, starting AT\n"
+            "[FAULT] the interrupted rsp and running UP through the live caller frames.\n",
+            (unsigned long)(uintptr_t)sp, (unsigned long)(uintptr_t)end,
+            run, (unsigned)poison);
+
+        if (end >= hi) {
+            /* Nothing survived. A local array cannot do this -- it would stop
+             * where its own overrun stopped, leaving the outer frames intact. */
+            kernel_serial_printf(
+                "[FAULT] The run reaches the TOP OF THE STACK. Every live frame is payload,\n"
+                "[FAULT] so this is NOT a local array running off its end -- that would stop\n"
+                "[FAULT] somewhere and leave the outer frames readable. Something wrote over\n"
+                "[FAULT] the stack wholesale. The top stack page is 0x%016lx; check whether\n"
+                "[FAULT] the frame allocator ever handed it out, and check any DMA target.\n",
+                (unsigned long)((uintptr_t)hi - 4096) & ~(uintptr_t)4095);
+        } else {
+            kernel_serial_printf(
+                "[FAULT] First surviving qword is at 0x%016lx = %016lx -- if that is a code\n"
+                "[FAULT] address it is the return address of the outermost frame the overrun\n"
+                "[FAULT] reached, and the writer is below it.\n",
+                (unsigned long)(uintptr_t)end, (unsigned long)end[0]);
+        }
+    } else if (poison >= 0) {
+        kernel_serial_printf(
+            "[FAULT] rsp does NOT point at 0x%02x -- the poison is not contiguous with the\n"
+            "[FAULT] return point, so the smashed slot was isolated rather than part of a run.\n",
+            (unsigned)poison);
     }
 
-    /* Window straddling the boundary: 8 qwords below the interrupted rsp (the
-     * popped, poisoned region) and 16 above (the frames still live). Where the
-     * two stop looking alike is the top of the overrun. */
-    const uint64_t* from = (sp - 8 < lo) ? lo : sp - 8;
-    const uint64_t* to   = (sp + 16 > hi) ? hi : sp + 16;
-    kernel_serial_printf("[FAULT] stack %p..%p (interrupted rsp marked >>):\n",
-                         (void*)from, (void*)to);
-    for (const uint64_t* p = from; p < to; p += 2)
-        kernel_serial_printf("[FAULT] %s %p: %016lx %016lx\n",
-                             (p == sp) ? ">>" : "  ", (void*)p,
-                             (unsigned long)p[0],
-                             (unsigned long)((p + 1 < to) ? p[1] : 0));
+    /* Dump the boundary rather than the whole run: the run is uniform by
+     * definition and its top edge is the only part with information in it.
+     * When there is no run, `end` is rsp and this degenerates to the window
+     * around the return point. */
+    const uint64_t* from = (end - 4 < sp) ? sp : end - 4;
+    const uint64_t* to   = (end + 8 > hi) ? hi : end + 8;
+    kernel_serial_printf(
+        "[FAULT] stack %p..%p (>> = interrupted rsp, ^^ = first surviving qword):\n",
+        (void*)from, (void*)to);
+    for (const uint64_t* p = from; p < to; p++)
+        kernel_serial_printf("[FAULT] %s %p: %016lx\n",
+                             (p == sp) ? ">>" : (p == end && end > sp) ? "^^" : "  ",
+                             (void*)p, (unsigned long)p[0]);
 }
 
 static void fault_explain(unsigned long saved_rip) {

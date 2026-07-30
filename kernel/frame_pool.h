@@ -90,6 +90,16 @@ void frame_pool_reserve_below(uint64_t end_addr);
  * without this a 512 MiB machine would happily be handed a page at 3 GiB. */
 void frame_pool_limit_ram(uint64_t top_addr);
 
+/* Nonzero if this frame was reserved at boot -- part of the kernel image, or
+ * memory the machine does not physically have -- rather than allocated to any
+ * partition. partition_reclaim_all_frames() skips these: frame_owner[] is a
+ * uint8_t and PARTITION_MAX is 256, so there is no spare tag value meaning
+ * "the machine owns this", and a reserved frame would otherwise read as
+ * PARTITION_SYSTEM and be freed. Exposed so a host test can assert that
+ * reclaiming PARTITION_SYSTEM does not hand the kernel's own stack back to
+ * the allocator. */
+int frame_pool_frame_is_machine_owned(uint64_t frame_index);
+
 /* Introspection for the boot log and the host test. */
 uint64_t frame_pool_reserved_count(void);
 int      frame_pool_is_reserved(uint64_t frame_index);

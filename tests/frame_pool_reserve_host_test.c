@@ -187,6 +187,74 @@ int main(void) {
               "an end address of 0 reserves nothing rather than wrapping");
     }
 
+    /* ─── A reservation is not an allocation ───────────────────────────────
+     * frame_owner[] is a uint8_t and PARTITION_MAX is 256, so every value it
+     * can hold names a real partition and there is no spare tag for "the
+     * machine owns this." Boot reservations therefore leave the default 0,
+     * which reads as PARTITION_SYSTEM, and fp_mark_used() sets the bitmap bit
+     * -- so a reserved kernel frame satisfies BOTH of the conditions
+     * partition_reclaim_all_frames() uses to decide a frame is free-able.
+     *
+     * Reclaiming PARTITION_SYSTEM would hand back the kernel's own .text,
+     * .data, .bss, page tables and 64 KiB bootstrap stack. Both call sites
+     * refuse partition 0 today, so this is a landmine rather than a live bug,
+     * and this test is what keeps it defused if a third call site appears. */
+    {
+        frame_pool_reset();
+        frame_pool_reserve_below(64 * 1024);      /* frames 0..15 = "the kernel" */
+        frame_pool_limit_ram(1024 * 1024);        /* frames 256.. = "no RAM there" */
+
+        uint64_t reserved_before = frame_pool_reserved_count();
+        CHECK(frame_pool_frame_is_machine_owned(0) &&
+              frame_pool_frame_is_machine_owned(15),
+              "*** frames inside the kernel image are machine-owned ***");
+        CHECK(!frame_pool_frame_is_machine_owned(16) &&
+              !frame_pool_frame_is_machine_owned(255),
+              "...allocatable frames between the two watermarks are not");
+        CHECK(frame_pool_frame_is_machine_owned(256) &&
+              frame_pool_frame_is_machine_owned(1000),
+              "*** and so is memory the machine does not physically have ***");
+
+        /* Hand one real frame to a tenant so the reclaim has honest work. */
+        void* tenant = allocate_physical_ram_frame_for_partition(7);
+        CHECK(tenant != 0, "a tenant frame was allocated from the free span");
+        uint64_t tenant_idx = (uint64_t)(uintptr_t)tenant / FRAME_SIZE;
+
+        uint32_t freed = partition_reclaim_all_frames(PARTITION_SYSTEM);
+        CHECK(freed == 0,
+              "*** reclaiming PARTITION_SYSTEM frees NOTHING when it owns nothing -- "
+              "the boot reservation is not its allocation ***");
+        CHECK(frame_pool_reserved_count() == reserved_before,
+              "...and the reserved count is unchanged");
+        CHECK(frame_pool_is_reserved(0) && frame_pool_is_reserved(15),
+              "*** the kernel image is STILL reserved after the reclaim ***");
+        CHECK(frame_pool_is_reserved(256) && frame_pool_is_reserved(1000),
+              "...and so is the nonexistent memory above the RAM top");
+
+        /* The assertion that actually matters: the allocator must not now be
+         * able to hand out the kernel. Drain a few frames and check every one
+         * came from the free span. */
+        int handed_out_kernel = 0;
+        for (int i = 0; i < 32; i++) {
+            void* f = allocate_physical_ram_frame();
+            if (!f) break;
+            uint64_t idx = (uint64_t)(uintptr_t)f / FRAME_SIZE;
+            if (frame_pool_frame_is_machine_owned(idx)) handed_out_kernel = 1;
+        }
+        CHECK(!handed_out_kernel,
+              "*** after reclaiming PARTITION_SYSTEM the allocator still never returns "
+              "a frame from the kernel image or from absent RAM ***");
+
+        /* A real tenant reclaim must still work -- the guard must not have
+         * turned reclamation into a no-op across the board. */
+        CHECK(!frame_pool_frame_is_machine_owned(tenant_idx),
+              "the tenant's frame is in the allocatable span");
+        CHECK(partition_reclaim_all_frames(7) == 1,
+              "*** reclaiming a real tenant still frees exactly its frame ***");
+        CHECK(!frame_pool_is_reserved(tenant_idx),
+              "...and that frame really is back in the pool");
+    }
+
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;
 }

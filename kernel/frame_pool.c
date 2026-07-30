@@ -29,14 +29,21 @@ static uint64_t partition_frame_quota[PARTITION_MAX];
  * one byte per physical frame, alongside the aggregate-only counter above.
  * BSS zero-init means every entry starts as PARTITION_SYSTEM (0) by
  * default -- indistinguishable, by value alone, from "genuinely allocated
- * to PARTITION_SYSTEM." That ambiguity is safe by construction: every
- * reader of this array (partition_reclaim_all_frames() below) also checks
- * physical_memory_bitmap's real allocated bit before ever acting on a
- * frame_owner[] value, so a never-allocated frame's default-0 owner tag is
- * never mistaken for a real, live PARTITION_SYSTEM allocation -- the same
- * "0 is honest, verify before trusting" discipline partition_owner_table[]
- * uses one layer up in kernel/partition.c. See frame_pool.h's own comment
- * on partition_reclaim_all_frames() for the full design writeup. */
+ * to PARTITION_SYSTEM."
+ *
+ * CORRECTION. This comment used to claim that ambiguity was "safe by
+ * construction" because partition_reclaim_all_frames() also checks
+ * physical_memory_bitmap's real allocated bit before acting, so a
+ * never-allocated frame's default-0 tag could not be mistaken for a live
+ * PARTITION_SYSTEM allocation. That is true of a never-allocated frame and
+ * false of a RESERVED one: fp_mark_used() sets the bitmap bit, so the boot
+ * reservation covering the kernel image passes the check with its owner tag
+ * still at the default 0. The bitmap bit distinguishes "allocated" from
+ * "free"; it says nothing about "owned by a tenant" versus "owned by the
+ * machine", which is the distinction that actually mattered here.
+ *
+ * The real guard is the reserved_below/reserved_above watermark pair below,
+ * checked by frame_pool_frame_is_machine_owned(). See its comment. */
 static uint8_t frame_owner[TOTAL_FRAMES];
 
 /* ─── Boot-time reservation ───────────────────────────────────────────
@@ -48,6 +55,40 @@ static uint8_t frame_owner[TOTAL_FRAMES];
 extern char _kernel_image_end[];
 
 static uint64_t frames_reserved = 0;
+
+/* ─── Boot reservations are not allocations ───────────────────────────────
+ * frame_owner[] is a uint8_t and PARTITION_MAX is 256, so every value it can
+ * hold is a valid partition id and there is no spare sentinel meaning "this
+ * frame belongs to the machine, not to a tenant." The boot reservations below
+ * therefore leave frame_owner[] at its BSS-zero default, which reads as
+ * PARTITION_SYSTEM -- and a reserved kernel frame becomes indistinguishable
+ * from a frame genuinely allocated to the system partition.
+ *
+ * frame_owner[]'s own comment notices this ambiguity and concludes it is safe
+ * because every reader also checks the bitmap bit before acting. That
+ * reasoning does not hold: fp_mark_used() SETS the bitmap bit, so a reserved
+ * frame passes the check. partition_reclaim_all_frames(PARTITION_SYSTEM)
+ * would walk frames 1..N, match every one of them on owner, confirm the bit,
+ * and free the kernel's own .text, .data, .bss, page tables and 64 KiB
+ * bootstrap stack into the allocator.
+ *
+ * Today both call sites -- partition_destroy() and partition_migrate() --
+ * refuse PARTITION_SYSTEM before they get here, so this is a landmine rather
+ * than a live bug. It is guarded here anyway, at the function that would do
+ * the damage, because "unreachable" is a property of two call sites that
+ * could gain a third, and the failure mode is the kernel handing out its own
+ * running stack as scratch memory.
+ *
+ * These two watermarks bound the reserved regions: everything below
+ * `reserved_below` (the kernel image) and everything at or above
+ * `reserved_above` (memory that does not physically exist) is machine state
+ * that no partition owns and no reclaim may touch. */
+static uint64_t reserved_below = 0;              /* frames [0, reserved_below) */
+static uint64_t reserved_above = TOTAL_FRAMES;   /* frames [reserved_above, TOTAL_FRAMES) */
+
+int frame_pool_frame_is_machine_owned(uint64_t frame_index) {
+    return frame_index < reserved_below || frame_index >= reserved_above;
+}
 
 static void fp_mark_used(uint64_t frame_index) {
     if (frame_index >= TOTAL_FRAMES) return;
@@ -62,6 +103,7 @@ void frame_pool_reserve_below(uint64_t end_addr) {
     uint64_t last = (end_addr + FRAME_SIZE - 1) / FRAME_SIZE;
     if (last > TOTAL_FRAMES) last = TOTAL_FRAMES;
     for (uint64_t f = 0; f < last; f++) fp_mark_used(f);
+    if (last > reserved_below) reserved_below = last;
 }
 
 void frame_pool_init(void) {
@@ -86,6 +128,7 @@ void frame_pool_limit_ram(uint64_t top_addr) {
 
     uint64_t before = frames_reserved;
     for (uint64_t f = first_absent; f < TOTAL_FRAMES; f++) fp_mark_used(f);
+    if (first_absent < reserved_above) reserved_above = first_absent;
     kernel_serial_printf(
         "[FRAME] reserved %llu frames above 0x%llx -- that memory does not exist.\n",
         (unsigned long long)(frames_reserved - before),
@@ -103,6 +146,8 @@ void frame_pool_reset(void) {
     for (size_t i = 0; i < (TOTAL_FRAMES / 64); i++) physical_memory_bitmap[i] = 0;
     for (size_t i = 0; i < TOTAL_FRAMES; i++) frame_owner[i] = 0;
     frames_reserved = 0;
+    reserved_below  = 0;
+    reserved_above  = TOTAL_FRAMES;
 }
 
 
@@ -242,6 +287,10 @@ uint32_t partition_reclaim_all_frames(uint32_t partition_id)
     // Start at frame 1, same skip-frame-0 discipline as alloc_raw_frame()/
     // free_raw_frame() (frame 0 = address 0x0 = NULL, never handed out).
     for (uint64_t frame_index = 1; frame_index < TOTAL_FRAMES; frame_index++) {
+        /* Boot reservations are machine state, not anybody's allocation.
+         * Without this, reclaiming PARTITION_SYSTEM frees the kernel image --
+         * see the reserved_below/reserved_above comment above. */
+        if (frame_pool_frame_is_machine_owned(frame_index)) continue;
         if (frame_owner[frame_index] != (uint8_t)partition_id) continue;
         size_t word = frame_index / 64;
         int    bit  = (int)(frame_index % 64);
