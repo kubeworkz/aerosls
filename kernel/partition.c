@@ -355,6 +355,22 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // Step 1 (LPAR Phase 14): pause -- excludes the partition from scheduling
     // for the duration of the move. Reuses partition_pause() directly rather
     // than re-deriving the same runtime flag a second way.
+    /* ─── Remember whether it was already paused ──────────────────────────
+     * Every failure path below used to return with the partition still paused.
+     * On SUCCESS that is deliberate and documented -- the partition must be
+     * resumed on the destination, not here. On FAILURE it is an availability
+     * regression the operator never asked for: ownership was not transferred,
+     * no frames were reclaimed, the data is untouched and the partition is
+     * exactly where it started -- and yet the tenant is now out of the
+     * scheduling rotation until somebody notices. The abort message even says
+     * "the partition stays here, paused" as though that were the safe outcome,
+     * and tells the operator to retry without telling them to resume.
+     *
+     * The pause is a MEANS to the migration, not a desired end state. So a
+     * failed migration restores whatever the pause state was before it started
+     * -- restores, not resumes: a partition an operator had deliberately paused
+     * must stay paused, or the failure would silently un-pause it. */
+    int was_paused_before_migrate = partition_is_paused(partition_id);
     partition_pause(partition_id);
 
     // Step 2 (Multi-Node Phase 4/6): relinquish this node's write-lease claim
@@ -430,11 +446,13 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     if (streams_relocated < streams_expected) {
         kernel_serial_printf(
             "[PARTITION] ERROR: migrate ABORTED for partition %u -- %d of %d stream(s) "
-            "were confirmed by node %u. Ownership NOT transferred and no frames "
-            "reclaimed; the partition stays here, paused, with its data intact. "
-            "Check node %u's log for the refusal reason, then retry.\n",
+            "were confirmed by node %u. Ownership NOT transferred, no frames "
+            "reclaimed, data intact, and the partition's pause state restored to "
+            "what it was before the attempt -- nothing changed. Check node %u's "
+            "log for the refusal reason, then retry.\n",
             (unsigned)partition_id, streams_relocated, streams_expected,
             (unsigned)dest_node_id, (unsigned)dest_node_id);
+        if (!was_paused_before_migrate) partition_resume(partition_id);
         return 1;
     }
 
@@ -475,9 +493,11 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     if (partition_set_owner_node(partition_id, dest_node_id) != 0) {
         kernel_serial_printf(
             "[PARTITION] ERROR: migration of partition %u aborted -- "
-            "ownership reassignment failed. Partition remains paused; "
-            "frames were NOT reclaimed since ownership never actually moved.\n",
+            "ownership reassignment failed. Frames were NOT reclaimed since "
+            "ownership never actually moved, and the pause state is restored to "
+            "what it was before the attempt.\n",
             (unsigned)partition_id);
+        if (!was_paused_before_migrate) partition_resume(partition_id);
         return 1;
     }
 

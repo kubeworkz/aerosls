@@ -370,6 +370,62 @@ int main(void) {
     }
     g_streams_present = 0; g_streams_confirmed = 0;
 
+    /* ─── A failed migration must not leave the tenant down ────────────────
+     * partition_migrate() pauses for the duration of the move. On SUCCESS the
+     * partition stays paused deliberately -- it has to be resumed on the
+     * DESTINATION. On FAILURE nothing moved: ownership was not transferred, no
+     * frames were reclaimed, the data is untouched. Leaving it paused turns
+     * "the migration failed, nothing changed" into "the migration failed and
+     * the tenant is out of the scheduling rotation until somebody notices".
+     *
+     * Found by reading the output of a PASSING end-to-end run, not by a test
+     * failing. The abort message announced "the partition stays here, paused"
+     * as though that were the safe outcome. */
+    {
+        uint32_t p = partition_create("resume-on-abort");
+        CHECK(p != 0, "created a partition to abort a migration on");
+        CHECK(partition_is_paused(p) == 0, "a fresh partition is not paused");
+
+        /* The failure has to happen AFTER the pause, or none of this is being
+         * tested. The first version of this block used dest == source, which is
+         * refused by a guard ABOVE partition_pause() -- so the partition was
+         * never paused, "still not paused" was trivially true, and all four
+         * mutations (including deleting the resume outright) passed.
+         *
+         * A short stream relocation is the real post-pause abort: the partition
+         * has one stream and the destination confirms none of it. */
+        uint32_t elsewhere = cluster_local_node_id() + 1;
+        g_streams_present   = 1;
+        g_streams_confirmed = 0;      /* destination refused everything */
+
+        CHECK(partition_migrate(p, elsewhere) != 0,
+              "the migration aborts: 0 of 1 stream(s) confirmed");
+        CHECK(partition_is_paused(p) == 0,
+              "*** a failed migration RESUMES the partition -- ownership did not "
+              "move and no frames were reclaimed, so leaving the tenant out of the "
+              "scheduling rotation is a side effect nobody asked for ***");
+
+        /* A partition the operator had already paused must STAY paused: the
+         * failure restores the PRIOR state, it does not blanket-resume. */
+        partition_pause(p);
+        CHECK(partition_is_paused(p) == 1, "the operator pauses it deliberately");
+        CHECK(partition_migrate(p, elsewhere) != 0, "the migration aborts again");
+        CHECK(partition_is_paused(p) == 1,
+              "*** ...and it is STILL paused: restoring the prior state, not "
+              "resuming something the operator had disabled ***");
+
+        /* Success still leaves it paused -- that is deliberate, because the
+         * partition has to be resumed on the DESTINATION, not here. Without
+         * this, "restore on failure" could be implemented as "always resume"
+         * and nothing would notice. */
+        g_streams_confirmed = 1;
+        CHECK(partition_migrate(p, elsewhere) == 0, "now the migration succeeds");
+        CHECK(partition_is_paused(p) == 1,
+              "*** a SUCCESSFUL migration still leaves it paused -- it is resumed "
+              "on the destination, so the restore must not fire here ***");
+        g_streams_present = 0; g_streams_confirmed = 0;
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }

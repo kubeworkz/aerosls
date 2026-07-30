@@ -1171,6 +1171,40 @@ It surfaced because the 186-check suite had been feeding consensus packets throu
 
 That is the seventh, eighth and ninth instance in this session of a check that could not fail. The common factor in every single one: **the assertion was true for a reason other than the one being tested**, and the only way to find out was to break the code and watch.
 
+## 9u. The reap test passes — and the passing output contained a bug
+
+`tests/reap_slot_e2e.sh`, first clean run. One 1 MiB stream, destination killed 0.5 s into the transfer:
+
+```
+[STREAM] migrate: page 21 unacknowledged after attempt 1..4 -- retransmitting 4 of 4 fragment(s).
+[STREAM] migrate: page 21 NOT confirmed after 4 attempt(s) -- transfer abandoned, source slot 3 left intact.
+[PARTITION] ERROR: migrate ABORTED for partition 5 -- 0 of 1 stream(s) confirmed by node 2.
+...
+[STREAM] REAPED slot 1 ('reap-433778.bin', 1048576 byte(s) expected): an incoming migration was
+         interrupted before its last page arrived, so this copy is incomplete.
+[STREAM] 1 interrupted transfer(s) reaped; rewriting the directory.
+```
+
+Every fix in the chain visible in one run: the bounded retransmit loop, source retention on an unconfirmed transfer, the §9k coherence guard refusing to hand over ownership, the durable `incoming` marker, the reap, and the write-back that three separate mutations survived before its test was fixed.
+
+### And a defect nothing asserted on
+
+`partition_migrate()` pauses for the duration of the move. On **success** the partition stays paused deliberately — it has to be resumed on the destination. On **failure** it also stayed paused, and no path after the pause ever resumed it. Ownership did not transfer, no frames were reclaimed, the data was untouched, the partition was exactly where it started — and the tenant was out of the scheduling rotation indefinitely. The abort message even announced *"the partition stays here, paused"* as though that were the safe outcome, and told the operator to retry without telling them to resume.
+
+The pause is a means to the migration, not a desired end state. A failure now restores the prior state — **restores, not resumes**: a partition an operator had deliberately paused must stay paused, or the failure would silently un-pause it. Both abort messages were rewritten, because they now described something the code no longer does.
+
+This did not come from a failing test. It came from reading the output of a passing one.
+
+### The eleventh check that could not fail
+
+The first version of the new test drove the abort with `dest == source`. That is refused by a guard **above** `partition_pause()` — so the partition was never paused, `partition_is_paused(p) == 0` was trivially true, and **all four mutations passed, including deleting the resume outright.**
+
+Rewritten to abort *after* the pause, via a stream the destination confirms none of. Now 5/5: leaving it paused, blanket-resuming regardless of prior state, blanket-not-resuming, reading the prior state after the pause instead of before, and resuming on the success path too.
+
+`partition_migrate_phase6_host_test.c` 46 → 55 checks.
+
+The count for this session is now eleven, and the shape has never once varied: **the assertion was true for a reason other than the one under test.** Deleting the guard is the only reliable way to find out — and in every single case the test had passed on its first run, which is precisely what made it feel finished.
+
 ## 10. Live/hot migration — deferred, not scoped
 
 Named explicitly rather than silently omitted: keeping a partition servicing reads and writes while its pages transfer in the background is a materially different and larger problem than cold migration — it needs the DSPP layer to serve reads from whichever node currently holds a given page mid-transfer, and writes to be either fenced or dual-written during the handoff window, neither of which this roadmap's Phase 4 lease model (a single "which node may write" flag) is designed to support mid-transfer. This is the same category of decision LPAR Phase 15 made about nested partitions — not "no concrete plan yet, revisit later," but "the mechanism this roadmap builds (a binary per-partition lease, cold-swapped) doesn't extend to this use case without a different design," worth naming now so Phase 6's lease model isn't mistaken for a stepping stone to something it structurally isn't.
