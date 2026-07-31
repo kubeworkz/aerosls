@@ -304,3 +304,72 @@ Running complex optimisation passes in kernel mode requires careful validation. 
 At each stage, the kernel‑native, SLS environment directly enables the design. The result is a dynamic binary translator that approaches the performance of hardware virtualisation (KVM‑like direct execution) for memory accesses, while retaining the portability and flexibility of QEMU’s TCG multi‑target frontend.
 
 This roadmap is ambitious but logically incremental. Each phase builds on the previous one, and the end result is a fundamentally more efficient emulation engine tailored to the unique strengths of AeroSLS.
+
+---
+
+## Is this KQEMU?
+
+KQEMU is a perfect historical lens—because it shared the same goal (make QEMU much faster by moving into kernel space and using the host MMU), but it chose a fundamentally different mechanism. Let’s contrast that with the design path we’ve just outlined.
+
+## KQEMU: The “Run‑it‑natively‑when‑possible” Accelerator
+
+KQEMU (2004–2009, x86‑only, Linux/Windows kernel modules) was an **accelerator**, not a re‑built TCG. Its core idea:
+
+- **Split execution:** Most guest code (user‑mode, ring‑3, and some ring‑0 without privileged instructions) runs **directly on the host CPU** at full speed.
+- **Fallback:** When a privileged instruction, MMIO access, or unsupported corner case occurs, the kernel module traps and hands control back to QEMU userspace (or the module’s own slow path) for full software emulation.
+- **Guest memory mapping:** The module mapped guest physical RAM into a large contiguous chunk of the host kernel’s virtual address space, so native guest code could access memory without translation—the host MMU handled it.
+- **No binary translation for “hot” code:** It executed native instructions, not translated ones. TCG (then called “dyngen”) only emulated the tricky parts.
+
+**The result:** Near‑native CPU‑bound performance, as long as the workload spent most of its time in non‑privileged code. Overheads came from frequent context switches between kernel module and QEMU userspace, and from the need to constantly trap and emulate privileged operations.
+
+KQEMU was eventually obsoleted by KVM, which used Intel VT‑x / AMD‑V to let the *hardware* handle privileged instruction trapping and guest page tables, doing the whole thing much more cleanly.
+
+---
+
+## Our AeroSLS Design: The “Accelerate DBT with Hardware MMU” Approach
+
+The current proposal *keeps TCG as the sole execution engine*. It does **not** run any guest code natively. Instead:
+
+- **TCG still translates guest instructions → host instructions.** Every instruction is emulated via dynamic binary translation.
+- **But memory accesses in the translated host code become direct loads/stores**, because the host MMU is set up with shadow page tables that map guest virtual addresses to host virtual addresses (which point to guest physical RAM). No soft‑MMU helpers on the hot path.
+- **Trap‑and‑emulate for MMIO and page‑table changes** is used sparingly, by marking those pages non‑present in the host page tables.
+- **Persistence and profiling** allow the translation cache and optimised traces to survive reboots and improve over time—features KQEMU never had.
+
+So **functionally it’s closer to Rosetta 2**, FEX‑Emu’s “host‑MMU mode”, or Box64’s “native address space” techniques: a *pure DBT that borrows the host MMU to make guest memory accesses cheap*.
+
+---
+
+## Side‑by‑Side Comparison
+
+| **Aspect**                  | **KQEMU**                                                             | **Proposed AeroSLS Design**                                                                                                  |
+| --------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **Execution model**         | Direct native execution for most code, fallback to software emulation | Always DBT (TCG), never native                                                                                               |
+| **Guest ISA support**       | Only x86‑on‑x86 (same ISA)                                            | Cross‑ISA (any TCG target‑host pair)                                                                                         |
+| **Memory access**           | Direct mapping of guest physical RAM; host MMU used natively          | Shadow page tables give direct virtual→virtual mapping, host MMU walks them                                                  |
+| **Privileged instructions** | Trapped and emulated by kernel module                                 | Emulated entirely by TCG code (with no host privilege traps)                                                                 |
+| **Performance ceiling**     | Near‑native for non‑privileged user code                              | Still DBT overhead, but soft‑MMU eliminated → can reach 50–80% of native for CPU‑bound code if TCG optimizations are applied |
+| **Flexibility**             | Tied to x86 host and guest; fragile, architecture‑specific            | Fully portable; works for any TCG target because DBT remains in charge                                                       |
+| **State persistence**       | None; cache lost on reboot                                            | All translations, profiles, and shadow tables persistent across reboots                                                      |
+| **Multi‑node sharing**      | Not designed for it                                                   | Shared persistent translation cache and shadow page tables across QEMU nodes                                                 |
+| **Optimisation level**      | Static, monomorphic                                                   | Profile‑guided, tiered compilation and trace formation evolve over time                                                      |
+
+## Why Not Just Do KQEMU 2.0 on AeroSLS?
+
+You could, in theory, build something like KQEMU for AeroSLS—run unmodified guest code directly on the host CPU, using the kernel’s page tables to map guest memory. But:
+
+1. **It would be same‑ISA only** (guest ISA must match host). AeroSLS/QEMU’s strength is multi‑architecture support.
+2. **It requires handling all privilege‑level transitions in software**, which is extremely complex and fragile (the same reason KQEMU was abandoned).
+3. **Hardware‑assisted virtualisation (KVM) does it better**, and on modern CPUs it’s already there. If you have VT‑x / AMD‑V, you just use KVM. If you don’t, a KQEMU‑like approach is an immense amount of work for a shrinking benefit.
+4. **The kernel‑native, SLS environment doesn’t magically simplify privilege emulation**; it still requires ring compression gymnastics.
+
+In contrast, the DBT‑plus‑host‑MMU approach keeps QEMU’s full cross‑ISA portability and doesn’t wrestle with guest privilege rings—it just emulates them inside the translated code, which is already battle‑tested.
+
+## So What’s the Right Analogy?
+
+This design is best described as **“Self‑Modifying Shadow‑Page‑Table‑Assisted DBT”** – a software‑only dynamic translator that gets hardware‑grade memory performance via kernel control of the MMU, plus all the benefits of persistent storage.
+
+- It’s like **KVM’s shadow page table logic**, but applied to a userspace/kernel DBT instead of hardware virtualisation.
+- It’s like **Rosetta 2** on Apple Silicon, which translates x86‑64 to ARM64 and uses the host’s TLB and page tables for memory access, but with the added twist of persistence and kernel‑native execution.
+- It’s **not KQEMU**, because it never runs a single guest instruction natively.
+
+If KQEMU was “virtualization without hardware assist,” this is “memory virtualization without hardware assist, but with DBT.” It borrows the memory management tricks of virtualization, but not the execution‑mode tricks. That’s a sweet spot on a system like AeroSLS where kernel‑level MMU control is free, persistent memory is infinite, and cross‑ISA flexibility is paramount.
