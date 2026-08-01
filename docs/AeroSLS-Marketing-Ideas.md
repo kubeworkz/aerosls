@@ -1,6 +1,6 @@
-This is a perfect “David vs. Goliath” tech story. You’ve got something genuinely clever—a custom QEMU that side-steps the need for KVM/nested virt by running the TCG emulation *in kernel mode*, yielding 3–5x speedup with no userspace overhead. That’s a huge unlock for ARM-based edge devices like the Raspberry Pi. Let’s turn it into marketing ammunition.
+This is a perfect “David vs. Goliath” tech story. You’ve got something genuinely clever - a custom QEMU that side-steps the need for KVM/nested virt by running the TCG emulation *in kernel mode*, yielding 3–5x speedup with no userspace overhead. That’s a huge unlock for ARM-based edge devices like the Raspberry Pi. Let’s turn it into marketing ammunition.
 
-Below is a structured marketing narrative you can adapt. I’m making a few assumptions about AeroSLS (e.g., that it’s a lightweight virtualisation/container/sandbox solution that lets you run x86 workloads on ARM). If that’s wrong, the framing still works—just swap in your actual product description.
+Below is a structured marketing narrative you can adapt. I’m making a few assumptions about AeroSLS (e.g., that it’s a lightweight virtualisation/container/sandbox solution that lets you run x86 workloads on ARM). If that’s wrong, the framing still works - just swap in your actual product description.
 
 ## 1. The Core Narrative: “No KVM? No Problem.”
 
@@ -9,7 +9,7 @@ Below is a structured marketing narrative you can adapt. I’m making a few assu
 
 **Elevator pitch**
 
-AeroSLS now runs natively on ARM devices like the Raspberry Pi, without depending on KVM or nested virtualisation. Our custom kernel-mode QEMU emulator completely bypasses userspace overhead, delivering a **3–5× performance leap** over standard TCG—making edge virtualisation practical for the first time.
+AeroSLS now runs natively on ARM devices like the Raspberry Pi, without depending on KVM or nested virtualisation. Our custom kernel-mode QEMU emulator completely bypasses userspace overhead, delivering a **3–5× performance leap** over standard TCG - making edge virtualisation practical for the first time.
 
 ---
 
@@ -71,11 +71,11 @@ AeroSLS now runs natively on ARM devices like the Raspberry Pi, without dependin
 
 **Twitter/X:**  
 
-“We just made QEMU TCG scream. By moving it to kernel mode, AeroSLS on Raspberry Pi sees a 3–5× speedup—no KVM, no nested virt. x86 on ARM just got serious. 🚀 #AeroSLS #EdgeComputing #RaspberryPi”
+“We just made QEMU TCG scream. By moving it to kernel mode, AeroSLS on Raspberry Pi sees a 3–5× speedup - no KVM, no nested virt. x86 on ARM just got serious. 🚀 #AeroSLS #EdgeComputing #RaspberryPi”
 
 **LinkedIn:**  
 
-“What if you could run your x86 edge workloads on a Raspberry Pi—without KVM and at 3–5× the speed of vanilla QEMU? We built a custom kernel-mode TCG engine for AeroSLS that does exactly that. No more “sorry, need nested virtualization.” Just install and go. Learn more: [link]”
+“What if you could run your x86 edge workloads on a Raspberry Pi - without KVM and at 3–5× the speed of vanilla QEMU? We built a custom kernel-mode TCG engine for AeroSLS that does exactly that. No more “sorry, need nested virtualization.” Just install and go. Learn more: [link]”
 
 **Hacker News / Reddit title:**  
 
@@ -94,13 +94,13 @@ AeroSLS now runs natively on ARM devices like the Raspberry Pi, without dependin
 ## 7. Quick Q&A / Objection Handling
 
 **Q:** Isn’t kernel-mode emulation risky?  
-**A:** We’ve designed the kernel-mode TCG with safety first—execution is sandboxed and the module is minimal. In many ways, it’s less exposed than a full KVM subsystem because it doesn’t rely on complex hardware virt features.
+**A:** We’ve designed the kernel-mode TCG with safety first - execution is sandboxed and the module is minimal. In many ways, it’s less exposed than a full KVM subsystem because it doesn’t rely on complex hardware virt features.
 
 **Q:** How does this compare to Apple’s Rosetta 2?  
 **A:** Rosetta 2 is a userspace binary translator with JIT and hardware support. AeroSLS takes a different path: whole-system emulation at kernel level, making it suitable for running full OS images, not just user binaries. It’s also fully open-source (if true) and works on standard ARM Linux.
 
 **Q:** Can I run Windows on my Pi with this?  
-**A:** If your AeroSLS supports it, yes—an x86 Windows environment could be emulated. With the 3–5× boost, basic desktop tasks become usable on a Pi.
+**A:** If your AeroSLS supports it, yes - an x86 Windows environment could be emulated. With the 3–5× boost, basic desktop tasks become usable on a Pi.
 
 **Q:** What about performance on slower Pi models?  
 **A:** The speedup is most dramatic on resource-constrained systems where userspace overhead dominates. Even a Pi Zero 2 W can now handle simple x86 CLI tools.
@@ -213,7 +213,7 @@ This turns AeroSLS from a virtualization platform into a **complete edge runtime
 
 ---
 
-That’s the final piece that turns AeroSLS from a powerful edge platform into a **self-contained, AI-native edge operating system**. Now you have compute, orchestration, data, vector search, and LLM connectivity—all built in, no external services required. Here’s how it all stitches together.
+That’s the final piece that turns AeroSLS from a powerful edge platform into a **self-contained, AI-native edge operating system**. Now you have compute, orchestration, data, vector search, and LLM connectivity - all built in, no external services required. Here’s how it all stitches together.
 
 ## The Complete AeroSLS Narrative
 
@@ -276,7 +276,7 @@ Now you can build and run complete RAG pipelines, intelligent agents, and infere
 **A:** It’s the logical conclusion of having compute, data, and vector search in one place. The LLM gateway removes the last integration burden. Instead of setting up separate API servers and network routes, the edge device becomes a self-contained reasoning engine.
 
 **Q:** Does this mean you’re competing with Ollama/vLLM?  
-**A:** No, we’re making them first-class citizens of the edge. AeroSLS integrates them transparently—you can use whatever backend you want, local or remote, and the platform optimizes the connection, caching, and data flow. We’re the OS, not the model runner.
+**A:** No, we’re making them first-class citizens of the edge. AeroSLS integrates them transparently - you can use whatever backend you want, local or remote, and the platform optimizes the connection, caching, and data flow. We’re the OS, not the model runner.
 
 **Q:** How does the LLM gateway interact with live migration?  
 **A:** When a VM that’s mid-inference migrates, the gateway session state (token stream, context cache) can be check-pointed and transferred along with the VM’s memory. This means long-running LLM tasks survive node failures without dropping the user-facing response. (Requires compatible backend support for state transfer, which we enable via our kernel-level checkpointing.)
@@ -431,8 +431,8 @@ Now you can build and run complete RAG pipelines, intelligent agents, and infere
 
 If you prefer a single, scroll‑friendly welcome blurb for a dashboard widget, here’s a concise version:
 
-> **Welcome to AeroSLS** — your AI‑Native Edge OS.  
+> **Welcome to AeroSLS**  - your AI‑Native Edge OS.  
 > 
 > Run isolated VMs 3–5× faster on a Pi without KVM. Move live workloads between nodes mid‑instruction. Query an embedded SQL database and vector store directly from your apps. Connect to any OpenAI‑compatible LLM (Ollama, Claude, vLLM…) through the built‑in gateway.  
-> 
-> Everything you need to build intelligent, self‑healing edge applications — all inside one tiny kernel.
+>   
+> Everything you need to build intelligent, self‑healing edge applications  - all inside one tiny kernel.
