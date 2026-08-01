@@ -12,7 +12,7 @@
 | `qemu/osdep.h`                                                                                                                                                                                           | 42 includes in [cputlb.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) alone           | The largest shim layer needed — provide thin wrappers for the ~20 types/macros it defines                                                                                                                                                                                                |
 | **Coroutines** ([qemu-coroutine.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html)) | Block layer, not TCG hot path                                                                                                                                                                                  | Not needed for Phase 0 (no block devices in the initial SLS target)                                                                                                                                                                                                                      |
 
-**Core TCG engine** is ~21K lines (`tcg/`). The **accelerator runtime** is ~12K lines (`accel/tcg/`). The **x86-64 backend** (`tcg/x86_64/`) adds ~3K. Total: **~36K lines** to port, but:
+**Core TCG engine** is ~~21K lines (`tcg/`). The **accelerator runtime** is ~12K lines (`accel/tcg/`). The **x86-64 backend** (`tcg/x86_64/`) adds ~3K. Total: **~~36K lines** to port, but:
 
 - **Only ~13K lines are the hot path** (tcg.c + [cputlb.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) + cpu-exec.c + [translate-all.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) + tcg-op-ldst.c)
 - TCG already has its own internal allocator (`tcg_malloc_internal` → `TCGPool`) that uses `g_malloc` underneath. Replacing `g_malloc` with a single persistent-memory allocator covers 80% of GLib usage
@@ -129,3 +129,15 @@ The "hard" part — actually making the optimizer produce better code — is bou
 4. Cross-ISA support (unlike KQEMU which was x86-only)
 
 The closest analog is Apple's Rosetta 2 (DBT + host MMU for memory), but Rosetta is userspace-only, proprietary, and non-persistent. This would be the first open, kernel-native, persistent DBT with hardware MMU acceleration.
+
+---
+
+## Phase 0 Final Status
+
+| **Milestone** | **Status** | **Proof**                                           |
+| ------------- | ---------- | --------------------------------------------------- |
+| M0.1          | ✓          | SLS shim compiles standalone                        |
+| M0.2          | ✓          | 8 TCG core files: 0 errors, 568KB objects           |
+| M0.4          | ✓          | Guest "Hello" prints via serial (13/13 tests)       |
+| M0.5          | ✓          | TCG+TCI initializes, prologue generated, link clean |
+| M0.6          | ✓          | Full IR generation pipeline: init→alloc→emit→exit   |
