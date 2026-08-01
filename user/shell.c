@@ -21,6 +21,7 @@
 #include "../kernel/webapp.h"
 #include "../kernel/auth.h"
 #include "../kernel/agent.h"
+#include "../kernel/checkpoint_mgr.h"
 #include "../kernel/sql_exec.h"
 #include "../kernel/vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
 #include "../kernel/rowstore.h"   // Gap Remediation Phase B -- SYS_SLS_ROWSTORE_CREATE_TABLE
@@ -273,6 +274,10 @@ static void print_help(void) {
         "  svc restart <name>             restart a crashed service\n"
         "  ipc stat                       IPC queue depths and latency\n"
         "  ipc post <svc> <opcode_hex>    post a raw IPC message for testing\n"
+        "  checkpoint                     trigger a full system checkpoint\n"
+        "  checkpoint status              show last checkpoint info\n"
+        "  checkpoint list                enumerate stored checkpoints\n"
+        "  checkpoint tree                dump the current state tree\n"
         "  -- Row Locks (DB2 / Read-Committed isolation) --\n"
         "  lock list                      show all active row locks\n"
         "  -- Indexes (DB3 / keyed access path) --\n"
@@ -2524,6 +2529,29 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                     "ipc post: opcode=0x%04x -> %s (port 0x%04x)\n",
                     opcode, svc_name, target_port);
             }
+        }
+
+        // ── Checkpoint (Core Backup Strategies, Step 1) ───────────────────────
+        else if (sh_eq(input_buffer, "checkpoint")) {
+            checkpoint_trigger();
+        }
+        else if (sh_eq(input_buffer, "checkpoint status")) {
+            struct IPCPostRequest req = {0};
+            req.msg.dst_port = IPC_PORT_CKPTMGR;
+            req.msg.opcode   = CKPT_OP_STATUS;
+            do_syscall(SYS_SLS_IPC_POST, &req);
+        }
+        else if (sh_eq(input_buffer, "checkpoint list")) {
+            struct IPCPostRequest req = {0};
+            req.msg.dst_port = IPC_PORT_CKPTMGR;
+            req.msg.opcode   = CKPT_OP_LIST;
+            do_syscall(SYS_SLS_IPC_POST, &req);
+        }
+        else if (sh_eq(input_buffer, "checkpoint tree")) {
+            struct IPCPostRequest req = {0};
+            req.msg.dst_port = IPC_PORT_CKPTMGR;
+            req.msg.opcode   = CKPT_OP_TREE;
+            do_syscall(SYS_SLS_IPC_POST, &req);
         }
 
         // ── Phase H: AI Agents ────────────────────────────────────────────────

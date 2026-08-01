@@ -717,6 +717,12 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
             return;
         }
 
+        if (opcode >= DSPP_CKPT_BEGIN_REQ && opcode <= DSPP_CKPT_CHUNK_ACK) {
+            if (len < sizeof(struct DSPPCkptHeader)) return;
+            dspp_ckpt_rx((struct DSPPCkptChunkPacket*)buf, len);
+            return;
+        }
+
         if (len < sizeof(struct DSPPMigrateHeader)) return;
         dspp_migrate_rx((struct DSPPMigratePagePacket*)buf, len);
         return;

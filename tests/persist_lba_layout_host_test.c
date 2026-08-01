@@ -56,6 +56,7 @@
 #include "kernel/view.h"
 #include "kernel/stream.h"
 #include "kernel/persist.h"
+#include "kernel/checkpoint_mgr.h"
 #include <stdio.h>
 #include <stdint.h>
 
@@ -156,6 +157,9 @@ static struct Region regions[] = {
     { "workloads", 1, {
         HDR("workloads", PERSIST_WORKLOAD_HDR_LBA),
         ARR("workloads", PERSIST_WORKLOAD_ENT_LBA, workloads) }, 2 },
+    { "checkpoints", 1, {
+        HDR("checkpoints", PERSIST_CKPT_HDR_LBA),
+        { "ckpt_history", PERSIST_CKPT_ENT_LBA, SECTORS_PER_FRAME } }, 2 },
 };
 #define NREGIONS ((int)(sizeof(regions)/sizeof(regions[0])))
 

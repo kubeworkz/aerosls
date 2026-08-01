@@ -11,10 +11,11 @@
 #define IPC_PORT_TIERMGR  0x1004   // StorageTierMgr
 #define IPC_PORT_LOGMGR   0x1005   // RecoveryLogVerifier
 #define IPC_PORT_AGENTMGR 0x1006   // AgentRuntimeMgr
+#define IPC_PORT_CKPTMGR  0x1007   // CheckpointMgr
 
 #define IPC_PORT_FIRST    0x1001
-#define IPC_PORT_LAST     0x1006
-#define IPC_NUM_QUEUES    6
+#define IPC_PORT_LAST     0x1007
+#define IPC_NUM_QUEUES    7
 
 // ─── Opcodes per Service ──────────────────────────────────────────────────────
 // VirtualMemoryMgr
@@ -47,6 +48,13 @@
 #define AGENT_OP_STEP        0x0602   // run one ReAct step (blocks until done)
 #define AGENT_OP_COMPLETE    0x0603   // agent finished — log and record result
 #define AGENT_OP_KILL        0x0604   // stop and remove an agent
+
+// CheckpointMgr
+#define CKPT_OP_TRIGGER      0x0701   // trigger a full system checkpoint
+#define CKPT_OP_STATUS       0x0702   // query last checkpoint seq/time
+#define CKPT_OP_LIST         0x0703   // enumerate available checkpoints
+#define CKPT_OP_RESTORE      0x0704   // restore from a given sequence (Step 5)
+#define CKPT_OP_TREE         0x0705   // dump the current state tree
 
 // ─── Message Struct ───────────────────────────────────────────────────────────
 // No-copy design: payload carries pointers / object IDs, not raw data bytes.

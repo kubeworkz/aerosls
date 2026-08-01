@@ -27,6 +27,7 @@
 #include "tenant.h"
 #include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]
 #include "workload.h"            // Orchestration Plan Phase 5 -- workloads[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
+#include "checkpoint_delta.h"    // Step 4: incremental dirty tracking
 #include "../drivers/nvme_io.h"
 
 // ─── 4 KiB DMA staging buffer (page-aligned for NVMe PRP) ────────────────────
@@ -694,6 +695,7 @@ void persist_defer_end(void) {
 // ─── persist_catalog ─────────────────────────────────────────────────────────
 // Writes object_catalog[] and role_table[].  Called after valloc/vfree/role_set.
 void persist_catalog(void) {
+    ckpt_mark_dirty(CKPT_REGION_CATALOG);
     if (persist_defer_note(PERSIST_PEND_CAT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t cat_bytes  = (uint32_t)sizeof(object_catalog);
@@ -720,6 +722,7 @@ void persist_catalog(void) {
 // accurate reference and always was; only this comment disagreed with it.
 // See docs/AeroSLS-Persist-Write-Amplification-Scoping-v0.1.md.
 void persist_records(void) {
+    ckpt_mark_dirty(CKPT_REGION_RECORDS);
     if (persist_defer_note(PERSIST_PEND_REC)) return;
     if (!io_sq || !io_cq) return;
     uint32_t rec_bytes = (uint32_t)sizeof(object_records);
@@ -735,6 +738,7 @@ void persist_records(void) {
 
 // ─── persist_schemas ─────────────────────────────────────────────────────────
 void persist_schemas(void) {
+    ckpt_mark_dirty(CKPT_REGION_SCHEMAS);
     if (persist_defer_note(PERSIST_PEND_SCH)) return;
     if (!io_sq || !io_cq) return;
     uint32_t sch_bytes = (uint32_t)sizeof(object_schemas);
@@ -749,6 +753,7 @@ void persist_schemas(void) {
 // Called after the final upload chunk (is_last=1) so only complete binaries
 // are snapshotted.
 void persist_programs(void) {
+    ckpt_mark_dirty(CKPT_REGION_PROGRAMS);
     if (persist_defer_note(PERSIST_PEND_PROG)) return;
     if (!io_sq || !io_cq) return;
     uint32_t prog_bytes = (uint32_t)sizeof(service_binaries);
@@ -779,6 +784,7 @@ void persist_programs(void) {
 // row at all after a reboot -- a real, silent regression for the one
 // property this whole roadmap exists to make durable.
 void persist_partitions(void) {
+    ckpt_mark_dirty(CKPT_REGION_PARTITIONS);
     if (persist_defer_note(PERSIST_PEND_PART)) return;
     if (!io_sq || !io_cq) return;
     uint32_t part_bytes   = (uint32_t)sizeof(partition_table);
@@ -806,6 +812,7 @@ void persist_partitions(void) {
 // (previously always 0) so a restore can tell this snapshot includes it —
 // see persist.h's LBA layout comment for the full reasoning.
 void persist_rowstore_headers(void) {
+    ckpt_mark_dirty(CKPT_REGION_ROWSTORE);
     if (persist_defer_note(PERSIST_PEND_ROWSTORE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(table_headers);
@@ -825,6 +832,7 @@ void persist_rowstore_headers(void) {
 // persist.h's own comment). Called after every successful row_constraint_
 // add_unique/_not_null/_range/_reference().
 void persist_row_constraints(void) {
+    ckpt_mark_dirty(CKPT_REGION_ROW_CONSTR);
     if (persist_defer_note(PERSIST_PEND_ROWCONSTRAINT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(row_constraints);
@@ -843,6 +851,7 @@ void persist_row_constraints(void) {
 // never persisted at all -- see PERSIST_ROW_INDEX_HDR_LBA's own comment in
 // persist.h). Called after every successful row_index_create().
 void persist_row_index_defs(void) {
+    ckpt_mark_dirty(CKPT_REGION_ROW_INDEX);
     if (persist_defer_note(PERSIST_PEND_ROWINDEX)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(row_indexes);
@@ -861,6 +870,7 @@ void persist_row_index_defs(void) {
 // and stashes the same format-version marker in the header's v2 slot --
 // mirrors persist_rowstore_headers()'s own Phase 3 addition exactly.
 void persist_vecstore_headers(void) {
+    ckpt_mark_dirty(CKPT_REGION_VECSTORE);
     if (persist_defer_note(PERSIST_PEND_VECSTORE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t hdr_bytes = (uint32_t)sizeof(vector_collections);
@@ -878,6 +888,7 @@ void persist_vecstore_headers(void) {
 // row_index_create() above, mirrored here for vec_index_create(). Called
 // after every successful vec_index_create().
 void persist_vec_index_defs(void) {
+    ckpt_mark_dirty(CKPT_REGION_VEC_INDEX);
     if (persist_defer_note(PERSIST_PEND_VECINDEX)) return;
     if (!io_sq || !io_cq) return;
     uint32_t bytes = (uint32_t)sizeof(vec_indexes);
@@ -894,6 +905,7 @@ void persist_vec_index_defs(void) {
 // row_journal_notify_insert/update/delete() and row_journal_commit_tx()/
 // _rollback_tx().
 void persist_row_journal(void) {
+    ckpt_mark_dirty(CKPT_REGION_ROW_JOURNAL);
     if (persist_defer_note(PERSIST_PEND_ROWJOURNAL)) return;
     if (!io_sq || !io_cq) return;
     uint32_t buf_bytes    = (uint32_t)sizeof(row_journal_buffer);
@@ -919,6 +931,7 @@ void persist_row_journal(void) {
 // reattachment failure the Namespace roadmap's §1.2 never-reuse design
 // exists to prevent, previously defeated by this exact persistence hole.
 void persist_databases(void) {
+    ckpt_mark_dirty(CKPT_REGION_DATABASES);
     if (persist_defer_note(PERSIST_PEND_DATABASE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t db_bytes    = (uint32_t)sizeof(databases);
@@ -936,6 +949,7 @@ void persist_databases(void) {
 // databases[]'s database_next_id, no rebuild-on-boot step like row_index/
 // vec_index) -- the header carries just the array's own byte size.
 void persist_views(void) {
+    ckpt_mark_dirty(CKPT_REGION_VIEWS);
     if (persist_defer_note(PERSIST_PEND_VIEW)) return;
     if (!io_sq || !io_cq) return;
     uint32_t view_bytes = (uint32_t)sizeof(views);
@@ -954,6 +968,7 @@ void persist_views(void) {
 // allocator must not re-issue an id a stale persisted tenant_id
 // reference still holds.
 void persist_tenants(void) {
+    ckpt_mark_dirty(CKPT_REGION_TENANTS);
     if (persist_defer_note(PERSIST_PEND_TENANT)) return;
     if (!io_sq || !io_cq) return;
     uint32_t tenant_bytes = (uint32_t)sizeof(tenants);
@@ -971,6 +986,7 @@ void persist_tenants(void) {
 // reference -- the reason persist_tenants()/persist_databases() need that
 // third header field does not arise here.
 void persist_services(void) {
+    ckpt_mark_dirty(CKPT_REGION_SERVICES);
     if (persist_defer_note(PERSIST_PEND_SERVICE)) return;
     if (!io_sq || !io_cq) return;
     uint32_t svc_bytes = (uint32_t)sizeof(services_registry);
@@ -986,6 +1002,7 @@ void persist_services(void) {
 // "actions=17" after a reboot learns something true about the declaration's
 // history. They are not desired state and nothing reconciles against them.
 void persist_workloads(void) {
+    ckpt_mark_dirty(CKPT_REGION_WORKLOADS);
     if (persist_defer_note(PERSIST_PEND_WORKLOAD)) return;
     if (!io_sq || !io_cq) return;
     uint32_t wl_bytes = (uint32_t)sizeof(workloads);

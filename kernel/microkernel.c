@@ -4,6 +4,7 @@
 #include "object_catalog.h"
 #include "transaction.h"
 #include "agent.h"
+#include "checkpoint_mgr.h"
 #include "../kernel/dashboard.h"
 
 extern void tier_mgr_init(void);
@@ -249,11 +250,14 @@ void microkernel_init(void) {
                      0x0000000010005000ULL,  140, log_handler);
     register_service("AgentRuntimeMgr",     106, IPC_PORT_AGENTMGR,
                      0x0000000010006000ULL,    0, agent_handler);
+    register_service("CheckpointMgr",       107, IPC_PORT_CKPTMGR,
+                     0x0000000010007000ULL,   50, checkpoint_mgr_handler);
 
     kernel_serial_print(
         "[MK] Fault Isolation Daemon active. Poll interval: 100ms.\n");
 
     tier_mgr_init();
+    checkpoint_mgr_init();
 }
 
 // ─── microkernel_service_poll ─────────────────────────────────────────────────

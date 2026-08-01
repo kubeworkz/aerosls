@@ -58,6 +58,7 @@ extern uint64_t dspp_tx_oversize_dropped;   /* net/dspp.c */
 #include "../kernel/usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- GET /api/usage
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
+#include "../kernel/checkpoint_mgr.h" // Core Backup Strategies Step 1 -- POST /api/checkpoint
 #include "../kernel/secure_api.h"     // Shell-Command JSON-Promotion Roadmap -- struct SLSSealRequest
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
@@ -4639,6 +4640,15 @@ static void http_route(int conn, char* req) {
             blen = api_health(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        if (!strcmp(path, "/api/checkpoints")) {
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0);
+            jb_uint(&j, "count",    checkpoint_count());        jb_putc(&j, ',');
+            jb_uint(&j, "last_seq", checkpoint_last_sequence());
+            jb_obj_close(&j);
+            j.buf[j.pos] = '\0';
+            http_respond(conn, 200, "application/json", resp_body, j.pos); return;
+        }
         if (!strcmp(path, "/api/metrics")) {
             blen = api_metrics(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -5527,6 +5537,17 @@ static void http_route(int conn, char* req) {
         if (!strcmp(path, "/api/ipc/post")) {
             blen = api_ipc_post_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/checkpoint")) {
+            int rc = checkpoint_trigger();
+            JSONBuf j = { resp_body, 0, (int)sizeof(resp_body) };
+            jb_obj_open(&j, 0);
+            jb_uint(&j, "status", (uint64_t)rc);              jb_putc(&j, ',');
+            jb_uint(&j, "seq",    checkpoint_last_sequence()); jb_putc(&j, ',');
+            jb_uint(&j, "count",  checkpoint_count());
+            jb_obj_close(&j);
+            j.buf[j.pos] = '\0';
+            http_respond(conn, rc == 0 ? 200 : 503, "application/json", resp_body, j.pos); return;
         }
         // Group 3: journal / tier / object
         if (!strcmp(path, "/api/journal")) {

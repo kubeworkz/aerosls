@@ -629,4 +629,55 @@ void dspp_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
  * every other opcode (page_data is neither present nor read). */
 void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len);
 
+/* ─── Checkpoint transfer (Core Backup Strategies, Step 3) ─────────────────
+ * Transfers a serialized state tree (kernel/state_tree.h) from one node to
+ * another via DSPP. Same chunked protocol shape as context migration:
+ * BEGIN announces the transfer, CHUNKs carry the payload, receiver ACKs
+ * each. Fire-and-forget from the sender's perspective (no retransmit).
+ *
+ * Shares DSPP_MIGRATE_MAGIC, routed by opcode in dspp_rx_dispatch(). */
+enum DSPPCkptOpcode {
+    DSPP_CKPT_BEGIN_REQ  = 11,
+    DSPP_CKPT_BEGIN_ACK  = 12,
+    DSPP_CKPT_CHUNK_REQ  = 13,
+    DSPP_CKPT_CHUNK_ACK  = 14,
+};
+
+#define DSPP_CKPT_CHUNK_BYTES 1024
+
+struct DSPPCkptHeader {
+    /* Prefix: byte-identical to DSPPMigrateHeader's leading fields */
+    uint64_t magic;             /* DSPP_MIGRATE_MAGIC */
+    uint16_t opcode;            /* DSPPCkptOpcode */
+    uint16_t node_source_id;
+    uint32_t node_dest_id;
+    uint64_t transfer_id;
+    uint32_t partition_id;      /* unused for checkpoint; kept for prefix compat */
+    uint32_t chunk_index;
+    uint8_t  status;
+    /* Checkpoint-specific tail */
+    uint64_t sequence;          /* checkpoint sequence number (BEGIN_REQ) */
+    uint32_t total_bytes;       /* total serialized tree size (BEGIN_REQ) */
+    uint32_t total_chunks;      /* ceil(total_bytes / DSPP_CKPT_CHUNK_BYTES) */
+    uint32_t chunk_bytes;       /* live bytes in THIS chunk (CHUNK_REQ) */
+} __attribute__((packed));
+
+struct DSPPCkptChunkPacket {
+    struct DSPPCkptHeader header;
+    uint8_t               chunk_data[DSPP_CKPT_CHUNK_BYTES];
+} __attribute__((packed));
+
+/* Sender: transmit a full serialized state tree to node_dest_id */
+void dspp_ckpt_send(uint64_t transfer_id, uint32_t node_dest_id,
+                    uint64_t sequence, const uint8_t* data, uint32_t data_size);
+
+/* Receiver: called from dspp_rx_dispatch() for DSPP_CKPT_* opcodes */
+void dspp_ckpt_rx(struct DSPPCkptChunkPacket* packet, uint16_t len);
+
+/* Receiver state: query whether a complete checkpoint was received */
+int      dspp_ckpt_recv_ready(void);
+uint32_t dspp_ckpt_recv_size(void);
+void     dspp_ckpt_recv_copy(uint8_t* out, uint32_t max);
+void     dspp_ckpt_recv_reset(void);
+
 #endif /* DSPP_H */
