@@ -16,6 +16,9 @@
 #include "qemu_sls_tcache.h"
 #include "qemu_sls_pgo.h"
 #include "qemu_sls_vm.h"
+/* sls-launcher.h is in the sibling qemu repo, accessed at build time */
+extern int sls_launch_guest(const void *image, uint32_t len,
+                             uint64_t entry_gpa, uint32_t max_insns);
 #include "boot_params.h"   // boot-time cluster identity (node=<n>)
 #include "smp.h"           // AP bring-up + the uniprocessor fallback
 #include "partition.h"

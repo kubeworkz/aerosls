@@ -141,3 +141,112 @@ The closest analog is Apple's Rosetta 2 (DBT + host MMU for memory), but Rosetta
 | M0.4          | ✓          | Guest "Hello" prints via serial (13/13 tests)       |
 | M0.5          | ✓          | TCG+TCI initializes, prologue generated, link clean |
 | M0.6          | ✓          | Full IR generation pipeline: init→alloc→emit→exit   |
+
+### Step 1 — Bridge [sls-runtime.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) to the AeroSLS kernel *(~1 hour) (complete)*
+
+[sls-runtime.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) has a [sls_printf()](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) stub that currently does nothing. It needs to call `kernel_serial_printf` at kernel link time.
+
+**Change:** Add one `extern` declaration to [sls-osdep.h](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) and wire [sls_printf](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) to it in [sls-runtime.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html). The kernel provides the symbol; no header cycle.
+
+```plaintext
+// sls/sls-osdep.h — add at bottom
+extern void kernel_serial_printf(const char *fmt, ...);
+#define sls_printf kernel_serial_printf
+```
+
+Same for `sls_abort` → `kernel panic / halt`. This is a 10-line change.
+
+---
+
+### Step 2 — Add TCG objects to the AeroSLS build *(half day) (Complete)*
+
+The two repos are siblings ([qemu](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) relative to `aerosls2`). The `sls/Makefile` already has the exact source list. The AeroSLS [Makefile](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) needs:
+
+**New variable + include flags in `aerosls2/Makefile`:**
+
+```plaintext
+QEMU_INC = -I ../qemu/sls \
+           -I ../qemu/include \
+           -I ../qemu/tcg \
+           -I ../qemu/tcg/x86_64 \
+           -I ../qemu/target/i386 \
+           -include ../qemu/sls/sls-osdep.h
+
+TCG_C_SRC = \
+    ../qemu/sls/sls-runtime.c \
+    ../qemu/sls/sls-exec.c \
+    ../qemu/sls/sls-tcg-wrappers.c \
+    ../qemu/tcg/tcg.c \
+    ../qemu/tcg/tcg-common.c \
+    ../qemu/tcg/tcg-op.c \
+    ../qemu/tcg/tcg-op-ldst.c \
+    ../qemu/tcg/tcg-op-vec.c \
+    ../qemu/tcg/tcg-op-gvec.c \
+    ../qemu/tcg/optimize.c \
+    ../qemu/tcg/region.c \
+    ../qemu/tcg/tci.c     # interpreter fallback — no x86 frontend needed yet
+```
+
+The `accel/tcg/*.c` files are **not needed** — [sls-exec.c](vscode-file://vscode-app/c:/Users/kubew/AppData/Local/Programs/Microsoft%20VS%20Code/e4c7e7b1d6/resources/app/out/vs/code/electron-browser/workbench/workbench.html) replaces them.
+
+A separate compile rule is needed because TCG sources need `$(QEMU_INC)` added to `$(X86_CFLAGS)`.
+
+---
+
+### Step 3 — Write the launcher *(2–3 days) (Complete)*
+
+A new file `qemu/sls/sls-launcher.c` (and matching header `sls-launcher.h` exposed to the AeroSLS kernel) that wires the Phase 1–4 hooks to the TCG engine:
+
+```plaintext
+/* Called from the AeroSLS shell (user/shell.c) or REST API */
+int sls_launch_guest(const void *image, size_t image_len) {
+
+    // 1. Allocate and map guest RAM via Phase 1
+    qemu_sls_mmu_map_guest_ram(0, QEMU_GUEST_RAM_PAGES);
+
+    // 2. Copy guest image into guest RAM
+    void *guest_base = qemu_sls_dma_host_ptr(0);   // Phase 4 DMA
+    memcpy(guest_base, image, image_len);
+
+    // 3. Initialise TCG context
+    tcg_register_thread();
+    // ... set up CPUState, set RIP = 0 ...
+
+    // 4. Set Phase 1 shadow CR3 and guest CR3
+    qemu_sls_guest_cr3 = 0;  // guest page tables at GPA 0 initially
+    __asm__ volatile("mov %0, %%cr3" :: "r"(qemu_sls_shadow_cr3));
+
+    // 5. Run the TCG loop
+    sls_exec_run(&guest_cpu);
+
+    // 6. Restore kernel CR3 on exit
+    __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3));
+    return 0;
+}
+```
+
+The shell gets a new command: `qemu load <object_name>` that calls `sls_launch_guest`.
+
+---
+
+### Step 4 — Enable the x86 guest frontend *(1–2 weeks) (Complete)*
+
+Currently deferred in `sls/Makefile` as "Layer 3". This is `target/i386/tcg/translate.c` (~15K lines) — the code that decodes x86 guest instructions into TCG IR.
+
+**What this requires:**
+
+- Add `target/i386/tcg/translate.c` + `target/i386/` helper files to `TCG_C_SRC`
+- Provide `CPUX86State` (the x86 architectural register file) — already partially designed as `QemuVMState` in Phase 4
+- Stub the few remaining x86 helpers that call into QEMU's device model (PIC, IOAPIC, etc.) — these can be stubs returning 0 for Phase 4
+
+**Milestone gate:** boot a minimal x86 kernel (e.g., a 512-byte bootsector that prints "HELLO" via port 0xE9) and see it on the AeroSLS serial log.
+
+---
+
+### Step 5 — Shadow PT backend patch (Step 1.3) *(2–3 days)*
+
+Once the x86 frontend works and guests run correctly (via soft-MMU helpers), patch `tcg/x86_64/tcg-target.c.inc` to emit direct memory references instead of `helper_ld*/st*` calls.
+
+The specific change: in the `tcg_out_qemu_ld` / `tcg_out_qemu_st` functions, replace the helper call path with a direct `mov [GVA + bias]` where `bias = QEMU_GPA_HOST_BASE`. The shadow PT (already live) handles the mapping; faults go to the Phase 1 `handle_page_fault` hook.
+
+This delivers the 3–5× speedup the viability analysis promises.

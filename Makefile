@@ -97,6 +97,35 @@ X86_OBJECTS = $(X86_ASM_SRC:.asm=.x86.o) $(X86_C_SRC:.c=.x86.o) arch/x86/trampol
 X86_BIN     = my_sls_kernel.bin
 X86_ISO     = sls_operating_system.iso
 
+# --- QEMU-SLS TCG Integration (Steps 2+) ---
+QEMU_INC  = -I ../qemu/sls/include -I ../qemu/sls -I ../qemu/include \
+            -I ../qemu/tcg -I ../qemu/tcg/x86_64 -I ../qemu/accel/tcg
+QEMU_DEFS = -include ../qemu/sls/sls-osdep.h \
+            -DSLS_IN_KERNEL=1 -UCONFIG_PLUGIN -DCONFIG_TCG
+QEMU_WARN = -Wno-unused-parameter -Wno-unused-function \
+            -Wno-unused-variable -Wno-unused-but-set-variable
+TCG_CFLAGS = -ffreestanding -O2 -mcmodel=small -mno-red-zone \
+             -mno-sse -mno-sse2 -mno-mmx \
+             -fno-pie -fno-pic -fno-tree-vectorize \
+             $(QEMU_INC) $(QEMU_DEFS) $(QEMU_WARN)
+
+TCG_OBJS = \
+    tcg-objs/sls-runtime.x86.o \
+    tcg-objs/sls-launcher.x86.o \
+    tcg-objs/sls-x86-frontend.x86.o \
+    tcg-objs/sls-tcg-wrappers.x86.o \
+    tcg-objs/tcg.x86.o \
+    tcg-objs/tcg-common.x86.o \
+    tcg-objs/tcg-op.x86.o \
+    tcg-objs/tcg-op-ldst.x86.o \
+    tcg-objs/tcg-op-vec.x86.o \
+    tcg-objs/tcg-op-gvec.x86.o \
+    tcg-objs/optimize.x86.o \
+    tcg-objs/region.x86.o \
+    tcg-objs/tci.x86.o
+
+VPATH += ../qemu/sls ../qemu/tcg
+
 # --- RISC-V 64-Bit Toolchain ---
 RV_CC       = riscv64-unknown-elf-gcc
 RV_LD       = riscv64-unknown-elf-ld
@@ -128,6 +157,10 @@ plugins: compiler/SLSAllocationPassV2.cpp
 %.x86.o: %.c
 	$(X86_CC) $(X86_CFLAGS) -c $< -o $@
 
+$(TCG_OBJS): tcg-objs/%.x86.o: %.c
+	@mkdir -p tcg-objs
+	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
+
 arch/x86/trampoline.o: arch/x86/trampoline.asm
 	$(ASN) -f bin $< -o arch/x86/trampoline.bin
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
@@ -135,8 +168,8 @@ arch/x86/trampoline.o: arch/x86/trampoline.asm
 		--redefine-sym _binary_arch_x86_trampoline_bin_end=trampoline_end \
 		arch/x86/trampoline.bin arch/x86/trampoline.o
 
-$(X86_BIN): $(X86_OBJECTS)
-	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) -o $(X86_BIN)
+$(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS)
+	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) -o $(X86_BIN)
 
 x86-iso: $(X86_BIN)
 	mkdir -p isodir/boot/grub
@@ -176,6 +209,7 @@ riscv-run: riscv-elf
 
 clean:
 	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
+	rm -rf tcg-objs
 
 # ── User-space programs ────────────────────────────────────────────────────────
 # Builds all .c files under user/examples/ into flat binaries using libsls.

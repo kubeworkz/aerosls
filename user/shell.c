@@ -1945,9 +1945,32 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         }
 
         // ── Phase C: demo <name> ─────────────────────────────────────────────
+        // ── qemu run <hex> ──────────────────────────────────────────────────────────────────
+        // Loads a hex-encoded flat x86 binary into guest RAM and executes it.
+        // Example: qemu run b0 48 e6 e9 b0 0a e6 e9 f4
+        //   (MOV AL,'H'; OUT 0xe9,AL; MOV AL,LF; OUT 0xe9,AL; HLT)
+        else if (sh_starts(input_buffer, "qemu run ")) {
+            extern int sls_launch_guest(const void *image, uint32_t len,
+                                        uint64_t entry_gpa, uint32_t max_insns);
+            static uint8_t guest_bin[4096];
+            uint32_t guest_len = 0;
+            const char *p = input_buffer + 9;
+            while (p[0] && p[1] && guest_len < sizeof(guest_bin)) {
+                uint8_t hi = (uint8_t)(p[0] >= 'a' ? p[0]-'a'+10 :
+                                       p[0] >= 'A' ? p[0]-'A'+10 : p[0]-'0');
+                uint8_t lo = (uint8_t)(p[1] >= 'a' ? p[1]-'a'+10 :
+                                       p[1] >= 'A' ? p[1]-'A'+10 : p[1]-'0');
+                guest_bin[guest_len++] = (uint8_t)((hi << 4) | lo);
+                p += 2;
+                while (*p == ' ') p++;
+            }
+            int n = sls_launch_guest(guest_bin, guest_len, 0, 100000);
+            kernel_serial_printf("[QEMU] executed %d guest instructions\n", n);
+        }
+
+        // ── demo <name> ──────────────────────────────────────────────────────────────────────────
         else if (sh_starts(input_buffer, "demo ")) {
             const char* name = input_buffer + 5;
-            // Write the built-in demo binary to the store, then spawn
             struct SLSUploadRequest req;
             sh_copy(req.object_name, name, PROC_NAME_LEN);
             req.byte_offset = 0;
