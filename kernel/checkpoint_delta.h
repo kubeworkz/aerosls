@@ -36,7 +36,8 @@
 #define CKPT_REGION_TENANTS       13
 #define CKPT_REGION_SERVICES      14
 #define CKPT_REGION_WORKLOADS     15
-#define CKPT_NUM_REGIONS          16
+#define CKPT_REGION_TCACHE        16
+#define CKPT_NUM_REGIONS          17
 
 // ─── Compaction interval: force a full checkpoint every N incremental ones ────
 #define CKPT_FULL_INTERVAL        8

@@ -12,6 +12,10 @@
 #include "timer.h"
 #include "process.h"
 #include "frame_pool.h"
+#include "qemu_sls_mmu.h"
+#include "qemu_sls_tcache.h"
+#include "qemu_sls_pgo.h"
+#include "qemu_sls_vm.h"
 #include "boot_params.h"   // boot-time cluster identity (node=<n>)
 #include "smp.h"           // AP bring-up + the uniprocessor fallback
 #include "partition.h"
@@ -165,6 +169,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
      * does not have. The bitmap spans a fixed 4 GiB regardless of the
      * real amount installed. */
     frame_pool_limit_ram(top_usable);
+
+    // ── 2c. QEMU-SLS Phase 1: shadow page table subsystem ─────────────────
+    qemu_sls_mmu_init();
 
     // ── 3. Local APIC + timer IRQ ──────────────────────────────────────────
     init_local_apic_registers();
@@ -394,6 +401,11 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
             }
         }
     }
+
+    // ── 7c-ante. QEMU-SLS Phase 2: restore translation cache ─────────────────
+    qemu_sls_tcache_init();
+    qemu_sls_pgo_init();
+    qemu_sls_vm_init();
 
     // ── 7c. Seed default demo-account authority roles ──────────────────────
     // Must run after persist_restore_all() above (step 7b), not from

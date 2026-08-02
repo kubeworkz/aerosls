@@ -13,6 +13,7 @@
 #include "object_catalog.h"
 #include "process.h"
 #include "fault_report.h"
+#include "qemu_sls_mmu.h"
 
 // ─── C-library string functions (freestanding replacements) ──────────────────
 
@@ -71,6 +72,10 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
         process_exit(139);   /* SIGSEGV-equivalent */
         /* process_exit() restores kernel context and does not return here */
     }
+    /* Phase 1: shadow PT miss — walk guest PT, install mapping, retry. */
+    if (qemu_sls_mmu_shadow_fault((uint64_t)faulting_address,
+                                   (uint32_t)error_code) == 0)
+        return;
     kernel_serial_printf(
         "\n[FAULT] Kernel #PF  error=0x%lx  addr=0x%016lx  — Halting.\n",
         error_code, faulting_address);

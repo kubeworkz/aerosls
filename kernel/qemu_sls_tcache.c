@@ -1,0 +1,243 @@
+/*
+ * qemu_sls_tcache.c — Phase 2 persistent translation cache for QEMU-SLS.
+ * See docs/AeroSLS-QEMU-SLS-Viability-Analysis.md §Phase 2.
+ *
+ * The code-gen buffer (codebuf_storage) lives in .bss at a linker-assigned VA
+ * that is identical every boot, so absolute addresses embedded in translated
+ * code remain valid after restore.  Gen counters and the TB descriptor table
+ * are both persisted synchronously, making stale-translation detection correct
+ * across reboots without a boot-epoch counter.
+ */
+
+#include "qemu_sls_tcache.h"
+#include "checkpoint_delta.h"
+#include "kernel_io.h"
+#include "../drivers/nvme_io.h"
+#include <stddef.h>
+#include <stdint.h>
+
+/* ─── static storage ────────────────────────────────────────────────────── */
+
+uint32_t qemu_sls_page_gen[QEMU_TCACHE_GEN_PAGES]
+    __attribute__((aligned(4096)));
+
+static QemuTBDesc tb_table[QEMU_TCACHE_MAX_TBS]
+    __attribute__((aligned(4096)));
+
+static uint8_t codebuf_storage[QEMU_TCACHE_CODEBUF_SIZE]
+    __attribute__((aligned(4096)));
+
+uint8_t  *qemu_sls_codebuf      = codebuf_storage;
+uint32_t  qemu_sls_codebuf_used = 0;
+
+static int initialized;
+
+/* Scratch frame for single-page NVMe header reads/writes. */
+static uint8_t io_scratch[4096] __attribute__((aligned(4096)));
+/* One bit per code-buffer page; set by mark_code_dirty, cleared after adaptive sync. */
+#define CODEBUF_DIRTY_WORDS ((QEMU_TCACHE_CODEBUF_PAGES + 63) / 64)
+static uint64_t codebuf_dirty_map[CODEBUF_DIRTY_WORDS];
+/* ─── internal helpers ──────────────────────────────────────────────────── */
+
+/* Fibonacci multiplicative hash — good distribution for page-aligned PCs. */
+static uint32_t hash_pc(uint64_t pc) {
+    return (uint32_t)((pc * 0x9e3779b97f4a7c15ULL) >> 52)
+           & (QEMU_TCACHE_MAX_TBS - 1);
+}
+
+static void write_gen_page(uint32_t nvme_pg) {
+    nvme_write_sync(QEMU_TCACHE_GEN_DAT_LBA + nvme_pg * NVME_SECTORS_PER_PAGE,
+                    qemu_sls_page_gen + nvme_pg * (NVME_PAGE_SIZE / sizeof(uint32_t)));
+}
+/* ─── qemu_sls_tcache_mark_code_dirty ──────────────────────────────────────── */
+
+void qemu_sls_tcache_mark_code_dirty(uint32_t code_offset, uint32_t len) {
+    if (!len) return;
+    uint32_t first = code_offset / NVME_PAGE_SIZE;
+    uint32_t last  = (code_offset + len - 1) / NVME_PAGE_SIZE;
+    if (last >= QEMU_TCACHE_CODEBUF_PAGES) last = QEMU_TCACHE_CODEBUF_PAGES - 1;
+    for (uint32_t p = first; p <= last; p++)
+        codebuf_dirty_map[p / 64] |= 1ULL << (p % 64);
+}
+/* ─── qemu_sls_tcache_init ──────────────────────────────────────────────── */
+
+int qemu_sls_tcache_init(void) {
+    if (!io_sq || !io_cq) {
+        for (uint32_t i = 0; i < QEMU_TCACHE_GEN_PAGES; i++)
+            qemu_sls_page_gen[i] = 1;
+        initialized = 1;
+        kernel_serial_print("[QEMU-SLS TCACHE] NVMe unavailable — cold start\n");
+        return 0;
+    }
+
+    if (nvme_read_sync(QEMU_TCACHE_HDR_LBA, io_scratch) != 0 ||
+        *(const uint64_t *)io_scratch != QEMU_TCACHE_MAGIC) {
+        for (uint32_t i = 0; i < QEMU_TCACHE_GEN_PAGES; i++)
+            qemu_sls_page_gen[i] = 1;
+        initialized = 1;
+        kernel_serial_print("[QEMU-SLS TCACHE] no snapshot — cold start\n");
+        return 0;
+    }
+
+    uint32_t saved_code_used = *(const uint32_t *)(io_scratch + 12);
+
+    /* Restore gen counters: 64 pages in 2 batches. */
+    nvme_read_pages_sync(QEMU_TCACHE_GEN_DAT_LBA,
+                         qemu_sls_page_gen, 32);
+    nvme_read_pages_sync(QEMU_TCACHE_GEN_DAT_LBA + 32 * NVME_SECTORS_PER_PAGE,
+                         (uint8_t *)qemu_sls_page_gen + 32 * NVME_PAGE_SIZE, 32);
+
+    /* Restore TB table: 32 pages. */
+    nvme_read_pages_sync(QEMU_TCACHE_TB_DAT_LBA,
+                         tb_table, sizeof(tb_table) / NVME_PAGE_SIZE);
+
+    /* Restore code buffer: 1024 pages in 32-page batches. */
+    for (uint32_t b = 0; b < QEMU_TCACHE_CODEBUF_PAGES;
+         b += NVME_MAX_PAGES_PER_XFER) {
+        nvme_read_pages_sync(
+            QEMU_TCACHE_CODE_DAT_LBA + (uint64_t)b * NVME_SECTORS_PER_PAGE,
+            codebuf_storage + (uint64_t)b * NVME_PAGE_SIZE,
+            NVME_MAX_PAGES_PER_XFER);
+    }
+    qemu_sls_codebuf_used = saved_code_used;
+
+    initialized = 1;
+    kernel_serial_printf(
+        "[QEMU-SLS TCACHE] warm start — codebuf_used=%u, codebuf=0x%016lx\n",
+        saved_code_used, (uint64_t)(uintptr_t)codebuf_storage);
+    return 0;
+}
+
+/* ─── qemu_sls_tcache_flush_page ─────────────────────────────────────────── */
+
+void qemu_sls_tcache_flush_page(uint64_t gpa) {
+    uint32_t page = (uint32_t)(gpa / NVME_PAGE_SIZE);
+    if (page >= QEMU_TCACHE_GEN_PAGES) return;
+    qemu_sls_page_gen[page]++;
+    /* Synchronously persist the one NVMe page covering this counter. */
+    if (io_sq && io_cq)
+        write_gen_page(page / (NVME_PAGE_SIZE / sizeof(uint32_t)));
+}
+
+/* ─── qemu_sls_tcache_flush_all ──────────────────────────────────────────── */
+
+void qemu_sls_tcache_flush_all(void) {
+    for (uint32_t i = 0; i < QEMU_TCACHE_GEN_PAGES; i++)
+        qemu_sls_page_gen[i]++;
+    /* Full gen array sync is left to the next qemu_sls_tcache_sync() call. */
+}
+
+/* ─── qemu_sls_tcache_lookup ─────────────────────────────────────────────── */
+
+void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out) {
+    if (!initialized || !guest_pc) return NULL;
+    uint32_t slot = hash_pc(guest_pc);
+    for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
+        QemuTBDesc *d = &tb_table[(slot + i) & (QEMU_TCACHE_MAX_TBS - 1)];
+        if (!d->guest_pc) return NULL;
+        if (d->guest_pc != guest_pc) continue;
+        /* Stale translation: source page was written after this TB was compiled. */
+        if (d->guest_page < QEMU_TCACHE_GEN_PAGES &&
+            qemu_sls_page_gen[d->guest_page] != d->gen_expected)
+            return NULL;
+        d->exec_count++;
+        if (code_len_out) *code_len_out = d->code_len;
+        return codebuf_storage + d->code_offset;
+    }
+    return NULL;
+}
+
+/* ─── qemu_sls_tcache_insert ─────────────────────────────────────────────── */
+
+int qemu_sls_tcache_insert(uint64_t guest_pc, uint32_t code_offset,
+                            uint32_t code_len, uint64_t gpa) {
+    if (!initialized || !guest_pc) return -1;
+    uint32_t guest_page = (uint32_t)(gpa / NVME_PAGE_SIZE);
+    uint32_t gen = (guest_page < QEMU_TCACHE_GEN_PAGES)
+                   ? qemu_sls_page_gen[guest_page] : 0;
+    uint32_t slot = hash_pc(guest_pc);
+    for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
+        QemuTBDesc *d = &tb_table[(slot + i) & (QEMU_TCACHE_MAX_TBS - 1)];
+        if (!d->guest_pc || d->guest_pc == guest_pc) {
+            d->guest_pc     = guest_pc;
+            d->code_offset  = code_offset;
+            d->code_len     = code_len;
+            d->gen_expected = gen;
+            d->exec_count   = 0;
+            d->guest_page   = guest_page;
+            d->_pad         = 0;
+            ckpt_mark_dirty(CKPT_REGION_TCACHE);
+            return 0;
+        }
+    }
+    return -1;  /* table full */
+}
+
+/* ─── qemu_sls_tcache_foreach_hot ──────────────────────────────────────────── */
+
+void qemu_sls_tcache_foreach_hot(uint32_t threshold,
+    void (*cb)(uint64_t guest_pc, uint32_t code_offset,
+               uint32_t code_len, uint32_t exec_count)) {
+    for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
+        QemuTBDesc *d = &tb_table[i];
+        if (d->guest_pc && d->exec_count >= threshold)
+            cb(d->guest_pc, d->code_offset, d->code_len, d->exec_count);
+    }
+}
+
+/* ─── qemu_sls_tcache_update_tb ─────────────────────────────────────────────── */
+
+void qemu_sls_tcache_update_tb(uint64_t guest_pc,
+    uint32_t new_code_offset, uint32_t new_code_len) {
+    if (!guest_pc) return;
+    uint32_t slot = hash_pc(guest_pc);
+    for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
+        QemuTBDesc *d = &tb_table[(slot + i) & (QEMU_TCACHE_MAX_TBS - 1)];
+        if (!d->guest_pc) return;
+        if (d->guest_pc != guest_pc) continue;
+        d->code_offset = new_code_offset;
+        d->code_len    = new_code_len;
+        d->exec_count  = 0;
+        return;
+    }
+}
+
+void qemu_sls_tcache_sync(void) {
+    if (!initialized || !io_sq || !io_cq) return;
+
+    /* Count live TBs for the log line. */
+    uint32_t tb_count = 0;
+    for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++)
+        if (tb_table[i].guest_pc) tb_count++;
+
+    /* Header. */
+    for (uint32_t i = 0; i < 4096; i++) io_scratch[i] = 0;
+    *(uint64_t *)io_scratch        = QEMU_TCACHE_MAGIC;
+    *(uint32_t *)(io_scratch +  8) = tb_count;
+    *(uint32_t *)(io_scratch + 12) = qemu_sls_codebuf_used;
+    nvme_write_sync(QEMU_TCACHE_HDR_LBA, io_scratch);
+
+    /* Gen counters: 64 pages in 2 batches. */
+    nvme_write_pages_sync(QEMU_TCACHE_GEN_DAT_LBA,
+                          qemu_sls_page_gen, 32);
+    nvme_write_pages_sync(QEMU_TCACHE_GEN_DAT_LBA + 32 * NVME_SECTORS_PER_PAGE,
+                          (const uint8_t *)qemu_sls_page_gen + 32 * NVME_PAGE_SIZE,
+                          32);
+
+    /* TB table: 32 pages. */
+    nvme_write_pages_sync(QEMU_TCACHE_TB_DAT_LBA,
+                          tb_table, sizeof(tb_table) / NVME_PAGE_SIZE);
+
+    /* Code buffer: adaptive — only write dirty 4 KiB pages (Phase 4). */
+    for (uint32_t p = 0; p < QEMU_TCACHE_CODEBUF_PAGES; p++) {
+        if (!(codebuf_dirty_map[p / 64] & (1ULL << (p % 64)))) continue;
+        nvme_write_sync(QEMU_TCACHE_CODE_DAT_LBA + (uint64_t)p * NVME_SECTORS_PER_PAGE,
+                        codebuf_storage + (uint64_t)p * NVME_PAGE_SIZE);
+        codebuf_dirty_map[p / 64] &= ~(1ULL << (p % 64));
+    }
+
+    nvme_flush_sync();
+    kernel_serial_printf(
+        "[QEMU-SLS TCACHE] synced: %u TBs, %u code bytes\n",
+        tb_count, qemu_sls_codebuf_used);
+}

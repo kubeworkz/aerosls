@@ -7,6 +7,7 @@
 extern void* allocate_physical_ram_frame(void);
 extern void ap_kernel_main(void);
 extern void flush_daemon_tick(void);
+extern void qemu_sls_pgo_scan_tick(void);
 extern void kernel_sleep_ticks(uint32_t ticks);
 extern void kernel_serial_print(const char* s);
 extern void kernel_serial_printf(const char* fmt, ...);
@@ -99,6 +100,7 @@ void smp_uniprocessor_tick(void) {
 
     flush_daemon_tick();
     microkernel_service_poll();
+    qemu_sls_pgo_scan_tick();
 }
 
 // Executed concurrently by Core 1 and Core 2 when they leave the trampoline
@@ -113,6 +115,7 @@ void ap_kernel_main(void) {
     while (1) {
         flush_daemon_tick();
         microkernel_service_poll();
+        qemu_sls_pgo_scan_tick();
         kernel_sleep_ticks(10);
     }
 }
