@@ -62,22 +62,22 @@ AeroSLS now runs natively on ARM devices like the Raspberry Pi, without dependin
 ## 4. Sample Press Release Opening Paragraph
 
 > **AeroSLS Brings True x86 Virtualisation to Raspberry Pi – No KVM Required**  
-> *New kernel-mode QEMU technology eliminates userspace bottlenecks, delivering a 3–5× speedup for edge computing workloads.*
+> *New kernel-mode QEMU technology eliminates userspace bottlenecks, delivering a 3–5× speedup for edge computing workloads.*  
 > [City, Date] – AeroSLS today announced a breakthrough that enables its lightweight virtualisation platform to run on ARM-based devices like the Raspberry Pi without relying on KVM or nested virtualisation extensions. By embedding a customised QEMU TCG engine directly into the Linux kernel, AeroSLS avoids the overhead of traditional user-mode emulation, achieving performance gains of 3–5× compared to standard QEMU setups. This innovation opens the door to running full x86 Linux environments on low-cost, low-power edge hardware – no special kernel modules or hardware support needed.
 
 ---
 
 ## 5. Social Media Snippets
 
-**Twitter/X:**  
+**Twitter/X:**
 
 “We just made QEMU TCG scream. By moving it to kernel mode, AeroSLS on Raspberry Pi sees a 3–5× speedup - no KVM, no nested virt. x86 on ARM just got serious. 🚀 #AeroSLS #EdgeComputing #RaspberryPi”
 
-**LinkedIn:**  
+**LinkedIn:**
 
 “What if you could run your x86 edge workloads on a Raspberry Pi - without KVM and at 3–5× the speed of vanilla QEMU? We built a custom kernel-mode TCG engine for AeroSLS that does exactly that. No more “sorry, need nested virtualization.” Just install and go. Learn more: [link]”
 
-**Hacker News / Reddit title:**  
+**Hacker News / Reddit title:**
 
 “Show HN: AeroSLS – kernel-mode QEMU TCG gives 3-5x speedup, runs on Pi without KVM”
 
@@ -432,9 +432,7 @@ Now you can build and run complete RAG pipelines, intelligent agents, and infere
 If you prefer a single, scroll‑friendly welcome blurb for a dashboard widget, here’s a concise version:
 
 > **Welcome to AeroSLS**  - your AI‑Native Edge OS.  
-> 
 > Run isolated VMs 3–5× faster on a Pi without KVM. Move live workloads between nodes mid‑instruction. Query an embedded SQL database and vector store directly from your apps. Connect to any OpenAI‑compatible LLM (Ollama, Claude, vLLM…) through the built‑in gateway.  
->   
 > Everything you need to build intelligent, self‑healing edge applications  - all inside one tiny kernel.
 
 ---
@@ -443,7 +441,7 @@ If you prefer a single, scroll‑friendly welcome blurb for a dashboard widget, 
 
 # Introducing AeroSLS: The AI-Native Edge OS That Thinks for Itself
 
-**What if your edge device came with a hypervisor, a database, a vector store, and an LLM already built in?**  
+**What if your edge device came with a hypervisor, a database, a vector store, and an LLM already built in?**
 
 We thought so, too. So we built it. Meet **AeroSLS** – the tiny, mighty operating system that turns a cluster of Raspberry Pis into a self-contained AI powerhouse.
 
@@ -468,3 +466,67 @@ AeroSLS comes with a built‑in LLM gateway that speaks OpenAI‑compatible API.
 We set out to build something that feels like the future of edge computing: **small, fast, secure, and ridiculously capable.** AeroSLS collapses compute, data, and AI into a single cohesive kernel that you can run on a handful of $35 boards. It’s the edge OS we always wished existed. Now it does.
 
 **Ready to give your edge a brain?** [Get started with AeroSLS today →](https://aerosls.kubeworkz.io/)
+
+---
+
+## Technical Findings for Marketing Purposes
+
+**What shadow page tables are, in plain terms.** When you emulate a computer, the fake computer has its own idea of memory addresses, and every time the emulated program touches memory you have to convert that to a real address. QEMU normally does this in software: a little lookup routine runs on *every single memory access*. Shadow page tables skip that by programming the real CPU's address-translation hardware to do the conversion instead - the same silicon your processor already uses for every program on your machine. The lookup stops being work and becomes free.
+
+**Why QEMU can't just do this.** QEMU is an ordinary application. It doesn't control the machine's page tables; the operating system does. **AeroSLS is the operating system.** That's the whole structural argument, and it's genuinely true and genuinely unusual:
+
+> An operating system can do something to an emulator that a normal program cannot.
+
+**Is it good?** The technique is proven - it's how qemu-user, FEX-Emu, Box64 and Apple's Rosetta 2 all work. Nobody has done it for *full-system* emulation, which is the part AeroSLS is building. So: the idea is established, our implementation of it is not yet measured.
+
+**Is it measurable?** Yes, and that's the real progress today. With the software MMU, each emulated memory access costs **86 bytes of machine code** - measured, and identical across nine runs, five boots and three builds. That's the "before" number. The "after" number is one flag away and not yet taken.
+
+**So today you can honestly say:**
+
+> AeroSLS eliminates QEMU's software memory-management layer by using the host CPU's own address-translation hardware — something a userspace emulator structurally cannot do. We've built the instrumentation and established a reproducible baseline.
+
+**What you cannot say yet:** any speed multiplier. Not "3–5×", not "2× faster", nothing with a number attached to performance. We have one side of the comparison.
+
+**And one trap worth knowing.** If a technical reader assumes you mean running Windows or Linux on a normal PC, they'll point out that hardware virtualization already does this better - which is true, and is why the old 3–5× claim didn't survive. The defensible framing is **cross-architecture**: running x86 software on ARM or RISC-V chips, where no hardware shortcut exists or can exist. That's the gap, and it's a real and growing one.
+
+---
+
+## Shadow Pages in the Context of Single Level Storage Architecture
+
+Not purely memory wizardry - but the honest answer has a sharper version than you might expect, and today's numbers make the case.
+
+**Shadow paging by itself is not an SLS idea.** KQEMU did it in 2005 with no single-level store anywhere near it. Taken alone, it's a memory trick that happens to need OS privileges.
+
+**But two things connect it to SLS properly.**
+
+**First, SLS is why AeroSLS could build it at all.** In a conventional OS, paging is plumbing - necessary, boring, buried. In a single-level store, the address space *is* the storage system, so page-table walking, fault handling and frame management aren't plumbing, they're the core competency. `qemu_sls_mmu.c` was written on top of machinery that already existed: `walk_page_tables_x86.c`, `user_paging.c`, `frame_pool.c`. The Viability Analysis called this an "unfair advantage" and that part was right. It's a capability argument, not a performance one.
+
+**Second - and this is the stronger story - our own measurements point at it.** Look at where the time actually goes:
+
+```plaintext
+TRANSLATE  149,357,683 cycles   (85%)
+EXEC        25,816,654 cycles   (15%)
+
+```
+
+**Compiling the guest code costs five to six times more than running it.** Shadow paging attacks the 15%. That's real, but it's the smaller half.
+
+The 85% is *translation* - and a JIT normally throws all of it away at shutdown and recompiles from scratch on every boot. That's the universal tax on emulation, and everyone pays it.
+
+Unless your address space is persistent. Your boot log already shows the beginnings:
+
+```plaintext
+[QEMU-SLS TCACHE] no snapshot — cold start
+[QEMU-SLS VM] no snapshot (cold start)
+
+```
+
+In a single-level store, the translation cache isn't a transient allocation - it's an object. Compiled code survives reboots. **A conventional hypervisor cannot do this without explicitly serializing and reloading; an SLS one gets it structurally.** Same for guest RAM: a VM whose memory is an SLS object is persistent by construction, so checkpoint and restore stop being features and become properties.
+
+##### So the framing suggestion:
+
+> Shadow page tables let AeroSLS remove the software memory layer - a capability that requires being the operating system. Single-level storage goes further: because the address space is persistent, compiled guest code and guest memory survive restarts, eliminating the recompilation cost that dominates every other emulator.
+
+The first sentence is a capability claim, defensible today. The second is the differentiated one - and it targets the 85%, not the 15%.
+
+The honest caveat: the persistent-translation-cache path exists in skeleton (`TCACHE`, `VM` snapshot hooks) but hasn't been measured. It's Phase 2 in the Viability Analysis. Given that we now know translation is 85% of the cost, **that's arguably the more valuable thing to measure next than Step 5** - and unlike shadow paging, nobody else can copy it without rebuilding their OS.
