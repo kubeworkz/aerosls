@@ -54,6 +54,42 @@ if ! (cd ../slsos-sim && git pull); then
     exit 1
 fi
 
+# ─── ../qemu: pulled because the kernel is BUILT from it ───────────────────
+# The Makefile links 15 objects out of ../qemu (tcg/, accel/tcg/ and all of
+# sls/ -- see TCG_OBJS and the VPATH line). This script pulled aerosls2 and
+# slsos-sim and built from three repositories, so every change under
+# qemu/sls/ silently deployed as whatever happened to be on the server's
+# disk.
+#
+# That is not theoretical. In one session it produced four separate runs
+# against a binary nobody intended: a banner still reading "(TCI)" after the
+# string was changed, missing EXEC/TRANSLATE lines that had definitely been
+# added, and finally a partial state where sls-launcher.c's ARENA reporting
+# was present while its ALLOC reporting and the sls-runtime.c counters it
+# calls were both absent. Each one cost a full diagnostic round spent looking
+# for a bug in code that was not running.
+#
+# Not fatal if the repo is missing entirely -- some checkouts build against a
+# vendored copy -- but a pull that FAILS is fatal, because that is the case
+# where a stale tree gets linked while looking like it succeeded.
+if [ -d ../qemu/.git ]; then
+    echo "[deploy] Pulling latest qemu (kernel links 15 objects from it)..."
+    if ! (cd ../qemu && git pull); then
+        echo "[deploy] FAILED: git pull (qemu) failed. Aborting -- the kernel links"
+        echo "         TCG and sls/ objects from ../qemu, so building now would ship"
+        echo "         a mix of new aerosls2 code against a stale QEMU tree."
+        exit 1
+    fi
+elif [ -d ../qemu ]; then
+    echo "[deploy] NOTE: ../qemu exists but is not a git checkout -- not pulled."
+    echo "         Changes under qemu/sls/ must be copied there by hand, and the"
+    echo "         post-build assertion below is the only thing that will notice"
+    echo "         if they were not."
+else
+    echo "[deploy] FAILED: ../qemu not found. The kernel cannot link without it."
+    exit 1
+fi
+
 echo "[deploy] Building frontend (npm ci && npm run build)..."
 if ! (cd ../slsos-sim && npm ci && npm run build); then
     echo "[deploy] FAILED: frontend build failed. Aborting -- kernel NOT restarted, still running the previous build."
@@ -71,6 +107,91 @@ if ! make x86-iso; then
     echo "[deploy] FAILED: make x86-iso failed. Aborting -- kernel NOT restarted, still running the previous build."
     exit 1
 fi
+
+# ─── Post-build assertion: is the image built from the source on disk? ─────
+# `make` succeeding proves the compiler ran. It does not prove the compiler
+# ran over the sources you think are there -- a partial sync, a stale object
+# a dependency rule missed, or a repo that was never pulled all produce a
+# clean build of the wrong program.
+#
+# So this samples literal strings from the qemu/sls sources and requires them
+# to be present in the linked binary. A string is a good probe precisely
+# because it is inert: it cannot be optimised away, it survives with no
+# debug info, and finding it proves that specific text was compiled.
+#
+# Samples the LAST occurrence in each file rather than the first: files are
+# appended to far more often than prepended, so the most recent edit is the
+# most likely to be the one that did not make it across. Checking the first
+# string would have passed happily in the exact case that motivated this.
+echo "[deploy] Verifying the built image matches the sources on disk..."
+if ! command -v strings >/dev/null; then
+    echo "[deploy] FAILED: 'strings' not found (binutils). Cannot verify the build."
+    echo "         Install binutils rather than skipping -- a verification that"
+    echo "         silently does nothing is worse than none, because it is trusted."
+    exit 1
+fi
+
+KERNEL_BIN="my_sls_kernel.bin"
+[ -f "$KERNEL_BIN" ] || { echo "[deploy] FAILED: $KERNEL_BIN missing after a successful make."; exit 1; }
+
+command -v perl >/dev/null || { echo "[deploy] FAILED: perl not found; needed to strip comments before probing."; exit 1; }
+
+probe_missing=0
+probes_run=0
+probes_skipped=0
+for src in ../qemu/sls/sls-launcher.c ../qemu/sls/sls-runtime.c \
+           ../qemu/sls/sls-helper-stubs.c kernel/stubs.c \
+           net/http.c user/shell.c; do
+    [ -f "$src" ] || continue
+
+    # Comments and #directives are stripped FIRST. Both contain quoted text
+    # that never reaches the binary -- an #include path, or a comment quoting
+    # a compiler message. A first attempt at this skipped that step and drew
+    # its probe for kernel_io.c out of a comment (about, of all things, reading
+    # absence as evidence), which would have failed a perfectly good build.
+    #
+    # Then: any complete string literal of 24+ characters containing no printf
+    # conversion and no escape. Those three constraints matter -- a conversion
+    # or an escape means the bytes in the binary differ from the bytes in the
+    # source, so grep -F would not match even on a correct build.
+    probe="$(perl -0pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g; s{^\s*#[^\n]*}{}gm' "$src" 2>/dev/null \
+             | grep -ho '"[^"%\\]\{24,\}"' | tail -1 | sed 's/^"//;s/"$//')"
+
+    if [ -z "$probe" ]; then
+        # Reported, not silently passed over. Some files genuinely have no
+        # qualifying literal (kernel/qemu_sls_mmu.c is one), and knowing which
+        # files were NOT checked is part of knowing what this check proved.
+        probes_skipped=$((probes_skipped + 1))
+        echo "[deploy]   skip $src (no probe-able string literal)"
+        continue
+    fi
+
+    probes_run=$((probes_run + 1))
+    if ! strings "$KERNEL_BIN" | grep -qF -- "$probe"; then
+        echo "[deploy] MISMATCH: $src"
+        echo "         a string near the end of that file is NOT in $KERNEL_BIN:"
+        echo "           \"$probe\""
+        probe_missing=$((probe_missing + 1))
+    fi
+done
+
+if [ "$probes_run" -eq 0 ]; then
+    echo "[deploy] FAILED: no probe strings could be extracted from any source, so"
+    echo "         nothing was actually verified ($probes_skipped file(s) skipped)."
+    echo "         Treating that as a failure rather than a pass -- a check that"
+    echo "         examined nothing must not report success."
+    exit 1
+fi
+
+if [ "$probe_missing" -ne 0 ]; then
+    echo "[deploy] FAILED: $probe_missing of $probes_run source file(s) contributed"
+    echo "         no matching string to the built image. The build is NOT from the"
+    echo "         sources on disk -- most likely a partial sync or a stale object."
+    echo "         Aborting: kernel NOT restarted, still running the previous build."
+    echo "         Try 'make clean && make x86-iso', and check that ../qemu is current."
+    exit 1
+fi
+echo "[deploy] OK: $probes_run source file(s) verified present in $KERNEL_BIN ($probes_skipped skipped)."
 
 echo "[deploy] Restarting pm2 process '$PM2_APP_NAME'..."
 if ! pm2 restart "$PM2_APP_NAME"; then
