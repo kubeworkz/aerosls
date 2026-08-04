@@ -65,18 +65,54 @@ int qemu_sls_mmu_map_guest_ram(uint64_t gpa_start, uint32_t size_pages) {
 
     uint64_t hva_base = QEMU_GPA_HOST_BASE + gpa_start;
 
+    /* Refuse a range that overlaps one already backed. Silently re-mapping
+     * would orphan the previous frames -- they would stay marked allocated in
+     * the frame pool with nothing left pointing at them, and the guest's old
+     * contents would vanish under it. */
+    for (uint32_t i = 0; i < size_pages; i++) {
+        if (guest_ram_frames[first_idx + i]) {
+            kernel_serial_printf(
+                "[QEMU-SLS MMU] map_guest_ram REFUSED: GPA 0x%016lx is already backed "
+                "by frame 0x%016lx. Re-mapping it would orphan that frame and lose "
+                "whatever the guest had there.\n",
+                gpa_start + (uint64_t)i * FRAME_SIZE,
+                guest_ram_frames[first_idx + i]);
+            return -1;
+        }
+    }
+
+    /* ─── Allocate everything BEFORE mapping anything ──────────────────────
+     * The original ordering allocated-and-mapped in one pass and returned -1
+     * on OOM partway through. That left the frames it had already taken both
+     * allocated and installed in the shadow PT, recorded in
+     * guest_ram_frames[], and yet registered in NO region -- so
+     * qemu_sls_dma_host_ptr() returned NULL for pages that were mapped and
+     * live, the frames were unreclaimable, and the caller saw a clean failure.
+     *
+     * Two passes make the failure atomic. Nothing is mapped until every frame
+     * is in hand, and a short allocation unwinds completely. */
     for (uint32_t i = 0; i < size_pages; i++) {
         void *frame = allocate_physical_ram_frame();
         if (!frame) {
             kernel_serial_printf(
-                "[QEMU-SLS MMU] map_guest_ram: OOM at page %u/%u\n", i, size_pages);
+                "[QEMU-SLS MMU] map_guest_ram: OOM at page %u/%u -- rolling back "
+                "%u frame(s); nothing mapped, nothing registered.\n",
+                i, size_pages, i);
+            while (i-- > 0) {
+                free_physical_ram_frame(
+                    (void *)(uintptr_t)guest_ram_frames[first_idx + i]);
+                guest_ram_frames[first_idx + i] = 0;
+            }
             return -1;
         }
         guest_ram_frames[first_idx + i] = (uint64_t)(uintptr_t)frame;
-        /* Step 1.1: direct GPA access path — QEMU_GPA_HOST_BASE + GPA → frame. */
+    }
+
+    /* Step 1.1: direct GPA access path — QEMU_GPA_HOST_BASE + GPA → frame. */
+    for (uint32_t i = 0; i < size_pages; i++) {
         user_map_page(shadow_pml4,
                       hva_base + (uint64_t)i * FRAME_SIZE,
-                      (uint64_t)(uintptr_t)frame,
+                      guest_ram_frames[first_idx + i],
                       USER_PTE_PRESENT | USER_PTE_WRITE);
     }
 

@@ -250,3 +250,53 @@ Once the x86 frontend works and guests run correctly (via soft-MMU helpers), pat
 The specific change: in the `tcg_out_qemu_ld` / `tcg_out_qemu_st` functions, replace the helper call path with a direct `mov [GVA + bias]` where `bias = QEMU_GPA_HOST_BASE`. The shadow PT (already live) handles the mapping; faults go to the Phase 1 `handle_page_fault` hook.
 
 This delivers the 3–5× speedup the viability analysis promises.
+
+---
+
+### Step 5 — findings before the patch
+
+**The addressing question is already answered, and not the way it first looked.**
+`shadow_install()` maps the **guest virtual address** directly into the shadow
+PML4. `QEMU_GPA_HOST_BASE` is how the *emulator* reaches guest memory — reading
+guest page tables, DMA, image load — not how translated code addresses it. So
+`guest_base` is **0**, no base register is needed, and emitted loads/stores are a
+bare `mov (%gva)`. An earlier reading of this had R12 pinned to the window; that
+would have been wrong.
+
+**Scope, measured rather than estimated.** 18 `tcg_use_softmmu` references
+tree-wide, 6 in files this build compiles: 4 in `tcg/x86_64/tcg-target.c.inc`, 2
+in `tcg/tcg-op-ldst.c`. One of the four is the ld/st clobber set —
+`tcg_use_softmmu ? (1 << TCG_REG_L0) | (1 << TCG_REG_L1) : 0` — so turning
+softmmu off frees exactly the two registers the TLB path was using.
+
+The edits: `tcg_use_softmmu` false under `SLS_IN_KERNEL` in `tcg-internal.h`;
+let the `x86_guest_base` block at `tcg-target.c.inc:1878/1907` compile for
+`SLS_IN_KERNEL` as well as `CONFIG_USER_ONLY`; audit the 6 live references.
+`setup_guest_base_seg()` already no-ops to 0 via the `#ifndef` at 1909.
+
+**Gotcha:** `sls-launcher.c:346` has a local `void *guest_base` from
+`qemu_sls_dma_host_ptr(0)` — same name as the global the prologue reads, entirely
+different meaning. Rename before the global exists.
+
+### Phase 1 was load-bearing and untested; three bugs
+
+All four `kernel/qemu_sls_*.c` files had zero host tests.
+`qemu_sls_mmu_shadow_fault()` is wired into `handle_page_fault()` but today only
+runs after the soft-MMU has already failed. Step 5 makes it the only thing
+between translated code and memory.
+
+| Bug | Consequence |
+| --- | --- |
+| No "is a guest running" guard | The shadow table maps GVAs, so no address range separates a guest access from a kernel bug. Any kernel #PF got walked against the guest's tables; a hit installed a PTE in a table that is not the live CR3 and returned "handled", so `iretq` re-executed forever — an unkillable spin instead of a `[FAULT]` line. Fixed with `qemu_sls_guest_active`, set in the launcher after the CR3 switch and cleared before the restore. |
+| No `invlpg` after installing a PTE | Harmless on a not-present fault (x86 does not cache non-present translations) but fatal on a **permission** fault: the stale read-only entry survives, the write faults again, same PTE installed forever. Any copy-on-write guest hits it. |
+| `map_guest_ram()` OOM left partial state | Frames allocated, mapped, recorded in `guest_ram_frames[]`, and registered in no region — so `dma_host_ptr()` returned NULL for pages that were live and unreclaimable, while the caller saw a clean `-1`. Now allocates everything before mapping anything, and unwinds completely. An overlapping range is refused rather than silently re-mapped over live frames. |
+
+Testing it required two extractions, both improvements independent of the test:
+`mov %%cr3` is privileged, so the whole layer segfaulted before its first
+assertion — now `arch_read_cr3()`, non-inline so the seam exists. Same for
+`qemu_sls_invlpg()`. `QEMU_GPA_HOST_BASE` is `#ifndef`-wrapped so a host test can
+relocate the window, with the production value asserted separately where
+relocating it cannot hide it — which is how the header's "2 TiB" was caught: the
+constant is 2^45, **32 TiB**.
+
+`tests/qemu_sls_mmu_host_test.c`, 54 checks, 13/13 mutations.

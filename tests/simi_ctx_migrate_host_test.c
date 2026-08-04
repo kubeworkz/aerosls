@@ -38,7 +38,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net -I tools/simi \
  *       -o /tmp/simi_ctx_migrate_host_test \
- *       tests/simi_ctx_migrate_host_test.c net/dspp.c kernel/simi_ctx_migrate.c \
+ *       tests/simi_ctx_migrate_host_test.c net/dspp.c kernel/simi_ctx_migrate.c net/dspp_checkpoint.c \
  *       kernel/simi_ckpt.c kernel/simi_interp.c tools/simi/simi_obj.c
  *   /tmp/simi_ctx_migrate_host_test
  */

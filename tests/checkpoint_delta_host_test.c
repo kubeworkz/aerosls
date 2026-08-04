@@ -109,12 +109,24 @@ static void test_flow(void) {
     CHECK(incr_mask == ((1u << CKPT_REGION_CATALOG) | (1u << CKPT_REGION_RECORDS)),
           "incremental: only 2 regions dirty");
 
-    /* Only those 2 regions would be persisted — 14 skipped */
+    /* Only those 2 regions would be persisted; everything else is skipped.
+     *
+     * Derived from CKPT_NUM_REGIONS rather than hardcoded. This assertion read
+     * `skipped == 14` with the message "out of 16" -- correct when it was
+     * written and wrong the moment a 17th region was added, which is what it
+     * was failing on. The substance of the scenario is "an incremental
+     * checkpoint touches only the dirty regions", and that is true at any
+     * dimension; pinning the dimension only made the test break when the thing
+     * it does not test changed. */
     int skipped = 0;
     for (int i = 0; i < CKPT_NUM_REGIONS; i++) {
         if (!(incr_mask & (1u << i))) skipped++;
     }
-    CHECK(skipped == 14, "14 out of 16 regions skipped");
+    char skip_msg[96];
+    snprintf(skip_msg, sizeof skip_msg,
+             "%d of %d regions skipped -- everything not dirtied",
+             CKPT_NUM_REGIONS - 2, CKPT_NUM_REGIONS);
+    CHECK(skipped == CKPT_NUM_REGIONS - 2, skip_msg);
 
     ckpt_clear_all();
     CHECK(ckpt_incremental_count() == 1, "incremental counter advanced to 1");

@@ -42,6 +42,15 @@
 #include <stdio.h>
 #include <stdint.h>
 
+/* smp.c's AP tick calls into the QEMU-SLS PGO scanner. Stubbed rather than
+ * linked: kernel/qemu_sls_pgo.c pulls in kernel/qemu_sls_tcache.c and onward,
+ * and this file is about what the tick loop does with ONE cpu, not about
+ * profile-guided optimisation. The stub counts calls so "the AP tick ran" stays
+ * observable -- a stub that silently did nothing would let a tick loop that
+ * never fires look identical to one that does. */
+static int g_pgo_scan_ticks = 0;
+void qemu_sls_pgo_scan_tick(void) { g_pgo_scan_ticks++; }
+
 static int checks_passed = 0;
 static int checks_failed = 0;
 #define CHECK(cond, msg) do { \

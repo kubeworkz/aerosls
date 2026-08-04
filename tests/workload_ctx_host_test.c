@@ -32,7 +32,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net -I tools/simi \
  *       -o /tmp/workload_ctx_host_test \
- *       tests/workload_ctx_host_test.c kernel/workload.c kernel/workload_ctx.c \
+ *       tests/workload_ctx_host_test.c kernel/workload.c kernel/workload_ctx.c net/dspp_checkpoint.c \
  *       kernel/simi_ctx_migrate.c kernel/simi_ckpt.c kernel/simi_interp.c \
  *       kernel/service_registry.c kernel/partition.c net/dspp.c
  *   /tmp/workload_ctx_host_test

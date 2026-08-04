@@ -24,7 +24,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/rowstore_host_test \
- *       tests/rowstore_host_test.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/view.c
+ *       tests/rowstore_host_test.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/checkpoint_delta.c kernel/view.c
  *   /tmp/rowstore_host_test
  */
 #include "kernel/object_catalog.h"

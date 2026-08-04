@@ -102,9 +102,27 @@ static uint8_t *g_guest_ram;
 static uint8_t *g_frame_pool;
 static int      g_frames_used = 0;
 
+static int g_frames_freed = 0;
+
 void *allocate_physical_ram_frame(void) {
     if (g_frames_used >= POOL_FRAMES) return NULL;
     return g_frame_pool + (size_t)(g_frames_used++) * FRAME_SIZE;
+}
+
+/* Counted, not just accepted. "map_guest_ram returned -1" is true whether it
+ * rolled back or leaked, so the return code cannot distinguish them -- only
+ * the frames coming back can. */
+int free_physical_ram_frame(void *frame) {
+    if (frame < (void *)g_frame_pool ||
+        frame >= (void *)(g_frame_pool + (size_t)POOL_FRAMES * FRAME_SIZE))
+        return -1;                      /* not ours: a wild free would land here */
+    g_frames_freed++;
+    /* Rollback frees in reverse order, which a bump allocator can honour
+     * exactly -- so the pool really does recover and "can we map again after a
+     * failed attempt" becomes a question this test can ask. */
+    if (frame == g_frame_pool + (size_t)(g_frames_used - 1) * FRAME_SIZE)
+        g_frames_used--;
+    return 0;
 }
 
 /* Recording user_map_page(): the shadow PTEs actually installed. */
@@ -211,6 +229,9 @@ int main(void) {
           "...present and writable");
     CHECK(g_maps[0].pa != g_maps[1].pa,
           "...and distinct frames, so the pool is really being consumed");
+    /* Captured now, because g_map_count is reset by later scenarios and
+     * g_maps[0] then refers to something else entirely. */
+    const uint64_t gpa0_frame = g_maps[0].pa;
 
     printf("\n-- region lookup --\n");
     CHECK(qemu_sls_mmu_find_region(QEMU_GPA_HOST_BASE) != NULL,
@@ -345,6 +366,50 @@ int main(void) {
         CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 1 && g_map_count == 0,
               "*** a 1 GiB guest page over guest RAM that was never allocated is "
               "refused, not mapped to frame 0 ***");
+    }
+
+    printf("\n-- a short allocation unwinds completely --\n");
+    {
+        /* The pool has POOL_FRAMES; ask for more than remain. The old code
+         * allocated-and-mapped in one pass and returned -1 partway through,
+         * leaving frames allocated, mapped into the shadow PT, recorded in
+         * guest_ram_frames[] -- and registered in no region. dma_host_ptr()
+         * then returned NULL for pages that were live and unreclaimable. */
+        uint32_t remaining = POOL_FRAMES - g_frames_used;
+        uint32_t ask = remaining + 4;
+        uint64_t oom_gpa = 0x100000;            /* 1 MiB, untouched so far */
+
+        int maps_before   = g_map_count;
+        int frames_before = g_frames_used;
+        g_frames_freed = 0;
+
+        CHECK(qemu_sls_mmu_map_guest_ram(oom_gpa, ask) == -1,
+              "asking for more frames than the pool holds fails");
+        CHECK(g_map_count == maps_before,
+              "*** ...having mapped NOTHING -- allocation completes before any PTE "
+              "is installed, so a partial range never reaches the shadow table ***");
+        CHECK(g_frames_freed == (int)remaining,
+              "*** ...and every one of the frames it managed to take was handed "
+              "back: -1 is returned whether it rolled back or leaked, so only the "
+              "count distinguishes them ***");
+        CHECK(g_frames_used == frames_before,
+              "*** ...so the pool is exactly as full as before the attempt ***");
+        CHECK(qemu_sls_dma_frame_phys(oom_gpa) == 0,
+              "*** guest_ram_frames[] is clean, so a later mapping of the same GPA "
+              "is not refused as already-backed ***");
+        CHECK(qemu_sls_mmu_find_region(QEMU_GPA_HOST_BASE + oom_gpa) == NULL,
+              "...and no region was registered");
+    }
+
+    printf("\n-- overlapping a live region is refused, not silently re-mapped --\n");
+    {
+        int maps_before = g_map_count;
+        CHECK(qemu_sls_mmu_map_guest_ram(0, 1) == -1,
+              "*** re-mapping a GPA that is already backed is REFUSED -- doing it "
+              "would orphan the old frame with nothing pointing at it ***");
+        CHECK(g_map_count == maps_before, "...and installs nothing");
+        CHECK(qemu_sls_dma_frame_phys(0) == gpa0_frame,
+              "...leaving the original mapping intact");
     }
 
     printf("\n-- faults are only resolved while guest code is running --\n");

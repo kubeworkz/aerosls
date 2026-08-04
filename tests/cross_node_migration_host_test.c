@@ -35,7 +35,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net -I user \
  *       -o /tmp/cross_node_migration_host_test \
- *       tests/cross_node_migration_host_test.c kernel/stream.c net/dspp.c
+ *       tests/cross_node_migration_host_test.c kernel/stream.c net/dspp.c net/dspp_checkpoint.c
  *   /tmp/cross_node_migration_host_test
  */
 #include "kernel/stream.h"

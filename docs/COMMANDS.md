@@ -693,6 +693,28 @@ Real resource and execution isolation within one kernel — a `partition_id` tag
 | `partition connquotas`                                       | List per-partition connection usage/quota                                                                                |
 | `partition migrate <partition_id> <dest_node_id>`             | Cold-migrate a partition's ownership (and, for stream/blob data, the actual bytes) to another cluster node — pauses, hands off the lease, moves stream data over the real DSPP wire protocol if `cluster init` has been run on this boot (same-disk relocate otherwise), reclaims frames, leaves the partition **paused** on success |
 
+### Checkpointing (Core Backup Strategies)
+
+All four are exact-match commands — `sh_eq`, not prefix — so they take no arguments and a trailing word makes them unrecognised.
+
+| Command | What it does |
+| --- | --- |
+| `checkpoint` | Triggers a checkpoint immediately via `checkpoint_trigger()`. Direct call, not IPC. |
+| `checkpoint status` | Posts `CKPT_OP_STATUS` to `IPC_PORT_CKPTMGR`. Output arrives on the serial console from the manager task, not as a return value. |
+| `checkpoint list` | Posts `CKPT_OP_LIST` — the checkpoints on record. |
+| `checkpoint tree` | Posts `CKPT_OP_TREE` — the checkpoint lineage. |
+
+Because the three `status`/`list`/`tree` forms go through IPC, the shell returns before the manager has answered. Over `aeroslsctl shell` the captured output may therefore be empty even on success; read the node's serial log for the result.
+
+### QEMU-SLS guest execution
+
+| Command | What it does |
+| --- | --- |
+| `qemu run <hex>` | Decodes `<hex>` as a guest binary and runs it through the TCG engine via `sls_launch_guest(bin, len, entry_gpa=0, max_insns=100000)`. |
+
+Three limits worth knowing before using it: the decode buffer is a fixed **4096 bytes**, so anything longer is silently truncated; the hex parser accepts spaces between byte pairs but does **no validation**, so a non-hex character decodes to garbage rather than an error; and execution stops after 100,000 instructions whether or not the guest halted.
+
+
 ### Two rules that are not guessable, and cost real time when missed
 
 **A stream's partition is stamped when the stream is created, and never changes.** `stream_create()` calls `partition_get_for_uid(caller_uid)` once and stores the result. `partition assign` is **not retroactive** — reassigning a uid moves nothing that already exists. So the order is fixed:

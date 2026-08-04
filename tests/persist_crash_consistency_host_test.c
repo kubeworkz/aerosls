@@ -28,7 +28,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/persist_crash_consistency_host_test \
- *       tests/persist_crash_consistency_host_test.c kernel/persist.c kernel/view.c kernel/partition.c
+ *       tests/persist_crash_consistency_host_test.c kernel/persist.c kernel/checkpoint_delta.c kernel/view.c kernel/partition.c
  *   /tmp/persist_crash_consistency_host_test
  */
 #include "kernel/object_catalog.h"
