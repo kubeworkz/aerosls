@@ -332,6 +332,61 @@ unusable.
 
 ---
 
+## 5c. RESULT — Step 5 A/B, softmmu ON vs OFF (2026-08-04)
+
+Five runs each, same binary, same guest, one compile-time flag between them.
+`tcg_use_softmmu` false under `SLS_IN_KERNEL`; `guest_base` =
+`QEMU_GPA_HOST_BASE`, loaded into TCG_REG_R12 by the prologue.
+
+| | softmmu ON | softmmu OFF | ratio |
+|---|---|---|---|
+| **CODE bytes emitted** | **43,293** | **8,003** | **5.41×** |
+| **bytes per guest load** | **86** | **16** | **5.4×** |
+| instructions executed | 502 | 502 | — |
+| variation in CODE | 0 across 9 samples | **0 across 5 samples** | — |
+| EXEC cycles/load (mean) | 51,182 | 6,774 | 7.56× |
+| EXEC CV | 1.9% | 15.3% | — |
+| TRANSLATE (mean) | ~149M | ~14M | ~10× |
+| arena per launch | 10,353,840 | 3,909,296 | 2.6× |
+
+**A guest memory access fell from 86 bytes of host code to 16.** Deterministic,
+zero variance, and the instruction count is unchanged at 502 with no completion
+warning — the guest did the same work, in a fifth of the code.
+
+### Separating the real effect from the measurement artifact
+
+Per §5b, `code_ratio` predicts the EXEC improvement attributable purely to
+there being less code for the *outer* emulator to compile:
+
+```
+code_ratio  = 43,293 / 8,003   = 5.41×      (exact, zero variance)
+exec_ratio  = 51,182 / 6,774   = 7.56×      (±7%, from CV 15.3% over n=5)
+excess      = 7.56 / 5.41      = 1.40×      (range ~1.30-1.50)
+```
+
+**`exec_ratio` exceeds `code_ratio`, and the gap is outside the error bar.**
+So roughly **1.3-1.5× is real work eliminated**, over and above the artifact —
+the software TLB lookup that no longer runs on every access. The remaining
+5.41× is the outer emulator having less to compile, and is not ours to claim.
+
+This is the first result on this hardware that separates a genuine effect from
+the emulation confound, and it only became possible because CODE has never
+varied: an exact denominator makes the artifact subtractable rather than merely
+acknowledged.
+
+### What may be said
+
+**Defensible now:** eliminating QEMU's software MMU reduces the host code for a
+guest memory access by **5.4×** (86 bytes to 16), measured, deterministic,
+reproducible. On this host a further ~1.4× of genuine execution work is
+eliminated beyond what the code-size reduction alone explains.
+
+**Still not claimable:** an end-to-end speed multiplier. §9 stands — this box
+has no KVM, and a timing claim needs KVM or real non-x86 hardware. What is
+claimed above is *work not done*, which is countable.
+
+---
+
 ## 6. Node 2 — the undiagnosed silent halt
 
 **Status: open. Blocking, and would have been blocking under any direction.**
