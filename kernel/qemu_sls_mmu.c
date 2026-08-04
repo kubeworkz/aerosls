@@ -30,6 +30,35 @@ static int              initialized;
 /* Physical frame address for each guest 4 KiB page; 0 = unallocated. */
 static uint64_t guest_ram_frames[QEMU_GUEST_RAM_PAGES];
 
+/* ─── The shadow shares page tables with the kernel ────────────────────────
+ *
+ * qemu_sls_mmu_init() copies all 512 kernel PML4 entries BY VALUE, so every
+ * lower-level table is shared, not cloned. user_map_page() follows a present
+ * entry rather than cloning it (arch/x86/user_paging.c:110, get_or_alloc).
+ *
+ * Therefore installing a mapping at an address the KERNEL also maps does not
+ * shadow the kernel's translation -- it OVERWRITES it, in the kernel's own
+ * live page tables, permanently, whether or not the shadow root is loaded. A
+ * mapping at a low address would remap the kernel image (1..221 MiB) out from
+ * under the CPU currently executing it.
+ *
+ * The window at QEMU_GPA_HOST_BASE occupies a PML4 slot nothing else uses,
+ * which is why sharing is safe there and why map_guest_ram() can publish that
+ * one entry into the kernel root. The constraint has always held; it was
+ * never written down, was load-bearing for one caller and fatal to another.
+ *
+ * See docs/AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md.
+ */
+#define SHADOW_PML4_SLOT(va) (unsigned)(((va) >> 39) & 0x1FF)
+
+/* Guest accesses land in the GUEST window, not the emulator one. The emulator
+ * window is identity and never faults; the guest window is the only range
+ * translated guest code addresses, so it is the only range shadow_fault()
+ * should ever resolve. */
+static int shadow_va_in_window(uint64_t va) {
+    return SHADOW_PML4_SLOT(va) == SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE);
+}
+
 /* ─── qemu_sls_mmu_init ──────────────────────────────────────────────────── */
 
 int qemu_sls_mmu_init(void) {
@@ -109,10 +138,32 @@ int qemu_sls_mmu_map_guest_ram(uint64_t gpa_start, uint32_t size_pages) {
         guest_ram_frames[first_idx + i] = (uint64_t)(uintptr_t)frame;
     }
 
-    /* Step 1.1: direct GPA access path — QEMU_GPA_HOST_BASE + GPA → frame. */
+    /* Step 1.1: EMULATOR window — QEMU_GPA_HOST_BASE + GPA → frame.
+     * Identity, permanent, published into the kernel root below. */
     for (uint32_t i = 0; i < size_pages; i++) {
         user_map_page(shadow_pml4,
                       hva_base + (uint64_t)i * FRAME_SIZE,
+                      guest_ram_frames[first_idx + i],
+                      USER_PTE_PRESENT | USER_PTE_WRITE);
+    }
+
+    /* GUEST window — QEMU_GUEST_WINDOW_BASE + GPA → frame, shadow root only.
+     *
+     * Identity, because the guest starts with paging off and its virtual
+     * addresses are its physical ones. Emitted code addresses memory here
+     * (guest_base), so with paging off every access resolves with no fault at
+     * all -- which is exactly what the current benchmark measures.
+     *
+     * When the guest enables paging these identity entries become wrong, and
+     * qemu_sls_mmu_guest_paging_enable() drops them wholesale so that
+     * shadow_fault() can repopulate the window from the guest's own tables.
+     * Deliberately NOT published to the kernel root: nothing but translated
+     * guest code may address memory this way, and keeping it out of the kernel
+     * root means a stray kernel pointer into this range faults instead of
+     * quietly reading guest memory. */
+    for (uint32_t i = 0; i < size_pages; i++) {
+        user_map_page(shadow_pml4,
+                      QEMU_GUEST_WINDOW_BASE + gpa_start + (uint64_t)i * FRAME_SIZE,
                       guest_ram_frames[first_idx + i],
                       USER_PTE_PRESENT | USER_PTE_WRITE);
     }
@@ -179,6 +230,58 @@ int qemu_sls_mmu_map_guest_ram(uint64_t gpa_start, uint32_t size_pages) {
     return 0;
 }
 
+/* ─── qemu_sls_mmu_guest_paging_enable ──────────────────────────────────── */
+
+int qemu_sls_mmu_guest_paging_enable(void) {
+    if (!initialized) return -1;
+    if (qemu_sls_guest_paging_on) return 0;          /* idempotent */
+
+    if (!qemu_sls_guest_cr3) {
+        kernel_serial_print(
+            "[QEMU-SLS MMU] guest enabled paging with CR3 still 0 -- refusing.\n"
+            "[QEMU-SLS MMU] Every subsequent access would walk a null root and be "
+            "reported unresolved; halting now names the cause instead.\n");
+        return -1;
+    }
+
+    /* ─── Drop the guest window's identity mappings ────────────────────────
+     * They were correct only while guest virtual == guest physical. From here
+     * the guest's own tables decide, and leaving the identity entries in place
+     * would let an access resolve through them instead of faulting -- silently
+     * reading frame(V) where the guest meant frame(P).
+     *
+     * Zeroing the single PML4 entry drops the whole 512 GiB subtree in one
+     * write, so every guest access faults and shadow_fault() repopulates from
+     * the guest's tables on demand. The alternative -- unmapping 65,536 pages
+     * individually -- is the same result for 65,536 times the work.
+     *
+     * The PDPT/PD/PT frames below the entry are LEAKED, not freed. There is no
+     * page-table reclaim path in this kernel yet, and inventing one on the
+     * paging-enable path would be the largest untested thing in the change.
+     * Bounded and one-off: it happens at most once per guest launch, and costs
+     * the ~130 frames the identity window used. Recorded rather than hidden.
+     *
+     * The emulator window is untouched, which is the entire reason it is a
+     * separate slot: shadow_fault() is about to walk the guest's page tables
+     * through it, on the very next fault. */
+    unsigned slot = SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE);
+    shadow_pml4[slot] = 0;
+
+    /* The identity translations are live in the TLB. invlpg-per-page is not
+     * viable for 512 GiB; a CR3 reload flushes every non-global entry. Safe
+     * here because the shadow root is the live CR3 during guest execution,
+     * which is the only time this is called. */
+    qemu_sls_flush_tlb();
+
+    qemu_sls_guest_paging_on = 1;
+    kernel_serial_printf(
+        "[QEMU-SLS MMU] guest paging ENABLED, guest CR3=0x%016lx. Guest window "
+        "identity dropped (PML4 slot %u); accesses now resolve through the "
+        "guest's own tables.\n",
+        qemu_sls_guest_cr3, slot);
+    return 0;
+}
+
 /* ─── qemu_sls_mmu_find_region ──────────────────────────────────────────── */
 
 const QemuGuestRegion *qemu_sls_mmu_find_region(uint64_t hva) {
@@ -199,31 +302,6 @@ static const uint64_t *gpa_to_hva(uint64_t gpa) {
     uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
     if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return NULL;
     return (const uint64_t *)(QEMU_GPA_HOST_BASE + gpa);
-}
-
-/* ─── The shadow shares page tables with the kernel ────────────────────────
- *
- * qemu_sls_mmu_init() copies all 512 kernel PML4 entries BY VALUE, so every
- * lower-level table is shared, not cloned. user_map_page() follows a present
- * entry rather than cloning it (arch/x86/user_paging.c:110, get_or_alloc).
- *
- * Therefore installing a mapping at an address the KERNEL also maps does not
- * shadow the kernel's translation -- it OVERWRITES it, in the kernel's own
- * live page tables, permanently, whether or not the shadow root is loaded. A
- * mapping at a low address would remap the kernel image (1..221 MiB) out from
- * under the CPU currently executing it.
- *
- * The window at QEMU_GPA_HOST_BASE occupies a PML4 slot nothing else uses,
- * which is why sharing is safe there and why map_guest_ram() can publish that
- * one entry into the kernel root. The constraint has always held; it was
- * never written down, was load-bearing for one caller and fatal to another.
- *
- * See docs/AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md.
- */
-#define SHADOW_PML4_SLOT(va) (unsigned)(((va) >> 39) & 0x1FF)
-
-static int shadow_va_in_window(uint64_t va) {
-    return SHADOW_PML4_SLOT(va) == SHADOW_PML4_SLOT(QEMU_GPA_HOST_BASE);
 }
 
 /* Install one shadow PTE: host VA → frame, W-bit propagated from the guest PTE.
@@ -301,7 +379,7 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
      * that range -- but the two together are considerably stronger than either.
      */
     if (!shadow_va_in_window(faulting_addr)) return 1;
-    uint64_t faulting_gva = faulting_addr - QEMU_GPA_HOST_BASE;
+    uint64_t faulting_gva = faulting_addr - QEMU_GUEST_WINDOW_BASE;
 
     /* ─── With paging off there is nothing to walk ─────────────────────────
      * The guest's virtual addresses are its physical ones, so the contiguous

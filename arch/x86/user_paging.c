@@ -124,3 +124,11 @@ uint64_t arch_read_cr3(void) {
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     return cr3;
 }
+
+/* Full non-global TLB flush by CR3 reload. Lives here beside arch_read_cr3()
+ * and for the same reason: privileged, so a host test needs a seam. */
+void qemu_sls_flush_tlb(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+}

@@ -42,6 +42,7 @@
  * constant is asserted on its own further down, so relocating it here cannot
  * hide a wrong value there. */
 uint64_t qemu_sls_test_gpa_base;
+uint64_t qemu_sls_test_guest_window;
 
 #include "kernel/qemu_sls_mmu.h"
 
@@ -53,8 +54,8 @@ uint64_t qemu_sls_test_gpa_base;
 
 /* ─── The address the CPU reports is NOT the guest's ──────────────────────
  * Emitted guest code addresses memory as `guest_va + guest_base`, and
- * guest_base is QEMU_GPA_HOST_BASE (see tcg/tcg.c, and the correction note in
- * kernel/qemu_sls_mmu.h). So CR2 -- and therefore the argument
+ * guest_base is QEMU_GUEST_WINDOW_BASE -- the GUEST window, not the emulator
+ * one (see tcg/tcg.c and kernel/qemu_sls_mmu.h). So CR2 -- and the argument
  * qemu_sls_mmu_shadow_fault() receives from handle_page_fault() -- is the
  * guest address plus the window base.
  *
@@ -67,7 +68,7 @@ uint64_t qemu_sls_test_gpa_base;
  * asserting a constraint rather than documenting it.
  *
  * Installed shadow PTEs are therefore at GUEST_FAULT_ADDR(gva), not gva. */
-#define GUEST_FAULT_ADDR(gva)  ((uint64_t)(gva) + QEMU_GPA_HOST_BASE)
+#define GUEST_FAULT_ADDR(gva)  ((uint64_t)(gva) + QEMU_GUEST_WINDOW_BASE)
 
 static int checks_passed = 0, checks_failed = 0;
 #define CHECK(cond, msg) do { \
@@ -100,6 +101,14 @@ void qemu_sls_invlpg(uint64_t va) {
     if (g_invlpg_count < 64) g_invlpg[g_invlpg_count] = va;
     g_invlpg_count++;
 }
+
+/* Recorded, not swallowed. Dropping the guest window's identity mappings
+ * leaves those translations live in the TLB, so the flush is not incidental --
+ * without it the guest keeps using the identity mapping it was just supposed
+ * to stop using, and reads the right-looking wrong frame. An empty stub would
+ * make that omission invisible. */
+static int g_flush_tlb_count;
+void qemu_sls_flush_tlb(void) { g_flush_tlb_count++; }
 
 /* Guest "physical" memory: the buffer the relocated GPA window points at.
  * 2 MiB is enough for a few page-table levels plus data pages. */
@@ -225,6 +234,9 @@ int main(void) {
     memset(g_frame_pool, 0, (size_t)POOL_FRAMES * FRAME_SIZE);
     setvbuf(stdout, NULL, _IONBF, 0);   /* so a crash does not eat the output */
     qemu_sls_test_gpa_base = (uint64_t)(uintptr_t)g_guest_ram;
+    /* One PML4 slot (512 GiB) above the emulator window. Never dereferenced --
+     * see tests/qemu_sls_test_window.h. */
+    qemu_sls_test_guest_window = qemu_sls_test_gpa_base + 0x8000000000ULL;
 
     printf("=== QEMU-SLS Phase 1: shadow page tables ===\n\n");
 
@@ -252,7 +264,19 @@ int main(void) {
 
     g_map_count = 0;
     CHECK(qemu_sls_mmu_map_guest_ram(0, 4) == 0, "maps 4 pages of guest RAM at GPA 0");
-    CHECK(g_map_count == 4, "*** one shadow PTE per page, no more and no fewer ***");
+    CHECK(g_map_count == 8,
+          "*** TWO shadow PTEs per page: one in the emulator window, one in the "
+          "guest window. Not one, and not three -- the count is the cheapest "
+          "check that both windows were populated and neither twice ***");
+    CHECK(g_maps[0].va == QEMU_GPA_HOST_BASE &&
+          g_maps[4].va == QEMU_GUEST_WINDOW_BASE,
+          "*** ...the first four in the EMULATOR window, the next four in the "
+          "GUEST window, both starting at GPA 0 ***");
+    CHECK(g_maps[0].pa == g_maps[4].pa,
+          "*** ...and the same GPA is backed by the SAME frame through both "
+          "windows. Two views of one page, which is the entire point: the "
+          "emulator and the guest must see identical memory while paging is "
+          "off, and diverge only once the guest's own tables take over ***");
     CHECK(g_maps[0].va == QEMU_GPA_HOST_BASE + 0 &&
           g_maps[3].va == QEMU_GPA_HOST_BASE + 3 * FRAME_SIZE,
           "*** each page lands at GPA_HOST_BASE + gpa, contiguously ***");
@@ -620,6 +644,61 @@ int main(void) {
               "an unrelated failure ***");
 
         qemu_sls_guest_paging_on = 1;   /* restore for the blocks below */
+    }
+
+    printf("\n-- enabling guest paging drops the identity window --\n");
+    {
+        /* The transition that made two windows necessary. While paging is off
+         * the guest window is identity, so guest_va == guest_physical and every
+         * access resolves with no fault. The instant the guest's own tables
+         * take over, those identity entries are wrong -- and worse than absent,
+         * because an access resolves THROUGH them instead of faulting, quietly
+         * reading frame(V) where the guest meant frame(P). */
+        const uint64_t saved_cr3 = qemu_sls_guest_cr3;
+        qemu_sls_guest_paging_on = 0;
+        qemu_sls_guest_cr3 = 0;
+
+        CHECK(qemu_sls_mmu_guest_paging_enable() == -1 &&
+              qemu_sls_guest_paging_on == 0,
+              "*** refused while guest CR3 is still 0 -- every later access "
+              "would walk a null root and report unresolved, naming the symptom "
+              "instead of the cause ***");
+
+        /* Reuses the previous block's guest CR3 rather than building another
+         * table, and that is not laziness. build_guest_pt_4k() hands out guest
+         * tables from a bump pointer, but only GPA indices 16..55 are backed by
+         * map_guest_ram() -- so every extra call pushes the NEXT test's page
+         * tables closer to unbacked memory. An earlier version of this block
+         * did build one, and the invlpg tests below then failed while walking
+         * page tables that gpa_to_hva() could no longer read. The budget is
+         * real, undocumented, and shared. */
+        qemu_sls_guest_cr3 = saved_cr3;
+        unsigned slot = (unsigned)((QEMU_GUEST_WINDOW_BASE >> 39) & 0x1FF);
+        uint64_t *shadow = (uint64_t *)(uintptr_t)g_maps[0].pml4;
+
+        CHECK(shadow[slot] != 0,
+              "control: the guest window's PML4 slot is populated before the "
+              "transition (otherwise the check below proves nothing)");
+
+        g_flush_tlb_count = 0;
+        CHECK(qemu_sls_mmu_guest_paging_enable() == 0 &&
+              qemu_sls_guest_paging_on == 1,
+              "paging enables once CR3 is set");
+        CHECK(shadow[slot] == 0,
+              "*** the guest window's whole subtree is dropped in ONE PML4 "
+              "write -- 512 GiB of stale identity, not 65,536 individual "
+              "unmaps ***");
+        CHECK(g_flush_tlb_count == 1,
+              "*** and the TLB was flushed. The identity translations are live "
+              "in it; without this the guest keeps using the mapping that was "
+              "just revoked and reads a right-looking wrong frame ***");
+        CHECK(g_fake_kernel_pml4[(QEMU_GPA_HOST_BASE >> 39) & 0x1FF] != 0,
+              "*** the EMULATOR window is untouched -- shadow_fault is about to "
+              "walk the guest's page tables through it on the very next fault, "
+              "which is why it had to be a separate slot ***");
+
+        CHECK(qemu_sls_mmu_guest_paging_enable() == 0,
+              "...and the call is idempotent");
     }
 
     printf("\n-- the TLB is invalidated, not just the table written --\n");

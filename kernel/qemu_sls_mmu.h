@@ -107,6 +107,42 @@ extern uint64_t qemu_sls_guest_cr3;
  */
 extern int qemu_sls_guest_paging_on;
 
+/* ─── The GUEST window: where emitted code sees guest memory ───────────────
+ *
+ * Two windows, two purposes. They must be separate PML4 slots, and the reason
+ * is not tidiness -- it is that one linear address cannot have two meanings.
+ *
+ *   QEMU_GPA_HOST_BASE   (32 TiB, slot 64)  EMULATOR window.
+ *       Identity: GPA + base → frame(GPA). Present in BOTH the kernel root
+ *       and the shadow root, and never changes. This is how the emulator
+ *       reads guest page tables, does DMA, and loads images -- including
+ *       from inside shadow_fault(), which runs while the shadow root is
+ *       loaded, so it has to be in both.
+ *
+ *   QEMU_GUEST_WINDOW_BASE (64 TiB, slot 128)  GUEST window.
+ *       guest_base for emitted code: a guest access at V compiles to a host
+ *       access at V + this. Present in the SHADOW root ONLY, because nothing
+ *       but translated guest code should ever address memory this way.
+ *       Identity while the guest has paging off (V == GPA). Once the guest
+ *       enables paging its own tables decide, and shadow_fault() populates
+ *       this window from them.
+ *
+ * With a single shared window, enabling guest paging is unimplementable: guest
+ * code needs V + base to mean frame(P), the emulator needs P + base to mean
+ * frame(P), and with V != P one of them silently reads the wrong frame -- no
+ * fault, no log line. Splitting them costs one PML4 slot and removes the
+ * conflict entirely, with no page-table cloning and no world switch.
+ *
+ * Overridable for host tests, like the emulator window. Note the asymmetry:
+ * the emulator window must point at real, dereferenceable memory because
+ * gpa_to_hva() reads through it. The guest window is never dereferenced by
+ * this file -- it is only ever an address handed to user_map_page() -- so a
+ * test may point it anywhere, as long as it is a different PML4 slot.
+ */
+#ifndef QEMU_GUEST_WINDOW_BASE
+#define QEMU_GUEST_WINDOW_BASE  0x0000400000000000ULL
+#endif
+
 /* ─── Turning paging ON needs a SECOND window. Not yet built. ──────────────
  *
  * With paging off, map_guest_ram() identity-maps (GPA + window) → frame(GPA),
@@ -156,6 +192,22 @@ extern int qemu_sls_guest_active;
  * test can observe the invalidation instead of executing a privileged
  * instruction -- same reason as arch_read_cr3(). */
 void qemu_sls_invlpg(uint64_t va);
+
+/* Full non-global TLB flush (CR3 reload). A function, not inline asm, for the
+ * same reason as invlpg and arch_read_cr3(): a host test must be able to see
+ * that it happened without executing a privileged instruction. */
+void qemu_sls_flush_tlb(void);
+
+/*
+ * Called when the guest sets CR0.PG. Drops the guest window's identity
+ * mappings -- correct only while guest virtual == guest physical -- so that
+ * subsequent accesses fault and resolve through the guest's own page tables.
+ * Requires qemu_sls_guest_cr3 to have been set already.
+ *
+ * Returns 0 on success, -1 if refused (not initialised, or CR3 still 0).
+ * Idempotent.
+ */
+int qemu_sls_mmu_guest_paging_enable(void);
 
 /* One-time boot init: allocates shadow PML4 inheriting all kernel PT entries. */
 int qemu_sls_mmu_init(void);

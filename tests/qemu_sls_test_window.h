@@ -22,4 +22,17 @@
 extern uint64_t qemu_sls_test_gpa_base;
 #define QEMU_GPA_HOST_BASE qemu_sls_test_gpa_base
 
+/* ─── The GUEST window, one PML4 slot above the emulator's ─────────────────
+ * The two windows must be DIFFERENT PML4 slots or shadow_va_in_window() can
+ * no longer tell an emulator access from a guest one -- which is the whole
+ * point of splitting them. +512 GiB is exactly one slot.
+ *
+ * Note the asymmetry, and that it is safe: the emulator window has to point
+ * at real memory because gpa_to_hva() reads through it, but the guest window
+ * is never dereferenced by qemu_sls_mmu.c. It is only ever an address handed
+ * to user_map_page(), which the test stubs. So it can be a synthetic value
+ * far outside anything this process has mapped. */
+extern uint64_t qemu_sls_test_guest_window;
+#define QEMU_GUEST_WINDOW_BASE qemu_sls_test_guest_window
+
 #endif
