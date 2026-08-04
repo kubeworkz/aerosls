@@ -266,12 +266,24 @@ cache behaviour and host pipeline effects this hardware cannot observe. §9's
 requirement stands unchanged: **no timing claim is publishable without KVM or
 real non-x86 hardware.**
 
-### Open
+### Determinism — VERIFIED (2026-08-04)
 
-Determinism is *asserted* above, not yet *verified*. Two consecutive runs must
-produce byte-identical totals (43,293). Until that is checked, the zero-variance
-claim is exactly the kind of reasonable-sounding assumption this document exists
-to distrust.
+Two runs of `qemu bench 500`, **in different boots of different builds**:
+
+| | run A | run B | delta |
+|---|---|---|---|
+| **CODE bytes** | **43,293** | **43,293** | **0** |
+| bytes/load | 86 | 86 | 0 |
+| total cycles | 172,043,042 | 181,143,837 | **+5.3%** |
+| EXEC cycles | 26,350,118 | 29,680,280 | +12.6% |
+
+Byte counts bit-identical across a reboot; cycle counts moved 5–13% on the same
+workload. That is the whole argument for using code size, demonstrated rather
+than asserted, and it is a stronger check than the same-boot repeat originally
+asked for.
+
+**86 bytes/load is the confirmed softmmu=ON baseline.** Step 5 compares against
+it directly.
 
 ---
 
