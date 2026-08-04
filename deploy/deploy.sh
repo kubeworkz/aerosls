@@ -32,10 +32,36 @@ HEALTH_RETRY_DELAY_SECS="${HEALTH_RETRY_DELAY_SECS:-2}"
 
 cd "$(dirname "$0")/.."   # aerosls2 repo root
 
+# ─── This script pulls the repo that contains this script ─────────────────
+# So a change to deploy.sh itself does not take effect until the NEXT run --
+# the current instance was loaded before the pull. Worse, bash reads a script
+# incrementally by byte offset, so a file that changes underneath a running
+# shell can resume at the wrong place in the new text.
+#
+# That is not hypothetical: a fixed deploy.sh was pulled and the run that
+# pulled it still reported the OLD version's error message, which looked
+# exactly like the fix not having been made at all. Diagnosing that cost a
+# round trip, on top of the four already spent on stale binaries.
+#
+# So: hash before, hash after, re-exec if it changed. SELF_REEXEC guards
+# against a loop if something makes the hash unstable.
+_self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+_hash_before=""
+command -v md5sum >/dev/null && _hash_before="$(md5sum "$_self" 2>/dev/null | cut -d' ' -f1)"
+
 echo "[deploy] Pulling latest aerosls2..."
 if ! git pull; then
     echo "[deploy] FAILED: git pull (aerosls2) failed. Aborting -- nothing rebuilt or restarted."
     exit 1
+fi
+
+if [ -z "${SELF_REEXEC:-}" ] && [ -n "$_hash_before" ]; then
+    _hash_after="$(md5sum "$_self" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "$_hash_after" ] && [ "$_hash_after" != "$_hash_before" ]; then
+        echo "[deploy] deploy.sh changed in that pull -- re-executing the new version"
+        echo "         rather than continuing with the copy bash already read."
+        SELF_REEXEC=1 exec bash "$_self" "$@"
+    fi
 fi
 
 # The Makefile's own `bundle` target runs `npm run build --silent
