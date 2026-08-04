@@ -20,6 +20,7 @@
 #include "../kernel/dashboard.h"    /* read_tsc() */
 #include "../drivers/nvme_io.h"
 #include "../net/consensus.h"       /* cluster_local_node_id() */
+#include "qemu_sls_tcache.h"        /* qemu_sls_tcache_sync() */
 
 /* ─── Local helpers ──────────────────────────────────────────────────── */
 static void cm_memcpy(void* d, const void* s, uint32_t n) {
@@ -156,6 +157,29 @@ int checkpoint_trigger(void) {
     if (dirty & (1u << CKPT_REGION_WORKLOADS))   persist_workloads();
 
     persist_defer_end();
+
+    /* ─── QEMU-SLS translation cache ───────────────────────────────────────
+     * Phase 2's whole premise is that compiled guest code is a persistent
+     * object like any other, so it belongs in the system checkpoint rather
+     * than in a mechanism of its own.
+     *
+     * It was NOT in it. qemu_sls_tcache_sync() and qemu_sls_snapshot_save()
+     * existed, were correct as far as anyone could tell, and were called from
+     * nowhere -- so every boot since the cache was written has reported
+     * "no snapshot -- cold start" for the simple reason that a snapshot had
+     * never once been produced. The restore path had nothing to restore, and
+     * looked exactly like a restore path that did not work.
+     *
+     * Deliberately outside the dirty-region mask above: those regions are
+     * tracked by explicit checkpoint_mark_dirty() calls, and the tcache has
+     * none. Syncing unconditionally is a bounded cost (a few MiB of NVMe on an
+     * operation that already writes the whole catalog) and cannot silently
+     * skip a checkpoint because nobody remembered to mark it. Adding a region
+     * bit is the right long-term shape; unconditional is the right first step,
+     * because a cache that is occasionally missed is worse than one that is
+     * always written -- the stale-versus-absent distinction is exactly what
+     * Gate 1's identity stamp exists to police. */
+    qemu_sls_tcache_sync();
 
     /* Build state tree snapshot (Step 2) */
     ckpt_tree_count = state_tree_build(ckpt_tree, ST_MAX_NODES);

@@ -78,8 +78,26 @@ That is the whole reason TRANSLATE is 85% on the fifth identical run of the
 same program in the same boot. Nothing is broken; the hot path simply does not
 ask.
 
-**This is the phase.** Not new machinery — a lookup on the translate path, and
-an insert after it.
+**This is the phase** — but it is not the one-line change that description
+implies, and Gate 0's investigation showed why.
+
+TCG generates code into `sls_code_buffer` (32 MiB, `sls/sls-runtime.c`, handed
+out by `sls_code_alloc()` via the `mmap` stub). The tcache persists
+`qemu_sls_codebuf` (4 MiB, `kernel/qemu_sls_tcache.c`). **They are different
+buffers**, and nothing copies between them.
+
+So wiring the cache means deciding one of:
+
+- **TCG generates directly into the tcache buffer** — `sls_code_alloc()` returns
+  `qemu_sls_codebuf`. Cleanest, but the sizes disagree (32 vs 4 MiB) and the
+  buffer must live at a deterministic virtual address across reboots, which is
+  why it is `.bss` today.
+- **Copy on insert** — after `tcg_gen_code()`, copy the emitted bytes into the
+  tcache buffer and record the offset. Simpler and keeps the two independent,
+  at the cost of a memcpy per block and double the memory.
+
+That choice belongs to Gate 2 and should be made explicitly rather than
+discovered.
 
 ### Gap B — restore validates a constant, not an identity
 
@@ -108,20 +126,46 @@ Nothing starts before its predecessor's gate is met.
 
 ### Gate 0 — does the existing machinery actually round-trip?
 
-Before writing any new code, find out whether the cache that exists today can
-be written and read back at all. Every boot log so far says `no snapshot —
-cold start`; a snapshot has never been observed being produced.
+**Partly answered statically, 2026-08-04, and the answer was not what the gate
+expected.**
+
+`qemu_sls_tcache_sync()` was called from `qemu_sls_snapshot_save()`, and
+`qemu_sls_snapshot_save()` **was called from nowhere.** Both were dead code.
+`checkpoint_trigger()` — the system checkpoint the shell's `checkpoint` command
+runs — belongs to a different subsystem and never touched the QEMU-SLS cache.
+
+So every boot has reported `no snapshot — cold start` for a reason nobody would
+have guessed from the message: **a snapshot had never once been written.** The
+restore path had nothing to restore and was indistinguishable from a restore
+path that did not work.
+
+`checkpoint_trigger()` now calls `qemu_sls_tcache_sync()` directly. Deliberately
+outside the dirty-region mask: those regions rely on explicit
+`checkpoint_mark_dirty()` calls and the tcache has none, so an unconditional
+sync cannot silently skip a checkpoint because nobody remembered to mark it.
+
+**Corrected gate.** The original criterion — `codebuf_used=N` with N > 0 — was
+wrong, and for a second reason worth writing down: *nothing populates the cache
+either.* `sls_launch_guest()` contains no reference to `tcache`, `page_gen` or
+`codebuf`, and TCG generates into `sls_code_buffer` (32 MiB, `sls-runtime.c`),
+which is a **different buffer** from `qemu_sls_codebuf` (4 MiB, the one the
+tcache persists). Connecting those two is Gate 2's real work, and it is a larger
+job than "add a lookup".
+
+So Gate 0 now tests only what it can: **does the storage layer round-trip?**
 
 ```
-qemu bench 8            # populate
-checkpoint              # qemu_sls_vm.c:51 calls qemu_sls_tcache_sync()
+checkpoint              # now reaches qemu_sls_tcache_sync()
 <restart node>
 ```
 
-*Gate:* the boot banner reads `warm start — codebuf_used=N` with N > 0.
+*Gate:* the boot banner reads `warm start` rather than `no snapshot`.
+`codebuf_used=0` is the **expected** value until Gate 2 — it means the header
+was written, found and validated, which is the whole of what this gate can
+prove today.
 
-If it does not, that is the phase's first bug and it is in the storage layer,
-not the hot path. Do not proceed on the assumption that persistence works.
+If it still says `no snapshot`, the bug is in the storage layer and is now
+genuinely reachable for the first time.
 
 ### Gate 1 — identity stamping (Gap B), before any lookup is wired in
 
