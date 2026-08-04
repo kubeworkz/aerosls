@@ -108,90 +108,63 @@ if ! make x86-iso; then
     exit 1
 fi
 
-# ─── Post-build assertion: is the image built from the source on disk? ─────
-# `make` succeeding proves the compiler ran. It does not prove the compiler
-# ran over the sources you think are there -- a partial sync, a stale object
-# a dependency rule missed, or a repo that was never pulled all produce a
-# clean build of the wrong program.
+# ─── Post-build assertion: is the image NEWER than every source it needs? ──
+# `make` succeeding proves the compiler ran. It does not prove it ran over the
+# sources you think are on disk -- a repo that was never pulled, a partial
+# sync, or a dependency rule that missed a header all produce a clean build of
+# the wrong program. That happened four times in one session: a banner still
+# reading "(TCI)" after the string had been changed, missing report lines that
+# had definitely been added, and a half-synced sls/ where one file's changes
+# were present and another's were not.
 #
-# So this samples literal strings from the qemu/sls sources and requires them
-# to be present in the linked binary. A string is a good probe precisely
-# because it is inert: it cannot be optimised away, it survives with no
-# debug info, and finding it proves that specific text was compiled.
+# ─── Why mtime and not string probing ──────────────────────────────────────
+# The first version of this check extracted a string literal from each source
+# and looked for it in the binary. It was wrong twice, for two unrelated
+# reasons, and the second one blocked a perfectly good deploy:
 #
-# Samples the LAST occurrence in each file rather than the first: files are
-# appended to far more often than prepended, so the most recent edit is the
-# most likely to be the one that did not make it across. Checking the first
-# string would have passed happily in the exact case that motivated this.
-echo "[deploy] Verifying the built image matches the sources on disk..."
-if ! command -v strings >/dev/null; then
-    echo "[deploy] FAILED: 'strings' not found (binutils). Cannot verify the build."
-    echo "         Install binutils rather than skipping -- a verification that"
-    echo "         silently does nothing is worse than none, because it is trusted."
-    exit 1
-fi
+#   1. It drew probes out of COMMENTS, which never reach the binary.
+#   2. After that was fixed it matched the GAP BETWEEN two string literals --
+#      from the closing quote of one, through the intervening code, to the
+#      opening quote of the next -- yielding "probes" like
+#          " : (p == end && end > sp) ? "
+#      that are C code, not data, and are correctly absent from the image.
+#
+# A regular expression cannot tell an opening quote from a closing one; that
+# needs a tokeniser. Two failures from two unrelated causes says the approach
+# was wrong, not the pattern -- so this checks a property that requires no
+# parsing at all: NOTHING THE KERNEL IS BUILT FROM MAY BE NEWER THAN THE
+# KERNEL. git pull sets mtimes to checkout time, so a pulled-but-not-rebuilt
+# file is caught exactly.
+echo "[deploy] Verifying the built image is newer than every source..."
 
 KERNEL_BIN="my_sls_kernel.bin"
 [ -f "$KERNEL_BIN" ] || { echo "[deploy] FAILED: $KERNEL_BIN missing after a successful make."; exit 1; }
 
-command -v perl >/dev/null || { echo "[deploy] FAILED: perl not found; needed to strip comments before probing."; exit 1; }
-
-probe_missing=0
-probes_run=0
-probes_skipped=0
-for src in ../qemu/sls/sls-launcher.c ../qemu/sls/sls-runtime.c \
-           ../qemu/sls/sls-helper-stubs.c kernel/stubs.c \
-           net/http.c user/shell.c; do
-    [ -f "$src" ] || continue
-
-    # Comments and #directives are stripped FIRST. Both contain quoted text
-    # that never reaches the binary -- an #include path, or a comment quoting
-    # a compiler message. A first attempt at this skipped that step and drew
-    # its probe for kernel_io.c out of a comment (about, of all things, reading
-    # absence as evidence), which would have failed a perfectly good build.
-    #
-    # Then: any complete string literal of 24+ characters containing no printf
-    # conversion and no escape. Those three constraints matter -- a conversion
-    # or an escape means the bytes in the binary differ from the bytes in the
-    # source, so grep -F would not match even on a correct build.
-    probe="$(perl -0pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g; s{^\s*#[^\n]*}{}gm' "$src" 2>/dev/null \
-             | grep -ho '"[^"%\\]\{24,\}"' | tail -1 | sed 's/^"//;s/"$//')"
-
-    if [ -z "$probe" ]; then
-        # Reported, not silently passed over. Some files genuinely have no
-        # qualifying literal (kernel/qemu_sls_mmu.c is one), and knowing which
-        # files were NOT checked is part of knowing what this check proved.
-        probes_skipped=$((probes_skipped + 1))
-        echo "[deploy]   skip $src (no probe-able string literal)"
-        continue
-    fi
-
-    probes_run=$((probes_run + 1))
-    if ! strings "$KERNEL_BIN" | grep -qF -- "$probe"; then
-        echo "[deploy] MISMATCH: $src"
-        echo "         a string near the end of that file is NOT in $KERNEL_BIN:"
-        echo "           \"$probe\""
-        probe_missing=$((probe_missing + 1))
-    fi
+SRC_ROOTS=""
+for d in kernel arch net user ../qemu/sls ../qemu/tcg ../qemu/accel/tcg ../qemu/include; do
+    [ -d "$d" ] && SRC_ROOTS="$SRC_ROOTS $d"
 done
+[ -n "$SRC_ROOTS" ] || { echo "[deploy] FAILED: no source directories found; cannot verify."; exit 1; }
 
-if [ "$probes_run" -eq 0 ]; then
-    echo "[deploy] FAILED: no probe strings could be extracted from any source, so"
-    echo "         nothing was actually verified ($probes_skipped file(s) skipped)."
-    echo "         Treating that as a failure rather than a pass -- a check that"
-    echo "         examined nothing must not report success."
-    exit 1
-fi
+# -newer is strictly greater, so a source touched in the same second as the
+# link does not trip it. That is the right way round: this must not cry wolf.
+STALE="$(find $SRC_ROOTS \( -name '*.c' -o -name '*.h' -o -name '*.inc' -o -name '*.asm' -o -name '*.S' \) \
+         -newer "$KERNEL_BIN" 2>/dev/null | head -20)"
 
-if [ "$probe_missing" -ne 0 ]; then
-    echo "[deploy] FAILED: $probe_missing of $probes_run source file(s) contributed"
-    echo "         no matching string to the built image. The build is NOT from the"
-    echo "         sources on disk -- most likely a partial sync or a stale object."
+if [ -n "$STALE" ]; then
+    echo "[deploy] FAILED: these sources are NEWER than $KERNEL_BIN, so the image"
+    echo "         was not built from them:"
+    echo "$STALE" | sed 's/^/           /'
+    echo "         The build did not pick them up -- usually a dependency rule that"
+    echo "         does not track headers across the ../qemu boundary."
     echo "         Aborting: kernel NOT restarted, still running the previous build."
-    echo "         Try 'make clean && make x86-iso', and check that ../qemu is current."
+    echo "         Try 'make clean && make x86-iso'."
     exit 1
 fi
-echo "[deploy] OK: $probes_run source file(s) verified present in $KERNEL_BIN ($probes_skipped skipped)."
+
+CHECKED="$(find $SRC_ROOTS \( -name '*.c' -o -name '*.h' -o -name '*.inc' -o -name '*.asm' -o -name '*.S' \) 2>/dev/null | wc -l)"
+[ "$CHECKED" -gt 0 ] || { echo "[deploy] FAILED: found 0 source files to check. A check that examined nothing must not pass."; exit 1; }
+echo "[deploy] OK: $CHECKED source file(s) all older than $KERNEL_BIN."
 
 echo "[deploy] Restarting pm2 process '$PM2_APP_NAME'..."
 if ! pm2 restart "$PM2_APP_NAME"; then
