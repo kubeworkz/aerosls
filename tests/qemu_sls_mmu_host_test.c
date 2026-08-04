@@ -131,6 +131,15 @@ typedef struct { uint64_t pml4, va, pa, flags; } MapCall;
 static MapCall g_maps[MAX_MAPS];
 static int     g_map_count;
 
+/* Marker the stub writes into the top-level slot, standing in for the PDPT
+ * frame the real user_map_page() would allocate and install there. Without
+ * this the stub records the call but leaves the PML4 all zeroes -- and the
+ * "window published to the kernel root" check below would then compare 0
+ * against 0 and pass no matter what the code did. A stub LESS capable than the
+ * thing it replaces makes an assertion vacuous just as surely as one that is
+ * more capable makes it permissive. */
+#define STUB_PDPT_MARKER 0xABCD0000ULL
+
 void user_map_page(uint64_t *pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags) {
     if (g_map_count < MAX_MAPS) {
         g_maps[g_map_count].pml4  = (uint64_t)(uintptr_t)pml4;
@@ -139,6 +148,8 @@ void user_map_page(uint64_t *pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
         g_maps[g_map_count].flags = flags;
     }
     g_map_count++;
+    if (pml4) pml4[(vaddr >> 39) & 0x1FF] =
+        STUB_PDPT_MARKER | USER_PTE_PRESENT | USER_PTE_WRITE;
 }
 
 static const MapCall *last_map(void) {
@@ -229,6 +240,34 @@ int main(void) {
           "...present and writable");
     CHECK(g_maps[0].pa != g_maps[1].pa,
           "...and distinct frames, so the pool is really being consumed");
+
+    /* ─── the window must be reachable from the KERNEL root, not just the
+     *      shadow ────────────────────────────────────────────────────────────
+     * map_guest_ram() installs pages in shadow_pml4. The shadow root is only
+     * in CR3 while translated guest code runs -- but the EMULATOR touches this
+     * same window as ordinary kernel code, on the kernel's CR3, to read guest
+     * page tables and load images. init() copies kernel->shadow, once, BEFORE
+     * this window exists, so nothing carried it the other way.
+     *
+     * The consequence in production was a #PF at 0x0000200000001000 (error=2)
+     * on the benchmark's very first buffer write, which shadow_fault() then
+     * refused -- correctly, since qemu_sls_guest_active was 0. Every guard
+     * behaved as designed and the node halted anyway.
+     *
+     * Asserted against the kernel PML4 that arch_read_cr3() hands out, which
+     * is the table the CPU would actually walk. */
+    {
+        unsigned widx = (unsigned)((QEMU_GPA_HOST_BASE >> 39) & 0x1FF);
+        const uint64_t *shadow = (const uint64_t *)(uintptr_t)g_maps[0].pml4;
+        CHECK(shadow[widx] != 0,
+              "*** the stub really populated the shadow's top-level slot -- "
+              "without this the next check compares 0 against 0 ***");
+        CHECK(g_fake_kernel_pml4[widx] == shadow[widx],
+              "*** the window's PML4 entry was published to the KERNEL root, so "
+              "the emulator can reach guest RAM without a guest running ***");
+        CHECK(g_fake_kernel_pml4[widx] & USER_PTE_PRESENT,
+              "...and it is present, not merely copied as a zero");
+    }
     /* Captured now, because g_map_count is reset by later scenarios and
      * g_maps[0] then refers to something else entirely. */
     const uint64_t gpa0_frame = g_maps[0].pa;

@@ -116,6 +116,55 @@ int qemu_sls_mmu_map_guest_ram(uint64_t gpa_start, uint32_t size_pages) {
                       USER_PTE_PRESENT | USER_PTE_WRITE);
     }
 
+    /* ─── The window must also exist in the KERNEL address space ───────────
+     * user_map_page() above installed everything in shadow_pml4. But the
+     * shadow root is only loaded into CR3 while translated guest code runs --
+     * the EMULATOR reaches guest memory through this same window while running
+     * as ordinary kernel code on the kernel's CR3, which is exactly what this
+     * header promises:
+     *
+     *     "This window is how the EMULATOR reaches guest memory -- reading
+     *      guest page tables, DMA, image load."          (qemu_sls_mmu.h)
+     *
+     * qemu_sls_mmu_init() copies kernel_pml4 INTO the shadow, and that copy is
+     * one-directional and happens BEFORE this function builds the window. So
+     * the kernel PML4 has no entry for it, and the first emulator-side touch
+     * of the window takes a #PF at 0x0000200000001000 with error=0x2 that
+     * qemu_sls_mmu_shadow_fault() then correctly refuses -- correctly, because
+     * qemu_sls_guest_active is 0 and no guest is running. Every guard behaved
+     * exactly as designed while the node halted on the benchmark's first
+     * buffer write.
+     *
+     * Copying the covering PML4 entries makes both roots share the SAME
+     * PDPT/PD/PT below them, so they cannot drift: a later map_guest_ram()
+     * that adds pages under an existing entry is visible from both without
+     * any further work. It is the same trick init() already uses in the other
+     * direction, applied to the one range that init() could not know about.
+     *
+     * No TLB flush: these entries were not-present, and x86 does not cache
+     * non-present translations. */
+    {
+        uint64_t *kernel_pml4 =
+            (uint64_t *)(uintptr_t)(arch_read_cr3() & ~0xFFFULL);
+        uint64_t  win_end = hva_base + (uint64_t)size_pages * FRAME_SIZE - 1;
+        unsigned  first   = (unsigned)((hva_base >> 39) & 0x1FF);
+        unsigned  last    = (unsigned)((win_end  >> 39) & 0x1FF);
+
+        /* A region spanning more than the 512 PML4 slots would wrap the index
+         * and copy the WRONG entries -- silently, and only for large guests.
+         * QEMU_GUEST_RAM_PAGES is 256 MiB today so this cannot trigger, which
+         * is precisely why it is checked rather than assumed. */
+        if (last < first) {
+            kernel_serial_printf(
+                "[QEMU-SLS MMU] window PML4 range wrapped (%u..%u) -- refusing to "
+                "publish it to the kernel root.\n", first, last);
+            return -1;
+        }
+        for (unsigned i = first; i <= last; i++) {
+            if (kernel_pml4[i] != shadow_pml4[i]) kernel_pml4[i] = shadow_pml4[i];
+        }
+    }
+
     QemuGuestRegion *r = &regions[region_count++];
     r->gpa_start = gpa_start;
     r->gpa_end   = gpa_start + (uint64_t)size_pages * FRAME_SIZE;
