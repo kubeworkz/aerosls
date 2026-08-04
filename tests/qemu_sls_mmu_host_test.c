@@ -51,10 +51,31 @@ uint64_t qemu_sls_test_gpa_base;
 #define USER_PTE_WRITE       (1ULL << 1)
 #define USER_PTE_FRAME_MASK  0x000FFFFFFFFFF000ULL
 
+/* ─── The address the CPU reports is NOT the guest's ──────────────────────
+ * Emitted guest code addresses memory as `guest_va + guest_base`, and
+ * guest_base is QEMU_GPA_HOST_BASE (see tcg/tcg.c, and the correction note in
+ * kernel/qemu_sls_mmu.h). So CR2 -- and therefore the argument
+ * qemu_sls_mmu_shadow_fault() receives from handle_page_fault() -- is the
+ * guest address plus the window base.
+ *
+ * These tests passed raw guest VAs, which was correct for the GVA-direct
+ * design and is wrong for the window model that shipped in Step 5. The
+ * mismatch was invisible until shadow_install() gained a guard refusing
+ * mappings outside the window's PML4 slot: sixteen checks failed at once, all
+ * of them encoding the retired calling convention. The guard found a real
+ * defect in the code AND a real defect in the tests, which is the argument for
+ * asserting a constraint rather than documenting it.
+ *
+ * Installed shadow PTEs are therefore at GUEST_FAULT_ADDR(gva), not gva. */
+#define GUEST_FAULT_ADDR(gva)  ((uint64_t)(gva) + QEMU_GPA_HOST_BASE)
+
 static int checks_passed = 0, checks_failed = 0;
 #define CHECK(cond, msg) do { \
-    if (cond) { checks_passed++; printf("  ok   %s\n", msg); } \
-    else      { checks_failed++; printf("  FAIL %s\n", msg); } \
+    /* "ok:" at column 0 -- tests/run_all.sh counts checks with grep -c '^ok:',
+     * so this file reported "0 checks" for its entire life while passing 61.
+     * A suite that cannot tell 61 assertions from none is not reporting. */ \
+    if (cond) { checks_passed++; printf("ok:   %s\n", msg); } \
+    else      { checks_failed++; printf("FAIL: %s\n", msg); } \
 } while (0)
 
 /* ─── stubs ──────────────────────────────────────────────────────────────── */
@@ -315,14 +336,15 @@ int main(void) {
         qemu_sls_guest_cr3 = cr3;
 
         g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva + 0x123, 0) == 0,
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva + 0x123), 0) == 0,
               "a fully-present guest mapping resolves");
         CHECK(g_map_count == 1, "...installing exactly one shadow PTE");
         const MapCall *m = last_map();
-        CHECK(m && m->va == gva,
-              "*** the shadow PTE is installed at the GUEST VIRTUAL address, page-"
-              "aligned -- not at the host GPA-window address, and with the faulting "
-              "offset stripped ***");
+        CHECK(m && m->va == GUEST_FAULT_ADDR(gva),
+              "*** the shadow PTE is installed at the HOST address the CPU faulted "
+              "on -- guest_va + guest_base -- page-aligned, with the faulting offset "
+              "stripped. This assertion previously required the opposite (the raw "
+              "guest VA), which was correct for the retired GVA-direct design ***");
         CHECK(m && m->pa == qemu_sls_dma_frame_phys(target_gpa),
               "*** ...pointing at the HOST FRAME backing that guest physical page. "
               "This is the assertion a passing return code cannot make: a walk that "
@@ -338,7 +360,7 @@ int main(void) {
                                          USER_PTE_PRESENT, 4);   /* read-only leaf */
         qemu_sls_guest_cr3 = cr3;
         g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 0, "a read-only guest page resolves");
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 0, "a read-only guest page resolves");
         const MapCall *m = last_map();
         CHECK(m && (m->flags & USER_PTE_PRESENT), "...present");
         CHECK(m && !(m->flags & USER_PTE_WRITE),
@@ -356,7 +378,7 @@ int main(void) {
             char msg[128];
             snprintf(msg, sizeof msg,
                      "%d of 4 levels present -> refused (returns 1), nothing installed", lvl);
-            int rc = qemu_sls_mmu_shadow_fault(gva, 0);
+            int rc = qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0);
             CHECK(rc == 1 && g_map_count == 0, msg);
         }
     }
@@ -377,14 +399,14 @@ int main(void) {
         qemu_sls_guest_cr3 = cr3;
 
         g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva + off + 0x40, 0) == 0,
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva + off + 0x40), 0) == 0,
               "a 2 MiB guest page resolves");
         const MapCall *m = last_map();
         CHECK(g_map_count == 1,
               "*** ...as ONE 4 KiB shadow PTE, not 512 -- the decomposition is "
               "per-fault, so an untouched huge page costs nothing ***");
-        CHECK(m && m->va == (gva + off),
-              "...at the faulting 4 KiB page within the huge page");
+        CHECK(m && m->va == GUEST_FAULT_ADDR(gva + off),
+              "...at the faulting 4 KiB page within the huge page, in host terms");
         CHECK(m && m->pa == qemu_sls_dma_frame_phys(off & ~(uint64_t)0xFFF),
               "*** ...backed by the frame for GPA (huge_base | gva[20:0]) -- the "
               "offset inside the huge page must survive, or every access in 2 MiB "
@@ -402,7 +424,7 @@ int main(void) {
         gpa_ptr(pdpt)[PDPT_IDX(gva)] = (1ULL << 30) | USER_PTE_PRESENT | PS_FLAG;
         qemu_sls_guest_cr3 = cr3;
         g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 1 && g_map_count == 0,
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 1 && g_map_count == 0,
               "*** a 1 GiB guest page over guest RAM that was never allocated is "
               "refused, not mapped to frame 0 ***");
     }
@@ -464,12 +486,12 @@ int main(void) {
 
         qemu_sls_guest_active = 1;
         g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 0 && g_map_count == 1,
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 0 && g_map_count == 1,
               "with guest code running, a mapped GVA resolves");
 
         qemu_sls_guest_active = 0;
         g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 1,
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 1,
               "*** the SAME fault at the SAME address is REFUSED when no guest is "
               "running -- so a kernel bug halts with a diagnosable [FAULT] line "
               "instead of spinning in the fault handler ***");
@@ -478,21 +500,95 @@ int main(void) {
         qemu_sls_guest_active = 1;
     }
 
+    printf("\n-- an address outside the guest window is not a guest access --\n");
+    {
+        /* The shadow SHARES lower-level page tables with the kernel:
+         * qemu_sls_mmu_init() copies all 512 kernel PML4 entries by value, and
+         * user_map_page() follows a present entry instead of cloning it. So a
+         * mapping installed at an address the kernel also maps does not shadow
+         * the kernel's translation, it OVERWRITES it -- in the kernel's own
+         * live tables, permanently. At a low address that means remapping the
+         * kernel image out from under the CPU executing it.
+         *
+         * Under the window model this cannot arise from a legitimate guest
+         * access, because every such access is at guest_va + guest_base. An
+         * address outside the window is by definition something else: a kernel
+         * bug, or a caller still using the retired GVA-direct convention.
+         *
+         * qemu_sls_guest_active is deliberately left SET here. That flag is the
+         * other guard, and leaving it on is what makes this check test the
+         * window test rather than accidentally passing because the active flag
+         * caught it first -- the two guards must be shown to be independent. */
+        const uint64_t gva = 0x00000000BEEF0000ULL;
+        /* GPA 3*FRAME_SIZE, not 5: only the first four guest pages are backed
+         * at this point, and an unbacked target makes the walk fail for a
+         * reason that has nothing to do with the window -- which the control
+         * check below caught when this test first used 5. */
+        qemu_sls_guest_cr3 = build_guest_pt_4k(gva, 3 * FRAME_SIZE,
+                                               USER_PTE_PRESENT | USER_PTE_WRITE, 4);
+        qemu_sls_guest_active = 1;
+
+        /* Sanity: through the window it resolves. Without this the refusal
+         * below could be caused by a broken guest table rather than by the
+         * window check, and the test could not tell the difference. */
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 0 &&
+              g_map_count == 1,
+              "control: the same mapping DOES resolve when addressed through "
+              "the window");
+
+        /* ─── What these two checks do and do NOT prove ────────────────────
+         * They prove the OUTCOME: an out-of-window address resolves nothing
+         * and installs nothing. They do NOT isolate the window guard, and
+         * mutation testing is what showed it: deleting
+         * `if (!shadow_va_in_window(...)) return 1;` leaves every check here
+         * passing, because the subtraction below it then underflows the
+         * address into garbage, the guest walk misses, and the function
+         * returns 1 for a different reason.
+         *
+         * So the guard in shadow_fault() is defence in depth, not the sole
+         * mechanism, and this test cannot tell the two apart. Recorded rather
+         * than papered over: a check whose failure mode is indistinguishable
+         * from success is worth less than it appears, and the honest move is
+         * to say which one this is.
+         *
+         * The guard that IS load-bearing is in shadow_install(), against a
+         * future caller passing a raw guest VA. It is unreachable from here --
+         * shadow_fault has already screened the address -- so it has no test
+         * at all, and should get one when guest paging gives it a second
+         * caller. */
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 1,
+              "the raw guest VA -- outside the window -- does not resolve, with "
+              "guest code active and the guest mapping otherwise valid");
+        CHECK(g_map_count == 0,
+              "*** and NOTHING was installed. A refusal that still wrote a PTE "
+              "would have corrupted the kernel's own page tables, which is the "
+              "entire failure this guard exists to prevent ***");
+
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_shadow_fault(0x1000, 0) == 1 && g_map_count == 0,
+              "...and so is a low kernel-range address");
+        /* guest_active deliberately LEFT SET: the invlpg block below depends on
+         * it, and clearing it here made four unrelated checks fail. */
+    }
+
     printf("\n-- the TLB is invalidated, not just the table written --\n");
     {
         const uint64_t gva = 0x00000000BEEF0000ULL;
         qemu_sls_guest_cr3 = build_guest_pt_4k(gva, 1 * FRAME_SIZE,
                                                USER_PTE_PRESENT, 4);
         g_invlpg_count = 0; g_map_count = 0;
-        CHECK(qemu_sls_mmu_shadow_fault(gva + 0x888, 0) == 0, "the fault resolves");
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva + 0x888), 0) == 0, "the fault resolves");
         CHECK(g_invlpg_count == 1,
               "*** ...and invlpg was issued. x86 does not cache non-present "
               "translations, so the FIRST fault would retry fine without this -- but "
               "a permission fault leaves a stale read-only entry, and the retry "
               "would fault again forever ***");
-        CHECK(g_invlpg_count == 1 && g_invlpg[0] == gva,
-              "*** on the page-aligned faulting address, not the raw one: invlpg "
-              "takes a linear address and the offset must be stripped ***");
+        CHECK(g_invlpg_count == 1 && g_invlpg[0] == GUEST_FAULT_ADDR(gva),
+              "*** on the page-aligned HOST address, not the raw one: invlpg takes a "
+              "linear address, so it must be the address the CPU actually faulted on "
+              "-- flushing the guest VA would flush an unrelated kernel page ***");
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

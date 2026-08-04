@@ -200,8 +200,52 @@ static const uint64_t *gpa_to_hva(uint64_t gpa) {
     return (const uint64_t *)(QEMU_GPA_HOST_BASE + gpa);
 }
 
-/* Install one shadow PTE: gva → frame, W-bit propagated from the guest PTE. */
-static void shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
+/* ─── The shadow shares page tables with the kernel ────────────────────────
+ *
+ * qemu_sls_mmu_init() copies all 512 kernel PML4 entries BY VALUE, so every
+ * lower-level table is shared, not cloned. user_map_page() follows a present
+ * entry rather than cloning it (arch/x86/user_paging.c:110, get_or_alloc).
+ *
+ * Therefore installing a mapping at an address the KERNEL also maps does not
+ * shadow the kernel's translation -- it OVERWRITES it, in the kernel's own
+ * live page tables, permanently, whether or not the shadow root is loaded. A
+ * mapping at a low address would remap the kernel image (1..221 MiB) out from
+ * under the CPU currently executing it.
+ *
+ * The window at QEMU_GPA_HOST_BASE occupies a PML4 slot nothing else uses,
+ * which is why sharing is safe there and why map_guest_ram() can publish that
+ * one entry into the kernel root. The constraint has always held; it was
+ * never written down, was load-bearing for one caller and fatal to another.
+ *
+ * See docs/AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md.
+ */
+#define SHADOW_PML4_SLOT(va) (unsigned)(((va) >> 39) & 0x1FF)
+
+static int shadow_va_in_window(uint64_t va) {
+    return SHADOW_PML4_SLOT(va) == SHADOW_PML4_SLOT(QEMU_GPA_HOST_BASE);
+}
+
+/* Install one shadow PTE: host VA → frame, W-bit propagated from the guest PTE.
+ *
+ * Returns 0 on success, -1 if refused. The caller must treat a refusal as an
+ * unresolved fault -- silently not installing would loop the fault handler
+ * forever on the same address. */
+static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
+    if (!shadow_va_in_window(gva)) {
+        kernel_serial_printf(
+            "[QEMU-SLS MMU] shadow_install REFUSED: 0x%016lx is in PML4 slot %u, "
+            "outside the guest window's slot %u.\n"
+            "[QEMU-SLS MMU] The shadow SHARES lower-level tables with the kernel, so "
+            "mapping here would overwrite the kernel's own page tables rather than "
+            "shadow them.\n"
+            "[QEMU-SLS MMU] Under the window model the faulting address is already "
+            "guest_va + QEMU_GPA_HOST_BASE; a raw guest VA reaching here means the "
+            "caller still assumes the retired GVA-direct design.\n"
+            "[QEMU-SLS MMU] See docs/AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md\n",
+            gva, SHADOW_PML4_SLOT(gva), SHADOW_PML4_SLOT(QEMU_GPA_HOST_BASE));
+        return -1;
+    }
+
     uint64_t flags = USER_PTE_PRESENT;
     if (guest_pte & USER_PTE_WRITE) flags |= USER_PTE_WRITE;
     user_map_page(shadow_pml4, gva & ~(uint64_t)0xFFF, frame, flags);
@@ -217,6 +261,7 @@ static void shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
      *
      * One instruction on a path that has already taken a page fault. */
     qemu_sls_invlpg(gva & ~(uint64_t)0xFFF);
+    return 0;
 }
 
 /* ─── qemu_sls_mmu_shadow_fault ─────────────────────────────────────────── */
@@ -230,9 +275,32 @@ static void shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
  * Huge-page guest mappings (1 GiB, 2 MiB) are decomposed into 4 KiB shadow
  * PTEs — one per fault — so we only pay for pages the guest actually touches.
  */
-int qemu_sls_mmu_shadow_fault(uint64_t faulting_gva, uint32_t error_code) {
+int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
     if (!initialized) return 1;
     (void)error_code;
+
+    /* ─── The faulting address is a HOST address, not a guest one ──────────
+     * Emitted guest code addresses memory as `guest_va + guest_base`, where
+     * guest_base is QEMU_GPA_HOST_BASE (see tcg/tcg.c and the note in
+     * qemu_sls_mmu.h). CR2 therefore reports guest_va + the window base, and
+     * the guest virtual address has to be recovered before anything can walk
+     * the guest's page tables with it.
+     *
+     * This function previously treated CR2 as a raw guest VA. That was correct
+     * for the GVA-direct design and is wrong under the window model that
+     * shipped in Step 5 -- it would walk the guest's tables with an address
+     * 32 TiB too high, miss, and report an unresolved fault for a page the
+     * guest had legitimately mapped.
+     *
+     * Checking the window FIRST also gives back the address-range test that
+     * the comment below says does not exist. It does now: an access outside
+     * the window is definitionally not translated guest code touching guest
+     * memory. qemu_sls_guest_active remains the primary guard because a kernel
+     * bug CAN produce an address inside the window -- the emulator itself uses
+     * that range -- but the two together are considerably stronger than either.
+     */
+    if (!shadow_va_in_window(faulting_addr)) return 1;
+    uint64_t faulting_gva = faulting_addr - QEMU_GPA_HOST_BASE;
 
     /* ─── Only ever resolve faults taken BY guest code ─────────────────────
      * handle_page_fault() calls this for every kernel-mode #PF, at any
@@ -272,7 +340,7 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_gva, uint32_t error_code) {
                        (faulting_gva & (uint64_t)0x3FFFFFFF);
         uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
         if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
-        shadow_install(faulting_gva, guest_ram_frames[idx], e2);
+        if (shadow_install(faulting_addr, guest_ram_frames[idx], e2) != 0) return 1;
         return 0;
     }
 
@@ -287,7 +355,7 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_gva, uint32_t error_code) {
                        (faulting_gva & (uint64_t)0x1FFFFF);
         uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
         if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
-        shadow_install(faulting_gva, guest_ram_frames[idx], e1);
+        if (shadow_install(faulting_addr, guest_ram_frames[idx], e1) != 0) return 1;
         return 0;
     }
 
@@ -300,7 +368,7 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_gva, uint32_t error_code) {
     uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
     if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
 
-    shadow_install(faulting_gva, guest_ram_frames[idx], leaf);
+    if (shadow_install(faulting_addr, guest_ram_frames[idx], leaf) != 0) return 1;
     return 0;
 }
 
