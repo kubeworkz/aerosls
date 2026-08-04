@@ -285,6 +285,51 @@ asked for.
 **86 bytes/load is the confirmed softmmu=ON baseline.** Step 5 compares against
 it directly.
 
+### Five consecutive runs, one boot (2026-08-04)
+
+| run | CODE bytes | EXEC cycles/load | arena after |
+|---|---|---|---|
+| 1 | **43,293** | 50,622 | 15% |
+| 2 | **43,293** | 49,795 | 30% |
+| 3 | **43,293** | 51,136 | 46% |
+| 4 | **43,293** | 52,723 | 61% |
+| 5 | **43,293** | 51,633 | 77% |
+
+**CODE: identical five times out of five**, on top of four earlier boots across
+three different builds. Nine samples, zero variation.
+
+**EXEC: mean 51,182 cycles/load, σ ≈ 982, CV ≈ 1.9%**, range 49,795–52,723.
+Within a single boot the cycle counter is far steadier than the 5–13% seen
+across boots — so cross-boot comparison is what introduces most of the noise,
+not the counter itself.
+
+### Using CODE as a control for EXEC in Step 5
+
+EXEC is contaminated because the outer emulator must translate our JIT's output
+(§ above). But that contamination is *proportional to how much code we emit* —
+which is exactly what CODE measures. That makes the confound estimable rather
+than merely acknowledged:
+
+1. Record CODE and EXEC with softmmu **ON** (done: 43,293 bytes, 51,182 cyc/load)
+2. Record both with softmmu **OFF**
+3. `code_ratio = CODE_on / CODE_off` predicts the EXEC improvement attributable
+   purely to there being less code for the outer emulator to compile
+4. `exec_ratio = EXEC_on / EXEC_off`
+
+If **`exec_ratio ≈ code_ratio`**, the apparent speedup is entirely the artifact
+and this hardware has measured nothing about execution. If **`exec_ratio >
+code_ratio`**, the excess is real work eliminated, and its size is the first
+honest estimate of what shadow paging buys.
+
+At CV ≈ 1.9%, five runs per configuration resolve a difference of roughly 3–4%
+between those two ratios. Both are obtainable in one boot per configuration
+with the 64 MiB arena.
+
+This does not lift §9's requirement — a *timing* claim still needs KVM or real
+non-x86 hardware. It does mean the A/B can distinguish "less code to compile"
+from "less work to do", which was the objection that made the cycle figures
+unusable.
+
 ---
 
 ## 6. Node 2 — the undiagnosed silent halt
