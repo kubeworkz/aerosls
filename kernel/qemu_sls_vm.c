@@ -1,3 +1,4 @@
+#include <stdint.h>
 /*
  * qemu_sls_vm.c — Phase 4 VM snapshot for QEMU-SLS.
  * See docs/AeroSLS-QEMU-SLS-Viability-Analysis.md §Phase 4.
@@ -66,4 +67,10 @@ int qemu_sls_snapshot_restore(QemuVMState *state) {
         "[QEMU-SLS VM] snapshot restored: seq=%llu rip=0x%016lx\n",
         (unsigned long long)vm_snap_buf.sequence, vm_snap_buf.rip);
     return 0;
+}
+
+/* See qemu_sls_mmu.h. Defined here rather than in qemu_sls_mmu.c so that file
+ * stays free of privileged instructions and remains host-testable. */
+void qemu_sls_invlpg(uint64_t va) {
+    __asm__ volatile("invlpg (%0)" :: "r"((void *)(uintptr_t)va) : "memory");
 }

@@ -49,4 +49,17 @@ uint64_t user_clone_page_table(void);
 // Allocates intermediate tables from the physical frame pool as needed.
 void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags);
 
+/* Reads CR3. A named function rather than inline asm at each site because
+ * `mov %%cr3` is privileged: any host test that links a translation unit
+ * containing it dies before main() gets anywhere -- which is exactly what
+ * happened to kernel/qemu_sls_mmu.c, whose entire shadow-PT layer was
+ * untestable for that one instruction.
+ *
+ * NOT inline, deliberately: a static inline would still emit the instruction
+ * into the caller and the seam would not exist. kernel/qemu_sls_mmu.c uses
+ * this; arch/x86/walk_page_tables_x86.c, kernel/smp.c and this file's own
+ * user_paging.c:90 still open-code it and should be converted when something
+ * needs to test them. */
+uint64_t arch_read_cr3(void);
+
 #endif /* USER_PAGING_H */

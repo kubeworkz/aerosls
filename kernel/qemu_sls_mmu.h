@@ -18,10 +18,25 @@
 /*
  * Guest physical address space is mapped at this fixed offset in the host VA
  * space.  GPA X → host VA (QEMU_GPA_HOST_BASE + X).
- * Placed at 2 TiB — above the kernel's identity-mapped lower 4 GiB, below
- * the 4-level-paging canonical-address hole at 128 TiB.
+ *
+ * Placed at 32 TiB — above the kernel's identity-mapped lower 4 GiB, below the
+ * 4-level-paging canonical-address hole that starts at 128 TiB. (This comment
+ * said "2 TiB" until it was checked: 0x200000000000 is 2^45, which is 32 TiB,
+ * not 2. Both are inside the safe span so nothing was broken, but it is the
+ * number the TCG backend patch reasons about.)
+ *
+ * This window is how the EMULATOR reaches guest memory — reading guest page
+ * tables, DMA, image load. It is NOT how translated guest code addresses
+ * memory: the shadow PT maps guest virtual addresses directly (see
+ * shadow_install() in the .c), so emitted loads and stores use a bare GVA with
+ * no base register at all.
+ *
+ * Overridable so a host test can point the window at a real buffer; the
+ * production value is asserted separately in tests/qemu_sls_mmu_host_test.c.
  */
+#ifndef QEMU_GPA_HOST_BASE
 #define QEMU_GPA_HOST_BASE   0x0000200000000000ULL
+#endif
 
 /* Maximum guest RAM in 4 KiB pages (256 MiB). */
 #define QEMU_GUEST_RAM_PAGES 65536U
@@ -43,6 +58,19 @@ extern uint64_t qemu_sls_guest_cr3;
 
 /* Physical address of the shadow PML4; load into CR3 before running TCG code. */
 extern uint64_t qemu_sls_shadow_cr3;
+
+/* Nonzero only while translated guest code is executing. The launcher sets it
+ * around sls_exec_run(). qemu_sls_mmu_shadow_fault() refuses to resolve
+ * anything when it is clear: the shadow table maps guest VIRTUAL addresses, so
+ * nothing about a faulting address distinguishes a guest access from a kernel
+ * bug, and "resolving" a kernel bug turns a diagnosable halt into an infinite
+ * fault loop. */
+extern int qemu_sls_guest_active;
+
+/* invlpg on one page. A function, not inline asm at the call site, so a host
+ * test can observe the invalidation instead of executing a privileged
+ * instruction -- same reason as arch_read_cr3(). */
+void qemu_sls_invlpg(uint64_t va);
 
 /* One-time boot init: allocates shadow PML4 inheriting all kernel PT entries. */
 int qemu_sls_mmu_init(void);

@@ -116,3 +116,11 @@ void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
 
     pt[PT_IDX(vaddr)] = (paddr & USER_PTE_FRAME_MASK) | flags;
 }
+
+/* See the declaration in user_paging.h for why this is a function and not an
+ * inline. */
+uint64_t arch_read_cr3(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    return cr3;
+}

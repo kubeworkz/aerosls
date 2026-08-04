@@ -19,6 +19,7 @@
 
 uint64_t qemu_sls_guest_cr3  = 0;
 uint64_t qemu_sls_shadow_cr3 = 0;
+int      qemu_sls_guest_active = 0;
 
 static uint64_t        *shadow_pml4;
 static QemuGuestRegion  regions[QEMU_MAX_REGIONS];
@@ -39,8 +40,7 @@ int qemu_sls_mmu_init(void) {
 
     /* Copy kernel PT entries so IDT/syscall handlers stay reachable when
      * TCG code runs with this PML4 loaded as CR3. */
-    uint64_t current_cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+    uint64_t current_cr3 = arch_read_cr3();
     const uint64_t *kernel_pml4 =
         (const uint64_t *)(uintptr_t)(current_cr3 & USER_PTE_FRAME_MASK);
     for (int i = 0; i < 512; i++) shadow_pml4[i] = kernel_pml4[i];
@@ -120,6 +120,18 @@ static void shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
     uint64_t flags = USER_PTE_PRESENT;
     if (guest_pte & USER_PTE_WRITE) flags |= USER_PTE_WRITE;
     user_map_page(shadow_pml4, gva & ~(uint64_t)0xFFF, frame, flags);
+
+    /* user_map_page() does not invalidate, and iretq re-executes the faulting
+     * instruction immediately. For a NOT-PRESENT fault that is harmless: x86
+     * does not cache non-present translations, so the retry walks the table we
+     * just wrote. For a PERMISSION fault it is not: the read-only entry IS in
+     * the TLB, the new writable PTE is invisible to it, the write faults again,
+     * and the handler installs the same PTE forever. A guest page that starts
+     * read-only and later becomes writable -- copy-on-write, a loader marking
+     * .data, any normal OS behaviour -- hits exactly that.
+     *
+     * One instruction on a path that has already taken a page fault. */
+    qemu_sls_invlpg(gva & ~(uint64_t)0xFFF);
 }
 
 /* ─── qemu_sls_mmu_shadow_fault ─────────────────────────────────────────── */
@@ -136,6 +148,26 @@ static void shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
 int qemu_sls_mmu_shadow_fault(uint64_t faulting_gva, uint32_t error_code) {
     if (!initialized) return 1;
     (void)error_code;
+
+    /* ─── Only ever resolve faults taken BY guest code ─────────────────────
+     * handle_page_fault() calls this for every kernel-mode #PF, at any
+     * address. The shadow table maps guest VIRTUAL addresses directly, so
+     * there is no address range that separates "a guest access" from "the
+     * kernel dereferencing a bad pointer" -- the two spaces overlap by
+     * construction.
+     *
+     * Without this flag, once a guest's RAM and page tables exist, an
+     * unrelated kernel fault gets walked against the guest's tables. If the
+     * guest happens to map that address, this installs a PTE into the shadow
+     * PML4 -- which is NOT the live CR3 when the kernel is running -- and
+     * returns 0. iretq then re-executes the faulting instruction, it faults
+     * again, and the kernel spins in the fault handler forever instead of
+     * halting with the diagnosable [FAULT] line that says what went wrong.
+     *
+     * The launcher sets this around sls_exec_run() and clears it on exit, so
+     * the answer is "is guest code on the stack right now", which is the
+     * actual question. */
+    if (!qemu_sls_guest_active) return 1;
 
     uint64_t cr3_gpa = qemu_sls_guest_cr3 & ~(uint64_t)0xFFF;
     const uint64_t *pml4 = gpa_to_hva(cr3_gpa);
