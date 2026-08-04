@@ -72,9 +72,25 @@ done
 # sends the next hour in the wrong direction.
 step "2. check the kernel ELF"
 [ -f "$KERNEL_ELF" ] || die "$KERNEL_ELF not found -- run from the repo root"
-file "$KERNEL_ELF" | grep -q ELF \
-    || die "$KERNEL_ELF is not an ELF file. If the build was changed to emit a
-       flat binary, gdb has no symbols to work with and this script is useless."
+
+# readelf, not file(1). The first version piped `file` into grep, and on a host
+# without file(1) installed the pipeline failed and this reported "$KERNEL_ELF
+# is not an ELF file" -- a confident conclusion about something it had never
+# looked at. A missing TOOL and a wrong FILE are different problems with
+# different fixes, and a check that cannot tell them apart is worse than no
+# check, because it sends the reader somewhere specific and wrong.
+#
+# readelf is required for the .symtab test below anyway, so this removes a
+# dependency rather than adding one.
+command -v readelf >/dev/null \
+    || die "readelf not found. Install binutils -- this cannot verify the kernel
+       image without it, and proceeding would mean attaching gdb to symbols
+       nothing has checked."
+
+readelf -h "$KERNEL_ELF" >/dev/null 2>&1 \
+    || die "$KERNEL_ELF is not an ELF file (readelf could not read its header).
+       If the build was changed to emit a flat binary, gdb has no symbols to
+       work with and this script is useless."
 readelf -S "$KERNEL_ELF" 2>/dev/null | grep -q '\.symtab' \
     || die "$KERNEL_ELF has no .symtab -- it has been stripped, so gdb cannot
        name functions. Rebuild without stripping."
