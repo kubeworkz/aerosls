@@ -121,7 +121,10 @@ TCG_OBJS = \
     tcg-objs/tcg-op-vec.x86.o \
     tcg-objs/tcg-op-gvec.x86.o \
     tcg-objs/optimize.x86.o \
-    tcg-objs/region.x86.o
+    tcg-objs/region.x86.o \
+    tcg-objs/tcg-runtime.x86.o \
+    tcg-objs/tcg-runtime-gvec.x86.o \
+    tcg-objs/sls-helper-stubs.x86.o
 
 # tcg-objs/tci.x86.o deliberately NOT built.
 #
@@ -142,7 +145,13 @@ TCG_OBJS = \
 # print_insn_tci, tcg_qemu_tb_exec). Re-add it only alongside
 # -DCONFIG_TCG_INTERPRETER, which switches the whole engine to the interpreter.
 
-VPATH += ../qemu/sls ../qemu/tcg
+# accel/tcg is here for tcg-runtime.c and tcg-runtime-gvec.c, which define the
+# ~200 helper_info_* metadata objects plus the helper functions they point at.
+# tcg-op.c, tcg-op-ldst.c and tcg-op-gvec.c all reference those symbols through
+# macro expansion (glue(helper_info_, NAME)), so they never appear as text in
+# any source file and cannot be found by grepping for them -- they surface only
+# at link time, all at once.
+VPATH += ../qemu/sls ../qemu/tcg ../qemu/accel/tcg
 
 # --- RISC-V 64-Bit Toolchain ---
 RV_CC       = riscv64-unknown-elf-gcc
