@@ -711,6 +711,15 @@ Because the three `status`/`list`/`tree` forms go through IPC, the shell returns
 | Command | What it does |
 | --- | --- |
 | `qemu run <hex>` | Decodes `<hex>` as a guest binary and runs it through the TCG engine via `sls_launch_guest(bin, len, entry_gpa=0, max_insns=100000)`. |
+| `qemu bench [loads]` | Builds an unrolled straight-line guest program of `loads` (default 4096) `MOV EAX,[EBX+disp32]` instructions striding 64 bytes, runs it once, and reports cycles via `rdtsc`. |
+
+`qemu bench` exists to measure the **one** thing the shadow-page-table work changes: the cost of a guest memory load through generated code. Three things about the number:
+
+- The program is **straight-line, not a loop**. Every control-flow instruction in the frontend exits the TB to the C dispatcher, so a loop would measure the interpreter rather than the generated code.
+- The cycle count **includes translation**, because the frontend re-translates on every launch. With a large `loads` count that is amortised and roughly equal in both configurations, so the *ratio* between softmmu-on and softmmu-off is dominated by execution; the absolute cycles/load is an upper bound.
+- It is a **microbenchmark of the load path**, not a workload. A ratio taken from it describes the load path and should be described that way.
+
+The output states `softmmu=ON|OFF`, read from the same `tcg_use_softmmu` the backend compiled with, so a run cannot be attributed to the wrong configuration.
 
 Three limits worth knowing before using it: the decode buffer is a fixed **4096 bytes**, so anything longer is silently truncated; the hex parser accepts spaces between byte pairs but does **no validation**, so a non-hex character decodes to garbage rather than an error; and execution stops after 100,000 instructions whether or not the guest halted.
 

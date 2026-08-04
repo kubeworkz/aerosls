@@ -1949,6 +1949,24 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // Loads a hex-encoded flat x86 binary into guest RAM and executes it.
         // Example: qemu run b0 48 e6 e9 b0 0a e6 e9 f4
         //   (MOV AL,'H'; OUT 0xe9,AL; MOV AL,LF; OUT 0xe9,AL; HLT)
+        else if (sh_starts(input_buffer, "qemu bench")) {
+            /* Measures the guest LOAD path -- the only thing the shadow-PT
+             * change affects. Optional argument = number of unrolled loads;
+             * default 4096, which amortises the per-launch translation cost. */
+            extern int sls_bench_load_path(uint32_t n_loads, uint64_t *cycles,
+                                           uint32_t *insns);
+            uint32_t n = 4096;
+            const char *arg = input_buffer + 10;
+            while (*arg == ' ') arg++;
+            if (*arg >= '0' && *arg <= '9') {
+                uint32_t v = 0;
+                while (*arg >= '0' && *arg <= '9') v = v * 10 + (uint32_t)(*arg++ - '0');
+                if (v) n = v;
+            }
+            uint64_t cyc = 0; uint32_t insns = 0;
+            if (sls_bench_load_path(n, &cyc, &insns) < 0)
+                kernel_serial_print("[SLS-BENCH] refused: load count out of range\n");
+        }
         else if (sh_starts(input_buffer, "qemu run ")) {
             extern int sls_launch_guest(const void *image, uint32_t len,
                                         uint64_t entry_gpa, uint32_t max_insns);
