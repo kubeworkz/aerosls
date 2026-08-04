@@ -211,6 +211,70 @@ for a ceiling, and it must be stated wherever the number is used.
 
 ---
 
+## 5b. Measured: the softmmu=ON baseline
+
+**First reproducible measurement in this project. 2026-08-04, node 2.**
+
+```
+qemu bench 500   ->  502 insn(s) compiled, 0 interpreted
+                     CODE  43,293 bytes emitted  ->  86 bytes/load
+                     softmmu = ON
+```
+
+**86 bytes of host code per guest load** is the A/B baseline. Step 5 re-runs the
+identical command with `tcg_use_softmmu` false; the two byte counts are the
+comparison. Report both framings:
+
+- **total bytes/load, ON vs OFF** — the honest end-to-end cost of a guest load
+- **ON − OFF** — the bytes attributable to the inlined TLB lookup specifically
+
+### Why bytes and not cycles
+
+The cycle columns from the same run are **not usable**, and the reason is worth
+recording because it applies to every future measurement taken on this host:
+
+```
+EXEC       26,350,118 cycles  ->  52,700 cycles/load
+TRANSLATE 144,597,112 cycles in 8 blocks
+```
+
+52,700 cycles for one `MOV EAX,[EBX+disp32]` is roughly fifty times too high. A
+softmmu load is 10–20 host instructions; even at 50× outer-emulation overhead
+that is about a thousand cycles. The node runs under host `qemu-system-x86_64`
+with **no KVM** (Hetzner Cloud does not expose nested virtualisation on this
+instance type — `/dev/kvm` is absent). Our JIT emits fresh host code at fresh
+addresses, so the outer emulator must translate that code before running it,
+every time, because it is always cold. EXEC is timing **the outer emulator
+compiling our JIT's output**, not our output executing.
+
+**That confound is not neutral.** With softmmu off, each load emits a bare MOV
+instead of an inlined TLB lookup — less host code, so less outer-translation
+work. A cycle-based A/B on this box would report a speedup partly composed of
+"fewer instructions for the outer emulator to compile", biasing the result **in
+our favour**. For a number whose purpose is to justify a strategy, that is the
+worst possible direction to be wrong in.
+
+Generated-code size has none of those problems: it is what TCG emitted, counted
+before anything runs. Deterministic, unaffected by the outer emulator, the TSC,
+or host load.
+
+### What this number is not
+
+It is **not a speedup figure** and must not be quoted as one. Fewer bytes is
+strong evidence of less work per access; converting that to time depends on
+cache behaviour and host pipeline effects this hardware cannot observe. §9's
+requirement stands unchanged: **no timing claim is publishable without KVM or
+real non-x86 hardware.**
+
+### Open
+
+Determinism is *asserted* above, not yet *verified*. Two consecutive runs must
+produce byte-identical totals (43,293). Until that is checked, the zero-variance
+claim is exactly the kind of reasonable-sounding assumption this document exists
+to distrust.
+
+---
+
 ## 6. Node 2 — the undiagnosed silent halt
 
 **Status: open. Blocking, and would have been blocking under any direction.**
