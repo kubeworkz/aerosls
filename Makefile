@@ -14,9 +14,23 @@ ALLOC_PLUGIN    = libSLSAllocationPassV2.so
 # --- x86_64 Toolchain ---
 X86_CC      = x86_64-elf-gcc
 X86_LD      = x86_64-elf-ld
+# -Wframe-larger-than: a kernel has no stack guard page and no way to grow the
+# stack, so a large frame is not a style issue -- it is silent memory
+# corruption. sls_shell_execute() carried a 276,032-byte frame against a 64 KiB
+# stack for months; every shell command wrote ~208 KiB past stack_bottom into
+# .bss, and it only surfaced once TCG started using the arena that lived there.
+# This flag would have printed the number in seconds at any point.
+#
+# A WARNING, not an error: shell.c and http.c are over budget today (276 KB and
+# 266 KB), and turning that into a hard build failure would block work on a
+# problem that needs a considered refactor, not a rushed one. The hard gate is
+# tests/stack_frame_budget_check.sh, which asserts frames stay within the
+# ACTUAL stack size -- the invariant that matters, since a threshold unrelated
+# to the stack it must fit in is just a number.
 X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
               -mno-sse -mno-sse2 -mno-mmx \
-              -fno-pie -fno-pic -fno-tree-vectorize
+              -fno-pie -fno-pic -fno-tree-vectorize \
+              -Wframe-larger-than=16384
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
 X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm

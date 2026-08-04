@@ -29,7 +29,36 @@ align 16
 ; bottom", and those want completely different investigations.
 global stack_bottom
 global stack_top
-stack_bottom: resb 4096 * 16
+
+; ─── Size: 1 MiB, raised from 64 KiB ──────────────────────────────────────────
+; sls_shell_execute() compiles to a 276,032-byte stack frame -- more than four
+; times the old 64 KiB stack. EVERY shell command, local or over HTTP, therefore
+; ran with RSP roughly 208 KiB BELOW stack_bottom, writing into whatever .bss
+; followed. Three separate faults were captured at 212,768 / 212,864 / 212,880
+; bytes past the bottom: the offset is constant because it is one fixed frame,
+; not recursion.
+;
+; It went unnoticed for months because the memory being trampled -- the top of
+; sls_heap, the QEMU-SLS bump arena -- was unused until TCG was linked in.
+; Overwriting memory nobody reads is invisible. The moment `qemu bench` made
+; TCG allocate from that arena, the shell's stack frame and tcg_init_ctx
+; occupied the same bytes, and the node halted on the first TCG initialisation.
+;
+; 1 MiB gives ~3.5x headroom over the largest known frame. It is not a licence
+; for larger frames: tests/stack_frame_budget_check.sh asserts the two numbers
+; stay in a fixed relationship, and X86_CFLAGS carries -Wframe-larger-than so a
+; new offender is visible at compile time rather than as a fault address.
+;
+; The cost is 1 MiB of nobits .bss on a node with 1 GiB. The alternative --
+; auditing ~1400 lines of shell branches to shrink a frame built from hundreds
+; of small locals GCC declines to overlap -- is a far larger change with far
+; more room to introduce a subtler bug.
+;
+; Kept as its own top-level output section in arch/x86/linker.ld: nested inside
+; .bss the wildcard did not match, the section became an orphan placed ABOVE
+; PROVIDE(_kernel_image_end), and the frame allocator handed out live kernel
+; stack. See tests/kernel_image_end_check.sh, which asserts it stays covered.
+stack_bottom: resb 4096 * 256
 stack_top:
 
 ; ─── Early page tables (BSS — zeroed by GRUB) ────────────────────────────────
