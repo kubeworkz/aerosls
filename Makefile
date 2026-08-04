@@ -121,8 +121,26 @@ TCG_OBJS = \
     tcg-objs/tcg-op-vec.x86.o \
     tcg-objs/tcg-op-gvec.x86.o \
     tcg-objs/optimize.x86.o \
-    tcg-objs/region.x86.o \
-    tcg-objs/tci.x86.o
+    tcg-objs/region.x86.o
+
+# tcg-objs/tci.x86.o deliberately NOT built.
+#
+# tci.c is the TCG *interpreter*. This build uses the native x86_64 backend:
+# tcg.c includes "tcg-target.c.inc", resolved by QEMU_INC to tcg/x86_64, and
+# CONFIG_TCG_INTERPRETER is defined nowhere. Two consequences make tci.c not
+# merely unnecessary but harmful here:
+#
+#   1. It switches on INDEX_op_tci_* opcodes, which come from
+#      tcg/tci/tcg-target-opc.h.inc via tcg-opc.h:183. With -I tcg/x86_64 that
+#      include resolves to the x86_64 opcode list instead, so all fifteen are
+#      undeclared -- which is exactly how this surfaced.
+#   2. It defines tcg_qemu_tb_exec as a FUNCTION. Outside CONFIG_TCG_INTERPRETER
+#      tcg.h declares that name as a function POINTER which tcg.c:1857 fills in
+#      from the generated prologue. Linking both would be a symbol conflict.
+#
+# Nothing outside tci.c references its symbols (checked: tci_disas,
+# print_insn_tci, tcg_qemu_tb_exec). Re-add it only alongside
+# -DCONFIG_TCG_INTERPRETER, which switches the whole engine to the interpreter.
 
 VPATH += ../qemu/sls ../qemu/tcg
 
