@@ -20,6 +20,7 @@
 uint64_t qemu_sls_guest_cr3  = 0;
 uint64_t qemu_sls_shadow_cr3 = 0;
 int      qemu_sls_guest_active = 0;
+int      qemu_sls_guest_paging_on = 0;   /* CR0.PG; 0 at reset, as on hardware */
 
 static uint64_t        *shadow_pml4;
 static QemuGuestRegion  regions[QEMU_MAX_REGIONS];
@@ -301,6 +302,29 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
      */
     if (!shadow_va_in_window(faulting_addr)) return 1;
     uint64_t faulting_gva = faulting_addr - QEMU_GPA_HOST_BASE;
+
+    /* ─── With paging off there is nothing to walk ─────────────────────────
+     * The guest's virtual addresses are its physical ones, so the contiguous
+     * window built by map_guest_ram() already resolves every legitimate
+     * access. A fault reaching here means an unbacked GPA -- an error to be
+     * reported, not resolved.
+     *
+     * Walking qemu_sls_guest_cr3 anyway is actively dangerous: with paging off
+     * it holds whatever the guest last wrote, or nothing. A walk over arbitrary
+     * guest memory readily finds words with the PRESENT bit set, and the walker
+     * would install a mapping to a frame chosen by garbage and return
+     * "handled". The guest then reads the wrong page, silently, with no fault
+     * and no log line. Returning 1 turns that into the [FAULT] report the
+     * address deserves. */
+    if (!qemu_sls_guest_paging_on) {
+        kernel_serial_printf(
+            "[QEMU-SLS MMU] fault at GPA 0x%016lx with guest paging OFF -- that GPA "
+            "is not backed by guest RAM. Not walking CR3: with paging off it "
+            "describes nothing, and a walk over guest memory can find plausible "
+            "garbage and resolve to the wrong frame.\n",
+            faulting_gva);
+        return 1;
+    }
 
     /* ─── Only ever resolve faults taken BY guest code ─────────────────────
      * handle_page_fault() calls this for every kernel-mode #PF, at any

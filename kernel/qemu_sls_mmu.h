@@ -88,6 +88,25 @@ typedef struct {
 /* Written by TCG vCPU on every emulated MOV to CR3. */
 extern uint64_t qemu_sls_guest_cr3;
 
+/* ─── Does the guest have paging enabled? ──────────────────────────────────
+ * Set from the emulated CR0.PG bit; 0 at reset, as on real hardware.
+ *
+ * This is not a detail. With paging OFF the guest's virtual addresses ARE its
+ * physical addresses, so map_guest_ram()'s contiguous window already resolves
+ * every access and no fault should ever reach the shadow walker. If one does,
+ * it means the guest touched an unbacked GPA -- a real error that must be
+ * reported, not "resolved".
+ *
+ * Walking qemu_sls_guest_cr3 in that state is worse than useless: with paging
+ * off, CR3 holds whatever the guest last wrote or nothing at all, and a walk
+ * over arbitrary guest memory can easily find bit patterns with the PRESENT
+ * bit set. The walker would then install a mapping to a frame chosen by
+ * garbage, return "handled", and the guest would quietly read the wrong page.
+ * A wrong answer that looks like a right one -- which is the single most
+ * expensive failure shape this project has met.
+ */
+extern int qemu_sls_guest_paging_on;
+
 /* Physical address of the shadow PML4; load into CR3 before running TCG code. */
 extern uint64_t qemu_sls_shadow_cr3;
 

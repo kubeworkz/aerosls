@@ -324,8 +324,18 @@ int main(void) {
     CHECK(qemu_sls_dma_frame_phys((uint64_t)QEMU_GUEST_RAM_PAGES * FRAME_SIZE) == 0,
           "*** a GPA past the tracked span returns 0, not an out-of-bounds read ***");
 
-    /* Everything below faults on behalf of guest code. */
+    /* Everything below faults on behalf of guest code, with the guest's own
+     * paging enabled -- which is the only state in which walking
+     * qemu_sls_guest_cr3 means anything.
+     *
+     * These tests set only guest_active until the paging flag existed, and
+     * seventeen of them failed the moment it did. They were not wrong about
+     * the walk; they were silent about a precondition they depended on. With
+     * paging off the guest's virtual addresses are its physical ones, the
+     * window resolves every access directly, and a fault reaching the walker
+     * is an error rather than something to resolve. */
     qemu_sls_guest_active = 1;
+    qemu_sls_guest_paging_on = 1;
 
     printf("\n-- the 4 KiB walk --\n");
     {
@@ -571,6 +581,45 @@ int main(void) {
               "...and so is a low kernel-range address");
         /* guest_active deliberately LEFT SET: the invlpg block below depends on
          * it, and clearing it here made four unrelated checks fail. */
+    }
+
+    printf("\n-- with guest paging OFF, CR3 is not walked --\n");
+    {
+        /* Real x86 boots with CR0.PG clear and enables paging later, so this
+         * is the state every guest starts in, not a corner case.
+         *
+         * The danger being guarded is specific: with paging off, CR3 holds
+         * whatever the guest last wrote or nothing at all. A four-level walk
+         * over arbitrary guest memory readily finds words with the PRESENT bit
+         * set -- so the walker would resolve to a frame chosen by garbage,
+         * return "handled", and the guest would read the wrong page with no
+         * fault and no log line.
+         *
+         * To make that concrete rather than theoretical, guest_cr3 is pointed
+         * at a table that IS valid and WOULD resolve. If the walk happens, it
+         * succeeds -- and succeeding is the bug. */
+        const uint64_t gva = 0x00000000DEADB000ULL;
+        qemu_sls_guest_cr3 = build_guest_pt_4k(gva, 2 * FRAME_SIZE,
+                                               USER_PTE_PRESENT | USER_PTE_WRITE, 4);
+        qemu_sls_guest_active = 1;
+
+        qemu_sls_guest_paging_on = 1;
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 0 &&
+              g_map_count == 1,
+              "control: with paging ON this exact mapping resolves");
+
+        qemu_sls_guest_paging_on = 0;
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0) == 1,
+              "*** with paging OFF the SAME fault is refused -- the walk is "
+              "skipped, not merely unsuccessful ***");
+        CHECK(g_map_count == 0,
+              "*** and no PTE was installed. The control above proves the walk "
+              "would have SUCCEEDED, so this is the flag being honoured and not "
+              "an unrelated failure ***");
+
+        qemu_sls_guest_paging_on = 1;   /* restore for the blocks below */
     }
 
     printf("\n-- the TLB is invalidated, not just the table written --\n");
