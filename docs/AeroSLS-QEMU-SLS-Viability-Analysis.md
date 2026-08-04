@@ -45,6 +45,33 @@ With AeroSLS controlling page tables directly:
 
 **Expected impact:** 3–5x speedup on memory-intensive workloads (validated by KQEMU's historical results and FEX-Emu's MMU-bypass measurements).
 
+> **⚠ CORRECTION (2026-08-04) — this line must not be quoted as an AeroSLS claim.**
+> See `AeroSLS-QEMU-SLS-Cross-ISA-Repositioning-v0.1.md`.
+>
+> **It has never been measured on AeroSLS.** It is inherited from two other
+> projects, and the two citations point in opposite directions:
+>
+> - **KQEMU** did exactly this — host-MMU memory access instead of software
+>   translation — and was made redundant by KVM and removed from QEMU. It is the
+>   tombstone for the *same-ISA* version of this strategy, not validation of it.
+> - **FEX-Emu** is alive because it runs x86-64 guests on **ARM** hosts, where no
+>   hardware virtualization exists or can exist.
+>
+> The engineering in this phase is correct. The premise underneath it was not:
+> QEMU uses TCG **only when hardware virtualization cannot be used at all**. Where
+> guest and host share an ISA, KVM/HVF/WHPX run at roughly native speed and TCG is
+> never reached. A 3–5x TCG improvement in that configuration competes with an
+> accelerator already 10–50x faster.
+>
+> The phase retains its value **only for cross-ISA emulation** (x86 guest on
+> ARM/RISC-V host, or the reverse), where binary translation is not a fallback but
+> the only mechanism that exists. Note also that `tcg_use_softmmu` is already
+> `false` for `CONFIG_USER_ONLY` (`tcg/tcg-internal.h:37`) — qemu-user has shipped
+> this memory model for years. The novel work here is doing it in **full-system**
+> mode, which requires shadowing guest page tables and therefore requires owning
+> the host's page tables. That part remains genuinely unavailable to any userspace
+> emulator, and is the real claim.
+
 **Estimated effort:** 1–2 weeks on top of Phase 0.
 
 ---
@@ -112,7 +139,7 @@ The "hard" part — actually making the optimizer produce better code — is bou
 | **Phase** | **Feasibility**                              | **Impact**                    | **Effort** | **Dependencies** |
 | --------- | -------------------------------------------- | ----------------------------- | ---------- | ---------------- |
 | 0         | **High** (mechanical porting)                | Baseline — no speedup yet     | 2–4 weeks  | None             |
-| 1         | **Very High** (AeroSLS's sweet spot)         | **3–5x** speedup              | 1–2 weeks  | Phase 0          |
+| 1         | **Very High** (AeroSLS's sweet spot)         | **3–5x** speedup — ⚠ unmeasured, see §Phase 1 correction | 1–2 weeks  | Phase 0          |
 | 2         | **Very High** (SLS makes it trivial)         | Eliminates cold-start penalty | 1 week     | Phase 0          |
 | 3         | **High** (bounded by existing TCG optimizer) | 10–30% on hot loops           | 2–3 weeks  | Phase 2          |
 | 4         | **Trivial** (consequence of prior phases)    | Polish + integration          | 1 week     | Phases 1–3       |

@@ -1955,7 +1955,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
              * default 4096, which amortises the per-launch translation cost. */
             extern int sls_bench_load_path(uint32_t n_loads, uint64_t *cycles,
                                            uint32_t *insns);
-            uint32_t n = 4096;
+            uint32_t n = 256;   /* one TB holds TCG_MAX_INSNS (512) */
             const char *arg = input_buffer + 10;
             while (*arg == ' ') arg++;
             if (*arg >= '0' && *arg <= '9') {
