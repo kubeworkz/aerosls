@@ -107,6 +107,40 @@ extern uint64_t qemu_sls_guest_cr3;
  */
 extern int qemu_sls_guest_paging_on;
 
+/* ─── Turning paging ON needs a SECOND window. Not yet built. ──────────────
+ *
+ * With paging off, map_guest_ram() identity-maps (GPA + window) → frame(GPA),
+ * and that mapping is SHARED between the shadow root and the kernel root
+ * (init copies all 512 PML4 entries by value; map_guest_ram publishes the
+ * window entry back). Emitted guest code and the emulator therefore agree,
+ * because with paging off guest virtual == guest physical and there is only
+ * one correct answer.
+ *
+ * The moment the guest enables paging that stops being true:
+ *
+ *   - guest code at GVA V accesses V + window, which must resolve to
+ *     frame(P), where the guest's own tables translate V → P
+ *   - the emulator must still read GPA P at P + window to walk those very
+ *     tables (gpa_to_hva)
+ *
+ * One linear address, two required meanings, one shared page table. Whichever
+ * is installed, the other silently reads the wrong frame -- no fault, no log
+ * line. Exactly the failure shape qemu_sls_guest_paging_on was added to stop.
+ *
+ * The fix is NOT copy-on-write page tables. It is two windows:
+ *
+ *   EMULATOR window  (this one, QEMU_GPA_HOST_BASE): identity GPA → frame,
+ *       in both roots, never changes. How the emulator reaches guest memory.
+ *   GUEST window     (a second PML4 slot): guest_base for emitted code, in
+ *       the SHADOW root only. Identity while paging is off; populated by
+ *       shadow_fault from the guest's tables once it is on.
+ *
+ * Two slots, two purposes, no cloning and no world switch. Until that exists,
+ * qemu_sls_guest_paging_on must never be set to 1 in production -- see the
+ * refusal in sls-launcher.c's MOV CR0 handler.
+ */
+#define QEMU_GUEST_WINDOW_UNIMPLEMENTED 1
+
 /* Physical address of the shadow PML4; load into CR3 before running TCG code. */
 extern uint64_t qemu_sls_shadow_cr3;
 
