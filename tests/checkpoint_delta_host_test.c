@@ -17,9 +17,13 @@
 
 static int checks_passed = 0;
 static int checks_failed = 0;
+/* Passes print too, and at column 0. tests/run_all.sh counts checks with
+ * grep -c '^ok:', so a file that counted passes silently reported "0 checks"
+ * while running 30 of them -- indistinguishable in the suite output from a
+ * test that had quietly stopped asserting anything. */
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); checks_failed++; } \
-    else         { checks_passed++; } \
+    else         { printf("ok:   %s\n", msg); checks_passed++; } \
 } while (0)
 
 /* ─── Scenario 1: initial state is all-dirty ───────────────────────── */

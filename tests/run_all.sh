@@ -35,6 +35,19 @@ extract_build_cmd() {
         /\* *gcc / { grab=1 }
         grab {
             line = $0
+            # ─── Strip CR before anything else ────────────────────────────
+            # This repository is edited on Windows and three test files are
+            # CRLF. A backslash continuation then ends "\" CR, and bash does
+            # not treat that as a continuation -- so every line of the build
+            # command ran as a SEPARATE command. The result was
+            #     ld: cannot find : No such file or directory
+            #     -o: command not found
+            #     tests/foo.c: line 2: LICENSE: command not found
+            # i.e. the C source being executed as a shell script, reported by
+            # run_all.sh as "compile error". Two tests were red for a long time
+            # over a line ending, and the message pointed at the compiler,
+            # which was never involved.
+            gsub(/\r/, "", line)
             sub(/^[[:space:]]*\*[[:space:]]?/, "", line)
             print line
             if (line !~ /\\[[:space:]]*$/) { exit }

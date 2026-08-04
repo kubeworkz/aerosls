@@ -35,8 +35,8 @@
 
 static int checks_passed = 0, checks_failed = 0;
 #define CHECK(cond, msg) do { \
-    if (cond) { checks_passed++; printf("  ok   %s\n", msg); } \
-    else      { checks_failed++; printf("  FAIL %s\n", msg); } \
+    if (cond) { checks_passed++; printf("ok:   %s\n", msg); } \
+    else      { checks_failed++; printf("FAIL: %s\n", msg); } \
 } while (0)
 
 int main(void) {
