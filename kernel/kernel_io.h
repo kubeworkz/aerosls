@@ -64,6 +64,35 @@ int console_feed(char c, char* out, size_t cap);
  * as bytes kept arriving. */
 int serial_console_poll(char* out, size_t cap);
 
+/* ─── Panic-path output ────────────────────────────────────────────────────
+ * Use these, NOT kernel_serial_print/printf, from any path that is reporting a
+ * fault, a panic, or anything else that halts the machine.
+ *
+ * kernel_serial_putchar() consults capture_buf on every character (see the
+ * capture note above). While a shell command is running, that pointer is
+ * non-NULL, so output goes to a memory buffer instead of the UART -- and a
+ * halting path never reaches the kernel_serial_capture_stop() that would flush
+ * it. The message is written, and then discarded, and the log shows nothing.
+ *
+ * That is not hypothetical: it hid a kernel page fault for an entire debugging
+ * session. gdb showed the CPU stopped two instructions past the printf that
+ * was supposed to have reported it, while the serial log had no [FAULT] line
+ * at all.
+ *
+ * These functions touch no globals -- no capture state, no VGA state, no
+ * lookup tables -- so they also work when .bss is what got corrupted, which is
+ * a real possibility in the situations where they get called. They wait a
+ * bounded time for the transmitter and then write anyway: a dropped character
+ * beats a panic handler that hangs.
+ *
+ * See kernel/kernel_io.c for the full rationale and
+ * tests/kernel_panic_output_host_test.c for the assertions.
+ */
+void kernel_panic_putchar(char c);
+void kernel_panic_puts(const char* s);
+void kernel_panic_hex64(uint64_t v);      /* prints 0x + 16 hex digits */
+void kernel_panic_dec(uint64_t v);
+
 // Print message to serial and halt all cores
 void kernel_panic(const char* msg);
 

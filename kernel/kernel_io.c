@@ -3,14 +3,23 @@
 #include "../arch/x86/vga.h"
 
 // ─── x86 Port I/O ─────────────────────────────────────────────────────────────
+/* Wrapped in #ifndef so tests/kernel_io_panic_port.h can substitute recording
+ * hooks. Port I/O is privileged, so without a seam here the panic path is
+ * untestable on the host -- and an untestable panic path is exactly how this
+ * kernel came to have one that could not print. Same reasoning as
+ * arch_read_cr3() and qemu_sls_invlpg(). */
+#ifndef outb
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
+#endif
+#ifndef inb
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
+#endif
 
 // ─── Serial initialisation (9600 8N1, no IRQs) ────────────────────────────────
 void serial_init(void) {
@@ -45,6 +54,97 @@ size_t kernel_serial_capture_stop(void) {
     capture_len = 0;
     capture_cap = 0;
     return n;
+}
+
+/* ─── Panic-path output ────────────────────────────────────────────────────
+ *
+ * Everything below writes to the UART directly and touches NO global state.
+ * That is the entire point, and it was bought at a cost worth recording.
+ *
+ * ─── What happened ────────────────────────────────────────────────────────
+ * A `qemu bench 8` issued over HTTP took a kernel page fault and halted. The
+ * serial log showed NOTHING: no [SLS-BENCH], no [QEMU-SLS MMU], and no [FAULT]
+ * -- even though gdb later proved the CPU was stopped on the `cli; hlt` two
+ * instructions PAST the kernel_serial_printf() that reports the fault.
+ *
+ * The reason is directly above: user/shell.c:457 calls
+ * kernel_serial_capture_start() before running a command, so every character
+ * the command produces is diverted into a memory buffer and never reaches the
+ * UART. The command halted before the matching _stop() at shell.c:2812, so the
+ * buffer was never flushed and the HTTP response was never sent. The output
+ * existed; it just had nowhere to go.
+ *
+ * That cost an entire debugging session. Six successive hypotheses were built
+ * on "the log does not show X, therefore X did not happen" -- and the log was
+ * incapable of showing anything at all. This project already had the rule that
+ * covers it: AN ABSENCE IS NOT A MEASUREMENT.
+ *
+ * ─── Why not simply call kernel_serial_capture_stop() first ───────────────
+ * Because capture_buf, capture_len and capture_cap are in .bss, and .bss is
+ * one of the things that can be unmapped or corrupted when the kernel is
+ * panicking. A panic handler must not depend on the health of the machinery it
+ * exists to report on. kernel_serial_putchar() reads capture_buf on EVERY
+ * character, so it faults on its own first instruction in exactly the scenario
+ * where its output matters most -- and a fault inside a fault handler is a
+ * double fault, which reboots the machine and destroys the evidence.
+ *
+ * ─── The constraints these functions honour ───────────────────────────────
+ *   - No .bss and no .data reads. SERIAL_COM1_BASE is a compile-time constant;
+ *     every local here lives in a register.
+ *   - No lookup tables. kernel_serial_print_hex64() indexes a static const
+ *     char[]; the digit is computed arithmetically instead. (.rodata is
+ *     normally mapped with .text, but the format strings are already an
+ *     unavoidable .rodata dependency and there is no reason to add another.)
+ *   - No VGA mirroring. vga_is_ready() reads driver state.
+ *   - Minimal stack. RSP was 208 KiB outside the bootstrap stack when this was
+ *     written, so the stack is not to be trusted either.
+ *   - A BOUNDED wait for the transmitter, unlike kernel_serial_putchar()'s
+ *     unbounded spin. A panic that hangs forever waiting on a UART that will
+ *     never drain is strictly worse than a panic that drops a character: the
+ *     first tells you nothing, the second tells you almost everything.
+ *
+ * Asserted by tests/kernel_panic_output_host_test.c, which drives these with a
+ * capture buffer ACTIVE and checks the bytes arrive at the port rather than in
+ * the buffer -- the far side of the boundary being crossed.
+ */
+
+/* Spin limit for the transmitter-holding-register-empty poll. At 115200 baud
+ * one character is ~87 us; this is many thousands of character times, so it
+ * expires only when the UART is genuinely not draining. */
+#define PANIC_TX_SPIN 1000000UL
+
+void kernel_panic_putchar(char c) {
+    for (unsigned long i = 0; i < PANIC_TX_SPIN; i++) {
+        if (inb(SERIAL_COM1_BASE + 5) & 0x20) break;
+    }
+    /* Written even if the poll expired -- see the bounded-wait note above. */
+    outb(SERIAL_COM1_BASE, (uint8_t)c);
+}
+
+void kernel_panic_puts(const char* s) {
+    if (!s) s = "(null)";
+    while (*s) {
+        if (*s == '\n') kernel_panic_putchar('\r');
+        kernel_panic_putchar(*s++);
+    }
+}
+
+void kernel_panic_hex64(uint64_t v) {
+    kernel_panic_putchar('0');
+    kernel_panic_putchar('x');
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        unsigned nyb = (unsigned)((v >> shift) & 0xFu);
+        kernel_panic_putchar(nyb < 10u ? (char)('0' + nyb)
+                                       : (char)('a' + (nyb - 10u)));
+    }
+}
+
+void kernel_panic_dec(uint64_t v) {
+    char tmp[21];
+    int  len = 0;
+    if (v == 0) { kernel_panic_putchar('0'); return; }
+    while (v && len < (int)sizeof tmp) { tmp[len++] = (char)('0' + (v % 10u)); v /= 10u; }
+    while (len-- > 0) kernel_panic_putchar(tmp[len]);
 }
 
 // ─── Output primitives ────────────────────────────────────────────────────────
@@ -241,9 +341,15 @@ void read_line(char* buf) {
 
 // ─── kernel_panic ─────────────────────────────────────────────────────────────
 void kernel_panic(const char* msg) {
-    kernel_serial_print("\n[KERNEL PANIC] ");
-    kernel_serial_print(msg);
-    kernel_serial_print("\n-- System Halted --\n");
+    /* kernel_panic_puts(), not kernel_serial_print(). This function used the
+     * latter, which means every panic raised while an HTTP shell command was
+     * running went into that command's capture buffer and was never seen --
+     * and a panic is precisely the event that prevents the buffer from ever
+     * being flushed. The failure was silent and total. See the panic-path
+     * header comment above. */
+    kernel_panic_puts("\n[KERNEL PANIC] ");
+    kernel_panic_puts(msg);
+    kernel_panic_puts("\n-- System Halted --\n");
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }

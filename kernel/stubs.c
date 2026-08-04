@@ -60,6 +60,13 @@ int memcmp(const void* a, const void* b, size_t n) {
 // ─── Page fault handler ───────────────────────────────────────────────────────
 // Called from isr14_stub.  Error code bit 2 (U/S): set = Ring-3 fault → kill
 // the process and return to kernel.  Clear = kernel fault → panic.
+/* The bootstrap stack, from arch/x86/boot.asm. Their ADDRESSES are the bounds;
+ * the objects are never read. Declared here rather than below fault_dump_stack()
+ * because handle_page_fault() now checks them too -- taking the address of an
+ * extern array is a link-time constant, so this costs no memory access, which
+ * matters on a path that runs when memory access is what failed. */
+extern char stack_bottom[], stack_top[];
+
 void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
     unsigned long faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
@@ -76,16 +83,61 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
     if (qemu_sls_mmu_shadow_fault((uint64_t)faulting_address,
                                    (uint32_t)error_code) == 0)
         return;
-    kernel_serial_printf(
-        "\n[FAULT] Kernel #PF  error=0x%lx  addr=0x%016lx  — Halting.\n",
-        error_code, faulting_address);
+    /* ─── kernel_panic_puts(), NOT kernel_serial_printf() ──────────────────
+     * This line used kernel_serial_printf(). While an HTTP shell command is
+     * running, user/shell.c:457 has redirected kernel_serial_putchar() into a
+     * memory buffer, and a path that halts never reaches the _stop() that
+     * flushes it -- so this message was written and then thrown away. A kernel
+     * page fault produced a completely empty log for an entire session, with
+     * gdb eventually showing the CPU stopped on the `hlt` two instructions
+     * below. See kernel/kernel_io.h's panic-path note. */
+    uint64_t sp_now;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(sp_now));
+
+    kernel_panic_puts("\n[FAULT] Kernel #PF  error=");
+    kernel_panic_hex64((uint64_t)error_code);
+    kernel_panic_puts("  addr=");
+    kernel_panic_hex64((uint64_t)faulting_address);
+    kernel_panic_puts("\n[FAULT] rip=");
+    kernel_panic_hex64((uint64_t)saved_rip);
+    kernel_panic_puts("  rsp=");
+    kernel_panic_hex64(sp_now);
+    kernel_panic_puts("  stack=[");
+    kernel_panic_hex64((uint64_t)(uintptr_t)stack_bottom);
+    kernel_panic_puts(",");
+    kernel_panic_hex64((uint64_t)(uintptr_t)stack_top);
+    kernel_panic_puts(")\n");
+
+    /* ─── The check that would have named this bug on sight ────────────────
+     * The fault that motivated all of the above had RSP 208 KiB BELOW
+     * stack_bottom -- the kernel stack had overflowed its 64 KiB region and
+     * was running down through sls_heap, overwriting it. Nothing reported
+     * that. The frame-pool guards added earlier watch the ALLOCATOR handing
+     * out stack frames; none of them watches the stack pointer leaving its own
+     * region, which is a different failure and was undefended.
+     *
+     * Printed before any interpretation of the faulting address, because when
+     * the stack is gone the faulting address is usually a consequence rather
+     * than a cause, and chasing it wastes the session. */
+    if (sp_now < (uint64_t)(uintptr_t)stack_bottom ||
+        sp_now >= (uint64_t)(uintptr_t)stack_top) {
+        uint64_t under = (sp_now < (uint64_t)(uintptr_t)stack_bottom)
+                       ? (uint64_t)(uintptr_t)stack_bottom - sp_now : 0;
+        kernel_panic_puts(
+            "[FAULT] *** STACK OVERFLOW: rsp is OUTSIDE the bootstrap stack.\n"
+            "[FAULT] *** It has run ");
+        kernel_panic_dec(under);
+        kernel_panic_puts(
+            " byte(s) past stack_bottom and has been\n"
+            "[FAULT] *** overwriting whatever lies below it. The faulting\n"
+            "[FAULT] *** address above is most likely a CONSEQUENCE of this,\n"
+            "[FAULT] *** not its cause -- fix the overflow first.\n");
+    }
+
+    kernel_panic_puts("[FAULT] -- Halting.\n");
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }
-
-/* The bootstrap stack, from arch/x86/boot.asm. Their ADDRESSES are the bounds;
- * the objects are never read. */
-extern char stack_bottom[], stack_top[];
 
 /* Dumps the interrupted stack, anchored at the interrupted RSP rather than at
  * the handler's own frame -- the first version anchored at the handler and
