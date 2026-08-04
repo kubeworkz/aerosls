@@ -31,6 +31,38 @@
  * shadow_install() in the .c), so emitted loads and stores use a bare GVA with
  * no base register at all.
  *
+ * ⚠ CORRECTION (2026-08-04) — the paragraph above describes a design that has
+ * been RETIRED. See AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md.
+ *
+ * Translated code addresses guest memory as `guest address + guest_base`,
+ * where guest_base IS this window base and lives in TCG_REG_R12. That is the
+ * qemu-user model, it shipped in Step 5, and it measured 86 → 16 bytes of host
+ * code per guest access.
+ *
+ * Two reasons the GVA-direct variant is not being built:
+ *
+ *   1. It cannot work as the code stands. qemu_sls_mmu_init() copies all 512
+ *      kernel PML4 entries BY VALUE, so the shadow shares every lower-level
+ *      table with the kernel. user_map_page() follows present entries rather
+ *      than cloning them, so installing a guest mapping at a low address does
+ *      not shadow the kernel's mapping — it OVERWRITES it, in the kernel's own
+ *      live page tables. A paging-off guest at GPA 0..256 MiB would remap the
+ *      kernel image (1..221 MiB) out from under itself while executing. That
+ *      sharing is harmless at 32 TiB, which is the only range ever mapped so
+ *      far, and is what makes the window fix in map_guest_ram() correct.
+ *
+ *   2. It buys almost nothing. `mov eax,[rbx+r12+disp32]` and
+ *      `mov eax,[rbx+disp32]` are both one instruction; the difference is a
+ *      SIB byte and one reserved register. Address coincidence only matters
+ *      when guest code runs NATIVELY on the host CPU — same-ISA
+ *      virtualisation, which KVM owns and which the repositioning plan
+ *      retired. In cross-ISA emulation the generated host code can address
+ *      guest memory however it likes.
+ *
+ * Guest PAGING support is unaffected and still required: shadow_fault() will
+ * walk the guest's tables and install GVA → (frame + window), inside the
+ * window's PML4 subtree where table sharing is already safe.
+ *
  * Overridable so a host test can point the window at a real buffer; the
  * production value is asserted separately in tests/qemu_sls_mmu_host_test.c.
  */
