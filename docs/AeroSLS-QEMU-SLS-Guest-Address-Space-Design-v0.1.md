@@ -168,6 +168,56 @@ contiguous mapping.
 
 ---
 
+## 5b. VALIDATED on hardware — 2026-08-04
+
+`qemu paging`, node 2:
+
+```
+[SLS-LAUNCHER] guest CR3 = 0x0000000000001000
+[QEMU-SLS MMU] guest paging ENABLED, guest CR3=0x1000.
+               Guest window identity dropped (PML4 slot 128)
+[SLS-LAUNCHER] guest halted after 7 instructions
+[SLS-PAGING]   7 insn(s), paging_on=1, EAX=0x5a5ac0de
+[SLS-PAGING]   PASS
+```
+
+A guest loaded its own CR3, enabled paging, and read through **GVA 0x400000**
+whose physical target is **GPA 0x5000**. The magic value arrived. Identity
+mapping alone returns 0, so the value is proof the shadow walker resolved
+through the guest's own four-level page tables.
+
+That single result exercises the whole design at once: the two-window split,
+`guest_base` addressing, the identity drop, the TLB flush, the shadow walk, and
+the MOV CRn dispatch path.
+
+### Two bugs it found on the way
+
+**The hybrid TCG/C design never worked.** `sls_x86_translate_block()` signalled
+"unknown opcode" by writing `-2ULL` into `eip` -- discarding the address needed
+to resume -- and `sls_launch_guest()` read that as *halted*. So the C dispatcher
+could only handle instructions appearing at the **start** of a block; anything
+it was meant to handle mid-block killed the guest.
+
+Invisible for as long as it existed, because the benchmark guest is built
+entirely from opcodes the frontend already knows. `MOV CR3` was the second
+instruction of the first guest that needed the fallback. Fixed by setting `eip`
+to the declined instruction's own address so the launcher loops round and the
+dispatcher takes it, plus a guard: a block that translates nothing has not
+advanced `eip` and would spin forever, so it halts and names the opcode.
+
+There were **two** sites writing that sentinel -- the second in the ModRM
+decoder for SIB and RIP-relative operands -- found by grepping for the sentinel
+rather than assuming the first fix covered it.
+
+**And the test's own diagnostic was wrong.** Its first hardware run reported
+`EAX=0` and blamed the identity mapping, while the line above it read
+*2 instructions, CR3=0*. The load had never executed. A failure message that
+interprets a result without first checking the program ran is a confident wrong
+answer, which is the thing this project keeps paying for. It now checks
+execution before interpreting output.
+
+---
+
 ## 6. Next work, in order
 
 **Step A — annotate `qemu_sls_mmu.h`.** The header currently instructs a future
