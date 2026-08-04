@@ -1949,6 +1949,18 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // Loads a hex-encoded flat x86 binary into guest RAM and executes it.
         // Example: qemu run b0 48 e6 e9 b0 0a e6 e9 f4
         //   (MOV AL,'H'; OUT 0xe9,AL; MOV AL,LF; OUT 0xe9,AL; HLT)
+        /* Checked BEFORE "qemu bench": sh_starts() is a prefix test, and while
+         * "qemu paging" does not collide today, ordering a more specific
+         * command after a less specific one is how a future "qemu p..." gets
+         * silently swallowed by the wrong handler. */
+        else if (sh_starts(input_buffer, "qemu paging")) {
+            /* End-to-end: the guest loads CR3, sets CR0.PG, and reads through a
+             * GVA whose physical target is elsewhere. Only a real walk of the
+             * guest's own page tables produces the magic value -- the identity
+             * mapping would return 0, so pass and fail are distinguishable. */
+            extern int sls_test_guest_paging(void);
+            sls_test_guest_paging();
+        }
         else if (sh_starts(input_buffer, "qemu bench")) {
             /* Measures the guest LOAD path -- the only thing the shadow-PT
              * change affects. Optional argument = number of unrolled loads;

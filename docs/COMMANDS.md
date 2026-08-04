@@ -711,6 +711,7 @@ Because the three `status`/`list`/`tree` forms go through IPC, the shell returns
 | Command | What it does |
 | --- | --- |
 | `qemu run <hex>` | Decodes `<hex>` as a guest binary and runs it through the TCG engine via `sls_launch_guest(bin, len, entry_gpa=0, max_insns=100000)`. |
+| `qemu paging` | Runs an end-to-end guest-paging test: the launcher builds four-level guest page tables mapping GVA `0x400000` to GPA `0x5000`, then a guest loads `CR3`, sets `CR0.PG`, and reads through that GVA. Prints PASS only if the magic value arrives, which requires the shadow walker to have resolved through the guest's own tables — the identity mapping would return 0, so a pass and a failure are distinguishable rather than both looking like "the guest halted". |
 | `qemu bench [loads]` | Builds an unrolled straight-line guest program of `loads` (default 4096) `MOV EAX,[EBX+disp32]` instructions striding 64 bytes, runs it once, and reports cycles via `rdtsc`. |
 
 `qemu bench` exists to measure the **one** thing the shadow-page-table work changes: the cost of a guest memory load through generated code. Three things about the number:
