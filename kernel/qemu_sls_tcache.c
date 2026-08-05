@@ -180,7 +180,29 @@ void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out,
 void *qemu_sls_tcache_store(uint64_t guest_pc, const void *code,
                             uint32_t code_len, uint64_t gpa,
                             uint32_t insn_count) {
-    if (!initialized || !guest_pc || !code || !code_len) return 0;
+    /* ─── The one path that used to fail silently ──────────────────────────
+     * Two loud failure messages below and a bare `return 0` here meant a cache
+     * that stored nothing looked identical to one that was never called. On
+     * the first hardware run every block was a miss, checkpoint reported
+     * "0 TBs, 0 code bytes", and neither failure message appeared -- leaving
+     * no way to tell which of four conditions had declined the store.
+     *
+     * guest_pc == 0 is the interesting one and is NOT a bug in the caller: the
+     * benchmark guest is loaded at GPA 0, so its first block legitimately
+     * starts at guest_pc 0 -- which qemu_sls_tcache_insert() uses as its
+     * empty-slot sentinel. That block can never be cached until the table
+     * distinguishes "empty" from "guest_pc 0" with a separate valid flag. */
+    if (!initialized || !guest_pc || !code || !code_len) {
+        kernel_serial_printf(
+            "[QEMU-SLS TCACHE] store declined at guest_pc=0x%016lx: %s\n",
+            guest_pc,
+            !initialized ? "tcache not initialised" :
+            !guest_pc    ? "guest_pc is 0, which the TB table uses as its "
+                           "empty-slot marker -- this block cannot be cached" :
+            !code        ? "code pointer is NULL" :
+                           "code_len is 0");
+        return 0;
+    }
 
     /* 16-byte alignment: generated blocks are entered by an indirect call, and
      * an unaligned entry point costs a fetch penalty on every execution of a
