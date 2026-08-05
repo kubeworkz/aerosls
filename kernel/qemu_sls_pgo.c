@@ -76,7 +76,7 @@ void qemu_sls_pgo_patch_jump(uint64_t guest_pc,
                               uint32_t new_code_offset, uint32_t new_code_len) {
     /* Resolve the old code location before updating the descriptor. */
     uint32_t dummy_len;
-    uint8_t *old_code = (uint8_t *)qemu_sls_tcache_lookup(guest_pc, &dummy_len);
+    uint8_t *old_code = (uint8_t *)qemu_sls_tcache_lookup(guest_pc, &dummy_len, 0);
     if (!old_code) return;
 
     uint8_t *new_code = qemu_sls_codebuf + new_code_offset;

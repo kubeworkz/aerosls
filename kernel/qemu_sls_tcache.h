@@ -107,7 +107,11 @@ typedef struct {
     uint32_t gen_expected;  /* page_gen value at translation time */
     uint32_t exec_count;    /* incremented per execution hit (Phase 3) */
     uint32_t guest_page;    /* gpa / 4096, for flush_page invalidation */
-    uint32_t _pad;
+    /* Guest instructions this block covers. Was _pad. Needed because a cache
+     * HIT skips translation entirely, and the launcher's instruction counter
+     * would otherwise stop advancing -- making a warm run look like it executed
+     * nothing. Struct stays 32 bytes, so the NVMe layout is unchanged. */
+    uint32_t insn_count;
 } QemuTBDesc;               /* 32 bytes */
 
 /* Generation counter per guest code page — read in TCG-emitted prologues. */
@@ -135,7 +139,8 @@ void qemu_sls_tcache_flush_all(void);
  * hit (also fills *code_len_out), NULL on miss or gen mismatch.
  * Increments exec_count on each hit for Phase 3 profiling.
  */
-void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out);
+void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out,
+                             uint32_t *insn_count_out);
 
 /*
  * Record a new TB.  code_offset is the byte offset already written into the
@@ -143,7 +148,8 @@ void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out);
  * source page.  Returns 0 on success, -1 if the table is full.
  */
 int  qemu_sls_tcache_insert(uint64_t guest_pc, uint32_t code_offset,
-                             uint32_t code_len, uint64_t gpa);
+                             uint32_t code_len, uint64_t gpa,
+                             uint32_t insn_count);
 
 /*
  * Write gen counters + TB table + code buffer to NVMe.
@@ -155,6 +161,29 @@ void qemu_sls_tcache_sync(void);
 void qemu_sls_tcache_foreach_hot(uint32_t threshold,
     void (*cb)(uint64_t guest_pc, uint32_t code_offset,
                uint32_t code_len, uint32_t exec_count));
+
+/*
+ * Copy freshly generated host code into the persistent buffer and record it.
+ *
+ * Gate 2 of the Phase 2 plan. TCG generates into its OWN buffer
+ * (sls_code_buffer, 32 MiB, sls/sls-runtime.c); this copies the emitted bytes
+ * into qemu_sls_codebuf (4 MiB, persisted) and inserts the descriptor, so the
+ * two allocators stay independent.
+ *
+ * Copy rather than redirecting TCG's allocator at this buffer: that would put
+ * TCG's region manager and this cursor in charge of the same memory, and being
+ * wrong about which owns what means executing the wrong bytes -- with cached
+ * host code, silently. One memcpy per translated block is a cheap price for
+ * keeping the two apart, and translation already costs ~85% of a launch.
+ *
+ * Returns a pointer INTO the persistent buffer -- the address the code will
+ * occupy on every subsequent boot, which is why the buffer is .bss at a
+ * linker-fixed VA and why the identity stamp must match before any of it is
+ * trusted. NULL if the buffer or the table is full.
+ */
+void *qemu_sls_tcache_store(uint64_t guest_pc, const void *code,
+                            uint32_t code_len, uint64_t gpa,
+                            uint32_t insn_count);
 
 /* Update a TB's code location after PGO re-translation; resets exec_count. */
 void qemu_sls_tcache_update_tb(uint64_t guest_pc,

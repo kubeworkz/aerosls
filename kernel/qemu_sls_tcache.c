@@ -153,7 +153,8 @@ void qemu_sls_tcache_flush_all(void) {
 
 /* ─── qemu_sls_tcache_lookup ─────────────────────────────────────────────── */
 
-void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out) {
+void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out,
+                             uint32_t *insn_count_out) {
     if (!initialized || !guest_pc) return NULL;
     uint32_t slot = hash_pc(guest_pc);
     for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
@@ -165,7 +166,8 @@ void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out) {
             qemu_sls_page_gen[d->guest_page] != d->gen_expected)
             return NULL;
         d->exec_count++;
-        if (code_len_out) *code_len_out = d->code_len;
+        if (code_len_out)   *code_len_out   = d->code_len;
+        if (insn_count_out) *insn_count_out = d->insn_count;
         return codebuf_storage + d->code_offset;
     }
     return NULL;
@@ -173,8 +175,55 @@ void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out) {
 
 /* ─── qemu_sls_tcache_insert ─────────────────────────────────────────────── */
 
+/* ─── qemu_sls_tcache_store ─────────────────────────────────────────────── */
+
+void *qemu_sls_tcache_store(uint64_t guest_pc, const void *code,
+                            uint32_t code_len, uint64_t gpa,
+                            uint32_t insn_count) {
+    if (!initialized || !guest_pc || !code || !code_len) return 0;
+
+    /* 16-byte alignment: generated blocks are entered by an indirect call, and
+     * an unaligned entry point costs a fetch penalty on every execution of a
+     * block that will be re-executed for the life of the cache. */
+    uint32_t off = (qemu_sls_codebuf_used + 15u) & ~15u;
+
+    if ((uint64_t)off + code_len > QEMU_TCACHE_CODEBUF_SIZE) {
+        /* Full. Refuse rather than wrap: wrapping would overwrite code that
+         * live TB descriptors still point at, and the next lookup would return
+         * a valid-looking pointer into the middle of someone else's block.
+         * Declining to cache costs a re-translation; wrapping costs a jump
+         * into arbitrary bytes. */
+        kernel_serial_printf(
+            "[QEMU-SLS TCACHE] code buffer full (%u of %u bytes) -- not caching "
+            "the block at guest_pc=0x%016lx. Translation still works; it will "
+            "just not persist.\n",
+            qemu_sls_codebuf_used, (unsigned)QEMU_TCACHE_CODEBUF_SIZE, guest_pc);
+        return 0;
+    }
+
+    uint8_t *dst = qemu_sls_codebuf + off;
+    const uint8_t *src = (const uint8_t *)code;
+    for (uint32_t i = 0; i < code_len; i++) dst[i] = src[i];
+
+    if (qemu_sls_tcache_insert(guest_pc, off, code_len, gpa, insn_count) != 0) {
+        /* Table full. The bytes are already copied, but without a descriptor
+         * nothing can ever find them, so the space is wasted rather than
+         * dangerous. The cursor is NOT advanced, so the next store reuses it. */
+        kernel_serial_printf(
+            "[QEMU-SLS TCACHE] TB table full (%u entries) -- block at "
+            "guest_pc=0x%016lx not cached.\n",
+            (unsigned)QEMU_TCACHE_MAX_TBS, guest_pc);
+        return 0;
+    }
+
+    qemu_sls_codebuf_used = off + code_len;
+    qemu_sls_tcache_mark_code_dirty(off, code_len);
+    return dst;
+}
+
 int qemu_sls_tcache_insert(uint64_t guest_pc, uint32_t code_offset,
-                            uint32_t code_len, uint64_t gpa) {
+                            uint32_t code_len, uint64_t gpa,
+                            uint32_t insn_count) {
     if (!initialized || !guest_pc) return -1;
     uint32_t guest_page = (uint32_t)(gpa / NVME_PAGE_SIZE);
     uint32_t gen = (guest_page < QEMU_TCACHE_GEN_PAGES)
@@ -189,7 +238,7 @@ int qemu_sls_tcache_insert(uint64_t guest_pc, uint32_t code_offset,
             d->gen_expected = gen;
             d->exec_count   = 0;
             d->guest_page   = guest_page;
-            d->_pad         = 0;
+            d->insn_count   = insn_count;
             ckpt_mark_dirty(CKPT_REGION_TCACHE);
             return 0;
         }
