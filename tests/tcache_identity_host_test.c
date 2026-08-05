@@ -48,9 +48,38 @@ static int checks_passed = 0, checks_failed = 0;
 
 /* Computed independently of the implementation, for
  * AEROSLS_BUILD_ID="aerosls-test-build-A", CODEBUF_SIZE=4 MiB, MAX_TBS=4096,
- * 64-bit host. */
-#define GOLDEN_A 0x393db903c46df50aULL
-#define GOLDEN_B 0x30943e03bf85f65fULL
+ * 64-bit host.
+ *
+ * Updated for QEMU_TCACHE_FORMAT_VERSION 2, which added a version term to the
+ * mixing (and the multiply after the pointer-width xor that the term needs to
+ * be distinguishable). This test failed on that change, which is the outcome
+ * it was written for -- its own message says any change to the mixing moves
+ * the value.
+ *
+ * The new goldens were NOT read out of the implementation. Copying whatever
+ * the code produces makes this assertion vacuous: it would pass by
+ * construction even if the mixing were wrong. They were derived from a
+ * separate reimplementation of the documented steps, in a different language,
+ * which was first checked against the v1 goldens below and reproduced both
+ * exactly -- so the reimplementation is faithful and its v2 output is
+ * independent evidence rather than an echo.
+ *
+ *   v1 (pre-format-version): A = 0x393db903c46df50a, B = 0x30943e03bf85f65f
+ *
+ * This test caught two real defects when it was finally re-run, both of them
+ * introduced by the commit that added the softmmu term and never re-ran this
+ * file:
+ *
+ *   1. The goldens were stale, so the suite was red and nobody had looked.
+ *   2. The softmmu ON and OFF tags differed in ONE BIT, so the two sides of
+ *      the A/B produced identities one bit apart. That passes an equality
+ *      check and fails the standard this file argues for twenty lines below:
+ *      "a hash that changed a single bit would still differ, and would still
+ *      be a bad guard." Adding a multiply took it to 8 bits; separating the
+ *      two tags took it to 26.
+ */
+#define GOLDEN_A 0x413d6c1fa3ed892fULL
+#define GOLDEN_B 0xe40e480212dc0928ULL
 
 int main(void) {
     printf("tcache_identity_host_test\n=========================\n\n");

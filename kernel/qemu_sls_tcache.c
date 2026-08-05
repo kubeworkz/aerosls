@@ -49,6 +49,68 @@ static void write_gen_page(uint32_t nvme_pg) {
     nvme_write_sync(QEMU_TCACHE_GEN_DAT_LBA + nvme_pg * NVME_SECTORS_PER_PAGE,
                     qemu_sls_page_gen + nvme_pg * (NVME_PAGE_SIZE / sizeof(uint32_t)));
 }
+
+/* ─── page digests ──────────────────────────────────────────────────────────
+ * See the contract note in qemu_sls_tcache.h. Open-addressed on the guest page
+ * number, same shape as tb_table; page_plus1 == 0 means empty, so page 0 (the
+ * page the loader actually writes) is representable. */
+typedef struct {
+    uint64_t page_plus1;
+    uint64_t digest;
+} QemuPageDigest;                      /* 16 bytes */
+
+static QemuPageDigest pdig_table[QEMU_TCACHE_PDIG_ENTRIES]
+    __attribute__((aligned(4096)));
+
+static uint32_t hash_page(uint64_t page) {
+    return (uint32_t)((page * 0x9e3779b97f4a7c15ULL) >> 52)
+           & (QEMU_TCACHE_PDIG_ENTRIES - 1);
+}
+
+/* FNV-1a over the bytes, with the length mixed in. Folding the length in means
+ * a short read and a long read of the same prefix cannot collide, so the
+ * comparison does not need a separate length field to be correct. */
+static uint64_t digest_bytes(const uint8_t *p, uint32_t len) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)len << 7;
+    h *= 1099511628211ULL;
+    return h ? h : 1;                  /* never 0; 0 is not a sentinel here but
+                                          keeping it nonzero avoids surprises */
+}
+
+/* Slot for `page`, or NULL if absent and `create` is 0. */
+static QemuPageDigest *pdig_slot(uint64_t page, int create) {
+    uint32_t slot = hash_page(page);
+    for (uint32_t i = 0; i < QEMU_TCACHE_PDIG_ENTRIES; i++) {
+        QemuPageDigest *d = &pdig_table[(slot + i) & (QEMU_TCACHE_PDIG_ENTRIES - 1)];
+        if (d->page_plus1 == page + 1) return d;
+        if (!d->page_plus1) {
+            if (!create) return NULL;
+            d->page_plus1 = page + 1;
+            d->digest     = 0;
+            return d;
+        }
+    }
+    return NULL;                       /* full: caller flushes, which is safe */
+}
+
+int qemu_sls_tcache_page_matches(uint64_t gpa, const void *bytes, uint32_t len) {
+    if (!initialized || !bytes || !len) return 0;
+    QemuPageDigest *d = pdig_slot(gpa / NVME_PAGE_SIZE, 0);
+    if (!d || !d->digest) return 0;    /* never recorded, or cleared by a flush */
+    return d->digest == digest_bytes((const uint8_t *)bytes, len);
+}
+
+void qemu_sls_tcache_record_page(uint64_t gpa, const void *bytes, uint32_t len) {
+    if (!initialized || !bytes || !len) return;
+    QemuPageDigest *d = pdig_slot(gpa / NVME_PAGE_SIZE, 1);
+    if (!d) return;                    /* table full: stay pessimistic */
+    d->digest = digest_bytes((const uint8_t *)bytes, len);
+}
 /* ─── qemu_sls_tcache_mark_code_dirty ──────────────────────────────────────── */
 
 void qemu_sls_tcache_mark_code_dirty(uint32_t code_offset, uint32_t len) {
@@ -62,6 +124,17 @@ void qemu_sls_tcache_mark_code_dirty(uint32_t code_offset, uint32_t len) {
 /* ─── qemu_sls_tcache_init ──────────────────────────────────────────────── */
 
 int qemu_sls_tcache_init(void) {
+    /* Every exit from this function must leave pdig_table either empty or
+     * restored from the same snapshot as tb_table. Clearing up front makes
+     * that true on all four paths without repeating it on each, and does not
+     * rely on .bss zeroing still holding -- which it would not if this were
+     * ever re-entered after a warm start. An empty table means
+     * page_matches() returns 0 and the loader flushes: the safe default. */
+    for (uint32_t i = 0; i < QEMU_TCACHE_PDIG_ENTRIES; i++) {
+        pdig_table[i].page_plus1 = 0;
+        pdig_table[i].digest     = 0;
+    }
+
     if (!io_sq || !io_cq) {
         for (uint32_t i = 0; i < QEMU_TCACHE_GEN_PAGES; i++)
             qemu_sls_page_gen[i] = 1;
@@ -110,6 +183,13 @@ int qemu_sls_tcache_init(void) {
                          qemu_sls_page_gen, 32);
     nvme_read_pages_sync(QEMU_TCACHE_GEN_DAT_LBA + 32 * NVME_SECTORS_PER_PAGE,
                          (uint8_t *)qemu_sls_page_gen + 32 * NVME_PAGE_SIZE, 32);
+
+    /* Restore page digests: 16 pages. Reached only past the identity check,
+     * which now includes QEMU_TCACHE_FORMAT_VERSION -- so a pre-v2 snapshot,
+     * whose LBAs at QEMU_TCACHE_PDIG_DAT_LBA hold unrelated bytes, was already
+     * discarded above and cannot be read here as digests. */
+    nvme_read_pages_sync(QEMU_TCACHE_PDIG_DAT_LBA,
+                         pdig_table, sizeof(pdig_table) / NVME_PAGE_SIZE);
 
     /* Restore TB table: 32 pages. */
     nvme_read_pages_sync(QEMU_TCACHE_TB_DAT_LBA,
@@ -171,6 +251,24 @@ void qemu_sls_tcache_flush_page(uint64_t gpa) {
             gpa, page, qemu_sls_page_gen[page],
             flush_log_budget ? "" : "   (budget spent; further flushes silent)");
     }
+
+    /* ─── Drop the digest, and why this line is the safety property ────────
+     * qemu_sls_tcache_page_matches() lets the loader skip a flush when the
+     * bytes it is about to write are the ones the cached TBs were compiled
+     * from. That is only sound while a recorded digest implies "the TBs on
+     * this page match this content."
+     *
+     * Every invalidation that does NOT come from the loader -- a guest store
+     * caught by qemu_sls_mmu_shadow_fault(), a DMA completion -- means the
+     * page changed underneath the cache. Clearing here makes the next
+     * page_matches() call return 0 for that page, so the loader flushes
+     * rather than trusting a digest recorded before the change.
+     *
+     * The loader records its digest AFTER calling this, which is the only
+     * ordering that works: flush first (bump the generation, clear the
+     * digest), then record what was actually written. */
+    QemuPageDigest *d = pdig_slot(page, 0);
+    if (d) d->digest = 0;
 
     /* Synchronously persist the one NVMe page covering this counter. */
     if (io_sq && io_cq)
@@ -398,6 +496,13 @@ void qemu_sls_tcache_sync(void) {
     /* TB table: 32 pages. */
     nvme_write_pages_sync(QEMU_TCACHE_TB_DAT_LBA,
                           tb_table, sizeof(tb_table) / NVME_PAGE_SIZE);
+
+    /* Page digests: 16 pages. Written unconditionally alongside the TB table,
+     * because the two are only meaningful together -- a digest that outlived
+     * its descriptors could authorise skipping a flush for TBs that are no
+     * longer there. */
+    nvme_write_pages_sync(QEMU_TCACHE_PDIG_DAT_LBA,
+                          pdig_table, sizeof(pdig_table) / NVME_PAGE_SIZE);
 
     /* Code buffer: adaptive — only write dirty 4 KiB pages (Phase 4). */
     for (uint32_t p = 0; p < QEMU_TCACHE_CODEBUF_PAGES; p++) {

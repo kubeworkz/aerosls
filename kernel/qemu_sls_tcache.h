@@ -19,11 +19,22 @@
 #define QEMU_TCACHE_GEN_DAT_LBA  10008ULL
 #define QEMU_TCACHE_TB_DAT_LBA   10520ULL
 #define QEMU_TCACHE_CODE_DAT_LBA 10776ULL
+/* Page-digest table. codebuf ends at 18968; QEMU_VM_STATE_LBA is 20000.
+ * 4096 entries x 16 bytes = 64 KiB = 16 frames = 128 sectors: 19000..19128. */
+#define QEMU_TCACHE_PDIG_DAT_LBA 19000ULL
 
 #define QEMU_TCACHE_MAGIC        0xCAFE000000000020ULL
 
 
 /* Matches QEMU_GUEST_RAM_PAGES — one gen counter per guest 4 KiB page. */
+/* On-NVMe format version; folded into the identity stamp. v2 added the
+ * page-digest table. Bump on any layout change. */
+#define QEMU_TCACHE_FORMAT_VERSION 2U
+
+/* One digest slot per TB slot: 4096 TBs can occupy at most 4096 distinct
+ * guest pages, so the table can never be the thing that overflows first. */
+#define QEMU_TCACHE_PDIG_ENTRIES 4096U
+
 #define QEMU_TCACHE_GEN_PAGES    65536U
 
 /* Open-addressing hash table size (power of 2). */
@@ -90,6 +101,14 @@ static inline uint64_t qemu_tcache_identity_of(const char *build_id) {
     h *= 1099511628211ULL;
     h ^= (uint64_t)sizeof(void *);                     /* host pointer width */
     h *= 1099511628211ULL;
+    /* On-NVMe format version. Bumped when a region is added or its layout
+     * changes -- the page-digest table at QEMU_TCACHE_PDIG_DAT_LBA was added
+     * at v2. An older snapshot has no digest table, so those LBAs hold
+     * whatever was there before; reading them as digests could produce a match
+     * against uninitialised disk and skip a flush that was needed. Discarding
+     * on the version alone is one cold start and removes the question. */
+    h ^= (uint64_t)QEMU_TCACHE_FORMAT_VERSION << 5;
+    h *= 1099511628211ULL;
     /* ─── softmmu side, because it changes every emitted load ──────────────
      * SLS_FORCE_SOFTMMU (see ../qemu/tcg/tcg-internal.h) flips guest memory
      * accesses between an inlined TLB lookup and a bare MOV -- 86 bytes of
@@ -105,12 +124,22 @@ static inline uint64_t qemu_tcache_identity_of(const char *build_id) {
      * change most likely to produce it.
      *
      * Adding this term changes the hash for every build once, discarding
-     * existing caches on the next boot. One cold start, correctly taken. */
+     * existing caches on the next boot. One cold start, correctly taken.
+     *
+     * The two tags are far apart, and the multiply after them is not
+     * decoration. Written first as constants differing in the low bit with no
+     * multiply, the two sides landed ONE bit apart; adding the multiply took
+     * that to 8, still poor. Two high-entropy tags differing in half their
+     * bits, then mixed, put the sides 26 bits apart. tests/
+     * tcache_identity_host_test.c argues exactly this point about build ids --
+     * "a hash that changed a single bit would still differ, and would still be
+     * a bad guard" -- and the same standard applies here. */
 #ifdef SLS_FORCE_SOFTMMU
-    h ^= 0x536F66744D4D5501ULL;                        /* softmmu = ON  */
+    h ^= 0x9E3779B97F4A7C15ULL;                        /* softmmu = ON  */
 #else
-    h ^= 0x536F66744D4D5500ULL;                        /* softmmu = OFF */
+    h ^= 0xC2B2AE3D27D4EB4FULL;                        /* softmmu = OFF */
 #endif
+    h *= 1099511628211ULL;
     return h;
 }
 
@@ -150,7 +179,39 @@ extern uint32_t qemu_sls_codebuf_used;
  */
 int  qemu_sls_tcache_init(void);
 
-/* Bump gen counter for gpa's page; immediately persists the affected NVMe page. */
+/* ─── Page digests: telling "rewritten" apart from "changed" ────────────────
+ * The loader rewrites the guest image into guest RAM on every launch, because
+ * guest RAM is not persisted while the translation cache is. It then flushed
+ * the pages it wrote, which invalidated every restored TB -- measured, one
+ * flush of page 0 per boot, generation climbing 2, 3, 4 while the restored
+ * descriptors stayed one behind. A cache that survives NVMe and is then
+ * destroyed by its own loader is a cache that never works across a reboot.
+ *
+ * The old predicate asked "do the bytes I am about to write differ from what
+ * is in guest RAM?" On a fresh boot that is always yes, because the frames are
+ * newly allocated. The predicate that matters is "do the bytes I am about to
+ * write differ from the bytes these TBs were compiled from?" -- and after the
+ * copy the page holds exactly those bytes, so the flush was firing on a page
+ * that ended up correct.
+ *
+ * A digest of the written range answers the second question. The range, not
+ * the whole page: allocate_physical_ram_frame() does not zero, so the tail of
+ * the last page is recycled memory that differs between boots and would defeat
+ * any full-page comparison.
+ *
+ * SAFETY -- the rule that makes this sound rather than merely convenient:
+ * qemu_sls_tcache_flush_page() CLEARS the digest for the page it flushes. Any
+ * invalidation from outside the loader (a guest store caught by
+ * qemu_sls_mmu_shadow_fault(), DMA completion) therefore drops the digest, and
+ * the next load cannot match against it. Only a page whose digest was recorded
+ * by the loader, after its own flush, can ever be skipped. Loosening a
+ * cache-validity check is the dangerous direction, and this is the invariant
+ * that bounds it. */
+int  qemu_sls_tcache_page_matches(uint64_t gpa, const void *bytes, uint32_t len);
+void qemu_sls_tcache_record_page(uint64_t gpa, const void *bytes, uint32_t len);
+
+/* Bump gen counter for gpa's page; immediately persists the affected NVMe page.
+ * Also clears that page's digest -- see the note above. */
 void qemu_sls_tcache_flush_page(uint64_t gpa);
 
 /* Invalidate all TBs by incrementing every gen counter. */
