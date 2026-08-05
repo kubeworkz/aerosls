@@ -82,6 +82,17 @@ static int checks_passed = 0, checks_failed = 0;
 /* ─── stubs ──────────────────────────────────────────────────────────────── */
 
 void kernel_serial_print(const char *s) { (void)s; }
+
+/* The MMU now calls into the translation cache to invalidate a page whose code
+ * the guest overwrote. Stubbed to do exactly what the real one does to the one
+ * piece of state this test observes -- bump the counter -- and nothing else.
+ * A stub that did NOT bump it would make every generation assertion below pass
+ * against a no-op. */
+uint32_t qemu_sls_page_gen[65536];
+void qemu_sls_tcache_flush_page(uint64_t gpa) {
+    uint32_t pg = (uint32_t)(gpa / 4096);
+    if (pg < 65536) qemu_sls_page_gen[pg]++;
+}
 void kernel_serial_printf(const char *f, ...) { (void)f; }
 
 /* The reason this file could not exist until arch_read_cr3() was factored out:
@@ -699,6 +710,78 @@ int main(void) {
 
         CHECK(qemu_sls_mmu_guest_paging_enable() == 0,
               "...and the call is idempotent");
+    }
+
+    printf("\n-- self-modifying guest code: protect, fault, invalidate --\n");
+    {
+        /* The mechanism that makes the persistent cache SAFE. With softmmu off
+         * a guest store is a bare MOV -- no helper, no TLB lookup, nothing to
+         * hook. Without write protection a guest can rewrite a page it has
+         * already executed and the cache goes on serving translations of bytes
+         * that no longer exist: correct-looking code, wrong program, no fault
+         * and no log line. */
+        qemu_sls_guest_paging_on = 0;
+        const uint64_t code_gpa = 2 * FRAME_SIZE;
+        const uint32_t page_idx = 2;
+
+        g_map_count = 0; g_invlpg_count = 0;
+        CHECK(qemu_sls_mmu_write_protect_gpa(code_gpa) == 0,
+              "a code page can be write-protected");
+        const MapCall *m = last_map();
+        CHECK(m && m->va == QEMU_GUEST_WINDOW_BASE + code_gpa,
+              "...in the GUEST window, which is the only range guest stores "
+              "reach");
+        CHECK(m && (m->flags & USER_PTE_PRESENT) && !(m->flags & USER_PTE_WRITE),
+              "*** present but NOT writable -- the guest may still execute and "
+              "read the page; only the store traps, because only a store can "
+              "invalidate a translation ***");
+        CHECK(g_invlpg_count == 1,
+              "*** and the TLB entry was flushed. A stale writable entry would "
+              "let the store succeed WITHOUT faulting, and the cache would "
+              "never learn the page changed -- the invlpg IS the protection ***");
+
+        CHECK(qemu_sls_mmu_write_protect_gpa(
+                  (uint64_t)QEMU_GUEST_RAM_PAGES * FRAME_SIZE) == -1,
+              "...and an unbacked GPA is refused rather than mapped");
+
+        /* Now the fault the protection exists to cause. error_code 0x3 =
+         * write (bit 1) to a PRESENT page (bit 0) -- a permission fault, not a
+         * missing mapping. */
+        uint32_t gen_before = qemu_sls_page_gen[page_idx];
+        g_map_count = 0; g_invlpg_count = 0;
+        qemu_sls_guest_active = 1;
+        CHECK(qemu_sls_mmu_shadow_fault(
+                  QEMU_GUEST_WINDOW_BASE + code_gpa + 0x40, 0x3) == 0,
+              "a guest write to the protected page resolves");
+        CHECK(qemu_sls_page_gen[page_idx] == gen_before + 1,
+              "*** ...and the page's GENERATION was bumped, which is what makes "
+              "every TB compiled from it a lookup miss ***");
+        const MapCall *m2 = last_map();
+        CHECK(m2 && (m2->flags & USER_PTE_WRITE),
+              "*** ...and write permission was RESTORED, so the retried store "
+              "succeeds. Leaving it protected would fault forever on the same "
+              "instruction ***");
+        CHECK(g_invlpg_count == 1,
+              "...with the read-only entry flushed, or the retry faults again");
+
+        /* A write to an UNPROTECTED page must not be swallowed. Only a
+         * permission fault means "protected code page"; a not-present fault is
+         * a genuine miss and belongs to the walker below. */
+        uint32_t gen_other = qemu_sls_page_gen[3];
+        CHECK(qemu_sls_mmu_shadow_fault(
+                  QEMU_GUEST_WINDOW_BASE + 3 * FRAME_SIZE, 0x2) == 1 &&
+              qemu_sls_page_gen[3] == gen_other,
+              "*** a NOT-PRESENT write (error 0x2) is not treated as a code-page "
+              "write: no generation bumped, fault left unresolved. Otherwise "
+              "every ordinary miss would silently invalidate a page ***");
+
+        /* Restore what the blocks below depend on. This block turned paging
+         * OFF and guest_active ON for its own purposes, and leaving either
+         * that way broke three unrelated checks -- the second time in this
+         * file that a new block has done exactly that. The shared mutable
+         * state is the hazard, not the individual mistake. */
+        qemu_sls_guest_paging_on = 1;
+        qemu_sls_guest_active    = 1;
     }
 
     printf("\n-- the TLB is invalidated, not just the table written --\n");

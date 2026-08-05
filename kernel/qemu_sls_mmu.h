@@ -209,6 +209,27 @@ void qemu_sls_flush_tlb(void);
  */
 int qemu_sls_mmu_guest_paging_enable(void);
 
+/* ─── Self-modifying guest code: the only way to see a guest store ─────────
+ *
+ * With tcg_use_softmmu false, a guest store compiles to a bare host MOV. There
+ * is no helper call, no TLB lookup, nothing to hook -- so a guest that writes
+ * to a page it has already executed produces NO signal, and the translation
+ * cache goes on serving blocks compiled from bytes that no longer exist.
+ * Stale code executing silently is the worst failure this layer can produce.
+ *
+ * So a page that translated code was generated from is write-protected in the
+ * guest window. The next guest store to it takes a #PF, which is the hook that
+ * did not otherwise exist: qemu_sls_mmu_shadow_fault() bumps the page's
+ * generation counter (invalidating every TB compiled from it), restores write
+ * permission, and returns resolved so the store retries and succeeds.
+ *
+ * The cost is one fault per page per modification, which is what QEMU pays for
+ * the same guarantee. The alternative is not paying it -- and not knowing.
+ *
+ * Returns 0 on success, -1 if the GPA is not backed.
+ */
+int qemu_sls_mmu_write_protect_gpa(uint64_t gpa);
+
 /* One-time boot init: allocates shadow PML4 inheriting all kernel PT entries. */
 int qemu_sls_mmu_init(void);
 

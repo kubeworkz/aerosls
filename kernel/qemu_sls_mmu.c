@@ -6,6 +6,7 @@
 #include "qemu_sls_mmu.h"
 #include "frame_pool.h"
 #include "kernel_io.h"
+#include "qemu_sls_tcache.h"   /* flush_page, page_gen */
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -282,6 +283,26 @@ int qemu_sls_mmu_guest_paging_enable(void) {
     return 0;
 }
 
+/* ─── qemu_sls_mmu_write_protect_gpa ────────────────────────────────────── */
+
+int qemu_sls_mmu_write_protect_gpa(uint64_t gpa) {
+    if (!initialized) return -1;
+    uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
+    if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return -1;
+
+    uint64_t va = QEMU_GUEST_WINDOW_BASE + (gpa & ~(uint64_t)0xFFF);
+    /* PRESENT without WRITE. The guest may still execute and read it -- only
+     * the store traps, which is the one event that invalidates a translation. */
+    user_map_page(shadow_pml4, va, guest_ram_frames[idx], USER_PTE_PRESENT);
+
+    /* The writable translation is live in the TLB, and a stale writable entry
+     * defeats the entire mechanism: the store would succeed without faulting
+     * and the cache would never learn the page changed. This invlpg is not an
+     * optimisation, it is the protection. */
+    qemu_sls_invlpg(va);
+    return 0;
+}
+
 /* ─── qemu_sls_mmu_find_region ──────────────────────────────────────────── */
 
 const QemuGuestRegion *qemu_sls_mmu_find_region(uint64_t hva) {
@@ -394,6 +415,54 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
      * "handled". The guest then reads the wrong page, silently, with no fault
      * and no log line. Returning 1 turns that into the [FAULT] report the
      * address deserves. */
+    /* ─── A write to a PRESENT page is a store to protected guest code ─────
+     * error_code bit 0 = the page was present (a permission fault, not a
+     * missing mapping); bit 1 = it was a write. Together, in the guest window,
+     * that can only be a guest store to a page write-protected because
+     * translated code was generated from it -- everything else in this window
+     * is mapped writable.
+     *
+     * This is the hook that bare-MOV stores do not otherwise provide. Bump the
+     * page's generation so every TB compiled from it becomes a lookup miss,
+     * restore write permission, and report the fault resolved: iretq re-runs
+     * the store, which now succeeds, and the guest never knows it happened.
+     *
+     * Checked BEFORE the paging-off guard below, because a protected-page
+     * write is meaningful whether or not the guest has paging enabled -- it is
+     * about the physical page the code came from, not about translation. */
+    if ((error_code & 0x3u) == 0x3u) {
+        uint64_t gpa = qemu_sls_guest_paging_on ? 0 : faulting_gva;
+        uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
+        if (!qemu_sls_guest_paging_on &&
+            idx < QEMU_GUEST_RAM_PAGES && guest_ram_frames[idx]) {
+            qemu_sls_tcache_flush_page(gpa);       /* invalidate every TB on it */
+            user_map_page(shadow_pml4,
+                          QEMU_GUEST_WINDOW_BASE + (gpa & ~(uint64_t)0xFFF),
+                          guest_ram_frames[idx],
+                          USER_PTE_PRESENT | USER_PTE_WRITE);
+            qemu_sls_invlpg(QEMU_GUEST_WINDOW_BASE + (gpa & ~(uint64_t)0xFFF));
+            kernel_serial_printf(
+                "[QEMU-SLS MMU] guest wrote to code page GPA 0x%016lx -- %u TB(s) "
+                "from it invalidated, page made writable again.\n",
+                gpa & ~(uint64_t)0xFFF, qemu_sls_page_gen[idx]);
+            return 0;
+        }
+        /* Paging on: the faulting address is a GVA, so the physical page it
+         * belongs to needs a guest page-table walk before its generation can
+         * be bumped. Not implemented -- and refused loudly rather than
+         * resolved, because silently permitting the write would leave stale
+         * translations live, which is exactly what this whole mechanism is
+         * for. */
+        if (qemu_sls_guest_paging_on) {
+            kernel_serial_printf(
+                "[QEMU-SLS MMU] write to protected code page at GVA 0x%016lx with "
+                "guest paging ON -- invalidation for paged guests is not "
+                "implemented. Refusing rather than allowing a write that would "
+                "leave stale translations live.\n", faulting_gva);
+            return 1;
+        }
+    }
+
     if (!qemu_sls_guest_paging_on) {
         kernel_serial_printf(
             "[QEMU-SLS MMU] fault at GPA 0x%016lx with guest paging OFF -- that GPA "
