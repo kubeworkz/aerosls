@@ -175,7 +175,7 @@ recorded run.
 | EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. 2026-08-05 cold EXEC was 5,939 cyc/load vs §5c's 6,774 — a −12.3% move, inside the reported CV. Consistent. |
 | Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
 | Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
-| Translation cache survives reboot | Phase2 | **Storage layer: WORKS.** `warm start — codebuf_used=8051` after reboot, matching the sync exactly. **End to end: DOES NOT.** The loader flushes page 0 while repopulating guest RAM, which is not persisted, invalidating every restored TB. Root cause at `sls-launcher.c:542-550`; see §3c. |
+| Translation cache survives reboot | Phase2 | **Storage layer: WORKS.** `warm start — codebuf_used=8051` after reboot, matching the sync exactly. **End to end: DOES NOT — root-caused and confirmed by measurement.** The loader flushes page 0 while repopulating guest RAM, which is not persisted, invalidating every restored TB. `sls-launcher.c:542-550`; evidence in §3c. |
 
 **Before any of these is published**, re-run on current `HEAD` and record the
 build ID. The §5c A/B was taken 2026-08-04; the tree has moved since. Zero
@@ -426,19 +426,36 @@ TB descriptors, and flush only when the **post-copy** bytes disagree with it.
 Eight bytes per page for the handful of pages that actually back TBs — not the
 256 MiB of guest RAM, which is the obvious alternative and much worse.
 
-### Confidence, and what would settle it
+### CONFIRMED by measurement, 2026-08-05
 
-This is a **code-reading hypothesis**, and §6 records three of those about a
-different bug, all three wrong. Two things distinguish it: it was derived after
-the measurements rather than before, and it predicts the same-boot versus
-cross-boot asymmetry that had already been observed independently across three
-boots.
+The print was added (`qemu_sls_tcache_flush_page()`, commit `19798a8`) and the
+prediction held exactly:
 
-It is still not a diagnosis. One `kernel_serial_printf` in
-`qemu_sls_tcache_flush_page()` reporting the page and the new generation would
-settle it — expect exactly one call, on page 0, on the post-reboot launch, and
-none on the warm one. Until that print exists this belongs in the "strong
-explanation" column, not the "root-caused" one.
+| Run | `flush_page` output | `TCACHE` |
+|---|---|---|
+| Boot A, 1st launch | `gpa=0x0 page=0 gen->2` — **once** | 0 hit / 8 miss |
+| **Boot B, 1st launch — the test** | `gpa=0x0 page=0 gen->3` — **once** | **0 hit / 8 miss** |
+| Boot B, 2nd launch — the control | **no line at all** | **8 hit / 0 miss** |
+
+Every element of the prediction is present: exactly one flush, page 0 only, on
+the first launch after a boot and not on the warm relaunch. The generation
+climbs by one per boot — 2, then 3 — because `flush_page` persists the counter
+synchronously, so restored TBs carry `gen_expected` from the previous boot and
+are always exactly one behind.
+
+That also settles **which** miss path is taken: the descriptors are present and
+correct and are being rejected by the staleness check. It is a generation
+mismatch, not an absent TB.
+
+Both falsifiers were live and neither fired. A flush on the warm run would have
+meant something else invalidates on every launch; no flush at all would have
+meant the descriptors were missing rather than stale. **Root-caused.**
+
+**For the record:** this began as a code-reading hypothesis, which §6 warns
+against having watched three of them fail on a different bug. What changed the
+outcome was writing down what each possible result would mean *before* running
+it, so that a confirming result could not be quietly reinterpreted from a
+disconfirming one.
 
 ### Minor, noted in passing
 
