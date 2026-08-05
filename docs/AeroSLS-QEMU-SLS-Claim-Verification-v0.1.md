@@ -175,7 +175,7 @@ recorded run.
 | EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. 2026-08-05 cold EXEC was 5,939 cyc/load vs §5c's 6,774 — a −12.3% move, inside the reported CV. Consistent. |
 | Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
 | Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
-| Translation cache survives reboot | Phase2 | **Storage layer: WORKS.** `warm start — codebuf_used=8051` after reboot, matching the sync exactly. **End to end: DOES NOT — root-caused and confirmed by measurement.** The loader flushes page 0 while repopulating guest RAM, which is not persisted, invalidating every restored TB. `sls-launcher.c:542-550`; evidence in §3c. |
+| Translation cache survives reboot | Phase2 | **YES — verified end to end, 2026-08-05.** First launch after a reboot: no `flush_page`, `TCACHE 8 hit / 0 miss`, `TRANSLATE` 0 cycles / 0 blocks, `CODE` 0 bytes, arena 1,056 B against 1,508,448 B cold. Fixed in `551d9db` + `8fc55f2`; evidence in §3c. |
 
 **Before any of these is published**, re-run on current `HEAD` and record the
 build ID. The §5c A/B was taken 2026-08-04; the tree has moved since. Zero
@@ -419,7 +419,50 @@ that **after** the copy the page holds exactly the bytes the TBs were compiled
 from — so the flush fires on a page that ends up correct. The invalidation is
 sound in mechanism and spurious in this instance.
 
-### Fix direction
+### FIXED AND VERIFIED, 2026-08-05 — first cross-reboot warm start
+
+Fix in `551d9db` (qemu) + `8fc55f2` (aerosls2). Re-run of the same sequence:
+
+```
+qemu bench 500   ->  flush_page page=0 gen->2 ;  TCACHE 0 hit / 8 miss
+checkpoint       ->  synced: 8 TBs, 8051 code bytes
+<node restart>
+qemu bench 500   ->  NO flush_page line ;  TCACHE 8 hit(s) / 0 miss(es)
+```
+
+| | cold | warm after reboot |
+|---|---|---|
+| `flush_page` | `page=0 gen->2` | **absent** |
+| `TCACHE` | 0 hit / 8 miss | **8 hit / 0 miss** |
+| `TRANSLATE` | 39,210,486 cyc, 8 blocks | **0 cyc, 0 blocks** |
+| `CODE` | 8,003 bytes | **0 compiled** |
+| `ARENA` consumed this launch | 1,507,392 B | **0** |
+| `ARENA` used, total | 1,508,448 B | **1,056 B** |
+| `ALLOC` since boot | 13 calls | **4 calls** |
+
+**Phase 2's premise is demonstrated end to end.** Translation is not merely
+faster across a reboot, it does not happen: zero blocks compiled, zero bytes
+emitted, and the 1.5 MB of TCG arena a cold launch consumes is never
+allocated — 1,056 bytes across 4 calls instead of 1,508,448 across 13.
+
+### What to quote from this, and what not to
+
+**Quotable — countable and rig-independent**, the same class as `CODE`:
+translation eliminated entirely (`TRANSLATE` 0 cycles, 0 blocks, `CODE` 0
+bytes, 8 TB hits), and 1.5 MB of per-launch arena allocation eliminated.
+
+**Not quotable:** the total-cycles ratio (48,289,941 → 4,559,082, ~10.6×).
+`EXEC` on this run was **6,128 cyc/load**, against 100–455 for same-boot warm
+runs — because restarting the node restarts the outer `qemu-system-x86_64`
+too, so the outer emulator must translate our restored host code on first
+execution even though *our* translator did not run.
+
+That is a clean confirmation of §3b: a first launch after a boot always carries
+outer-translation cost regardless of whether the inner cache hit, and `EXEC`
+differences track the outer emulator rather than the guest load path. It also
+kills the last reason to quote any cycle figure from this host.
+
+### Fix direction (as implemented)
 
 Persist a per-page digest of the bytes each TB was compiled from, alongside the
 TB descriptors, and flush only when the **post-copy** bytes disagree with it.
