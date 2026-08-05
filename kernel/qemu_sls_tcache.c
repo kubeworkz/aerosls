@@ -151,16 +151,45 @@ void qemu_sls_tcache_flush_all(void) {
     /* Full gen array sync is left to the next qemu_sls_tcache_sync() call. */
 }
 
+/* ─── guest_pc is stored BIASED BY ONE ──────────────────────────────────────
+ *
+ * The descriptor uses guest_pc == 0 to mean "empty slot", which made a block
+ * at guest address 0 impossible to cache. That is not a corner case: a guest
+ * image loaded at GPA 0 begins there, and the benchmark guest does exactly
+ * that -- one block of every run was permanently uncacheable.
+ *
+ * The obvious alternative, a separate valid flag, is worse here. The restore
+ * path reads raw NVMe bytes straight into tb_table, so a blank region, a
+ * short read, or a failed read all produce zeroes -- and "all zero means all
+ * empty" has to stay true, or 4096 zeroed entries become 4096 entries claiming
+ * to hold a block at guest_pc 0 pointing at code_offset 0.
+ *
+ * Biasing keeps that property: stored 0 still means empty, and every real
+ * guest_pc maps to a distinct non-zero value. The cost is that these two
+ * helpers must be used everywhere the field is touched; the field is
+ * deliberately never compared raw below.
+ *
+ * guest_pc == UINT64_MAX would wrap to 0 and be rejected by pc_store(). An
+ * instruction cannot begin in the last byte of the address space, so this
+ * cannot arise for a real block -- but it is refused rather than assumed. */
+static inline uint64_t pc_store(uint64_t guest_pc) {
+    return guest_pc + 1;                 /* 0 stays reserved for "empty" */
+}
+static inline uint64_t pc_load(uint64_t stored) {
+    return stored - 1;
+}
+
 /* ─── qemu_sls_tcache_lookup ─────────────────────────────────────────────── */
 
 void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out,
                              uint32_t *insn_count_out) {
-    if (!initialized || !guest_pc) return NULL;
+    if (!initialized) return NULL;
+    if (guest_pc == (uint64_t)-1) return NULL;      /* would bias to 0 */
     uint32_t slot = hash_pc(guest_pc);
     for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
         QemuTBDesc *d = &tb_table[(slot + i) & (QEMU_TCACHE_MAX_TBS - 1)];
         if (!d->guest_pc) return NULL;
-        if (d->guest_pc != guest_pc) continue;
+        if (d->guest_pc != pc_store(guest_pc)) continue;
         /* Stale translation: source page was written after this TB was compiled. */
         if (d->guest_page < QEMU_TCACHE_GEN_PAGES &&
             qemu_sls_page_gen[d->guest_page] != d->gen_expected)
@@ -229,14 +258,6 @@ int qemu_sls_tcache_commit(uint64_t guest_pc, void *code_at,
                            uint32_t insn_count) {
     if (!initialized || !code_at || !code_len) return -1;
 
-    if (!guest_pc) {
-        /* guest_pc 0 is the TB table's empty-slot marker, so a block starting
-         * at guest address 0 cannot be recorded. The benchmark guest loads at
-         * GPA 0, so this is its first block, every run. Not a caller bug --
-         * a representation limit, and it costs one re-translation. */
-        return -1;
-    }
-
     uint8_t *at = (uint8_t *)code_at;
     if (at < qemu_sls_codebuf ||
         at + code_len > qemu_sls_codebuf + QEMU_TCACHE_CODEBUF_SIZE) {
@@ -256,112 +277,19 @@ int qemu_sls_tcache_commit(uint64_t guest_pc, void *code_at,
     return 0;
 }
 
-/* ─── qemu_sls_tcache_store ─────────────────────────────────────────────── */
-
-void *qemu_sls_tcache_store(uint64_t guest_pc, const void *code,
-                            uint32_t code_len, uint64_t gpa,
-                            uint32_t insn_count) {
-    /* ─── The one path that used to fail silently ──────────────────────────
-     * Two loud failure messages below and a bare `return 0` here meant a cache
-     * that stored nothing looked identical to one that was never called. On
-     * the first hardware run every block was a miss, checkpoint reported
-     * "0 TBs, 0 code bytes", and neither failure message appeared -- leaving
-     * no way to tell which of four conditions had declined the store.
-     *
-     * guest_pc == 0 is the interesting one and is NOT a bug in the caller: the
-     * benchmark guest is loaded at GPA 0, so its first block legitimately
-     * starts at guest_pc 0 -- which qemu_sls_tcache_insert() uses as its
-     * empty-slot sentinel. That block can never be cached until the table
-     * distinguishes "empty" from "guest_pc 0" with a separate valid flag. */
-    if (!initialized || !guest_pc || !code || !code_len) {
-        kernel_serial_printf(
-            "[QEMU-SLS TCACHE] store declined at guest_pc=0x%016lx: %s\n",
-            guest_pc,
-            !initialized ? "tcache not initialised" :
-            !guest_pc    ? "guest_pc is 0, which the TB table uses as its "
-                           "empty-slot marker -- this block cannot be cached" :
-            !code        ? "code pointer is NULL" :
-                           "code_len is 0");
-        return 0;
-    }
-
-    /* 16-byte alignment: generated blocks are entered by an indirect call, and
-     * an unaligned entry point costs a fetch penalty on every execution of a
-     * block that will be re-executed for the life of the cache. */
-    uint32_t off = (qemu_sls_codebuf_used + 15u) & ~15u;
-
-    if ((uint64_t)off + code_len > QEMU_TCACHE_CODEBUF_SIZE) {
-        /* Full. Refuse rather than wrap: wrapping would overwrite code that
-         * live TB descriptors still point at, and the next lookup would return
-         * a valid-looking pointer into the middle of someone else's block.
-         * Declining to cache costs a re-translation; wrapping costs a jump
-         * into arbitrary bytes. */
-        kernel_serial_printf(
-            "[QEMU-SLS TCACHE] code buffer full (%u of %u bytes) -- not caching "
-            "the block at guest_pc=0x%016lx. Translation still works; it will "
-            "just not persist.\n",
-            qemu_sls_codebuf_used, (unsigned)QEMU_TCACHE_CODEBUF_SIZE, guest_pc);
-        return 0;
-    }
-
-    uint8_t *dst = qemu_sls_codebuf + off;
-    const uint8_t *src = (const uint8_t *)code;
-    for (uint32_t i = 0; i < code_len; i++) dst[i] = src[i];
-
-    /* ─── Refuse to record a block that copied nothing ─────────────────────
-     * The first hardware run cached a block whose source was entirely zero,
-     * the launcher executed it, and the CPU walked forward through 4 MiB of
-     * zeroed .bss running `add %al,(%rax)` until the node was killed. gdb found
-     * rip at codebuf_storage+0.
-     *
-     * A translated block ALWAYS begins with real instructions -- TCG emits a
-     * prologue that touches the CPU state pointer. All-zero leading bytes mean
-     * the source pointer was wrong, not that the block is unusual. Checking
-     * the first eight bytes costs nothing and converts a silent jump into
-     * arbitrary memory into a refusal that names itself.
-     *
-     * Not a substitute for the caller passing the right pointer. It is the
-     * assertion that says so out loud when it does not. */
-    int all_zero = 1;
-    for (uint32_t i = 0; i < code_len && i < 8; i++)
-        if (dst[i]) { all_zero = 0; break; }
-    if (all_zero) {
-        kernel_serial_printf(
-            "[QEMU-SLS TCACHE] REFUSED to cache guest_pc=0x%016lx: the first "
-            "bytes of the %u-byte source at %p are all zero, so it is not "
-            "generated code. Caching it would mean executing zeroes on a later "
-            "boot.\n", guest_pc, code_len, code);
-        return 0;
-    }
-
-    if (qemu_sls_tcache_insert(guest_pc, off, code_len, gpa, insn_count) != 0) {
-        /* Table full. The bytes are already copied, but without a descriptor
-         * nothing can ever find them, so the space is wasted rather than
-         * dangerous. The cursor is NOT advanced, so the next store reuses it. */
-        kernel_serial_printf(
-            "[QEMU-SLS TCACHE] TB table full (%u entries) -- block at "
-            "guest_pc=0x%016lx not cached.\n",
-            (unsigned)QEMU_TCACHE_MAX_TBS, guest_pc);
-        return 0;
-    }
-
-    qemu_sls_codebuf_used = off + code_len;
-    qemu_sls_tcache_mark_code_dirty(off, code_len);
-    return dst;
-}
-
 int qemu_sls_tcache_insert(uint64_t guest_pc, uint32_t code_offset,
                             uint32_t code_len, uint64_t gpa,
                             uint32_t insn_count) {
-    if (!initialized || !guest_pc) return -1;
+    if (!initialized) return -1;
+    if (guest_pc == (uint64_t)-1) return -1;        /* would bias to 0 */
     uint32_t guest_page = (uint32_t)(gpa / NVME_PAGE_SIZE);
     uint32_t gen = (guest_page < QEMU_TCACHE_GEN_PAGES)
                    ? qemu_sls_page_gen[guest_page] : 0;
     uint32_t slot = hash_pc(guest_pc);
     for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
         QemuTBDesc *d = &tb_table[(slot + i) & (QEMU_TCACHE_MAX_TBS - 1)];
-        if (!d->guest_pc || d->guest_pc == guest_pc) {
-            d->guest_pc     = guest_pc;
+        if (!d->guest_pc || d->guest_pc == pc_store(guest_pc)) {
+            d->guest_pc     = pc_store(guest_pc);
             d->code_offset  = code_offset;
             d->code_len     = code_len;
             d->gen_expected = gen;
@@ -383,7 +311,7 @@ void qemu_sls_tcache_foreach_hot(uint32_t threshold,
     for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
         QemuTBDesc *d = &tb_table[i];
         if (d->guest_pc && d->exec_count >= threshold)
-            cb(d->guest_pc, d->code_offset, d->code_len, d->exec_count);
+            cb(pc_load(d->guest_pc), d->code_offset, d->code_len, d->exec_count);
     }
 }
 
@@ -391,12 +319,12 @@ void qemu_sls_tcache_foreach_hot(uint32_t threshold,
 
 void qemu_sls_tcache_update_tb(uint64_t guest_pc,
     uint32_t new_code_offset, uint32_t new_code_len) {
-    if (!guest_pc) return;
+    if (guest_pc == (uint64_t)-1) return;
     uint32_t slot = hash_pc(guest_pc);
     for (uint32_t i = 0; i < QEMU_TCACHE_MAX_TBS; i++) {
         QemuTBDesc *d = &tb_table[(slot + i) & (QEMU_TCACHE_MAX_TBS - 1)];
         if (!d->guest_pc) return;
-        if (d->guest_pc != guest_pc) continue;
+        if (d->guest_pc != pc_store(guest_pc)) continue;
         d->code_offset = new_code_offset;
         d->code_len    = new_code_len;
         d->exec_count  = 0;

@@ -196,32 +196,6 @@ int   qemu_sls_tcache_commit(uint64_t guest_pc, void *code_at,
                              uint32_t code_len, uint64_t gpa,
                              uint32_t insn_count);
 
-/*
- * DEPRECATED -- copies, and copying cannot work. See the note above.
- * Kept only so the build does not break while callers migrate.
- *
- * Copy freshly generated host code into the persistent buffer and record it.
- *
- * Gate 2 of the Phase 2 plan. TCG generates into its OWN buffer
- * (sls_code_buffer, 32 MiB, sls/sls-runtime.c); this copies the emitted bytes
- * into qemu_sls_codebuf (4 MiB, persisted) and inserts the descriptor, so the
- * two allocators stay independent.
- *
- * Copy rather than redirecting TCG's allocator at this buffer: that would put
- * TCG's region manager and this cursor in charge of the same memory, and being
- * wrong about which owns what means executing the wrong bytes -- with cached
- * host code, silently. One memcpy per translated block is a cheap price for
- * keeping the two apart, and translation already costs ~85% of a launch.
- *
- * Returns a pointer INTO the persistent buffer -- the address the code will
- * occupy on every subsequent boot, which is why the buffer is .bss at a
- * linker-fixed VA and why the identity stamp must match before any of it is
- * trusted. NULL if the buffer or the table is full.
- */
-void *qemu_sls_tcache_store(uint64_t guest_pc, const void *code,
-                            uint32_t code_len, uint64_t gpa,
-                            uint32_t insn_count);
-
 /* Update a TB's code location after PGO re-translation; resets exec_count. */
 void qemu_sls_tcache_update_tb(uint64_t guest_pc,
     uint32_t new_code_offset, uint32_t new_code_len);
