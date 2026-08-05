@@ -69,7 +69,7 @@ hypothesis. Applying it to our own strategy:
 |---|---|---|
 | TCG is bypassed when hardware virt is available | **Verified** | Architectural; definitional for KVM/HVF/WHPX. |
 | Hardware virt requires matching guest/host ISA | **Verified** | Definitional. No cross-ISA hardware path exists. |
-| qemu-user already runs with softmmu disabled | **Verified in tree** | `tcg/tcg-internal.h:37` — `#ifdef CONFIG_USER_ONLY / #define tcg_use_softmmu false`. |
+| qemu-user already runs with softmmu disabled | **Verified in tree** | `tcg/tcg-internal.h:54` — `#if defined(CONFIG_USER_ONLY) \|\| defined(SLS_IN_KERNEL) / #define tcg_use_softmmu false`. Note the second half is **ours**, added for the §5c A/B: AeroSLS now takes the same softmmu-off path qemu-user does. This row understated the position when it cited upstream alone. |
 | QEMU has TCG backends for ARM64 and RISC-V hosts | **Verified in tree** | `tcg/aarch64/`, `tcg/riscv64/`. |
 | AeroSLS has a working RISC-V port | **Verified in tree** | `arch/riscv/` — boot, traps, PLIC, SBI, `user_paging_riscv.c`, `walk_page_tables_riscv.c`. Makefile target `riscv-elf`. |
 | The cluster nodes run without hardware acceleration | **Verified by observation** | No `-enable-kvm` in any node's `/proc/<pid>/cmdline`. |
@@ -467,9 +467,11 @@ No log evidence can distinguish those two; the instruction stream can.
 
 `sls_launcher_init()` maps `QEMU_GUEST_RAM_PAGES` = 65,536 pages = **256 MiB**
 eagerly, for a benchmark whose program is 10 instructions and whose buffer is 512
-bytes. On a node with `-m 1G` and a kernel image that has grown to **173 MiB**
-since TCG was linked in, that is a large, unnecessary, and unmeasured commitment
-made before anything is measured. Map what the caller needs.
+bytes. On a node with `-m 1G` and a loaded kernel image of **221.6 MiB**
+(`readelf -lW my_sls_kernel.bin` → `memsz` 0xdd8e810), that is a large,
+unnecessary, and unmeasured commitment made before anything is measured. The two
+together are 477 MiB of a 1 GiB node before the guest runs a single instruction.
+Map what the caller needs.
 
 ---
 
@@ -552,8 +554,35 @@ instruction set. This is the schedule risk.
 **No performance claim is publishable without non-x86 hardware.** Emulated
 measurement of an emulator measures the outer emulator.
 
-**The kernel image is 173 MiB and growing.** Linking TCG did that. Every
-allocation decision made before TCG was linked in was made under different
+**The loaded kernel image is 221.6 MiB and growing.** An earlier revision of this
+line said 173 MiB and attributed the growth to linking TCG. Both halves were
+wrong, and the second more usefully than the first:
+
+| Object | Size | Owner |
+|---|---|---|
+| `sls_heap` | 64.00 MiB | core AeroSLS |
+| `http_conns` | 32.01 MiB | core AeroSLS |
+| `sls_code_buffer` | 32.00 MiB | **TCG** |
+| `g_add_column_scratch` | 16.03 MiB | core (SQL) |
+| `tcp_conns` | 16.02 MiB | core AeroSLS |
+| `btree_nodes` | 13.81 MiB | core (RDBMS) |
+| `codebuf_storage` | 4.00 MiB | **TCG** |
+
+`nm --size-sort -S my_sls_kernel.bin | tail -20`
+
+**TCG is 36 MiB of a 218.7 MiB `.bss` — about 16%.** `sls_heap` alone is nearly
+twice that. The footprint is dominated by fixed-size static arrays in core
+subsystems, so an effort to shrink the image aimed at TCG would be aimed at the
+wrong sixth of it.
+
+This cuts in favour of the cross-ISA direction rather than against it: most of
+the footprint is compile-time constants tunable per deployment, not an inherent
+cost of carrying a JIT. But it must be measured per target, not assumed —
+`memsz`, not the ELF file size, which is 2.0 MiB and 111× smaller because `.bss`
+is `nobits`. Sizing hardware from `ls -l` gives an answer that is wrong by two
+orders of magnitude.
+
+Every allocation decision made before TCG was linked in was made under different
 arithmetic, and `map_guest_ram`'s 256 MiB request is one such decision. There may
 be others that have not surfaced yet.
 

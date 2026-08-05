@@ -21,12 +21,21 @@ X86_LD      = x86_64-elf-ld
 # .bss, and it only surfaced once TCG started using the arena that lived there.
 # This flag would have printed the number in seconds at any point.
 #
-# A WARNING, not an error: shell.c and http.c are over budget today (276 KB and
-# 266 KB), and turning that into a hard build failure would block work on a
-# problem that needs a considered refactor, not a rushed one. The hard gate is
-# tests/stack_frame_budget_check.sh, which asserts frames stay within the
-# ACTUAL stack size -- the invariant that matters, since a threshold unrelated
-# to the stack it must fit in is just a number.
+# A WARNING, not an error. The original reason was that shell.c and http.c were
+# over budget (276 KB and 266 KB) and turning that into a hard build failure
+# would have blocked work on a problem needing a considered refactor.
+#
+# THAT REASON HAS LAPSED. Both frames were root-caused to single oversized
+# structs, not to the diffuse "hundreds of small locals" they were assumed to
+# be: sls_shell_execute() is now 10,224 bytes and http_route() 5,456, verified
+# against a linked binary. Nothing in the tree exceeds this 16,384 threshold.
+#
+# So `-Werror=frame-larger-than` is now available for the asking, and whether to
+# take it is an open decision rather than a settled one -- left as a warning
+# here only because nobody has decided, not because anything still needs the
+# slack. The hard gate remains tests/stack_frame_budget_check.sh, which asserts
+# frames stay within the ACTUAL stack size -- the invariant that matters, since
+# a threshold unrelated to the stack it must fit in is just a number.
 # ─── Build identity for the persistent translation cache ─────────────────────
 # The QEMU-SLS translation cache stores HOST MACHINE CODE on NVMe and restores
 # it across reboots. Its magic number proves only that SOME build wrote it, so
