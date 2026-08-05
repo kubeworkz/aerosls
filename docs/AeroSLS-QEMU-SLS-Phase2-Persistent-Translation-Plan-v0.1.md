@@ -316,12 +316,34 @@ count does not move, which is exactly why the block count is the number quoted.
   that produces different code.** It has only refused an unstamped cache and a
   differing hash.
 
+### 3d. COMPLETE — zero translation on a warm run (2026-08-04)
+
+After biasing `guest_pc` by one in the descriptor, the last uncacheable block
+was gone and a warm run compiled **nothing at all**:
+
+| | cold | warm |
+|---|---|---|
+| blocks compiled | 8 | **0** |
+| instructions compiled | 502 | **0** |
+| TRANSLATE cycles | 24,495,001 | **0** |
+| TCACHE | 0 hit, 8 miss | **8 hit, 0 miss** |
+| instructions executed | 502 | **502** |
+| arena consumed | 11,829,392 | **0** |
+| total cycles | 28,607,572 | 719,712 |
+
+**100% of translation eliminated**, with identical guest results.
+
+The arena figure is a second-order confirmation and worth noting: the ~1.48 MB
+per block that `sls_malloc` leaks comes entirely from TCG's translation
+allocations, so a run that compiles nothing allocates nothing. The leak that
+limited a boot to ~5 benchmark runs applies only to cold runs.
+
 ### The marketing claim this supports
 
 > Every other emulator recompiles from scratch on every start. AeroSLS does not:
 > in a single-level store, compiled code is a persistent object like any other.
-> On this workload a restarted node compiled 1 block instead of 8 — 87% less
-> translation work — and executed identical results.
+> On this workload a warm node compiled **nothing** — 0 blocks instead of 8 —
+> and executed identical results.
 
 Capability, with a measurement, in counts. No speed multiplier is claimed, and
 none should be until the work runs on hardware with KVM or on a non-x86 host.
