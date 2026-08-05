@@ -31,7 +31,7 @@ global stack_bottom
 global stack_top
 
 ; ─── Size: 1 MiB, raised from 64 KiB ──────────────────────────────────────────
-; sls_shell_execute() compiles to a 276,032-byte stack frame -- more than four
+; sls_shell_execute() compiled to a 276,032-byte stack frame -- more than four
 ; times the old 64 KiB stack. EVERY shell command, local or over HTTP, therefore
 ; ran with RSP roughly 208 KiB BELOW stack_bottom, writing into whatever .bss
 ; followed. Three separate faults were captured at 212,768 / 212,864 / 212,880
@@ -44,15 +44,37 @@ global stack_top
 ; TCG allocate from that arena, the shell's stack frame and tcg_init_ctx
 ; occupied the same bytes, and the node halted on the first TCG initialisation.
 ;
-; 1 MiB gives ~3.5x headroom over the largest known frame. It is not a licence
-; for larger frames: tests/stack_frame_budget_check.sh asserts the two numbers
-; stay in a fixed relationship, and X86_CFLAGS carries -Wframe-larger-than so a
-; new offender is visible at compile time rather than as a fault address.
+; 1 MiB gave ~3.8x headroom over the 276 KB frame that forced the raise. That
+; frame is since gone -- one `static` in user/shell.c took it to 10,224 bytes --
+; so the headroom is now far wider, and this file deliberately does not restate
+; the multiple, because a hardcoded ratio here is exactly the thing that goes
+; stale and misleads. tests/stack_frame_budget_check.sh computes it from the
+; linked binary on every run; ask it, not this comment.
 ;
-; The cost is 1 MiB of nobits .bss on a node with 1 GiB. The alternative --
-; auditing ~1400 lines of shell branches to shrink a frame built from hundreds
-; of small locals GCC declines to overlap -- is a far larger change with far
-; more room to introduce a subtler bug.
+; The size is NOT reduced back in step with the frame. 1 MiB of nobits .bss on
+; a 1 GiB node costs nothing measurable, and the whole point of the check is
+; that frames are held against the stack that exists rather than the stack
+; being trimmed to whatever the frames happen to need this week.
+;
+; It is not a licence for larger frames either: stack_frame_budget_check.sh
+; asserts the two numbers stay in a fixed relationship, and X86_CFLAGS carries
+; -Wframe-larger-than so a new offender is visible at compile time rather than
+; as a fault address.
+;
+; The cost is 1 MiB of nobits .bss on a node with 1 GiB. The alternative
+; considered at the time -- auditing ~1400 lines of shell branches to shrink a
+; frame believed to be built from hundreds of small locals GCC was declining to
+; overlap -- looked like a far larger change with far more room to introduce a
+; subtler bug, so the stack was raised instead.
+;
+; That reading of the frame was wrong, and it is worth recording why, because
+; the audit kept getting re-proposed on the strength of it. The frame being
+; identical at -O0, -O1, -O2 and -Os was taken as proof the optimiser was
+; refusing to overlap the locals. It meant the opposite: GCC overlaps
+; branch-local structs at every level, so the size was invariant because it was
+; ONE object, not hundreds. sizeof(SLSVecJoinRequest) was 265,880 of the
+; 276,032 bytes. The fix was a one-line `static`, not a dispatcher rewrite.
+; See the comment at the top of sls_shell_execute() in user/shell.c.
 ;
 ; Kept as its own top-level output section in arch/x86/linker.ld: nested inside
 ; .bss the wildcard did not match, the section became an orphan placed ABOVE

@@ -455,24 +455,33 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
     reconcile_drain();
 
     /* ─── Shared storage for the largest command request structs ──────────
-     * sls_shell_execute() compiles to a 276 KB stack frame, built from ~90
-     * request structs and ~50 small arrays spread across its command branches.
-     * They do not share stack slots -- the frame is the same size at -O0, -O1,
-     * -O2 and -Os, so this is not the optimiser declining to overlap them.
+     * CURRENT STATE, so nobody has to read to the end of this comment for it:
+     * sls_shell_execute() compiles to a 10,224-byte frame, under 1% of the
+     * 1 MiB stack. It is not the largest frame in the tree and needs no
+     * further work. Verify with tests/stack_frame_budget_check.sh rather than
+     * trusting this number -- it is recorded here because a stale figure in
+     * this very paragraph once sent a session off to plan a refactor that had
+     * already been done.
      *
-     * It matters because this frame ran on a 64 KiB stack until today: every
-     * shell command executed ~208 KiB below stack_bottom, overwriting .bss,
-     * invisibly, for months. The stack is now 1 MiB and the frame fits, but
-     * 26% of the stack for one function is not a place to leave it.
+     * The rest of this comment is why the union below exists and why the ~85
+     * other request structs must be left alone. It is history, and the
+     * numbers in it are historical.
+     *
+     * This frame WAS 276,032 bytes, and it ran on a 64 KiB stack: every shell
+     * command executed ~208 KiB below stack_bottom, overwriting .bss,
+     * invisibly, for months.
      *
      * Exactly one command runs per call, so at most one request struct is ever
      * live -- which makes a union the right shape rather than a trick.
      *
      * Measured, after an earlier claim here was wrong. This union was added
-     * first, on the theory that the five largest structs were ~51 KB of the
-     * 276 KB frame. The frame did not move by a single byte, because GCC
-     * already overlaps branch-local structs -- which is also why the frame was
-     * identical at -O0, -O1, -O2 and -Os.
+     * first, on the theory that the frame was ~90 request structs failing to
+     * share slots, of which the five largest were ~51 KB. The frame did not
+     * move by a single byte. GCC already overlaps branch-local structs -- which
+     * is also why the frame was identical at -O0, -O1, -O2 and -Os. That
+     * invariance had been read as proof the optimiser was declining to overlap
+     * them; it was the opposite, and the union was aimed at a cause that was
+     * never there.
      *
      * The frame was ONE struct: sizeof(SLSVecJoinRequest) is 265,880 bytes,
      * 96% of the total (see the note at its declaration below). With that moved
@@ -1804,9 +1813,11 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
 
 /* ─── 260 KB: this one struct WAS the frame ────────────────────────────
              * sizeof(struct SLSVecJoinRequest) is 265,880 bytes -- it carries
-             * results[VEC_JOIN_MAX_RESULTS] inline. That is 96% of this
-             * function's 276,032-byte frame; GCC overlaps every other command's
-             * locals, so the frame is essentially this struct alone.
+             * results[VEC_JOIN_MAX_RESULTS] inline. That was 96% of this
+             * function's frame back when the struct was automatic and the frame
+             * was 276,032 bytes; GCC overlaps every other command's locals, so
+             * the frame was essentially this struct alone. It is 10,224 bytes
+             * now, because of the `static` on the declaration below.
              *
              * It ran on a 64 KiB stack until today, which is how every shell
              * command came to execute ~208 KiB below stack_bottom, overwriting

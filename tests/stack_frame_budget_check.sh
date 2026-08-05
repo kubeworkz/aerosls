@@ -35,9 +35,14 @@
 #   deterministically, which is the bug that produced this file.
 #
 # ADVISORY at WARN_PCT (default 25%): large, worth shrinking, not yet unsafe.
-#   Reported and NOT failed, deliberately. sls_shell_execute() is 276 KB
-#   against a 1 MiB stack today -- 26%, fine, but only 3.8x from disaster and
-#   it should not be allowed to drift quietly upward.
+#   Reported and NOT failed, deliberately. The case it was written for was
+#   sls_shell_execute() at 276 KB against a 1 MiB stack -- 26%, safe but only
+#   3.8x from disaster, and not something to let drift quietly upward.
+#
+#   That frame is now 10,224 bytes and nothing in the tree is above the
+#   advisory line. No current figure is quoted here on purpose: the run prints
+#   the live worst frame every time, and a number pasted into a comment is how
+#   a fixed problem gets re-reported as an open one months later.
 #
 # The tiers are separate so the hard gate keeps its meaning. A check that fails
 # on a clean checkout gets suppressed, and a suppressed check protects nothing;
