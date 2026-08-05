@@ -338,6 +338,57 @@ per block that `sls_malloc` leaks comes entirely from TCG's translation
 allocations, so a run that compiles nothing allocates nothing. The leak that
 limited a boot to ~5 benchmark runs applies only to cold runs.
 
+### 3e. Gate 4 — invalidation, and the two doors into guest code
+
+`qemu_sls_tcache_flush_page()` and `_flush_all()` existed and were **called from
+nowhere**. Worse, with softmmu off there was nothing to call them *from*: a
+guest store compiles to a bare host MOV -- no helper, no TLB lookup, no hook --
+so a guest rewriting a page it had already executed produced no signal at all,
+and the cache went on serving translations of bytes that no longer existed.
+
+Two distinct paths write guest code, and they need opposite treatments.
+
+**Guest stores — go through the GUEST window.** A page that translated code was
+generated from is now write-protected there after a successful commit. The next
+guest store faults, which is the hook that did not otherwise exist:
+`shadow_fault()` bumps the page generation (making every TB from it a lookup
+miss), restores write permission, and reports the fault resolved so the store
+retries and succeeds. Present-but-not-writable, so execute and read are
+unaffected: only a store can invalidate a translation.
+
+**Emulator writes — go through the EMULATOR window, which is deliberately
+unprotected**, because that is how the emulator reads guest page tables and
+loads images. So they overwrite guest code with no fault and no signal. Found
+while testing the above: `sls_launch_guest()` memcpy's the image on every
+launch, straight over the code page, invisibly.
+
+### The correction that mattered most
+
+Flushing on that memcpy was correct and ruinous. Re-launching the same image
+rewrites identical bytes and invalidates every page it touches -- and all eight
+blocks of this benchmark live in the single page the 3006-byte image occupies.
+**A warm run went from 8 hits to 8 misses the moment the flush was added.**
+
+The image copy now compares per page and flushes only where the bytes actually
+differ. A 4 KiB scan against ~25 million cycles of re-translation; not really an
+optimisation, but the difference between a cache that survives its own loader
+and one that cannot.
+
+```
+warm run, after all three rounds:
+   TCACHE 8 hit(s), 0 miss(es)      TRANSLATE 0 cycles in 0 block(s)
+   502 insn(s) executed             ARENA 0 consumed by this launch
+```
+
+83 host checks, 5 mutations caught.
+
+**Still open:** invalidation for guests with paging ON (the faulting address is
+then a GVA and needs a page-table walk before its physical page can be
+identified -- currently refused loudly rather than allowed), and an audit of
+every other caller of `qemu_sls_dma_host_ptr()`. Making that accessor invalidate
+by itself would make the safe path the default rather than something each caller
+has to remember.
+
 ### The marketing claim this supports
 
 > Every other emulator recompiles from scratch on every start. AeroSLS does not:
