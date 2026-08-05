@@ -89,6 +89,28 @@ static inline uint64_t qemu_tcache_identity_of(const char *build_id) {
     h ^= (uint64_t)QEMU_TCACHE_MAX_TBS << 3;
     h *= 1099511628211ULL;
     h ^= (uint64_t)sizeof(void *);                     /* host pointer width */
+    h *= 1099511628211ULL;
+    /* ─── softmmu side, because it changes every emitted load ──────────────
+     * SLS_FORCE_SOFTMMU (see ../qemu/tcg/tcg-internal.h) flips guest memory
+     * accesses between an inlined TLB lookup and a bare MOV -- 86 bytes of
+     * host code per load against 16. The two builds emit different machine
+     * code for the same guest instruction.
+     *
+     * Without this term they hash identically, because AEROSLS_BUILD_ID is
+     * the git commit and the A/B is a flag change at one commit. A cache
+     * written by the OFF build would then be accepted by the ON build and
+     * jumped into: host machine code executed against the wrong memory-access
+     * contract, with no fault to catch it. That is precisely the outcome the
+     * identity stamp exists to make impossible, and the A/B knob is the one
+     * change most likely to produce it.
+     *
+     * Adding this term changes the hash for every build once, discarding
+     * existing caches on the next boot. One cold start, correctly taken. */
+#ifdef SLS_FORCE_SOFTMMU
+    h ^= 0x536F66744D4D5501ULL;                        /* softmmu = ON  */
+#else
+    h ^= 0x536F66744D4D5500ULL;                        /* softmmu = OFF */
+#endif
     return h;
 }
 

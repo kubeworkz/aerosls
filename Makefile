@@ -54,10 +54,35 @@ X86_LD      = x86_64-elf-ld
 # accepting a cache whose provenance cannot be established.
 AEROSLS_BUILD_ID := $(shell git rev-parse --short=12 HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)
 
+# ─── SLS_SOFTMMU: the A/B knob for the Cross-ISA §5c measurement ─────────────
+# The headline number -- 86 bytes of host code per guest load with QEMU's
+# software MMU, 16 without, a 5.41x ratio -- comes from building the same
+# sources twice with this one switch flipped.
+#
+# Until this existed the ON side required hand-editing tcg-internal.h, so the
+# published ratio rested on a build that could not be reproduced. Half of it
+# was measured on 2026-08-04 and had no way to be re-derived.
+#
+#   make x86-iso                    # softmmu OFF (default, the shipping config)
+#   make x86-iso SLS_SOFTMMU=on     # softmmu ON  (the A/B comparison side)
+#
+# The define MUST reach both compilers. TCG_CFLAGS governs code generation in
+# tcg.c and tcg-op-ldst.c; X86_CFLAGS governs the translation cache's identity
+# stamp, which has to know which side it is on or an OFF-built cache will be
+# accepted by an ON build and jumped into. See qemu_tcache_identity_of() in
+# kernel/qemu_sls_tcache.h.
+SLS_SOFTMMU ?= off
+ifeq ($(SLS_SOFTMMU),on)
+AB_DEFS = -DSLS_FORCE_SOFTMMU
+else ifneq ($(SLS_SOFTMMU),off)
+$(error SLS_SOFTMMU must be 'on' or 'off', got '$(SLS_SOFTMMU)')
+endif
+
 X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
               -mno-sse -mno-sse2 -mno-mmx \
               -fno-pie -fno-pic -fno-tree-vectorize \
               -Wframe-larger-than=16384 \
+              $(AB_DEFS) \
               -DAEROSLS_BUILD_ID='"$(AEROSLS_BUILD_ID)"'
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
@@ -149,6 +174,7 @@ QEMU_WARN = -Wno-unused-parameter -Wno-unused-function \
 TCG_CFLAGS = -ffreestanding -O2 -mcmodel=small -mno-red-zone \
              -mno-sse -mno-sse2 -mno-mmx \
              -fno-pie -fno-pic -fno-tree-vectorize \
+             $(AB_DEFS) \
              $(QEMU_INC) $(QEMU_DEFS) $(QEMU_WARN)
 
 TCG_OBJS = \

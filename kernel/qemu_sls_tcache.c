@@ -134,10 +134,44 @@ int qemu_sls_tcache_init(void) {
 
 /* ─── qemu_sls_tcache_flush_page ─────────────────────────────────────────── */
 
+/* Budget for the diagnostic below. Bounded rather than unconditional because
+ * qemu_sls_mmu_shadow_fault() also calls flush_page, once per protected-page
+ * write fault -- rare on the bench path, potentially hot under a real guest,
+ * and a diagnostic that floods the console is one that gets removed. */
+static uint32_t flush_log_budget = 16;
+
 void qemu_sls_tcache_flush_page(uint64_t gpa) {
     uint32_t page = (uint32_t)(gpa / NVME_PAGE_SIZE);
     if (page >= QEMU_TCACHE_GEN_PAGES) return;
     qemu_sls_page_gen[page]++;
+
+    /* ─── Why this print exists ────────────────────────────────────────────
+     * A restored cache can be discarded by its own loader without any of the
+     * existing output showing it. `qemu bench` after a reboot reported
+     * TCACHE 0 hit / 8 miss while the boot log said "warm start" -- the
+     * restore had worked and the misses came from a generation bump that
+     * nothing announced.
+     *
+     * The suspected path is sls-launcher.c's image copy: guest RAM is not
+     * persisted, so on a fresh boot the copy finds page 0 differs, writes it,
+     * and flushes -- invalidating every TB compiled from that page. Within a
+     * boot the bytes already match, the copy is skipped, and the cache hits.
+     * That asymmetry is consistent across four boots but has never been
+     * observed directly, only inferred.
+     *
+     * Expect exactly one line, page 0, on the first launch after a reboot,
+     * and none on a warm relaunch. If that is what appears, the inference
+     * becomes a measurement. If flushes appear on the warm run too, or none
+     * appears at all, the explanation is wrong and this print is how we find
+     * that out rather than shipping a fix for the wrong cause. */
+    if (flush_log_budget) {
+        flush_log_budget--;
+        kernel_serial_printf(
+            "[QEMU-SLS TCACHE] flush_page gpa=0x%016lx page=%u gen->%u%s\n",
+            gpa, page, qemu_sls_page_gen[page],
+            flush_log_budget ? "" : "   (budget spent; further flushes silent)");
+    }
+
     /* Synchronously persist the one NVMe page covering this counter. */
     if (io_sq && io_cq)
         write_gen_page(page / (NVME_PAGE_SIZE / sizeof(uint32_t)));
