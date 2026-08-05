@@ -328,6 +328,62 @@ It goes to the node console at boot, not to the `aeroslsctl shell` capture,
 which is why the trial did not include it. **Read that line before drawing any
 conclusion about persistence.**
 
+### 2026-08-05, second trial — correctly sequenced, restore still did not fire
+
+The sequence below was run. The write **succeeded** and the restore **did not**:
+
+```
+qemu bench 500   ->  TCACHE 0 hit, 8 miss   (cold, expected)
+checkpoint       ->  [QEMU-SLS TCACHE] synced: 8 TBs, 8051 code bytes   <- written
+<node restart>
+qemu bench 500   ->  TCACHE 0 hit, 8 miss   <- NOT restored
+```
+
+The third run is a first-launch-after-boot, not a same-boot repeat: it re-prints
+the `[QEMU-SLS MMU]` mapping and `TCG ready` lines, and `ALLOC` reads *13 call(s)
+since boot* with *8 block(s) this launch* — identical to the first run. A second
+launch in the same boot would have carried a higher cumulative `ALLOC`.
+
+**So this is a real open defect, not a sequencing mistake.** What has been ruled
+out, statically, from the tree:
+
+| Hypothesis | Status |
+|---|---|
+| `tcache_init` runs before NVMe is up | **Eliminated.** `nvme_io_init()` at `kernel.c:387` precedes `qemu_sls_tcache_init()` at `:409` |
+| `sync` was never called | **Eliminated.** It printed `synced: 8 TBs, 8051 code bytes` |
+| Write and read use different LBAs or layouts | **Eliminated.** Both use `QEMU_TCACHE_HDR_LBA`; header field offsets match at `:345-354` and `:73-106` |
+| The node's disk is recreated on restart | **Eliminated.** `run-cluster.sh:465` creates the image only when absent |
+| Another subsystem overwrites the tcache LBAs | **Eliminated.** tcache spans 10000–18968; persist ends ~7664, `STREAM_DIR` 8192, stream data 65536+, VM state 20000. All disjoint. |
+
+### What is left, and the one line that decides it
+
+Three candidates remain, and `qemu_sls_tcache_init()` prints exactly which one
+occurred — to the **node console at boot**, which is why no `aeroslsctl shell`
+capture has contained it:
+
+```bash
+grep 'QEMU-SLS TCACHE' cluster/node2.log | head -3
+```
+
+| If the line says | Then |
+|---|---|
+| `snapshot is from a DIFFERENT BUILD … discarded` | The node was **rebuilt** between checkpoint and restart. Correct refusal — `AEROSLS_BUILD_ID` is `git rev-parse HEAD` and several commits landed this day. Re-test without rebuilding. |
+| `no snapshot — cold start` | **Real bug.** The magic was written but does not read back. Write path claims success while producing nothing readable. |
+| `NVMe unavailable — cold start` | I/O queues down this boot; `[NVME] I/O queue setup failed` should also appear, and `persist_restore_all()` would have been skipped too. |
+
+**Do not patch anything before reading that line.** §6 of the Cross-ISA plan
+records three hypotheses advanced from reading code on a different bug, all
+three wrong, all three killed by a two-command measurement. The standing rule
+from that session applies here unchanged: *the first request is the log, not a
+patch.*
+
+### Minor, noted in passing
+
+`synced: 8 TBs, **8051** code bytes` against `CODE **8003** bytes emitted` — a
+48-byte difference between `qemu_sls_codebuf_used` and the bench's emitted
+count. Probably prologue or alignment, but it is unexplained and both numbers
+are supposed to describe the same code.
+
 ### The correct sequence
 
 ```bash
