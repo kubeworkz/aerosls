@@ -1886,7 +1886,14 @@ static int api_schema_import_post(const char* body, char* buf, int max, uint32_t
     static char import_text[SQL_SCHEMA_EXPORT_MAX_LEN];
     json_str(body, "sql", import_text, sizeof(import_text));
 
-    struct SqlSchemaImportResult res;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 16,404 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct SqlSchemaImportResult res;
     sql_schema_import(req_uid, import_text, &res);
 
     jb_obj_open(&j, 0);
@@ -1976,7 +1983,14 @@ static int api_vec_data_import_post(const char* body, char* buf, int max, uint32
     static char import_text[VEC_DATA_EXPORT_MAX_LEN];
     json_str(body, "text", import_text, sizeof(import_text));
 
-    struct VecDataImportResult res;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 18,444 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct VecDataImportResult res;
     vec_data_import(req_uid, import_text, &res);
 
     jb_obj_open(&j, 0);
@@ -3091,7 +3105,14 @@ static int api_object_set_database_post(const char* body, char* buf, int max, ui
 static int api_vec_insert_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    struct SLSVecInsertRequest req;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 8,304 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct SLSVecInsertRequest req;
     req.caller_uid = req_uid;
     json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
     req.external_id = json_uint64(body, "external_id");
@@ -3149,7 +3170,14 @@ static int api_vec_embed_insert_post(const char* body, char* buf, int max, uint3
 static int api_vec_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    struct SLSVecSearchRequest req;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 9,920 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct SLSVecSearchRequest req;
     req.caller_uid = req_uid;
     json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
     req.query.count = (uint32_t)json_float_array(body, "query", req.query.values, VECSTORE_MAX_DIMENSION);
@@ -3229,7 +3257,14 @@ static int api_vec_index_create_post(const char* body, char* buf, int max, uint3
 static int api_vec_index_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    struct SLSVecIndexSearchRequest req;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 9,904 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct SLSVecIndexSearchRequest req;
     req.caller_uid = req_uid;
     json_str(body, "index", req.index_name, OBJECT_NAME_LEN);
     req.query.count = (uint32_t)json_float_array(body, "query", req.query.values, VECSTORE_MAX_DIMENSION);
@@ -3286,7 +3321,14 @@ static int api_vec_index_search_post(const char* body, char* buf, int max, uint3
 static int api_vec_embed_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    struct SLSVecEmbedSearchRequest req;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 3,992 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct SLSVecEmbedSearchRequest req;
     req.caller_uid = req_uid;
     json_str(body, "collection", req.collection_name, OBJECT_NAME_LEN);
     json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "10.0.2.2");
@@ -3343,7 +3385,14 @@ static int api_vec_embed_search_post(const char* body, char* buf, int max, uint3
 static int api_vec_index_embed_search_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    struct SLSVecIndexEmbedSearchRequest req;
+    /* Static, not automatic -- see the "one request at a time" note below.
+     * This struct carries its result/row array inline, so an automatic here
+     * puts the whole array on the kernel stack. Sized by measurement, not
+     * guess: this one is 3,976 bytes, and at -O2 GCC inlines this handler into
+     * http_route() (single call site), so the cost lands in the ROUTER's
+     * frame, not this function's -- which is why it was invisible until
+     * -fno-inline moved it back here. */
+    static struct SLSVecIndexEmbedSearchRequest req;
     req.caller_uid = req_uid;
     json_str(body, "index", req.index_name, OBJECT_NAME_LEN);
     json_str_or_default(body, "endpoint_ip", req.ollama_req.endpoint_ip, OLLAMA_ENDPOINT_LEN, "10.0.2.2");
@@ -3422,51 +3471,77 @@ static int api_vec_index_rebuild_post(const char* body, char* buf, int max, uint
 // re-running a search itself, matching sys_sls_vec_join()'s own real
 // contract: this is the join primitive alone, composable with either search
 // path via ordinary REST calls rather than a hidden second search.
+// ─── Streaming join ────────────────────────────────────────────────────────
+// vec_join_resolve() has always delivered rows one at a time through
+// VecJoinRowCb, and this handler JSON-encodes them one at a time. The
+// 264,192-byte results[] array inside SLSVecJoinRequest exists only so the
+// ring-3 syscall ABI (sys_sls_vec_join) can hand a ring-3 caller a flat
+// struct -- a caller that consumes rows sequentially never needed it. Going
+// through the syscall wrapper here meant materialising all 64 rows just to
+// walk them once, which was this function's entire 266,304-byte frame.
+//
+// One consequence, deliberate: result_count and truncated are emitted AFTER
+// the results array rather than before it, because neither is known until the
+// last row has streamed. JSON member order is not significant, and nothing in
+// tests/ or the frontend reads these positionally (checked before reordering).
+struct vj_emit_ctx {
+    JSONBuf* j;
+    uint32_t seen;      // counts PAST the cap -- this is how truncation is detected,
+                        // matching vjs_collect_cb()'s own contract in vec_join.c
+    uint32_t emitted;   // how many actually made it into the array
+};
+
+static void vj_emit_cb(const struct VecMatch* m, const struct RowValues* row, void* ctxp) {
+    struct vj_emit_ctx* c = (struct vj_emit_ctx*)ctxp;
+    if (c->seen < VEC_JOIN_MAX_RESULTS) {
+        JSONBuf* j = c->j;
+        if (c->emitted) jb_putc(j, ',');
+        jb_obj_open(j, 0);
+        jb_uint(j, "external_id", m->external_id); jb_putc(j, ',');
+        jb_arr_open(j, "row");
+        for (uint32_t cc = 0; cc < row->count; cc++) {
+            if (cc) jb_putc(j, ',');
+            // Phase 4 (SQL Feature-Parity Roadmap): same real-null
+            // round-trip as sql_row_to_json_cb() above.
+            if (row->null_mask & (1u << cc)) jb_raw(j, "null");
+            else jb_esc_str(j, row->values[cc]);
+        }
+        jb_arr_close(j);
+        jb_obj_close(j);
+        c->emitted++;
+    }
+    c->seen++;
+}
+
 static int api_vec_join_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    /* 265,880 bytes -- results[VEC_JOIN_MAX_RESULTS] lives inline in the
-     * request. It was this function's whole 266,304-byte frame. static because
-     * the HTTP server is single-threaded and handles one request at a time; see
-     * the fuller note at the matching declaration in user/shell.c. */
-    static struct SLSVecJoinRequest req;
-    req.caller_uid = req_uid;
-    json_str(body, "table", req.table_name, OBJECT_NAME_LEN);
-    json_str(body, "id_column", req.id_column, RECORD_KEY_LEN);
+    char table_name[OBJECT_NAME_LEN], id_column[RECORD_KEY_LEN];
+    struct VecMatch matches[VEC_SEARCH_MAX_K];   // 1,536 bytes -- the caller-supplied
+                                                 // side is small; only results[] was not
+    json_str(body, "table", table_name, OBJECT_NAME_LEN);
+    json_str(body, "id_column", id_column, RECORD_KEY_LEN);
     uint32_t n = 0;
     char objbuf[256];
     while (n < VEC_SEARCH_MAX_K && json_array_object_at(body, "matches", (int)n, objbuf, (int)sizeof(objbuf))) {
-        req.matches[n].external_id  = json_uint64(objbuf, "external_id");
-        req.matches[n].id.page_id    = (uint32_t)json_int(objbuf, "page_id");
-        req.matches[n].id.slot_index = (uint32_t)json_int(objbuf, "slot_index");
-        json_float(objbuf, "distance", &req.matches[n].distance);
+        matches[n].external_id  = json_uint64(objbuf, "external_id");
+        matches[n].id.page_id    = (uint32_t)json_int(objbuf, "page_id");
+        matches[n].id.slot_index = (uint32_t)json_int(objbuf, "slot_index");
+        json_float(objbuf, "distance", &matches[n].distance);
         n++;
     }
-    req.match_count = n;
-    uint64_t rc = sys_sls_vec_join(&req);
     jb_obj_open(&j,0);
-    jb_str(&j, "ok", rc==0 ? "true" : "false"); jb_putc(&j,',');
+    // Unconditionally true, and it was before this change too: sys_sls_vec_join()
+    // only ever returned non-zero for a NULL request (see vec_join.h -- "always
+    // returns 0"), which a stack/static local could never be.
+    jb_str(&j, "ok", "true"); jb_putc(&j,',');
     jb_uint(&j, "match_count", n); jb_putc(&j,',');
-    jb_uint(&j, "result_count", req.result_count); jb_putc(&j,',');
-    jb_str(&j, "truncated", req.truncated ? "true" : "false"); jb_putc(&j,',');
     jb_arr_open(&j, "results");
-    uint32_t nshown = req.result_count < VEC_JOIN_MAX_RESULTS ? req.result_count : VEC_JOIN_MAX_RESULTS;
-    for (uint32_t i = 0; i < nshown; i++) {
-        if (i) jb_putc(&j, ',');
-        jb_obj_open(&j, 0);
-        jb_uint(&j, "external_id", req.results[i].match.external_id); jb_putc(&j, ',');
-        jb_arr_open(&j, "row");
-        for (uint32_t c = 0; c < req.results[i].row.count; c++) {
-            if (c) jb_putc(&j, ',');
-            // Phase 4 (SQL Feature-Parity Roadmap): same real-null
-            // round-trip as sql_row_to_json_cb() above.
-            if (req.results[i].row.null_mask & (1u << c)) jb_raw(&j, "null");
-            else jb_esc_str(&j, req.results[i].row.values[c]);
-        }
-        jb_arr_close(&j);
-        jb_obj_close(&j);
-    }
-    jb_arr_close(&j);
+    struct vj_emit_ctx ctx = { &j, 0, 0 };
+    vec_join_resolve(req_uid, table_name, id_column, matches, n, vj_emit_cb, &ctx);
+    jb_arr_close(&j); jb_putc(&j,',');
+    jb_uint(&j, "result_count", ctx.seen); jb_putc(&j,',');
+    jb_str(&j, "truncated", ctx.seen > VEC_JOIN_MAX_RESULTS ? "true" : "false");
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 

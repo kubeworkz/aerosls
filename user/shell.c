@@ -1818,11 +1818,27 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
              * instance is correct. Moving it to .bss costs the same memory and
              * takes it off the stack entirely.
              *
-             * The real fix is for the result rows to live outside the request
-             * -- a caller-supplied buffer, or a cursor -- so that the size is
-             * the caller's choice rather than a compile-time constant every
-             * caller pays. That is an API change across the vec-join callers
-             * and wants its own pass. */
+             * That pass has now happened, and this site was deliberately left
+             * alone. vec_join_resolve() streams rows through VecJoinRowCb, so
+             * a caller that consumes them sequentially never needs results[]
+             * at all -- net/http.c's api_vec_join_post() was converted to do
+             * exactly that and no longer allocates the array anywhere.
+             *
+             * This site is different, and the difference is the line below:
+             * it goes through do_syscall(SYS_SLS_VEC_JOIN, ...), a real trap,
+             * not a direct C call. http.c was calling sys_sls_vec_join() as an
+             * ordinary function, so it paid the whole flattening cost while
+             * exercising none of the ABI. This shell command is the only live
+             * end-to-end test of syscall 226 -- the dispatcher, the argument
+             * marshalling, and the flat-struct contract that a ring-3 caller
+             * genuinely cannot avoid, because it cannot be handed a kernel
+             * callback.
+             *
+             * So the array stays here on purpose. Converting this site too
+             * would buy 260 KB of .bss by deleting the only coverage syscall
+             * 226 has, in a kernel that maps 256 MiB of guest RAM. That is a
+             * bad trade. static keeps it off the stack, which was the actual
+             * defect. */
             static struct SLSVecJoinRequest jreq;
             jreq.caller_uid = current_session_uid;
             sh_copy(jreq.table_name, table_name, sizeof(jreq.table_name));

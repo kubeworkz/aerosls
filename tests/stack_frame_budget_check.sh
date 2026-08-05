@@ -60,6 +60,26 @@ echo "========================"
 [ -f "$KERNEL" ] || { echo "ABORT: $KERNEL not found -- run 'make' first" >&2; exit 2; }
 command -v nm >/dev/null || { echo "ABORT: nm not found (binutils)" >&2; exit 2; }
 
+# ─── 0b. the binary must be built FROM the sources being judged ────────────
+# This check derives the stack size from $KERNEL and the frame sizes from the
+# .c files. If the binary is older than the sources, those two halves describe
+# different programs and the verdict is meaningless -- which is not theoretical:
+# this fired against a binary two weeks older than arch/x86/boot.asm, so it was
+# measuring current frames against a 64 KiB stack that had already been raised
+# to 1 MiB. It reported a confident FAILED. A stale-binary run must abort, not
+# produce a number; the same mtime rule guards deploy.sh for the same reason.
+NEWER="$(find . -name '*.c' -o -name '*.h' -o -name '*.asm' 2>/dev/null \
+         | while read -r f; do [ "$f" -nt "$KERNEL" ] && echo "$f"; done | head -5)"
+if [ -n "$NEWER" ]; then
+    echo "ABORT: $KERNEL is older than the sources this check reads." >&2
+    echo "       Newer than the binary (first few):" >&2
+    echo "$NEWER" | sed 's/^/         /' >&2
+    echo "       Run 'make' first. Judging current frames against a stale" >&2
+    echo "       binary's stack size gives a confident answer about a program" >&2
+    echo "       that was never built." >&2
+    exit 2
+fi
+
 # ─── 1. the stack size, from the binary rather than from a constant here ───
 SB="$(nm "$KERNEL" | awk '$3=="stack_bottom"{print $1}')"
 ST="$(nm "$KERNEL" | awk '$3=="stack_top"{print $1}')"
