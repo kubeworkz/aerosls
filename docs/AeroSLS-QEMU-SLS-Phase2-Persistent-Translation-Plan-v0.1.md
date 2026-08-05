@@ -269,6 +269,65 @@ the only reason it surfaced.
 
 ---
 
+## 3c. RESULT — the cache survives a reboot (2026-08-04)
+
+The claim the phase exists for, validated on node 2:
+
+```
+qemu bench 500        ->  8 blocks compiled, 502 insn(s) compiled, 0 hits
+checkpoint            ->  [QEMU-SLS TCACHE] synced: 7 TBs, 7203 code bytes
+< node restarted >
+qemu bench 500        ->  ARENA 2%, ALLOC 6 calls since boot   (fresh boot)
+                          TCACHE 7 hit(s), 1 miss(es)
+                          TRANSLATE 1 block(s), 64 insn(s) compiled
+                          502 insn(s) executed
+```
+
+**Seven of eight translated blocks were read back from NVMe, at the address
+they were generated at, and executed correctly on the first run after a
+restart.** The guest performed the identical 502 instructions.
+
+### The defensible claim
+
+**Blocks compiled across a restart: 8 → 1. Instructions compiled: 502 → 64.**
+
+Counts, not times: deterministic, immune to the outer emulator, reproducible.
+That is an 87.5% reduction in compilation work on a cold boot -- work that every
+other emulator repeats in full, every start, because its translation cache dies
+with the process.
+
+Cycle figures fell too (44.3M → 18.5M total) but are **not publishable**: this
+host has no KVM, so every timing is contaminated (repositioning plan §5c). Note
+also that the post-reboot TRANSLATE (13.7M) is higher than the same-boot warm
+run (3.9M) because a first launch carries one-time TCG initialisation. The block
+count does not move, which is exactly why the block count is the number quoted.
+
+### What is still true and unfinished
+
+- **guest_pc 0 can never be cached.** `qemu_sls_tcache_insert()` uses 0 as its
+  empty-slot marker and the benchmark guest loads at GPA 0. That is the one
+  remaining miss, every run. A real guest rarely starts at address 0, but the
+  limitation is real.
+- **Gate 4 (invalidation) is not done.** Nothing yet proves that writing to a
+  guest code page forces re-translation. The generation counters exist and are
+  persisted; whether they are *wired* is a separate question, and a stale hit is
+  a far worse failure than a missed one.
+- **The identity stamp has not been tested against a genuinely different build
+  that produces different code.** It has only refused an unstamped cache and a
+  differing hash.
+
+### The marketing claim this supports
+
+> Every other emulator recompiles from scratch on every start. AeroSLS does not:
+> in a single-level store, compiled code is a persistent object like any other.
+> On this workload a restarted node compiled 1 block instead of 8 — 87% less
+> translation work — and executed identical results.
+
+Capability, with a measurement, in counts. No speed multiplier is claimed, and
+none should be until the work runs on hardware with KVM or on a non-x86 host.
+
+---
+
 ## 4. Risks, stated before the work
 
 **A stale cache is worse than no cache.** Every other risk here is a variation
