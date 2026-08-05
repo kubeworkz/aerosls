@@ -474,3 +474,25 @@ runs in one boot:
 The CODE column is what makes Gate 2's "bit-identical" check meaningful: it has
 never varied, so any change in it after wiring the cache is a real difference
 and not noise.
+
+### Superseded — arena, re-measured 2026-08-05 (softmmu=OFF, node 2)
+
+The arena row above no longer describes the system. Two consecutive
+`qemu bench 500` runs in one boot:
+
+| | cold launch | warm launch |
+|---|---|---|
+| arena consumed **this launch** | **1,507,392 bytes** | **0** |
+| `RECYCLE` | 7 free(s), 7 reuse(s) since boot | unchanged |
+| largest single allocation | 1,474,576 bytes | — |
+| blocks | 8 | 0 |
+
+**The per-launch leak is gone.** A repeat launch consumes nothing: the arena
+grows only when a request finds no free block, and after the first launch it
+never does. 10,353,840 → 1,507,392 on the cold path is 6.9×; against §5c's
+softmmu=OFF figure of 3,909,296 it is still 2.6×.
+
+The ~1.47 MB object is still the largest single allocation, so the *size* noted
+above was never the defect — the failure to recycle it was, and that is what
+changed. `map_guest_ram`'s eager 256 MiB commitment (Cross-ISA §6) is a separate
+issue and is unaffected by this.

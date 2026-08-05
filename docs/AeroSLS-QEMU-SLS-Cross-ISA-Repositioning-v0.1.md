@@ -349,6 +349,14 @@ Five runs each, same binary, same guest, one compile-time flag between them.
 | TRANSLATE (mean) | ~149M | ~14M | ~10× |
 | arena per launch | 10,353,840 | 3,909,296 | 2.6× |
 
+> **Re-measured 2026-08-05 on `88003e7`.** The softmmu=OFF CODE figure reproduces
+> **exactly** — `CODE 8003 bytes → 16 bytes/load`. EXEC OFF moved to 5,939
+> cyc/load (−12.3% vs 6,774, inside the reported CV of 15.3%). The arena row is
+> **superseded**: 1,507,392 cold and **0** on a warm repeat launch, the leak
+> having been fixed (see the Phase2 appendix). The softmmu=ON column was **not**
+> re-run, so the ratios in this table rest on a 2026-08-04 measurement of the ON
+> side; re-deriving them needs an ON build.
+
 **A guest memory access fell from 86 bytes of host code to 16.** Deterministic,
 zero variance, and the instruction count is unchanged at 502 with no completion
 warning — the guest did the same work, in a fifth of the code.
@@ -389,9 +397,38 @@ claimed above is *work not done*, which is countable.
 
 ## 6. Node 2 — the undiagnosed silent halt
 
-**Status: open. Blocking, and would have been blocking under any direction.**
+**Status: NO LONGER REPRODUCES (2026-08-05). Not diagnosed. Read the next
+paragraph before treating this as closed.**
 
-### What is established
+`qemu bench 500` on node 2 now completes, and the specific line whose absence
+defined this bug is present:
+
+```
+[QEMU-SLS MMU] guest RAM GPA 0x0000000000000000..0x0000000010000000
+               → HVA 0x0000200000000000 (65536 pages)
+[SLS-LAUNCHER] guest RAM mapped: 256 MiB at HVA 0x0000200000000000
+[SLS-LAUNCHER] guest halted after 502 instructions
+```
+
+`map_guest_ram` completed. Step 1 of §8 is unblocked in the practical sense.
+
+**But §8's gate for this step was explicit:** *"a named function and a root
+cause. Not a fix that makes the symptom go away — three plausible fixes were
+already proposed for this bug and all three were aimed at the wrong thing."*
+That gate has **not** been met. Nobody attached gdb, nobody read the program
+counter, and no commit is known to have fixed it. Something between the failing
+build and `88003e7` changed the behaviour, and which change did it is unknown.
+
+This is precisely the outcome §6 was written to refuse. A symptom that stops
+reproducing without a root cause is not a fixed bug; it is a bug whose trigger
+moved. The eager 256 MiB mapping described below is still there, still made
+before anything is measured, and remains the most likely neighbourhood.
+
+**Recommended:** keep `tests/node_gdb_attach.sh` and the procedure below intact.
+If this returns, it will return under load or on a different node, and the
+procedure is the fastest path back. Do not delete this section.
+
+### What was established when it was failing
 
 | Observation | Evidence |
 |---|---|

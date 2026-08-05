@@ -170,15 +170,71 @@ recorded run.
 | Claim | Source | Status |
 |---|---|---|
 | 86 bytes of host code per guest load (softmmu ON) | Cross-ISA §5b | Runtime. 9 samples, zero variance reported. |
-| 16 bytes per guest load (softmmu OFF) | Cross-ISA §5c | Runtime. 5 samples, zero variance reported. |
-| CODE 43,293 → 8,003 bytes, **5.41×** | Cross-ISA §5c | Runtime. This is the headline defensible number. |
-| EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. |
-| Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **Open.** Blocking Step 1. |
+| 16 bytes per guest load (softmmu OFF) | Cross-ISA §5c | **RE-VERIFIED 2026-08-05** on `88003e7`: `CODE 8003 bytes → 16 bytes/load`, exact match. |
+| CODE 43,293 → 8,003 bytes, **5.41×** | Cross-ISA §5c | **Half re-verified.** The OFF term (8,003) reproduces exactly. The ON term was not re-run, so the *ratio* is not re-derived — that needs a softmmu=ON build. |
+| EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. 2026-08-05 cold EXEC was 5,939 cyc/load vs §5c's 6,774 — a −12.3% move, inside the reported CV. Consistent. |
+| Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
+| Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
+| Translation cache survives reboot | Phase2 | **Not shown.** Both 2026-08-05 runs were one boot — run 1 populated, run 2 hit. Proving persistence means rebooting and seeing `TCACHE` hits on the *first* bench. |
 
 **Before any of these is published**, re-run on current `HEAD` and record the
 build ID. The §5c A/B was taken 2026-08-04; the tree has moved since. Zero
 variance across samples is not evidence of stability across *builds* — §5b makes
 exactly this point about cross-boot versus within-boot noise.
+
+---
+
+## 3b. The cold/warm method — how to get an honest cycle number without KVM
+
+**Established 2026-08-05, node 2. This is a measurement technique, not a
+result, and it is the most reusable thing in this document.**
+
+§5b of the Cross-ISA plan disqualified every cycle figure taken on this host:
+
+> Our JIT emits fresh host code at fresh addresses, so the outer emulator must
+> translate that code before running it, every time, because it is always cold.
+> EXEC is timing **the outer emulator compiling our JIT's output**, not our
+> output executing.
+
+That reasoning is correct, and it has an exploitable hole: it only holds while
+the code is *fresh*. Once the translation cache is warm, the same bytes sit at
+the same address, so the **outer** emulator's TB cache hits too and no outer
+translation occurs. Running the identical bench twice therefore separates the
+two costs by subtraction:
+
+| | cold (`TCACHE 0 hit, 8 miss`) | warm (`TCACHE 8 hit, 0 miss`) |
+|---|---|---|
+| `TRANSLATE` | 24,318,725 cyc, 8 blocks | **0 cyc, 0 blocks** |
+| `CODE` | 8,003 bytes | 0 (nothing compiled) |
+| `EXEC` | 2,969,646 cyc → **5,939 cyc/load** | 125,562 cyc → **251 cyc/load** |
+
+- **cold EXEC** = guest code executing **+** outer emulator translating it
+- **warm EXEC** = guest code executing, that cost already paid
+- the difference, ~5,688 cyc/load, is the outer-translation artifact itself
+
+**251 cycles/load is the first EXEC figure on this hardware not dominated by
+the confound.** It cross-checks: `qemu-system-x86_64` without KVM runs roughly
+50× slower than native, a bare softmmu-off `MOV` is ~5 cycles native, and
+251/5 ≈ 50. The number is consistent with the rig that produced it.
+
+### The trap in the same data
+
+**The 23.7× cold-to-warm ratio must never be quoted as a speedup.** It is the
+difference between paying outer-emulator translation and not paying it. On real
+hardware there is no outer emulator and the ratio largely disappears. It
+measures the test rig, not the system under test — the identical error §5b
+caught, in a new form. Quote **251 cyc/load** as a bounded execution cost on an
+emulated host; quote the ratio for nothing.
+
+### Procedure
+
+```bash
+tools/aeroslsctl --host localhost:3002 shell "qemu bench 500"   # cold: TCACHE 0/8
+tools/aeroslsctl --host localhost:3002 shell "qemu bench 500"   # warm: TCACHE 8/0
+```
+
+Check `TCACHE` on each run to confirm which regime you are in. A "warm" run
+showing misses, or a "cold" run showing hits, invalidates the pair.
 
 ---
 
