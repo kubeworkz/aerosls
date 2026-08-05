@@ -165,6 +165,32 @@ void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out,
         if (d->guest_page < QEMU_TCACHE_GEN_PAGES &&
             qemu_sls_page_gen[d->guest_page] != d->gen_expected)
             return NULL;
+        /* ─── A hit is a JUMP. Sanity-check the target first. ──────────────
+         * Everything above proves the descriptor says this block is valid; it
+         * proves nothing about the bytes. A cache restored from NVMe whose
+         * code region failed to read, or a descriptor pointing at never-written
+         * space, both produce a plausible descriptor over zeroed memory -- and
+         * the caller would jump into it. That exact failure walked 4 MiB of
+         * zeroed .bss executing `add %al,(%rax)` before the node was killed.
+         *
+         * Generated code always begins with real instructions, so all-zero
+         * leading bytes mean the block is not there. Refuse the hit and let it
+         * be re-translated: a wasted translation is recoverable, a jump into
+         * zeroes is not. */
+        {
+            const uint8_t *p = codebuf_storage + d->code_offset;
+            int all_zero = 1;
+            for (uint32_t k = 0; k < d->code_len && k < 8; k++)
+                if (p[k]) { all_zero = 0; break; }
+            if (all_zero) {
+                kernel_serial_printf(
+                    "[QEMU-SLS TCACHE] hit at guest_pc=0x%016lx REFUSED: the "
+                    "cached bytes are zero, so the block is not actually there. "
+                    "Re-translating.\n", guest_pc);
+                return NULL;
+            }
+        }
+
         d->exec_count++;
         if (code_len_out)   *code_len_out   = d->code_len;
         if (insn_count_out) *insn_count_out = d->insn_count;
@@ -174,6 +200,61 @@ void *qemu_sls_tcache_lookup(uint64_t guest_pc, uint32_t *code_len_out,
 }
 
 /* ─── qemu_sls_tcache_insert ─────────────────────────────────────────────── */
+
+/* ─── qemu_sls_tcache_reserve / _commit ─────────────────────────────────── */
+
+void *qemu_sls_tcache_reserve(void) {
+    if (!initialized) return 0;
+
+    /* 16-byte aligned: generated blocks are entered by an indirect call, and
+     * a misaligned entry costs a fetch penalty on every execution for the life
+     * of the cache. */
+    uint32_t off = (qemu_sls_codebuf_used + 15u) & ~15u;
+
+    /* Room for a WORST-CASE block, not for the one about to be generated --
+     * its size is not known until tcg_gen_code() returns, and by then the code
+     * has already been written. Reserving optimistically and discovering the
+     * overrun afterwards means the overrun has already happened.
+     *
+     * TCG's own overflow check (s->code_gen_highwater) is no help here: it
+     * guards TCG's region, and the code is being generated into ours. */
+    if ((uint64_t)off + QEMU_TCACHE_MAX_TB_BYTES > QEMU_TCACHE_CODEBUF_SIZE)
+        return 0;
+
+    return qemu_sls_codebuf + off;
+}
+
+int qemu_sls_tcache_commit(uint64_t guest_pc, void *code_at,
+                           uint32_t code_len, uint64_t gpa,
+                           uint32_t insn_count) {
+    if (!initialized || !code_at || !code_len) return -1;
+
+    if (!guest_pc) {
+        /* guest_pc 0 is the TB table's empty-slot marker, so a block starting
+         * at guest address 0 cannot be recorded. The benchmark guest loads at
+         * GPA 0, so this is its first block, every run. Not a caller bug --
+         * a representation limit, and it costs one re-translation. */
+        return -1;
+    }
+
+    uint8_t *at = (uint8_t *)code_at;
+    if (at < qemu_sls_codebuf ||
+        at + code_len > qemu_sls_codebuf + QEMU_TCACHE_CODEBUF_SIZE) {
+        kernel_serial_printf(
+            "[QEMU-SLS TCACHE] commit REFUSED: %p..+%u is outside the code "
+            "buffer. Recording it would hand a later boot a pointer into "
+            "memory the cache does not own.\n", code_at, code_len);
+        return -1;
+    }
+
+    uint32_t off = (uint32_t)(at - qemu_sls_codebuf);
+    if (qemu_sls_tcache_insert(guest_pc, off, code_len, gpa, insn_count) != 0)
+        return -1;                      /* table full; code stays, unreferenced */
+
+    qemu_sls_codebuf_used = off + code_len;
+    qemu_sls_tcache_mark_code_dirty(off, code_len);
+    return 0;
+}
 
 /* ─── qemu_sls_tcache_store ─────────────────────────────────────────────── */
 

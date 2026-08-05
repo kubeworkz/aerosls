@@ -162,7 +162,44 @@ void qemu_sls_tcache_foreach_hot(uint32_t threshold,
     void (*cb)(uint64_t guest_pc, uint32_t code_offset,
                uint32_t code_len, uint32_t exec_count));
 
+/* ─── Generate-in-place: reserve, then commit ──────────────────────────────
+ *
+ * TCG output is POSITION-DEPENDENT. It carries relative calls and jumps -- to
+ * helpers, to the epilogue, for exit_tb -- whose displacements are computed
+ * against the address the block is generated at. Moving a block afterwards
+ * breaks every one of them, which is why qemu_sls_tcache_store() below could
+ * copy perfectly valid bytes and still produce a block that hung when run.
+ * QEMU never relocates generated code, and neither can this.
+ *
+ * So the block must be generated AT its permanent address. That address is
+ * needed before tcg_gen_code() runs, and the length only afterwards -- hence
+ * two calls:
+ *
+ *     void *at = qemu_sls_tcache_reserve();      // where to generate
+ *     tb->tc.ptr = at;
+ *     int len = tcg_gen_code(...);               // emits AT that address
+ *     qemu_sls_tcache_commit(pc, at, len, gpa, insns);
+ *
+ * reserve() returns NULL when too little room remains for a worst-case block,
+ * and the caller then generates into TCG's own buffer as before -- correct,
+ * just not cached. Nothing is recorded until commit(), so a failed or
+ * abandoned translation leaves no descriptor pointing at half-written code.
+ *
+ * This is also why the buffer is .bss at a linker-fixed VA: a restored block
+ * is only valid at precisely the address it was born at, which is exactly what
+ * the build-identity stamp is there to guarantee.
+ */
+#define QEMU_TCACHE_MAX_TB_BYTES 65536U
+
+void *qemu_sls_tcache_reserve(void);
+int   qemu_sls_tcache_commit(uint64_t guest_pc, void *code_at,
+                             uint32_t code_len, uint64_t gpa,
+                             uint32_t insn_count);
+
 /*
+ * DEPRECATED -- copies, and copying cannot work. See the note above.
+ * Kept only so the build does not break while callers migrate.
+ *
  * Copy freshly generated host code into the persistent buffer and record it.
  *
  * Gate 2 of the Phase 2 plan. TCG generates into its OWN buffer
