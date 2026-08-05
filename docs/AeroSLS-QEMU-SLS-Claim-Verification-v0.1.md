@@ -175,7 +175,7 @@ recorded run.
 | EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. 2026-08-05 cold EXEC was 5,939 cyc/load vs §5c's 6,774 — a −12.3% move, inside the reported CV. Consistent. |
 | Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
 | Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
-| Translation cache survives reboot | Phase2 | **Not shown.** Both 2026-08-05 runs were one boot — run 1 populated, run 2 hit. Proving persistence means rebooting and seeing `TCACHE` hits on the *first* bench. |
+| Translation cache survives reboot | Phase2 | **STILL NOT TESTED.** A reboot trial on 2026-08-05 returned `TCACHE 0 hit, 8 miss` on the first bench, which looks like a negative result and is not one — no `checkpoint` was run, and that is the only thing that writes the cache. See §3c. |
 
 **Before any of these is published**, re-run on current `HEAD` and record the
 build ID. The §5c A/B was taken 2026-08-04; the tree has moved since. Zero
@@ -210,31 +210,139 @@ two costs by subtraction:
 
 - **cold EXEC** = guest code executing **+** outer emulator translating it
 - **warm EXEC** = guest code executing, that cost already paid
-- the difference, ~5,688 cyc/load, is the outer-translation artifact itself
+- the difference is the outer-translation artifact itself
 
-**251 cycles/load is the first EXEC figure on this hardware not dominated by
-the confound.** It cross-checks: `qemu-system-x86_64` without KVM runs roughly
-50× slower than native, a bare softmmu-off `MOV` is ~5 cycles native, and
-251/5 ≈ 50. The number is consistent with the rig that produced it.
+### The warm figure does NOT replicate — corrected 2026-08-05
+
+An earlier revision of this section called 251 cyc/load "the first EXEC figure
+on this hardware not dominated by the confound" and quoted it as a result. **A
+second boot gave 455.** The correction matters more than the number:
+
+| | boot A | boot B | move |
+|---|---|---|---|
+| cold EXEC | 5,939 cyc/load | 5,434 | **−8.5%** — inside §5b's 5–13% cross-boot band |
+| **warm EXEC** | **251 cyc/load** | **455** | **+81%** — far outside it |
+| cold/warm ratio | 23.7× | 11.9× | — |
+| `CODE` | 8,003 B | 8,003 B | **0** |
+| arena, cold launch | 1,507,392 B | 1,507,392 B | **0** |
+
+The warm figure is the **noisiest** measurement in the set, not the cleanest.
+It is a much smaller sample — 125K–228K cycles against 2.7–3.0M cold — so fixed
+overheads and interrupt noise are a far larger fraction of it. `n=1` was quoted
+as though it were settled, which is the error §5b spent two pages establishing
+should not be made.
+
+**The method stands; the value does not.** Warming the cache does remove outer
+translation, and that is real. But any warm figure needs **five runs in one
+boot**, with a CV, exactly as §5b did for the ON baseline, before it means
+anything. Until then there is no publishable warm number.
+
+**What replicated perfectly across both boots:** `CODE` at 8,003 bytes, arena at
+1,507,392 cold and 0 warm, `TCACHE` 0/8 then 8/0, 502 instructions. Zero
+variance on every one. §5b's original conclusion — build claims on emitted code
+size, never on cycles — survived its own extension intact.
 
 ### The trap in the same data
 
-**The 23.7× cold-to-warm ratio must never be quoted as a speedup.** It is the
+**The cold-to-warm ratio must never be quoted as a speedup.** It is the
 difference between paying outer-emulator translation and not paying it. On real
 hardware there is no outer emulator and the ratio largely disappears. It
 measures the test rig, not the system under test — the identical error §5b
-caught, in a new form. Quote **251 cyc/load** as a bounded execution cost on an
-emulated host; quote the ratio for nothing.
+caught, in a new form. That it came out 23.7× on one boot and 11.9× on the next
+is the tell: a real property of the system would not move by half.
 
 ### Procedure
 
 ```bash
 tools/aeroslsctl --host localhost:3002 shell "qemu bench 500"   # cold: TCACHE 0/8
 tools/aeroslsctl --host localhost:3002 shell "qemu bench 500"   # warm: TCACHE 8/0
+# repeat the warm run 5x and report a CV -- one sample is not a measurement
 ```
 
 Check `TCACHE` on each run to confirm which regime you are in. A "warm" run
 showing misses, or a "cold" run showing hits, invalidates the pair.
+
+---
+
+## 3c. Persistence across reboot — NOT YET TESTED
+
+A reboot trial on 2026-08-05 produced `TCACHE 0 hit(s), 8 miss(es)` on the first
+bench after boot, with 8 blocks recompiled and 8,003 bytes re-emitted. **This is
+not a negative result, and must not be recorded as one.**
+
+`qemu_sls_tcache_sync()` is the only writer of the on-NVMe cache. It has **two**
+call sites, and only one of them is reachable:
+
+| Call site | Reachable? |
+|---|---|
+| `kernel/checkpoint_mgr.c:182` | **Yes** — the `checkpoint` shell command |
+| `kernel/qemu_sls_vm.c:51`, inside `qemu_sls_snapshot_save()` | **No** — see below |
+
+The bench path calls neither; `sls-launcher.c` does not reference either symbol.
+The trial ran `qemu bench` and then rebooted, so nothing was ever written and the
+restore path had nothing to restore.
+
+### Separate finding: `qemu_sls_snapshot_save()` is still unwired
+
+`checkpoint_mgr.c:166` names **two** functions as having been called from
+nowhere. Wiring `qemu_sls_tcache_sync()` into the checkpoint fixed one of them.
+`qemu_sls_snapshot_save()` was not wired and remains dead:
+
+```
+grep -rn 'qemu_sls_snapshot_save\s*(' --include=*.c kernel/ user/ net/
+  kernel/qemu_sls_vm.c:39        <- the definition
+  kernel/checkpoint_mgr.c:166    <- a comment saying it is called from nowhere
+```
+
+No caller. So the guest CPU state it persists — `rip`, registers, sequence — is
+never written by anything, and `qemu_sls_snapshot_restore()` has nothing to
+restore for the same reason the tcache did not. The comment at `:166` reads as
+though both halves were fixed. Only one was.
+
+Whether that matters depends on intent: the tcache is keyed by `guest_pc`, so
+restoring translated code without CPU state may be exactly right for a bench
+that always enters at GPA 0. But it is currently undecided rather than decided,
+and the dead function makes it look settled.
+
+`checkpoint_mgr.c:166` describes this precise trap, from when the sync call was
+genuinely unwired:
+
+> `qemu_sls_tcache_sync()` and `qemu_sls_snapshot_save()` existed, were correct
+> as far as anyone could tell, and were called from nowhere — so every boot has
+> reported "no snapshot — cold start" for the simple reason that a snapshot had
+> never once been produced. The restore path had nothing to restore, **and
+> looked exactly like a restore path that did not work.**
+
+### The boot log already contains the answer
+
+`qemu_sls_tcache_init()` runs at `kernel/kernel.c:409` and prints exactly one of:
+
+| Line | Meaning |
+|---|---|
+| `NVMe unavailable — cold start` | No device; nothing to do with the cache logic |
+| `no snapshot — cold start` | Nothing was ever written — **expected for the 08-05 trial** |
+| `snapshot is from a DIFFERENT BUILD … discarded, cold start` | Build ID moved; correct refusal |
+| `warm start — codebuf_used=N, codebuf=0x…` | Restored |
+
+It goes to the node console at boot, not to the `aeroslsctl shell` capture,
+which is why the trial did not include it. **Read that line before drawing any
+conclusion about persistence.**
+
+### The correct sequence
+
+```bash
+tools/aeroslsctl --host localhost:3002 shell "qemu bench 500"   # populates in-memory
+tools/aeroslsctl --host localhost:3002 shell "checkpoint"       # the ONLY thing that writes it
+#   expect: [QEMU-SLS TCACHE] synced: N TBs, M code bytes
+# reboot the node WITHOUT rebuilding
+#   expect in the boot log: [QEMU-SLS TCACHE] warm start — codebuf_used=…
+tools/aeroslsctl --host localhost:3002 shell "qemu bench 500"   # expect TCACHE 8 hit(s)
+```
+
+**The reboot must not rebuild.** `AEROSLS_BUILD_ID` is `git rev-parse
+--short=12 HEAD` and any commit invalidates the cache by design. If `deploy.sh`
+runs as part of the restart, the result is `DIFFERENT BUILD … discarded` — a
+correct refusal that once again looks identical to failure.
 
 ---
 
