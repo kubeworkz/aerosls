@@ -276,4 +276,13 @@ const QemuGuestRegion *qemu_sls_mmu_find_region(uint64_t hva);
 void    *qemu_sls_dma_host_ptr(uint64_t gpa);    /* host VA for direct R/W */
 uint64_t qemu_sls_dma_frame_phys(uint64_t gpa);  /* physical frame for DMA hardware */
 
+#ifdef QEMU_SLS_MMU_TEST_HOOKS
+/* Test-only. See the note at the definition in qemu_sls_mmu.c. Declared here
+ * rather than extern'd inside the test so the compiler checks the signature --
+ * a mismatch across translation units would silently pass garbage to the one
+ * function whose entire job is refusing bad addresses. */
+int qemu_sls_mmu_test_shadow_install(uint64_t gva, uint64_t frame,
+                                     uint64_t guest_pte);
+#endif
+
 #endif /* QEMU_SLS_MMU_H */

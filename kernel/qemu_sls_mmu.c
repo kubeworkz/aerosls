@@ -339,10 +339,10 @@ static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
             "mapping here would overwrite the kernel's own page tables rather than "
             "shadow them.\n"
             "[QEMU-SLS MMU] Under the window model the faulting address is already "
-            "guest_va + QEMU_GPA_HOST_BASE; a raw guest VA reaching here means the "
-            "caller still assumes the retired GVA-direct design.\n"
+            "guest_va + QEMU_GUEST_WINDOW_BASE; a raw guest VA reaching here means "
+            "the caller still assumes the retired GVA-direct design.\n"
             "[QEMU-SLS MMU] See docs/AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md\n",
-            gva, SHADOW_PML4_SLOT(gva), SHADOW_PML4_SLOT(QEMU_GPA_HOST_BASE));
+            gva, SHADOW_PML4_SLOT(gva), SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE));
         return -1;
     }
 
@@ -363,6 +363,37 @@ static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
     qemu_sls_invlpg(gva & ~(uint64_t)0xFFF);
     return 0;
 }
+
+#ifdef QEMU_SLS_MMU_TEST_HOOKS
+/* ─── test-only reachability ───────────────────────────────────────────────
+ * shadow_install()'s window guard is the load-bearing one: it is what stops a
+ * caller passing a raw guest VA from writing into PML4 slots the shadow SHARES
+ * with the kernel, i.e. overwriting the kernel's own page tables rather than
+ * shadowing them.
+ *
+ * It had no test, and the reason was structural rather than neglect. The only
+ * production caller is qemu_sls_mmu_shadow_fault(), which screens the address
+ * against the same predicate before calling -- so the guard is unreachable
+ * through the public header, and the host test compiles this file as a separate
+ * translation unit where `static` puts it out of reach entirely. The task
+ * tracking it waited on "guest paging adding a second caller"; guest paging
+ * shipped and added none, so that trigger was never going to fire.
+ *
+ * A test-only wrapper is the way in, following tests/kernel_io_panic_port.h,
+ * which substitutes recording hooks for outb/inb on the same principle. This
+ * compiles only under -DQEMU_SLS_MMU_TEST_HOOKS, so the kernel build is
+ * byte-identical and shadow_install() stays static in it.
+ *
+ * Writing the test found a real defect in the code below it: the refusal
+ * printed SHADOW_PML4_SLOT(QEMU_GPA_HOST_BASE) -- the EMULATOR window, slot 64
+ * -- while calling it "the guest window's slot", when the predicate actually
+ * tests QEMU_GUEST_WINDOW_BASE, slot 128. Anyone debugging a refusal was told
+ * to compare against a slot the guard does not use. */
+int qemu_sls_mmu_test_shadow_install(uint64_t gva, uint64_t frame,
+                                     uint64_t guest_pte) {
+    return shadow_install(gva, frame, guest_pte);
+}
+#endif
 
 /* ─── guest_walk: GVA -> GPA through the guest's own page tables ───────────
  *

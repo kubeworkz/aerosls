@@ -25,6 +25,7 @@
  *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
+ *       -DQEMU_SLS_MMU_TEST_HOOKS \
  *       -include tests/qemu_sls_test_window.h \
  *       -o /tmp/qemu_sls_mmu_host_test \
  *       tests/qemu_sls_mmu_host_test.c kernel/qemu_sls_mmu.c
@@ -627,9 +628,11 @@ int main(void) {
          *
          * The guard that IS load-bearing is in shadow_install(), against a
          * future caller passing a raw guest VA. It is unreachable from here --
-         * shadow_fault has already screened the address -- so it has no test
-         * at all, and should get one when guest paging gives it a second
-         * caller. */
+         * shadow_fault has already screened the address -- so it needs to be
+         * called directly, which the block after this one now does through
+         * qemu_sls_mmu_test_shadow_install(). This waited a long time on
+         * "guest paging adding a second caller"; guest paging shipped and
+         * added none, so the trigger was never going to arrive. */
         g_map_count = 0;
         CHECK(qemu_sls_mmu_shadow_fault(gva, 0) == 1,
               "the raw guest VA -- outside the window -- does not resolve, with "
@@ -644,6 +647,67 @@ int main(void) {
               "...and so is a low kernel-range address");
         /* guest_active deliberately LEFT SET: the invlpg block below depends on
          * it, and clearing it here made four unrelated checks fail. */
+    }
+
+    printf("\n-- shadow_install's window guard, called directly --\n");
+    {
+        /* The guard above is defence in depth; THIS is the one that matters.
+         * shadow_install() writes through user_map_page() into a shadow that
+         * SHARES lower-level page tables with the kernel, so a raw guest VA
+         * arriving here does not produce a wrong guest mapping -- it overwrites
+         * the kernel's own page tables. That is why the assertion below is on
+         * g_map_count and not just the return value: a refusal that still wrote
+         * a PTE would be the entire failure this guard exists to prevent, and
+         * would return -1 while doing it. */
+
+        /* Control FIRST, deliberately. Every refusal check below passes against
+         * a function that does nothing and returns -1 -- that exact hole is why
+         * an earlier gate test in this project passed against a constant. This
+         * check is what makes the refusals mean something. */
+        g_map_count = 0;
+        int installed = qemu_sls_mmu_test_shadow_install(
+            QEMU_GUEST_WINDOW_BASE + 0x5000, 9 * FRAME_SIZE,
+            USER_PTE_PRESENT | USER_PTE_WRITE);
+        CHECK(installed == 0 && g_map_count == 1,
+              "control: an in-window GVA IS installed -- without this, every "
+              "refusal below would pass against a function that never maps");
+        CHECK(g_map_count == 1 && g_maps[0].va == QEMU_GUEST_WINDOW_BASE + 0x5000 &&
+              g_maps[0].pa == 9 * FRAME_SIZE,
+              "...at the right VA and frame, page-aligned");
+
+        /* A raw guest VA -- the retired GVA-direct design's address shape. */
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_test_shadow_install(0x00000000DEADB000ULL,
+                                               9 * FRAME_SIZE, USER_PTE_PRESENT) == -1,
+              "a raw guest VA is REFUSED");
+        CHECK(g_map_count == 0,
+              "*** and NOTHING was written. The shadow shares lower-level tables "
+              "with the kernel, so a write here corrupts the kernel's own page "
+              "tables rather than producing a wrong guest mapping ***");
+
+        /* The EMULATOR window is not the GUEST window. This distinction is not
+         * pedantic: the refusal message used to print the emulator window's slot
+         * (64) while calling it "the guest window's slot", when the predicate
+         * tests the guest window (128). Anyone debugging a refusal was told to
+         * compare against a slot the guard does not use. Writing this check is
+         * what surfaced it. */
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_test_shadow_install(QEMU_GPA_HOST_BASE + 0x1000,
+                                               9 * FRAME_SIZE, USER_PTE_PRESENT) == -1
+              && g_map_count == 0,
+              "*** an address in the EMULATOR window is refused too -- the two "
+              "windows are different PML4 slots and only the guest one is "
+              "installable ***");
+
+        /* A low kernel-range address: PML4 slot 0, where the kernel itself lives. */
+        g_map_count = 0;
+        CHECK(qemu_sls_mmu_test_shadow_install(0x1000, 9 * FRAME_SIZE,
+                                               USER_PTE_PRESENT) == -1
+              && g_map_count == 0,
+              "...and so is a low kernel-range address");
+
+        g_map_count = 0;   /* leave no state for the blocks below -- this test
+                            * has broken unrelated checks that way three times */
     }
 
     printf("\n-- with guest paging OFF, CR3 is not walked --\n");
