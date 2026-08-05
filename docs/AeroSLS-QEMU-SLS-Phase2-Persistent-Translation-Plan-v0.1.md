@@ -219,6 +219,56 @@ corruption, and this gate is the only thing standing between the design and it.
 
 ---
 
+## 3b. RESULT — the cache works, same boot (2026-08-04)
+
+`qemu bench 500` twice in one boot, node 2:
+
+| | run 1 (cold) | run 2 (warm) |
+|---|---|---|
+| **blocks compiled** | **8** | **1** |
+| **instructions compiled** | **502** | **64** |
+| instructions **executed** | 502 | **502** |
+| TCACHE | 0 hit, 8 miss | **7 hit, 1 miss** |
+| TRANSLATE cycles | 37,913,139 | 3,918,114 |
+| total cycles | 44,280,246 | 5,283,964 |
+
+**The defensible claim is the work ratio, not the time ratio.** Compilation
+fell from 502 instructions to 64 — an **87.2% reduction** — while the guest
+executed the identical 502 instructions. Blocks compiled fell 8 → 1. Those are
+counts: deterministic, immune to the outer emulator, and reproducible.
+
+The 8.4× drop in total cycles is consistent with that but is **not** a
+publishable figure: this host has no KVM, so every cycle count is contaminated
+by the outer emulator (see §5c of the repositioning plan). The count of blocks
+compiled is not.
+
+The single remaining miss is the block at **guest_pc 0**, which
+qemu_sls_tcache_insert() cannot represent because it uses 0 as its empty-slot
+marker. The benchmark guest loads at GPA 0, so this recurs every run. A real
+guest rarely begins at address 0, but the limitation is real and tracked.
+
+### What it took, and what was wrong on the way
+
+**Copy-on-insert cannot work.** The first implementation memcpy'd generated
+code into the persistent buffer. TCG output is position-dependent -- relative
+calls and jumps to helpers, the epilogue and exit_tb carry displacements
+computed against the address the block was generated at -- so a relocated block
+has real bytes and broken targets. Observed exactly that way: 7 blocks stored
+cleanly, and executing them hung with no fault, jumps landing in mapped memory
+and wandering. Replaced with reserve/commit: the block is GENERATED at its
+permanent address and never moves.
+
+**And TCG had no output address at all.** `tcg_gen_code()` begins with
+`s->code_buf = tb->tc.ptr` (tcg.c:6665). In QEMU that field is filled by
+`tb_gen_code()`; this launcher never calls it, so it was NULL and every
+translated block was emitted at **host address 0** and executed from there --
+for the entire life of the launcher. It worked only because AeroSLS
+identity-maps low memory writable and executable, and because no two blocks
+ever had to coexist. Phase 2 was the first thing that required two, which is
+the only reason it surfaced.
+
+---
+
 ## 4. Risks, stated before the work
 
 **A stale cache is worse than no cache.** Every other risk here is a variation
