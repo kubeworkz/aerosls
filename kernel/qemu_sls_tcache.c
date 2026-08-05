@@ -227,6 +227,32 @@ void *qemu_sls_tcache_store(uint64_t guest_pc, const void *code,
     const uint8_t *src = (const uint8_t *)code;
     for (uint32_t i = 0; i < code_len; i++) dst[i] = src[i];
 
+    /* ─── Refuse to record a block that copied nothing ─────────────────────
+     * The first hardware run cached a block whose source was entirely zero,
+     * the launcher executed it, and the CPU walked forward through 4 MiB of
+     * zeroed .bss running `add %al,(%rax)` until the node was killed. gdb found
+     * rip at codebuf_storage+0.
+     *
+     * A translated block ALWAYS begins with real instructions -- TCG emits a
+     * prologue that touches the CPU state pointer. All-zero leading bytes mean
+     * the source pointer was wrong, not that the block is unusual. Checking
+     * the first eight bytes costs nothing and converts a silent jump into
+     * arbitrary memory into a refusal that names itself.
+     *
+     * Not a substitute for the caller passing the right pointer. It is the
+     * assertion that says so out loud when it does not. */
+    int all_zero = 1;
+    for (uint32_t i = 0; i < code_len && i < 8; i++)
+        if (dst[i]) { all_zero = 0; break; }
+    if (all_zero) {
+        kernel_serial_printf(
+            "[QEMU-SLS TCACHE] REFUSED to cache guest_pc=0x%016lx: the first "
+            "bytes of the %u-byte source at %p are all zero, so it is not "
+            "generated code. Caching it would mean executing zeroes on a later "
+            "boot.\n", guest_pc, code_len, code);
+        return 0;
+    }
+
     if (qemu_sls_tcache_insert(guest_pc, off, code_len, gpa, insn_count) != 0) {
         /* Table full. The bytes are already copied, but without a descriptor
          * nothing can ever find them, so the space is wasted rather than
