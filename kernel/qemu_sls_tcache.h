@@ -22,6 +22,7 @@
 
 #define QEMU_TCACHE_MAGIC        0xCAFE000000000020ULL
 
+
 /* Matches QEMU_GUEST_RAM_PAGES — one gen counter per guest 4 KiB page. */
 #define QEMU_TCACHE_GEN_PAGES    65536U
 
@@ -31,6 +32,69 @@
 /* Code-gen buffer; static .bss ensures a deterministic VA across reboots. */
 #define QEMU_TCACHE_CODEBUF_SIZE (4U * 1024U * 1024U)
 #define QEMU_TCACHE_CODEBUF_PAGES (QEMU_TCACHE_CODEBUF_SIZE / 4096U)
+
+/* ─── Build identity: the magic is not enough ──────────────────────────────
+ *
+ * The magic proves the region was written by SOME build of this code. It does
+ * not prove it was written by THIS one -- and what is stored here is HOST
+ * MACHINE CODE. Restoring a cache produced by a different compiler, a
+ * different TCG revision, or different code-generation flags hands the CPU
+ * instructions built against assumptions that no longer hold. There is no
+ * fault to catch it. It simply executes.
+ *
+ * That is the single most expensive failure shape this project has met: a
+ * wrong state indistinguishable from a right one. Every other guard in the
+ * QEMU-SLS layer exists to make some version of it loud, so this one is
+ * checked before a single cached byte is ever executed.
+ *
+ * AEROSLS_BUILD_ID comes from the Makefile (git hash, or a timestamp when git
+ * is unavailable). It is deliberately CONSERVATIVE: any rebuild invalidates
+ * the cache, even one that could not have changed code generation. A needless
+ * cold start costs one round of recompilation; a wrongly-accepted cache costs
+ * arbitrary behaviour with no diagnostic.
+ *
+ * Header layout at QEMU_TCACHE_HDR_LBA:
+ *   +0   u64  magic
+ *   +8   u32  tb_count
+ *   +12  u32  codebuf_used
+ *   +16  u64  identity   (this)
+ *   +24  u32  codebuf_size
+ *   +28  u32  max_tbs
+ */
+#ifndef AEROSLS_BUILD_ID
+#define AEROSLS_BUILD_ID "unknown-build"
+#endif
+
+/* FNV-1a over the build id, mixed with the structural constants that decide
+ * whether cached code can be interpreted at all. Sizes are included because a
+ * cache written when the table or buffer was a different size cannot be read
+ * back correctly even from an identical compiler. */
+/* Parameterised so the build id can be varied by a test.
+ *
+ * The reason is specific: with the id fixed at compile time, "the identity
+ * responds to its input" is not observable, and mutation testing proved it --
+ * an implementation that simply RETURNED the expected constant passed every
+ * check, including determinism. A guard that cannot be shown to depend on what
+ * it guards is not a guard. Taking the id as an argument makes the property
+ * testable in the only way that means anything: call it twice with different
+ * ids and require different answers. */
+static inline uint64_t qemu_tcache_identity_of(const char *build_id) {
+    uint64_t h = 1469598103934665603ULL;               /* FNV-1a offset basis */
+    for (const char *p = build_id; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)QEMU_TCACHE_CODEBUF_SIZE << 1;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)QEMU_TCACHE_MAX_TBS << 3;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)sizeof(void *);                     /* host pointer width */
+    return h;
+}
+
+static inline uint64_t qemu_tcache_identity(void) {
+    return qemu_tcache_identity_of(AEROSLS_BUILD_ID);
+}
 
 /*
  * Translation block descriptor — 32 bytes so tb_table[4096] fits in 32 NVMe

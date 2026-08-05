@@ -79,6 +79,30 @@ int qemu_sls_tcache_init(void) {
         return 0;
     }
 
+    /* ─── Identity, checked before a single cached byte is restored ────────
+     * The magic above only proves SOME build wrote this. What follows it is
+     * host machine code, so a cache from a different compiler or different
+     * code-generation flags would be executed as though it were ours -- with
+     * no fault and no diagnostic. Discard and cold-start on any mismatch: a
+     * needless recompile costs one round; a wrongly-accepted cache costs
+     * arbitrary behaviour. See the note in qemu_sls_tcache.h. */
+    {
+        uint64_t want = qemu_tcache_identity();
+        uint64_t got  = *(const uint64_t *)(io_scratch + 16);
+        if (got != want) {
+            for (uint32_t i = 0; i < QEMU_TCACHE_GEN_PAGES; i++)
+                qemu_sls_page_gen[i] = 1;
+            initialized = 1;
+            kernel_serial_printf(
+                "[QEMU-SLS TCACHE] snapshot is from a DIFFERENT BUILD "
+                "(identity 0x%016lx, this build 0x%016lx) — discarded, cold start.\n"
+                "[QEMU-SLS TCACHE] It holds host machine code; running it would "
+                "execute instructions built against different assumptions.\n",
+                got, want);
+            return 0;
+        }
+    }
+
     uint32_t saved_code_used = *(const uint32_t *)(io_scratch + 12);
 
     /* Restore gen counters: 64 pages in 2 batches. */
@@ -215,6 +239,13 @@ void qemu_sls_tcache_sync(void) {
     *(uint64_t *)io_scratch        = QEMU_TCACHE_MAGIC;
     *(uint32_t *)(io_scratch +  8) = tb_count;
     *(uint32_t *)(io_scratch + 12) = qemu_sls_codebuf_used;
+    /* Identity, so the next boot can tell OUR cache from a different build's.
+     * Written on every sync rather than once, because the value is derived at
+     * compile time and a header written by an older binary would otherwise
+     * carry an older stamp into a newer file. */
+    *(uint64_t *)(io_scratch + 16) = qemu_tcache_identity();
+    *(uint32_t *)(io_scratch + 24) = QEMU_TCACHE_CODEBUF_SIZE;
+    *(uint32_t *)(io_scratch + 28) = QEMU_TCACHE_MAX_TBS;
     nvme_write_sync(QEMU_TCACHE_HDR_LBA, io_scratch);
 
     /* Gen counters: 64 pages in 2 batches. */

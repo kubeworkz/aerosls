@@ -27,10 +27,29 @@ X86_LD      = x86_64-elf-ld
 # tests/stack_frame_budget_check.sh, which asserts frames stay within the
 # ACTUAL stack size -- the invariant that matters, since a threshold unrelated
 # to the stack it must fit in is just a number.
+# ─── Build identity for the persistent translation cache ─────────────────────
+# The QEMU-SLS translation cache stores HOST MACHINE CODE on NVMe and restores
+# it across reboots. Its magic number proves only that SOME build wrote it, so
+# restoring a cache produced by a different compiler or different code-gen
+# flags would execute instructions built against assumptions that no longer
+# hold -- with no fault to catch it.
+#
+# This stamp goes into the cache header and is compared on restore; a mismatch
+# discards and cold-starts. Deliberately conservative: any commit invalidates
+# the cache, even one that could not have changed code generation. A needless
+# recompile costs one round. A wrongly-accepted cache costs arbitrary
+# behaviour with no diagnostic.
+#
+# Falls back to a timestamp when git is unavailable (release tarball, CI
+# without history), which errs toward cold-starting rather than toward
+# accepting a cache whose provenance cannot be established.
+AEROSLS_BUILD_ID := $(shell git rev-parse --short=12 HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)
+
 X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
               -mno-sse -mno-sse2 -mno-mmx \
               -fno-pie -fno-pic -fno-tree-vectorize \
-              -Wframe-larger-than=16384
+              -Wframe-larger-than=16384 \
+              -DAEROSLS_BUILD_ID='"$(AEROSLS_BUILD_ID)"'
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
 X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm
