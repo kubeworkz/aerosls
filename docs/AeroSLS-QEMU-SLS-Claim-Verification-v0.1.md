@@ -175,7 +175,7 @@ recorded run.
 | EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. 2026-08-05 cold EXEC was 5,939 cyc/load vs §5c's 6,774 — a −12.3% move, inside the reported CV. Consistent. |
 | Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
 | Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
-| Translation cache survives reboot | Phase2 | **STILL NOT TESTED.** A reboot trial on 2026-08-05 returned `TCACHE 0 hit, 8 miss` on the first bench, which looks like a negative result and is not one — no `checkpoint` was run, and that is the only thing that writes the cache. See §3c. |
+| Translation cache survives reboot | Phase2 | **Storage layer: WORKS.** `warm start — codebuf_used=8051` after reboot, matching the sync exactly. **End to end: DOES NOT.** The loader flushes page 0 while repopulating guest RAM, which is not persisted, invalidating every restored TB. Root cause at `sls-launcher.c:542-550`; see §3c. |
 
 **Before any of these is published**, re-run on current `HEAD` and record the
 build ID. The §5c A/B was taken 2026-08-04; the tree has moved since. Zero
@@ -355,27 +355,90 @@ out, statically, from the tree:
 | The node's disk is recreated on restart | **Eliminated.** `run-cluster.sh:465` creates the image only when absent |
 | Another subsystem overwrites the tcache LBAs | **Eliminated.** tcache spans 10000–18968; persist ends ~7664, `STREAM_DIR` 8192, stream data 65536+, VM state 20000. All disjoint. |
 
-### What is left, and the one line that decides it
+### The boot log answered it — the restore WORKED
 
-Three candidates remain, and `qemu_sls_tcache_init()` prints exactly which one
-occurred — to the **node console at boot**, which is why no `aeroslsctl shell`
-capture has contained it:
-
-```bash
-grep 'QEMU-SLS TCACHE' cluster/node2.log | head -3
+```
+[QEMU-SLS TCACHE] warm start — codebuf_used=8051, codebuf=0x0000000007944000
 ```
 
-| If the line says | Then |
-|---|---|
-| `snapshot is from a DIFFERENT BUILD … discarded` | The node was **rebuilt** between checkpoint and restart. Correct refusal — `AEROSLS_BUILD_ID` is `git rev-parse HEAD` and several commits landed this day. Re-test without rebuilding. |
-| `no snapshot — cold start` | **Real bug.** The magic was written but does not read back. Write path claims success while producing nothing readable. |
-| `NVMe unavailable — cold start` | I/O queues down this boot; `[NVME] I/O queue setup failed` should also appear, and `persist_restore_all()` would have been skipped too. |
+`codebuf_used=8051` matches `synced: 8 TBs, 8051 code bytes` exactly. The header
+was found, the magic matched, the identity matched, the code buffer was read
+back. **The storage layer is not the defect.** Every hypothesis in the table
+that used to be here was wrong, including the one marked "most likely" — the
+build ID matched fine.
 
-**Do not patch anything before reading that line.** §6 of the Cross-ISA plan
-records three hypotheses advanced from reading code on a different bug, all
-three wrong, all three killed by a two-command measurement. The standing rule
-from that session applies here unchanged: *the first request is the log, not a
-patch.*
+The misses therefore happen *after* a successful restore, in
+`qemu_sls_tcache_lookup()`, which has two silent miss paths: the descriptor is
+absent, or `qemu_sls_page_gen[d->guest_page] != d->gen_expected`. (The third,
+all-zero code bytes, prints `REFUSED` and did not appear.)
+
+### Root cause: the loader invalidates the cache it just restored
+
+`../qemu/sls/sls-launcher.c:542-550`:
+
+```c
+for (uint32_t off = 0; off < len; off += 4096) {
+    int differs = 0;
+    for (...) if (dst[off + i] != src[off + i]) { differs = 1; break; }
+    if (!differs) continue;              /* identical: no copy, no flush */
+    for (...) dst[off + i] = src[off + i];
+    qemu_sls_tcache_flush_page(off);     /* bumps qemu_sls_page_gen[page] */
+}
+```
+
+**The translation cache is persisted. The guest RAM it was compiled from is
+not.** Nothing in any checkpoint or persist path covers guest RAM, and
+`qemu_sls_mmu_map_guest_ram()` allocates fresh frames on every boot. So:
+
+| | guest RAM at launch | `differs` | flush | result |
+|---|---|---|---|---|
+| **Post-reboot, 1st launch** | fresh frames | **1** | **yes, page 0** | gen bumped → all 8 TBs stale → **0 hit / 8 miss** |
+| **Same boot, 2nd launch** | still holds the image | 0 | no | gen intact → **8 hit / 0 miss** |
+
+The image is 3,006 bytes — one page — and all 8 TBs are compiled from GPA
+`0x0..0xBBE`, so a single `flush_page(0)` invalidates the entire cache.
+
+### Why this was hard to see
+
+The comment directly above that loop names this exact failure mode:
+
+> Comparing first costs a 4 KiB scan per page. Re-translating the blocks on that
+> page costs, on this workload, about 25 million cycles. The comparison is not an
+> optimisation so much as **the difference between a cache that works across
+> launches and one that never survives its own loader.**
+
+The compare-before-copy was added *specifically* to prevent this, and it works —
+for the same-boot case. It cannot work across a reboot, because the reference it
+compares against is guest RAM, and guest RAM is precisely what does not persist.
+
+**The predicate is subtly wrong.** It asks *"do the bytes I am about to write
+differ from what is in guest RAM?"* The invariant the cache actually needs is
+*"do the bytes now in guest RAM differ from the bytes these TBs were compiled
+from?"* Identical questions within a boot; different questions across one. Note
+that **after** the copy the page holds exactly the bytes the TBs were compiled
+from — so the flush fires on a page that ends up correct. The invalidation is
+sound in mechanism and spurious in this instance.
+
+### Fix direction
+
+Persist a per-page digest of the bytes each TB was compiled from, alongside the
+TB descriptors, and flush only when the **post-copy** bytes disagree with it.
+Eight bytes per page for the handful of pages that actually back TBs — not the
+256 MiB of guest RAM, which is the obvious alternative and much worse.
+
+### Confidence, and what would settle it
+
+This is a **code-reading hypothesis**, and §6 records three of those about a
+different bug, all three wrong. Two things distinguish it: it was derived after
+the measurements rather than before, and it predicts the same-boot versus
+cross-boot asymmetry that had already been observed independently across three
+boots.
+
+It is still not a diagnosis. One `kernel_serial_printf` in
+`qemu_sls_tcache_flush_page()` reporting the page and the new generation would
+settle it — expect exactly one call, on page 0, on the post-reboot launch, and
+none on the warm one. Until that print exists this belongs in the "strong
+explanation" column, not the "root-caused" one.
 
 ### Minor, noted in passing
 
