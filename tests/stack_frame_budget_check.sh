@@ -4,7 +4,7 @@
 # overflow the bootstrap stack.
 #
 # ─── The bug this exists to catch ──────────────────────────────────────────
-# sls_shell_execute() compiles to a 276,032-byte frame. The bootstrap stack was
+# sls_shell_execute() compiled to a 276,032-byte frame. The bootstrap stack was
 # 65,536 bytes. Every shell command -- local or over HTTP -- therefore ran with
 # RSP about 208 KiB BELOW stack_bottom, writing into whatever .bss followed it.
 # Three captured faults put it at 212,768 / 212,864 / 212,880 bytes past the
