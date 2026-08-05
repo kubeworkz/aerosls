@@ -1,0 +1,18 @@
+# Line endings are normalised to LF in the repository.
+#
+# Three test files were CRLF while the other 84 were LF, and the build recipe
+# in each header comment uses backslash continuations. A backslash followed by
+# CR is not a continuation to bash, so every line of the command ran as a
+# separate command -- and tests/run_all.sh reported it as "compile error",
+# pointing at the compiler, which was never involved. Two tests were red for a
+# long time over a line ending.
+#
+# run_all.sh now strips CR defensively; this stops the situation arising.
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.iso  binary
+*.img  binary
+*.bin  binary

@@ -251,7 +251,28 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_gva, uint32_t error_code);
 /* Returns the guest-region record whose HVA range contains hva, or NULL. */
 const QemuGuestRegion *qemu_sls_mmu_find_region(uint64_t hva);
 
-/* Zero-copy DMA (Phase 4): map guest physical address to host pointers. */
+/* ─── Zero-copy DMA (Phase 4): guest physical → host pointer ───────────────
+ *
+ * ⚠ A WRITE THROUGH THIS POINTER BYPASSES CODE INVALIDATION.
+ *
+ * Guest stores are caught because translated code's source pages are
+ * write-protected in the GUEST window. This returns a pointer into the
+ * EMULATOR window, which is deliberately writable -- that is how the emulator
+ * reads guest page tables and loads images. So a write here overwrites guest
+ * code with no fault, no generation bump, and no signal, leaving the
+ * translation cache serving blocks compiled from bytes that no longer exist.
+ *
+ * Every writer must call qemu_sls_tcache_flush_page() for each page it
+ * modifies. sls_launch_guest() does, comparing per page first so that
+ * rewriting an identical image does not needlessly invalidate the cache.
+ *
+ * As of 2026-08-04 that is the ONLY caller. The obvious hardening -- splitting
+ * this into a const read accessor and a write accessor that invalidates -- was
+ * considered and not done: with one call site the enforcement would be
+ * ceremony, and the launcher's compare-then-flush is smarter than any blanket
+ * invalidate the accessor could perform. Revisit when a second writer appears;
+ * that is the moment the cost of remembering exceeds the cost of the split.
+ */
 void    *qemu_sls_dma_host_ptr(uint64_t gpa);    /* host VA for direct R/W */
 uint64_t qemu_sls_dma_frame_phys(uint64_t gpa);  /* physical frame for DMA hardware */
 

@@ -264,9 +264,32 @@ void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsign
             saved_cs, error_code, saved_rip);
         process_exit(134);
     }
-    kernel_serial_printf(
-        "\n[FAULT] Kernel fault  cs=0x%lx  error=0x%lx  rip=0x%016lx  — Halting.\n",
-        saved_cs, error_code, saved_rip);
+    /* ─── The essential facts first, by the path that cannot be swallowed ──
+     * This path halts, so anything it prints through kernel_serial_printf()
+     * while an HTTP shell command is running goes into that command's capture
+     * buffer and is never flushed. handle_page_fault(), kernel_panic(),
+     * sls_abort() and the TCG helper stubs were all fixed for this; this was
+     * the last one, and it is the one with the richest output to lose.
+     *
+     * Ordered deliberately: cs, error and rip go out via kernel_panic_puts()
+     * FIRST, because those three identify the fault and must survive even if
+     * .bss is what broke. Only then is the capture released, so the detailed
+     * report below -- fault_explain(), the stack dump, the poison-run scan --
+     * reaches the wire as well. If capture_stop() itself faults on a corrupted
+     * .bss, the facts that matter are already out. */
+    kernel_panic_puts("\n[FAULT] Kernel fault  cs=");
+    kernel_panic_hex64((uint64_t)saved_cs);
+    kernel_panic_puts("  error=");
+    kernel_panic_hex64((uint64_t)error_code);
+    kernel_panic_puts("  rip=");
+    kernel_panic_hex64((uint64_t)saved_rip);
+    kernel_panic_puts("  — Halting.\n");
+
+    /* Now let the rich report through. Nothing below can be trusted to reach
+     * the wire without this, and nothing below is worth more than the three
+     * values already printed. */
+    kernel_serial_capture_stop();
+
     fault_explain(saved_rip);
     /* Search upward from this frame for the rip/cs pair the CPU pushed. 64
      * qwords is far more than any stub prologue and still nowhere near the
