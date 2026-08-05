@@ -3425,7 +3425,11 @@ static int api_vec_index_rebuild_post(const char* body, char* buf, int max, uint
 static int api_vec_join_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
-    struct SLSVecJoinRequest req;
+    /* 265,880 bytes -- results[VEC_JOIN_MAX_RESULTS] lives inline in the
+     * request. It was this function's whole 266,304-byte frame. static because
+     * the HTTP server is single-threaded and handles one request at a time; see
+     * the fuller note at the matching declaration in user/shell.c. */
+    static struct SLSVecJoinRequest req;
     req.caller_uid = req_uid;
     json_str(body, "table", req.table_name, OBJECT_NAME_LEN);
     json_str(body, "id_column", req.id_column, RECORD_KEY_LEN);

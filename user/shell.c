@@ -454,6 +454,47 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
     // kernel/workload.h's stated limitation.
     reconcile_drain();
 
+    /* ─── Shared storage for the largest command request structs ──────────
+     * sls_shell_execute() compiles to a 276 KB stack frame, built from ~90
+     * request structs and ~50 small arrays spread across its command branches.
+     * They do not share stack slots -- the frame is the same size at -O0, -O1,
+     * -O2 and -Os, so this is not the optimiser declining to overlap them.
+     *
+     * It matters because this frame ran on a 64 KiB stack until today: every
+     * shell command executed ~208 KiB below stack_bottom, overwriting .bss,
+     * invisibly, for months. The stack is now 1 MiB and the frame fits, but
+     * 26% of the stack for one function is not a place to leave it.
+     *
+     * Exactly one command runs per call, so at most one request struct is ever
+     * live -- which makes a union the right shape rather than a trick.
+     *
+     * Measured, after an earlier claim here was wrong. This union was added
+     * first, on the theory that the five largest structs were ~51 KB of the
+     * 276 KB frame. The frame did not move by a single byte, because GCC
+     * already overlaps branch-local structs -- which is also why the frame was
+     * identical at -O0, -O1, -O2 and -Os.
+     *
+     * The frame was ONE struct: sizeof(SLSVecJoinRequest) is 265,880 bytes,
+     * 96% of the total (see the note at its declaration below). With that moved
+     * off the stack the union's effect became measurable for the first time:
+     * 27,040 bytes without it, 10,224 with. It trades 16.8 KB of stack for
+     * 16.5 KB of .bss -- neutral on memory, better on stack safety.
+     *
+     * The remaining ~85 request structs share slots and cost nothing. There is
+     * no reason to convert them.
+     *
+     * static, not automatic: the shell has a single active session by design
+     * (see the capture note in kernel/kernel_io.h and current_tx_id below), so
+     * one instance is correct, and a static keeps it off the stack entirely
+     * rather than moving the problem to a smaller frame. */
+    static union {
+        struct SLSSchemaImportRequest     schema_import;
+        struct SLSVecSchemaImportRequest  vec_schema_import;
+        struct SLSVecDataImportRequest    vec_data_import;
+        struct WebAppSetRequest           webapp_set;
+        struct SLSUploadRequest           upload;
+    } sh_req;
+
     kernel_serial_capture_start(out_buf, out_cap);
 
     // Architectural Phase 2: local copies of what used to be file-scope
@@ -1067,15 +1108,15 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // past individual statement failures -- see sql_exec.h's own
         // comment on sql_schema_import() for why.
         else if (sh_starts(input_buffer, "schema import ")) {
-            struct SLSSchemaImportRequest req;
-            req.caller_uid = current_session_uid;
-            sh_copy(req.sql_text, input_buffer + 15, sizeof(req.sql_text));
-            do_syscall(SYS_SLS_SCHEMA_IMPORT, &req);
+            struct SLSSchemaImportRequest *req = &sh_req.schema_import;
+            req->caller_uid = current_session_uid;
+            sh_copy(req->sql_text, input_buffer + 15, sizeof(req->sql_text));
+            do_syscall(SYS_SLS_SCHEMA_IMPORT, req);
             kernel_serial_printf("[SCHEMA] import: %u total, %u succeeded, %u failed\n",
-                                 req.result.total, req.result.succeeded, req.result.failed);
-            uint32_t shown = req.result.total < SQL_SCHEMA_IMPORT_MAX_STMTS ? req.result.total : SQL_SCHEMA_IMPORT_MAX_STMTS;
+                                 req->result.total, req->result.succeeded, req->result.failed);
+            uint32_t shown = req->result.total < SQL_SCHEMA_IMPORT_MAX_STMTS ? req->result.total : SQL_SCHEMA_IMPORT_MAX_STMTS;
             for (uint32_t si = 0; si < shown; si++) {
-                struct SqlSchemaImportStmtResult* sr = &req.result.stmts[si];
+                struct SqlSchemaImportStmtResult* sr = &req->result.stmts[si];
                 if (sr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", si, sr->offset);
                 else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", si, sr->offset, sr->error_msg);
             }
@@ -1103,15 +1144,15 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // individual line failures -- see vec_index.h's own comment on
         // vec_schema_import() for why.
         else if (sh_starts(input_buffer, "vec schema import ")) {
-            struct SLSVecSchemaImportRequest req;
-            req.caller_uid = current_session_uid;
-            sh_copy(req.text, input_buffer + 19, sizeof(req.text));
-            do_syscall(SYS_SLS_VEC_SCHEMA_IMPORT, &req);
+            struct SLSVecSchemaImportRequest *req = &sh_req.vec_schema_import;
+            req->caller_uid = current_session_uid;
+            sh_copy(req->text, input_buffer + 19, sizeof(req->text));
+            do_syscall(SYS_SLS_VEC_SCHEMA_IMPORT, req);
             kernel_serial_printf("[VEC_SCHEMA] import: %u total, %u succeeded, %u failed\n",
-                                 req.result.total, req.result.succeeded, req.result.failed);
-            uint32_t vshown = req.result.total < VEC_SCHEMA_IMPORT_MAX_LINES ? req.result.total : VEC_SCHEMA_IMPORT_MAX_LINES;
+                                 req->result.total, req->result.succeeded, req->result.failed);
+            uint32_t vshown = req->result.total < VEC_SCHEMA_IMPORT_MAX_LINES ? req->result.total : VEC_SCHEMA_IMPORT_MAX_LINES;
             for (uint32_t vi = 0; vi < vshown; vi++) {
-                struct VecSchemaImportLineResult* lr = &req.result.lines[vi];
+                struct VecSchemaImportLineResult* lr = &req->result.lines[vi];
                 if (lr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", vi, lr->offset);
                 else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", vi, lr->offset, lr->error_msg);
             }
@@ -1158,15 +1199,15 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // vec_data_import() for why, and for the inherited (not new)
         // external_id-non-dedup gap this call carries.
         else if (sh_starts(input_buffer, "vec data import ")) {
-            struct SLSVecDataImportRequest req;
-            req.caller_uid = current_session_uid;
-            sh_copy(req.text, input_buffer + 17, sizeof(req.text));
-            do_syscall(SYS_SLS_VEC_DATA_IMPORT, &req);
+            struct SLSVecDataImportRequest *req = &sh_req.vec_data_import;
+            req->caller_uid = current_session_uid;
+            sh_copy(req->text, input_buffer + 17, sizeof(req->text));
+            do_syscall(SYS_SLS_VEC_DATA_IMPORT, req);
             kernel_serial_printf("[VEC_DATA] import: %u total, %u succeeded, %u failed\n",
-                                 req.result.total, req.result.succeeded, req.result.failed);
-            uint32_t vdshown = req.result.total < VEC_DATA_IMPORT_MAX_LINES ? req.result.total : VEC_DATA_IMPORT_MAX_LINES;
+                                 req->result.total, req->result.succeeded, req->result.failed);
+            uint32_t vdshown = req->result.total < VEC_DATA_IMPORT_MAX_LINES ? req->result.total : VEC_DATA_IMPORT_MAX_LINES;
             for (uint32_t vdi = 0; vdi < vdshown; vdi++) {
-                struct VecDataImportLineResult* lr = &req.result.lines[vdi];
+                struct VecDataImportLineResult* lr = &req->result.lines[vdi];
                 if (lr->ok) kernel_serial_printf("  [%u] ok (offset %u)\n", vdi, lr->offset);
                 else        kernel_serial_printf("  [%u] FAILED (offset %u): %s\n", vdi, lr->offset, lr->error_msg);
             }
@@ -1761,7 +1802,28 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             sreq.query.count = n;
             do_syscall(SYS_SLS_VEC_SEARCH, &sreq);
 
-            struct SLSVecJoinRequest jreq;
+/* ─── 260 KB: this one struct WAS the frame ────────────────────────────
+             * sizeof(struct SLSVecJoinRequest) is 265,880 bytes -- it carries
+             * results[VEC_JOIN_MAX_RESULTS] inline. That is 96% of this
+             * function's 276,032-byte frame; GCC overlaps every other command's
+             * locals, so the frame is essentially this struct alone.
+             *
+             * It ran on a 64 KiB stack until today, which is how every shell
+             * command came to execute ~208 KiB below stack_bottom, overwriting
+             * .bss invisibly for months. The stack is 1 MiB now and it fits,
+             * but one request struct should not be a quarter of it.
+             *
+             * static: one shell session is active by design (see current_tx_id
+             * above and the capture note in kernel/kernel_io.h), so a single
+             * instance is correct. Moving it to .bss costs the same memory and
+             * takes it off the stack entirely.
+             *
+             * The real fix is for the result rows to live outside the request
+             * -- a caller-supplied buffer, or a cursor -- so that the size is
+             * the caller's choice rather than a compile-time constant every
+             * caller pays. That is an API change across the vec-join callers
+             * and wants its own pass. */
+            static struct SLSVecJoinRequest jreq;
             jreq.caller_uid = current_session_uid;
             sh_copy(jreq.table_name, table_name, sizeof(jreq.table_name));
             sh_copy(jreq.id_column, id_column, sizeof(jreq.id_column));
@@ -1914,27 +1976,27 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                  sh_starts(input_buffer, "webapp append ")) {
             int append = sh_starts(input_buffer, "webapp append ");
             const char* p = input_buffer + (append ? 14 : 11);
-            struct WebAppSetRequest req;
-            req.append = (uint8_t)append;
+            struct WebAppSetRequest *req = &sh_req.webapp_set;
+            req->append = (uint8_t)append;
             // parse obj name
             size_t nlen = 0;
             while (p[nlen] && p[nlen] != ' ') nlen++;
-            sh_copy(req.obj_name, p,
+            sh_copy(req->obj_name, p,
                     nlen+1 < OBJECT_NAME_LEN ? (int)(nlen+1) : OBJECT_NAME_LEN);
             p = sh_next(p);
             // parse path (URL)
             size_t plen = 0;
             while (p[plen] && p[plen] != ' ') plen++;
-            sh_copy(req.path, p,
+            sh_copy(req->path, p,
                     plen+1 < WEBAPP_PATH_LEN ? (int)(plen+1) : WEBAPP_PATH_LEN);
             p = sh_next(p);
             // rest of line = content
             size_t clen = 0;
             while (p[clen]) clen++;
             if (clen >= WEBAPP_CONTENT_LEN) clen = WEBAPP_CONTENT_LEN - 1;
-            sh_copy(req.content, p, (int)(clen + 1));
-            req.content_len = (uint32_t)clen;
-            do_syscall(SYS_SLS_WEBAPP_SET, &req);
+            sh_copy(req->content, p, (int)(clen + 1));
+            req->content_len = (uint32_t)clen;
+            do_syscall(SYS_SLS_WEBAPP_SET, req);
         }
 
         // ── Phase D: webapp list [<obj>] ───────────────────────────────────
@@ -2001,42 +2063,42 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // ── demo <name> ──────────────────────────────────────────────────────────────────────────
         else if (sh_starts(input_buffer, "demo ")) {
             const char* name = input_buffer + 5;
-            struct SLSUploadRequest req;
-            sh_copy(req.object_name, name, PROC_NAME_LEN);
-            req.byte_offset = 0;
-            req.chunk_len   = aerosls_demo_bin_size < UPLOAD_CHUNK_MAX
+            struct SLSUploadRequest *req = &sh_req.upload;
+            sh_copy(req->object_name, name, PROC_NAME_LEN);
+            req->byte_offset = 0;
+            req->chunk_len   = aerosls_demo_bin_size < UPLOAD_CHUNK_MAX
                               ? aerosls_demo_bin_size : UPLOAD_CHUNK_MAX;
-            for (uint32_t i = 0; i < req.chunk_len; i++)
-                req.chunk[i] = aerosls_demo_bin[i];
-            req.is_last     = 1;
-            do_syscall(SYS_SLS_UPLOAD_BINARY, &req);
+            for (uint32_t i = 0; i < req->chunk_len; i++)
+                req->chunk[i] = aerosls_demo_bin[i];
+            req->is_last     = 1;
+            do_syscall(SYS_SLS_UPLOAD_BINARY, req);
             do_syscall(SYS_SLS_LOAD, (void*)name);
         }
 
         // ── Phase C: upload <name> <hex> ─────────────────────────────────────
         else if (sh_starts(input_buffer, "upload ")) {
             const char* p = input_buffer + 7;
-            struct SLSUploadRequest req;
+            struct SLSUploadRequest *req = &sh_req.upload;
             // parse name
             size_t nlen = 0;
             while (p[nlen] && p[nlen] != ' ') nlen++;
-            sh_copy(req.object_name, p,
+            sh_copy(req->object_name, p,
                     nlen + 1 < PROC_NAME_LEN ? nlen + 1 : PROC_NAME_LEN);
             p = sh_next(p);
             // decode hex string into chunk[]
-            req.byte_offset = 0;
-            req.chunk_len   = 0;
-            while (p[0] && p[1] && req.chunk_len < UPLOAD_CHUNK_MAX) {
+            req->byte_offset = 0;
+            req->chunk_len   = 0;
+            while (p[0] && p[1] && req->chunk_len < UPLOAD_CHUNK_MAX) {
                 // each byte = two hex chars
                 uint8_t hi = (uint8_t)(p[0] >= 'a' ? p[0]-'a'+10 :
                                        p[0] >= 'A' ? p[0]-'A'+10 : p[0]-'0');
                 uint8_t lo = (uint8_t)(p[1] >= 'a' ? p[1]-'a'+10 :
                                        p[1] >= 'A' ? p[1]-'A'+10 : p[1]-'0');
-                req.chunk[req.chunk_len++] = (uint8_t)((hi << 4) | lo);
+                req->chunk[req->chunk_len++] = (uint8_t)((hi << 4) | lo);
                 p += 2;
             }
-            req.is_last = 1;
-            do_syscall(SYS_SLS_UPLOAD_BINARY, &req);
+            req->is_last = 1;
+            do_syscall(SYS_SLS_UPLOAD_BINARY, req);
         }
 
         // ── Phase C: load <name> ──────────────────────────────────────────────
