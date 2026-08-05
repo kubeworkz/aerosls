@@ -205,8 +205,35 @@ static uint64_t g_next_gpa_table = 0x10000;   /* GPA 64 KiB */
 static uint64_t *gpa_ptr(uint64_t gpa) {
     return (uint64_t *)(g_guest_ram + gpa);
 }
+/* ─── The shared budget that has now caught three separate blocks ─────────
+ * Guest page tables come from this bump cursor, but only the GPAs backed by
+ * map_guest_ram() can actually be read back through gpa_to_hva(). Run past the
+ * backed range and build_guest_pt_4k() returns a CR3 whose tables are
+ * unreadable -- so the failure lands on whichever block happens to walk next,
+ * with a message about that block's assertion and nothing about the cause.
+ *
+ * That has happened three times in this file: each new block added four tables,
+ * pushed the cursor past the end, and broke three unrelated checks below it.
+ * Each time the diagnosis started from the wrong block.
+ *
+ * The budget cannot be enforced from here (the backed range lives in the .c),
+ * but exhausting it can at least stop being silent. */
+#define GUEST_TABLE_LIMIT_GPA  (56u * FRAME_SIZE)   /* map_guest_ram backs 16..55 */
+
 static uint64_t alloc_guest_table(void) {
     uint64_t gpa = g_next_gpa_table;
+    if (gpa + FRAME_SIZE > GUEST_TABLE_LIMIT_GPA) {
+        fprintf(stderr,
+            "\nFATAL: guest page-table space exhausted at GPA 0x%llx.\n"
+            "  build_guest_pt_4k() hands out tables from a bump cursor, and only\n"
+            "  GPAs backed by map_guest_ram() are readable. Past this point a\n"
+            "  CR3 points at tables gpa_to_hva() returns NULL for, and the walk\n"
+            "  fails in whatever block runs NEXT -- not in the one that ran out.\n"
+            "  Either reuse an existing qemu_sls_guest_cr3 instead of building a\n"
+            "  new table, or back more guest RAM before adding this block.\n",
+            (unsigned long long)gpa);
+        exit(2);
+    }
     g_next_gpa_table += FRAME_SIZE;
     memset(gpa_ptr(gpa), 0, FRAME_SIZE);
     return gpa;
@@ -238,6 +265,7 @@ static uint64_t build_guest_pt_4k(uint64_t gva, uint64_t target_gpa,
 }
 
 int main(void) {
+    uint64_t saved_cr3_paged = 0;
     g_guest_ram = aligned_alloc(FRAME_SIZE, GUEST_RAM_BYTES);
     g_frame_pool = aligned_alloc(FRAME_SIZE, (size_t)POOL_FRAMES * FRAME_SIZE);
     if (!g_guest_ram || !g_frame_pool) { printf("aligned_alloc failed\n"); return 2; }
@@ -636,6 +664,10 @@ int main(void) {
         const uint64_t gva = 0x00000000DEADB000ULL;
         qemu_sls_guest_cr3 = build_guest_pt_4k(gva, 2 * FRAME_SIZE,
                                                USER_PTE_PRESENT | USER_PTE_WRITE, 4);
+        /* Kept for the paged-invalidation block below, which needs a real
+         * GVA->GPA mapping but must not build another set of tables -- the
+         * guest-table budget is shared and nearly spent by this point. */
+        saved_cr3_paged = qemu_sls_guest_cr3;
         qemu_sls_guest_active = 1;
 
         qemu_sls_guest_paging_on = 1;
@@ -774,6 +806,70 @@ int main(void) {
               "*** a NOT-PRESENT write (error 0x2) is not treated as a code-page "
               "write: no generation bumped, fault left unresolved. Otherwise "
               "every ordinary miss would silently invalidate a page ***");
+
+        /* ─── The same thing, with guest paging ON ─────────────────────────
+         * Generations are keyed by PHYSICAL page, because that is what a
+         * translation was compiled from. Two guest virtual addresses can alias
+         * one physical page, so invalidating by GVA would leave the alias
+         * serving stale code -- the walk is not an implementation detail, it
+         * is the difference between invalidating the right thing and something
+         * that merely looks right.
+         *
+         * The check below is built so a GVA-keyed implementation FAILS it: the
+         * GVA and its GPA are deliberately different, and the generation that
+         * must move is the one indexed by the GPA. */
+        qemu_sls_guest_paging_on = 1;
+        {
+            /* Reuses the CR3 an earlier block built rather than building a
+             * fifth set of tables: the guest-table cursor is a shared, finite
+             * budget (see alloc_guest_table) and this block was the one that
+             * exhausted it, breaking three checks further down. gva and
+             * target_gpa below must match what that block mapped. */
+            const uint64_t gva = 0x00000000DEADB000ULL;
+            const uint64_t target_gpa = 2 * FRAME_SIZE;
+            qemu_sls_guest_cr3 = saved_cr3_paged;
+            CHECK((gva / FRAME_SIZE) != (target_gpa / FRAME_SIZE),
+                  "control: the test GVA and its GPA are on different pages, so "
+                  "keying invalidation by the wrong one is detectable");
+
+            uint32_t gen_gpa_before = qemu_sls_page_gen[target_gpa / FRAME_SIZE];
+            g_map_count = 0; g_invlpg_count = 0;
+
+            CHECK(qemu_sls_mmu_shadow_fault(GUEST_FAULT_ADDR(gva), 0x3) == 0,
+                  "a paged guest's write to a protected code page resolves");
+            CHECK(qemu_sls_page_gen[target_gpa / FRAME_SIZE] == gen_gpa_before + 1,
+                  "*** ...and the generation bumped is the one for the PHYSICAL "
+                  "page the guest's tables map to -- not the virtual address it "
+                  "wrote through ***");
+            const MapCall *mw = last_map();
+            CHECK(mw && mw->va == GUEST_FAULT_ADDR(gva) &&
+                  (mw->flags & USER_PTE_WRITE),
+                  "*** ...and the page was made writable again at the GVA, so "
+                  "the retried store succeeds instead of faulting forever ***");
+            CHECK(mw && mw->pa == qemu_sls_dma_frame_phys(target_gpa),
+                  "...pointing at the frame the guest's own tables resolve to");
+            CHECK(g_invlpg_count == 1 &&
+                  g_invlpg[0] == (GUEST_FAULT_ADDR(gva) & ~(uint64_t)0xFFF),
+                  "*** ...and the read-only TLB entry was flushed, at the "
+                  "page-aligned host address. Without it the retried store hits "
+                  "the stale read-only translation and faults forever on the "
+                  "same instruction -- mutation testing caught this assertion "
+                  "missing from the paged path while the identical one guarded "
+                  "the unpaged one ***");
+
+            /* A write to a GVA the guest does not map cannot be attributed to
+             * any physical page. Bumping a generation chosen by guesswork would
+             * invalidate unrelated code AND leave the real page stale. */
+            uint32_t gen_all = qemu_sls_page_gen[2] + qemu_sls_page_gen[3]
+                             + qemu_sls_page_gen[4];
+            CHECK(qemu_sls_mmu_shadow_fault(
+                      GUEST_FAULT_ADDR(0x00000000DEAD0000ULL), 0x3) == 1,
+                  "*** an unmapped GVA is refused, not resolved ***");
+            CHECK(qemu_sls_page_gen[2] + qemu_sls_page_gen[3]
+                  + qemu_sls_page_gen[4] == gen_all,
+                  "*** ...and no generation moved. Guessing would invalidate "
+                  "unrelated code while leaving the modified page live ***");
+        }
 
         /* Restore what the blocks below depend on. This block turned paging
          * OFF and guest_active ON for its own purposes, and leaving either

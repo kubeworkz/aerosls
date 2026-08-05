@@ -364,6 +364,63 @@ static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
     return 0;
 }
 
+/* ─── guest_walk: GVA -> GPA through the guest's own page tables ───────────
+ *
+ * Extracted from qemu_sls_mmu_shadow_fault(), which had the walk inlined with
+ * three exits (1 GiB, 2 MiB, 4 KiB) each computing a GPA and installing a
+ * shadow PTE. Invalidation for a paged guest needs the same walk for a
+ * different purpose -- to find which PHYSICAL page a write landed on, so its
+ * generation can be bumped -- and a second copy of a four-level page-table
+ * walk is two chances to get the huge-page offset masks wrong.
+ *
+ * Fills *gpa_out with the guest physical address and *leaf_out with the leaf
+ * entry (whose W bit the caller propagates). Returns 0 on success, 1 if the
+ * guest has no mapping or the GPA is not backed by guest RAM.
+ */
+static int guest_walk(uint64_t gva, uint64_t *gpa_out, uint64_t *leaf_out) {
+    uint64_t cr3_gpa = qemu_sls_guest_cr3 & ~(uint64_t)0xFFF;
+    const uint64_t *pml4 = gpa_to_hva(cr3_gpa);
+    if (!pml4) return 1;
+
+    uint64_t e3 = pml4[PML4_IDX(gva)];
+    if (!(e3 & USER_PTE_PRESENT)) return 1;
+
+    const uint64_t *pdpt = gpa_to_hva(e3 & USER_PTE_FRAME_MASK);
+    if (!pdpt) return 1;
+    uint64_t e2 = pdpt[PDPT_IDX(gva)];
+    if (!(e2 & USER_PTE_PRESENT)) return 1;
+
+    uint64_t gpa, leaf;
+    if (e2 & HUGE_1G_FLAG) {
+        gpa  = (e2 & ~(uint64_t)0x3FFFFFFF) | (gva & (uint64_t)0x3FFFFFFF);
+        leaf = e2;
+    } else {
+        const uint64_t *pd = gpa_to_hva(e2 & USER_PTE_FRAME_MASK);
+        if (!pd) return 1;
+        uint64_t e1 = pd[PD_IDX(gva)];
+        if (!(e1 & USER_PTE_PRESENT)) return 1;
+
+        if (e1 & HUGE_2M_FLAG) {
+            gpa  = (e1 & ~(uint64_t)0x1FFFFF) | (gva & (uint64_t)0x1FFFFF);
+            leaf = e1;
+        } else {
+            const uint64_t *pt = gpa_to_hva(e1 & USER_PTE_FRAME_MASK);
+            if (!pt) return 1;
+            uint64_t l = pt[PT_IDX(gva)];
+            if (!(l & USER_PTE_PRESENT)) return 1;
+            gpa  = l & USER_PTE_FRAME_MASK;
+            leaf = l;
+        }
+    }
+
+    uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
+    if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
+
+    if (gpa_out)  *gpa_out  = gpa;
+    if (leaf_out) *leaf_out = leaf;
+    return 0;
+}
+
 /* ─── qemu_sls_mmu_shadow_fault ─────────────────────────────────────────── */
 
 /*
@@ -447,19 +504,45 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
                 gpa & ~(uint64_t)0xFFF, qemu_sls_page_gen[idx]);
             return 0;
         }
-        /* Paging on: the faulting address is a GVA, so the physical page it
-         * belongs to needs a guest page-table walk before its generation can
-         * be bumped. Not implemented -- and refused loudly rather than
-         * resolved, because silently permitting the write would leave stale
-         * translations live, which is exactly what this whole mechanism is
-         * for. */
+        /* ─── Paged guest: the faulting address is a GVA ───────────────────
+         * Generations are keyed by PHYSICAL page, because that is what a
+         * translation was compiled from -- two GVAs can alias one GPA, and
+         * invalidating by GVA would leave the alias serving stale code. So the
+         * guest's own tables are walked to find which physical page the write
+         * landed on, using the same guest_walk() the resolve path uses.
+         *
+         * If the walk fails the guest has no mapping for the address it just
+         * wrote through, which cannot happen for a fault on a PRESENT page --
+         * it means the guest's tables changed under us. Refused rather than
+         * guessed: bumping the wrong page's generation would invalidate
+         * unrelated code while leaving the modified page's translations live,
+         * which is worse than not invalidating at all. */
         if (qemu_sls_guest_paging_on) {
+            uint64_t wgpa = 0, wleaf = 0;
+            if (guest_walk(faulting_gva, &wgpa, &wleaf) != 0) {
+                kernel_serial_printf(
+                    "[QEMU-SLS MMU] write to protected page at GVA 0x%016lx, but the "
+                    "guest has no mapping for it -- refusing rather than bumping a "
+                    "generation chosen by guesswork.\n", faulting_gva);
+                return 1;
+            }
+            uint32_t widx = (uint32_t)(wgpa / FRAME_SIZE);
+            qemu_sls_tcache_flush_page(wgpa);
+
+            /* Reinstall writable. The guest's own leaf decides the W bit for
+             * everything else, but this fault only happens on a page WE
+             * protected -- the guest already believes it is writable, or the
+             * store would be its own protection violation to handle. Forcing W
+             * restores the guest's view, it does not widen it. */
+            user_map_page(shadow_pml4, faulting_addr & ~(uint64_t)0xFFF,
+                          guest_ram_frames[widx],
+                          USER_PTE_PRESENT | USER_PTE_WRITE);
+            qemu_sls_invlpg(faulting_addr & ~(uint64_t)0xFFF);
             kernel_serial_printf(
-                "[QEMU-SLS MMU] write to protected code page at GVA 0x%016lx with "
-                "guest paging ON -- invalidation for paged guests is not "
-                "implemented. Refusing rather than allowing a write that would "
-                "leave stale translations live.\n", faulting_gva);
-            return 1;
+                "[QEMU-SLS MMU] paged guest wrote to code page GVA 0x%016lx "
+                "(GPA 0x%016lx) -- TBs invalidated, page writable again.\n",
+                faulting_gva, wgpa & ~(uint64_t)0xFFF);
+            return 0;
         }
     }
 
@@ -493,53 +576,13 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
      * actual question. */
     if (!qemu_sls_guest_active) return 1;
 
-    uint64_t cr3_gpa = qemu_sls_guest_cr3 & ~(uint64_t)0xFFF;
-    const uint64_t *pml4 = gpa_to_hva(cr3_gpa);
-    if (!pml4) return 1;
+    uint64_t gpa = 0, leaf = 0;
+    if (guest_walk(faulting_gva, &gpa, &leaf) != 0) return 1;
 
-    uint64_t e3 = pml4[PML4_IDX(faulting_gva)];
-    if (!(e3 & USER_PTE_PRESENT)) return 1;
-
-    const uint64_t *pdpt = gpa_to_hva(e3 & USER_PTE_FRAME_MASK);
-    if (!pdpt) return 1;
-    uint64_t e2 = pdpt[PDPT_IDX(faulting_gva)];
-    if (!(e2 & USER_PTE_PRESENT)) return 1;
-
-    if (e2 & HUGE_1G_FLAG) {
-        /* 1 GiB page: GPA = upper bits of e2 | lower 30 bits of GVA. */
-        uint64_t gpa = (e2 & ~(uint64_t)0x3FFFFFFF) |
-                       (faulting_gva & (uint64_t)0x3FFFFFFF);
-        uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
-        if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
-        if (shadow_install(faulting_addr, guest_ram_frames[idx], e2) != 0) return 1;
-        return 0;
-    }
-
-    const uint64_t *pd = gpa_to_hva(e2 & USER_PTE_FRAME_MASK);
-    if (!pd) return 1;
-    uint64_t e1 = pd[PD_IDX(faulting_gva)];
-    if (!(e1 & USER_PTE_PRESENT)) return 1;
-
-    if (e1 & HUGE_2M_FLAG) {
-        /* 2 MiB page: GPA = upper bits of e1 | lower 21 bits of GVA. */
-        uint64_t gpa = (e1 & ~(uint64_t)0x1FFFFF) |
-                       (faulting_gva & (uint64_t)0x1FFFFF);
-        uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
-        if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
-        if (shadow_install(faulting_addr, guest_ram_frames[idx], e1) != 0) return 1;
-        return 0;
-    }
-
-    const uint64_t *pt = gpa_to_hva(e1 & USER_PTE_FRAME_MASK);
-    if (!pt) return 1;
-    uint64_t leaf = pt[PT_IDX(faulting_gva)];
-    if (!(leaf & USER_PTE_PRESENT)) return 1;
-
-    uint64_t gpa = leaf & USER_PTE_FRAME_MASK;
-    uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
-    if (idx >= QEMU_GUEST_RAM_PAGES || !guest_ram_frames[idx]) return 1;
-
-    if (shadow_install(faulting_addr, guest_ram_frames[idx], leaf) != 0) return 1;
+    if (shadow_install(faulting_addr,
+                       guest_ram_frames[(uint32_t)(gpa / FRAME_SIZE)],
+                       leaf) != 0)
+        return 1;
     return 0;
 }
 
