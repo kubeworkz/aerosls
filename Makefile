@@ -335,7 +335,7 @@ $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP)
 # generic TCG core, where it has no business.
 SLS_X86_FRONTEND ?= off
 ifeq ($(SLS_X86_FRONTEND),on)
-TARGET_OBJS = tcg-objs/i386-translate.x86.o
+TARGET_OBJS = tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o
 else ifneq ($(SLS_X86_FRONTEND),off)
 $(error SLS_X86_FRONTEND must be 'on' or 'off', got '$(SLS_X86_FRONTEND)')
 endif
@@ -343,6 +343,24 @@ endif
 tcg-objs/i386-translate.x86.o: ../qemu/target/i386/tcg/translate.c $(AB_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
+
+# Step 6.3: x86_translate_code() calls translator_loop(), which lives here.
+# This is the ONLY part of accel/tcg we take -- see the plan's 6.3 decision.
+# cpu-exec.c, translate-all.c and cputlb.c stay out: sls-launcher.c keeps the
+# execution loop and TB management, and cputlb.c is the software TLB that
+# softmmu=OFF exists to bypass.
+#
+# No -DCOMPILING_PER_TARGET: verified it compiles identically with and without,
+# and it is generic accel code, so the guest-word-size assumption has no place
+# in it.
+#
+# Explicit rule even though 'translator.c' IS unique in the tree today and
+# VPATH would resolve it. Uniformity within this group is worth one line: the
+# neighbouring translate.c has 20+ namesakes, and a reader comparing the two
+# rules should not have to work out why one is safe and the other is not.
+tcg-objs/translator.x86.o: ../qemu/accel/tcg/translator.c $(AB_STAMP)
+	@mkdir -p tcg-objs
+	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
 
 arch/x86/trampoline.o: arch/x86/trampoline.asm
 	$(ASN) -f bin $< -o arch/x86/trampoline.bin

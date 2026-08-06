@@ -1,22 +1,34 @@
-# Step 6.2 — undefined symbols in QEMU's x86-64 decoder
+# Step 6.2/6.3 — symbols still undefined after linking the frontend objects
 #
 # Generated, do not hand-edit. Regenerate with:
-#   make x86-iso SLS_X86_FRONTEND=on   # (will not link until 6.4)
-#   nm -u tcg-objs/i386-translate.x86.o | awk '{print $2}' | sort
+#   make x86-iso SLS_X86_FRONTEND=on          # (will not link until 6.4)
+#   nm -u tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o \
+#     | awk '{print $2}' | sort -u
 #
-# Captured 2026-08-05 from target/i386/tcg/translate.c compiled with the
-# real build's flags plus -DCOMPILING_PER_TARGET. This is the Step 6.4
-# work list, recorded verbatim rather than summarised: a count is not a
+# Captured 2026-08-05 from target/i386/tcg/translate.c and
+# accel/tcg/translator.c, real build flags. This is the Step 6.4 work
+# list, recorded verbatim rather than summarised: a count is not a
 # backlog, and the order things are needed in is decided by what a target
 # binary calls, not by what looks important here.
 #
-# total undefined:  935
+# still undefined: 943
 # helper_* of those: 765
-# already stubbed in sls-helper-stubs.c: 261
+# already stubbed in sls-helper-stubs.c: 0 (its 131 are TCG atomics,
+#   a disjoint family from the decoder's instruction-semantics helpers)
+#
+# translator_loop is NOT here: accel/tcg/translator.c supplies it, which
+# is the whole content of the 6.3 decision.
 
+
+QEMU_IS_ALIGNED
 abort
+cpu_ldb_code_mmu
+cpu_ldl_code_mmu
+cpu_ldq_code_mmu
+cpu_ldw_code_mmu
 gen_new_label
 gen_set_label
+get_page_addr_code_hostp
 helper_aaa
 helper_aad
 helper_aam
@@ -782,11 +794,16 @@ helper_xrstor
 helper_xsave
 helper_xsaveopt
 helper_xsetbv
+memcpy
 memset
 qemu_build_assert
 sls_abort
 sls_longjmp
 sls_setjmp
+target_page
+tb_lock_page1
+tb_unlock_page1
+tb_unlock_pages
 tcg_constant_i32
 tcg_constant_i64
 tcg_constant_ptr_int
@@ -814,6 +831,7 @@ tcg_gen_atomic_or_fetch_i64_chk
 tcg_gen_atomic_xchg_i64_chk
 tcg_gen_atomic_xor_fetch_i64_chk
 tcg_gen_brcond_i64
+tcg_gen_brcondi_i32
 tcg_gen_brcondi_i64
 tcg_gen_bswap32_i64
 tcg_gen_call1
@@ -923,10 +941,12 @@ tcg_gen_shri_i64
 tcg_gen_st16_i32
 tcg_gen_st16_i64
 tcg_gen_st32_i64
+tcg_gen_st8_i32
 tcg_gen_st8_i64
 tcg_gen_st_i128
 tcg_gen_st_i32
 tcg_gen_st_i64
+tcg_gen_sub_i32
 tcg_gen_sub_i64
 tcg_gen_subi_i64
 tcg_gen_umax_i64
@@ -942,10 +962,3 @@ tcg_temp_new_i32
 tcg_temp_new_i64
 tcg_temp_new_ptr
 tcg_temp_new_vec_matching
-translator_io_start
-translator_is_same_page
-translator_ldl_end
-translator_ldub
-translator_lduw_end
-translator_loop
-translator_use_goto_tb

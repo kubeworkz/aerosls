@@ -186,11 +186,48 @@ flag helpers plus a subset of the integer group — a far smaller number than 76
 and the reason 6.4 must be ordered by what a target binary calls rather than by
 working down the list.
 
-**Step 6.3 — Decide the execution loop.** Our `sls-launcher.c` loop and QEMU's
-`accel/tcg` translator loop are alternatives, and the kernel currently links
-neither `cpu-exec.c` nor `translate-all.c`. Either adapt our loop to drive
-`translator_loop`'s output, or adopt theirs.
-*Gate:* an explicit decision, recorded, with the reason.
+**Step 6.3 — Execution loop. ✅ DECIDED 2026-08-05.**
+
+> **We keep `sls-launcher.c`'s execution loop and TB management, and take
+> exactly one file from `accel/tcg`: `translator.c`.**
+
+`x86_translate_code()` (translate.c:3613) drives `i386_tr_ops` through
+`translator_loop()`, which lives in `accel/tcg/translator.c` — 522 lines. That
+is the only part of `accel/tcg` required. `sls-launcher.c` already does what
+`tb_gen_code()` would: it sets `tcg_ctx->gen_tb`, calls `tcg_gen_code()`, and
+threads `qemu_sls_tcache_reserve()` through the result.
+
+| | Ours + `translator.c` | Full `accel/tcg` |
+|---|---|---|
+| New code | **522 lines** | ~5,150 lines |
+| Pulls in `cputlb.c` | no | **yes — 2,902 lines** |
+| Persistent tcache | untouched | `translate-all.c` owns `tb_gen_code`, which it is built around |
+| softmmu=OFF | preserved | adopts what we removed |
+
+**The reason, and it is not primarily size.** `cputlb.c` *is* the software TLB —
+95 softmmu symbols, defines `tlb_flush`, `tlb_set_page`, `tlb_fill`. Eliminating
+it is the entire content of `tcg_use_softmmu false` and of the 5.41× result.
+Adopting the full loop would mean linking the thing this project exists to
+bypass. And `translate-all.c` owns `tb_gen_code()`, which is where our
+cross-reboot translation cache is integrated — the one feature verified working
+end to end this week.
+
+**Cost of the choice, stated honestly:** we stay diverged from upstream, so
+future QEMU updates need manual reconciliation in the launcher, and edge cases
+that `cpu-exec.c` handles from years of real guests are ours to discover. If
+Step 6.4 shows our loop's simplifications failing under real guest code, this
+decision is the one to revisit first.
+
+**Done as part of the decision:** `translator.c` compiles clean (3 shim gaps
+closed — `AccelState`, the `IcountDecr.u16` layout, and `target_disas`'s
+signature) and its object defines `translator_loop`, resolving the decoder's
+reference. Both objects are in the build behind `SLS_X86_FRONTEND=on`.
+
+One of those three is worth noting: our `icount_decr` stub had only the `u32`
+arm, but `translator.c:81` takes `offsetof(CPUState, neg.icount_decr.u16.low)`
+to emit the instruction-budget check into every block. A member that must exist
+*at the right offset*, in a struct generated code indexes into. It compiled
+everywhere else and would have failed exactly there.
 
 **Step 6.4 — Implement helpers, measured by a real binary.** Work the list from
 6.2, prioritised by what a `gcc -static -nostdlib` hello world actually calls.
