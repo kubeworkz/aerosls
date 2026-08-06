@@ -29,3 +29,21 @@ jobs:
 
       - name: Kernel syntax check (gcc -fsyntax-only, X86_C_SRC)
         run: bash tools/syntax_check_all.sh
+
+      # ─── The *_check.sh guards ──────────────────────────────────────────
+      # These were run by nothing until now: run_all.sh globs *_host_test.c,
+      # and these are shell scripts, so five guards sat in tests/ passing
+      # review and inspecting nothing. Each was written after the bug it
+      # catches had already cost a diagnostic round.
+      #
+      # Two of the five (makefile_sources, commands_doc) read only sources
+      # and run here. The other three need a linked kernel or its objects,
+      # and this runner has no x86_64-elf-gcc -- see the note at the top of
+      # this file -- so they exit 2 and are reported as SKIP with the reason
+      # printed. A skip is counted separately and never mistaken for a pass;
+      # read the step's output rather than just its green tick.
+      #
+      # Use --require-all on a build host, where the prerequisites must
+      # exist and "could not check" must not resemble "it is fine".
+      - name: Guard scripts (tests/*_check.sh)
+        run: bash tests/run_checks.sh
