@@ -67,9 +67,16 @@ static uint32_t hash_page(uint64_t page) {
            & (QEMU_TCACHE_PDIG_ENTRIES - 1);
 }
 
-/* FNV-1a over the bytes, with the length mixed in. Folding the length in means
- * a short read and a long read of the same prefix cannot collide, so the
- * comparison does not need a separate length field to be correct. */
+/* FNV-1a over the bytes, with the length mixed in.
+ *
+ * The length term is defence in depth, NOT the thing that makes a truncated
+ * read detectable -- an earlier comment here claimed it was, and mutation
+ * testing disproved that: removing the term leaves every assertion in
+ * tests/tcache_page_digest_host_test.c passing, because FNV over a prefix
+ * already differs from FNV over the full buffer. Kept because it costs one
+ * multiply and covers the case where a future change to the mixing makes
+ * prefix collisions reachable; described accurately so nobody relies on it
+ * for a property it does not currently provide. */
 static uint64_t digest_bytes(const uint8_t *p, uint32_t len) {
     uint64_t h = 1469598103934665603ULL;
     for (uint32_t i = 0; i < len; i++) {
