@@ -1934,6 +1934,49 @@ static int api_qemu_bench_post(const char* body, char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+// ─── POST /api/node/reboot ─────────────────────────────────────────────────
+// Resets this node's machine. See kernel/node_reset.c for the mechanism and
+// for why no checkpoint is taken.
+//
+// REQUIRES {"confirm":"reboot"} IN THE BODY. The bearer token already gates
+// this, but a token is carried by every request a page makes -- including ones
+// a browser retries on its own. A destructive action reachable at the same
+// trust level as GET /api/health wants something that cannot be sent by
+// accident, and a literal in the body cannot be.
+//
+// The client will usually see this request FAIL. That is expected: the reset
+// lands before the response finishes crossing the wire. A caller should treat
+// a dropped connection here as success and poll for the node coming back,
+// rather than reporting an error the operator then investigates.
+static int api_node_reboot_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    char confirm[16] = {0};
+    if (body) json_str(body, "confirm", confirm, sizeof(confirm));
+
+    if (strcmp(confirm, "reboot") != 0) {
+        jb_obj_open(&j, 0);
+        jb_str(&j, "error", "reboot requires {\"confirm\":\"reboot\"} in the body");
+        jb_putc(&j, ',');
+        jb_str(&j, "checkpointed", "false");
+        jb_putc(&j, ',');
+        jb_str(&j, "note", "nothing is checkpointed by this route -- run 'checkpoint' first if you want the state kept");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+
+    extern void sls_node_reset(void);
+    kernel_serial_printf(
+        "[HTTP] POST /api/node/reboot confirmed -- resetting node %u.\n",
+        cluster_local_node_id());
+    sls_node_reset();          /* does not return */
+
+    /* Unreachable. Present so the function has a defined shape if the reset
+     * ever fails to take -- node_reset halts in that case rather than
+     * returning, so this is belt and braces, not a real path. */
+    jb_obj_open(&j, 0);
+    jb_str(&j, "error", "reset did not take");
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_qemu_paging_post(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     // Passes only if the shadow walker resolved through the guest's OWN page
@@ -5295,6 +5338,11 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/paging")) {
             blen = api_qemu_paging_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // Destructive. Requires {"confirm":"reboot"}; see the handler.
+        if (!strcmp(path, "/api/node/reboot")) {
+            blen = api_node_reboot_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Gap Remediation Phase C: Vector Store HTTP reachability ────────────

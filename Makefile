@@ -145,7 +145,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               net/ollama_client.c \
               kernel/process.c arch/x86/user_paging.c \
               kernel/partition.c \
-              kernel/boot_params.c \
+              kernel/boot_params.c kernel/node_reset.c \
               kernel/console.c \
               kernel/loader.c \
               kernel/simi_x86.c \
