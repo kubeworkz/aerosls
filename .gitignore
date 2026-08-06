@@ -25,3 +25,7 @@ sls_storage_rv64.img
 # pid file. *.iso/*.img above already cover most of it; this catches the
 # whole directory including cluster.pids and node<i>.log.
 cluster/
+
+# Build-configuration stamps (see the SLS_SOFTMMU block in Makefile)
+.build-config.stamp
+.build-id.stamp

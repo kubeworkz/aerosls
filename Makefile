@@ -78,6 +78,51 @@ else ifneq ($(SLS_SOFTMMU),off)
 $(error SLS_SOFTMMU must be 'on' or 'off', got '$(SLS_SOFTMMU)')
 endif
 
+# ─── Rebuild when the CONFIGURATION changes, not only when sources do ────────
+# make compares source timestamps against object timestamps. It has no idea
+# that X86_CFLAGS or TCG_CFLAGS changed, so `make x86-iso SLS_SOFTMMU=on` over
+# an existing tree recompiled 2 files out of 121 and produced a kernel with
+# softmmu still OFF -- which then reported `softmmu=OFF` from a run that was
+# supposed to be the ON side of the A/B. A build flag that silently does
+# nothing is worse than no flag, because the output looks like a measurement.
+#
+# These stamps hold the current configuration. Objects depend on them, so
+# changing the configuration makes the affected objects out of date exactly
+# once. The stamp is only rewritten when the value actually differs, so a
+# no-op invocation does not trigger a rebuild.
+#
+# Two stamps, because they have different blast radii:
+#   AB_STAMP  -- SLS_SOFTMMU. Changes code generation everywhere; all objects.
+#   BID_STAMP -- AEROSLS_BUILD_ID. Only reaches objects that include
+#                kernel/qemu_sls_tcache.h, whose inline identity function
+#                embeds it. Scoped so a commit rebuilds six files, not 121.
+#
+# BID_STAMP is not optional politeness. qemu_tcache_identity() is what stops a
+# cache written by one build being executed by another, and it is derived from
+# AEROSLS_BUILD_ID at compile time. Without this, an incremental build after a
+# commit leaves qemu_sls_tcache.x86.o carrying the PREVIOUS commit's id: the
+# kernel then accepts a cache from a build whose generated code it no longer
+# entirely is. deploy.sh builds incrementally over a pulled tree, so that was
+# the live path, not a hypothetical one.
+AB_STAMP  := .build-config.stamp
+BID_STAMP := .build-id.stamp
+#
+# The `[ -f ... ] &&` is load-bearing. Without it, the default configuration
+# (SLS_SOFTMMU=off, so AB_DEFS is empty) compares an empty variable against
+# `cat` of a missing file -- which is also empty -- concludes nothing changed,
+# and never creates the stamp. make then fails with "No rule to make target
+# '.build-config.stamp'". Since clean removes the stamps, that broke
+# `make clean && make x86-iso` completely. Caught by a scratch-directory
+# reproduction of this exact logic, not by reading it.
+$(shell v='$(AB_DEFS)';  [ -f $(AB_STAMP) ]  && [ "$$(cat $(AB_STAMP))"  = "$$v" ] || printf '%s' "$$v" > $(AB_STAMP))
+$(shell v='$(AEROSLS_BUILD_ID)'; [ -f $(BID_STAMP) ] && [ "$$(cat $(BID_STAMP))" = "$$v" ] || printf '%s' "$$v" > $(BID_STAMP))
+
+# Objects whose translation unit pulls in the identity function.
+BUILD_ID_OBJS = kernel/checkpoint_mgr.x86.o kernel/kernel.x86.o \
+                kernel/qemu_sls_mmu.x86.o kernel/qemu_sls_pgo.x86.o \
+                kernel/qemu_sls_tcache.x86.o kernel/qemu_sls_vm.x86.o
+$(BUILD_ID_OBJS): $(BID_STAMP)
+
 X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
               -mno-sse -mno-sse2 -mno-mmx \
               -fno-pie -fno-pic -fno-tree-vectorize \
@@ -249,10 +294,10 @@ plugins: compiler/SLSAllocationPassV2.cpp
 %.x86.o: %.asm
 	$(ASN) -f elf64 $< -o $@
 
-%.x86.o: %.c
+%.x86.o: %.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) -c $< -o $@
 
-$(TCG_OBJS): tcg-objs/%.x86.o: %.c
+$(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
 
@@ -303,7 +348,16 @@ riscv-run: riscv-elf
 		-m 4G -smp 4 -nographic -serial stdio
 
 clean:
+	# `rm -f *.o` matched NOTHING: all 127 objects are built next to their
+	# sources (kernel/, net/, arch/x86/, drivers/, user/), none in the root.
+	# So clean removed tcg-objs and left every kernel object in place, and
+	# `make clean && make SLS_SOFTMMU=on` produced a MIXED kernel -- TCG
+	# codegen from the new flag, identity stamp and kernel code from the old
+	# one. A half-clean is worse than no clean, because it looks like a clean.
+	find . -name '*.x86.o' -not -path './.git/*' -delete
+	find . -name '*.rv.o'  -not -path './.git/*' -delete
 	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
+	rm -f $(AB_STAMP) $(BID_STAMP)
 	rm -rf tcg-objs
 
 # ── User-space programs ────────────────────────────────────────────────────────
