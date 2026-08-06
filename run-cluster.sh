@@ -430,7 +430,25 @@ fi
 mkdir -p "$CLUSTER_DIR"
 
 echo
-echo "==> Building the kernel once (make $X86_BIN)..."
+# ─── Say which kernel this is ──────────────────────────────────────────
+# This script rebuilds, so it decides what the cluster runs. It used to say
+# only "building the kernel" -- and after `make x86-iso SLS_SOFTMMU=on`, a
+# plain run here silently rebuilt the OFF kernel and the A/B measured the
+# wrong side. (Before the Makefile grew configuration stamps it was worse in
+# the other direction: this make was a no-op that left whatever was on disk,
+# so the cluster ran a kernel nobody had asked for either way.)
+#
+# SLS_SOFTMMU is honoured from the environment because the Makefile declares
+# it with ?=, so `SLS_SOFTMMU=on ./run-cluster.sh --nodes 4` builds the ON
+# side without this script needing an option of its own. What it does need is
+# to print the answer, so the configuration is never inferred from memory.
+SLS_SOFTMMU="${SLS_SOFTMMU:-off}"
+case "$SLS_SOFTMMU" in
+    on)  echo "==> Building the kernel once (make $X86_BIN)  [softmmu=ON -- QEMU software TLB, the A/B comparison side]" ;;
+    off) echo "==> Building the kernel once (make $X86_BIN)  [softmmu=off -- shadow PT, the shipping default]" ;;
+    *)   echo "error: SLS_SOFTMMU must be 'on' or 'off', got '$SLS_SOFTMMU'" >&2; exit 1 ;;
+esac
+export SLS_SOFTMMU
 make "$X86_BIN"
 
 # ─── Per-node ISO ──────────────────────────────────────────────────────
