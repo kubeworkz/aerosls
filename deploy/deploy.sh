@@ -192,6 +192,51 @@ CHECKED="$(find $SRC_ROOTS \( -name '*.c' -o -name '*.h' -o -name '*.inc' -o -na
 [ "$CHECKED" -gt 0 ] || { echo "[deploy] FAILED: found 0 source files to check. A check that examined nothing must not pass."; exit 1; }
 echo "[deploy] OK: $CHECKED source file(s) all older than $KERNEL_BIN."
 
+# ─── The *_check.sh guards, as a hard gate ─────────────────────────────────
+# Five guards live in tests/, each written after the bug it catches had
+# already happened and cost a diagnostic round:
+#
+#   stack_frame_budget_check.sh   a frame that does not fit the stack that
+#                                 exists -- 276 KB against 64 KiB, silent for
+#                                 months while it overwrote .bss
+#   kernel_image_end_check.sh     .bootstrap_stack orphaned above
+#                                 _kernel_image_end, so the frame allocator
+#                                 handed out live kernel stack
+#   no_tls_relocations_check.sh   TLS relocations in a kernel that has no TLS
+#   makefile_sources_check.sh     X86_C_SRC drifting from what is on disk
+#   commands_doc_check.sh         COMMANDS.md drifting from the real commands
+#
+# Until recently nothing ran them: tests/run_all.sh globs *_host_test.c and
+# these are shell scripts, so they passed review and inspected nothing.
+#
+# ─── Why here, and why --require-all ───────────────────────────────────────
+# Here, because it is after the build and after the staleness assertion above
+# -- so the linked kernel and its objects exist and the guards have something
+# real to read -- and before the pm2 restart, so a violation stops the deploy
+# instead of shipping. That is the same shape as every other failure in this
+# script: abort with the previous build still serving.
+#
+# --require-all, because on a build host a missing prerequisite is not a
+# neutral "nothing to check". The build just succeeded; if a guard cannot
+# find the binary or its objects, the build did not produce what it claimed
+# and that is itself the finding. "Could not check" must not resemble "it is
+# fine" on the path that puts code in front of users.
+#
+# Invoked via `bash` rather than executed directly: none of the eleven
+# tests/*.sh files carry a tracked exec bit (all 100644 in the index, because
+# development happens on a Windows checkout where the mode does not survive),
+# so a fresh clone on the server would give "Permission denied" here. CI calls
+# run_all.sh the same way for the same reason.
+echo "[deploy] Running guard scripts (tests/run_checks.sh --require-all)..."
+if ! bash tests/run_checks.sh --require-all; then
+    echo "[deploy] FAILED: a guard script failed against the build just produced."
+    echo "         Aborting -- kernel NOT restarted, still running the previous build."
+    echo "         These are not style checks. Each one exists because the property"
+    echo "         it asserts was violated in shipped code and cost a diagnostic"
+    echo "         round to find. Read the output above before overriding anything."
+    exit 1
+fi
+
 echo "[deploy] Restarting pm2 process '$PM2_APP_NAME'..."
 if ! pm2 restart "$PM2_APP_NAME"; then
     echo "[deploy] FAILED: pm2 restart failed. Check 'pm2 list' -- is PM2_APP_NAME=$PM2_APP_NAME the right process name?"
