@@ -171,8 +171,8 @@ recorded run.
 |---|---|---|
 | 86 bytes of host code per guest load (softmmu ON) | Cross-ISA §5b | Runtime. 9 samples, zero variance reported. |
 | 16 bytes per guest load (softmmu OFF) | Cross-ISA §5c | **RE-VERIFIED 2026-08-05** on `88003e7`: `CODE 8003 bytes → 16 bytes/load`, exact match. |
-| CODE 43,293 → 8,003 bytes, **5.41×** | Cross-ISA §5c | **Half re-verified.** The OFF term (8,003) reproduces exactly. The ON term was not re-run, so the *ratio* is not re-derived — that needs a softmmu=ON build. |
-| EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | Runtime, ±7% from CV 15.3%, n=5. 2026-08-05 cold EXEC was 5,939 cyc/load vs §5c's 6,774 — a −12.3% move, inside the reported CV. Consistent. |
+| CODE 43,293 → 8,003 bytes, **5.41×** | Cross-ISA §5c | **FULLY RE-VERIFIED 2026-08-05** at `bebbc6e421df`. Both sides re-run from one flag apart: 43,293 and 8,003, ratio 5.4096×, all four figures bit-identical to 2026-08-04. See §3d. |
+| EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | **DID NOT REPRODUCE.** 2026-08-05 A/B gave exec_ratio 6.12× and excess **1.13×**, below §5c's own 1.30–1.50 range. n=1 per side against §5c's n=5, so not a refutation — but unreproduced, and not quotable until re-run at n=5. See §3d. |
 | Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
 | Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
 | Translation cache survives reboot | Phase2 | **YES — verified end to end, 2026-08-05.** First launch after a reboot: no `flush_page`, `TCACHE 8 hit / 0 miss`, `TRANSLATE` 0 cycles / 0 blocks, `CODE` 0 bytes, arena 1,056 B against 1,508,448 B cold. Fixed in `551d9db` + `8fc55f2`; evidence in §3c. |
@@ -525,6 +525,60 @@ correct refusal that once again looks identical to failure.
 
 ---
 
+## 3d. The softmmu A/B — COMPLETE, both sides reproducible
+
+**2026-08-05, node 2, commit `bebbc6e421df`.** Both sides built from identical
+sources, one documented flag apart (`SLS_SOFTMMU=on|off`), first launch after
+boot so translation actually runs.
+
+| | softmmu ON | softmmu OFF | ratio | §5c, 2026-08-04 |
+|---|---|---|---|---|
+| **`CODE` bytes emitted** | **43,293** | **8,003** | **5.4096×** | 5.41× ✓ |
+| **bytes per guest load** | **86** | **16** | **5.375×** | 5.4× ✓ |
+| instructions executed | 502 | 502 | — | 502 ✓ |
+
+**All four numbers are bit-identical to the measurement taken a week earlier**,
+across many commits, a Makefile rebuilt from scratch twice, and the
+configuration-stamp and clean fixes. `CODE` has now never varied in any sample
+this project has taken.
+
+This is the first time the headline ratio rests on two builds that can be
+reproduced on demand. Until `SLS_FORCE_SOFTMMU` existed the ON side required
+hand-editing `tcg-internal.h`, so half the published figure came from a build
+nobody could recreate.
+
+### The `~1.4× real work` claim did NOT reproduce
+
+§5c's more attractive claim — that beyond the code-size reduction a further
+1.3–1.5× of genuine execution work is eliminated — does not hold at this
+sample size:
+
+```
+code_ratio = 43,293 / 8,003  = 5.41x     (exact, zero variance)
+exec_ratio = 45,470 / 7,426  = 6.12x     (n=1 per side)
+excess     = 6.12 / 5.41     = 1.13x     (5c reported ~1.40x, range 1.30-1.50)
+```
+
+1.13× is **below** §5c's stated range. That is not a refutation — §5c used five
+runs per side and `EXEC` carries a cold CV of ~10% on this host, so a single
+sample each cannot settle it. But it does mean the excess figure is currently
+**unreproduced**, and it must not be quoted until it has had the same n=5
+treatment §5b gave the ON baseline.
+
+The asymmetry is worth stating plainly: the metric with zero variance
+reproduced to the digit; the metric derived from cycle counts did not. That is
+the third independent confirmation of §5b's original conclusion.
+
+### Also confirmed on the ON build
+
+`TCACHE 8 hit(s), 0 miss(es)` on the warm relaunch, `TRANSLATE 0`. The
+persistent cache works on the ON side too, and its identity stamp differs from
+the OFF build's — so the two configurations cannot contaminate each other's
+caches, which is what the softmmu term in `qemu_tcache_identity_of()` was added
+to guarantee.
+
+---
+
 ## 4. Cannot be verified here — needs hardware
 
 | Claim | Blocker |
@@ -540,10 +594,24 @@ correct refusal that once again looks identical to failure.
 **Defensible, with the method attached:**
 
 > Eliminating QEMU's software MMU reduces the host code emitted for a guest
-> memory access by 5.4× — from 86 bytes to 16 — measured on AeroSLS, bit-identical
-> across nine samples spanning five boots and three builds. On that host a further
-> ~1.4× of genuine execution work is eliminated beyond what the code-size
-> reduction alone accounts for.
+> memory access by **5.41×** — from 86 bytes to 16. Measured on AeroSLS at
+> commit `bebbc6e421df`, both sides built from identical sources one build flag
+> apart (`SLS_SOFTMMU=on|off`), reproducible on demand. Bit-identical to the
+> same measurement taken a week and many commits earlier; `CODE` has never
+> varied in any sample this project has taken.
+
+**Also defensible, and a better fit for constrained hardware:**
+
+> Across a reboot, translation does not merely get faster — it does not happen.
+> Zero blocks compiled, zero bytes emitted, all translation blocks served from a
+> cache restored from NVMe, and the 1.5 MB of arena a cold launch consumes is
+> never allocated: 1,056 bytes across 4 calls, against 1,508,448 across 13.
+
+**No longer claimable — withdrawn 2026-08-05:** the "~1.4× of genuine execution
+work eliminated beyond the code-size reduction." It came out at 1.13×, below
+§5c's own 1.30–1.50 range, on a single sample per side. See §3d. Needs n=5 per
+side before it can be used, and until then it is unreproduced rather than
+merely unverified.
 
 **Structurally true and the strongest framing available** (Cross-ISA §10):
 
