@@ -1872,6 +1872,7 @@ extern uint64_t sls_last_code_bytes;
 extern uint32_t sls_last_tb_count;
 extern uint32_t sls_last_tcache_hits;
 extern uint32_t sls_last_tcache_misses;
+extern uint64_t sls_last_arena_consumed;
 
 static int api_qemu_bench_post(const char* body, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
@@ -1897,11 +1898,9 @@ static int api_qemu_bench_post(const char* body, char* buf, int max) {
         jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
     }
 
-    uint64_t arena_before = sls_heap_used();
     uint64_t cycles = 0;
     uint32_t insns  = 0;
     int rc = sls_bench_load_path(loads, &cycles, &insns);
-    uint64_t arena_after = sls_heap_used();
 
     jb_obj_open(&j, 0);
     jb_str(&j, "ok", rc < 0 ? "false" : "true");                       jb_putc(&j, ',');
@@ -1919,8 +1918,14 @@ static int api_qemu_bench_post(const char* body, char* buf, int max) {
     // Same test the console uses to print "cold: every block was compiled".
     // Derived here so the UI does not re-implement the rule and drift from it.
     jb_str(&j, "cold", sls_last_tcache_hits == 0 ? "true" : "false");  jb_putc(&j, ',');
-    jb_uint(&j, "arena_consumed",   arena_after - arena_before);       jb_putc(&j, ',');
-    jb_uint(&j, "arena_used",       arena_after);                      jb_putc(&j, ',');
+    // Read, not sampled. A first version bracketed the call with
+    // sls_heap_used() and reported 1,508,448 where the console said 1,507,392
+    // for the same run: heap_before inside the bench is captured AFTER
+    // sls_launcher_init() allocates, so an external sampler also counts the
+    // one-time init. It was only wrong on the first bench of a boot, which is
+    // the worst kind of wrong -- every retest agreed.
+    jb_uint(&j, "arena_consumed",   sls_last_arena_consumed);          jb_putc(&j, ',');
+    jb_uint(&j, "arena_used",       sls_heap_used());                  jb_putc(&j, ',');
     jb_uint(&j, "arena_total",      sls_heap_total());                 jb_putc(&j, ',');
     // Which side of the A/B produced these numbers. Without it a caller can
     // compare an ON run against an OFF run and see a 5.4x "improvement" that is
