@@ -139,10 +139,52 @@ from one hole: 92 → 4 (the `OBJECT_DECLARE_CPU_TYPE` macro) → 276 (real surf
 revealed) → 8 (`COMPILING_PER_TARGET` + typedefs) → 0. At no point was the
 number an estimate of remaining work.
 
-**Step 6.2 — Link it.** Add the objects to `TCG_OBJS` and resolve what the
-linker reports missing. Expect a long list of `helper_*` symbols; that list IS
-the Step 6.4 work item, so capture it verbatim rather than summarising it.
-*Gate:* the kernel links, and the missing-symbol list is written down.
+**Step 6.2 — Wire it into the build and capture the work list. ✅ DONE
+2026-08-05.** The symbol list is captured verbatim in
+`docs/step6/undefined-symbols.txt` (935 entries). The kernel does **not** link
+yet and cannot until 6.4, so the build integration is behind a flag:
+
+```
+make x86-iso                      # unchanged, our 18-opcode frontend
+make x86-iso SLS_X86_FRONTEND=on  # QEMU's decoder; will not link yet
+```
+
+Off by default so `deploy.sh` is untouched. Verified: the default build never
+mentions the new object, `=on` adds it, `COMPILING_PER_TARGET` lands on exactly
+one compile line (`translate.c`) and not on the generic TCG core, and an
+invalid value is a hard error.
+
+The object is built by an **explicit-path rule, not VPATH**. There are 20+
+files named `translate.c` in the QEMU tree, one per guest architecture;
+resolving through VPATH and a `%`-stem would make which decoder we compile
+depend on VPATH search order, so adding an unrelated directory later could
+silently swap in another architecture's frontend and still build clean. The
+object is named `i386-translate` so the target is visible in the build log.
+
+### What the 765 actually are
+
+**None of them are already stubbed.** `sls-helper-stubs.c` defines 131 helper
+names and the overlap with the decoder's 765 is **zero** — not an artifact.
+The existing stubs are TCG's *atomic memory* helpers (`helper_atomic_add_fetchb`
+…); the decoder wants *x86 instruction semantics* (`helper_aaa`,
+`helper_addpd_xmm`, `helper_sha1rnds4`). Two unrelated families.
+
+Approximate breakdown by category (regex-classified, so treat as indicative —
+some scalar SSE lands in "other"):
+
+| Category | Count | Share |
+|---|---|---|
+| Vector — SSE/AVX/MMX | 507 | 66% |
+| x87 FPU | 59 | 7% |
+| Flags | 5 | <1% |
+| Other — integer, system, string | 194 | 25% |
+
+**Roughly three quarters is vector and FPU long tail** that a
+`gcc -static -nostdlib` binary never executes, and for which a stub that halts
+loudly is a correct answer. The critical path for a first running binary is the
+flag helpers plus a subset of the integer group — a far smaller number than 765,
+and the reason 6.4 must be ordered by what a target binary calls rather than by
+working down the list.
 
 **Step 6.3 — Decide the execution loop.** Our `sls-launcher.c` loop and QEMU's
 `accel/tcg` translator loop are alternatives, and the kernel currently links

@@ -311,6 +311,39 @@ $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
 
+# ─── Step 6.2: QEMU's own x86-64 guest frontend ──────────────────────────────
+# docs/AeroSLS-QEMU-SLS-Step6-x86-Frontend-Plan-v0.1.md.
+#
+# OFF BY DEFAULT, and it must stay that way until Step 6.4. translate.c
+# references 765 helper_* symbols against sls-helper-stubs.c's ~130, so linking
+# it today fails. Gating it keeps the default build -- and therefore deploy.sh
+# -- exactly as it was, while the work proceeds behind a flag:
+#
+#   make x86-iso                        # unchanged, our 18-opcode frontend
+#   make x86-iso SLS_X86_FRONTEND=on    # QEMU's decoder; will not link yet
+#
+# EXPLICIT PATH, NOT VPATH, and deliberately so. There are 20+ files named
+# translate.c in the QEMU tree, one per guest architecture. Resolving this
+# through VPATH and a %-stem would make the decoder we compile depend on VPATH
+# search order, so adding an unrelated directory later could silently swap in
+# another architecture's frontend and still build. The object is named
+# i386-translate to keep that visible in the build log and in tcg-objs/.
+#
+# COMPILING_PER_TARGET goes ONLY here. It gates the helper 'tl' plumbing in
+# exec/helper-head.h.inc, which is meaningful only for per-target files;
+# defining it globally would apply a guest-word-size assumption to the
+# generic TCG core, where it has no business.
+SLS_X86_FRONTEND ?= off
+ifeq ($(SLS_X86_FRONTEND),on)
+TARGET_OBJS = tcg-objs/i386-translate.x86.o
+else ifneq ($(SLS_X86_FRONTEND),off)
+$(error SLS_X86_FRONTEND must be 'on' or 'off', got '$(SLS_X86_FRONTEND)')
+endif
+
+tcg-objs/i386-translate.x86.o: ../qemu/target/i386/tcg/translate.c $(AB_STAMP)
+	@mkdir -p tcg-objs
+	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
+
 arch/x86/trampoline.o: arch/x86/trampoline.asm
 	$(ASN) -f bin $< -o arch/x86/trampoline.bin
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
@@ -318,8 +351,8 @@ arch/x86/trampoline.o: arch/x86/trampoline.asm
 		--redefine-sym _binary_arch_x86_trampoline_bin_end=trampoline_end \
 		arch/x86/trampoline.bin arch/x86/trampoline.o
 
-$(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS)
-	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) -o $(X86_BIN)
+$(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS)
+	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) -o $(X86_BIN)
 
 x86-iso: $(X86_BIN)
 	mkdir -p isodir/boot/grub
