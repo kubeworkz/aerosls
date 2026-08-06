@@ -504,12 +504,34 @@ outcome was writing down what each possible result would mean *before* running
 it, so that a confirming result could not be quietly reinterpreted from a
 disconfirming one.
 
-### Minor, noted in passing
+### The 8051-vs-8003 gap — EXPLAINED 2026-08-05
 
-`synced: 8 TBs, **8051** code bytes` against `CODE **8003** bytes emitted` — a
-48-byte difference between `qemu_sls_codebuf_used` and the bench's emitted
-count. Probably prologue or alignment, but it is unexplained and both numbers
-are supposed to describe the same code.
+`synced: 8 TBs, **8051** code bytes` against `CODE **8003** bytes emitted`.
+Both numbers are correct; they measure different things, and neither is a bug.
+
+| | Source | Counts |
+|---|---|---|
+| `CODE` **8003** | `sls_last_code_bytes`, `sls-launcher.c:885` | sum of raw `gen_bytes` per block — what TCG actually emitted |
+| `synced` **8051** | `qemu_sls_codebuf_used`, `qemu_sls_tcache.c:389` | high-water mark in the code buffer, **including alignment gaps** |
+
+Blocks are placed 16-byte aligned (`qemu_sls_tcache.c:355`,
+`off = (used + 15) & ~15`) because generated blocks are entered by an indirect
+call and a misaligned entry costs a fetch penalty on every execution for the
+life of the cache. Eight blocks means seven inter-block boundaries:
+
+```
+8051 - 8003 = 48 bytes over 7 boundaries = 6.86 avg
+expected mean for 16-byte alignment on arbitrary sizes ≈ 7.5
+```
+
+Consistent, and deterministic — block sizes never vary, so the padding never
+varies either, which is why both figures have been stable across every boot.
+
+**Why this matters beyond curiosity:** it confirms `CODE` is the right metric
+for the A/B and `codebuf_used` is not. `CODE` is pure code generation.
+`codebuf_used` folds in an allocation policy, so it would move if someone
+changed the alignment without a single byte of generated code changing. A
+ratio built on it would be measuring the allocator.
 
 ### The correct sequence
 

@@ -495,7 +495,21 @@ void qemu_sls_tcache_sync(void) {
     }
 
     nvme_flush_sync();
+    /* "code bytes" here is qemu_sls_codebuf_used -- the high-water mark in the
+     * buffer, which INCLUDES the 16-byte alignment padding between blocks. It
+     * is deliberately not the same number as the bench's CODE figure, which
+     * sums raw gen_bytes per block and is pure code generation.
+     *
+     * On the standard 8-block bench they read 8051 and 8003: 48 bytes across 7
+     * inter-block boundaries, ~6.9 each, against ~7.5 expected for 16-byte
+     * alignment on arbitrary sizes. Both are deterministic because the block
+     * sizes are.
+     *
+     * The distinction matters for the A/B: CODE is the metric to quote, since
+     * codebuf_used folds in an allocation policy and would move if the
+     * alignment changed without a byte of generated code changing. */
     kernel_serial_printf(
-        "[QEMU-SLS TCACHE] synced: %u TBs, %u code bytes\n",
+        "[QEMU-SLS TCACHE] synced: %u TBs, %u code bytes (buffer high-water, "
+        "includes inter-block alignment; not the bench's CODE figure)\n",
         tb_count, qemu_sls_codebuf_used);
 }
