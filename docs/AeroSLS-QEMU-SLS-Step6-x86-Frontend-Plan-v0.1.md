@@ -108,11 +108,36 @@ while rebuilding two files of 121. A green compile is the same class of signal.
 
 Each step has a gate that is a measurement, not an opinion.
 
-**Step 6.1 — Target shim.** Create `sls/sls-target-i386.h` providing
-`CPUX86State`, the decoder's enums/constants, and opaque declarations for the
-QOM and device types. Wire `TARGET_LONG_BITS=64` and the helper `tl` plumbing.
-*Gate:* `translate.c` and `decode-new.c.inc` compile to objects with zero
-errors, using the real build's flags, not the Phase 0 makefile's.
+**Step 6.1 — Target shim. ✅ DONE 2026-08-05. Gate met.**
+
+`target/i386/tcg/translate.c` now compiles to a **701,888-byte object with 919
+functions**, zero errors, using the real build's flags. The existing TCG core
+compiles with zero errors throughout — checked after every edit, not at the
+end.
+
+It did not need a new `sls-target-i386.h`. The blockers were all in headers the
+shim *already shadows*, so the work was thickening four of them:
+
+| File | Change |
+|---|---|
+| `sls/include/qom/object.h` | the `OBJECT_DECLARE_*` family, emitting typedefs only |
+| `sls/include/hw/core/cpu.h` | pull in `qom/object.h`; add `enum CacheType`, `TranslateForDebugResult`, `CPUState::cc` |
+| `sls/include/qemu/typedefs.h` | ~12 QOM/device types; `Notifier`/`CPUClass`/`ResettablePhases` complete because `cpu.h` embeds them by value |
+| `sls/include/qapi/qapi-types-machine-common.h` | new — stubs a QAPI-generated header |
+
+Plus two build flags, both upstream's own mechanism rather than invention:
+`-DTARGET_LONG_BITS=64` (added to `QEMU_DEFS`) and `-DCOMPILING_PER_TARGET`,
+which is what gates the helper `tl` plumbing in `helper-head.h.inc`.
+
+**Two mistakes worth recording**, both the same mistake: stub definitions of
+`MemTxAttrs` and `TCGCPUOps` collided with the real headers, which the include
+graph already reaches. The shim's job is to fill holes, never to duplicate a
+header that resolves — every duplicate is a second definition free to drift.
+
+**The error counts along the way were almost all cascade**, and each drop came
+from one hole: 92 → 4 (the `OBJECT_DECLARE_CPU_TYPE` macro) → 276 (real surface
+revealed) → 8 (`COMPILING_PER_TARGET` + typedefs) → 0. At no point was the
+number an estimate of remaining work.
 
 **Step 6.2 — Link it.** Add the objects to `TCG_OBJS` and resolve what the
 linker reports missing. Expect a long list of `helper_*` symbols; that list IS
@@ -141,8 +166,25 @@ deliberately as a fast path with that stated in its header.
 
 ## 4. Risks and honest unknowns
 
-**The helper surface is unmeasured.** §2. Everything about schedule beyond Step
-6.2 is guesswork until that list exists.
+**The helper surface — now measured, and it is the project.** §2 said this was
+unknown. Step 6.1's object answers it:
+
+```
+nm -u translate.o | grep -c helper_     ->  765
+nm -u translate.o | wc -l               ->  935
+```
+
+**765 undefined `helper_*` symbols.** Against `sls/sls-helper-stubs.c`'s ~130
+stubs that announce their name and halt. That gap is Step 6.4, and it is the
+first honest measure of it anyone has had.
+
+Not all 765 need real implementations to run a first binary — many are SSE,
+FPU and MMX that a simple static binary never touches, and a stub that halts
+loudly is a correct answer for an instruction the guest never executes. But the
+flag-computation helpers alone (`helper_cc_compute_all` and friends) are on the
+path of essentially every compiled instruction, and nothing runs until they are
+real. Step 6.4 should be ordered by what a target binary actually calls, not by
+walking the list.
 
 **`cpu.h` may resist cutting down.** The spike stubbed types away to see past
 them; a real shim must satisfy every *use*, not merely every mention. If

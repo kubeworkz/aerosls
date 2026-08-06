@@ -211,8 +211,19 @@ X86_ISO     = sls_operating_system.iso
 # --- QEMU-SLS TCG Integration (Steps 2+) ---
 QEMU_INC  = -I ../qemu/sls/include -I ../qemu/sls -I ../qemu/include \
             -I ../qemu/tcg -I ../qemu/tcg/x86_64 -I ../qemu/accel/tcg
+# TARGET_LONG_BITS: the guest's word size, 64 for our x86-64 guest. Set here
+# rather than in a header because that is upstream's own mechanism --
+# include/exec/target_long.h says "the build-system must ensure
+# TARGET_LONG_BITS is defined directly" and #errors out otherwise. QEMU's meson
+# sets it per target; we have exactly one guest target, so it is a constant.
+#
+# Step 6.1 (docs/AeroSLS-QEMU-SLS-Step6-x86-Frontend-Plan-v0.1.md): required
+# before target/i386/tcg/translate.c will parse. Harmless to the existing TCG
+# core objects, which is asserted rather than assumed -- they compile with 0
+# errors either side of this change.
 QEMU_DEFS = -include ../qemu/sls/sls-osdep.h \
-            -DSLS_IN_KERNEL=1 -UCONFIG_PLUGIN -DCONFIG_TCG
+            -DSLS_IN_KERNEL=1 -UCONFIG_PLUGIN -DCONFIG_TCG \
+            -DTARGET_LONG_BITS=64
 QEMU_WARN = -Wno-unused-parameter -Wno-unused-function \
             -Wno-unused-variable -Wno-unused-but-set-variable
 TCG_CFLAGS = -ffreestanding -O2 -mcmodel=small -mno-red-zone \
