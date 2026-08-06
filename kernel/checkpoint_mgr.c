@@ -170,6 +170,25 @@ int checkpoint_trigger(void) {
      * never once been produced. The restore path had nothing to restore, and
      * looked exactly like a restore path that did not work.
      *
+     * ─── Only ONE of those two was fixed, deliberately ────────────────────
+     * The call below wires qemu_sls_tcache_sync(). qemu_sls_snapshot_save()
+     * is still called from nowhere, and this paragraph read as though both
+     * had been dealt with -- which is how it was described in a later
+     * session and taken at face value.
+     *
+     * Wiring it would be the wrong fix rather than a missing one. Its
+     * counterpart qemu_sls_snapshot_restore() also has zero callers, and
+     * nothing could consume a restored guest state: the launcher's only
+     * entry point is sls_launch_guest(image, len, entry_gpa, max_insns),
+     * which loads an image and runs from a GPA. There is no resume path. So
+     * calling save() here would persist guest registers that nothing ever
+     * reads, and write-only data is wrong by the time someone finally
+     * depends on it -- no reader means nothing ever proved it was right.
+     *
+     * See kernel/qemu_sls_vm.h, which now says the same thing at the
+     * declarations. The Phase 4 design stands; it is waiting on a resume
+     * path, not on this line.
+     *
      * Deliberately outside the dirty-region mask above: those regions are
      * tracked by explicit checkpoint_mark_dirty() calls, and the tcache has
      * none. Syncing unconditionally is a bounded cost (a few MiB of NVMe on an

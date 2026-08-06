@@ -25,12 +25,25 @@ int qemu_sls_snapshot_exists(void) {
 
 void qemu_sls_vm_init(void) {
     if (qemu_sls_snapshot_exists()) {
-        /* vm_snap_buf is now populated by the NVMe read above. */
+        /* vm_snap_buf is now populated by the NVMe read above.
+         *
+         * Reaching here would be genuinely surprising: qemu_sls_snapshot_save()
+         * has no callers, so nothing writes LBA 20000. A valid magic here means
+         * either that a writer was added without updating this note, or that
+         * something else is writing into the VM-state LBA -- and the second
+         * would be worth chasing immediately. */
         kernel_serial_printf(
-            "[QEMU-SLS VM] snapshot found: seq=%llu rip=0x%016lx\n",
+            "[QEMU-SLS VM] snapshot found: seq=%llu rip=0x%016lx\n"
+            "[QEMU-SLS VM] NOTE: nothing in this tree calls "
+            "qemu_sls_snapshot_save(). Investigate what wrote LBA 20000.\n",
             (unsigned long long)vm_snap_buf.sequence, vm_snap_buf.rip);
     } else {
-        kernel_serial_print("[QEMU-SLS VM] no snapshot (cold start)\n");
+        /* The only outcome this line has ever had. Says why, so it is not
+         * mistaken for a report about a subsystem that is doing something --
+         * see the status note in qemu_sls_vm.h. */
+        kernel_serial_print(
+            "[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers "
+            "(scaffolding, awaiting a launcher resume path)\n");
     }
 }
 

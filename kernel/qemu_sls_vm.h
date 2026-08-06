@@ -43,7 +43,39 @@ typedef struct {
     uint8_t  _pad[4096 - 224];
 } QemuVMState;
 
-/* One-time boot check; logs whether a valid snapshot exists on NVMe. */
+/* ─── STATUS: Phase 4 scaffolding. Nothing calls save or restore. ───────────
+ * Verified 2026-08-05:
+ *
+ *   qemu_sls_snapshot_save()      0 callers
+ *   qemu_sls_snapshot_restore()   0 callers
+ *   qemu_sls_snapshot_exists()    1, inside qemu_sls_vm_init(), which logs
+ *   qemu_sls_vm_init()            1, kernel.c, at boot
+ *
+ * So LBA 20000 has never been written, and the boot line below can only ever
+ * say "no snapshot (cold start)". It has said that on every boot this project
+ * has done, while reading like a status report on something real.
+ *
+ * This is recorded rather than fixed, because wiring save() is the wrong
+ * repair. restore() has no callers either, and nothing could use a restored
+ * state: the launcher's only entry point is sls_launch_guest(image, len,
+ * entry_gpa, max_insns) -- load an image, run from a GPA. There is no resume
+ * path to hand registers to. Persisting guest state now would create data
+ * with no reader, which nothing validates and which will be wrong the first
+ * time it is trusted.
+ *
+ * What this API is waiting on is a launcher entry point that resumes from
+ * saved registers. When that exists, save() and restore() get wired together
+ * and tested together, which is the only way either gets proven. Until then
+ * the declarations below describe an intended design, not a working one, and
+ * should not be read as available infrastructure.
+ *
+ * QemuVMState.tcache_codebuf_used is doubly dead: written by nothing, read by
+ * nothing, and duplicating saved_code_used which the tcache header already
+ * persists at its own offset 12.
+ */
+
+/* One-time boot check; logs whether a valid snapshot exists on NVMe.
+ * See the status note above: with no writer, this always reports cold start. */
 void qemu_sls_vm_init(void);
 
 /*
