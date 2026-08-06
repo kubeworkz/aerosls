@@ -229,10 +229,52 @@ to emit the instruction-budget check into every block. A member that must exist
 *at the right offset*, in a struct generated code indexes into. It compiled
 everywhere else and would have failed exactly there.
 
-**Step 6.4 — Implement helpers, measured by a real binary.** Work the list from
-6.2, prioritised by what a `gcc -static -nostdlib` hello world actually calls.
-*Gate:* that binary runs to completion. Then widen: a static busybox applet is
-the honest next rung.
+**Step 6.4 — Implement helpers, measured by a real binary.** *In progress.*
+
+**First milestone reached 2026-08-05: every QEMU-side symbol resolves.** The
+unresolved list went from 943 to 24, and all 24 are AeroSLS kernel functions or
+libc that the kernel objects supply — each checked against `kernel/` and found.
+Zero `helper_*`, zero code-fetch.
+
+Two new files did it:
+
+`sls-i386-helper-stubs.c` defines all **765** helpers, each halting with its own
+name. It is not a generated *list* — it expands `target/i386/helper.h` through
+QEMU's own `DEF_HELPER` machinery, exactly as `helper-proto.h.inc` does for
+prototypes. So every stub carries the real signature and tracks upstream
+automatically; there is nothing here to go stale. 764 came out of `helper.h`
+directly and the 765th, `helper_info_memset`, is metadata already supplied by
+`tcg-runtime-gvec`.
+
+`sls-i386-codefetch.c` supplies guest instruction fetch — `cpu_ld{b,w,l,q}_code_mmu`
+and `get_page_addr_code_hostp`. Upstream has these only in `cputlb.c` (the soft
+MMU we exclude) or `user-exec.c` (1,271 lines of qemu-user process model:
+`mmap_lock`, `TaskState`, signal-based faults). Ours reads straight through the
+GPA window, which **is** what softmmu=OFF means, at the fetch path rather than
+the data path. It refuses loudly if the guest has paging enabled, since that
+needs the shadow walk and returning the wrong bytes would decode as plausible
+instructions and fail far from the cause.
+
+It also supplies `tb_lock_page1`/`tb_unlock_page1`/`tb_unlock_pages` as no-ops.
+They exist upstream to stop concurrent translation of a guest page; translation
+here runs on the BSP one block at a time and there is no `PageDesc` tree to
+protect. That is a simplification following from 6.3 and is flagged in place as
+the first thing to revisit if guest code misbehaves.
+
+**Two bugs the decoder found in the existing shim**, both worth recording:
+
+- `QEMU_IS_ALIGNED` is a *macro* in the real `qemu/osdep.h`, which our shim
+  shadows. Missing, it did not fail the compile — `translator.c:344` turned it
+  into an implicit function call that compiled and only failed at link. **A
+  missing macro degrades into a plausible function**, which is worse than a
+  missing header.
+- `abort()` is called directly by `translate.c`; the shim had `sls_abort()` but
+  not the standard spelling.
+
+*Remaining gate, unchanged:* a `gcc -static -nostdlib` binary runs to
+completion. **The work list is no longer a file.** It is whatever helper a
+running guest halts on first — launch, read the name, implement it, repeat.
+Ordering by anything else is guessing at what a guest executes.
 
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
