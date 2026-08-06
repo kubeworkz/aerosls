@@ -5,13 +5,31 @@ did not cause it.**
 
 ---
 
-## 0. Symptom, as reported
+## 0. Symptom
 
 Successive `qemu bench` runs behave correctly — the first compiles, the second
-is served from the translation cache. **After one `qemu paging`, every
-subsequent benchmark comes back cold**, indefinitely, for the rest of the boot.
+is served from the translation cache.
 
-That is the visible part. It is not the important part.
+**After one `qemu paging`, the next benchmark hangs the node.** The launch does
+not return, the kernel's HTTP server stops answering, and every endpoint returns
+502 through the proxy.
+
+### Severity was revised upward, and how
+
+First reported as "benchmarks come back cold after the paging test", and that
+was written up here as the symptom. It was the *mild presentation*: a node that
+had already been restarted underneath by pm2, so each bench was a genuine first
+run after boot.
+
+Watching it again with the console open showed the real behaviour — `Failed to
+fetch` on the benchmark, 45 console errors, and 502 Bad Gateway on every polled
+endpoint (`/api/tiers`, `/api/objects`, `/api/wal`, `/api/metrics`,
+`/api/services`, `/api/health`, `/api/security/audit`). A 502 means the proxy
+could not reach the kernel at all.
+
+This document previously said the benchmark was "running in the wrong address
+space and getting away with it because its access pattern is simple". **That was
+wrong.** It does not get away with it. It takes the node down.
 
 ---
 
@@ -87,15 +105,29 @@ mappings for frames already held**, which is exactly what a reset needs.
 
 ---
 
-## 3. Mitigation until it is fixed
+## 3. Guards in place
 
-**After running guest paging, restart the node before trusting any subsequent
-guest run.** Nothing enforces this today and nothing says it on the console.
+**After running guest paging, the node must be restarted before any further
+guest run.**
 
-The Guest Runtime screen now disables its paging button after one run per page
-load and says why, so the UI cannot walk a user into the broken state
-repeatedly. That is a guard, not a fix: the shell command and the HTTP route
-are both still reachable and still leave the node in this state.
+Three guards, none of them the fix:
+
+**`sls_launch_guest()` refuses when `qemu_sls_guest_paging_on` is set.** This is
+the important one — it converts an unrecoverable node hang into a returned error
+and a message naming the cause. It costs one comparison and covers every caller:
+the shell command, the HTTP route, and the bench. The refusal is placed *after*
+the `sls_last_*` counter resets, so a refused launch reports zeros rather than
+the previous successful run's figures beside `ok:false`.
+
+**`sls_test_guest_paging()` prints what it did** on its PASS path, since the
+console had no way to know the node was now unusable.
+
+**The Guest Runtime screen disables both buttons** after a paging run and
+explains the state, so it cannot walk someone into the refusal.
+
+All three are guards. The shell command and HTTP route still enable paging and
+still leave the node needing a restart; they just no longer take it down
+silently.
 
 ---
 
