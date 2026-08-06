@@ -1902,8 +1902,43 @@ static int api_qemu_bench_post(const char* body, char* buf, int max) {
     uint32_t insns  = 0;
     int rc = sls_bench_load_path(loads, &cycles, &insns);
 
+    // ─── A refused run must SAY it was refused ─────────────────────────────
+    // The launcher explains itself on the serial console. An HTTP caller never
+    // sees that, so without this the response was ok:"false" and nothing else
+    // -- the exact failure the `loads` range check above was written to avoid,
+    // repeated one branch further down.
+    //
+    // The timing and derived fields are dropped too. A refused launch was
+    // measured at 37,000,684 total_cycles (the launcher-init cost, bracketed by
+    // the bench's own rdtsc) and reported cold:"true", because `cold` is
+    // derived from tcache_hits == 0 and no run means no hits. Both look like
+    // measurements of something. Neither is.
+    if (rc < 0) {
+        extern int qemu_sls_guest_paging_on;
+        jb_obj_open(&j, 0);
+        jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        if (qemu_sls_guest_paging_on) {
+            jb_str(&j, "error",
+                   "refused: a previous guest enabled paging and this kernel has no reset path");
+            jb_putc(&j, ',');
+            jb_str(&j, "remedy", "POST /api/node/reboot with {\"confirm\":\"reboot\"}");
+            jb_putc(&j, ',');
+            jb_str(&j, "defect", "AeroSLS-QEMU-SLS-Guest-Paging-Reset-Defect-v0.1.md");
+        } else {
+            jb_str(&j, "error", "the guest launch was refused; see the node console for the reason");
+        }
+        jb_putc(&j, ',');
+        jb_uint(&j, "loads", (uint64_t)loads); jb_putc(&j, ',');
+        // Kept because they describe the node, not the run that did not happen.
+        jb_uint(&j, "arena_used",  sls_heap_used());  jb_putc(&j, ',');
+        jb_uint(&j, "arena_total", sls_heap_total()); jb_putc(&j, ',');
+        jb_str(&j, "softmmu", sls_softmmu_enabled() ? "on" : "off");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+
+    // rc >= 0 from here: the run happened, so every field below describes it.
     jb_obj_open(&j, 0);
-    jb_str(&j, "ok", rc < 0 ? "false" : "true");                       jb_putc(&j, ',');
+    jb_str(&j, "ok", "true");                                          jb_putc(&j, ',');
     jb_uint(&j, "loads",            (uint64_t)loads);                  jb_putc(&j, ',');
     jb_uint(&j, "insns",            (uint64_t)insns);                  jb_putc(&j, ',');
     jb_uint(&j, "total_cycles",     cycles);                           jb_putc(&j, ',');
