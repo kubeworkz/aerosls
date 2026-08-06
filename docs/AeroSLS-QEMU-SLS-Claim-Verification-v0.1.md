@@ -4,8 +4,12 @@
 Each row carries the command that produced the measurement, so this document
 can be re-run rather than believed.*
 
-**Measured at:** `88003e7`, against `my_sls_kernel.bin` built from those sources
-(staleness guard passing).
+**Provenance:** each section carries its own commit and date, because a single
+header stamp rots. This one said `88003e7` for most of a day after the document
+had moved well past it — a stale figure at the top of the document about stale
+figures. Sections §3b–§3d name the commit they were measured at; §1 and §2 name
+the command that reproduces each row.
+
 **Scope:** `docs/AeroSLS-QEMU-SLS-*.md`, `docs/AeroSLS-QEMU-TCG-Optimizations.md`,
 `Makefile`, and the `../qemu` tree the kernel links against.
 

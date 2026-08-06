@@ -530,3 +530,32 @@ In a single-level store, the translation cache isn't a transient allocation - it
 The first sentence is a capability claim, defensible today. The second is the differentiated one - and it targets the 85%, not the 15%.
 
 The honest caveat: the persistent-translation-cache path exists in skeleton (`TCACHE`, `VM` snapshot hooks) but hasn't been measured. It's Phase 2 in the Viability Analysis. Given that we now know translation is 85% of the cost, **that's arguably the more valuable thing to measure next than Step 5** - and unlike shadow paging, nobody else can copy it without rebuilding their OS.
+
+---
+
+## Now Defensible Numbers
+
+The A/B is complete, and it reproduces **exactly**:
+
+|              | softmmu ON | softmmu OFF | ratio |
+| ------------ | ---------- | ----------- | ----- |
+| `CODE` bytes | 43,293     | 8,003       | 5.41× |
+| bytes/load   | 86         | 16          | 5.4×  |
+
+Those are bit-identical to the 2026-08-04 figures — same four numbers, a week and many commits later, now from two builds anyone can reproduce with a documented flag.
+
+**The headline number is now fully defensible for the first time:**
+
+> Eliminating QEMU's software MMU reduces the host code emitted per guest memory access by **5.41×** — 86 bytes to 16. Measured at `bebbc6e421df`, both sides built from identical sources one documented flag apart, reproducible on demand.
+
+All four figures bit-identical to the 08-04 run, across many commits, two from-scratch rebuilds, and the stamp/clean fixes. `CODE` has still never varied in any sample this project has taken.
+
+Also worth noting from that ON run — `TCACHE 8 hit / 0 miss` and `TRANSLATE 0` on the warm relaunch. The persistent cache works on the ON build too, and its identity stamp differs from the OFF build's, so the two configurations can't contaminate each other's caches. That's the softmmu term in `qemu_tcache_identity_of()` doing precisely the job it was added for.
+
+Where that leaves the marketing question you opened with: you have two claims that survive scrutiny — the 5.41× code-size reduction, and cross-reboot warm start eliminating translation entirely. The second is the better edge story, and neither needs KVM or non-x86 hardware to state honestly.
+
+---
+
+**What is safe to quote** — countable, deterministic, rig-independent, same class as `CODE`:
+
+> Across a reboot, translation is not merely faster — it does not occur. Zero blocks compiled, zero bytes emitted, 8 of 8 translation blocks served from a cache restored from NVMe, and the 1.5 MB of arena a cold launch consumes is never allocated: 1,056 bytes across 4 calls, against 1,508,448 across 13.
