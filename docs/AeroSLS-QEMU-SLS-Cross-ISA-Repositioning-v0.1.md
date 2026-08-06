@@ -382,12 +382,43 @@ the emulation confound, and it only became possible because CODE has never
 varied: an exact denominator makes the artifact subtractable rather than merely
 acknowledged.
 
+> ### RETIRED 2026-08-05 — this figure did not reproduce
+>
+> The A/B was re-run at `bebbc6e421df`, both sides built from identical
+> sources one documented flag apart (`SLS_SOFTMMU=on|off`). The code-size
+> result reproduced exactly — 43,293 and 8,003 bytes, ratio 5.4096×, all four
+> figures bit-identical to the run above. **The excess did not:**
+>
+> ```
+> code_ratio  = 43,293 / 8,003  = 5.41x
+> exec_ratio  = 45,470 / 7,426  = 6.12x
+> excess      = 6.12 / 5.41     = 1.13x     <- below the 1.30-1.50 stated here
+> ```
+>
+> That is n=1 per side against the n=5 above, and `EXEC` carries a ~10% cold
+> CV on this host, so it is a failure to reproduce rather than a refutation.
+> But it is unreproduced, and **must not be quoted** until someone re-runs it
+> at n=5 per side and reports a CV.
+>
+> The asymmetry is the finding worth keeping: the zero-variance metric
+> reproduced to the digit, the cycle-derived one did not. That is the third
+> independent confirmation of §5b's conclusion, arrived at by trying to reuse
+> the more attractive of the two claims and watching it fail.
+>
+> Left in place rather than deleted — the reasoning above is sound and the
+> method may yet be right at proper n. What is retired is the *number*, and
+> anything that quotes it.
+
 ### What may be said
 
 **Defensible now:** eliminating QEMU's software MMU reduces the host code for a
-guest memory access by **5.4×** (86 bytes to 16), measured, deterministic,
-reproducible. On this host a further ~1.4× of genuine execution work is
-eliminated beyond what the code-size reduction alone explains.
+guest memory access by **5.41×** (86 bytes to 16), measured, deterministic,
+and — since 2026-08-05 — reproducible on demand from two builds one flag apart
+(`make x86-iso SLS_SOFTMMU=on|off`), bit-identical across a week of commits.
+
+~~On this host a further ~1.4× of genuine execution work is eliminated beyond
+what the code-size reduction alone explains.~~ **RETIRED** — did not reproduce;
+came out at 1.13×, below the range claimed. See the box in §5c. Not quotable.
 
 **Still not claimable:** an end-to-end speed multiplier. §9 stands — this box
 has no KVM, and a timing claim needs KVM or real non-x86 hardware. What is
