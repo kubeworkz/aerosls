@@ -1836,6 +1836,112 @@ static int api_shell_exec_post(const char* body, char* buf, int max, uint32_t re
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── POST /api/qemu/bench, POST /api/qemu/paging ───────────────────────────
+// QEMU-SLS is the one major subsystem with no HTTP surface: it was reachable
+// only through `qemu bench` / `qemu paging` on the serial console, and the
+// frontend retired its /api/shell/exec passthrough when every shell command got
+// a purpose-built JSON route. So the browser could not see it at all.
+//
+// These report the SAME figures the console prints, as fields rather than as
+// text. That distinction is the point. A UI that regexes "[SLS-BENCH] CODE
+// %llu bytes" breaks silently the first time someone rewords a log line, and
+// this project has spent enough time on numbers that drifted apart while
+// everything still looked fine.
+//
+// Every value below is read from a global the bench already sets
+// (sls-launcher.h) -- nothing is recomputed here, so the route cannot disagree
+// with the console about the same run.
+//
+// DELIBERATELY NO /api/qemu/run. `qemu run <hex>` feeds arbitrary bytes to the
+// guest frontend and the shadow-paging fault path. The frontend implements 18
+// opcodes, so it could not run a real binary anyway, and the risk/benefit of
+// exposing it over HTTP is the wrong way round.
+// Declared locally rather than by including ../qemu/sls/sls-launcher.h:
+// X86_CFLAGS carries -I. -Ikernel -Iarch/x86 -Inet and no path into the QEMU
+// tree, so that header is not reachable from here. user/shell.c declares the
+// same symbols the same way at its own `qemu` handlers. Definitions and full
+// commentary live in sls-launcher.h.
+extern int      sls_bench_load_path(uint32_t n_loads, uint64_t *cycles, uint32_t *insns);
+extern int      sls_test_guest_paging(void);
+extern int      sls_softmmu_enabled(void);
+extern uint64_t sls_heap_used(void);
+extern uint64_t sls_heap_total(void);
+extern uint64_t sls_last_translate_cycles;
+extern uint64_t sls_last_exec_cycles;
+extern uint64_t sls_last_code_bytes;
+extern uint32_t sls_last_tb_count;
+extern uint32_t sls_last_tcache_hits;
+extern uint32_t sls_last_tcache_misses;
+
+static int api_qemu_bench_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+
+    // Default 256 matches user/shell.c's `qemu bench`. The launcher refuses
+    // anything above TCG_MAX_INSNS - 2 (510) because one TB holds at most
+    // TCG_MAX_INSNS instructions and the program needs two more for setup and
+    // halt. Validated HERE rather than left to the launcher: its refusal goes
+    // to the serial console, which an HTTP caller never sees, so it would look
+    // like an empty success.
+    uint32_t loads = 256;
+    if (body) {
+        uint64_t v = json_uint64(body, "loads");
+        if (v) loads = (uint32_t)v;
+    }
+    if (loads < 1 || loads > 510) {
+        jb_obj_open(&j, 0);
+        jb_str(&j, "error", "loads out of range");
+        jb_putc(&j, ',');
+        jb_uint(&j, "min", 1); jb_putc(&j, ',');
+        jb_uint(&j, "max", 510); jb_putc(&j, ',');
+        jb_uint(&j, "requested", (uint64_t)loads);
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+
+    uint64_t arena_before = sls_heap_used();
+    uint64_t cycles = 0;
+    uint32_t insns  = 0;
+    int rc = sls_bench_load_path(loads, &cycles, &insns);
+    uint64_t arena_after = sls_heap_used();
+
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok", rc < 0 ? "false" : "true");                       jb_putc(&j, ',');
+    jb_uint(&j, "loads",            (uint64_t)loads);                  jb_putc(&j, ',');
+    jb_uint(&j, "insns",            (uint64_t)insns);                  jb_putc(&j, ',');
+    jb_uint(&j, "total_cycles",     cycles);                           jb_putc(&j, ',');
+    jb_uint(&j, "exec_cycles",      sls_last_exec_cycles);             jb_putc(&j, ',');
+    jb_uint(&j, "translate_cycles", sls_last_translate_cycles);        jb_putc(&j, ',');
+    jb_uint(&j, "blocks",           (uint64_t)sls_last_tb_count);      jb_putc(&j, ',');
+    // The A/B figure. Deterministic across every sample this project has taken,
+    // which is why it and not the cycle columns is the one to quote.
+    jb_uint(&j, "code_bytes",       sls_last_code_bytes);              jb_putc(&j, ',');
+    jb_uint(&j, "tcache_hits",      (uint64_t)sls_last_tcache_hits);   jb_putc(&j, ',');
+    jb_uint(&j, "tcache_misses",    (uint64_t)sls_last_tcache_misses); jb_putc(&j, ',');
+    // Same test the console uses to print "cold: every block was compiled".
+    // Derived here so the UI does not re-implement the rule and drift from it.
+    jb_str(&j, "cold", sls_last_tcache_hits == 0 ? "true" : "false");  jb_putc(&j, ',');
+    jb_uint(&j, "arena_consumed",   arena_after - arena_before);       jb_putc(&j, ',');
+    jb_uint(&j, "arena_used",       arena_after);                      jb_putc(&j, ',');
+    jb_uint(&j, "arena_total",      sls_heap_total());                 jb_putc(&j, ',');
+    // Which side of the A/B produced these numbers. Without it a caller can
+    // compare an ON run against an OFF run and see a 5.4x "improvement" that is
+    // only the build flag.
+    jb_str(&j, "softmmu", sls_softmmu_enabled() ? "on" : "off");
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+static int api_qemu_paging_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // Passes only if the shadow walker resolved through the guest's OWN page
+    // tables: the identity mapping would return 0, so a pass and a failure are
+    // distinguishable rather than both looking like "the guest halted".
+    int rc = sls_test_guest_paging();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_sql_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
@@ -5173,6 +5279,17 @@ static void http_route(int conn, char* req) {
         // ── Kernel-Side Shell Refactor ──────────────────────────────────────
         if (!strcmp(path, "/api/shell/exec")) {
             blen = api_shell_exec_post(body_ptr, resp_body, (int)sizeof(resp_body), req_uid);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // ── QEMU-SLS: the guest runtime, reachable as JSON rather than as
+        //    console text. See api_qemu_bench_post() for why there is no
+        //    /api/qemu/run to go with these. ────────────────────────────────
+        if (!strcmp(path, "/api/qemu/bench")) {
+            blen = api_qemu_bench_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/paging")) {
+            blen = api_qemu_paging_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Gap Remediation Phase C: Vector Store HTTP reachability ────────────
