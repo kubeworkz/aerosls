@@ -705,21 +705,23 @@ Total emitted bytes across the 20-program parity set: **M0 28500 → M1
   error"). jmpr_join's teeth: reverting the block-head constant reset
   makes it return 1 instead of 222.
 
-### 10.5 M2.1 amendment — folding arithmetic constants (as built)
+### 10.5 M2.1/M2.2 amendment — folding arithmetic constants (as built)
 
 The M2 fold accepted only index values the analysis could see directly
 (LOADI/LOADI64 constants, propagated through MOV). M2.1 extends the
-constant map to fold ADD/SUB — the index is now COMPUTED at translate
-time, e.g. `load; add; sub; dispatch`, which is how real dispatchers
-shape their index. On the emitted code side nothing changed: the ALU is
-a plain 64-bit add/sub for every SIMI type (the translator never
-truncates to the declared width), `materialize_imm` sign-extends imm28
-exactly as the analysis does, so `a+b`/`a-b` with 64-bit wrap is
-bit-identical to runtime. The fold is deliberately limited to ADD/SUB:
-DIV/MOD would change behavior on a translate-time division by zero, and
-MUL — safe to fold (plain 64-bit multiply, never faults, type-agnostic)
-— is left with the rest of the ALU family for a later pass, a
-conservative omission rather than a soundness one.
+constant map to fold ADD/SUB; M2.2 adds MUL — the index is now
+COMPUTED at translate time, e.g. `load; add; sub; dispatch` or `load;
+mul; dispatch`, which is how real dispatchers shape their index. On the
+emitted code side nothing changed: the ALU is a plain 64-bit add/sub/
+mul for every SIMI type (the translator never truncates to the declared
+width), `materialize_imm` sign-extends imm28 exactly as the analysis
+does, and MUL emits `enc_madd(rh, X_T0, rhs, 31)` — `rd = rn*rm + xzr`,
+a plain multiply that never faults — so the 64-bit wrap of `a+b`/`a-b`/
+`a*b` here is bit-identical to runtime. The fold is deliberately limited
+to ADD/SUB/MUL: DIV/MOD would change behavior on a translate-time
+division by zero, and the rest of the ALU family (AND/OR/XOR/shifts) is
+left to a later pass, a conservative omission rather than a soundness
+one.
 
 - **`tests/jmpr_calc.simi`** — reworked to compute its index through all
   four fold shapes (ADD reg+reg, SUB reg+imm, SUB reg+reg, ADD reg+imm,
@@ -759,8 +761,8 @@ Total emitted bytes across the 22-program parity set: **M0 31088 → M1
   (`g_const_val[ra] < num_instr`), which also correctly refuses
   sign-extended negative constants (they land ≥ 2^63) — sound, but no
   test currently computes a negative index to pin the refusal.
-- MUL remains unfoldable despite being safe; a later pass can extend
-  the same machinery.
+- M2.2 folded MUL, but the rest of the ALU family (AND/OR/XOR/shifts)
+  still does not fold; a later pass can extend the same machinery.
 
 ### 10.8 Honest limits that stand after M2
 
@@ -777,6 +779,35 @@ Total emitted bytes across the 22-program parity set: **M0 31088 → M1
   only by the JMPR count in the worst case.
 - The §8.5/§9.5 caveats stand: decoder-based evidence, unproven ABI,
   and the encoder net's register-blindness all still apply.
+
+### 10.9 M2.2 amendment — folding MUL (as built)
+
+M2.1 folded ADD/SUB; M2.2 adds MUL to the same fold branch. The sound-
+ness argument carries over verbatim: the ALU emits `enc_madd(rh, X_T0,
+rhs, 31)` — a plain 64-bit multiply with the XZR addend, never faults,
+type-agnostic, no truncation — and the imm28 sign-extension matches
+`materialize_imm`, so `a*b` with 64-bit wrap is bit-identical to run-
+time. MUL joins the fold in the same FLAG_IMM/register-form handling;
+DIV/MOD stay excluded (translate-time division by zero would diverge
+from the runtime fault).
+
+- **`tests/jmpr_calc_mul.simi`** — index computed through a MULTIPLY
+  chain: MUL reg+reg (3*4 = 12), MUL reg+imm (12*2 = 24), SUB reg+imm
+  (24−11 = 13) — folds to pc 13. The M0 baseline measured against the
+  committed M0 translator: **1272 → 1064, 208 saved**; disabling the
+  MUL fold grows it back to exactly 1272 while the dynamic path still
+  returns 222 (the teeth check).
+
+### 10.10 M2.2 gate results (measured)
+
+Total emitted bytes across the 23-program parity set: **M0 32360 → M1
+31284, 1076 saved** (≈3.3%). The M2.2 row on top of M2.1's 868:
+
+- jmpr_calc_mul 1272 → 1064 (−208): the computed multiply index folds.
+- Four-way parity: interp 25/0, x86 24/0/3, RV64 23/0/4, ARM 23/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: disabling the MUL fold
+  grows jmpr_calc_mul back to exactly its M0 1272 while remaining
+  correct via the dynamic path.
 
 ---
 
