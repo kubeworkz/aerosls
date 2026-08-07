@@ -71,8 +71,26 @@
 # i32, so the scaled path can't take it — M2.10's unscaled form folds
 # #5 in one word), with the i32 addresses kept >= 4 bytes apart and
 # confined to the r7+[560, 4092] band portable across all four engines'
-# r7 scratch conventions — 124 bytes below its M0 baseline, and
-# disabling the unscaled fold grows it back to 1200. mem_pre is M2.10:
+# r7 scratch conventions — 132 bytes below its M0 baseline (M2.11's
+# register-offset fold turns the [r5-4101] store and load into
+# li64 + one register-offset word each, two more words saved), and
+# disabling the unscaled fold grows it back to 1200. mem_reg is M2.11:
+# the register-offset load/store — a displacement past the imm12 range
+# (|disp| > 4095, not a multiple of 4096) now lives in a register and
+# the access is ONE ldr/str xt, [xb, xm] word instead of the M2.8
+# li64 + add_shift + zero-offset access, and consecutive LOAD/STORE
+# sharing the SAME materialize-class displacement form a RUN: the
+# displacement is materialized once into x12 (X_DR, outside the
+# x9/x10/x11 cache) and every access in the run is just the one
+# register-offset word. Rows: imm9 [r4-100] and imm12 [r5-4096]
+# controls (unchanged — runs are only formed for materialize-class
+# displacements), a standalone [r5-5250] pair separated by an ADD into
+# a free register (each pays its own per-instruction fold), i64 runs of
+# 5 at [r5-5000] and 3 at [r6-7000], and an i32 run of 2 at [r6-7100]
+# (the narrow forms MUST use SXTW — LSL #0 would zero-extend Wm and
+# turn -7100 into a huge positive offset; that row pins it) — 324
+# bytes below its M0 baseline, and disabling the run-reuse (run
+# threshold 2 -> 9999) grows it back to 1580. mem_pre is M2.10:
 # ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
 # folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
 # no writeback, no alignment requirement, superseding the M2.9
@@ -124,7 +142,8 @@ declare -A M0_BASELINES=(
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968
-    [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012 [obj_ops]=1164 [ptr_ops]=1120
+    [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
+    [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
     [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
     [straight_line_bench]=1104
 )

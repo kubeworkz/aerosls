@@ -347,6 +347,57 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             continue;
         }
 
+        /* ─── Load/store register, REGISTER offset (ldr/str xt,[xb,xm]) ─
+         * size:2 111 0 00 opc 1 Rm opt:3 s:1 10 Rn Rt. M2.11: simi_arm.c
+         * emits these for displacements past the imm12 range (the
+         * materialize path) — the displacement lives in a register (X_DR
+         * = x12 on a run of same-displacement accesses, a scratch
+         * otherwise) and the access itself is one word. Fenced by bit 21
+         * = 1 and bits 11:10 = 10 (the imm9 class has bit 21 = 0, the
+         * scaled class 25:24 = 01), and only two options are emitted,
+         * pinned against QEMU's a64.decode @ldst: opt = 011 (LSL #0,
+         * Xm used in full) with size = 11 — a 64-bit two's-complement
+         * displacement wraps the address add correctly — and opt = 110
+         * (SXTW, the low 32 bits sign-extended) with the narrower sizes;
+         * any other option, or a narrow LSL (which would zero-extend and
+         * is never emitted), faults. X[n] is untouched; Rm = 31 reads
+         * XZR (zero). */
+        if (((w & 0x3F20FC00u) == 0x38206800u || (w & 0x3F20FC00u) == 0x3820C800u)) {
+            int size = (int)(w >> 30);
+            int opc = (int)((w >> 22) & 3);
+            int opt = (int)((w >> 13) & 7);
+            int rm = (int)((w >> 16) & 0x1F);
+            int rn = (int)((w >> 5) & 0x1F);
+            int rt = (int)(w & 0x1F);
+            int width = 1 << size;
+            int64_t off;
+            if (opt == 3) {                              /* LSL #0 — Xm in full */
+                if (size != 3) return AR_EXEC_BAD_INSTR; /* narrow LSL not emitted (would zero-extend) */
+                off = (int64_t)rx(cpu, rm);
+            } else if (opt == 6) {                       /* SXTW — sign-extend the low 32 bits */
+                off = (int64_t)(int32_t)rx(cpu, rm);
+            } else {
+                return AR_EXEC_BAD_INSTR;                /* options 000-010/100-101/111 not emitted */
+            }
+            uint64_t addr = cpu->x[rn] + (uint64_t)off;  /* 64-bit wrap — negative offsets just work */
+            if (opc == 0) {                             /* STR */
+                uint64_t sv = (rt == 31) ? 0 : cpu->x[rt];
+                if (!store_mem(cpu, addr, width, sv)) return AR_EXEC_MEM_FAULT;
+            } else if (opc == 1) {                      /* LDR */
+                uint64_t v;
+                if (!load_mem(cpu, addr, width, 0, &v)) return AR_EXEC_MEM_FAULT;
+                set_x(cpu, rt, v);
+            } else if (opc == 2) {                      /* LDRS (sign-extend) */
+                uint64_t v;
+                if (!load_mem(cpu, addr, width, 1, &v)) return AR_EXEC_MEM_FAULT;
+                set_x(cpu, rt, v);
+            } else {
+                return AR_EXEC_BAD_INSTR;               /* opc 11 not emitted */
+            }
+            cpu->pc = next_pc;
+            continue;
+        }
+
         /* ─── Load/store register (unsigned scaled 12-bit immediate) ────
          * size:2 111 0 01 opc:2 imm12 Rn Rt. opc 00=STR, 01=LDR
          * (zero-extend), 10=LDRS (sign-extend), 11=pre/post (unused).

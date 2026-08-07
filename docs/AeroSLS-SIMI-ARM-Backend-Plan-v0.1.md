@@ -1326,6 +1326,118 @@ register-offset forms (`ldr xt, [xb, xm]` with the magnitude in a
 register, or a base adjusted once for a run of accesses) are the
 natural next candidate.
 
+### 10.28 M2.11 amendment — register-offset access and run-reuse (as built)
+
+§10.27 closed by naming the next structural lever: magnitudes past the
+imm9 window (|disp| > 255) still paid the materialize path — li64 +
+add_shift + zero-offset access, three words — and asked whether the
+register-offset forms (`ldr/str xt, [xb, xm]`) could do better, either
+by materializing the displacement once for a run of accesses or when
+the base is dead after the access. M2.11 answers with two folds, both
+gated on g_alloc like every fold before them:
+
+1. **Per-instruction register-offset access** on the materialize path
+   (the class mem_materialize_class returns true for: |disp| > 4095
+   and not an imm12-split multiple of 4096, either sign). The
+displacement is materialized into a scratch register (h_imm for LOAD,
+X_T2 for STORE — clobbered first) and the access is a SINGLE
+`ldr/str xt, [xb, xm]` word instead of li64 + add_shift +
+zero-offset access (three words). Nothing modifies h_base, so — the
+M2.10 simplifying fact again — clobber_scratch(h_a/h_base) lives in
+the imm12 branch only. mem_neg's −4101 i64 pair is the corpus
+instance: 1184 → 1176 (−8).
+
+2. **Run-reuse**: a pre-pass (also g_alloc-gated) marks maximal
+   straight-line runs of ≥ 2 consecutive LOAD/STORE with the SAME
+   materialize-class displacement (the class is purely a function of
+   (disp, type), so sharing a displacement means sharing a class). The
+   run head materializes the displacement ONCE into **X_DR = x12** — a
+   register deliberately outside the x9/x10/x11 cache, verified unused
+   by the prologue, trampoline, cache, and hostfn call sites — and
+each access in the run emits one register-offset word reusing x12:
+   run of N accesses = 1 li64 + N words vs. the per-instruction 3N.
+   Runs break at g_pc_target (block heads, which folded-JMPR targets
+   seed) and at control-flow boundaries. The dynamic-JMPR hazard is
+   structural, not special-cased: g_alloc is 0 whenever any JMPR fails
+   to fold to a direct branch (the M0 comment at its definition), so a
+   function containing a non-folded JMPR gets NO run-reuse at all — a
+   dynamic jump can never land mid-run on an un-materialized x12.
+
+   The STORE alias analysis is worth recording. cache_fetch_hosts only
+   ever assigns x9/x10 for the value and base hosts (the M2.5 swap is
+   x9↔x10), so h_val can never be X_T2 — the per-instruction
+   displacement li64 into X_T2 cannot overwrite a live store value, and
+   clobber_scratch(X_T2) is a pure safety net. X_DR's clobber_scratch
+   is a no-op by construction (slot 3 fails the cache guard); the run
+   head's li64 lands in a register nothing else touches between the
+   head and the run's last access, because runs never span a block
+   head or a control-flow boundary. The rd==ra and value-aliases-base
+   cases need no extra guards: the register-offset word has no
+   writeback, so the base host is never modified, and the M2.10
+   distinct-hosts argument carries over unchanged.
+
+The encoding is the A64 load/store register (register offset) form:
+bit 21 = 1, bits 11:10 = 10, option = 011 (LSL#0) for 64-bit
+accesses, option = 110 (SXTW) for the narrow sign-extension case
+(negative displacements on i32/i16/i8), S = 0 — pinned against QEMU's
+a64.decode `@ldst .. ... . .. .. . rm:5 opt:3 s:1 .. rn:5 rt:5` (the
+same derivation the M2.x encoders used; no assembler available, §2
+caveats apply, the parity net plus the Python bit layout are the
+cross-checks). The emulator's decode fence is `(w & 0x3F20FC00) ==
+0x38206800` (option 011) or `== 0x3820C800` (option 110) — bits
+29:24 = 111000 (29:27 = 111, V = 0, opc = 00), bit 21 = 1, bits 11:10
+= 10, S = 0, rn[9:8] = 00. The fence cannot collide with any other
+emitted class: scaled (25:24 = 01) and the imm9 family (bit 21 = 0)
+are excluded by pinned bits, and MOVZ/MOVK (29:27 = 010), CBZ/CBNZ
+(110), B/BL (001), B.cond (010), BR/BLR/RET (010), and the ALU
+shifted/logical ops (100/001/010/101) all differ in 29:27. The load
+side fences (opc = 01 → 0x3920…, opc = 10 → 0x3A20…) are distinct
+from the store fences and from each other. a64_enc_check.py gained
+the 11 `_reg` classes in the encoders, the decoders, and ALLOWED.
+
+- **`tests/mem_reg.simi`** — three runs plus a run-breaker and
+  unchanged controls: an i64 run at [r7-4101] (the mem_neg magnitude,
+  now exercising run-reuse), an i64 run at [r7+8193], and an i32 run
+  at [r7-4101] (the SXTW form — str_w_reg/ldrsw_reg with rm = x12).
+  The run-breaker is a [r15+4101] store/load pair splitting the i64
+  run in two, verifying runs break and re-materialize. Expected 1300.
+  M0 baseline (committed M0 translator): **1764 → 1440, 324 saved**;
+  disabling run-reuse (run-length gate forced to 9999) grows it back
+  to exactly 1580. mem_neg's −4101 pair folds per-instruction: 1184 →
+  1176.
+
+### 10.29 M2.11 gate results (measured)
+
+Total emitted bytes across the now-31-program parity set (the gate's
+own M0/M1 totals now include the new mem_reg row): **M0 43492 → M1
+40372, 3120 saved** (≈7.2%), up from M2.10's 2788. The M2.11 rows on
+top of M2.10's 2788:
+
+- mem_reg 1764 → 1440 (−324, new 31st row): the three runs' heads
+  materialize x12 once each (li64 count 17 across the file — one per
+  run head), every run access is one register-offset word, and the
+  standalone pair uses per-instruction scratches (rm = x11/x10).
+- mem_neg 1184 → 1176 (−8): its −4101 i64 pair now emits
+  li64 + `ldr/str x, [x, xm]` (two words) instead of li64 + add +
+  zero-offset access (three).
+- Row-by-row M2.10-vs-M2.11 accounting (gate tables diffed): all 29
+  shared rows byte-identical — nothing else grew or shrank. The
+  totals move by exactly mem_neg (−8) and the new mem_reg row.
+- Four-way parity: interp 33/0, x86 32/0/3, RV64 31/0/4, ARM 31/0/4.
+  enc-check 12/12 OK; jmpr_oob still faults (UDF, rc=1). Teeth:
+  disabling run-reuse grows mem_reg to 1580, still correct.
+
+The M-line has now compounded to 3120 bytes saved. The immediate
+family (ALU, LOAD, STORE) is folded through both imm9 forms and now
+past imm12 via the register-offset word, with run-reuse amortizing the
+materialize across a straight-line run. The remaining levers are the
+same structural ones §10.27 named: register-offset forms for narrow
+magnitudes a run cannot amortize (a lone |disp| > 4095 access still
+pays 2 words — the honest floor for a magnitude no immediate can
+express), and — beyond the memory folds — the branch-side
+optimizations (block coalescing, tail reuse) that the JMPR folding has
+been leaving on the table.
+
 ---
 
 ## Sources consulted
