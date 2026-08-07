@@ -1,0 +1,30 @@
+; jmpr_calc_mul.simi — M2.2: the JMPR index is COMPUTED at translate
+; time through a MULTIPLY chain, not just loads and add/sub. The
+; constant analysis folds MUL like ADD/SUB (the emitted enc_madd is a
+; plain 64-bit multiply that never faults and ignores the declared type,
+; so a*b with 64-bit wrap is bit-identical to runtime): r1 = 3*4 = 12,
+; then 12*2 = 24 (MUL reg+imm), then 24-11 = 13 (SUB reg+imm, also
+; folded) — the JMPR folds to pc 13. A fold bug computing any other
+; value lands on pc 7 (111), pc 8 (returns 0) or pc 9-12 (55) — all
+; caught by the four-way parity against the dynamic dispatchers. Caveat
+; as in jmpr_calc: a fold bug that STILL computes 13 would pass parity —
+; the teeth check (disabling the MUL fold → exactly the M0 size) bounds
+; that class; inherent to fold testing.
+; Expected result: 222
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #3, i64
+    LOADI r2, #4, i64
+    MUL r1, r1, r2, i64      ; r1 = 12 (MUL reg+reg)
+    MUL r1, r1, #2, i64      ; r1 = 24 (MUL reg+imm)
+    SUB r1, r1, #11, i64     ; r1 = 13 (SUB reg+imm)
+    JMPR r1                  ; folds to pc 13 (target)
+    LOADI r0, #111, i32
+    RET
+    LOADI r0, #55, i32
+    LOADI r0, #55, i32
+    LOADI r0, #55, i32
+    LOADI r0, #55, i32
+    LOADI r0, #222, i32      ; pc 13 (target)
+    RET
