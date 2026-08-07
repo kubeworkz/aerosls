@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -22,6 +22,31 @@ simi-jit-test: simi_jit_test.c simi_x86.c simi_x86.h
 simi-riscv-verify: simi_riscv_verify.c simi_riscv.c simi_riscv.h rv64_exec.c rv64_exec.h
 	$(CC) $(CFLAGS) -o $@ simi_riscv_verify.c simi_riscv.c rv64_exec.c
 
+# M0 (Step 7 / AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md): portable AArch64
+# (A64) translator core + a small purpose-built A64 decoder/executor
+# standing in for real hardware/QEMU (neither available in this sandbox —
+# see simi_arm_verify.c's top comment and a64_exec.h).
+simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h
+	$(CC) $(CFLAGS) -o $@ simi_arm_verify.c simi_arm.c a64_exec.c
+
+# M0 transcription-error net: a from-scratch Python A64 encoder re-derives
+# the bit layout independently and checks every static word simi_arm.c
+# emitted (see a64_enc_check.py's docstring). Catches the error class
+# where encoder AND decoder agree on a wrong constant.
+a64_dump: a64_dump.c simi_arm.c simi_arm.h
+	$(CC) $(CFLAGS) -o $@ a64_dump.c simi_arm.c
+
+a64-enc-check: simi-asm a64_dump
+	./simi-asm tests/straight_line_bench.simi tests/straight_line_bench.tmo
+	./simi-asm tests/loop_sum.simi tests/loop_sum.tmo
+	./simi-asm tests/extra_ops.simi tests/extra_ops.tmo
+	./a64_dump tests/straight_line_bench.tmo > /tmp/slb.dump
+	./a64_dump tests/loop_sum.tmo > /tmp/ls.dump
+	./a64_dump tests/extra_ops.tmo > /tmp/eo.dump
+	python3 a64_enc_check.py /tmp/slb.dump straight_line_bench
+	python3 a64_enc_check.py /tmp/ls.dump loop_sum
+	python3 a64_enc_check.py /tmp/eo.dump extra_ops
+
 test: all
 	./tests/run_tests.sh
 
@@ -31,7 +56,10 @@ test-native: all
 test-riscv: all
 	./tests/run_riscv_tests.sh
 
-clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify tests/*.tmo
+test-arm: all
+	./tests/run_arm_tests.sh
 
-.PHONY: all test test-native test-riscv clean
+clean:
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump tests/*.tmo
+
+.PHONY: all test test-native test-riscv test-arm clean

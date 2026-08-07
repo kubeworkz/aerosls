@@ -1,9 +1,11 @@
 # Build outputs — regenerate with `make` in this directory.
-timi-asm
-timi-run
-timi-dis
-timi-jit-test
-timi-riscv-verify
+simi-asm
+simi-run
+simi-dis
+simi-jit-test
+simi-riscv-verify
+simi-arm-verify
+a64_dump
 tests/*.tmo
 tests/*.log
 tests/*.txt
