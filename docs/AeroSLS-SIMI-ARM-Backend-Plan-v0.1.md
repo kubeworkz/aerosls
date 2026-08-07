@@ -962,6 +962,54 @@ Total emitted bytes across the 26-program parity set: **M0 36080 → M1
   jmpr_oob still faults (UDF, rc=1). Teeth: reverting the swap grows
   fetch_cross to exactly 1160 while remaining correct.
 
+### 10.18 M2.6 amendment — small add/sub immediates fold (as built)
+
+The ALU immediate-form codegen now folds small non-negative ADD/SUB
+immediates into A64's 12-bit add-imm/sub-imm encodings — one word
+instead of the movz(+movk)+add_shift materialization, exactly what
+LEA/PTRADD/LOAD already do for their displacements. The fold fires in
+cache mode (g_alloc) after the first operand is fetched, when the
+sign-extended imm28 is in [0, 4095]; the instruction is then consumed
+by a single `add/sub xd, xn, #imm` + store_result (the `break` exits
+the outer switch, skipping the inner ALU switch and the common
+store_result — no double or missed store). Gated on g_alloc so the
+naive (JMPR) path stays byte-identical to M0, preserving the gate's
+jmpr baselines and its "0 saved, the honest floor" rows.
+
+Deliberate non-folds, stated in the code comment: values past imm12
+(> 4095) and negative immediates keep the materialized path; A64's
+add-imm also has an `imm12 << 12` shifted form (multiples of 4096 up
+to 0xFFFFFF) recorded as a known next extension; AND/OR/XOR immediates
+are bitmask encodings, not plain 12-bit, so the rest of the ALU family
+is untouched.
+
+- **`tests/alu_imm.simi`** — an immediate-heavy chain: five folded rows
+  (5, 3, 100, 55, and the exact 4095 boundary) then three rows that
+  must NOT fold (4096 just past imm12, a negative #-5, and a
+  register-form ADD) so parity exercises both the fold and the
+  materialized fallback (expected 8268). M0 baseline measured against
+  the committed M0 translator: **1132 → 1080, 52 saved**; disabling
+  the fold grows it back by exactly 20 — the five folded rows times
+  one saved word each.
+
+### 10.19 M2.6 gate results (measured)
+
+Total emitted bytes across the 27-program parity set: **M0 37212 → M1
+35208, 2004 saved** (≈5.4%). The M2.6 rows on top of M2.5's 1932:
+
+- alu_imm 1132 → 1080 (−52): the folded immediate rows are one word
+  each instead of two.
+- jmpr_calc 1076 → 1064 (−12), jmpr_calc_mul 1064 → 1060 (−4),
+  jmpr_calc_bit 1136 → 1132 (−4): the three computed-index chains use
+  SUB #imm under the cache (their JMPRs fold, so g_alloc=1), so the
+  fold compounds on the M2.1-M2.3 machinery — their totals vs M0 are
+  now 224/212/252 below (up from 212/208/248).
+- Row-by-row M2.5-vs-M2.6 comparison: no test grew; these four are the
+  only changes.
+- Four-way parity: interp 29/0, x86 28/0/3, RV64 27/0/4, ARM 27/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: disabling the fold grows
+  alu_imm to exactly 1100 while remaining correct.
+
 ---
 
 ## Sources consulted

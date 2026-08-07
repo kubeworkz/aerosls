@@ -26,18 +26,21 @@
 # head constant reset makes it return 1 instead of 222, caught by the
 # four-way parity). jmpr_calc is M2.1: its index is COMPUTED at translate
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
-# reg+reg, reg+imm) — 212 bytes below its M0 baseline, and disabling the
-# ADD/SUB fold grows it back to exactly 1288. jmpr_mix is the M2.1 mixed
+# reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
+# fold compounds 12 more on M2.1's 212, and disabling the ADD/SUB index
+# fold grows it back to exactly 1288. jmpr_mix is the M2.1 mixed
 # case: one runtime JMPR (forces g_alloc=0, whole program naive) and one
 # constant JMPR that still folds — 48 bytes below its M0 baseline, the
 # folded-branch-under-naive-codegen interaction pinned. jmpr_calc_mul is
 # M2.2: its index is COMPUTED through a MULTIPLY chain (MUL reg+reg,
-# MUL reg+imm, SUB reg+imm) — 208 bytes below its M0 baseline, and
-# disabling the MUL fold grows it back to exactly 1272. jmpr_calc_bit is
+# MUL reg+imm, SUB reg+imm) — 212 bytes below its M0 baseline after
+# M2.6's imm fold compounds 4 more on M2.2's 208, and disabling the MUL
+# fold grows it back to exactly 1272. jmpr_calc_bit is
 # M2.3: its index is COMPUTED through the BITWISE + SHIFT folds (OR/SAR/
 # SHR/SHL/AND/XOR/ADD, with the shifts masking their amount mod 64 and
-# SAR arithmetic on a sign-bit value) — 248 bytes below its M0 baseline,
-# and disabling the fold grows it back to exactly 1384. src_resident is
+# SAR arithmetic on a sign-bit value) — 252 bytes below its M0 baseline
+# after M2.6's imm fold compounds 4 more on M2.3's 248, and disabling
+# the fold grows it back to exactly 1384. src_resident is
 # M2.4: a chain that re-reads r1/r2 as sources five times; cache_reserve
 # now prefers a non-source victim, so the sources stay resident — 40
 # bytes below its M0 baseline, and reverting the source preference grows
@@ -46,7 +49,12 @@
 # shape where the default fetch targets (ra->x9, rb->x10) spill both
 # operands and reload one — cache_fetch_hosts swaps the targets so each
 # fetch is a no-op into its own slot — 104 bytes below its M0 baseline,
-# and reverting the swap grows it back to 1160 (the M2.4 state). Same skips as the runner: float_ops rejected,
+# and reverting the swap grows it back to 1160 (the M2.4 state). alu_imm
+# is M2.6: an ADD/SUB #imm chain whose small non-negative immediates fold
+# into A64's 12-bit add-imm/sub-imm forms (one word each instead of the
+# movz+add materialization) — 52 bytes below its M0 baseline, and
+# disabling the fold grows it back by exactly 20 (the five folded rows
+# times one saved word each). Same skips as the runner: float_ops rejected,
 # mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
 # path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
@@ -73,7 +81,7 @@ VERIFY=../simi-arm-verify
 
 # name: M0 bytes (from git 1729f50, built + measured 2026-08-07)
 declare -A M0_BASELINES=(
-    [add]=976 [aggregate_abi]=4592 [branch_cmp]=1096 [call_ret]=1932
+    [add]=976 [aggregate_abi]=4592 [alu_imm]=1132 [branch_cmp]=1096 [call_ret]=1932
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272

@@ -1,0 +1,36 @@
+; alu_imm.simi — M2.6: small non-negative ADD/SUB immediates fold into
+; A64's 12-bit add-imm/sub-imm forms (one word) instead of the
+; movz(+movk)+add_shift materialization (two+ words) — the same fold
+; LEA/PTRADD/LOAD already do for displacements. The chain exercises the
+; folded rows (5, 3, 100, 55, and the exact 4095 boundary), then three
+; rows that must NOT fold: 4096 (just past imm12), a negative immediate
+; (#-5, folded later as SUB of a negated value is out of scope), and a
+; register-form ADD — so parity exercises both the fold and the
+; materialized fallback paths. The teeth check (disabling the fold)
+; grows the test back by exactly the five folded rows' saved words.
+; r1 = 10
+; r2 = r1 + 5  = 15    (fold)
+; r3 = r2 - 3  = 12    (fold)
+; r4 = r3 + 100 = 112  (fold)
+; r5 = r4 - 55 = 57    (fold)
+; r6 = r5 + 4095 = 4152 (fold — exact imm12 boundary)
+; r7 = r6 + 4096 = 8248 (NO fold — past imm12)
+; r8 = r7 - -5 = 8253  (NO fold — negative imm, sub of 0xFF..FB = +5)
+; r9 = r8 + r2 = 8268  (register form)
+; r0 = r9 = 8268
+; Expected result: 8268
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #10, i64
+    ADD r2, r1, #5, i64
+    SUB r3, r2, #3, i64
+    ADD r4, r3, #100, i64
+    SUB r5, r4, #55, i64
+    ADD r6, r5, #4095, i64
+    ADD r7, r6, #4096, i64
+    SUB r8, r7, #-5, i64
+    ADD r9, r8, r2, i64
+    LOADI r0, #0, i64
+    ADD r0, r0, r9, i64
+    RET

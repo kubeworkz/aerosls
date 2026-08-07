@@ -862,6 +862,28 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             h_a = cache_single_host(ra);
             h_b = (h_a == X_T0) ? X_T1 : X_T0;
             get_operand(cb, ra, h_a, rd_live);
+            /* M2.6: fold small non-negative ADD/SUB immediates into the
+             * 12-bit add-imm/sub-imm forms — 1 word instead of the
+             * movz(+movk)+add_shift materialization, exactly what
+             * LEA/PTRADD/LOAD already do for their displacements. Gated
+             * on g_alloc: the naive (JMPR) path must stay byte-identical
+             * to M0 for the gate's jmpr baselines and its "0 saved, the
+             * honest floor" rows. Values past imm12 (or negative) keep
+             * the materialized path; the non-add/sub ops are untouched
+             * (A64's AND/OR/XOR immediates are bitmask encodings, not
+             * plain 12-bit — out of scope). A64's add-imm also has the
+             * imm12 << 12 shifted form (values 4096..0xFFFFFF multiples
+             * of 4096) — a known next extension, deliberately not
+             * folded here. */
+            if (g_alloc && (op == OP_ADD || op == OP_SUB)) {
+                int64_t imm = w_imm28(w);
+                if (imm >= 0 && imm <= 4095) {
+                    e32(cb, (op == OP_ADD) ? enc_add_imm(rh, h_a, (uint32_t)imm)
+                                           : enc_sub_imm(rh, h_a, (uint32_t)imm));
+                    store_result(cb, rd);
+                    break;   /* fold consumed this instruction — skip the inner switch */
+                }
+            }
             materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w), h_b);
         } else {
             cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
