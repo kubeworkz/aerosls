@@ -1616,6 +1616,95 @@ the first fused join. The remaining §10.29 levers are tail reuse and
 block coalescing's sibling — epilogue/prologue merging across
 backward folds — plus the entry-corner hardening note in §10.32.
 
+### 10.34 M2.14 amendment — tail reuse: one return sequence per function (as built)
+
+The first of the §10.29 branch-side levers, and the one the dump
+revealed most plainly: in jmpr_basic, the dead-path RET and the target
+RET emitted byte-identical 7-word return tails (ldr x9 slot0; ldrb
+x10 tag0; add sp,#TOTAL_FRAME; ldr x30; ldr x29; add sp,#16; br x30).
+The tail is cache-independent — the RET's cache_flush emptied
+x9/x10/x11 first, so its use of t0/t1 cannot collide with a resident
+guest — and pc-independent, so every RET in the function emits the
+same bytes. M2.14 emits ONE copy: the first RET in pc order emits it
+in place and records the tail's first word in g_tail_ret_off; every
+later RET emits just `cache_flush; b tail` — a backward branch, since
+the owner is earlier in layout, whose target is exact at emit time (no
+fixup needed; the offset arithmetic is a byte-delta / 4 with enc_b's
+signed imm26 masking). N RETs share one copy; N-1 copies are deleted,
+6 words (24 bytes) each. Gated on g_alloc like every fold: the naive
+path stays byte-identical to M0, and jmpr_dyn keeps its documented
+0-saved honest floor.
+
+Soundness is the straight-line invariant again. Each RET's own flush
+writes ITS resident set to slots before branching; the shared tail
+then reads r0's slot+tag (sp-relative — correct for whichever frame
+sp points at, which is also why the tail would stay correct even if a
+.tmo ever carried multiple exported entries, since the frame layout
+TX_AR_TOTAL_FRAME_BYTES is uniform) and returns. The branch crosses
+no SIMI block boundary: the cache is empty after the flush and the
+tail touches only t0/t1, so every arrival sees exactly the state its
+own RET left. The CALL-return protocol is preserved identically: the
+tail leaves r0's value in t0 and tag in t1 for the call site's
+post-call code, whether the RET is the owner or a sharer.
+
+This milestone also repaired a test-suite regression that M2.3 had
+introduced silently: jmpr_dyn and jmpr_mix made their "runtime" JMPR
+index with r1 = 5 ^ r0, and M2.3 added XOR to the fold set — folding
+the index to 7, flipping both tests to g_alloc=1, and leaving the
+dynamic (and mixed) dispatch paths unexercised since then (only
+jmpr_oob's fault path remained). Both now read the index back from
+guest memory (`LOAD r1, r7, #0` after a `STORE`), which the
+constant-fold analysis never tracks (LOAD writes rd and hits the
+constant-reset branch), so g_alloc=0 is genuinely restored — and the
+gate's "honest floor" prose is true again: jmpr_dyn's dynamic JMPR
+emission is byte-identical to M0's, its 16 bytes below M0 coming from
+the zero-displacement STORE/LOAD folds, which apply to every program
+regardless of g_alloc.
+
+- **`tests/tail_ret.simi`** — three RET blocks via a BC dispatch (no
+  JMPR), pinning that tail reuse is independent of the JMPR folding
+  and of g_alloc's folds in general. Expected 33; dump-verified: one
+  full tail, two `cache_flush; b tail` sharers.
+- **call_ret** — dump-verified the sharer ON a call-return path:
+  add2 (callee, pcs 0-2) owns the tail; main (pcs 3-7) calls add2 and
+  its own RET is the sharer — `b` back over the callee's code to the
+  shared tail, which pops MAIN's frame and returns, handing r0's
+  value+tag to the harness through t0/t1.
+
+### 10.35 M2.14 gate results (measured)
+
+Total emitted bytes across the now-34-program parity set (the gate's
+own M0/M1 totals now include the new tail_ret row): **M0 47168 →
+M1 43352, 3816 saved** (≈8.1%), up from M2.13's 3680. The M2.14
+movement on top of M2.13's 3680:
+
+- Tail reuse: every multi-RET g_alloc=1 row shrank by exactly
+  24 bytes (6 words) per sharing RET — aggregate_abi −72 (4 RETs),
+  cap_call_ret −48, jmpr_calc_bit −48, jmpr_fall −48, branch_cmp
+  −24, call_ret −24, jmpr_basic −24, jmpr_calc −24, jmpr_calc_mul
+  −24, jmpr_mid −24; tail_ret 1048 → 1000 (−48, new 34th row). The
+  row-by-row M2.13-vs-M2.14 accounting (gate tables diffed): every
+  OTHER row byte-identical — the tail-sharing deltas account for all
+  408 bytes, with no collateral movement anywhere.
+- jmpr_dyn 1136/1004 → 1148/1132 and jmpr_mix 1300/1080 → 1312/1248:
+  the two restored dynamic tests (see §10.34) — their M0 baselines
+  re-measured at 1729f50 with the new content. The honest-floor row
+  is genuine again (16 saved, all from the memory folds).
+- Four-way parity: interp 36/0, x86 35/0/3, RV64 34/0/4, ARM 34/0/4.
+  enc-check 12/12 OK; jmpr_oob still faults (UDF, rc=1). Teeth:
+  disabling the sharing (`0 && g_alloc && ...`) grows tail_ret back
+  to exactly 1048 = its M0 baseline and jmpr_basic to 984, both still
+  correct.
+
+The M-line has now compounded to 3816 bytes saved. Tail reuse closes
+out the branch-side ledger §10.29 opened: dispatches fold, dead
+fall-through branches vanish, empty joins fuse away their prologue
+flush, chains cascade, and now N blocks ending in the same terminal
+sequence share one copy of it. The remaining lever is §10.29's other
+named item — epilogue/prologue merging across backward folds — plus
+the fixpoint-vs-coalescing interactions the §10.30 ceiling
+replacement (§10.32) describes.
+
 ---
 
 ## Sources consulted

@@ -1,17 +1,21 @@
-; jmpr_dyn.simi — M2: a JMPR whose index is NOT a compile-time constant
-; (r1 = 5 ^ r0 computed at runtime), so the translator must keep the
-; dynamic runtime-table + bounds-check dispatch path. XOR is deliberately
-; NOT in the fold set (M2.1 folds only LOADI/LOADI64/MOV/ADD/SUB) — an
-; ADD here would fold to 7 and this test would stop exercising the
-; dynamic path. jmpr_basic folded in M2, so this test exists to pin the
-; dynamic SUCCESS path — jmpr_oob pins only the fault path.
+; jmpr_dyn.simi — M2: a JMPR whose index is NOT a compile-time constant,
+; pinning the dynamic runtime-table + bounds-check dispatch SUCCESS path
+; (jmpr_oob pins only the fault path). r1 = mem[r7+0] — a value written
+; to guest memory and read straight back — which the constant-fold
+; analysis never tracks (LOAD is not in the fold set). The original used
+; r1 = 5 ^ r0, but M2.3 added XOR to the fold set, which folded it to a
+; constant and silently stopped exercising the dynamic path (the index
+; became a folded direct branch and g_alloc flipped to 1). With a
+; runtime index, g_alloc = 0 and the whole program is byte-identical to
+; M0's naive codegen — the honest 0-saved floor the gate documents —
+; while still returning 222 through the table + bounds check.
 ; Expected result: 222
 .entry main
 main:
     ENTER #8
-    LOADI r0, #2, i64
-    LOADI r1, #5, i64
-    XOR r1, r1, r0, i64      ; r1 = 5 ^ 2 = 7 — runtime-computed, not folded
+    LOADI r0, #7, i64        ; the dispatch index — stored, then re-loaded
+    STORE r0, r7, #0, i64    ; mem[r7+0] = 7
+    LOAD r1, r7, #0, i64     ; r1 = 7 — runtime-computed, NOT folded
     JMPR r1                  ; dynamic dispatch to pc 7 (target)
     LOADI r0, #111, i32      ; dead path — never reached
     RET
