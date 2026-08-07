@@ -60,7 +60,20 @@
 # magnitudes that are multiples of 4096 (4096, 8192, the 4095<<12 max,
 # and #-4096) emit add/sub #u, lsl #12 — 100 bytes below its M0
 # baseline; its 16777216 (past 0xFFFFFF) and #-200000 (not a multiple of
-# 4096) rows keep the materialized fallback exercised. Same skips as the runner: float_ops rejected,
+# 4096) rows keep the materialized fallback exercised. mem_neg is M2.8:
+# LOAD/STORE displacement address math — a negative displacement
+# previously fell to the movz(+movk)+add_shift materialization even at
+# |disp| <= 4095 (A64's scaled load/store immediate is unsigned), now
+# |disp| folds into a single add/sub-imm (plain, or shifted for
+# multiples of 4096): rows at [r6-8] (sub #8), [r5-4096] (sub #1, lsl
+# #12), [r5-4101] (honest materialize — |disp| > 4095, not a multiple
+# of 4096) and [r6+5] (add #5, unaligned so the scaled path can't take
+# it), with the i32 addresses kept >= 4 bytes apart and confined to the
+# r7+[560, 4092] band portable across all four engines' r7 scratch
+# conventions — 108 bytes below its M0 baseline, and disabling
+# the address-math fold grows it back to 1272. mem_ops_native is
+# unchanged (its 0/8 displacements were already in the scaled fast
+# path). Same skips as the runner: float_ops rejected,
 # mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
 # path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
@@ -94,7 +107,7 @@ declare -A M0_BASELINES=(
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968
-    [loop_sum]=1040 [mem_ops_native]=1048 [obj_ops]=1164 [ptr_ops]=1120
+    [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [obj_ops]=1164 [ptr_ops]=1120
     [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
     [straight_line_bench]=1104
 )

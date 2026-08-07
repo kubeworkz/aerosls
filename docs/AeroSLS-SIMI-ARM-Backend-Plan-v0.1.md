@@ -1059,6 +1059,68 @@ Total emitted bytes across the 28-program parity set: **M0 38408 → M1
   jmpr_oob still faults (UDF, rc=1). Teeth: disabling the fold grows
   alu_imm to 1100 and alu_imm_ext to 1160 while remaining correct.
 
+### 10.22 M2.8 amendment — LOAD/STORE displacement address math (as built)
+
+§10.21 closed with the natural next target: a negative LOAD/STORE
+displacement fell to the movz(+movk)+add_shift materialization even at
+|disp| ≤ 4095, because A64's scaled load/store immediate is unsigned.
+M2.8 extends the M2.7 add/sub-imm machinery to the memory-operand
+address math. The LOAD and STORE codegen's non-scaled fallback (any
+disp that is negative, unaligned for the access width, or too large)
+now, gated on g_alloc, folds |disp| through the SAME shared
+imm12_split helper the ALU fold uses — plain imm12 (0..4095) or the
+shifted imm12<<12 form for multiples of 4096 up to 0xFFFFFF — emitting
+a single `add/sub xB, xB, #imm` in place on the base register (one
+word) instead of materialize + add_shift (2-5 words). STORE's
+materialize fallback keeps its M2.6-era X_T2 + emit_li64 shape (both
+x9/x10 are fetch targets there, so there is no h_imm to borrow). The
+in-place base modification is gated by clobber_scratch before the fold
+in both paths: without it, a base resident at its fetch slot would
+leave a stale directory entry claiming a register that now holds
+base±disp, poisoning every later read of that base (load-bearing —
+mem_neg re-reads its base registers across the fold rows and would
+compute wrong addresses otherwise).
+
+- **`tests/mem_neg.simi`** — the negative-displacement rows: [r6-8]
+  (fold sub #8), [r5-4096] (fold sub #1, lsl #12), [r5-4101] (honest
+  materialize — |disp| = 4101 > 4095 and not a multiple of 4096, so
+  the fold must decline), and [r6+5] (fold add #5 — positive but
+  unaligned for i32, so the scaled fast path declines too). The bases
+  r5 = r7 + 4661 (LEA #4095 + ADD #566) and r6 = r7 + 4087 (LEA
+  #4087) are pure arithmetic, never dereferenced, so every effective
+  address lands in r7 + [560, 4092] — the band portable across all
+  four engines' r7 scratch conventions: above ARM/RV64's 576-byte
+  frame (which occupies r7 + [−16, 560)), inside x86's 4096-byte mmap
+  window (a 4-byte i32 access must end before offset 4096), and small
+  enough for the interpreter's zeroed r7 + 64 KiB mem. The four i32
+  addresses (565, 560, 4079, 4092) are all ≥ 4 bytes apart. A first
+  draft used −4096 and −4097 — one byte apart — and the i32 stores
+  OVERLAPPED (the 4-byte store at r7+1 clobbered the store at r7+0's
+  high bytes); the four-way parity caught it as a wrong result (400
+  vs 600), the same class of address-overlap bug the scaled path's
+  alignment requirement guards against by construction. Expected
+  600. M0 baseline measured against the committed M0 translator:
+  **1308 → 1200, 108 saved**; disabling the fold grows it back to
+  exactly 1272. mem_ops_native's displacements (0, 8) were already in
+  the scaled fast path, so it is unchanged at 1004 — the audit the
+  milestone asked for.
+
+### 10.23 M2.8 gate results (measured)
+
+Total emitted bytes across the 29-program parity set: **M0 39716 →
+M1 37484, 2232 saved** (≈5.6%). The M2.8 row on top of M2.7's 2124:
+
+- mem_neg 1308 → 1200 (−108): six of its eight memory ops fold to a
+  single add/sub-imm (the −4096 rows through the sh=1 form); the
+  −4101 store+load round-trip stays on the honest materialize path.
+- Row-by-row M2.7-vs-M2.8 accounting (gate tables diffed, mem_neg
+  excluded): all 28 shared rows byte-identical — nothing else grew or
+  shrank. The totals move by exactly the mem_neg row (M0 +1308, M1
+  +1200).
+- Four-way parity: interp 31/0, x86 30/0/3, RV64 29/0/4, ARM 29/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: disabling the address-math
+  fold grows mem_neg to 1272 while remaining correct.
+
 ---
 
 ## Sources consulted

@@ -500,6 +500,16 @@ static uint8_t cache_single_host(int g) {
     if (g_alloc && cache_find(g) == 1) return X_T1;
     return X_T0;
 }
+/* M2.7/M2.8: split a magnitude into A64's add/sub immediate form —
+ * (sh, imm12) with value = imm12 << (12*sh), sh=0 for 0..4095 and
+ * sh=1 for multiples of 4096 up to 0xFFFFFF — returning 0 when it does
+ * not fit. Shared by the ALU immediate fold and the LOAD/STORE
+ * displacement address math. */
+static int imm12_split(uint64_t mag, int* sh, uint32_t* u) {
+    if (mag <= 4095) { *sh = 0; *u = (uint32_t)mag; return 1; }
+    if ((mag & 0xFFFu) == 0 && mag <= 0xFFFFFFu) { *sh = 1; *u = (uint32_t)(mag >> 12); return 1; }
+    return 0;
+}
 /* Materialize `imm` into the given scratch host, spilling its occupant
  * first. Callers pick the host with cache_single_host/cache_fetch_hosts
  * so it is never the first-operand host (which holds a live operand this
@@ -895,10 +905,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
                 uint64_t mag = (imm < 0) ? (uint64_t)(-imm) : (uint64_t)imm;
                 int add_dir = (op == OP_ADD) ^ (imm < 0);   /* 1 = add-imm, 0 = sub-imm */
                 int sh; uint32_t u;
-                if (mag <= 4095) { sh = 0; u = (uint32_t)mag; }
-                else if ((mag & 0xFFFu) == 0 && mag <= 0xFFFFFFu) { sh = 1; u = (uint32_t)(mag >> 12); }
-                else { sh = -1; u = 0; }
-                if (sh >= 0) {
+                if (imm12_split(mag, &sh, &u)) {
                     e32(cb, add_dir ? enc_add_imm_sh(rh, h_a, u, (uint8_t)sh)
                                     : enc_sub_imm_sh(rh, h_a, u, (uint8_t)sh));
                     store_result(cb, rd);
@@ -1078,9 +1085,33 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             /* the offset folds into the scaled immediate — no address math */
             load_typed(cb, type, rh, h_a, (uint16_t)(disp >> sh));
         } else {
+            /* M2.8: address math. Fold |disp| into a single add/sub-imm
+             * (plain or shifted) when it fits — negative displacements
+             * previously fell to the materialize path even at
+             * |disp| <= 4095 — else materialize. Gated on g_alloc like
+             * the ALU fold: the naive JMPR path stays byte-identical to
+             * M0. */
+            uint64_t mag = (disp < 0) ? (uint64_t)(-(int64_t)disp) : (uint64_t)disp;
+            int sh2; uint32_t u;
+            /* The address math below modifies h_a IN PLACE (sub/add the
+             * displacement into the base register). If the cache
+             * directory still claimed h_a's slot held the base as a
+             * resident value, a later get_operand(base) would reuse the
+             * now-address-modified register instead of reloading it —
+             * the base's register value is poisoned. The clobber spills
+             * the slot's occupant (if any, and if not the reserved
+             * result slot) and clears the directory entry, so the next
+             * fetch of the base must go to memory. Load-bearing, not
+             * defensive: mem_neg re-reads its base registers across
+             * these rows and would compute wrong addresses without it. */
             clobber_scratch(cb, h_a);
-            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
-            e32(cb, enc_add_shift(h_a, h_a, sc, 0, 0));
+            if (g_alloc && imm12_split(mag, &sh2, &u)) {
+                e32(cb, (disp >= 0) ? enc_add_imm_sh(h_a, h_a, u, (uint8_t)sh2)
+                                    : enc_sub_imm_sh(h_a, h_a, u, (uint8_t)sh2));
+            } else {
+                uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
+                e32(cb, enc_add_shift(h_a, h_a, sc, 0, 0));
+            }
             load_typed(cb, type, rh, h_a, 0);
         }
         store_result(cb, rd);
@@ -1100,10 +1131,23 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) {
             store_typed(cb, type, h_val, h_base, (uint16_t)(disp >> sh));
         } else {
+            /* M2.8: address math — same fold as LOAD's, on the base
+             * register; X_T2 stays untouched (and unclobbered) on the
+             * folded path. The clobber_scratch(h_base) before the fold
+             * is load-bearing exactly as in LOAD's address math: the
+             * in-place add/sub would leave a stale resident directory
+             * entry claiming a register that now holds base+/-disp. */
+            uint64_t mag = (disp < 0) ? (uint64_t)(-(int64_t)disp) : (uint64_t)disp;
+            int sh2; uint32_t u;
             clobber_scratch(cb, h_base);
-            clobber_scratch(cb, X_T2);
-            emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
-            e32(cb, enc_add_shift(h_base, h_base, X_T2, 0, 0));
+            if (g_alloc && imm12_split(mag, &sh2, &u)) {
+                e32(cb, (disp >= 0) ? enc_add_imm_sh(h_base, h_base, u, (uint8_t)sh2)
+                                    : enc_sub_imm_sh(h_base, h_base, u, (uint8_t)sh2));
+            } else {
+                clobber_scratch(cb, X_T2);
+                emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
+                e32(cb, enc_add_shift(h_base, h_base, X_T2, 0, 0));
+            }
             store_typed(cb, type, h_val, h_base, 0);
         }
         break;
