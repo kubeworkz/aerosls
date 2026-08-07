@@ -1121,6 +1121,106 @@ M1 37484, 2232 saved** (≈5.6%). The M2.8 row on top of M2.7's 2124:
   jmpr_oob still faults (UDF, rc=1). Teeth: disabling the address-math
   fold grows mem_neg to 1272 while remaining correct.
 
+### 10.24 M2.9 amendment — pre-indexed load/store fold (as built)
+
+§10.23 closed with the natural next target: a negative displacement
+that is *aligned* to the access width (e.g. −16 for i64) still paid the
+M2.8 sub-imm + zero-offset access (two words) even when it was tiny,
+because A64's scaled immediate is unsigned and the M2.8 address math
+had no smaller form. M2.9 adds the missing single-word form: the
+pre-indexed load/store with its signed 9-bit *unscaled* immediate,
+`ldr/str xt, [xb, #imm]!` (bits 31:30 size, 29:27 111, 26 0, 25:24 00,
+23:22 opc, 21 0, 20:12 imm9 signed, 11:10 11 pre-index, 9:5 Rn, 4:0 Rt
+— the 00/01 values of bits 11:10 are the unscaled ldur/stur and
+post-indexed forms, neither emitted). In both LOAD and STORE address
+math, a displacement that is negative, aligned to the access width,
+and fits imm9 (|disp| ≤ 256) now emits ONE word instead of sub + a
+zero-offset access, gated on g_alloc like every fold before it. The
+writeback updates only the base's HOST register — guest memory is
+touched only at the effective address, and clobber_scratch already
+poisoned the base slot before the fold (the M2.8 load-bearing detail,
+now load-bearing for a second reason), so later reads of the base
+re-fetch from memory. Two aliasing facts make the fold safe without
+extra guards: for LOAD, the emulator applies the writeback before the
+load result (the ARM pseudocode order), so rd==ra (`ldr x9, [x9,
+#-256]!`) ends with the loaded value in the result register; for
+STORE, the value and base hosts are always distinct (cache_fetch_hosts
+returns x9/x10), so the emitted rt never equals rn and the value is
+never the written-back address even when the guest value register
+aliases the base.
+
+A first draft double-emitted: the pre-indexed word was followed by the
+pre-existing trailing load_typed/store_typed, and for the rt==rn loads
+the follow-up zero-offset load re-read `Mem[loaded value]` as an
+address — the four-way parity caught it as a garbage ARM result
+(-1008467667301860836 vs 1144 on the other three engines). The
+translator now skips the trailing access on the pre-indexed branch
+(the load_typed/store_typed calls moved into the imm12_split and
+materialize branches). The same draft also used an i8 row loaded with
+T_I8: 200 sign-extends to −56, and the three non-ARM engines agreed on
+1144 — the row is u8 now.
+
+The emulator (a64_exec.c) gained the pre-indexed decode, fenced by
+`(w & 0x3B000000) == 0x38000000 && (w & 0xC00) == 0xC00` (bits 29:27
+= 111, 26 = 0, 25:24 = 00, 21 = 0, 11:10 = 11 — the scaled class's
+25:24 = 01 and the register-offset/atomic bit 21 = 1 are both
+excluded; ldur and post-indexed still fall through to BAD_INSTR as
+always). The writeback happens before the Rt read/store, matching the
+ARM pseudocode. a64_enc_check.py gained the 11 classes (ldr/str/ldrb/
+strb/ldrh/strh/ldr_w/str_w/ldrsb/ldrsh/ldrsw, all `_pre`) in ALLOWED
+and decoders masked 0xFFC00C00 so the 11:10 = 11 marker is asserted,
+not just the top byte. The encoding was pinned against QEMU's
+a64.decode `@ldst_imm_pre` and the canonical `str x29, [sp, #-16]!` ==
+0xF81F0FFD (no assembler available in this environment — the
+verification caveats of §2 apply; the parity net plus the independent
+Python bit layout are the cross-checks, exactly as for every other
+emitted class).
+
+- **`tests/mem_pre.simi`** — ten rows across all four widths: i64 at
+  [r5-16] and [r5-256] (the exact imm9 boundary — −256 is the most
+  negative 9-bit signed value), i32 at [r5-8] and [r5-4], i16 at
+  [r6-6], u8 at [r6-1], the sign-extending i8 (ldrsb) at [r6-9], i64
+  at [r6-24], and the two honest non-folds [r5-264] and [r6-258]
+  (|disp| > 256 yet still aligned, so they take the M2.8 sub path).
+  Every row round-trips store→load at the same address and re-reads
+  its base (r5/r6) across rows, pinning the clobber_scratch
+  poisoning the writeback depends on. Effective addresses stay in
+  r7 + [1784, 3047] — inside the same portable band as mem_neg, ≥ 4
+  bytes apart. Expected 1500. M0 baseline (committed M0 translator):
+  **1860 → 1392, 468 saved**; disabling the pre-indexed fold grows it
+  back to exactly 1456. mem_neg's [r6-8] store and load now fold too:
+  1200 → 1192, revising §10.22's "sub #8" row description and §10.23's
+  mem_neg total from 108 to 116 below M0.
+
+### 10.25 M2.9 gate results (measured)
+
+Total emitted bytes across the now-30-program parity set: **M0 41576 →
+M1 38868, 2708 saved** (≈6.5%), up from M2.8's 2232. The M2.9 rows on
+top of M2.8's 2232:
+
+- mem_pre 1860 → 1392 (−468): its sixteen foldable memory ops (eight
+  stores + eight loads) are each one pre-indexed word instead of
+  sub + access; the −264/−258 round-trips stay on the M2.8 sub path.
+- mem_neg 1308 → 1192 (−116, revised from −108): the [r6-8] i32 store
+  and load fold to `str/ldr w, [x, #-8]!`, two more words saved.
+- Row-by-row M2.8-vs-M2.9 accounting (gate tables diffed): all 28
+  shared rows byte-identical — nothing else grew or shrank. The
+  totals move by exactly mem_neg (−8) and the new mem_pre row.
+- Four-way parity: interp 32/0, x86 31/0/3, RV64 30/0/4, ARM 30/0/4.
+  enc-check 12/12 OK; jmpr_oob still faults (UDF, rc=1). Teeth:
+  disabling the pre-indexed fold grows mem_pre to 1456 and mem_neg to
+  1200, both still correct.
+
+The M-line has now compounded to 2708 bytes saved. The immediate
+family folds are complete across ALU, LOAD, and STORE — both signs,
+both shift forms, and now the pre-indexed writeback form for aligned
+negative displacements up to 256. The remaining lever on this axis is
+structural rather than another fold: a negative displacement that is
+*aligned but larger* than imm9 (e.g. −1024 for i64) still pays
+sub + zero-offset, where a post-indexed writeback could not help, and
+the two-word shape is the honest floor for magnitudes the pre-indexed
+imm9 cannot express.
+
 ---
 
 ## Sources consulted
