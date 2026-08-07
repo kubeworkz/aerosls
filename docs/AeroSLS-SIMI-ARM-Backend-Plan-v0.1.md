@@ -1221,6 +1221,111 @@ sub + zero-offset, where a post-indexed writeback could not help, and
 the two-word shape is the honest floor for magnitudes the pre-indexed
 imm9 cannot express.
 
+### 10.26 M2.10 amendment — the unscaled ldur/stur fold (as built)
+
+§10.25 closed by asking whether the post-indexed writeback
+(`ldr/str xt, [xb], #imm`) could fold another shape. The analysis
+answered no for post-indexed specifically: its access is at the
+UNMODIFIED base, so it can never fold the displacement into the same
+instruction — only a cross-instruction fusion could use it, and the
+translator emits one SIMI instruction at a time. But the same
+imm9-family inspection turned up the form post-indexed's comment had
+been calling out all along: the **unscaled ldur/stur** (bits 11:10 =
+00), which needs NO writeback and NO alignment requirement. That makes
+it strictly more general than the M2.9 pre-indexed form: it covers
+every displacement in the same signed 9-bit imm9 ([-256, 255]),
+*including unaligned ones* — the class that previously fell to the
+M2.8 sub-imm + zero-offset access — and it does so with no base
+register modification at all. M2.10 therefore replaces the pre-indexed
+fold with the unscaled fold; the pre-indexed and post-indexed forms
+(bits 11:10 = 11/01) are never emitted and decode to BAD_INSTR in the
+emulator, which the M2.9 comment already reserved for them.
+
+The translator change is small and simplifying. The fold condition
+became `g_alloc && disp >= -256 && disp <= 255` (both signs, any
+alignment); the unscaled word IS the access, so the trailing
+load_typed/store_typed is skipped exactly as in M2.9; and — the
+simplification — **clobber_scratch moved into the add/sub-imm
+else-branch only**, because the unscaled form never modifies the base
+host register. The M2.8/M2.9 load-bearing poison argument applied to
+the *in-place* add/sub; with no writeback, the base's cache directory
+entry stays truthful and a later fetch of the base can reuse the
+register. The rd==ra case (`ldr x9, [x9, #imm]` with rh == h_a) reads
+the base before overwriting it with the loaded value — no writeback
+ordering to reason about, identical to the scaled fast path's existing
+behavior. STORE's value/base hosts remain distinct by construction
+(cache_fetch_hosts returns x9/x10).
+
+The encoders are the imm9 family at bits 20:12 with bits 11:10 = 00
+(bases 0xF8400000/0xF8000000 ldur/stur, 0x38400000/0x38000000
+ldurb/sturb, 0x78400000/0x78000000 ldurh/sturh, 0xB8400000/0xB8000000
+ldur_w/stur_w, and the sign-extending ldursb/ldursh/ldursw at
+0x38800000/0x78800000/0xB8800000 — the M2.9 bases minus the 0xC00
+writeback marker), plus the load_unscaled/store_unscaled width tables.
+The emulator's decode fence became `(w & 0x3B000000) == 0x38000000 &&
+(w & 0xC00) == 0x0000` with the writeback line deleted; pre/post-indexed
+words fall through every other class to BAD_INSTR. a64_enc_check.py's
+11 classes renamed `_pre` → the bare ldur/stur names in the encoders,
+the decoders (mask 0xFFC00C00 with bits 11:10 = 00 asserted in both
+mask and target), and ALLOWED. The canonical reference is now
+`stur x29, [sp, #-16]` == 0xF81F03FD (0xF81F0FFD decodes back to the
+pre-indexed form — the bit that changed is exactly the 11:10 field).
+The QEMU @ldst_imm9 cite and the §2 verification caveats apply as
+before; the parity net plus the independent Python bit layout are the
+cross-checks.
+
+- **`tests/mem_pre.simi`** — rewritten for the unscaled form with two
+  NEW rows that only it can fold, which are the reason the form
+  supersedes M2.9: [r5+5] (positive but UNALIGNED for i32 — the
+  scaled fast path rejects it for alignment, and the M2.9 aligned-only
+  pre-indexed fold rejected it too) and [r5-45] (negative unaligned
+  — M2.9's alignment test excluded it as well). Both round-trip
+  store→load and fold to a single stur_w/ldursw word. The other ten
+  rows carry over ([r5-16], [r5-256] the imm9 boundary, the honest
+  non-folds [r5-264]/[r6-258], i32 [r5-8]/[r5-4], i16 [r6-6], u8
+  [r6-1], i8 ldursb [r6-9], i64 [r6-24]); expected 1800. M0 baseline
+  re-measured for the 12-row file: **2012 → 1472, 540 saved**;
+  disabling the unscaled fold grows it back to exactly 1552.
+- **`tests/mem_neg.simi`** — comment-only change; its [r6+5] row (the
+  positive-unaligned case that M2.8 folded as add #5 + access) now
+  folds to a single stur_w/ldursw #5: 1192 → 1184, revising §10.24's
+  mem_neg total from 116 to 124 below M0 (the [r6-8] row emits the
+  unscaled word instead of the pre-indexed one — same size, new
+  encoding).
+
+### 10.27 M2.10 gate results (measured)
+
+Total emitted bytes across the 30-program parity set: **M0 41728 → M1
+38940, 2788 saved** (≈6.7%), up from M2.9's 2708. The M2.10 rows on
+top of M2.9's 2708:
+
+- mem_pre 2012 → 1472 (−540, re-baselined for the 12-row file): its
+  20 foldable memory ops are each one unscaled word — including the
+  four that were two words under M2.9's aligned-only fold (the +5/−45
+  unaligned rows) — and its base grew by the M0 cost of two rows (152)
+  minus what the unscaled fold recovers (80).
+- mem_neg 1308 → 1184 (−124, revised from −116): the [r6+5] i32
+  store and load fold to `stur_w/ldursw w, [x, #5]`, two more words
+  saved.
+- Row-by-row M2.9-vs-M2.10 accounting (gate tables diffed): all 28
+  shared rows byte-identical — nothing else grew or shrank. The
+  totals move by exactly mem_neg (−8) and the mem_pre re-baseline.
+- Four-way parity: interp 32/0, x86 31/0/3, RV64 30/0/4, ARM 30/0/4.
+  enc-check 12/12 OK; jmpr_oob still faults (UDF, rc=1). Teeth:
+  disabling the unscaled fold grows mem_pre to 1552 and mem_neg to
+  1200, both still correct.
+
+The M-line has now compounded to 2788 bytes saved. The imm9 family is
+complete in its canonical form: the unscaled ldur/stur is the single
+word for EVERY displacement in [-256, 255], aligned or not, either
+sign — strictly more general than the pre-indexed form it replaced,
+and strictly simpler (no writeback, no clobber). The remaining lever
+on this axis is magnitudes past imm9: a displacement like −1024 for
+i64 still pays the two-word sub + zero-offset shape, where the
+register-offset forms (`ldr xt, [xb, xm]` with the magnitude in a
+register, or a base adjusted once for a run of accesses) are the
+natural next candidate.
+
 ---
 
 ## Sources consulted

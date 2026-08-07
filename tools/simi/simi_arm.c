@@ -262,26 +262,30 @@ static uint32_t enc_str_w(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0xB90
 static uint32_t enc_ldrsb(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0x39800000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_ldrsh(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0x79800000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_ldrsw(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0xB9800000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
-/* Load/store register, PRE-INDEXED (9-bit signed immediate, writeback):
- * size:2 111 0 00 opc 0 imm9:9 11 Rn Rt. The imm9 is UNSCALED (not
- * shifted by size), signed -256..255, and bits 11:10 = 11 select the
- * pre-indexed form (00 = the unscaled ldur/stur form, 01 =
- * post-indexed; neither is emitted). M2.9: folds a negative
- * displacement that is aligned to the access width and fits imm9 into
- * ONE word — the M2.8 add/sub-imm address math + zero-offset access
- * is two. Verified against QEMU's a64.decode @ldst_imm_pre and the
- * canonical str x29, [sp, #-16]! == 0xF81F0FFD. */
-static uint32_t enc_ldr_pre (uint8_t rt, uint8_t rn, int16_t imm9) { return 0xF8400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_str_pre (uint8_t rt, uint8_t rn, int16_t imm9) { return 0xF8000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_ldrb_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_strb_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_ldrh_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_strh_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_ldr_w_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_str_w_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_ldrsb_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_ldrsh_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
-static uint32_t enc_ldrsw_pre(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | (0x3u << 10) | ((uint32_t)rn << 5) | rt; }
+/* Load/store register, UNSCALED 9-bit signed immediate (ldur/stur):
+ * size:2 111 0 00 opc 0 imm9:9 00 Rn Rt. The imm9 is UNSCALED (not
+ * shifted by size), signed -256..255, and bits 11:10 = 00 select the
+ * unscaled form — the access has NO writeback and NO alignment
+ * requirement (that is exactly what ldur/stur exist for; bits 11:10
+ * = 01 is post-indexed and 11 is pre-indexed). M2.10: this form
+ * SUPERSEDES the M2.9 pre-indexed fold (writeback): same single word
+ * for the foldable range, no writeback to poison the base host (so a
+ * resident base stays resident), and it extends the fold to POSITIVE
+ * and UNALIGNED displacements the scaled path rejects (e.g. [x, #5]
+ * i32, which M2.8 paid add #5 + access for). Verified against QEMU's
+ * a64.decode @ldst_imm and the canonical stur x29, [sp, #-16] ==
+ * 0xF81F03FD. */
+static uint32_t enc_ldur  (uint8_t rt, uint8_t rn, int16_t imm9) { return 0xF8400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_stur  (uint8_t rt, uint8_t rn, int16_t imm9) { return 0xF8000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldurb (uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_sturb (uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldurh (uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_sturh (uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldur_w(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8400000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_stur_w(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8000000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldursb(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldursh(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldursw(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
 /* Branches. imm26/imm19 are in units of 4 bytes (word offsets). */
 static uint32_t enc_b   (int32_t imm26) { return 0x14000000u | ((uint32_t)imm26 & 0x03FFFFFFu); }
 static uint32_t enc_bl  (int32_t imm26) { return 0x94000000u | ((uint32_t)imm26 & 0x03FFFFFFu); }
@@ -739,28 +743,28 @@ static void store_typed(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn, ui
         default: e32(cb, enc_str(rs, rn, imm12)); break;
     }
 }
-/* M2.9: the same width/signedness table as load_typed/store_typed, in
- * the pre-indexed form — the access's imm9 IS the displacement (it must
- * be negative, aligned to the width, and fit -256..255, checked by the
- * caller), so there is no separate address-math word and no separate
- * zero-offset access: the whole thing is one word. */
-static void load_pre(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn, int16_t imm9) {
+/* M2.10: the same width/signedness table as load_typed/store_typed, in
+ * the UNSCALED form — the access's imm9 IS the displacement (checked
+ * by the caller to fit -256..255), so there is no separate address-math
+ * word and no separate zero-offset access: the whole thing is one
+ * word. No writeback, so the base host register is untouched. */
+static void load_unscaled(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn, int16_t imm9) {
     switch (type) {
-        case T_I8:  e32(cb, enc_ldrsb_pre(rd, rn, imm9)); break;
-        case T_U8:  case T_BOOL: e32(cb, enc_ldrb_pre(rd, rn, imm9)); break;
-        case T_I16: e32(cb, enc_ldrsh_pre(rd, rn, imm9)); break;
-        case T_U16: e32(cb, enc_ldrh_pre(rd, rn, imm9)); break;
-        case T_I32: case T_F32: e32(cb, enc_ldrsw_pre(rd, rn, imm9)); break;
-        case T_U32: e32(cb, enc_ldr_w_pre(rd, rn, imm9)); break;
-        default:    e32(cb, enc_ldr_pre(rd, rn, imm9)); break;
+        case T_I8:  e32(cb, enc_ldursb(rd, rn, imm9)); break;
+        case T_U8:  case T_BOOL: e32(cb, enc_ldurb(rd, rn, imm9)); break;
+        case T_I16: e32(cb, enc_ldursh(rd, rn, imm9)); break;
+        case T_U16: e32(cb, enc_ldurh(rd, rn, imm9)); break;
+        case T_I32: case T_F32: e32(cb, enc_ldursw(rd, rn, imm9)); break;
+        case T_U32: e32(cb, enc_ldur_w(rd, rn, imm9)); break;
+        default:    e32(cb, enc_ldur(rd, rn, imm9)); break;
     }
 }
-static void store_pre(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn, int16_t imm9) {
+static void store_unscaled(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn, int16_t imm9) {
     switch (type) {
-        case T_I8: case T_U8: case T_BOOL: e32(cb, enc_strb_pre(rs, rn, imm9)); break;
-        case T_I16: case T_U16:            e32(cb, enc_strh_pre(rs, rn, imm9)); break;
-        case T_I32: case T_U32: case T_F32: e32(cb, enc_str_w_pre(rs, rn, imm9)); break;
-        default: e32(cb, enc_str_pre(rs, rn, imm9)); break;
+        case T_I8: case T_U8: case T_BOOL: e32(cb, enc_sturb(rs, rn, imm9)); break;
+        case T_I16: case T_U16:            e32(cb, enc_sturh(rs, rn, imm9)); break;
+        case T_I32: case T_U32: case T_F32: e32(cb, enc_stur_w(rs, rn, imm9)); break;
+        default: e32(cb, enc_stur(rs, rn, imm9)); break;
     }
 }
 static int type_shift(int t) {   /* log2(byte width) — used for PTRADD scaling */
@@ -1137,40 +1141,41 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
              * M0. */
             uint64_t mag = (disp < 0) ? (uint64_t)(-(int64_t)disp) : (uint64_t)disp;
             int sh2; uint32_t u;
-            /* The address math below modifies h_a IN PLACE (sub/add the
-             * displacement into the base register). If the cache
-             * directory still claimed h_a's slot held the base as a
-             * resident value, a later get_operand(base) would reuse the
-             * now-address-modified register instead of reloading it —
-             * the base's register value is poisoned. The clobber spills
-             * the slot's occupant (if any, and if not the reserved
-             * result slot) and clears the directory entry, so the next
-             * fetch of the base must go to memory. Load-bearing, not
-             * defensive: mem_neg re-reads its base registers across
-             * these rows and would compute wrong addresses without it. */
-            clobber_scratch(cb, h_a);
-            /* M2.9: pre-indexed fold — a negative displacement that is
-             * ALIGNED to the access width and fits imm9 (-256..255)
-             * folds into a single ldr xt, [xb, #imm]! (one word, vs the
-             * M2.8 sub + zero-offset access = two). The writeback
-             * updates the base HOST register only — guest memory is
-             * untouched and clobber_scratch above has poisoned the
-             * base's slot, so the next fetch of ra re-reads memory. The
-             * emulator applies the writeback before the load result
-             * (the ARM pseudocode order), so rd==ra is safe: the loaded
-             * value overwrites the written-back address in rh exactly
-             * as the two-instruction sequence would. */
-            if (g_alloc && disp < 0 && mag <= 256 &&
-                (disp & ((1 << sh) - 1)) == 0) {
-                load_pre(cb, type, rh, h_a, (int16_t)disp);   /* pre-indexed: access AND writeback in one word — skip the trailing load_typed */
-            } else if (g_alloc && imm12_split(mag, &sh2, &u)) {
-                e32(cb, (disp >= 0) ? enc_add_imm_sh(h_a, h_a, u, (uint8_t)sh2)
-                                    : enc_sub_imm_sh(h_a, h_a, u, (uint8_t)sh2));
-                load_typed(cb, type, rh, h_a, 0);
+            /* M2.10: unscaled ldur/stur fold — ANY displacement that
+             * fits A64's signed 9-bit imm9 ([-256, 255]) folds into a
+             * single ldr/str xt, [xb, #imm] word, with NO writeback and
+             * NO alignment requirement (the M2.9 pre-indexed form needed
+             * both — unaligned displacements like #-45 fell to the M2.8
+             * address math). Nothing modifies h_a here, so this branch
+             * skips the clobber the add/sub paths need: if the base is
+             * resident at this slot its directory entry stays valid and
+             * a later fetch of ra can reuse the register. The unscaled
+             * word IS the access, so the trailing load_typed is
+             * skipped. */
+            if (g_alloc && disp >= -256 && disp <= 255) {
+                load_unscaled(cb, type, rh, h_a, (int16_t)disp);
             } else {
-                uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
-                e32(cb, enc_add_shift(h_a, h_a, sc, 0, 0));
-                load_typed(cb, type, rh, h_a, 0);
+                /* The address math below modifies h_a IN PLACE (sub/add the
+                 * displacement into the base register). If the cache
+                 * directory still claimed h_a's slot held the base as a
+                 * resident value, a later get_operand(base) would reuse the
+                 * now-address-modified register instead of reloading it —
+                 * the base's register value is poisoned. The clobber spills
+                 * the slot's occupant (if any, and if not the reserved
+                 * result slot) and clears the directory entry, so the next
+                 * fetch of the base must go to memory. Load-bearing, not
+                 * defensive: mem_neg re-reads its base registers across
+                 * these rows and would compute wrong addresses without it. */
+                clobber_scratch(cb, h_a);
+                if (g_alloc && imm12_split(mag, &sh2, &u)) {
+                    e32(cb, (disp >= 0) ? enc_add_imm_sh(h_a, h_a, u, (uint8_t)sh2)
+                                        : enc_sub_imm_sh(h_a, h_a, u, (uint8_t)sh2));
+                    load_typed(cb, type, rh, h_a, 0);
+                } else {
+                    uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
+                    e32(cb, enc_add_shift(h_a, h_a, sc, 0, 0));
+                    load_typed(cb, type, rh, h_a, 0);
+                }
             }
         }
         store_result(cb, rd);
@@ -1190,35 +1195,37 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) {
             store_typed(cb, type, h_val, h_base, (uint16_t)(disp >> sh));
         } else {
-            /* M2.8: address math — same fold as LOAD's, on the base
-             * register; X_T2 stays untouched (and unclobbered) on the
-             * folded path. The clobber_scratch(h_base) before the fold
-             * is load-bearing exactly as in LOAD's address math: the
-             * in-place add/sub would leave a stale resident directory
-             * entry claiming a register that now holds base+/-disp. */
+            /* M2.10: unscaled ldur/stur fold — same imm9 window as
+             * LOAD's, on the base register, and equally writeback-free:
+             * the emitted rt (h_val) and rn (h_base) are always distinct
+             * hosts (cache_fetch_hosts returns x9/x10), so the store
+             * value register is untouched even when the guest value
+             * register aliases the base (STORE r, r, #disp). The
+             * unscaled word IS the access, so the trailing store_typed
+             * is skipped. */
             uint64_t mag = (disp < 0) ? (uint64_t)(-(int64_t)disp) : (uint64_t)disp;
             int sh2; uint32_t u;
-            clobber_scratch(cb, h_base);
-            /* M2.9: pre-indexed fold — same condition as LOAD's, on the
-             * base register. The emitted rt (h_val) is always a
-             * DIFFERENT host register than rn (h_base) —
-             * cache_fetch_hosts returns distinct x9/x10 — so the store
-             * value sits in a register the writeback never touches, even
-             * when the guest value register aliases the base (STORE r,
-             * r, #-disp); the ARM pseudocode reads Rt after the
-             * writeback, and rt != rn here makes that moot. */
-            if (g_alloc && disp < 0 && mag <= 256 &&
-                (disp & ((1 << sh) - 1)) == 0) {
-                store_pre(cb, type, h_val, h_base, (int16_t)disp);   /* pre-indexed: access AND writeback in one word — skip the trailing store_typed */
-            } else if (g_alloc && imm12_split(mag, &sh2, &u)) {
-                e32(cb, (disp >= 0) ? enc_add_imm_sh(h_base, h_base, u, (uint8_t)sh2)
-                                    : enc_sub_imm_sh(h_base, h_base, u, (uint8_t)sh2));
-                store_typed(cb, type, h_val, h_base, 0);
+            if (g_alloc && disp >= -256 && disp <= 255) {
+                store_unscaled(cb, type, h_val, h_base, (int16_t)disp);
             } else {
-                clobber_scratch(cb, X_T2);
-                emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
-                e32(cb, enc_add_shift(h_base, h_base, X_T2, 0, 0));
-                store_typed(cb, type, h_val, h_base, 0);
+                /* The add/sub-imm fold below modifies h_base IN PLACE,
+                 * with the materialize fallback using X_T2 (which the
+                 * folded path never touches). The clobber_scratch(h_base)
+                 * before it is load-bearing exactly as in LOAD's address
+                 * math: the in-place add/sub would leave a stale resident
+                 * directory entry claiming a register that now holds
+                 * base±disp. */
+                clobber_scratch(cb, h_base);
+                if (g_alloc && imm12_split(mag, &sh2, &u)) {
+                    e32(cb, (disp >= 0) ? enc_add_imm_sh(h_base, h_base, u, (uint8_t)sh2)
+                                        : enc_sub_imm_sh(h_base, h_base, u, (uint8_t)sh2));
+                    store_typed(cb, type, h_val, h_base, 0);
+                } else {
+                    clobber_scratch(cb, X_T2);
+                    emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
+                    e32(cb, enc_add_shift(h_base, h_base, X_T2, 0, 0));
+                    store_typed(cb, type, h_val, h_base, 0);
+                }
             }
         }
         break;
