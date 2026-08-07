@@ -105,7 +105,22 @@
 # the branch is still dropped but the block-head flush stays. — 312
 # bytes below its M0 baseline, and disabling the coalescing (fold-
 # target check pc+1 -> pc+9999) grows it back to 1080, so the
-# fusion itself is worth 16 of the 312. mem_pre is M2.10:
+# fusion itself is worth 16 of the 312. jmpr_fall2 is M2.13:
+# CASCADING fall-through folds — three JMPRs in a row each folding to
+# their OWN next pc, with all three index constants loaded BEFORE the
+# chain. Under M2.12's merge this chain collapses: the first fold's
+# rule-1 mark on its target resets the constant map at the second
+# JMPR's index, un-folding it (a JMPR that fails to fold is DYNAMIC,
+# which kills g_alloc for the whole function — the rest fall back to
+# the runtime table + bounds check). M2.13's fix: the fold fixpoint's
+# rule-1 merge skips fall-through targets (target == pc+1 — its branch
+# is the dead one being dropped), so the constant map flows through
+# all three joins, every JMPR folds, and the coalescing pre-pass fuses
+# all three boundaries: no branch, no flush, x9/x10/x11 resident
+# across the whole chain. — 248 bytes below its M0 baseline (1228);
+# the old mark-all merge measures 1180 (the cascade alone is worth
+# 200 of the 248), and disabling the coalescing grows it back to 996
+# (fusion worth 16). mem_pre is M2.10:
 # ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
 # folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
 # no writeback, no alignment requirement, superseding the M2.9
@@ -155,7 +170,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_dyn]=1136 [jmpr_fall]=1376 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
+    [jmpr_dyn]=1136 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
