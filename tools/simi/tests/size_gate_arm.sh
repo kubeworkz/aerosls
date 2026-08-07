@@ -41,7 +41,12 @@
 # M2.4: a chain that re-reads r1/r2 as sources five times; cache_reserve
 # now prefers a non-source victim, so the sources stay resident — 40
 # bytes below its M0 baseline, and reverting the source preference grows
-# it back to 1108 (28 over the hint). Same skips as the runner: float_ops rejected,
+# it back to 1108 (28 over the hint). fetch_cross is M2.5: a chain that
+# alternates operand order so ra@slot1 and rb@slot0 are CROSSED, the
+# shape where the default fetch targets (ra->x9, rb->x10) spill both
+# operands and reload one — cache_fetch_hosts swaps the targets so each
+# fetch is a no-op into its own slot — 104 bytes below its M0 baseline,
+# and reverting the swap grows it back to 1160 (the M2.4 state). Same skips as the runner: float_ops rejected,
 # mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
 # path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
@@ -69,7 +74,8 @@ VERIFY=../simi-arm-verify
 # name: M0 bytes (from git 1729f50, built + measured 2026-08-07)
 declare -A M0_BASELINES=(
     [add]=976 [aggregate_abi]=4592 [branch_cmp]=1096 [call_ret]=1932
-    [cap_call_ret]=3192 [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
+    [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
+    [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968

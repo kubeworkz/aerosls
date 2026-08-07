@@ -1,0 +1,41 @@
+; fetch_cross.simi — M2.5: the fetch-order clobber. This chain keeps r1
+; and r2 resident at slots 0 and 1 (every instruction's sources), then
+; alternates the OPERAND ORDER so each ADD reads r2 as ra and r1 as rb:
+; ra@slot1, rb@slot0 — CROSSED. get_operand's default fetch targets
+; (ra->x9, rb->x10) would spill r1 on the first fetch, then spill r2 and
+; reload r1 on the second — two spills and a reload for operands that
+; were both resident. M2.5's cache_fetch_hosts swaps the targets
+; (ra->x10, rb->x9), making each fetch a no-op into its own slot.
+; The CMP and PTRADD variants exercise the same swap in their codegen
+; (emit_cmp's operand hosts, and the shifted add). Without the fix the
+; crossed instructions are 4-6 words each instead of 1-2; the teeth
+; check (reverting cache_fetch_hosts) grows this test back to 1160 — 48
+; bytes over — while parity still passes. That 48 is the COMPOUNDING
+; total: the first no-fix crossed ADD spills both sources, so later
+; instructions find empty slots and pay less, not a flat 6 words each.
+; r3 = r1 + r2 = 12 (establishes the slot pattern)
+; r4..r7 = r2 + r1 = 12 each (crossed)
+; r8 = (r2 > r1) = 1 (crossed CMP)
+; r9 = r2 + r1*8 = 47 (crossed PTRADD, i64 scale = <<3)
+; r0 = 12+12+12+12 + 1 + 47 = 96
+; Expected result: 96
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #5, i64
+    LOADI r2, #7, i64
+    ADD r3, r1, r2, i64      ; 12 (r3 @ slot 2)
+    ADD r4, r2, r1, i64      ; crossed: 12
+    ADD r5, r2, r1, i64      ; crossed: 12
+    ADD r6, r2, r1, i64      ; crossed: 12
+    ADD r7, r2, r1, i64      ; crossed: 12
+    CMP r8, r2, r1, i64, GT  ; crossed: (7 > 5) = 1
+    PTRADD r9, r2, r1, i64   ; crossed: 7 + 5*8 = 47
+    LOADI r0, #0, i64
+    ADD r0, r0, r4, i64      ; 12
+    ADD r0, r0, r5, i64      ; 24
+    ADD r0, r0, r6, i64      ; 36
+    ADD r0, r0, r7, i64      ; 48
+    ADD r0, r0, r8, i64      ; 49
+    ADD r0, r0, r9, i64      ; 96
+    RET

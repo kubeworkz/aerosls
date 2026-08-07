@@ -903,10 +903,64 @@ Total emitted bytes across the 25-program parity set: **M0 34864 → M1
 - The reservation preference does not address the FETCH-ORDER clobber:
   when a source lives in the other operand's fetch target slot (e.g.
   ra resident in slot 1 but fetched into X_T0), get_operand still
-  spills the co-resident source and reloads it. A fetch-target
-  selection aware of both operands would be the next compounding win.
+  spills the co-resident source and reloads it. **Closed by M2.5
+  (§10.16)**: fetch-target selection is now aware of both operands,
+  compounding 264 bytes beyond M2.4 (1668 → 1932).
 - The defensive round-robin fallback is argued unreachable (3 slots,
   ≤2 sources, rd not resident) and untested by construction.
+
+### 10.16 M2.5 amendment — fetch-order clobber fixed (as built)
+
+M2.4's first honest limit is now closed: get_operand's fetch-target
+selection is aware of both operands. The default host assignment
+(operand1→x9, operand2→x10) is overridden per instruction by two new
+helpers:
+
+- `cache_fetch_hosts(g1, g2, &h1, &h2)` — used by every two-register
+  form (ALU, DIV/MOD, CMP, PTRADD, STORE's base+value): when g1 is
+  resident at slot 1 or g2 at slot 0 (the CROSSED shape — e.g.
+  `ADD r5, r2, r1` after `ADD r4, r1, r2` leaves r1@slot0, r2@slot1),
+  the targets swap so each operand fetches into its own resident slot.
+  Otherwise the first fetch spills the second operand, then the second
+  fetch spills the first and reloads it — two spills and a reload for
+  operands that were both resident. The swap is never larger than the
+  default (checked per residency combination) and usually 2-4 words
+  smaller. Naive mode keeps x9/x10 so M0 codegen stays byte-identical
+  (gate baselines untouched).
+- `cache_single_host(g)` — for the one-register-operand + immediate
+  forms (ALU/DIV/MOD imm, LEA, PTRADD imm, LOAD): the operand takes x10
+  when resident at slot 1, so the immediate's materialization (into x9)
+  never spills it. `materialize_imm` now takes its target host
+  explicitly; the M1-era X_T2 fallback for g_resv_slot==1 is gone,
+  argued safe: the one live-reuse collision (rd==ra reused at slot 1)
+  always triggers the slot-1 swap, so the immediate never overwrites a
+  reused result register still holding rd's live old value.
+- `emit_cmp` gained rn/rm host parameters, so CMP's `subs xzr, rn, rm`
+  keeps the relation's operand order under the swap.
+
+- **`tests/fetch_cross.simi`** — a chain that alternates operand order
+  (`ADD rX, r2, r1` after `ADD r3, r1, r2`) so every instruction is
+  crossed (ra@slot1, rb@slot0), plus crossed CMP and PTRADD variants
+  (expected 96). M0 baseline measured against the committed M0
+  translator: **1216 → 1112, 104 saved**; the teeth check (reverting
+  the swap) grows it to 1160 — the M2.4 state — while remaining
+  correct. The swap compounds corpus-wide: src_resident 1080 → 1056,
+  aggregate_abi 4432 → 4420, mem_ops_native −8 more.
+
+### 10.17 M2.5 gate results (measured)
+
+Total emitted bytes across the 26-program parity set: **M0 36080 → M1
+34148, 1932 saved** (≈5.4%). The M2.5 rows on top of M2.4's 1668:
+
+- fetch_cross 1216 → 1112 (−104): the crossed chain fetches each
+  operand into its own resident slot (1-2 words per instruction
+  instead of 5-6).
+- src_resident 1080 → 1056 (−24 additional), aggregate_abi 4432 →
+  4420 (−12 additional): the swap compounds on existing
+  arithmetic-heavy programs.
+- Four-way parity: interp 28/0, x86 27/0/3, RV64 26/0/4, ARM 26/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: reverting the swap grows
+  fetch_cross to exactly 1160 while remaining correct.
 
 ---
 
