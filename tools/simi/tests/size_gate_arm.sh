@@ -24,7 +24,13 @@
 # fold-soundness pin: its index is set to different constants on two
 # joining paths, so it must NOT fold (0 saved — and reverting the block-
 # head constant reset makes it return 1 instead of 222, caught by the
-# four-way parity). Same skips as the runner: float_ops rejected,
+# four-way parity). jmpr_calc is M2.1: its index is COMPUTED at translate
+# time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
+# reg+reg, reg+imm) — 212 bytes below its M0 baseline, and disabling the
+# ADD/SUB fold grows it back to exactly 1288. jmpr_mix is the M2.1 mixed
+# case: one runtime JMPR (forces g_alloc=0, whole program naive) and one
+# constant JMPR that still folds — 48 bytes below its M0 baseline, the
+# folded-branch-under-naive-codegen interaction pinned. Same skips as the runner: float_ops rejected,
 # mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
 # path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
@@ -53,8 +59,8 @@ VERIFY=../simi-arm-verify
 declare -A M0_BASELINES=(
     [add]=976 [aggregate_abi]=4592 [branch_cmp]=1096 [call_ret]=1932
     [cap_call_ret]=3192 [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
-    [jmpr_basic]=1088 [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200
-    [loadi64]=968
+    [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_dyn]=1136 [jmpr_join]=1144
+    [jmpr_mid]=1200 [jmpr_mix]=1300 [loadi64]=968
     [loop_sum]=1040 [mem_ops_native]=1048 [obj_ops]=1164 [ptr_ops]=1120
     [rd_star]=1108 [rv64_boot_smoke]=928 [straight_line_bench]=1104
 )

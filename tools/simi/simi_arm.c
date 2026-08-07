@@ -1113,6 +1113,35 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     g_const_known[rd] = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
                     g_const_val[rd] = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
                 }
+            } else if (op == OP_ADD || op == OP_SUB) {
+                /* M2.1: fold arithmetic constants. The emitted ALU is a
+                 * plain 64-bit add/sub for every SIMI type (no width or
+                 * signedness rounding — the translator never truncates),
+                 * and the imm28 is sign-extended exactly as
+                 * materialize_imm does, so the 64-bit wrap of a+b / a-b
+                 * here is bit-identical to runtime. Deliberately limited
+                 * to ADD/SUB: DIV/MOD would change behavior on a
+                 * translate-time division by zero; MUL would fold just as
+                 * safely (plain 64-bit multiply, never faults, type-
+                 * agnostic like ADD/SUB) but is left with the rest of the
+                 * ALU family for the same later pass — a conservative
+                 * omission, not a soundness one. */
+                if (rd < TX_AR_MAX_REGS) {
+                    int k = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
+                    uint64_t a = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
+                    int fold = 0;
+                    uint64_t b = 0;
+                    if (w_flags(w) & FLAG_IMM) {
+                        b = (uint64_t)(int64_t)w_imm28(w);
+                        fold = k;
+                    } else {
+                        uint16_t rb = w_rb_reg(w);
+                        fold = k && rb < TX_AR_MAX_REGS && g_const_known[rb];
+                        if (fold) b = g_const_val[rb];
+                    }
+                    if (fold) { g_const_known[rd] = 1; g_const_val[rd] = (op == OP_ADD) ? a + b : a - b; }
+                    else      { g_const_known[rd] = 0; }
+                }
             } else if (op == OP_ENTER || op == OP_RET) {
                 for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;  /* prologue/terminal: no constant survives */
             } else if (op == OP_JMPR) {
