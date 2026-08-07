@@ -1,0 +1,22 @@
+; jmpr_join.simi — M2 fold-soundness: the JMPR's index is set to a
+; DIFFERENT constant on each of two paths that join at the JMPR (r1 = 8 on
+; the branch path, 9 on the fall-through). The fold analysis must NOT fold
+; this JMPR: pc 5 (dispatch) is a branch target, so the constant map
+; resets at the join and the JMPR keeps the dynamic runtime dispatch. An
+; unsound linear scan (no reset at the join) would fold r1=9 from the
+; dead fall-through and jump to pc 9 (RET), returning 1 instead of 222 —
+; the four-way parity would catch it.
+; Expected result: 222
+.entry main
+main:
+    ENTER #8
+    LOADI r0, #1, i64        ; nonzero — the BC below always branches
+    LOADI r1, #8, i64        ; branch-path index
+    BC r0, dispatch          ; r0 != 0 → jump to dispatch (pc 5)
+    LOADI r1, #9, i64        ; fall-through only: r1 = 9 (dead at runtime)
+dispatch:
+    JMPR r1                  ; r1 = 8 at runtime → dynamic dispatch to pc 8
+    LOADI r0, #111, i32
+    RET
+    LOADI r0, #222, i32
+    RET

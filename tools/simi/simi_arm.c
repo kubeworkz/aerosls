@@ -322,14 +322,29 @@ static void emit_li64(struct CodeBuf* cb, uint8_t reg, uint64_t imm);   /* fwd: 
  * sequences, so the JMPR fallback is exercised by jmpr_basic/jmpr_oob.
  */
 #define AR_CACHE_N 3
-static int g_alloc;                    /* 0 when the program contains JMPR */
-static int g_has_jmpr;                 /* any JMPR in the program disables the cache */
+static int g_alloc;                    /* 0 when any JMPR cannot be folded to a direct branch */
 static int g_cache_guest[AR_CACHE_N];  /* guest reg resident in x9+i, or -1 */
 static int g_cache_round;              /* round-robin eviction cursor */
 static int g_resv_slot;                /* slot reserved for the in-flight result */
 static int g_resv_reuse;               /* reserved slot held rd's old value (in-place result) */
 static int g_resv_guest;               /* the guest reg the reservation is for (== rd) */
-static uint8_t g_pc_target[4096];      /* branch/call target pcs (block heads) */
+static uint8_t g_pc_target[4096];      /* branch/call/fold-target pcs (block heads) */
+/* M2: constant-index JMPR folding. A JMPR's index is usually a constant
+ * loaded shortly before the dispatch (LOADI/MOV chains), and a JMPR with
+ * a provably-constant in-range index is just a direct branch — which the
+ * normal block-head discipline makes cache-safe. The pre-pass tracks
+ * per-register compile-time constants (g_const_known/g_const_val, reset
+ * at every block head so the analysis is sound across joins) and records
+ * a fold target per JMPR pc in g_jmpr_fold (-1 = keep the dynamic
+ * runtime-table path). g_alloc is 1 only when every JMPR folds; a single
+ * non-constant (or out-of-range) JMPR still forces the whole program
+ * back to the naive path, because that JMPR's runtime targets can be any
+ * pc, and any pc reachable without a compile-time discipline makes every
+ * pc a potential block head. */
+static uint64_t g_const_val[TX_AR_MAX_REGS];
+static uint8_t  g_const_known[TX_AR_MAX_REGS];
+static int      g_jmpr_fold[4096];      /* per-JMPR-pc folded target, or -1 */
+static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-scope like the other arrays) */
 
 static uint8_t cache_host(int i) { return (uint8_t)(X_T0 + i); }
 static int cache_find(int g) {
@@ -991,36 +1006,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         e32(cb, enc_br(X_LR));
         break;
     case OP_CALL: return TX_AR_ERR_BAD_OPCODE; /* handled specially in translate() (needs pc) */
-    case OP_JMPR: {
-        /* Gap Remediation SIMI Phase 14: indirect jump through the runtime
-         * table of guest-space code offsets (see g_jmpr_li_pos's design
-         * note above and the reservation+backfill glue in
-         * simi_arm_translate()). Unlike BR/BC/CALL this needs no pc from
-         * the caller and no global fixup entry — the target is only known
-         * at runtime. The bounds check (t0 < num_instr) is the
-         * non-negotiable CFI requirement of ISA §16: `cmp x9, x11; cset
-         * x10, lo` then cbz to UDF #0 on the out-of-bounds path.
-         * (g_alloc is 0 in any program containing JMPR — the cache is
-         * never populated — so the flush here is a no-op, kept for the
-         * invariant's sake.) */
-        cache_flush(cb);
-        ld_slot(cb, X_T0, ra);                            /* t0 = target abstract pc */
-        e32(cb, enc_movz(X_T2, (uint16_t)g_num_instr, 0)); /* num_instr <= 4096 fits one movz */
-        e32(cb, enc_subs_shift(31, X_T0, X_T2, 0, 0));    /* cmp x9, x11 */
-        e32(cb, enc_cset(X_T1, 3));                       /* cset x10, lo — unsigned less */
-        uint32_t cbz_pos = emit_cbz_placeholder(cb); /* cbz t1, .oob */
-        /* Table base: 4-word movz+3xmovk placeholder, patched once the
-         * table's offset is known (see the final pass in translate()). */
-        if (g_njmpr_li_pos >= TX_AR_MAX_FIXUPS) return TX_AR_ERR_TOO_MANY_FIXUPS;
-        g_jmpr_li_pos[g_njmpr_li_pos++] = cb->len;
-        e32(cb, 0); e32(cb, 0); e32(cb, 0); e32(cb, 0);
-        e32(cb, enc_add_shift(X_T2, X_T2, X_T0, 0, 3));   /* t2 = base + (target << 3) */
-        e32(cb, enc_ldr(X_T2, X_T2, 0));                  /* t2 = table[target] */
-        e32(cb, enc_br(X_T2));                            /* jump — never falls through */
-        patch_local_cbz(cb, cbz_pos, X_T1);               /* .oob: */
-        op_illegal(cb);                                   /* UDF #0 — real undefined-instruction trap, non-negotiable CFI per ISA §16 */
-        break;
-    }
+    case OP_JMPR: return TX_AR_ERR_BAD_OPCODE; /* handled specially in translate() (needs the jump table; folded in M2) */
     default: return TX_AR_ERR_BAD_OPCODE;
     }
     return TX_AR_OK;
@@ -1078,27 +1064,83 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     struct CodeBuf cb; cb.buf = out_buf; cb.cap = out_cap; cb.len = 0; cb.overflow = 0;
     g_nfixups = 0;
 
-    /* M1: pre-pass — mark branch/call target pcs (block heads) and detect
-     * JMPR. A program containing JMPR translates with the cache disabled
-     * (g_alloc=0): the JMPR table can land on any pc, so every pc would be
-     * a block head, which is no cache at all — the naive M0 codegen is
-     * byte-identical and jmpr_basic/jmpr_oob exercise it. */
-    g_has_jmpr = 0;
-    for (uint32_t q = 0; q < 4096; q++) g_pc_target[q] = 0;   /* clear ONCE, before the loop
-                                                                 * — zeroing g_pc_target[pc] inside
-                                                                 * the loop would wipe marks that
-                                                                 * earlier branches set (branch_cmp
-                                                                 * caught this exact bug) */
+    /* M1/M2 pre-pass. Pass A: mark branch/call target pcs (block heads).
+     * The targets must be cleared ONCE, before the loop — zeroing
+     * g_pc_target[pc] inside the loop would wipe marks that earlier
+     * branches set (branch_cmp caught this exact bug). */
+    for (uint32_t q = 0; q < 4096; q++) g_pc_target[q] = 0;
     for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
         uint64_t w = instrs[pc];
         uint8_t op = w_op(w);
-        if (op == OP_JMPR) g_has_jmpr = 1;
-        else if (op == OP_BR || op == OP_BC || op == OP_CALL) {
+        if (op == OP_BR || op == OP_BC || op == OP_CALL) {
             int64_t tgt = (int64_t)pc + 1 + w_imm28(w);
             if (tgt >= 0 && tgt < (int64_t)hdr.num_instr) g_pc_target[(uint32_t)tgt] = 1;
         }
     }
-    g_alloc = g_has_jmpr ? 0 : 1;
+    /* M2: constant-index JMPR folding, by fixpoint. Each scan walks the
+     * linear stream with a per-register constant map that resets at every
+     * pc in g_pc_target (pass-A targets plus any fold targets discovered
+     * so far). The reset makes the analysis sound across joins: a chain
+     * between block heads is executed identically on every path that
+     * enters it, so a constant attributed to the JMPR's index there holds
+     * on every arrival. A JMPR whose index is a known in-range constant
+     * records its fold target; the target is merged into g_pc_target so
+     * rule 1 flushes its block head in the main loop. The fixpoint
+     * matters because a fold target can sit inside another JMPR's chain
+     * (a backward fold retroactively splits it, potentially un-folding
+     * that JMPR) — the fold set is monotone decreasing, so this
+     * terminates in at most the number of JMPRs. */
+    for (int i = 0; i < 4096; i++) g_jmpr_fold[i] = -1;
+    for (;;) {
+        for (int i = 0; i < 4096; i++) g_jmpr_fold_prev[i] = g_jmpr_fold[i];
+        for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;
+        for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+            if (g_pc_target[pc]) {   /* block head: constants do not survive a join */
+                for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;
+            }
+            uint64_t w = instrs[pc];
+            uint8_t op = w_op(w);
+            uint16_t rd = w_rd(w), ra = w_ra(w);
+            if (op == OP_LOADI) {
+                if (rd < TX_AR_MAX_REGS) { g_const_known[rd] = 1; g_const_val[rd] = (uint64_t)(int64_t)w_imm28(w); }
+            } else if (op == OP_LOADI64) {
+                uint32_t idx = w_rb_raw(w);
+                if (idx < hdr.num_literals && rd < TX_AR_MAX_REGS) {
+                    g_const_known[rd] = 1; g_const_val[rd] = literals[idx];
+                }
+            } else if (op == OP_MOV) {
+                if (rd < TX_AR_MAX_REGS) {
+                    g_const_known[rd] = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
+                    g_const_val[rd] = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
+                }
+            } else if (op == OP_ENTER || op == OP_RET) {
+                for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;  /* prologue/terminal: no constant survives */
+            } else if (op == OP_JMPR) {
+                g_jmpr_fold[pc] = (ra < TX_AR_MAX_REGS && g_const_known[ra] &&
+                                   g_const_val[ra] < hdr.num_instr) ? (int)g_const_val[ra] : -1;
+            } else if (rd < TX_AR_MAX_REGS) {
+                g_const_known[rd] = 0;   /* every other register-writing opcode breaks the constant */
+            }
+        }
+        for (uint32_t pc = 0; pc < hdr.num_instr; pc++)   /* fold targets are block heads (rule 1) */
+            if (g_jmpr_fold[pc] >= 0) g_pc_target[(uint32_t)g_jmpr_fold[pc]] = 1;
+        int same = 1;
+        for (int i = 0; i < 4096; i++)
+            if (g_jmpr_fold[i] != g_jmpr_fold_prev[i]) { same = 0; break; }
+        if (same) break;
+        /* The retroactive-split case — a fold target landing inside
+         * another JMPR's chain, before that JMPR's constant source — is
+         * covered by this re-scan (the added reset un-folds that JMPR)
+         * but has no dedicated test: constructing it requires two JMPRs
+         * tangled with branches in a way the corpus does not contain.
+         * The reset argument holds regardless; see plan doc §10. */
+    }
+    /* g_alloc = cache enabled iff every JMPR folds. One non-foldable JMPR
+     * can reach any pc, which makes every pc a block head — no cache.
+     * Folded JMPRs are direct branches either way (they need no cache). */
+    g_alloc = 1;
+    for (uint32_t pc = 0; pc < hdr.num_instr; pc++)
+        if (w_op(instrs[pc]) == OP_JMPR && g_jmpr_fold[pc] < 0) { g_alloc = 0; break; }
     for (int i = 0; i < AR_CACHE_N; i++) g_cache_guest[i] = -1;
     g_cache_round = 0;
     g_resv_slot = -1;
@@ -1147,6 +1189,39 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
              * arg-tag mask from memory, which must be current. */
             cache_flush(&cb);
             emit_call_site(&cb, target, 0);
+        } else if (op == OP_JMPR) {
+            /* Gap Remediation SIMI Phase 14 / M2. Two shapes:
+             *  - FOLDED (g_jmpr_fold[pc] >= 0): the index is provably a
+             *    constant in [0, num_instr) — a plain direct branch. The
+             *    target pc is a block head (the pre-pass merged it into
+             *    g_pc_target), so rule 1 gives it an empty cache, and no
+             *    bounds check is needed because the range is proved. This
+             *    is what lets JMPR-bearing programs keep the cache.
+             *  - DYNAMIC: the runtime table + bounds-check path below,
+             *    moved here from emit_instr (it needs the pc table). The
+             *    bounds check (t0 < num_instr) is the non-negotiable CFI
+             *    requirement of ISA §16: cmp+cset lo then cbz to UDF #0. */
+            uint16_t ra = w_ra(w);
+            if (ra >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
+            if (g_jmpr_fold[pc] >= 0) {
+                cache_flush(&cb);
+                op_b(&cb, (uint32_t)g_jmpr_fold[pc]);
+            } else {
+                cache_flush(&cb);
+                ld_slot(&cb, X_T0, ra);                             /* t0 = target abstract pc */
+                e32(&cb, enc_movz(X_T2, (uint16_t)g_num_instr, 0)); /* num_instr <= 4096 fits one movz */
+                e32(&cb, enc_subs_shift(31, X_T0, X_T2, 0, 0));     /* cmp x9, x11 */
+                e32(&cb, enc_cset(X_T1, 3));                        /* cset x10, lo — unsigned less */
+                uint32_t cbz_pos = emit_cbz_placeholder(&cb);       /* cbz t1, .oob */
+                if (g_njmpr_li_pos >= TX_AR_MAX_FIXUPS) return TX_AR_ERR_TOO_MANY_FIXUPS;
+                g_jmpr_li_pos[g_njmpr_li_pos++] = cb.len;           /* 4-word table-base placeholder */
+                e32(&cb, 0); e32(&cb, 0); e32(&cb, 0); e32(&cb, 0);
+                e32(&cb, enc_add_shift(X_T2, X_T2, X_T0, 0, 3));    /* t2 = base + (target << 3) */
+                e32(&cb, enc_ldr(X_T2, X_T2, 0));                   /* t2 = table[target] */
+                e32(&cb, enc_br(X_T2));                             /* jump — never falls through */
+                patch_local_cbz(&cb, cbz_pos, X_T1);                /* .oob: */
+                op_illegal(&cb);                                    /* UDF #0 — non-negotiable CFI per ISA §16 */
+            }
         } else {
             int rc = emit_instr(&cb, w);
             if (rc != TX_AR_OK) return rc;

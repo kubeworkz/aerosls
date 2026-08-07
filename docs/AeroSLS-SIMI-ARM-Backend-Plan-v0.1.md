@@ -640,6 +640,87 @@ Three real allocator bugs, all fixed before commit:
   price of a runtime-indirect branch, and no JMPR-bearing test exists
   that would measure a smarter middle ground.
 
+## 10. M2 as-built addendum (constant-index JMPR folding)
+
+M1 gave every JMPR-bearing program the worst of both worlds: the cache
+was disabled for the whole program (a runtime JMPR can land on any pc,
+so every pc would have to be a block head — no cache at all), and the
+JMPR itself paid the full runtime machinery (4-word table-base constant,
+table lookup, bounds check, UDF path). M2 folds the common case —
+`load index; dispatch`, where the index is a compile-time constant —
+into a plain direct branch, and only a genuinely runtime index keeps
+the old dynamic path.
+
+### 10.1 What shipped
+
+- **`simi_arm.c`** — a per-register compile-time constant map
+  (`g_const_val`/`g_const_known`) in the pre-pass, a JMPR fold target
+  per pc (`g_jmpr_fold`), and OP_JMPR moved from `emit_instr` into
+  `translate()`'s main loop where it can see the pc: folded →
+  `cache_flush` + `op_b(target)`; else the original dynamic
+  table+bounds-check path (word-identical, moved verbatim).
+- **`tests/jmpr_mid.simi`** — a constant-index dispatch after a real
+  arithmetic chain: the middle-ground measurement (the cache stays
+  live AND the JMPR folds).
+- **`tests/jmpr_dyn.simi`** — a runtime-computed index: pins the
+  dynamic SUCCESS path, which jmpr_basic used to cover before it
+  folded (jmpr_oob pins only the fault path).
+- **`tests/jmpr_join.simi`** — the fold-soundness pin: an index set to
+  different constants on two paths joining at a branch target, which
+  the analysis must NOT fold.
+
+### 10.2 Design decisions worth recording
+
+- **The fold is only sound if the index is provably constant on every
+  path that reaches the JMPR.** The analysis resets the constant map at
+  every block head (branch/call target), so a chain between heads is
+  executed identically on every path that enters it — a constant
+  attributed there holds on every arrival. The fold targets are
+  themselves merged into the block-head set, so their arrivals get
+  rule-1 flushes too — a fold target landing inside another JMPR's
+  chain (before its constant source) retroactively splits that chain,
+  which is why the analysis runs to a fixpoint: the fold set is
+  monotone decreasing and the added reset un-folds the affected JMPR.
+- **g_alloc is 1 only when every JMPR folds.** One runtime-indexed
+  JMPR still forces the whole program back to the naive path — its
+  targets are any pc, and any pc reachable without a compile-time
+  discipline makes every pc a potential block head. Folded JMPRs are
+  plain branches and fold regardless of g_alloc.
+- **The folded JMPR needs no bounds check** — the range `[0,
+  num_instr)` is proved at fold time; the dynamic path's UDF #0 CFI
+  machinery exists only for non-folded JMPRs.
+
+### 10.3 Gate results (measured)
+
+Total emitted bytes across the 20-program parity set: **M0 28500 → M1
+27892, 608 saved** (≈2.1%). The JMPR row is the honest picture:
+
+- jmpr_basic 1088 → 984 (−104): the fold + a live cache.
+- jmpr_mid 1200 → 1032 (−168): dispatch after an arithmetic chain.
+- jmpr_dyn 1136 → 1136 (0) and jmpr_join 1144 → 1144 (0): runtime or
+  join-split indices keep the dynamic path, byte-identical to M0's
+  naive codegen — the floor, exactly as designed.
+- Four-way parity: interp 22/0, x86 21/0/3, RV64 20/0/4, ARM 20/0/4.
+  jmpr_oob still faults (UDF, verified by hand: rc=1, "execution
+  error"). jmpr_join's teeth: reverting the block-head constant reset
+  makes it return 1 instead of 222.
+
+### 10.4 Honest limits that stand after M2
+
+- The general case — a genuinely runtime index — still disables the
+  cache for the whole program, and always will: the JMPR table can
+  reach any pc, and no compile-time discipline survives that.
+- The fixpoint's retroactive-split case (a fold target un-folding
+  another JMPR) is covered by the reset argument and the convergence
+  proof but has no dedicated test — constructing it needs two JMPRs
+  tangled with branches in a way the corpus does not contain. Noted
+  in the code; a future JMPR-heavy stress test may close it.
+- Translate time grew by one O(n) constant-analysis scan per program
+  (plus fixpoint iterations); negligible at these sizes, unbounded
+  only by the JMPR count in the worst case.
+- The §8.5/§9.5 caveats stand: decoder-based evidence, unproven ABI,
+  and the encoder net's register-blindness all still apply.
+
 ---
 
 ## Sources consulted

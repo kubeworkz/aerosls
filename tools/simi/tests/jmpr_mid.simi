@@ -1,0 +1,22 @@
+; jmpr_mid.simi — M2: a JMPR dispatch with real arithmetic BEFORE it.
+; The index (r1) is a compile-time constant loaded at pc 2 and never
+; rewritten, so the translator folds the JMPR into a direct branch to
+; pc 9 and keeps the x9/x10/x11 cache live for the whole program — the
+; chain r0/r2 above it stays resident. jmpr_basic proved the fold's
+; existence; this is the middle-ground measurement: a JMPR-bearing
+; program that still gets the allocator.
+; Expected result: 189 (r0 = (10+9)*9 = 171; r2 = 180; target: r2 + r1)
+.entry main
+main:
+    ENTER #8
+    LOADI r0, #10, i64
+    LOADI r1, #9, i64        ; the JMPR index — compile-time constant
+    ADD r0, r0, r1, i64      ; r0 = 19
+    MUL r0, r0, r1, i64      ; r0 = 171
+    ADD r2, r0, r1, i64      ; r2 = 180
+    JMPR r1                  ; folds to pc 9 (target)
+    LOADI r0, #111, i32      ; dead path — never reached
+    RET
+target:
+    ADD r0, r2, r1, i64      ; r0 = 180 + 9 = 189
+    RET
