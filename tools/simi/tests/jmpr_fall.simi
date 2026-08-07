@@ -1,0 +1,41 @@
+; jmpr_fall.simi — M2.12: block coalescing. The JMPR's index (r1 = 7)
+; folds to pc 7 — the VERY NEXT instruction. The branch `b +0` the fold
+; would emit is dead code (control reaches pc 7 by falling through
+; anyway), so the translator drops it entirely. And since pc 7 has no
+; other incoming edge (no BR/BC/CALL, no other JMPR, no entry), the two
+; blocks FUSE: the block-head flush at the boundary is skipped and the
+; x9/x10/x11 cache survives the join — the register chain r0/r1/r2 built
+; at pcs 1-5 stays resident into pc 7, so the target's ADD reuses it
+; without reloading the register frame a second time (jmpr_mid's fold
+; jumped OVER a dead path; this one has no dead path at all).
+; A coalescing bug that emits the branch anyway is caught by the size
+; gate; one that fuses but mis-flushes the boundary is caught by the
+; four-way parity against the dynamic dispatchers (the other three
+; engines prove the runtime value 133).
+;
+; The dead-path section at pcs 9-14 pins the OTHER half of the feature:
+; a fall-through fold whose target has a SECOND incoming edge (a
+; backward fold at pc 13 also targets pc 11), so the blocks do NOT fuse
+; — the branch is still dropped, but the block-head flush stays (other
+; edges land with an empty cache). Never executed (pc 8's RET exits);
+; its emission is what the size gate measures.
+; Expected result: 133
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #7, i64        ; the JMPR index — folds to pc 7 (next pc)
+    LOADI r0, #10, i64
+    ADD r0, r0, r1, i64      ; r0 = 17
+    MUL r0, r0, r1, i64      ; r0 = 119
+    ADD r2, r0, r1, i64      ; r2 = 126
+    JMPR r1                  ; folds to pc 7 = pc+1 (fall-through, branch dropped, FUSED)
+target:
+    ADD r0, r2, r1, i64      ; r0 = 126 + 7 = 133 — r0/r1/r2 still resident
+    RET
+    ; ---- dead path: the non-fused fall-through fold (never executed) ----
+    LOADI r4, #11, i64       ; folds to pc 11
+    JMPR r4                  ; folds to pc 11 = pc+1 (branch dropped, NOT fused)
+    RET                      ; pc 11 — also the target of the backward fold at pc 13
+    LOADI r5, #11, i64       ; folds to pc 11
+    JMPR r5                  ; backward fold into pc 11 — the second incoming edge
+    RET
