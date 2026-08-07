@@ -428,6 +428,12 @@ static uint64_t g_const_val[TX_AR_MAX_REGS];
 static uint8_t  g_const_known[TX_AR_MAX_REGS];
 static int      g_jmpr_fold[4096];      /* per-JMPR-pc folded target, or -1 */
 static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-scope like the other arrays) */
+static uint8_t  g_fold_fall[4096];      /* M2.12: folded JMPR whose target is pc+1 — a dead
+                                         * branch (control falls through to it anyway). The main
+                                         * loop drops the branch entirely; when the target also
+                                         * has NO other incoming edge, the coalescing pre-pass
+                                         * clears its g_pc_target mark so the end-of-loop flush
+                                         * is skipped too and the cache survives the join. */
 /* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
  * continuation pcs of a maximal straight-line run of LOAD/STORE that share
  * ONE displacement past the imm12 range — the displacement is materialized
@@ -1581,6 +1587,55 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     g_cache_round = 0;
     g_resv_slot = -1;
 
+    /* M2.12: block-coalescing pre-pass. A folded JMPR whose target is the
+     * VERY NEXT pc (g_jmpr_fold[pc] == pc + 1) emits `cache_flush; b
+     * next` — a branch to the immediately-following instruction, which
+     * control reaches by falling through anyway. The branch is dead: mark
+     * the pc so the main loop emits NOTHING for the JMPR (rule 1's
+     * cache_flush is still owed on the fall-through side — see below).
+     * When the target also has NO other incoming edge — no BR/BC/CALL,
+     * no other folded JMPR, no entry trampoline — the two blocks FUSE:
+     * the target's block-head mark is cleared, so the end-of-loop flush
+     * that rule 1 would otherwise emit at the boundary is skipped too,
+     * and the x9/x10/x11 cache survives the join: the register frame is
+     * loaded once, not once per block. Soundness rests on the incoming-
+     * edge check: with no other way in, the only path to the target is
+     * the fall-through, which carries exactly the cache state the
+     * previous instruction left — the same invariant straight-line
+     * code already relies on. Gated on g_alloc: a dynamic JMPR can land
+     * on any pc (every pc is a block head), so no fusion — and the naive
+     * path stays byte-identical to M0. */
+    for (uint32_t q = 0; q < 4096; q++) g_fold_fall[q] = 0;
+    if (g_alloc) {
+        for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+            if (g_jmpr_fold[pc] != (int)(pc + 1)) continue;
+            g_fold_fall[pc] = 1;
+            /* Count other incoming edges to pc+1. The fold at pc itself
+             * IS an edge (it's the one being dropped); the g_pc_target
+             * pass-A marks were seeded for BR/BC/CALL, so re-derive from
+             * the instructions plus the entry trampolines. */
+            uint32_t t = pc + 1;
+            int other = 0;
+            for (uint32_t q = 0; q < hdr.num_instr && !other; q++) {
+                if (q == pc) continue;   /* the fold at pc is the edge being dropped, not an "other" */
+                uint64_t wq = instrs[q];
+                uint8_t opq = w_op(wq);
+                if (opq == OP_BR || opq == OP_BC || opq == OP_CALL) {
+                    int64_t tgt = (int64_t)q + 1 + w_imm28(wq);
+                    if (tgt >= 0 && tgt < (int64_t)hdr.num_instr &&
+                        (uint32_t)tgt == t) other = 1;
+                } else if (opq == OP_JMPR && g_jmpr_fold[q] >= 0 &&
+                           (uint32_t)g_jmpr_fold[q] == t) {
+                    other = 1;
+                }
+            }
+            if (!other)
+                for (uint32_t i = 0; i < hdr.num_entries; i++)
+                    if (entries[i].offset == t) { other = 1; break; }
+            if (!other) g_pc_target[t] = 0;   /* fuse: the fold is the only way in */
+        }
+    }
+
     /* M2.11: run-reuse pre-pass. A maximal straight-line run of LOAD/STORE
      * with the SAME displacement that lands in the materialize path (past
      * the imm12 range — the imm9/imm12 folds already take those in one or
@@ -1678,8 +1733,20 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             uint16_t ra = w_ra(w);
             if (ra >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
             if (g_jmpr_fold[pc] >= 0) {
-                cache_flush(&cb);
-                op_b(&cb, (uint32_t)g_jmpr_fold[pc]);
+                /* M2.12: a fall-through fold (target == pc+1) is a dead
+                 * branch — the target is the next instruction, reached by
+                 * falling through. Emit NOTHING for it. The end-of-loop
+                 * block-head flush below still fires at the boundary when
+                 * the target kept its mark (it has other incoming edges —
+                 * those land with an empty cache exactly as before), and is
+                 * SKIPPED when the coalescing pre-pass fused the target
+                 * (the fold was the only way in), so the x9/x10/x11 cache
+                 * survives the join and the register frame is loaded once,
+                 * not once per block. */
+                if (!(g_alloc && g_fold_fall[pc])) {
+                    cache_flush(&cb);
+                    op_b(&cb, (uint32_t)g_jmpr_fold[pc]);
+                }
             } else {
                 cache_flush(&cb);
                 ld_slot(&cb, X_T0, ra);                             /* t0 = target abstract pc */

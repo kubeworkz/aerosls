@@ -90,7 +90,22 @@
 # (the narrow forms MUST use SXTW — LSL #0 would zero-extend Wm and
 # turn -7100 into a huge positive offset; that row pins it) — 324
 # bytes below its M0 baseline, and disabling the run-reuse (run
-# threshold 2 -> 9999) grows it back to 1580. mem_pre is M2.10:
+# threshold 2 -> 9999) grows it back to 1580. jmpr_fall is M2.12:
+# BLOCK COALESCING — the JMPR's index folds to pc+1, the VERY NEXT
+# instruction, so the fold's `b +0` is a dead branch (control falls
+# through to the target anyway) and the translator drops it entirely.
+# Since the target has no other incoming edge (no BR/BC/CALL, no other
+# folded JMPR, no entry), the two blocks FUSE: the block-head flush at
+# the boundary is skipped and the x9/x10/x11 cache survives the join,
+# so the register chain r0/r1/r2 built before the JMPR stays resident
+# into the target block (the register frame is loaded once, not once
+# per block). A dead-path section pins the NON-FUSED half: a fall-
+# through fold whose target (pc 11) has a SECOND incoming edge — a
+# backward fold at pc 13 also targets it — so the blocks do NOT fuse;
+# the branch is still dropped but the block-head flush stays. — 312
+# bytes below its M0 baseline, and disabling the coalescing (fold-
+# target check pc+1 -> pc+9999) grows it back to 1080, so the
+# fusion itself is worth 16 of the 312. mem_pre is M2.10:
 # ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
 # folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
 # no writeback, no alignment requirement, superseding the M2.9
@@ -140,7 +155,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
+    [jmpr_dyn]=1136 [jmpr_fall]=1376 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120

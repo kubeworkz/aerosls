@@ -1438,6 +1438,92 @@ express), and — beyond the memory folds — the branch-side
 optimizations (block coalescing, tail reuse) that the JMPR folding has
 been leaving on the table.
 
+### 10.30 M2.12 amendment — block coalescing for folded JMPRs (as built)
+
+§10.29 closed by naming the branch-side lever the memory folds had
+been ignoring: every folded JMPR emitted `cache_flush; b target`, and
+every block head paid rule 1's end-of-loop flush — so a program whose
+JMPR index happens to fold to the VERY NEXT pc emitted a branch to the
+next instruction (dead: control falls through to it anyway) and then
+spilled/reloaded the register frame across a block boundary that was
+never really a join. M2.12 adds a block-coalescing pre-pass that
+eliminates both, gated on g_alloc like every fold before it:
+
+1. **The dead branch is dropped.** A folded JMPR whose target is
+   pc+1 (`g_jmpr_fold[pc] == pc + 1`) is marked `g_fold_fall[pc]`; the
+   main loop then emits NOTHING for it (previously `cache_flush` +
+   `op_b`). Falling through to pc+1 IS the fold's target, so the
+   branch is pure waste — one word saved on every fall-through fold.
+2. **The blocks fuse when the fold is the only way in.** The pre-pass
+   counts pc+1's other incoming edges: BR/BC/CALL (target formula
+   pc+1+imm28, the same one pass A uses), other folded JMPRs (the scan
+   skips q == pc — the fold at pc is the edge being dropped, not an
+   "other"), and entry trampolines (`entries[i].offset`). When NONE
+   exist, `g_pc_target[pc+1]` is CLEARED: the end-of-loop flush rule 1
+   would otherwise owe at the boundary is skipped, the x9/x10/x11
+   cache survives the join, and the register frame is loaded once, not
+   once per block. When the target keeps other edges, the branch is
+   still dropped but the flush stays — the other paths land with an
+   empty cache exactly as before.
+
+The soundness argument is the straight-line invariant made explicit.
+Clearing a block-head mark is only sound when the only path to that pc
+is the fall-through, which carries precisely the cache state the
+previous instruction's emission left (the same invariant every
+non-block-head pc already relies on). With g_alloc = 1 every JMPR
+folds, so no dynamic JMPR can land mid-block; the incoming-edge scan
+closes the direct-branch and entry paths. The end-of-loop flush for a
+still-marked target is unchanged, so the other edges' arrivals are
+byte-for-byte what they were. The M2.11 run-reuse pre-pass runs AFTER
+this pass, so a LOAD/STORE run may now START at a fused target — the
+cleared mark is exactly what the run walk checks — a compounding win
+noted but not separately tested. One conservative ceiling: clearing
+marks happens after the fold fixpoint converges, so a chain that a
+fused boundary would newly enable to fold is missed (sound — no fold
+is invalidated — just not maximally folded).
+
+- **`tests/jmpr_fall.simi`** — the first fall-through fold in the
+  corpus (all prior jmpr tests fold two or more pcs ahead). Live path:
+  r1 = 7 folds to pc 7 = pc+1, fused (no other edge), so the chain
+  r0/r1/r2 built at pcs 1-5 stays resident into the target's ADD —
+  the register frame is loaded once. Dead path (pcs 9-14, after pc 8's
+  RET, never executed — its EMISSION is what the gate measures): a
+  fall-through fold at pc 10 whose target pc 11 has a SECOND incoming
+  edge (the backward fold at pc 13 also targets pc 11), pinning the
+  NON-fused half — branch dropped, flush kept. Expected 133. M0
+  baseline (committed M0 translator, dynamic JMPR paths): **1376 →
+  1064, 312 saved**; disabling the coalescing (fold-target check
+  pc+1 → pc+9999) grows it back to exactly 1080, so the fusion itself
+  is worth 16 of the 312.
+
+### 10.31 M2.12 gate results (measured)
+
+Total emitted bytes across the now-32-program parity set (the gate's
+own M0/M1 totals now include the new jmpr_fall row): **M0 44868 → M1
+41436, 3432 saved** (≈7.6%), up from M2.11's 3120. The M2.12 rows on
+top of M2.11's 3120:
+
+- jmpr_fall 1376 → 1064 (−312, new 32nd row): the fused live path
+  drops the branch AND the boundary flush (the target ADD reuses
+  resident x9/x10/x11 — dump-verified: no spill/reload between the
+  chain and the target), and the dead path pins the non-fused branch-
+  drop (no branch word, flush retained).
+- Row-by-row M2.11-vs-M2.12 accounting (gate tables diffed): all 31
+  shared rows byte-identical — nothing else grew or shrank. The
+  totals move by exactly the new jmpr_fall row.
+- Four-way parity: interp 34/0, x86 33/0/3, RV64 32/0/4, ARM 32/0/4.
+  enc-check 12/12 OK; jmpr_oob still faults (UDF, rc=1). Teeth:
+  disabling the coalescing grows jmpr_fall to 1080, still correct.
+
+The M-line has now compounded to 3432 bytes saved. The JMPR side of
+the branch ledger is complete: constant-index dispatches fold, dead
+fall-through branches vanish, and genuinely-empty block joins fuse
+away their prologue flush. The remaining branch-side levers §10.29
+named are still on the table — tail reuse (a block whose epilogue is
+identical to its successor's prologue) and coalescing chains across
+more than one fall-through fold — plus the fixpoint-vs-fusion
+interaction the §10.30 ceiling describes.
+
 ---
 
 ## Sources consulted
