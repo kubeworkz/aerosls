@@ -856,6 +856,58 @@ Total emitted bytes across the 24-program parity set: **M0 33744 → M1
   jmpr_calc_bit back to exactly its M0 1384 while remaining correct
   via the dynamic path.
 
+### 10.13 M2.4 amendment — source-resident reservation (as built)
+
+The M1 allocator's cache_reserve picked its eviction victim by
+round-robin alone, so in a chain that re-reads the same source
+(`ADD r4, r1, r2; ADD r5, r1, r2`) the victim could be a source
+register: the instruction spilled it and then reloaded it from memory
+when get_operand fetched it a few words later — a wasted store+load on
+exactly the pattern that should benefit from residency. M2.4 passes the
+instruction's source registers (ra, and rb when the operand is a
+register) into cache_reserve, which now prefers a victim slot that
+holds neither source. The preference is a two-pass scan: any EMPTY slot
+first (a free slot costs no spill — empties occur transiently when
+clobber_scratch or a prior spill leaves -1), then a non-source
+occupant. Soundness: with rd not resident, at most 2 of the 3 slots
+hold the ≤2 distinct sources, so a non-source slot always exists; the
+plain round-robin victim remains only as a defensive fallback (the
+cursor still advances every call, so nothing starves). All 11 call
+sites pass their real source sets (CMP is always register form; the
+call site and LOADI/LOADI64 pass none).
+
+- **`tests/src_resident.simi`** — five ADDs re-reading r1/r2 as
+  sources, results accumulated into r0 (expected 35). The M0 baseline
+  measured against the committed M0 translator: **1120 → 1080, 40
+  saved**; reverting to the blind round-robin grows it to 1108 (28
+  over the hint) while staying correct. The hint also shaved 8 more
+  off aggregate_abi and a few bytes elsewhere — the preference
+  compounds across every arithmetic chain, not just this test.
+
+### 10.14 M2.4 gate results (measured)
+
+Total emitted bytes across the 25-program parity set: **M0 34864 → M1
+33196, 1668 saved** (≈4.8%). The M2.4 rows on top of M2.3's 1604:
+
+- src_resident 1120 → 1080 (−40): the source-reuse chain keeps its
+  sources resident.
+- aggregate_abi 4440 → 4432 (−8 additional): the preference compounds
+  on an existing arithmetic-heavy program.
+- Four-way parity: interp 27/0, x86 26/0/3, RV64 25/0/4, ARM 25/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: reverting the source
+  preference grows src_resident to exactly 1108 while remaining
+  correct.
+
+### 10.15 M2.4 honest limits
+
+- The reservation preference does not address the FETCH-ORDER clobber:
+  when a source lives in the other operand's fetch target slot (e.g.
+  ra resident in slot 1 but fetched into X_T0), get_operand still
+  spills the co-resident source and reloads it. A fetch-target
+  selection aware of both operands would be the next compounding win.
+- The defensive round-robin fallback is argued unreachable (3 slots,
+  ≤2 sources, rd not resident) and untested by construction.
+
 ---
 
 ## Sources consulted
