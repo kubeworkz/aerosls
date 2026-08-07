@@ -1113,19 +1113,25 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     g_const_known[rd] = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
                     g_const_val[rd] = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
                 }
-            } else if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
-                /* M2.2: fold arithmetic constants through ADD/SUB/MUL.
-                 * The emitted ALU is a plain 64-bit op for every SIMI
-                 * type (no width or signedness rounding — the translator
-                 * never truncates), the imm28 is sign-extended exactly as
-                 * materialize_imm does, and MUL is enc_madd(rh, X_T0,
-                 * rhs, 31) — rd = rn*rm + xzr, a plain multiply that
-                 * never faults — so the 64-bit wrap of a+b / a-b / a*b
-                 * here is bit-identical to runtime. Deliberately limited
-                 * to ADD/SUB/MUL: DIV/MOD would change behavior on a
-                 * translate-time division by zero, and the rest of the
-                 * ALU family (AND/OR/XOR/shifts) is left to a later pass
-                 * — a conservative omission, not a soundness one. */
+            } else if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_AND ||
+                       op == OP_OR || op == OP_XOR || op == OP_SHL || op == OP_SHR ||
+                       op == OP_SAR) {
+                /* M2.3: fold arithmetic constants through the whole ALU
+                 * family. The emitted ALU is a plain 64-bit op for every
+                 * SIMI type (no width or signedness rounding — the
+                 * translator never truncates), the imm28 is sign-extended
+                 * exactly as materialize_imm does, and the binary ops are
+                 * enc_and/orr/eor_shift while the shifts are
+                 * enc_lslv/lsrv/asrv — all plain 64-bit, never fault. The
+                 * shift AMOUNT is masked mod 64 (& 0x3F) in hardware
+                 * (lslv/lsrv/asrv) and identically in the interpreter
+                 * (fetch_operand_b & 0x3F) and RV64 (v2 & 0x3F), so the
+                 * fold masks too; SAR is arithmetic (sign-filling) like
+                 * the interpreter's (int64)>>. Deliberately limited:
+                 * DIV/MOD would change behavior on a translate-time
+                 * division by zero, and NOT (a foldable ~a, plain 64-bit)
+                 * is left out as a conservative omission — unary, never
+                 * a dispatch index in practice. */
                 if (rd < TX_AR_MAX_REGS) {
                     int k = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
                     uint64_t a = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
@@ -1141,7 +1147,18 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     }
                     if (fold) {
                         g_const_known[rd] = 1;
-                        g_const_val[rd] = (op == OP_ADD) ? a + b : (op == OP_SUB) ? a - b : a * b;
+                        uint64_t amt = b & 0x3F;   /* shifts mask the amount mod 64 */
+                        switch (op) {
+                            case OP_ADD: g_const_val[rd] = a + b; break;
+                            case OP_SUB: g_const_val[rd] = a - b; break;
+                            case OP_MUL: g_const_val[rd] = a * b; break;
+                            case OP_AND: g_const_val[rd] = a & b; break;
+                            case OP_OR:  g_const_val[rd] = a | b; break;
+                            case OP_XOR: g_const_val[rd] = a ^ b; break;
+                            case OP_SHL: g_const_val[rd] = a << amt; break;
+                            case OP_SHR: g_const_val[rd] = a >> amt; break;
+                            case OP_SAR: g_const_val[rd] = (uint64_t)((int64_t)a >> amt); break;
+                        }
                     } else {
                         g_const_known[rd] = 0;
                     }

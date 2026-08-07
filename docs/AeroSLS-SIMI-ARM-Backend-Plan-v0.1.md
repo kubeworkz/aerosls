@@ -705,23 +705,28 @@ Total emitted bytes across the 20-program parity set: **M0 28500 → M1
   error"). jmpr_join's teeth: reverting the block-head constant reset
   makes it return 1 instead of 222.
 
-### 10.5 M2.1/M2.2 amendment — folding arithmetic constants (as built)
+### 10.5 M2.1/M2.2/M2.3 amendment — folding arithmetic constants (as built)
 
 The M2 fold accepted only index values the analysis could see directly
 (LOADI/LOADI64 constants, propagated through MOV). M2.1 extends the
-constant map to fold ADD/SUB; M2.2 adds MUL — the index is now
-COMPUTED at translate time, e.g. `load; add; sub; dispatch` or `load;
-mul; dispatch`, which is how real dispatchers shape their index. On the
-emitted code side nothing changed: the ALU is a plain 64-bit add/sub/
-mul for every SIMI type (the translator never truncates to the declared
-width), `materialize_imm` sign-extends imm28 exactly as the analysis
-does, and MUL emits `enc_madd(rh, X_T0, rhs, 31)` — `rd = rn*rm + xzr`,
-a plain multiply that never faults — so the 64-bit wrap of `a+b`/`a-b`/
-`a*b` here is bit-identical to runtime. The fold is deliberately limited
-to ADD/SUB/MUL: DIV/MOD would change behavior on a translate-time
-division by zero, and the rest of the ALU family (AND/OR/XOR/shifts) is
-left to a later pass, a conservative omission rather than a soundness
-one.
+constant map to fold ADD/SUB; M2.2 adds MUL; M2.3 completes the ALU
+family with AND/OR/XOR and SHL/SHR/SAR — the index is now COMPUTED at
+translate time, e.g. `load; add; sub; dispatch`, `load; mul; dispatch`
+or `load; and; shl; xor; dispatch`, which is how real dispatchers shape
+their index. On the emitted code side nothing changed: the ALU is a
+plain 64-bit op for every SIMI type (the translator never truncates to
+the declared width), `materialize_imm` sign-extends imm28 exactly as
+the analysis does, MUL emits `enc_madd(rh, X_T0, rhs, 31)` — `rd =
+rn*rm + xzr`, a plain multiply that never faults — and the shifts mask
+their AMOUNT mod 64 (`& 0x3F`) exactly like A64's `lslv/lsrv/asrv`
+hardware, the interpreter's `fetch_operand_b & 0x3F`, and RV64's
+`v2 & 0x3F`, with SAR arithmetic (sign-filling) like the interpreter's
+`(int64)>>` — so the 64-bit wrap of `a+b`/`a-b`/`a*b`/`a&b`/`a|b`/
+`a^b`/`a<<amt`/`a>>amt` here is bit-identical to runtime. The fold is
+deliberately limited to these nine: DIV/MOD would change behavior on a
+translate-time division by zero, and NOT (a foldable `~a`, plain
+64-bit) is left out as a conservative omission — unary, never a
+dispatch index in practice.
 
 - **`tests/jmpr_calc.simi`** — reworked to compute its index through all
   four fold shapes (ADD reg+reg, SUB reg+imm, SUB reg+reg, ADD reg+imm,
@@ -761,8 +766,10 @@ Total emitted bytes across the 22-program parity set: **M0 31088 → M1
   (`g_const_val[ra] < num_instr`), which also correctly refuses
   sign-extended negative constants (they land ≥ 2^63) — sound, but no
   test currently computes a negative index to pin the refusal.
-- M2.2 folded MUL, but the rest of the ALU family (AND/OR/XOR/shifts)
-  still does not fold; a later pass can extend the same machinery.
+- The only ALU ops left unfoldable are DIV/MOD (translate-time
+  division by zero would diverge from the runtime fault) and NOT (a
+  foldable `~a` left out as a conservative omission — unary, never a
+  dispatch index in practice).
 
 ### 10.8 Honest limits that stand after M2
 
@@ -808,6 +815,46 @@ Total emitted bytes across the 23-program parity set: **M0 32360 → M1
   jmpr_oob still faults (UDF, rc=1). Teeth: disabling the MUL fold
   grows jmpr_calc_mul back to exactly its M0 1272 while remaining
   correct via the dynamic path.
+
+### 10.11 M2.3 amendment — folding the bitwise + shift ALU family (as built)
+
+M2.1/M2.2 folded ADD/SUB/MUL; M2.3 completes the ALU family in the
+same fold branch: AND/OR/XOR (plain 64-bit, no masking, no fault) and
+SHL/SHR/SAR. The shifts are the subtle part — the AMOUNT is masked mod
+64 (`& 0x3F`) identically in the fold, the interpreter
+(`fetch_operand_b & 0x3F`), A64 hardware (`lslv/lsrv/asrv`), and RV64
+(`v2 & 0x3F`), so an amount of 65 shifts by 1; SAR is arithmetic
+(sign-filling) via `(uint64_t)((int64_t)a >> amt)`, the interpreter's
+exact expression. DIV/MOD stay excluded (translate-time division by
+zero would diverge); NOT is left out as a conservative omission.
+
+- **`tests/jmpr_calc_bit.simi`** — index computed through the new
+  shapes with real teeth on both subtleties: r1 =
+  0x8000000000000000|5 (sign bit set via the LOADI64 literal
+  `#-9223372036854775808` — the assembler's strtoll clamps a positive
+  2^63 to LLONG_MAX, so the negative literal is required to reach
+  0x8000000000000000); SAR #2 = 0xE000000000000001 (a logical SAR
+  would give 0x2000000000000001 — the fold MUST be arithmetic); SHR
+  #61 = 7; SHL by a REGISTER amount 65 (masked to 1) = 14; AND 5 = 4;
+  XOR #8 = 12; ADD #4 = 16 — folds to pc 16. A logical-SAR fold bug
+  lands on pc 12 (55), distinct and caught by parity; an unmasked
+  amount un-folds instead (dynamic path, correct but a size
+  regression, caught by the teeth check). The M0 baseline measured
+  against the committed M0 translator: **1384 → 1136, 248 saved**;
+  disabling the fold grows it back to exactly 1384 while the dynamic
+  path still returns 222.
+
+### 10.12 M2.3 gate results (measured)
+
+Total emitted bytes across the 24-program parity set: **M0 33744 → M1
+32140, 1604 saved** (≈4.8%). The M2.3 row on top of M2.2's 1076:
+
+- jmpr_calc_bit 1384 → 1136 (−248): the computed bitwise+shift index
+  folds.
+- Four-way parity: interp 26/0, x86 25/0/3, RV64 24/0/4, ARM 24/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: disabling the fold grows
+  jmpr_calc_bit back to exactly its M0 1384 while remaining correct
+  via the dynamic path.
 
 ---
 
