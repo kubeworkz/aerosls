@@ -52,9 +52,15 @@
 # and reverting the swap grows it back to 1160 (the M2.4 state). alu_imm
 # is M2.6: an ADD/SUB #imm chain whose small non-negative immediates fold
 # into A64's 12-bit add-imm/sub-imm forms (one word each instead of the
-# movz+add materialization) — 52 bytes below its M0 baseline, and
-# disabling the fold grows it back by exactly 20 (the five folded rows
-# times one saved word each). Same skips as the runner: float_ops rejected,
+# movz+add materialization) — 72 bytes below its M0 baseline after M2.7
+# also folds its 4096 row (add #1, lsl #12) and its #-5 row (negative
+# SUB inverts to add #5), and disabling the fold grows it back to 1100
+# (the full materialize state). alu_imm_ext is M2.7: the NEGATIVE and
+# SHIFTED families — ADD #-7 emits sub #7, SUB #-12 emits add #12, and
+# magnitudes that are multiples of 4096 (4096, 8192, the 4095<<12 max,
+# and #-4096) emit add/sub #u, lsl #12 — 100 bytes below its M0
+# baseline; its 16777216 (past 0xFFFFFF) and #-200000 (not a multiple of
+# 4096) rows keep the materialized fallback exercised. Same skips as the runner: float_ops rejected,
 # mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
 # path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
@@ -81,7 +87,8 @@ VERIFY=../simi-arm-verify
 
 # name: M0 bytes (from git 1729f50, built + measured 2026-08-07)
 declare -A M0_BASELINES=(
-    [add]=976 [aggregate_abi]=4592 [alu_imm]=1132 [branch_cmp]=1096 [call_ret]=1932
+    [add]=976 [aggregate_abi]=4592 [alu_imm]=1132 [alu_imm_ext]=1196
+    [branch_cmp]=1096 [call_ret]=1932
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272

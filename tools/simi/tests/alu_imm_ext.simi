@@ -1,0 +1,38 @@
+; alu_imm_ext.simi — M2.7: the extended ADD/SUB immediate fold. Where
+; alu_imm.simi covers the plain rows, this covers the two families M2.7
+; adds: NEGATIVE immediates (the direction flips — ADD #-v emits sub #v,
+; SUB #-v emits add #v, bit-identical to the 64-bit wrap materialization)
+; and the SHIFTED form (imm12<<12, for magnitudes that are multiples of
+; 4096 up to 0xFFFFFF: add/sub xd, xn, #u, lsl #12). Rows 2-7 fold; rows
+; 8-9 must NOT fold — 16777216 is 0x1000000, one past the shifted range,
+; and #-200000 has |v| = 0x30D40 which is not a multiple of 4096 — so
+; the materialized fallback stays exercised. Row 10 is register form.
+; r1 = 10
+; r2 = r1 + -7 = 3        (fold: negative ADD inverts to sub #7)
+; r3 = r2 - -12 = 15      (fold: negative SUB inverts to add #12)
+; r4 = r3 + 4096 = 4111   (fold sh=1: add #1, lsl #12)
+; r5 = r4 + 16773120 = 16777231 (fold sh=1: add #4095, lsl #12 — the
+;                                 exact shifted max, 0xFFF000)
+; r6 = r5 - 8192 = 16769039      (fold sh=1: sub #2, lsl #12)
+; r7 = r6 + -4096 = 16764943     (fold: negative + shifted — sub #1, lsl #12)
+; r8 = r7 + 16777216 = 33542159  (NO fold — 0x1000000 past 0xFFFFFF)
+; r9 = r8 - -200000 = 33742159   (NO fold — |v| not a multiple of 4096)
+; r10 = r9 + r2 = 33742162       (register form)
+; r0 = r10 = 33742162
+; Expected result: 33742162
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #10, i64
+    ADD r2, r1, #-7, i64
+    SUB r3, r2, #-12, i64
+    ADD r4, r3, #4096, i64
+    ADD r5, r4, #16773120, i64
+    SUB r6, r5, #8192, i64
+    ADD r7, r6, #-4096, i64
+    ADD r8, r7, #16777216, i64
+    SUB r9, r8, #-200000, i64
+    ADD r10, r9, r2, i64
+    LOADI r0, #0, i64
+    ADD r0, r0, r10, i64
+    RET

@@ -104,6 +104,11 @@ def decode(w):
         # 64-bit: MOVZ = 110100101 (0x1A5), MOVK = 111100101 (0x1E5) in
         # bits 31:23 — they differ at bit 28.
         return ("movz" if (w >> 23) == 0x1A5 else "movk", hw(w), imm16(w), rd(w))
+    # ADD/SUB immediate: sh (bit 22, imm12 << 12) is masked away by
+    # 0xFF000000, so a sh=1 word (M2.7's shifted-immediate fold) still
+    # classifies as add_imm/sub_imm; imm12() extracts the raw field. The
+    # body check is class-based only, so the unshifted payload is fine
+    # (a64_exec.c carries the same note).
     if is_masked(w, 0xFF000000, 0x91000000): return ("add_imm", imm12(w), rn(w), rd(w))
     if is_masked(w, 0xFF000000, 0xD1000000): return ("sub_imm", imm12(w), rn(w), rd(w))
     if is_masked(w, 0xFF000000, 0xF1000000): return ("subs_imm", imm12(w), rn(w), rd(w))
