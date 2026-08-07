@@ -304,6 +304,50 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             continue;
         }
 
+        /* ─── Load/store register, pre-indexed (9-bit signed imm, ─────
+         * writeback): size:2 111 0 00 opc 0 imm9:9 11 Rn Rt. M2.9:
+         * simi_arm.c emits these for negative displacements that are
+         * aligned to the access width and fit imm9 (-256..255) — one
+         * word vs the add/sub-imm address math + zero-offset access.
+         * Fenced by the 0x3B000000 mask (bits 29:27 = 111, 26 = 0,
+         * 25:24 = 00, 21 = 0 — the 9-bit-immediate load/store family;
+         * the scaled class has 25:24 = 01 and register-offset has
+         * bit 21 = 1) and bits 11:10 = 11 (pre-indexed: 00 = the
+         * unscaled ldur/stur form, 01 = post-indexed — neither is
+         * emitted, both fall through to BAD_INSTR as before).
+         * Writeback order follows the ARM pseudocode: X[n] is updated
+         * to the effective address BEFORE Rt is read/stored, so
+         * ldr xt,[xn,#imm]! with rt==rn yields the loaded value and
+         * str xt,[xn,#imm]! with rt==rn stores the address. Verified
+         * against QEMU's a64.decode @ldst_imm_pre and the canonical
+         * str x29, [sp, #-16]! == 0xF81F0FFD. */
+        if ((w & 0x3B000000u) == 0x38000000u && (w & 0xC00u) == 0xC00u) {
+            int size = (int)(w >> 30);
+            int opc = (int)((w >> 22) & 3);
+            int64_t imm9 = sext((w >> 12) & 0x1FF, 9);
+            int rn = (int)((w >> 5) & 0x1F);
+            int rt = (int)(w & 0x1F);
+            int width = 1 << size;
+            uint64_t addr = cpu->x[rn] + imm9;
+            cpu->x[rn] = addr;                          /* writeback (rn==31 = SP, per A64) */
+            if (opc == 0) {                             /* STR — Rt read AFTER writeback */
+                uint64_t sv = (rt == 31) ? 0 : cpu->x[rt];
+                if (!store_mem(cpu, addr, width, sv)) return AR_EXEC_MEM_FAULT;
+            } else if (opc == 1) {                      /* LDR — result overwrites the writeback when rt==rn */
+                uint64_t v;
+                if (!load_mem(cpu, addr, width, 0, &v)) return AR_EXEC_MEM_FAULT;
+                set_x(cpu, rt, v);
+            } else if (opc == 2) {                      /* LDRS (sign-extend) */
+                uint64_t v;
+                if (!load_mem(cpu, addr, width, 1, &v)) return AR_EXEC_MEM_FAULT;
+                set_x(cpu, rt, v);
+            } else {
+                return AR_EXEC_BAD_INSTR;               /* opc 11 not emitted */
+            }
+            cpu->pc = next_pc;
+            continue;
+        }
+
         /* ─── Load/store register (unsigned scaled 12-bit immediate) ────
          * size:2 111 0 01 opc:2 imm12 Rn Rt. opc 00=STR, 01=LDR
          * (zero-extend), 10=LDRS (sign-extend), 11=pre/post (unused).

@@ -1,0 +1,75 @@
+; mem_pre.simi — M2.9: the pre-indexed load/store fold. A negative
+; displacement that is ALIGNED to the access width and fits A64's signed
+; 9-bit imm9 (-256..255) now folds into a single pre-indexed
+; ldr/str xt, [xb, #imm]! (one word) instead of the M2.8 sub + zero-offset
+; access (two words). The rows:
+;   [r5-16]    i64 pre-indexed            -> r7+2032  (plain)
+;   [r5-256]   i64 pre-indexed            -> r7+1792  (exact imm9 boundary,
+;              mag 256 is the most negative 9-bit signed value)
+;   [r5-264]   i64 NO pre-index           -> r7+1784  (264 > 256, aligned —
+;              falls to the M2.8 sub #264 + access)
+;   [r5-8]     i32 pre-indexed            -> r7+2040
+;   [r5-4]     i32 pre-indexed            -> r7+2044
+;   [r6-6]     i16 pre-indexed (strh/ldrh)-> r7+3042
+;   [r6-1]     u8  pre-indexed (strb/ldrb)-> r7+3047
+;   [r6-9]     i8  pre-indexed (ldrsb)    -> r7+3039  (the sign-extending
+;              byte load is the one opc/size combo the u8 row doesn't cover)
+;   [r6-24]    i64 pre-indexed            -> r7+3024
+;   [r6-258]   i16 NO pre-index           -> r7+2790  (258 > 256, aligned)
+; Every pre-indexed store round-trips through a load at the same address,
+; and every row RE-READS its base register (r5/r6) — the writeback in the
+; pre-indexed form modifies only the base's HOST register, so the cache
+; directory must have been poisoned (clobber_scratch) for the next fetch
+; to reload the base from memory; a stale entry would compute a wrong
+; address and fail the four-way parity. Effective offsets stay in
+; r7+[560, 4088] — the band portable across all four engines (x86's r7 is
+; a host pointer into a 4096-byte mmap, ARM/RV64's r7 is scratch_ptr with
+; the 576-byte frame below 560, the interpreter's r7 is 0 with 64 KiB),
+; and every access is >= 4 bytes from its neighbors (the i32-overlap trap
+; mem_neg.simi's comments record). Bases built with folding LEA/ADD:
+; r5 = r7 + 2048, r6 = r7 + 2048 + 1000 = r7 + 3048.
+; r1 = 100, r2 = 200
+; [r5-16]=100, [r5-256]=200, [r5-264]=100, [r5-8]=200, [r5-4]=200,
+; [r6-6]=100, [r6-1]=200, [r6-9]=100, [r6-24]=100, [r6-258]=200
+; r3=100, r4=200, r8=100, r9=200, r10=200, r11=100, r12=200, r13=100,
+; r14=200, r15=100
+; r0 = 100+200+100+200+200+100+200+100+200+100 = 1500
+; Expected result: 1500
+.entry main
+main:
+    ENTER #12
+    LOADI r1, #100, i32
+    LOADI r2, #200, i32
+    LEA r5, r7, #2048          ; r5 = r7 + 2048 (fold: add #2048)
+    LEA r6, r7, #2048          ; r6 = r7 + 2048
+    ADD r6, r6, #1000, i32     ; r6 = r7 + 3048 (fold: add #1000)
+    STORE r1, r5, #-16, i64
+    STORE r2, r5, #-256, i64
+    STORE r1, r5, #-264, i64
+    STORE r2, r5, #-8, i32
+    STORE r2, r5, #-4, i32
+    STORE r1, r6, #-6, i16
+    STORE r2, r6, #-1, u8
+    STORE r1, r6, #-9, i8
+    STORE r1, r6, #-24, i64
+    STORE r2, r6, #-258, i16
+    LOAD r3, r5, #-16, i64
+    LOAD r4, r5, #-256, i64
+    LOAD r8, r5, #-264, i64
+    LOAD r9, r5, #-8, i32
+    LOAD r10, r5, #-4, i32
+    LOAD r11, r6, #-6, i16
+    LOAD r12, r6, #-1, u8
+    LOAD r15, r6, #-9, i8
+    LOAD r13, r6, #-24, i64
+    LOAD r14, r6, #-258, i16
+    ADD r0, r3, r4, i32
+    ADD r0, r0, r8, i32
+    ADD r0, r0, r9, i32
+    ADD r0, r0, r10, i32
+    ADD r0, r0, r11, i32
+    ADD r0, r0, r12, i32
+    ADD r0, r0, r15, i32
+    ADD r0, r0, r13, i32
+    ADD r0, r0, r14, i32
+    RET
