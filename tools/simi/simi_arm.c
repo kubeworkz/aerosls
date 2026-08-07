@@ -171,6 +171,18 @@ static uint32_t enc_add_imm(uint8_t rd, uint8_t rn, uint32_t imm12) {
 static uint32_t enc_sub_imm(uint8_t rd, uint8_t rn, uint32_t imm12) {
     return 0xD1000000u | ((imm12 & 0xFFFu) << 10) | ((uint32_t)rn << 5) | rd;
 }
+/* The same forms with the sh bit (bit 22): value = imm12 << 12. M2.7's
+ * shifted-immediate fold emits these for magnitudes that are multiples
+ * of 4096 (4096..0xFFFFFF); a64_exec.c already applies the shift on
+ * decode ("if (w & 0x400000u) imm12 <<= 12"). */
+static uint32_t enc_add_imm_sh(uint8_t rd, uint8_t rn, uint32_t imm12, uint8_t sh) {
+    return 0x91000000u | ((uint32_t)(sh & 1) << 22) | ((imm12 & 0xFFFu) << 10) |
+           ((uint32_t)rn << 5) | rd;
+}
+static uint32_t enc_sub_imm_sh(uint8_t rd, uint8_t rn, uint32_t imm12, uint8_t sh) {
+    return 0xD1000000u | ((uint32_t)(sh & 1) << 22) | ((imm12 & 0xFFFu) << 10) |
+           ((uint32_t)rn << 5) | rd;
+}
 static uint32_t enc_subs_imm(uint8_t rd, uint8_t rn, uint32_t imm12) {
     return 0xF1000000u | ((imm12 & 0xFFFu) << 10) | ((uint32_t)rn << 5) | rd;
 }
@@ -862,24 +874,33 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             h_a = cache_single_host(ra);
             h_b = (h_a == X_T0) ? X_T1 : X_T0;
             get_operand(cb, ra, h_a, rd_live);
-            /* M2.6: fold small non-negative ADD/SUB immediates into the
-             * 12-bit add-imm/sub-imm forms — 1 word instead of the
-             * movz(+movk)+add_shift materialization, exactly what
-             * LEA/PTRADD/LOAD already do for their displacements. Gated
-             * on g_alloc: the naive (JMPR) path must stay byte-identical
-             * to M0 for the gate's jmpr baselines and its "0 saved, the
-             * honest floor" rows. Values past imm12 (or negative) keep
-             * the materialized path; the non-add/sub ops are untouched
-             * (A64's AND/OR/XOR immediates are bitmask encodings, not
-             * plain 12-bit — out of scope). A64's add-imm also has the
-             * imm12 << 12 shifted form (values 4096..0xFFFFFF multiples
-             * of 4096) — a known next extension, deliberately not
-             * folded here. */
+            /* M2.6/M2.7: fold ADD/SUB immediates into A64's add-imm /
+             * sub-imm forms — 1 word instead of the movz(+movk)+add_shift
+             * materialization, exactly what LEA/PTRADD/LOAD already do
+             * for their displacements. The magnitude folds into the
+             * plain imm12 form (0..4095) or the imm12<<12 shifted form
+             * (multiples of 4096 up to 0xFFFFFF); the direction flips
+             * with the sign — ADD #-v == SUB #v and SUB #-v == ADD #v —
+             * and the negated-magnitude encodings are bit-identical to
+             * the 64-bit wrap materialization (ra + (2^64 - |v|) ==
+             * ra - |v|). Gated on g_alloc: the naive (JMPR) path must
+             * stay byte-identical to M0 for the gate's jmpr baselines
+             * and its "0 saved, the honest floor" rows. Values outside
+             * both forms (|imm| past 0xFFFFFF, or a non-multiple of 4096
+             * past 4095) keep the materialized path; the non-add/sub ops
+             * are untouched (A64's AND/OR/XOR immediates are bitmask
+             * encodings, not plain 12-bit). */
             if (g_alloc && (op == OP_ADD || op == OP_SUB)) {
                 int64_t imm = w_imm28(w);
-                if (imm >= 0 && imm <= 4095) {
-                    e32(cb, (op == OP_ADD) ? enc_add_imm(rh, h_a, (uint32_t)imm)
-                                           : enc_sub_imm(rh, h_a, (uint32_t)imm));
+                uint64_t mag = (imm < 0) ? (uint64_t)(-imm) : (uint64_t)imm;
+                int add_dir = (op == OP_ADD) ^ (imm < 0);   /* 1 = add-imm, 0 = sub-imm */
+                int sh; uint32_t u;
+                if (mag <= 4095) { sh = 0; u = (uint32_t)mag; }
+                else if ((mag & 0xFFFu) == 0 && mag <= 0xFFFFFFu) { sh = 1; u = (uint32_t)(mag >> 12); }
+                else { sh = -1; u = 0; }
+                if (sh >= 0) {
+                    e32(cb, add_dir ? enc_add_imm_sh(rh, h_a, u, (uint8_t)sh)
+                                    : enc_sub_imm_sh(rh, h_a, u, (uint8_t)sh));
                     store_result(cb, rd);
                     break;   /* fold consumed this instruction — skip the inner switch */
                 }

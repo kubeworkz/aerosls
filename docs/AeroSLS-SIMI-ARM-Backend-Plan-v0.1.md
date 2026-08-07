@@ -987,10 +987,12 @@ is untouched.
   (5, 3, 100, 55, and the exact 4095 boundary) then three rows that
   must NOT fold (4096 just past imm12, a negative #-5, and a
   register-form ADD) so parity exercises both the fold and the
-  materialized fallback (expected 8268). M0 baseline measured against
-  the committed M0 translator: **1132 → 1080, 52 saved**; disabling
-  the fold grows it back by exactly 20 — the five folded rows times
-  one saved word each.
+  materialized fallback (expected 8268). **M2.7 closed the 4096 and
+  #-5 rows** (see §10.20): 4096 folds via the sh=1 shifted form and
+  #-5 via the sign inversion, so only the register-form row remains a
+  non-fold here. M0 baseline measured against the committed M0
+  translator: **1132 → 1080, 52 saved** at M2.6; the M2.7 fold brings
+  it to 1060 (72 below, teeth 1100 = the full materialize state).
 
 ### 10.19 M2.6 gate results (measured)
 
@@ -1009,6 +1011,53 @@ Total emitted bytes across the 27-program parity set: **M0 37212 → M1
 - Four-way parity: interp 29/0, x86 28/0/3, RV64 27/0/4, ARM 27/0/4.
   jmpr_oob still faults (UDF, rc=1). Teeth: disabling the fold grows
   alu_imm to exactly 1100 while remaining correct.
+
+### 10.20 M2.7 amendment — negative and shifted immediates fold (as built)
+
+M2.6's two remaining immediate families are now folded, closing the
+"known next extension" note in §10.18. The fold's direction flips with
+the sign — `ADD #-v` emits `sub xd, xn, #|v|` and `SUB #-v` emits
+`add xd, xn, #|v|` (bit-identical to the 64-bit wrap materialization:
+ra + (2^64 − |v|) ≡ ra − |v|) — and the magnitude folds into either
+form of A64's add/sub immediate: the plain imm12 (sh=0, 0..4095) or
+the shifted imm12<<12 (sh=1, magnitudes that are multiples of 4096 up
+to 0xFFFFFF, imm12 = mag>>12 ≤ 4095). New encoders
+enc_add_imm_sh/enc_sub_imm_sh set bit 22; a64_exec.c already applied
+sh on decode (its comment is updated), and a64_enc_check.py needs no
+change (the body check is class-based and its 0xFF000000 mask ignores
+bit 22 — a note records that). The fold stays gated on g_alloc, so the
+naive JMPR path remains byte-identical to M0.
+
+- **`tests/alu_imm_ext.simi`** — the negative and shifted rows:
+  ADD #-7 → sub #7, SUB #-12 → add #12, ADD #4096 → add #1 lsl 12,
+  ADD #16773120 → add #4095 lsl 12 (the exact shifted max, 0xFFF000 —
+  a first draft used 16777215 = 0xFFFFFF, which is NOT a multiple of
+  4096 and silently didn't fold; caught by dumping the emitted words),
+  SUB #8192 → sub #2 lsl 12, and ADD #-4096 → sub #1 lsl 12 (negative
+  + shifted in one row). Two rows must still materialize: 16777216
+  (0x1000000, past 0xFFFFFF) and #-200000 (|v| = 0x30D40, not a
+  multiple of 4096), plus a register-form ADD (expected 33742162). M0
+  baseline measured against the committed M0 translator: **1196 →
+  1096, 100 saved**; disabling the fold grows it back to exactly 1160.
+  alu_imm.simi's instructions are unchanged (its M0 baseline 1132
+  stays valid); only its 4096 and #-5 rows' comments moved from "no
+  fold" to "fold" — its size drops 1080 → 1060.
+
+### 10.21 M2.7 gate results (measured)
+
+Total emitted bytes across the 28-program parity set: **M0 38408 → M1
+36284, 2124 saved** (≈5.4%). The M2.7 rows on top of M2.6's 2004:
+
+- alu_imm_ext 1196 → 1096 (−100): the negative and shifted rows are
+  one word each instead of the 2-5 word materializations.
+- alu_imm 1080 → 1060 (−20 additional): the 4096 row (was movz+add)
+  and the #-5 row (was a 5-word movz+3×movk+sub) now fold.
+- Row-by-row M2.6-vs-M2.7 accounting: grep confirms no other test
+  contains a negative or 5+-digit ADD/SUB immediate, so these two rows
+  are the only changes (the M1 delta 1096 − 20 reconciles exactly).
+- Four-way parity: interp 30/0, x86 29/0/3, RV64 28/0/4, ARM 28/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: disabling the fold grows
+  alu_imm to 1100 and alu_imm_ext to 1160 while remaining correct.
 
 ---
 

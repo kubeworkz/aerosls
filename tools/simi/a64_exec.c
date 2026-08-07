@@ -170,10 +170,10 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
         }
 
         /* ─── ADD/SUB/ADDS/SUBS (immediate) — 1 00/10/01/11 100010 sh ───
-         * sh=1 (bit 22) scales imm12 by 12; simi_arm.c only emits sh=0 but
-         * the decoder honors the bit for faithfulness. 31 == SP here (the
-         * one place the subset uses the SP interpretation: sub sp,sp,#16
-         * and friends). */
+         * sh=1 (bit 22) scales imm12 by 12; simi_arm.c emits sh=1 for
+         * the M2.7 shifted-immediate fold (multiples of 4096) and sh=0
+         * elsewhere. 31 == SP here (the one place the subset uses the SP
+         * interpretation: sub sp,sp,#16 and friends). */
         if ((w & 0xFF000000u) == 0x91000000u ||
             (w & 0xFF000000u) == 0xD1000000u ||
             (w & 0xFF000000u) == 0xF1000000u) {
