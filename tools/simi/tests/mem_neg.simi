@@ -9,8 +9,11 @@
 ;               form, M2.8 sub #8 + access)
 ;   [r5-4096]  fold sh=1: sub #1,lsl#12 -> r7+565   (shifted negative; |disp| > 255,
 ;               so the unscaled imm9 cannot take it)
-;   [r5-4101]  NO fold (materialize)    -> r7+560   (|disp| > 4095 and
-;               not a multiple of 4096 — the honest fallback stays exercised)
+;   [r5-4101]  fold M2.11: reg-offset  -> r7+560   (|disp| > 4095 and not
+;               a multiple of 4096: the materialize path puts the
+;               displacement in a scratch (X_T2, clobbered first) and the
+;               access is ONE ldr/str x, [x, xm] word — M2.8's honest
+;               fallback was li64 + add_shift + zero-offset access)
 ;   [r6+5]     fold M2.10: unscaled     -> r7+4092  (positive but UNALIGNED
 ;               for i32 — the scaled fast path rejects it and M2.9's
 ;               aligned-only pre-indexed form rejected it too; the unscaled

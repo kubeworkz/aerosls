@@ -92,6 +92,24 @@ def stur_w(rt, rn, imm9):return 0xB8000000 | ((imm9 & 0x1FF) << 12) | (rn << 5) 
 def ldursb(rt, rn, imm9):return 0x38800000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
 def ldursh(rt, rn, imm9):return 0x78800000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
 def ldursw(rt, rn, imm9):return 0xB8800000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+# M2.11: load/store register, REGISTER offset — size:2 111 0 00 opc 1
+# Rm opt:3 s:1 10 Rn Rt (bit 21 = 1, bits 11:10 = 10). Two options, as
+# QEMU's a64.decode @ldst specifies: opt 011 (LSL #0) for the 64-bit
+# forms (Xm used in full), opt 110 (SXTW) for the 8/16/32-bit forms
+# (low 32 bits sign-extended — how a negative two's-complement
+# displacement stays negative; LSL #0 on a Wm would zero-extend it).
+# ldr x0, [x1, x2] == 0xF8626820 (base 0xF8606800 | (2 << 16) | (1 << 5)).
+def ldr_reg(rt, rn, rm):  return 0xF8606800 | (rm << 16) | (rn << 5) | rt
+def str_reg(rt, rn, rm):  return 0xF8206800 | (rm << 16) | (rn << 5) | rt
+def ldrb_reg(rt, rn, rm): return 0x3860C800 | (rm << 16) | (rn << 5) | rt
+def strb_reg(rt, rn, rm): return 0x3820C800 | (rm << 16) | (rn << 5) | rt
+def ldrh_reg(rt, rn, rm): return 0x7860C800 | (rm << 16) | (rn << 5) | rt
+def strh_reg(rt, rn, rm): return 0x7820C800 | (rm << 16) | (rn << 5) | rt
+def ldr_w_reg(rt, rn, rm):return 0xB860C800 | (rm << 16) | (rn << 5) | rt
+def str_w_reg(rt, rn, rm):return 0xB820C800 | (rm << 16) | (rn << 5) | rt
+def ldrsb_reg(rt, rn, rm):return 0x38A0C800 | (rm << 16) | (rn << 5) | rt
+def ldrsh_reg(rt, rn, rm):return 0x78A0C800 | (rm << 16) | (rn << 5) | rt
+def ldrsw_reg(rt, rn, rm):return 0xB8A0C800 | (rm << 16) | (rn << 5) | rt
 def br(rn):                 return 0xD61F0000 | (rn << 5)
 def blr(rn):                return 0xD63F0000 | (rn << 5)
 
@@ -177,6 +195,20 @@ def decode(w):
     if (w & 0xFFC00C00) == 0x38800000: return ("ldursb", (w >> 12) & 0x1FF, rn(w), rd(w))
     if (w & 0xFFC00C00) == 0x78800000: return ("ldursh", (w >> 12) & 0x1FF, rn(w), rd(w))
     if (w & 0xFFC00C00) == 0xB8800000: return ("ldursw", (w >> 12) & 0x1FF, rn(w), rd(w))
+    # Register offset: the 0x3F20FC00 mask pins bits 29:24, bit 21 = 1 and
+    # bits 15:8 (opt, s, and the 10 marker); the two emitted options are
+    # opt 011 (target 0x68) and opt 110 (target 0xC8) — any other option
+    # decodes as None. sz@31:30 and opc@23:22 map to the width classes;
+    # rm@20:16, rn@9:5, rt@4:0 are free.
+    reg_base = w & 0x3F20FC00
+    if reg_base in (0x38206800, 0x3820C800):
+        sz = (w >> 30) & 3
+        opc = (w >> 22) & 3
+        name = {0: {0: "strb_reg", 1: "ldrb_reg", 2: "ldrsb_reg"},
+                1: {0: "strh_reg", 1: "ldrh_reg", 2: "ldrsh_reg"},
+                2: {0: "str_w_reg", 1: "ldr_w_reg", 2: "ldrsw_reg"},
+                3: {0: "str_reg", 1: "ldr_reg"}}.get(sz, {}).get(opc)
+        if name: return (name, rm(w), rn(w), rd(w))
     if (w & 0xFFFFFC1F) == 0xD61F0000: return ("br", rn(w))
     if (w & 0xFFFFFC1F) == 0xD63F0000: return ("blr", rn(w))
     if (w & 0xFC000000) == 0x14000000: return ("b", (w & 0x3FFFFFF) | (-(1 << 26) if w & 0x2000000 else 0))
@@ -196,6 +228,9 @@ ALLOWED = {"movz", "movk", "add_imm", "sub_imm", "subs_imm", "add_shift",
            "ldrsh", "ldrh", "strh", "ldrsb", "ldur", "stur",
            "ldurb", "sturb", "ldurh", "sturh", "ldur_w", "stur_w",
            "ldursb", "ldursh", "ldursw",
+           "ldr_reg", "str_reg", "ldrb_reg", "strb_reg", "ldrh_reg",
+           "strh_reg", "ldr_w_reg", "str_w_reg", "ldrsb_reg",
+           "ldrsh_reg", "ldrsw_reg",
            "br", "blr", "b", "bl", "cbz", "cbnz"}
 
 # Register numbers used by simi_arm.c

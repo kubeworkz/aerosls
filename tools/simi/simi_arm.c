@@ -122,6 +122,11 @@ static int32_t  w_imm28(uint64_t w) {
                       * (see the OP_RET design note in simi_arm_verify.c) */
 #define X_T1    10   /* t1: secondary working register */
 #define X_T2    11   /* t2: tertiary working register */
+#define X_DR    12   /* x12: M2.11 run-reuse displacement register — deliberately
+                      * OUTSIDE the x9/x10/x11 cache (slot 3), so cache evictions and
+                      * operand fetches never touch it; holds a LOAD/STORE displacement
+                      * shared across a run of accesses. Never a hostfn/trampoline
+                      * register (x0-x5) nor frame (x29/x30/sp). */
 #define X_FP    29   /* frame pointer (entry sp), saved/restored like RV64's s0 */
 #define X_LR    30   /* link register */
 #define X_SP    31   /* sp */
@@ -286,6 +291,31 @@ static uint32_t enc_stur_w(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB800
 static uint32_t enc_ldursb(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x38800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_ldursh(uint8_t rt, uint8_t rn, int16_t imm9) { return 0x78800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_ldursw(uint8_t rt, uint8_t rn, int16_t imm9) { return 0xB8800000u | (((uint32_t)(imm9 & 0x1FF)) << 12) | ((uint32_t)rn << 5) | rt; }
+/* Load/store register, REGISTER offset: size:2 111 0 00 opc 1 Rm opt 0 10
+ * Rn Rt — bit 21 = 1 (vs the imm9 forms' 0) and bits 11:10 = 10. M2.11:
+ * the materialize path (|disp| past the imm12 range) puts the displacement
+ * in a register and the access is ONE word — the M2.8 li64 + add_shift +
+ * zero-offset access was two words of address math on top of the
+ * materialize. Two options, pinned against QEMU's a64.decode @ldst
+ * (register offset): opt = 011 (LSL #0, Xm used in full) for the 64-bit
+ * forms, and opt = 110 (SXTW, sign-extend the low 32 bits of Xm) for the
+ * 8/16/32-bit forms — the narrow forms need SXTW because LSL #0 would
+ * ZERO-extend Wm and turn a negative two's-complement displacement into a
+ * huge positive offset. The translator materializes the full 64-bit
+ * displacement; its low 32 bits sign-extend back to itself, so SXTW is
+ * exact for both signs (imm28 range is well inside int32). Verified:
+ * ldr x0, [x1, x2] == 0xF8626820. */
+static uint32_t enc_ldr_reg (uint8_t rt, uint8_t rn, uint8_t rm) { return 0xF8606800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_str_reg (uint8_t rt, uint8_t rn, uint8_t rm) { return 0xF8206800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldrb_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0x3860C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_strb_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0x3820C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldrh_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0x7860C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_strh_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0x7820C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldr_w_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0xB860C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_str_w_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0xB820C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldrsb_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0x38A0C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldrsh_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0x78A0C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldrsw_reg(uint8_t rt, uint8_t rn, uint8_t rm) { return 0xB8A0C800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | rt; }
 /* Branches. imm26/imm19 are in units of 4 bytes (word offsets). */
 static uint32_t enc_b   (int32_t imm26) { return 0x14000000u | ((uint32_t)imm26 & 0x03FFFFFFu); }
 static uint32_t enc_bl  (int32_t imm26) { return 0x94000000u | ((uint32_t)imm26 & 0x03FFFFFFu); }
@@ -398,6 +428,15 @@ static uint64_t g_const_val[TX_AR_MAX_REGS];
 static uint8_t  g_const_known[TX_AR_MAX_REGS];
 static int      g_jmpr_fold[4096];      /* per-JMPR-pc folded target, or -1 */
 static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-scope like the other arrays) */
+/* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
+ * continuation pcs of a maximal straight-line run of LOAD/STORE that share
+ * ONE displacement past the imm12 range — the displacement is materialized
+ * once into X_DR (x12) at the run head and every access in the run is a
+ * single register-offset word. g_cur_pc is the main loop's current pc,
+ * visible to emit_instr (which takes no pc parameter). */
+static uint8_t  g_run_first[4096];
+static uint8_t  g_run_cont[4096];
+static uint32_t g_cur_pc;
 
 static uint8_t cache_host(int i) { return (uint8_t)(X_T0 + i); }
 static int cache_find(int g) {
@@ -767,6 +806,34 @@ static void store_unscaled(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn,
         default: e32(cb, enc_stur(rs, rn, imm9)); break;
     }
 }
+/* M2.11: the same width/signedness table in the REGISTER-offset form
+ * (bit 21 = 1, opt/s as below). The 64-bit forms use LSL #0 (Xm in
+ * full — a two's-complement 64-bit displacement wraps the address add
+ * correctly); every narrower form uses SXTW (the low 32 bits sign-
+ * extended), which is how a negative displacement stays negative — LSL
+ * #0 would zero-extend Wm into a huge positive offset. The caller
+ * guarantees the displacement fits int32 (imm28 range). The register
+ * rm holds the displacement (X_DR on a marked run, a scratch otherwise)
+ * and is never modified by the access. */
+static void load_typed_reg(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn, uint8_t rm) {
+    switch (type) {
+        case T_I8:  e32(cb, enc_ldrsb_reg(rd, rn, rm)); break;
+        case T_U8:  case T_BOOL: e32(cb, enc_ldrb_reg(rd, rn, rm)); break;
+        case T_I16: e32(cb, enc_ldrsh_reg(rd, rn, rm)); break;
+        case T_U16: e32(cb, enc_ldrh_reg(rd, rn, rm)); break;
+        case T_I32: case T_F32: e32(cb, enc_ldrsw_reg(rd, rn, rm)); break;
+        case T_U32: e32(cb, enc_ldr_w_reg(rd, rn, rm)); break;
+        default:    e32(cb, enc_ldr_reg(rd, rn, rm)); break;
+    }
+}
+static void store_typed_reg(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn, uint8_t rm) {
+    switch (type) {
+        case T_I8: case T_U8: case T_BOOL: e32(cb, enc_strb_reg(rs, rn, rm)); break;
+        case T_I16: case T_U16:            e32(cb, enc_strh_reg(rs, rn, rm)); break;
+        case T_I32: case T_U32: case T_F32: e32(cb, enc_str_w_reg(rs, rn, rm)); break;
+        default: e32(cb, enc_str_reg(rs, rn, rm)); break;
+    }
+}
 static int type_shift(int t) {   /* log2(byte width) — used for PTRADD scaling */
     switch (t) {
         case T_I8: case T_U8: case T_BOOL: return 0;
@@ -774,6 +841,24 @@ static int type_shift(int t) {   /* log2(byte width) — used for PTRADD scaling
         case T_I32: case T_U32: case T_F32: return 2;
         default: return 3;
     }
+}
+/* M2.11: does this LOAD/STORE land in the materialize path — i.e. NOT the
+ * scaled-fast (1 word), NOT the unscaled imm9 (1 word), NOT the imm12
+ * add/sub (2 words)? Only such displacements (> 4095 and not a multiple
+ * of 4096, either sign) are worth the register-offset/run-reuse
+ * machinery; the class is purely a function of (disp, type) and is
+ * identical for every access sharing a displacement, since the scaled
+ * and imm12 checks depend on the same magnitude. Consulted by the run
+ * pre-pass, which runs only when g_alloc (the codegen's imm9/imm12 folds
+ * are g_alloc-gated too, so the classes match exactly). */
+static int mem_materialize_class(int32_t disp, int type) {
+    int sh = type_shift(type);
+    if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) return 0;
+    if (disp >= -256 && disp <= 255) return 0;
+    uint64_t mag = (disp < 0) ? (uint64_t)(-(int64_t)disp) : (uint64_t)disp;
+    int sh2; uint32_t u;
+    if (imm12_split(mag, &sh2, &u)) return 0;
+    return 1;
 }
 
 /* ─── Procedure prologue/epilogue ─────────────────────────────────────────
@@ -1155,26 +1240,33 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             if (g_alloc && disp >= -256 && disp <= 255) {
                 load_unscaled(cb, type, rh, h_a, (int16_t)disp);
             } else {
-                /* The address math below modifies h_a IN PLACE (sub/add the
-                 * displacement into the base register). If the cache
-                 * directory still claimed h_a's slot held the base as a
-                 * resident value, a later get_operand(base) would reuse the
-                 * now-address-modified register instead of reloading it —
-                 * the base's register value is poisoned. The clobber spills
-                 * the slot's occupant (if any, and if not the reserved
-                 * result slot) and clears the directory entry, so the next
-                 * fetch of the base must go to memory. Load-bearing, not
-                 * defensive: mem_neg re-reads its base registers across
-                 * these rows and would compute wrong addresses without it. */
-                clobber_scratch(cb, h_a);
                 if (g_alloc && imm12_split(mag, &sh2, &u)) {
+                    /* The add/sub below modifies h_a IN PLACE — the clobber
+                     * is load-bearing (M2.8): without it, a base resident at
+                     * this slot would leave a stale directory entry claiming
+                     * a register that now holds base±disp, poisoning later
+                     * fetches of ra. */
+                    clobber_scratch(cb, h_a);
                     e32(cb, (disp >= 0) ? enc_add_imm_sh(h_a, h_a, u, (uint8_t)sh2)
                                         : enc_sub_imm_sh(h_a, h_a, u, (uint8_t)sh2));
                     load_typed(cb, type, rh, h_a, 0);
                 } else {
-                    uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
-                    e32(cb, enc_add_shift(h_a, h_a, sc, 0, 0));
-                    load_typed(cb, type, rh, h_a, 0);
+                    /* M2.11: register-offset access. The displacement lives
+                     * in a register and the access is ONE word — the M2.8
+                     * materialize + add_shift + zero-offset access was two
+                     * words of address math on top of the materialize. The
+                     * register is X_DR (x12) when this pc is inside a marked
+                     * run (the materialize happened once at the run head);
+                     * otherwise a scratch (h_imm, a cache host, which
+                     * materialize_imm's clobber makes safe). Nothing
+                     * modifies h_a, so no clobber here and the base's
+                     * directory entry stays valid (a resident base stays
+                     * resident). */
+                    uint8_t sc;
+                    if (g_alloc && g_run_cont[g_cur_pc]) sc = X_DR;
+                    else if (g_alloc && g_run_first[g_cur_pc]) sc = materialize_imm(cb, (uint64_t)(int64_t)disp, X_DR);
+                    else sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
+                    load_typed_reg(cb, type, rh, h_a, sc);
                 }
             }
         }
@@ -1208,23 +1300,28 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             if (g_alloc && disp >= -256 && disp <= 255) {
                 store_unscaled(cb, type, h_val, h_base, (int16_t)disp);
             } else {
-                /* The add/sub-imm fold below modifies h_base IN PLACE,
-                 * with the materialize fallback using X_T2 (which the
-                 * folded path never touches). The clobber_scratch(h_base)
-                 * before it is load-bearing exactly as in LOAD's address
-                 * math: the in-place add/sub would leave a stale resident
-                 * directory entry claiming a register that now holds
-                 * base±disp. */
-                clobber_scratch(cb, h_base);
                 if (g_alloc && imm12_split(mag, &sh2, &u)) {
+                    /* The add/sub below modifies h_base IN PLACE — the
+                     * clobber_scratch(h_base) is load-bearing exactly as in
+                     * LOAD's address math (M2.8): the in-place add/sub would
+                     * leave a stale resident directory entry claiming a
+                     * register that now holds base±disp. */
+                    clobber_scratch(cb, h_base);
                     e32(cb, (disp >= 0) ? enc_add_imm_sh(h_base, h_base, u, (uint8_t)sh2)
                                         : enc_sub_imm_sh(h_base, h_base, u, (uint8_t)sh2));
                     store_typed(cb, type, h_val, h_base, 0);
                 } else {
-                    clobber_scratch(cb, X_T2);
-                    emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
-                    e32(cb, enc_add_shift(h_base, h_base, X_T2, 0, 0));
-                    store_typed(cb, type, h_val, h_base, 0);
+                    /* M2.11: register-offset access — same shape as LOAD's,
+                     * on the base register. The store value (h_val) and base
+                     * (h_base) hosts are distinct (x9/x10); the displacement
+                     * register is X_DR on a marked run or X_T2 otherwise
+                     * (clobbered first — X_T2's slot may hold a resident
+                     * guest value). Nothing modifies h_base. */
+                    uint8_t sc;
+                    if (g_alloc && g_run_cont[g_cur_pc]) sc = X_DR;
+                    else if (g_alloc && g_run_first[g_cur_pc]) sc = materialize_imm(cb, (uint64_t)(int64_t)disp, X_DR);
+                    else { clobber_scratch(cb, X_T2); sc = materialize_imm(cb, (uint64_t)(int64_t)disp, X_T2); }
+                    store_typed_reg(cb, type, h_val, h_base, sc);
                 }
             }
         }
@@ -1484,6 +1581,43 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     g_cache_round = 0;
     g_resv_slot = -1;
 
+    /* M2.11: run-reuse pre-pass. A maximal straight-line run of LOAD/STORE
+     * with the SAME displacement that lands in the materialize path (past
+     * the imm12 range — the imm9/imm12 folds already take those in one or
+     * two words, so a run would only be bigger) shares ONE materialization
+     * of that displacement into X_DR (x12, outside the cache): the run
+     * head emits the li64 once and every access in the run is a single
+     * register-offset word, instead of a per-access materialize +
+     * add_shift + zero-offset access. The run must not cross a block head
+     * (a branch could arrive with x12 holding garbage) nor a non-
+     * LOAD/STORE instruction (CALL/trampoline clobber x12), and it is
+     * gated on g_alloc like every fold — the naive JMPR path stays
+     * byte-identical to M0. Runs of one are left to the per-instruction
+     * register-offset fold below. */
+    for (uint32_t q = 0; q < 4096; q++) { g_run_first[q] = 0; g_run_cont[q] = 0; }
+    if (g_alloc) {
+        for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+            if (g_pc_target[pc]) continue;   /* a branch could land here with x12 stale */
+            uint64_t w0 = instrs[pc];
+            uint8_t op0 = w_op(w0);
+            if ((op0 != OP_LOAD && op0 != OP_STORE) ||
+                !mem_materialize_class(w_imm28(w0), w_type(w0)))
+                continue;
+            int32_t disp0 = w_imm28(w0);
+            uint32_t j = pc + 1;
+            while (j < hdr.num_instr && !g_pc_target[j] &&
+                   (w_op(instrs[j]) == OP_LOAD || w_op(instrs[j]) == OP_STORE) &&
+                   w_imm28(instrs[j]) == disp0 &&
+                   mem_materialize_class(w_imm28(instrs[j]), w_type(instrs[j])))
+                j++;
+            if (j - pc >= 2) {               /* a run is >= 2 accesses or it isn't worth it */
+                g_run_first[pc] = 1;
+                for (uint32_t k = pc + 1; k < j; k++) g_run_cont[k] = 1;
+                pc = j - 1;                  /* the loop's pc++ lands on the access after the run */
+            }
+        }
+    }
+
     for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
         g_instr_off[pc] = cb.len;
         /* The in-flight result reservation is per-instruction state: a
@@ -1495,6 +1629,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         g_resv_slot = -1;
         g_resv_reuse = 0;
         g_resv_guest = -1;
+        g_cur_pc = pc;
         uint64_t w = instrs[pc];
         uint8_t op = w_op(w);
 
