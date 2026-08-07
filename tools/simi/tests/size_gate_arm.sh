@@ -19,8 +19,13 @@
 # the gate's savings, and reverting the rd_live hint grows the test by
 # exactly that), plus the M2 JMPR pair: jmpr_mid (constant index folds to
 # a direct branch and keeps the cache — 168 bytes below its M0 baseline)
-# and jmpr_dyn (runtime index keeps the dynamic path, byte-identical to
-# M0's naive codegen: 0 saved, the honest floor). jmpr_join is the
+# and jmpr_dyn (runtime index keeps the dynamic path — the index is a
+# value read back from guest memory, since M2.3 added XOR to the fold
+# set and the original r1 = 5 ^ r0 silently folded, stopping this test
+# from exercising the dynamic path at all; the LOAD restores it. The
+# dynamic JMPR emission is byte-identical to M0's; the 16 bytes below
+# M0 come from the zero-displacement STORE/LOAD folds, which apply to
+# every program regardless of g_alloc). jmpr_join is the
 # fold-soundness pin: its index is set to different constants on two
 # joining paths, so it must NOT fold (0 saved — and reverting the block-
 # head constant reset makes it return 1 instead of 222, caught by the
@@ -29,8 +34,9 @@
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
 # fold compounds 12 more on M2.1's 212, and disabling the ADD/SUB index
 # fold grows it back to exactly 1288. jmpr_mix is the M2.1 mixed
-# case: one runtime JMPR (forces g_alloc=0, whole program naive) and one
-# constant JMPR that still folds — 48 bytes below its M0 baseline, the
+# case: one runtime JMPR (forces g_alloc=0, whole program naive — the
+# index is a LOAD result for the same M2.3 reason as jmpr_dyn) and one
+# constant JMPR that still folds — 64 bytes below its M0 baseline, the
 # folded-branch-under-naive-codegen interaction pinned. jmpr_calc_mul is
 # M2.2: its index is COMPUTED through a MULTIPLY chain (MUL reg+reg,
 # MUL reg+imm, SUB reg+imm) — 212 bytes below its M0 baseline after
@@ -120,7 +126,15 @@
 # across the whole chain. — 248 bytes below its M0 baseline (1228);
 # the old mark-all merge measures 1180 (the cascade alone is worth
 # 200 of the 248), and disabling the coalescing grows it back to 996
-# (fusion worth 16). mem_pre is M2.10:
+# (fusion worth 16). tail_ret is M2.14: TAIL REUSE — every RET in a
+# function emits an identical 7-word return tail (ldr x9 slot0; ldrb
+# x10 tag0; pop frame; restore x30/x29; br x30), cache-independent (the
+# RET's flush emptied x9/x10/x11 first) and pc-independent, so N RETs
+# share ONE copy: the first RET emits it in place, the rest emit just
+# `cache_flush; b tail`. A BC dispatch (no JMPR) pins that tail reuse is
+# independent of the JMPR folding: 3 RETs -> 1 copy -> 48 bytes below
+# its M0 baseline (2 sharing RETs x 24 bytes; disabling the sharing
+# grows it back to exactly 1048 = M0, still correct). mem_pre is M2.10:
 # ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
 # folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
 # no writeback, no alignment requirement, superseding the M2.9
@@ -170,12 +184,12 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_dyn]=1136 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
+    [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
     [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
-    [straight_line_bench]=1104
+    [straight_line_bench]=1104 [tail_ret]=1048
 )
 
 pass=0

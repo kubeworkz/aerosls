@@ -443,6 +443,11 @@ static uint8_t  g_fold_fall[4096];      /* M2.12: folded JMPR whose target is pc
 static uint8_t  g_run_first[4096];
 static uint8_t  g_run_cont[4096];
 static uint32_t g_cur_pc;
+/* M2.14: tail-reuse offset. The first RET in the function emits the
+ * shared return-sequence tail in place and records the tail's first
+ * word here; every later RET emits `cache_flush; b tail` instead of its
+ * own copy (0xFFFFFFFF = no owner yet / naive mode). See OP_RET. */
+static uint32_t g_tail_ret_off;
 
 static uint8_t cache_host(int i) { return (uint8_t)(X_T0 + i); }
 static int cache_find(int g) {
@@ -1385,6 +1390,31 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     }
     case OP_RET:
         cache_flush(cb);         /* M1: r0 (and everything else) must be in slots — the call site reads them */
+        /* M2.14 TAIL REUSE. The sequence below (ld_slot t0,0; ld_tag
+         * t1,0; add sp,#frame; ldr x30; ldr x29; add sp,#16; br x30) is
+         * byte-identical for EVERY RET in the function — the flush above
+         * emptied x9/x10/x11 (so the tail's use of t0/t1 is
+         * cache-independent) and none of it depends on the pc or the
+         * resident set. The first RET emits it in place and records the
+         * tail's first word in g_tail_ret_off; every later RET emits
+         * just `b tail` (a backward branch — the owner is earlier in
+         * layout), so N RETs share ONE copy of the return sequence and
+         * N-1 copies are deleted (6 words each). Gated on g_alloc like
+         * every fold: the naive path stays byte-identical to M0 (and
+         * jmpr_dyn keeps its documented 0-saved honest floor). The tail
+         * spans every RET in the object — correct even if a .tmo ever
+         * carries multiple exported entries, since it is sp-relative and
+         * the frame layout (TX_AR_TOTAL_FRAME_BYTES) is uniform. Soundness:
+         * each RET's own flush writes ITS resident set to slots before
+         * branching, and the shared tail then reads r0's slot+tag and
+         * returns — the branch crosses no SIMI block boundary (the cache
+         * is empty and the tail touches only t0/t1), so every arrival
+         * sees exactly the state its own RET left. */
+        if (g_alloc && g_tail_ret_off != 0xFFFFFFFFu) {
+            e32(cb, enc_b((int)((int64_t)g_tail_ret_off - (int64_t)cb->len) / 4));
+            break;
+        }
+        if (g_alloc) g_tail_ret_off = cb->len;   /* owner: record the tail's first word */
         ld_slot(cb, X_T0, 0);    /* r0 is the return-value register, §4.8; t0 survives the epilogue below untouched */
         /* Gap Remediation SIMI Phase 12: r0's tag rides in t1, alongside
          * t0 — the epilogue below (add sp; ldr x30; ldr x29; add sp; br
@@ -1452,6 +1482,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     g_num_names = hdr.num_names;
     g_num_instr = hdr.num_instr;
     g_njmpr_li_pos = 0;
+    g_tail_ret_off = 0xFFFFFFFFu;   /* M2.14: no tail owner yet */
 
     struct CodeBuf cb; cb.buf = out_buf; cb.cap = out_cap; cb.len = 0; cb.overflow = 0;
     g_nfixups = 0;

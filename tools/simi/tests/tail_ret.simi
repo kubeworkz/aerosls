@@ -1,0 +1,30 @@
+; tail_ret.simi — M2.14: TAIL REUSE. Every RET in a function emits an
+; identical 7-word return tail (ldr x9 slot0; ldrb x10 tag0; pop frame;
+; restore x30/x29; add sp; br x30) — it is cache-independent (the RET's
+; flush emptied x9/x10/x11 first) and pc-independent, so N RETs share
+; ONE copy: the first RET (pc 4, in the dead path) emits the tail in
+; place and records its offset; the other two (pc 8, pc 10) emit just
+; `cache_flush; b tail` — a backward branch to the shared return
+; sequence. 3 RETs → 1 copy → 12 words saved vs. M2.13's 3 copies.
+; Deliberately a BC dispatch, NOT a JMPR, to pin that tail reuse is
+; independent of the JMPR folding (and of g_alloc's folds in general).
+; A regression is caught two ways: the size gate (N-1 copies deleted)
+; and correctness — every RET must still hand r0's value+tag to the
+; caller through t0/t1, which the parity engines prove (the shared tail
+; executes exactly once per RET, on whatever path reaches it).
+; Expected result: 33
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #2, i64
+    BC r1, two             ; r1 = 2 != 0 → two (always taken)
+    LOADI r0, #11, i64     ; dead path 1 — RET here is the tail OWNER
+    RET
+two:
+    LOADI r2, #3, i64
+    BC r2, three           ; r2 = 3 != 0 → three (always taken)
+    LOADI r0, #22, i64     ; dead path 2 — RET shares the tail
+    RET
+three:
+    LOADI r0, #33, i64     ; live path — RET shares the tail
+    RET
