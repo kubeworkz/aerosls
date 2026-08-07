@@ -1524,6 +1524,98 @@ identical to its successor's prologue) and coalescing chains across
 more than one fall-through fold — plus the fixpoint-vs-fusion
 interaction the §10.30 ceiling describes.
 
+### 10.32 M2.13 amendment — cascading fall-through folds (as built)
+
+The §10.30 ceiling named exactly the interaction M2.13 now removes:
+"clearing marks happens after the fold fixpoint converges, so a chain
+that a fused boundary would newly enable to fold is missed." A chain
+of fall-through folds collapsed under M2.12 because the rule-1 merge
+marked EVERY fold target as a block head — including a fall-through
+fold's own target (pc+1). The mark reset the constant map at the NEXT
+JMPR in the chain, un-folding it; a JMPR that fails to fold is
+DYNAMIC, which kills g_alloc for the whole function. Three chained
+fall-through folds: only the first folds, the other two fall back to
+the runtime table + bounds check, and the function loses its cache
+entirely.
+
+The fix is a two-line change plus the coalescing pass taking over
+mark authority:
+
+1. **The rule-1 merge skips fall-through folds.** `g_jmpr_fold[pc] >= 0
+   && g_jmpr_fold[pc] != (int)(pc + 1)` — a fall-through fold's branch
+   is the dead one M2.12 drops, so it owes no mark. The constant map
+   flows through the join, the next JMPR in the chain still sees its
+   index constant, folds, and so on down the whole chain.
+2. **The coalescing pass is the authority on fall-through targets.**
+   For each fall-through fold it counts the target's OTHER incoming
+   edges as before; when NONE exist it fuses (`g_pc_target[t] = 0`),
+   and when they DO it now RE-MARKS (`g_pc_target[t] = 1`) — the
+   merge no longer did, and the boundary flush plus the analysis-side
+   constant reset must be exactly what they were.
+
+The final `g_pc_target` state is IDENTICAL to M2.12's for every shape
+the earlier pass handled (fused and non-fused single folds) — the
+only behavioral difference is that chains now fold all the way
+through, and a g_alloc=0 function with a folded fall-through JMPR
+stops emitting the (dead, zero-width) boundary flush after its
+unconditional branch. Pass A also now marks entry pcs: the trampoline
+branches to them, so constants cannot survive into an entry — this
+hardens the corner where an entry pc is also a fall-through fold
+target (without it, such a target would be unmarked in the fixpoint
+and a JMPR after it could fold on a fall-through-only constant; the
+trampoline arrival marshals the arg slots and guarantees nothing).
+Byte-neutral for the corpus — every entry sits at pc 0, where the
+scan starts with an empty constant map anyway.
+
+Soundness of the cascade rests on the same single-edge argument as
+§10.30's fusion: a fall-through target is only left unmarked when it
+has no other way in, so the only path to it is the fall-through,
+which carries exactly the constants the linear walk attributed. When
+it DOES have other edges, the edge that marks it (pass-A branch, real
+fold merge) is sticky from the fixpoint's early iterations, and the
+fixpoint re-scans un-fold any JMPR that folded across the join. The
+coalescing pass never invents a fold — it only decides marks after
+the fixpoint has converged.
+
+- **`tests/jmpr_fall2.simi`** — the first chain in the corpus. Three
+  JMPRs in a row, each folding to its own next pc (r1=5→pc 5,
+  r2=6→pc 6, r3=7→pc 7), with all three index constants loaded
+  BEFORE the chain (pcs 1-3) — the shape that actually exercises the
+  cascade (loading each index right before its JMPR would fold even
+  under the old merge). Expected 18; dump-verified: three movz + tag
+  writes, NO branch words, no boundary flush, x9/x10/x11 resident
+  straight into the target ADDs — the register frame is loaded once,
+  not four times.
+
+### 10.33 M2.13 gate results (measured)
+
+Total emitted bytes across the now-33-program parity set (the gate's
+own M0/M1 totals now include the new jmpr_fall2 row): **M0 46096 →
+M1 42416, 3680 saved** (≈8.0%), up from M2.12's 3432. The M2.13 row
+on top of M2.12's 3432:
+
+- jmpr_fall2 1228 → 980 (−248, new 33rd row). The cascade is the
+  bulk of it: the old mark-all merge (M2.12's rule-1) measures 1180 —
+  the cascade alone is worth 200 of the 248, since a mark-all chain
+  leaves JMPRs 5/6 dynamic, which kills g_alloc and drops the whole
+  function to memory-slot codegen. Disabling the coalescing (fold-
+  target check pc+1 -> pc+9999) grows it to 996, still correct —
+  the branch-drop + fusion is worth 16 of the 248.
+- Row-by-row M2.12-vs-M2.13 accounting (gate tables diffed): all 32
+  shared rows byte-identical — the pass-A entry marking and the merge
+  change perturbed nothing in the existing corpus. The totals move
+  by exactly the new jmpr_fall2 row.
+- Four-way parity: interp 35/0, x86 34/0/3, RV64 33/0/4, ARM 33/0/4.
+  enc-check 12/12 OK; jmpr_oob still faults (UDF, rc=1). Teeth:
+  mark-all merge 1180 and coalescing-off 996 both still verify 18.
+
+The M-line has now compounded to 3680 bytes saved, and the §10.30
+ceiling is gone: fused boundaries now participate in the fold
+analysis, so chains fold all the way through instead of stopping at
+the first fused join. The remaining §10.29 levers are tail reuse and
+block coalescing's sibling — epilogue/prologue merging across
+backward folds — plus the entry-corner hardening note in §10.32.
+
 ---
 
 ## Sources consulted

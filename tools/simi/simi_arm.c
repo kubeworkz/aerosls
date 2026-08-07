@@ -1469,6 +1469,17 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             if (tgt >= 0 && tgt < (int64_t)hdr.num_instr) g_pc_target[(uint32_t)tgt] = 1;
         }
     }
+    /* M2.13: entry pcs are block heads too — the trampoline branches to
+     * them, so constants cannot survive into an entry pc. This hardens
+     * the corner where an entry pc is ALSO a fall-through fold target:
+     * the fold fixpoint's rule-1 merge skips fall-through targets, so
+     * without this the entry would be unmarked and a JMPR after it could
+     * fold on a constant that only holds on the fall-through path (the
+     * trampoline arrival marshals the arg slots and guarantees nothing).
+     * Byte-neutral for the corpus: entries sit at pc 0, where the scan
+     * starts with an empty constant map anyway. */
+    for (uint32_t i = 0; i < hdr.num_entries; i++)
+        if (entries[i].offset < hdr.num_instr) g_pc_target[entries[i].offset] = 1;
     /* M2: constant-index JMPR folding, by fixpoint. Each scan walks the
      * linear stream with a per-register constant map that resets at every
      * pc in g_pc_target (pass-A targets plus any fold targets discovered
@@ -1564,8 +1575,21 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                 g_const_known[rd] = 0;   /* every other register-writing opcode breaks the constant */
             }
         }
-        for (uint32_t pc = 0; pc < hdr.num_instr; pc++)   /* fold targets are block heads (rule 1) */
-            if (g_jmpr_fold[pc] >= 0) g_pc_target[(uint32_t)g_jmpr_fold[pc]] = 1;
+        for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+            /* rule 1: fold targets are block heads — EXCEPT a fall-through
+             * fold (target == pc + 1): its branch is dead (M2.12 drops it), so
+             * it marks nothing here, and the M2.12 coalescing pre-pass below
+             * is the authority on whether the target keeps a mark (its OTHER
+             * incoming edges — pass-A branches, real folds, entries). Skipping
+             * the mark is what lets a chain of fall-through folds CASCADE:
+             * the target's constant map is not reset, the next JMPR in the
+             * chain still sees its index constant, folds, and so on down the
+             * chain — instead of the first fold marking the next JMPR as a
+             * block head, which resets its index constant and un-folds it
+             * (turning it into a DYNAMIC JMPR and killing g_alloc entirely). */
+            if (g_jmpr_fold[pc] >= 0 && g_jmpr_fold[pc] != (int)(pc + 1))
+                g_pc_target[(uint32_t)g_jmpr_fold[pc]] = 1;
+        }
         int same = 1;
         for (int i = 0; i < 4096; i++)
             if (g_jmpr_fold[i] != g_jmpr_fold_prev[i]) { same = 0; break; }
@@ -1602,9 +1626,17 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
      * edge check: with no other way in, the only path to the target is
      * the fall-through, which carries exactly the cache state the
      * previous instruction left — the same invariant straight-line
-     * code already relies on. Gated on g_alloc: a dynamic JMPR can land
-     * on any pc (every pc is a block head), so no fusion — and the naive
-     * path stays byte-identical to M0. */
+     * code already relies on. M2.13: the fixpoint's rule-1 merge no
+     * longer marks fall-through fold targets at all (a fall-through
+     * fold's own edge is the one being dropped, so it owes no mark),
+     * which lets CHAINS cascade: three JMPRs each folding to their own
+     * next pc fold in sequence, and this pass fuses all three joins.
+     * When the target keeps other edges, the pass re-marks it (the
+     * merge skipped it), so the boundary flush and the analysis-side
+     * constant reset are exactly what they were before the merge
+     * change. Gated on g_alloc: a dynamic JMPR can land on any pc
+     * (every pc is a block head), so no fusion — and the naive path
+     * stays byte-identical to M0. */
     for (uint32_t q = 0; q < 4096; q++) g_fold_fall[q] = 0;
     if (g_alloc) {
         for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
@@ -1633,6 +1665,12 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                 for (uint32_t i = 0; i < hdr.num_entries; i++)
                     if (entries[i].offset == t) { other = 1; break; }
             if (!other) g_pc_target[t] = 0;   /* fuse: the fold is the only way in */
+            else g_pc_target[t] = 1;          /* M2.13: re-mark — the fixpoint's rule-1
+                                               * merge skips fall-through targets, so the
+                                               * target's mark now owes to its OTHER edges;
+                                               * this restores the boundary flush (and the
+                                               * analysis-side constant reset) exactly as
+                                               * before the merge change. */
         }
     }
 
@@ -1735,7 +1773,9 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             if (g_jmpr_fold[pc] >= 0) {
                 /* M2.12: a fall-through fold (target == pc+1) is a dead
                  * branch — the target is the next instruction, reached by
-                 * falling through. Emit NOTHING for it. The end-of-loop
+                 * falling through. Emit NOTHING for it (M2.13: the fold
+                 * fixpoint now folds whole CHAINS of these — each target
+                 * is unmarked by the merge, so every link folds). The end-of-loop
                  * block-head flush below still fires at the boundary when
                  * the target kept its mark (it has other incoming edges —
                  * those land with an empty cache exactly as before), and is
