@@ -514,6 +514,132 @@ all gates are the measurements below, not opinions.
   addresses; the real A64 ABI result convention (x0) is exercised by
   `cap_call_ret` through the trampoline but unproven against a real runtime.
 
+## 9. M1 as-built addendum (register allocator + size gate)
+
+M1 is the first performance milestone: M0's naive load-operate-store
+codegen — every SIMI instruction fetched its operands from the frame and
+stored its result back — became a tiny three-register allocator that
+keeps arithmetic chains resident across instruction boundaries. The
+surface area is unchanged (all 31 opcodes, all 10 CMP relations, JMPR
+bounds check); only the shape of the emitted body changed.
+
+### 9.1 What shipped
+
+- **`simi_arm.c`** — an x9/x10/x11 cache with a compile-time directory
+  (`g_cache_guest[]`), round-robin eviction, per-instruction
+  reservation state (`g_resv_*`), and cache-aware codegen for ALU,
+  LOAD/STORE, MOV, LOADI64, LEA/PTRADD, CMP (subs+cset, cached result),
+  and the call-site return value. `get_operand` takes an `rd_live` hint
+  (rd aliases a source operand) so a fetch that clobbers a REUSED result
+  register spills the old value only when it is live — a dead
+  destination's spill is skipped (9.2). Flush points are exactly the
+  guest-observing boundaries: BR/BC/CALL/RET/JMPR/hostfn/ENTER.
+- **`tests/rd_star.simi`** — the allocator edge-case test (`ADD rd,ra,rd`
+  with rd resident): fails without the reserved-slot downgrade fix
+  (10 instead of 42) and runs on all four engines.
+- **`tests/dead_reuse.simi`** — the complement: `ADD rd,ra,rb` with rd
+  resident but not an operand, ten forced occurrences. Reverting the
+  `rd_live` skip grows the test by exactly 40 bytes (1152, back to M0's
+  size); it pins the optimization the gate measures.
+- **`tests/size_gate_arm.sh`** + Makefile `size-gate-arm` — the
+  measurement gate.
+- **`a64_enc_check.py`** — rewritten from M0's exact-body expectations
+  to allocation-agnostic checks (see 9.3).
+
+### 9.2 Design decisions worth recording
+
+- **The cache must be empty at every block head.** A branch target that
+  lands mid-chain would read garbage registers, so a pre-pass marks all
+  branch/call target pcs (`g_pc_target[]`) and the main loop flushes the
+  cache at the end of any instruction whose successor is a target — the
+  flush word becomes part of the block head, and branch fixups (resolved
+  after the loop) land on it naturally.
+- **Result-in-place vs phantom.** When rd is already resident its slot is
+  reused and the result computed in place; a *fresh* claim's register is
+  garbage until the result lands, so operand reads of rd go to memory
+  while the claim is a "phantom". When an operand fetch must clobber a
+  reused result register (e.g. `ADD rd, ra, rd`), the old value is
+  spilled and the reservation downgraded to a phantom — this is the
+  rd_star fix.
+- **JMPR disables the cache entirely** (`g_alloc=0`, naive M0 path). A
+  JMPR can land on any pc, so no compile-time cache discipline survives
+  it; jmpr_basic/jmpr_oob therefore measure the allocator's floor, not
+  its peak, and their M0 sizes are unchanged.
+- **The `rd_live` hint kills the dead-value spill.** When an operand
+  fetch must clobber a REUSED result register, the old value is spilled
+  only if rd is a source operand of the instruction (`rd_live`, e.g.
+  `ADD rd, ra, rd` — a later fetch of rd must reload it from memory);
+  if rd is not an operand (`ADD rd, ra, rb` with rd resident) the old
+  value is dead and the spill is skipped — the result overwrites the
+  register in place. The reservation downgrades to a phantom either
+  way, so the register is garbage until the result lands. The cost is
+  one boolean per call site; the win is one store per dead-resident
+  reuse, measured by dead_reuse.simi (40 bytes) and add.simi (4).
+
+### 9.3 Gate results (measured)
+
+Total emitted bytes across the 17-program parity set — the 15 M0-corpus
+programs plus the two M1 allocator edge-case tests (rd_star, dead_reuse),
+whose baselines were measured by running the committed M0 translator on
+the new .simi files: **M0 25020 → M1 24684, 336 saved** (≈1.3%). The
+distribution is the honest picture:
+
+- Arithmetic-heavy programs win big: aggregate_abi −152, dead_reuse −64
+  (40 of it the rd_live skips — five first-fetch and five second-fetch
+  shapes — the rest LOADI residency), mem_ops_native −36, rd_star −24.
+- `straight_line_bench` — the register-pressure worst case (six live
+  values vs a 3-register pool, so everything spills) — shrinks only 4
+  bytes. This is the gate's point: the allocator is a measured ceiling,
+  not a promise of a specific win.
+- Branch-heavy programs (branch_cmp −8, cap_forge −4) win little; the
+  cache is empty at every block head by design.
+- `size-gate-arm` fails any test that regresses past its M0 baseline
+  (hardcoded, with a documented re-measure procedure for corpus edits).
+
+`a64_enc_check.py` changed what it can assert: M1's body is
+allocation-dependent (register choice varies by eviction order), so exact
+body words would just restate the allocator. It now requires (1) every
+emitted body word to decode to a legal A64 class via the independent
+Python bit layout, and (2) every movz/movk chain to carry the exact
+LOADI values — prologue and trampoline keep exact-word checks. The net
+is deliberately register-blind: a wrong operand register still decodes
+as legal, so allocation correctness rests on the four-way execution
+parity, not this net.
+
+### 9.4 Bugs the gates caught
+
+Three real allocator bugs, all fixed before commit:
+
+1. **`g_pc_target` wipe** — the pre-pass zeroed each entry as it walked,
+   wiping the marks earlier branch instructions had set; every block-head
+   flush silently vanished and branch fixups landed on stale offsets
+   (branch_cmp corrupting a live slot). Zeroed once before the walk.
+2. **Stale `g_resv_slot` across instructions** — a LOADI left its
+   reservation set; the next STORE's base-address fetch then skipped the
+   spill of the "reserved" register and clobbered a resident value
+   (aggregate_abi, mem_ops_native). Reservation state is reset at the
+   top of every translate-loop iteration.
+3. **Reserved-slot reuse with rd as operand** — `ADD rd, ra, rd` with rd
+   resident read garbage into the second operand because the first fetch
+   had claimed rd's register. The downgrade-to-phantom in `get_operand`
+   is the fix; rd_star.simi proves it fails without (10 vs 42).
+
+### 9.5 Honest limits that stand after M1
+
+- The §8.5 caveats (decoder-based evidence, unproven ABI, unasserted
+  JMPR fault path) stand unchanged — M1 added no real execution.
+- Register correctness is covered only by execution parity, not the
+  encoder net (9.3); the corpus is 17 programs, so an allocation bug
+  that the corpus never exercises could still hide.
+- The block-head flush is a structural cost (every branch target pays
+  an empty cache), bounded and measured by the gate; the dead-value
+  spill is gone but the corpus now includes dead_reuse.simi so a
+  regression of the rd_live hint is caught by size, not just missed
+  bytes.
+- JMPR programs get no allocator benefit at all — the naive path is the
+  price of a runtime-indirect branch, and no JMPR-bearing test exists
+  that would measure a smarter middle ground.
+
 ---
 
 ## Sources consulted

@@ -275,6 +275,175 @@ static void st_untag(struct CodeBuf* cb, int i)            { e32(cb, enc_strb(31
  * simi_x86.c/simi_riscv.c. */
 static void st_slot_untag(struct CodeBuf* cb, uint8_t rs, int i) { st_slot(cb, rs, i); st_untag(cb, i); }
 
+static void emit_li64(struct CodeBuf* cb, uint8_t reg, uint64_t imm);   /* fwd: defined below */
+
+/* ─── M1: three-entry symbolic-register cache (x9/x10/x11) ────────────────
+ * The M0 codegen load-operate-stored every operand and result — five or
+ * six words per arithmetic instruction even when the operands were just
+ * produced two instructions earlier. M1 keeps up to three guest registers
+ * resident in the working registers x9/x10/x11 across SIMI instruction
+ * boundaries, keyed by a tiny compile-time directory:
+ *
+ *   - g_cache_guest[i] = guest reg resident in x9+i, or -1.
+ *   - cache_reserve() claims a host register for the current result with
+ *     round-robin eviction; the evicted value is spilled to its slot.
+ *   - get_operand() reads a guest reg through the cache (a mov when it is
+ *     resident in another working register, a slot load otherwise).
+ *   - store_result() keeps the result resident (writing only the tag byte,
+ *     so memory's tag bytes stay authoritative), or falls back to the M0
+ *     store+untag sequence.
+ *
+ * Correctness rules, all enforced at emit time:
+ *   1. MEMORY IS ALWAYS THE SOURCE OF TRUTH AT BLOCK BOUNDARIES. Every
+ *      BR/BC/CALL spills the whole cache first, and every instruction
+ *      whose next pc is a branch target ends with a spill, so a jump
+ *      always lands on code that re-fetches from slots. The branch path
+ *      and the fall-through path therefore see identical, correct memory
+ *      — the fall-through into a mid-chain target cannot rely on cached
+ *      values, because the target is shared with paths that never cached
+ *      them (or that arrive with different registers clobbered).
+ *   2. JMPR DISABLES THE CACHE FOR THE WHOLE PROGRAM. The JMPR table can
+ *      land on any pc, so every pc would have to be a block head — which
+ *      is no cache at all. Programs containing JMPR translate with
+ *      g_alloc=0 and get byte-identical M0 codegen.
+ *   3. TAG BYTES ARE WRITTEN TO MEMORY IMMEDIATELY. A cached value's tag
+ *      byte is stored the moment the value is cached (store_result's
+ *      st_untag, MOV's st_tag, the call site's st_tag), so a spill only
+ *      ever needs to write the value — the tag byte in memory is always
+ *      authoritative. This is what lets OBJSIZE/OBJTYPE/RET/CALL read
+ *      tags straight from memory without knowing the cache state.
+ *   4. SCRATCH USE EVICTS FIRST. X_T1/X_T2 are also cache hosts; any use
+ *      of them as scratch (constants, the MOV tag load) spills the
+ *      occupant first, and the round-robin victim of cache_reserve is
+ *      never spilled by the in-flight instruction's own operand fetches
+ *      (g_resv_slot). A64 reads all operands before writing the result,
+ *      so the result register may alias an operand register.
+ * The naive (g_alloc=0) path degrades these helpers to exactly the M0
+ * sequences, so the JMPR fallback is exercised by jmpr_basic/jmpr_oob.
+ */
+#define AR_CACHE_N 3
+static int g_alloc;                    /* 0 when the program contains JMPR */
+static int g_has_jmpr;                 /* any JMPR in the program disables the cache */
+static int g_cache_guest[AR_CACHE_N];  /* guest reg resident in x9+i, or -1 */
+static int g_cache_round;              /* round-robin eviction cursor */
+static int g_resv_slot;                /* slot reserved for the in-flight result */
+static int g_resv_reuse;               /* reserved slot held rd's old value (in-place result) */
+static int g_resv_guest;               /* the guest reg the reservation is for (== rd) */
+static uint8_t g_pc_target[4096];      /* branch/call target pcs (block heads) */
+
+static uint8_t cache_host(int i) { return (uint8_t)(X_T0 + i); }
+static int cache_find(int g) {
+    for (int i = 0; i < AR_CACHE_N; i++)
+        if (g_cache_guest[i] == g) return i;
+    return -1;
+}
+/* Write one resident value back to its slot and drop the directory entry.
+ * The tag byte is already authoritative in memory (rule 3). */
+static void cache_spill_one(struct CodeBuf* cb, int i) {
+    if (!g_alloc || g_cache_guest[i] < 0) return;
+    st_slot(cb, cache_host(i), g_cache_guest[i]);
+    g_cache_guest[i] = -1;
+}
+static void cache_flush(struct CodeBuf* cb) {
+    if (!g_alloc) return;
+    for (int i = 0; i < AR_CACHE_N; i++) cache_spill_one(cb, i);
+}
+/* Claim a host register for rd's result; returns the cache slot (result
+ * register = x9+slot), or -1 in naive mode (result in x9, stored by
+ * store_result). When rd is already resident its slot is REUSED and the
+ * result is computed in place (g_resv_reuse=1): the register still holds
+ * the OLD value, which an operand read of rd must see — and a new slot
+ * claim would strand that value in the old slot's register while the
+ * directory pointed at a fresh one. Only when rd is not resident does the
+ * round-robin victim get evicted (spilled) and claimed. */
+static int cache_reserve(struct CodeBuf* cb, int rd) {
+    if (!g_alloc) { g_resv_slot = -1; g_resv_reuse = 0; return -1; }
+    int v = cache_find(rd);
+    if (v >= 0) {
+        g_resv_reuse = 1;
+    } else {
+        v = g_cache_round;
+        g_cache_round = (g_cache_round + 1) % AR_CACHE_N;
+        if (g_cache_guest[v] >= 0) cache_spill_one(cb, v);
+        g_resv_reuse = 0;
+    }
+    g_cache_guest[v] = rd;
+    g_resv_slot = v;
+    g_resv_guest = rd;
+    return v;
+}
+static uint8_t result_host(int v) { return (uint8_t)(X_T0 + (v >= 0 ? v : 0)); }
+/* Commit a plain result: resident in alloc mode (tag byte stored now),
+ * M0 store+untag in naive mode. */
+static void store_result(struct CodeBuf* cb, int rd) {
+    if (g_alloc) st_untag(cb, rd);   /* value already resident in the reserved register */
+    else         st_slot_untag(cb, X_T0, rd);
+}
+/* Evict (spill) the occupant of cache slot hosting `h` unless it is the
+ * in-flight result slot, before `h` is clobbered as scratch or as a
+ * base/address register (the occupant's value has been consumed). The
+ * reserved slot is never spilled here — if it was reused, its old value
+ * is dead (being replaced); if freshly claimed, the register is garbage
+ * until the result lands. */
+static void clobber_scratch(struct CodeBuf* cb, uint8_t h) {
+    int slot = (int)(h - X_T0);
+    if (g_alloc && slot >= 0 && slot < AR_CACHE_N &&
+        g_cache_guest[slot] >= 0 && slot != g_resv_slot)
+        cache_spill_one(cb, slot);
+}
+/* Materialize `imm` into a scratch register that is neither X_T0 (first
+ * operand) nor the reserved result register; returns that register. */
+static uint8_t materialize_imm(struct CodeBuf* cb, uint64_t imm) {
+    if (g_resv_slot == 1) { clobber_scratch(cb, X_T2); emit_li64(cb, X_T2, imm); return X_T2; }
+    clobber_scratch(cb, X_T1); emit_li64(cb, X_T1, imm); return X_T1;
+}
+/* Read guest register g into host h (x9/x10/x11), through the cache.
+ * Loading or moving into h destroys any occupant of h's slot, so that
+ * occupant is spilled first — except the in-flight result slot. The one
+ * subtlety is the fresh-claim phantom: cache_reserve may have just
+ * claimed a slot for rd whose register does NOT yet hold rd's value (the
+ * result lands there at the end of the instruction), so a read of rd as
+ * an operand when rd was not resident must go to memory, not to the
+ * phantom register. When the slot was REUSED the old value IS in the
+ * register, so the read uses it.
+ *
+ * rd_live says whether this instruction reads rd's OLD value as a source
+ * operand (rd aliases an operand register). When an operand fetch must
+ * clobber a REUSED result register, the old value is spilled only when
+ * rd_live — a later fetch of rd must reload it from memory; when rd is
+ * not an operand (pure ADD rd, ra, rb with rd resident) the old value is
+ * dead, so the spill is skipped and the result overwrites it in place,
+ * saving one store on the common path. The reservation is downgraded to
+ * a fresh claim either way: the register is garbage until the result
+ * lands, so reads of rd must hit memory (the phantom rule below). */
+static void get_operand(struct CodeBuf* cb, int g, uint8_t h, int rd_live) {
+    if (!g_alloc) { ld_slot(cb, h, g); return; }
+    int slot = (int)(h - X_T0);
+    if (g_cache_guest[slot] >= 0 && g_cache_guest[slot] != g) {
+        if (slot == g_resv_slot && g_resv_reuse) {
+            /* The register h is about to clobber is the in-place RESULT
+             * register, still holding rd's OLD value. If rd is an operand
+             * of this instruction (e.g. ADD rd, ra, rd) that value is
+             * live and must be spilled so a later fetch of rd reloads it
+             * from memory; if rd is not an operand, the value is dead and
+             * the spill is skipped (the result replaces it in place).
+             * Downgrade to a fresh claim either way: the register is
+             * garbage until the result lands, so reads of rd must hit
+             * memory (the phantom rule below). */
+            if (rd_live) cache_spill_one(cb, slot);
+            g_cache_guest[slot] = g_resv_guest;
+            g_resv_reuse = 0;
+        } else if (slot != g_resv_slot) {
+            cache_spill_one(cb, slot);
+        }
+    }
+    int i = cache_find(g);
+    if (i >= 0 && !(i == g_resv_slot && !g_resv_reuse)) {
+        if (i != slot) e32(cb, enc_orr_shift(h, 31, cache_host(i), 0, 0));  /* mov h, x{i} */
+    } else {
+        ld_slot(cb, h, g);   /* not resident, or the claimed slot is a phantom */
+    }
+}
 /* ─── 64-bit constants: movz + up to 3 movk, no literal pool ─────────────
  * RV64 needed a whole literal-pool machinery (auipc+ld pairs, a second
  * patch pass, pool emission) because RV64 has no single-instruction 64-bit
@@ -288,16 +457,6 @@ static void emit_li64(struct CodeBuf* cb, uint8_t reg, uint64_t imm) {
         if (half) e32(cb, enc_movk(reg, half, (uint8_t)hw));
     }
 }
-/* Materialize a signed displacement into `reg`: one movz when it fits the
- * 16-bit unsigned field (the overwhelmingly common case for the small
- * LOAD/STORE/LEA offsets the test corpus uses), li64 otherwise. A64's
- * add/sub-immediate rn=31 means SP, not XZR, so unlike RV64 there is no
- * `addi reg, x0, disp` shortcut — movz is the correct 1-instruction path. */
-static void emit_li_disp(struct CodeBuf* cb, uint8_t reg, int32_t disp) {
-    if (disp >= 0 && disp <= 65535) e32(cb, enc_movz(reg, (uint16_t)disp, 0));
-    else emit_li64(cb, reg, (uint64_t)(int64_t)disp);
-}
-
 /* ─── Local (intra-instruction) conditional branch helpers ───────────────
  * OBJSIZE/OBJTYPE and JMPR need runtime branches whose targets are a few
  * instructions further into this same emitted SIMI instruction's code,
@@ -379,23 +538,24 @@ static void op_cbz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fix
 static void op_cbnz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fixup(cb, target_pc, FIX_CBNZ, rt); }
 
 /* ─── CMP: synthesize all 10 relations from cmp+cset (§4) ────────────────
- * Operands in t0 (lhs), t1 (rhs); result (0/1) always ends up in t0.
- * `cmp x0, x1` (subs xzr, x0, x1) writes NZCV; `cset x0, cond` reads it.
- * The A64 condition code for each SIMI relation:
- *   EQ=0 NE=1 HS=2 LO=3 HI=8 LS=9 GE=10 LT=11 GT=12 LE=13. */
-static int emit_cmp(struct CodeBuf* cb, int rel) {
+ * Operands in t0 (lhs), t1 (rhs); result (0/1) ends up in `rd` (M1: the
+ * reserved result register, which may alias an operand register — A64
+ * reads all operands before writing). `cmp x0, x1` (subs xzr, x0, x1)
+ * writes NZCV; `cset xd, cond` reads it. The A64 condition code for each
+ * SIMI relation: EQ=0 NE=1 HS=2 LO=3 HI=8 LS=9 GE=10 LT=11 GT=12 LE=13. */
+static int emit_cmp(struct CodeBuf* cb, int rel, uint8_t rd) {
     e32(cb, enc_subs_shift(31, X_T0, X_T1, 0, 0));   /* cmp x9, x10 */
     switch (rel) {
-        case REL_EQ:  e32(cb, enc_cset(X_T0, 0)); break;   /* eq */
-        case REL_NE:  e32(cb, enc_cset(X_T0, 1)); break;   /* ne */
-        case REL_LT:  e32(cb, enc_cset(X_T0, 11)); break;  /* lt */
-        case REL_GT:  e32(cb, enc_cset(X_T0, 12)); break;  /* gt */
-        case REL_LE:  e32(cb, enc_cset(X_T0, 13)); break;  /* le */
-        case REL_GE:  e32(cb, enc_cset(X_T0, 10)); break;  /* ge */
-        case REL_LTU: e32(cb, enc_cset(X_T0, 3)); break;   /* lo (cc) */
-        case REL_GTU: e32(cb, enc_cset(X_T0, 8)); break;   /* hi */
-        case REL_LEU: e32(cb, enc_cset(X_T0, 9)); break;   /* ls */
-        case REL_GEU: e32(cb, enc_cset(X_T0, 2)); break;   /* hs (cs) */
+        case REL_EQ:  e32(cb, enc_cset(rd, 0)); break;   /* eq */
+        case REL_NE:  e32(cb, enc_cset(rd, 1)); break;   /* ne */
+        case REL_LT:  e32(cb, enc_cset(rd, 11)); break;  /* lt */
+        case REL_GT:  e32(cb, enc_cset(rd, 12)); break;  /* gt */
+        case REL_LE:  e32(cb, enc_cset(rd, 13)); break;  /* le */
+        case REL_GE:  e32(cb, enc_cset(rd, 10)); break;  /* ge */
+        case REL_LTU: e32(cb, enc_cset(rd, 3)); break;   /* lo (cc) */
+        case REL_GTU: e32(cb, enc_cset(rd, 8)); break;   /* hi */
+        case REL_LEU: e32(cb, enc_cset(rd, 9)); break;   /* ls */
+        case REL_GEU: e32(cb, enc_cset(rd, 2)); break;   /* hs (cs) */
         default: return 0;
     }
     return 1;
@@ -406,23 +566,25 @@ static int emit_cmp(struct CodeBuf* cb, int rel) {
  * combination (opc 01 zero-extends, opc 10 sign-extends, 32-bit rt
  * zeroes the upper half), so like RV64 the mapping is 1:1 with no x86
  * movsx/movzx zoo. */
-static void load_typed(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn) {
+/* M1: imm12 is the scaled unsigned offset — 0 in naive mode, the folded
+ * displacement when it fits (an M1 size win for pointer-heavy code). */
+static void load_typed(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn, uint16_t imm12) {
     switch (type) {
-        case T_I8:  e32(cb, enc_ldrsb(rd, rn, 0)); break;
-        case T_U8:  case T_BOOL: e32(cb, enc_ldrb(rd, rn, 0)); break;
-        case T_I16: e32(cb, enc_ldrsh(rd, rn, 0)); break;
-        case T_U16: e32(cb, enc_ldrh(rd, rn, 0)); break;
-        case T_I32: case T_F32: e32(cb, enc_ldrsw(rd, rn, 0)); break;
-        case T_U32: e32(cb, enc_ldr_w(rd, rn, 0)); break;
-        default:    e32(cb, enc_ldr(rd, rn, 0)); break;   /* i64/u64/f64/ptr */
+        case T_I8:  e32(cb, enc_ldrsb(rd, rn, imm12)); break;
+        case T_U8:  case T_BOOL: e32(cb, enc_ldrb(rd, rn, imm12)); break;
+        case T_I16: e32(cb, enc_ldrsh(rd, rn, imm12)); break;
+        case T_U16: e32(cb, enc_ldrh(rd, rn, imm12)); break;
+        case T_I32: case T_F32: e32(cb, enc_ldrsw(rd, rn, imm12)); break;
+        case T_U32: e32(cb, enc_ldr_w(rd, rn, imm12)); break;
+        default:    e32(cb, enc_ldr(rd, rn, imm12)); break;   /* i64/u64/f64/ptr */
     }
 }
-static void store_typed(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn) {
+static void store_typed(struct CodeBuf* cb, int type, uint8_t rs, uint8_t rn, uint16_t imm12) {
     switch (type) {
-        case T_I8: case T_U8: case T_BOOL: e32(cb, enc_strb(rs, rn, 0)); break;
-        case T_I16: case T_U16:            e32(cb, enc_strh(rs, rn, 0)); break;
-        case T_I32: case T_U32: case T_F32: e32(cb, enc_str_w(rs, rn, 0)); break;
-        default: e32(cb, enc_str(rs, rn, 0)); break;
+        case T_I8: case T_U8: case T_BOOL: e32(cb, enc_strb(rs, rn, imm12)); break;
+        case T_I16: case T_U16:            e32(cb, enc_strh(rs, rn, imm12)); break;
+        case T_I32: case T_U32: case T_F32: e32(cb, enc_str_w(rs, rn, imm12)); break;
+        default: e32(cb, enc_str(rs, rn, imm12)); break;
     }
 }
 static int type_shift(int t) {   /* log2(byte width) — used for PTRADD scaling */
@@ -512,8 +674,20 @@ static void emit_call_site(struct CodeBuf* cb, uint32_t target_pc, int rd) {
     e32(cb, enc_strb(X_T1, X_SP, 64));
     op_bl(cb, target_pc);
     e32(cb, enc_add_imm(X_SP, X_SP, TX_AR_OUTGOING_BYTES));
-    st_slot(cb, X_T0, rd);
-    st_tag(cb, X_T1, rd);   /* Gap Remediation SIMI Phase 12: propagate r0's tag */
+    /* Gap Remediation SIMI Phase 12: propagate r0's tag. M1: the callee's
+     * RET left the value in x9 and the tag in x10 — keep the value
+     * resident (rule 3: write the tag byte to memory now so it stays
+     * authoritative), M0's store+tag in naive mode. */
+    if (g_alloc) {
+        int v = cache_reserve(cb, rd);
+        clobber_scratch(cb, X_T1);      /* x10 is about to be used for the tag store */
+        st_tag(cb, X_T1, rd);           /* tag byte from x10, before the value move */
+        uint8_t rh = result_host(v);
+        if (rh != X_T0) e32(cb, enc_orr_shift(rh, 31, X_T0, 0, 0));
+    } else {
+        st_slot(cb, X_T0, rd);
+        st_tag(cb, X_T1, rd);
+    }
 }
 
 /* ─── Trampoline: zero r0..r5, r6=namepool_ptr, r7=scratch_ptr, call
@@ -570,118 +744,194 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     switch (op) {
     case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR:
     case OP_MUL: case OP_SHL: case OP_SHR: case OP_SAR: {
-        ld_slot(cb, X_T0, ra);
-        if (flags & FLAG_IMM) emit_li64(cb, X_T1, (uint64_t)(int64_t)w_imm28(w));
-        else                  ld_slot(cb, X_T1, w_rb_reg(w));
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
+        get_operand(cb, ra, X_T0, rd_live);
+        uint8_t rhs = X_T1;
+        if (flags & FLAG_IMM) rhs = materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w));
+        else                 get_operand(cb, w_rb_reg(w), X_T1, rd_live);
         switch (op) {
-            case OP_ADD: e32(cb, enc_add_shift(X_T0, X_T0, X_T1, 0, 0)); break;
-            case OP_SUB: e32(cb, enc_sub_shift(X_T0, X_T0, X_T1, 0, 0)); break;
-            case OP_AND: e32(cb, enc_and_shift(X_T0, X_T0, X_T1, 0, 0)); break;
-            case OP_OR:  e32(cb, enc_orr_shift(X_T0, X_T0, X_T1, 0, 0)); break;
-            case OP_XOR: e32(cb, enc_eor_shift(X_T0, X_T0, X_T1, 0, 0)); break;
-            case OP_MUL: e32(cb, enc_madd(X_T0, X_T0, X_T1, 31)); break;  /* MUL */
-            case OP_SHL: e32(cb, enc_lslv(X_T0, X_T0, X_T1)); break;
-            case OP_SHR: e32(cb, enc_lsrv(X_T0, X_T0, X_T1)); break;
-            case OP_SAR: e32(cb, enc_asrv(X_T0, X_T0, X_T1)); break;
+            case OP_ADD: e32(cb, enc_add_shift(rh, X_T0, rhs, 0, 0)); break;
+            case OP_SUB: e32(cb, enc_sub_shift(rh, X_T0, rhs, 0, 0)); break;
+            case OP_AND: e32(cb, enc_and_shift(rh, X_T0, rhs, 0, 0)); break;
+            case OP_OR:  e32(cb, enc_orr_shift(rh, X_T0, rhs, 0, 0)); break;
+            case OP_XOR: e32(cb, enc_eor_shift(rh, X_T0, rhs, 0, 0)); break;
+            case OP_MUL: e32(cb, enc_madd(rh, X_T0, rhs, 31)); break;  /* MUL */
+            case OP_SHL: e32(cb, enc_lslv(rh, X_T0, rhs)); break;
+            case OP_SHR: e32(cb, enc_lsrv(rh, X_T0, rhs)); break;
+            case OP_SAR: e32(cb, enc_asrv(rh, X_T0, rhs)); break;
         }
-        st_slot_untag(cb, X_T0, rd);
+        store_result(cb, rd);
         break;
     }
     case OP_DIV: case OP_MOD: {
-        ld_slot(cb, X_T0, ra);
-        if (flags & FLAG_IMM) emit_li64(cb, X_T1, (uint64_t)(int64_t)w_imm28(w));
-        else                  ld_slot(cb, X_T1, w_rb_reg(w));
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
+        get_operand(cb, ra, X_T0, rd_live);
+        uint8_t rhs = X_T1;
+        if (flags & FLAG_IMM) rhs = materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w));
+        else                 get_operand(cb, w_rb_reg(w), X_T1, rd_live);
         int sgn = ar_type_signed(type);
         /* A64 has no remainder instruction: sdiv/udiv then msub folds the
          * quotient back (t = t - (t/d)*d), yielding the dividend-sign
-         * remainder RV64's rem/remu produce. */
+         * remainder RV64's rem/remu produce. M1 keeps the dividend and
+         * divisor live in x9/x10, so the quotient uses x0 (dead between
+         * hostfn calls — every such call flushes first) instead of x11,
+         * which may be the reserved result register. */
         if (op == OP_DIV) {
-            e32(cb, sgn ? enc_sdiv(X_T0, X_T0, X_T1) : enc_udiv(X_T0, X_T0, X_T1));
+            e32(cb, sgn ? enc_sdiv(rh, X_T0, rhs) : enc_udiv(rh, X_T0, rhs));
         } else {
-            e32(cb, sgn ? enc_sdiv(X_T2, X_T0, X_T1) : enc_udiv(X_T2, X_T0, X_T1));
-            e32(cb, enc_msub(X_T0, X_T2, X_T1, X_T0));
+            e32(cb, sgn ? enc_sdiv(X_ARG, X_T0, rhs) : enc_udiv(X_ARG, X_T0, rhs));
+            e32(cb, enc_msub(rh, X_ARG, rhs, X_T0));
         }
-        st_slot_untag(cb, X_T0, rd);
+        store_result(cb, rd);
         break;
     }
     case OP_NOT:
-        ld_slot(cb, X_T0, ra);
-        e32(cb, enc_orn(X_T0, X_T0));               /* mvn x9, x9 */
-        st_slot_untag(cb, X_T0, rd);
+    case OP_NEG: {
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        get_operand(cb, ra, X_T0, rd == ra);
+        if (op == OP_NOT) e32(cb, enc_orn(rh, X_T0));              /* mvn rh, x9 */
+        else              e32(cb, enc_sub_shift(rh, 31, X_T0, 0, 0));  /* sub rh, xzr, x9 */
+        store_result(cb, rd);
         break;
-    case OP_NEG:
-        ld_slot(cb, X_T0, ra);
-        e32(cb, enc_sub_shift(X_T0, 31, X_T0, 0, 0));  /* sub x9, xzr, x9 */
-        st_slot_untag(cb, X_T0, rd);
-        break;
-    case OP_MOV:
+    }
+    case OP_MOV: {
         /* v0.3 (Phase 7): the one opcode besides RESOLVE that can produce
          * a tagged register — propagating an existing capability is still
-         * a valid capability. */
-        ld_slot(cb, X_T0, ra);
-        st_slot(cb, X_T0, rd);
-        ld_tag(cb, X_T1, ra);
-        st_tag(cb, X_T1, rd);
+         * a valid capability. The tag byte is written to memory
+         * immediately (rule 3), so the propagated value's tag is
+         * authoritative wherever it came from. */
+        if (g_alloc) {
+            int i0 = cache_find(ra);        /* source residency BEFORE reserve */
+            int v = cache_reserve(cb, rd);
+            uint8_t rh = result_host(v);
+            /* Subtle: when ra is resident at the reserve victim slot,
+             * i0 == v and the copy below is skipped — correct because
+             * reserve's spill STORES the old value but never clears the
+             * register, so it still physically holds ra. Fragile-looking
+             * but sound: a store cannot modify a register. */
+            if (i0 >= 0) {
+                if (cache_host(i0) != rh) e32(cb, enc_orr_shift(rh, 31, cache_host(i0), 0, 0));
+            } else {
+                ld_slot(cb, rh, ra);
+            }
+            uint8_t sc = (g_resv_slot == 2) ? X_T1 : X_T2;
+            clobber_scratch(cb, sc);
+            ld_tag(cb, sc, ra);
+            st_tag(cb, sc, rd);
+        } else {
+            ld_slot(cb, X_T0, ra);
+            st_slot(cb, X_T0, rd);
+            ld_tag(cb, X_T1, ra);
+            st_tag(cb, X_T1, rd);
+        }
         break;
-    case OP_LOADI:
-        emit_li64(cb, X_T0, (uint64_t)(int64_t)w_imm28(w));
-        st_slot_untag(cb, X_T0, rd);
+    }
+    case OP_LOADI: {
+        int v = cache_reserve(cb, rd);
+        emit_li64(cb, result_host(v), (uint64_t)(int64_t)w_imm28(w));
+        store_result(cb, rd);
         break;
+    }
     case OP_LOADI64:
         return TX_AR_ERR_BAD_OPCODE; /* unreachable: handled specially in translate(), needs literal pool value */
     case OP_CMP: {
-        ld_slot(cb, X_T0, ra);
-        ld_slot(cb, X_T1, w_rb_reg(w));
-        if (flags >= 10 || !emit_cmp(cb, flags)) return TX_AR_ERR_BAD_OPCODE;
-        st_slot_untag(cb, X_T0, rd);
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        int rd_live = (rd == ra) || (rd == w_rb_reg(w));
+        get_operand(cb, ra, X_T0, rd_live);
+        get_operand(cb, w_rb_reg(w), X_T1, rd_live);
+        if (flags >= 10 || !emit_cmp(cb, flags, rh)) return TX_AR_ERR_BAD_OPCODE;
+        store_result(cb, rd);
         break;
     }
     case OP_BR: return TX_AR_ERR_BAD_OPCODE;  /* handled specially in translate() (needs pc) */
     case OP_LEA: {
-        ld_slot(cb, X_T0, ra);
-        emit_li_disp(cb, X_T1, w_imm28(w));
-        e32(cb, enc_add_shift(X_T0, X_T0, X_T1, 0, 0));
-        st_slot_untag(cb, X_T0, rd);
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        get_operand(cb, ra, X_T0, rd == ra);
+        int32_t disp = w_imm28(w);
+        if (disp >= 0 && disp <= 4095) {
+            e32(cb, enc_add_imm(rh, X_T0, (uint32_t)disp));
+        } else {
+            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp);
+            e32(cb, enc_add_shift(rh, X_T0, sc, 0, 0));
+        }
+        store_result(cb, rd);
         break;
     }
     case OP_PTRADD: {
         /* v0.3 (Phase 7): always untagged — pointer arithmetic must never
          * yield a capability even when rA is currently tagged. */
-        ld_slot(cb, X_T0, ra);   /* base */
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
+        get_operand(cb, ra, X_T0, rd_live);   /* base */
         int shift = type_shift(type);
         if (flags & FLAG_IMM) {
-            int64_t idx = w_imm28(w);
-            emit_li64(cb, X_T1, (uint64_t)(idx << shift));
-            e32(cb, enc_add_shift(X_T0, X_T0, X_T1, 0, 0));
+            int64_t scaled = (int64_t)w_imm28(w) << shift;
+            if (scaled >= 0 && scaled <= 4095) {
+                e32(cb, enc_add_imm(rh, X_T0, (uint32_t)scaled));
+            } else {
+                uint8_t sc = materialize_imm(cb, (uint64_t)scaled);
+                e32(cb, enc_add_shift(rh, X_T0, sc, 0, 0));
+            }
         } else {
-            ld_slot(cb, X_T1, w_rb_reg(w));
-            /* add x9, x9, x10, lsl #shift — A64's shifted register operand
+            get_operand(cb, w_rb_reg(w), X_T1, rd_live);
+            /* add xd, x9, x10, lsl #shift — A64's shifted register operand
              * folds the scale into the add, one instruction where RV64
              * needs a separate slli. */
-            e32(cb, enc_add_shift(X_T0, X_T0, X_T1, 0, (uint8_t)shift));
+            e32(cb, enc_add_shift(rh, X_T0, X_T1, 0, (uint8_t)shift));
         }
-        st_slot_untag(cb, X_T0, rd);
+        store_result(cb, rd);
         break;
     }
     case OP_LOAD: {
-        ld_slot(cb, X_T0, ra);                        /* t0 = base pointer */
-        emit_li_disp(cb, X_T1, w_imm28(w));
-        e32(cb, enc_add_shift(X_T1, X_T0, X_T1, 0, 0));   /* t1 = effective address */
-        load_typed(cb, type, X_T0, X_T1);             /* load into t0 */
-        st_slot_untag(cb, X_T0, rd);
+        int v = cache_reserve(cb, rd);
+        uint8_t rh = result_host(v);
+        get_operand(cb, ra, X_T0, rd == ra);   /* base */
+        int32_t disp = w_imm28(w);
+        int sh = type_shift(type);
+        if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) {
+            /* the offset folds into the scaled immediate — no address math */
+            load_typed(cb, type, rh, X_T0, (uint16_t)(disp >> sh));
+        } else {
+            clobber_scratch(cb, X_T0);
+            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp);
+            e32(cb, enc_add_shift(X_T0, X_T0, sc, 0, 0));
+            load_typed(cb, type, rh, X_T0, 0);
+        }
+        store_result(cb, rd);
         break;
     }
     case OP_STORE: {
-        ld_slot(cb, X_T0, ra);                        /* t0 = base pointer */
-        ld_slot(cb, X_T1, rd);                        /* rd holds the *source* value register, same convention as x86 */
-        emit_li_disp(cb, X_T2, w_imm28(w));
-        e32(cb, enc_add_shift(X_T2, X_T0, X_T2, 0, 0));   /* t2 = effective address */
-        store_typed(cb, type, X_T1, X_T2);
+        /* No reservation in STORE (g_resv_slot == -1), so the hint is
+         * inert — passed as 0 for the signature. */
+        get_operand(cb, ra, X_T0, 0);   /* base */
+        get_operand(cb, rd, X_T1, 0);   /* rd holds the *source* value register, same convention as x86 */
+        int32_t disp = w_imm28(w);
+        int sh = type_shift(type);
+        if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) {
+            store_typed(cb, type, X_T1, X_T0, (uint16_t)(disp >> sh));
+        } else {
+            clobber_scratch(cb, X_T0);
+            clobber_scratch(cb, X_T2);
+            emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
+            e32(cb, enc_add_shift(X_T0, X_T0, X_T2, 0, 0));
+            store_typed(cb, type, X_T1, X_T0, 0);
+        }
         break;
     }
-    case OP_ENTER: emit_prologue(cb); break;
+    case OP_ENTER: cache_flush(cb); emit_prologue(cb); break;
     case OP_LEAVE: /* no-op directive, matches Phase 1 interpreter */ break;
     case OP_RESOLVE: {
+        /* M1: the runtime call clobbers x0 and reads the name-pool arg from
+         * its slot — the cache must be empty first (rule 1). */
+        cache_flush(cb);
         /* rb_raw holds the name-pool index (FMT_RESOLVE, simi_isa.h). x0 =
          * namepool_ptr(r6) + idx*TX_AR_NAME_SIZE, a raw pointer straight
          * into the object's own name-pool bytes — no copy, mirrors x86.
@@ -704,6 +954,9 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_OBJSIZE: case OP_OBJTYPE: {
+        /* M1: the runtime call clobbers x0 and the tag/value reads go
+         * straight to memory, which must be current first (rule 1/3). */
+        cache_flush(cb);
         /* v0.3 (Phase 7): require rA to currently carry a valid capability
          * tag before ever consulting the runtime catalog — an untagged
          * operand is rejected with the same sentinel used for "no such
@@ -724,6 +977,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_RET:
+        cache_flush(cb);         /* M1: r0 (and everything else) must be in slots — the call site reads them */
         ld_slot(cb, X_T0, 0);    /* r0 is the return-value register, §4.8; t0 survives the epilogue below untouched */
         /* Gap Remediation SIMI Phase 12: r0's tag rides in t1, alongside
          * t0 — the epilogue below (add sp; ldr x30; ldr x29; add sp; br
@@ -745,7 +999,11 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
          * the caller and no global fixup entry — the target is only known
          * at runtime. The bounds check (t0 < num_instr) is the
          * non-negotiable CFI requirement of ISA §16: `cmp x9, x11; cset
-         * x10, lo` then cbz to UDF #0 on the out-of-bounds path. */
+         * x10, lo` then cbz to UDF #0 on the out-of-bounds path.
+         * (g_alloc is 0 in any program containing JMPR — the cache is
+         * never populated — so the flush here is a no-op, kept for the
+         * invariant's sake.) */
+        cache_flush(cb);
         ld_slot(cb, X_T0, ra);                            /* t0 = target abstract pc */
         e32(cb, enc_movz(X_T2, (uint16_t)g_num_instr, 0)); /* num_instr <= 4096 fits one movz */
         e32(cb, enc_subs_shift(31, X_T0, X_T2, 0, 0));    /* cmp x9, x11 */
@@ -820,8 +1078,42 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     struct CodeBuf cb; cb.buf = out_buf; cb.cap = out_cap; cb.len = 0; cb.overflow = 0;
     g_nfixups = 0;
 
+    /* M1: pre-pass — mark branch/call target pcs (block heads) and detect
+     * JMPR. A program containing JMPR translates with the cache disabled
+     * (g_alloc=0): the JMPR table can land on any pc, so every pc would be
+     * a block head, which is no cache at all — the naive M0 codegen is
+     * byte-identical and jmpr_basic/jmpr_oob exercise it. */
+    g_has_jmpr = 0;
+    for (uint32_t q = 0; q < 4096; q++) g_pc_target[q] = 0;   /* clear ONCE, before the loop
+                                                                 * — zeroing g_pc_target[pc] inside
+                                                                 * the loop would wipe marks that
+                                                                 * earlier branches set (branch_cmp
+                                                                 * caught this exact bug) */
+    for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+        uint64_t w = instrs[pc];
+        uint8_t op = w_op(w);
+        if (op == OP_JMPR) g_has_jmpr = 1;
+        else if (op == OP_BR || op == OP_BC || op == OP_CALL) {
+            int64_t tgt = (int64_t)pc + 1 + w_imm28(w);
+            if (tgt >= 0 && tgt < (int64_t)hdr.num_instr) g_pc_target[(uint32_t)tgt] = 1;
+        }
+    }
+    g_alloc = g_has_jmpr ? 0 : 1;
+    for (int i = 0; i < AR_CACHE_N; i++) g_cache_guest[i] = -1;
+    g_cache_round = 0;
+    g_resv_slot = -1;
+
     for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
         g_instr_off[pc] = cb.len;
+        /* The in-flight result reservation is per-instruction state: a
+         * stale g_resv_slot from the previous instruction would make
+         * get_operand() skip the eviction of the register it clobbers as
+         * an operand base (mem_ops_native: STORE's base load destroyed
+         * x9 while the directory still claimed r1 was resident there,
+         * and the source read then went to memory and stored 0). */
+        g_resv_slot = -1;
+        g_resv_reuse = 0;
+        g_resv_guest = -1;
         uint64_t w = instrs[pc];
         uint8_t op = w_op(w);
 
@@ -830,27 +1122,38 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             if (idx >= hdr.num_literals) return TX_AR_ERR_LITERAL_OUT_OF_RANGE;
             uint16_t rd = w_rd(w);
             if (rd >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
-            emit_li64(&cb, X_T0, literals[idx]);
-            st_slot_untag(&cb, X_T0, rd);
+            int v = cache_reserve(&cb, rd);
+            emit_li64(&cb, result_host(v), literals[idx]);
+            store_result(&cb, rd);
         } else if (op == OP_BR) {
+            /* rule 1: the branch path and the fall-through both land on
+             * code that must see current memory and an empty cache. */
+            cache_flush(&cb);
             uint32_t target = (uint32_t)((int64_t)pc + 1 + w_imm28(w));
             op_b(&cb, target);
         } else if (op == OP_BC) {
             uint16_t ra = w_ra(w);
             if (ra >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
+            cache_flush(&cb);
             uint32_t target = (uint32_t)((int64_t)pc + 1 + w_imm28(w));
-            ld_slot(&cb, X_T0, ra);
+            get_operand(&cb, ra, X_T0, 0);   /* no reservation in BC, hint inert */
             if (w_flags(w) & FLAG_INVERT) op_cbz(&cb, target, X_T0);
             else                          op_cbnz(&cb, target, X_T0);
         } else if (op == OP_CALL) {
             uint32_t target = (uint32_t)((int64_t)pc + 1 + w_imm28(w));
             /* CALL has no rD in the ISA — the call site always stores the
-             * result into the CALLER's r0, same as x86/RV64. */
+             * result into the CALLER's r0, same as x86/RV64. M1: flush
+             * first — the argument marshaling reads slots 0..7 and the
+             * arg-tag mask from memory, which must be current. */
+            cache_flush(&cb);
             emit_call_site(&cb, target, 0);
         } else {
             int rc = emit_instr(&cb, w);
             if (rc != TX_AR_OK) return rc;
         }
+        /* rule 1 (fall-through half): the next pc is a block head — the
+         * fall-through must arrive with current memory and no cache. */
+        if (pc + 1 < hdr.num_instr && g_pc_target[pc + 1]) cache_flush(&cb);
         if (cb.overflow) return TX_AR_ERR_BUF_FULL;
     }
 

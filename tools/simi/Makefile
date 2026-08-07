@@ -59,7 +59,14 @@ test-riscv: all
 test-arm: all
 	./tests/run_arm_tests.sh
 
+# M1 code-size gate: every ARM test must stay at or below its M0 emitted
+# byte count (baselines recorded from git 1729f50, the committed M0
+# translator). The allocator must never be a net regression on the parity
+# corpus — see tests/size_gate_arm.sh's top comment.
+size-gate-arm: simi-arm-verify simi-asm
+	./tests/size_gate_arm.sh
+
 clean:
 	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm clean
