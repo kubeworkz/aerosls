@@ -314,10 +314,17 @@ static void emit_li64(struct CodeBuf* cb, uint8_t reg, uint64_t imm);   /* fwd: 
  *      tags straight from memory without knowing the cache state.
  *   4. SCRATCH USE EVICTS FIRST. X_T1/X_T2 are also cache hosts; any use
  *      of them as scratch (constants, the MOV tag load) spills the
- *      occupant first, and the round-robin victim of cache_reserve is
- *      never spilled by the in-flight instruction's own operand fetches
- *      (g_resv_slot). A64 reads all operands before writing the result,
- *      so the result register may alias an operand register.
+ *      occupant first, and the reserved result slot is never spilled by
+ *      the in-flight instruction's own operand fetches (g_resv_slot).
+ *      A64 reads all operands before writing the result, so the result
+ *      register may alias an operand register.
+ *   5. RESERVATION PREFERS NON-SOURCE VICTIMS (M2.4). cache_reserve is
+ *      told the instruction's source registers and evicts a slot that
+ *      holds neither source when one exists — which it always does, with
+ *      3 slots and at most 2 sources — so chains that re-read the same
+ *      register (ADD r4, r1, r2; ADD r5, r1, r2) keep the source
+ *      resident instead of spilling it now and reloading it when
+ *      get_operand fetches it a few words later.
  * The naive (g_alloc=0) path degrades these helpers to exactly the M0
  * sequences, so the JMPR fallback is exercised by jmpr_basic/jmpr_oob.
  */
@@ -369,15 +376,43 @@ static void cache_flush(struct CodeBuf* cb) {
  * result is computed in place (g_resv_reuse=1): the register still holds
  * the OLD value, which an operand read of rd must see — and a new slot
  * claim would strand that value in the old slot's register while the
- * directory pointed at a fresh one. Only when rd is not resident does the
- * round-robin victim get evicted (spilled) and claimed. */
-static int cache_reserve(struct CodeBuf* cb, int rd) {
+ * directory pointed at a fresh one. Only when rd is not resident does a
+ * victim get evicted (spilled) and claimed.
+ *
+ * M2.4: src1/src2 are the instruction's source operands (guest regs it
+ * reads, or -1 when there is no second source / the operand is an
+ * immediate). The victim is chosen to PREFER a slot that is neither
+ * source: evicting a source forces a spill now and a memory reload when
+ * get_operand fetches it a few words later, on exactly the chains that
+ * re-read the same register (e.g. ADD r5, r1, r2 after ADD r4, r1, r2).
+ * With 3 slots and at most 2 distinct sources, a non-source slot always
+ * exists (a reused rd is handled by the reuse path above), so the scan
+ * finds one; the plain round-robin victim remains only as a defensive
+ * fallback. The round-robin cursor still advances every call, so no
+ * slot starves. */
+static int cache_reserve(struct CodeBuf* cb, int rd, int src1, int src2) {
     if (!g_alloc) { g_resv_slot = -1; g_resv_reuse = 0; return -1; }
     int v = cache_find(rd);
     if (v >= 0) {
         g_resv_reuse = 1;
     } else {
-        v = g_cache_round;
+        /* Two-pass preference: an EMPTY slot (never costs a spill) beats
+         * a non-source occupant, which beats the plain round-robin
+         * fallback. Empty slots occur transiently — clobber_scratch and
+         * cache_spill_one leave -1 without reclaiming — so scanning for
+         * them first avoids spilling a dead-but-occupied slot when a
+         * free one exists. With rd not resident, at most 2 of the 3
+         * slots hold the ≤2 distinct sources, so pass 2 always finds a
+         * non-source slot; the fallback is defensive only. */
+        int i = 0;
+        for (i = 0; i < AR_CACHE_N; i++)
+            if (g_cache_guest[(g_cache_round + i) % AR_CACHE_N] < 0) break;
+        if (i >= AR_CACHE_N)
+            for (i = 0; i < AR_CACHE_N; i++) {
+                int cand = (g_cache_round + i) % AR_CACHE_N;
+                if (g_cache_guest[cand] != src1 && g_cache_guest[cand] != src2) break;
+            }
+        v = (i < AR_CACHE_N) ? (g_cache_round + i) % AR_CACHE_N : g_cache_round;
         g_cache_round = (g_cache_round + 1) % AR_CACHE_N;
         if (g_cache_guest[v] >= 0) cache_spill_one(cb, v);
         g_resv_reuse = 0;
@@ -694,7 +729,7 @@ static void emit_call_site(struct CodeBuf* cb, uint32_t target_pc, int rd) {
      * resident (rule 3: write the tag byte to memory now so it stays
      * authoritative), M0's store+tag in naive mode. */
     if (g_alloc) {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, -1, -1);   /* call result: no SIMI sources to keep resident */
         clobber_scratch(cb, X_T1);      /* x10 is about to be used for the tag store */
         st_tag(cb, X_T1, rd);           /* tag byte from x10, before the value move */
         uint8_t rh = result_host(v);
@@ -759,7 +794,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     switch (op) {
     case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR:
     case OP_MUL: case OP_SHL: case OP_SHR: case OP_SAR: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, (flags & FLAG_IMM) ? -1 : w_rb_reg(w));
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
         get_operand(cb, ra, X_T0, rd_live);
@@ -781,7 +816,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_DIV: case OP_MOD: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, (flags & FLAG_IMM) ? -1 : w_rb_reg(w));
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
         get_operand(cb, ra, X_T0, rd_live);
@@ -806,7 +841,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     }
     case OP_NOT:
     case OP_NEG: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, -1);
         uint8_t rh = result_host(v);
         get_operand(cb, ra, X_T0, rd == ra);
         if (op == OP_NOT) e32(cb, enc_orn(rh, X_T0));              /* mvn rh, x9 */
@@ -822,13 +857,13 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
          * authoritative wherever it came from. */
         if (g_alloc) {
             int i0 = cache_find(ra);        /* source residency BEFORE reserve */
-            int v = cache_reserve(cb, rd);
+            int v = cache_reserve(cb, rd, ra, -1);
             uint8_t rh = result_host(v);
-            /* Subtle: when ra is resident at the reserve victim slot,
-             * i0 == v and the copy below is skipped — correct because
-             * reserve's spill STORES the old value but never clears the
-             * register, so it still physically holds ra. Fragile-looking
-             * but sound: a store cannot modify a register. */
+            /* Subtle: since M2.4 the reserve scan never picks ra's slot
+             * as a victim, so i0 == v now arises only for MOV rd,rd via
+             * the reuse path — the copy below is skipped, and the
+             * register still physically holds ra (a store cannot modify
+             * a register). */
             if (i0 >= 0) {
                 if (cache_host(i0) != rh) e32(cb, enc_orr_shift(rh, 31, cache_host(i0), 0, 0));
             } else {
@@ -847,7 +882,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_LOADI: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, -1, -1);
         emit_li64(cb, result_host(v), (uint64_t)(int64_t)w_imm28(w));
         store_result(cb, rd);
         break;
@@ -855,7 +890,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     case OP_LOADI64:
         return TX_AR_ERR_BAD_OPCODE; /* unreachable: handled specially in translate(), needs literal pool value */
     case OP_CMP: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, w_rb_reg(w));   /* CMP is always register form */
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (rd == w_rb_reg(w));
         get_operand(cb, ra, X_T0, rd_live);
@@ -866,7 +901,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     }
     case OP_BR: return TX_AR_ERR_BAD_OPCODE;  /* handled specially in translate() (needs pc) */
     case OP_LEA: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, -1);
         uint8_t rh = result_host(v);
         get_operand(cb, ra, X_T0, rd == ra);
         int32_t disp = w_imm28(w);
@@ -882,7 +917,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     case OP_PTRADD: {
         /* v0.3 (Phase 7): always untagged — pointer arithmetic must never
          * yield a capability even when rA is currently tagged. */
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, (flags & FLAG_IMM) ? -1 : w_rb_reg(w));
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
         get_operand(cb, ra, X_T0, rd_live);   /* base */
@@ -906,7 +941,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_LOAD: {
-        int v = cache_reserve(cb, rd);
+        int v = cache_reserve(cb, rd, ra, -1);
         uint8_t rh = result_host(v);
         get_operand(cb, ra, X_T0, rd == ra);   /* base */
         int32_t disp = w_imm28(w);
@@ -1214,7 +1249,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             if (idx >= hdr.num_literals) return TX_AR_ERR_LITERAL_OUT_OF_RANGE;
             uint16_t rd = w_rd(w);
             if (rd >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
-            int v = cache_reserve(&cb, rd);
+            int v = cache_reserve(&cb, rd, -1, -1);
             emit_li64(&cb, result_host(v), literals[idx]);
             store_result(&cb, rd);
         } else if (op == OP_BR) {

@@ -37,7 +37,11 @@
 # M2.3: its index is COMPUTED through the BITWISE + SHIFT folds (OR/SAR/
 # SHR/SHL/AND/XOR/ADD, with the shifts masking their amount mod 64 and
 # SAR arithmetic on a sign-bit value) — 248 bytes below its M0 baseline,
-# and disabling the fold grows it back to exactly 1384. Same skips as the runner: float_ops rejected,
+# and disabling the fold grows it back to exactly 1384. src_resident is
+# M2.4: a chain that re-reads r1/r2 as sources five times; cache_reserve
+# now prefers a non-source victim, so the sources stay resident — 40
+# bytes below its M0 baseline, and reverting the source preference grows
+# it back to 1108 (28 over the hint). Same skips as the runner: float_ops rejected,
 # mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
 # path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
@@ -70,7 +74,8 @@ declare -A M0_BASELINES=(
     [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968
     [loop_sum]=1040 [mem_ops_native]=1048 [obj_ops]=1164 [ptr_ops]=1120
-    [rd_star]=1108 [rv64_boot_smoke]=928 [straight_line_bench]=1104
+    [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
+    [straight_line_bench]=1104
 )
 
 pass=0

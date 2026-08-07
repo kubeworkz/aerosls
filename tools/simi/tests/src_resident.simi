@@ -1,0 +1,24 @@
+; src_resident.simi — M2.4: the reservation must keep SOURCE operands
+; resident through chains that re-read the same register. Every ADD here
+; reads r1 and r2; with 3 cache slots and these 2 sources, a
+; non-source victim always exists, so cache_reserve's M2.4 scan keeps r1
+; and r2 resident for the whole chain — an ADD never spills a source it
+; is about to read. Before M2.4 the round-robin victim would land on r1
+; or r2 every other instruction, paying a spill + memory reload on each
+; such fetch. The results r3..r7 accumulate into r0 at the end.
+; Expected result: 35 ((3+4)*5 = 7*5)
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #3, i64
+    LOADI r2, #4, i64
+    ADD r3, r1, r2, i64      ; 7
+    ADD r4, r1, r2, i64      ; 7
+    ADD r5, r1, r2, i64      ; 7
+    ADD r6, r1, r2, i64      ; 7
+    ADD r7, r1, r2, i64      ; 7
+    ADD r0, r3, r4, i64      ; 14
+    ADD r0, r0, r5, i64      ; 21
+    ADD r0, r0, r6, i64      ; 28
+    ADD r0, r0, r7, i64      ; 35
+    RET
