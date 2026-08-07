@@ -4,14 +4,17 @@
 ; unsigned — now the address math folds |disp| into a single add/sub-imm
 ; (plain 0..4095, or the shifted imm12<<12 form for multiples of 4096),
 ; the same imm12_split the ALU immediate fold uses. The rows:
-;   [r6-8]     fold M2.9: pre-indexed  -> r7+4079  (aligned i32, |disp| <= 256:
-;               str/ldr w, [x, #-8]! — one word; M2.8 emitted sub #8 + access)
-;   [r5-4096]  fold sh=1: sub #1,lsl#12 -> r7+565   (shifted negative; |disp| > 256,
-;               so the pre-indexed imm9 cannot take it)
+;   [r6-8]     fold M2.10: unscaled     -> r7+4079  (aligned i32 in imm9:
+;               stur_w/ldur_w #-8 — one word; M2.9 emitted the pre-indexed
+;               form, M2.8 sub #8 + access)
+;   [r5-4096]  fold sh=1: sub #1,lsl#12 -> r7+565   (shifted negative; |disp| > 255,
+;               so the unscaled imm9 cannot take it)
 ;   [r5-4101]  NO fold (materialize)    -> r7+560   (|disp| > 4095 and
 ;               not a multiple of 4096 — the honest fallback stays exercised)
-;   [r6+5]     fold: add #5             -> r7+4092  (positive but unaligned
-;               for i32, so the scaled fast path can't take it either)
+;   [r6+5]     fold M2.10: unscaled     -> r7+4092  (positive but UNALIGNED
+;               for i32 — the scaled fast path rejects it and M2.9's
+;               aligned-only pre-indexed form rejected it too; the unscaled
+;               form needs no alignment and folds #5 in one word)
 ; All four i32 addresses stay >= 4 bytes apart (an earlier draft used
 ; -4096 and -4097 — one byte apart — and the i32 stores overlapped; the
 ; four-way parity caught it as a wrong result — an address-overlap bug

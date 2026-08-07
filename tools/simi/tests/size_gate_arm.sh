@@ -65,26 +65,29 @@
 # previously fell to the movz(+movk)+add_shift materialization even at
 # |disp| <= 4095 (A64's scaled load/store immediate is unsigned), now
 # |disp| folds into a single add/sub-imm (plain, or shifted for
-# multiples of 4096): rows at [r6-8] (M2.9 pre-indexed str/ldr w,
-# [x, #-8]!), [r5-4096] (sub #1, lsl #12), [r5-4101] (honest
-# materialize — |disp| > 4095, not a multiple of 4096) and [r6+5]
-# (add #5, unaligned so the scaled path can't take it), with the i32
-# addresses kept >= 4 bytes apart and confined to the r7+[560, 4092]
-# band portable across all four engines' r7 scratch conventions —
-# 116 bytes below its M0 baseline (M2.9's pre-indexed fold turns the
-# [r6-8] store and load into single words), and disabling the
-# address-math fold grows it back to 1272. mem_pre is M2.9:
-# a negative displacement that is ALIGNED to the access width and fits
-# A64's signed 9-bit imm9 (-256..255) folds into a single pre-indexed
-# ldr/str xt, [xb, #imm]! — one word instead of the M2.8 sub +
-# zero-offset access. Rows at [r5-16] and [r5-256] (the exact imm9
-# boundary), [r5-264] and [r6-258] (honest non-folds — magnitude past
-# 256, still aligned so they take the M2.8 sub path), i32 at
-# [r5-8]/[r5-4], i16 at [r6-6], u8 at [r6-1], the sign-extending i8
-# ldrsb at [r6-9], and i64 at [r6-24], all round-tripping store->load
-# and re-reading their bases (pinning the clobber_scratch poisoning the
-# writeback depends on) — 468 bytes below its M0 baseline, and
-# disabling the pre-indexed fold grows it back to 1456.
+# multiples of 4096): rows at [r6-8] (M2.10 unscaled stur_w/ldur_w #-8),
+# [r5-4096] (sub #1, lsl #12), [r5-4101] (honest materialize — |disp| >
+# 4095, not a multiple of 4096) and [r6+5] (positive but UNALIGNED for
+# i32, so the scaled path can't take it — M2.10's unscaled form folds
+# #5 in one word), with the i32 addresses kept >= 4 bytes apart and
+# confined to the r7+[560, 4092] band portable across all four engines'
+# r7 scratch conventions — 124 bytes below its M0 baseline, and
+# disabling the unscaled fold grows it back to 1200. mem_pre is M2.10:
+# ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
+# folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
+# no writeback, no alignment requirement, superseding the M2.9
+# pre-indexed form (which required both). Rows at [r5-16] and [r5-256]
+# (the exact imm9 boundary), [r5-264] and [r6-258] (honest non-folds —
+# magnitude past 255, still aligned so they take the M2.8 sub path),
+# i32 at [r5-8]/[r5-4] plus the two rows ONLY the unscaled form can
+# fold: [r5+5] and [r5-45], both UNALIGNED for i32 (the scaled fast
+# path rejects +5 for alignment and M2.9's pre-indexed form rejected
+# -45 too), i16 at [r6-6], u8 at [r6-1], the sign-extending i8 ldursb
+# at [r6-9], and i64 at [r6-24], all round-tripping store->load and
+# re-reading their bases (no writeback means the base's cache entry
+# stays valid — the M2.9 clobber_scratch pin is gone) — 540 bytes
+# below its M0 baseline, and disabling the unscaled fold grows it back
+# to 1552.
 # mem_ops_native is
 # unchanged (its 0/8 displacements were already in the scaled fast
 # path). Same skips as the runner: float_ops rejected,
@@ -121,7 +124,7 @@ declare -A M0_BASELINES=(
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_dyn]=1136 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1300
     [loadi64]=968
-    [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=1860 [obj_ops]=1164 [ptr_ops]=1120
+    [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012 [obj_ops]=1164 [ptr_ops]=1120
     [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
     [straight_line_bench]=1104
 )

@@ -75,22 +75,23 @@ def ldrsh(rt, rn):          return 0x79800000 | (rn << 5) | rt
 def ldrh(rt, rn):           return 0x79400000 | (rn << 5) | rt
 def strh(rt, rn):           return 0x79000000 | (rn << 5) | rt
 def ldrsb(rt, rn):          return 0x39800000 | (rn << 5) | rt
-# M2.9: pre-indexed load/store register — size:2 111 0 00 opc 0 imm9:9
-# 11 Rn Rt. imm9 is a signed UNSCALED 9-bit displacement (-256..255) at
-# bits 20:12, bits 11:10 = 11 select pre-indexed (00 = unscaled ldur/
-# stur, 01 = post-indexed), bit 21 = 0. str x29, [sp, #-16]! ==
-# 0xF81F0FFD (base 0xF8000000 | (0x1F0 << 12) | (3 << 10) | (31 << 5) | 29).
-def ldr_pre(rt, rn, imm9):  return 0xF8400000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def str_pre(rt, rn, imm9):  return 0xF8000000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def ldrb_pre(rt, rn, imm9): return 0x38400000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def strb_pre(rt, rn, imm9): return 0x38000000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def ldrh_pre(rt, rn, imm9): return 0x78400000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def strh_pre(rt, rn, imm9): return 0x78000000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def ldr_w_pre(rt, rn, imm9):return 0xB8400000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def str_w_pre(rt, rn, imm9):return 0xB8000000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def ldrsb_pre(rt, rn, imm9):return 0x38800000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def ldrsh_pre(rt, rn, imm9):return 0x78800000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
-def ldrsw_pre(rt, rn, imm9):return 0xB8800000 | ((imm9 & 0x1FF) << 12) | (0x3 << 10) | (rn << 5) | rt
+# M2.10: unscaled load/store register (ldur/stur) — size:2 111 0 00
+# opc 0 imm9:9 00 Rn Rt. imm9 is a signed UNSCALED 9-bit displacement
+# (-256..255) at bits 20:12, bits 11:10 = 00 select unscaled (01 =
+# post-indexed, 11 = pre-indexed — the M2.9 pre-indexed form was
+# superseded by this one in M2.10), bit 21 = 0. stur x29, [sp, #-16]
+# == 0xF81F03FD (base 0xF8000000 | (0x1F0 << 12) | (31 << 5) | 29).
+def ldur(rt, rn, imm9):  return 0xF8400000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def stur(rt, rn, imm9):  return 0xF8000000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def ldurb(rt, rn, imm9): return 0x38400000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def sturb(rt, rn, imm9): return 0x38000000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def ldurh(rt, rn, imm9): return 0x78400000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def sturh(rt, rn, imm9): return 0x78000000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def ldur_w(rt, rn, imm9):return 0xB8400000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def stur_w(rt, rn, imm9):return 0xB8000000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def ldursb(rt, rn, imm9):return 0x38800000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def ldursh(rt, rn, imm9):return 0x78800000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
+def ldursw(rt, rn, imm9):return 0xB8800000 | ((imm9 & 0x1FF) << 12) | (rn << 5) | rt
 def br(rn):                 return 0xD61F0000 | (rn << 5)
 def blr(rn):                return 0xD63F0000 | (rn << 5)
 
@@ -161,19 +162,21 @@ def decode(w):
     if (w & 0xFFC00000) == 0x79400000: return ("ldrh", rn(w), rd(w))
     if (w & 0xFFC00000) == 0x79000000: return ("strh", rn(w), rd(w))
     if (w & 0xFFC00000) == 0x39800000: return ("ldrsb", rn(w), rd(w))
-    # Pre-indexed: the 0xFFC00000 top mask + the 0xC00 pre-index marker
-    # (bits 11:10 = 11) pin the family exactly; imm9 at 20:12 is signed.
-    if (w & 0xFFC00C00) == 0xF8400C00: return ("ldr_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0xF8000C00: return ("str_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0x38400C00: return ("ldrb_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0x38000C00: return ("strb_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0x78400C00: return ("ldrh_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0x78000C00: return ("strh_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0xB8400C00: return ("ldr_w_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0xB8000C00: return ("str_w_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0x38800C00: return ("ldrsb_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0x78800C00: return ("ldrsh_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
-    if (w & 0xFFC00C00) == 0xB8800C00: return ("ldrsw_pre", (w >> 12) & 0x1FF, rn(w), rd(w))
+    # Unscaled ldur/stur: the 0xFFC00C00 top mask with bits 11:10 = 00
+    # (both mask and target) pin the family exactly — 01 = post-indexed
+    # and 11 = pre-indexed are never emitted and decode as None; imm9
+    # at 20:12 is signed.
+    if (w & 0xFFC00C00) == 0xF8400000: return ("ldur", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0xF8000000: return ("stur", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0x38400000: return ("ldurb", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0x38000000: return ("sturb", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0x78400000: return ("ldurh", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0x78000000: return ("sturh", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0xB8400000: return ("ldur_w", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0xB8000000: return ("stur_w", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0x38800000: return ("ldursb", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0x78800000: return ("ldursh", (w >> 12) & 0x1FF, rn(w), rd(w))
+    if (w & 0xFFC00C00) == 0xB8800000: return ("ldursw", (w >> 12) & 0x1FF, rn(w), rd(w))
     if (w & 0xFFFFFC1F) == 0xD61F0000: return ("br", rn(w))
     if (w & 0xFFFFFC1F) == 0xD63F0000: return ("blr", rn(w))
     if (w & 0xFC000000) == 0x14000000: return ("b", (w & 0x3FFFFFF) | (-(1 << 26) if w & 0x2000000 else 0))
@@ -190,9 +193,9 @@ ALLOWED = {"movz", "movk", "add_imm", "sub_imm", "subs_imm", "add_shift",
            "sub_shift", "subs_shift", "and_shift", "orr_shift", "eor_shift",
            "orn", "lslv", "lsrv", "asrv", "sdiv", "udiv", "madd", "msub",
            "cset", "ldr", "str", "ldrb", "strb", "ldrsw", "ldr_w", "str_w",
-           "ldrsh", "ldrh", "strh", "ldrsb", "ldr_pre", "str_pre",
-           "ldrb_pre", "strb_pre", "ldrh_pre", "strh_pre", "ldr_w_pre",
-           "str_w_pre", "ldrsb_pre", "ldrsh_pre", "ldrsw_pre",
+           "ldrsh", "ldrh", "strh", "ldrsb", "ldur", "stur",
+           "ldurb", "sturb", "ldurh", "sturh", "ldur_w", "stur_w",
+           "ldursb", "ldursh", "ldursw",
            "br", "blr", "b", "bl", "cbz", "cbnz"}
 
 # Register numbers used by simi_arm.c
