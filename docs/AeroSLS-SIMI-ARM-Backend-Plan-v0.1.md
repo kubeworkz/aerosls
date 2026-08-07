@@ -705,7 +705,64 @@ Total emitted bytes across the 20-program parity set: **M0 28500 → M1
   error"). jmpr_join's teeth: reverting the block-head constant reset
   makes it return 1 instead of 222.
 
-### 10.4 Honest limits that stand after M2
+### 10.5 M2.1 amendment — folding arithmetic constants (as built)
+
+The M2 fold accepted only index values the analysis could see directly
+(LOADI/LOADI64 constants, propagated through MOV). M2.1 extends the
+constant map to fold ADD/SUB — the index is now COMPUTED at translate
+time, e.g. `load; add; sub; dispatch`, which is how real dispatchers
+shape their index. On the emitted code side nothing changed: the ALU is
+a plain 64-bit add/sub for every SIMI type (the translator never
+truncates to the declared width), `materialize_imm` sign-extends imm28
+exactly as the analysis does, so `a+b`/`a-b` with 64-bit wrap is
+bit-identical to runtime. The fold is deliberately limited to ADD/SUB:
+DIV/MOD would change behavior on a translate-time division by zero, and
+MUL — safe to fold (plain 64-bit multiply, never faults, type-agnostic)
+— is left with the rest of the ALU family for a later pass, a
+conservative omission rather than a soundness one.
+
+- **`tests/jmpr_calc.simi`** — reworked to compute its index through all
+  four fold shapes (ADD reg+reg, SUB reg+imm, SUB reg+reg, ADD reg+imm,
+  with ADD reg+reg appearing twice): r1 = 5+3−2+3−2+6 = 13, folding to
+  pc 13. The M0 baseline re-measured (the program grew by one LOADI):
+  **1288 → 1076, 212 saved**; disabling the fold grows it back to
+  exactly 1288 while the dynamic path still returns 222.
+- **`tests/jmpr_mix.simi`** — the mixed case the corpus lacked: ONE
+  runtime JMPR (index = 5^2, XOR deliberately not in the fold set) and
+  ONE constant JMPR in the same program. The runtime index forces
+  g_alloc=0 — the whole program runs naive codegen — yet the constant
+  index still folds to a direct branch. This pins the folded-
+  branch-under-naive-codegen interaction across all four engines.
+  **1300 → 1252, 48 saved** (the fold under naive codegen; everything
+  else byte-identical to M0).
+- **`tests/jmpr_dyn.simi`** — its index arithmetic switched ADD → XOR.
+  With M2.1's fold, `ADD r1, r1, r0` with a constant r0 would fold and
+  jmpr_dyn would silently stop exercising the dynamic path; XOR is not
+  in the fold set, so the test stays a genuine runtime index.
+
+### 10.6 M2.1 gate results (measured)
+
+Total emitted bytes across the 22-program parity set: **M0 31088 → M1
+30220, 868 saved** (≈2.8%). The M2.1 rows on top of M2's 608:
+
+- jmpr_calc 1288 → 1076 (−212): the computed index folds.
+- jmpr_mix 1300 → 1252 (−48): folded branch under naive codegen.
+- jmpr_dyn 1136 → 1136 (0): still a runtime index, still the floor.
+- Four-way parity: interp 24/0, x86 23/0/3, RV64 22/0/4, ARM 22/0/4.
+  jmpr_oob still faults (UDF, rc=1). Teeth: disabling the ADD/SUB fold
+  grows jmpr_calc back to exactly its M0 1288 while remaining correct
+  via the dynamic path.
+
+### 10.7 M2.1 honest limits
+
+- The fold's in-range check is an unsigned comparison
+  (`g_const_val[ra] < num_instr`), which also correctly refuses
+  sign-extended negative constants (they land ≥ 2^63) — sound, but no
+  test currently computes a negative index to pin the refusal.
+- MUL remains unfoldable despite being safe; a later pass can extend
+  the same machinery.
+
+### 10.8 Honest limits that stand after M2
 
 - The general case — a genuinely runtime index — still disables the
   cache for the whole program, and always will: the JMPR table can

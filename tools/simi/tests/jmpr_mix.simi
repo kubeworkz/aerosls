@@ -1,0 +1,30 @@
+; jmpr_mix.simi — M2.1: ONE folded and ONE dynamic JMPR in the same
+; program — the mixed case no other test covers. The runtime index
+; (r1 = 5 ^ 2 = 7, XOR deliberately not in the fold set) forces
+; g_alloc=0, so the WHOLE program runs the naive codegen — yet the
+; constant index (r2 = 12) still folds to a plain direct branch to
+; pc 12, skipping the dead path at pc 10-11. This pins the interaction
+; the reviewer flagged: a folded JMPR emitting cache_flush + op_b while
+; the dynamic table path is live in the same program, byte-identical
+; across all four engines. (The first draft set r2 = #9 — the JMPR's own
+; pc — which folds to itself and loops forever; the step-budget trip
+; caught it.)
+; Expected result: 15 (r0 = 3 + 12 at the folded dispatch's landing)
+.entry main
+main:
+    ENTER #8
+    LOADI r0, #2, i64
+    LOADI r1, #5, i64
+    XOR r1, r1, r0, i64      ; r1 = 5 ^ 2 = 7 — runtime-computed
+    JMPR r1                  ; DYNAMIC dispatch to pc 7 (mid)
+    LOADI r0, #111, i32      ; dead path — never reached
+    RET
+mid:
+    LOADI r0, #3, i64        ; pc 7
+    LOADI r2, #12, i64       ; pc 8 — constant index
+    JMPR r2                  ; pc 9 — FOLDS to pc 12 (target)
+    LOADI r0, #111, i32      ; pc 10 dead — never reached
+    RET
+target:
+    ADD r0, r0, r2, i64      ; pc 12: r0 = 3 + 12 = 15
+    RET

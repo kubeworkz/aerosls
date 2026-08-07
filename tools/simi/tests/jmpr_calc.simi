@@ -1,0 +1,30 @@
+; jmpr_calc.simi — M2.1: the JMPR index is COMPUTED at translate time,
+; not merely loaded. The constant analysis folds ADD/SUB through all
+; four shapes — ADD reg+reg, SUB reg+imm, ADD reg+reg, SUB reg+reg
+; (r3 = 2), ADD reg+imm — so r1 = 5+3-2+3-2+6 = 13 and the JMPR folds
+; to pc 13. A fold bug that computes any other value lands on pc 10
+; (111), pc 11 (returns 0) or pc 12 (55) — all caught by the four-way
+; parity against the dynamic dispatchers. Caveat: a fold bug that STILL
+; computes 13 (e.g. a compensating sign-extension error) would pass the
+; parity — the other three engines prove only the runtime value, not
+; the fold's derivation; the teeth check (disabling the fold → exactly
+; the M0 1288) and enc-check bound that class but not every wrong-but-13
+; fold. Inherent to fold testing.
+; Expected result: 222
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #5, i64
+    LOADI r2, #3, i64
+    LOADI r3, #2, i64
+    ADD r1, r1, r2, i64      ; r1 = 8  (ADD reg+reg)
+    SUB r1, r1, #2, i64      ; r1 = 6  (SUB reg+imm)
+    ADD r1, r1, r2, i64      ; r1 = 9  (ADD reg+reg)
+    SUB r1, r1, r3, i64      ; r1 = 7  (SUB reg+reg)
+    ADD r1, r1, #6, i64      ; r1 = 13 (ADD reg+imm)
+    JMPR r1                  ; folds to pc 13 (target)
+    LOADI r0, #111, i32
+    RET
+    LOADI r0, #55, i32
+    LOADI r0, #222, i32
+    RET

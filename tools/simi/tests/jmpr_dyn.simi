@@ -1,15 +1,17 @@
 ; jmpr_dyn.simi — M2: a JMPR whose index is NOT a compile-time constant
-; (r1 = 5 + r0 computed at runtime), so the translator must keep the
-; dynamic runtime-table + bounds-check dispatch path. jmpr_basic folded
-; in M2, so this test exists to pin the dynamic SUCCESS path — jmpr_oob
-; pins only the fault path.
+; (r1 = 5 ^ r0 computed at runtime), so the translator must keep the
+; dynamic runtime-table + bounds-check dispatch path. XOR is deliberately
+; NOT in the fold set (M2.1 folds only LOADI/LOADI64/MOV/ADD/SUB) — an
+; ADD here would fold to 7 and this test would stop exercising the
+; dynamic path. jmpr_basic folded in M2, so this test exists to pin the
+; dynamic SUCCESS path — jmpr_oob pins only the fault path.
 ; Expected result: 222
 .entry main
 main:
     ENTER #8
     LOADI r0, #2, i64
     LOADI r1, #5, i64
-    ADD r1, r1, r0, i64      ; r1 = 7 — runtime-computed, not constant
+    XOR r1, r1, r0, i64      ; r1 = 5 ^ 2 = 7 — runtime-computed, not folded
     JMPR r1                  ; dynamic dispatch to pc 7 (target)
     LOADI r0, #111, i32      ; dead path — never reached
     RET
