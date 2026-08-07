@@ -434,6 +434,43 @@ static uint8_t  g_fold_fall[4096];      /* M2.12: folded JMPR whose target is pc
                                          * has NO other incoming edge, the coalescing pre-pass
                                          * clears its g_pc_target mark so the end-of-loop flush
                                          * is skipped too and the cache survives the join. */
+/* M2.15: epilogue/prologue merge flags per pc. For a single-edge
+ * BACKWARD fold (target T < fold pc), the head block at T reloads its
+ * operand registers from the frame — and the source block's tail may
+ * have reloaded the SAME registers a few instructions earlier, leaving
+ * the values in x9/x10 (transient fetches the fold's flush does not
+ * store). The head's matching reloads then re-read the same slot values
+ * into the same hosts — dead code. g_epi_merge[T] bit 1 = drop the
+ * first source's fetch (g1@x9), bit 2 = drop the second (g2@x10); the
+ * pre-pass computes which from the cache round-robin cursor; see the
+ * M2.15 pre-pass block in translate() below. */
+static uint8_t  g_epi_merge[4096];
+/* M2.15: the 2-register-source ALU family whose codegen has the canonical
+ * x9/x10 fetch pattern (cache_fetch_hosts + two get_operands) — the
+ * pattern/tail opcodes of an epilogue/prologue merge. */
+static int ar_is_alu2(uint8_t op) {
+    return op == OP_ADD || op == OP_SUB || op == OP_AND || op == OP_OR ||
+           op == OP_XOR || op == OP_MUL || op == OP_SHL || op == OP_SHR ||
+           op == OP_SAR;
+}
+/* M2.15: ops whose codegen calls cache_reserve (each advances the cache
+ * round-robin cursor exactly once when g_alloc=1). Mirrors the reserve
+ * call sites in translate()/emit_instr/emit_call_site — the count mod 3
+ * is the cursor value at a pc ONLY when no reserve reuses a resident
+ * slot, which epi_merge_pass guarantees with its distinct-registers
+ * check. */
+static int ar_is_result_op(uint8_t op) {
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+    case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR:
+    case OP_SAR: case OP_NOT: case OP_NEG: case OP_MOV: case OP_LOADI:
+    case OP_LOADI64: case OP_CMP: case OP_LEA: case OP_PTRADD:
+    case OP_LOAD: case OP_CALL:
+        return 1;
+    default:
+        return 0;
+    }
+}
 /* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
  * continuation pcs of a maximal straight-line run of LOAD/STORE that share
  * ONE displacement past the imm12 range — the displacement is materialized
@@ -1059,8 +1096,17 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w), h_b);
         } else {
             cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
-            get_operand(cb, ra, h_a, rd_live);
-            get_operand(cb, w_rb_reg(w), h_b, rd_live);
+            /* M2.15: at a merged single-edge backward-fold head, the
+             * pattern's operand fetches are dead — the source block's
+             * tail left the SAME guests in these hosts and the fold's
+             * flush does not store transient values (see
+             * epi_merge_pass). Skipping the fetch makes the instruction
+             * read the runtime register directly; A64 reads all sources
+             * before writing the result, so the result host may alias a
+             * dropped operand host. */
+            uint8_t epi = g_epi_merge[g_cur_pc];
+            if (!(epi & 1)) get_operand(cb, ra, h_a, rd_live);
+            if (!(epi & 2)) get_operand(cb, w_rb_reg(w), h_b, rd_live);
         }
         switch (op) {
             case OP_ADD: e32(cb, enc_add_shift(rh, h_a, h_b, 0, 0)); break;
@@ -1702,6 +1748,99 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                                * this restores the boundary flush (and the
                                                * analysis-side constant reset) exactly as
                                                * before the merge change. */
+        }
+    }
+
+    /* M2.15: epilogue/prologue merging for single-edge BACKWARD folds.
+     * A folded JMPR whose target is an EARLIER pc emits
+     * `cache_flush; b target`. The target block's head reloads its
+     * operand registers from the frame (rule 1 gives it an empty cache) —
+     * and the source block's tail may have RELOADED THE SAME REGISTERS a
+     * few instructions earlier. The fold's flush stores only the
+     * directory's resident RESULTS, so the tail's fetched values (which
+     * are transient — never claimed by the directory) are STILL IN x9/x10
+     * when control lands at the head: the head's matching reloads re-read
+     * the same slot values into the same hosts — dead code. The merge
+     * DROPS them: the frame is loaded once (at the tail), not once per
+     * block — §10.29's "epilogue/prologue merging across backward folds".
+     *
+     * Soundness requires the head to be reached ONLY via the fold — any
+     * other edge arrives with its own, unknown x9/x10 state, and the
+     * head's code is shared. So the target must have no BR/BC/CALL edge,
+     * no other folded JMPR, no entry trampoline, and NO fall-through:
+     * its predecessor T-1 must be an unconditional terminal (RET, BR, or
+     * a JMPR that does not fold to T). This makes the shape inherently
+     * dead-path code (a live loop's head is also reached by its own
+     * entry), which is exactly what the parity set measures — emission.
+     *
+     * The runtime state at the head is determined by the emitted words
+     * between the head and the fold, so the analysis must know them
+     * statically. The layout is rigid: the head block is exactly
+     * [ALU-2src pattern @ T][terminal @ T+1]; then exactly two
+     * result-only instructions (LOADI/LOADI64 — no operand fetches, so
+     * the cache holds exactly the two fresh residents) at T+2/T+3; then
+     * the tail [ALU-2src @ T+4] reading the SAME guests in the SAME
+     * order as the pattern; then the fold [JMPR @ T+5] back to T. The
+     * tail's reserve pick (its result host slot v) is the cache
+     * round-robin cursor slot, because the two LOADIs occupy cursor+1
+     * and cursor+2; the fetches go to x9 (g1) and x10 (g2), so g1's
+     * value survives iff v != 0 and g2's iff v != 1 — the drop flags.
+     * The cursor at the tail is (result-instruction count mod 3), which
+     * equals the count WITHOUT simulation only when no reserve reuses a
+     * resident slot; the pre-T result registers must therefore be
+     * pairwise distinct (the directory only ever holds result registers,
+     * so a register never before written as a result cannot be resident).
+     * Gated on g_alloc like every fold: the naive JMPR path stays
+     * byte-identical to M0. */
+    for (uint32_t q = 0; q < 4096; q++) g_epi_merge[q] = 0;
+    if (g_alloc) {
+        for (uint32_t T = 1; T + 5 < hdr.num_instr; T++) {
+            if (w_op(instrs[T + 5]) != OP_JMPR || g_jmpr_fold[T + 5] != (int)T) continue;
+            /* single-edge target T: no other fold, no BR/BC/CALL, no entry */
+            int other = 0;
+            for (uint32_t q = 0; q < hdr.num_instr && !other; q++) {
+                if (q != T + 5 && g_jmpr_fold[q] >= 0 && (uint32_t)g_jmpr_fold[q] == T) other = 1;
+                if (!other && (w_op(instrs[q]) == OP_BR || w_op(instrs[q]) == OP_BC ||
+                               w_op(instrs[q]) == OP_CALL)) {
+                    int64_t tgt = (int64_t)q + 1 + w_imm28(instrs[q]);
+                    if (tgt >= 0 && tgt < (int64_t)hdr.num_instr && (uint32_t)tgt == T) other = 1;
+                }
+            }
+            if (!other)
+                for (uint32_t i = 0; i < hdr.num_entries; i++)
+                    if (entries[i].offset == T) { other = 1; break; }
+            if (other) continue;
+            uint8_t op_prev = w_op(instrs[T - 1]);
+            if (!(op_prev == OP_RET || op_prev == OP_BR ||
+                  (op_prev == OP_JMPR && g_jmpr_fold[T - 1] != (int)T))) continue;
+            /* the pattern (head block's first instruction) + rigid layout */
+            if (!ar_is_alu2(w_op(instrs[T])) || (w_flags(instrs[T]) & FLAG_IMM)) continue;
+            uint16_t a1 = w_ra(instrs[T]), b1 = w_rb_reg(instrs[T]);
+            if (!(w_op(instrs[T + 1]) == OP_RET || w_op(instrs[T + 1]) == OP_BR)) continue;
+            if (!(w_op(instrs[T + 2]) == OP_LOADI || w_op(instrs[T + 2]) == OP_LOADI64)) continue;
+            if (!(w_op(instrs[T + 3]) == OP_LOADI || w_op(instrs[T + 3]) == OP_LOADI64)) continue;
+            if (!ar_is_alu2(w_op(instrs[T + 4])) || (w_flags(instrs[T + 4]) & FLAG_IMM)) continue;
+            if (w_ra(instrs[T + 4]) != a1 || w_rb_reg(instrs[T + 4]) != b1) continue;
+            /* the two dead-region LOADIs' destinations must be distinct and
+             * not the pattern's sources (the tail's fetches are then real
+             * reloads, misses against a cache holding exactly those two). */
+            uint16_t d1 = w_rd(instrs[T + 2]), d2 = w_rd(instrs[T + 3]);
+            if (d1 == d2 || d1 == a1 || d1 == b1 || d2 == a1 || d2 == b1) continue;
+            /* the pre-T result registers must be pairwise distinct (no
+             * reserve reuse — the cursor is then exactly the count). */
+            uint64_t seen = 0; int cnt = 0; int ok = 1;
+            for (uint32_t pc = 0; pc < T; pc++) {
+                uint64_t w = instrs[pc];
+                uint8_t op = w_op(w);
+                if (!ar_is_result_op(op)) continue;
+                uint16_t rd = (op == OP_CALL) ? 0 : w_rd(w);
+                if (rd >= 64 || (seen & (1ull << rd))) { ok = 0; break; }
+                seen |= (1ull << rd);
+                cnt++;
+            }
+            if (!ok) continue;
+            int c = cnt % 3;   /* the tail's result host slot */
+            g_epi_merge[T] = (uint8_t)(((c != 0) ? 1 : 0) | ((c != 1) ? 2 : 0));
         }
     }
 
