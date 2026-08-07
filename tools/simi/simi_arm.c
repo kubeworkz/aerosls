@@ -325,6 +325,16 @@ static void emit_li64(struct CodeBuf* cb, uint8_t reg, uint64_t imm);   /* fwd: 
  *      register (ADD r4, r1, r2; ADD r5, r1, r2) keep the source
  *      resident instead of spilling it now and reloading it when
  *      get_operand fetches it a few words later.
+ *   6. FETCH TARGETS ARE CHOSEN TO MATCH RESIDENCY (M2.5). get_operand's
+ *      default host assignment (operand1→x9, operand2→x10) is overridden
+ *      per instruction by cache_fetch_hosts/cache_single_host: when an
+ *      operand is resident at slot 1 (or the second operand at slot 0),
+ *      the fetch targets swap so each operand fetches into its own
+ *      resident slot — otherwise the first fetch spills the second
+ *      operand, then the second fetch spills the first and reloads it,
+ *      two spills and a reload for operands that were both resident
+ *      (e.g. ADD r5, r2, r1 after ADD r4, r1, r2: r1@slot0, r2@slot1
+ *      makes the swapped-order ADD crossed).
  * The naive (g_alloc=0) path degrades these helpers to exactly the M0
  * sequences, so the JMPR fallback is exercised by jmpr_basic/jmpr_oob.
  */
@@ -441,11 +451,57 @@ static void clobber_scratch(struct CodeBuf* cb, uint8_t h) {
         g_cache_guest[slot] >= 0 && slot != g_resv_slot)
         cache_spill_one(cb, slot);
 }
-/* Materialize `imm` into a scratch register that is neither X_T0 (first
- * operand) nor the reserved result register; returns that register. */
-static uint8_t materialize_imm(struct CodeBuf* cb, uint64_t imm) {
-    if (g_resv_slot == 1) { clobber_scratch(cb, X_T2); emit_li64(cb, X_T2, imm); return X_T2; }
-    clobber_scratch(cb, X_T1); emit_li64(cb, X_T1, imm); return X_T1;
+/* M2.5: FETCH TARGET SELECTION AWARE OF BOTH OPERANDS. get_operand's
+ * default host assignment is g1→x9, g2→x10. When the operands are
+ * resident CROSSED (g1 at slot 1, g2 at slot 0), the default fetch of
+ * g1 spills g2, then the fetch of g2 spills g1 and reloads g2 from
+ * memory — two spills and a reload for operands that were BOTH resident
+ * (e.g. ADD r5, r2, r1 after ADD r4, r1, r2 leaves r1@slot0 and
+ * r2@slot1, so a swapped-order ADD crosses them). Swapping the
+ * assignment (g1→x10, g2→x9) makes each fetch a no-op into its own
+ * resident slot. The rule swaps whenever g1 is resident at slot 1 or g2
+ * at slot 0, because the swap is never larger than the default and
+ * usually smaller (g1@1 avoids spilling slot 1's occupant AND a wasted
+ * mov; g2@0 is the symmetric case); the cases where the default is
+ * already optimal (both at slots 0/2 or 2/1) do not match the rule.
+ * Naive mode keeps the canonical x9/x10 order — M0 codegen must stay
+ * byte-identical for the gate baselines. */
+static void cache_fetch_hosts(int g1, int g2, uint8_t* h1, uint8_t* h2) {
+    *h1 = X_T0; *h2 = X_T1;
+    if (!g_alloc) return;
+    if (cache_find(g1) == 1 || cache_find(g2) == 0) { *h1 = X_T1; *h2 = X_T0; }
+}
+/* M2.5: fetch host for an instruction's ONE register operand when the
+ * other operand is an immediate needing a scratch register (x9 or x10).
+ * Default is operand→x9, imm→x10. When the operand is resident at slot
+ * 1, that default would spill it on the imm materialization (and waste
+ * the mov that just fetched it into x9), so swap: operand→x10, imm→x9.
+ * The swap also defuses the only dangerous aliasing for the imm target:
+ * a REUSED result register holding rd's live old value sits at
+ * g_resv_slot, and rd==ra there means cache_find(ra)==g_resv_slot — so
+ * when the operand takes X_T1 (g_resv_slot==1), the imm goes to X_T0
+ * and never touches it; when the imm goes to X_T1, the operand did not
+ * take X_T1, so g_resv_slot==1 there implies the reused value is dead
+ * (rd != ra) or the slot is a fresh-claim phantom (garbage until the
+ * result lands). */
+static uint8_t cache_single_host(int g) {
+    if (g_alloc && cache_find(g) == 1) return X_T1;
+    return X_T0;
+}
+/* Materialize `imm` into the given scratch host, spilling its occupant
+ * first. Callers pick the host with cache_single_host/cache_fetch_hosts
+ * so it is never the first-operand host (which holds a live operand this
+ * instruction reads). The reserved-result aliasing cases are all
+ * dead-or-phantom: h is always x9 or x10 (never the slot-2 host), and
+ * the one live-reuse slot that could collide — slot 1 with rd==ra — is
+ * exactly the case cache_single_host's slot-1 check swaps away, so the
+ * imm never overwrites a reused result register still holding rd's live
+ * old value (this is why the M1-era X_T2 g_resv_slot==1 fallback is
+ * gone). */
+static uint8_t materialize_imm(struct CodeBuf* cb, uint64_t imm, uint8_t h) {
+    clobber_scratch(cb, h);
+    emit_li64(cb, h, imm);
+    return h;
 }
 /* Read guest register g into host h (x9/x10/x11), through the cache.
  * Loading or moving into h destroys any occupant of h's slot, so that
@@ -588,13 +644,17 @@ static void op_cbz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fix
 static void op_cbnz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fixup(cb, target_pc, FIX_CBNZ, rt); }
 
 /* ─── CMP: synthesize all 10 relations from cmp+cset (§4) ────────────────
- * Operands in t0 (lhs), t1 (rhs); result (0/1) ends up in `rd` (M1: the
+ * Operands in rn (lhs), rm (rhs); result (0/1) ends up in `rd` (M1: the
  * reserved result register, which may alias an operand register — A64
- * reads all operands before writing). `cmp x0, x1` (subs xzr, x0, x1)
+ * reads all operands before writing). `cmp xN, xM` (subs xzr, xN, xM)
  * writes NZCV; `cset xd, cond` reads it. The A64 condition code for each
- * SIMI relation: EQ=0 NE=1 HS=2 LO=3 HI=8 LS=9 GE=10 LT=11 GT=12 LE=13. */
-static int emit_cmp(struct CodeBuf* cb, int rel, uint8_t rd) {
-    e32(cb, enc_subs_shift(31, X_T0, X_T1, 0, 0));   /* cmp x9, x10 */
+ * SIMI relation: EQ=0 NE=1 HS=2 LO=3 HI=8 LS=9 GE=10 LT=11 GT=12 LE=13.
+ * M2.5: rn/rm are the operand hosts chosen by cache_fetch_hosts, so a
+ * crossed residency (ra@1, rb@0) swaps them without disturbing the
+ * relation's operand order — subs xzr, x10, x9 with the same semantics
+ * as subs xzr, x9, x10. */
+static int emit_cmp(struct CodeBuf* cb, int rel, uint8_t rd, uint8_t rn, uint8_t rm) {
+    e32(cb, enc_subs_shift(31, rn, rm, 0, 0));   /* cmp rn, rm */
     switch (rel) {
         case REL_EQ:  e32(cb, enc_cset(rd, 0)); break;   /* eq */
         case REL_NE:  e32(cb, enc_cset(rd, 1)); break;   /* ne */
@@ -797,20 +857,27 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         int v = cache_reserve(cb, rd, ra, (flags & FLAG_IMM) ? -1 : w_rb_reg(w));
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
-        get_operand(cb, ra, X_T0, rd_live);
-        uint8_t rhs = X_T1;
-        if (flags & FLAG_IMM) rhs = materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w));
-        else                 get_operand(cb, w_rb_reg(w), X_T1, rd_live);
+        uint8_t h_a, h_b;
+        if (flags & FLAG_IMM) {
+            h_a = cache_single_host(ra);
+            h_b = (h_a == X_T0) ? X_T1 : X_T0;
+            get_operand(cb, ra, h_a, rd_live);
+            materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w), h_b);
+        } else {
+            cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
+            get_operand(cb, ra, h_a, rd_live);
+            get_operand(cb, w_rb_reg(w), h_b, rd_live);
+        }
         switch (op) {
-            case OP_ADD: e32(cb, enc_add_shift(rh, X_T0, rhs, 0, 0)); break;
-            case OP_SUB: e32(cb, enc_sub_shift(rh, X_T0, rhs, 0, 0)); break;
-            case OP_AND: e32(cb, enc_and_shift(rh, X_T0, rhs, 0, 0)); break;
-            case OP_OR:  e32(cb, enc_orr_shift(rh, X_T0, rhs, 0, 0)); break;
-            case OP_XOR: e32(cb, enc_eor_shift(rh, X_T0, rhs, 0, 0)); break;
-            case OP_MUL: e32(cb, enc_madd(rh, X_T0, rhs, 31)); break;  /* MUL */
-            case OP_SHL: e32(cb, enc_lslv(rh, X_T0, rhs)); break;
-            case OP_SHR: e32(cb, enc_lsrv(rh, X_T0, rhs)); break;
-            case OP_SAR: e32(cb, enc_asrv(rh, X_T0, rhs)); break;
+            case OP_ADD: e32(cb, enc_add_shift(rh, h_a, h_b, 0, 0)); break;
+            case OP_SUB: e32(cb, enc_sub_shift(rh, h_a, h_b, 0, 0)); break;
+            case OP_AND: e32(cb, enc_and_shift(rh, h_a, h_b, 0, 0)); break;
+            case OP_OR:  e32(cb, enc_orr_shift(rh, h_a, h_b, 0, 0)); break;
+            case OP_XOR: e32(cb, enc_eor_shift(rh, h_a, h_b, 0, 0)); break;
+            case OP_MUL: e32(cb, enc_madd(rh, h_a, h_b, 31)); break;  /* MUL */
+            case OP_SHL: e32(cb, enc_lslv(rh, h_a, h_b)); break;
+            case OP_SHR: e32(cb, enc_lsrv(rh, h_a, h_b)); break;
+            case OP_SAR: e32(cb, enc_asrv(rh, h_a, h_b)); break;
         }
         store_result(cb, rd);
         break;
@@ -819,22 +886,29 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         int v = cache_reserve(cb, rd, ra, (flags & FLAG_IMM) ? -1 : w_rb_reg(w));
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
-        get_operand(cb, ra, X_T0, rd_live);
-        uint8_t rhs = X_T1;
-        if (flags & FLAG_IMM) rhs = materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w));
-        else                 get_operand(cb, w_rb_reg(w), X_T1, rd_live);
+        uint8_t h_a, h_b;
+        if (flags & FLAG_IMM) {
+            h_a = cache_single_host(ra);
+            h_b = (h_a == X_T0) ? X_T1 : X_T0;
+            get_operand(cb, ra, h_a, rd_live);
+            materialize_imm(cb, (uint64_t)(int64_t)w_imm28(w), h_b);
+        } else {
+            cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
+            get_operand(cb, ra, h_a, rd_live);
+            get_operand(cb, w_rb_reg(w), h_b, rd_live);
+        }
         int sgn = ar_type_signed(type);
         /* A64 has no remainder instruction: sdiv/udiv then msub folds the
          * quotient back (t = t - (t/d)*d), yielding the dividend-sign
          * remainder RV64's rem/remu produce. M1 keeps the dividend and
-         * divisor live in x9/x10, so the quotient uses x0 (dead between
-         * hostfn calls — every such call flushes first) instead of x11,
-         * which may be the reserved result register. */
+         * divisor live in the working registers, so the quotient uses x0
+         * (dead between hostfn calls — every such call flushes first)
+         * instead of x11, which may be the reserved result register. */
         if (op == OP_DIV) {
-            e32(cb, sgn ? enc_sdiv(rh, X_T0, rhs) : enc_udiv(rh, X_T0, rhs));
+            e32(cb, sgn ? enc_sdiv(rh, h_a, h_b) : enc_udiv(rh, h_a, h_b));
         } else {
-            e32(cb, sgn ? enc_sdiv(X_ARG, X_T0, rhs) : enc_udiv(X_ARG, X_T0, rhs));
-            e32(cb, enc_msub(rh, X_ARG, rhs, X_T0));
+            e32(cb, sgn ? enc_sdiv(X_ARG, h_a, h_b) : enc_udiv(X_ARG, h_a, h_b));
+            e32(cb, enc_msub(rh, X_ARG, h_b, h_a));
         }
         store_result(cb, rd);
         break;
@@ -893,9 +967,11 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         int v = cache_reserve(cb, rd, ra, w_rb_reg(w));   /* CMP is always register form */
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (rd == w_rb_reg(w));
-        get_operand(cb, ra, X_T0, rd_live);
-        get_operand(cb, w_rb_reg(w), X_T1, rd_live);
-        if (flags >= 10 || !emit_cmp(cb, flags, rh)) return TX_AR_ERR_BAD_OPCODE;
+        uint8_t h_a, h_b;
+        cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
+        get_operand(cb, ra, h_a, rd_live);
+        get_operand(cb, w_rb_reg(w), h_b, rd_live);
+        if (flags >= 10 || !emit_cmp(cb, flags, rh, h_a, h_b)) return TX_AR_ERR_BAD_OPCODE;
         store_result(cb, rd);
         break;
     }
@@ -903,13 +979,15 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     case OP_LEA: {
         int v = cache_reserve(cb, rd, ra, -1);
         uint8_t rh = result_host(v);
-        get_operand(cb, ra, X_T0, rd == ra);
+        uint8_t h_a = cache_single_host(ra);
+        uint8_t h_imm = (h_a == X_T0) ? X_T1 : X_T0;
+        get_operand(cb, ra, h_a, rd == ra);
         int32_t disp = w_imm28(w);
         if (disp >= 0 && disp <= 4095) {
-            e32(cb, enc_add_imm(rh, X_T0, (uint32_t)disp));
+            e32(cb, enc_add_imm(rh, h_a, (uint32_t)disp));
         } else {
-            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp);
-            e32(cb, enc_add_shift(rh, X_T0, sc, 0, 0));
+            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
+            e32(cb, enc_add_shift(rh, h_a, sc, 0, 0));
         }
         store_result(cb, rd);
         break;
@@ -920,22 +998,27 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         int v = cache_reserve(cb, rd, ra, (flags & FLAG_IMM) ? -1 : w_rb_reg(w));
         uint8_t rh = result_host(v);
         int rd_live = (rd == ra) || (!(flags & FLAG_IMM) && rd == w_rb_reg(w));
-        get_operand(cb, ra, X_T0, rd_live);   /* base */
         int shift = type_shift(type);
         if (flags & FLAG_IMM) {
+            uint8_t h_a = cache_single_host(ra);
+            uint8_t h_imm = (h_a == X_T0) ? X_T1 : X_T0;
+            get_operand(cb, ra, h_a, rd_live);   /* base */
             int64_t scaled = (int64_t)w_imm28(w) << shift;
             if (scaled >= 0 && scaled <= 4095) {
-                e32(cb, enc_add_imm(rh, X_T0, (uint32_t)scaled));
+                e32(cb, enc_add_imm(rh, h_a, (uint32_t)scaled));
             } else {
-                uint8_t sc = materialize_imm(cb, (uint64_t)scaled);
-                e32(cb, enc_add_shift(rh, X_T0, sc, 0, 0));
+                uint8_t sc = materialize_imm(cb, (uint64_t)scaled, h_imm);
+                e32(cb, enc_add_shift(rh, h_a, sc, 0, 0));
             }
         } else {
-            get_operand(cb, w_rb_reg(w), X_T1, rd_live);
-            /* add xd, x9, x10, lsl #shift — A64's shifted register operand
+            uint8_t h_a, h_b;
+            cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
+            get_operand(cb, ra, h_a, rd_live);   /* base */
+            get_operand(cb, w_rb_reg(w), h_b, rd_live);
+            /* add xd, xA, xB, lsl #shift — A64's shifted register operand
              * folds the scale into the add, one instruction where RV64
              * needs a separate slli. */
-            e32(cb, enc_add_shift(rh, X_T0, X_T1, 0, (uint8_t)shift));
+            e32(cb, enc_add_shift(rh, h_a, h_b, 0, (uint8_t)shift));
         }
         store_result(cb, rd);
         break;
@@ -943,36 +1026,42 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     case OP_LOAD: {
         int v = cache_reserve(cb, rd, ra, -1);
         uint8_t rh = result_host(v);
-        get_operand(cb, ra, X_T0, rd == ra);   /* base */
+        uint8_t h_a = cache_single_host(ra);
+        uint8_t h_imm = (h_a == X_T0) ? X_T1 : X_T0;
+        get_operand(cb, ra, h_a, rd == ra);   /* base */
         int32_t disp = w_imm28(w);
         int sh = type_shift(type);
         if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) {
             /* the offset folds into the scaled immediate — no address math */
-            load_typed(cb, type, rh, X_T0, (uint16_t)(disp >> sh));
+            load_typed(cb, type, rh, h_a, (uint16_t)(disp >> sh));
         } else {
-            clobber_scratch(cb, X_T0);
-            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp);
-            e32(cb, enc_add_shift(X_T0, X_T0, sc, 0, 0));
-            load_typed(cb, type, rh, X_T0, 0);
+            clobber_scratch(cb, h_a);
+            uint8_t sc = materialize_imm(cb, (uint64_t)(int64_t)disp, h_imm);
+            e32(cb, enc_add_shift(h_a, h_a, sc, 0, 0));
+            load_typed(cb, type, rh, h_a, 0);
         }
         store_result(cb, rd);
         break;
     }
     case OP_STORE: {
-        /* No reservation in STORE (g_resv_slot == -1), so the hint is
-         * inert — passed as 0 for the signature. */
-        get_operand(cb, ra, X_T0, 0);   /* base */
-        get_operand(cb, rd, X_T1, 0);   /* rd holds the *source* value register, same convention as x86 */
+        /* No reservation in STORE (g_resv_slot == -1), so the rd_live
+         * hint is inert — passed as 0 for the signature. M2.5: the base
+         * and value registers are two sources like any ALU's, so the
+         * fetch hosts swap when they are crossed (base@1, value@0). */
+        uint8_t h_base, h_val;
+        cache_fetch_hosts(ra, rd, &h_base, &h_val);
+        get_operand(cb, ra, h_base, 0);   /* base */
+        get_operand(cb, rd, h_val, 0);    /* rd holds the *source* value register, same convention as x86 */
         int32_t disp = w_imm28(w);
         int sh = type_shift(type);
         if (disp >= 0 && (disp & ((1 << sh) - 1)) == 0 && (disp >> sh) <= 0xFFF) {
-            store_typed(cb, type, X_T1, X_T0, (uint16_t)(disp >> sh));
+            store_typed(cb, type, h_val, h_base, (uint16_t)(disp >> sh));
         } else {
-            clobber_scratch(cb, X_T0);
+            clobber_scratch(cb, h_base);
             clobber_scratch(cb, X_T2);
             emit_li64(cb, X_T2, (uint64_t)(int64_t)disp);
-            e32(cb, enc_add_shift(X_T0, X_T0, X_T2, 0, 0));
-            store_typed(cb, type, X_T1, X_T0, 0);
+            e32(cb, enc_add_shift(h_base, h_base, X_T2, 0, 0));
+            store_typed(cb, type, h_val, h_base, 0);
         }
         break;
     }
