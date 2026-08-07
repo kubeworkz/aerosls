@@ -1,0 +1,25 @@
+; rd_star.simi — M1 register-allocator edge case: arithmetic where the
+; destination register is ALSO the second (rb) operand, with rd resident
+; across the instruction boundary. The first operand fetch (ra) clobbers
+; x9 (the in-place result register); get_operand must spill rd's old
+; value first so the second fetch of rd reads memory, not the clobbered
+; register. This is the pattern straight_line_bench deliberately does NOT
+; contain (its ADDs all use distinct fresh destinations), so the shared
+; corpus could not catch the bug — this test exists to prove the fix.
+; Expected result: 42
+.entry main
+main:
+    ENTER #8
+    LOADI r0, #5, i64        ; r0 resident
+    LOADI r1, #3, i64        ; r1 resident (forces round-robin pressure)
+    LOADI r2, #2, i64        ; r2 resident
+    LOADI r3, #4, i64        ; r3 evicts r0 -> r0 no longer resident
+    LOADI r0, #10, i64       ; r0 back in cache (reclaims a slot)
+    ADD r0, r1, r0, i64      ; rd==rb: r0 = 3 + 10 = 13 (in-place reuse)
+    ADD r0, r2, r0, i64      ; again: r0 = 2 + 13 = 15
+    ADD r4, r0, r1, i64      ; r4 = 15 + 3 = 18 (distinct, ordinary)
+    ADD r0, r4, r0, i64      ; rd==rb again: r0 = 18 + 15 = 33
+    ADD r0, r0, r3, i64      ; rd==ra: r0 = 33 + 4 = 37
+    LOADI r5, #5, i64
+    ADD r0, r5, r0, i64      ; rd==rb with a fresh-claim: 5 + 37 = 42
+    RET

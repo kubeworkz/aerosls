@@ -1,0 +1,40 @@
+; dead_reuse.simi — M1 register-allocator edge case: arithmetic where the
+; destination register is resident in the cache but is NOT an operand of
+; the instruction (ADD rd, ra, rb with rd != ra, rd != rb). An operand
+; fetch must clobber the in-place result register still holding rd's OLD
+; value, which is dead — get_operand must skip the spill (the result
+; overwrites the register in place); before the rd_live hint it paid one
+; wasted store per occurrence. This is the complement of rd_star.simi,
+; which proves the LIVE direction (rd == rb, the spill is mandatory).
+;
+; Two skip shapes are forced, five occurrences each:
+;   Phase A — r0 claimed first, so it is resident at slot 0 and the FIRST
+;     operand fetch (into x9) clobbers the reserved register.
+;   Phase B — r0 claimed second (r1 takes slot 0), so it is resident at
+;     slot 1 and the SECOND operand fetch (into x10) clobbers the
+;     reserved register (add x10, x9, x10 reads both operands first).
+; Reverting the rd_live skip grows the test by exactly 40 bytes (back to
+; 1152, M0's size) — 10 ADDs x one skipped str each.
+; Expected result: 5
+.entry main
+main:
+    ENTER #8
+    ; Phase A: r0 resident at slot 0 — first-fetch skip.
+    LOADI r0, #100, i64     ; r0 -> slot 0 (round 0)
+    LOADI r1, #2, i64       ; r1 -> slot 1
+    LOADI r2, #3, i64       ; r2 -> slot 2
+    ADD r0, r1, r2, i64     ; r0 = 2 + 3 = 5 (r0's old 100 is dead)
+    ADD r0, r1, r2, i64
+    ADD r0, r1, r2, i64
+    ADD r0, r1, r2, i64
+    ADD r0, r1, r2, i64
+    ; Phase B: r0 resident at slot 1 — second-fetch skip.
+    LOADI r1, #2, i64       ; r1 -> slot 0 (evicts r0's old slot)
+    LOADI r0, #5, i64       ; r0 -> slot 1
+    LOADI r2, #3, i64       ; r2 still at slot 2
+    ADD r0, r1, r2, i64     ; r0 = 2 + 3 = 5 (r0's old 5 is dead)
+    ADD r0, r1, r2, i64
+    ADD r0, r1, r2, i64
+    ADD r0, r1, r2, i64
+    ADD r0, r1, r2, i64
+    RET

@@ -1,29 +1,49 @@
 #!/usr/bin/env python3
 """
-a64_enc_check.py — M0 transcription-error net.
+a64_enc_check.py — M0/M1 transcription-error net.
 
 Independently re-encodes a set of A64 instructions using the ARM bit
 layout written from the architecture reference (field positions: Rd@0,
 Rn@5, Rm@16, imm12@21:10, shift@23:22, size@31:30, cond@15:12 — the
 same layout confirmed independently in the Linux kernel's
-arch/arm64/lib/insn.c), then checks that the words simi_arm.c actually
-emitted (dumped by a64_dump.c) contain exactly those encodings.
+arch/arm64/lib/insn.c), then checks the words simi_arm.c actually
+emitted (dumped by a64_dump.c).
 
-This is deliberately NOT the C decoder (which shares simi_arm.c's
-author); it is a from-scratch Python encoder catching transcription
-errors in the C encoder's constants. The C decoder executing the output
-is the stronger end-to-end proof; this catches the class of error where
-encoder AND decoder agree on a wrong constant.
+M1 changed what the check can assert. M0's codegen was deterministic
+load-operate-store, so the checker could demand exact word sequences.
+M1's x9/x10/x11 register cache makes the BODY allocation-dependent: the
+same SIMI program can place a value in x9 or x10 depending on eviction
+order, so exact body words would just restate the allocator, not verify
+it. The prologue and trampoline stay deterministic (no cache state at
+their boundaries) and keep exact-word checks. The body is verified two
+allocation-agnostic ways:
+
+  1. Every emitted word must decode — via this independent bit layout —
+     to a legal A64 instruction of a class the translator emits. This
+     catches the transcription-error class this net exists for: a wrong
+     opcode/constant in simi_arm.c shows up as a word that fails to
+     decode, even when the C decoder (same author) "agrees" on it.
+  2. The movz/movk chains must encode the exact LOADI/literal values the
+     program demands, in whatever register the allocator chose — decoded
+     and summed here from the raw bits, never taken from simi_arm.c.
+
+What this net CANNOT catch: register selection. A wrong operand register
+in an ALU word (add x9,x9,x10 vs add x9,x9,x11) still decodes to a legal
+class, so allocation mistakes are invisible here — they are caught by the
+four-way execution parity (interp/x86/RV64/ARM run the same .tmo to the
+same expected value). This net is a structural complement to that, not a
+replacement; a word must fail to decode here OR produce a wrong result
+there to be found.
 
 Usage: a64_enc_check.py <dump file> <simi program name>
 The dump file is the output of a64_dump.c; the program name selects the
-expected word set (straight_line_bench | loop_sum | extra_ops).
+expected value set (straight_line_bench | loop_sum | extra_ops).
 """
 
 import sys
 from collections import Counter
 
-# ── Independent encoders, from the ARM bit layout ────────────────────────
+# ── Independent encoders/decoders, from the ARM bit layout ───────────────
 def movz(rd, imm16, hw=0):  return 0xD2800000 | ((hw & 3) << 21) | ((imm16 & 0xFFFF) << 5) | rd
 def movk(rd, imm16, hw):    return 0xF2800000 | ((hw & 3) << 21) | ((imm16 & 0xFFFF) << 5) | rd
 def add_imm(rd, rn, imm12): return 0x91000000 | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd
@@ -66,11 +86,83 @@ def li64(rd, imm):
             words.append(movk(rd, half, hw))
     return words
 
+# ── Decode a single emitted word back to a class + payload, INDEPENDENTLY ─
+# Every mask/constant below is re-derived from the bit layout above (which
+# itself came from the ARM reference), never read from simi_arm.c. If
+# simi_arm.c and this file disagree on a constant, the word fails to
+# decode or decodes to the wrong class — exactly the net's purpose.
+def decode(w):
+    def rd(w):  return w & 0x1F
+    def rn(w):  return (w >> 5) & 0x1F
+    def rm(w):  return (w >> 16) & 0x1F
+    def imm12(w): return (w >> 10) & 0xFFF
+    def hw(w):  return (w >> 21) & 3
+    def imm16(w): return (w >> 5) & 0xFFFF
+    def is_masked(w, mask, k):  return (w & mask) == (k & mask)
+    top = w & 0xFF000000
+    if top in (0xD2000000, 0xF2000000):                      # move wide
+        # 64-bit: MOVZ = 110100101 (0x1A5), MOVK = 111100101 (0x1E5) in
+        # bits 31:23 — they differ at bit 28.
+        return ("movz" if (w >> 23) == 0x1A5 else "movk", hw(w), imm16(w), rd(w))
+    if is_masked(w, 0xFF000000, 0x91000000): return ("add_imm", imm12(w), rn(w), rd(w))
+    if is_masked(w, 0xFF000000, 0xD1000000): return ("sub_imm", imm12(w), rn(w), rd(w))
+    if is_masked(w, 0xFF000000, 0xF1000000): return ("subs_imm", imm12(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE00000, 0x8B000000): return ("add_shift", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE00000, 0xCB000000): return ("sub_shift", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE00000, 0xEB000000): return ("subs_shift", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE00000, 0x8A000000): return ("and_shift", rm(w), rn(w), rd(w))
+    # Logical shifted: sf 001010 0 N Rm imm6 Rn Rd — N@21 distinguishes
+    # ORR (0xAA000000) from ORN (0xAA200000); MVN = ORN Xd, XZR, Xm.
+    if is_masked(w, 0xFFE00000, 0xAA200000): return ("orn", rn(w), rd(w))
+    if is_masked(w, 0xFFE00000, 0xAA000000): return ("orr_shift", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE00000, 0xCA000000): return ("eor_shift", rm(w), rn(w), rd(w))
+    # Variable shifts: free Rm@20:16, Rn@9:5, Rd@4:0.
+    if is_masked(w, 0xFFE0FC00, 0x9AC02000): return ("lslv", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x9AC02400): return ("lsrv", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x9AC02800): return ("asrv", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x9AC00C00): return ("sdiv", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x9AC00800): return ("udiv", rm(w), rn(w), rd(w))
+    # MADD/MSUB: free Rm@20:16, Ra@14:10, Rn@9:5, Rd@4:0; bit 15 is the
+    # multiply-add/subtract selector.
+    if is_masked(w, 0xFFE08000, 0x9B000000): return ("madd", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE08000, 0x9B008000): return ("msub", rm(w), rn(w), rd(w))
+    # CSINC Xd, XZR, XZR, !cond: bits 31:16 = 0x9A9F, bits 11:5 =
+    # 0x7E0 (op@11:10=01, Rn@9:5=31) — cond@15:12 and Rd@4:0 are free.
+    if is_masked(w, 0xFFFF07E0, 0x9A9F07E0): return ("cset", (w >> 12) & 0xF, rd(w))
+    if (w & 0xFFC00000) == 0xF9400000: return ("ldr", imm12(w), rn(w), rd(w))
+    if (w & 0xFFC00000) == 0xF9000000: return ("str", imm12(w), rn(w), rd(w))
+    if (w & 0xFFC00000) == 0x39400000: return ("ldrb", imm12(w), rn(w), rd(w))
+    if (w & 0xFFC00000) == 0x39000000: return ("strb", imm12(w), rn(w), rd(w))
+    if (w & 0xFFC00000) == 0xB9800000: return ("ldrsw", rn(w), rd(w))
+    if (w & 0xFFC00000) == 0xB9400000: return ("ldr_w", rn(w), rd(w))
+    if (w & 0xFFC00000) == 0xB9000000: return ("str_w", rn(w), rd(w))
+    if (w & 0xFFC00000) == 0x79800000: return ("ldrsh", rn(w), rd(w))
+    if (w & 0xFFC00000) == 0x79400000: return ("ldrh", rn(w), rd(w))
+    if (w & 0xFFC00000) == 0x79000000: return ("strh", rn(w), rd(w))
+    if (w & 0xFFC00000) == 0x39800000: return ("ldrsb", rn(w), rd(w))
+    if (w & 0xFFFFFC1F) == 0xD61F0000: return ("br", rn(w))
+    if (w & 0xFFFFFC1F) == 0xD63F0000: return ("blr", rn(w))
+    if (w & 0xFC000000) == 0x14000000: return ("b", (w & 0x3FFFFFF) | (-(1 << 26) if w & 0x2000000 else 0))
+    if (w & 0xFC000000) == 0x94000000: return ("bl", (w & 0x3FFFFFF) | (-(1 << 26) if w & 0x2000000 else 0))
+    # CBZ/CBNZ (64-bit): 0xB4/0xB5 in bits 31:24 — bit 24 selects
+    # zero/nonzero, imm19@23:5 and Rt@4:0 are free.
+    if (w & 0xFE000000) == 0xB4000000: return ("cbz", (w >> 5) & 0x7FFFF, rd(w))
+    if (w & 0xFE000000) == 0xB5000000: return ("cbnz", (w >> 5) & 0x7FFFF, rd(w))
+    return None
+
+# Classes simi_arm.c may legally emit (M0/M1). Anything else in the dump
+# is a wrong constant.
+ALLOWED = {"movz", "movk", "add_imm", "sub_imm", "subs_imm", "add_shift",
+           "sub_shift", "subs_shift", "and_shift", "orr_shift", "eor_shift",
+           "orn", "lslv", "lsrv", "asrv", "sdiv", "udiv", "madd", "msub",
+           "cset", "ldr", "str", "ldrb", "strb", "ldrsw", "ldr_w", "str_w",
+           "ldrsh", "ldrh", "strh", "ldrsb", "br", "blr", "b", "bl",
+           "cbz", "cbnz"}
+
 # Register numbers used by simi_arm.c
 T0, T1, T2, SP, FP, LR, XZR = 9, 10, 11, 31, 29, 30, 31
-X0 = 0
 
-# ── Expected word sets per program (all static encodings) ────────────────
+# ── Deterministic prologue/trampoline checks (exact words) ───────────────
 def check_trampoline(dump, label):
     """The trampoline is emitted AFTER the procedure body (like RV64), and
     its only non-static words are the two li64 constants (namepool_ptr and
@@ -133,11 +225,82 @@ def prologue():
               subs_imm(XZR, T2, 0), cset(T2, 1), strb(T2, SP, i)]
     return w
 
-def loadi(rd, imm):
-    return li64(T0, imm & 0xFFFFFFFFFFFFFFFF) + [stp_(T0, SP, 71 - rd), strb(XZR, SP, rd)]
+# ── M1 body checks: every word decodes to an allowed class; every li64 ───
+# chain (per destination register, split at any non-movz/movk word)
+# encodes a value from the program's expected set, INDEPENDENTLY.
+def li64_chains(dump):
+    """Yield (value, nwords) for every maximal run of movz/movk words that
+    starts with movz hw=0 and stays on one destination register. Runs that
+    don't start with hw=0 movz are skipped (the trampoline's 2 li64s are
+    in the dump too, but their values are host addresses — they are
+    excluded by the register filter below only in the caller)."""
+    i = 0
+    n = len(dump)
+    while i < n:
+        dec = decode(dump[i])
+        # Only the move-wide family returns 4-tuples; everything else is
+        # not a constant chain and is skipped.
+        if dec is None or len(dec) != 4:
+            i += 1
+            continue
+        cls, hw, imm16, rd_ = dec
+        if cls == "movz" and hw == 0:
+            val = imm16
+            j = i + 1
+            while j < n:
+                dec2 = decode(dump[j])
+                if dec2 is None or len(dec2) != 4:
+                    break
+                c2, h2, i2, r2 = dec2
+                if c2 == "movk" and r2 == rd_ and h2 == (j - i):
+                    val |= i2 << (16 * h2)
+                    j += 1
+                else:
+                    break
+            yield (rd_, val, j - i)
+            i = j
+        else:
+            i += 1
 
-def alu2(opword, rd, ra, rb):
-    return [ldr(T0, SP, 71 - ra), ldr(T1, SP, 71 - rb), opword, stp_(T0, SP, 71 - rd), strb(XZR, SP, rd)]
+def body_checks(dump, expected_values, label):
+    ok = True
+    bad = []
+    for w in dump:
+        d = decode(w)
+        if d is None or d[0] not in ALLOWED:
+            bad.append((w, d))
+    if bad:
+        print("MISMATCH %-22s: %d word(s) fail independent decode / not an emitted class"
+              % (label, len(bad)))
+        for w, d in bad[:8]:
+            print("    %08x -> %s" % (w, d))
+        ok = False
+    else:
+        print("OK       %-22s: all %d words decode to legal A64 classes"
+              % (label, len(dump)))
+    # li64 value check: every LOADI constant must appear as a chain. The
+    # trampoline's two li64s target x9 and sit after the body; the body's
+    # own li64s also use x9/x10/x11. We only require the expected values
+    # to be PRESENT (the translator also emits store/load/tag words that
+    # may reuse the same register between chains, so chains are split at
+    # any non-movz/movk word — exactly what li64_chains does).
+    present = Counter(v for (_, v, _) in li64_chains(dump))
+    missing = []
+    for v in expected_values:
+        if present.get(v, 0) > 0:
+            present[v] -= 1
+        else:
+            missing.append(v)
+    if missing:
+        print("MISMATCH %-22s: %d expected li64 constant(s) not found"
+              % (label, len(missing)))
+        for v in missing[:8]:
+            print("    missing 0x%x" % v)
+        ok = False
+    else:
+        print("OK       %-22s: all %d li64 constants encoded correctly"
+              % (label, len(expected_values)))
+    return ok
 
 def check(dump_words, expected, label):
     cnt = Counter(dump_words)
@@ -171,60 +334,20 @@ def main():
     ok &= check(dump, prologue(), "prologue")
 
     if prog == "straight_line_bench":
-        exp = []
-        for rd, v in [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]:
-            exp += loadi(rd, v)
-        exp += alu2(add_sh(T0, T0, T1), 6, 0, 1)
-        exp += alu2(add_sh(T0, T0, T1), 7, 2, 3)
-        exp += alu2(add_sh(T0, T0, T1), 8, 4, 5)
-        exp += alu2(add_sh(T0, T0, T1), 9, 6, 7)
-        exp += alu2(add_sh(T0, T0, T1), 10, 9, 8)
-        # MOV r0, r10
-        exp += [ldr(T0, SP, 71 - 10), stp_(T0, SP, 71 - 0), ldrb(T1, SP, 10), strb(T1, SP, 0)]
-        ok &= check(dump, exp, "body")
+        # LOADIs r0..r5 = 1..6. The body ADDs/MOV are checked structurally
+        # (legal classes, above); the constants are the allocation-free
+        # ground truth.
+        expected_values = [1, 2, 3, 4, 5, 6]
+        ok &= body_checks(dump, expected_values, "body")
     elif prog == "loop_sum":
-        exp = loadi(0, 0) + loadi(1, 1) + loadi(2, 10) + loadi(4, 1)
-        # CMP r3, r1, r2, GT
-        exp += [ldr(T0, SP, 71 - 1), ldr(T1, SP, 71 - 2), subs_sh(XZR, T0, T1),
-                cset(T0, 12), stp_(T0, SP, 71 - 3), strb(XZR, SP, 3)]
-        # ADD r0, r0, r1; ADD r1, r1, r4
-        exp += alu2(add_sh(T0, T0, T1), 0, 0, 1)
-        exp += alu2(add_sh(T0, T0, T1), 1, 1, 4)
-        # RET: ldr t0,slot0; ldrb t1,tag0; add sp,sp,#576; ldr x30,[sp,#8];
-        #      ldr x29,[sp,#0]; add sp,sp,#16; br x30
-        exp += [ldr(T0, SP, 71), ldrb(T1, SP, 0), add_imm(SP, SP, 576),
-                0xF94007FE, 0xF94003FD, 0x910043FF, br(LR)]
-        ok &= check(dump, exp, "body")
+        # LOADIs r0=0, r1=1, r2=10, r4=1 (loop), plus CMP/ADD/cset/cbz.
+        expected_values = [0, 1, 10, 1]
+        ok &= body_checks(dump, expected_values, "body")
     elif prog == "extra_ops":
-        exp = loadi(0, 17) + loadi(1, 5)
-        # DIV r2, r0, r1 (signed): sdiv t0,t0,t1
-        exp += [ldr(T0, SP, 71 - 0), ldr(T1, SP, 71 - 1), sdiv(T0, T0, T1),
-                stp_(T0, SP, 71 - 2), strb(XZR, SP, 2)]
-        # MOD r3, r0, r1: sdiv t2,t0,t1; msub t0,t2,t1,t0
-        exp += [ldr(T0, SP, 71 - 0), ldr(T1, SP, 71 - 1), sdiv(T2, T0, T1),
-                msub(T0, T2, T1, T0), stp_(T0, SP, 71 - 3), strb(XZR, SP, 3)]
-        # ADD r4, r2, r3
-        exp += alu2(add_sh(T0, T0, T1), 4, 2, 3)
-        # SHL r5, r4, #2 (imm path): li64 t1, 2; lslv
-        exp += [ldr(T0, SP, 71 - 4)] + li64(T1, 2) + [lslv(T0, T0, T1),
-                stp_(T0, SP, 71 - 5), strb(XZR, SP, 5)]
-        # SHR r6, r5, #1: lsrv
-        exp += [ldr(T0, SP, 71 - 5)] + li64(T1, 1) + [lsrv(T0, T0, T1),
-                stp_(T0, SP, 71 - 6), strb(XZR, SP, 6)]
-        # LOADI r8, #-8 (sign-extended 64-bit)
-        exp += li64(T0, 0xFFFFFFFFFFFFFFF8) + [stp_(T0, SP, 71 - 8), strb(XZR, SP, 8)]
-        # SAR r9, r8, #1: asrv
-        exp += [ldr(T0, SP, 71 - 8)] + li64(T1, 1) + [asrv(T0, T0, T1),
-                stp_(T0, SP, 71 - 9), strb(XZR, SP, 9)]
-        # NEG r10, r9: sub t0, xzr, t0
-        exp += [ldr(T0, SP, 71 - 9), sub_sh(T0, XZR, T0),
-                stp_(T0, SP, 71 - 10), strb(XZR, SP, 10)]
-        # ADD r11, r6, r10
-        exp += alu2(add_sh(T0, T0, T1), 11, 6, 10)
-        # NOT r0, r11: mvn (orn t0, xzr, t0)
-        exp += [ldr(T0, SP, 71 - 11), orn(T0, T0),
-                stp_(T0, SP, 71 - 0), strb(XZR, SP, 0)]
-        ok &= check(dump, exp, "body")
+        # LOADIs r0=17, r1=5, r8=-8; plus immediates 2 and 1 materialized
+        # for SHL/SHR/SAR register shifts.
+        expected_values = [17, 5, 0xFFFFFFFFFFFFFFF8, 2, 1]
+        ok &= body_checks(dump, expected_values, "body")
     else:
         print("unknown program %s" % prog)
         return 2
