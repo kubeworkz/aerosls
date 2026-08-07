@@ -1705,6 +1705,126 @@ named item — epilogue/prologue merging across backward folds — plus
 the fixpoint-vs-coalescing interactions the §10.30 ceiling
 replacement (§10.32) describes.
 
+### 10.36 M2.15 amendment — epilogue/prologue merging across backward folds (as built)
+
+The last §10.29 lever, and the one the earlier milestones could not
+touch: a folded JMPR to an EARLIER pc emits `cache_flush; b target`,
+and the target block's head RELOADS its operand registers from the
+frame (rule 1 gives a marked head an empty cache) — while the source
+block's tail may have reloaded the SAME registers a few words earlier.
+The key fact that makes the round trip partially dead is M1's
+fetch discipline: `get_operand`'s miss path ld_slots WITHOUT claiming
+the directory (only results — `cache_reserve` claims — ever become
+resident). A tail fetch of g1/g2 into x9/x10 is therefore TRANSIENT,
+and the fold's flush stores only the directory's resident RESULTS —
+it never touches x9/x10's transient values. So when control lands at
+the head, x9 still holds g1 and x10 still holds g2: the head's matching
+reloads would re-read the same slot values into the same hosts — dead
+code. The merge DROPS them, so the register frame is loaded once (at
+the tail), not once per block.
+
+Soundness is the single-edge invariant, sharper than §10.30's: the
+head's code is SHARED by every incoming path, but the dropped reads
+consume whatever is in x9/x10, which only the fold's path guarantees.
+Any other edge (a fall-through from T-1, a BR/BC/CALL, another JMPR,
+an entry trampoline) arrives with its own unknown x9/x10 state, so
+the target must be reached ONLY via the fold: no BR/BC/CALL edge (the
+pass-A formula q+1+imm28), no other folded JMPR, no entry, and T-1
+must be an unconditional terminal — RET, BR, or a JMPR that does not
+fold to T (this excludes BC's fall-through and CALL's return path).
+This makes the shape inherently loop-free-dead at the target — a live
+loop's head is also reached by its own entry — which is why the test
+is structured so the LIVE path flows through the fold anyway: pc 3's
+BR jumps INTO the fold source, so tail → fold → head all execute at
+runtime, and the head's pattern writes r0 = r2 + r1, making the
+expected value flow THROUGH the dropped reads (the ARM engine executes
+them; a wrong drop diverges from the three interpreters).
+
+The analysis must know the emitted words between the head and the
+fold statically, so the layout is rigid: pattern [ALU-2src @ T] —
+terminal [RET/BR @ T+1] — two result-only LOADIs [@ T+2, T+3] —
+matching tail [ALU-2src @ T+4 reading the SAME guests in the SAME
+order] — fold [JMPR @ T+5]. The LOADIs' destinations must be distinct
+and not the pattern's sources (the tail's fetches are then real
+reloads, misses against a cache holding exactly those two), and the
+pre-T result registers must be pairwise distinct — the directory only
+ever holds result registers, so a never-before-written rd cannot be
+resident, every result op's claim is fresh, and the round-robin
+cursor at the tail is exactly (result-op count) mod 3. The two LOADIs
+occupy cursor+1 and cursor+2, so the tail's reserve picks the cursor
+slot: the x9 fetch's value survives iff that slot is not x9, and the
+x10 fetch's iff it is not x10 — the per-fetch drop flags. Gated on
+g_alloc like every fold (the naive JMPR path stays byte-identical to
+M0); `ar_is_result_op` mirrors the reserve call sites exactly
+(ADD..SAR, DIV/MOD, NOT/NEG, MOV, LOADI, LOADI64, CMP, LEA, PTRADD,
+LOAD, CALL-with-r0 — OP_RESOLVE/OBJSIZE/OBJTYPE flush and store
+without claiming, and OP_LEAVE is a no-op, so neither advances the
+cursor).
+
+- **`tests/epi_merge.simi`** — the first single-edge backward fold in
+  the corpus, and the M-line's first LIVE-executed merge test: the
+  live path runs pc 0-2 (r2 = 3, r1 = 4), BRs into the fold source at
+  pc 6, flows LOADI → LOADI → tail (the frame reloads) → fold → head
+  (the dropped reads) → RET, and the head's `ADD r0, r2, r1` returns
+  7. Expected 7 — the value propagates through the dropped reads, so
+  the four-way parity self-validates the merge. The live region has
+  TWO distinct results, so the result count mod 3 is 2, the tail's
+  result lands in x11, and BOTH head fetches drop (the flags=3 case).
+  M0 baseline (committed M0 translator, naive codegen): **1140 →
+  1004, 136 saved**, of which the merge itself is the 8 bytes the
+  teeth check isolates: disabling the fetch-drop hook grows the file
+  back to exactly 1012 (the two reload words), still correct.
+- **`tests/epi_merge2.simi`** — the ASYMMETRIC half (flags=2): a
+  third distinct live result (r6) makes the count mod 3 = 0, so the
+  tail's result lands in x9 and CLOBBERS the r2 transient — only the
+  r1 fetch survives the fold's flush, the head drops ONLY its second
+  fetch, and its first reload of r2 stays (reading the unchanged slot,
+  which the live flush stored). A bug that drops both fetches reads
+  x9 = the tail's result (7) as r2 and computes 11 instead of 7 — the
+  parity fails on its own, pinning the asymmetric branch of the flags
+  formula. **1160 → 1020, 140 saved**; disabling the merge grows it
+  back to exactly 1024 (the one kept fetch, 4 bytes), still correct.
+
+### 10.37 M2.15 gate results (measured)
+
+Total emitted bytes across the now-36-program parity set: **M0 49468
+→ M1 45376, 4092 saved**, up from M2.14's 3816. The M2.15 rows on top
+of M2.14's 3816:
+
+- epi_merge 1140 → 1004 (−136, new 35th row): the head's two reloads
+  dropped (the tail's transient fetches survive the fold's flush in
+  x9/x10) — dump-verified: the head emits a bare `add x11, x9, x10`
+  (no `ldr` words), the tail emits the two frame reloads plus its two
+  resident spills, and the fold's flush stores only the result.
+- epi_merge2 1160 → 1020 (−140, new 36th row): the asymmetric
+  flags=2 half — the tail's result lands in x9 and clobbers the r2
+  transient, so only the r1 fetch drops and the head's r2 reload
+  stays (dump-verified: `ldr x9, slot2` then `add x9, x9, x10` — the
+  dropped read comes from x10's surviving transient).
+- Row-by-row M2.14-vs-M2.15 accounting (gate tables diffed): all 34
+  shared rows byte-identical — nothing else grew or shrank (no corpus
+  program matches the rigid single-edge layout; jmpr_fall's backward
+  fold targets a RET block head with a second edge). The totals move
+  by exactly the new rows' 8 + 4 byte merge deltas.
+- Four-way parity: interp 38/0, x86 37/0/3, RV64 36/0/4, ARM 36/0/4.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1). Teeth:
+  disabling the merge grows epi_merge to exactly 1012 and epi_merge2
+  to exactly 1024, both still correct.
+
+The M-line has now compounded to 4092 bytes saved, and §10.29's
+branch-side ledger is complete: dispatches fold, dead fall-through
+branches vanish, empty joins fuse, chains cascade, terminal sequences
+share one copy, and now a single-edge backward fold's head reuses the
+source tail's reloads instead of paying for them twice. The honest
+ceiling is the shape itself: the single-edge condition restricts the
+merge to fold targets with no other incoming path (a live loop's head
+always has an entry edge too), and the emission-order constraint — the
+head is compiled before the source, so the runtime register state at
+the head must be derivable from a rigid, statically-known layout — is
+what keeps the analysis from generalizing to arbitrary backward folds.
+The §10.30-era fixpoint-vs-coalescing interactions remain the open
+frontier.
+
 ---
 
 ## Sources consulted

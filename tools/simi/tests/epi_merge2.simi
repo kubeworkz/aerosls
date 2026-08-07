@@ -1,0 +1,28 @@
+; epi_merge2.simi — M2.15: the ASYMMETRIC half of the epilogue/prologue
+; merge. Same single-edge backward fold as epi_merge.simi (pattern@T,
+; RET@T+1, two LOADIs@T+2/T+3, matching tail@T+4, fold@T+5), but the live
+; region has THREE distinct results (r2, r1, r6) — the result count mod 3
+; is 0, so the tail's result lands in x9 (the cursor slot), CLOBBERING the
+; g1 (r2) transient. Only the g2 (r1) fetch survives the fold's flush, so
+; the head drops ONLY the second fetch (flags = 2): its first reload of
+; r2 stays — reading the unchanged slot (the live region's flush stored
+; r2 = 3 at pc 4's BR) — while the dropped r1 read comes from x10's
+; surviving transient. A bug that drops both fetches for this shape reads
+; x9 = the tail's result (7) as r2 and computes 11 instead of 7 — the
+; four-way parity fails on its own, pinning the flags formula's
+; asymmetric branch. Expected result: 7 (r0 = r2 + r1 = 3 + 4).
+.entry main
+main:
+    ENTER #8
+    LOADI r2, #3, i64        ; pc 1 — the pattern's first source (r2 = 3)
+    LOADI r1, #4, i64        ; pc 2 — the pattern's second source (r1 = 4)
+    LOADI r6, #8, i64        ; pc 3 — third distinct live result (cnt = 3, cursor 0)
+    BR src                   ; pc 4 — T-1: terminal, jumps INTO the fold source
+target:                      ; pc 5 = T — reached only via the fold at pc 10
+    ADD r0, r2, r1, i64      ; pc 5 — the pattern: reads r2, r1 — r0 = 7
+    RET                      ; pc 6 — returns r0 = 3 + 4 = 7
+src:                         ; pc 7 — the fold source (the BR target)
+    LOADI r4, #5, i64        ; pc 7 — fold index (r4 = 5, folds BACKWARD to pc 5)
+    LOADI r5, #9, i64        ; pc 8 — second dead-region result
+    ADD r9, r2, r1, i64      ; pc 9 — the tail: reads r2, r1 (same pattern)
+    JMPR r4                  ; pc 10 — folds to pc 5 — the single incoming edge

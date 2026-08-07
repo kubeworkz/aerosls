@@ -134,7 +134,43 @@
 # `cache_flush; b tail`. A BC dispatch (no JMPR) pins that tail reuse is
 # independent of the JMPR folding: 3 RETs -> 1 copy -> 48 bytes below
 # its M0 baseline (2 sharing RETs x 24 bytes; disabling the sharing
-# grows it back to exactly 1048 = M0, still correct). mem_pre is M2.10:
+# grows it back to exactly 1048 = M0, still correct). epi_merge is
+# M2.15: EPILOGUE/PROLOGUE MERGING across a single-edge BACKWARD fold
+# (the last §10.29 lever). A folded JMPR to an EARLIER pc (pc 9 -> pc 4
+# here) emits cache_flush + b; the target block's head reloads its
+# operands from the frame (rule 1 gives it an empty cache) — and the
+# source block's tail (pc 8) RELOADS THE SAME r2, r1 in the same order a
+# few words earlier. The fold's flush stores only the directory's
+# resident RESULTS, so the tail's fetched values stay in x9/x10 across
+# the branch: the head's matching reloads re-read the same slot values
+# into the same hosts — dead code, and the merge drops them (the frame
+# is loaded once, at the tail, not once per block). Soundness requires
+# the head to be reached ONLY via the fold (no other edge's x9/x10 state
+# is known): pc 4 has no BR/BC/CALL, no other JMPR, no entry, and pc 3
+# BR jumps INTO the fold source (pc 6) rather than falling through — no
+# fall-through edge into the head. The test is LIVE-executed: the live
+# path runs pc 0-2, BRs to pc 6, flows tail -> fold -> head, and the
+# head's pattern writes r0 = r2 + r1 = 7, so the expected value flows
+# THROUGH the dropped reads — the ARM engine executes them and any wrong
+# drop makes its result differ from the three interpreters
+# (self-validating, not a dead-path shape verified only by dump). The
+# layout is rigid (pattern@T, RET@T+1, two LOADIs@T+2/T+3,
+# matching tail@T+4, fold@T+5) and the pre-T results (r2, r1) are
+# pairwise distinct, so the cache cursor at the tail is the result count
+# mod 3 (= 2), the tail's result lands in x11, and BOTH head fetches
+# drop — 136 bytes below its M0 baseline, and disabling the merge (the
+# fetch-drop hook) grows it back to exactly 1012 (the 8 bytes are the
+# two dropped reload words), still correct. epi_merge2 is the
+# ASYMMETRIC half: three distinct live results (r2, r1, r6) make the
+# result count mod 3 = 0, so the tail's result lands in x9 and CLOBBERS
+# the r2 transient — only the r1 fetch survives the fold's flush, the
+# head drops ONLY its second fetch (flags = 2), and its first reload of
+# r2 stays (reading the unchanged slot — the live flush stored r2 = 3).
+# A bug that drops both fetches reads x9 = the tail's result (7) as r2
+# and computes 11 instead of 7 — the four-way parity fails on its own,
+# pinning the flags formula's asymmetric branch — 140 bytes below its
+# M0 baseline, and disabling the merge grows it back to exactly 1024
+# (the one kept fetch, 4 bytes), still correct. mem_pre is M2.10:
 # ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
 # folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
 # no writeback, no alignment requirement, superseding the M2.9
@@ -185,6 +221,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
+    [epi_merge]=1140 [epi_merge2]=1160
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
