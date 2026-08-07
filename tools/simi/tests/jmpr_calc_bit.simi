@@ -1,0 +1,40 @@
+; jmpr_calc_bit.simi — M2.3: the JMPR index is COMPUTED at translate
+; time through the BITWISE + SHIFT fold shapes the M2.1/M2.2 tests did
+; not cover. The constant analysis now folds AND/OR/XOR (plain 64-bit,
+; like ADD/SUB/MUL) and SHL/SHR/SAR — the shifts mask the amount mod 64
+; (& 0x3F), matching A64's lslv/lsrv/asrv hardware masking, the
+; interpreter's `fetch_operand_b & 0x3F`, and RV64's `v2 & 0x3F`; SAR is
+; arithmetic (sign-filling), like the interpreter's (int64)>>. The
+; chain: r1 = 0x8000000000000000 | 5 = 0x8000000000000005; SAR #2 =
+; 0xE000000000000001 (logical would give 0x2000000000000001 — the fold
+; MUST be arithmetic); SHR #61 = 7; SHL by a REGISTER amount 65 (masked
+; to 1) = 14; AND r3 (5) = 4; XOR #8 = 12; ADD #4 = 16 — the JMPR folds
+; to pc 16. A logical-SAR fold bug lands on pc 12 (55) — distinct,
+; caught by parity. (An UNMASKED shift amount would compute a huge
+; out-of-range value and UN-fold instead: the JMPR falls to the dynamic
+; path, correct result but a size regression, caught only by the teeth
+; check — a different failure mode from the mis-fold.) Caveat as in
+; jmpr_calc: a fold bug that STILL computes 16
+; would pass parity — the teeth check (disabling the fold → exactly the
+; M0 size) bounds that class; inherent to fold testing.
+; Expected result: 222
+.entry main
+main:
+    ENTER #8
+    LOADI64 r1, #-9223372036854775808, i64  ; 0x8000000000000000 — sign bit set
+    LOADI r2, #65, i64                      ; shift amount 65 (masked to 1)
+    LOADI r3, #5, i64
+    OR r1, r1, r3, i64                      ; 0x8000000000000005 (OR reg+reg)
+    SAR r1, r1, #2, i64                     ; 0xE000000000000001 (SAR reg+imm, arithmetic)
+    SHR r1, r1, #61, i64                    ; 7 (SHR reg+imm)
+    SHL r1, r1, r2, i64                     ; 14 (SHL reg+reg, amount 65 masked to 1)
+    AND r1, r1, r3, i64                     ; 4 (AND reg+reg)
+    XOR r1, r1, #8, i64                     ; 12 (XOR reg+imm)
+    ADD r1, r1, #4, i64                     ; 16 (ADD reg+imm)
+    JMPR r1                                 ; folds to pc 16 (target)
+    LOADI r0, #55, i32                      ; pc 12 (dead)
+    RET
+    LOADI r0, #111, i32
+    RET
+    LOADI r0, #222, i32                     ; pc 16 (target)
+    RET
