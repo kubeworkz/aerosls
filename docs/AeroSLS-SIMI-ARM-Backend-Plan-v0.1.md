@@ -3024,6 +3024,62 @@ added, zero moved:
   fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
   rc=1).
 
+### 10.72 M2.31 — the deferred pair product, generalized (as built)
+
+The M2.30 deferral machinery (§10.70) shipped op-generic without a
+pin: the walk's product branch records `cur[s].def_op = op` for the
+whole six-op branch (ADD/SUB/MUL/AND/OR/XOR — the same set the M2.2
+fold and the M2.27/28 image justify as plain 64-bit, never-faulting,
+type-agnostic), and both materialization sites (the walk-side capped
+`chain_flatten` and the dispatch-side BIG `chain_flatten_big`) evaluate
+through the shared `chain_alu_eval`, which already handled all six
+ops. jmpr_chain6 pinned only ADD, so a bitwise- or multiply-built index
+had no proof that the deferred form round-trips. M2.31 closes that
+with jmpr_chain7: a **deferred XOR product**.
+
+- **The pin.** `r1 = r2 ^ r3` over a 3-way join (`r2 ∈ {0,32,64}`)
+  and a 5-way join (`r3 ∈ {20,22,24,26,28}`) — FIFTEEN distinct
+  products `{20,22,...,92}` (bit-6/7 toggles over an even low run,
+  all ≥ 2 apart, all real block pcs). The flat image overflows the
+  cap of 12, so the walk defers: `def_op = OP_XOR` plus the two source
+  slots, invalidated on any write/union (jmpr_chain6's discipline,
+  untouched). The dispatch re-merges into the BIG set and the cost
+  gate (124 < 416) emits the 15-pair chain; runtime `64 ^ 28 = 92`
+  takes the FIFTEENTH b.eq, landing on block14's LOADI #1500.
+- **Zero codegen delta.** The emission is byte-identical to M2.30's;
+  the walk's deferred-form record was already op-agnostic. M2.31's
+  code change is nil — the milestone is the proof, the teeth, and the
+  measurement (below). The one build note surfaced: `e64()` in
+  simi_arm.c is dead (zero callers, predating M2.31; -Wunused-function
+  warns on every build) — left untouched as out of scope.
+
+### 10.73 M2.31 gate results (measured)
+
+Total emitted bytes across the now-55-program parity set: **M0 86888
+→ M1 74320, 12568 saved** (≈14.5%), up from M2.30's 11892. One row
+added, zero moved:
+
+- jmpr_chain7 3020 → 2344 (−676, new 55th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The chain vs table delta
+  is exactly 416 − 124 = +292 (94-entry table + 10-word dispatch
+  minus the 15-pair chain); the remaining 384 of the 676 is the M1
+  allocator on the 94-instruction body. The teeth (deferral
+  restricted to ADD-only) grows it back to exactly 2636 (the table
+  path, still correct) — proving the XOR path is the deferral doing
+  the work, not an accident of the walk.
+- Row-by-row accounting (gate tables diffed vs committed 0920071,
+  measured with the M2.30 verifier): **all 54 shared rows
+  byte-identical** — M2.31 is strictly additive; no pre-existing
+  program's product exceeds 12, so nothing else moved.
+- Four-way parity: 220 PASS, 0 FAIL — all 55 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 15-candidate
+  XOR chain executes at runtime on the ARM engine (PASS 1500), and
+  the documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean (the canonical make a64-enc-check, a
+  fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
+  rc=1).
+
 ---
 
 ## Sources consulted
