@@ -998,6 +998,35 @@ static void chain_merge(struct ChainSet* a, const struct ChainSet* b) {
 /* M2.26: set constructors and the tracked-register operand tests. */
 static void chain_singleton(struct ChainSet* s, uint32_t v) { s->n = 1; s->unk = 0; s->v[0] = v; }
 static void chain_unknown(struct ChainSet* s) { s->n = 0; s->unk = 1; }
+/* M2.27: the ALU set image — S(out) = { f(a, k) : a in S(a) } for the
+ * immediate form, or { f(a, b) : a in S(a), b in S(b) } for the register
+ * form, where f is ADD/SUB/MUL. Plain 64-bit ops that never fault and
+ * ignore the declared type — the same argument as the M2.2 constant
+ * fold — so the image is bit-identical to runtime. The merge caps and
+ * collapses to UNKNOWN exactly like the unions. */
+static void chain_img_alu(struct ChainSet* out, uint8_t op, int use_imm, int32_t imm,
+                          const struct ChainSet* a, const struct ChainSet* b) {
+    struct ChainSet tmp = { .n = 0, .unk = 0 };
+    if (a->unk || (!use_imm && b->unk)) { chain_unknown(&tmp); *out = tmp; return; }
+    for (uint8_t i = 0; i < a->n && !tmp.unk; i++) {
+        int64_t av = (int64_t)a->v[i];
+        if (use_imm) {
+            int64_t r = (op == OP_ADD) ? av + imm
+                       : (op == OP_SUB) ? av - imm : av * (int64_t)imm;
+            struct ChainSet one;
+            chain_singleton(&one, (uint32_t)r);
+            chain_merge(&tmp, &one);
+        } else for (uint8_t j = 0; j < b->n && !tmp.unk; j++) {
+            int64_t bv = (int64_t)b->v[j];
+            int64_t r = (op == OP_ADD) ? av + bv
+                       : (op == OP_SUB) ? av - bv : av * bv;
+            struct ChainSet one;
+            chain_singleton(&one, (uint32_t)r);
+            chain_merge(&tmp, &one);
+        }
+    }
+    *out = tmp;
+}
 /* w_ra is a register source operand (feeds rd when rd is tracked). */
 static int ar_has_reg_ra(uint8_t op) {
     switch (op) {
@@ -2412,31 +2441,21 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                     int ss = (w_ra(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_ra(w)] : -1;
                                     if (ss >= 0) cur[s] = cur[ss];
                                     else chain_unknown(&cur[s]);
-                                } else if (op == OP_ADD || op == OP_SUB) {
-                                    /* S(rd) = image of S(ra) under +imm/-imm,
-                                     * or the pair-product over S(ra) x S(rb) */
+                                } else if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
+                                    /* M2.27: S(rd) = image of S(ra) under
+                                     * the op and the immediate (imm form)
+                                     * or S(rb) (register form) — plain
+                                     * 64-bit, never faults, type-agnostic. */
                                     int s_a = (w_ra(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_ra(w)] : -1;
-                                    struct ChainSet tmp = { .n = 0, .unk = 0 };
-                                    if (s_a < 0 || cur[s_a].unk) chain_unknown(&tmp);
-                                    else if (w_flags(w) & FLAG_IMM) {
-                                        int64_t imm = w_imm28(w);
-                                        for (uint8_t i = 0; i < cur[s_a].n && !tmp.unk; i++) {
-                                            struct ChainSet one;
-                                            chain_singleton(&one, (uint32_t)((int64_t)cur[s_a].v[i] + (op == OP_ADD ? imm : -imm)));
-                                            chain_merge(&tmp, &one);
-                                        }
-                                    } else {
+                                    struct ChainSet unk = { .n = 0, .unk = 1 };
+                                    const struct ChainSet* sa = (s_a >= 0) ? &cur[s_a] : &unk;
+                                    const struct ChainSet* sb = &unk;
+                                    int use_imm = (w_flags(w) & FLAG_IMM) != 0;
+                                    if (!use_imm) {
                                         int s_b = (w_rb_reg(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_rb_reg(w)] : -1;
-                                        if (s_b < 0 || cur[s_b].unk) chain_unknown(&tmp);
-                                        else for (uint8_t i = 0; i < cur[s_a].n && !tmp.unk; i++)
-                                            for (uint8_t j = 0; j < cur[s_b].n && !tmp.unk; j++) {
-                                                struct ChainSet one;
-                                                chain_singleton(&one, (uint32_t)((int64_t)cur[s_a].v[i] +
-                                                    (op == OP_ADD ? (int64_t)cur[s_b].v[j] : -(int64_t)cur[s_b].v[j])));
-                                                chain_merge(&tmp, &one);
-                                            }
+                                        if (s_b >= 0) sb = &cur[s_b];
                                     }
-                                    cur[s] = tmp;
+                                    chain_img_alu(&cur[s], op, use_imm, w_imm28(w), sa, sb);
                                 } else if (op == OP_CMP) {
                                     cur[s].n = 2; cur[s].unk = 0;
                                     cur[s].v[0] = 0; cur[s].v[1] = 1;

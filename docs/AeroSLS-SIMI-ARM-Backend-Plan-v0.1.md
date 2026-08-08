@@ -2792,6 +2792,57 @@ added, zero moved:
   ARM engine; the three documented float/mem engine skips unchanged).
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.64 M2.27 — the chain follows a MUL-built index (as built)
+
+M2.26's pair-product image covered ADD/SUB only, so an index built by
+multiplication — `MUL r1, r2, #k` — was still opaque: the MUL writer
+marked its set UNKNOWN and the program kept the table. M2.27 extends
+the image to MUL with the same argument the M2.2 fold used: plain
+64-bit multiply never faults and is type-agnostic, so its value set
+is exactly the product of its sources' sets.
+
+- **chain_img_alu, shared.** The ADD/SUB and MUL images are now one
+  helper: for each operation, S(rd) = {a op imm} for the immediate
+  form and {a op b : a in S(ra), b in S(rb)} for the register form,
+  with the cap collapse if either source is untracked or unknown.
+  The closure already followed MUL (its operands are registers, so
+  the transitive feeder scan picks them up — no closure change
+  needed). Every other writer still marks UNKNOWN.
+- **jmpr_chain3, the pin.** `r1 = r2 * 2` with the join-dependent
+  base r2 in {5, 6} — the candidate set is the MUL image {5, 6} × 2
+  = {10, 12}, and the runtime index 12 takes the chain's SECOND
+  b.eq (dump-verified: `madd x9, x9, x10, xzr` computes r2*2, then
+  `subs xzr,x9,#10 / b.eq`, `subs xzr,x9,#12 / b.eq`, `udf #0`).
+- **Unchanged soundness argument.** Union-at-joins, real-edges-only
+  linear state, UDF fall-through, out-of-range collapse — exactly
+  M2.25/M2.26's; only the image's opcode set grew, and the teeth
+  (MUL dropped from the image) grows jmpr_chain3 back to exactly
+  1184 (the table path, still correct).
+
+### 10.65 M2.27 gate results (measured)
+
+Total emitted bytes across the now-51-program parity set: **M0 78336
+→ M1 67304, 11032 saved** (≈14.1%), up from M2.26's 10892. One row
+added, zero moved:
+
+- jmpr_chain3 1248 → 1108 (−140, new 51st row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The teeth (MUL image
+  disabled) grows it back to exactly 1184 (the table path, still
+  correct).
+- Row-by-row accounting (gate tables diffed vs committed 119bcda,
+  measured with the M2.26 verifier): **all 50 shared rows
+  byte-identical** — M2.27 is strictly additive; MUL appears in the
+  corpus only inside jmpr_calc_mul (whose constant fold predates
+  M2.26 and does not feed a chain), so nothing else moved.
+- Four-way parity: 204 PASS, 0 FAIL — all 51 expected-result programs
+  on all four engines (interp, x86 JIT, RV64, ARM), each checked
+  against its "Expected result:" comment; the register-MUL chain
+  executes at runtime on the ARM engine (PASS 333), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean (the canonical make a64-enc-check, a
+  fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
+  rc=1).
+
 ---
 
 ## Sources consulted
