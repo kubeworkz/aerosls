@@ -1,0 +1,33 @@
+; jmpr_chain4.simi — M2.28: the inline chain extended to an index built
+; by a BITWISE op. The dispatch index is r1 = r2 ^ 8, where r2 is the
+; join-dependent base (2 on the never-taken branch path, 4 on the taken
+; fall-through) — so the candidate set is the XOR image over the tracked
+; base: {2, 4} ^ 8 = {10, 12}. M2.27's chain_img_alu covered ADD/SUB/MUL;
+; M2.28 adds AND/OR/XOR — plain 64-bit, never faults, type-agnostic (the
+; same argument as the M2.3 bitwise fold) — via the shared chain_alu_eval
+; helper, imm and register forms alike. The runtime index 12 takes the
+; chain's SECOND b.eq (jmpr_chain/chain2/chain3's shape, now through a
+; XOR), and the fold fixpoint cannot fold the JMPR (r2 is
+; join-dependent), so g_alloc=0 and the chain is the naive-mode
+; dispatch. Candidates 10 and 12 are real pcs (blockA/blockB), as the
+; chain branches straight to g_instr_off[candidate].
+; Expected result: 333
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: the BC below NEVER branches
+    LOADI r2, #2, i64   ; pc 2 — branch-path base (2) — dead at runtime
+    BC r0, L            ; pc 3 — r0 == 0 → falls through (delivers {r2:2} at the join)
+    LOADI r2, #4, i64   ; pc 4 — fall-through base (4)
+L:                      ; pc 5 — join: r2 ∈ {2, 4}
+    XOR r1, r2, #8, i64 ; pc 5 — r1 = r2 ^ 8 ∈ {10, 12}
+    JMPR r1             ; pc 6 — candidates {10, 12}, runtime 12
+    LOADI r0, #111, i32 ; pc 7 — dead path — never reached
+    RET                 ; pc 8
+    LOADI r0, #222, i32 ; pc 9 — dead filler (aligns blockA to pc 10)
+blockA:                 ; pc 10 — candidate 10's landing (never hit: BC falls through)
+    LOADI r0, #222, i32 ; pc 10
+    RET                 ; pc 11
+blockB:                 ; pc 12 — candidate 12's landing (runtime hit)
+    LOADI r0, #333, i32 ; pc 12
+    RET                 ; pc 13
