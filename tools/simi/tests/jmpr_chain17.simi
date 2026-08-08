@@ -1,0 +1,134 @@
+; jmpr_chain17.simi — M2.41: the flat walk cap above 12. M2.25-M2.40
+; capped the walk's FLAT set at TX_AR_CHAIN_MAX = 12: a register-form
+; product whose set exceeded 12 was DEFERRED (a record) and re-computed
+; at the dispatch. M2.41 raises the cap to 20, so a 13-20-value product
+; stays FLAT — and a flat set SURVIVES a write to one of its source
+; registers: chain_prewrite only flattens DEFERRED forms (a write to r2
+; leaves the flat set in r1's slot untouched), while a >12-value
+; deferred record was flattened to UNKNOWN by the same write (the eager
+; flatten caps at the walk bound) — killing the chain. Here r1 =
+; r2 + r3 is TWENTY values {42..80} (r2 in {2,12,22,32}, r3 in
+; {40,42,44,46,48}); the arm `BC r5, J` delivers it into J; then
+; `LOADI r2, #1` WRITES a source. Under cap 12: R1 defers at pc 19, the
+; pc 21 write flattens it to UNKNOWN, the dispatch falls to the table.
+; Under cap 20: the product is flat, the write is a no-op for r1's
+; slot, and the dispatch emits the 20-pair chain (the gate 164 < 368
+; says it beats the table). The runtime index 32 + 48 = 80 (r5 == 0 —
+; the arm BC falls through) takes the chain's TWENTIETH b.eq, landing
+; on block19's LOADI #2000. The candidates are real pcs (block0..block19
+; at 42..80), as the chain branches straight to g_instr_off[pc].
+; Expected result: 2000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r5, #0, i64   ; pc 2 — arm BC NOT taken at runtime (r5 = 0)
+    LOADI r2, #2, i64   ; pc 3 — branch-path base (2) — dead at runtime
+    BC r0, J2           ; pc 4 — falls through (delivers {r2:2} at J2)
+    LOADI r2, #12, i64  ; pc 5
+    BC r0, J2           ; pc 6 — falls through (delivers {r2:12} at J2)
+    LOADI r2, #22, i64  ; pc 7
+    BC r0, J2           ; pc 8 — falls through (delivers {r2:22} at J2)
+    LOADI r2, #32, i64  ; pc 9 — fall-through base (32)
+J2:                     ; (label) — join: r2 in {2, 12, 22, 32}
+    LOADI r3, #40, i64  ; pc 10
+    BC r0, J3           ; pc 11 — falls through (delivers {r3:40} at J3)
+    LOADI r3, #42, i64  ; pc 12
+    BC r0, J3           ; pc 13 — falls through (delivers {r3:42} at J3)
+    LOADI r3, #44, i64  ; pc 14
+    BC r0, J3           ; pc 15 — falls through (delivers {r3:44} at J3)
+    LOADI r3, #46, i64  ; pc 16
+    BC r0, J3           ; pc 17 — falls through (delivers {r3:46} at J3)
+    LOADI r3, #48, i64  ; pc 18 — fall-through base (48)
+J3:                     ; (label) — join: r3 in {40,42,44,46,48}
+    ADD r1, r2, r3, i64 ; pc 19 — r1 = r2 + r3 = 20 values (42..80 evens).
+                        ; M2.41: FLAT (fits the raised 20-cap) — under the
+                        ; old 12-cap this DEFERRED (R1) instead.
+    BC r5, J            ; pc 20 — NOT taken at runtime (r5 == 0): delivers
+                        ; r1's set at J (flat under the 20-cap, R1 under 12)
+    LOADI r2, #1, i64   ; pc 21 — WRITE to r2, a SOURCE of r1's product.
+                        ; Under cap 12 this flattens R1 (chain_def_touches
+                        ; its DAG) to UNKNOWN — the chain dies, the table
+                        ; runs. Under cap 20 the flat set in r1's slot is
+                        ; untouched — the chain survives.
+J:                      ; (label) — join: r1 in {42,44,...,80} (20 values)
+    JMPR r1             ; pc 22 — candidates {42,44,...,80}, runtime 80
+    LOADI r0, #0, i32   ; pc 23 — dead filler (aligns block0 to pc 42)
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+    LOADI r0, #0, i32   ; pc 40
+    LOADI r0, #0, i32   ; pc 41
+block0:                 ; pc 42
+    LOADI r0, #100, i32 ; pc 42
+    RET                 ; pc 43
+block1:                 ; pc 44
+    LOADI r0, #200, i32 ; pc 44
+    RET                 ; pc 45
+block2:                 ; pc 46
+    LOADI r0, #300, i32 ; pc 46
+    RET                 ; pc 47
+block3:                 ; pc 48
+    LOADI r0, #400, i32 ; pc 48
+    RET                 ; pc 49
+block4:                 ; pc 50
+    LOADI r0, #500, i32 ; pc 50
+    RET                 ; pc 51
+block5:                 ; pc 52
+    LOADI r0, #600, i32 ; pc 52
+    RET                 ; pc 53
+block6:                 ; pc 54
+    LOADI r0, #700, i32 ; pc 54
+    RET                 ; pc 55
+block7:                 ; pc 56
+    LOADI r0, #800, i32 ; pc 56
+    RET                 ; pc 57
+block8:                 ; pc 58
+    LOADI r0, #900, i32 ; pc 58
+    RET                 ; pc 59
+block9:                 ; pc 60
+    LOADI r0, #1000, i32 ; pc 60
+    RET                 ; pc 61
+block10:                ; pc 62
+    LOADI r0, #1100, i32 ; pc 62
+    RET                 ; pc 63
+block11:                ; pc 64
+    LOADI r0, #1200, i32 ; pc 64
+    RET                 ; pc 65
+block12:                ; pc 66
+    LOADI r0, #1300, i32 ; pc 66
+    RET                 ; pc 67
+block13:                ; pc 68
+    LOADI r0, #1400, i32 ; pc 68
+    RET                 ; pc 69
+block14:                ; pc 70
+    LOADI r0, #1500, i32 ; pc 70
+    RET                 ; pc 71
+block15:                ; pc 72
+    LOADI r0, #1600, i32 ; pc 72
+    RET                 ; pc 73
+block16:                ; pc 74
+    LOADI r0, #1700, i32 ; pc 74
+    RET                 ; pc 75
+block17:                ; pc 76
+    LOADI r0, #1800, i32 ; pc 76
+    RET                 ; pc 77
+block18:                ; pc 78
+    LOADI r0, #1900, i32 ; pc 78
+    RET                 ; pc 79
+block19:                ; pc 80
+    LOADI r0, #2000, i32 ; pc 80
+    RET                 ; pc 81

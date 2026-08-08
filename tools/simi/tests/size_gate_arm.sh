@@ -278,6 +278,29 @@
 # below its M0 baseline, and disabling the M2.38 union grows it back
 # to exactly 3060 (the table path, still correct) — the teeth prove
 # the nested composition dispatches through the same union machinery.
+# jmpr_chain17 is M2.41: the FLAT walk cap above 12. M2.25-M2.40 capped
+# the walk's FLAT set (TX_AR_CHAIN_MAX) at 12: a register-form product
+# whose set exceeded 12 DEFERRED (a record) and re-computed at the
+# dispatch. M2.41 raises the cap to 20, so a 13-20-value product stays
+# FLAT — and a flat set SURVIVES a write to one of its source
+# registers: chain_prewrite only flattens DEFERRED forms (a write to r2
+# leaves the flat set in r1's slot untouched), while a >12-value
+# deferred record was flattened to UNKNOWN by the same write (the eager
+# flatten caps at the walk bound). The raise needs two companions to
+# stay airtight: (a) a flat+flat head-union whose merged set exceeds 20
+# freezes as a PRE-MERGED union record (chain14/15's 30-value joins
+# must not regress), and (b) an in-place product over a FLAT source
+# whose image overflows freezes the aliased source as a CD_FLAT operand
+# (chain13's second product must not regress). The pin's product is
+# TWENTY values {42..80}: r1 = r2 + r3 (r2 in {2,12,22,32}, r3 in
+# {40,42,44,46,48}); the arm `BC r5, J` delivers it; then `LOADI r2,
+# #1` WRITES a source. Under the old 12-cap the product deferred and
+# the write flattened it to UNKNOWN (the table ran); under 20 it stays
+# flat, the write is a no-op for r1's slot, and the gate (164 < 368)
+# emits the 20-pair chain. The runtime index 32 + 48 = 80 takes the
+# chain's TWENTIETH b.eq (block19, LOADI #2000). 540 bytes below its
+# M0 baseline, and reverting the cap to 12 grows it back to exactly
+# 2516 (the table path, still correct) — the teeth.
 # jmpr_chain16 is M2.40: BEYOND the 32-cap. M2.30-M2.39 capped the BIG
 # candidate set — the walk's deferred-materialization set, the union
 # record's merged set, and the emitted chain — at 32; a dispatch whose
@@ -708,7 +731,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

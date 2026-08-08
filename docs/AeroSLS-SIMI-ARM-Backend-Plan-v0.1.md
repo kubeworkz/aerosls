@@ -3662,6 +3662,86 @@ One row added, zero moved:
   float/mem skips and the no-expected jmpr_oob are unchanged.
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.92 M2.41 — the flat walk cap above 12 (as built)
+
+M2.25-M2.40 capped the walk's FLAT set (TX_AR_CHAIN_MAX) at 12: a
+register-form product whose set exceeded 12 DEFERRED (a record) and
+re-computed at the dispatch. M2.41 raises the cap to 20, so a
+13-20-value product stays FLAT — and a flat set SURVIVES a write to
+one of its SOURCE registers: chain_prewrite only flattens DEFERRED
+forms (a write to r2 leaves the flat set in r1's slot untouched), while
+a >12-value deferred record was flattened to UNKNOWN by the same write
+(the eager flatten caps at the walk bound), killing the chain. The
+raise is not free — it needs two companions to stay airtight:
+
+- (a) **Flat+flat union fallback.** Raising the cap changes which sets
+  are flat vs deferred, and a flat+flat head-union whose merged set
+  exceeds the new cap has no representation (records only enter via
+  products). chain14/15's 30-value joins would have collapsed. The
+  fix generalizes chain_def_alloc_union so BOTH sides may be CD_FLAT:
+  the union record now PRE-MERGES its true set into its store at
+  creation — exact-or-conservative (record sides materialize over the
+  current cur[] — the carry record is live by construction, the
+  arrival record under chain_def_live; flat sides are frozen; later
+  head-unions only widen) — and materializing is a single store copy.
+  This actually SIMPLIFIES the flatten code (the UNION special cases
+  no longer resolve operands).
+- (b) **In-place-over-flat freeze.** chain13's second product (ADD
+  r1, r1, r4 over its 16-value union U) previously deferred because U
+  was a RECORD (the CD_REC indirection makes in-place sound). Under
+  the 20-cap U is FLAT, and an in-place product over a flat source
+  cannot reference a CD_SLOT (self-cycle) — it would collapse to
+  UNKNOWN and chain13 would regress. The fix freezes the aliased flat
+  source as a CD_FLAT operand (the set as it stands at the product
+  instruction — exactly the runtime value rd holds) in both the M2.32
+  deferred-source branch and the M2.30 overflow branch (the latter
+  snapshots the aliased slot before the image write clobbers it).
+
+Soundness is the M2.37 CD_FLAT story: frozen sets are immutable,
+immune to writes and unions (chain_def_touches/live ignore
+non-CDSLOT operands), and a product's materialization over a frozen
+source is exact because the runtime value is fixed at the instruction.
+The cap raise is emission-invisible for every pre-existing program —
+no 13-20-value flat set survives in the M2.40 corpus (chain13-16's
+products were designed around the record machinery and dispatch the
+same candidate sets) — so it is strictly additive.
+
+### 10.93 M2.41 gate results (measured)
+
+Total emitted bytes across the now-65-program parity set: **M0
+119232 → M1 100992, 18240 saved** (≈15.3%), up from M2.40's 17700.
+One row added, zero moved:
+
+- jmpr_chain17 2852 → 2312 (−540, new 65th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: r1 = r2 + r3 is TWENTY values
+  {42..80} (r2 in {2,12,22,32}, r3 in {40,42,44,46,48}); the arm
+  `BC r5, J` delivers it; then `LOADI r2, #1` WRITES a source. Under
+  the old 12-cap the product deferred and the write flattened it to
+  UNKNOWN (the table ran); under 20 it stays flat, the write is a
+  no-op for r1's slot, and the gate (164 < 368) emits the 20-pair
+  chain. Runtime `32 + 48 = 80` takes the chain's TWENTIETH b.eq
+  (dump-verified: 20 b.eq pairs, first → #100's block at offset
+  1412, twentieth → #2000's block at offset 2172, both byte-exact).
+  The chain vs table delta is exactly 368 − 164 = +204; the rest of
+  the 540 is the M1 allocator on the 82-instruction body.
+- Teeth: reverting the cap to 12 grows jmpr_chain17 back to exactly
+  2516 (the table path — the product defers and the write kills it,
+  still correct), proving the raised cap is what the chain dispatches
+  through.
+- Row-by-row accounting (gate tables diffed vs committed 32e33f8,
+  measured with the M2.40 verifier): **all 64 shared rows
+  byte-identical** — the cap raise, the freeze, and the flat+flat
+  fallback are emission-invisible for the whole M2.40 corpus
+  (chain13/14/15/16 keep their exact bytes), so M2.41 is strictly
+  additive.
+- Four-way parity: 260 PASS, 0 FAIL — all 65 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 20-candidate
+  flat chain executes at runtime on the ARM engine (PASS 2000,
+  runtime index 80 taking the twentieth b.eq), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
