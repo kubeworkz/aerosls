@@ -3388,6 +3388,87 @@ One row added, zero moved:
   float/mem skips and the no-expected jmpr_oob are unchanged.
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.84 M2.37 — the non-contained deferred-over-flat join (as built)
+
+M2.35/M2.36 made a deferred record survive a flat join only when the
+flat side was CONTAINED in the record's true set (then the union is
+exactly the record). A flat value outside the record's set — the
+flat arm carrying #70 against R1's `{26..54}` — still collapsed the
+union to UNKNOWN (the record's >12 values dominate the walk's flat
+bound), killing the chain. M2.37 closes that: when containment
+fails in EITHER orientation, the union is represented as a **UNION
+record** — a new record shape, `op(rec(R), flat(F))`, whose
+materialization MERGES the record's true set with the flat set,
+capped at TX_AR_CHAIN_BIG (32). The flat side is a new operand
+kind, CD_FLAT: the ≤12-value set is frozen out-of-line in
+`g_chain_def_flat[rec]` at creation and is immune to later writes
+and unions. The record side is a CD_REC reference to the existing
+record, so the DAG stays acyclic and the existing invalidation
+machinery needs no change: `chain_def_touches`/`chain_def_live`
+already recurse CD_REC and ignore unknown kinds, and `chain_prewrite`
+flattens the union like any other record when one of its transitively
+read slots is written.
+
+Soundness of the union record: its materialization at the dispatch
+merges `flatten(rec)` over the CURRENT cur[] with the frozen flat
+set. The caller gates make this exact-or-superset — in the carry
+orientation the record is live by construction (any write to its DAG
+flattened it out of cur[]), and in the arrival orientation the
+M2.36 liveness check (chain_def_live) is required before the union
+fires; head-unions can only widen the leaves (a sound superset), so
+the dispatch materialization can only grow, never lose, values. The
+eager cap-check in `chain_def_alloc_union` materializes the union
+at the head and refuses to create the record when the merged set
+exceeds 32 — exact-or-conservative, because a later head-union can
+only widen (a union that fits at the head provably fits at the
+dispatch; one that does not fit there can never fit later). Two
+scoping decisions keep it strictly additive: an EMPTY flat side
+still collapses (the M2.34 first-iteration behavior is unchanged),
+and `chain_deliver` is untouched (a mix of record and flat arrivals
+in the accumulator still collapses — the union fires only on the
+head-union's single flat side). The union composes: products over
+the union record defer with a CD_REC reference, and the flattened
+union merges transitively (a union record inside another union's
+record side is handled by the same flatten case).
+
+### 10.85 M2.37 gate results (measured)
+
+Total emitted bytes across the now-61-program parity set: **M0
+105576 → M1 89832, 15744 saved** (≈14.9%), up from M2.36's 15116.
+One row added, zero moved:
+
+- jmpr_chain13 3492 → 2864 (−628, new 61st row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: chain12's shape (index =
+  `(r2 + r3) + r4` over three joins) with the flat arm carrying #70
+  — OUTSIDE R1's 15-value set. The R-arm's `BC r5, J1` (NOT taken
+  at runtime, r5 = 0) delivers the deferred R1 forward; the
+  fall-through flat arm provides the flat carry {70}. Containment
+  fails in the M2.36 orientation, so the head creates the UNION
+  record U = R1 ∪ {70} (16 values), and the in-place second product
+  composes R2 = op(rec(U), slot(r4)) to the THIRTY-ONE candidates
+  `{26,28,...,54, 58,60,...,86, 102}` (56 is a gap — R1 starts at
+  26 — and 70 duplicates); runtime `70 + 32 = 102` takes the
+  chain's thirty-first b.eq (dump-verified: 31 b.eq pairs, first →
+  #100's block at offset 1316, thirty-first → #3200's block at
+  offset 2724, both byte-exact). The chain vs table delta is
+  exactly 456 − 252 = +204; the rest of the 628 is the M1
+  allocator on the 104-instruction body.
+- Teeth: disabling BOTH union fallbacks (the M2.35- and M2.36-
+  orientation heads) grows jmpr_chain13 back to exactly 3068 (the
+  table path, still correct) — proving the union record is what the
+  chain dispatches through, not an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed 13822f7,
+  measured with the M2.36 verifier): **all 60 shared rows
+  byte-identical** — no pre-existing program has a deferred record
+  meeting a non-contained flat set, so M2.37 is strictly additive.
+- Four-way parity: 244 PASS, 0 FAIL — all 61 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 31-candidate
+  union chain executes at runtime on the ARM engine (PASS 3200,
+  runtime index 102 taking the thirty-first b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
