@@ -4240,6 +4240,49 @@ M2.49 commit (a probe, not a change):
   no-expected jmpr_oob are unchanged (jmpr_oob still faults via UDF
   at pc=0x320, rc=1). enc-check clean.
 
+### 10.112 M2.51 — the unary collapse promoted to a committed pin (as built)
+
+A PROOF milestone with NO code change: the conservative side of the
+unary cap discipline — M2.50's ad-hoc teeth — is promoted into the
+corpus as jmpr_chain27, so the collapse is regression-guarded exactly
+like the exact side (chain24). The pin drives a SIXTY-FIVE-DISTINCT
+join source through NEG (r2 in {-150,-149,...,-86} -> 65 values
+{86..150}), which OVERFLOWS the image merge cap (64,
+TX_AR_CHAIN_MAX/TX_AR_CHAIN_BIG) inside chain_img_alu -> the image is
+UNKNOWN -> the chain dies -> the naive table dispatch runs. The test
+DISCRIMINATES truncation: a wrong analysis emitting a chain over only
+the first 64 candidates {86..149} would miss the runtime index 150,
+miss every b.eq and UDF-trap — only the conservative collapse passes.
+
+### 10.113 M2.51 gate results (measured)
+
+Total emitted bytes across the now-75-program parity set: **M0 151040
+→ M1 126436, 24604 saved** (≈16.3%), up from M2.50's 23988. One row
+added, zero moved — simi_arm.c is BYTE-IDENTICAL to the M2.50 commit
+(a promotion, not a change):
+
+- jmpr_chain27 4500 → 3884 (−616, new 75th row; M0 baseline measured
+  at git 1729f50) — the conservative-collapse pin: 152 instructions
+  (65 join paths + NEG + JMPR + 17 filler + block0), runtime
+  -(-150) = 150 landing on block0 at pc 150 -> LOADI #777 -> PASS 777
+  on all four engines through the table's bounds check.
+  Dump-verified: 0 b.eq and the full 10-word table dispatch (movz
+  x11, #152 = num_instr, subs/cset/cbz bounds check, li32 base,
+  add-shift ldr, br x11, UDF). The row is a dynamic-JMPR program
+  (g_alloc = 0), so the 616-byte M0→M1 delta is the accumulated
+  emission folds, not the chain.
+- Row-by-row accounting (gate tables diffed vs committed 64bd805):
+  **all 74 shared rows byte-identical** and simi_arm.c untouched —
+  strictly additive.
+- Four-way parity: 300 PASS, 0 FAIL — all 75 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the collapse-pin table path
+  executes at runtime on the ARM engine (PASS 777 through the bounds
+  check), and the documented float/mem skips and the no-expected
+  jmpr_oob are unchanged (jmpr_oob still faults via UDF at
+  pc=0x320, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted

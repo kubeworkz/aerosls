@@ -297,6 +297,22 @@
 # makes build2's image UNKNOWN — the chain dies (0 b.eq, table) and the
 # runtime index 80 + 96 = 176 lands on block17 -> 1800 on all four
 # engines — tracked vs opaque writer on the feeder, same position.
+# jmpr_chain27 is M2.51: the CONSERVATIVE side of the unary cap
+# discipline, promoted from M2.50's ad-hoc teeth into a committed pin
+# — a PROOF milestone with no code change. chain24 pinned the EXACT
+# side (ten-value NEG source -> ten candidates -> chain); this pin
+# regression-guards the collapse: a SIXTY-FIVE-DISTINCT join source
+# through NEG maps to 65 values, which OVERFLOWS the image merge cap
+# (64) inside chain_img_alu -> UNKNOWN -> the chain dies -> the naive
+# table runs. The index is r1 = -r2 over a 65-way join (r2 in
+# {-150..-86}); runtime -(-150) = 150 lands on block0 at pc 150 ->
+# 777 on all four engines through the table's bounds check.
+# Dump-verified: 0 b.eq, the full 10-word table (movz #152,
+# subs/cset/cbz, li32 base, add-shift ldr, br, UDF). The pin
+# DISCRIMINATES truncation: a wrong chain over only the first 64
+# candidates {86..149} would miss runtime 150 and UDF-trap — only
+# the conservative collapse passes. 616 bytes below its M0 baseline
+# (a dynamic-JMPR program, so the savings are the emission folds).
 # jmpr_chain26 is M2.50: the NOT-built index, IN RANGE — a PROOF
 # milestone with no code change (the multi-value unary mapping was
 # already there — chain24 pinned a ten-value NEG source; the
@@ -900,7 +916,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
