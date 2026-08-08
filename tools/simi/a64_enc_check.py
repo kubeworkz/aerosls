@@ -37,7 +37,10 @@ there to be found.
 
 Usage: a64_enc_check.py <dump file> <simi program name>
 The dump file is the output of a64_dump.c; the program name selects the
-expected value set (straight_line_bench | loop_sum | extra_ops).
+expected value set (straight_line_bench | loop_sum | extra_ops |
+float_ops — F2 added float_ops, whose expected constants are Python's
+own IEEE-754 bit patterns, so the float encoders are cross-checked
+against an independent source too).
 """
 
 import sys
@@ -114,6 +117,32 @@ def br(rn):                 return 0xD61F0000 | (rn << 5)
 def blr(rn):                return 0xD63F0000 | (rn << 5)
 def bcond(cond, imm19):     return 0x54000000 | (cond << 12) | ((imm19 & 0x7FFFF) << 5)
 
+# ── F2: scalar floating point (SIMI Phase 10, verified vs QEMU's ────────
+# a64.decode in F0 — see the scalar-FP section of a64_exec.c for the
+# patterns and the canonical S/D constants).
+#   3-same FADD/FSUB/FMUL/FDIV: 0001 1110 0 sz 1 Rm <opc6> Rn Rd — bit 22
+#     = sz (0 = S, 1 = D); opc6 FMUL 000010 / FDIV 000110 / FADD 001010 /
+#     FSUB 001110.
+#   FCMP: 0001 1110 0 sz 1 Rm 001000 Rn 0 0 000 — register form, quiet
+#     (e=0, z=0), no Rd (writes NZCV).
+#   FMOV general: sf 0011110 <type> 1 <opc5> 000000 Rn Rd — type 00 = S /
+#     01 = D; opc5 00110 = FP→GP (Xd,Dn / Wd,Sn), 00111 = GP→FP (Dd,Xn /
+#     Sd,Wn). The S-form GP→FP zeroes the high 32 bits (bits_of_f32).
+def fadd_d(rd, rn, rm):  return 0x1E600000 | (rm << 16) | (0x0A << 10) | (rn << 5) | rd
+def fadd_s(rd, rn, rm):  return 0x1E200000 | (rm << 16) | (0x0A << 10) | (rn << 5) | rd
+def fsub_d(rd, rn, rm):  return 0x1E600000 | (rm << 16) | (0x0E << 10) | (rn << 5) | rd
+def fsub_s(rd, rn, rm):  return 0x1E200000 | (rm << 16) | (0x0E << 10) | (rn << 5) | rd
+def fmul_d(rd, rn, rm):  return 0x1E600000 | (rm << 16) | (0x02 << 10) | (rn << 5) | rd
+def fmul_s(rd, rn, rm):  return 0x1E200000 | (rm << 16) | (0x02 << 10) | (rn << 5) | rd
+def fdiv_d(rd, rn, rm):  return 0x1E600000 | (rm << 16) | (0x06 << 10) | (rn << 5) | rd
+def fdiv_s(rd, rn, rm):  return 0x1E200000 | (rm << 16) | (0x06 << 10) | (rn << 5) | rd
+def fcmp_d(rn, rm):      return 0x1E600000 | (rm << 16) | (0x08 << 10) | (rn << 5)
+def fcmp_s(rn, rm):      return 0x1E200000 | (rm << 16) | (0x08 << 10) | (rn << 5)
+def fmov_xd(rd, rn):     return 0x9E660000 | (rn << 5) | rd   # FMOV Xd, Dn  — FP → GP, 64-bit
+def fmov_dx(rd, rn):     return 0x9E670000 | (rn << 5) | rd   # FMOV Dd, Xn  — GP → FP, 64-bit
+def fmov_ws(rd, rn):     return 0x1E260000 | (rn << 5) | rd   # FMOV Wd, Sn  — FP → GP, 32-bit
+def fmov_sw(rd, rn):     return 0x1E270000 | (rn << 5) | rd   # FMOV Sd, Wn  — GP → FP, 32-bit
+
 def li64(rd, imm):
     words = [movz(rd, imm & 0xFFFF)]
     for hw in (1, 2, 3):
@@ -170,6 +199,28 @@ def decode(w):
     # CSINC Xd, XZR, XZR, !cond: bits 31:16 = 0x9A9F, bits 11:5 =
     # 0x7E0 (op@11:10=01, Rn@9:5=31) — cond@15:12 and Rd@4:0 are free.
     if is_masked(w, 0xFFFF07E0, 0x9A9F07E0): return ("cset", (w >> 12) & 0xF, rd(w))
+    # ── F2: scalar FP (F1's simi_arm.c emission). 3-same: 0001 1110 0 sz 1
+    # Rm <opc6> Rn Rd — mask 0xFFE0FC00 pins bits 31:21 (sf + the 0011110
+    # family + sz@22 + the mandatory 1@21) and opc6@15:10; Rm/Rn/Rd are
+    # free. FCMP is the opc6=001000 member with e@4=0, z@3=0 and bits
+    # 2:0 = 000, so it pins bits 4:0 too (mask 0xFFE0FC1F). FMOV general:
+    # sf 0011110 <type> 1 <opc5> 000000 Rn Rd — mask 0xFFF0FC00 pins bits
+    # 31:16 (sf/type/opc5) and the 000000@15:10; opc5 00110 = FP→GP,
+    # 00111 = GP→FP.
+    if is_masked(w, 0xFFE0FC00, 0x1E602800): return ("fadd_d", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E202800): return ("fadd_s", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E603800): return ("fsub_d", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E203800): return ("fsub_s", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E600800): return ("fmul_d", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E200800): return ("fmul_s", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E601800): return ("fdiv_d", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC00, 0x1E201800): return ("fdiv_s", rm(w), rn(w), rd(w))
+    if is_masked(w, 0xFFE0FC1F, 0x1E602000): return ("fcmp_d", rm(w), rn(w))
+    if is_masked(w, 0xFFE0FC1F, 0x1E202000): return ("fcmp_s", rm(w), rn(w))
+    if is_masked(w, 0xFFF0FC00, 0x9E660000): return ("fmov_xd", rn(w), rd(w))
+    if is_masked(w, 0xFFF0FC00, 0x9E670000): return ("fmov_dx", rn(w), rd(w))
+    if is_masked(w, 0xFFF0FC00, 0x1E260000): return ("fmov_ws", rn(w), rd(w))
+    if is_masked(w, 0xFFF0FC00, 0x1E270000): return ("fmov_sw", rn(w), rd(w))
     if (w & 0xFFC00000) == 0xF9400000: return ("ldr", imm12(w), rn(w), rd(w))
     if (w & 0xFFC00000) == 0xF9000000: return ("str", imm12(w), rn(w), rd(w))
     if (w & 0xFFC00000) == 0x39400000: return ("ldrb", imm12(w), rn(w), rd(w))
@@ -234,9 +285,12 @@ ALLOWED = {"movz", "movk", "add_imm", "sub_imm", "subs_imm", "add_shift",
            "ldurb", "sturb", "ldurh", "sturh", "ldur_w", "stur_w",
            "ldursb", "ldursh", "ldursw",
            "ldr_reg", "str_reg", "ldrb_reg", "strb_reg", "ldrh_reg",
-           "strh_reg", "ldr_w_reg", "str_w_reg", "ldrsb_reg",
-           "ldrsh_reg", "ldrsw_reg",
-           "br", "blr", "b", "bl", "cbz", "cbnz", "bcond"}
+           "strh_reg", "ldr_w_reg", "str_w_reg",           "ldrsb_reg", "ldrsh_reg", "ldrsw_reg",
+           "br", "blr", "b", "bl", "cbz", "cbnz", "bcond",
+           # F2: scalar FP classes simi_arm.c may emit (F1 codegen).
+           "fadd_d", "fadd_s", "fsub_d", "fsub_s", "fmul_d", "fmul_s",
+           "fdiv_d", "fdiv_s", "fcmp_d", "fcmp_s",
+           "fmov_xd", "fmov_dx", "fmov_ws", "fmov_sw"}
 
 # Register numbers used by simi_arm.c
 T0, T1, T2, SP, FP, LR, XZR = 9, 10, 11, 31, 29, 30, 31
@@ -312,7 +366,17 @@ def li64_chains(dump):
     starts with movz hw=0 and stays on one destination register. Runs that
     don't start with hw=0 movz are skipped (the trampoline's 2 li64s are
     in the dump too, but their values are host addresses — they are
-    excluded by the register filter below only in the caller)."""
+    excluded by the register filter below only in the caller).
+
+    F2 fix: emit_li64 SKIPS ZERO HIGH HALVES (movz already zeroed the
+    register), so the movk halves of a chain are strictly increasing, NOT
+    contiguous. The pre-F2 corpus only ever exercised contiguous chains
+    (low-half constants like 1/2/10, or full-width values like -8 whose
+    halves are all nonzero), so the old `h2 == (j - i)` requirement was
+    never tripped; float_ops's f64 literals (e.g. 3.5 = 0x400C0000000000
+    with only hw2/hw3 nonzero) are the first constants with skipped
+    halves, and the old check silently reconstructed the wrong value.
+    Accept any strictly-increasing movk half now."""
     i = 0
     n = len(dump)
     while i < n:
@@ -325,14 +389,16 @@ def li64_chains(dump):
         cls, hw, imm16, rd_ = dec
         if cls == "movz" and hw == 0:
             val = imm16
+            last_hw = 0
             j = i + 1
             while j < n:
                 dec2 = decode(dump[j])
                 if dec2 is None or len(dec2) != 4:
                     break
                 c2, h2, i2, r2 = dec2
-                if c2 == "movk" and r2 == rd_ and h2 == (j - i):
+                if c2 == "movk" and r2 == rd_ and h2 > last_hw:
                     val |= i2 << (16 * h2)
+                    last_hw = h2
                     j += 1
                 else:
                     break
@@ -426,6 +492,25 @@ def main():
         # LOADIs r0=17, r1=5, r8=-8; plus immediates 2 and 1 materialized
         # for SHL/SHR/SAR register shifts.
         expected_values = [17, 5, 0xFFFFFFFFFFFFFFF8, 2, 1]
+        ok &= body_checks(dump, expected_values, "body")
+    elif prog == "float_ops":
+        # F2 (SIMI Phase 10): the float literals, derived INDEPENDENTLY
+        # from Python's IEEE-754 handling (never transcribed from
+        # simi_arm.c). f64 literals are the full 64-bit pattern; f32
+        # literals are the raw 32-bit pattern zero-extended to 64 bits
+        # (the assembler's parse_float_imm stores (uint64_t)c.u, and the
+        # translator's li64 then loads that exact 64-bit value). Plus the
+        # NaN, which float_ops loads as a plain i64 literal.
+        import struct
+        def f64bits(x): return struct.unpack('<Q', struct.pack('<d', x))[0]
+        def f32bits(x): return struct.unpack('<I', struct.pack('<f', x))[0]
+        expected_values = [
+            f64bits(3.5), f64bits(2.0), f64bits(5.5), f64bits(1.5),
+            f64bits(7.0), f64bits(1.75), f64bits(-3.5),
+            f32bits(3.5), f32bits(2.0), f32bits(5.5), f32bits(1.5),
+            f32bits(7.0), f32bits(1.75), f32bits(-3.5),
+            0x7FF8000000000000,
+        ]
         ok &= body_checks(dump, expected_values, "body")
     else:
         print("unknown program %s" % prog)

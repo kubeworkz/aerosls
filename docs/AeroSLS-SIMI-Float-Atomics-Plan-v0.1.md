@@ -119,9 +119,9 @@ cache for a pure constant).
   bounce per D4), float `CMP` per D5. Gate: `float_ops.simi` PASS on the ARM
   engine; new size-gate row (naive baseline — see §3.2); the 77 existing rows
   byte-identical (float codegen is additive — no integer path changes).
-- **F2** — the fold/allocator interaction: confirm the integer corpus's byte
-  identity holds (D6's scoping means the chain machinery is untouched), and add
-  `a64_enc_check.py` rows for the new encoders.
+- **F2 — LANDED** — the fold/allocator interaction: confirm the integer
+  corpus's byte identity holds (D6's scoping means the chain machinery is
+  untouched), and add `a64_enc_check.py` rows for the new encoders.
 - **F3** — unskip `float_ops` on ARM: four-way parity (interp / x86 / RV64-skip /
   ARM), enc-check clean, gate re-measure, doc §16 Phase 10 addendum (A64 landed).
 - **F4 (deferred, rides Phase 9)** — RV64 float codegen per Phase 10 D6 (the
@@ -215,6 +215,51 @@ A64. The evidence, all measured:
   un-skip is F3's milestone — plus the standing cap_forge_debug/jmpr_oob/
   mem_ops skips), interp 79/79, x86 native 78/78, RV64 77/77, `a64-f0-test`
   still PASS.
+
+### 3.3 F2 status — LANDED (a64_enc_check.py float rows + a real finding)
+
+F2 is done: the independent transcription net now covers the float
+encoders, and it found a genuine latent bug in its own constant walker.
+The evidence, all measured:
+
+- **The float rows** — `a64_enc_check.py` gains the scalar-FP families
+  exactly as verified in F0: the 3-same FADD/FSUB/FMUL/FDIV d+s (mask
+  0xFFE0FC00 pins sf+family+sz+the mandatory 1@21 and opc6; Rm/Rn/Rd
+  free), FCMP d+s (opc6=001000 with e@4=0, z@3=0 and 000@2:0 pinned),
+  and the four FMOV-general forms (0xFFF0FC00 pins sf/type/opc5 and the
+  000000@15:10). All 14 go into `ALLOWED`; `main()` gains a `float_ops`
+  branch whose 15 expected constants are derived INDEPENDENTLY from
+  Python's own IEEE-754 (`struct.pack`), never transcribed from
+  simi_arm.c — the f64 literals as full 64-bit patterns, the f32
+  literals as the raw 32-bit pattern zero-extended to 64 (the
+  assembler's `(uint64_t)c.u` storage), plus the NaN loaded as i64.
+- **The real finding — the checker's own latent bug.** The M0-era
+  `li64_chains` assumed a constant chain's movk halves are CONTIGUOUS
+  (`h2 == j - i`). That held for every pre-F2 corpus constant (low-half
+  values like 1/2/10, or full-width values like -8 whose halves are all
+  nonzero) — but `emit_li64` actually SKIPS ZERO HIGH HALVES (movz
+  already zeroed the register), so float_ops's f64 literals (e.g.
+  3.5 = 0x400C000000000000, whose only nonzero halves are hw2/hw3)
+  silently reconstructed the wrong value. The float_ops row tripped it
+  on the first run (8 of 15 constants "missing"); the f32 values were
+  found only because their chains are contiguous. Fixed: accept any
+  strictly-increasing movk half, matching emit_li64's real emission.
+  This is exactly the error class the net exists for — and the fix is
+  in the CHECKER, not the translator (simi_arm.c was never wrong here).
+- **The teeth (ad hoc)** — (b) replacing one emitted FP word with a
+  non-instruction fails decode (MISMATCH body: 1 word, `00000000 ->
+  None`); (c) flipping one movk half inside an f64 chain so the chain
+  still DECODES but encodes the wrong value is caught by the constant
+  check (`missing 0x400c000000000000` = 3.5). The net has teeth on both
+  the class side and the value side for the float encoders.
+- **The gate** — `make a64-enc-check`: all four programs green (16 OK
+  rows: trampoline/prologue/body-structure/body-constants each),
+  including float_ops's 539-word body with all 15 constants. The integer
+  rows are byte-identical (the checker change is additive: new decode
+  classes + the li64_chains fix, which provably changes nothing for
+  contiguous chains). Size gate byte-identical (78/78, 26404 saved —
+  simi_arm.c untouched), ARM suite 77/77, interp 79/79, x86 native
+  78/78, RV64 77/77, `a64-f0-test` PASS, float_ops on ARM = 15 at 2156.
 
 ## 4. Honest verification caveats
 
