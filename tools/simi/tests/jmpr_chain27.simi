@@ -1,0 +1,179 @@
+; jmpr_chain27.simi — M2.51: the conservative side of the UNARY cap
+; discipline, promoted from M2.50's ad-hoc teeth into a committed pin.
+; M2.48's chain24 pinned the EXACT side (a ten-value NEG source maps to
+; ten candidates and chains); this pin regression-guards the collapse:
+; a SIXTY-FIVE-DISTINCT join source through NEG maps to 65 distinct
+; values, which OVERFLOWS the image merge cap (64, TX_AR_CHAIN_MAX /
+; TX_AR_CHAIN_BIG) inside chain_img_alu -> the image is UNKNOWN -> the
+; chain dies -> the naive table dispatch runs. The index is r1 = -r2
+; over a 65-way join (r2 in {-150,-149,...,-86} -> 65 values {86..150});
+; runtime -(-150) = 150 lands on block0 at pc 150 -> LOADI #777 -> PASS
+; 777 on all four engines, through the table's bounds check. The test
+; DISCRIMINATES truncation: a wrong analysis that emitted a chain over
+; only the first 64 candidates {86..149} would miss runtime 150, miss
+; every b.eq and UDF-trap (rc=1) — only the conservative UNKNOWN ->
+; table path passes. Dump-verified: 0 b.eq, the full 10-word table
+; dispatch (movz num_instr, subs/cset/cbz, li32 base, add-shift ldr,
+; br, UDF), 152 instructions.
+; Expected result: 777
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #-149, i64 ; pc 2 — branch-path base (-149) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:-149} at J2)
+    LOADI r2, #-148, i64 ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:-148} at J2)
+    LOADI r2, #-147, i64 ; pc 6
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:-147} at J2)
+    LOADI r2, #-146, i64 ; pc 8
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:-146} at J2)
+    LOADI r2, #-145, i64 ; pc 10
+    BC r0, J2           ; pc 11 — falls through (delivers {r2:-145} at J2)
+    LOADI r2, #-144, i64 ; pc 12
+    BC r0, J2           ; pc 13 — falls through (delivers {r2:-144} at J2)
+    LOADI r2, #-143, i64 ; pc 14
+    BC r0, J2           ; pc 15 — falls through (delivers {r2:-143} at J2)
+    LOADI r2, #-142, i64 ; pc 16
+    BC r0, J2           ; pc 17 — falls through (delivers {r2:-142} at J2)
+    LOADI r2, #-141, i64 ; pc 18
+    BC r0, J2           ; pc 19 — falls through (delivers {r2:-141} at J2)
+    LOADI r2, #-140, i64 ; pc 20
+    BC r0, J2           ; pc 21 — falls through (delivers {r2:-140} at J2)
+    LOADI r2, #-139, i64 ; pc 22
+    BC r0, J2           ; pc 23 — falls through (delivers {r2:-139} at J2)
+    LOADI r2, #-138, i64 ; pc 24
+    BC r0, J2           ; pc 25 — falls through (delivers {r2:-138} at J2)
+    LOADI r2, #-137, i64 ; pc 26
+    BC r0, J2           ; pc 27 — falls through (delivers {r2:-137} at J2)
+    LOADI r2, #-136, i64 ; pc 28
+    BC r0, J2           ; pc 29 — falls through (delivers {r2:-136} at J2)
+    LOADI r2, #-135, i64 ; pc 30
+    BC r0, J2           ; pc 31 — falls through (delivers {r2:-135} at J2)
+    LOADI r2, #-134, i64 ; pc 32
+    BC r0, J2           ; pc 33 — falls through (delivers {r2:-134} at J2)
+    LOADI r2, #-133, i64 ; pc 34
+    BC r0, J2           ; pc 35 — falls through (delivers {r2:-133} at J2)
+    LOADI r2, #-132, i64 ; pc 36
+    BC r0, J2           ; pc 37 — falls through (delivers {r2:-132} at J2)
+    LOADI r2, #-131, i64 ; pc 38
+    BC r0, J2           ; pc 39 — falls through (delivers {r2:-131} at J2)
+    LOADI r2, #-130, i64 ; pc 40
+    BC r0, J2           ; pc 41 — falls through (delivers {r2:-130} at J2)
+    LOADI r2, #-129, i64 ; pc 42
+    BC r0, J2           ; pc 43 — falls through (delivers {r2:-129} at J2)
+    LOADI r2, #-128, i64 ; pc 44
+    BC r0, J2           ; pc 45 — falls through (delivers {r2:-128} at J2)
+    LOADI r2, #-127, i64 ; pc 46
+    BC r0, J2           ; pc 47 — falls through (delivers {r2:-127} at J2)
+    LOADI r2, #-126, i64 ; pc 48
+    BC r0, J2           ; pc 49 — falls through (delivers {r2:-126} at J2)
+    LOADI r2, #-125, i64 ; pc 50
+    BC r0, J2           ; pc 51 — falls through (delivers {r2:-125} at J2)
+    LOADI r2, #-124, i64 ; pc 52
+    BC r0, J2           ; pc 53 — falls through (delivers {r2:-124} at J2)
+    LOADI r2, #-123, i64 ; pc 54
+    BC r0, J2           ; pc 55 — falls through (delivers {r2:-123} at J2)
+    LOADI r2, #-122, i64 ; pc 56
+    BC r0, J2           ; pc 57 — falls through (delivers {r2:-122} at J2)
+    LOADI r2, #-121, i64 ; pc 58
+    BC r0, J2           ; pc 59 — falls through (delivers {r2:-121} at J2)
+    LOADI r2, #-120, i64 ; pc 60
+    BC r0, J2           ; pc 61 — falls through (delivers {r2:-120} at J2)
+    LOADI r2, #-119, i64 ; pc 62
+    BC r0, J2           ; pc 63 — falls through (delivers {r2:-119} at J2)
+    LOADI r2, #-118, i64 ; pc 64
+    BC r0, J2           ; pc 65 — falls through (delivers {r2:-118} at J2)
+    LOADI r2, #-117, i64 ; pc 66
+    BC r0, J2           ; pc 67 — falls through (delivers {r2:-117} at J2)
+    LOADI r2, #-116, i64 ; pc 68
+    BC r0, J2           ; pc 69 — falls through (delivers {r2:-116} at J2)
+    LOADI r2, #-115, i64 ; pc 70
+    BC r0, J2           ; pc 71 — falls through (delivers {r2:-115} at J2)
+    LOADI r2, #-114, i64 ; pc 72
+    BC r0, J2           ; pc 73 — falls through (delivers {r2:-114} at J2)
+    LOADI r2, #-113, i64 ; pc 74
+    BC r0, J2           ; pc 75 — falls through (delivers {r2:-113} at J2)
+    LOADI r2, #-112, i64 ; pc 76
+    BC r0, J2           ; pc 77 — falls through (delivers {r2:-112} at J2)
+    LOADI r2, #-111, i64 ; pc 78
+    BC r0, J2           ; pc 79 — falls through (delivers {r2:-111} at J2)
+    LOADI r2, #-110, i64 ; pc 80
+    BC r0, J2           ; pc 81 — falls through (delivers {r2:-110} at J2)
+    LOADI r2, #-109, i64 ; pc 82
+    BC r0, J2           ; pc 83 — falls through (delivers {r2:-109} at J2)
+    LOADI r2, #-108, i64 ; pc 84
+    BC r0, J2           ; pc 85 — falls through (delivers {r2:-108} at J2)
+    LOADI r2, #-107, i64 ; pc 86
+    BC r0, J2           ; pc 87 — falls through (delivers {r2:-107} at J2)
+    LOADI r2, #-106, i64 ; pc 88
+    BC r0, J2           ; pc 89 — falls through (delivers {r2:-106} at J2)
+    LOADI r2, #-105, i64 ; pc 90
+    BC r0, J2           ; pc 91 — falls through (delivers {r2:-105} at J2)
+    LOADI r2, #-104, i64 ; pc 92
+    BC r0, J2           ; pc 93 — falls through (delivers {r2:-104} at J2)
+    LOADI r2, #-103, i64 ; pc 94
+    BC r0, J2           ; pc 95 — falls through (delivers {r2:-103} at J2)
+    LOADI r2, #-102, i64 ; pc 96
+    BC r0, J2           ; pc 97 — falls through (delivers {r2:-102} at J2)
+    LOADI r2, #-101, i64 ; pc 98
+    BC r0, J2           ; pc 99 — falls through (delivers {r2:-101} at J2)
+    LOADI r2, #-100, i64 ; pc 100
+    BC r0, J2           ; pc 101 — falls through (delivers {r2:-100} at J2)
+    LOADI r2, #-99, i64  ; pc 102
+    BC r0, J2           ; pc 103 — falls through (delivers {r2:-99} at J2)
+    LOADI r2, #-98, i64  ; pc 104
+    BC r0, J2           ; pc 105 — falls through (delivers {r2:-98} at J2)
+    LOADI r2, #-97, i64  ; pc 106
+    BC r0, J2           ; pc 107 — falls through (delivers {r2:-97} at J2)
+    LOADI r2, #-96, i64  ; pc 108
+    BC r0, J2           ; pc 109 — falls through (delivers {r2:-96} at J2)
+    LOADI r2, #-95, i64  ; pc 110
+    BC r0, J2           ; pc 111 — falls through (delivers {r2:-95} at J2)
+    LOADI r2, #-94, i64  ; pc 112
+    BC r0, J2           ; pc 113 — falls through (delivers {r2:-94} at J2)
+    LOADI r2, #-93, i64  ; pc 114
+    BC r0, J2           ; pc 115 — falls through (delivers {r2:-93} at J2)
+    LOADI r2, #-92, i64  ; pc 116
+    BC r0, J2           ; pc 117 — falls through (delivers {r2:-92} at J2)
+    LOADI r2, #-91, i64  ; pc 118
+    BC r0, J2           ; pc 119 — falls through (delivers {r2:-91} at J2)
+    LOADI r2, #-90, i64  ; pc 120
+    BC r0, J2           ; pc 121 — falls through (delivers {r2:-90} at J2)
+    LOADI r2, #-89, i64  ; pc 122
+    BC r0, J2           ; pc 123 — falls through (delivers {r2:-89} at J2)
+    LOADI r2, #-88, i64  ; pc 124
+    BC r0, J2           ; pc 125 — falls through (delivers {r2:-88} at J2)
+    LOADI r2, #-87, i64  ; pc 126
+    BC r0, J2           ; pc 127 — falls through (delivers {r2:-87} at J2)
+    LOADI r2, #-86, i64  ; pc 128
+    BC r0, J2           ; pc 129 — falls through (delivers {r2:-86} at J2)
+    LOADI r2, #-150, i64 ; pc 130 — fall-through base (-150) — the runtime
+                        ; value: every BC falls through, so r2 is -150 at J2.
+J2:                     ; (label) — join: r2 in {-150,-149,...,-86} (65
+                        ; DISTINCT values)
+    NEG r1, r2, i64     ; pc 131 — the index build: r1 = -r2 = 65 distinct
+                        ; values {86..150} — OVERFLOWS the image merge cap
+                        ; (64) -> chain_img_alu returns UNKNOWN -> the
+                        ; chain dies conservatively.
+    JMPR r1             ; pc 132 — runtime -(-150) = 150.
+    LOADI r0, #0, i32   ; pc 133 — dead filler (aligns block0 to pc 150)
+    LOADI r0, #0, i32   ; pc 134
+    LOADI r0, #0, i32   ; pc 135
+    LOADI r0, #0, i32   ; pc 136
+    LOADI r0, #0, i32   ; pc 137
+    LOADI r0, #0, i32   ; pc 138
+    LOADI r0, #0, i32   ; pc 139
+    LOADI r0, #0, i32   ; pc 140
+    LOADI r0, #0, i32   ; pc 141
+    LOADI r0, #0, i32   ; pc 142
+    LOADI r0, #0, i32   ; pc 143
+    LOADI r0, #0, i32   ; pc 144
+    LOADI r0, #0, i32   ; pc 145
+    LOADI r0, #0, i32   ; pc 146
+    LOADI r0, #0, i32   ; pc 147
+    LOADI r0, #0, i32   ; pc 148
+    LOADI r0, #0, i32   ; pc 149
+block0:                 ; pc 150
+    LOADI r0, #777, i32 ; pc 150
+    RET                 ; pc 151
