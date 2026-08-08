@@ -1,0 +1,131 @@
+; jmpr_chain25.simi — M2.49: the register-form shift PRODUCT image — a
+; PROOF milestone with no code change. M2.47 verified the shift image
+; with a SINGLETON amount (SHL r1, r2, r5 with LOADI r5, #1); this pin
+; exercises the full product form: the amount register r5 carries a
+; MULTI-VALUE set, so the image is the pair product { a << (b & 0x3F) :
+; a in S(a), b in S(b) } (chain_img_alu's register path, exact until
+; the merge cap). The pin's sets: r2 in {10,11,12} and r5 in {2,3,66}
+; — where 66 & 0x3F = 2, so the amount 66 is MASKED to 2 exactly as
+; the hardware (lslv), the interpreter and ar_const_step do. The nine
+; pairs collapse to SIX distinct candidates {40,44,48,80,88,96}: the
+; product is exact AND the masking is applied (an unmasked analysis
+; would compute 12 << 66 out-of-range and emit a bare UDF — trapping
+; the runtime index 48; a masked one chains it). The gate (52 < 40 +
+; 4*98 = 432) emits the 6-pair chain. The runtime index 12 << (66 &
+; 0x3F) = 12 << 2 = 48 takes the b.eq for 48, landing on block2's LOADI
+; #300. Candidates are real pcs (blocks at 40,44,48,80,88,96). The
+; teeth: an OVER-CAP product (12 x 12 = 144 pairs) overflows the merge
+; cap and collapses to UNKNOWN — the table runs, still correct — the
+; exact-or-conservative cap discipline verified ad hoc.
+; Expected result: 300
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #10, i64  ; pc 2 — branch-path base (10) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:10} at J2)
+    LOADI r2, #11, i64  ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:11} at J2)
+    LOADI r2, #12, i64  ; pc 6 — fall-through base (12)
+J2:                     ; (label) — join: r2 in {10, 11, 12}
+    LOADI r5, #2, i64   ; pc 7 — branch-path base (2) — dead at runtime
+    BC r0, J5           ; pc 8 — falls through (delivers {r5:2} at J5)
+    LOADI r5, #3, i64   ; pc 9
+    BC r0, J5           ; pc 10 — falls through (delivers {r5:3} at J5)
+    LOADI r5, #66, i64  ; pc 11 — fall-through base (66)
+J5:                     ; (label) — join: r5 in {2, 3, 66}
+    SHL r1, r2, r5, i64 ; pc 12 — the index build: r1 = r2 << r5 = the
+                        ; PRODUCT {10,11,12} x {2,3,66} = SIX values
+                        ; {40,44,48,80,88,96} — 66 masked to 2.
+    JMPR r1             ; pc 13 — candidates {40,44,48,80,88,96}, runtime
+                        ; 12 << (66 & 0x3F) = 48.
+    LOADI r0, #0, i32   ; pc 14 — dead filler (aligns block0 to pc 40)
+    LOADI r0, #0, i32   ; pc 15
+    LOADI r0, #0, i32   ; pc 16
+    LOADI r0, #0, i32   ; pc 17
+    LOADI r0, #0, i32   ; pc 18
+    LOADI r0, #0, i32   ; pc 19
+    LOADI r0, #0, i32   ; pc 20
+    LOADI r0, #0, i32   ; pc 21
+    LOADI r0, #0, i32   ; pc 22
+    LOADI r0, #0, i32   ; pc 23
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+block0:                 ; pc 40
+    LOADI r0, #100, i32 ; pc 40
+    RET                 ; pc 41
+    LOADI r0, #0, i32   ; pc 42 — filler (block1 at pc 44)
+    LOADI r0, #0, i32   ; pc 43
+block1:                 ; pc 44
+    LOADI r0, #200, i32 ; pc 44
+    RET                 ; pc 45
+    LOADI r0, #0, i32   ; pc 46 — filler (block2 at pc 48)
+    LOADI r0, #0, i32   ; pc 47
+block2:                 ; pc 48
+    LOADI r0, #300, i32 ; pc 48
+    RET                 ; pc 49
+    LOADI r0, #0, i32   ; pc 50 — filler (block3 at pc 80)
+    LOADI r0, #0, i32   ; pc 51
+    LOADI r0, #0, i32   ; pc 52
+    LOADI r0, #0, i32   ; pc 53
+    LOADI r0, #0, i32   ; pc 54
+    LOADI r0, #0, i32   ; pc 55
+    LOADI r0, #0, i32   ; pc 56
+    LOADI r0, #0, i32   ; pc 57
+    LOADI r0, #0, i32   ; pc 58
+    LOADI r0, #0, i32   ; pc 59
+    LOADI r0, #0, i32   ; pc 60
+    LOADI r0, #0, i32   ; pc 61
+    LOADI r0, #0, i32   ; pc 62
+    LOADI r0, #0, i32   ; pc 63
+    LOADI r0, #0, i32   ; pc 64
+    LOADI r0, #0, i32   ; pc 65
+    LOADI r0, #0, i32   ; pc 66
+    LOADI r0, #0, i32   ; pc 67
+    LOADI r0, #0, i32   ; pc 68
+    LOADI r0, #0, i32   ; pc 69
+    LOADI r0, #0, i32   ; pc 70
+    LOADI r0, #0, i32   ; pc 71
+    LOADI r0, #0, i32   ; pc 72
+    LOADI r0, #0, i32   ; pc 73
+    LOADI r0, #0, i32   ; pc 74
+    LOADI r0, #0, i32   ; pc 75
+    LOADI r0, #0, i32   ; pc 76
+    LOADI r0, #0, i32   ; pc 77
+    LOADI r0, #0, i32   ; pc 78
+    LOADI r0, #0, i32   ; pc 79
+block3:                 ; pc 80
+    LOADI r0, #400, i32 ; pc 80
+    RET                 ; pc 81
+    LOADI r0, #0, i32   ; pc 82 — filler (block4 at pc 88)
+    LOADI r0, #0, i32   ; pc 83
+    LOADI r0, #0, i32   ; pc 84
+    LOADI r0, #0, i32   ; pc 85
+    LOADI r0, #0, i32   ; pc 86
+    LOADI r0, #0, i32   ; pc 87
+block4:                 ; pc 88
+    LOADI r0, #500, i32 ; pc 88
+    RET                 ; pc 89
+    LOADI r0, #0, i32   ; pc 90 — filler (block5 at pc 96)
+    LOADI r0, #0, i32   ; pc 91
+    LOADI r0, #0, i32   ; pc 92
+    LOADI r0, #0, i32   ; pc 93
+    LOADI r0, #0, i32   ; pc 94
+    LOADI r0, #0, i32   ; pc 95
+block5:                 ; pc 96
+    LOADI r0, #600, i32 ; pc 96
+    RET                 ; pc 97
