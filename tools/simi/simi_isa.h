@@ -43,6 +43,22 @@ typedef enum {
                    * trap/kill rather than transfer control on an out-of-range
                    * value -- a non-negotiable CFI requirement, not optional
                    * hardening (see AeroSLS-SIMI-ISA-v0.1.md §16 Phase 14). */
+    /* ---- Gap Remediation SIMI Phase 15: shared-memory atomics ----
+     * The two primitives lock-free queues, reference counts, and cross-CPU
+     * coordination all compose from (see AeroSLS-SIMI-Float-Atomics-Plan-
+     * v0.1.md Part II). Both are FMT_RRR, both read and write the 4/8-byte
+     * cell at address rA (T_I32/T_I64 and unsigned views in v1; the 28-bit
+     * rB/imm field is register-only -- FLAG_IMM is rejected), and both write
+     * the returned OLD value into rD (the x86 cmpxchg/xadd operand shape,
+     * which A64/RV64/x86 all map onto cleanly). Ordering is SC in v1; the
+     * three free flags bits (1-3) stay reserved for a future acquire/
+     * release extension -- no ordering flag exists yet. */
+    OP_CAS,       /* rD = [rA]; if (rD == rB) [rA] = rD_in; -- rD is BOTH the
+                   * new value (input) and the returned old value (output),
+                   * the cmpxchg operand shape: `CAS rD, rA, rB, TYPE` */
+    OP_ATOMIC_ADD,/* rD = [rA]; [rA] = rD + rB; -- fetch-and-add: returns the
+                   * old value (composable for ticket locks), adds rB into
+                   * the cell: `ATOMIC_ADD rD, rA, rB, TYPE` */
     OP_COUNT
 } SimiOpcode;
 
@@ -160,6 +176,8 @@ static const SimiOpInfo SIMI_OPS[OP_COUNT] = {
     [OP_OBJSIZE] = {"OBJSIZE", FMT_RR},
     [OP_OBJTYPE] = {"OBJTYPE", FMT_RR},
     [OP_JMPR]    = {"JMPR",    FMT_JMPR},
+    [OP_CAS]         = {"CAS",         FMT_RRR},
+    [OP_ATOMIC_ADD]  = {"ATOMIC_ADD",  FMT_RRR},
 };
 
 static const char *SIMI_TYPE_NAMES[T_COUNT] = {

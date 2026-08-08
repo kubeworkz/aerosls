@@ -1,0 +1,49 @@
+; cas_simple.simi — Gap Remediation SIMI Phase 15 (shared-memory atomics):
+; the CAS success, failure, and returned-old cases, self-checked and summed
+; like float_ops.simi. The address comes from r7 (the Phase 3 trampoline's
+; scratch-pointer convention) via LEA, so this runs on the interpreter
+; (r7 = 0, valid in its simulated memory) AND on every native translator
+; (r7 = the baked scratch pointer) — the same base-address trick
+; mem_ops_native.simi uses.
+;
+; CAS semantics (plan doc Part II D1): rD is BOTH the new value (input)
+; and the returned OLD value (output). old = [rA]; if (old == rB) [rA] =
+; rD_in; rD = old. Five checks, all-pass total = 5.
+; Expected result: 5
+.entry main
+main:
+    ENTER #8
+    LEA r6, r7, #0             ; r6 = base address (scratch area)
+
+    ; ── Success: cell = 100, expected 100 -> new 200 ──────────────────
+    LOADI r1, #100, i64
+    STORE r1, r6, #0, i64      ; [base] = 100
+    LOADI r2, #200, i64        ; r2 = new value (rD input)
+    LOADI r3, #100, i64        ; r3 = expected (rB)
+    CAS r2, r6, r3, i64        ; old=100 == 100 -> [base]=200; r2 = 100
+    CMP r10, r2, r3, i64, EQ   ; chk1: returned old == 100
+    LOAD r4, r6, #0, i64
+    LOADI r5, #200, i64
+    CMP r11, r4, r5, i64, EQ   ; chk2: cell is now 200
+
+    ; ── Failure: cell = 200, expected 100 (wrong) -> no store ─────────
+    LOADI r2, #300, i64        ; r2 = new value (would be written)
+    LOADI r3, #100, i64        ; r3 = expected (WRONG: cell holds 200)
+    CAS r2, r6, r3, i64        ; old=200 != 100 -> no store; r2 = 200
+    CMP r12, r2, r4, i64, EQ   ; chk3: returned old == 200 (the cell's value)
+    LOAD r4, r6, #0, i64
+    LOADI r5, #200, i64
+    CMP r13, r4, r5, i64, EQ   ; chk4: cell UNCHANGED at 200
+
+    ; ── Returned-old on a second success: cell = 200, expected 200 ────
+    LOADI r2, #500, i64        ; r2 = new value
+    LOADI r3, #200, i64        ; r3 = expected (matches the cell)
+    CAS r2, r6, r3, i64        ; old=200 == 200 -> [base]=500; r2 = 200
+    CMP r14, r2, r3, i64, EQ   ; chk5: returned old == 200
+
+    ; ── Sum all five checks (i32) ─────────────────────────────────────
+    ADD r0, r10, r11, i32
+    ADD r0, r0, r12, i32
+    ADD r0, r0, r13, i32
+    ADD r0, r0, r14, i32
+    RET

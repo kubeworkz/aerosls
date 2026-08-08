@@ -26,6 +26,15 @@ for src in *.simi; do
         skip=$((skip+1))
         continue
     fi
+    # Phase 15 (shared-memory atomics) A0: CAS/ATOMIC_ADD landed in the
+    # ISA + interpreter; the x86 translator gets them at A1 (lock
+    # cmpxchg/xadd). Until then the translator's BAD_OPCODE rejection is
+    # exactly what a FAIL would look like, so skip like float_ops did.
+    if [ "$name" = "cas_simple" ] || [ "$name" = "atomic_add" ]; then
+        echo "SKIP  $name (Phase 15 atomics: interpreter-only until A1; see plan doc Part II §7)"
+        skip=$((skip+1))
+        continue
+    fi
 
     expected=$(grep -oE 'Expected result: -?[0-9]+' "$src" | grep -oE -- '-?[0-9]+$')
     if [ -z "$expected" ]; then

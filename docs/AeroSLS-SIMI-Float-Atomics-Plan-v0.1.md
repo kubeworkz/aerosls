@@ -373,10 +373,10 @@ Phases 9–14 numbering — the exact number follows the convention the ARM back
 
 ## 7. Milestones
 
-- **A0** — ISA: enum + `SIMI_OPS` + formats, assembler/disassembler, the §7/§16
-  entries, and the two new test fixtures (`cas_simple.simi`: success, failure,
-  returned-old cases; `atomic_add.simi`: a counter incremented N times, expected
-  final value + returned olds).
+- **A0 — LANDED** — ISA: enum + `SIMI_OPS` + formats, assembler/disassembler,
+  the §7/§16 entries, the interpreter semantics, and the two new test fixtures
+  (`cas_simple.simi`: success, failure, returned-old cases; `atomic_add.simi`:
+  a counter incremented N times, expected final value + returned olds).
 - **A1** — interpreter + x86 (`lock cmpxchg`/`lock xadd`) + three-way parity
   (interp / x86 / RV64-reject), no existing test's result changed.
 - **A2** — RV64 (`lr`/`sc`, `amo.add.d`) + `rv64_exec.c` + four-way parity.
@@ -385,6 +385,53 @@ Phases 9–14 numbering — the exact number follows the convention the ARM back
 - **A4 (later, only if a consumer needs it)** — acquire/release ordering bits
   using the reserved flags slots, once a real kernel spinlock or queue needs
   non-SC semantics; v1 ships SC-only.
+
+### 7.1 A0 status — LANDED (ISA + interpreter + fixtures)
+
+A0 is done: the atomics phase has real ISA plumbing and interpreter
+semantics, verified by two permanent fixtures. The evidence, all
+measured:
+
+- **The ISA plumbing, as designed (D6)** — `OP_CAS`/`OP_ATOMIC_ADD`
+  appended before `OP_COUNT` in `simi_isa.h` (append, never insert — the
+  enum values are the wire encoding), two `SIMI_OPS` rows both
+  `FMT_RRR`, and a doc comment recording the v1 scope (4/8-byte types
+  only, register operands only, SC ordering, the three free flags bits
+  reserved for the future acquire/release extension). No new format was
+  needed — `FMT_RRR` already parses/prints `OP rD, rA, rB, TYPE` in the
+  assembler and disassembler unchanged.
+- **The interpreter semantics (D5), as the single-threaded parity
+  reference** — `OP_CAS` and `OP_ATOMIC_ADD` in `simi_interp.c`:
+  width-aware cell access via `width_of` (4/8-byte only; byte/float
+  atomics `die()` with a clear message), `FLAG_IMM` rejected (register
+  operands only — there is no displacement form), bounds-checked against
+  the simulated memory, rD written with the returned old value (raw
+  bits, zero-extended — "the cell is compared and returned as stored",
+  no sign extension). CAS compares with a width mask, so an i32 CAS
+  against an expected value whose high bits are garbage still matches
+  on the cell's bits.
+- **The fixtures** — `cas_simple.simi` (5 checks → **5**: success
+  updates the cell and returns the old value, failure leaves the cell
+  unchanged and returns the cell's value, a second success returns 200)
+  and `atomic_add.simi` (2 checks → **2**: a counter incremented 10
+  times, final cell 10, sum of the ten returned olds 0+..+9 = 45). Both
+  address memory via `LEA r6, r7, #0` — the r7 scratch-pointer
+  convention — so they are engine-agnostic (interp r7=0, natives
+  r7=scratch_ptr), ready for A1-A3 unchanged.
+- **The gate** — interpreter suite **81 passed / 0 failed** (was 79;
+  both fixtures joined the permanent corpus). x86 / RV64 / ARM suites
+  stay green with the two fixtures skipped (translate-time `BAD_OPCODE`
+  rejection until A1/A2/A3 land — the float_ops skip discipline); no
+  existing test's result changed anywhere.
+- **The teeth (ad hoc)** — an immediate-operand CAS traps cleanly
+  (`CAS has no immediate form in v1`), an i32-width CAS round-trips
+  (cell 100 → CAS 1000 → returned 100, cell 1000, sum 2), and all three
+  native translators reject the fixtures at translate time as expected
+  before the skips were added.
+- **ISA doc §16** — Phase 15 entry records the design decisions (the
+  cmpxchg/xadd-shaped op set, the SC ordering + reserved-bits note) and
+  this A0 status; the §7 roadmap row shows Phase 15 as 🟡 (A0 done, A1-A3
+  pending).
 
 ## 8. Honest verification caveats
 

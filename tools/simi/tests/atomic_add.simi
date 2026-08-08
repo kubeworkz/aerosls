@@ -1,0 +1,35 @@
+; atomic_add.simi — Gap Remediation SIMI Phase 15 (shared-memory atomics):
+; ATOMIC_ADD fetch-and-add over a counter. rD is the returned OLD value
+; (composable: ticket locks use it directly, counters add rB to it). The
+; counter lives at the r7-derived scratch address (interp r7=0, natives
+; r7=scratch_ptr), incremented 10 times by 1. Final cell must be 10, and
+; the sum of the ten returned olds must be 0+1+..+9 = 45 — together these
+; prove every increment both stored and returned the right value.
+; Two checks, all-pass total = 2.
+; Expected result: 2
+.entry main
+main:
+    ENTER #8
+    LEA r6, r7, #0             ; r6 = base address (scratch area)
+
+    LOADI r1, #0, i64
+    STORE r1, r6, #0, i64      ; counter = 0
+    LOADI r2, #1, i64          ; increment amount
+    LOADI r3, #0, i64          ; sum of returned olds
+    LOADI r4, #0, i64          ; loop index
+    LOADI r5, #10, i64         ; loop limit
+loop:
+    CMP r8, r4, r5, i64, GE    ; i >= 10 -> done
+    BC r8, done
+    ATOMIC_ADD r9, r6, r2, i64 ; r9 = old counter; counter += 1
+    ADD r3, r3, r9, i64        ; sum += returned old
+    ADD r4, r4, r2, i64        ; i++
+    BR loop
+done:
+    LOAD r10, r6, #0, i64      ; final counter
+    LOADI r11, #10, i64
+    CMP r12, r10, r11, i64, EQ ; chk1: final counter == 10
+    LOADI r11, #45, i64
+    CMP r13, r3, r11, i64, EQ  ; chk2: sum of returned olds == 45
+    ADD r0, r12, r13, i32
+    RET
