@@ -471,6 +471,29 @@ static int ar_is_result_op(uint8_t op) {
         return 0;
     }
 }
+/* M2.17: the dead-region intermediates (T+2/T+3) of an epi-merge shape
+ * may be ANY plain result-op whose emission is "reserve + transient
+ * fetches + compute + store" — the merge invariants depend only on the
+ * CLAIM COUNT (two fresh claims between the terminal and the tail net
+ * +3 ≡ 0 mod 3, so the tail's result host stays the pre-T cursor value
+ * cnt%3) and on the destinations being distinct and not the pattern's
+ * sources; NOT on what computes the values. So a COMPUTED fold index —
+ * an arithmetic chain in the dead region (M2.1-style constant folding
+ * makes it fold), or a CMP/LEA/PTRADD result — merges exactly like a
+ * LOADI did. Excluded: OP_CALL (no plain claim; clobbers the call-site
+ * scratch) and OP_LOAD (its address math's clobber_scratch paths and
+ * the M2.8-M2.10 folds aren't covered by the invariant argument). */
+static int ar_is_interm_op(uint8_t op) {
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+    case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR:
+    case OP_SAR: case OP_NOT: case OP_NEG: case OP_MOV: case OP_LOADI:
+    case OP_LOADI64: case OP_CMP: case OP_LEA: case OP_PTRADD:
+        return 1;
+    default:
+        return 0;
+    }
+}
 /* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
  * continuation pcs of a maximal straight-line run of LOAD/STORE that share
  * ONE displacement past the imm12 range — the displacement is materialized
@@ -1777,21 +1800,26 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
      * between the head and the fold, so the analysis must know them
      * statically. The layout is rigid: the head block is exactly
      * [ALU-2src pattern @ T][terminal @ T+1]; then exactly two
-     * result-only instructions (LOADI/LOADI64 — no operand fetches, so
-     * the cache holds exactly the two fresh residents) at T+2/T+3; then
-     * the tail [ALU-2src @ T+4] reading the SAME guests in the SAME
-     * order as the pattern; then the fold [JMPR @ T+5] back to T. The
-     * tail's reserve pick (its result host slot v) is the cache
-     * round-robin cursor slot, because the two LOADIs occupy cursor+1
-     * and cursor+2; the fetches go to x9 (g1) and x10 (g2), so g1's
-     * value survives iff v != 0 and g2's iff v != 1 — the drop flags.
-     * The cursor at the tail is (result-instruction count mod 3), which
-     * equals the count WITHOUT simulation only when no reserve reuses a
-     * resident slot; the pre-T result registers must therefore be
-     * pairwise distinct (the directory only ever holds result registers,
-     * so a register never before written as a result cannot be resident).
-     * Gated on g_alloc like every fold: the naive JMPR path stays
-     * byte-identical to M0. */
+     * result-only plain instructions at T+2/T+3 (M2.17: any
+     * ar_is_interm_op — LOADI/LOADI64 as before, or a COMPUTED result
+     * like an arithmetic chain — the invariants below depend only on
+     * the claim count, not on what computes the values; their operand
+     * fetches are transient and the tail's fetches re-establish the
+     * transient state); then the tail [ALU-2src @ T+4] reading the
+     * SAME guests in the SAME order as the pattern; then the fold
+     * [JMPR @ T+5] back to T. The tail's reserve pick (its result
+     * host slot v) is the cache round-robin cursor slot, because the
+     * pattern's claim plus the two intermediates' claims net +3 ≡ 0
+     * mod 3 — the two intermediates occupy cursor+1 and cursor+2; the
+     * fetches go to x9 (g1) and x10 (g2), so g1's value survives iff
+     * v != 0 and g2's iff v != 1 — the drop flags. The cursor at the
+     * tail is (result-instruction count mod 3), which equals the count
+     * WITHOUT simulation only when no reserve reuses a resident slot;
+     * the pre-T result registers must therefore be pairwise distinct
+     * (the directory only ever holds result registers, so a register
+     * never before written as a result cannot be resident). Gated on
+     * g_alloc like every fold: the naive JMPR path stays byte-identical
+     * to M0. */
     for (uint32_t q = 0; q < 4096; q++) g_epi_merge[q] = 0;
     if (g_alloc) {
         for (uint32_t T = 1; T + 5 < hdr.num_instr; T++) {
@@ -1817,13 +1845,14 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             if (!ar_is_alu2(w_op(instrs[T])) || (w_flags(instrs[T]) & FLAG_IMM)) continue;
             uint16_t a1 = w_ra(instrs[T]), b1 = w_rb_reg(instrs[T]);
             if (!(w_op(instrs[T + 1]) == OP_RET || w_op(instrs[T + 1]) == OP_BR)) continue;
-            if (!(w_op(instrs[T + 2]) == OP_LOADI || w_op(instrs[T + 2]) == OP_LOADI64)) continue;
-            if (!(w_op(instrs[T + 3]) == OP_LOADI || w_op(instrs[T + 3]) == OP_LOADI64)) continue;
+            if (!ar_is_interm_op(w_op(instrs[T + 2]))) continue;  /* M2.17: computed results allowed */
+            if (!ar_is_interm_op(w_op(instrs[T + 3]))) continue;
             if (!ar_is_alu2(w_op(instrs[T + 4])) || (w_flags(instrs[T + 4]) & FLAG_IMM)) continue;
             if (w_ra(instrs[T + 4]) != a1 || w_rb_reg(instrs[T + 4]) != b1) continue;
-            /* the two dead-region LOADIs' destinations must be distinct and
-             * not the pattern's sources (the tail's fetches are then real
-             * reloads, misses against a cache holding exactly those two). */
+            /* the two dead-region intermediates' destinations must be
+             * distinct and not the pattern's sources (the tail's fetches
+             * are then real reloads, misses against a cache holding
+             * exactly those two). */
             uint16_t d1 = w_rd(instrs[T + 2]), d2 = w_rd(instrs[T + 3]);
             if (d1 == d2 || d1 == a1 || d1 == b1 || d2 == a1 || d2 == b1) continue;
             /* the pre-T result registers must be pairwise distinct (no

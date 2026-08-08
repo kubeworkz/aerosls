@@ -1,0 +1,46 @@
+; epi_merge5.simi — M2.17 follow-up: the COMPUTED fold index in the
+; flags=2 cursor class. Same single-edge backward fold as epi_merge2
+; (three live results r2/r1/r6 → result-count mod 3 = 0 → the tail's
+; result lands in x9, clobbering the r2 transient, so the head KEEPS
+; the r2 reload and DROPS the r1 fetch — flags=2), but the fold index
+; is COMPUTED by an arithmetic chain instead of a plain LOADI: the
+; seed LOADI r4, #2 (pc 7, the fold source / BR target) then
+; ADD r5, r4, #3 (pc 8) computes r5 = 2 + 3 = 5 — the M2.1 constant
+; analysis folds it (the chain is entirely inside the dead region,
+; after the BR-target reset at pc 7), so the JMPR at pc 10 folds
+; BACKWARD to T = 5. The M2.17 widening lets T+3 be any plain
+; result-op (ar_is_interm_op); this is the second cursor class with a
+; computed intermediate (epi_merge4 pinned flags=3).
+;
+; A STRUCTURAL CEILING, recorded here rather than fought: BOTH
+; intermediates cannot be computed. T+2 is necessarily the fold-source
+; BR target — a block head where the fold fixpoint resets every
+; constant — so a computed T+2 has no known source, its result cannot
+; fold, and the JMPR goes dynamic (g_alloc dies, the whole function
+; emits the naive path). The seed at T+2 must be a LOADI; at most one
+; dead-region intermediate can be computed. probe_2c.simi was the
+; scratch proof; see the plan doc §10.44.
+;
+; The head's pattern writes r0 = r2 + r1, so the expected result (7)
+; flows THROUGH the dropped reads: the three interpreter engines
+; compute it from the SIMI semantics, and the ARM engine executes the
+; emitted code — a wrong drop (say a cursor error yielding flags=3 or
+; flags=1) makes the ARM result differ and the four-way parity fails
+; on its own. Disabling the merge grows the file by exactly 4 bytes
+; (the one kept fetch) — the teeth.
+; Expected result: 7 (r0 = r2 + r1 = 3 + 4)
+.entry main
+main:
+    ENTER #8
+    LOADI r2, #3, i64        ; pc 1 — the pattern's first source (r2 = 3)
+    LOADI r1, #4, i64        ; pc 2 — the pattern's second source (r1 = 4)
+    LOADI r6, #9, i64        ; pc 3 — third live result (cnt = 3 → c = 0 → flags = 2)
+    BR src                   ; pc 4 — T-1: terminal, jumps INTO the fold source
+target:                      ; pc 5 = T — reached only via the fold at pc 10
+    ADD r0, r2, r1, i64      ; pc 5 — the pattern: reads r2, r1 — r0 = 7
+    RET                      ; pc 6 — returns r0 = 3 + 4 = 7
+src:                         ; pc 7 — the fold source (the BR target)
+    LOADI r4, #2, i64        ; pc 7 — T+2: the seed (fresh claim, r4 = 2)
+    ADD r5, r4, #3, i64      ; pc 8 — T+3: COMPUTED — r5 = 2 + 3 = 5 (the fold index)
+    ADD r9, r2, r1, i64      ; pc 9 — the tail: reads r2, r1 (same pattern)
+    JMPR r5                  ; pc 10 — r5 = 5 — folds to pc 5 — the single incoming edge

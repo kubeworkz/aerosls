@@ -182,7 +182,44 @@
 # r1 and computes 10 instead of 7 — the four-way parity fails on its
 # own, pinning the flags formula's third branch — 148 bytes below its
 # M0 baseline, and disabling the merge grows it back to exactly 1036
-# (the one kept fetch, 4 bytes), still correct. jmpr_cross is
+# (the one kept fetch, 4 bytes), still correct. epi_merge4 is
+# M2.17: the epi-merge dead region with a COMPUTED fold index — the
+# §10.37 emission-order constraint relaxed. The M2.15 pass required
+# both dead-region intermediates to be LOADI/LOADI64; M2.17 widens
+# them to any plain result-op (ar_is_interm_op) because the merge
+# invariants depend only on the CLAIM COUNT (two fresh claims net +3
+# ≡ 0 mod 3, so the tail's result host stays cnt%3) and the
+# destinations being distinct and not the pattern's sources — NOT on
+# what computes the values. Here LOADI r4 (seed) then ADD r5, r4, #3
+# computes the fold index r5 = 4 (the M2.1 constant analysis folds
+# the chain, which sits entirely inside the dead region after the
+# BR-target reset at T+2), the JMPR folds BACKWARD to T, and the
+# tail's fetches evict the intermediate results (standard clobber)
+# before establishing the r2/r1 transients — flags = 3, both head
+# fetches drop, 144 bytes below its M0 baseline. The teeth: reverting
+# T+3 to LOADI-only rejects the shape (the merge does not fire, the
+# head reloads both sources) — measured at exactly 1012, +8, still
+# correct. A post-hoc fixup could not have done this: an emitted ldr
+# word cannot be un-emitted, so the generalization stays a pre-pass
+# decision (plan doc §10.42). epi_merge5 is
+# M2.17-follow-up: the COMPUTED fold index in the flags=2 cursor
+# class — the epi_merge2 mirror (three live results r2/r1/r6 → count
+# mod 3 = 0 → the tail's result lands in x9, clobbering the r2
+# transient, so the head keeps its r2 reload and drops ONLY the r1
+# fetch), but with the fold index COMPUTED by an arithmetic chain
+# (seed LOADI r4, #2 then ADD r5, r4, #3 → r5 = 5 = T) instead of a
+# plain LOADI — the M2.17 widening at work in a second cursor class,
+# closing the §10.43 flags=1/2-with-computed pin. It also records a
+# STRUCTURAL CEILING: both intermediates cannot be computed, because
+# T+2 is necessarily the fold-source BR target — a block head where
+# the fold fixpoint resets every constant — so a computed T+2 has no
+# known source, the JMPR goes dynamic, and g_alloc dies (probe_2c
+# proved it: the whole function emits the naive path). The seed at
+# T+2 must be a LOADI; at most one dead-region intermediate can be
+# computed (plan doc §10.44). 148 bytes below its M0 baseline, and
+# disabling the merge grows it back to exactly 1024 (the one kept
+# fetch, 4 bytes) — the exact mirror of epi_merge2's teeth, still
+# correct. jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -254,7 +291,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
-    [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180
+    [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
