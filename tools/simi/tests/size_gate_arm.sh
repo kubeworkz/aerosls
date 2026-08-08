@@ -99,6 +99,20 @@
 # (block9, LOADI #1000), proving the full walk dispatches. 268 bytes
 # below its M0 baseline, and forcing the old cap of 8 grows it back to
 # exactly 1664 (the table path, still correct) — the teeth.
+# jmpr_chain6 is
+# M2.30: the DEFERRED pair product. Its dispatch index is r1 = r2 + r3
+# over a 3-way join ({0,2,4}) and a 5-way join ({20,30,40,50,60}), so
+# the candidate set has FIFTEEN in-range values {20,22,...,64} — beyond
+# the walk's flat cap of 12. M2.25-M2.29 collapsed such a product to
+# UNKNOWN at the 13th merge and kept the table; M2.30 DEFERS it: the
+# walk records the op + the two source slots, and the dispatch
+# re-computes the product into the BIG candidate set (cap 32) over the
+# provably-unchanged sources (every write or union of a source flattens
+# the deferred form eagerly), so the emission gate (8*n + 4 < 40 +
+# 4*num_instr — here 124 < 304) can emit the 15-pair chain. The runtime
+# index 4 + 60 = 64 takes the chain's FIFTEENTH b.eq (block14, LOADI
+# #1500). 452 bytes below its M0 baseline, and disabling deferral grows
+# it back to exactly 2188 (the table path, still correct) — the teeth.
 # jmpr_calc is M2.1: its index is COMPUTED at translate
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
@@ -511,7 +525,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

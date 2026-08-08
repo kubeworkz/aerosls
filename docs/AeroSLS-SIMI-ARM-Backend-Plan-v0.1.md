@@ -2954,6 +2954,76 @@ added, zero moved:
   fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
   rc=1).
 
+### 10.70 M2.30 — the deferred pair product (as built)
+
+M2.29's adaptive gate could emit a 13-32-candidate chain, but the walk
+itself capped flat sets at 12 — a pair product that exceeded it
+collapsed to UNKNOWN at the 13th merge and kept the table. M2.30 lets
+the walk DEFER an oversized register-form product:
+
+- **The deferred form.** A register-form ADD/SUB/MUL/AND/OR/XOR whose
+  image overflowed the flat cap is recorded in the walk state as
+  (op, source-slot-a, source-slot-b) instead of UNKNOWN. The dispatch
+  then re-computes the product into a BIG candidate set (cap 32) and
+  the M2.29 gate decides. The imm form can never overflow (one source),
+  and rd == ra/rb is refused (a self-referencing deferred form could
+  not be materialized).
+- **Soundness — the invalidation discipline.** A deferred product's
+  value is fixed at its instruction, so its sources must be untouched:
+  every WRITE of a source slot, every head-UNION, and every DELIVERY
+  flattens (and caps) any deferred form reading it eagerly — over the
+  pre-write/pre-union source values. The dispatch materialization
+  therefore sees exactly the sources the product saw. Every merge
+  output and every constructor is flat by construction (def = 0), so
+  a deferred form can never leak into an accumulator.
+- **jmpr_chain6, the pin.** The index is r1 = r2 + r3 over a 3-way
+  join ({0,2,4}) and a 5-way join ({20,30,40,50,60}) — FIFTEEN
+  distinct in-range candidates {20,22,...,64} on the 66-instruction
+  program, beyond the flat cap of 12. The walk defers; the dispatch
+  materializes all 15; the gate (124 < 304) emits the 15-pair chain;
+  the runtime index 4 + 60 = 64 takes the chain's FIFTEENTH b.eq
+  (block14, LOADI #1500).
+- **A latent decoder bug the pin exposed.** The M2.25-era B.cond
+  decode in a64_exec.c read the cond field from bits 15:12 instead of
+  3:0 — grabbing imm19's top nibble. Every M2.25-M2.29 chain stayed
+  under the 512-byte b.eq offset threshold where the misread nibble is
+  zero, so EQ decoded correctly by luck; jmpr_chain6's 15-pair chain
+  pushed the later offsets past it and the branches silently became NE
+  (the runtime index fell through to the wrong block). The fix is one
+  line (cond = w & 0xF); the airtight diff proves all prior rows
+  byte-identical, and the enc-check's bcond class check was unaffected
+  (it masks only the top byte).
+- **Unchanged emission.** The M2.29 cost gate and the chain shape are
+  untouched — only the walk's set representation grew, and the teeth
+  (deferral disabled) grows jmpr_chain6 back to exactly 2188 (the
+  table path, still correct).
+
+### 10.71 M2.30 gate results (measured)
+
+Total emitted bytes across the now-54-program parity set: **M0 83868
+→ M1 71976, 11892 saved** (≈14.2%), up from M2.29's 11440. One row
+added, zero moved:
+
+- jmpr_chain6 2460 → 2008 (−452, new 54th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The teeth (deferral
+  disabled) grows it back to exactly 2188 (the table path, still
+  correct; the +180 delta is exactly the 66-entry table + 10-word
+  dispatch minus the 15-pair chain).
+- Row-by-row accounting (gate tables diffed vs committed 5298fcd,
+  measured with the M2.29 verifier): **all 53 shared rows
+  byte-identical** — M2.30 is strictly additive; no pre-existing
+  program's product exceeds 12, so nothing else moved, and the B.cond
+  fix is byte-invisible on every prior row (their offsets were all
+  under the 512-byte threshold).
+- Four-way parity: 216 PASS, 0 FAIL — all 54 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 15-candidate
+  chain executes at runtime on the ARM engine (PASS 1500), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean (the canonical make a64-enc-check, a
+  fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
+  rc=1).
+
 ---
 
 ## Sources consulted
