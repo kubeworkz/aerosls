@@ -255,6 +255,37 @@ static uint32_t enc_udiv(uint8_t rd, uint8_t rn, uint8_t rm) {
 static uint32_t enc_cset(uint8_t rd, uint8_t cond) {
     return 0x9A9F07E0u | ((uint32_t)(cond ^ 1) << 12) | rd;
 }
+/* ─── F1 (Gap Remediation SIMI Phase 10): scalar floating point —──────
+ * Every word verified against QEMU's a64.decode in F0 (see the
+ * scalar-FP section of a64_exec.c for the patterns and the canonical
+ * S/D constants):
+ *   3-same FADD/FSUB/FMUL/FDIV: 0001 1110 0 sz 1 Rm <opc6> Rn Rd,
+ *     bit 22 = sz (0 = S, 1 = D), opc6 FMUL 000010 FDIV 000110
+ *     FADD 001010 FSUB 001110.
+ *   FCMP: 0001 1110 0 sz 1 Rm 001000 Rn 0 0 000 (register form,
+ *     quiet — e=0, z=0).
+ *   FMOV general: sf 0011110 <type> 1 <opc5> 000000 Rn Rd, type 00 =
+ *     S / 01 = D, opc5 00110 = FP→GP (Xd,Dn / Wd,Sn), 00111 = GP→FP
+ *     (Dd,Xn / Sd,Wn).
+ * The F1 codegen (GP-bounce per plan D4) uses d0/d1 as pure compute
+ * scratch and moves bits through the x9/x10/x11 integer cache, so
+ * these are the ONLY FP encoders the integer-allocation machinery
+ * needs to know about — LOAD/STORE under float types already reuse
+ * the integer encoders (D3: rt is a plain register number). */
+static uint32_t enc_fadd_d(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E600000u | ((uint32_t)rm << 16) | (0x0Au << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fadd_s(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E200000u | ((uint32_t)rm << 16) | (0x0Au << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fsub_d(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E600000u | ((uint32_t)rm << 16) | (0x0Eu << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fsub_s(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E200000u | ((uint32_t)rm << 16) | (0x0Eu << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fmul_d(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E600000u | ((uint32_t)rm << 16) | (0x02u << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fmul_s(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E200000u | ((uint32_t)rm << 16) | (0x02u << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fdiv_d(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E600000u | ((uint32_t)rm << 16) | (0x06u << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fdiv_s(uint8_t rd, uint8_t rn, uint8_t rm) { return 0x1E200000u | ((uint32_t)rm << 16) | (0x06u << 10) | ((uint32_t)rn << 5) | rd; }
+static uint32_t enc_fcmp_d(uint8_t rn, uint8_t rm) { return 0x1E600000u | ((uint32_t)rm << 16) | (0x08u << 10) | ((uint32_t)rn << 5); }
+static uint32_t enc_fcmp_s(uint8_t rn, uint8_t rm) { return 0x1E200000u | ((uint32_t)rm << 16) | (0x08u << 10) | ((uint32_t)rn << 5); }
+static uint32_t enc_fmov_xd(uint8_t rd, uint8_t rn) { return 0x9E660000u | ((uint32_t)rn << 5) | rd; }   /* FMOV Xd, Dn  — FP → GP, 64-bit */
+static uint32_t enc_fmov_dx(uint8_t rd, uint8_t rn) { return 0x9E670000u | ((uint32_t)rn << 5) | rd; }   /* FMOV Dd, Xn  — GP → FP, 64-bit */
+static uint32_t enc_fmov_ws(uint8_t rd, uint8_t rn) { return 0x1E260000u | ((uint32_t)rn << 5) | rd; }   /* FMOV Wd, Sn  — FP → GP, 32-bit (zero-extend) */
+static uint32_t enc_fmov_sw(uint8_t rd, uint8_t rn) { return 0x1E270000u | ((uint32_t)rn << 5) | rd; }   /* FMOV Sd, Wn  — GP → FP, 32-bit (zero high half) */
 /* Load/store register, unsigned scaled immediate: size:2 111 0 01 opc imm12. */
 static uint32_t enc_ldr (uint8_t rt, uint8_t rn, uint16_t imm12) { return 0xF9400000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_str (uint8_t rt, uint8_t rn, uint16_t imm12) { return 0xF9000000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
@@ -1776,15 +1807,22 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
          op==OP_OR||op==OP_XOR||op==OP_SHL||op==OP_SHR||op==OP_SAR||op==OP_CMP||
          op==OP_PTRADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_AR_MAX_REGS)
         return TX_AR_ERR_REG_OUT_OF_RANGE;
-    /* Gap Remediation SIMI Phase 10: this translator has no float codegen
-     * at all (scoped out of M0 — see TX_AR_ERR_FLOAT_UNSUPPORTED's comment
-     * in simi_arm.h). Every opcode that would have float meaning on x86
-     * must reject T_F32/T_F64 explicitly here, up front, rather than
-     * falling into codegen that reads the slot as a plain 64-bit integer
-     * and silently produces a wrong answer on real IEEE bit patterns. */
-    if ((type==T_F64 || type==T_F32) &&
-        (op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV||op==OP_MOD||
-         op==OP_NEG||op==OP_CMP))
+    /* Gap Remediation SIMI Phase 10 (F1): ADD/SUB/MUL/DIV/NEG/CMP now
+     * have real IEEE-754 float codegen below (GP-bounce per plan D4,
+     * fcmp+cset per D5). Two float shapes stay rejected, matching the
+     * interpreter's permanent boundaries and x86's codegen:
+     *   - MOD has no float instruction on any target this project ships
+     *     (compose DIV+MUL+SUB instead) — permanent, not a temporary gap.
+     *   - a float op with an immediate operand has no float meaning
+     *     (you cannot add a float to a 28-bit integer immediate); x86
+     *     rejects the same combination (simi_x86.c). AND/OR/XOR/SHL/SHR/
+     *     SAR are deliberately NOT rejected: they operate on the raw
+     *     bits of the slot exactly like the reference interpreter's
+     *     plain integer path. */
+    if ((type==T_F64 || type==T_F32) && op == OP_MOD)
+        return TX_AR_ERR_FLOAT_UNSUPPORTED;
+    if ((type==T_F64 || type==T_F32) && (flags & FLAG_IMM) &&
+        (op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV))
         return TX_AR_ERR_FLOAT_UNSUPPORTED;
 
     switch (op) {
@@ -1841,6 +1879,29 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             if (!(epi & 1)) get_operand(cb, ra, h_a, rd_live);
             if (!(epi & 2)) get_operand(cb, w_rb_reg(w), h_b, rd_live);
         }
+        /* F1: float ADD/SUB/MUL — the GP-bounce (plan D4). The value
+         * never leaves the x9/x10/x11 integer cache: the operand bits
+         * move into the FP scratch registers d0/s0 and d1/s1, the
+         * IEEE-754 op computes there, and the result bits move back
+         * into the reserved cache host. Four words per float op (the
+         * documented "two extra moves" cost — actually three), and
+         * d0/d1 are never used by the integer codegen, so there is no
+         * cross-instruction FP state to manage. The s-form fmovs zero
+         * the high 32 bits exactly like the interpreter's bits_of_f32. */
+        if ((type == T_F64 || type == T_F32) &&
+            (op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
+            int d = (type == T_F64);
+            e32(cb, d ? enc_fmov_dx(0, h_a) : enc_fmov_sw(0, h_a));
+            e32(cb, d ? enc_fmov_dx(1, h_b) : enc_fmov_sw(1, h_b));
+            switch (op) {
+                case OP_ADD: e32(cb, d ? enc_fadd_d(0, 0, 1) : enc_fadd_s(0, 0, 1)); break;
+                case OP_SUB: e32(cb, d ? enc_fsub_d(0, 0, 1) : enc_fsub_s(0, 0, 1)); break;
+                default:     e32(cb, d ? enc_fmul_d(0, 0, 1) : enc_fmul_s(0, 0, 1)); break;
+            }
+            e32(cb, d ? enc_fmov_xd(rh, 0) : enc_fmov_ws(rh, 0));
+            store_result(cb, rd);
+            break;   /* float consumed this instruction — skip the integer inner switch */
+        }
         switch (op) {
             case OP_ADD: e32(cb, enc_add_shift(rh, h_a, h_b, 0, 0)); break;
             case OP_SUB: e32(cb, enc_sub_shift(rh, h_a, h_b, 0, 0)); break;
@@ -1870,6 +1931,16 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
             get_operand(cb, ra, h_a, rd_live);
             get_operand(cb, w_rb_reg(w), h_b, rd_live);
         }
+        if (type == T_F64 || type == T_F32) {
+            /* F1: float DIV GP-bounce (float MOD was rejected up front). */
+            int d = (type == T_F64);
+            e32(cb, d ? enc_fmov_dx(0, h_a) : enc_fmov_sw(0, h_a));
+            e32(cb, d ? enc_fmov_dx(1, h_b) : enc_fmov_sw(1, h_b));
+            e32(cb, d ? enc_fdiv_d(0, 0, 1) : enc_fdiv_s(0, 0, 1));
+            e32(cb, d ? enc_fmov_xd(rh, 0) : enc_fmov_ws(rh, 0));
+            store_result(cb, rd);
+            break;
+        }
         int sgn = ar_type_signed(type);
         /* A64 has no remainder instruction: sdiv/udiv then msub folds the
          * quotient back (t = t - (t/d)*d), yielding the dividend-sign
@@ -1888,6 +1959,24 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     }
     case OP_NOT:
     case OP_NEG: {
+        /* F1: float NEG is a sign-bit flip through the integer cache
+         * (plan D3 — deliberately NO float instruction; F0 proved this
+         * exact XOR path bit-for-bit). The mask always lands in X_T1:
+         * the operand sits in X_T0, and when X_T1 IS the reserved
+         * result register the eor reads both sources before writing,
+         * so mask-then-eor is correct there too. The 64-bit mask
+         * flips bit 63; the 32-bit mask flips bit 31 and leaves the
+         * zero-extended upper half zero, matching bits_of_f32. */
+        if (type == T_F64 || type == T_F32) {
+            int v = cache_reserve(cb, rd, ra, -1);
+            uint8_t rh = result_host(v);
+            get_operand(cb, ra, X_T0, rd == ra);
+            uint64_t sign = (type == T_F64) ? 0x8000000000000000ull : 0x80000000ull;
+            materialize_imm(cb, sign, X_T1);
+            e32(cb, enc_eor_shift(rh, X_T0, X_T1, 0, 0));
+            store_result(cb, rd);
+            break;
+        }
         int v = cache_reserve(cb, rd, ra, -1);
         uint8_t rh = result_host(v);
         get_operand(cb, ra, X_T0, rd == ra);
@@ -1944,6 +2033,35 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         cache_fetch_hosts(ra, w_rb_reg(w), &h_a, &h_b);
         get_operand(cb, ra, h_a, rd_live);
         get_operand(cb, w_rb_reg(w), h_b, rd_live);
+        if (type == T_F64 || type == T_F32) {
+            /* F1: float CMP — fcmp + cset with the D5 mapping verified
+             * in F0: EQ/NE/LT/LE compare (a,b) directly, which FCMP's
+             * NZCV (incl. the unordered N=1,Z=0,C=1,V=1 NaN case) makes
+             * IEEE-correct with a single cset; GT/GE compare the SWAPPED
+             * operands and cset lt/le, because a single cset gt/ge is
+             * WRONG on NaN (unordered yields N==V, so !Z && N==V and
+             * N==V are both true). The unsigned relations have no float
+             * meaning (assembler-level, same as the interpreter). */
+            int d = (type == T_F64);
+            int swap = (flags == REL_GT || flags == REL_GE);
+            int cond;
+            switch (flags) {
+                case REL_EQ:       cond = 0;  break;   /* eq */
+                case REL_NE:       cond = 1;  break;   /* ne */
+                case REL_LT:
+                case REL_GT:       cond = 11; break;   /* lt */
+                case REL_LE:
+                case REL_GE:       cond = 13; break;   /* le */
+                default: return TX_AR_ERR_BAD_OPCODE;  /* LTU..GEU: no float meaning */
+            }
+            e32(cb, d ? enc_fmov_dx(0, h_a) : enc_fmov_sw(0, h_a));
+            e32(cb, d ? enc_fmov_dx(1, h_b) : enc_fmov_sw(1, h_b));
+            e32(cb, d ? enc_fcmp_d(swap ? 1 : 0, swap ? 0 : 1)
+                      : enc_fcmp_s(swap ? 1 : 0, swap ? 0 : 1));
+            e32(cb, enc_cset(rh, cond));
+            store_result(cb, rd);
+            break;
+        }
         if (flags >= 10 || !emit_cmp(cb, flags, rh, h_a, h_b)) return TX_AR_ERR_BAD_OPCODE;
         store_result(cb, rd);
         break;

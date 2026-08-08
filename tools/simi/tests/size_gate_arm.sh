@@ -923,11 +923,19 @@
 # stays valid — the M2.9 clobber_scratch pin is gone) — 540 bytes
 # below its M0 baseline, and disabling the unscaled fold grows it back
 # to 1552.
-# mem_ops_native is
-# unchanged (its 0/8 displacements were already in the scaled fast
-# path). Same skips as the runner: float_ops rejected,
-# mem_ops address-0 convenience, jmpr_oob self-skip — its UDF fault
-# path has no expected result, so it is checked by hand with
+# float_ops is F1
+# (SIMI Phase 10 float codegen): the row's 2340 M0-equivalent is the
+# NAIVE emission measured with the F1 translator forced to g_alloc=0
+# — the documented invariant that the naive path degrades the cache
+# helpers to exactly the M0 sequences means this is byte-identical to
+# what the M0 commit (1729f50) WOULD have emitted for float had float
+# been in scope there (it was rejected outright instead, so there is
+# no real M0 byte count to measure — the honest substitute is the
+# naive shape, measured, not invented). The F1 cached emission is
+# 2156 (-184: the register cache keeping the arithmetic chains
+# resident, the same win every other row shows). Same skips as the
+# runner: mem_ops address-0 convenience, jmpr_oob self-skip — its UDF
+# fault path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
 # "execution error" — see the plan doc's M2 addendum, §10).
 # straight_line_bench is the
@@ -954,8 +962,9 @@ VERIFY=../simi-arm-verify
 declare -A M0_BASELINES=(
     [add]=976 [aggregate_abi]=4592 [alu_imm]=1132 [alu_imm_ext]=1196
     [branch_cmp]=1096 [call_ret]=1932
-    [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
+    [cap_call_ret]=3192    [cap_forge]=1336    [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
+    [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248 [jmpr_chain29]=4600 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156

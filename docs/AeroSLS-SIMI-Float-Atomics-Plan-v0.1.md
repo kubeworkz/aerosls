@@ -115,10 +115,10 @@ cache for a pure constant).
   `fdiv`/`fneg`-via-XOR is already executable/`fcmp`/`fmov`, d and s forms). The
   gate: `float_ops.simi` executes on the A64 executor and returns 15. Parity pin:
   interpreter vs A64-executor bit-identical on all 17 checks.
-- **F1** — `simi_arm.c` float codegen, naive (d-cache mirror or GP bounce per D4),
-  float `CMP` per D5. Gate: `float_ops.simi` PASS on the ARM engine; new size-gate
-  row measured at the m0 worktree; the 77 existing rows byte-identical (float
-  codegen is additive — no integer path changes).
+- **F1 — LANDED** — `simi_arm.c` float codegen, naive (d-cache mirror or GP
+  bounce per D4), float `CMP` per D5. Gate: `float_ops.simi` PASS on the ARM
+  engine; new size-gate row (naive baseline — see §3.2); the 77 existing rows
+  byte-identical (float codegen is additive — no integer path changes).
 - **F2** — the fold/allocator interaction: confirm the integer corpus's byte
   identity holds (D6's scoping means the chain machinery is untouched), and add
   `a64_enc_check.py` rows for the new encoders.
@@ -169,6 +169,52 @@ passes. The evidence, all measured:
   leave the integer corpus untouched — ARM suite 77/77 (4 skipped incl.
   float_ops), size gate byte-identical (77 rows, 26220 saved), and the interp /
   x86 / RV64 suites all green.
+
+### 3.2 F1 status — LANDED (simi_arm.c float codegen)
+
+F1 is done: `simi_arm.c` emits the float family and `float_ops.simi` PASSes on
+A64. The evidence, all measured:
+
+- **The D4 GP-bounce, as designed** — float ADD/SUB/MUL/DIV move the operand
+  bits from the x9/x10/x11 integer cache into the FP scratch registers d0/s0
+  and d1/s1 via `fmov` (GP→FP), compute there, and move the result back
+  (FP→GP) into the reserved cache host: four words per float op, and d0/d1 are
+  never used by the integer codegen, so there is no cross-instruction FP state
+  to manage. The s-form `fmov` (GP→FP) zeroes the high 32 bits exactly like
+  the interpreter's `bits_of_f32`. LOAD/STORE under float types reuse the
+  integer encoders unchanged (D3: `rt` is a plain register number).
+- **NEG stays a sign-bit flip (D3)** — no float instruction: the mask
+  (`0x8000...0` for f64, `0x80000000` for f32) is materialized into X_T1 and
+  XORed through the integer cache. The 32-bit mask flips bit 31 and leaves the
+  zero-extended upper half zero, matching `bits_of_f32`.
+- **CMP per the D5 finding** — EQ/NE/LT/LE emit `fcmp (a,b)` + a single
+  `cset`; GT/GE emit `fcmp (b,a)` + `cset lt/le` (the swapped-operand trick F0
+  verified, because a single `cset gt/ge` is wrong on NaN's N=1,Z=0,C=1,V=1).
+  The unsigned relations (LTU..GEU) have no float meaning and return
+  `TX_AR_ERR_BAD_OPCODE`.
+- **The permanent rejection boundaries, narrowed honestly** — the M0-era blanket
+  rejection is gone. What remains: float MOD (no float instruction on any
+  target — compose DIV+MUL+SUB), and a float op with an immediate operand
+  (no float meaning — x86 parity). AND/OR/XOR/SHL/SHR/SAR under float types
+  are deliberately NOT rejected: they operate on the raw slot bits exactly
+  like the reference interpreter's plain integer path.
+- **The gate** — `simi-arm-verify float_ops.tmo main 15` → **PASS, 15, at 2156
+  bytes** (F1 cached emission). Reference interpreter → 15; x86 real hardware
+  → 15.
+- **The size-gate row, with the honest baseline** — M0 (git 1729f50) rejected
+  float outright, so there is no real M0 byte count to measure; the row's
+  baseline is the NAIVE emission of the F1 translator measured with the cache
+  forced off (`g_alloc=0` — the documented invariant that the naive path
+  degrades the cache helpers to exactly the M0 sequences means this is
+  byte-identical to what M0 would have emitted had float been in scope).
+  Measured: naive 2340, cached 2156 (−184). Gate is now **78/78 — 26404
+  saved**, and the airtight diff vs the F0 commit shows **all 77 existing
+  rows byte-identical** — float codegen is strictly additive, no integer path
+  changed.
+- **No regression** — ARM suite 77/77 (4 skipped: float_ops — the runner
+  un-skip is F3's milestone — plus the standing cap_forge_debug/jmpr_oob/
+  mem_ops skips), interp 79/79, x86 native 78/78, RV64 77/77, `a64-f0-test`
+  still PASS.
 
 ## 4. Honest verification caveats
 

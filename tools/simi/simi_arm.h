@@ -71,13 +71,16 @@ enum {
     TX_AR_ERR_TOO_MANY_LITERALS,
     TX_AR_ERR_BRANCH_OUT_OF_RANGE,
     TX_AR_ERR_NAME_OUT_OF_RANGE,   /* v0.3: RESOLVE name-pool index out of range */
-    TX_AR_ERR_FLOAT_UNSUPPORTED,   /* Gap Remediation SIMI Phase 10: T_F32/
-                                    * T_F64 on ADD/SUB/MUL/DIV/MOD/NEG/CMP
-                                    * is scoped out of M0 (same decision as
-                                    * the RV64 target — rejected outright
-                                    * rather than silently mis-executed as
-                                    * integer ops on the raw IEEE bit
-                                    * pattern) */
+    TX_AR_ERR_FLOAT_UNSUPPORTED,   /* Gap Remediation SIMI Phase 10: F1
+                                    * landed ADD/SUB/MUL/DIV/NEG/CMP float
+                                    * codegen (plan D4 GP-bounce); the two
+                                    * remaining rejections are permanent
+                                    * boundaries, not gaps: float MOD has
+                                    * no instruction on any target (compose
+                                    * DIV+MUL+SUB instead), and a float op
+                                    * with an immediate operand has no
+                                    * float meaning (x86 parity). RV64
+                                    * still rejects the whole family. */
 };
 
 /* Same contract as simi_riscv_translate() (simi_riscv.h) — see that file
