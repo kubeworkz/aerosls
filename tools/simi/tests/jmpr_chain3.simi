@@ -1,0 +1,33 @@
+; jmpr_chain3.simi — M2.27: the inline chain extended to an index built
+; by MULTIPLICATION. The dispatch index is r1 = r2 * 2, where r2 is the
+; join-dependent base (5 on the never-taken branch path, 6 on the taken
+; fall-through) — so the candidate set is the MUL image over the tracked
+; base: {5, 6} * 2 = {10, 12}. M2.26's image covered ADD/SUB only; M2.27
+; adds MUL to chain_img_alu — plain 64-bit, never faults, type-agnostic
+; (the same argument as the M2.2 fold) — so the imm form multiplies
+; every base candidate by the constant. The runtime index 12 takes the
+; chain's SECOND b.eq (jmpr_chain/chain2's shape, now through a MUL),
+; and the fold fixpoint cannot fold the JMPR (r2 is join-dependent), so
+; g_alloc=0 and the chain is the naive-mode dispatch. Candidates 10 and
+; 12 are real pcs (blockA/blockB), as the chain branches straight to
+; g_instr_off[candidate].
+; Expected result: 333
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: the BC below NEVER branches
+    LOADI r2, #5, i64   ; pc 2 — branch-path base (5) — dead at runtime
+    BC r0, L            ; pc 3 — r0 == 0 → falls through (delivers {r2:5} at the join)
+    LOADI r2, #6, i64   ; pc 4 — fall-through base (6)
+L:                      ; pc 5 — join: r2 ∈ {5, 6}
+    MUL r1, r2, #2, i64 ; pc 5 — r1 = r2 * 2 ∈ {10, 12}
+    JMPR r1             ; pc 6 — candidates {10, 12}, runtime 12
+    LOADI r0, #111, i32 ; pc 7 — dead path — never reached
+    RET                 ; pc 8
+    LOADI r0, #222, i32 ; pc 9 — dead filler (aligns blockA to pc 10)
+blockA:                 ; pc 10 — candidate 10's landing (never hit: BC falls through)
+    LOADI r0, #222, i32 ; pc 10
+    RET                 ; pc 11
+blockB:                 ; pc 12 — candidate 12's landing (runtime hit)
+    LOADI r0, #333, i32 ; pc 12
+    RET                 ; pc 13
