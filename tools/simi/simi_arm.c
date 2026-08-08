@@ -508,7 +508,16 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * dispatch materializes over the provably-unchanged sources. */
 #define TX_AR_CHAIN_MAX 64
 #define TX_AR_CHAIN_BIG 64
-#define TX_AR_CHAIN_REGS 4
+/* M2.43: the tracked-register closure cap. M2.26 sized it at 4 — the
+ * index register plus its feeders. M2.43 raises it to 8 so a 5-8-
+ * feeder index chain (r1 = (r4 + r5) + r3 over joins — jmpr_chain19)
+ * still analyzes: under the old cap the closure truncated silently
+ * (the missing feeder's set stayed UNKNOWN, poisoning the index set to
+ * UNKNOWN and falling to the table). g_chain_arr is REGS x 4096
+ * ChainSets, so the static footprint scales with the cap; 8 is a
+ * generous bound for realistic register chains while staying well
+ * under TX_AR_MAX_REGS. */
+#define TX_AR_CHAIN_REGS 8
 #define TX_AR_CHAIN_DEFS 64
 #define CD_SLOT 0   /* M2.32: deferred-product operand kind — a tracked slot */
 #define CD_REC  1   /* M2.32: deferred-product operand kind — an older pool record */
@@ -2750,14 +2759,18 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         if (n_dyn == 1) {
             uint16_t ra = w_ra(instrs[dyn_pc]);
             if (ra < TX_AR_MAX_REGS) {
-                /* M2.26: the tracked-register closure — ra plus every
-                 * register that can transitively feed it (operands of
-                 * instructions whose rd is tracked). Capped at
+                /* M2.26/M2.43: the tracked-register closure — ra plus
+                 * every register that can transitively feed it (operands
+                 * of instructions whose rd is tracked). Capped at
                  * TX_AR_CHAIN_REGS; beyond that the analysis declines
-                 * (the table path). The closure is over the whole
-                 * stream, so a feeder on any path is tracked everywhere
-                 * — over-tracking is harmless (bounded by the cap),
-                 * under-tracking is what would be unsound. */
+                 * (the table path). M2.43 raised the cap 4 -> 8: a
+                 * closure needing more than 8 feeders still declines,
+                 * but 5-8-feeder index chains (jmpr_chain19) now
+                 * analyze instead of silently truncating to UNKNOWN.
+                 * The closure is over the whole stream, so a feeder on
+                 * any path is tracked everywhere — over-tracking is
+                 * harmless (bounded by the cap), under-tracking is what
+                 * would be unsound. */
                 int ntr = 1;
                 for (int i = 0; i < TX_AR_MAX_REGS; i++) { g_chain_tracked[i] = 0; g_chain_slot[i] = -1; }
                 g_chain_tracked[ra] = 1;
