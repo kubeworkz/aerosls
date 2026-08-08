@@ -480,14 +480,30 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
 #define TX_AR_CHAIN_MAX 12
 #define TX_AR_CHAIN_BIG 32
 #define TX_AR_CHAIN_REGS 4
+#define TX_AR_CHAIN_DEFS 64
+#define CD_SLOT 0   /* M2.32: deferred-product operand kind — a tracked slot */
+#define CD_REC  1   /* M2.32: deferred-product operand kind — an older pool record */
+/* M2.32: an immutable deferred-product record. An operand is either a
+ * tracked slot (its value as it stands when the record is materialized,
+ * sound because any write to the slot invalidates every record that
+ * transitively reads it) or an OLDER pool record (the indirection that
+ * makes in-place products sound: ADD r1, r1, r4 defers as op(rec(R1),
+ * slot(r4)) — the left operand is the immutable record for r1's OLD
+ * value, not cur[r1] itself, so no self-cycle). Records only reference
+ * older records, so the DAG is acyclic. */
+struct ChainDef {
+    uint8_t op;       /* ADD/SUB/MUL/AND/OR/XOR */
+    uint8_t ka, kb;   /* CD_SLOT or CD_REC for operand a / operand b */
+    int16_t a, b;     /* slot index (ka/kb == CD_SLOT) or record index (CD_REC) */
+};
 struct ChainSet {
     uint8_t n, unk;
     uint32_t v[TX_AR_CHAIN_MAX];
-    uint8_t def;      /* M2.30: 1 = deferred pair product (n/unk unused) */
-    uint8_t def_op;   /* ADD/SUB/MUL/AND/OR/XOR */
-    int8_t  def_sa, def_sb;   /* tracked slots of the two sources */
+    int16_t def;      /* M2.30/M2.32: -1 = flat set (n/unk live); else g_chain_defs index */
 };
 struct ChainBig { uint8_t n, unk; uint32_t v[TX_AR_CHAIN_BIG]; };
+static struct ChainDef g_chain_defs[TX_AR_CHAIN_DEFS];
+static int      g_chain_ndef;      /* M2.32: pool cursor, reset each walk iteration */
 static uint32_t g_chain_cand[TX_AR_CHAIN_BIG];
 static struct ChainBig g_chain_bigsnap;
 static int      g_chain_ncand;
@@ -1003,7 +1019,7 @@ static void op_b_cond(struct CodeBuf* cb, uint32_t target_pc, uint8_t cond) { ad
  * — the sound over-approximation that disables the chain (the walk is
  * monotone, so the iteration converges). */
 static void chain_merge(struct ChainSet* a, const struct ChainSet* b) {
-    if (b->unk || a->unk) { a->unk = 1; a->n = 0; a->def = 0; return; }
+    if (b->unk || a->unk) { a->unk = 1; a->n = 0; a->def = -1; return; }
     uint32_t tmp[TX_AR_CHAIN_MAX];
     uint8_t i = 0, j = 0, k = 0;
     while (i < a->n && j < b->n && k < TX_AR_CHAIN_MAX) {
@@ -1013,16 +1029,16 @@ static void chain_merge(struct ChainSet* a, const struct ChainSet* b) {
     }
     while (i < a->n && k < TX_AR_CHAIN_MAX) tmp[k++] = a->v[i++];
     while (j < b->n && k < TX_AR_CHAIN_MAX) tmp[k++] = b->v[j++];
-    if (i < a->n || j < b->n) { a->unk = 1; a->n = 0; a->def = 0; return; }   /* union overflowed the cap */
+    if (i < a->n || j < b->n) { a->unk = 1; a->n = 0; a->def = -1; return; }   /* union overflowed the cap */
     for (uint8_t t = 0; t < k; t++) a->v[t] = tmp[t];
     a->n = k;
-    a->def = 0;   /* every merge output is flat (M2.30) */
+    a->def = -1;   /* every merge output is flat (M2.30) */
 }
 /* M2.26: set constructors and the tracked-register operand tests. Every
- * constructor and every merge OUTPUT is a flat set (def = 0); only the
+ * constructor and every merge OUTPUT is a flat set (def = -1); only the
  * walk's product branch records a deferred form. */
-static void chain_singleton(struct ChainSet* s, uint32_t v) { s->n = 1; s->unk = 0; s->v[0] = v; s->def = 0; s->def_op = 0; s->def_sa = s->def_sb = -1; }
-static void chain_unknown(struct ChainSet* s) { s->n = 0; s->unk = 1; s->def = 0; s->def_op = 0; s->def_sa = s->def_sb = -1; }
+static void chain_singleton(struct ChainSet* s, uint32_t v) { s->n = 1; s->unk = 0; s->v[0] = v; s->def = -1; }
+static void chain_unknown(struct ChainSet* s) { s->n = 0; s->unk = 1; s->def = -1; }
 /* M2.27: the ALU image evaluator — plain 64-bit, never faults,
  * type-agnostic (the M2.2 constant-fold argument). */
 static int64_t chain_alu_eval(uint8_t op, int64_t av, int64_t bv) {
@@ -1036,27 +1052,56 @@ static int64_t chain_alu_eval(uint8_t op, int64_t av, int64_t bv) {
     default:     return 0;   /* caller gates the op set */
     }
 }
-/* M2.30: materialize a deferred pair product into a flat set, capped at
- * TX_AR_CHAIN_MAX (overflow -> UNKNOWN — the conservative walk-state
- * bound). Reads the sources from cur[], recursing on deferred sources.
- * Called wherever a deferred form must become flat: source writes, head
- * unions, deliveries, and as an input to a later image. */
-static void chain_flatten(struct ChainSet* out, const struct ChainSet* cur, int8_t slot) {
-    const struct ChainSet* s = &cur[slot];
-    if (!s->def) { *out = *s; return; }
-    if (cur[s->def_sa].unk || cur[s->def_sb].unk) { chain_unknown(out); return; }
+/* M2.32: allocate a deferred-product record referencing operand a and
+ * operand b (each a tracked slot or an older pool record). Returns -1
+ * on pool exhaustion — the caller falls back to UNKNOWN (conservative).
+ * The pool is reset at the top of every walk iteration, so the indices
+ * stored in cur[].def are valid only within one iteration. */
+static int chain_def_alloc(uint8_t op, uint8_t ka, int16_t a, uint8_t kb, int16_t b) {
+    if (g_chain_ndef >= TX_AR_CHAIN_DEFS) return -1;
+    struct ChainDef* d = &g_chain_defs[g_chain_ndef];
+    d->op = op; d->ka = ka; d->a = a; d->kb = kb; d->b = b;
+    return g_chain_ndef++;
+}
+/* M2.32: does the record DAG rooted at rec transitively reference any
+ * tracked slot marked dirty? Records reference slots and older records
+ * only, so this terminates. */
+static int chain_def_touches(int16_t rec, const uint8_t* dirty) {
+    const struct ChainDef* d = &g_chain_defs[rec];
+    if ((d->ka == CD_SLOT && dirty[d->a]) || (d->kb == CD_SLOT && dirty[d->b])) return 1;
+    if (d->ka == CD_REC && chain_def_touches(d->a, dirty)) return 1;
+    if (d->kb == CD_REC && chain_def_touches(d->b, dirty)) return 1;
+    return 0;
+}
+/* M2.30/M2.32: materialize a deferred product RECORD into a flat set,
+ * capped at TX_AR_CHAIN_MAX (overflow -> UNKNOWN — the conservative
+ * walk-state bound). A CD_SLOT operand reads cur[] (recursing if that
+ * slot is itself deferred); a CD_REC operand recurses into the older
+ * record. Called wherever a deferred form must become flat: source
+ * writes, head unions, deliveries, and as an input to a later image. */
+static void chain_flatten(struct ChainSet* out, const struct ChainSet* cur, int16_t slot);
+static void chain_flatten_big(struct ChainBig* out, const struct ChainSet* cur, int16_t slot);
+static void chain_flatten_rec(struct ChainSet* out, const struct ChainSet* cur, int16_t rec) {
+    const struct ChainDef* d = &g_chain_defs[rec];
     struct ChainSet va, vb;
-    if (cur[s->def_sa].def) chain_flatten(&va, cur, s->def_sa); else va = cur[s->def_sa];
-    if (cur[s->def_sb].def) chain_flatten(&vb, cur, s->def_sb); else vb = cur[s->def_sb];
+    if (d->ka == CD_SLOT) { if (cur[d->a].def >= 0) chain_flatten(&va, cur, d->a); else va = cur[d->a]; }
+    else chain_flatten_rec(&va, cur, d->a);
+    if (d->kb == CD_SLOT) { if (cur[d->b].def >= 0) chain_flatten(&vb, cur, d->b); else vb = cur[d->b]; }
+    else chain_flatten_rec(&vb, cur, d->b);
     if (va.unk || vb.unk) { chain_unknown(out); return; }
     struct ChainSet tmp = { .n = 0, .unk = 0 };
     for (uint8_t i = 0; i < va.n && !tmp.unk; i++)
         for (uint8_t j = 0; j < vb.n && !tmp.unk; j++) {
             struct ChainSet one;
-            chain_singleton(&one, (uint32_t)chain_alu_eval(s->def_op, (int64_t)va.v[i], (int64_t)vb.v[j]));
+            chain_singleton(&one, (uint32_t)chain_alu_eval(d->op, (int64_t)va.v[i], (int64_t)vb.v[j]));
             chain_merge(&tmp, &one);
         }
     *out = tmp;
+}
+static void chain_flatten(struct ChainSet* out, const struct ChainSet* cur, int16_t slot) {
+    const struct ChainSet* s = &cur[slot];
+    if (s->def < 0) { *out = *s; return; }
+    chain_flatten_rec(out, cur, s->def);
 }
 static void chain_unknown_big(struct ChainBig* s) { s->n = 0; s->unk = 1; }
 static void chain_merge_big(struct ChainBig* a, const struct ChainSet* b) {
@@ -1074,49 +1119,72 @@ static void chain_merge_big(struct ChainBig* a, const struct ChainSet* b) {
     for (uint8_t t = 0; t < k; t++) a->v[t] = tmp[t];
     a->n = k;
 }
-/* M2.30: the dispatch-side materialization — a deferred pair product is
- * re-computed over the sources into the BIG candidate set (capped at
- * TX_AR_CHAIN_BIG), because the walk's flat sets cannot hold > 12 and
- * the emission gate may still want a 13-32-candidate chain. Sound only
- * because every write or union of a source slot flattened the deferred
- * form eagerly, so the sources here are exactly what the product saw. */
-static void chain_flatten_big(struct ChainBig* out, const struct ChainSet* cur, int8_t slot) {
-    const struct ChainSet* s = &cur[slot];
+/* M2.30/M2.32: the dispatch-side materialization — a deferred product
+ * is re-computed over its record DAG into the BIG candidate set (capped
+ * at TX_AR_CHAIN_BIG), because the walk's flat sets cannot hold > 12
+ * and the emission gate may still want a 13-32-candidate chain. Sound
+ * only because every write or union of a source slot flattened every
+ * record that transitively reads it eagerly, so the slots referenced
+ * here are exactly what each product saw at its instruction. */
+static void chain_flatten_big_rec(struct ChainBig* out, const struct ChainSet* cur, int16_t rec) {
+    const struct ChainDef* d = &g_chain_defs[rec];
     struct ChainBig tmp = { .n = 0, .unk = 0 };
-    if (!s->def) {
-        tmp.n = s->n; tmp.unk = s->unk;
-        for (uint8_t i = 0; i < s->n; i++) tmp.v[i] = s->v[i];
-        *out = tmp; return;
-    }
     struct ChainBig va, vb;
-    if (cur[s->def_sa].def) chain_flatten_big(&va, cur, s->def_sa);
-    else { va.n = cur[s->def_sa].n; va.unk = cur[s->def_sa].unk; for (uint8_t i = 0; i < va.n; i++) va.v[i] = cur[s->def_sa].v[i]; }
-    if (cur[s->def_sb].def) chain_flatten_big(&vb, cur, s->def_sb);
-    else { vb.n = cur[s->def_sb].n; vb.unk = cur[s->def_sb].unk; for (uint8_t i = 0; i < vb.n; i++) vb.v[i] = cur[s->def_sb].v[i]; }
+    if (d->ka == CD_SLOT) {
+        if (cur[d->a].def >= 0) chain_flatten_big(&va, cur, d->a);
+        else { va.n = cur[d->a].n; va.unk = cur[d->a].unk; for (uint8_t i = 0; i < va.n; i++) va.v[i] = cur[d->a].v[i]; }
+    } else chain_flatten_big_rec(&va, cur, d->a);
+    if (d->kb == CD_SLOT) {
+        if (cur[d->b].def >= 0) chain_flatten_big(&vb, cur, d->b);
+        else { vb.n = cur[d->b].n; vb.unk = cur[d->b].unk; for (uint8_t i = 0; i < vb.n; i++) vb.v[i] = cur[d->b].v[i]; }
+    } else chain_flatten_big_rec(&vb, cur, d->b);
     if (va.unk || vb.unk) { chain_unknown_big(&tmp); *out = tmp; return; }
     for (uint8_t i = 0; i < va.n && !tmp.unk; i++)
         for (uint8_t j = 0; j < vb.n && !tmp.unk; j++) {
             struct ChainSet one;
-            chain_singleton(&one, (uint32_t)chain_alu_eval(s->def_op, (int64_t)va.v[i], (int64_t)vb.v[j]));
+            chain_singleton(&one, (uint32_t)chain_alu_eval(d->op, (int64_t)va.v[i], (int64_t)vb.v[j]));
             chain_merge_big(&tmp, &one);
         }
     *out = tmp;
 }
+static void chain_flatten_big(struct ChainBig* out, const struct ChainSet* cur, int16_t slot) {
+    const struct ChainSet* s = &cur[slot];
+    struct ChainBig tmp = { .n = 0, .unk = 0 };
+    if (s->def < 0) {
+        tmp.n = s->n; tmp.unk = s->unk;
+        for (uint8_t i = 0; i < s->n; i++) tmp.v[i] = s->v[i];
+        *out = tmp; return;
+    }
+    chain_flatten_big_rec(out, cur, s->def);
+}
 /* M2.30: deliver cur[s] into a per-head accumulator, flattening a
  * deferred form first (the accumulator holds flat sets only). */
 static void chain_deliver(struct ChainSet* dst, const struct ChainSet* cur, int s) {
-    if (cur[s].def) {
+    if (cur[s].def >= 0) {
         struct ChainSet flat;
         chain_flatten(&flat, cur, s);
         chain_merge(dst, &flat);
     } else chain_merge(dst, &cur[s]);
 }
-/* M2.30: a deferred pair product's sources must not change — its value
+/* M2.30/M2.32: a deferred product's sources must not change — its value
  * is fixed at its instruction. Before slot s is written or unioned,
- * flatten every deferred form that reads it (reading the OLD cur[s]). */
+ * flatten every deferred form whose record DAG TRANSITIVELY reads s — a
+ * nested deferral reads its source's source, so a write to a leaf would
+ * otherwise leave the nested form deferring over a RECOMPUTED (new)
+ * leaf value while its own runtime value is fixed at its instruction.
+ * Each flatten reads the OLD cur[] (the write has not happened yet). */
 static void chain_prewrite(struct ChainSet* cur, int ntr, int s) {
+    uint8_t dirty[TX_AR_CHAIN_REGS];
+    for (int t = 0; t < ntr; t++) dirty[t] = 0;
+    dirty[s] = 1;
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int t = 0; t < ntr; t++)
+            if (!dirty[t] && cur[t].def >= 0 && chain_def_touches(cur[t].def, dirty)) { dirty[t] = 1; changed = 1; }
+    }
     for (int t = 0; t < ntr; t++)
-        if (cur[t].def && t != s && (cur[t].def_sa == s || cur[t].def_sb == s))
+        if (dirty[t] && t != s && cur[t].def >= 0)
             chain_flatten(&cur[t], cur, t);
 }
 /* M2.27: the ALU set image — S(out) = { f(a, k) : a in S(a) } for the
@@ -2482,13 +2550,14 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     for (int i = 0; i < TX_AR_MAX_REGS; i++)
                         if (g_chain_tracked[i]) g_chain_slot[i] = (int8_t)(slot++);
                     for (int s = 0; s < ntr; s++)
-                        for (uint32_t q = 0; q < 4096; q++) { g_chain_arr[s][q].n = 0; g_chain_arr[s][q].unk = 0; g_chain_arr[s][q].def = 0; }
+                        for (uint32_t q = 0; q < 4096; q++) { g_chain_arr[s][q].n = 0; g_chain_arr[s][q].unk = 0; g_chain_arr[s][q].def = -1; }
                     g_chain_bigsnap.n = 0; g_chain_bigsnap.unk = 1;   /* M2.30: the big convergence snapshot */
                     int changed = 1;
                     for (int iter = 0; changed && iter < 64; iter++) {
                         changed = 0;
+                        g_chain_ndef = 0;   /* M2.32: the def-record pool is per-iteration */
                         struct ChainSet cur[TX_AR_CHAIN_REGS];
-                        for (int s = 0; s < ntr; s++) { cur[s].n = 0; cur[s].unk = 1; cur[s].def = 0; cur[s].def_op = 0; cur[s].def_sa = cur[s].def_sb = -1; }  /* entry: opaque */
+                        for (int s = 0; s < ntr; s++) { cur[s].n = 0; cur[s].unk = 1; cur[s].def = -1; }  /* entry: opaque */
                         int carry = 1;                  /* pc 0 is reached from the trampoline */
                         for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
                             uint64_t w = instrs[pc];
@@ -2504,10 +2573,10 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                  * pre-union source values); then the
                                  * resets clear the def marker. */
                                 for (int s = 0; s < ntr; s++) {
-                                    if (cur[s].def) chain_flatten(&cur[s], cur, s);
+                                    if (cur[s].def >= 0) chain_flatten(&cur[s], cur, s);
                                 }
                                 for (int s = 0; s < ntr; s++) {
-                                    if (!carry) { cur[s].n = 0; cur[s].unk = 0; cur[s].def = 0; }
+                                    if (!carry) { cur[s].n = 0; cur[s].unk = 0; cur[s].def = -1; }
                                     chain_merge(&cur[s], &g_chain_arr[s][pc]);
                                 }
                             }
@@ -2598,31 +2667,66 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                         s_b = (w_rb_reg(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_rb_reg(w)] : -1;
                                         if (s_b >= 0) sb = &cur[s_b];
                                     }
-                                    /* M2.30: a deferred SOURCE must be
-                                     * flattened (capped) before the image —
-                                     * the image reads its values. */
-                                    struct ChainSet fa, fb;
-                                    if (sa->def) { chain_flatten(&fa, cur, s_a); sa = &fa; }
-                                    if (!use_imm && sb->def) { chain_flatten(&fb, cur, s_b); sb = &fb; }
-                                    chain_img_alu(&cur[s], op, use_imm, w_imm28(w), sa, sb);
-                                    /* M2.30: a register-form product that
-                                     * OVERFLOWED the flat cap with known
-                                     * sources is DEFERRED — the walk state
-                                     * records the op + source slots, and
-                                     * the dispatch re-computes the product
-                                     * into the BIG candidate set. Sound
-                                     * only while the sources are untouched
-                                     * (every write/union flattens eagerly)
-                                     * and rd != ra/rb (no self-reference). */
-                                    if (!use_imm && cur[s].unk && s_a >= 0 && s_b >= 0 &&
-                                        !sa->unk && !sb->unk &&
-                                        rd != w_ra(w) && rd != w_rb_reg(w)) {
-                                        cur[s].def = 1; cur[s].def_op = op;
-                                        cur[s].def_sa = (int8_t)s_a; cur[s].def_sb = (int8_t)s_b;
-                                        cur[s].n = 0; cur[s].unk = 0;
+                                    /* M2.32: a DEFERRED source is not
+                                     * flattened for the deferral decision —
+                                     * its true set exceeds the flat cap, so
+                                     * the capped flatten would collapse to
+                                     * UNKNOWN and kill the chain. A product
+                                     * over a deferred source always exceeds
+                                     * 12 (the source alone does), so it is
+                                     * DEFERRED directly: the record operands
+                                     * reference the source slots — or, when
+                                     * rd aliases a source (ADD r1, r1, r4),
+                                     * the OLD record of that slot, which is
+                                     * what makes the in-place form sound
+                                     * (the immutable record, not cur[r1]
+                                     * itself). An in-place FLAT source
+                                     * cannot be referenced without a
+                                     * self-cycle, so it falls to UNKNOWN
+                                     * exactly as M2.30 did. */
+                                    int da = (s_a >= 0 && cur[s_a].def >= 0);
+                                    int db = (!use_imm && s_b >= 0 && cur[s_b].def >= 0);
+                                    if (!use_imm && (da || db) && !sa->unk && !sb->unk) {
+                                        int rd_is_a = (rd == w_ra(w));
+                                        int rd_is_b = (!use_imm && rd == w_rb_reg(w));
+                                        if ((rd_is_a && !da) || (rd_is_b && !db)) {
+                                            chain_unknown(&cur[s]);   /* in-place flat source: self-cycle */
+                                        } else {
+                                            uint8_t ka = da ? CD_REC : CD_SLOT;
+                                            int16_t oa = da ? cur[s_a].def : (int16_t)s_a;
+                                            uint8_t kb = db ? CD_REC : CD_SLOT;
+                                            int16_t ob = db ? cur[s_b].def : (int16_t)s_b;
+                                            int ri = chain_def_alloc(op, ka, oa, kb, ob);
+                                            if (ri < 0) chain_unknown(&cur[s]);
+                                            else { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; }
+                                        }
+                                    } else {
+                                        struct ChainSet fa, fb;
+                                        if (sa->def >= 0) { chain_flatten(&fa, cur, s_a); sa = &fa; }
+                                        if (!use_imm && sb->def >= 0) { chain_flatten(&fb, cur, s_b); sb = &fb; }
+                                        chain_img_alu(&cur[s], op, use_imm, w_imm28(w), sa, sb);
+                                        /* M2.30: a register-form product that
+                                         * OVERFLOWED the flat cap with known
+                                         * FLAT sources is DEFERRED — the
+                                         * walk records the op + source
+                                         * slots, and the dispatch re-
+                                         * computes the product into the BIG
+                                         * candidate set. Sound only while
+                                         * the sources are untouched (every
+                                         * write/union flattens eagerly) and
+                                         * rd != ra/rb (no self-reference —
+                                         * flat sources can only be
+                                         * referenced as slots). */
+                                        if (!use_imm && cur[s].unk && s_a >= 0 && s_b >= 0 &&
+                                            !sa->unk && !sb->unk &&
+                                            rd != w_ra(w) && rd != w_rb_reg(w)) {
+                                            int ri = chain_def_alloc(op, CD_SLOT, (int16_t)s_a, CD_SLOT, (int16_t)s_b);
+                                            if (ri < 0) chain_unknown(&cur[s]);
+                                            else { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; }
+                                        }
                                     }
                                 } else if (op == OP_CMP) {
-                                    cur[s].n = 2; cur[s].unk = 0; cur[s].def = 0;
+                                    cur[s].n = 2; cur[s].unk = 0; cur[s].def = -1;
                                     cur[s].v[0] = 0; cur[s].v[1] = 1;
                                 } else {
                                     chain_unknown(&cur[s]);   /* opaque writer: no chain */
