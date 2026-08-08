@@ -3906,6 +3906,61 @@ M2.43 commit (the milestone is a probe, not a change):
   the no-expected jmpr_oob are unchanged. enc-check clean; jmpr_oob
   still faults (UDF, rc=1).
 
+### 10.100 M2.45 — an opaque rewrite of the index register itself (as built)
+
+A PROOF milestone with NO code change — the mirror of M2.44. M2.44
+pinned that a write to a FEEDER leaves r1's stored image untouched;
+M2.45 pins that a write to the INDEX register r1 itself REPLACES
+cur[r1] entirely: a TRACKED writer installs the new image (the
+M2.27/M2.28 family), an OPAQUE writer (SHR — not in the image family)
+installs UNKNOWN, and the dispatch snapshot is then UNKNOWN — the
+chain dies conservatively and the runtime table runs. This mirrors the
+runtime exactly: the dispatch uses the register's CURRENT value, so a
+chain built from a stale pre-rewrite image would be wrong (the runtime
+index is no longer a member of the old candidate set).
+
+### 10.101 M2.45 gate results (measured)
+
+Total emitted bytes across the now-69-program parity set: **M0
+131756 → M1 111416, 20340 saved** (≈15.4%), up from M2.44's 20004.
+One row added, zero moved — simi_arm.c is BYTE-IDENTICAL to the M2.44
+commit (a probe, not a change):
+
+- jmpr_chain21 2880 → 2544 (−336, new 69th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: r1 = r2 + r3 over joins (r2 in
+  {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values {42..80});
+  the OPAQUE rewrite `SHR r1, r1, #1` sits BETWEEN the build (pc 18)
+  and the dispatch (pc 20). The chain dies (dump-verified: ZERO b.eq
+  in the body — the table path) and the runtime index `32 + 48 = 80`
+  becomes 80 >> 1 = 40 — a REAL block (block_40 at pc 40, deliberately
+  OUTSIDE the candidate set), which the table lands on
+  (dump-verified: block_40's `movz x9, #10000` at word 321) -> PASS
+  10000 on all four engines. The test DISCRIMINATES: a stale-image
+  chain would dispatch 40 against {42..80}, miss every b.eq and
+  UDF-trap, so a regression in the replace semantics fails the parity
+  pin. The −336 delta is the accumulated M1 emission folds, not the
+  chain — the chain is dead by design, and the row is a regression
+  guard (a fired chain would shrink it below the honest table size).
+- Teeth (op-sensitivity at the same pc): swapping SHR for a TRACKED
+  rewrite `ADD r1, r1, #-32` re-derives the image {10..48} and the
+  chain fires on the SHIFTED candidates (dump-verified: 20 b.eq — 6
+  backward to the pre-chain body at candidates 10..20, 14 forward to
+  the post-chain filler/blocks at 22..48 — with the first subs = #10
+  and the last = #48), runtime 48 taking the twentieth b.eq -> block3
+  -> 400 on all four engines. The replace is VALUE-ACCURATE in both
+  directions, proven at the same pc with only the op differing.
+- Row-by-row accounting (gate tables diffed vs committed 44d97b3,
+  measured with the M2.44 verifier): **all 68 shared rows
+  byte-identical** and simi_arm.c untouched — strictly additive.
+- Four-way parity: 276 PASS, 0 FAIL — all 69 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the opaque-rewrite table
+  dispatch executes at runtime on the ARM engine (PASS 10000, index
+  40 landing on block_40), and the documented float/mem skips and the
+  no-expected jmpr_oob are unchanged. enc-check clean; jmpr_oob
+  still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
