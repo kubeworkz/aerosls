@@ -1172,6 +1172,29 @@ static void chain_flatten_big(struct ChainBig* out, const struct ChainSet* cur, 
     }
     chain_flatten_big_rec(out, cur, s->def);
 }
+/* M2.35: is every value of the flat set f contained in the true set of
+ * the deferred form on slot (materialized BIG over cur)? Sound because
+ * the caller's record is LIVE — chain_prewrite flattens a deferred
+ * form on any write to its DAG — so its CD_SLOT operands still read
+ * exactly the values the product saw. Both sets are sorted; walk them
+ * together. An unknown or EMPTY f returns 0: unknown cannot be
+ * tested, and an empty arrival is a no-op union that must keep the
+ * M2.34 behavior (the deferred carry still collapses on the first,
+ * delivery-less iteration, then the branch deliveries re-establish
+ * it). */
+static int chain_flat_in_def(const struct ChainSet* cur, int16_t slot, const struct ChainSet* f) {
+    if (f->unk || f->n == 0) return 0;
+    struct ChainBig rb;
+    chain_flatten_big(&rb, cur, slot);
+    if (rb.unk) return 0;
+    uint8_t i = 0, j = 0;
+    while (i < f->n && j < rb.n) {
+        if (f->v[i] == rb.v[j]) { i++; j++; }
+        else if (f->v[i] < rb.v[j]) return 0;
+        else j++;
+    }
+    return i == f->n;
+}
 /* M2.30/M2.34: deliver cur[s] into a per-head accumulator. A DEFERRED
  * arrival is never flattened into the union — every record's true set
  * exceeds the flat cap (it was created by an overflow), so its
@@ -2594,27 +2617,60 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                 /* block head: union of the fall-through
                                  * carry (only if pc-1 falls through) and
                                  * the branch deliveries, per tracked slot.
-                                 * M2.30/M2.34: a DEFERRED carry's true set
-                                 * always exceeds the flat cap, so the
-                                 * union is UNKNOWN unless the arrival is
-                                 * the SAME record — every path carries the
-                                 * same product, the union is a no-op, and
-                                 * the deferred form crosses the join (the
-                                 * head-union no longer flattens what it
-                                 * preserves). The same-record check is
+                                 * M2.30/M2.34/M2.35: a DEFERRED carry's
+                                 * true set always exceeds the flat cap, so
+                                 * the union is UNKNOWN unless the arrival
+                                 * is the SAME record — every path carries
+                                 * the same product, the union is a no-op,
+                                 * and the deferred form crosses the join
+                                 * (the head-union no longer flattens what
+                                 * it preserves). The same-record check is
                                  * sound: the carry record is live (any
                                  * write to its DAG would have invalidated
                                  * cur[]), so an equal-index delivery —
                                  * made after the product — is live too.
-                                 * Anything else with a record on either
-                                 * side collapses to UNKNOWN. */
+                                 * M2.35 adds the FLAT-arrival case: when
+                                 * the flat path contributes only values
+                                 * the record already has, the union is
+                                 * still exactly the record, so the
+                                 * deferred form survives the join (the
+                                 * containment test materializes the LIVE
+                                 * carry record — sound for the same
+                                 * reason). Anything else with a record on
+                                 * either side collapses to UNKNOWN. */
                                 for (int s = 0; s < ntr; s++) {
-                                    if (cur[s].def >= 0 && g_chain_arr[s][pc].def != cur[s].def)
+                                    /* M2.35: only a DIFFERENT deferred
+                                     * arrival unknowns a deferred carry
+                                     * here; a FLAT arrival is decided in
+                                     * the second loop, where the
+                                     * containment test can materialize the
+                                     * record over the intact cur[]. */
+                                    if (cur[s].def >= 0 && g_chain_arr[s][pc].def >= 0 &&
+                                        g_chain_arr[s][pc].def != cur[s].def)
                                         chain_unknown(&cur[s]);
                                 }
                                 for (int s = 0; s < ntr; s++) {
                                     if (!carry) { cur[s].n = 0; cur[s].unk = 0; cur[s].def = -1; }
                                     if (cur[s].def >= 0 && g_chain_arr[s][pc].def == cur[s].def) continue;   /* same record: keep deferred */
+                                    if (cur[s].def >= 0) {
+                                        /* M2.35: a deferred carry meets a
+                                         * FLAT arrival — the union is
+                                         * still the record exactly when
+                                         * the flat path contributes only
+                                         * values the record already has
+                                         * (containment); otherwise the
+                                         * union exceeds it (still > 12)
+                                         * and cannot be a flat walk set.
+                                         * Materializing the CARRY record
+                                         * is sound: it is live, so its
+                                         * DAG slots still read the values
+                                         * the product saw. */
+                                        if (g_chain_arr[s][pc].def < 0 &&
+                                            chain_flat_in_def(cur, s, &g_chain_arr[s][pc]))
+                                            continue;
+                                        chain_unknown(&cur[s]);
+                                        continue;
+                                    }
                                     if (g_chain_arr[s][pc].def >= 0) { chain_unknown(&cur[s]); continue; }    /* record arrival vs flat carry: > 12 */
                                     chain_merge(&cur[s], &g_chain_arr[s][pc]);
                                 }

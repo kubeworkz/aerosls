@@ -3256,6 +3256,76 @@ added, zero moved:
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.80 M2.35 — the deferred-over-flat join (as built)
+
+M2.34 preserved a deferred form across a join only when every path
+carried the SAME record. The mirror case — a deferred carry meeting a
+FLAT arrival (a branch path whose index register is a constant) —
+still collapsed to UNKNOWN. M2.35's rule: when a join mixes a live
+deferred form with a flat set, the union is still exactly the record
+when the flat set is CONTAINED in the record's true set (the flat
+path contributes nothing new); otherwise the union exceeds the record
+(still > 12) and cannot be a flat walk set. The containment test
+(`chain_flat_in_def`) materializes the CARRY record BIG — sound for
+the M2.34 reason: the carry record is live (chain_prewrite flattens
+it on any write to its DAG), so its CD_SLOT operands still read the
+values the product saw. Two scoping decisions keep it sound and
+strictly additive:
+
+- **Empty-arrival gate**: an empty (delivery-less) arrival returns
+  "not contained", so iteration 1 of the fixpoint still collapses the
+  deferred carry exactly as M2.34 did — the change fires only when a
+  real flat arrival exists, preserving every pre-existing program's
+  iteration path byte-for-byte.
+- **Deliver-side untouched**: `chain_deliver`'s flat-then-deferred
+  order is unreachable — any flat r1 implies a prior r1 write, which
+  flattens the record out of `cur[]`, so a deferred delivery always
+  precedes a flat one into the same accumulator. Only the head-union
+  (deferred CARRY vs flat arrival) needed the change.
+
+The probe (jmpr_chain11) also surfaced two layout constraints worth
+recording: (a) the flat delivery must be FORWARD (a backward BR's
+arrival is read one iteration late, after the fixpoint has already
+exited — iteration 0's UNKNOWN matches the initial UNKNOWN snapshot);
+and (b) a BC delivery carries EVERY tracked slot, so the flat arm
+must sit after all joins — an early arm delivers UNKNOWN for the
+not-yet-joined registers and poisons them at the head. The final
+shape: all joins first, then the flat arm (`r1 = #34`, a value inside
+R1's set), then the product (R1 defers), then J1.
+
+### 10.81 M2.35 gate results (measured)
+
+Total emitted bytes across the now-59-program parity set: **M0 98944
+→ M1 84336, 14608 saved** (≈14.8%), up from M2.34's 14116. One row
+added, zero moved:
+
+- jmpr_chain11 3100 → 2608 (−492, new 59th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: index = `(r2 + r3) + r4` over
+  three joins plus the flat arm's forward BC delivering `{r1:34}`
+  into J1. R1's 15-value deferred product (the carry) survives the
+  flat join via containment, and the in-place second product composes
+  to the thirty candidates `{24..84}`; runtime `(20+32)+32 = 84`
+  takes the chain's thirtieth b.eq (dump-verified: 30 b.eq pairs,
+  first → #100's block, thirtieth → #3000's block). The chain vs
+  table delta is exactly 384 − 244 = +140; the rest of the 492 is the
+  M1 allocator on the 86-instruction body.
+- Teeth: disabling the containment keep grows jmpr_chain11 back to
+  exactly 2748 (the table path, still correct) — proving the
+  flat-arrival containment is what the chain dispatches through, not
+  an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed d4d7323,
+  measured with the M2.34 verifier): **all 58 shared rows
+  byte-identical** — no pre-existing program has a non-empty flat
+  arrival meeting a deferred carry (the empty-arrival gate keeps
+  iteration 1 identical), so M2.35 is strictly additive.
+- Four-way parity: 236 PASS, 0 FAIL — all 59 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 30-candidate
+  flat-join chain executes at runtime on the ARM engine (PASS 3000,
+  runtime index 84 taking the thirtieth b.eq), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
