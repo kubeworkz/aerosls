@@ -3080,6 +3080,80 @@ added, zero moved:
   fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
   rc=1).
 
+### 10.74 M2.32 — the deferred pair product, nested (as built)
+
+The M2.30/M2.31 deferral records the op plus two SOURCE SLOTS, so a
+product over a deferred source had to be flattened eagerly — and the
+capped walk-side flatten collapses (a deferred source's true set always
+exceeds 12) to UNKNOWN, killing the chain. jmpr_chain8's shape makes
+that visible: an in-place second product `ADD r1, r1, r4` over a
+15-value deferred `r1` died to the table. Two design facts block the
+naive fixes:
+
+- **Four-tracked-register cap.** The closure tracks the JMPR register
+  plus its transitive feeders (≤ 4). A second product in a fresh
+  register would need a fifth (the JMPR reg, the first product's two
+  sources, the second product's source, and the second dst), so the
+  nested form must write `r1` in place — `rd == ra`.
+- **No self-cycle.** The in-place record cannot reference its own slot
+  (materialization would recurse forever), so it must reference the
+  OLD value of `r1` — which is exactly what the deferral overwrites.
+
+M2.32 solves both with an immutable **def-record pool**: `cur[].def`
+became an index into `g_chain_defs`, and each record's two operands
+are either a tracked slot (`CD_SLOT`) or an OLDER record (`CD_REC`).
+The in-place product defers as `op(rec(R1), slot(r4))` — the left
+operand is the immutable record for `r1`'s old value, not `cur[r1]`
+itself, so there is no cycle. Records only reference older records, so
+the DAG is acyclic; the pool resets each walk iteration (cap 64,
+overflow → UNKNOWN). Two supporting changes keep the deferral sound:
+
+- **Transitive invalidation.** `chain_prewrite` now flattens every
+  deferred form whose record DAG TRANSITIVELY reaches the written
+  slot — a nested deferral reads its source's source, so writing a
+  leaf must invalidate the whole chain above it (a `CD_REC` operand
+  is immune, being immutable).
+- **In-place rule.** The deferral allows `rd == ra`/`rd == rb` only
+  when that source is itself deferred (referenced as a record); an
+  in-place FLAT source still falls to UNKNOWN exactly as M2.30 did.
+
+A layout caveat the pin surfaced: a deferred source cannot cross a
+block head — the head-union flattens every deferred form it mutates —
+so jmpr_chain8 runs all three joins first, then the two products and
+the JMPR in one straight-line run. (An imm-form product over a
+deferred source also stays UNKNOWN — the record's two operands are
+slot/record refs, no imm kind; noted as future work.)
+
+### 10.75 M2.32 gate results (measured)
+
+Total emitted bytes across the now-56-program parity set: **M0 89952
+→ M1 76908, 13044 saved** (≈14.5%), up from M2.31's 12568. One row
+added, zero moved:
+
+- jmpr_chain8 3064 → 2588 (−476, new 56th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The chain vs table delta
+  is exactly 376 − 244 = +132 (84-entry table + 10-word dispatch
+  minus the 30-pair chain); the remaining 344 of the 476 is the M1
+  allocator on the 84-instruction body. The teeth (nested record path
+  disabled) grows it back to exactly 2720 (the table path, still
+  correct) — proving the 30-candidate walk dispatches through the
+  nested DAG, not an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed a74f00f,
+  measured with the M2.31 verifier): **all 55 shared rows
+  byte-identical** — the def-record-pool rewrite is emission-invisible
+  on every pre-existing program (chain6/7's two-slot deferrals became
+  two-operand records with identical materialization; nothing else
+  touches the deferred form), so M2.32 is strictly additive.
+- Four-way parity: 224 PASS, 0 FAIL — all 56 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 30-candidate
+  nested chain executes at runtime on the ARM engine (PASS 3000,
+  runtime index 82 taking the thirtieth b.eq, dump-verified 30 b.eq
+  pairs from #100's block to #3000's block), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean (the canonical make a64-enc-check, a fresh assemble
+  + dump + re-derive); jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
