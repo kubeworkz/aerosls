@@ -3798,6 +3798,61 @@ One row added, zero moved:
   float/mem skips and the no-expected jmpr_oob are unchanged.
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.96 M2.43 — the tracked-register closure above 4 (as built)
+
+M2.26 sized TX_AR_CHAIN_REGS at 4 — the index register plus its
+feeders — and a closure needing more feeders TRUNCATED silently: the
+missing feeder was never tracked, its set stayed UNKNOWN, the index
+set became UNKNOWN, and the dispatch fell to the table. M2.43 raises
+the cap to 8, so a 5-8-feeder index chain now analyzes. Every
+TX_AR_CHAIN_REGS use is an array size or loop bound (g_chain_arr is
+REGS x 4096 ChainSets — the static footprint scales with the cap; 8
+is a generous bound for realistic register chains while staying well
+under TX_AR_MAX_REGS), so the change is a single define. The raise is
+emission-invisible for every pre-existing program — none has a closure
+between 5 and 8 (the chain-family tests were designed to fit the 4-cap
+or decline) — so it is strictly additive.
+
+### 10.97 M2.43 gate results (measured)
+
+Total emitted bytes across the now-67-program parity set: **M0
+126012 → M1 106548, 19464 saved** (≈15.4%), up from M2.42's 18940.
+One row added, zero moved:
+
+- jmpr_chain19 2824 → 2300 (−524, new 67th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: the index is built in TWO
+  stages over joins — r2 = r4 + r5 (r4 in {0,10}, r5 in {0,10,20} →
+  4 values {0,10,20,30}), then r1 = r2 + r3 (r3 in {40,42,44,46,48} →
+  TWENTY values {40..78}). The tracked closure is {r1, r2, r3, r4,
+  r5} — FIVE registers: under the 4-cap the closure stops at r4 and
+  r5 is never tracked, so r1 falls to UNKNOWN and the table runs;
+  under the 8-cap all five are tracked and the gate (164 < 360) emits
+  the 20-pair chain. Runtime `10 + 20 + 48 = 78` takes the chain's
+  TWENTIETH b.eq (dump-verified: 20 b.eq pairs, first → #100's block
+  at offset 1400, twentieth → #2000's block at offset 2160, both
+  byte-exact). The candidates ARE the block pcs (block0..block19 at
+  40..78) — the JMPR jumps to pc == index, so the dispatch index
+  doubles as the target pc. The chain vs table delta is exactly
+  360 − 164 = +196; the rest of the 524 is the M1 allocator on the
+  80-instruction body.
+- Teeth: reverting the cap to 4 grows jmpr_chain19 back to exactly
+  2496 (the table path — the closure truncates and r1 goes UNKNOWN,
+  still correct), proving the raised cap is what the chain dispatches
+  through.
+- Row-by-row accounting (gate tables diffed vs committed e1fe7d1,
+  measured with the M2.42 verifier): **all 66 shared rows
+  byte-identical** — no pre-existing program has a 5-8-register
+  closure, so M2.43 is strictly additive.
+- Four-way parity: 268 PASS, 0 FAIL — all 67 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (this milestone's
+  harness also captures the interpreter's OUTPUT — simi-run exits 0
+  regardless — so the interp check is a real value comparison); the
+  20-candidate two-stage chain executes at runtime on the ARM engine
+  (PASS 2000, runtime index 78 taking the twentieth b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
