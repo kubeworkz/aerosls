@@ -2508,6 +2508,89 @@ added, five moved:
   pre-existing skips unchanged). enc-check clean; jmpr_oob still
   faults (UDF, rc=1).
 
+### 10.56 M2.23 — whole-body dead-code elimination (as built)
+
+M2.22 treated dead code as dead for the FRAME LOAD and the FLUSHES but
+still emitted the dead bodies. M2.23 goes the rest of the way: a pc
+with ZERO live predecessors never executes under g_alloc=1 (the §10.52
+closure argument again: with the cache on, every reachable JMPR folds,
+so the reachable set is exact), so its ENTIRE body is not emitted. The
+emission loop's first act is the elimination skip —
+`if (g_alloc && !g_reach[pc] && g_npred[pc] == 0) { g_instr_off[pc] =
+cb.len; continue; }` — after which only live pcs reach the dispatch:
+ENTER frame loads, arithmetic, branches, CALL sites, dynamic JMPR
+table paths, and RETs of dead functions simply do not appear.
+
+The reachable-emission machinery SIMPLIFIES rather than accumulates:
+
+- The rule-1 boundary flush moves from the end of the loop to the
+  head of each block (`if (pc >= 1 && g_pc_target[pc]) cache_flush`),
+  landing at the same byte position (directly after the previous
+  instruction's code) and byte-identical for every reachable path.
+  M2.22's dead-head skip needs no guard: a dead head never reaches
+  the line (eliminated), and a live head always owes the flush
+  (g_reach is exact under the closure).
+- M2.22's `flush_owed` guards and its region-start reset are REMOVED
+  as subsumed: with elimination, every emitted pc is live, so every
+  internal flush is owed and every dead region is simply absent (no
+  cold shape to compile). M2.23 minus the elimination is
+  byte-identical to M2.21 (measured), which is also the teeth.
+- The JMPR jump table disappears from every g_alloc=1 program: a
+  dynamic path is only emitted by a non-folding JMPR, and under
+  g_alloc=1 every EMITTED JMPR folds (the non-folding ones are
+  dead — eliminated, table and all). The table machinery survives
+  only for naive mode, byte-identical to M0.
+- The M2.14 tail ownership naturally stays on live RETs: dead RETs
+  never reach the OP_RET case (they are eliminated), so the first
+  LIVE RET emits the shared return tail in place and the rest branch
+  to it. This is what keeps jmpr_calc correct — its dead RET was
+  previously the tail's owner.
+
+`g_instr_off[pc]` still records a byte position for a dead pc (the
+next live code) so the table and patch passes stay well-defined;
+nothing ever dispatches to it. Naive mode is untouched (a dynamic
+dispatch can land anywhere, so no pc is provably dead). The pc→offset
+mapping, the patch pass, and the fixpoint marks are all pc-based and
+need no adjustment — only the emission skips.
+
+### 10.57 M2.23 gate results (measured)
+
+Total emitted bytes across the now-47-program parity set: **M0 73240
+→ M1 63032, 10208 saved** (≈13.9%), up from M2.22's 8012. One row
+added, ten moved:
+
+- jmpr_deadfull 3316 → 1964 (−1352, new 47th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin. `deadfull` (pc 10) is an
+  unreachable function with a rich body (arithmetic chain computing
+  600, a CALL to the leaf, a BR to a second block, and a JMPR whose
+  600 index is out of range, so its dynamic path — and, as the only
+  dynamic JMPR in the stream, the whole 176-byte table — is dead).
+  M2.23 drops the entire function: 1964 = main + leaf + trampoline.
+  Teeth: disabling the elimination grows it back to exactly 3204 (the
+  M2.21 emission — M2.23 minus the elimination is byte-identical to
+  M2.21, since the hoisted flush and the reverted guards are
+  byte-neutral; the 1240-byte delta is the elimination alone).
+- The four dead-function rows now land on the same 1964-byte live
+  core (main + leaf + trampoline): jmpr_unreach 2160 → 1964 (−196:
+  dead body + 128-byte table), jmpr_deadmult 2188 → 1964 (−224: dead
+  body + 144-byte table), jmpr_callret_arg 2224 → 1964 (−260: the
+  whole `other` body — no table, its JMPR folds), and jmpr_deadfull.
+- Partial dead regions shrink to nothing: jmpr_calc 1036 → 1012
+  (−24: the dead LOADI/RET dispatch blocks), jmpr_calc_bit 1080 →
+  1052 (−28), jmpr_calc_mul 1032 → 984 (−48), jmpr_fall 1008 → 980
+  (−28: the whole dead path at the stream end), jmpr_mid 1008 → 992
+  (−16: its dead path), jmpr_basic 960 → 944 (−16), jmpr_cross 992 →
+  988 (−4: its dead RET).
+- Row-by-row accounting (gate tables diffed vs committed 7783483,
+  measured with the M2.22 verifier): all other 36 shared rows
+  byte-identical — M2.23 is byte-neutral over every program with no
+  dead code (and over every naive-mode program, jmpr_foldreach 3044
+  unchanged). The elimination is the entire M2.23 delta: with it
+  disabled, every row returns to its M2.21 byte count exactly.
+- Four-way parity: 147 PASS, 0 FAIL across all engines (the three
+  pre-existing skips unchanged). enc-check clean; jmpr_oob still
+  faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted

@@ -669,16 +669,6 @@ static void cache_flush(struct CodeBuf* cb) {
     if (!g_alloc) return;
     for (int i = 0; i < AR_CACHE_N; i++) cache_spill_one(cb, i);
 }
-/* M2.22: reachability-aware flush guard. Under g_alloc=1 a DEAD pc —
- * unreachable per the fold-aware BFS closure, so no runtime path ever
- * executes it or falls into its block — owes no spill: the flush
- * serves a live block (a branch target that must see current memory,
- * or the instruction's own slot reads), and a dead instruction's
- * flushes are dead weight. In naive mode cache_flush is a no-op, so
- * the guard only bites when the cache is on. Reachable code is
- * emitted exactly as before (this is byte-neutral over every
- * pre-existing reachable instruction). */
-static int flush_owed(uint32_t pc) { return !g_alloc || g_reach[pc]; }
 /* Claim a host register for rd's result; returns the cache slot (result
  * register = x9+slot), or -1 in naive mode (result in x9, stored by
  * store_result). When rd is already resident its slot is REUSED and the
@@ -1560,22 +1550,12 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         }
         break;
     }
-    case OP_ENTER:
-        /* M2.22: an UNREACHABLE function's ENTER never runs — drop its
-         * flush and the WHOLE prologue (the frame load; ~197 words of
-         * dead code). The dead-region start invariant has already
-         * emptied the directory, so the dead body is compiled exactly
-         * as a cold entry would be (the "empty initial cache
-         * directory" contract), and the frame the prologue would have
-         * built is main's, already in place for any fold that lands
-         * past this ENTER (jmpr_foldreach's shape). */
-        if (flush_owed(g_cur_pc)) { cache_flush(cb); emit_prologue(cb); }
-        break;
+    case OP_ENTER: cache_flush(cb); emit_prologue(cb); break;
     case OP_LEAVE: /* no-op directive, matches Phase 1 interpreter */ break;
     case OP_RESOLVE: {
         /* M1: the runtime call clobbers x0 and reads the name-pool arg from
          * its slot — the cache must be empty first (rule 1). */
-        if (flush_owed(g_cur_pc)) cache_flush(cb);
+        cache_flush(cb);
         /* rb_raw holds the name-pool index (FMT_RESOLVE, simi_isa.h). x0 =
          * namepool_ptr(r6) + idx*TX_AR_NAME_SIZE, a raw pointer straight
          * into the object's own name-pool bytes — no copy, mirrors x86.
@@ -1600,7 +1580,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     case OP_OBJSIZE: case OP_OBJTYPE: {
         /* M1: the runtime call clobbers x0 and the tag/value reads go
          * straight to memory, which must be current first (rule 1/3). */
-        if (flush_owed(g_cur_pc)) cache_flush(cb);
+        cache_flush(cb);
         /* v0.3 (Phase 7): require rA to currently carry a valid capability
          * tag before ever consulting the runtime catalog — an untagged
          * operand is rejected with the same sentinel used for "no such
@@ -1621,8 +1601,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_RET:
-        /* M1: r0 (and everything else) must be in slots — the call site reads them. M2.22: a dead RET never runs — skip its flush (the shared tail it branches to is only ever executed by live RETs, each of which flushes its own resident set first). */
-        if (flush_owed(g_cur_pc)) cache_flush(cb);
+        cache_flush(cb);         /* M1: r0 (and everything else) must be in slots — the call site reads them */
         /* M2.14 TAIL REUSE. The sequence below (ld_slot t0,0; ld_tag
          * t1,0; add sp,#frame; ldr x30; ldr x29; add sp,#16; br x30) is
          * byte-identical for EVERY RET in the function — the flush above
@@ -2196,6 +2175,32 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     }
 
     for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+        /* M2.23: DEAD-CODE ELIMINATION. A pc with zero live predecessors
+         * — g_npred[pc]==0 per the fold-aware BFS (entries are roots,
+         * reachable with count 0, excluded here by !g_reach) — never
+         * executes under g_alloc=1 (the closure of §10.52: every
+         * reachable JMPR folds, so the reachable set is exact), so its
+         * ENTIRE body — ENTER frame load, arithmetic, branches, CALL
+         * sites, dynamic JMPR table paths, RETs — is dead code and is
+         * not emitted at all (M2.22 dropped only the frame load and the
+         * flushes; this supersedes that). g_instr_off[pc] still records
+         * a byte position (the next live code) so the JMPR-table and
+         * patch passes stay well-defined; nothing ever dispatches to a
+         * dead pc. Naive mode is untouched: a dynamic dispatch can land
+         * anywhere, so no pc is provably dead there. */
+        if (g_alloc && !g_reach[pc] && g_npred[pc] == 0) {
+            g_instr_off[pc] = cb.len;
+            continue;
+        }
+        /* rule 1 (fall-through half), hoisted to the block head: a head
+         * reached by fall-through must arrive with current memory and no
+         * cache. Emitting the spill HERE (before pc's first word, i.e.
+         * directly after the previous instruction's code) is the same
+         * byte position the end-of-loop flush occupied, and the M2.22
+         * dead-head skip needs no guard: a dead head never reaches this
+         * line (eliminated above), and a live head always owes the
+         * flush (g_reach is exact under the closure). */
+        if (pc >= 1 && g_pc_target[pc]) cache_flush(&cb);
         g_instr_off[pc] = cb.len;
         /* The in-flight result reservation is per-instruction state: a
          * stale g_resv_slot from the previous instruction would make
@@ -2207,23 +2212,6 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         g_resv_reuse = 0;
         g_resv_guest = -1;
         g_cur_pc = pc;
-        /* M2.22: dead-region start invariant. A block with ZERO live
-         * predecessors — g_npred[pc]==0 per the fold-aware BFS (entries
-         * are roots, reachable with count 0, excluded here by !g_reach)
-         * and not fallen into from a live pc — is entered by no runtime
-         * path, so it is compiled with an EMPTY initial cache directory,
-         * the same state any cold entry sees. In practice the directory
-         * is already empty at a region start (the linear predecessor of
-         * a dead region is a terminal whose own flush spilled it), so
-         * this reset never emits a spill: it makes the contract
-         * structural rather than incidental, so a dead region's bytes
-         * cannot drift with the reachable residue preceding it, and a
-         * region that later becomes reachable (analysis change) is
-         * already emitted in its correct cold shape. */
-        if (g_alloc && !g_reach[pc] && g_npred[pc] == 0 && (pc == 0 || g_reach[pc - 1])) {
-            for (int i = 0; i < AR_CACHE_N; i++) g_cache_guest[i] = -1;
-            g_cache_round = 0;
-        }
         uint64_t w = instrs[pc];
         uint8_t op = w_op(w);
 
@@ -2238,13 +2226,13 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         } else if (op == OP_BR) {
             /* rule 1: the branch path and the fall-through both land on
              * code that must see current memory and an empty cache. */
-            if (flush_owed(pc)) cache_flush(&cb);
+            cache_flush(&cb);
             uint32_t target = (uint32_t)((int64_t)pc + 1 + w_imm28(w));
             op_b(&cb, target);
         } else if (op == OP_BC) {
             uint16_t ra = w_ra(w);
             if (ra >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
-            if (flush_owed(pc)) cache_flush(&cb);
+            cache_flush(&cb);
             uint32_t target = (uint32_t)((int64_t)pc + 1 + w_imm28(w));
             get_operand(&cb, ra, X_T0, 0);   /* no reservation in BC, hint inert */
             if (w_flags(w) & FLAG_INVERT) op_cbz(&cb, target, X_T0);
@@ -2255,7 +2243,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
              * result into the CALLER's r0, same as x86/RV64. M1: flush
              * first — the argument marshaling reads slots 0..7 and the
              * arg-tag mask from memory, which must be current. */
-            if (flush_owed(pc)) cache_flush(&cb);
+            cache_flush(&cb);
             emit_call_site(&cb, target, 0);
         } else if (op == OP_JMPR) {
             /* Gap Remediation SIMI Phase 14 / M2. Two shapes:
@@ -2276,20 +2264,20 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                  * branch — the target is the next instruction, reached by
                  * falling through. Emit NOTHING for it (M2.13: the fold
                  * fixpoint now folds whole CHAINS of these — each target
-                 * is unmarked by the merge, so every link folds). The end-of-loop
-                 * block-head flush below still fires at the boundary when
-                 * the target kept its mark (it has other incoming edges —
-                 * those land with an empty cache exactly as before), and is
-                 * SKIPPED when the coalescing pre-pass fused the target
-                 * (the fold was the only way in), so the x9/x10/x11 cache
-                 * survives the join and the register frame is loaded once,
-                 * not once per block. */
+                 * is unmarked by the merge, so every link folds). The
+                 * hoisted block-head flush at the target (loop top) still
+                 * fires when the target kept its mark (it has other
+                 * incoming edges — those land with an empty cache exactly
+                 * as before), and is SKIPPED when the coalescing pre-pass
+                 * fused the target (the fold was the only way in), so the
+                 * x9/x10/x11 cache survives the join and the register
+                 * frame is loaded once, not once per block. */
                 if (!(g_alloc && g_fold_fall[pc])) {
-                    if (flush_owed(pc)) cache_flush(&cb);
+                    cache_flush(&cb);
                     op_b(&cb, (uint32_t)g_jmpr_fold[pc]);
                 }
             } else {
-                if (flush_owed(pc)) cache_flush(&cb);
+                cache_flush(&cb);
                 ld_slot(&cb, X_T0, ra);                             /* t0 = target abstract pc */
                 e32(&cb, enc_movz(X_T2, (uint16_t)g_num_instr, 0)); /* num_instr <= 4096 fits one movz */
                 e32(&cb, enc_subs_shift(31, X_T0, X_T2, 0, 0));     /* cmp x9, x11 */
@@ -2308,13 +2296,6 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             int rc = emit_instr(&cb, w);
             if (rc != TX_AR_OK) return rc;
         }
-        /* rule 1 (fall-through half): the next pc is a block head — the
-         * fall-through must arrive with current memory and no cache.
-         * M2.22: a head with no live predecessors (a dead block) never
-         * runs, so the boundary flush is dead weight — skip it; the
-         * dead-region start invariant keeps its initial directory
-         * empty, so nothing downstream depends on the spill. */
-        if (pc + 1 < hdr.num_instr && g_pc_target[pc + 1] && flush_owed(pc + 1)) cache_flush(&cb);
         if (cb.overflow) return TX_AR_ERR_BUF_FULL;
     }
 
