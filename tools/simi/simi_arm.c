@@ -464,7 +464,12 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * value, not fold a single one. M2.26: the walk tracks ra plus its
  * TRANSITIVE FEEDERS (the closure in translate()), so an index built by
  * a register-form ADD/SUB — LOADI rb; ADD ra, ra, rb — chains too. */
-#define TX_AR_CHAIN_MAX 8
+/* M2.29: the set/chain capacity is 12 — larger than the M2.25-M2.28
+ * hard cap of 8, so 9-11-candidate sets can be collected AND emitted
+ * when the adaptive cost check says the chain beats the table. The
+ * emission is no longer a fixed cap: it fires when 8*n + 4 < 40 +
+ * 4*num_instr (see the activation below). */
+#define TX_AR_CHAIN_MAX 12
 #define TX_AR_CHAIN_REGS 4
 struct ChainSet { uint8_t n, unk; uint32_t v[TX_AR_CHAIN_MAX]; };
 static uint32_t g_chain_cand[TX_AR_CHAIN_MAX];
@@ -2483,7 +2488,26 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                         for (uint8_t i = 0; i < snap.n; i++)
                             if (snap.v[i] < hdr.num_instr && g_chain_ncand < TX_AR_CHAIN_MAX)
                                 g_chain_cand[g_chain_ncand++] = snap.v[i];
-                        g_chain_active = 1;   /* even ncand==0: a provably-constant OOB index (jmpr_oob) */
+                        /* M2.29: ADAPTIVE chain. Emit the chain only when
+                         * it actually beats the runtime table on bytes.
+                         * Chain: one subs+b.eq pair per in-range candidate
+                         * (2 words) + the UDF fall-through (1 word); the
+                         * index load and the pre-dispatch flush are shared
+                         * with the table path, so they cancel. Table: the
+                         * 10-word dispatch (movz num_instr, subs cmp, cset,
+                         * cbz, 2-word li32 base, add-shift, ldr W, br, UDF)
+                         * + num_instr 4-byte entries. Chain wins iff
+                         * 8*n + 4 < 40 + 4*num_instr. ncand==0 (jmpr_oob's
+                         * constant 999) always wins — a bare UDF. Every
+                         * in-range candidate is < num_instr <= 4096, so
+                         * all fit the imm12 of subs — no movz+subs form is
+                         * ever needed. The old hard cap of 8 made
+                         * 9-11-candidate sets keep the table even when the
+                         * chain was smaller; the 12-cap + cost gate is the
+                         * M2.29 change. */
+                        if (g_chain_ncand <= TX_AR_CHAIN_MAX &&
+                            8*g_chain_ncand + 4 < 40 + 4*(int)hdr.num_instr)
+                            g_chain_active = 1;
                     }
                 }
             }

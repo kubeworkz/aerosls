@@ -2894,6 +2894,66 @@ added, zero moved:
   fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
   rc=1).
 
+### 10.68 M2.29 — the adaptive chain cap (as built)
+
+M2.25-M2.28 emitted the inline chain only when the provable candidate
+set fit the hard cap of 8 — a 9-11-candidate set kept the runtime table
+EVEN when the chain would have been smaller. M2.29 makes the decision
+adaptive:
+
+- **The cost function.** Chain: one subs+b.eq pair per in-range
+  candidate (2 words) plus the UDF fall-through (1 word); the index
+  load and the pre-dispatch cache flush are shared with the table
+  path, so they cancel. Table: the 10-word dispatch (movz num_instr,
+  subs cmp, cset, cbz, the 2-word li32 base, add-shift, ldr W, br,
+  UDF) plus num_instr 4-byte entries (M2.24's compaction). The chain
+  fires when 8·n + 4 < 40 + 4·num_instr. Every in-range candidate is
+  < num_instr ≤ 4096, so all fit the imm12 of subs — no movz+subs
+  form is ever needed; ncand==0 (jmpr_oob's constant 999) always
+  wins (a bare UDF), byte-identical to M2.25.
+- **The 8 → 12 raise.** TX_AR_CHAIN_MAX grows to 12 so 9-11-candidate
+  sets can be COLLECTED (the merge no longer collapses them to
+  UNKNOWN at 9) and emitted. The static BSS cost is bounded (~290
+  KiB more across g_chain_arr); the corpus's sets stay tiny.
+- **jmpr_chain5, the pin.** The index is the pair product r1 = r2 + r3
+  over a 2-way join ({0, 10}) and a 5-way join ({18..26 evens}) — TEN
+  in-range candidates {18..36 evens} on the 38-instruction program.
+  The old cap kept the 152-byte table + dispatch (1664 bytes); the
+  adaptive check (84 < 192) emits the 10-pair chain instead, and the
+  runtime index 10 + 26 = 36 takes the chain's TENTH b.eq (block9,
+  LOADI #1000) — the full walk dispatches. (First test draft landed
+  the candidates 2 pcs off — labels do not consume pcs — and candidate
+  38 fell out of range, faulting via the chain UDF exactly as designed;
+  the corrected layout uses the blocks' real even pcs.)
+- **Unchanged soundness argument.** Union-at-joins, real-edges-only
+  linear state, UDF fall-through, out-of-range collapse — exactly
+  M2.25-M2.28's; only the emission decision grew from a hard cap to
+  a cost comparison, and the teeth (cap forced back to 8) grows
+  jmpr_chain5 back to exactly 1664 (the table path, still correct).
+
+### 10.69 M2.29 gate results (measured)
+
+Total emitted bytes across the now-53-program parity set: **M0 81408
+→ M1 69968, 11440 saved** (≈14.1%), up from M2.28's 11172. One row
+added, zero moved:
+
+- jmpr_chain5 1824 → 1556 (−268, new 53rd row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The teeth (cap forced to
+  8) grows it back to exactly 1664 (the table path, still correct).
+- Row-by-row accounting (gate tables diffed vs committed 649fbff,
+  measured with the M2.28 verifier): **all 52 shared rows
+  byte-identical** — M2.29 is strictly additive; no pre-existing
+  program has a candidate set above 2, so nothing else moved
+  (jmpr_oob's degenerate ncand==0 chain still fires).
+- Four-way parity: 212 PASS, 0 FAIL — all 53 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 10-candidate
+  chain executes at runtime on the ARM engine (PASS 1000), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean (the canonical make a64-enc-check, a
+  fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
+  rc=1).
+
 ---
 
 ## Sources consulted
