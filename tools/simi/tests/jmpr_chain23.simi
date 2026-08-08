@@ -1,0 +1,96 @@
+; jmpr_chain23.simi — M2.47: a SHL-BUILT dispatch index. Before M2.47
+; the shifts were NOT in the chain image family (chain_alu_eval handled
+; only ADD/SUB/MUL/AND/OR/XOR), so a shift on the index path fell to
+; the walk's opaque-writer branch and the chain died. M2.47 adds
+; SHL/SHR/SAR to the image: a constant-amount shift of a known set is
+; plain 64-bit, never faults and is type-agnostic (the M2.3 argument),
+; so a shifted index RE-DERIVES. The pin's index is r1 = r2 << 1 over a
+; TEN-way join (r2 in {20..29} -> TEN values {40,42,...,58}); the
+; gate (84 < 40 + 4*60 = 280) emits the 10-pair chain. The runtime
+; index 29 << 1 = 58 takes the chain's TENTH b.eq (58 = 40 + 2*9),
+; landing on block9's LOADI #1000. Candidates are real pcs (blocks at
+; 40..58 — the JMPR jumps to pc == index). The teeth: reverting the
+; M2.47 tracking (dropping the shifts from the walk's ALU branch) makes
+; the SHL opaque again — cur[r1] goes UNKNOWN, the chain dies, and the
+; row grows back to the table path, still correct. The register-form
+; amount (SHL r1, r2, r5 with LOADI r5, #1) re-derives identically —
+; the amount set is a singleton {1}, masked mod 64 (verified ad hoc).
+; Expected result: 1000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #20, i64  ; pc 2 — branch-path base (20) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:20} at J2)
+    LOADI r2, #21, i64  ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:21} at J2)
+    LOADI r2, #22, i64  ; pc 6
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:22} at J2)
+    LOADI r2, #23, i64  ; pc 8
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:23} at J2)
+    LOADI r2, #24, i64  ; pc 10
+    BC r0, J2           ; pc 11 — falls through (delivers {r2:24} at J2)
+    LOADI r2, #25, i64  ; pc 12
+    BC r0, J2           ; pc 13 — falls through (delivers {r2:25} at J2)
+    LOADI r2, #26, i64  ; pc 14
+    BC r0, J2           ; pc 15 — falls through (delivers {r2:26} at J2)
+    LOADI r2, #27, i64  ; pc 16
+    BC r0, J2           ; pc 17 — falls through (delivers {r2:27} at J2)
+    LOADI r2, #28, i64  ; pc 18
+    BC r0, J2           ; pc 19 — falls through (delivers {r2:28} at J2)
+    LOADI r2, #29, i64  ; pc 20 — fall-through base (29)
+J2:                     ; (label) — join: r2 in {20,21,...,29}
+    SHL r1, r2, #1, i64 ; pc 21 — the index build: r1 = r2 << 1 = TEN
+                        ; values {40,42,...,58}. M2.47: the shift is
+                        ; TRACKED — the walk re-derives the image
+                        ; (amount 1, masked mod 64) instead of treating
+                        ; the SHL as an opaque writer (UNKNOWN -> table).
+    JMPR r1             ; pc 22 — candidates {40,42,...,58}, runtime
+                        ; 29 << 1 = 58 (tenth).
+    LOADI r0, #0, i32   ; pc 23 — dead filler (aligns block0 to pc 40)
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+block0:                 ; pc 40
+    LOADI r0, #100, i32 ; pc 40
+    RET                 ; pc 41
+block1:                 ; pc 42
+    LOADI r0, #200, i32 ; pc 42
+    RET                 ; pc 43
+block2:                 ; pc 44
+    LOADI r0, #300, i32 ; pc 44
+    RET                 ; pc 45
+block3:                 ; pc 46
+    LOADI r0, #400, i32 ; pc 46
+    RET                 ; pc 47
+block4:                 ; pc 48
+    LOADI r0, #500, i32 ; pc 48
+    RET                 ; pc 49
+block5:                 ; pc 50
+    LOADI r0, #600, i32 ; pc 50
+    RET                 ; pc 51
+block6:                 ; pc 52
+    LOADI r0, #700, i32 ; pc 52
+    RET                 ; pc 53
+block7:                 ; pc 54
+    LOADI r0, #800, i32 ; pc 54
+    RET                 ; pc 55
+block8:                 ; pc 56
+    LOADI r0, #900, i32 ; pc 56
+    RET                 ; pc 57
+block9:                 ; pc 58
+    LOADI r0, #1000, i32 ; pc 58
+    RET                 ; pc 59
