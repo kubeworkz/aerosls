@@ -1,18 +1,18 @@
-; jmpr_chain21.simi — M2.45: an OPAQUE rewrite of the INDEX register r1
-; itself, between the index build and the dispatch — the mirror of M2.44
-; (which rewrote a FEEDER and pinned that r1's stored image survives).
-; The walk stores a per-register set, so a WRITE to r1 replaces cur[r1]
-; entirely: a TRACKED writer installs the new image (M2.27/M2.28), an
-; OPAQUE writer (SHR — not in the image family) installs UNKNOWN, and
-; the dispatch snapshot is then UNKNOWN — the chain dies conservatively
-; and the runtime table runs. The index is r1 = r2 + r3 over joins (r2
-; in {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values {42..80});
-; the opaque `SHR r1, r1, #1` sits BETWEEN the build and the dispatch.
-; The runtime index 32 + 48 = 80 becomes 80 >> 1 = 40 — a REAL block
-; (block_40 at pc 40, deliberately OUTSIDE the candidate set). The pin:
-; a stale-image chain would dispatch 40 against {42..80}, miss every
-; b.eq and UDF-trap; the table (the honest naive path, which the dead
-; chain forces) lands 40 on block_40 -> 10000. Four engines must agree.
+; jmpr_chain21.simi — M2.45: a rewrite of the INDEX register r1 itself,
+; between the index build and the dispatch — the mirror of M2.44 (which
+; rewrote a FEEDER and pinned that r1's stored image survives). The walk
+; stores a per-register set, so a WRITE to r1 REPLACES cur[r1] entirely:
+; a TRACKED writer installs the new image (M2.27/M2.28; M2.47 adds the
+; shifts), an OPAQUE writer installs UNKNOWN. The index is r1 = r2 + r3
+; over joins (r2 in {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY
+; values {42..80}); the `SHR r1, r1, #1` sits BETWEEN the build and the
+; dispatch. Since M2.47 the SHR is TRACKED: the write REPLACES the
+; stored image with the shifted one {42..80} >> 1 = TWENTY values
+; {21..40}, and the chain fires on the SHIFTED candidates. The runtime
+; index 32 + 48 = 80 becomes 80 >> 1 = 40 — the TWENTIETH candidate —
+; whose block (block_40 at pc 40) holds LOADI #10000. The pre-M2.47
+; behavior (SHR opaque -> UNKNOWN -> table, 2544 bytes) is the teeth;
+; the M2.45 "opaque dies" narrative is superseded. Four engines agree.
 ; Expected result: 10000
 .entry main
 main:
@@ -40,12 +40,13 @@ J3:                     ; (label) — join: r3 in {40,42,44,46,48}
                         ; This STORED image is what the dispatch WOULD
                         ; have read — but the next instruction rewrites
                         ; the index register itself.
-    SHR r1, r1, #1, i64 ; pc 19 — OPAQUE rewrite of the INDEX register:
-                        ; the walk cannot track SHR, so cur[r1] is
-                        ; REPLACED by UNKNOWN (unlike a feeder write,
-                        ; which leaves the stored image untouched). The
-                        ; chain must die — the runtime register now
-                        ; holds 80 >> 1 = 40, NOT a member of {42..80}.
+    SHR r1, r1, #1, i64 ; pc 19 — rewrite of the INDEX register: TRACKED
+                        ; since M2.47, so cur[r1] is REPLACED by the
+                        ; shifted image {42..80} >> 1 = {21..40} (the
+                        ; write replaces the stored image — unlike a
+                        ; feeder write, which leaves it untouched). The
+                        ; chain fires on the SHIFTED candidates; runtime
+                        ; 80 >> 1 = 40 = the twentieth candidate.
     JMPR r1             ; pc 20 — dynamic (index unknown) -> table.
                         ; Runtime 40 -> g_instr_off[40] = block_40.
     LOADI r0, #0, i32   ; pc 21 — dead filler (aligns block_40 to pc 40)

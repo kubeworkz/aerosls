@@ -4,11 +4,12 @@
 ; WRITE to a FEEDER updates only that feeder's slot — r1's stored image
 ; is untouched, exactly like the runtime register (r1 holds the value
 ; computed at the build, not re-derived from the rewritten r2). The
-; stress here is an OPAQUE rewrite: `SHL r2, r2, #1` is a writer the
-; walk cannot track, so r2's slot becomes UNKNOWN — yet the index set
+; stress here is a rewrite of the FEEDER r2 between the build and the
+; dispatch: `SHL r2, r2, #1` — TRACKED since M2.47 (the walk re-derives
+; {2,12,22,32} << 1 = {4,24,44,64} into r2's slot) — yet the index set
 ; must survive, because the dispatch reads only r1's slot.
 ; The index is r1 = r2 + r3 over joins (r2 in {2,12,22,32}, r3 in
-; {40,42,44,46,48} -> TWENTY values {42..80}); the opaque rewrite of r2
+; {40,42,44,46,48} -> TWENTY values {42..80}); the rewrite of r2
 ; sits BETWEEN the build and the dispatch; the gate (164 < 368) emits
 ; the 20-pair chain. The runtime index 32 + 48 = 80 (all join BCs fall
 ; through, r0 == 0) takes the chain's TWENTIETH b.eq, landing on
@@ -41,12 +42,13 @@ J2:                     ; (label) — join: r2 in {2, 12, 22, 32}
 J3:                     ; (label) — join: r3 in {40,42,44,46,48}
     ADD r1, r2, r3, i64 ; pc 18 — r1 = r2 + r3 = 20 values (42..80 evens).
                         ; This STORED image is what the dispatch reads.
-    SHL r2, r2, #1, i64 ; pc 19 — OPAQUE rewrite of the FEEDER r2: the
-                        ; walk cannot track SHL, so r2's slot becomes
-                        ; UNKNOWN — but r1's slot (the index) is a stored
-                        ; image from pc 18 and must be untouched. M2.44:
-                        ; the analysis must NOT re-derive the index set
-                        ; from the (now-unknown) feeder.
+    SHL r2, r2, #1, i64 ; pc 19 — rewrite of the FEEDER r2: TRACKED
+                        ; since M2.47, so the walk re-derives r2's slot
+                        ; to {4,24,44,64} — but r1's slot (the index) is
+                        ; a stored image from pc 18 and must be
+                        ; untouched. M2.44: the analysis must NOT
+                        ; re-derive the index set from the rewritten
+                        ; feeder.
     JMPR r1             ; pc 20 — candidates {42,44,...,80}, runtime 80
     LOADI r0, #0, i32   ; pc 21 — dead filler (aligns block0 to pc 42)
     LOADI r0, #0, i32   ; pc 22

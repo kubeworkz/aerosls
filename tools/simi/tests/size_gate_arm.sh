@@ -297,46 +297,63 @@
 # makes build2's image UNKNOWN — the chain dies (0 b.eq, table) and the
 # runtime index 80 + 96 = 176 lands on block17 -> 1800 on all four
 # engines — tracked vs opaque writer on the feeder, same position.
-# jmpr_chain21 is M2.45: an OPAQUE rewrite of the INDEX register r1
-# itself, between the index build and the dispatch — the mirror of M2.44
-# — a PROOF milestone with no code change. The walk stores a
-# PER-REGISTER set, so a WRITE to r1 REPLACES cur[r1] entirely: a
-# tracked writer installs the new image (M2.27/M2.28), an OPAQUE writer
-# (SHR — not in the image family) installs UNKNOWN, and the dispatch
-# snapshot is then UNKNOWN — the chain dies conservatively and the
-# runtime table runs. The pin's index is r1 = r2 + r3 over joins (r2 in
-# {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values {42..80}); the
-# opaque `SHR r1, r1, #1` sits BETWEEN the build and the dispatch. The
-# runtime index 32 + 48 = 80 becomes 80 >> 1 = 40 — a REAL block
-# (block_40 at pc 40, deliberately OUTSIDE the candidate set). The pin
-# discriminates: a stale-image chain would dispatch 40 against
-# {42..80}, miss every b.eq and UDF-trap; the table (the honest naive
-# path, which the dead chain forces) lands 40 on block_40 -> 10000. 336
-# bytes below its M0 baseline (the chain is dead by design — the delta
-# is the accumulated M1 emission folds, not the chain). The teeth: a
-# TRACKED rewrite at the same pc (ADD r1, r1, #-32) re-derives the
-# image {10..48} and the chain fires on the SHIFTED candidates (runtime
-# 48 -> block3, 400 on all four engines) — the replace is value-accurate
-# in both directions, proven at the same pc with only the op differing.
+# jmpr_chain23 is M2.47: the SHL-built dispatch index. Before M2.47
+# the shifts were NOT in the chain image family (chain_alu_eval handled
+# only ADD/SUB/MUL/AND/OR/XOR), so a shift on the index path fell to
+# the walk's opaque-writer branch and the chain died. M2.47 adds
+# SHL/SHR/SAR to the image: a constant-amount shift of a known set is
+# plain 64-bit, never faults and is type-agnostic (the M2.3 argument),
+# so a shifted index RE-DERIVES. The pin's index is r1 = r2 << 1 over a
+# TEN-way join (r2 in {20..29} -> TEN values {40,42,...,58}); the gate
+# (84 < 40 + 4*60 = 280) emits the 10-pair chain. The runtime index
+# 29 << 1 = 58 takes the chain's TENTH b.eq (block9, LOADI #1000).
+# 444 bytes below its M0 baseline. The register-form amount (SHL r1,
+# r2, r5 with LOADI r5, #1 — the amount set is a singleton {1}, masked
+# mod 64) re-derives identically (10 b.eq, 1804 bytes, PASS 1000 on
+# all four engines, verified ad hoc). The teeth: reverting the M2.47
+# tracking (dropping the shifts from the walk's ALU branch) makes the
+# SHL opaque again — cur[r1] goes UNKNOWN, the chain dies, and the row
+# grows back to exactly 2000 (the table path, 0 b.eq, still correct;
+# the 196-byte delta is exactly (40 + 4*60) - (8*10 + 4)).
+# jmpr_chain21 is M2.45: a rewrite of the INDEX register r1 itself,
+# between the index build and the dispatch — the mirror of M2.44 — a
+# PROOF milestone with no code change. The walk stores a PER-REGISTER
+# set, so a WRITE to r1 REPLACES cur[r1] entirely: a tracked writer
+# installs the new image (M2.27/M2.28), an OPAQUE writer installs
+# UNKNOWN. M2.45 (as built): the SHR was not in the image family, so
+# the write installed UNKNOWN, the chain died and the table ran (2544
+# bytes). M2.47 supersedes that narrative: the shifts joined the image,
+# so the SHR now REPLACES the stored image with the SHIFTED one —
+# {42..80} >> 1 = {21..40} — and the chain fires on the shifted
+# candidates (20 b.eq, 2340 bytes, −204 = the chain-vs-table delta).
+# The pin's index is r1 = r2 + r3 over joins (r2 in {2,12,22,32}, r3 in
+# {40,42,44,46,48} -> TWENTY values {42..80}); the `SHR r1, r1, #1`
+# sits BETWEEN the build and the dispatch. The runtime index 32 + 48 =
+# 80 becomes 80 >> 1 = 40 — the TWENTIETH candidate — whose block
+# (block_40 at pc 40) holds LOADI #10000, so the result is unchanged
+# (10000 on all four engines). The teeth: reverting the M2.47 tracking
+# grows the row back to exactly 2544 (SHR opaque -> UNKNOWN -> table,
+# still correct).
 # jmpr_chain20 is M2.44: a tracked FEEDER rewritten after the index
 # computation — a PROOF milestone with no code change. The chain walk
 # stores a PER-REGISTER set: the index build puts the image { r2 + r3 }
 # into r1's slot, and a later WRITE to a feeder updates only that
 # feeder's slot — r1's stored image is untouched, exactly like the
 # runtime register (r1 holds the value computed at the build, not
-# re-derived from the rewritten r2). The stress is an OPAQUE rewrite:
-# `SHL r2, r2, #1` is a writer the walk cannot track, so r2's slot
-# becomes UNKNOWN — yet the index set survives, because the dispatch
-# reads only r1's slot. The pin's index is r1 = r2 + r3 over joins
-# (r2 in {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values
-# {42..80}); the opaque rewrite sits BETWEEN the build and the
-# dispatch; the gate (164 < 368) emits the 20-pair chain. The runtime
-# index 32 + 48 = 80 (the SHL sets r2 = 64, but r1 was computed
-# before it) takes the chain's TWENTIETH b.eq (block19, LOADI #2000).
-# 540 bytes below its M0 baseline, and swapping the order (rewrite
-# BEFORE the build) grows it back to exactly 2528 (the table path —
-# the index is then computed from the unknown feeder, still correct)
-# — the teeth proving the analysis is order-sensitive.
+# re-derived from the rewritten r2). The stress is a rewrite of the
+# feeder r2: `SHL r2, r2, #1` — TRACKED since M2.47 (the walk
+# re-derives {2,12,22,32} << 1 = {4,24,44,64} into r2's slot) — yet
+# the index set survives, because the dispatch reads only r1's slot.
+# The pin's index is r1 = r2 + r3 over joins (r2 in {2,12,22,32}, r3
+# in {40,42,44,46,48} -> TWENTY values {42..80}); the rewrite sits
+# BETWEEN the build and the dispatch; the gate (164 < 368) emits the
+# 20-pair chain. The runtime index 32 + 48 = 80 (the SHL sets r2 = 64,
+# but r1 was computed before it) takes the chain's TWENTIETH b.eq
+# (block19, LOADI #2000). 540 bytes below its M0 baseline, and
+# swapping the order (rewrite BEFORE the build) grows it back to
+# exactly 2528 (the table path — the index is then computed from the
+# rewritten feeder, still correct) — the teeth proving the analysis
+# is order-sensitive.
 # jmpr_chain19 is M2.43: the tracked-register closure above 4. M2.26
 # sized TX_AR_CHAIN_REGS at 4 — the index register plus its feeders; a
 # closure needing more feeders truncated silently (the missing feeder's
@@ -824,7 +841,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

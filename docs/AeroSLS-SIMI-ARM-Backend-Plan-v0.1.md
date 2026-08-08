@@ -4019,6 +4019,70 @@ commit (a probe, not a change):
   and the no-expected jmpr_oob are unchanged. enc-check clean;
   jmpr_oob still faults (UDF, rc=1).
 
+### 10.104 M2.47 — the shifts join the chain image (as built)
+
+A CODE-CHANGE milestone (the first since M2.43's cap raise):
+SHL/SHR/SAR join the chain image family. Before M2.47 the walk's ALU
+branch tracked only ADD/SUB/MUL/AND/OR/XOR (chain_alu_eval returned 0
+for anything else), so a shift on the index path fell to the
+opaque-writer branch and the chain died. M2.47 adds the three shifts
+with the M2.3 argument: a constant-amount shift of a known set is
+plain 64-bit, never faults and is type-agnostic, so the image
+re-derives. The semantics mirror ar_const_step exactly: the AMOUNT is
+masked mod 64 (& 0x3F — lslv/lsrv/asrv mask in hardware, the interp
+masks with fetch_operand_b & 0x3F), SHR is LOGICAL (unsigned >>) and
+SAR ARITHMETIC (sign-filling). The change is two lines of logic
+(chain_alu_eval's switch + the walk's write-path condition); the
+emission needed nothing (the runtime shift codegen was already there).
+
+### 10.105 M2.47 gate results (measured)
+
+Total emitted bytes across the now-71-program parity set: **M0
+138868 → M1 116540, 22328 saved** (≈16.1%), up from M2.46's 21680.
+This milestone deliberately moves ONE shared row — the first since the
+airtight series began — and adds one:
+
+- jmpr_chain23 2248 → 1804 (−444, new 71st row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: a SHL-BUILT index. r1 = r2 << 1
+  over a TEN-way join (r2 in {20..29} -> TEN values {40,42,...,58});
+  the gate (84 < 40 + 4·60 = 280) emits the 10-pair chain. Runtime
+  `29 << 1 = 58` takes the chain's TENTH b.eq (dump-verified: 10 b.eq,
+  first subs = #40, last = #58) -> block9 -> PASS 1000 on all four
+  engines. The register-form amount (`SHL r1, r2, r5` with LOADI
+  r5,#1 — the amount set is the singleton {1}, masked mod 64)
+  re-derives identically (10 b.eq, 1804 bytes, PASS 1000, verified ad
+  hoc). Teeth: reverting the M2.47 tracking (dropping the shifts from
+  the walk's ALU branch) makes the SHL opaque again — cur[r1] goes
+  UNKNOWN, the chain dies, and the row grows back to exactly 2000
+  (the table path, 0 b.eq, still correct); the 196-byte delta is
+  exactly (40 + 4·60) − (8·10 + 4).
+- jmpr_chain21 2544 → 2340 (−204, MOVED — the deliberate
+  supersession): the M2.45 pin's SHR is now TRACKED. The write still
+  REPLACES cur[r1] (the M2.45 semantics hold), but with the SHIFTED
+  image {42..80} >> 1 = {21..40} instead of UNKNOWN — so the chain
+  fires on the shifted candidates and the row shrinks by exactly the
+  chain-vs-table delta. The result is unchanged (10000: runtime 80 >>
+  1 = 40 = the twentieth candidate -> block_40). The M2.45 "opaque
+  dies" narrative is superseded; the teeth revert grows the row back
+  to exactly 2544. jmpr_chain20's SHL (a FEEDER rewrite) is likewise
+  now tracked (r2's slot re-derives to {4,24,44,64}), but its row is
+  UNCHANGED at 2324 — the stored-image claim holds for tracked
+  writers too, so the pin survives with only its prose updated. The
+  M2.44/45 doc sections remain as-built history.
+- Row-by-row accounting (gate tables diffed vs committed c640fb7):
+  **exactly one of the 70 shared rows moved** (jmpr_chain21, above,
+  deliberate and documented), the other 69 byte-identical, and
+  jmpr_chain23 added — the shift tracking is emission-invisible
+  everywhere except where a shift actually feeds an index path.
+- Four-way parity: 284 PASS, 0 FAIL — all 71 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the SHL-built chain executes at
+  runtime on the ARM engine (PASS 1000, runtime index 58 taking the
+  tenth b.eq), and the documented float/mem skips and the no-expected
+  jmpr_oob are unchanged. enc-check clean; jmpr_oob still faults
+  (UDF, rc=1).
+
 ---
 
 ## Sources consulted
