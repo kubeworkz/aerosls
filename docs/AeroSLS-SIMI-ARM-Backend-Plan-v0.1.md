@@ -1971,6 +1971,143 @@ on top of M2.16's 4312:
 - Four-way parity: interp 40/0, x86 39/0/3, RV64 38/0/4, ARM 38/0/4.
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.42 M2.17 amendment — relaxing the epi-merge rigid layout (as built)
+
+M2.15's layout made the two dead-region intermediates at T+2/T+3
+rigidly LOADI/LOADI64 — the head is compiled before the source, so the
+runtime register state at the head has to come from a statically known
+shape. M2.17 relaxes that to **any plain result-op** whose emission is
+"reserve + transient fetches + compute + store" — an arithmetic chain,
+CMP, LEA or PTRADD result merges exactly like a LOADI did.
+
+Why this is sound: the merge's invariants depend only on the **claim
+count**, not on what computes the values. Each accepted op calls
+cache_reserve exactly once (ar_is_result_op's contract), so the
+pattern's claim plus the two intermediates' claims still net +3 ≡ 0
+mod 3, the tail's result host stays the pre-T cursor value cnt%3, and
+the drop flags are unchanged. The destination check (d1/d2 distinct
+and neither equal to the pattern's sources a1/b1) is what makes the
+tail's fetches *real reloads* — a miss against a cache holding exactly
+the two intermediate claims. That is the execution-order subtlety: the
+head executes *after* the intermediates via the backward fold, but is
+program-order *before* them, so "dead result" must be read as "not
+claimed onto a guest the head (or tail) fetches" — the d1/d2 ≠ a1/b1
+distinctness check, not a program-order liveness scan. The folded
+JMPR's index register is deliberately exempt: it may be the computed
+intermediate's destination (the flagship epi_merge4 shape), and a
+folded JMPR never fetches its index at runtime.
+
+The accepted set is a strict whitelist (ar_is_interm_op), not "any
+result-op": **OP_CALL is excluded** (no plain claim — the call-site
+scratch clobbers the cache state the invariant argument assumes) and
+**OP_LOAD is excluded** (its address math's clobber_scratch paths and
+the M2.8–M2.10 folds aren't covered by the invariant). Every other
+result-op's emission is plain.
+
+Why a post-hoc fixup variant can't work (the §10.37 emission-order
+constraint, restated): the head's drop decisions are baked into
+*already-emitted* bytes — the ldr count and host assignments at the
+head are fixed by the time the fold source is reached. Patching the
+head's fetch layout after the fact is recompilation, which is exactly
+the constraint being relaxed; the only sound directions are (a) widen
+what the *source* may emit while keeping the head's shape fixed (this
+milestone), or (b) compile the head twice against a placeholder — not
+worth it for a dead-path shape. The remaining frontier named in §10.37
+(the general joint fixpoint) is still open; the emission-order
+constraint on epi-merge is unchanged, only its layout is wider.
+
+### 10.43 M2.17 gate results (measured)
+
+Total emitted bytes across the now-39-program parity set: **M0 53008
+→ M1 48404, 4604 saved** (≈8.7%), up from M2.16's 4460. The new row
+on top of M2.16's 4460:
+
+- epi_merge4 1148 → 1004 (−144, new 39th row; M0 baseline measured
+  at git 1729f50). The dead region computes its fold index with an
+  arithmetic chain (seed LOADI + ADD) instead of a LOADI; the
+  constant-fixpoint analysis folds it, the epi-merge fires with both
+  fetches dropped (flags=3 class), and the head is a bare add with
+  zero ldr words. Reverting the widening to LOADI-only grows it back
+  to exactly 1012 (+8 — the merge no longer fires, head reloads both
+  sources), still correct; the other three epi_merge rows are
+  byte-identical (their T+3 is still a LOADI).
+- Row-by-row accounting (gate tables diffed): all 38 shared rows
+  byte-identical — the totals move by exactly the new row.
+- Four-way parity: interp 41/0, x86 40/0/3, RV64 39/0/4, ARM 39/0/4.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+- Coverage pin (follow-up, mirroring how epi_merge3 was teed up in
+  §10.39): epi_merge4 exercises exactly **one** computed intermediate
+  (T+2 is still a LOADI seed) in the flags=3 class. The
+  two-computed-intermediate shape and the flags=1/2 classes with
+  computed ops remain unpinned; the formula is shared, so they are
+  pins rather than gaps.
+
+### 10.44 M2.17-follow-up — the computed fold index in the flags=2 class, and the two-computed ceiling (as pinned)
+
+This amendment closes the §10.43 coverage pin — **partially**, and
+precisely: the flags=2-with-computed clause is now pinned; the
+flags=1-with-computed clause remains a follow-up (epi_merge3 pins
+flags=1 with LOADI intermediates, so the formula's first branch still
+lacks a computed-op witness); and the two-computed-intermediate
+clause is closed as a **proven-impossible ceiling**, not a pin.
+
+epi_merge5 is the epi_merge2 mirror with a computed fold index: three
+live results (r2, r1, r6) make the pre-T result count 3 ≡ 0 mod 3, so
+the tail's result lands in x9 and clobbers the r2 transient — the
+head KEEPS its r2 reload and DROPS only the r1 fetch (flags = 2),
+with r1 surviving as the tail's transient in x10. The dead region
+computes the fold index with an arithmetic chain (seed LOADI r4, #2
+then ADD r5, r4, #3 → r5 = 5 = T) — the M2.17 widening at work in a
+second cursor class. Dump-verified: the head is `ldr x9, slot2; add
+x9, x9, x10` — exactly one ldr. Teeth: disabling the merge grows it
+back to exactly 1024 (+4 — the one kept fetch), the exact mirror of
+epi_merge2's teeth; all epi_merge rows still verify 7. Four-way
+parity: interp 42/0, x86 41/0/3, RV64 40/0/4, ARM 40/0/4; enc-check
+clean; jmpr_oob still faults (UDF, rc=1).
+
+**The two-computed ceiling.** The M2.17 widening is *permissive* —
+ar_is_interm_op accepts any plain result-op at T+2, and the claim-count
+invariant (the pattern's claim plus two intermediates' claims net +3 ≡
+0 mod 3) would be satisfied by two computed ops as readily as by one.
+The ceiling is the constant-fixpoint analysis, not the invariant: T+2
+is necessarily the fold-source BR target — a block head where the
+fold fixpoint resets every constant — and every pre-T constant is
+additionally wiped at T (rule-1 fold-target mark, from the second
+scan onward) and at T+1 (RET). A computed T+2 therefore has no known
+source; its result cannot fold; the JMPR's index is unknown, so it
+goes DYNAMIC and kills g_alloc for the whole function. A scratch
+probe (probe_2c, T+2 = ADD sourcing a pre-T constant) proved it
+empirically: the JMPR did not fold and the function emitted the naive
+path. The probe was deleted after the measurement — its un-folded
+step-budget loop hangs the test runners, so it cannot live in the
+corpus. The seed at T+2 must be a LOADI (or LOADI64, the only
+constant-establishing ops); **at most one dead-region intermediate
+can be computed**. Relaxing this would require the fixpoint to carry
+constants across the fold-source entry — the §10.38 joint-fixpoint
+future work, not a widening change.
+
+### 10.45 M2.17-follow-up gate results (measured)
+
+Total emitted bytes across the now-40-program parity set: **M0 54176
+→ M1 49424, 4752 saved** (≈8.8%), up from M2.17's 4604. The new row
+on top of M2.17's 4604:
+
+- epi_merge5 1168 → 1020 (−148, new 40th row; M0 baseline measured
+  at git 1729f50). 148 = epi_merge4's 144 plus the extra pre-T decoy
+  (r6) the flags=2 cursor class requires. Disabling the merge grows
+  it back to exactly 1024 (+4, the one kept fetch — the mirror of
+  epi_merge2's teeth, while epi_merge's two dropped fetches measure
+  +8). All teeth states still verify 7.
+- Row-by-row accounting (gate tables diffed vs committed 8b61abd):
+  all 38 shared rows byte-identical — the totals move by exactly the
+  two new rows (epi_merge4 1012→1004, M2.17's widening delta;
+  epi_merge5 1024→1020).
+- Four-way parity: interp 42/0, x86 41/0/3, RV64 40/0/4, ARM 40/0/4.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+- Remaining follow-up pin: flags=1-with-computed (mirror of how
+  epi_merge3 was teed up; the formula and hook are shared, so it is
+  a pin rather than a gap).
+
 ---
 
 ## Sources consulted
