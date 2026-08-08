@@ -89,6 +89,7 @@ enum {
     OP_ENTER, OP_LEAVE,
     OP_RESOLVE, OP_OBJSIZE, OP_OBJTYPE, /* v0.3 (Phase 6) */
     OP_JMPR, /* Gap Remediation SIMI Phase 14 */
+    OP_CAS, OP_ATOMIC_ADD, /* Gap Remediation SIMI Phase 15 (shared-memory atomics) */
     OP_COUNT
 };
 enum { T_I8=0,T_I16,T_I32,T_I64,T_U8,T_U16,T_U32,T_U64,T_F32,T_F64,T_PTR,T_BOOL,T_OBJREF };
@@ -124,6 +125,12 @@ static int32_t  w_imm28(uint64_t w) {
 #define X_A0   10   /* v0.3 (Phase 6): real RV64 ABI arg0/return register, used
                       * only around RESOLVE/OBJSIZE/OBJTYPE runtime calls —
                       * every other codegen path here uses t0-t2 exclusively. */
+#define X_A1   11   /* Gap Remediation SIMI Phase 15: fourth scratch register,
+                      * used ONLY by the CAS lr/sc loop (expected value must
+                      * survive the lr.d clobber; see OP_CAS's comment). No
+                      * runtime call crosses the loop, so a1 stays live —
+                      * the "t0-t2 exclusively" note above gets exactly this
+                      * one documented exception. */
 
 /* ─── Code buffer ─────────────────────────────────────────────────────── */
 struct CodeBuf { uint8_t* buf; uint32_t cap; uint32_t len; int overflow; };
@@ -225,6 +232,16 @@ static void s_sb  (struct CodeBuf* cb, uint8_t rs2, uint8_t rs1, int32_t imm) { 
 
 static void u_auipc (struct CodeBuf* cb, uint8_t rd, int32_t imm20) { e32(cb, enc_u(imm20,rd,OPC_AUIPC)); }
 static void i_jalr  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, int32_t imm) { e32(cb, enc_i(imm,rs1,0x0,rd,OPC_JALR)); }
+/* Gap Remediation SIMI Phase 15 (shared-memory atomics): the A-extension
+ * AMO encodings the plan's D4 design specifies — lr.w/lr.d (funct5 0x02),
+ * sc.w/sc.d (funct5 0x03), amo.add.w/amo.add.d (funct5 0x00), opcode
+ * 0x2F. aq=rl=1 (acquire-release; the single-threaded exec model can't
+ * observe the distinction, and on real hardware it's the strongest
+ * SC-ish form available from the A extension alone). funct3 is 0x2 (W)
+ * or 0x3 (D), matching LW/LD's width field. */
+static void amo_lr  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, int is_d) { e32(cb, (0x02u<<27)|(1u<<26)|(1u<<25)|((uint32_t)rs1<<15)|((uint32_t)(is_d?3:2)<<12)|((uint32_t)rd<<7)|0x2Fu); }
+static void amo_sc  (struct CodeBuf* cb, uint8_t rd, uint8_t rs2, uint8_t rs1, int is_d) { e32(cb, (0x03u<<27)|(1u<<26)|(1u<<25)|((uint32_t)rs2<<20)|((uint32_t)rs1<<15)|((uint32_t)(is_d?3:2)<<12)|((uint32_t)rd<<7)|0x2Fu); }
+static void amo_add (struct CodeBuf* cb, uint8_t rd, uint8_t rs2, uint8_t rs1, int is_d) { e32(cb, (0x00u<<27)|(1u<<26)|(1u<<25)|((uint32_t)rs2<<20)|((uint32_t)rs1<<15)|((uint32_t)(is_d?3:2)<<12)|((uint32_t)rd<<7)|0x2Fu); }
 
 /* ─── Symbolic register slot helpers: reg i lives at [s0 - 8*(i+1) - 16] ──
  * Direct RV64 analog of simi_x86.c's rbp-relative reg_disp/ld_rax/st_rax,
@@ -299,6 +316,24 @@ static uint32_t emit_beqz_placeholder(struct CodeBuf* cb) {
 static void patch_local_beqz(struct CodeBuf* cb, uint32_t pos, uint8_t rs1) {
     int32_t off = (int32_t)(cb->len - pos);
     patch32(cb->buf, pos, enc_b(off, X_ZERO, rs1, 0x0, OPC_BRANCH));
+}
+/* Phase 15: BNE variants of the same local-patch pattern — the CAS
+ * lr/sc loop needs a two-register BNE (old vs expected) and a backward
+ * BNE (sc failure -> retry), both intra-instruction. */
+static uint32_t emit_bne_placeholder(struct CodeBuf* cb) {
+    uint32_t pos = cb->len;
+    e32(cb, 0);
+    return pos;
+}
+static void patch_local_bne(struct CodeBuf* cb, uint32_t pos, uint8_t rs1, uint8_t rs2) {
+    int32_t off = (int32_t)(cb->len - pos);
+    patch32(cb->buf, pos, enc_b(off, rs2, rs1, 0x1, OPC_BRANCH));
+}
+/* Backward variant: target is already-emitted code (the retry label),
+ * not the current end of buffer. */
+static void patch_bne_back(struct CodeBuf* cb, uint32_t branch_pos, uint32_t target_pos, uint8_t rs1, uint8_t rs2) {
+    int32_t off = (int32_t)(target_pos - branch_pos);
+    patch32(cb->buf, branch_pos, enc_b(off, rs2, rs1, 0x1, OPC_BRANCH));
 }
 static uint32_t emit_jal_placeholder(struct CodeBuf* cb) {
     uint32_t pos = cb->len;
@@ -611,7 +646,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     if (rd >= TX_RV_MAX_REGS || ra >= TX_RV_MAX_REGS) return TX_RV_ERR_REG_OUT_OF_RANGE;
     if ((op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV||op==OP_MOD||op==OP_AND||
          op==OP_OR||op==OP_XOR||op==OP_SHL||op==OP_SHR||op==OP_SAR||op==OP_CMP||
-         op==OP_PTRADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_RV_MAX_REGS)
+         op==OP_PTRADD||op==OP_CAS||op==OP_ATOMIC_ADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_RV_MAX_REGS)
         return TX_RV_ERR_REG_OUT_OF_RANGE;
     /* Gap Remediation SIMI Phase 10: this translator has no float codegen
      * at all (scoped out of v1 -- see TX_RV_ERR_FLOAT_UNSUPPORTED's
@@ -807,6 +842,48 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         i_jalr(cb, X_ZERO, X_T2, 0);                         /* jump -- never falls through */
         patch_local_beqz(cb, beqz_pos, X_T1);                 /* .oob: */
         op_illegal(cb);                                       /* real illegal-instruction trap -- non-negotiable CFI per ISA §16 */
+        break;
+    }
+    case OP_CAS: case OP_ATOMIC_ADD: {
+        /* Gap Remediation SIMI Phase 15 (plan doc Part II D1/D4): v1 =
+         * 4/8-byte cells, register operands only (FLAG_IMM rejected —
+         * there is no displacement form), SC ordering. rA = base
+         * pointer, rB = expected (CAS) / addend (ATOMIC_ADD), rD =
+         * new-in/old-out (CAS, the cmpxchg shape) / old-out only
+         * (ATOMIC_ADD). RV64's A extension implements the plan's D4
+         * design: CAS is the lr/sc loop (lr.w/lr.d -> compare ->
+         * sc.w/sc.d, retry on sc failure), ATOMIC_ADD is
+         * amo.add.w/amo.add.d. The returned old is the cell's raw bits
+         * ZERO-extended — lr.w/amo.add.w sign-extend, so the 32-bit
+         * forms zero-extend via slli+srli, exactly the interpreter's
+         * width-masked semantics (and the expected value's garbage high
+         * bits are masked the same way, the A1 i32 tooth's shape). */
+        int wdt = 1 << type_shift(type);
+        if (flags & FLAG_IMM) return TX_RV_ERR_BAD_OPCODE;
+        if (wdt != 4 && wdt != 8) return TX_RV_ERR_BAD_OPCODE;
+        ld_slot(cb, X_T0, ra);                 /* t0 = base pointer */
+        if (op == OP_CAS) {
+            ld_slot(cb, X_T1, rd);             /* t1 = new value (rD input) */
+            ld_slot(cb, X_A1, w_rb_reg(w));    /* a1 = expected (rB) — survives the lr clobber */
+            if (wdt == 4) { i_slli(cb, X_A1, X_A1, 32); i_srli(cb, X_A1, X_A1, 32); } /* mask expected to low 32 */
+            uint32_t retry_pos = cb->len;      /* .retry: */
+            if (wdt == 8) amo_lr (cb, X_T2, X_T0, 1);         /* t2 = old */
+            else          amo_lr (cb, X_T2, X_T0, 0);
+            if (wdt == 4) { i_slli(cb, X_T2, X_T2, 32); i_srli(cb, X_T2, X_T2, 32); } /* zero-extend old */
+            uint32_t mismatch_pos = emit_bne_placeholder(cb); /* bne t2, a1, .done */
+            if (wdt == 8) amo_sc (cb, X_T2, X_T1, X_T0, 1);   /* attempt store; t2 = 0 on success */
+            else          amo_sc (cb, X_T2, X_T1, X_T0, 0);
+            uint32_t retry_branch = emit_bne_placeholder(cb); /* bne t2, zero, .retry */
+            patch_bne_back(cb, retry_branch, retry_pos, X_T2, X_ZERO);
+            i_addi(cb, X_T2, X_A1, 0);                        /* success: old == expected (a1) */
+            patch_local_bne(cb, mismatch_pos, X_T2, X_A1);    /* .done: */
+        } else {
+            ld_slot(cb, X_T1, w_rb_reg(w));    /* t1 = addend (rB) */
+            if (wdt == 8) amo_add(cb, X_T2, X_T1, X_T0, 1);   /* t2 = old; [base] += addend */
+            else          amo_add(cb, X_T2, X_T1, X_T0, 0);
+            if (wdt == 4) { i_slli(cb, X_T2, X_T2, 32); i_srli(cb, X_T2, X_T2, 32); } /* zero-extend old */
+        }
+        st_slot_untag(cb, X_T2, rd);           /* rD = old (returned), untagged */
         break;
     }
     default: return TX_RV_ERR_BAD_OPCODE;

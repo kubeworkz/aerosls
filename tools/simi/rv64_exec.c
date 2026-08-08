@@ -157,6 +157,43 @@ int rv64_exec_run(struct RvCpu* cpu, uint64_t max_steps) {
             }
             break;
         }
+        case 0x2F: { /* AMO (A extension) — Gap Remediation SIMI Phase 15:
+            * lr/sc/amo.add, the three encodings simi_riscv.c emits for
+            * OP_CAS (lr+sc loop) and OP_ATOMIC_ADD (amo.add). funct3 is
+            * 0x2 (W, 4-byte) / 0x3 (D, 8-byte); aq/rl bits [26:25] are
+            * ignored (the guest model is single-threaded — nothing can
+            * contend). The single-threaded model also means sc never
+            * fails: the plan's "sc.d failure path" is implemented as
+            * rd=0 always, and the loop simply never retries here (real
+            * contention needs real hardware — the documented caveat).
+            * lr.w/amo.add.w sign-extend their loaded old per the spec;
+            * the emitted slli+srli zero-extension normalizes it to the
+            * interpreter's "raw bits, zero-extended" returned-old. */
+            uint32_t funct5 = (w>>27) & 0x1Fu;
+            if (funct3 != 0x2 && funct3 != 0x3) return RV_EXEC_BAD_INSTR;
+            switch (funct5) {
+                case 0x02: { /* LR: rd = [rs1] */
+                    uint64_t out;
+                    if (!load_mem(cpu, v1, 1 << funct3, (funct3 == 0x2), &out)) return RV_EXEC_MEM_FAULT;
+                    setx(cpu, rd, out);
+                    break;
+                }
+                case 0x03: { /* SC: [rs1] = rs2; rd = 0 on success (always here) */
+                    if (!store_mem(cpu, v1, 1 << funct3, v2)) return RV_EXEC_MEM_FAULT;
+                    setx(cpu, rd, 0);
+                    break;
+                }
+                case 0x00: { /* AMOADD: rd = old; [rs1] += rs2 (truncated to width) */
+                    uint64_t old;
+                    if (!load_mem(cpu, v1, 1 << funct3, (funct3 == 0x2), &old)) return RV_EXEC_MEM_FAULT;
+                    if (!store_mem(cpu, v1, 1 << funct3, old + v2)) return RV_EXEC_MEM_FAULT;
+                    setx(cpu, rd, old);
+                    break;
+                }
+                default: return RV_EXEC_BAD_INSTR;
+            }
+            break;
+        }
         case 0x63: { /* BRANCH */
             int taken;
             switch (funct3) {
