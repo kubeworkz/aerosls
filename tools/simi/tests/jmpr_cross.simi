@@ -1,0 +1,38 @@
+; jmpr_cross.simi — M2.16: a JMPR whose index chain CROSSES a fused
+; fall-through fold's target. The §10.30-era fixpoint-vs-coalescing
+; interaction, pinned: a folded JMPR to the VERY NEXT pc (fold A, pc 3
+; -> pc 4) is a dead branch that the coalescing pass DROPS and FUSES
+; (pc 4 has no other incoming edge), so the register frame is loaded
+; once. But pc 4 sits INSIDE another JMPR's index chain: r2 (fold B's
+; index) is loaded at pc 1, BEFORE pc 4, and read at pc 5. Under the
+; M2.12-era mark-all merge, the rule-1 mark on pc 4 reset the constant
+; map at the boundary, un-folding B — a JMPR that fails to fold is
+; DYNAMIC, which kills g_alloc for the whole function (the runtime
+; table + bounds check return, and the cache dies with them). The
+; M2.13 rule-1 skip (fall-through fold targets are never marked — the
+; coalescing pass is the authority on their mark) lets the chain flow
+; through the fused boundary: r2 = 7 survives from pc 1 across pc 4
+; to B at pc 5, B folds to pc 7, and g_alloc stays 1.
+;
+; jmpr_fall2 pins the CASCADE (three consecutive fall-through folds);
+; jmpr_cross pins the GENERAL shape the §10.30 ceiling named — a
+; chain that a fused boundary enables to fold, where the chain is NOT
+; the fall-through fold's own next JMPR. The teeth: reverting the
+; rule-1 skip to mark-all makes B dynamic (g_alloc=0) — measured in
+; the size gate — while the four-way parity proves the program still
+; computes 19 on every path (the dynamic path's bounds check must
+; still dispatch correctly).
+; Expected result: 19 (r3 = r2+1 = 8; r0 = (8+4)+7)
+.entry main
+main:
+    ENTER #8
+    LOADI r2, #7, i64        ; B's index — set BEFORE the fused boundary pc 4
+    LOADI r1, #4, i64        ; A's index
+    JMPR r1                  ; A: folds to pc 4 = pc+1 (fall-through fold)
+    ADD r3, r2, #1, i64      ; pc 4 = A's target, fused: r3 = 7 + 1 = 8
+    JMPR r2                  ; B: index r2 = 7 — folds to pc 7 iff the chain survives pc 4
+    RET                      ; dead path (B folds to 7, never reached)
+target7:
+    ADD r0, r3, r1, i64      ; r0 = 8 + 4 = 12
+    ADD r0, r0, r2, i64      ; r0 = 12 + 7 = 19
+    RET
