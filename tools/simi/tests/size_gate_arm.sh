@@ -86,7 +86,20 @@
 # type-agnostic — the M2.3 fold's argument), imm and register forms
 # alike. 140 bytes below its M0 baseline, and disabling the bitwise
 # image grows it back to exactly 1184 (the table path, still correct)
-# — the teeth. jmpr_calc is M2.1: its index is COMPUTED at translate
+# — the teeth. jmpr_chain5 is
+# M2.29: the ADAPTIVE chain cap. Its dispatch index is the pair product
+# r1 = r2 + r3 over a 2-way join ({0,10}) and a 5-way join ({18..26
+# evens}), so the candidate set has TEN in-range values {18..36 evens} —
+# beyond the M2.25-M2.28 hard cap of 8, which made such a set keep the
+# runtime table. M2.29 raises the collection/emission cap to 12 and
+# makes the chain adaptive: it fires when 8*n + 4 < 40 + 4*num_instr
+# (chain = 2 words per candidate + UDF; table = 10-word dispatch +
+# num_instr 4-byte entries) — 84 < 192 here, so the 10-candidate chain
+# wins. The runtime index 10 + 26 = 36 takes the chain's TENTH b.eq
+# (block9, LOADI #1000), proving the full walk dispatches. 268 bytes
+# below its M0 baseline, and forcing the old cap of 8 grows it back to
+# exactly 1664 (the table path, still correct) — the teeth.
+# jmpr_calc is M2.1: its index is COMPUTED at translate
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
 # fold compounds 12 more on M2.1's 212, and disabling the ADD/SUB index
@@ -498,7 +511,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

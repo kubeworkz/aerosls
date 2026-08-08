@@ -1,0 +1,67 @@
+; jmpr_chain5.simi — M2.29: the ADAPTIVE chain cap. The dispatch index is
+; the pair product r1 = r2 + r3 over two join-dependent bases: r2 in
+; {0, 10} (2-way join: one BC), r3 in {18,20,22,24,26} (5-way join: four
+; BCs + fall-through) — so the candidate set is {0,10} + {18..26 evens}
+; = {18,20,22,24,26,28,30,32,34,36}, TEN in-range candidates (the blocks
+; sit at the even pcs 18..36). M2.25-M2.28 had a hard cap of 8, so this
+; set kept the runtime table (38 entries x 4 + the 10-word dispatch =
+; 192 bytes); M2.29 raises the collection/emission cap to 12 and makes
+; the chain ADAPTIVE — it fires when 8*n + 4 < 40 + 4*num_instr, and
+; here 84 < 192, so the chain wins. The runtime index is 10 + 26 = 36
+; (every BC falls through — r0 == 0), the chain's TENTH b.eq, landing on
+; block9's LOADI #1000 — proving the full 10-candidate walk dispatches.
+; The candidates are real pcs (block0..block9), as the chain branches
+; straight to g_instr_off[pc].
+; Expected result: 1000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every BC below falls through
+    LOADI r2, #0, i64   ; pc 2 — branch-path base (0) — dead at runtime
+    BC r0, J2           ; pc 3 — r0 == 0 → falls through (delivers {r2:0} at J2)
+    LOADI r2, #10, i64  ; pc 4 — fall-through base (10)
+J2:                     ; (label) — join: r2 ∈ {0, 10}
+    LOADI r3, #18, i64  ; pc 5
+    BC r0, J3           ; pc 6 — falls through (delivers {r3:18} at J3)
+    LOADI r3, #20, i64  ; pc 7
+    BC r0, J3           ; pc 8 — falls through (delivers {r3:20} at J3)
+    LOADI r3, #22, i64  ; pc 9
+    BC r0, J3           ; pc 10 — falls through (delivers {r3:22} at J3)
+    LOADI r3, #24, i64  ; pc 11
+    BC r0, J3           ; pc 12 — falls through (delivers {r3:24} at J3)
+    LOADI r3, #26, i64  ; pc 13 — fall-through base (26)
+J3:                     ; (label) — join: r3 ∈ {18,20,22,24,26}
+    ADD r1, r2, r3, i64 ; pc 14 — r1 = r2 + r3 ∈ {18..36 evens} (10 candidates)
+    JMPR r1             ; pc 15 — candidates {18,20,...,36}, runtime 36
+    LOADI r0, #0, i32   ; pc 16 — dead filler (aligns block0 to pc 18)
+    LOADI r0, #0, i32   ; pc 17 — dead filler
+block0:                 ; pc 18
+    LOADI r0, #111, i32 ; pc 18
+    RET                 ; pc 19
+block1:                 ; pc 20
+    LOADI r0, #222, i32 ; pc 20
+    RET                 ; pc 21
+block2:                 ; pc 22
+    LOADI r0, #333, i32 ; pc 22
+    RET                 ; pc 23
+block3:                 ; pc 24
+    LOADI r0, #444, i32 ; pc 24
+    RET                 ; pc 25
+block4:                 ; pc 26
+    LOADI r0, #555, i32 ; pc 26
+    RET                 ; pc 27
+block5:                 ; pc 28
+    LOADI r0, #666, i32 ; pc 28
+    RET                 ; pc 29
+block6:                 ; pc 30
+    LOADI r0, #777, i32 ; pc 30
+    RET                 ; pc 31
+block7:                 ; pc 32
+    LOADI r0, #888, i32 ; pc 32
+    RET                 ; pc 33
+block8:                 ; pc 34
+    LOADI r0, #999, i32 ; pc 34
+    RET                 ; pc 35
+block9:                 ; pc 36
+    LOADI r0, #1000, i32; pc 36
+    RET                 ; pc 37
