@@ -4080,6 +4080,60 @@ airtight series began — and adds one:
   captures the interpreter's output); the SHL-built chain executes at
   runtime on the ARM engine (PASS 1000, runtime index 58 taking the
   tenth b.eq), and the documented float/mem skips and the no-expected
+  jmpr_oob are unchanged. enc-check clean;  jmpr_oob still faults (UDF, rc=1).
+
+### 10.106 M2.48 — the unary NOT/NEG join the chain image (as built)
+
+A CODE-CHANGE milestone (a follow-on to M2.47): the unary NOT (~a) and
+NEG (-a) join the image family. Before M2.48 the image covered only
+the binary ADD/SUB/MUL/AND/OR/XOR plus the M2.47 shifts, so a unary op
+on the index path fell to the walk's opaque-writer branch and the
+chain died. M2.48 adds the UNARY image — { f(a) : a in S(a) } — with
+the M2.2 argument (plain 64-bit, never faults, type-agnostic),
+implemented as a dedicated walk branch that reuses the image helper's
+immediate path with a dummy imm (the unary eval ignores bv). A
+deferred source is unreachable under the M2.42 equal-caps proof (no
+record is ever created), so that case falls to UNKNOWN to stay
+conservative. The change is one eval pair + one walk branch; the
+emission needed nothing.
+
+### 10.107 M2.48 gate results (measured)
+
+Total emitted bytes across the now-72-program parity set: **M0
+141232 → M1 118460, 22772 saved** (≈16.1%), up from M2.47's 22328.
+One row added, zero moved:
+
+- jmpr_chain24 2364 → 1920 (−444, new 72nd row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: a NEG-BUILT index. r1 = -r2
+  over a TEN-way join of NEGATIVE constants (r2 in {-58,-56,...,-40}
+  -> TEN values {40,42,...,58} — the uint32 wrap of the negated
+  negative constants is exact); the gate (84 < 40 + 4·60 = 280) emits
+  the 10-pair chain. Runtime `-(-58) = 58` takes the chain's TENTH
+  b.eq (dump-verified: 10 b.eq, first subs = #40, last = #58) ->
+  block9 -> PASS 1000 on all four engines. The NOT side is
+  out-of-range by construction (NOT of a small pc is huge), so it
+  lands on the bare-UDF path: the analysis computes the NOT image
+  exactly, finds no in-range candidate, and emits just the UDF
+  (dump-verified: 0 b.eq, 0 table words, 1 UDF word; all four engines
+  fault rc=1/2 — verified ad hoc on a NOT variant of jmpr_chain23).
+  The size discriminates it from the UNKNOWN -> table path, so the
+  NOT image is genuinely computed, not collapsed.
+- Teeth: reverting the M2.48 tracking (disabling the unary branch)
+  makes the NEG opaque again — cur[r1] goes UNKNOWN, the chain dies,
+  and the row grows back to exactly 2116 (the table path, 0 b.eq,
+  still correct); the 196-byte delta is exactly (40 + 4·60) − (8·10 +
+  4).
+- Row-by-row accounting (gate tables diffed vs committed fc49bde):
+  **all 71 shared rows byte-identical** — no committed program uses
+  NOT/NEG in a chain path (the only NOT/NEG instructions live in
+  extra_ops/float_ops, neither of which has a JMPR, so the walk never
+  runs on them) — and jmpr_chain24 added; strictly additive.
+- Four-way parity: 288 PASS, 0 FAIL — all 72 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the NEG-built chain executes at
+  runtime on the ARM engine (PASS 1000, runtime index 58 taking the
+  tenth b.eq), and the documented float/mem skips and the no-expected
   jmpr_oob are unchanged. enc-check clean; jmpr_oob still faults
   (UDF, rc=1).
 

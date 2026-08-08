@@ -1103,7 +1103,9 @@ static void chain_unknown(struct ChainSet* s) { s->n = 0; s->unk = 1; s->def = -
  * (lslv/lsrv/asrv), the interpreter (fetch_operand_b & 0x3F) and
  * ar_const_step — so a constant-amount shift of a known set re-derives
  * (the M2.3 argument). SHR is LOGICAL (unsigned >>), SAR arithmetic
- * (sign-filling, like the interpreter's (int64)>>). */
+ * (sign-filling, like the interpreter's (int64)>>). M2.48: the unary
+ * NOT (~a) and NEG (-a) join too — plain 64-bit, never fault,
+ * type-agnostic; bv is ignored for them. */
 static int64_t chain_alu_eval(uint8_t op, int64_t av, int64_t bv) {
     switch (op) {
     case OP_ADD: return av + bv;
@@ -1115,6 +1117,8 @@ static int64_t chain_alu_eval(uint8_t op, int64_t av, int64_t bv) {
     case OP_SHL: return av << (bv & 0x3F);
     case OP_SHR: return (int64_t)((uint64_t)av >> (bv & 0x3F));
     case OP_SAR: return (int64_t)((int64_t)av >> (bv & 0x3F));
+    case OP_NOT: return ~av;
+    case OP_NEG: return -av;
     default:     return 0;   /* caller gates the op set */
     }
 }
@@ -1445,11 +1449,13 @@ static void chain_prewrite(struct ChainSet* cur, int ntr, int s) {
 }
 /* M2.27: the ALU set image — S(out) = { f(a, k) : a in S(a) } for the
  * immediate form, or { f(a, b) : a in S(a), b in S(b) } for the register
- * form. f is ADD/SUB/MUL (M2.27), AND/OR/XOR (M2.28) and SHL/SHR/SAR
- * (M2.47, amount masked mod 64) — plain 64-bit ops that never fault and
- * ignore the declared type (the same argument as the M2.2 constant
- * fold), so the image is bit-identical to runtime. The merge caps and
- * collapses to UNKNOWN exactly like the unions. */
+ * form. f is ADD/SUB/MUL (M2.27), AND/OR/XOR (M2.28), SHL/SHR/SAR
+ * (M2.47, amount masked mod 64) and — via the immediate path with a
+ * dummy imm — the unary NOT/NEG (M2.48, bv ignored). All plain 64-bit
+ * ops that never fault and ignore the declared type (the same argument
+ * as the M2.2 constant fold), so the image is bit-identical to
+ * runtime. The merge caps and collapses to UNKNOWN exactly like the
+ * unions. */
 static void chain_img_alu(struct ChainSet* out, uint8_t op, int use_imm, int32_t imm,
                           const struct ChainSet* a, const struct ChainSet* b) {
     struct ChainSet tmp = { .n = 0, .unk = 0 };
@@ -3224,6 +3230,23 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                             }
                                         }
                                     }
+                                } else if (op == OP_NOT || op == OP_NEG) {
+                                    /* M2.48: UNARY image — { f(a) : a in
+                                     * S(a) }, f = NOT (~a) or NEG (-a),
+                                     * plain 64-bit, never faults,
+                                     * type-agnostic (the M2.2 argument).
+                                     * Reuse the image's immediate path
+                                     * with a dummy imm (the unary eval
+                                     * ignores bv). A deferred source is
+                                     * unreachable under the M2.42
+                                     * equal-caps proof (no record is ever
+                                     * created); fall to UNKNOWN there to
+                                     * stay conservative. */
+                                    int s_a = (w_ra(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_ra(w)] : -1;
+                                    struct ChainSet unk = { .n = 0, .unk = 1 };
+                                    const struct ChainSet* sa = (s_a >= 0) ? &cur[s_a] : &unk;
+                                    if (sa->def >= 0) chain_unknown(&cur[s]);
+                                    else chain_img_alu(&cur[s], op, 1, 0, sa, &unk);
                                 } else if (op == OP_CMP) {
                                     cur[s].n = 2; cur[s].unk = 0; cur[s].def = -1;
                                     cur[s].v[0] = 0; cur[s].v[1] = 1;
