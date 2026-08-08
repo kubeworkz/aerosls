@@ -461,7 +461,13 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
          * cmp (subs xzr) + b.eq pairs; cond_true() is the same condition
          * table cset uses. */
         if ((w & 0xFF000010u) == 0x54000000u) {
-            int cond = (int)((w >> 12) & 0xF);
+            int cond = (int)(w & 0xF);   /* cond is bits 3:0 — reading 15:12
+                                          * grabbed imm19's top nibble and
+                                          * misdecoded every b.eq whose offset
+                                          * exceeded 512 bytes as NE instead of
+                                          * EQ (M2.30's 15-candidate chain
+                                          * exposed it; M2.25-M2.29's shorter
+                                          * chains stayed under the threshold) */
             int64_t off = sext(((w >> 5) & 0x7FFFFu) << 2, 21);
             if (cond_true(cpu, cond)) cpu->pc = (uint64_t)((int64_t)cpu->pc + off);
             else                      cpu->pc = next_pc;
