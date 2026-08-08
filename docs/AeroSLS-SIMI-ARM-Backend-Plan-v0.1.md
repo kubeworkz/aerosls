@@ -2843,6 +2843,57 @@ added, zero moved:
   fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
   rc=1).
 
+### 10.66 M2.28 — the chain follows a bitwise-built index (as built)
+
+M2.27's chain_img_alu image covered ADD/SUB/MUL only, so a bitwise-built
+index — `XOR r1, r2, #k` — was still opaque: the XOR writer marked its
+set UNKNOWN and the program kept the table. M2.28 extends the image to
+AND/OR/XOR with the same argument the M2.3 bitwise fold used: plain
+64-bit bitwise ops never fault and are type-agnostic, so the value set
+is exactly the op of its sources' sets.
+
+- **chain_alu_eval, shared.** The six images now funnel through one
+  int64 evaluator (op, a, b), replacing M2.27's growing nested
+  ternary; the imm form passes the sign-extended imm28, the register
+  form the source value. AND/OR/XOR join ADD/SUB/MUL in both forms,
+  and the writer rule in the walk matches. Every other writer still
+  marks UNKNOWN.
+- **jmpr_chain4, the pin.** `r1 = r2 ^ 8` with the join-dependent
+  base r2 in {2, 4} — the candidate set is the XOR image {2, 4} ^ 8
+  = {10, 12}, and the runtime index 12 takes the chain's SECOND
+  b.eq (dump-verified: `eor x9, x9, x10` computes r2^8, then
+  `subs xzr,x9,#10 / b.eq`, `subs xzr,x9,#12 / b.eq`, `udf #0`).
+- **Unchanged soundness argument.** Union-at-joins, real-edges-only
+  linear state, UDF fall-through, out-of-range collapse — exactly
+  M2.25-M2.27's; only the image's opcode set grew, and the teeth
+  (bitwise ops dropped from the writer rule) grows jmpr_chain4 back
+  to exactly 1184 (the table path, still correct).
+
+### 10.67 M2.28 gate results (measured)
+
+Total emitted bytes across the now-52-program parity set: **M0 79584
+→ M1 68412, 11172 saved** (≈14.0%), up from M2.27's 11032. One row
+added, zero moved:
+
+- jmpr_chain4 1248 → 1108 (−140, new 52nd row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The teeth (bitwise
+  image disabled) grows it back to exactly 1184 (the table path,
+  still correct).
+- Row-by-row accounting (gate tables diffed vs committed 11352bf,
+  measured with the M2.27 verifier): **all 51 shared rows
+  byte-identical** — M2.28 is strictly additive; AND/OR/XOR appear
+  in the corpus only inside jmpr_calc_bit (whose constant fold
+  predates the chain and does not feed a dispatch), so nothing else
+  moved.
+- Four-way parity: 208 PASS, 0 FAIL — all 52 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the register-XOR
+  chain executes at runtime on the ARM engine (PASS 333), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean (the canonical make a64-enc-check, a
+  fresh assemble + dump + re-derive); jmpr_oob still faults (UDF,
+  rc=1).
+
 ---
 
 ## Sources consulted

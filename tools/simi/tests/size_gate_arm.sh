@@ -77,7 +77,16 @@
 # 64-bit, never faults, type-agnostic — the M2.2 fold's argument), imm
 # and register forms alike. 140 bytes below its M0 baseline, and
 # disabling the MUL image grows it back to exactly 1184 (the table
-# path, still correct) — the teeth. jmpr_calc is M2.1: its index is COMPUTED at translate
+# path, still correct) — the teeth. jmpr_chain4 is
+# M2.28: the chain extended to an index built by a BITWISE op — r1 =
+# r2 ^ 8 with the join-dependent base r2 in {2, 4}, so the candidate
+# set is the XOR image {2, 4} ^ 8 = {10, 12}, and the runtime index 12
+# takes the chain's SECOND b.eq. chain_img_alu now covers AND/OR/XOR
+# via the shared chain_alu_eval helper (plain 64-bit, never faults,
+# type-agnostic — the M2.3 fold's argument), imm and register forms
+# alike. 140 bytes below its M0 baseline, and disabling the bitwise
+# image grows it back to exactly 1184 (the table path, still correct)
+# — the teeth. jmpr_calc is M2.1: its index is COMPUTED at translate
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
 # fold compounds 12 more on M2.1's 212, and disabling the ADD/SUB index
@@ -489,7 +498,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
