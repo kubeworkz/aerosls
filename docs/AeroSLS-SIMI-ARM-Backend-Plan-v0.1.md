@@ -4283,6 +4283,59 @@ added, zero moved — simi_arm.c is BYTE-IDENTICAL to the M2.50 commit
   jmpr_oob are unchanged (jmpr_oob still faults via UDF at
   pc=0x320, rc=1). enc-check clean.
 
+### 10.114 M2.52 — the double-unary image, NOT then NEG (as built)
+
+A PROOF milestone with NO code change: the composition of two unary
+ops, where the second unary's source is the FIRST unary's STORED
+IMAGE. The walk's unary branch (M2.48) maps { f(a) : a in S(a) } over
+whatever cur[source] holds — for a second unary that is the previous
+unary's image, in place (rd == ra) or not. The two maps compose
+exactly in two's complement: NEG(NOT(a)) = -(~a) = a + 1, and the
+uint32 wrap preserves it mod 2^32. jmpr_chain28 drives r1 = ~r2 over
+a ten-way join (r2 in {39,41,...,57}, ten odd positives) followed by
+in-place NEG r1, r1 -> the composed image {40,42,...,58} (a + 1 over
+the source set) — in range.
+
+### 10.115 M2.52 gate results (measured)
+
+Total emitted bytes across the now-76-program parity set: **M0
+153288 → M1 128240, 25048 saved** (≈16.3%), up from M2.51's 24604.
+One row added, zero moved — simi_arm.c is BYTE-IDENTICAL to the
+M2.51 commit (a probe, not a change):
+
+- jmpr_chain28 2248 → 1804 (−444, new 76th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: NOT-then-NEG over the ten-way
+  join. The gate (84 < 40 + 4*60 = 280) emits the 10-pair chain;
+  runtime NEG(NOT(57)) = 58 takes the chain's TENTH b.eq (58 = 40 +
+  2*9) -> block9's LOADI #1000 -> PASS 1000 on all four engines.
+  Dump-verified: 10 b.eq, first subs #40, last #58; the tenth b.eq
+  (imm19 140) lands byte-exact on block9's movz x9, #1000. The test
+  DISCRIMINATES the stored-image read: if the second unary re-read
+  the JOIN set, NEG over {39..57} would be {-57..-39} — uint32-huge,
+  all out of range — and runtime 58 would miss every candidate and
+  UDF-trap; only the correct stored-image composition chains.
+- Teeth — both orders compose, and the chain is proven to come from
+  the stored image (ad hoc): (a) the MIRROR composition NEG-then-NOT
+  over {41..59} (NOT(NEG(a)) = a - 1) lands the SAME candidate set
+  {40..58} — 10 b.eq, PASS 1000 on all four engines at the identical
+  1804 bytes, so both orders re-derive and compose exactly;
+  (b) disabling the unary tracking (temporary edit) grows the row to
+  exactly 2000 bytes (table, 0 b.eq, still PASS 1000) — the 196-byte
+  delta is exactly (40 + 4*60) − (8*10 + 4), the chain-vs-table
+  difference, proving the fired chain came from the composed stored
+  image and not from a coincidental table hit.
+- Row-by-row accounting (gate tables diffed vs committed 67810c2):
+  **all 75 shared rows byte-identical** and simi_arm.c untouched —
+  strictly additive.
+- Four-way parity: 304 PASS, 0 FAIL — all 76 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the composed-image chain
+  executes at runtime on the ARM engine (PASS 1000, runtime index 58
+  taking the tenth b.eq), and the documented float/mem skips and
+  the no-expected jmpr_oob are unchanged (jmpr_oob still faults via
+  UDF at pc=0x320, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted

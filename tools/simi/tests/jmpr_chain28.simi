@@ -1,0 +1,99 @@
+; jmpr_chain28.simi — M2.52: the DOUBLE-UNARY image — NOT then NEG.
+; M2.48/M2.50 added the unary image { f(a) : a in S(a) } and pinned the
+; single-unary forms (chain24 NEG, chain26 NOT). This pin probes the
+; COMPOSITION: a second unary whose source is the FIRST unary's STORED
+; IMAGE — the walk must read cur[source] (the NOT output), not re-read
+; the join register. The two maps compose exactly in two's complement:
+; NEG(NOT(a)) = -(~a) = a + 1 (and the uint32 wrap preserves it mod
+; 2^32). The index: r2 in {39,41,...,57} (ten ODD positives) -> NOT
+; r1, r2 -> in-place NEG r1, r1 -> the composed image {40,42,...,58}
+; (a+1 over the source set) — in range. The runtime index
+; NEG(NOT(57)) = 58 takes the chain's TENTH b.eq (58 = 40 + 2*9),
+; landing on block9's LOADI #1000. The test DISCRIMINATES: if the
+; second unary wrongly re-derived from the JOIN register instead of
+; the stored image, NEG over the join set {39..57} would give
+; {-57..-39} — uint32-huge, all out of range — so the runtime index
+; 58 would miss every candidate and UDF-trap; only the correct
+; stored-image composition chains. The mirror NEG-then-NOT
+; (NOT(NEG(a)) = a - 1) over {41..59} lands the SAME candidate set
+; {40..58} — verified ad hoc at the same pc, both orders compose.
+; Expected result: 1000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #39, i64  ; pc 2 — branch-path base (39) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:39} at J2)
+    LOADI r2, #41, i64  ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:41} at J2)
+    LOADI r2, #43, i64  ; pc 6
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:43} at J2)
+    LOADI r2, #45, i64  ; pc 8
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:45} at J2)
+    LOADI r2, #47, i64  ; pc 10
+    BC r0, J2           ; pc 11 — falls through (delivers {r2:47} at J2)
+    LOADI r2, #49, i64  ; pc 12
+    BC r0, J2           ; pc 13 — falls through (delivers {r2:49} at J2)
+    LOADI r2, #51, i64  ; pc 14
+    BC r0, J2           ; pc 15 — falls through (delivers {r2:51} at J2)
+    LOADI r2, #53, i64  ; pc 16
+    BC r0, J2           ; pc 17 — falls through (delivers {r2:53} at J2)
+    LOADI r2, #55, i64  ; pc 18
+    BC r0, J2           ; pc 19 — falls through (delivers {r2:55} at J2)
+    LOADI r2, #57, i64  ; pc 20 — fall-through base (57)
+J2:                     ; (label) — join: r2 in {39,41,...,57} (10 values)
+    NOT r1, r2, i64     ; pc 21 — first unary: r1 = ~r2 — the stored image
+                        ; is the uint32-wrapped NOT of each value (huge,
+                        ; out of range — fine, it is an intermediate).
+    NEG r1, r1, i64     ; pc 22 — second unary, IN PLACE: r1 = -r1, read
+                        ; from the FIRST unary's stored image (cur[r1]).
+                        ; NEG(NOT(a)) = a + 1: the composed image is
+                        ; {40,42,...,58} — in range.
+    JMPR r1             ; pc 23 — candidates {40,42,...,58}, runtime
+                        ; NEG(NOT(57)) = 58.
+    LOADI r0, #0, i32   ; pc 24 — dead filler (aligns block0 to pc 40)
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+block0:                 ; pc 40
+    LOADI r0, #100, i32 ; pc 40
+    RET                 ; pc 41
+block1:                 ; pc 42
+    LOADI r0, #200, i32 ; pc 42
+    RET                 ; pc 43
+block2:                 ; pc 44
+    LOADI r0, #300, i32 ; pc 44
+    RET                 ; pc 45
+block3:                 ; pc 46
+    LOADI r0, #400, i32 ; pc 46
+    RET                 ; pc 47
+block4:                 ; pc 48
+    LOADI r0, #500, i32 ; pc 48
+    RET                 ; pc 49
+block5:                 ; pc 50
+    LOADI r0, #600, i32 ; pc 50
+    RET                 ; pc 51
+block6:                 ; pc 52
+    LOADI r0, #700, i32 ; pc 52
+    RET                 ; pc 53
+block7:                 ; pc 54
+    LOADI r0, #800, i32 ; pc 54
+    RET                 ; pc 55
+block8:                 ; pc 56
+    LOADI r0, #900, i32 ; pc 56
+    RET                 ; pc 57
+block9:                 ; pc 58
+    LOADI r0, #1000, i32 ; pc 58
+    RET                 ; pc 59
