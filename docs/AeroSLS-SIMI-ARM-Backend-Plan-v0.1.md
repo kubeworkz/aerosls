@@ -3961,6 +3961,64 @@ commit (a probe, not a change):
   no-expected jmpr_oob are unchanged. enc-check clean; jmpr_oob
   still faults (UDF, rc=1).
 
+### 10.102 M2.46 — two index generations over one tracked feeder (as built)
+
+A PROOF milestone with NO code change. The chain machinery requires
+exactly ONE dynamic JMPR (n_dyn == 1 — a second dynamic dispatch forces
+naive table mode for the whole program), so the probe puts both index
+generations in the SAME register with a single dispatch: build1 `r1 =
+r2 + r3` at pc 18 (TWENTY values {42..80}, the stored image), a
+TRACKED `LOADI r3, #100` at pc 19 (rewrites the feeder — cur[r3]
+becomes {100}, and r1's stored image is untouched, M2.44's mechanism
+now with a tracked writer), then build2 IN-PLACE `r1 = r1 + r3` at pc
+20 — which reads the OLD r1 image and the NEW r3 -> TWENTY values
+{142..180}. Each generation is computed from the feeder's value AT THAT
+BUILD (build1 uses r3's join set {40..48}, build2 uses {100}); the two
+generations COEXIST in one image. The dispatch chains on the SECOND
+image — the walk's per-register abstract interpretation handles it by
+construction (chain_img_alu reads both operand slots into a local
+before writing the destination, so the in-place form is sound).
+
+### 10.103 M2.46 gate results (measured)
+
+Total emitted bytes across the now-70-program parity set: **M0
+136620 → M1 114940, 21680 saved** (≈15.9%), up from M2.45's 20340.
+One row added, zero moved — simi_arm.c is BYTE-IDENTICAL to the M2.45
+commit (a probe, not a change):
+
+- jmpr_chain22 4864 → 3524 (−1340, new 70th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: build1 {42..80} -> tracked
+  LOADI r3,#100 -> build2 in-place {142..180}; the gate (164 <
+  40+4·182 = 768) emits the 20-pair chain on the SECOND image.
+  Runtime `32 + 48 = 80` then `+ 100 = 180` takes the chain's
+  TWENTIETH b.eq (dump-verified: 20 b.eq pairs, first subs = #142 at
+  word 257, the twentieth b.eq targeting +552 words = word 848 =
+  block19's `movz x9, #2000` d280fa09, byte-exact) -> PASS 2000 on
+  all four engines. The test DISCRIMINATES every failure mode of the
+  two-generation independence: re-deriving r1's image at the LOADI
+  (→ {202..232}), a stale r3 at build2 (→ {82..128}), or an in-place
+  read-after-write (→ {202..232}) all move the candidate set off the
+  runtime index 180 and UDF-trap — a regression in either generation
+  fails the parity pin.
+- Teeth (op-sensitivity at the same pc): swapping the TRACKED LOADI
+  for an OPAQUE `SHL r3, r3, #1` makes build2's image UNKNOWN — the
+  chain dies (dump-verified: 0 b.eq, table path, 4136 bytes = the
+  honest naive size; the 612-byte delta vs the chain is the table
+  768 minus the chain 164 plus the shared index-load/flush nuance)
+  and the runtime index `80 + 96 = 176` lands on block17 -> 1800 on
+  all four engines. Tracked vs opaque writer on the feeder, same pc.
+- Row-by-row accounting (gate tables diffed vs committed 42e426a,
+  measured with the M2.45 verifier): **all 69 shared rows
+  byte-identical** and simi_arm.c untouched — strictly additive.
+- Four-way parity: 280 PASS, 0 FAIL — all 70 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the two-generation chain
+  executes at runtime on the ARM engine (PASS 2000, runtime index
+  180 taking the twentieth b.eq), and the documented float/mem skips
+  and the no-expected jmpr_oob are unchanged. enc-check clean;
+  jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted

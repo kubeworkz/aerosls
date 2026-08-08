@@ -1,0 +1,235 @@
+; jmpr_chain22.simi — M2.46: TWO index generations over one tracked
+; feeder. The chain machinery requires exactly ONE dynamic JMPR, so the
+; probe puts both generations in the SAME register with ONE dispatch:
+;   pc 18 (build1): r1 = r2 + r3 -> TWENTY values {42..80} (stored image)
+;   pc 19:          LOADI r3, #100  (TRACKED rewrite of the feeder r3)
+;   pc 20 (build2): r1 = r1 + r3    (in-place, reads the OLD r1 image
+;                   and the NEW r3) -> TWENTY values {142..180}
+;   pc 21:          JMPR r1         (chains on the SECOND image)
+; Each generation's image is computed from the feeder's value AT THAT
+; BUILD: build1 uses r3's join set {40..48}, build2 uses r3's new
+; singleton {100} — while r1's STORED image from build1 must survive
+; the LOADI untouched (M2.44's mechanism, now with a TRACKED writer).
+; The two generations COEXIST: the second image is the old r1 snapshot
+; PLUS the new r3, so a bug in either independence breaks the chain:
+;   - re-derive r1's image at the LOADI -> {102..132}, build2 = {202..232}
+;   - stale r3 at build2 -> {82..128}
+;   - in-place read-after-write -> {202..232}
+; ...all of which MISS the runtime index 80 + 100 = 180 and UDF-trap.
+; The runtime takes the chain's TWENTIETH b.eq (180 = 142 + 2*19),
+; landing on block19's LOADI #2000. Candidates are real pcs (blocks at
+; 142..180 — the JMPR jumps to pc == index). Gate: 164 < 40 + 4*182.
+; Expected result: 2000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #2, i64   ; pc 2 — branch-path base (2) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:2} at J2)
+    LOADI r2, #12, i64  ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:12} at J2)
+    LOADI r2, #22, i64  ; pc 6
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:22} at J2)
+    LOADI r2, #32, i64  ; pc 8 — fall-through base (32)
+J2:                     ; (label) — join: r2 in {2, 12, 22, 32}
+    LOADI r3, #40, i64  ; pc 9
+    BC r0, J3           ; pc 10 — falls through (delivers {r3:40} at J3)
+    LOADI r3, #42, i64  ; pc 11
+    BC r0, J3           ; pc 12 — falls through (delivers {r3:42} at J3)
+    LOADI r3, #44, i64  ; pc 13
+    BC r0, J3           ; pc 14 — falls through (delivers {r3:44} at J3)
+    LOADI r3, #46, i64  ; pc 15
+    BC r0, J3           ; pc 16 — falls through (delivers {r3:46} at J3)
+    LOADI r3, #48, i64  ; pc 17 — fall-through base (48)
+J3:                     ; (label) — join: r3 in {40,42,44,46,48}
+    ADD r1, r2, r3, i64 ; pc 18 — GENERATION 1: r1 = r2 + r3 = 20 values
+                        ; (42..80 evens). Stored image in r1's slot.
+    LOADI r3, #100, i64 ; pc 19 — TRACKED rewrite of the FEEDER r3:
+                        ; cur[r3] becomes {100}. r1's stored image is
+                        ; untouched (the write updates only r3's slot).
+    ADD r1, r1, r3, i64 ; pc 20 — GENERATION 2, IN-PLACE on r1: reads
+                        ; the OLD r1 image {42..80} and the NEW r3
+                        ; {100} -> {142..180}. The two generations
+                        ; COEXIST in one image — the independence pin.
+    JMPR r1             ; pc 21 — candidates {142,144,...,180}, runtime
+                        ; 32 + 48 = 80 then + 100 = 180 (twentieth).
+    LOADI r0, #0, i32   ; pc 22 — dead filler (aligns block0 to pc 142)
+    LOADI r0, #0, i32   ; pc 23
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+    LOADI r0, #0, i32   ; pc 40
+    LOADI r0, #0, i32   ; pc 41
+    LOADI r0, #0, i32   ; pc 42
+    LOADI r0, #0, i32   ; pc 43
+    LOADI r0, #0, i32   ; pc 44
+    LOADI r0, #0, i32   ; pc 45
+    LOADI r0, #0, i32   ; pc 46
+    LOADI r0, #0, i32   ; pc 47
+    LOADI r0, #0, i32   ; pc 48
+    LOADI r0, #0, i32   ; pc 49
+    LOADI r0, #0, i32   ; pc 50
+    LOADI r0, #0, i32   ; pc 51
+    LOADI r0, #0, i32   ; pc 52
+    LOADI r0, #0, i32   ; pc 53
+    LOADI r0, #0, i32   ; pc 54
+    LOADI r0, #0, i32   ; pc 55
+    LOADI r0, #0, i32   ; pc 56
+    LOADI r0, #0, i32   ; pc 57
+    LOADI r0, #0, i32   ; pc 58
+    LOADI r0, #0, i32   ; pc 59
+    LOADI r0, #0, i32   ; pc 60
+    LOADI r0, #0, i32   ; pc 61
+    LOADI r0, #0, i32   ; pc 62
+    LOADI r0, #0, i32   ; pc 63
+    LOADI r0, #0, i32   ; pc 64
+    LOADI r0, #0, i32   ; pc 65
+    LOADI r0, #0, i32   ; pc 66
+    LOADI r0, #0, i32   ; pc 67
+    LOADI r0, #0, i32   ; pc 68
+    LOADI r0, #0, i32   ; pc 69
+    LOADI r0, #0, i32   ; pc 70
+    LOADI r0, #0, i32   ; pc 71
+    LOADI r0, #0, i32   ; pc 72
+    LOADI r0, #0, i32   ; pc 73
+    LOADI r0, #0, i32   ; pc 74
+    LOADI r0, #0, i32   ; pc 75
+    LOADI r0, #0, i32   ; pc 76
+    LOADI r0, #0, i32   ; pc 77
+    LOADI r0, #0, i32   ; pc 78
+    LOADI r0, #0, i32   ; pc 79
+    LOADI r0, #0, i32   ; pc 80
+    LOADI r0, #0, i32   ; pc 81
+    LOADI r0, #0, i32   ; pc 82
+    LOADI r0, #0, i32   ; pc 83
+    LOADI r0, #0, i32   ; pc 84
+    LOADI r0, #0, i32   ; pc 85
+    LOADI r0, #0, i32   ; pc 86
+    LOADI r0, #0, i32   ; pc 87
+    LOADI r0, #0, i32   ; pc 88
+    LOADI r0, #0, i32   ; pc 89
+    LOADI r0, #0, i32   ; pc 90
+    LOADI r0, #0, i32   ; pc 91
+    LOADI r0, #0, i32   ; pc 92
+    LOADI r0, #0, i32   ; pc 93
+    LOADI r0, #0, i32   ; pc 94
+    LOADI r0, #0, i32   ; pc 95
+    LOADI r0, #0, i32   ; pc 96
+    LOADI r0, #0, i32   ; pc 97
+    LOADI r0, #0, i32   ; pc 98
+    LOADI r0, #0, i32   ; pc 99
+    LOADI r0, #0, i32   ; pc 100
+    LOADI r0, #0, i32   ; pc 101
+    LOADI r0, #0, i32   ; pc 102
+    LOADI r0, #0, i32   ; pc 103
+    LOADI r0, #0, i32   ; pc 104
+    LOADI r0, #0, i32   ; pc 105
+    LOADI r0, #0, i32   ; pc 106
+    LOADI r0, #0, i32   ; pc 107
+    LOADI r0, #0, i32   ; pc 108
+    LOADI r0, #0, i32   ; pc 109
+    LOADI r0, #0, i32   ; pc 110
+    LOADI r0, #0, i32   ; pc 111
+    LOADI r0, #0, i32   ; pc 112
+    LOADI r0, #0, i32   ; pc 113
+    LOADI r0, #0, i32   ; pc 114
+    LOADI r0, #0, i32   ; pc 115
+    LOADI r0, #0, i32   ; pc 116
+    LOADI r0, #0, i32   ; pc 117
+    LOADI r0, #0, i32   ; pc 118
+    LOADI r0, #0, i32   ; pc 119
+    LOADI r0, #0, i32   ; pc 120
+    LOADI r0, #0, i32   ; pc 121
+    LOADI r0, #0, i32   ; pc 122
+    LOADI r0, #0, i32   ; pc 123
+    LOADI r0, #0, i32   ; pc 124
+    LOADI r0, #0, i32   ; pc 125
+    LOADI r0, #0, i32   ; pc 126
+    LOADI r0, #0, i32   ; pc 127
+    LOADI r0, #0, i32   ; pc 128
+    LOADI r0, #0, i32   ; pc 129
+    LOADI r0, #0, i32   ; pc 130
+    LOADI r0, #0, i32   ; pc 131
+    LOADI r0, #0, i32   ; pc 132
+    LOADI r0, #0, i32   ; pc 133
+    LOADI r0, #0, i32   ; pc 134
+    LOADI r0, #0, i32   ; pc 135
+    LOADI r0, #0, i32   ; pc 136
+    LOADI r0, #0, i32   ; pc 137
+    LOADI r0, #0, i32   ; pc 138
+    LOADI r0, #0, i32   ; pc 139
+    LOADI r0, #0, i32   ; pc 140
+    LOADI r0, #0, i32   ; pc 141
+block0:                 ; pc 142
+    LOADI r0, #100, i32 ; pc 142
+    RET                 ; pc 143
+block1:                 ; pc 144
+    LOADI r0, #200, i32 ; pc 144
+    RET                 ; pc 145
+block2:                 ; pc 146
+    LOADI r0, #300, i32 ; pc 146
+    RET                 ; pc 147
+block3:                 ; pc 148
+    LOADI r0, #400, i32 ; pc 148
+    RET                 ; pc 149
+block4:                 ; pc 150
+    LOADI r0, #500, i32 ; pc 150
+    RET                 ; pc 151
+block5:                 ; pc 152
+    LOADI r0, #600, i32 ; pc 152
+    RET                 ; pc 153
+block6:                 ; pc 154
+    LOADI r0, #700, i32 ; pc 154
+    RET                 ; pc 155
+block7:                 ; pc 156
+    LOADI r0, #800, i32 ; pc 156
+    RET                 ; pc 157
+block8:                 ; pc 158
+    LOADI r0, #900, i32 ; pc 158
+    RET                 ; pc 159
+block9:                 ; pc 160
+    LOADI r0, #1000, i32 ; pc 160
+    RET                 ; pc 161
+block10:                ; pc 162
+    LOADI r0, #1100, i32 ; pc 162
+    RET                 ; pc 163
+block11:                ; pc 164
+    LOADI r0, #1200, i32 ; pc 164
+    RET                 ; pc 165
+block12:                ; pc 166
+    LOADI r0, #1300, i32 ; pc 166
+    RET                 ; pc 167
+block13:                ; pc 168
+    LOADI r0, #1400, i32 ; pc 168
+    RET                 ; pc 169
+block14:                ; pc 170
+    LOADI r0, #1500, i32 ; pc 170
+    RET                 ; pc 171
+block15:                ; pc 172
+    LOADI r0, #1600, i32 ; pc 172
+    RET                 ; pc 173
+block16:                ; pc 174
+    LOADI r0, #1700, i32 ; pc 174
+    RET                 ; pc 175
+block17:                ; pc 176
+    LOADI r0, #1800, i32 ; pc 176
+    RET                 ; pc 177
+block18:                ; pc 178
+    LOADI r0, #1900, i32 ; pc 178
+    RET                 ; pc 179
+block19:                ; pc 180
+    LOADI r0, #2000, i32 ; pc 180
+    RET                 ; pc 181
