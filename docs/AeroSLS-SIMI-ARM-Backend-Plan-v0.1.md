@@ -2727,6 +2727,71 @@ added, one moved:
   enc-check clean (B.cond now decodes in the independent net);
   jmpr_oob still faults (UDF, rc=1, now at the bare chain word).
 
+### 10.62 M2.26 — the chain follows a register-built index (as built)
+
+M2.25's candidate-set walk tracked ONLY the index register, so an
+index built by a register-form ADD/SUB — `LOADI r2, #c; ADD r1, r1, r2`
+— was opaque: the ADD's source was untracked, r1's set collapsed to
+UNKNOWN, and the program kept the table. M2.26 generalizes the walk to
+multiple registers without touching the emission:
+
+- **The tracked-register closure.** Before the walk, a pre-scan
+  computes the registers that can TRANSITIVELY feed ra: ra, plus every
+  operand of an instruction whose rd is tracked (iterated to
+  stability, capped at TX_AR_CHAIN_REGS=4 — beyond that the analysis
+  declines). The operand tests are opcode-gated (ar_has_reg_ra /
+  ar_has_reg_rb): LOADI/LOADI64/BR/CALL carry no register source in
+  w_ra, and rb is a register only in the non-immediate binary-ALU
+  forms, so the immediate bits are never mistaken for registers. Each
+  addition is individually capped — the first closure round can name
+  several feeders at once, and the per-head arrival arrays and the
+  walk state are sized to the cap (the teeth caught this as a
+  would-be out-of-bounds).
+- **Per-register walk state.** cur[] and the per-head arrivals become
+  one ChainSet per tracked slot; the head-join unions every slot, and
+  BR/BC/folded-JMPR deliveries carry every slot. The set-update rules
+  now apply to any tracked rd: LOADI {imm}, LOADI64 {literal},
+  MOV copies its source's set, CMP {0, 1}, and ADD/SUB compute the
+  image over the SOURCES — S(rd) = {a + imm} for the immediate form,
+  or the pair product {a + b : a in S(ra), b in S(rb)} for the
+  register form, with the cap collapse if either source is untracked
+  or unknown. Every other writer (LOAD, MUL/DIV/AND/OR/XOR, shifts,
+  RESOLVE...) still marks its set UNKNOWN — conservative, and the
+  reason jmpr_dyn/mix/foldreach keep the table. (STORE is now
+  correctly not treated as a writer — its rd is the value source — a
+  small soundness improvement over M2.25's over-conservative guard,
+  byte-neutral on the corpus.)
+- **Unchanged soundness argument.** The union-at-joins discipline, the
+  real-edges-only linear state, the UDF fall-through, and the
+  out-of-range collapse are exactly M2.25's; only the tracked
+  register count grew, and a closure of size 1 reproduces M2.25
+  byte-for-byte (verified: all 49 shared gate rows byte-identical).
+
+### 10.63 M2.26 gate results (measured)
+
+Total emitted bytes across the now-50-program parity set: **M0 77088
+→ M1 66196, 10892 saved** (≈14.1%), up from M2.25's 10752. One row
+added, zero moved:
+
+- jmpr_chain2 1248 → 1108 (−140, new 50th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin. The dispatch index is r1 = 2 +
+  r2 with the join-dependent base r2 in {8, 10} (never-taken branch
+  path / taken fall-through), so the candidate set is the pair product
+  {2} + {8, 10} = {10, 12} across the two tracked registers, and the
+  runtime index 12 takes the chain's SECOND b.eq — jmpr_chain's
+  second-candidate shape, now through a register ADD instead of a
+  bare LOADI. The teeth (register-form image disabled) grows it back
+  to exactly 1184 (the table path, still correct) — and exposed the
+  closure's per-round over-cap, fixed before it could overflow.
+- Row-by-row accounting (gate tables diffed vs committed 579c5ad,
+  measured with the M2.25 verifier): **all 49 shared rows
+  byte-identical** — M2.26 is strictly additive; the closure is
+  {ra} alone for every pre-existing row, so nothing else moved.
+- Four-way parity: 200 PASS, 0 FAIL across all engines on the 50
+  gated programs (the register-ADD chain executes at runtime on the
+  ARM engine; the three documented float/mem engine skips unchanged).
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
