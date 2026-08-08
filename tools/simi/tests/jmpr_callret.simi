@@ -1,0 +1,28 @@
+; jmpr_callret.simi — M2.19: a JMPR chain across a call-return boundary
+; whose index is the callee's RETURN VALUE (r0). The callee is a
+; straight-line leaf — ENTER, LOADI r0 = 3, RET, no branches, no nested
+; calls — and the M2.19 leaf-callee return-value analysis makes r0 = 3
+; known in the CALLER after the call (the fresh-frame model: the
+; interpreter zeroes the callee's frame, copies r0-r7 as args, and on
+; RET only r0 propagates back — so the caller's other registers are
+; structurally preserved, and r0's value is exactly what the analyzable
+; leaf returns). JMPR r0 then folds to pc 3. Without the analysis, r0
+; is unknown after the call (the return register), the JMPR goes
+; dynamic, and g_alloc dies for the whole function. The analysis is
+; per-callee with the args unknown: r0's chain must be constant under
+; the fresh-frame map (r0-r7 unknown, r8+ = 0, zeroed by the prologue),
+; so a leaf that returns a value computed from its ARGS is conservatively
+; not folded.
+; Expected result: 4 (target: ADD r0, r0, #1 -> 3 + 1).
+.entry main
+main:
+    ENTER #8
+    CALL leaf            ; pc 1 — r0 = 3 after the call (M2.19)
+    JMPR r0              ; pc 2 — r0 = 3 — folds to pc 3 (a fall-through fold)
+target:                  ; pc 3 — reached only via the fold (pc 2 never falls through)
+    ADD r0, r0, #1, i64  ; pc 3 — r0 = 3 + 1 = 4
+    RET                  ; pc 4 — returns 4
+leaf:                    ; pc 5 — the callee (a straight-line leaf)
+    ENTER #8             ; pc 5 — fresh frame: r8+ zeroed, r0-r7 = caller args
+    LOADI r0, #3, i64    ; pc 6 — the return value, constant
+    RET                  ; pc 7

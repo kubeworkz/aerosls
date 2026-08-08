@@ -241,7 +241,25 @@
 # dead region computes the index, the fold's flush leaves the r2/r1
 # transients alive — 148 bytes below its M0 baseline, and disabling
 # the relaxation grows it back to exactly 1156 (the JMPR dynamic, the
-# whole function naive), still correct. jmpr_cross is
+# whole function naive), still correct. jmpr_callret is
+# M2.19: a JMPR chain across a CALL-RETURN boundary, keyed on the
+# callee's RETURN VALUE (r0). The callee is a straight-line leaf (ENTER,
+# LOADI r0 = 3, RET — no branches, no nested calls), and the M2.19
+# leaf-callee return-value analysis makes r0 = 3 known in the CALLER
+# after the call. The fresh-frame model (the interpreter zeroes the
+# callee's frame, copies r0-r7 as args, and on RET only r0 propagates
+# back) already lets non-r0 chains survive a call — the probe showed a
+# JMPR keyed on r2 folds with no new machinery; what the analysis adds
+# is the RETURN register. The analysis runs the fixpoint's own constant
+# step (factored into ar_const_step) over the callee with the fresh-frame
+# map (r0-r7 unknown, r8+ = 0, zeroed by the prologue) and requires the
+# callee to start with ENTER, so a leaf returning a value computed from
+# its ARGS is conservatively not folded. JMPR r0 folds to pc 3 (a
+# fall-through fold — the branch is dropped and the call site flows
+# directly into the target) — 152 bytes below its M0 baseline, and
+# disabling the analysis grows it back to exactly 2036 (the JMPR
+# dynamic, g_alloc = 0, runtime dispatch table + bounds check), still
+# correct. jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -312,7 +330,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
+    [jmpr_callret]=2036 [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
