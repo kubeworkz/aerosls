@@ -42,6 +42,7 @@ enum {
     OP_ENTER, OP_LEAVE,
     OP_RESOLVE, OP_OBJSIZE, OP_OBJTYPE, /* v0.3 (Phase 6) */
     OP_JMPR, /* Gap Remediation SIMI Phase 14 */
+    OP_CAS, OP_ATOMIC_ADD, /* Gap Remediation SIMI Phase 15: shared-memory atomics */
     OP_COUNT
 };
 enum { T_I8=0,T_I16,T_I32,T_I64,T_U8,T_U16,T_U32,T_U64,T_F32,T_F64,T_PTR,T_BOOL,T_OBJREF };
@@ -597,6 +598,29 @@ static void op_lea_rax_rax(struct CodeBuf* cb, int32_t disp) {
 static void op_imul_rcx_imm(struct CodeBuf* cb, int32_t imm) {
     e8(cb,0x48); e8(cb,0x69); e8(cb,0xC9); e32(cb,imm);
 }
+/* mov rdx,rax */
+static void op_mov_rdx_rax(struct CodeBuf* cb) { e8(cb,0x48); e8(cb,0x89); e8(cb,0xC2); }
+
+/* ─── Gap Remediation SIMI Phase 15: shared-memory atomics ──────────────
+ * lock cmpxchg / lock xadd against [rdx+disp32]. The base pointer is
+ * staged in rdx (the fixed scratch register DIV/MOD already clobber
+ * freely — never in the allocation pool), cmpxchg's implicit accumulator
+ * is rax, and the operand register is rcx. disp32 always, the same shape
+ * as load_mem_to_rcx/store_rcx_to_mem above. w is the cell width in
+ * bytes (4 or 8 only — the Phase 15 v1 scope); REX.W is emitted for the
+ * 64-bit form. ModRM: (mod=10)|(reg=001=rcx)|(rm=010=rdx) = 0x8A. */
+static void op_lock_cmpxchg(struct CodeBuf* cb, int w, int32_t disp) {
+    e8(cb,0xF0);                       /* lock */
+    if (w == 8) e8(cb,0x48);           /* REX.W: 64-bit operand */
+    e8(cb,0x0F); e8(cb,0xB1);          /* cmpxchg r/m, r */
+    e8(cb,0x8A); e32(cb, disp);        /* [rdx+disp32], rcx */
+}
+static void op_lock_xadd(struct CodeBuf* cb, int w, int32_t disp) {
+    e8(cb,0xF0);
+    if (w == 8) e8(cb,0x48);
+    e8(cb,0x0F); e8(cb,0xC1);          /* xadd r/m, r */
+    e8(cb,0x8A); e32(cb, disp);
+}
 
 /* ─── One procedure's prologue (emitted at OP_ENTER) ─────────────────────
  * push rbp; mov rbp,rsp; sub rsp,FRAME; zero the frame; copy incoming
@@ -715,7 +739,8 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     if (rd >= TX_MAX_REGS || ra >= TX_MAX_REGS) return TX_ERR_REG_OUT_OF_RANGE;
     if ((op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV||op==OP_MOD||op==OP_AND||
          op==OP_OR||op==OP_XOR||op==OP_SHL||op==OP_SHR||op==OP_SAR||op==OP_CMP||
-         op==OP_PTRADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_MAX_REGS)
+         op==OP_PTRADD||op==OP_CAS||op==OP_ATOMIC_ADD) && !(flags & FLAG_IMM) &&
+         w_rb_reg(w) >= TX_MAX_REGS)
         return TX_ERR_REG_OUT_OF_RANGE;
 
     switch (op) {
@@ -947,6 +972,42 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         store_rcx_to_mem(cb, type, w_imm28(w));
         break;
     }
+    case OP_CAS: case OP_ATOMIC_ADD: {
+        /* Gap Remediation SIMI Phase 15: shared-memory atomics (plan doc
+         * Part II D1): v1 supports 4/8-byte cells only, register operands
+         * only (FLAG_IMM rejected — there is no displacement form), SC
+         * ordering. rD is BOTH the new value (input) and the returned OLD
+         * value (output) — the cmpxchg/xadd operand shape; the returned
+         * old is the cell's raw bits zero-extended, exactly the
+         * interpreter's semantics (no sign extension). FMT_RRR's rb field
+         * is a register, so the memory displacement is 0. The 32-bit
+         * forms compare/store on EAX/ECX only — high garbage bits in the
+         * expected or new value are ignored, matching the interpreter's
+         * width-masked compare and truncated store. */
+        int wdt = type_width(type);
+        if (flags & FLAG_IMM) return TX_ERR_BAD_OPCODE;
+        if (wdt != 4 && wdt != 8) return TX_ERR_BAD_OPCODE;
+        ld_rax(cb, ra);               /* rax = base pointer */
+        op_mov_rdx_rax(cb);           /* rdx = base (rax is cmpxchg's accumulator) */
+        if (op == OP_CAS) {
+            ld_rax(cb, w_rb_reg(w));  /* rax = expected (rB) */
+            ld_rcx(cb, rd);           /* rcx = new value (rD input) */
+            op_lock_cmpxchg(cb, wdt, 0);
+            /* On a MATCH, cmpxchg leaves the accumulator untouched, so
+             * the 32-bit form's RAX still carries the expected value's
+             * garbage high bits — zero-extend EAX to reproduce the
+             * interpreter's width-masked returned old (on a mismatch EAX
+             * is already zero-extended by the 32-bit memory load, making
+             * this mov a harmless no-op there). */
+            if (wdt == 4) { e8(cb,0x89); e8(cb,0xC0); }  /* mov eax,eax */
+            st_rax_untag(cb, rd);     /* rD = old (returned), untagged */
+        } else {
+            ld_rcx(cb, w_rb_reg(w));  /* rcx = addend (rB) */
+            op_lock_xadd(cb, wdt, 0);
+            st_rcx_untag(cb, rd);     /* rD = old (returned), untagged */
+        }
+        break;
+    }
     case OP_ENTER: emit_prologue(cb); break;
     case OP_LEAVE: /* no-op directive, matches Phase 1 interpreter */ break;
     case OP_RESOLVE: {
@@ -1111,6 +1172,13 @@ static void compute_alloc_for_proc(const uint64_t* instrs, uint32_t start_pc, ui
              * destination -- see emit_instr's own comment at its case.
              * Direction doesn't matter for touch-tracking either way. */
             tx_touch(ra, pc); tx_touch(rd, pc);
+            break;
+        case OP_CAS: case OP_ATOMIC_ADD:
+            /* Phase 15 atomics: rD is new-value-in and old-value-out, rA
+             * the cell address, rB the expected/addend operand — all
+             * three touched. The codegen is straight-line (no real call),
+             * so no boundary is needed. */
+            tx_touch(rd, pc); tx_touch(ra, pc); tx_touch(w_rb_reg(w), pc);
             break;
         case OP_BC: {
             tx_touch(ra, pc);
