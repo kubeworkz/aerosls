@@ -18,7 +18,8 @@
 # skipped; 10 forced occurrences across both clobber shapes = 40 bytes of
 # the gate's savings, and reverting the rd_live hint grows the test by
 # exactly that), plus the M2 JMPR pair: jmpr_mid (constant index folds to
-# a direct branch and keeps the cache — 168 bytes below its M0 baseline)
+# a direct branch and keeps the cache — 208 bytes below its M0 baseline
+# after M2.23's elimination drops its post-fold dead path)
 # and jmpr_dyn (runtime index keeps the dynamic path — the index is a
 # value read back from guest memory, since M2.3 added XOR to the fold
 # set and the original r1 = 5 ^ r0 silently folded, stopping this test
@@ -33,7 +34,8 @@
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
 # fold compounds 12 more on M2.1's 212, and disabling the ADD/SUB index
-# fold grows it back to exactly 1288. jmpr_mix is the M2.1 mixed
+# fold grows it back to exactly 1288. M2.23's elimination drops the dead
+# LOADI/RET dispatch blocks after the fold target — 276 below M0 now. jmpr_mix is the M2.1 mixed
 # case: one runtime JMPR (forces g_alloc=0, whole program naive — the
 # index is a LOAD result for the same M2.3 reason as jmpr_dyn) and one
 # constant JMPR that still folds — 64 bytes below its M0 baseline, the
@@ -41,12 +43,14 @@
 # M2.2: its index is COMPUTED through a MULTIPLY chain (MUL reg+reg,
 # MUL reg+imm, SUB reg+imm) — 212 bytes below its M0 baseline after
 # M2.6's imm fold compounds 4 more on M2.2's 208, and disabling the MUL
-# fold grows it back to exactly 1272. jmpr_calc_bit is
+# fold grows it back to exactly 1272. M2.23's elimination drops its dead
+# dispatch tail — 288 below M0 now. jmpr_calc_bit is
 # M2.3: its index is COMPUTED through the BITWISE + SHIFT folds (OR/SAR/
 # SHR/SHL/AND/XOR/ADD, with the shifts masking their amount mod 64 and
 # SAR arithmetic on a sign-bit value) — 252 bytes below its M0 baseline
 # after M2.6's imm fold compounds 4 more on M2.3's 248, and disabling
-# the fold grows it back to exactly 1384. src_resident is
+# the fold grows it back to exactly 1384. M2.23's elimination drops its
+# dead dispatch tail — 332 below M0 now. src_resident is
 # M2.4: a chain that re-reads r1/r2 as sources five times; cache_reserve
 # now prefers a non-source victim, so the sources stay resident — 40
 # bytes below its M0 baseline, and reverting the source preference grows
@@ -111,7 +115,8 @@
 # the branch is still dropped but the block-head flush stays. — 312
 # bytes below its M0 baseline, and disabling the coalescing (fold-
 # target check pc+1 -> pc+9999) grows it back to 1080, so the
-# fusion itself is worth 16 of the 312. jmpr_fall2 is M2.13:
+# fusion itself is worth 16 of the 312. M2.23's elimination drops the
+# whole dead path at the stream end — 396 below M0 now. jmpr_fall2 is M2.13:
 # CASCADING fall-through folds — three JMPRs in a row each folding to
 # their OWN next pc, with all three index constants loaded BEFORE the
 # chain. Under M2.12's merge this chain collapses: the first fold's
@@ -283,7 +288,10 @@
 # drops the SECOND caller's frame load: `other` (pc 10) is unreachable
 # — main's RET at pc 9 exits and nothing targets pc 10 — so its ENTER
 # prologue (~197 words) and its folded JMPR's flush are dead code,
-# taking the row to 2224 (-1120 vs M0: 328 + 792). jmpr_unreach is
+# taking the row to 2224 (-1120 vs M0: 328 + 792). M2.23's whole-body
+# elimination then drops `other` ENTIRELY (its arithmetic, its CALL
+# site, its branches, its RET) — 1964, -1380 vs M0: the four dead-code
+# rows now land on the same 1964-byte live core. jmpr_unreach is
 # M2.21: the g_alloc gate is scoped to REACHABLE JMPRs. `dead` (pc 10)
 # is an unreachable function — entered from nowhere (main's RET at pc 9
 # is a terminal, nothing targets pc 10) — and its JMPR r7 reads an
@@ -310,7 +318,9 @@
 # bytes below its M0 baseline now, and reverting only the
 # reachability-aware emission (flush_owed -> always flush) grows it
 # back to exactly 2948 (the M2.21 bytes, still correct) — the M2.22
-# teeth, isolating the 788-byte prologue delta exactly. jmpr_foldreach is
+# teeth, isolating the 788-byte prologue delta exactly. M2.23 then
+# ELIMINATES dead's whole body (its dynamic JMPR path AND the 128-byte
+# JMPR table, which only existed for it) — 1964, -1080 vs M0. jmpr_foldreach is
 # M2.21 soundness pin (reviewer finding): a REACHABLE fold can dispatch
 # into a statically-unreachable-looking region — main's JMPR r0 = 10
 # folds to pc 10, which sits inside `dead` (the fold index is just a
@@ -340,7 +350,27 @@
 # baseline (197-word prologue + dead BR spill + M2.14 tail-reuse +
 # fold machinery), and reverting the reachability-aware emission grows
 # it back to exactly 2980 (the M2.21 bytes, still correct) — the
-# teeth. jmpr_cross is
+# teeth. M2.23 eliminates dead's whole body and the 144-byte JMPR
+# table — 1964, -1112 vs M0. jmpr_deadfull is
+# M2.23, whole-body DEAD-CODE ELIMINATION: a pc with zero live
+# predecessors (g_npred[pc]==0 per the fold-aware BFS — entries are
+# roots, reachable with count 0) never executes under g_alloc=1, so its
+# ENTIRE body is not emitted — the ENTER frame load, arithmetic,
+# branches, CALL sites, dynamic JMPR table paths, and RETs (M2.22
+# dropped only the frame load and flushes; this supersedes that).
+# `deadfull` (pc 10) is an unreachable function with a rich body: an
+# arithmetic chain (r4 = (10+20)*20 = 600), a CALL to the leaf, a BR to
+# a second block, and a JMPR whose index 600 is OUT OF RANGE — never
+# folding, so its dynamic table path (and, since it was the only
+# dynamic JMPR in the stream, the whole num_instr x 8-byte JMPR table)
+# vanishes with the body: under g_alloc=1 every EMITTED JMPR folds, so
+# no table is ever needed. 1352 bytes below its M0 baseline, and
+# disabling the elimination grows it back to exactly 3204 (the M2.21
+# emission — M2.23 minus the elimination is byte-identical to M2.21,
+# the hoisted head flush and the reverted guards being byte-neutral —
+# still correct) — the teeth, isolating the 1240-byte elimination
+# delta (dead body + 176-byte table). The four dead-code rows now land
+# on the same 1964-byte live core. jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -355,7 +385,8 @@
 # across pc 4 to B, B folds to pc 7, and g_alloc stays 1 — 220 bytes
 # below its M0 baseline, and reverting the skip to mark-all grows it
 # back to exactly 1164 (B dynamic, g_alloc=0, runtime table + bounds
-# check return), still correct. The same teeth move jmpr_fall2 by its
+# check return), still correct. M2.23's elimination drops its dead RET
+# (pc 6, never reached) — 224 below M0 now. The same teeth move jmpr_fall2 by its
 # exact M2.13 measurement (+200) — the two shapes the skip protects.
 # The pass-order design note is plan doc §10.38: a post-coalescing
 # re-run of the fold analysis is byte-neutral (the coalescing pass
@@ -411,7 +442,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
