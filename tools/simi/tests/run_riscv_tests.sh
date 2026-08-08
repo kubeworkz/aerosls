@@ -42,15 +42,6 @@ for src in *.simi; do
         skip=$((skip+1))
         continue
     fi
-    # Phase 15 (shared-memory atomics) A0: CAS/ATOMIC_ADD landed in the
-    # ISA + interpreter; the RV64 translator gets them at A2 (lr/sc,
-    # amo.add.d). Until then its BAD_OPCODE rejection looks like a FAIL.
-    if [ "$name" = "cas_simple" ] || [ "$name" = "atomic_add" ]; then
-        echo "SKIP  $name (Phase 15 atomics: interpreter-only until A2; see plan doc Part II §7)"
-        skip=$((skip+1))
-        continue
-    fi
-
     expected=$(grep -oE 'Expected result: -?[0-9]+' "$src" | grep -oE -- '-?[0-9]+$')
     if [ -z "$expected" ]; then
         echo "SKIP  $name (no 'Expected result:' comment)"

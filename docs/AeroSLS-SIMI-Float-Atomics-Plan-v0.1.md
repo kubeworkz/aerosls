@@ -380,7 +380,8 @@ Phases 9–14 numbering — the exact number follows the convention the ARM back
 - **A1 — LANDED** — x86 translator: `lock cmpxchg` for CAS, `lock xadd` for
   ATOMIC_ADD, un-skipped in the native runner, three-way parity
   (interp / x86 / RV64-reject), no existing test's result changed.
-- **A2** — RV64 (`lr`/`sc`, `amo.add.d`) + `rv64_exec.c` + four-way parity.
+- **A2 — LANDED** — RV64 (`lr`/`sc`, `amo.add.d`) + `rv64_exec.c` +
+  four-way parity (interp / x86 / RV64 / ARM-reject).
 - **A3** — A64 (`ldaxr`/`stlxr` loops) + `a64_exec.c` exclusive-monitor model +
   enc-check + size-gate rows + full four-way parity.
 - **A4 (later, only if a consumer needs it)** — acquire/release ordering bits
@@ -475,6 +476,54 @@ both fixtures join the native suite. The evidence, all measured:
 - **No regression** — interp 81/81, x86 native 80/80 (+2, 3 pre-existing
   skips), RV64 77/77, ARM 78/78, size gate byte-identical (78/78, 26404
   saved — simi_arm.c untouched), enc-check clean.
+
+### 7.3 A2 status — LANDED (RV64 `lr`/`sc` + `amo.add.d`)
+
+A2 is done: the RV64 translator emits the A-extension atomics the plan's
+D4 design specified — the `lr`/`sc` loop for CAS, `amo.add` for
+ATOMIC_ADD — and `rv64_exec.c` decodes them, so both fixtures run on the
+RV64 engine and the four-way parity is complete except the A3 ARM leg.
+The evidence, all measured:
+
+- **The codegen (D4)** — `simi_riscv.c` gains `OP_CAS`/`OP_ATOMIC_ADD`
+  cases; the kernel copy (`kernel/simi_riscv.c`) is re-synced
+  byte-identical below its differing header. `t0` holds the base
+  pointer, `t1` the new value (CAS) or addend (ATOMIC_ADD, rB — the
+  rD-old-out-only shape matches the interpreter); CAS's expected value
+  (rB) lives in `a1` (the one documented fourth-scratch exception —
+  the `lr` would clobber it otherwise) and the loop is
+  `lr.d`/`cmp`/`bne .done`/`sc.d`/`bne .retry`, with the success path
+  recovering `old` from `a1` (they're equal there). ATOMIC_ADD is the
+  single `amo.add.d`. The three AMO encoders emit aq=rl=1. The 32-bit
+  forms (`lr.w`/`sc.w`/`amo.add.w`) mask the expected value and
+  zero-extend the returned old via `slli`+`srli` — `lr.w`/`amo.add.w`
+  sign-extend per spec, and the interpreter's contract is "the cell's
+  raw bits, zero-extended," so the A1 i32 shape (garbage high bits in
+  the expected value) is reproduced exactly.
+- **`rv64_exec.c` gains the AMO opcode (0x2F)** — `lr.w/d`, `sc.w/d`,
+  `amo.add.w/d` decode with funct3 width (0x2/0x3), sign-extending
+  `lr.w`/`amo.add.w` loads per spec; the single-threaded model means
+  `sc` always succeeds (`rd = 0`), so the retry path never executes
+  here — the plan's "sc failure path" is implemented but unexercised
+  until real hardware (the documented caveat).
+- **The fixtures un-skipped** — `run_riscv_tests.sh` drops the A0-era
+  skip block; both fixtures now RUN on the RV64 engine through
+  `simi-riscv-verify`: **cas_simple = 5 at 1472 bytes, atomic_add = 2
+  at 1244 bytes** of RV64 code.
+- **The four-way parity** — interp 5/2, x86 5/2 (unchanged from A1:
+  995/822 bytes), RV64 5/2, ARM clean translate-time rejection (`the
+  documented fourth leg until A3`).
+- **The teeth (ad hoc)** — an i32-width tooth (garbage-high-bits
+  expected CAS + a 3×7 i32 ATOMIC_ADD counter at a distinct base —
+  ATOMIC_ADD has no displacement, so the counter lives at `r7+4` via a
+  second LEA): interp 4, x86 4, RV64 4, ARM-reject. (The tooth's first
+  draft failed identically on interp and x86 — it stored the counter at
+  `[r6+4]` but `ATOMIC_ADD` always operates at `[rA+0]`; the engines
+  were all correct.)
+- **No regression** — interp 81/81, x86 native 80/80, RV64 **79/79**
+  (+2, the two fixtures), ARM 78/78 (+2 skipped until A3), size gate
+  byte-identical (78/78, 26404 saved — simi_arm.c untouched), enc-check
+  clean.
 
 ## 8. Honest verification caveats
 
