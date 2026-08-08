@@ -3853,6 +3853,59 @@ One row added, zero moved:
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.98 M2.44 — a tracked feeder rewritten after the index (as built)
+
+A PROOF milestone with NO code change. The chain walk stores a
+PER-REGISTER set — an abstract interpretation, not a re-derivation:
+when the index build computes cur[r1] = image(cur[r2], cur[r3]) at pc
+A, that set is a STORED image, and a later WRITE to a feeder updates
+only that feeder's slot. This mirrors the runtime exactly: r1 holds the
+value computed at the build, not something re-derived from the
+rewritten r2. The stress case is an OPAQUE rewrite — `SHL r2, r2, #1`
+is a writer the walk cannot track, so r2's slot becomes UNKNOWN — and
+the index set must still survive, because the dispatch reads only r1's
+slot (chain_flatten_big of a flat slot is a direct copy; chain_prewrite
+only flattens DEFERRED forms, and a flat index has none). The probe
+proves the analysis is order-sensitive: build-then-rewrite chains with
+the EXACT pre-rewrite candidate set, while rewrite-before-build
+computes the index from the unknown feeder and falls to the table.
+
+### 10.99 M2.44 gate results (measured)
+
+Total emitted bytes across the now-68-program parity set: **M0
+128876 → M1 108872, 20004 saved** (≈15.5%), up from M2.43's 19464.
+One row added, zero moved — and simi_arm.c is BYTE-IDENTICAL to the
+M2.43 commit (the milestone is a probe, not a change):
+
+- jmpr_chain20 2864 → 2324 (−540, new 68th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: r1 = r2 + r3 over joins (r2 in
+  {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values {42..80});
+  the OPAQUE rewrite `SHL r2, r2, #1` sits BETWEEN the build (pc 18)
+  and the dispatch (pc 20); the gate (164 < 368) emits the 20-pair
+  chain. Runtime `32 + 48 = 80` (the SHL sets r2 = 64, but r1 was
+  computed before it) takes the chain's TWENTIETH b.eq
+  (dump-verified: 20 b.eq pairs with the FIRST subs = #42, first →
+  #100's block at offset 1424, twentieth → #2000's block at offset
+  2184, both byte-exact). The candidate set being EXACTLY the
+  pre-rewrite image {42..80} — not fewer, not the SHL'd values — is
+  the proof that the stored image was used.
+- Teeth (order-sensitivity): swapping the two instructions (rewrite
+  BEFORE the build) grows jmpr_chain20 back to exactly 2528 (the
+  table path — the index is then computed from the unknown feeder,
+  still correct), proving the analysis really is per-pc abstract
+  interpretation, not a degenerate approximation.
+- Row-by-row accounting (gate tables diffed vs committed 5de17cc,
+  measured with the M2.43 verifier): **all 67 shared rows
+  byte-identical** and simi_arm.c untouched — strictly additive.
+- Four-way parity: 272 PASS, 0 FAIL — all 68 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the feeder-rewrite chain
+  executes at runtime on the ARM engine (PASS 2000, runtime index 80
+  taking the twentieth b.eq), and the documented float/mem skips and
+  the no-expected jmpr_oob are unchanged. enc-check clean; jmpr_oob
+  still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
