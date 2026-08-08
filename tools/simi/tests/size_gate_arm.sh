@@ -297,6 +297,28 @@
 # makes build2's image UNKNOWN — the chain dies (0 b.eq, table) and the
 # runtime index 80 + 96 = 176 lands on block17 -> 1800 on all four
 # engines — tracked vs opaque writer on the feeder, same position.
+# jmpr_chain25 is M2.49: the register-form shift PRODUCT image — a
+# PROOF milestone with no code change. M2.47 verified the shift image
+# with a SINGLETON amount; this pin exercises the full product form:
+# the amount register r5 carries a MULTI-VALUE set, so the image is
+# { a << (b & 0x3F) : a in S(a), b in S(b) } — chain_img_alu's register
+# path, exact until the merge cap. The pin's sets: r2 in {10,11,12} and
+# r5 in {2,3,66} — where 66 & 0x3F = 2, so the amount 66 is MASKED to 2
+# exactly as the hardware (lslv), the interpreter and ar_const_step do.
+# The nine pairs collapse to SIX distinct candidates {40,44,48,80,88,96}
+# (dump-verified: 6 b.eq, compares #40 #44 #48 #80 #88 #96): the product
+# is EXACT and the masking is applied — an unmasked analysis would
+# compute 12 << 66 out-of-range and emit a bare UDF, trapping the
+# runtime index 48. The runtime index 12 << (66 & 0x3F) = 48 takes the
+# b.eq for 48 (block2, LOADI #300). 780 bytes below its M0 baseline.
+# The teeth verify the exact-or-conservative cap discipline both ways:
+# (a) EXACT — a 65-PAIR product whose distinct set is under the 64 cap
+# chains on the exact deduplicated candidates (22 in-range b.eq, and
+# the runtime 13 << 5 = 416 correctly misses them all and faults);
+# (b) CONSERVATIVE — a 240-pair product with >64 DISTINCT values
+# collapses to UNKNOWN (0 b.eq, the full 10-word table), and the
+# runtime 40 << 6 = 2560 faults through the bounds check — no
+# truncated or wrong chain is ever emitted.
 # jmpr_chain24 is M2.48: the NEG-built dispatch index — the unary
 # NOT/NEG join the chain image. Before M2.48 the image family was the
 # binary ADD/SUB/MUL/AND/OR/XOR plus the M2.47 shifts, so a NEG on the
@@ -860,7 +882,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

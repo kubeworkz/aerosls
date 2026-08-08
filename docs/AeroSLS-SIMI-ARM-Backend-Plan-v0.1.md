@@ -4134,8 +4134,60 @@ One row added, zero moved:
   captures the interpreter's output); the NEG-built chain executes at
   runtime on the ARM engine (PASS 1000, runtime index 58 taking the
   tenth b.eq), and the documented float/mem skips and the no-expected
-  jmpr_oob are unchanged. enc-check clean; jmpr_oob still faults
-  (UDF, rc=1).
+  jmpr_oob are unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
+### 10.108 M2.49 — the register-form shift product image (as built)
+
+A PROOF milestone with NO code change. M2.47 verified the shift image
+with a SINGLETON amount (SHL r1, r2, r5 with LOADI r5, #1); this pin
+exercises the full PRODUCT form: the amount register r5 carries a
+MULTI-VALUE set, so the image is the pair product { a << (b & 0x3F) :
+a in S(a), b in S(b) } — chain_img_alu's register path, exact until
+its merge cap. The masking is part of the product: 66 & 0x3F = 2, so
+an amount of 66 behaves identically to 2, exactly as the hardware
+(lslv), the interpreter and ar_const_step. An unmasked analysis would
+compute 12 << 66 out-of-range and emit a bare UDF — trapping the
+runtime index 48 — so the pin discriminates.
+
+### 10.109 M2.49 gate results (measured)
+
+Total emitted bytes across the now-73-program parity set: **M0
+144196 → M1 120644, 23552 saved** (≈16.3%), up from M2.48's 22772.
+One row added, zero moved — simi_arm.c is BYTE-IDENTICAL to the M2.48
+commit (a probe, not a change):
+
+- jmpr_chain25 2964 → 2184 (−780, new 73rd row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: SHL r1, r2, r5 with r2 in
+  {10,11,12} and r5 in {2,3,66}. The nine pairs collapse to SIX
+  distinct candidates {40,44,48,80,88,96} (dump-verified: 6 b.eq,
+  compares #40 #44 #48 #80 #88 #96) — the product is EXACT (dedup
+  preserves all six) and the masking is applied (48 present, not a
+  huge unmasked value). Runtime `12 << (66 & 0x3F) = 12 << 2 = 48`
+  takes the b.eq for 48 -> block2 -> PASS 300 on all four engines.
+  The gate (52 < 40 + 4·98 = 432) emits the 6-pair chain.
+- Teeth — the exact-or-conservative cap discipline, both ways:
+  (a) EXACT: a 65-PAIR product (r2 in {1..13} x r5 in {1..5}) whose
+  DISTINCT set stays under the 64 cap chains on the exact
+  deduplicated candidates (22 in-range b.eq; the runtime 13 << 5 =
+  416 correctly misses all of them and faults — the analysis is
+  exact, not prematurely collapsed); (b) CONSERVATIVE: a 240-pair
+  product with >64 DISTINCT values (r2 in {1..40} x r5 in {1..6})
+  overflows the merge cap and collapses to UNKNOWN — 0 b.eq, the
+  full 10-word table (movz #132, subs/cset/cbz, li32 base, add-shift,
+  ldr, br, UDF, dump-verified), and the runtime 40 << 6 = 2560 faults
+  through the bounds check on all four engines. No truncated or
+  wrong chain is ever emitted.
+- Row-by-row accounting (gate tables diffed vs committed dbb6438):
+  **all 72 shared rows byte-identical** and simi_arm.c untouched —
+  strictly additive.
+- Four-way parity: 292 PASS, 0 FAIL — all 73 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the product-image chain
+  executes at runtime on the ARM engine (PASS 300, runtime index 48
+  taking the b.eq for 48), and the documented float/mem skips and
+  the no-expected jmpr_oob are unchanged. enc-check clean; jmpr_oob
+  still faults (UDF, rc=1).
 
 ---
 
