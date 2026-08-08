@@ -3154,6 +3154,53 @@ added, zero moved:
   enc-check clean (the canonical make a64-enc-check, a fresh assemble
   + dump + re-derive); jmpr_oob still faults (UDF, rc=1).
 
+### 10.76 M2.33 — the deferred product, imm form (as built)
+
+M2.32's record operands were slots or older records, so an IMM-form
+product over a deferred source (`ADD r1, r1, #32`) still fell to the
+flatten path — the capped flatten collapses (the source's true set
+always exceeds 12) to UNKNOWN, killing the chain. M2.33 adds a third
+operand kind, `CD_IMM`: the imm-form product defers as `op(rec(R1),
+#32)` — the source referenced as its immutable record (a record ref is
+safe even in-place, per M2.32's design) and the immediate baked in as a
+constant operand (the record's operand fields widened to int32 for the
+imm28). The materializers gained a shared operand-resolution step that
+handles all three kinds, and the invalidation is untouched (`CD_IMM`
+never touches a slot, so `chain_def_touches` ignores it). Because the
+imm image has exactly the source's cardinality, the imm branch fires
+whenever the source is deferred — there is no flat overflow to check
+(a flattened source is already UNKNOWN), and deferring is always
+sound since the materialization computes the true image (even for
+non-injective imm ops like `MUL r1, r1, #0`).
+
+### 10.77 M2.33 gate results (measured)
+
+Total emitted bytes across the now-57-program parity set: **M0 92780
+→ M1 79140, 13640 saved** (≈14.7%), up from M2.32's 13044. One row
+added, zero moved:
+
+- jmpr_chain9 2828 → 2232 (−596, new 57th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin above. The chain vs table delta
+  is exactly 376 − 124 = +252 (84-entry table + 10-word dispatch
+  minus the 15-pair chain); the remaining 344 of the 596 is the M1
+  allocator on the 84-instruction body. The teeth (CD_IMM path
+  disabled) grows it back to exactly 2484 (the table path, still
+  correct) — proving the imm product dispatches through the record
+  DAG, not an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed 7cb4a17,
+  measured with the M2.32 verifier): **all 56 shared rows
+  byte-identical** — no pre-existing program has an imm-form product
+  over a deferred source, so M2.33 is strictly additive.
+- Four-way parity: 228 PASS, 0 FAIL — all 57 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 15-candidate
+  imm chain executes at runtime on the ARM engine (PASS 1500,
+  runtime index 82 taking the fifteenth b.eq, dump-verified 15 b.eq
+  pairs from #100's block to #1500's block), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean (the canonical make a64-enc-check, a fresh assemble
+  + dump + re-derive); jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
