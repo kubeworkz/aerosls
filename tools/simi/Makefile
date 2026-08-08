@@ -48,12 +48,15 @@ a64-enc-check: simi-asm a64_dump
 	./simi-asm tests/straight_line_bench.simi tests/straight_line_bench.tmo
 	./simi-asm tests/loop_sum.simi tests/loop_sum.tmo
 	./simi-asm tests/extra_ops.simi tests/extra_ops.tmo
+	./simi-asm tests/float_ops.simi tests/float_ops.tmo
 	./a64_dump tests/straight_line_bench.tmo > /tmp/slb.dump
 	./a64_dump tests/loop_sum.tmo > /tmp/ls.dump
 	./a64_dump tests/extra_ops.tmo > /tmp/eo.dump
+	./a64_dump tests/float_ops.tmo > /tmp/fo.dump
 	python3 a64_enc_check.py /tmp/slb.dump straight_line_bench
 	python3 a64_enc_check.py /tmp/ls.dump loop_sum
 	python3 a64_enc_check.py /tmp/eo.dump extra_ops
+	python3 a64_enc_check.py /tmp/fo.dump float_ops
 
 test: all
 	./tests/run_tests.sh
