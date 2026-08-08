@@ -377,7 +377,8 @@ Phases 9–14 numbering — the exact number follows the convention the ARM back
   the §7/§16 entries, the interpreter semantics, and the two new test fixtures
   (`cas_simple.simi`: success, failure, returned-old cases; `atomic_add.simi`:
   a counter incremented N times, expected final value + returned olds).
-- **A1** — interpreter + x86 (`lock cmpxchg`/`lock xadd`) + three-way parity
+- **A1 — LANDED** — x86 translator: `lock cmpxchg` for CAS, `lock xadd` for
+  ATOMIC_ADD, un-skipped in the native runner, three-way parity
   (interp / x86 / RV64-reject), no existing test's result changed.
 - **A2** — RV64 (`lr`/`sc`, `amo.add.d`) + `rv64_exec.c` + four-way parity.
 - **A3** — A64 (`ldaxr`/`stlxr` loops) + `a64_exec.c` exclusive-monitor model +
@@ -432,6 +433,48 @@ measured:
   cmpxchg/xadd-shaped op set, the SC ordering + reserved-bits note) and
   this A0 status; the §7 roadmap row shows Phase 15 as 🟡 (A0 done, A1-A3
   pending).
+
+### 7.2 A1 status — LANDED (x86 `lock cmpxchg` / `lock xadd`)
+
+A1 is done: the x86 translator emits real locked atomic instructions and
+both fixtures join the native suite. The evidence, all measured:
+
+- **The codegen, as designed (D1/D5)** — `simi_x86.c` gains `OP_CAS` and
+  `OP_ATOMIC_ADD` cases, and the kernel copy (`kernel/simi_x86.c`) is
+  re-synced byte-for-byte below its differing header comment. The base
+  pointer is staged in `rdx` (the fixed scratch register DIV/MOD already
+  clobber freely — never in the allocation pool); CAS puts the expected
+  value in `rax` (cmpxchg's implicit accumulator) and the new value in
+  `rcx`, then `lock cmpxchg [rdx], rcx`; ATOMIC_ADD puts the addend in
+  `rcx`, then `lock xadd [rdx], rcx`. No displacement (FMT_RRR's rb
+  field is a register — disp = 0). `st_rax_untag`/`st_rcx_untag` clear
+  rD's capability tag, matching the interpreter. The 64-bit forms emit
+  REX.W; the 32-bit forms compare/store on EAX/ECX only, so high garbage
+  bits in the expected/new values are ignored exactly like the
+  interpreter's width-masked compare.
+- **The real finding (a genuine x86 semantics bug, caught by the i32
+  tooth)** — on a *successful* `cmpxchg`, the accumulator is **not
+  written**, so the 32-bit form's RAX still carries the expected value's
+  garbage high bits and the returned "old" would be wrong. Fixed by
+  zero-extending EAX (`mov eax,eax`, a no-op on the mismatch path where
+  EAX is already loaded from memory) after the 32-bit cmpxchg. The
+  interpreter's width-masked returned-old semantics are now reproduced
+  bit-for-bit.
+- **The fixtures un-skipped** — `run_native_tests.sh` drops the A0-era
+  skip block; both fixtures now RUN on real x86-64 hardware (the mmap'd
+  scratch region stands in for process memory): **cas_simple = 5 at 995
+  bytes, atomic_add = 2 at 822 bytes** of native code.
+- **The three-way parity** — interp 5/2, x86 5/2, RV64 clean
+  translate-time rejection (`unsupported or malformed opcode`, the
+  documented fourth leg until A2).
+- **The teeth (ad hoc)** — an i32-width CAS with garbage high bits in
+  the expected value (0x10000000064 vs a cell holding 100) matches on
+  the low 32 bits, stores the new value, and returns the zero-extended
+  old (the width-mask semantics, now on the native path too); an
+  immediate-operand CAS is rejected at translate time (`BAD_OPCODE`).
+- **No regression** — interp 81/81, x86 native 80/80 (+2, 3 pre-existing
+  skips), RV64 77/77, ARM 78/78, size gate byte-identical (78/78, 26404
+  saved — simi_arm.c untouched), enc-check clean.
 
 ## 8. Honest verification caveats
 
