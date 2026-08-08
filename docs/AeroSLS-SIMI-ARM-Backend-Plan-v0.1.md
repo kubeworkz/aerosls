@@ -2273,6 +2273,72 @@ on top of 4900:
   site would fold leaves that return a function of their (constant)
   arguments, at the cost of making the analysis call-site-dependent.
 
+### 10.50 M2.20 — the call-site-aware leaf analysis (as built)
+
+The recorded M2.19 follow-up, built. The analysis is now
+call-site-dependent: the precompute shrinks to a per-callee LEAF MARKER
+(ar_leaf_ret_pc — ENTER start, straight-line body, first RET; the
+M2.19 reviewer hardening against mid-body ENTERs and the
+BR/BC/JMPR/CALL rejection are preserved), and the fixpoint's CALL
+branch runs the SAME ar_const_step body walk at each call site against
+an r8+ = 0 scratch map (file-scope, like the M2.18 snapshots) whose
+r0-r7 are seeded from the CALLER's constant map. Sound because the
+call-site marshaling copies the caller's live r0-r7 verbatim (in both
+the interpreter and the emitted code), so a constant the caller's map
+attributes to an argument register is a constant the callee reads; the
+once-execution and block-head disciplines that make the caller's map
+sound at any pc make it sound here. Two ordering lessons, both in the
+code comments: the seed must snapshot the caller's r0 BEFORE the
+"return value is unknown" clear (the same snapshot-before-clear trap
+as M2.18's branch snapshot — the first build cleared r0 first, killing
+arg0, and the probe caught it), and the args-unknown case is just the
+all-unknown seed — so jmpr_callret's fold survives byte-identically.
+
+### 10.51 M2.20 gate results (measured)
+
+Total emitted bytes across the now-43-program parity set: **M0 60712
+→ M1 55332, 5380 saved** (≈8.9%), up from M2.19's 5052. The new row
+on top of 5052:
+
+- jmpr_callret_arg 3344 → 3016 (−328, new 43rd row; M0 baseline
+  measured at git 1729f50). TWO call sites to the SAME leaf pin the
+  per-site dependence: the leaf returns arg0 + arg1; main passes
+  3 + 5 = 8 and its JMPR folds to pc 8, other passes 8 + 10 = 18 and
+  its JMPR folds to pc 18. Both folds are REAL branches (unreachable
+  filler at pc 7 / pc 17, so neither target is pc+1; the coalescing
+  pre-pass does not fire; rule 1 marks pc 8 and pc 18), and both are
+  load-bearing — g_alloc requires EVERY JMPR in the stream to fold,
+  so a single failed site would throw the whole program back to the
+  naive path. Disabling ONLY the arg seeding (args stay unknown — the
+  M2.19 behavior) grows it back to exactly 3344 while jmpr_callret
+  stays byte-identical at 1884, both still correct — the teeth,
+  isolating the arg-seeding delta (2 × 164) exactly.
+- Row-by-row accounting (gate tables diffed vs committed c4ee7fc):
+  all 42 shared rows byte-identical — the totals move by exactly the
+  new row. The analysis is byte-neutral across the pre-existing
+  corpus: no existing call test's fold decisions change (jmpr_callret
+  folds identically under the all-unknown seed; call_ret, cap_call_ret
+  and aggregate_abi measure identically).
+- Four-way parity: all 46 common tests pass on all four engines (the
+  three skips are the pre-existing float_ops RV64/ARM and mem_ops x86
+  limitations). enc-check clean; jmpr_oob still faults (UDF, rc=1).
+- Convergence (honest framing): the call-site analysis joins the
+  pre-existing latent 2-cycle class — a backward fold into a region
+  that seeds another fold can oscillate (fold -> reset -> un-fold ->
+  re-fold), and the M2.18 cap's fallback re-runs the UN-relaxed
+  fixpoint, which is monotone-decreasing in the fold set and provably
+  terminates under the accumulating block-head marks; the call-site
+  seeds only shrink as marks accumulate, and the walk never invents a
+  value — a partially-known walk result is UNKNOWN, never a different
+  constant — so a call's r0 result is monotone known -> unknown, and
+  the same argument covers them. The corpus exercises neither shape;
+  the cap is the translator's termination guarantee on any input.
+- Remaining restriction (recorded, not a gap): the walk is
+  straight-line only, so a leaf with a branch, a nested call, or a
+  load/store-dependent return is conservatively not folded; and the
+  call-site walk re-runs every fixpoint pass (deterministic and cheap
+  — the leaf is rejected upfront unless straight-line).
+
 ---
 
 ## Sources consulted
