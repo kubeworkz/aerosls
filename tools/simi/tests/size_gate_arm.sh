@@ -235,6 +235,29 @@
 # THIRTY-FIRST b.eq (block31, LOADI #3200). 628 bytes below its M0
 # baseline, and disabling both union fallbacks grows it back to
 # exactly 3068 (the table path, still correct) — the teeth.
+# jmpr_chain14 is M2.38: the RECORD-vs-RECORD join. chain13 closed the
+# deferred-over-flat family; a join mixing a deferred record with a
+# DIFFERENT deferred record still collapsed (the first loop's
+# different-record unknowning — the union of two >12-value sets can't
+# be either record). Here the dispatch index r1 is computed on two
+# arms: the R-arm computes R1 = r2 + r3 (FIFTEEN values {40..68},
+# DEFERS) and its `BC r5, J` delivers R1 into J; the fall-through
+# S-arm (taken at runtime, r5 == 0) computes R2 = r2 + r6 over the
+# SHARED r2 join (FIFTEEN DISJOINT values {70..98}, DEFERS — replacing
+# R1 in cur, already delivered). All joins precede the delivery (a BC
+# carries every tracked slot — an early arm would deliver UNKNOWN for
+# the not-yet-joined r6), and both products share r2 so the
+# tracked-register closure {r1,r2,r3,r6} stays within the 4-register
+# cap. M2.38 generalizes the union record to reference BOTH records —
+# op(rec(R2), rec(R1)) — when the merged true set fits the 32-cap
+# (the carry record is live by construction; the arrival record must
+# pass the M2.36 liveness check), and the first loop's unknowning is
+# gone: every record-vs-record case is decided where the union can
+# fire. The union materializes to THIRTY candidates {40..98}; the gate
+# (244 < 440) emits the 30-pair chain. The runtime index 22 + 76 = 98
+# takes the chain's THIRTIETH b.eq (block29, LOADI #3000). 604 bytes
+# below its M0 baseline, and disabling the M2.38 union grows it back
+# to exactly 2960 (the table path, still correct) — the teeth.
 # jmpr_calc is M2.1: its index is COMPUTED at translate
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
@@ -647,7 +670,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

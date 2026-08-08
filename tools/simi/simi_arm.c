@@ -501,8 +501,9 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * op(rec(R1), #32) instead of collapsing to UNKNOWN), or a FROZEN flat
  * set (CD_FLAT — the union record's small side, stored out-of-line and
  * never invalidated). CHAIN_OP_UNION records carry the record side in
- * operand a (CD_REC) and the flat side in operand b (CD_FLAT). Records
- * only reference older records, so the DAG is acyclic. */
+ * operand a (CD_REC) and the second side in operand b — CD_FLAT (M2.37)
+ * or CD_REC (M2.38, the record-vs-record join). Records only reference
+ * older records, so the DAG is acyclic. */
 struct ChainDef {
     uint8_t op;       /* ADD/SUB/MUL/AND/OR/XOR */
     uint8_t ka, kb;   /* CD_SLOT / CD_REC / CD_IMM for operand a / operand b */
@@ -1169,37 +1170,52 @@ static void chain_merge_big(struct ChainBig* a, const struct ChainSet* b) {
     for (uint8_t t = 0; t < k; t++) a->v[t] = tmp[t];
     a->n = k;
 }
-/* M2.37: allocate a UNION record — op(rec(R), flat(F)) — whose
+/* M2.37/M2.38: allocate a UNION record — op(rec(R), side) — whose
  * materialization is the merged true set of the deferred record R and
- * the flat set F (capped at TX_AR_CHAIN_BIG). This is the head-union
- * fallback when a deferred record meets a flat set that is NOT
- * contained: the union exceeds the record's > 12 values but still fits
- * the 32-cap, so instead of collapsing to UNKNOWN the chain survives
- * as a record. The eager cap-check is exact-or-conservative: the
- * record side is materialized over the CURRENT cur[] (the caller's
- * record is live — the carry record by construction, the arrival
- * record under chain_def_live), and any later head-union can only
- * widen it (a sound superset), never shrink it, so a union that fits
- * here is provably representable. The flat side is frozen into
- * g_chain_def_flat[rec] — immune to later writes and unions. The
- * record references rec (created earlier this iteration), so the DAG
- * stays acyclic. Returns -1 when the union exceeds the cap or the pool
- * is full — the caller falls back to UNKNOWN. */
-static int chain_def_alloc_union(const struct ChainSet* cur, int16_t rec, const struct ChainSet* flat, uint32_t pc) {
+ * the second side (capped at TX_AR_CHAIN_BIG). The second side is a
+ * FROZEN flat set (CD_FLAT, M2.37 — stored out-of-line in
+ * g_chain_def_flat[ri], immune to later writes and unions) or another
+ * DEFERRED record (CD_REC, M2.38 — the record-vs-record join). This is
+ * the head-union fallback when a deferred record meets a non-contained
+ * flat set or a DIFFERENT deferred record: the union exceeds the
+ * record's > 12 values but still fits the 32-cap, so instead of
+ * collapsing to UNKNOWN the chain survives as a record. The eager
+ * cap-check is exact-or-conservative: both sides are materialized over
+ * the CURRENT cur[] (the caller's records are live — the carry record
+ * by construction, the arrival record under chain_def_live), and any
+ * later head-union can only widen (a sound superset), never shrink, so
+ * a union that fits here is provably representable. The record
+ * references both rec and the second side (created earlier this
+ * iteration), so the DAG stays acyclic. Returns -1 when the union
+ * exceeds the cap or the pool is full — the caller falls back to
+ * UNKNOWN. */
+static int chain_def_alloc_union(const struct ChainSet* cur, int16_t rec, uint8_t kb, int32_t b,
+                                 const struct ChainSet* flat, uint32_t pc) {
     struct ChainBig rb;
     chain_flatten_big_rec(&rb, cur, rec);
     if (rb.unk) return -1;
-    for (uint8_t i = 0; i < flat->n && !rb.unk; i++) {
-        struct ChainSet one;
-        chain_singleton(&one, flat->v[i]);
-        chain_merge_big(&rb, &one);
+    if (kb == CD_REC) {
+        struct ChainBig r2;
+        chain_flatten_big_rec(&r2, cur, (int16_t)b);
+        if (r2.unk) return -1;
+        for (uint8_t i = 0; i < r2.n && !rb.unk; i++) {
+            struct ChainSet one;
+            chain_singleton(&one, r2.v[i]);
+            chain_merge_big(&rb, &one);
+        }
+    } else {
+        for (uint8_t i = 0; i < flat->n && !rb.unk; i++) {
+            struct ChainSet one;
+            chain_singleton(&one, flat->v[i]);
+            chain_merge_big(&rb, &one);
+        }
     }
     if (rb.unk) return -1;
     if (g_chain_ndef >= TX_AR_CHAIN_DEFS) return -1;
     int ri = g_chain_ndef++;
     struct ChainDef* d = &g_chain_defs[ri];
-    d->op = CHAIN_OP_UNION; d->ka = CD_REC; d->a = rec; d->kb = CD_FLAT; d->b = ri;
-    g_chain_def_flat[ri] = *flat;
+    d->op = CHAIN_OP_UNION; d->ka = CD_REC; d->a = rec; d->kb = kb; d->b = (kb == CD_FLAT) ? ri : b;
+    if (kb == CD_FLAT) g_chain_def_flat[ri] = *flat;
     g_chain_def_pc[ri] = pc;   /* M2.36: the union's value is fixed at this instruction */
     return ri;
 }
@@ -2776,19 +2792,18 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                  * the merged true set, capped at 32 —
                                  * so a non-contained flat join still
                                  * feeds the chain instead of collapsing.
+                                 * M2.38: the arrival may also be a
+                                 * DIFFERENT deferred record — the union
+                                 * is then op(rec(R), rec(R2)) over BOTH
+                                 * records (arrival liveness required),
+                                 * and the first loop's different-record
+                                 * unknowning is gone: every record-vs-
+                                 * record case is decided here, where the
+                                 * union can fire (the carry record is
+                                 * live by construction, so the merged
+                                 * materialization is exact-or-superset).
                                  * Anything else with a record on either
                                  * side collapses to UNKNOWN. */
-                                for (int s = 0; s < ntr; s++) {
-                                    /* M2.35: only a DIFFERENT deferred
-                                     * arrival unknowns a deferred carry
-                                     * here; a FLAT arrival is decided in
-                                     * the second loop, where the
-                                     * containment test can materialize the
-                                     * record over the intact cur[]. */
-                                    if (cur[s].def >= 0 && g_chain_arr[s][pc].def >= 0 &&
-                                        g_chain_arr[s][pc].def != cur[s].def)
-                                        chain_unknown(&cur[s]);
-                                }
                                 for (int s = 0; s < ntr; s++) {
                                     if (!carry) { cur[s].n = 0; cur[s].unk = 0; cur[s].def = -1; }
                                     if (cur[s].def >= 0 && g_chain_arr[s][pc].def == cur[s].def) continue;   /* same record: keep deferred */
@@ -2820,7 +2835,24 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                          * behavior byte-identical). */
                                         if (g_chain_arr[s][pc].def < 0 &&
                                             g_chain_arr[s][pc].n > 0 && !g_chain_arr[s][pc].unk) {
-                                            int ri = chain_def_alloc_union(cur, cur[s].def, &g_chain_arr[s][pc], pc);
+                                            int ri = chain_def_alloc_union(cur, cur[s].def, CD_FLAT, 0, &g_chain_arr[s][pc], pc);
+                                            if (ri >= 0) { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; continue; }
+                                        }
+                                        /* M2.38: the arrival is a DIFFERENT
+                                         * deferred record — the union of
+                                         * two >12-value records. Represent
+                                         * it as a UNION record over BOTH
+                                         * records when the merged true
+                                         * set fits the 32-cap: the carry
+                                         * record is live by construction,
+                                         * and the arrival record must
+                                         * pass the M2.36 liveness check
+                                         * (no write to its transitive DAG
+                                         * since creation) to be
+                                         * materializable at the dispatch. */
+                                        if (g_chain_arr[s][pc].def >= 0 &&
+                                            chain_def_live(g_chain_arr[s][pc].def)) {
+                                            int ri = chain_def_alloc_union(cur, cur[s].def, CD_REC, (int32_t)g_chain_arr[s][pc].def, NULL, pc);
                                             if (ri >= 0) { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; continue; }
                                         }
                                         chain_unknown(&cur[s]);
@@ -2855,7 +2887,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                              * empty carry still collapses,
                                              * byte-identical to M2.36). */
                                             if (chain_def_live(rec) && cur[s].n > 0) {
-                                                int ri = chain_def_alloc_union(cur, rec, &cur[s], pc);
+                                                int ri = chain_def_alloc_union(cur, rec, CD_FLAT, 0, &cur[s], pc);
                                                 if (ri >= 0) { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; continue; }
                                             }
                                         }
