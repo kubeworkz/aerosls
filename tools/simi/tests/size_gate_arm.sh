@@ -279,7 +279,44 @@
 # args-unknown case is just the all-unknown seed, so jmpr_callret is
 # byte-identical. 328 bytes below its M0 baseline, and disabling the
 # arg seeding grows it back to exactly 3344 (both JMPRs dynamic,
-# g_alloc = 0, whole function naive), still correct. jmpr_cross is
+# g_alloc = 0, whole function naive), still correct. jmpr_unreach is
+# M2.21: the g_alloc gate is scoped to REACHABLE JMPRs. `dead` (pc 10)
+# is an unreachable function — entered from nowhere (main's RET at pc 9
+# is a terminal, nothing targets pc 10) — and its JMPR r7 reads an
+# ENTER argument, unknown under the constant map, so it NEVER folds.
+# Before M2.21 that one unreachable JMPR killed g_alloc for the whole
+# program (the gate was every JMPR in the linear stream): main's own
+# foldable JMPR (r0 = 8 after the M2.20 leaf call) was thrown away and
+# everything ran naive. M2.21's static reachability pre-pass (a BFS
+# from the entries over the non-JMPR edges: BR/BC targets + fall-
+# through, CALL target + fall-through; RET and JMPR are terminals)
+# shows pc 11 is never reachable — a JMPR that can never dispatch
+# cannot make every pc a potential block head — so main's JMPR folds
+# to pc 8 and the cache survives. dead's dynamic dispatch path is
+# still emitted (correct, never executed; the cache discipline is
+# per-path, so a fold into an unreachable-looking region would land
+# on a rule-1 block-head flush anyway). 96 bytes below its M0 baseline
+# (the extra 48 vs the teeth is M2.14 tail-reuse across the three
+# RETs), and reverting the reachability gate grows it back to exactly
+# 2996 (main's JMPR dynamic, g_alloc = 0, whole function naive), still
+# correct. jmpr_foldreach is
+# M2.21 soundness pin (reviewer finding): a REACHABLE fold can dispatch
+# into a statically-unreachable-looking region — main's JMPR r0 = 10
+# folds to pc 10, which sits inside `dead` (the fold index is just a
+# constant, any pc) — so the reachability pre-pass must be FOLD-AWARE:
+# the fold edge makes pc 13 runtime-reachable, and dead's JMPR (index
+# = a DIV result, 14/2 = 7, which never folds — the constant analysis
+# deliberately excludes DIV) MUST gate. Without the fold edge, dead's
+# JMPR hides from the gate, g_alloc stays 1, and the runtime dispatch
+# could land mid-chain with a stale cache — the hazard the gate exists
+# to prevent. With the closure the whole program goes naive (correct;
+# the runtime still terminates: fold to pc 10, DIV -> 7, dispatch to
+# pc 7, ADD -> 8). 48 bytes below its M0 baseline (the naive-path
+# machinery: pc 6's fold as a direct branch + M2.14 tail-reuse), and
+# removing the fold edge from the pre-pass drops it to exactly 2988
+# (the buggy g_alloc=1 emission, dead's JMPR hidden), still passing —
+# the teeth, isolating the fold-edge delta (3044 -> 2988 = -56) exactly.
+# jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -350,7 +387,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

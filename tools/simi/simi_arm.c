@@ -617,6 +617,21 @@ static int ar_leaf_ret_pc(const uint64_t* instrs, uint32_t num_instr, uint32_t T
 static int g_call_leaf_ret[4096];
 static uint8_t  g_call_arg_known[TX_AR_MAX_REGS];
 static uint64_t g_call_arg_val[TX_AR_MAX_REGS];
+/* M2.21: static reachability from the entries. The BFS follows the
+ * non-JMPR control edges (BR/BC targets + fall-through, CALL target +
+ * fall-through; RET is a terminal) AND, because it runs AFTER the fold
+ * fixpoint, the fold edges: a FOLDED JMPR's target is a runtime edge
+ * (the fold is a direct branch — the M2.12 fall-through fold's target
+ * pc+1 is reached by falling through), while an UNFOLDED JMPR is a
+ * terminal whose runtime target is data-dependent. g_alloc gates on
+ * REACHABLE JMPRs only: a JMPR whose pc can never dispatch cannot make
+ * every pc a potential block head, so an unreachable function's
+ * non-folding JMPR no longer throws the whole program back to the naive
+ * path. The fold edges are the soundness-critical part: a reachable
+ * fold can dispatch into a statically-unreachable-looking region, and
+ * a non-folding JMPR THERE would still dispatch to arbitrary pcs at
+ * runtime — it must gate (M2.21 reviewer finding). */
+static uint8_t g_reach[4096];
 /* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
  * continuation pcs of a maximal straight-line run of LOAD/STORE that share
  * ONE displacement past the imm12 range — the displacement is materialized
@@ -1898,12 +1913,63 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
          * tangled with branches in a way the corpus does not contain.
          * The reset argument holds regardless; see plan doc §10. */
     }
-    /* g_alloc = cache enabled iff every JMPR folds. One non-foldable JMPR
-     * can reach any pc, which makes every pc a block head — no cache.
-     * Folded JMPRs are direct branches either way (they need no cache). */
+    /* M2.21: static reachability pre-pass — a worklist BFS from the
+     * entries. RET is a terminal; BR adds its target (never falls
+     * through); BC/CALL add their target AND fall through (the call
+     * returns); everything else flows to pc+1; a FOLDED JMPR adds its
+     * fold target (a direct branch — for the M2.12 fall-through shape
+     * that is pc+1, reached by falling through), while an UNFOLDED
+     * JMPR is a terminal (its runtime target is data-dependent; its own
+     * pc being reachable or not is all the gate below needs). The fold
+     * edges are what make the gate SOUND: without them, a reachable
+     * fold into a statically-unreachable-looking region could hide a
+     * runtime-reachable non-folding JMPR there, which would still
+     * dispatch to arbitrary pcs (M2.21 reviewer finding). */
+    for (uint32_t q = 0; q < 4096; q++) g_reach[q] = 0;
+    {
+        uint32_t wl[4096], wh = 0, wr = 0;
+        for (uint32_t i = 0; i < hdr.num_entries; i++)
+            if (entries[i].offset < hdr.num_instr && !g_reach[entries[i].offset]) {
+                g_reach[entries[i].offset] = 1;
+                wl[wr++] = entries[i].offset;
+            }
+        while (wh < wr) {
+            uint32_t p = wl[wh++];
+            uint8_t op = w_op(instrs[p]);
+            if (op == OP_RET) continue;                    /* terminal */
+            if (op == OP_JMPR) {
+                if (g_jmpr_fold[p] >= 0) {
+                    uint32_t t = (uint32_t)g_jmpr_fold[p];
+                    if (t < hdr.num_instr && !g_reach[t]) { g_reach[t] = 1; wl[wr++] = t; }
+                }
+                continue;                                  /* unfolded: data-dependent target */
+            }
+            if (op == OP_BR) {
+                int64_t t = (int64_t)p + 1 + w_imm28(instrs[p]);
+                if (t >= 0 && t < (int64_t)hdr.num_instr && !g_reach[(uint32_t)t]) {
+                    g_reach[(uint32_t)t] = 1; wl[wr++] = (uint32_t)t;
+                }
+                continue;                                  /* BR never falls through */
+            }
+            if (op == OP_BC || op == OP_CALL) {
+                int64_t t = (int64_t)p + 1 + w_imm28(instrs[p]);
+                if (t >= 0 && t < (int64_t)hdr.num_instr && !g_reach[(uint32_t)t]) {
+                    g_reach[(uint32_t)t] = 1; wl[wr++] = (uint32_t)t;
+                }
+            }
+            if (p + 1 < hdr.num_instr && !g_reach[p + 1]) { g_reach[p + 1] = 1; wl[wr++] = p + 1; }
+        }
+    }
+    /* g_alloc = cache enabled iff every REACHABLE JMPR folds. One
+     * reachable non-foldable JMPR can dispatch to any pc, which makes
+     * every pc a block head — no cache. Folded JMPRs are direct branches
+     * either way (they need no cache), and unreachable JMPRs never
+     * dispatch (M2.21) — both are inert for the gate. */
     g_alloc = 1;
     for (uint32_t pc = 0; pc < hdr.num_instr; pc++)
-        if (w_op(instrs[pc]) == OP_JMPR && g_jmpr_fold[pc] < 0) { g_alloc = 0; break; }
+        if (w_op(instrs[pc]) == OP_JMPR && g_jmpr_fold[pc] < 0 && g_reach[pc]) {
+            g_alloc = 0; break;
+        }
     for (int i = 0; i < AR_CACHE_N; i++) g_cache_guest[i] = -1;
     g_cache_round = 0;
     g_resv_slot = -1;

@@ -1,0 +1,45 @@
+; jmpr_foldreach.simi — M2.21 soundness pin (reviewer finding). A
+; REACHABLE fold can dispatch into a statically-unreachable-looking
+; region: main's JMPR r0 = 10 folds to pc 10, which sits inside `dead`
+; (the fold index is just a constant — any pc). The M2.21 reachability
+; pre-pass must therefore be FOLD-AWARE: the fold edge makes pc 10 (and
+; its continuation, pc 13) runtime-reachable, so dead's JMPR — whose
+; index is a DIV result (14/2 = 7 at runtime, but DIV never folds — the
+; constant analysis deliberately excludes it), hence NEVER a fold — MUST
+; gate g_alloc. Without the fold edge in the pre-pass, dead's JMPR would
+; be marked unreachable, g_alloc would stay 1, and the runtime dispatch
+; from pc 13 to pc 7 could land mid-chain with a stale cache directory —
+; the exact hazard the gate exists to prevent. With the closure, the
+; whole program goes naive (correct), and the runtime still terminates:
+; main folds to pc 10, computes r0 = 7, dispatches to pc 7 (the end
+; block), ADD -> 8. This pin's signature is the SIZE: its M1 (3044)
+; is the GATED naive size — the fold-reached non-folding JMPR
+; correctly forfeits the cache, and the teeth (removing the fold edge
+; from the pre-pass) drop it to 2988, the buggy g_alloc=1 emission
+; where dead's JMPR hides from the gate. The 48 bytes between M0 and
+; M1 are the naive-path machinery (pc 6's fold as a direct branch,
+; M2.14 tail-reuse), not a cache win.
+; Expected result: 8 (pc 7: ADD r0, r0, #1 -> 7 + 1).
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r2, #3, i64   ; pc 1
+    LOADI r3, #7, i64   ; pc 2 — 3 + 7 = 10
+    MOV r0, r2, i64     ; pc 3
+    MOV r1, r3, i64     ; pc 4
+    CALL leaf           ; pc 5 — r0 = 3 + 7 = 10 after the call (M2.20)
+    JMPR r0             ; pc 6 — r0 = 10 — FOLDS to pc 10 (dead's LOADI)
+end:                    ; pc 7 — the runtime dispatch target (via dead's JMPR)
+    ADD r0, r0, #1, i64 ; pc 7 — r0 = 7 + 1 = 8
+    RET                 ; pc 8 — returns 8
+dead:                   ; pc 9 — statically unreachable WITHOUT the fold edge
+    ENTER #8            ; pc 9
+    LOADI r5, #14, i64  ; pc 10 — the FOLD TARGET (reached at runtime via main's fold)
+    LOADI r6, #2, i64   ; pc 11
+    DIV r0, r5, r6, i64 ; pc 12 — r0 = 14 / 2 = 7 at runtime; UNKNOWN to the fixpoint
+    JMPR r0             ; pc 13 — non-folding — reachable VIA THE FOLD — MUST gate
+    RET                 ; pc 14 — never reached
+leaf:                   ; pc 15 — the callee (a straight-line leaf)
+    ENTER #8            ; pc 15 — fresh frame: r8+ zeroed, r0-r7 = caller args
+    ADD r0, r0, r1, i64 ; pc 16 — r0 = arg0 + arg1
+    RET                 ; pc 17
