@@ -1,0 +1,133 @@
+; jmpr_chain21.simi — M2.45: an OPAQUE rewrite of the INDEX register r1
+; itself, between the index build and the dispatch — the mirror of M2.44
+; (which rewrote a FEEDER and pinned that r1's stored image survives).
+; The walk stores a per-register set, so a WRITE to r1 replaces cur[r1]
+; entirely: a TRACKED writer installs the new image (M2.27/M2.28), an
+; OPAQUE writer (SHR — not in the image family) installs UNKNOWN, and
+; the dispatch snapshot is then UNKNOWN — the chain dies conservatively
+; and the runtime table runs. The index is r1 = r2 + r3 over joins (r2
+; in {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values {42..80});
+; the opaque `SHR r1, r1, #1` sits BETWEEN the build and the dispatch.
+; The runtime index 32 + 48 = 80 becomes 80 >> 1 = 40 — a REAL block
+; (block_40 at pc 40, deliberately OUTSIDE the candidate set). The pin:
+; a stale-image chain would dispatch 40 against {42..80}, miss every
+; b.eq and UDF-trap; the table (the honest naive path, which the dead
+; chain forces) lands 40 on block_40 -> 10000. Four engines must agree.
+; Expected result: 10000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #2, i64   ; pc 2 — branch-path base (2) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:2} at J2)
+    LOADI r2, #12, i64  ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:12} at J2)
+    LOADI r2, #22, i64  ; pc 6
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:22} at J2)
+    LOADI r2, #32, i64  ; pc 8 — fall-through base (32)
+J2:                     ; (label) — join: r2 in {2, 12, 22, 32}
+    LOADI r3, #40, i64  ; pc 9
+    BC r0, J3           ; pc 10 — falls through (delivers {r3:40} at J3)
+    LOADI r3, #42, i64  ; pc 11
+    BC r0, J3           ; pc 12 — falls through (delivers {r3:42} at J3)
+    LOADI r3, #44, i64  ; pc 13
+    BC r0, J3           ; pc 14 — falls through (delivers {r3:44} at J3)
+    LOADI r3, #46, i64  ; pc 15
+    BC r0, J3           ; pc 16 — falls through (delivers {r3:46} at J3)
+    LOADI r3, #48, i64  ; pc 17 — fall-through base (48)
+J3:                     ; (label) — join: r3 in {40,42,44,46,48}
+    ADD r1, r2, r3, i64 ; pc 18 — r1 = r2 + r3 = 20 values (42..80 evens).
+                        ; This STORED image is what the dispatch WOULD
+                        ; have read — but the next instruction rewrites
+                        ; the index register itself.
+    SHR r1, r1, #1, i64 ; pc 19 — OPAQUE rewrite of the INDEX register:
+                        ; the walk cannot track SHR, so cur[r1] is
+                        ; REPLACED by UNKNOWN (unlike a feeder write,
+                        ; which leaves the stored image untouched). The
+                        ; chain must die — the runtime register now
+                        ; holds 80 >> 1 = 40, NOT a member of {42..80}.
+    JMPR r1             ; pc 20 — dynamic (index unknown) -> table.
+                        ; Runtime 40 -> g_instr_off[40] = block_40.
+    LOADI r0, #0, i32   ; pc 21 — dead filler (aligns block_40 to pc 40)
+    LOADI r0, #0, i32   ; pc 22
+    LOADI r0, #0, i32   ; pc 23
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+block_40:               ; pc 40 — the table's target: runtime 40 lands
+    LOADI r0, #10000, i32 ; pc 40 — here (10x the block0 value, distinct
+                        ; from every chain candidate's block)
+    RET                 ; pc 41
+block0:                 ; pc 42
+    LOADI r0, #100, i32 ; pc 42
+    RET                 ; pc 43
+block1:                 ; pc 44
+    LOADI r0, #200, i32 ; pc 44
+    RET                 ; pc 45
+block2:                 ; pc 46
+    LOADI r0, #300, i32 ; pc 46
+    RET                 ; pc 47
+block3:                 ; pc 48
+    LOADI r0, #400, i32 ; pc 48
+    RET                 ; pc 49
+block4:                 ; pc 50
+    LOADI r0, #500, i32 ; pc 50
+    RET                 ; pc 51
+block5:                 ; pc 52
+    LOADI r0, #600, i32 ; pc 52
+    RET                 ; pc 53
+block6:                 ; pc 54
+    LOADI r0, #700, i32 ; pc 54
+    RET                 ; pc 55
+block7:                 ; pc 56
+    LOADI r0, #800, i32 ; pc 56
+    RET                 ; pc 57
+block8:                 ; pc 58
+    LOADI r0, #900, i32 ; pc 58
+    RET                 ; pc 59
+block9:                 ; pc 60
+    LOADI r0, #1000, i32 ; pc 60
+    RET                 ; pc 61
+block10:                ; pc 62
+    LOADI r0, #1100, i32 ; pc 62
+    RET                 ; pc 63
+block11:                ; pc 64
+    LOADI r0, #1200, i32 ; pc 64
+    RET                 ; pc 65
+block12:                ; pc 66
+    LOADI r0, #1300, i32 ; pc 66
+    RET                 ; pc 67
+block13:                ; pc 68
+    LOADI r0, #1400, i32 ; pc 68
+    RET                 ; pc 69
+block14:                ; pc 70
+    LOADI r0, #1500, i32 ; pc 70
+    RET                 ; pc 71
+block15:                ; pc 72
+    LOADI r0, #1600, i32 ; pc 72
+    RET                 ; pc 73
+block16:                ; pc 74
+    LOADI r0, #1700, i32 ; pc 74
+    RET                 ; pc 75
+block17:                ; pc 76
+    LOADI r0, #1800, i32 ; pc 76
+    RET                 ; pc 77
+block18:                ; pc 78
+    LOADI r0, #1900, i32 ; pc 78
+    RET                 ; pc 79
+block19:                ; pc 80
+    LOADI r0, #2000, i32 ; pc 80
+    RET                 ; pc 81

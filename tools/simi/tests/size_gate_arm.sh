@@ -278,6 +278,27 @@
 # below its M0 baseline, and disabling the M2.38 union grows it back
 # to exactly 3060 (the table path, still correct) — the teeth prove
 # the nested composition dispatches through the same union machinery.
+# jmpr_chain21 is M2.45: an OPAQUE rewrite of the INDEX register r1
+# itself, between the index build and the dispatch — the mirror of M2.44
+# — a PROOF milestone with no code change. The walk stores a
+# PER-REGISTER set, so a WRITE to r1 REPLACES cur[r1] entirely: a
+# tracked writer installs the new image (M2.27/M2.28), an OPAQUE writer
+# (SHR — not in the image family) installs UNKNOWN, and the dispatch
+# snapshot is then UNKNOWN — the chain dies conservatively and the
+# runtime table runs. The pin's index is r1 = r2 + r3 over joins (r2 in
+# {2,12,22,32}, r3 in {40,42,44,46,48} -> TWENTY values {42..80}); the
+# opaque `SHR r1, r1, #1` sits BETWEEN the build and the dispatch. The
+# runtime index 32 + 48 = 80 becomes 80 >> 1 = 40 — a REAL block
+# (block_40 at pc 40, deliberately OUTSIDE the candidate set). The pin
+# discriminates: a stale-image chain would dispatch 40 against
+# {42..80}, miss every b.eq and UDF-trap; the table (the honest naive
+# path, which the dead chain forces) lands 40 on block_40 -> 10000. 336
+# bytes below its M0 baseline (the chain is dead by design — the delta
+# is the accumulated M1 emission folds, not the chain). The teeth: a
+# TRACKED rewrite at the same pc (ADD r1, r1, #-32) re-derives the
+# image {10..48} and the chain fires on the SHIFTED candidates (runtime
+# 48 -> block3, 400 on all four engines) — the replace is value-accurate
+# in both directions, proven at the same pc with only the op differing.
 # jmpr_chain20 is M2.44: a tracked FEEDER rewritten after the index
 # computation — a PROOF milestone with no code change. The chain walk
 # stores a PER-REGISTER set: the index build puts the image { r2 + r3 }
@@ -784,7 +805,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
