@@ -469,6 +469,54 @@ int main(int argc, char **argv) {
             pc++; break;
         }
 
+        /* Gap Remediation SIMI Phase 15: shared-memory atomics. The
+         * interpreter is the single-threaded PARITY REFERENCE — these are
+         * plain load-compare-store / load-add-store in one thread; what the
+         * four-way cross-check proves is the FUNCTIONAL semantics (CAS
+         * success/failure + returned-old values, atomic-add results), NOT
+         * concurrency semantics (exclusion / no lost updates / ordering),
+         * which needs a real-hardware multi-threaded stress harness the
+         * sandbox lacks (plan doc Part II §8, stated plainly).
+         *
+         * v1 scope per plan D1: T_I32/T_I64 and the unsigned views only
+         * (byte/float atomics scoped out — composable via masking if ever
+         * needed), register operands only (FLAG_IMM rejected — the rB/imm
+         * field is a register; there is no displacement form), SC ordering.
+         * rD is BOTH the new value (input) and the returned old value
+         * (output) — the x86 cmpxchg/xadd operand shape. The returned old
+         * value is the cell's raw bits zero-extended to 64 (no sign
+         * extension — the cell is compared and returned as stored). */
+        case OP_CAS: {
+            if (simi_flags(w) & FLAG_IMM) die("CAS has no immediate form in v1 (register operands only; see plan doc Part II D1)", pc);
+            int wdt = width_of((SimiType)type);
+            if (wdt != 4 && wdt != 8) die("CAS v1 supports T_I32/T_I64 and unsigned views only", pc);
+            uint64_t addr = fr->regs[ra];
+            if (addr + wdt > MEM_SIZE) die("CAS out of simulated memory bounds", pc);
+            uint64_t old = 0, newval = fr->regs[rd];
+            memcpy(&old, &mem[addr], wdt);          /* old = [rA] */
+            uint64_t expected = fr->regs[simi_rb_reg(w)];
+            uint64_t mask = (wdt == 8) ? ~0ull : ((1ull << (wdt * 8)) - 1);
+            if ((old & mask) == (expected & mask))  /* if (old == rB) */
+                memcpy(&mem[addr], &newval, wdt);   /* [rA] = rD_in */
+            fr->regs[rd] = old;                     /* rD = old (returned) */
+            set_tag(fr, rd, 0);
+            pc++; break;
+        }
+        case OP_ATOMIC_ADD: {
+            if (simi_flags(w) & FLAG_IMM) die("ATOMIC_ADD has no immediate form in v1 (register operands only; see plan doc Part II D1)", pc);
+            int wdt = width_of((SimiType)type);
+            if (wdt != 4 && wdt != 8) die("ATOMIC_ADD v1 supports T_I32/T_I64 and unsigned views only", pc);
+            uint64_t addr = fr->regs[ra];
+            if (addr + wdt > MEM_SIZE) die("ATOMIC_ADD out of simulated memory bounds", pc);
+            uint64_t old = 0;
+            memcpy(&old, &mem[addr], wdt);          /* old = [rA] */
+            uint64_t sum = old + fr->regs[simi_rb_reg(w)];
+            memcpy(&mem[addr], &sum, wdt);          /* [rA] = old + rB */
+            fr->regs[rd] = old;                     /* rD = old (returned) */
+            set_tag(fr, rd, 0);
+            pc++; break;
+        }
+
         case OP_RESOLVE: {
             uint32_t idx = simi_rb_raw(w);
             if (idx >= obj.num_names) die("RESOLVE name-pool index out of range", pc);
