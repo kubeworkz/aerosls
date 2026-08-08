@@ -3742,6 +3742,62 @@ One row added, zero moved:
   float/mem skips and the no-expected jmpr_oob are unchanged.
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.94 M2.42 — the flat walk cap matches the BIG cap (as built)
+
+M2.41 raised TX_AR_CHAIN_MAX from 12 to 20; M2.42 raises it to 64,
+equal to TX_AR_CHAIN_BIG, so a 21-64-value product now stays FLAT too
+(no deferral). The key observation: a set of > 64 values can NEVER
+chain — the emission gate rejects ncand > TX_AR_CHAIN_BIG, and the
+walk's deferral only triggers on a flat-cap overflow — so with equal
+caps every REACHABLE chain materializes from a flat set and the entire
+M2.30-M2.41 record machinery (product defers, union records, the
+flat+flat fallback, the in-place freeze, chain_def_live/chain_prewrite
+flattening of >64 records) is UNREACHABLE: no record is ever created
+whose true set fits the emission bound, and a union exceeding 64 is
+rejected by chain_def_alloc_union's cap-check exactly where the plain
+merge would collapse. The machinery is retained — it is the recorded
+history and a safety net should the caps ever diverge again — and
+annotated as vestigial in the code. The raise is emission-invisible
+for every pre-existing program: chain13-17's dispatch sets are
+unchanged (chain16's 25-value product and 40-value union now flatten
+instead of deferring, but the candidate SET — what the chain emits —
+is identical), so it is strictly additive.
+
+### 10.95 M2.42 gate results (measured)
+
+Total emitted bytes across the now-66-program parity set: **M0
+123188 → M1 104248, 18940 saved** (≈15.4%), up from M2.41's 18240.
+One row added, zero moved:
+
+- jmpr_chain18 3956 → 3256 (−700, new 66th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: r1 = r2 + r3 is FORTY values
+  {42..120} (r2 in {2,12,...,72} — EIGHT values, r3 in
+  {40,42,44,46,48} — FIVE values); the arm `BC r5, J` delivers it;
+  then `LOADI r2, #1` WRITES a source. Under the M2.41 20-cap the
+  product deferred and the write flattened it to UNKNOWN (the table
+  ran); under 64 it stays flat, the write is a no-op for r1's slot,
+  and the gate (324 < 528) emits the 40-pair chain. Runtime
+  `72 + 48 = 120` takes the chain's FORTIETH b.eq (dump-verified:
+  40 b.eq pairs, first → #100's block at offset 1556, fortieth →
+  #4000's block at offset 3116, both byte-exact). The chain vs table
+  delta is exactly 528 − 324 = +204; the rest of the 700 is the M1
+  allocator on the 122-instruction body.
+- Teeth: reverting the cap to 20 grows jmpr_chain18 back to exactly
+  3460 (the table path — the product defers and the write kills it,
+  still correct), proving the raised cap is what the chain dispatches
+  through.
+- Row-by-row accounting (gate tables diffed vs committed 2826afb,
+  measured with the M2.41 verifier): **all 65 shared rows
+  byte-identical** — the raise is emission-invisible for the whole
+  M2.41 corpus, so M2.42 is strictly additive.
+- Four-way parity: 264 PASS, 0 FAIL — all 66 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 40-candidate
+  flat chain executes at runtime on the ARM engine (PASS 4000,
+  runtime index 120 taking the fortieth b.eq), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
