@@ -2648,6 +2648,85 @@ added, four moved:
   skips unchanged). enc-check clean; jmpr_oob still faults (UDF,
   rc=1, now at a slightly earlier pc — the table is smaller).
 
+### 10.60 M2.25 — the inline compare-and-branch dispatch chain (as built)
+
+M2.24 left the naive-mode table at its floor: num_instr x 4 bytes plus
+an 8-byte base load per dynamic JMPR. M2.25 removes the table and the
+indirect load entirely when the dispatch is provably small — a naive
+mode program (g_alloc=0) with EXACTLY ONE dynamic (non-folding) JMPR
+whose index register's possible values are a small, provable constant
+set. The dispatch becomes an inline chain — `ld t0, slot(ra); cmp
+subs xzr, t0, #c0; b.eq pc(c0); cmp ...; b.eq pc(ck); UDF #0` — one
+cmp + b.eq pair per candidate, straight to the target's code, with
+UDF #0 as the fall-through.
+
+- **The candidate-set analysis (new).** A forward walk over the linear
+  stream tracks only the index register's constant set, with the SAME
+  join discipline as the fold fixpoint (constants die at block heads)
+  — but a head's set is the UNION of its incoming edges' sets, because
+  the chain must cover every path's value, not fold a single one
+  (jmpr_join's index is 8 on the branch path and 9 on the fall-through:
+  set = {8, 9}). Branch deliveries accumulate per-head arrival sets;
+  the walk iterates to a fixpoint (sets only grow, collapsing to
+  UNKNOWN at the TX_AR_CHAIN_MAX=8 cap, so it converges; a backward
+  branch's delivery to an already-walked head is picked up next pass).
+  Any writer that is not a known constant — LOAD, CALL result,
+  register-form ALU, MUL/DIV/AND/OR/XOR, shifts — marks the register
+  UNKNOWN and no chain fires (jmpr_dyn/mix/foldreach, whose indices
+  come from LOAD/DIV, keep the table; jmpr_table has two dynamic
+  sites, which disqualifies it outright). ADD/SUB-immediate and CMP
+  (0/1) are set-computable.
+- **Soundness.** The chain's fall-through UDF fires exactly for indices
+  the analysis proves impossible — any deviation would contradict a
+  per-edge constant set — and candidates >= num_instr get no branch
+  and land on the UDF, matching the table's bounds-check fault. The
+  walk's linear state is built only from real edges (a non-head pc
+  after a terminal is either a branch target whose union resets it, or
+  unreachable; the single dynamic JMPR is reachable by construction —
+  it is what forced g_alloc=0), so a dead region cannot taint the
+  dispatch set. The B.cond opcode (0x54000000, cond@15:12) and the
+  subs-xzr cmp are new to the emitted set — a64_exec.c decodes and
+  executes both, a64_enc_check.py re-derives the encodings
+  independently, and the fixup pass gained a FIX_B_COND kind.
+- **Degenerate chains.** jmpr_oob's index is the constant 999 —
+  provably out of range, zero in-range candidates: the chain collapses
+  to a bare UDF #0 (the bounds check and table are gone; the fault is
+  identical, verified rc=1).
+
+The table under g_alloc=0 is now conditional: it exists only when the
+single dynamic JMPR's set is unknowable or too large, or when there
+are two or more dynamic sites. When the chain fires, g_njmpr_li_pos
+stays 0 and no table is emitted at all.
+
+### 10.61 M2.25 gate results (measured)
+
+Total emitted bytes across the now-49-program parity set: **M0 75840
+→ M1 65088, 10752 saved** (≈14.2%), up from M2.24's 10552. One row
+added, one moved:
+
+- jmpr_chain 1256 → 1116 (−140, new 49th row; M0 baseline measured at
+  git 1729f50) — the dedicated pin. The index's provable set is {10,
+  12} — the union of the never-taken BC's branch-path value (10,
+  delivered at the join) and the taken fall-through's (12) — and the
+  runtime index 12 takes the chain's SECOND b.eq, proving the chain
+  dispatches past the first candidate (jmpr_join's runtime 8 is the
+  first candidate of {8, 9}).
+- jmpr_join 1096 → 1036 (−60) — the only shared row that moved. The
+  chain replaced the M2.24 table (10x4 + 8) and the bounds-check
+  dispatch words; the teeth (chain activation disabled) restores
+  exactly 1096, and jmpr_chain's teeth version (table path) measures
+  1192 (+76).
+- Row-by-row accounting (gate tables diffed vs committed b945e16,
+  measured with the M2.24 verifier): all other 47 shared rows
+  byte-identical — jmpr_dyn/mix/foldreach/table keep their M2.24
+  bytes exactly (unknown index sets / two dynamic sites), and every
+  g_alloc=1 row is untouched.
+- Four-way parity: 196 PASS, 0 FAIL across all engines on the 49
+  gated programs (the b.eq chain executes at runtime on the ARM
+  engine; the three documented float/mem engine skips unchanged).
+  enc-check clean (B.cond now decodes in the independent net);
+  jmpr_oob still faults (UDF, rc=1, now at the bare chain word).
+
 ---
 
 ## Sources consulted

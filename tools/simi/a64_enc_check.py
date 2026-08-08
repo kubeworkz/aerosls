@@ -112,6 +112,7 @@ def ldrsh_reg(rt, rn, rm):return 0x78A0C800 | (rm << 16) | (rn << 5) | rt
 def ldrsw_reg(rt, rn, rm):return 0xB8A0C800 | (rm << 16) | (rn << 5) | rt
 def br(rn):                 return 0xD61F0000 | (rn << 5)
 def blr(rn):                return 0xD63F0000 | (rn << 5)
+def bcond(cond, imm19):     return 0x54000000 | (cond << 12) | ((imm19 & 0x7FFFF) << 5)
 
 def li64(rd, imm):
     words = [movz(rd, imm & 0xFFFF)]
@@ -217,6 +218,10 @@ def decode(w):
     # zero/nonzero, imm19@23:5 and Rt@4:0 are free.
     if (w & 0xFE000000) == 0xB4000000: return ("cbz", (w >> 5) & 0x7FFFF, rd(w))
     if (w & 0xFE000000) == 0xB5000000: return ("cbnz", (w >> 5) & 0x7FFFF, rd(w))
+    # B.cond: 0101 0100 0 imm19 0 cond 00000 — bits 31:24 and bit 4 are
+    # fixed; cond@15:12 and imm19@23:5 are free. M2.25's inline JMPR
+    # chain emits cmp (subs_imm XZR) + b.eq pairs.
+    if (w & 0xFF000010) == 0x54000000: return ("bcond", (w >> 12) & 0xF, (w >> 5) & 0x7FFFF)
     return None
 
 # Classes simi_arm.c may legally emit (M0/M1). Anything else in the dump
@@ -231,7 +236,7 @@ ALLOWED = {"movz", "movk", "add_imm", "sub_imm", "subs_imm", "add_shift",
            "ldr_reg", "str_reg", "ldrb_reg", "strb_reg", "ldrh_reg",
            "strh_reg", "ldr_w_reg", "str_w_reg", "ldrsb_reg",
            "ldrsh_reg", "ldrsw_reg",
-           "br", "blr", "b", "bl", "cbz", "cbnz"}
+           "br", "blr", "b", "bl", "cbz", "cbnz", "bcond"}
 
 # Register numbers used by simi_arm.c
 T0, T1, T2, SP, FP, LR, XZR = 9, 10, 11, 31, 29, 30, 31

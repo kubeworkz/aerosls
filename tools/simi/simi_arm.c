@@ -321,6 +321,12 @@ static uint32_t enc_b   (int32_t imm26) { return 0x14000000u | ((uint32_t)imm26 
 static uint32_t enc_bl  (int32_t imm26) { return 0x94000000u | ((uint32_t)imm26 & 0x03FFFFFFu); }
 static uint32_t enc_cbz (uint8_t rt, int32_t imm19) { return 0xB4000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | rt; }
 static uint32_t enc_cbnz(uint8_t rt, int32_t imm19) { return 0xB5000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | rt; }
+/* B.cond — conditional branch on NZCV: 0101 0100 0 imm19:19 0 cond:4
+ * 00000 (0x54000000 | (cond << 12) | (imm19 << 5)). M2.25's inline JMPR
+ * chain emits cmp (subs xzr) + b.eq pairs instead of the runtime table. */
+static uint32_t enc_b_cond(uint8_t cond, int32_t imm19) {
+    return 0x54000000u | ((uint32_t)cond << 12) | (((uint32_t)imm19 & 0x7FFFFu) << 5);
+}
 static uint32_t enc_br  (uint8_t rn) { return 0xD61F0000u | ((uint32_t)rn << 5); }
 static uint32_t enc_blr (uint8_t rn) { return 0xD63F0000u | ((uint32_t)rn << 5); }
 
@@ -444,6 +450,26 @@ static uint8_t  g_relax_snap_active[4096];
 static uint8_t  g_fold_tgt_prev[4096];
 static int      g_jmpr_fold[4096];      /* per-JMPR-pc folded target, or -1 */
 static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-scope like the other arrays) */
+/* M2.25: inline JMPR dispatch chain. In naive mode (g_alloc=0) with
+ * EXACTLY one dynamic (non-folding) JMPR, the runtime table + bounds
+ * check is replaced by an inline compare-and-branch chain over the index
+ * register's provable candidate set — one cmp + b.eq per candidate, UDF
+ * fall-through. g_chain_cand is the sorted in-range subset (a candidate
+ * >= num_instr has no code and falls through to the UDF, matching the
+ * table's bounds-check fault — jmpr_oob's index 999 becomes a bare UDF).
+ * g_chain_ncand == 0 is legal (the degenerate always-fault chain).
+ * Soundness: the set is the union of the constant sets arriving at the
+ * dispatch along every incoming edge — the same join discipline as the
+ * fold fixpoint, but a UNION, because the chain must cover every path's
+ * value, not fold a single one. */
+#define TX_AR_CHAIN_MAX 8
+static uint32_t g_chain_cand[TX_AR_CHAIN_MAX];
+static int      g_chain_ncand;
+static int      g_chain_active;
+/* per-head arrival accumulators for the candidate-set walk */
+static uint8_t  g_chain_arr_unk[4096];
+static uint8_t  g_chain_arr_n[4096];
+static uint32_t g_chain_arr_v[4096][TX_AR_CHAIN_MAX];
 static uint8_t  g_fold_fall[4096];      /* M2.12: folded JMPR whose target is pc+1 — a dead
                                          * branch (control falls through to it anyway). The main
                                          * loop drops the branch entirely; when the target also
@@ -898,7 +924,7 @@ static void op_illegal(struct CodeBuf* cb) { e32(cb, 0); }
  * offset is known (the imm26/imm19 fields are not contiguous sub-fields
  * that survive patching in place — same reasoning as RV64's J/B-type
  * re-encode). */
-enum { FIX_B, FIX_BL, FIX_CBZ, FIX_CBNZ };
+enum { FIX_B, FIX_BL, FIX_CBZ, FIX_CBNZ, FIX_B_COND };
 #define TX_AR_MAX_FIXUPS 4096
 struct Fixup { uint32_t instr_pos; uint32_t target_pc; uint8_t kind; uint8_t rt; };
 static struct Fixup g_fixups[TX_AR_MAX_FIXUPS];
@@ -943,6 +969,29 @@ static void op_bl(struct CodeBuf* cb, uint32_t target_pc) { add_fixup(cb, target
  * has the compare-and-branch-on-zero pair built in). */
 static void op_cbz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fixup(cb, target_pc, FIX_CBZ, rt); }
 static void op_cbnz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fixup(cb, target_pc, FIX_CBNZ, rt); }
+static void op_b_cond(struct CodeBuf* cb, uint32_t target_pc, uint8_t cond) { add_fixup(cb, target_pc, FIX_B_COND, cond); }
+
+/* M2.25: merge a constant set (bn, bv, bunk) into an accumulator
+ * (an, av, aunk), keeping sorted order with dedup. A union that would
+ * exceed TX_AR_CHAIN_MAX collapses to UNKNOWN — the sound
+ * over-approximation that disables the chain (the walk below is
+ * monotone, so the iteration converges). */
+static void chain_merge(uint8_t* an, uint32_t* av, uint8_t* aunk,
+                        uint8_t bn, const uint32_t* bv, uint8_t bunk) {
+    if (bunk || *aunk) { *aunk = 1; *an = 0; return; }
+    uint32_t tmp[TX_AR_CHAIN_MAX];
+    uint8_t i = 0, j = 0, k = 0;
+    while (i < *an && j < bn && k < TX_AR_CHAIN_MAX) {
+        if (av[i] < bv[j]) tmp[k++] = av[i++];
+        else if (bv[j] < av[i]) tmp[k++] = bv[j++];
+        else { tmp[k++] = av[i++]; j++; }
+    }
+    while (i < *an && k < TX_AR_CHAIN_MAX) tmp[k++] = av[i++];
+    while (j < bn && k < TX_AR_CHAIN_MAX) tmp[k++] = bv[j++];
+    if (i < *an || j < bn) { *aunk = 1; *an = 0; return; }   /* union overflowed the cap */
+    for (uint8_t t = 0; t < k; t++) av[t] = tmp[t];
+    *an = k;
+}
 
 /* ─── CMP: synthesize all 10 relations from cmp+cset (§4) ────────────────
  * Operands in rn (lhs), rm (rhs); result (0/1) ends up in `rd` (M1: the
@@ -2176,6 +2225,141 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         }
     }
 
+    /* M2.25: inline-dispatch chain analysis. Naive mode (g_alloc=0) with
+     * exactly ONE dynamic JMPR: replace the runtime table + bounds check
+     * with an inline compare-and-branch chain over the index register's
+     * PROVABLE candidate set. The set is computed by a forward walk over
+     * the linear stream with the same join discipline as the fold
+     * fixpoint (constants die at block heads), but a head's set is the
+     * UNION of its incoming edges' sets — the chain must cover every
+     * path's value, not fold a single one. Only the index register is
+     * tracked; any writer that is not a known constant (LOAD, CALL
+     * result, register-form ALU, MUL/DIV/AND/OR/XOR, shifts...) marks it
+     * UNKNOWN and no chain fires (jmpr_dyn/mix/foldreach keep the
+     * table). The walk iterates to a fixpoint because a backward branch
+     * delivers its arrival set to a head already processed; sets only
+     * grow and collapse to UNKNOWN at the cap, so it converges.
+     * Soundness: the chain's fall-through UDF fires exactly for indices
+     * the analysis proves impossible; candidates >= num_instr get no
+     * branch and land on the UDF, matching the table's bounds-check
+     * fault (jmpr_oob's constant 999 collapses to a bare UDF). The
+     * walk's linear state is built only from real edges — a non-head pc
+     * after a terminal is either a branch target (its union resets it)
+     * or unreachable, and the single dynamic JMPR is reachable here (it
+     * is what forced g_alloc=0), so its set is never tainted by a dead
+     * region. */
+    g_chain_active = 0;
+    g_chain_ncand = 0;
+    if (!g_alloc) {
+        uint32_t dyn_pc = 0, n_dyn = 0;
+        for (uint32_t pc = 0; pc < hdr.num_instr; pc++)
+            if (w_op(instrs[pc]) == OP_JMPR && g_jmpr_fold[pc] < 0) { n_dyn++; dyn_pc = pc; }
+        if (n_dyn == 1) {
+            uint16_t ra = w_ra(instrs[dyn_pc]);
+            if (ra < TX_AR_MAX_REGS) {
+                for (uint32_t q = 0; q < 4096; q++) { g_chain_arr_n[q] = 0; g_chain_arr_unk[q] = 0; }
+                uint8_t snap_n = 0, snap_unk = 1;
+                uint32_t snap_v[TX_AR_CHAIN_MAX] = {0};
+                int changed = 1;
+                for (int iter = 0; changed && iter < 64; iter++) {
+                    changed = 0;
+                    uint8_t  cur_n = 0, cur_unk = 1;      /* entry: the index is opaque (caller args) */
+                    uint32_t cur_v[TX_AR_CHAIN_MAX] = {0};
+                    int carry = 1;                        /* pc 0 is reached from the trampoline */
+                    for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+                        uint64_t w = instrs[pc];
+                        uint8_t op = w_op(w);
+                        uint16_t rd = w_rd(w);
+                        if (g_pc_target[pc] && pc != 0) {
+                            /* block head: union of the fall-through carry
+                             * (only if pc-1 falls through) and the branch
+                             * deliveries accumulated so far */
+                            if (!carry) { cur_n = 0; cur_unk = 0; }
+                            chain_merge(&cur_n, cur_v, &cur_unk,
+                                        g_chain_arr_n[pc], g_chain_arr_v[pc],
+                                        g_chain_arr_unk[pc]);
+                        }
+                        if (pc == dyn_pc) {
+                            /* capture the candidate set at the dispatch */
+                            if (cur_n != snap_n || cur_unk != snap_unk) changed = 1;
+                            else for (uint8_t i = 0; i < cur_n; i++)
+                                if (cur_v[i] != snap_v[i]) { changed = 1; break; }
+                            snap_n = cur_n; snap_unk = cur_unk;
+                            for (uint8_t i = 0; i < cur_n; i++) snap_v[i] = cur_v[i];
+                        }
+                        if (op == OP_ENTER) {
+                            cur_n = 0; cur_unk = 1;       /* fresh frame: nothing known */
+                            carry = 1;
+                        } else if (op == OP_RET) {
+                            carry = 0;                    /* terminal */
+                        } else if (op == OP_BR) {
+                            int64_t t = (int64_t)pc + 1 + w_imm28(w);
+                            if (t >= 0 && t < (int64_t)hdr.num_instr)
+                                chain_merge(&g_chain_arr_n[(uint32_t)t], g_chain_arr_v[(uint32_t)t],
+                                            &g_chain_arr_unk[(uint32_t)t], cur_n, cur_v, cur_unk);
+                            carry = 0;
+                        } else if (op == OP_BC) {
+                            int64_t t = (int64_t)pc + 1 + w_imm28(w);
+                            if (t >= 0 && t < (int64_t)hdr.num_instr)
+                                chain_merge(&g_chain_arr_n[(uint32_t)t], g_chain_arr_v[(uint32_t)t],
+                                            &g_chain_arr_unk[(uint32_t)t], cur_n, cur_v, cur_unk);
+                            carry = 1;
+                        } else if (op == OP_CALL) {
+                            /* callee entry is opaque (args + fresh frame);
+                             * the return clobbers r0 only */
+                            int64_t t = (int64_t)pc + 1 + w_imm28(w);
+                            if (t >= 0 && t < (int64_t)hdr.num_instr)
+                                chain_merge(&g_chain_arr_n[(uint32_t)t], g_chain_arr_v[(uint32_t)t],
+                                            &g_chain_arr_unk[(uint32_t)t], 0, NULL, 1);
+                            if (ra == 0) { cur_n = 0; cur_unk = 1; }
+                            carry = 1;
+                        } else if (op == OP_JMPR) {
+                            if (g_jmpr_fold[pc] >= 0) {
+                                uint32_t t = (uint32_t)g_jmpr_fold[pc];
+                                if (t < hdr.num_instr)
+                                    chain_merge(&g_chain_arr_n[t], g_chain_arr_v[t],
+                                                &g_chain_arr_unk[t], cur_n, cur_v, cur_unk);
+                                carry = (t == pc + 1);    /* fall-through fold continues linearly */
+                            } else {
+                                carry = 0;                /* dynamic dispatch: terminal */
+                            }
+                        } else if (rd == ra) {
+                            if (op == OP_LOADI) {
+                                cur_n = 1; cur_unk = 0;
+                                cur_v[0] = (uint32_t)w_imm28(w);
+                            } else if ((op == OP_ADD || op == OP_SUB) &&
+                                       (w_flags(w) & FLAG_IMM) && !cur_unk) {
+                                /* image of the set under +imm / -imm (the
+                                 * image of a sorted set stays sorted) */
+                                int64_t imm = w_imm28(w);
+                                uint8_t nn = 0;
+                                uint32_t nv[TX_AR_CHAIN_MAX];
+                                for (uint8_t i = 0; i < cur_n; i++) {
+                                    int64_t c = (int64_t)cur_v[i] + (op == OP_ADD ? imm : -imm);
+                                    if (nn == 0 || nv[nn - 1] != (uint32_t)c) nv[nn++] = (uint32_t)c;
+                                }
+                                cur_n = nn; cur_unk = 0;
+                                for (uint8_t i = 0; i < nn; i++) cur_v[i] = nv[i];
+                            } else {
+                                cur_n = 0; cur_unk = 1;   /* opaque writer: no chain */
+                            }
+                            carry = 1;
+                        } else {
+                            carry = 1;
+                        }
+                    }
+                }
+                /* the converged snapshot at dyn_pc is the candidate set */
+                if (!snap_unk && snap_n > 0 && snap_n <= TX_AR_CHAIN_MAX) {
+                    for (uint8_t i = 0; i < snap_n; i++)
+                        if (snap_v[i] < hdr.num_instr && g_chain_ncand < TX_AR_CHAIN_MAX)
+                            g_chain_cand[g_chain_ncand++] = snap_v[i];
+                    g_chain_active = 1;   /* even ncand==0: a provably-constant OOB index (jmpr_oob) */
+                }
+            }
+        }
+    }
+
     for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
         /* M2.23: DEAD-CODE ELIMINATION. A pc with zero live predecessors
          * — g_npred[pc]==0 per the fold-aware BFS (entries are roots,
@@ -2278,6 +2462,28 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     cache_flush(&cb);
                     op_b(&cb, (uint32_t)g_jmpr_fold[pc]);
                 }
+            } else if (g_chain_active) {
+                /* M2.25: inline compare-and-branch chain — the single
+                 * dynamic JMPR's index is provably one of g_chain_cand.
+                 * Each in-range candidate is a cmp + b.eq pair straight
+                 * to its code; the fall-through is UDF #0 — the same
+                 * non-negotiable CFI word the bounds check targets. An
+                 * index outside the provable set contradicts the
+                 * analysis (dead in practice, still a fault if reached),
+                 * and an out-of-range constant like jmpr_oob's 999 has
+                 * no branch and lands here, exactly as the table's
+                 * bounds check would fault. No table is emitted at all
+                 * (g_njmpr_li_pos stays 0 — the chain needs no base or
+                 * indirect load). */
+                cache_flush(&cb);
+                if (g_chain_ncand > 0) {
+                    ld_slot(&cb, X_T0, ra);                         /* t0 = index */
+                    for (int i = 0; i < g_chain_ncand; i++) {
+                        e32(&cb, enc_subs_imm(31, X_T0, g_chain_cand[i]));  /* cmp t0, #c */
+                        op_b_cond(&cb, g_chain_cand[i], 0);                /* b.eq target (EQ=0) */
+                    }
+                }
+                op_illegal(&cb);
             } else {
                 cache_flush(&cb);
                 ld_slot(&cb, X_T0, ra);                             /* t0 = target abstract pc */
@@ -2354,6 +2560,10 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                 if (words < -0x2000000ll || words > 0x1FFFFFFll) return TX_AR_ERR_BRANCH_OUT_OF_RANGE;
                 word = (g_fixups[i].kind == FIX_B) ? enc_b((int32_t)words)
                                                    : enc_bl((int32_t)words);
+                break;
+            case FIX_B_COND:   /* M2.25: the chain's cmp + b.eq pairs */
+                if (words < -0x40000ll || words > 0x3FFFFll) return TX_AR_ERR_BRANCH_OUT_OF_RANGE;
+                word = enc_b_cond(g_fixups[i].rt, (int32_t)words);
                 break;
             default: /* FIX_CBZ / FIX_CBNZ */
                 if (words < -0x40000ll || words > 0x3FFFFll) return TX_AR_ERR_BRANCH_OUT_OF_RANGE;

@@ -1,0 +1,35 @@
+; jmpr_chain.simi — M2.25: the inline compare-and-branch dispatch chain,
+; pinning the SECOND candidate at runtime. The index register's provable
+; set is {10, 12} — the union of the two paths feeding the dispatch: the
+; never-taken BC's branch path delivers r1 = 10 and the taken fall-
+; through sets r1 = 12 (the join keeps the JMPR dynamic — the fold
+; fixpoint cannot attribute a single constant across the join, exactly
+; like jmpr_join). With exactly one dynamic JMPR and a 2-candidate set,
+; M2.25 replaces the runtime table + bounds check with
+;   ld t0, slot(r1); cmp t0,#10; b.eq pc10; cmp t0,#12; b.eq pc12; UDF
+; and the runtime index 12 takes the SECOND branch, proving the chain
+; dispatches past the first candidate. jmpr_join (runtime 8 = the FIRST
+; candidate of {8,9}) pins the first; jmpr_oob (constant 999, no
+; in-range candidate) pins the bare-UDF degenerate chain. All three run
+; under g_alloc=0 (a join means no single foldable constant), so they
+; are the naive-mode dispatch shapes — and the table is gone entirely.
+; Expected result: 333
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: the BC below NEVER branches
+    LOADI r1, #10, i64  ; pc 2 — branch-path index (10 — blockA's pc)
+    BC r0, dispatch     ; pc 3 — r0 == 0 → falls through (delivers {10} at the join)
+    LOADI r1, #12, i64  ; pc 4 — fall-through index (12 — blockB's pc)
+dispatch:               ; pc 5 — candidates {10, 12}, runtime 12
+    JMPR r1             ; pc 5 — dynamic dispatch (join: no single constant)
+    LOADI r0, #111, i32 ; pc 6 — dead path — never reached
+    RET                 ; pc 7
+    LOADI r0, #222, i32 ; pc 8 — dead — never reached
+    RET                 ; pc 9
+blockA:                 ; pc 10 — candidate 10's landing (never hit: BC falls through)
+    LOADI r0, #222, i32 ; pc 10
+    RET                 ; pc 11
+blockB:                 ; pc 12 — candidate 12's landing (runtime hit)
+    LOADI r0, #333, i32 ; pc 12
+    RET                 ; pc 13
