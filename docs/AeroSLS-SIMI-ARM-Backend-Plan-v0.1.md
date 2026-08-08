@@ -4333,6 +4333,73 @@ M2.51 commit (a probe, not a change):
   captures the interpreter's output); the composed-image chain
   executes at runtime on the ARM engine (PASS 1000, runtime index 58
   taking the tenth b.eq), and the documented float/mem skips and
+  the no-expected  jmpr_oob are unchanged (jmpr_oob still faults via UDF at
+  pc=0x320, rc=1). enc-check clean.
+
+### 10.116 M2.53 — the unary-over-deferred boundary (as built)
+
+A PROOF milestone with NO code change, and a HONEST CORRECTION of the
+M2.42 "UNREACHABLE" comment. The unary branch's fallback
+(`sa->def >= 0 -> UNKNOWN`) is reachable in PRINCIPLE: the M2.30 root
+allocates a record whenever a register-form product OVERFLOWS the
+merge cap with known FLAT sources (a >64-DISTINCT image) — the M2.42
+comment means such records can never lead to a CHAIN (the dispatch
+gate rejects ncand > TX_AR_CHAIN_BIG), NOT that they are never
+allocated. All other record creators (M2.32/33/35-39/41) chase an
+existing record, so the M2.30 root is the only first record. The
+fallback is observationally conservative: the record-collapse and the
+plain-UNKNOWN-collapse both give UNKNOWN -> the table, and the true
+set (>64) can never chain anyway. Under CURRENT equal caps the
+boundary is: sub-64 products keep their FLAT image (no record — the
+unary re-derives), >64 products collapse (record or plain UNKNOWN —
+the unary falls back). jmpr_chain29 pins the flat side of the
+boundary: a product whose image EXCEEDED the OLD flat cap (12,
+pre-M2.41) but fits the current 64.
+
+### 10.117 M2.53 gate results (measured)
+
+Total emitted bytes across the now-77-program parity set: **M0
+157888 → M1 131668, 26220 saved** (≈16.6%), up from M2.52's 25048.
+One row added, zero moved — simi_arm.c is BYTE-IDENTICAL to the
+M2.52 commit (a probe, not a change):
+
+- jmpr_chain29 4600 → 3428 (−1172, new 77th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: r1 = -(r2 + r3) with r2, r3 in
+  {-79,-77,...,-61} (ten odd negatives each). The ADD product is the
+  19 even values {-158,-156,...,-122} (19 distinct <= 64 — FLAT, so
+  no record is created and the in-place NEG RE-DERIVES to
+  {122,124,...,158}); a 12-cap walker would defer this product. The
+  gate (156 < 40 + 4*160 = 680) emits the 19-pair chain; runtime
+  -( -61 + -61 ) = 122 takes the chain's FIRST b.eq -> block0's LOADI
+  #100 -> PASS 100 on all four engines. Dump-verified: 19 b.eq,
+  compares exactly {122..158 step 2}; the first b.eq (imm19 275)
+  lands byte-exact on block0's movz x9, #100 (d2800c89).
+- Teeth — the two sides of the boundary (ad hoc):
+  (a) OVER-cap: a 20x20 MUL product (>64 distinct values) followed by
+  in-place NEG — the image overflows the merge cap, the M2.30 root
+  allocates a record (or plain UNKNOWN), the NEG hits the fallback
+  -> 0 b.eq, the full table dispatch, and the runtime index
+  -(20*20) = -400 (uint32-huge, out of range) faults through the
+  bounds check (ARM rc=1 at the table's UDF word, interp rc=2
+  "JMPR target out of range") — conservative, no wrong chain.
+  (b) CAP-REVERT — temporarily setting TX_AR_CHAIN_MAX back to 12
+  (the pre-M2.41 cap) makes the SAME jmpr_chain29 pin's product
+  DEFER: the M2.30 root creates a record, the NEG reads
+  cur[r1].def >= 0 and hits the unary-over-deferred fallback ->
+  UNKNOWN -> the table, PASS 100 on all four engines at 3952 bytes
+  (0 b.eq, +524 over the 3428-byte chain). This is the sharpest
+  demonstration: the fallback fires correctly when records ARE
+  reachable, and never emits a wrong chain. The cap is restored
+  byte-identical (diff empty) and the committed pin chains again.
+- Row-by-row accounting (gate tables diffed vs committed c2e6f2f):
+  **all 76 shared rows byte-identical** and simi_arm.c untouched —
+  strictly additive.
+- Four-way parity: 308 PASS, 0 FAIL — all 77 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the flat-product+NEG chain
+  executes at runtime on the ARM engine (PASS 100, runtime index 122
+  taking the first b.eq), and the documented float/mem skips and
   the no-expected jmpr_oob are unchanged (jmpr_oob still faults via
   UDF at pc=0x320, rc=1). enc-check clean.
 
