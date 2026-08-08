@@ -1,0 +1,45 @@
+; jmpr_deadmult.simi — M2.22: per-pc live-predecessor reachability in
+; the EMISSION, not just the g_alloc gate. `dead` (pc 13) is an
+; unreachable, MULTI-BLOCK function at the stream end: entered from
+; nowhere (leaf's RET at pc 12 is a terminal), with an internal BR to a
+; second block. Under M2.21 its whole body was still emitted — the ENTER
+; frame-load prologue (~197 words, dead), the BR's cache_flush + branch,
+; the label block's dynamic JMPR path — all correct code that can never
+; run. M2.22 proves the emission can DROP the frame load (a function
+; with zero live predecessors — g_npred[pc]==0 per the fold-aware BFS —
+; is compiled with an EMPTY initial cache directory, and its prologue
+; never runs: off[13]==off[14], the ENTER emits ZERO words) and the
+; flushes of dead instructions (the BR's spill of r4 is dead weight —
+; r4 is never read anywhere reachable, and the region is at the stream
+; end so the deferred spill never fires: the BR's first word is the b
+; itself, dump-verified). 792 bytes below its M0 baseline (the 197-word
+; prologue + the dead BR's spill), and reverting flush_owed to always
+; flush grows it back to exactly 2980 (the M2.21 emission, still
+; correct) — the teeth. main is unchanged: its JMPR (r0 = 8 after the
+; M2.20 leaf call) folds to pc 8 (dump-verified: a direct b, imm=4 ->
+; word 255 == pc 8's word).
+; Expected result: 9 (pc 8: ADD r0, r0, #1 -> 8 + 1).
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r2, #3, i64   ; pc 1 — arg0 seed
+    LOADI r3, #5, i64   ; pc 2 — arg1 seed
+    MOV r0, r2, i64     ; pc 3 — arg0 = 3
+    MOV r1, r3, i64     ; pc 4 — arg1 = 5
+    CALL leaf           ; pc 5 — r0 = 3 + 5 = 8 after the call (M2.20)
+    JMPR r0             ; pc 6 — r0 = 8 — folds to pc 8 (a real branch)
+    LOADI r9, #99, i64  ; pc 7 — unreachable filler
+target:                 ; pc 8 — reached only via the fold
+    ADD r0, r0, #1, i64 ; pc 8 — r0 = 8 + 1 = 9
+    RET                 ; pc 9 — returns 9
+leaf:                   ; pc 10 — the callee (a straight-line leaf)
+    ENTER #8            ; pc 10 — fresh frame: r8+ zeroed, r0-r7 = caller args
+    ADD r0, r0, r1, i64 ; pc 11 — r0 = arg0 + arg1 = 8
+    RET                 ; pc 12
+dead:                   ; pc 13 — UNREACHABLE function, multi-block, at stream end
+    ENTER #8            ; pc 13
+    LOADI r4, #5, i64   ; pc 14 — leaves r4 resident (the BR's flush spills it in M2.21)
+    BR skip             ; pc 15 — dead BR; target pc 16 is a g_pc_target head
+skip:                   ; pc 16 — dead block head (g_pc_target via the BR at pc 15)
+    JMPR r7             ; pc 16 — r7 is an ENTER arg — NEVER folds; dead
+    RET                 ; pc 17
