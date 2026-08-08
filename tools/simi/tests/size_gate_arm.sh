@@ -26,7 +26,23 @@
 # from exercising the dynamic path at all; the LOAD restores it. The
 # dynamic JMPR emission is byte-identical to M0's; the 16 bytes below
 # M0 come from the zero-displacement STORE/LOAD folds, which apply to
-# every program regardless of g_alloc). jmpr_join is the
+# every program regardless of g_alloc). M2.24 halves the dynamic
+# path's table: entries are 32-bit byte offsets read with a single ldr
+# W at base + (target << 2), and the per-JMPR base load is a 2-word
+# movz+movk — jmpr_dyn 1132 -> 1088 (-44 = 9x4 table + 8 base).
+# jmpr_table is
+# M2.24, the compact JMPR table pinned at runtime: two DYNAMIC JMPRs
+# (indices stored to and re-loaded from guest memory — never fold, so
+# g_alloc = 0) dispatch SEQUENTIALLY through two distinct table
+# entries in one run (table[7] -> block A, table[13] -> block B), each
+# with a passing bounds check — the table's indexing, base load, and
+# 32-bit entry width all exercised at runtime, with jmpr_oob pinning
+# the same path's fault side. 108 bytes below its M0 baseline (the
+# naive body + the 15x4 table + 2x8 base), and the M2.23-era 8-byte
+# table measures 1312 (+76 = 15x4 + 16) — the teeth, isolating the
+# width delta exactly. Under g_alloc=1 there is no table at all (every
+# emitted JMPR folds — M2.23), so this is the naive-mode table only.
+# jmpr_join is the
 # fold-soundness pin: its index is set to different constants on two
 # joining paths, so it must NOT fold (0 saved — and reverting the block-
 # head constant reset makes it return 1 instead of 222, caught by the
@@ -442,7 +458,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

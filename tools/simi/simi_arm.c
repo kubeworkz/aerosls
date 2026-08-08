@@ -916,10 +916,12 @@ static uint32_t g_num_names;
  * purely by offset into a bounded guest memory buffer, exactly like every
  * B/BL/CBZ target this file computes (see simi_riscv.c's Phase 14
  * correction note for the identical trap, already learned once on RV64).
- * Each JMPR site emits a fixed 4-word movz+3xmovk placeholder for the
+ * Each JMPR site emits a fixed 2-word movz+movk placeholder for the
  * table base offset (the only constant not known at emit time); the
  * position of each placeholder is recorded here and rewritten in the
- * final pass once the table's offset is known. */
+ * final pass once the table's offset is known. The base is a byte
+ * offset into out_buf — cb.len is uint32_t, so 32 bits always suffice
+ * (M2.24; M2.23-era used a 4-word li64 for an 8-byte-entry table). */
 static uint32_t g_num_instr;
 static uint32_t g_jmpr_li_pos[TX_AR_MAX_FIXUPS];
 static uint32_t g_njmpr_li_pos;
@@ -1646,12 +1648,12 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     return TX_AR_OK;
 }
 
-/* Rewrite a 4-word movz+3xmovk placeholder (JMPR table base) in place. */
-static void patch_li64(uint8_t* out_buf, uint32_t pos, uint64_t imm) {
+/* Rewrite a 2-word movz+movk placeholder (JMPR table base) in place.
+ * M2.24: the base is a byte offset into out_buf and cb.len is uint32_t,
+ * so the 64-bit li64 (4 words) was overkill — 32 bits always suffice. */
+static void patch_li32(uint8_t* out_buf, uint32_t pos, uint32_t imm) {
     patch32(out_buf, pos,      enc_movz(X_T2, (uint16_t)(imm & 0xFFFF), 0));
     patch32(out_buf, pos + 4,  enc_movk(X_T2, (uint16_t)((imm >> 16) & 0xFFFF), 1));
-    patch32(out_buf, pos + 8,  enc_movk(X_T2, (uint16_t)((imm >> 32) & 0xFFFF), 2));
-    patch32(out_buf, pos + 12, enc_movk(X_T2, (uint16_t)((imm >> 48) & 0xFFFF), 3));
 }
 
 /* ─── Top-level translate: two passes (emit + patch fixups) ─────────────
@@ -2284,10 +2286,10 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                 e32(&cb, enc_cset(X_T1, 3));                        /* cset x10, lo — unsigned less */
                 uint32_t cbz_pos = emit_cbz_placeholder(&cb);       /* cbz t1, .oob */
                 if (g_njmpr_li_pos >= TX_AR_MAX_FIXUPS) return TX_AR_ERR_TOO_MANY_FIXUPS;
-                g_jmpr_li_pos[g_njmpr_li_pos++] = cb.len;           /* 4-word table-base placeholder */
-                e32(&cb, 0); e32(&cb, 0); e32(&cb, 0); e32(&cb, 0);
-                e32(&cb, enc_add_shift(X_T2, X_T2, X_T0, 0, 3));    /* t2 = base + (target << 3) */
-                e32(&cb, enc_ldr(X_T2, X_T2, 0));                   /* t2 = table[target] */
+                g_jmpr_li_pos[g_njmpr_li_pos++] = cb.len;           /* 2-word table-base placeholder (M2.24) */
+                e32(&cb, 0); e32(&cb, 0);
+                e32(&cb, enc_add_shift(X_T2, X_T2, X_T0, 0, 2));    /* t2 = base + (target << 2) */
+                e32(&cb, enc_ldr_w(X_T2, X_T2, 0));                 /* t2 = (u32) table[target] — 4-byte entries, zero-extends */
                 e32(&cb, enc_br(X_T2));                             /* jump — never falls through */
                 patch_local_cbz(&cb, cbz_pos, X_T1);                /* .oob: */
                 op_illegal(&cb);                                    /* UDF #0 — non-negotiable CFI per ISA §16 */
@@ -2316,16 +2318,24 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
      * every real pc at this point (the main loop above has finished). */
     uint32_t jmpr_table_off = 0;
     if (g_njmpr_li_pos > 0) {
+        /* M2.24: 4-byte entries. Every dispatch target is a pc in
+         * [0, num_instr) (the bounds check above) and g_instr_off[] is a
+         * byte offset into out_buf — uint32_t by construction — so one
+         * 32-bit ldr per entry suffices; the base placeholder shrinks
+         * with it (movz+movk, 2 words). This HALVES the naive-mode table
+         * (M2.23's 8-byte entries mirrored RV64's 64-bit slots). Under
+         * g_alloc=1 the table is absent entirely — every emitted JMPR
+         * folds, so no dynamic path (and no table) exists (M2.23). */
         jmpr_table_off = cb.len;
-        for (uint32_t q = 0; q < hdr.num_instr; q++) e64(&cb, 0);
+        for (uint32_t q = 0; q < hdr.num_instr; q++) e32(&cb, 0);
         if (cb.overflow) return TX_AR_ERR_BUF_FULL;
         for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
-            uint64_t off = (uint64_t)g_instr_off[pc];
-            for (int b = 0; b < 8; b++)
-                out_buf[jmpr_table_off + pc*8 + b] = (uint8_t)((off >> (8*b)) & 0xFF);
+            uint32_t off = g_instr_off[pc];
+            for (int b = 0; b < 4; b++)
+                out_buf[jmpr_table_off + pc*4 + b] = (uint8_t)((off >> (8*b)) & 0xFF);
         }
         for (uint32_t i = 0; i < g_njmpr_li_pos; i++)
-            patch_li64(out_buf, g_jmpr_li_pos[i], (uint64_t)jmpr_table_off);
+            patch_li32(out_buf, g_jmpr_li_pos[i], jmpr_table_off);
     }
 
     /* Patch pass: branch/call targets (B/BL/CBZ/CBNZ). imm26/imm19 are
