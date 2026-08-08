@@ -1,0 +1,96 @@
+; jmpr_chain26.simi — M2.50: the NOT-BUILT dispatch index, IN RANGE.
+; M2.48 added the unary image { f(a) : a in S(a) } for NOT/NEG, and
+; jmpr_chain24 pinned the NEG side with a ten-way join source (the
+; multi-value mapping was already proven there). This pin covers the
+; NOT side in the case chain24 deliberately did NOT: chain24's NOT
+; variant used POSITIVE constants (NOT of a small pc is huge — out of
+; range, so the analysis computed the exact image, found no in-range
+; candidate and emitted a bare UDF). Over NEGATIVE constants the NOT
+; image lands IN RANGE: ~(-58) = 57, ~(-40) = 39. The index is r1 = ~r2
+; over a TEN-way join of negative constants (r2 in {-58,-56,...,-40} ->
+; TEN values {39,41,...,57}); the gate (84 < 40 + 4*60 = 280) emits the
+; 10-pair chain. The runtime index ~(-58) = 57 takes the chain's TENTH
+; b.eq (57 = 39 + 2*9), landing on block9's LOADI #1000. Candidates are
+; real pcs (blocks at 39..57 — the JMPR jumps to pc == index). This also
+; closes the cap-discipline question for the UNARY image: the image maps
+; the full source set through chain_merge, so an over-64-distinct source
+; overflows the merge cap to UNKNOWN -> the table runs (conservative),
+; verified ad hoc — the exact side is this pin's ten distinct candidates.
+; Expected result: 1000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #-40, i64 ; pc 2 — branch-path base (-40) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:-40} at J2)
+    LOADI r2, #-42, i64 ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:-42} at J2)
+    LOADI r2, #-44, i64 ; pc 6
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:-44} at J2)
+    LOADI r2, #-46, i64 ; pc 8
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:-46} at J2)
+    LOADI r2, #-48, i64 ; pc 10
+    BC r0, J2           ; pc 11 — falls through (delivers {r2:-48} at J2)
+    LOADI r2, #-50, i64 ; pc 12
+    BC r0, J2           ; pc 13 — falls through (delivers {r2:-50} at J2)
+    LOADI r2, #-52, i64 ; pc 14
+    BC r0, J2           ; pc 15 — falls through (delivers {r2:-52} at J2)
+    LOADI r2, #-54, i64 ; pc 16
+    BC r0, J2           ; pc 17 — falls through (delivers {r2:-54} at J2)
+    LOADI r2, #-56, i64 ; pc 18
+    BC r0, J2           ; pc 19 — falls through (delivers {r2:-56} at J2)
+    LOADI r2, #-58, i64 ; pc 20 — fall-through base (-58)
+J2:                     ; (label) — join: r2 in {-58,...,-40} (10 values)
+    NOT r1, r2, i64     ; pc 21 — the index build: r1 = ~r2 = TEN values
+                        ; {39,41,...,57} — the NOT of each negative
+                        ; constant is a small positive pc (in range —
+                        ; chain24's NOT side used positives and fell out
+                        ; of range to the bare UDF instead).
+    JMPR r1             ; pc 22 — candidates {39,41,...,57}, runtime
+                        ; ~(-58) = 57.
+    LOADI r0, #0, i32   ; pc 23 — dead filler (aligns block0 to pc 39)
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+block0:                 ; pc 39
+    LOADI r0, #100, i32 ; pc 39
+    RET                 ; pc 40
+block1:                 ; pc 41
+    LOADI r0, #200, i32 ; pc 41
+    RET                 ; pc 42
+block2:                 ; pc 43
+    LOADI r0, #300, i32 ; pc 43
+    RET                 ; pc 44
+block3:                 ; pc 45
+    LOADI r0, #400, i32 ; pc 45
+    RET                 ; pc 46
+block4:                 ; pc 47
+    LOADI r0, #500, i32 ; pc 47
+    RET                 ; pc 48
+block5:                 ; pc 49
+    LOADI r0, #600, i32 ; pc 49
+    RET                 ; pc 50
+block6:                 ; pc 51
+    LOADI r0, #700, i32 ; pc 51
+    RET                 ; pc 52
+block7:                 ; pc 53
+    LOADI r0, #800, i32 ; pc 53
+    RET                 ; pc 54
+block8:                 ; pc 55
+    LOADI r0, #900, i32 ; pc 55
+    RET                 ; pc 56
+block9:                 ; pc 57
+    LOADI r0, #1000, i32 ; pc 57
+    RET                 ; pc 58

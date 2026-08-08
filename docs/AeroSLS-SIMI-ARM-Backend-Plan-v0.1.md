@@ -4189,6 +4189,57 @@ commit (a probe, not a change):
   the no-expected jmpr_oob are unchanged. enc-check clean; jmpr_oob
   still faults (UDF, rc=1).
 
+### 10.110 M2.50 — the NOT-built index, in range (as built)
+
+A PROOF milestone with NO code change — and an honest premise
+correction. The M2.50 brief said the unary branch "only handles a
+singleton source set"; that is INACCURATE — the branch passes the
+FULL source set to chain_img_alu's immediate path, which maps
+{ f(a) : a in S(a) } over every element, and jmpr_chain24 (M2.48)
+already pinned a TEN-VALUE NEG source. What M2.48 did NOT cover is
+an IN-RANGE NOT image: chain24's NOT variant used POSITIVE
+constants (NOT of a small pc is huge — out of range, so the
+analysis computed the exact image, found no in-range candidate and
+emitted a bare UDF). Over NEGATIVE constants the NOT image lands IN
+RANGE: ~(-58) = 57, ~(-40) = 39 — the NOT of each negative constant
+is a small positive pc.
+
+### 10.111 M2.50 gate results (measured)
+
+Total emitted bytes across the now-74-program parity set: **M0
+146540 → M1 122552, 23988 saved** (≈16.4%), up from M2.49's 23552.
+One row added, zero moved — simi_arm.c is BYTE-IDENTICAL to the
+M2.49 commit (a probe, not a change):
+
+- jmpr_chain26 2344 → 1908 (−436, new 74th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: r1 = ~r2 over a ten-way join
+  of negative constants (r2 in {-58,-56,...,-40} -> TEN values
+  {39,41,...,57}). The gate (84 < 40 + 4*60 = 280) emits the 10-pair
+  chain; runtime ~(-58) = 57 takes the chain's TENTH b.eq (57 = 39 +
+  2*9) -> block9's LOADI #1000 -> PASS 1000 on all four engines.
+  Dump-verified: 10 b.eq, first subs #39, last #57; the tenth b.eq
+  (imm19 140) lands byte-exact on block9's movz x9, #1000.
+- Teeth — the cap discipline for the UNARY image (ad hoc): a
+  65-DISTINCT join source through NEG (generated scratch program,
+  152 instructions, runtime NEG(-150) = 150) overflows the merge cap
+  inside chain_img_alu -> the image is UNKNOWN (0 b.eq, no chain
+  words) and the full table dispatch runs -> PASS 777 on all four
+  engines through the bounds check. The exact side is this pin's
+  ten distinct candidates. No truncated or wrong chain is ever
+  emitted — same discipline as the M2.49 product teeth, now
+  demonstrated for the unary map.
+- Row-by-row accounting (gate tables diffed vs committed 440ad69):
+  **all 73 shared rows byte-identical** and simi_arm.c untouched —
+  strictly additive.
+- Four-way parity: 296 PASS, 0 FAIL — all 74 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment (the harness
+  captures the interpreter's output); the NOT-image chain executes
+  at runtime on the ARM engine (PASS 1000, runtime index 57 taking
+  the tenth b.eq), and the documented float/mem skips and the
+  no-expected jmpr_oob are unchanged (jmpr_oob still faults via UDF
+  at pc=0x320, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted
