@@ -461,15 +461,20 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * Soundness: the set is the union of the constant sets arriving at the
  * dispatch along every incoming edge — the same join discipline as the
  * fold fixpoint, but a UNION, because the chain must cover every path's
- * value, not fold a single one. */
+ * value, not fold a single one. M2.26: the walk tracks ra plus its
+ * TRANSITIVE FEEDERS (the closure in translate()), so an index built by
+ * a register-form ADD/SUB — LOADI rb; ADD ra, ra, rb — chains too. */
 #define TX_AR_CHAIN_MAX 8
+#define TX_AR_CHAIN_REGS 4
+struct ChainSet { uint8_t n, unk; uint32_t v[TX_AR_CHAIN_MAX]; };
 static uint32_t g_chain_cand[TX_AR_CHAIN_MAX];
 static int      g_chain_ncand;
 static int      g_chain_active;
-/* per-head arrival accumulators for the candidate-set walk */
-static uint8_t  g_chain_arr_unk[4096];
-static uint8_t  g_chain_arr_n[4096];
-static uint32_t g_chain_arr_v[4096][TX_AR_CHAIN_MAX];
+/* M2.26: which registers the walk tracks (ra + feeders) and their slot */
+static uint8_t  g_chain_tracked[TX_AR_MAX_REGS];
+static int8_t   g_chain_slot[TX_AR_MAX_REGS];
+/* per-head arrival accumulators, one set per tracked slot */
+static struct ChainSet g_chain_arr[TX_AR_CHAIN_REGS][4096];
 static uint8_t  g_fold_fall[4096];      /* M2.12: folded JMPR whose target is pc+1 — a dead
                                          * branch (control falls through to it anyway). The main
                                          * loop drops the branch entirely; when the target also
@@ -971,26 +976,59 @@ static void op_cbz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fix
 static void op_cbnz(struct CodeBuf* cb, uint32_t target_pc, uint8_t rt) { add_fixup(cb, target_pc, FIX_CBNZ, rt); }
 static void op_b_cond(struct CodeBuf* cb, uint32_t target_pc, uint8_t cond) { add_fixup(cb, target_pc, FIX_B_COND, cond); }
 
-/* M2.25: merge a constant set (bn, bv, bunk) into an accumulator
- * (an, av, aunk), keeping sorted order with dedup. A union that would
- * exceed TX_AR_CHAIN_MAX collapses to UNKNOWN — the sound
- * over-approximation that disables the chain (the walk below is
+/* M2.25: merge constant set b into set a, keeping sorted order with
+ * dedup. A union that would exceed TX_AR_CHAIN_MAX collapses to UNKNOWN
+ * — the sound over-approximation that disables the chain (the walk is
  * monotone, so the iteration converges). */
-static void chain_merge(uint8_t* an, uint32_t* av, uint8_t* aunk,
-                        uint8_t bn, const uint32_t* bv, uint8_t bunk) {
-    if (bunk || *aunk) { *aunk = 1; *an = 0; return; }
+static void chain_merge(struct ChainSet* a, const struct ChainSet* b) {
+    if (b->unk || a->unk) { a->unk = 1; a->n = 0; return; }
     uint32_t tmp[TX_AR_CHAIN_MAX];
     uint8_t i = 0, j = 0, k = 0;
-    while (i < *an && j < bn && k < TX_AR_CHAIN_MAX) {
-        if (av[i] < bv[j]) tmp[k++] = av[i++];
-        else if (bv[j] < av[i]) tmp[k++] = bv[j++];
-        else { tmp[k++] = av[i++]; j++; }
+    while (i < a->n && j < b->n && k < TX_AR_CHAIN_MAX) {
+        if (a->v[i] < b->v[j]) tmp[k++] = a->v[i++];
+        else if (b->v[j] < a->v[i]) tmp[k++] = b->v[j++];
+        else { tmp[k++] = a->v[i++]; j++; }
     }
-    while (i < *an && k < TX_AR_CHAIN_MAX) tmp[k++] = av[i++];
-    while (j < bn && k < TX_AR_CHAIN_MAX) tmp[k++] = bv[j++];
-    if (i < *an || j < bn) { *aunk = 1; *an = 0; return; }   /* union overflowed the cap */
-    for (uint8_t t = 0; t < k; t++) av[t] = tmp[t];
-    *an = k;
+    while (i < a->n && k < TX_AR_CHAIN_MAX) tmp[k++] = a->v[i++];
+    while (j < b->n && k < TX_AR_CHAIN_MAX) tmp[k++] = b->v[j++];
+    if (i < a->n || j < b->n) { a->unk = 1; a->n = 0; return; }   /* union overflowed the cap */
+    for (uint8_t t = 0; t < k; t++) a->v[t] = tmp[t];
+    a->n = k;
+}
+/* M2.26: set constructors and the tracked-register operand tests. */
+static void chain_singleton(struct ChainSet* s, uint32_t v) { s->n = 1; s->unk = 0; s->v[0] = v; }
+static void chain_unknown(struct ChainSet* s) { s->n = 0; s->unk = 1; }
+/* w_ra is a register source operand (feeds rd when rd is tracked). */
+static int ar_has_reg_ra(uint8_t op) {
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+    case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR: case OP_SAR:
+    case OP_NOT: case OP_NEG: case OP_MOV: case OP_CMP:
+    case OP_LEA: case OP_PTRADD: case OP_LOAD: case OP_STORE:
+    case OP_BC: case OP_JMPR:
+        return 1;
+    default: return 0;
+    }
+}
+/* w_rb_reg is a register source (register-form binary ALU, no FLAG_IMM). */
+static int ar_has_reg_rb(uint8_t op) {
+    switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+    case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR: case OP_SAR:
+    case OP_CMP:
+        return 1;
+    default: return 0;
+    }
+}
+/* rd is a WRITTEN destination (STORE's rd is the value source, not a
+ * destination; the transfers write nothing). */
+static int ar_writes_rd(uint8_t op) {
+    switch (op) {
+    case OP_STORE: case OP_BR: case OP_BC: case OP_JMPR:
+    case OP_RET: case OP_ENTER: case OP_CALL:
+        return 0;
+    default: return 1;
+    }
 }
 
 /* ─── CMP: synthesize all 10 relations from cmp+cset (§4) ────────────────
@@ -2225,29 +2263,31 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         }
     }
 
-    /* M2.25: inline-dispatch chain analysis. Naive mode (g_alloc=0) with
-     * exactly ONE dynamic JMPR: replace the runtime table + bounds check
-     * with an inline compare-and-branch chain over the index register's
-     * PROVABLE candidate set. The set is computed by a forward walk over
-     * the linear stream with the same join discipline as the fold
-     * fixpoint (constants die at block heads), but a head's set is the
-     * UNION of its incoming edges' sets — the chain must cover every
-     * path's value, not fold a single one. Only the index register is
-     * tracked; any writer that is not a known constant (LOAD, CALL
-     * result, register-form ALU, MUL/DIV/AND/OR/XOR, shifts...) marks it
-     * UNKNOWN and no chain fires (jmpr_dyn/mix/foldreach keep the
-     * table). The walk iterates to a fixpoint because a backward branch
-     * delivers its arrival set to a head already processed; sets only
-     * grow and collapse to UNKNOWN at the cap, so it converges.
-     * Soundness: the chain's fall-through UDF fires exactly for indices
-     * the analysis proves impossible; candidates >= num_instr get no
-     * branch and land on the UDF, matching the table's bounds-check
-     * fault (jmpr_oob's constant 999 collapses to a bare UDF). The
-     * walk's linear state is built only from real edges — a non-head pc
-     * after a terminal is either a branch target (its union resets it)
-     * or unreachable, and the single dynamic JMPR is reachable here (it
-     * is what forced g_alloc=0), so its set is never tainted by a dead
-     * region. */
+    /* M2.25/M2.26: inline-dispatch chain analysis. Naive mode
+     * (g_alloc=0) with exactly ONE dynamic JMPR: replace the runtime
+     * table + bounds check with an inline compare-and-branch chain over
+     * the index register's PROVABLE candidate set. The set is computed
+     * by a forward walk over the linear stream with the same join
+     * discipline as the fold fixpoint (constants die at block heads),
+     * but a head's set is the UNION of its incoming edges' sets — the
+     * chain must cover every path's value, not fold a single one.
+     * M2.26: the walk tracks ra plus its TRANSITIVE FEEDERS (the
+     * closure below), so an index built by a register-form ADD/SUB —
+     * LOADI rb; ADD ra, ra, rb — chains too (jmpr_chain2); a writer
+     * that is not a known constant (LOAD, CALL result, MUL/DIV/AND/
+     * OR/XOR, shifts...) still marks its set UNKNOWN and no chain
+     * fires (jmpr_dyn/mix/foldreach keep the table). The walk iterates
+     * to a fixpoint because a backward branch delivers its arrival set
+     * to a head already processed; sets only grow and collapse to
+     * UNKNOWN at the cap, so it converges. Soundness: the chain's
+     * fall-through UDF fires exactly for indices the analysis proves
+     * impossible; candidates >= num_instr get no branch and land on the
+     * UDF, matching the table's bounds-check fault (jmpr_oob's constant
+     * 999 collapses to a bare UDF). The walk's linear state is built
+     * only from real edges — a non-head pc after a terminal is either a
+     * branch target (its union resets it) or unreachable, and the
+     * single dynamic JMPR is reachable here (it is what forced
+     * g_alloc=0), so its set is never tainted by a dead region. */
     g_chain_active = 0;
     g_chain_ncand = 0;
     if (!g_alloc) {
@@ -2257,104 +2297,165 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         if (n_dyn == 1) {
             uint16_t ra = w_ra(instrs[dyn_pc]);
             if (ra < TX_AR_MAX_REGS) {
-                for (uint32_t q = 0; q < 4096; q++) { g_chain_arr_n[q] = 0; g_chain_arr_unk[q] = 0; }
-                uint8_t snap_n = 0, snap_unk = 1;
-                uint32_t snap_v[TX_AR_CHAIN_MAX] = {0};
-                int changed = 1;
-                for (int iter = 0; changed && iter < 64; iter++) {
-                    changed = 0;
-                    uint8_t  cur_n = 0, cur_unk = 1;      /* entry: the index is opaque (caller args) */
-                    uint32_t cur_v[TX_AR_CHAIN_MAX] = {0};
-                    int carry = 1;                        /* pc 0 is reached from the trampoline */
+                /* M2.26: the tracked-register closure — ra plus every
+                 * register that can transitively feed it (operands of
+                 * instructions whose rd is tracked). Capped at
+                 * TX_AR_CHAIN_REGS; beyond that the analysis declines
+                 * (the table path). The closure is over the whole
+                 * stream, so a feeder on any path is tracked everywhere
+                 * — over-tracking is harmless (bounded by the cap),
+                 * under-tracking is what would be unsound. */
+                int ntr = 1;
+                for (int i = 0; i < TX_AR_MAX_REGS; i++) { g_chain_tracked[i] = 0; g_chain_slot[i] = -1; }
+                g_chain_tracked[ra] = 1;
+                int grew = 1;
+                while (grew && ntr <= TX_AR_CHAIN_REGS) {
+                    grew = 0;
                     for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
                         uint64_t w = instrs[pc];
-                        uint8_t op = w_op(w);
                         uint16_t rd = w_rd(w);
-                        if (g_pc_target[pc] && pc != 0) {
-                            /* block head: union of the fall-through carry
-                             * (only if pc-1 falls through) and the branch
-                             * deliveries accumulated so far */
-                            if (!carry) { cur_n = 0; cur_unk = 0; }
-                            chain_merge(&cur_n, cur_v, &cur_unk,
-                                        g_chain_arr_n[pc], g_chain_arr_v[pc],
-                                        g_chain_arr_unk[pc]);
+                        if (rd >= TX_AR_MAX_REGS || !g_chain_tracked[rd]) continue;
+                        uint8_t op = w_op(w);
+                        /* the ntr < cap guard on each addition keeps the
+                         * count bounded even when one round would add
+                         * several feeders at once — g_chain_arr and the
+                         * walk state are sized TX_AR_CHAIN_REGS */
+                        if (ar_has_reg_ra(op)) {
+                            uint16_t ra2 = w_ra(w);
+                            if (ra2 < TX_AR_MAX_REGS && !g_chain_tracked[ra2] && ntr < TX_AR_CHAIN_REGS) { g_chain_tracked[ra2] = 1; ntr++; grew = 1; }
                         }
-                        if (pc == dyn_pc) {
-                            /* capture the candidate set at the dispatch */
-                            if (cur_n != snap_n || cur_unk != snap_unk) changed = 1;
-                            else for (uint8_t i = 0; i < cur_n; i++)
-                                if (cur_v[i] != snap_v[i]) { changed = 1; break; }
-                            snap_n = cur_n; snap_unk = cur_unk;
-                            for (uint8_t i = 0; i < cur_n; i++) snap_v[i] = cur_v[i];
-                        }
-                        if (op == OP_ENTER) {
-                            cur_n = 0; cur_unk = 1;       /* fresh frame: nothing known */
-                            carry = 1;
-                        } else if (op == OP_RET) {
-                            carry = 0;                    /* terminal */
-                        } else if (op == OP_BR) {
-                            int64_t t = (int64_t)pc + 1 + w_imm28(w);
-                            if (t >= 0 && t < (int64_t)hdr.num_instr)
-                                chain_merge(&g_chain_arr_n[(uint32_t)t], g_chain_arr_v[(uint32_t)t],
-                                            &g_chain_arr_unk[(uint32_t)t], cur_n, cur_v, cur_unk);
-                            carry = 0;
-                        } else if (op == OP_BC) {
-                            int64_t t = (int64_t)pc + 1 + w_imm28(w);
-                            if (t >= 0 && t < (int64_t)hdr.num_instr)
-                                chain_merge(&g_chain_arr_n[(uint32_t)t], g_chain_arr_v[(uint32_t)t],
-                                            &g_chain_arr_unk[(uint32_t)t], cur_n, cur_v, cur_unk);
-                            carry = 1;
-                        } else if (op == OP_CALL) {
-                            /* callee entry is opaque (args + fresh frame);
-                             * the return clobbers r0 only */
-                            int64_t t = (int64_t)pc + 1 + w_imm28(w);
-                            if (t >= 0 && t < (int64_t)hdr.num_instr)
-                                chain_merge(&g_chain_arr_n[(uint32_t)t], g_chain_arr_v[(uint32_t)t],
-                                            &g_chain_arr_unk[(uint32_t)t], 0, NULL, 1);
-                            if (ra == 0) { cur_n = 0; cur_unk = 1; }
-                            carry = 1;
-                        } else if (op == OP_JMPR) {
-                            if (g_jmpr_fold[pc] >= 0) {
-                                uint32_t t = (uint32_t)g_jmpr_fold[pc];
-                                if (t < hdr.num_instr)
-                                    chain_merge(&g_chain_arr_n[t], g_chain_arr_v[t],
-                                                &g_chain_arr_unk[t], cur_n, cur_v, cur_unk);
-                                carry = (t == pc + 1);    /* fall-through fold continues linearly */
-                            } else {
-                                carry = 0;                /* dynamic dispatch: terminal */
-                            }
-                        } else if (rd == ra) {
-                            if (op == OP_LOADI) {
-                                cur_n = 1; cur_unk = 0;
-                                cur_v[0] = (uint32_t)w_imm28(w);
-                            } else if ((op == OP_ADD || op == OP_SUB) &&
-                                       (w_flags(w) & FLAG_IMM) && !cur_unk) {
-                                /* image of the set under +imm / -imm (the
-                                 * image of a sorted set stays sorted) */
-                                int64_t imm = w_imm28(w);
-                                uint8_t nn = 0;
-                                uint32_t nv[TX_AR_CHAIN_MAX];
-                                for (uint8_t i = 0; i < cur_n; i++) {
-                                    int64_t c = (int64_t)cur_v[i] + (op == OP_ADD ? imm : -imm);
-                                    if (nn == 0 || nv[nn - 1] != (uint32_t)c) nv[nn++] = (uint32_t)c;
-                                }
-                                cur_n = nn; cur_unk = 0;
-                                for (uint8_t i = 0; i < nn; i++) cur_v[i] = nv[i];
-                            } else {
-                                cur_n = 0; cur_unk = 1;   /* opaque writer: no chain */
-                            }
-                            carry = 1;
-                        } else {
-                            carry = 1;
+                        if (!(w_flags(w) & FLAG_IMM) && ar_has_reg_rb(op)) {
+                            uint16_t rb = w_rb_reg(w);
+                            if (rb < TX_AR_MAX_REGS && !g_chain_tracked[rb] && ntr < TX_AR_CHAIN_REGS) { g_chain_tracked[rb] = 1; ntr++; grew = 1; }
                         }
                     }
                 }
-                /* the converged snapshot at dyn_pc is the candidate set */
-                if (!snap_unk && snap_n > 0 && snap_n <= TX_AR_CHAIN_MAX) {
-                    for (uint8_t i = 0; i < snap_n; i++)
-                        if (snap_v[i] < hdr.num_instr && g_chain_ncand < TX_AR_CHAIN_MAX)
-                            g_chain_cand[g_chain_ncand++] = snap_v[i];
-                    g_chain_active = 1;   /* even ncand==0: a provably-constant OOB index (jmpr_oob) */
+                if (ntr <= TX_AR_CHAIN_REGS) {
+                    int slot = 0;
+                    for (int i = 0; i < TX_AR_MAX_REGS; i++)
+                        if (g_chain_tracked[i]) g_chain_slot[i] = (int8_t)(slot++);
+                    for (int s = 0; s < ntr; s++)
+                        for (uint32_t q = 0; q < 4096; q++) { g_chain_arr[s][q].n = 0; g_chain_arr[s][q].unk = 0; }
+                    struct ChainSet snap = { .n = 0, .unk = 1 };
+                    int changed = 1;
+                    for (int iter = 0; changed && iter < 64; iter++) {
+                        changed = 0;
+                        struct ChainSet cur[TX_AR_CHAIN_REGS];
+                        for (int s = 0; s < ntr; s++) { cur[s].n = 0; cur[s].unk = 1; }  /* entry: opaque */
+                        int carry = 1;                  /* pc 0 is reached from the trampoline */
+                        for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
+                            uint64_t w = instrs[pc];
+                            uint8_t op = w_op(w);
+                            uint16_t rd = w_rd(w);
+                            if (g_pc_target[pc] && pc != 0) {
+                                /* block head: union of the fall-through
+                                 * carry (only if pc-1 falls through) and
+                                 * the branch deliveries, per tracked slot */
+                                for (int s = 0; s < ntr; s++) {
+                                    if (!carry) { cur[s].n = 0; cur[s].unk = 0; }
+                                    chain_merge(&cur[s], &g_chain_arr[s][pc]);
+                                }
+                            }
+                            if (pc == dyn_pc) {
+                                /* capture the candidate set at the dispatch */
+                                struct ChainSet* c = &cur[g_chain_slot[ra]];
+                                if (c->n != snap.n || c->unk != snap.unk) changed = 1;
+                                else for (uint8_t i = 0; i < c->n; i++)
+                                    if (c->v[i] != snap.v[i]) { changed = 1; break; }
+                                snap = *c;
+                            }
+                            if (op == OP_ENTER) {
+                                for (int s = 0; s < ntr; s++) chain_unknown(&cur[s]);  /* fresh frame */
+                                carry = 1;
+                            } else if (op == OP_RET) {
+                                carry = 0;                /* terminal */
+                            } else if (op == OP_BR) {
+                                int64_t t = (int64_t)pc + 1 + w_imm28(w);
+                                if (t >= 0 && t < (int64_t)hdr.num_instr)
+                                    for (int s = 0; s < ntr; s++) chain_merge(&g_chain_arr[s][(uint32_t)t], &cur[s]);
+                                carry = 0;
+                            } else if (op == OP_BC) {
+                                int64_t t = (int64_t)pc + 1 + w_imm28(w);
+                                if (t >= 0 && t < (int64_t)hdr.num_instr)
+                                    for (int s = 0; s < ntr; s++) chain_merge(&g_chain_arr[s][(uint32_t)t], &cur[s]);
+                                carry = 1;
+                            } else if (op == OP_CALL) {
+                                /* callee entry is opaque (args + fresh frame);
+                                 * the return clobbers r0 only */
+                                int64_t t = (int64_t)pc + 1 + w_imm28(w);
+                                if (t >= 0 && t < (int64_t)hdr.num_instr)
+                                    for (int s = 0; s < ntr; s++) {
+                                        struct ChainSet unk = { .n = 0, .unk = 1 };
+                                        chain_merge(&g_chain_arr[s][(uint32_t)t], &unk);
+                                    }
+                                if (g_chain_slot[0] >= 0) chain_unknown(&cur[g_chain_slot[0]]);
+                                carry = 1;
+                            } else if (op == OP_JMPR) {
+                                if (g_jmpr_fold[pc] >= 0) {
+                                    uint32_t t = (uint32_t)g_jmpr_fold[pc];
+                                    if (t < hdr.num_instr)
+                                        for (int s = 0; s < ntr; s++) chain_merge(&g_chain_arr[s][t], &cur[s]);
+                                    carry = (t == pc + 1);    /* fall-through fold continues linearly */
+                                } else {
+                                    carry = 0;                /* dynamic dispatch: terminal */
+                                }
+                            } else if (ar_writes_rd(op) && rd < TX_AR_MAX_REGS &&
+                                       g_chain_slot[rd] >= 0) {
+                                int s = g_chain_slot[rd];
+                                if (op == OP_LOADI) {
+                                    chain_singleton(&cur[s], (uint32_t)w_imm28(w));
+                                } else if (op == OP_LOADI64) {
+                                    uint32_t idx = w_rb_raw(w);
+                                    if (idx < hdr.num_literals) chain_singleton(&cur[s], (uint32_t)literals[idx]);
+                                    else chain_unknown(&cur[s]);
+                                } else if (op == OP_MOV) {
+                                    int ss = (w_ra(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_ra(w)] : -1;
+                                    if (ss >= 0) cur[s] = cur[ss];
+                                    else chain_unknown(&cur[s]);
+                                } else if (op == OP_ADD || op == OP_SUB) {
+                                    /* S(rd) = image of S(ra) under +imm/-imm,
+                                     * or the pair-product over S(ra) x S(rb) */
+                                    int s_a = (w_ra(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_ra(w)] : -1;
+                                    struct ChainSet tmp = { .n = 0, .unk = 0 };
+                                    if (s_a < 0 || cur[s_a].unk) chain_unknown(&tmp);
+                                    else if (w_flags(w) & FLAG_IMM) {
+                                        int64_t imm = w_imm28(w);
+                                        for (uint8_t i = 0; i < cur[s_a].n && !tmp.unk; i++) {
+                                            struct ChainSet one;
+                                            chain_singleton(&one, (uint32_t)((int64_t)cur[s_a].v[i] + (op == OP_ADD ? imm : -imm)));
+                                            chain_merge(&tmp, &one);
+                                        }
+                                    } else {
+                                        int s_b = (w_rb_reg(w) < TX_AR_MAX_REGS) ? g_chain_slot[w_rb_reg(w)] : -1;
+                                        if (s_b < 0 || cur[s_b].unk) chain_unknown(&tmp);
+                                        else for (uint8_t i = 0; i < cur[s_a].n && !tmp.unk; i++)
+                                            for (uint8_t j = 0; j < cur[s_b].n && !tmp.unk; j++) {
+                                                struct ChainSet one;
+                                                chain_singleton(&one, (uint32_t)((int64_t)cur[s_a].v[i] +
+                                                    (op == OP_ADD ? (int64_t)cur[s_b].v[j] : -(int64_t)cur[s_b].v[j])));
+                                                chain_merge(&tmp, &one);
+                                            }
+                                    }
+                                    cur[s] = tmp;
+                                } else if (op == OP_CMP) {
+                                    cur[s].n = 2; cur[s].unk = 0;
+                                    cur[s].v[0] = 0; cur[s].v[1] = 1;
+                                } else {
+                                    chain_unknown(&cur[s]);   /* opaque writer: no chain */
+                                }
+                                carry = 1;
+                            } else {
+                                carry = 1;
+                            }
+                        }
+                    }
+                    /* the converged snapshot at dyn_pc is the candidate set */
+                    if (!snap.unk && snap.n > 0 && snap.n <= TX_AR_CHAIN_MAX) {
+                        for (uint8_t i = 0; i < snap.n; i++)
+                            if (snap.v[i] < hdr.num_instr && g_chain_ncand < TX_AR_CHAIN_MAX)
+                                g_chain_cand[g_chain_ncand++] = snap.v[i];
+                        g_chain_active = 1;   /* even ncand==0: a provably-constant OOB index (jmpr_oob) */
+                    }
                 }
             }
         }
