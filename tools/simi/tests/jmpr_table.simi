@@ -1,0 +1,37 @@
+; jmpr_table.simi — M2.24: the compact JMPR table, pinned at runtime.
+; Both JMPRs are DYNAMIC (g_alloc=0 — the indices are values stored to
+; guest memory and loaded back, which the constant analysis never
+; tracks, so neither folds), and the program dispatches through the
+; table TWICE in one run: the first JMPR's index is 7 (table[7] ->
+; block A, pc 7) and the second's is 13 (table[13] -> block B, pc 13)
+; — so TWO distinct entries of the table are fetched, indexed, and
+; branched to, and both bounds checks pass. M2.24 halved the table:
+; entries are
+; 32-bit byte offsets (g_instr_off[pc], uint32_t by construction) read
+; with a single ldr W at base + (target << 2), and the per-JMPR base
+; load is a 2-word movz+movk instead of M2.23's 4-word li64 — the
+; naive-mode table is num_instr x 4 bytes (plus 8 per dynamic JMPR for
+; the base load). Under g_alloc=1 there is no table at all (every
+; emitted JMPR folds — M2.23), so this pin is the naive-mode table
+; only. jmpr_oob pins the same path's fault side (index out of range ->
+; UDF #0).
+; Expected result: 222
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #7, i64   ; pc 1 — first dispatch index (7 — blockA's pc)
+    STORE r0, r7, #0, i64   ; pc 2 — mem[r7+0] = 7
+    LOAD r1, r7, #0, i64    ; pc 3 — r1 = 7 — runtime-computed, NEVER folds
+    JMPR r1             ; pc 4 — dynamic dispatch: table[7] -> block A (pc 7)
+    LOADI r0, #111, i32 ; pc 5 — dead path (index 7 never lands here)
+    RET                 ; pc 6
+blockA:                 ; pc 7 — reached via table[7]
+    LOADI r0, #13, i64  ; pc 7 — second dispatch index (13 — blockB's pc)
+    STORE r0, r7, #0, i64   ; pc 8 — mem[r7+0] = 13
+    LOAD r1, r7, #0, i64    ; pc 9 — r1 = 13
+    JMPR r1             ; pc 10 — dynamic dispatch: table[13] -> block B (pc 13)
+    LOADI r0, #111, i32 ; pc 11 — dead path (index 13 never lands here)
+    RET                 ; pc 12
+blockB:                 ; pc 13 — reached via table[13]
+    LOADI r0, #222, i32 ; pc 13
+    RET                 ; pc 14

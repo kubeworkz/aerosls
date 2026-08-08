@@ -2591,6 +2591,63 @@ added, ten moved:
   pre-existing skips unchanged). enc-check clean; jmpr_oob still
   faults (UDF, rc=1).
 
+### 10.58 M2.24 — the compact JMPR table (as built)
+
+M2.23 made the JMPR jump table disappear from every g_alloc=1 program
+(no dynamic path is emitted, so no table is needed). The table that
+remains lives only under g_alloc=0 (naive) — a reachable non-folding
+JMPR's runtime index is data, so every pc in [0, num_instr) is a
+possible target and all num_instr entries are required. M2.24 shrinks
+that table and its access paths:
+
+- **4-byte entries.** M2.23's 8-byte entries mirrored RV64's 64-bit
+  slots, but the entry is a byte offset into out_buf — `g_instr_off[pc]`
+  and `cb.len` are `uint32_t` by construction, and the harness maps the
+  code buffer at VA 0, so one 32-bit `ldr W` per entry suffices. The
+  dispatch becomes `t2 = base + (target << 2); t2 = (u32)[t2]; br t2`
+  (the 32-bit load zero-extends — offsets are positive). The table is
+  num_instr x 4 bytes, exactly half of M2.23's.
+- **2-word base load.** The table-base placeholder shrinks from a
+  4-word movz+3xmovk li64 to a 2-word movz+movk (the base is also a
+  32-bit offset — `cb.len` at the table's position, < 2^32 always).
+  Saves 8 bytes per dynamic JMPR.
+- **Bounds check unchanged.** `t0 < num_instr; cset lo; cbz -> UDF #0`
+  is the ISA §16 CFI requirement, untouched — jmpr_oob still faults.
+
+The g_alloc=1 elimination of the table (M2.23) is now the two-sided
+story: when every reachable JMPR folds there is nothing to dispatch
+with, and when one doesn't, the dispatch path is minimal. The naive
+path stays byte-identical to M0 except for the table's width and the
+base load's width — both pure size wins, no semantic change (verified
+by the four-way parity executing the compact table at runtime).
+
+### 10.59 M2.24 gate results (measured)
+
+Total emitted bytes across the now-48-program parity set: **M0 74584
+→ M1 64032, 10552 saved** (≈14.1%), up from M2.23's 10208. One row
+added, four moved:
+
+- jmpr_table 1344 → 1236 (−108, new 48th row; M0 baseline measured at
+  git 1729f50) — the dedicated pin. Two DYNAMIC JMPRs (indices stored
+  to and re-loaded from guest memory — never fold, g_alloc=0)
+  dispatch SEQUENTIALLY through two distinct table entries in one
+  run: table[7] -> block A, table[13] -> block B, each with a passing
+  bounds check. The M2.23-era 8-byte table measures 1312 (+76 = 15x4
+  table + 2x8 base) — the teeth, isolating the width delta exactly.
+- jmpr_dyn 1132 → 1088 (−44 = 9x4 + 8), jmpr_mix 1248 → 1184 (−64 =
+  14x4 + 8), jmpr_foldreach 3044 → 2964 (−80 = 18x4 + 8), jmpr_join
+  1144 → 1096 (−48 = 10x4 + 8) — the naive-mode table-bearing rows,
+  each shrinking by exactly num_instr x 4 (table) + 8 (base load).
+- Row-by-row accounting (gate tables diffed vs committed 3d8d52e,
+  measured with the M2.23 verifier): all other 43 shared rows
+  byte-identical — M2.24 touches ONLY the naive-mode dynamic dispatch
+  (every g_alloc=1 row, including the 1964-byte dead-code core,
+  unchanged).
+- Four-way parity: 150 PASS, 0 FAIL across all engines (the compact
+  table executes at runtime on the ARM engine; the three pre-existing
+  skips unchanged). enc-check clean; jmpr_oob still faults (UDF,
+  rc=1, now at a slightly earlier pc — the table is smaller).
+
 ---
 
 ## Sources consulted
