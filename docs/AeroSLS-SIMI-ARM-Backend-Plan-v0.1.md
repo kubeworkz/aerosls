@@ -2207,6 +2207,72 @@ byte-neutral across the pre-existing corpus.
   mem_ops x86 limitations). enc-check clean; jmpr_oob still faults
   (UDF, rc=1).
 
+### 10.48 M2.19 — the leaf-callee return value (as built)
+
+M2.18's relaxation excluded CALL targets: a call edge was treated as
+carrying an unknown callee-modified map. M2.19 shows that framing was
+over-conservative — but the win is at the RETURN POINT, not the call
+target, and it rests on a structural fact of this SIMI's fresh-frame
+model. The interpreter's CALL zeroes the callee's frame, copies r0-r7
+as arguments, and on RET propagates ONLY r0 (the return value) back to
+the caller; the emitted code matches (the callee's ENTER prologue
+zeroes all 64 slots + tags, then the call site marshals r0-r7 from the
+outgoing-arg area). So the caller's register map is **structurally
+preserved by a call except r0** — a probe confirmed a JMPR keyed on r2
+survives a call and folds with no new machinery. What was genuinely
+unknown was r0 itself: the fixpoint cleared it (the return register),
+so a JMPR keyed on the RETURN VALUE never folded.
+
+The first cut: **leaf-callee return-value analysis**. For each CALL
+site, if the callee is a straight-line leaf — starts with ENTER, no
+BR/BC/JMPR/CALL before its first RET — the fixpoint's own constant
+step (factored into ar_const_step, shared with the main scan) is run
+over the callee body against the fresh-frame map (r0-r7 unknown, r8+ =
+0, zeroed by the prologue). If r0 at the RET is a compile-time
+constant, the caller's r0 after the call is that constant, and a JMPR
+keyed on it folds. The analysis is per-callee with the args unknown, so
+a leaf returning a value computed from its ARGS is conservatively not
+folded (the call-site-dependent seeding of the arg constants is the
+natural follow-up); the ENTER requirement is what makes the r8+ = 0
+seeding sound in the EMITTED code (a callee without ENTER would read
+the caller's stale frame there, diverging from the interpreter).
+
+Why this is sound: the callee is straight-line, so every execution of
+it takes the same path and computes the same r0 from the same
+constant/zeroed inputs — independent of the caller's state; and the
+fresh-frame model makes the caller's other registers unaffected, so the
+post-call map is exactly the pre-call map with r0 replaced by the
+analyzed constant. jmpr_callret pins it: ENTER, LOADI r0 = 3, RET; the
+JMPR r0 folds to pc 3 (a fall-through fold — the branch is dropped and
+the call site flows directly into the target's ADD), g_alloc stays 1
+for the whole function.
+
+### 10.49 M2.19 gate results (measured)
+
+Total emitted bytes across the now-42-program parity set: **M0 57368
+→ M1 52316, 5052 saved** (≈8.8%), up from M2.18's 4900. The new row
+on top of 4900:
+
+- jmpr_callret 2036 → 1884 (−152, new 42nd row; M0 baseline measured
+  at git 1729f50). 152 = the whole function's naive-to-cache delta:
+  the JMPR's dynamic dispatch (runtime table + bounds check) is gone,
+  the branch is a dropped fall-through, and g_alloc stays 1. Disabling
+  the leaf analysis grows it back to exactly 2036 (the JMPR dynamic,
+  g_alloc = 0, the runtime dispatch table), still correct — the teeth.
+- Row-by-row accounting (gate tables diffed vs committed abc0a46):
+  all 41 shared rows byte-identical — the totals move by exactly the
+  new row. The analysis is byte-neutral across the pre-existing
+  corpus: no existing call test's fold decisions change (call_ret,
+  cap_call_ret and aggregate_abi all measure identically).
+- Four-way parity: interp 44/0, x86 43/0/1, RV64 43/0/1, ARM 43/0/1
+  (the three skips are the pre-existing float_ops RV64/ARM and
+  mem_ops x86 limitations). enc-check clean; jmpr_oob still faults
+  (UDF, rc=1).
+- Open follow-up (recorded, not a gap): the args-unknown restriction —
+  seeding the callee's r0-r7 with the CALLER's constants at each call
+  site would fold leaves that return a function of their (constant)
+  arguments, at the cost of making the analysis call-site-dependent.
+
 ---
 
 ## Sources consulted

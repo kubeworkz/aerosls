@@ -510,6 +510,118 @@ static int ar_is_interm_op(uint8_t op) {
         return 0;
     }
 }
+/* M2.19: per-instruction constant propagation, factored out of the
+ * fixpoint scan so a leaf callee can be analyzed against a scratch map.
+ * Applies one instruction's effect to known[]/val[]: LOADI/LOADI64/MOV
+ * establish or copy, the ALU family folds when its sources are known
+ * (plain 64-bit ops, never fault; shifts mask the amount mod 64; SAR
+ * sign-fills), and every other register-writing opcode breaks the
+ * constant. ENTER/RET/JMPR/CALL/BR/BC are handled by the callers. */
+static void ar_const_step(uint64_t w, uint32_t num_literals, const uint64_t* literals,
+                          uint8_t* known, uint64_t* val) {
+    uint8_t op = w_op(w);
+    uint16_t rd = w_rd(w), ra = w_ra(w);
+    if (op == OP_LOADI) {
+        if (rd < TX_AR_MAX_REGS) { known[rd] = 1; val[rd] = (uint64_t)(int64_t)w_imm28(w); }
+    } else if (op == OP_LOADI64) {
+        uint32_t idx = w_rb_raw(w);
+        if (idx < num_literals && rd < TX_AR_MAX_REGS) { known[rd] = 1; val[rd] = literals[idx]; }
+    } else if (op == OP_MOV) {
+        if (rd < TX_AR_MAX_REGS) {
+            known[rd] = (ra < TX_AR_MAX_REGS) ? known[ra] : 0;
+            val[rd] = (ra < TX_AR_MAX_REGS) ? val[ra] : 0;
+        }
+    } else if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_AND ||
+               op == OP_OR || op == OP_XOR || op == OP_SHL || op == OP_SHR ||
+               op == OP_SAR) {
+        /* M2.3: fold arithmetic constants through the whole ALU
+         * family. The emitted ALU is a plain 64-bit op for every
+         * SIMI type (no width or signedness rounding — the
+         * translator never truncates), the imm28 is sign-extended
+         * exactly as materialize_imm does, and the binary ops are
+         * enc_and/orr/eor_shift while the shifts are
+         * enc_lslv/lsrv/asrv — all plain 64-bit, never fault. The
+         * shift AMOUNT is masked mod 64 (& 0x3F) in hardware
+         * (lslv/lsrv/asrv) and identically in the interpreter
+         * (fetch_operand_b & 0x3F) and RV64 (v2 & 0x3F), so the
+         * fold masks too; SAR is arithmetic (sign-filling) like
+         * the interpreter's (int64)>>. Deliberately limited:
+         * DIV/MOD would change behavior on a translate-time
+         * division by zero, and NOT (a foldable ~a, plain 64-bit)
+         * is left out as a conservative omission — unary, never
+         * a dispatch index in practice. */
+        if (rd < TX_AR_MAX_REGS) {
+            int k = (ra < TX_AR_MAX_REGS) ? known[ra] : 0;
+            uint64_t a = (ra < TX_AR_MAX_REGS) ? val[ra] : 0;
+            int fold = 0;
+            uint64_t b = 0;
+            if (w_flags(w) & FLAG_IMM) {
+                b = (uint64_t)(int64_t)w_imm28(w);
+                fold = k;
+            } else {
+                uint16_t rb = w_rb_reg(w);
+                fold = k && rb < TX_AR_MAX_REGS && known[rb];
+                if (fold) b = val[rb];
+            }
+            if (fold) {
+                known[rd] = 1;
+                uint64_t amt = b & 0x3F;   /* shifts mask the amount mod 64 */
+                switch (op) {
+                    case OP_ADD: val[rd] = a + b; break;
+                    case OP_SUB: val[rd] = a - b; break;
+                    case OP_MUL: val[rd] = a * b; break;
+                    case OP_AND: val[rd] = a & b; break;
+                    case OP_OR:  val[rd] = a | b; break;
+                    case OP_XOR: val[rd] = a ^ b; break;
+                    case OP_SHL: val[rd] = a << amt; break;
+                    case OP_SHR: val[rd] = a >> amt; break;
+                    case OP_SAR: val[rd] = (uint64_t)((int64_t)a >> amt); break;
+                }
+            } else {
+                known[rd] = 0;
+            }
+        }
+    } else if (rd < TX_AR_MAX_REGS) {
+        known[rd] = 0;   /* every other register-writing opcode breaks the constant */
+    }
+}
+/* M2.19: analyze a straight-line leaf callee's return value. The callee
+ * starts with ENTER at T (the emitted prologue zeroes the frame, matching
+ * the interpreter's fresh-frame CALL — a callee without ENTER reads the
+ * caller's stale frame in the emitted code and is not analyzable), contains
+ * no BR/BC/JMPR/CALL, and terminates at its first RET; r0 at that RET must
+ * be a compile-time constant under the fresh-frame map (r0-r7 = the
+ * caller's args — unknown, since the analysis is per-callee; r8+ = 0,
+ * zeroed by the prologue). Returns the constant, or -1 when not analyzable.
+ * The caller's r0 after the call is then that constant, so a JMPR keyed on
+ * the RETURN VALUE folds. */
+static int64_t ar_callee_r0_const(const uint64_t* instrs, uint32_t num_instr,
+                                  uint32_t num_literals, const uint64_t* literals,
+                                  uint32_t T) {
+    if (w_op(instrs[T]) != OP_ENTER) return -1;
+    uint8_t  known[TX_AR_MAX_REGS];
+    uint64_t val[TX_AR_MAX_REGS];
+    for (int i = 0; i < 8; i++) known[i] = 0;                       /* args: unknown */
+    for (int i = 8; i < TX_AR_MAX_REGS; i++) { known[i] = 1; val[i] = 0; }  /* zeroed frame */
+    for (uint32_t pc = T; pc < num_instr; pc++) {
+        uint64_t w = instrs[pc];
+        uint8_t op = w_op(w);
+        /* Only the LEADING ENTER (pc == T) is legal: the seeding already
+         * models the zeroed frame. A mid-body ENTER would mean the region
+         * overlaps another function's prologue, and the fixpoint's own
+         * OP_ENTER semantics is a full constant-map reset — reject it so
+         * the analysis never attributes a constant the runtime would not
+         * honor (M2.19 reviewer hardening). */
+        if (op == OP_ENTER) { if (pc != T) return -1; continue; }
+        if (op == OP_RET) return known[0] ? (int64_t)val[0] : -1;
+        if (op == OP_BR || op == OP_BC || op == OP_JMPR || op == OP_CALL) return -1;
+        ar_const_step(w, num_literals, literals, known, val);
+    }
+    return -1;   /* no RET before the end of the stream */
+}
+/* M2.19: per-CALL-pc leaf return-value constant (-1 = unknown/not a
+ * leaf). Keyed by the CALL site, precomputed before the fixpoint. */
+static int64_t g_call_r0_const[4096];
 /* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
  * continuation pcs of a maximal straight-line run of LOAD/STORE that share
  * ONE displacement past the imm12 range — the displacement is materialized
@@ -1623,6 +1735,20 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         if (is_entry) continue;   /* the trampoline edge guarantees nothing */
         g_relax_ok[X] = 1;
     }
+    /* M2.19: leaf-callee return-value analysis, precomputed per CALL
+     * site. A JMPR keyed on the return value of an analyzable leaf folds
+     * because the caller's r0 after the call is that constant. The
+     * analysis is per-callee with the args unknown, so every call site
+     * of the same leaf gets the same (correct) constant. */
+    for (uint32_t q = 0; q < 4096; q++) g_call_r0_const[q] = -1;
+    for (uint32_t P = 0; P < hdr.num_instr; P++) {
+        uint64_t wP = instrs[P];
+        if (w_op(wP) != OP_CALL) continue;
+        int64_t tgt = (int64_t)P + 1 + w_imm28(wP);
+        if (tgt < 0 || tgt >= (int64_t)hdr.num_instr) continue;
+        g_call_r0_const[P] = ar_callee_r0_const(instrs, hdr.num_instr,
+                                                hdr.num_literals, literals, (uint32_t)tgt);
+    }
     /* M2: constant-index JMPR folding, by fixpoint. Each scan walks the
      * linear stream with a per-register constant map that resets at every
      * pc in g_pc_target (pass-A targets plus any fold targets discovered
@@ -1669,7 +1795,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             }
             uint64_t w = instrs[pc];
             uint8_t op = w_op(w);
-            uint16_t rd = w_rd(w), ra = w_ra(w);
+            uint16_t ra = w_ra(w);
             if (op == OP_BR || op == OP_BC) {
                 /* M2.18: snapshot the current map at the branch, for an
                  * eligible (and not-fold-target) target head. Taken before
@@ -1684,77 +1810,27 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     g_relax_snap_active[(uint32_t)tgt] = 1;
                 }
             }
-            if (op == OP_LOADI) {
-                if (rd < TX_AR_MAX_REGS) { g_const_known[rd] = 1; g_const_val[rd] = (uint64_t)(int64_t)w_imm28(w); }
-            } else if (op == OP_LOADI64) {
-                uint32_t idx = w_rb_raw(w);
-                if (idx < hdr.num_literals && rd < TX_AR_MAX_REGS) {
-                    g_const_known[rd] = 1; g_const_val[rd] = literals[idx];
-                }
-            } else if (op == OP_MOV) {
-                if (rd < TX_AR_MAX_REGS) {
-                    g_const_known[rd] = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
-                    g_const_val[rd] = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
-                }
-            } else if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_AND ||
-                       op == OP_OR || op == OP_XOR || op == OP_SHL || op == OP_SHR ||
-                       op == OP_SAR) {
-                /* M2.3: fold arithmetic constants through the whole ALU
-                 * family. The emitted ALU is a plain 64-bit op for every
-                 * SIMI type (no width or signedness rounding — the
-                 * translator never truncates), the imm28 is sign-extended
-                 * exactly as materialize_imm does, and the binary ops are
-                 * enc_and/orr/eor_shift while the shifts are
-                 * enc_lslv/lsrv/asrv — all plain 64-bit, never fault. The
-                 * shift AMOUNT is masked mod 64 (& 0x3F) in hardware
-                 * (lslv/lsrv/asrv) and identically in the interpreter
-                 * (fetch_operand_b & 0x3F) and RV64 (v2 & 0x3F), so the
-                 * fold masks too; SAR is arithmetic (sign-filling) like
-                 * the interpreter's (int64)>>. Deliberately limited:
-                 * DIV/MOD would change behavior on a translate-time
-                 * division by zero, and NOT (a foldable ~a, plain 64-bit)
-                 * is left out as a conservative omission — unary, never
-                 * a dispatch index in practice. */
-                if (rd < TX_AR_MAX_REGS) {
-                    int k = (ra < TX_AR_MAX_REGS) ? g_const_known[ra] : 0;
-                    uint64_t a = (ra < TX_AR_MAX_REGS) ? g_const_val[ra] : 0;
-                    int fold = 0;
-                    uint64_t b = 0;
-                    if (w_flags(w) & FLAG_IMM) {
-                        b = (uint64_t)(int64_t)w_imm28(w);
-                        fold = k;
-                    } else {
-                        uint16_t rb = w_rb_reg(w);
-                        fold = k && rb < TX_AR_MAX_REGS && g_const_known[rb];
-                        if (fold) b = g_const_val[rb];
-                    }
-                    if (fold) {
-                        g_const_known[rd] = 1;
-                        uint64_t amt = b & 0x3F;   /* shifts mask the amount mod 64 */
-                        switch (op) {
-                            case OP_ADD: g_const_val[rd] = a + b; break;
-                            case OP_SUB: g_const_val[rd] = a - b; break;
-                            case OP_MUL: g_const_val[rd] = a * b; break;
-                            case OP_AND: g_const_val[rd] = a & b; break;
-                            case OP_OR:  g_const_val[rd] = a | b; break;
-                            case OP_XOR: g_const_val[rd] = a ^ b; break;
-                            case OP_SHL: g_const_val[rd] = a << amt; break;
-                            case OP_SHR: g_const_val[rd] = a >> amt; break;
-                            case OP_SAR: g_const_val[rd] = (uint64_t)((int64_t)a >> amt); break;
-                        }
-                    } else {
-                        g_const_known[rd] = 0;
-                    }
-                }
-            } else if (op == OP_ENTER || op == OP_RET) {
+            if (op == OP_ENTER || op == OP_RET) {
                 for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;  /* prologue/terminal: no constant survives */
             } else if (op == OP_JMPR) {
                 g_jmpr_fold[pc] = (ra < TX_AR_MAX_REGS && g_const_known[ra] &&
                                    g_const_val[ra] < hdr.num_instr) ? (int)g_const_val[ra] : -1;
                 if (g_jmpr_fold[pc] >= 0 && g_jmpr_fold[pc] != (int)(pc + 1))
                     g_fold_tgt_prev[(uint32_t)g_jmpr_fold[pc]] = 1;   /* M2.18: live fold-target exclusion */
-            } else if (rd < TX_AR_MAX_REGS) {
-                g_const_known[rd] = 0;   /* every other register-writing opcode breaks the constant */
+            } else if (op == OP_CALL) {
+                /* M2.19: the return value. The fresh-frame model (the
+                 * interpreter zeroes the callee's frame, copies r0-r7 as
+                 * args, and on RET only r0 propagates back) means the
+                 * caller's other registers are structurally preserved by
+                 * the call — r0 is the callee's return value, unknown
+                 * unless the callee is an analyzable leaf. */
+                g_const_known[0] = 0;
+                if (g_call_r0_const[pc] >= 0) {
+                    g_const_known[0] = 1;
+                    g_const_val[0] = (uint64_t)g_call_r0_const[pc];
+                }
+            } else {
+                ar_const_step(w, hdr.num_literals, literals, g_const_known, g_const_val);
             }
         }
         for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
