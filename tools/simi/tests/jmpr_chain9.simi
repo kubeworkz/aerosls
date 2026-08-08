@@ -1,0 +1,123 @@
+; jmpr_chain9.simi — M2.33: the def-record pool gains an IMMEDIATE
+; operand kind, so an imm-form product over a deferred source defers
+; instead of collapsing to UNKNOWN. The dispatch index is r1 =
+; (r2 + r3) + 32: the register product {0,10,20} + {22,24,26,28,30} has
+; FIFTEEN distinct values {22,24,...,50} (the 10-step spacing keeps all
+; 15 sums distinct), beyond the flat cap of 12, so it DEFERS (M2.30).
+; The SECOND op is the IMM form (ADD r1, r1, #32, IN-PLACE) over that
+; deferred source. M2.30-M2.32 flattened a deferred source before an
+; imm image — the capped flatten collapses (15 > 12) to UNKNOWN, so
+; the whole chain died to the table. M2.33 records the imm product as
+; op(rec(R1), #32) — the source referenced as its immutable record (a
+; record ref is safe in-place), the 32 baked in as a CD_IMM constant
+; operand — and the dispatch materializes {a + 32 : a in S(R1)} = the
+; FIFTEEN candidates {54,56,...,82}. The emission gate (8*n + 4 < 40 +
+; 4*num_instr — here 124 < 376) emits the 15-pair chain. The runtime
+; index is (20 + 30) + 32 = 82 (every BC falls through — r0 == 0), the
+; chain's FIFTEENTH b.eq, landing on block14's LOADI #1500. The
+; candidates are real pcs (block0..block14 at 54..82), as the chain
+; branches straight to g_instr_off[pc].
+; Expected result: 1500
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every BC below falls through
+    LOADI r2, #0, i64   ; pc 2 — branch-path base (0) — dead at runtime
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:0} at J2)
+    LOADI r2, #10, i64  ; pc 4
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:10} at J2)
+    LOADI r2, #20, i64  ; pc 6 — fall-through base (20)
+J2:                     ; (label) — join: r2 ∈ {0, 10, 20}
+    LOADI r3, #22, i64  ; pc 7
+    BC r0, J3           ; pc 8 — falls through (delivers {r3:22} at J3)
+    LOADI r3, #24, i64  ; pc 9
+    BC r0, J3           ; pc 10 — falls through (delivers {r3:24} at J3)
+    LOADI r3, #26, i64  ; pc 11
+    BC r0, J3           ; pc 12 — falls through (delivers {r3:26} at J3)
+    LOADI r3, #28, i64  ; pc 13
+    BC r0, J3           ; pc 14 — falls through (delivers {r3:28} at J3)
+    LOADI r3, #30, i64  ; pc 15 — fall-through base (30)
+J3:                     ; (label) — join: r3 ∈ {22,24,26,28,30}
+    ADD r1, r2, r3, i64 ; pc 16 — r1 = r2 + r3 ∈ 15 values (22..50 evens) — DEFERS
+    ADD r1, r1, #32, i64; pc 17 — IN-PLACE imm: r1 = r1 + 32 ∈ 15 values (nested CD_IMM def)
+    JMPR r1             ; pc 18 — candidates {54,56,...,82}, runtime 82
+    LOADI r0, #0, i32   ; pc 19 — dead filler (aligns block0 to pc 54)
+    LOADI r0, #0, i32   ; pc 20
+    LOADI r0, #0, i32   ; pc 21
+    LOADI r0, #0, i32   ; pc 22
+    LOADI r0, #0, i32   ; pc 23
+    LOADI r0, #0, i32   ; pc 24
+    LOADI r0, #0, i32   ; pc 25
+    LOADI r0, #0, i32   ; pc 26
+    LOADI r0, #0, i32   ; pc 27
+    LOADI r0, #0, i32   ; pc 28
+    LOADI r0, #0, i32   ; pc 29
+    LOADI r0, #0, i32   ; pc 30
+    LOADI r0, #0, i32   ; pc 31
+    LOADI r0, #0, i32   ; pc 32
+    LOADI r0, #0, i32   ; pc 33
+    LOADI r0, #0, i32   ; pc 34
+    LOADI r0, #0, i32   ; pc 35
+    LOADI r0, #0, i32   ; pc 36
+    LOADI r0, #0, i32   ; pc 37
+    LOADI r0, #0, i32   ; pc 38
+    LOADI r0, #0, i32   ; pc 39
+    LOADI r0, #0, i32   ; pc 40
+    LOADI r0, #0, i32   ; pc 41
+    LOADI r0, #0, i32   ; pc 42
+    LOADI r0, #0, i32   ; pc 43
+    LOADI r0, #0, i32   ; pc 44
+    LOADI r0, #0, i32   ; pc 45
+    LOADI r0, #0, i32   ; pc 46
+    LOADI r0, #0, i32   ; pc 47
+    LOADI r0, #0, i32   ; pc 48
+    LOADI r0, #0, i32   ; pc 49
+    LOADI r0, #0, i32   ; pc 50
+    LOADI r0, #0, i32   ; pc 51
+    LOADI r0, #0, i32   ; pc 52
+    LOADI r0, #0, i32   ; pc 53
+block0:                 ; pc 54
+    LOADI r0, #100, i32 ; pc 54
+    RET                 ; pc 55
+block1:                 ; pc 56
+    LOADI r0, #200, i32 ; pc 56
+    RET                 ; pc 57
+block2:                 ; pc 58
+    LOADI r0, #300, i32 ; pc 58
+    RET                 ; pc 59
+block3:                 ; pc 60
+    LOADI r0, #400, i32 ; pc 60
+    RET                 ; pc 61
+block4:                 ; pc 62
+    LOADI r0, #500, i32 ; pc 62
+    RET                 ; pc 63
+block5:                 ; pc 64
+    LOADI r0, #600, i32 ; pc 64
+    RET                 ; pc 65
+block6:                 ; pc 66
+    LOADI r0, #700, i32 ; pc 66
+    RET                 ; pc 67
+block7:                 ; pc 68
+    LOADI r0, #800, i32 ; pc 68
+    RET                 ; pc 69
+block8:                 ; pc 70
+    LOADI r0, #900, i32 ; pc 70
+    RET                 ; pc 71
+block9:                 ; pc 72
+    LOADI r0, #1000, i32; pc 72
+    RET                 ; pc 73
+block10:                ; pc 74
+    LOADI r0, #1100, i32; pc 74
+    RET                 ; pc 75
+block11:                ; pc 76
+    LOADI r0, #1200, i32; pc 76
+    RET                 ; pc 77
+block12:                ; pc 78
+    LOADI r0, #1300, i32; pc 78
+    RET                 ; pc 79
+block13:                ; pc 80
+    LOADI r0, #1400, i32; pc 80
+    RET                 ; pc 81
+block14:                ; pc 82
+    LOADI r0, #1500, i32; pc 82
+    RET                 ; pc 83
