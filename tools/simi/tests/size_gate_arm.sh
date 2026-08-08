@@ -219,7 +219,29 @@
 # computed (plan doc §10.44). 148 bytes below its M0 baseline, and
 # disabling the merge grows it back to exactly 1024 (the one kept
 # fetch, 4 bytes) — the exact mirror of epi_merge2's teeth, still
-# correct. jmpr_cross is
+# correct. epi_merge6 is
+# M2.18: the TWO-COMPUTED epi-merge dead region — the §10.44 structural
+# ceiling, broken. Both dead-region intermediates are computed: a
+# DEPENDENT chain ADD r4, r2, #2 then SUB r5, r4, #1 computes the fold
+# index r5 = (3 + 2) - 1 = 4 = T instead of a LOADI seed. The M2.17
+# widening already accepted the ops; what blocked the shape was the
+# constant fixpoint — T+2 is the fold-source BR target (a block head),
+# so the reset there killed the seed r2 = 3, the chain broke, the JMPR
+# went dynamic, and g_alloc died (probe_2c measured the whole function
+# falling back to the naive path). M2.18's targeted fixpoint
+# relaxation: a head pc whose ONLY incoming path is a single forward
+# BR/BC (X-1 is a terminal, so the fall-through is dead; not an entry;
+# not a fold target) is NOT a join, so the scan restores the constant
+# map as it was at that branch instead of resetting. The fold-target
+# exclusion is per-scan (a fold edge is another incoming path) and a
+# hard safety cap falls back to the un-relaxed fixpoint if a
+# relaxation-enabled backward fold ever 2-cycles the fixpoint. The
+# epi-merge invariants are untouched (claim count still three → tail
+# result host x11, both head fetches drop): the head is a bare add, the
+# dead region computes the index, the fold's flush leaves the r2/r1
+# transients alive — 148 bytes below its M0 baseline, and disabling
+# the relaxation grows it back to exactly 1156 (the JMPR dynamic, the
+# whole function naive), still correct. jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -291,7 +313,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
-    [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168
+    [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120

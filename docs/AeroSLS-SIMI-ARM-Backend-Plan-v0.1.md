@@ -2108,6 +2108,105 @@ on top of M2.17's 4604:
   epi_merge3 was teed up; the formula and hook are shared, so it is
   a pin rather than a gap).
 
+### 10.46 M2.18 — the two-computed dead region (the §10.44 ceiling, broken)
+
+§10.44 claimed a structural ceiling: T+2 is the fold-source BR target,
+and the constant fixpoint resets every constant at that block head, so
+a computed T+2 has no known source, the index chain cannot fold, and
+at most one dead-region intermediate can be computed. M2.18 breaks
+that ceiling with a **targeted fixpoint relaxation** — but only after
+the probe proved the ceiling's mechanism first: probe_2c (T+2 = ADD
+sourcing the pre-T constant r2, T+3 = SUB of it) emitted the naive
+path (1156 bytes) because the JMPR went dynamic and g_alloc died.
+
+**The relaxation rule (as built).** A block head pc X whose ONLY
+incoming path is a single **forward** BR/BC edge — X−1 is a terminal
+(RET or unconditional BR, so the fall-through edge is dead), no CALL
+targets X, X is not an entry pc (the trampoline arrival guarantees
+nothing), and no backward branch targets it — is **not a join**: the
+constant map as it was at that branch holds at X, so the scan restores
+the branch-time snapshot instead of resetting. The eligibility is
+computed once (static); the snapshot is taken per-scan at the branch
+and restored at the head. Two exclusions keep it sound:
+
+- **Fold targets are excluded per-scan** (g_fold_tgt_prev, built from
+the previous scan's COMPLETE fold set and live-updated as the scan
+discovers folds): a fold edge into X is another incoming path, so X
+must reset. A fold DISCOVERED during the scan at q < X is caught
+within the same scan; a backward fold (q > X) is caught one scan
+late, exactly like the existing rule-1 machinery.
+- **A hard safety cap**: a fold ENABLED BY the relaxation can target
+the relaxed head itself (a backward fold re-entering the head makes
+it a loop head the relaxation must not apply to) — that shape
+2-cycles the fixpoint (relax → fold → reset → un-fold). The corpus
+does not exercise it, but a translator must terminate on any input:
+if the fixpoint exceeds 512 passes it disables the relaxation and
+re-runs the un-relaxed fixpoint from scratch, which is
+monotone-decreasing in the fold set and provably terminates.
+
+Why the relaxation is sound where it fires: the scan's constant map at
+the branch is valid on every path into the branch, the branch writes
+no registers, and the branch edge is X's only incoming path — so the
+restored map is valid on every path into X. The deeper structural
+reason this stays sound in the presence of loops is the **once-
+execution property**: X−1 is a terminal (RET or unconditional BR), so
+X can never be re-entered by fall-through, and X has no fold edge
+(the per-scan exclusion) — the unique forward BR is X's ONLY path, so
+X's block executes AT MOST ONCE per call and the restored constants
+are consumed at most once, on the unique BR path, where they hold.
+Any loop that could re-enter X's region would have to pass through
+X−1 (a terminal), which either returns or jumps away; and any
+loop-creating fold derived from X's constants has its target marked,
+which severs the X-derived chain on the next scan (target between X
+and the JMPR) or re-initializes the chain root (target at/before the
+root) — so the shape either oscillates into the cap or self-corrects.
+The relaxation inherits (but does not widen) the pre-existing latent
+gap of the fixpoint: a constant-index fold into a loop whose index is
+loop-variant would be unsound — the corpus avoids such programs and
+four-way parity guards them, exactly as before M2.18; folds fed by
+relaxed constants are one-shot by the once-execution property, so the
+relaxation adds no new exposure. The change is also byte-neutral
+across the pre-existing corpus: the row-by-row diff shows every
+shared row byte-identical (no eligible head among them changed any
+emission — the totals move by exactly the three epi_merge rows).
+
+**epi_merge6 (as pinned).** The same single-edge backward-fold shape
+as epi_merge4/5, but with a **dependent two-op chain** computing the
+index: ADD r4, r2, #2 then SUB r5, r4, #1 → r5 = (3+2)−1 = 4 = T.
+With the relaxation, T+2's block head restores r2 = 3 (the snapshot
+at the pc-3 BR), the chain folds, and the JMPR folds BACKWARD to T
+with both head fetches dropped (flags=3 — the claim count is still
+three, so the invariants are unchanged). Dump-verified: the head is a
+bare `add x11, x9, x10` (zero ldr words), the dead region is
+`add x9, x9, #2; sub x10, x9, #1`, and the fold branches back to the
+head; the tail's fetches evict the computed intermediates and
+re-establish the r2/r1 transients exactly as in the LOADI shapes.
+This closes the §10.44 pin: the joint-fixpoint direction (§10.38) is
+no longer the only path to a two-computed dead region.
+
+### 10.47 M2.18 gate results (measured)
+
+Total emitted bytes across the now-41-program parity set: **M0 55332
+→ M1 50432, 4900 saved** (≈8.9%), up from M2.17-follow-up's 4752.
+The new row on top of 4752:
+
+- epi_merge6 1156 → 1008 (−148, new 41st row; M0 baseline measured
+  at git 1729f50). 148 = the full two-computed dead region folding
+  with both head fetches dropped. Disabling the relaxation grows it
+  back to exactly 1156 (the JMPR dynamic, g_alloc = 0, the whole
+  function naive) — the same 148 the M0 baseline measures, and the
+  probe's pre-fix size. All teeth states still verify 7.
+- Row-by-row accounting (gate tables diffed vs committed 8b61abd):
+  all 38 pre-M2.17 shared rows byte-identical — the totals move by
+exactly the three epi_merge rows (epi_merge4 1012→1004 and
+epi_merge5 1024→1020, M2.17's widening deltas; epi_merge6
+1156→1008, this milestone's relaxation). The relaxation itself is
+byte-neutral across the pre-existing corpus.
+- Four-way parity: interp 43/0, x86 42/0/1, RV64 42/0/1, ARM 42/0/1
+  (the three skips are the pre-existing float_ops RV64/ARM and
+  mem_ops x86 limitations). enc-check clean; jmpr_oob still faults
+  (UDF, rc=1).
+
 ---
 
 ## Sources consulted
