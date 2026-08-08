@@ -3326,6 +3326,68 @@ added, zero moved:
   float/mem skips and the no-expected jmpr_oob are unchanged.
   enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.82 M2.36 — the deferred-arrival-over-flat join (as built)
+
+M2.35 handled the join where the deferred form is the CARRY (sound
+because the carry record is live). The mirror — a flat carry meeting
+a deferred ARRIVAL — stayed UNKNOWN because an arrival record can be
+STALE: its DAG slots may have been written since the product, and
+materializing it would read replaced values (a chain over the wrong
+set could UDF-fault on a true dispatch value). M2.36 adds a
+record-LIVENESS check: `chain_def_live` walks the record's transitive
+DAG and fails if any CD_SLOT leaf was WRITTEN after the record's
+creation pc (tracked via `g_chain_def_pc`, set by
+`chain_def_alloc`, and `g_chain_last_write`, updated at every write
+site — the ar_writes branch, the CALL r0 clobber, and the ENTER
+frame reset). The key soundness observation: head-unions are
+DELIBERATELY not writes — a union only ever widens a slot to a
+SUPERSET of what the record saw (it includes the arrival path's own
+delivery), so materializing over a widened leaf is a sound
+over-approximation; only a WRITE replaces a set and kills the
+record. The keep then applies M2.35's containment in the other
+direction: the flat carry must be contained in the record's
+materialized true set (`chain_flat_in_def_idx`), so the carry path
+contributes nothing new. The liveness + containment together make
+keeping the arrival record EXACT (the union is exactly the record,
+modulo the sound superset widening). No pre-existing program has a
+flat carry meeting a deferred arrival, so the branch is dead for the
+entire M2.35 corpus — strictly additive.
+
+### 10.83 M2.36 gate results (measured)
+
+Total emitted bytes across the now-60-program parity set: **M0
+102084 → M1 86968, 15116 saved** (≈14.8%), up from M2.35's 14608.
+One row added, zero moved:
+
+- jmpr_chain12 3140 → 2632 (−508, new 60th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: index = `(r2 + r3) + r4` over
+  three joins, with the R-arm's `BC r5, J1` (taken at runtime,
+  r5 = 1) delivering the DEFERRED R1 into J1 forward, and the
+  fall-through flat arm (`r1 = #34`, a value inside R1's set)
+  providing the flat carry {34}. R1's 15-value deferred record
+  survives the flat join via liveness + containment, and the in-place
+  second product composes to the thirty candidates `{26..86}`;
+  runtime `(22+32)+32 = 86` takes the chain's thirtieth b.eq
+  (dump-verified: 30 b.eq pairs, first → #100's block, thirtieth →
+  #3000's block). The chain vs table delta is exactly 392 − 244 =
+  +148; the rest of the 508 is the M1 allocator on the 88-instruction
+  body.
+- Teeth: disabling the liveness keep grows jmpr_chain12 back to
+  exactly 2780 (the table path, still correct) — proving the
+  deferred-arrival liveness is what the chain dispatches through,
+  not an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed d3a441d,
+  measured with the M2.35 verifier): **all 59 shared rows
+  byte-identical** — no pre-existing program has a flat carry
+  meeting a deferred arrival, so M2.36 is strictly additive.
+- Four-way parity: 240 PASS, 0 FAIL — all 60 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 30-candidate
+  flat-carry chain executes at runtime on the ARM engine (PASS 3000,
+  runtime index 86 taking the thirtieth b.eq), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted

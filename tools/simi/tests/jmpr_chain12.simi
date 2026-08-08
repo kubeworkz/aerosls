@@ -1,0 +1,150 @@
+; jmpr_chain12.simi — M2.36: the deferred-arrival-over-flat join — the
+; mirror of chain11. The dispatch index is r1 = (r2 + r3) + r4 over a
+; 3-way join (r2 in {2,12,22}), a 5-way join (r3 in {24,26,28,30,32})
+; and a 2-way join (r4 in {0,32}). The R-arm (the product
+; r1 = r2 + r3, FIFTEEN values {26,28,...,54}) is followed by
+; `BC r5, J1` — TAKEN at runtime (r5 = 1) — which delivers the
+; DEFERRED record R1 into the join head J1 (a forward, same-iteration
+; delivery). The fall-through then sets r1 = #34 (a value INSIDE R1's
+; set) and flows into J1 as the flat CARRY {34}. So J1 mixes a flat
+; carry with a DEFERRED arrival — the opposite of chain11's deferred
+; carry vs flat arrival. M2.35 handled only the carry side (sound
+; because the carry record is live); an arrival record can be STALE
+; (its DAG slots written since delivery) and materializing it would
+; read replaced values. M2.36 checks liveness — no write to the
+; record's transitive DAG since its creation (head-unions only widen,
+; a sound superset, so they don't kill it) — and containment: the
+; flat carry {34} is a subset of R1's true set, so the union IS R1 and
+; the deferred form survives. The in-place second product composes R2
+; over the preserved R1 to THIRTY candidates {26,28,...,54,
+; 58,60,...,86}; the gate (244 < 396) emits the 30-pair chain. The
+; runtime index (22 + 32) + 32 = 86 (the BC is taken — r5 == 1 — so
+; the flat arm is dead at runtime) takes the chain's THIRTIETH b.eq,
+; landing on block29's LOADI #3000. The candidates are real pcs
+; (block0..block14 at 26..54, block15..block29 at 58..86), as the
+; chain branches straight to g_instr_off[pc].
+; Expected result: 3000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r5, #1, i64   ; pc 2 — flat-arm BC TAKEN at runtime (r5 = 1)
+    LOADI r4, #0, i64   ; pc 3 — branch-path base (0) — dead at runtime
+    BC r0, J4           ; pc 4 — falls through (delivers {r4:0} at J4)
+    LOADI r4, #32, i64  ; pc 5 — fall-through base (32)
+J4:                     ; (label) — join: r4 in {0, 32}
+    LOADI r2, #2, i64   ; pc 6 — branch-path base (2) — dead at runtime
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:2} at J2)
+    LOADI r2, #12, i64  ; pc 8
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:12} at J2)
+    LOADI r2, #22, i64  ; pc 10 — fall-through base (22)
+J2:                     ; (label) — join: r2 in {2, 12, 22}
+    LOADI r3, #24, i64  ; pc 11
+    BC r0, J3           ; pc 12 — falls through (delivers {r3:24} at J3)
+    LOADI r3, #26, i64  ; pc 13
+    BC r0, J3           ; pc 14 — falls through (delivers {r3:26} at J3)
+    LOADI r3, #28, i64  ; pc 15
+    BC r0, J3           ; pc 16 — falls through (delivers {r3:28} at J3)
+    LOADI r3, #30, i64  ; pc 17
+    BC r0, J3           ; pc 18 — falls through (delivers {r3:30} at J3)
+    LOADI r3, #32, i64  ; pc 19 — fall-through base (32)
+J3:                     ; (label) — join: r3 in {24,26,28,30,32}
+    ADD r1, r2, r3, i64 ; pc 20 — r1 = r2 + r3 in 15 values (26..54 evens) — DEFERS (R1)
+    BC r5, J1           ; pc 21 — TAKEN at runtime (r5 == 1): delivers R1 (deferred) at J1
+    LOADI r1, #34, i64  ; pc 22 — flat arm (dead at runtime): r1 = #34 (a value IN R1)
+J1:                     ; (label) — join: carry {r1:34}, arrival R1 (deferred) — M2.36
+    ADD r1, r1, r4, i64 ; pc 23 — IN-PLACE over the PRESERVED R1: r1 = r1 + r4 in 30 values (nested def)
+    JMPR r1             ; pc 24 — candidates {26,28,...,54, 58,60,...,86}, runtime 86
+    LOADI r0, #0, i32   ; pc 25 — dead filler (aligns block0 to pc 26)
+block0:                 ; pc 26
+    LOADI r0, #100, i32 ; pc 26
+    RET                 ; pc 27
+block1:                 ; pc 28
+    LOADI r0, #200, i32 ; pc 28
+    RET                 ; pc 29
+block2:                 ; pc 30
+    LOADI r0, #300, i32 ; pc 30
+    RET                 ; pc 31
+block3:                 ; pc 32
+    LOADI r0, #400, i32 ; pc 32
+    RET                 ; pc 33
+block4:                 ; pc 34
+    LOADI r0, #500, i32 ; pc 34
+    RET                 ; pc 35
+block5:                 ; pc 36
+    LOADI r0, #600, i32 ; pc 36
+    RET                 ; pc 37
+block6:                 ; pc 38
+    LOADI r0, #700, i32 ; pc 38
+    RET                 ; pc 39
+block7:                 ; pc 40
+    LOADI r0, #800, i32 ; pc 40
+    RET                 ; pc 41
+block8:                 ; pc 42
+    LOADI r0, #900, i32 ; pc 42
+    RET                 ; pc 43
+block9:                 ; pc 44
+    LOADI r0, #1000, i32; pc 44
+    RET                 ; pc 45
+block10:                ; pc 46
+    LOADI r0, #1100, i32; pc 46
+    RET                 ; pc 47
+block11:                ; pc 48
+    LOADI r0, #1200, i32; pc 48
+    RET                 ; pc 49
+block12:                ; pc 50
+    LOADI r0, #1300, i32; pc 50
+    RET                 ; pc 51
+block13:                ; pc 52
+    LOADI r0, #1400, i32; pc 52
+    RET                 ; pc 53
+block14:                ; pc 54
+    LOADI r0, #1500, i32; pc 54
+    RET                 ; pc 55
+    LOADI r0, #0, i32   ; pc 56 — dead filler (aligns block15 to pc 58)
+    LOADI r0, #0, i32   ; pc 57 — dead filler
+block15:                ; pc 58
+    LOADI r0, #1600, i32; pc 58
+    RET                 ; pc 59
+block16:                ; pc 60
+    LOADI r0, #1700, i32; pc 60
+    RET                 ; pc 61
+block17:                ; pc 62
+    LOADI r0, #1800, i32; pc 62
+    RET                 ; pc 63
+block18:                ; pc 64
+    LOADI r0, #1900, i32; pc 64
+    RET                 ; pc 65
+block19:                ; pc 66
+    LOADI r0, #2000, i32; pc 66
+    RET                 ; pc 67
+block20:                ; pc 68
+    LOADI r0, #2100, i32; pc 68
+    RET                 ; pc 69
+block21:                ; pc 70
+    LOADI r0, #2200, i32; pc 70
+    RET                 ; pc 71
+block22:                ; pc 72
+    LOADI r0, #2300, i32; pc 72
+    RET                 ; pc 73
+block23:                ; pc 74
+    LOADI r0, #2400, i32; pc 74
+    RET                 ; pc 75
+block24:                ; pc 76
+    LOADI r0, #2500, i32; pc 76
+    RET                 ; pc 77
+block25:                ; pc 78
+    LOADI r0, #2600, i32; pc 78
+    RET                 ; pc 79
+block26:                ; pc 80
+    LOADI r0, #2700, i32; pc 80
+    RET                 ; pc 81
+block27:                ; pc 82
+    LOADI r0, #2800, i32; pc 82
+    RET                 ; pc 83
+block28:                ; pc 84
+    LOADI r0, #2900, i32; pc 84
+    RET                 ; pc 85
+block29:                ; pc 86
+    LOADI r0, #3000, i32; pc 86
+    RET                 ; pc 87

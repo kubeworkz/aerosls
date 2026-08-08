@@ -507,6 +507,8 @@ struct ChainSet {
 struct ChainBig { uint8_t n, unk; uint32_t v[TX_AR_CHAIN_BIG]; };
 static struct ChainDef g_chain_defs[TX_AR_CHAIN_DEFS];
 static int      g_chain_ndef;      /* M2.32: pool cursor, reset each walk iteration */
+static uint32_t g_chain_def_pc[TX_AR_CHAIN_DEFS];   /* M2.36: the walk pc where each record was created */
+static int32_t  g_chain_last_write[TX_AR_CHAIN_REGS]; /* M2.36: last WRITE pc per tracked slot (per iteration, -1 = never) */
 static uint32_t g_chain_cand[TX_AR_CHAIN_BIG];
 static struct ChainBig g_chain_bigsnap;
 static int      g_chain_ncand;
@@ -1060,10 +1062,11 @@ static int64_t chain_alu_eval(uint8_t op, int64_t av, int64_t bv) {
  * on pool exhaustion — the caller falls back to UNKNOWN (conservative).
  * The pool is reset at the top of every walk iteration, so the indices
  * stored in cur[].def are valid only within one iteration. */
-static int chain_def_alloc(uint8_t op, uint8_t ka, int32_t a, uint8_t kb, int32_t b) {
+static int chain_def_alloc(uint8_t op, uint8_t ka, int32_t a, uint8_t kb, int32_t b, uint32_t pc) {
     if (g_chain_ndef >= TX_AR_CHAIN_DEFS) return -1;
     struct ChainDef* d = &g_chain_defs[g_chain_ndef];
     d->op = op; d->ka = ka; d->a = a; d->kb = kb; d->b = b;
+    g_chain_def_pc[g_chain_ndef] = pc;   /* M2.36: the record's value is fixed at this instruction */
     return g_chain_ndef++;
 }
 /* M2.32: does the record DAG rooted at rec transitively reference any
@@ -1186,6 +1189,40 @@ static int chain_flat_in_def(const struct ChainSet* cur, int16_t slot, const str
     if (f->unk || f->n == 0) return 0;
     struct ChainBig rb;
     chain_flatten_big(&rb, cur, slot);
+    if (rb.unk) return 0;
+    uint8_t i = 0, j = 0;
+    while (i < f->n && j < rb.n) {
+        if (f->v[i] == rb.v[j]) { i++; j++; }
+        else if (f->v[i] < rb.v[j]) return 0;
+        else j++;
+    }
+    return i == f->n;
+}
+/* M2.36: is the deferred record `rec` still LIVE at the current head —
+ * was no tracked slot in its transitive DAG WRITTEN after the record's
+ * creation pc? This is what makes materializing a deferred ARRIVAL
+ * sound: a write REPLACES a slot's set, so a written DAG leaf would
+ * materialize a WRONG set (missing true values -> the chain could
+ * UDF-fault). Head-unions are deliberately NOT writes: a union only
+ * ever widens a slot to a SUPERSET of what the record saw (it includes
+ * the arrival path's own delivery), so materializing over a widened
+ * leaf is a sound over-approximation. */
+static int chain_def_live(int16_t rec) {
+    const struct ChainDef* d = &g_chain_defs[rec];
+    if ((d->ka == CD_SLOT && g_chain_last_write[d->a] > (int32_t)g_chain_def_pc[rec]) ||
+        (d->kb == CD_SLOT && g_chain_last_write[d->b] > (int32_t)g_chain_def_pc[rec])) return 0;
+    if (d->ka == CD_REC && !chain_def_live(d->a)) return 0;
+    if (d->kb == CD_REC && !chain_def_live(d->b)) return 0;
+    return 1;
+}
+/* M2.36: is the flat set f contained in the true set of the deferred
+ * record `rec` — a def INDEX, not necessarily in cur[] (the
+ * deferred-ARRIVAL case)? Materialize the record BIG directly over cur
+ * (only sound when chain_def_live(rec) held) and check containment. */
+static int chain_flat_in_def_idx(const struct ChainSet* cur, int16_t rec, const struct ChainSet* f) {
+    if (f->unk || f->n == 0) return 0;
+    struct ChainBig rb;
+    chain_flatten_big_rec(&rb, cur, rec);
     if (rb.unk) return 0;
     uint8_t i = 0, j = 0;
     while (i < f->n && j < rb.n) {
@@ -2606,6 +2643,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                     for (int iter = 0; changed && iter < 64; iter++) {
                         changed = 0;
                         g_chain_ndef = 0;   /* M2.32: the def-record pool is per-iteration */
+                        for (int s = 0; s < ntr; s++) g_chain_last_write[s] = -1;   /* M2.36 */
                         struct ChainSet cur[TX_AR_CHAIN_REGS];
                         for (int s = 0; s < ntr; s++) { cur[s].n = 0; cur[s].unk = 1; cur[s].def = -1; }  /* entry: opaque */
                         int carry = 1;                  /* pc 0 is reached from the trampoline */
@@ -2617,27 +2655,34 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                 /* block head: union of the fall-through
                                  * carry (only if pc-1 falls through) and
                                  * the branch deliveries, per tracked slot.
-                                 * M2.30/M2.34/M2.35: a DEFERRED carry's
-                                 * true set always exceeds the flat cap, so
-                                 * the union is UNKNOWN unless the arrival
-                                 * is the SAME record — every path carries
-                                 * the same product, the union is a no-op,
-                                 * and the deferred form crosses the join
-                                 * (the head-union no longer flattens what
-                                 * it preserves). The same-record check is
-                                 * sound: the carry record is live (any
-                                 * write to its DAG would have invalidated
-                                 * cur[]), so an equal-index delivery —
-                                 * made after the product — is live too.
-                                 * M2.35 adds the FLAT-arrival case: when
-                                 * the flat path contributes only values
-                                 * the record already has, the union is
-                                 * still exactly the record, so the
-                                 * deferred form survives the join (the
-                                 * containment test materializes the LIVE
-                                 * carry record — sound for the same
-                                 * reason). Anything else with a record on
-                                 * either side collapses to UNKNOWN. */
+                                 * M2.30/M2.34/M2.35/M2.36: a DEFERRED
+                                 * carry's true set always exceeds the flat
+                                 * cap, so the union is UNKNOWN unless the
+                                 * arrival is the SAME record — every path
+                                 * carries the same product, the union is a
+                                 * no-op, and the deferred form crosses the
+                                 * join (the head-union no longer flattens
+                                 * what it preserves). The same-record
+                                 * check is sound: the carry record is
+                                 * live (any write to its DAG would have
+                                 * invalidated cur[]), so an equal-index
+                                 * delivery — made after the product — is
+                                 * live too. M2.35 adds the FLAT-arrival
+                                 * case against a deferred carry: when the
+                                 * flat path contributes only values the
+                                 * record already has, the union is still
+                                 * exactly the record (the containment
+                                 * test materializes the LIVE carry record
+                                 * — sound for the same reason). M2.36
+                                 * adds the mirror — a deferred ARRIVAL
+                                 * against a flat carry — gated on the
+                                 * record-LIVENESS check (no write to its
+                                 * transitive DAG since creation; only
+                                 * writes replace a set, head-unions only
+                                 * widen, a sound superset) plus the same
+                                 * containment. Anything else with a
+                                 * record on either side collapses to
+                                 * UNKNOWN. */
                                 for (int s = 0; s < ntr; s++) {
                                     /* M2.35: only a DIFFERENT deferred
                                      * arrival unknowns a deferred carry
@@ -2671,7 +2716,29 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                         chain_unknown(&cur[s]);
                                         continue;
                                     }
-                                    if (g_chain_arr[s][pc].def >= 0) { chain_unknown(&cur[s]); continue; }    /* record arrival vs flat carry: > 12 */
+                                    if (g_chain_arr[s][pc].def >= 0) {
+                                        /* M2.36: a deferred ARRIVAL meets a
+                                         * flat carry — the mirror of M2.35.
+                                         * The union is still the record
+                                         * when (a) the record is LIVE — no
+                                         * write to its transitive DAG since
+                                         * its creation (a write REPLACES a
+                                         * leaf, so materializing over it
+                                         * would be a wrong set; head-unions
+                                         * only widen, a sound superset) —
+                                         * and (b) the flat carry is
+                                         * contained in the record's true
+                                         * set (the carry path contributes
+                                         * nothing new). */
+                                        if (cur[s].def < 0 && !cur[s].unk &&
+                                            chain_def_live(g_chain_arr[s][pc].def) &&
+                                            chain_flat_in_def_idx(cur, g_chain_arr[s][pc].def, &cur[s])) {
+                                            cur[s] = g_chain_arr[s][pc];
+                                            continue;
+                                        }
+                                        chain_unknown(&cur[s]);
+                                        continue;
+                                    }
                                     chain_merge(&cur[s], &g_chain_arr[s][pc]);
                                 }
                             }
@@ -2692,7 +2759,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                 g_chain_bigsnap = *c;
                             }
                             if (op == OP_ENTER) {
-                                for (int s = 0; s < ntr; s++) chain_unknown(&cur[s]);  /* fresh frame */
+                                for (int s = 0; s < ntr; s++) { chain_unknown(&cur[s]); g_chain_last_write[s] = (int32_t)pc; }  /* fresh frame */
                                 carry = 1;
                             } else if (op == OP_RET) {
                                 carry = 0;                /* terminal */
@@ -2720,6 +2787,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                 if (g_chain_slot[0] >= 0) {
                                     chain_prewrite(cur, ntr, g_chain_slot[0]);
                                     chain_unknown(&cur[g_chain_slot[0]]);
+                                    g_chain_last_write[g_chain_slot[0]] = (int32_t)pc;   /* M2.36 */
                                 }
                                 carry = 1;
                             } else if (op == OP_JMPR) {
@@ -2735,6 +2803,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                        g_chain_slot[rd] >= 0) {
                                 int s = g_chain_slot[rd];
                                 chain_prewrite(cur, ntr, s);   /* M2.30: flatten deferred forms that read this slot */
+                                g_chain_last_write[s] = (int32_t)pc;   /* M2.36: this pc is the slot's last write */
                                 if (op == OP_LOADI) {
                                     chain_singleton(&cur[s], (uint32_t)w_imm28(w));
                                 } else if (op == OP_LOADI64) {
@@ -2791,7 +2860,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                             int32_t oa = da ? (int32_t)cur[s_a].def : (int32_t)s_a;
                                             uint8_t kb = db ? CD_REC : CD_SLOT;
                                             int32_t ob = db ? (int32_t)cur[s_b].def : (int32_t)s_b;
-                                            int ri = chain_def_alloc(op, ka, oa, kb, ob);
+                                            int ri = chain_def_alloc(op, ka, oa, kb, ob, pc);
                                             if (ri < 0) chain_unknown(&cur[s]);
                                             else { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; }
                                         }
@@ -2805,7 +2874,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                          * The source is referenced as its
                                          * immutable record (in-place or not —
                                          * a record ref is safe either way). */
-                                        int ri = chain_def_alloc(op, CD_REC, (int32_t)cur[s_a].def, CD_IMM, (int32_t)w_imm28(w));
+                                        int ri = chain_def_alloc(op, CD_REC, (int32_t)cur[s_a].def, CD_IMM, (int32_t)w_imm28(w), pc);
                                         if (ri < 0) chain_unknown(&cur[s]);
                                         else { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; }
                                     } else {
@@ -2828,7 +2897,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                         if (!use_imm && cur[s].unk && s_a >= 0 && s_b >= 0 &&
                                             !sa->unk && !sb->unk &&
                                             rd != w_ra(w) && rd != w_rb_reg(w)) {
-                                            int ri = chain_def_alloc(op, CD_SLOT, (int16_t)s_a, CD_SLOT, (int16_t)s_b);
+                                            int ri = chain_def_alloc(op, CD_SLOT, (int16_t)s_a, CD_SLOT, (int16_t)s_b, pc);
                                             if (ri < 0) chain_unknown(&cur[s]);
                                             else { cur[s].def = (int16_t)ri; cur[s].n = 0; cur[s].unk = 0; }
                                         }
