@@ -259,7 +259,27 @@
 # directly into the target) — 152 bytes below its M0 baseline, and
 # disabling the analysis grows it back to exactly 2036 (the JMPR
 # dynamic, g_alloc = 0, runtime dispatch table + bounds check), still
-# correct. jmpr_cross is
+# correct. jmpr_callret_arg is
+# M2.20: the call-site-aware extension of M2.19. The leaf returns
+# arg0 + arg1 — a value computed from its ARGS, which the M2.19
+# per-callee analysis (args unknown under the fresh-frame map)
+# conservatively could not fold. M2.20 runs the same ar_const_step body
+# walk AT EACH CALL SITE, seeding the scratch map's r0-r7 from the
+# CALLER's constant map: the emitted call site marshals r0-r7 from the
+# caller's frame (and the interpreter copies them), so a known constant
+# argument is a known constant inside the leaf. TWO call sites to the
+# SAME leaf pin the per-site dependence: main passes 3 + 5 = 8 (JMPR
+# folds to pc 8), other passes 8 + 10 = 18 (JMPR folds to pc 18); both
+# are REAL branches (unreachable filler at pc 7 / pc 17, so neither
+# target is pc+1 and the coalescing pre-pass does not fire), and both
+# folds are load-bearing — g_alloc requires EVERY JMPR in the stream
+# to fold, so if either call site failed, the whole program would go
+# naive. The precompute shrinks to a per-callee LEAF MARKER
+# (ar_leaf_ret_pc — ENTER start, straight-line, first RET), and the
+# args-unknown case is just the all-unknown seed, so jmpr_callret is
+# byte-identical. 328 bytes below its M0 baseline, and disabling the
+# arg seeding grows it back to exactly 3344 (both JMPRs dynamic,
+# g_alloc = 0, whole function naive), still correct. jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -330,7 +350,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

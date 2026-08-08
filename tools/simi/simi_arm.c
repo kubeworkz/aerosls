@@ -585,43 +585,38 @@ static void ar_const_step(uint64_t w, uint32_t num_literals, const uint64_t* lit
         known[rd] = 0;   /* every other register-writing opcode breaks the constant */
     }
 }
-/* M2.19: analyze a straight-line leaf callee's return value. The callee
- * starts with ENTER at T (the emitted prologue zeroes the frame, matching
- * the interpreter's fresh-frame CALL — a callee without ENTER reads the
- * caller's stale frame in the emitted code and is not analyzable), contains
- * no BR/BC/JMPR/CALL, and terminates at its first RET; r0 at that RET must
- * be a compile-time constant under the fresh-frame map (r0-r7 = the
- * caller's args — unknown, since the analysis is per-callee; r8+ = 0,
- * zeroed by the prologue). Returns the constant, or -1 when not analyzable.
- * The caller's r0 after the call is then that constant, so a JMPR keyed on
- * the RETURN VALUE folds. */
-static int64_t ar_callee_r0_const(const uint64_t* instrs, uint32_t num_instr,
-                                  uint32_t num_literals, const uint64_t* literals,
-                                  uint32_t T) {
+/* M2.20: is the function at T an analyzable straight-line leaf? Starts
+ * with ENTER at T (the emitted prologue zeroes the frame, matching the
+ * interpreter's fresh-frame CALL — a callee without ENTER reads the
+ * caller's stale frame in the emitted code and is not analyzable),
+ * contains no BR/BC/JMPR/CALL and no mid-body ENTER (M2.19 reviewer
+ * hardening: a mid-body ENTER would mean the region overlaps another
+ * function's prologue, and the fixpoint's own OP_ENTER semantics is a
+ * full constant-map reset) before its FIRST RET. Returns that RET's pc,
+ * or -1 when the callee is not analyzable. The per-call-site BODY
+ * analysis (what r0 is at the RET) lives in the fixpoint scan, which
+ * seeds a scratch map from the CALLER's argument constants at the call
+ * (M2.20) — or leaves them unknown (M2.19's per-callee analysis, the
+ * args-unknown special case). */
+static int ar_leaf_ret_pc(const uint64_t* instrs, uint32_t num_instr, uint32_t T) {
     if (w_op(instrs[T]) != OP_ENTER) return -1;
-    uint8_t  known[TX_AR_MAX_REGS];
-    uint64_t val[TX_AR_MAX_REGS];
-    for (int i = 0; i < 8; i++) known[i] = 0;                       /* args: unknown */
-    for (int i = 8; i < TX_AR_MAX_REGS; i++) { known[i] = 1; val[i] = 0; }  /* zeroed frame */
-    for (uint32_t pc = T; pc < num_instr; pc++) {
-        uint64_t w = instrs[pc];
-        uint8_t op = w_op(w);
-        /* Only the LEADING ENTER (pc == T) is legal: the seeding already
-         * models the zeroed frame. A mid-body ENTER would mean the region
-         * overlaps another function's prologue, and the fixpoint's own
-         * OP_ENTER semantics is a full constant-map reset — reject it so
-         * the analysis never attributes a constant the runtime would not
-         * honor (M2.19 reviewer hardening). */
-        if (op == OP_ENTER) { if (pc != T) return -1; continue; }
-        if (op == OP_RET) return known[0] ? (int64_t)val[0] : -1;
+    for (uint32_t pc = T + 1; pc < num_instr; pc++) {
+        uint8_t op = w_op(instrs[pc]);
+        if (op == OP_ENTER) return -1;
+        if (op == OP_RET) return (int)pc;
         if (op == OP_BR || op == OP_BC || op == OP_JMPR || op == OP_CALL) return -1;
-        ar_const_step(w, num_literals, literals, known, val);
     }
     return -1;   /* no RET before the end of the stream */
 }
-/* M2.19: per-CALL-pc leaf return-value constant (-1 = unknown/not a
- * leaf). Keyed by the CALL site, precomputed before the fixpoint. */
-static int64_t g_call_r0_const[4096];
+/* M2.20: per-callee-ENTRY straight-line leaf marker (the RET pc, or -1
+ * when the callee at that pc is not analyzable). Precomputed before the
+ * fixpoint; the scan's CALL branch runs the body analysis with a scratch
+ * map seeded from the CALLER's constants. The scratch map is file-scope
+ * (like g_relax_snap_*) — transient per-CALL-per-pass state, hoisted to
+ * avoid stack churn on every CALL in every scan pass. */
+static int g_call_leaf_ret[4096];
+static uint8_t  g_call_arg_known[TX_AR_MAX_REGS];
+static uint64_t g_call_arg_val[TX_AR_MAX_REGS];
 /* M2.11: run-reuse tables. g_run_first/g_run_cont mark the head pc and the
  * continuation pcs of a maximal straight-line run of LOAD/STORE that share
  * ONE displacement past the imm12 range — the displacement is materialized
@@ -1735,19 +1730,18 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         if (is_entry) continue;   /* the trampoline edge guarantees nothing */
         g_relax_ok[X] = 1;
     }
-    /* M2.19: leaf-callee return-value analysis, precomputed per CALL
-     * site. A JMPR keyed on the return value of an analyzable leaf folds
-     * because the caller's r0 after the call is that constant. The
-     * analysis is per-callee with the args unknown, so every call site
-     * of the same leaf gets the same (correct) constant. */
-    for (uint32_t q = 0; q < 4096; q++) g_call_r0_const[q] = -1;
+    /* M2.20: leaf-callee marker, precomputed per CALL TARGET. Whether the
+     * callee is an analyzable straight-line leaf is a property of the
+     * callee alone (M2.19 computed the args-unknown constant per call
+     * SITE; M2.20 moves the body analysis into the scan so each site can
+     * seed the callee's r0-r7 with ITS OWN caller-side constants). */
+    for (uint32_t q = 0; q < 4096; q++) g_call_leaf_ret[q] = -1;
     for (uint32_t P = 0; P < hdr.num_instr; P++) {
         uint64_t wP = instrs[P];
         if (w_op(wP) != OP_CALL) continue;
         int64_t tgt = (int64_t)P + 1 + w_imm28(wP);
         if (tgt < 0 || tgt >= (int64_t)hdr.num_instr) continue;
-        g_call_r0_const[P] = ar_callee_r0_const(instrs, hdr.num_instr,
-                                                hdr.num_literals, literals, (uint32_t)tgt);
+        g_call_leaf_ret[(uint32_t)tgt] = ar_leaf_ret_pc(instrs, hdr.num_instr, (uint32_t)tgt);
     }
     /* M2: constant-index JMPR folding, by fixpoint. Each scan walks the
      * linear stream with a per-register constant map that resets at every
@@ -1818,16 +1812,47 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                 if (g_jmpr_fold[pc] >= 0 && g_jmpr_fold[pc] != (int)(pc + 1))
                     g_fold_tgt_prev[(uint32_t)g_jmpr_fold[pc]] = 1;   /* M2.18: live fold-target exclusion */
             } else if (op == OP_CALL) {
-                /* M2.19: the return value. The fresh-frame model (the
-                 * interpreter zeroes the callee's frame, copies r0-r7 as
-                 * args, and on RET only r0 propagates back) means the
+                /* M2.19/M2.20: the return value. The fresh-frame model
+                 * (the interpreter zeroes the callee's frame, copies r0-r7
+                 * as args, and on RET only r0 propagates back) means the
                  * caller's other registers are structurally preserved by
                  * the call — r0 is the callee's return value, unknown
-                 * unless the callee is an analyzable leaf. */
-                g_const_known[0] = 0;
-                if (g_call_r0_const[pc] >= 0) {
-                    g_const_known[0] = 1;
-                    g_const_val[0] = (uint64_t)g_call_r0_const[pc];
+                 * unless the callee is an analyzable leaf. M2.20 seeds the
+                 * callee's ARGS from the CALLER's constant map at the call
+                 * site: the emitted call site marshals r0-r7 from the
+                 * caller's frame (and the interpreter copies them), so a
+                 * known constant argument is a known constant inside the
+                 * leaf, and a leaf that returns a function of its constant
+                 * arguments folds. The scratch map's r0-r7 come from the
+                 * caller (known constants or unknown); r8+ = 0, zeroed by
+                 * the leaf's ENTER prologue. The walk is re-run every scan
+                 * pass — deterministic, and cheap: the leaf is rejected
+                 * upfront unless it is straight-line. */
+                int64_t tgt = (int64_t)pc + 1 + w_imm28(w);
+                if (tgt >= 0 && tgt < (int64_t)hdr.num_instr) {
+                    int ret = g_call_leaf_ret[(uint32_t)tgt];
+                    /* A leaf's RET pc is always >= T+1 >= 1, so > 0
+                     * distinguishes the -1 sentinel (not a leaf). */
+                    if (ret > 0) {
+                        /* Snapshot the caller's map for the args BEFORE
+                         * clearing r0 below: arg0 is the caller's r0 at the
+                         * call, and the clear models the return value — the
+                         * M2.18 lesson (snapshot before the clear that
+                         * overwrites it) applies to the argument seeding. */
+                        for (int i = 0; i < 8; i++) {
+                            g_call_arg_known[i] = g_const_known[i];
+                            g_call_arg_val[i] = g_const_val[i];
+                        }
+                        for (int i = 8; i < TX_AR_MAX_REGS; i++) { g_call_arg_known[i] = 1; g_call_arg_val[i] = 0; }
+                        for (uint32_t q = (uint32_t)tgt + 1; q < (uint32_t)ret; q++)
+                            ar_const_step(instrs[q], hdr.num_literals, literals, g_call_arg_known, g_call_arg_val);
+                        if (g_call_arg_known[0]) { g_const_known[0] = 1; g_const_val[0] = g_call_arg_val[0]; }
+                        else                    { g_const_known[0] = 0; }
+                    } else {
+                        g_const_known[0] = 0;   /* not a leaf: the return value is unknown */
+                    }
+                } else {
+                    g_const_known[0] = 0;   /* out-of-range call target: unknown */
                 }
             } else {
                 ar_const_step(w, hdr.num_literals, literals, g_const_known, g_const_val);
