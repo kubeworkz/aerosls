@@ -122,8 +122,9 @@ cache for a pure constant).
 - **F2 — LANDED** — the fold/allocator interaction: confirm the integer
   corpus's byte identity holds (D6's scoping means the chain machinery is
   untouched), and add `a64_enc_check.py` rows for the new encoders.
-- **F3** — unskip `float_ops` on ARM: four-way parity (interp / x86 / RV64-skip /
-  ARM), enc-check clean, gate re-measure, doc §16 Phase 10 addendum (A64 landed).
+- **F3 — LANDED** — unskip `float_ops` on ARM: four-way parity (interp / x86 /
+  RV64-skip / ARM), enc-check clean, gate re-measure, doc §16 Phase 10
+  addendum (A64 landed).
 - **F4 (deferred, rides Phase 9)** — RV64 float codegen per Phase 10 D6 (the
   `sstatus.FS` lazy-save mechanism), a separate later pass, not this plan's work.
 
@@ -260,6 +261,33 @@ The evidence, all measured:
   contiguous chains). Size gate byte-identical (78/78, 26404 saved —
   simi_arm.c untouched), ARM suite 77/77, interp 79/79, x86 native
   78/78, RV64 77/77, `a64-f0-test` PASS, float_ops on ARM = 15 at 2156.
+
+### 3.4 F3 status — LANDED (float_ops runs on ARM; four-way parity)
+
+F3 is done: the ARM runner un-skips `float_ops`, and the float program now
+has a genuine four-way execution parity. The evidence, all measured:
+
+- **The un-skip** — `tests/run_arm_tests.sh` removes the `float_ops`
+  skip case and its header rationale (M0-era "scoped out" text),
+  replacing it with the F1/F2 story: simi_arm.c emits real IEEE-754
+  words, a64_exec.c decodes/executes them, so ARM joins the float
+  parity. The runner is now 78 passed / 0 failed / 3 skipped (the
+  standing cap_forge_debug, jmpr_oob, and mem_ops skips).
+- **The four-way parity** — the SAME `.tmo` and SAME `Expected result:
+  15`: interpreter → 15; real x86-64 JIT (SSE, Phase 10 codegen) → 15
+  at 2426 bytes; A64 executor → 15 at 2156 bytes; RV64 → its expected
+  explicit rejection (`TX_RV_ERR_FLOAT_UNSUPPORTED`, scoped out of
+  Phase 10 v1 — the documented fourth leg, not a regression). Every
+  arithmetic result, all 17 checks, and the three NaN unordered-compare
+  cases agree across the engines that execute it.
+- **No regression** — size gate byte-identical (78/78, 26404 saved —
+  simi_arm.c untouched; the runner change is test-side only), interp
+  79/79, x86 native 78/78 (float_ops among them), RV64 77/77, enc-check
+  clean, `a64-f0-test` PASS.
+- **ISA doc §16 Phase 10 addendum** — records the A64 landing (F0-F3)
+  next to the x86/interpreter findings: the GP-bounce, the sign-XOR
+  NEG, the D5 swapped-operand CMP, the two permanent rejection
+  boundaries, and the four-engine parity numbers.
 
 ## 4. Honest verification caveats
 

@@ -10,12 +10,15 @@
 # .tmo files and SAME expected values, proving the same unmodified SIMI
 # object retargets correctly to a third ISA.
 #
-# mem_ops.simi and float_ops.simi are skipped for the same reasons
-# run_riscv_tests.sh skips them: address-0 is a Phase 1 interpreter-only
-# convenience, and float codegen is scoped out of M0 (simi_arm.c is
-# expected to reject every float-typed instruction with
-# TX_AR_ERR_FLOAT_UNSUPPORTED, not produce a wrong numeric answer — see
-# tests/float_ops.simi's own top comment and the ISA doc §16 Phase 10).
+# mem_ops.simi is skipped for the same reason run_riscv_tests.sh skips
+# it: address-0 is a Phase 1 interpreter-only convenience (see
+# mem_ops_native). float_ops.simi RAN starting at F3: simi_arm.c's F1
+# float codegen (GP-bounce ADD/SUB/MUL/DIV/NEG/CMP, D5 swapped-operand
+# fcmp+cset) emits real IEEE-754 words and the A64 executor decodes and
+# executes them (F0), so the ARM engine now joins interp/x86 in the
+# float four-way parity — the same .tmo, the same Expected result: 15.
+# (RV64 still skips it: float is scoped out of Phase 10 v1 there, an
+# explicit rejection, per the ISA doc §16 and run_riscv_tests.sh.)
 # jmpr_oob.simi self-skips via the "no Expected result:" rule below (its
 # whole point is that execution must NOT produce one — the translator
 # lands on UDF #0, which a64_exec.c reports as a fault).
@@ -35,12 +38,6 @@ for src in *.simi; do
         skip=$((skip+1))
         continue
     fi
-    if [ "$name" = "float_ops" ]; then
-        echo "SKIP  $name (A64 float codegen scoped out of M0; see simi_arm.h's TX_AR_ERR_FLOAT_UNSUPPORTED)"
-        skip=$((skip+1))
-        continue
-    fi
-
     expected=$(grep -oE 'Expected result: -?[0-9]+' "$src" | grep -oE -- '-?[0-9]+$')
     if [ -z "$expected" ]; then
         echo "SKIP  $name (no 'Expected result:' comment)"

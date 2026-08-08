@@ -431,6 +431,27 @@ This changes the shape of the work: it's not "port three x86-coupled files," it'
 
 **Verification.** A new self-checking test program, `tools/simi/tests/float_ops.simi`, exercises `ADD`/`SUB`/`MUL`/`DIV`/`NEG` under both `T_F64` and `T_F32`, plus all four ordered `CMP` relations and reflexive `EQ`/`NE`, summing seventeen individual pass/fail checks (each a `CMP` result) into one `i32` total via plain integer `ADD` — chosen so a single `Expected result: 15` comment can catch a wrong answer anywhere in the chain without needing one test file per operation, matching this project's existing test-fixture style. Three of the seventeen checks specifically exercise IEEE-754 NaN unordered-compare semantics (`EQ`/`NE`/`LT` against a raw `0x7FF8000000000000` quiet-NaN bit pattern loaded via plain `i64` `LOADI64` and reinterpreted by the `CMP` itself) — `EQ`/`LT` both correctly resolve false and `NE` correctly resolves true, the concrete proof the unordered-compare codegen (interpreter's native C operators; x86's `UCOMISD` operand-swap scheme) is right, not just "doesn't crash." Result: **15 on both the interpreter (`make test`) and the real x86-64 JIT harness (`make test-native`)** — every arithmetic result, relation, and NaN case bit-identical between the two, independently cross-checked against Python's own `struct.pack`/`struct.unpack` IEEE bit patterns during development. `make test-riscv` shows 11 passed, 0 failed, 3 skipped (the pre-existing `mem_ops`/`cap_forge_debug` skips plus the new, expected `float_ops` skip) — no regression. Float `MOD` and `FLAG_IMM`+float were independently confirmed to fail cleanly with the new `TX_ERR_FLOAT_UNSUPPORTED` error, not silently misexecute. A full 76-file kernel compile-check sweep (every file in the Makefile's `X86_C_SRC` list, compiled individually under the exact `X86_CFLAGS` including `-mno-sse -mno-sse2 -mno-mmx`) is clean — zero errors across all 76, and zero warnings in every file touched this phase (`kernel/simi_x86.c`, `arch/x86/idt.c`, `kernel/stubs.c`, `arch/x86/lazy_fpu.c`) — confirming the float translator's hand-emitted SSE2 byte sequences compile correctly into a file that itself builds under strict `-mno-sse`, with zero new C `double`/`float` types introduced anywhere in `kernel/simi_x86.c`, exactly as decision 1's constraint required.
 
+**A64 (the ARM backend) landed the same Phase 10 float support — F0/F1/F2/F3 of
+Gap Remediation's float plan, recorded in full in
+`docs/AeroSLS-SIMI-Float-Atomics-Plan-v0.1.md` §3.** `simi_arm.c` (F1) emits
+real IEEE-754 codegen: the D4 GP-bounce (operand bits through d0/s0+d1/s1 via
+`fmov`, compute, result back into the reserved cache host), NEG as a sign-bit
+XOR through the integer cache (no float instruction — the x86 finding repeated),
+and CMP per the D5 finding — EQ/NE/LT/LE as `fcmp(a,b)`+`cset`, GT/GE as the
+swapped-operand `fcmp(b,a)`+`cset lt/le`, because a single `cset gt/ge` is wrong
+on NaN (unordered yields N=1,Z=0,C=1,V=1, so `!Z && N==V` and `N==V` are both
+true). The M0-era blanket rejection narrows to the two permanent boundaries
+(float MOD, float-with-immediate); bitwise/shift ops on raw bits stay allowed,
+matching the interpreter. `a64_exec.c` (F0) decodes/executes the same family
+via a distinct `f[32]` SIMD&FP file, with encodings verified bit-for-bit
+against QEMU's `a64.decode`; `a64_enc_check.py` (F2) independently re-encodes
+all fourteen float classes with expected constants derived from Python's own
+IEEE-754. `float_ops.simi` now runs on all four engines' execution paths: **15
+on interp, 15 on the real x86-64 JIT, 15 on the A64 executor** (2156 bytes), and
+RV64's expected explicit rejection (`TX_RV_ERR_FLOAT_UNSUPPORTED`) stays the
+fourth leg of the parity (deferred per decision 6, riding Phase 9). The ARM
+runner (`tests/run_arm_tests.sh`) un-skipped `float_ops` at F3.
+
 ### Phase 11: Real register allocation — concrete design
 
 **The gap, confirmed.** A direct read of `kernel/simi_x86.c` confirms every symbolic register is an rbp-relative stack slot (§ "rbp-relative symbolic register slot helpers"), loaded before and stored after every use, with no exceptions — the file's own reserved-usage registers are `rax`/`rdx` (hardwired by the `MUL`/`DIV` lowering idiom, which needs the x86 `mul`/`div` instructions' fixed operand positions) and an explicit `r10`/`r11` scratch pair (used for the "save value, do a thing, bring it back" idiom the tag-check codegen already relies on). Every other GP register sits unused for the entire duration of translated code.
