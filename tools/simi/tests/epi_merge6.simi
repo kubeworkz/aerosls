@@ -1,0 +1,32 @@
+; epi_merge6.simi — M2.18: the TWO-COMPUTED epi-merge dead region. Both
+; dead-region intermediates (T+2 and T+3) are arithmetic — a DEPENDENT
+; chain ADD r4, r2, #2 then SUB r5, r4, #1 — instead of LOADI seeds, so
+; the fold index r5 = (3 + 2) - 1 = 4 = T is computed, not loaded. The
+; M2.17 widening already accepts the ops; what blocked the shape is the
+; constant fixpoint: pc 6 (T+2) is the fold-source BR target (a block
+; head), so it resets every constant and the seed r2 = 3 from pc 1 does
+; not survive — the chain breaks, the JMPR goes dynamic, and g_alloc
+; dies (the whole function fell back to the naive path). M2.18's
+; targeted fixpoint relaxation fixes the reset: a head pc whose ONLY
+; incoming path is a single forward BR/BC (X-1 is a terminal, so the
+; fall-through is dead; not an entry; not a fold target) is not a join —
+; the scan restores the constant map as it was at that branch instead of
+; resetting. The epi-merge invariants are unchanged (the claim count is
+; still three, so the tail's result host stays cnt%3 = 2 = x11 and both
+; head fetches drop): the head is a bare add, the dead region computes
+; the index, the fold's flush leaves the r2/r1 transients alive.
+; Expected result: 7 (r0 = r2 + r1 = 3 + 4).
+.entry main
+main:
+    ENTER #8
+    LOADI r2, #3, i64        ; pc 1 — the pattern's first source (r2 = 3)
+    LOADI r1, #4, i64        ; pc 2 — the pattern's second source (r1 = 4)
+    BR src                   ; pc 3 — T-1: terminal, jumps INTO the fold source
+target:                      ; pc 4 = T — reached only via the fold at pc 9
+    ADD r0, r2, r1, i64      ; pc 4 — the pattern: reads r2, r1 — r0 = 7
+    RET                      ; pc 5 — returns r0 = 3 + 4 = 7
+src:                         ; pc 6 — the fold source (the BR target)
+    ADD r4, r2, #2, i64      ; pc 6 — T+2: COMPUTED — r4 = 3 + 2 = 5
+    SUB r5, r4, #1, i64      ; pc 7 — T+3: COMPUTED — r5 = 5 - 1 = 4 (the fold index)
+    ADD r9, r2, r1, i64      ; pc 8 — the tail: reads r2, r1 (same pattern)
+    JMPR r5                  ; pc 9 — r5 = 4 — folds to pc 4 — the single incoming edge

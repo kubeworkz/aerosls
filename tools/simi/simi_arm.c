@@ -426,6 +426,22 @@ static uint8_t g_pc_target[4096];      /* branch/call/fold-target pcs (block hea
  * pc a potential block head. */
 static uint64_t g_const_val[TX_AR_MAX_REGS];
 static uint8_t  g_const_known[TX_AR_MAX_REGS];
+/* M2.18: targeted fixpoint relaxation — a block head whose ONLY incoming
+ * path is a single forward BR/BC (linear predecessor is a terminal, so no
+ * fall-through; not an entry; not a fold target) is NOT a join, so the
+ * constant map as it was at that branch survives into the head.
+ * g_relax_ok is the static part (computed once); g_relax_snap_* hold the
+ * per-head snapshot taken at the branch during each scan; the fold-target
+ * exclusion is per-scan (g_fold_tgt_prev, live-updated as the scan
+ * discovers folds). This is what lets a TWO-COMPUTED epi-merge dead
+ * region fold: T+2 is the fold-source BR target (a block head), and
+ * without the relaxation the reset there kills the seed constants from
+ * before the BR, so the computed index chain cannot fold. */
+static uint8_t  g_relax_ok[4096];
+static uint8_t  g_relax_snap_known[4096][TX_AR_MAX_REGS];
+static uint64_t g_relax_snap_val[4096][TX_AR_MAX_REGS];
+static uint8_t  g_relax_snap_active[4096];
+static uint8_t  g_fold_tgt_prev[4096];
 static int      g_jmpr_fold[4096];      /* per-JMPR-pc folded target, or -1 */
 static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-scope like the other arrays) */
 static uint8_t  g_fold_fall[4096];      /* M2.12: folded JMPR whose target is pc+1 — a dead
@@ -1580,6 +1596,33 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
      * starts with an empty constant map anyway. */
     for (uint32_t i = 0; i < hdr.num_entries; i++)
         if (entries[i].offset < hdr.num_instr) g_pc_target[entries[i].offset] = 1;
+    /* M2.18: the static part of the fixpoint relaxation. A head pc X is
+     * eligible iff its ONLY incoming path is a single FORWARD BR/BC edge
+     * (X-1 is a terminal — RET or BR — so the fall-through is dead, no
+     * CALL targets X, X is not an entry, and no backward branch targets
+     * it). The fold-target exclusion is deliberately NOT here: the fold
+     * set is what the fixpoint is converging, so it is applied per-scan
+     * (g_fold_tgt_prev). */
+    for (uint32_t q = 0; q < 4096; q++) { g_relax_ok[q] = 0; g_relax_snap_active[q] = 0; }
+    for (uint32_t X = 1; X < hdr.num_instr; X++) {
+        int nbr = 0, ncall = 0, src = -1;
+        for (uint32_t P = 0; P < hdr.num_instr; P++) {
+            uint64_t wP = instrs[P];
+            uint8_t opP = w_op(wP);
+            if (opP != OP_BR && opP != OP_BC && opP != OP_CALL) continue;
+            int64_t tgt = (int64_t)P + 1 + w_imm28(wP);
+            if (tgt != (int64_t)X) continue;
+            if (opP == OP_CALL) ncall++; else { nbr++; src = (int)P; }
+        }
+        if (nbr != 1 || ncall != 0 || src >= (int)X) continue;  /* unique FORWARD edge */
+        uint8_t opPrev = w_op(instrs[X - 1]);
+        if (!(opPrev == OP_RET || opPrev == OP_BR)) continue;   /* terminal: no fall-through */
+        int is_entry = 0;
+        for (uint32_t i = 0; i < hdr.num_entries; i++)
+            if (entries[i].offset == X) { is_entry = 1; break; }
+        if (is_entry) continue;   /* the trampoline edge guarantees nothing */
+        g_relax_ok[X] = 1;
+    }
     /* M2: constant-index JMPR folding, by fixpoint. Each scan walks the
      * linear stream with a per-register constant map that resets at every
      * pc in g_pc_target (pass-A targets plus any fold targets discovered
@@ -1594,16 +1637,53 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
      * that JMPR) — the fold set is monotone decreasing, so this
      * terminates in at most the number of JMPRs. */
     for (int i = 0; i < 4096; i++) g_jmpr_fold[i] = -1;
+    int relax_enabled = 1;   /* M2.18; the safety fallback below disables it */
+    int passes = 0;
     for (;;) {
         for (int i = 0; i < 4096; i++) g_jmpr_fold_prev[i] = g_jmpr_fold[i];
+        /* M2.18: per-scan fold-target exclusion for the relaxation — the
+         * previous scan's COMPLETE fold set (a fold edge is another
+         * incoming path into the head; live-updated below as the scan
+         * discovers folds, so a forward fold into a relaxed head is
+         * caught within the same scan). */
+        for (int i = 0; i < 4096; i++) g_fold_tgt_prev[i] = 0;
+        for (uint32_t q = 0; q < hdr.num_instr; q++)
+            if (g_jmpr_fold_prev[q] >= 0 && g_jmpr_fold_prev[q] != (int)(q + 1))
+                g_fold_tgt_prev[(uint32_t)g_jmpr_fold_prev[q]] = 1;
         for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;
         for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
             if (g_pc_target[pc]) {   /* block head: constants do not survive a join */
-                for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;
+                if (relax_enabled && g_relax_ok[pc] && g_relax_snap_active[pc] &&
+                    !g_fold_tgt_prev[pc]) {
+                    /* M2.18: the unique incoming path is a single forward
+                     * BR/BC from a pc whose fall-through cannot reach here
+                     * (X-1 is a terminal) — restore the map as it was at
+                     * that branch; there is no join to merge. */
+                    for (int i = 0; i < TX_AR_MAX_REGS; i++) {
+                        g_const_known[i] = g_relax_snap_known[pc][i];
+                        g_const_val[i] = g_relax_snap_val[pc][i];
+                    }
+                } else {
+                    for (int i = 0; i < TX_AR_MAX_REGS; i++) g_const_known[i] = 0;
+                }
             }
             uint64_t w = instrs[pc];
             uint8_t op = w_op(w);
             uint16_t rd = w_rd(w), ra = w_ra(w);
+            if (op == OP_BR || op == OP_BC) {
+                /* M2.18: snapshot the current map at the branch, for an
+                 * eligible (and not-fold-target) target head. Taken before
+                 * the else-clause below, which may clear rd's constant. */
+                int64_t tgt = (int64_t)pc + 1 + w_imm28(w);
+                if (relax_enabled && tgt >= 0 && tgt < (int64_t)hdr.num_instr &&
+                    g_relax_ok[(uint32_t)tgt] && !g_fold_tgt_prev[(uint32_t)tgt]) {
+                    for (int i = 0; i < TX_AR_MAX_REGS; i++) {
+                        g_relax_snap_known[(uint32_t)tgt][i] = g_const_known[i];
+                        g_relax_snap_val[(uint32_t)tgt][i] = g_const_val[i];
+                    }
+                    g_relax_snap_active[(uint32_t)tgt] = 1;
+                }
+            }
             if (op == OP_LOADI) {
                 if (rd < TX_AR_MAX_REGS) { g_const_known[rd] = 1; g_const_val[rd] = (uint64_t)(int64_t)w_imm28(w); }
             } else if (op == OP_LOADI64) {
@@ -1671,6 +1751,8 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
             } else if (op == OP_JMPR) {
                 g_jmpr_fold[pc] = (ra < TX_AR_MAX_REGS && g_const_known[ra] &&
                                    g_const_val[ra] < hdr.num_instr) ? (int)g_const_val[ra] : -1;
+                if (g_jmpr_fold[pc] >= 0 && g_jmpr_fold[pc] != (int)(pc + 1))
+                    g_fold_tgt_prev[(uint32_t)g_jmpr_fold[pc]] = 1;   /* M2.18: live fold-target exclusion */
             } else if (rd < TX_AR_MAX_REGS) {
                 g_const_known[rd] = 0;   /* every other register-writing opcode breaks the constant */
             }
@@ -1694,6 +1776,20 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         for (int i = 0; i < 4096; i++)
             if (g_jmpr_fold[i] != g_jmpr_fold_prev[i]) { same = 0; break; }
         if (same) break;
+        if (++passes > 512) {
+            /* M2.18 safety net: a fold ENABLED BY the relaxation can target
+             * the relaxed head itself (a backward fold re-entering the head
+             * makes it a loop head the relaxation must not apply to) — that
+             * shape 2-cycles the fixpoint (relax -> fold -> reset ->
+             * un-fold). The corpus does not exercise it, but a translator
+             * must terminate on any input: fall back to the un-relaxed
+             * fixpoint, which is monotone-decreasing in the fold set and
+             * provably terminates. */
+            relax_enabled = 0;
+            for (int i = 0; i < 4096; i++) g_jmpr_fold[i] = -1;
+            passes = 0;
+            continue;
+        }
         /* The retroactive-split case — a fold target landing inside
          * another JMPR's chain, before that JMPR's constant source — is
          * covered by this re-scan (the added reset un-folds that JMPR)
