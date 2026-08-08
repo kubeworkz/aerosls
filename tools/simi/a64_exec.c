@@ -455,6 +455,19 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             continue;
         }
 
+        /* ─── B.cond (conditional branch on NZCV flags) ──────────────────
+         * 0101 0100 0 imm19:19 0 cond:4 00000 == 0x54000000 (bits 31:24
+         * and bit 4 are fixed). M2.25's inline JMPR chain emits
+         * cmp (subs xzr) + b.eq pairs; cond_true() is the same condition
+         * table cset uses. */
+        if ((w & 0xFF000010u) == 0x54000000u) {
+            int cond = (int)((w >> 12) & 0xF);
+            int64_t off = sext(((w >> 5) & 0x7FFFFu) << 2, 21);
+            if (cond_true(cpu, cond)) cpu->pc = (uint64_t)((int64_t)cpu->pc + off);
+            else                      cpu->pc = next_pc;
+            continue;
+        }
+
         /* ─── BR / BLR / RET (branch to register) ───────────────────────
          * 1101011 0opc 11111 000000 Rn 00000. BR = 0xD61F0000, BLR =
          * 0xD63F0000, RET = 0xD65F0000 (bits 20:16 == 11111 for all). */
