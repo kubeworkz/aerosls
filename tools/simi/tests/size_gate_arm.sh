@@ -278,6 +278,24 @@
 # below its M0 baseline, and disabling the M2.38 union grows it back
 # to exactly 3060 (the table path, still correct) — the teeth prove
 # the nested composition dispatches through the same union machinery.
+# jmpr_chain16 is M2.40: BEYOND the 32-cap. M2.30-M2.39 capped the BIG
+# candidate set — the walk's deferred-materialization set, the union
+# record's merged set, and the emitted chain — at 32; a dispatch whose
+# union of records exceeded 32 collapsed to UNKNOWN and fell to the
+# table. M2.40 raises TX_AR_CHAIN_BIG to 64, so a 33-64-candidate
+# dispatch chains when the honest cost gate (8*n + 4 < 40 + 4*num_instr)
+# says it beats the table. The LINEAR chain is the right emission shape
+# at any n: each candidate needs its own cmp + b.eq pair regardless, so
+# two chained segments add a selector without reducing comparisons
+# (8n + 8 > 8n + 4) and a compare-tree costs ~4 words per internal node
+# — both strictly worse on bytes. The pin's union is FORTY values:
+# R1 = r2 + r3 (TWENTY values {42..80}) and R2 = r2 + r6 (TWENTY-FIVE
+# values {72..120}) mix at J into op(rec(R2), rec(R1)) = {42..120}
+# evens — accepted at 64, rejected at 32. The gate (324 < 528) emits
+# the 40-pair chain; runtime 32 + 88 = 120 takes the FORTIETH b.eq
+# (block39, LOADI #4000). 700 bytes below its M0 baseline, and
+# reverting the cap to 32 grows it back to exactly 3448 (the table
+# path, still correct) — the teeth.
 # jmpr_calc is M2.1: its index is COMPUTED at translate
 # time through all four folded ADD/SUB shapes (reg+reg, reg+imm, reg+reg,
 # reg+reg, reg+imm) — 224 bytes below its M0 baseline after M2.6's imm
@@ -690,7 +708,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
