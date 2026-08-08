@@ -277,9 +277,13 @@
 # naive. The precompute shrinks to a per-callee LEAF MARKER
 # (ar_leaf_ret_pc — ENTER start, straight-line, first RET), and the
 # args-unknown case is just the all-unknown seed, so jmpr_callret is
-# byte-identical. 328 bytes below its M0 baseline, and disabling the
-# arg seeding grows it back to exactly 3344 (both JMPRs dynamic,
-# g_alloc = 0, whole function naive), still correct. jmpr_unreach is
+# byte-identical. 328 bytes below its M0 baseline under M2.20/2.21, and
+# disabling the arg seeding grows it back to exactly 3344 (both JMPRs
+# dynamic, g_alloc = 0, whole function naive), still correct. M2.22
+# drops the SECOND caller's frame load: `other` (pc 10) is unreachable
+# — main's RET at pc 9 exits and nothing targets pc 10 — so its ENTER
+# prologue (~197 words) and its folded JMPR's flush are dead code,
+# taking the row to 2224 (-1120 vs M0: 328 + 792). jmpr_unreach is
 # M2.21: the g_alloc gate is scoped to REACHABLE JMPRs. `dead` (pc 10)
 # is an unreachable function — entered from nowhere (main's RET at pc 9
 # is a terminal, nothing targets pc 10) — and its JMPR r7 reads an
@@ -299,7 +303,14 @@
 # (the extra 48 vs the teeth is M2.14 tail-reuse across the three
 # RETs), and reverting the reachability gate grows it back to exactly
 # 2996 (main's JMPR dynamic, g_alloc = 0, whole function naive), still
-# correct. jmpr_foldreach is
+# correct. M2.22 adds the EMISSION side: dead's ENTER frame-load
+# prologue (~197 words) is dead code — a function with zero live
+# predecessors never runs, so its frame load is dropped (the dead
+# region is compiled with an empty initial cache directory) — 884
+# bytes below its M0 baseline now, and reverting only the
+# reachability-aware emission (flush_owed -> always flush) grows it
+# back to exactly 2948 (the M2.21 bytes, still correct) — the M2.22
+# teeth, isolating the 788-byte prologue delta exactly. jmpr_foldreach is
 # M2.21 soundness pin (reviewer finding): a REACHABLE fold can dispatch
 # into a statically-unreachable-looking region — main's JMPR r0 = 10
 # folds to pc 10, which sits inside `dead` (the fold index is just a
@@ -316,7 +327,20 @@
 # removing the fold edge from the pre-pass drops it to exactly 2988
 # (the buggy g_alloc=1 emission, dead's JMPR hidden), still passing —
 # the teeth, isolating the fold-edge delta (3044 -> 2988 = -56) exactly.
-# jmpr_cross is
+# jmpr_deadmult is
+# M2.22, the per-pc live-predecessor count in the EMISSION: `dead` (pc
+# 13) is an unreachable MULTI-BLOCK function at the stream end (leaf's
+# RET at pc 12 is a terminal), with an internal BR to a second block —
+# so its whole body (ENTER frame-load prologue, the BR's spill of r4,
+# the label's dynamic JMPR path) is correct-but-dead code. M2.22 drops
+# the frame load (the ENTER emits ZERO words, dump-verified off[13] ==
+# off[14]) and the dead flushes (the BR's first word is the b itself —
+# no spill; r4 is never read reachable and the region is at the stream
+# end, so the deferred spill never fires). 888 bytes below its M0
+# baseline (197-word prologue + dead BR spill + M2.14 tail-reuse +
+# fold machinery), and reverting the reachability-aware emission grows
+# it back to exactly 2980 (the M2.21 bytes, still correct) — the
+# teeth. jmpr_cross is
 # M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
 # folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
 # branch the coalescing pass DROPS and FUSES (pc 4 has no other
@@ -387,7 +411,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_cross]=1212 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012

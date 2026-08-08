@@ -2413,6 +2413,101 @@ added:
   three skips are the pre-existing float_ops RV64/ARM and mem_ops x86
   limitations). enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.54 M2.22 — per-pc live-predecessor reachability in the emission (as built)
+
+M2.21 put reachability in the GATE (only reachable non-folding JMPRs
+forfeit the cache). M2.22 puts it in the EMISSION: the same fold-aware
+BFS now counts, per pc, the number of LIVE incoming edges
+(`g_npred[]` — every edge the BFS follows increments its target's
+count; entries are roots, reachable with count 0). A block with ZERO
+live predecessors is entered by no runtime path under g_alloc=1 (the
+closure argument of §10.52: with the cache on, every reachable JMPR
+folds, so the reachable set is exact — a dynamic dispatch would imply
+a reachable non-folding JMPR that gates). The emission therefore treats
+dead code as dead:
+
+- **Dead-region start invariant.** The first unreachable pc after a
+  live one (or the stream start) is compiled with an EMPTY initial
+  cache directory — the same state any cold entry sees. In practice
+  the directory is already empty there (a dead region's linear
+  predecessor is a terminal whose own flush spilled it), so the reset
+  never emits a spill: it makes the contract structural rather than
+  incidental, so a dead region's bytes cannot drift with the reachable
+  residue preceding it, and a region that later becomes reachable
+  (analysis change) is already emitted in its correct cold shape.
+- **The frame load is dropped.** An UNREACHABLE function's ENTER never
+  runs, so its `cache_flush + emit_prologue` (~197 words of frame
+  setup — sub/str/str/add/sub, 64 slot zeroes, 64 tag zeroes, arg
+  marshaling) is dead code and is not emitted. Dump-verified:
+  `off[ENTER] == off[ENTER+1]` — the ENTER emits ZERO words. The
+  frame the prologue would have built is the caller's, already in
+  place for any fold that lands past this ENTER (jmpr_foldreach's
+  shape); a fold landing exactly ON the ENTER keeps it reachable, so
+  the drop never fires for an entered frame.
+- **Dead flushes are skipped.** Every `cache_flush` whose pc is dead
+  (BR/BC/CALL/JMPR/RET/RESOLVE/OBJSIZE) or whose target block is dead
+  (the rule-1 boundary flush) is dead weight and is skipped, via one
+  guard (`flush_owed(pc) = !g_alloc || g_reach[pc]`; naive mode is a
+  no-op either way). The spill words are CONSERVED when reachable code
+  follows (the first flush at a live head after the region spills the
+  deferred residents — same count), and genuinely SAVED when the dead
+  region ends the stream (the deferred spill never fires).
+
+Soundness rests on the same per-path argument as §10.52: reachability
+only decides whether dead words are emitted, never the emitted code's
+correctness. The conservative direction holds — reachable code is
+emitted exactly as before (flush_owed is 1 for every reachable pc), and
+the dead-region reset only touches dead pcs. Naive-mode programs
+(g_alloc=0) are byte-identical (all guards are no-ops there) —
+jmpr_foldreach measures 3044 unchanged.
+
+### 10.55 M2.22 gate results (measured)
+
+Total emitted bytes across the now-46-program parity set: **M0 69924
+→ M1 61912, 8012 saved** (≈11.5%), up from M2.21's 5524. One row
+added, five moved:
+
+- jmpr_deadmult 3076 → 2188 (−888, new 46th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin. `dead` (pc 13) is an
+  unreachable MULTI-BLOCK function at the stream end (leaf's RET at pc
+  12 is a terminal), with an internal BR to a second block — so its
+  whole body (ENTER frame-load prologue, the BR's spill of r4, the
+  label's dynamic JMPR path) is correct-but-dead code. M2.22 drops
+  the frame load (the ENTER emits ZERO words) and the dead flushes
+  (the BR's first word is the b itself — no spill; r4 is never read
+  reachable and the region is at the stream end, so the deferred spill
+  never fires). The 792 below the M2.21 emission is exactly the
+  197-word prologue + the dead BR's spill; the remaining 96 below M0
+  is M2.14 tail-reuse + fold machinery. Reverting the
+  reachability-aware emission (flush_owed → always flush) grows it
+  back to exactly 2980 (the M2.21 bytes, still correct) — the teeth.
+- jmpr_unreach 3044 → 2160 (−884, from 2948): M2.22 drops `dead`'s
+  ENTER frame-load prologue (788 = 197 words) — the M2.21 win's
+  emission side. Teeth: revert only the emission → back to exactly
+  2948, the M2.21 bytes.
+- jmpr_callret_arg 3344 → 2224 (−1120, from 3016): `other` (pc 10),
+  the second caller to the leaf, is UNREACHABLE (main's RET exits,
+  nothing targets pc 10) — its ENTER prologue (788) and its folded
+  JMPR's flush (4) drop. This is a pre-existing row shrinking under
+  the new rule, not a fold change: other's fold edges stay dead (the
+  BFS is source-gated, so a dead fold does not resurrect its target).
+- jmpr_calc/jmpr_calc_bit/jmpr_calc_mul 1040→1036 / 1084→1080 /
+  1036→1032 (−4 each): each has an unreachable dispatch block after
+  its fold target (the LOADI/RET dead paths); a dead RET's flush is
+  skipped.
+- jmpr_fall 1016 → 1008 (−8): the dead path at the stream end (pcs
+  9-14) loses two flushes — the rule-1 boundary spill of r4 (the
+  fall-through fold's target has another edge, so its head is live in
+  g_pc_target but dead in g_reach) and the backward fold's spill of
+  r5, both at the stream end so never deferred.
+- Row-by-row accounting (gate tables diffed vs committed e9e3eb2,
+  measured with the M2.21 verifier): all other 40 shared rows
+  byte-identical — M2.22 is byte-neutral over every program with no
+  dead region (and over every naive-mode program).
+- Four-way parity: 144 PASS, 0 FAIL across all engines (the three
+  pre-existing skips unchanged). enc-check clean; jmpr_oob still
+  faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
