@@ -3469,6 +3469,79 @@ One row added, zero moved:
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.86 M2.38 — the record-vs-record join (as built)
+
+M2.37 made a deferred record survive a flat join; the remaining gap
+was a join mixing a deferred record with a DIFFERENT deferred record
+— the union of two >12-value sets cannot be represented by either
+record, so the first loop's different-record unknowning collapsed it
+to UNKNOWN and killed the chain. M2.38 generalizes the UNION record
+so its second side can itself be a record: `op(rec(R2), rec(R1))`
+(kb = CD_REC in the second operand slot, where M2.37 used CD_FLAT).
+The flatten helpers need no change — `chain_flatten_op` already
+resolves CD_REC on either operand, so the union's materialization
+merges `flatten(rec2)` with `flatten(rec1)` exactly as it merged the
+flat side. `chain_def_alloc_union` gained a second-side kind: CD_REC
+(runs the same eager 32-cap merge over the second record) or CD_FLAT
+(the M2.37 path, unchanged). The first loop's different-record
+unknowning is DELETED — every record-vs-record case now reaches the
+deferred-carry branch, where the union can fire: the carry record is
+live by construction and the ARRIVAL record must pass the M2.36
+liveness check (no write to its transitive DAG since creation) for
+its materialization at the dispatch to be exact-or-superset. Records
+only reference older records (both R2 and R1 predate the union at the
+head), so the DAG stays acyclic and the existing invalidation needs
+no change: `chain_prewrite`/`chain_def_touches`/`chain_def_live`
+already recurse both CD_REC operands. The deletion is
+emission-invisible — a record-vs-record union that does NOT fit (or
+an unlive arrival) falls through to the same UNKNOWN the first loop
+produced, and no pre-existing program has the shape that now fires.
+
+### 10.87 M2.38 gate results (measured)
+
+Total emitted bytes across the now-62-program parity set: **M0
+108944 → M1 92596, 16348 saved** (≈15.0%), up from M2.37's 15744.
+One row added, zero moved:
+
+- jmpr_chain14 3368 → 2764 (−604, new 62nd row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: the dispatch index r1 is
+  computed on two arms. The R-arm computes R1 = r2 + r3 (FIFTEEN
+  values {40..68}, DEFERS) and its `BC r5, J` delivers R1 into J's
+  accumulator; the fall-through S-arm (taken at runtime, r5 = 0)
+  computes R2 = r2 + r6 over the SHARED r2 join (FIFTEEN DISJOINT
+  values {70..98}, DEFERS — replacing R1 in cur, already delivered)
+  and flows into J. So J mixes a deferred CARRY R2 with a deferred
+  ARRIVAL R1 of a DIFFERENT record; the M2.38 union op(rec(R2),
+  rec(R1)) fires (the merged 30-value set fits the 32-cap; R1 passes
+  the liveness check) and the chain dispatches the THIRTY candidates
+  `{40..98}` — runtime `22 + 76 = 98` takes the thirtieth b.eq
+  (dump-verified: 30 b.eq pairs, first → #100's block at offset
+  1464, thirtieth → #3000's block at offset 2624, both byte-exact).
+  The chain vs table delta is exactly 440 − 244 = +196; the rest of
+  the 604 is the M1 allocator on the 100-instruction body.
+- Teeth: disabling the M2.38 union grows jmpr_chain14 back to
+  exactly 2960 (the table path, still correct) — proving the
+  record-vs-record union is what the chain dispatches through, not
+  an accident of the layout. The probe also documents two layout
+  constraints the debugging surfaced: a BC delivery carries EVERY
+  tracked slot, so all joins must precede the delivering arm (an
+  early arm delivers UNKNOWN for the not-yet-joined r6, poisoning
+  the head and the union's materialization); and both products share
+  the r2 join so the tracked-register closure {r1,r2,r3,r6} stays
+  within the 4-register cap.
+- Row-by-row accounting (gate tables diffed vs committed 34da96a,
+  measured with the M2.37 verifier): **all 61 shared rows
+  byte-identical** — the first-loop deletion is emission-invisible
+  and no pre-existing program has the record-vs-record shape, so
+  M2.38 is strictly additive.
+- Four-way parity: 248 PASS, 0 FAIL — all 62 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 30-candidate
+  record-vs-record chain executes at runtime on the ARM engine (PASS
+  3000, runtime index 98 taking the thirtieth b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
