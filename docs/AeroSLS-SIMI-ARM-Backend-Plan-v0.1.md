@@ -3201,6 +3201,61 @@ added, zero moved:
   enc-check clean (the canonical make a64-enc-check, a fresh assemble
   + dump + re-derive); jmpr_oob still faults (UDF, rc=1).
 
+### 10.78 M2.34 — the deferred-preserving join (as built)
+
+M2.32/M2.33's head-union flattened every deferred form it mutated, so
+a deferred source could not cross a join: a product followed by a join
+(chain8's shape with the r4 join moved *between* the products) killed
+R1's deferred form at the head, and the second product fell back to
+UNKNOWN. The soundness premise that makes a fix possible: every
+record's true set exceeds the flat cap (12), so its contribution to a
+union is UNKNOWN **unless** every incoming path carries the *same*
+record — in which case the union is a no-op and the deferred form can
+be kept. M2.34 rewrites `chain_deliver` to preserve: same record →
+no-op (keep deferred), first arrival → keep the record, any mix →
+UNKNOWN; and the head-union's second loop gains the same-record
+preserve with the UNKNOWN fallback. This also removes the need to
+flatten delivered records on delivery entirely — the unsound trap
+being that flattening a stale delivered record reads slots rewritten
+since the record was created.
+
+### 10.79 M2.34 gate results (measured)
+
+Total emitted bytes across the now-58-program parity set: **M0 95844
+→ M1 81728, 14116 saved** (≈14.7%), up from M2.33's 13640. One row
+added, zero moved:
+
+- jmpr_chain10 3064 → 2588 (−476, new 58th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: index = `(r2 + r3) + r4` with
+  the r4 join *between* the two products. R1's 15-value deferred
+  product crosses the join (every incoming path carries the same
+  record), then the in-place second product composes through the
+  record DAG to the thirty candidates `{22..82}`; runtime
+  `(20+30)+32 = 82` takes the chain's thirtieth b.eq (dump-verified:
+  30 b.eq pairs, first → #100's block, thirtieth → #3000's block).
+  The chain vs table delta is exactly 376 − 244 = +132; the rest of
+  the 476 is the M1 allocator on the 112-instruction body.
+- Teeth: the preserve had to be disabled in *both* places (the
+  head-union's same-record branch **and** `chain_deliver`'s
+  preservation — disabling only the head-union branch does not bite,
+  because deliver's preservation alone still keeps R1 alive through
+  the join). With both off, jmpr_chain10 grows to exactly 2720 (the
+  table path, still correct) — proving the join-preserved record is
+  what the chain dispatches through, not an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed 88e0709,
+  measured with the M2.33 verifier): **all 57 shared rows
+  byte-identical** — the deliver/head-union rewrite is
+  emission-invisible on every pre-existing program (no pre-existing
+  program carries the same record into a join), so M2.34 is strictly
+  additive.
+- Four-way parity: 232 PASS, 0 FAIL — all 58 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 30-candidate
+  join-crossing chain executes at runtime on the ARM engine (PASS
+  3000, runtime index 82 taking the thirtieth b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
