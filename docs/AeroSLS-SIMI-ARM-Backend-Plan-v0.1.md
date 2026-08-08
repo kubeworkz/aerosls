@@ -3542,6 +3542,68 @@ One row added, zero moved:
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.88 M2.39 — the nested union join (as built)
+
+M2.38 made the union record's second side a CD_REC, so its
+materialization recurses through `chain_flatten_big_rec` (the UNION
+special case resolves CD_REC operands via `chain_flatten_big_op`),
+and `chain_def_live` recurses both CD_REC operands. That means a
+union record meeting a THIRD distinct deferred record should compose
+with NO new code: the M2.38 head-union branch fires with the arrival
+being the union record (liveness recurses through it), and
+`chain_def_alloc_union` merges `flatten(rec3)` with `flatten(union)`
+— the union special case inside the flatten recursion — when the
+merged true set fits the 32-cap. M2.39 is therefore a PROOF
+milestone: the probe pins the composition, and no translator code
+changed (the working tree's only deltas are the test, the gate row,
+and this section). The cap-check stays exact-or-conservative for
+nested unions: both the union and the new record materialize over
+the live cur[], a later head-union can only widen, and a nested
+union that fits at the head provably fits at the dispatch.
+
+### 10.89 M2.39 gate results (measured)
+
+Total emitted bytes across the now-63-program parity set: **M0
+112436 → M1 95436, 17000 saved** (≈15.1%), up from M2.38's 16348.
+One row added, zero moved:
+
+- jmpr_chain15 3492 → 2840 (−652, new 63rd row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: three arms compute three
+  DISTINCT deferred records over the four-register closure
+  {r1,r2,r3,r6}: R1 = r2 + r3 (FIFTEEN values {42..70}), R2 = r2 + r6
+  (FIFTEEN values {42,46,50,...,78}), R3 = r6 + r3 (THIRTEEN values
+  {80..104} — the sparse-vs-contiguous steps of r6/r3 spread R3's
+  sums past 12). The R-arm's `BC r5, J1` delivers R1; the
+  fall-through computes R2 and flows in as the carry, so J1 forms
+  the union U = op(rec(R2), rec(R1)) = {42..70, 74, 78} (17 values).
+  The next `BC r5, JN` delivers U into JN; the fall-through computes
+  R3, so JN forms the NESTED union U2 = op(rec(R3), rec(U)) to
+  THIRTY candidates {42..104}; runtime `56 + 48 = 104` takes the
+  thirtieth b.eq (dump-verified: 30 b.eq pairs, first → #100's block
+  at offset 1492, thirtieth → #3000's block at offset 2700, both
+  byte-exact). The chain vs table delta is exactly 464 − 244 = +220;
+  the rest of the 652 is the M1 allocator on the 106-instruction
+  body.
+- Teeth: disabling the M2.38 union (the ONLY thing that could make
+  this work — the nested union fires through the same branch) grows
+  jmpr_chain15 back to exactly 3060 (the table path, still correct),
+  proving the nested composition dispatches through the union
+  machinery, not an accident of the layout. The probe also documents
+  the design constraint: R3's sums must SPREAD past 12 — two
+  contiguous 5-value ranges give only 9 distinct sums — so the probe
+  uses sparse r6 (step 4) against contiguous r3 (step 2).
+- Row-by-row accounting (gate tables diffed vs committed d998e8c,
+  measured with the M2.38 verifier): **all 62 shared rows
+  byte-identical** — simi_arm.c is untouched, so M2.39 is trivially
+  additive; the only delta is the new jmpr_chain15 row at −652.
+- Four-way parity: 252 PASS, 0 FAIL — all 63 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 30-candidate
+  nested-union chain executes at runtime on the ARM engine (PASS
+  3000, runtime index 104 taking the thirtieth b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
