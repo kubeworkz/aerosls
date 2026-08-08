@@ -3604,6 +3604,64 @@ One row added, zero moved:
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged. enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
+### 10.90 M2.40 — beyond the 32-cap (as built)
+
+M2.30-M2.39 capped the BIG candidate set — the walk's
+DEFERRED-materialization set (chain_flatten_big), the union record's
+merged set (chain_merge_big / chain_def_alloc_union's eager
+cap-check), and the emitted chain (g_chain_cand) — at TX_AR_CHAIN_BIG
+= 32. A dispatch whose union of records exceeded 32 collapsed to
+UNKNOWN and fell to the table. M2.40 raises TX_AR_CHAIN_BIG to 64, so
+a 33-64-candidate dispatch now chains when the honest cost gate
+(8n + 4 < 40 + 4·num_instr) says it beats the table. The LINEAR chain
+is the right emission shape at any n: every candidate needs its own
+cmp + b.eq pair (2 words) regardless, so "two chained segments" would
+add a selector without reducing comparisons (8n + 8 > 8n + 4), and a
+compare-and-branch tree costs ~4 words per internal node (cmp + b.eq
++ b.lo + b.hi) for n−1 nodes — both strictly worse on bytes. The
+raise is sound with no other change: the flat walk set stays capped
+at 12 (TX_AR_CHAIN_MAX — deferral still handles >12), the eager
+cap-check stays exact-or-conservative at the new bound, the chain's
+candidates are still < num_instr ≤ 4096 (the subs imm12), and the
+b.eq imm19 range is far beyond 64. The raise is emission-invisible
+for every pre-existing program — none has a union exceeding 32 — so
+it is strictly additive.
+
+### 10.91 M2.40 gate results (measured)
+
+Total emitted bytes across the now-64-program parity set: **M0
+116380 → M1 98680, 17700 saved** (≈15.2%), up from M2.39's 17000.
+One row added, zero moved:
+
+- jmpr_chain16 3944 → 3244 (−700, new 64th row; M0 baseline measured
+  at git 1729f50) — the dedicated pin: a union of two deferred
+  records is FORTY values. R1 = r2 + r3 (r2 in {2,12,22,32}, r3 in
+  {40,42,44,46,48} — TWENTY values {42..80}) and R2 = r2 + r6 (r6 in
+  {70,72,...,88} — TWENTY-FIVE values {72..120}) mix at J into
+  op(rec(R2), rec(R1)) = {42..120} evens — accepted at the 64 cap,
+  rejected at 32 (the R-arm's `BC r5, J` delivers R1 forward, the
+  fall-through computes R2 as the carry). The gate (324 < 528) emits
+  the 40-pair chain; runtime `32 + 88 = 120` takes the fortieth
+  b.eq (dump-verified: 40 b.eq pairs, first → #100's block at offset
+  1544, fortieth → #4000's block at offset 3104, both byte-exact).
+  The chain vs table delta is exactly 528 − 324 = +204; the rest of
+  the 700 is the M1 allocator on the 122-instruction body.
+- Teeth: reverting the cap to 32 grows jmpr_chain16 back to exactly
+  3448 (the table path — the 40-value union collapses, still
+  correct), proving the raised cap is what the chain dispatches
+  through, not an accident of the layout.
+- Row-by-row accounting (gate tables diffed vs committed 5a63ee6,
+  measured with the M2.39 verifier): **all 63 shared rows
+  byte-identical** — no pre-existing program has a union exceeding
+  32, so M2.40 is strictly additive.
+- Four-way parity: 256 PASS, 0 FAIL — all 64 expected-result
+  programs on all four engines (interp, x86 JIT, RV64, ARM), each
+  checked against its "Expected result:" comment; the 40-candidate
+  over-cap chain executes at runtime on the ARM engine (PASS 4000,
+  runtime index 120 taking the fortieth b.eq), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted

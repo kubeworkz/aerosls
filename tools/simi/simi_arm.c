@@ -473,12 +473,21 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * UNKNOWN — it is DEFERRED (the def_* fields record the op and the two
  * source slots) and re-computed at the dispatch into the BIG candidate
  * set (TX_AR_CHAIN_BIG), so a 13-32-candidate dispatch can still chain
- * when the cost gate says it wins. Deferral is sound only while the
- * sources are untouched: every write or head-union of a source slot
- * flattens (and caps) the deferred form eagerly, and the dispatch
- * materializes over the provably-unchanged sources. */
+ * when the cost gate says it wins. M2.40 raises TX_AR_CHAIN_BIG to 64
+ * (the walk's big-set cap, the union record's materialization cap, and
+ * the chain's candidate cap): a 33-64-candidate dispatch — a union of
+ * records whose merged true set exceeds 32 — now also chains when the
+ * gate says it beats the table. The LINEAR chain is the right emission
+ * shape at any n: each candidate needs its own cmp + b.eq pair
+ * (2 words) regardless, so "two chained segments" would add a selector
+ * without reducing comparisons (8n + 8 vs 8n + 4) and a compare-tree
+ * costs ~4 words per internal node — both strictly worse on bytes; the
+ * honest 8*n + 4 < 40 + 4*num_instr gate is what decides. Deferral is
+ * sound only while the sources are untouched: every write or head-union
+ * of a source slot flattens (and caps) the deferred form eagerly, and
+ * the dispatch materializes over the provably-unchanged sources. */
 #define TX_AR_CHAIN_MAX 12
-#define TX_AR_CHAIN_BIG 32
+#define TX_AR_CHAIN_BIG 64
 #define TX_AR_CHAIN_REGS 4
 #define TX_AR_CHAIN_DEFS 64
 #define CD_SLOT 0   /* M2.32: deferred-product operand kind — a tracked slot */
@@ -488,8 +497,8 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
                      * (stored in g_chain_def_flat[rec]; immune to writes and unions) */
 #define CHAIN_OP_UNION 0xFE  /* M2.37: record op sentinel — a union record op(rec(R), flat(F))
                               * materializes to the MERGED true set (R's set union F, capped at
-                              * 32), so a >12 union that is not a single product can still feed
-                              * the chain. Not an instruction opcode. */
+                              * TX_AR_CHAIN_BIG), so a >12 union that is not a single product can
+                              * still feed the chain. Not an instruction opcode. */
 /* M2.32/M2.33/M2.37: an immutable deferred-product record. An operand is
  * a tracked slot (its value as it stands when the record is materialized,
  * sound because any write to the slot invalidates every record that
@@ -1222,8 +1231,9 @@ static int chain_def_alloc_union(const struct ChainSet* cur, int16_t rec, uint8_
 /* M2.30/M2.32: the dispatch-side materialization — a deferred product
  * is re-computed over its record DAG into the BIG candidate set (capped
  * at TX_AR_CHAIN_BIG), because the walk's flat sets cannot hold > 12
- * and the emission gate may still want a 13-32-candidate chain. Sound
- * only because every write or union of a source slot flattened every
+ * and the emission gate may still want a 13-64-candidate chain (M2.40
+ * raised the cap from 32). Sound only because every write or union of
+ * a source slot flattened every
  * record that transitively reads it eagerly, so the slots referenced
  * here are exactly what each product saw at its instruction. */
 /* M2.33: resolve one record operand into a BIG flat set: an immediate
@@ -3090,8 +3100,9 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                          * all fit the imm12 of subs — no movz+subs form is
                          * ever needed. M2.29 raised the walk cap 8 -> 12
                          * and added the cost gate; M2.30 lets a deferred
-                         * pair product deliver 13-32 candidates here (the
-                         * BIG cap) when the same gate says the chain wins. */
+                         * pair product deliver 13-64 candidates here (the
+                         * BIG cap, raised from 32 by M2.40) when the same
+                         * gate says the chain wins. */
                         if (g_chain_ncand <= TX_AR_CHAIN_BIG &&
                             8*g_chain_ncand + 4 < 40 + 4*(int)hdr.num_instr)
                             g_chain_active = 1;
