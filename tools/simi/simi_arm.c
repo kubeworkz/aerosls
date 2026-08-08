@@ -1172,14 +1172,26 @@ static void chain_flatten_big(struct ChainBig* out, const struct ChainSet* cur, 
     }
     chain_flatten_big_rec(out, cur, s->def);
 }
-/* M2.30: deliver cur[s] into a per-head accumulator, flattening a
- * deferred form first (the accumulator holds flat sets only). */
+/* M2.30/M2.34: deliver cur[s] into a per-head accumulator. A DEFERRED
+ * arrival is never flattened into the union — every record's true set
+ * exceeds the flat cap (it was created by an overflow), so its
+ * contribution is UNKNOWN unless the accumulator already holds the SAME
+ * record, in which case the union is a no-op (every path carries the
+ * same product — the join can keep a deferred source). A flat arrival
+ * into a deferred accumulator also collapses to UNKNOWN (the record's
+ * > 12 values dominate). Never flattening a delivered record sidesteps
+ * the stale-slot trap: a record delivered early and invalidated by a
+ * later slot write can no longer be materialized correctly, so it is
+ * conservatively UNKNOWN instead of a wrong flat set. */
 static void chain_deliver(struct ChainSet* dst, const struct ChainSet* cur, int s) {
     if (cur[s].def >= 0) {
-        struct ChainSet flat;
-        chain_flatten(&flat, cur, s);
-        chain_merge(dst, &flat);
-    } else chain_merge(dst, &cur[s]);
+        if (dst->def == cur[s].def) return;               /* same record: union is a no-op */
+        if (dst->n == 0 && !dst->unk && dst->def < 0) { *dst = *cur; return; }   /* first arrival keeps the deferred form */
+        chain_unknown(dst);                               /* record vs anything else: > 12, UNKNOWN */
+    } else {
+        if (dst->def >= 0) chain_unknown(dst);            /* flat arrival into a deferred accumulator: UNKNOWN */
+        chain_merge(dst, &cur[s]);
+    }
 }
 /* M2.30/M2.32: a deferred product's sources must not change — its value
  * is fixed at its instruction. Before slot s is written or unioned,
@@ -2582,16 +2594,28 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                 /* block head: union of the fall-through
                                  * carry (only if pc-1 falls through) and
                                  * the branch deliveries, per tracked slot.
-                                 * M2.30: the union MUTATES every slot, so
-                                 * any deferred pair product reading a slot
-                                 * must be flattened FIRST (over the
-                                 * pre-union source values); then the
-                                 * resets clear the def marker. */
+                                 * M2.30/M2.34: a DEFERRED carry's true set
+                                 * always exceeds the flat cap, so the
+                                 * union is UNKNOWN unless the arrival is
+                                 * the SAME record — every path carries the
+                                 * same product, the union is a no-op, and
+                                 * the deferred form crosses the join (the
+                                 * head-union no longer flattens what it
+                                 * preserves). The same-record check is
+                                 * sound: the carry record is live (any
+                                 * write to its DAG would have invalidated
+                                 * cur[]), so an equal-index delivery —
+                                 * made after the product — is live too.
+                                 * Anything else with a record on either
+                                 * side collapses to UNKNOWN. */
                                 for (int s = 0; s < ntr; s++) {
-                                    if (cur[s].def >= 0) chain_flatten(&cur[s], cur, s);
+                                    if (cur[s].def >= 0 && g_chain_arr[s][pc].def != cur[s].def)
+                                        chain_unknown(&cur[s]);
                                 }
                                 for (int s = 0; s < ntr; s++) {
                                     if (!carry) { cur[s].n = 0; cur[s].unk = 0; cur[s].def = -1; }
+                                    if (cur[s].def >= 0 && g_chain_arr[s][pc].def == cur[s].def) continue;   /* same record: keep deferred */
+                                    if (g_chain_arr[s][pc].def >= 0) { chain_unknown(&cur[s]); continue; }    /* record arrival vs flat carry: > 12 */
                                     chain_merge(&cur[s], &g_chain_arr[s][pc]);
                                 }
                             }
