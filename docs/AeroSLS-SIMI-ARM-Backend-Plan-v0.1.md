@@ -2339,6 +2339,80 @@ on top of 5052:
   call-site walk re-runs every fixpoint pass (deterministic and cheap
   — the leaf is rejected upfront unless straight-line).
 
+### 10.52 M2.21 — reachability-scoped g_alloc (as built)
+
+The g_alloc gate was "every JMPR in the linear stream folds" — but the
+fixpoint scans the whole stream, including functions that are never
+entered, so a single non-folding JMPR in an UNREACHABLE function threw
+the whole program back to the naive path. M2.21 scopes the gate to
+REACHABLE JMPRs. The reachability pre-pass is a worklist BFS from the
+entries. It follows the static control edges — BR/BC targets +
+fall-through, CALL target + fall-through (the call returns), RET is a
+terminal — AND the FOLD edges, because it runs AFTER the fold fixpoint:
+a FOLDED JMPR's target is a runtime edge (a direct branch; the M2.12
+fall-through fold's target pc+1 is reached by falling through), while
+an UNFOLDED JMPR is a terminal (its runtime target is data-dependent —
+only whether ITS OWN pc is reachable matters to the gate). The gate
+then requires every reachable JMPR to fold; unreachable ones keep their
+dynamic dispatch path in the emission (correct code, never executed).
+
+The FOLD EDGES are the soundness-critical part (M2.21 reviewer
+finding). A reachable fold can dispatch into a statically-unreachable-
+looking region — the fold index is just a constant, any pc. Without
+the fold edge in the pre-pass, a non-folding JMPR THERE would be marked
+unreachable, g_alloc would stay 1, and the runtime dispatch from that
+region could land mid-chain with a stale cache directory — the exact
+hazard the gate exists to prevent. Rule 1 makes the region's ENTRY
+cache-safe (the fold target is a block head), but the region's own
+non-folding JMPR still dispatches to arbitrary pcs at runtime, so it
+must gate. With the fold edges, the reachable set is complete for the
+gating question. The cache correctness argument is otherwise PER-PATH
+and independent of reachability (rule 1 re-fetches at every branch/call
+/fold target), so reachability only changes the OPTIMIZATION gate,
+never the emitted code's correctness; and the conservative direction
+holds — a reachable non-folding JMPR still gates (jmpr_oob, jmpr_dyn,
+their JMPRs in main, measure byte-identically).
+
+### 10.53 M2.21 gate results (measured)
+
+Total emitted bytes across the now-45-program parity set: **M0 66848
+→ M1 61324, 5524 saved** (≈8.3%), up from M2.20's 5380. Two rows
+added:
+
+- jmpr_unreach 3044 → 2948 (−96, new 44th row; M0 baseline measured
+  at git 1729f50). `dead` (pc 10) is an unreachable function whose
+  JMPR r7 reads an ENTER argument — unknown, so it NEVER folds; before
+  M2.21 it killed g_alloc for the whole program, and main's own
+  foldable JMPR (r0 = 8 after the M2.20 leaf call) was thrown away.
+  With the scoped gate, main's JMPR folds to pc 8 (dump-verified: a
+  direct `b` over the filler; dead's dispatch path — table + br + UDF
+  — is still emitted, never executed). Reverting the reachability gate
+  grows it back to exactly 2996 (main's JMPR dynamic, g_alloc = 0,
+  whole function naive), still correct — the teeth. The remaining 48
+  of the 96 below M0 is M2.14 tail-reuse across the program's three
+  RETs (M0 has none).
+- jmpr_foldreach 3092 → 3044 (−48, new 45th row; M0 baseline measured
+  at git 1729f50) — the SOUNDNESS pin, byte-identical to the M2.20
+  tree's row: main's JMPR r0 = 10 folds to pc 10 INSIDE `dead`, and
+  dead's JMPR (index = DIV 14/2 = 7, which never folds) is reachable
+  VIA THE FOLD, so it gates. Under M2.20's all-JMPRs rule it gated by
+  the old rule's conservatism (every JMPR in the stream); the closure
+  is what keeps it gated under the scoped rule — removing the fold
+  edge from the pre-pass drops the row to exactly 2988 (−56, the
+  buggy g_alloc=1 emission where dead's JMPR hides from the gate),
+  still passing in this construct but unsound in general — the teeth.
+  The 48 below M0 is the naive-path machinery (pc 6's fold as a
+  direct branch, M2.14 tail-reuse), not a cache win.
+- Row-by-row accounting (gate tables diffed vs committed 2b2e8e6):
+  all 43 pre-existing rows byte-identical and jmpr_foldreach
+  byte-identical (3044) — exactly ONE row moved, jmpr_unreach (2996
+  → 2948), the M2.21 delta (+48 saved). The scoping is byte-neutral
+  across the pre-existing corpus: every pre-existing non-folding JMPR
+  is reachable (jmpr_oob, jmpr_dyn), so no fold decision changes.
+- Four-way parity: all 48 common tests pass on all four engines (the
+  three skips are the pre-existing float_ops RV64/ARM and mem_ops x86
+  limitations). enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
 ---
 
 ## Sources consulted
