@@ -297,6 +297,25 @@
 # makes build2's image UNKNOWN — the chain dies (0 b.eq, table) and the
 # runtime index 80 + 96 = 176 lands on block17 -> 1800 on all four
 # engines — tracked vs opaque writer on the feeder, same position.
+# jmpr_chain24 is M2.48: the NEG-built dispatch index — the unary
+# NOT/NEG join the chain image. Before M2.48 the image family was the
+# binary ADD/SUB/MUL/AND/OR/XOR plus the M2.47 shifts, so a NEG on the
+# index path fell to the walk's opaque-writer branch and the chain
+# died. M2.48 adds the UNARY image — { f(a) : a in S(a) } for f = NOT
+# (~a) or NEG (-a), plain 64-bit, never faults, type-agnostic (the M2.2
+# argument). The pin's index is r1 = -r2 over a TEN-way join of
+# NEGATIVE constants (r2 in {-58,-56,...,-40} -> TEN values {40..58});
+# the gate (84 < 40 + 4*60 = 280) emits the 10-pair chain. The runtime
+# index -(-58) = 58 takes the chain's TENTH b.eq (block9, LOADI #1000).
+# 444 bytes below its M0 baseline. The NOT side is out-of-range by
+# construction (NOT of a small pc is huge), so it lands on the bare-UDF
+# path — the analysis computes the image exactly, finds no in-range
+# candidate and emits just the UDF (0 b.eq, 0 table, 1 UDF word, all
+# four engines fault rc=1/2; verified ad hoc — the size discriminates
+# it from the UNKNOWN -> table path). The teeth: reverting the M2.48
+# tracking makes the NEG opaque again — the chain dies and the row
+# grows back to exactly 2116 (the table path, 0 b.eq, still correct;
+# the 196-byte delta is exactly (40 + 4*60) - (8*10 + 4)).
 # jmpr_chain23 is M2.47: the SHL-built dispatch index. Before M2.47
 # the shifts were NOT in the chain image family (chain_alu_eval handled
 # only ADD/SUB/MUL/AND/OR/XOR), so a shift on the index path fell to
@@ -841,7 +860,7 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
