@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -35,6 +35,14 @@ simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h
 # where encoder AND decoder agree on a wrong constant.
 a64_dump: a64_dump.c simi_arm.c simi_arm.h
 	$(CC) $(CFLAGS) -o $@ a64_dump.c simi_arm.c
+
+# F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
+# the a64_exec.c float decode+execute work (see a64_f0_test.c's top
+# comment). simi_arm.c can't emit float yet (F1) — this proves the
+# decoder before the encoder exists. In `all` so the build always
+# refreshes it (the M2.27 stale-binary lesson).
+a64-f0-test: a64_f0_test.c a64_exec.c a64_exec.h
+	$(CC) $(CFLAGS) -o $@ a64_f0_test.c a64_exec.c
 
 a64-enc-check: simi-asm a64_dump
 	./simi-asm tests/straight_line_bench.simi tests/straight_line_bench.tmo

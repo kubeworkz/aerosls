@@ -95,6 +95,13 @@ struct A64Cpu {
     uint64_t x[32];     /* x0..x30 plus x31 = SP (A64: only add/sub-immediate
                          * and load/store treat 31 as SP; everywhere else 31
                          * is XZR — this executor applies that contextually) */
+    /* f0..f31 — the SIMD&FP register file (F0, Phase 10 float): dN is the
+     * low 64 bits of fN, sN is the low 32 bits (the high 32 zeroed on
+     * every s-form write, per real A64). Named `f` (not `v`, which is
+     * taken by the NZCV overflow flag). Distinct from x[]: fmov moves
+     * bits between the two files explicitly — the F1 codegen's GP-bounce
+     * path and this executor's fcmp/fadd/etc. rely on that separation. */
+    uint64_t f[32];
     uint64_t pc;
     /* NZCV condition flags — the one piece of implicit machine state this
      * subset must carry: simi_arm.c's CMP synthesis uses `cmp` (subs xzr)
