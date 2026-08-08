@@ -482,25 +482,31 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * (2 words) regardless, so "two chained segments" would add a selector
  * without reducing comparisons (8n + 8 vs 8n + 4) and a compare-tree
  * costs ~4 words per internal node — both strictly worse on bytes; the
- * honest 8*n + 4 < 40 + 4*num_instr gate is what decides. M2.41 raises
+ * honest 8*n + 4 < 40 + 4*num_instr gate is what decides. M2.41 raised
  * TX_AR_CHAIN_MAX from 12 to 20: a 13-20-value product now stays FLAT
  * instead of deferring — and a flat set SURVIVES a source-register
  * write (chain_prewrite only flattens DEFERRED forms; a flat set in
  * rd's slot is untouched by writes to its feeders), while a deferred
  * record of > 12 values was flattened to UNKNOWN by the same write
- * (the eager flatten caps at the walk bound). Raising the cap also
- * needs two companions: (a) a flat+flat head-union whose merged set
- * exceeds 20 freezes as a PRE-MERGED union record instead of
- * collapsing (chain14/15's 30-value joins must not regress), and
- * (b) an in-place product over a FLAT source whose image overflows
- * freezes the aliased source as a CD_FLAT operand so it still defers
- * (chain13's second product must not regress). Both mechanisms freeze
- * flat sets out-of-line in g_chain_def_flat, immune to writes and
- * unions — the CD_FLAT story M2.37 started. Deferral is sound only
- * while the sources are untouched: every write or head-union of a
+ * (the eager flatten caps at the walk bound). The raise needed two
+ * companions: (a) a flat+flat head-union whose merged set exceeds the
+ * cap freezes as a PRE-MERGED union record instead of collapsing
+ * (chain14/15's 30-value joins must not regress), and (b) an in-place
+ * product over a FLAT source whose image overflows freezes the aliased
+ * source as a CD_FLAT operand so it still defers (chain13's second
+ * product must not regress). M2.42 raises TX_AR_CHAIN_MAX to 64 to
+ * MATCH TX_AR_CHAIN_BIG: a 21-64-value product now stays flat too —
+ * and since a set of > 64 values can never chain (the emission gate
+ * rejects ncand > TX_AR_CHAIN_BIG), the entire deferred-record
+ * machinery becomes UNREACHABLE for chaining: every reachable chain
+ * materializes from a flat set, and the M2.30-M2.41 record paths
+ * (defers, union records, the flat+flat fallback, the in-place
+ * freeze) are vestigial — retained as the recorded history and as a
+ * safety net should the caps ever diverge again. Deferral is sound
+ * only while the sources are untouched: every write or head-union of a
  * source slot flattens (and caps) the deferred form eagerly, and the
  * dispatch materializes over the provably-unchanged sources. */
-#define TX_AR_CHAIN_MAX 20
+#define TX_AR_CHAIN_MAX 64
 #define TX_AR_CHAIN_BIG 64
 #define TX_AR_CHAIN_REGS 4
 #define TX_AR_CHAIN_DEFS 64
@@ -2938,21 +2944,29 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                         /* M2.41: both sides FLAT — a plain
                                          * merge, capped at TX_AR_CHAIN_MAX.
                                          * When the union exceeds the cap
-                                         * (13-20-value sets that the old
-                                         * cap would have deferred, now
-                                         * flat), freeze it as a PRE-MERGED
-                                         * union record op(flat(F1),
-                                         * flat(F2)) so a >20 flat join
-                                         * still feeds the chain instead of
-                                         * collapsing to UNKNOWN. Both
-                                         * sides are frozen as they stand
-                                         * at this head — the carry's and
-                                         * the arrival's sets are exact for
-                                         * their paths — so the merged
-                                         * store is the join's true set.
-                                         * An empty or unknown side keeps
-                                         * the old collapse (the M2.34
-                                         * first-iteration behavior). */
+                                         * (sets that the old cap would
+                                         * have deferred, now flat), freeze
+                                         * it as a PRE-MERGED union record
+                                         * op(flat(F1), flat(F2)) so a
+                                         * >cap flat join still feeds the
+                                         * chain instead of collapsing to
+                                         * UNKNOWN. Both sides are frozen
+                                         * as they stand at this head —
+                                         * the carry's and the arrival's
+                                         * sets are exact for their paths —
+                                         * so the merged store is the
+                                         * join's true set. An empty or
+                                         * unknown side keeps the old
+                                         * collapse (the M2.34
+                                         * first-iteration behavior).
+                                         * M2.42: with TX_AR_CHAIN_MAX ==
+                                         * TX_AR_CHAIN_BIG this branch is
+                                         * UNREACHABLE — a >64 union can
+                                         * never chain (the emission gate
+                                         * rejects ncand > 64), and the
+                                         * allocator's cap-check returns
+                                         * -1, so it collapses exactly as
+                                         * the plain merge would. */
                                         struct ChainSet carry = cur[s];
                                         const struct ChainSet* arr = &g_chain_arr[s][pc];
                                         chain_merge(&cur[s], arr);
@@ -3074,8 +3088,13 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                      * at this instruction — instead of
                                      * falling to UNKNOWN; the flat-cap
                                      * overflow path (M2.30) got the same
-                                     * freeze, so an in-place product over a
-                                     * >20 flat set defers soundly. */
+                                     * freeze, so an in-place product over
+                                     * a >cap flat set defers soundly.
+                                     * M2.42: with equal caps this is
+                                     * UNREACHABLE — an in-place product
+                                     * whose image exceeds 64 materializes
+                                     * > 64 candidates, which the emission
+                                     * gate rejects. */
                                     int da = (s_a >= 0 && cur[s_a].def >= 0);
                                     int db = (!use_imm && s_b >= 0 && cur[s_b].def >= 0);
                                     if (!use_imm && (da || db) && !sa->unk && !sb->unk) {
@@ -3147,9 +3166,13 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                                          * source is frozen as a CD_FLAT
                                          * operand (snapshotted above, before
                                          * the image write), so an in-place
-                                         * product over a >20 flat set
+                                         * product over a >cap flat set
                                          * (chain13's second product) defers
-                                         * soundly instead of collapsing. */
+                                         * soundly instead of collapsing.
+                                         * M2.42: with equal caps this is
+                                         * UNREACHABLE — the image overflow
+                                         * means > 64 candidates, which can
+                                         * never chain. */
                                         if (!use_imm && cur[s].unk && s_a >= 0 && s_b >= 0) {
                                             int rd_is_a = (rd == w_ra(w));
                                             int rd_is_b = (!use_imm && rd == w_rb_reg(w));
