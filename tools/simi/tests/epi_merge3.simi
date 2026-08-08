@@ -1,0 +1,34 @@
+; epi_merge3.simi — M2.15 follow-up: the THIRD cursor class of the
+; epilogue/prologue merge (flags = 1). Same single-edge backward fold
+; as epi_merge/epi_merge2 (pattern@T, RET@T+1, two LOADIs@T+2/T+3,
+; matching tail@T+4, fold@T+5), but the live region has FOUR distinct
+; results (r2, r1, r6, r7) — the result count mod 3 is 1, so the
+; tail's result lands in x10 (the cursor slot), CLOBBERING the g2 (r1)
+; transient. Only the g1 (r2) fetch survives the fold's flush (x9),
+; so the head drops ONLY the FIRST fetch (flags = 1): its second
+; reload of r1 stays — reading the unchanged slot (the live region's
+; flush stored r1 = 4 at pc 5's BR) — while the dropped r2 read comes
+; from x9's surviving transient. This is the mirror of epi_merge2
+; (which has cnt mod 3 = 0, flags = 2): there the tail's result
+; clobbers x9 and only the second fetch drops; here it clobbers x10
+; and only the FIRST drops. A bug that computes flags = 2 or 3 for
+; this shape reads x10 = the tail's result (7) as r1 and computes
+; 3 + 7 = 10 instead of 7 — the four-way parity fails on its own,
+; pinning the flags formula's third branch (c != 1 -> bit 2).
+; Expected result: 7 (r0 = r2 + r1 = 3 + 4)
+.entry main
+main:
+    ENTER #8
+    LOADI r2, #3, i64        ; pc 1 — the pattern's first source (r2 = 3)
+    LOADI r1, #4, i64        ; pc 2 — the pattern's second source (r1 = 4)
+    LOADI r6, #8, i64        ; pc 3 — third distinct live result (cursor advance)
+    LOADI r7, #9, i64        ; pc 4 — fourth distinct live result (cnt = 4, cursor 1)
+    BR src                   ; pc 5 — T-1: terminal, jumps INTO the fold source
+target:                      ; pc 6 = T — reached only via the fold at pc 11
+    ADD r0, r2, r1, i64      ; pc 6 — the pattern: reads r2, r1 — r0 = 7
+    RET                      ; pc 7 — returns r0 = 3 + 4 = 7
+src:                         ; pc 8 — the fold source (the BR target)
+    LOADI r4, #6, i64        ; pc 8 — fold index (r4 = 6, folds BACKWARD to pc 6)
+    LOADI r5, #9, i64        ; pc 9 — second dead-region result
+    ADD r9, r2, r1, i64      ; pc 10 — the tail: reads r2, r1 (same pattern)
+    JMPR r4                  ; pc 11 — folds to pc 6 — the single incoming edge

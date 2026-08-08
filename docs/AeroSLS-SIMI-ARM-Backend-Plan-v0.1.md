@@ -1822,8 +1822,154 @@ always has an entry edge too), and the emission-order constraint — the
 head is compiled before the source, so the runtime register state at
 the head must be derivable from a rigid, statically-known layout — is
 what keeps the analysis from generalizing to arbitrary backward folds.
-The §10.30-era fixpoint-vs-coalescing interactions remain the open
-frontier.
+### 10.38 M2.16 amendment — the fixpoint-vs-coalescing interaction (as designed)
+
+M2.16 closes the §10.37 frontier by DESIGN, not by a code change — the
+pass order already achieves what a re-ordering would, and the milestone
+proves it. The interaction §10.30 named: "clearing marks happens after
+the fold fixpoint converges, so a chain that a fused boundary would
+newly enable to fold is missed." The question is whether the
+coalescing pass's mark changes can ever change WHICH JMPRs fold — and
+whether a re-run of the fold analysis after coalescing would emit
+different code.
+
+The answer is no, by the following mark-identity argument. The
+fixpoint's block-head marks come from exactly three sources: pass-A
+BR/BC/CALL targets, entry trampolines, and rule-1 fold targets — and
+M2.13's rule-1 skip means a fall-through fold's OWN target is never
+one of them. The coalescing pass clears `g_pc_target[t]` only when the
+fall-through target t has NO other incoming edge, where "other edges"
+are counted with the IDENTICAL formulas: BR/BC/CALL (q+1+imm28,
+same bounds check), other folded JMPRs (`g_jmpr_fold[q] == t`, with
+q == pc excluded — and a fall-through fold into t would require q ==
+t-1 == pc, so any counted fold is non-fall-through and rule-1 marked
+t), and entry trampolines. Every mark the fixpoint sets is therefore
+an "other edge" that forces the coalescing pass to RE-MARK, never to
+clear; every mark it clears was never set. The post-coalescing
+fold-relevant mark set is IDENTICAL to the fixpoint's, so a re-run of
+the fold analysis (the literal pass-order fix) reproduces g_jmpr_fold
+exactly — byte-neutral. The identity is exact because the fixpoint's
+convergence is exact: the rule-1 marks are a deterministic function of
+the fold set (M = f(S)), and convergence S_k == S_{k-1} forces
+M_k == M_{k-1}, so the final scan — the one that produced the
+converged folds — already saw every mark a re-run would see. This was
+corroborated empirically: temporary instrumentation comparing
+g_pc_target before and after the coalescing pass printed "marks
+identical after coalescing" for all 39 corpus programs that carry an
+expected result (the full parity set).
+
+The invariant to preserve is stated once, for future pass authors:
+**the coalescing pass changes no fold-relevant mark.** M2.13's rule-1
+skip is the mechanism that keeps it true (fall-through fold targets
+are never marked, so the chain across them folds regardless of whether
+the target is fused — the fusion is a flush-removal win, not a
+fold-enabler). A future change that re-introduces mark-all, or adds a
+new mark source that the coalescing scan does not count as an edge,
+re-opens the interaction; the general fix would then be the joint
+(marks, folds) convergence loop — fixpoint, coalescing, re-run,
+re-run-coalescing — which terminates because folds are monotone in the
+mark set. jmpr_cross pins the current closed state.
+
+- **`tests/jmpr_cross.simi`** — the first corpus test of a chain
+  CROSSING a fused fall-through fold's target. Fold A (pc 3 -> pc 4,
+  target == pc+1) is dropped and fused (pc 4 has no other incoming
+  edge); r2 (fold B's index) is loaded at pc 1, BEFORE pc 4, and read
+  at pc 5. The rule-1 skip lets the constant survive the unmarked
+  boundary, B folds to pc 7, and g_alloc stays 1 — dump-verified: the
+  ADD at pc 4 reads r2 straight from the resident cache (no reload),
+  no boundary flush, and ZERO dynamic-path words (no runtime table,
+  no bounds check). jmpr_fall2 pins the CASCADE; jmpr_cross pins the
+  GENERAL shape §10.30 named. Expected 19.
+
+### 10.39 M2.16 gate results (measured)
+
+Total emitted bytes across the now-37-program parity set: **M0 50680
+→ M1 46368, 4312 saved** (≈8.5%), up from M2.15's 4092. The M2.16
+row on top of M2.15's 4092:
+
+- jmpr_cross 1212 → 992 (−220, new 37th row; M0 baseline measured at
+  git 1729f50 like every other row — the committed M0 translator
+  emits both JMPRs as dynamic table + bounds-check paths, g_alloc=0,
+  naive codegen). The teeth isolate the two mechanisms' own
+  contributions (they do not partition the 220 — the rest is the M1
+  pipeline's codegen win vs M0's naive path, present regardless of the
+  folds): reverting M2.13's rule-1 skip to mark-all grows it to
+exactly 1164 (+172 — fold B's chain resets at the fused target, B
+goes dynamic, g_alloc dies, the runtime table returns), and
+disabling the coalescing (fold-target check pc+1 → pc+9999) grows it
+to exactly 1000 (+8 — fold A's dead branch + flush, the branch-drop
+side of coalescing; the fusion itself is worth 0 here because the
+rule-1 skip left pc 4 unmarked anyway, which is precisely why the
+fusion is not a fold-enabler); the same two teeth move jmpr_fall2 by
+its exact M2.13 measurements (+200 and +16).
+  Both teeth states still verify 19 — correctness is preserved either
+  way, which is what the four-way parity proves.
+- Row-by-row M2.15-vs-M2.16 accounting (gate tables diffed): all 36
+  shared rows byte-identical — nothing else grew or shrank. The
+  totals move by exactly the new jmpr_cross row: the byte-neutral
+  re-run claim holds for the whole corpus, not just the new test.
+- Four-way parity: interp 39/0, x86 38/0/3, RV64 37/0/4, ARM 37/0/4.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
+
+The M-line has now compounded to 4312 bytes saved, and §10.37's last
+frontier — the fixpoint-vs-coalescing interaction — is closed by the
+mark-identity argument, pinned by jmpr_cross, and protected by the
+two teeth (mark-all and coalescing-off) whose deltas are recorded
+above. The remaining named levers on the branch ledger are the
+emission-order constraint on epi-merge generalization (§10.37) and
+the flags=1 cursor class (the mirror of epi_merge2, unexercised — the
+formula and hook are shared, so it is a follow-up pin rather than a
+gap). §10.40 closes that last pin.
+
+### 10.40 M2.15 follow-up — the flags=1 cursor class (as pinned)
+
+§10.39's "follow-up pin" — the third cursor class of the M2.15
+epilogue/prologue merge, flags = 1 — is now exercised by
+**`tests/epi_merge3.simi`**. simi_arm.c is unchanged: the pass's flag
+formula `((c != 0) ? 1 : 0) | ((c != 1) ? 2 : 0)` and the main-loop
+hook already handle the class, which is why it was a pin and not a
+code change. The layout is the rigid epi_merge shape (pattern@T,
+RET@T+1, two LOADIs@T+2/T+3, matching tail@T+4, fold@T+5) with FOUR
+distinct live results (r2, r1, r6, r7) — the result count mod 3 is 1,
+so the tail's result lands in x10, CLOBBERING the g2 (r1) transient:
+only the g1 (r2) fetch survives the fold's flush (x9), and the head
+drops ONLY its FIRST fetch (flags = 1), keeping the r1 reload — the
+mirror of epi_merge2 (count mod 3 = 0, flags = 2, the second fetch
+drops). The three classes are now all pinned: c=0 → flags=2
+(epi_merge2), c=1 → flags=1 (epi_merge3), c=2 → flags=3 (epi_merge)
+— the cursor-class ledger is closed.
+
+Live-executed like epi_merge: the live path BRs (pc 5, the T-1
+terminal) into the fold source, flows LOADI r4=6 → LOADI r5=9 → tail
+ADD r9 (r2+r1=7) → JMPR r4 (folds backward to T=6) → head ADD r0
+(r2+r1) → RET, returning 7. The dropped r2 read comes from x9's
+surviving transient; the kept r1 reload reads the unchanged slot (the
+live region's flush stored r1 = 4 at pc 5's BR). The tail's r2 fetch
+into x9 evicts the resident r5 (a decoy LOADI result, standard
+clobber behavior — the same eviction epi_merge's tail performs on its
+LOADI residents), so the fold's flush stores only r4 and r9 and x9's
+r2 transient survives — dump-verified: the head emits exactly ONE
+ldr (the r1 reload into x10) then `add x10, x9, x10` = 7. A bug that
+computes flags = 2 or 3 for this shape reads x10 = the tail's result
+(7) as r1 and computes 10 instead of 7 — the four-way parity fails on
+its own, pinning the formula's `c != 1` branch.
+
+### 10.41 M2.15-follow-up gate results (measured)
+
+Total emitted bytes across the now-38-program parity set: **M0 51860
+→ M1 47400, 4460 saved** (≈8.5%), up from M2.16's 4312. The new row
+on top of M2.16's 4312:
+
+- epi_merge3 1180 → 1032 (−148, new 38th row; M0 baseline measured
+  at git 1729f50). Disabling the merge (the fetch-drop hook) grows it
+  back to exactly 1036 — the one kept fetch, 4 bytes — the exact
+  mirror of epi_merge2's teeth (+4), while epi_merge's two dropped
+  fetches measure +8. All teeth states still verify 7.
+- Row-by-row M2.15-vs-now accounting (gate tables diffed): all 36
+  shared rows byte-identical — the totals move by exactly the two new
+  rows (jmpr_cross +220, epi_merge3 +148).
+- Four-way parity: interp 40/0, x86 39/0/3, RV64 38/0/4, ARM 38/0/4.
+  enc-check clean; jmpr_oob still faults (UDF, rc=1).
 
 ---
 

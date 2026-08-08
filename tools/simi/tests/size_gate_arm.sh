@@ -170,7 +170,40 @@
 # and computes 11 instead of 7 — the four-way parity fails on its own,
 # pinning the flags formula's asymmetric branch — 140 bytes below its
 # M0 baseline, and disabling the merge grows it back to exactly 1024
-# (the one kept fetch, 4 bytes), still correct. mem_pre is M2.10:
+# (the one kept fetch, 4 bytes), still correct. epi_merge3 is the
+# M2.15 follow-up that closes the cursor-class ledger: FOUR distinct
+# live results (r2, r1, r6, r7) make the result count mod 3 = 1, so
+# the tail's result lands in x10 and CLOBBERS the g2 (r1) transient —
+# the mirror of epi_merge2. Only the g1 (r2) fetch survives the fold's
+# flush (x9), so the head drops ONLY its FIRST fetch (flags = 1) and
+# its second reload of r1 stays (reading the unchanged slot — the live
+# region's flush stored r1 = 4 at pc 5's BR). A bug that computes
+# flags = 2 or 3 for this shape reads x10 = the tail's result (7) as
+# r1 and computes 10 instead of 7 — the four-way parity fails on its
+# own, pinning the flags formula's third branch — 148 bytes below its
+# M0 baseline, and disabling the merge grows it back to exactly 1036
+# (the one kept fetch, 4 bytes), still correct. jmpr_cross is
+# M2.16: the §10.30-era FIXPOINT-vs-COALESCING interaction, pinned. A
+# folded JMPR to the very next pc (fold A, pc 3 -> pc 4) is a dead
+# branch the coalescing pass DROPS and FUSES (pc 4 has no other
+# incoming edge) — but pc 4 sits INSIDE another JMPR's index chain: r2
+# (fold B's index) is loaded at pc 1, BEFORE pc 4, and read at pc 5.
+# Under M2.12's mark-all merge, the rule-1 mark on pc 4 reset the
+# constant map at the fused boundary, un-folding B — and a JMPR that
+# fails to fold is DYNAMIC, which kills g_alloc for the whole function.
+# M2.13's rule-1 skip (fall-through fold targets are never marked by
+# the merge — the coalescing pass is the authority on their mark) lets
+# the chain flow through the fused boundary: r2 survives from pc 1
+# across pc 4 to B, B folds to pc 7, and g_alloc stays 1 — 220 bytes
+# below its M0 baseline, and reverting the skip to mark-all grows it
+# back to exactly 1164 (B dynamic, g_alloc=0, runtime table + bounds
+# check return), still correct. The same teeth move jmpr_fall2 by its
+# exact M2.13 measurement (+200) — the two shapes the skip protects.
+# The pass-order design note is plan doc §10.38: a post-coalescing
+# re-run of the fold analysis is byte-neutral (the coalescing pass
+# changes no fold-relevant mark — verified by instrumentation across
+# the whole corpus), so the fixpoint-vs-coalescing frontier is closed
+# by construction, not by ordering. mem_pre is M2.10:
 # ANY displacement that fits A64's signed 9-bit imm9 ([-256, 255])
 # folds into a single unscaled ldr/str xt, [xb, #imm] word — one word,
 # no writeback, no alignment requirement, superseding the M2.9
@@ -220,8 +253,8 @@ declare -A M0_BASELINES=(
     [cap_call_ret]=3192    [cap_forge]=1336 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
-    [epi_merge]=1140 [epi_merge2]=1160
+    [jmpr_cross]=1212 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312
+    [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
