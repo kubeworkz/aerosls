@@ -50,6 +50,53 @@ static int store_mem(struct A64Cpu* cpu, uint64_t addr, int width, uint64_t val)
     return 1;
 }
 
+/* ─── F0 (Phase 10 float): IEEE-754 bit-reinterpretation ────────────────
+ * T_F64 = a double in the low 64 bits of vN, T_F32 = a single in the low
+ * 32 bits (high 32 zeroed on s-form writes) — the same union trick as
+ * simi_interp.c's f64_of_bits/bits_of_f64, so the executor and the
+ * reference interpreter compute the identical bit patterns: same C
+ * `double`/`float` types, same -std=c11 -O2 flags (no -ffast-math),
+ * default IEEE-754 rounding. That sameness IS the F0 bit-identity
+ * contract — a64_exec.c is host-only tooling like simi_interp.c, never
+ * compiled into the kernel's -mno-sse builds. */
+static double f64_of_bits(uint64_t b) { union { uint64_t u; double d; } c; c.u = b; return c.d; }
+static uint64_t bits_of_f64(double d) { union { uint64_t u; double d; } c; c.d = d; return c.u; }
+static float f32_of_bits(uint64_t b) { union { uint32_t u; float f; } c; c.u = (uint32_t)b; return c.f; }
+static uint64_t bits_of_f32(float f) { union { uint32_t u; float f; } c; c.f = f; return (uint64_t)c.u; }
+
+/* F0: real A64 FCMP flag model, verified against the ARM semantics for
+ * the unordered (NaN) case: FCMP sets NZCV = N=1, Z=0, C=1, V=1 for an
+ * unordered comparison, and for ordered ones C = (a >= b), Z = (a == b),
+ * N = (a < b), V = 0. From those flags the condition codes give
+ *   EQ (Z)          : equal → 1, NaN → 0            — IEEE EQ ✓
+ *   NE (!Z)         : NaN → 1                        — IEEE NE ✓
+ *   LT (N != V)     : lt → 1, unordered → 0          — IEEE LT ✓
+ *   LE (Z || N!=V)  : le → 1, unordered → 0          — IEEE LE ✓
+ *   GT (!Z && N==V) : unordered → 1 !!               — IEEE GT ✗
+ *   GE (N == V)     : unordered → 1 !!               — IEEE GE ✗
+ * So GT and GE cannot be a single cset — the F1 codegen compares the
+ * SWAPPED operands (fcmp b,a) and cset lt/le, exactly the x86
+ * seta/setae-via-swap finding; this executor's job is the flag model
+ * below, which is what makes both the direct and the swapped paths
+ * come out right. The three NaN checks in float_ops.simi + the NaN
+ * GT/GE pins in a64_f0_test.c are the discriminators. */
+static void fcmp_flags(struct A64Cpu* cpu, int is_d, uint64_t abits, uint64_t bbits) {
+    int nan, lt, eq, ge;
+    if (is_d) {
+        double a = f64_of_bits(abits), b = f64_of_bits(bbits);
+        nan = (a != a) || (b != b);
+        lt = (a < b); eq = (a == b); ge = (a >= b);
+    } else {
+        float a = f32_of_bits(abits), b = f32_of_bits(bbits);
+        nan = (a != a) || (b != b);
+        lt = (a < b); eq = (a == b); ge = (a >= b);
+    }
+    cpu->n = (uint8_t)(nan || lt);
+    cpu->z = (uint8_t)(!nan && eq);
+    cpu->c = (uint8_t)(nan || ge);
+    cpu->v = (uint8_t)nan;
+}
+
 /* ─── NZCV flag model ───────────────────────────────────────────────────
  * add_flags/sub_flags compute the 64-bit result AND the N/Z/C/V flags
  * exactly as real A64 SUBS/ADDS do. The formulas:
@@ -300,6 +347,96 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             uint64_t prod = rx(cpu, rn) * rx(cpu, rm);
             uint64_t r = sub ? rx(cpu, ra) - prod : rx(cpu, ra) + prod;  /* MUL: ra==31 = XZR */
             set_x(cpu, rd, r);
+            cpu->pc = next_pc;
+            continue;
+        }
+
+        /* ─── Scalar floating point, the 0x1E family (F0, Phase 10) —──
+         * sf=0 (bit 31 = 0), u=0 (bit 30 = 0), bits 28:24 = 11110:
+         * the fenced mask (w & 0x1F000000) == 0x1E000000 and bit 21 =
+         * 1 selects exactly {FADD/FSUB/FMUL/FDIV 3-same, FMOV 1-src
+         * scalar copy, FCMP, FMOV general 32-bit}. Bit 22 = sz (0 = S,
+         * 1 = D); bit 23 = 1 is fp16 (0x3E family — never emitted,
+         * BAD_INSTR). Split by bits 15:10, verified bit-for-bit
+         * against QEMU's a64.decode:
+         *   FMUL 000010, FDIV 000110, FADD 001010, FSUB 001110
+         *     (Rm@20:16, Rn@9:5, Rd@4:0)
+         *   1-src: 010000 (opcode@20:16 — 00000 = FMOV copy only)
+         *   FCMP:  001000 (Rm@20:16, Rn@9:5, e@4, z@3)
+         *   FMOV general 32: 000000 (opcode@20:16 — 00110 = w←s,
+         *     00111 = s←w; sf=0 forces type 00, bit 22 = 0)
+         * The s-form arithmetic/fmov writes zero the high 32 bits of
+         * the destination f-register, per real A64. */
+        if ((w & 0x1F000000u) == 0x1E000000u && (w & 0x200000u) && !(w & 0x80000000u)) {
+            int sz = (int)((w >> 22) & 1);          /* 0 = S, 1 = D */
+            uint32_t mid = (w >> 10) & 0x3F;        /* bits 15:10 */
+            int rm = (int)((w >> 16) & 0x1F);
+            int rn = (int)((w >> 5) & 0x1F);
+            int rd = (int)(w & 0x1F);
+            if (sz) {                               /* 64-bit d-form */
+                switch (mid) {
+                    case 0x02: cpu->f[rd] = bits_of_f64(f64_of_bits(cpu->f[rn]) * f64_of_bits(cpu->f[rm])); break;
+                    case 0x06: cpu->f[rd] = bits_of_f64(f64_of_bits(cpu->f[rn]) / f64_of_bits(cpu->f[rm])); break;
+                    case 0x0A: cpu->f[rd] = bits_of_f64(f64_of_bits(cpu->f[rn]) + f64_of_bits(cpu->f[rm])); break;
+                    case 0x0E: cpu->f[rd] = bits_of_f64(f64_of_bits(cpu->f[rn]) - f64_of_bits(cpu->f[rm])); break;
+                    case 0x10: {                    /* 1-src: FMOV Dd, Dn */
+                        if (((w >> 16) & 0x1F) != 0) return AR_EXEC_BAD_INSTR;  /* FABS/FNEG/FSQRT/FRINT not emitted */
+                        cpu->f[rd] = cpu->f[rn];
+                        break;
+                    }
+                    case 0x08: {                    /* FCMP Dn, Dm / Dn, #0.0 */
+                        int with_zero = (int)((w >> 3) & 1);
+                        fcmp_flags(cpu, 1, cpu->f[rn], with_zero ? 0ull : cpu->f[rm]);
+                        break;
+                    }
+                    default: return AR_EXEC_BAD_INSTR;   /* 0x00 + sz=1, FP-imm, FCVT, fp16 — not emitted */
+                }
+            } else {                                /* 32-bit s-form */
+                switch (mid) {
+                    case 0x02: cpu->f[rd] = bits_of_f32(f32_of_bits(cpu->f[rn]) * f32_of_bits(cpu->f[rm])); break;
+                    case 0x06: cpu->f[rd] = bits_of_f32(f32_of_bits(cpu->f[rn]) / f32_of_bits(cpu->f[rm])); break;
+                    case 0x0A: cpu->f[rd] = bits_of_f32(f32_of_bits(cpu->f[rn]) + f32_of_bits(cpu->f[rm])); break;
+                    case 0x0E: cpu->f[rd] = bits_of_f32(f32_of_bits(cpu->f[rn]) - f32_of_bits(cpu->f[rm])); break;
+                    case 0x10: {                    /* 1-src: FMOV Sd, Sn */
+                        if (((w >> 16) & 0x1F) != 0) return AR_EXEC_BAD_INSTR;
+                        cpu->f[rd] = cpu->f[rn] & 0xFFFFFFFFull;   /* zero the high 32 */
+                        break;
+                    }
+                    case 0x08: {                    /* FCMP Sn, Sm / Sn, #0.0 */
+                        int with_zero = (int)((w >> 3) & 1);
+                        fcmp_flags(cpu, 0, cpu->f[rn], with_zero ? 0ull : cpu->f[rm]);
+                        break;
+                    }
+                    case 0x00: {                    /* FMOV general 32-bit: fmov w0,s1 / fmov s0,w1 */
+                        uint32_t opc = (w >> 16) & 0x1F;
+                        if (opc == 0x06)      cpu->x[rd] = cpu->f[rn] & 0xFFFFFFFFull;   /* FP → GP, zero-extend */
+                        else if (opc == 0x07) cpu->f[rd] = cpu->x[rn] & 0xFFFFFFFFull;   /* GP → FP, zero the high 32 */
+                        else return AR_EXEC_BAD_INSTR;   /* FCVT/SCVTF/etc. not emitted */
+                        break;
+                    }
+                    default: return AR_EXEC_BAD_INSTR;
+                }
+            }
+            cpu->pc = next_pc;
+            continue;
+        }
+
+        /* ─── FMOV general 64-bit (F0): fmov x0,d1 / fmov d0,x1 —──
+         * sf=1 (bit 31) family: 1001 1110 01 1 <opc> 000000 Rn Rd,
+         * i.e. (w & 0xFF000000) == 0x9E000000 with type (bits 23:22)
+         * = 01 (D); type 10/11 are the fp16/Q forms, never emitted.
+         * opcode@20:16: 00110 = FP → GP (Xd, Dn), 00111 = GP → FP
+         * (Dd, Xn). Verified against QEMU's a64.decode FMOV_xd /
+         * FMOV_dx patterns. */
+        if ((w & 0xFF000000u) == 0x9E000000u) {
+            if ((w & 0xC00000u) != 0x400000u) return AR_EXEC_BAD_INSTR;  /* type != 01 */
+            if (((w >> 10) & 0x3F) != 0)       return AR_EXEC_BAD_INSTR;
+            uint32_t opc = (w >> 16) & 0x1F;
+            int rn = (int)((w >> 5) & 0x1F);
+            int rd = (int)(w & 0x1F);
+            if (opc == 0x06)            cpu->x[rd] = cpu->f[rn];
+            else if (opc == 0x07)       cpu->f[rd] = cpu->x[rn];
+            else return AR_EXEC_BAD_INSTR;
             cpu->pc = next_pc;
             continue;
         }
