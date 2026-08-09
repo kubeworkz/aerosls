@@ -923,6 +923,17 @@
 # stays valid — the M2.9 clobber_scratch pin is gone) — 540 bytes
 # below its M0 baseline, and disabling the unscaled fold grows it back
 # to 1552.
+# cas_simple and atomic_add are A3 (SIMI Phase 15 atomics): neither
+# existed at M0 (they arrived with the A0 ISA), so their M0-equivalents
+# are the NAIVE emissions measured with the A3 translator forced to
+# g_alloc=0 — the same honest substitute float_ops's 2340 used. The
+# atomics codegen's `if (!g_alloc)` branch (h_base=x10, h_other=x11,
+# no cache flush/reserve) degrades to exactly the M0 sequences, so the
+# baseline is the M0-era shape, measured not invented. The cached
+# emission wins 44 bytes on cas_simple (1416->1372) and 24 on
+# atomic_add (1220->1196) — the register frame loaded once, not once
+# per instruction, and the CAS loop's old-value host reused for the
+# stlxr status (zero extra words for the retry/result plumbing).
 # float_ops is F1
 # (SIMI Phase 10 float codegen): the row's 2340 M0-equivalent is the
 # NAIVE emission measured with the F1 translator forced to g_alloc=0
@@ -961,8 +972,9 @@ VERIFY=../simi-arm-verify
 # name: M0 bytes (from git 1729f50, built + measured 2026-08-07)
 declare -A M0_BASELINES=(
     [add]=976 [aggregate_abi]=4592 [alu_imm]=1132 [alu_imm_ext]=1196
+    [atomic_add]=1220
     [branch_cmp]=1096 [call_ret]=1932
-    [cap_call_ret]=3192    [cap_forge]=1336    [dead_reuse]=1188 [extra_ops]=1140
+    [cap_call_ret]=3192    [cap_forge]=1336    [cas_simple]=1416 [dead_reuse]=1188 [extra_ops]=1140
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272

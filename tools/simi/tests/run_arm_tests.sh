@@ -38,14 +38,10 @@ for src in *.simi; do
         skip=$((skip+1))
         continue
     fi
-    # Phase 15 (shared-memory atomics) A0: CAS/ATOMIC_ADD landed in the
-    # ISA + interpreter; the A64 translator gets them at A3 (ldaxr/stlxr
-    # loops). Until then its BAD_OPCODE rejection looks like a FAIL.
-    if [ "$name" = "cas_simple" ] || [ "$name" = "atomic_add" ]; then
-        echo "SKIP  $name (Phase 15 atomics: interpreter-only until A3; see plan doc Part II §7)"
-        skip=$((skip+1))
-        continue
-    fi
+    # Phase 15 (shared-memory atomics): the A0 skip block for
+    # cas_simple/atomic_add was removed at A3 — the A64 translator emits
+    # ldaxr/stlxr loops now, so both fixtures RUN here (cas_simple = 5,
+    # atomic_add = 2, through simi-arm-verify).
     expected=$(grep -oE 'Expected result: -?[0-9]+' "$src" | grep -oE -- '-?[0-9]+$')
     if [ -z "$expected" ]; then
         echo "SKIP  $name (no 'Expected result:' comment)"
