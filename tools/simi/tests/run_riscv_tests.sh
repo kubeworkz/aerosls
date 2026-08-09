@@ -90,6 +90,30 @@ else
 fi
 rm -f rv_exit.out rv_exit.err
 
+# The M-mode twin (rv-syscall-exit-test-m, compiled -DRISCV_MMODE): the
+# bare-metal branch never calls the firmware, so the failing stub's marker
+# must be ABSENT from stderr while the "no firmware to power off" message
+# fires and dispatch still terminates inside rv_halt.
+if ../rv-syscall-exit-test-m >rv_exitm.out 2>rv_exitm.err; then
+    if grep -q "\[SYSCALL\] SYS_SLS_EXIT, code=42" rv_exitm.out \
+       && grep -q "direct M-mode boot: no firmware to power off -- halting hart" rv_exitm.out \
+       && ! grep -q "sbi_system_reset() stub" rv_exitm.err \
+       && ! grep -q "dispatch returned" rv_exitm.err; then
+        echo "PASS  rv-syscall-exit-m (M-mode no-firmware branch + halt, reset never attempted)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  rv-syscall-exit-m (M-mode branch messages / stub-absence / halt not as expected)"
+        cat rv_exitm.out rv_exitm.err
+        fail=$((fail+1))
+    fi
+else
+    rc=$?
+    echo "FAIL  rv-syscall-exit-m (exit rc=$rc — dispatch crashed or did not halt)"
+    cat rv_exitm.out rv_exitm.err
+    fail=$((fail+1))
+fi
+rm -f rv_exitm.out rv_exitm.err
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
