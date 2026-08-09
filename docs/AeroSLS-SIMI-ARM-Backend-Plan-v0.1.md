@@ -5231,6 +5231,83 @@ M2.65 is a pure pin):
   — a truncated exhaustion fallback would UDF-trap its runtime
   291). enc-check clean, a64-f0 PASS, stress all-green.
 
+### 10.142 M2.66 — the deferred-UNION path probed: the cap check makes it unreachable at equal caps (as built)
+
+M2.66 answers the last structural question the M2.61–M2.65 cap
+series left open: can ANY UNION record survive the equal-caps
+collapse and fire a chain, or is the union allocator's cap check
+what makes it unreachable? This is a pure probe + pin: **simi_arm.c
+is unchanged**.
+
+**The structural argument.** At MAX = BIG = 96 the ONLY ways to
+create a record are (i) a flat product whose image exceeds MAX —
+its true set is > 96 by construction — and (ii) products over such
+a source (monotone in cardinality for every ALU op the image
+supports). Every product record therefore has a true set > 96, and
+its materialization overflows chain_merge_big → UNKNOWN. A UNION
+record (chain_def_alloc_union) must materialize each CD_REC operand
+over the current cur[] — a product record's flatten collapses — and
+the flat-flat union path (M2.41) only triggers when the merged walk
+set exceeds MAX, which the allocator's own merge then rejects. So
+no union record can be allocated at equal caps: the allocator's
+BIG-store cap check is the binding constraint, and the deferred-
+union machinery is structurally unreachable.
+
+**The probe (jmpr_chain42).** chain13's M2.37 skeleton scaled so
+the deferred side is a > 96-value product: R1 = r2 + r3 (r2 in
+{0,10,…,90}, r3 in {0..9} → all 100 values {0..99} distinct) defers
+as record 0; a BC (r5 = 0, not taken) delivers R1 at J1 while the
+flat arm writes r1 = #200 — OUTSIDE {0..99} — so the M2.36
+containment test fails and the M2.37 union path runs:
+chain_def_alloc_union(CD_REC rec0, CD_FLAT {200}) flattens its
+record side — rec0's 100-value true set OVERFLOWS the BIG store —
+returns -1, and r1 falls to FLAT UNKNOWN at the walk (instrumented:
+`ndef = 1, r1's def = -1`) — the dispatch is the TABLE, 0 b.eq, and
+runtime **232** (99 at the root, the flat arm's 200, then +32)
+passes the bounds check to block0 at pc 232 → LOADI #4200 → PASS
+on all four engines.
+
+**The control (BIG=128 ad hoc, the M2.55 direction, reverted).**
+rec0's materialization now fits the store (100 ≤ 128), the union
+record IS created (instrumented: `ndef = 3, r1's def = 2`), and the
+dispatch materializes {32..131} ∪ {232} = 101 candidates → the
+**101-pair chain fires** (dump: 101 b.eq, 0 table words, 4480 vs
+4656 bytes), runtime 232 = the LAST b.eq. The probe therefore proves
+the cap check is the binding constraint: the union path is REACHED,
+and the allocator's BIG-store check is what makes it unreachable at
+equal caps. 232 is the 101st candidate — any truncated
+materialization misses it and UDF-traps, so the four-way PASS proves
+the collapse is exact.
+
+### 10.143 M2.66 gate results (measured)
+
+Total emitted bytes across the now-95-program parity set: **M0
+251452 → M1 205664, 45788 saved**. One row added, **zero moved** —
+the totals delta is EXACTLY chain42's row (M0 +5612, M1 +4656), so
+all 94 shared rows are byte-identical (simi_arm.c untouched):
+
+- jmpr_chain42 5612 → 4656 (−956, new 94th row; M0 baseline
+  measured at git 1729f50) — the deferred-union probe: the
+  table path itself is byte-identical to M0's shape (no chain —
+  the union allocator rejects the over-cap record side); the
+  −956 is M2.24's table compaction (32-bit entries, 2-word
+  base) plus the accumulated emission folds, on a 237-
+  instruction body.
+- Row-by-row accounting: **all 94 shared rows byte-identical** —
+  the gate total moved by exactly chain42's M1. (A mid-
+  milestone control-residue caught in review: the gate was
+  first run against the BIG=128 control binary, moving
+  chain40's row by −412 and reporting chain42 at the control's
+  4480; rebuilding from the reverted source restored both —
+  chain40 6324, chain42 4656 — and the accounting above is the
+  shipped state.)
+- Four-way parity: 377 PASS, 0 FAIL — all 95 expected-result
+  programs on all four engines (interp 95/95, x86 94/0/3, RV64
+  94/0/3, ARM 94/0/3); chain42's table dispatch executes at
+  runtime on every engine (the ARM engine is the soundness check
+  — a truncated union materialization would UDF-trap its
+  runtime 232). enc-check clean, a64-f0 PASS, stress all-green.
+
 ---
 
 ## Sources consulted

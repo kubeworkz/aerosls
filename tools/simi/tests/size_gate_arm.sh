@@ -992,7 +992,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508 [jmpr_chain41]=7556 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508 [jmpr_chain41]=7556 [jmpr_chain42]=5612 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -1256,6 +1256,35 @@ declare -A M0_BASELINES=(
 # at git 1729f50) differs from M1 (6364) by the M2.24 table
 # compaction and the accumulated emission folds (-1192) — the table
 # path is byte-identical to M0's shape, no chain.
+# jmpr_chain42 is M2.66: the deferred-UNION path probed at the EQUAL
+# caps — the structural question of whether any UNION record can
+# survive at MAX = BIG = 96. The shape is chain13's skeleton scaled
+# so the deferred side is a > 96-value product: R1 = r2 + r3 (r2 in
+# {0,10,...,90}, r3 in {0..9} -> all 100 values {0..99} distinct >
+# MAX 96) defers as record 0; a BC (r5 = 0, not taken) delivers R1
+# at J1 while the flat arm writes r1 = #200 — OUTSIDE the set — so
+# the M2.36 containment test fails and the M2.37 union path runs:
+# chain_def_alloc_union flattens its record side, rec0's 100-value
+# true set OVERFLOWS the BIG store (chain_merge_big -> UNKNOWN), the
+# allocator returns -1, r1 falls to FLAT UNKNOWN at the walk
+# (instrumented: ndef = 1, r1's def = -1) — the dispatch is the
+# TABLE, 0 b.eq, and runtime 232 (99 at the root, the flat arm's
+# 200, then +32) passes the bounds check to block0 -> LOADI #4200 on
+# all four engines. The control (BIG=128 ad hoc, the M2.55
+# direction): rec0's materialization fits the store, the union
+# record IS created (ndef = 3, r1's def = 2), and the dispatch
+# materializes {32..131} U {232} = 101 candidates -> the 101-pair
+# chain FIRES (dump: 101 b.eq, 0 table words, 4480 vs 4656 bytes),
+# runtime 232 = the LAST b.eq. The probe proves the cap check is the
+# binding constraint: the union path is REACHED, and the allocator's
+# BIG-store check is what makes it unreachable at equal caps. 232 is
+# the 101st candidate — any truncated materialization misses it and
+# UDF-traps, so the four-way PASS proves the collapse is exact.
+# Pure pin: simi_arm.c unchanged, all 93 shared rows byte-identical.
+# This row's M0 baseline (5612, measured at git 1729f50) differs from
+# M1 (4656) by the M2.24 table compaction and the accumulated
+# emission folds (-956) — the table path is byte-identical to M0's
+# shape, no chain.
 
 pass=0
 fail=0
