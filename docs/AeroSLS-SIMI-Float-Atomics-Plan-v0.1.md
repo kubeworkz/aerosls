@@ -657,16 +657,41 @@ four engines. The evidence, all measured:
 
 ## 8. Honest verification caveats
 
-- **The four-way parity harness is single-threaded.** It proves the FUNCTIONAL
-  semantics — CAS success/failure and returned-old values, atomic-add results —
-  bit-identical across all four engines. It CANNOT prove concurrency semantics:
-  mutual exclusion, no lost updates under contention, ordering. That needs a
-  real-hardware multi-threaded stress harness — x86 has real hardware, but ARM
-  and RV64 need real boards or QEMU, neither available in this sandbox. Stated
-  plainly: **this plan delivers bit-identical single-threaded semantics and
-  documents the concurrency proof as a real-hardware follow-up, not glossed
-  over** (the same honesty standard Phase 5 used for its decoder+executor
-  evidence class).
+- **The four-way parity harness is single-threaded — CLOSED for x86 by the
+  real-hardware stress harness (`tools/simi/stress_atomics.c`).** The parity
+  harness proves the FUNCTIONAL semantics (CAS success/failure and returned-old
+  values, atomic-add results) bit-identical across all four engines; it cannot
+  prove concurrency semantics (mutual exclusion, no lost updates under
+  contention, ordering). That gap is now closed for the x86 leg by
+  `stress-atomics`: it translates `tests/stress_atomics.simi` (entries `main`
+  and `consumer`, sharing one scratch region) and runs it under pthreads, where
+  the A1 codegen's `lock cmpxchg` / `lock xadd` contend on REAL CPU cores —
+  M producer threads hammer a shared ATOMIC_ADD counter and CAS-claim the next
+  free slot of a bounded lock-free queue (writing their tid), while a single
+  consumer thread drains the queue concurrently. Every run checks seven
+  invariants: the counter equals M×R exactly (no lost updates), the CAS claim
+  index equals M×R (every claim succeeds exactly once), each of the M×R slots
+  holds exactly one producer's tid with a per-tid histogram of exactly R
+  (no double-claim, no skip, no lost write), the concurrent drainer sees all
+  M×R items (deq == M×R, 0 out-of-range values), and the M producer returns are
+  a permutation of 0..M-1 (the ATOMIC_ADD ticket claim gives each thread a
+  unique tid). Measured on this machine (12 WSL vCPUs): 8×20000 → 160000,
+  16×16000 / 32×8000 / 64×4000 → 256000, 64×10000 → 640000 slots, up to
+  **1,920,064 lock ops per run, every count exact at every thread count, all
+  checks passed**. The negative control proves the checks have teeth: a plain
+  non-atomic `cnt++` under the same load shape (8 threads × 2M) landed at
+  **7,398,330 of 16,000,000 — 53% of updates lost** — so an exact-count pass on
+  the SIMI-emitted `lock` codegen is meaningful, not trivially reachable. The
+  concurrent drainer's spin pattern (observe the enqueue counter, then read the
+  slot) is sound on x86 TSO — the producer's value store precedes its `lock
+  xadd` (a full barrier) — and is the documented ARM/RV64-unsound-without-A4
+  shape: **the ARM and RV64 legs still need real boards or QEMU (neither
+  available in this sandbox), or the deferred A4 acquire/release extension,
+  before their concurrency semantics can be claimed**. Stated plainly: this
+  plan delivers bit-identical single-threaded semantics everywhere, and the
+  concurrency proof on real hardware for x86 — the one target with real
+  hardware available (the same honesty standard Phase 5 used for its
+  decoder+executor evidence class).
 - `a64_exec.c`'s exclusive monitor must be modeled correctly — `ldaxr` marks the
   address, `stlxr` succeeds only if still marked, else the loop retries — or the
   loop spins forever. It is (A3): `excl_valid`/`excl_addr`, LDAXR arms, STLXR
@@ -680,6 +705,22 @@ four engines. The evidence, all measured:
   M0, and the naive path degrades to exactly the M0 sequences (the float_ops
   precedent); all 78 existing rows byte-identical, the two new rows additive
   (80 rows total, both parts strictly additive).
+
+### 7.5 A-stress status — LANDED (real-hardware x86 stress harness)
+
+The §8 concurrency gap is closed for the x86 leg: `tools/simi/stress_atomics.c`
+(+ `tests/stress_atomics.simi`, + the `stress-atomics` Makefile target, in
+`all`) runs the atomics under pthreads on real hardware — M producers hammer
+an ATOMIC_ADD shared counter and CAS-claim slots of a bounded lock-free queue
+while one consumer drains concurrently. Measured: every count exact at
+8/16/32/64 threads (up to 1,920,064 lock ops/run), the ticket leg yields a
+unique tid per thread, the slot walk shows exactly R writes per thread, and a
+plain non-atomic `cnt++` control loses 53% of updates on the same machine —
+the exact-count checks are meaningful. `stress_atomics` also joined the
+four-way parity corpus (single-threaded result 0) and the size gate
+(naive 2632 → cached 2568, -64). A4 (acquire/release on the reserved flags
+bits) stays deferred; the ARM/RV64 legs of the concurrency proof still need
+real hardware.
 
 ---
 

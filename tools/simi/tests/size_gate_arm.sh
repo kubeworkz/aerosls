@@ -949,6 +949,19 @@
 # fault path has no expected result, so it is checked by hand with
 # `./simi-arm-verify tests/jmpr_oob.tmo main 111` (expect rc=1 and
 # "execution error" — see the plan doc's M2 addendum, §10).
+# stress_atomics is the
+# Phase 15 concurrency stress fixture (tools/simi/stress_atomics.c runs it
+# under pthreads on real x86 hardware). Its row's 2632 M0-equivalent is
+# the NAIVE emission measured with the translator forced to g_alloc=0,
+# the same honest substitute cas_simple/atomic_add/float_ops used — the
+# fixture's consumer entry is unreachable from main and M2.23's
+# dead-function elimination drops it, so this row measures the producer
+# body only (the same code the harness actually executes). The cached
+# emission is 2568 (-64: the atomics' register-frame loads and the
+# enq/claim cells staying cache-resident across the loop, plus the
+# claim-loop's CAS kept entirely in the 3-slot cache). The suite runners
+# expect main's single-threaded result 0 (the harness-written M/R cells
+# are zero there).
 # straight_line_bench is the
 # interesting one: it is the register-pressure WORST case (six live
 # values vs a 3-register pool, so everything spills) and shrinks only 4
@@ -984,7 +997,7 @@ declare -A M0_BASELINES=(
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
     [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
-    [straight_line_bench]=1104 [tail_ret]=1048
+    [straight_line_bench]=1104 [stress_atomics]=2632 [tail_ret]=1048
 )
 
 pass=0
