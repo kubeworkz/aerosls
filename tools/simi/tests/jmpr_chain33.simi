@@ -1,0 +1,350 @@
+; jmpr_chain33.simi — M2.57: the deferred-record pool AT its 64-cap
+; (TX_AR_CHAIN_DEFS). The index is a 64-record DAG: the root product
+; r1 = r2 + r3 (r2 in {0,20,...,140}, r3 in {0..18 step 2} -> ALL even
+; numbers 0..158, 80 DISTINCT values > 64) OVERFLOWS the image merge
+; cap, so the walk DEFERS it (M2.30: record 0, CD_SLOT/CD_SLOT). Then
+; 63 IN-PLACE ADDs r1 = r1 + r4 with r4 = {2} (a singleton — the
+; tracked-register closure stays {r1,r2,r3,r4} = 4 <= TX_AR_CHAIN_REGS
+; 8): every product over the DEFERRED source defers (M2.32/M2.41:
+; record k = op(rec(k-1), slot(r4))) — 63 more records, 64 total =
+; TX_AR_CHAIN_DEFS EXACTLY, all allocating from the per-iteration
+; pool (the walk confirms def = 63 on r1's slot at the dispatch).
+; Under the shipped EQUAL caps the record machinery is conservative
+; (the M2.42 vestigial note): the root's 80-value true set OVERFLOWS
+; the BIG store on materialization (chain_merge_big collapses to
+; UNKNOWN, exact-or-conservative — it never keeps a truncated set),
+; so the dispatch falls to the TABLE — 0 b.eq, and runtime 252 (the
+; joins' fall-through arms 120 + 6, plus 63*2) dispatches through the
+; table's bounds check to block63's LOADI #7777. The two boundaries
+; are pinned by the ad-hoc controls: (A) TX_AR_CHAIN_BIG raised to
+; 128 — the same DAG materializes 80 values and the chain FIRES with
+; the 64 in-range candidates (even 126..252), runtime 252 taking the
+; SIXTY-FOURTH b.eq (sound when reachable); (B) a 65th in-place ADD
+; — the pool is exhausted (g_chain_ndef >= 64 -> -1), r1 falls to
+; UNKNOWN, and the dispatch is the table again (conservative, PASSes
+; its runtime 256 through the bounds check). Dump-verified (shipped):
+; 0 b.eq, the full table dispatch.
+; Expected result: 7777
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #0, i64 ; pc 2 — r2 arm 0 (0)
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:0} at J2)
+    LOADI r2, #20, i64 ; pc 4 — r2 arm 1 (20)
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:20} at J2)
+    LOADI r2, #40, i64 ; pc 6 — r2 arm 2 (40)
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:40} at J2)
+    LOADI r2, #60, i64 ; pc 8 — r2 arm 3 (60)
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:60} at J2)
+    LOADI r2, #80, i64 ; pc 10 — r2 arm 4 (80)
+    BC r0, J2           ; pc 11 — falls through (delivers {r2:80} at J2)
+    LOADI r2, #100, i64 ; pc 12 — r2 arm 5 (100)
+    BC r0, J2           ; pc 13 — falls through (delivers {r2:100} at J2)
+    LOADI r2, #140, i64 ; pc 14 — r2 arm 6 (140)
+    BC r0, J2           ; pc 15 — falls through (delivers {r2:140} at J2)
+    LOADI r2, #120, i64 ; pc 16 — r2 arm 7 (120)
+J2:                     ; (label) — join: r2 in {0,20,...,140}
+    LOADI r3, #18, i64 ; pc 17 — r3 arm 0 (18)
+    BC r0, J3           ; pc 18 — falls through (delivers {r3:18} at J3)
+    LOADI r3, #16, i64 ; pc 19 — r3 arm 1 (16)
+    BC r0, J3           ; pc 20 — falls through (delivers {r3:16} at J3)
+    LOADI r3, #14, i64 ; pc 21 — r3 arm 2 (14)
+    BC r0, J3           ; pc 22 — falls through (delivers {r3:14} at J3)
+    LOADI r3, #12, i64 ; pc 23 — r3 arm 3 (12)
+    BC r0, J3           ; pc 24 — falls through (delivers {r3:12} at J3)
+    LOADI r3, #10, i64 ; pc 25 — r3 arm 4 (10)
+    BC r0, J3           ; pc 26 — falls through (delivers {r3:10} at J3)
+    LOADI r3, #8, i64 ; pc 27 — r3 arm 5 (8)
+    BC r0, J3           ; pc 28 — falls through (delivers {r3:8} at J3)
+    LOADI r3, #4, i64 ; pc 29 — r3 arm 6 (4)
+    BC r0, J3           ; pc 30 — falls through (delivers {r3:4} at J3)
+    LOADI r3, #2, i64 ; pc 31 — r3 arm 7 (2)
+    BC r0, J3           ; pc 32 — falls through (delivers {r3:2} at J3)
+    LOADI r3, #0, i64 ; pc 33 — r3 arm 8 (0)
+    BC r0, J3           ; pc 34 — falls through (delivers {r3:0} at J3)
+    LOADI r3, #6, i64 ; pc 35 — r3 arm 9 (6)
+J3:                     ; (label) — join: r3 in {0..18 step 2}
+    ADD r1, r2, r3, i64 ; pc 36 — root: 80 evens > 64 -> record 0 (overflow defer)
+    LOADI r4, #2, i64   ; pc 37 — r4 = {2}: singleton shift source (+2/level)
+    ADD r1, r1, r4, i64 ; pc 38 — in-place level 1: record 1 = op(rec(0), r4)
+    ADD r1, r1, r4, i64 ; pc 39 — in-place level 2: record 2 = op(rec(1), r4)
+    ADD r1, r1, r4, i64 ; pc 40 — in-place level 3: record 3 = op(rec(2), r4)
+    ADD r1, r1, r4, i64 ; pc 41 — in-place level 4: record 4 = op(rec(3), r4)
+    ADD r1, r1, r4, i64 ; pc 42 — in-place level 5: record 5 = op(rec(4), r4)
+    ADD r1, r1, r4, i64 ; pc 43 — in-place level 6: record 6 = op(rec(5), r4)
+    ADD r1, r1, r4, i64 ; pc 44 — in-place level 7: record 7 = op(rec(6), r4)
+    ADD r1, r1, r4, i64 ; pc 45 — in-place level 8: record 8 = op(rec(7), r4)
+    ADD r1, r1, r4, i64 ; pc 46 — in-place level 9: record 9 = op(rec(8), r4)
+    ADD r1, r1, r4, i64 ; pc 47 — in-place level 10: record 10 = op(rec(9), r4)
+    ADD r1, r1, r4, i64 ; pc 48 — in-place level 11: record 11 = op(rec(10), r4)
+    ADD r1, r1, r4, i64 ; pc 49 — in-place level 12: record 12 = op(rec(11), r4)
+    ADD r1, r1, r4, i64 ; pc 50 — in-place level 13: record 13 = op(rec(12), r4)
+    ADD r1, r1, r4, i64 ; pc 51 — in-place level 14: record 14 = op(rec(13), r4)
+    ADD r1, r1, r4, i64 ; pc 52 — in-place level 15: record 15 = op(rec(14), r4)
+    ADD r1, r1, r4, i64 ; pc 53 — in-place level 16: record 16 = op(rec(15), r4)
+    ADD r1, r1, r4, i64 ; pc 54 — in-place level 17: record 17 = op(rec(16), r4)
+    ADD r1, r1, r4, i64 ; pc 55 — in-place level 18: record 18 = op(rec(17), r4)
+    ADD r1, r1, r4, i64 ; pc 56 — in-place level 19: record 19 = op(rec(18), r4)
+    ADD r1, r1, r4, i64 ; pc 57 — in-place level 20: record 20 = op(rec(19), r4)
+    ADD r1, r1, r4, i64 ; pc 58 — in-place level 21: record 21 = op(rec(20), r4)
+    ADD r1, r1, r4, i64 ; pc 59 — in-place level 22: record 22 = op(rec(21), r4)
+    ADD r1, r1, r4, i64 ; pc 60 — in-place level 23: record 23 = op(rec(22), r4)
+    ADD r1, r1, r4, i64 ; pc 61 — in-place level 24: record 24 = op(rec(23), r4)
+    ADD r1, r1, r4, i64 ; pc 62 — in-place level 25: record 25 = op(rec(24), r4)
+    ADD r1, r1, r4, i64 ; pc 63 — in-place level 26: record 26 = op(rec(25), r4)
+    ADD r1, r1, r4, i64 ; pc 64 — in-place level 27: record 27 = op(rec(26), r4)
+    ADD r1, r1, r4, i64 ; pc 65 — in-place level 28: record 28 = op(rec(27), r4)
+    ADD r1, r1, r4, i64 ; pc 66 — in-place level 29: record 29 = op(rec(28), r4)
+    ADD r1, r1, r4, i64 ; pc 67 — in-place level 30: record 30 = op(rec(29), r4)
+    ADD r1, r1, r4, i64 ; pc 68 — in-place level 31: record 31 = op(rec(30), r4)
+    ADD r1, r1, r4, i64 ; pc 69 — in-place level 32: record 32 = op(rec(31), r4)
+    ADD r1, r1, r4, i64 ; pc 70 — in-place level 33: record 33 = op(rec(32), r4)
+    ADD r1, r1, r4, i64 ; pc 71 — in-place level 34: record 34 = op(rec(33), r4)
+    ADD r1, r1, r4, i64 ; pc 72 — in-place level 35: record 35 = op(rec(34), r4)
+    ADD r1, r1, r4, i64 ; pc 73 — in-place level 36: record 36 = op(rec(35), r4)
+    ADD r1, r1, r4, i64 ; pc 74 — in-place level 37: record 37 = op(rec(36), r4)
+    ADD r1, r1, r4, i64 ; pc 75 — in-place level 38: record 38 = op(rec(37), r4)
+    ADD r1, r1, r4, i64 ; pc 76 — in-place level 39: record 39 = op(rec(38), r4)
+    ADD r1, r1, r4, i64 ; pc 77 — in-place level 40: record 40 = op(rec(39), r4)
+    ADD r1, r1, r4, i64 ; pc 78 — in-place level 41: record 41 = op(rec(40), r4)
+    ADD r1, r1, r4, i64 ; pc 79 — in-place level 42: record 42 = op(rec(41), r4)
+    ADD r1, r1, r4, i64 ; pc 80 — in-place level 43: record 43 = op(rec(42), r4)
+    ADD r1, r1, r4, i64 ; pc 81 — in-place level 44: record 44 = op(rec(43), r4)
+    ADD r1, r1, r4, i64 ; pc 82 — in-place level 45: record 45 = op(rec(44), r4)
+    ADD r1, r1, r4, i64 ; pc 83 — in-place level 46: record 46 = op(rec(45), r4)
+    ADD r1, r1, r4, i64 ; pc 84 — in-place level 47: record 47 = op(rec(46), r4)
+    ADD r1, r1, r4, i64 ; pc 85 — in-place level 48: record 48 = op(rec(47), r4)
+    ADD r1, r1, r4, i64 ; pc 86 — in-place level 49: record 49 = op(rec(48), r4)
+    ADD r1, r1, r4, i64 ; pc 87 — in-place level 50: record 50 = op(rec(49), r4)
+    ADD r1, r1, r4, i64 ; pc 88 — in-place level 51: record 51 = op(rec(50), r4)
+    ADD r1, r1, r4, i64 ; pc 89 — in-place level 52: record 52 = op(rec(51), r4)
+    ADD r1, r1, r4, i64 ; pc 90 — in-place level 53: record 53 = op(rec(52), r4)
+    ADD r1, r1, r4, i64 ; pc 91 — in-place level 54: record 54 = op(rec(53), r4)
+    ADD r1, r1, r4, i64 ; pc 92 — in-place level 55: record 55 = op(rec(54), r4)
+    ADD r1, r1, r4, i64 ; pc 93 — in-place level 56: record 56 = op(rec(55), r4)
+    ADD r1, r1, r4, i64 ; pc 94 — in-place level 57: record 57 = op(rec(56), r4)
+    ADD r1, r1, r4, i64 ; pc 95 — in-place level 58: record 58 = op(rec(57), r4)
+    ADD r1, r1, r4, i64 ; pc 96 — in-place level 59: record 59 = op(rec(58), r4)
+    ADD r1, r1, r4, i64 ; pc 97 — in-place level 60: record 60 = op(rec(59), r4)
+    ADD r1, r1, r4, i64 ; pc 98 — in-place level 61: record 61 = op(rec(60), r4)
+    ADD r1, r1, r4, i64 ; pc 99 — in-place level 62: record 62 = op(rec(61), r4)
+    ADD r1, r1, r4, i64 ; pc 100 — in-place level 63: record 63 = op(rec(62), r4)
+    JMPR r1             ; pc 101 — candidates {126, 128, ..., 252} (64, step 2),
+                        ; runtime 120 + 6 + 63*2 = 252 (the last)
+    LOADI r0, #0, i32   ; pc 102 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 103 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 104 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 105 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 106 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 107 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 108 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 109 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 110 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 111 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 112 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 113 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 114 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 115 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 116 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 117 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 118 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 119 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 120 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 121 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 122 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 123 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 124 — dead filler (aligns block0 to pc 126)
+    LOADI r0, #0, i32   ; pc 125 — dead filler (aligns block0 to pc 126)
+block0:                 ; pc 126
+    LOADI r0, #100, i32 ; pc 126
+    RET                 ; pc 127
+block1:                 ; pc 128
+    LOADI r0, #200, i32 ; pc 128
+    RET                 ; pc 129
+block2:                 ; pc 130
+    LOADI r0, #300, i32 ; pc 130
+    RET                 ; pc 131
+block3:                 ; pc 132
+    LOADI r0, #400, i32 ; pc 132
+    RET                 ; pc 133
+block4:                 ; pc 134
+    LOADI r0, #500, i32 ; pc 134
+    RET                 ; pc 135
+block5:                 ; pc 136
+    LOADI r0, #600, i32 ; pc 136
+    RET                 ; pc 137
+block6:                 ; pc 138
+    LOADI r0, #700, i32 ; pc 138
+    RET                 ; pc 139
+block7:                 ; pc 140
+    LOADI r0, #800, i32 ; pc 140
+    RET                 ; pc 141
+block8:                 ; pc 142
+    LOADI r0, #900, i32 ; pc 142
+    RET                 ; pc 143
+block9:                 ; pc 144
+    LOADI r0, #1000, i32 ; pc 144
+    RET                 ; pc 145
+block10:                 ; pc 146
+    LOADI r0, #1100, i32 ; pc 146
+    RET                 ; pc 147
+block11:                 ; pc 148
+    LOADI r0, #1200, i32 ; pc 148
+    RET                 ; pc 149
+block12:                 ; pc 150
+    LOADI r0, #1300, i32 ; pc 150
+    RET                 ; pc 151
+block13:                 ; pc 152
+    LOADI r0, #1400, i32 ; pc 152
+    RET                 ; pc 153
+block14:                 ; pc 154
+    LOADI r0, #1500, i32 ; pc 154
+    RET                 ; pc 155
+block15:                 ; pc 156
+    LOADI r0, #1600, i32 ; pc 156
+    RET                 ; pc 157
+block16:                 ; pc 158
+    LOADI r0, #1700, i32 ; pc 158
+    RET                 ; pc 159
+block17:                 ; pc 160
+    LOADI r0, #1800, i32 ; pc 160
+    RET                 ; pc 161
+block18:                 ; pc 162
+    LOADI r0, #1900, i32 ; pc 162
+    RET                 ; pc 163
+block19:                 ; pc 164
+    LOADI r0, #2000, i32 ; pc 164
+    RET                 ; pc 165
+block20:                 ; pc 166
+    LOADI r0, #2100, i32 ; pc 166
+    RET                 ; pc 167
+block21:                 ; pc 168
+    LOADI r0, #2200, i32 ; pc 168
+    RET                 ; pc 169
+block22:                 ; pc 170
+    LOADI r0, #2300, i32 ; pc 170
+    RET                 ; pc 171
+block23:                 ; pc 172
+    LOADI r0, #2400, i32 ; pc 172
+    RET                 ; pc 173
+block24:                 ; pc 174
+    LOADI r0, #2500, i32 ; pc 174
+    RET                 ; pc 175
+block25:                 ; pc 176
+    LOADI r0, #2600, i32 ; pc 176
+    RET                 ; pc 177
+block26:                 ; pc 178
+    LOADI r0, #2700, i32 ; pc 178
+    RET                 ; pc 179
+block27:                 ; pc 180
+    LOADI r0, #2800, i32 ; pc 180
+    RET                 ; pc 181
+block28:                 ; pc 182
+    LOADI r0, #2900, i32 ; pc 182
+    RET                 ; pc 183
+block29:                 ; pc 184
+    LOADI r0, #3000, i32 ; pc 184
+    RET                 ; pc 185
+block30:                 ; pc 186
+    LOADI r0, #3100, i32 ; pc 186
+    RET                 ; pc 187
+block31:                 ; pc 188
+    LOADI r0, #3200, i32 ; pc 188
+    RET                 ; pc 189
+block32:                 ; pc 190
+    LOADI r0, #3300, i32 ; pc 190
+    RET                 ; pc 191
+block33:                 ; pc 192
+    LOADI r0, #3400, i32 ; pc 192
+    RET                 ; pc 193
+block34:                 ; pc 194
+    LOADI r0, #3500, i32 ; pc 194
+    RET                 ; pc 195
+block35:                 ; pc 196
+    LOADI r0, #3600, i32 ; pc 196
+    RET                 ; pc 197
+block36:                 ; pc 198
+    LOADI r0, #3700, i32 ; pc 198
+    RET                 ; pc 199
+block37:                 ; pc 200
+    LOADI r0, #3800, i32 ; pc 200
+    RET                 ; pc 201
+block38:                 ; pc 202
+    LOADI r0, #3900, i32 ; pc 202
+    RET                 ; pc 203
+block39:                 ; pc 204
+    LOADI r0, #4000, i32 ; pc 204
+    RET                 ; pc 205
+block40:                 ; pc 206
+    LOADI r0, #4100, i32 ; pc 206
+    RET                 ; pc 207
+block41:                 ; pc 208
+    LOADI r0, #4200, i32 ; pc 208
+    RET                 ; pc 209
+block42:                 ; pc 210
+    LOADI r0, #4300, i32 ; pc 210
+    RET                 ; pc 211
+block43:                 ; pc 212
+    LOADI r0, #4400, i32 ; pc 212
+    RET                 ; pc 213
+block44:                 ; pc 214
+    LOADI r0, #4500, i32 ; pc 214
+    RET                 ; pc 215
+block45:                 ; pc 216
+    LOADI r0, #4600, i32 ; pc 216
+    RET                 ; pc 217
+block46:                 ; pc 218
+    LOADI r0, #4700, i32 ; pc 218
+    RET                 ; pc 219
+block47:                 ; pc 220
+    LOADI r0, #4800, i32 ; pc 220
+    RET                 ; pc 221
+block48:                 ; pc 222
+    LOADI r0, #4900, i32 ; pc 222
+    RET                 ; pc 223
+block49:                 ; pc 224
+    LOADI r0, #5000, i32 ; pc 224
+    RET                 ; pc 225
+block50:                 ; pc 226
+    LOADI r0, #5100, i32 ; pc 226
+    RET                 ; pc 227
+block51:                 ; pc 228
+    LOADI r0, #5200, i32 ; pc 228
+    RET                 ; pc 229
+block52:                 ; pc 230
+    LOADI r0, #5300, i32 ; pc 230
+    RET                 ; pc 231
+block53:                 ; pc 232
+    LOADI r0, #5400, i32 ; pc 232
+    RET                 ; pc 233
+block54:                 ; pc 234
+    LOADI r0, #5500, i32 ; pc 234
+    RET                 ; pc 235
+block55:                 ; pc 236
+    LOADI r0, #5600, i32 ; pc 236
+    RET                 ; pc 237
+block56:                 ; pc 238
+    LOADI r0, #5700, i32 ; pc 238
+    RET                 ; pc 239
+block57:                 ; pc 240
+    LOADI r0, #5800, i32 ; pc 240
+    RET                 ; pc 241
+block58:                 ; pc 242
+    LOADI r0, #5900, i32 ; pc 242
+    RET                 ; pc 243
+block59:                 ; pc 244
+    LOADI r0, #6000, i32 ; pc 244
+    RET                 ; pc 245
+block60:                 ; pc 246
+    LOADI r0, #6100, i32 ; pc 246
+    RET                 ; pc 247
+block61:                 ; pc 248
+    LOADI r0, #6200, i32 ; pc 248
+    RET                 ; pc 249
+block62:                 ; pc 250
+    LOADI r0, #6300, i32 ; pc 250
+    RET                 ; pc 251
+block63:                 ; pc 252
+    LOADI r0, #7777, i32 ; pc 252
+    RET                 ; pc 253

@@ -4639,6 +4639,78 @@ strictly additive):
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged (jmpr_oob still faults via UDF, rc=1). enc-check clean.
 
+### 10.124 M2.57 — the deferred-record pool pinned at its 64-cap (as built)
+
+A boundary pin, no code change: the index is a 64-record DAG built by
+the walk's deferred-product machinery (jmpr_chain33). The root
+product r1 = r2 + r3 (r2 in {0,20,...,140}, r3 in {0..18 step 2} ->
+ALL even numbers 0..158, 80 DISTINCT values > 64) OVERFLOWS the image
+merge cap and DEFERS (M2.30: record 0, CD_SLOT/CD_SLOT); then 63
+IN-PLACE ADDs r1 = r1 + r4 with r4 = {2} (a singleton — the closure
+stays {r1,r2,r3,r4} = 4 <= TX_AR_CHAIN_REGS 8) each defer over the
+DEFERRED source (M2.32/M2.41: record k = op(rec(k-1), slot(r4))) —
+64 records total, EXACTLY TX_AR_CHAIN_DEFS, all allocating from the
+per-iteration pool (instrumentation confirmed def = 63 on r1's slot
+at the dispatch). The 64-deep DAG materializes through the BIG store
+on dispatch (chain_flatten_big_rec recurses the whole record chain).
+
+**The honest shipped-cap behavior — conservative, by design.** Under
+the shipped EQUAL caps the record machinery cannot chain (the M2.42
+vestigial note is correct): the root's 80-value true set OVERFLOWS
+the BIG store on materialization — chain_merge_big collapses to
+UNKNOWN (exact-or-conservative, it NEVER keeps a truncated 64-value
+set) — so the dispatch falls to the TABLE: 0 b.eq, and the runtime
+252 (the joins' fall-through arms 120 + 6, plus 63*2; every BC falls
+through, r0 == 0) dispatches through the table's bounds check to
+block63's LOADI #7777 -> PASS 7777 on all four engines. The pin's
+value is the regression-guarded COLLAPSE of a genuine 64-record
+DAG — a deeper and different collapse than chain30's single flat
+100-image product — still dispatching correctly through the table.
+
+**The two boundaries, proven by the ad-hoc controls (not committed).**
+(A) TX_AR_CHAIN_BIG raised to 128 (MAX stays 64): the same DAG now
+materializes its 80-value set (fits the 128 store) and the chain
+FIRES with the 64 in-range candidates (even 126..252, the rest >= 
+num_instr are filtered), runtime 252 taking the chain's SIXTY-FOURTH
+b.eq — the record machinery is SOUND when reachable, exactly the
+cap-divergence story M2.54/M2.55's controls established. (B) a 65th
+in-place ADD (same BIG=128): the pool is exhausted (g_chain_ndef >=
+64 -> chain_def_alloc returns -1), r1's slot falls to UNKNOWN, and
+the dispatch is the table again — conservative and correct, the
+runtime 256 dispatching through the bounds check. The pool holds
+exactly 64 records and fails cleanly at 65.
+
+### 10.125 M2.57 gate results (measured)
+
+Total emitted bytes across the now-81-program parity set: **M0
+194884 → M1 161272, 33612 saved** (≈17.2%). One row added, zero
+moved — **all 85 shared rows byte-identical** (the gate row is
+strictly additive):
+
+- jmpr_chain33 7468 → 6444 (−1024, new 81st row; M0 baseline
+  measured at git 1729f50) — the 64-record-DAG pool pin: runtime
+  252 dispatches through the table's bounds check to block63's
+  LOADI #7777 -> PASS 7777 on all four engines. The 1024-byte
+  M0->M1 delta is the accumulated emission folds on the program's
+  straight-line body (254 instructions, 63 in-place ADDs).
+- Teeth — the pool's two boundaries (ad hoc, not committed):
+  (a) Control A (BIG=128 > MAX=64) — the same DAG materializes
+  80 values and chains: 64 b.eq, runtime 252 = the sixty-fourth,
+  PASS 7777 (sound when reachable); (b) Control B (a 65th in-place
+  ADD, BIG=128) — the pool exhausts, r1 UNKNOWN, the table: 0 b.eq,
+  PASS 7777 via the bounds check (conservative).
+- Row-by-row accounting (gate tables diffed vs the current committed
+  simi_arm.c): **all 85 shared rows byte-identical** — strictly
+  additive; simi_arm.c is UNCHANGED in M2.57 (a pure pin + gate
+  row + doc).
+- Four-way parity: 341 PASS, 0 FAIL — all 86 expected-result
+  programs on all four engines (interp 86/86, x86 85/0/3, RV64
+  85/0/3, ARM 85/0/3), each checked against its "Expected result:"
+  comment; the pool-pin's table path executes at runtime on the ARM
+  engine (PASS 7777 through the bounds check), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged
+  (jmpr_oob still faults via UDF, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted
