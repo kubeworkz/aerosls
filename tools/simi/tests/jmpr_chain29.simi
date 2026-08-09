@@ -3,19 +3,19 @@
 ; "deferred source -> UNKNOWN" fallback is reachable. The static trace
 ; shows it IS reachable in principle: the M2.30 root allocates a record
 ; whenever a register-form product overflows the merge cap with known
-; FLAT sources (a >64-distinct image — the M2.42 "UNREACHABLE" comment
+; FLAT sources (a >96-distinct image — the M2.42 "UNREACHABLE" comment
 ; means such records can never lead to a CHAIN, not that they are never
-; allocated), so a >64 product followed by a NOT/NEG hits the fallback.
+; allocated), so a >96 product followed by a NOT/NEG hits the fallback.
 ; The fallback is provably conservative: the record-collapse and the
 ; plain-UNKNOWN-collapse are observationally identical (both -> the
-; table), and the true set (>64) can never chain anyway. This pin
+; table), and the true set (>96) can never chain anyway. This pin
 ; proves the FLAT side of the boundary: a product whose image EXCEEDED
-; the OLD flat cap (12, pre-M2.41) but fits the current 64 — 19
+; the OLD flat cap (12, pre-M2.41) but fits the current 96 — 19
 ; distinct values — does NOT create a record, so the following unary
 ; RE-DERIVES from the flat image and the chain fires.
 ; The index: r1 = -(r2 + r3) with r2, r3 in {-79,-77,...,-61} (ten odd
 ; negatives each). The ADD product is the 19 even values
-; {-158,-156,...,-122} (odd+odd, 19 distinct <= 64 — flat, no record; a
+; {-158,-156,...,-122} (odd+odd, 19 distinct <= 96 — flat, no record; a
 ; 12-cap walker would defer it — the teeth prove that shape collapses
 ; conservatively at the NEG). The in-place NEG re-derives to
 ; {122,124,...,158}. Runtime -( -61 + -61 ) = 122 -> the chain's FIRST

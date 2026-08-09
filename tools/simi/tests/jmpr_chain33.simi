@@ -1,29 +1,21 @@
-; jmpr_chain33.simi — M2.57: the deferred-record pool AT its 64-cap
-; (TX_AR_CHAIN_DEFS). The index is a 64-record DAG: the root product
-; r1 = r2 + r3 (r2 in {0,20,...,140}, r3 in {0..18 step 2} -> ALL even
-; numbers 0..158, 80 DISTINCT values > 64) OVERFLOWS the image merge
-; cap, so the walk DEFERS it (M2.30: record 0, CD_SLOT/CD_SLOT). Then
-; 63 IN-PLACE ADDs r1 = r1 + r4 with r4 = {2} (a singleton — the
-; tracked-register closure stays {r1,r2,r3,r4} = 4 <= TX_AR_CHAIN_REGS
-; 8): every product over the DEFERRED source defers (M2.32/M2.41:
-; record k = op(rec(k-1), slot(r4))) — 63 more records, 64 total =
-; TX_AR_CHAIN_DEFS EXACTLY, all allocating from the per-iteration
-; pool (the walk confirms def = 63 on r1's slot at the dispatch).
-; Under the shipped EQUAL caps the record machinery is conservative
-; (the M2.42 vestigial note): the root's 80-value true set OVERFLOWS
-; the BIG store on materialization (chain_merge_big collapses to
-; UNKNOWN, exact-or-conservative — it never keeps a truncated set),
-; so the dispatch falls to the TABLE — 0 b.eq, and runtime 252 (the
-; joins' fall-through arms 120 + 6, plus 63*2) dispatches through the
-; table's bounds check to block63's LOADI #7777. The two boundaries
-; are pinned by the ad-hoc controls: (A) TX_AR_CHAIN_BIG raised to
-; 128 — the same DAG materializes 80 values and the chain FIRES with
-; the 64 in-range candidates (even 126..252), runtime 252 taking the
-; SIXTY-FOURTH b.eq (sound when reachable); (B) a 65th in-place ADD
-; — the pool is exhausted (g_chain_ndef >= 64 -> -1), r1 falls to
-; UNKNOWN, and the dispatch is the table again (conservative, PASSes
-; its runtime 256 through the bounds check). Dump-verified (shipped):
-; 0 b.eq, the full table dispatch.
+; jmpr_chain33.simi — M2.57: the deferred-record pool boundary, now a
+; FLAT fixture under the equal caps. At the M2.57-era caps the index
+; was a 64-record DAG (root product r1 = r2 + r3, r2 in {0,20,...,140},
+; r3 in {0..18 step 2} -> ALL evens 0..158, 80 DISTINCT values > 64,
+; DEFERRED as record 0, then 63 in-place ADDs r1 = r1 + r4 with r4 =
+; {2}, each def-ering over the deferred source — 64 records =
+; TX_AR_CHAIN_DEFS, and the dispatch collapsed to the table). M2.61's
+; EQUAL-CAPS bump (MAX = BIG = 96) changed this row's meaning: the
+; root's 80-value true set now FITS the BIG store, so the walk keeps
+; the whole chain FLAT — no records at all (instrumented ndef = 0 at
+; M2.64, the M2.57 "64-record DAG" is a fossil). The flat 80-value
+; image {126..284 step 2} materializes and the chain fires with the 64
+; IN-RANGE candidates (even 126..252, < num_instr): 64 b.eq, 0 table
+; words, and runtime 252 (joins' fall-through arms 120 + 6, plus 63*2)
+; takes the SIXTY-FOURTH b.eq -> block63's LOADI #7777 — a truncated
+; image (63 candidates) would miss it and UDF-trap. The pool boundary
+; itself moved to the M2.64/M2.65 pins: chain40 (96 records, at-cap)
+; and chain41 (97 records, exhaustion).
 ; Expected result: 7777
 .entry main
 main:

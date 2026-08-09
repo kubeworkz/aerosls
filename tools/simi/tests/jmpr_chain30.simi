@@ -4,20 +4,23 @@
 ; join source through NEG); this pin regression-guards the mirror for the
 ; REGISTER-FORM PRODUCT: chain_img_alu's register path computes the pair
 ; product { f(a,b) : a in S(a), b in S(b) }, exact until its merge cap
-; (64, TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG). A product whose DISTINCT image
-; exceeds 64 overflows the cap -> the image is UNKNOWN -> the chain dies
+; (96, TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG). A product whose DISTINCT image
+; exceeds 96 overflows the cap -> the image is UNKNOWN -> the chain dies
 ; -> the naive table dispatch runs. No truncated or wrong chain is ever
-; emitted.
+; emitted. (At the shipped equal caps the walk DEFERS the >96 product as
+; record 0 — instrumented ndef=1 at M2.64 — and the dispatch
+; materialization then collapses at the BIG store: same table, exact-or-
+; conservative.)
 ; The index: r1 = r2 + r3 with r2 in {0,10,...,90} (ten values, joined at
 ; Ja) and r3 in {0,1,...,9} (ten values, joined at Jb) — the two
 ; sequential joins deliver the sets INDEPENDENTLY, so the analysis's
-; image is the full 100-pair product {0..99} (100 DISTINCT values, > 64)
+; image is the full 100-pair product {0..99} (100 DISTINCT values, > 96)
 ; -> collapse -> g_alloc = 0 -> the JMPR table. Runtime: every join BC
 ; falls through, so r2 = 90 and r3 = 9 -> r1 = 99 -> JMPR 99 -> block0 at
 ; pc 99 -> LOADI #999 -> PASS 999 on all four engines, through the
 ; table's bounds check. The test DISCRIMINATES truncation: a wrong
-; analysis that emitted a chain over only the first 64 candidates
-; {0..63} would miss runtime 99, miss every b.eq and UDF-trap (rc=1) —
+; analysis that emitted a chain over only the first 96 candidates
+; {0..95} would miss runtime 99, miss every b.eq and UDF-trap (rc=1) —
 ; only the conservative UNKNOWN -> table path passes. Dump-verified:
 ; 0 b.eq, the full table dispatch (movz num_instr, subs/cset/cbz, li32
 ; base, add-shift ldr, br, UDF), 101 instructions.

@@ -6,23 +6,27 @@
 ; materializes soundly through the BIG path (chain_flatten_big_rec, the
 ; dispatch snapshot) and collapses conservatively at the walk path
 ; (the M2.41 guards: st->n > TX_AR_CHAIN_MAX -> UNKNOWN). Under the
-; shipped EQUAL caps (64/64) that divergence is unreachable — a record's
-; store can hold at most 64, and 64 is exactly the flat bound — so this
-; pin regression-guards the TURN-OVER BOUNDARY itself: the largest set
-; the machinery can represent (n == MAX == BIG, exactly 64 values),
-; materializing through record creation, the BIG store, and the walk
-; flatten all at the same point. A truncated materialization (a guard
+; shipped EQUAL caps (96/96, M2.61) that divergence is unreachable — a
+; record's store can hold at most 96, and 96 is exactly the flat bound.
+; At the M2.55-era caps (64/64) this fixture WAS the TURN-OVER BOUNDARY
+; (n == MAX == BIG, exactly 64 values); after M2.61's equal bump the
+; same 64-value union now sits BELOW the cap and materializes FLAT — the
+; record machinery never engages (instrumented ndef=0 at M2.64). The
+; fixture still fires its 64-pair chain (the union path is unchanged);
+; the turn-over boundary itself moved to chain37 (96 values, M2.61) and
+; chain30 (100 values, collapses). A truncated materialization (a guard
 ; that kept only 63, or a store one short) would miss the runtime index
 ; and UDF-trap — the discriminator.
-; The index: the union of TWO deferred products, mirroring chain16's
-; R-arm shape. R1 = r2 + r3 (r2 in {44,60,76,92}, r3 in {0,2,...,14} ->
-; THIRTY-TWO values {44..106} step 2) and R2 = r2 + r6 (r6 in
-; {108,110,...,122} -> THIRTY-TWO values {152..214} step 2); the union
-; {44..106} ∪ {152..214} = 64 DISTINCT values — exactly MAX = BIG. The
-; R-arm's `BC r5, J` (r5 = 0, not taken) delivers R1 into J; the
-; fall-through computes R2 and flows in as the carry, so J forms the
-; union record op(rec(R2), rec(R1)). The gate (8*64+4 = 516 <
-; 40 + 4*216 = 904) emits the 64-pair chain. Runtime 92 + 122 = 214
+; The index: the union of two products, mirroring chain16's R-arm shape.
+; R1 = r2 + r3 (r2 in {44,60,76,92}, r3 in {0,2,...,14} -> THIRTY-TWO
+; values {44..106} step 2) and R2 = r2 + r6 (r6 in {108,110,...,122} ->
+; THIRTY-TWO values {152..214} step 2); the union {44..106} ∪ {152..214}
+; = 64 DISTINCT values (64 < 96, below the equal caps — the "deferred"
+; union-record machinery never engages; the walk unions the two flat
+; images, instrumented ndef=0 at M2.64). The R-arm's `BC r5, J` (r5 = 0,
+; not taken) delivers R1 into J; the fall-through computes R2 and flows
+; in as the carry, so J's head-union joins the two flat sets. The gate
+; (8*64+4 = 516 < 40 + 4*216 = 904) emits the 64-pair chain. Runtime 92 + 122 = 214
 ; (the BCs are NOT taken — r0 == 0, r5 == 0) takes the chain's
 ; SIXTY-FOURTH b.eq, landing on block63's LOADI #555. The candidates are
 ; real pcs (block0..block31 at 44..106, block32..block63 at 152..214),
