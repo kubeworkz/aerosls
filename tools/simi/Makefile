@@ -1,3 +1,9 @@
+# NOTE (cleanup M2.83): the build outputs in this directory (simi-asm,
+# simi-run, simi-dis, simi-jit-test, simi-riscv-verify, simi-arm-verify,
+# a64_dump, a64-f0-test, stress-atomics, bench-*, cross-isa, cross-size,
+# tests/*.tmo) are NOT tracked — a fresh checkout has none of them. Run
+# `make` (or `make clean && make` if you want a guaranteed-fresh build)
+# before `make test` or any bench. See plan doc §10.177.
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
