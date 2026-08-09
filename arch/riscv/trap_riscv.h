@@ -86,15 +86,23 @@ void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top);
  * U-mode. */
 void riscv_trap_dispatch(struct RvPerHartData* phd);
 
-/* Gap Remediation SIMI Phase 9 (sub-phase 9d): minimal ecall-based
- * syscall surface. a7 = syscall number, a0 = single argument -- the
- * smallest convention that can express SYS_SLS_EXIT (the only syscall
- * wired today; see trap_riscv.c). NOT the real AeroSLS x86 syscall ABI
+/* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): minimal syscall
+ * surface. a7 = syscall number, a0 = single argument -- the smallest
+ * convention that can express SYS_SLS_EXIT (the only syscall wired
+ * today; see trap_riscv.c). NOT the real AeroSLS x86 syscall ABI
  * (kernel/process.c's SYSCALL-based dispatch, register-for-argument
  * marshaling, or the full syscall table) -- a deliberately narrower,
  * headless-only surface, per this project's own established "host
  * toolchain only until it can actually be verified" scoping discipline
- * (see §16 Phase 9's sub-phase 9d design text). */
+ * (see §16 Phase 9's sub-phase 9d design text).
+ *
+ * Trigger (Phase 9f): the syscall is carried through ebreak (exception
+ * 3) on real hardware, because OpenSBI's default MEDELEG does not
+ * delegate exception 9 (ecall from S-mode) -- an ecall with this ABI
+ * bounces as a failed SBI call. riscv_trap_dispatch() (trap_riscv.c)
+ * routes scause=3 with a7 == RV_SYS_EXIT to riscv_syscall_dispatch(),
+ * which powers the machine off via the SBI_SRST extension. The ecall
+ * path (scause=9) is kept for the day exception 9 is delegated. */
 #define RV_SYS_EXIT 164   /* matches kernel/process.h's SYS_SLS_EXIT numeric value */
 
 void riscv_syscall_dispatch(struct RvPerHartData* phd);

@@ -48,11 +48,11 @@ static struct RvPerHartData g_hart0_data;
 #define RV64_SMOKE_CODE_BUF_SIZE 4096
 static uint8_t g_smoke_code_buf[RV64_SMOKE_CODE_BUF_SIZE] __attribute__((aligned(16)));
 
-/* Gap Remediation SIMI Phase 9 (sub-phase 9d): translate the embedded
+/* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): translate the embedded
  * rv64_boot_smoke.simi program and call it directly as a real function —
  * the exact same verification idea tools/simi/simi_riscv_verify.c already
- * uses on the host side (a plain C function-pointer call into freshly
- * emitted machine code), just now running inside the real freestanding
+ * uses on the host side (a call into freshly emitted machine code, with
+ * the result read from t0), just now running inside the real freestanding
  * kernel binary instead of a host test harness. scratch_ptr/rt_resolve_fn/
  * rt_objsize_fn/rt_objtype_fn are all 0 -- this program never touches r7,
  * r6, RESOLVE, OBJSIZE, or OBJTYPE, so nothing dereferences them. */
@@ -74,31 +74,54 @@ static void rv64_boot_smoke_test(void) {
 
     typedef int64_t (*SimiEntryFn)(void);
     SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_smoke_code_buf + entry_off);
-    int64_t result = fn();
 
-    (void)result;
+    /* The translated program's result rides in t0 (x5), NOT a0: that is
+     * the RV translator's documented return convention (simi_riscv.c's
+     * OP_RET loads r0 into t0 -- "r0 is the return-value register" --
+     * and the trampoline's epilogue returns with t0 untouched; the host
+     * verifier reads the same register, simi_riscv_verify.c's cpu.x[5]).
+     * A plain C call would read a0, which the trampoline never sets, so
+     * the call happens in inline asm with ra as the link register (the
+     * trampoline saves/restores its incoming ra itself) and t0 declared
+     * live so the compiler cannot reuse it; the value is copied out of
+     * t0 immediately, before any intervening C call can clobber it. */
+    register uint64_t result __asm__("t0");
+    __asm__ volatile(
+        "jalr ra, 0(%[addr])\n"
+        : "+r"(result)
+        : [addr] "r"((unsigned long)(uintptr_t)fn)
+        : "ra", "memory");
+    uint64_t code = result;   /* captured from t0 before anything can clobber it */
 
     rv_boot_print("[SIMI] entry returned (real machine code executed) -- issuing "
-                  "ebreak to trap through the real stvec path...\n");
+                  "RV_SYS_EXIT (a7=164, a0=code) via ebreak, the delegated "
+                  "syscall trigger...\n");
 
-    /* Real trap round trip: an ebreak (exception 3) is the one guaranteed
-     * way to reach riscv_trap_entry from S-mode under OpenSBI's default
-     * delegation. The original design used an ecall with RV_SYS_EXIT in
-     * a7, but OpenSBI (fw_dynamic) does NOT delegate exception 9 (ecall
-     * from S-mode) -- its MEDELEG leaves bit 9 clear -- so an S-mode ecall
-     * bounces back as a failed SBI call and never reaches our stvec
-     * handler. ebreak IS delegated, so it enters riscv_trap_entry
-     * (arch/riscv/trap_riscv.S), dispatches to riscv_trap_dispatch()
-     * (arch/riscv/trap_riscv.c), prints the unhandled-exception
-     * diagnostics, and halts the hart -- control never returns.
-     * riscv_syscall_dispatch()/RV_SYS_EXIT remain in place for the day
-     * exception 9 is delegated (see AeroSLS-SIMI-ISA-v0.1.md section 16). */
-    __asm__ volatile("ebreak" : : : "memory");
+    /* The SIMI syscall fixture on real hardware (Phase 9f): the
+     * translated program's return value (42) becomes the RV_SYS_EXIT
+     * syscall ABI -- a7 = 164 (matching kernel/process.h's SYS_SLS_EXIT),
+     * a0 = exit code -- and the syscall is triggered through ebreak
+     * (exception 3), the one exception OpenSBI's default MEDELEG
+     * delegates to S-mode. (Exception 9, ecall from S-mode, is NOT
+     * delegated -- an ecall carrying this ABI bounces as a failed SBI
+     * call and never reaches our stvec handler.) riscv_trap_entry
+     * (arch/riscv/trap_riscv.S) saves every GPR including a7/a0,
+     * riscv_trap_dispatch() (arch/riscv/trap_riscv.c) routes scause=3
+     * with a7==RV_SYS_EXIT to riscv_syscall_dispatch(), which reports
+     * the exit code and powers the machine off via OpenSBI's SBI_SRST
+     * extension -- control never returns, and QEMU exits rc=0. This is
+     * the same trap path the pre-9f ebreak smoke exercised, now carrying
+     * the real syscall instead of halting on an unhandled exception. */
+    __asm__ volatile(
+        "mv a0, %0\n"
+        "li a7, %1\n"
+        "ebreak\n"
+        : : "r"(code), "i"(RV_SYS_EXIT) : "a0", "a7", "memory");
 
-    /* Unreachable in practice (the trap path halts), but stated
-     * explicitly rather than left as fallthrough into whatever code
-     * happens to follow. */
-    rv_boot_print("[SIMI] unexpected: trap returned control.\n");
+    /* Unreachable in practice (the syscall powers the machine off), but
+     * stated explicitly rather than left as fallthrough into whatever
+     * code happens to follow. */
+    rv_boot_print("[SIMI] unexpected: RV_SYS_EXIT returned control.\n");
 }
 
 void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
