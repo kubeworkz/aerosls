@@ -58,15 +58,17 @@ bench-net: simi-asm bench_net.c simi_arm.c simi_arm.h tests/jmpr_chain36.simi
 	$(CC) $(CFLAGS) -o $@ bench_net.c simi_arm.c
 	./bench-net tests/jmpr_chain36.tmo 100
 
-# M2.72: corpus-wide translate-cost bench — translates every fixture N
-# times at the shipped trip count, recording per-instruction translate
-# time and the fixpoint scan counts, as the regression guard for the
-# fixpoint series beyond chain36 (bench-net pins the net-firing input;
-# this pins the whole corpus). Assembles all fixtures on the spot;
-# FAILS if the total scan count moves (deterministic) or the aggregate
-# per-instruction time exceeds the committed ceiling (see bench_corpus.c
-# and plan doc §10.154/10.155). In `all` with bench-net (~1 s total at
-# the default 50 iters — the M2.27 stale-binary lesson).
+# M2.72/M2.73: corpus-wide translate-cost bench — translates every
+# fixture N times at the shipped trip count, as the regression guard for
+# the fixpoint series beyond chain36 (bench-net pins the net-firing
+# input; this pins the whole corpus). M2.73 committed PER-ROW baselines
+# (exact scan counts + us/instr at a 3x wall-clock margin) in
+# bench_corpus.c's BASELINES table — a fixture that changes convergence
+# or grows its translate cost 3x+ FAILS its row (see bench_corpus.c's
+# top comment and plan doc §10.156/10.157). N=500 for per-row timing
+# stability. Assembles fixtures on the spot only when stale/missing (a
+# fresh checkout pays the full assembly once). In `all` with bench-net
+# (~2-3 s total — the M2.27 stale-binary lesson).
 bench-corpus: simi-asm bench_corpus.c simi_arm.c simi_arm.h
 	$(CC) $(CFLAGS) -o $@ bench_corpus.c simi_arm.c
 	# Assemble on the spot, but only when stale/missing — a fresh checkout
@@ -75,7 +77,7 @@ bench-corpus: simi-asm bench_corpus.c simi_arm.c simi_arm.h
 	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
 	    if [ ! -f "$$tmo" ] || [ "$$f" -nt "$$tmo" ]; then \
 	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
-	./bench-corpus tests/*.tmo 50
+	./bench-corpus tests/*.tmo 500
 
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top

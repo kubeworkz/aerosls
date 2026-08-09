@@ -5667,7 +5667,52 @@ untouched (M2.72 adds no simi_arm.c change — the globals came in at
 M2.71), so the size gate stays **96/96, 46224 saved, all rows
 byte-identical**; four-way parity interp 97/97, x86/RV64/ARM 96/0/3.
 New files: bench_corpus.c, the Makefile bench-corpus target + gitignore
-entry, and the §10.152 floor amendment.
+entry, and the §10.152 floor amendment. (M2.73 supersedes this record's
+two aggregate assertions — the total-scan count and the per-instruction
+ceiling — with the per-row committed baselines of §10.156/10.157.)
+
+### 10.156 M2.73 — per-row translate-cost baselines, the size gate's per-fixture model (as built)
+
+M2.72's aggregate assertions (total scans == 144, aggregate < 4.0
+µs/instr) could not see a change confined to ONE fixture — two
+fixtures trading scan counts keeps the total, and a single fixture's
+cost regression is diluted in the aggregate. M2.73 tightens to
+COMMITTED PER-ROW BASELINES: bench_corpus.c now carries a 99-row
+BASELINES table (name → scans, name → µs/instr, measured 2026-08-09
+at N=500 on this sandbox), and every fixture's row is asserted:
+
+- **scans: EXACT** — the deterministic, machine-independent fixpoint
+  work per fixture (1 for the plain fixtures, 2 for the M2-era
+  chain/join fixtures, 3 for chain35/43, 4 for chain44, 18 for
+  chain36). ANY convergence change in ANY fixture fails its row — the
+  tight per-fixture guard, closing the total's trade-off hole.
+- **us/instr: asserted at a 3.0x margin over the committed value.**
+  Per-fixture wall-clock is inherently noisy — two N=500 runs swung up
+  to 42% on individual fixtures (WSL timer granularity, load drift;
+  the aggregate stayed within 2.3%) — so a tighter margin would flake.
+  3.0 absorbs the noise and machine-speed differences while still
+  failing a fixture whose translate cost grows 3x or more: the gross
+  single-fixture regression the aggregate ceiling could not see. The
+  printed table shows every fixture's measured value next to its
+  baseline, so drifts below the margin stay visible for a human.
+
+A fixture with no baseline row FAILS loudly — adding/removing a
+corpus fixture requires updating the table deliberately, exactly the
+size gate's M0_BASELINES discipline. The Makefile target now runs at
+N=500 for per-row timing stability (~2-3 s total in `all`).
+
+### 10.157 M2.73 gate results (measured)
+
+bench_corpus (N=500, this sandbox): **99 fixtures, 6672 instr, 144
+scans, 0.950 µs/instr aggregate, 0 failed — ALL CHECKS PASSED**, all
+99 rows within their committed baselines (teeth: corrupting add.tmo's
+committed scans 1 -> 2 fails the row "scans=1 != committed 2",
+reverted to PASS). Emission untouched, so the size gate stays **96/96,
+46224 saved, all rows byte-identical**; four-way parity interp 97/97,
+x86/RV64/ARM 96/0/3. Changed: bench_corpus.c (the BASELINES table +
+per-row assertions, replacing the aggregate constants), the Makefile
+bench-corpus target (N=50 -> 500 + comment), §10.154/10.155
+superseded.
 
 ---
 
