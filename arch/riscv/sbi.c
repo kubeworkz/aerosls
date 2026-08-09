@@ -1,14 +1,30 @@
 #include "sbi.h"
 
 void sbi_putchar(char c) {
-    // Invoke historical extension or modern debug console write strings
-    sbi_call(SBI_EXT_0_1_CONSOLE_PUTCHAR, 0, c, 0);
+    /* OpenSBI >= 0.9 removed the legacy console putchar extension
+     * (SBI_EXT_0_1_CONSOLE_PUTCHAR) for S-mode guests -- the call is
+     * silently dropped, so a kernel printing through it appears mute.
+     * Use the Debug Console extension (SBI_DBCN) instead, with the
+     * legacy call as a fallback for older firmwares. */
+    char buf = c;
+    unsigned long written = 0;
+    struct SBIReturn ret = sbi_call(SBI_EXT_DBCN, SBI_DBCN_WRITE,
+                                    1, (unsigned long)&buf, (unsigned long)&written);
+    if (ret.error == 0) return;
+    sbi_call(SBI_EXT_0_1_CONSOLE_PUTCHAR, 0, c, 0, 0);
 }
 
 int sbi_getchar(void) {
-    struct SBIReturn ret = sbi_call(SBI_EXT_0_1_CONSOLE_GETCHAR, 0, 0, 0);
-    // Value returns -1 if no character is currently waiting in the hardware UART buffer
-    return (int)ret.error; 
+    /* Same story as sbi_putchar: legacy getchar is gone for S-mode
+     * guests, so read via SBI_DBCN with a legacy fallback. Returns -1
+     * when no character is currently waiting in the UART buffer. */
+    char buf = 0;
+    unsigned long got = 0;
+    struct SBIReturn ret = sbi_call(SBI_EXT_DBCN, SBI_DBCN_READ,
+                                    1, (unsigned long)&buf, (unsigned long)&got);
+    if (ret.error == 0 && got > 0) return (int)(unsigned char)buf;
+    struct SBIReturn legacy = sbi_call(SBI_EXT_0_1_CONSOLE_GETCHAR, 0, 0, 0, 0);
+    return (int)legacy.error;
 }
 
 // Global text canvas array used to buffer incoming shell commands from the virtual UART
@@ -16,10 +32,20 @@ int sbi_getchar(void) {
 static char riscv_shell_input_buffer[SHELL_BUF_SIZE];
 static uint32_t buf_cursor = 0;
 
-extern void route_sls_shell_command(const char* buffer);
+/* The x86 kernel routes UART shell lines through route_sls_shell_command();
+ * the RISC-V port has no SLS shell yet, so the honest behavior is to
+ * report the received line and continue. This definition closes the
+ * dangling symbol that only becomes a hard link error once the trap
+ * path actually links (see AeroSLS-SIMI-ISA-v0.1.md section 16 Phase 9c). */
+void route_sls_shell_command(const char* buffer) {
+    const char* prefix = "[SHELL] no SLS shell on the RISC-V port; received: \"";
+    for (const char* p = prefix; *p; p++) sbi_putchar(*p);
+    for (const char* p = buffer; *p; p++) sbi_putchar(*p);
+    sbi_putchar('\"'); sbi_putchar('\n');
+}
 
-// Registered inside the stvec (Supervisor Trap Vector Base Address Register) 
-// to process asynchronous Supervisor Software / External Interrupts (scause Bit 63 = 1, Code = 9)
+// Invoked from riscv_trap_dispatch (arch/riscv/trap_riscv.c) for
+// asynchronous Supervisor External Interrupts (scause Bit 63 = 1, Code = 9)
 void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
     (void)stval; // Avoid unreferenced variable warnings
     

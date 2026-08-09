@@ -6,10 +6,13 @@ _start:
     # 1. Disable all interrupts globally in the Supervisor Status Register (sstatus)
     csrw sie, zero
 
-    # 2. Serialize Core Bootup (Symmetric Multiprocessing Isolation)
-    # a0 contains the Hart ID. Only Hart 0 is allowed to initialize the main systems.
-    # Secondary harts (APs) are parked in a spin loop awaiting synchronization markers.
-    bnez a0, .park_secondary_hart
+    # 2. OpenSBI (fw_dynamic) delivers the payload to exactly one hart -- the
+    #    boot hart -- whose id is NOT necessarily 0 (default: the last hart).
+    #    The former a0==0 gate silently parked the only hart that ever enters,
+    #    so the kernel never ran under `-smp > 1` (riscv-run's own config).
+    #    The delivered hart is the boot hart by construction; proceed straight
+    #    to the C entry. (Secondary harts are parked inside OpenSBI; nothing
+    #    in this port starts them via HSM, so no AP path exists yet.)
 
     # 3. Setup a clean, page-aligned temporary compilation bootstrap stack
     la   sp, bsp_stack_top      # Load address of the top of the stack
@@ -32,31 +35,9 @@ _start:
     wfi                         # Wait For Interrupt loop safeguard
     j    .halt
 
-.park_secondary_hart:
-    # Secondary cores spin here until Hart 0 configures the primary Sv39 page directories
-    la   t0, flag_cores_synchronized
-.spin_lock_check:
-    ld   t1, 0(t0)
-    bnez t1, .ap_boot_bridge
-    nop                         # Conserve execution pipeline energy (hint)
-    j    .spin_lock_check
-
-.ap_boot_bridge:
-    # Setup unique stack mapping offsets computed out of Hart IDs
-    slli t2, a0, 12             # Multiply Hart ID by 4096 (4KB unique stack block)
-    la   sp, bsp_stack_top
-    sub  sp, sp, t2             # Assign unique offset stack context
-
-    jal  ap_riscv_kernel_main
-
 # Allocate memory areas inside the uninitialized BSS block data segments
 .section .bss
 .align 12                       # Force 4KB page alignment
 bsp_stack_bottom:
     .space 4096 * 4             # 16KB total temporary boot stack allocation
 bsp_stack_top:
-
-.global flag_cores_synchronized
-.align 3
-flag_cores_synchronized:
-    .quad 0                     # Set to 1 by Hart 0 to release parked secondary cores

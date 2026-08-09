@@ -194,3 +194,67 @@ jobs:
           fi
           echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
+
+  riscv-guards:
+    # The RISC-V kernel's boot smoke, mirrored from the x86 kernel-guards
+    # job. The RV kernel is self-contained (its sources are all in
+    # aerosls2 — no ../qemu sibling repo needed), but pre-9e it was
+    # unbuildable and unbootable: `make riscv-elf` could not link
+    # (trap_riscv.S/.c object collision + a dangling route_sls_shell_command
+    # symbol), and once it did link it would not boot (kernel base at
+    # 0x80000000 colliding with OpenSBI, an a0==0 boot gate vs OpenSBI's
+    # arbitrary boot-hart id, and a legacy console that OpenSBI silently
+    # drops for S-mode guests). All six defects found and fixed — see
+    # AeroSLS-SIMI-ISA-v0.1.md §16 Phase 9, 9e addendum.
+    #
+    # There is no webapp on the RISC-V port, so the "service" assertions
+    # are the port's equivalents of the x86 health check: the boot banner,
+    # the SIMI translate-and-execute smoke (the embedded rv64_boot_smoke
+    # tmo running as real RV64-native code), and a real trap through stvec
+    # (ebreak, scause=3) before the harts wfi. The kernel keeps running
+    # until the timeout kills QEMU (rc=124), exactly like the x86 boot.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: RISC-V toolchain and QEMU
+        run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf qemu-system-misc
+
+      - name: Build the RISC-V kernel (riscv-elf)
+        run: make riscv-elf
+
+      - name: Boot the kernel under QEMU and assert the boot smoke
+        run: |
+          # GitHub's default `set -e` would treat the expected timeout kill
+          # (rc=124) as a step failure, so the `if` wrapper handles it like
+          # the x86 job does: rc=0 is a failure (kernel should never exit
+          # cleanly), anything other than 124 is an early crash.
+          if timeout 60 qemu-system-riscv64 -M virt -bios default -kernel sls_riscv_kernel.elf \
+             -m 4G -smp 4 -display none -serial file:boot_rv.log -no-reboot; then
+            echo "FAILED: qemu exited cleanly (rc=0) — the kernel should keep running until the timeout" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          else
+            rc=$?
+            if [ "$rc" -ne 124 ]; then
+              echo "FAILED: qemu exited early (rc=$rc) — kernel crashed" >&2
+              tail -30 boot_rv.log >&2
+              exit 1
+            fi
+          fi
+          grep -a "AeroSLS RISC-V Supervisor Node Kernel Online!" boot_rv.log || {
+            echo "FAILED: RISC-V boot banner not seen in the serial log" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
+          grep -a "\[SIMI\] entry returned (real machine code executed)" boot_rv.log || {
+            echo "FAILED: SIMI boot smoke did not translate and execute" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
+          grep -a "\[TRAP\] unhandled exception, scause=3" boot_rv.log || {
+            echo "FAILED: real trap through stvec (ebreak) never fired" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
+          echo "OK: RISC-V kernel booted, SIMI smoke executed, trap path fired"
