@@ -1,7 +1,7 @@
 /* rv_syscall_exit_test.c — host-side tripwire for the RISC-V kernel's
  * RV_SYS_EXIT exit branches (ISA doc §16 Phase 9g).
  *
- * Compiled TWICE from this one source, both for the x86 host with
+ * Compiled THREE times from this one source, all for the x86 host with
  * -DSIMI_HOST_TEST (which swaps the RISC-V-only pieces for host
  * behavior, see arch/riscv/trap_riscv.c's top comment):
  *
@@ -15,6 +15,16 @@
  *                           sbi_system_reset() is never called and the
  *                           "direct M-mode boot: no firmware to power
  *                           off -- halting hart." branch fires.
+ *   rv-syscall-exit-test-u  SIMI_HOST_TEST + RV_TEST_A7=<bogus> — the
+ *                           unimplemented-syscall branch: a7 is not
+ *                           RV_SYS_EXIT, so dispatch reports
+ *                           "unimplemented syscall number N -- halting
+ *                           hart." without ever touching the reset
+ *                           stub.
+ *
+ * The a7 register is injected as RV_TEST_A7 (default RV_SYS_EXIT), so
+ * the third build reuses the exact same dispatch call with a bogus
+ * syscall number instead of special-casing it in C.
  *
  * Under SIMI_HOST_TEST the CSR-armed functions (riscv_trap_init /
  * riscv_trap_dispatch / riscv_trap_dispatch_m) are compiled out — they
@@ -37,6 +47,14 @@
 #include <string.h>
 #include "../../arch/riscv/trap_riscv.h"
 
+/* The syscall number under test. The S-mode and M-mode twins leave it at
+ * RV_SYS_EXIT (164); the unimplemented-syscall twin overrides it at
+ * compile time with -DRV_TEST_A7=999, exercising the same dispatch call
+ * with a number dispatch does not implement. */
+#ifndef RV_TEST_A7
+#define RV_TEST_A7 RV_SYS_EXIT   /* 164, SYS_SLS_EXIT */
+#endif
+
 /* ─── Host stubs for the kernel's SBI layer (arch/riscv/sbi.h) ──────── */
 
 /* Mirrors the kernel console (S-mode path: SBI_DBCN → the serial line).
@@ -57,7 +75,7 @@ void sbi_system_reset(void) {
 int main(void) {
     struct RvPerHartData phd;
     memset(&phd, 0, sizeof(phd));
-    phd.trap_frame[TF_A7] = RV_SYS_EXIT;   /* 164, SYS_SLS_EXIT */
+    phd.trap_frame[TF_A7] = RV_TEST_A7;   /* 164, SYS_SLS_EXIT by default */
     phd.trap_frame[TF_A0] = 42;            /* the SIMI boot smoke's result */
 
     riscv_syscall_dispatch(&phd);
