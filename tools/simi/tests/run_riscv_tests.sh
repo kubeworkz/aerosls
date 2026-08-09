@@ -114,6 +114,30 @@ else
 fi
 rm -f rv_exitm.out rv_exitm.err
 
+# The unimplemented-syscall twin (rv-syscall-exit-test-u, compiled
+# -DRV_TEST_A7=999): a7 is not RV_SYS_EXIT, so dispatch reports the
+# unimplemented number and halts — the reset stub is never reached, so
+# its marker must be ABSENT from stderr.
+if ../rv-syscall-exit-test-u >rv_exitu.out 2>rv_exitu.err; then
+    if grep -q "\[SYSCALL\] unimplemented syscall number 999" rv_exitu.out \
+       && grep -q "halting hart" rv_exitu.out \
+       && ! grep -q "sbi_system_reset() stub" rv_exitu.err \
+       && ! grep -q "dispatch returned" rv_exitu.err; then
+        echo "PASS  rv-syscall-exit-u (unimplemented-syscall branch + halt, reset never attempted)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  rv-syscall-exit-u (unimplemented-syscall message / stub-absence / halt not as expected)"
+        cat rv_exitu.out rv_exitu.err
+        fail=$((fail+1))
+    fi
+else
+    rc=$?
+    echo "FAIL  rv-syscall-exit-u (exit rc=$rc — dispatch crashed or did not halt)"
+    cat rv_exitu.out rv_exitu.err
+    fail=$((fail+1))
+fi
+rm -f rv_exitu.out rv_exitu.err
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
