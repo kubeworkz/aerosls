@@ -76,40 +76,48 @@ static void rv64_boot_smoke_test(void) {
     SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_smoke_code_buf + entry_off);
     int64_t result = fn();
 
+    (void)result;
+
     rv_boot_print("[SIMI] entry returned (real machine code executed) -- issuing "
-                  "SYS_SLS_EXIT via ecall for real, through the new trap path...\n");
+                  "ebreak to trap through the real stvec path...\n");
 
-    /* Real ecall round trip: a0 = exit code, a7 = syscall number. Traps
-     * into riscv_trap_entry (arch/riscv/trap_riscv.S), which dispatches
-     * to riscv_syscall_dispatch() (arch/riscv/trap_riscv.c) -- that
-     * function halts the hart itself (see its own comment for why: no
-     * process table exists to return control to), so this call never
-     * returns. */
-    register uint64_t a0 __asm__("a0") = (uint64_t)result;
-    register uint64_t a7 __asm__("a7") = RV_SYS_EXIT;
-    __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
+    /* Real trap round trip: an ebreak (exception 3) is the one guaranteed
+     * way to reach riscv_trap_entry from S-mode under OpenSBI's default
+     * delegation. The original design used an ecall with RV_SYS_EXIT in
+     * a7, but OpenSBI (fw_dynamic) does NOT delegate exception 9 (ecall
+     * from S-mode) -- its MEDELEG leaves bit 9 clear -- so an S-mode ecall
+     * bounces back as a failed SBI call and never reaches our stvec
+     * handler. ebreak IS delegated, so it enters riscv_trap_entry
+     * (arch/riscv/trap_riscv.S), dispatches to riscv_trap_dispatch()
+     * (arch/riscv/trap_riscv.c), prints the unhandled-exception
+     * diagnostics, and halts the hart -- control never returns.
+     * riscv_syscall_dispatch()/RV_SYS_EXIT remain in place for the day
+     * exception 9 is delegated (see AeroSLS-SIMI-ISA-v0.1.md section 16). */
+    __asm__ volatile("ebreak" : : : "memory");
 
-    /* Unreachable in practice (riscv_syscall_dispatch halts), but stated
+    /* Unreachable in practice (the trap path halts), but stated
      * explicitly rather than left as fallthrough into whatever code
      * happens to follow. */
-    rv_boot_print("[SIMI] unexpected: ecall returned control.\n");
+    rv_boot_print("[SIMI] unexpected: trap returned control.\n");
 }
 
 void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
+    (void)hart_id;
     (void)fdt;
     const char* msg = "AeroSLS RISC-V Supervisor Node Kernel Online!";
     for(int i = 0; msg[i] != '\0'; i++) sbi_putchar(msg[i]);
     sbi_putchar('\n');
 
-    if (hart_id == 0) {
-        uint64_t trap_stack_top =
-            (uint64_t)(uintptr_t)&g_hart0_trap_stack[sizeof(g_hart0_trap_stack) - 16];
-        riscv_trap_init(&g_hart0_data, trap_stack_top);
+    /* OpenSBI (fw_dynamic) delivers the payload to exactly one hart -- the
+     * boot hart -- whose id is NOT necessarily 0 (default: the last hart,
+     * see boot_riscv.S). The former `hart_id == 0` gate never fired under
+     * `-smp > 1`, so the trap path and the SIMI smoke never ran; the
+     * delivered hart IS the boot hart, so run the boot sequence directly. */
+    uint64_t trap_stack_top =
+        (uint64_t)(uintptr_t)&g_hart0_trap_stack[sizeof(g_hart0_trap_stack) - 16];
+    riscv_trap_init(&g_hart0_data, trap_stack_top);
 
-        rv64_boot_smoke_test();
-    }
+    rv64_boot_smoke_test();
 
     while(1) { asm volatile("wfi"); }
 }
-
-void ap_riscv_kernel_main(void) { while(1); }

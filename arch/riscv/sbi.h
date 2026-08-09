@@ -17,17 +17,19 @@ struct SBIReturn {
 
 // Raw architectural calling wrapper to pass parameters up to OpenSBI Machine Mode
 static inline struct SBIReturn sbi_call(unsigned long ext, unsigned long fid, 
-                                        unsigned long arg0, unsigned long arg1) {
+                                        unsigned long arg0, unsigned long arg1,
+                                        unsigned long arg2) {
     struct SBIReturn ret;
     register unsigned long a0 __asm__("a0") = arg0;
     register unsigned long a1 __asm__("a1") = arg1;
+    register unsigned long a2 __asm__("a2") = arg2;
     register unsigned long a7 __asm__("a7") = ext;
     register unsigned long a6 __asm__("a6") = fid;
 
     __asm__ volatile(
         "ecall"
         : "+r"(a0), "+r"(a1)
-        : "r"(a6), "r"(a7)
+        : "r"(a6), "r"(a7), "r"(a2)
         : "memory"
     );
 

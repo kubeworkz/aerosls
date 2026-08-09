@@ -291,7 +291,14 @@ RV_C_SRC    = kernel/kernel_riscv.c arch/riscv/walk_page_tables_riscv.c \
               kernel/simi_riscv.c kernel/object_catalog.c \
               arch/riscv/user_paging_riscv.c arch/riscv/trap_riscv.c
 
-RV_OBJECTS  = $(RV_ASM_SRC:.S=.rv.o) $(RV_C_SRC:.c=.rv.o)
+# arch/riscv/trap_riscv.c and arch/riscv/trap_riscv.S both map to
+# trap_riscv.rv.o via the pattern rules below, so the C half (which
+# defines riscv_trap_init/riscv_trap_dispatch/riscv_syscall_dispatch)
+# was silently never built. Give the C file a unique object so both
+# halves link.
+RV_OBJECTS  = $(RV_ASM_SRC:.S=.rv.o) \
+              $(filter-out arch/riscv/trap_riscv.rv.o,$(RV_C_SRC:.c=.rv.o)) \
+              arch/riscv/trap_riscv_c.rv.o
 RV_ELF      = sls_riscv_kernel.elf
 
 .PHONY: all clean x86-run riscv-run plugins
@@ -413,6 +420,10 @@ x86-run: x86-iso
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
 
 %.rv.o: %.c
+	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
+
+# Unique object for trap_riscv.c (see the RV_OBJECTS comment above).
+arch/riscv/trap_riscv_c.rv.o: arch/riscv/trap_riscv.c
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
 
 $(RV_ELF): $(RV_OBJECTS)

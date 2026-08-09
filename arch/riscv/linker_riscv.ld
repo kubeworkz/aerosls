@@ -4,8 +4,11 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Begin putting sections at the OpenSBI / QEMU RAM base boundary (2 GiB) */
-    . = 0x80000000;
+    /* Begin putting sections 2 MiB above the OpenSBI / QEMU RAM base boundary
+     * (2 GiB): with `-bios default` OpenSBI itself occupies 0x80000000, so
+     * 0x80200000 is the canonical kernel load address under OpenSBI on
+     * qemu-system-riscv64 -M virt (the same layout Linux uses). */
+    . = 0x80200000;
 
     .text : ALIGN(4K)
     {
