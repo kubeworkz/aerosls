@@ -91,6 +91,7 @@ enum {
     OP_ENTER, OP_LEAVE,
     OP_RESOLVE, OP_OBJSIZE, OP_OBJTYPE, /* v0.3 (Phase 6) */
     OP_JMPR, /* Gap Remediation SIMI Phase 14 */
+    OP_CAS, OP_ATOMIC_ADD, /* Gap Remediation SIMI Phase 15 (shared-memory atomics) */
     OP_COUNT
 };
 enum { T_I8=0,T_I16,T_I32,T_I64,T_U8,T_U16,T_U32,T_U64,T_F32,T_F64,T_PTR,T_BOOL,T_OBJREF };
@@ -213,6 +214,14 @@ static uint32_t enc_orr_shift(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t shift,
     return 0xAA000000u | ((uint32_t)(shift & 3) << 22) | ((uint32_t)rm << 16) |
            ((uint32_t)(imm6 & 0x3F) << 10) | ((uint32_t)rn << 5) | rd;
 }
+/* Phase 15 (A3): `orr wd, wzr, wm` — the 32-bit MOV (register), whose
+ * W-form write ZERO-EXTENDS m into d. Used to mask an i32 CAS's expected
+ * value to its low 32 bits (the interpreter's width-masked compare —
+ * garbage high bits in rB must not affect the match, the A1 tooth's
+ * shape). sf=0 makes the whole encoding the 32-bit ORR. */
+static uint32_t enc_orr_32(uint8_t rd, uint8_t rm) {
+    return 0x2A0003E0u | ((uint32_t)rm << 16) | rd;
+}
 static uint32_t enc_eor_shift(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t shift, uint8_t imm6) {
     return 0xCA000000u | ((uint32_t)(shift & 3) << 22) | ((uint32_t)rm << 16) |
            ((uint32_t)(imm6 & 0x3F) << 10) | ((uint32_t)rn << 5) | rd;
@@ -290,6 +299,19 @@ static uint32_t enc_fmov_sw(uint8_t rd, uint8_t rn) { return 0x1E270000u | ((uin
 static uint32_t enc_ldr (uint8_t rt, uint8_t rn, uint16_t imm12) { return 0xF9400000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_str (uint8_t rt, uint8_t rn, uint16_t imm12) { return 0xF9000000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_ldrb(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0x39400000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
+/* Gap Remediation SIMI Phase 15 (A3, plan D2): the exclusive-access
+ * encodings — ldaxr/stlxr, the acquire/release pair the atomics loops
+ * emit (aq=1/rl=1 baked into the opcode). LDXR/LDAXR: size 00 111000
+ * 01/10 1 11111 Rn Rt (bits 20:16 all-ones = load, bit 15 = 0 for
+ * ldxr, 1 for ldaxr). STXR/STLXR: size 00 111000 00 0 Rs 11111 Rn Rt
+ * (bit 15 = 0 for stxr, 1 for stlxr; Rs = status dest, always a W
+ * register). The 32-bit forms differ only in size = 10 (sf bit 30).
+ * Bit 22 separates load (1) from store (0), bit 15 the acquire/
+ * release bit — the decoder's discriminator below. */
+static uint32_t enc_ldaxr (uint8_t rt, uint8_t rn) { return 0xC85FFC00u | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_ldaxr_w(uint8_t rt, uint8_t rn) { return 0x885FFC00u | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_stlxr (uint8_t rs, uint8_t rt, uint8_t rn) { return 0xC800FC00u | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | rt; }
+static uint32_t enc_stlxr_w(uint8_t rs, uint8_t rt, uint8_t rn) { return 0x8800FC00u | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_strb(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0x39000000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_ldrh(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0x79400000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
 static uint32_t enc_strh(uint8_t rt, uint8_t rn, uint16_t imm12) { return 0x79000000u | ((uint32_t)(imm12 & 0xFFF) << 10) | ((uint32_t)rn << 5) | rt; }
@@ -353,10 +375,18 @@ static uint32_t enc_bl  (int32_t imm26) { return 0x94000000u | ((uint32_t)imm26 
 static uint32_t enc_cbz (uint8_t rt, int32_t imm19) { return 0xB4000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | rt; }
 static uint32_t enc_cbnz(uint8_t rt, int32_t imm19) { return 0xB5000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | rt; }
 /* B.cond — conditional branch on NZCV: 0101 0100 0 imm19:19 0 cond:4
- * 00000 (0x54000000 | (cond << 12) | (imm19 << 5)). M2.25's inline JMPR
- * chain emits cmp (subs xzr) + b.eq pairs instead of the runtime table. */
+ * 00000 (0x54000000 | cond | (imm19 << 5)). M2.25's inline JMPR
+ * chain emits cmp (subs xzr) + b.eq pairs instead of the runtime table.
+ *
+ * A3 (Phase 15) bug-fix: the cond MUST land in bits 3:0, not bits 12:15.
+ * Every pre-A3 caller used cond = 0 (b.eq), where the two layouts agree
+ * (both write zeros there), so the wrong placement was invisible for
+ * months; the atomics' b.ne (cond = 1) exposed it — the word decoded as
+ * b.eq on the executor, the CAS mismatch path never fired, and the
+ * compare fell through into the stlxr. a64_exec.c's B.cond decode reads
+ * w & 0xF (bits 3:0), the ARM-canonical position. */
 static uint32_t enc_b_cond(uint8_t cond, int32_t imm19) {
-    return 0x54000000u | ((uint32_t)cond << 12) | (((uint32_t)imm19 & 0x7FFFFu) << 5);
+    return 0x54000000u | ((uint32_t)(cond & 0xF)) | (((uint32_t)imm19 & 0x7FFFFu) << 5);
 }
 static uint32_t enc_br  (uint8_t rn) { return 0xD61F0000u | ((uint32_t)rn << 5); }
 static uint32_t enc_blr (uint8_t rn) { return 0xD63F0000u | ((uint32_t)rn << 5); }
@@ -1033,6 +1063,29 @@ static uint32_t emit_cbz_placeholder(struct CodeBuf* cb) {
 static void patch_local_cbz(struct CodeBuf* cb, uint32_t pos, uint8_t rt) {
     int32_t off = (int32_t)(cb->len - pos);
     patch32(cb->buf, pos, enc_cbz(rt, off / 4));
+}
+/* Phase 15 (A3): local B.cond and backward-CBNZ variants of the same
+ * pattern — the CAS lr/sc-style loop needs a forward b.ne (mismatch ->
+ * .done) and a backward cbnz (stlxr failure -> .retry), both
+ * intra-instruction. enc_b_cond's imm19 is in words, like the other
+ * branch encoders here. */
+static uint32_t emit_bcond_placeholder(struct CodeBuf* cb) {
+    uint32_t pos = cb->len;
+    e32(cb, 0);
+    return pos;
+}
+static void patch_local_bcond(struct CodeBuf* cb, uint32_t pos, uint8_t cond) {
+    int32_t off = (int32_t)(cb->len - pos);
+    patch32(cb->buf, pos, enc_b_cond(cond, off / 4));
+}
+static uint32_t emit_cbnz_placeholder(struct CodeBuf* cb) {
+    uint32_t pos = cb->len;
+    e32(cb, 0);
+    return pos;
+}
+static void patch_cbnz_back(struct CodeBuf* cb, uint32_t branch_pos, uint32_t target_pos, uint8_t rt) {
+    int32_t off = (int32_t)(target_pos - branch_pos);
+    patch32(cb->buf, branch_pos, enc_cbnz(rt, off / 4));
 }
 static uint32_t emit_b_placeholder(struct CodeBuf* cb) {
     uint32_t pos = cb->len;
@@ -1805,7 +1858,7 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     if (rd >= TX_AR_MAX_REGS || ra >= TX_AR_MAX_REGS) return TX_AR_ERR_REG_OUT_OF_RANGE;
     if ((op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV||op==OP_MOD||op==OP_AND||
          op==OP_OR||op==OP_XOR||op==OP_SHL||op==OP_SHR||op==OP_SAR||op==OP_CMP||
-         op==OP_PTRADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_AR_MAX_REGS)
+         op==OP_PTRADD||op==OP_CAS||op==OP_ATOMIC_ADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_AR_MAX_REGS)
         return TX_AR_ERR_REG_OUT_OF_RANGE;
     /* Gap Remediation SIMI Phase 10 (F1): ADD/SUB/MUL/DIV/NEG/CMP now
      * have real IEEE-754 float codegen below (GP-bounce per plan D4,
@@ -2326,6 +2379,75 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     case OP_CALL: return TX_AR_ERR_BAD_OPCODE; /* handled specially in translate() (needs pc) */
     case OP_JMPR: return TX_AR_ERR_BAD_OPCODE; /* handled specially in translate() (needs the jump table; folded in M2) */
+    case OP_CAS: case OP_ATOMIC_ADD: {
+        /* Gap Remediation SIMI Phase 15 (A3, plan D2): the exclusive-
+         * monitor loops — CAS is ldaxr/cmp/b.ne/stlxr/cbnz retry,
+         * ATOMIC_ADD is ldaxr/add/stlxr/cbnz retry, exactly as the
+         * plan's D2 design specified (ARMv8.0, no LSE dependency).
+         * v1 scope: 4/8-byte cells, register operands only (FLAG_IMM
+         * rejected), SC ordering. rA = base, rB = expected (CAS) /
+         * addend (ATOMIC_ADD), rD = new-in/old-out (CAS, the cmpxchg
+         * shape) / old-out only (ATOMIC_ADD).
+         *
+         * Register plan: this instruction needs FOUR persistent hosts
+         * (base, new/addend, expected, and the result register), one
+         * more than the 3-slot x9/x10/x11 cache — so the cache is
+         * flushed first (empty, like RESOLVE's runtime-call flush), the
+         * result host rh is reserved for rd, the two non-rh slots hold
+         * base and new/addend, and the expected (CAS only) lives in
+         * X_DR (x12, outside the cache — no run-reuse displacement is
+         * live at an atomics pc, since runs are marked only on
+         * LOAD/STORE). The loop reuses rh for old (the ldaxr target —
+         * the mismatch path exits with old already in the result
+         * register, zero extra words) and the stlxr status doubles rh
+         * (on success old == expected, recovered from x12 with one
+         * mov; on the retry path the next ldaxr overwrites it). For
+         * ATOMIC_ADD the sum is a transient in x12 and old stays in rh
+         * untouched — no recovery mov at all.
+         *
+         * Width masking: ldaxr w (32-bit) zero-extends the loaded old;
+         * the 32-bit expected is masked with `mov w12, w12` (orr-32),
+         * so the cmp compares the width-masked pair exactly like the
+         * interpreter (garbage high bits in rB are ignored — the A1
+         * i32 tooth's shape). The 32-bit ATOMIC_ADD computes the sum
+         * in 64 bits and the stlxr w store truncates to low 32,
+         * matching the interpreter's memcpy of wdt bytes of the full
+         * sum. */
+        int wdt = 1 << type_shift(type);
+        if (flags & FLAG_IMM) return TX_AR_ERR_BAD_OPCODE;
+        if (wdt != 4 && wdt != 8) return TX_AR_ERR_BAD_OPCODE;
+        cache_flush(cb);
+        int v = cache_reserve(cb, rd, -1, -1);
+        uint8_t rh = result_host(v);
+        uint8_t h_base, h_other;
+        if (!g_alloc) { h_base = X_T1; h_other = X_T2; }
+        else { h_base = (uint8_t)(X_T0 + ((v + 1) % AR_CACHE_N)); h_other = (uint8_t)(X_T0 + ((v + 2) % AR_CACHE_N)); }
+        get_operand(cb, ra, h_base, 0);                 /* base */
+        if (op == OP_CAS) {
+            get_operand(cb, rd, h_other, 0);            /* new value (rD input) */
+            ld_slot(cb, X_DR, w_rb_reg(w));             /* expected (rB) — cache is empty, the slot is valid */
+            if (wdt == 4) e32(cb, enc_orr_32(X_DR, X_DR));   /* mask expected to low 32 */
+            uint32_t retry_pos = cb->len;               /* .retry: */
+            e32(cb, (wdt == 8) ? enc_ldaxr(rh, h_base) : enc_ldaxr_w(rh, h_base));   /* old -> rh */
+            e32(cb, enc_subs_shift(31, rh, X_DR, 0, 0));    /* cmp rh, x12 (both masked for wdt==4) */
+            uint32_t mismatch_pos = emit_bcond_placeholder(cb); /* b.ne .done */
+            e32(cb, (wdt == 8) ? enc_stlxr(rh, h_other, h_base) : enc_stlxr_w(rh, h_other, h_base)); /* status -> w{rh}; store new */
+            uint32_t retry_branch = emit_cbnz_placeholder(cb); /* cbnz rh, .retry */
+            patch_cbnz_back(cb, retry_branch, retry_pos, rh);
+            e32(cb, enc_orr_shift(rh, 31, X_DR, 0, 0));       /* success: old == expected — mov rh, x12 */
+            patch_local_bcond(cb, mismatch_pos, 1);     /* .done: b.ne (NE = 1) */
+        } else {
+            get_operand(cb, w_rb_reg(w), h_other, 0);   /* addend (rB) */
+            uint32_t retry_pos = cb->len;               /* .retry: */
+            e32(cb, (wdt == 8) ? enc_ldaxr(rh, h_base) : enc_ldaxr_w(rh, h_base));   /* old -> rh (the result host) */
+            e32(cb, enc_add_shift(X_DR, rh, h_other, 0, 0)); /* x12 = old + addend */
+            e32(cb, (wdt == 8) ? enc_stlxr(X_DR, X_DR, h_base) : enc_stlxr_w(X_DR, X_DR, h_base)); /* status -> w12; store the sum */
+            uint32_t retry_branch = emit_cbnz_placeholder(cb); /* cbnz x12, .retry */
+            patch_cbnz_back(cb, retry_branch, retry_pos, X_DR);
+        }
+        store_result(cb, rd);   /* rh = old: CAS's rh holds it on both paths; ATOMIC_ADD's rh never left it */
+        break;
+    }
     default: return TX_AR_ERR_BAD_OPCODE;
     }
     return TX_AR_OK;

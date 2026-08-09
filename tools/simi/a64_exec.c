@@ -297,6 +297,27 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             continue;
         }
 
+        /* ─── 32-bit ORR (register) — A3 (Phase 15): emitted only as
+         * `mov w12, w12` (enc_orr_32, the i32 CAS expected-value mask —
+         * orr wd, wzr, wm). The W-form write zero-extends into the
+         * upper 32 bits, like every other 32-bit register write here.
+         * Only the shift=0, N=0 form is emitted; anything else in the
+         * 32-bit logical family faults. */
+        if ((w & 0xFFE00000u) == 0x2A000000u) {
+            int nbit = (int)((w >> 21) & 1);
+            int rm = (int)((w >> 16) & 0x1F);
+            int shift = (int)((w >> 22) & 3);
+            uint64_t imm6 = (w >> 10) & 0x3F;
+            int rn = (int)((w >> 5) & 0x1F);
+            int rd = (int)(w & 0x1F);
+            if (nbit || shift != 0 || imm6 != 0) return AR_EXEC_BAD_INSTR;
+            uint64_t a = rx(cpu, rn);
+            uint64_t b = rx(cpu, rm);
+            set_x(cpu, rd, (a | b) & 0xFFFFFFFFull);
+            cpu->pc = next_pc;
+            continue;
+        }
+
         /* ─── Data-processing register families: csel/csinc/csinv/csneg,
          * variable shifts, mul/div/msub — all share the 1 00 1101/0110
          * top region; split by the finer 0xFFE00000 mask. */
@@ -518,6 +539,7 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             }
             uint64_t addr = cpu->x[rn] + (uint64_t)off;  /* 64-bit wrap — negative offsets just work */
             if (opc == 0) {                             /* STR */
+                if (cpu->excl_valid && addr == cpu->excl_addr) cpu->excl_valid = 0;  /* A3: a store to the watched address clears the monitor */
                 uint64_t sv = (rt == 31) ? 0 : cpu->x[rt];
                 if (!store_mem(cpu, addr, width, sv)) return AR_EXEC_MEM_FAULT;
             } else if (opc == 1) {                      /* LDR */
@@ -549,6 +571,7 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
             int width = 1 << size;
             uint64_t addr = cpu->x[rn] + (imm12 << size);
             if (opc == 0) {                             /* STR — Rt==31 is XZR (stores zero), only Rn can be SP */
+                if (cpu->excl_valid && addr == cpu->excl_addr) cpu->excl_valid = 0;  /* A3: a store to the watched address clears the monitor */
                 uint64_t sv = (rt == 31) ? 0 : cpu->x[rt];
                 if (!store_mem(cpu, addr, width, sv)) return AR_EXEC_MEM_FAULT;
             } else if (opc == 1) {                      /* LDR */
@@ -643,6 +666,52 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
         if ((w & 0xFFFFFC00u) == 0xD65F0000u) {
             int rn = (int)((w >> 5) & 0x1F);
             cpu->pc = cpu->x[rn];                       /* rn==30 == LR for plain `ret` */
+            continue;
+        }
+
+        /* ─── Exclusive-access family (ldxr/ldaxr/stxr/stlxr) — ────────
+         * Gap Remediation SIMI Phase 15 (A3, plan D2): the atomics loops
+         * emit ldaxr + stlxr. The family shares bits 29:24 = 001000
+         * (mask 0x3F000000 == 0x08000000), with bit 22 separating load
+         * (1) from store (0), bit 15 the acquire/release bit (1 =
+         * ldaxr/stlxr — the only forms emitted), and size (bits 31:30)
+         * the width (11 = 64-bit X, 10 = 32-bit W — W forms
+         * zero-extend the loaded value / store the low 32 bits, exactly
+         * the interpreter's width-masked semantics). The exclusive-
+         * monitor model (see the A64Cpu struct): LDAXR sets the
+         * monitor; STLXR succeeds iff it is valid and matches, then
+         * clears it; any other store to the watched address clears it
+         * too (the STR paths above). The single-threaded guest's
+         * atomics loops emit no store between the pair, so stlxr
+         * succeeds first try here — the retry path needs real
+         * hardware (documented in the plan). */
+        if ((w & 0x3F000000u) == 0x08000000u) {
+            int size = (int)(w >> 30);
+            int is_load = (int)((w >> 22) & 1);
+            int rn = (int)((w >> 5) & 0x1F);
+            int rt = (int)(w & 0x1F);
+            int width = 1 << size;
+            if (width != 4 && width != 8) return AR_EXEC_BAD_INSTR;
+            uint64_t addr = cpu->x[rn];
+            if (is_load) {
+                uint64_t v;
+                if (!load_mem(cpu, addr, width, 0, &v)) return AR_EXEC_MEM_FAULT;
+                set_x(cpu, rt, v);
+                cpu->excl_valid = 1;                 /* monitor armed on the loaded address */
+                cpu->excl_addr = addr;
+            } else {
+                int rs = (int)((w >> 16) & 0x1F);    /* status: 0 = success, 1 = failure */
+                uint64_t sv = (rt == 31) ? 0 : cpu->x[rt];
+                int ok = cpu->excl_valid && cpu->excl_addr == addr;
+                if (ok) {
+                    if (!store_mem(cpu, addr, width, sv)) return AR_EXEC_MEM_FAULT;
+                    set_x(cpu, rs, 0);
+                } else {
+                    set_x(cpu, rs, 1);
+                }
+                cpu->excl_valid = 0;                 /* the monitor is always cleared by STXR */
+            }
+            cpu->pc = next_pc;
             continue;
         }
 

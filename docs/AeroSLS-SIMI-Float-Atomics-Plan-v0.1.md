@@ -382,8 +382,9 @@ Phases 9–14 numbering — the exact number follows the convention the ARM back
   (interp / x86 / RV64-reject), no existing test's result changed.
 - **A2 — LANDED** — RV64 (`lr`/`sc`, `amo.add.d`) + `rv64_exec.c` +
   four-way parity (interp / x86 / RV64 / ARM-reject).
-- **A3** — A64 (`ldaxr`/`stlxr` loops) + `a64_exec.c` exclusive-monitor model +
-  enc-check + size-gate rows + full four-way parity.
+- **A3 — LANDED** — A64 (`ldaxr`/`stlxr` loops) + `a64_exec.c`
+  exclusive-monitor model + enc-check + size-gate rows + full four-way
+  parity (interp / x86 / RV64 / ARM).
 - **A4 (later, only if a consumer needs it)** — acquire/release ordering bits
   using the reserved flags slots, once a real kernel spinlock or queue needs
   non-SC semantics; v1 ships SC-only.
@@ -525,6 +526,69 @@ The evidence, all measured:
   byte-identical (78/78, 26404 saved — simi_arm.c untouched), enc-check
   clean.
 
+### 7.4 A3 status — LANDED (A64 `ldaxr`/`stlxr` loops + exclusive-monitor model)
+
+A3 is done: the A64 translator emits the exclusive-monitor loops the
+D2 design specified, `a64_exec.c` models the monitor, and both fixtures
+run on the ARM engine — the four-way parity is now complete on all
+four engines. The evidence, all measured:
+
+- **The codegen (D2)** — `simi_arm.c` gains `OP_CAS`/`OP_ATOMIC_ADD`
+  cases (mirror enum + the shared reg-range check, `FLAG_IMM`/width
+  rejects). The instruction needs FOUR persistent hosts, one more than
+  the 3-slot cache, so the cache flushes first (like RESOLVE's runtime
+  call), the result host is reserved for rd, base and new/addend take
+  the two non-rh slots, and the expected (CAS only) lives in x12
+  (outside the cache — no run-reuse displacement is live at an atomics
+  pc). CAS is `ldaxr`/`cmp`/`b.ne .done`/`stlxr`/`cbnz .retry`, with
+  the success path recovering `old` from x12 via one `mov` — the
+  `stlxr` status register doubles the result host (on success old ==
+  expected; on retry the next ldaxr overwrites it), zero extra words
+  for the plumbing. ATOMIC_ADD is `ldaxr`/`add`/`stlxr`/`cbnz .retry`
+  with the sum in x12 and old staying in rh untouched — no recovery
+  mov at all. Width masking: the 32-bit expected is masked with
+  `mov w12, w12` (orr-32) and the `stlxr w` store truncates to the low
+  32 bits, matching the interpreter's width-masked compare + wdt-byte
+  store exactly (the A1 i32 tooth's shape).
+- **A latent `enc_b_cond` bug, found and fixed** — the encoder wrote
+  cond at bits 12–15 but ARM (and `a64_exec.c`) read it at bits 3:0.
+  Every pre-A3 caller used cond = 0 (`b.eq`), where the two layouts
+  agree, so the wrong placement was invisible for months; the atomics'
+  `b.ne` (cond = 1) exposed it — the CAS mismatch branch decoded as
+  `b.eq` on the executor and the compare fell through into the stlxr.
+  Fixed at the source; the enc-check's independent `bcond` decoder
+  carried the same latent 15:12 reading and was fixed there too.
+- **The exclusive-monitor model** — `A64Cpu` gains `excl_valid` /
+  `excl_addr`; LDAXR arms the monitor, STLXR succeeds iff it is valid
+  and matches then clears it, and every ordinary STR path clears it
+  too. The single-threaded guest's atomics loops emit no store between
+  the pair, so stlxr succeeds first try here — the retry path is
+  implemented but unexercised until real hardware (the documented
+  caveat). `a64_exec.c` decodes the whole exclusive family; the i32
+  tooth's `mov w12, w12` (orr-32) decode was added with it.
+- **The fixtures un-skipped** — `run_arm_tests.sh` drops the A0-era
+  skip block; both fixtures now RUN on the ARM engine through
+  `simi-arm-verify`: **cas_simple = 5 at 1372 bytes, atomic_add = 2 at
+  1196 bytes** of A64 code.
+- **The four-way parity** — interp 5/2, x86 5/2 (unchanged: 995/822
+  bytes), RV64 5/2 (unchanged: 1472/1244 bytes), ARM 5/2. The i32
+  tooth (garbage-high-bits CAS + 3×7 ATOMIC_ADD counter) passes on all
+  four: interp 4, x86 4, RV64 4, ARM 4.
+- **Enc-check** — `a64_enc_check.py` gains independent `ldaxr`/`stlxr`
+  W/X encoders + decode rules + ALLOWED classes and two new program
+  rows (`cas_simple`, `atomic_add` — the Makefile assembles/dumps
+  them); 6 programs, 24 OK / 0 MISMATCH. The decode verifies every
+  emitted word — including the exclusive words — classifies into a
+  legal A64 class.
+- **Size gate** — the two new rows use honest NAIVE baselines (the
+  programs didn't exist at M0; measured with the A3 translator forced
+  to `g_alloc=0`, the float_ops precedent): cas_simple 1416→1372
+  (**-44**), atomic_add 1220→1196 (**-24**). **80/80 rows, saved
+  26472** (was 26404 — the +68 is exactly the two new rows; all 78
+  existing rows byte-identical).
+- **No regression** — interp 81/81, x86 native 80/80, RV64 79/79, ARM
+  **80/80** (both fixtures now run), enc-check clean, a64-f0-test PASS.
+
 ## 8. Honest verification caveats
 
 - **The four-way parity harness is single-threaded.** It proves the FUNCTIONAL
@@ -539,10 +603,17 @@ The evidence, all measured:
   evidence class).
 - `a64_exec.c`'s exclusive monitor must be modeled correctly — `ldaxr` marks the
   address, `stlxr` succeeds only if still marked, else the loop retries — or the
-  loop spins forever. A small, well-scoped executor addition, but a real one;
-  the CAS fixture's failure-path check exercises the retry.
-- The size gate: the two new programs get M0 baselines at git 1729f50; all 79
-  existing rows must stay byte-identical (both parts are strictly additive).
+  loop spins forever. It is (A3): `excl_valid`/`excl_addr`, LDAXR arms, STLXR
+  succeeds iff valid and matching then clears, every ordinary STR to the
+  watched address clears too. The single-threaded guest emits no store between
+  the pair, so stlxr succeeds first try here — the retry loop is implemented
+  but its failure path is exercised only on real hardware; the fixtures' CAS
+  failure-path checks exercise the `cmp`/`b.ne` mismatch path instead.
+- The size gate: the two new programs get NAIVE (`g_alloc=0`) baselines
+  measured with the A3 translator forced to g_alloc=0 — they did not exist at
+  M0, and the naive path degrades to exactly the M0 sequences (the float_ops
+  precedent); all 78 existing rows byte-identical, the two new rows additive
+  (80 rows total, both parts strictly additive).
 
 ---
 

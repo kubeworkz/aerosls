@@ -113,9 +113,21 @@ def str_w_reg(rt, rn, rm):return 0xB820C800 | (rm << 16) | (rn << 5) | rt
 def ldrsb_reg(rt, rn, rm):return 0x38A0C800 | (rm << 16) | (rn << 5) | rt
 def ldrsh_reg(rt, rn, rm):return 0x78A0C800 | (rm << 16) | (rn << 5) | rt
 def ldrsw_reg(rt, rn, rm):return 0xB8A0C800 | (rm << 16) | (rn << 5) | rt
+# A3 (SIMI Phase 15): the exclusive-access family — LDAXR/STLXR, the
+# only forms simi_arm.c's atomics loops emit (aq=1/rl=1 baked into the
+# opcode). LDAXR: size 00 111000 0 1 11111 1 11111 Rn Rt — bit 22 = 1
+# (load), bit 15 = 1 (acquire); STLXR: size 00 111000 00 0 Rs 11111 Rn
+# Rt — bit 22 = 0 (store), bit 15 = 1 (release), Rs@20:16 = the W
+# status dest (0 = success, 1 = failure). size@31:30 = width: 11 =
+# 64-bit X, 10 = 32-bit W. lda x0, [x1] == 0xC85FFC20 (base
+# 0xC85FFC00 | (1 << 5)).
+def ldaxr(rt, rn):    return 0xC85FFC00 | (rn << 5) | rt
+def ldaxr_w(rt, rn):  return 0x885FFC00 | (rn << 5) | rt
+def stlxr(rs, rt, rn):  return 0xC800FC00 | (rs << 16) | (rn << 5) | rt
+def stlxr_w(rs, rt, rn):return 0x8800FC00 | (rs << 16) | (rn << 5) | rt
 def br(rn):                 return 0xD61F0000 | (rn << 5)
 def blr(rn):                return 0xD63F0000 | (rn << 5)
-def bcond(cond, imm19):     return 0x54000000 | (cond << 12) | ((imm19 & 0x7FFFF) << 5)
+def bcond(cond, imm19):     return 0x54000000 | (cond & 0xF) | ((imm19 & 0x7FFFF) << 5)
 
 # ── F2: scalar floating point (SIMI Phase 10, verified vs QEMU's ────────
 # a64.decode in F0 — see the scalar-FP section of a64_exec.c for the
@@ -261,6 +273,19 @@ def decode(w):
                 2: {0: "str_w_reg", 1: "ldr_w_reg", 2: "ldrsw_reg"},
                 3: {0: "str_reg", 1: "ldr_reg"}}.get(sz, {}).get(opc)
         if name: return (name, rm(w), rn(w), rd(w))
+    # Exclusive-access family (A3): bits 29:24 = 001000 (mask
+    # 0x3F000000 == 0x08000000 — no other emitted class has that
+    # field), bit 22 = load (1) / store (0), bit 15 = 1 (only the
+    # aq/rl forms ldaxr/stlxr are emitted — plain ldxr/stxr, bit 15 =
+    # 0, decode as None), size@31:30 = width (11 = X, 10 = W). LDAXR
+    # has no status field; STLXR's Rs@20:16 is the status dest.
+    if (w & 0x3F000000) == 0x08000000:
+        width = 1 << ((w >> 30) & 3)
+        is_load = (w >> 22) & 1
+        if width == 8:
+            return ("ldaxr", rn(w), rd(w)) if is_load else ("stlxr", rm(w), rn(w), rd(w))
+        if width == 4:
+            return ("ldaxr_w", rn(w), rd(w)) if is_load else ("stlxr_w", rm(w), rn(w), rd(w))
     if (w & 0xFFFFFC1F) == 0xD61F0000: return ("br", rn(w))
     if (w & 0xFFFFFC1F) == 0xD63F0000: return ("blr", rn(w))
     if (w & 0xFC000000) == 0x14000000: return ("b", (w & 0x3FFFFFF) | (-(1 << 26) if w & 0x2000000 else 0))
@@ -269,10 +294,13 @@ def decode(w):
     # zero/nonzero, imm19@23:5 and Rt@4:0 are free.
     if (w & 0xFE000000) == 0xB4000000: return ("cbz", (w >> 5) & 0x7FFFF, rd(w))
     if (w & 0xFE000000) == 0xB5000000: return ("cbnz", (w >> 5) & 0x7FFFF, rd(w))
-    # B.cond: 0101 0100 0 imm19 0 cond 00000 — bits 31:24 and bit 4 are
-    # fixed; cond@15:12 and imm19@23:5 are free. M2.25's inline JMPR
-    # chain emits cmp (subs_imm XZR) + b.eq pairs.
-    if (w & 0xFF000010) == 0x54000000: return ("bcond", (w >> 12) & 0xF, (w >> 5) & 0x7FFFF)
+    # B.cond: 0101 0100 0 imm19 0 cond 00000 — bits 31:24, bit 23:5 =
+    # imm19 and bit 4 are fixed; cond is bits 3:0 (the ARM-canonical
+    # position — the A3 fix to simi_arm.c's enc_b_cond, which the
+    # atomics' b.ne exposed: the old encoder wrote cond at 15:12 where
+    # pre-A3 callers' cond=0 (b.eq) made the discrepancy invisible).
+    # M2.25's inline JMPR chain emits cmp (subs_imm XZR) + b.eq pairs.
+    if (w & 0xFF000010) == 0x54000000: return ("bcond", w & 0xF, (w >> 5) & 0x7FFFF)
     return None
 
 # Classes simi_arm.c may legally emit (M0/M1). Anything else in the dump
@@ -287,6 +315,8 @@ ALLOWED = {"movz", "movk", "add_imm", "sub_imm", "subs_imm", "add_shift",
            "ldr_reg", "str_reg", "ldrb_reg", "strb_reg", "ldrh_reg",
            "strh_reg", "ldr_w_reg", "str_w_reg",           "ldrsb_reg", "ldrsh_reg", "ldrsw_reg",
            "br", "blr", "b", "bl", "cbz", "cbnz", "bcond",
+           # A3: exclusive-access classes simi_arm.c's atomics loops emit.
+           "ldaxr", "ldaxr_w", "stlxr", "stlxr_w",
            # F2: scalar FP classes simi_arm.c may emit (F1 codegen).
            "fadd_d", "fadd_s", "fsub_d", "fsub_s", "fmul_d", "fmul_s",
            "fdiv_d", "fdiv_s", "fcmp_d", "fcmp_s",
@@ -511,6 +541,20 @@ def main():
             f32bits(7.0), f32bits(1.75), f32bits(-3.5),
             0x7FF8000000000000,
         ]
+        ok &= body_checks(dump, expected_values, "body")
+    elif prog == "cas_simple":
+        # A3 (SIMI Phase 15): the CAS fixture's LOADI constants — the
+        # expected/new values 100/200/100/200/300/100/200/500/200. The
+        # exclusive words themselves (ldaxr/stlxr) are verified by the
+        # decode-all check: they must classify into an ALLOWED class or
+        # the body check fails.
+        expected_values = [100, 200, 100, 200, 300, 100, 200, 500, 200]
+        ok &= body_checks(dump, expected_values, "body")
+    elif prog == "atomic_add":
+        # A3: the ATOMIC_ADD fixture's LOADI constants — counter init 0,
+        # increment 1, sum/loop seeds 0/0, loop limit 10, and the two
+        # expected-result constants 10/45.
+        expected_values = [0, 1, 0, 0, 10, 10, 45]
         ok &= body_checks(dump, expected_values, "body")
     else:
         print("unknown program %s" % prog)

@@ -108,6 +108,19 @@ struct A64Cpu {
      * + `cset` for all 10 SIMI relations, so the decoder must model the
      * flag writes of SUBS and the flag reads of the CSEL family. */
     uint8_t n, z, c, v;
+    /* Gap Remediation SIMI Phase 15 (A3): the exclusive-monitor model —
+     * the one piece of machine state the ldaxr/stlxr loops need. LDXR/
+     * LDAXR sets excl_valid=1 and records the loaded address; STXR/
+     * STLXR succeeds (status 0) iff the monitor is valid and matches,
+     * then clears it; an ordinary store to the watched address clears
+     * it too (per ARMv8, the monitor is cleared by any store to the
+     * watched address — implementations may clear on more). The guest
+     * is single-threaded, so the monitor can only be cleared by the
+     * program's own code between the pair; the atomics loops emit no
+     * stores between ldaxr and stlxr, so they succeed first try here —
+     * the retry path is exercised only on real hardware (documented). */
+    uint8_t excl_valid;
+    uint64_t excl_addr;
     uint8_t* mem;
     uint32_t mem_size;
 };
