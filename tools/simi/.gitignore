@@ -13,6 +13,7 @@ bench-corpus
 bench-exec
 bench-exec-rv64
 cross-isa
+cross-size
 tests/*.tmo
 tests/*.log
 tests/*.txt
