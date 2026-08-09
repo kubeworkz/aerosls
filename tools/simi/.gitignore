@@ -9,6 +9,7 @@ a64_dump
 a64-f0-test
 stress-atomics
 bench-net
+bench-corpus
 tests/*.tmo
 tests/*.log
 tests/*.txt
