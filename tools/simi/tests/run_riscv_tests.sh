@@ -62,6 +62,34 @@ for src in *.simi; do
     fi
 done
 
+# Phase 9g host-side tripwire: the SBI_SRST failure fallback in
+# riscv_syscall_dispatch() (arch/riscv/trap_riscv.c). The REAL kernel file
+# is compiled for the host with -DSIMI_HOST_TEST and a FAILING
+# sbi_system_reset() stub (tools/simi/rv_syscall_exit_test.c); this asserts
+# the fallback messages fired, the stub was reached, and dispatch never
+# returned (the process terminated from inside rv_halt's host branch
+# instead of falling through to main's "returned" marker).
+if ../rv-syscall-exit-test >rv_exit.out 2>rv_exit.err; then
+    if grep -q "\[SYSCALL\] SYS_SLS_EXIT, code=42" rv_exit.out \
+       && grep -q "powering off via OpenSBI SBI_SRST" rv_exit.out \
+       && grep -q "SBI_SRST unsupported or failed -- halting hart instead" rv_exit.out \
+       && grep -q "sbi_system_reset() stub" rv_exit.err \
+       && ! grep -q "dispatch returned" rv_exit.err; then
+        echo "PASS  rv-syscall-exit (SBI_SRST failure fallback messages + halt)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  rv-syscall-exit (fallback messages / stub / halt not as expected)"
+        cat rv_exit.out rv_exit.err
+        fail=$((fail+1))
+    fi
+else
+    rc=$?
+    echo "FAIL  rv-syscall-exit (exit rc=$rc — dispatch crashed or did not halt)"
+    cat rv_exit.out rv_exit.err
+    fail=$((fail+1))
+fi
+rm -f rv_exit.out rv_exit.err
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
