@@ -5776,6 +5776,49 @@ bench_exec.c (new — the per-row BASELINES table), a64_exec.h/.c
 (the steps counter), the Makefile (bench-exec target in `all`/`clean`)
 and .gitignore.
 
+### 10.160 M2.75 — the parity harness asserts the committed step counts (as built)
+
+The M2.74 follow-up: bench-exec's committed per-fixture step counts now
+fire in the PARITY HARNESS itself, before any bench runs. The 96-row
+baseline table moved out of bench_exec.c into **bench_baselines.h** —
+the single source of truth shared by bench-exec (the execution-cost
+gate) and simi_arm_verify.c (the four-way parity ARM leg).
+simi-arm-verify takes a new optional `--steps` flag: after a successful
+run, it derives the fixture name from the .tmo path (basename with
+.tmo -> .simi), looks up the committed count, and asserts
+A64Cpu.steps equals it — failing loudly if the fixture has no
+committed row (the M0_BASELINES update discipline) or if the count
+moves (a decode that now faults early, a fold that alters the emitted
+control flow, an a64_exec regression). The check is skipped when
+execution does not complete (a fault is already reported as FAIL), and
+the counts are for the "main" entry the runners execute. run_arm_tests.sh
+passes `--steps` on every fixture; the Makefile's simi-arm-verify and
+bench-exec rules gained bench_baselines.h as a dependency.
+
+Why the harness, not just the bench: a step-count regression is a
+DECODE/EMISSION regression — the four-way parity is the semantic
+surface that must catch it first, and it runs on every `make test-arm`.
+The bench's per-row steps guard remains (same table, same numbers) as
+the translate-cost-adjacent check; the harness check is the earlier,
+cheaper tripwire.
+
+### 10.161 M2.75 gate results (measured)
+
+ARM parity with `--steps` on all 96 fixtures: **96 passed, 0 failed, 3
+skipped — every PASS prints "steps ok"**, proving every committed count
+matches the harness's own execution exactly (teeth: corrupting add.simi's
+committed steps 241 -> 999 fails the parity row "--steps: executed 241
+instructions != committed 999 (decode/emission regression)", reverted to
+PASS). bench-exec unchanged (same table via the header): **96 rows within
+their committed baselines, ALL CHECKS PASSED**. Emission untouched (no
+simi_arm.c change), so the size gate stays **96/96, 46224 saved, all
+rows byte-identical**; four-way parity interp 97/97, x86/RV64/ARM
+96/0/3; bench-net and bench-corpus PASS; enc-check clean. Changed:
+bench_baselines.h (new — the shared table), simi_arm_verify.c (the
+--steps check), bench_exec.c (consumes the header), run_arm_tests.sh
+(--steps on every fixture), the Makefile (deps) and plan doc §10.158
+superseded for the table's location.
+
 ---
 
 ## Sources consulted

@@ -56,7 +56,11 @@ for src in *.simi; do
         continue
     fi
 
-    if "$VERIFY" "$name.tmo" main "$expected"; then
+    # M2.75: --steps asserts the fixture's committed executed-instruction
+    # count (bench_baselines.h — the same table bench-exec gates on) right
+    # here in the parity harness, catching decode/emission regressions
+    # before any bench runs. Deterministic and machine-independent.
+    if "$VERIFY" "$name.tmo" main "$expected" --steps; then
         pass=$((pass+1))
     else
         fail=$((fail+1))
