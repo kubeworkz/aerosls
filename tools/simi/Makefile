@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -58,6 +58,25 @@ bench-net: simi-asm bench_net.c simi_arm.c simi_arm.h tests/jmpr_chain36.simi
 	$(CC) $(CFLAGS) -o $@ bench_net.c simi_arm.c
 	./bench-net tests/jmpr_chain36.tmo 100
 
+# M2.72: corpus-wide translate-cost bench — translates every fixture N
+# times at the shipped trip count, recording per-instruction translate
+# time and the fixpoint scan counts, as the regression guard for the
+# fixpoint series beyond chain36 (bench-net pins the net-firing input;
+# this pins the whole corpus). Assembles all fixtures on the spot;
+# FAILS if the total scan count moves (deterministic) or the aggregate
+# per-instruction time exceeds the committed ceiling (see bench_corpus.c
+# and plan doc §10.154/10.155). In `all` with bench-net (~1 s total at
+# the default 50 iters — the M2.27 stale-binary lesson).
+bench-corpus: simi-asm bench_corpus.c simi_arm.c simi_arm.h
+	$(CC) $(CFLAGS) -o $@ bench_corpus.c simi_arm.c
+	# Assemble on the spot, but only when stale/missing — a fresh checkout
+	# has no .tmo (gitignored), so the first build pays the full assembly;
+	# incremental builds re-assemble only the fixtures whose .simi moved.
+	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
+	    if [ ! -f "$$tmo" ] || [ "$$f" -nt "$$tmo" ]; then \
+	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
+	./bench-corpus tests/*.tmo 50
+
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top
 # comment). simi_arm.c can't emit float yet (F1) — this proves the
@@ -106,6 +125,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus clean
