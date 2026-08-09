@@ -1,8 +1,12 @@
-; jmpr_chain32.simi — M2.56: the tracked-register closure AT its 8-cap.
+; jmpr_chain32.simi — M2.56: the tracked-register closure at its 8-cap.
 ; M2.43 raised TX_AR_CHAIN_REGS from 4 to 8 (jmpr_chain19 pinned the
-; 5-register closure); this pin regression-guards the NEW turn-over
+; 5-register closure); this pin regression-guarded that turn-over
 ; boundary: a closure needing EXACTLY 8 registers — the largest the cap
-; admits. The index is built in FOUR stages over joins:
+; admitted then. M2.62 later raised TX_AR_CHAIN_REGS to 12, so the same
+; 8-feeder closure now sits BELOW the cap: the fixture still fires its
+; 30-pair chain unchanged, and the turn-over boundary itself moved to
+; chain38 (12 feeders, M2.62) / chain39 (13 feeders, M2.63). The index
+; is built in FOUR stages over joins:
 ;   r8 in {0, 10}                    (2-way join)
 ;   r4 = r8 + r8    -> {0, 20}
 ;   r5 in {0, 10, ..., 50}           (6-way join)
@@ -12,12 +16,13 @@
 ;   r1 = r2 + r3    -> THIRTY distinct values {80..170} U {280..370} U
 ;                      {480..570} step 10
 ; The tracked closure is {r1, r2, r3, r4, r5, r6, r7, r8} — EIGHT
-; registers, exactly TX_AR_CHAIN_REGS: every feeder is tracked and the
+; registers (<= TX_AR_CHAIN_REGS 12): every feeder is tracked and the
 ; 30-candidate chain fires (the gate: 8*30+4 = 244 < 40 + 4*572 = 2328).
-; A closure needing a NINTH register (r4 = r8 + r9 instead of r8 + r8)
-; would stop growing at 8 — r9 untracked, its set UNKNOWN, r1 falls to
-; the table (conservative and correct, dump shows 0 b.eq; verified as
-; the ad-hoc control). The runtime index 10 + 10 + 50 + 100 + 400 = 570
+; At the 8-cap era, a closure needing a NINTH register (r4 = r8 + r9
+; instead of r8 + r8) would stop growing at 8 — r9 untracked, its set
+; UNKNOWN, r1 falls to the table (conservative and correct, dump shows
+; 0 b.eq; verified as the ad-hoc control; the analogous 13-feeder
+; over-cap is now pinned by chain39, M2.63). The runtime index 10 + 10 + 50 + 100 + 400 = 570
 ; (all join BCs fall through, r0 == 0) is the LAST of the 30 candidates
 ; and takes the chain's THIRTIETH b.eq, landing on block29's LOADI
 ; #3000 — a truncated image (a 29-candidate chain, or one feeder

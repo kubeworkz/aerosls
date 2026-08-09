@@ -302,17 +302,17 @@
 # branch's "deferred source -> UNKNOWN" fallback IS reachable in
 # principle: the M2.30 root allocates a record whenever a
 # register-form product overflows the merge cap with known FLAT
-# sources (a >64-distinct image — the M2.42 "UNREACHABLE" comment
+# sources (a >96-distinct image — the M2.42 "UNREACHABLE" comment
 # means such records can never lead to a CHAIN, not that they are
 # never allocated). The pin proves the FLAT side: r1 = -(r2 + r3)
 # with r2, r3 in {-79..-61 step 2} — the ADD product is the 19 even
 # values {-158..-122 step 2} (would DEFER under the old 12-cap, fits
-# the current 64) — so NO record is created and the in-place NEG
+# the current 96) — so NO record is created and the in-place NEG
 # RE-DERIVES to {122..158}. Runtime -( -61 + -61 ) = 122 -> the
 # chain's FIRST b.eq -> block0 -> 100 on all four engines.
 # Dump-verified: 19 b.eq, compares exactly {122..158 step 2}, the
 # first b.eq byte-exact on block0's movz x9, #100. Teeth: (a) a
-# 20x20 MUL product (>64 distinct) + NEG collapses conservatively
+# 20x20 MUL product (>96 distinct) + NEG collapses conservatively
 # (0 b.eq, table, runtime -400 out of range -> fault rc=1 on ARM and
 # interp); (b) the CAP-REVERT — with TX_AR_CHAIN_MAX back at 12 the
 # same pin's product DEFERS (record created), the NEG reads the
@@ -1006,12 +1006,12 @@ declare -A M0_BASELINES=(
 # (the mirror of chain27's UNARY collapse). The index r1 = r2 + r3 over
 # two SEQUENTIAL 10-way joins (r2 in {0,10,...,90} at Ja, r3 in {0..9}
 # at Jb — the sets delivered independently) gives the analysis a
-# 100-DISTINCT image {0..99}, which OVERFLOWS the image merge cap (64,
+# 100-DISTINCT image {0..99}, which OVERFLOWS the image merge cap (96,
 # TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG) -> UNKNOWN -> the chain dies ->
 # the naive table dispatch runs. Runtime 90 + 9 = 99 lands on block0 at
 # pc 99 -> LOADI #999 -> PASS 999 on all four engines, through the
 # table's bounds check; runtime 99 is the LAST of the 100-value image,
-# so a wrong analysis emitting a truncated 64-candidate chain would
+# so a wrong analysis emitting a truncated 96-candidate chain would
 # miss it and UDF-trap (rc=1). Dump-verified: 0 b.eq, the full table
 # dispatch, 101 instructions. M2.54 ALSO fixed a latent bug the pin's
 # control exposed: chain_flatten_big copied a flat set (stored at
@@ -1019,23 +1019,29 @@ declare -A M0_BASELINES=(
 # check — a stack overflow whenever MAX > BIG (a raised-cap control
 # crashed with stack smashing; now it collapses to UNKNOWN instead,
 # exact-or-conservative). Under the shipped equal caps the fix is
-# byte-invisible (n <= 64 = BIG always), so this row's M0 baseline
+# byte-invisible (n <= 96 = BIG always), so this row's M0 baseline
 # (2888, measured at git 1729f50) differs from M1 (2476) only by the
 # accumulated emission folds on the g_alloc=0 table path (-412).
+# (Equal-caps note, M2.64: the >96 product DEFERS as record 0 —
+# instrumented ndef=1 — and the dispatch materialization then
+# collapses at the BIG store; same table, exact-or-conservative.)
 
 # jmpr_chain31 is M2.55: the mirror cap divergence pinned from the shipped
 # side. The M2.54 control proved MAX > BIG is overflow-free (flatten
 # collapses); the mirror is BIG > MAX — the union store's frozen
 # g_chain_def_flat is BIG-shaped, so a deferred record whose true set
 # exceeds the walk's flat bound (TX_AR_CHAIN_MAX) materializes soundly
-# through the BIG path. Under the shipped EQUAL caps (64/64) that
-# divergence is unreachable — a record's store holds at most 64, exactly
-# the flat bound — so this pin regression-guards the TURN-OVER BOUNDARY:
-# the largest set the machinery can represent (n == MAX == BIG, exactly
-# 64 values), materializing through record creation, the BIG store, and
-# the walk flatten all at the same point. The index is the union of TWO
-# deferred products: R1 = r2 + r3 (32 values {44..106} step 2) and R2 =
-# r2 + r6 (32 values {152..214}), 64 DISTINCT values total; runtime 92 +
+# through the BIG path. Under the shipped EQUAL caps (96/96, M2.61)
+# that divergence is unreachable — a record's store holds at most 96,
+# exactly the flat bound. At the M2.55-era caps (64/64) this fixture WAS
+# the TURN-OVER BOUNDARY (n == MAX == BIG, exactly 64 values); after
+# M2.61's equal bump the same 64-value union now sits BELOW the cap and
+# materializes FLAT (the record machinery never engages — instrumented
+# ndef=0 at M2.64), and the boundary itself moved to chain37 (96 values)
+# / chain30 (100 values, collapses). The index is the union of two
+# 32-value products (R1 = r2 + r3 -> {44..106} step 2, R2 = r2 + r6 ->
+# {152..214}), 64 DISTINCT values total — below the cap, so the flat
+# union path runs, no records (see the fixture header). Runtime 92 +
 # 122 = 214 takes the chain's SIXTY-FOURTH b.eq, so a truncated
 # materialization (a store one short, a guard keeping 63) misses it and
 # UDF-traps. Dump-verified: 64 b.eq, 65 br, 1 udf, 0 table words. M2.55
@@ -1045,18 +1051,21 @@ declare -A M0_BASELINES=(
 # record with BIG < MAX; the guard refuses (-> UNKNOWN, exact-or-
 # conservative). The control (BIG=128 > MAX=64, ASan) ran the full ARM
 # suite 83/0/3: >MAX records materialize soundly. Byte-invisible under
-# equal caps; this row's M0 baseline (6204, measured at git 1729f50)
-# differs from M1 (4944) by the accumulated emission folds (-1260).
+# equal caps (M2.61 raised both to 96 together); this row's M0 baseline
+# (6204, measured at git 1729f50) differs from M1 (4944) by the
+# accumulated emission folds (-1260).
 
-# jmpr_chain32 is M2.56: the tracked-register closure AT its 8-cap
+# jmpr_chain32 is M2.56: the tracked-register closure at its 8-cap
 # (TX_AR_CHAIN_REGS, raised 4 -> 8 in M2.43). M2.43's chain19 pinned the
-# 5-register closure; this pin regression-guards the NEW turn-over
+# 5-register closure; this pin regression-guarded that turn-over
 # boundary — a closure needing EXACTLY 8 registers, the largest the cap
-# admits. The index is built in FOUR stages: r4 = r8 + r8 (r8 in
+# admitted then. M2.62 later raised TX_AR_CHAIN_REGS to 12, so the same
+# 8-feeder closure now sits BELOW the cap: the fixture still fires its
+# 30-pair chain, and the boundary moved to chain38 (12) / chain39 (13). The index is built in FOUR stages: r4 = r8 + r8 (r8 in
 # {0,10}), r2 = r4 + r5 (r5 in {0,10,...,50}), r3 = r6 + r7 (r6 in
 # {80,90,100}, r7 in {0,200,400}), r1 = r2 + r3 -> THIRTY distinct
 # values {80..170} U {280..370} U {480..570} step 10. The closure
-# {r1..r8} = EIGHT registers = TX_AR_CHAIN_REGS: every feeder is
+# {r1..r8} = EIGHT registers (<= TX_AR_CHAIN_REGS 12): every feeder is
 # tracked and the 30-pair chain fires (8*30+4 = 244 < 40 + 4*572 =
 # 2328). Runtime 10+10+50+100+400 = 570 is the LAST of the 30
 # candidates and takes the chain's THIRTIETH b.eq, landing on block29's
@@ -1070,8 +1079,10 @@ declare -A M0_BASELINES=(
 # baseline (12828, measured at git 1729f50) differs from M1 (8448) by
 # the accumulated emission folds (-4380).
 
-# jmpr_chain33 is M2.57: the deferred-record pool AT its TX_AR_CHAIN_DEFS
-# = 64 cap. The index is a 64-record DAG: the root product r1 = r2 + r3
+# jmpr_chain33 is M2.57: the deferred-record pool boundary, now a FLAT
+# fixture under the equal caps (see the fixture header for the full
+# story). At the M2.57-era caps (DEFS = 64) the index was a 64-record
+# DAG: the root product r1 = r2 + r3
 # (r2 in {0,20,...,140}, r3 in {0..18 step 2} -> ALL even numbers 0..158,
 # 80 DISTINCT values > 64) OVERFLOWS the image merge cap and DEFERS
 # (M2.30: record 0, CD_SLOT/CD_SLOT); then 63 IN-PLACE ADDs r1 = r1 + r4
@@ -1086,10 +1097,10 @@ declare -A M0_BASELINES=(
 # b.eq, the table — the M2.42 "vestigial" note) was CAP-SPECIFIC, not
 # structural: M2.57's Control A (BIG=128) already proved the same DAG
 # chains when the caps admit it, and the 96/96 shipped state is exactly
-# that behavior, now regression-guarded. The pool boundary is still
-# pinned: a 65th in-place ADD exhausts g_chain_ndef >= 64 -> r1 UNKNOWN
-# -> the table (conservative), and chain30 (100 values > 96) still
-# collapses. Dump-verified (96/96): 64 b.eq, 0 table words. This row's
+# that behavior, now regression-guarded. The pool boundary moved to the
+# M2.64/M2.65 pins: chain40 (96 records, at-cap) and chain41 (97
+# records, exhaustion); chain30 (100 values > 96) still collapses.
+# Dump-verified (96/96): 64 b.eq, 0 table words. This row's
 # M0 baseline (7468, measured at git 1729f50) differs from M1 (5904)
 # by the 64-candidate chain replacing the table and the accumulated
 # emission folds (-1564).

@@ -5308,6 +5308,55 @@ all 94 shared rows are byte-identical (simi_arm.c untouched):
   — a truncated union materialization would UDF-trap its
   runtime 232). enc-check clean, a64-f0 PASS, stress all-green.
 
+### 10.144 M2.67 — stale fixture-header cleanup to the equal-caps reality (as built)
+
+A comment-only pass (no code change) prompted by the M2.64/M2.66
+findings: several chain fixtures' headers still narrated the
+M2.54–M2.57-era mechanics and caps, which the equal-caps bumps
+(M2.61 MAX/BIG 64→96, M2.62 REGS 8→12, M2.64 DEFS 64→96) had made
+false as *current-behavior* claims. The instrumented ground truth
+(M2.64: every fixture flat with ndef=0 except chain30's single
+record) was the authority for each rewrite:
+
+- jmpr_chain29: "fits the current 64" / ">64-distinct image" → 96
+  (the unary-over-deferred boundary numbers; the flat-side
+  mechanism claim was already correct).
+- jmpr_chain30: merge-cap "(64, TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG)"
+  and the truncated-64-candidate discriminator → 96, plus an
+  explicit note that the >96 product DEFERS as record 0
+  (instrumented ndef=1) and collapses at the dispatch BIG store.
+- jmpr_chain31: the "TURN-OVER BOUNDARY at exactly 64" framing was
+  false at 96/96 — the 64-value union now sits BELOW the cap and
+  materializes flat (instrumented ndef=0, the "deferred products"
+  narrative is a fossil); the fixture still fires its 64-pair
+  chain, and the boundary moved to chain37 (96) / chain30 (100).
+- jmpr_chain32: "AT its 8-cap" → the 8-feeder closure is now BELOW
+  TX_AR_CHAIN_REGS 12 (M2.62); the fixture still fires its 30-pair
+  chain, and the boundary moved to chain38 (12) / chain39 (13).
+- jmpr_chain33: the "64-record DAG falls to the table — 0 b.eq"
+  narrative was false — at 96/96 the 80-value root fits the BIG
+  store, the walk keeps everything flat (ndef=0), and the chain
+  fires 64 b.eq; the pool boundary itself moved to the
+  chain40/chain41 pins (M2.64/M2.65).
+
+The size_gate_arm.sh row comments for chain29–33 were aligned to
+match (the M2.61-era chain33 gate comment was already current in
+its emission claim; its "pool boundary pinned by a 65th ADD at
+DEFS=64" tail was corrected to point at chain40/41). chain6–18
+headers were left as historical milestone narratives (they describe
+what each milestone did at its then-current caps; chain18's
+"vestigial" note already frames the record machinery as history).
+
+### 10.145 M2.67 gate results (measured)
+
+No code change, so the gate is a no-op by construction: **94/94,
+M0 251452 → M1 205664, 45788 saved — byte-identical to M2.66's
+totals, all 94 rows unchanged** (the comment edits cannot move
+emission). Four-way parity re-run for safety: interp 95/95, x86
+94/0/3, RV64 94/0/3, ARM 94/0/3 — all green on the exact final
+state. The six changed files are comment-only: five fixture
+headers and the gate script's row comments.
+
 ---
 
 ## Sources consulted
