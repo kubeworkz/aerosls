@@ -4849,6 +4849,79 @@ a pure pin + gate row + doc):
   87/0/3, ARM 87/0/3); the split path (A -> T -> B -> 9) executes
   at runtime on every engine. enc-check clean.
 
+### 10.130 M2.60 — the relaxation 2-cycle driven into the 512-pass safety net (as built)
+
+A pure probe + pin milestone (`simi_arm.c` unchanged). The M2.18
+safety-net comment documents the last untested convergence
+mechanism: "a fold ENABLED BY the relaxation can target the relaxed
+head itself (a backward fold re-entering the head makes it a loop
+head the relaxation must not apply to) — that shape 2-cycles the
+fixpoint (relax -> fold -> reset -> un-fold)". M2.60 constructed it
+(jmpr_chain36):
+
+- The loop head V (pc 5) is RELAX-ELIGIBLE: its unique incoming
+  edge is S's forward BR (pc 3), V-1 = pc 4 is a RET (a terminal —
+  no fall-through), no CALL targets V, V is not an entry, and no
+  backward BR/BC targets it (J is a JMPR — the eligibility scan
+  counts only BR/BC/CALL edges, so J's back-edge is invisible to
+  it).
+- JMPR J (pc 8) dispatches on r2 = 5 = V's pc — a BACKWARD fold
+  re-entering the relaxed head — and r2's constant (LOADI at pc 2)
+  is established BEFORE V. V is a pre-marked block head (BR
+  targets are heads from the start), so its reset kills r2 UNLESS
+  the relaxation restores it from the S snapshot — the fold is
+  genuinely ENABLED BY the relaxation, exactly as the comment says.
+
+**The 2-cycle, instrumented.** Pass 1: snapshot at S, relaxation
+restores r2 at V, J folds. Pass 2: V is a fold target (g_fold_tgt_prev
+live-excluded) — the relaxation is refused, the reset kills r2, J
+un-folds. Pass 3: V is no longer a fold target — relax again, J folds.
+The fixpoint alternates forever: **NET FIRED at total pass 513** (the
+>512 boundary), the safety net disables the relaxation, clears the
+fold set, and restarts; the un-relaxed fixpoint is monotone-decreasing
+and terminates at **total pass 514** with J un-folded (fold8=-1). The
+post-net state is EXACTLY what the un-relaxed analysis would reach, so
+the restart is sound — the pin guards TERMINATION, not emission.
+
+**The M2.58 interaction.** The post-net state — J the single dynamic
+JMPR — feeds the walk: g_alloc = 0, the S-branch delivers {5} at the
+head V, and J emits a 1-candidate chain (cmp r2, #5; b.eq BACK to V;
+UDF fall-through) instead of the runtime table. The loop's back-edge
+is NOT an edge for the walk — an unfolded JMPR is a terminal — so the
+walk converges in 2 iterations and the M2.58 unconverged guard stays
+silent even though the PROGRAM loops. Runtime: the chain dispatches
+r2 = 5 back to V, the loop runs three times (r1 3->2->1->0), the INV
+BC exits at r1 == 0, r0 = 5 + 5 = 10 on all four engines.
+
+**Teeth.** Control A (the head forced not relax-eligible, ad hoc):
+the fixpoint takes 1 pass, no net, same 1056-byte emission, PASS 10
+— the 2-cycle requires the eligibility. Control B (the net disabled,
+ad hoc, timeout-bounded): the translator HANGS on the 2-cycle (exit
+124) — the net is provably the termination mechanism. Dump-verified:
+1 b (S's BR), 1 b.eq (J's chain, BACKWARD to V), 1 udf, 0 table
+words.
+
+### 10.131 M2.60 gate results (measured)
+
+Total emitted bytes across the now-84-program parity set: **M0
+202100 → M1 167516, 34584 saved** (≈16.9%). One row added, zero
+moved — `simi_arm.c` is byte-identical to the M2.59 commit (pure
+pin + gate row + doc):
+
+- jmpr_chain36 1180 → 1056 (−124, new 84th row; M0 baseline
+  measured at git 1729f50) — the 2-cycle pin: the 1-candidate
+  chain replacing J's runtime table (the chain's b.eq loops back
+  to V — the walk's backward candidate — which the M0 table's
+  indirect branch also served) plus the accumulated emission
+  folds on the small loop body. Runtime 10 on all four engines.
+- Row-by-row accounting: **all 88 shared rows byte-identical** —
+  zero simi_arm.c delta; the net never fires for any corpus
+  program (all converge), so nothing else can move.
+- Four-way parity: 353 PASS, 0 FAIL — all 89 expected-result
+  programs on all four engines (interp 89/89, x86 88/0/3, RV64
+  88/0/3, ARM 88/0/3); the loop body (S -> V -> J -> V ... ->
+  EXIT) executes at runtime on every engine. enc-check clean.
+
 ---
 
 ## Sources consulted
