@@ -11,6 +11,7 @@ stress-atomics
 bench-net
 bench-corpus
 bench-exec
+bench-exec-rv64
 tests/*.tmo
 tests/*.log
 tests/*.txt

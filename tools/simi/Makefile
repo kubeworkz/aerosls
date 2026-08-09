@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -100,6 +100,22 @@ bench-exec: simi-asm bench_exec.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h be
 	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
 	./bench-exec tests/*.simi 500
 
+# M2.77: corpus-wide RV64 EXECUTION-cost bench — the symmetric counterpart
+# of bench-exec, driving rv64_exec.c instead of a64_exec. COMMITTED
+# PER-ROW BASELINES in bench_baselines_rv64.h (the single source of truth
+# shared with the simi-riscv-verify --steps check): exact per-fixture
+# steps + ns/call at a 4x wall-clock margin. Re-measure deliberately with
+# RV64_BENCH_MEASURE=1 ./bench-exec-rv64 <tests/ fixtures> 500 (see
+# bench_exec_rv64.c's top comment and plan doc §10.164/10.165). In `all`
+# with the other benches (~1-2 s total).
+bench-exec-rv64: simi-asm bench_exec_rv64.c simi_riscv.c simi_riscv.h rv64_exec.c rv64_exec.h bench_baselines_rv64.h
+	$(CC) $(CFLAGS) -o $@ bench_exec_rv64.c simi_riscv.c rv64_exec.c
+	# Same assemble-on-the-spot loop as bench-corpus (stale/missing only).
+	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
+	    if [ ! -f "$$tmo" ] || [ "$$f" -nt "$$tmo" ]; then \
+	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
+	./bench-exec-rv64 tests/*.simi 500
+
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top
 # comment). simi_arm.c can't emit float yet (F1) — this proves the
@@ -148,6 +164,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 clean
