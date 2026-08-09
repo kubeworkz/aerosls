@@ -5451,6 +5451,64 @@ the exact final state. Three files changed, all comment-only: the
 plan doc (§10.112-125 sweep + §10.146/10.147 records), the chain27
 fixture header, and the gate script's chain37 row comment.
 
+### 10.148 M2.69 — the fold fixpoint's safety net probed: convergence is ≤ 3 scans, so the 512-pass net fires only on the 2-cycle (as built)
+
+M2.59 pinned the retroactive split (chain35, two JMPRs, 3 passes); M2.60
+pinned the relaxation 2-cycle (chain36, the net firing). The untested
+boundary was the "many scans" direction: can a fold analysis need many
+passes to converge, approaching the 512-pass safety net without being a
+divergence? The probe (jmpr_chain43) scales chain35's mechanism to a
+SIX-JMPR cascade — J_k folds (pass 1) to T_k, where T_k sits INSIDE
+J_{k+1}'s chain (between S_{k+1} and JMPR_{k+1}), so the pass-1 rule-1
+mark at T_k resets r_{k+1} in pass 2.
+
+The structural argument — the answer is that the case does not exist.
+g_pc_target (the block-head marks) only ever ACCRETES inside the
+fixpoint: the per-pass scan resets the constant map at every marked pc,
+and the post-pass rule-1 only adds marks (never removes). A JMPR
+un-folds iff a marked pc sits in its chain, and once un-folded it can
+never re-fold (no mark is ever removed; a LOADI re-establishing a
+constant is a fixed instruction with a fixed value). The fold set is
+monotone-decreasing, and pass 1's marks are ALL already live in pass 2 —
+so every JMPR whose chain contains ANY pass-1 target un-folds in the
+SAME pass. Convergence is exactly 3 scans (fold-all, un-fold-all,
+confirm) for ANY cascade size; the pass count never scales with the
+number of JMPRs. The M2.18 relaxation is the only non-monotone force
+(it can RESTORE a constant at a relax-eligible head, re-folding a
+JMPR), and its per-pass exclusion (g_fold_tgt_prev, the previous pass's
+complete fold set) makes a re-folding JMPR's own target flip the head's
+eligibility back and forth — the 2-cycle chain36 pins. So the 512-pass
+safety net is reachable ONLY by the 2-cycle; a slow-converging fold
+analysis cannot be constructed.
+
+The instrumented probe (temporary pass counter, reverted, simi_arm.c
+byte-identical): **chain43 FIXPOINT passes=2 relax=1 net=0** — 2
+changed iterations + 1 confirm = 3 scans for six JMPRs, the net never
+fired, the relaxation stayed enabled. The control at the same
+instrumented level — **chain36 FIXPOINT passes=0 relax=0 net=1**: the
+2-cycle drove the counter past 512, the net fired exactly once (relax
+disabled, fold set cleared, restart), and the un-relaxed restart
+converged on its first scan (passes=0 after the reset — no JMPR folds
+without the relaxation) — the restart-and-terminate behavior, still
+PASSing = 10. Emission dump-verified: chain43 emits exactly ONE direct
+`b` (J1's fold survives — its chain (1, 7) contains no mark, all
+pass-1 targets sit at pc ≥ 9), 0 b.eq, and 5 `br x11` table dispatches
+(J2..J6 went dynamic; multiple dynamic JMPRs mean no inline chain, so
+g_alloc = 0 and the naive path emits the compacted table). Runtime
+9 → 12 → 15 → 18 → 21 → 24 → r0 = 1 on all four engines.
+
+### 10.149 M2.69 gate results (measured)
+
+**95/95, M0 253200 → M1 207220, 45980 saved** — the new jmpr_chain43
+row (M0 1748, measured at git 1729f50: the naive translator, all six
+JMPRs via table → M1 1556, −192: the M2.24 table compaction and
+accumulated naive-path emission folds) and all **94 shared rows
+byte-identical** (45788 + 192 = 45980 exactly). Four-way parity on the
+exact final state: interp 96/96, x86 95/0/3, RV64 95/0/3, ARM 95/0/3
+(+1 each = chain43). The teeth: reverting the rule-1 mark (constants
+flowing through fold targets) keeps J2..J6 folded → g_alloc = 1 →
+cache mode → a smaller, different emission, caught by the gate row.
+
 ---
 
 ## Sources consulted
