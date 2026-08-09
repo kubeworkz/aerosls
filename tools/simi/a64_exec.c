@@ -182,6 +182,7 @@ const char* a64_exec_strerror(int code) {
 int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
     for (uint64_t step = 0; step < max_steps; step++) {
         if (cpu->pc == AR_EXEC_SENTINEL_LR) return AR_EXEC_OK;
+        cpu->steps++;   /* M2.74: one executed instruction (bench_exec.c's exact guard) */
 
         uint32_t w;
         if (!fetch32(cpu, cpu->pc, &w)) return AR_EXEC_MEM_FAULT;

@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -79,6 +79,25 @@ bench-corpus: simi-asm bench_corpus.c simi_arm.c simi_arm.h
 	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
 	./bench-corpus tests/*.tmo 500
 
+# M2.74: corpus-wide EXECUTION-cost bench — the runtime-side counterpart
+# of bench-corpus. Each fixture is translated once, then executed N times
+# through a64_exec.c (the same purpose-built A64 decoder/executor the
+# four-way parity uses) with the same mock host functions and the expected
+# result parsed from the .simi comment. COMMITTED PER-ROW BASELINES in
+# bench_exec.c: exact per-fixture steps (a64_exec's new per-instruction
+# counter — deterministic, machine-independent) + ns/call at a 4x
+# wall-clock margin. Re-measure deliberately with
+# BENCH_EXEC_MEASURE=1 ./bench-exec tests/*.simi 500 (see bench_exec.c's
+# top comment and plan doc §10.158/10.159). In `all` with bench-corpus
+# (~1-2 s total).
+bench-exec: simi-asm bench_exec.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h
+	$(CC) $(CFLAGS) -o $@ bench_exec.c simi_arm.c a64_exec.c
+	# Same assemble-on-the-spot loop as bench-corpus (stale/missing only).
+	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
+	    if [ ! -f "$$tmo" ] || [ "$$f" -nt "$$tmo" ]; then \
+	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
+	./bench-exec tests/*.simi 500
+
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top
 # comment). simi_arm.c can't emit float yet (F1) — this proves the
@@ -127,6 +146,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec clean

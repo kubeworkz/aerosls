@@ -103,6 +103,12 @@ struct A64Cpu {
      * path and this executor's fcmp/fadd/etc. rely on that separation. */
     uint64_t f[32];
     uint64_t pc;
+    /* M2.74: steps executed — a64_exec_run() increments this once per
+     * decoded instruction. A deterministic, machine-independent count of
+     * the execution work per run (the bench_exec.c exact guard, mirroring
+     * bench_corpus.c's fixpoint scan counts). Zeroed by the caller's
+     * memset; callers that don't care never read it. */
+    uint64_t steps;
     /* NZCV condition flags — the one piece of implicit machine state this
      * subset must carry: simi_arm.c's CMP synthesis uses `cmp` (subs xzr)
      * + `cset` for all 10 SIMI relations, so the decoder must model the

@@ -10,6 +10,7 @@ a64-f0-test
 stress-atomics
 bench-net
 bench-corpus
+bench-exec
 tests/*.tmo
 tests/*.log
 tests/*.txt
