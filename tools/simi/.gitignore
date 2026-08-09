@@ -12,6 +12,7 @@ bench-net
 bench-corpus
 bench-exec
 bench-exec-rv64
+bench-exec-interp
 cross-isa
 cross-size
 tests/*.tmo

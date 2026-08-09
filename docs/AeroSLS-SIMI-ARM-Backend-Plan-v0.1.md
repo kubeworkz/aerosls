@@ -6022,6 +6022,78 @@ checks (bench-net, bench-corpus, bench-exec, bench-exec-rv64,
 cross-isa, cross-size) PASS. Changed: cross_size.c (new), the Makefile
 (cross-size target in `all`/`clean`) and .gitignore.
 
+### 10.170 M2.80 — the interpreter leg gets its execution-cost gate (design)
+
+M2.79 left the four-way measurement story one leg short: A64 and RV64
+have execution-cost benches (bench-exec, bench-exec-rv64), x86 has its
+emitted-byte gate, but the reference interpreter — the parity GROUND
+TRUTH every other leg is checked against — had no committed cost or
+work number of its own. M2.80 closes that with `bench-exec-interp`, the
+same translate-once + run-N-times model as the other two benches.
+
+The interpreter is a Phase-1 standalone program (the run loop and its
+static frame/memory state lived inline in `simi_interp.c`'s `main()`,
+with no library API — unlike a64_exec/rv64_exec). M2.80 extracts the
+loop into a reusable entry point, behavior-identical:
+
+- `simi_interp_run(SimiObject obj, entry_pc, &steps, &result)` — the
+  exact loop simi-run used, moved verbatim into a non-static function
+  (declared in new `simi_interp.h`); it resets the frame stack AND
+  zeroes `mem` on entry, so repeated calls are independent and
+  deterministic (a no-op change for the standalone, which always
+  started from a fresh process). `main()` became a thin wrapper that
+  parses args, loads the object, calls the run function, and prints
+  `result`. `main` is guarded by `SIMI_INTERP_NO_MAIN` so the bench
+  can link `simi_interp.c` without a main conflict. Guard: the interp
+  parity stays 97/97 (verified).
+- `bench_exec_interp.c` — reads each .tmo once with `simi_obj_read`
+  (the "translate once" analog — the interpreter doesn't translate),
+  then executes it N=500 times through `simi_interp_run`, asserting
+  the expected r0 and step-count determinism every iteration, and
+  timing ns/call. Fixture set is run_tests.sh's: every fixture with an
+  "Expected result:" comment — INCLUDING mem_ops.simi (the address-0
+  pointer is an interpreter-only convenience; the translated legs use
+  mem_ops_native instead), so this table carries **97 rows** to the
+  translated legs' 96. jmpr_oob (faults by design) and cap_forge_debug
+  (no expected result) are skipped, exactly as the runner skips them.
+- `bench_baselines_interp.h` — the committed per-row table (steps
+  EXACT + ns/call at a 4x margin), the same two-tier model and
+  discipline as the other benches (a fixture with no row FAILS loudly;
+  re-measure deliberately with `SIMI_BENCH_MEASURE=1`).
+
+The steps are the SIMI-instruction count the interpreter executes —
+the raw SIMI stream, no translation — so this is the GROUND-TRUTH
+work number the translated ISAs' counts are compared against by the
+cross-ISA reports, and it is now itself a committed, asserted figure.
+
+### 10.171 M2.80 gate results (measured)
+
+**ALL CHECKS PASSED — 97 fixture rows within their committed
+baselines: 2595 SIMI steps across one run of the whole corpus (2
+skipped, 0 failed)** — the interp bench's first committed run. Noise
+analysis over three N=500 measure passes: steps identical across all
+three (determinism confirmed), ns/call tail **2.08x per fixture** (1/97
+over 2.0x, 0/97 over 3.0x; median 1.07x) — the same WSL profile as the
+A64/RV64 sides (2.28x/2.37x), so the 4.0x margin is comfortably sized.
+The headline number is the expansion factor: the interpreter executes
+**2595 SIMI instructions** where the translated code executes **35032
+A64 / 32820 RV64** (~13.5x / ~12.7x) — the ISA-level work the
+translators emit per SIMI op (fetch/cache machinery, chains, frame
+prologues), now pinned as a committed quantity. Teeth: corrupting
+add.simi's committed steps 6→99 fails "steps=6 != committed 99
+(interpreter/emission work changed)"; corrupting its ns 3218→100
+fails "3498 ns/call > committed 100 x 4 (execution cost regression)";
+both reverted to PASS. Emission untouched (no simi_arm.c change — the
+bench only READS the emission via the .tmo), so the size gate stays
+**96/96, 46224 saved, all rows byte-identical**; four-way parity interp
+97/97, x86/RV64/ARM 96/0/3; all **seven** `all` checks (bench-net,
+bench-corpus, bench-exec, bench-exec-rv64, bench-exec-interp,
+cross-isa, cross-size) PASS; enc-check clean; stress all-green.
+Changed: simi_interp.c/simi_interp.h (the simi_interp_run extraction),
+bench_exec_interp.c (new), bench_baselines_interp.h (new, 97 rows),
+the Makefile (bench-exec-interp target in `all`/`clean`) and
+.gitignore.
+
 ---
 
 ## Sources consulted
