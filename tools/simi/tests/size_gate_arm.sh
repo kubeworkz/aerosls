@@ -1175,10 +1175,11 @@ declare -A M0_BASELINES=(
 # LOADI #987. A truncated materialization (a union one short, or a
 # store one short) misses 346 and UDF-traps. The bump is monotone in
 # capability: sets <= 64 behave byte-identically (all 88 shared rows
-# unchanged except jmpr_chain33, whose 80-value root now fits 96 and
-# chains — the M2.57 Control-A behavior, documented above), and
-# chain30's 100-value index still collapses conservatively (100 > 96).
-# Dump-verified: 96 b.eq, 0 table words. This row's M0 baseline
+# unchanged except jmpr_chain27 and jmpr_chain33, whose 65- and
+# 80-value images now fit 96 and chain — chain33 is the M2.57
+# Control-A behavior, documented above), and chain30's 100-value
+# index still collapses conservatively (100 > 96). Dump-verified:
+# 96 b.eq, 0 table words. This row's M0 baseline
 # (9348, measured at git 1729f50) differs from M1 (7288) by the
 # 96-candidate chain replacing the runtime table and the accumulated
 # emission folds (-2060).

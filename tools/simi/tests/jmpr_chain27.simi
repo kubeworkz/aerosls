@@ -1,20 +1,22 @@
-; jmpr_chain27.simi — M2.51: the conservative side of the UNARY cap
-; discipline, promoted from M2.50's ad-hoc teeth into a committed pin.
-; M2.48's chain24 pinned the EXACT side (a ten-value NEG source maps to
-; ten candidates and chains); this pin regression-guards the collapse:
-; a SIXTY-FIVE-DISTINCT join source through NEG maps to 65 distinct
-; values, which OVERFLOWS the image merge cap (64, TX_AR_CHAIN_MAX /
-; TX_AR_CHAIN_BIG) inside chain_img_alu -> the image is UNKNOWN -> the
-; chain dies -> the naive table dispatch runs. The index is r1 = -r2
-; over a 65-way join (r2 in {-150,-149,...,-86} -> 65 values {86..150});
-; runtime -(-150) = 150 lands on block0 at pc 150 -> LOADI #777 -> PASS
-; 777 on all four engines, through the table's bounds check. The test
-; DISCRIMINATES truncation: a wrong analysis that emitted a chain over
-; only the first 64 candidates {86..149} would miss runtime 150, miss
-; every b.eq and UDF-trap (rc=1) — only the conservative UNKNOWN ->
-; table path passes. Dump-verified: 0 b.eq, the full 10-word table
-; dispatch (movz num_instr, subs/cset/cbz, li32 base, add-shift ldr,
-; br, UDF), 152 instructions.
+; jmpr_chain27.simi — M2.51: the UNARY cap discipline, promoted from
+; M2.50's ad-hoc teeth into a committed pin. M2.48's chain24 pinned the
+; EXACT side (a ten-value NEG source maps to ten candidates and
+; chains); this pin originally regression-guarded the COLLAPSE: at the
+; M2.51-era caps (64, TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG) the
+; SIXTY-FIVE-DISTINCT join source through NEG (65 values {86..150})
+; OVERFLOWED the image merge cap inside chain_img_alu -> UNKNOWN ->
+; the table. M2.61's EQUAL-CAPS bump (MAX = BIG = 96) changed this
+; pin's meaning, exactly like chain33's: 65 <= 96 now FITS, so the
+; image materializes and the chain FIRES with the full 65 candidates.
+; The index is r1 = -r2 over a 65-way join (r2 in {-150,-149,...,-86}
+; -> 65 values {86..150}); runtime -(-150) = 150 takes the chain's
+; SIXTY-FIFTH b.eq -> block0 at pc 150 -> LOADI #777 -> PASS 777 on
+; all four engines. The test DISCRIMINATES truncation: a wrong
+; analysis that emitted a chain over only the first 64 candidates
+; {86..149} would miss runtime 150, miss every b.eq and UDF-trap
+; (rc=1) — only the exact-or-conservative emission passes. The
+; collapse side of the discipline moved to chain30 (100 values > 96).
+; Dump-verified (96/96): 65 b.eq, 0 table words.
 ; Expected result: 777
 .entry main
 main:
