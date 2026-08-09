@@ -146,7 +146,7 @@ jobs:
           healthy=0
           qemu_alive=1
           for i in $(seq 1 75); do
-            if curl -sf --max-time 2 http://localhost:3001/api/health >/dev/null 2>&1; then
+            if curl -sf --max-time 2 http://localhost:3001/api/health > health.json 2>/dev/null; then
               healthy=1
               break
             fi
@@ -172,5 +172,25 @@ jobs:
             tail -30 boot.log >&2
             exit 1
           }
+          # Assert the BODY, not just the 200: a degraded service could still
+          # answer. status must be "ok" and uptime_ticks a positive integer.
+          if ! python3 -c '
+          import json, sys
+          try:
+              d = json.load(open(sys.argv[1]))
+          except Exception as e:
+              sys.exit("health JSON unparseable: %s" % e)
+          if d.get("status") != "ok":
+              sys.exit("status is %r, expected \"ok\"" % d.get("status"))
+          u = d.get("uptime_ticks")
+          if isinstance(u, bool) or not isinstance(u, int) or u <= 0:
+              sys.exit("uptime_ticks is %r, expected a positive integer" % u)
+          print("OK: /api/health status=ok uptime_ticks=%d" % u)
+          ' health.json; then
+            echo "FAILED: /api/health body assertion failed — a 200 from a degraded service" >&2
+            echo "         body was: $(cat health.json)" >&2
+            tail -30 boot.log >&2
+            exit 1
+          fi
           echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
