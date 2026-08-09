@@ -6,7 +6,7 @@ all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
 
-simi-run: simi_interp.c simi_obj.c simi_isa.h simi_obj.h
+simi-run: simi_interp.c simi_obj.c simi_isa.h simi_obj.h simi_interp.h bench_baselines_interp.h
 	$(CC) $(CFLAGS) -o $@ simi_interp.c simi_obj.c
 
 simi-dis: simi_disasm.c simi_obj.c simi_isa.h simi_obj.h

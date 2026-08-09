@@ -27,7 +27,12 @@ for src in *.simi; do
         continue
     fi
 
-    actual=$("$RUN" "$name.tmo" main 2>"$name.run.log")
+    # M2.81: --steps asserts the fixture's committed SIMI-instruction
+    # count (bench_baselines_interp.h) after the run — the interpreter-leg
+    # tripwire mirroring the ARM/RV64 --steps checks (M2.75/M2.76). A
+    # decode/emission/interpreter regression that moves the count fails
+    # the row here, before any bench runs.
+    actual=$("$RUN" --steps "$name.tmo" main 2>"$name.run.log")
     rc=$?
     if [ $rc -ne 0 ]; then
         echo "FAIL  $name (interpreter exited $rc)"
