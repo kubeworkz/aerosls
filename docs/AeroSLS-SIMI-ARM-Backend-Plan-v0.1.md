@@ -6144,6 +6144,57 @@ simi_interp.c (the --steps check + guarded header include),
 run_tests.sh (--steps on every fixture), the Makefile (simi-run dep),
 plan doc §10.172/10.173.
 
+### 10.174 M2.82 — the interpreter step count joins the cross-ISA report (design)
+
+M2.80/M2.81 made the interpreter's SIMI-instruction counts a committed,
+tripwire-pinned quantity (bench_baselines_interp.h, asserted EXACTLY by
+the simi-run --steps check in the parity suite), so the cross-ISA
+execution-work report gains its third axis: cross_isa.c now reads all
+THREE committed step tables — interp (ground truth), A64, RV64 — and
+reports, per fixture, the ISA/interp EXPANSION factors: how many
+translated instructions one SIMI instruction costs on each ISA. The
+existing A64-vs-RV64 section and its 1.0674 gate are untouched; the new
+section adds:
+
+- the per-fixture expansion table (interp / a64 / rv64 counts plus
+  a64/interp and rv64/interp ratios, sorted by expansion so the
+extremes are visible);
+- the aggregate expansion factors with their own +/-25% committed
+  bands (EXP_A64_MEASURED / EXP_RV64_MEASURED);
+- the interp orphan gates: every A64 and RV64 row must have an interp
+  row, and every interp row must be in the shared set EXCEPT
+  mem_ops.simi — the deliberate interpreter-only fixture (address-0
+  pointer; the translated legs use mem_ops_native). mem_ops's 10 steps
+  are reported but EXCLUDED from the expansion denominators, so the
+  factors are a fair shared-96 comparison.
+
+The tool is still pure header computation — no execution, instant, in
+`all` — and now keeps all three tables honest against each other on
+every build.
+
+### 10.175 M2.82 gate results (measured)
+
+**ALL CHECKS PASSED — 96 paired fixtures, aggregate ratio 1.0674,
+expansion a64/interp 13.5520 rv64/interp 12.6963 within their committed
+bands.** The pinned expansion numbers: one SIMI instruction costs
+**13.55 A64 / 12.70 RV64 instructions** on average across the corpus
+(35032 / 2585 and 32820 / 2585 over the shared 96) — the ~13x
+M2.80 headline, now a committed, band-gated quantity. Per-fixture
+range: rv64_boot_smoke 77.3x (3 SIMI steps -> 232 A64 — the fixed
+entry/exit machinery dominates the tiniest fixtures) down to
+jmpr_chain34 5.09x (the loop-heavy fixture amortizes it), with the
+call/ret and jmpr_callret* cluster at ~40-60x. Teeth: removing
+add.simi's interp row fails "orphan A64/RV64 row: add.simi has no
+interpreter baseline" plus both fixture-set mismatches; moving
+EXP_A64_MEASURED to 10.0 fails "a64/interp expansion 13.5520 outside
+committed band [7.5000, 12.5000] around 10.0000 (ISA expansion
+drift)"; both reverted to PASS. Emission untouched (no simi_arm.c
+change), so the size gate stays **96/96, 46224 saved, all rows
+byte-identical**; four-way parity interp 97/97, x86/RV64/ARM 96/0/3;
+all seven `all` checks PASS. Changed: cross_isa.c (the third axis),
+the Makefile (cross-isa dep on bench_baselines_interp.h + comment),
+plan doc §10.174/10.175.
+
 ---
 
 ## Sources consulted
