@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # 1. Assemble the bootloader into an ELF64 object file
 nasm -f elf64 boot.asm -o boot.o
 
