@@ -599,7 +599,26 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * adds ~6 MB of BSS at MAX = 96); 12 is a generous bound for
  * realistic register chains while staying well under TX_AR_MAX_REGS. */
 #define TX_AR_CHAIN_REGS 12
-#define TX_AR_CHAIN_DEFS 64
+/* M2.64: the deferred-record pool cap raised 64 -> 96 to MATCH MAX and
+ * BIG (the EQUAL-CAPS regression's third dimension — M2.61 did the set
+ * caps, M2.62 the register closure). The M2.57-era 64-record boundary
+ * was shifted by M2.61 itself: with MAX = BIG = 96 a root product whose
+ * true set exceeds 96 DEFERS (record 0) and its materialization
+ * collapses conservatively at the BIG store (chain_merge_big's
+ * overflow -> UNKNOWN — the exact-or-conservative discipline), while a
+ * <= 96-value root stays FLAT and never touches the pool, so the pool
+ * is a pure CEILING on DAG depth: nothing below the cap moves. The
+ * M2.64 pin (jmpr_chain40) is a DAG needing EXACTLY 96 records — the
+ * root's 100-value product plus 95 in-place ADDs — that fits the pool
+ * at the new cap (instrumented: ndef = 96, r1's def = 95 at the
+ * dispatch; the runtime 289 = the 100th candidate would UDF-trap any
+ * truncated materialization, so the conservative table is what PASSes)
+ * and exhausts it at DEFS = 95 (the ad-hoc control: the 96th
+ * allocation returns -1 -> r1 falls to flat UNKNOWN at the walk — the
+ * same table, a different mechanism, proven by the walk state). The
+ * static footprint scales: g_chain_defs and its companion stores are
+ * DEFS entries each. */
+#define TX_AR_CHAIN_DEFS 96
 #define CD_SLOT 0   /* M2.32: deferred-product operand kind — a tracked slot */
 #define CD_REC  1   /* M2.32: deferred-product operand kind — an older pool record */
 #define CD_IMM  2   /* M2.33: deferred-product operand kind — an immediate constant */
