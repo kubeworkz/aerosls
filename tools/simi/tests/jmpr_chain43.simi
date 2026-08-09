@@ -1,0 +1,73 @@
+; jmpr_chain43.simi — M2.69: the fold fixpoint's retroactive-split CASCADE,
+; the largest constructible shape for the "many scans" convergence
+; question. chain35 (M2.59) pinned the mechanism with TWO JMPRs (A folds
+; to a target inside B's chain, killing B's constant in pass 2). This
+; scales the same mechanism to SIX JMPRs: J_k folds (pass 1) to T_k,
+; where T_k sits INSIDE J_{k+1}'s chain (between S_{k+1} and JMPR_{k+1}),
+; so the pass-1 mark at T_k resets r_{k+1} in pass 2.
+;
+; The structural argument — why "many scans" is IMPOSSIBLE. g_pc_target
+; (the block-head marks) only ever ACCRETES inside the fixpoint: the
+; per-pass scan resets the constant map at every marked pc, and the
+; post-pass rule-1 only adds marks (never removes). A JMPR therefore
+; un-folds iff a marked pc sits in its chain, and once un-folded it can
+; never re-fold (no mark is ever removed; a LOADI re-establishing a
+; constant is a fixed instruction with a fixed value). The fold set is
+; monotone-decreasing, and the marks from pass 1 are ALL present in pass
+; 2 — so every JMPR whose chain contains ANY pass-1 target un-folds in
+; the SAME pass. Convergence is exactly 3 scans (fold-all, un-fold-all,
+; confirm) for ANY cascade size, never scaling with the number of JMPRs.
+; The M2.18 relaxation is the only non-monotone force (it can RESTORE a
+; constant at a relax-eligible head, re-folding a JMPR) — and its
+; exclusion rule (g_fold_tgt_prev, the previous pass's fold set) makes
+; a re-folding JMPR's target flip the head's eligibility back and forth,
+; the 2-cycle chain36 pins. So the 512-pass safety net is reachable ONLY
+; by the 2-cycle; a slow-converging fold analysis does not exist.
+;
+; The teeth: this cascade has SIX JMPRs and converges in exactly 3 scans
+; (instrumented: passes = 2 changes + 1 confirm, net NEVER fires) — the
+; pass count does not scale with the cascade size, proving the "many
+; scans" case structurally unreachable. The control is chain36 at the
+; same instrumented level: passes hits 513, the net fires (relax disabled,
+; fold set cleared, restart), and the un-relaxed fixpoint terminates in
+; 3 more scans — the restart-and-terminate behavior. Reverting the rule-1
+; mark (constants flowing through fold targets) keeps J2..J6 folded ->
+; g_alloc = 1 -> cache mode -> a smaller, different emission, caught by
+; the size-gate row.
+;
+; Runtime flow (correct on all four engines): J1 dispatches r1 = 9 -> pc
+; 9, J2 dispatches r2 = 12 -> pc 12, J3 -> 15, J4 -> 18, J5 -> 21, J6 ->
+; 24 (the final target: r0 = 1). J1 is the ONLY fold that survives (its
+; chain (1, 7) contains no mark — all targets are at pc >= 9); J2..J6 are
+; dynamic (the table), so g_alloc = 0 and the naive path emits the table.
+; Expected result: 1 (r0 = 0 + 1 at pc 24; the fillers ADD r7, r7, #0
+; never touch r0 or the index registers).
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #9, i64       ; S1 — J1's index: folds to T1 = 9
+    LOADI r2, #12, i64      ; S2 — J2's index: folds to T2 = 12 in pass 1
+    LOADI r3, #15, i64      ; S3 — J3's index: folds to T3 = 15 in pass 1
+    LOADI r4, #18, i64      ; S4 — J4's index: folds to T4 = 18 in pass 1
+    LOADI r5, #21, i64      ; S5 — J5's index: folds to T5 = 21 in pass 1
+    LOADI r6, #24, i64      ; S6 — J6's index: folds to T6 = 24 in pass 1
+    JMPR r1                 ; J1 at pc 7 — folds to 9 (non-fall-through)
+    ADD r7, r7, #0, i64     ; pc 8 — dead at runtime (J1 dispatches to 9)
+    ADD r7, r7, #0, i64     ; pc 9 — T1: inside J2's chain (2 < 9 < 10):
+                            ; the pass-1 mark here kills r2 in pass 2
+    JMPR r2                 ; J2 at pc 10 — un-folds in pass 2
+    ADD r7, r7, #0, i64     ; pc 11 — dead at runtime (J2 dispatches to 12)
+    ADD r7, r7, #0, i64     ; pc 12 — T2: inside J3's chain (3 < 12 < 13)
+    JMPR r3                 ; J3 at pc 13 — un-folds in pass 2
+    ADD r7, r7, #0, i64     ; pc 14 — dead at runtime (J3 dispatches to 15)
+    ADD r7, r7, #0, i64     ; pc 15 — T3: inside J4's chain (4 < 15 < 16)
+    JMPR r4                 ; J4 at pc 16 — un-folds in pass 2
+    ADD r7, r7, #0, i64     ; pc 17 — dead at runtime (J4 dispatches to 18)
+    ADD r7, r7, #0, i64     ; pc 18 — T4: inside J5's chain (5 < 18 < 19)
+    JMPR r5                 ; J5 at pc 19 — un-folds in pass 2
+    ADD r7, r7, #0, i64     ; pc 20 — dead at runtime (J5 dispatches to 21)
+    ADD r7, r7, #0, i64     ; pc 21 — T5: inside J6's chain (6 < 21 < 22)
+    JMPR r6                 ; J6 at pc 22 — un-folds in pass 2
+    ADD r7, r7, #0, i64     ; pc 23 — dead at runtime (J6 dispatches to 24)
+    ADD r0, r0, #1, i64     ; pc 24 — T6: the final target: r0 = 1
+    RET
