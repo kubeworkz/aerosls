@@ -557,18 +557,34 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * source as a CD_FLAT operand so it still defers (chain13's second
  * product must not regress). M2.42 raises TX_AR_CHAIN_MAX to 64 to
  * MATCH TX_AR_CHAIN_BIG: a 21-64-value product now stays flat too —
- * and since a set of > 64 values can never chain (the emission gate
- * rejects ncand > TX_AR_CHAIN_BIG), the entire deferred-record
- * machinery becomes UNREACHABLE for chaining: every reachable chain
- * materializes from a flat set, and the M2.30-M2.41 record paths
- * (defers, union records, the flat+flat fallback, the in-place
- * freeze) are vestigial — retained as the recorded history and as a
+ * and since a set of > 96 values can never chain (the emission gate
+ * rejects ncand > TX_AR_CHAIN_BIG), the deferred-record machinery
+ * beyond the record-pool cap is UNREACHABLE for chaining: every
+ * reachable chain materializes from a flat set or a record whose true
+ * set fits the BIG store, and the M2.30-M2.41 record paths (defers,
+ * union records, the flat+flat fallback, the in-place freeze) are
+ * vestigial above that — retained as the recorded history and as a
  * safety net should the caps ever diverge again. Deferral is sound
  * only while the sources are untouched: every write or head-union of a
  * source slot flattens (and caps) the deferred form eagerly, and the
  * dispatch materializes over the provably-unchanged sources. */
-#define TX_AR_CHAIN_MAX 64
-#define TX_AR_CHAIN_BIG 64
+/* M2.61: the EQUAL-CAPS regression. The cap series (M2.54/M2.55) found
+ * the discipline's two failure modes when the caps DIVERGE — the
+ * flatten overflow (MAX > BIG) and the freeze overflow (BIG > MAX) —
+ * and every pin since has guarded the equal-caps turn-over at 64
+ * (chain31) or the collapse side (chain33/chain30). This milestone
+ * permanently bumps BOTH caps together 64 -> 96, proving the caps are
+ * parameterized (nothing hardcodes 64): jmpr_chain37 pins the new
+ * turn-over at exactly 96, chain33's 80-value root now materializes
+ * and chains (the exact behavior M2.57's Control A proved sound under
+ * divergence — the 64/64 collapse was cap-specific, not structural),
+ * and chain30's 100-value index still collapses conservatively (100 >
+ * 96). The bump is monotone in capability: sets <= 64 behave
+ * byte-identically (all shared gate rows unchanged), and 65-96-value
+ * sets gain the chain. The static footprint scales: g_chain_arr is
+ * REGS x 4096 ChainSets. */
+#define TX_AR_CHAIN_MAX 96
+#define TX_AR_CHAIN_BIG 96
 /* M2.43: the tracked-register closure cap. M2.26 sized it at 4 — the
  * index register plus its feeders. M2.43 raises it to 8 so a 5-8-
  * feeder index chain (r1 = (r4 + r5) + r3 over joins — jmpr_chain19)

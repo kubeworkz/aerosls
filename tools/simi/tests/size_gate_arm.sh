@@ -338,22 +338,23 @@
 # still PASS) — the 196-byte delta is exactly the chain-vs-table
 # difference, proving the chain came from the composed stored image.
 # 444 bytes below its M0 baseline.
-# jmpr_chain27 is M2.51: the CONSERVATIVE side of the unary cap
-# discipline, promoted from M2.50's ad-hoc teeth into a committed pin
-# — a PROOF milestone with no code change. chain24 pinned the EXACT
-# side (ten-value NEG source -> ten candidates -> chain); this pin
-# regression-guards the collapse: a SIXTY-FIVE-DISTINCT join source
-# through NEG maps to 65 values, which OVERFLOWS the image merge cap
-# (64) inside chain_img_alu -> UNKNOWN -> the chain dies -> the naive
-# table runs. The index is r1 = -r2 over a 65-way join (r2 in
-# {-150..-86}); runtime -(-150) = 150 lands on block0 at pc 150 ->
-# 777 on all four engines through the table's bounds check.
-# Dump-verified: 0 b.eq, the full 10-word table (movz #152,
-# subs/cset/cbz, li32 base, add-shift ldr, br, UDF). The pin
-# DISCRIMINATES truncation: a wrong chain over only the first 64
-# candidates {86..149} would miss runtime 150 and UDF-trap — only
-# the conservative collapse passes. 616 bytes below its M0 baseline
-# (a dynamic-JMPR program, so the savings are the emission folds).
+# jmpr_chain27 is M2.51: the unary cap discipline, promoted from
+# M2.50's ad-hoc teeth into a committed pin — a PROOF milestone with no
+# code change. chain24 pinned the EXACT side (ten-value NEG source ->
+# ten candidates -> chain). The index is r1 = -r2 over a 65-way join
+# (r2 in {-150..-86}) -> 65 values {86..150}. At the M2.51-era caps
+# (64/64) that OVERFLOWED the image merge cap -> UNKNOWN -> the table
+# (0 b.eq, dump-verified) — the conservative-collapse pin, whose
+# discriminator is truncation (a chain over the first 64 candidates
+# would miss runtime 150 and UDF-trap). M2.61's EQUAL-CAPS bump (MAX =
+# BIG = 96) changed this row's meaning, exactly like chain33's: 65 <=
+# 96 now FITS, so the image materializes and the chain fires with the
+# full 65 candidates — runtime -(-150) = 150 = the SIXTY-FIFTH b.eq
+# -> block0 at pc 150 -> 777 on all four engines. The M2.51 collapse
+# was cap-specific; the collapse side of the discipline now lives at
+# chain30 (100 values > 96). Dump-verified (96/96): 65 b.eq, 0 table
+# words. 740 bytes below its M0 baseline (4500) by the 65-candidate
+# chain and the accumulated emission folds.
 # jmpr_chain26 is M2.50: the NOT-built index, IN RANGE — a PROOF
 # milestone with no code change (the multi-value unary mapping was
 # already there — chain24 pinned a ten-value NEG source; the
@@ -991,7 +992,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240 [jmpr_chain36]=1180 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180 [jmpr_chain37]=9348 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -1076,23 +1077,22 @@ declare -A M0_BASELINES=(
 # (M2.30: record 0, CD_SLOT/CD_SLOT); then 63 IN-PLACE ADDs r1 = r1 + r4
 # with r4 = {2} (a singleton — the closure stays {r1,r2,r3,r4} = 4 <= 8)
 # each defer over the deferred source (M2.32/M2.41) — 64 records total,
-# EXACTLY the pool, all allocating (def = 63 at the dispatch). Under the
-# shipped EQUAL caps the record machinery is conservative (the M2.42
-# vestigial note): the root's 80-value true set OVERFLOWS the BIG store
-# on materialization (chain_merge_big collapses to UNKNOWN, exact-or-
-# conservative — never a truncated set), so the dispatch falls to the
-# TABLE — 0 b.eq, and runtime 252 (120 + 6 + 63*2, all join BCs fall
-# through) dispatches through the table's bounds check to block63's
-# LOADI #7777 -> PASS 7777 on all four engines. The boundaries are the
-# ad-hoc controls: (A) BIG=128 -> the same DAG materializes 80 values,
-# the chain fires with the 64 in-range candidates (even 126..252), 64
-# b.eq, runtime 252 = the sixty-fourth (sound when reachable); (B) a
-# 65th in-place ADD -> the pool is exhausted (g_chain_ndef >= 64 ->
-# -1), r1 UNKNOWN, the table again (conservative, PASSes its runtime
-# 256 through the bounds check). Dump-verified (shipped): 0 b.eq, the
-# full table dispatch. This row's M0 baseline (7468, measured at git
-# 1729f50) differs from M1 (6444) by the accumulated emission folds
-# (-1024).
+# EXACTLY the pool, all allocating (def = 63 at the dispatch). M2.61's
+# EQUAL-CAPS bump (MAX = BIG = 96) changed this row's meaning: the
+# root's 80-value true set now FITS the BIG store, so the DAG
+# materializes and the chain fires with the 64 in-range candidates
+# (even 126..252, < num_instr) — 64 b.eq, runtime 252 = the sixty-
+# fourth, PASS 7777 on all four engines. The M2.57-era collapse (0
+# b.eq, the table — the M2.42 "vestigial" note) was CAP-SPECIFIC, not
+# structural: M2.57's Control A (BIG=128) already proved the same DAG
+# chains when the caps admit it, and the 96/96 shipped state is exactly
+# that behavior, now regression-guarded. The pool boundary is still
+# pinned: a 65th in-place ADD exhausts g_chain_ndef >= 64 -> r1 UNKNOWN
+# -> the table (conservative), and chain30 (100 values > 96) still
+# collapses. Dump-verified (96/96): 64 b.eq, 0 table words. This row's
+# M0 baseline (7468, measured at git 1729f50) differs from M1 (5904)
+# by the 64-candidate chain replacing the table and the accumulated
+# emission folds (-1564).
 
 # jmpr_chain34 is M2.58: the walk's fixpoint convergence at the
 # 64-iteration cap, and the UNSOUNDNESS the probe found. A BACKWARD-
@@ -1152,6 +1152,25 @@ declare -A M0_BASELINES=(
 # (1180, measured at git 1729f50) differs from M1 (1056) by the
 # 1-candidate chain replacing J's runtime table and the accumulated
 # emission folds (-124).
+# jmpr_chain37 is M2.61: the EQUAL-CAPS regression — MAX and BIG bumped
+# together 64 -> 96, pinning the NEW turn-over boundary at exactly 96.
+# The index is the union of two flat products (chain31's R-arm shape
+# scaled): R1 = r2 + r3 (r2 in {52,68,84,100,116,132}, r3 in
+# {0,2,...,14}) = FORTY-EIGHT values {52..146} step 2, and R2 = r2 + r6
+# (r6 in {200,202,...,214}) = FORTY-EIGHT values {252..346} step 2;
+# the union {52..146} U {252..346} = 96 DISTINCT values — exactly the
+# new MAX = BIG. Runtime 132 + 214 = 346 (all join BCs fall through:
+# r0 == 0, r5 == 0) takes the chain's NINETY-SIXTH b.eq -> block95's
+# LOADI #987. A truncated materialization (a union one short, or a
+# store one short) misses 346 and UDF-traps. The bump is monotone in
+# capability: sets <= 64 behave byte-identically (all 88 shared rows
+# unchanged except jmpr_chain33, whose 80-value root now fits 96 and
+# chains — the M2.57 Control-A behavior, documented above), and
+# chain30's 100-value index still collapses conservatively (100 > 96).
+# Dump-verified: 96 b.eq, 0 table words. This row's M0 baseline
+# (9348, measured at git 1729f50) differs from M1 (7288) by the
+# 96-candidate chain replacing the runtime table and the accumulated
+# emission folds (-2060).
 
 pass=0
 fail=0
