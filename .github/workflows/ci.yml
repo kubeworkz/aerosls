@@ -217,6 +217,15 @@ jobs:
     # powers the machine off via OpenSBI's SBI_SRST extension, so QEMU
     # exits rc=0 (clean shutdown) instead of being killed by the timeout.
     # See AeroSLS-SIMI-ISA-v0.1.md §16 Phase 9, 9f addendum.
+    #
+    # Phase 9g added the second boot path: `make riscv-elf` also builds
+    # sls_riscv_kernel_m.elf — the same sources recompiled with
+    # -DRISCV_MMODE and linked at 0x80000000 — which QEMU enters directly
+    # in M-mode (`-bios none`, no OpenSBI at all). Its console is the raw
+    # 16550 UART, its traps go to mtvec, and it has no firmware to power
+    # off with, so its smoke ends in a reported, deliberate halt (rc=124
+    # timeout) instead of a clean shutdown. Both boot paths are asserted
+    # below. See AeroSLS-SIMI-ISA-v0.1.md §16 Phase 9, 9g addendum.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -265,3 +274,45 @@ jobs:
             exit 1
           }
           echo "OK: RISC-V kernel booted, SIMI smoke executed, RV_SYS_EXIT powered off via SBI_SRST"
+
+      - name: Boot the kernel as a direct M-mode payload and assert the boot smoke + halt
+        run: |
+          # The second RV boot path (Phase 9g). `-M virt` defaults to
+          # OpenSBI even without -bios, so the true bare-metal path needs
+          # `-bios none` plus the M-mode variant (sls_riscv_kernel_m.elf,
+          # linked at 0x80000000, -DRISCV_MMODE): QEMU enters it directly
+          # in M-mode with no firmware — console is the raw 16550 UART,
+          # traps go to mtvec, and there is no SBI_SRST to power the
+          # machine off, so the kernel reports the exit and halts. QEMU is
+          # killed by the timeout (rc=124); rc=0 would mean the kernel
+          # exited cleanly without firmware (impossible), anything else is
+          # an early crash.
+          if timeout 60 qemu-system-riscv64 -M virt -bios none -kernel sls_riscv_kernel_m.elf \
+             -m 4G -smp 4 -display none -serial file:boot_rv_m.log -no-reboot; then
+            echo "FAILED: qemu exited rc=0 — the M-mode kernel should halt (no firmware to power off)" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          else
+            rc=$?
+            if [ "$rc" -ne 124 ]; then
+              echo "FAILED: qemu exited early (rc=$rc) — kernel crashed in M-mode" >&2
+              tail -30 boot_rv_m.log >&2
+              exit 1
+            fi
+          fi
+          grep -a "AeroSLS RISC-V Supervisor Node Kernel Online!" boot_rv_m.log || {
+            echo "FAILED: M-mode boot banner not seen in the serial log" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          grep -a "\[SIMI\] entry returned (real machine code executed)" boot_rv_m.log || {
+            echo "FAILED: SIMI boot smoke did not translate and execute in M-mode" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          grep -a "\[SYSCALL\] SYS_SLS_EXIT, code=42" boot_rv_m.log || {
+            echo "FAILED: the SIMI return never became the RV_SYS_EXIT syscall in M-mode" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          echo "OK: M-mode kernel booted, SIMI smoke executed, graceful halt reached"

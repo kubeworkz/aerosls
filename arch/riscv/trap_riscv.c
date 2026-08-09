@@ -56,16 +56,29 @@ void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top) {
     phd->kernel_sp = kernel_stack_top;
     for (int i = 0; i < TF_COUNT; i++) phd->trap_frame[i] = 0;
 
-    /* sscratch <- &RvPerHartData. Must happen before stvec is armed --
-     * the very first trap after the csrw stvec below will immediately
+    /* sscratch <- &RvPerHartData. Must happen before the trap vector is
+     * armed -- the very first trap after the csrw below will immediately
      * swap sp with whatever sscratch currently holds, so sscratch has to
      * already be correct by then, not "correct eventually." */
     __asm__ volatile("csrw sscratch, %0" : : "r"(phd) : "memory");
 
+    /* Phase 9g: arm the vector for the build's mode -- the variant is
+     * baked in at compile time (-DRISCV_MMODE), not detected at runtime:
+     * reading mstatus (the only CSR that would reveal the privilege
+     * mode) traps as an illegal instruction from S-mode (see §16 Phase
+     * 9g). Under OpenSBI (S-mode) exceptions go to stvec; as a direct
+     * M-mode payload they always go to mtvec, and arming only stvec
+     * would leave every trap jumping to address 0. The M-mode entry
+     * reads mepc/mcause/mtval and returns via mret (trap_riscv.S). */
+#if defined(RISCV_MMODE)
+    extern void riscv_trap_entry_m(void);
+    __asm__ volatile("csrw mtvec, %0" : : "r"(&riscv_trap_entry_m) : "memory");
+    rv_print_str("[TRAP] mtvec + sscratch armed for this hart (direct M-mode boot).\n");
+#else
     extern void riscv_trap_entry(void);
     __asm__ volatile("csrw stvec, %0" : : "r"(&riscv_trap_entry) : "memory");
-
     rv_print_str("[TRAP] stvec + sscratch armed for this hart.\n");
+#endif
 }
 
 /* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): the minimal,
@@ -91,12 +104,20 @@ void riscv_syscall_dispatch(struct RvPerHartData* phd) {
     if (num == RV_SYS_EXIT) {
         rv_print_str("[SYSCALL] SYS_SLS_EXIT, code=");
         rv_print_udec(arg0);
+#if defined(RISCV_MMODE)
+        /* Direct M-mode boot: there is no firmware, so no SBI_SRST
+         * exists to power the machine off -- the honest terminal state
+         * is a reported, deliberate halt (QEMU is killed by the CI
+         * timeout, rc=124). */
+        rv_print_str(" -- direct M-mode boot: no firmware to power off -- halting hart.\n");
+#else
         rv_print_str(" -- powering off via OpenSBI SBI_SRST (SHUTDOWN)...\n");
         sbi_system_reset();
         /* Only reached if the firmware lacks the SRST extension (or the
          * reset failed) -- sbi_system_reset() documents that callers
          * must not assume the machine is gone just because it returned. */
         rv_print_str("[SYSCALL] SBI_SRST unsupported or failed -- halting hart instead.\n");
+#endif
         while (1) { __asm__ volatile("wfi"); }
     }
 
@@ -106,11 +127,13 @@ void riscv_syscall_dispatch(struct RvPerHartData* phd) {
     while (1) { __asm__ volatile("wfi"); }
 }
 
-void riscv_trap_dispatch(struct RvPerHartData* phd) {
-    uint64_t scause, stval;
-    __asm__ volatile("csrr %0, scause" : "=r"(scause));
-    __asm__ volatile("csrr %0, stval"  : "=r"(stval));
-
+/* Shared routing for both privilege modes; the caller reads the
+ * mode-appropriate cause/tval CSRs (scause/stval in S-mode,
+ * mcause/mtval in M-mode) and hands them in. The unhandled-exception
+ * message below calls the value "scause" for brevity; in M-mode it is
+ * the mcause value (same encoding). */
+static void riscv_trap_dispatch_common(struct RvPerHartData* phd,
+                                       uint64_t scause, uint64_t stval) {
     int is_interrupt = (int)((scause >> 63) & 1);
     uint64_t code = scause & 0x7FFFFFFFFFFFFFFFULL;
 
@@ -165,4 +188,20 @@ void riscv_trap_dispatch(struct RvPerHartData* phd) {
     rv_print_udec(phd->trap_frame[TF_SEPC]);
     rv_print_str(" -- halting hart.\n");
     while (1) { __asm__ volatile("wfi"); }
+}
+
+void riscv_trap_dispatch(struct RvPerHartData* phd) {
+    uint64_t scause, stval;
+    __asm__ volatile("csrr %0, scause" : "=r"(scause));
+    __asm__ volatile("csrr %0, stval"  : "=r"(stval));
+    riscv_trap_dispatch_common(phd, scause, stval);
+}
+
+/* Phase 9g: M-mode twin -- exceptions taken in M-mode populate mcause/
+ * mtval, not scause/stval. Called by riscv_trap_entry_m (trap_riscv.S). */
+void riscv_trap_dispatch_m(struct RvPerHartData* phd) {
+    uint64_t mcause, mtval;
+    __asm__ volatile("csrr %0, mcause" : "=r"(mcause));
+    __asm__ volatile("csrr %0, mtval"  : "=r"(mtval));
+    riscv_trap_dispatch_common(phd, mcause, mtval);
 }

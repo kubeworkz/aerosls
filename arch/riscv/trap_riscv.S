@@ -1,5 +1,5 @@
-# trap_riscv.S — Gap Remediation SIMI Phase 9 (sub-phase 9c): real RISC-V
-# supervisor trap entry/exit, sscratch-based per-hart-data mechanism.
+# trap_riscv.S — Gap Remediation SIMI Phase 9 (sub-phases 9c/9g): real RISC-V
+# trap entry/exit, sscratch-based per-hart-data mechanism.
 # See trap_riscv.h for the full design rationale and the RvPerHartData
 # layout this file's hardcoded byte offsets must stay in lockstep with
 # (trap_riscv.c carries _Static_asserts enforcing that at compile time).
@@ -8,10 +8,20 @@
 # kernel uses for this, e.g. xv6-riscv's trampoline.S) -- not a literal
 # port of anything x86 does, because there is nothing on x86 shaped like
 # this to port; see trap_riscv.h's header comment for why.
+#
+# Two entries, one body (Phase 9g): riscv_trap_entry is armed into stvec
+# when the kernel runs in S-mode under OpenSBI (exception PC from sepc,
+# return via sret, dispatched by riscv_trap_dispatch), and
+# riscv_trap_entry_m is armed into mtvec when the kernel runs as a direct
+# M-mode payload (QEMU -bios none: exceptions in M-mode are always taken
+# to mtvec). The save/restore body is identical -- the two differ only in
+# the exception-PC CSR (sepc vs mepc), the return instruction (sret vs
+# mret), and the C dispatcher (which reads the matching cause/tval CSR).
+# The sscratch swap works in both modes: sscratch is just a scratch CSR.
 .section .text
 .align 4
-.global riscv_trap_entry
-riscv_trap_entry:
+
+.macro TRAP_ENTRY pc_csr, dispatch_fn, ret_insn
     # sscratch always holds &RvPerHartData outside of trap handling.
     # This single instruction atomically does BOTH: sscratch <- old sp,
     # sp <- &RvPerHartData (the trap_frame's own base address, since
@@ -58,24 +68,25 @@ riscv_trap_entry:
     sd    t0,   8(sp)
 
     # trap_frame.sepc (offset 248, TF_SEPC*8) = the trapped instruction's
-    # own address -- needed both to resume correctly for exceptions that
-    # DON'T advance past themselves, and so riscv_trap_dispatch() can
-    # advance it by 4 for ecall (else sret would re-execute the same
-    # ecall forever).
-    csrr  t0, sepc
+    # own address (\pc_csr: sepc in S-mode, mepc in M-mode) -- needed
+    # both to resume correctly for exceptions that DON'T advance past
+    # themselves, and so the C dispatcher can advance it by 4 for ecall
+    # (else the return instruction would re-execute the same ecall
+    # forever).
+    csrr  t0, \pc_csr
     sd    t0, 248(sp)
 
     # s1 already saved (offset 64) -- safe to repurpose as our own
     # "pointer to RvPerHartData, survives the C call" register, since
-    # riscv_trap_dispatch() follows the standard calling convention and
-    # is free to clobber s1 like any other callee-saved register IT
-    # decides to use, but WE restore our own copy from the trap frame on
-    # the way out regardless, so whatever the C side does to the live
-    # register doesn't matter.
+    # the dispatcher follows the standard calling convention and is free
+    # to clobber s1 like any other callee-saved register IT decides to
+    # use, but WE restore our own copy from the trap frame on the way out
+    # regardless, so whatever the C side does to the live register
+    # doesn't matter.
     mv    s1, sp
     ld    sp, 256(s1)      # switch to this hart's real kernel trap stack
     mv    a0, s1           # a0 = &RvPerHartData, the dispatcher's argument
-    call  riscv_trap_dispatch
+    call  \dispatch_fn
     mv    sp, s1           # back to &RvPerHartData (== &trap_frame)
 
     ld    ra,   0(sp)
@@ -108,9 +119,10 @@ riscv_trap_entry:
     ld    t5, 232(sp)
     ld    t6, 240(sp)
 
-    # Restore sepc (riscv_trap_dispatch may have advanced it past ecall).
+    # Restore the exception PC (the dispatcher may have advanced it past
+    # ecall/ebreak).
     ld    t0, 248(sp)
-    csrw  sepc, t0
+    csrw  \pc_csr, t0
 
     # sscratch must point at &RvPerHartData again for the NEXT trap --
     # sp already does right now, so this is just handing that same value
@@ -124,4 +136,13 @@ riscv_trap_entry:
     # Finally restore the real sp (saved at offset 8) and return.
     ld    t0,   8(sp)
     mv    sp, t0
-    sret
+    \ret_insn
+.endm
+
+.global riscv_trap_entry
+riscv_trap_entry:
+    TRAP_ENTRY sepc, riscv_trap_dispatch, sret
+
+.global riscv_trap_entry_m
+riscv_trap_entry_m:
+    TRAP_ENTRY mepc, riscv_trap_dispatch_m, mret

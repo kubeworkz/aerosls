@@ -65,9 +65,11 @@ struct RvPerHartData {
                                        * stack). */
 };
 
-/* Real assembly trap entry point, installed into stvec by
- * riscv_trap_init() below. Never called directly from C. */
+/* Real assembly trap entry points, installed by riscv_trap_init() below
+ * (stvec for the S-mode/OpenSBI boot, mtvec for a direct M-mode payload
+ * -- Phase 9g). Never called directly from C. */
 void riscv_trap_entry(void);
+void riscv_trap_entry_m(void);
 
 /* Called once per hart during boot, before anything that might trap
  * (an ecall, or an external interrupt if sstatus.SIE ever gets set).
@@ -77,14 +79,17 @@ void riscv_trap_entry(void);
  * already running on. */
 void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top);
 
-/* The real trap dispatcher, called from riscv_trap_entry (trap_riscv.S)
- * once every GPR is safely saved. Reads scause/stval itself; routes
- * external-interrupt causes to the existing
- * handle_riscv_supervisor_interrupt() (arch/riscv/sbi.c), and
- * environment-call-from-S-mode causes to riscv_syscall_dispatch()
- * (trap_riscv.c) -- see that function's own comment for why S-mode, not
- * U-mode. */
+/* The real trap dispatchers, called from the assembly entries
+ * (trap_riscv.S) once every GPR is safely saved. The S-mode one reads
+ * scause/stval; the M-mode one (Phase 9g, direct -bios none boot) reads
+ * mcause/mtval -- exceptions taken in M-mode always populate the M CSRs
+ * and trap to mtvec. Both share the same routing: external-interrupt
+ * causes to handle_riscv_supervisor_interrupt() (arch/riscv/sbi.c),
+ * environment-call and ebreak-with-the-syscall-ABI causes to
+ * riscv_syscall_dispatch() (trap_riscv.c) -- see that function's own
+ * comment for why S-mode, not U-mode. */
 void riscv_trap_dispatch(struct RvPerHartData* phd);
+void riscv_trap_dispatch_m(struct RvPerHartData* phd);
 
 /* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): minimal syscall
  * surface. a7 = syscall number, a0 = single argument -- the smallest
