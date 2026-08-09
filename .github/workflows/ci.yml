@@ -48,3 +48,13 @@ jobs:
       # exist and "could not check" must not resemble "it is fine".
       - name: Guard scripts (tests/*_check.sh)
         run: bash tests/run_checks.sh
+
+      # The step above proves the guards pass; this one proves they can
+      # fail. script_conventions_smoke.sh stages three deliberate index
+      # violations (a 100644 .sh, a shebang-less .sh, a CRLF text blob)
+      # and asserts the script_conventions guard exits 1 and names each
+      # one — so a regression that made the guard blind fails CI instead
+      # of sailing through green. It is *smoke.sh*, not *_check.sh, so
+      # run_checks.sh and deploy.sh's guard gate never run it.
+      - name: Script-conventions guard teeth (smoke)
+        run: bash tests/script_conventions_smoke.sh
