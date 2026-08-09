@@ -5714,6 +5714,68 @@ per-row assertions, replacing the aggregate constants), the Makefile
 bench-corpus target (N=50 -> 500 + comment), §10.154/10.155
 superseded.
 
+### 10.158 M2.74 — the execution-cost bench, the runtime-side measurement (as built)
+
+The measurement story's final axis: bench_corpus pins TRANSLATE cost;
+bench_exec.c pins what the translated code COSTS TO RUN. Every fixture
+is translated once (translate cost is bench-corpus's job), then executed
+N=500 times through a64_exec.c — the same purpose-built A64
+decoder/executor the four-way parity uses — with the same mock host
+functions (obj_ops's catalog) and the same Expected result parsed from
+the .simi comment (run_arm_tests.sh's rule: the LAST "Expected result:"
+match; the Makefile target reuses the assemble-on-the-spot loop). Three
+fixtures are skipped exactly as the runner skips them: mem_ops
+(address-0 pointer is a Phase 1 interpreter-only convenience),
+jmpr_oob and cap_forge_debug (no Expected result — jmpr_oob's whole
+point is that execution must NOT produce one). In `all` with the other
+benches (~1-2 s).
+
+The per-row guard mirrors bench_corpus's two-tier model:
+
+- **steps: EXACT** — a64_exec_run now counts executed instructions
+  (`A64Cpu.steps`, one increment per decoded instruction; behavior-
+  neutral, the other callers never read it). Deterministic and machine-
+  independent — the same translated bytes over zeroed guest state
+  always execute the same count — so ANY change in how much the code
+  executes (a decode that now faults early, a fold that changes the
+  emitted control flow, an a64_exec regression) moves the count and
+  fails the row. The bench also ASSERTS determinism: every iteration
+  must execute the same steps AND produce the expected x9, which
+  catches the fault-early hazard (a fixture that now faults after 3
+  instructions looks FAST on the clock but fails both checks).
+- **ns/call: asserted at 4.0x** over the committed value (median of
+  three N=500 passes). Execution runs are only a few microseconds, so
+  the wall-clock tail is fatter than translate's: three passes swung up
+  to **2.28x per fixture** (worst of 96; 5 fixtures over 2.0x; mean
+  ~1.3x — WSL load). 4.0 absorbs that tail and machine-speed
+  differences while still failing a fixture whose execution cost grows
+  4x+ — the gross single-fixture regression. (bench_corpus's margin is
+  3.0x because its runs are longer and less load-sensitive.)
+
+Corpus totals: **96 fixtures, 35032 steps** executed across one run of
+every fixture (jmpr_chain34=1034, aggregate_abi=1108 the heaviest; the
+atomics fixtures run their trivial M=0/R=0 path — the harness-filled
+scratch cells are zeroed here, so the loops don't spin). A fixture with
+no baseline row FAILS loudly — the M0_BASELINES update discipline.
+Re-measure deliberately with `BENCH_EXEC_MEASURE=1
+./bench-exec <tests/ fixtures> 500` (prints the table rows without
+asserting).
+
+### 10.159 M2.74 gate results (measured)
+
+bench-exec (N=500, this sandbox): **99 fixtures, 35032 steps, ~8-11
+µs/step aggregate, 3 skipped, 0 failed — ALL CHECKS PASSED**, all 96
+rows within their committed baselines (teeth: corrupting add.simi's
+committed steps 241 -> 999 fails the row "steps=241 != committed 999",
+reverted to PASS). Emission untouched (no simi_arm.c change — the
+A64Cpu.steps counter is a64_exec-side and behavior-neutral), so the
+size gate stays **96/96, 46224 saved, all rows byte-identical**;
+four-way parity interp 97/97, x86/RV64/ARM 96/0/3; bench-net PASS;
+bench-corpus PASS; enc-check clean; stress all-green. Changed:
+bench_exec.c (new — the per-row BASELINES table), a64_exec.h/.c
+(the steps counter), the Makefile (bench-exec target in `all`/`clean`)
+and .gitignore.
+
 ---
 
 ## Sources consulted
