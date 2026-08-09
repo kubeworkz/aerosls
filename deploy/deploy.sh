@@ -192,7 +192,7 @@ CHECKED="$(find $SRC_ROOTS \( -name '*.c' -o -name '*.h' -o -name '*.inc' -o -na
 [ "$CHECKED" -gt 0 ] || { echo "[deploy] FAILED: found 0 source files to check. A check that examined nothing must not pass."; exit 1; }
 echo "[deploy] OK: $CHECKED source file(s) all older than $KERNEL_BIN."
 
-# ─── The *_check.sh guards, as a hard gate ─────────────────────────────────
+# ─── The *_check.sh guards + *_smoke.sh teeth, as a hard gate ─────────────
 # Five guards live in tests/, each written after the bug it catches had
 # already happened and cost a diagnostic round:
 #
@@ -209,6 +209,13 @@ echo "[deploy] OK: $CHECKED source file(s) all older than $KERNEL_BIN."
 # Until recently nothing ran them: tests/run_all.sh globs *_host_test.c and
 # these are shell scripts, so they passed review and inspected nothing.
 #
+# The *_smoke.sh teeth run right after, via tests/run_guard_smokes.sh: each
+# smoke deliberately breaks a guard's input and asserts the guard fails. A
+# guard that passes is only half the story — a guard that has gone blind
+# passes while inspecting nothing. The three kernel-needing smokes
+# (stack_frame_budget, kernel_image_end, no_tls_relocations) can only run
+# where the build exists, which is exactly what this gate is.
+#
 # ─── Why here, and why --require-all ───────────────────────────────────────
 # Here, because it is after the build and after the staleness assertion above
 # -- so the linked kernel and its objects exist and the guards have something
@@ -220,13 +227,14 @@ echo "[deploy] OK: $CHECKED source file(s) all older than $KERNEL_BIN."
 # neutral "nothing to check". The build just succeeded; if a guard cannot
 # find the binary or its objects, the build did not produce what it claimed
 # and that is itself the finding. "Could not check" must not resemble "it is
-# fine" on the path that puts code in front of users.
+# fine" on the path that puts code in front of users. The smokes apply the
+# same discipline unconditionally: a smoke that cannot run proves nothing
+# and counts as a failure.
 #
-# Invoked via `bash` rather than executed directly: none of the eleven
-# tests/*.sh files carry a tracked exec bit (all 100644 in the index, because
-# development happens on a Windows checkout where the mode does not survive),
-# so a fresh clone on the server would give "Permission denied" here. CI calls
-# run_all.sh the same way for the same reason.
+# Invoked via `bash` rather than executed directly: every tracked *.sh now
+# carries the 100755 bit (the repo-wide +x sweep), but calling through bash
+# keeps the gate portable across checkouts and filesystems, and CI calls
+# run_all.sh the same way.
 echo "[deploy] Running guard scripts (tests/run_checks.sh --require-all)..."
 if ! bash tests/run_checks.sh --require-all; then
     echo "[deploy] FAILED: a guard script failed against the build just produced."
@@ -234,6 +242,15 @@ if ! bash tests/run_checks.sh --require-all; then
     echo "         These are not style checks. Each one exists because the property"
     echo "         it asserts was violated in shipped code and cost a diagnostic"
     echo "         round to find. Read the output above before overriding anything."
+    exit 1
+fi
+
+echo "[deploy] Running guard smokes (tests/run_guard_smokes.sh)..."
+if ! bash tests/run_guard_smokes.sh; then
+    echo "[deploy] FAILED: a guard smoke failed against the build just produced."
+    echo "         Aborting -- kernel NOT restarted, still running the previous build."
+    echo "         A smoke proves a guard can FAIL, not just pass. A smoke that"
+    echo "         cannot run proves nothing and is treated as a failure here."
     exit 1
 fi
 
