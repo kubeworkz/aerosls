@@ -4,11 +4,17 @@
  *
  * SIMI_HOST_TEST (host-side test build only): this file is also compiled
  * for the x86 host by tools/simi/rv_syscall_exit_test.c, which stubs
- * sbi_putchar/sbi_system_reset and drives riscv_syscall_dispatch()'s
- * SBI_SRST failure fallback. Under that macro the RISC-V-only pieces are
- * swapped for host behavior: the CSR-armed functions are compiled out
- * entirely (the dispatch under test never calls them) and rv_halt()
- * exits the process instead of wfi-spinning (see rv_halt below).
+ * sbi_putchar/sbi_system_reset (and, for the trap-routing twin,
+ * handle_riscv_supervisor_interrupt) and drives riscv_syscall_dispatch()'s
+ * exit branches and riscv_trap_dispatch_common()'s routing with injected
+ * cause/tval values. Under that macro the RISC-V-only pieces are swapped
+ * for host behavior: the CSR-armed functions (riscv_trap_init and the
+ * riscv_trap_dispatch/riscv_trap_dispatch_m wrappers that READ scause/
+ * mcause) are compiled out entirely -- x86 has no such CSRs -- while the
+ * routing core they share, riscv_trap_dispatch_common(), is compiled in
+ * (it takes its cause/tval as plain arguments, so the host test can
+ * inject them), and rv_halt() exits the process instead of wfi-spinning
+ * (see rv_halt below).
  */
 #include "trap_riscv.h"
 #include "sbi.h"
@@ -153,14 +159,16 @@ void riscv_syscall_dispatch(struct RvPerHartData* phd) {
     rv_halt();
 }
 
-#if !defined(SIMI_HOST_TEST)
 /* Shared routing for both privilege modes; the caller reads the
  * mode-appropriate cause/tval CSRs (scause/stval in S-mode,
  * mcause/mtval in M-mode) and hands them in. The unhandled-exception
  * message below calls the value "scause" for brevity; in M-mode it is
- * the mcause value (same encoding). */
-static void riscv_trap_dispatch_common(struct RvPerHartData* phd,
-                                       uint64_t scause, uint64_t stval) {
+ * the mcause value (same encoding). NOT static: the CSR-armed wrappers
+ * below call it in the kernel, and the SIMI_HOST_TEST build drives it
+ * directly with injected cause/tval (tools/simi/rv_syscall_exit_test.c,
+ * -DSIMI_TEST_TRAP) -- see trap_riscv.h. */
+void riscv_trap_dispatch_common(struct RvPerHartData* phd,
+                                uint64_t scause, uint64_t stval) {
     int is_interrupt = (int)((scause >> 63) & 1);
     uint64_t code = scause & 0x7FFFFFFFFFFFFFFFULL;
 
@@ -217,6 +225,7 @@ static void riscv_trap_dispatch_common(struct RvPerHartData* phd,
     rv_halt();
 }
 
+#if !defined(SIMI_HOST_TEST)
 void riscv_trap_dispatch(struct RvPerHartData* phd) {
     uint64_t scause, stval;
     __asm__ volatile("csrr %0, scause" : "=r"(scause));
@@ -232,4 +241,4 @@ void riscv_trap_dispatch_m(struct RvPerHartData* phd) {
     __asm__ volatile("csrr %0, mtval"  : "=r"(mtval));
     riscv_trap_dispatch_common(phd, mcause, mtval);
 }
-#endif /* !SIMI_HOST_TEST: CSR-armed trap functions above */
+#endif /* !SIMI_HOST_TEST: CSR-armed trap wrappers above */
