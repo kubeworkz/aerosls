@@ -590,11 +590,15 @@ static int      g_jmpr_fold_prev[4096]; /* fixpoint convergence snapshot (file-s
  * feeder index chain (r1 = (r4 + r5) + r3 over joins — jmpr_chain19)
  * still analyzes: under the old cap the closure truncated silently
  * (the missing feeder's set stayed UNKNOWN, poisoning the index set to
- * UNKNOWN and falling to the table). g_chain_arr is REGS x 4096
- * ChainSets, so the static footprint scales with the cap; 8 is a
- * generous bound for realistic register chains while staying well
- * under TX_AR_MAX_REGS. */
-#define TX_AR_CHAIN_REGS 8
+ * UNKNOWN and falling to the table). M2.62 raises it to 12 (the
+ * EQUAL-CAPS regression's register dimension): a 12-feeder index chain
+ * (jmpr_chain38 — the closure {r1..r12} = exactly the cap, the M2.56
+ * turn-over at the new value) now analyzes, and a 13th feeder still
+ * truncates conservatively to the table. g_chain_arr is REGS x 4096
+ * ChainSets, so the static footprint scales with the cap (8 -> 12
+ * adds ~6 MB of BSS at MAX = 96); 12 is a generous bound for
+ * realistic register chains while staying well under TX_AR_MAX_REGS. */
+#define TX_AR_CHAIN_REGS 12
 #define TX_AR_CHAIN_DEFS 64
 #define CD_SLOT 0   /* M2.32: deferred-product operand kind — a tracked slot */
 #define CD_REC  1   /* M2.32: deferred-product operand kind — an older pool record */

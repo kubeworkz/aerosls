@@ -4987,6 +4987,58 @@ below 65 values:
   64-candidate chain both execute at runtime on every engine.
   enc-check clean, a64-f0 PASS, stress all-green.
 
+### 10.134 M2.62 — the tracked-register closure raised to its 12-cap, and the turn-over pinned (as built)
+
+M2.61 made the equal-caps invariant permanent (MAX = BIG = 96); this
+milestone applies the same regression discipline to the register
+dimension: **TX_AR_CHAIN_REGS is raised 8 -> 12**, and jmpr_chain38
+pins the new turn-over — a closure needing EXACTLY TWELVE registers,
+the largest the cap admits. The index is built in six stages over
+joins (chain32's structure extended): r4 = r8 + r8 (the self-add
+tracks r8 ONCE — that's what keeps the closure at twelve), r5 = r9 +
+r10, r2 = r4 + r5, r6 = r11 + r12, r3 = r6 + r7, r1 = r2 + r3 -> the
+closure {r1..r12} = 12 = TX_AR_CHAIN_REGS: every feeder tracked, and
+the 33-candidate chain fires (cost 268 < table 2020).
+
+**The turn-over.** Runtime 10 + (10+5) + (50+5) + 400 = 490 — the LAST
+of the 33 candidates {40..90} U {240..290} U {440..490} step 5 — takes
+the chain's THIRTY-THIRD b.eq -> block32 at pc 490 -> LOADI #3200 ->
+PASS 3200 on all four engines; a truncated image (32 candidates, or
+one dropped feeder) misses 490 and UDF-traps. Dump-verified: **33
+b.eq, 34 br, 1 udf, 0 table words**. The control (REGS=8, ad hoc,
+not committed): the closure stops growing at 8 — the untracked
+feeders' sets stay UNKNOWN, poisoning r1 -> the dispatch falls to the
+table: 0 b.eq, PASS 3200 through the bounds check (9376 bytes vs
+7624 at the 12-cap) — the over-cap side of the boundary is
+conservative and correct, never a wrong chain.
+
+**Footprint note.** g_chain_arr is REGS x 4096 ChainSets, so the
+static BSS scales with the cap (8 -> 12 adds ~6 MB at MAX = 96).
+The ceiling semantics are unchanged: every existing fixture uses at
+most 8 feeders, so nothing below the new cap can move.
+
+### 10.135 M2.62 gate results (measured)
+
+Total emitted bytes across the now-86-program parity set: **M0
+222812 → M1 181764, 41048 saved** (≈18.4%). One row added, **zero
+moved** — the totals delta is EXACTLY chain38's row (M0 +11364, M1
++7624), so all 89 shared rows are byte-identical; the REGS bump is a
+pure ceiling:
+
+- jmpr_chain38 11364 → 7624 (−3740, new 86th row; M0 baseline
+  measured at git 1729f50) — the 12-register turn-over pin: the
+  33-candidate chain replacing the runtime table, on a 495-
+  instruction body (the 12-join header + the three 11-block
+  candidate regions + fillers). Runtime 490 on all four engines.
+- Row-by-row accounting: **all 89 shared rows byte-identical** —
+  the gate total moved by exactly chain38's M1; the ceiling never
+  changes emission below it.
+- Four-way parity: 361 PASS, 0 FAIL — all 91 expected-result
+  programs on all four engines (interp 91/91, x86 90/0/3, RV64
+  90/0/3, ARM 90/0/3); chain38's 33-candidate chain executes at
+  runtime on every engine. enc-check clean, a64-f0 PASS, stress
+  all-green.
+
 ---
 
 ## Sources consulted
