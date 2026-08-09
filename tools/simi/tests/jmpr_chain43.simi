@@ -16,13 +16,18 @@
 ; monotone-decreasing, and the marks from pass 1 are ALL present in pass
 ; 2 — so every JMPR whose chain contains ANY pass-1 target un-folds in
 ; the SAME pass. Convergence is exactly 3 scans (fold-all, un-fold-all,
-; confirm) for ANY cascade size, never scaling with the number of JMPRs.
-; The M2.18 relaxation is the only non-monotone force (it can RESTORE a
-; constant at a relax-eligible head, re-folding a JMPR) — and its
-; exclusion rule (g_fold_tgt_prev, the previous pass's fold set) makes
-; a re-folding JMPR's target flip the head's eligibility back and forth,
-; the 2-cycle chain36 pins. So the 512-pass safety net is reachable ONLY
-; by the 2-cycle; a slow-converging fold analysis does not exist.
+; confirm) for any RULE-1-driven cascade size, never scaling with the
+; number of JMPRs. The M2.18 relaxation is the only non-monotone force
+; (it can RESTORE a constant at a relax-eligible head, re-folding a
+; JMPR) — and its per-pass exclusion (g_fold_tgt_prev, the previous
+; pass's fold set) makes a re-folding JMPR's target flip the head's
+; eligibility back and forth, the 2-cycle chain36 pins. M2.70 (chain44)
+; CORRECTS the "ANY" in the 3-scan bound: when a fold INTO a relax-
+; eligible head un-folds, the head drops out of the next pass's
+; exclusion and its JMPR re-folds once — a legitimate 4th scan
+; (passes=3). The 2-cycle (a fold into its own head) is the only
+; DIVERGENCE, so the safety net fires only there; a slow-converging
+; fold analysis still does not exist.
 ;
 ; The teeth: this cascade has SIX JMPRs and converges in exactly 3 scans
 ; (instrumented: passes = 2 changes + 1 confirm, net NEVER fires) — the

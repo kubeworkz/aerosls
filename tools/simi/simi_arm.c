@@ -2764,15 +2764,24 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         for (int i = 0; i < 4096; i++)
             if (g_jmpr_fold[i] != g_jmpr_fold_prev[i]) { same = 0; break; }
         if (same) break;
-        if (++passes > 512) {
+        if (++passes > 16) {
             /* M2.18 safety net: a fold ENABLED BY the relaxation can target
              * the relaxed head itself (a backward fold re-entering the head
              * makes it a loop head the relaxation must not apply to) — that
              * shape 2-cycles the fixpoint (relax -> fold -> reset ->
-             * un-fold). The corpus does not exercise it, but a translator
-             * must terminate on any input: fall back to the un-relaxed
-             * fixpoint, which is monotone-decreasing in the fold set and
-             * provably terminates. */
+             * un-fold). M2.69/M2.70 bound the LEGITIMATE convergence:
+             * rule-1-driven retroactive splits settle in <= 3 scans
+             * (M2.69, chain43), and the relaxation-flip re-fold (M2.70,
+             * chain44 — an un-fold clearing the per-pass exclusion lets
+             * the head's JMPR re-fold once) adds a 4th scan (passes=3);
+             * the corpus max is passes=2 (instrumented). The 2-cycle is
+             * the only divergence, so the trip count just needs to sit
+             * above the legit max with margin: 512 was a 170x
+             * overestimate; 16 (5x over passes=3) still never fires on
+             * legitimate input while cutting the 2-cycle's translate
+             * time ~30x. The restart is sound regardless: fall back to
+             * the un-relaxed fixpoint, which is monotone-decreasing in
+             * the fold set and provably terminates. */
             relax_enabled = 0;
             for (int i = 0; i < 4096; i++) g_jmpr_fold[i] = -1;
             passes = 0;

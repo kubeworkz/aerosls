@@ -5472,12 +5472,16 @@ constant is a fixed instruction with a fixed value). The fold set is
 monotone-decreasing, and pass 1's marks are ALL already live in pass 2 —
 so every JMPR whose chain contains ANY pass-1 target un-folds in the
 SAME pass. Convergence is exactly 3 scans (fold-all, un-fold-all,
-confirm) for ANY cascade size; the pass count never scales with the
-number of JMPRs. The M2.18 relaxation is the only non-monotone force
-(it can RESTORE a constant at a relax-eligible head, re-folding a
-JMPR), and its per-pass exclusion (g_fold_tgt_prev, the previous pass's
-complete fold set) makes a re-folding JMPR's own target flip the head's
-eligibility back and forth — the 2-cycle chain36 pins. So the 512-pass
+confirm) for any RULE-1-driven cascade size; the pass count never
+scales with the number of JMPRs. The M2.18 relaxation is the only
+non-monotone force (it can RESTORE a constant at a relax-eligible
+head, re-folding a JMPR), and its per-pass exclusion (g_fold_tgt_prev,
+the previous pass's complete fold set) makes a re-folding JMPR's own
+target flip the head's eligibility back and forth — the 2-cycle
+chain36 pins. M2.70 (chain44) corrects the "ANY": when a fold INTO a
+relax-eligible head un-folds, the head drops out of the next pass's
+exclusion and its JMPR re-folds once — a legitimate 4th scan
+(passes=3). The 2-cycle is the only DIVERGENCE, so the 512-pass
 safety net is reachable ONLY by the 2-cycle; a slow-converging fold
 analysis cannot be constructed.
 
@@ -5508,6 +5512,55 @@ exact final state: interp 96/96, x86 95/0/3, RV64 95/0/3, ARM 95/0/3
 (+1 each = chain43). The teeth: reverting the rule-1 mark (constants
 flowing through fold targets) keeps J2..J6 folded → g_alloc = 1 →
 cache mode → a smaller, different emission, caught by the gate row.
+
+### 10.150 M2.70 — the safety net tightened 512 → 16, and the "≤ 3 scans" bound corrected (as built)
+
+M2.69 claimed convergence is exactly 3 scans for ANY cascade. The
+instrumented corpus sweep confirmed the empirical max (passes=2 — 71
+fixtures passes=0, 21 passes=1, chain35/43 passes=2, only chain36 fires
+its net), but the structural claim needed one more case: the
+RELAXATION-FLIP. The M2.18 per-pass exclusion (g_fold_tgt_prev,
+recomputed from the PREVIOUS pass's fold set) can CLEAR: when a JMPR
+that folded INTO a relax-eligible head un-folds, the head drops out of
+the next pass's exclusion and its JMPR re-folds once. jmpr_chain44
+constructs it: J2 (pc 8) folds forward into J3's head H3 (pc 10) in
+pass 1 while J1 (pc 4) folds to T1 = 6 inside J2's chain. Pass 2: T1's
+rule-1 mark kills r2 permanently (J2's fold to 10 leaves the fold set),
+and H3's exclusion kills r3 at H3 (J3 un-folds). Pass 3: J2's fold to
+10 is GONE from pass 2's fold set, so H3 is no longer excluded — the
+relaxation restores r3 = 12 and J3 RE-FOLDS (an un-fold ENABLED a
+re-fold). Pass 4: same → converge. Instrumented: FIXPOINT passes=3
+relax=1 net=0 — a legitimate 4th scan, net silent. J3's re-fold is
+stable (its target 12 is fall-through, not the head — no self-reentry),
+so the constructible legit max is passes=3; the 2-cycle (a fold into
+its own head, chain36) is the only DIVERGENCE.
+
+The tightening: `++passes > 512` → `++passes > 16`. The trip count
+only needs to sit above the legit max with margin — 512 was a 170×
+overestimate of the corpus's 2; 16 gives 5× over the constructible
+passes=3 and 8× over the corpus max, while cutting the 2-cycle's
+translate time ~30× (chain36's net now fires at pass 17 instead of
+513, with the same un-relaxed restart and the same emission). The
+restart's soundness is unchanged: the un-relaxed fixpoint is
+monotone-decreasing in the fold set and provably terminates. Also
+amended: the M2.69-era "ANY cascade" phrasings in chain43's header,
+the gate's chain43 comment, and §10.148 now scope the 3-scan bound to
+rule-1-driven cascades and point at chain44 for the relaxation-flip.
+
+### 10.151 M2.70 gate results (measured)
+
+**96/96, M0 254532 → M1 208308, 46224 saved** — the new jmpr_chain44
+row (M0 1332, measured at git 1729f50: the naive translator, all three
+JMPRs via table → M1 1088, −244: the M2.24 table compaction, J1/J3's
+folds, and J2's M2.25 1-candidate inline chain) and all **95 shared
+rows byte-identical** (45980 + 244 = 46224 exactly — the tightening
+cannot move emission: no corpus fixture's fixpoint runs past passes=2,
+and chain36's net outcome is unchanged). Four-way parity on the exact
+final state: interp 97/97, x86 96/0/3, RV64 96/0/3, ARM 96/0/3 (+1
+each = chain44). Dump-verified chain44: 1 b.eq (J2's chain), 0 table
+dispatches, J1/J3 direct b's. The teeth: making H3 non-eligible (H3-1
+= ADD instead of RET) keeps J3 folded from pass 1 → a different
+emission, caught by the gate row.
 
 ---
 
