@@ -5538,14 +5538,19 @@ its own head, chain36) is the only DIVERGENCE.
 The tightening: `++passes > 512` → `++passes > 16`. The trip count
 only needs to sit above the legit max with margin — 512 was a 170×
 overestimate of the corpus's 2; 16 gives 5× over the constructible
-passes=3 and 8× over the corpus max, while cutting the 2-cycle's
-translate time ~30× (chain36's net now fires at pass 17 instead of
-513, with the same un-relaxed restart and the same emission). The
-restart's soundness is unchanged: the un-relaxed fixpoint is
-monotone-decreasing in the fold set and provably terminates. Also
-amended: the M2.69-era "ANY cascade" phrasings in chain43's header,
-the gate's chain43 comment, and §10.148 now scope the 3-scan bound to
-rule-1-driven cascades and point at chain44 for the relaxation-flip.
+passes=3 and 8× over the corpus max, cutting the 2-cycle's scan
+count 514 → 18 (28.6×) and chain36's end-to-end translate ~8-9× —
+measured as committed numbers by bench_net (M2.71; the end-to-end
+ratio is diluted below the scan ratio by the per-translate fixed
+passes — array clears, pass A, the reachability BFS, the emission —
+which are identical at both trip counts; chain36's net now fires at
+pass 17 instead of 513, with the same un-relaxed restart and the
+same emission). The restart's soundness is unchanged: the un-relaxed
+fixpoint is monotone-decreasing in the fold set and provably
+terminates. Also amended: the M2.69-era "ANY cascade" phrasings in
+chain43's header, the gate's chain43 comment, and §10.148 now scope
+the 3-scan bound to rule-1-driven cascades and point at chain44 for
+the relaxation-flip.
 
 ### 10.151 M2.70 gate results (measured)
 
@@ -5561,6 +5566,50 @@ each = chain44). Dump-verified chain44: 1 b.eq (J2's chain), 0 table
 dispatches, J1/J3 direct b's. The teeth: making H3 non-eligible (H3-1
 = ADD instead of RET) keeps J3 folded from pass 1 → a different
 emission, caught by the gate row.
+
+### 10.152 M2.71 — the safety-net translate-time win committed as a measurement (as built)
+
+The M2.70 claim was "~30× faster translate". M2.71 makes it a
+committed, measured number: bench_net.c translates chain36 — the only
+input in the corpus whose fold fixpoint DIVERGES (the M2.60 relaxation
+2-cycle) — N times at the shipped trip count (16, now the tunable
+g_ar_net_trip exposed in simi_arm.h) and at the M2.69-era count (512)
+in the SAME process (identical fixed overhead: same buffer, same
+warmup, same arrays), timing both with CLOCK_MONOTONIC. The fixpoint's
+scan count (g_ar_net_scans, incremented once per scan) is reported as
+the machine-independent truth: **18 vs 514 scans = 28.6×** — the 2-cycle
+burns 17 scans before the net fires (then the un-relaxed restart
+converges in 1) instead of 513 + 1.
+
+The honest end-to-end number: **~8-9× wall-clock on chain36** (25.7 µs
+vs 221 µs per translate, measured on this sandbox; three runs 7.1-9.1×).
+The end-to-end ratio is BELOW the scan ratio because the per-translate
+FIXED passes — the 4096-entry array clears, pass A, the reachability
+BFS, the emission — are identical at both trip counts and dominate the
+16-side's 18 scans; the scan-work win (28.6×) is the fixpoint's own
+cost and is what the translate spends when the 2-cycle runs. (An
+ad-hoc 2011-instruction padded variant measured only 2.0× — the fixed
+passes scale with program size too, so the end-to-end ratio is
+smallest on large programs; the win is fundamentally the scan count.)
+The committed gate: `make bench-net` FAILS if the scan ratio drops
+below 20× or the wall-clock ratio below 5× (floors with margin over
+the measured 28.6×/8-9×). The M2.70-era "~30× translate time"
+phrasings (§10.150, the chain44 gate comment, the net comment in
+simi_arm.c) are corrected to the precise numbers.
+
+### 10.153 M2.71 gate results (measured)
+
+bench_net (N=100, this sandbox): **trip=16 25.74 µs/translate / 18
+scans; trip=512 220.95 µs/translate / 514 scans; 8.6× wall-clock,
+28.6× scans — ALL CHECKS PASSED**. Emission unaffected (the trip count
+is read per translate; the shipped default stays 16, and no corpus
+fixture's fixpoint runs past passes=2), so the size gate and four-way
+parity are unchanged: **96/96, 46224 saved** and interp 97/97,
+x86/RV64/ARM 96/0/3, re-run on the exact final state. New files:
+bench_net.c, the Makefile bench-net target (in `all`, ~0.5 s at 100
+iters — the M2.27 stale-binary lesson), the gitignore entry, and the
+two exposed globals g_ar_net_trip / g_ar_net_scans in simi_arm.c/.h
+(the trip count becomes a tunable, default unchanged at 16).
 
 ---
 

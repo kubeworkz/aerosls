@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -45,6 +45,18 @@ simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h
 # where encoder AND decoder agree on a wrong constant.
 a64_dump: a64_dump.c simi_arm.c simi_arm.h
 	$(CC) $(CFLAGS) -o $@ a64_dump.c simi_arm.c
+
+# M2.71: translate-time micro-benchmark for the fold fixpoint's safety
+# net — translates chain36 (the only net-firing input: the M2.60
+# relaxation 2-cycle) N times at the shipped trip count (16, the tunable
+# g_ar_net_trip) vs the M2.69-era 512, asserting the committed speedup
+# floor (see bench_net.c's top comment). In `all` so the committed
+# measurement always refreshes with the build (the M2.27 stale-binary
+# lesson); ~0.5 s at the default 100 iters.
+bench-net: simi-asm bench_net.c simi_arm.c simi_arm.h tests/jmpr_chain36.simi
+	./simi-asm tests/jmpr_chain36.simi tests/jmpr_chain36.tmo
+	$(CC) $(CFLAGS) -o $@ bench_net.c simi_arm.c
+	./bench-net tests/jmpr_chain36.tmo 100
 
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top
@@ -94,6 +106,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net clean
