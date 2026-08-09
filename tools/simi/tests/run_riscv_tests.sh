@@ -52,7 +52,10 @@ for src in *.simi; do
         continue
     fi
 
-    if "$VERIFY" "$name.tmo" main "$expected"; then
+    # M2.76: --steps asserts the fixture's committed executed-instruction
+    # count (bench_baselines_rv64.h — the same deterministic, machine-
+    # independent tripwire M2.75 added to the ARM leg).
+    if "$VERIFY" "$name.tmo" main "$expected" --steps; then
         pass=$((pass+1))
     else
         fail=$((fail+1))

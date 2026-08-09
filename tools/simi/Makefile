@@ -13,7 +13,7 @@ simi-dis: simi_disasm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_disasm.c simi_obj.c
 
 # Phase 3: portable x86-64 translator core + host JIT-execution test harness.
-simi-jit-test: simi_jit_test.c simi_x86.c simi_x86.h
+simi-jit-test: simi_jit_test.c simi_x86.c simi_x86.h bench_baselines_x86.h
 	$(CC) $(CFLAGS) -o $@ simi_jit_test.c simi_x86.c
 
 # Phase 15 (plan Part II §8): the real-hardware concurrency stress harness —
@@ -29,7 +29,7 @@ stress-atomics: simi-asm stress_atomics.c simi_x86.c simi_x86.h tests/stress_ato
 # Phase 5: portable RV64 translator core + a small purpose-built RV64
 # decoder/executor standing in for real hardware/QEMU (neither available
 # in this project's dev sandbox — see simi_riscv_verify.c's top comment).
-simi-riscv-verify: simi_riscv_verify.c simi_riscv.c simi_riscv.h rv64_exec.c rv64_exec.h
+simi-riscv-verify: simi_riscv_verify.c simi_riscv.c simi_riscv.h rv64_exec.c rv64_exec.h bench_baselines_rv64.h
 	$(CC) $(CFLAGS) -o $@ simi_riscv_verify.c simi_riscv.c rv64_exec.c
 
 # M0 (Step 7 / AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md): portable AArch64

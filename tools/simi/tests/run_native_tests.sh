@@ -40,7 +40,11 @@ for src in *.simi; do
         continue
     fi
 
-    if "$JIT" "$name.tmo" main "$expected"; then
+    # M2.76: --bytes asserts the fixture's committed emitted-byte count
+    # (bench_baselines_x86.h — the deterministic emission tripwire for the
+    # native leg; the sandbox has no vPMU, so dynamic steps are unmeasurable
+    # here — see bench_baselines_x86.h's top comment).
+    if "$JIT" "$name.tmo" main "$expected" --bytes; then
         pass=$((pass+1))
     else
         fail=$((fail+1))
