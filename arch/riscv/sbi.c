@@ -1,5 +1,44 @@
 #include "sbi.h"
 
+/* QEMU virt 16550 UART (Phase 9g) -- the console for the M-mode build
+ * (QEMU `-bios none -kernel`): there is no OpenSBI, so no SBI console
+ * extension exists at all, and the console is the raw 16550 the virt
+ * machine maps at physical 0x10000000 (the standard first-UART base;
+ * paging is Bare in M-mode -- satp is never written -- so the MMIO
+ * access is a plain volatile load/store). The S-mode build (no
+ * RISCV_MMODE) keeps using SBI_DBCN below. The variant is baked in at
+ * build time rather than detected at runtime, because reading mstatus
+ * (the only CSR that would reveal the privilege mode) traps as an
+ * illegal instruction from S-mode -- see AeroSLS-SIMI-ISA-v0.1.md §16
+ * Phase 9g. */
+#define VIRT_UART_BASE 0x10000000UL
+
+#if defined(RISCV_MMODE)
+
+static void uart_putchar(char c) {
+    volatile uint8_t* lsr = (volatile uint8_t*)(VIRT_UART_BASE + 5);
+    volatile uint8_t* thr = (volatile uint8_t*)(VIRT_UART_BASE + 0);
+    while ((*lsr & 0x20) == 0) { }   /* LSR bit 5: THR empty -- wait for it */
+    *thr = (uint8_t)c;
+}
+
+static int uart_getchar(void) {
+    volatile uint8_t* lsr = (volatile uint8_t*)(VIRT_UART_BASE + 5);
+    volatile uint8_t* rbr = (volatile uint8_t*)(VIRT_UART_BASE + 0);
+    if ((*lsr & 0x01) == 0) return -1;   /* LSR bit 0: RX data ready */
+    return (int)(unsigned char)*rbr;
+}
+
+void sbi_putchar(char c) {
+    uart_putchar(c);
+}
+
+int sbi_getchar(void) {
+    return uart_getchar();
+}
+
+#else /* S-mode under OpenSBI */
+
 void sbi_putchar(char c) {
     /* OpenSBI >= 0.9 removed the legacy console putchar extension
      * (SBI_EXT_0_1_CONSOLE_PUTCHAR) for S-mode guests -- the call is
@@ -26,6 +65,8 @@ int sbi_getchar(void) {
     struct SBIReturn legacy = sbi_call(SBI_EXT_0_1_CONSOLE_GETCHAR, 0, 0, 0, 0);
     return (int)legacy.error;
 }
+
+#endif
 
 void sbi_system_reset(void) {
     /* System Reset Extension (SBI v0.3+/v1.0): an ecall to M-mode

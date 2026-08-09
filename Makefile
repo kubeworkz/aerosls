@@ -283,6 +283,14 @@ RV_CFLAGS   = -ffreestanding -O2 -Wall -Wextra -mcmodel=medany \
               -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections
 RV_LDFLAGS  = -T arch/riscv/linker_riscv.ld -nostdlib --gc-sections
 
+# Phase 9g: the M-mode variant (QEMU `-bios none -kernel` direct payload).
+# Same sources, recompiled with -DRISCV_MMODE (UART console, mtvec trap
+# vector, no-firmware exit) and linked at the DRAM base 0x80000000 -- the
+# address the reset vector enters in a bare M-mode boot, where OpenSBI is
+# absent (see arch/riscv/linker_riscv_m.ld and ISA doc §16 Phase 9g).
+RV_CFLAGS_M  = $(RV_CFLAGS) -DRISCV_MMODE
+RV_LDFLAGS_M = -T arch/riscv/linker_riscv_m.ld -nostdlib --gc-sections
+
 RV_ASM_SRC  = arch/riscv/boot_riscv.S arch/riscv/context_riscv.S arch/riscv/vector_state.S \
               arch/riscv/trap_riscv.S
 RV_C_SRC    = kernel/kernel_riscv.c arch/riscv/walk_page_tables_riscv.c \
@@ -300,6 +308,11 @@ RV_OBJECTS  = $(RV_ASM_SRC:.S=.rv.o) \
               $(filter-out arch/riscv/trap_riscv.rv.o,$(RV_C_SRC:.c=.rv.o)) \
               arch/riscv/trap_riscv_c.rv.o
 RV_ELF      = sls_riscv_kernel.elf
+
+# Same object list recompiled with -DRISCV_MMODE (distinct .m.rv.o names so
+# both variants can coexist in one build tree).
+RV_OBJECTS_M = $(RV_OBJECTS:.rv.o=.m.rv.o)
+RV_ELF_M     = sls_riscv_kernel_m.elf
 
 .PHONY: all clean x86-run riscv-run plugins
 
@@ -422,14 +435,27 @@ x86-run: x86-iso
 %.rv.o: %.c
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
 
-# Unique object for trap_riscv.c (see the RV_OBJECTS comment above).
+%.m.rv.o: %.S
+	$(RV_CC) $(RV_CFLAGS_M) -c $< -o $@
+
+%.m.rv.o: %.c
+	$(RV_CC) $(RV_CFLAGS_M) -c $< -o $@
+
+# Unique object for trap_riscv.c (see the RV_OBJECTS comment above), both
+# variants.
 arch/riscv/trap_riscv_c.rv.o: arch/riscv/trap_riscv.c
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
+
+arch/riscv/trap_riscv_c.m.rv.o: arch/riscv/trap_riscv.c
+	$(RV_CC) $(RV_CFLAGS_M) -c $< -o $@
 
 $(RV_ELF): $(RV_OBJECTS)
 	$(RV_LD) $(RV_LDFLAGS) $(RV_OBJECTS) -o $(RV_ELF)
 
-riscv-elf: $(RV_ELF)
+$(RV_ELF_M): $(RV_OBJECTS_M)
+	$(RV_LD) $(RV_LDFLAGS_M) $(RV_OBJECTS_M) -o $(RV_ELF_M)
+
+riscv-elf: $(RV_ELF) $(RV_ELF_M)
 
 riscv-run: riscv-elf
 	@if [ ! -f sls_storage_rv64.img ]; then qemu-img create -f raw sls_storage_rv64.img 10G; fi
