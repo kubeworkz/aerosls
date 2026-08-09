@@ -3520,6 +3520,28 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                             }
                         }
                     }
+                    /* M2.58: the 64-iteration cap can STOP a still-growing
+                     * walk. A BACKWARD-branch lattice (a loop whose
+                     * back-edge delivers the loop-carried set to its own
+                     * head) is path-insensitive in this walk — the head
+                     * set grows by one value per iteration and the
+                     * fixpoint of an accumulator loop is UNBOUNDED, so
+                     * the walk never converges and the cap truncates it.
+                     * The truncated snapshot is UNSOUND as a candidate
+                     * set: a runtime index outside the truncated tail is
+                     * legitimate (the loop can iterate more times) yet
+                     * the chain would UDF-trap it (jmpr_chain34's probe
+                     * proved it: runtime 165, pre-fix snapshot {101..164},
+                     * the chain missed and faulted). Unconverged ->
+                     * UNKNOWN, the exact-or-conservative discipline: the
+                     * table dispatches every index. `changed` is only
+                     * ever set by the bigsnap comparator, so a still-1
+                     * flag here means the snapshot was still moving at
+                     * the last iteration. Byte-invisible for every
+                     * CONVERGED program (the existing corpus: forward
+                     * join lattices settle within a handful of
+                     * iterations) — the size gate proves it. */
+                    if (changed) chain_unknown_big(&g_chain_bigsnap);
                     /* the converged snapshot at dyn_pc is the candidate set */
                     if (!g_chain_bigsnap.unk && g_chain_bigsnap.n > 0 &&
                         g_chain_bigsnap.n <= TX_AR_CHAIN_BIG) {

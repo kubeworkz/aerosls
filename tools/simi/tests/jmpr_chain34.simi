@@ -1,0 +1,228 @@
+; jmpr_chain34.simi — M2.58: the walk's fixpoint convergence, pinned at
+; the 64-iteration cap. A BACKWARD-branch join lattice: the loop at
+; LOOP (pc 5) increments r2 by r3 = {1} and branches BACK to LOOP,
+; delivering r2's set to the already-processed head. The walk is
+; path-insensitive, so the head's set grows by ONE value per walk
+; iteration ({100}, {100,101}, ...) — an accumulator loop's fixpoint
+; is UNBOUNDED, so the walk never converges and the 64-iteration cap
+; (iter < 64) stops it at iteration 63. Runtime executes the loop
+; 65 times (r5 counts 65 -> 0), so r2 = 100 + 65 = 165 at the JMPR.
+; M2.58's probe found the truncation UNSOUND: the pre-fix snapshot at
+; iteration 63 is the post-increment {101..164}, the chain fires over
+; it, and the runtime index 165 is NOT covered -> the chain falls
+; through to UDF (rc=1 on the ARM engine — a legitimate index killed
+; by a truncated candidate set). The fix is the exact-or-conservative
+; discipline: an UNCONVERGED walk (changed still true after the cap)
+; collapses the snapshot to UNKNOWN -> the table, which dispatches
+; 165 through its bounds check to block32's LOADI #8000 -> PASS 8000
+; on all four engines. Dump-verified: 0 b.eq, the full table
+; dispatch. (interp/x86/rv64 execute the .tmo directly — no chain
+; analysis — so they pass either way; the pin's discriminator is the
+; ARM engine.)
+; Expected result: 8000
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: unused fallback condition
+    LOADI r2, #100, i64 ; pc 2 — the index/counter base
+    LOADI r3, #1, i64   ; pc 3 — the increment
+    LOADI r5, #65, i64  ; pc 4 — runtime loop count (65 iterations)
+LOOP:                   ; pc 5 — backward branch target (head)
+    ADD r2, r2, r3, i64 ; pc 5 — r2 += 1: the walk's set grows per
+                        ; iteration {100}, {100,101}, ... (unbounded)
+    SUB r5, r5, #1, i64 ; pc 6 — runtime counter decrement
+    BC r5, LOOP         ; pc 7 — taken while r5 != 0 (65 iterations);
+                        ; delivers r2's set to LOOP (backward edge)
+    JMPR r2             ; pc 8 — runtime 165; pre-fix the truncated
+                        ; snapshot {101..164} misses it -> UDF
+    LOADI r0, #0, i32   ; pc 9 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 10 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 11 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 12 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 13 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 14 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 15 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 16 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 17 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 18 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 19 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 20 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 21 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 22 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 23 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 24 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 25 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 26 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 27 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 28 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 29 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 30 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 31 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 32 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 33 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 34 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 35 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 36 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 37 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 38 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 39 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 40 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 41 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 42 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 43 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 44 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 45 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 46 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 47 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 48 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 49 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 50 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 51 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 52 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 53 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 54 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 55 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 56 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 57 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 58 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 59 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 60 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 61 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 62 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 63 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 64 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 65 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 66 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 67 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 68 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 69 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 70 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 71 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 72 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 73 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 74 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 75 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 76 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 77 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 78 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 79 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 80 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 81 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 82 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 83 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 84 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 85 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 86 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 87 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 88 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 89 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 90 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 91 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 92 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 93 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 94 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 95 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 96 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 97 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 98 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 99 — dead filler (aligns block0 to pc 101)
+    LOADI r0, #0, i32   ; pc 100 — dead filler (aligns block0 to pc 101)
+block0:                 ; pc 101
+    LOADI r0, #100, i32 ; pc 101
+    RET                 ; pc 102
+block1:                 ; pc 103
+    LOADI r0, #200, i32 ; pc 103
+    RET                 ; pc 104
+block2:                 ; pc 105
+    LOADI r0, #300, i32 ; pc 105
+    RET                 ; pc 106
+block3:                 ; pc 107
+    LOADI r0, #400, i32 ; pc 107
+    RET                 ; pc 108
+block4:                 ; pc 109
+    LOADI r0, #500, i32 ; pc 109
+    RET                 ; pc 110
+block5:                 ; pc 111
+    LOADI r0, #600, i32 ; pc 111
+    RET                 ; pc 112
+block6:                 ; pc 113
+    LOADI r0, #700, i32 ; pc 113
+    RET                 ; pc 114
+block7:                 ; pc 115
+    LOADI r0, #800, i32 ; pc 115
+    RET                 ; pc 116
+block8:                 ; pc 117
+    LOADI r0, #900, i32 ; pc 117
+    RET                 ; pc 118
+block9:                 ; pc 119
+    LOADI r0, #1000, i32 ; pc 119
+    RET                 ; pc 120
+block10:                 ; pc 121
+    LOADI r0, #1100, i32 ; pc 121
+    RET                 ; pc 122
+block11:                 ; pc 123
+    LOADI r0, #1200, i32 ; pc 123
+    RET                 ; pc 124
+block12:                 ; pc 125
+    LOADI r0, #1300, i32 ; pc 125
+    RET                 ; pc 126
+block13:                 ; pc 127
+    LOADI r0, #1400, i32 ; pc 127
+    RET                 ; pc 128
+block14:                 ; pc 129
+    LOADI r0, #1500, i32 ; pc 129
+    RET                 ; pc 130
+block15:                 ; pc 131
+    LOADI r0, #1600, i32 ; pc 131
+    RET                 ; pc 132
+block16:                 ; pc 133
+    LOADI r0, #1700, i32 ; pc 133
+    RET                 ; pc 134
+block17:                 ; pc 135
+    LOADI r0, #1800, i32 ; pc 135
+    RET                 ; pc 136
+block18:                 ; pc 137
+    LOADI r0, #1900, i32 ; pc 137
+    RET                 ; pc 138
+block19:                 ; pc 139
+    LOADI r0, #2000, i32 ; pc 139
+    RET                 ; pc 140
+block20:                 ; pc 141
+    LOADI r0, #2100, i32 ; pc 141
+    RET                 ; pc 142
+block21:                 ; pc 143
+    LOADI r0, #2200, i32 ; pc 143
+    RET                 ; pc 144
+block22:                 ; pc 145
+    LOADI r0, #2300, i32 ; pc 145
+    RET                 ; pc 146
+block23:                 ; pc 147
+    LOADI r0, #2400, i32 ; pc 147
+    RET                 ; pc 148
+block24:                 ; pc 149
+    LOADI r0, #2500, i32 ; pc 149
+    RET                 ; pc 150
+block25:                 ; pc 151
+    LOADI r0, #2600, i32 ; pc 151
+    RET                 ; pc 152
+block26:                 ; pc 153
+    LOADI r0, #2700, i32 ; pc 153
+    RET                 ; pc 154
+block27:                 ; pc 155
+    LOADI r0, #2800, i32 ; pc 155
+    RET                 ; pc 156
+block28:                 ; pc 157
+    LOADI r0, #2900, i32 ; pc 157
+    RET                 ; pc 158
+block29:                 ; pc 159
+    LOADI r0, #3000, i32 ; pc 159
+    RET                 ; pc 160
+block30:                 ; pc 161
+    LOADI r0, #3100, i32 ; pc 161
+    RET                 ; pc 162
+block31:                 ; pc 163
+    LOADI r0, #3200, i32 ; pc 163
+    RET                 ; pc 164
+block32:                 ; pc 165
+    LOADI r0, #8000, i32 ; pc 165
+    RET                 ; pc 166

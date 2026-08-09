@@ -4711,6 +4711,78 @@ strictly additive):
   float/mem skips and the no-expected jmpr_oob are unchanged
   (jmpr_oob still faults via UDF, rc=1). enc-check clean.
 
+### 10.126 M2.58 — the walk's fixpoint convergence pinned, and an unsound truncation fixed (as built)
+
+A PROBE milestone that found and fixed a REAL soundness bug. The
+chain walk iterates its linear-stream analysis to a fixpoint, capped
+at 64 iterations (`for (iter = 0; changed && iter < 64; iter++)`);
+`changed` is set solely by the dispatch-snapshot comparator. M2.58
+probed the convergence behavior with a BACKWARD-branch join lattice
+(jmpr_chain34): a loop that increments r2 by r3 = {1} and branches
+BACK to its own head, delivering r2's loop-carried set to the
+already-processed head. Because the walk is path-insensitive, the
+head's set grows by ONE value per walk iteration ({100}, {100,101},
+{100,101,102}, ...) — the fixpoint of an accumulator loop is
+UNBOUNDED, so the walk NEVER converges, and the 64-iteration cap
+stops it at iteration 63 with a truncated set.
+
+**The bug.** The pre-fix snapshot at iteration 63 was the
+post-increment {101..164}, and the emission fired the chain over it
+(64 b.eq, dump-verified). But the runtime executes the loop 65 times
+(r5 counts 65 -> 0), so the index at the JMPR is 165 — a LEGITIMATE
+value (the loop can iterate any number of times) that the truncated
+set does not cover. The chain fell through to UDF: the ARM engine
+faulted (rc=1, "unimplemented or malformed instruction") while
+interp/x86/rv64 — which execute the .tmo directly and have no chain
+analysis — returned 8000. A real soundness break: the chain's
+fall-through was documented to "fire exactly for indices the analysis
+proves impossible", but the truncation proved 165 impossible when it
+was not.
+
+**The fix — the exact-or-conservative discipline at the cap.**
+After the iteration loop, `if (changed) chain_unknown_big(&g_chain_bigsnap)`
+— an UNCONVERGED walk collapses the snapshot to UNKNOWN and the
+dispatch falls to the table, which dispatches every index correctly.
+The discriminator control (guard temporarily removed) reproduces the
+UDF exactly; with the guard, jmpr_chain34 PASSes 8000 through the
+table's bounds check. **Byte-invisible**: every existing program's
+lattice converges within the cap (the corpus is all forward join
+lattices that settle in a handful of iterations) — the size gate's
+85 shared rows are byte-identical with the fix in.
+
+### 10.127 M2.58 gate results (measured)
+
+Total emitted bytes across the now-82-program parity set: **M0
+199680 → M1 165392, 34288 saved** (≈17.2%). One row added, zero
+moved — despite the simi_arm.c unconverged guard, **all 86 shared
+rows are byte-identical** (the guard only fires when the walk is
+still moving at iteration 64, impossible for every converged
+program):
+
+- jmpr_chain34 4796 → 4120 (−676, new 82nd row; M0 baseline
+  measured at git 1729f50) — the convergence pin: runtime 165
+  dispatches through the table's bounds check to block32's LOADI
+  #8000 -> PASS 8000 on all four engines. The 676-byte M0->M1
+  delta is the accumulated emission folds on the program's small
+  straight-line body (167 instructions, a 3-instruction loop).
+- Teeth — the fix's two sides (ad hoc, not committed): (a) the
+  UNSOUND chain — guard removed, the same fixture's truncated
+  {101..164} chain fires (64 b.eq) and runtime 165 UDF-faults
+  (rc=1), the exact bug the pin regression-guards; (b) the
+  sound table — guard present, 0 b.eq, PASS 8000 through the
+  bounds check.
+- Row-by-row accounting (gate tables diffed vs the current committed
+  simi_arm.c): **all 86 shared rows byte-identical** — the only
+  simi_arm.c delta is the unconverged guard, provably invisible for
+  every converged program.
+- Four-way parity: 345 PASS, 0 FAIL — all 87 expected-result
+  programs on all four engines (interp 87/87, x86 86/0/3, RV64
+  86/0/3, ARM 86/0/3), each checked against its "Expected result:"
+  comment; the convergence-pin's table path executes at runtime on
+  the ARM engine (PASS 8000 through the bounds check), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged (jmpr_oob still faults via UDF, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted
