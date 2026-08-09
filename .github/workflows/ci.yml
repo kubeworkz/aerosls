@@ -49,12 +49,21 @@ jobs:
       - name: Guard scripts (tests/*_check.sh)
         run: bash tests/run_checks.sh
 
-      # The step above proves the guards pass; this one proves they can
-      # fail. script_conventions_smoke.sh stages three deliberate index
-      # violations (a 100644 .sh, a shebang-less .sh, a CRLF text blob)
-      # and asserts the script_conventions guard exits 1 and names each
-      # one — so a regression that made the guard blind fails CI instead
-      # of sailing through green. It is *smoke.sh*, not *_check.sh, so
-      # run_checks.sh and deploy.sh's guard gate never run it.
+      # The step above proves the guards pass; the smokes prove they can
+      # fail. Each *_smoke.sh deliberately breaks one guard's input and
+      # asserts the guard exits 1 and names the violation — so a
+      # regression that made a guard blind fails CI instead of sailing
+      # through green. All three source-only guards have a smoke now:
+      # script_conventions (index teeth: mode, shebang, CRLF),
+      # makefile_sources (an unbuilt .c and a stale list entry),
+      # commands_doc (the hex-vs-data field bug). They are *smoke.sh*,
+      # not *_check.sh, so run_checks.sh and deploy.sh's guard gate never
+      # run them.
       - name: Script-conventions guard teeth (smoke)
         run: bash tests/script_conventions_smoke.sh
+
+      - name: Makefile-sources guard teeth (smoke)
+        run: bash tests/makefile_sources_smoke.sh
+
+      - name: Commands-doc guard teeth (smoke)
+        run: bash tests/commands_doc_smoke.sh
