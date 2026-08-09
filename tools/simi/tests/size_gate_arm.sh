@@ -992,7 +992,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -1188,6 +1188,24 @@ declare -A M0_BASELINES=(
 # table words. This row's M0 baseline (11364, measured at git 1729f50)
 # differs from M1 (7624) by the 33-candidate chain replacing the
 # runtime table and the accumulated emission folds (-3740).
+# jmpr_chain39 is M2.63: the tracked-register closure ONE PAST its
+# 12-cap — the OVER-cap side of the M2.62 turn-over. The index is
+# chain38's six stages plus an intermediate (r13 = r2 + r6, r1 = r13 +
+# r3) and a 2-way r7 join (narrowed so the COMPLETED image fits the
+# 96-cap): the closure {r1,r13,r3,r2,r6,r7,r4,r5,r11,r12,r8,r9} =
+# exactly TWELVE registers — the scan fills in stream order and the
+# ntr < cap guard blocks the THIRTEENTH (r10), so r5 = r9 + r10 has an
+# UNKNOWN source and r1 collapses to UNKNOWN: no chain, the runtime
+# table (dump: 0 b.eq, cbz bounds-check + br + UDF dispatch, the
+# 350-entry table), PASS 3200 through the bounds check. The turn-over
+# control (REGS=13 ad hoc): r10 tracked, the image completes at 28
+# values <= TX_AR_CHAIN_MAX=96 and the 28-candidate chain fires (dump:
+# 28 b.eq, 0 table words, 5344 vs 6556 bytes) — the same fixture, the
+# chain shape, proving the boundary discriminates. This row's M0
+# baseline (7964, measured at git 1729f50) differs from M1 (6556) by
+# the M2.24 table compaction (32-bit entries, 2-word base) and the
+# accumulated emission folds (-1408) — the table path itself is
+# byte-identical to M0's shape, no chain.
 
 pass=0
 fail=0
