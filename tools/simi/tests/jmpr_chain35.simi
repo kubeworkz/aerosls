@@ -1,0 +1,41 @@
+; jmpr_chain35.simi — M2.59: the fold fixpoint's RETROACTIVE SPLIT, the
+; convergence case the rule-1 comment documents but the corpus never
+; tested ("a fold target landing inside another JMPR's chain, before that
+; JMPR's constant source ... has no dedicated test"). A folded JMPR (A, pc
+; 3) whose target T (pc 5) lands INSIDE another JMPR's chain — B's source
+; LOADI r2 at pc 2, T, then B at pc 6. Pass 1 folds BOTH (no marks yet: the
+; scan reaches pc 5 before any target is marked). The post-pass rule-1 mark
+; on pc 5 then resets the constant map at T in pass 2, killing r2 = 9 —
+; B's constant source is before the split, so B UN-FOLDS. The fold set is
+; monotone-decreasing (a fold only ever dies; marks only ever accrete), so
+; the fixpoint settles in exactly 3 passes: fold A+B, un-fold B, confirm.
+;
+; This is also the M2.58 interaction pin: the fold fixpoint's convergence
+; (its own passes) is separate from the M2.25 walk's 64-iteration cap. The
+; converged state — A folded, B the single dynamic JMPR — feeds the walk:
+; g_alloc = 0, the walk's snapshot at B is {9} (forward-only, one
+; iteration, the M2.58 unconverged guard stays silent), and B emits a
+; 1-candidate inline chain (cmp + b.eq) instead of the runtime table. The
+; teeth: reverting the rule-1 mark (constants flowing through fold
+; targets) keeps B folded -> g_alloc = 1 -> cache mode -> a different,
+; smaller emission, caught by the size-gate row; the four-way parity
+; proves the split path (A -> T -> B -> 9) computes 15 on every engine.
+; Expected result: 15 (r3 = r2+1 = 10 at pc 5; r0 = r3 + r1 = 15 at pc 9)
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #5, i64        ; A's index — folds to pc 5 (T)
+    LOADI r2, #9, i64        ; B's index — set BEFORE A: the runtime path
+                             ; into T is A's dispatch (which skips pc 4), so
+                             ; B's source must precede A to be live at B
+    JMPR r1                  ; A at pc 3 — folds to 5 (non-fall-through fold)
+    ADD r3, r3, #1, i64      ; pc 4 — dead at runtime (A dispatches to 5)
+T:  ADD r3, r2, #1, i64      ; pc 5 — A's fold target, inside B's chain
+                             ; (2 < 5 < 6): the mark resets r2 -> B un-folds
+    JMPR r2                  ; B at pc 6 — dynamic after the split (the walk
+                             ; emits its 1-candidate chain {9})
+    RET                      ; dead path (B dispatches to 9)
+    ADD r0, r0, #0, i64      ; pc 8 — dead filler
+target9:
+    ADD r0, r3, r1, i64      ; pc 9 — r0 = 10 + 5 = 15
+    RET

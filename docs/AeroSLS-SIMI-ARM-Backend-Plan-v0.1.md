@@ -4783,6 +4783,72 @@ program):
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged (jmpr_oob still faults via UDF, rc=1). enc-check clean.
 
+### 10.128 M2.59 — the fold fixpoint's retroactive split pinned, and its interaction with the M2.58 guard (as built)
+
+A pure probe + pin milestone (`simi_arm.c` unchanged). The rule-1
+comment at the fold fixpoint's mark loop documents the RETROACTIVE
+SPLIT — "a fold target landing inside another JMPR's chain, before
+that JMPR's constant source" — but notes the corpus has no dedicated
+test for it. M2.59 constructed it (jmpr_chain35): JMPR A (pc 3,
+index 5) folds to target T = pc 5, which sits INSIDE JMPR B's chain
+(B's source LOADI r2 at pc 2, then T, then B at pc 6). B's index
+source is set BEFORE A on purpose: the runtime path into T is A's
+dispatch (which skips pc 4), so B's source must precede A to be live
+at B — while the ANALYSIS still sees source < T < B, exactly the
+split shape the comment names.
+
+**The convergence.** Pass 1 folds BOTH JMPRs (no target is marked
+when the scan reaches pc 5 — marks land post-pass). The rule-1 mark
+on pc 5 then resets the constant map at T in pass 2, killing r2 = 9
+— B's constant source is before the split — so B UN-FOLDS; pass 3
+confirms (no change). The fold set is monotone-decreasing (a fold
+only ever dies; marks only ever accrete), so the fixpoint settles in
+exactly 3 scans; instrumentation confirmed `passes` converged with
+fold3=5 fold6=-1. The 512-pass safety net stays unreachable (it needs
+the relaxation 2-cycle, which the corpus still cannot construct) —
+consistent with the existing comments.
+
+**The M2.58 interaction.** The converged state — A folded, B the
+single dynamic JMPR — feeds the M2.25 chain walk: g_alloc = 0, the
+walk's snapshot at B is the singleton {9} (the union at the head T
+is {9} from the fall-through carry; the fold edge delivers the same
+set, so the merge is exact), and B emits a 1-candidate inline chain
+(cmp + b.eq -> pc 9, UDF fall-through) instead of the runtime table.
+The fold fixpoint's convergence (its own passes) is separate from
+the walk's 64-iteration cap: the walk here is forward-only — no
+backward edge — so it converges in ONE iteration, and the M2.58
+unconverged guard (changed still true at the cap -> UNKNOWN) stays
+silent. The pin proves the two analyses compose: a fold that takes
+multiple fixpoint passes to settle still hands the walk a converged,
+sound input.
+
+**Teeth.** Four-way parity (runtime 15 on all four engines: A -> T
+-> B -> target9) proves the split path dispatches correctly through
+the chain. The dump pins the emission shape: 1 unconditional branch
+(A's fold, b pc 5), 1 b.eq (B's chain), 1 UDF (chain fall-through),
+0 table words. The control (rule-1 mark disabled ad hoc, not
+committed) keeps B folded -> g_alloc = 1 -> cache mode -> 984 bytes,
+0 b.eq — a different, smaller emission the gate row discriminates.
+
+### 10.129 M2.59 gate results (measured)
+
+Total emitted bytes across the now-83-program parity set: **M0
+200920 → M1 166460, 34460 saved** (≈17.1%). One row added, zero
+moved — `simi_arm.c` is byte-identical to the M2.58 commit (this is
+a pure pin + gate row + doc):
+
+- jmpr_chain35 1240 → 1068 (−172, new 83rd row; M0 baseline
+  measured at git 1729f50) — the retroactive-split pin: A's
+  direct-branch fold, B's 1-candidate chain replacing its runtime
+  table, and the naive-mode frame discipline. Runtime 15 = 10 + 5
+  (r3 = r2+1 at T, r0 = r3+r1 at target9) on all four engines.
+- Row-by-row accounting: **all 87 shared rows byte-identical** —
+  zero simi_arm.c delta, so the gate proves nothing else moved.
+- Four-way parity: 349 PASS, 0 FAIL — all 88 expected-result
+  programs on all four engines (interp 88/88, x86 87/0/3, RV64
+  87/0/3, ARM 87/0/3); the split path (A -> T -> B -> 9) executes
+  at runtime on every engine. enc-check clean.
+
 ---
 
 ## Sources consulted
