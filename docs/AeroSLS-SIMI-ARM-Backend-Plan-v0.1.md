@@ -4574,6 +4574,71 @@ exceeds TX_AR_CHAIN_BIG, impossible under the shipped equal caps):
   documented float/mem skips and the no-expected jmpr_oob are
   unchanged (jmpr_oob still faults via UDF, rc=1). enc-check clean.
 
+### 10.122 M2.56 — the tracked-register closure pinned at its 8-cap (as built)
+
+A boundary pin, no code change: M2.43 raised TX_AR_CHAIN_REGS from 4
+to 8 (chain19 pinned the 5-register closure); this milestone pins the
+NEW turn-over boundary — a closure needing EXACTLY 8 registers, the
+largest the cap admits. The index is built in FOUR stages over joins
+(jmpr_chain32): r4 = r8 + r8 (r8 in {0,10} — the self-add tracks r8
+ONCE, which is what keeps the closure at eight), r2 = r4 + r5 (r5 in
+{0,10,...,50}), r3 = r6 + r7 (r6 in {80,90,100}, r7 in {0,200,400}),
+r1 = r2 + r3 -> THIRTY distinct values {80..170} U {280..370} U
+{480..570} step 10. The closure {r1,r2,...,r8} = EIGHT registers =
+TX_AR_CHAIN_REGS: every feeder is tracked and the 30-pair chain
+fires (the gate: 8*30+4 = 244 < 40 + 4*572 = 2328). Runtime 10 + 10
++ 50 + 100 + 400 = 570 is the LAST of the 30 candidates and takes the
+chain's THIRTIETH b.eq, landing on block29's LOADI #3000 — a
+TRUNCATED image (29 candidates, or one feeder dropped by a closure
+bug) misses 570 and UDF-traps (rc=1): the discriminator.
+Dump-verified: 30 b.eq, 31 br (30 block RETs + 1), 1 udf
+fall-through, 0 table words.
+
+**The turn-over control — a NINTH feeder falls to the table,
+conservatively and correctly.** The closure BFS adds feeders only
+while `ntr < TX_AR_CHAIN_REGS`; a closure needing nine registers
+stops growing at eight, the missing feeder (r9 in the ad-hoc
+control, `ADD r4, r8, r9` instead of `r8 + r8`) is never tracked and
+its set stays UNKNOWN, poisoning r4 -> r2 -> r1 to UNKNOWN — the
+dispatch falls to the naive table. The control (not committed) runs
+its runtime index through the table's bounds check and PASSes its
+expected value with 0 b.eq in the dump: the over-cap side of the
+boundary is sound (conservative, never a wrong chain). This is the
+same exact-or-conservative discipline the cap series has held since
+M2.26.
+
+### 10.123 M2.56 gate results (measured)
+
+Total emitted bytes across the now-80-program parity set: **M0
+187416 → M1 154828, 32588 saved** (≈17.4%). One row added, zero
+moved — **all 84 shared rows byte-identical** (the gate row is
+strictly additive):
+
+- jmpr_chain32 12828 → 8448 (−4380, new 80th row; M0 baseline
+  measured at git 1729f50) — the 8-register-closure boundary pin:
+  runtime 570 -> the chain's thirtieth b.eq -> block29's LOADI
+  #3000 -> PASS 3000 on all four engines. The 4380-byte M0->M1
+  delta is the accumulated emission folds on the program's large
+  straight-line body (572 instructions).
+- Teeth — the turn-over sides (ad hoc, not committed): (a) the pin
+  itself discriminates truncation at runtime (570 is the last of
+  30 candidates; a 29-candidate chain UDF-traps) and in the dump
+  (30 b.eq, 0 table words); (b) the NINTH-feeder control (r4 = r8
+  + r9, closure needs 9 > 8) — 0 b.eq, the table dispatch, PASSes
+  its expected value through the bounds check (conservative and
+  correct).
+- Row-by-row accounting (gate tables diffed vs the current committed
+  simi_arm.c): **all 84 shared rows byte-identical** — strictly
+  additive; simi_arm.c is UNCHANGED in M2.56 (a pure pin + gate
+  row + doc).
+- Four-way parity: 337 PASS, 0 FAIL — all 85 expected-result
+  programs on all four engines (interp 85/85, x86 84/0/3, RV64
+  84/0/3, ARM 84/0/3), each checked against its "Expected result:"
+  comment; the boundary-pin chain executes at runtime on the ARM
+  engine (PASS 3000 through the chain's thirtieth b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged (jmpr_oob still faults via UDF, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted
