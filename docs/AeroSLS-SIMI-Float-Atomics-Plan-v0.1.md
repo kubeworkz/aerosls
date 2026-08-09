@@ -125,8 +125,12 @@ cache for a pure constant).
 - **F3 — LANDED** — unskip `float_ops` on ARM: four-way parity (interp / x86 /
   RV64-skip / ARM), enc-check clean, gate re-measure, doc §16 Phase 10
   addendum (A64 landed).
-- **F4 (deferred, rides Phase 9)** — RV64 float codegen per Phase 10 D6 (the
-  `sstatus.FS` lazy-save mechanism), a separate later pass, not this plan's work.
+- **F4 — LANDED** — RV64 float codegen: the F/D GP-bounce in
+  `simi_riscv.c` (fmv-d/x moves, fadd/fsub/fmul/fdiv, feq/flt/fle, the
+  sign-XOR NEG), `rv64_exec.c` F/D decode + f file, un-skip `float_ops`
+  on the RV64 runner, four-way float parity (interp / x86 / RV64 /
+  ARM all 15). The kernel-side `sstatus.FS` lazy-save (saving f0-f31
+  across context switches) remains Phase 9's RISC-V kernel wiring.
 
 ### 3.1 F0 status — LANDED (a64_exec.c float decode+execute)
 
@@ -288,6 +292,68 @@ has a genuine four-way execution parity. The evidence, all measured:
   next to the x86/interpreter findings: the GP-bounce, the sign-XOR
   NEG, the D5 swapped-operand CMP, the two permanent rejection
   boundaries, and the four-engine parity numbers.
+
+### 3.5 F4 status — LANDED (RV64 F/D codegen; four-way float parity complete)
+
+F4 is done: `simi_riscv.c` emits the scalar F/D GP-bounce, `rv64_exec.c`
+decodes and executes it against a new f file, and `float_ops` runs on the
+RV64 engine — the four-way float parity (interp / x86 / RV64 / ARM) is
+now complete on every engine. The evidence, all measured:
+
+- **The codegen (GP-bounce)** — same choice x86 (XMM0/XMM1) and A64
+  (d0/d1) made: operand bits arrive in the integer scratch regs t0/t1,
+  bounce into f10/f11 (`fmv.d.x` / `fmv.w.x`), compute with the real
+  F/D instruction (`fadd`/`fsub`/`fmul`/`fdiv`, d and s forms), bounce
+  back (`fmv.x.d`). f32 results go through `fmv.x.w` then a
+  `slli`/`srli` zero-extend, because FMV.X.W sign-extends per the
+  RV64 ABI convention while SIMI's f32 convention is high-32-zeroed
+  (the interpreter's raw-bits contract). `NEG` is a pure sign-bit XOR
+  through the integer cache (the x86/A64 finding). `CMP` maps 1:1 onto
+  `feq`/`flt`/`fle` — which RETURN an integer 0/1 with exactly the
+  IEEE-754 unordered semantics the interpreter's C operators give:
+  feq is 0 for NaN, flt/fle are 0 for any unordered pair; GT/GE swap
+  the operands, NE is feq then xori 1. `rv64_exec.c` gains the f file
+  and the OP-FP (0x53) decode: the arithmetic/compare subset with the
+  D-vs-S fmt bit, and the four fmv moves (FMV.X.W sign-extending per
+  spec).
+- **Two latent sign-extension bugs found by the F4 tooth, one on each
+  of the two targets** — the interpreter, x86, and the RV64 translator
+  all zero-extend f32 loads (raw-bits convention), but `simi_riscv.c`'s
+  `load_typed` mapped T_F32 to `i_lw` (SIGN-extends) and `simi_arm.c`'s
+  three load forms (scaled/unscaled/register-offset) mapped T_F32 to
+  LDRSW/LDURSW/LDRSW-reg (also sign-extending). Both were invisible
+  because `float_ops` never LOADs an f32 from memory (only LOADI64 +
+  arithmetic + CMP); a new f32 store→load→raw-bits tooth (negative
+  -3.5f32, checked as i64 against 0x00000000C0600000, plus NEG-after-
+  load) exposed both. Fixed: RV64 T_F32 → `i_lwu`, ARM T_F32 → the
+  zero-extending `ldr w`/`ldur w`/`ldr w, reg` forms — one word for
+  one word, so no existing program's emission changes. (The tooth's
+  first draft failed on every engine including the interpreter — the
+  expected constant was wrong, 3224371200 vs the true 3227516928 =
+  0xC0600000; the engines were all correct, exactly the false alarm
+  the cross-check isolates.)
+- **The un-skip** — `run_riscv_tests.sh` removes the A0-era skip
+  block; `float_ops` now RUNS on the RV64 engine through
+  `simi-riscv-verify`: **float_ops = 15 at 2380 bytes** of RV64 code.
+- **The four-way float parity** — interp 15, x86 15 (2426 bytes),
+  RV64 15 (2380 bytes), ARM 15 (2156 bytes) — every arithmetic result,
+  relation, and the three NaN unordered-compare cases bit-identical
+  across all four engines. The f32-load tooth: 2/2/2/2.
+- **The rejection teeth** — float MOD, FLAG_IMM + float arithmetic,
+  and unsigned float CMP relations all reject cleanly at translate
+  time on every native translator (the ARM strerror's stale
+  "scoped out of M0" message was updated to match x86/RV64's
+  "operand combination has no float meaning (immediate operand, or
+  float MOD)").
+- **No regression** — interp 81/81, x86 native 80/80, RV64 **80/80**
+  (+1, float_ops now runs), ARM 80/80, size gate byte-identical
+  (80/80, 26472 saved — the f32-load fixes are word-for-word), enc-
+  check clean (24 OK / 0 MISMATCH), a64-f0-test PASS.
+- **Kernel side** — `kernel/simi_riscv.c` mirrors the body changes
+  byte-identical below its differing header. The remaining kernel
+  work is the `sstatus.FS` lazy-save (saving f0-f31 across context
+  switches, the `lazy_vector.c` twin) — Phase 9's RISC-V kernel
+  wiring, honestly out of this tools-side pass.
 
 ## 4. Honest verification caveats
 
@@ -620,9 +686,9 @@ four engines. The evidence, all measured:
 ## 9. Sequencing note
 
 Both parts are independent of each other and of the in-flight M2.x chain work.
-Part I's F0–F3 can proceed immediately in this workspace (all tooling exists; the
+Part I's F0–F4 can proceed immediately in this workspace (all tooling exists; the
 m0 worktree, gate, parity harness, and enc-check are all in place). Part II's
-A0–A3 likewise. F4 (RV64 float) and A4 (ordering bits) are deferred by their own
-scoping, not by this plan. The one cross-cutting rule from Phase 10 D1 carries
+A0–A3 likewise. A4 (ordering bits) remains deferred by its own scoping, not by
+this plan. The one cross-cutting rule from Phase 10 D1 carries
 through both parts: **no ISA format surgery** — the type tags, opcode slots
 (225 free), and flags bits (3 free) already reserve everything both parts need.

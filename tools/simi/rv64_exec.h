@@ -10,8 +10,12 @@
  *
  * So: this is a small, purpose-built RV64 instruction decoder+executor,
  * covering exactly the encodings simi_riscv.c emits (not a general RISC-V
- * simulator — no CSRs, no FP, no atomics, no compressed instructions, no
- * traps). It exists for the same reason simi_interp.c (Phase 1) exists:
+ * simulator — no CSRs, no vector, no compressed instructions, no traps).
+ * Gap Remediation SIMI Phase 10 (F4) adds the scalar F/D subset the
+ * float codegen emits (fadd/fsub/fmul/fdiv, feq/flt/fle, the four
+ * fmv.x.d/fmv.d.x/fmv.x.w/fmv.w.x moves — see the OP-FP case below),
+ * with a full 32-register f file. It exists for the same reason
+ * simi_interp.c (Phase 1) exists:
  * an independently-written reference that actually executes the encoded
  * bytes, so a bit-packing mistake in the encoder shows up as a wrong
  * answer instead of passing silent review. See
@@ -90,6 +94,7 @@ void rv64_exec_set_hostfn(int idx, RvHostFn fn);
 
 struct RvCpu {
     uint64_t x[32];     /* x0 is architecturally hardwired to zero; this executor enforces that on every write */
+    uint64_t f[32];     /* F/D file (Gap Remediation SIMI Phase 10, F4) — f32 ops use the low 32 bits */
     uint64_t pc;
     uint8_t* mem;
     uint32_t mem_size;

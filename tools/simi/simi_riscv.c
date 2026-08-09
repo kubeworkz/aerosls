@@ -50,6 +50,24 @@
  *     way there was on x86 (§8 Q2) — register-based comparison is simply
  *     how RV64 works natively, SIMI's design principle #2 (no implicit
  *     machine state) costs nothing extra on this target.
+ *   - Gap Remediation SIMI Phase 10 (F4) adds float: the GP-bounce.
+ *     Float-typed ADD/SUB/MUL/DIV/CMP bounce the operand bits from the
+ *     integer scratch regs into f10/f11 (fmv.d.x / fmv.w.x), compute
+ *     with the real F/D instruction, and bounce back (fmv.x.d; f32
+ *     results go through fmv.x.w + slli/srli, because FMV.X.W
+ *     sign-extends per the RV64 ABI convention while SIMI's f32
+ *     convention is high-32-zeroed — the interpreter's raw-bits
+ *     contract). NEG is a pure sign-bit XOR through the integer cache
+ *     (no FP instruction), exactly the x86/A64 finding. CMP's float
+ *     relations map 1:1 onto feq/flt/fle, which RETURN an integer 0/1
+ *     with correct IEEE-754 unordered semantics for NaN by construction
+ *     — no flags register to fuse. float MOD stays rejected (no
+ *     hardware float-remainder instruction on any target); FLAG_IMM +
+ *     float and the unsigned CMP relations are rejected too, mirroring
+ *     x86. The f10/f11 scratch pair is this file's ONLY f-file use; on
+ *     real RV64 hardware the kernel's context switch must save/restore
+ *     the f file (the sstatus.FS lazy-save twin of lazy_vector.c —
+ *     Phase 9's RISC-V kernel wiring, not this tools-side pass).
  *
  *   - v0.3 (Phase 7) adds the capability-tag region: a second, TX_RV_MAX_
  *     REGS-byte block sits directly below (more negative than) the
@@ -131,6 +149,13 @@ static int32_t  w_imm28(uint64_t w) {
                       * runtime call crosses the loop, so a1 stays live —
                       * the "t0-t2 exclusively" note above gets exactly this
                       * one documented exception. */
+#define FT0   10   /* Gap Remediation SIMI Phase 10 (F4): the two compute
+                    * scratch F registers for the GP-bounce float codegen —
+                    * this file's ONLY f-file use (no other codegen path
+                    * touches it). f10/f11 are the F-ABI a0/a1, irrelevant
+                    * here since no emitted code ever runs on a real FPU
+                    * in this sandbox (rv64_exec.c models the f file). */
+#define FT1   11
 
 /* ─── Code buffer ─────────────────────────────────────────────────────── */
 struct CodeBuf { uint8_t* buf; uint32_t cap; uint32_t len; int overflow; };
@@ -190,6 +215,7 @@ static uint32_t enc_j(int32_t imm21, uint8_t rd, uint8_t opcode) {
 #define OPC_JALR    0x67u
 #define OPC_JAL     0x6Fu
 #define OPC_AUIPC   0x17u
+#define OPC_FP      0x53u   /* Gap Remediation SIMI Phase 10 (F4): OP-FP, the F/D extension */
 
 static void i_addi (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, int32_t imm) { e32(cb, enc_i(imm, rs1, 0x0, rd, OPC_OPIMM)); }
 static void i_xori  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, int32_t imm) { e32(cb, enc_i(imm, rs1, 0x4, rd, OPC_OPIMM)); }
@@ -242,6 +268,31 @@ static void i_jalr  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, int32_t imm) {
 static void amo_lr  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, int is_d) { e32(cb, (0x02u<<27)|(1u<<26)|(1u<<25)|((uint32_t)rs1<<15)|((uint32_t)(is_d?3:2)<<12)|((uint32_t)rd<<7)|0x2Fu); }
 static void amo_sc  (struct CodeBuf* cb, uint8_t rd, uint8_t rs2, uint8_t rs1, int is_d) { e32(cb, (0x03u<<27)|(1u<<26)|(1u<<25)|((uint32_t)rs2<<20)|((uint32_t)rs1<<15)|((uint32_t)(is_d?3:2)<<12)|((uint32_t)rd<<7)|0x2Fu); }
 static void amo_add (struct CodeBuf* cb, uint8_t rd, uint8_t rs2, uint8_t rs1, int is_d) { e32(cb, (0x00u<<27)|(1u<<26)|(1u<<25)|((uint32_t)rs2<<20)|((uint32_t)rs1<<15)|((uint32_t)(is_d?3:2)<<12)|((uint32_t)rd<<7)|0x2Fu); }
+/* Gap Remediation SIMI Phase 10 (F4): the scalar F/D encodings the float
+ * codegen emits — OP-FP, same R-type layout as integer OP, so enc_r() is
+ * reused directly. Arithmetic: funct7 = 0000<op:2>0<fmt>, fmt bit 0 (0 =
+ * S, 1 = D). Compares: funct7 101000<fmt>, funct3 000=fle 001=flt
+ * 010=feq, result in an INTEGER register. Moves: FMV.X.W/FMV.X.D move
+ * F->X (W sign-extends per the spec), FMV.W.X/FMV.D.X move X->F (low 32
+ * bits only for W). */
+static void f_fadd_d (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x01,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fadd_s (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x00,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fsub_d (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x05,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fsub_s (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x04,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fmul_d (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x09,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fmul_s (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x08,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fdiv_d (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x0D,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fdiv_s (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x0C,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_feq_d  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x51,rs2,rs1,0x2,rd,OPC_FP)); }
+static void f_feq_s  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x50,rs2,rs1,0x2,rd,OPC_FP)); }
+static void f_flt_d  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x51,rs2,rs1,0x1,rd,OPC_FP)); }
+static void f_flt_s  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x50,rs2,rs1,0x1,rd,OPC_FP)); }
+static void f_fle_d  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x51,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fle_s  (struct CodeBuf* cb, uint8_t rd, uint8_t rs1, uint8_t rs2) { e32(cb, enc_r(0x50,rs2,rs1,0x0,rd,OPC_FP)); }
+static void f_fmv_x_d(struct CodeBuf* cb, uint8_t rd, uint8_t rs1) { e32(cb, enc_r(0x71,0,rs1,0x0,rd,OPC_FP)); }
+static void f_fmv_d_x(struct CodeBuf* cb, uint8_t rd, uint8_t rs1) { e32(cb, enc_r(0x79,0,rs1,0x0,rd,OPC_FP)); }
+static void f_fmv_x_w(struct CodeBuf* cb, uint8_t rd, uint8_t rs1) { e32(cb, enc_r(0x70,0,rs1,0x0,rd,OPC_FP)); }
+static void f_fmv_w_x(struct CodeBuf* cb, uint8_t rd, uint8_t rs1) { e32(cb, enc_r(0x78,0,rs1,0x0,rd,OPC_FP)); }
 
 /* ─── Symbolic register slot helpers: reg i lives at [s0 - 8*(i+1) - 16] ──
  * Direct RV64 analog of simi_x86.c's rbp-relative reg_disp/ld_rax/st_rax,
@@ -501,7 +552,8 @@ static void load_typed(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rs1) {
         case T_U8:  case T_BOOL: i_lbu(cb, rd, rs1, 0); break;
         case T_I16: i_lh (cb, rd, rs1, 0); break;
         case T_U16: i_lhu(cb, rd, rs1, 0); break;
-        case T_I32: case T_F32: i_lw (cb, rd, rs1, 0); break;
+        case T_I32: i_lw (cb, rd, rs1, 0); break;
+        case T_F32: i_lwu(cb, rd, rs1, 0); break;  /* F4: f32 loads zero-extend (the interpreter's raw-bits convention) — LW would sign-extend negative floats */
         case T_U32: i_lwu(cb, rd, rs1, 0); break;
         default:    i_ld (cb, rd, rs1, 0); break;   /* i64/u64/f64/ptr */
     }
@@ -648,21 +700,51 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
          op==OP_OR||op==OP_XOR||op==OP_SHL||op==OP_SHR||op==OP_SAR||op==OP_CMP||
          op==OP_PTRADD||op==OP_CAS||op==OP_ATOMIC_ADD) && !(flags & FLAG_IMM) && w_rb_reg(w) >= TX_RV_MAX_REGS)
         return TX_RV_ERR_REG_OUT_OF_RANGE;
-    /* Gap Remediation SIMI Phase 10: this translator has no float codegen
-     * at all (scoped out of v1 -- see TX_RV_ERR_FLOAT_UNSUPPORTED's
-     * comment in simi_riscv.h). Every opcode below that would have float
-     * meaning on x86 (ADD/SUB/MUL/DIV/MOD/NEG/CMP) must reject T_F32/
-     * T_F64 explicitly here, up front, rather than falling into codegen
-     * that reads the slot as a plain 64-bit integer and silently produces
-     * a wrong answer on real IEEE bit patterns. */
-    if ((type==T_F64 || type==T_F32) &&
-        (op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV||op==OP_MOD||
-         op==OP_NEG||op==OP_CMP))
-        return TX_RV_ERR_FLOAT_UNSUPPORTED;
-
+    /* Gap Remediation SIMI Phase 10 (F4): float is now REAL here —
+     * ADD/SUB/MUL/DIV/NEG/CMP dispatch on T_F32/T_F64 in their cases
+     * below (the GP-bounce). The remaining rejections are the same
+     * permanent scopes as x86: float MOD (no hardware float-remainder
+     * instruction on any target), FLAG_IMM + float arithmetic (no
+     * immediate FP form in v1), and the unsigned CMP relations on
+     * floats (meaningless — caught in OP_CMP). Everything else under a
+     * float type — LOADI64/LOAD/STORE/MOV — is the plain integer-width
+     * path: the float value is just the slot's bits (load_typed
+     * zero-extends f32 loads per the raw-bits convention). */
     switch (op) {
     case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR:
     case OP_MUL: case OP_SHL: case OP_SHR: case OP_SAR: {
+        /* Gap Remediation SIMI Phase 10 (F4): ADD/SUB/MUL under float
+         * types — the GP-bounce (x86's XMM0/XMM1-bounce choice, A64's
+         * d0/d1-bounce): operand bits in t0/t1, fmv into f10/f11, real
+         * F/D arithmetic, fmv back. f32 results pass through fmv.x.w
+         * (which SIGN-extends per the RV64 ABI convention) then a
+         * slli/srli zero-extend, because SIMI's f32 convention is
+         * high-32-zeroed (the interpreter's raw-bits contract). */
+        if ((op==OP_ADD||op==OP_SUB||op==OP_MUL) && (type==T_F64||type==T_F32)) {
+            if (flags & FLAG_IMM) return TX_RV_ERR_FLOAT_UNSUPPORTED;
+            ld_slot(cb, X_T0, ra);
+            ld_slot(cb, X_T1, w_rb_reg(w));
+            if (type == T_F64) {
+                f_fmv_d_x(cb, FT0, X_T0); f_fmv_d_x(cb, FT1, X_T1);
+                switch (op) {
+                    case OP_ADD: f_fadd_d(cb, FT0, FT0, FT1); break;
+                    case OP_SUB: f_fsub_d(cb, FT0, FT0, FT1); break;
+                    default:     f_fmul_d(cb, FT0, FT0, FT1); break;
+                }
+                f_fmv_x_d(cb, X_T0, FT0);
+            } else {
+                f_fmv_w_x(cb, FT0, X_T0); f_fmv_w_x(cb, FT1, X_T1);
+                switch (op) {
+                    case OP_ADD: f_fadd_s(cb, FT0, FT0, FT1); break;
+                    case OP_SUB: f_fsub_s(cb, FT0, FT0, FT1); break;
+                    default:     f_fmul_s(cb, FT0, FT0, FT1); break;
+                }
+                f_fmv_x_w(cb, X_T0, FT0);
+                i_slli(cb, X_T0, X_T0, 32); i_srli(cb, X_T0, X_T0, 32);
+            }
+            st_slot_untag(cb, X_T0, rd);
+            break;
+        }
         ld_slot(cb, X_T0, ra);
         if (flags & FLAG_IMM) { if (!emit_li64(cb, X_T1, (uint64_t)(int64_t)w_imm28(w))) return TX_RV_ERR_TOO_MANY_LITERALS; }
         else                  ld_slot(cb, X_T1, w_rb_reg(w));
@@ -681,6 +763,28 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_DIV: case OP_MOD: {
+        /* Gap Remediation SIMI Phase 10 (F4): float DIV is real (IEEE
+         * div-by-zero is a defined result — signed infinity/NaN, no
+         * trap); float MOD stays rejected permanently, matching x86 (no
+         * hardware float remainder on any target — compose DIV+MUL+SUB). */
+        if (type==T_F64 || type==T_F32) {
+            if (op == OP_MOD) return TX_RV_ERR_FLOAT_UNSUPPORTED;
+            if (flags & FLAG_IMM) return TX_RV_ERR_FLOAT_UNSUPPORTED;
+            ld_slot(cb, X_T0, ra);
+            ld_slot(cb, X_T1, w_rb_reg(w));
+            if (type == T_F64) {
+                f_fmv_d_x(cb, FT0, X_T0); f_fmv_d_x(cb, FT1, X_T1);
+                f_fdiv_d(cb, FT0, FT0, FT1);
+                f_fmv_x_d(cb, X_T0, FT0);
+            } else {
+                f_fmv_w_x(cb, FT0, X_T0); f_fmv_w_x(cb, FT1, X_T1);
+                f_fdiv_s(cb, FT0, FT0, FT1);
+                f_fmv_x_w(cb, X_T0, FT0);
+                i_slli(cb, X_T0, X_T0, 32); i_srli(cb, X_T0, X_T0, 32);
+            }
+            st_slot_untag(cb, X_T0, rd);
+            break;
+        }
         ld_slot(cb, X_T0, ra);
         if (flags & FLAG_IMM) { if (!emit_li64(cb, X_T1, (uint64_t)(int64_t)w_imm28(w))) return TX_RV_ERR_TOO_MANY_LITERALS; }
         else                  ld_slot(cb, X_T1, w_rb_reg(w));
@@ -691,7 +795,21 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         break;
     }
     case OP_NOT: ld_slot(cb,X_T0,ra); i_xori(cb,X_T0,X_T0,-1); st_slot_untag(cb,X_T0,rd); break;
-    case OP_NEG: ld_slot(cb,X_T0,ra); r_sub(cb,X_T0,X_ZERO,X_T0); st_slot_untag(cb,X_T0,rd); break;
+    case OP_NEG:
+        /* Gap Remediation SIMI Phase 10 (F4): float NEG is a pure
+         * sign-bit flip — XOR the slot against a sign-mask constant
+         * through the integer cache, no F instruction (the x86/A64
+         * finding). f32's 0x80000000 constant is loaded zero-extended
+         * via the literal pool, so the XOR flips bit 31 only and leaves
+         * the (already zero per the convention) high 32 alone. */
+        if (type == T_F64 || type == T_F32) {
+            ld_slot(cb, X_T0, ra);
+            if (!emit_li64(cb, X_T1, (type == T_F64) ? 0x8000000000000000ull : 0x80000000ull)) return TX_RV_ERR_TOO_MANY_LITERALS;
+            r_xor(cb, X_T0, X_T0, X_T1);
+            st_slot_untag(cb, X_T0, rd);
+            break;
+        }
+        ld_slot(cb,X_T0,ra); r_sub(cb,X_T0,X_ZERO,X_T0); st_slot_untag(cb,X_T0,rd); break;
     case OP_MOV:
         /* v0.3 (Phase 7): the one opcode besides RESOLVE that can produce
          * a tagged register — propagating an existing capability is still
@@ -706,6 +824,44 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     case OP_LOADI64:
         return TX_RV_ERR_BAD_OPCODE; /* unreachable: handled specially in translate(), needs literal pool value */
     case OP_CMP: {
+        /* Gap Remediation SIMI Phase 10 (F4): float CMP — feq/flt/fle
+         * RETURN an integer 0/1 with exactly the IEEE-754 unordered
+         * semantics the interpreter's C operators give: feq is 0 for NaN,
+         * flt/fle are 0 for any unordered pair. LT/LE/GT/GE map 1:1 (GT
+         * and GE swap the operands — flt/fle of b against a); NE is feq
+         * then xori 1 (IEEE defines != as the exact negation of ==,
+         * including NaN). Unsigned relations (REL_LTU and up) have no
+         * float meaning — rejected like x86. */
+        if (type == T_F64 || type == T_F32) {
+            if (flags >= REL_LTU) return TX_RV_ERR_BAD_OPCODE;
+            ld_slot(cb, X_T0, ra);
+            ld_slot(cb, X_T1, w_rb_reg(w));
+            if (type == T_F64) {
+                f_fmv_d_x(cb, FT0, X_T0); f_fmv_d_x(cb, FT1, X_T1);
+                switch (flags) {
+                    case REL_EQ: f_feq_d(cb, X_T0, FT0, FT1); break;
+                    case REL_NE: f_feq_d(cb, X_T0, FT0, FT1); i_xori(cb, X_T0, X_T0, 1); break;
+                    case REL_LT: f_flt_d(cb, X_T0, FT0, FT1); break;
+                    case REL_LE: f_fle_d(cb, X_T0, FT0, FT1); break;
+                    case REL_GT: f_flt_d(cb, X_T0, FT1, FT0); break;
+                    case REL_GE: f_fle_d(cb, X_T0, FT1, FT0); break;
+                    default: return TX_RV_ERR_BAD_OPCODE;
+                }
+            } else {
+                f_fmv_w_x(cb, FT0, X_T0); f_fmv_w_x(cb, FT1, X_T1);
+                switch (flags) {
+                    case REL_EQ: f_feq_s(cb, X_T0, FT0, FT1); break;
+                    case REL_NE: f_feq_s(cb, X_T0, FT0, FT1); i_xori(cb, X_T0, X_T0, 1); break;
+                    case REL_LT: f_flt_s(cb, X_T0, FT0, FT1); break;
+                    case REL_LE: f_fle_s(cb, X_T0, FT0, FT1); break;
+                    case REL_GT: f_flt_s(cb, X_T0, FT1, FT0); break;
+                    case REL_GE: f_fle_s(cb, X_T0, FT1, FT0); break;
+                    default: return TX_RV_ERR_BAD_OPCODE;
+                }
+            }
+            st_slot_untag(cb, X_T0, rd);
+            break;
+        }
         ld_slot(cb, X_T0, ra);
         ld_slot(cb, X_T1, w_rb_reg(w));
         if (flags >= 10 || !emit_cmp(cb, flags)) return TX_RV_ERR_BAD_OPCODE;
@@ -1066,7 +1222,7 @@ const char* simi_riscv_strerror(int code) {
         case TX_RV_ERR_TOO_MANY_LITERALS: return "too many 64-bit constants for the literal pool";
         case TX_RV_ERR_BRANCH_OUT_OF_RANGE: return "branch/call target exceeds JAL/BEQ/BNE encodable range";
         case TX_RV_ERR_NAME_OUT_OF_RANGE: return "RESOLVE name-pool index out of range";
-        case TX_RV_ERR_FLOAT_UNSUPPORTED: return "float (T_F32/T_F64) not supported by the RV64 translator (scoped out of Phase 10 v1)";
+        case TX_RV_ERR_FLOAT_UNSUPPORTED: return "operand combination has no float meaning (immediate operand, or float MOD)";
         default: return "unknown error";
     }
 }
