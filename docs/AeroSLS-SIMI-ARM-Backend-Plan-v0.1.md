@@ -5927,6 +5927,52 @@ Changed: bench_exec_rv64.c (new), bench_baselines_rv64.h (the
 ns_per_call column), the Makefile (bench-exec-rv64 target in
 `all`/`clean`) and .gitignore.
 
+### 10.166 M2.78 — the cross-ISA execution-work report, A64 vs RV64 pinned (as built)
+
+The measurement series' derived view: cross_isa.c is a small tool over
+the two COMMITTED step tables — bench_baselines.h (A64) and
+bench_baselines_rv64.h — whose counts are already pinned EXACTLY by the
+parity tripwires (simi-arm-verify --steps, simi-riscv-verify --steps).
+It does no execution and no timing of its own: pure header computation,
+deterministic and instant, in `all` so the two tables stay honest on
+every build. It prints the per-fixture A64-vs-RV64 executed-instruction
+ratio table sorted by ratio (so the codegen-density extremes are
+visible), the totals and the aggregate ratio, and asserts two gates a
+single-ISA check cannot see:
+
+- **No orphan rows** — every fixture must have a committed count in
+  BOTH tables. A row in one table missing from the other (or a
+  fixture-set mismatch) FAILS: adding a fixture to one ISA's baselines
+  and not the other's is a deliberate-update error.
+- **The aggregate ratio within a +/-25% band** around the measured
+  value. A codegen change that rebalances the two ISAs' instruction
+  mixes (a fold that saves A64 steps but not RV64 steps, or vice
+  versa) moves it; the band tolerates deliberate divergence while
+  failing gross drift.
+
+**The pinned number (measured 2026-08-09): aggregate ratio 1.0674** —
+A64 executes 35032 instructions across the corpus vs RV64's 32820, so
+the A64 codegen is ~6.7% instruction-heavier overall. The per-fixture
+extremes: mem_pre.simi is the most RV64-heavy (0.874 — the A64
+pre-indexed address fold is one instruction where RV64 needs a longer
+address computation) and jmpr_chain37.simi the most A64-heavy (1.486 —
+the M2.x chain/fold machinery's per-dispatch A64 instruction count is
+higher); the jmpr_chain* fixtures cluster at the A64-heavy end.
+
+### 10.167 M2.78 gate results (measured)
+
+cross-isa: **96 paired fixtures, aggregate ratio 1.0674 within the
+committed band — ALL CHECKS PASSED**. Teeth: commenting out add.simi's
+A64 row fails "orphan RV64 row: add.simi has no A64 baseline" plus the
+fixture-set mismatch; moving the committed ratio constant to 1.5 fails
+"aggregate ratio 1.0674 outside committed band [1.1250, 1.8750]"; both
+reverted to PASS. Emission untouched (no simi_arm.c change), so the
+size gate stays **96/96, 46224 saved, all rows byte-identical**;
+four-way parity interp 97/97, x86/RV64/ARM 96/0/3; all five `all`
+checks (bench-net, bench-corpus, bench-exec, bench-exec-rv64,
+cross-isa) PASS. Changed: cross_isa.c (new), the Makefile (cross-isa
+target in `all`/`clean`) and .gitignore.
+
 ---
 
 ## Sources consulted

@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -116,6 +116,18 @@ bench-exec-rv64: simi-asm bench_exec_rv64.c simi_riscv.c simi_riscv.h rv64_exec.
 	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
 	./bench-exec-rv64 tests/*.simi 500
 
+# M2.78: cross-ISA execution-work report — the derived view over the
+# committed A64/RV64 per-fixture step counts (both pinned exactly by the
+# parity tripwires): per-fixture ratios sorted by density, the aggregate
+# ratio, and two consistency gates (no orphan rows across the two tables;
+# the aggregate ratio within a +/-25% committed band around the measured
+# 1.0674). Pure header computation — no execution, instant. In `all` so
+# the two tables stay honest on every build (see cross_isa.c's top
+# comment and plan doc §10.166/10.167).
+cross-isa: cross_isa.c bench_baselines.h bench_baselines_rv64.h
+	$(CC) $(CFLAGS) -o $@ cross_isa.c
+	./cross-isa
+
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top
 # comment). simi_arm.c can't emit float yet (F1) — this proves the
@@ -164,6 +176,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa clean
