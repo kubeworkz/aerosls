@@ -5102,6 +5102,75 @@ all 90 shared rows are byte-identical; the pin changes nothing:
   runtime on every engine. enc-check clean, a64-f0 PASS, stress
   all-green.
 
+### 10.138 M2.64 — the deferred-record pool raised to its 96-cap (as built)
+
+M2.64 completes the EQUAL-CAPS regression's third dimension:
+TX_AR_CHAIN_DEFS (the deferred-record pool) raised 64 → 96 to match
+MAX and BIG (M2.61 did the set caps, M2.62 the register closure).
+The code change is the one `#define` plus this milestone's comment.
+
+The honest finding first: **at equal caps the deferred-record
+machinery is observationally conservative, so the bump is a pure
+ceiling.** Instrumenting the dispatch captured the current state:
+jmpr_chain33 (the M2.57 64-record pin) is now **flat** — `ndef = 0`,
+its 80-value root stays flat at MAX = 96 and never touches the pool
+(the M2.61 MAX bump moved that boundary; the M2.57 "64-record DAG"
+comment is a fossil). jmpr_chain30 (100-value index) is the ONLY
+corpus program that creates a record (`ndef = 1`), and its
+materialization collapses conservatively: a root product whose true
+set exceeds 96 DEFERS (record 0), and its materialization at the
+BIG store overflows chain_merge_big → UNKNOWN — the exact-or-
+conservative discipline, never a truncated set. So the pool bounds
+only DAG depth, and nothing below the cap moves.
+
+**The pin (jmpr_chain40).** A DAG needing EXACTLY 96 records: the
+root product r1 = r2 + r3 (r2 in {0,10,…,90} — 10 arms, r3 in
+{0..9} — 10 arms → ALL 100 values {0..99} distinct, > MAX 96)
+overflows the image merge cap and defers (record 0), then **95
+in-place ADDs** r1 = r1 + r4 (r4 = {2}, a flat singleton; the
+closure {r1,r2,r3,r4} = 4 ≤ REGS) each defer as record k =
+op(rec(k-1), slot r4) — **96 records = TX_AR_CHAIN_DEFS exactly**
+(instrumented: `ndef = 96`, r1's def = 95 at the dispatch). The
+materialization of the 100-value root collapses conservatively, so
+the dispatch is the TABLE — 0 b.eq — and runtime **289** (the
+fall-through arms 90 + 9 plus 95×2, the **hundredth** value of the
+true set {190..289}) passes the bounds check to block0 at pc 289 →
+LOADI #7777 → PASS on all four engines. The discriminator is
+soundness-shaped: any truncated materialization (96, 97, 98, or 99
+candidates) would miss 289 and UDF-trap (rc=1) — the four-way PASS
+proves the collapse is exact, not truncated.
+
+**The boundary control (DEFS=95, ad hoc, reverted).** The 96th
+allocation returns -1 (pool exhausted), r1 falls to FLAT UNKNOWN at
+the walk, and the dispatch is the table again — the SAME 6324-byte
+emission, a DIFFERENT mechanism (walk-state UNKNOWN vs
+materialization collapse), proven by the walk state (`ndef = 95` vs
+96). Reverting restored the shipped emission byte-identically.
+
+### 10.139 M2.64 gate results (measured)
+
+Total emitted bytes across the now-93-program parity set: **M0
+238284 → M1 194644, 43640 saved**. One row added, **zero moved** —
+the totals delta is EXACTLY chain40's row (M0 +7508, M1 +6324), so
+all 92 shared rows are byte-identical; the DEFS bump is a pure
+ceiling (chain30's single record and every other program's walk are
+unchanged):
+
+- jmpr_chain40 7508 → 6324 (−1184, new 92nd row; M0 baseline
+  measured at git 1729f50) — the 96-record pool pin: the table
+  path itself is byte-identical to M0's shape (no chain — the
+  over-cap DAG collapses conservatively); the −1184 is M2.24's
+  table compaction (32-bit entries, 2-word base) plus the
+  accumulated emission folds, on a 294-instruction body.
+- Row-by-row accounting: **all 92 shared rows byte-identical** —
+  the gate total moved by exactly chain40's M1.
+- Four-way parity: 369 PASS, 0 FAIL — all 93 expected-result
+  programs on all four engines (interp 93/93, x86 92/0/3, RV64
+  92/0/3, ARM 92/0/3); chain40's table dispatch executes at
+  runtime on every engine (the ARM engine is the soundness check
+  — a truncated candidate set would UDF-trap its runtime 289).
+  enc-check clean, a64-f0 PASS, stress all-green.
+
 ---
 
 ## Sources consulted
