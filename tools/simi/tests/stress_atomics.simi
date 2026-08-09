@@ -1,0 +1,103 @@
+; stress_atomics.simi — Gap Remediation SIMI Phase 15: the real-hardware
+; concurrency stress fixture. This is the program the plan's §8 caveat said
+; the single-threaded four-way parity could not run: the harness
+; (tools/simi/stress_atomics.c) executes it under pthreads on real x86
+; hardware, where the A1 codegen's `lock cmpxchg` / `lock xadd` are REAL
+; CPU atomics contending across cores.
+;
+; TWO entries share one r7 scratch region (the harness passes the SAME
+; scratch pointer to both translates):
+;
+;   main     — the producer body. Every thread (M of them) claims a unique
+;              tid via ATOMIC_ADD on the tid cell (ticket shape: rD = old),
+;              then R times: bumps the shared enqueue counter (ATOMIC_ADD —
+;              the "shared counter" leg) and CAS-claims the next free slot
+;              of a bounded slot array (the "lock-free queue" leg: the
+;              classic cmpxchg retry loop — no locks, every claim succeeds
+;              exactly once, each slot is owned by exactly one producer),
+;              writing its tid into the claimed slot. Returns tid.
+;
+;   consumer — the single concurrent drainer. Walks pos = 0..M*R-1,
+;              spinning on the enqueue counter until slot pos is published
+;              (x86 TSO: the producer's value store precedes its lock xadd,
+;              so once enq > pos is observed the slot is visible — the
+;              documented ARM-unsound-without-A4 caveat), validates the
+;              slot's tid is in range [0, M), then ATOMIC_ADD the dequeue
+;              counter. Returns TOTAL = M*R.
+;
+; Scratch layout (i64 cells, shared with stress_atomics.c — the harness
+; writes M/R/CAP into the +40/+48/+56 cells BEFORE spawning threads):
+;   +0   tid counter         +8  enq (hit) counter    +16  claim index
+;   +24  consumer deq count  +32  consumer bad count  +40  M (threads)
+;   +48  R (iters/producer)  +56  CAP (capacity)      +64  values[CAP]
+;
+; The producer's M*R claims never exceed the CAP the harness guards, so the
+; slot index stays inside values[]. Single-threaded (all four parity
+; runners): the harness-written cells are zero, so R = 0, the loop runs
+; zero times, and main returns its tid = 0.
+; Expected result: 0
+.entry main
+main:
+    ENTER #32
+    LEA r6, r7, #0             ; r6 = scratch base
+    LOADI r1, #1, i64
+    LEA r21, r6, #8            ; r21 = &enq counter
+    LEA r22, r6, #16           ; r22 = &claim index
+    LEA r14, r6, #64           ; r14 = &values[0]
+    ATOMIC_ADD r0, r6, r1, i64 ; r0 = tid = old; [tid] += 1
+    MOV r2, r0, i64            ; r2 = tid (kept)
+    LOAD r5, r6, #48, i64      ; r5 = R (0 on the parity runners)
+    LOADI r4, #0, i64          ; r4 = pos
+ploop:
+    CMP r8, r4, r5, i64, GE    ; pos >= R -> done
+    BC r8, pdone
+    ATOMIC_ADD r9, r21, r1, i64 ; [enq] += 1 (the shared-counter leg)
+pclaim:
+    LOAD r10, r22, #0, i64     ; r10 = old claim index
+    ADD r11, r10, r1, i64      ; r11 = new = old+1 (rD input)
+    MOV r12, r10, i64          ; r12 = expected (rB)
+    CAS r11, r22, r12, i64     ; if [claim]==old: [claim]=new; r11 = old returned
+    CMP r13, r11, r12, i64, EQ ; success iff returned == expected
+    BC r13, pgot
+    BR pclaim                  ; lost the race — retry (lock-free)
+pgot:
+    PTRADD r15, r14, r11, i64  ; r15 = &values[slot]
+    STORE r2, r15, #0, i64     ; values[slot] = tid (published)
+    ADD r4, r4, r1, i64        ; pos++
+    BR ploop
+pdone:
+    RET                        ; r0 = tid
+
+.entry consumer
+consumer:
+    ENTER #32
+    LEA r6, r7, #0
+    LOADI r1, #1, i64
+    LOAD r2, r6, #40, i64      ; r2 = M (threads)
+    LOAD r3, r6, #48, i64      ; r3 = R (iters)
+    MUL r4, r2, r3, i64        ; r4 = TOTAL = M*R
+    LOADI r5, #0, i64          ; r5 = pos
+    LEA r14, r6, #64           ; r14 = &values[0]
+    LEA r23, r6, #24           ; r23 = &deq counter
+    LEA r24, r6, #32           ; r24 = &bad counter
+cloop:
+    CMP r8, r5, r4, i64, GE    ; pos >= TOTAL -> done
+    BC r8, cdone
+cwait:
+    LOAD r10, r6, #8, i64      ; r10 = enq count
+    CMP r11, r10, r5, i64, GT  ; enq > pos?
+    BC r11, chave
+    BR cwait                   ; spin until slot pos is published
+chave:
+    PTRADD r15, r14, r5, i64   ; r15 = &values[pos]
+    LOAD r12, r15, #0, i64     ; r12 = values[pos]
+    CMP r13, r12, r2, i64, LTU ; values[pos] < M?
+    BC r13, cok
+    ATOMIC_ADD r16, r24, r1, i64 ; [bad] += 1 (out-of-range value seen)
+cok:
+    ATOMIC_ADD r16, r23, r1, i64 ; [deq] += 1
+    ADD r5, r5, r1, i64        ; pos++
+    BR cloop
+cdone:
+    MOV r0, r5, i64            ; r0 = TOTAL drained
+    RET

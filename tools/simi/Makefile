@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -15,6 +15,16 @@ simi-dis: simi_disasm.c simi_obj.c simi_isa.h simi_obj.h
 # Phase 3: portable x86-64 translator core + host JIT-execution test harness.
 simi-jit-test: simi_jit_test.c simi_x86.c simi_x86.h
 	$(CC) $(CFLAGS) -o $@ simi_jit_test.c simi_x86.c
+
+# Phase 15 (plan Part II §8): the real-hardware concurrency stress harness —
+# translates tests/stress_atomics.simi (entries main + consumer) and runs it
+# under pthreads, where the A1 `lock cmpxchg`/`lock xadd` codegen contends on
+# real CPU cores. Closes the gap the single-threaded four-way parity cannot:
+# mutual exclusion and no lost updates under contention. In `all` so the build
+# always refreshes it (the M2.27 stale-binary lesson).
+stress-atomics: simi-asm stress_atomics.c simi_x86.c simi_x86.h tests/stress_atomics.simi
+	./simi-asm tests/stress_atomics.simi tests/stress_atomics.tmo
+	$(CC) $(CFLAGS) -pthread -o $@ stress_atomics.c simi_x86.c
 
 # Phase 5: portable RV64 translator core + a small purpose-built RV64
 # decoder/executor standing in for real hardware/QEMU (neither available
@@ -86,4 +96,4 @@ size-gate-arm: simi-arm-verify simi-asm
 clean:
 	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics clean
