@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa cross-size
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -128,6 +128,23 @@ cross-isa: cross_isa.c bench_baselines.h bench_baselines_rv64.h
 	$(CC) $(CFLAGS) -o $@ cross_isa.c
 	./cross-isa
 
+# M2.79: cross-ISA emitted-size report — the code-density dimension.
+# A64 side: the CURRENT emitted bytes measured live by translating each
+# fixture with the real simi_arm.c (the size gate's M1 mechanism — no
+# execution). x86 side: the COMMITTED current bytes in
+# bench_baselines_x86.h (the simi-jit-test --bytes table). Prints the
+# per-fixture a64/x86 ratio table sorted by density, the totals and the
+# aggregate ratio, and gates on no-orphans + the aggregate within a
+# +/-25% committed band (see cross_size.c's top comment and plan doc
+# §10.168/10.169). In `all` with the other checks (~1 s).
+cross-size: simi-asm cross_size.c simi_arm.c simi_arm.h bench_baselines_x86.h
+	$(CC) $(CFLAGS) -o $@ cross_size.c simi_arm.c
+	# Same assemble-on-the-spot loop as bench-corpus (stale/missing only).
+	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
+	    if [ ! -f "$$tmo" ] || [ "$$f" -nt "$$tmo" ]; then \
+	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
+	./cross-size tests/*.simi
+
 # F0 (Phase 10 float): hand-assembled float_ops.simi-semantics gate for
 # the a64_exec.c float decode+execute work (see a64_f0_test.c's top
 # comment). simi_arm.c can't emit float yet (F1) — this proves the
@@ -176,6 +193,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa cross-size tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa cross-size clean

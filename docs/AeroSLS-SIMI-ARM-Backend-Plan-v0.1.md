@@ -5973,6 +5973,55 @@ checks (bench-net, bench-corpus, bench-exec, bench-exec-rv64,
 cross-isa) PASS. Changed: cross_isa.c (new), the Makefile (cross-isa
 target in `all`/`clean`) and .gitignore.
 
+### 10.168 M2.79 — the cross-ISA emitted-size report, A64 vs x86 density pinned (as built)
+
+The code-density dimension the M2.78 step report misses: cross_size.c
+compares the two ISAs' EMITTED sizes per fixture. The two sides are
+honestly asymmetric, exactly matching where their truth lives:
+
+- **A64 — measured live.** The size gate (size_gate_arm.sh) measures the
+  CURRENT emitted bytes (its "M1") live every run — there is no
+  committed current-A64 table, because every codegen change moves it. So
+  cross_size translates each fixture with the real simi_arm.c and reads
+  out_len (translate-only — no execution, the bench-corpus pattern; the
+  same measurement the size gate gates on with M1 <= M0).
+- **x86 — from the committed --bytes table.** The CURRENT x86 emitted
+  bytes are committed in bench_baselines_x86.h (the simi-jit-test
+  --bytes tripwire's table), so the report reads them from there.
+
+Skips mirror the parity runners exactly (mem_ops, jmpr_oob,
+cap_forge_debug — no committed x86 row). Output: the per-fixture
+a64/x86 emitted-byte ratio table sorted by density, the totals and the
+aggregate ratio. Gates, mirroring cross_isa: **no orphans** (every
+committed x86 row must be measured on the A64 side; a fixture without an
+x86 baseline fails) and the **aggregate ratio within +/-25%** of the
+measured value (code-size mix drift — a fold that shrinks one ISA's
+emission without the other — fails).
+
+**The pinned number (measured 2026-08-09): aggregate ratio 0.9092** —
+A64 M1 emits 207808 bytes across the corpus vs x86's 228549, so the
+folding-heavy A64 backend is ~9% smaller overall. The per-fixture
+extremes are the mirror image of the step report's: the jmpr_chain*
+fixtures are the most A64-lean (jmpr_chain32 0.502 — the M2.x chain
+emission is a fraction of x86's per-candidate mov+compare words), while
+the tiny fixtures are x86-lean (rv64_boot_smoke 2.388, add 2.172 —
+x86's compact register forms beat A64's fixed 4-byte words once the
+trampoline/entry overhead dominates).
+
+### 10.169 M2.79 gate results (measured)
+
+cross-size: **96 paired fixtures (3 skipped), aggregate ratio 0.9092
+within the committed band — ALL CHECKS PASSED**. Teeth: commenting out
+add.simi's x86 row fails "no committed x86 baseline"; moving the
+committed ratio constant to 1.3 fails "aggregate ratio 0.9092 outside
+committed band [0.9750, 1.6250]"; both reverted to PASS. Emission
+untouched (no simi_arm.c change — cross_size only READS the emission),
+so the size gate stays **96/96, 46224 saved, all rows byte-identical**;
+four-way parity interp 97/97, x86/RV64/ARM 96/0/3; all six `all`
+checks (bench-net, bench-corpus, bench-exec, bench-exec-rv64,
+cross-isa, cross-size) PASS. Changed: cross_size.c (new), the Makefile
+(cross-size target in `all`/`clean`) and .gitignore.
+
 ---
 
 ## Sources consulted
