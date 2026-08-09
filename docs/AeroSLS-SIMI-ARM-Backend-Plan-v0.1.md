@@ -4403,6 +4403,82 @@ M2.52 commit (a probe, not a change):
   the no-expected jmpr_oob are unchanged (jmpr_oob still faults via
   UDF at pc=0x320, rc=1). enc-check clean.
 
+### 10.118 M2.54 — the binary over-cap collapse pinned, and the flatten overflow fixed (as built)
+
+A PROOF milestone that found and fixed a REAL latent bug. M2.51's
+chain27 pinned the collapse for the UNARY image; this pin promotes
+M2.49's ad-hoc binary teeth (a >64-distinct product collapsing to
+UNKNOWN) into a committed corpus test — jmpr_chain30: r1 = r2 + r3
+over TWO SEQUENTIAL 10-way joins (r2 in {0,10,...,90} at Ja, r3 in
+{0..9} at Jb, the sets delivered independently), so the analysis's
+image is the full 100-pair product {0..99} — 100 DISTINCT values, >
+64 — which OVERFLOWS the image merge cap inside chain_img_alu ->
+UNKNOWN -> the chain dies -> the naive table dispatch runs. Runtime
+90 + 9 = 99 lands on block0 at pc 99 -> LOADI #999 -> PASS 999 on all
+four engines, through the table's bounds check. The runtime index 99
+is the LAST value of the 100-image, so the test DISCRIMINATES
+truncation: a wrong analysis emitting a chain over only the first 64
+candidates {0..63} would miss 99, miss every b.eq and UDF-trap
+(rc=1) — only the conservative collapse passes. Dump-verified:
+0 b.eq, the full table dispatch, 101 instructions.
+
+**The latent bug the pin's positive control exposed.** The control
+raised TX_AR_CHAIN_MAX to 128 (keeping TX_AR_CHAIN_BIG at 64) so the
+walk would keep the 100-value image and the chain could fire — and
+the translator CRASHED with stack smashing in both simi-arm-verify
+and a64_dump. ASan pinned it: `chain_flatten_big` copies a FLAT set
+(stored at TX_AR_CHAIN_MAX width, n <= 128) into a `struct ChainBig`
+store (TX_AR_CHAIN_BIG width, v[64]) with NO cap check — the loop at
+simi_arm.c:1430 (`tmp.v[i] = s->v[i]`) writes past the 260-byte stack
+buffer whenever TX_AR_CHAIN_MAX > TX_AR_CHAIN_BIG. Under the shipped
+equal caps (M2.42) n <= 64 = BIG always, so the overflow is
+unreachable — but it is a landmine for any future cap divergence.
+
+**The fix — exact-or-conservative, byte-invisible under equal caps.**
+`chain_flatten_big` now collapses to UNKNOWN when `s->unk || s->n >
+TX_AR_CHAIN_BIG` instead of copying (never a truncated set — a
+truncated candidate list could UDF-fault at runtime; UNKNOWN always
+falls to the table). Under the shipped caps the guard never fires
+(n <= 64), so the fix is byte-invisible: the gate's 81 existing rows
+are byte-identical. The control re-run proves it: with TX_AR_CHAIN_MAX
+= 128 the translator no longer crashes — jmpr_chain30 PASS 999 at
+2476 bytes, 0 b.eq, the full table dispatch (the 100-value flat set
+collapses at the flatten boundary instead of overflowing).
+
+### 10.119 M2.54 gate results (measured)
+
+Total emitted bytes across the now-78-program parity set: **M0
+168384 → M1 141436, 26948 saved** (≈16.0%). One row added, zero
+moved — despite the simi_arm.c flatten fix, **all 81 shared rows are
+byte-identical** (the fix only fires when TX_AR_CHAIN_MAX >
+TX_AR_CHAIN_BIG, impossible under the shipped equal caps):
+
+- jmpr_chain30 2888 → 2476 (−412, new 78th row; M0 baseline measured
+  at git 1729f50) — the binary-collapse pin: r1 = r2 + r3 over the
+  two sequential 10-way joins -> the 100-distinct image {0..99} ->
+  UNKNOWN -> the table. Runtime 90 + 9 = 99 -> block0's LOADI #999
+  -> PASS 999 on all four engines, through the table's bounds check.
+  The row is a dynamic-JMPR program (g_alloc = 0), so the 412-byte
+  M0->M1 delta is the accumulated emission folds, not the chain.
+- Teeth — the fix's two sides (ad hoc): (a) the OVERFLOW control
+  (TX_AR_CHAIN_MAX raised to 128) previously crashed with stack
+  smashing; with the fix it PASSes conservatively (0 b.eq, table,
+  2476 bytes — the flatten collapses instead of overflowing);
+  (b) a TRUNCATION check — the emitted candidate path can never
+  deliver a partial set, because every flatten/merge site caps to
+  UNKNOWN (chain_merge_big, the dispatch's bigsnap.n <= BIG guard,
+  and now chain_flatten_big).
+- Row-by-row accounting (gate tables diffed vs the current committed
+  simi_arm.c): **all 81 shared rows byte-identical** — strictly
+  additive; the only simi_arm.c delta is the flatten guard.
+- Four-way parity: 332 PASS, 0 FAIL — all 83 expected-result
+  programs on all four engines (interp 83/83, x86 82/0/3, RV64
+  82/0/3, ARM 82/0/3), each checked against its "Expected result:"
+  comment; the collapse-pin table path executes at runtime on the
+  ARM engine (PASS 999 through the bounds check), and the documented
+  float/mem skips and the no-expected jmpr_oob are unchanged
+  (jmpr_oob still faults via UDF, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted

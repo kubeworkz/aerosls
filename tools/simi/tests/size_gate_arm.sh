@@ -991,7 +991,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248 [jmpr_chain29]=4600 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248 [jmpr_chain29]=4600 [jmpr_chain30]=2888 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -999,6 +999,28 @@ declare -A M0_BASELINES=(
     [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
     [straight_line_bench]=1104 [stress_atomics]=2632 [tail_ret]=1048
 )
+
+# jmpr_chain30 is M2.54: the conservative side of the BINARY cap
+# discipline, promoted from M2.49's ad-hoc teeth into a committed pin
+# (the mirror of chain27's UNARY collapse). The index r1 = r2 + r3 over
+# two SEQUENTIAL 10-way joins (r2 in {0,10,...,90} at Ja, r3 in {0..9}
+# at Jb — the sets delivered independently) gives the analysis a
+# 100-DISTINCT image {0..99}, which OVERFLOWS the image merge cap (64,
+# TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG) -> UNKNOWN -> the chain dies ->
+# the naive table dispatch runs. Runtime 90 + 9 = 99 lands on block0 at
+# pc 99 -> LOADI #999 -> PASS 999 on all four engines, through the
+# table's bounds check; runtime 99 is the LAST of the 100-value image,
+# so a wrong analysis emitting a truncated 64-candidate chain would
+# miss it and UDF-trap (rc=1). Dump-verified: 0 b.eq, the full table
+# dispatch, 101 instructions. M2.54 ALSO fixed a latent bug the pin's
+# control exposed: chain_flatten_big copied a flat set (stored at
+# TX_AR_CHAIN_MAX width) into the TX_AR_CHAIN_BIG store with no cap
+# check — a stack overflow whenever MAX > BIG (a raised-cap control
+# crashed with stack smashing; now it collapses to UNKNOWN instead,
+# exact-or-conservative). Under the shipped equal caps the fix is
+# byte-invisible (n <= 64 = BIG always), so this row's M0 baseline
+# (2888, measured at git 1729f50) differs from M1 (2476) only by the
+# accumulated emission folds on the g_alloc=0 table path (-412).
 
 pass=0
 fail=0
