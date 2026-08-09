@@ -25,9 +25,11 @@
  *                           riscv_trap_dispatch_common() (the routing
  *                           core the CSR-armed wrappers share) with
  *                           INJECTED cause/tval, since x86 has no
- *                           scause/mcause CSRs. Three argv modes:
+ *                           scause/mcause CSRs. Four argv modes:
  *                           "syscall" (scause=3 + a7=RV_SYS_EXIT →
  *                           routes into the S-mode exit path),
+ *                           "ecall" (scause=9 + a7=RV_SYS_EXIT → the
+ *                           same exit path through the code==9 branch),
  *                           "unhandled" (scause=2 → the [TRAP]
  *                           unhandled-exception branch), "interrupt"
  *                           (bit 63 set → handle_riscv_supervisor_
@@ -117,6 +119,11 @@ int main(void) {
 /* Drives riscv_trap_dispatch_common() with injected cause/tval. Modes:
  *   syscall     scause=3 (ebreak) + a7=RV_SYS_EXIT → routes into the
  *               S-mode syscall exit path (which halts: rc=0 via rv_halt).
+ *   ecall       scause=9 (environment call) + a7=RV_SYS_EXIT → the SAME
+ *               exit path through the code==9 branch -- pins that the
+ *               two triggers route identically (dispatch halts before
+ *               the branch's sepc+=4 continuation line, so only the
+ *               routing is observable).
  *   unhandled   scause=2 (illegal instruction) → the [TRAP] unhandled
  *               branch (halts).
  *   interrupt   scause bit 63 set → handle_riscv_supervisor_interrupt()
@@ -126,8 +133,9 @@ int main(void) {
  * The runner drives each mode as its own process (one scenario per
  * process, like every other twin) via argv[1]. */
 int main(int argc, char** argv) {
-    int mode = 0;   /* 0=syscall, 1=unhandled, 2=interrupt */
-    if (argc > 1 && strcmp(argv[1], "unhandled") == 0) mode = 1;
+    int mode = 0;   /* 0=syscall, 1=unhandled, 2=interrupt, 3=ecall */
+    if (argc > 1 && strcmp(argv[1], "ecall") == 0) mode = 3;
+    else if (argc > 1 && strcmp(argv[1], "unhandled") == 0) mode = 1;
     else if (argc > 1 && strcmp(argv[1], "interrupt") == 0) mode = 2;
 
     struct RvPerHartData phd;
@@ -140,6 +148,8 @@ int main(int argc, char** argv) {
         riscv_trap_dispatch_common(&phd, 3 /* scause: ebreak */, 0);
     } else if (mode == 1) {
         riscv_trap_dispatch_common(&phd, 2 /* scause: illegal instruction */, 0x1234);
+    } else if (mode == 3) {
+        riscv_trap_dispatch_common(&phd, 9 /* scause: environment call */, 0);
     } else {
         riscv_trap_dispatch_common(&phd, (1ULL << 63) | 5 /* timer interrupt */, 0);
     }

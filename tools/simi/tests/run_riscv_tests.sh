@@ -143,9 +143,11 @@ rm -f rv_exitu.out rv_exitu.err
 # scause/mcause CSRs). Three modes, one scenario per process:
 #   syscall    scause=3 (ebreak) + a7=RV_SYS_EXIT -> routes into the
 #              S-mode syscall exit path (SRST attempted, fallback halt).
+#   ecall      scause=9 (environment call) + a7=RV_SYS_EXIT -> the same
+#              exit path through the code==9 branch.
 #   unhandled  scause=2 (illegal instruction) -> [TRAP] unhandled branch.
 #   interrupt  scause bit 63 set -> the interrupt stub, which RETURNS.
-for mode in syscall unhandled interrupt; do
+for mode in syscall ecall unhandled interrupt; do
     if ../rv-trap-test "$mode" >rv_trap_$mode.out 2>rv_trap_$mode.err; then
         case "$mode" in
         syscall)
@@ -159,6 +161,19 @@ for mode in syscall unhandled interrupt; do
             else
                 echo "FAIL  rv-trap-test syscall (routing / messages not as expected)"
                 cat rv_trap_syscall.out rv_trap_syscall.err
+                fail=$((fail+1))
+            fi ;;
+        ecall)
+            if grep -q "\[SYSCALL\] SYS_SLS_EXIT, code=42" rv_trap_ecall.out \
+               && grep -q "SBI_SRST unsupported or failed -- halting hart instead" rv_trap_ecall.out \
+               && grep -q "sbi_system_reset() stub" rv_trap_ecall.err \
+               && ! grep -q "\[TRAP\] unhandled" rv_trap_ecall.out \
+               && ! grep -q "no branch halted" rv_trap_ecall.err; then
+                echo "PASS  rv-trap-test ecall (scause=9 + a7=RV_SYS_EXIT -> code==9 syscall path)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  rv-trap-test ecall (routing / messages not as expected)"
+                cat rv_trap_ecall.out rv_trap_ecall.err
                 fail=$((fail+1))
             fi ;;
         unhandled)
