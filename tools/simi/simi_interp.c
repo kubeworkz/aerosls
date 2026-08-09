@@ -28,6 +28,7 @@
  */
 #include "simi_isa.h"
 #include "simi_obj.h"
+#include "simi_interp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -170,28 +171,21 @@ static const MockCatalogEntry *mock_lookup_vaddr(uint64_t vaddr) {
  *     docs/AeroSLS-SIMI-ISA-v0.1.md §16 Phase 12 for the full design. */
 static void set_tag(Frame *fr, uint16_t reg, int val) { fr->cap_tag[reg] = (uint8_t)(val ? 1 : 0); }
 
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s program.tmo entry_name\n", argv[0]);
-        return 1;
-    }
-    SimiObject obj = {0};
-    if (simi_obj_read(argv[1], &obj) != 0) return 1;
-
-    uint32_t entry_pc = UINT32_MAX;
-    for (uint32_t i = 0; i < obj.num_entries; i++) {
-        if (strcmp(obj.entries[i].name, argv[2]) == 0) { entry_pc = obj.entries[i].offset; break; }
-    }
-    if (entry_pc == UINT32_MAX) {
-        fprintf(stderr, "no such entry point '%s'\n", argv[2]);
-        return 1;
-    }
-
+/* M2.80: extracted from main() so a bench harness can drive the reference
+ * interpreter in-process (bench_exec_interp.c) — the run loop, frame-stack
+ * reset, and step counter are exactly what main() used to do inline.
+ * Behavior-identical: simi-run's printed output and exit codes are
+ * unchanged, with the interpreter-leg parity (97/97) as the guard. mem is
+ * zeroed on entry so each call is an independent, deterministic run — a
+ * no-op for the standalone (a fresh process starts zeroed), the
+ * per-iteration determinism the bench needs. */
+int simi_interp_run(SimiObject obj, uint32_t entry_pc, long *steps_out, long long *result_out) {
     frame_top = 0;
     frames[0].caller_frame = -1;
     frames[0].return_pc = 0;
     memset(frames[0].regs, 0, sizeof(frames[0].regs));
     memset(frames[0].cap_tag, 0, sizeof(frames[0].cap_tag));
+    memset(mem, 0, sizeof(mem));
 
     uint32_t pc = entry_pc;
     long steps = 0;
@@ -417,8 +411,8 @@ int main(int argc, char **argv) {
         }
         case OP_RET: {
             if (frame_top == 0) {
-                printf("%lld\n", (long long)(int64_t)frames[0].regs[0]);
-                simi_obj_free(&obj);
+                *result_out = (long long)(int64_t)frames[0].regs[0];
+                *steps_out = steps;
                 return 0;
             }
             uint64_t retval = fr->regs[0];
@@ -545,3 +539,32 @@ int main(int argc, char **argv) {
         }
     }
 }
+
+#ifndef SIMI_INTERP_NO_MAIN   /* bench_exec_interp.c defines this and links
+                               * simi_interp.c for simi_interp_run; the
+                               * standalone simi-run keeps its own main */
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s program.tmo entry_name\n", argv[0]);
+        return 1;
+    }
+    SimiObject obj = {0};
+    if (simi_obj_read(argv[1], &obj) != 0) return 1;
+
+    uint32_t entry_pc = UINT32_MAX;
+    for (uint32_t i = 0; i < obj.num_entries; i++) {
+        if (strcmp(obj.entries[i].name, argv[2]) == 0) { entry_pc = obj.entries[i].offset; break; }
+    }
+    if (entry_pc == UINT32_MAX) {
+        fprintf(stderr, "no such entry point '%s'\n", argv[2]);
+        return 1;
+    }
+
+    long steps = 0;
+    long long result = 0;
+    int rc = simi_interp_run(obj, entry_pc, &steps, &result);
+    printf("%lld\n", result);
+    simi_obj_free(&obj);
+    return rc;
+}
+#endif

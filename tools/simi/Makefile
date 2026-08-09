@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa cross-size
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -116,6 +116,29 @@ bench-exec-rv64: simi-asm bench_exec_rv64.c simi_riscv.c simi_riscv.h rv64_exec.
 	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
 	./bench-exec-rv64 tests/*.simi 500
 
+# M2.80: corpus-wide INTERPRETER execution-cost bench — the last leg of
+# the four-way measurement story. Each fixture is read once (the
+# interpreter doesn't translate — simi_obj_read loads the .tmo directly),
+# then executed N times through simi_interp_run() — the exact run loop
+# simi-run uses, extracted from its main() in M2.80 and driven in-process
+# (simi_interp.c is linked with -DSIMI_INTERP_NO_MAIN so the bench's own
+# main links). COMMITTED PER-ROW BASELINES in bench_baselines_interp.h:
+# exact per-fixture SIMI-instruction steps + ns/call at a 4x wall-clock
+# margin — the ground-truth work the translated legs' counts compare
+# against. Fixture set is run_tests.sh's — 97 rows (incl. mem_ops.simi;
+# jmpr_oob/cap_forge_debug skipped — no Expected result). Re-measure
+# deliberately with
+# SIMI_BENCH_MEASURE=1 ./bench-exec-interp <tests/ fixtures> 500 (see
+# bench_exec_interp.c's top comment and plan doc §10.170/10.171). In
+# `all` with the other benches (~1-2 s total).
+bench-exec-interp: simi-asm bench_exec_interp.c simi_interp.c simi_obj.c simi_interp.h simi_obj.h bench_baselines_interp.h
+	$(CC) $(CFLAGS) -DSIMI_INTERP_NO_MAIN -o $@ bench_exec_interp.c simi_interp.c simi_obj.c
+	# Same assemble-on-the-spot loop as bench-corpus (stale/missing only).
+	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
+	    if [ ! -f "$$tmo" ] || [ "$$f" -nt "$$tmo" ]; then \
+	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
+	./bench-exec-interp tests/*.simi 500
+
 # M2.78: cross-ISA execution-work report — the derived view over the
 # committed A64/RV64 per-fixture step counts (both pinned exactly by the
 # parity tripwires): per-fixture ratios sorted by density, the aggregate
@@ -193,6 +216,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa cross-size tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 cross-isa cross-size clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size clean
