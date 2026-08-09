@@ -139,15 +139,20 @@ bench-exec-interp: simi-asm bench_exec_interp.c simi_interp.c simi_obj.c simi_in
 	        ./simi-asm "$$f" "$$tmo" >/dev/null 2>&1 || exit 1; fi; done
 	./bench-exec-interp tests/*.simi 500
 
-# M2.78: cross-ISA execution-work report — the derived view over the
-# committed A64/RV64 per-fixture step counts (both pinned exactly by the
-# parity tripwires): per-fixture ratios sorted by density, the aggregate
-# ratio, and two consistency gates (no orphan rows across the two tables;
-# the aggregate ratio within a +/-25% committed band around the measured
-# 1.0674). Pure header computation — no execution, instant. In `all` so
-# the two tables stay honest on every build (see cross_isa.c's top
-# comment and plan doc §10.166/10.167).
-cross-isa: cross_isa.c bench_baselines.h bench_baselines_rv64.h
+# M2.78/M2.82: cross-ISA execution-work report — the derived view over
+# the committed per-fixture step counts of all three executors (A64 /
+# RV64 / the interpreter, each pinned exactly by its parity tripwire):
+# per-fixture A64-vs-RV64 ratios sorted by density, the M2.82 per-fixture
+# ISA/interp EXPANSION table (how many translated instructions one SIMI
+# instruction costs per fixture), the aggregate ratio and expansion
+# factors, and consistency gates (no orphan rows across the three tables
+# — mem_ops.simi is the deliberate interpreter-only fixture; the
+# aggregate ratio and both expansion factors within +/-25% committed
+# bands around the measured 1.0674 / ~13.55 / ~12.70). Pure header
+# computation — no execution, instant. In `all` so the three tables stay
+# honest on every build (see cross_isa.c's top comment and plan doc
+# §10.166/10.167 and §10.174/10.175).
+cross-isa: cross_isa.c bench_baselines.h bench_baselines_rv64.h bench_baselines_interp.h
 	$(CC) $(CFLAGS) -o $@ cross_isa.c
 	./cross-isa
 
