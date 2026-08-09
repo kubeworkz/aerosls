@@ -5878,6 +5878,55 @@ tables), simi_riscv_verify.c (--steps + RV64_STEPS_MEASURE),
 simi_jit_test.c (--bytes), run_riscv_tests.sh + run_native_tests.sh
 (the flags on every fixture), the Makefile (deps).
 
+### 10.164 M2.77 — the RV64 execution-cost bench, the timing dimension (as built)
+
+The M2.76 follow-up: bench_exec.c's model now has its RV64 counterpart.
+bench_exec_rv64.c mirrors it exactly but drives rv64_exec.c — every
+fixture is translated once (translate cost is bench-corpus's job), then
+executed N=500 times through the same purpose-built RV64 decoder/executor
+the four-way parity uses, with the same mock host functions and the
+Expected result parsed from the .simi comment; skips mirror
+run_riscv_tests.sh exactly (mem_ops, jmpr_oob, cap_forge_debug).
+
+The per-row guard uses the SAME single source of truth as the parity
+tripwire: bench_baselines_rv64.h gained the ns_per_call column (the
+struct's steps column is the table the simi-riscv-verify --steps check
+already reads), so the bench's steps assertions and the harness's are
+one table, one truth. Two tiers, sized from measurement:
+
+- **steps: EXACT** — the deterministic, machine-independent execution
+  work per fixture. Cross-validated: the bench's three measurement
+  passes produced EXACTLY the committed steps the M2.76 parity table
+  carries (all 96 rows), independent confirmation that the harness and
+  the bench agree on the execution path.
+- **ns/call: asserted at 4.0x** over the committed median of three N=500
+  passes. Measured tail: three passes swung up to **2.37x per fixture**
+  (worst of 96; 7 fixtures over 2.0x) — the same WSL load profile
+  bench_exec documented on the A64 side (2.28x), so the same 4.0x
+  margin applies. The printed table shows measured vs committed.
+
+Corpus totals: **96 fixtures, 32820 RV64 steps** across one run of
+every fixture (aggregate_abi=1110 and jmpr_chain34=1083 the heaviest;
+RV64 executes fewer steps than A64 — 32820 vs 35032 — because the
+RV64 codegen uses a different instruction mix). In `all` with the
+other benches (~1-2 s). Re-measure deliberately with
+RV64_BENCH_MEASURE=1 ./bench-exec-rv64 <tests/ fixtures> 500.
+
+### 10.165 M2.77 gate results (measured)
+
+bench-exec-rv64 (N=500, this sandbox): **99 fixtures, 32820 steps,
+~8.8 µs/step aggregate, 3 skipped, 0 failed — ALL CHECKS PASSED**, all
+96 rows within their committed baselines (teeth: corrupting add.simi's
+committed ns 5321 -> 100 fails the row "4841 ns/call > committed 100 x
+4 (execution cost regression)", reverted to PASS). Emission untouched
+(no simi_arm.c change — rv64_exec/rv64_exec.h steps came in M2.76), so
+the size gate stays **96/96, 46224 saved, all rows byte-identical**;
+four-way parity interp 97/97, x86/RV64/ARM 96/0/3; bench-net,
+bench-corpus and bench-exec PASS; enc-check clean; stress all-green.
+Changed: bench_exec_rv64.c (new), bench_baselines_rv64.h (the
+ns_per_call column), the Makefile (bench-exec-rv64 target in
+`all`/`clean`) and .gitignore.
+
 ---
 
 ## Sources consulted
