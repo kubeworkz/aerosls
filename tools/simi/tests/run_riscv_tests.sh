@@ -138,6 +138,64 @@ else
 fi
 rm -f rv_exitu.out rv_exitu.err
 
+# Phase 9g trap-routing twin (rv-trap-test, -DSIMI_TEST_TRAP): drives
+# riscv_trap_dispatch_common() with INJECTED cause/tval (x86 has no
+# scause/mcause CSRs). Three modes, one scenario per process:
+#   syscall    scause=3 (ebreak) + a7=RV_SYS_EXIT -> routes into the
+#              S-mode syscall exit path (SRST attempted, fallback halt).
+#   unhandled  scause=2 (illegal instruction) -> [TRAP] unhandled branch.
+#   interrupt  scause bit 63 set -> the interrupt stub, which RETURNS.
+for mode in syscall unhandled interrupt; do
+    if ../rv-trap-test "$mode" >rv_trap_$mode.out 2>rv_trap_$mode.err; then
+        case "$mode" in
+        syscall)
+            if grep -q "\[SYSCALL\] SYS_SLS_EXIT, code=42" rv_trap_syscall.out \
+               && grep -q "SBI_SRST unsupported or failed -- halting hart instead" rv_trap_syscall.out \
+               && grep -q "sbi_system_reset() stub" rv_trap_syscall.err \
+               && ! grep -q "\[TRAP\] unhandled" rv_trap_syscall.out \
+               && ! grep -q "no branch halted" rv_trap_syscall.err; then
+                echo "PASS  rv-trap-test syscall (scause=3 + a7=RV_SYS_EXIT -> syscall path)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  rv-trap-test syscall (routing / messages not as expected)"
+                cat rv_trap_syscall.out rv_trap_syscall.err
+                fail=$((fail+1))
+            fi ;;
+        unhandled)
+            if grep -q "\[TRAP\] unhandled exception, scause=2, stval=4660, sepc=2149584896" rv_trap_unhandled.out \
+               && grep -q "halting hart" rv_trap_unhandled.out \
+               && ! grep -q "\[SYSCALL\]" rv_trap_unhandled.out \
+               && ! grep -q "sbi_system_reset() stub" rv_trap_unhandled.err \
+               && ! grep -q "no branch halted" rv_trap_unhandled.err; then
+                echo "PASS  rv-trap-test unhandled (scause=2 -> [TRAP] unhandled branch)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  rv-trap-test unhandled (routing / messages not as expected)"
+                cat rv_trap_unhandled.out rv_trap_unhandled.err
+                fail=$((fail+1))
+            fi ;;
+        interrupt)
+            if grep -q "interrupt stub fired" rv_trap_interrupt.err \
+               && grep -q "interrupt path returned as expected" rv_trap_interrupt.err \
+               && ! grep -q "\[SYSCALL\]" rv_trap_interrupt.out \
+               && ! grep -q "\[TRAP\]" rv_trap_interrupt.out; then
+                echo "PASS  rv-trap-test interrupt (bit 63 -> interrupt stub, returns)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  rv-trap-test interrupt (routing / messages not as expected)"
+                cat rv_trap_interrupt.out rv_trap_interrupt.err
+                fail=$((fail+1))
+            fi ;;
+        esac
+    else
+        rc=$?
+        echo "FAIL  rv-trap-test $mode (exit rc=$rc — dispatch crashed or behaved wrongly)"
+        cat rv_trap_$mode.out rv_trap_$mode.err
+        fail=$((fail+1))
+    fi
+done
+rm -f rv_trap_*.out rv_trap_*.err
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

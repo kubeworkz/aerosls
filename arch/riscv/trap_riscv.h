@@ -91,6 +91,16 @@ void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top);
 void riscv_trap_dispatch(struct RvPerHartData* phd);
 void riscv_trap_dispatch_m(struct RvPerHartData* phd);
 
+/* The routing core the two wrappers share: cause/tval are passed in as
+ * plain arguments (the wrappers read them from the mode-appropriate
+ * CSRs). Declared public because the host-side tripwire
+ * (tools/simi/rv_syscall_exit_test.c, -DSIMI_TEST_TRAP) drives it
+ * directly with injected cause/tval values -- x86 has no scause/mcause
+ * CSRs, but the routing logic itself is pure C and must be pinned like
+ * riscv_syscall_dispatch's branches are. In the kernel only the two
+ * wrappers call it. */
+void riscv_trap_dispatch_common(struct RvPerHartData* phd, uint64_t scause, uint64_t stval);
+
 /* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): minimal syscall
  * surface. a7 = syscall number, a0 = single argument -- the smallest
  * convention that can express SYS_SLS_EXIT (the only syscall wired

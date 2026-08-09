@@ -11,6 +11,7 @@ stress-atomics
 rv-syscall-exit-test
 rv-syscall-exit-test-m
 rv-syscall-exit-test-u
+rv-trap-test
 bench-net
 bench-corpus
 bench-exec
