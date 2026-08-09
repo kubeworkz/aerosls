@@ -4922,6 +4922,71 @@ pin + gate row + doc):
   88/0/3, ARM 88/0/3); the loop body (S -> V -> J -> V ... ->
   EXIT) executes at runtime on every engine. enc-check clean.
 
+### 10.132 M2.61 — the permanent EQUAL-CAPS regression: MAX and BIG bumped together 64 -> 96 (as built)
+
+The cap series (M2.54/M2.55) found the discipline's two failure modes
+when the caps DIVERGE — the flatten overflow (MAX > BIG) and the
+freeze overflow (BIG > MAX) — and every pin since guarded the
+equal-caps turn-over at 64 or a collapse side. This milestone makes
+the equality itself a committed, re-measured fact: **TX_AR_CHAIN_MAX
+and TX_AR_CHAIN_BIG are permanently bumped TOGETHER 64 -> 96**, the
+gate is re-measured, and a new turn-over pin (jmpr_chain37) guards
+the new boundary. Nothing in the code hardcodes 64 (the M2.55
+controls already ran the whole suite at 128/20 and 128/64 — the caps
+are pure macros), so the bump is a pure capability gain, monotone in
+set size: sets <= 64 behave byte-identically, and 65-96-value sets
+gain the chain.
+
+**The new turn-over pin (jmpr_chain37).** The index is the union of
+two flat products (chain31's R-arm shape scaled): R1 = r2 + r3 (r2 in
+{52,68,84,100,116,132}, r3 in {0,2,...,14}) = 48 values {52..146}
+step 2, and R2 = r2 + r6 (r6 in {200,202,...,214}) = 48 values
+{252..346} step 2 — the union is **96 DISTINCT values, exactly the
+new MAX = BIG**, materializing through the flat walk, the head union,
+and the emission gate at the same point. Runtime 132 + 214 = 346 (all
+join BCs fall through: r0 == 0, r5 == 0) takes the chain's
+NINETY-SIXTH b.eq -> block95's LOADI #987 -> PASS 987 on all four
+engines; a truncated materialization (a union one short, or a store
+one short) misses 346 and UDF-traps. Dump-verified: **96 b.eq, 97 br,
+1 udf, 0 table words**. The cost gate (8*96+4 = 772 < 40 + 4*348 =
+1432) emits the full 96-pair chain.
+
+**What the bump proves about the discipline.** Three rows moved, all
+intended capability gains:
+
+- jmpr_chain37 9348 -> 7288 (new 85th row) — the 96 turn-over.
+- jmpr_chain33 6444 -> 5904 — its 80-value root now FITS the 96
+  store, so the 64-record DAG materializes and chains (64 b.eq;
+  runtime 252 = the sixty-fourth). The M2.57-era collapse at 64/64
+  (the M2.42 "vestigial" note) was CAP-SPECIFIC, not structural —
+  M2.57's own Control A (BIG=128) proved the same DAG chains when
+  the caps admit it, and the shipped 96/96 state is exactly that
+  behavior, now regression-guarded.
+- jmpr_chain27 3884 -> 3760 — its 65-distinct NEG image now fits
+  and chains (65 b.eq; runtime 150 = the sixty-fifth). Same story
+  as chain33: the M2.51 collapse pin became the exact-side pin.
+- jmpr_chain30 (100 values) STILL collapses to the table (100 >
+  96) — the over-cap conservative side of the discipline is
+  unchanged and still pinned.
+
+### 10.133 M2.61 gate results (measured)
+
+Total emitted bytes across the now-85-program parity set: **M0
+211448 → M1 174140, 37308 saved** (≈17.6%). One row added, three
+moved (the intended 65-96 capability gains above); the other **87
+shared rows are byte-identical** — proving the bump is invisible
+below 65 values:
+
+- Row-by-row accounting (gate table diffed vs the M2.60 commit's
+  build): only jmpr_chain27 (-124), jmpr_chain33 (-540), and the
+  new jmpr_chain37 (+7288) differ — every other shared row is
+  byte-for-byte the M2.60 emission.
+- Four-way parity: 357 PASS, 0 FAIL — all 90 expected-result
+  programs on all four engines (interp 90/90, x86 89/0/3, RV64
+  89/0/3, ARM 89/0/3); chain37's 96-candidate chain and chain33's
+  64-candidate chain both execute at runtime on every engine.
+  enc-check clean, a64-f0 PASS, stress all-green.
+
 ---
 
 ## Sources consulted
