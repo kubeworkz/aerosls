@@ -1,0 +1,134 @@
+; jmpr_chain30.simi — M2.54: the conservative side of the BINARY cap
+; discipline, promoted from M2.49's ad-hoc teeth into a committed pin.
+; M2.51's chain27 pinned the collapse for the UNARY image (a 65-distinct
+; join source through NEG); this pin regression-guards the mirror for the
+; REGISTER-FORM PRODUCT: chain_img_alu's register path computes the pair
+; product { f(a,b) : a in S(a), b in S(b) }, exact until its merge cap
+; (64, TX_AR_CHAIN_MAX / TX_AR_CHAIN_BIG). A product whose DISTINCT image
+; exceeds 64 overflows the cap -> the image is UNKNOWN -> the chain dies
+; -> the naive table dispatch runs. No truncated or wrong chain is ever
+; emitted.
+; The index: r1 = r2 + r3 with r2 in {0,10,...,90} (ten values, joined at
+; Ja) and r3 in {0,1,...,9} (ten values, joined at Jb) — the two
+; sequential joins deliver the sets INDEPENDENTLY, so the analysis's
+; image is the full 100-pair product {0..99} (100 DISTINCT values, > 64)
+; -> collapse -> g_alloc = 0 -> the JMPR table. Runtime: every join BC
+; falls through, so r2 = 90 and r3 = 9 -> r1 = 99 -> JMPR 99 -> block0 at
+; pc 99 -> LOADI #999 -> PASS 999 on all four engines, through the
+; table's bounds check. The test DISCRIMINATES truncation: a wrong
+; analysis that emitted a chain over only the first 64 candidates
+; {0..63} would miss runtime 99, miss every b.eq and UDF-trap (rc=1) —
+; only the conservative UNKNOWN -> table path passes. Dump-verified:
+; 0 b.eq, the full table dispatch (movz num_instr, subs/cset/cbz, li32
+; base, add-shift ldr, br, UDF), 101 instructions.
+; Expected result: 999
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #0, i64   ; pc 2 — branch-path base (0) — dead at runtime
+    BC r0, Ja           ; pc 3 — falls through (delivers {r2:0} at Ja)
+    LOADI r2, #10, i64  ; pc 4
+    BC r0, Ja           ; pc 5 — falls through (delivers {r2:10} at Ja)
+    LOADI r2, #20, i64  ; pc 6
+    BC r0, Ja           ; pc 7 — falls through (delivers {r2:20} at Ja)
+    LOADI r2, #30, i64  ; pc 8
+    BC r0, Ja           ; pc 9 — falls through (delivers {r2:30} at Ja)
+    LOADI r2, #40, i64  ; pc 10
+    BC r0, Ja           ; pc 11 — falls through (delivers {r2:40} at Ja)
+    LOADI r2, #50, i64  ; pc 12
+    BC r0, Ja           ; pc 13 — falls through (delivers {r2:50} at Ja)
+    LOADI r2, #60, i64  ; pc 14
+    BC r0, Ja           ; pc 15 — falls through (delivers {r2:60} at Ja)
+    LOADI r2, #70, i64  ; pc 16
+    BC r0, Ja           ; pc 17 — falls through (delivers {r2:70} at Ja)
+    LOADI r2, #80, i64  ; pc 18
+    BC r0, Ja           ; pc 19 — falls through (delivers {r2:80} at Ja)
+    LOADI r2, #90, i64  ; pc 20 — fall-through base (90)
+Ja:                     ; (label) — join: r2 in {0,10,...,90} (10 values)
+    LOADI r3, #0, i64   ; pc 21 — branch-path base (0) — dead at runtime
+    BC r0, Jb           ; pc 22 — falls through (delivers {r3:0} at Jb)
+    LOADI r3, #1, i64   ; pc 23
+    BC r0, Jb           ; pc 24 — falls through (delivers {r3:1} at Jb)
+    LOADI r3, #2, i64   ; pc 25
+    BC r0, Jb           ; pc 26 — falls through (delivers {r3:2} at Jb)
+    LOADI r3, #3, i64   ; pc 27
+    BC r0, Jb           ; pc 28 — falls through (delivers {r3:3} at Jb)
+    LOADI r3, #4, i64   ; pc 29
+    BC r0, Jb           ; pc 30 — falls through (delivers {r3:4} at Jb)
+    LOADI r3, #5, i64   ; pc 31
+    BC r0, Jb           ; pc 32 — falls through (delivers {r3:5} at Jb)
+    LOADI r3, #6, i64   ; pc 33
+    BC r0, Jb           ; pc 34 — falls through (delivers {r3:6} at Jb)
+    LOADI r3, #7, i64   ; pc 35
+    BC r0, Jb           ; pc 36 — falls through (delivers {r3:7} at Jb)
+    LOADI r3, #8, i64   ; pc 37
+    BC r0, Jb           ; pc 38 — falls through (delivers {r3:8} at Jb)
+    LOADI r3, #9, i64   ; pc 39 — fall-through base (9)
+Jb:                     ; (label) — join: r3 in {0,1,...,9} (10 values)
+    ADD r1, r2, r3, i64 ; pc 40 — the product: 100 pairs -> {0..99} — 100
+                        ; DISTINCT values, > 64: OVERFLOWS the image merge
+                        ; cap -> chain_img_alu returns UNKNOWN -> the
+                        ; chain dies conservatively (the M2.49 tooth-b
+                        ; shape, now committed).
+    JMPR r1             ; pc 41 — runtime 90 + 9 = 99.
+    LOADI r0, #0, i32   ; pc 42 — dead filler (aligns block0 to pc 99)
+    LOADI r0, #0, i32   ; pc 43
+    LOADI r0, #0, i32   ; pc 44
+    LOADI r0, #0, i32   ; pc 45
+    LOADI r0, #0, i32   ; pc 46
+    LOADI r0, #0, i32   ; pc 47
+    LOADI r0, #0, i32   ; pc 48
+    LOADI r0, #0, i32   ; pc 49
+    LOADI r0, #0, i32   ; pc 50
+    LOADI r0, #0, i32   ; pc 51
+    LOADI r0, #0, i32   ; pc 52
+    LOADI r0, #0, i32   ; pc 53
+    LOADI r0, #0, i32   ; pc 54
+    LOADI r0, #0, i32   ; pc 55
+    LOADI r0, #0, i32   ; pc 56
+    LOADI r0, #0, i32   ; pc 57
+    LOADI r0, #0, i32   ; pc 58
+    LOADI r0, #0, i32   ; pc 59
+    LOADI r0, #0, i32   ; pc 60
+    LOADI r0, #0, i32   ; pc 61
+    LOADI r0, #0, i32   ; pc 62
+    LOADI r0, #0, i32   ; pc 63
+    LOADI r0, #0, i32   ; pc 64
+    LOADI r0, #0, i32   ; pc 65
+    LOADI r0, #0, i32   ; pc 66
+    LOADI r0, #0, i32   ; pc 67
+    LOADI r0, #0, i32   ; pc 68
+    LOADI r0, #0, i32   ; pc 69
+    LOADI r0, #0, i32   ; pc 70
+    LOADI r0, #0, i32   ; pc 71
+    LOADI r0, #0, i32   ; pc 72
+    LOADI r0, #0, i32   ; pc 73
+    LOADI r0, #0, i32   ; pc 74
+    LOADI r0, #0, i32   ; pc 75
+    LOADI r0, #0, i32   ; pc 76
+    LOADI r0, #0, i32   ; pc 77
+    LOADI r0, #0, i32   ; pc 78
+    LOADI r0, #0, i32   ; pc 79
+    LOADI r0, #0, i32   ; pc 80
+    LOADI r0, #0, i32   ; pc 81
+    LOADI r0, #0, i32   ; pc 82
+    LOADI r0, #0, i32   ; pc 83
+    LOADI r0, #0, i32   ; pc 84
+    LOADI r0, #0, i32   ; pc 85
+    LOADI r0, #0, i32   ; pc 86
+    LOADI r0, #0, i32   ; pc 87
+    LOADI r0, #0, i32   ; pc 88
+    LOADI r0, #0, i32   ; pc 89
+    LOADI r0, #0, i32   ; pc 90
+    LOADI r0, #0, i32   ; pc 91
+    LOADI r0, #0, i32   ; pc 92
+    LOADI r0, #0, i32   ; pc 93
+    LOADI r0, #0, i32   ; pc 94
+    LOADI r0, #0, i32   ; pc 95
+    LOADI r0, #0, i32   ; pc 96
+    LOADI r0, #0, i32   ; pc 97
+    LOADI r0, #0, i32   ; pc 98
+block0:                 ; pc 99
+    LOADI r0, #999, i32 ; pc 99
+    RET                 ; pc 100

@@ -1426,6 +1426,14 @@ static void chain_flatten_big(struct ChainBig* out, const struct ChainSet* cur, 
     const struct ChainSet* s = &cur[slot];
     struct ChainBig tmp = { .n = 0, .unk = 0 };
     if (s->def < 0) {
+        /* M2.54: the flat set is stored at TX_AR_CHAIN_MAX width but the
+         * BIG store (and this tmp) is TX_AR_CHAIN_BIG. The shipped caps
+         * are equal, so n <= BIG holds and this is a plain copy; a cap
+         * raise that makes MAX > BIG (the M2.54 control) would OVERFLOW
+         * tmp.v — collapse to UNKNOWN instead, the exact-or-conservative
+         * discipline (a truncated candidate set could UDF-fault at
+         * runtime; UNKNOWN always falls to the table). */
+        if (s->unk || s->n > TX_AR_CHAIN_BIG) { chain_unknown_big(&tmp); *out = tmp; return; }
         tmp.n = s->n; tmp.unk = s->unk;
         for (uint8_t i = 0; i < s->n; i++) tmp.v[i] = s->v[i];
         *out = tmp; return;
