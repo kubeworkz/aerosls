@@ -12,7 +12,21 @@
  * environment, and how it compares in strength to Phase 3's real-CPU-
  * execution proof and Phase 5's RV64 decoder proof.
  *
- * Usage: simi-arm-verify program.tmo entry_name expected_value
+ * Usage: simi-arm-verify program.tmo entry_name expected_value [--steps]
+ *
+ * With `--steps` (M2.75): after a successful run, the executed
+ * instruction count (A64Cpu.steps) must equal the fixture's COMMITTED
+ * count in bench_baselines.h — the same table bench-exec gates on —
+ * keyed by the .tmo's fixture name (basename with .tmo -> .simi). This
+ * catches decode regressions at the parity harness itself, before any
+ * bench runs: a change in how much the translated code executes (a
+ * decode that now faults early, a fold that alters the emitted control
+ * flow, an a64_exec regression) moves the count and fails the fixture.
+ * The committed counts are for the "main" entry's full run — the entry
+ * the runners execute. A fixture with no committed row FAILS loudly
+ * (adding/removing a corpus fixture requires updating the table
+ * deliberately). The check is skipped when execution does not complete
+ * (a fault is already reported as FAIL).
  *
  * The result register is x9 (t0): simi_arm.c's OP_RET leaves r0's value
  * in t0 (x9) and r0's capability tag in t1 (x10) — the epilogue
@@ -23,6 +37,7 @@
  */
 #include "simi_arm.h"
 #include "a64_exec.h"
+#include "bench_baselines.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,8 +95,11 @@ static uint64_t mock_rt_objtype(uint64_t base_vaddr) {
 #define HOSTFN_OBJTYPE 2
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s program.tmo entry_name expected_value\n", argv[0]);
+    int check_steps = 0;
+    if (argc == 5 && strcmp(argv[4], "--steps") == 0) {
+        check_steps = 1;
+    } else if (argc != 4) {
+        fprintf(stderr, "usage: %s program.tmo entry_name expected_value [--steps]\n", argv[0]);
         return 1;
     }
     const char* path = argv[1];
@@ -132,11 +150,42 @@ int main(int argc, char** argv) {
     }
 
     long long result = (long long)cpu.x[9 /* t0 — result register, see simi_arm.c's OP_RET/trampoline design */];
-    if (result == expected) {
-        printf("PASS  %-28s = %lld  (%u bytes native code)\n", path, result, out_len);
-        return 0;
-    } else {
+    if (result != expected) {
         printf("FAIL  %-28s expected %lld, got %lld\n", path, expected, result);
         return 1;
     }
+
+    if (check_steps) {
+        /* derive the fixture name: <dir>/<fixture>.tmo -> <fixture>.simi */
+        const char* base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        size_t blen = strlen(base);
+        char fname[256];
+        if (blen < 4 || strcmp(base + blen - 4, ".tmo") != 0 ||
+            blen - 4 + 5 >= sizeof(fname)) {
+            fprintf(stderr, "FAIL  %-28s --steps: cannot derive fixture name from '%s'\n", path, path);
+            return 1;
+        }
+        memcpy(fname, base, blen - 4);
+        memcpy(fname + blen - 4, ".simi", 5);
+        fname[blen - 4 + 5] = '\0';
+
+        const struct FixtureBaseline* bl = NULL;
+        for (size_t i = 0; i < sizeof(BASELINES) / sizeof(BASELINES[0]); i++)
+            if (strcmp(BASELINES[i].name, fname) == 0) { bl = &BASELINES[i]; break; }
+        if (!bl) {
+            fprintf(stderr, "FAIL  %-28s --steps: no committed baseline for %s (update bench_baselines.h — see plan doc §10.160)\n",
+                    path, fname);
+            return 1;
+        }
+        if ((long long)cpu.steps != bl->steps) {
+            fprintf(stderr, "FAIL  %-28s --steps: executed %llu instructions != committed %lld (decode/emission regression)\n",
+                    path, (unsigned long long)cpu.steps, bl->steps);
+            return 1;
+        }
+    }
+
+    printf("PASS  %-28s = %lld  (%u bytes native code%s)\n",
+           path, result, out_len, check_steps ? ", steps ok" : "");
+    return 0;
 }

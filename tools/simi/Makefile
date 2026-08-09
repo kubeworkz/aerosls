@@ -36,7 +36,7 @@ simi-riscv-verify: simi_riscv_verify.c simi_riscv.c simi_riscv.h rv64_exec.c rv6
 # (A64) translator core + a small purpose-built A64 decoder/executor
 # standing in for real hardware/QEMU (neither available in this sandbox —
 # see simi_arm_verify.c's top comment and a64_exec.h).
-simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h
+simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h bench_baselines.h
 	$(CC) $(CFLAGS) -o $@ simi_arm_verify.c simi_arm.c a64_exec.c
 
 # M0 transcription-error net: a from-scratch Python A64 encoder re-derives
@@ -84,13 +84,15 @@ bench-corpus: simi-asm bench_corpus.c simi_arm.c simi_arm.h
 # through a64_exec.c (the same purpose-built A64 decoder/executor the
 # four-way parity uses) with the same mock host functions and the expected
 # result parsed from the .simi comment. COMMITTED PER-ROW BASELINES in
-# bench_exec.c: exact per-fixture steps (a64_exec's new per-instruction
-# counter — deterministic, machine-independent) + ns/call at a 4x
-# wall-clock margin. Re-measure deliberately with
+# bench_baselines.h — the single source of truth shared with the
+# simi-arm-verify --steps check (M2.75): exact per-fixture steps
+# (a64_exec's per-instruction counter — deterministic, machine-
+# independent) + ns/call at a 4x wall-clock margin. Re-measure
+# deliberately with
 # BENCH_EXEC_MEASURE=1 ./bench-exec tests/*.simi 500 (see bench_exec.c's
 # top comment and plan doc §10.158/10.159). In `all` with bench-corpus
 # (~1-2 s total).
-bench-exec: simi-asm bench_exec.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h
+bench-exec: simi-asm bench_exec.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h bench_baselines.h
 	$(CC) $(CFLAGS) -o $@ bench_exec.c simi_arm.c a64_exec.c
 	# Same assemble-on-the-spot loop as bench-corpus (stale/missing only).
 	for f in tests/*.simi; do tmo="$${f%.simi}.tmo"; \
