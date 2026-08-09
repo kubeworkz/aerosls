@@ -1634,7 +1634,8 @@ static void load_typed(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn, uin
         case T_U8:  case T_BOOL: e32(cb, enc_ldrb(rd, rn, imm12)); break;
         case T_I16: e32(cb, enc_ldrsh(rd, rn, imm12)); break;
         case T_U16: e32(cb, enc_ldrh(rd, rn, imm12)); break;
-        case T_I32: case T_F32: e32(cb, enc_ldrsw(rd, rn, imm12)); break;
+        case T_I32: e32(cb, enc_ldrsw(rd, rn, imm12)); break;
+        case T_F32: e32(cb, enc_ldr_w(rd, rn, imm12)); break;  /* F4: f32 loads zero-extend (the interpreter's raw-bits convention) — ldrsw would sign-extend negative floats */
         case T_U32: e32(cb, enc_ldr_w(rd, rn, imm12)); break;
         default:    e32(cb, enc_ldr(rd, rn, imm12)); break;   /* i64/u64/f64/ptr */
     }
@@ -1658,7 +1659,8 @@ static void load_unscaled(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn, 
         case T_U8:  case T_BOOL: e32(cb, enc_ldurb(rd, rn, imm9)); break;
         case T_I16: e32(cb, enc_ldursh(rd, rn, imm9)); break;
         case T_U16: e32(cb, enc_ldurh(rd, rn, imm9)); break;
-        case T_I32: case T_F32: e32(cb, enc_ldursw(rd, rn, imm9)); break;
+        case T_I32: e32(cb, enc_ldursw(rd, rn, imm9)); break;
+        case T_F32: e32(cb, enc_ldur_w(rd, rn, imm9)); break;  /* F4: f32 loads zero-extend (see load_typed) */
         case T_U32: e32(cb, enc_ldur_w(rd, rn, imm9)); break;
         default:    e32(cb, enc_ldur(rd, rn, imm9)); break;
     }
@@ -1686,7 +1688,8 @@ static void load_typed_reg(struct CodeBuf* cb, int type, uint8_t rd, uint8_t rn,
         case T_U8:  case T_BOOL: e32(cb, enc_ldrb_reg(rd, rn, rm)); break;
         case T_I16: e32(cb, enc_ldrsh_reg(rd, rn, rm)); break;
         case T_U16: e32(cb, enc_ldrh_reg(rd, rn, rm)); break;
-        case T_I32: case T_F32: e32(cb, enc_ldrsw_reg(rd, rn, rm)); break;
+        case T_I32: e32(cb, enc_ldrsw_reg(rd, rn, rm)); break;
+        case T_F32: e32(cb, enc_ldr_w_reg(rd, rn, rm)); break;  /* F4: f32 loads zero-extend (see load_typed) */
         case T_U32: e32(cb, enc_ldr_w_reg(rd, rn, rm)); break;
         default:    e32(cb, enc_ldr_reg(rd, rn, rm)); break;
     }
@@ -3765,7 +3768,7 @@ const char* simi_arm_strerror(int code) {
         case TX_AR_ERR_TOO_MANY_LITERALS: return "too many 64-bit constants";
         case TX_AR_ERR_BRANCH_OUT_OF_RANGE: return "branch/call target exceeds B/BL/CBZ/CBNZ encodable range";
         case TX_AR_ERR_NAME_OUT_OF_RANGE: return "RESOLVE name-pool index out of range";
-        case TX_AR_ERR_FLOAT_UNSUPPORTED: return "float (T_F32/T_F64) not supported by the A64 translator (scoped out of M0)";
+        case TX_AR_ERR_FLOAT_UNSUPPORTED: return "operand combination has no float meaning (immediate operand, or float MOD)";
         default: return "unknown error";
     }
 }

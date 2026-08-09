@@ -42,6 +42,15 @@ static void setx(struct RvCpu* cpu, int rd, uint64_t val) {
     if (rd != 0) cpu->x[rd] = val;   /* x0 hardwired to zero */
 }
 
+/* F/D bit reinterpretation (Gap Remediation SIMI Phase 10, F4) — the
+ * executor's float semantics are the host C float/double arithmetic the
+ * interpreter already uses as its reference, so the two agree bit-for-bit
+ * by construction (same IEEE-754 ops, same NaN behavior). */
+static double f64_of_bits(uint64_t u) { union { uint64_t u; double d; } c; c.u = u; return c.d; }
+static uint64_t bits_of_f64(double d) { union { uint64_t u; double d; } c; c.d = d; return c.u; }
+static float  f32_of_bits(uint64_t u) { union { uint32_t u; float  f; } c; c.u = (uint32_t)u; return c.f; }
+static uint64_t bits_of_f32(float f)  { union { uint32_t u; float  f; } c; c.f = f; return (uint64_t)c.u; }
+
 /* v0.3 (Phase 6): host-callback table — see rv64_exec.h's top comment. */
 static RvHostFn g_hostfns[RV_EXEC_MAX_HOSTFNS];
 
@@ -154,6 +163,66 @@ int rv64_exec_run(struct RvCpu* cpu, uint64_t max_steps) {
                     case 0x7: setx(cpu, rd, v1 & v2); break;                              /* AND */
                     default: return RV_EXEC_BAD_INSTR;
                 }
+            }
+            break;
+        }
+        case 0x53: { /* OP-FP — Gap Remediation SIMI Phase 10 (F4): the
+            * scalar F/D subset simi_riscv.c's float codegen emits. The
+            * R-type layout is shared with integer OP; funct7 discriminates.
+            * Arithmetic: funct7 = 0000 <op:2> 0 <fmt> (bits 6,5,1 always
+            * zero — mask 0x62), op 00=fadd 01=fsub 10=fmul 11=fdiv, fmt
+            * 0=S 1=D. Compares: funct7 = 101000<fmt> (mask 0x7E == 0x50),
+            * funct3 000=fle 001=flt 010=feq — each returns an integer
+            * 0/1 with exactly the IEEE-754 unordered semantics the
+            * interpreter's C operators give: feq is 0 for NaN, flt/fle are
+            * 0 for any unordered pair (host C comparisons; NaN compares
+            * false against everything). Moves: funct7 1110000/1110001/
+            * 1111000/1111001 with rs2=0, funct3=0 — FMV.X.W/FMV.X.D move
+            * F->X (FMV.X.W sign-extends the 32-bit value to 64 per the
+            * spec's RV64 convention, exactly the ABI rule the translator's
+            * slli+srli zero-extend normalizes), FMV.W.X/FMV.D.X move X->F
+            * (low 32 bits only for W). f32 arithmetic writes only the low
+            * 32 bits of the destination f register (the upper 32 are
+            * never read by anything this executor is asked to run). */
+            if ((funct7 & 0x62u) == 0x00u && funct3 == 0) {      /* fadd/fsub/fmul/fdiv */
+                int opc = (int)((funct7 >> 2) & 3u);
+                if (funct7 & 1u) {                              /* D */
+                    double a = f64_of_bits(cpu->f[rs1]), b = f64_of_bits(cpu->f[rs2]);
+                    switch (opc) {
+                        case 0: cpu->f[rd] = bits_of_f64(a + b); break;
+                        case 1: cpu->f[rd] = bits_of_f64(a - b); break;
+                        case 2: cpu->f[rd] = bits_of_f64(a * b); break;
+                        default: cpu->f[rd] = bits_of_f64(a / b); break;
+                    }
+                } else {                                        /* S */
+                    float a = f32_of_bits(cpu->f[rs1]), b = f32_of_bits(cpu->f[rs2]);
+                    switch (opc) {
+                        case 0: cpu->f[rd] = bits_of_f32(a + b); break;
+                        case 1: cpu->f[rd] = bits_of_f32(a - b); break;
+                        case 2: cpu->f[rd] = bits_of_f32(a * b); break;
+                        default: cpu->f[rd] = bits_of_f32(a / b); break;
+                    }
+                }
+            } else if ((funct7 & 0x7Eu) == 0x50u && funct3 <= 2) { /* feq/flt/fle */
+                uint64_t r;
+                if (funct7 & 1u) {                              /* D */
+                    double a = f64_of_bits(cpu->f[rs1]), b = f64_of_bits(cpu->f[rs2]);
+                    r = (funct3 == 0) ? (a <= b) : (funct3 == 1) ? (a < b) : (a == b);
+                } else {                                        /* S */
+                    float a = f32_of_bits(cpu->f[rs1]), b = f32_of_bits(cpu->f[rs2]);
+                    r = (funct3 == 0) ? (a <= b) : (funct3 == 1) ? (a < b) : (a == b);
+                }
+                setx(cpu, rd, r ? 1 : 0);
+            } else if (rs2 == 0 && funct3 == 0) {              /* fmv moves */
+                switch (funct7) {
+                    case 0x70: setx(cpu, rd, (uint64_t)(int64_t)(int32_t)(uint32_t)cpu->f[rs1]); break; /* FMV.X.W (sign-extends) */
+                    case 0x71: setx(cpu, rd, cpu->f[rs1]); break;                                          /* FMV.X.D */
+                    case 0x78: cpu->f[rd] = (uint64_t)(uint32_t)cpu->x[rs1]; break;                        /* FMV.W.X (low 32) */
+                    case 0x79: cpu->f[rd] = cpu->x[rs1]; break;                                            /* FMV.D.X */
+                    default: return RV_EXEC_BAD_INSTR;
+                }
+            } else {
+                return RV_EXEC_BAD_INSTR;
             }
             break;
         }

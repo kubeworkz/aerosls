@@ -158,7 +158,7 @@ A spec is only real once something can run against it:
 | 7 | Capability/authority model on pointers (System/38 "pointer" semantics — tagged, unforgeable references) | 6 — ✅ done, verified on all three implementations + real kernel authority-check wiring (see §14) |
 | 8 | LPAR groundwork — partitioned SLIC instances sharing/isolating single-level store | 6, 7 — ✅ groundwork done (partition-tagged objects/uids + one enforced boundary check; see §15 for what "groundwork" does and doesn't mean here) |
 | 9 | RISC-V kernel wiring — port the host-only RV64 translator into a live `kernel/simi_x86.c`-equivalent, blocked on `kernel_riscv.c` process/loader/object-catalog infrastructure that doesn't exist yet | 5 — 🟡 mostly done (9a, 9b full, 9c-native, 9d done: Sv39 mapping API, RISC-V-native trap entry + per-hart data, a real ecall syscall round trip, and a boot-time SIMI-translate-and-execute smoke test passing 42 on real RV64-native code inside the kernel binary's own source tree; full `process.c`/scheduler parity, live Sv39 paging enablement, and 9e's real QEMU/hardware verification still not done), see §16 |
-| 10 | Float opcodes — real `FADD`/`FSUB`/`FMUL`/`FDIV`/float `LOADI`, implementing the `T_F32`/`T_F64` type tags reserved since v0.1 but never backed by any opcode | 3 — ✅ done (interpreter + x86-native; RV64 explicitly rejects float, scoped out of v1), see §16 |
+| 10 | Float opcodes — real `FADD`/`FSUB`/`FMUL`/`FDIV`/float `LOADI`, implementing the `T_F32`/`T_F64` type tags reserved since v0.1 but never backed by any opcode | 3 — ✅ done (interpreter + all three native translators: x86 SSE2, RV64 F/D, A64 scalar FP; four-way float parity 15/15/15/15, float_ops runs on every engine), see §16 |
 | 11 | Real register allocation in the native translators, replacing today's naive one-stack-slot-per-symbolic-register codegen | 3 — ✅ done (x86-native linear-scan allocator; RV64 pool audited but implementation deferred), see §16 |
 | 12 | Capability tag propagation across `CALL`/`RET` — a documented v1 limitation, currently tags never cross a procedure-call boundary | 7 — ✅ done, verified on interpreter + x86-native + RV64, see §16 |
 | 13 | Activation cache frame reclamation — re-uploading a changed object currently leaks the old translation's physical frames | 4 — ✅ done, see §16 |
@@ -452,6 +452,35 @@ on interp, 15 on the real x86-64 JIT, 15 on the A64 executor** (2156 bytes), and
 RV64's expected explicit rejection (`TX_RV_ERR_FLOAT_UNSUPPORTED`) stays the
 fourth leg of the parity (deferred per decision 6, riding Phase 9). The ARM
 runner (`tests/run_arm_tests.sh`) un-skipped `float_ops` at F3.
+
+**RV64 (F4) landed — decision 6's deferral is closed.** `simi_riscv.c`
+emits the scalar F/D GP-bounce (the x86/A64 choice repeated): operand
+bits in t0/t1, `fmv.d.x`/`fmv.w.x` into f10/f11, real
+`fadd`/`fsub`/`fmul`/`fdiv` (d and s forms), `fmv.x.d` back — with f32
+results through `fmv.x.w` + a `slli`/`srli` zero-extend, because
+FMV.X.W sign-extends per the RV64 ABI convention (verified against the
+spec's "The 32-bit result is sign-extended to 64 bits") while SIMI's
+f32 convention is high-32-zeroed. NEG is the sign-bit XOR through the
+integer cache; CMP maps 1:1 onto `feq`/`flt`/`fle` (which return an
+integer 0/1 with correct IEEE-754 unordered semantics for NaN by
+construction — GT/GE swap operands, NE is feq+xori 1). `rv64_exec.c`
+gains an f[32] file and the OP-FP (0x53) decode for exactly that
+subset, FMV.X.W implemented sign-extending per spec. `float_ops` is
+un-skipped on the RV64 runner: **15 at 2380 bytes** — the four-way
+float parity is complete (**interp 15 / x86 15 / RV64 15 / ARM 15**).
+The teeth found two latent sign-extension bugs the fixture never
+exercised (it never LOADs an f32): `simi_riscv.c`'s T_F32 load mapped
+to `i_lw` and `simi_arm.c`'s three T_F32 load forms mapped to
+LDRSW/LDURSW/LDRSW-reg, both sign-extending negative floats against
+the raw-bits convention — fixed to the zero-extending forms (`i_lwu`
+/ `ldr w` family), word-for-word, so no existing emission changes. The
+permanent rejections (float MOD, float-with-immediate, unsigned float
+CMP) now carry the same message on all three native translators (the
+ARM strerror's stale "scoped out of M0" wording was updated). The
+kernel's `sstatus.FS` lazy-save (saving f0-f31 across context
+switches, the `lazy_vector.c` twin) remains Phase 9's RISC-V kernel
+wiring; `kernel/simi_riscv.c` mirrors the tools body byte-identical
+below its header, so the codegen is in place for when that lands.
 
 ### Phase 11: Real register allocation — concrete design
 

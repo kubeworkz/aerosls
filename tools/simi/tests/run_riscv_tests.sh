@@ -13,14 +13,15 @@
 # address-0 is a Phase 1 interpreter-only convenience, not a legitimate
 # pointer under either native target's r7 scratch-pointer convention.
 #
-# float_ops.simi is skipped here (Gap Remediation SIMI Phase 10): RV64
-# float codegen is explicitly scoped OUT of Phase 10 v1 (deferred to ride
-# alongside Phase 9's RISC-V kernel wiring, itself not yet done either) --
-# simi_riscv.c is expected to reject every float-typed instruction in this
-# program with TX_RV_ERR_FLOAT_UNSUPPORTED, not produce a wrong numeric
-# answer, which is exactly what a plain FAIL-on-mismatch check here can't
-# distinguish from a real regression. See tests/float_ops.simi's own top
-# comment and AeroSLS-SIMI-ISA-v0.1.md §16 Phase 10 for the full story.
+# float_ops.simi RUNS here starting at F4 (Gap Remediation SIMI Phase 10
+# completion): simi_riscv.c now emits the scalar F/D GP-bounce codegen
+# (fadd/fsub/fmul/fdiv, feq/flt/fle, fmv) and rv64_exec.c decodes and
+# executes it against its new f file, so the 17-check fixture executes on
+# the RV64 engine and returns 15 — completing the four-way float parity
+# (interp / x86 / RV64 / ARM all 15). The A0-era skip block was removed.
+# The kernel-side sstatus.FS lazy-save (saving f0-f31 across context
+# switches) remains Phase 9's RISC-V kernel wiring; the tools-side
+# translator and executor are complete.
 set -u
 cd "$(dirname "$0")"
 ASM=../simi-asm
@@ -34,11 +35,6 @@ for src in *.simi; do
     name="${src%.simi}"
     if [ "$name" = "mem_ops" ]; then
         echo "SKIP  $name (address-0 pointer is a Phase 1 interpreter-only convenience; see mem_ops_native)"
-        skip=$((skip+1))
-        continue
-    fi
-    if [ "$name" = "float_ops" ]; then
-        echo "SKIP  $name (RV64 float codegen scoped out of Phase 10 v1; see simi_riscv.h's TX_RV_ERR_FLOAT_UNSUPPORTED)"
         skip=$((skip+1))
         continue
     fi
