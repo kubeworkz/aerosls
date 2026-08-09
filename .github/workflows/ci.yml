@@ -59,6 +59,12 @@ jobs:
       # commands_doc (the hex-vs-data field bug). They are *smoke.sh*,
       # not *_check.sh, so run_checks.sh and deploy.sh's guard gate never
       # run them.
+      #
+      # The three kernel-needing guards cannot run here (no cross
+      # toolchain). Their teeth are proven on a build host instead: after
+      # `make`, run `bash tests/run_guard_smokes.sh`, which runs every
+      # *_smoke.sh including the three build-host smokes (stack_frame_
+      # budget, kernel_image_end, no_tls_relocations).
       - name: Script-conventions guard teeth (smoke)
         run: bash tests/script_conventions_smoke.sh
 
