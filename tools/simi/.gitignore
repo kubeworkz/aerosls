@@ -12,6 +12,7 @@ bench-net
 bench-corpus
 bench-exec
 bench-exec-rv64
+cross-isa
 tests/*.tmo
 tests/*.log
 tests/*.txt
