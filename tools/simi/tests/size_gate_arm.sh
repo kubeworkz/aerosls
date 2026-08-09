@@ -991,7 +991,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888 [jmpr_chain31]=6204 [jmpr_chain32]=12828 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828 [jmpr_chain33]=7468 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -1068,6 +1068,31 @@ declare -A M0_BASELINES=(
 # bounds check with 0 b.eq (conservative and correct). This row's M0
 # baseline (12828, measured at git 1729f50) differs from M1 (8448) by
 # the accumulated emission folds (-4380).
+
+# jmpr_chain33 is M2.57: the deferred-record pool AT its TX_AR_CHAIN_DEFS
+# = 64 cap. The index is a 64-record DAG: the root product r1 = r2 + r3
+# (r2 in {0,20,...,140}, r3 in {0..18 step 2} -> ALL even numbers 0..158,
+# 80 DISTINCT values > 64) OVERFLOWS the image merge cap and DEFERS
+# (M2.30: record 0, CD_SLOT/CD_SLOT); then 63 IN-PLACE ADDs r1 = r1 + r4
+# with r4 = {2} (a singleton — the closure stays {r1,r2,r3,r4} = 4 <= 8)
+# each defer over the deferred source (M2.32/M2.41) — 64 records total,
+# EXACTLY the pool, all allocating (def = 63 at the dispatch). Under the
+# shipped EQUAL caps the record machinery is conservative (the M2.42
+# vestigial note): the root's 80-value true set OVERFLOWS the BIG store
+# on materialization (chain_merge_big collapses to UNKNOWN, exact-or-
+# conservative — never a truncated set), so the dispatch falls to the
+# TABLE — 0 b.eq, and runtime 252 (120 + 6 + 63*2, all join BCs fall
+# through) dispatches through the table's bounds check to block63's
+# LOADI #7777 -> PASS 7777 on all four engines. The boundaries are the
+# ad-hoc controls: (A) BIG=128 -> the same DAG materializes 80 values,
+# the chain fires with the 64 in-range candidates (even 126..252), 64
+# b.eq, runtime 252 = the sixty-fourth (sound when reachable); (B) a
+# 65th in-place ADD -> the pool is exhausted (g_chain_ndef >= 64 ->
+# -1), r1 UNKNOWN, the table again (conservative, PASSes its runtime
+# 256 through the bounds check). Dump-verified (shipped): 0 b.eq, the
+# full table dispatch. This row's M0 baseline (7468, measured at git
+# 1729f50) differs from M1 (6444) by the accumulated emission folds
+# (-1024).
 
 pass=0
 fail=0
