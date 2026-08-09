@@ -27,6 +27,19 @@ int sbi_getchar(void) {
     return (int)legacy.error;
 }
 
+void sbi_system_reset(void) {
+    /* System Reset Extension (SBI v0.3+/v1.0): an ecall to M-mode
+     * OpenSBI, which performs the reset on the firmware's behalf. A
+     * SHUTDOWN reset on QEMU -M virt powers the machine off -- the qemu
+     * process exits rc=0 -- which is the real, honest "exit" for the
+     * RISC-V port: the kernel has no process table to tear down (see
+     * riscv_syscall_dispatch()'s comment in trap_riscv.c). Returns
+     * (error in a0) only if the firmware lacks the extension; callers
+     * must not assume the machine is gone just because the call returned. */
+    sbi_call(SBI_EXT_SRST, SBI_SRST_RESET,
+             SBI_SRST_RESET_TYPE_SHUTDOWN, SBI_SRST_RESET_REASON_NONE, 0);
+}
+
 // Global text canvas array used to buffer incoming shell commands from the virtual UART
 #define SHELL_BUF_SIZE 256
 static char riscv_shell_input_buffer[SHELL_BUF_SIZE];

@@ -68,17 +68,22 @@ void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top) {
     rv_print_str("[TRAP] stvec + sscratch armed for this hart.\n");
 }
 
-/* Gap Remediation SIMI Phase 9 (sub-phase 9d): the minimal, headless-only
- * syscall surface. Only SYS_SLS_EXIT is wired -- there is no process
- * table, no scheduler, and no user/kernel privilege separation on RISC-V
- * yet (paging is still Bare everywhere, see user_paging_riscv.h), so
- * kernel/process.c's real process_exit() (which assumes a live
- * ProcessDescriptor entered via kernel_enter_ring3(), an x86-only
- * mechanism this phase does not port -- see §16 Phase 9's findings) has
- * nothing valid to act on here. This just reports the exit code and
- * halts the hart, which is the honest, correct behavior for "a bare
- * translated SIMI program finished running with nothing else going on,"
- * not a stand-in for real process teardown. */
+/* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): the minimal,
+ * headless-only syscall surface. Only SYS_SLS_EXIT is wired -- there is
+ * no process table, no scheduler, and no user/kernel privilege
+ * separation on RISC-V yet (paging is still Bare everywhere, see
+ * user_paging_riscv.h), so kernel/process.c's real process_exit() (which
+ * assumes a live ProcessDescriptor entered via kernel_enter_ring3(), an
+ * x86-only mechanism this phase does not port -- see §16 Phase 9's
+ * findings) has nothing valid to act on here. Since 9f the exit is a
+ * REAL machine shutdown through OpenSBI's SBI_SRST extension (an ecall
+ * to M-mode OpenSBI powers the machine off -- on QEMU the process exits
+ * rc=0), which is the honest, correct behavior for "a bare translated
+ * SIMI program finished running with nothing else going on," not a
+ * stand-in for real process teardown. Reached either from an ecall
+ * (exception 9, only once/if OpenSBI ever delegates it) or from the
+ * ebreak trigger (exception 3, delegated today -- see
+ * riscv_trap_dispatch()'s comment and trap_riscv.h). */
 void riscv_syscall_dispatch(struct RvPerHartData* phd) {
     uint64_t num = phd->trap_frame[TF_A7];
     uint64_t arg0 = phd->trap_frame[TF_A0];
@@ -86,7 +91,12 @@ void riscv_syscall_dispatch(struct RvPerHartData* phd) {
     if (num == RV_SYS_EXIT) {
         rv_print_str("[SYSCALL] SYS_SLS_EXIT, code=");
         rv_print_udec(arg0);
-        rv_print_str(" -- halting hart (no process table on RISC-V yet, see doc section 16 Phase 9).\n");
+        rv_print_str(" -- powering off via OpenSBI SBI_SRST (SHUTDOWN)...\n");
+        sbi_system_reset();
+        /* Only reached if the firmware lacks the SRST extension (or the
+         * reset failed) -- sbi_system_reset() documents that callers
+         * must not assume the machine is gone just because it returned. */
+        rv_print_str("[SYSCALL] SBI_SRST unsupported or failed -- halting hart instead.\n");
         while (1) { __asm__ volatile("wfi"); }
     }
 
@@ -115,11 +125,30 @@ void riscv_trap_dispatch(struct RvPerHartData* phd) {
     if (code == 9) {   /* Environment call from S-mode */
         riscv_syscall_dispatch(phd);
         /* riscv_syscall_dispatch() never returns today (every path halts
-         * the hart) -- but advance sepc past the ecall regardless, so a
-         * future syscall that DOES return doesn't re-trap on the same
-         * ecall instruction forever. ecall is always a 4-byte instruction
-         * (RISC-V has no compressed-C encoding for it), so +4 is exact,
-         * not a heuristic. */
+         * the hart or powers the machine off) -- but advance sepc past
+         * the ecall regardless, so a future syscall that DOES return
+         * doesn't re-trap on the same ecall instruction forever. ecall is
+         * always a 4-byte instruction (RISC-V has no compressed-C
+         * encoding for it), so +4 is exact, not a heuristic. */
+        phd->trap_frame[TF_SEPC] += 4;
+        return;
+    }
+
+    if (code == 3 && phd->trap_frame[TF_A7] == RV_SYS_EXIT) {
+        /* S-mode syscall trigger (Phase 9f): OpenSBI's default MEDELEG
+         * does not delegate exception 9 (ecall from S-mode), so an ecall
+         * carrying the syscall ABI never reaches our stvec handler -- it
+         * bounces as an SBI call. ebreak (exception 3) IS delegated, so
+         * the kernel's syscall convention is carried through ebreak
+         * instead: a7 = syscall number, a0 = argument -- the same ABI
+         * the ecall path above uses (see trap_riscv.h). The SIMI boot
+         * smoke issues exactly this (kernel/kernel_riscv.c), and
+         * riscv_syscall_dispatch() powers the machine off via SBI_SRST,
+         * so this is the smoke's terminal event. If dispatch ever
+         * returns, advance past the ebreak -- the assembler emits the
+         * 4-byte non-compressed form for the `ebreak` mnemonic -- and
+         * continue. */
+        riscv_syscall_dispatch(phd);
         phd->trap_frame[TF_SEPC] += 4;
         return;
     }

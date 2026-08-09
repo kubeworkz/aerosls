@@ -9,6 +9,10 @@
 #define SBI_EXT_DBCN                0x4442434E  // Debug Console Extension
 #define SBI_DBCN_WRITE              0
 #define SBI_DBCN_READ               1
+#define SBI_EXT_SRST                0x53525354  // System Reset Extension ("SRST", SBI v0.3+)
+#define SBI_SRST_RESET              0
+#define SBI_SRST_RESET_TYPE_SHUTDOWN 0
+#define SBI_SRST_RESET_REASON_NONE  0
 
 struct SBIReturn {
     long error;
@@ -36,9 +40,8 @@ static inline struct SBIReturn sbi_call(unsigned long ext, unsigned long fid,
     ret.error = a0;
     ret.value = a1;
     return ret;
-}
-
-void sbi_putchar(char c);
+}void sbi_putchar(char c);
 int sbi_getchar(void);
+void sbi_system_reset(void);
 
 #endif
