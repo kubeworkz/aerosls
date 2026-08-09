@@ -29,6 +29,10 @@
 #include "simi_isa.h"
 #include "simi_obj.h"
 #include "simi_interp.h"
+#ifndef SIMI_INTERP_NO_MAIN
+#include "bench_baselines_interp.h"   /* the committed SIMI-step table the
+                                       * --steps check asserts against */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -543,20 +547,34 @@ int simi_interp_run(SimiObject obj, uint32_t entry_pc, long *steps_out, long lon
 #ifndef SIMI_INTERP_NO_MAIN   /* bench_exec_interp.c defines this and links
                                * simi_interp.c for simi_interp_run; the
                                * standalone simi-run keeps its own main */
+/* M2.81: the --steps flag trips the committed SIMI-count check — the
+ * interpreter-leg mirror of the simi-arm-verify/simi-riscv-verify
+ * --steps tripwires (M2.75/M2.76). The parity runner (run_tests.sh)
+ * passes --steps on every fixture, so after a successful run the
+ * executed SIMI-instruction count must equal the committed count in
+ * bench_baselines_interp.h (the same table bench-exec-interp asserts);
+ * a decode/emission/interpreter regression that moves a fixture's work
+ * count FAILS the row here, at the earliest point in the pipeline. The
+ * fixture name is derived from the .tmo path (basename, .tmo -> .simi
+ * — the runner's rule); a fixture with no committed row fails loudly.
+ * Without --steps the standalone behaves exactly as before. */
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s program.tmo entry_name\n", argv[0]);
+    int check_steps = 0;
+    int argi = 1;
+    if (argc >= 2 && strcmp(argv[1], "--steps") == 0) { check_steps = 1; argi++; }
+    if (argc - argi < 2) {
+        fprintf(stderr, "usage: %s [--steps] program.tmo entry_name\n", argv[0]);
         return 1;
     }
     SimiObject obj = {0};
-    if (simi_obj_read(argv[1], &obj) != 0) return 1;
+    if (simi_obj_read(argv[argi], &obj) != 0) return 1;
 
     uint32_t entry_pc = UINT32_MAX;
     for (uint32_t i = 0; i < obj.num_entries; i++) {
-        if (strcmp(obj.entries[i].name, argv[2]) == 0) { entry_pc = obj.entries[i].offset; break; }
+        if (strcmp(obj.entries[i].name, argv[argi + 1]) == 0) { entry_pc = obj.entries[i].offset; break; }
     }
     if (entry_pc == UINT32_MAX) {
-        fprintf(stderr, "no such entry point '%s'\n", argv[2]);
+        fprintf(stderr, "no such entry point '%s'\n", argv[argi + 1]);
         return 1;
     }
 
@@ -564,6 +582,34 @@ int main(int argc, char **argv) {
     long long result = 0;
     int rc = simi_interp_run(obj, entry_pc, &steps, &result);
     printf("%lld\n", result);
+
+    if (check_steps) {
+        const char *base = strrchr(argv[argi], '/');
+        base = base ? base + 1 : argv[argi];
+        size_t blen = strlen(base);
+        char fname[128];
+        if (blen >= 4 && strcmp(base + blen - 4, ".tmo") == 0) {
+            memcpy(fname, base, blen - 4);
+            memcpy(fname + blen - 4, ".simi", 6);   /* 5 chars + NUL */
+        } else {
+            snprintf(fname, sizeof(fname), "%s", base);
+        }
+
+        const struct InterpBaseline *bl = NULL;
+        for (size_t i = 0; i < sizeof(INTERP_BASELINES) / sizeof(INTERP_BASELINES[0]); i++)
+            if (strcmp(INTERP_BASELINES[i].name, fname) == 0) { bl = &INTERP_BASELINES[i]; break; }
+        if (!bl) {
+            fprintf(stderr, "--steps: no committed baseline for '%s' (update bench_baselines_interp.h — see plan doc §10.170)\n", fname);
+            rc = 1;
+        } else if (steps != bl->steps) {
+            fprintf(stderr, "--steps: executed %ld instructions != committed %lld (interpreter/decode/emission regression)\n",
+                    steps, bl->steps);
+            rc = 1;
+        } else {
+            fprintf(stderr, "--steps: ok (%ld)\n", steps);
+        }
+    }
+
     simi_obj_free(&obj);
     return rc;
 }

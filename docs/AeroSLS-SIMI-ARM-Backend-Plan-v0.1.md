@@ -6094,6 +6094,56 @@ bench_exec_interp.c (new), bench_baselines_interp.h (new, 97 rows),
 the Makefile (bench-exec-interp target in `all`/`clean`) and
 .gitignore.
 
+### 10.172 M2.81 — the interp leg gets its parity-suite tripwire (design)
+
+M2.80 gave the interpreter leg its cost gate (bench-exec-interp) but,
+unlike the translated legs, it had no tripwire in the PARITY SUITE
+itself: M2.75/M2.76 wired `--steps`/`--bytes` into the ARM/RV64/x86
+runners, so a decode or emission regression fails the fixture at the
+earliest point in the pipeline — the interpreter runner (run_tests.sh)
+still only checked the result value. M2.81 closes that with a `--steps`
+flag on simi-run, the exact M2.75/M2.76 mirror:
+
+- `simi-run [--steps] program.tmo entry_name` — with the flag, after a
+  successful run (top-level RET) the executed SIMI-instruction count
+  must equal the committed count in `bench_baselines_interp.h` (the
+  same single source of truth bench-exec-interp asserts; the header is
+  included only in the non-bench build, so the bench TU stays
+  warning-free). The fixture name is derived from the .tmo path
+  (basename, `.tmo` -> `.simi` — the runner's rule); a fixture with no
+  committed row FAILS loudly (exit 1), the same deliberate-update
+  discipline as every other table. The check prints `--steps: ok (N)`
+  to stderr (the per-fixture .run.log) and exits 1 with
+  `--steps: executed N instructions != committed M (...)` on any
+  mismatch. Without the flag the standalone behaves exactly as before.
+- `run_tests.sh` now invokes `simi-run --steps` on every fixture, so
+  all 97 runner fixtures (the same set as the bench table) assert their
+  committed count during the normal `make test` parity run. The result
+  comparison is untouched — the check is stderr-only.
+- Makefile: `simi-run` gains `bench_baselines_interp.h` as a
+  dependency, so the tripwire table is always current with the build
+  (the M2.27 stale-binary lesson).
+
+### 10.173 M2.81 gate results (measured)
+
+**Interp parity 97 passed, 0 failed — every fixture's .run.log shows
+`--steps: ok (N)` (97/97)**, proving each committed count matches the
+harness's own execution exactly. Teeth: corrupting add.simi's committed
+6->99 fails the row "FAIL add (interpreter exited 1)" with the log
+"--steps: executed 6 instructions != committed 99 (interpreter/decode/
+emission regression)"; reverted to PASS (97/97, steps-ok 97/97). One
+implementation bug caught in testing: the `.tmo`->`.simi` name swap
+initially copied 5 bytes (missing the NUL), leaving a garbage byte on
+uninitialized stack — 11 fixtures failed nondeterministically on the
+lookup; fixed by copying 6 bytes, then deterministic 97/97. Emission
+untouched (no simi_arm.c change), so the size gate stays **96/96,
+46224 saved, all rows byte-identical**; four-way parity interp 97/97,
+x86/RV64/ARM 96/0/3; all seven `all` checks PASS (bench-exec-interp
+re-verified against the modified simi_interp.c). Changed:
+simi_interp.c (the --steps check + guarded header include),
+run_tests.sh (--steps on every fixture), the Makefile (simi-run dep),
+plan doc §10.172/10.173.
+
 ---
 
 ## Sources consulted
