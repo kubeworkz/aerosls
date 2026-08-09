@@ -1,0 +1,60 @@
+; jmpr_chain44.simi — M2.70: the fold fixpoint's RELAXATION-FLIP re-fold,
+; the legitimate convergence case the M2.69 "exactly 3 scans" argument
+; missed. M2.69's bound holds for rule-1-driven retroactive splits (the
+; accreting g_pc_target marks make those un-folds PERMANENT), but the
+; M2.18 relaxation's per-pass exclusion (g_fold_tgt_prev, recomputed
+; from the PREVIOUS pass's fold set) can CLEAR: when a JMPR that folded
+; INTO a relax-eligible head un-folds, the head drops out of the next
+; pass's exclusion and its JMPR RE-FOLDS — a 4th scan.
+;
+; The shape: J3's head H3 (pc 10) is relax-eligible via the unique
+; forward edge S (pc 5: BR 10, H3-1 = pc 9 is RET). J2 (pc 8) folds
+; FORWARD into H3 in pass 1 — making H3 a fold target — while J1 (pc 4)
+; folds to T1 = 6, INSIDE J2's chain (2 < 6 < 8):
+;
+;   pass 1: J1 -> 6, J2 -> 10, J3 -> 12 (all fold; H3 relax applies)
+;   pass 2: T1's rule-1 mark at pc 6 kills r2 PERMANENTLY (J2 un-folds,
+;           its fold to 10 gone from the fold set); H3's exclusion
+;           (J2's pass-1 fold) kills r3 at H3 -> J3 un-folds
+;   pass 3: J2's fold to 10 is GONE from pass 2's fold set, so H3 is no
+;           longer excluded -> the relaxation restores r3 = 12 at H3 ->
+;           J3 RE-FOLDS (the flip: an un-fold ENABLED a re-fold)
+;   pass 4: same -> converge.  FIXPOINT passes=3, net NEVER fires.
+;
+; J3's re-fold is STABLE (its target 12 is a fall-through fold, not the
+; head 10 — no self-reentry, no 2-cycle). The 2-cycle requires a fold
+; INTO the head itself (chain36); the flip here is a one-time transient.
+; The net's trip count must therefore sit ABOVE passes=3 — M2.70 tightens
+; 512 -> 16 (5x margin over the constructible legit max, 8x over the
+; corpus max of passes=2). Reverting the flip (making H3 non-eligible,
+; e.g. H3-1 = ADD instead of RET) keeps J3 folded from pass 1 -> a
+; different emission, caught by the size-gate row.
+;
+; Runtime (correct on all four engines): J1 dispatches r1 = 6 -> pc 6,
+; J2 dispatches r2 = 10 -> pc 10, J3 dispatches r3 = 12 -> pc 12 (the
+; final target: r0 = 1). The BR at pc 5 and the RET at pc 9 are dead at
+; runtime (J1/J2's dispatches skip them). J1 and J3 fold (final state),
+; J2 is the single dynamic JMPR -> the M2.25 1-candidate inline chain.
+; Expected result: 1 (r0 = 0 + 1 at pc 12).
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #6, i64       ; J1's index — folds to T1 = 6 (non-fall-through)
+    LOADI r2, #10, i64      ; J2's index — folds to H3 = 10 in pass 1
+    LOADI r3, #12, i64      ; J3's index — folds to T3 = 12 (fall-through)
+    JMPR r1                 ; J1 at pc 4 — folds to 6, STAYS folded
+S:  BR H3                   ; pc 5 — the unique forward edge into H3
+                            ; (dead at runtime: J1 dispatches to 6)
+T1: ADD r7, r7, #0, i64     ; pc 6 — J1's target, INSIDE J2's chain
+                            ; (2 < 6 < 8): the rule-1 mark kills r2 in
+                            ; pass 2 — J2's un-fold is PERMANENT
+    ADD r7, r7, #0, i64     ; pc 7 — filler
+    JMPR r2                 ; J2 at pc 8 — folds to 10 in pass 1, un-folds
+                            ; in pass 2 (the flip's trigger), stays
+    RET                     ; pc 9 — dead at runtime; H3-1 terminal
+H3: ADD r7, r7, #0, i64     ; pc 10 — J3's relax-eligible head: r3 restored
+                            ; here in passes 1, 3, 4 (not 2 — excluded)
+    JMPR r3                 ; J3 at pc 11 — un-folds in pass 2, RE-FOLDS
+                            ; in pass 3 (the relaxation-flip), stable
+    ADD r0, r0, #1, i64     ; pc 12 — T3: the final target: r0 = 1
+    RET

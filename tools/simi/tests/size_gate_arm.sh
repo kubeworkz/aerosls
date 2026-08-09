@@ -992,7 +992,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508    [jmpr_chain41]=7556 [jmpr_chain42]=5612 [jmpr_chain43]=1748 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508    [jmpr_chain41]=7556 [jmpr_chain42]=5612    [jmpr_chain43]=1748 [jmpr_chain44]=1332 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -1305,10 +1305,13 @@ declare -A M0_BASELINES=(
 # the fold set is monotone-decreasing and every pass-1 mark is already
 # live in pass 2 — all five dependent JMPRs un-fold in the SAME pass,
 # convergence is exactly 3 scans (fold-all, un-fold-all, confirm) for
-# ANY cascade size, and the pass count never scales with the number of
-# JMPRs. The M2.18 relaxation's only non-monotone force is the
-# head-reentry 2-cycle (chain36's pin), so the 512-pass net fires ONLY
-# on the 2-cycle; a slow-converging fold analysis does not exist.
+# any RULE-1-driven cascade size, and the pass count never scales with
+# the number of JMPRs. The M2.18 relaxation's only non-monotone force
+# is the head-reentry 2-cycle (chain36's pin) — and M2.70 (chain44)
+# corrects the "ANY": when a fold INTO a relax-eligible head un-folds,
+# the head's JMPR re-folds once (a legitimate 4th scan, passes=3). The
+# 2-cycle is the only DIVERGENCE, so the safety net fires only there;
+# a slow-converging fold analysis still does not exist.
 # Instrumented (temporary, reverted): chain43 FIXPOINT passes=2 relax=1
 # net=0 (3 scans, net silent); chain36 at the same level FIXPOINT
 # passes=0 relax=0 net=1 — the net fired at 513, disabled relaxation,
@@ -1326,6 +1329,34 @@ declare -A M0_BASELINES=(
 # (-192) — the cascade's un-folds are the point, not the size: the row
 # pins the 3-scan convergence (teeth: reverting the rule-1 mark keeps
 # J2..J6 folded -> g_alloc = 1 -> cache mode -> a different emission).
+# jmpr_chain44 is M2.70: the fold fixpoint's RELAXATION-FLIP re-fold —
+# the legitimate convergence case that CORRECTS the M2.69 "exactly 3
+# scans for ANY cascade" bound. The flip: J2 (pc 8) folds forward INTO
+# J3's relax-eligible head H3 (pc 10) in pass 1, while J1 (pc 4) folds
+# to T1 = 6 inside J2's chain. Pass 2: T1's rule-1 mark kills r2
+# PERMANENTLY (J2 un-folds — its fold to 10 leaves the fold set); H3's
+# per-pass exclusion (g_fold_tgt_prev, recomputed from the PREVIOUS
+# pass's fold set) kills r3 at H3 -> J3 un-folds. Pass 3: J2's fold to
+# 10 is GONE from pass 2's fold set, so H3 is no longer excluded -> the
+# relaxation restores r3 = 12 at H3 -> J3 RE-FOLDS (an un-fold ENABLED a
+# re-fold). Pass 4: same -> converge. Instrumented: FIXPOINT passes=3
+# relax=1 net=0 — 4 scans, the net NEVER fires (it stays silent on all
+# legitimate input; the corpus max is passes=2). J3's re-fold is STABLE
+# (its target 12 is fall-through, not the head 10 — no 2-cycle); the
+# flip is a one-time transient, so the legitimate max is passes=3.
+# M2.70 tightens the safety net 512 -> 16 (5x margin over passes=3,
+# 8x over the corpus max) — the 2-cycle (chain36) still fires, now at
+# pass 17 instead of 513 (~30x faster translate), with the same
+# un-relaxed restart and the same emission.
+# Emission: J1 and J3 fold (final state), J2 is the single dynamic JMPR
+# -> the M2.25 1-candidate inline chain (cmp + b.eq for 10); 0 table
+# words. Runtime 6 -> 10 -> 12 -> r0 = 1 on all four engines (the BR at
+# pc 5 and the RET at pc 9 are dead). This row's M0 baseline (1332,
+# measured at git 1729f50 — the naive translator, all 3 JMPRs via
+# table) differs from M1 (1088) by the M2.24 table compaction, the two
+# folds, and the inline chain (-244). Teeth: making H3 non-eligible
+# (H3-1 = ADD instead of RET) keeps J3 folded from pass 1 -> a
+# different emission, caught by the row.
 
 pass=0
 fail=0
