@@ -5039,6 +5039,69 @@ pure ceiling:
   runtime on every engine. enc-check clean, a64-f0 PASS, stress
   all-green.
 
+### 10.136 M2.63 — the 13-register OVER-cap boundary pinned (as built)
+
+M2.62 pinned the at-cap turn-over (jmpr_chain38 — the closure
+{r1..r12} = exactly TX_AR_CHAIN_REGS = 12); M2.63 pins the other
+side of the same boundary: a closure needing EXACTLY THIRTEEN
+registers — the smallest the cap rejects — must truncate
+conservatively to the runtime table. This is a pure probe + pin:
+**simi_arm.c is unchanged** (the truncation is the existing
+`ntr < TX_AR_CHAIN_REGS` guard on the closure scan, first committed
+at M2.26).
+
+**The fixture (jmpr_chain39).** The index is chain38's six stages
+plus one intermediate (r13 = r2 + r6, then r1 = r13 + r3) and a
+2-way r7 join {0, 200} (narrowed from chain38's 3-way so the
+COMPLETED image — the control's — fits the 96-cap). The closure
+scan fills in stream order: round 1 {r1, r13, r3}, round 2 +{r2,
+r6, r7}, round 3 +{r4, r5, r11, r12} (ntr=10), round 4 +r8 (11)
+then +r9 (12 — the `ntr < cap` guard now blocks r10). Tracked =
+{r1, r13, r3, r2, r6, r7, r4, r5, r11, r12, r8, r9} = TWELVE, and
+r10 — the thirteenth feeder — is untracked. Its set stays UNKNOWN
+in the walk, so r5 = r9 + r10 is UNKNOWN, poisoning r2 → r13 → r1:
+no candidate set, no chain, the runtime table. Runtime 345 (all
+join BCs fall through: 10 + 10 + 5 + 50 + 5 + 200 → r13 = 35 + 55
+= 90, r3 = 55 + 200 = 255, r1 = 90 + 255 = 345) dispatches through
+the table's bounds check to block33 at pc 345 → LOADI #3200 → PASS
+on all four engines.
+
+**Dump-verified (shipped):** 0 b.eq, 0 b — the M2.24 table
+dispatch (cbz bounds-check, 2-word li32 base, add-shift, ldr W,
+br, UDF) and the 350-entry table; 6556 bytes. The body UDF and the
+dispatch UDF are the two 0x00000000 words, matching jmpr_dyn's
+shape.
+
+**The turn-over control (REGS=13, ad hoc, reverted):** the closure
+completes — r10 tracked, r5 known, r13 = {40..90 step 5} (11),
+r3 = 8 values, r1 = r13 + r3 = 28 distinct values (14 + 14 sums,
+≤ TX_AR_CHAIN_MAX = 96) — and the **28-candidate chain fires**
+(dump: 28 b.eq, 0 table words, 5344 bytes), still PASS 3200: 345
+is the LAST candidate. The same fixture, the chain shape — the
+discriminator is the dump + byte size, not the result. Reverting
+the control restored the shipped 6556-byte table emission exactly.
+
+### 10.137 M2.63 gate results (measured)
+
+Total emitted bytes across the now-92-program parity set: **M0
+230776 → M1 188320, 42456 saved**. One row added, **zero moved** —
+the totals delta is EXACTLY chain39's row (M0 +7964, M1 +6556), so
+all 90 shared rows are byte-identical; the pin changes nothing:
+
+- jmpr_chain39 7964 → 6556 (−1408, new 91st row; M0 baseline
+  measured at git 1729f50) — the 13-register over-cap pin: the
+  table path itself is byte-identical to M0's shape (no chain,
+  no fold); the −1408 is M2.24's table compaction (32-bit
+  entries, 2-word base) plus the accumulated emission folds, on
+  a 350-instruction body.
+- Row-by-row accounting: **all 90 shared rows byte-identical** —
+  the gate total moved by exactly chain39's M1.
+- Four-way parity: 365 PASS, 0 FAIL — all 92 expected-result
+  programs on all four engines (interp 92/92, x86 91/0/3, RV64
+  91/0/3, ARM 91/0/3); chain39's table dispatch executes at
+  runtime on every engine. enc-check clean, a64-f0 PASS, stress
+  all-green.
+
 ---
 
 ## Sources consulted
