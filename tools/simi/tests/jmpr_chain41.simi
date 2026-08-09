@@ -1,0 +1,336 @@
+; jmpr_chain41.simi — M2.65: the deferred-record pool ONE PAST
+; its 96-cap. M2.64 pinned the at-cap turn-over (jmpr_chain40
+; — the DAG {root + 95 adds} = exactly 96 records fits the
+; pool, r1's def = 95 at the dispatch); this pin regression-
+; guards the OVER-cap side: a DAG needing EXACTLY NINETY-SEVEN
+; records — the smallest the pool rejects — must exhaust it
+; conservatively at the walk. The index is chain40's shape
+; plus ONE more in-place add:
+;   root: r1 = r2 + r3, r2 in {0,10,...,90} (10 arms), r3 in
+;         {0..9} (10 arms) -> ALL 100 values {0..99} DISTINCT
+;         (> TX_AR_CHAIN_MAX 96) -> the M2.30 deferral: record 0.
+;   96 in-place ADDs r1 = r1 + r4, r4 = {2}: records 1..95
+;         allocate (96 allocations total), and the 96th add's
+;         allocation — the 97th — returns -1 (g_chain_ndef = 96
+;         >= TX_AR_CHAIN_DEFS 96): r1 falls to FLAT UNKNOWN at
+;         the walk (instrumented: ndef = 96, r1's def = -1).
+; The dispatch is the TABLE — 0 b.eq — and runtime 291 (the
+; joins' fall-through arms 90 + 9, plus 96*2) passes the
+; bounds check to block0 at pc 291 -> LOADI #8888, on all four
+; engines. 291 is the LAST (100th) value of the true set
+; {192..291}: any truncated candidate set — a non-conservative
+; exhaustion fallback that kept a partial image — would miss it
+; and UDF-trap (rc=1), so the four-way PASS proves the -1
+; fallback is exact-or-conservative, not truncated. The
+; boundary control (DEFS=97 ad hoc): the 97-record DAG FITS the
+; pool (instrumented: ndef = 97, r1's def = 96), and the 100-
+; value materialization then collapses conservatively at the
+; BIG store (chain_merge_big -> UNKNOWN) — the SAME table, a
+; DIFFERENT mechanism (pool exhaustion at the walk vs
+; materialization collapse), proven by the walk state. With
+; chain40 (96 records, fits, r1.def = 95) and this pin (97
+; records, exhausts, r1.def = -1), the DEFS boundary is
+; bracketed from both sides: at-cap fits the pool, one-past
+; exhausts conservatively.
+; Expected result: 8888
+.entry main
+main:
+    ENTER #8            ; pc 0
+    LOADI r0, #0, i64   ; pc 1 — zero: every join BC below falls through
+    LOADI r2, #0, i64 ; pc 2 — r2 arm 0 (0)
+    BC r0, J2           ; pc 3 — falls through (delivers {r2:0} at J2)
+    LOADI r2, #10, i64 ; pc 4 — r2 arm 1 (10)
+    BC r0, J2           ; pc 5 — falls through (delivers {r2:10} at J2)
+    LOADI r2, #20, i64 ; pc 6 — r2 arm 2 (20)
+    BC r0, J2           ; pc 7 — falls through (delivers {r2:20} at J2)
+    LOADI r2, #30, i64 ; pc 8 — r2 arm 3 (30)
+    BC r0, J2           ; pc 9 — falls through (delivers {r2:30} at J2)
+    LOADI r2, #40, i64 ; pc 10 — r2 arm 4 (40)
+    BC r0, J2           ; pc 11 — falls through (delivers {r2:40} at J2)
+    LOADI r2, #50, i64 ; pc 12 — r2 arm 5 (50)
+    BC r0, J2           ; pc 13 — falls through (delivers {r2:50} at J2)
+    LOADI r2, #60, i64 ; pc 14 — r2 arm 6 (60)
+    BC r0, J2           ; pc 15 — falls through (delivers {r2:60} at J2)
+    LOADI r2, #70, i64 ; pc 16 — r2 arm 7 (70)
+    BC r0, J2           ; pc 17 — falls through (delivers {r2:70} at J2)
+    LOADI r2, #80, i64 ; pc 18 — r2 arm 8 (80)
+    BC r0, J2           ; pc 19 — falls through (delivers {r2:80} at J2)
+    LOADI r2, #90, i64 ; pc 20 — r2 arm 9 (90) fall-through base
+J2:                     ; (label) — join: r2 in {0,10,...,90}
+    LOADI r3, #0, i64 ; pc 21 — r3 arm 0 (0)
+    BC r0, J3           ; pc 22 — falls through (delivers {r3:0} at J3)
+    LOADI r3, #1, i64 ; pc 23 — r3 arm 1 (1)
+    BC r0, J3           ; pc 24 — falls through (delivers {r3:1} at J3)
+    LOADI r3, #2, i64 ; pc 25 — r3 arm 2 (2)
+    BC r0, J3           ; pc 26 — falls through (delivers {r3:2} at J3)
+    LOADI r3, #3, i64 ; pc 27 — r3 arm 3 (3)
+    BC r0, J3           ; pc 28 — falls through (delivers {r3:3} at J3)
+    LOADI r3, #4, i64 ; pc 29 — r3 arm 4 (4)
+    BC r0, J3           ; pc 30 — falls through (delivers {r3:4} at J3)
+    LOADI r3, #5, i64 ; pc 31 — r3 arm 5 (5)
+    BC r0, J3           ; pc 32 — falls through (delivers {r3:5} at J3)
+    LOADI r3, #6, i64 ; pc 33 — r3 arm 6 (6)
+    BC r0, J3           ; pc 34 — falls through (delivers {r3:6} at J3)
+    LOADI r3, #7, i64 ; pc 35 — r3 arm 7 (7)
+    BC r0, J3           ; pc 36 — falls through (delivers {r3:7} at J3)
+    LOADI r3, #8, i64 ; pc 37 — r3 arm 8 (8)
+    BC r0, J3           ; pc 38 — falls through (delivers {r3:8} at J3)
+    LOADI r3, #9, i64 ; pc 39 — r3 arm 9 (9) fall-through base
+J3:                     ; (label) — join: r3 in {0..9}
+    ADD r1, r2, r3, i64 ; pc 40 — root: 100 values {0..99} > 96 -> record 0 (overflow defer)
+    LOADI r4, #2, i64 ; pc 41 — r4 = {2} (flat singleton)
+    ADD r1, r1, r4, i64 ; pc 42 — in-place add 1: record 1 = op(rec(0), slot r4)
+    ADD r1, r1, r4, i64 ; pc 43 — in-place add 2: record 2 = op(rec(1), slot r4)
+    ADD r1, r1, r4, i64 ; pc 44 — in-place add 3: record 3 = op(rec(2), slot r4)
+    ADD r1, r1, r4, i64 ; pc 45 — in-place add 4: record 4 = op(rec(3), slot r4)
+    ADD r1, r1, r4, i64 ; pc 46 — in-place add 5: record 5 = op(rec(4), slot r4)
+    ADD r1, r1, r4, i64 ; pc 47 — in-place add 6: record 6 = op(rec(5), slot r4)
+    ADD r1, r1, r4, i64 ; pc 48 — in-place add 7: record 7 = op(rec(6), slot r4)
+    ADD r1, r1, r4, i64 ; pc 49 — in-place add 8: record 8 = op(rec(7), slot r4)
+    ADD r1, r1, r4, i64 ; pc 50 — in-place add 9: record 9 = op(rec(8), slot r4)
+    ADD r1, r1, r4, i64 ; pc 51 — in-place add 10: record 10 = op(rec(9), slot r4)
+    ADD r1, r1, r4, i64 ; pc 52 — in-place add 11: record 11 = op(rec(10), slot r4)
+    ADD r1, r1, r4, i64 ; pc 53 — in-place add 12: record 12 = op(rec(11), slot r4)
+    ADD r1, r1, r4, i64 ; pc 54 — in-place add 13: record 13 = op(rec(12), slot r4)
+    ADD r1, r1, r4, i64 ; pc 55 — in-place add 14: record 14 = op(rec(13), slot r4)
+    ADD r1, r1, r4, i64 ; pc 56 — in-place add 15: record 15 = op(rec(14), slot r4)
+    ADD r1, r1, r4, i64 ; pc 57 — in-place add 16: record 16 = op(rec(15), slot r4)
+    ADD r1, r1, r4, i64 ; pc 58 — in-place add 17: record 17 = op(rec(16), slot r4)
+    ADD r1, r1, r4, i64 ; pc 59 — in-place add 18: record 18 = op(rec(17), slot r4)
+    ADD r1, r1, r4, i64 ; pc 60 — in-place add 19: record 19 = op(rec(18), slot r4)
+    ADD r1, r1, r4, i64 ; pc 61 — in-place add 20: record 20 = op(rec(19), slot r4)
+    ADD r1, r1, r4, i64 ; pc 62 — in-place add 21: record 21 = op(rec(20), slot r4)
+    ADD r1, r1, r4, i64 ; pc 63 — in-place add 22: record 22 = op(rec(21), slot r4)
+    ADD r1, r1, r4, i64 ; pc 64 — in-place add 23: record 23 = op(rec(22), slot r4)
+    ADD r1, r1, r4, i64 ; pc 65 — in-place add 24: record 24 = op(rec(23), slot r4)
+    ADD r1, r1, r4, i64 ; pc 66 — in-place add 25: record 25 = op(rec(24), slot r4)
+    ADD r1, r1, r4, i64 ; pc 67 — in-place add 26: record 26 = op(rec(25), slot r4)
+    ADD r1, r1, r4, i64 ; pc 68 — in-place add 27: record 27 = op(rec(26), slot r4)
+    ADD r1, r1, r4, i64 ; pc 69 — in-place add 28: record 28 = op(rec(27), slot r4)
+    ADD r1, r1, r4, i64 ; pc 70 — in-place add 29: record 29 = op(rec(28), slot r4)
+    ADD r1, r1, r4, i64 ; pc 71 — in-place add 30: record 30 = op(rec(29), slot r4)
+    ADD r1, r1, r4, i64 ; pc 72 — in-place add 31: record 31 = op(rec(30), slot r4)
+    ADD r1, r1, r4, i64 ; pc 73 — in-place add 32: record 32 = op(rec(31), slot r4)
+    ADD r1, r1, r4, i64 ; pc 74 — in-place add 33: record 33 = op(rec(32), slot r4)
+    ADD r1, r1, r4, i64 ; pc 75 — in-place add 34: record 34 = op(rec(33), slot r4)
+    ADD r1, r1, r4, i64 ; pc 76 — in-place add 35: record 35 = op(rec(34), slot r4)
+    ADD r1, r1, r4, i64 ; pc 77 — in-place add 36: record 36 = op(rec(35), slot r4)
+    ADD r1, r1, r4, i64 ; pc 78 — in-place add 37: record 37 = op(rec(36), slot r4)
+    ADD r1, r1, r4, i64 ; pc 79 — in-place add 38: record 38 = op(rec(37), slot r4)
+    ADD r1, r1, r4, i64 ; pc 80 — in-place add 39: record 39 = op(rec(38), slot r4)
+    ADD r1, r1, r4, i64 ; pc 81 — in-place add 40: record 40 = op(rec(39), slot r4)
+    ADD r1, r1, r4, i64 ; pc 82 — in-place add 41: record 41 = op(rec(40), slot r4)
+    ADD r1, r1, r4, i64 ; pc 83 — in-place add 42: record 42 = op(rec(41), slot r4)
+    ADD r1, r1, r4, i64 ; pc 84 — in-place add 43: record 43 = op(rec(42), slot r4)
+    ADD r1, r1, r4, i64 ; pc 85 — in-place add 44: record 44 = op(rec(43), slot r4)
+    ADD r1, r1, r4, i64 ; pc 86 — in-place add 45: record 45 = op(rec(44), slot r4)
+    ADD r1, r1, r4, i64 ; pc 87 — in-place add 46: record 46 = op(rec(45), slot r4)
+    ADD r1, r1, r4, i64 ; pc 88 — in-place add 47: record 47 = op(rec(46), slot r4)
+    ADD r1, r1, r4, i64 ; pc 89 — in-place add 48: record 48 = op(rec(47), slot r4)
+    ADD r1, r1, r4, i64 ; pc 90 — in-place add 49: record 49 = op(rec(48), slot r4)
+    ADD r1, r1, r4, i64 ; pc 91 — in-place add 50: record 50 = op(rec(49), slot r4)
+    ADD r1, r1, r4, i64 ; pc 92 — in-place add 51: record 51 = op(rec(50), slot r4)
+    ADD r1, r1, r4, i64 ; pc 93 — in-place add 52: record 52 = op(rec(51), slot r4)
+    ADD r1, r1, r4, i64 ; pc 94 — in-place add 53: record 53 = op(rec(52), slot r4)
+    ADD r1, r1, r4, i64 ; pc 95 — in-place add 54: record 54 = op(rec(53), slot r4)
+    ADD r1, r1, r4, i64 ; pc 96 — in-place add 55: record 55 = op(rec(54), slot r4)
+    ADD r1, r1, r4, i64 ; pc 97 — in-place add 56: record 56 = op(rec(55), slot r4)
+    ADD r1, r1, r4, i64 ; pc 98 — in-place add 57: record 57 = op(rec(56), slot r4)
+    ADD r1, r1, r4, i64 ; pc 99 — in-place add 58: record 58 = op(rec(57), slot r4)
+    ADD r1, r1, r4, i64 ; pc 100 — in-place add 59: record 59 = op(rec(58), slot r4)
+    ADD r1, r1, r4, i64 ; pc 101 — in-place add 60: record 60 = op(rec(59), slot r4)
+    ADD r1, r1, r4, i64 ; pc 102 — in-place add 61: record 61 = op(rec(60), slot r4)
+    ADD r1, r1, r4, i64 ; pc 103 — in-place add 62: record 62 = op(rec(61), slot r4)
+    ADD r1, r1, r4, i64 ; pc 104 — in-place add 63: record 63 = op(rec(62), slot r4)
+    ADD r1, r1, r4, i64 ; pc 105 — in-place add 64: record 64 = op(rec(63), slot r4)
+    ADD r1, r1, r4, i64 ; pc 106 — in-place add 65: record 65 = op(rec(64), slot r4)
+    ADD r1, r1, r4, i64 ; pc 107 — in-place add 66: record 66 = op(rec(65), slot r4)
+    ADD r1, r1, r4, i64 ; pc 108 — in-place add 67: record 67 = op(rec(66), slot r4)
+    ADD r1, r1, r4, i64 ; pc 109 — in-place add 68: record 68 = op(rec(67), slot r4)
+    ADD r1, r1, r4, i64 ; pc 110 — in-place add 69: record 69 = op(rec(68), slot r4)
+    ADD r1, r1, r4, i64 ; pc 111 — in-place add 70: record 70 = op(rec(69), slot r4)
+    ADD r1, r1, r4, i64 ; pc 112 — in-place add 71: record 71 = op(rec(70), slot r4)
+    ADD r1, r1, r4, i64 ; pc 113 — in-place add 72: record 72 = op(rec(71), slot r4)
+    ADD r1, r1, r4, i64 ; pc 114 — in-place add 73: record 73 = op(rec(72), slot r4)
+    ADD r1, r1, r4, i64 ; pc 115 — in-place add 74: record 74 = op(rec(73), slot r4)
+    ADD r1, r1, r4, i64 ; pc 116 — in-place add 75: record 75 = op(rec(74), slot r4)
+    ADD r1, r1, r4, i64 ; pc 117 — in-place add 76: record 76 = op(rec(75), slot r4)
+    ADD r1, r1, r4, i64 ; pc 118 — in-place add 77: record 77 = op(rec(76), slot r4)
+    ADD r1, r1, r4, i64 ; pc 119 — in-place add 78: record 78 = op(rec(77), slot r4)
+    ADD r1, r1, r4, i64 ; pc 120 — in-place add 79: record 79 = op(rec(78), slot r4)
+    ADD r1, r1, r4, i64 ; pc 121 — in-place add 80: record 80 = op(rec(79), slot r4)
+    ADD r1, r1, r4, i64 ; pc 122 — in-place add 81: record 81 = op(rec(80), slot r4)
+    ADD r1, r1, r4, i64 ; pc 123 — in-place add 82: record 82 = op(rec(81), slot r4)
+    ADD r1, r1, r4, i64 ; pc 124 — in-place add 83: record 83 = op(rec(82), slot r4)
+    ADD r1, r1, r4, i64 ; pc 125 — in-place add 84: record 84 = op(rec(83), slot r4)
+    ADD r1, r1, r4, i64 ; pc 126 — in-place add 85: record 85 = op(rec(84), slot r4)
+    ADD r1, r1, r4, i64 ; pc 127 — in-place add 86: record 86 = op(rec(85), slot r4)
+    ADD r1, r1, r4, i64 ; pc 128 — in-place add 87: record 87 = op(rec(86), slot r4)
+    ADD r1, r1, r4, i64 ; pc 129 — in-place add 88: record 88 = op(rec(87), slot r4)
+    ADD r1, r1, r4, i64 ; pc 130 — in-place add 89: record 89 = op(rec(88), slot r4)
+    ADD r1, r1, r4, i64 ; pc 131 — in-place add 90: record 90 = op(rec(89), slot r4)
+    ADD r1, r1, r4, i64 ; pc 132 — in-place add 91: record 91 = op(rec(90), slot r4)
+    ADD r1, r1, r4, i64 ; pc 133 — in-place add 92: record 92 = op(rec(91), slot r4)
+    ADD r1, r1, r4, i64 ; pc 134 — in-place add 93: record 93 = op(rec(92), slot r4)
+    ADD r1, r1, r4, i64 ; pc 135 — in-place add 94: record 94 = op(rec(93), slot r4)
+    ADD r1, r1, r4, i64 ; pc 136 — in-place add 95: record 95 = op(rec(94), slot r4)
+    ADD r1, r1, r4, i64 ; pc 137 — in-place add 96: record 96 = op(rec(95), slot r4)  <-- the 97th allocation FAILS (pool exhausted)
+    JMPR r1             ; pc 138 — table dispatch; runtime 90 + 9 + 96*2 = 291
+    LOADI r0, #0, i32   ; pc 139 — dead filler
+    LOADI r0, #0, i32   ; pc 140 — dead filler
+    LOADI r0, #0, i32   ; pc 141 — dead filler
+    LOADI r0, #0, i32   ; pc 142 — dead filler
+    LOADI r0, #0, i32   ; pc 143 — dead filler
+    LOADI r0, #0, i32   ; pc 144 — dead filler
+    LOADI r0, #0, i32   ; pc 145 — dead filler
+    LOADI r0, #0, i32   ; pc 146 — dead filler
+    LOADI r0, #0, i32   ; pc 147 — dead filler
+    LOADI r0, #0, i32   ; pc 148 — dead filler
+    LOADI r0, #0, i32   ; pc 149 — dead filler
+    LOADI r0, #0, i32   ; pc 150 — dead filler
+    LOADI r0, #0, i32   ; pc 151 — dead filler
+    LOADI r0, #0, i32   ; pc 152 — dead filler
+    LOADI r0, #0, i32   ; pc 153 — dead filler
+    LOADI r0, #0, i32   ; pc 154 — dead filler
+    LOADI r0, #0, i32   ; pc 155 — dead filler
+    LOADI r0, #0, i32   ; pc 156 — dead filler
+    LOADI r0, #0, i32   ; pc 157 — dead filler
+    LOADI r0, #0, i32   ; pc 158 — dead filler
+    LOADI r0, #0, i32   ; pc 159 — dead filler
+    LOADI r0, #0, i32   ; pc 160 — dead filler
+    LOADI r0, #0, i32   ; pc 161 — dead filler
+    LOADI r0, #0, i32   ; pc 162 — dead filler
+    LOADI r0, #0, i32   ; pc 163 — dead filler
+    LOADI r0, #0, i32   ; pc 164 — dead filler
+    LOADI r0, #0, i32   ; pc 165 — dead filler
+    LOADI r0, #0, i32   ; pc 166 — dead filler
+    LOADI r0, #0, i32   ; pc 167 — dead filler
+    LOADI r0, #0, i32   ; pc 168 — dead filler
+    LOADI r0, #0, i32   ; pc 169 — dead filler
+    LOADI r0, #0, i32   ; pc 170 — dead filler
+    LOADI r0, #0, i32   ; pc 171 — dead filler
+    LOADI r0, #0, i32   ; pc 172 — dead filler
+    LOADI r0, #0, i32   ; pc 173 — dead filler
+    LOADI r0, #0, i32   ; pc 174 — dead filler
+    LOADI r0, #0, i32   ; pc 175 — dead filler
+    LOADI r0, #0, i32   ; pc 176 — dead filler
+    LOADI r0, #0, i32   ; pc 177 — dead filler
+    LOADI r0, #0, i32   ; pc 178 — dead filler
+    LOADI r0, #0, i32   ; pc 179 — dead filler
+    LOADI r0, #0, i32   ; pc 180 — dead filler
+    LOADI r0, #0, i32   ; pc 181 — dead filler
+    LOADI r0, #0, i32   ; pc 182 — dead filler
+    LOADI r0, #0, i32   ; pc 183 — dead filler
+    LOADI r0, #0, i32   ; pc 184 — dead filler
+    LOADI r0, #0, i32   ; pc 185 — dead filler
+    LOADI r0, #0, i32   ; pc 186 — dead filler
+    LOADI r0, #0, i32   ; pc 187 — dead filler
+    LOADI r0, #0, i32   ; pc 188 — dead filler
+    LOADI r0, #0, i32   ; pc 189 — dead filler
+    LOADI r0, #0, i32   ; pc 190 — dead filler
+    LOADI r0, #0, i32   ; pc 191 — dead filler
+    LOADI r0, #0, i32   ; pc 192 — dead filler
+    LOADI r0, #0, i32   ; pc 193 — dead filler
+    LOADI r0, #0, i32   ; pc 194 — dead filler
+    LOADI r0, #0, i32   ; pc 195 — dead filler
+    LOADI r0, #0, i32   ; pc 196 — dead filler
+    LOADI r0, #0, i32   ; pc 197 — dead filler
+    LOADI r0, #0, i32   ; pc 198 — dead filler
+    LOADI r0, #0, i32   ; pc 199 — dead filler
+    LOADI r0, #0, i32   ; pc 200 — dead filler
+    LOADI r0, #0, i32   ; pc 201 — dead filler
+    LOADI r0, #0, i32   ; pc 202 — dead filler
+    LOADI r0, #0, i32   ; pc 203 — dead filler
+    LOADI r0, #0, i32   ; pc 204 — dead filler
+    LOADI r0, #0, i32   ; pc 205 — dead filler
+    LOADI r0, #0, i32   ; pc 206 — dead filler
+    LOADI r0, #0, i32   ; pc 207 — dead filler
+    LOADI r0, #0, i32   ; pc 208 — dead filler
+    LOADI r0, #0, i32   ; pc 209 — dead filler
+    LOADI r0, #0, i32   ; pc 210 — dead filler
+    LOADI r0, #0, i32   ; pc 211 — dead filler
+    LOADI r0, #0, i32   ; pc 212 — dead filler
+    LOADI r0, #0, i32   ; pc 213 — dead filler
+    LOADI r0, #0, i32   ; pc 214 — dead filler
+    LOADI r0, #0, i32   ; pc 215 — dead filler
+    LOADI r0, #0, i32   ; pc 216 — dead filler
+    LOADI r0, #0, i32   ; pc 217 — dead filler
+    LOADI r0, #0, i32   ; pc 218 — dead filler
+    LOADI r0, #0, i32   ; pc 219 — dead filler
+    LOADI r0, #0, i32   ; pc 220 — dead filler
+    LOADI r0, #0, i32   ; pc 221 — dead filler
+    LOADI r0, #0, i32   ; pc 222 — dead filler
+    LOADI r0, #0, i32   ; pc 223 — dead filler
+    LOADI r0, #0, i32   ; pc 224 — dead filler
+    LOADI r0, #0, i32   ; pc 225 — dead filler
+    LOADI r0, #0, i32   ; pc 226 — dead filler
+    LOADI r0, #0, i32   ; pc 227 — dead filler
+    LOADI r0, #0, i32   ; pc 228 — dead filler
+    LOADI r0, #0, i32   ; pc 229 — dead filler
+    LOADI r0, #0, i32   ; pc 230 — dead filler
+    LOADI r0, #0, i32   ; pc 231 — dead filler
+    LOADI r0, #0, i32   ; pc 232 — dead filler
+    LOADI r0, #0, i32   ; pc 233 — dead filler
+    LOADI r0, #0, i32   ; pc 234 — dead filler
+    LOADI r0, #0, i32   ; pc 235 — dead filler
+    LOADI r0, #0, i32   ; pc 236 — dead filler
+    LOADI r0, #0, i32   ; pc 237 — dead filler
+    LOADI r0, #0, i32   ; pc 238 — dead filler
+    LOADI r0, #0, i32   ; pc 239 — dead filler
+    LOADI r0, #0, i32   ; pc 240 — dead filler
+    LOADI r0, #0, i32   ; pc 241 — dead filler
+    LOADI r0, #0, i32   ; pc 242 — dead filler
+    LOADI r0, #0, i32   ; pc 243 — dead filler
+    LOADI r0, #0, i32   ; pc 244 — dead filler
+    LOADI r0, #0, i32   ; pc 245 — dead filler
+    LOADI r0, #0, i32   ; pc 246 — dead filler
+    LOADI r0, #0, i32   ; pc 247 — dead filler
+    LOADI r0, #0, i32   ; pc 248 — dead filler
+    LOADI r0, #0, i32   ; pc 249 — dead filler
+    LOADI r0, #0, i32   ; pc 250 — dead filler
+    LOADI r0, #0, i32   ; pc 251 — dead filler
+    LOADI r0, #0, i32   ; pc 252 — dead filler
+    LOADI r0, #0, i32   ; pc 253 — dead filler
+    LOADI r0, #0, i32   ; pc 254 — dead filler
+    LOADI r0, #0, i32   ; pc 255 — dead filler
+    LOADI r0, #0, i32   ; pc 256 — dead filler
+    LOADI r0, #0, i32   ; pc 257 — dead filler
+    LOADI r0, #0, i32   ; pc 258 — dead filler
+    LOADI r0, #0, i32   ; pc 259 — dead filler
+    LOADI r0, #0, i32   ; pc 260 — dead filler
+    LOADI r0, #0, i32   ; pc 261 — dead filler
+    LOADI r0, #0, i32   ; pc 262 — dead filler
+    LOADI r0, #0, i32   ; pc 263 — dead filler
+    LOADI r0, #0, i32   ; pc 264 — dead filler
+    LOADI r0, #0, i32   ; pc 265 — dead filler
+    LOADI r0, #0, i32   ; pc 266 — dead filler
+    LOADI r0, #0, i32   ; pc 267 — dead filler
+    LOADI r0, #0, i32   ; pc 268 — dead filler
+    LOADI r0, #0, i32   ; pc 269 — dead filler
+    LOADI r0, #0, i32   ; pc 270 — dead filler
+    LOADI r0, #0, i32   ; pc 271 — dead filler
+    LOADI r0, #0, i32   ; pc 272 — dead filler
+    LOADI r0, #0, i32   ; pc 273 — dead filler
+    LOADI r0, #0, i32   ; pc 274 — dead filler
+    LOADI r0, #0, i32   ; pc 275 — dead filler
+    LOADI r0, #0, i32   ; pc 276 — dead filler
+    LOADI r0, #0, i32   ; pc 277 — dead filler
+    LOADI r0, #0, i32   ; pc 278 — dead filler
+    LOADI r0, #0, i32   ; pc 279 — dead filler
+    LOADI r0, #0, i32   ; pc 280 — dead filler
+    LOADI r0, #0, i32   ; pc 281 — dead filler
+    LOADI r0, #0, i32   ; pc 282 — dead filler
+    LOADI r0, #0, i32   ; pc 283 — dead filler
+    LOADI r0, #0, i32   ; pc 284 — dead filler
+    LOADI r0, #0, i32   ; pc 285 — dead filler
+    LOADI r0, #0, i32   ; pc 286 — dead filler
+    LOADI r0, #0, i32   ; pc 287 — dead filler
+    LOADI r0, #0, i32   ; pc 288 — dead filler
+    LOADI r0, #0, i32   ; pc 289 — dead filler
+    LOADI r0, #0, i32   ; pc 290 — dead filler
+block0:                ; pc 291
+    LOADI r0, #8888, i32 ; pc 291
+    RET                 ; pc 292
+    LOADI r0, #0, i32   ; pc 293 — spacer
+    LOADI r0, #0, i32   ; pc 294 — spacer
+    LOADI r0, #0, i32   ; pc 295 — spacer

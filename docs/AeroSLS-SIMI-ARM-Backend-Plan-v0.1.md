@@ -5171,6 +5171,66 @@ unchanged):
   — a truncated candidate set would UDF-trap its runtime 289).
   enc-check clean, a64-f0 PASS, stress all-green.
 
+### 10.140 M2.65 — the 97-record OVER-cap boundary pinned (as built)
+
+M2.64 pinned the at-cap turn-over (jmpr_chain40 — a 96-record DAG
+fits the pool, r1's def = 95 at the dispatch); M2.65 pins the other
+side of the same boundary: a DAG needing EXACTLY NINETY-SEVEN
+records — the smallest the pool rejects — must exhaust it
+conservatively at the walk. This is a pure probe + pin: **simi_arm.c
+is unchanged** (the exhaustion is the existing `g_chain_ndef >=
+TX_AR_CHAIN_DEFS → -1` guard in chain_def_alloc, first committed at
+M2.32).
+
+**The fixture (jmpr_chain41).** chain40's shape plus ONE in-place
+add: the root product r1 = r2 + r3 (r2 in {0,10,…,90}, r3 in {0..9}
+→ all 100 values {0..99} distinct, > MAX 96) defers as record 0,
+then 96 in-place ADDs r1 = r1 + r4 (r4 = {2}) defer — 97 records
+needed. At DEFS = 96 the first 96 allocations succeed (records
+0..95) and the 97th returns -1: r1 falls to FLAT UNKNOWN at the
+walk (instrumented: `ndef = 96, r1's def = -1` — vs chain40's
+`def = 95`, the fits-and-materializes side). The dispatch is the
+TABLE — 0 b.eq — and runtime **291** (the fall-through arms 90 + 9
+plus 96×2, the **100th** value of the true set {192..291}) passes
+the bounds check to block0 at pc 291 → LOADI #8888 → PASS on all
+four engines. The discriminator is soundness-shaped: a
+non-conservative exhaustion fallback — one that kept a truncated
+partial image instead of clearing to UNKNOWN — would miss 291 and
+UDF-trap (rc=1), so the four-way PASS proves the -1 fallback is
+exact-or-conservative, not truncated.
+
+**The boundary control (DEFS=97, ad hoc, reverted).** The 97-record
+DAG FITS the pool (instrumented: `ndef = 97, r1's def = 96`), and
+the 100-value materialization then collapses conservatively at the
+BIG store (chain_merge_big → UNKNOWN) — the SAME 6364-byte table, a
+DIFFERENT mechanism (walk-state pool exhaustion vs materialization
+collapse), proven by the walk state. Reverting restored the shipped
+emission byte-identically. Together chain40/chain41 bracket the DEFS
+boundary from both sides: at-cap fits, one-past exhausts.
+
+### 10.141 M2.65 gate results (measured)
+
+Total emitted bytes across the now-94-program parity set: **M0
+245840 → M1 201008, 44832 saved**. One row added, **zero moved** —
+the totals delta is EXACTLY chain41's row (M0 +7556, M1 +6364), so
+all 93 shared rows are byte-identical (the DEFS cap is untouched —
+M2.65 is a pure pin):
+
+- jmpr_chain41 7556 → 6364 (−1192, new 93rd row; M0 baseline
+  measured at git 1729f50) — the 97-record over-cap pin: the
+  table path itself is byte-identical to M0's shape (no chain —
+  the pool exhaustion falls back conservatively); the −1192 is
+  M2.24's table compaction (32-bit entries, 2-word base) plus
+  the accumulated emission folds, on a 296-instruction body.
+- Row-by-row accounting: **all 93 shared rows byte-identical** —
+  the gate total moved by exactly chain41's M1.
+- Four-way parity: 373 PASS, 0 FAIL — all 94 expected-result
+  programs on all four engines (interp 94/94, x86 93/0/3, RV64
+  93/0/3, ARM 93/0/3); chain41's table dispatch executes at
+  runtime on every engine (the ARM engine is the soundness check
+  — a truncated exhaustion fallback would UDF-trap its runtime
+  291). enc-check clean, a64-f0 PASS, stress all-green.
+
 ---
 
 ## Sources consulted
