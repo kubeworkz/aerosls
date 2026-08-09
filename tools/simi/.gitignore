@@ -8,6 +8,7 @@ simi-arm-verify
 a64_dump
 a64-f0-test
 stress-atomics
+rv-syscall-exit-test
 bench-net
 bench-corpus
 bench-exec

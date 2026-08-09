@@ -1,10 +1,21 @@
 /*
  * trap_riscv.c — see trap_riscv.h for the full design rationale. Gap
- * Remediation SIMI Phase 9 (sub-phases 9c/9d).
+ * Remediation SIMI Phase 9 (sub-phases 9c/9d/9f/9g).
+ *
+ * SIMI_HOST_TEST (host-side test build only): this file is also compiled
+ * for the x86 host by tools/simi/rv_syscall_exit_test.c, which stubs
+ * sbi_putchar/sbi_system_reset and drives riscv_syscall_dispatch()'s
+ * SBI_SRST failure fallback. Under that macro the RISC-V-only pieces are
+ * swapped for host behavior: the CSR-armed functions are compiled out
+ * entirely (the dispatch under test never calls them) and rv_halt()
+ * exits the process instead of wfi-spinning (see rv_halt below).
  */
 #include "trap_riscv.h"
 #include "sbi.h"
 #include <stddef.h>
+#if defined(SIMI_HOST_TEST)
+#include <stdlib.h>   /* exit() -- host-side test build only, see rv_halt() */
+#endif
 
 extern void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval);
 /* Deliberately NOT calling kernel/process.c's process_exit() here -- it
@@ -52,6 +63,20 @@ static void rv_print_udec(uint64_t v) {
     while (i > 0) sbi_putchar(buf[--i]);
 }
 
+/* Deliberate terminal halt for the syscall/unhandled paths. Real kernel:
+ * wfi-spin forever, never returning. Host-side test build
+ * (SIMI_HOST_TEST): exit the process cleanly instead, so the harness
+ * observes "dispatch never returned" as the process terminating from
+ * inside the handler rather than falling through to main. */
+static void rv_halt(void) {
+#if defined(SIMI_HOST_TEST)
+    exit(0);
+#else
+    while (1) { __asm__ volatile("wfi"); }
+#endif
+}
+
+#if !defined(SIMI_HOST_TEST)
 void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top) {
     phd->kernel_sp = kernel_stack_top;
     for (int i = 0; i < TF_COUNT; i++) phd->trap_frame[i] = 0;
@@ -80,6 +105,7 @@ void riscv_trap_init(struct RvPerHartData* phd, uint64_t kernel_stack_top) {
     rv_print_str("[TRAP] stvec + sscratch armed for this hart.\n");
 #endif
 }
+#endif /* !SIMI_HOST_TEST: CSR-armed riscv_trap_init only -- riscv_syscall_dispatch below is ALWAYS compiled, because the host test drives it */
 
 /* Gap Remediation SIMI Phase 9 (sub-phases 9d/9f): the minimal,
  * headless-only syscall surface. Only SYS_SLS_EXIT is wired -- there is
@@ -118,15 +144,16 @@ void riscv_syscall_dispatch(struct RvPerHartData* phd) {
          * must not assume the machine is gone just because it returned. */
         rv_print_str("[SYSCALL] SBI_SRST unsupported or failed -- halting hart instead.\n");
 #endif
-        while (1) { __asm__ volatile("wfi"); }
+        rv_halt();
     }
 
     rv_print_str("[SYSCALL] unimplemented syscall number ");
     rv_print_udec(num);
     rv_print_str(" -- halting hart.\n");
-    while (1) { __asm__ volatile("wfi"); }
+    rv_halt();
 }
 
+#if !defined(SIMI_HOST_TEST)
 /* Shared routing for both privilege modes; the caller reads the
  * mode-appropriate cause/tval CSRs (scause/stval in S-mode,
  * mcause/mtval in M-mode) and hands them in. The unhandled-exception
@@ -187,7 +214,7 @@ static void riscv_trap_dispatch_common(struct RvPerHartData* phd,
     rv_print_str(", sepc=");
     rv_print_udec(phd->trap_frame[TF_SEPC]);
     rv_print_str(" -- halting hart.\n");
-    while (1) { __asm__ volatile("wfi"); }
+    rv_halt();
 }
 
 void riscv_trap_dispatch(struct RvPerHartData* phd) {
@@ -205,3 +232,4 @@ void riscv_trap_dispatch_m(struct RvPerHartData* phd) {
     __asm__ volatile("csrr %0, mtval"  : "=r"(mtval));
     riscv_trap_dispatch_common(phd, mcause, mtval);
 }
+#endif /* !SIMI_HOST_TEST: CSR-armed trap functions above */
