@@ -9,10 +9,24 @@
  * bytes. If the encoder has a bug, this either crashes (SIGSEGV/SIGILL,
  * caught and reported below) or returns the wrong value.
  *
- * Usage: simi-jit-test program.tmo entry_name expected_value
+ * Usage: simi-jit-test program.tmo entry_name expected_value [--bytes]
+ *
+ * With `--bytes` (M2.76): the emitted translation's size (out_len) must
+ * equal the fixture's COMMITTED count in bench_baselines_x86.h — the
+ * deterministic, machine-independent emission tripwire for the native
+ * leg. The x86 leg runs real machine code on the host CPU, so there is
+ * no executor to count retired instructions and this sandbox has no
+ * virtualized PMU (perf_event_open PERF_COUNT_HW_INSTRUCTIONS returns
+ * ENOENT — probed); the emitted-byte count is the x86 analog of the
+ * ARM size gate's per-fixture baselines, asserted right in the native
+ * parity runner so ANY emission change fails the fixture. Dynamic
+ * correctness remains the execution itself + the result check + the
+ * crash handler. Keyed by the .tmo's fixture name (basename with .tmo
+ * -> .simi); a fixture with no committed row FAILS loudly.
  */
 #define _GNU_SOURCE
 #include "simi_x86.h"
+#include "bench_baselines_x86.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,8 +77,14 @@ uint64_t simi_rt_objtype(uint64_t base_vaddr) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s program.tmo entry_name expected_value\n", argv[0]);
+    /* volatile: set before setjmp(), read after the longjmp-protected
+     * execution — the crash path returns before the read, but the
+     * compiler can't prove that. */
+    volatile int check_bytes = 0;
+    if (argc == 5 && strcmp(argv[4], "--bytes") == 0) {
+        check_bytes = 1;
+    } else if (argc != 4) {
+        fprintf(stderr, "usage: %s program.tmo entry_name expected_value [--bytes]\n", argv[0]);
         return 1;
     }
     const char* path = argv[1];
@@ -129,11 +149,42 @@ int main(int argc, char** argv) {
     sigaction(SIGILL,  &old_ill,  NULL);
     sigaction(SIGFPE,  &old_fpe,  NULL);
 
-    if (result == expected) {
-        printf("PASS  %-28s = %lld  (%u bytes native code)\n", path, result, out_len);
-        return 0;
-    } else {
+    if (result != expected) {
         printf("FAIL  %-28s expected %lld, got %lld\n", path, expected, result);
         return 1;
     }
+
+    if (check_bytes) {
+        /* derive the fixture name: <dir>/<fixture>.tmo -> <fixture>.simi */
+        const char* base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        size_t blen = strlen(base);
+        char fname[256];
+        if (blen < 4 || strcmp(base + blen - 4, ".tmo") != 0 ||
+            blen - 4 + 5 >= sizeof(fname)) {
+            fprintf(stderr, "FAIL  %-28s --bytes: cannot derive fixture name from '%s'\n", path, path);
+            return 1;
+        }
+        memcpy(fname, base, blen - 4);
+        memcpy(fname + blen - 4, ".simi", 5);
+        fname[blen - 4 + 5] = '\0';
+
+        const struct X86Baseline* bl = NULL;
+        for (size_t i = 0; i < sizeof(X86_BASELINES) / sizeof(X86_BASELINES[0]); i++)
+            if (strcmp(X86_BASELINES[i].name, fname) == 0) { bl = &X86_BASELINES[i]; break; }
+        if (!bl) {
+            fprintf(stderr, "FAIL  %-28s --bytes: no committed baseline for %s (update bench_baselines_x86.h — see plan doc §10.162)\n",
+                    path, fname);
+            return 1;
+        }
+        if ((long long)out_len != bl->bytes) {
+            fprintf(stderr, "FAIL  %-28s --bytes: emitted %u bytes != committed %lld (emission regression)\n",
+                    path, out_len, bl->bytes);
+            return 1;
+        }
+    }
+
+    printf("PASS  %-28s = %lld  (%u bytes native code%s)\n",
+           path, result, out_len, check_bytes ? ", bytes ok" : "");
+    return 0;
 }

@@ -96,6 +96,13 @@ struct RvCpu {
     uint64_t x[32];     /* x0 is architecturally hardwired to zero; this executor enforces that on every write */
     uint64_t f[32];     /* F/D file (Gap Remediation SIMI Phase 10, F4) — f32 ops use the low 32 bits */
     uint64_t pc;
+    /* M2.76: steps executed — rv64_exec_run() increments this once per
+     * decoded instruction. A deterministic, machine-independent count of
+     * the execution work per run (the simi-riscv-verify --steps exact
+     * guard, mirroring a64_exec.c's A64Cpu.steps and bench_corpus's
+     * scan counts). Zeroed by the caller's memset; callers that don't
+     * care never read it. */
+    uint64_t steps;
     uint8_t* mem;
     uint32_t mem_size;
 };

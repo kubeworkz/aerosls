@@ -71,6 +71,7 @@ const char* rv64_exec_strerror(int code) {
 int rv64_exec_run(struct RvCpu* cpu, uint64_t max_steps) {
     for (uint64_t step = 0; step < max_steps; step++) {
         if (cpu->pc == RV_EXEC_SENTINEL_RA) return RV_EXEC_OK;
+        cpu->steps++;   /* M2.76: one executed instruction (simi-riscv-verify --steps guard) */
 
         uint32_t w;
         if (!fetch32(cpu, cpu->pc, &w)) return RV_EXEC_MEM_FAULT;

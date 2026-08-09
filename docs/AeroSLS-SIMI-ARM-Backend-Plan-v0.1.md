@@ -5819,6 +5819,65 @@ bench_baselines.h (new — the shared table), simi_arm_verify.c (the
 (--steps on every fixture), the Makefile (deps) and plan doc §10.158
 superseded for the table's location.
 
+### 10.162 M2.76 — the step-count tripwire extended to RV64 and x86 (as built)
+
+The M2.75 follow-up, completing the four-way story. Both remaining
+parity legs now assert committed per-fixture counts in their runners:
+
+- **RV64 — dynamic steps (the full mirror).** rv64_exec_run() gained
+  the same behavior-neutral per-instruction counter as a64_exec
+  (RvCpu.steps, one increment per decoded instruction), and
+  simi-riscv-verify takes the same `--steps` flag as simi-arm-verify:
+  after a successful run it derives the fixture name from the .tmo
+  path, looks up the committed count in the new bench_baselines_rv64.h
+  (96 rows, measured via the new RV64_STEPS_MEASURE env mode — the
+  documented re-measure tool), and asserts cpu.steps equals it. The
+  counts are deterministic and machine-independent — same translated
+  bytes over zeroed guest state always execute the same count — so ANY
+  decode/emission regression (fault-early decode, a fold altering the
+  control flow, an rv64_exec change) fails the fixture in
+  run_riscv_tests.sh, before any bench runs.
+- **x86 — emitted bytes (the honest native-leg count).** The x86 leg
+  executes REAL machine code on the host CPU (mmap PROT_EXEC + a
+  function-pointer call), so there is no executor to count retired
+  instructions — and this sandbox has NO virtualized PMU to count them
+  in hardware (probed: perf_event_open PERF_COUNT_HW_INSTRUCTIONS
+  returns ENOENT on the WSL2 kernel — /proc/sys/kernel/perf_event_paranoid
+  is 2, so the syscall is permitted, the counter just doesn't exist;
+  the software counters measure time, not instructions). The
+  deterministic, machine-independent count that IS available is the
+  emitted translation's size (simi_x86_translate's out_len) — the x86
+  analog of the ARM size gate's per-fixture byte baselines. simi-jit-test
+  takes `--bytes`: it asserts out_len equals the committed count in the
+  new bench_baselines_x86.h (96 rows, measured from the runner's own
+  "%u bytes native code" field) — ANY emission change (a fold altering
+  how much code is emitted, a codegen restructure) fails the fixture in
+  run_native_tests.sh. Dynamic correctness on the native leg remains
+  the execution itself + the result check + the crash handler.
+
+So the four-way story is now complete in the sense the sandbox allows:
+ARM and RV64 (the executor legs) assert dynamic executed-instruction
+counts; x86 (the native leg) asserts the emitted-byte count, with the
+no-vPMU limitation recorded honestly rather than papered over.
+
+### 10.163 M2.76 gate results (measured)
+
+Native parity with `--bytes` on all 96 fixtures: **96 passed, 0 failed,
+3 skipped** — every PASS prints "bytes ok". RV64 parity with `--steps`
+on all 96 fixtures: **96 passed, 0 failed, 3 skipped** — every PASS
+prints "steps ok". Teeth: corrupting add.simi's committed RV64 steps
+225 -> 999 fails "--steps: executed 225 instructions != committed 999";
+corrupting its committed x86 bytes 442 -> 999 fails "--bytes: emitted
+442 bytes != committed 999"; both reverted to PASS. Emission untouched
+(no simi_arm.c change), so the size gate stays **96/96, 46224 saved,
+all rows byte-identical**; four-way parity interp 97/97, x86/RV64/ARM
+96/0/3; bench-net, bench-corpus and bench-exec PASS; enc-check clean;
+stress all-green. Changed: rv64_exec.h/.c (RvCpu.steps),
+bench_baselines_rv64.h + bench_baselines_x86.h (new — the committed
+tables), simi_riscv_verify.c (--steps + RV64_STEPS_MEASURE),
+simi_jit_test.c (--bytes), run_riscv_tests.sh + run_native_tests.sh
+(the flags on every fixture), the Makefile (deps).
+
 ---
 
 ## Sources consulted

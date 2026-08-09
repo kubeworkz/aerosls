@@ -11,10 +11,26 @@
  * no riscv64 toolchain or QEMU is available in this environment, and how
  * it compares in strength to Phase 3's real-CPU-execution proof.
  *
- * Usage: simi-riscv-verify program.tmo entry_name expected_value
+ * Usage: simi-riscv-verify program.tmo entry_name expected_value [--steps]
+ *
+ * With `--steps` (M2.76): after a successful run, the executed
+ * instruction count (RvCpu.steps) must equal the fixture's COMMITTED
+ * count in bench_baselines_rv64.h — the deterministic,
+ * machine-independent execution work per fixture — keyed by the .tmo's
+ * fixture name (basename with .tmo -> .simi). This catches decode/
+ * emission regressions at the parity harness itself, before any bench
+ * runs (the same tripwire M2.75 added to simi-arm-verify). The
+ * committed counts are for the "main" entry's full run — the entry the
+ * runners execute. A fixture with no committed row FAILS loudly
+ * (adding/removing a corpus fixture requires updating the table
+ * deliberately). The check is skipped when execution does not complete
+ * (a fault is already reported as FAIL). With RV64_STEPS_MEASURE=1 the
+ * measured count is printed per fixture without asserting — the
+ * documented re-measure tool for a deliberate table update.
  */
 #include "simi_riscv.h"
 #include "rv64_exec.h"
+#include "bench_baselines_rv64.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,13 +88,17 @@ static uint64_t mock_rt_objtype(uint64_t base_vaddr) {
 #define HOSTFN_OBJTYPE 2
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s program.tmo entry_name expected_value\n", argv[0]);
+    int check_steps = 0;
+    if (argc == 5 && strcmp(argv[4], "--steps") == 0) {
+        check_steps = 1;
+    } else if (argc != 4) {
+        fprintf(stderr, "usage: %s program.tmo entry_name expected_value [--steps]\n", argv[0]);
         return 1;
     }
     const char* path = argv[1];
     const char* entry_name = argv[2];
     long long expected = atoll(argv[3]);
+    int measure = getenv("RV64_STEPS_MEASURE") != NULL;
 
     FILE* f = fopen(path, "rb");
     if (!f) { perror(path); return 1; }
@@ -124,11 +144,48 @@ int main(int argc, char** argv) {
     }
 
     long long result = (long long)cpu.x[5 /* t0 — result register, see simi_riscv.c's RET/trampoline design */];
-    if (result == expected) {
-        printf("PASS  %-28s = %lld  (%u bytes native code)\n", path, result, out_len);
-        return 0;
-    } else {
+    if (result != expected) {
         printf("FAIL  %-28s expected %lld, got %lld\n", path, expected, result);
         return 1;
     }
+
+    /* derive the fixture name: <dir>/<fixture>.tmo -> <fixture>.simi */
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    size_t blen = strlen(base);
+    char fname[256];
+    if (blen < 4 || strcmp(base + blen - 4, ".tmo") != 0 ||
+        blen - 4 + 5 >= sizeof(fname)) {
+        fprintf(stderr, "FAIL  %-28s --steps: cannot derive fixture name from '%s'\n", path, path);
+        return 1;
+    }
+    memcpy(fname, base, blen - 4);
+    memcpy(fname + blen - 4, ".simi", 5);
+    fname[blen - 4 + 5] = '\0';
+
+    if (measure) {
+        printf("MEASURE %-24s %llu\n", fname, (unsigned long long)cpu.steps);
+        printf("PASS  %-28s = %lld  (%u bytes native code, steps measured)\n", path, result, out_len);
+        return 0;
+    }
+
+    if (check_steps) {
+        const struct Rv64Baseline* bl = NULL;
+        for (size_t i = 0; i < sizeof(RV64_BASELINES) / sizeof(RV64_BASELINES[0]); i++)
+            if (strcmp(RV64_BASELINES[i].name, fname) == 0) { bl = &RV64_BASELINES[i]; break; }
+        if (!bl) {
+            fprintf(stderr, "FAIL  %-28s --steps: no committed baseline for %s (update bench_baselines_rv64.h — see plan doc §10.162)\n",
+                    path, fname);
+            return 1;
+        }
+        if ((long long)cpu.steps != bl->steps) {
+            fprintf(stderr, "FAIL  %-28s --steps: executed %llu instructions != committed %lld (decode/emission regression)\n",
+                    path, (unsigned long long)cpu.steps, bl->steps);
+            return 1;
+        }
+    }
+
+    printf("PASS  %-28s = %lld  (%u bytes native code%s)\n",
+           path, result, out_len, check_steps ? ", steps ok" : "");
+    return 0;
 }
