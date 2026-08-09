@@ -1,0 +1,56 @@
+; jmpr_chain36.simi — M2.60: the fold fixpoint's RELAXATION 2-CYCLE, the
+; last documented-but-untested convergence mechanism. The M2.18 comment
+; names it: "a fold ENABLED BY the relaxation can target the relaxed head
+; itself (a backward fold re-entering the head makes it a loop head the
+; relaxation must not apply to) — that shape 2-cycles the fixpoint
+; (relax -> fold -> reset -> un-fold)". The head V (pc 5) is relax-
+; eligible: the UNIQUE forward edge into it is S's BR (pc 3), V-1 = pc 4
+; is a RET (terminal), no CALL targets it, it is not an entry. JMPR J
+; (pc 8) dispatches on r2 = V (pc 5) — a BACKWARD fold re-entering V —
+; and r2's constant (LOADI at pc 2) is established BEFORE V, so the
+; reset at the pre-marked head V kills it UNLESS the relaxation restores
+; it from the S snapshot. That is precisely "a fold enabled by the
+; relaxation":
+;
+;   pass 1:  snapshot at S -> relax restores r2 at V -> J folds to V
+;   pass 2:  V is now a fold target -> relaxation excluded -> reset
+;            kills r2 -> J un-folds
+;   pass 3:  V no longer a fold target -> relax again -> J folds
+;   ...      2-cycle forever (relax -> fold -> reset -> un-fold) ...
+;   pass 513: the 512-pass safety net fires: relax disabled, fold set
+;            cleared, restart. The un-relaxed fixpoint is monotone-
+;            decreasing in the fold set and terminates: pass 1 resets
+;            r2 at V (no relaxation), J never folds; pass 2 confirms.
+;
+; The final converged state — J un-folded — is the SAME the un-relaxed
+; analysis would reach, so the net's restart is sound (the pin proves
+; termination, not a different emission: the gate row is identical to a
+; no-relaxation build; the four-way parity proves the runtime result).
+; J is the single dynamic JMPR -> the M2.25 walk runs: its snapshot at J
+; is {5} (the S-branch delivers {5} at the head V; the loop back-edge is
+; NOT an edge for the walk — an unfolded JMPR is a terminal — so the
+; walk converges in 2 iterations and the M2.58 guard stays silent). The
+; 1-candidate chain dispatches r2 = 5 back to V, the loop runs three
+; times (r1 3->2->1->0), the BC exits at r1 == 0, r0 = 5 + 5 = 10.
+; The teeth: Control A (head not relax-eligible) takes ~3 passes with
+; no net; Control B (net disabled, timeout-bounded) HANGS on the
+; 2-cycle (exit 124) — the net is the termination mechanism. Both are
+; instrumentation-level, not emission-level: the pin guards termination.
+; Expected result: 10 (r0 = r2+r2 = 5+5; the loop body runs twice)
+.entry main
+main:
+    ENTER #8
+    LOADI r1, #3, i64        ; loop counter (3 iterations)
+    LOADI r2, #5, i64        ; J's index = V's pc — the constant the
+                             ; relaxation must restore at V (source BEFORE V)
+S:  BR V                     ; pc 3 — the unique forward edge into V
+    RET                      ; pc 4 — dead (BR never falls through); V-1 is a
+                             ; terminal, making V relax-eligible
+V:  SUB r1, r1, #1, i64      ; pc 5 — the loop head, relax-eligible
+    BC r1, EXIT, INV         ; pc 6 — exit when r1 == 0
+    ADD r0, r0, r2, i64      ; pc 7 — body: r0 += 5 (r1 = 2, then 1)
+    JMPR r2                  ; pc 8 — J: backward fold to V iff the
+                             ; relaxation restored r2 (the 2-cycle source)
+EXIT:
+    ADD r0, r0, #0, i64      ; pc 9 — r0 = 10
+    RET
