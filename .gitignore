@@ -10,6 +10,11 @@
 # Runtime logs
 *.log
 
+# Freebuff desktop app state — SQLite db + per-worktree bookkeeping.
+# These are live app files, churned on every session; never tracked
+# (cleanup M2.83 removed them from the index; see plan doc §10.176/10.177).
+.freebuff/
+
 # Compiler plugin
 compiler/*.so
 compiler/*.dylib

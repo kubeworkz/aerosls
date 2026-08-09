@@ -6195,6 +6195,46 @@ all seven `all` checks PASS. Changed: cross_isa.c (the third axis),
 the Makefile (cross-isa dep on bench_baselines_interp.h + comment),
 plan doc §10.174/10.175.
 
+### 10.176 M2.83 — the long-standing repo cleanup (design)
+
+Two categories of files were tracked in the repository that should
+never have been:
+
+- **`.freebuff/` desktop app state** — `desktop-v2.db` (plus `-shm` /
+  `-wal`) is the Freebuff desktop app's live SQLite database, churned
+  on every session; `.freebuff/worktrees/<id>` is the app's per-worktree
+  bookkeeping. Because they were tracked, `git status` showed constant
+  churn and merges occasionally tripped over them (the M2.80 merge's
+  transient "unstable object source data" stash failure was a race with
+  the app writing them). They are removed from the index (kept on disk
+  — the running app needs them) and `.freebuff/` is added to the root
+  `.gitignore`, so the app state can never be re-added.
+- **`tools/simi` build outputs** — five committed binaries (`simi-asm`,
+  `simi-run`, `simi-dis`, `simi-jit-test`, `simi-riscv-verify`) were
+  tracked; they went stale whenever the sources moved (the recurring
+  "stale-toolchain quirk": a fresh checkout's tracked binaries predate
+  the atomics/float work, so `make test` failed until a forced rebuild).
+  They are removed from the index (kept on disk) — the directory's
+  `.gitignore` already listed every build output, so untracking makes
+  the ignore real.
+
+The fresh-checkout contract is now honest: a new clone has NO binaries
+and NO `.tmo` files, and needs one build before anything runs. That
+step is documented in the `tools/simi/Makefile` top comment (`make`, or
+`make clean && make` for a guaranteed-fresh build, then `make test`).
+
+### 10.177 M2.83 cleanup result (verified)
+
+`git ls-files` confirms zero tracked files in either category —
+`.freebuff/` (4 files) and the `tools/simi` binaries (5 files) are all
+untracked and ignored; the working-tree copies are intact (kept via
+`git rm --cached`). No source, test, or measurement file changed, so
+the size gate's 96/96, 46224-saved, byte-identical state and the
+four-way parity (interp 97/97, x86/RV64/ARM 96/0/3) are untouched by
+construction. Changed: root `.gitignore` (`.freebuff/` entry),
+`tools/simi/Makefile` (fresh-checkout note), the index removals, and
+this record.
+
 ---
 
 ## Sources consulted
