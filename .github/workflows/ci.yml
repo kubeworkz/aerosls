@@ -42,7 +42,8 @@ jobs:
       # x86_64-elf-gcc -- see the note at the top of this file -- so they
       # exit 2 and are reported as SKIP with the reason printed. A skip is
       # counted separately and never mistaken for a pass; read the step's
-      # output rather than just its green tick.
+      # output rather than just its green tick. Those three are run for
+      # real, with their teeth proven, in the kernel-guards job below.
       #
       # Use --require-all on a build host, where the prerequisites must
       # exist and "could not check" must not resemble "it is fine".
@@ -61,10 +62,8 @@ jobs:
       # run them.
       #
       # The three kernel-needing guards cannot run here (no cross
-      # toolchain). Their teeth are proven on a build host instead: after
-      # `make`, run `bash tests/run_guard_smokes.sh`, which runs every
-      # *_smoke.sh including the three build-host smokes (stack_frame_
-      # budget, kernel_image_end, no_tls_relocations).
+      # toolchain). The kernel-guards job below builds the real binary and
+      # runs all six guards and all six smokes for real -- nothing skips.
       - name: Script-conventions guard teeth (smoke)
         run: bash tests/script_conventions_smoke.sh
 
@@ -73,3 +72,53 @@ jobs:
 
       - name: Commands-doc guard teeth (smoke)
         run: bash tests/commands_doc_smoke.sh
+
+  kernel-guards:
+    # The three kernel-needing guards (stack_frame_budget, kernel_image_end,
+    # no_tls_relocations) need the linked kernel and its objects, so they
+    # skip in `verify` and were proven only on a build host. This job builds
+    # the real binary and runs the deploy gate's two commands --
+    # run_checks.sh --require-all and run_guard_smokes.sh -- so all six
+    # guards pass AND all six smokes prove their teeth on every push, with
+    # nothing skipping. Verified end-to-end on a fresh checkout: the build
+    # succeeds and all six guards + all six smokes pass.
+    #
+    # Toolchain: the cross compiler (x86_64-elf-gcc) is replaced by the
+    # host gcc/ld via the X86_CC/X86_LD overrides. The kernel is
+    # freestanding x86-64 and the guards themselves compile with plain gcc,
+    # so the linked artifacts are equivalent for everything the guards
+    # inspect. The Makefile builds only the binary target here -- no plugins
+    # (llvm) and no riscv-elf toolchain required.
+    #
+    # The kernel links 15 objects out of ../qemu, so the sibling repo must
+    # be checked out next to aerosls2 (the Makefile's hardcoded ../qemu
+    # path). qemu-sls is kubeworkz/qemu-sls: if it is private, set the
+    # QEMU_SLS_PAT secret to a token with read access; if public, no secret
+    # is needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: aerosls2
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kubeworkz/qemu-sls
+          path: qemu
+          token: ${{ secrets.QEMU_SLS_PAT }}
+          fetch-depth: 1
+
+      - name: Kernel build tools (nasm)
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Build the kernel binary (host gcc/ld as the toolchain)
+        run: make X86_CC=gcc X86_LD=ld my_sls_kernel.bin
+        working-directory: aerosls2
+
+      - name: Run all six guards with --require-all (nothing skips on a build)
+        run: bash tests/run_checks.sh --require-all
+        working-directory: aerosls2
+
+      - name: Run all six guard smokes (every guard proven able to fail)
+        run: bash tests/run_guard_smokes.sh
+        working-directory: aerosls2
