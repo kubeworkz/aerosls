@@ -4479,6 +4479,101 @@ TX_AR_CHAIN_BIG, impossible under the shipped equal caps):
   float/mem skips and the no-expected jmpr_oob are unchanged
   (jmpr_oob still faults via UDF, rc=1). enc-check clean.
 
+### 10.120 M2.55 — the mirror cap divergence (BIG > MAX) pinned, and the freeze overflow fixed (as built)
+
+The mirror of M2.54. M2.54 proved the FLAT->BIG direction
+(TX_AR_CHAIN_MAX > TX_AR_CHAIN_BIG) is overflow-free by collapsing
+at the flatten boundary; this milestone probes the opposite
+divergence — TX_AR_CHAIN_BIG > TX_AR_CHAIN_MAX — where the union
+store's frozen `g_chain_def_flat` (BIG-shaped) can hold more than the
+walk's flat bound, and stresses that a >MAX deferred record still
+materializes soundly through the BIG path (`chain_flatten_big_rec`,
+the dispatch snapshot) while the walk path collapses conservatively
+(the M2.41 guards: `st->n > TX_AR_CHAIN_MAX -> UNKNOWN`).
+
+**The pin — the turn-over boundary at the shipped caps.** Under the
+shipped EQUAL caps (64/64) the divergence is unreachable — a record's
+store holds at most 64, exactly the flat bound — so the committed
+corpus test (jmpr_chain31) regression-guards the boundary itself:
+the largest set the machinery can represent (n == MAX == BIG,
+exactly 64 values), materializing through record creation, the BIG
+store, and the walk flatten all at the same point. The index is the
+union of TWO deferred products (mirroring chain16's R-arm): R1 =
+r2 + r3 (r2 in {44,60,76,92}, r3 in {0,2,...,14} -> 32 values
+{44..106} step 2) and R2 = r2 + r6 (r6 in {108,110,...,122} -> 32
+values {152..214}); the R-arm's `BC r5, J` (r5 = 0, not taken)
+delivers R1 into J, the fall-through computes R2 as the carry, and J
+forms the union record — 64 DISTINCT values, exactly MAX = BIG. The
+cost gate (8*64+4 = 516 < 40 + 4*216 = 904) emits the 64-pair chain;
+runtime 92 + 122 = 214 takes the chain's SIXTY-FOURTH b.eq, landing
+on block63's LOADI #555 — so a truncated materialization (a store
+one short, a guard that kept only 63) would miss it and UDF-trap:
+the discriminator. Dump-verified: 64 b.eq, 65 br (64 block RETs +
+1), 1 udf fall-through, 0 table words — the full candidate chain.
+
+**The latent bug this pin's control exposed — the FREEZE copy, the
+mirror of M2.54's flatten.** `chain_def_alloc`'s freeze path copies
+a FLAT set (a `struct ChainSet` at TX_AR_CHAIN_MAX width) into the
+record's BIG-shaped store (`g_chain_def_flat[ri].v[TX_AR_CHAIN_BIG]`)
+with NO cap check — the mirror of the M2.54 flatten overflow, at the
+in-place deferral sites (an aliased flat source frozen as a CD_FLAT
+operand against a deferred other source). ASan-proven: with the caps
+temporarily diverged the other way (MAX=20 / BIG=1 / DEFS=2, a
+9-value aliased source frozen at the LAST record ri = DEFS-1), the
+freeze loop at simi_arm.c:1246 fires an ASan
+`global-buffer-overflow` (rc=1); the same program post-fix PASSes
+conservatively (rc=0, the guard refuses -> UNKNOWN -> table). For
+non-last records the overwrite lands in the NEXT record's header,
+which its own later allocation overwrites (self-healing but silent
+corruption of in-flight state); at the array end it is a real
+out-of-bounds write. The fix is the exact-or-conservative discipline
+at the freeze boundary: `freeze && (freeze->unk || freeze->n >
+TX_AR_CHAIN_BIG) -> refuse (-1, UNKNOWN)` — never a truncated set.
+
+**Control A — the mirror divergence itself (BIG=128 > MAX=64,
+ASan-clean).** With TX_AR_CHAIN_BIG raised to 128 and the walk cap
+at 64, a >MAX record's true set (up to 128) materializes through the
+BIG store: jmpr_chain30 (100-value product index, previously the
+collapse pin) and jmpr_chain31 both PASS their expected values
+(999/555) — the >MAX record materializes soundly and the emission
+gate chooses the cheaper shape (chain30 falls to the table by cost;
+chain31 chains all 64). The full ARM suite at the control cap runs
+83 passed / 0 failed / 3 skipped — every chain-series program, the
+deferred joins, and the unions stay sound, and the walk path
+collapses any >MAX record conservatively (the M2.41 guards).
+
+### 10.121 M2.55 gate results (measured)
+
+Total emitted bytes across the now-79-program parity set: **M0
+174588 → M1 146380, 28208 saved** (≈16.2%). One row added, zero
+moved — despite the simi_arm.c freeze guard, **all 83 shared rows
+are byte-identical** (the guard only fires when the freeze set
+exceeds TX_AR_CHAIN_BIG, impossible under the shipped equal caps):
+
+- jmpr_chain31 6204 → 4944 (−1260, new 79th row; M0 baseline
+  measured at git 1729f50) — the boundary pin: the 64-distinct
+  union of two deferred products, runtime 214 -> the chain's
+  sixty-fourth b.eq -> block63's LOADI #555 -> PASS 555 on all four
+  engines. The 1260-byte M0->M1 delta is the accumulated emission
+  folds on the program's large straight-line body.
+- Teeth — the fix's two sides (ad hoc, not committed): (a) the
+  FREEZE overflow control (MAX=20 / BIG=1 / DEFS=2, 9-value frozen
+  aliased source at the last record) — ASan global-buffer-overflow
+  at simi_arm.c:1246 pre-fix (rc=1), conservative PASS post-fix
+  (rc=0); (b) Control A (BIG=128 > MAX=64) — the full ARM suite at
+  the divergent caps: 83/0/3, ASan-clean, >MAX records materialize
+  soundly through the BIG store.
+- Row-by-row accounting (gate tables diffed vs the current committed
+  simi_arm.c): **all 83 shared rows byte-identical** — strictly
+  additive; the only simi_arm.c delta is the freeze guard.
+- Four-way parity: 333 PASS, 0 FAIL — all 84 expected-result
+  programs on all four engines (interp 84/84, x86 83/0/3, RV64
+  83/0/3, ARM 83/0/3), each checked against its "Expected result:"
+  comment; the boundary-pin chain executes at runtime on the ARM
+  engine (PASS 555 through the chain's sixty-fourth b.eq), and the
+  documented float/mem skips and the no-expected jmpr_oob are
+  unchanged (jmpr_oob still faults via UDF, rc=1). enc-check clean.
+
 ---
 
 ## Sources consulted

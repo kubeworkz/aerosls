@@ -1222,6 +1222,16 @@ static int64_t chain_alu_eval(uint8_t op, int64_t av, int64_t bv) {
 static int chain_def_alloc(uint8_t op, uint8_t ka, int32_t a, uint8_t kb, int32_t b,
                            const struct ChainSet* freeze, uint32_t pc) {
     if (g_chain_ndef >= TX_AR_CHAIN_DEFS) return -1;
+    /* M2.55: the freeze copy below writes freeze->n values into the
+     * record's BIG-shaped store (g_chain_def_flat[ri].v[TX_AR_CHAIN_BIG]),
+     * but freeze is a flat ChainSet (stored at TX_AR_CHAIN_MAX width).
+     * The shipped caps are equal, so freeze->n <= MAX = BIG and the copy
+     * is safe; a cap raise that makes MAX > BIG (the M2.54-direction
+     * control — an in-place product over a >64-value flat source) would
+     * OVERFLOW the store — refuse the record instead (the caller falls
+     * back to UNKNOWN, the exact-or-conservative discipline, matching
+     * chain_flatten_big's M2.54 guard). */
+    if (freeze && (freeze->unk || freeze->n > TX_AR_CHAIN_BIG)) return -1;
     int ri = g_chain_ndef++;
     struct ChainDef* d = &g_chain_defs[ri];
     d->op = op;
