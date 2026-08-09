@@ -94,6 +94,14 @@ enum {
  * x86's movabs+call reg and RV64's auipc+ld+jalr. namepool_ptr (r6) is
  * computed internally from obj_data, same as the other translators — not
  * a parameter here either. */
+/* M2.71: the safety net's trip count (the M2.18/M2.70 2-cycle net in
+ * simi_arm.c's fixpoint loop; default 16, tunable) and the fixpoint's
+ * scan count for the last translate. Exposed so bench_net.c can measure
+ * the M2.70 translate-time win (16 vs the M2.69-era 512) from one
+ * binary — see bench_net.c's top comment. */
+extern int g_ar_net_trip;
+extern int g_ar_net_scans;
+
 int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                         uint8_t* out_buf, uint32_t out_cap,
                         const char* entry_name, uint64_t scratch_ptr,

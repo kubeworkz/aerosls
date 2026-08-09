@@ -473,6 +473,14 @@ static void emit_li64(struct CodeBuf* cb, uint8_t reg, uint64_t imm);   /* fwd: 
  */
 #define AR_CACHE_N 3
 static int g_alloc;                    /* 0 when any JMPR cannot be folded to a direct branch */
+/* M2.71: the safety net's trip count (default 16 — see the M2.18/M2.70
+ * net comment in the fixpoint loop) and the fixpoint's scan count for
+ * the last translate. Exposed (non-static, declared in simi_arm.h) so
+ * bench_net.c can measure the M2.70 translate-time win — 16 vs the
+ * M2.69-era 512 — from one binary: g_ar_net_scans is reset by the
+ * bench, incremented once per fixpoint scan, and read back after. */
+int g_ar_net_trip = 16;
+int g_ar_net_scans = 0;
 static int g_cache_guest[AR_CACHE_N];  /* guest reg resident in x9+i, or -1 */
 static int g_cache_round;              /* round-robin eviction cursor */
 static int g_resv_slot;                /* slot reserved for the in-flight result */
@@ -2647,6 +2655,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     int relax_enabled = 1;   /* M2.18; the safety fallback below disables it */
     int passes = 0;
     for (;;) {
+        g_ar_net_scans++;    /* M2.71: fixpoint scan count (bench_net.c reads it) */
         for (int i = 0; i < 4096; i++) g_jmpr_fold_prev[i] = g_jmpr_fold[i];
         /* M2.18: per-scan fold-target exclusion for the relaxation — the
          * previous scan's COMPLETE fold set (a fold edge is another
@@ -2764,7 +2773,7 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
         for (int i = 0; i < 4096; i++)
             if (g_jmpr_fold[i] != g_jmpr_fold_prev[i]) { same = 0; break; }
         if (same) break;
-        if (++passes > 16) {
+        if (++passes > g_ar_net_trip) {
             /* M2.18 safety net: a fold ENABLED BY the relaxation can target
              * the relaxed head itself (a backward fold re-entering the head
              * makes it a loop head the relaxation must not apply to) — that
@@ -2777,11 +2786,15 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
              * the corpus max is passes=2 (instrumented). The 2-cycle is
              * the only divergence, so the trip count just needs to sit
              * above the legit max with margin: 512 was a 170x
-             * overestimate; 16 (5x over passes=3) still never fires on
-             * legitimate input while cutting the 2-cycle's translate
-             * time ~30x. The restart is sound regardless: fall back to
-             * the un-relaxed fixpoint, which is monotone-decreasing in
-             * the fold set and provably terminates. */
+             * overestimate; the shipped trip count is the tunable
+             * g_ar_net_trip = 16 (5x over passes=3), which still never
+             * fires on legitimate input while cutting the 2-cycle's
+             * scan count 514 -> 18 (28.6x) and chain36's end-to-end
+             * translate ~8-9x — measured as committed numbers by
+             * bench_net (M2.71). The restart is sound regardless: fall
+             * back to the un-relaxed fixpoint, which is
+             * monotone-decreasing in the fold set and provably
+             * terminates. */
             relax_enabled = 0;
             for (int i = 0; i < 4096; i++) g_jmpr_fold[i] = -1;
             passes = 0;

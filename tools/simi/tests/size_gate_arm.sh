@@ -1346,7 +1346,8 @@ declare -A M0_BASELINES=(
 # flip is a one-time transient, so the legitimate max is passes=3.
 # M2.70 tightens the safety net 512 -> 16 (5x margin over passes=3,
 # 8x over the corpus max) — the 2-cycle (chain36) still fires, now at
-# pass 17 instead of 513 (~30x faster translate), with the same
+# pass 17 instead of 513 (measured 28.6x fewer fixpoint scans, ~8-9x
+# end-to-end translate on chain36 — bench_net, M2.71), with the same
 # un-relaxed restart and the same emission.
 # Emission: J1 and J3 fold (final state), J2 is the single dynamic JMPR
 # -> the M2.25 1-candidate inline chain (cmp + b.eq for 10); 0 table
