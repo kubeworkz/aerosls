@@ -81,11 +81,13 @@ jobs:
     # runs the deploy gate's two commands -- run_checks.sh --require-all and
     # run_guard_smokes.sh -- so all six guards pass AND all six smokes prove
     # their teeth on every push, with nothing skipping. Then it boots the
-    # ISO under QEMU and asserts the kernel's first serial banner appears
-    # and qemu is still alive at the timeout (a triple fault exits early and
-    # fails the step). Verified end-to-end on a fresh checkout: the ISO
-    # builds, all six guards + all six smokes pass, and the ISO boots under
-    # QEMU to the consensus loop.
+    # ISO under QEMU and checks the service end to end: the kernel's first
+    # serial banner must appear, and its webapp must answer /api/health on
+    # the forwarded port (the exact endpoint deploy.sh gates on) — proving
+    # the webapp serves, not just that the kernel boots. Verified
+    # end-to-end on a fresh checkout: the ISO builds, all six guards + all
+    # six smokes pass, the ISO boots under QEMU, and /api/health answers in
+    # ~10s.
     #
     # Toolchain: the cross compiler (x86_64-elf-gcc) is replaced by the
     # host gcc/ld via the X86_CC/X86_LD overrides. The kernel is
@@ -127,31 +129,48 @@ jobs:
         run: bash tests/run_guard_smokes.sh
         working-directory: aerosls2
 
-      - name: Boot the ISO under QEMU (smoke boot)
+      - name: Boot the ISO under QEMU and check /api/health (service smoke)
         run: |
           qemu-img create -f raw sls_storage.img 10G >/dev/null
-          if timeout 60 qemu-system-x86_64 -cdrom sls_operating_system.iso \
+          qemu-system-x86_64 -cdrom sls_operating_system.iso \
               -drive id=disk,file=sls_storage.img,if=none,format=raw \
               -device nvme,drive=disk,serial=slsdev0 \
               -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
               -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
               -display none -m 4G -smp 4 -boot d -no-reboot \
-              -serial file:boot.log 2>/dev/null; then
-            rc=0
-          else
-            rc=$?
-          fi
-          # 124 = the timeout killed a kernel that was still running (good);
-          # 0 = qemu exited cleanly. Anything else = early exit / triple fault.
-          if [ "$rc" -ne 124 ] && [ "$rc" -ne 0 ]; then
-            echo "FAILED: qemu exited early (rc=$rc) — kernel crashed before the timeout" >&2
+              -serial file:boot.log 2>/dev/null &
+          QPID=$!
+          # The kernel's webapp listens on guest port 3000, forwarded to host
+          # 3001. Poll /api/health — the exact endpoint deploy.sh gates on —
+          # until it answers, qemu dies (crash), or the window runs out.
+          healthy=0
+          qemu_alive=1
+          for i in $(seq 1 75); do
+            if curl -sf --max-time 2 http://localhost:3001/api/health >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            if ! kill -0 "$QPID" 2>/dev/null; then
+              qemu_alive=0
+              break
+            fi
+            sleep 2
+          done
+          kill "$QPID" 2>/dev/null || true
+          wait "$QPID" 2>/dev/null || true
+          if [ "$healthy" -ne 1 ]; then
+            if [ "$qemu_alive" -eq 0 ]; then
+              echo "FAILED: qemu exited before /api/health answered — kernel crashed" >&2
+            else
+              echo "FAILED: /api/health never answered within the poll window" >&2
+            fi
             tail -30 boot.log >&2
             exit 1
           fi
-          if ! grep -q "AEROSLS BOOT LOGGER" boot.log; then
+          grep -q "AEROSLS BOOT LOGGER" boot.log || {
             echo "FAILED: boot banner not seen in the serial log" >&2
             tail -30 boot.log >&2
             exit 1
-          fi
-          echo "OK: kernel booted from the ISO — banner seen, qemu alive at timeout (rc=$rc)"
+          }
+          echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
