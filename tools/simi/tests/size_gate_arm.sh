@@ -992,7 +992,7 @@ declare -A M0_BASELINES=(
     [fetch_cross]=1216
     [float_ops]=2340
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
-    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
+    [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508 [jmpr_chain41]=7556 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
@@ -1233,6 +1233,29 @@ declare -A M0_BASELINES=(
 # differs from M1 (6324) by the M2.24 table compaction and the
 # accumulated emission folds (-1184) — the table path is byte-
 # identical to M0's shape, no chain.
+# jmpr_chain41 is M2.65: the deferred-record pool ONE PAST its 96-cap —
+# the OVER-cap side of the M2.64 turn-over (chain40 + ONE in-place
+# add: the root's 100-value product defers as record 0, then 96 adds
+# r1 = r1 + r4 defer — 97 records needed). At TX_AR_CHAIN_DEFS = 96
+# the 97th allocation returns -1 (pool exhausted): r1 falls to FLAT
+# UNKNOWN at the walk (instrumented: ndef = 96, r1's def = -1 — vs
+# chain40's def = 95, the fits-and-materializes side) — the dispatch
+# is the TABLE, 0 b.eq, and runtime 291 (fall-through arms 90 + 9
+# plus 96*2, the 100th value of {192..291}) passes the bounds check
+# to block0 -> LOADI #8888 on all four engines; a non-conservative
+# exhaustion fallback (a truncated partial image) would miss 291 and
+# UDF-trap (rc=1), so the four-way PASS proves the -1 fallback is
+# exact-or-conservative. The boundary control (DEFS=97 ad hoc): the
+# 97-record DAG FITS the pool (ndef = 97, r1's def = 96) and the
+# 100-value materialization then collapses at the BIG store — the
+# SAME 6364-byte table, a DIFFERENT mechanism (walk-state exhaustion
+# vs materialization collapse), proven by the walk state. Together
+# chain40/chain41 bracket the DEFS boundary: at-cap fits, one-past
+# exhausts conservatively. Pure pin: simi_arm.c unchanged, all 92
+# shared rows byte-identical. This row's M0 baseline (7556, measured
+# at git 1729f50) differs from M1 (6364) by the M2.24 table
+# compaction and the accumulated emission folds (-1192) — the table
+# path is byte-identical to M0's shape, no chain.
 
 pass=0
 fail=0
