@@ -1,22 +1,37 @@
 /* rv_syscall_exit_test.c — host-side tripwire for the RISC-V kernel's
- * RV_SYS_EXIT SBI_SRST failure fallback (ISA doc §16 Phase 9g).
+ * RV_SYS_EXIT exit branches (ISA doc §16 Phase 9g).
  *
- * Compiles the REAL arch/riscv/trap_riscv.c for the x86 host with
- * -DSIMI_HOST_TEST, which swaps the RISC-V-only pieces for host behavior
- * (see that file's top comment): the CSR-armed functions
- * (riscv_trap_init / riscv_trap_dispatch / riscv_trap_dispatch_m) are
- * compiled out — they cannot exist on x86 and the dispatch under test
- * never calls them — and rv_halt() (the wfi-spin terminal halt) becomes
- * exit(0), so "dispatch never returned" is observable as the process
- * terminating from inside the handler.
+ * Compiled TWICE from this one source, both for the x86 host with
+ * -DSIMI_HOST_TEST (which swaps the RISC-V-only pieces for host
+ * behavior, see arch/riscv/trap_riscv.c's top comment):
  *
- * The stubs below close the two things dispatch touches that would
- * otherwise reach the firmware: sbi_putchar() mirrors the kernel's
- * console to stdout, and sbi_system_reset() is stubbed to FAIL — it
- * returns without powering the machine off, exactly the
- * firmware-lacks-SBI_SRST case. tests/run_riscv_tests.sh asserts the
- * fallback messages on stdout, the stub-fired marker on stderr, and the
- * ABSENCE of main's post-call "returned" marker.
+ *   rv-syscall-exit-test    plain SIMI_HOST_TEST — the S-mode/OpenSBI
+ *                           branch: reports the code, attempts the
+ *                           firmware reset, and on failure prints the
+ *                           "SBI_SRST unsupported or failed -- halting
+ *                           hart instead." fallback.
+ *   rv-syscall-exit-test-m  SIMI_HOST_TEST + RISCV_MMODE — the
+ *                           bare-metal branch: no firmware exists, so
+ *                           sbi_system_reset() is never called and the
+ *                           "direct M-mode boot: no firmware to power
+ *                           off -- halting hart." branch fires.
+ *
+ * Under SIMI_HOST_TEST the CSR-armed functions (riscv_trap_init /
+ * riscv_trap_dispatch / riscv_trap_dispatch_m) are compiled out — they
+ * cannot exist on x86 and the dispatch under test never calls them —
+ * and rv_halt() (the wfi-spin terminal halt) becomes exit(0), so
+ * "dispatch never returned" is observable as the process terminating
+ * from inside the handler.
+ *
+ * The stubs below close what dispatch touches that would otherwise
+ * reach the firmware: sbi_putchar() mirrors the kernel's console to
+ * stdout, and sbi_system_reset() is stubbed to FAIL — it returns
+ * without powering the machine off, exactly the firmware-lacks-SBI_SRST
+ * case — with a stderr marker so the runner can assert whether or not
+ * the branch under test attempted the reset. tests/run_riscv_tests.sh
+ * asserts the branch-specific messages on stdout, the stub-fired marker
+ * presence/absence on stderr, and the ABSENCE of main's post-call
+ * "returned" marker.
  */
 #include <stdio.h>
 #include <string.h>

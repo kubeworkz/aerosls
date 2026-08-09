@@ -9,6 +9,7 @@ a64_dump
 a64-f0-test
 stress-atomics
 rv-syscall-exit-test
+rv-syscall-exit-test-m
 bench-net
 bench-corpus
 bench-exec

@@ -7,7 +7,7 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=c11 -O2 -g
 
-all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test
+all: simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump a64-f0-test stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m
 
 simi-asm: simi_asm.c simi_obj.c simi_isa.h simi_obj.h
 	$(CC) $(CFLAGS) -o $@ simi_asm.c simi_obj.c
@@ -47,6 +47,14 @@ simi-riscv-verify: simi_riscv_verify.c simi_riscv.c simi_riscv.h rv64_exec.c rv6
 # refreshes it (the M2.27 stale-binary lesson).
 rv-syscall-exit-test: rv_syscall_exit_test.c ../../arch/riscv/trap_riscv.c ../../arch/riscv/trap_riscv.h ../../arch/riscv/sbi.h
 	$(CC) $(CFLAGS) -DSIMI_HOST_TEST -o $@ rv_syscall_exit_test.c ../../arch/riscv/trap_riscv.c
+
+# The M-mode twin: the same test source compiled with -DRISCV_MMODE, so
+# dispatch takes the bare-metal branch ("no firmware to power off"); the
+# runner additionally asserts sbi_system_reset() was NEVER called (the
+# failing stub's marker must be absent from stderr). Pins both exit
+# branches of RV_SYS_EXIT.
+rv-syscall-exit-test-m: rv_syscall_exit_test.c ../../arch/riscv/trap_riscv.c ../../arch/riscv/trap_riscv.h ../../arch/riscv/sbi.h
+	$(CC) $(CFLAGS) -DSIMI_HOST_TEST -DRISCV_MMODE -o $@ rv_syscall_exit_test.c ../../arch/riscv/trap_riscv.c
 
 # M0 (Step 7 / AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md): portable AArch64
 # (A64) translator core + a small purpose-built A64 decoder/executor
@@ -237,6 +245,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m tests/*.tmo
 
 .PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size clean
