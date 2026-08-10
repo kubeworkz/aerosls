@@ -455,7 +455,7 @@ jobs:
             exit 1
           }
 
-      - name: Build the M4a+M4b arm64 kernel and assert the boot + SIMI smoke + PSCI shutdown
+      - name: Build the M4a+M4b+M4c arm64 kernel and assert the boot + MMU walk + SIMI smoke + PSCI shutdown
         run: |
           # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
           # first bootable AArch64 kernel — banner over the PL011, then
@@ -509,7 +509,32 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a+M4b arm64 kernel booted — banner + EL1 + SIMI result 42 + PSCI SYSTEM_OFF (rc=0)"
+          # M4c (plan doc §6 M4 / §10.190): the VMSAv8-64 MMU comes on
+          # BEFORE the banner, so every line below already proves the
+          # tables. The asserts pin SCTLR.M, the real 4-level walk
+          # results (UART=device+PXN, kernel=normal WBWA), and that the
+          # SIMI smoke still returns 42 with the MMU on.
+          grep -a "\[M4c\] MMU on" arm64_boot.log || {
+            echo "FAILED: the M4c MMU-on line not seen" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "SCTLR_EL1 M=1 C=1 I=1" arm64_boot.log || {
+            echo "FAILED: SCTLR_EL1.M not set (MMU off?)" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "walk(0x40080000) L3=0x0000000040080407 attr=1 (normal)" arm64_boot.log || {
+            echo "FAILED: the 4-level walk did not yield the kernel's normal-WBWA page" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "walk(0x09000000) L3=0x0020000009000403 attr=0 pxn=1 (device)" arm64_boot.log || {
+            echo "FAILED: the walk did not yield the UART device page (attr 0, PXN)" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a+M4b+M4c arm64 kernel booted — banner + MMU walk + SIMI result 42 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |
