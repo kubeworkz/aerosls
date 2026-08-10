@@ -369,6 +369,34 @@ done, staged and compile-gated (§10.180); the actual arm64 kernel
 *build* and its wiring (translate glue, paging, activation, syscall
 path) remains deliberately undone and honest.
 
+**M4 — arm64 kernel target (SCOPED — not started, §10.187).** The last
+row of the §10.184 matrix: a minimal bootable AArch64 kernel that
+`kernel/simi_arm.c` finally links into. Scope in three sub-milestones,
+mirroring the RISC-V kernel's Phase 9 shape (self-contained qemu `-M
+virt` build, embedded .tmo boot smoke, clean power-off): M4a boots
+(entry, PL011 console, banner, PSCI SYSTEM_OFF shutdown — the exact
+analog of SBI_SRST, so QEMU exits rc=0); M4b links `kernel/simi_arm.c`
+(the freestanding `{memcpy, memset}` pair the §10.181 gate permits must
+be PROVIDED by the kernel — that contract becomes concrete here),
+embeds a tiny .tmo exactly like `rv64_boot_smoke_tmo.h`, translates it
+with `simi_arm_translate()`, and calls the entry as a real function
+(result in x9, the M3-established convention) — the kernel leg's job is
+the LINK, not re-verifying the encoder, which qemu-aarch64 already
+proved; M4c (deferred) is the arm64 MMU (VMSAv8-64: TCR/MAIR/TTBR,
+4-level walk), then user paging + interrupts + the syscall path — the
+Phase-9-equivalent honest remainder.
+- **Gate (M4a):** `qemu-system-aarch64 -M virt -cpu cortex-a53 -kernel
+  sls_arm64_kernel.elf` exits rc=0 (PSCI powered it off) with the boot
+  banner in the serial log. **Gate (M4b):** the log shows `[SIMI] entry
+  returned (real machine code executed)` with the expected result,
+  matching the four-way host value; `make arm64-elf` links
+  `kernel/simi_arm.c` into the image. Both gates enforced in the
+  arm64-guards CI job (which already installs the aarch64 toolchain;
+  it gains qemu-system-arm).
+- Sizing: boot_arm64.S ~150, linker_arm64.ld ~40, uart_pl011.c ~80,
+  kernel_arm64.c ~220 (banner + boot smoke + memcpy/memset + PSCI),
+  Makefile ~25, CI ~30; M4c's MMU ~250-400.
+
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
 from Step 6.4 applies equally here:
@@ -6500,7 +6528,7 @@ the copy was made and has no automated re-check.
 | undefined-symbol gate | CHECK same arm64-guards step: nm -u must show nothing beyond {memcpy, memset} -- GCC 13/AArch64 synthesizes exactly that pair from the M2 chain struct copies (§10.181) | CHECK same simi_x86_kernel_check.sh: ZERO undefined symbols -- the -nostdlib link contract is strictly empty on x86 (§10.183) | CHECK same simi_riscv_kernel_check.sh: ZERO undefined symbols (§10.183) |
 | teeth (deliberate-violation smokes) | CHECK arm64_kernel_copy_smoke.sh (printf + unused-var, 3 teeth, arm64-guards job) + the rediff smoke above (§10.181/10.182) | CHECK tests/simi_x86_kernel_smoke.sh (3 teeth, glob-run) (§10.183) + the x86 rediff smoke (kernel-mutation and host-mutation teeth) (§10.185) | CHECK tools/simi/tests/simi_riscv_kernel_smoke.sh (3 teeth, riscv-guards job) (§10.183) + the riscv rediff smoke (§10.185) |
 | real-execution leg on the host twin | CHECK M3 qemu-aarch64 corpus: run_arm64_tests.sh translates and EXECUTES every fixture on real A64 (§10.178/10.179) -- the kernel copy is byte-identical to that proven encoder | CHECK native x86 JIT: run_native_tests.sh executes the host twin as real x86 (M2.76 steps/bytes tripwires) | CHECK rv64_exec parity (run_riscv_tests.sh) + the real RV64 kernel boot smoke in the riscv-guards job (the host twin runs as actual machine code) |
-| kernel build/link | NONE -- deliberately: no arm64 kernel target exists, so the copy is compiled nowhere and linked into nothing; the freestanding compile + re-diff gates are the staging proxy (§10.180). The makefile_sources guard documents this exclusion (§10.183) | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
+| kernel build/link | NONE -- no arm64 kernel target exists, so the copy is compiled nowhere and linked into nothing; the freestanding compile + re-diff gates are the staging proxy (§10.180). The makefile_sources guard documents this exclusion (§10.183). SCOPE DONE (§10.187): M4 defines the minimal bootable arm64 kernel (entry, PL011, PSCI shutdown, linked kernel/simi_arm.c with the kernel-provided {memcpy, memset}) that closes this row | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
 | matrix self-check | CHECK tests/kernel_copy_matrix_check.sh + smoke tests/kernel_copy_matrix_smoke.sh (§10.186) -- parses THIS table: every script named in a CHECK cell must exist and be wired (the tests/*_check.sh + *_smoke.sh globs, or a ci.yml/Makefile reference), every .c named must be referenced by the build/CI | same mechanism, all three columns | same |
 
 Gap 1 (the byte-identity tripwires for x86 and RV64) is CLOSED (§10.185):
@@ -6588,6 +6616,111 @@ one of the 16 script claims in the matrix as of this record, including
 the two runners (run_native_tests.sh, run_riscv_tests.sh) whose wiring
 is the tools/simi/Makefile test targets rather than a CI job — the
 check's wiring vocabulary had to match that reality, which it now does.
+
+### 10.187 M4 scoped: the minimal bootable arm64 kernel that links simi_arm.c
+
+This is a scoping study, not an implementation — the last open row of the
+§10.184 matrix (kernel build/link for the ARM copy) is "NONE" not
+because a check is missing but because no arm64 kernel target exists.
+The scope below is grounded in the closest precedent the repo already
+has: the self-contained RISC-V kernel (kernel/kernel_riscv.c + arch/
+riscv/* + Makefile riscv-elf + the riscv-guards CI job) is a qemu `-M
+virt` build with an embedded .tmo boot smoke and a clean power-off. An
+arm64 kernel is the same shape with different silicon.
+
+#### The three sub-milestones
+
+**M4a — bootable arm64 kernel.** The vertical slice with no SIMI yet:
+- `arch/arm64/linker_arm64.ld` — mirror arch/riscv/linker_riscv.ld:
+  `OUTPUT_ARCH("aarch64")`, `ENTRY(_start)`, load base 0x40080000 (2 MiB
+  into qemu -M virt's 0x40000000 DRAM; the Linux arm64 convention),
+  sections .text.init/.text/.rodata/.data/.bss, `_end` symbol.
+- `arch/arm64/boot_arm64.S` (~150 lines) — `_start`: set up the stack,
+  clear BSS, write VBAR_EL1 (a minimal 16-entry vector table; the smoke
+  needs only the sync/panic entries), and handle the exception level
+  reality: qemu -M virt with TCG enters the kernel at EL2 (the embedded
+  boot path), so the head either stays at EL2 or drops to EL1 like
+  Linux — the scope's decision point, documented, not a blocker.
+- `arch/arm64/uart_pl011.c` (~80 lines) — the virt PL011 UART at
+  0x09000000, polled TX (UARTFR bit 5), putc/puts/print-hex; the analog
+  of the RV kernel's 16550 rv_boot_print.
+- `kernel/kernel_arm64.c` (~220 lines) — kernel_arm64_main(): banner,
+  the PL011 print path, and `psci_system_off()`: qemu -M virt emulates
+  PSCI 0.2 through EL3, so `smc #0` with function id 0x84000008 powers
+  the machine off and QEMU exits rc=0 — the EXACT analog of the RV
+  kernel's SBI_SRST shutdown (Phase 9f), including the rc=0 assertion
+  in the CI runner. No -bios needed (unlike RV, the PSCI monitor is
+  emulated by the virt machine itself).
+- Makefile: `arm64-elf` target — AR_CC=aarch64-linux-gnu-gcc,
+  AR_CFLAGS="-ffreestanding -O2 -Wall -Wextra -march=armv8-a
+  -mgeneral-regs-only -fno-stack-protector -ffunction-sections
+  -fdata-sections" (the -mgeneral-regs-only is the arm64 analog of the
+  x86 kernel's -mno-sse: no FP/SIMD anywhere in the kernel),
+  AR_LD/AR_LDFLAGS with the linker script, AR_ELF=sls_arm64_kernel.elf.
+- **Gate:** qemu-system-aarch64 -M virt -cpu cortex-a53 -m 1G -kernel
+  sls_arm64_kernel.elf exits rc=0 with the banner in the serial log.
+
+**M4b — SIMI translate + execute in-kernel.** The milestone the whole
+scope exists for:
+- Add `kernel/simi_arm.c` to the arm64 build's AR_C_SRC. This is the
+  first time the §10.180 copy is LINKED anywhere, and it makes the
+  §10.181 contract concrete: GCC 13 synthesizes memcpy/memset calls
+  from the M2 chain struct copies, so kernel_arm64.c (or a small
+  arch/arm64/mem.S) must PROVIDE the freestanding {memcpy, memset}
+  pair — the exact symbols the undefined-symbol gate permits and no
+  more. The matrix's ARM compile/undefined-symbol rows stay exactly as
+  they are; the kernel simply satisfies them.
+- Embed a fixture the way kernel/rv64_boot_smoke_tmo.h does:
+  `tools/simi/simi-asm` a tiny .simi (straight_line_bench or a
+  dedicated arm64_boot_smoke), convert to a committed
+  kernel/arm64_boot_smoke_tmo.h. kernel_arm64.c mirrors
+  rv64_boot_smoke_test(): call `simi_arm_translate(tmo, len,
+  g_simi_code_buf, cap, entry_name, scratch, 0, 0, 0, &out_len,
+  &entry_off)`, then call the translated entry as a real function and
+  read the result from x9 (the M3-established return convention).
+- **The honest division of labor:** the kernel leg's job is the LINK
+  and the call — the encoder itself is already proven by the
+  qemu-aarch64 corpus (M3, §10.178/10.179), and the kernel copy is
+  byte-identical to that proven encoder (the re-diff tripwire, §10.182).
+  A wrong result in-kernel would indict the glue (buffer, entry_off,
+  hostfn routing), not the encoder.
+- **Gate:** the serial log shows the banner, `[SIMI] entry returned
+  (real machine code executed)`, and the expected result matching the
+  four-way host value; then PSCI SYSTEM_OFF exits rc=0.
+
+**M4c — the arm64 MMU and the honest remainder (deferred, optional).**
+Boot runs with the MMU OFF (physical addressing — legitimate for a boot
+smoke; the A64 words simi_arm.c emits are position-independent enough
+for direct execution). When the MMU arrives it is VMSAv8-64, nothing
+like Sv39: TCR_EL1 (IPS/T0SZ), MAIR_EL1 (device + normal WBWA), TTBR0/
+TTBR1, a 4-level 4 KiB walk — ~250-400 lines, its own milestone. After
+that come the Phase-9-equivalent honest gaps, verbatim from the RV64
+kernel's scope: user-mode paging (per-process address spaces), an
+activation cache, the syscall/object-catalog/exit-stub story, GIC
+interrupts (the smoke is polled-only), and FP/SIMD context management
+for in-kernel T_F32/T_F64 SIMI execution (the kernel itself compiles
+-mgeneral-regs-only; the boot smoke uses an integer fixture).
+
+#### The CI story
+
+The arm64-guards job already installs gcc-aarch64-linux-gnu and runs
+the real-execution corpus. It gains `binutils-aarch64-linux-gnu
+qemu-system-arm`, then two steps mirroring riscv-guards: build
+`make arm64-elf`, boot under qemu-system-aarch64, assert rc=0 + banner
+(M4a) + the [SIMI] smoke line and expected value (M4b). Nothing about
+the kernel-copy gates changes — they are exactly what makes the link
+safe to land.
+
+#### Sizing and risk
+
+M4a+b is ~500 lines of new kernel code plus ~55 lines of Makefile/CI
+wiring — the same scale as the M0-M3 milestones this plan has shipped.
+The riskiest unknown is the exception-level entry dance (EL2 vs EL1)
+and the PSCI call under TCG, both of which are one-file, one-boot-loop
+problems. The MMU, interrupts, and user paging are honestly deferred,
+not hidden: the kernel-copy matrix row flips NONE -> CHECK only when
+M4b's gate passes, and this record stays as the scope it was written
+against.
 
 ---
 
