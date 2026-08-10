@@ -391,6 +391,38 @@ jobs:
             exit 1
           fi
 
+      - name: Kernel copy compiles under RV_CFLAGS with zero undefined symbols
+        run: |
+          # The RV64 kernel translator copy (kernel/simi_riscv.c) gets the
+          # same audit the ARM copy got (plan doc §10.181): compile it with
+          # the EXACT RV_CFLAGS the kernel build uses and assert (a) zero
+          # warnings and (b) ZERO undefined symbols. The RV64 kernel links
+          # -nostdlib and provides no global memcpy/memset, so the contract
+          # is strictly empty — any symbol (printf, malloc, or a GCC-
+          # synthesized memcpy) would fail the link. The toolchain here is
+          # the same one that built `make riscv-elf` above.
+          out=$(bash tools/simi/tests/simi_riscv_kernel_check.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "0 violations" || {
+            echo "FAILED: kernel/simi_riscv.c does not compile clean under RV_CFLAGS or has undefined symbols" >&2
+            exit 1
+          }
+
+      - name: Teeth — RV64 kernel-copy guard smokes (broken copies must fail)
+        run: |
+          # The check above proves the copy is clean; this proves the check
+          # has teeth. tools/simi/tests/simi_riscv_kernel_smoke.sh
+          # deliberately injects a libc call (printf) and an unused variable
+          # into throwaway copies and asserts the SAME checks fail, plus
+          # asserts the clean copy still passes (so the teeth are
+          # meaningful). A check that has gone blind fails here.
+          out=$(bash tools/simi/tests/simi_riscv_kernel_smoke.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "3 passed, 0 failed" || {
+            echo "FAILED: RV64 kernel-copy gate teeth — a deliberate violation slipped through" >&2
+            exit 1
+          }
+
   arm64-guards:
     # M3 (docs/AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md §6): the REAL
     # AArch64 execution proof. simi-arm-verify runs the emitted A64 words
