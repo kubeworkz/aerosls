@@ -331,8 +331,11 @@ jobs:
           # waits for [TICK 2 Us] — the periodic supervisor timer (STIP via
           # the Sstc stimecmp write, armed at boot and re-armed inside
           # every tick handler) printing its count after the re-arm, which
-          # proves the timer is periodic, not one-shot — plus the full
-          # command loop:
+          # proves the timer is periodic, not one-shot. On the echo build
+          # the period is 100ms (Phase 9n contention probe), so the client
+          # also asserts the tick numbers stay an unbroken run (no missed
+          # re-arms) while interleaving with the UART [IRQ] tripwire — plus
+          # the full command loop:
           # help, a backspace-edited CR-only line (PING\bX -> unknown
           # command PINX), echo <text>, and `exit` — which powers the
           # machine off via SBI_SRST, so QEMU must exit rc=0 (rc=124
@@ -348,7 +351,7 @@ jobs:
           wait $qpid
           rc=$?
           if [ "$rc" -eq 0 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_client.log; then
-            echo "OK: device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing + wall-clock uptime verified ([TICK 2 Us], tasks table, exit -> rc=0)"
+            echo "OK: device-driven UART RX interrupt echo + command loop + 100ms periodic timer + round-robin time-slicing + wall-clock uptime + no-missed-re-arm contention probe verified ([TICK 2 Us], tasks table, exit -> rc=0)"
           else
             echo "FAILED: echo check failed (qemu rc=$rc, client rc=$crc)" >&2
             cat echo_client.log echo_qemu.log >&2
@@ -362,9 +365,11 @@ jobs:
           # with mcause = bit63+11. `-bios none` + sls_riscv_kernel_echo_m.elf
           # (built by `make riscv-elf` above, linked at 0x80000000). Same
           # socket protocol as the S-mode echo step, plus the Phase 9k
-          # timer twin: the bare-metal build arms a 1s tick by programming
+          # timer twin: the bare-metal build arms the periodic tick (100ms
+          # on the echo build, Phase 9n contention probe) by programming
           # the CLINT mtimecmp MMIO directly and enables mie.MTIE, so the
-          # client is passed `tick` and asserts [TICK 2 Us] (MTIP, re-armed).
+          # client is passed `tick` and asserts [TICK 2 Us] (MTIP, re-armed)
+          # plus the no-missed-re-arm run.
           # rc=124 is success here because the M-mode `exit` has no firmware
           # to power off with — it reports the halt and spins (killed by the
           # timeout).
@@ -379,7 +384,7 @@ jobs:
           wait $qpid
           rc=$?
           if [ "$rc" -eq 124 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_m_client.log; then
-            echo "OK: M-mode device-driven UART RX interrupt echo + periodic timer tick + round-robin time-slicing + wall-clock uptime verified ([TICK 2 Us] via CLINT mtimecmp, tasks table)"
+            echo "OK: M-mode device-driven UART RX interrupt echo + 100ms periodic timer + round-robin time-slicing + wall-clock uptime + no-missed-re-arm contention probe verified ([TICK 2 Us] via CLINT mtimecmp, tasks table)"
           else
             echo "FAILED: M-mode echo check failed (qemu rc=$rc, client rc=$crc)" >&2
             cat echo_m_client.log echo_m_qemu.log >&2
