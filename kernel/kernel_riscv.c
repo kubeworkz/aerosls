@@ -112,10 +112,20 @@ static void rv64_boot_smoke_test(void) {
      * extension -- control never returns, and QEMU exits rc=0. This is
      * the same trap path the pre-9f ebreak smoke exercised, now carrying
      * the real syscall instead of halting on an unhandled exception. */
+    /* The ebreak must be the 4-byte (non-compressed) form: the handler
+     * advances sepc by exactly 4 (trap_riscv.c's code==3 branch), and
+     * with the C extension enabled the plain `ebreak` mnemonic assembles
+     * to the 2-byte compressed 0x9002 -- mepc+4 would then land
+     * mid-instruction. .option norvc pins the 32-bit 0x00100073, keeping
+     * the +4 resume exact (the bare-metal trap-entry fixture in
+     * tools/simi/tests/rv_trap_entry/ caught this same bug by actually
+     * executing the restore path, see ISA doc §16 Phase 9h). */
     __asm__ volatile(
         "mv a0, %0\n"
         "li a7, %1\n"
+        ".option norvc\n"
         "ebreak\n"
+        ".option rvc\n"
         : : "r"(code), "i"(RV_SYS_EXIT) : "a0", "a7", "memory");
 
     /* Unreachable in practice (the syscall powers the machine off), but

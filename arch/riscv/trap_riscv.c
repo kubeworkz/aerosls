@@ -203,9 +203,13 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
          * smoke issues exactly this (kernel/kernel_riscv.c), and
          * riscv_syscall_dispatch() powers the machine off via SBI_SRST,
          * so this is the smoke's terminal event. If dispatch ever
-         * returns, advance past the ebreak -- the assembler emits the
-         * 4-byte non-compressed form for the `ebreak` mnemonic -- and
-         * continue. */
+         * returns, advance past the ebreak -- +4 is exact ONLY because
+         * the trigger site pins the 4-byte (non-compressed) ebreak via
+         * .option norvc (kernel/kernel_riscv.c; the C extension would
+         * otherwise compress `ebreak` to 2 bytes and +4 would land
+         * mid-instruction -- a latent bug the bare-metal trap-entry
+         * fixture exposed by executing the restore path, ISA doc §16
+         * Phase 9h) -- and continue. */
         riscv_syscall_dispatch(phd);
         phd->trap_frame[TF_SEPC] += 4;
         return;
