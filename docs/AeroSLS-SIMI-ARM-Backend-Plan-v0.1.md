@@ -6408,6 +6408,32 @@ memcpy.S/memset.S) — and ANY other symbol fails the gate. The gate's
 `nm -u` check enforces exactly that: `memcpy`/`memset` are allowed,
 everything else (printf, malloc, ...) is a hard failure.
 
+### 10.182 The byte-identity contract becomes a CI tripwire (re-diff on every push)
+
+Before this, kernel/simi_arm.{c,h} identity with the tools copies was
+asserted once at commit time and never looked at again: a future edit to
+tools/simi/simi_arm.c that forgot to re-derive the kernel copy would
+silently diverge the two, and the arm64-guards compile gate would still
+pass (it compiles whatever kernel/simi_arm.c happens to be). A new
+toolchain-free guard closes that: `tests/arm_kernel_copy_rediff_check.sh`
+re-runs the re-diff on every push (it rides the `tests/*_check.sh` glob
+in tests/run_checks.sh, so the main CI job runs it — no aarch64
+toolchain required). It extracts each pair's BODY from its marker line
+(the `#include "simi_arm.h"` / `#ifndef SIMI_ARM_H` anchors) to EOF and
+diffs — marker-anchored, not hardcoded line numbers, so header growth
+(the kernel .c header has grown twice, §10.180/10.181) never breaks the
+extraction. Empty-body extraction is an ABORT (exit 2), not a pass, so a
+broken marker can't silently make the diff trivially green.
+
+Teeth: `tests/arm_kernel_copy_rediff_smoke.sh` (rides the
+`tests/*_smoke.sh` glob in run_guard_smokes.sh) copies the four files to
+a temp dir, mutates one token in the KERNEL copy's body and then in the
+HOST copy's body, and asserts the check FAILS each time — plus asserts
+the pristine copies still PASS, so the teeth are meaningful. The real
+files are never touched; the check's positional-path args exist
+precisely to let the smoke point it at the throwaway copies. A check
+that has gone blind (broken marker, empty diff) fails here.
+
 ---
 
 ## Sources consulted
