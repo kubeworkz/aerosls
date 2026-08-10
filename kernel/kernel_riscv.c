@@ -168,8 +168,25 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
      * interrupt is taken in M-mode at mtvec with mcause = bit63 + 11. */
 #if defined(RISCV_MMODE)
     init_riscv_plic(0);
+
+    /* Phase 9k M-mode twin: the same 1-second periodic timer over the
+     * bare-metal path. sbi_arm_timer programs the CLINT's hart-0
+     * mtimecmp MMIO directly (physical 0x02004000 — no firmware
+     * exists, so there is no SBI call to make), and mie.MTIE (bit 7 =
+     * 0x80 — which, like STIE, does NOT fit the CSRxI 5-bit immediate
+     * field, so the register form is required) makes MTIP deliverable
+     * to M-mode. Same order discipline as the S-mode arm below: arm
+     * first (comparator in the future), THEN enable, so whatever
+     * mtimecmp held at reset cannot produce an early tick. The machine
+     * timer is taken at mtvec with mcause = bit63 + 7 and re-armed in
+     * handle_riscv_supervisor_interrupt, exactly like the S-mode STIP
+     * path. */
+    sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+    uint64_t mtie_bit = 0x80;
+    __asm__ volatile("csrs mie, %0" : : "r"(mtie_bit) : "memory");
     __asm__ volatile("csrs mstatus, 8");
     rv_boot_print("[PLIC] UART RX interrupt wired (source 10 -> hart 0 M-mode, MEIE + MIE on).\n");
+    rv_boot_print("[TIMER] CLINT mtimecmp armed (MTIP, 1s period).\n");
 #else
     init_riscv_plic(0);
     __asm__ volatile("csrs sstatus, 2");

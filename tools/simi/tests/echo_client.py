@@ -30,14 +30,14 @@ queued bytes and must drain completely (every char echoed, every line
 dispatched) no matter how many interrupts they split into -- pinning
 claim/complete discipline under rapid input.
 
-Optional second argument "tick" (Phase 9k; passed by the S-mode runner
-only -- the M-mode twin has no firmware to program the timer, so no
-ticks ever fire there): after the IRQ tripwire, wait for [TICK 2]. Each
-[TICK N] is printed AFTER the kernel re-armed the next tick, so seeing
-[TICK 2] proves the timer is genuinely periodic -- a one-shot arm would
-deliver at most [TICK 1] and then go silent. (The tick wait is placed
-before the command loop so the assertion runs while the machine is
-still on; `exit` below powers it off.)
+Optional second argument "tick" (Phase 9k; passed by BOTH runners -- the
+S-mode kernel arms the timer via the stimecmp CSR, the M-mode twin via
+the CLINT mtimecmp MMIO): after the IRQ tripwire, wait for [TICK 2].
+Each [TICK N] is printed AFTER the kernel re-armed the next tick, so
+seeing [TICK 2] proves the timer is genuinely periodic -- a one-shot
+arm would deliver at most [TICK 1] and then go silent. (The tick wait
+is placed before the command loop so the assertion runs while the
+machine is still on; `exit` below powers it off.)
 
 Usage: python3 echo_client.py /path/to/serial.sock [tick]
 
@@ -112,13 +112,13 @@ def main() -> int:
     s.sendall(b"\r")
     buf = recv_until(s, buf, b'unknown command: "ABC"', 5)
 
-    # Phase 9k periodic-timer tripwire (tick mode only): the S-mode
-    # kernel arms the stimecmp comparator (Sstc) for a 1s tick at boot
-    # and re-arms inside every STIP handler, printing [TICK N] after the
-    # re-arm. [TICK 1] fires ~1s after boot and may already be in the
-    # buffer; [TICK 2] proves the interrupt fired AND was re-armed — a
-    # one-shot arm would go silent after [TICK 1]. The 8s budget covers
-    # a slow CI host.
+    # Phase 9k periodic-timer tripwire (tick mode only): the kernel arms
+    # a 1s tick at boot (S-mode: stimecmp CSR, Sstc; M-mode twin: CLINT
+    # mtimecmp MMIO) and re-arms inside every timer handler (STIP/MTIP),
+    # printing [TICK N] after the re-arm. [TICK 1] fires ~1s after boot
+    # and may already be in the buffer; [TICK 2] proves the interrupt
+    # fired AND was re-armed — a one-shot arm would go silent after
+    # [TICK 1]. The 8s budget covers a slow CI host.
     tick_mode = len(sys.argv) > 2 and sys.argv[2] == "tick"
     if tick_mode:
         buf = recv_until(s, buf, b"[TICK 2]", 8)
