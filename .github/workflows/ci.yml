@@ -441,7 +441,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: AArch64 cross toolchain and QEMU user-mode
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user qemu-system-arm
 
       - name: Build the M3 JIT harness (cross-compiled)
         run: make -C tools/simi simi-arm-jit
@@ -454,6 +454,50 @@ jobs:
             echo "FAILED: M3 real-execution leg has failures — the emitted A64 code misbehaves on real A64" >&2
             exit 1
           }
+
+      - name: Build the M4a arm64 kernel and assert the boot + PSCI shutdown
+        run: |
+          # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
+          # first bootable AArch64 kernel — banner over the PL011, then
+          # PSCI SYSTEM_OFF (smc #0) powers the machine off, so qemu must
+          # exit rc=0 by itself. rc=124 means the shutdown call never
+          # fired; anything else is an early crash — the riscv-guards
+          # SBI_SRST discipline, mirrored. The working config is
+          # virtualization=on (NOT secure, §10.188): that gives the virt
+          # machine the SMC PSCI conduit and enters the payload at EL2;
+          # the head drops to EL1 and the smc is intercepted by QEMU's
+          # PSCI emulation.
+          make arm64-elf
+          if timeout 60 qemu-system-aarch64 -M virt,virtualization=on \
+             -cpu cortex-a53 -m 1G -kernel sls_arm64_kernel.elf \
+             -nographic -serial file:arm64_boot.log -no-reboot; then
+            echo "OK: qemu exited rc=0 — PSCI SYSTEM_OFF powered the machine off"
+          else
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+              echo "FAILED: timeout (rc=124) — PSCI SYSTEM_OFF never fired" >&2
+            else
+              echo "FAILED: qemu exited early (rc=$rc) — kernel crashed before shutdown" >&2
+            fi
+            tail -30 arm64_boot.log >&2
+            exit 1
+          fi
+          grep -a "AeroSLS ARM64 Node Kernel Online!" arm64_boot.log || {
+            echo "FAILED: arm64 boot banner not seen in the serial log" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "exception level: EL1" arm64_boot.log || {
+            echo "FAILED: the EL drop did not land at EL1" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "PSCI SYSTEM_OFF" arm64_boot.log || {
+            echo "FAILED: the PSCI farewell line not seen" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a arm64 kernel booted — banner + EL1 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |
