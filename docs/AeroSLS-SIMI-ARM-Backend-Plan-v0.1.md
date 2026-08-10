@@ -6382,6 +6382,32 @@ object-catalog/syscall-dispatch/exit-stub story — all awaits an arm64
 kernel target the roadmap does not grow. That is the remaining half of
 M3, kept honest and undone (updated §6).
 
+### 10.181 The kernel-copy gate grows teeth — and the teeth found a real hole
+
+The arm64-guards CI gate for `kernel/simi_arm.c` is now a two-part check
+with a dedicated teeth smoke, mirroring the repo's `tests/*_smoke.sh`
+discipline. The smoke (`tools/simi/tests/arm64_kernel_copy_smoke.sh`,
+run by the arm64-guards job) deliberately breaks both halves of the gate
+on throwaway copies and asserts the gate FAILS each time, plus asserts
+the clean copy still passes (so the teeth are meaningful, not trivially
+red): an injected `printf` is caught by the undefined-symbol check, an
+injected unused variable by the zero-warning check. A gate that has gone
+blind fails the job.
+
+Building the smoke exposed a real hole in the copy's no-libc claim: GCC
+13 on AArch64 synthesizes `memcpy`/`memset` CALLS from the M2
+chain-analysis struct copies (`struct ChainSet` is ~392 bytes after the
+M2.64 cap bump; the aggregate-copy path lowers `*dst = *cur` to a
+libcall), and no flag (`-fno-builtin`, `-fno-tree-loop-distribute-
+patterns`, `-fno-tree-vectorize`, `-Os`) removes them. The RV64 and x86
+kernel copies compile to ZERO undefined symbols on their toolchains, so
+the ARM copy's honest contract is now stated precisely in its header:
+the object's only undefined symbols may be the freestanding {memcpy,
+memset} pair — exactly what a real kernel provides (Linux arm64 ships
+memcpy.S/memset.S) — and ANY other symbol fails the gate. The gate's
+`nm -u` check enforces exactly that: `memcpy`/`memset` are allowed,
+everything else (printf, malloc, ...) is a hard failure.
+
 ---
 
 ## Sources consulted

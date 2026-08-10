@@ -430,14 +430,41 @@ jobs:
           # (re-diffed at commit time); no arm64 kernel build exists to
           # link it, so this freestanding compile under the kernel's flag
           # discipline (-ffreestanding -O2 -Wall -Wextra, the M2 gate's
-          # exact shape) is what keeps the copy honest in CI — it must
-          # build with zero warnings. A divergence from the host copy
-          # surfaces as a behavior difference under the real-A64 leg
-          # above.
+          # exact shape) is what keeps the copy honest in CI. Two checks:
+          # (a) zero warnings; (b) no undefined symbols beyond the
+          # freestanding {memcpy, memset} pair — GCC 13 on AArch64
+          # synthesizes exactly those two from the M2 chain struct copies
+          # (the RV64/x86 kernel copies compile to zero undefined symbols
+          # on their toolchains), so the no-libc contract is "nothing but
+          # the freestanding pair", and ANY other symbol (printf, malloc,
+          # ...) fails the gate. A divergence from the host copy surfaces
+          # as a behavior difference under the real-A64 leg above.
           out=$(aarch64-linux-gnu-gcc -ffreestanding -O2 -Wall -Wextra \
                 -ffunction-sections -fdata-sections -c kernel/simi_arm.c -o /tmp/kernel_simi_arm.o 2>&1)
           echo "$out"
           [ -z "$out" ] || {
             echo "FAILED: kernel/simi_arm.c does not compile clean under freestanding flags" >&2
+            exit 1
+          }
+          bad=$(aarch64-linux-gnu-nm -u /tmp/kernel_simi_arm.o | awk '$1 == "U" { print $2 }' \
+                | grep -vx 'memcpy\|memset')
+          [ -z "$bad" ] || {
+            echo "FAILED: kernel/simi_arm.o has libc references beyond {memcpy, memset}:" >&2
+            echo "$bad" >&2
+            exit 1
+          }
+
+      - name: Teeth — kernel-copy gate smokes (broken copies must fail)
+        run: |
+          # The gate above proves the copy is clean; this proves the gate
+          # has teeth. tools/simi/tests/arm64_kernel_copy_smoke.sh
+          # deliberately injects a libc call (printf) and an unused
+          # variable into throwaway copies and asserts the SAME checks
+          # fail, plus asserts the clean copy still passes (so the teeth
+          # are meaningful). A gate that has gone blind fails here.
+          out=$(bash tools/simi/tests/arm64_kernel_copy_smoke.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "3 passed, 0 failed" || {
+            echo "FAILED: kernel-copy gate teeth — a deliberate violation slipped through" >&2
             exit 1
           }

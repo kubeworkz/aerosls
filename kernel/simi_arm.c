@@ -23,7 +23,13 @@
  * qemu-aarch64 REAL-execution leg of M3 (plan doc §10.178/10.179) —
  * same encoder, same bugs or lack thereof; and (2) a clean compile under
  * aarch64 freestanding flags with zero warnings, enforced by the
- * arm64-guards CI job. What's NOT here: kernel/simi_translate_arm.c-
+ * arm64-guards CI job. The no-libc contract is precise: the object's
+ * only undefined symbols may be the freestanding {memcpy, memset} pair
+ * (GCC 13 on AArch64 synthesizes exactly those two calls from the M2
+ * chain-analysis struct copies — the RV64/x86 kernel copies compile to
+ * zero undefined symbols on their toolchains — and a real kernel
+ * provides them, as Linux arm64 does); ANY other symbol fails the gate
+ * (§10.181). What's NOT here: kernel/simi_translate_arm.c-
  * equivalent glue, an arm64 activation/spawn path, user-mode paging, and
  * the object-catalog/syscall-dispatch/exit-stub story — all of it needs
  * an arm64 kernel target the roadmap does not grow; plan doc §6 keeps
