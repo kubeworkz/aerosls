@@ -211,6 +211,41 @@ for mode in syscall ecall unhandled interrupt; do
 done
 rm -f rv_trap_*.out rv_trap_*.err
 
+# Phase 9h (ISA doc §16): the bare-metal trap-entry fixture. The REAL
+# entry assembly (arch/riscv/trap_riscv.S) cannot run on the x86 host,
+# so the fixture links it into a tiny freestanding M-mode payload
+# (tests/rv_trap_entry/, built on demand by `make rv-trap-entry-test`)
+# and boots it under qemu-system-riscv64 -bios none (single hart). It
+# pins the entry's save/restore round trip -- including the restore+
+# return half no kernel boot exercises (every real trap halts or powers
+# off). The fixture halts deliberately, so QEMU is killed by the timeout
+# (rc=124); the assertions are the serial messages. Skipped when the
+# cross toolchain or system QEMU is absent.
+if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
+    if make -C .. rv-trap-entry-test >/dev/null 2>&1; then
+        timeout 30 qemu-system-riscv64 -M virt -m 128M -smp 1 -bios none -kernel ../rv_trap_entry.elf -nographic >rv_trap_entry.out 2>&1
+        rc=$?
+        if [ "$rc" -eq 124 ] \
+           && grep -q "\[FIXTURE\] dispatcher: frame save verified" rv_trap_entry.out \
+           && grep -q "\[FIXTURE\] PASS: entry save/restore round-trip verified" rv_trap_entry.out \
+           && ! grep -q "\[FIXTURE\] FAIL" rv_trap_entry.out; then
+            echo "PASS  rv-trap-entry (real entry save/restore round-trip under system QEMU)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  rv-trap-entry (rc=$rc — serial output not as expected)"
+            cat rv_trap_entry.out
+            fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  rv-trap-entry (fixture build failed — check the cross toolchain)"
+        skip=$((skip+1))
+    fi
+    rm -f rv_trap_entry.out
+else
+    echo "SKIP  rv-trap-entry (no qemu-system-riscv64 / riscv64-unknown-elf-gcc)"
+    skip=$((skip+1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

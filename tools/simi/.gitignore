@@ -12,6 +12,10 @@ rv-syscall-exit-test
 rv-syscall-exit-test-m
 rv-syscall-exit-test-u
 rv-trap-test
+rv_trap_entry.elf
+rv_trap_entry.o
+rv_trap_entry_driver.o
+rv_trap_entry_asm.o
 bench-net
 bench-corpus
 bench-exec
