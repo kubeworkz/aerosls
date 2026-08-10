@@ -12,11 +12,11 @@
 # bare-metal M-mode boot keeps FS=Off where the dispatcher's scause=2
 # case catches it. Design B part 2 adds a deliberate, contained FP user:
 # fp_save_all/fp_load_all (arch/riscv/trap_riscv.S), the two-owner FS
-# lazy-save plumbing; Design B part 3 adds the two-task round-robin's
-# FP work (rv_fp_task_a/rv_fp_task_b in kernel/kernel_riscv.c — one
-# fadd.d + one fmv.x.d per slice, pinned by the boot's [TASK] asserts).
+# lazy-save plumbing; Design B part 3 adds the N-task ready queue's FP
+# work (rv_fp_task_common in kernel/kernel_riscv.c — one fadd.d + one
+# fmv.x.d per slice, pinned by the boot's [TASK] asserts).
 # The invariant is therefore NOT "zero FP instructions" anymore — it is
-# "FP instructions ONLY inside those four functions": a function-scoped
+# "FP instructions ONLY inside those three functions": a function-scoped
 # allow-list, so an accidental fadd.d (or a stray fld anywhere outside
 # the plumbing/tasks) still fails the gate.
 #
@@ -34,9 +34,8 @@
 #     the operand check covers f[ast]?[0-9]+ and the v-register class;
 #   * the function gate tracks the current symbol (objdump's
 #     `<name>:` headers), so sanctioned means literally inside
-#     fp_save_all / fp_load_all / rv_fp_task_a / rv_fp_task_b — a helper
-#     moved, renamed, or inlined elsewhere starts failing the census
-#     again.
+#     fp_save_all / fp_load_all / rv_fp_task_common — a helper moved,
+#     renamed, or inlined elsewhere starts failing the census again.
 # Validated: on all four clean kernel ELFs the only FP instructions are
 # the two helpers' 66 fld/fsd/fmv/frcsr/fscsr lines plus the two task
 # functions' fadd.d/fmv.x.d lines (sanctioned, 0 unexpected); 4/4
@@ -74,7 +73,7 @@ CENSUS_AWK='
 ($3 ~ /^(fadd|fsub|fmul|fdiv|fsqrt|fmin|fmax|fmadd|fmsub|fnmadd|fnmsub|fcvt|fsgnj|fsgnjn|fsgnjx|fmv|fle|flt|feq|fclass|fld|flw|fsd|fsw|frcsr|fscsr|frrm|fsrm|frflags|fsflags|vsetvli|vsetivli|vsetvl|v)/ ||
  $4 ~ /(^|[, ])(f[ast]?[0-9]+|v[0-9]+)([., ]|$)/) {
     if (fn == "fp_save_all" || fn == "fp_load_all" ||
-        fn == "rv_fp_task_a" || fn == "rv_fp_task_b") { sanc++; }
+        fn == "rv_fp_task_common") { sanc++; }
     else { print "UNEXPECTED: " $0; bad++; }
 }
 END { print "SANCTIONED: " sanc + 0; }'
@@ -92,7 +91,7 @@ for elf in "${elfs[@]}"; do
     sanctioned=$(printf '%s\n' "$out" | sed -n 's/^SANCTIONED: //p')
     [ -z "$sanctioned" ] && sanctioned=0
     if [ "$unexpected" -eq 0 ]; then
-        echo "fp-census: OK — $elf: $sanctioned sanctioned FP instructions (fp_save_all/fp_load_all + rv_fp_task_a/b), 0 unexpected"
+        echo "fp-census: OK — $elf: $sanctioned sanctioned FP instructions (fp_save_all/fp_load_all + rv_fp_task_common), 0 unexpected"
     else
         echo "fp-census: FAILED — $elf contains $unexpected unexpected FP/vector instruction line(s) (sanctioned: $sanctioned):" >&2
         printf '%s\n' "$out" | grep '^UNEXPECTED:' | head -10 >&2

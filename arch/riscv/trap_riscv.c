@@ -63,11 +63,12 @@ _Static_assert(TF_F0 == 32, "TF_F0 must be the first slot after TF_SEPC (offset 
 _Static_assert(TF_F31 == 63, "TF_F31 must end the f-register block (offset 504)");
 _Static_assert(TF_FCSR == 64, "TF_FCSR at offset 512 (fcsr is 32-bit, full slot)");
 _Static_assert(TF_SFS == 65, "TF_SFS at offset 520 (saved sstatus.FS field)");
-_Static_assert(sizeof(struct RvPerHartData) == 1080,
-                "1080 = 66*8 (trap_frame, GPR+sepc + Design B FP region) + 8 "
-                "(kernel_sp) + 2*33*8 (fp_save, Design B part 2: two owners' "
-                "f0-f31+fcsr) + 8 (fp_owner) + 8 (fp_current) -- if this "
-                "changes, trap_riscv.S's hardcoded offsets need updating too");
+_Static_assert(sizeof(struct RvPerHartData) == 1608,
+                "1608 = 66*8 (trap_frame, GPR+sepc + Design B FP region) + 8 "
+                "(kernel_sp) + 4*33*8 (fp_save, Design B part 2/3: RV_FP_OWNERS=4 "
+                "owners' f0-f31+fcsr) + 8 (fp_owner) + 8 (fp_current) -- if "
+                "this changes, trap_riscv.S's hardcoded offsets need updating "
+                "too");
 _Static_assert(offsetof(struct RvPerHartData, fp_save) == 536,
                 "fp_save must sit right after kernel_sp (offset 536)");
 
@@ -85,7 +86,7 @@ static void rv_print_udec(uint64_t v) {
 
 /* Design B part 3: how many FS lazy-saves have fired since boot. Only
  * touched from trap context (single hart, interrupts disabled inside
- * the handler), so a plain global is fine. The two-task round-robin
+ * the handler), so a plain global is fine. The N-task ready queue
  * asserts its delta across the demo (exactly one lazy-save per
  * task-slice, since each switch disarms FP). */
 uint64_t g_fp_lazy_count;
@@ -300,8 +301,8 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
         __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus_v));
         uint64_t fs = (sstatus_v >> 13) & 3;
         if (is_fp && fs == 0) {
-            uint64_t live = phd->fp_current & 1;
-            uint64_t next = phd->fp_owner & 1;
+            uint64_t live = phd->fp_current;   /* full owner id, 0..RV_FP_OWNERS-1 */
+            uint64_t next = phd->fp_owner;     /* (the &1 two-owner masks are gone -- part 3) */
             __asm__ volatile("csrw sstatus, %0"
                               : : "r"(sstatus_v | (3ULL << 13)) : "memory");
             fp_save_all(&phd->fp_save[live][0]);

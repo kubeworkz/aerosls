@@ -318,21 +318,21 @@ jobs:
             tail -30 boot_rv.log >&2
             exit 1
           }
-          # Design B part 3: the two-task FP round-robin (real coroutine
+          # Design B part 3: the three-task FP ready queue (real coroutine
           # contexts via perform_riscv_context_switch, FP state saved/
           # restored through the fp_save owner rows, one lazy-save per
-          # slice = exactly 10 more, after the smoke's 3).
-          grep -a "\[TASK\] round-robin: ALL PASS" boot_rv.log || {
-            echo "FAILED: the two-task FP round-robin did not pass in S-mode" >&2
+          # slice = exactly 15 more, after the smoke's 3).
+          grep -a "\[TASK\] ready queue: ALL PASS" boot_rv.log || {
+            echo "FAILED: the three-task FP ready queue did not pass in S-mode" >&2
             tail -30 boot_rv.log >&2
             exit 1
           }
-          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 PASS; lazy-saves during demo: 10 PASS" boot_rv.log || {
-            echo "FAILED: the round-robin final rows/count did not hold in S-mode" >&2
+          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS" boot_rv.log || {
+            echo "FAILED: the ready-queue final rows/count did not hold in S-mode" >&2
             tail -30 boot_rv.log >&2
             exit 1
           }
-          echo "OK: RISC-V kernel booted, FP lazy-save + two-task round-robin passed, SIMI smoke executed, RV_SYS_EXIT powered off via SBI_SRST"
+          echo "OK: RISC-V kernel booted, FP lazy-save + three-task ready queue passed, SIMI smoke executed, RV_SYS_EXIT powered off via SBI_SRST"
 
       - name: Boot the kernel as a direct M-mode payload and assert the boot smoke + halt
         run: |
@@ -402,20 +402,20 @@ jobs:
             tail -30 boot_rv_m.log >&2
             exit 1
           }
-          # Design B part 3: the two-task FP round-robin on the bare-metal
-          # path too — the same coroutine contexts + FP owner rows, 10
+          # Design B part 3: the three-task FP ready queue on the bare-metal
+          # path too — the same coroutine contexts + FP owner rows, 15
           # per-slice lazy-saves after the smoke's 3.
-          grep -a "\[TASK\] round-robin: ALL PASS" boot_rv_m.log || {
-            echo "FAILED: the two-task FP round-robin did not pass in M-mode" >&2
+          grep -a "\[TASK\] ready queue: ALL PASS" boot_rv_m.log || {
+            echo "FAILED: the three-task FP ready queue did not pass in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
-          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 PASS; lazy-saves during demo: 10 PASS" boot_rv_m.log || {
-            echo "FAILED: the round-robin final rows/count did not hold in M-mode" >&2
+          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS" boot_rv_m.log || {
+            echo "FAILED: the ready-queue final rows/count did not hold in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
-          echo "OK: M-mode kernel booted, FP lazy-save + two-task round-robin passed, SIMI smoke executed, graceful halt reached"
+          echo "OK: M-mode kernel booted, FP lazy-save + three-task ready queue passed, SIMI smoke executed, graceful halt reached"
 
       - name: Boot the UART-echo kernel and assert the device-driven RX interrupt echo
         run: |
