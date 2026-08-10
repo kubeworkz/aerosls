@@ -27,9 +27,10 @@
  * interrupt causes, closing that gap for real rather than leaving the
  * stale comment as the only evidence anyone intended to.
  *
- * Layout note: `trap_frame[]`'s 32 slots and `RvPerHartData`'s overall
+ * Layout note: `trap_frame[]`'s 66 slots and `RvPerHartData`'s overall
  * shape are mirrored EXACTLY as hardcoded byte offsets in
- * trap_riscv.S (0, 8, 16, ... 248 for the frame, 256 for kernel_sp) —
+ * trap_riscv.S (0, 8, 16, ... 248 for the GPR+sepc slots, 256..504 for
+ * the Design B FP region, 512 fcsr, 520 sfs, 528 for kernel_sp) —
  * assembly can't #include this struct, so trap_riscv.c carries
  * compile-time `_Static_assert`s pinning every offset this header
  * implies against what the assembly actually uses, specifically so the
@@ -51,16 +52,30 @@ enum {
     TF_S2, TF_S3, TF_S4, TF_S5, TF_S6, TF_S7, TF_S8, TF_S9, TF_S10, TF_S11,
     TF_T3, TF_T4, TF_T5, TF_T6,
     TF_SEPC,
-    TF_COUNT   /* = 32 */
+    /* Design B FP region (ISA doc §16 Phase 16 audit addendum): the
+     * scalar FP state the trap path does NOT save today (the audit: the
+     * frame is GPR-only). These slots are RESERVED now so the future
+     * save path (a scause=2 FS lazy-save handler, or an eager f0-f31 +
+     * fcsr save in the trap entry) has a home the moment it lands; the
+     * entry assembly does not touch them yet. TF_SFS holds the
+     * interrupted context's sstatus.FS field so a restore can put it
+     * back exactly. */
+    TF_F0, TF_F1, TF_F2, TF_F3, TF_F4, TF_F5, TF_F6, TF_F7,
+    TF_F8, TF_F9, TF_F10, TF_F11, TF_F12, TF_F13, TF_F14, TF_F15,
+    TF_F16, TF_F17, TF_F18, TF_F19, TF_F20, TF_F21, TF_F22, TF_F23,
+    TF_F24, TF_F25, TF_F26, TF_F27, TF_F28, TF_F29, TF_F30, TF_F31,
+    TF_FCSR,             /* 32-bit FP control/status, full slot for uniformity */
+    TF_SFS,              /* saved sstatus.FS field (2 bits, full slot) */
+    TF_COUNT             /* = 66 */
 };
 
 struct RvPerHartData {
-    uint64_t trap_frame[TF_COUNT];   /* offsets 0..248, see enum above */
-    uint64_t kernel_sp;              /* offset 256: top of this hart's
+    uint64_t trap_frame[TF_COUNT];   /* offsets 0..520, see enum above */
+    uint64_t kernel_sp;              /* offset 528: top of this hart's
                                        * dedicated trap-handling stack --
                                        * the C dispatcher runs on THIS
                                        * stack, not on trap_frame[] itself
-                                       * (32*8=256 bytes is nowhere near
+                                       * (66*8=528 bytes is nowhere near
                                        * enough room for a real C call
                                        * stack). */
 };

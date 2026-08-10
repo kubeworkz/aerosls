@@ -84,7 +84,12 @@
     # regardless, so whatever the C side does to the live register
     # doesn't matter.
     mv    s1, sp
-    ld    sp, 256(s1)      # switch to this hart's real kernel trap stack
+    # Switch to this hart's real kernel trap stack. kernel_sp moved from
+    # offset 256 to 528 when the Design B FP region (TF_F0..TF_F31 +
+    # fcsr + sfs, ISA doc §16 Phase 16 audit addendum) grew trap_frame
+    # from 32 to 66 slots — the _Static_asserts in trap_riscv.c pin this
+    # offset against the C struct (offsetof(kernel_sp) == 528).
+    ld    sp, 528(s1)
     mv    a0, s1           # a0 = &RvPerHartData, the dispatcher's argument
     call  \dispatch_fn
     mv    sp, s1           # back to &RvPerHartData (== &trap_frame)
