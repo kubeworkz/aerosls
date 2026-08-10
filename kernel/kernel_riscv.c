@@ -200,19 +200,38 @@ static void rv64_float_smoke_test(void) {
 }
 
 /* ─── Design B part 3 (ISA doc §16 Phase 16 audit addendum) + the
- * N-task ready-queue follow-up: the context switch finally gets real
- * callers. perform_riscv_context_switch (arch/riscv/context_riscv.S)
- * has been dead code since Phase 9c and GPR-only (the audit, Finding 2:
- * "the context switch is GPR-only AND dead code"). This section gives
- * it its first callers and teaches the switch to save and restore the
- * fp_save owner rows: rv_task_switch_fp saves the LIVE owner's state,
- * loads the incoming task's row, folds the registry, disarms FP, then
- * performs the coroutine switch. The tick marks each slice boundary
- * (g_rv_slice_expired, set in sbi.c), so the round-robin is tick-
- * cadenced like Phase 9l's modeled table — but with REAL register
- * contexts and REAL per-task FP state. The follow-up generalizes the
- * two-task demo into an N-task ready queue: a task array + round-robin
- * cursor (rv_schedule_next skips `done` tasks), a generic runner
+ * N-task ready-queue follow-up + the preemption follow-up: the context
+ * switch finally gets real callers. perform_riscv_context_switch
+ * (arch/riscv/context_riscv.S) has been dead code since Phase 9c and
+ * GPR-only (the audit, Finding 2: "the context switch is GPR-only AND
+ * dead code"). This section gives it its first callers and teaches the
+ * switch to save and restore the fp_save owner rows: rv_task_switch_fp
+ * saves the LIVE owner's state, loads the incoming task's row, folds
+ * the registry, disarms FP, then performs the coroutine switch.
+ *
+ * TWO switch mechanisms now share the scheduler, and the preemption
+ * follow-up is what makes the tick a true preemptive scheduler instead
+ * of the poll-and-yield protocol:
+ *
+ * 1. COOPERATIVE (rv_task_switch_fp -> perform_riscv_context_switch):
+ *    used ONLY for the boot-context handoffs — entering the first task
+ *    from the driver and returning to the boot context when the queue
+ *    empties. g_rv_switching guards the whole sequence so a tick can
+ *    never preempt mid-switch (the coroutine's in-flight stack/FP
+ *    state is not in a preemptable shape).
+ *
+ * 2. PREEMPTIVE (rv_scheduler_tick, called from the timer interrupt in
+ *    arch/riscv/sbi.c): the tick handler itself rotates the running
+ *    task, so a compute-bound task cannot hog the hart. The interrupted
+ *    task's FULL context (all 31 GPRs + sepc) is already sitting in
+ *    RvPerHartData.trap_frame (the trap entry saved it); the scheduler
+ *    copies it into the task's ctx[32] image, copies the next task's
+ *    image into trap_frame, swaps the FP owner registry, and disarms
+ *    FS — the trap epilogue then srets into the next task. The trap
+ *    frame IS the switch buffer, zero new assembly.
+ *
+ * The ready queue is N-task: a task array + round-robin cursor
+ * (rv_schedule_next skips `done` tasks), a generic runner
  * (rv_fp_task_common) driven by a per-task spec table, and a handoff
  * back to the boot context when no task remains runnable. The FP owner
  * registry grows with it: fp_save rows are now RV_FP_OWNERS (trap_riscv.h)
@@ -225,19 +244,32 @@ static struct RvTask g_rv_tasks[RV_TASK_COUNT];
 /* The N-task scheduler state: g_rv_cursor is the index of the task that
  * last ran (the next pick starts just after it); g_rv_current is the
  * running task, or NULL while the boot context runs (set by
- * rv_task_switch_fp before each switch so a resumed task can identify
- * itself -- the only task identity a coroutine entry needs). */
+ * rv_task_switch_fp and rv_scheduler_tick before each switch so a
+ * resumed task can identify itself -- the only task identity a
+ * coroutine entry needs). */
 static uint64_t g_rv_cursor;
 static struct RvTask* g_rv_current;
 
-/* The time-slice boundary marker (context_riscv.h): written by the tick
- * handler (sbi.c), polled+cleared by the running task at its slice
- * boundary. Defined here — the tasks are this file's feature. */
-volatile uint64_t g_rv_slice_expired;
+/* The preemption guard: 1 while a COOPERATIVE switch is in flight
+ * (rv_task_switch_fp's FP save/load + coroutine handoff), so the tick
+ * handler's rv_scheduler_tick no-ops rather than preempt a task whose
+ * context is half-way between its stack and its trap-frame image. Set
+ * by the switching side, cleared by whichever context the switch
+ * resumes into (the task entry's first line, or the driver right after
+ * the switch returns). Written/read by different contexts, so
+ * volatile — single hart, but the readers must never get a stale
+ * hoisted load. */
+volatile uint64_t g_rv_switching;
 
-/* Lay a task's initial stack frame: the switch's restore pops 14
- * registers (ra, s0-s11, tp) off the incoming sp and `ret`s — so the
- * fabricated frame has ra = the task entry and zeros elsewhere. */
+/* Lay a task's initial state: the COOPERATIVE entry path needs a
+ * fabricated stack frame (the switch's restore pops 14 registers — ra,
+ * s0-s11, tp — off the incoming sp and `ret`s, so the frame has ra =
+ * the task entry and zeros elsewhere); the PREEMPTIVE entry path needs
+ * the fabricated ctx[32] trap-frame image (sepc = entry, sp = stack
+ * top, gp/tp = the kernel's live values — the tick loads it into
+ * trap_frame and the trap epilogue srets into it). Both are laid here
+ * so the first entry into ANY task works in either mechanism; every
+ * later entry overwrites whichever image the tick/switch used. */
 static void rv_task_init(struct RvTask* t, void (*fn)(void), uint64_t owner,
                          const char* name) {
     uint64_t* sp = (uint64_t*)(t->stack + sizeof(t->stack));
@@ -249,19 +281,37 @@ static void rv_task_init(struct RvTask* t, void (*fn)(void), uint64_t owner,
     t->name = name;
     t->slices = 0;
     t->done = 0;
+    t->preemptions = 0;
+    register uint64_t gp_v __asm__("gp");
+    register uint64_t tp_v __asm__("tp");
+    for (int i = 0; i < 32; i++) t->ctx[i] = 0;
+    t->ctx[TF_RA] = 0;
+    t->ctx[TF_SP] = (uint64_t)(uintptr_t)(t->stack + sizeof(t->stack));
+    t->ctx[TF_GP] = gp_v;
+    t->ctx[TF_TP] = tp_v;
+    t->ctx[TF_SEPC] = (uint64_t)(uintptr_t)fn;
+    /* The rest of ctx stays zero: the task entry's prologue sets up its
+     * own frame and clobbers caller-saved registers anyway. */
 }
 
-/* The FP-aware task switch — the switch's only intended caller. Saves
- * the live owner's FP state (whoever's is in the registers) into its
- * fp_save row, loads the incoming task's row, folds the owner registry,
- * disarms FP (so the incoming task's FIRST FP instruction lazy-saves —
- * proving the eager load and the trap path agree), then performs the
- * GPR coroutine switch. When the switch later returns into this task,
- * the switch that left it here already loaded THIS task's state — no FP
- * work happens on resume. All FP instructions here are the sanctioned
+/* The FP-aware cooperative task switch — the coroutine path's only
+ * caller, used ONLY for the boot-context handoffs (driver -> first
+ * task, last task -> driver). Saves the live owner's FP state
+ * (whoever's is in the registers) into its fp_save row, loads the
+ * incoming task's row, folds the owner registry, disarms FP (so the
+ * incoming task's FIRST FP instruction lazy-saves — proving the eager
+ * load and the trap path agree), then performs the GPR coroutine
+ * switch. g_rv_switching is raised for the whole sequence and lowered
+ * by whichever context the switch resumes into — the task entry's
+ * first line, or right here when the switch returns into the driver —
+ * so a tick can never preempt a task whose context is mid-handoff.
+ * When the switch later returns into this task, the switch that left it
+ * here already loaded THIS task's state — no FP work happens on
+ * resume. All FP instructions here are the sanctioned
  * fp_save_all/fp_load_all plumbing (rv64_fp_census gate). */
 static void rv_task_switch_fp(struct RvTask* cur, struct RvTask* next) {
     struct RvPerHartData* phd = &g_hart0_data;
+    g_rv_switching = 1;
     uint64_t sst;
     __asm__ volatile("csrr %0, sstatus" : "=r"(sst));
     /* FS=Dirty first: an fsd with FS=Off would itself trap. */
@@ -277,8 +327,10 @@ static void rv_task_switch_fp(struct RvTask* cur, struct RvTask* next) {
     /* FS=Off: the incoming task's first FP instruction lazy-saves. */
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     perform_riscv_context_switch(cur, next);
-    /* Resumed later: this task's state was loaded by the switch that
-     * left it here; FS is Off again (that switch disarmed it). */
+    g_rv_switching = 0;
+    /* Resumed later (boot-context side): the tasks never return from a
+     * cooperative switch — they are resumed by the tick's ctx reload,
+     * which clears the guard at task entry instead. */
 }
 
 /* The ready-queue pick: advance the cursor and return the next task
@@ -293,10 +345,68 @@ static struct RvTask* rv_schedule_next(void) {
 }
 
 /* Yield: run the next ready task, or go back to the boot context when
- * none is left. */
+ * none is left. Used ONLY for the queue-empty handoff now — the per-
+ * slice rotation is the tick handler's job (rv_scheduler_tick). */
 static void rv_task_yield(struct RvTask* cur) {
     struct RvTask* next = rv_schedule_next();
     rv_task_switch_fp(cur, next ? next : &g_rv_main_ctx);
+}
+
+/* The preemptive scheduler hook — called from the timer interrupt
+ * (arch/riscv/sbi.c) on every tick, replacing the old poll-and-yield
+ * protocol: the tick handler itself rotates the running task, so a
+ * compute-bound task cannot hog the hart. The interrupted task's full
+ * context (all 31 GPRs + sepc) is already sitting in
+ * RvPerHartData.trap_frame — the trap entry saved it, and the epilogue
+ * will restore whatever is there when the handler returns. Preemption
+ * is therefore just: save the running task's trap-frame image into its
+ * ctx[32], save its FP state into its owner row, load the next runnable
+ * task's ctx image into trap_frame, load its FP state, fold the
+ * registry, and disarm FS — the trap epilogue then srets into the next
+ * task. The trap frame IS the switch buffer: zero new assembly. A no-op
+ * while the boot context runs (g_rv_current == NULL) or a cooperative
+ * switch is in flight (g_rv_switching) — the timer already re-armed
+ * before this call, so no tick is lost. Only runnable-task preemptions
+ * count (preemptions++ happens only when next exists AND the preempted
+ * task is still runnable — a done task's rotation-out is just the
+ * scheduler clearing the stage for the remaining tasks). */
+void rv_scheduler_tick(void) {
+    struct RvPerHartData* phd = &g_hart0_data;
+    if (g_rv_switching || g_rv_current == NULL) return;
+    struct RvTask* cur = g_rv_current;
+    struct RvTask* next = rv_schedule_next();   /* skips done tasks */
+    if (next == NULL) return;   /* all done: the last-finishing task's
+                                  * cooperative handoff to the boot
+                                  * context is already in flight or
+                                  * imminent — never preempt it */
+    /* 1. The interrupted task's context: trap_frame[TF_RA..TF_SEPC] is
+     * slots 0..31 (TF_RA is 0), mirroring ctx[i] 1:1. */
+    for (int i = 0; i < 32; i++) cur->ctx[i] = phd->trap_frame[i];
+    if (!cur->done) cur->preemptions++;
+    /* 2. Its FP state into its owner row (FS=Dirty first: an fsd with
+     * FS=Off would itself trap). fp_current == cur->fp_owner: the last
+     * rotation loaded THIS task's row and folded the registry, and the
+     * per-slice lazy-save only ever folds owner->owner (a 0->0 no-op). */
+    uint64_t sst;
+    __asm__ volatile("csrr %0, sstatus" : "=r"(sst));
+    __asm__ volatile("csrw sstatus, %0" : : "r"(sst | (3ULL << 13)) : "memory");
+    fp_save_all(&phd->fp_save[cur->fp_owner][0]);
+    /* 3. The next task's context + FP state into place. */
+    for (int i = 0; i < 32; i++) phd->trap_frame[i] = next->ctx[i];
+    fp_load_all(&phd->fp_save[next->fp_owner][0]);
+    phd->fp_owner = next->fp_owner;
+    phd->fp_current = next->fp_owner;
+    g_rv_current = next;
+    /* 4. Disarm FS: the incoming task's first FP instruction lazy-saves
+     * — one trap per slice, the count the demo and CI pin. The eager
+     * load + disarm makes that trap a 0->0 no-op round-trip through its
+     * own row, exactly like the cooperative path. */
+    __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
+    rv_boot_print("[TASK] preempt ");
+    rv_boot_print(cur->name);
+    rv_boot_print(" -> ");
+    rv_boot_print(next->name);
+    rv_boot_print("\n");
 }
 
 /* The FP work of the tasks — the ONLY FP instructions outside the
@@ -357,10 +467,27 @@ static const struct RvTaskSpec g_rv_spec[RV_TASK_COUNT] = {
 };
 
 static void rv_fp_task_common(void) {
-    struct RvTask* me = g_rv_current;   /* set by the switch that entered us */
+    struct RvTask* me = g_rv_current;   /* set by the switch/tick that entered us */
+    g_rv_switching = 0;   /* the cooperative entry (driver -> task 0) is
+                           * complete: the tick may now preempt us. For
+                           * tasks entered preemptively (via the tick
+                           * loading their fabricated ctx) this is a
+                           * no-op — the flag was already clear. */
     uint64_t idx = (uint64_t)(me - g_rv_tasks);
     const struct RvTaskSpec* sp = &g_rv_spec[idx];
     for (int s = 0; s < RV_TASK_SLICES; s++) {
+        /* Wait for the tick to grant slice s+1. Every rotation into us
+         * resumes at this spin — the tick saved our sepc mid-spin — and
+         * each rotation also incremented me->preemptions, so the spin
+         * exits exactly when s+1 boundaries have passed. A BUSY spin,
+         * deliberately NOT wfi: a preemption taken at the wfi would
+         * re-execute it on resume and burn the grant that just woke us,
+         * drifting the per-task preemptions accounting (the
+         * spurious-wake lesson of part 3's 11th lazy-save, in spin
+         * form). The task spends ~100ms in this spin per slice vs.
+         * microseconds on the work below, so the tick lands here —
+         * exactly one preemption per slice. */
+        while (me->preemptions < (uint64_t)(s + 1)) { }
         uint64_t got;
         __asm__ volatile(
             "fmv.d.x ft0, %1\n\t"
@@ -377,25 +504,42 @@ static void rv_fp_task_common(void) {
         rv_boot_print(": ");
         rv_boot_print_hex64(got);
         rv_boot_print(got == sp->exp[s] ? " PASS\n" : " FAIL\n");
-        while (!g_rv_slice_expired) { __asm__ volatile("wfi"); }
-        g_rv_slice_expired = 0;
-        rv_task_yield(me);
     }
-    /* All slices done: mark finished and let the queue decide — the
-     * next ready task runs, or control returns to the boot context. */
+    /* All slices done: mark finished. The handoff discipline matters
+     * here: a task that was PREEMPTIVELY suspended holds its resume
+     * state in its ctx image, so the coroutine path must never resume
+     * it — therefore a done task never cooperatively hands off to
+     * another task; it either hands back to the boot context (only
+     * valid when it is the LAST runnable task — switching OUT of a
+     * running task is always sound, the coroutine saves our current
+     * state and pops the driver's) or spins until the tick rotates it
+     * out of the way so the next task can resume. */
     me->done = 1;
-    rv_task_yield(me);
+    int last = 1;
+    for (int i = 0; i < RV_TASK_COUNT; i++) {
+        if (&g_rv_tasks[i] != me && !g_rv_tasks[i].done) { last = 0; break; }
+    }
+    if (last) {
+        rv_task_yield(me);   /* -> boot context (queue empty) */
+        /* Not reached: the driver resumed and never switches back. */
+    }
+    for (;;) { __asm__ volatile(""); }   /* wait to be preempted away */
 }
 
 /* The demo driver: reset the FP registry (the float smoke left rows 0/1
  * holding its +inf/20.0 state), initialize the N-task ready queue, run
  * the round-robin at a fast 100ms tick cadence, then assert the FINAL
- * fp_save rows (one per task owner) and the lazy-save delta (one per
- * task-slice = RV_TASK_COUNT*RV_TASK_SLICES = 15). */
+ * fp_save rows (one per task owner), the lazy-save delta (one per
+ * task-slice = RV_TASK_COUNT*RV_TASK_SLICES = 15), and the preemption
+ * accounting (one tick-handler rotation per slice boundary, also 15).
+ * Task 0 is entered COOPERATIVELY by the driver (rv_task_switch_fp);
+ * every subsequent rotation is the tick handler's rv_scheduler_tick
+ * preempting the running task — the demo's only cooperative switches
+ * are the entry and the queue-empty handoff back to this driver. */
 static void rv_fp_round_robin_demo(void) __attribute__((unused)); /* the echo build never calls it (wfi loop) */
 static void rv_fp_round_robin_demo(void) {
     struct RvPerHartData* phd = &g_hart0_data;
-    rv_boot_print("[TASK] three-task FP ready queue (real register contexts, Design B part 3)...\n");
+    rv_boot_print("[TASK] three-task FP ready queue (preemptive, real register contexts, Design B part 3 + preemption follow-up)...\n");
     for (uint64_t o = 0; o < RV_FP_OWNERS; o++)
         for (int i = 0; i < 33; i++) phd->fp_save[o][i] = 0;
     phd->fp_owner = 0;
@@ -425,6 +569,19 @@ static void rv_fp_round_robin_demo(void) {
                   (phd->fp_save[1][10] == 0x4004000000000000ULL) &&  /* B: 2.5 */
                   (phd->fp_save[2][10] == 0x3FF4000000000000ULL);    /* C: 1.25 */
     int lazy_ok = (lazy_delta == RV_TASK_COUNT * RV_TASK_SLICES);
+    /* The preemption accounting: each task must have been preempted
+     * exactly RV_TASK_SLICES times (one rotation per slice boundary) —
+     * the preemption-side twin of the lazy-save count. The tick never
+     * fires while the boot context runs or a cooperative switch is in
+     * flight, and it lands in the tasks' spin loops, so the sum is
+     * exact: RV_TASK_COUNT * RV_TASK_SLICES = 15. */
+    uint64_t preempt_sum = 0;
+    int preempt_ok = 1;
+    for (int i = 0; i < RV_TASK_COUNT; i++) {
+        preempt_sum += g_rv_tasks[i].preemptions;
+        if (g_rv_tasks[i].preemptions != RV_TASK_SLICES) preempt_ok = 0;
+    }
+    if (preempt_sum != RV_TASK_COUNT * RV_TASK_SLICES) preempt_ok = 0;
     rv_boot_print("[TASK] fp_save rows: A=");
     rv_boot_print_hex64(phd->fp_save[0][10]);
     rv_boot_print(" B=");
@@ -434,9 +591,13 @@ static void rv_fp_round_robin_demo(void) {
     rv_boot_print(rows_ok ? " PASS;" : " FAIL;");
     rv_boot_print(" lazy-saves during demo: ");
     rv_boot_print_udec64(lazy_delta);
-    rv_boot_print(lazy_ok ? " PASS\n" : " FAIL\n");
-    rv_boot_print(rows_ok && lazy_ok ? "[TASK] ready queue: ALL PASS\n"
-                                     : "[TASK] ready queue: FAIL\n");
+    rv_boot_print(lazy_ok ? " PASS;" : " FAIL;");
+    rv_boot_print(" preemptions: ");
+    rv_boot_print_udec64(preempt_sum);
+    rv_boot_print(preempt_ok ? " PASS\n" : " FAIL\n");
+    rv_boot_print(rows_ok && lazy_ok && preempt_ok
+                      ? "[TASK] ready queue: ALL PASS\n"
+                      : "[TASK] ready queue: FAIL\n");
 }
 
 static void rv64_boot_smoke_test(void) __attribute__((unused));
