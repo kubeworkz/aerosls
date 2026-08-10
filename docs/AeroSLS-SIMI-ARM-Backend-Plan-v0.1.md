@@ -6501,6 +6501,7 @@ the copy was made and has no automated re-check.
 | teeth (deliberate-violation smokes) | CHECK arm64_kernel_copy_smoke.sh (printf + unused-var, 3 teeth, arm64-guards job) + the rediff smoke above (§10.181/10.182) | CHECK tests/simi_x86_kernel_smoke.sh (3 teeth, glob-run) (§10.183) + the x86 rediff smoke (kernel-mutation and host-mutation teeth) (§10.185) | CHECK tools/simi/tests/simi_riscv_kernel_smoke.sh (3 teeth, riscv-guards job) (§10.183) + the riscv rediff smoke (§10.185) |
 | real-execution leg on the host twin | CHECK M3 qemu-aarch64 corpus: run_arm64_tests.sh translates and EXECUTES every fixture on real A64 (§10.178/10.179) -- the kernel copy is byte-identical to that proven encoder | CHECK native x86 JIT: run_native_tests.sh executes the host twin as real x86 (M2.76 steps/bytes tripwires) | CHECK rv64_exec parity (run_riscv_tests.sh) + the real RV64 kernel boot smoke in the riscv-guards job (the host twin runs as actual machine code) |
 | kernel build/link | NONE -- deliberately: no arm64 kernel target exists, so the copy is compiled nowhere and linked into nothing; the freestanding compile + re-diff gates are the staging proxy (§10.180). The makefile_sources guard documents this exclusion (§10.183) | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
+| matrix self-check | CHECK tests/kernel_copy_matrix_check.sh + smoke tests/kernel_copy_matrix_smoke.sh (§10.186) -- parses THIS table: every script named in a CHECK cell must exist and be wired (the tests/*_check.sh + *_smoke.sh globs, or a ci.yml/Makefile reference), every .c named must be referenced by the build/CI | same mechanism, all three columns | same |
 
 Gap 1 (the byte-identity tripwires for x86 and RV64) is CLOSED (§10.185):
 the marker-anchored check + teeth smoke pattern generalized to both
@@ -6552,6 +6553,41 @@ With this, all three kernel translator copies re-diff against their host
 twins on every push; the §10.184 matrix's only remaining open gap is
 the ARM copy's no-kernel-build boundary (§10.180), which closes with an
 arm64 kernel target, not a check.
+
+### 10.186 The §10.184 matrix becomes self-verifying
+
+A doc table goes stale silently: a guard renamed or deleted, a CI
+reference dropped, a kernel file renamed — the prose keeps saying CHECK
+while nothing enforces it. The matrix now carries its own machine check:
+`tests/kernel_copy_matrix_check.sh` parses the §10.184 table and
+asserts, for every script named in a CHECK cell, that the script EXISTS
+and is WIRED, and for every .c file named anywhere in the table, that
+the build/CI references it. It rides the `tests/*_check.sh` glob in
+run_checks.sh, so it runs on every push — toolchain-free, pure text.
+
+The wiring rules are exactly what the matrix text claims: `tests/*_check.sh`
+scripts must match the run_checks.sh glob (`guards=(tests/*_check.sh)`),
+`tests/*_smoke.sh` the run_guard_smokes.sh glob
+(`smokes=(tests/*_smoke.sh)`), and `tools/simi/tests/` + bare script
+names must be referenced by basename in ci.yml, the root Makefile, or
+tools/simi/Makefile (the explicit toolchain jobs, X86_C_SRC/RV_C_SRC,
+and the test-native/test-riscv/test-arm targets). .c files must appear
+in the root Makefile or ci.yml. The table gained a self-referential
+"matrix self-check" row — the check verifies its own existence and
+wiring, closing the loop.
+
+Teeth: `tests/kernel_copy_matrix_smoke.sh` (rides the `tests/*_smoke.sh`
+glob) breaks each staleness class in throwaway copies of the doc and
+ci.yml — a renamed script, a dropped run_arm64_tests.sh CI reference,
+a renamed kernel .c — and asserts the check FAILS each time, plus
+asserts the pristine copies still PASS. 4 teeth, all verified green
+against the real tree.
+
+The first real run already earned the check's keep: it confirmed every
+one of the 16 script claims in the matrix as of this record, including
+the two runners (run_native_tests.sh, run_riscv_tests.sh) whose wiring
+is the tools/simi/Makefile test targets rather than a CI job — the
+check's wiring vocabulary had to match that reality, which it now does.
 
 ---
 
