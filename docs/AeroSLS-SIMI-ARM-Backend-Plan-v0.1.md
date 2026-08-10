@@ -369,7 +369,7 @@ done, staged and compile-gated (§10.180); the actual arm64 kernel
 *build* and its wiring (translate glue, paging, activation, syscall
 path) remains deliberately undone and honest.
 
-**M4 — arm64 kernel target. M4a DONE (§10.188); M4b/M4c scoped (§10.187).**
+**M4 — arm64 kernel target. M4a+M4b DONE (§10.188, §10.189); M4c scoped (§10.187).**
 The last row of the §10.184 matrix: a minimal bootable AArch64 kernel that
 `kernel/simi_arm.c` finally links into. Scope in three sub-milestones,
 mirroring the RISC-V kernel's Phase 9 shape (self-contained qemu `-M
@@ -392,10 +392,17 @@ Phase-9-equivalent honest remainder.
   CI job (builds `make arm64-elf`, boots, asserts rc=0 + banner + EL1 +
   PSCI line). The working machine config was itself the milestone's
   riskiest unknown and is pinned empirically: virtualization=on (NOT
-  secure) — see §10.188. **Gate (M4b):** the log shows `[SIMI] entry
-  returned (real machine code executed)` with the expected result,
+  secure) — see §10.188.
+- **Gate (M4b) — PASSED (§10.189):** the log shows `[SIMI] entry
+  returned (real machine code executed) -- result=0x…2a (expected 42)`,
   matching the four-way host value; `make arm64-elf` links
-  `kernel/simi_arm.c` into the image.
+  `kernel/simi_arm.c` into the image (the kernel provides the
+  freestanding `{memcpy, memset}` pair — the §10.181 contract,
+  concrete). The first real fix M4b forced: the kernel's 16 KiB boot
+  stack overflowed — `simi_arm_translate` alone has an 18,800-byte
+  frame (measured with `-fstack-usage`), so the stack was raised to
+  256 KiB (§10.189). The boot assertion (result=42) is CI-enforced in
+  arm64-guards.
 - Sizing: boot_arm64.S ~150, linker_arm64.ld ~40, uart_pl011.c ~80,
   kernel_arm64.c ~220 (banner + boot smoke + memcpy/memset + PSCI),
   Makefile ~25, CI ~30; M4c's MMU ~250-400.
@@ -6531,7 +6538,7 @@ the copy was made and has no automated re-check.
 | undefined-symbol gate | CHECK same arm64-guards step: nm -u must show nothing beyond {memcpy, memset} -- GCC 13/AArch64 synthesizes exactly that pair from the M2 chain struct copies (§10.181) | CHECK same simi_x86_kernel_check.sh: ZERO undefined symbols -- the -nostdlib link contract is strictly empty on x86 (§10.183) | CHECK same simi_riscv_kernel_check.sh: ZERO undefined symbols (§10.183) |
 | teeth (deliberate-violation smokes) | CHECK arm64_kernel_copy_smoke.sh (printf + unused-var, 3 teeth, arm64-guards job) + the rediff smoke above (§10.181/10.182) | CHECK tests/simi_x86_kernel_smoke.sh (3 teeth, glob-run) (§10.183) + the x86 rediff smoke (kernel-mutation and host-mutation teeth) (§10.185) | CHECK tools/simi/tests/simi_riscv_kernel_smoke.sh (3 teeth, riscv-guards job) (§10.183) + the riscv rediff smoke (§10.185) |
 | real-execution leg on the host twin | CHECK M3 qemu-aarch64 corpus: run_arm64_tests.sh translates and EXECUTES every fixture on real A64 (§10.178/10.179) -- the kernel copy is byte-identical to that proven encoder | CHECK native x86 JIT: run_native_tests.sh executes the host twin as real x86 (M2.76 steps/bytes tripwires) | CHECK rv64_exec parity (run_riscv_tests.sh) + the real RV64 kernel boot smoke in the riscv-guards job (the host twin runs as actual machine code) |
-| kernel build/link | NONE -- no arm64 kernel target exists, so the copy is compiled nowhere and linked into nothing; the freestanding compile + re-diff gates are the staging proxy (§10.180). The makefile_sources guard documents this exclusion (§10.183). SCOPE DONE (§10.187): M4 defines the minimal bootable arm64 kernel (entry, PL011, PSCI shutdown, linked kernel/simi_arm.c with the kernel-provided {memcpy, memset}) that closes this row | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
+| kernel build/link | CHECK kernel/simi_arm.c is in AR_C_SRC -- linked into the arm64 kernel image (M4b, §10.189), with the kernel providing the freestanding {memcpy, memset} pair (§10.181). The matrix's last NONE row is closed | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
 | matrix self-check | CHECK tests/kernel_copy_matrix_check.sh + smoke tests/kernel_copy_matrix_smoke.sh (§10.186) -- parses THIS table: every script named in a CHECK cell must exist and be wired (the tests/*_check.sh + *_smoke.sh globs, or a ci.yml/Makefile reference), every .c named must be referenced by the build/CI | same mechanism, all three columns | same |
 
 Gap 1 (the byte-identity tripwires for x86 and RV64) is CLOSED (§10.185):
@@ -6785,6 +6792,62 @@ M4b (link kernel/simi_arm.c + the embedded .tmo smoke) is next; M4c
 (MMU, interrupts, user paging) remains the honest remainder.
 
 ---
+
+### 10.189 M4b as built: kernel/simi_arm.c linked into the arm64 kernel, translating and executing at boot
+
+M4b is the milestone the whole M4 scope exists for: `kernel/simi_arm.c`
+— the AArch64 SIMI translator — is finally LINKED into a real kernel
+image and its output executed as machine code inside that kernel. The
+§10.184 matrix's last NONE row (ARM kernel build/link) flips to CHECK
+here.
+
+**What shipped.** `tools/simi/tests/arm64_boot_smoke.simi` (the mirror
+of `rv64_boot_smoke.simi`: ENTER #4, LOADI r0 #42, RET — deliberately
+trivial, no CALL/memory/RESOLVE, because the encoder is already proven
+by the qemu-aarch64 M3 leg; the kernel leg proves the LINK and the
+call), assembled to an 80-byte .tmo and embedded as
+`kernel/arm64_boot_smoke_tmo.h` (hand-transcribed, then diffed
+byte-for-byte against the .tmo — identical). `kernel/kernel_arm64.c`
+gains the freestanding `{memcpy, memset}` pair the §10.181 contract
+requires (the M2 chain struct copies in simi_arm.c synthesize calls to
+them under GCC 13 — the linked ELF has zero undefined symbols), a
+4 KiB 16-aligned code buffer, and `arm64_boot_smoke_test()`: translate
+the embedded .tmo via `simi_arm_translate()`, then call the entry with
+a plain `blr` (the emitted blob is a normal callable A64 subroutine)
+and read the result out of x9 (t0 — OP_RET's register, the M3
+convention) in inline asm with x9 declared live. The Makefile's
+`AR_C_SRC` gains `kernel/simi_arm.c`; the arm64-guards CI boot step
+gains a `result=0x000000000000002a` serial-log assertion.
+
+**The first real fix M4b forced — a stack overflow, found by booting.**
+The first boot after the link hung: the banner and `[SIMI] translating`
+printed, then QEMU looped. `-d int` showed an Undefined Instruction at
+ELR=0x0 — the kernel had branched to address 0. Root cause, measured
+with `-fstack-usage`: `simi_arm_translate` alone has an **18,800-byte
+stack frame** (the M2 chain machinery — chain walk, def pool, chain
+emission — is far heavier than `simi_riscv_translate`'s), plus ~1.6 KB
+frames in the chain helpers it calls, against a **16 KiB** boot stack
+(mirroring the RV64 kernel's — which works there only because the RV64
+translator's frame is small). The overflow clobbered the return
+address, so the first `ret` landed at 0x0; with no MMU, address 0 is
+real memory in qemu virt, the fetch of zeros is an undefined
+instruction, and with VBAR_EL1=0 the vector at 0x200 was also zeros —
+an infinite exception loop. Fix: the arm64 kernel's stack reservation
+goes 16 KiB -> 256 KiB (linker_arm64.ld; BSS is hundreds of KiB, so
+the image costs nothing). After the fix: `[SIMI] entry returned (real
+machine code executed) -- result=0x000000000000002a (expected 0x2a =
+42)`, then PSCI SYSTEM_OFF, qemu rc=0.
+
+**Verified.** Two consecutive boots, each rc=0 with the full log
+(banner, EL1, translate OK, result 42, PSCI farewell); zero undefined
+symbols in the linked ELF; `makefile_sources_check` (the M4a
+exclusion already named the M4b link), the kernel-copy matrix
+self-check, and the re-diff tripwires all green. The M4c remainder
+(MMU, interrupts, user paging — §10.187) stays deferred; the matrix
+row it was the boundary for is now closed.
+
+---
+
 
 ## Sources consulted
 

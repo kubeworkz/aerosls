@@ -455,7 +455,7 @@ jobs:
             exit 1
           }
 
-      - name: Build the M4a arm64 kernel and assert the boot + PSCI shutdown
+      - name: Build the M4a+M4b arm64 kernel and assert the boot + SIMI smoke + PSCI shutdown
         run: |
           # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
           # first bootable AArch64 kernel — banner over the PL011, then
@@ -497,7 +497,19 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a arm64 kernel booted — banner + EL1 + PSCI SYSTEM_OFF (rc=0)"
+          # M4b (plan doc §6 M4 / §10.189): kernel/simi_arm.c is linked
+          # into this image and the embedded arm64_boot_smoke.tmo is
+          # translated at boot, executed as real machine code, and must
+          # return 42 (x9/t0). This asserts the LINK + the call — the
+          # milestone's whole point. The kernel provides the
+          # freestanding {memcpy, memset} pair the §10.181 gate permits;
+          # a missing pair fails the link with undefined symbols.
+          grep -a "entry returned (real machine code executed) -- result=0x000000000000002a" arm64_boot.log || {
+            echo "FAILED: the M4b SIMI boot smoke did not execute and return 42" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a+M4b arm64 kernel booted — banner + EL1 + SIMI result 42 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |

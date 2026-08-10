@@ -997,7 +997,7 @@ declare -A M0_BASELINES=(
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
-    [rd_star]=1108 [rv64_boot_smoke]=928 [src_resident]=1120
+    [rd_star]=1108 [arm64_boot_smoke]=928 [rv64_boot_smoke]=928 [src_resident]=1120
     [straight_line_bench]=1104 [stress_atomics]=2632 [tail_ret]=1048
 )
 
