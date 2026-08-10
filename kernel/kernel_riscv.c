@@ -17,6 +17,7 @@
 #include "../include/sls_mmu.h"
 #include "simi_riscv.h"
 #include "../arch/riscv/trap_riscv.h"
+#include "../arch/riscv/plic.h"
 #include "rv64_boot_smoke_tmo.h"
 
 extern void sbi_putchar(char c);
@@ -56,6 +57,7 @@ static uint8_t g_smoke_code_buf[RV64_SMOKE_CODE_BUF_SIZE] __attribute__((aligned
  * kernel binary instead of a host test harness. scratch_ptr/rt_resolve_fn/
  * rt_objsize_fn/rt_objtype_fn are all 0 -- this program never touches r7,
  * r6, RESOLVE, OBJSIZE, or OBJTYPE, so nothing dereferences them. */
+static void rv64_boot_smoke_test(void) __attribute__((unused));
 static void rv64_boot_smoke_test(void) {
     rv_boot_print("[SIMI] RV64 boot smoke test: translating rv64_boot_smoke.tmo...\n");
 
@@ -150,7 +152,37 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
         (uint64_t)(uintptr_t)&g_hart0_trap_stack[sizeof(g_hart0_trap_stack) - 16];
     riscv_trap_init(&g_hart0_data, trap_stack_top);
 
+#if !defined(RISCV_MMODE)
+    /* Phase 9i: the first device-driven kernel I/O. The trap path above
+     * only routes interrupts that arrive; nothing made them arrive. This
+     * programs the PLIC so the 16550 UART's RX line can reach S-mode
+     * (source-10 priority, hart-0 S-mode context enable + threshold,
+     * sie.SEIE, and the UART's own IER bit 0 so a byte actually asserts
+     * the line), then raises the GLOBAL interrupt enable (sstatus.SIE).
+     * From here on, an incoming character interrupts the hart, and
+     * handle_riscv_supervisor_interrupt (arch/riscv/sbi.c) drains the
+     * 16550 directly and echoes it. M-mode build: not wired -- the PLIC
+     * S-mode context and sie.SEIE have no meaning in bare M-mode (that
+     * path would need mie.MEIE + the M-mode PLIC context instead). */
+    init_riscv_plic(0);
+    __asm__ volatile("csrs sstatus, 2");
+    rv_boot_print("[PLIC] UART RX interrupt wired (source 10 -> hart 0 S-mode, SEIE + SIE on).\n");
+#endif
+
+#if defined(KERNEL_UART_ECHO)
+    /* The echo build (sls_riscv_kernel_echo.elf, -DKERNEL_UART_ECHO):
+     * instead of the SIMI smoke (which would power the machine off),
+     * spin with interrupts enabled. Every received character interrupts
+     * the hart, is echoed by the SEIP handler, and a complete line is
+     * routed to the headless shell (which reports it). The runner
+     * (tools/simi/tests/run_riscv_tests.sh) feeds a line through a
+     * serial socket and asserts the echo -- the first device-driven
+     * kernel I/O verified end to end. */
+    rv_boot_print("[UART] ECHO READY: device-driven RX interrupt echo.\n");
+    while (1) { asm volatile("wfi"); }
+#else
     rv64_boot_smoke_test();
+#endif
 
     while(1) { asm volatile("wfi"); }
 }

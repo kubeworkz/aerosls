@@ -1,14 +1,30 @@
 #include <stdint.h>
+#include "plic.h"
 
-// RISC-V Virt Board PLIC MMIO Register Bounds
-#define PLIC_BASE_VIRT        0xFFFFFFFF40003000ULL // Mapped virtual memory window
+/* QEMU virt PLIC, PHYSICAL MMIO. This kernel runs with paging Bare (satp
+ * is never written), so every address here is a physical address — the
+ * original design draft's PLIC_BASE_VIRT 0xFFFFFFFF40003000 (a "mapped
+ * virtual memory window" address that exists in neither QEMU virt's
+ * memory map nor this kernel) was wrong and, being never-called code,
+ * never caught: nothing invoked these functions until Phase 9i wired
+ * them at boot. The real virt PLIC sits at physical 0x0c000000. */
+#define PLIC_BASE_VIRT        0x0c000000UL
 #define PLIC_PRIORITY_BASE    0x0000
 #define PLIC_ENABLE_BASE      0x2000
 #define PLIC_THRESHOLD_BASE   0x200000
 #define PLIC_CLAIM_BASE       0x200004
 
-// UART Peripheral IRQ number on the QEMU Virt machine
+/* UART Peripheral IRQ number on the QEMU Virt machine */
 #define UART0_IRQ 10
+
+/* The PLIC's source-10 device: the 16550 UART at physical 0x10000000.
+ * The UART's own interrupt-enable register (IER) decides whether an
+ * incoming byte actually asserts the interrupt line — the PLIC can only
+ * deliver a line that exists. Bit 0 (ERBI) enables the receiver-buffer
+ * interrupt; transmit stays polled. */
+#define VIRT_UART_BASE 0x10000000UL
+#define UART_IER_OFFSET 1
+#define UART_IER_RX_ENABLE 0x01
 
 static inline uint32_t plic_read(uint32_t offset) {
     return *(volatile uint32_t*)(PLIC_BASE_VIRT + offset);
@@ -43,6 +59,12 @@ void init_riscv_plic(uint32_t target_hart_id) {
     __asm__ volatile("csrr %0, sie" : "=r"(sie_val));
     sie_val |= (1ULL << 9); // Enable SEIE
     __asm__ volatile("csrw sie, %0" : : "r"(sie_val));
+
+    // 5. Make the device actually raise its line: enable the UART's
+    // receiver interrupt (IER bit 0). Steps 1-4 route an asserted line to
+    // S-mode; without this step no byte ever asserts it.
+    volatile uint8_t* ier = (volatile uint8_t*)(VIRT_UART_BASE + UART_IER_OFFSET);
+    *ier = (uint8_t)(*ier | UART_IER_RX_ENABLE);
 }
 
 // Polling/Acknowledgment router handler run inside 'handle_riscv_supervisor_interrupt'

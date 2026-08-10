@@ -1,4 +1,5 @@
 #include "sbi.h"
+#include "plic.h"
 
 /* QEMU virt 16550 UART (Phase 9g) -- the console for the M-mode build
  * (QEMU `-bios none -kernel`): there is no OpenSBI, so no SBI console
@@ -13,6 +14,22 @@
  * Phase 9g. */
 #define VIRT_UART_BASE 0x10000000UL
 
+/* Phase 9i: read one byte from the 16550 RECEIVER BUFFER directly -- the
+ * device-driven contract for the interrupt handler. The byte that raised
+ * the UART's interrupt line (and thus SEIP through the PLIC) is in the
+ * hardware FIFO; reading it here is what empties the FIFO and lets the
+ * line deassert. sbi_getchar() (the SBI console) is the firmware's
+ * polling view of the SAME UART -- equivalent bytes, but the
+ * interrupt-driven path is supposed to talk to the device, not the
+ * firmware. Available in both modes (the UART is at the same physical
+ * address with paging Bare). */
+static int uart_rx_byte(void) {
+    volatile uint8_t* lsr = (volatile uint8_t*)(VIRT_UART_BASE + 5);
+    volatile uint8_t* rbr = (volatile uint8_t*)(VIRT_UART_BASE + 0);
+    if ((*lsr & 0x01) == 0) return -1;   /* LSR bit 0: RX data ready */
+    return (int)(unsigned char)*rbr;
+}
+
 #if defined(RISCV_MMODE)
 
 static void uart_putchar(char c) {
@@ -23,10 +40,7 @@ static void uart_putchar(char c) {
 }
 
 static int uart_getchar(void) {
-    volatile uint8_t* lsr = (volatile uint8_t*)(VIRT_UART_BASE + 5);
-    volatile uint8_t* rbr = (volatile uint8_t*)(VIRT_UART_BASE + 0);
-    if ((*lsr & 0x01) == 0) return -1;   /* LSR bit 0: RX data ready */
-    return (int)(unsigned char)*rbr;
+    return uart_rx_byte();
 }
 
 void sbi_putchar(char c) {
@@ -136,10 +150,22 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
     
     // Check if the cause is a Supervisor External Interrupt (IRQ 9 from PLIC/UART)
     if ((scause & (1ULL << 63)) && (scause & 0xFF) == 9) {
-        
-        // Drain the virtual UART buffer using OpenSBI firmware getchar calls
+        // Phase 9i: claim the PLIC source for hart 0's S-mode context --
+        // returns 10 (the UART). Claiming masks the source while the
+        // handler drains, so a re-asserted line cannot double-deliver;
+        // the matching complete() at the end unmasks it for the next
+        // character.
+        uint32_t irq = plic_claim_interrupt(0);
+
+        // Drain the 16550 receiver buffer DIRECTLY (uart_rx_byte, not
+        // the SBI console): the bytes that raised the line are in the
+        // hardware FIFO, and emptying it is what lets the line (and
+        // thus SEIP) deassert. Level-triggered RX: any bytes that
+        // arrive while the handler runs simply stay in the FIFO and
+        // re-assert the line after the complete() -- the next interrupt
+        // drains them.
         while (1) {
-            int input_char = sbi_getchar();
+            int input_char = uart_rx_byte();
             if (input_char == -1) break; // Buffer empty
 
             char c = (char)input_char;
@@ -168,5 +194,11 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
                 sbi_putchar(c); // Echo character back to user terminal display
             }
         }
+
+        // Acknowledge the PLIC: writing the claimed source back unmasks
+        // it for the next interrupt (Phase 9i -- without this the line
+        // would be stuck claimed and no further UART interrupt could
+        // ever fire).
+        plic_complete_interrupt(0, irq);
     }
 }
