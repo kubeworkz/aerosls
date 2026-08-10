@@ -64,22 +64,28 @@ static uint64_t bits_of_f64(double d) { union { uint64_t u; double d; } c; c.d =
 static float f32_of_bits(uint64_t b) { union { uint32_t u; float f; } c; c.u = (uint32_t)b; return c.f; }
 static uint64_t bits_of_f32(float f) { union { uint32_t u; float f; } c; c.f = f; return (uint64_t)c.u; }
 
-/* F0: real A64 FCMP flag model, verified against the ARM semantics for
- * the unordered (NaN) case: FCMP sets NZCV = N=1, Z=0, C=1, V=1 for an
- * unordered comparison, and for ordered ones C = (a >= b), Z = (a == b),
- * N = (a < b), V = 0. From those flags the condition codes give
+/* F0/M3: real A64 FCMP flag model, pinned EMPIRICALLY on real A64
+ * (aarch64-linux-gnu-gcc + qemu-aarch64, M3's fcmp_probe4.c): an
+ * unordered (NaN) FCMP sets NZCV = N=0, Z=0, C=1, V=1, and ordered
+ * ones C = (a >= b), Z = (a == b), N = (a < b), V = 0. From those
+ * flags the condition codes give
  *   EQ (Z)          : equal → 1, NaN → 0            — IEEE EQ ✓
  *   NE (!Z)         : NaN → 1                        — IEEE NE ✓
- *   LT (N != V)     : lt → 1, unordered → 0          — IEEE LT ✓
- *   LE (Z || N!=V)  : le → 1, unordered → 0          — IEEE LE ✓
- *   GT (!Z && N==V) : unordered → 1 !!               — IEEE GT ✗
- *   GE (N == V)     : unordered → 1 !!               — IEEE GE ✗
- * So GT and GE cannot be a single cset — the F1 codegen compares the
- * SWAPPED operands (fcmp b,a) and cset lt/le, exactly the x86
- * seta/setae-via-swap finding; this executor's job is the flag model
- * below, which is what makes both the direct and the swapped paths
- * come out right. The three NaN checks in float_ops.simi + the NaN
- * GT/GE pins in a64_f0_test.c are the discriminators. */
+ *   LT (N != V)     : NaN → 1 !!                     — IEEE LT ✗
+ *   LE (Z || N!=V)  : NaN → 1 !!                     — IEEE LE ✗
+ *   GT (!Z && N==V) : unordered → 0                  — IEEE GT ✓
+ *   GE (N == V)     : unordered → 0                  — IEEE GE ✓
+ * So LT and LE cannot be a single cset lt/le — the classic A64 NaN
+ * gotcha (N=0, V=1 for unordered, so N!=V and Z||N!=V are both
+ * true) — and the F1 codegen emits cset mi (N) for LT and cset ls
+ * (!C || Z) for LE, each 0 on unordered; EQ/NE/GT/GE are the naive
+ * cset eq/ne/gt/ge, all IEEE-correct with NO operand swap. The
+ * pre-M3 model (N=1, Z=0) was wrong and the swapped-operand GT/GE
+ * trick was tuned to it — encoder and decoder AGREED, so four-way
+ * parity passed while real A64 disagreed (float_ops = 16, not 15);
+ * M3's real-execution leg caught the agreeing pair. The three NaN
+ * checks in float_ops.simi + the NaN LT/LE/GT/GE pins in
+ * a64_f0_test.c are the discriminators. */
 static void fcmp_flags(struct A64Cpu* cpu, int is_d, uint64_t abits, uint64_t bbits) {
     int nan, lt, eq, ge;
     if (is_d) {
@@ -91,7 +97,7 @@ static void fcmp_flags(struct A64Cpu* cpu, int is_d, uint64_t abits, uint64_t bb
         nan = (a != a) || (b != b);
         lt = (a < b); eq = (a == b); ge = (a >= b);
     }
-    cpu->n = (uint8_t)(nan || lt);
+    cpu->n = (uint8_t)(!nan && lt);
     cpu->z = (uint8_t)(!nan && eq);
     cpu->c = (uint8_t)(nan || ge);
     cpu->v = (uint8_t)nan;
@@ -213,6 +219,28 @@ int a64_exec_run(struct A64Cpu* cpu, uint64_t max_steps) {
                 cpu->x[rd] = (cpu->x[rd] & mask) | (imm16 << (16 * hw));
                 if (!sf) cpu->x[rd] &= 0xFFFFFFFFull;
             }
+            cpu->pc = next_pc;
+            continue;
+        }
+
+        /* ─── ADR (PC-relative address) — 0 00 10000 immlo:1 immhi:19 Rd ─
+         * M3: the dynamic-JMPR dispatch loads its table base with adr
+         * (PC + signed 21-bit byte offset), which is how the table is
+         * reachable on REAL A64 — the pre-M3 movz+movk base baked a bare
+         * byte OFFSET into out_buf that only a64_exec's guest convention
+         * could branch to (a real `br` to 0xNNN faults). imm =
+         * (immhi << 2) | immlo, sign-extended from bit 20 (bytes). PC
+         * here is cpu->pc — the byte offset of this instruction — which
+         * is exactly the guest value real A64 produces by adding the
+         * real PC, so the table lands at the same place in both
+         * conventions and the signed RELATIVE entries (offset −
+         * table_off, M3) resolve to absolute targets in both. ADRP (bit
+         * 31 set) is never emitted. */
+        if ((w & 0x9F000000u) == 0x10000000u) {
+            uint32_t immlo = (w >> 23) & 1;
+            int32_t imm = (int32_t)((((w >> 5) & 0x7FFFFu) << 2) | immlo);
+            if (imm & (1 << 20)) imm |= (int32_t)0xFFE00000u;  /* sign-extend 21 bits */
+            set_x(cpu, (int)(w & 0x1F), cpu->pc + (int64_t)imm);
             cpu->pc = next_pc;
             continue;
         }

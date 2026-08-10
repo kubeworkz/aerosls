@@ -167,8 +167,21 @@ static void patch32(uint8_t* out_buf, uint32_t pos, uint32_t v) {
 static uint32_t enc_movz(uint8_t rd, uint16_t imm16, uint8_t hw) {
     return 0xD2800000u | ((uint32_t)(hw & 3) << 21) | ((uint32_t)imm16 << 5) | rd;
 }
+
 static uint32_t enc_movk(uint8_t rd, uint16_t imm16, uint8_t hw) {
     return 0xF2800000u | ((uint32_t)(hw & 3) << 21) | ((uint32_t)imm16 << 5) | rd;
+}
+
+/* ADR (PC-relative address): 0 00 10000 immlo:1 immhi:19 Rd — imm is a
+ * SIGNED 21-bit byte offset from the adr's own address. M3: the dynamic
+ * JMPR dispatch loads its table base this way so the table is reachable
+ * on real A64 (a movz+movk base baked a bare out_buf byte offset, which
+ * only a64_exec's guest convention could branch to). ±1MB range; the
+ * whole blob is capped at 256 KiB (CODE_CAP), so any adr-to-table
+ * distance is structurally in range. */
+static uint32_t enc_adr(uint8_t rd, int32_t imm) {
+    uint32_t u = (uint32_t)imm & 0x1FFFFFu;
+    return 0x10000000u | ((u & 1u) << 23) | ((u >> 2) << 5) | rd;
 }
 /* Add/subtract immediate, sh=0: 1 00/10/11 100010 0 imm12 Rn Rd. */
 static uint32_t enc_add_imm(uint8_t rd, uint8_t rn, uint32_t imm12) {
@@ -2155,30 +2168,31 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
         get_operand(cb, ra, h_a, rd_live);
         get_operand(cb, w_rb_reg(w), h_b, rd_live);
         if (type == T_F64 || type == T_F32) {
-            /* F1: float CMP — fcmp + cset with the D5 mapping verified
-             * in F0: EQ/NE/LT/LE compare (a,b) directly, which FCMP's
-             * NZCV (incl. the unordered N=1,Z=0,C=1,V=1 NaN case) makes
-             * IEEE-correct with a single cset; GT/GE compare the SWAPPED
-             * operands and cset lt/le, because a single cset gt/ge is
-             * WRONG on NaN (unordered yields N==V, so !Z && N==V and
-             * N==V are both true). The unsigned relations have no float
-             * meaning (assembler-level, same as the interpreter). */
+            /* F1/M3: float CMP — fcmp + cset under the REAL unordered
+             * model (N=0, Z=0, C=1, V=1, pinned empirically on real A64
+             * by M3): EQ/NE/GT/GE are the naive cset eq/ne/gt/ge, all
+             * IEEE-correct with NO operand swap (Z and N==V are both
+             * false on unordered); LT/LE need cset mi (N) and cset ls
+             * (!C || Z) — the naive lt/le read N!=V / Z||N!=V, both TRUE
+             * on unordered, the classic A64 NaN gotcha. The pre-M3 D5
+             * swapped-operand trick (GT/GE via fcmp (b,a) + cset lt/le)
+             * was tuned to the wrong model and is gone. The unsigned
+             * relations have no float meaning (assembler-level, same as
+             * the interpreter). */
             int d = (type == T_F64);
-            int swap = (flags == REL_GT || flags == REL_GE);
             int cond;
             switch (flags) {
                 case REL_EQ:       cond = 0;  break;   /* eq */
                 case REL_NE:       cond = 1;  break;   /* ne */
-                case REL_LT:
-                case REL_GT:       cond = 11; break;   /* lt */
-                case REL_LE:
-                case REL_GE:       cond = 13; break;   /* le */
+                case REL_LT:       cond = 4;  break;   /* mi (N) — lt is N!=V, true on unordered */
+                case REL_LE:       cond = 9;  break;   /* ls (!C||Z) — le is Z||N!=V, true on unordered */
+                case REL_GT:       cond = 12; break;   /* gt */
+                case REL_GE:       cond = 10; break;   /* ge */
                 default: return TX_AR_ERR_BAD_OPCODE;  /* LTU..GEU: no float meaning */
             }
             e32(cb, d ? enc_fmov_dx(0, h_a) : enc_fmov_sw(0, h_a));
             e32(cb, d ? enc_fmov_dx(1, h_b) : enc_fmov_sw(1, h_b));
-            e32(cb, d ? enc_fcmp_d(swap ? 1 : 0, swap ? 0 : 1)
-                      : enc_fcmp_s(swap ? 1 : 0, swap ? 0 : 1));
+            e32(cb, d ? enc_fcmp_d(0, 1) : enc_fcmp_s(0, 1));
             e32(cb, enc_cset(rh, cond));
             store_result(cb, rd);
             break;
@@ -2521,17 +2535,23 @@ static int emit_instr(struct CodeBuf* cb, uint64_t w) {
     return TX_AR_OK;
 }
 
-/* Rewrite a 2-word movz+movk placeholder (JMPR table base) in place.
- * M2.24: the base is a byte offset into out_buf and cb.len is uint32_t,
- * so the 64-bit li64 (4 words) was overkill — 32 bits always suffice. */
-static void patch_li32(uint8_t* out_buf, uint32_t pos, uint32_t imm) {
-    patch32(out_buf, pos,      enc_movz(X_T2, (uint16_t)(imm & 0xFFFF), 0));
-    patch32(out_buf, pos + 4,  enc_movk(X_T2, (uint16_t)((imm >> 16) & 0xFFFF), 1));
+/* Rewrite a 1-word adr placeholder (JMPR table base) in place. M3: the
+ * table base is reached PC-RELATIVELY — adr x11, #(table_off − pos) — so
+ * the same blob executes under a64_exec's guest convention (PC = byte
+ * offset into out_buf) and on real A64 (PC = actual address): both land
+ * on the table, and the table's signed relative entries resolve to
+ * absolute targets in both. The pre-M3 movz+movk base baked a bare byte
+ * offset that ONLY the guest convention could branch to. imm = target −
+ * pos fits ±1MB by construction (CODE_CAP = 256 KiB, table inside). */
+static void patch_adr(uint8_t* out_buf, uint32_t pos, uint32_t target_off) {
+    int64_t imm = (int64_t)target_off - (int64_t)pos;
+    if (imm < -(1ll << 20) || imm > ((1ll << 20) - 1)) return;  /* unreachable (256 KiB cap) */
+    patch32(out_buf, pos, enc_adr(X_T2, (int32_t)imm));
 }
 
 /* ─── Top-level translate: two passes (emit + patch fixups) ─────────────
  * No literal pool pass — movz/movk made it unnecessary; the only post-emit
- * rewrite besides branch/call fixups is the JMPR table-base li64 (see
+ * rewrite besides branch/call fixups is the JMPR table-base adr (see
  * g_jmpr_li_pos) and the JMPR table's own contents, both of which happen
  * once every instruction's offset is known. */
 int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
@@ -3768,10 +3788,11 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
                 e32(&cb, enc_cset(X_T1, 3));                        /* cset x10, lo — unsigned less */
                 uint32_t cbz_pos = emit_cbz_placeholder(&cb);       /* cbz t1, .oob */
                 if (g_njmpr_li_pos >= TX_AR_MAX_FIXUPS) return TX_AR_ERR_TOO_MANY_FIXUPS;
-                g_jmpr_li_pos[g_njmpr_li_pos++] = cb.len;           /* 2-word table-base placeholder (M2.24) */
-                e32(&cb, 0); e32(&cb, 0);
-                e32(&cb, enc_add_shift(X_T2, X_T2, X_T0, 0, 2));    /* t2 = base + (target << 2) */
-                e32(&cb, enc_ldr_w(X_T2, X_T2, 0));                 /* t2 = (u32) table[target] — 4-byte entries, zero-extends */
+                g_jmpr_li_pos[g_njmpr_li_pos++] = cb.len;           /* 1-word PC-relative adr table-base placeholder (M3) */
+                e32(&cb, 0);
+                e32(&cb, enc_add_shift(X_T1, X_T2, X_T0, 0, 2));    /* t1 = base + (target << 2) — entry address */
+                e32(&cb, enc_ldrsw(X_T1, X_T1, 0));                 /* t1 = s32 table[target] — (offset − table_off), sign-extended */
+                e32(&cb, enc_add_shift(X_T2, X_T2, X_T1, 0, 0));    /* t2 = base + rel — absolute target (both conventions) */
                 e32(&cb, enc_br(X_T2));                             /* jump — never falls through */
                 patch_local_cbz(&cb, cbz_pos, X_T1);                /* .oob: */
                 op_illegal(&cb);                                    /* UDF #0 — non-negotiable CFI per ISA §16 */
@@ -3794,30 +3815,39 @@ int simi_arm_translate(const uint8_t* obj_data, uint32_t obj_size,
     if (found_off == 0xFFFFFFFFu) return TX_AR_ERR_ENTRY_NOT_FOUND;
 
     /* Gap Remediation SIMI Phase 14: reserve + backfill the JMPR jump
-     * table, placed AFTER the trampolines. Table entries are plain byte
-     * offsets into out_buf (g_instr_off[pc]), NOT host addresses — see
-     * g_jmpr_li_pos's design note above. g_instr_off[] is complete for
-     * every real pc at this point (the main loop above has finished). */
+     * table, placed AFTER the trampolines. M3: table entries are signed
+     * 32-bit RELATIVE offsets — (g_instr_off[pc] − jmpr_table_off), the
+     * distance from the table base to the target code — and the dispatch
+     * reaches the base PC-RELATIVELY (adr), so the same blob executes
+     * under a64_exec's guest convention (addresses are byte offsets into
+     * out_buf) AND on real A64 (addresses are actual): base + rel lands
+     * on the target in both. The pre-M3 entries were bare out_buf
+     * offsets that only the guest convention could branch to — a real
+     * `br` to 0xNNN faulted (M3's 12 dynamic-JMPR fixtures).
+     * g_instr_off[] is complete for every real pc at this point (the
+     * main loop above has finished). */
     uint32_t jmpr_table_off = 0;
     if (g_njmpr_li_pos > 0) {
         /* M2.24: 4-byte entries. Every dispatch target is a pc in
-         * [0, num_instr) (the bounds check above) and g_instr_off[] is a
-         * byte offset into out_buf — uint32_t by construction — so one
-         * 32-bit ldr per entry suffices; the base placeholder shrinks
-         * with it (movz+movk, 2 words). This HALVES the naive-mode table
-         * (M2.23's 8-byte entries mirrored RV64's 64-bit slots). Under
-         * g_alloc=1 the table is absent entirely — every emitted JMPR
-         * folds, so no dynamic path (and no table) exists (M2.23). */
+         * [0, num_instr) (the bounds check above), the table sits after
+         * the trampolines (so offset − table_off is always negative and
+         * ldrsw's sign-extension is what the dispatch wants), and the
+         * base placeholder shrinks to ONE word (adr) — same 5-word
+         * dispatch as the pre-M3 shape, so no fixture's size moves.
+         * This HALVES the naive-mode table (M2.23's 8-byte entries
+         * mirrored RV64's 64-bit slots). Under g_alloc=1 the table is
+         * absent entirely — every emitted JMPR folds, so no dynamic path
+         * (and no table) exists (M2.23). */
         jmpr_table_off = cb.len;
         for (uint32_t q = 0; q < hdr.num_instr; q++) e32(&cb, 0);
         if (cb.overflow) return TX_AR_ERR_BUF_FULL;
         for (uint32_t pc = 0; pc < hdr.num_instr; pc++) {
-            uint32_t off = g_instr_off[pc];
+            int32_t rel = (int32_t)((int64_t)g_instr_off[pc] - (int64_t)jmpr_table_off);
             for (int b = 0; b < 4; b++)
-                out_buf[jmpr_table_off + pc*4 + b] = (uint8_t)((off >> (8*b)) & 0xFF);
+                out_buf[jmpr_table_off + pc*4 + b] = (uint8_t)(((uint32_t)rel >> (8*b)) & 0xFF);
         }
         for (uint32_t i = 0; i < g_njmpr_li_pos; i++)
-            patch_li32(out_buf, g_jmpr_li_pos[i], jmpr_table_off);
+            patch_adr(out_buf, g_jmpr_li_pos[i], jmpr_table_off);
     }
 
     /* Patch pass: branch/call targets (B/BL/CBZ/CBNZ). imm26/imm19 are

@@ -481,10 +481,13 @@ Gap Remediation's float plan, recorded in full in
 real IEEE-754 codegen: the D4 GP-bounce (operand bits through d0/s0+d1/s1 via
 `fmov`, compute, result back into the reserved cache host), NEG as a sign-bit
 XOR through the integer cache (no float instruction — the x86 finding repeated),
-and CMP per the D5 finding — EQ/NE/LT/LE as `fcmp(a,b)`+`cset`, GT/GE as the
-swapped-operand `fcmp(b,a)`+`cset lt/le`, because a single `cset gt/ge` is wrong
-on NaN (unordered yields N=1,Z=0,C=1,V=1, so `!Z && N==V` and `N==V` are both
-true). The M0-era blanket rejection narrows to the two permanent boundaries
+and CMP per the D5 finding, corrected by M3's real-A64 execution leg — all six
+relations as `fcmp(a,b)`+`cset` with no operand swap: EQ/NE/GT/GE are the naive
+eq/ne/gt/ge (IEEE-correct directly under the REAL unordered flags N=0,Z=0,C=1,V=1,
+pinned empirically on actual A64), and LT/LE use **cset mi (N)** and **cset ls
+(!C || Z)** because the naive lt/le read N!=V / Z||N!=V, both true on unordered
+(N=0, V=1) — the classic A64 NaN gotcha. The pre-M3 swapped-operand design was
+tuned to the wrong model (N=1,Z=0) and is retired (full record: ARM plan §10.179). The M0-era blanket rejection narrows to the two permanent boundaries
 (float MOD, float-with-immediate); bitwise/shift ops on raw bits stay allowed,
 matching the interpreter. `a64_exec.c` (F0) decodes/executes the same family
 via a distinct `f[32]` SIMD&FP file, with encodings verified bit-for-bit

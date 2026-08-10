@@ -22,11 +22,14 @@
  *
  *   3. Every one of the 17 CMP check values (9 f64 + 5 f32 + 3 NaN) is
  *      the expected 0/1 — pinning the fcmp NZCV model including the
- *      unordered-NaN case — plus two extra NaN pins for GT and GE
- *      (float_ops only NaN-tests EQ/NE/LT; the plan's D5 mandate was to
- *      verify the full unordered mapping, and GT/GE are exactly the two
- *      relations a single cset gets WRONG, which is why F1 compares
- *      them via swapped operands).
+ *      unordered-NaN case — plus two extra NaN pins for GT and GE.
+ *      M3 pinned the REAL unordered model on actual A64 (qemu-aarch64):
+ *      NZCV = N=0, Z=0, C=1, V=1, so EQ/NE/GT/GE are single cset
+ *      eq/ne/gt/ge with NO operand swap, LT is cset mi (N), and LE is
+ *      cset ls (!C || Z) — the naive lt/le read N!=V / Z||N!=V, both
+ *      TRUE on unordered, the classic A64 NaN gotcha. The words below
+ *      are exactly what F1's CMP codegen emits, so a codegen regression
+ *      and a decoder regression both fail the same pins.
  *
  * Every word below is annotated with the QEMU a64.decode pattern it was
  * derived from — the same authoritative source the executor's other
@@ -116,9 +119,9 @@ int main(void) {
     w[n++] = fcmp(4, 9, 1);  w[n++] = cset(14, 0x0);   /* mul eq    → 1 */
     w[n++] = fcmp(5, 10, 1); w[n++] = cset(15, 0x0);   /* div eq    → 1 */
     w[n++] = fcmp(6, 11, 1); w[n++] = cset(16, 0x0);   /* neg eq    → 1 */
-    w[n++] = fcmp(1, 0, 1);  w[n++] = cset(17, 0xB);   /* 3.5>2.0 GT → swapped fcmp(b,a), lt → 1 */
-    w[n++] = fcmp(1, 0, 1);  w[n++] = cset(18, 0xB);   /* 2.0<3.5 LT → lt → 1 */
-    w[n++] = fcmp(0, 0, 1);  w[n++] = cset(19, 0xD);   /* 3.5>=3.5 GE reflexive → le → 1 */
+    w[n++] = fcmp(0, 1, 1);  w[n++] = cset(17, 0xC);   /* 3.5>2.0 GT → fcmp(a,b) + cset gt → 1 (M3: no swap) */
+    w[n++] = fcmp(1, 0, 1);  w[n++] = cset(18, 0x4);   /* 2.0<3.5 LT → cset mi (N) → 1 (M3: naive lt is 1 on NaN) */
+    w[n++] = fcmp(0, 0, 1);  w[n++] = cset(19, 0xA);   /* 3.5>=3.5 GE reflexive → cset ge → 1 (M3: no swap) */
     w[n++] = fcmp(0, 1, 1);  w[n++] = cset(20, 0x1);   /* 3.5!=2.0 NE → 1 */
 
     /* ── f32: a = 3.5f (s12), b = 2.0f (s13) ────────────────────────── */
@@ -149,13 +152,14 @@ int main(void) {
     /* ── NaN unordered semantics (f64) ──────────────────────────────── */
     li64(w, &n, 0, 0x7FF8000000000000ull); w[n++] = fmov_dx(24, 0);  /* quiet NaN */
     w[n++] = fmov_ss(25, 0, 1);            /* d25 = fmov copy of d0 (3.5) */
-    w[n++] = fcmp(24, 25, 1); w[n++] = cset(26, 0x0);   /* NaN == 3.5 → 0 */
-    w[n++] = fcmp(24, 25, 1); w[n++] = cset(27, 0x1);   /* NaN != 3.5 → 1 */
-    w[n++] = fcmp(24, 25, 1); w[n++] = cset(28, 0xB);   /* NaN <  3.5 → 0 */
-    /* plan D5 pins: NaN GT/GE must be 0 — the two relations a single
-     * cset gets wrong, closed via the swapped-operand path F1 will emit */
-    w[n++] = fcmp(25, 24, 1); w[n++] = cset(3, 0xB);    /* GT(NaN,3.5) → 0 */
-    w[n++] = fcmp(25, 24, 1); w[n++] = cset(4, 0xD);    /* GE(NaN,3.5) → 0 */
+    w[n++] = fcmp(24, 25, 1); w[n++] = cset(26, 0x0);   /* NaN == 3.5 → 0 (eq: Z=0 on unordered) */
+    w[n++] = fcmp(24, 25, 1); w[n++] = cset(27, 0x1);   /* NaN != 3.5 → 1 (ne) */
+    w[n++] = fcmp(24, 25, 1); w[n++] = cset(28, 0x4);   /* NaN <  3.5 → 0 (mi: N=0 on unordered — naive lt is 1!) */
+    /* M3 pins: the REAL unordered model is N=0,Z=0,C=1,V=1, so GT/GE are
+     * directly cset gt/ge (N==V is false on unordered), no swap needed,
+     * and LE would need cset ls. These mirror exactly what F1 now emits. */
+    w[n++] = fcmp(24, 25, 1); w[n++] = cset(3, 0xC);    /* GT(NaN,3.5) → 0 (gt: !Z && N==V → false) */
+    w[n++] = fcmp(24, 25, 1); w[n++] = cset(4, 0xA);    /* GE(NaN,3.5) → 0 (ge: N==V → false) */
 
     /* ── sum the 17 checks → x29; result in x0 ──────────────────────── */
     w[n++] = add_sh(29, 12, 13);   /* i32 sum — small values, 64-bit add identical */

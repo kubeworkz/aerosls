@@ -342,13 +342,28 @@ identical below it), compiled under freestanding flags with zero warnings.
   kernel requires an arm64 kernel build or real ARM hardware/QEMU — not claimed,
   filed as honest unverified.
 
-**M3 — optional, environment-dependent.** Real-hardware or `qemu-aarch64`
-execution proof once a toolchain is available (the riscv64 constraint §12
-documented has no reason to be permanent), or an arm64 kernel target if the
-roadmap ever grows one.
+**M3 — CLOSED (qemu-aarch64 leg), optional (arm64 kernel half).** The
+real-execution proof landed via `qemu-aarch64` user-mode: `simi_arm_jit.c`
+(§10.178) translates each corpus fixture with the exact `simi_arm.c`, mmaps
+the emitted words executable, and ACTUALLY branches into them on a real A64
+implementation (qemu-aarch64 user-mode running a static aarch64-linux-gnu
+ELF — the same translator that will port into the kernel). The emitted `blr`
+host calls land in real C functions under the real AAPCS64 convention, and
+the whole corpus runs with results matching the four-way expected values,
+closing the two decoder-blind gaps: an encoder+decoder that agree but are
+every way wrong (M3's first run PROVED it — it found two such bugs, the
+JMPR table's guest-relative addressing and the FCMP unordered flag model,
+both fixed in §10.179), and A64 architectural rules (SP 16-byte alignment,
+4-byte branch alignment) `a64_exec` is documented laxer about. The runner
+(`run_arm64_tests.sh`) skips cleanly without the toolchain (the
+"environment-dependent" premise) and the `arm64-guards` CI job installs it
+and requires all-pass. The other half of M3's definition — an *arm64 kernel
+target* if the roadmap ever grows one — remains deliberately undone and
+honest.
 
-**M0 and M1 are the project.** M2 is a port with a re-diff; M3 is
-environment-dependent. The ordering rule from Step 6.4 applies equally here:
+**M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
+environment-dependent until the qemu-aarch64 leg landed. The ordering rule
+from Step 6.4 applies equally here:
 implement what a running test halts on first, not by walking a list.
 
 ---
@@ -6234,6 +6249,96 @@ four-way parity (interp 97/97, x86/RV64/ARM 96/0/3) are untouched by
 construction. Changed: root `.gitignore` (`.freebuff/` entry),
 `tools/simi/Makefile` (fresh-checkout note), the index removals, and
 this record.
+
+### 10.178 M3 — the REAL AArch64 execution proof lands (qemu-aarch64 leg)
+
+§6's M3 was the milestone the whole M-series deferred on the honest
+premise that no AArch64 toolchain or QEMU existed in this environment
+("optional, environment-dependent"). M3 is now CLOSED on the execution
+half via `qemu-aarch64` **user-mode** — the strongest substitute for
+real ARM hardware available on an x86 host, and the same class of proof
+the x86 leg has had since Phase 3 (`simi_jit_test.c` executes real
+x86-64 on the host CPU) and the RV64 leg has never had. The M3 design
+reuses the x86 leg's shape wholesale: `tools/simi/simi_arm_jit.c`
+translates each corpus fixture with the EXACT `simi_arm.c`, mmaps the
+emitted words, flips the page to executable (W^X), and branches into
+the trampoline for real — no decoder in the loop. The result register
+is read out of x9 (t0, OP_RET's convention) by a three-instruction
+naked stub (`blr x0; mov x0, x9; ret`); SIGSEGV/SIGILL/SIGBUS are
+caught and reported as execution faults. The first full-corpus run was
+**84 passed / 12 failed** — and the failures were exactly the
+agreement risk §7 predicted: TWO bugs that a64_exec and simi_arm.c
+shared, invisible to four-way parity, found only by real execution
+(§10.179 records both fixes). The Makefile's `simi-arm-jit` target
+cross-compiles the harness statically
+(`aarch64-linux-gnu-gcc -static`, deliberately not in `all` — the
+sandbox has no toolchain), `tools/simi/tests/run_arm64_tests.sh` loops
+the same parity set as `run_arm_tests.sh` (same skip rules) and runs
+every fixture under qemu-aarch64, skipping cleanly when the toolchain
+is absent, and the `arm64-guards` CI job installs
+`gcc-aarch64-linux-gnu` + `qemu-user`, builds, and requires all-pass.
+What M3 closes: the two decoder-blind residual risks §7 documented —
+(a) an encoder and decoder that AGREE but are both wrong pass four-way
+parity invisibly (now execution-visible, and it happened), and (b) A64
+architectural rules a64_exec is laxer about (SP 16-byte alignment,
+4-byte branch alignment) are now enforced by the real A64
+implementation.
+Deliberately NOT done: the arm64 *kernel* target half of M3's
+definition — no arm64 kernel build exists, and §6 keeps that honest.
+
+### 10.179 M3's paydirt — the two agreeing-but-wrong bugs real A64 caught
+
+The first M3 corpus run under qemu-aarch64 failed 12 of 96 fixtures:
+all 12 dynamic-JMPR (table-dispatch) programs faulted, and float_ops
+returned 16 instead of 15. Both were encoder/decoder pairs that agreed
+with each other — the exact residual risk §7(a) — and both were
+empirically pinned against real A64 before fixing.
+
+**(1) The JMPR table was guest-relative.** The dynamic dispatch loaded
+its table base with `movz`+`movk` of a bare *byte offset into out_buf*
+and `br`'d to it — correct only under a64_exec's guest convention
+(addresses are byte offsets), where a `br` to 0xNNN lands inside the
+buffer. On real A64 that offset is an unmapped address and every
+naive-mode fixture faulted (the same "identical trap" RV64's auipc
+port avoided — the A64 port never hit it because a64_exec hid it). The
+fix keeps the same 5-word dispatch and the same 4-byte table, so NO
+fixture's size moves: the dispatch now loads the base PC-RELATIVELY
+(`adr x11, #table_off − pos`, patched post-emit) and the table entries
+become SIGNED RELATIVE offsets — `(g_instr_off[pc] − jmpr_table_off)`,
+loaded with `ldrsw` (always negative: the table sits after the code) —
+so `base + rel` resolves to the absolute target in BOTH conventions
+(a64_exec's PC is a byte offset; real A64's is an address; `adr` is
+PC-relative in both). a64_exec gained its first `adr` decode
+(`0 00 10000 immlo immhi Rd`, 21-bit signed byte offset). The pre-M3
+`patch_li32` (movz+movk, 2 words) became `patch_adr` (1 word); the
+±1MB adr range is structurally safe under the 256 KiB CODE_CAP.
+
+**(2) The FCMP unordered model was wrong, and the cset mappings were
+tuned to it.** a64_exec modeled unordered FCMP as N=1, Z=0, C=1, V=1,
+and F1's float-CMP codegen (EQ/NE/LT/LE direct, GT/GE via swapped
+operands + cset lt/le) was derived from it. An empirical probe on real
+A64 (fcmp_probe4.c, `mrs nzcv`, bits 31:28) pinned the truth: **NZCV
+= N=0, Z=0, C=1, V=1** — so EQ/NE/GT/GE are IEEE-correct with a
+single cset eq/ne/gt/ge and NO swap, while LT and LE are the classic
+A64 NaN gotcha: naive cset lt/le read N!=V / Z||N!=V, both TRUE on
+unordered (N=0, V=1), so they return 1 for NaN. F1 now emits **cset mi
+(N)** for LT and **cset ls (!C || Z)** for LE, both 0 on unordered;
+a64_exec's `fcmp_flags` was corrected to the real model; and
+a64_f0_test.c's pins were rewritten to the exact sequences F1 emits
+(the old pins asserted the wrong model — they passed because encoder
+and decoder agreed). float_ops returns **15 on real A64**, matching
+interp/x86/RV64 exactly.
+
+Both fixes are size-neutral (the dispatch stays 5 words; fcmp+cset is
+one pair either way), so the size gate's committed rows did not move,
+and a64_exec's `adr` + the corrected flags keep the four-way parity
+green. The corrected corpus is **96 passed / 0 failed / 3 skipped on
+real A64** — the full chain series, the memory folds, obj_ops' real
+hostfn `blr` calls, and stress_atomics' real ldaxr/stlxr under
+contention all execute correctly on actual AArch64, and jmpr_oob still
+faults at the bounds-check UDF in both legs. The two bugs are the
+fulfillment of §6's promise that M3 would close "the one documented
+residual-risk class the whole M2 series has been building against".
 
 ---
 
