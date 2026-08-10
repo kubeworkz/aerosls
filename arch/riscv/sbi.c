@@ -144,12 +144,20 @@ void route_sls_shell_command(const char* buffer) {
 }
 
 // Invoked from riscv_trap_dispatch (arch/riscv/trap_riscv.c) for
-// asynchronous Supervisor External Interrupts (scause Bit 63 = 1, Code = 9)
+// asynchronous external interrupts (scause/mcause Bit 63 = 1). Cause 9 is
+// SEIP (supervisor external, the PLIC's S-mode context line); cause 11
+// is MEIP (machine external, the PLIC's M-mode context line -- the
+// Phase 9i M-mode twin, where the bare-metal build has no firmware and
+// the interrupt is taken in M-mode at mtvec). Both are the same PLIC/
+// UART device path; plic.c's plic_claim/complete resolve to the mode's
+// own context.
 void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
     (void)stval; // Avoid unreferenced variable warnings
     
-    // Check if the cause is a Supervisor External Interrupt (IRQ 9 from PLIC/UART)
-    if ((scause & (1ULL << 63)) && (scause & 0xFF) == 9) {
+    // Check if the cause is an external interrupt (IRQ 9 from PLIC/UART in
+    // S-mode, IRQ 11 in M-mode)
+    if ((scause & (1ULL << 63)) &&
+        ((scause & 0xFF) == 9 || (scause & 0xFF) == 11)) {
         // Phase 9i: claim the PLIC source for hart 0's S-mode context --
         // returns 10 (the UART). Claiming masks the source while the
         // handler drains, so a re-asserted line cannot double-deliver;

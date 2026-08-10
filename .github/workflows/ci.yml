@@ -345,3 +345,29 @@ jobs:
             cat echo_client.log echo_qemu.log >&2
             exit 1
           fi
+
+      - name: Boot the UART-echo kernel as an M-mode payload and assert the device-driven echo
+        run: |
+          # Phase 9i M-mode twin: the same echo over the bare-metal path —
+          # the M-mode PLIC context, mie.MEIE + mstatus.MIE, trap at mtvec
+          # with mcause = bit63+11. `-bios none` + sls_riscv_kernel_echo_m.elf
+          # (built by `make riscv-elf` above, linked at 0x80000000). Same
+          # socket protocol and assertions as the S-mode echo step; rc=124
+          # (deliberate spin killed by the timeout) is success.
+          rm -f /tmp/sls_echo_m.sock
+          timeout 40 qemu-system-riscv64 -M virt -m 128M -smp 1 -bios none \
+            -chardev socket,id=s0,path=/tmp/sls_echo_m.sock,server=on,wait=on \
+            -serial chardev:s0 -kernel sls_riscv_kernel_echo_m.elf -nographic \
+            >echo_m_qemu.log 2>&1 &
+          qpid=$!
+          python3 tools/simi/tests/echo_client.py /tmp/sls_echo_m.sock >echo_m_client.log 2>&1
+          crc=$?
+          wait $qpid
+          rc=$?
+          if [ "$rc" -eq 124 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_m_client.log; then
+            echo "OK: M-mode device-driven UART RX interrupt echo verified (chars echoed, line reached the shell)"
+          else
+            echo "FAILED: M-mode echo check failed (qemu rc=$rc, client rc=$crc)" >&2
+            cat echo_m_client.log echo_m_qemu.log >&2
+            exit 1
+          fi
