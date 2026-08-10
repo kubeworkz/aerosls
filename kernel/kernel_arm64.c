@@ -1,13 +1,14 @@
-/* kernel/kernel_arm64.c — M4a/M4b: the minimal arm64 kernel main.
+/* kernel/kernel_arm64.c — M4a/M4b/M4c: the minimal arm64 kernel main.
  *
  * Gap Remediation SIMI Phase 10 / M4 (docs/AeroSLS-SIMI-ARM-Backend-Plan-
  * v0.1.md §6 M4, §10.187): the first bootable AArch64 kernel, mirroring
  * the RISC-V kernel's Phase 9 shape — a self-contained qemu -M virt
- * build whose boot prints a banner, translates and EXECUTES an embedded
- * .tmo through kernel/simi_arm.c (M4b), and ends in a clean power-off.
- * The arm64 analog of SBI_SRST is PSCI: qemu -M virt emulates PSCI 0.2
- * through its EL3 monitor, so `smc #0` with the SYSTEM_OFF function id
- * powers the machine off and QEMU exits rc=0.
+ * build whose boot prints a banner, enables the VMSAv8-64 MMU (M4c),
+ * translates and EXECUTES an embedded .tmo through kernel/simi_arm.c
+ * (M4b), and ends in a clean power-off. The arm64 analog of SBI_SRST
+ * is PSCI: qemu -M virt emulates PSCI 0.2 through its EL3 monitor, so
+ * `smc #0` with the SYSTEM_OFF function id powers the machine off and
+ * QEMU exits rc=0.
  *
  * M4b's division of labor (the point of this milestone): the encoder
  * (kernel/simi_arm.c) is already proven by the qemu-aarch64 M3 leg and
@@ -19,9 +20,19 @@
  * exact symbols the undefined-symbol gate permits and no more.
  *
  * No libc, no FP/SIMD: compiled -mgeneral-regs-only, mirroring the x86
- * kernel's -mno-sse discipline. */
+ * kernel's -mno-sse discipline.
+ *
+ * M4c (this milestone): the MMU comes on FIRST, before the UART is
+ * touched, so the banner itself is printed through the device page and
+ * the whole boot proves the translation tables work. mmu.c builds a
+ * 4-level identity map (kernel image region + UART device page), and
+ * the selfcheck below prints the SCTLR/TTBR0 state and the walk
+ * descriptors for both — the walk result is the proof the 4-level
+ * machinery is real, not just M bit set. */
+#include <stddef.h>
 #include <stdint.h>
 
+#include "arch/arm64/mmu.h"
 #include "arch/arm64/uart_pl011.h"
 #include "arm64_boot_smoke_tmo.h"
 #include "simi_arm.h"
@@ -73,6 +84,67 @@ static void print_u64(uint64_t v)
     uart_puts(buf);
 }
 
+/* M4c: the translated code is DATA until the MMU runs with I=1; the
+ * I-cache must be invalidated (and the D-cache line cleaned to the
+ * point of unification) before the first execute, or real silicon can
+ * run stale bytes. qemu TCG is coherent, but this is the honest
+ * hardware hygiene the JIT harness's __builtin___clear_cache provides
+ * (M3). dc cvau + ic ivau per 64-byte line, then the barriers. */
+static void arm64_flush_icache(uintptr_t addr, size_t len)
+{
+    uintptr_t start = addr & ~(uintptr_t)63;
+    uintptr_t end = (addr + len + 63) & ~(uintptr_t)63;
+    uintptr_t p;
+    for (p = start; p < end; p += 64)
+        asm volatile("dc cvau, %0" ::"r"(p) : "memory");
+    asm volatile("dsb ish" ::: "memory");
+    for (p = start; p < end; p += 64)
+        asm volatile("ic ivau, %0" ::"r"(p) : "memory");
+    asm volatile("dsb ish\n isb" ::: "memory");
+}
+
+/* M4c selfcheck: prove the MMU is genuinely on and the walk is real.
+ * Prints SCTLR_EL1.M|C|I, TTBR0/MAIR/TCR, then walks two addresses
+ * through the built tables: the UART (device attr 0, PXN) and the
+ * kernel image (normal attr 1). The walk reading the tables through
+ * the identity map is itself an MMU-on load. */
+static void mmu_selfcheck(void)
+{
+    uint64_t sctlr, ttbr0, mair, tcr;
+    asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    asm volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+    asm volatile("mrs %0, mair_el1" : "=r"(mair));
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
+
+    uart_puts("[M4c] SCTLR_EL1 M=");
+    uart_putc((sctlr & 1) ? '1' : '0');
+    uart_puts(" C=");
+    uart_putc((sctlr & (1UL << 2)) ? '1' : '0');
+    uart_puts(" I=");
+    uart_putc((sctlr & (1UL << 12)) ? '1' : '0');
+    uart_puts("\r\n");
+    uart_puts("[M4c] TTBR0_EL1=");
+    print_u64(ttbr0);
+    uart_puts(" MAIR_EL1=");
+    print_u64(mair & 0xFFFFUL);
+    uart_puts(" TCR_EL1=");
+    print_u64(tcr);
+    uart_puts("\r\n");
+
+    uint64_t d_uart = mmu_walk_va(0x09000000UL);
+    uint64_t d_img = mmu_walk_va(0x40080000UL);
+    uart_puts("[M4c] walk(0x09000000) L3=");
+    print_u64(d_uart);
+    uart_puts(" attr=");
+    uart_putc('0' + (char)((d_uart >> 2) & 7));
+    uart_puts((d_uart & (1UL << 53)) ? " pxn=1 (device)\r\n" : " pxn=0\r\n");
+    uart_puts("[M4c] walk(0x40080000) L3=");
+    print_u64(d_img);
+    uart_puts(" attr=");
+    uart_putc('0' + (char)((d_img >> 2) & 7));
+    uart_puts(" (normal)\r\n");
+}
+
 /* M4b: translate the embedded arm64_boot_smoke.tmo and call the entry
  * as a real function. The translated program's result rides in t0 (x9),
  * NOT x0: X_T0 is simi_arm.c's primary working register and carries the
@@ -101,6 +173,10 @@ static uint64_t arm64_boot_smoke_test(void)
     }
 
     uart_puts("[SIMI] translated OK, calling entry directly...\r\n");
+
+    /* M4c: the buffer is data until now; make the I-cache see it before
+     * the first fetch (no-op on qemu TCG, required on real silicon). */
+    arm64_flush_icache((uintptr_t)g_smoke_code_buf, (size_t)len);
 
     typedef int64_t (*SimiEntryFn)(void);
     SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_smoke_code_buf + entry_off);
@@ -140,10 +216,15 @@ static void print_el(void)
 
 void kernel_arm64_main(void)
 {
+    /* M4c: MMU on FIRST — the banner below prints through the device
+     * page and every subsequent load/store/fetch walks the tables. */
+    mmu_enable_identity();
     uart_init();
     uart_puts("AeroSLS ARM64 Node Kernel Online!\r\n");
-    uart_puts("[M4] minimal arm64 kernel (M4a+M4b) booted under qemu -M virt\r\n");
+    uart_puts("[M4c] MMU on: VMSAv8-64 4-level 4 KiB identity map, "
+              "32 MiB kernel region + UART device page\r\n");
     print_el();
+    mmu_selfcheck();
     arm64_boot_smoke_test();
     uart_puts("[M4] issuing PSCI SYSTEM_OFF\r\n");
     psci_system_off();

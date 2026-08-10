@@ -369,7 +369,7 @@ done, staged and compile-gated (§10.180); the actual arm64 kernel
 *build* and its wiring (translate glue, paging, activation, syscall
 path) remains deliberately undone and honest.
 
-**M4 — arm64 kernel target. M4a+M4b DONE (§10.188, §10.189); M4c scoped (§10.187).**
+**M4 — arm64 kernel target. M4a+M4b+M4c DONE (§10.188-10.190).**
 The last row of the §10.184 matrix: a minimal bootable AArch64 kernel that
 `kernel/simi_arm.c` finally links into. Scope in three sub-milestones,
 mirroring the RISC-V kernel's Phase 9 shape (self-contained qemu `-M
@@ -382,9 +382,10 @@ embeds a tiny .tmo exactly like `rv64_boot_smoke_tmo.h`, translates it
 with `simi_arm_translate()`, and calls the entry as a real function
 (result in x9, the M3-established convention) — the kernel leg's job is
 the LINK, not re-verifying the encoder, which qemu-aarch64 already
-proved; M4c (deferred) is the arm64 MMU (VMSAv8-64: TCR/MAIR/TTBR,
-4-level walk), then user paging + interrupts + the syscall path — the
-Phase-9-equivalent honest remainder.
+proved; M4c (DONE, §10.190) is the arm64 MMU (VMSAv8-64: TCR/MAIR/TTBR,
+a real 4-level 4 KiB walk, identity-mapped), then user paging +
+interrupts + the syscall path — the Phase-9-equivalent honest
+remainder.
 - **Gate (M4a) — PASSED (§10.188):** `qemu-system-aarch64 -M
   virt,virtualization=on -cpu cortex-a53 -kernel sls_arm64_kernel.elf`
   exits rc=0 (PSCI powered it off) with the banner + the `[M4]`
@@ -403,9 +404,21 @@ Phase-9-equivalent honest remainder.
   frame (measured with `-fstack-usage`), so the stack was raised to
   256 KiB (§10.189). The boot assertion (result=42) is CI-enforced in
   arm64-guards.
+- **Gate (M4c) — PASSED (§10.190):** the log shows `[M4c] MMU on`,
+  `SCTLR_EL1 M=1 C=1 I=1`, and the two walk results — the kernel page
+  as normal WBWA (attr 1) and the UART page as device+PXN (attr 0) —
+  then the SIMI smoke still returns 42 and PSCI powers off rc=0, all
+  under the MMU. The MMU comes on BEFORE the banner, so the whole log
+  is translated output. Two real bugs were found and fixed en route:
+  the 1 GiB-boundary L1 index (kernel at 0x40000000 = exactly 1 GiB
+  sits at L1[1], not L1[0]) and a walk whose block/table constants
+  were both 0b11, letting the compiler dead-code-eliminate the L3
+  descent — the walk printed L2 descriptors and lied (§10.190).
+  CI-enforced in arm64-guards (rc=0 + banner + SCTLR + both walk
+  lines + SIMI result + PSCI).
 - Sizing: boot_arm64.S ~150, linker_arm64.ld ~40, uart_pl011.c ~80,
   kernel_arm64.c ~220 (banner + boot smoke + memcpy/memset + PSCI),
-  Makefile ~25, CI ~30; M4c's MMU ~250-400.
+  mmu.c ~250 (tables, enable, walk), Makefile ~25, CI ~30.
 
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
@@ -6845,6 +6858,59 @@ exclusion already named the M4b link), the kernel-copy matrix
 self-check, and the re-diff tripwires all green. The M4c remainder
 (MMU, interrupts, user paging — §10.187) stays deferred; the matrix
 row it was the boundary for is now closed.
+
+---
+
+
+### 10.190 M4c as built: the VMSAv8-64 MMU, on and walking
+
+M4c is the arm64 MMU milestone the scope (§10.187) sized at ~250-400
+lines and flagged "nothing like Sv39". It landed as `arch/arm64/mmu.c`
+(~250 lines): a genuine 4-level (L0/L1/L2/L3) 4 KiB-granule identity
+map, enabled at EL1 BEFORE the UART is touched, so the banner and every
+subsequent line in the boot log is translated output.
+
+**Design.** MAIR_EL1 = device-nGnRnE (attr 0) | normal WBWA (attr 1);
+TCR_EL1 = T0SZ=16 (48-bit VA) | TG0=4 KiB | IPS=40-bit (safe on both
+cortex-a53 and -a57); TTBR0 -> a 20-table tree in BSS (80 KiB, inside
+the mapped region): one L0/L1/L2 table, 16 L3 tables identity-mapping
+0x40000000..0x42000000 (32 MiB at 4 KiB — the image alone is 21.2 MiB,
+the M2 chain arrays make BSS ~21 MiB), plus one L3 table for the UART
+device page at 0x09000000. The enable sequence follows the ARM ARM
+transition discipline (dsb ish; program MAIR/TCR/TTBR0; isb; tlbi
+vmalle1; dsb ish; isb; SCTLR_EL1.M|C|I; isb), and the SIMI code buffer
+gets a dc cvau / ic ivau flush before execution (the M3
+`__builtin___clear_cache` hygiene, now that I=1). TTBR1 is deliberately
+unused — the deferred user-space half.
+
+**Two real bugs, found by booting, both pinned empirically.**
+1. **The 1 GiB-boundary L1 index.** The first boot after enabling faulted
+   with a level-1 translation fault (ESR 0x86000005, FAR = the isb right
+   after `msr sctlr_el1`): 0x40000000 is EXACTLY 1 GiB, so the kernel at
+   0x40080000 lives at L1[1] ([1 GiB, 2 GiB)), not L1[0] ([0, 1 GiB) —
+   where only the UART lives). L1[1] was empty (zeroed BSS). Fix: both
+   L1 entries share one L2 table (L2[0..15] kernel, L2[72] UART).
+2. **The walk that lied.** The selfcheck's walk printed L3 descriptors
+   with attr=0 everywhere — because DESC_TABLE and DESC_PAGE were BOTH
+   defined as 0b11, so the walk's "block vs table" checks folded into
+   one condition and the compiler dead-code-eliminated the entire L3
+   descent: the "walk" returned L2 table descriptors (whose low bits
+   coincidentally read attr 0). The builder was always right — only the
+   walk's constants were broken. Fix: distinct encodings (0b11 valid
+   table/page, 0b01 block) and explicit block handling at L1/L2.
+
+**Verified.** With the walk honest, the log shows the real descriptors:
+`walk(0x09000000) L3=0x0020000009000403 attr=0 pxn=1 (device)` (PA
+0x09000000, attr 0, PXN set) and `walk(0x40080000) L3=0x0000000040080407
+attr=1 (normal)` (PA 0x40080000, attr 1, AF). Boots rc=0 on BOTH
+cortex-a57 (local) and cortex-a53 (CI), deterministic across runs, with
+the SIMI boot smoke still returning 42 under the MMU and PSCI powering
+off. The arm64-guards CI boot step now asserts the `[M4c] MMU on` line,
+`SCTLR_EL1 M=1 C=1 I=1`, both walk lines byte-exact, and the existing
+SIMI-result + PSCI lines. The M4 honest remainder (user paging, an
+activation cache, the syscall/object-catalog story, GIC interrupts,
+FP/SIMD context) stays deferred — M4c's own gate (boot + walk + SIMI +
+shutdown under the MMU) is closed.
 
 ---
 
