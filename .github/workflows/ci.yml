@@ -390,3 +390,35 @@ jobs:
             cat echo_m_client.log echo_m_qemu.log >&2
             exit 1
           fi
+
+  arm64-guards:
+    # M3 (docs/AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md §6): the REAL
+    # AArch64 execution proof. simi-arm-verify runs the emitted A64 words
+    # through a64_exec.c, a purpose-built decoder — but a decoder that
+    # AGREES with a wrong encoder passes the four-way parity invisibly,
+    # and A64 architectural rules a64_exec is documented laxer about (SP
+    # 16-byte alignment, 4-byte branch-target alignment) are never
+    # checked at all. This job cross-compiles simi_arm_jit.c for
+    # aarch64-linux-gnu (static) and EXECUTES the whole SIMI corpus on a
+    # real A64 implementation — qemu-aarch64 user-mode — the same
+    # translator (simi_arm.c) that will port into the kernel. The runner
+    # skips cleanly without the toolchain; here it is installed, so the
+    # run must be all-pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AArch64 cross toolchain and QEMU user-mode
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+
+      - name: Build the M3 JIT harness (cross-compiled)
+        run: make -C tools/simi simi-arm-jit
+
+      - name: Execute the corpus on real A64 and assert all-pass
+        run: |
+          out=$(tools/simi/tests/run_arm64_tests.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "0 failed" || {
+            echo "FAILED: M3 real-execution leg has failures — the emitted A64 code misbehaves on real A64" >&2
+            exit 1
+          }

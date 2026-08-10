@@ -151,14 +151,16 @@ passes. The evidence, all measured:
   - FMOV general: `sf 0011110 <type> 1 100110/100111 000000 Rn Rd` — opcode
     0x06 = FP→GP (`fmov x0,d1` = 0x9E660020, `fmov w0,s1` = 0x1E260020),
     0x07 = GP→FP (`fmov d0,x1` = 0x9E670020, `fmov s0,w1` = 0x1E270020).
-- **The NZCV unordered model, verified per D5** — FCMP sets N=1, Z=0, C=1, V=1 on
-  NaN; from those flags EQ/NE/LT/LE come out IEEE-correct with a single cset,
-  but **GT and GE are wrong with a single cset** (unordered → `!Z && N==V` and
-  `N==V` are both true). F1 therefore compares the swapped operands
-  (`fcmp b,a` + `cset lt/le`) for GT/GE — the exact x86 seta/setae-via-swap
-  finding — and this executor's flag model is what makes both the direct and
-  swapped paths right. The NaN pins in the test cover all six relations, not
-  just float_ops's three.
+- **The NZCV unordered model, verified per D5 EMPIRICALLY (M3)** — real A64
+  FCMP on NaN sets **N=0, Z=0, C=1, V=1** (pinned on actual A64 via
+  qemu-aarch64, `mrs nzcv` bits 31:28 — the pre-M3 N=1,Z=0 assumption was
+  wrong and F1's codegen was tuned to it). From the real flags EQ/NE/GT/GE are
+  IEEE-correct with a single cset eq/ne/gt/ge and NO operand swap (Z and N==V
+  are both false on unordered), while **LT and LE are the classic A64 NaN
+  gotcha**: naive cset lt/le read N!=V / Z||N!=V, both TRUE on unordered (N=0,
+  V=1), returning 1 for NaN. F1 emits **cset mi (N)** for LT and **cset ls
+  (!C || Z)** for LE, both 0 on unordered. The NaN pins in the test cover all
+  six relations, not just float_ops's three.
 - **The gate** (`make a64-f0-test`): a hand-assembled A64 transcription of
   `float_ops.simi`'s exact semantics (104 words, every word annotated with the
   decode pattern it came from — simi_arm.c can't emit float until F1, so this
@@ -192,10 +194,13 @@ A64. The evidence, all measured:
   (`0x8000...0` for f64, `0x80000000` for f32) is materialized into X_T1 and
   XORed through the integer cache. The 32-bit mask flips bit 31 and leaves the
   zero-extended upper half zero, matching `bits_of_f32`.
-- **CMP per the D5 finding** — EQ/NE/LT/LE emit `fcmp (a,b)` + a single
-  `cset`; GT/GE emit `fcmp (b,a)` + `cset lt/le` (the swapped-operand trick F0
-  verified, because a single `cset gt/ge` is wrong on NaN's N=1,Z=0,C=1,V=1).
-  The unsigned relations (LTU..GEU) have no float meaning and return
+- **CMP per the D5 finding, corrected by M3** — the real unordered model is
+  N=0, Z=0, C=1, V=1 (empirically pinned), so ALL six relations emit
+  `fcmp (a,b)` + a single `cset` with NO operand swap: EQ→eq, NE→ne, GT→gt,
+  GE→ge (all IEEE-correct directly), LT→**mi (N)** and LE→**ls (!C || Z)**
+  (the naive lt/le read N!=V / Z||N!=V, both true on unordered — the A64 NaN
+  gotcha the pre-M3 swapped-operand trick was built around). The unsigned
+  relations (LTU..GEU) have no float meaning and return
   `TX_AR_ERR_BAD_OPCODE`.
 - **The permanent rejection boundaries, narrowed honestly** — the M0-era blanket
   rejection is gone. What remains: float MOD (no float instruction on any
@@ -290,8 +295,10 @@ has a genuine four-way execution parity. The evidence, all measured:
   clean, `a64-f0-test` PASS.
 - **ISA doc §16 Phase 10 addendum** — records the A64 landing (F0-F3)
   next to the x86/interpreter findings: the GP-bounce, the sign-XOR
-  NEG, the D5 swapped-operand CMP, the two permanent rejection
-  boundaries, and the four-engine parity numbers.
+  NEG, the D5 real-model CMP (mi/ls for LT/LE after M3 corrected the
+  unordered flags — the swapped-operand design is retired, see §10.179
+  of the ARM plan), the two permanent rejection boundaries, and the
+  four-engine parity numbers.
 
 ### 3.5 F4 status — LANDED (RV64 F/D codegen; four-way float parity complete)
 

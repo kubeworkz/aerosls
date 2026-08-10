@@ -145,6 +145,15 @@ rv-trap-entry-test-seip: rv_trap_entry_seip.o rv_trap_entry_driver_seip.o rv_tra
 simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h bench_baselines.h
 	$(CC) $(CFLAGS) -o $@ simi_arm_verify.c simi_arm.c a64_exec.c
 
+# M3 (plan doc §6): the REAL AArch64 execution proof — see simi_arm_jit.c's
+# top comment. Cross-compiled as a static Linux aarch64 ELF and executed
+# under qemu-aarch64 user-mode by tools/simi/tests/run_arm64_tests.sh,
+# which skips cleanly when the toolchain is absent (the M3 "optional,
+# environment-dependent" premise). Deliberately NOT in `all` — the
+# sandbox has no aarch64 toolchain; the arm64-guards CI job installs one.
+simi-arm-jit: simi_arm_jit.c simi_arm.c simi_arm.h
+	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -o $@ simi_arm_jit.c simi_arm.c
+
 # M0 transcription-error net: a from-scratch Python A64 encoder re-derives
 # the bit layout independently and checks every static word simi_arm.c
 # emitted (see a64_enc_check.py's docstring). Catches the error class
@@ -327,6 +336,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m rv-syscall-exit-test-u rv-trap-test rv_trap_entry.elf rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o rv_trap_entry_s.elf rv_trap_entry_s.o rv_trap_entry_driver_s.o rv_trap_entry_si.elf rv_trap_entry_si.o rv_trap_entry_driver_si.o rv_trap_entry_t.elf rv_trap_entry_t.o rv_trap_entry_driver_t.o rv_trap_entry_seip.elf rv_trap_entry_seip.o rv_trap_entry_driver_seip.o tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify simi-arm-jit a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m rv-syscall-exit-test-u rv-trap-test rv_trap_entry.elf rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o rv_trap_entry_s.elf rv_trap_entry_s.o rv_trap_entry_driver_s.o rv_trap_entry_si.elf rv_trap_entry_si.o rv_trap_entry_driver_si.o rv_trap_entry_t.elf rv_trap_entry_t.o rv_trap_entry_driver_t.o rv_trap_entry_seip.elf rv_trap_entry_seip.o rv_trap_entry_driver_seip.o tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-trap-entry-test rv-trap-entry-test-s rv-trap-entry-test-si rv-trap-entry-test-t rv-trap-entry-test-seip clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-trap-entry-test rv-trap-entry-test-s rv-trap-entry-test-si rv-trap-entry-test-t rv-trap-entry-test-seip simi-arm-jit clean
