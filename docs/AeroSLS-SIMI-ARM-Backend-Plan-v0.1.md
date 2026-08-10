@@ -467,8 +467,8 @@ sync-from-lower-A64 handler stores x9 (the result) and erets to a real
   containment use-case lands, the capability-flavored object-catalog
   trap for foreign-code domains.
 
-**M5.1 — the activation cache (translate-on-first-use). SCOPED
-(§10.192).** The System/38 `CREATE PROGRAM` → activation split, on
+**M5.1 — the activation cache (translate-on-first-use). DONE
+(§10.192-10.193).** The System/38 `CREATE PROGRAM` → activation split, on
 arm64, mirroring `kernel/simi_translate.c`'s `g_activations[]` (ISA doc
 §11): translate a `.tmo` once, cache the emitted A64 code, and re-enter
 it any number of times WITHOUT retranslating. Today the arm64 kernel
@@ -488,16 +488,16 @@ name+hash-keyed cache with an observable HIT path.
   cache's fresh-per-process scratch frame, but free: the arm64
   trampoline has no baked per-process address (unlike the x86 r7
   `movabs`), so nothing about the cached bytes is per-entry.
-- **Gate (planned):** a translate counter `g_translate_count` — a MISS
-  increments it, a HIT must not. The boot log prints `[SIMI] activation
-  cache MISS (translated N bytes)` once, then `[SIMI] activation cache
-  HIT (reusing entry_off)` on every later entry, with all results 42:
-  (1) EL1 direct activation (MISS, 42); (2) EL1 direct re-entry (HIT,
-  42, counter unchanged); (3) EL0 excursion (HIT — same cached page
-  mapped into a FRESH user tree with fresh stack/stub/scratch, 42 via
-  SVC); (4) EL0 excursion again (HIT, fresh tree, 42). Four entries,
-  one translation, all 42. CI (arm64-guards) asserts the MISS line +
-  at least one HIT line + the four result lines + rc=0.
+- **Gate (M5.1) — PASSED (§10.193):** occurrence counts on the boot
+  log: exactly 1 `activation cache MISS` (translate once), exactly 3
+  `activation cache HIT`s, exactly 2 EL1 direct results (42), exactly
+  2 EL0 results (42) — the four entries (EL1, EL1, EL0, EL0), one
+  translation, all 42, rc=0 on cortex-a57 (local) and cortex-a53
+  (CI), with the exception log containing exactly the intended three
+  (SVC, SVC, PSCI smc). The gate uses `grep -o | wc -l` occurrence
+  counts, not `grep -c` line counts: the kernel's UART lines carry
+  literal `\r\n` text, so logical lines share one grep line
+  (§10.193). CI (arm64-guards) asserts the four counts + rc=0.
 - **Honest caveats.** Single-object today (one embedded `.tmo` — no
   second object exists to exercise slot selection); re-upload
   invalidation is argued from the FNV-1a keying (the x86 kernel's
@@ -7207,6 +7207,71 @@ exactly as x86's `simi_translate.c` wraps rather than modifies
 freestanding-compile gate are unaffected. The riskiest unknowns are
 nothing new: the EL0 re-entry path is the M5-proven shape, and the only
 new moving part is the counter/keying, both plain C.
+
+### 10.193 M5.1 as built: the activation cache, four entries one translation
+
+M5.1 implements the scope of §10.192: the System/38 `CREATE PROGRAM` →
+activation split on the arm64 kernel. The boot gate — four entries
+(EL1, EL1, EL0, EL0), ONE translation, all returning 42 — is closed,
+and the boot log now makes the property explicit:
+
+```
+[SIMI] translating arm64_boot_smoke.tmo with kernel/simi_arm.c...
+[SIMI] activation cache MISS (translated 0x…39c bytes)      ← entry 1 (EL1)
+[SIMI] entry returned (real machine code executed) -- result=0x…2a
+[SIMI] activation cache HIT (reusing entry_off=0x…33c)      ← entry 2 (EL1)
+[SIMI] entry returned (real machine code executed) -- result=0x…2a
+[SIMI] activation cache HIT (reusing entry_off=0x…33c)      ← entry 3 (EL0)
+[M5] eret into EL0...
+[M5] returned from EL0 -- user result=0x…2a
+[SIMI] activation cache HIT (reusing entry_off=0x…33c)      ← entry 4 (EL0)
+[M5] eret into EL0...
+[M5] returned from EL0 -- user result=0x…2a
+[M4] issuing PSCI SYSTEM_OFF                                 → qemu rc=0
+```
+
+**Design as built** (§10.192's shape, no drift): `struct
+Arm64Activation` slots (name + FNV-1a `content_hash` + `tmo_len` +
+`code_len` + `entry_off`), `g_act[ARM64_ACT_SLOTS]`, and
+`g_translate_count`; `arm64_activate()` MISS/HITs through the existing
+`g_smoke_code_buf` — on MISS it translates, flushes the I-cache,
+records the slot, and bumps the counter; on HIT it reuses
+`entry_off`/`len` with no translation, no flush, no bump. The two entry
+paths then share the cache: `arm64_el1_entry()` (the M4b `blr` shape,
+called twice) and `arm64_el0_activate()` (the M5 eret shape, called
+from main and again from the continuation `arm64_el0_done`, which
+launches the second EL0 excursion when `g_el0_excursions < 2` and
+powers off after the second). Each EL0 excursion builds a FRESH user
+tree (fresh stack/stub/scratch pages — only the cached code page is
+shared), and the EL0 alias at USER_CODE_VA gets its own dc cvau / ic
+ivau flush (a distinct VA from the kernel VA; no-op on qemu TCG, the
+honest real-silicon hygiene). The register frame is not cached — it is
+SP-relative, carved per entry — exactly as scoped.
+
+**One measurement lesson, recorded because the CI depends on it:** the
+kernel's UART lines carry literal `\r\n` TEXT (not carriage-return +
+line-feed), so several logical lines share one grep line and `grep -c`
+line counts undercount (the M5.1 gate's MISS/HIT/result counts read
+1/2/1/2 with `-c` versus the true 1/3/2/2). The CI asserts therefore
+use `grep -o | wc -l` occurrence counts — and the pre-M5.1 substring
+asserts were immune either way. The literal-`\r\n` emission is
+pre-existing (since M4a) and cosmetic; it is left untouched per the
+fewest-changes discipline and documented here so no future gate trips
+on it.
+
+**Verified.** `make arm64-elf` clean (zero warnings), boots rc=0 on
+cortex-a57 (local) and cortex-a53 (CI CPU), deterministic across runs:
+1 MISS + 3 HITs, 2 EL1 results (42) + 2 EL0 results (42), and the
+exception log is exactly the intended three exceptions — SVC (entry 3's
+return trap), SVC (entry 4's return trap), and the PSCI Secure Monitor
+Call — with no stray fault. The M5.1 gate is CI-enforced in
+arm64-guards: the four occurrence counts + rc=0 + all pre-existing
+asserts. The honest caveats from the scope hold as recorded
+(single-object today; upload-invalidation argued from the x86-tested
+FNV-1a keying, not exercised — no upload path; the frame-leak gap
+degenerates to nothing in the fixed 4 KiB buffer). The translator core
+was untouched — the re-diff tripwire and freestanding-compile gates are
+unaffected.
 
 ---
 

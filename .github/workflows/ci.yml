@@ -455,7 +455,7 @@ jobs:
             exit 1
           }
 
-      - name: Build the M4a+M4b+M4c+M5 arm64 kernel and assert the boot + TTBR1/EL0 paging + SIMI smoke + PSCI shutdown
+      - name: Build the M4a+M4b+M4c+M5+M5.1 arm64 kernel and assert the boot + TTBR1/EL0 paging + activation cache + SIMI smoke + PSCI shutdown
         run: |
           # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
           # first bootable AArch64 kernel — banner over the PL011, then
@@ -556,7 +556,34 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a+M4b+M4c+M5 arm64 kernel booted — banner + TTBR1 kernel + EL0 user page + SIMI result 42 + PSCI SYSTEM_OFF (rc=0)"
+          # M5.1 (plan doc §6 M5.1 / §10.192): the activation cache gate.
+          # The boot is FOUR entries — EL1 (MISS), EL1 (HIT), EL0 (HIT),
+          # EL0 (HIT) — ONE translation, all returning 42. The counts
+          # are occurrence counts (grep -o | wc -l), NOT grep -c line
+          # counts: the kernel's UART lines carry literal \r\n text, so
+          # several logical lines share one grep line and -c undercounts
+          # (the pre-M5.1 asserts are substring greps, immune either way).
+          [ "$(grep -ao 'activation cache MISS' arm64_boot.log | wc -l)" -eq 1 ] || {
+            echo "FAILED: expected exactly ONE activation cache MISS (translate once)" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          [ "$(grep -ao 'activation cache HIT' arm64_boot.log | wc -l)" -eq 3 ] || {
+            echo "FAILED: expected exactly THREE activation cache HITs (both EL1 re-entry and both EL0 excursions)" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          [ "$(grep -ao 'entry returned (real machine code executed) -- result=0x000000000000002a' arm64_boot.log | wc -l)" -eq 2 ] || {
+            echo "FAILED: expected exactly TWO EL1 direct executions returning 42" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          [ "$(grep -ao 'returned from EL0 -- user result=0x000000000000002a (expected 0x2a = 42)' arm64_boot.log | wc -l)" -eq 2 ] || {
+            echo "FAILED: expected exactly TWO EL0 excursions returning 42" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a+M4b+M4c+M5+M5.1 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |
