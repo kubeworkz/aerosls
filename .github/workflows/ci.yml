@@ -455,7 +455,7 @@ jobs:
             exit 1
           }
 
-      - name: Build the M4a+M4b+M4c+M5+M5.1 arm64 kernel and assert the boot + TTBR1/EL0 paging + activation cache + SIMI smoke + PSCI shutdown
+      - name: Build the M4a+M4b+M4c+M5+M5.1+M5.2 arm64 kernel and assert the boot + TTBR1/EL0 paging + activation cache + GIC ticks + SIMI smoke + PSCI shutdown
         run: |
           # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
           # first bootable AArch64 kernel — banner over the PL011, then
@@ -583,7 +583,23 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a+M4b+M4c+M5+M5.1 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
+          # M5.2 (plan doc §6 M5.2 / §10.194): the GIC tick gate. The
+          # log shows [TICK 1], [TICK 2], [TICK 3] as an unbroken run
+          # (exactly 3), and [TICK 2] specifically is the re-arm proof
+          # — a one-shot timer delivers only [TICK 1]. The ticks fire
+          # strictly after the last EL0 result line, so the M5.1 counts
+          # above are untouched by construction.
+          [ "$(grep -ao '\[TICK [0-9]' arm64_boot.log | wc -l)" -eq 3 ] || {
+            echo "FAILED: expected exactly THREE tick lines ([TICK 1..3], unbroken run)" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a '\[TICK 2\]' arm64_boot.log || {
+            echo "FAILED: [TICK 2] not seen — the timer re-armed (a one-shot delivers only [TICK 1])" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + GIC ticks [TICK 1..3] + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |

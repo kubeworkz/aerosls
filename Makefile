@@ -517,7 +517,7 @@ AR_ASM_SRC  = arch/arm64/boot_arm64.S
 # {memcpy, memset} pair (the §10.181 contract), provided by
 # kernel/kernel_arm64.c.
 AR_C_SRC    = kernel/kernel_arm64.c kernel/simi_arm.c arch/arm64/mmu.c \
-              arch/arm64/uart_pl011.c
+              arch/arm64/uart_pl011.c arch/arm64/gic.c
 AR_OBJECTS  = $(AR_ASM_SRC:.S=.ar64.o) $(AR_C_SRC:.c=.ar64.o)
 AR_ELF      = sls_arm64_kernel.elf
 

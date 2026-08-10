@@ -124,6 +124,25 @@ head_start:
     movk    x4, #0x20, lsl #48      /* PXN = 1<<53 */
     str     x4, [x3]
 
+    /* M5.2: the GICv2 device pages (the kernel is TTBR1-pure, so the
+     * distributor 0x08000000 + CPU interface 0x08010000 are mapped at
+     * high VAs, the UART pattern — one L3 table under L2[64], which
+     * covers the 0x08000000 2 MiB region). L3[0] = distributor,
+     * L3[16] = 0x08010000 CPU interface. Same device descriptor
+     * (0b11 | AF | PXN) as the UART. */
+    adrp    x3, g_boot_pg_gic
+    add     x3, x3, :lo12:g_boot_pg_gic   /* x3 = phys GIC L3 */
+    orr     x4, x3, #3
+    str     x4, [x2, #(64 * 8)]           /* L2[64] = GIC L3 table */
+    mov     x4, #0x8000000          /* 0x08000000 (assembler-synthesized) */
+    add     x4, x4, #0x403          /* 0b11 | AF */
+    movk    x4, #0x20, lsl #48      /* PXN = 1<<53 */
+    str     x4, [x3]                /* L3[0]: 0x08000000 distributor */
+    mov     x4, #0x8010000          /* 0x08010000 */
+    add     x4, x4, #0x403          /* 0b11 | AF */
+    movk    x4, #0x20, lsl #48      /* PXN = 1<<53 */
+    str     x4, [x3, #(16 * 8)]     /* L3[16]: 0x08010000 CPU iface */
+
     /* Program the regime and enable (ARM ARM transition order). */
     mov     x0, #0xff00             /* MAIR: attr0=device, attr1=WBWA */
     msr     mair_el1, x0
@@ -195,6 +214,8 @@ g_boot_pg_l1:   .space 4096
 g_boot_pg_l2:   .space 4096
 .globl g_boot_pg_uart
 g_boot_pg_uart: .space 4096
+.globl g_boot_pg_gic
+g_boot_pg_gic:  .space 4096
 /* The kernel's TTBR0 root: all-invalid, so low VAs fault (the kernel
  * lives entirely in TTBR1; the user tables replace this for EL0 runs). */
 .globl g_boot_pg_empty
@@ -218,7 +239,7 @@ arm64_vectors:
     VEC_SLOT arm64_vector_stub      /* 0x100 FIQ,   EL1t  */
     VEC_SLOT arm64_vector_stub      /* 0x180 SError, EL1t */
     VEC_SLOT arm64_vector_stub      /* 0x200 sync,  EL1h  */
-    VEC_SLOT arm64_vector_stub      /* 0x280 IRQ,   EL1h  */
+    VEC_SLOT arm64_irq_el1h        /* 0x280 IRQ,   EL1h  ← M5.2 tick */
     VEC_SLOT arm64_vector_stub      /* 0x300 FIQ,   EL1h  */
     VEC_SLOT arm64_vector_stub      /* 0x380 SError, EL1h */
     VEC_SLOT arm64_svc_from_el0     /* 0x400 sync,  lower A64 ← SVC */
@@ -229,6 +250,38 @@ arm64_vectors:
     VEC_SLOT arm64_vector_stub      /* 0x680 IRQ,   lower A32 */
     VEC_SLOT arm64_vector_stub      /* 0x700 FIQ,   lower A32 */
     VEC_SLOT arm64_vector_stub      /* 0x780 SError, lower A32 */
+
+/* M5.2 EL1h IRQ entry (VBAR+0x280): the generic-timer tick. The
+ * interrupted C code (the idle loop in kernel_arm64.c) may hold live
+ * values in any register, so the entry saves everything it will clobber
+ * — the caller-saved x0-x17 plus x30 (the C handler preserves the
+ * callee-saved x19-x28/x29 per the ABI, and SP is untouched) — calls
+ * arm64_tick_irq, restores, erets. 18 * 8 = 144 bytes, 16-aligned. */
+arm64_irq_el1h:
+    sub     sp, sp, #(18 * 8)
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    str     x30, [sp, #136]
+    bl      arm64_tick_irq
+    ldp     x0, x1, [sp, #0]
+    ldp     x2, x3, [sp, #16]
+    ldp     x4, x5, [sp, #32]
+    ldp     x6, x7, [sp, #48]
+    ldp     x8, x9, [sp, #64]
+    ldp     x10, x11, [sp, #80]
+    ldp     x12, x13, [sp, #96]
+    ldp     x14, x15, [sp, #112]
+    ldp     x16, x17, [sp, #128]
+    ldr     x30, [sp, #136]
+    add     sp, sp, #(18 * 8)
+    eret
 
 /* SVC from the EL0 SIMI program: the trampoline `br x30`-ed into a
  * user-mode `svc #0` stub with the result still in t0 (x9). Save it to
