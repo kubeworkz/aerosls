@@ -13,6 +13,12 @@
 #define SBI_SRST_RESET              0
 #define SBI_SRST_RESET_TYPE_SHUTDOWN 0
 #define SBI_SRST_RESET_REASON_NONE  0
+/* Phase 9k: the S-mode periodic timer's period, in `time` CSR ticks.
+ * QEMU virt's timebase is 10 MHz, so 10,000,000 ticks = 1 second. The
+ * timer is armed by writing the stimecmp CSR directly (the Sstc
+ * extension), NOT through SBI_SET_TIMER — see arch/riscv/sbi.c's
+ * sbi_arm_timer for why the SBI call shape was abandoned. */
+#define SBI_TIMER_TICKS_PER_SEC     10000000UL
 
 struct SBIReturn {
     long error;
@@ -43,5 +49,6 @@ static inline struct SBIReturn sbi_call(unsigned long ext, unsigned long fid,
 }void sbi_putchar(char c);
 int sbi_getchar(void);
 void sbi_system_reset(void);
+int sbi_arm_timer(uint64_t period_ticks);   /* Phase 9k: arm/re-arm the S-mode timer (stimecmp); always returns 0 */
 
 #endif
