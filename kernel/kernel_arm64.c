@@ -112,9 +112,12 @@ static uint32_t g_el0_excursions;    /* the M5.1 gate: exactly 2 at boot */
 /* M5.2: the tick counter, bumped by the EL1h IRQ handler. Volatile —
  * written by arm64_tick_irq, read by the wait loop. */
 static volatile uint32_t g_tick_count;
-#define M52_TICK_TARGET 4            /* the gate: [TICK 1..4], unbroken — 2
+#define M52_TICK_TARGET 4            /* the M5.2 gate: [TICK 1..4], unbroken — 2
                                      * pended through the EL0 windows, 2
                                      * during idle (contention probe, §10.196) */
+#define M53_TICK_TARGET 6            /* the M5.3 gate: [TICK 1..6], unbroken —
+                                     * TICK 5 physical + TICK 6 nested virtual
+                                     * (the M5.3 nesting phase, §10.197) */
 
 static void print_u64_dec(uint64_t v);
 
@@ -128,11 +131,52 @@ void arm64_tick_irq(void)
     uint32_t intid = gic_iar();
     if (intid == 1023)
         return;
+    if (intid == GIC_VIRT_TIMER_INTID) {
+        /* M5.3 nested tick: the virtual timer (INTID 27, priority 0x00)
+         * preempted the physical handler. One-shot: disarm it FIRST so
+         * the level deasserts before the EOIR (else the line re-asserts
+         * and storms); no re-arm — the nesting is a single, bounded
+         * event. The EL1h IRQ entry (boot_arm64.S) saved/restored the
+         * caller-saved set, so the outer handler's frame is untouched. */
+        arm_vtimer_disarm();
+        g_tick_count++;
+        uart_puts("[TICK ");
+        print_u64_dec(g_tick_count);
+        uart_puts("]\\r\\n");
+        gic_eoir(intid);
+        return;
+    }
+    /* Physical timer path (INTID 30, priority 0x80). */
     arm_timer_arm();
     g_tick_count++;
     uart_puts("[TICK ");
     print_u64_dec(g_tick_count);
     uart_puts("]\\r\\n");
+    if (g_tick_count == 5) {
+        /* M5.3 nesting window (§10.197): on the FIFTH physical tick —
+         * the M5.3 phase runs after the M5.2 gate (TICK 1..4), so the
+         * M5.2 assertions stay byte-identical. Arm the virtual timer
+         * (10 ms) and unmask IRQs; the virtual fire preempts THIS
+         * handler (a DIFFERENT INTID at a higher priority — the
+         * same-PPI case is impossible, GICv2 running-priority: an
+         * interrupt cannot preempt its own active instance, and the
+         * spike showed qemu's lax re-entry corrupts the GIC). The
+         * window is a short, bounded spin (10 ms) well under the
+         * 100 ms physical period, so no physical fire can nest too. */
+        arm_vtimer_arm();
+        uart_puts("[M5.3] nesting window: virtual timer armed (10 ms), "
+                  "IRQs unmasked...\\r\\n");
+        asm volatile("msr daifclr, #2" ::: "memory");   /* IRQ unmask (I) */
+        uint64_t now, end;
+        asm volatile("mrs %0, cntpct_el0" : "=r"(end));
+        end += arm_timer_cntfrq() / 100;   /* 10 ms window */
+        do {
+            asm volatile("mrs %0, cntpct_el0" : "=r"(now));
+        } while (now < end);
+        asm volatile("msr daifset, #2" ::: "memory");   /* re-mask */
+        uart_puts("[M5.3] nested: virtual timer preempted the physical "
+                  "handler\\r\\n");
+    }
     gic_eoir(intid);
 }
 
@@ -440,10 +484,12 @@ static void arm64_wait_ticks(uint32_t target)
 {
     /* The timer was armed in main before the EL0 excursions (§10.196)
      * and the handler re-arms on every tick, so there is nothing to arm
-     * here. IRQs are already unmasked: arm64_el0_done cleared the I bit
-     * at its entry, so each tick pended through an EL0 window was taken
-     * exactly once on that return. This phase just idles for the idle
-     * ticks that complete the count. */
+     * here. Self-contained masking: unmask IRQs for the idle wait (the
+     * M5.3 phase calls this a SECOND time after the M5.2 gate re-masked,
+     * so the mask state must not be assumed from the caller) and
+     * re-mask before returning. Each tick pended through an EL0 window
+     * was taken exactly once on the continuation's return. */
+    asm volatile("msr daifclr, #2" ::: "memory");   /* IRQ unmask (I) */
     uart_puts("[M5.2] waiting for ");
     print_u64_dec(target);
     uart_puts(" ticks total (GICv2, CNTP PPI 14, 100 ms period)...\\r\\n");
@@ -466,17 +512,32 @@ static void arm64_el0_done(void)
 {
     /* M5.2 contention probe (§10.196): the svc handler returns with DAIF
      * masked (SPSR 0x3c5), but a tick that fired during the EL0 window
-     * is pending RIGHT NOW. Unmask immediately so it is taken exactly
-     * once on this return — a level-sensitive GIC line that deasserts
-     * (the handler's re-arm) before being taken is silently dropped, the
-     * exact lost-tick failure the probe exists to prove absent. */
-    asm volatile("msr daifclr, #2" ::: "memory");   /* IRQ unmask (I) */
+     * is pending RIGHT NOW. Unmask so it is taken exactly once on this
+     * return — a level-sensitive GIC line that deasserts (the handler's
+     * re-arm) before being taken is silently dropped, the exact
+     * lost-tick failure the probe exists to prove absent. Then RE-MASK
+     * immediately (the M5.3 determinism fix, §10.197): the continuation
+     * prints and the next excursion's setup must run masked, so the
+     * next physical fire pends deterministically and is taken at the
+     * next daifclr boundary (the next el0_done or the wait phase) —
+     * every tick's position is pinned, independent of UART timing. */
+    asm volatile("msr daifclr, #2" ::: "memory");   /* take the pended tick */
+    asm volatile("msr daifset, #2" ::: "memory");   /* re-mask for the prints */
     uart_puts("[M5] returned from EL0 -- user result=");
     print_u64(g_user_result);
     uart_puts(" (expected 0x2a = 42)\\r\\n");
     if (g_el0_excursions < 2)
         arm64_el0_activate();   /* second EL0 excursion (HIT) */
     arm64_wait_ticks(M52_TICK_TARGET);
+    /* M5.3 (§10.197): the nesting probe — a SEPARATE phase after the
+     * M5.2 gate, so the M5.2 assertions stay byte-identical. Wait for
+     * the next physical tick (TICK 5); its handler opens the nesting
+     * window and the virtual timer preempts it (TICK 6), then the gate
+     * closes at 6. The window's handler ends well inside the 100 ms
+     * physical period, so no seventh tick can land before the PSCI. */
+    uart_puts("[M5.3] nesting probe: arming the virtual timer for the "
+              "next physical tick (TICK 5)...\\r\\n");
+    arm64_wait_ticks(M53_TICK_TARGET);
     uart_puts("[M4] issuing PSCI SYSTEM_OFF\\r\\n");
     psci_system_off();
     for (;;)
