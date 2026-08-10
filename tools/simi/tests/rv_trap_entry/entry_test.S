@@ -1,16 +1,19 @@
 # tools/simi/tests/rv_trap_entry/entry_test.S — Phase 9h (ISA doc §16):
-# the trap-entry fixture's test driver. Same source, three builds, exactly
+# the trap-entry fixture's test driver. Same source, four builds, exactly
 # the kernel's own RISCV_MMODE pattern: the default build is a direct
 # M-mode payload under qemu-system-riscv64 -bios none (single hart) —
 # arms mtvec + sscratch against riscv_trap_entry_m; the -DFIXTURE_SMODE
 # build boots under OpenSBI (default -bios) at 0x80200000 — arms stvec +
 # sscratch against riscv_trap_entry; -DFIXTURE_SMODE -DFIXTURE_SMODE_INTR
 # is the same S-mode build but triggers a SUPERVISOR SOFTWARE interrupt
-# (sie.SSIE + sstatus.SIE + csrs sip, bit 63 scause) instead of ebreak,
-# proving the restore path when the exception PC is NOT advanced. All
-# builds use the REAL entry (arch/riscv/trap_riscv.S), load distinctive
-# values into every pinable GPR, trap, and verify the save/restore round
-# trip.
+# (sie.SSIE + sstatus.SIE + csrs sip, bit 63 scause) instead of ebreak;
+# -DFIXTURE_SMODE -DFIXTURE_SMODE_TIMER is the same S-mode build but
+# triggers a SUPERVISOR TIMER interrupt (STIP, via SBI_SET_TIMER + the
+# ACLINT/OpenSBI — the device-driven path, level-pending rather than
+# software-solicited). Both interrupt builds prove the restore path when
+# the exception PC is NOT advanced. All builds use the REAL entry
+# (arch/riscv/trap_riscv.S), load distinctive values into every pinable
+# GPR, trap, and verify the save/restore round trip.
 #
 # The restore+return half of the entry is the part NO kernel boot
 # exercises: every real trap in the kernel either halts (unhandled
@@ -58,25 +61,44 @@ _start:
 
     # Record what the trap must observe: the exception PC (sepc in
     # S-mode, mepc in M-mode) and the sp live at trap time. The
-    # interrupt build records &intr_site (the instruction the SSI is
-    # taken at — sepc is NOT advanced by an interrupt) and arms the
+    # interrupt builds record &intr_site (the instruction the interrupt
+    # is taken at — sepc is NOT advanced by an interrupt) and arm the
     # interrupt enables BEFORE the pins below overwrite the scratch
     # registers.
-#ifdef FIXTURE_SMODE_INTR
+#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER)
     la   t3, intr_site
     la   t4, g_expected_sepc
     sd   t3, 0(t4)
     la   t5, g_pre_trap_sp
     sd   sp, 0(t5)
-
+#endif
+#ifdef FIXTURE_SMODE_INTR
     # Enable ONLY the supervisor software interrupt: clear any pending
-    # SSIP, set sie.SSIE, set sstatus.SIE (the S-mode view of mstatus;
-    # writable from S-mode). Nothing else is enabled, so no other
-    # interrupt source can fire once SIE goes high.
+    # SSIP, set sie.SSIE. Nothing else is enabled, so no other
+    # interrupt source can fire once SIE goes high. (sstatus.SIE is
+    # raised at the trigger point below — SIE must stay OFF until then
+    # so the pending interrupt is taken at a deterministic boundary.)
     csrc sip, 2
     li   t0, 2
     csrw sie, t0
-    csrs sstatus, 2
+#elif defined(FIXTURE_SMODE_TIMER)
+    # Enable ONLY the supervisor timer interrupt, then arm the timer:
+    # SBI_SET_TIMER(0) sets mtimecmp=0, and since mtime is already past
+    # that, STIP pends IMMEDIATELY (timer interrupts are level-
+    # sensitive — they stay pending until mtimecmp is moved to the
+    # future). SIE stays OFF until the trigger point below, so the
+    # pending STIP cannot be taken early; the trap fires exactly at the
+    # first instruction boundary after SIE goes high. This is the
+    # device-driven path: the interrupt source is the ACLINT timer via
+    # OpenSBI, not a software-solicited sip bit.
+    csrc sip, 2
+    li   t0, 0x20
+    csrw sie, t0
+    li   a0, 0            # stime_value lo = 0
+    li   a1, 0            # stime_value hi = 0
+    li   a6, 0            # fid: SBI_EXT_TIME_SET_TIMER
+    li   a7, 0            # ext: SBI_EXT_TIME
+    ecall                 # -> OpenSBI programs mtimecmp=0, STIP pends
 #else
     la   t3, ebreak_site
     la   t4, g_expected_sepc
@@ -117,16 +139,28 @@ _start:
     li   t5,   0x101D
     li   t6,   0x101E
 
+#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER)
+    # Trigger the interrupt. The trap is taken at the NEXT instruction
+    # (interrupt checks happen at instruction boundaries), so
+    # sepc = &intr_site. Interrupts do NOT advance the exception PC, so
+    # the dispatcher must NOT add 4 here — and it acknowledges the
+    # interrupt before returning (csrc sip for the software interrupt,
+    # SBI_SET_TIMER(far future) for the timer), because sret restores
+    # SIE from SPIE and would otherwise re-trap immediately on the
+    # still-pending interrupt. sret then resumes exactly at intr_site,
+    # proving the restore path with an un-advanced PC.
 #ifdef FIXTURE_SMODE_INTR
-    # Raise the supervisor software interrupt. The trap is taken at the
-    # NEXT instruction (interrupt checks happen at instruction
-    # boundaries), so sepc = &intr_site. Interrupts do NOT advance the
-    # exception PC, so the dispatcher must NOT add 4 here — and it
-    # acknowledges the interrupt (csrc sip) before returning, because
-    # sret restores SIE from SPIE and would otherwise re-trap
-    # immediately on the still-pending SSIP. sret then resumes exactly
-    # at intr_site, proving the restore path with an un-advanced PC.
+    # Software interrupt: raise SSIP AND enable SIE (the arm block only
+    # set sie.SSIE; SIE must be on for the pending interrupt to be
+    # taken). Either order lands the trap at the same boundary — sepc
+    # is &intr_site either way.
     csrs sip, 2
+    csrs sstatus, 2
+#else
+    # Timer interrupt: STIP is already level-pending from the arming
+    # ecall above — raise SIE so it is taken at the next boundary.
+    csrs sstatus, 2
+#endif
 intr_site:
     # 4-BYTE nop (`.option norvc`): intr_site must be a 4-byte
     # instruction so that a hypothetical +4 sepc advance (the bug this
@@ -263,7 +297,7 @@ ebreak_site:
 #else
     csrr t5, mepc
 #endif
-#ifdef FIXTURE_SMODE_INTR
+#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER)
     la   t6, intr_site
 #else
     la   t6, ebreak_site
@@ -289,6 +323,8 @@ fail:
 .section .rodata
 #ifdef FIXTURE_SMODE_INTR
 msg_pass: .asciz "[FIXTURE] PASS: S-mode interrupt entry save/restore round-trip verified\n"
+#elif defined(FIXTURE_SMODE_TIMER)
+msg_pass: .asciz "[FIXTURE] PASS: S-mode timer entry save/restore round-trip verified\n"
 #elif defined(FIXTURE_SMODE)
 msg_pass: .asciz "[FIXTURE] PASS: S-mode entry save/restore round-trip verified\n"
 #else
