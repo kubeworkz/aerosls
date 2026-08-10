@@ -20,6 +20,8 @@
 #include "../arch/riscv/plic.h"
 #include "../arch/riscv/sbi.h"   /* sbi_arm_timer — Phase 9k periodic tick */
 #include "rv64_boot_smoke_tmo.h"
+#include "rv64_float_smoke_a_tmo.h"
+#include "rv64_float_smoke_b_tmo.h"
 
 extern void sbi_putchar(char c);
 
@@ -31,6 +33,17 @@ static void rv_boot_print_hex_rc(int rc) {
      * a single decimal digit is enough for every error code this
      * translator can return today. */
     sbi_putchar((char)('0' + (rc % 10)));
+}
+static void rv_boot_print_hex64(uint64_t v) {
+    /* Full 16-digit lowercase hex, 0x-prefixed -- the smoke asserts
+     * exact bit patterns (+inf, 20.0), so a readable full-width dump is
+     * worth the 17 bytes of buffer. */
+    static const char hexd[] = "0123456789abcdef";
+    char buf[17];
+    for (int i = 0; i < 16; i++) { buf[15 - i] = hexd[v & 0xf]; v >>= 4; }
+    buf[16] = '\0';
+    rv_boot_print("0x");
+    rv_boot_print(buf);
 }
 
 /* Dedicated trap-handling stack for hart 0 — deliberately separate from
@@ -58,6 +71,126 @@ static uint8_t g_smoke_code_buf[RV64_SMOKE_CODE_BUF_SIZE] __attribute__((aligned
  * kernel binary instead of a host test harness. scratch_ptr/rt_resolve_fn/
  * rt_objsize_fn/rt_objtype_fn are all 0 -- this program never touches r7,
  * r6, RESOLVE, OBJSIZE, or OBJTYPE, so nothing dereferences them. */
+/* Design B part 2 (ISA doc §16 Phase 16 audit addendum): translate and
+ * call an embedded .tmo, returning the value the RV translator leaves in
+ * t0 (its documented return register, simi_riscv.c's OP_RET). Shared by
+ * the float smoke below (three runs); the boot smoke keeps its own
+ * inline copy (its inline asm is heavily commented for the ebreak
+ * syscall that follows). */
+static uint64_t rv64_translate_and_call(const uint8_t* tmo, uint32_t tmo_len) {
+    uint32_t len = 0, entry_off = 0;
+    int rc = simi_riscv_translate(tmo, tmo_len, g_smoke_code_buf,
+                                  RV64_SMOKE_CODE_BUF_SIZE,
+                                  "main", 0, 0, 0, 0, &len, &entry_off);
+    if (rc != TX_RV_OK) {
+        rv_boot_print("[SIMI] translate FAILED, rc=");
+        rv_boot_print_hex_rc(rc);
+        rv_boot_print("\n");
+        return 0xDEADBEEFDEADBEEFULL;
+    }
+    typedef int64_t (*SimiEntryFn)(void);
+    SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_smoke_code_buf + entry_off);
+    register uint64_t result __asm__("t0");
+    __asm__ volatile(
+        "jalr ra, 0(%[addr])\n"
+        : "+r"(result)
+        : [addr] "r"((unsigned long)(uintptr_t)fn)
+        : "ra", "memory");
+    return result;
+}
+
+/* Design B part 2 (ISA doc §16 Phase 16 audit addendum): the FS lazy-
+ * save on REAL hardware. The kernel deliberately disables FP (FS=Off)
+ * before each owner's run; the first FP instruction of the translated
+ * program traps scause=2, riscv_trap_dispatch_common's code==2 branch
+ * saves the previous owner's live state into its fp_save row, loads the
+ * new owner's, and re-executes. The assertions (all printed, CI-
+ * greppable):
+ *   A = 1.5/0.0 -> +inf (0x7ff0000000000000) with fcsr DZ set  -- and
+ *       that exact state round-trips: after B evicts A, fp_save[0] must
+ *       hold f10=+inf AND DZ (the 33rd slot) -- the lazy save captures
+ *       more than the f-registers.
+ *   B = 10.0+10.0 -> 20.0 (0x4034000000000000), flag-free fcsr -- the
+ *       CONTRAST owner: B's saved state (evicted explicitly) must come
+ *       back clean (fcsr=0), proving each owner's row holds ITS state,
+ *       not A's.
+ *   A again (the reload path): A's state was saved at B's eviction,
+ *       so A's second run must trap AGAIN and get +inf BACK from
+ *       fp_save[0] -- the full two-owner round trip.
+ * Three lazy-saves total (A#1's cold-start, B, A#2), each logged as
+ * "[FP] lazy-save: owner X -> Y". */
+static void rv64_float_smoke_test(void) __attribute__((unused));
+static void rv64_float_smoke_test(void) {
+    struct RvPerHartData* phd = &g_hart0_data;
+    uint64_t fs_off_mask = 3ULL << 13;   /* sstatus.FS bits 14:13 = Off */
+    rv_boot_print("[FP-SMOKE] two-owner FP lazy-save round-trip (Design B part 2)...\n");
+
+    /* Reset the owner registry: both rows zeroed, owner A (0) current. */
+    for (int i = 0; i < 33; i++) { phd->fp_save[0][i] = 0; phd->fp_save[1][i] = 0; }
+    phd->fp_owner = 0;
+    phd->fp_current = 0;
+
+    /* Owner A: 1.5/0.0 = +inf, DZ. FS=Off so A's first FP instruction
+     * traps (cold start: the handler saves/loads row 0, both zeros). */
+    __asm__ volatile("csrc sstatus, %0" : : "r"(fs_off_mask) : "memory");
+    uint64_t rA = rv64_translate_and_call(g_rv64_float_smoke_a_tmo,
+                                          g_rv64_float_smoke_a_tmo_len);
+    rv_boot_print("[FP-SMOKE] owner A run: ");
+    rv_boot_print_hex64(rA);
+    rv_boot_print(rA == 0x7ff0000000000000ULL ? " = +inf PASS\n"
+                                             : " != +inf FAIL\n");
+
+    /* Switch to owner B: mark the owner, disarm FP. A's LIVE state stays
+     * in the f-registers (no eager save) -- B's first FP instruction
+     * traps and the handler writes A's state into fp_save[0]. */
+    phd->fp_owner = 1;
+    __asm__ volatile("csrc sstatus, %0" : : "r"(fs_off_mask) : "memory");
+    uint64_t rB = rv64_translate_and_call(g_rv64_float_smoke_b_tmo,
+                                          g_rv64_float_smoke_b_tmo_len);
+    rv_boot_print("[FP-SMOKE] owner B run: ");
+    rv_boot_print_hex64(rB);
+    rv_boot_print(rB == 0x4034000000000000ULL ? " = 20.0 PASS\n"
+                                              : " != 20.0 FAIL\n");
+
+    /* A was evicted into fp_save[0] by B's lazy-save trap: assert the
+     * saved row holds A's DISTINCT state (f10=+inf, fcsr DZ set). */
+    int a_saved = (phd->fp_save[0][10] == 0x7ff0000000000000ULL) &&
+                  ((phd->fp_save[0][32] & 8) != 0);
+    rv_boot_print("[FP-SMOKE] A evicted into fp_save[0]: f10=");
+    rv_boot_print_hex64(phd->fp_save[0][10]);
+    rv_boot_print(", fcsr DZ=");
+    rv_boot_print((phd->fp_save[0][32] & 8) ? "1" : "0");
+    rv_boot_print(a_saved ? " PASS\n" : " FAIL\n");
+
+    /* Evict B explicitly (FP is still Dirty from B's run) and assert its
+     * row is the CONTRAST: 20.0 with a CLEAN fcsr -- not A's state. */
+    fp_save_all(&phd->fp_save[1][0]);
+    int b_saved = (phd->fp_save[1][10] == 0x4034000000000000ULL) &&
+                  (phd->fp_save[1][32] == 0);
+    rv_boot_print("[FP-SMOKE] B evicted: fp_save[1] f10=");
+    rv_boot_print_hex64(phd->fp_save[1][10]);
+    rv_boot_print(", fcsr=0 ");
+    rv_boot_print(b_saved ? "PASS\n" : "FAIL\n");
+
+    /* Back to owner A (the reload path): A's state was saved at B's
+     * eviction, so A's second run must trap again and get +inf BACK
+     * from fp_save[0] -- the round trip closes. */
+    phd->fp_owner = 0;
+    __asm__ volatile("csrc sstatus, %0" : : "r"(fs_off_mask) : "memory");
+    uint64_t rA2 = rv64_translate_and_call(g_rv64_float_smoke_a_tmo,
+                                           g_rv64_float_smoke_a_tmo_len);
+    rv_boot_print("[FP-SMOKE] owner A reload run: ");
+    rv_boot_print_hex64(rA2);
+    rv_boot_print(rA2 == 0x7ff0000000000000ULL ? " = +inf PASS\n"
+                                               : " != +inf FAIL\n");
+
+    int all_ok = (rA == 0x7ff0000000000000ULL) && a_saved &&
+                 (rB == 0x4034000000000000ULL) && b_saved &&
+                 (rA2 == 0x7ff0000000000000ULL);
+    rv_boot_print(all_ok ? "[FP-SMOKE] round-trip: ALL PASS\n"
+                         : "[FP-SMOKE] round-trip: FAIL\n");
+}
+
 static void rv64_boot_smoke_test(void) __attribute__((unused));
 static void rv64_boot_smoke_test(void) {
     rv_boot_print("[SIMI] RV64 boot smoke test: translating rv64_boot_smoke.tmo...\n");
@@ -165,7 +298,7 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
         rv_boot_print(" (Off: FP/vector accesses trap scause=2)");
     else
         rv_boot_print(" (not Off: FP/vector would EXECUTE -- the FP-free discipline rests on the rv64_fp_census gate, not a trap)");
-    rv_boot_print(" -- the RV64 kernel is FP-free by design\n");
+    rv_boot_print(" -- RV64 kernel FP use: the sanctioned fp_save_all/fp_load_all plumbing only (Design B part 2, rv64_fp_census gate)\n");
 
     /* OpenSBI (fw_dynamic) delivers the payload to exactly one hart -- the
      * boot hart -- whose id is NOT necessarily 0 (default: the last hart,
@@ -256,6 +389,7 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
     rv_boot_print("[UART] ECHO READY: device-driven RX interrupt echo.\n");
     while (1) { asm volatile("wfi"); }
 #else
+    rv64_float_smoke_test();   /* Design B part 2 -- before the boot smoke, which powers off */
     rv64_boot_smoke_test();
 #endif
 

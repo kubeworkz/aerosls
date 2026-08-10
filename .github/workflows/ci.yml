@@ -236,12 +236,15 @@ jobs:
       - name: Build the RISC-V kernel (riscv-elf)
         run: |
           make riscv-elf
-          # Design A (ISA doc §16 Phase 16 audit addendum): the zero-FP
-          # census — the LOAD-BEARING guard. The S-mode boot runs under
-          # OpenSBI with sstatus.FS=3 (an FP instruction would EXECUTE
-          # silently there); only the bare-metal M-mode boot keeps FS=Off
-          # and traps. Either way, zero FP/vector instructions in the
-          # linked ELF is the invariant, checked across all four kernels.
+          # Design A + Design B part 2 (ISA doc §16 Phase 16 audit
+          # addendum): the function-scoped FP census — the LOAD-BEARING
+          # guard. The S-mode boot runs under OpenSBI with sstatus.FS=3
+          # (an FP instruction would EXECUTE silently there); only the
+          # bare-metal M-mode boot keeps FS=Off and traps. Design B part 2
+          # adds a deliberate, contained FP user (fp_save_all/
+          # fp_load_all, the two-owner lazy-save plumbing), so the census
+          # allow-lists exactly those two helpers and fails on ANY other
+          # FP/vector instruction — checked across all four kernels.
           bash tools/simi/tests/rv64_fp_census.sh || {
             echo "FAILED: a RISC-V kernel ELF contains FP/vector instructions (the census above prints them)" >&2
             exit 1
@@ -294,7 +297,28 @@ jobs:
             tail -30 boot_rv.log >&2
             exit 1
           }
-          echo "OK: RISC-V kernel booted, SIMI smoke executed, RV_SYS_EXIT powered off via SBI_SRST"
+          # Design B part 2: the two-owner FP lazy-save round-trip runs
+          # BEFORE the boot smoke (which powers off). The smoke disables
+          # FP (FS=Off), so each owner's first FP instruction traps
+          # scause=2 and the code==2 branch lazy-saves — proving the FS
+          # lazy-save works in S-mode too (OpenSBI normally leaves FS=3;
+          # the smoke's explicit Off is what arms the trap path here).
+          grep -a "\[FP-SMOKE\] round-trip: ALL PASS" boot_rv.log || {
+            echo "FAILED: the FP lazy-save round-trip did not pass in S-mode" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
+          grep -a "\[FP-SMOKE\] owner B run: 0x4034000000000000 = 20.0 PASS" boot_rv.log || {
+            echo "FAILED: owner B did not compute 20.0 after the lazy-save" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
+          [ "$(grep -ac '\[FP\] lazy-save:' boot_rv.log)" -eq 3 ] || {
+            echo "FAILED: expected exactly 3 lazy-saves (A cold start, B, A reload)" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
+          echo "OK: RISC-V kernel booted, FP lazy-save round-trip passed, SIMI smoke executed, RV_SYS_EXIT powered off via SBI_SRST"
 
       - name: Boot the kernel as a direct M-mode payload and assert the boot smoke + halt
         run: |
@@ -344,7 +368,27 @@ jobs:
             tail -30 boot_rv_m.log >&2
             exit 1
           }
-          echo "OK: M-mode kernel booted, SIMI smoke executed, graceful halt reached"
+          # Design B part 2: the lazy-save round-trip on the bare-metal
+          # path — FS starts at reset (Off), the smoke's first FP access
+          # traps scause=2 to the code==2 lazy-save branch, and both
+          # owners' distinct state (A: +inf + DZ; B: 20.0 clean) round-
+          # trips through their fp_save rows.
+          grep -a "\[FP-SMOKE\] round-trip: ALL PASS" boot_rv_m.log || {
+            echo "FAILED: the FP lazy-save round-trip did not pass in M-mode" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          grep -a "\[FP-SMOKE\] A evicted into fp_save\[0\]: f10=0x7ff0000000000000, fcsr DZ=1 PASS" boot_rv_m.log || {
+            echo "FAILED: A's +inf+DZ state did not survive B's eviction" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          [ "$(grep -ac '\[FP\] lazy-save:' boot_rv_m.log)" -eq 3 ] || {
+            echo "FAILED: expected exactly 3 lazy-saves (A cold start, B, A reload)" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          echo "OK: M-mode kernel booted, FP lazy-save round-trip passed, SIMI smoke executed, graceful halt reached"
 
       - name: Boot the UART-echo kernel and assert the device-driven RX interrupt echo
         run: |
@@ -454,17 +498,20 @@ jobs:
 
       - name: Teeth — RV64 FP census + trap smokes (an FP violation must fail)
         run: |
-          # The census gate proves the kernels are FP-free; this proves the
-          # gate has teeth. tools/simi/tests/rv64_fp_gate_smoke.sh injects
-          # a real fadd.d into kernel_riscv.c, rebuilds, and asserts (a)
-          # the census FAILS on the broken ELF and (b) booting the broken
-          # M-MODE kernel TRAPS with the specific FP-free diagnostic — the
-          # FS=Off backstop: [TRAP] illegal instruction (scause=2),
-          # sstatus.FS=0 ... halting hart, and the boot never reaches the
-          # SIMI smoke — then restores the tree. (The S-mode build is not
-          # boot-asserted: under OpenSBI FS=3 makes the same instruction
-          # execute silently, which is exactly why the census tooth must
-          # fire.) A gate that has gone blind fails here.
+          # The census gate proves kernel FP use stays inside the two
+          # sanctioned helpers; this proves the gate has teeth.
+          # tools/simi/tests/rv64_fp_gate_smoke.sh injects a real fadd.d
+          # into kernel_riscv.c, rebuilds, and asserts (a) the census
+          # FAILS on the broken ELF (the fadd.d is outside fp_save_all/
+          # fp_load_all) and (b) booting the broken M-MODE kernel
+          # LAZY-SAVES the FP access (the Design B part 2 path: the
+          # code==2 branch's "[FP] lazy-save:" line, then the float-smoke
+          # round-trip and the SIMI smoke still run — the boot continues,
+          # it does not halt at the trap) — then restores the tree. (The
+          # S-mode build is not boot-asserted: under OpenSBI FS=3 makes
+          # the same instruction execute silently, which is exactly why
+          # the census tooth must fire.) A gate that has gone blind fails
+          # here.
           out=$(bash tools/simi/tests/rv64_fp_gate_smoke.sh 2>&1)
           echo "$out"
           echo "$out" | grep -q "4 passed, 0 failed" || {

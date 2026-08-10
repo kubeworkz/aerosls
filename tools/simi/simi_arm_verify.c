@@ -96,6 +96,7 @@ static uint64_t mock_rt_objtype(uint64_t base_vaddr) {
 
 int main(int argc, char** argv) {
     int check_steps = 0;
+    int measure = getenv("ARM_STEPS_MEASURE") != NULL;   /* M2.75 re-measure: prints MEASURE rows instead of asserting */
     uint64_t max_steps = 10000000ull;   /* the infinite-loop/decode-bug guard */
     for (int a = 4; a < argc; a++) {
         if (strcmp(argv[a], "--steps") == 0) {
@@ -179,6 +180,12 @@ int main(int argc, char** argv) {
         memcpy(fname, base, blen - 4);
         memcpy(fname + blen - 4, ".simi", 5);
         fname[blen - 4 + 5] = '\0';
+
+        if (measure) {
+            printf("MEASURE %-24s %llu\n", fname, (unsigned long long)cpu.steps);
+            printf("PASS  %-28s = %lld  (%u bytes native code, steps measured)\n", path, result, out_len);
+            return 0;
+        }
 
         const struct FixtureBaseline* bl = NULL;
         for (size_t i = 0; i < sizeof(BASELINES) / sizeof(BASELINES[0]); i++)

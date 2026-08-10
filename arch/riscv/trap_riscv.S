@@ -138,9 +138,24 @@
     # after every other use of it is done.
     ld    s1,  64(sp)
 
-    # Finally restore the real sp (saved at offset 8) and return.
+    # Finally restore the real sp (saved at offset 8) and return. t0 was
+    # clobbered by the sp-restore (ld t0, 8(sp); mv sp, t0) -- Design B
+    # part 2 (ISA doc §16 Phase 16 audit addendum) restores t0's REAL
+    # frame value as the final act, reaching the frame through sscratch
+    # (which still holds &RvPerHartData from the csrw above -- sp no
+    # longer does, it is the faulting context's sp again). This matters
+    # the moment the re-executed instruction reads t0: the FP lazy-save
+    # re-executes the trapping FP instruction (e.g. fmv.d.x f10,t0)
+    # after the handler returns, and a stale t0 there silently fed the
+    # re-execution the exception PC instead of the faulting context's
+    # real t0 -- caught by the float smoke (owner B's 10.0 became
+    # 10.0+NX from a denormalized address). t0 is caller-saved so a
+    # C-level ABI never notices, but the re-execute-after-trap path is
+    # not an ordinary call: every register must round-trip.
     ld    t0,   8(sp)
     mv    sp, t0
+    csrr  t0, sscratch
+    ld    t0,  32(t0)      # TF_T0*8 = offset 32: the real saved t0
     \ret_insn
 .endm
 
@@ -151,3 +166,89 @@ riscv_trap_entry:
 .global riscv_trap_entry_m
 riscv_trap_entry_m:
     TRAP_ENTRY mepc, riscv_trap_dispatch_m, mret
+
+# ─── Design B part 2: the FP save/load helpers ────────────────────────────
+# The ONLY FP instructions in the kernel image (rv64_fp_census gate
+# allow-lists exactly these two functions). Callers must have
+# sstatus.FS enabled (the lazy-save handler sets FS=Dirty first) or an
+# fsd/fld inside would itself trap. f-registers are untouched except
+# the ones each helper reads/writes, so fp_save_all can be called
+# directly by kernel C (e.g. the float smoke's explicit evict) without
+# disturbing live activation FP state. A0 carries the row pointer: 32
+# f-registers at dst[0..31], fcsr at dst[32].
+
+.global fp_save_all
+fp_save_all:
+    fsd    f0,   0(a0)
+    fsd    f1,   8(a0)
+    fsd    f2,  16(a0)
+    fsd    f3,  24(a0)
+    fsd    f4,  32(a0)
+    fsd    f5,  40(a0)
+    fsd    f6,  48(a0)
+    fsd    f7,  56(a0)
+    fsd    f8,  64(a0)
+    fsd    f9,  72(a0)
+    fsd    f10, 80(a0)
+    fsd    f11, 88(a0)
+    fsd    f12, 96(a0)
+    fsd    f13,104(a0)
+    fsd    f14,112(a0)
+    fsd    f15,120(a0)
+    fsd    f16,128(a0)
+    fsd    f17,136(a0)
+    fsd    f18,144(a0)
+    fsd    f19,152(a0)
+    fsd    f20,160(a0)
+    fsd    f21,168(a0)
+    fsd    f22,176(a0)
+    fsd    f23,184(a0)
+    fsd    f24,192(a0)
+    fsd    f25,200(a0)
+    fsd    f26,208(a0)
+    fsd    f27,216(a0)
+    fsd    f28,224(a0)
+    fsd    f29,232(a0)
+    fsd    f30,240(a0)
+    fsd    f31,248(a0)
+    frcsr  t0
+    sd     t0, 256(a0)
+    ret
+
+.global fp_load_all
+fp_load_all:
+    fld    f0,   0(a0)
+    fld    f1,   8(a0)
+    fld    f2,  16(a0)
+    fld    f3,  24(a0)
+    fld    f4,  32(a0)
+    fld    f5,  40(a0)
+    fld    f6,  48(a0)
+    fld    f7,  56(a0)
+    fld    f8,  64(a0)
+    fld    f9,  72(a0)
+    fld    f10, 80(a0)
+    fld    f11, 88(a0)
+    fld    f12, 96(a0)
+    fld    f13,104(a0)
+    fld    f14,112(a0)
+    fld    f15,120(a0)
+    fld    f16,128(a0)
+    fld    f17,136(a0)
+    fld    f18,144(a0)
+    fld    f19,152(a0)
+    fld    f20,160(a0)
+    fld    f21,168(a0)
+    fld    f22,176(a0)
+    fld    f23,184(a0)
+    fld    f24,192(a0)
+    fld    f25,200(a0)
+    fld    f26,208(a0)
+    fld    f27,216(a0)
+    fld    f28,224(a0)
+    fld    f29,232(a0)
+    fld    f30,240(a0)
+    fld    f31,248(a0)
+    ld     t0, 256(a0)
+    fscsr  t0
+    ret

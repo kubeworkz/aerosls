@@ -31,15 +31,17 @@
 # separately against g_pre_trap_sp; index 31/sepc is verified separately
 # against g_expected_sepc). The dispatcher stub checks the saved frame
 # from inside the trap; this file checks the restored registers after
-# mret. t0 (TF_T0) is the one register the entry does NOT round-trip:
-# its restore is deliberately overwritten by the sp-restore scratch
-# (`ld t0, 8(sp); mv sp, t0`) — caller-saved, so ABI-legal — and this
-# file verifies its actual post-trap value (the pre-trap sp) instead.
-# t5 is the fixture's own capture pointer (the post-mret dump below) so
-# its round-trip is not directly observable — the other 29 pinned
-# registers are. gp/tp are deliberately pinned too — the C side is
-# compiled with -msmall-data-limit=0 -mno-relax so nothing addresses
-# data through gp, and tp is unused (no TLS) — see the Makefile target.
+# mret. t0 (TF_T0) now DOES round-trip: Design B part 2 (ISA doc §16
+# Phase 16 audit addendum) restored its real frame value as the
+# epilogue's final act (reaching the frame through sscratch after the
+# sp-restore clobbered it) — the re-executed-instruction path (the FP
+# lazy-save's sepc-unchanged return) depends on every register being
+# exact, so the fixture now asserts 0x1004 comes back. t5 is the
+# fixture's own capture pointer (the post-mret dump below) so its
+# round-trip is not directly observable — the other 29 pinned registers
+# are. gp/tp are deliberately pinned too — the C side is compiled with
+# -msmall-data-limit=0 -mno-relax so nothing addresses data through gp,
+# and tp is unused (no TLS) — see the Makefile target.
 .section .text.init,"ax",@progbits
 .global _start
 _start:
@@ -264,11 +266,12 @@ ebreak_site:
     # clear SSIP (else sret re-traps). Either way, arriving here with
     # the captured state correct is the PASS.
     #
-    # t0 is the ONE register the entry does not round-trip, by design:
-    # after its restore it is reused as the sp-restore scratch
-    # (trap_riscv.S: `ld t0, 8(sp); mv sp, t0`) -- caller-saved, so the
-    # ABI permits the trap to clobber it. Its post-trap value is the
-    # pre-trap sp, which we verify here.
+    # t0 now round-trips (Design B part 2): the epilogue restores its
+    # real frame value as the final act, after the sp-restore scratch
+    # (trap_riscv.S: `ld t0, 8(sp); mv sp, t0` then `csrr t0, sscratch;
+    # ld t0, 32(t0)`) -- the re-execute-after-trap path (the FP lazy-
+    # save's sepc-unchanged return) needs every register exact, so t0's
+    # pinned 0x1004 must come back.
     #
     # Scratch discipline: t5 is the universal scratch. The capture above
     # already clobbered t5 to the dump pointer, so its round-trip is
@@ -277,9 +280,8 @@ ebreak_site:
     # t4/t6 are checked against their frame slots: the dispatcher
     # verified every slot against the same constants, so
     # restored-reg != frame[i] catches a restore-offset bug.
-    la   t5, g_pre_trap_sp
-    ld   t5, 0(t5)
-    bne  t0, t5, fail              # t0 vs the pre-trap sp
+    li   t5, 0x1004
+    bne  t0, t5, fail              # t0 round-trips (Design B part 2 epilogue)
     la   t5, g_phd
     ld   t5, 224(t5)               # frame[28] (the saved t4)
     bne  t4, t5, fail

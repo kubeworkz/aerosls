@@ -78,7 +78,34 @@ struct RvPerHartData {
                                        * (66*8=528 bytes is nowhere near
                                        * enough room for a real C call
                                        * stack). */
+    /* Design B part 2 (ISA doc §16 Phase 16 audit addendum): the FP
+     * lazy-save owner registry. fp_save[owner][0..31] = f0-f31,
+     * fp_save[owner][32] = fcsr, one row per FP owner (the kernel's two
+     * activation slots). fp_owner is the owner about to run (the
+     * activation currently executing); fp_current is the owner whose
+     * state is LIVE in the FP registers right now -- the two diverge
+     * only between an owner switch (fp_owner = new, fp_current = old,
+     * sstatus.FS cleared to Off) and the new owner's first FP access,
+     * which traps scause=2 and drives the lazy-save in trap_riscv.c:
+     * save fp_current's live state, load fp_owner's saved state, fold
+     * the two together. The trap frame's TF_F0..TF_F31/TF_FCSR slots
+     * stay reserved (an eager entry-time save would write them); the
+     * lazy path uses these rows directly. */
+    uint64_t fp_save[2][33];         /* offset 536: two owners' f0-f31 + fcsr */
+    uint64_t fp_owner;               /* 0/1: the owner about to run */
+    uint64_t fp_current;             /* 0/1: owner whose state is LIVE in FP regs */
 };
+
+/* Design B part 2: the FP save/load helpers (arch/riscv/trap_riscv.S).
+ * These are the ONLY FP instructions in the whole kernel image -- the
+ * rv64_fp_census gate allows exactly fp_save_all/fp_load_all (and
+ * nothing else), so an accidental F/D instruction in kernel C still
+ * fails the census. fp_save_all: f0-f31 -> dst[0..31], fcsr -> dst[32].
+ * fp_load_all: dst[0..31] -> f0-f31, dst[32] -> fcsr. Callers must have
+ * sstatus.FS enabled (the lazy-save handler sets FS=Dirty before
+ * calling these -- an fsd/fld with FS=Off would itself trap). */
+void fp_save_all(uint64_t* dst);
+void fp_load_all(const uint64_t* src);
 
 /* Real assembly trap entry points, installed by riscv_trap_init() below
  * (stvec for the S-mode/OpenSBI boot, mtvec for a direct M-mode payload

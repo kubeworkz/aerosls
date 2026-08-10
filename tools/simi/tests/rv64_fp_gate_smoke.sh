@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 # tools/simi/tests/rv64_fp_gate_smoke.sh — teeth for the RV64 FP/vector
-# gates (ISA doc §16 Phase 16 audit addendum, Design A).
+# gates (ISA doc §16 Phase 16 audit addendum, Design A; updated for
+# Design B part 2).
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # The RV64 FP audit found the kernel's FP state is unmanaged and the
 # mode-exact reality makes the CENSUS the load-bearing guard (S-mode
 # boots under OpenSBI with sstatus.FS=3 — an FP instruction would
 # EXECUTE silently; only the bare-metal M-mode boot keeps FS=Off where
-# the dispatcher's scause=2 case traps). This smoke proves both
-# machine-checkable halves have teeth, the arm64 pattern:
+# the dispatcher's scause=2 case catches it). Design B part 2 adds a
+# deliberate, contained FP user — the fp_save_all/fp_load_all plumbing
+# behind the two-owner FS lazy-save — so the census is now a
+# function-scoped allow-list (FP ONLY inside those two helpers) and the
+# scause=2 case is a LAZY-SAVE, not a halt, for FP-family instructions
+# with FS=Off. This smoke proves both machine-checkable halves have
+# teeth, the arm64 pattern:
+#   * tooth 0 (sanity): the CLEAN kernels pass the census — the
+#     sanctioned-plumbing classification is meaningful.
 #   * tooth 1 (census): inject a real fadd.d into kernel_riscv.c,
-#     rebuild, and assert rv64_fp_census.sh FAILS on the broken ELF.
-#   * tooth 2 (backstop): boot the broken M-MODE kernel and assert the
-#     FP access TRAPS with the specific diagnostic — the fadd.d fires
-#     after riscv_trap_init armed mtvec, so the dispatcher's scause=2
-#     case prints "[TRAP] illegal instruction (scause=2),
-#     sstatus.FS=0 ... FP-free by design ... halting hart", and the
-#     boot never reaches the SIMI smoke. The S-mode build is NOT
-#     asserted here: under OpenSBI FS=3 means the same instruction
-#     executes silently — the census is the only guard there, which is
+#     rebuild, and assert rv64_fp_census.sh FAILS on the broken ELF —
+#     the injected fadd.d is outside the two sanctioned helpers, so it
+#     is caught exactly as Design A's zero-FP census caught it.
+#   * tooth 2 (lazy-save): boot the broken M-MODE kernel and assert the
+#     FP access is handled by the DESIGN B PATH — the lazy-save fires
+#     ("[FP] lazy-save:"), the boot CONTINUES (the float smoke round-
+#     trip passes and the SIMI smoke runs to its syscall) instead of
+#     halting at the trap. The S-mode build is NOT boot-asserted here:
+#     under OpenSBI FS=3 normally means the same instruction would
+#     execute silently — the census is the only guard there, which is
 #     exactly why the census tooth must fire.
 # Tooth 0 (the clean kernels pass the census) proves the teeth are
 # meaningful; the restore step leaves the tree and ELFs clean.
@@ -59,8 +68,9 @@ echo "========================="
 echo
 
 # ── tooth 0: the CLEAN kernels must pass the census (sanity — proves
-# ── the gate isn't trivially broken, so the teeth below are meaningful).
-echo "tooth 0: the clean kernels pass the zero-FP census"
+# ── the sanctioned/UNEXPECTED classification is meaningful, so the
+# ── teeth below are too).
+echo "tooth 0: the clean kernels pass the census (sanctioned plumbing only)"
 if make riscv-elf >/dev/null 2>&1 && bash "$CENSUS" >/dev/null 2>&1; then
     echo "  PASS  clean ELFs census clean"
     pass=$((pass + 1))
@@ -71,10 +81,12 @@ fi
 echo
 
 # ── tooth 1: inject a real FP instruction into kernel_riscv.c (after
-# ── riscv_trap_init arms the vector table, so the M-mode trap tooth
-# ── below routes through the dispatcher), rebuild, and assert the
-# ── CENSUS catches it.
-echo "tooth 1: an FP instruction fails the census"
+# ── riscv_trap_init arms the vector table, so the M-mode boot below
+# ── routes the access through the dispatcher), rebuild, and assert the
+# ── CENSUS catches it — the injected fadd.d is outside fp_save_all/
+# ── fp_load_all, so it must fail the gate exactly like the Design A
+# ── zero-FP census failed it.
+echo "tooth 1: an FP instruction outside the plumbing fails the census"
 sed -i "/riscv_trap_init(&g_hart0_data, trap_stack_top);/a\\
     asm volatile(\"fadd.d f10, f10, f11\" ::: \"memory\");" kernel/kernel_riscv.c
 if make riscv-elf >/dev/null 2>&1 && bash "$CENSUS" >/dev/null 2>&1; then
@@ -86,26 +98,30 @@ else
 fi
 echo
 
-# ── tooth 2: boot the broken M-MODE kernel and assert the FPEN-class
-# ── backstop: FS=Off (reset, bare metal) makes the fadd.d trap
-# ── scause=2, the dispatcher prints the specific FP-free diagnostic,
-# ── and the hart halts — the boot never reaches the SIMI smoke.
-echo "tooth 2: the broken M-mode kernel TRAPS on the FP access (FS=Off)"
+# ── tooth 2: boot the broken M-MODE kernel and assert the DESIGN B
+# ── path handles the FP access: FS=Off (reset, bare metal) makes the
+# ── injected fadd.d trap scause=2, the dispatcher's code==2 branch
+# ── LAZY-SAVES (the "[FP] lazy-save:" log line) and re-executes with
+# ── FS=Dirty — the boot CONTINUES through the float smoke round-trip
+# ── and the SIMI smoke to its syscall. The pre-Design-B halt-and-die
+# ── behavior is gone: the tooth now proves the lazy-save fires and the
+# ── kernel survives the FP access instead of proving the trap kills it.
+echo "tooth 2: the broken M-mode kernel LAZY-SAVES on the FP access (FS=Off) and continues"
 rm -f "$LOG"
 timeout 30 qemu-system-riscv64 -M virt -bios none -kernel sls_riscv_kernel_m.elf \
     -nographic -serial "file:$LOG" -no-reboot >/dev/null 2>&1
 rc=$?
 if [ "$rc" -ne 124 ]; then
-    echo "  FAIL  expected the trap halt (rc=124), got rc=$rc"
+    echo "  FAIL  expected the boot to run to its deliberate halt (rc=124), got rc=$rc"
     fail=$((fail + 1))
-elif grep -q "\[TRAP\] illegal instruction (scause=2), sstatus.FS=0" "$LOG" \
-     && grep -q "FP-free by design (rv64_fp_census gate)" "$LOG" \
-     && ! grep -q "\[SIMI\] RV64 boot smoke test" "$LOG"; then
-    echo "  PASS  the fadd.d trapped with the FP-free diagnostic (rc=124)"
+elif grep -aq "\\[FP\\] lazy-save:" "$LOG" \
+     && grep -aq "\\[FP-SMOKE\\] round-trip: ALL PASS" "$LOG" \
+     && grep -aq "\\[SYSCALL\\] SYS_SLS_EXIT, code=42" "$LOG"; then
+    echo "  PASS  the fadd.d was lazy-saved and the boot continued (round-trip + syscall)"
     pass=$((pass + 1))
 else
-    echo "  FAIL  the FP access did not trap with the specific message"
-    tail -5 "$LOG" >&2
+    echo "  FAIL  the FP access did not lazy-save-and-continue (log below)"
+    grep -a "FP-SMOKE\\|FP] lazy\\|SYSCALL\\|TRAP" "$LOG" | tail -8 >&2
     fail=$((fail + 1))
 fi
 echo
