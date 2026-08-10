@@ -314,6 +314,15 @@ RV_ELF      = sls_riscv_kernel.elf
 RV_OBJECTS_M = $(RV_OBJECTS:.rv.o=.m.rv.o)
 RV_ELF_M     = sls_riscv_kernel_m.elf
 
+# Phase 9i: the UART-echo variant (distinct .e.rv.o names) -- same S-mode
+# sources with -DKERNEL_UART_ECHO, which makes kernel_riscv_main skip the
+# SIMI smoke (it powers the machine off) and instead spin with the PLIC-
+# wired UART RX interrupt enabled, echoing every received character (see
+# kernel/kernel_riscv.c and ISA doc §16 Phase 9i). S-mode only: the echo
+# path uses sie.SEIE + the PLIC S-mode context, which bare M-mode lacks.
+RV_OBJECTS_E = $(RV_OBJECTS:.rv.o=.e.rv.o)
+RV_ELF_E     = sls_riscv_kernel_echo.elf
+
 .PHONY: all clean x86-run riscv-run plugins
 
 all: plugins x86-iso riscv-elf
@@ -441,13 +450,22 @@ x86-run: x86-iso
 %.m.rv.o: %.c
 	$(RV_CC) $(RV_CFLAGS_M) -c $< -o $@
 
-# Unique object for trap_riscv.c (see the RV_OBJECTS comment above), both
-# variants.
+%.e.rv.o: %.S
+	$(RV_CC) $(RV_CFLAGS) -DKERNEL_UART_ECHO -c $< -o $@
+
+%.e.rv.o: %.c
+	$(RV_CC) $(RV_CFLAGS) -DKERNEL_UART_ECHO -c $< -o $@
+
+# Unique object for trap_riscv.c (see the RV_OBJECTS comment above), all
+# three variants.
 arch/riscv/trap_riscv_c.rv.o: arch/riscv/trap_riscv.c
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
 
 arch/riscv/trap_riscv_c.m.rv.o: arch/riscv/trap_riscv.c
 	$(RV_CC) $(RV_CFLAGS_M) -c $< -o $@
+
+arch/riscv/trap_riscv_c.e.rv.o: arch/riscv/trap_riscv.c
+	$(RV_CC) $(RV_CFLAGS) -DKERNEL_UART_ECHO -c $< -o $@
 
 $(RV_ELF): $(RV_OBJECTS)
 	$(RV_LD) $(RV_LDFLAGS) $(RV_OBJECTS) -o $(RV_ELF)
@@ -455,7 +473,10 @@ $(RV_ELF): $(RV_OBJECTS)
 $(RV_ELF_M): $(RV_OBJECTS_M)
 	$(RV_LD) $(RV_LDFLAGS_M) $(RV_OBJECTS_M) -o $(RV_ELF_M)
 
-riscv-elf: $(RV_ELF) $(RV_ELF_M)
+$(RV_ELF_E): $(RV_OBJECTS_E)
+	$(RV_LD) $(RV_LDFLAGS) $(RV_OBJECTS_E) -o $(RV_ELF_E)
+
+riscv-elf: $(RV_ELF) $(RV_ELF_M) $(RV_ELF_E)
 
 riscv-run: riscv-elf
 	@if [ ! -f sls_storage_rv64.img ]; then qemu-img create -f raw sls_storage_rv64.img 10G; fi

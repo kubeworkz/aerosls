@@ -375,6 +375,51 @@ else
     skip=$((skip+1))
 fi
 
+# Phase 9i (ISA doc §16): the REAL kernel's first device-driven I/O — a
+# UART RX interrupt echo. The echo build (sls_riscv_kernel_echo.elf,
+# -DKERNEL_UART_ECHO) arms the PLIC for the 16550 UART at boot (source-10
+# priority, hart-0 S-mode context enable + threshold, sie.SEIE, and the
+# UART's own IER bit 0), raises sstatus.SIE, and spins; every incoming
+# character interrupts the hart through the REAL entry (riscv_trap_entry)
+# and is echoed by handle_riscv_supervisor_interrupt, which claims the
+# PLIC, drains the 16550 RBR directly, and completes. The check boots it
+# under OpenSBI with the serial port on a UNIX socket (server=on,wait=on
+# — QEMU holds the VM until the client connects, so no boot output is
+# dropped), then echo_client.py feeds a "PING" line and asserts the
+# characters came back AND the complete line reached the headless shell.
+# rc=124 (the deliberate wfi spin, killed by the timeout) is success.
+if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    if make -C ../../.. sls_riscv_kernel_echo.elf >/dev/null 2>&1; then
+        rm -f /tmp/sls_echo.sock
+        timeout 40 qemu-system-riscv64 -M virt -m 128M -smp 1 \
+            -chardev socket,id=s0,path=/tmp/sls_echo.sock,server=on,wait=on \
+            -serial chardev:s0 -kernel ../../../sls_riscv_kernel_echo.elf \
+            -nographic >rv_echo_qemu.out 2>&1 &
+        qpid=$!
+        python3 echo_client.py /tmp/sls_echo.sock >rv_echo_client.out 2>&1
+        crc=$?
+        wait $qpid
+        rc=$?
+        if [ "$rc" -eq 124 ] \
+           && [ "$crc" -eq 0 ] \
+           && grep -q "ECHO_OK" rv_echo_client.out; then
+            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  rv-uart-echo (qemu rc=$rc, client rc=$crc — echo not as expected)"
+            cat rv_echo_client.out rv_echo_qemu.out
+            fail=$((fail+1))
+        fi
+        rm -f rv_echo_client.out rv_echo_qemu.out /tmp/sls_echo.sock
+    else
+        echo "SKIP  rv-uart-echo (echo kernel build failed — check the cross toolchain)"
+        skip=$((skip+1))
+    fi
+else
+    echo "SKIP  rv-uart-echo (no qemu-system-riscv64 / riscv64-unknown-elf-gcc / python3)"
+    skip=$((skip+1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

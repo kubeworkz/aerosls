@@ -998,7 +998,13 @@ On the standard QEMU RISC-V Virt machine platform, the PLIC resides at base MMIO
 #include <stdint.h>
 
 // RISC-V Virt Board PLIC MMIO Register Bounds
-#define PLIC_BASE_VIRT        0xFFFFFFFF40003000ULL // Mapped virtual memory window
+// NOTE (Phase 9i correction): this kernel runs with paging Bare, so the
+// base is the PHYSICAL address 0x0c000000. The original draft's
+// 0xFFFFFFFF40003000 (a "mapped virtual memory window" address) exists
+// in neither QEMU virt's memory map nor this kernel, and was never
+// exercised because nothing called these functions until Phase 9i wired
+// them at boot (see AeroSLS-SIMI-ISA-v0.1.md §16 Phase 9i).
+#define PLIC_BASE_VIRT        0x0c000000UL
 #define PLIC_PRIORITY_BASE    0x0000
 #define PLIC_ENABLE_BASE      0x2000
 #define PLIC_THRESHOLD_BASE   0x200000
