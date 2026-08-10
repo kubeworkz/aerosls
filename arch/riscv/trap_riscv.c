@@ -217,10 +217,31 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
         return;
     }
 
-    /* Unhandled exception (illegal instruction, page fault, misaligned
-     * access, ecall from an unexpected mode, ...). No crash-safe recovery
-     * exists for these yet -- print diagnostics and halt rather than
-     * `sret` back into the same faulting instruction forever. */
+    if (code == 2) {
+        /* Design A (ISA doc §16 Phase 16 audit addendum): an illegal
+         * instruction. In this kernel the plausible illegal instructions
+         * are FP/vector accesses with sstatus.FS/VS=Off (the kernel is
+         * FP-free by design, rv64_fp_census-gated) or a genuinely
+         * malformed opcode. Report the actual FS state (read here in
+         * both modes: sstatus is a view of mstatus in M-mode) and halt
+         * with the specific diagnostic -- the FP-free violation must be
+         * documented and CI-greppable, not a generic unhandled line. No
+         * safe recovery exists (the arm64 FPEN trap is the same shape:
+         * loud halt, never silent corruption). */
+        uint64_t sstatus_v;
+        __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus_v));
+        uint64_t fs = (sstatus_v >> 13) & 3;
+        rv_print_str("[TRAP] illegal instruction (scause=2), sstatus.FS=");
+        rv_print_udec(fs);
+        rv_print_str(" -- an FP/vector access with FS=Off traps here. The RV64 kernel is FP-free by design (rv64_fp_census gate); halting hart.\n");
+        rv_halt();
+        return;
+    }
+
+    /* Unhandled exception (page fault, misaligned access, ecall from an
+     * unexpected mode, ...). No crash-safe recovery exists for these yet
+     * -- print diagnostics and halt rather than `sret` back into the
+     * same faulting instruction forever. */
     rv_print_str("[TRAP] unhandled exception, scause=");
     rv_print_udec(scause);
     rv_print_str(", stval=");
