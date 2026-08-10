@@ -397,9 +397,10 @@ fi
 # SBI_SRST — so QEMU must exit rc=0 (rc=124 means the exit command never
 # fired). The rapid batches must also drain with no lost bytes (the
 # claim/complete discipline under queued input). The M-mode twin below
-# does NOT pass `tick`: bare metal has no firmware to program the timer,
-# so no STIP is ever armed there — the periodic tick is an S-mode-only
-# behavior, like the readline `exit` power-off.
+# passes `tick` too (Phase 9k M-mode twin): there the timer is armed by
+# programming the CLINT mtimecmp MMIO directly — no firmware exists —
+# and taken at mtvec as MTIP (mcause = bit63 + 7), the same
+# periodic-tick protocol with the same [TICK 2] re-arm proof.
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo.sock
@@ -443,7 +444,13 @@ fi
 # `exit` has no firmware to power off with — it reports the halt and
 # spins (killed by the timeout). This is also the first real M-mode
 # INTERRUPT round trip through the entry (the entry fixture's M-mode
-# build only exercised the ebreak/advanced case).
+# build only exercised the ebreak/advanced case). The Phase 9k
+# M-mode twin arms the same 1s periodic timer by programming the CLINT
+# mtimecmp MMIO directly (physical 0x02004000 — bare metal has no
+# firmware to program a timer with) and enables mie.MTIE; the interrupt
+# arrives at mtvec as MTIP (mcause = bit63 + 7), is re-armed inside the
+# handler, and prints [TICK N] — so the client is passed `tick` here
+# too and asserts [TICK 2], proving the bare-metal timer is periodic.
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo_m.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo_m.sock
@@ -452,14 +459,14 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
             -serial chardev:s0 -kernel ../../../sls_riscv_kernel_echo_m.elf \
             -nographic >rv_echo_m_qemu.out 2>&1 &
         qpid=$!
-        python3 echo_client.py /tmp/sls_echo_m.sock >rv_echo_m_client.out 2>&1
+        python3 echo_client.py /tmp/sls_echo_m.sock tick >rv_echo_m_client.out 2>&1
         crc=$?
         wait $qpid
         rc=$?
         if [ "$rc" -eq 124 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_m_client.out; then
-            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo)"
+            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + periodic timer tick)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo-m (qemu rc=$rc, client rc=$crc — echo not as expected)"
