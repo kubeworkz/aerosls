@@ -509,6 +509,52 @@ name+hash-keyed cache with an observable HIT path.
   (the cache is a caller-side concern, exactly as x86's
   `simi_translate.c` wraps rather than modifies `simi_x86.c`).
 
+**M5.2 — GIC interrupts: the arm64 kernel's first interrupt-driven
+behavior. SCOPED (§10.194).** The deferred interrupt story from
+§10.190/§10.191, as its own milestone: a periodic tick delivered by the
+ARMv8 generic timer through the qemu virt GIC, handled in the vector
+table's EL1h IRQ slot, with a tick line and an IRQ-count tripwire — the
+RISC-V kernel's Phase 9k/9n `[TICK N]` + re-arm proof, mirrored (the
+exact analog of `sbi_arm_timer` + STIP, but with no firmware: the
+arm64 kernel programs the CNTP timer and the GIC itself).
+- **Design.** Timer: the EL1 physical generic timer (CNTP_TVAL_EL0 +
+  CNTP_CTL_EL0.ENABLE, re-armed in the handler — a one-shot never
+  delivers `[TICK 2]`, the RISC-V re-arm proof). Interrupt routing:
+  the qemu virt GIC (GICv3 expected on QEMU 8.2: distributor
+  0x08000000, redistributor 0x080A0000, CPU interface via the
+  ICC_*_EL1 sysregs — no MMIO CPU interface), programmed to put the
+  EL1 physical timer PPI in group 1 and enable it (GICD_CTLR /
+  GICD_IGROUPR0 / GICD_ISENABLER0 + ICC_SRE/IGRPEN1; the exact PPI
+  number — SBSA says 26 — and the GIC version are pinned EMPIRICALLY
+  at implementation, the spike-before-estimate discipline). The GIC
+  MMIO is low-VA, and the kernel is TTBR1-pure: mmu.c gains device
+  pages for the distributor/redistributor at high VAs, mirroring the
+  UART page (attr 0, PXN). Vector table: the EL1h IRQ slot (VBAR+0x280)
+  becomes the tick handler — acknowledge (ICC_IAR1), increment the
+  counter, re-arm, print `[TICK N]`, EOIR (ICC_EOIR1). The lower-EL IRQ
+  slot stays a stub: interrupts are masked (DAIF.I=1, SPSR 0x3c0/0x3c5)
+  during the EL0 excursions and the handler, so no IRQ can trap from
+  EL0 — honest note.
+- **Gate (planned):** after the second EL0 excursion, the continuation
+  clears DAIF.I and idles until the target tick count fires — the log
+  shows `[TICK 1]`, `[TICK 2]`, ... as an unbroken run (count ==
+  target, no missed re-arms), then PSCI SYSTEM_OFF rc=0. The tripwire
+  asserts `[TICK 2]` specifically (the re-arm proof), and the M5.1
+  gate (1 MISS / 3 HITs / four 42s) stays INTACT — ticks fire strictly
+  after the last result line. CI (arm64-guards) asserts the tick run
+  + the existing counts + rc=0. The Phase 9n 100ms contention probe
+  (tick stream interleaving with UART with zero lost ticks) is a
+  possible follow-up, not part of the gate.
+- **Honest caveats.** TCG timing is not real-time: the tripwire
+  asserts the tick COUNT and the re-arm, never wall-clock; the PPI
+  number/GIC version are pinned empirically before the design is
+  trusted (the RISC-V SBI_SRST and the M4a EL-ladder are the
+  precedents for such spikes being real); no interrupt nesting (the
+  handler runs masked, the RISC-V discipline). Sizing: ~150-200 lines
+  — mmu.c GIC device pages (~20), a new arch/arm64/gic.c (~90:
+  distributor + sysreg init + acknowledge/EOIR), timer arm + handler
+  in kernel_arm64.c (~50), the vector slot (~10), CI asserts (~10).
+
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
 from Step 6.4 applies equally here:
@@ -7272,6 +7318,106 @@ FNV-1a keying, not exercised — no upload path; the frame-leak gap
 degenerates to nothing in the fixed 4 KiB buffer). The translator core
 was untouched — the re-diff tripwire and freestanding-compile gates are
 unaffected.
+
+### 10.194 M5.2 scope: GIC interrupts — the arm64 kernel's first interrupt-driven behavior
+
+M5.2 is the deferred interrupt story from §10.190/§10.191, scoped as its
+own milestone in the established "scope before spike" shape. It is the
+arm64 analog of the RISC-V kernel's Phase 9k/9n periodic tick — but
+with NO firmware: the arm64 kernel programs the timer and the interrupt
+controller itself, the exact parallel of how the M-mode RISC-V twin
+programmed the CLINT directly. The gate mirrors the RISC-V one exactly:
+a periodic tick printed as `[TICK N]`, with `[TICK 2]` as the re-arm
+proof (a one-shot timer delivers only `[TICK 1]`), and an unbroken run
+with zero missed re-arms as the tripwire.
+
+**Timer.** The ARMv8 generic timer at EL1: write CNTP_TVAL_EL0 and set
+CNTP_CTL_EL0.ENABLE (IMASK cleared) to arm; the handler re-arms by
+writing CNTP_TVAL_EL0 again before EOIR. The EL1 physical timer is the
+right choice for an EL1 kernel (the EL2 virtual/hypervisor timers belong
+to virtualization software). qemu TCG models the generic timer; CNTPCT
+advances with the VM's virtual time.
+
+**Interrupt routing — the GIC.** On qemu `-M virt` (QEMU 8.2.2), the
+interrupt controller is a GIC; the expected config is GICv3
+(gic-version=3 is the virt default since QEMU 5.0): distributor MMIO at
+0x08000000, redistributor at 0x080A0000, and the CPU interface accessed
+via the ICC_*_EL1 system registers (ICC_SRE_EL1 to force the sysreg
+interface, ICC_IGRPEN1_EL1 to enable group 1, ICC_IAR1_EL1 to
+acknowledge, ICC_EOIR1_EL1 to end). Programming a PPI into group 1
+(non-secure) via GICD_IGROUPR0 and enabling it via GICD_ISENABLER0, plus
+GICD_CTLR.EnableGrp1. The EL1 physical timer's PPI is 26 per the ARM
+SBSA; the exact PPI number and the machine's GIC version are pinned
+EMPIRICALLY at implementation time (the spike-before-estimate
+discipline — the M4a EL-ladder and the RISC-V SBI_SRST work are the
+precedents for such probes being genuinely surprising). If the machine
+reports GICv2, the CPU interface is MMIO at 0x08010000 (GICC_CTLR/IAR/
+EOIR) instead of sysregs — a contained alternative, decided by the
+spike.
+
+**TTBR1-pure integration.** The GIC distributor/redistributor live at
+low physical addresses, and the kernel is TTBR1-pure (it never
+dereferences a low VA — the M5 discipline). mmu.c therefore gains device
+pages for 0x08000000 (distributor) and 0x080A0000 (redistributor) at
+high VAs, mirroring the UART device page exactly (MAIR attr 0
+device-nGnRnE, PXN). This is the same one-L3-table-per-device pattern
+M4c established for the PL011 at 0x09000000.
+
+**Vector table.** boot_arm64.S currently parks every IRQ slot on the
+wfi stub. M5.2 replaces the EL1h IRQ slot (VBAR+0x280) with the tick
+handler: acknowledge (read ICC_IAR1_EL1), increment a global tick
+counter, re-arm the timer, print `[TICK N]` over the UART, end (write
+ICC_EOIR1_EL1), eret. The lower-EL IRQ slot (VBAR+0x480) stays a stub:
+interrupts are masked during the EL0 excursions (SPSR_EL1 0x3c0 and the
+handler's 0x3c5 both set DAIF.I), so an IRQ can never trap from EL0 —
+stated honestly rather than silently assuming it.
+
+**Where the ticks fire.** The M5.1 boot flow runs the four entries with
+DAIF masked throughout. M5.2 inserts a tick-wait phase after the second
+EL0 excursion: the continuation clears DAIF.I (msr daifclr, #2), idles
+until the target tick count is reached, then re-masks and issues PSCI
+SYSTEM_OFF. The tick stream therefore lands strictly AFTER the last
+`returned from EL0` line, so every pre-existing assertion (banner, MMU
+walks, 1 MISS / 3 HITs, four 42s, PSCI rc=0) is untouched — the M5.1
+gate stays intact by construction, which is the milestone's own
+regression guard.
+
+**The honest gate (planned).**
+- The log shows `[TICK 1]`, `[TICK 2]`, ... as an unbroken run with
+  count == target (no missed re-arms).
+- The tripwire asserts `[TICK 2]` explicitly — the re-arm proof
+  (mirroring the RISC-V runner's `[TICK 2 Us]`).
+- Occurrence-count assertions (the §10.193 `grep -o | wc -l` lesson):
+  `[TICK N` occurrences == target, and the M5.1 counts unchanged.
+- qemu rc=0 (PSCI still powers off).
+- CI (arm64-guards) asserts the tick run + the existing counts + rc=0,
+  on cortex-a53.
+
+**Honest caveats.**
+- TCG timing is not real-time: the gate asserts the tick COUNT and the
+  re-arm, never wall-clock. The period is a knob (e.g., 50-100ms of
+  virtual time) tuned so the idle phase reliably delivers the target
+  ticks without stretching the boot.
+- The PPI number and GIC version are spiked empirically before the
+  design is trusted; the spike is a contained, one-file probe (enable
+  the timer, print whatever interrupt arrives), exactly how the M4a
+  entry-EL and the RV64 SBI_SRST findings were pinned.
+- No interrupt nesting: the handler runs with IRQs masked and erets
+  back (the RISC-V handler discipline). If a tick ever fires during an
+  EL0 excursion it would be masked and delivered on the next unmask —
+  but it cannot trap from EL0 by construction (SPSR masks IRQs), and
+  the excursions are microseconds of virtual time vs a 50ms+ period.
+- The Phase 9n 100ms contention probe (tick stream interleaving with
+  the UART with zero lost bytes) is a possible follow-up, not part of
+  this gate: the arm64 boot has no concurrent UART traffic to contend
+  with yet.
+
+**Sizing.** ~150-200 lines: mmu.c GIC device pages (~20), a new
+arch/arm64/gic.c (~90: distributor + sysreg init, acknowledge/EOIR,
+the PPI-enable), the timer arm + tick handler + idle phase in
+kernel_arm64.c (~50), the vector slot + DAIF clear in boot_arm64.S
+(~10), CI asserts (~10). The translator core and the activation cache
+are untouched.
 
 ---
 
