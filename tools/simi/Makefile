@@ -125,6 +125,18 @@ rv_trap_entry_driver_t.o: tests/rv_trap_entry/entry_test.S
 	$(RV_CC) -ffreestanding -O2 -Wall -Wextra -mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections -DFIXTURE_SMODE -DFIXTURE_SMODE_TIMER -c tests/rv_trap_entry/entry_test.S -o $@
 rv-trap-entry-test-t: rv_trap_entry_t.o rv_trap_entry_driver_t.o rv_trap_entry_asm.o
 	$(RV_LD) -T tests/rv_trap_entry/linker_fixture_s.ld -nostdlib --gc-sections rv_trap_entry_driver_t.o rv_trap_entry_t.o rv_trap_entry_asm.o -o rv_trap_entry_t.elf
+# The external-interrupt twin: S-mode build triggered by a supervisor
+# EXTERNAL interrupt (SEIP) — the 16550 UART's THRE line through the
+# PLIC/OpenSBI, the device-driven path a real peripheral takes. Same
+# un-advanced-sepc restore assertion as the SI/TIMER twins; the stub
+# acknowledges by clearing the UART IER bit and completing the PLIC
+# claim.
+rv_trap_entry_seip.o: tests/rv_trap_entry/entry_test.c
+	$(RV_CC) -ffreestanding -O2 -Wall -Wextra -mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax -msmall-data-limit=0 -ffunction-sections -fdata-sections -DFIXTURE_SMODE -DFIXTURE_SMODE_SEIP -c tests/rv_trap_entry/entry_test.c -o $@
+rv_trap_entry_driver_seip.o: tests/rv_trap_entry/entry_test.S
+	$(RV_CC) -ffreestanding -O2 -Wall -Wextra -mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections -DFIXTURE_SMODE -DFIXTURE_SMODE_SEIP -c tests/rv_trap_entry/entry_test.S -o $@
+rv-trap-entry-test-seip: rv_trap_entry_seip.o rv_trap_entry_driver_seip.o rv_trap_entry_asm.o
+	$(RV_LD) -T tests/rv_trap_entry/linker_fixture_s.ld -nostdlib --gc-sections rv_trap_entry_driver_seip.o rv_trap_entry_seip.o rv_trap_entry_asm.o -o rv_trap_entry_seip.elf
 
 # M0 (Step 7 / AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md): portable AArch64
 # (A64) translator core + a small purpose-built A64 decoder/executor
@@ -315,6 +327,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m rv-syscall-exit-test-u rv-trap-test rv_trap_entry.elf rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o rv_trap_entry_s.elf rv_trap_entry_s.o rv_trap_entry_driver_s.o rv_trap_entry_si.elf rv_trap_entry_si.o rv_trap_entry_driver_si.o rv_trap_entry_t.elf rv_trap_entry_t.o rv_trap_entry_driver_t.o tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m rv-syscall-exit-test-u rv-trap-test rv_trap_entry.elf rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o rv_trap_entry_s.elf rv_trap_entry_s.o rv_trap_entry_driver_s.o rv_trap_entry_si.elf rv_trap_entry_si.o rv_trap_entry_driver_si.o rv_trap_entry_t.elf rv_trap_entry_t.o rv_trap_entry_driver_t.o rv_trap_entry_seip.elf rv_trap_entry_seip.o rv_trap_entry_driver_seip.o tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-trap-entry-test rv-trap-entry-test-s rv-trap-entry-test-si rv-trap-entry-test-t clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-trap-entry-test rv-trap-entry-test-s rv-trap-entry-test-si rv-trap-entry-test-t rv-trap-entry-test-seip clean

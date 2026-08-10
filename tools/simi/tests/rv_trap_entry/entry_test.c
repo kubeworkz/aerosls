@@ -4,7 +4,7 @@
  * most importantly — the verification STUB the real entry calls:
  * riscv_trap_dispatch_m() in the default (M-mode) build,
  * riscv_trap_dispatch() when compiled -DFIXTURE_SMODE. Same source,
- * four builds — exactly the kernel's own RISCV_MMODE pattern.
+ * five builds — exactly the kernel's own RISCV_MMODE pattern.
  *
  * The stub runs INSIDE the trap (the entry switched sp to
  * phd->kernel_sp before calling it, a0 = &phd) and checks the
@@ -110,6 +110,8 @@ void uart_print(const char* s) {
 #define FIXTURE_MODE_TAG " (S-mode, interrupt)"
 #elif defined(FIXTURE_SMODE_TIMER)
 #define FIXTURE_MODE_TAG " (S-mode, timer)"
+#elif defined(FIXTURE_SMODE_SEIP)
+#define FIXTURE_MODE_TAG " (S-mode, external)"
 #elif defined(FIXTURE_SMODE)
 #define FIXTURE_MODE_TAG " (S-mode)"
 #else
@@ -238,6 +240,26 @@ void FIXTURE_DISPATCH_MAIN(struct RvPerHartData* phd) {
         "li a7, 0\n\t"
         "ecall"
         ::: "a0", "a1", "a6", "a7", "memory");
+#elif defined(FIXTURE_SMODE_SEIP)
+    /* External interrupt build: acknowledge by deasserting the device
+     * line (clear the UART's THRE interrupt-enable bit so the 16550
+     * stops asserting) and completing the PLIC claim for hart 0's
+     * S-mode context. External interrupts are LEVEL-pending: the PLIC
+     * holds its context line (and thus SEIP) asserted while any
+     * enabled source with priority above the threshold is pending, and
+     * sret restores SIE from SPIE (re-enabling interrupts), so a
+     * still-asserted line would re-trap immediately after the return.
+     * The trap is NOT advanced, exactly like the other interrupt
+     * twins. The claim's return value is irrelevant (10 with the line
+     * still up, 0 once the IER clear has deasserted) — the complete
+     * write is unconditional PLIC hygiene. */
+    __asm__ volatile(
+        "li   t0, 0x10000001\n\t" /* UART IER */
+        "sb   zero, 0(t0)\n\t"    /* clear THRE interrupt enable */
+        "li   t0, 0x0c201004\n\t" /* claim/complete, S-mode hart 0 */
+        "lw   t1, 0(t0)\n\t"      /* claim (source 10, or 0) */
+        "sw   t1, 0(t0)\n\t"      /* complete */
+        ::: "t0", "t1", "memory");
 #elif defined(FIXTURE_SMODE_INTR)
     /* Interrupt build: interrupts do NOT advance the exception PC, so
      * the entry must resume at the SAME instruction (intr_site) — the
