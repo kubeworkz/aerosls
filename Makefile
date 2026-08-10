@@ -331,9 +331,9 @@ RV_ELF_E     = sls_riscv_kernel_echo.elf
 RV_OBJECTS_ME = $(RV_OBJECTS:.rv.o=.m.e.rv.o)
 RV_ELF_ME     = sls_riscv_kernel_echo_m.elf
 
-.PHONY: all clean x86-run riscv-run plugins
+.PHONY: all clean x86-run riscv-run arm64-run plugins
 
-all: plugins x86-iso riscv-elf
+all: plugins x86-iso riscv-elf arm64-elf
 
 plugins: compiler/SLSAllocationPassV2.cpp
 	$(HOST_CXX) $(PLUGIN_CXXFLAGS) $(PLUGIN_LDFLAGS) $< -o $(ALLOC_PLUGIN) $(shell $(LLVM_CONFIG) --libs)
@@ -498,6 +498,43 @@ $(RV_ELF_ME): $(RV_OBJECTS_ME)
 
 riscv-elf: $(RV_ELF) $(RV_ELF_M) $(RV_ELF_E) $(RV_ELF_ME)
 
+# ── M4a: the minimal arm64 kernel (qemu-system-aarch64 -M virt) ────────
+# Plan doc §6 M4 / §10.187: the first bootable AArch64 kernel, mirroring
+# the RISC-V kernel's Phase 9 shape. sls_arm64_kernel.elf is linked at
+# 0x40080000 (the virt DRAM + 2 MiB convention), boots a banner over the
+# PL011, and powers off via PSCI SYSTEM_OFF (the SBI_SRST analog), so
+# qemu exits rc=0. -mgeneral-regs-only is the arm64 analog of the x86
+# kernel's -mno-sse: no FP/SIMD anywhere in the kernel.
+AR_CC       = aarch64-linux-gnu-gcc
+AR_LD       = aarch64-linux-gnu-ld
+AR_CFLAGS   = -ffreestanding -O2 -Wall -Wextra -march=armv8-a -I. \
+              -mgeneral-regs-only -fno-stack-protector -fno-pic -fno-pie \
+              -ffunction-sections -fdata-sections
+AR_LDFLAGS  = -T arch/arm64/linker_arm64.ld -nostdlib --gc-sections
+AR_ASM_SRC  = arch/arm64/boot_arm64.S
+AR_C_SRC    = kernel/kernel_arm64.c arch/arm64/uart_pl011.c
+AR_OBJECTS  = $(AR_ASM_SRC:.S=.ar64.o) $(AR_C_SRC:.c=.ar64.o)
+AR_ELF      = sls_arm64_kernel.elf
+
+%.ar64.o: %.S
+	$(AR_CC) $(AR_CFLAGS) -c $< -o $@
+
+%.ar64.o: %.c
+	$(AR_CC) $(AR_CFLAGS) -c $< -o $@
+
+$(AR_ELF): $(AR_OBJECTS)
+	$(AR_LD) $(AR_LDFLAGS) $(AR_OBJECTS) -o $(AR_ELF)
+
+arm64-elf: $(AR_ELF)
+
+arm64-run: arm64-elf
+	# The working M4a config, pinned empirically (§10.188): virtualization=on
+	# (NOT secure) gives the virt machine the SMC PSCI conduit and enters
+	# the payload at EL2; the head drops to EL1 and the smc routes to
+	# QEMU's PSCI emulation, so qemu exits rc=0 (the SBI_SRST analog).
+	qemu-system-aarch64 -M virt,virtualization=on -cpu cortex-a53 -m 1G \
+		-kernel $(AR_ELF) -nographic -serial file:sls_arm64_boot.log -no-reboot
+
 riscv-run: riscv-elf
 	@if [ ! -f sls_storage_rv64.img ]; then qemu-img create -f raw sls_storage_rv64.img 10G; fi
 	qemu-system-riscv64 -M virt -bios default -kernel $(RV_ELF) \
@@ -514,6 +551,7 @@ clean:
 	# one. A half-clean is worse than no clean, because it looks like a clean.
 	find . -name '*.x86.o' -not -path './.git/*' -delete
 	find . -name '*.rv.o'  -not -path './.git/*' -delete
+	find . -name '*.ar64.o' -not -path './.git/*' -delete
 	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
 	rm -f $(AB_STAMP) $(BID_STAMP)
 	rm -rf tcg-objs

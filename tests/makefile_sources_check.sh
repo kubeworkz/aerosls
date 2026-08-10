@@ -27,7 +27,8 @@ SEARCH_DIRS="kernel net drivers arch/x86"
 # to leave that out" can hide -- and it has to say why.
 declare -A EXCLUDED=(
   ["kernel/kernel_riscv.c"]="RISC-V port, not in the x86 image"
-  ["kernel/simi_arm.c"]="AArch64 translator staging copy (M3 kernel half, plan doc §6/§10.180) — no arm64 kernel build exists to link it; its honesty is enforced by the byte-identity re-diff + freestanding-compile gates, not by the x86 image"
+  ["kernel/kernel_arm64.c"]="AArch64 kernel main (M4a, plan doc §6/§10.187) — built by `make arm64-elf`, not the x86 image"
+  ["kernel/simi_arm.c"]="AArch64 translator staging copy (M3 kernel half, plan doc §6/§10.180) — linked into the arm64 kernel by M4b; its honesty is enforced by the byte-identity re-diff + freestanding-compile gates, not by the x86 image"
 )
 
 echo "=== Makefile X86_C_SRC vs the tree ==="

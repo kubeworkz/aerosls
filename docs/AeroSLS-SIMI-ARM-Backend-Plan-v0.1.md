@@ -369,8 +369,8 @@ done, staged and compile-gated (§10.180); the actual arm64 kernel
 *build* and its wiring (translate glue, paging, activation, syscall
 path) remains deliberately undone and honest.
 
-**M4 — arm64 kernel target (SCOPED — not started, §10.187).** The last
-row of the §10.184 matrix: a minimal bootable AArch64 kernel that
+**M4 — arm64 kernel target. M4a DONE (§10.188); M4b/M4c scoped (§10.187).**
+The last row of the §10.184 matrix: a minimal bootable AArch64 kernel that
 `kernel/simi_arm.c` finally links into. Scope in three sub-milestones,
 mirroring the RISC-V kernel's Phase 9 shape (self-contained qemu `-M
 virt` build, embedded .tmo boot smoke, clean power-off): M4a boots
@@ -385,14 +385,17 @@ the LINK, not re-verifying the encoder, which qemu-aarch64 already
 proved; M4c (deferred) is the arm64 MMU (VMSAv8-64: TCR/MAIR/TTBR,
 4-level walk), then user paging + interrupts + the syscall path — the
 Phase-9-equivalent honest remainder.
-- **Gate (M4a):** `qemu-system-aarch64 -M virt -cpu cortex-a53 -kernel
-  sls_arm64_kernel.elf` exits rc=0 (PSCI powered it off) with the boot
-  banner in the serial log. **Gate (M4b):** the log shows `[SIMI] entry
+- **Gate (M4a) — PASSED (§10.188):** `qemu-system-aarch64 -M
+  virt,virtualization=on -cpu cortex-a53 -kernel sls_arm64_kernel.elf`
+  exits rc=0 (PSCI powered it off) with the banner + the `[M4]`
+  exception-level line in the serial log; enforced in the arm64-guards
+  CI job (builds `make arm64-elf`, boots, asserts rc=0 + banner + EL1 +
+  PSCI line). The working machine config was itself the milestone's
+  riskiest unknown and is pinned empirically: virtualization=on (NOT
+  secure) — see §10.188. **Gate (M4b):** the log shows `[SIMI] entry
   returned (real machine code executed)` with the expected result,
   matching the four-way host value; `make arm64-elf` links
-  `kernel/simi_arm.c` into the image. Both gates enforced in the
-  arm64-guards CI job (which already installs the aarch64 toolchain;
-  it gains qemu-system-arm).
+  `kernel/simi_arm.c` into the image.
 - Sizing: boot_arm64.S ~150, linker_arm64.ld ~40, uart_pl011.c ~80,
   kernel_arm64.c ~220 (banner + boot smoke + memcpy/memset + PSCI),
   Makefile ~25, CI ~30; M4c's MMU ~250-400.
@@ -6721,6 +6724,65 @@ problems. The MMU, interrupts, and user paging are honestly deferred,
 not hidden: the kernel-copy matrix row flips NONE -> CHECK only when
 M4b's gate passes, and this record stays as the scope it was written
 against.
+
+### 10.188 M4a as built: sls_arm64_kernel.elf boots and PSCI powers it off
+
+The scope's two riskiest unknowns (§10.187) were real and were pinned
+empirically before the milestone could pass its gate. What shipped:
+
+- `arch/arm64/linker_arm64.ld` — ENTRY(_start), load base 0x40080000
+  (2 MiB into the virt DRAM), .text.init/.text/.rodata/.data/.bss with
+  the 16 KiB boot stack inside BSS (so the entry's BSS clear pre-zeros
+  it and the ELF loader maps it), `_end` symbol.
+- `arch/arm64/boot_arm64.S` — the head: BSS clear, the EL drop ladder
+  (EL3 -> EL1 and EL2 -> EL1), stack, `bl kernel_arm64_main`, panic
+  loop. adrp+add throughout, no literal pool, no stack use before
+  el1_ready.
+- `arch/arm64/uart_pl011.{c,h}` — the virt PL011 at 0x09000000, polled
+  TX only, minimal init (QEMU resets it already enabled at 8n1; the
+  divisor/line-control registers are a documented M4a scope cut).
+- `kernel/kernel_arm64.c` — banner, the `[M4]` exception-level line
+  (`mrs CurrentEL`), PSCI SYSTEM_OFF (0x84000008 via `smc #0`), panic
+  fallback. Compiled -mgeneral-regs-only, no FP/SIMD, no libc.
+- Makefile: `arm64-elf` (AR_CC=aarch64-linux-gnu-gcc, AR_CFLAGS with
+  -march=armv8-a -mgeneral-regs-only, AR_LDFLAGS with the linker
+  script) + `arm64-run`; added to `all` and `clean` like riscv-elf.
+  `makefile_sources_check` gained the kernel/kernel_arm64.c exclusion
+  ("AArch64 kernel main — built by make arm64-elf, not the x86 image").
+- CI: the arm64-guards job installs qemu-system-arm + binutils, builds
+  `make arm64-elf`, boots, and asserts rc=0 + the banner + the EL1 line
+  + the PSCI farewell — the riscv-guards SBI_SRST discipline mirrored.
+
+The empirical pins — the part the scope flagged as risky and was right
+to flag:
+
+1. **Entry EL depends on the machine config.** Default `-M virt` enters
+   the -kernel payload at EL1; `secure=on` enters at EL3; `secure=on
+   +virtualization=on` enters at EL3 and the EL3 eret is unreliable in
+   TCG. The WORKING configuration is `-machine virt,virtualization=on`
+   (secure OFF): the machine's PSCI conduit logic (QEMU 8.2.2
+   hw/arm/virt.c: `secure && firmware_loaded` -> DISABLED, `virt` ->
+   SMC, else HVC) makes the conduit SMC, and the payload enters at EL2,
+   where the head's HCR_EL2.RW=0x80000000 + eret drop lands it at EL1.
+2. **SCR_EL3 resets to 0, i.e. secure AArch32 lower ELs.** An EL3 -> EL1
+   eret without `SCR_EL3 = NS|RW (0x401)` does not leave EL3 (the
+   exception log: "from EL3 to EL3, ELR = the eret target"). With it
+   set, the drop works — but under secure=on the subsequent smc is
+   delivered to an EMPTY EL3 vector (VBAR_EL3=0, no firmware), not to
+   QEMU's PSCI emulation, because arm_is_psci_call only fires when the
+   conduit is SMC. Hence virtualization=on, not secure=on.
+3. **PSCI SYSTEM_OFF is intercepted by QEMU at exception delivery**
+   (target/arm/helper.c arm_cpu_do_interrupt: `arm_is_psci_call` ->
+   arm_handle_psci_call when TCG + conduit match) — no firmware
+   required. The kernel's `smc #0` with x0=0x84000008 from non-secure
+   EL1 powers the machine off and qemu exits rc=0.
+
+Verified: `make arm64-elf` builds clean (the RWX-segment ld warning is
+expected — no MMU, so no NX in M4a); three consecutive boots each exit
+rc=0 with the banner, `[M4] exception level: EL1`, and the PSCI
+farewell in the serial log. M4a's gate is CI-enforced in arm64-guards.
+M4b (link kernel/simi_arm.c + the embedded .tmo smoke) is next; M4c
+(MMU, interrupts, user paging) remains the honest remainder.
 
 ---
 
