@@ -1,17 +1,20 @@
 # tools/simi/tests/rv_trap_entry/entry_test.S — Phase 9h (ISA doc §16):
-# the bare-metal trap-entry fixture's test driver. Runs as a direct
-# M-mode payload under qemu-system-riscv64 -bios none (single hart), the
-# same boot mode the M-mode kernel uses. It arms mtvec + sscratch against
-# the REAL entry (arch/riscv/trap_riscv.S), loads distinctive values into
-# every pinable GPR, traps via ebreak, and then verifies the entry's
-# save/restore round trip.
+# the trap-entry fixture's test driver. Same source, two builds, exactly
+# the kernel's own RISCV_MMODE pattern: the default build is a direct
+# M-mode payload under qemu-system-riscv64 -bios none (single hart) —
+# arms mtvec + sscratch against riscv_trap_entry_m; the -DFIXTURE_SMODE
+# build boots under OpenSBI (default -bios) at 0x80200000 — arms stvec +
+# sscratch against riscv_trap_entry. Both use the REAL entry
+# (arch/riscv/trap_riscv.S), load distinctive values into every pinable
+# GPR, trap via ebreak, and verify the entry's save/restore round trip.
 #
 # The restore+return half of the entry is the part NO kernel boot
 # exercises: every real trap in the kernel either halts (unhandled
 # exception, M-mode exit) or powers the machine off (S-mode exit) — so
-# the `ld` restore sequence, the mepc restore (dispatcher-advanced), the
-# sscratch re-arm, the sp restore, and mret have never executed anywhere
-# until this fixture's dispatcher stub (entry_test.c) RETURNS.
+# the `ld` restore sequence, the exception-PC restore
+# (dispatcher-advanced), the sscratch re-arm, the sp restore, and
+# sret/mret have never executed anywhere until this fixture's dispatcher
+# stub (entry_test.c) RETURNS.
 #
 # Register pinning: every GPR the entry saves is loaded with a
 # distinctive value — TF index i carries 0x1000+i for i in 0..30 (x2/sp
@@ -33,17 +36,25 @@
 _start:
     la   sp, _stack_top
 
-    # Point sscratch at the fixture's RvPerHartData, arm mtvec with the
-    # real M-mode entry, and give the entry a real kernel trap stack.
+    # Point sscratch at the fixture's RvPerHartData, arm the mode's
+    # trap vector with the real entry (stvec/riscv_trap_entry under
+    # OpenSBI, mtvec/riscv_trap_entry_m bare-metal — both emitted by
+    # trap_riscv.S), and give the entry a real kernel trap stack.
     la   t0, g_phd
     csrw sscratch, t0
+#ifdef FIXTURE_SMODE
+    la   t1, riscv_trap_entry
+    csrw stvec, t1
+#else
     la   t1, riscv_trap_entry_m
     csrw mtvec, t1
+#endif
     la   t2, _stack_top
     sd   t2, 256(t0)          # kernel_sp (offset 256) = stack top
 
-    # Record what the trap must observe: the ebreak's address (mepc) and
-    # the sp live at trap time.
+    # Record what the trap must observe: the ebreak's address (the
+    # exception PC: sepc in S-mode, mepc in M-mode) and the sp live at
+    # trap time.
     la   t3, ebreak_site
     la   t4, g_expected_sepc
     sd   t3, 0(t4)
@@ -86,7 +97,7 @@ ebreak_site:
     # ebreak, FORCED to the 4-byte form. The dispatcher advances the
     # exception PC by 4 (the kernel's documented contract, trap_riscv.c);
     # with the C extension enabled the plain `ebreak` mnemonic assembles
-    # to the 2-byte compressed 0x9002, and mepc+4 would land MID-
+    # to the 2-byte compressed 0x9002, and PC+4 would land MID-
     # INSTRUCTION (a real latent bug the fixture exposed in the kernel's
     # own trigger too -- kernel/kernel_riscv.c). `.option norvc` pins
     # the 32-bit 0x00100073 so the +4 resume is exact.
@@ -133,9 +144,9 @@ ebreak_site:
     sd   t6, 232(t5)
 
     # Now the checks; registers may be clobbered freely.
-    # If the dispatcher did NOT advance mepc past the ebreak, we never
-    # get here (mret re-traps on the same ebreak forever -> the runner
-    # sees a hang with no PASS, i.e. a failure).
+    # If the dispatcher did NOT advance the exception PC past the
+    # ebreak, we never get here (sret/mret re-traps on the same ebreak
+    # forever -> the runner sees a hang with no PASS, i.e. a failure).
     #
     # t0 is the ONE register the entry does not round-trip, by design:
     # after its restore it is reused as the sp-restore scratch
@@ -208,5 +219,9 @@ fail:
     j    halt
 
 .section .rodata
+#ifdef FIXTURE_SMODE
+msg_pass: .asciz "[FIXTURE] PASS: S-mode entry save/restore round-trip verified\n"
+#else
 msg_pass: .asciz "[FIXTURE] PASS: entry save/restore round-trip verified\n"
+#endif
 msg_fail: .asciz "[FIXTURE] FAIL: register round-trip mismatch\n"

@@ -39,28 +39,59 @@ int sbi_getchar(void) {
 
 #else /* S-mode under OpenSBI */
 
+/* SBI DBCN (v2.0 spec 4.2) carries its buffer addresses as lo/hi 32-bit
+ * pairs: a1=base_lo, a2=base_hi, a3=written/read_lo, a4=written/read_hi.
+ * The generic 3-arg sbi_call() cannot express this -- passing the
+ * written-count pointer as arg2 would put it in a2 (base_hi), corrupting
+ * the base address so the call always errors. That was the actual state
+ * of the code below until the trap-entry fixture exposed it (ISA doc
+ * §16 Phase 9h): DBCN always failed and printing rode on the legacy
+ * fallback, which this OpenSBI build (v1.3) still serves despite the
+ * spec deprecation. On RV64/Sv39 the hi halves are 0. */
+static struct SBIReturn sbi_dbcn(unsigned long fid, unsigned long num_bytes,
+                                 unsigned long base_addr, unsigned long count_addr) {
+    struct SBIReturn ret;
+    register unsigned long a0 __asm__("a0") = num_bytes;
+    register unsigned long a1 __asm__("a1") = base_addr & 0xFFFFFFFFUL; /* base_lo */
+    register unsigned long a2 __asm__("a2") = 0;                        /* base_hi */
+    register unsigned long a3 __asm__("a3") = count_addr & 0xFFFFFFFFUL; /* count_lo */
+    register unsigned long a4 __asm__("a4") = 0;                        /* count_hi */
+    register unsigned long a6 __asm__("a6") = fid;
+    register unsigned long a7 __asm__("a7") = SBI_EXT_DBCN;
+    __asm__ volatile("ecall"
+                     : "+r"(a0), "+r"(a1)
+                     : "r"(a2), "r"(a3), "r"(a4), "r"(a6), "r"(a7)
+                     : "memory");
+    ret.error = a0;
+    ret.value = a1;
+    return ret;
+}
+
 void sbi_putchar(char c) {
-    /* OpenSBI >= 0.9 removed the legacy console putchar extension
-     * (SBI_EXT_0_1_CONSOLE_PUTCHAR) for S-mode guests -- the call is
-     * silently dropped, so a kernel printing through it appears mute.
-     * Use the Debug Console extension (SBI_DBCN) instead, with the
-     * legacy call as a fallback for older firmwares. */
+    /* Debug Console extension write; falls back to the legacy SBI v0.1
+     * console putchar (still served by OpenSBI v1.3 despite the spec
+     * deprecation) for firmwares without DBCN. Only the RETURN is
+     * trusted: OpenSBI v1.3 emits the byte and returns error 0 but
+     * does not reliably write the byte count back to the a3 address
+     * (observed empirically by the trap-entry fixture, ISA doc §16
+     * Phase 9h), so checking the count would double-print via the
+     * fallback. */
     char buf = c;
     unsigned long written = 0;
-    struct SBIReturn ret = sbi_call(SBI_EXT_DBCN, SBI_DBCN_WRITE,
-                                    1, (unsigned long)&buf, (unsigned long)&written);
+    struct SBIReturn ret = sbi_dbcn(SBI_DBCN_WRITE, 1,
+                                    (unsigned long)&buf, (unsigned long)&written);
     if (ret.error == 0) return;
     sbi_call(SBI_EXT_0_1_CONSOLE_PUTCHAR, 0, c, 0, 0);
 }
 
 int sbi_getchar(void) {
-    /* Same story as sbi_putchar: legacy getchar is gone for S-mode
-     * guests, so read via SBI_DBCN with a legacy fallback. Returns -1
-     * when no character is currently waiting in the UART buffer. */
+    /* Same shape as sbi_putchar: DBCN read with a legacy fallback.
+     * Returns -1 when no character is currently waiting in the UART
+     * buffer. */
     char buf = 0;
     unsigned long got = 0;
-    struct SBIReturn ret = sbi_call(SBI_EXT_DBCN, SBI_DBCN_READ,
-                                    1, (unsigned long)&buf, (unsigned long)&got);
+    struct SBIReturn ret = sbi_dbcn(SBI_DBCN_READ, 1,
+                                    (unsigned long)&buf, (unsigned long)&got);
     if (ret.error == 0 && got > 0) return (int)(unsigned char)buf;
     struct SBIReturn legacy = sbi_call(SBI_EXT_0_1_CONSOLE_GETCHAR, 0, 0, 0, 0);
     return (int)legacy.error;
