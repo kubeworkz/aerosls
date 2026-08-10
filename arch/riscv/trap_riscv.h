@@ -41,6 +41,13 @@
 
 #include <stdint.h>
 
+/* Design B part 3 (ISA doc §16): how many FP owners the lazy-save
+ * registry can hold -- the N-task ready queue's task count is 3, so 4
+ * gives the round-robin headroom. Must stay >= the kernel's task count
+ * (kernel_riscv.c's RV_TASK_COUNT); the struct-size _Static_assert in
+ * trap_riscv.c pins the resulting RvPerHartData layout. */
+#define RV_FP_OWNERS 4
+
 /* Index into trap_frame[] for each general-purpose register — x0 (zero)
  * is never saved (hardwired zero, saving it would be pointless), so
  * these indices skip it entirely: index 0 is x1 (ra), not x0. */
@@ -80,9 +87,12 @@ struct RvPerHartData {
                                        * stack). */
     /* Design B part 2 (ISA doc §16 Phase 16 audit addendum): the FP
      * lazy-save owner registry. fp_save[owner][0..31] = f0-f31,
-     * fp_save[owner][32] = fcsr, one row per FP owner (the kernel's two
-     * activation slots). fp_owner is the owner about to run (the
-     * activation currently executing); fp_current is the owner whose
+     * fp_save[owner][32] = fcsr, one row per FP owner. Part 3's N-task
+     * ready queue raised the registry from 2 rows to RV_FP_OWNERS (the
+     * round-robin runs 3 tasks, so 4 leaves headroom); the &1 masks the
+     * lazy-save path and switch used for two owners are gone -- owners
+     * are now full 0..RV_FP_OWNERS-1 ids. fp_owner is the owner about to
+     * run (the task currently executing); fp_current is the owner whose
      * state is LIVE in the FP registers right now -- the two diverge
      * only between an owner switch (fp_owner = new, fp_current = old,
      * sstatus.FS cleared to Off) and the new owner's first FP access,
@@ -91,9 +101,9 @@ struct RvPerHartData {
      * the two together. The trap frame's TF_F0..TF_F31/TF_FCSR slots
      * stay reserved (an eager entry-time save would write them); the
      * lazy path uses these rows directly. */
-    uint64_t fp_save[2][33];         /* offset 536: two owners' f0-f31 + fcsr */
-    uint64_t fp_owner;               /* 0/1: the owner about to run */
-    uint64_t fp_current;             /* 0/1: owner whose state is LIVE in FP regs */
+    uint64_t fp_save[RV_FP_OWNERS][33];  /* offset 536: N owners' f0-f31 + fcsr */
+    uint64_t fp_owner;               /* 0..RV_FP_OWNERS-1: the owner about to run */
+    uint64_t fp_current;             /* 0..RV_FP_OWNERS-1: owner whose state is LIVE in FP regs */
 };
 
 /* Design B part 2: the FP save/load helpers (arch/riscv/trap_riscv.S).
@@ -108,7 +118,7 @@ void fp_save_all(uint64_t* dst);
 void fp_load_all(const uint64_t* src);
 
 /* Design B part 3: how many FS lazy-saves have fired since boot
- * (trap_riscv.c). The two-task round-robin asserts its delta across the
+ * (trap_riscv.c). The N-task ready queue asserts its delta across the
  * demo — one lazy-save per task-slice, because each switch disarms FP.
  * Kernel-internal; the host twin never builds the lazy-save branch. */
 extern uint64_t g_fp_lazy_count;

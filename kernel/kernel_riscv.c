@@ -199,8 +199,8 @@ static void rv64_float_smoke_test(void) {
                          : "[FP-SMOKE] round-trip: FAIL\n");
 }
 
-/* ─── Design B part 3 (ISA doc §16 Phase 16 audit addendum): the
- * two-task FP round-robin — the context switch finally gets real
+/* ─── Design B part 3 (ISA doc §16 Phase 16 audit addendum) + the
+ * N-task ready-queue follow-up: the context switch finally gets real
  * callers. perform_riscv_context_switch (arch/riscv/context_riscv.S)
  * has been dead code since Phase 9c and GPR-only (the audit, Finding 2:
  * "the context switch is GPR-only AND dead code"). This section gives
@@ -210,10 +210,25 @@ static void rv64_float_smoke_test(void) {
  * performs the coroutine switch. The tick marks each slice boundary
  * (g_rv_slice_expired, set in sbi.c), so the round-robin is tick-
  * cadenced like Phase 9l's modeled table — but with REAL register
- * contexts and REAL per-task FP state. */
+ * contexts and REAL per-task FP state. The follow-up generalizes the
+ * two-task demo into an N-task ready queue: a task array + round-robin
+ * cursor (rv_schedule_next skips `done` tasks), a generic runner
+ * (rv_fp_task_common) driven by a per-task spec table, and a handoff
+ * back to the boot context when no task remains runnable. The FP owner
+ * registry grows with it: fp_save rows are now RV_FP_OWNERS (trap_riscv.h)
+ * and the &1 two-owner masks are gone — owners are full 0..N-1 ids. */
+#define RV_TASK_COUNT 3
+
 static struct RvTask g_rv_main_ctx;    /* the boot context (suspended while tasks run) */
-static struct RvTask g_rv_task_a;
-static struct RvTask g_rv_task_b;
+static struct RvTask g_rv_tasks[RV_TASK_COUNT];
+
+/* The N-task scheduler state: g_rv_cursor is the index of the task that
+ * last ran (the next pick starts just after it); g_rv_current is the
+ * running task, or NULL while the boot context runs (set by
+ * rv_task_switch_fp before each switch so a resumed task can identify
+ * itself -- the only task identity a coroutine entry needs). */
+static uint64_t g_rv_cursor;
+static struct RvTask* g_rv_current;
 
 /* The time-slice boundary marker (context_riscv.h): written by the tick
  * handler (sbi.c), polled+cleared by the running task at its slice
@@ -230,9 +245,10 @@ static void rv_task_init(struct RvTask* t, void (*fn)(void), uint64_t owner,
     sp[0] = (uint64_t)(uintptr_t)fn;   /* ra: the task entry */
     for (int i = 1; i < 14; i++) sp[i] = 0;
     t->rsp = (uint64_t)(uintptr_t)sp;
-    t->fp_owner = owner & 1;
+    t->fp_owner = owner;   /* full owner id, 0..RV_FP_OWNERS-1 */
     t->name = name;
     t->slices = 0;
+    t->done = 0;
 }
 
 /* The FP-aware task switch — the switch's only intended caller. Saves
@@ -250,12 +266,14 @@ static void rv_task_switch_fp(struct RvTask* cur, struct RvTask* next) {
     __asm__ volatile("csrr %0, sstatus" : "=r"(sst));
     /* FS=Dirty first: an fsd with FS=Off would itself trap. */
     __asm__ volatile("csrw sstatus, %0" : : "r"(sst | (3ULL << 13)) : "memory");
-    uint64_t live = phd->fp_current & 1;
+    uint64_t live = phd->fp_current;   /* full owner id */
     fp_save_all(&phd->fp_save[live][0]);
-    uint64_t no = next->fp_owner & 1;
+    uint64_t no = next->fp_owner;
     fp_load_all(&phd->fp_save[no][0]);
     phd->fp_owner = no;
     phd->fp_current = no;
+    g_rv_current = (next == &g_rv_main_ctx) ? NULL : next;  /* the resumed
+                                      * task identifies itself via this */
     /* FS=Off: the incoming task's first FP instruction lazy-saves. */
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     perform_riscv_context_switch(cur, next);
@@ -263,38 +281,85 @@ static void rv_task_switch_fp(struct RvTask* cur, struct RvTask* next) {
      * left it here; FS is Off again (that switch disarmed it). */
 }
 
-/* The FP work of the two tasks — the ONLY FP instructions outside the
+/* The ready-queue pick: advance the cursor and return the next task
+ * that has not finished; NULL when every task is done (the yield then
+ * hands control back to the boot context). */
+static struct RvTask* rv_schedule_next(void) {
+    for (uint64_t i = 1; i <= RV_TASK_COUNT; i++) {
+        struct RvTask* t = &g_rv_tasks[(g_rv_cursor + i) % RV_TASK_COUNT];
+        if (!t->done) { g_rv_cursor = (g_rv_cursor + i) % RV_TASK_COUNT; return t; }
+    }
+    return NULL;
+}
+
+/* Yield: run the next ready task, or go back to the boot context when
+ * none is left. */
+static void rv_task_yield(struct RvTask* cur) {
+    struct RvTask* next = rv_schedule_next();
+    rv_task_switch_fp(cur, next ? next : &g_rv_main_ctx);
+}
+
+/* The FP work of the tasks — the ONLY FP instructions outside the
  * fp_save_all/fp_load_all plumbing, and the rv64_fp_census allow-list
- * sanctions exactly these two functions (an injected fadd.d in any
- * other kernel function still fails the gate). Each slice does one
- * fadd.d accumulating the task's step into f10, reads it back with
- * fmv.x.d, asserts the exact bit pattern (the per-slice expected
+ * sanctions exactly rv_fp_task_common (an injected fadd.d in any other
+ * kernel function still fails the gate). One generic runner drives all
+ * N tasks off a per-task spec (step, expected bit patterns, name): each
+ * slice does one fadd.d accumulating the task's step into f10, reads it
+ * back with fmv.x.d, asserts the exact bit pattern (the expected
  * constants are precomputed double(s) bit patterns — no FP conversion
  * needed in C), then waits for the tick's slice-boundary flag and
- * yields to the partner task. Because every switch disarms FP, each
- * slice's first fadd.d traps and lazy-saves — one trap per slice. */
+ * yields to the next ready task. Because every switch disarms FP, each
+ * slice's first fadd.d traps and lazy-saves — one trap per slice. The
+ * step constant rides in a GPR and is materialized INSIDE the asm via
+ * fmv.d.x into scratch ft0: the compiler therefore sees no FP value
+ * live in this function, so it cannot hoist a loop-invariant double
+ * into callee-saved fs0 (which would put a compiler-generated fld in
+ * the epilogue AFTER the handback switch disarms FS -- the spurious
+ * 11th lazy-save that broke the per-slice trap count). The only FP
+ * instructions in this function are the asm blocks themselves. */
 #define RV_TASK_SLICES 5
 
-static void rv_fp_task_a(void);
-static void rv_fp_task_b(void);
+struct RvTaskSpec {
+    uint64_t step;            /* f10 += step per slice, as double bits */
+    const uint64_t* exp;      /* RV_TASK_SLICES expected f10 bit patterns */
+    const char* name;         /* "fp-a" / "fp-b" / "fp-c" for the [TASK] log */
+};
 
-static void rv_fp_task_a(void) {
-    /* Task A's accumulator: f10 += 1.0 per slice -> 1.0..5.0. The step
-     * constant rides in a GPR and is materialized INSIDE the asm via
-     * fmv.d.x into scratch ft0: the compiler therefore sees no FP value
-     * live in this function, so it cannot hoist a loop-invariant double
-     * into callee-saved fs0 (which would put a compiler-generated fld in
-     * the epilogue AFTER the handback switch disarms FS -- the spurious
-     * 11th lazy-save that broke the per-slice trap count). The only FP
-     * instructions in this function are the asm blocks themselves. */
-    static const uint64_t exp[RV_TASK_SLICES] = {
-        0x3FF0000000000000ULL, /* 1.0 */
-        0x4000000000000000ULL, /* 2.0 */
-        0x4008000000000000ULL, /* 3.0 */
-        0x4010000000000000ULL, /* 4.0 */
-        0x4014000000000000ULL, /* 5.0 */
-    };
-    uint64_t step = 0x3FF0000000000000ULL;   /* 1.0, as bits */
+/* Task A: f10 += 1.0 -> 1.0..5.0. Task B: f10 += 0.5 -> 0.5..2.5.
+ * Task C: f10 += 0.25 -> 0.25..1.25 — the CONTRAST owner: after every
+ * switch back, each task's f10 must be ITS OWN value, never another
+ * task's — that is the round-trip proof with N owners in the registry. */
+static const uint64_t g_rv_exp_a[RV_TASK_SLICES] = {
+    0x3FF0000000000000ULL, /* 1.0 */
+    0x4000000000000000ULL, /* 2.0 */
+    0x4008000000000000ULL, /* 3.0 */
+    0x4010000000000000ULL, /* 4.0 */
+    0x4014000000000000ULL, /* 5.0 */
+};
+static const uint64_t g_rv_exp_b[RV_TASK_SLICES] = {
+    0x3FE0000000000000ULL, /* 0.5 */
+    0x3FF0000000000000ULL, /* 1.0 */
+    0x3FF8000000000000ULL, /* 1.5 */
+    0x4000000000000000ULL, /* 2.0 */
+    0x4004000000000000ULL, /* 2.5 */
+};
+static const uint64_t g_rv_exp_c[RV_TASK_SLICES] = {
+    0x3FD0000000000000ULL, /* 0.25 */
+    0x3FE0000000000000ULL, /* 0.5 */
+    0x3FE8000000000000ULL, /* 0.75 */
+    0x3FF0000000000000ULL, /* 1.0 */
+    0x3FF4000000000000ULL, /* 1.25 */
+};
+static const struct RvTaskSpec g_rv_spec[RV_TASK_COUNT] = {
+    { 0x3FF0000000000000ULL, g_rv_exp_a, "fp-a" },   /* += 1.0   -> 1.0..5.0  */
+    { 0x3FE0000000000000ULL, g_rv_exp_b, "fp-b" },   /* += 0.5   -> 0.5..2.5  */
+    { 0x3FD0000000000000ULL, g_rv_exp_c, "fp-c" },   /* += 0.25  -> 0.25..1.25 */
+};
+
+static void rv_fp_task_common(void) {
+    struct RvTask* me = g_rv_current;   /* set by the switch that entered us */
+    uint64_t idx = (uint64_t)(me - g_rv_tasks);
+    const struct RvTaskSpec* sp = &g_rv_spec[idx];
     for (int s = 0; s < RV_TASK_SLICES; s++) {
         uint64_t got;
         __asm__ volatile(
@@ -302,68 +367,37 @@ static void rv_fp_task_a(void) {
             "fadd.d f10, f10, ft0\n\t"
             "fmv.x.d %0, f10\n\t"
             : "=r"(got)
-            : "r"(step)
+            : "r"(sp->step)
             : "ft0", "f10", "memory");
-        g_rv_task_a.slices++;
-        rv_boot_print("[TASK] fp-a slice ");
+        me->slices++;
+        rv_boot_print("[TASK] ");
+        rv_boot_print(sp->name);
+        rv_boot_print(" slice ");
         rv_boot_print_udec64((uint64_t)(s + 1));
         rv_boot_print(": ");
         rv_boot_print_hex64(got);
-        rv_boot_print(got == exp[s] ? " PASS\n" : " FAIL\n");
+        rv_boot_print(got == sp->exp[s] ? " PASS\n" : " FAIL\n");
         while (!g_rv_slice_expired) { __asm__ volatile("wfi"); }
         g_rv_slice_expired = 0;
-        rv_task_switch_fp(&g_rv_task_a, &g_rv_task_b);
+        rv_task_yield(me);
     }
-    /* All slices done: hand back to the boot context. */
-    rv_task_switch_fp(&g_rv_task_a, &g_rv_main_ctx);
+    /* All slices done: mark finished and let the queue decide — the
+     * next ready task runs, or control returns to the boot context. */
+    me->done = 1;
+    rv_task_yield(me);
 }
 
-static void rv_fp_task_b(void) {
-    /* Task B's accumulator: f10 += 0.5 per slice -> 0.5..2.5 — the
-     * CONTRAST owner: after every switch back, B's f10 must be ITS own
-     * value, never A's 1.0/2.0/... — that is the round-trip proof. Same
-     * GPR-step discipline as task A (see above): no FP value lives in
-     * this function outside the asm blocks, so no compiler-generated
-     * FP spill runs after the disarm. */
-    static const uint64_t exp[RV_TASK_SLICES] = {
-        0x3FE0000000000000ULL, /* 0.5 */
-        0x3FF0000000000000ULL, /* 1.0 */
-        0x3FF8000000000000ULL, /* 1.5 */
-        0x4000000000000000ULL, /* 2.0 */
-        0x4004000000000000ULL, /* 2.5 */
-    };
-    uint64_t step = 0x3FE0000000000000ULL;   /* 0.5, as bits */
-    for (int s = 0; s < RV_TASK_SLICES; s++) {
-        uint64_t got;
-        __asm__ volatile(
-            "fmv.d.x ft0, %1\n\t"
-            "fadd.d f10, f10, ft0\n\t"
-            "fmv.x.d %0, f10\n\t"
-            : "=r"(got)
-            : "r"(step)
-            : "ft0", "f10", "memory");
-        g_rv_task_b.slices++;
-        rv_boot_print("[TASK] fp-b slice ");
-        rv_boot_print_udec64((uint64_t)(s + 1));
-        rv_boot_print(": ");
-        rv_boot_print_hex64(got);
-        rv_boot_print(got == exp[s] ? " PASS\n" : " FAIL\n");
-        while (!g_rv_slice_expired) { __asm__ volatile("wfi"); }
-        g_rv_slice_expired = 0;
-        rv_task_switch_fp(&g_rv_task_b, &g_rv_task_a);
-    }
-    rv_task_switch_fp(&g_rv_task_b, &g_rv_main_ctx);
-}
-
-/* The demo driver: reset the FP registry (the float smoke left row 0 =
- * +inf and row 1 = 20.0), initialize the two tasks, run the round-robin
- * at a fast 100ms tick cadence, then assert the FINAL fp_save rows and
- * the lazy-save delta (one per task-slice = 2*RV_TASK_SLICES = 10). */
+/* The demo driver: reset the FP registry (the float smoke left rows 0/1
+ * holding its +inf/20.0 state), initialize the N-task ready queue, run
+ * the round-robin at a fast 100ms tick cadence, then assert the FINAL
+ * fp_save rows (one per task owner) and the lazy-save delta (one per
+ * task-slice = RV_TASK_COUNT*RV_TASK_SLICES = 15). */
 static void rv_fp_round_robin_demo(void) __attribute__((unused)); /* the echo build never calls it (wfi loop) */
 static void rv_fp_round_robin_demo(void) {
     struct RvPerHartData* phd = &g_hart0_data;
-    rv_boot_print("[TASK] two-task FP round-robin (real register contexts, Design B part 3)...\n");
-    for (int i = 0; i < 33; i++) { phd->fp_save[0][i] = 0; phd->fp_save[1][i] = 0; }
+    rv_boot_print("[TASK] three-task FP ready queue (real register contexts, Design B part 3)...\n");
+    for (uint64_t o = 0; o < RV_FP_OWNERS; o++)
+        for (int i = 0; i < 33; i++) phd->fp_save[o][i] = 0;
     phd->fp_owner = 0;
     phd->fp_current = 0;
     /* Make the registry honest: fp_current=0 claims "the physical FP
@@ -375,28 +409,34 @@ static void rv_fp_round_robin_demo(void) {
     __asm__ volatile("csrr %0, sstatus" : "=r"(sst));
     __asm__ volatile("csrw sstatus, %0" : : "r"(sst | (3ULL << 13)) : "memory");
     fp_load_all(&phd->fp_save[0][0]);
-    rv_task_init(&g_rv_task_a, rv_fp_task_a, 0, "fp-a");
-    rv_task_init(&g_rv_task_b, rv_fp_task_b, 1, "fp-b");
+    g_rv_cursor = 0;                   /* task 0 is about to run: the first
+                                         * yield picks (0+1)%N = task 1 */
+    g_rv_current = NULL;               /* boot context runs the driver */
+    for (uint64_t i = 0; i < RV_TASK_COUNT; i++)
+        rv_task_init(&g_rv_tasks[i], rv_fp_task_common, i, g_rv_spec[i].name);
     uint64_t lazy_before = g_fp_lazy_count;
     sbi_set_tick_period(1000000UL);   /* 100ms slices for the demo */
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
-    rv_task_switch_fp(&g_rv_main_ctx, &g_rv_task_a);
-    /* Back here when task A finishes its slices and hands control back. */
+    rv_task_switch_fp(&g_rv_main_ctx, &g_rv_tasks[0]);
+    /* Back here when the last task finishes and no ready task remains. */
     sbi_set_tick_period(0);
     uint64_t lazy_delta = g_fp_lazy_count - lazy_before;
     int rows_ok = (phd->fp_save[0][10] == 0x4014000000000000ULL) &&  /* A: 5.0 */
-                  (phd->fp_save[1][10] == 0x4004000000000000ULL);    /* B: 2.5 */
-    int lazy_ok = (lazy_delta == 2 * RV_TASK_SLICES);
+                  (phd->fp_save[1][10] == 0x4004000000000000ULL) &&  /* B: 2.5 */
+                  (phd->fp_save[2][10] == 0x3FF4000000000000ULL);    /* C: 1.25 */
+    int lazy_ok = (lazy_delta == RV_TASK_COUNT * RV_TASK_SLICES);
     rv_boot_print("[TASK] fp_save rows: A=");
     rv_boot_print_hex64(phd->fp_save[0][10]);
     rv_boot_print(" B=");
     rv_boot_print_hex64(phd->fp_save[1][10]);
+    rv_boot_print(" C=");
+    rv_boot_print_hex64(phd->fp_save[2][10]);
     rv_boot_print(rows_ok ? " PASS;" : " FAIL;");
     rv_boot_print(" lazy-saves during demo: ");
     rv_boot_print_udec64(lazy_delta);
     rv_boot_print(lazy_ok ? " PASS\n" : " FAIL\n");
-    rv_boot_print(rows_ok && lazy_ok ? "[TASK] round-robin: ALL PASS\n"
-                                     : "[TASK] round-robin: FAIL\n");
+    rv_boot_print(rows_ok && lazy_ok ? "[TASK] ready queue: ALL PASS\n"
+                                     : "[TASK] ready queue: FAIL\n");
 }
 
 static void rv64_boot_smoke_test(void) __attribute__((unused));
@@ -598,7 +638,7 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
     while (1) { asm volatile("wfi"); }
 #else
     rv64_float_smoke_test();     /* Design B part 2 -- before the boot smoke, which powers off */
-    rv_fp_round_robin_demo();    /* Design B part 3 -- the two-task FP round-robin */
+    rv_fp_round_robin_demo();    /* Design B part 3 -- the N-task FP ready queue */
     rv64_boot_smoke_test();
 #endif
 
