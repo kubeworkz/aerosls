@@ -562,12 +562,34 @@ arm64 kernel programs the CNTP timer and the GIC itself).
   ticks, zero missed re-arms, on a57 + a53; CI asserts the ordered
   stream itself. Measured EL0 windows ~760-790 ms vs the 100 ms period
   (host-speed-dependent margin; the TCG not-real-time caveat holds).
+- **Nested-IRQ probe (M5.3, §10.197) — DONE:** the contention probe
+  extends to interrupt NESTING. After the M5.2 gate, the next physical
+  tick (TICK 5) opens a bounded unmasked window inside ITS OWN handler
+  with the VIRTUAL timer (CNTV, a different GIC INTID at higher
+  priority) armed for 10 ms; the virtual fire (TICK 6) preempts the
+  physical handler mid-window — proving the EL1h IRQ entry's
+  ELR_EL1/SPSR_EL1 save/restore. Same-PPI nesting is impossible
+  (GICv2 running-priority: an interrupt cannot preempt its own active
+  instance) and the spike showed qemu's lax same-PPI re-entry corrupts
+  the GIC (double-activation/EOIR of one INTID → hang), so the
+  virtual timer is the honest second source. The probe's deepest
+  finding: the kernel boots in the SECURE world, and qemu's GICv2
+  hides group-1 interrupts from a secure IAR read (returns 1022
+  without GICC_CTLR.AckCtl) — M5.2's "group 1" ticks were spurious
+  1022s all along; both timers moved to group 0 (the secure group),
+  the honest config for a secure kernel. Gate: the M5.2 phase stays
+  byte-identical, then `[TICK 5] → nesting window → [TICK 6] →
+  nested marker → gate at 6` — deterministic across 5/5 runs on a57 +
+  a53; CI asserts the full ordered stream.
 - **Honest caveats.** TCG timing is not real-time: the tripwire
   asserts the tick COUNT and the re-arm, never wall-clock; the PPI
   number/GIC version are pinned empirically before the design is
   trusted (the RISC-V SBI_SRST and the M4a EL-ladder are the
-  precedents for such spikes being real); no interrupt nesting (the
-  handler runs masked, the RISC-V discipline). Sizing: ~150-200 lines
+  precedents for such spikes being real); nesting is proven only via
+  the virtual timer (the same-PPI case is architecturally impossible)
+  and only in the EL1h handler (the lower-EL IRQ slot stays a stub:
+  SPSR masks IRQs during the EL0 excursions, as scoped in §10.194).
+  Sizing: ~150-200 lines
   — mmu.c GIC device pages (~20), a new arch/arm64/gic.c (~90:
   distributor + sysreg init + acknowledge/EOIR), timer arm + handler
   in kernel_arm64.c (~50), the vector slot (~10), CI asserts (~10).
@@ -7614,6 +7636,105 @@ EL0 window exceeding the period, which the 1e8-iteration loop makes
 slot stays a stub (SPSR masks IRQs during the EL0 excursions, as
 scoped in §10.194). The kernel stack is 256 KiB and the boot now takes
 ~2 s — no gate-impacting cost.
+
+### 10.197 M5.3 as built: interrupt NESTING — the virtual timer preempts the physical handler
+
+M5.3 extends the M5.2 contention probe to interrupt nesting: unmask
+IRQs inside the tick handler and assert the handler re-enters cleanly
+when a second tick fires during it. The spike-before-estimate
+discipline found the design three times over — each finding a real
+bug, one of them in M5.2 itself.
+
+**The same-PPI spike: architecturally impossible AND empirically
+broken.** The naive reading (unmask inside the physical handler, let
+the same PPI fire again) was spiked first. qemu's GICv2 model DOES
+re-enter the same PPI (its running-priority rule is lax), printing the
+nested line — but the boot then hangs (rc=124): the nested handler
+re-arms and the double-activation/double-EOIR of the same INTID
+corrupts the GIC state, breaking the tick stream. The architecture
+agrees: GICv2's running-priority rule means an interrupt cannot
+preempt its own active instance. The honest nested source is a
+DIFFERENT interrupt at a higher priority — the ARM generic timer's
+VIRTUAL timer (CNTV), PPI 11 → INTID 27, at GIC priority 0x00 vs the
+physical's 0x80.
+
+**Finding 1 — M5.2's ticks were spurious 1022s all along (group
+semantics).** The virtual timer stormed (13516 IRQs, the first
+physical handler never completing), and instrumenting the IAR read
+showed the storm entries returning 1022, not 27 or 30. qemu's
+`gic_get_current_irq` returns 1022 — the "spurious" value normally
+reserved for 1023-class reads — when the pending interrupt is group 1
+and the access is SECURE without GICC_CTLR.AckCtl (bit 2) set. This
+kernel boots at EL1 in the SECURE world (qemu's -kernel path leaves
+SCR_EL3.NS=0), so every GIC MMIO access is secure. The consequence is
+retroactive: M5.2's group-1 configuration never delivered a real
+interrupt — every IAR read returned 1022, and the gate passed only
+because the handler re-armed the timer and the level deasserted, so
+the cadence looked right. The fix: move BOTH timer PPIs to group 0
+(the secure group — the default), which a secure access acknowledges
+directly with no AckCtl and which matches real-hardware semantics for
+a secure kernel. Group 0 works in both qemu configs (see Finding 3).
+
+**Finding 2 — the classic nested-exception bug: the EL1h IRQ entry
+must save/restore ELR_EL1/SPSR_EL1.** With real delivery, the nested
+flow almost worked — TICK 1 → window → TICK 2 (virtual) → nested
+marker — but the continuation never resumed after TICK 1's handler.
+When the virtual IRQ preempts the physical handler's spin, the
+hardware overwrites ELR_EL1/SPSR_EL1 with the spin's PC/state; the
+nested eret resumes the spin fine, but the OUTER entry's eret then
+reads the stale spin PC and loops in the handler tail. The fix is the
+textbook one: `arm64_irq_el1h` grows to save/restore ELR_EL1/SPSR_EL1
+(the frame is now 20 x 8 = 160 bytes; the restore runs with I masked
+— the handler re-masks before returning — so no IRQ can clobber the
+restored values before the eret).
+
+**Finding 3 — the local-vs-CI config split (and why the local PSCI
+"hang" was a config artifact, not a kernel bug).** The nested build
+hung at PSCI SYSTEM_OFF locally (rc=124) but the CI-equivalent config
+passed. The cause: CI boots `-M virt,virtualization=on` (NON-secure
+EL1 — the §10.188 finding, where qemu's PSCI emulation intercepts the
+SMC), while the plain `-M virt` used for local bring-up boots SECURE
+EL1, where the SMC is NOT intercepted and qemu never powers off. The
+group-0 fix works in both configs; the local runs moved to the CI
+config for honest parity with the gate.
+
+**The window + the M5.2-phase determinism fix.** The first restructure
+put the unmasked nesting window inside TICK 1's handler, and the slow
+UART prints stretched that handler past the 100 ms physical period —
+T3/T4 landed in the excursion-2 setup, a fragile run-order-dependent
+pattern (5-run determinism check: 3 of 5 streams differed). Two
+changes made it deterministic: (a) the M5.2 gate stays BYTE-IDENTICAL
+(the window moved OUT of TICK 1's handler into a separate phase after
+the gate — TICK 5 physical opens the window, TICK 6 virtual preempts,
+gate at 6), and (b) `arm64_el0_done` now re-masks IMMEDIATELY after
+taking the pended tick, so every tick's take is pinned to a daifclr
+boundary and the continuation's prints + the next excursion's setup
+run masked — the next physical fire pends deterministically regardless
+of UART timing. The window is a 10 ms spin (`arm_timer_cntfrq() / 100`,
+not a hardcoded count — CNTFRQ is 6.25 MHz under the CI config, and
+the hardcoded 3125000 was a 500 ms window). 5/5 runs are byte-identical
+on both a53 and a57.
+
+**Gate (M5.3) — PASSED:** the full ordered stream is
+`eret → [TICK 1] → eret → [TICK 2] → [TICK 3] → [TICK 4] → gate (4) →
+[TICK 5] → nesting window → [TICK 6] → nested marker → gate (6) →
+PSCI SYSTEM_OFF`, rc=0 on a57 + a53, deterministic across 5/5 runs.
+The M5.1 counts are untouched (1 MISS / 3 HITs / four 42s) and the
+exception discipline is exactly 6 IRQ (4 physical + TICK 5 + the
+nested TICK 6) + 2 SVC + 1 PSCI smc, no strays. CI (arm64-guards)
+asserts the full nested stream, the 6-tick count, and the M5.3
+markers.
+
+**Honest caveats.** Nesting is proven only for the virtual-timer
+source (the same-PPI case is architecturally impossible and
+empirically broken — recorded, not papered over); the nesting window
+is an unmasked 10 ms spin inside the EL1h handler, so a stray IRQ in
+that window re-enters the handler (bounded: the spin is well under the
+physical period); the lower-EL IRQ slot remains a stub (EL0 runs
+masked by design); and the group-0 finding means the kernel's GIC
+programming now targets the secure group — correct for this
+Secure-world kernel, and a documented divergence from a hypothetical
+NS EL1 kernel's group-1 layout.
 
 ---
 

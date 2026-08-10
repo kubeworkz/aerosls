@@ -455,7 +455,7 @@ jobs:
             exit 1
           }
 
-      - name: Build the M4a+M4b+M4c+M5+M5.1+M5.2 arm64 kernel and assert the boot + TTBR1/EL0 paging + activation cache + GIC ticks + SIMI smoke + PSCI shutdown
+      - name: Build the M4a+M4b+M4c+M5+M5.1+M5.2+M5.3 arm64 kernel and assert the boot + TTBR1/EL0 paging + activation cache + GIC ticks + nested-IRQ probe + SIMI smoke + PSCI shutdown
         run: |
           # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
           # first bootable AArch64 kernel — banner over the PL011, then
@@ -598,8 +598,8 @@ jobs:
           # order — a lost tick (a level-sensitive GIC line deasserted
           # before being taken) would break the sequence or hang the
           # gate. The M5.1 counts above are untouched by construction.
-          [ "$(grep -ao '\[TICK [0-9]' arm64_boot.log | wc -l)" -eq 4 ] || {
-            echo "FAILED: expected exactly FOUR tick lines ([TICK 1..4], unbroken run)" >&2
+          [ "$(grep -ao '\[TICK [0-9]' arm64_boot.log | wc -l)" -eq 6 ] || {
+            echo "FAILED: expected exactly SIX tick lines ([TICK 1..6], unbroken run)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
@@ -608,10 +608,23 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached' arm64_boot.log)
-          want=$'[M5] eret into EL0...\n[TICK 1]\n[M5] eret into EL0...\n[TICK 2]\n[TICK 3]\n[TICK 4]\ntick gate reached'
+          # M5.3 (plan doc §10.197): the NESTED-IRQ probe. After the
+          # M5.2 gate, the next physical tick ([TICK 5]) opens a bounded
+          # unmasked window inside ITS OWN handler with the virtual
+          # timer (CNTV, a DIFFERENT GIC INTID at higher priority —
+          # same-PPI nesting is impossible, GICv2 running-priority, and
+          # the spike proved qemu's lax same-PPI re-entry corrupts the
+          # GIC) armed for 10 ms; [TICK 6] preempts the physical
+          # handler mid-window, proving the EL1h IRQ entry's
+          # ELR_EL1/SPSR_EL1 save/restore (a nested fire overwrites
+          # both with the spin's PC; without the save/restore the outer
+          # eret returns to the stale spin and loops). The ordered
+          # stream asserts the whole M5.2 interleave + the nesting
+          # phase, in this exact order.
+          seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached|nesting window|nested: virtual timer preempted' arm64_boot.log)
+          want=$'[M5] eret into EL0...\n[TICK 1]\n[M5] eret into EL0...\n[TICK 2]\n[TICK 3]\n[TICK 4]\ntick gate reached\n[TICK 5]\nnesting window\n[TICK 6]\nnested: virtual timer preempted\ntick gate reached'
           [ "$seq" = "$want" ] || {
-            echo "FAILED: the tick stream does not interleave with the EL0 excursions (a tick was lost, duplicated, or taken out of order)" >&2
+            echo "FAILED: the tick stream does not interleave with the EL0 excursions and the M5.3 nested phase (a tick was lost, duplicated, or taken out of order)" >&2
             echo "--- got:" >&2
             echo "$seq" >&2
             echo "--- want:" >&2
@@ -619,7 +632,7 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + contention-probe GIC ticks [TICK 1..4] interleaved with the EL0 excursions + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
+          echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2+M5.3 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + contention-probe GIC ticks [TICK 1..4] interleaved with the EL0 excursions + nested virtual-timer IRQ ([TICK 5] window, [TICK 6] preempts the physical handler) + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |

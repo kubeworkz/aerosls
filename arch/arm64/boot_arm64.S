@@ -256,9 +256,20 @@ arm64_vectors:
  * values in any register, so the entry saves everything it will clobber
  * — the caller-saved x0-x17 plus x30 (the C handler preserves the
  * callee-saved x19-x28/x29 per the ABI, and SP is untouched) — calls
- * arm64_tick_irq, restores, erets. 18 * 8 = 144 bytes, 16-aligned. */
+ * arm64_tick_irq, restores, erets. 18 * 8 = 144 bytes, 16-aligned.
+ *
+ * M5.3 nesting (§10.197): the entry ALSO saves ELR_EL1/SPSR_EL1.
+ * Without that, a NESTED IRQ (the M5.3 virtual timer preempting the
+ * physical handler's spin) overwrites ELR_EL1/SPSR_EL1 with the spin's
+ * PC/state, and the outer entry's eret then returns to the stale spin
+ * PC — the handler tail loops instead of returning to the interrupted
+ * continuation. The save/restore happens with I masked (the handler
+ * re-masks before returning), so no IRQ can clobber the restored
+ * values before the eret. 20 * 8 = 160 bytes, 16-aligned; layout:
+ * x0-x17 at [0..127], x30 at [136], ELR_EL1 at [144], SPSR_EL1 at
+ * [152]. */
 arm64_irq_el1h:
-    sub     sp, sp, #(18 * 8)
+    sub     sp, sp, #(20 * 8)
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -269,7 +280,15 @@ arm64_irq_el1h:
     stp     x14, x15, [sp, #112]
     stp     x16, x17, [sp, #128]
     str     x30, [sp, #136]
+    mrs     x16, elr_el1
+    str     x16, [sp, #144]
+    mrs     x16, spsr_el1
+    str     x16, [sp, #152]
     bl      arm64_tick_irq
+    ldr     x16, [sp, #152]
+    msr     spsr_el1, x16
+    ldr     x16, [sp, #144]
+    msr     elr_el1, x16
     ldp     x0, x1, [sp, #0]
     ldp     x2, x3, [sp, #16]
     ldp     x4, x5, [sp, #32]
@@ -280,7 +299,7 @@ arm64_irq_el1h:
     ldp     x14, x15, [sp, #112]
     ldp     x16, x17, [sp, #128]
     ldr     x30, [sp, #136]
-    add     sp, sp, #(18 * 8)
+    add     sp, sp, #(20 * 8)
     eret
 
 /* SVC from the EL0 SIMI program: the trampoline `br x30`-ed into a
