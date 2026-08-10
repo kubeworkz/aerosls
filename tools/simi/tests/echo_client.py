@@ -30,18 +30,21 @@ queued bytes and must drain completely (every char echoed, every line
 dispatched) no matter how many interrupts they split into -- pinning
 claim/complete discipline under rapid input.
 
-Optional second argument "tick" (Phase 9k/9l; passed by BOTH runners --
-the S-mode kernel arms the timer via the stimecmp CSR, the M-mode twin
-via the CLINT mtimecmp MMIO): after the IRQ tripwire, wait for [TICK 2]
-(printed AFTER the re-arm, so it proves the timer is genuinely
-periodic -- a one-shot arm would deliver at most [TICK 1] and go
-silent), then send `tasks` and assert the Phase 9l time-slicing
+Optional second argument "tick" (Phase 9k/9l/9m; passed by BOTH runners
+-- the S-mode kernel arms the timer via the stimecmp CSR, the M-mode
+twin via the CLINT mtimecmp MMIO): after the IRQ tripwire, wait for
+[TICK 2] (printed AFTER the re-arm, so it proves the timer is
+genuinely periodic -- a one-shot arm would deliver at most [TICK 1]
+and go silent), then send `tasks` and assert the Phase 9l time-slicing
 invariant: the four round-robin tasks' slice counts are within 1 of
 each other (true at every instant of a fair rotation), at least one
 slice has run, and [SLICE ...] markers appear in the stream -- the
-per-tick preemption exposed over the UART. (The tick waits are placed
-before the command loop so the assertions run while the machine is
-still on; `exit` below powers it off.)
+per-tick preemption exposed over the UART. The tick line also carries
+Phase 9m wall-clock uptime ([TICK N Us], seconds from rdtime), which
+the client asserts stays consistent with the tick count (U >= N,
+monotone). (The tick waits are placed before the command loop so the
+assertions run while the machine is still on; `exit` below powers it
+off.)
 
 Usage: python3 echo_client.py /path/to/serial.sock [tick]
 
@@ -127,8 +130,11 @@ def main() -> int:
     tick_mode = len(sys.argv) > 2 and sys.argv[2] == "tick"
     tasks_ok = False
     if tick_mode:
-        buf = recv_until(s, buf, b"[TICK 2]", 8)
-        if b"[TICK 2]" not in buf:
+        # Phase 9m: the tick line is now [TICK N Us] (wall-clock seconds
+        # appended), so the marker is the tick-2 prefix up to the space
+        # before the seconds — the old exact [TICK 2] no longer exists.
+        buf = recv_until(s, buf, b"[TICK 2 ", 8)
+        if b"[TICK 2 " not in buf:
             print("FAIL: periodic timer tick never reached [TICK 2]")
             print(buf.decode(errors="replace"))
             return 1
@@ -184,12 +190,37 @@ def main() -> int:
 
     text = buf.decode(errors="replace")
     print(text[-1300:])
+
+    # Phase 9m wall-clock tripwire (tick mode only): every tick line now
+    # carries the uptime in seconds derived from rdtime (the `time` CSR
+    # / mtime at the shared 10 MHz timebase), e.g. [TICK 2 2s]. Parse
+    # every observed pair and assert the wall clock is CONSISTENT with
+    # the tick count: at tick N the machine has run at least N seconds
+    # (a 1s-period, drift-free timer cannot report fewer elapsed seconds
+    # than ticks fired), and the reported uptime never goes backwards
+    # (monotone non-decreasing in stream order). A bare tick counter
+    # would pass these trivially; only real rdtime-derived seconds can.
+    up_ok = True
+    if tick_mode:
+        pairs = [(int(a), int(b)) for a, b in
+                 re.findall(r"\[TICK (\d+) (\d+)s\]", text)]
+        prev_up = None
+        for tn, up in pairs:
+            if up < tn or (prev_up is not None and up < prev_up):
+                up_ok = False
+                break
+            prev_up = up
+        if not pairs or not up_ok:
+            up_ok = False
+            print("FAIL: wall-clock uptime not consistent with ticks (pairs=%r)" % pairs)
+            return 1
+
     ok = (b"[IRQ#1]" in buf) and (b"[IRQ#2]" in buf) and (b"[IRQ#3]" in buf) and \
          (b'unknown command: "ABC"' in buf) and \
          (b"[HELP] commands:" in buf) and \
          (b'unknown command: "PINX"' in buf) and \
          (b"[ECHO] hello world" in buf) and \
-         (not tick_mode or b"[TICK 2]" in buf) and \
+         (not tick_mode or b"[TICK 2 " in buf) and \
          (not tick_mode or tasks_ok)
     if ok:
         msg = ("ECHO_OK: interrupt tripwire pinned (1 keystroke -> 1 IRQ "
@@ -198,7 +229,8 @@ def main() -> int:
         if tick_mode:
             msg += (", periodic timer tick proven ([TICK 2] after re-arm), "
                     "round-robin time-slicing proven (tasks table, "
-                    "fair rotation max-min <= 1)")
+                    "fair rotation max-min <= 1), wall-clock uptime "
+                    "proven ([TICK N Us] consistent, monotone)")
         print(msg)
     else:
         print("FAIL: interrupt-tripwire / readline / dispatch markers not all observed")

@@ -389,7 +389,7 @@ fi
 # (three isolated keystrokes must each produce EXACTLY one interrupt —
 # the kernel prints [IRQ#N] after its complete(), so the assertion is
 # deterministic), the Phase 9k periodic-timer tripwire (the client is
-# passed `tick`, so it waits for [TICK 2] — printed after the STIP
+# passed `tick`, so it waits for [TICK 2 Us] — printed after the STIP
 # handler re-arms the next tick, proving the 1s timer is periodic, not
 # one-shot), plus the full readline + command-loop protocol: help, a
 # backspace-edited CR-only line (PING\bX -> the unknown command PINX),
@@ -400,7 +400,7 @@ fi
 # passes `tick` too (Phase 9k M-mode twin): there the timer is armed by
 # programming the CLINT mtimecmp MMIO directly — no firmware exists —
 # and taken at mtvec as MTIP (mcause = bit63 + 7), the same
-# periodic-tick protocol with the same [TICK 2] re-arm proof.
+# periodic-tick protocol with the same [TICK 2 Us] re-arm proof.
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo.sock
@@ -416,7 +416,7 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
         if [ "$rc" -eq 0 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_client.out; then
-            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing)"
+            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing + wall-clock uptime)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo (qemu rc=$rc, client rc=$crc — echo not as expected)"
@@ -450,7 +450,7 @@ fi
 # firmware to program a timer with) and enables mie.MTIE; the interrupt
 # arrives at mtvec as MTIP (mcause = bit63 + 7), is re-armed inside the
 # handler, and prints [TICK N] — so the client is passed `tick` here
-# too and asserts [TICK 2], proving the bare-metal timer is periodic.
+# too and asserts [TICK 2 Us], proving the bare-metal timer is periodic.
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo_m.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo_m.sock
@@ -466,7 +466,7 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
         if [ "$rc" -eq 124 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_m_client.out; then
-            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing)"
+            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing + wall-clock uptime)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo-m (qemu rc=$rc, client rc=$crc — echo not as expected)"

@@ -406,9 +406,19 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
             shell_print("[SLICE ");
             shell_print(g_tasks[ran].name);
             shell_print("]\r\n");
+            /* Phase 9m: the tick line now carries wall-clock uptime in
+             * seconds, derived from the same timebase that arms the
+             * timer (`time` CSR in S-mode, `time`/mtime in M-mode —
+             * rv_rdtime reads the shared 10 MHz clock, so seconds =
+             * ticks / SBI_TIMER_TICKS_PER_SEC). The client asserts the
+             * wall clock stays consistent with the tick count: at tick
+             * N the machine has run at least N seconds, and the
+             * reported uptime never goes backwards. */
             shell_print("[TICK ");
             shell_print_udec(g_tick_count);
-            shell_print("]\r\n");
+            shell_print(" ");
+            shell_print_udec(rv_rdtime() / SBI_TIMER_TICKS_PER_SEC);
+            shell_print("s]\r\n");
 #endif
             return;
         }
