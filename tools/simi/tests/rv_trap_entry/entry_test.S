@@ -1,5 +1,5 @@
 # tools/simi/tests/rv_trap_entry/entry_test.S — Phase 9h (ISA doc §16):
-# the trap-entry fixture's test driver. Same source, four builds, exactly
+# the trap-entry fixture's test driver. Same source, five builds, exactly
 # the kernel's own RISCV_MMODE pattern: the default build is a direct
 # M-mode payload under qemu-system-riscv64 -bios none (single hart) —
 # arms mtvec + sscratch against riscv_trap_entry_m; the -DFIXTURE_SMODE
@@ -9,9 +9,11 @@
 # (sie.SSIE + sstatus.SIE + csrs sip, bit 63 scause) instead of ebreak;
 # -DFIXTURE_SMODE -DFIXTURE_SMODE_TIMER is the same S-mode build but
 # triggers a SUPERVISOR TIMER interrupt (STIP, via SBI_SET_TIMER + the
-# ACLINT/OpenSBI — the device-driven path, level-pending rather than
-# software-solicited). Both interrupt builds prove the restore path when
-# the exception PC is NOT advanced. All builds use the REAL entry
+# ACLINT/OpenSBI); -DFIXTURE_SMODE -DFIXTURE_SMODE_SEIP is the same
+# S-mode build but triggers a SUPERVISOR EXTERNAL interrupt (SEIP,
+# raised by the 16550 UART's THRE line through the PLIC — the
+# device-driven path). All three interrupt builds prove the restore path
+# when the exception PC is NOT advanced. All builds use the REAL entry
 # (arch/riscv/trap_riscv.S), load distinctive values into every pinable
 # GPR, trap, and verify the save/restore round trip.
 #
@@ -65,7 +67,7 @@ _start:
     # is taken at — sepc is NOT advanced by an interrupt) and arm the
     # interrupt enables BEFORE the pins below overwrite the scratch
     # registers.
-#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER)
+#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER) || defined(FIXTURE_SMODE_SEIP)
     la   t3, intr_site
     la   t4, g_expected_sepc
     sd   t3, 0(t4)
@@ -99,6 +101,33 @@ _start:
     li   a6, 0            # fid: SBI_EXT_TIME_SET_TIMER
     li   a7, 0            # ext: SBI_EXT_TIME
     ecall                 # -> OpenSBI programs mtimecmp=0, STIP pends
+#elif defined(FIXTURE_SMODE_SEIP)
+    # Enable ONLY the supervisor external interrupt, then drive the PLIC
+    # so a real device line asserts SEIP. QEMU virt: PLIC at 0x0c000000,
+    # the 16550 UART is source 10, and a UART transmit-hold-register-
+    # empty interrupt (IER bit 1) asserts IMMEDIATELY while THRE is set
+    # (the UART is idle at boot). Program source-10 priority=1 (above
+    # the context threshold), enable it for hart 0's S-mode context
+    # (context 1: enables at 0x0c002080) and zero that context's
+    # threshold; then set the UART IER bit 1 (0x10000001) so the line
+    # asserts and SEIP pends (level). SIE stays OFF until the trigger
+    # point below, so the pending external interrupt is taken at a
+    # deterministic boundary. This is the device-driven path through the
+    # PLIC — the same route a real peripheral (UART/virtio) takes.
+    csrc sip, 2
+    li   t0, 0x200
+    csrw sie, t0          # sie.SEIE only
+    li   t0, 0x0c000028   # PLIC source 10 priority
+    li   t1, 1
+    sw   t1, 0(t0)
+    li   t0, 0x0c002080   # S-mode hart 0 enables
+    li   t1, 0x400        # bit 10 (UART)
+    sw   t1, 0(t0)
+    li   t0, 0x0c201000   # S-mode hart 0 threshold
+    sw   zero, 0(t0)
+    li   t0, 0x10000001   # UART IER
+    li   t1, 0x02         # THRE interrupt enable
+    sb   t1, 0(t0)        # -> UART asserts, SEIP pends (level)
 #else
     la   t3, ebreak_site
     la   t4, g_expected_sepc
@@ -139,13 +168,14 @@ _start:
     li   t5,   0x101D
     li   t6,   0x101E
 
-#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER)
+#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER) || defined(FIXTURE_SMODE_SEIP)
     # Trigger the interrupt. The trap is taken at the NEXT instruction
     # (interrupt checks happen at instruction boundaries), so
     # sepc = &intr_site. Interrupts do NOT advance the exception PC, so
     # the dispatcher must NOT add 4 here — and it acknowledges the
     # interrupt before returning (csrc sip for the software interrupt,
-    # SBI_SET_TIMER(far future) for the timer), because sret restores
+    # SBI_SET_TIMER(far future) for the timer, IER-clear + PLIC
+    # claim/complete for the external interrupt), because sret restores
     # SIE from SPIE and would otherwise re-trap immediately on the
     # still-pending interrupt. sret then resumes exactly at intr_site,
     # proving the restore path with an un-advanced PC.
@@ -157,8 +187,8 @@ _start:
     csrs sip, 2
     csrs sstatus, 2
 #else
-    # Timer interrupt: STIP is already level-pending from the arming
-    # ecall above — raise SIE so it is taken at the next boundary.
+    # Timer/external interrupt: STIP/SEIP is already level-pending from
+    # the arming writes — raise SIE so it is taken at the next boundary.
     csrs sstatus, 2
 #endif
 intr_site:
@@ -297,7 +327,7 @@ ebreak_site:
 #else
     csrr t5, mepc
 #endif
-#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER)
+#if defined(FIXTURE_SMODE_INTR) || defined(FIXTURE_SMODE_TIMER) || defined(FIXTURE_SMODE_SEIP)
     la   t6, intr_site
 #else
     la   t6, ebreak_site
@@ -325,6 +355,8 @@ fail:
 msg_pass: .asciz "[FIXTURE] PASS: S-mode interrupt entry save/restore round-trip verified\n"
 #elif defined(FIXTURE_SMODE_TIMER)
 msg_pass: .asciz "[FIXTURE] PASS: S-mode timer entry save/restore round-trip verified\n"
+#elif defined(FIXTURE_SMODE_SEIP)
+msg_pass: .asciz "[FIXTURE] PASS: S-mode external entry save/restore round-trip verified\n"
 #elif defined(FIXTURE_SMODE)
 msg_pass: .asciz "[FIXTURE] PASS: S-mode entry save/restore round-trip verified\n"
 #else

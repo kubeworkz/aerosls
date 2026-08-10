@@ -25,6 +25,9 @@ rv_trap_entry_driver_si.o
 rv_trap_entry_t.elf
 rv_trap_entry_t.o
 rv_trap_entry_driver_t.o
+rv_trap_entry_seip.elf
+rv_trap_entry_seip.o
+rv_trap_entry_driver_seip.o
 bench-net
 bench-corpus
 bench-exec
