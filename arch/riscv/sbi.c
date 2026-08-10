@@ -1,7 +1,7 @@
 #include "sbi.h"
 #include "plic.h"
 #include "trap_riscv.h"   /* rv_halt() -- the shell's `exit` command (Phase 9i) */
-#include "context_riscv.h"   /* g_rv_slice_expired -- the Design B part 3 time-slice boundary */
+#include "context_riscv.h"   /* rv_scheduler_tick() -- the preemptive task scheduler hook (Design B part 3 follow-up) */
 
 /* QEMU virt 16550 UART (Phase 9g) -- the console for the M-mode build
  * (QEMU `-bios none -kernel`): there is no OpenSBI, so no SBI console
@@ -411,14 +411,18 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
              * gets fast, deterministic slice cadence. */
             sbi_arm_timer(g_tick_period_override ? g_tick_period_override
                                                   : SBI_TIMER_TICK_PERIOD);
-            /* Design B part 3: mark the time-slice boundary. The
-             * running task polls this flag and yields at its next
-             * boundary — this is what turns the tick into a round-robin
-             * scheduler handoff for the REAL register-context tasks
-             * (vs. the modeled Phase 9l slice table below). Set
-             * unconditionally: the echo build never polls it, so the
-             * [TICK]/[SLICE] protocol is unaffected. */
-            g_rv_slice_expired = 1;
+            /* Design B part 3 follow-up (preemption): the tick handler
+             * itself rotates the running REAL task — rv_scheduler_tick
+             * swaps the interrupted task's trap-frame image for the
+             * next task's, so the trap epilogue srets into it. This is
+             * what turns the tick into a true preemptive scheduler (vs.
+             * the modeled Phase 9l slice table below, and vs. the old
+             * poll-and-yield protocol): a compute-bound task cannot hog
+             * the hart. A no-op while the boot context runs or a
+             * cooperative switch is in flight. Unconditional: the echo
+             * build never starts the tasks, so the [TICK]/[SLICE]
+             * protocol is unaffected. */
+            rv_scheduler_tick();
 
             /* Phase 9l: preemptive time-slice — hand the hart to the
              * active task for one bounded slice, then rotate. The slice
