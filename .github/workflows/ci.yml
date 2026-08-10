@@ -468,6 +468,15 @@ jobs:
           # the head drops to EL1 and the smc is intercepted by QEMU's
           # PSCI emulation.
           make arm64-elf
+          # M5 FP/SIMD gate (plan doc §10.198, leg 2): the LINKED ELF must
+          # contain ZERO FP/SIMD instructions — the machine-checked form of
+          # the zero-FP claim. -mgeneral-regs-only constrains the C codegen,
+          # but only this census sees the hand-written asm too; a violation
+          # (fmov, vector ops, q/d-register forms) fails here.
+          bash tools/simi/tests/arm64_fp_census.sh sls_arm64_kernel.elf || {
+            echo "FAILED: the kernel ELF contains FP/SIMD instructions (the census above prints them)" >&2
+            exit 1
+          }
           if timeout 60 qemu-system-aarch64 -M virt,virtualization=on \
              -cpu cortex-a53 -m 1G -kernel sls_arm64_kernel.elf \
              -nographic -serial file:arm64_boot.log -no-reboot; then
@@ -489,6 +498,16 @@ jobs:
           }
           grep -a "exception level: EL1" arm64_boot.log || {
             echo "FAILED: the EL drop did not land at EL1" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          # M5 FP/SIMD gate (plan doc §10.198, leg 3 visible): CPACR_EL1 is
+          # never written, so FPEN=0 (reset) — any FP/SIMD access traps to
+          # the EL1h sync vector instead of executing. The log line pins the
+          # state; the census above pins the image; the teeth smoke pins the
+          # trap itself.
+          grep -a "cpacr_el1=0x0000000000000000 (FPEN=0: FP/SIMD accesses trap to EL1)" arm64_boot.log || {
+            echo "FAILED: CPACR_EL1 did not log FPEN=0 (the FP/SIMD trap backstop is not in place)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
@@ -677,5 +696,22 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "3 passed, 0 failed" || {
             echo "FAILED: kernel-copy gate teeth — a deliberate violation slipped through" >&2
+            exit 1
+          }
+
+      - name: Teeth — FP/SIMD census + trap smokes (a SIMD violation must fail)
+        run: |
+          # The census gate proves the ELF is clean; this proves the gate
+          # has teeth. tools/simi/tests/arm64_fp_gate_smoke.sh injects a
+          # real fmov into kernel_arm64.c, rebuilds, and asserts (a) the
+          # census FAILS on the broken ELF and (b) booting the broken
+          # kernel TRAPS on the SIMD access — the CPACR_EL1.FPEN=0
+          # backstop: the probe's "before" line prints, the "after" never
+          # does, rc=124 — then restores the tree. A gate that has gone
+          # blind fails here.
+          out=$(bash tools/simi/tests/arm64_fp_gate_smoke.sh 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "4 passed, 0 failed" || {
+            echo "FAILED: FP/SIMD gate teeth — a deliberate SIMD violation slipped through" >&2
             exit 1
           }
