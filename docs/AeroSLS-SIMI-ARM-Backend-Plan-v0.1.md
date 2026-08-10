@@ -589,6 +589,11 @@ arm64 kernel programs the CNTP timer and the GIC itself).
   the virtual timer (the same-PPI case is architecturally impossible)
   and only in the EL1h handler (the lower-EL IRQ slot stays a stub:
   SPSR masks IRQs during the EL0 excursions, as scoped in §10.194).
+  FP/SIMD context: the zero-FP claim is scoped in §10.198 — it holds
+  on three machine-checked legs (`-mgeneral-regs-only` codegen, a
+  0-instruction image census, and the CPACR_EL1.FPEN=0 trap, spike-
+  verified under TCG), so the EL1h entry needs no SIMD save; the
+  remainder is the committed CI census + teeth, not context code.
   Sizing: ~150-200 lines
   — mmu.c GIC device pages (~20), a new arch/arm64/gic.c (~90:
   distributor + sysreg init + acknowledge/EOIR), timer arm + handler
@@ -7735,6 +7740,77 @@ masked by design); and the group-0 finding means the kernel's GIC
 programming now targets the secure group — correct for this
 Secure-world kernel, and a documented divergence from a hypothetical
 NS EL1 kernel's group-1 layout.
+
+### 10.198 Scope: the M5 FP/SIMD remainder — does the zero-FP claim hold, and what should the EL1h entry do?
+
+The last honest-remainder item on the M5 board is FP/SIMD context.
+The question decomposes into two: does the kernel have any FP/SIMD
+state to preserve across the nested interrupt, and — if not — what
+gate keeps that true? The verdict is a zero-FP claim, but only as a
+MACHINE-CHECKED invariant, not as an argument; the EL1h entry needs
+no SIMD save, and the honest remainder is the check, not the code.
+
+**Leg 1 — codegen: `-mgeneral-regs-only` on every C source.** The
+arm64 kernel builds with `-mgeneral-regs-only` in AR_CFLAGS (the
+x86 `-mno-sse` analog), so the compiler's register allocator cannot
+touch v0-v31; every FP/SIMD operation in C becomes soft-float GPR
+code. This constrains COMPILER output only — hand-written assembly
+is outside its reach (hence Leg 2).
+
+**Leg 2 — image: the shipped ELF contains zero FP/SIMD instructions.**
+The census is a disassembly sweep of the linked kernel
+(`sls_arm64_kernel.elf` — every section, including the hand-written
+boot_arm64.S and the vector table): `aarch64-linux-gnu-objdump -d`
+counts 0 matches for v/q register operands and the FP opcode family
+(verified on the M5.3 build: count = 0). This closes the hole Leg 1
+leaves open: even an asm routine cannot slip SIMD into the image.
+
+**Leg 3 — architecture: CPACR_EL1.FPEN=0 makes any violation a TRAP,
+not corruption.** The kernel never writes CPACR_EL1, so it stays at
+its reset value (FPEN=0): an EL1 access to the FP/SIMD registers
+traps (same-EL synchronous exception) instead of executing. The
+spike proved the backstop is real even under qemu TCG — injecting a
+single `fmov d0, xzr` into the boot path printed `[TEMP] before SIMD
+access` and then hung at the EL1h sync stub (no "after" print,
+rc=124), exactly the GICv2-running-priority precedent's lesson: TCG
+can be lax, so the spike matters. The failure mode is LOUD (the
+vector stub's wfi hang) on both TCG and real silicon — never silent
+state corruption. Note the x86 asymmetry worth recording: the x86
+kernel's `-mno-sse` has NO equivalent trap backstop (x87 is always
+on; CR0.TS/MP are not set), so an accidental x87/SSE instruction
+there silently corrupts — the ARM kernel's FPEN trap is strictly
+stronger.
+
+**The nested-handler question resolves to: no save, by construction.**
+The M5.3 handler opens a 10 ms unmasked window; if it (or anything
+it calls) used SIMD, a nested fire would clobber its FP state — the
+ELR/SPSR bug class, for FP. A v0-v31 + FPCR/FPSR save (32x16 + 2x4 =
+520 bytes; the entry frame would grow 160 -> 680) would be a save of
+DEAD state: legs 1+2 prove no FP instruction can exist in the image,
+and leg 3 proves that if one ever slips in, it traps before it can
+execute. Saving would protect nothing; the invariant to protect is
+"no FP instruction in the image," which is machine-checkable.
+
+**What the remainder actually is — three committed gates, no context
+code:** (a) a CI check in arm64-guards that runs the census grep over
+the freshly built ELF and fails on any FP/SIMD instruction (the M2
+gate shape: a machine check, not an argument); (b) a teeth smoke that
+injects a SIMD instruction into a throwaway build and asserts the
+boot hangs before the probe's "after" print — proving the trap has
+not gone blind (the kernel-copy teeth pattern); (c) optionally, a
+boot-time `[M5] cpacr_el1=0x0 (FPEN=0: FP/SIMD traps)` log line so the
+FPEN state is visible in the serial stream. Estimated size: ~25 lines
+of CI + ~30 lines of teeth script + ~3 kernel lines — the smallest
+honest close of the board's last item.
+
+**Future trigger (recorded, not built):** if the kernel ever needs
+real FP — a hardware-float decision, a SIMD memcpy, a crypto
+extension — the EL1h entry MUST grow the v0-v31 + FPCR/FPSR save
+(520 bytes) or adopt lazy switching (CPACR FPEN=1 + a
+save-on-first-use handler). The M5.3 nesting window makes this a
+correctness requirement for any future FP-using handler, not an
+optimization. Until then, the zero-FP claim stands on three
+independently machine-checked legs.
 
 ---
 
