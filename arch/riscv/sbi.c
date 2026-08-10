@@ -1,6 +1,7 @@
 #include "sbi.h"
 #include "plic.h"
 #include "trap_riscv.h"   /* rv_halt() -- the shell's `exit` command (Phase 9i) */
+#include "context_riscv.h"   /* g_rv_slice_expired -- the Design B part 3 time-slice boundary */
 
 /* QEMU virt 16550 UART (Phase 9g) -- the console for the M-mode build
  * (QEMU `-bios none -kernel`): there is no OpenSBI, so no SBI console
@@ -155,6 +156,16 @@ void sbi_system_reset(void) {
  * plic.c. mtimecmp and `time` share the same timebase, so the same
  * period constant and drift-free arithmetic apply unchanged. */
 static uint64_t g_next_tick;
+
+/* Design B part 3: a runtime override for the tick period, so the
+ * two-task round-robin demo can run tick-cadenced slices at 100ms
+ * without a rebuild. 0 (the default) = the compile-time
+ * SBI_TIMER_TICK_PERIOD. The demo sets it, then restores 0. */
+static uint64_t g_tick_period_override;
+
+void sbi_set_tick_period(uint64_t period_ticks) {
+    g_tick_period_override = period_ticks;
+}
 
 static uint64_t rv_rdtime(void) {
     uint64_t t;
@@ -394,8 +405,20 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
              * tick-vs-UART contention probe). The drift-free
              * arithmetic keeps the 100ms cadence exact even under
              * contention, and the level-pending bit guarantees no tick
-             * is lost to an interrupt that arrives while disabled. */
-            sbi_arm_timer(SBI_TIMER_TICK_PERIOD);
+             * is lost to an interrupt that arrives while disabled.
+             * Design B part 3: the demo's sbi_set_tick_period override
+             * (100ms) wins while it is set, so the two-task round-robin
+             * gets fast, deterministic slice cadence. */
+            sbi_arm_timer(g_tick_period_override ? g_tick_period_override
+                                                  : SBI_TIMER_TICK_PERIOD);
+            /* Design B part 3: mark the time-slice boundary. The
+             * running task polls this flag and yields at its next
+             * boundary — this is what turns the tick into a round-robin
+             * scheduler handoff for the REAL register-context tasks
+             * (vs. the modeled Phase 9l slice table below). Set
+             * unconditionally: the echo build never polls it, so the
+             * [TICK]/[SLICE] protocol is unaffected. */
+            g_rv_slice_expired = 1;
 
             /* Phase 9l: preemptive time-slice — hand the hart to the
              * active task for one bounded slice, then rotate. The slice

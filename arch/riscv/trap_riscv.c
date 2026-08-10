@@ -83,6 +83,13 @@ static void rv_print_udec(uint64_t v) {
     while (i > 0) sbi_putchar(buf[--i]);
 }
 
+/* Design B part 3: how many FS lazy-saves have fired since boot. Only
+ * touched from trap context (single hart, interrupts disabled inside
+ * the handler), so a plain global is fine. The two-task round-robin
+ * asserts its delta across the demo (exactly one lazy-save per
+ * task-slice, since each switch disarms FP). */
+uint64_t g_fp_lazy_count;
+
 /* Deliberate terminal halt for the syscall/unhandled paths (and, since
  * Phase 9i's command loop, the shell's `exit` command -- arch/riscv/
  * sbi.c, which includes this header). Real kernel: wfi-spin forever,
@@ -266,9 +273,29 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
          *    silent corruption). */
     if (code == 2) {
         uint32_t insn = (uint32_t)stval;
-        unsigned op = insn & 0x7f;
-        int is_fp = (op == 0x07 || op == 0x27 || op == 0x43 || op == 0x47 ||
+        unsigned q = insn & 3;   /* compressed-instruction quadrant */
+        int is_fp;
+        if (q == 3) {
+            /* Full 32-bit instruction: the RISC-V opcode field (bits 6:0)
+             * is authoritative. FP family = load/store-FP (0x07/0x27),
+             * the four FMA opcodes (0x43/0x47/0x4B/0x4F), OP-FP (0x53). */
+            unsigned op = insn & 0x7f;
+            is_fp = (op == 0x07 || op == 0x27 || op == 0x43 || op == 0x47 ||
                      op == 0x4b || op == 0x4f || op == 0x53);
+        } else if (q == 1) {
+            is_fp = 0;   /* quadrant 1 is all integer/control (c.addi..c.bnez) */
+        } else {
+            /* Compressed FP load/store: quadrant 0 (c.fld funct3=001,
+             * c.fsd funct3=101) and quadrant 2 (c.fldsp 001, c.fsdsp
+             * 101). The low bits of a compressed word are NOT an RV64
+             * opcode field — the task round-robin's prologue fsd traps
+             * as c.fsd and this quadrant decode is what keeps it a
+             * lazy-save instead of a halt (the census's compressed-
+             * encoding lesson, on the decode side this time). RV64 has
+             * no c.flw/c.fsw (RV32-only), so funct3 011 is not FP. */
+            unsigned f3 = (insn >> 13) & 7;
+            is_fp = (f3 == 0x01 || f3 == 0x05);
+        }
         uint64_t sstatus_v;
         __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus_v));
         uint64_t fs = (sstatus_v >> 13) & 3;
@@ -280,6 +307,7 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
             fp_save_all(&phd->fp_save[live][0]);
             fp_load_all(&phd->fp_save[next][0]);
             phd->fp_current = next;
+            g_fp_lazy_count++;
             rv_print_str("[FP] lazy-save: owner ");
             rv_print_udec(live);
             rv_print_str(" -> ");
