@@ -388,12 +388,18 @@ fi
 # dropped), then echo_client.py drives the interrupt-count tripwire
 # (three isolated keystrokes must each produce EXACTLY one interrupt —
 # the kernel prints [IRQ#N] after its complete(), so the assertion is
-# deterministic) plus the full readline + command-loop protocol: help, a
+# deterministic), the Phase 9k periodic-timer tripwire (the client is
+# passed `tick`, so it waits for [TICK 2] — printed after the STIP
+# handler re-arms the next tick, proving the 1s timer is periodic, not
+# one-shot), plus the full readline + command-loop protocol: help, a
 # backspace-edited CR-only line (PING\bX -> the unknown command PINX),
 # echo <text>, and finally `exit`, which powers the machine off via
 # SBI_SRST — so QEMU must exit rc=0 (rc=124 means the exit command never
 # fired). The rapid batches must also drain with no lost bytes (the
-# claim/complete discipline under queued input).
+# claim/complete discipline under queued input). The M-mode twin below
+# does NOT pass `tick`: bare metal has no firmware to program the timer,
+# so no STIP is ever armed there — the periodic tick is an S-mode-only
+# behavior, like the readline `exit` power-off.
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo.sock
@@ -402,14 +408,14 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
             -serial chardev:s0 -kernel ../../../sls_riscv_kernel_echo.elf \
             -nographic >rv_echo_qemu.out 2>&1 &
         qpid=$!
-        python3 echo_client.py /tmp/sls_echo.sock >rv_echo_client.out 2>&1
+        python3 echo_client.py /tmp/sls_echo.sock tick >rv_echo_client.out 2>&1
         crc=$?
         wait $qpid
         rc=$?
         if [ "$rc" -eq 0 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_client.out; then
-            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop)"
+            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + periodic timer tick)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo (qemu rc=$rc, client rc=$crc — echo not as expected)"

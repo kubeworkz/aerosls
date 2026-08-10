@@ -325,25 +325,30 @@ jobs:
           # trap entry and is echoed by the SEIP handler (claim, direct
           # 16550 RBR drain, complete). QEMU holds the VM until the serial
           # client connects (server=on,wait=on — no boot output is
-          # dropped), then echo_client.py drives the interrupt-count
-          # tripwire (three isolated keystrokes, each exactly one
-          # interrupt — [IRQ#N] prints after the complete()) plus the
-          # full command loop: help, a backspace-edited CR-only line
-          # (PING\bX -> unknown command PINX), echo <text>, and `exit` —
-          # which powers the machine off via SBI_SRST, so QEMU must exit
-          # rc=0 (rc=124 means the exit command never fired).
+          # dropped), then echo_client.py (passed `tick`, Phase 9k) drives
+          # the interrupt-count tripwire (three isolated keystrokes, each
+          # exactly one interrupt — [IRQ#N] prints after the complete()),
+          # waits for [TICK 2] — the periodic supervisor timer (STIP via
+          # the Sstc stimecmp write, armed at boot and re-armed inside
+          # every tick handler) printing its count after the re-arm, which
+          # proves the timer is periodic, not one-shot — plus the full
+          # command loop:
+          # help, a backspace-edited CR-only line (PING\bX -> unknown
+          # command PINX), echo <text>, and `exit` — which powers the
+          # machine off via SBI_SRST, so QEMU must exit rc=0 (rc=124
+          # means the exit command never fired).
           rm -f /tmp/sls_echo.sock
           timeout 40 qemu-system-riscv64 -M virt -m 128M -smp 1 \
             -chardev socket,id=s0,path=/tmp/sls_echo.sock,server=on,wait=on \
             -serial chardev:s0 -kernel sls_riscv_kernel_echo.elf -nographic \
             >echo_qemu.log 2>&1 &
           qpid=$!
-          python3 tools/simi/tests/echo_client.py /tmp/sls_echo.sock >echo_client.log 2>&1
+          python3 tools/simi/tests/echo_client.py /tmp/sls_echo.sock tick >echo_client.log 2>&1
           crc=$?
           wait $qpid
           rc=$?
           if [ "$rc" -eq 0 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_client.log; then
-            echo "OK: device-driven UART RX interrupt echo + command loop verified (help, editing, echo, exit -> rc=0)"
+            echo "OK: device-driven UART RX interrupt echo + command loop + periodic timer tick verified ([TICK 2], exit -> rc=0)"
           else
             echo "FAILED: echo check failed (qemu rc=$rc, client rc=$crc)" >&2
             cat echo_client.log echo_qemu.log >&2

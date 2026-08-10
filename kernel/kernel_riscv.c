@@ -18,6 +18,7 @@
 #include "simi_riscv.h"
 #include "../arch/riscv/trap_riscv.h"
 #include "../arch/riscv/plic.h"
+#include "../arch/riscv/sbi.h"   /* sbi_arm_timer — Phase 9k periodic tick */
 #include "rv64_boot_smoke_tmo.h"
 
 extern void sbi_putchar(char c);
@@ -173,6 +174,26 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
     init_riscv_plic(0);
     __asm__ volatile("csrs sstatus, 2");
     rv_boot_print("[PLIC] UART RX interrupt wired (source 10 -> hart 0 S-mode, SEIE + SIE on).\n");
+
+    /* Phase 9k: the kernel's first periodic interrupt-driven behavior —
+     * arm a 1-second supervisor timer (STIP). From here on,
+     * handle_riscv_supervisor_interrupt (arch/riscv/sbi.c) takes a tick
+     * every second, re-arms the next one, and prints [TICK N] on the
+     * echo builds — a committed, observable periodic heartbeat (the
+     * echo client waits for [TICK 2], which also proves the re-arm: a
+     * one-shot timer would never deliver a second tick). Order matters:
+     * sbi_arm_timer first (stimecmp -> now+1s, far in the future), THEN
+     * sie.STIE. Arming before enabling guarantees no early tick:
+     * whatever stimecmp held at boot, the comparator is already in the
+     * future when the STIP becomes deliverable. sie.STIE is bit 5 =
+     * 0x20, which does NOT fit the CSRxI immediate field (5 bits,
+     * 0-31) — `csrs sie, 0x20` is an assembler error, so the register
+     * form is required (sstatus/mstatus's SIE/MIE bits above are 1/3
+     * and fit fine as immediates). */
+    sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+    uint64_t stie_bit = 0x20;
+    __asm__ volatile("csrs sie, %0" : : "r"(stie_bit) : "memory");
+    rv_boot_print("[TIMER] stimecmp armed (STIP, 1s period).\n");
 #endif
 
 #if defined(KERNEL_UART_ECHO)

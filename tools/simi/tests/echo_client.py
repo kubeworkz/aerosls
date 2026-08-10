@@ -30,7 +30,16 @@ queued bytes and must drain completely (every char echoed, every line
 dispatched) no matter how many interrupts they split into -- pinning
 claim/complete discipline under rapid input.
 
-Usage: python3 echo_client.py /path/to/serial.sock
+Optional second argument "tick" (Phase 9k; passed by the S-mode runner
+only -- the M-mode twin has no firmware to program the timer, so no
+ticks ever fire there): after the IRQ tripwire, wait for [TICK 2]. Each
+[TICK N] is printed AFTER the kernel re-armed the next tick, so seeing
+[TICK 2] proves the timer is genuinely periodic -- a one-shot arm would
+deliver at most [TICK 1] and then go silent. (The tick wait is placed
+before the command loop so the assertion runs while the machine is
+still on; `exit` below powers it off.)
+
+Usage: python3 echo_client.py /path/to/serial.sock [tick]
 
 Exit code 0 = every marker observed; 1 = not.
 """
@@ -40,7 +49,15 @@ import time
 
 
 def recv_until(s, buf, marker, timeout):
-    """Read until marker appears in the accumulated stream (or timeout)."""
+    """Read until marker appears in the accumulated stream (or the deadline
+    passes). NOTE: on socket.timeout the loop must CONTINUE, not break —
+    a single 0.5s recv gap (e.g. the kernel's 1-second periodic tick
+    straddling the timeout window) must not abort the wait. The Phase 9k
+    tick tripwire exposed exactly this latent bug: [TICK 1] fires ~10ms
+    after the first recv's timeout, so a break-on-timeout implementation
+    failed to find even [TICK 2] within its 8s budget. The fast markers
+    (banner, IRQ tripwire, help/echo replies) never tripped it because
+    they all respond well under 0.5s."""
     deadline = time.time() + timeout
     while marker not in buf and time.time() < deadline:
         try:
@@ -49,7 +66,7 @@ def recv_until(s, buf, marker, timeout):
                 break
             buf += chunk
         except socket.timeout:
-            break
+            continue
     return buf
 
 
@@ -95,6 +112,21 @@ def main() -> int:
     s.sendall(b"\r")
     buf = recv_until(s, buf, b'unknown command: "ABC"', 5)
 
+    # Phase 9k periodic-timer tripwire (tick mode only): the S-mode
+    # kernel arms the stimecmp comparator (Sstc) for a 1s tick at boot
+    # and re-arms inside every STIP handler, printing [TICK N] after the
+    # re-arm. [TICK 1] fires ~1s after boot and may already be in the
+    # buffer; [TICK 2] proves the interrupt fired AND was re-armed — a
+    # one-shot arm would go silent after [TICK 1]. The 8s budget covers
+    # a slow CI host.
+    tick_mode = len(sys.argv) > 2 and sys.argv[2] == "tick"
+    if tick_mode:
+        buf = recv_until(s, buf, b"[TICK 2]", 8)
+        if b"[TICK 2]" not in buf:
+            print("FAIL: periodic timer tick never reached [TICK 2]")
+            print(buf.decode(errors="replace"))
+            return 1
+
     s.sendall(b"help\r")
     buf = recv_until(s, buf, b"[HELP] commands:", 5)
 
@@ -119,16 +151,20 @@ def main() -> int:
             break
 
     text = buf.decode(errors="replace")
-    print(text[-1100:])
+    print(text[-1300:])
     ok = (b"[IRQ#1]" in buf) and (b"[IRQ#2]" in buf) and (b"[IRQ#3]" in buf) and \
          (b'unknown command: "ABC"' in buf) and \
          (b"[HELP] commands:" in buf) and \
          (b'unknown command: "PINX"' in buf) and \
-         (b"[ECHO] hello world" in buf)
+         (b"[ECHO] hello world" in buf) and \
+         (not tick_mode or b"[TICK 2]" in buf)
     if ok:
-        print("ECHO_OK: interrupt tripwire pinned (1 keystroke -> 1 IRQ "
-              "x3), help dispatched, backspace editing proven (PING\\bX "
-              "-> PINX), CR-only line routed, echo <text> works")
+        msg = ("ECHO_OK: interrupt tripwire pinned (1 keystroke -> 1 IRQ "
+               "x3), help dispatched, backspace editing proven (PING\\bX "
+               "-> PINX), CR-only line routed, echo <text> works")
+        if tick_mode:
+            msg += ", periodic timer tick proven ([TICK 2] after re-arm)"
+        print(msg)
     else:
         print("FAIL: interrupt-tripwire / readline / dispatch markers not all observed")
     return 0 if ok else 1

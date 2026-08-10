@@ -127,6 +127,59 @@ void sbi_system_reset(void) {
              SBI_SRST_RESET_TYPE_SHUTDOWN, SBI_SRST_RESET_REASON_NONE, 0);
 }
 
+#if !defined(RISCV_MMODE)
+/* Phase 9k: the kernel's first periodic interrupt-driven behavior — a
+ * supervisor timer interrupt (STIP) armed by writing the stimecmp CSR
+ * directly (the Sstc extension this platform exposes — QEMU virt +
+ * OpenSBI v1.3 advertise "time,sstc" in the boot log). `time` runs at
+ * QEMU virt's 10 MHz timebase, so SBI_TIMER_TICKS_PER_SEC ticks = 1
+ * second. The first call arms the first tick at now+period; every later
+ * call advances the next tick from the previously SCHEDULED time (not
+ * from the handler's entry time), so a late handler cannot accumulate
+ * drift. The STIP branch in handle_riscv_supervisor_interrupt calls
+ * this to re-arm; timer interrupts are level-sensitive, so the re-arm
+ * (moving stimecmp into the future) is what deasserts STIP — without it
+ * the interrupt would re-fire immediately after sret, exactly like the
+ * timer fixture's ack-required tooth proved. SBI_SET_TIMER is NOT used:
+ * on this OpenSBI both the legacy EID=0 and the v0.2 TIME
+ * (EID=0x54494D45) call shapes return error 0 but never actually fire a
+ * supervisor timer interrupt (diagnosed empirically — see the comment
+ * on the csrw below), so the direct Sstc write is the only mechanism
+ * that works here. S-mode only: the M-mode twin would need direct CLINT
+ * writes + mie.MTIE, which this phase deliberately does not add. */
+static uint64_t g_next_tick;
+
+static uint64_t rv_rdtime(void) {
+    uint64_t t;
+    __asm__ volatile("csrr %0, time" : "=r"(t));
+    return t;
+}
+
+int sbi_arm_timer(uint64_t period_ticks) {
+    uint64_t now = rv_rdtime();
+    if (g_next_tick == 0 || g_next_tick <= now) {
+        /* First arm, or the previous tick fired late (now already past
+         * the scheduled time — a boot that took longer than the period):
+         * resync to now+period rather than compounding the lateness. */
+        g_next_tick = now + period_ticks;
+    } else {
+        g_next_tick += period_ticks;
+    }
+    /* SBI_SET_TIMER on this OpenSBI (both the legacy EID=0 and the v0.2
+     * TIME EID=0x54494D45 call shapes) returns error 0 but NEVER
+     * produces a supervisor timer interrupt — the comparator write is
+     * accepted and silently ignored, so no tick ever fires (diagnosed
+     * empirically: error 0, then total STIP silence across 20s while
+     * SEIP kept arriving). The direct stimecmp CSR write programs the
+     * S-mode comparator that generates STIP, bypassing OpenSBI entirely.
+     * (The trap-entry fixture's SBI_SET_TIMER(0) appeared to work only
+     * because stimecmp is 0 at reset, so STIP was pending from the start
+     * — time >= 0 — not because the SBI call programmed anything.) */
+    __asm__ volatile("csrw stimecmp, %0" : : "r"(g_next_tick) : "memory");
+    return 0;   /* no SBI call anymore — the direct stimecmp write cannot fail */
+}
+#endif
+
 // Global text canvas array used to buffer incoming shell commands from the virtual UART
 #define SHELL_BUF_SIZE 256
 static char riscv_shell_input_buffer[SHELL_BUF_SIZE];
@@ -139,6 +192,19 @@ static uint32_t buf_cursor = 0;
  * complete() (see the handler), which is what makes per-keystroke
  * interrupt accounting a deterministic assertion. */
 static uint64_t g_uart_rx_irq_count;
+
+/* Phase 9k: how many supervisor timer interrupts (STIP) have been taken
+ * since boot. Same discipline as g_uart_rx_irq_count: only touched from
+ * interrupt context (single hart, interrupts disabled inside the
+ * handler), so a plain global is fine. The echo builds print it as
+ * [TICK N] AFTER the re-arm (see the STIP branch below), so a client
+ * that has seen [TICK N] knows the next tick is already scheduled — the
+ * deterministic proof that the timer is periodic, not one-shot. S-mode
+ * only (the STIP branch is compiled out of the bare-metal build, which
+ * never arms a timer). */
+#if !defined(RISCV_MMODE)
+static uint64_t g_tick_count;
+#endif
 
 /* Phase 9i command loop: the real headless shell. Every line accumulated
  * by handle_riscv_supervisor_interrupt (with backspace editing and CR-only
@@ -214,7 +280,29 @@ void route_sls_shell_command(const char* buffer) {
 // own context.
 void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
     (void)stval; // Avoid unreferenced variable warnings
-    
+
+#if !defined(RISCV_MMODE)
+    // Phase 9k: supervisor timer interrupt (STIP, cause 5) — the kernel's
+    // first periodic interrupt-driven behavior. The S-mode build arms the
+    // timer at boot (kernel_riscv.c's sbi_arm_timer call); each tick
+    // re-arms the next one and (echo builds only) prints the running
+    // count. The re-arm is what deasserts the level-pending STIP, so it
+    // must happen on EVERY tick — a one-shot arm would deliver [TICK 1]
+    // and then never fire again, which the client's [TICK 2] assertion
+    // would catch. M-mode build: never armed (no firmware to program the
+    // timer), so cause 5 can never arrive there.
+    if ((scause & (1ULL << 63)) && (scause & 0xFF) == 5) {
+        g_tick_count++;
+        sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+#if defined(KERNEL_UART_ECHO)
+        shell_print("[TICK ");
+        shell_print_udec(g_tick_count);
+        shell_print("]\r\n");
+#endif
+        return;
+    }
+#endif
+
     // Check if the cause is an external interrupt (IRQ 9 from PLIC/UART in
     // S-mode, IRQ 11 in M-mode)
     if ((scause & (1ULL << 63)) &&
