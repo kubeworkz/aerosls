@@ -41,6 +41,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/arm64/gic.h"
 #include "arch/arm64/mmu.h"
 #include "arch/arm64/uart_pl011.h"
 #include "arm64_boot_smoke_tmo.h"
@@ -108,6 +109,31 @@ static struct Arm64Activation g_act[ARM64_ACT_SLOTS];
 static uint32_t g_translate_count;   /* the M5.1 gate: exactly 1 at boot */
 static uint32_t g_el0_excursions;    /* the M5.1 gate: exactly 2 at boot */
 
+/* M5.2: the tick counter, bumped by the EL1h IRQ handler. Volatile —
+ * written by arm64_tick_irq, read by the wait loop. */
+static volatile uint32_t g_tick_count;
+#define M52_TICK_TARGET 3            /* the gate: [TICK 1..3], unbroken */
+
+static void print_u64_dec(uint64_t v);
+
+/* M5.2: the EL1h IRQ handler (boot_arm64.S arm64_irq_el1h calls this
+ * with caller-saved regs saved). Acknowledge; if spurious (1023) there
+ * is nothing to EOIR; re-arm the timer BEFORE the EOIR (minimize the
+ * window a tick could be missed — the RISC-V discipline); bump the
+ * counter; print [TICK N]; end. */
+void arm64_tick_irq(void)
+{
+    uint32_t intid = gic_iar();
+    if (intid == 1023)
+        return;
+    arm_timer_arm();
+    g_tick_count++;
+    uart_puts("[TICK ");
+    print_u64_dec(g_tick_count);
+    uart_puts("]\\r\\n");
+    gic_eoir(intid);
+}
+
 static uint32_t fnv1a32(const uint8_t *p, uint32_t n)
 {
     uint32_t h = 2166136261u;
@@ -141,6 +167,23 @@ static void print_u64(uint64_t v)
     buf[16] = '\0';
     uart_puts("0x");
     uart_puts(buf);
+}
+
+static void print_u64_dec(uint64_t v)
+{
+    /* Decimal print for the [TICK N] lines (no libc). */
+    char buf[21];
+    int i = 20;
+    buf[i] = '\0';
+    if (v == 0) {
+        uart_puts("0");
+        return;
+    }
+    while (v) {
+        buf[--i] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    uart_puts(buf + i);
 }
 
 /* M4c: the translated code is DATA until it runs; the I-cache must be
@@ -385,13 +428,38 @@ static void arm64_el0_activate(void)
     __builtin_unreachable();
 }
 
+/* M5.2: arm the timer, unmask IRQs (msr daifclr #4 clears the I bit),
+ * idle until the target tick count fires — each tick prints [TICK N]
+ * and re-arms (the [TICK 2] re-arm proof) — then re-mask. The ticks
+ * fire strictly AFTER the last EL0 result line, so the M5.1 counts are
+ * untouched by construction. The busy-wait reads the volatile counter
+ * each iteration (the IRQ handler bumps it). */
+static void arm64_wait_ticks(uint32_t target)
+{
+    arm_timer_arm();   /* arm BEFORE unmask — no early tick */
+    uart_puts("[M5.2] waiting for ");
+    print_u64_dec(target);
+    uart_puts(" ticks (GICv2, CNTP PPI 14)...\\r\\n");
+    /* Unmask IRQs. The DAIF immediate encoding is {D=8, A=4, I=2, F=1}
+     * — clearing the I (IRQ) mask is #2, NOT #4 (which clears A; the
+     * first M5.2 bring-up bug, §10.195). Linux's local_irq_enable uses
+     * the same #2. */
+    asm volatile("msr daifclr, #2" ::: "memory");   /* IRQ unmask (I) */
+    while (g_tick_count < target)
+        ;
+    asm volatile("msr daifset, #2" ::: "memory");   /* re-mask */
+    uart_puts("[M5.2] tick gate reached: ");
+    print_u64_dec(g_tick_count);
+    uart_puts(" ticks, unbroken run\\r\\n");
+}
+
 /* The EL0 excursion's continuation (defined after psci_system_off):
  * entered via the svc handler's eret with TTBR0 still the user tables
  * and the kernel SP (SP_EL1 never changed across the excursion — the
  * eret into EL0 switched to SP_EL0). Prints the result; if this is the
  * first excursion, launches the SECOND EL0 excursion (the M5.1 gate:
  * two EL0 entries, both cache HITs, one translation total); after the
- * second, powers off. */
+ * second, runs the M5.2 tick gate, then powers off. */
 static void arm64_el0_done(void)
 {
     uart_puts("[M5] returned from EL0 -- user result=");
@@ -399,6 +467,7 @@ static void arm64_el0_done(void)
     uart_puts(" (expected 0x2a = 42)\\r\\n");
     if (g_el0_excursions < 2)
         arm64_el0_activate();   /* second EL0 excursion (HIT) */
+    arm64_wait_ticks(M52_TICK_TARGET);
     uart_puts("[M4] issuing PSCI SYSTEM_OFF\\r\\n");
     psci_system_off();
     for (;;)
@@ -434,11 +503,16 @@ void kernel_arm64_main(void)
               "TTBR0 empty (kernel is TTBR1-pure)\\r\\n");
     print_el();
     mmu_selfcheck_kernel();
+    /* M5.2: the GIC and the generic timer (CNTFRQ read) are init once,
+     * before any entry; the timer is armed when the wait phase starts
+     * (arm64_wait_ticks), so no tick can fire during the entries. */
+    gic_init();
+    arm_timer_init();
     /* M5.1 gate (four entries, one translation, all 42): the first EL1
      * entry is the cache MISS (translate + call); the second EL1 entry
      * and both EL0 excursions are HITs (reuse, no retranslation). The
      * EL0 path never returns — arm64_el0_done launches the second EL0
-     * excursion, then issues PSCI SYSTEM_OFF. */
+     * excursion, then runs the M5.2 tick gate, then PSCI SYSTEM_OFF. */
     arm64_el1_entry();
     arm64_el1_entry();
     arm64_el0_activate();

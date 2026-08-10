@@ -510,7 +510,7 @@ name+hash-keyed cache with an observable HIT path.
   `simi_translate.c` wraps rather than modifies `simi_x86.c`).
 
 **M5.2 — GIC interrupts: the arm64 kernel's first interrupt-driven
-behavior. SCOPED (§10.194).** The deferred interrupt story from
+behavior. DONE (§10.194-10.195).** The deferred interrupt story from
 §10.190/§10.191, as its own milestone: a periodic tick delivered by the
 ARMv8 generic timer through the qemu virt GIC, handled in the vector
 table's EL1h IRQ slot, with a tick line and an IRQ-count tripwire — the
@@ -535,15 +535,21 @@ arm64 kernel programs the CNTP timer and the GIC itself).
   slot stays a stub: interrupts are masked (DAIF.I=1, SPSR 0x3c0/0x3c5)
   during the EL0 excursions and the handler, so no IRQ can trap from
   EL0 — honest note.
-- **Gate (planned):** after the second EL0 excursion, the continuation
-  clears DAIF.I and idles until the target tick count fires — the log
-  shows `[TICK 1]`, `[TICK 2]`, ... as an unbroken run (count ==
-  target, no missed re-arms), then PSCI SYSTEM_OFF rc=0. The tripwire
-  asserts `[TICK 2]` specifically (the re-arm proof), and the M5.1
-  gate (1 MISS / 3 HITs / four 42s) stays INTACT — ticks fire strictly
-  after the last result line. CI (arm64-guards) asserts the tick run
-  + the existing counts + rc=0. The Phase 9n 100ms contention probe
-  (tick stream interleaving with UART with zero lost ticks) is a
+- **Gate (M5.2) — PASSED (§10.195):** the log shows `[TICK 1]`,
+  `[TICK 2]`, `[TICK 3]` as an unbroken run (exactly 3), `[TICK 2]`
+  proving the re-arm, then `[M5.2] tick gate reached: 3 ticks,
+  unbroken run` and PSCI SYSTEM_OFF rc=0 — on cortex-a57 (local) and
+  cortex-a53 (CI), deterministic. The M5.1 counts (1 MISS / 3 HITs /
+  four 42s) are untouched, and the exception log is exactly the six
+  intended exceptions: 3 IRQ (the ticks), 2 SVC (the EL0 excursions),
+  1 PSCI smc. The spike overrode BOTH scope assumptions — the machine
+  is GICv2 (not v3), and the timer's INTID is 30 (FDT PPI 14 + 16) —
+  and three bring-up bugs were found by booting: `msr daifclr` #4
+  clears A not I (IRQ unmask is #2), GICC_CTLR 0x1 enables group 0
+  not group 1 (EnableGrp1 is bit 1 = 0x2), and the ISENABLER0 write
+  targeted SGI 14 instead of PPI 14's INTID 30 (§10.195). CI
+  (arm64-guards) asserts the 3-tick run + `[TICK 2]` + the existing
+  counts + rc=0. The Phase 9n 100ms contention probe remains a
   possible follow-up, not part of the gate.
 - **Honest caveats.** TCG timing is not real-time: the tripwire
   asserts the tick COUNT and the re-arm, never wall-clock; the PPI
@@ -7418,6 +7424,90 @@ the PPI-enable), the timer arm + tick handler + idle phase in
 kernel_arm64.c (~50), the vector slot + DAIF clear in boot_arm64.S
 (~10), CI asserts (~10). The translator core and the activation cache
 are untouched.
+
+### 10.195 M5.2 as built: GIC ticks, the arm64 kernel's first interrupt
+
+M5.2 implements the scope of §10.194: a periodic tick from the ARMv8
+EL1 physical generic timer (CNTP) through the qemu virt GIC, handled in
+the vector table's EL1h IRQ slot. The boot log's final act is now:
+
+```
+[M5.2] waiting for 3 ticks (GICv2, CNTP PPI 14)...
+[TICK 1]
+[TICK 2]
+[TICK 3]
+[M5.2] tick gate reached: 3 ticks, unbroken run
+[M4] issuing PSCI SYSTEM_OFF          → qemu rc=0
+```
+
+with the M5.1 gate (1 MISS / 3 HITs, two EL1 + two EL0 results, all 42)
+fully intact, and the exception log exactly the six intended exceptions
+(3 IRQ, 2 SVC, 1 PSCI smc) — no strays.
+
+**The spike overrode BOTH scope assumptions — and that is the point of
+the discipline.** (1) The machine defaults to **GICv2**, not GICv3:
+qemu's `finalize_gic_version` picks v2 whenever v2 emulation is
+supported and max_cpus <= 8 (GIC_NCPU), which is the case under TCG, so
+the CPU interface is MMIO at 0x08010000 (GICC_CTLR/PMR/IAR/EOIR), not
+the ICC_* sysregs. (2) The timer's **INTID is 30, not 14**: qemu's FDT
+says `/timer interrupts = <1 14 260>` for the NS EL1 physical timer —
+"PPI 14" is the PPI NUMBER, and a PPI's GIC INTID is ppi + 16 (SGIs
+0-15, PPIs 16-31), so the enable/group/pending bits sit at bit 30.
+Verified from qemu's own dumped device tree (§10.194's spike).
+
+**Three bring-up bugs, all found by booting, all pinned empirically.**
+1. **`msr daifclr` mask bits.** The first attempt unmasked with
+   `daifclr, #4` — the DAIF immediate encoding is {D=8, A=4, I=2,
+   F=1}, so #4 clears the async-abort mask, NOT the IRQ mask. The IRQ
+   unmask is `daifclr, #2` (the exact immediate Linux's
+   `local_irq_enable` uses). Symptom: the wait phase started, zero
+   ticks, boot hung (timeout).
+2. **GICC_CTLR bit 0 is EnableGrp0.** The CPU interface was programmed
+   with 0x1 (EnableGrp0, the SECURE group) while the timer PPI was in
+   group 1 — the interface silently disabled the very interrupt being
+   set up. EnableGrp1 is bit 1 = 0x2. Symptom: with the unmask fixed,
+   still zero ticks — the exception log showed no IRQ ever taken.
+3. **SGI 14 vs PPI 14 (INTID 30).** The distributor was programmed with
+   bit 14 — the SGI 14 enable — not the timer. The tell: reading back
+   GICD_ISENABLER0 showed 0xffff, which is just the always-enabled
+   SGIs (bits 0-15 read as one), so the timer IRQ line never asserted.
+   Symptom: a poll loop (temp debug) showed the timer FIRED
+   (CNTP_CTL_EL0.ISTATUS=1) but GICC_IAR stayed 1023 — the GIC never
+   saw the interrupt. Fix: `GIC_NS_EL1_PHYS_TIMER_INTID 30u`.
+
+**Design as built** (§10.194's shape, minus the overridden pins):
+`arch/arm64/gic.c` — GICv2 init (distributor: GICD_CTLR.EnableGrp1,
+IGROUPR0/ICPENDR0/ISENABLER0 at bit 30; CPU interface: GICC_CTLR 0x2,
+GICC_PMR 0xFF) plus `gic_iar`/`gic_eoir`, and the generic timer
+(`arm_timer_init` reads CNTFRQ_EL0, `arm_timer_arm` reloads
+CNTP_TVAL_EL0 with a 50 ms period and sets CNTP_CTL_EL0.ENABLE). The GIC
+MMIO is reached at high-VA device pages mapped in boot_arm64.S (L2[64]
+L3 table: distributor at 0xFFFF000008000000, CPU interface at
+0xFFFF000008010000 — the UART device-page pattern, attr 0 + PXN). The
+EL1h IRQ slot (VBAR+0x280) is a real entry (`arm64_irq_el1h`) that saves
+x0-x17 + x30 (the C handler preserves the callee-saved set per the ABI),
+calls `arm64_tick_irq`, restores, and erets. `arm64_tick_irq`
+acknowledges (1023 = spurious, nothing to EOIR), re-arms the timer
+BEFORE the EOIR (the RISC-V discipline: minimize the window), bumps
+`g_tick_count`, prints `[TICK N]`, and ends. After the second EL0
+excursion the continuation runs `arm64_wait_ticks(3)`: arm the timer
+first (no early tick), unmask IRQs (`daifclr #2`), busy-wait on the
+volatile counter, re-mask, print the gate line. The tick phase sits
+strictly AFTER the last EL0 result line, so every pre-existing
+assertion is untouched by construction — the milestone's own regression
+guard. The DAIF-immediate and GICC_CTLR gotchas are recorded in the
+code comments so no future edit re-introduces them.
+
+**Verified.** `make arm64-elf` clean, boots rc=0 on cortex-a57 (local)
+and cortex-a53 (CI), deterministic across runs: exactly 3 `[TICK N]`
+lines (unbroken), `[TICK 2]` present (the re-arm proof), the M5.1
+counts unchanged, and the six-exception discipline. CI (arm64-guards)
+asserts the 3-tick run + `[TICK 2]` + all existing counts + rc=0. The
+honest caveats from the scope hold: the gate asserts the tick COUNT and
+the re-arm, never wall-clock (TCG is not real-time); no interrupt
+nesting (the handler runs masked); the lower-EL IRQ slot stays a stub
+because SPSR masks IRQs during the EL0 excursions. The Phase 9n 100ms
+contention probe remains a possible follow-up, not part of this gate.
 
 ---
 
