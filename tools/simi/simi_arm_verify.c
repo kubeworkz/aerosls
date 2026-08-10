@@ -96,11 +96,21 @@ static uint64_t mock_rt_objtype(uint64_t base_vaddr) {
 
 int main(int argc, char** argv) {
     int check_steps = 0;
-    if (argc == 5 && strcmp(argv[4], "--steps") == 0) {
-        check_steps = 1;
-    } else if (argc != 4) {
-        fprintf(stderr, "usage: %s program.tmo entry_name expected_value [--steps]\n", argv[0]);
-        return 1;
+    uint64_t max_steps = 10000000ull;   /* the infinite-loop/decode-bug guard */
+    for (int a = 4; a < argc; a++) {
+        if (strcmp(argv[a], "--steps") == 0) {
+            check_steps = 1;
+        } else if (strcmp(argv[a], "--max-steps") == 0 && a + 1 < argc) {
+            /* M5.2 contention probe (§10.196): the size gate's
+             * arm64_boot_smoke row is a deliberately LONG-RUNNING loop
+             * (the EL0 window must exceed the 100 ms tick period), so its
+             * ~1e9-step execution needs a raised budget. The default stays
+             * 10M — the tight infinite-loop guard for every other fixture. */
+            max_steps = (uint64_t)strtoull(argv[++a], NULL, 10);
+        } else {
+            fprintf(stderr, "usage: %s program.tmo entry_name expected_value [--steps] [--max-steps N]\n", argv[0]);
+            return 1;
+        }
     }
     const char* path = argv[1];
     const char* entry_name = argv[2];
@@ -142,7 +152,7 @@ int main(int argc, char** argv) {
     cpu.x[30 /* x30 = LR */] = AR_EXEC_SENTINEL_LR;
     cpu.x[31 /* sp */] = (uint64_t)CODE_CAP + STACK_SIZE - 16;
 
-    int erc = a64_exec_run(&cpu, 10000000ull);
+    int erc = a64_exec_run(&cpu, max_steps);
     if (erc != AR_EXEC_OK) {
         fprintf(stderr, "FAIL  %-28s execution error: %s (pc=0x%llx)\n",
                 path, a64_exec_strerror(erc), (unsigned long long)cpu.pc);

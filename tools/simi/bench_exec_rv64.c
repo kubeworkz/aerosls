@@ -158,6 +158,11 @@ int main(int argc, char** argv) {
             nskip++;
             continue;
         }
+        if (strcmp(name, "arm64_boot_smoke.simi") == 0) {
+            printf("SKIP  %-24s kernel-embedded boot fixture (M4b/M5.2): by design LONG-RUNNING (the 5e7-iteration contention-probe loop) — a 500x bench-exec-rv64 run would take ~an hour; outside the parity corpus (plan doc §10.196)\n", name);
+            nskip++;
+            continue;
+        }
         long long expected = 0;
         if (!parse_expected(path, &expected)) {
             printf("SKIP  %-24s no 'Expected result:' comment (jmpr_oob faults by design; cap_forge_debug)\n", name);

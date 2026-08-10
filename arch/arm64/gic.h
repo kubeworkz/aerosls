@@ -28,7 +28,7 @@ uint32_t gic_iar(void);
 void gic_eoir(uint32_t intid);
 
 /* Generic timer (CNTP, the EL1 physical timer). init reads CNTFRQ_EL0;
- * arm reloads CNTP_TVAL_EL0 with a 50 ms period and enables the timer.
+ * arm reloads CNTP_TVAL_EL0 with a 100 ms period and enables the timer.
  * The handler re-arms BEFORE the EOIR (the RISC-V discipline: minimize
  * the window where a tick could be missed). */
 void arm_timer_init(void);

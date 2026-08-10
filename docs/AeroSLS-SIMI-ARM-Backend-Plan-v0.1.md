@@ -548,9 +548,20 @@ arm64 kernel programs the CNTP timer and the GIC itself).
   clears A not I (IRQ unmask is #2), GICC_CTLR 0x1 enables group 0
   not group 1 (EnableGrp1 is bit 1 = 0x2), and the ISENABLER0 write
   targeted SGI 14 instead of PPI 14's INTID 30 (§10.195). CI
-  (arm64-guards) asserts the 3-tick run + `[TICK 2]` + the existing
-  counts + rc=0. The Phase 9n 100ms contention probe remains a
-  possible follow-up, not part of the gate.
+  (arm64-guards) asserts the tick run + `[TICK 2]` + the existing
+  counts + rc=0.
+- **Contention probe (M5.2 addendum, §10.196) — DONE:** the Phase 9n
+  follow-up is now part of the gate. The embedded boot program is a
+  1e8-iteration loop (still returns 42), the tick period is 100 ms
+  (was 50 ms), and the timer is armed BEFORE the EL0 excursions — so a
+  tick fires inside each EL0 window, pends against the EL0 SPSR's I
+  mask, and is taken exactly once on the svc-return to EL1 (the
+  continuation clears I at its entry). The gate is the unbroken
+  `[TICK 1..4]` stream with the exact interleave — `eret → [TICK 1] →
+  eret → [TICK 2] → [TICK 3] → [TICK 4] → gate reached` — zero lost
+  ticks, zero missed re-arms, on a57 + a53; CI asserts the ordered
+  stream itself. Measured EL0 windows ~760-790 ms vs the 100 ms period
+  (host-speed-dependent margin; the TCG not-real-time caveat holds).
 - **Honest caveats.** TCG timing is not real-time: the tripwire
   asserts the tick COUNT and the re-arm, never wall-clock; the PPI
   number/GIC version are pinned empirically before the design is
@@ -7508,6 +7519,101 @@ the re-arm, never wall-clock (TCG is not real-time); no interrupt
 nesting (the handler runs masked); the lower-EL IRQ slot stays a stub
 because SPSR masks IRQs during the EL0 excursions. The Phase 9n 100ms
 contention probe remains a possible follow-up, not part of this gate.
+
+### 10.196 M5.2 addendum as built: the Phase 9n-style contention probe
+
+M5.2's scoped follow-up — the RISC-V Phase 9n probe mirrored — is now
+part of the gate: the 100 ms `[TICK N]` stream INTERLEAVES with the EL0
+excursion logs, with zero lost ticks and zero missed re-arms, asserted
+by CI as an exact ordered token stream.
+
+**The design.** (1) The embedded boot program (`arm64_boot_smoke.simi`,
+still returning 42 — the M4b/M5.1 gates are unchanged) becomes a
+1e8-iteration loop; the emitted A64 loop body is ~10 instructions per
+SIMI iteration (the block-head frame reload), so one entry is ~1e9 A64
+instructions — a ~760 ms EL0 window on the dev host, nearly 8x the
+100 ms period (measured directly below). (2) The tick period goes 50 ms
+→ 100 ms (`arm_timer_arm`, `g_cntfrq / 10`). (3) The timer is armed in
+`kernel_arm64_main` BEFORE the first EL0 excursion (it used to be armed
+only in the wait phase after both excursions), so the first fire lands
+inside EL0 #1's window. (4) `arm64_el0_done` clears the I bit as its
+FIRST statement: the svc handler erets back with SPSR 0x3c5 (DAIF
+masked), but a tick pended during the EL0 window is pending right then
+— unmask immediately so it is taken exactly once on that return.
+
+**The lost-tick failure the probe exists to prove absent.** The GIC PPI
+is LEVEL-sensitive: if a window ever ran shorter than the period, the
+timer would fire during the masked EL1 phase, the handler's re-arm would
+deassert the line before it was ever taken, and that tick would vanish
+— the count breaks or (worse) the gate never reaches its target and the
+boot hangs. The measured ~760-790 ms windows vs the 100 ms period are
+the margin that makes the pended-through-EL0 path the one that actually
+happens; the margin is host-speed-dependent (TCG, the standing caveat),
+which is exactly why the gate asserts the ordered stream, not a count
+of ticks that happen to land.
+
+**Measured.** A temporary CNTPCT delta print in the tick handler
+(removed after the measurement) read the EL0 windows directly: [TICK 1]
+was taken 763 ms after the arm, [TICK 2] 1549 ms after — i.e. the two
+windows were ~763 ms and ~786 ms. The final gate, identical on
+cortex-a57 and cortex-a53 and deterministic across runs:
+
+```
+[M5.2] contention probe: 100 ms ticks armed before the EL0 excursions...
+[M5] eret into EL0...
+[TICK 1]                            ← pended through EL0 #1, taken on return
+[M5] returned from EL0 -- result=0x2a
+[M5] eret into EL0...
+[TICK 2]                            ← pended through EL0 #2, taken on return
+[M5] returned from EL0 -- result=0x2a
+[TICK 3]
+[TICK 4]                            ← idle ticks complete the count
+[M5.2] tick gate reached: 4 ticks, unbroken run
+[M4] issuing PSCI SYSTEM_OFF        → qemu rc=0
+```
+
+The M5.1 counts are untouched by construction (1 MISS / 3 HITs / two
+EL1 + two EL0 results, all 42 — the EL1 entries now just take longer:
+~1.9 s total boot). The exception log is exactly 4 IRQ + 2 SVC + 1 PSCI
+smc, no strays.
+
+**The verifier `--max-steps` knob.** The loop executes ~1e9 steps — far
+beyond simi-arm-verify's 10M infinite-loop budget. `simi-arm-verify`
+gains an optional `--max-steps N` (default unchanged at 10M — the tight
+guard for every other fixture); the size gate passes
+`--max-steps 1000000000` for this one row. The M0-era verifier at
+1729f50 got the same knob (throwaway worktree, for the baseline
+measurement only).
+
+**The size-gate row.** The embedded program changed, so its M0 baseline
+was re-measured with the M0-era translator (1729f50 worktree, the
+documented re-measure procedure adapted for a post-M0 fixture): the
+M0 emission is 1020 bytes (the trivial 42-return was 928), the current
+emission is 1016 (-4: the M2.x imm12-fold family) — the loop's
+block-head frame reload is the one shape that wins nothing.
+
+**The execution benches skip the fixture.** `arm64_boot_smoke` is
+kernel-embedded, not a parity-corpus fixture (no runner includes it),
+and a 500x bench-exec run of the loop would take ~an hour — so
+bench-exec, bench-exec-rv64, bench-exec-interp, bench-corpus, and
+cross-size SKIP it with a documented reason. This also closes the
+latent M4b-era breakage where the fixture had no committed baseline
+rows in any bench table (rv64_boot_smoke had them all; arm64_boot_smoke
+was never added) and `make all` failed on it. The ARM parity runner
+(run_arm_tests.sh) asserts the same latent fix: it verifies
+arm64_boot_smoke by RESULT with `--max-steps` (no `--steps` — the
+fixture deliberately has no committed steps row, since bench-exec
+skips it and a row no bench maintains would be a lie; the kernel boot
+is the real gate for this program).
+
+**Honest caveats.** The window margin is host-speed-dependent (TCG is
+not real-time; the gate asserts the ordered tick stream and the re-arm,
+never wall-clock); the position of [TICK 1] specifically depends on the
+EL0 window exceeding the period, which the 1e8-iteration loop makes
+~8x on the dev host and larger on slower CI hosts; the lower-EL IRQ
+slot stays a stub (SPSR masks IRQs during the EL0 excursions, as
+scoped in §10.194). The kernel stack is 256 KiB and the boot now takes
+~2 s — no gate-impacting cost.
 
 ---
 

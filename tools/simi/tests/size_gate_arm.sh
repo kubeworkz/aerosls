@@ -997,7 +997,17 @@ declare -A M0_BASELINES=(
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
-    [rd_star]=1108 [arm64_boot_smoke]=928 [rv64_boot_smoke]=928 [src_resident]=1120
+    # arm64_boot_smoke re-measured at git 1729f50 for the M5.2 contention
+    # probe (plan doc §10.196): the embedded boot program is now a
+    # 1e8-iteration loop (the EL0 window must comfortably exceed the
+    # 100 ms tick period), so the M0-era translator emits 1020 bytes where
+    # the trivial 42-return emitted 928. The current translator emits 1016
+    # (-4: the M2.x imm12-fold family) — the loop's block-head frame
+    # reload is the one shape that wins nothing. The row's verify needs
+    # --max-steps (the loop executes ~1e9 steps vs the 10M budget — the
+    # row passes 2e9 so the ~1e9-step run plus the trampoline/frame
+    # overhead clears it; see the loop below).
+    [rd_star]=1108 [arm64_boot_smoke]=1020 [rv64_boot_smoke]=928 [src_resident]=1120
     [straight_line_bench]=1104 [stress_atomics]=2632 [tail_ret]=1048
 )
 
@@ -1379,7 +1389,16 @@ for name in $(printf '%s\n' "${!M0_BASELINES[@]}" | sort); do
         fail=$((fail+1))
         continue
     fi
-    out=$("$VERIFY" "$name.tmo" main "$exp" 2>/dev/null)
+    # M5.2: the arm64_boot_smoke row is a deliberately long-running loop
+    # (the contention probe's EL0 window), far beyond the verifier's 10M
+    # step budget — raise it for this one row (simi-arm-verify's
+    # --max-steps knob, §10.196). All other rows keep the tight 10M
+    # infinite-loop guard.
+    extra=""
+    if [ "$name" = arm64_boot_smoke ]; then
+        extra="--max-steps 2000000000"
+    fi
+    out=$("$VERIFY" "$name.tmo" main "$exp" $extra 2>/dev/null)
     if [ $? -ne 0 ]; then
         echo "FAIL  $name (verify failed — size gate assumes a passing program)"
         fail=$((fail+1))

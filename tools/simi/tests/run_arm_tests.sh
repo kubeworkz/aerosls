@@ -60,7 +60,19 @@ for src in *.simi; do
     # count (bench_baselines.h — the same table bench-exec gates on) right
     # here in the parity harness, catching decode/emission regressions
     # before any bench runs. Deterministic and machine-independent.
-    if "$VERIFY" "$name.tmo" main "$expected" --steps; then
+    # arm64_boot_smoke is the exception (M5.2, §10.196): the kernel's
+    # embedded program is a deliberately LONG-RUNNING 1e8-iteration loop
+    # (~1e9 executed steps — the contention probe's EL0 window), so its
+    # step count is not a parity signal, it has no committed baseline row
+    # (bench-exec skips it — a row no bench maintains would be a lie),
+    # and the run needs the raised budget. The kernel boot itself is the
+    # real gate for this program; here we assert the result (42) only.
+    if [ "$name" = arm64_boot_smoke ]; then
+        "$VERIFY" "$name.tmo" main "$expected" --max-steps 2000000000
+    else
+        "$VERIFY" "$name.tmo" main "$expected" --steps
+    fi
+    if [ $? -eq 0 ]; then
         pass=$((pass+1))
     else
         fail=$((fail+1))

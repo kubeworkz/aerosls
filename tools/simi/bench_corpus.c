@@ -184,12 +184,21 @@ int main(int argc, char** argv) {
 
     long long tot_instr = 0, tot_scans = 0;
     double tot_us = 0.0;
-    int fails = 0, nrows = 0;
+    int fails = 0, nrows = 0, nskip = 0;
 
     for (int a = 0; a < nfixtures; a++) {
         const char* path = argv[a + 1];
         const char* name = strrchr(path, '/');
         name = name ? name + 1 : path;
+
+        if (strcmp(name, "arm64_boot_smoke.tmo") == 0) {
+            /* M5.2 (§10.196): kernel-embedded boot fixture, outside the
+             * parity corpus — its translate cost is not a corpus signal
+             * (and the fixture's step count dwarfs every other row). */
+            printf("SKIP  %-24s kernel-embedded boot fixture (M4b/M5.2), outside the parity corpus (plan doc §10.196)\n", name);
+            nskip++;
+            continue;
+        }
 
         const struct FixtureBaseline* bl = find_baseline(name);
         if (!bl) {
@@ -256,8 +265,8 @@ int main(int argc, char** argv) {
     }
 
     double us_per_instr = tot_us / (double)(tot_instr * iters);
-    printf("\n%5d fixtures: %lld instr, %lld scans, %.3f us/instr aggregate (%d failed)\n",
-           nfixtures, tot_instr, tot_scans, us_per_instr, fails);
+    printf("\n%5d fixtures: %lld instr, %lld scans, %.3f us/instr aggregate (%d skipped, %d failed)\n",
+           nfixtures, tot_instr, tot_scans, us_per_instr, nskip, fails);
 
     if (fails) return 1;
     printf("ALL CHECKS PASSED — %d fixture rows within their committed baselines\n", nrows);
