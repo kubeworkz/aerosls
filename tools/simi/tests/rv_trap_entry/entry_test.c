@@ -51,10 +51,10 @@ uint64_t g_pre_trap_sp;
  * so the C side can report exactly which one failed to round-trip.
  * Index order = the capture stores in entry_test.S: 0=ra, 1=gp, 2=tp,
  * 3=t0, 4=t1, 5=t2, 6=s0, 7=s1, 8=a0, ... 26=t3, 27=t4, 28=t5, 29=t6
- * (x2/sp omitted -- it is not pinable). Two slots are EXPECTED to
- * mismatch the constants and are skipped: index 3 (t0 -- the entry's
- * sp-restore scratch, left holding the pre-trap sp) and index 28 (t5 --
- * the capture pointer). */
+ * (x2/sp omitted -- it is not pinable). t0 now round-trips too (Design
+ * B part 2 restored its real frame value as the epilogue's final act),
+ * so exactly ONE slot is EXPECTED to mismatch the constants and is
+ * skipped: index 28 (t5 -- the capture pointer). */
 uint64_t g_reg_dump[30];
 
 /* Console. The M-mode build (no firmware) writes the 16550 UART at the
@@ -151,7 +151,6 @@ void dump_and_halt(void) {
     };
     uart_print("[FIXTURE] FAIL: register round-trip dump (x1..x31, sp omitted)\n");
     for (int i = 0; i < 30; i++) {
-        if (i == 3) continue;    /* t0: the entry's sp-restore scratch, left holding the pre-trap sp */
         if (i == 28) continue;   /* t5: the capture pointer, not its post-mret value */
         if (g_reg_dump[i] != exp[i]) {
             uart_print("  ");

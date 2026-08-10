@@ -129,12 +129,14 @@ static const struct FixtureBaseline BASELINES[] = {
     { "ptr_ops.simi", 275, 5902 },
     { "rd_star.simi", 264, 4656 },
     { "rv64_boot_smoke.simi", 232, 5562 },
+    { "rv64_float_smoke_a.simi", 242, 5731 },
+    { "rv64_float_smoke_b.simi", 240, 7533 },
     { "src_resident.simi", 264, 4990 },
     { "straight_line_bench.simi", 275, 5942 },
     { "stress_atomics.simi", 272, 5477 },
     { "tail_ret.simi", 243, 5658 },
 };
-/* 96 rows — the "main" entry's full run (the count for the entry the
+/* 98 rows — the "main" entry's full run (the count for the entry the
  * runners execute; other entries in the same .tmo would differ). */
 
 #endif /* BENCH_BASELINES_H */

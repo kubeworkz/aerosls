@@ -130,12 +130,14 @@ static const struct Rv64Baseline RV64_BASELINES[] = {
     { "ptr_ops.simi", 259, 4579 },
     { "rd_star.simi", 262, 5610 },
     { "rv64_boot_smoke.simi", 212, 5294 },
+    { "rv64_float_smoke_a.simi", 224, 5730 },
+    { "rv64_float_smoke_b.simi", 220, 3648 },
     { "src_resident.simi", 261, 5454 },
     { "straight_line_bench.simi", 261, 4360 },
     { "stress_atomics.simi", 259, 6067 },
     { "tail_ret.simi", 224, 5145 },
 };
-/* 96 rows — steps EXACT (cross-checked against the parity table's
+/* 98 rows — steps EXACT (cross-checked against the parity table's
  * counts), ns/call = median of three N=500 passes (measured 2026-08-09
  * on this sandbox). */
 

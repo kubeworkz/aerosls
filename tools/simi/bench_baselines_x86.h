@@ -126,11 +126,13 @@ static const struct X86Baseline X86_BASELINES[] = {
     { "ptr_ops.simi", 625 },
     { "rd_star.simi", 602 },
     { "rv64_boot_smoke.simi", 387 },
+    { "rv64_float_smoke_a.simi", 445 },
+    { "rv64_float_smoke_b.simi", 425 },
     { "src_resident.simi", 607 },
     { "straight_line_bench.simi", 618 },
     { "stress_atomics.simi", 1996 },
     { "tail_ret.simi", 509 },
 };
-/* 96 rows — emitted bytes EXACT, measured 2026-08-09. */
+/* 98 rows — emitted bytes EXACT, measured 2026-08-09. */
 
 #endif /* BENCH_BASELINES_X86_H */

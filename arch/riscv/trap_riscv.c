@@ -63,10 +63,13 @@ _Static_assert(TF_F0 == 32, "TF_F0 must be the first slot after TF_SEPC (offset 
 _Static_assert(TF_F31 == 63, "TF_F31 must end the f-register block (offset 504)");
 _Static_assert(TF_FCSR == 64, "TF_FCSR at offset 512 (fcsr is 32-bit, full slot)");
 _Static_assert(TF_SFS == 65, "TF_SFS at offset 520 (saved sstatus.FS field)");
-_Static_assert(sizeof(struct RvPerHartData) == 536,
-                "536 = 66*8 (trap_frame, GPR+sepc + Design B FP region) + 8 "
-                "(kernel_sp) -- if this changes, trap_riscv.S's hardcoded "
-                "offsets need updating too");
+_Static_assert(sizeof(struct RvPerHartData) == 1080,
+                "1080 = 66*8 (trap_frame, GPR+sepc + Design B FP region) + 8 "
+                "(kernel_sp) + 2*33*8 (fp_save, Design B part 2: two owners' "
+                "f0-f31+fcsr) + 8 (fp_owner) + 8 (fp_current) -- if this "
+                "changes, trap_riscv.S's hardcoded offsets need updating too");
+_Static_assert(offsetof(struct RvPerHartData, fp_save) == 536,
+                "fp_save must sit right after kernel_sp (offset 536)");
 
 /* ─── Local no-libc helper (mirrors kernel/simi_x86.c's own convention) ── */
 static void rv_print_str(const char* s) {
@@ -228,26 +231,69 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
         return;
     }
 
+#if !defined(SIMI_HOST_TEST)
+    /* Design A + Design B part 2 (ISA doc §16 Phase 16 audit addendum):
+     * an illegal instruction. Kernel-only: the branch reads/writes
+     * sstatus (a CSR the x86 host twin cannot express) and calls the
+     * FP save/load asm helpers (trap_riscv.S, never built on host), so
+     * under SIMI_HOST_TEST code==2 falls through to the unhandled
+     * branch below -- which is exactly what rv-trap-test's "unhandled"
+     * mode pins (scause=2 + stval=0x1234 -> the [TRAP] unhandled
+     * exception message). The lazy-save itself is verified by the
+     * kernel float smoke, not the host twin.
+     *
+     * stval for cause 2 holds the FAULTING INSTRUCTION BITS, not an
+     * address (RISC-V priv spec; the boot spikes confirmed QEMU puts
+     * e.g. 0xF2028553, the full fmv.d.x word, in mtval), so the opcode
+     * is decoded directly from stval. Two classes:
+         *
+         * 1. FP-family opcode (opcodes 0x07/0x27 load/store-FP, the four
+         *    FMA opcodes 0x43/0x47/0x4B/0x4F, OP-FP 0x53) WITH FS=Off: a
+         *    disabled-FP access -- the Design B part 2 LAZY-SAVE. The FP
+         *    registers still hold the previous owner's live state (the
+         *    owner switch only cleared FS, it never saved), so: enable
+         *    FP (FS=Dirty), save the live owner's state into its
+         *    fp_save row, load the new owner's saved state, fold
+         *    fp_current, and return WITHOUT advancing sepc -- the
+         *    trapping instruction re-executes, now enabled. The lazy
+         *    save happens exactly once per owner switch (after the
+         *    first re-execution FS stays Dirty). This is the FS lazy-
+         *    save twin lazy_vector.c's header always claimed existed.
+         * 2. Anything else (genuinely malformed opcode, or an FP
+         *    instruction with FS already enabled): Design A's loud halt
+         *    with the FP-free diagnostic -- no safe recovery exists
+         *    (the arm64 FPEN trap is the same shape: loud halt, never
+         *    silent corruption). */
     if (code == 2) {
-        /* Design A (ISA doc §16 Phase 16 audit addendum): an illegal
-         * instruction. In this kernel the plausible illegal instructions
-         * are FP/vector accesses with sstatus.FS/VS=Off (the kernel is
-         * FP-free by design, rv64_fp_census-gated) or a genuinely
-         * malformed opcode. Report the actual FS state (read here in
-         * both modes: sstatus is a view of mstatus in M-mode) and halt
-         * with the specific diagnostic -- the FP-free violation must be
-         * documented and CI-greppable, not a generic unhandled line. No
-         * safe recovery exists (the arm64 FPEN trap is the same shape:
-         * loud halt, never silent corruption). */
+        uint32_t insn = (uint32_t)stval;
+        unsigned op = insn & 0x7f;
+        int is_fp = (op == 0x07 || op == 0x27 || op == 0x43 || op == 0x47 ||
+                     op == 0x4b || op == 0x4f || op == 0x53);
         uint64_t sstatus_v;
         __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus_v));
         uint64_t fs = (sstatus_v >> 13) & 3;
+        if (is_fp && fs == 0) {
+            uint64_t live = phd->fp_current & 1;
+            uint64_t next = phd->fp_owner & 1;
+            __asm__ volatile("csrw sstatus, %0"
+                              : : "r"(sstatus_v | (3ULL << 13)) : "memory");
+            fp_save_all(&phd->fp_save[live][0]);
+            fp_load_all(&phd->fp_save[next][0]);
+            phd->fp_current = next;
+            rv_print_str("[FP] lazy-save: owner ");
+            rv_print_udec(live);
+            rv_print_str(" -> ");
+            rv_print_udec(next);
+            rv_print_str(" (FS=Off scause=2; sepc re-executes the FP instruction)\n");
+            return;   /* sepc unchanged: re-execute the trapping FP insn */
+        }
         rv_print_str("[TRAP] illegal instruction (scause=2), sstatus.FS=");
         rv_print_udec(fs);
-        rv_print_str(" -- an FP/vector access with FS=Off traps here. The RV64 kernel is FP-free by design (rv64_fp_census gate); halting hart.\n");
+        rv_print_str(" -- an FP/vector access with FS=Off traps here. The RV64 kernel's FP use is limited to the fp_save_all/fp_load_all plumbing (rv64_fp_census gate); halting hart.\n");
         rv_halt();
         return;
     }
+#endif /* !SIMI_HOST_TEST: the scause=2 special-case is kernel-only */
 
     /* Unhandled exception (page fault, misaligned access, ecall from an
      * unexpected mode, ...). No crash-safe recovery exists for these yet

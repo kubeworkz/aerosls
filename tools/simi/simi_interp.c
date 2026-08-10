@@ -560,6 +560,7 @@ int simi_interp_run(SimiObject obj, uint32_t entry_pc, long *steps_out, long lon
  * Without --steps the standalone behaves exactly as before. */
 int main(int argc, char **argv) {
     int check_steps = 0;
+    int measure = getenv("INTERP_STEPS_MEASURE") != NULL;   /* M2.81 re-measure: prints MEASURE rows instead of asserting */
     int argi = 1;
     if (argc >= 2 && strcmp(argv[1], "--steps") == 0) { check_steps = 1; argi++; }
     if (argc - argi < 2) {
@@ -595,10 +596,17 @@ int main(int argc, char **argv) {
             snprintf(fname, sizeof(fname), "%s", base);
         }
 
+        if (measure) {
+            printf("MEASURE %-24s %ld\n", fname, steps);
+            rc = 0;
+        }
+
         const struct InterpBaseline *bl = NULL;
         for (size_t i = 0; i < sizeof(INTERP_BASELINES) / sizeof(INTERP_BASELINES[0]); i++)
             if (strcmp(INTERP_BASELINES[i].name, fname) == 0) { bl = &INTERP_BASELINES[i]; break; }
-        if (!bl) {
+        if (measure) {
+            rc = 0;
+        } else if (!bl) {
             fprintf(stderr, "--steps: no committed baseline for '%s' (update bench_baselines_interp.h — see plan doc §10.170)\n", fname);
             rc = 1;
         } else if (steps != bl->steps) {

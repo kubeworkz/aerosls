@@ -133,12 +133,14 @@ static const struct InterpBaseline INTERP_BASELINES[] = {
     { "ptr_ops.simi", 13, 3011 },
     { "rd_star.simi", 14, 2874 },
     { "rv64_boot_smoke.simi", 3, 2530 },
+    { "rv64_float_smoke_a.simi", 5, 3107 },
+    { "rv64_float_smoke_b.simi", 4, 3411 },
     { "src_resident.simi", 13, 2714 },
     { "straight_line_bench.simi", 14, 3128 },
     { "stress_atomics.simi", 13, 2898 },
     { "tail_ret.simi", 7, 2915 },
 };
-/* 97 rows — steps EXACT (the reference interpreter's own SIMI count,
+/* 99 rows — steps EXACT (the reference interpreter's own SIMI count,
  * cross-checked identical across three measure passes), ns/call = median
  * of three N=500 passes (measured 2026-08-09 on this sandbox). The
  * counts are tiny vs the translated legs' (corpus 2595 SIMI steps vs

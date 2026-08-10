@@ -1007,7 +1007,8 @@ declare -A M0_BASELINES=(
     # --max-steps (the loop executes ~1e9 steps vs the 10M budget — the
     # row passes 2e9 so the ~1e9-step run plus the trampoline/frame
     # overhead clears it; see the loop below).
-    [rd_star]=1108 [arm64_boot_smoke]=1020 [rv64_boot_smoke]=928 [src_resident]=1120
+    [rd_star]=1108 [arm64_boot_smoke]=1020 [rv64_boot_smoke]=928
+    [rv64_float_smoke_a]=968 [rv64_float_smoke_b]=960 [src_resident]=1120
     [straight_line_bench]=1104 [stress_atomics]=2632 [tail_ret]=1048
 )
 

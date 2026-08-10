@@ -1,0 +1,17 @@
+; rv64_float_smoke_a.simi — Design B part 2 (ISA doc §16 Phase 16 audit
+; addendum): owner A of the two-owner FP lazy-save round-trip embedded in
+; kernel/kernel_riscv.c. 1.5 / 0.0 is an IEEE-754 div-by-zero: a DEFINED
+; result (+inf), never a trap, and it sets fcsr's DZ sticky flag (bit 3)
+; — so the kernel can assert the fcsr slot round-trips with the saved
+; owner state (the 33rd slot of fp_save), proving the lazy-save saves
+; more than just the f-registers. Owner A deliberately uses f64 only
+; (the RV64 translator's GP-bounce through f10/f11), so at return the
+; live f-registers hold: f10 = +inf, f11 = 0.0, fcsr = DZ.
+; Expected result: 9218868437227405312   (0x7FF0000000000000 = +inf f64)
+.entry main
+main:
+    ENTER #16
+    LOADI64 r1, #1.5f64, f64
+    LOADI64 r2, #0.0f64, f64
+    DIV r0, r1, r2, f64
+    RET

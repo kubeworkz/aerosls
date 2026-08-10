@@ -26,6 +26,19 @@ for src in *.simi; do
         skip=$((skip+1))
         continue
     fi
+    if [ "$name" = "arm64_boot_smoke" ]; then
+        # M5.2 (plan doc §10.196): the kernel-embedded boot fixture is a
+        # DELIBERATELY long-running loop (1e8 iterations, so a tick can
+        # fire inside each EL0 excursion on the real kernel). Its emitted
+        # size has no committed --bytes baseline (it is kernel-embedded,
+        # not a parity-corpus fixture) — the same reason bench_corpus.c
+        # SKIPs it, the ARM size gate raises the budget for this one row,
+        # and the RV64 runner skips it. Its native behavior is covered by
+        # the arm64 kernel boot smoke and by rv64_boot_smoke's row.
+        echo "SKIP  $name (kernel-embedded boot fixture, 1e8-loop — outside the parity corpus, plan doc §10.196)"
+        skip=$((skip+1))
+        continue
+    fi
     expected=$(grep -oE 'Expected result: -?[0-9]+' "$src" | grep -oE -- '-?[0-9]+$')
     if [ -z "$expected" ]; then
         echo "SKIP  $name (no 'Expected result:' comment)"

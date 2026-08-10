@@ -1,0 +1,14 @@
+; rv64_float_smoke_b.simi — Design B part 2 (ISA doc §16 Phase 16 audit
+; addendum): owner B of the two-owner FP lazy-save round-trip embedded in
+; kernel/kernel_riscv.c. 10.0 + 10.0 = 20.0 — an exact, flag-free f64 add
+; (no overflow, no inexact), the CONTRAST owner: while owner A leaves
+; fcsr.DZ set, owner B's saved fcsr must come back clean (0). The kernel
+; asserts fp_save[1][10] == 0x4034000000000000 and fp_save[1][32] == 0
+; after B is evicted — proving the save captured B's distinct state, not
+; A's. Expected result: 4626322717216342016 (0x4034000000000000 = 20.0)
+.entry main
+main:
+    ENTER #16
+    LOADI64 r1, #10.0f64, f64
+    ADD r0, r1, r1, f64
+    RET
