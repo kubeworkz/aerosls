@@ -122,4 +122,9 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd, uint64_t scause, uint
 
 void riscv_syscall_dispatch(struct RvPerHartData* phd);
 
+/* Deliberate terminal halt (wfi-spin in the kernel; exit(0) in the
+ * SIMI_HOST_TEST build). Shared by the syscall/unhandled paths here and
+ * the shell's `exit` command (arch/riscv/sbi.c). */
+void rv_halt(void);
+
 #endif /* TRAP_RISCV_H */
