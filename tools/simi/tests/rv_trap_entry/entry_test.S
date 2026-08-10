@@ -1,12 +1,16 @@
 # tools/simi/tests/rv_trap_entry/entry_test.S — Phase 9h (ISA doc §16):
-# the trap-entry fixture's test driver. Same source, two builds, exactly
+# the trap-entry fixture's test driver. Same source, three builds, exactly
 # the kernel's own RISCV_MMODE pattern: the default build is a direct
 # M-mode payload under qemu-system-riscv64 -bios none (single hart) —
 # arms mtvec + sscratch against riscv_trap_entry_m; the -DFIXTURE_SMODE
 # build boots under OpenSBI (default -bios) at 0x80200000 — arms stvec +
-# sscratch against riscv_trap_entry. Both use the REAL entry
-# (arch/riscv/trap_riscv.S), load distinctive values into every pinable
-# GPR, trap via ebreak, and verify the entry's save/restore round trip.
+# sscratch against riscv_trap_entry; -DFIXTURE_SMODE -DFIXTURE_SMODE_INTR
+# is the same S-mode build but triggers a SUPERVISOR SOFTWARE interrupt
+# (sie.SSIE + sstatus.SIE + csrs sip, bit 63 scause) instead of ebreak,
+# proving the restore path when the exception PC is NOT advanced. All
+# builds use the REAL entry (arch/riscv/trap_riscv.S), load distinctive
+# values into every pinable GPR, trap, and verify the save/restore round
+# trip.
 #
 # The restore+return half of the entry is the part NO kernel boot
 # exercises: every real trap in the kernel either halts (unhandled
@@ -52,14 +56,34 @@ _start:
     la   t2, _stack_top
     sd   t2, 256(t0)          # kernel_sp (offset 256) = stack top
 
-    # Record what the trap must observe: the ebreak's address (the
-    # exception PC: sepc in S-mode, mepc in M-mode) and the sp live at
-    # trap time.
+    # Record what the trap must observe: the exception PC (sepc in
+    # S-mode, mepc in M-mode) and the sp live at trap time. The
+    # interrupt build records &intr_site (the instruction the SSI is
+    # taken at — sepc is NOT advanced by an interrupt) and arms the
+    # interrupt enables BEFORE the pins below overwrite the scratch
+    # registers.
+#ifdef FIXTURE_SMODE_INTR
+    la   t3, intr_site
+    la   t4, g_expected_sepc
+    sd   t3, 0(t4)
+    la   t5, g_pre_trap_sp
+    sd   sp, 0(t5)
+
+    # Enable ONLY the supervisor software interrupt: clear any pending
+    # SSIP, set sie.SSIE, set sstatus.SIE (the S-mode view of mstatus;
+    # writable from S-mode). Nothing else is enabled, so no other
+    # interrupt source can fire once SIE goes high.
+    csrc sip, 2
+    li   t0, 2
+    csrw sie, t0
+    csrs sstatus, 2
+#else
     la   t3, ebreak_site
     la   t4, g_expected_sepc
     sd   t3, 0(t4)
     la   t5, g_pre_trap_sp
     sd   sp, 0(t5)
+#endif
 
     # Pin every register the entry saves: TF index i -> 0x1000+i.
     li   ra,   0x1000
@@ -93,6 +117,26 @@ _start:
     li   t5,   0x101D
     li   t6,   0x101E
 
+#ifdef FIXTURE_SMODE_INTR
+    # Raise the supervisor software interrupt. The trap is taken at the
+    # NEXT instruction (interrupt checks happen at instruction
+    # boundaries), so sepc = &intr_site. Interrupts do NOT advance the
+    # exception PC, so the dispatcher must NOT add 4 here — and it
+    # acknowledges the interrupt (csrc sip) before returning, because
+    # sret restores SIE from SPIE and would otherwise re-trap
+    # immediately on the still-pending SSIP. sret then resumes exactly
+    # at intr_site, proving the restore path with an un-advanced PC.
+    csrs sip, 2
+intr_site:
+    # 4-BYTE nop (`.option norvc`): intr_site must be a 4-byte
+    # instruction so that a hypothetical +4 sepc advance (the bug this
+    # twin guards against) lands on a CLEAN instruction boundary — the
+    # capture's auipc — where the resume-point check fires, instead of
+    # mid-instruction where the fault would mask the real diagnosis.
+    .option norvc
+    nop
+    .option rvc
+#else
 ebreak_site:
     # ebreak, FORCED to the 4-byte form. The dispatcher advances the
     # exception PC by 4 (the kernel's documented contract, trap_riscv.c);
@@ -104,6 +148,7 @@ ebreak_site:
     .option norvc
     ebreak
     .option rvc
+#endif
 
     # ===== post-trap: the entry restored every register; verify. =====
     # FIRST capture the post-mret register state to g_reg_dump, BEFORE
@@ -144,9 +189,12 @@ ebreak_site:
     sd   t6, 232(t5)
 
     # Now the checks; registers may be clobbered freely.
-    # If the dispatcher did NOT advance the exception PC past the
-    # ebreak, we never get here (sret/mret re-traps on the same ebreak
-    # forever -> the runner sees a hang with no PASS, i.e. a failure).
+    # ebreak builds: if the dispatcher did NOT advance the exception PC,
+    # we never get here (sret/mret re-traps on the same ebreak forever
+    # -> the runner sees a hang with no PASS, i.e. a failure). interrupt
+    # build: the inverse — the dispatcher must NOT advance, and must
+    # clear SSIP (else sret re-traps). Either way, arriving here with
+    # the captured state correct is the PASS.
     #
     # t0 is the ONE register the entry does not round-trip, by design:
     # after its restore it is reused as the sp-restore scratch
@@ -203,6 +251,26 @@ ebreak_site:
     la   t6, g_phd
     bne  t5, t6, fail
 
+    # The exception-PC CSR must still hold the resume point the entry
+    # restored, proving sret/mret landed EXACTLY there: the ebreak
+    # builds resume at ebreak_site+4 (the dispatcher advanced past the
+    # ebreak); the interrupt build resumes at intr_site (no advance —
+    # this is the whole point of the SI twin, and a dispatcher that
+    # wrongly advanced would otherwise be invisible to the round-trip
+    # checks, since the capture after intr_site runs either way).
+#ifdef FIXTURE_SMODE
+    csrr t5, sepc
+#else
+    csrr t5, mepc
+#endif
+#ifdef FIXTURE_SMODE_INTR
+    la   t6, intr_site
+#else
+    la   t6, ebreak_site
+    addi t6, t6, 4
+#endif
+    bne  t5, t6, fail
+
     la   a0, msg_pass
     call uart_print
 halt:
@@ -219,7 +287,9 @@ fail:
     j    halt
 
 .section .rodata
-#ifdef FIXTURE_SMODE
+#ifdef FIXTURE_SMODE_INTR
+msg_pass: .asciz "[FIXTURE] PASS: S-mode interrupt entry save/restore round-trip verified\n"
+#elif defined(FIXTURE_SMODE)
 msg_pass: .asciz "[FIXTURE] PASS: S-mode entry save/restore round-trip verified\n"
 #else
 msg_pass: .asciz "[FIXTURE] PASS: entry save/restore round-trip verified\n"

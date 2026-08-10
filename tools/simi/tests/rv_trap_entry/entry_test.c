@@ -1,10 +1,10 @@
-/* entry_test.c — Phase 9h (ISA doc §16): the C half of the bare-metal
- * trap-entry fixture (tools/simi/tests/rv_trap_entry/). Provides the
- * fixture's RvPerHartData, the pre-trap observation globals, the
- * console, and — most importantly — the verification STUB the real
- * entry calls: riscv_trap_dispatch_m() in the default (M-mode) build,
+/* entry_test.c — Phase 9h (ISA doc §16): the C half of the trap-entry
+ * fixture (tools/simi/tests/rv_trap_entry/). Provides the fixture's
+ * RvPerHartData, the pre-trap observation globals, the console, and —
+ * most importantly — the verification STUB the real entry calls:
+ * riscv_trap_dispatch_m() in the default (M-mode) build,
  * riscv_trap_dispatch() when compiled -DFIXTURE_SMODE. Same source,
- * two builds — exactly the kernel's own RISCV_MMODE pattern.
+ * three builds — exactly the kernel's own RISCV_MMODE pattern.
  *
  * The stub runs INSIDE the trap (the entry switched sp to
  * phd->kernel_sp before calling it, a0 = &phd) and checks the
@@ -106,7 +106,9 @@ void uart_print(const char* s) {
     while (*s) uart_putchar(*s++);
 }
 
-#ifdef FIXTURE_SMODE
+#ifdef FIXTURE_SMODE_INTR
+#define FIXTURE_MODE_TAG " (S-mode, interrupt)"
+#elif defined(FIXTURE_SMODE)
 #define FIXTURE_MODE_TAG " (S-mode)"
 #else
 #define FIXTURE_MODE_TAG ""
@@ -216,6 +218,15 @@ void FIXTURE_DISPATCH_MAIN(struct RvPerHartData* phd) {
 
     uart_print("[FIXTURE] dispatcher" FIXTURE_MODE_TAG ": frame save verified\n");
 
+#ifdef FIXTURE_SMODE_INTR
+    /* Interrupt build: interrupts do NOT advance the exception PC, so
+     * the entry must resume at the SAME instruction (intr_site) — the
+     * whole point of this variant is proving the restore path with an
+     * un-advanced sepc. Also acknowledge the software interrupt (clear
+     * SSIP): sret restores SIE from SPIE (re-enabling interrupts), so
+     * a still-pending SSIP would re-trap immediately after the return. */
+    __asm__ volatile("csrc sip, 2");
+#else
     /* Advance the exception PC past the ebreak — the contract the
      * kernel's own dispatch keeps (see riscv_trap_dispatch_common's
      * code==3/9 branches) but never exercises, because it never
@@ -223,6 +234,7 @@ void FIXTURE_DISPATCH_MAIN(struct RvPerHartData* phd) {
      * and sret/mret resumes at ebreak+4, letting the fixture's
      * post-trap checks run. */
     phd->trap_frame[TF_SEPC] += 4;
+#endif
 }
 
 /* The OTHER entry (the one this build does NOT arm) sits in the SAME
