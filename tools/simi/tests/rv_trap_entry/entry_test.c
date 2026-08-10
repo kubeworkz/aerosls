@@ -33,9 +33,12 @@
 #include "../../../../arch/riscv/trap_riscv.h"
 
 /* The fixture's per-hart data. The entry (trap_riscv.S) swaps sscratch
- * into sp and saves the frame here; kernel_sp (offset 256) is set by
- * _start in entry_test.S. Every one of the 32 frame slots is written by
- * the entry itself, so the fixture needs no .bss zeroing for it. */
+ * into sp and saves the frame here; kernel_sp (offset 528 — 66 slots
+ * since the Design B FP region, ISA doc §16 Phase 16 audit addendum) is
+ * set by _start in entry_test.S. Every one of the 32 GPR+sepc slots is
+ * written by the entry itself; the reserved FP slots (32..65) stay zero
+ * and are covered by the exp[] zero-fill below, so the fixture needs no
+ * .bss zeroing for it. */
 struct RvPerHartData g_phd;
 
 /* What the trap must observe, recorded by _start right before the

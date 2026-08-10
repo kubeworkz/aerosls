@@ -47,15 +47,26 @@ extern void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval);
  * implicit. */
 _Static_assert(offsetof(struct RvPerHartData, trap_frame) == 0,
                 "trap_riscv.S assumes trap_frame is RvPerHartData's first member");
-_Static_assert(offsetof(struct RvPerHartData, kernel_sp) == 256,
-                "trap_riscv.S hardcodes offset 256 for kernel_sp");
+_Static_assert(offsetof(struct RvPerHartData, kernel_sp) == 528,
+                "trap_riscv.S hardcodes offset 528 for kernel_sp (Design B FP region: 66*8)");
 _Static_assert(TF_SP == 1, "trap_riscv.S hardcodes offset 8 for trap_frame.sp");
 _Static_assert(TF_SEPC == 31, "trap_riscv.S hardcodes offset 248 for trap_frame.sepc");
 _Static_assert(TF_A7 == 16, "riscv_syscall_dispatch reads a7 at trap_frame[16] (offset 128)");
 _Static_assert(TF_A0 == 9, "riscv_syscall_dispatch reads/writes a0 at trap_frame[9] (offset 72)");
-_Static_assert(sizeof(struct RvPerHartData) == 264,
-                "264 = 32*8 (trap_frame) + 8 (kernel_sp) -- if this changes, "
-                "trap_riscv.S's hardcoded offsets need updating too");
+/* Design B FP region (ISA doc §16 Phase 16 audit addendum): pin the
+ * reserved slots so the future save path (an FS lazy-save scause=2
+ * handler, or an eager entry save) and this header can never drift: the
+ * GPR+sepc slots occupy 0..248, f0-f31 256..504, fcsr 512, sfs 520.
+ * The entry assembly does not touch the FP region yet (it only saves
+ * GPRs), so these asserts document the reservation, not current code. */
+_Static_assert(TF_F0 == 32, "TF_F0 must be the first slot after TF_SEPC (offset 256)");
+_Static_assert(TF_F31 == 63, "TF_F31 must end the f-register block (offset 504)");
+_Static_assert(TF_FCSR == 64, "TF_FCSR at offset 512 (fcsr is 32-bit, full slot)");
+_Static_assert(TF_SFS == 65, "TF_SFS at offset 520 (saved sstatus.FS field)");
+_Static_assert(sizeof(struct RvPerHartData) == 536,
+                "536 = 66*8 (trap_frame, GPR+sepc + Design B FP region) + 8 "
+                "(kernel_sp) -- if this changes, trap_riscv.S's hardcoded "
+                "offsets need updating too");
 
 /* ─── Local no-libc helper (mirrors kernel/simi_x86.c's own convention) ── */
 static void rv_print_str(const char* s) {

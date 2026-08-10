@@ -59,7 +59,11 @@ _start:
     csrw mtvec, t1
 #endif
     la   t2, _stack_top
-    sd   t2, 256(t0)          # kernel_sp (offset 256) = stack top
+    # kernel_sp sits at offset 528 since the Design B FP region (ISA doc
+    # §16 Phase 16 audit addendum) grew trap_frame from 32 to 66 slots
+    # (TF_F0..TF_F31 + fcsr + sfs occupy 256..520); trap_riscv.c's
+    # _Static_assert pins offsetof(kernel_sp) == 528.
+    sd   t2, 528(t0)          # kernel_sp (offset 528) = stack top
 
     # Record what the trap must observe: the exception PC (sepc in
     # S-mode, mepc in M-mode) and the sp live at trap time. The
