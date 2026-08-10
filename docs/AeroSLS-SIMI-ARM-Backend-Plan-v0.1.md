@@ -467,6 +467,48 @@ sync-from-lower-A64 handler stores x9 (the result) and erets to a real
   containment use-case lands, the capability-flavored object-catalog
   trap for foreign-code domains.
 
+**M5.1 — the activation cache (translate-on-first-use). SCOPED
+(§10.192).** The System/38 `CREATE PROGRAM` → activation split, on
+arm64, mirroring `kernel/simi_translate.c`'s `g_activations[]` (ISA doc
+§11): translate a `.tmo` once, cache the emitted A64 code, and re-enter
+it any number of times WITHOUT retranslating. Today the arm64 kernel
+already reuses one buffer across the M4b EL1 direct call and the M5 EL0
+excursion, but that reuse is implicit — M5.1 makes it an explicit,
+name+hash-keyed cache with an observable HIT path.
+- **Design.** A bounded static array of slots (mirroring the x86
+  `struct SimiActivation`: object name + FNV-1a hash + `.tmo` size +
+  translated code length + entry offset); the code bytes stay in the
+  existing `g_smoke_code_buf` (one slot per embedded object; the array
+  shape generalizes, no allocator — the kernel's static-array-everywhere
+  discipline). MISS: `simi_arm_translate()` + icache flush + record the
+  slot. HIT: skip the translator entirely, reuse entry_off/len, no
+  re-flush (bytes unchanged). The REGISTER FRAME IS NOT CACHED: the
+  SIMI frame is SP-relative, carved per entry off the kernel stack
+  (EL1) or a fresh user stack (EL0) — the arm64 equivalent of the x86
+  cache's fresh-per-process scratch frame, but free: the arm64
+  trampoline has no baked per-process address (unlike the x86 r7
+  `movabs`), so nothing about the cached bytes is per-entry.
+- **Gate (planned):** a translate counter `g_translate_count` — a MISS
+  increments it, a HIT must not. The boot log prints `[SIMI] activation
+  cache MISS (translated N bytes)` once, then `[SIMI] activation cache
+  HIT (reusing entry_off)` on every later entry, with all results 42:
+  (1) EL1 direct activation (MISS, 42); (2) EL1 direct re-entry (HIT,
+  42, counter unchanged); (3) EL0 excursion (HIT — same cached page
+  mapped into a FRESH user tree with fresh stack/stub/scratch, 42 via
+  SVC); (4) EL0 excursion again (HIT, fresh tree, 42). Four entries,
+  one translation, all 42. CI (arm64-guards) asserts the MISS line +
+  at least one HIT line + the four result lines + rc=0.
+- **Honest caveats.** Single-object today (one embedded `.tmo` — no
+  second object exists to exercise slot selection); re-upload
+  invalidation is argued from the FNV-1a keying (the x86 kernel's
+  hash-vs-collision testing, ISA §11) but not exercised — this kernel
+  has no upload path; and a changed-bytes retranslate reuses the same
+  fixed buffer, so the x86 Phase-4 frame-leak gap degenerates to
+  nothing here (one static 4 KiB region, never grown). Sizing: ~80-120
+  lines in `kernel_arm64.c` only — the translator core is untouched
+  (the cache is a caller-side concern, exactly as x86's
+  `simi_translate.c` wraps rather than modifies `simi_x86.c`).
+
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
 from Step 6.4 applies equally here:
@@ -7066,6 +7108,105 @@ sandbox. Next items: an activation cache, GIC interrupts, FP/SIMD
 context — and, only if a containment use-case lands, a
 capability-flavored object-catalog trap for foreign-code domains
 (deliberately not a POSIX-style syscall ABI).
+
+### 10.192 M5.1 scope: the activation cache (translate-on-first-use)
+
+M5.1 is the next of the M5 honest-remainder items (§6 M5, §10.191),
+scoped as its own milestone in the established "scope before spike"
+shape. It ports the x86 kernel's Phase 4 activation cache (ISA doc §11,
+`kernel/simi_translate.c`'s `g_activations[]`) to the arm64 kernel: the
+System/38 `CREATE PROGRAM` → activation split — translate a `.tmo` to
+native A64 once, cache the emitted code, and re-enter it many times
+without retranslating.
+
+**Why this is a real (if small) milestone, not a no-op.** The arm64
+kernel's two entry paths today already share one buffer: M4b's
+`arm64_boot_smoke_test()` translates into `g_smoke_code_buf` and records
+`g_code_len`/`g_entry_off`, and M5's `run_user_program()` reuses those
+globals when it maps the buffer's physical page into the user TTBR0
+tree — it does NOT retranslate. So the reuse exists but is implicit and
+unobservable: nothing counts translations, nothing keys on content, and
+nothing would stop a future change from silently re-translating on every
+entry (the exact regression the x86 Phase 3→4 gap was). M5.1 makes the
+property explicit and pinned.
+
+**Design.** A bounded static array of activation slots in
+`kernel_arm64.c`, mirroring the x86 shape:
+
+```
+struct Arm64Activation {
+    char     name[PROC_NAME_LEN];   /* embedded object name ("arm64_boot_smoke") */
+    uint32_t content_hash;          /* FNV-1a of the .tmo bytes (x86 keying) */
+    uint32_t tmo_len;               /* byte size of the .tmo */
+    uint32_t code_len;              /* translated A64 length (for flush + bounds) */
+    uint32_t entry_off;             /* entry offset within g_smoke_code_buf */
+    uint32_t valid;
+};
+```
+
+- **MISS** (no slot, or name+hash+size mismatch): run
+  `simi_arm_translate()` into `g_smoke_code_buf` (unchanged),
+  `arm64_flush_icache()`, record the slot, increment `g_translate_count`,
+  print `[SIMI] activation cache MISS (translated N bytes)`.
+- **HIT** (name+hash+size all match): skip the translator entirely, take
+  `entry_off`/`code_len` from the slot, do NOT re-flush (bytes
+  unchanged), do NOT increment the counter, print `[SIMI] activation
+  cache HIT (reusing entry_off)`.
+- **The register frame is deliberately NOT cached.** The SIMI frame is
+  SP-relative (carved off the caller's stack — the M5 finding), so each
+  entry gets a fresh frame: the kernel stack for the EL1 direct path, a
+  fresh user stack for the EL0 containment path. This is the arm64
+  equivalent of the x86 cache's fresh-per-process scratch frame — but
+  free, because the arm64 trampoline has no baked per-process address
+  (unlike the x86 r7 `movabs` immediate §10 of the ISA doc), so nothing
+  in the cached bytes is per-entry. The EL0 path must still build a
+  FRESH user tree per excursion (fresh stack/stub/scratch pages — never
+  shared, same discipline as x86's private scratch frame); only the code
+  page is the shared cached one.
+- **Invalidation.** Keyed on FNV-1a of the uploaded bytes + size, not
+  just the name (x86 precedent): a re-upload with different bytes is a
+  MISS. This kernel has no upload path, so the trigger is argued from
+  the x86 kernel's tested keying (ISA §11: deterministic, zero pairwise
+  collisions across the corpus, single-byte mutation changes the hash),
+  not exercised here — stated plainly, per the project's honest-caveat
+  discipline. And because the code region is one fixed 4 KiB static
+  buffer, the x86 Phase-4 "re-upload orphans old frames" gap degenerates
+  to nothing: there is no growing allocation to leak.
+
+**Re-entry paths (both proven by M4b/M5, now cache-aware).**
+1. **EL1 direct (M4b path):** `blr g_smoke_code_buf + entry_off`, result
+   in x9 — a plain callable A64 subroutine, re-enterable any number of
+   times; the M4b inline-asm call shape is unchanged.
+2. **EL0 containment (M5 path):** map the cached buffer's physical page
+   (kernel VA minus KERNEL_VIRT_OFF) into a fresh user TTBR0 tree at
+   USER_CODE_VA, plus fresh stack/stub/scratch pages; set SP_EL0, x30 =
+   stub VA, ELR_EL1 = USER_CODE_VA + entry_off, SPSR_EL1 = EL0t; eret.
+   The blob runs, `br x30`s into the stub, `svc #0` traps, the handler
+   stores x9 and erets into the noreturn continuation — unchanged from
+   M5, with the same two-exception discipline.
+
+**The honest gate (planned).** A translate counter + log lines make the
+"once" property observable:
+- (1) EL1 direct activation → MISS, translated N bytes, result 42;
+- (2) EL1 direct re-entry → HIT, result 42, `g_translate_count`
+  unchanged;
+- (3) EL0 excursion → HIT (same cached page, fresh tree), result 42 via
+  SVC;
+- (4) EL0 excursion again → HIT, fresh tree, result 42.
+Four entries, one translation, all returning 42. Optionally pin the
+buffer's first words' hash unchanged across the HITs (byte-identity
+discipline on the cache itself). CI (arm64-guards) asserts the MISS
+line, at least one HIT line, the four result lines, and rc=0.
+
+**Sizing and risk.** ~80-120 lines in `kernel_arm64.c` only: the FNV-1a
+(borrowed from the x86 keying), the slot find/insert, and the HIT/MISS
+branching in the two call paths. The translator core
+(`kernel/simi_arm.c`) is untouched — the cache is a caller-side concern,
+exactly as x86's `simi_translate.c` wraps rather than modifies
+`simi_x86.c`, so the byte-identity re-diff tripwire and the
+freestanding-compile gate are unaffected. The riskiest unknowns are
+nothing new: the EL0 re-entry path is the M5-proven shape, and the only
+new moving part is the counter/keying, both plain C.
 
 ---
 
