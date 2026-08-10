@@ -152,18 +152,24 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
         (uint64_t)(uintptr_t)&g_hart0_trap_stack[sizeof(g_hart0_trap_stack) - 16];
     riscv_trap_init(&g_hart0_data, trap_stack_top);
 
-#if !defined(RISCV_MMODE)
     /* Phase 9i: the first device-driven kernel I/O. The trap path above
      * only routes interrupts that arrive; nothing made them arrive. This
-     * programs the PLIC so the 16550 UART's RX line can reach S-mode
-     * (source-10 priority, hart-0 S-mode context enable + threshold,
-     * sie.SEIE, and the UART's own IER bit 0 so a byte actually asserts
-     * the line), then raises the GLOBAL interrupt enable (sstatus.SIE).
-     * From here on, an incoming character interrupts the hart, and
-     * handle_riscv_supervisor_interrupt (arch/riscv/sbi.c) drains the
-     * 16550 directly and echoes it. M-mode build: not wired -- the PLIC
-     * S-mode context and sie.SEIE have no meaning in bare M-mode (that
-     * path would need mie.MEIE + the M-mode PLIC context instead). */
+     * programs the PLIC so the 16550 UART's RX line can reach the mode
+     * this build runs in (source-10 priority, the hart-0 context enable +
+     * threshold, the mode's external-interrupt bit, and the UART's own
+     * IER bit 0 so a byte actually asserts the line), then raises the
+     * GLOBAL interrupt enable. From here on, an incoming character
+     * interrupts the hart, and handle_riscv_supervisor_interrupt
+     * (arch/riscv/sbi.c) drains the 16550 directly and echoes it.
+     * S-mode build: the PLIC S-mode context (2N+1) + sie.SEIE +
+     * sstatus.SIE (bit 1). M-mode twin (bare metal, no firmware): the
+     * M-mode context (2N+0) + mie.MEIE + mstatus.MIE (bit 3) -- the
+     * interrupt is taken in M-mode at mtvec with mcause = bit63 + 11. */
+#if defined(RISCV_MMODE)
+    init_riscv_plic(0);
+    __asm__ volatile("csrs mstatus, 8");
+    rv_boot_print("[PLIC] UART RX interrupt wired (source 10 -> hart 0 M-mode, MEIE + MIE on).\n");
+#else
     init_riscv_plic(0);
     __asm__ volatile("csrs sstatus, 2");
     rv_boot_print("[PLIC] UART RX interrupt wired (source 10 -> hart 0 S-mode, SEIE + SIE on).\n");

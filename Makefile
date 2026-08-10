@@ -323,6 +323,14 @@ RV_ELF_M     = sls_riscv_kernel_m.elf
 RV_OBJECTS_E = $(RV_OBJECTS:.rv.o=.e.rv.o)
 RV_ELF_E     = sls_riscv_kernel_echo.elf
 
+# The M-mode echo twin (distinct .m.e.rv.o names): the same echo sources
+# with BOTH -DRISCV_MMODE and -DKERNEL_UART_ECHO -- the bare-metal build
+# (linked at 0x80000000) whose PLIC path uses the M-mode context,
+# mie.MEIE and mstatus.MIE (see kernel/kernel_riscv.c and ISA doc §16
+# Phase 9i).
+RV_OBJECTS_ME = $(RV_OBJECTS:.rv.o=.m.e.rv.o)
+RV_ELF_ME     = sls_riscv_kernel_echo_m.elf
+
 .PHONY: all clean x86-run riscv-run plugins
 
 all: plugins x86-iso riscv-elf
@@ -456,8 +464,14 @@ x86-run: x86-iso
 %.e.rv.o: %.c
 	$(RV_CC) $(RV_CFLAGS) -DKERNEL_UART_ECHO -c $< -o $@
 
+%.m.e.rv.o: %.S
+	$(RV_CC) $(RV_CFLAGS_M) -DKERNEL_UART_ECHO -c $< -o $@
+
+%.m.e.rv.o: %.c
+	$(RV_CC) $(RV_CFLAGS_M) -DKERNEL_UART_ECHO -c $< -o $@
+
 # Unique object for trap_riscv.c (see the RV_OBJECTS comment above), all
-# three variants.
+# four variants.
 arch/riscv/trap_riscv_c.rv.o: arch/riscv/trap_riscv.c
 	$(RV_CC) $(RV_CFLAGS) -c $< -o $@
 
@@ -466,6 +480,9 @@ arch/riscv/trap_riscv_c.m.rv.o: arch/riscv/trap_riscv.c
 
 arch/riscv/trap_riscv_c.e.rv.o: arch/riscv/trap_riscv.c
 	$(RV_CC) $(RV_CFLAGS) -DKERNEL_UART_ECHO -c $< -o $@
+
+arch/riscv/trap_riscv_c.m.e.rv.o: arch/riscv/trap_riscv.c
+	$(RV_CC) $(RV_CFLAGS_M) -DKERNEL_UART_ECHO -c $< -o $@
 
 $(RV_ELF): $(RV_OBJECTS)
 	$(RV_LD) $(RV_LDFLAGS) $(RV_OBJECTS) -o $(RV_ELF)
@@ -476,7 +493,10 @@ $(RV_ELF_M): $(RV_OBJECTS_M)
 $(RV_ELF_E): $(RV_OBJECTS_E)
 	$(RV_LD) $(RV_LDFLAGS) $(RV_OBJECTS_E) -o $(RV_ELF_E)
 
-riscv-elf: $(RV_ELF) $(RV_ELF_M) $(RV_ELF_E)
+$(RV_ELF_ME): $(RV_OBJECTS_ME)
+	$(RV_LD) $(RV_LDFLAGS_M) $(RV_OBJECTS_ME) -o $(RV_ELF_ME)
+
+riscv-elf: $(RV_ELF) $(RV_ELF_M) $(RV_ELF_E) $(RV_ELF_ME)
 
 riscv-run: riscv-elf
 	@if [ ! -f sls_storage_rv64.img ]; then qemu-img create -f raw sls_storage_rv64.img 10G; fi

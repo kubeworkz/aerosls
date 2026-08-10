@@ -420,6 +420,46 @@ else
     skip=$((skip+1))
 fi
 
+# Phase 9i M-mode twin: the SAME echo over the bare-metal path — the
+# M-mode PLIC context (context 0), mie.MEIE + mstatus.MIE, the interrupt
+# taken at mtvec with mcause = bit63 + 11 (the handler accepts both cause
+# 9/SEIP and 11/MEIP). Same socket protocol and assertions as rv-uart-
+# echo; the difference is `-bios none` + sls_riscv_kernel_echo_m.elf
+# (linked at 0x80000000, -DRISCV_MMODE -DKERNEL_UART_ECHO). This is also
+# the first real M-mode INTERRUPT round trip through the entry (the
+# entry fixture's M-mode build only exercised the ebreak/advanced case).
+if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    if make -C ../../.. sls_riscv_kernel_echo_m.elf >/dev/null 2>&1; then
+        rm -f /tmp/sls_echo_m.sock
+        timeout 40 qemu-system-riscv64 -M virt -m 128M -smp 1 -bios none \
+            -chardev socket,id=s0,path=/tmp/sls_echo_m.sock,server=on,wait=on \
+            -serial chardev:s0 -kernel ../../../sls_riscv_kernel_echo_m.elf \
+            -nographic >rv_echo_m_qemu.out 2>&1 &
+        qpid=$!
+        python3 echo_client.py /tmp/sls_echo_m.sock >rv_echo_m_client.out 2>&1
+        crc=$?
+        wait $qpid
+        rc=$?
+        if [ "$rc" -eq 124 ] \
+           && [ "$crc" -eq 0 ] \
+           && grep -q "ECHO_OK" rv_echo_m_client.out; then
+            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  rv-uart-echo-m (qemu rc=$rc, client rc=$crc — echo not as expected)"
+            cat rv_echo_m_client.out rv_echo_m_qemu.out
+            fail=$((fail+1))
+        fi
+        rm -f rv_echo_m_client.out rv_echo_m_qemu.out /tmp/sls_echo_m.sock
+    else
+        echo "SKIP  rv-uart-echo-m (echo kernel build failed — check the cross toolchain)"
+        skip=$((skip+1))
+    fi
+else
+    echo "SKIP  rv-uart-echo-m (no qemu-system-riscv64 / riscv64-unknown-elf-gcc / python3)"
+    skip=$((skip+1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
