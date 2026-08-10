@@ -333,14 +333,19 @@ aggregate ABI (a pure convention — zero codegen, as Phase 14 established).
   out-of-range test (`jmpr_oob`) traps rather than jumping wild, on all four
   engines — the §16 Phase 14 verification discipline, applied to A64.
 
-**M2 — kernel copy + honest kernel-side gap note.**
+**M2 — kernel copy + honest kernel-side gap note — DONE (M3's kernel half, §10.180).**
 Byte-identical `kernel/simi_arm.{c,h}` following the Phase 3/5 port convention
 (shortened header pointing back at the host copy; re-diffed and confirmed
 identical below it), compiled under freestanding flags with zero warnings.
-- **Gate:** the port compiles clean under the kernel's freestanding flags, and
-  the doc records the open gap in Phase 9e's exact shape: *executing* A64 in a
-  kernel requires an arm64 kernel build or real ARM hardware/QEMU — not claimed,
-  filed as honest unverified.
+The copy was staged when M3's real-execution leg landed, so it inherits M3's
+verification rather than the plan's original "unverified" framing: the host
+copy it is byte-identical to is now proven by qemu-aarch64 real execution
+(§10.178/10.179), and its freestanding compile is a CI-enforced gate.
+- **Gate:** the port compiles clean under the kernel's freestanding flags
+  (zero warnings, enforced by the arm64-guards CI job), and the header records
+  the open gap honestly: *executing* A64 in a kernel still requires an arm64
+  kernel build — the copy is compiled nowhere and linked into nothing; there is
+  no arm64 kernel target to wire it into.
 
 **M3 — CLOSED (qemu-aarch64 leg), optional (arm64 kernel half).** The
 real-execution proof landed via `qemu-aarch64` user-mode: `simi_arm_jit.c`
@@ -358,8 +363,11 @@ both fixed in §10.179), and A64 architectural rules (SP 16-byte alignment,
 (`run_arm64_tests.sh`) skips cleanly without the toolchain (the
 "environment-dependent" premise) and the `arm64-guards` CI job installs it
 and requires all-pass. The other half of M3's definition — an *arm64 kernel
-target* if the roadmap ever grows one — remains deliberately undone and
-honest.
+target* if the roadmap ever grows one — is split: the kernel-side
+**copy** of the translator (`kernel/simi_arm.{c,h}`, M2's milestone) is
+done, staged and compile-gated (§10.180); the actual arm64 kernel
+*build* and its wiring (translate glue, paging, activation, syscall
+path) remains deliberately undone and honest.
 
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
@@ -6339,6 +6347,44 @@ contention all execute correctly on actual AArch64, and jmpr_oob still
 faults at the bounds-check UDF in both legs. The two bugs are the
 fulfillment of §6's promise that M3 would close "the one documented
 residual-risk class the whole M2 series has been building against".
+
+### 10.180 M2's kernel copy lands as M3's kernel half — staged, not wired
+
+M2's milestone text defined the kernel copy (`kernel/simi_arm.{c,h}`,
+byte-identical below a shortened header, compiled freestanding with zero
+warnings) but it was never executed — the M2 series ballooned into the
+size work instead. M3's kernel half picks it up, and it lands STRONGER
+than the plan's original gate: the host copy it is byte-identical to is
+now proven by real A64 execution (§10.178/10.179), and the freestanding
+compile is a CI-enforced gate rather than a one-time check.
+
+`kernel/simi_arm.c` (3862 lines) and `kernel/simi_arm.h` (110 lines)
+follow the Phase 5 RV64 port convention exactly: a replaced header
+carrying the kernel-copy framing and the honest gap note, then the
+unmodified body — re-diffed at commit time and confirmed byte-identical
+(the .c body below the header equals `tools/simi/simi_arm.c` lines
+72-end; the .h body equals `tools/simi/simi_arm.h` line 29-end). One
+pre-existing dead function (`e64`, zero call sites) was removed from the
+HOST copy as part of this, so the copy compiles with zero warnings —
+`aarch64-linux-gnu-gcc -ffreestanding -O2 -Wall -Wextra -ffunction-
+sections -fdata-sections -c kernel/simi_arm.c` is clean — and that exact
+command is now a step in the arm64-guards CI job (the M2 gate, enforced
+on every push; a divergence from the host copy would surface as a
+behavior difference under the real-A64 leg in the same job).
+
+The honest boundary, stated in both headers: there is DELIBERATELY no
+arm64 kernel build in this tree, so the copy is compiled nowhere and
+linked into nothing — unlike `kernel/simi_riscv.c`, which sits in the
+RISC-V kernel's `RV_C_SRC` because a RISC-V kernel exists. Wiring the
+A64 translator into a live kernel — `kernel/simi_translate_arm.c`-
+equivalent glue, an arm64 activation/spawn path, user-mode paging, an
+object-catalog/syscall-dispatch/exit-stub story — all awaits an arm64
+kernel target the roadmap does not grow. That is the remaining half of
+M3, kept honest and undone (updated §6).
+
+---
+
+## Sources consulted
 
 ---
 
