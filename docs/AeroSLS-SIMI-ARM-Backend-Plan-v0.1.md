@@ -7776,11 +7776,11 @@ access` and then hung at the EL1h sync stub (no "after" print,
 rc=124), exactly the GICv2-running-priority precedent's lesson: TCG
 can be lax, so the spike matters. The failure mode is LOUD (the
 vector stub's wfi hang) on both TCG and real silicon — never silent
-state corruption. Note the x86 asymmetry worth recording: the x86
-kernel's `-mno-sse` has NO equivalent trap backstop (x87 is always
-on; CR0.TS/MP are not set), so an accidental x87/SSE instruction
-there silently corrupts — the ARM kernel's FPEN trap is strictly
-stronger.
+state corruption. The x86 asymmetry is recorded in the ISA doc §16
+Phase 16: x86's `-mno-sse` flags have no LOUD backstop — the wired
+`#NM` lazy handler (CR0.TS=1 on context switch, vector 7) silently
+"rescues" an accidental SSE instruction with foreign state instead of
+halting — so the ARM kernel's FPEN trap is strictly stronger.
 
 **The nested-handler question resolves to: no save, by construction.**
 The M5.3 handler opens a 10 ms unmasked window; if it (or anything
