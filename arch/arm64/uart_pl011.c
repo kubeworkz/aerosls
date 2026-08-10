@@ -1,15 +1,16 @@
-/* arch/arm64/uart_pl011.c — M4a: the qemu -M virt PL011 console.
+/* arch/arm64/uart_pl011.c — M4a/M5: the qemu -M virt PL011 console.
  *
- * UART0 lives at 0x09000000 in the virt MMIO region. M4a needs TX only
- * (the boot banner + PSCI farewell), polled — no interrupts, no RX, no
- * FIFO management. QEMU's PL011 resets already enabled at 8n1, so
+ * UART0 lives at physical 0x09000000 in the virt MMIO region. Since M5
+ * the kernel is TTBR1-pure (plan doc §6 M5 / §10.191): the low half is
+ * unmapped in the kernel, so the device is reached at its HIGH VA
+ * (physical + KERNEL_VIRT_OFF), mapped by the boot tree's L3 device
+ * page. The driver is TX-only, polled — no interrupts, no RX, no FIFO
+ * management; QEMU's PL011 resets already enabled at 8n1, so
  * uart_init() only guarantees TXE|UARTEN on silicon that resets
- * differently; the divisor/line-control registers are left at the
- * model's working defaults (a documented M4a scope cut, not a driver
- * gap — baud programming is irrelevant to the serial-log assertions). */
+ * differently (a documented M4a scope cut, not a driver gap). */
 #include <stdint.h>
 
-#define PL011_BASE      0x09000000UL
+#define PL011_BASE      0xFFFF000009000000UL
 #define PL011_DR        (*(volatile uint32_t *)(PL011_BASE + 0x000))
 #define PL011_FR        (*(volatile uint32_t *)(PL011_BASE + 0x018))
 #define PL011_CR        (*(volatile uint32_t *)(PL011_BASE + 0x030))

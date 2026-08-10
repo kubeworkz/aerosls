@@ -420,6 +420,37 @@ remainder.
   kernel_arm64.c ~220 (banner + boot smoke + memcpy/memset + PSCI),
   mmu.c ~250 (tables, enable, walk), Makefile ~25, CI ~30.
 
+**M5 — user-mode paging on the arm64 kernel. DONE (§10.191).**
+The first of the M4 honest-remainder gaps (user paging, §10.190),
+taken as its own milestone: the kernel relinks to TTBR1 high VAs
+(VMA 0xFFFF000040080000, LMA 0x40080000, a physical entry stub at
+0x4007F000) and the translated SIMI program runs in EL0 from a VA the
+kernel's own tables do NOT map (TTBR0 user tree: code/stack/svc-stub/
+scratch at 0x10000000/0x10001000/0x10004000/0x10005000). The blob's
+trampoline `br x30`s into a user `svc #0` stub; the vector table's
+sync-from-lower-A64 handler stores x9 (the result) and erets to a real
+`noreturn` continuation function that prints the result and powers off.
+- **Gate (M5) — PASSED (§10.191):** the log shows `[M5] eret into
+  EL0...`, `[M5] returned from EL0 -- user result=0x000000000000002a
+  (expected 0x2a = 42)`, then PSCI SYSTEM_OFF with qemu rc=0; the
+  exception log contains exactly two exceptions (the SVC from EL0 and
+  the PSCI smc); boots rc=0 on cortex-a57 (local) and cortex-a53
+  (CI), deterministic. CI (arm64-guards) asserts the TTBR1-pure
+  kernel lines, the unmapped-to-kernel / user-walk pair at
+  0x10000000, the EL0-executable page, and the EL0 result line.
+- The milestone's hardest bug was the continuation: a computed-goto
+  label (`&&after_eret`) is NOT a stable eret target — GCC placed it
+  at the top of the inlined body, so the handler's eret re-ran the
+  whole EL0 excursion, and the EL0-clobbered register file then
+  faulted on a bare physical address. The fix is structural: the
+  continuation is a real `noreturn` function entered via eret
+  (§10.191, with the five other boot-found bugs: the `--gc-sections`
+  .text loss, a double-add in the high-VA jump, the unparenthesized
+  `KERNEL_VIRT_OFF` macro, AP at bit 8 instead of [7:6], and the
+  vector table's SError-first ordering).
+- Honest remainder: user paging now exists; next are an activation
+  cache / syscall path from EL0, GIC interrupts, and FP/SIMD context.
+
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
 from Step 6.4 applies equally here:
@@ -6911,6 +6942,106 @@ SIMI-result + PSCI lines. The M4 honest remainder (user paging, an
 activation cache, the syscall/object-catalog story, GIC interrupts,
 FP/SIMD context) stays deferred — M4c's own gate (boot + walk + SIMI +
 shutdown under the MMU) is closed.
+
+### 10.191 M5 as built: user-mode paging — a TTBR1 kernel / TTBR0 user split, SIMI in EL0
+
+M5 is the first of the M4 honest-remainder gaps (user paging, §10.190),
+taken as its own milestone because it forces the kernel into a shape
+the arm64 CPU actually has: kernel code at high VAs (TTBR1) and a
+translated SIMI program executing in EL0 from a VA the kernel's own
+tables do NOT map (TTBR0). The boot log's final act is now the
+milestone's whole point:
+
+```
+[M5] eret into EL0...
+[M5] returned from EL0 -- user result=0x000000000000002a (expected 0x2a = 42)
+[M4] issuing PSCI SYSTEM_OFF                      → qemu rc=0
+```
+
+and the exception log contains exactly two exceptions, both intended:
+`SVC from EL0 to EL1` (the blob's return trap, ELR 0x10004004 = the
+user `svc #0` stub) and `Secure Monitor Call ... handled as PSCI call`
+(the SYSTEM_OFF). A third exception anywhere fails the milestone.
+
+**Design.** The kernel relinked to VMA 0xFFFF000040080000 with an LMA
+split: `linker_arm64.ld` gives the `.text` an LMA of 0x40080000
+(`AT(...)`), so qemu loads the body at its physical address while all
+adrp/add references resolve at high VAs; a 64-byte entry stub parks at
+0x4007F000 (a free page below the image) and jumps to a fixed physical
+head whose `adrp`-relative math survives the MMU-off domain. The head
+builds ONE 4-level table tree in BSS, programs MAIR/TCR (T0SZ=16,
+T1SZ=16)/TTBR0_EL1+TTBR1_EL1 to the same tree, enables the MMU, and
+jumps to its own high-VA alias (the transition that makes the kernel
+TTBR1-pure; the boot tables are then reused as the user TTBR0 root).
+`mmu.c` gains `mmu_build_user()` — a second tree identity-mapping the
+code buffer's physical page (the translated blob, already icache-
+flushed) plus a stack page, the `svc #0` stub page, and a scratch page
+at user VAs 0x10000000/0x10001000/0x10004000/0x10005000 — with EL0
+read/write AP and no UXN on the code page, and the user tree built as
+physical descriptors (the walker reads physical memory). The kernel
+then writes `svc #0` (0xD4000001) into the stub page, sets SP_EL0 =
+user stack top, x30 = stub VA, ELR_EL1 = code VA + entry offset,
+SPSR_EL1 = EL0t, switches TTBR0 to the user root, and erets. The
+blob's trampoline runs in EL0, `br x30`s into the stub (x9 still
+holding the RET result), `svc #0` traps to the vector table's
+sync-from-lower-A64 slot, the handler stores x9 to `g_user_result` and
+erets to `g_user_ret_addr` — the kernel continuation.
+
+**The continuation bug that cost the most time.** The first version
+used a GNU computed-goto label as the continuation
+(`g_user_ret_addr = (uint64_t)&&after_eret;`). It failed twice over:
+(1) GCC placed the `after_eret` label at the TOP of the inlined
+function body, so the handler's eret re-ran the whole EL0 excursion —
+the serial log visibly restarted at "[M5] user TTBR0 tree built"; (2)
+even at the right address, the EL0 program clobbers the entire register
+file, so the continuation ran with garbage in callee-saved registers
+and faulted — a Data Abort at ELR uart_puts with FAR 0x4156f000, a
+bare PHYSICAL address (the user root's PA) used as a VA. The fix is
+structural: the continuation is now a real `noreturn` function
+(`arm64_el0_done`), entered via the handler's eret like a hand-called
+subroutine — it needs no pre-eret register state and no valid LR
+(PSCI powers the machine off before any epilogue), and its prologue
+pushes its own frame on the kernel SP (SP_EL1 never changed across the
+excursion — the eret into EL0 switched to SP_EL0). The lesson is
+recorded in the code comment: computed-goto labels in (possibly
+inlined) functions are not a stable eret target.
+
+**Five more real bugs, all found by booting and pinned empirically.**
+1. **`--gc-sections` nuked the whole `.text`.** The entry stub's `br
+   x0` jump to the physical head carries no relocation, so ld saw no
+   reference from `_start` into `.text` and collected everything but
+   the stub (objdump: zero instructions at 0x40080000). Fix:
+   `KEEP()` the head section.
+2. **A double-add overflow in the high-VA jump.** `movk` preserves the
+   destination's low bits, so adding the virt offset onto a register
+   still holding a physical address carried into bit 32 and produced
+   0xFFFF0000_8010C14C — an L1[2] VA, unmapped. Fix: `movz` (zeroing
+   the rest) before the add.
+3. **`KERNEL_VIRT_OFF` without parentheses.** `p - KERNEL_VIRT_OFF`
+   expanded to `p - 0xFFFF000040080000ULL - 0x40080000ULL` — the SUM
+   of the two halves, producing a sign-extended garbage descriptor
+   (0xFFFFFFFFC146E003) and a level-0 translation fault in the user
+   walk. One-line fix, caught only because the selfcheck prints the
+   descriptor.
+4. **AP at the wrong bit.** `DESC_AP_EL0RW = 1 << 8` put EL0 access in
+   the SHAREABILITY field (bit 8); the AP field is bits [7:6], so the
+   stack page stayed EL1-only and EL0 took a permission fault. Fix:
+   AP=01 at bits [7:6].
+5. **The vector table's per-group order.** The first layout wrote the
+   four slots per group as SError-first; the hardware order is
+   Synchronous, IRQ, FIQ, SError, so the SVC from EL0 entered at
+   VBAR+0x400 (a stub) instead of the handler — the table was fixed
+   before the continuation bug was chased down.
+
+**Verified.** rc=0 on both cortex-a57 (local) and cortex-a53 (CI),
+deterministic across runs; the exception log is exactly the two
+intended exceptions; the SIMI smoke still returns 42 on the M4b direct
+path and again from EL0; all host gates green. CI (arm64-guards) now
+asserts the TTBR1-pure kernel lines, the unmapped-to-kernel/user-walk
+pair at 0x10000000, the EL0-executable page, and the EL0 result line.
+The M5 honest remainder (user paging now exists; next: an activation
+cache / syscall path from EL0, GIC interrupts, FP/SIMD context) stays
+deferred.
 
 ---
 
