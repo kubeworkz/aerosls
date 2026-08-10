@@ -455,7 +455,7 @@ jobs:
             exit 1
           }
 
-      - name: Build the M4a+M4b+M4c arm64 kernel and assert the boot + MMU walk + SIMI smoke + PSCI shutdown
+      - name: Build the M4a+M4b+M4c+M5 arm64 kernel and assert the boot + TTBR1/EL0 paging + SIMI smoke + PSCI shutdown
         run: |
           # M4a (plan doc §6 M4 / §10.187): sls_arm64_kernel.elf is the
           # first bootable AArch64 kernel — banner over the PL011, then
@@ -509,32 +509,54 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          # M4c (plan doc §6 M4 / §10.190): the VMSAv8-64 MMU comes on
-          # BEFORE the banner, so every line below already proves the
-          # tables. The asserts pin SCTLR.M, the real 4-level walk
-          # results (UART=device+PXN, kernel=normal WBWA), and that the
-          # SIMI smoke still returns 42 with the MMU on.
-          grep -a "\[M4c\] MMU on" arm64_boot.log || {
-            echo "FAILED: the M4c MMU-on line not seen" >&2
+          # M5 (plan doc §10.191): the kernel was relinked to TTBR1 high
+          # VAs, so the first assert pins the TTBR1-pure claim (TTBR0 is
+          # parked on an all-invalid root). The two walk lines pin the
+          # same VMSAv8-64 table tree M4c proved, now serving the kernel
+          # from TTBR1 (device+PXN UART page, normal-WBWA kernel block).
+          grep -a "\[M5\] TTBR1 kernel: VMA=0xFFFF000040080000" arm64_boot.log || {
+            echo "FAILED: the kernel did not run TTBR1-pure from its high VMA" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          grep -a "SCTLR_EL1 M=1 C=1 I=1" arm64_boot.log || {
-            echo "FAILED: SCTLR_EL1.M not set (MMU off?)" >&2
+          grep -a "TTBR1 kernel walk(0xFFFF000040080000) block attr=1" arm64_boot.log || {
+            echo "FAILED: the TTBR1 walk did not yield the kernel's normal block" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          grep -a "walk(0x40080000) L3=0x0000000040080407 attr=1 (normal)" arm64_boot.log || {
-            echo "FAILED: the 4-level walk did not yield the kernel's normal-WBWA page" >&2
+          grep -a "TTBR1 kernel walk(0xFFFF000009000000) L3 attr=0 pxn=1 (device)" arm64_boot.log || {
+            echo "FAILED: the TTBR1 walk did not yield the UART device page (attr 0, PXN)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          grep -a "walk(0x09000000) L3=0x0020000009000403 attr=0 pxn=1 (device)" arm64_boot.log || {
-            echo "FAILED: the walk did not yield the UART device page (attr 0, PXN)" >&2
+          # M5 user-mode paging: the translated SIMI program runs in EL0
+          # from a VA the kernel's OWN tables do not map. The first assert
+          # is the split's whole point (same VA: fault in kernel tables,
+          # EL0-executable page in the user TTBR0 tree). The second pins
+          # the EL0 excursion: eret into the blob, trampoline br x30 into
+          # the svc stub, SVC back, and the result 42 (x9 at the svc)
+          # printed by the kernel continuation before PSCI powers off.
+          grep -a "kernel walk(0x10000000) = 0 (unmapped-to-kernel)" arm64_boot.log || {
+            echo "FAILED: the user VA 0x10000000 is mapped in the kernel tables (no split?)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a+M4b+M4c arm64 kernel booted — banner + MMU walk + SIMI result 42 + PSCI SYSTEM_OFF (rc=0)"
+          grep -a "user walk(0x10000000) L3=0x" arm64_boot.log || {
+            echo "FAILED: the user TTBR0 tree has no page at 0x10000000" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "uxn=0 (el0-exec)" arm64_boot.log || {
+            echo "FAILED: the user code page is not EL0-executable" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          grep -a "returned from EL0 -- user result=0x000000000000002a (expected 0x2a = 42)" arm64_boot.log || {
+            echo "FAILED: the EL0 SIMI program did not run and return 42 via SVC" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a+M4b+M4c+M5 arm64 kernel booted — banner + TTBR1 kernel + EL0 user page + SIMI result 42 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |
