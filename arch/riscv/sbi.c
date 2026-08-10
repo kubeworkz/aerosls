@@ -220,11 +220,60 @@ static uint64_t g_uart_rx_irq_count;
  * the CLINT/MTIP path). */
 static uint64_t g_tick_count;
 
+/* Phase 9l: preemptive time-slicing hook — the tick now doubles as a
+ * round-robin scheduler. A small task table models runnable work; every
+ * timer interrupt gives the ACTIVE task one bounded slice of real work
+ * (the LCG in sls_task_run_slice, stepped exactly budget times — an
+ * observable result that depends on the budget, so a "slice" provably
+ * ran its work, not just a counter), then rotates to the next task.
+ * This is the preemption mechanism a real scheduler is built on: the
+ * tick preempts whatever the main loop is doing and hands the hart to
+ * the next task for a bounded slice, with per-task slice accounting
+ * that must stay fair (a round-robin guarantees |slices_a - slices_b|
+ * <= 1 at every instant — the client asserts exactly that invariant).
+ * Interrupts are disabled inside the handler (single hart), so the
+ * table needs no locking. The tasks are stubs for now; the `tasks`
+ * shell command exposes the table over the UART. */
+#define SLS_NUM_TASKS 4
+
+struct sls_task {
+    const char* name;      /* printable task name */
+    uint64_t slices;       /* how many slices this task has run */
+    uint32_t budget;       /* per-slice work budget (LCG iterations) */
+    uint32_t acc;          /* accumulated work result (observable) */
+};
+
+static struct sls_task g_tasks[SLS_NUM_TASKS] = {
+    { "alpha", 0, 100, 0 },
+    { "beta",  0, 200, 0 },
+    { "gamma", 0, 300, 0 },
+    { "delta", 0, 400, 0 },
+};
+
+static uint32_t g_active_task = 0;
+
+/* One bounded slice of "work": a deterministic LCG (the Numerical
+ * Recipes constants) stepped exactly budget times. The final state is
+ * a function of the budget, so two tasks with different budgets cannot
+ * silently "run" identical work — the acc column in the `tasks` output
+ * is the observable proof each slice actually executed its iterations.
+ * Bounded (max 400 iterations of 3 ops) so a slice costs microseconds,
+ * never measurable drift on the 1s tick. */
+static void sls_task_run_slice(struct sls_task* t) {
+    uint32_t x = t->acc;
+    for (uint32_t i = 0; i < t->budget; i++) {
+        x = x * 1664525u + 1013904223u;
+    }
+    t->acc = x;
+    t->slices++;
+}
+
 /* Phase 9i command loop: the real headless shell. Every line accumulated
  * by handle_riscv_supervisor_interrupt (with backspace editing and CR-only
  * line endings) is dispatched here. Commands:
  *   help               list the commands
  *   version            kernel version banner
+ *   tasks              the round-robin task table (Phase 9l)
  *   echo <text>        repeat the text
  *   exit               power the machine off (SBI_SRST in S-mode; a
  *                      reported halt in bare M-mode, where no firmware
@@ -252,11 +301,38 @@ void route_sls_shell_command(const char* buffer) {
     if (buffer[0] == '\0') { sbi_putchar('\r'); sbi_putchar('\n'); return; }
 
     if (shell_streq(buffer, "help")) {
-        shell_print("[HELP] commands: help, version, echo <text>, exit\r\n");
+        shell_print("[HELP] commands: help, version, tasks, echo <text>, exit\r\n");
         return;
     }
     if (shell_streq(buffer, "version")) {
         shell_print("[VER] AeroSLS RISC-V kernel (SIMI Phase 9i command loop)\r\n");
+        return;
+    }
+    if (shell_streq(buffer, "tasks")) {
+        /* Phase 9l: expose the round-robin task table. The active task
+         * is the one the NEXT tick will slice; the slice counts prove
+         * the rotation (a round-robin keeps them within 1 of each other
+         * at every instant — the client asserts exactly that), and the
+         * acc column is the observable work result (budget-dependent,
+         * so a slice provably ran its LCG iterations). */
+        shell_print("[TASKS] active=");
+        shell_print(g_tasks[g_active_task].name);
+        shell_print("\r\n");
+        for (uint32_t i = 0; i < SLS_NUM_TASKS; i++) {
+            shell_print("  ");
+            shell_print(g_tasks[i].name);
+            shell_print(" slices=");
+            shell_print_udec(g_tasks[i].slices);
+            shell_print(" acc=");
+            shell_print_udec(g_tasks[i].acc);
+            shell_print("\r\n");
+        }
+        /* The client waits for this deterministic end-of-table marker
+         * (not a row prefix — the kernel prints char-by-char, so a
+         * row's digits can straddle a socket segment and truncate the
+         * last count). By the time [TASKS-END] appears, all four rows
+         * are fully in the stream. */
+        shell_print("[TASKS-END]\r\n");
         return;
     }
     if (shell_streq(buffer, "exit")) {
@@ -314,7 +390,22 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
         if ((scause & (1ULL << 63)) && (scause & 0xFF) == timer_cause) {
             g_tick_count++;
             sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+
+            /* Phase 9l: preemptive time-slice — hand the hart to the
+             * active task for one bounded slice, then rotate. The slice
+             * runs here, inside the tick handler, which is exactly what
+             * "preemptive" means: the tick preempts the main loop and
+             * schedules the next task regardless of what the loop was
+             * doing. Echo builds print [SLICE <name>] so the rotation is
+             * observable (the client's [TICK 2] wait is unaffected — the
+             * markers interleave in the stream). */
+            uint32_t ran = g_active_task;
+            sls_task_run_slice(&g_tasks[ran]);
+            g_active_task = (g_active_task + 1) % SLS_NUM_TASKS;
 #if defined(KERNEL_UART_ECHO)
+            shell_print("[SLICE ");
+            shell_print(g_tasks[ran].name);
+            shell_print("]\r\n");
             shell_print("[TICK ");
             shell_print_udec(g_tick_count);
             shell_print("]\r\n");

@@ -30,19 +30,24 @@ queued bytes and must drain completely (every char echoed, every line
 dispatched) no matter how many interrupts they split into -- pinning
 claim/complete discipline under rapid input.
 
-Optional second argument "tick" (Phase 9k; passed by BOTH runners -- the
-S-mode kernel arms the timer via the stimecmp CSR, the M-mode twin via
-the CLINT mtimecmp MMIO): after the IRQ tripwire, wait for [TICK 2].
-Each [TICK N] is printed AFTER the kernel re-armed the next tick, so
-seeing [TICK 2] proves the timer is genuinely periodic -- a one-shot
-arm would deliver at most [TICK 1] and then go silent. (The tick wait
-is placed before the command loop so the assertion runs while the
-machine is still on; `exit` below powers it off.)
+Optional second argument "tick" (Phase 9k/9l; passed by BOTH runners --
+the S-mode kernel arms the timer via the stimecmp CSR, the M-mode twin
+via the CLINT mtimecmp MMIO): after the IRQ tripwire, wait for [TICK 2]
+(printed AFTER the re-arm, so it proves the timer is genuinely
+periodic -- a one-shot arm would deliver at most [TICK 1] and go
+silent), then send `tasks` and assert the Phase 9l time-slicing
+invariant: the four round-robin tasks' slice counts are within 1 of
+each other (true at every instant of a fair rotation), at least one
+slice has run, and [SLICE ...] markers appear in the stream -- the
+per-tick preemption exposed over the UART. (The tick waits are placed
+before the command loop so the assertions run while the machine is
+still on; `exit` below powers it off.)
 
 Usage: python3 echo_client.py /path/to/serial.sock [tick]
 
 Exit code 0 = every marker observed; 1 = not.
 """
+import re
 import socket
 import sys
 import time
@@ -120,11 +125,38 @@ def main() -> int:
     # fired AND was re-armed — a one-shot arm would go silent after
     # [TICK 1]. The 8s budget covers a slow CI host.
     tick_mode = len(sys.argv) > 2 and sys.argv[2] == "tick"
+    tasks_ok = False
     if tick_mode:
         buf = recv_until(s, buf, b"[TICK 2]", 8)
         if b"[TICK 2]" not in buf:
             print("FAIL: periodic timer tick never reached [TICK 2]")
             print(buf.decode(errors="replace"))
+            return 1
+
+        # Phase 9l time-slicing tripwire: the tick now doubles as a
+        # round-robin scheduler. Every timer interrupt slices the ACTIVE
+        # task (a bounded LCG budget), rotates, and prints [SLICE <name>]
+        # on the echo builds. Send `tasks` and assert the table proves
+        # fair preemption: the four slice counts must be within 1 of each
+        # other (the round-robin invariant, true at every instant), at
+        # least one slice must have run (max >= 1), and the [SLICE ...]
+        # markers must appear in the stream (the per-tick preemption is
+        # exposed over the UART). The wait targets the kernel's
+        # [TASKS-END] marker, printed only after all four rows — waiting
+        # on a row prefix would race: the kernel prints char-by-char, so
+        # a row's digits can straddle a socket segment and arrive after
+        # the prefix, truncating the last count.
+        s.sendall(b"tasks\r")
+        buf = recv_until(s, buf, b"[TASKS-END]", 5)
+        ttext = buf.decode(errors="replace")
+        counts = [int(x) for x in re.findall(r"slices=(\d+)", ttext)]
+        if (b"[TASKS]" in buf and len(counts) == 4
+                and max(counts) - min(counts) <= 1
+                and max(counts) >= 1 and b"[SLICE " in buf):
+            tasks_ok = True
+        else:
+            print("FAIL: time-slicing table not as expected (counts=%r)" % counts)
+            print(ttext[-1300:])
             return 1
 
     s.sendall(b"help\r")
@@ -157,13 +189,16 @@ def main() -> int:
          (b"[HELP] commands:" in buf) and \
          (b'unknown command: "PINX"' in buf) and \
          (b"[ECHO] hello world" in buf) and \
-         (not tick_mode or b"[TICK 2]" in buf)
+         (not tick_mode or b"[TICK 2]" in buf) and \
+         (not tick_mode or tasks_ok)
     if ok:
         msg = ("ECHO_OK: interrupt tripwire pinned (1 keystroke -> 1 IRQ "
                "x3), help dispatched, backspace editing proven (PING\\bX "
                "-> PINX), CR-only line routed, echo <text> works")
         if tick_mode:
-            msg += ", periodic timer tick proven ([TICK 2] after re-arm)"
+            msg += (", periodic timer tick proven ([TICK 2] after re-arm), "
+                    "round-robin time-slicing proven (tasks table, "
+                    "fair rotation max-min <= 1)")
         print(msg)
     else:
         print("FAIL: interrupt-tripwire / readline / dispatch markers not all observed")

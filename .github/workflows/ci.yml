@@ -348,7 +348,7 @@ jobs:
           wait $qpid
           rc=$?
           if [ "$rc" -eq 0 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_client.log; then
-            echo "OK: device-driven UART RX interrupt echo + command loop + periodic timer tick verified ([TICK 2], exit -> rc=0)"
+            echo "OK: device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing verified ([TICK 2], tasks table, exit -> rc=0)"
           else
             echo "FAILED: echo check failed (qemu rc=$rc, client rc=$crc)" >&2
             cat echo_client.log echo_qemu.log >&2
@@ -379,7 +379,7 @@ jobs:
           wait $qpid
           rc=$?
           if [ "$rc" -eq 124 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_m_client.log; then
-            echo "OK: M-mode device-driven UART RX interrupt echo + periodic timer tick verified ([TICK 2] via CLINT mtimecmp)"
+            echo "OK: M-mode device-driven UART RX interrupt echo + periodic timer tick + round-robin time-slicing verified ([TICK 2] via CLINT mtimecmp, tasks table)"
           else
             echo "FAILED: M-mode echo check failed (qemu rc=$rc, client rc=$crc)" >&2
             cat echo_m_client.log echo_m_qemu.log >&2
