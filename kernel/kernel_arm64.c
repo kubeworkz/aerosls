@@ -573,6 +573,16 @@ void kernel_arm64_main(void)
               "TTBR0 empty (kernel is TTBR1-pure)\\r\\n");
     print_el();
     mmu_selfcheck_kernel();
+    /* M5 FP/SIMD gate (§10.198): log CPACR_EL1 so the leg-3 backstop is
+     * visible in the serial stream — the kernel never writes CPACR_EL1,
+     * so FPEN stays at reset (0b00 = trap EL0/EL1 FP/SIMD accesses to
+     * EL1), and CI asserts the line. If a future change sets FPEN=1 the
+     * line changes and the census + teeth gates must move with it. */
+    uint64_t cpacr;
+    asm volatile("mrs %0, cpacr_el1" : "=r"(cpacr));
+    uart_puts("[M5] cpacr_el1=");
+    print_u64(cpacr);
+    uart_puts(" (FPEN=0: FP/SIMD accesses trap to EL1)\\r\\n");
     /* M5.2: the GIC and the generic timer (CNTFRQ read) are init once,
      * before any entry; the timer is armed when the wait phase starts
      * (arm64_wait_ticks), so no tick can fire during the entries. */

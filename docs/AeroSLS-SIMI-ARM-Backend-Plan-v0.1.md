@@ -589,11 +589,12 @@ arm64 kernel programs the CNTP timer and the GIC itself).
   the virtual timer (the same-PPI case is architecturally impossible)
   and only in the EL1h handler (the lower-EL IRQ slot stays a stub:
   SPSR masks IRQs during the EL0 excursions, as scoped in §10.194).
-  FP/SIMD context: the zero-FP claim is scoped in §10.198 — it holds
-  on three machine-checked legs (`-mgeneral-regs-only` codegen, a
-  0-instruction image census, and the CPACR_EL1.FPEN=0 trap, spike-
-  verified under TCG), so the EL1h entry needs no SIMD save; the
-  remainder is the committed CI census + teeth, not context code.
+  FP/SIMD context: the zero-FP claim holds on three machine-checked
+  legs (`-mgeneral-regs-only` codegen, a 0-instruction image census,
+  and the CPACR_EL1.FPEN=0 trap, spike-verified under TCG), so the
+  EL1h entry needs no SIMD save — the gates are DONE (§10.199): the
+  census, the boot-time cpacr log, and the teeth smoke, all wired
+  into arm64-guards CI.
   Sizing: ~150-200 lines
   — mmu.c GIC device pages (~20), a new arch/arm64/gic.c (~90:
   distributor + sysreg init + acknowledge/EOIR), timer arm + handler
@@ -7811,6 +7812,65 @@ save-on-first-use handler). The M5.3 nesting window makes this a
 correctness requirement for any future FP-using handler, not an
 optimization. Until then, the zero-FP claim stands on three
 independently machine-checked legs.
+
+### 10.199 M5 FP/SIMD gates as built: the census, the trap, and their teeth
+
+The §10.198 scope is implemented as three committed gates, closing the
+M5 board's last item. All three were machine-verified locally before
+wiring, and the census regex was itself spiked: the first attempt
+(`\b[dsvqh][0-9]+\b` over the whole disassembly) false-positived 194
+times on the clean ELF — the 8-hex-char ENCODING word column
+(0xd5384242 = `mrs x2, currentel`) trivially matches `\bd[0-9]+\b`. The
+census is therefore scoped to the mnemonic + operand COLUMNS of
+objdump's tab-separated output (`ADDR:\tWORD\tMNEMONIC\tOPERANDS`):
+mnemonic in the FP family, or a d/s/v/q/h register in the operand
+column (allowing the vector-suffix forms like `v0.4s`). Validated: 0
+matches on the clean ELF, 3/3 known-bad lines caught (`fmov d0, xzr`,
+`ldp q0, q1, [x0]`, `add v0.4s, v1.4s, v2.4s`), and the hex-immediate
+`#0x40d0` false positive correctly excluded.
+
+**Gate 1 — the census (`tools/simi/tests/arm64_fp_census.sh`).** The
+single source of truth for leg 2: disassembles the ELF and fails on
+any FP/SIMD instruction (exit 1, printing the offending lines; exit 2
+if the toolchain or ELF is missing). The arm64-guards job runs it
+right after `make arm64-elf`, before the boot — a violation fails the
+job at the image, before any boot could paper over it.
+
+**Gate 2 — the visible backstop (kernel_arm64.c).** The boot now logs
+`[M5] cpacr_el1=0x0000000000000000 (FPEN=0: FP/SIMD accesses trap to
+EL1)` — the leg-3 state pinned in the serial stream, asserted by CI.
+The kernel still never writes CPACR_EL1, so FPEN is the reset value;
+if a future change sets FPEN=1, the line changes and the census +
+teeth must move with it (recorded in the code comment).
+
+**Gate 3 — the teeth (`tools/simi/tests/arm64_fp_gate_smoke.sh`).**
+The kernel-copy teeth pattern applied to both machine-checkable legs:
+- tooth 0: the clean ELF passes the census (sanity);
+- tooth 1: a real `fmov d0, xzr` injected into kernel_arm64.c makes
+  the census FAIL;
+- tooth 2: booting the broken kernel under the CI config TRAPS — the
+  probe's "before" line prints, the "after" never does, qemu times
+  out (rc=124) at the EL1h sync stub: the FPEN backstop is loud, never
+  silent corruption;
+- restore: the injected kernel is reverted from a file backup (no git
+  dependency — the smoke's restore must work in WSL, Git Bash, and CI
+  alike) and rebuilt, and the census passes again.
+
+**CI wiring.** Three additions to the arm64-guards job: the census
+after the build, the cpacr log-line assert after the boot, and a new
+"Teeth — FP/SIMD census + trap smokes" step asserting "4 passed, 0
+failed". Verified locally: census 0/clean + 3/3-bad, the full
+CI-equivalent boot block (banner, EL1, cpacr FPEN=0, PSCI rc=0, 6
+unbroken ticks, M5.1 counts) passes on a fresh boot, and the smoke
+fires 4/4 from a clean tree.
+
+**Honest caveats.** The census is image-scoped — it sees the shipped
+ELF, so it must stay wired into CI to remain true; the FP mnemonic
+family list and register-class check are enumerations (an exotic
+future FP instruction class would extend the list — the teeth smoke
+only proves the CURRENT classes are caught); the trap's loudness is
+the EL1h sync stub hang, which under qemu reads as rc=124 — the smoke
+asserts exactly that shape.
 
 ---
 
