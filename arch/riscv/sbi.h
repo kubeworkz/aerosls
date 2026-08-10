@@ -66,5 +66,6 @@ static inline struct SBIReturn sbi_call(unsigned long ext, unsigned long fid,
 int sbi_getchar(void);
 void sbi_system_reset(void);
 int sbi_arm_timer(uint64_t period_ticks);   /* Phase 9k: arm/re-arm the timer (stimecmp CSR in S-mode, CLINT mtimecmp in M-mode); always returns 0 */
+void sbi_set_tick_period(uint64_t period_ticks);   /* Design B part 3: runtime tick-period override for the round-robin demo; 0 = the compile-time SBI_TIMER_TICK_PERIOD */
 
 #endif

@@ -107,6 +107,12 @@ struct RvPerHartData {
 void fp_save_all(uint64_t* dst);
 void fp_load_all(const uint64_t* src);
 
+/* Design B part 3: how many FS lazy-saves have fired since boot
+ * (trap_riscv.c). The two-task round-robin asserts its delta across the
+ * demo — one lazy-save per task-slice, because each switch disarms FP.
+ * Kernel-internal; the host twin never builds the lazy-save branch. */
+extern uint64_t g_fp_lazy_count;
+
 /* Real assembly trap entry points, installed by riscv_trap_init() below
  * (stvec for the S-mode/OpenSBI boot, mtvec for a direct M-mode payload
  * -- Phase 9g). Never called directly from C. */
