@@ -416,7 +416,7 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
         if [ "$rc" -eq 0 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_client.out; then
-            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + periodic timer tick)"
+            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo (qemu rc=$rc, client rc=$crc — echo not as expected)"
@@ -466,7 +466,7 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
         if [ "$rc" -eq 124 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_m_client.out; then
-            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + periodic timer tick)"
+            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo-m (qemu rc=$rc, client rc=$crc — echo not as expected)"
