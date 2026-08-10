@@ -1,22 +1,28 @@
 /* entry_test.c — Phase 9h (ISA doc §16): the C half of the bare-metal
  * trap-entry fixture (tools/simi/tests/rv_trap_entry/). Provides the
- * fixture's RvPerHartData, the pre-trap observation globals, the 16550
- * UART console, and — most importantly — riscv_trap_dispatch_m(), the
- * verification STUB the real entry calls.
+ * fixture's RvPerHartData, the pre-trap observation globals, the
+ * console, and — most importantly — the verification STUB the real
+ * entry calls: riscv_trap_dispatch_m() in the default (M-mode) build,
+ * riscv_trap_dispatch() when compiled -DFIXTURE_SMODE. Same source,
+ * two builds — exactly the kernel's own RISCV_MMODE pattern.
  *
  * The stub runs INSIDE the trap (the entry switched sp to
  * phd->kernel_sp before calling it, a0 = &phd) and checks the
  * just-saved frame against the distinctive register values entry_test.S
  * loaded before the ebreak — proving the entry's save offsets — plus
- * sp and mepc. It then advances the exception PC past the ebreak and
- * RETURNS, which is the one thing the real kernel's dispatch never does:
- * every kernel trap either halts (unhandled exception, M-mode exit) or
- * powers the machine off (S-mode exit), so the entry's restore+return
- * half (the `ld` sequence, the mepc restore, the sscratch re-arm, the
- * sp restore, mret) has never executed until this fixture.
+ * sp and the exception PC. It then advances the exception PC past the
+ * ebreak and RETURNS, which is the one thing the real kernel's
+ * dispatch never does: every kernel trap either halts (unhandled
+ * exception, M-mode exit) or powers the machine off (S-mode exit), so
+ * the entry's restore+return half (the `ld` sequence, the PC restore,
+ * the sscratch re-arm, the sp restore, sret/mret) has never executed
+ * until this fixture.
  *
- * The real kernel's riscv_trap_dispatch_m is deliberately NOT linked;
- * the entry's `call riscv_trap_dispatch_m` resolves to this stub.
+ * The real kernel's dispatcher is deliberately NOT linked; the entry's
+ * `call` resolves to this stub. The S-mode build is booted under
+ * OpenSBI (stvec/sepc/sret, payload at 0x80200000, SBI_DBCN console);
+ * the M-mode build is a direct -bios none payload (mtvec/mepc/mret at
+ * 0x80000000, raw 16550 console).
  *
  * Compiled freestanding with -msmall-data-limit=0 -mno-relax (see the
  * Makefile target): the driver pins gp/tp to junk values across the
@@ -48,20 +54,63 @@ uint64_t g_pre_trap_sp;
  * the capture pointer). */
 uint64_t g_reg_dump[30];
 
-/* 16550 UART at the QEMU virt machine's MMIO base — the same console
- * the M-mode kernel uses (arch/riscv/sbi.c's RISCV_MMODE block). */
+/* Console. The M-mode build (no firmware) writes the 16550 UART at the
+ * QEMU virt MMIO base directly — the same console the M-mode kernel
+ * uses (arch/riscv/sbi.c's RISCV_MMODE block). The S-mode build runs
+ * under OpenSBI, where the legacy console-putchar ecall was REMOVED
+ * (>= 0.9, silently dropped — a mute fixture would look like a hang),
+ * so it prints through the Debug Console extension (SBI_DBCN) exactly
+ * like the S-mode kernel's sbi_putchar does. */
+#ifdef FIXTURE_SMODE
+static void uart_putchar(char c) {
+    /* SBI_DBCN write, spec-correct layout (SBI v2.0 4.2): a0=num_bytes,
+     * a1=base_lo, a2=base_hi=0, a3=count_lo, a4=count_hi=0. The kernel
+     * used to pass the count pointer in a2 (base_hi) -- DBCN always
+     * errored and printing rode on the legacy fallback; this fixture
+     * exposed it (ISA doc §16 Phase 9h) and arch/riscv/sbi.c now uses
+     * this same layout. Legacy putchar kept as a fallback, mirroring
+     * the kernel. */
+    char buf = c;
+    unsigned long written = 0;
+    register unsigned long a0 __asm__("a0") = 1;
+    register unsigned long a1 __asm__("a1") = (unsigned long)&buf;
+    register unsigned long a2 __asm__("a2") = 0;             /* base_hi */
+    register unsigned long a3 __asm__("a3") = (unsigned long)&written;
+    register unsigned long a4 __asm__("a4") = 0;             /* count_hi */
+    register unsigned long a6 __asm__("a6") = 0;             /* DBCN_WRITE */
+    register unsigned long a7 __asm__("a7") = 0x4442434EUL;  /* SBI_EXT_DBCN */
+    __asm__ volatile("ecall"
+                     : "+r"(a0), "+r"(a1)
+                     : "r"(a2), "r"(a3), "r"(a4), "r"(a6), "r"(a7)
+                     : "memory");
+    /* Only the return is trusted: OpenSBI v1.3 emits the byte with
+     * error 0 but does not reliably write the count back to a3, so
+     * checking written would double-print via the fallback. */
+    if (a0 == 0) return;
+    /* Legacy console putchar (SBI v0.1) fallback. */
+    __asm__ volatile("mv a0, %0\n\tli a7, 1\n\tecall"
+                     : : "r"((unsigned long)(unsigned char)c)
+                     : "a0", "a7", "memory");
+}
+#else
 #define VIRT_UART_BASE 0x10000000UL
-
 static void uart_putchar(char c) {
     volatile uint8_t* lsr = (volatile uint8_t*)(VIRT_UART_BASE + 5);
     volatile uint8_t* thr = (volatile uint8_t*)(VIRT_UART_BASE + 0);
     while ((*lsr & 0x20) == 0) { }   /* LSR bit 5: THR empty — wait for it */
     *thr = (uint8_t)c;
 }
+#endif
 
 void uart_print(const char* s) {
     while (*s) uart_putchar(*s++);
 }
+
+#ifdef FIXTURE_SMODE
+#define FIXTURE_MODE_TAG " (S-mode)"
+#else
+#define FIXTURE_MODE_TAG ""
+#endif
 
 static void uart_udec(uint64_t v) {
     char buf[20];
@@ -121,8 +170,19 @@ void dump_and_halt(void) {
 }
 
 /* The verification stub the entry calls with a0 = &phd. Runs on the
- * fixture's kernel stack (phd->kernel_sp = _stack_top, set by _start). */
-void riscv_trap_dispatch_m(struct RvPerHartData* phd) {
+ * fixture's kernel stack (phd->kernel_sp = _stack_top, set by _start).
+ * The real entry's `call` resolves to whichever name the build's mode
+ * picks: riscv_trap_dispatch under FIXTURE_SMODE (sepc/sret), else
+ * riscv_trap_dispatch_m (mepc/mret). */
+#ifdef FIXTURE_SMODE
+#define FIXTURE_DISPATCH_MAIN  riscv_trap_dispatch
+#define FIXTURE_DISPATCH_OTHER riscv_trap_dispatch_m
+#else
+#define FIXTURE_DISPATCH_MAIN  riscv_trap_dispatch_m
+#define FIXTURE_DISPATCH_OTHER riscv_trap_dispatch
+#endif
+
+void FIXTURE_DISPATCH_MAIN(struct RvPerHartData* phd) {
     /* TF index i (i != TF_SP, i != TF_SEPC) must hold 0x1000+i — the
      * distinctive value entry_test.S loaded before the ebreak. */
     static const uint64_t exp[TF_COUNT] = {
@@ -154,22 +214,27 @@ void riscv_trap_dispatch_m(struct RvPerHartData* phd) {
         halt_forever();
     }
 
-    uart_print("[FIXTURE] dispatcher: frame save verified\n");
+    uart_print("[FIXTURE] dispatcher" FIXTURE_MODE_TAG ": frame save verified\n");
 
     /* Advance the exception PC past the ebreak — the contract the
      * kernel's own dispatch keeps (see riscv_trap_dispatch_common's
      * code==3/9 branches) but never exercises, because it never
-     * returns. The entry restores this value into mepc and mret resumes
-     * at ebreak+4, letting the fixture's post-trap checks run. */
+     * returns. The entry restores this value into the exception-PC CSR
+     * and sret/mret resumes at ebreak+4, letting the fixture's
+     * post-trap checks run. */
     phd->trap_frame[TF_SEPC] += 4;
 }
 
-/* The S-mode entry (riscv_trap_entry, stvec) sits in the SAME .text
- * section as the M-mode one (trap_riscv.S), so --gc-sections keeps
- * both; this stub satisfies the link. The fixture only arms mtvec
- * (entry_m), so this is never called. */
-void riscv_trap_dispatch(struct RvPerHartData* phd) {
+/* The OTHER entry (the one this build does NOT arm) sits in the SAME
+ * .text section as the armed one (trap_riscv.S emits both), so
+ * --gc-sections keeps both; this stub satisfies the link. The fixture
+ * only arms one vector, so it is never called. */
+void FIXTURE_DISPATCH_OTHER(struct RvPerHartData* phd) {
     (void)phd;
+#ifdef FIXTURE_SMODE
+    uart_print("[FIXTURE] FAIL: M-mode dispatcher called (mtvec was never armed)\n");
+#else
     uart_print("[FIXTURE] FAIL: S-mode dispatcher called (stvec was never armed)\n");
+#endif
     halt_forever();
 }

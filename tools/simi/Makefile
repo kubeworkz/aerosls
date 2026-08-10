@@ -78,10 +78,17 @@ rv-trap-test: rv_syscall_exit_test.c ../../arch/riscv/trap_riscv.c ../../arch/ri
 # M-mode test driver (tests/rv_trap_entry/) and tests/run_riscv_tests.sh
 # boots the ELF under qemu-system-riscv64 -bios none. Pins the entry's
 # save/restore round trip -- including the restore+return half no kernel
-# boot exercises (every real trap halts or powers off). NOT in `all`:
-# requires the RISC-V cross toolchain; the runner builds it on demand and
-# skips when the toolchain/QEMU are absent (so the runner's build keeps
-# it fresh -- the M2.27 stale-binary lesson).
+# boot exercises (every real trap halts or powers off). Two builds of the
+# SAME fixture sources: the default is the M-mode bare-metal payload
+# (-bios none, mtvec/riscv_trap_entry_m, raw 16550 console, linked at
+# 0x80000000); rv-trap-entry-test-s compiles the driver + C with
+# -DFIXTURE_SMODE (stvec/riscv_trap_entry under OpenSBI, SBI_DBCN
+# console, linked at 0x80200000 -- the S-mode kernel's link address).
+# trap_riscv.S itself is mode-agnostic (it emits BOTH entries), so the
+# asm object is shared. NOT in `all`: requires the RISC-V cross
+# toolchain; the runner builds it on demand and skips when the
+# toolchain/QEMU are absent (so the runner's build keeps it fresh -- the
+# M2.27 stale-binary lesson).
 RV_CC ?= riscv64-unknown-elf-gcc
 RV_LD ?= riscv64-unknown-elf-ld
 rv_trap_entry.o: tests/rv_trap_entry/entry_test.c
@@ -92,6 +99,12 @@ rv_trap_entry_asm.o: ../../arch/riscv/trap_riscv.S
 	$(RV_CC) -ffreestanding -O2 -Wall -Wextra -mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections -c ../../arch/riscv/trap_riscv.S -o $@
 rv-trap-entry-test: rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o
 	$(RV_LD) -T tests/rv_trap_entry/linker_fixture.ld -nostdlib --gc-sections rv_trap_entry_driver.o rv_trap_entry.o rv_trap_entry_asm.o -o rv_trap_entry.elf
+rv_trap_entry_s.o: tests/rv_trap_entry/entry_test.c
+	$(RV_CC) -ffreestanding -O2 -Wall -Wextra -mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax -msmall-data-limit=0 -ffunction-sections -fdata-sections -DFIXTURE_SMODE -c tests/rv_trap_entry/entry_test.c -o $@
+rv_trap_entry_driver_s.o: tests/rv_trap_entry/entry_test.S
+	$(RV_CC) -ffreestanding -O2 -Wall -Wextra -mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax -ffunction-sections -fdata-sections -DFIXTURE_SMODE -c tests/rv_trap_entry/entry_test.S -o $@
+rv-trap-entry-test-s: rv_trap_entry_s.o rv_trap_entry_driver_s.o rv_trap_entry_asm.o
+	$(RV_LD) -T tests/rv_trap_entry/linker_fixture_s.ld -nostdlib --gc-sections rv_trap_entry_driver_s.o rv_trap_entry_s.o rv_trap_entry_asm.o -o rv_trap_entry_s.elf
 
 # M0 (Step 7 / AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md): portable AArch64
 # (A64) translator core + a small purpose-built A64 decoder/executor
@@ -282,6 +295,6 @@ size-gate-arm: simi-arm-verify simi-asm
 	./tests/size_gate_arm.sh
 
 clean:
-	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m rv-syscall-exit-test-u rv-trap-test rv_trap_entry.elf rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o tests/*.tmo
+	rm -f simi-asm simi-run simi-dis simi-jit-test simi-riscv-verify simi-arm-verify a64_dump bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-syscall-exit-test rv-syscall-exit-test-m rv-syscall-exit-test-u rv-trap-test rv_trap_entry.elf rv_trap_entry.o rv_trap_entry_driver.o rv_trap_entry_asm.o rv_trap_entry_s.elf rv_trap_entry_s.o rv_trap_entry_driver_s.o tests/*.tmo
 
-.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size clean
+.PHONY: all test test-native test-riscv test-arm size-gate-arm stress-atomics bench-net bench-corpus bench-exec bench-exec-rv64 bench-exec-interp cross-isa cross-size rv-trap-entry-test rv-trap-entry-test-s clean

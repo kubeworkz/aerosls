@@ -246,6 +246,37 @@ else
     skip=$((skip+1))
 fi
 
+# Phase 9h twin: the SAME fixture sources built with -DFIXTURE_SMODE and
+# booted under OpenSBI (default -bios) at 0x80200000 -- the sepc/sret
+# entry (riscv_trap_entry, stvec) and the SBI_DBCN console, i.e. the
+# exact mode the S-mode kernel runs in, so the S/M entry delta is
+# exercised for real instead of argued from CSR names. Same assertions,
+# mode-specific markers.
+if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
+    if make -C .. rv-trap-entry-test-s >/dev/null 2>&1; then
+        timeout 30 qemu-system-riscv64 -M virt -m 128M -smp 1 -kernel ../rv_trap_entry_s.elf -nographic >rv_trap_entry_s.out 2>&1
+        rc=$?
+        if [ "$rc" -eq 124 ] \
+           && grep -q "\[FIXTURE\] dispatcher (S-mode): frame save verified" rv_trap_entry_s.out \
+           && grep -q "\[FIXTURE\] PASS: S-mode entry save/restore round-trip verified" rv_trap_entry_s.out \
+           && ! grep -q "\[FIXTURE\] FAIL" rv_trap_entry_s.out; then
+            echo "PASS  rv-trap-entry-s (S-mode entry save/restore round-trip under OpenSBI)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  rv-trap-entry-s (rc=$rc — serial output not as expected)"
+            cat rv_trap_entry_s.out
+            fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  rv-trap-entry-s (fixture build failed — check the cross toolchain)"
+        skip=$((skip+1))
+    fi
+    rm -f rv_trap_entry_s.out
+else
+    echo "SKIP  rv-trap-entry-s (no qemu-system-riscv64 / riscv64-unknown-elf-gcc)"
+    skip=$((skip+1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
