@@ -448,8 +448,24 @@ sync-from-lower-A64 handler stores x9 (the result) and erets to a real
   .text loss, a double-add in the high-VA jump, the unparenthesized
   `KERNEL_VIRT_OFF` macro, AP at bit 8 instead of [7:6], and the
   vector table's SError-first ordering).
-- Honest remainder: user paging now exists; next are an activation
-  cache / syscall path from EL0, GIC interrupts, and FP/SIMD context.
+- **SLS framing (recorded per the architecture note):** AeroSLS is a
+  Single Level Storage architecture — there is no glibc and no user
+  space; everything runs in kernel space. M5 is therefore NOT the
+  start of a userland: it proves the CPU's isolation machinery
+  (TTBR1/TTBR0, EL1/EL0, vector dispatch) as a fault-containment
+  domain for code you do not trust (a SIMI guest, a network-facing
+  tenant, a downloaded artifact), while the single-level store stays
+  the shared object space underneath. The default configuration is
+  EL1-only — the M4b direct-call shape is the system's real home, and
+  the EL0 excursion is an optional sandbox, not the runtime's home.
+  If a contained domain ever needs to touch the store, the interface
+  is a capability-flavored object-catalog trap (ask for a capability,
+  get a handle, access through it) — deliberately NOT a POSIX-style
+  syscall ABI, which this architecture has no reason to carry.
+- Honest remainder: the isolation machinery now exists; next are an
+  activation cache, GIC interrupts, FP/SIMD context — and, only if a
+  containment use-case lands, the capability-flavored object-catalog
+  trap for foreign-code domains.
 
 **M0 and M1 are the project.** M2 is a port with a re-diff; M3 was
 environment-dependent until the qemu-aarch64 leg landed. The ordering rule
@@ -7039,9 +7055,17 @@ intended exceptions; the SIMI smoke still returns 42 on the M4b direct
 path and again from EL0; all host gates green. CI (arm64-guards) now
 asserts the TTBR1-pure kernel lines, the unmapped-to-kernel/user-walk
 pair at 0x10000000, the EL0-executable page, and the EL0 result line.
-The M5 honest remainder (user paging now exists; next: an activation
-cache / syscall path from EL0, GIC interrupts, FP/SIMD context) stays
-deferred.
+The M5 honest remainder stays deferred. Per the architecture note
+recorded in §6 M5: AeroSLS is Single Level Storage — no glibc, no user
+space, everything in kernel space — so the EL0 split is NOT a userland:
+it is a fault-containment domain for foreign/untrusted code (SIMI
+guest, tenant, downloaded artifact), with the single-level store as the
+shared object space beneath it. The default configuration is the
+EL1-only M4b direct-call shape; the EL0 excursion is an optional
+sandbox. Next items: an activation cache, GIC interrupts, FP/SIMD
+context — and, only if a containment use-case lands, a
+capability-flavored object-catalog trap for foreign-code domains
+(deliberately not a POSIX-style syscall ABI).
 
 ---
 
