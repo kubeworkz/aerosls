@@ -6483,6 +6483,42 @@ the only place a "we meant to leave that out" can hide, and it has to
 say why — this one points at the two gates that actually enforce the
 copy's contract.
 
+### 10.184 The kernel-copy coverage matrix (auditable at a glance)
+
+The kernel-translator-copy discipline now spans three copies (ARM
+§10.180/10.181, x86 and RV64 §10.183) and several gates. The guarantees
+are scattered across records, so here they are as a single matrix: for
+each kernel copy and each enforcement dimension, what exists and where.
+A row is CI-enforced when the named check/smoke runs on every push or in
+a toolchain job; "commit-time only" means the property was asserted when
+the copy was made and has no automated re-check.
+
+| dimension | kernel/simi_arm.c (host twin tools/simi/simi_arm.c) | kernel/simi_x86.c (host twin tools/simi/simi_x86.c) | kernel/simi_riscv.c (host twin tools/simi/simi_riscv.c) |
+|---|---|---|---|
+| byte-identity re-diff tripwire | CHECK tests/arm_kernel_copy_rediff_check.sh + smoke tests/arm_kernel_copy_rediff_smoke.sh (§10.182) -- marker-anchored body diff of BOTH .c and .h pairs, toolchain-free, runs every push via the tests/*_check.sh + *_smoke.sh globs | NONE -- asserted at commit time only | NONE -- asserted at commit time only |
+| freestanding compile gate (zero warnings) | CHECK arm64-guards CI job: aarch64-linux-gnu-gcc -ffreestanding -O2 -Wall -Wextra -ffunction-sections -fdata-sections -c kernel/simi_arm.c (§10.180) | CHECK tests/simi_x86_kernel_check.sh -- exact X86_CFLAGS mirror, host gcc, runs every push via the glob (§10.183) | CHECK tools/simi/tests/simi_riscv_kernel_check.sh -- exact RV_CFLAGS mirror (rv64gcv/lp64d), explicit step in the riscv-guards CI job (§10.183) |
+| undefined-symbol gate | CHECK same arm64-guards step: nm -u must show nothing beyond {memcpy, memset} -- GCC 13/AArch64 synthesizes exactly that pair from the M2 chain struct copies (§10.181) | CHECK same simi_x86_kernel_check.sh: ZERO undefined symbols -- the -nostdlib link contract is strictly empty on x86 (§10.183) | CHECK same simi_riscv_kernel_check.sh: ZERO undefined symbols (§10.183) |
+| teeth (deliberate-violation smokes) | CHECK arm64_kernel_copy_smoke.sh (printf + unused-var, 3 teeth, arm64-guards job) + the rediff smoke above (§10.181/10.182) | CHECK tests/simi_x86_kernel_smoke.sh (3 teeth, glob-run) (§10.183) | CHECK tools/simi/tests/simi_riscv_kernel_smoke.sh (3 teeth, riscv-guards job) (§10.183) |
+| real-execution leg on the host twin | CHECK M3 qemu-aarch64 corpus: run_arm64_tests.sh translates and EXECUTES every fixture on real A64 (§10.178/10.179) -- the kernel copy is byte-identical to that proven encoder | CHECK native x86 JIT: run_native_tests.sh executes the host twin as real x86 (M2.76 steps/bytes tripwires) | CHECK rv64_exec parity (run_riscv_tests.sh) + the real RV64 kernel boot smoke in the riscv-guards job (the host twin runs as actual machine code) |
+| kernel build/link | NONE -- deliberately: no arm64 kernel target exists, so the copy is compiled nowhere and linked into nothing; the freestanding compile + re-diff gates are the staging proxy (§10.180). The makefile_sources guard documents this exclusion (§10.183) | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
+
+The matrix's two open gaps, in priority order:
+
+1. x86 and RV64 lack a byte-identity re-diff tripwire. The ARM pair
+   closed this (§10.182): a host-side edit that forgets to re-derive the
+   kernel copy silently diverges the two, and the compile/undefined-
+   symbol gates still pass because they compile whatever the kernel copy
+   happens to be. The x86 check runs on every push and the RV64 check in
+   its CI job, but neither verifies identity with its host twin -- a
+   divergence would only surface as a behavioral difference, not a gate
+   failure. The arm_kernel_copy_rediff_check.sh pattern generalizes
+   directly (marker-anchored body extraction, positional-path args for
+   the teeth smoke).
+2. The ARM copy has no kernel build/link (documented honest boundary,
+   §10.180) -- the only row that is not a "TODO guard" but a "cannot
+   exist yet" gap: it closes when the roadmap grows an arm64 kernel
+   target, not by adding a check.
+
 ---
 
 ## Sources consulted
