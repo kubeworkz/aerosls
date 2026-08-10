@@ -1,5 +1,6 @@
 #include "sbi.h"
 #include "plic.h"
+#include "trap_riscv.h"   /* rv_halt() -- the shell's `exit` command (Phase 9i) */
 
 /* QEMU virt 16550 UART (Phase 9g) -- the console for the M-mode build
  * (QEMU `-bios none -kernel`): there is no OpenSBI, so no SBI console
@@ -131,16 +132,61 @@ void sbi_system_reset(void) {
 static char riscv_shell_input_buffer[SHELL_BUF_SIZE];
 static uint32_t buf_cursor = 0;
 
-/* The x86 kernel routes UART shell lines through route_sls_shell_command();
- * the RISC-V port has no SLS shell yet, so the honest behavior is to
- * report the received line and continue. This definition closes the
- * dangling symbol that only becomes a hard link error once the trap
- * path actually links (see AeroSLS-SIMI-ISA-v0.1.md section 16 Phase 9c). */
+/* Phase 9i command loop: the real headless shell. Every line accumulated
+ * by handle_riscv_supervisor_interrupt (with backspace editing and CR-only
+ * line endings) is dispatched here. Commands:
+ *   help               list the commands
+ *   version            kernel version banner
+ *   echo <text>        repeat the text
+ *   exit               power the machine off (SBI_SRST in S-mode; a
+ *                      reported halt in bare M-mode, where no firmware
+ *                      exists to power off with)
+ * Anything else is reported as an unknown command. This definition also
+ * closes the dangling symbol that only became a hard link error once the
+ * trap path actually linked (see AeroSLS-SIMI-ISA-v0.1.md §16 Phase 9c). */
+static int shell_streq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a++ != *b++) return 0;
+    }
+    return *a == *b;
+}
+static void shell_print(const char* s) {
+    while (*s) sbi_putchar(*s++);
+}
 void route_sls_shell_command(const char* buffer) {
-    const char* prefix = "[SHELL] no SLS shell on the RISC-V port; received: \"";
-    for (const char* p = prefix; *p; p++) sbi_putchar(*p);
+    if (buffer[0] == '\0') { sbi_putchar('\r'); sbi_putchar('\n'); return; }
+
+    if (shell_streq(buffer, "help")) {
+        shell_print("[HELP] commands: help, version, echo <text>, exit\r\n");
+        return;
+    }
+    if (shell_streq(buffer, "version")) {
+        shell_print("[VER] AeroSLS RISC-V kernel (SIMI Phase 9i command loop)\r\n");
+        return;
+    }
+    if (shell_streq(buffer, "exit")) {
+#if defined(RISCV_MMODE)
+        shell_print("[EXIT] no firmware to power off -- halting hart.\r\n");
+        rv_halt();
+#else
+        shell_print("[EXIT] powering off via OpenSBI SBI_SRST (SHUTDOWN).\r\n");
+        sbi_system_reset();
+        shell_print("[EXIT] SBI_SRST unsupported or failed -- halting hart instead.\r\n");
+        rv_halt();
+#endif
+        return;
+    }
+    if (buffer[0] == 'e' && buffer[1] == 'c' && buffer[2] == 'h' && buffer[3] == 'o' &&
+        buffer[4] == ' ') {
+        shell_print("[ECHO] ");
+        for (const char* p = buffer + 5; *p; p++) sbi_putchar(*p);
+        sbi_putchar('\r'); sbi_putchar('\n');
+        return;
+    }
+
+    shell_print("[ERR] unknown command: \"");
     for (const char* p = buffer; *p; p++) sbi_putchar(*p);
-    sbi_putchar('\"'); sbi_putchar('\n');
+    shell_print("\"\r\n");
 }
 
 // Invoked from riscv_trap_dispatch (arch/riscv/trap_riscv.c) for
@@ -179,11 +225,13 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
             char c = (char)input_char;
 
             if (c == '\r' || c == '\n') {
-                // Return / Enter Key: Terminate string and evaluate command
+                // Line end (a real terminal sends CR-only on Enter):
+                // terminate the buffer and dispatch it. Echo a proper
+                // CRLF so the terminal cursor returns to column 0.
                 riscv_shell_input_buffer[buf_cursor] = '\0';
-                sbi_putchar('\n'); // Echo newline to terminal output window
+                sbi_putchar('\r'); sbi_putchar('\n');
                 
-                // Route the buffer straight to the Single-Level Storage shell execution matrix
+                // Route the buffer to the command dispatcher
                 route_sls_shell_command(riscv_shell_input_buffer);
                 
                 // Reset buffer cursor for next input command stream loop

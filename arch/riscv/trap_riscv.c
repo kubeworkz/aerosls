@@ -69,12 +69,14 @@ static void rv_print_udec(uint64_t v) {
     while (i > 0) sbi_putchar(buf[--i]);
 }
 
-/* Deliberate terminal halt for the syscall/unhandled paths. Real kernel:
- * wfi-spin forever, never returning. Host-side test build
- * (SIMI_HOST_TEST): exit the process cleanly instead, so the harness
- * observes "dispatch never returned" as the process terminating from
- * inside the handler rather than falling through to main. */
-static void rv_halt(void) {
+/* Deliberate terminal halt for the syscall/unhandled paths (and, since
+ * Phase 9i's command loop, the shell's `exit` command -- arch/riscv/
+ * sbi.c, which includes this header). Real kernel: wfi-spin forever,
+ * never returning. Host-side test build (SIMI_HOST_TEST): exit the
+ * process cleanly instead, so the harness observes "dispatch never
+ * returned" as the process terminating from inside the handler rather
+ * than falling through to main. */
+void rv_halt(void) {
 #if defined(SIMI_HOST_TEST)
     exit(0);
 #else
