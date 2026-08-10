@@ -83,7 +83,11 @@ void arm_timer_init(void)
 
 void arm_timer_arm(void)
 {
-    uint64_t period = g_cntfrq / 20;   /* 50 ms of virtual time */
+    /* 100 ms of virtual time — the M5.2 contention probe's period
+     * (§10.196): the EL0 program's window must exceed it comfortably,
+     * and the [TICK 2] re-arm proof needs a real period between
+     * consecutive ticks. */
+    uint64_t period = g_cntfrq / 10;
     asm volatile("msr cntp_tval_el0, %0" ::"r"(period));
     asm volatile("msr cntp_ctl_el0, %0" ::"r"(1u));   /* ENABLE, IMASK=0 */
     asm volatile("isb" ::: "memory");

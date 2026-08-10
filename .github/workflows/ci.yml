@@ -583,14 +583,23 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          # M5.2 (plan doc §6 M5.2 / §10.194): the GIC tick gate. The
-          # log shows [TICK 1], [TICK 2], [TICK 3] as an unbroken run
-          # (exactly 3), and [TICK 2] specifically is the re-arm proof
-          # — a one-shot timer delivers only [TICK 1]. The ticks fire
-          # strictly after the last EL0 result line, so the M5.1 counts
-          # above are untouched by construction.
-          [ "$(grep -ao '\[TICK [0-9]' arm64_boot.log | wc -l)" -eq 3 ] || {
-            echo "FAILED: expected exactly THREE tick lines ([TICK 1..3], unbroken run)" >&2
+          # M5.2 (plan doc §6 M5.2 / §10.194/§10.196): the GIC tick gate
+          # + the Phase 9n-style contention probe. The boot log shows
+          # [TICK 1..4] as an unbroken run (exactly 4), and [TICK 2] is
+          # the re-arm proof — a one-shot timer delivers only [TICK 1].
+          # The ordered token stream below proves the INTERLEAVE: the
+          # timer is armed BEFORE the EL0 excursions, the EL0 program is
+          # a 1e8-iteration loop (~8x the 100 ms period, measured
+          # §10.196), so [TICK 1] fires inside EL0 #1's window, pends
+          # against the EL0 SPSR's I mask, and is taken on the
+          # svc-return (between the two eret lines); [TICK 2] is pended
+          # through EL0 #2 the same way; [TICK 3]/[TICK 4] land during
+          # idle. Zero lost ticks = the stream is exactly this, in this
+          # order — a lost tick (a level-sensitive GIC line deasserted
+          # before being taken) would break the sequence or hang the
+          # gate. The M5.1 counts above are untouched by construction.
+          [ "$(grep -ao '\[TICK [0-9]' arm64_boot.log | wc -l)" -eq 4 ] || {
+            echo "FAILED: expected exactly FOUR tick lines ([TICK 1..4], unbroken run)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
@@ -599,7 +608,18 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + GIC ticks [TICK 1..3] + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
+          seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached' arm64_boot.log)
+          want=$'[M5] eret into EL0...\n[TICK 1]\n[M5] eret into EL0...\n[TICK 2]\n[TICK 3]\n[TICK 4]\ntick gate reached'
+          [ "$seq" = "$want" ] || {
+            echo "FAILED: the tick stream does not interleave with the EL0 excursions (a tick was lost, duplicated, or taken out of order)" >&2
+            echo "--- got:" >&2
+            echo "$seq" >&2
+            echo "--- want:" >&2
+            echo "$want" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + contention-probe GIC ticks [TICK 1..4] interleaved with the EL0 excursions + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |

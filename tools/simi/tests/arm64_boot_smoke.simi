@@ -1,15 +1,37 @@
-; arm64_boot_smoke.simi — M4b (plan doc §6 M4 / §10.187): the tiny program
-; embedded into kernel/kernel_arm64.c's boot-time smoke test. Mirror of
-; rv64_boot_smoke.simi (Phase 9d): deliberately trivial (no CALL, no memory,
-; no RESOLVE) — the point is to prove simi_arm_translate()'s OUTPUT is
-; directly callable as real machine code inside the actual freestanding
-; AArch64 kernel binary (kernel/simi_arm.c linked into sls_arm64_kernel.elf,
-; with the kernel providing the {memcpy, memset} pair the §10.181 gate
-; permits), not to exercise the translator's feature surface — that is
-; tools/simi/tests/'s job (the qemu-aarch64 M3 leg covers it).
+; arm64_boot_smoke.simi — M4b + M5.2 contention probe (plan doc §6 M4 /
+; §10.187, §6 M5.2 / §10.196): the program embedded into
+; kernel/kernel_arm64.c's boot-time smoke test. Originally the M4b
+; trivial 42-return mirror of rv64_boot_smoke.simi; the M5.2
+; contention probe (Phase 9n-style, §10.196) makes it a LONG-RUNNING
+; loop so a tick can fire INSIDE each EL0 excursion's window — the
+; kernel's own logs prove the pended tick is taken exactly once on the
+; svc-return to EL1 (unbroken [TICK N] stream, zero lost ticks, zero
+; missed re-arms). The loop count (1e8) is chosen so the window
+; comfortably exceeds the 100 ms tick period across realistic TCG
+; speeds: the emitted A64 loop body is ~10 instructions per SIMI
+; iteration (the block-head frame reload), so 1e8 iterations is ~1e9
+; A64 instructions — measured ~0.5 s per EL0 window on the dev host
+; (a ~5x margin vs the 100 ms period; the total boot is ~3 s, far
+; under the CI 60 s timeout even at 5x slower TCG). The margin is the
+; whole point: if an EL0 window ever dropped BELOW the period, a
+; level-sensitive tick would deassert before being taken and the gate
+; would lose it (the exact failure this probe exists to prove absent).
+; The result is still 42, so the M4b/M5.1 gates (four entries, one
+; translation, all 42) are unchanged. The execution benches
+; (bench-exec & friends) SKIP this fixture: it is kernel-embedded, not
+; a parity-corpus fixture, and a 500x bench-exec run of the loop would
+; take ~an hour (see §10.196). The size gate passes --max-steps to
+; raise the verifier's 10M step budget for this one row.
 ; Expected result: 42
 .entry main
 main:
     ENTER #4
+    LOADI r0, #0, i32        ; counter
+    LOADI r1, #100000000, i32 ; limit — the loop window (see above)
+    LOADI r2, #1, i32        ; step
+loop:
+    ADD r0, r0, r2, i32
+    CMP r3, r0, r1, i32, LT
+    BC r3, loop
     LOADI r0, #42, i32
     RET

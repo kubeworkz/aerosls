@@ -112,7 +112,9 @@ static uint32_t g_el0_excursions;    /* the M5.1 gate: exactly 2 at boot */
 /* M5.2: the tick counter, bumped by the EL1h IRQ handler. Volatile —
  * written by arm64_tick_irq, read by the wait loop. */
 static volatile uint32_t g_tick_count;
-#define M52_TICK_TARGET 3            /* the gate: [TICK 1..3], unbroken */
+#define M52_TICK_TARGET 4            /* the gate: [TICK 1..4], unbroken — 2
+                                     * pended through the EL0 windows, 2
+                                     * during idle (contention probe, §10.196) */
 
 static void print_u64_dec(uint64_t v);
 
@@ -436,15 +438,15 @@ static void arm64_el0_activate(void)
  * each iteration (the IRQ handler bumps it). */
 static void arm64_wait_ticks(uint32_t target)
 {
-    arm_timer_arm();   /* arm BEFORE unmask — no early tick */
+    /* The timer was armed in main before the EL0 excursions (§10.196)
+     * and the handler re-arms on every tick, so there is nothing to arm
+     * here. IRQs are already unmasked: arm64_el0_done cleared the I bit
+     * at its entry, so each tick pended through an EL0 window was taken
+     * exactly once on that return. This phase just idles for the idle
+     * ticks that complete the count. */
     uart_puts("[M5.2] waiting for ");
     print_u64_dec(target);
-    uart_puts(" ticks (GICv2, CNTP PPI 14)...\\r\\n");
-    /* Unmask IRQs. The DAIF immediate encoding is {D=8, A=4, I=2, F=1}
-     * — clearing the I (IRQ) mask is #2, NOT #4 (which clears A; the
-     * first M5.2 bring-up bug, §10.195). Linux's local_irq_enable uses
-     * the same #2. */
-    asm volatile("msr daifclr, #2" ::: "memory");   /* IRQ unmask (I) */
+    uart_puts(" ticks total (GICv2, CNTP PPI 14, 100 ms period)...\\r\\n");
     while (g_tick_count < target)
         ;
     asm volatile("msr daifset, #2" ::: "memory");   /* re-mask */
@@ -462,6 +464,13 @@ static void arm64_wait_ticks(uint32_t target)
  * second, runs the M5.2 tick gate, then powers off. */
 static void arm64_el0_done(void)
 {
+    /* M5.2 contention probe (§10.196): the svc handler returns with DAIF
+     * masked (SPSR 0x3c5), but a tick that fired during the EL0 window
+     * is pending RIGHT NOW. Unmask immediately so it is taken exactly
+     * once on this return — a level-sensitive GIC line that deasserts
+     * (the handler's re-arm) before being taken is silently dropped, the
+     * exact lost-tick failure the probe exists to prove absent. */
+    asm volatile("msr daifclr, #2" ::: "memory");   /* IRQ unmask (I) */
     uart_puts("[M5] returned from EL0 -- user result=");
     print_u64(g_user_result);
     uart_puts(" (expected 0x2a = 42)\\r\\n");
@@ -515,6 +524,17 @@ void kernel_arm64_main(void)
      * excursion, then runs the M5.2 tick gate, then PSCI SYSTEM_OFF. */
     arm64_el1_entry();
     arm64_el1_entry();
+    /* M5.2 contention probe (§10.196): arm the timer BEFORE the EL0
+     * excursions. The EL0 program is a 1e8-iteration loop, so a 100 ms
+     * tick fires DURING each EL0 window, pends against the EL0 SPSR's I
+     * mask (0x3c0), and is taken exactly once when the continuation
+     * clears I on return — the [TICK N] lines interleave with the
+     * excursion logs, and the unbroken 1..4 stream is the zero-lost-tick
+     * proof. IRQs stay masked here; the unmask happens at the
+     * continuation entry (arm64_el0_done). */
+    arm_timer_arm();
+    uart_puts("[M5.2] contention probe: 100 ms ticks armed before the EL0 "
+              "excursions (they pend through each EL0 window)\\r\\n");
     arm64_el0_activate();
     /* Unreachable: arm64_el0_activate is noreturn. */
     for (;;)
