@@ -6495,29 +6495,63 @@ the copy was made and has no automated re-check.
 
 | dimension | kernel/simi_arm.c (host twin tools/simi/simi_arm.c) | kernel/simi_x86.c (host twin tools/simi/simi_x86.c) | kernel/simi_riscv.c (host twin tools/simi/simi_riscv.c) |
 |---|---|---|---|
-| byte-identity re-diff tripwire | CHECK tests/arm_kernel_copy_rediff_check.sh + smoke tests/arm_kernel_copy_rediff_smoke.sh (§10.182) -- marker-anchored body diff of BOTH .c and .h pairs, toolchain-free, runs every push via the tests/*_check.sh + *_smoke.sh globs | NONE -- asserted at commit time only | NONE -- asserted at commit time only |
+| byte-identity re-diff tripwire | CHECK tests/arm_kernel_copy_rediff_check.sh + smoke tests/arm_kernel_copy_rediff_smoke.sh (§10.182) -- marker-anchored body diff of BOTH .c and .h pairs, toolchain-free, runs every push via the tests/*_check.sh + *_smoke.sh globs | CHECK tests/x86_kernel_copy_rediff_check.sh + smoke tests/x86_kernel_copy_rediff_smoke.sh (§10.185) -- same marker-anchored mechanism, same globs | CHECK tests/riscv_kernel_copy_rediff_check.sh + smoke tests/riscv_kernel_copy_rediff_smoke.sh (§10.185) -- same mechanism; its FIRST run caught and re-derived a real divergence (the F4-era stale kernel .h) |
 | freestanding compile gate (zero warnings) | CHECK arm64-guards CI job: aarch64-linux-gnu-gcc -ffreestanding -O2 -Wall -Wextra -ffunction-sections -fdata-sections -c kernel/simi_arm.c (§10.180) | CHECK tests/simi_x86_kernel_check.sh -- exact X86_CFLAGS mirror, host gcc, runs every push via the glob (§10.183) | CHECK tools/simi/tests/simi_riscv_kernel_check.sh -- exact RV_CFLAGS mirror (rv64gcv/lp64d), explicit step in the riscv-guards CI job (§10.183) |
 | undefined-symbol gate | CHECK same arm64-guards step: nm -u must show nothing beyond {memcpy, memset} -- GCC 13/AArch64 synthesizes exactly that pair from the M2 chain struct copies (§10.181) | CHECK same simi_x86_kernel_check.sh: ZERO undefined symbols -- the -nostdlib link contract is strictly empty on x86 (§10.183) | CHECK same simi_riscv_kernel_check.sh: ZERO undefined symbols (§10.183) |
-| teeth (deliberate-violation smokes) | CHECK arm64_kernel_copy_smoke.sh (printf + unused-var, 3 teeth, arm64-guards job) + the rediff smoke above (§10.181/10.182) | CHECK tests/simi_x86_kernel_smoke.sh (3 teeth, glob-run) (§10.183) | CHECK tools/simi/tests/simi_riscv_kernel_smoke.sh (3 teeth, riscv-guards job) (§10.183) |
+| teeth (deliberate-violation smokes) | CHECK arm64_kernel_copy_smoke.sh (printf + unused-var, 3 teeth, arm64-guards job) + the rediff smoke above (§10.181/10.182) | CHECK tests/simi_x86_kernel_smoke.sh (3 teeth, glob-run) (§10.183) + the x86 rediff smoke (kernel-mutation and host-mutation teeth) (§10.185) | CHECK tools/simi/tests/simi_riscv_kernel_smoke.sh (3 teeth, riscv-guards job) (§10.183) + the riscv rediff smoke (§10.185) |
 | real-execution leg on the host twin | CHECK M3 qemu-aarch64 corpus: run_arm64_tests.sh translates and EXECUTES every fixture on real A64 (§10.178/10.179) -- the kernel copy is byte-identical to that proven encoder | CHECK native x86 JIT: run_native_tests.sh executes the host twin as real x86 (M2.76 steps/bytes tripwires) | CHECK rv64_exec parity (run_riscv_tests.sh) + the real RV64 kernel boot smoke in the riscv-guards job (the host twin runs as actual machine code) |
 | kernel build/link | NONE -- deliberately: no arm64 kernel target exists, so the copy is compiled nowhere and linked into nothing; the freestanding compile + re-diff gates are the staging proxy (§10.180). The makefile_sources guard documents this exclusion (§10.183) | CHECK kernel/simi_x86.c is in X86_C_SRC -- linked into the x86 kernel image | CHECK kernel/simi_riscv.c is in RV_C_SRC -- linked into the RISC-V kernel image |
 
-The matrix's two open gaps, in priority order:
+Gap 1 (the byte-identity tripwires for x86 and RV64) is CLOSED (§10.185):
+the marker-anchored check + teeth smoke pattern generalized to both
+remaining pairs. The tripwire proved itself immediately -- its first run
+on the RV64 pair caught a real divergence (the kernel .h had never been
+re-derived after F4's float-codegen comment change) and the copy was
+re-derived in the same pass. All three pairs now re-diff on every push.
 
-1. x86 and RV64 lack a byte-identity re-diff tripwire. The ARM pair
-   closed this (§10.182): a host-side edit that forgets to re-derive the
-   kernel copy silently diverges the two, and the compile/undefined-
-   symbol gates still pass because they compile whatever the kernel copy
-   happens to be. The x86 check runs on every push and the RV64 check in
-   its CI job, but neither verifies identity with its host twin -- a
-   divergence would only surface as a behavioral difference, not a gate
-   failure. The arm_kernel_copy_rediff_check.sh pattern generalizes
-   directly (marker-anchored body extraction, positional-path args for
-   the teeth smoke).
-2. The ARM copy has no kernel build/link (documented honest boundary,
+The one remaining open gap:
+
+1. The ARM copy has no kernel build/link (documented honest boundary,
    §10.180) -- the only row that is not a "TODO guard" but a "cannot
    exist yet" gap: it closes when the roadmap grows an arm64 kernel
    target, not by adding a check.
+
+### 10.185 Gap #1 closed: the byte-identity tripwire generalizes to x86 and RV64 — and its first run caught a real divergence
+
+The §10.184 matrix flagged x86 and RV64 as the two pairs without a
+byte-identity re-diff tripwire. They now have one, mirroring the ARM
+pair (§10.182) exactly: `tests/x86_kernel_copy_rediff_check.sh` and
+`tests/riscv_kernel_copy_rediff_check.sh` are marker-anchored body diffs
+(the `#include "simi_x86.h"` / `#ifndef SIMI_X86_H` and `#include
+"simi_riscv.h"` / `#ifndef SIMI_RISCV_H` anchors), toolchain-free, so
+they ride the `tests/*_check.sh` glob in run_checks.sh and run on every
+push. Empty-body extraction remains an abort, not a pass. Each has its
+own teeth smoke (`tests/x86_kernel_copy_rediff_smoke.sh`,
+`tests/riscv_kernel_copy_rediff_smoke.sh`): pristine copies must pass,
+a mutated kernel copy must fail, a mutated host copy must fail — 3 teeth
+each, all verified green with the real files.
+
+The tripwire proved its worth on the very first run. The RV64 check
+failed against the pristine tree: the .c bodies were byte-identical, but
+the .h bodies had diverged. The host tools/simi/simi_riscv.h carries the
+F4-era comment (float codegen for ADD/SUB/MUL/DIV/NEG/CMP under
+T_F32/T_F64 is REAL — the F/D GP-bounce in emit_instr; only float MOD
+and FLAG_IMM forms reject with TX_RV_ERR_FLOAT_UNSUPPORTED), while
+kernel/simi_riscv.h still carried the pre-F4 Phase 10 v1 claim (float
+"scoped OUT... rejected outright"). F4 updated the host header and never
+re-derived the kernel copy — exactly the silent divergence this class of
+check exists to catch, and one the compile/undefined-symbol gates could
+not (both files define TX_RV_ERR_FLOAT_UNSUPPORTED; only the surrounding
+comment differs, and no compiler reads comments). The kernel copy's .h
+was re-derived in the same pass (kernel-copy header prose preserved and
+its stale "float-rejection rationale" pointer corrected, host body
+spliced below the #ifndef marker), and the compile gate still passes
+clean. The matrix row for RV64 now records this history.
+
+With this, all three kernel translator copies re-diff against their host
+twins on every push; the §10.184 matrix's only remaining open gap is
+the ARM copy's no-kernel-build boundary (§10.180), which closes with an
+arm64 kernel target, not a check.
 
 ---
 

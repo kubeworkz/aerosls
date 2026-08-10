@@ -6,7 +6,9 @@
  * design-notes block (portable no-libc core structured to mirror
  * simi_x86.h/.c function-for-function, the r7/r6 scratch-pointer/
  * namepool-pointer conventions, the v0.3 capability-tag mechanism, and
- * the Gap Remediation Phase 10 float-rejection rationale). Keeping the
+ * the Gap Remediation Phase 10 F4 float-codegen notes — the arithmetic
+ * ops under T_F32/T_F64 are REAL (the F/D GP-bounce in emit_instr);
+ * only float MOD and FLAG_IMM forms reject). Keeping the
  * two copies byte-identical is deliberate: it's what makes the host
  * toolchain's rv64_exec.c-based verification (see AeroSLS-SIMI-ISA-v0.1.md
  * §12) meaningful for this kernel copy too — same encoder, same bugs or
@@ -69,20 +71,17 @@ enum {
     TX_RV_ERR_TOO_MANY_LITERALS,
     TX_RV_ERR_BRANCH_OUT_OF_RANGE,
     TX_RV_ERR_NAME_OUT_OF_RANGE,   /* v0.3: RESOLVE name-pool index out of range */
-    TX_RV_ERR_FLOAT_UNSUPPORTED,  /* Gap Remediation SIMI Phase 10: T_F32/
-                                    * T_F64 on ADD/SUB/MUL/DIV/MOD/NEG/CMP.
-                                    * RV64 float codegen is explicitly
-                                    * scoped OUT of Phase 10 v1 (deferred to
-                                    * ride alongside Phase 9's RISC-V kernel
-                                    * wiring, which hasn't happened yet
-                                    * either) -- rejected outright rather
-                                    * than silently mis-executed as integer
-                                    * ops on the raw IEEE bit pattern, which
-                                    * is what would happen without this
-                                    * check (this translator has no type
-                                    * dispatch at all otherwise; every
-                                    * arithmetic/compare opcode just reads
-                                    * the 64-bit slot as a plain integer). */
+    TX_RV_ERR_FLOAT_UNSUPPORTED,  /* Gap Remediation SIMI Phase 10 (F4): the
+                                    * remaining float scopes with no RV64
+                                    * meaning — float MOD (no hardware float
+                                    * remainder on any target; compose
+                                    * DIV+MUL+SUB) and FLAG_IMM + float
+                                    * arithmetic (no immediate FP form in
+                                    * v1). ADD/SUB/MUL/DIV/NEG/CMP under
+                                    * T_F32/T_F64 are REAL here (the F/D
+                                    * GP-bounce codegen in emit_instr);
+                                    * unsigned float CMP relations reject
+                                    * with TX_RV_ERR_BAD_OPCODE instead. */
 };
 
 /* Same contract as simi_x86_translate() (simi_x86.h) — see that file for
