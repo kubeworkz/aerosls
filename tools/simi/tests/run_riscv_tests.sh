@@ -385,11 +385,15 @@ fi
 # PLIC, drains the 16550 RBR directly, and completes. The check boots it
 # under OpenSBI with the serial port on a UNIX socket (server=on,wait=on
 # — QEMU holds the VM until the client connects, so no boot output is
-# dropped), then echo_client.py drives the full readline + command-loop
-# protocol: help, a backspace-edited CR-only line (PING\bX -> the unknown
-# command PINX), echo <text>, and finally `exit`, which powers the
-# machine off via SBI_SRST — so QEMU must exit rc=0 (rc=124 means the
-# exit command never fired).
+# dropped), then echo_client.py drives the interrupt-count tripwire
+# (three isolated keystrokes must each produce EXACTLY one interrupt —
+# the kernel prints [IRQ#N] after its complete(), so the assertion is
+# deterministic) plus the full readline + command-loop protocol: help, a
+# backspace-edited CR-only line (PING\bX -> the unknown command PINX),
+# echo <text>, and finally `exit`, which powers the machine off via
+# SBI_SRST — so QEMU must exit rc=0 (rc=124 means the exit command never
+# fired). The rapid batches must also drain with no lost bytes (the
+# claim/complete discipline under queued input).
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo.sock
@@ -425,14 +429,15 @@ fi
 # Phase 9i M-mode twin: the SAME echo over the bare-metal path — the
 # M-mode PLIC context (context 0), mie.MEIE + mstatus.MIE, the interrupt
 # taken at mtvec with mcause = bit63 + 11 (the handler accepts both cause
-# 9/SEIP and 11/MEIP). Same socket protocol as rv-uart-echo (help, the
-# backspace-edited CR-only line, echo <text>, exit); the difference is
-# `-bios none` + sls_riscv_kernel_echo_m.elf (linked at 0x80000000,
-# -DRISCV_MMODE -DKERNEL_UART_ECHO), and rc=124 is success here because
-# the M-mode `exit` has no firmware to power off with — it reports the
-# halt and spins (killed by the timeout). This is also the first real
-# M-mode INTERRUPT round trip through the entry (the entry fixture's
-# M-mode build only exercised the ebreak/advanced case).
+# 9/SEIP and 11/MEIP). Same socket protocol as rv-uart-echo (the
+# interrupt-count tripwire, help, the backspace-edited CR-only line,
+# echo <text>, exit); the difference is `-bios none` +
+# sls_riscv_kernel_echo_m.elf (linked at 0x80000000, -DRISCV_MMODE
+# -DKERNEL_UART_ECHO), and rc=124 is success here because the M-mode
+# `exit` has no firmware to power off with — it reports the halt and
+# spins (killed by the timeout). This is also the first real M-mode
+# INTERRUPT round trip through the entry (the entry fixture's M-mode
+# build only exercised the ebreak/advanced case).
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo_m.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo_m.sock

@@ -132,6 +132,14 @@ void sbi_system_reset(void) {
 static char riscv_shell_input_buffer[SHELL_BUF_SIZE];
 static uint32_t buf_cursor = 0;
 
+/* Phase 9i interrupt-count tripwire: how many UART RX interrupts have
+ * been claimed/drained/completed since boot. Only touched from interrupt
+ * context (single hart, interrupts disabled inside the handler), so a
+ * plain global is fine. The echo builds print it as [IRQ#N] AFTER the
+ * complete() (see the handler), which is what makes per-keystroke
+ * interrupt accounting a deterministic assertion. */
+static uint64_t g_uart_rx_irq_count;
+
 /* Phase 9i command loop: the real headless shell. Every line accumulated
  * by handle_riscv_supervisor_interrupt (with backspace editing and CR-only
  * line endings) is dispatched here. Commands:
@@ -152,6 +160,13 @@ static int shell_streq(const char* a, const char* b) {
 }
 static void shell_print(const char* s) {
     while (*s) sbi_putchar(*s++);
+}
+static void shell_print_udec(uint64_t v) {
+    char buf[20];
+    int i = 0;
+    if (v == 0) { sbi_putchar('0'); return; }
+    while (v > 0 && i < 20) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i > 0) sbi_putchar(buf[--i]);
 }
 void route_sls_shell_command(const char* buffer) {
     if (buffer[0] == '\0') { sbi_putchar('\r'); sbi_putchar('\n'); return; }
@@ -256,5 +271,20 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
         // would be stuck claimed and no further UART interrupt could
         // ever fire).
         plic_complete_interrupt(0, irq);
+
+        // Tripwire accounting. This prints AFTER the complete(), so a
+        // client that has seen [IRQ#N] knows this interrupt's whole
+        // claim/drain/complete round trip finished and the line is
+        // re-armed -- which is exactly what makes "one isolated
+        // keystroke -> exactly one interrupt" (and "a rapid batch drains
+        // with no lost bytes") a deterministic assertion rather than a
+        // timing guess. Echo builds only (KERNEL_UART_ECHO): the
+        // shipping kernels stay quiet.
+        g_uart_rx_irq_count++;
+#if defined(KERNEL_UART_ECHO)
+        shell_print("[IRQ#");
+        shell_print_udec(g_uart_rx_irq_count);
+        shell_print("]\r\n");
+#endif
     }
 }
