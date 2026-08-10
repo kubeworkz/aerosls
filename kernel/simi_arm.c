@@ -19,9 +19,11 @@
  * compiled nowhere and linked into nothing. It earns its place by the
  * two properties that make it trustworthy the day an arm64 kernel target
  * lands: (1) byte-identity with the host copy below this header
- * (re-diffed and confirmed), whose correctness is established by the
- * qemu-aarch64 REAL-execution leg of M3 (plan doc §10.178/10.179) —
- * same encoder, same bugs or lack thereof; and (2) a clean compile under
+ * (re-diffed at commit time, and re-verified on every push by the
+ * tests/arm_kernel_copy_rediff_check.sh CI tripwire — §10.182), whose
+ * correctness is established by the qemu-aarch64 REAL-execution leg of
+ * M3 (plan doc §10.178/10.179) — same encoder, same bugs or lack
+ * thereof; and (2) a clean compile under
  * aarch64 freestanding flags with zero warnings, enforced by the
  * arm64-guards CI job. The no-libc contract is precise: the object's
  * only undefined symbols may be the freestanding {memcpy, memset} pair
