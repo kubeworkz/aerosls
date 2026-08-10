@@ -4,7 +4,7 @@
  * most importantly — the verification STUB the real entry calls:
  * riscv_trap_dispatch_m() in the default (M-mode) build,
  * riscv_trap_dispatch() when compiled -DFIXTURE_SMODE. Same source,
- * three builds — exactly the kernel's own RISCV_MMODE pattern.
+ * four builds — exactly the kernel's own RISCV_MMODE pattern.
  *
  * The stub runs INSIDE the trap (the entry switched sp to
  * phd->kernel_sp before calling it, a0 = &phd) and checks the
@@ -108,6 +108,8 @@ void uart_print(const char* s) {
 
 #ifdef FIXTURE_SMODE_INTR
 #define FIXTURE_MODE_TAG " (S-mode, interrupt)"
+#elif defined(FIXTURE_SMODE_TIMER)
+#define FIXTURE_MODE_TAG " (S-mode, timer)"
 #elif defined(FIXTURE_SMODE)
 #define FIXTURE_MODE_TAG " (S-mode)"
 #else
@@ -218,7 +220,25 @@ void FIXTURE_DISPATCH_MAIN(struct RvPerHartData* phd) {
 
     uart_print("[FIXTURE] dispatcher" FIXTURE_MODE_TAG ": frame save verified\n");
 
-#ifdef FIXTURE_SMODE_INTR
+#if defined(FIXTURE_SMODE_TIMER)
+    /* Timer build: acknowledge by moving mtimecmp to the far future —
+     * SBI_SET_TIMER with 2^64-1 (mtime on the QEMU virt machine runs
+     * at 10 MHz, so that is effectively never). Timer interrupts are
+     * LEVEL-SENSITIVE: STIP stays pending until mtimecmp > mtime, and
+     * sret restores SIE from SPIE (re-enabling interrupts), so a
+     * still-pending STIP would re-trap immediately after the return.
+     * Setting mtimecmp to the future clears STIP — the device-driven
+     * counterpart of the SI build's csrc sip. The trap is NOT
+     * advanced: interrupts leave sepc untouched, exactly like the SI
+     * twin. */
+    __asm__ volatile(
+        "li a0, -1\n\t"
+        "li a1, -1\n\t"
+        "li a6, 0\n\t"
+        "li a7, 0\n\t"
+        "ecall"
+        ::: "a0", "a1", "a6", "a7", "memory");
+#elif defined(FIXTURE_SMODE_INTR)
     /* Interrupt build: interrupts do NOT advance the exception PC, so
      * the entry must resume at the SAME instruction (intr_site) — the
      * whole point of this variant is proving the restore path with an

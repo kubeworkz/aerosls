@@ -308,6 +308,39 @@ else
     skip=$((skip+1))
 fi
 
+# Phase 9h timer twin: the S-mode build triggered by a supervisor TIMER
+# interrupt (STIP) instead of ebreak — the device-driven interrupt path
+# through the ACLINT/OpenSBI (armed via SBI_SET_TIMER(0), which pends
+# STIP immediately since timer interrupts are level-sensitive; SIE is
+# raised only at the trigger point so the trap fires at a deterministic
+# boundary). The dispatcher does NOT advance sepc and acknowledges by
+# moving mtimecmp to the far future (SBI_SET_TIMER(2^64-1)), proving the
+# un-advanced sepc/sret restore path for a device interrupt.
+if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
+    if make -C .. rv-trap-entry-test-t >/dev/null 2>&1; then
+        timeout 30 qemu-system-riscv64 -M virt -m 128M -smp 1 -kernel ../rv_trap_entry_t.elf -nographic >rv_trap_entry_t.out 2>&1
+        rc=$?
+        if [ "$rc" -eq 124 ] \
+           && grep -q "\[FIXTURE\] dispatcher (S-mode, timer): frame save verified" rv_trap_entry_t.out \
+           && grep -q "\[FIXTURE\] PASS: S-mode timer entry save/restore round-trip verified" rv_trap_entry_t.out \
+           && ! grep -q "\[FIXTURE\] FAIL" rv_trap_entry_t.out; then
+            echo "PASS  rv-trap-entry-t (S-mode timer entry round-trip under OpenSBI)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  rv-trap-entry-t (rc=$rc — serial output not as expected)"
+            cat rv_trap_entry_t.out
+            fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  rv-trap-entry-t (fixture build failed — check the cross toolchain)"
+        skip=$((skip+1))
+    fi
+    rm -f rv_trap_entry_t.out
+else
+    echo "SKIP  rv-trap-entry-t (no qemu-system-riscv64 / riscv64-unknown-elf-gcc)"
+    skip=$((skip+1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
