@@ -512,7 +512,11 @@ AR_CFLAGS   = -ffreestanding -O2 -Wall -Wextra -march=armv8-a -I. \
               -ffunction-sections -fdata-sections
 AR_LDFLAGS  = -T arch/arm64/linker_arm64.ld -nostdlib --gc-sections
 AR_ASM_SRC  = arch/arm64/boot_arm64.S
-AR_C_SRC    = kernel/kernel_arm64.c arch/arm64/uart_pl011.c
+# M4b: kernel/simi_arm.c joins the image — the §10.184 matrix's ARM
+# build/link row flips NONE -> CHECK here. It needs the freestanding
+# {memcpy, memset} pair (the §10.181 contract), provided by
+# kernel/kernel_arm64.c.
+AR_C_SRC    = kernel/kernel_arm64.c kernel/simi_arm.c arch/arm64/uart_pl011.c
 AR_OBJECTS  = $(AR_ASM_SRC:.S=.ar64.o) $(AR_C_SRC:.c=.ar64.o)
 AR_ELF      = sls_arm64_kernel.elf
 

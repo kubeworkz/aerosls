@@ -1,0 +1,15 @@
+; arm64_boot_smoke.simi — M4b (plan doc §6 M4 / §10.187): the tiny program
+; embedded into kernel/kernel_arm64.c's boot-time smoke test. Mirror of
+; rv64_boot_smoke.simi (Phase 9d): deliberately trivial (no CALL, no memory,
+; no RESOLVE) — the point is to prove simi_arm_translate()'s OUTPUT is
+; directly callable as real machine code inside the actual freestanding
+; AArch64 kernel binary (kernel/simi_arm.c linked into sls_arm64_kernel.elf,
+; with the kernel providing the {memcpy, memset} pair the §10.181 gate
+; permits), not to exercise the translator's feature surface — that is
+; tools/simi/tests/'s job (the qemu-aarch64 M3 leg covers it).
+; Expected result: 42
+.entry main
+main:
+    ENTER #4
+    LOADI r0, #42, i32
+    RET
