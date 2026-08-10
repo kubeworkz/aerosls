@@ -6434,6 +6434,55 @@ files are never touched; the check's positional-path args exist
 precisely to let the smoke point it at the throwaway copies. A check
 that has gone blind (broken marker, empty diff) fails here.
 
+### 10.183 The x86 and RV64 kernel-copy guards get the same audit as the ARM copy
+
+The ARM copy audit (§10.181) proved the technique catches real holes: the
+freestanding-compile gate saw the synthesized memcpy/memset, and the
+no-libc claim became a precise, enforced contract. The other two kernel
+translator copies -- kernel/simi_x86.c and kernel/simi_riscv.c -- now get
+the same treatment.
+
+The x86 copy: `tests/simi_x86_kernel_check.sh` (toolchain-free -- the
+host gcc IS the x86 kernel's toolchain, the kernel-guards job builds with
+X86_CC=gcc -- so it rides the `tests/*_check.sh` glob in run_checks.sh
+and runs on every push). It compiles the copy with the exact X86_CFLAGS
+(-ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse
+-mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize
+-Wframe-larger-than=16384) and asserts (a) zero warnings and (b) ZERO
+undefined symbols. Teeth: `tests/simi_x86_kernel_smoke.sh` (rides the
+`tests/*_smoke.sh` glob) injects printf and an unused variable into
+throwaway copies and asserts the check fails each time.
+
+The RV64 copy: `tools/simi/tests/simi_riscv_kernel_check.sh` -- needs the
+riscv64-unknown-elf toolchain, so it is explicit, not globbed, and runs
+in the riscv-guards CI job (the same job that builds `make riscv-elf`).
+Same contract: exact RV_CFLAGS (-ffreestanding -O2 -Wall -Wextra
+-mcmodel=medany -march=rv64gcv -mabi=lp64d -mno-relax), zero warnings,
+ZERO undefined symbols. Teeth: `tools/simi/tests/simi_riscv_kernel_smoke.sh`,
+same printf/unused-var injections, same clean-copy sanity tooth.
+
+Both verified first: each copy compiles clean under its kernel's exact
+flags with zero warnings and zero undefined symbols -- so the contract
+for x86 and RV64 is strictly EMPTY, unlike the ARM copy's {memcpy,
+memset} allowance (the AArch64/GCC13 aggregate-copy synthesis is the only
+reason that pair is permitted at all). On both toolchains the M2 chain
+struct copies lower to plain inline copies, so no libcalls are
+synthesized and the -nostdlib link contract is literally no symbols.
+
+One pre-existing CI regression surfaced and was fixed in the same pass:
+tests/makefile_sources_check.sh flags every kernel/*.c not in X86_C_SRC
+(its documented job), and kernel/simi_arm.c — added by the M3 kernel
+half (§10.180) but deliberately linked into no image, since no arm64
+kernel build exists — tripped it, so the guard had been failing since
+that merge. It now carries the same documented-exclusion treatment as
+kernel/kernel_riscv.c ("RISC-V port, not in the x86 image"):
+"AArch64 translator staging copy — no arm64 kernel build exists to link
+it; its honesty is enforced by the byte-identity re-diff +
+freestanding-compile gates, not by the x86 image". The exclusion list is
+the only place a "we meant to leave that out" can hide, and it has to
+say why — this one points at the two gates that actually enforce the
+copy's contract.
+
 ---
 
 ## Sources consulted
