@@ -181,12 +181,16 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
      * timer is taken at mtvec with mcause = bit63 + 7 and re-armed in
      * handle_riscv_supervisor_interrupt, exactly like the S-mode STIP
      * path. */
-    sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+    sbi_arm_timer(SBI_TIMER_TICK_PERIOD);
     uint64_t mtie_bit = 0x80;
     __asm__ volatile("csrs mie, %0" : : "r"(mtie_bit) : "memory");
     __asm__ volatile("csrs mstatus, 8");
     rv_boot_print("[PLIC] UART RX interrupt wired (source 10 -> hart 0 M-mode, MEIE + MIE on).\n");
+#if defined(KERNEL_UART_ECHO)
+    rv_boot_print("[TIMER] CLINT mtimecmp armed (MTIP, 100ms period -- Phase 9n contention probe).\n");
+#else
     rv_boot_print("[TIMER] CLINT mtimecmp armed (MTIP, 1s period).\n");
+#endif
 #else
     init_riscv_plic(0);
     __asm__ volatile("csrs sstatus, 2");
@@ -207,10 +211,14 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
      * 0-31) — `csrs sie, 0x20` is an assembler error, so the register
      * form is required (sstatus/mstatus's SIE/MIE bits above are 1/3
      * and fit fine as immediates). */
-    sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+    sbi_arm_timer(SBI_TIMER_TICK_PERIOD);
     uint64_t stie_bit = 0x20;
     __asm__ volatile("csrs sie, %0" : : "r"(stie_bit) : "memory");
+#if defined(KERNEL_UART_ECHO)
+    rv_boot_print("[TIMER] stimecmp armed (STIP, 100ms period -- Phase 9n contention probe).\n");
+#else
     rv_boot_print("[TIMER] stimecmp armed (STIP, 1s period).\n");
+#endif
 #endif
 
 #if defined(KERNEL_UART_ECHO)

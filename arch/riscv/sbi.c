@@ -389,7 +389,13 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
 #endif
         if ((scause & (1ULL << 63)) && (scause & 0xFF) == timer_cause) {
             g_tick_count++;
-            sbi_arm_timer(SBI_TIMER_TICKS_PER_SEC);
+            /* Phase 9n: re-arm to SBI_TIMER_TICK_PERIOD — 1s on
+             * production builds, 100ms on the echo builds (the
+             * tick-vs-UART contention probe). The drift-free
+             * arithmetic keeps the 100ms cadence exact even under
+             * contention, and the level-pending bit guarantees no tick
+             * is lost to an interrupt that arrives while disabled. */
+            sbi_arm_timer(SBI_TIMER_TICK_PERIOD);
 
             /* Phase 9l: preemptive time-slice — hand the hart to the
              * active task for one bounded slice, then rotate. The slice

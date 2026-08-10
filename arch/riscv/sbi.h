@@ -13,14 +13,28 @@
 #define SBI_SRST_RESET              0
 #define SBI_SRST_RESET_TYPE_SHUTDOWN 0
 #define SBI_SRST_RESET_REASON_NONE  0
-/* Phase 9k: the periodic timer's period, in `time` ticks. QEMU virt's
- * timebase is 10 MHz, so 10,000,000 ticks = 1 second. The timer is
- * armed with no firmware involvement in either mode: S-mode writes the
- * stimecmp CSR directly (the Sstc extension), M-mode programs the
- * CLINT mtimecmp MMIO — see arch/riscv/sbi.c's sbi_arm_timer. (The
+/* Phase 9k: the timer's period, in `time` ticks. QEMU virt's timebase
+ * is 10 MHz, so 10,000,000 ticks = 1 second. The timer is armed with
+ * no firmware involvement in either mode: S-mode writes the stimecmp
+ * CSR directly (the Sstc extension), M-mode programs the CLINT
+ * mtimecmp MMIO — see arch/riscv/sbi.c's sbi_arm_timer. (The
  * SBI_SET_TIMER call shape was abandoned in S-mode: on this OpenSBI it
- * returns error 0 but never fires — documented at the csrw.) */
+ * returns error 0 but never fires — documented at the csrw.)
+ *
+ * SBI_TIMER_TICKS_PER_SEC is the TIMEBASE constant — it converts the
+ * `time` clock to wall-clock seconds and is used by the [TICK N Us]
+ * uptime print, independent of the arm period. SBI_TIMER_TICK_PERIOD
+ * is what each tick re-arms to: production builds tick once per
+ * second; the echo builds tick every 100ms — the Phase 9n tick-vs-UART
+ * contention probe, where the [TICK]/[SLICE] stream interleaves with
+ * the [IRQ] tripwire 10x faster and the client asserts no protocol
+ * bytes are lost and no re-arm is missed. */
 #define SBI_TIMER_TICKS_PER_SEC     10000000UL
+#if defined(KERNEL_UART_ECHO)
+#define SBI_TIMER_TICK_PERIOD       1000000UL    /* Phase 9n: 100ms contention probe */
+#else
+#define SBI_TIMER_TICK_PERIOD       10000000UL   /* production: 1s */
+#endif
 
 struct SBIReturn {
     long error;

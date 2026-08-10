@@ -390,7 +390,8 @@ fi
 # the kernel prints [IRQ#N] after its complete(), so the assertion is
 # deterministic), the Phase 9k periodic-timer tripwire (the client is
 # passed `tick`, so it waits for [TICK 2 Us] — printed after the STIP
-# handler re-arms the next tick, proving the 1s timer is periodic, not
+# handler re-arms the next tick, proving the periodic timer (100ms on
+# the echo builds — the Phase 9n contention probe) is periodic, not
 # one-shot), plus the full readline + command-loop protocol: help, a
 # backspace-edited CR-only line (PING\bX -> the unknown command PINX),
 # echo <text>, and finally `exit`, which powers the machine off via
@@ -401,6 +402,9 @@ fi
 # programming the CLINT mtimecmp MMIO directly — no firmware exists —
 # and taken at mtvec as MTIP (mcause = bit63 + 7), the same
 # periodic-tick protocol with the same [TICK 2 Us] re-arm proof.
+# The 100ms period means the tick stream interleaves with the UART
+# [IRQ] tripwire 10x faster; the client asserts no protocol bytes are
+# lost and the tick numbers stay an unbroken run (no missed re-arms).
 if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if make -C ../../.. sls_riscv_kernel_echo.elf >/dev/null 2>&1; then
         rm -f /tmp/sls_echo.sock
@@ -416,7 +420,7 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
         if [ "$rc" -eq 0 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_client.out; then
-            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing + wall-clock uptime)"
+            echo "PASS  rv-uart-echo (real kernel device-driven UART RX interrupt echo + command loop + 100ms periodic timer + round-robin time-slicing + wall-clock uptime + no-missed-re-arm contention probe)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo (qemu rc=$rc, client rc=$crc — echo not as expected)"
@@ -445,7 +449,8 @@ fi
 # spins (killed by the timeout). This is also the first real M-mode
 # INTERRUPT round trip through the entry (the entry fixture's M-mode
 # build only exercised the ebreak/advanced case). The Phase 9k
-# M-mode twin arms the same 1s periodic timer by programming the CLINT
+# M-mode twin arms the same periodic timer (100ms on the echo build)
+# by programming the CLINT
 # mtimecmp MMIO directly (physical 0x02004000 — bare metal has no
 # firmware to program a timer with) and enables mie.MTIE; the interrupt
 # arrives at mtvec as MTIP (mcause = bit63 + 7), is re-armed inside the
@@ -466,7 +471,7 @@ if command -v qemu-system-riscv64 >/dev/null 2>&1 && command -v riscv64-unknown-
         if [ "$rc" -eq 124 ] \
            && [ "$crc" -eq 0 ] \
            && grep -q "ECHO_OK" rv_echo_m_client.out; then
-            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + periodic timer tick + round-robin time-slicing + wall-clock uptime)"
+            echo "PASS  rv-uart-echo-m (M-mode device-driven UART RX interrupt echo + command loop + 100ms periodic timer + round-robin time-slicing + wall-clock uptime + no-missed-re-arm contention probe)"
             pass=$((pass+1))
         else
             echo "FAIL  rv-uart-echo-m (qemu rc=$rc, client rc=$crc — echo not as expected)"
