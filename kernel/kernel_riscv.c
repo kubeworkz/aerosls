@@ -144,6 +144,29 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
     for(int i = 0; msg[i] != '\0'; i++) sbi_putchar(msg[i]);
     sbi_putchar('\n');
 
+    /* Design A (ISA doc §16 Phase 16 audit addendum): log sstatus.FS so
+     * the FP-free discipline's ACTUAL backstop state is visible in the
+     * serial stream; CI asserts the line. The kernel never writes FS.
+     * The spike (spike-before-estimate) found the state is MODE-EXACT:
+     * under the S-mode boot, OpenSBI leaves FS=3 (Dirty) — FP is
+     * architecturally ENABLED, so an accidental F/D instruction would
+     * EXECUTE silently and the load-bearing guard is the census, not a
+     * trap; under the bare-metal M-mode boot FS stays at reset (Off)
+     * and the dispatcher's scause=2 case is the loud backstop. The
+     * message below reports the value and the honest state-dependent
+     * interpretation. If a future change enables FP by design (Design
+     * B), this line changes and the census + teeth gates must move. */
+    uint64_t sstatus_val;
+    __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus_val));
+    uint64_t fs = (sstatus_val >> 13) & 3;
+    rv_boot_print("[M5-audit] sstatus.FS=");
+    sbi_putchar((char)('0' + (int)fs));
+    if (fs == 0)
+        rv_boot_print(" (Off: FP/vector accesses trap scause=2)");
+    else
+        rv_boot_print(" (not Off: FP/vector would EXECUTE -- the FP-free discipline rests on the rv64_fp_census gate, not a trap)");
+    rv_boot_print(" -- the RV64 kernel is FP-free by design\n");
+
     /* OpenSBI (fw_dynamic) delivers the payload to exactly one hart -- the
      * boot hart -- whose id is NOT necessarily 0 (default: the last hart,
      * see boot_riscv.S). The former `hart_id == 0` gate never fired under
