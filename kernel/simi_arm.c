@@ -1,73 +1,33 @@
 /*
- * simi_arm.c — M0: SIMI-to-AArch64 (A64) native translator, the third
- * real target after x86-64 (Phase 3) and RV64 (Phase 5). See simi_arm.h
- * for the framing and docs/AeroSLS-SIMI-ARM-Backend-Plan-v0.1.md for the
- * phase plan. No libc dependency, mirrors simi_riscv.c's discipline so
- * this compiles unmodified under host gcc today and an aarch64
- * freestanding cross-compiler later (neither available in this sandbox —
- * correctness is established the Phase 5 way, via a64_exec.c actually
- * executing the emitted bytes; see the plan doc §2).
+ * simi_arm.c — SIMI-to-AArch64 (A64) native translator (kernel copy).
  *
- * ─── A64 design decisions, stated up front ─────────────────────────────
- *   - Same naive load-operate-store codegen as x86/RV64: every symbolic
- *     register is a stack slot, not a real allocated host register, and
- *     no value is ever assumed to survive across a SIMI instruction
- *     boundary. x9/x10/x11 are the "working registers" (t0/t1/t2), the
- *     direct analog of RV64's x5/x6/x7.
- *   - FRAME: SP-relative addressing, one structural deviation from the
- *     plan doc's §4.2 "xBASE base-register" sketch, adopted at build time
- *     for a concrete reason. The prologue is byte-for-byte the RV64 shape
- *     (sub sp,sp,#16; stp-style pair save; sub sp,sp,#576), so during a
- *     procedure body sp == entry_sp - 592. A64's unsigned scaled load/
- *     store immediate is non-negative, but every slot/tag offset relative
- *     to sp is POSITIVE: slot i at sp + (568 - 8i) (imm12 71-i, i=0..63),
- *     tag i at sp + i (imm12 i). The plan's xBASE version (x28 = x29-592,
- *     slots/tags off x28) has the same positive-offset property but needs
- *     a dedicated register that every callee's prologue necessarily
- *     re-bases and no epilogue restores — SP-relative addressing removes
- *     the register, the recompute-after-every-call, and the audit burden
- *     in one move. The physical frame is identical to RV64's (entry-24-8i
- *     for slot i, entry-592+i for tag i); only the anchor register
- *     differs. All offsets fit the 12-bit scaled immediate; 592 is a
- *     valid sub-immediate; the total sp delta (16 + 576 = 592 = 37x16)
- *     keeps SP 16-byte aligned at every point.
- *   - CONSTANTS: movz/movk materialize ANY 64-bit constant in at most
- *     four fixed-width instructions. This deletes the RV64 literal pool
- *     wholesale — no g_literals, no pool emission, no second patch pass
- *     for auipc+ld pairs. The one value not known at emit time (JMPR's
- *     table base offset) gets a fixed 4-word movz+3xmovk placeholder
- *     patched in a tiny final pass.
- *   - BRANCHES: B/BL (imm26) for BR/CALL, CBZ/CBNZ (imm19) for BC —
- *     A64's branch-only conditionality is a perfect fit for SIMI's
- *     test-a-register-and-jump BC; the plan's §4 note that M0 ships
- *     flag-free with NZCV entering at M1's CMP is amended at build time:
- *     branch_cmp.simi and loop_sum.simi both need CMP, so M0 models the
- *     full NZCV flags (subs + cset) — see emit_cmp() below.
- *   - CMP's 10 relations: A64 has no slt analog; the synthesis is
- *     `cmp xN, xM` (subs xzr, xN, xM) followed by `cset xN, <cond>`,
- *     one NZCV-read per relation, exactly the two-instruction idiom real
- *     compilers emit. NZCV is the ONE piece of implicit machine state
- *     this subset carries, and it is always write-consumed adjacently
- *     (emit_cmp, RESOLVE's tag test, JMPR's bounds test, the prologue's
- *     argument-tag extraction) — no flag value ever crosses a SIMI
- *     instruction boundary, preserving SIMI design principle #2.
- *   - DIV/MOD: A64 has div but no remainder instruction; MOD is the
- *     compiler idiom sdiv/udiv + msub (t = t - (t/d)*d), which yields
- *     the dividend-sign remainder RV64's rem/remu produce.
- *   - HOST CALLS (RESOLVE/OBJSIZE/OBJTYPE): real `blr xN` to a baked-in
- *     address, x0 as arg/result — A64's analog of x86's movabs+call reg
- *     and RV64's auipc+ld+jalr. The verifier's a64_exec.c redirects
- *     sentinel addresses (AR_EXEC_HOSTFN_BASE) to host C functions.
- *   - ILLEGAL WORD: 0x00000000 is A64's permanently-reserved UDF #0
- *     (unconditional undefined instruction) — the direct analog of
- *     RV64's reserved all-zeros word and x86's ud2; it is what JMPR's
- *     out-of-bounds path lands on, per the ISA §16 CFI requirement.
- *   - v0.3 (Phase 7): capability-tag region, same contract as the other
- *     targets — one byte per symbolic register at sp + i, RESOLVE tags
- *     iff nonzero (cmp+cset ne), MOV propagates, every other
- *     register-writing opcode clears, OBJSIZE/OBJTYPE require the tag
- *     before calling the runtime. The argument-tag mask rides in the
- *     outgoing-arg area at entry_sp + 64 exactly like RV64's.
+ * This file is a direct, unmodified copy of the host toolchain's
+ * simi_arm.c (tools/simi/simi_arm.c) below this comment — see that copy
+ * for the full "A64 design decisions, stated up front" block (SP-relative
+ * frame addressing with the positive scaled-immediate property, movz/movk
+ * wide immediates replacing RV64's auipc+ld literal pool, CBZ/CBNZ +
+ * subs/cset covering BC/CMP, the M1 register cache in x9/x10/x11, the
+ * M2-series code-size folds and chain analysis, and the F1 float
+ * GP-bounce). No libc dependency, same freestanding discipline as
+ * kernel/simi_riscv.c.
+ *
+ * Gap Remediation SIMI M3 (kernel half): the kernel-side copy of the
+ * AArch64 translator, staged exactly like the Phase 5 RV64 kernel copy
+ * (kernel/simi_riscv.c). Unlike that copy — which is built into the
+ * RISC-V kernel (RV_C_SRC) because a RISC-V kernel exists — there is
+ * deliberately NO arm64 kernel build in this tree, so this file is
+ * compiled nowhere and linked into nothing. It earns its place by the
+ * two properties that make it trustworthy the day an arm64 kernel target
+ * lands: (1) byte-identity with the host copy below this header
+ * (re-diffed and confirmed), whose correctness is established by the
+ * qemu-aarch64 REAL-execution leg of M3 (plan doc §10.178/10.179) —
+ * same encoder, same bugs or lack thereof; and (2) a clean compile under
+ * aarch64 freestanding flags with zero warnings, enforced by the
+ * arm64-guards CI job. What's NOT here: kernel/simi_translate_arm.c-
+ * equivalent glue, an arm64 activation/spawn path, user-mode paging, and
+ * the object-catalog/syscall-dispatch/exit-stub story — all of it needs
+ * an arm64 kernel target the roadmap does not grow; plan doc §6 keeps
+ * that half of M3 honest and undone.
  */
 #include "simi_arm.h"
 
