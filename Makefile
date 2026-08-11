@@ -105,6 +105,7 @@ endif
 # the live path, not a hypothetical one.
 AB_STAMP  := .build-config.stamp
 BID_STAMP := .build-id.stamp
+SLS_STAMP := .sls-frontend.stamp
 #
 # The `[ -f ... ] &&` is load-bearing. Without it, the default configuration
 # (SLS_SOFTMMU=off, so AB_DEFS is empty) compares an empty variable against
@@ -210,7 +211,8 @@ X86_ISO     = sls_operating_system.iso
 
 # --- QEMU-SLS TCG Integration (Steps 2+) ---
 QEMU_INC  = -I ../qemu/sls/include -I ../qemu/sls -I ../qemu/include \
-            -I ../qemu/tcg -I ../qemu/tcg/x86_64 -I ../qemu/accel/tcg
+            -I ../qemu/tcg -I ../qemu/tcg/x86_64 -I ../qemu/accel/tcg \
+            -I ../qemu/target/i386
 # TARGET_LONG_BITS: the guest's word size, 64 for our x86-64 guest. Set here
 # rather than in a header because that is upstream's own mechanism --
 # include/exec/target_long.h says "the build-system must ensure
@@ -344,7 +346,7 @@ plugins: compiler/SLSAllocationPassV2.cpp
 %.x86.o: %.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) -c $< -o $@
 
-$(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP)
+$(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
 
@@ -374,11 +376,27 @@ SLS_X86_FRONTEND ?= off
 ifeq ($(SLS_X86_FRONTEND),on)
 TARGET_OBJS = tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o \
               tcg-objs/i386-helper-stubs.x86.o tcg-objs/i386-codefetch.x86.o
+# M3: the decoder build's INVLPG hook (helper_flush_page) is wired into the C
+# dispatcher's INVLPG decode, so the guest window's shadow PTEs are
+# invalidated through the same function a TCG-translated INVLPG will call.
+# The define gates that routing in sls-launcher.c; the default build does not
+# link the helper layer and keeps its direct call.
+TCG_CFLAGS += -DSLS_X86_FRONTEND=1
 else ifneq ($(SLS_X86_FRONTEND),off)
 $(error SLS_X86_FRONTEND must be 'on' or 'off', got '$(SLS_X86_FRONTEND)')
 endif
+# Frontend-flip stamp. TCG_CFLAGS differs between the two builds (the define
+# above), but objects do not track their compile flags -- so flipping the
+# frontend after an incremental build would silently reuse the previous
+# build's sls-launcher.x86.o: the =on build would link a launcher that still
+# calls qemu_sls_mmu_shadow_invlpg() directly, and the M3 helper routing would
+# quietly not exist. Same mechanism and reasoning as AB_STAMP/BID_STAMP above;
+# the write is here, after the ?=/ifeq block, so the recorded value is the
+# effective one in BOTH builds (the SLS_STAMP variable itself is defined next
+# to the other stamps, before the rules that depend on it).
+$(shell v='$(SLS_X86_FRONTEND)'; [ -f $(SLS_STAMP) ] && [ "$$(cat $(SLS_STAMP))" = "$$v" ] || printf '%s' "$$v" > $(SLS_STAMP))
 
-tcg-objs/i386-translate.x86.o: ../qemu/target/i386/tcg/translate.c $(AB_STAMP)
+tcg-objs/i386-translate.x86.o: ../qemu/target/i386/tcg/translate.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
 
@@ -406,7 +424,7 @@ tcg-objs/translator.x86.o: ../qemu/accel/tcg/translator.c $(AB_STAMP)
 # automatically -- there is no list here to go stale. Each halts naming itself,
 # which is what turns "implement 765 helpers" into "run a binary, read the
 # name, implement that one".
-tcg-objs/i386-helper-stubs.x86.o: ../qemu/sls/sls-i386-helper-stubs.c $(AB_STAMP)
+tcg-objs/i386-helper-stubs.x86.o: ../qemu/sls/sls-i386-helper-stubs.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
 
@@ -414,7 +432,7 @@ tcg-objs/i386-helper-stubs.x86.o: ../qemu/sls/sls-i386-helper-stubs.c $(AB_STAMP
 # no-ops translator.c needs. Upstream gets both from cputlb.c (the soft MMU we
 # exclude) or user-exec.c (1,271 lines of qemu-user process model). Ours reads
 # straight through the GPA window, which IS what softmmu=OFF means.
-tcg-objs/i386-codefetch.x86.o: ../qemu/sls/sls-i386-codefetch.c $(AB_STAMP)
+tcg-objs/i386-codefetch.x86.o: ../qemu/sls/sls-i386-codefetch.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
 
@@ -583,7 +601,7 @@ clean:
 	find . -name '*.rv.o'  -not -path './.git/*' -delete
 	find . -name '*.ar64.o' -not -path './.git/*' -delete
 	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
-	rm -f $(AB_STAMP) $(BID_STAMP)
+	rm -f $(AB_STAMP) $(BID_STAMP) $(SLS_STAMP)
 	rm -rf tcg-objs
 
 # ── User-space programs ────────────────────────────────────────────────────────
