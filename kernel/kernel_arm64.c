@@ -10,13 +10,17 @@
  * not map (the TTBR0/TTBR1 split), then ends in a clean power-off via
  * PSCI SYSTEM_OFF (`smc #0`, the SBI_SRST analog; qemu exits rc=0).
  * M5.1 adds the activation cache (translate-on-first-use, §10.192);
- * §10.201 (this pass) extends it to two programs — the boot smoke
- * (slot 0) and the per-slice LCG (slot 1, §10.200) — each with its
- * own code buffer, and routes BOTH through the EL0 containment path.
- * The boot gate: smoke EL1 (MISS), smoke EL1 (HIT), LCG EL1 (MISS),
- * LCG EL0 x2 (HIT, HIT), smoke EL0 x2 (HIT, HIT) — two translations
- * total, the LCG's EL0 runs re-executing literally the same cached
- * bytes as its EL1 run (the "identical work at EL0" proof).
+ * §10.201/§10.202 (this pass) extends it to three programs — the boot
+ * smoke (slot 0), the per-slice LCG (slot 1, §10.200), and the EL0
+ * mem-touch fixture (slot 2, §10.202, EL0-only — its baked scratch is
+ * a user VA) — each with its own code buffer, and routes ALL of them
+ * through the EL0 containment path. The boot gate: smoke EL1 (MISS),
+ * smoke EL1 (HIT), LCG EL1 (MISS), LCG EL0 x2 (HIT, HIT), mem EL0 x2
+ * (MISS, HIT — the mem program is EL0-only), smoke EL0 x2 (HIT, HIT)
+ * — three translations total, each program's EL0 runs re-executing
+ * the same cached bytes (the "identical work at EL0" proof), and the
+ * mem pair proving the user tree's DATA pages, not just its code
+ * page.
  *
  * The MMU is enabled by boot_arm64.S before this main runs: TTBR1
  * holds the kernel (high VAs), TTBR0 is parked on an all-invalid root,
@@ -51,6 +55,7 @@
 #include "arch/arm64/uart_pl011.h"
 #include "arm64_boot_smoke_tmo.h"
 #include "arm64_lcg_slice_tmo.h"
+#include "arm64_mem_touch_tmo.h"
 #include "simi_arm.h"
 
 /* PSCI 0.2 function ids (smc #0 to the virt EL3 monitor). */
@@ -101,18 +106,28 @@ static uint32_t g_code_len, g_entry_off;
 static uint8_t g_lcg_code_buf[ARM64_SMOKE_CODE_BUF_SIZE]
     __attribute__((aligned(4096)));
 
+/* §10.202: the mem-touch fixture's code buffer — a THIRD static buffer
+ * (slot 2, EL0-only: its baked scratch is USER_SCRATCH_VA, unmapped in
+ * the kernel's TTBR1 tables, so it can never run at EL1). Page-aligned
+ * like the others — the EL0 user tree maps its physical page. */
+static uint8_t g_mem_code_buf[ARM64_SMOKE_CODE_BUF_SIZE]
+    __attribute__((aligned(4096)));
+
 /* M5.1/M5.6 activation cache (§10.192, the x86 kernel/simi_translate.c
  * precedent, ISA doc §11): translate-on-first-use. The cache key is
  * object name + FNV-1a hash + .tmo byte size — re-uploading the same
  * name with different bytes is a MISS, not a stale HIT. Each slot
  * carries its OWN code buffer: slot 0 emits into g_smoke_code_buf
- * (the boot smoke), slot 1 into g_lcg_code_buf (the LCG slice) — a
- * cache HIT therefore means the SAME bytes are re-executed (no
- * re-translation, no re-flush). Static-array discipline, no
+ * (the boot smoke), slot 1 into g_lcg_code_buf (the LCG slice), slot
+ * 2 into g_mem_code_buf (the EL0 mem-touch fixture) — a cache HIT
+ * therefore means the SAME bytes are re-executed (no re-translation,
+ * no re-flush). The mem slot's scratch_ptr (USER_SCRATCH_VA) is baked
+ * at its MISS and is part of the emitted code's identity — the
+ * name-keyed slot fixes it per program. Static-array discipline, no
  * allocator. The register frame is deliberately NOT cached: it is
  * SP-relative, carved per entry off the kernel stack (EL1) or a fresh
  * user stack (EL0). */
-#define ARM64_ACT_SLOTS      2
+#define ARM64_ACT_SLOTS      3
 #define ARM64_ACT_NAME_LEN   24
 struct Arm64Activation {
     char     name[ARM64_ACT_NAME_LEN];
@@ -125,7 +140,7 @@ struct Arm64Activation {
 };
 static struct Arm64Activation g_act[ARM64_ACT_SLOTS];
 static uint32_t g_translate_count;   /* the M5.1 gate: exactly 2 at boot */
-static uint32_t g_el0_excursions;    /* erets into EL0: exactly 4 at boot */
+static uint32_t g_el0_excursions;    /* erets into EL0: exactly 6 at boot */
 static uint8_t *g_act_code_buf;      /* the current activation's code buffer
                                       * (set by arm64_activate, consumed by
                                       * the EL0 user mapping) */
@@ -319,7 +334,7 @@ static void mmu_selfcheck_user(void)
  * the translator entirely, reuse entry_off/len, no re-flush (bytes
  * unchanged). Returns TX_AR_OK or the translator's error (printed). */
 static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len,
-                          uint8_t *out_buf)
+                          uint8_t *out_buf, uint64_t scratch_ptr)
 {
     struct Arm64Activation *act = NULL;
     int i;
@@ -348,7 +363,8 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
     uint32_t len = 0, entry_off = 0;
     int rc = simi_arm_translate(tmo, tmo_len, out_buf,
                                 ARM64_SMOKE_CODE_BUF_SIZE,
-                                "main", 0, 0, 0, 0, &len, &entry_off);
+                                "main", scratch_ptr, 0, 0, 0,
+                                &len, &entry_off);
     if (rc != TX_AR_OK) {
         uart_puts("[SIMI] translate FAILED, rc=");
         print_u64((uint64_t)(unsigned)rc);
@@ -400,7 +416,7 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
 static void arm64_el1_entry(void)
 {
     int rc = arm64_activate("arm64_boot_smoke", g_arm64_boot_smoke_tmo,
-                            g_arm64_boot_smoke_tmo_len, g_smoke_code_buf);
+                            g_arm64_boot_smoke_tmo_len, g_smoke_code_buf, 0);
     if (rc != TX_AR_OK)
         return;
     uart_puts("[SIMI] calling entry directly...\\r\\n");
@@ -445,7 +461,7 @@ static void arm64_el1_entry(void)
 static void arm64_lcg_slice_test(void)
 {
     int rc = arm64_activate("lcg_slice", g_arm64_lcg_slice_tmo,
-                            g_arm64_lcg_slice_tmo_len, g_lcg_code_buf);
+                            g_arm64_lcg_slice_tmo_len, g_lcg_code_buf, 0);
     if (rc != TX_AR_OK)
         return;
 
@@ -487,8 +503,10 @@ static void arm64_el0_activate_for(int prog) __attribute__((noreturn));
  * level (a cache HIT = the same emitted words). */
 #define ARM64_EL0_SMOKE 0
 #define ARM64_EL0_LCG   1
+#define ARM64_EL0_MEM   2
 static int g_el0_program = ARM64_EL0_SMOKE;
-static uint32_t g_el0_smoke_done, g_el0_lcg_done;   /* excursions per program */
+static uint32_t g_el0_smoke_done, g_el0_lcg_done, g_el0_mem_done;
+                                                /* excursions per program */
 
 /* M5/M5.1/M5.6: run the selected translated program in EL0 from
  * USER_CODE_VA — a VA the kernel's own tables do not map. Activates
@@ -497,11 +515,11 @@ static uint32_t g_el0_smoke_done, g_el0_lcg_done;   /* excursions per program */
  * stub. The blob's trampoline `br x30`s into the stub, `svc #0` traps
  * to arm64_svc_from_el0, which stores x9 (the result) and erets into
  * arm64_el0_done — this function NEVER returns. g_el0_excursions
- * counts the erets into EL0 (the M5.1 gate wants exactly four at
- * boot: LCG x2 then smoke x2). The user mapping uses g_act_code_buf
- * — set by arm64_activate to the slot's OWN buffer, so the smoke
- * excursion maps the smoke page and the LCG excursion maps the LCG
- * page (distinct physical pages; each excursion builds a fresh tree). */
+ * counts the erets into EL0 (the M5.1 gate wants exactly six at
+ * boot: LCG x2, mem x2, then smoke x2). The user mapping uses
+ * g_act_code_buf — set by arm64_activate to the slot's OWN buffer, so
+ * each excursion maps its program's page (distinct physical pages;
+ * each excursion builds a fresh tree). */
 static void arm64_el0_activate_for(int prog)
 {
     g_el0_excursions++;
@@ -509,18 +527,32 @@ static void arm64_el0_activate_for(int prog)
     const uint8_t *tmo;
     uint32_t tmo_len;
     uint8_t *out_buf;
+    uint64_t scratch;
     if (prog == ARM64_EL0_LCG) {
         name = "lcg_slice";
         tmo = g_arm64_lcg_slice_tmo;
         tmo_len = g_arm64_lcg_slice_tmo_len;
         out_buf = g_lcg_code_buf;
+        scratch = 0;
+    } else if (prog == ARM64_EL0_MEM) {
+        /* §10.202: the mem-touch fixture's scratch is baked to
+         * USER_SCRATCH_VA — a VA the kernel's TTBR1 tables do NOT map.
+         * That is the whole point (the program's memory round-trip must
+         * go through the user TTBR0 tree's data page), and why this
+         * program is EL0-only: at EL1 the baked address faults. */
+        name = "mem_touch";
+        tmo = g_arm64_mem_touch_tmo;
+        tmo_len = g_arm64_mem_touch_tmo_len;
+        out_buf = g_mem_code_buf;
+        scratch = USER_SCRATCH_VA;
     } else {
         name = "arm64_boot_smoke";
         tmo = g_arm64_boot_smoke_tmo;
         tmo_len = g_arm64_boot_smoke_tmo_len;
         out_buf = g_smoke_code_buf;
+        scratch = 0;
     }
-    int rc = arm64_activate(name, tmo, tmo_len, out_buf);
+    int rc = arm64_activate(name, tmo, tmo_len, out_buf, scratch);
     if (rc != TX_AR_OK) {
         uart_puts("[SIMI] EL0 entry aborted (activate failed)\\r\\n");
         for (;;)
@@ -607,12 +639,15 @@ static void arm64_wait_ticks(uint32_t target)
  * entered via the svc handler's eret with TTBR0 still the user tables
  * and the kernel SP (SP_EL1 never changed across the excursion — the
  * eret into EL0 switched to SP_EL0). Dispatches on which program ran
- * (§10.201): the LCG excursions come FIRST (both cache HITs — the
- * containment path re-executes the EL1 slice's exact bytes), and the
- * second LCG continuation performs the M5.2 handoff (arm the timer,
- * launch the smoke excursions); the smoke excursions follow (both
- * HITs, the committed M5.1 pair) and the second smoke continuation
- * runs the M5.2 tick gate, the M5.3 nesting probe, then powers off. */
+ * (§10.201/§10.202): the LCG excursions come FIRST (both cache HITs —
+ * the containment path re-executes the EL1 slice's exact bytes); the
+ * second LCG continuation hands off to the mem-touch pair (the first
+ * containment proof depending on the user tree's DATA page — MISS
+ * then HIT); the second mem continuation performs the M5.2 handoff
+ * (arm the timer, launch the smoke excursions); the smoke excursions
+ * follow (both HITs, the committed M5.1 pair) and the second smoke
+ * continuation runs the M5.2 tick gate, the M5.3 nesting probe, then
+ * powers off. */
 static void arm64_el0_done(void)
 {
     /* M5.2 contention probe (§10.196): the svc handler returns with DAIF
@@ -647,6 +682,27 @@ static void arm64_el0_done(void)
         g_el0_lcg_done++;
         if (g_el0_lcg_done < 2)
             arm64_el0_activate_for(ARM64_EL0_LCG);   /* second LCG excursion (HIT) */
+        arm64_el0_activate_for(ARM64_EL0_MEM);       /* §10.202: mem pair next (timer still unarmed) */
+    }
+    if (g_el0_program == ARM64_EL0_MEM) {
+        /* §10.202: the mem-touch excursion's continuation — the first
+         * containment proof whose result depends on the USER TTBR0
+         * tree's DATA page (the scratch page, baked to USER_SCRATCH_VA
+         * and EL0-RW). The program STOREs a 3-cell pattern, LOADs it
+         * back, verifies every cell, and returns the tooth 0x0d15ea5e
+         * only if all match. Its first run is the cache MISS (the
+         * translation bakes USER_SCRATCH_VA); the second is a HIT. A
+         * faulted access (unmapped page) traps to the EL1h sync
+         * vector and hangs — rc=124 — instead of this line. After the
+         * second excursion, hand off to the M5.2 probe: arm the timer,
+         * then the smoke excursions pend the ticks exactly as before. */
+        uart_puts("[M5] returned from EL0 (mem touch) -- user result=");
+        print_u64(g_user_result);
+        uart_puts(" (expected 0x0d15ea5e = 219540062) ");
+        uart_puts(g_user_result == 0x0d15ea5eULL ? "PASS\\r\\n" : "FAIL\\r\\n");
+        g_el0_mem_done++;
+        if (g_el0_mem_done < 2)
+            arm64_el0_activate_for(ARM64_EL0_MEM);   /* second mem excursion (HIT) */
         arm_timer_arm();
         uart_puts("[M5.2] contention probe: 100 ms ticks armed before the EL0 "
                   "excursions (they pend through each EL0 window)\\r\\n");
@@ -718,14 +774,15 @@ void kernel_arm64_main(void)
      * (arm64_wait_ticks), so no tick can fire during the entries. */
     gic_init();
     arm_timer_init();
-    /* M5.1/M5.6 gate (six entries, two translations): smoke EL1 MISS +
-     * HIT (42, 42), then the LCG slice EL1 MISS (0x0b6f2a40), then the
-     * LCG's two EL0 excursions (HIT, HIT — the containment path
-     * re-executing the identical cached bytes), then the smoke's two
-     * EL0 excursions (HIT, HIT — the committed M5.1 pair). The EL0
-     * path never returns — arm64_el0_done chains the LCG pair, the
-     * M5.2 timer-arm handoff, the smoke pair, the tick gate, the M5.3
-     * nesting probe, then PSCI SYSTEM_OFF. */
+    /* M5.1/M5.6 gate (eight entries, three translations): smoke EL1
+     * MISS + HIT (42, 42), then the LCG slice EL1 MISS (0x0b6f2a40),
+     * then the LCG's two EL0 excursions (HIT, HIT), then the mem-touch
+     * pair (MISS, HIT — EL0-only, its baked scratch is a user VA), then
+     * the smoke's two EL0 excursions (HIT, HIT — the committed M5.1
+     * pair). The EL0 path never returns — arm64_el0_done chains the
+     * LCG pair, the mem pair, the M5.2 timer-arm handoff, the smoke
+     * pair, the tick gate, the M5.3 nesting probe, then PSCI
+     * SYSTEM_OFF. */
     arm64_el1_entry();
     arm64_el1_entry();
     /* §10.200/§10.201: the per-slice LCG teeth — one full per-slice
@@ -737,12 +794,13 @@ void kernel_arm64_main(void)
      * the M5.2 tick gate's count and interleave are untouched by
      * construction. */
     arm64_lcg_slice_test();
-    /* §10.201: the LCG EL0 excursions — the containment path
+    /* §10.201/§10.202: the LCG EL0 excursions — the containment path
      * re-executes the EL1 slice's EXACT cached bytes (both HITs) at
-     * EL0 and must return the same tooth 0x0b6f2a40. They run before
-     * the timer arms (no tick can pend through them); the M5.2 probe's
-     * arm and the smoke excursions launch from the LCG continuation's
-     * handoff (arm64_el0_done). */
+     * EL0 and must return the same tooth 0x0b6f2a40; they chain into
+     * the mem-touch pair (MISS, HIT — the DATA-page proof) and then
+     * the M5.2 probe's arm + the smoke pair, all from the
+     * continuations in arm64_el0_done. Everything runs before the
+     * timer arms (no tick can pend through the LCG/mem windows). */
     arm64_el0_activate_for(ARM64_EL0_LCG);
     /* Unreachable: arm64_el0_activate_for is noreturn. */
     for (;;)

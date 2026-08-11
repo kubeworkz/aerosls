@@ -1,0 +1,42 @@
+; mem_touch.simi — the EL0 scratch-page memory round-trip fixture,
+; embedded into the arm64 kernel (kernel/arm64_mem_touch_tmo.h) and
+; executed ONLY in EL0 (plan doc §10.202). Its r7 scratch pointer is
+; baked to USER_SCRATCH_VA (0x10005000) at translate time — a VA the
+; kernel's TTBR1 tables do NOT map — so it is the first containment
+; proof whose correctness DEPENDS on the user TTBR0 tree's DATA pages,
+; not just the code page: the program STOREs a 3-cell pattern into the
+; scratch page, LOADs it back, verifies every cell, and returns the
+; tooth 0x0d15ea5e only if all three match (0 otherwise). A memory op
+; that faults (unmapped user page -> EL1 sync trap -> hang, rc=124),
+; translates wrong, or reads stale bytes changes the return value and
+; the kernel's serial assert fails. The register value (r7) rides the
+; trampoline's scratch convention, same as atomic_add/cas_simple.
+;
+; Kernel-embedded, NOT a parity-corpus fixture (the arm64_boot_smoke
+; model, plan doc §10.196): its real gate is the kernel boot's EL0
+; translate + execute + serial assert. The ARM runner still executes
+; it (a few hundred A64 steps) and the size gate pins its emission;
+; the interp/x86/RV64 runners and the bench tools skip it.
+; Expected result: 219540062
+.entry main
+main:
+    ENTER #8
+    LEA r6, r7, #0                 ; r6 = scratch base (USER_SCRATCH_VA in the kernel EL0 run)
+    LOADI64 r1, #219540062, i64    ; cell A = 0x0d15ea5e
+    LOADI64 r2, #23130, i64        ; cell B = 0x5a5a
+    LOADI64 r3, #12648430, i64     ; cell C = 0xc0ffee
+    STORE r1, r6, #0, i64          ; scratch+0  = A
+    STORE r2, r6, #8, i64          ; scratch+8  = B
+    STORE r3, r6, #16, i64         ; scratch+16 = C
+    LOAD r4, r6, #0, i64           ; read all three back
+    LOAD r5, r6, #8, i64
+    LOAD r8, r6, #16, i64
+    LOADI r9, #0, i64              ; zero
+    CMP r10, r4, r1, i64, NE       ; mismatch flag: cell0 != A
+    CMP r11, r5, r2, i64, NE       ; mismatch flag: cell1 != B
+    CMP r12, r8, r3, i64, NE       ; mismatch flag: cell2 != C
+    ADD r10, r10, r11, i32         ; sum of mismatch flags...
+    ADD r10, r10, r12, i32         ; ... = 0 iff every cell round-tripped
+    CMP r11, r10, r9, i64, EQ      ; all-ok = 1
+    MUL r0, r11, r1, i64           ; tooth 0x0d15ea5e if all-ok, else 0
+    RET

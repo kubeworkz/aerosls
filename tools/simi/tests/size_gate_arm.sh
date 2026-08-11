@@ -997,7 +997,7 @@ declare -A M0_BASELINES=(
     [lcg_fairness]=1304 [lcg_slice]=1092
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
-    [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
+    [mem_reg]=1764 [mem_touch]=1212 [obj_ops]=1164 [ptr_ops]=1120
     # arm64_boot_smoke re-measured at git 1729f50 for the M5.2 contention
     # probe (plan doc §10.196): the embedded boot program is now a
     # 1e8-iteration loop (the EL0 window must comfortably exceed the
@@ -1023,6 +1023,18 @@ declare -A M0_BASELINES=(
 # tight 10M budget) without a steps row; this row pins its emission
 # (1092 bytes — a codegen regression that bloats the loop body fails
 # here).
+
+# mem_touch is the arm64 kernel-embedded EL0 memory fixture (measured
+# at this commit — post-M0, same discipline as lcg_slice): a 3-cell
+# write/read-back round-trip through the r7 scratch page, verified and
+# returning 0x0d15ea5e only if all cells match. Its real gate is the
+# arm64 kernel's EL0 excursion (translate with scratch =
+# USER_SCRATCH_VA + execute + serial assert, plan doc §10.202), NOT
+# the parity corpus (it is skipped there and in the bench tools — the
+# arm64_boot_smoke model, and it is EL0-only by design). The ARM
+# runner still executes it without a steps row; this row pins its
+# emission (1212 bytes — a codegen regression that bloats the
+# load/store body fails here).
 
 # lcg_fairness is the cross-ISA fairness fixture (measured at this
 # commit — a post-M0 row, so the baseline is the current emission, the

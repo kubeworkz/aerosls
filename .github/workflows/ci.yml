@@ -783,24 +783,26 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          # M5.1/M5.6 (plan doc §6 M5.1 / §10.192 + §10.201): the
-          # activation cache gate. The boot is SIX entries — smoke EL1
-          # (MISS), smoke EL1 (HIT), LCG EL1 (MISS), LCG EL0 (HIT),
-          # LCG EL0 (HIT), smoke EL0 (HIT), smoke EL0 (HIT) — TWO
-          # translations (smoke + LCG, one per slot), each program's
-          # EL0 runs re-executing its EL1 run's exact cached bytes.
-          # The counts are occurrence counts (grep -o | wc -l), NOT
-          # grep -c line counts: the kernel's UART lines carry literal
-          # \r\n text, so several logical lines share one grep line and
-          # -c undercounts (the pre-M5.1 asserts are substring greps,
-          # immune either way).
-          [ "$(grep -ao 'activation cache MISS' arm64_boot.log | wc -l)" -eq 2 ] || {
-            echo "FAILED: expected exactly TWO activation cache MISSes (one translate per program)" >&2
+          # M5.1/M5.6 (plan doc §6 M5.1 / §10.192 + §10.201/§10.202):
+          # the activation cache gate. The boot is EIGHT entries —
+          # smoke EL1 (MISS), smoke EL1 (HIT), LCG EL1 (MISS), LCG EL0
+          # (HIT), LCG EL0 (HIT), mem EL0 (MISS), mem EL0 (HIT), smoke
+          # EL0 (HIT), smoke EL0 (HIT) — THREE translations (smoke +
+          # LCG + mem, one per slot; the mem program is EL0-only, its
+          # baked scratch is a user VA, so its first excursion is its
+          # MISS). Each program's EL0 runs re-execute the same cached
+          # bytes. The counts are occurrence counts (grep -o | wc -l),
+          # NOT grep -c line counts: the kernel's UART lines carry
+          # literal \r\n text, so several logical lines share one grep
+          # line and -c undercounts (the pre-M5.1 asserts are substring
+          # greps, immune either way).
+          [ "$(grep -ao 'activation cache MISS' arm64_boot.log | wc -l)" -eq 3 ] || {
+            echo "FAILED: expected exactly THREE activation cache MISSes (one translate per program)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
-          [ "$(grep -ao 'activation cache HIT' arm64_boot.log | wc -l)" -eq 5 ] || {
-            echo "FAILED: expected exactly FIVE activation cache HITs (smoke EL1 re-entry, both LCG EL0 excursions, both smoke EL0 excursions)" >&2
+          [ "$(grep -ao 'activation cache HIT' arm64_boot.log | wc -l)" -eq 6 ] || {
+            echo "FAILED: expected exactly SIX activation cache HITs (smoke EL1 re-entry, both LCG EL0 excursions, the second mem EL0 excursion, both smoke EL0 excursions)" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
@@ -821,6 +823,19 @@ jobs:
           # containment/eret fault, not a codegen change.
           [ "$(grep -ao 'returned from EL0 (lcg slice) -- user result=0x000000000b6f2a40 (expected 0x0b6f2a40 = 191834688) PASS' arm64_boot.log | wc -l)" -eq 2 ] || {
             echo "FAILED: expected exactly TWO LCG EL0 excursions returning the per-slice tooth 0x0b6f2a40" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
+          # §10.202: the mem-touch DATA-page proof — the first
+          # containment excursion whose result depends on the user TTBR0
+          # tree's DATA page (the scratch page, baked to USER_SCRATCH_VA
+          # and EL0-RW): it STOREs a 3-cell pattern, LOADs it back,
+          # verifies every cell, and must return the tooth 0x0d15ea5e,
+          # twice (first run MISS — EL0-only — then HIT). A faulted
+          # access (unmapped user page) traps to EL1 and hangs (rc=124)
+          # instead of this line.
+          [ "$(grep -ao 'returned from EL0 (mem touch) -- user result=0x000000000d15ea5e (expected 0x0d15ea5e = 219540062) PASS' arm64_boot.log | wc -l)" -eq 2 ] || {
+            echo "FAILED: expected exactly TWO mem-touch EL0 excursions returning the DATA-page tooth 0x0d15ea5e" >&2
             tail -30 arm64_boot.log >&2
             exit 1
           }
@@ -863,12 +878,13 @@ jobs:
           # stream asserts the whole M5.2 interleave + the nesting
           # phase, in this exact order.
           seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached|nesting window|nested: virtual timer preempted' arm64_boot.log)
-          # §10.201: the two LEADING erets are the LCG excursions — they
-          # run before the timer arms (the M5.2 probe is armed by the
-          # LCG continuation's handoff), so no tick can fire during
-          # them; [TICK 1]/[TICK 2] then pend through the smoke windows
-          # exactly as the committed sequence did.
-          want=$'[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[TICK 1]\n[M5] eret into EL0...\n[TICK 2]\n[TICK 3]\n[TICK 4]\ntick gate reached\n[TICK 5]\nnesting window\n[TICK 6]\nnested: virtual timer preempted\ntick gate reached'
+          # §10.201/§10.202: the four LEADING erets are the LCG pair
+          # then the mem pair — they run before the timer arms (the
+          # M5.2 probe is armed by the mem continuation's handoff), so
+          # no tick can fire during them; [TICK 1]/[TICK 2] then pend
+          # through the smoke windows exactly as the committed sequence
+          # did.
+          want=$'[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[TICK 1]\n[M5] eret into EL0...\n[TICK 2]\n[TICK 3]\n[TICK 4]\ntick gate reached\n[TICK 5]\nnesting window\n[TICK 6]\nnested: virtual timer preempted\ntick gate reached'
           [ "$seq" = "$want" ] || {
             echo "FAILED: the tick stream does not interleave with the EL0 excursions and the M5.3 nested phase (a tick was lost, duplicated, or taken out of order)" >&2
             echo "--- got:" >&2

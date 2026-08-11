@@ -7957,6 +7957,50 @@ ticks = 6, ordered stream with the two leading erets. Boot-verified:
 rc=0 (PSCI), all counts exact, 0 FAIL lines, 4 user-tree builds, all
 pre-existing asserts intact.
 
+### 10.202 M5.7 as built: the containment path proven on DATA — the mem-touch fixture
+
+§10.201's containment proofs (smoke, LCG) only ever exercised the
+user tree's CODE page — their memory effects were the frame carve on
+the user stack, which is infrastructure, not program. The mem-touch
+fixture closes that: a new embedded program
+(`tools/simi/tests/mem_touch.simi`, embedded as
+`kernel/arm64_mem_touch_tmo.h`, byte-diffed identical, 240 bytes)
+whose result depends on the user TTBR0 tree's DATA page. Its r7
+scratch pointer is baked to **USER_SCRATCH_VA (0x10005000)** at
+translate time — a VA the kernel's TTBR1 tables do NOT map — so the
+program STOREs a 3-cell pattern into the scratch page, LOADs it
+back, verifies every cell, and returns the tooth 0x0d15ea5e only if
+all match (0 otherwise). A faulted access (unmapped user page) traps
+to the EL1h sync vector and HANGS the boot (rc=124); a wrong
+translation or a stale read changes the value and the PASS verdict
+fails. The interpreter/x86/RV64 legs return 219540062 too (the
+scratch-relative r7 convention is ISA-neutral), verified on all four
+engines + real A64 (ARM a64_exec 1212 bytes, real A64 1208, RV64
+1252, x86 832).
+
+Design decisions:
+- **EL0-only by construction** — the baked scratch is a user VA, so
+  the program CANNOT run at EL1 (it would fault). That is why the
+  mem slot's first excursion is its MISS (unlike the smoke/LCG,
+  which warm at EL1): the translation happens on the first EL0 run
+  and the second EL0 run HITs it. The slot records scratch as part
+  of the emitted code's identity (name-keyed, fixed per program).
+- **Third slot + third buffer** (`ARM64_ACT_SLOTS 2 -> 3`,
+  `g_mem_code_buf`, 4096-aligned like the others); the EL0 machine's
+  per-program state grows a MEM branch, and the continuation chain
+  is LCG pair -> mem pair -> (arm the M5.2 timer, probe print) ->
+  smoke pair -> ticks -> M5.3 -> PSCI. Everything before the timer
+  arm, so the tick stream is untouched by construction.
+- **The gate is now eight entries, three translations**: smoke EL1
+  MISS+HIT, LCG EL1 MISS, LCG EL0 HIT+HIT, mem EL0 MISS+HIT, smoke
+  EL0 HIT+HIT. CI: MISS = 3, HIT = 6, LCG EL0 = 2, NEW mem EL0 = 2,
+  ticks = 6, ordered stream with FOUR leading erets. Boot-verified:
+  rc=0 (PSCI), all counts exact, 0 FAIL lines, 6 user-tree builds.
+  Runner treatment mirrors lcg_slice: skipped on the interp/x86/RV64
+  legs + all bench tools, RUN on the ARM runner (a few hundred A64
+  steps, no steps row) and the real-A64 leg; the size gate pins the
+  1212-byte emission.
+
 ---
 
 

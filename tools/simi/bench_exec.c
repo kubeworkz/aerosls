@@ -183,6 +183,15 @@ int main(int argc, char** argv) {
             nskip++;
             continue;
         }
+        if (strcmp(name, "mem_touch.simi") == 0) {
+            /* §10.202: kernel-embedded EL0 mem fixture (the arm64
+             * kernel's EL0 excursion is its gate) — outside the parity
+             * corpus, the arm64_boot_smoke model; no row a bench would
+             * maintain. */
+            printf("SKIP  %-24s kernel-embedded EL0 mem fixture (arm64 kernel EL0 excursion is its gate, plan doc §10.202)\n", name);
+            nskip++;
+            continue;
+        }
         long long expected = 0;
         if (!parse_expected(path, &expected)) {
             printf("SKIP  %-24s no 'Expected result:' comment (jmpr_oob faults by design; cap_forge_debug)\n", name);

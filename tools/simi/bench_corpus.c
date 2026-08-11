@@ -210,6 +210,14 @@ int main(int argc, char** argv) {
             nskip++;
             continue;
         }
+        if (strcmp(name, "mem_touch.tmo") == 0) {
+            /* §10.202: kernel-embedded EL0 mem fixture (the arm64
+             * kernel's EL0 excursion is its gate) — outside the parity
+             * corpus, the arm64_boot_smoke model. */
+            printf("SKIP  %-24s kernel-embedded EL0 mem fixture (arm64 kernel EL0 excursion is its gate, plan doc §10.202)\n", name);
+            nskip++;
+            continue;
+        }
 
         const struct FixtureBaseline* bl = find_baseline(name);
         if (!bl) {
