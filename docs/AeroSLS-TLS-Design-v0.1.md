@@ -1,6 +1,8 @@
 # AeroSLS TLS — design and sequencing, v0.1
 
-**Status:** Phases 0 and 1 implemented. Phase 2 library choice REVERSED — see
+**Status:** Phases 0, 1 and 2 implemented — mbedTLS 3.6.7 now links into the
+x86-64 kernel image. Phase 3 (a listener) is next and nothing calls the library
+yet. See "Phase 2 result" below. Phase 2 library choice REVERSED — see
 the amendment immediately below before reading §3.
 **Decided:** port **mbedTLS 3.6 LTS** (not BearSSL, not write-our-own); private
 CA with per-node certificates; first shippable version is server-side TLS
@@ -74,6 +76,67 @@ about the kernel, not the library, and both are implemented and tested.
 **Window:** this precedes all other roadmap work (see
 `AeroSLS-Roadmap-2026H2-v0.1.md` §2, which recommended deferring this; that
 recommendation is superseded and the roadmap extends to 12 months).
+
+---
+
+## Phase 2 result, 2026-08-11: the library links
+
+The whole of mbedTLS 3.6.7 compiles and links into the bare-metal image. Five
+platform hooks are supplied by kernel/tls_platform.c — randomness, memory,
+time, zeroization, transport — and the TCP bridge is written, tested and
+called by nothing yet.
+
+### What the link cost, and what it taught
+
+Eleven rounds of undefined symbols. Worth recording because the pattern was
+consistent and is the reusable part:
+
+**Three were ROOT CAUSES that each explained several symbols.**
+
+- `_FORTIFY_SOURCE=2` is on by default in this toolchain, so gcc rewrote
+  memcpy/memset/memmove into `__memcpy_chk` and friends. That is four symbols
+  from one cause — and it is also what produced `__explicit_bzero_chk` several
+  commits earlier, which was "fixed" with `ZEROIZE_ALT`. Right mechanism,
+  wrong disease; the ALT is worth keeping anyway.
+- `unix`/`__unix`/`__unix__` made mbedTLS believe it was building for Unix, so
+  `psa_crypto_random.c` wanted `getpid()` for fork protection. A kernel never
+  forks. `-U` removed the feature and the symbol together.
+- `MBEDTLS_X509_REMOVE_INFO` deleted the certificate pretty-printers, which
+  were the only reason most of the X.509 modules wanted `snprintf`.
+
+**Four were genuinely missing primitives**, each added because the linker
+named it *and its call site*: `memmove` (X.509 builds DER back-to-front and
+shifts it — overlapping, and `memcpy` is undefined there), `strncpy`, `strstr`,
+`strchr`, plus `libgcc` for `__udivti3` (bignum divides `unsigned __int128`;
+that helper belongs to the compiler, not to any C file).
+
+**Two were mine.** `mbedtls_platform_gmtime_r` was excluded on the strength of
+an `nm` run over a three-file set that did not contain x509.c — a real
+measurement over the wrong population. And `sls_snprintf` collided with an
+existing symbol in the QEMU-SLS layer, which was the lucky outcome: that one
+ignores its format and writes `<nofmt>`, which would have put that literal into
+certificate subject names had the link resolved silently.
+
+### Measured, not assumed
+
+- **Frame sizes are fine.** Not one module in bignum, ecp, ssl_tls, ssl_msg,
+  the TLS 1.3 handshake code, x509_crt or psa_crypto produces a frame warning
+  at 16 KB, let alone the 256 KB advisory. mbedTLS is written for embedded
+  targets and it shows. I predicted otherwise.
+- **`tests/stack_frame_budget_check.sh` now scans the vendored sources**, and
+  only the ones actually linked. It previously reported "109 files scanned,
+  all within budget" while scanning none of mbedTLS.
+
+### Owed
+
+- **Trim the module list.** Everything is linked because nothing was called
+  yet and no closure could be measured. `oid.c` and `x509_csr.c` demonstrated
+  the cost. Once a listener exists the real closure is measurable and this
+  becomes a real task with the image-end number as its instrument.
+- **Collapse the two snprintfs.** `sls_tls_snprintf` could replace the TCG
+  stub, whose own comment says a real one is the fix.
+- **The ARM64 entropy gate** (§2.5), still unrun on hardware with no RNG
+  instruction.
 
 ---
 
