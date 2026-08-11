@@ -566,3 +566,61 @@ original figure. Recording that here rather than quietly using the new number.
    adds ~3 weeks to the critical path before the first user sees anything. If
    the first user materialises early, shipping Phase 3 and deferring Phase 5
    is a defensible re-cut.
+
+## Phase 3 decision, 2026-08-11: self-signed first
+
+Dave chose the self-signed route over private-CA-first.
+
+**What it buys:** the shortest path to a browser handshake, and that handshake
+exercises the entire stack end to end — `entropy.c` -> EC key generation ->
+X.509 writing -> `rtc.c` supplying notBefore/notAfter -> the record layer ->
+`sls_tls_bio_send/recv`. Every component Phases 0-2 built gets proven together
+rather than one at a time.
+
+**What it costs:** certificate generation happens twice. The private CA in the
+later phase does not reuse the self-signed path; it replaces it.
+
+**Phase 3 gate (unchanged):** Chrome, Firefox and curl complete a handshake and
+fetch the Navigator.
+
+### API notes measured from the vendored headers, not remembered
+
+Confirmed present in `include/mbedtls/x509_crt.h`:
+
+- `mbedtls_x509write_crt_set_subject_name` (:1033)
+- `mbedtls_x509write_crt_set_validity` (:1003)
+- `mbedtls_x509write_crt_set_serial_raw` (:986)
+- `mbedtls_x509write_crt_set_basic_constraints` (:1090)
+- `mbedtls_x509write_crt_set_subject_key_identifier` (:1103)
+- `mbedtls_x509write_crt_der` (:1178)
+
+`set_subject_key`, `set_issuer_key` and `set_md_alg` did NOT match a grep for
+`int mbedtls_x509write_crt_...`, which suggests they return `void`. That is an
+INFERENCE from a negative result, not a measurement — confirm the signatures
+before calling them. A negative grep is exactly the kind of evidence that
+produced the `gmtime_r` error in Phase 2.
+
+`mbedtls_ecp_gen_key` likewise did not match; only `mbedtls_ecp_gen_keypair_base`
+(ecp.h:1201) did. Check which generator this version actually exposes.
+
+### Three things to settle when writing kernel/tls_cert.c
+
+1. **Validity strings.** `set_validity` takes `YYYYMMDDHHMMSS` text, so the
+   generator needs `rtc_civil_from_days()` and a formatter. This is the first
+   consumer of the inverse function added in Phase 1.
+
+2. **notBefore skew.** A certificate stamped with the node's exact boot time is
+   "not yet valid" for any verifier whose clock is a second behind. Backdate it.
+
+3. **Serial numbers.** `set_serial_raw` takes bytes; they must come from
+   `entropy_get()` and the fail-closed path must be honoured — no serial rather
+   than a predictable one.
+
+### Still owed from Phase 2
+
+- The **image-end number** from `tests/kernel_image_end_check.sh` on the linking
+  build. Baseline was 223 MiB pre-mbedTLS. Requested four times, still not
+  obtained; it is the instrument for deciding whether trimming the module list
+  is housekeeping or the next real task.
+- Collapse the two snprintfs (`sls_tls_snprintf` vs the TCG `<nofmt>` stub).
+- Run the ARM64 entropy diversity gate on hardware with no RNG instruction.
