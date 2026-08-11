@@ -667,7 +667,7 @@ int main(void) {
         g_map_count = 0;
         int installed = qemu_sls_mmu_test_shadow_install(
             QEMU_GUEST_WINDOW_BASE + 0x5000, 9 * FRAME_SIZE,
-            USER_PTE_PRESENT | USER_PTE_WRITE);
+            USER_PTE_PRESENT | USER_PTE_WRITE, 0);
         CHECK(installed == 0 && g_map_count == 1,
               "control: an in-window GVA IS installed -- without this, every "
               "refusal below would pass against a function that never maps");
@@ -678,7 +678,7 @@ int main(void) {
         /* A raw guest VA -- the retired GVA-direct design's address shape. */
         g_map_count = 0;
         CHECK(qemu_sls_mmu_test_shadow_install(0x00000000DEADB000ULL,
-                                               9 * FRAME_SIZE, USER_PTE_PRESENT) == -1,
+                                               9 * FRAME_SIZE, USER_PTE_PRESENT, 0) == -1,
               "a raw guest VA is REFUSED");
         CHECK(g_map_count == 0,
               "*** and NOTHING was written. The shadow shares lower-level tables "
@@ -693,7 +693,7 @@ int main(void) {
          * what surfaced it. */
         g_map_count = 0;
         CHECK(qemu_sls_mmu_test_shadow_install(QEMU_GPA_HOST_BASE + 0x1000,
-                                               9 * FRAME_SIZE, USER_PTE_PRESENT) == -1
+                                               9 * FRAME_SIZE, USER_PTE_PRESENT, 0) == -1
               && g_map_count == 0,
               "*** an address in the EMULATOR window is refused too -- the two "
               "windows are different PML4 slots and only the guest one is "
@@ -702,7 +702,7 @@ int main(void) {
         /* A low kernel-range address: PML4 slot 0, where the kernel itself lives. */
         g_map_count = 0;
         CHECK(qemu_sls_mmu_test_shadow_install(0x1000, 9 * FRAME_SIZE,
-                                               USER_PTE_PRESENT) == -1
+                                               USER_PTE_PRESENT, 0) == -1
               && g_map_count == 0,
               "...and so is a low kernel-range address");
 

@@ -46,6 +46,25 @@ static uint64_t identity_pml4e_stash;
 /* Physical frame address for each guest 4 KiB page; 0 = unallocated. */
 static uint64_t guest_ram_frames[QEMU_GUEST_RAM_PAGES];
 
+/* ─── Guest page-table pages (§3.2 invalidation policy, tier 2) ────────────
+ * One byte per guest 4 KiB page: 1 when that PHYSICAL page is used as a page
+ * table by the guest's CURRENT tables (PML4, PDPT, PD or PT page).
+ * guest_walk() marks each table page it uses; shadow_install() then maps any
+ * page whose frame is marked PRESENT-without-WRITE, so a guest store to its
+ * own page table faults -- the hook that bare-MOV stores do not otherwise
+ * provide -- and the permission-fault path drops the whole populated subtree
+ * before reinstalling the page writable so the store lands.
+ *
+ * Stale marks are harmless: they can only cause a spurious subtree drop, which
+ * is correctness-neutral (everything repopulates from the current tables). So
+ * marks are cleared only at paging enable/reset, not on CR3 reload. */
+static uint8_t guest_table_page[QEMU_GUEST_RAM_PAGES];
+
+static void guest_mark_table_page(uint64_t gpa) {
+    uint32_t idx = (uint32_t)(gpa / FRAME_SIZE);
+    if (idx < QEMU_GUEST_RAM_PAGES) guest_table_page[idx] = 1;
+}
+
 /* ─── The shadow shares page tables with the kernel ────────────────────────
  *
  * qemu_sls_mmu_init() copies all 512 kernel PML4 entries BY VALUE, so every
@@ -260,6 +279,12 @@ int qemu_sls_mmu_guest_paging_enable(void) {
         return -1;
     }
 
+    /* §3.2: table-page marks describe the CURRENT paged address space. Enable
+     * starts a fresh one (reset clears them at the end of the last one; this
+     * is the invariant's other half, so a node that never reset cannot carry
+     * stale marks across guests). */
+    for (uint32_t i = 0; i < QEMU_GUEST_RAM_PAGES; i++) guest_table_page[i] = 0;
+
     /* ─── Drop the guest window's identity mappings ────────────────────────
      * They were correct only while guest virtual == guest physical. From here
      * the guest's own tables decide, and leaving the identity entries in place
@@ -344,6 +369,9 @@ void qemu_sls_mmu_guest_paging_reset(void) {
     if (!initialized) return;
     if (!qemu_sls_guest_paging_on && !identity_pml4e_stash) return;  /* nothing to undo */
 
+    /* §3.2: the paged address space is over; its table-page marks go with it. */
+    for (uint32_t i = 0; i < QEMU_GUEST_RAM_PAGES; i++) guest_table_page[i] = 0;
+
     unsigned slot = SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE);
     uint64_t orphaned = shadow_pml4[slot];   /* the paged subtree, if any */
 
@@ -421,12 +449,16 @@ static const uint64_t *gpa_to_hva(uint64_t gpa) {
     return (const uint64_t *)(QEMU_GPA_HOST_BASE + gpa);
 }
 
-/* Install one shadow PTE: host VA → frame, W-bit propagated from the guest PTE.
+/* Install one shadow PTE: host VA → frame, W-bit propagated from the guest PTE
+ * except for guest page-table pages, which are installed read-only (§3.2).
+ * `gpa` is the leaf's guest PHYSICAL address, used to look the frame up in the
+ * table-page marks.
  *
  * Returns 0 on success, -1 if refused. The caller must treat a refusal as an
  * unresolved fault -- silently not installing would loop the fault handler
  * forever on the same address. */
-static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
+static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte,
+                          uint64_t gpa) {
     if (!shadow_va_in_window(gva)) {
         kernel_serial_printf(
             "[QEMU-SLS MMU] shadow_install REFUSED: 0x%016lx is in PML4 slot %u, "
@@ -444,6 +476,17 @@ static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
 
     uint64_t flags = USER_PTE_PRESENT;
     if (guest_pte & USER_PTE_WRITE) flags |= USER_PTE_WRITE;
+    /* ─── §3.2 tier 2: guest page-table pages are installed read-only ──────
+     * The guest's own leaf decides the W bit for everything else. A page the
+     * guest's CURRENT tables use as a table is special: editing it changes the
+     * meaning of every leaf installed through it, and with softmmu off there
+     * is no other signal. PRESENT-without-WRITE makes the next guest store to
+     * it fault, which is the hook the permission-fault path uses to drop the
+     * subtree. The guest believes the page is writable (its tables say so), so
+     * forcing read-only does not narrow anything -- it only adds the trap. */
+    uint32_t gidx = (uint32_t)(gpa / FRAME_SIZE);
+    if (gidx < QEMU_GUEST_RAM_PAGES && guest_table_page[gidx])
+        flags &= ~USER_PTE_WRITE;
     user_map_page(shadow_pml4, gva & ~(uint64_t)0xFFF, frame, flags);
 
     /* user_map_page() does not invalidate, and iretq re-executes the faulting
@@ -495,8 +538,8 @@ uint64_t qemu_sls_mmu_test_guest_window_pml4e(void) {
  * tests QEMU_GUEST_WINDOW_BASE, slot 128. Anyone debugging a refusal was told
  * to compare against a slot the guard does not use. */
 int qemu_sls_mmu_test_shadow_install(uint64_t gva, uint64_t frame,
-                                     uint64_t guest_pte) {
-    return shadow_install(gva, frame, guest_pte);
+                                     uint64_t guest_pte, uint64_t gpa) {
+    return shadow_install(gva, frame, guest_pte, gpa);
 }
 #endif
 
@@ -517,12 +560,14 @@ static int guest_walk(uint64_t gva, uint64_t *gpa_out, uint64_t *leaf_out) {
     uint64_t cr3_gpa = qemu_sls_guest_cr3 & ~(uint64_t)0xFFF;
     const uint64_t *pml4 = gpa_to_hva(cr3_gpa);
     if (!pml4) return 1;
+    guest_mark_table_page(cr3_gpa);          /* the PML4 page itself */
 
     uint64_t e3 = pml4[PML4_IDX(gva)];
     if (!(e3 & USER_PTE_PRESENT)) return 1;
 
     const uint64_t *pdpt = gpa_to_hva(e3 & USER_PTE_FRAME_MASK);
     if (!pdpt) return 1;
+    guest_mark_table_page(e3 & USER_PTE_FRAME_MASK);
     uint64_t e2 = pdpt[PDPT_IDX(gva)];
     if (!(e2 & USER_PTE_PRESENT)) return 1;
 
@@ -533,6 +578,7 @@ static int guest_walk(uint64_t gva, uint64_t *gpa_out, uint64_t *leaf_out) {
     } else {
         const uint64_t *pd = gpa_to_hva(e2 & USER_PTE_FRAME_MASK);
         if (!pd) return 1;
+        guest_mark_table_page(e2 & USER_PTE_FRAME_MASK);
         uint64_t e1 = pd[PD_IDX(gva)];
         if (!(e1 & USER_PTE_PRESENT)) return 1;
 
@@ -542,6 +588,7 @@ static int guest_walk(uint64_t gva, uint64_t *gpa_out, uint64_t *leaf_out) {
         } else {
             const uint64_t *pt = gpa_to_hva(e1 & USER_PTE_FRAME_MASK);
             if (!pt) return 1;
+            guest_mark_table_page(e1 & USER_PTE_FRAME_MASK);
             uint64_t l = pt[PT_IDX(gva)];
             if (!(l & USER_PTE_PRESENT)) return 1;
             gpa  = l & USER_PTE_FRAME_MASK;
@@ -570,7 +617,6 @@ static int guest_walk(uint64_t gva, uint64_t *gpa_out, uint64_t *leaf_out) {
  */
 int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
     if (!initialized) return 1;
-    (void)error_code;
 
     /* ─── The faulting address is a HOST address, not a guest one ──────────
      * Emitted guest code addresses memory as `guest_va + guest_base`, where
@@ -665,6 +711,27 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
             uint32_t widx = (uint32_t)(wgpa / FRAME_SIZE);
             qemu_sls_tcache_flush_page(wgpa);
 
+            /* ─── §3.2 tier 2: the store hit the guest's own page table ───
+             * Every populated leaf was derived from the PRE-store tables, so
+             * they are all stale. Drop the whole subtree; the next accesses
+             * repopulate from the just-edited tables.
+             *
+             * A second store to the same page is SILENT from here on (the
+             * leaf is reinstalled writable below) until the guest's own INVLPG
+             * or CR3 reload -- exactly hardware semantics, where a guest edits
+             * a table it has already translated and must flush the affected
+             * translations itself. The first store after every drop always
+             * traps, which is the guarantee: no stale leaf can be served past
+             * an edit nobody noticed. */
+            if (widx < QEMU_GUEST_RAM_PAGES && guest_table_page[widx]) {
+                qemu_sls_mmu_shadow_cr3_reload();
+                kernel_serial_printf(
+                    "[QEMU-SLS MMU] guest wrote to its own page-table page GVA "
+                    "0x%016lx (GPA 0x%016lx) -- guest window dropped; accesses "
+                    "now repopulate from the edited tables.\n",
+                    faulting_gva, wgpa & ~(uint64_t)0xFFF);
+            }
+
             /* Reinstall writable. The guest's own leaf decides the W bit for
              * everything else, but this fault only happens on a page WE
              * protected -- the guest already believes it is writable, or the
@@ -717,9 +784,75 @@ int qemu_sls_mmu_shadow_fault(uint64_t faulting_addr, uint32_t error_code) {
 
     if (shadow_install(faulting_addr,
                        guest_ram_frames[(uint32_t)(gpa / FRAME_SIZE)],
-                       leaf) != 0)
+                       leaf, gpa) != 0)
         return 1;
     return 0;
+}
+
+/* ─── §3.2: CR3 reload ─────────────────────────────────────────────────────
+ * The guest changed its root (or otherwise wants every translation gone).
+ * Every populated shadow PTE may be derived from the OLD tables, so the whole
+ * guest window subtree is dropped; the next accesses fault and repopulate
+ * from the guest's CURRENT tables. The identity stash is untouched -- that is
+ * a different slot state, restored only by guest_paging_reset().
+ *
+ * No-op when paging is off: CR3 is ignored by hardware then, and the window
+ * still holds the identity subtree, which must not be dropped. */
+void qemu_sls_mmu_shadow_cr3_reload(void) {
+    if (!initialized || !qemu_sls_guest_paging_on) return;
+
+    unsigned slot = SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE);
+    if (!shadow_pml4[slot]) return;          /* nothing populated to drop */
+
+    shadow_pml4[slot] = 0;
+    /* The dropped translations are live in the TLB. invlpg-per-page is not
+     * viable across 512 GiB; a CR3 reload flushes every non-global entry. Safe
+     * here for the same reason as guest_paging_enable(): the shadow root is
+     * the live CR3 during guest execution, which is the only time this runs. */
+    qemu_sls_flush_tlb();
+
+    kernel_serial_printf(
+        "[QEMU-SLS MMU] guest CR3 reloaded (0x%016lx): guest window subtree "
+        "dropped; next accesses repopulate from the guest's current tables.\n",
+        qemu_sls_guest_cr3);
+}
+
+/* ─── §3.2: INVLPG ─────────────────────────────────────────────────────────
+ * The guest invalidated ONE translation. Drop that page's shadow PTE only;
+ * everything else stands. No-op when paging is off or the page has no shadow
+ * PTE (x86 does not cache non-present translations, so a page that was never
+ * installed cannot be stale).
+ *
+ * The walk is over the SHADOW's host tables, not the guest's: all shadow
+ * mappings are 4 KiB (shadow_install never maps huge pages), so a present PD
+ * entry is always a pointer to a PT page. */
+void qemu_sls_mmu_shadow_invlpg(uint64_t gva) {
+    if (!initialized || !qemu_sls_guest_paging_on) return;
+
+    uint64_t va = QEMU_GUEST_WINDOW_BASE + (gva & ~(uint64_t)0xFFF);
+    const uint64_t *pdpt, *pd;
+    uint64_t *pt, *pte;
+
+    if (!(shadow_pml4[PML4_IDX(va)] & USER_PTE_PRESENT)) return;
+    pdpt = (const uint64_t *)(uintptr_t)
+           (shadow_pml4[PML4_IDX(va)] & USER_PTE_FRAME_MASK);
+    if (!(pdpt[PDPT_IDX(va)] & USER_PTE_PRESENT)) return;
+    pd = (const uint64_t *)(uintptr_t)
+         (pdpt[PDPT_IDX(va)] & USER_PTE_FRAME_MASK);
+    if (!(pd[PD_IDX(va)] & USER_PTE_PRESENT)) return;
+    pt = (uint64_t *)(uintptr_t)(pd[PD_IDX(va)] & USER_PTE_FRAME_MASK);
+    pte = &pt[PT_IDX(va)];
+    if (!(*pte & USER_PTE_PRESENT)) return;
+
+    *pte = 0;
+    /* The page's own translation is live in the TLB; a stale present entry
+     * would keep serving the old frame after the table above forgot it. */
+    qemu_sls_invlpg(va);
+
+    kernel_serial_printf(
+        "[QEMU-SLS MMU] guest INVLPG 0x%016lx: shadow PTE dropped; the next "
+        "access repopulates from the guest's current tables.\n",
+        gva & ~(uint64_t)0xFFF);
 }
 
 /* ─── zero-copy DMA (Phase 4) ─────────────────────────────────────────────── */

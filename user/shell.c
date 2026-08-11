@@ -2050,6 +2050,14 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             extern int sls_test_guest_paging(void);
             sls_test_guest_paging();
         }
+        else if (sh_starts(input_buffer, "qemu invl")) {
+            /* End-to-end §3.2 invalidation: the guest edits its own PT page in
+             * place (the store must fault and drop the subtree), executes
+             * INVLPG, and reloads CR3. Four stage results, four magics -- each
+             * can only pass if the invalidation before it actually happened. */
+            extern int sls_test_guest_invl(void);
+            sls_test_guest_invl();
+        }
         else if (sh_starts(input_buffer, "qemu bench")) {
             /* Measures the guest LOAD path -- the only thing the shadow-PT
              * change affects. Optional argument = number of unrolled loads;

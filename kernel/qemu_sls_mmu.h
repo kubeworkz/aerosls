@@ -193,6 +193,26 @@ extern int qemu_sls_guest_active;
  * instruction -- same reason as arch_read_cr3(). */
 void qemu_sls_invlpg(uint64_t va);
 
+/* ─── §3.2: the invalidation policy for guest page-table changes ───────────
+ * The guest window's shadow PTEs are populated on demand from the guest's own
+ * tables (shadow_fault) and become stale the moment those tables change. Three
+ * triggers, three responses (docs/AeroSLS-QEMU-SLS-Step6-AMD64-M2-
+ * Decision-v0.1.md §3.2):
+ *
+ *   - the guest reloads CR3 while paging is on: every populated PTE may be
+ *     derived from the OLD root, so all of them go (shadow_cr3_reload).
+ *   - the guest executes INVLPG <gva>: that one GVA's PTE is no longer
+ *     trusted (shadow_invlpg).
+ *   - the guest STORES to its own page-table page: table pages are installed
+ *     PRESENT-without-WRITE (shadow_install strips W for marked frames), the
+ *     store faults, and the fault handler drops the whole populated subtree
+ *     before reinstalling the page writable so the store lands.
+ *
+ * Both functions are no-ops when paging is off: CR3 is ignored by hardware
+ * then, and the identity window is not a shadow of any guest tables. */
+void qemu_sls_mmu_shadow_cr3_reload(void);
+void qemu_sls_mmu_shadow_invlpg(uint64_t gva);
+
 /* Full non-global TLB flush (CR3 reload). A function, not inline asm, for the
  * same reason as invlpg and arch_read_cr3(): a host test must be able to see
  * that it happened without executing a privileged instruction. */
@@ -305,7 +325,7 @@ uint64_t qemu_sls_mmu_test_guest_window_pml4e(void);
 #endif
 
 int qemu_sls_mmu_test_shadow_install(uint64_t gva, uint64_t frame,
-                                     uint64_t guest_pte);
+                                     uint64_t guest_pte, uint64_t gpa);
 #endif
 
 #endif /* QEMU_SLS_MMU_H */
