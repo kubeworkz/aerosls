@@ -111,6 +111,26 @@ typedef struct {
 
 void entropy_get_status(entropy_status_t* out);
 
+/* ─── Boot fingerprint: the cross-boot diversity gate ──────────────────────
+ * A 32-byte digest computed once, immediately after the DRBG is instantiated.
+ * Two nodes booted from an IDENTICAL image must produce different values; if
+ * seeding is broken they will match, and that is the single check that would
+ * have caught the Debian OpenSSL defect. Nothing else this subsystem does can
+ * detect it -- see entropy_host_test.c's header on why in-process tests
+ * cannot.
+ *
+ * Why a digest and not a sample. Publishing raw DRBG output over HTTP so a
+ * test can compare it would hand an attacker part of the generator's stream,
+ * which is a considerably worse bug than the one being tested for. Instead 32
+ * bytes are generated, hashed with a domain-separating label, and DISCARDED --
+ * never returned, never used as key material, never reachable again. The
+ * digest is one-way, the bytes behind it are used for nothing else, and it is
+ * therefore safe to serve publicly while still being a faithful witness to
+ * whether the two nodes seeded differently.
+ *
+ * Returns ENTROPY_OK, or ENTROPY_E_NOT_SEEDED with `out` untouched. */
+int entropy_boot_fingerprint(uint8_t out[32]);
+
 /* ─── Test hooks ───────────────────────────────────────────────────────────
  * Compiled only under ENTROPY_TEST_HOOKS, which the kernel build never
  * defines. Source-failure injection is not a nicety here: "the node still

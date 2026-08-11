@@ -318,6 +318,49 @@ int main(void) {
     ok(entropy_init() == ENTROPY_E_NOT_SEEDED,
        "with only stuck hardware sources and no jitter, init REFUSES");
 
+    printf("\n-- 6: boot fingerprint --\n");
+
+    /* The in-process half of the cross-boot gate. It cannot prove two BOOTS
+     * differ -- that needs two machines and lives in
+     * tests/entropy_boot_diversity_check.sh -- but it proves the fingerprint
+     * exists, is not a constant, and is not published before seeding. */
+    entropy_test_reset();
+    {
+        uint8_t fp[32];
+        for (int i = 0; i < 32; i++) fp[i] = 0x5A;
+        ok(entropy_boot_fingerprint(fp) == ENTROPY_E_NOT_SEEDED,
+           "no fingerprint before seeding");
+        {
+            int untouched = 1;
+            for (int i = 0; i < 32; i++) if (fp[i] != 0x5A) untouched = 0;
+            ok(untouched, "  ...and the buffer is left untouched");
+        }
+    }
+
+    entropy_test_reset();
+    {
+        uint8_t fp1[32], fp2[32];
+        entropy_init();
+        ok(entropy_boot_fingerprint(fp1) == ENTROPY_OK, "a fingerprint exists after seeding");
+
+        int nonzero = 0;
+        for (int i = 0; i < 32; i++) if (fp1[i]) nonzero = 1;
+        ok(nonzero, "  ...and is not all zero");
+
+        ok(entropy_boot_fingerprint(fp2) == ENTROPY_OK &&
+           memcmp(fp1, fp2, 32) == 0,
+           "  ...and is stable within a boot (two reads agree)");
+
+        /* A second independent instantiation must produce a different one.
+         * Same machine, same second -- so this is a much weaker signal than
+         * two real boots, but a fingerprint that is CONSTANT fails here. */
+        entropy_test_reset();
+        entropy_init();
+        ok(entropy_boot_fingerprint(fp2) == ENTROPY_OK &&
+           memcmp(fp1, fp2, 32) != 0,
+           "a re-seeded generator yields a DIFFERENT fingerprint");
+    }
+
     printf("\n=== %d passed, %d failed ===\n", checks - fails, fails);
     return fails == 0 ? 0 : 1;
 }

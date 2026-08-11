@@ -1,4 +1,5 @@
 #include "http.h"
+#include "../kernel/entropy.h"
 #include "tcp.h"
 #include "net.h"
 #include "http_rate_limit.h"   // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1
@@ -279,6 +280,59 @@ static int api_health(char* body, int max) {
     jb_str(&j,  "arch",         SLS_ARCH_NAME);            jb_putc(&j, ',');
     jb_uint(&j, "uptime_ticks", kernel_tick_counter);       jb_putc(&j, ',');
     jb_uint(&j, "object_count", object_catalog_count);
+    jb_obj_close(&j);
+    j.buf[j.pos] = '\0';
+    return j.pos;
+}
+
+/* ─── GET /api/entropy ─────────────────────────────────────────────────────
+ * Which entropy sources this node actually has, whether the DRBG is seeded,
+ * and the boot fingerprint that tests/entropy_boot_diversity_check.sh compares
+ * across nodes.
+ *
+ * Serving the fingerprint publicly is safe by construction and NOT by policy:
+ * it is a one-way digest of 32 bytes that were destroyed immediately and are
+ * used for nothing else (see kernel/entropy.h). Serving actual DRBG output
+ * here to make the test easier would hand out part of the generator's stream,
+ * which is a worse bug than the one the test looks for.
+ *
+ * Behind the same auth as every other /api route. "Safe to publish" is an
+ * argument about what an attacker learns from the value, not a reason to skip
+ * authentication -- the source inventory alone tells someone which hardware to
+ * attack. */
+static int api_entropy(char* body, int max) {
+    JSONBuf j = { body, 0, max };
+    entropy_status_t st;
+    entropy_get_status(&st);
+
+    jb_obj_open(&j, 0);
+    jb_str(&j,  "ready",       st.ready ? "true" : "false");   jb_putc(&j, ',');
+    jb_str(&j,  "rdseed",      st.have_rdseed ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j,  "rdrand",      st.have_rdrand ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j,  "jitter",      st.have_jitter ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "pool_bits",       st.pool_bits);        jb_putc(&j, ',');
+    jb_uint(&j, "reseed_count",    st.reseed_count);     jb_putc(&j, ',');
+    jb_uint(&j, "health_failures", st.health_failures);  jb_putc(&j, ',');
+    jb_uint(&j, "rdseed_retries",  st.rdseed_retries);   jb_putc(&j, ',');
+
+    /* Absent rather than zero when unseeded. A field of 64 zeros would look
+     * like a fingerprint and would compare EQUAL across two unseeded nodes --
+     * the diversity check would then report a failure whose cause is "no
+     * entropy" rather than "identical entropy", which are different problems
+     * with different fixes. */
+    uint8_t fp[32];
+    if (entropy_boot_fingerprint(fp) == ENTROPY_OK) {
+        char hex[65];
+        static const char* hx = "0123456789abcdef";
+        for (int i = 0; i < 32; i++) {
+            hex[i * 2]     = hx[fp[i] >> 4];
+            hex[i * 2 + 1] = hx[fp[i] & 0xf];
+        }
+        hex[64] = 0;
+        jb_str(&j, "boot_fingerprint", hex);
+    } else {
+        jb_str(&j, "boot_fingerprint", "");
+    }
     jb_obj_close(&j);
     j.buf[j.pos] = '\0';
     return j.pos;
@@ -4957,6 +5011,11 @@ static void http_route(int conn, char* req) {
         if (!strcmp(path, "/api/loader/list")) {
             blen = api_loader_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/entropy")) {
+            blen = api_entropy(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen);
+            return;
         }
         if (!strcmp(path, "/api/health")) {
             blen = api_health(resp_body, (int)sizeof(resp_body));

@@ -41,6 +41,11 @@ static uint32_t   stat_health_failures;
 static uint32_t   stat_rdseed_retries;
 static uint8_t    have_rdseed, have_rdrand, have_jitter, cpu_probed;
 
+/* See entropy.h. Computed once at instantiate; the bytes behind it are
+ * destroyed immediately and never serve any other purpose. */
+static uint8_t    boot_fp[SHA256_DIGEST_LEN];
+static uint8_t    boot_fp_valid;
+
 #ifdef ENTROPY_TEST_HOOKS
 static int force_rdseed_fail, force_rdrand_fail, force_jitter_fail;
 static int force_rdseed_stuck, force_rdrand_stuck;
@@ -452,6 +457,25 @@ int entropy_init(void) {
     int rc = seed_drbg_from_pool(drbg_instantiated ? 1 : 0);
     if (rc == ENTROPY_OK) {
         kernel_serial_print("[ENTROPY] seeded.\n");
+        if (!boot_fp_valid) {
+            /* Domain-separated so this digest can never collide with a hash
+             * of the same bytes taken for some other purpose later. */
+            uint8_t sample[32];
+            if (drbg_generate(sample, sizeof sample, 0, 0) == ENTROPY_OK) {
+                static const char label[] = "AeroSLS-boot-fingerprint-v1";
+                sha256_ctx fc;
+                sha256_init(&fc);
+                sha256_update(&fc, label, sizeof label - 1);
+                sha256_update(&fc, sample, sizeof sample);
+                sha256_final(&fc, boot_fp);
+                boot_fp_valid = 1;
+            }
+            /* The sample is dead here and must not survive in stack memory.
+             * Volatile so the compiler cannot delete a write it can prove
+             * nobody reads -- which is exactly this write. */
+            volatile uint8_t* sz = sample;
+            for (unsigned i = 0; i < sizeof sample; i++) sz[i] = 0;
+        }
     }
     return rc;
 }
@@ -482,6 +506,12 @@ int entropy_get(void* out, size_t len) {
     return drbg_generate((uint8_t*)out, len, addl, sizeof addl);
 }
 
+int entropy_boot_fingerprint(uint8_t out[32]) {
+    if (!boot_fp_valid) return ENTROPY_E_NOT_SEEDED;
+    for (unsigned i = 0; i < SHA256_DIGEST_LEN; i++) out[i] = boot_fp[i];
+    return ENTROPY_OK;
+}
+
 int entropy_is_ready(void) {
     return drbg_instantiated && pool_bits >= 8u * ENTROPY_SEED_BYTES;
 }
@@ -510,6 +540,7 @@ void entropy_test_reset(void) {
     drbg_instantiated = 0; drbg_reseed_counter = 0; pool_bits = 0;
     stat_health_failures = 0; stat_rdseed_retries = 0;
     cpu_probed = 0; have_rdseed = have_rdrand = have_jitter = 0;
+    boot_fp_valid = 0;
     force_rdseed_fail = force_rdrand_fail = force_jitter_fail = 0;
     force_rdseed_stuck = force_rdrand_stuck = 0;
     hs_rdseed = (health_state){0}; hs_rdrand = (health_state){0}; hs_jitter = (health_state){0};
