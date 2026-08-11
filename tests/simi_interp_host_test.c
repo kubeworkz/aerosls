@@ -118,6 +118,21 @@ static struct Case cases[] = {
     { "tools/simi/tests/ptr_ops.tmo", "main", 1, 125LL, SIMI_STATUS_OK },
     { "tools/simi/tests/rv64_boot_smoke.tmo", "main", 1, 42LL, SIMI_STATUS_OK },
     { "tools/simi/tests/straight_line_bench.tmo", "main", 1, 21LL, SIMI_STATUS_OK },
+    /* ─── Phase 15 atomics ─────────────────────────────────────────────────
+     * OP_CAS and OP_ATOMIC_ADD reached the ISA and all three code generators
+     * with NO interpreter coverage at all: the .simi sources existed here, but
+     * none was in this corpus, so the kernel interpreter had never executed
+     * either opcode. The ISA drift guard above caught that the enum was
+     * missing; nothing would have caught the semantics being wrong.
+     *
+     * Expected values are the reference interpreter's (tools/simi/simi-run),
+     * cross-checked against each program's own documented "Expected result".
+     * That matters more here than elsewhere in this list: the kernel and host
+     * interpreters are separate implementations of the same ISA, not copies,
+     * so these three are the only thing making them agree about atomics. */
+    { "tools/simi/tests/atomic_add.tmo",     "main", 1, 2LL, SIMI_STATUS_OK },
+    { "tools/simi/tests/cas_simple.tmo",     "main", 1, 5LL, SIMI_STATUS_OK },
+    { "tools/simi/tests/stress_atomics.tmo", "main", 1, 0LL, SIMI_STATUS_OK },
     /* The one float program must be REFUSED, not approximated -- see
      * simi_interp.h on -mno-sse and x87's 80-bit intermediates. Asserting
      * the refusal means a future change that starts computing floats

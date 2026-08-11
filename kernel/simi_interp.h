@@ -86,6 +86,14 @@ enum {
     OP_ENTER, OP_LEAVE,
     OP_RESOLVE, OP_OBJSIZE, OP_OBJTYPE,   /* v0.3 (Phase 6) */
     OP_JMPR,                              /* Phase 14 */
+    /* Phase 15 shared-memory atomics. Appended after OP_JMPR, matching
+     * tools/simi/simi_isa.h exactly -- the order IS the numbering, and the ISA
+     * drift guard in tests/simi_interp_host_test.c fingerprints OP_COUNT and
+     * four named opcodes to catch a mismatch. These arrived in the ISA and in
+     * all three code generators and were missed here, which is precisely what
+     * that guard is for: it went red rather than letting the interpreter and
+     * the encoders disagree quietly about what an opcode number means. */
+    OP_CAS, OP_ATOMIC_ADD,                /* Phase 15 */
     OP_COUNT
 };
 typedef enum {

@@ -339,6 +339,73 @@ SimiStatus simi_interp_run(struct SimiContext* ctx, uint64_t budget) {
             si_memcpy(&ctx->mem[addr], &fr->regs[rd], (uint32_t)wdt);
             ctx->pc++; break;
         }
+        /* ─── Phase 15: shared-memory atomics ──────────────────────────────
+         * CAS        rD, rA, rB, TYPE : old = [rA]; if (old == rB) [rA] = rD_in
+         * ATOMIC_ADD rD, rA, rB, TYPE : old = [rA]; [rA] = old + rB
+         * Both return the OLD value in rD, which is also CAS's new-value input
+         * -- the cmpxchg/xadd operand shape.
+         *
+         * The contract here is not invented. All three code generators
+         * (tools/simi/simi_{x86,arm,riscv}.c) were written first and describe
+         * these semantics in their own comments as "the interpreter's":
+         * 4/8-byte cells only, register operands only, old returned
+         * zero-extended with no sign extension, width-masked compare and
+         * truncated store. This implements what they already assume, so a
+         * program produces the same result interpreted and compiled. Any
+         * divergence would be a bug that only appears on one path.
+         *
+         * FMT_RRR puts a register in the rb field, so there is no displacement
+         * form and the address is rA exactly. FLAG_IMM is rejected rather than
+         * ignored: the encoders reject it, and silently treating an immediate
+         * as zero would make the interpreter accept a program they refuse.
+         *
+         * "Atomic" is a contract about what other observers can see between
+         * the load and the store. This interpreter has one thread of control
+         * and no concurrent observer, so the sequence below IS indivisible on
+         * this path -- no lock is missing. The encoders emit real LOCK/LL-SC
+         * sequences because their output does have concurrent observers. */
+        case OP_CAS:
+        case OP_ATOMIC_ADD: {
+            if (simi_flags(w) & FLAG_IMM)
+                return si_trap(ctx, SIMI_STATUS_TRAP_BAD_OPCODE, ctx->pc);
+            int wdt = si_width_of((SimiType)type);
+            if (wdt != 4 && wdt != 8)
+                return si_trap(ctx, SIMI_STATUS_TRAP_BAD_OPCODE, ctx->pc);
+
+            uint64_t addr = fr->regs[ra];
+            if (addr + (uint64_t)wdt > SIMI_MEM_SIZE)
+                return si_trap(ctx, SIMI_STATUS_TRAP_MEM_BOUNDS, ctx->pc);
+
+            /* Zero-extended by construction: si_memcpy fills the low wdt bytes
+             * of a zeroed word. Deliberately NOT sign-extended, unlike OP_LOAD
+             * -- an atomic returns the cell's raw bits. */
+            uint64_t old = 0;
+            si_memcpy(&old, &ctx->mem[addr], (uint32_t)wdt);
+
+            uint64_t rb = fr->regs[simi_rb_reg(w)];
+
+            if (op == OP_CAS) {
+                /* Width-masked compare: at 4 bytes the encoders compare on
+                 * EAX/ECX and ignore high garbage, so the interpreter must
+                 * too, or a caller with dirty high bits would see the swap
+                 * succeed compiled and fail interpreted. */
+                uint64_t mask = (wdt == 8) ? ~(uint64_t)0 : (uint64_t)0xFFFFFFFFu;
+                if (old == (rb & mask)) {
+                    uint64_t newv = fr->regs[rd];     /* rD is the input here */
+                    si_memcpy(&ctx->mem[addr], &newv, (uint32_t)wdt);
+                }
+            } else {
+                uint64_t sum = old + rb;              /* wraps; truncated below */
+                si_memcpy(&ctx->mem[addr], &sum, (uint32_t)wdt);
+            }
+
+            fr->regs[rd] = old;
+            /* Tag cleared: the result is a raw integer, never a capability,
+             * even when the cell happened to hold one. */
+            si_set_tag(fr, rd, 0);
+            ctx->pc++; break;
+        }
+
         case OP_LEA:
             fr->regs[rd] = fr->regs[ra] + (uint64_t)(int64_t)simi_imm28(w);
             si_set_tag(fr, rd, 0); ctx->pc++; break;
