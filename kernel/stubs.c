@@ -491,3 +491,52 @@ void* kernel_get_current_task_struct(void) {
                  * NULL-guard (fpu_hardware_owner == current_task) still
                  * applies here as a safety net, same as before this fix. */
 }
+
+/* ─── Freestanding string functions the vendored mbedTLS needs ─────────────
+ * gcc emits calls to these regardless of -ffreestanding, and mbedTLS's X.509
+ * code calls them directly. Each was added because the LINKER named it, not
+ * because a list somewhere said a kernel should have them:
+ *
+ *   memmove  x509write_crt.c, x509write_csr.c -- DER is built back-to-front
+ *            and then shifted, so the regions overlap
+ *   strncpy  x509write_crt.c, copying validity strings
+ *   strstr   x509_crt.c, matching a wildcard in a SAN
+ *
+ * memmove is the one that matters. memcpy above copies forward and is
+ * undefined on overlap; using it here would corrupt certificates in a way
+ * that depends on buffer addresses, which is to say intermittently. */
+
+void* memmove(void* dst, const void* src, size_t n) {
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    if (d == s || n == 0) return dst;
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+    } else {
+        /* Backwards, so a forward-overlapping move does not read bytes it has
+         * already overwritten. This is the entire reason memmove exists and
+         * the entire reason memcpy cannot stand in for it. */
+        for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+    }
+    return dst;
+}
+
+char* strncpy(char* dst, const char* src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    /* C requires the remainder be zero-filled, not merely terminated. Callers
+     * rely on it, and mbedTLS's validity-string handling is one of them. */
+    for (; i < n; i++) dst[i] = '\0';
+    return dst;
+}
+
+char* strstr(const char* hay, const char* needle) {
+    if (!*needle) return (char*)hay;
+    for (; *hay; hay++) {
+        const char* h = hay;
+        const char* n = needle;
+        while (*h && *n && *h == *n) { h++; n++; }
+        if (!*n) return (char*)hay;
+    }
+    return 0;
+}

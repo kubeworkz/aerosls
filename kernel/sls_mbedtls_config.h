@@ -188,6 +188,19 @@ void sls_mbedtls_exit(int status);
 #undef MBEDTLS_SHA512_USE_ARMV8_A_CRYPTO_IF_PRESENT
 #undef MBEDTLS_PADLOCK_C
 
+/* ─── 5c. Drop the X.509 pretty-printers ──────────────────────────────────
+ * mbedtls_x509_crt_info(), _csr_info() and friends format a certificate into
+ * human-readable text. Nothing here calls them -- there is no console command
+ * that dumps a certificate -- and they are the ONLY reason the X.509 modules
+ * reach for snprintf.
+ *
+ * Found by linking: x509_csr.o wanted MBEDTLS_PLATFORM_STD_SNPRINTF at eight
+ * call sites, all inside mbedtls_x509_csr_info(). The alternative was writing
+ * a freestanding snprintf -- a format-string parser, in a kernel, to support
+ * output nothing asks for. Removing the feature is smaller, and one less
+ * parser is one less place to get a %n wrong. */
+#define MBEDTLS_X509_REMOVE_INFO
+
 /* ─── 6. Debug output ──────────────────────────────────────────────────────
  * Off. mbedTLS's debug callback prints handshake internals including key
  * material at high verbosity levels, and this kernel's serial console is not
