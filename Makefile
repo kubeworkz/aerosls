@@ -377,7 +377,13 @@ plugins: compiler/SLSAllocationPassV2.cpp
 # different flags than the real build uses is not verification of the real
 # build.
 MBEDTLS_INC   = -I vendor/mbedtls/include
-MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"'
+# -U_FORTIFY_SOURCE is the root cause of a whole family of link errors, not a
+# style preference. This toolchain defines _FORTIFY_SOURCE=2 by default, so gcc
+# rewrites memcpy/memset/memmove with a compile-time-known size into
+# __memcpy_chk and friends -- glibc functions absent from a freestanding link.
+# It is also what produced __explicit_bzero_chk, which an earlier commit
+# treated with ZEROIZE_ALT: a good fix for the wrong reason.
+MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"' -U_FORTIFY_SOURCE
 
 kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@
