@@ -1,0 +1,398 @@
+# AeroSLS QEMU-SLS — Step 6 extension: the full AMD64 Guest Frontend, v0.1
+
+*Extends `AeroSLS-QEMU-SLS-Step6-x86-Frontend-Plan-v0.1.md` (the "Step 6" plan) from
+the 32-bit, paging-off guest it currently drives to **full AMD64 (64-bit mode)**.
+Target unchanged from the Step 6 agreement of 2026-08-05: **arbitrary statically-linked
+Linux x86-64 binaries.** Implementation environment constraint: freestanding, in-kernel,
+no user space, no glibc — the same constraint every `sls/` file already honors.*
+
+**Status: scoping plan — no code landed. Every claim below is checked against the tree
+as of 2026-08-11; the ones that are hypotheses are labeled as such.**
+
+---
+
+## 0. The one fact that orders everything
+
+**Long mode cannot exist without paging.** Entering 64-bit mode requires `CR0.PG=1`,
+`CR4.PAE=1`, and `EFER.LME=1` (LMA is set the moment PG is set with LME=1), and every
+instruction fetch after that is a paged fetch through the guest's CR3 tables. There is
+no 64-bit execution with paging off, at all, for a single instruction.
+
+This collides head-on with the current integration, where
+`sls/sls-i386-codefetch.c` **refuses loudly when `qemu_sls_guest_paging_on` is set** —
+its GPA-window read (`SLS_GPA_BASE + addr`) is only correct while guest virtual ==
+guest physical. That refusal is not a bug; it is the honest boundary of the paging-off
+path. But it means the entire "full AMD64" milestone order is forced by one constraint:
+
+> **The shadow-walk / paging-on fetch+data path is not the last thing to build. It is
+> the first thing. There is no intermediate paging-off 64-bit state to ship first.**
+
+Everything else in this plan is depth on top of that.
+
+---
+
+## 1. Current state — what "the i386 guest frontend" actually is
+
+The phrase is loaded: `sls/sls-x86-frontend.c` is 308 lines and 18 opcodes, but QEMU's
+own decoder — `target/i386/tcg/translate.c` (3,620 lines) + `decode-new.c.inc` (3,149)
+— is already compiling against the SLS shim behind `SLS_X86_FRONTEND=on`. ("i386" here
+is QEMU's *target* name, which covers both 32- and 64-bit decode — the name is not a
+32-bit limit, but the *machine state feeding it* is.)
+
+| Piece | File | State (2026-08-11) |
+|---|---|---|
+| Hand-rolled frontend, 18 opcodes | `sls/sls-x86-frontend.c` | Default build. Deliberately rejects SIB (`rm==100`) and RIP-relative (`mod==00, rm==101`) addressing — structurally incapable of 64-bit code. |
+| C dispatcher | `sls/sls-launcher.c` (~line 680+) | Hybrid loop: HLT, OUT, CALL, RET, LODSB, TEST, JZ/JNZ, MOV CR0/3/4, WRMSR/RDMSR (EFER only). Exits translated blocks to C for everything else. |
+| Guest CPU state | `SLSCPUState` in `sls/sls-launcher.h` | `regs[16]`, `eip`, `eflags`, `cc_dst/cc_src/cc_op` (TCG cc state), `halted`, `cr0`, `cr3`, `cr4`, `efer`. Zero at reset — boots paging-off, as real hardware. |
+| QEMU decoder (Step 6.1) | `target/i386/tcg/translate.c` + `decode-new.c.inc` | Compiles clean, 701,888-byte object, 919 functions. Full 64-bit decode machinery present: `CODE64`/`LMA`/`REX_W` (`translate.c:198-218`), `SYSCALL`/`SYSRET` decode entries (`decode-new.c.inc:1264-1266`), `swapgs` (`translate.c:3126`). |
+| Build wiring (Step 6.2) | `make x86-iso SLS_X86_FRONTEND=on` | Object built by explicit path (never VPATH); flag off by default. |
+| Execution loop (Step 6.3) | `sls-launcher.c` + one file from `accel/tcg`: `translator.c` | Decided: keep our launcher loop + TB management; `cputlb.c` deliberately excluded. |
+| Helpers (Step 6.4) | `sls/sls-i386-helper-stubs.c` | All **765** `helper_*` defined via QEMU's own `DEF_HELPER` expansion, real signatures, **each halts and names itself**. Remaining unresolved symbols: 24, all AeroSLS kernel-side (0 `helper_*`, 0 code-fetch) — see `docs/step6/undefined-symbols.txt`. |
+| Code fetch | `sls/sls-i386-codefetch.c` | GPA-window read; **refuses if guest paging is on** (the gate this plan exists to remove). |
+| Guest paging machinery | `kernel/qemu_sls_mmu.c` (+ host test suite, 107 checks) | Shadow tables, `shadow_fault`, guest-paging enable/reset — real and tested; **not wired into instruction fetch or the TCG data path for GVA translation**. |
+
+**Two things the decoder already gives us, so this plan does not spend any milestone on
+them:** REX/66/67 prefix handling, and the 64-bit addressing forms (RIP-relative, SIB
+with all 8 base/index registers, disp32 sign-extension). They are TCG-op work in
+`translate.c`, not helpers, and they decode correctly today given the right mode state.
+What is *not* given is that mode state, the paging translation behind every fetch and
+load/store, the helper semantics, and the guest bootstrap.
+
+---
+
+## 2. The gap decomposition — five distinct pieces of work
+
+"Full AMD64" decomposes into five gaps. They are independent enough to milestone
+separately (M1–M6 in §5 map onto these 1:1), and the first one is the paging gate.
+
+### Gap A — 64-bit mode state (who the decoder thinks it is)
+
+Every `CODE64`/`LMA` decision in `translate.c` reads `dc->flags` — `HF_CS64_MASK`,
+`HF_LMA_MASK` — plus the CS selector and EFER. Today the launcher drives a
+32-bit-ish, paging-off guest. Full AMD64 needs the machine to be *born* in long mode:
+
+- `CS.L=1, CS.D=0`, flat 64-bit code segment, CPL 0; `EFER.LME=LMA=1`; `CR4.PAE=1`;
+  `CR0.PG=1` — constructed by the launcher as **boot state**, not earned by the guest
+  executing real-mode → protected → long-mode transitions. This matches the agreed
+  target: a statically-linked Linux binary never runs real-mode code; the OS sets up
+  long mode and starts it there. Emulating the legacy boot sequence would be pure
+  waste. State this choice explicitly in the code: the guest starts at its ELF entry
+  with long mode already on.
+- `CPUX86State` fields the decoder reads that `SLSCPUState` does not have: `eip` under
+  `env`, the segment registers and their bases (FS/GS base matter — static glibc uses
+  FS:0 as the thread pointer), `a20_mask`, the xmm/fp register files (Gap D), and the
+  TCG env global layout `translate.c` binds via `offsetof`. The Step 6.1 shim already
+  provides the real `CPUX86State`; the work is *initializing* it and keeping the two
+  state structs coherent (or replacing `SLSCPUState` with `CPUX86State` outright —
+  a decision for M1, see §5).
+- Canonical-address semantics in the fetch/data path: 64-bit mode requires
+  sign-extended addresses; a non-canonical address is a `#GP` (exit-to-C, Gap E).
+
+### Gap B — paging-on fetch and data path (the gate)
+
+Long mode forces paging on (see §0). The pieces exist but are not connected:
+
+- **Fetch:** `sls-i386-codefetch.c` must translate guest VA → host pointer through the
+  shadow tables instead of refusing. The launcher already runs the whole guest window
+  under `qemu_sls_shadow_cr3` with `qemu_sls_guest_active=1`, and `shadow_fault()`
+  populates the shadow on host #PF — so the fetch path can be a real GVA→host resolve
+  that consults the shadow (walk it in software or fault-and-retry), not a special case
+  for identity mappings. The refusal stays as the fallback for *foreign* guest tables
+  until M2.
+- **Data:** TCG `qemu_ld/st` in the softmmu=OFF build emit direct host accesses at
+  `guest_base + gva`. With paging on, "gva" is a guest *virtual* address; the emitted
+  access must land in shadow-mapped host memory. This is the unresolved design point
+  from `AeroSLS-QEMU-SLS-Guest-Address-Space-Design-v0.1.md`: the GVA-direct scheme
+  (map guest VAs directly, no base register) is **blocked by the shared-table defect**
+  it documents — `qemu_sls_mmu_init()` copies kernel PML4 entries by value, so
+  installing guest mappings at low addresses overwrites the kernel's live tables. The
+  three ways out are on record there: (a) COW-clone page tables, (b) the guest_base
+  window (shipped for paging-off; for paging-on it needs a per-access translation), (c)
+  a separate address space with a world switch (shadow root maps only guest memory +
+  a trampoline). **This plan makes the choice of (a)/(b)/(c) an explicit M2 decision
+  record with the defect doc as the starting point**, because it is the single most
+  consequential architectural call in the whole effort.
+- The `guest_paging_on` flag and the reset/restore machinery
+  (`AeroSLS-QEMU-SLS-Guest-Paging-Reset-Defect-v0.1.md`, fixed 2026-08-06) stay as-is;
+  M1 builds on the *correct* reset, it does not re-litigate it.
+
+### Gap C — helper semantics for compiled 64-bit code
+
+The 765-helper census (from Step 6.1): **507 vector (66%), 59 x87 (7%), 5 flags (<1%),
+194 other (25%)**. The decoder emits every one as a call; today every one halts. The
+plan's ordering principle (inherited from Step 6.4) stays: *implement by what a target
+binary actually calls, not by walking the list.* The compiled-64-bit-binary subset:
+
+| Class | Helpers | Needed by |
+|---|---|---|
+| Flag computation | the 5 flag helpers (adc/sbb/rcr/rcl shift paths, `helper_cc_compute_all`) | essentially every compiled instruction stream that touches CF — M3 |
+| Integer | div/idiv (all forms), one-operand mul, bswap, shift-by-cl edge cases, string ops (rep movs/stos/cmps), cmpxchg paths | any non-trivial -nostdlib binary — M3 |
+| System | `helper_syscall` (`helper.h:55`, called from `emit.c.inc:4130`), cpuid, rdtsc, in/out, invlpg, cli/sti, hlt | any binary that touches the OS at all — M4 |
+| SSE2 scalar | movsd/movss family, addsd/addss, subsd, mulsd, divsd, sqrtsd, xorpd, ucomisd/comisd, cvtsi2sd/cvtsi2ss, cvttsd2si/cvttss2si, movd/movq, mxcsr handling | compiler-generated double/float math (gcc -O2 emits SSE2 by default) — M6 |
+| Everything else | ~600 (AVX/AVX2, most SSE4, MMX, all 59 x87, 3DNow, transactional) | **deferred or permanent-unsupported** — §4 |
+
+The "stub halts loudly" discipline (Step 6.4) is the right instrument throughout: a
+stub is the *correct permanent answer* for an instruction the agreed target never
+executes, and the surviving stub list is the written definition of what this build does
+not support. Nothing in this plan asks for silent-0 fallbacks.
+
+### Gap D — syscall and system semantics (the architectural decision)
+
+`SYSCALL` (0F 05) is decoded (`decode-new.c.inc:1264`) and emitted as
+`gen_helper_syscall(tcg_env, insn_len)` (`emit.c.inc:4130`). Upstream's
+`helper_syscall` raises `EXCP_SYSCALL` — "only for user emulation" (`cpu.h:1508`) —
+or delivers a system-mode exception to a guest OS. **SLS is the guest OS.** There is no
+Linux kernel underneath the guest, so the helper must route somewhere real:
+
+1. **Exit-to-C and halt** — M4 gate, honest and trivial: the launcher records the
+   syscall number + args and stops. Proves the decode/emit/helper path end-to-end.
+2. **Route to the AeroSLS syscall surface** (`SYS_SLS_*`) — natural for SIMI-era
+   guests, but the agreed target is *Linux* binaries that issue Linux syscall numbers.
+3. **A minimal Linux-compat shim inside SLS** — the endpoint for the agreed target:
+   `write`→serial, `exit`/`exit_group`, `brk`/`mmap`→SLS frames, plus whatever
+   `__libc_start_main`'s teardown needs (`read`, `futex`, `clock_gettime`). **M5.**
+
+The plan's position: (1) is the first milestone, (3) is the target, (2) is a parallel
+lane for SIMI guests that does not block the Linux-binary track. `swapgs` is already
+translated inline (`translate.c:3126`) — it must at minimum swap the two GS bases in
+the env without faulting; FS/GS base state rides along in Gap A.
+
+### Gap E — guest bootstrap and the ELF boundary
+
+Nothing in `sls/` parses ELF today (the `qemu run <hex>` shell command feeds raw
+machine code at a fixed GPA). "Arbitrary statically-linked Linux x86-64 binaries"
+requires a loader before execution even starts:
+
+- Parse ELF64 (no interpreter — static means no PT_INTERP), place PT_LOAD segments,
+  zero BSS, honor PT_TLS (static glibc requires a TCB at FS:0 with the `tcbhead_t`
+  self-pointer — glibc will crash at `_dl_tls_setup`/`__libc_start_main` without it).
+- Build the initial stack in guest RAM: argc/argv/envp **and the auxv vector**
+  (AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_ENTRY/AT_UID/AT_GID/AT_RANDOM/AT_EXECFN) —
+  static glibc reads these before main.
+- Enter long mode at the ELF entry with the launcher-built identity tables covering the
+  loaded segments and the stack (Gap A + B).
+
+The M4 syscall shim and the M5 loader are one milestone: a loader is useless until
+`write` and `exit_group` work, and the shim's test vehicle is a loaded binary.
+
+---
+
+## 3. Decoding strategy — the decision and the rejections
+
+**Decision: the decoder is QEMU's own `target/i386/tcg/translate.c` +
+`decode-new.c.inc`, already integrated (Steps 6.1–6.3). The AMD64 plan extends what
+feeds it (machine state, paging, helpers, bootstrap) — it does not write a decoder.**
+
+This is a decision, not an accident of history, and it is worth stating the rejections
+explicitly, because "write our own AMD64 decoder" is the natural instinct and it is the
+wrong one here:
+
+- **Rejected: extend the 18-opcode `sls-x86-frontend.c` to 64-bit.** It is
+  structurally incapable: it has no prefix/mode machinery, no REX, and its addressing
+  decoder *deliberately rejects* SIB and RIP-relative (the comment says so — "a
+  frontend that silently mis-decodes an address produces a guest that reads the wrong
+  memory"). Extending it to 64-bit means writing REX/66/67 handling, a full ModRM+SIB
+  decoder, and mode-state tracking from scratch — i.e., writing a second full AMD64
+  decoder that already exists and already compiles. Rejected.
+- **Rejected: a fresh hand-written decoder (Capstone-style opcode tables).** 6,769
+  lines of battle-tested decode, with the entire QEMU helper ecosystem's IR contract
+  already built around it, would be duplicated with zero integration benefit and a
+  permanent divergence cost every time upstream fixes a decode bug. Rejected.
+- **The 18-opcode frontend's fate (Step 6.5):** with translate.c carrying 64-bit, it
+  cannot remain "the frontend." Resolution: retire it as a frontend, keep it (if at
+  all) as a documented test fixture for the C-dispatcher hybrid, and flip the default
+  build to `SLS_X86_FRONTEND=on` once M7's corpus passes — M8 in this plan.
+
+**What "the decoder" therefore costs us:** the mode-state contract it assumes
+(`dc->flags` from CPUX86State, Gap A) and the helpers it calls (Gap C/D). Both are
+bounded and enumerated — the 765-helper census is a number, not a fog.
+
+---
+
+## 4. Instruction coverage — the full AMD64 surface, by class
+
+### 4.1 Already free (decoder + TCG ops, no helpers, no mode-state work beyond Gap A)
+
+MOV/LEA (all widths incl. REX.W 64-bit), push/pop, ADD/SUB/AND/OR/XOR/CMP/TEST on
+registers and memory, NOT/NEG, shifts/rotates (most), JMP/Jcc/CALL/RET, Jcc/setcc/cmov
+(most), MOVZX/MOVSX, **MOVSXD (63 /r — the i386 ARPL conflict is already resolved by
+the decoder's mode-aware tables)**, NOP/PAUSE, RIP-relative and SIB addressing,
+66h/67h/REX prefix matrix, 32-bit-write zero-extension semantics.
+
+### 4.2 Helper-gated — must implement for the agreed target (≈30–60 of 765)
+
+Flag computation (5); div/idiv/mul/bswap/shift-by-cl/string-op subset of the 194
+"other"; syscall/sysret/cpuid/rdtsc/in/out (system subset of the 194). Ordered by what
+the milestone binaries call (§5), with halting stubs for everything else.
+
+### 4.3 SSE2 scalar — one deliberate, bounded slice (≈30–50 of 507)
+
+movsd/movss + arithmetic/compare/convert/movd/movq + mxcsr, enough for
+compiler-generated scalar double/float. This is *optional* for the agreed target
+(compile fixtures with `-mno-sse -msoft-float` for M1–M5), but "arbitrary binaries"
+means real ones eventually, and gcc defaults to SSE2. M6.
+
+### 4.4 System — the small set that makes a Linux binary breathe
+
+`syscall` → helper (Gap D), `sysret`, `swapgs`, `cpuid` (return a conservative leaf set
+consistent with what helpers actually implement — do not advertise AVX before AVX is
+real), `rdtsc` (scale host TSC), `in`/`out` (route to the SLS port model / serial,
+per SCOPE.h CATEGORY 9), `cli`/`sti`/`hlt`, `invlpg`.
+
+### 4.5 Deferred — with reasons, not silence
+
+| Class | Count (of 765) | Reason |
+|---|---|---|
+| AVX/AVX2/AVX-512 | ~400 of the 507 vector | The agreed target's compiler output needs SSE2, not AVX; a halting stub is correct until then |
+| MMX | subset of 507 | Dead in 64-bit compiler output; x87-era |
+| x87 FPU (all 59) | 59 | gcc emits x87 only for `long double`; fixtures use `-mlong-double-64` or `-msoft-float` — document the flag, don't implement 80-bit math in M1–M6 |
+| 3DNow!, transactional memory, VMX/SVM, sysenter/sysexit | tail | Never in static-Linux-binary output |
+| Real-mode / protected-mode boot sequence | — | Guest starts in long mode (Gap A decision); the legacy path emulates nothing |
+
+The permanent-unsupported list is a *documented output* of M7, not a hidden assumption:
+at the end, the remaining halting stubs are the spec of what this build does not run.
+
+---
+
+## 5. Milestone order — each gated by a measurement, not an opinion
+
+Every gate is a concrete binary and a concrete result. This is the project's standing
+rule (a claim without a measurement is a hypothesis) applied to the plan itself.
+
+### M1 — Long-mode entry, paging-on fetch through the shadow. *(the gate in §0)*
+
+- Launcher constructs 64-bit boot state: `CS.L=1/CS.D=0`, `EFER.LME=LMA=1`,
+  `CR4.PAE=1`, `CR0.PG=1`, guest CR3 → identity tables the launcher built covering the
+  guest RAM window. Decide: initialize the real `CPUX86State` and stop maintaining
+  `SLSCPUState` as a parallel struct (one source of truth for the decoder's
+  `offsetof`-bound env).
+- `sls-i386-codefetch.c`: replace the paging refusal with a real GVA→host resolve
+  through the shadow for the launcher-built tables; keep the refusal for foreign CR3
+  until M2. Remove the "i386" name's implication by renaming to
+  `sls-x86-codefetch.c` or documenting in place — the file is mode-agnostic.
+- **Gate:** a `gcc -static -nostdlib` 64-bit fixture entered directly in long mode —
+  `movabs rax, imm64; mov rbx, [rip+disp]; mov rcx, [r12+r13*8+disp32]; add rax, rbx;
+  add rax, rcx; ret` — runs and the launcher reads the expected rax. Must include REX,
+  RIP-relative, SIB, and a 64-bit immediate: proves decode, mode state, addressing, and
+  paging-on fetch in one binary.
+
+### M2 — Guest-owned page tables; the fetch+data translation decision record.
+
+- Guest (or its M5 loader) installs its own CR3 tables; fetch **and** TCG data-path
+  accesses translate through them via the shadow. Resolve the Address-Space-Design
+  (a)/(b)/(c) choice as a written decision record — the COW-clone (a) or world-switch
+  (c) route fixes the shared-table defect; the window (b) route needs per-access
+  translation. This is the deepest architecture in the plan; the defect doc's §1–§2
+  analysis is the starting point.
+- **Gate:** a fixture that maps a data page at a high non-identity GVA, writes a known
+  value, reads it back, returns the checksum — and the identical fixture with a *bad*
+  translation faults cleanly to C (exit, not corruption).
+
+### M3 — Integer/flag helper subset for compiled code.
+
+- Implement the 5 flag helpers + the div/idiv/mul/shift/string subset (§4.2) in the
+  helper layer, replacing their halting stubs. Everything else still halts loudly.
+- **Gate:** a `-nostdlib` fixture mixing add/adc/sub/cmp/div/idiv/imul/shifts/branches
+  and returning a known 64-bit constant — the point where "a compiled 64-bit binary
+  runs" stops being a promise and becomes a regression test.
+
+### M4 — System instruction surface + the syscall decision.
+
+- `cpuid` (conservative leaves), `rdtsc` (scaled), `in`/`out` (port model/serial),
+  `swapgs` (real base-swap semantics in the env), and `syscall` → **exit-to-C with the
+  number+args recorded** (option 1 of Gap D). The launcher reports the intercepted
+  syscall and the guest state.
+- **Gate:** a fixture executing cpuid + rdtsc + a `syscall` whose interception the
+  launcher prints correctly. This proves the full decode→emit→helper→C boundary for
+  the one instruction every Linux binary eventually executes.
+
+### M5 — ELF64 loader, guest bootstrap, and the Linux-compat syscall shim.
+
+- `sls-elf64-loader.c`: parse ELF64 (static only — PT_INTERP rejected loudly), place
+  segments, zero BSS, build PT_TLS TCB at FS:0, build initial stack with auxv. Long-mode
+  entry per M1 covering loaded segments + stack (uses M2's translation).
+- Syscall shim (option 3 of Gap D): `write`→serial, `exit`/`exit_group`→launcher,
+  `brk`/`mmap`/`munmap`→SLS frames, plus `read`, `futex`, `clock_gettime` as the
+  binary demands them (stub-halt discipline: implement what the fixture calls).
+- **Gate — the agreed target, in one line:** `gcc -static` hello world prints to serial
+  and exits 0, delivered back to the launcher. This is the milestone the whole plan
+  exists for; M1–M4 are its prerequisites, and everything after is depth.
+
+### M6 — SSE2 scalar slice.
+
+- xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
+  Fixtures for M1–M5 may use `-mno-sse -msoft-float`; M6 removes that crutch.
+- **Gate:** a `-nostdlib` double-math fixture (add/sub/mul/div/sqrt/compare/convert
+  chain) compiled with default `-O2` returns the known value. Cross-check the same
+  value on the host to pin the result.
+
+### M7 — Fault semantics + hardening + the permanent-unsupported list.
+
+- `#UD` on genuinely undefined encodings, `#GP` on canonical violations and bad
+  segment state, `#PF` with guest CR2 set, `#DE` on div-by-zero — each delivered to C
+  (exit with the fault recorded) per the launcher's hybrid model.
+- The surviving halting stubs become the **written** permanent-unsupported list
+  (§4.5), each with its reason. No stub left that reads as live but is not.
+- **Gate:** a fixture that deliberately executes `ud2` and a div-by-zero; the launcher
+  reports the correct fault class, not a hang or corruption. Plus: the full M1–M6
+  corpus re-runs green (the start of the regression suite).
+
+### M8 — Retire the 18-opcode frontend; flip the default build; measure.
+
+- Step 6.5's decision, now forced by §3: retire `sls-x86-frontend.c` as a frontend
+  (keep only as a documented fixture if the C-dispatcher tests need it). `make x86-iso`
+  runs the real decoder without a flag.
+- Measure image size (`readelf -lW … memsz` — Step 6's footprint warning: the image is
+  already 221.6 MiB, TCG ~36 MiB), and verify the Phase 2 persistent tcache
+  (`AeroSLS-QEMU-SLS-Phase2-Persistent-Translation-Plan-v0.1.md`) round-trips 64-bit
+  TBs across a reboot.
+- **Gate:** a fresh `x86-iso` boots, the M1–M7 corpus passes on the default build, and
+  the size delta is recorded as a number.
+
+---
+
+## 6. Risks and honest unknowns
+
+- **The shadow-walk completeness is the whole project and it is unverified.**
+  `qemu_sls_mmu.c` is real (107 host-test checks) but the Repositioning plan records
+  `map_guest_ram` as "currently halts a node silently" and shadow paging as
+  UNVERIFIED. M1/M2 are the first time the shadow is load-bearing for *instruction
+  fetch* — the highest-stakes code path in the kernel. If the shared-table defect or a
+  walk bug shows up under real guest tables, it will look like misdecoded instructions
+  or corrupted kernel memory, which is the most expensive failure mode this project
+  has paid for. The M2 decision record must be written before the walk is extended,
+  not after.
+- **`CPUX86State` entanglement.** Step 6.1 proved the decoder parses against a shim;
+  feeding it a *correctly initialized* full `CPUX86State` is a different claim. If the
+  struct resists initialization outside QOM lifecycle, M1's "one source of truth"
+  decision gets larger.
+- **The helper subset estimate is an estimate.** §4.2's "≈30–60" is derived from the
+  census plus what gcc emits; the real list is whatever the M3/M5 fixtures halt on.
+  That is why the milestones are binary-gated rather than count-gated.
+- **glibc's surface is not "hello world".** Even trivial `-static` binaries touch
+  `brk`, `mmap`, `futex`, `clock_gettime`, `read`, and TLS init in
+  `__libc_start_main`. M5's shim will grow by whatever the first real binary halts on
+  — the same discipline as 6.4, expected.
+- **The market honesty note (from the Repositioning plan, unchanged):** this frontend's
+  value is x86-64 guests on *non-x86* hosts. On x86 hosts, hardware virtualization
+  owns the row. A complete AMD64 frontend on x86-only hardware demonstrates the
+  technique; it does not reach the market the Repositioning plan identified. The ARM64
+  host port is the independent track that completes the story — this plan is
+  deliberately frontend-only and does not pretend otherwise.
+- **"No user space or glibc" applies to the implementation, not the payload.** The
+  emulator is freestanding in-kernel code (as every `sls/` file already is); the guest
+  binaries the frontend runs are, by the agreed target, statically linked *with*
+  glibc. The constraint and the target live on opposite sides of the emulator boundary,
+  and both are satisfied by this plan.
+
+---
+
+## 7. What this plan does not cover (deliberately)
+
+- The ARM64/RISC-V *host* ports (separate track; §6).
+- Real-mode/protected-mode boot emulation (Gap A decision — guests start in long mode).
+- The SIMI layer and its x86-64 translator (`tools/simi/simi_x86.c`) — that is the
+  SLIC-vs-native story, orthogonal to guest emulation.
+- AVX/AVX-512, x87, MMX (permanent-unsupported or post-M7 depth; §4.5).
+- Multi-vCPU guest execution (the launcher is single-vCPU by design; SCOPE.h CATEGORY 4
+  elides locking for that reason, and M1–M8 keep it true).
