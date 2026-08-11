@@ -359,6 +359,29 @@ plugins: compiler/SLSAllocationPassV2.cpp
 %.x86.o: %.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) -c $< -o $@
 
+# ── kernel/tls_platform.c needs the vendored mbedTLS headers ───────────────
+# An explicit rule rather than adding these to X86_CFLAGS, so vendor/mbedtls's
+# headers are on the include path of exactly one file instead of all 200. The
+# library ships library/common.h, library/constant_time_internal.h and other
+# generic names; putting that directory on every translation unit's path is a
+# collision waiting for the first kernel header with a matching name.
+#
+# Only include/ is added, never library/. include/ holds the mbedtls/-prefixed
+# public headers and cannot collide; library/ holds the unprefixed internal
+# ones and would.
+#
+# This rule is why the build broke at de65656: tls_platform.c was already in
+# X86_C_SRC from an earlier commit, the allocator swap added an mbedTLS include
+# to it, and I verified that only with host gcc and -I flags typed by hand --
+# never through the Makefile that actually builds it. Compiling a file under
+# different flags than the real build uses is not verification of the real
+# build.
+MBEDTLS_INC   = -I vendor/mbedtls/include
+MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"'
+
+kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
+	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@
+
 $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
