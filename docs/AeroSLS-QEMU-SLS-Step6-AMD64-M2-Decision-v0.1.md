@@ -233,7 +233,12 @@ policy for guest-owned page tables, in three tiers:
    write-protect trap — this one AND the pre-existing code-page self-modifying trap —
    never fired on real hardware. `sls-launcher.c` now sets CR0.WP (bit 16) around
    guest execution and restores it after. This is what made tier 2 observable, and it
-   means the code-page trap (tier 3) now works on real hardware for the first time.
+   means the code-page trap (tier 3) now works on real hardware for the first time —
+   verified by the new `qemu selfmod` fixture (POST `/api/qemu/selfmod`): the guest
+   patches its own code page mid-run (a MOV immediate and a JMP displacement), the
+   store faults, the page generation bumps (3 TBs invalidated), and re-execution
+   comes from a fresh translation of the patched bytes (EAX = 0x22222222, 12 insns,
+   halted). PASS on both the default and `SLS_X86_FRONTEND=on` builds.
 
    Verified on hardware, both builds: the new `qemu invl` fixture (POST
    `/api/qemu/invl`) has the guest edit its PT page in place, execute `INVLPG`, and
