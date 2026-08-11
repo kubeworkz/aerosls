@@ -1,8 +1,76 @@
 # AeroSLS TLS — design and sequencing, v0.1
 
-**Status:** design. Nothing implemented yet.
-**Decided:** port BearSSL (not write); private CA with per-node certificates;
-first shippable version is server-side TLS **plus** mutual TLS between nodes.
+**Status:** Phases 0 and 1 implemented. Phase 2 library choice REVERSED — see
+the amendment immediately below before reading §3.
+**Decided:** port **mbedTLS 3.6 LTS** (not BearSSL, not write-our-own); private
+CA with per-node certificates; first shippable version is server-side TLS
+**plus** mutual TLS between nodes.
+
+---
+
+## AMENDMENT (2026-08-11): BearSSL cannot do TLS 1.3
+
+**§3 recommended BearSSL for a document about TLS 1.3. BearSSL does not
+implement TLS 1.3.** That recommendation was made without checking, and the
+check took one page fetch.
+
+From BearSSL's own site: TLS 1.0/1.1/1.2 only. Its TLS 1.3 roadmap is ten
+steps and step 1 is *"find an existing implementation with TLS 1.3 support, for
+interoperability tests"* — i.e. not begun. RSA/PSS, EdDSA, the 1.3 record
+format and the 1.3 handshake are all unimplemented. Both pages are © 2018;
+current version is 0.6, self-described as beta.
+
+A second gap, also missed: **BearSSL cannot issue certificates.** It generates
+key pairs, but "production of signed certificate requests and self-signed
+certificates" sits under *Not Yet Implemented*. §4's private CA would have
+needed certificate encoding written by us or performed off-box.
+
+### What replaced it, and what was verified this time
+
+**mbedTLS 3.6 LTS**, checked against `docs/architecture/tls13-support.md` and
+the project README rather than recollection:
+
+| Property | Verified |
+|---|---|
+| TLS 1.3, client **and** server | Yes — `MBEDTLS_SSL_PROTO_TLS1_3` |
+| Suites we want | `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256` |
+| Groups | x25519, secp256r1, secp384r1, secp521r1 |
+| 1.2 and 1.3 together, independently enableable | Yes, with version negotiation |
+| Licence | Dual Apache-2.0 OR GPL-2.0-or-later — take Apache-2.0 |
+| Maintenance | TrustedFirmware, security list, `SECURITY.md`, LTS branch |
+
+Costs, stated rather than discovered later:
+
+- **Requires `MBEDTLS_PSA_CRYPTO_C` and `MBEDTLS_SSL_KEEP_PEER_CERTIFICATE`.**
+  Both must stay on for TLS 1.3, and the second means the peer certificate is
+  retained per connection — RAM, on top of §3.2's record buffers.
+- **`MBEDTLS_SSL_MAX_FRAGMENT_LENGTH` and `MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH`
+  are unsupported under 1.3.** So the per-connection buffer is fixed at full
+  record size; §3.2's memory budget gets worse, not better, and the connection
+  limit must be enforced rather than discovered.
+- **It wants an allocator.** This was the strongest argument for BearSSL and
+  it is not fully neutralised, only reduced: mbedTLS can be given a fixed pool
+  rather than a general heap, which keeps TLS allocation out of the database's
+  arena. That has to be configured deliberately and verified, not assumed.
+- `MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED` alone drops all PSK
+  code, which is the configuration to start from for footprint.
+
+**Vendor the 3.6 LTS release tarball, not 4.0 and not `development`.** 4.0
+splits crypto into a separate TF-PSA-Crypto submodule repository; the
+development branch requires Python and Perl to generate source files that
+release tarballs already contain. 3.6 LTS carries only the framework submodule.
+
+### The rule this cost
+
+§8.1 listed "BearSSL is still the right choice" as an assumption to challenge,
+and named the right risk — a quiet upstream — while missing a larger and
+entirely checkable one: whether the library implements the protocol the
+document is about. **An assumption that can be settled by reading the
+project's own front page is not an assumption. It is something nobody
+checked.**
+
+Everything in §§0-2 (entropy) and §1.1 (the clock) is unaffected: those were
+about the kernel, not the library, and both are implemented and tested.
 **Window:** this precedes all other roadmap work (see
 `AeroSLS-Roadmap-2026H2-v0.1.md` §2, which recommended deferring this; that
 recommendation is superseded and the roadmap extends to 12 months).
