@@ -409,6 +409,13 @@ kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 MBEDTLS_SRC  = $(wildcard vendor/mbedtls/library/*.c)
 MBEDTLS_OBJS = $(MBEDTLS_SRC:.c=.x86.o)
 
+# libgcc supplies the compiler's own runtime helpers. bignum.c divides
+# unsigned __int128 and gcc emits a call to __udivti3, which is not something
+# a C file can provide -- it belongs to the compiler. -nostdlib excludes it
+# along with libc, so it is named explicitly rather than by dropping -nostdlib
+# and dragging a hosted libc in behind it.
+LIBGCC := $(shell $(X86_CC) -print-libgcc-file-name 2>/dev/null)
+
 $(MBEDTLS_OBJS): %.x86.o: %.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) -I vendor/mbedtls/library \
 	          $(MBEDTLS_DEFS) -I kernel -c $< -o $@
@@ -511,7 +518,7 @@ arch/x86/trampoline.o: arch/x86/trampoline.asm
 		arch/x86/trampoline.bin arch/x86/trampoline.o
 
 $(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS)
-	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS) -o $(X86_BIN)
+	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS) $(LIBGCC) -o $(X86_BIN)
 
 x86-iso: $(X86_BIN)
 	mkdir -p isodir/boot/grub
