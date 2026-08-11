@@ -393,9 +393,20 @@ kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 # these sources include library/common.h and friends. That is safe for the
 # vendored files themselves and unsafe for kernel files, which is why the two
 # rules differ rather than sharing flags.
-MBEDTLS_SRC  = vendor/mbedtls/library/memory_buffer_alloc.c \
-               vendor/mbedtls/library/platform.c \
-               vendor/mbedtls/library/platform_util.c
+# Phase 3 needs the TLS server, X.509 write, EC key generation and PSA crypto.
+# The dependency graph between those is dense enough that hand-picking a subset
+# is a guessing game -- and I have guessed wrong about this link three times
+# already this week. So: link the whole library first, MEASURE with the guards
+# that exist for exactly this (kernel_image_end_check, stack_frame_budget_check),
+# and trim from evidence.
+#
+# That inverts the "three files, not 107" argument from the previous commit,
+# and deliberately. Then, three was the measured closure of what was actually
+# called. Now nothing is called yet and the closure cannot be measured until a
+# listener exists, so the honest sequence is measure-then-trim rather than
+# trim-then-hope. The trimming is a real task, not an aspiration: it is what
+# the image-end number is for.
+MBEDTLS_SRC  = $(wildcard vendor/mbedtls/library/*.c)
 MBEDTLS_OBJS = $(MBEDTLS_SRC:.c=.x86.o)
 
 $(MBEDTLS_OBJS): %.x86.o: %.c $(AB_STAMP)
