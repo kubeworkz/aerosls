@@ -122,6 +122,15 @@ int main(int argc, char** argv) {
             nskip++;
             continue;
         }
+        if (strcmp(name, "lcg_slice.simi") == 0) {
+            /* §10.200: kernel-embedded LCG fixture (the arm64 kernel
+             * boot is its gate) — outside the parity corpus, no x86
+             * --bytes row; its A64 emission is pinned by the size
+             * gate's M0 row instead. */
+            printf("SKIP  %-24s kernel-embedded LCG fixture (arm64 kernel boot is its gate, plan doc §10.200) — no x86 --bytes row\n", name);
+            nskip++;
+            continue;
+        }
         long long expected = 0;
         if (!parse_expected(path, &expected)) {
             printf("SKIP  %-24s no 'Expected result:' comment (jmpr_oob faults by design; cap_forge_debug)\n", name);

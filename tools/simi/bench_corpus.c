@@ -202,6 +202,14 @@ int main(int argc, char** argv) {
             nskip++;
             continue;
         }
+        if (strcmp(name, "lcg_slice.tmo") == 0) {
+            /* §10.200: kernel-embedded LCG fixture (the arm64 kernel
+             * boot is its gate) — outside the parity corpus, the
+             * arm64_boot_smoke model. */
+            printf("SKIP  %-24s kernel-embedded LCG fixture (arm64 kernel boot is its gate, plan doc §10.200)\n", name);
+            nskip++;
+            continue;
+        }
 
         const struct FixtureBaseline* bl = find_baseline(name);
         if (!bl) {

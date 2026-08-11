@@ -7872,6 +7872,54 @@ only proves the CURRENT classes are caught); the trap's loudness is
 the EL1h sync stub hang, which under qemu reads as rc=124 — the smoke
 asserts exactly that shape.
 
+### 10.200 M5.4 as built: the per-slice LCG teeth on the arm64 kernel
+
+The fairness probe's "the work provably ran" proof lands on the
+AArch64 kernel, mirroring the RISC-V kernel's per-slice LCG
+(kernel_riscv.c, rv_fp_task_common). A new kernel-embedded fixture
+(`tools/simi/tests/lcg_slice.simi`, embedded as
+`kernel/arm64_lcg_slice_tmo.h` — the arm64_boot_smoke_tmo.h xxd
+pattern, byte-diffed identical) runs ONE full per-slice budget of the
+task LCG (acc = acc\*1664525 + 1013904223 mod 2^32, exactly
+sp->work = 200,000 iterations from 0 — the same recurrence the
+parity-corpus lcg_fairness.simi pins) and RETURNS the raw acc tooth:
+0x0b6f2a40 = 191834688, printed by the kernel and asserted by CI as
+`lcg slice executed (one per-slice budget) -- acc=0x000000000b6f2a40
+(expected 0x0b6f2a40 = 191834688) PASS`. The RISC-V connection is
+exact: five consecutive 200,000-iteration slices accumulate to the
+committed all-heavy tooth 0xf2dc5340.
+
+Design decisions, each pinned by the boot gate:
+- **Kernel-embedded, NOT a parity-corpus fixture** (the
+  arm64_boot_smoke §10.196 model): its real gate is the kernel boot's
+translate + execute + serial assert, not the host parity tables. The
+interp/x86/RV64 runners and all four bench tools skip it; the ARM
+runner still executes it (its ~4.4M A64 steps fit the tight 10M
+budget — no raised budget needed) without a steps row ("a row no
+bench maintains would be a lie"), and the size gate pins its emission
+(1092 bytes). Its host parity shape is covered by lcg_fairness.simi
+in the corpus.
+- **Direct translation, not the activation cache**: the program runs
+once, so caching would serve no reuse — and routing it through
+arm64_activate would have bumped the MISS count and broken the M5.1
+gate (exactly one MISS at boot). It gets its OWN static code buffer
+(`g_lcg_code_buf`, 16-aligned — EL1-only, no page mapping needed), so
+the boot smoke's translated code survives untouched for the EL0
+excursions.
+- **Runs after the M5.1 four-entry gate, before the timer arms**: the
+call sits between the second `arm64_el1_entry()` and
+`arm_timer_arm()` in kernel_arm64_main, with IRQs still masked — no
+tick can fire during the ~4.4M-instruction run, so the M5.2 tick
+gate's count (exactly 6) and interleave are untouched by
+construction. Boot-verified: rc=0 (PSCI), 1 MISS / 3 HIT / 2 EL1
+entries / 2 EL0 excursions / 6 ticks — every pre-existing gate
+byte-identical — plus the new `acc=0x000000000b6f2a40 ... PASS` line.
+- **The discriminator is the value itself**: a wrong recurrence (missing
+mod-2^32 mask, swapped constants, off-by-one count) changes the acc
+and the kernel's PASS/FAIL verdict (and CI) fails; the host fixture's
+"Expected result: 191834688" is verified on all four engines (ARM
+1092 bytes, RV64 1116, x86 699, interp value-exact).
+
 ---
 
 
