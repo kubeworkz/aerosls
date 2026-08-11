@@ -356,6 +356,16 @@ jobs:
             tail -30 boot_rv.log >&2
             exit 1
           }
+          # The wall-clock cadence teeth: elapsed mtime from the first
+          # preemption to the queue emptying must land in
+          # [300000, 500000) ticks — 15+ periods at the 2ms cadence and
+          # not 4ms-or-slower. The exact value is host-dependent (the
+          # last task's tail work), so only the shape is pinned.
+          grep -aE "mtime: [0-9]+ PASS" boot_rv.log || {
+            echo "FAILED: the demo's measured wall-clock cadence did not match the 2ms tick in S-mode" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
           echo "OK: RISC-V kernel booted, FP lazy-save + three-task ready queue passed, SIMI smoke executed, RV_SYS_EXIT powered off via SBI_SRST"
 
       - name: Boot the kernel as a direct M-mode payload and assert the boot smoke + halt
@@ -447,6 +457,12 @@ jobs:
           }
           grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS; preemptions: 15 PASS; work: 1000000/1000000/1000000 (equal) PASS; acc: 0x00000000f2dc5340/0x00000000f2dc5340/0x00000000f2dc5340 PASS" boot_rv_m.log || {
             echo "FAILED: the ready-queue final rows/count did not hold in M-mode" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          # Same wall-clock cadence teeth as the S-mode leg.
+          grep -aE "mtime: [0-9]+ PASS" boot_rv_m.log || {
+            echo "FAILED: the demo's measured wall-clock cadence did not match the 2ms tick in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }

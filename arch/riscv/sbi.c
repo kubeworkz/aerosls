@@ -167,7 +167,7 @@ void sbi_set_tick_period(uint64_t period_ticks) {
     g_tick_period_override = period_ticks;
 }
 
-static uint64_t rv_rdtime(void) {
+uint64_t rv_rdtime(void) {
     uint64_t t;
     __asm__ volatile("csrr %0, time" : "=r"(t));
     return t;
