@@ -38,17 +38,31 @@
 #define MBEDTLS_PLATFORM_NO_STD_FUNCTIONS
 
 /* ─── 2. Time ──────────────────────────────────────────────────────────────
- * MBEDTLS_HAVE_TIME off for now, deliberately, and this is a REAL limitation
- * rather than a tidy-up: with it off, X.509 does not check notBefore/notAfter,
- * so an expired certificate verifies. kernel/rtc.c exists precisely to fix
- * this and is tested (50 checks), but wiring it means MBEDTLS_PLATFORM_TIME_ALT
- * plus an mbedtls_time_t shim, which is its own commit with its own test.
+ * ON, and routed to kernel/rtc.c through sls_mbedtls_time() in
+ * kernel/tls_platform.c. Without this X.509 skips notBefore/notAfter entirely
+ * and an EXPIRED CERTIFICATE VERIFIES -- which is what this config shipped
+ * with for one commit, recorded here at the time so it could not be forgotten.
  *
- * Recorded here, in the file that causes it, so the gap is discoverable from
- * the code rather than only from a document: TLS built with this config has
- * NO CERTIFICATE EXPIRY CHECKING. Do not ship it. */
-#undef MBEDTLS_HAVE_TIME
-#undef MBEDTLS_HAVE_TIME_DATE
+ * There is no time_t in a freestanding build, so the type is named explicitly.
+ * `long long` rather than a 32-bit type: signed 32-bit seconds overflows in
+ * 2038, and a certificate-validity clock that wraps is exactly the quiet wrong
+ * answer kernel/rtc.c exists to refuse.
+ *
+ * TIME_MACRO, not TIME_ALT. The first attempt used TIME_ALT with a runtime
+ * mbedtls_platform_set_time() call, and mbedTLS's own check_config.h rejected
+ * it: TIME_TYPE_MACRO and TIME_ALT are mutually exclusive (check_config.h:528),
+ * because ALT keeps mbedtls_time_t as libc's time_t and a freestanding build
+ * has none. The compile-time macro is the better fit here regardless -- the
+ * time source is fixed at build time in a kernel, and a function pointer that
+ * can be left unset is one more way to boot into a broken state. */
+#define MBEDTLS_HAVE_TIME
+#define MBEDTLS_HAVE_TIME_DATE
+#define MBEDTLS_PLATFORM_TIME_TYPE_MACRO long long
+#define MBEDTLS_PLATFORM_TIME_MACRO      sls_mbedtls_time
+
+/* Declared here because mbedtls_time expands to it inside library sources
+ * that include no header of ours. */
+long long sls_mbedtls_time(long long *t);
 
 /* ─── 3. Entropy ───────────────────────────────────────────────────────────
  * No /dev/urandom, no CryptGenRandom. mbedtls_hardware_poll() in

@@ -21,12 +21,14 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "entropy.h"
+#include "rtc.h"
 
 #ifndef TLS_PLATFORM_HOST_TEST
 /* The kernel build compiles against the vendored tree; the host test does not,
  * so that the fail-closed RNG contract can be exercised without pulling 8 MB
  * of library into a unit test. */
 #include "mbedtls/memory_buffer_alloc.h"
+
 #endif
 
 #ifndef TLS_PLATFORM_HOST_TEST
@@ -147,3 +149,55 @@ size_t sls_tls_pool_bytes(void);
 size_t sls_tls_pool_bytes(void) { return SLS_TLS_POOL_BYTES; }
 int    sls_tls_memory_ready(void);
 int    sls_tls_memory_ready(void) { return tls_pool_ready != 0; }
+
+/* ─── 3. Time ──────────────────────────────────────────────────────────────
+ * X.509 asks the platform for the current time to check notBefore/notAfter
+ * (vendor/mbedtls/library/x509.c:1072 calls mbedtls_time(NULL)). With
+ * MBEDTLS_PLATFORM_TIME_ALT that is a function pointer, installed by
+ * sls_tls_time_init() below.
+ *
+ * ─── What happens with no trusted clock, and why 0 is not a fallback ──────
+ * kernel/rtc.c refuses rather than guessing -- no RTC, a dead battery reading
+ * 2000-01-01, a time before this kernel was built. When it refuses, this
+ * returns 0, and 0 is the epoch: every certificate our private CA issues has
+ * a notBefore far later than 1970, so X.509 rejects it as NOT YET VALID.
+ *
+ * That is fail-closed, but it is fail-closed by CONSEQUENCE, and relying on a
+ * consequence is how a security property quietly stops holding -- a
+ * certificate with an early enough notBefore would sail through. So it is the
+ * second line, not the first. The first is sls_tls_time_trusted(): TLS must
+ * refuse to start at all on a node with no trusted clock, checked before a
+ * listener is ever opened, and that check is the one to keep honest. */
+
+long long sls_mbedtls_time(long long *t);
+
+long long sls_mbedtls_time(long long *t)
+{
+    uint64_t now = 0;
+    long long v = 0;
+
+    if (rtc_get_unix(&now) == RTC_OK) v = (long long)now;
+    /* else v stays 0 -- see the note above; this is not a guess at the time,
+     * it is a value chosen because it cannot pass a validity check. */
+
+    if (t) *t = v;
+    return v;
+}
+
+int sls_tls_time_init(void);
+int sls_tls_time_trusted(void);
+
+/* No pointer to install: MBEDTLS_PLATFORM_TIME_MACRO binds mbedtls_time to
+ * sls_mbedtls_time at compile time. This exists purely to make the refusal
+ * explicit and early, at a place a caller must pass through. */
+int sls_tls_time_init(void)
+{
+    if (!rtc_is_trusted()) {
+        kernel_serial_print("[TLS] no trusted wall clock -- certificate "
+                            "validity cannot be checked. TLS must not start.\n");
+        return -1;
+    }
+    return 0;
+}
+
+int sls_tls_time_trusted(void) { return rtc_is_trusted(); }
