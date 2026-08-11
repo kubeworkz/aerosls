@@ -119,6 +119,32 @@ long long sls_mbedtls_time(long long *t);
 #undef MBEDTLS_SSL_DTLS_HELLO_VERIFY
 #undef MBEDTLS_SSL_DTLS_SRTP
 
+/* ─── 5b. No CPU crypto acceleration ───────────────────────────────────────
+ * AES-NI (x86) and the ARMv8 crypto extensions use SSE/NEON registers. This
+ * kernel is compiled -mno-sse -mno-sse2 -mno-mmx, and that is not a
+ * preference: using vector registers in kernel code requires saving and
+ * restoring FPU/SSE state across context switches and interrupts, and this
+ * kernel has no such path. Without it, a TLS handshake interrupted mid-AES
+ * would corrupt whatever else was using xmm -- silently, and only under load.
+ *
+ * Found by compiling: aesni.c fails with "the register 'xmm0' cannot be
+ * clobbered in 'asm' for the current target". That is the toolchain refusing
+ * an unsound combination rather than a build annoyance, and the fix is to turn
+ * the feature off, not to relax the flag.
+ *
+ * The cost is real and should be measured rather than assumed: software AES-GCM
+ * is several times slower than AES-NI. If that proves to matter, the answer is
+ * ChaCha20-Poly1305 (already enabled, fast in pure software, and what the
+ * config would prefer on a Pi anyway) -- not enabling SSE in a kernel that
+ * cannot save it. */
+#undef MBEDTLS_AESNI_C
+#undef MBEDTLS_AESCE_C
+#undef MBEDTLS_SHA256_USE_A64_CRYPTO_IF_PRESENT
+#undef MBEDTLS_SHA512_USE_A64_CRYPTO_IF_PRESENT
+#undef MBEDTLS_SHA256_USE_ARMV8_A_CRYPTO_IF_PRESENT
+#undef MBEDTLS_SHA512_USE_ARMV8_A_CRYPTO_IF_PRESENT
+#undef MBEDTLS_PADLOCK_C
+
 /* ─── 6. Debug output ──────────────────────────────────────────────────────
  * Off. mbedTLS's debug callback prints handshake internals including key
  * material at high verbosity levels, and this kernel's serial console is not

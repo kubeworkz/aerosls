@@ -152,9 +152,11 @@ int    sls_tls_memory_ready(void) { return tls_pool_ready != 0; }
 
 /* ─── 3. Time ──────────────────────────────────────────────────────────────
  * X.509 asks the platform for the current time to check notBefore/notAfter
- * (vendor/mbedtls/library/x509.c:1072 calls mbedtls_time(NULL)). With
- * MBEDTLS_PLATFORM_TIME_ALT that is a function pointer, installed by
- * sls_tls_time_init() below.
+ * (vendor/mbedtls/library/x509.c:1072 calls mbedtls_time(NULL)).
+ * MBEDTLS_PLATFORM_TIME_MACRO binds that name to this function at COMPILE
+ * time -- there is no pointer to install and no window in which one is unset.
+ * Proof it is bound rather than merely declared: x509.o carries an undefined
+ * reference to sls_mbedtls_time.
  *
  * ─── What happens with no trusted clock, and why 0 is not a fallback ──────
  * kernel/rtc.c refuses rather than guessing -- no RTC, a dead battery reading
@@ -165,9 +167,9 @@ int    sls_tls_memory_ready(void) { return tls_pool_ready != 0; }
  * That is fail-closed, but it is fail-closed by CONSEQUENCE, and relying on a
  * consequence is how a security property quietly stops holding -- a
  * certificate with an early enough notBefore would sail through. So it is the
- * second line, not the first. The first is sls_tls_time_trusted(): TLS must
- * refuse to start at all on a node with no trusted clock, checked before a
- * listener is ever opened, and that check is the one to keep honest. */
+ * second line, not the first. The first is sls_tls_time_init(), which REFUSES
+ * on a node with no trusted clock and must be called before a listener is ever
+ * opened. That is the check to keep honest. */
 
 long long sls_mbedtls_time(long long *t);
 
