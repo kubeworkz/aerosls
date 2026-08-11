@@ -1,6 +1,7 @@
 # AeroSLS QEMU-SLS — the guest-paging reset defect, v0.1
 
 **Status: FIXED 2026-08-06 — correctness half. Leak half reduced, not closed.**
+Guards retired 2026-08-10; §3 is now history, not instructions.
 Found 2026-08-05. Pre-existing; the Guest Runtime UI exposed it, did not cause
 it.
 
@@ -152,29 +153,24 @@ mappings for frames already held**, which is exactly what a reset needs.
 
 ---
 
-## 3. Guards in place
+## 3. Guards — all three retired by the fix
 
-**After running guest paging, the node must be restarted before any further
-guest run.**
+**Historical.** Between finding this and fixing it, three guards stood in for a
+reset. None was the fix and all three are now gone, which is recorded here
+because a guard outliving its defect is its own bug — a screen that keeps
+asserting a broken state the kernel has repaired is wrong in the same way a
+stale figure is, and more visibly.
 
-Three guards, none of them the fix:
+| Guard | Was | Now |
+|---|---|---|
+| `sls_launch_guest()` refuses when `qemu_sls_guest_paging_on` is set | converted an unrecoverable hang into a returned error naming the cause | **replaced** by an unconditional `qemu_sls_mmu_guest_paging_reset()` at the same spot — the launch succeeds instead of explaining why it can't |
+| `sls_test_guest_paging()` prints what it did on PASS | the console had no way to know the node was now unusable | kept; the message no longer warns, it reports |
+| Guest Runtime screen disables both buttons after a paging run | could not walk someone into the refusal | **removed** (`7241bd4`) — `pagingSpent` deleted, both buttons live, banner rewritten to state the residual leak instead of a restart requirement |
 
-**`sls_launch_guest()` refuses when `qemu_sls_guest_paging_on` is set.** This is
-the important one — it converts an unrecoverable node hang into a returned error
-and a message naming the cause. It costs one comparison and covers every caller:
-the shell command, the HTTP route, and the bench. The refusal is placed *after*
-the `sls_last_*` counter resets, so a refused launch reports zeros rather than
-the previous successful run's figures beside `ok:false`.
-
-**`sls_test_guest_paging()` prints what it did** on its PASS path, since the
-console had no way to know the node was now unusable.
-
-**The Guest Runtime screen disables both buttons** after a paging run and
-explains the state, so it cannot walk someone into the refusal.
-
-All three are guards. The shell command and HTTP route still enable paging and
-still leave the node needing a restart; they just no longer take it down
-silently.
+The refusal was deliberately placed *after* the `sls_last_*` counter resets, so
+a refused launch reported zeros rather than the previous run's figures beside
+`ok:false`. That ordering is worth keeping in mind for any future refusal added
+here; it is the difference between a failure and a plausible-looking lie.
 
 ---
 
