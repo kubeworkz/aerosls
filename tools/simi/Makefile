@@ -151,8 +151,16 @@ simi-arm-verify: simi_arm_verify.c simi_arm.c simi_arm.h a64_exec.c a64_exec.h b
 # which skips cleanly when the toolchain is absent (the M3 "optional,
 # environment-dependent" premise). Deliberately NOT in `all` — the
 # sandbox has no aarch64 toolchain; the arm64-guards CI job installs one.
+# A64_CC: the cross-compiler when building from x86, the plain host compiler
+# when we ARE aarch64. On a native aarch64 machine -- an Ampere box, a Pi, an
+# Apple-silicon container -- aarch64-linux-gnu-gcc is a cross-compiler nobody
+# has any reason to install, and requiring it made the one target that matters
+# unbuildable on the one host where its output runs for real.
+A64_CC ?= $(shell if [ "$$(uname -m)" = "aarch64" ] || [ "$$(uname -m)" = "arm64" ]; \
+                  then echo gcc; else echo aarch64-linux-gnu-gcc; fi)
+
 simi-arm-jit: simi_arm_jit.c simi_arm.c simi_arm.h
-	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -o $@ simi_arm_jit.c simi_arm.c
+	$(A64_CC) -static -O2 -Wall -Wextra -o $@ simi_arm_jit.c simi_arm.c
 
 # M0 transcription-error net: a from-scratch Python A64 encoder re-derives
 # the bit layout independently and checks every static word simi_arm.c
