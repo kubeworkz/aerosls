@@ -309,11 +309,19 @@ void riscv_trap_dispatch_common(struct RvPerHartData* phd,
             fp_load_all(&phd->fp_save[next][0]);
             phd->fp_current = next;
             g_fp_lazy_count++;
+            /* Short form on purpose: this line prints on EVERY slice's
+             * first fadd.d (once per preemption), and at the demo's
+             * fast cadence the ~80-char tail was a meaningful chunk of
+             * the slice budget (~0.5ms at 115200 baud vs ~0.2ms now) —
+             * the cadence stress tightens the print path itself. The
+             * "[FP] lazy-save:" prefix is what the CI count asserts;
+             * the semantics (owner swap, sepc unchanged, re-execute)
+             * are documented in the code and the ISA doc. */
             rv_print_str("[FP] lazy-save: owner ");
             rv_print_udec(live);
             rv_print_str(" -> ");
             rv_print_udec(next);
-            rv_print_str(" (FS=Off scause=2; sepc re-executes the FP instruction)\n");
+            rv_print_str("\n");
             return;   /* sepc unchanged: re-execute the trapping FP insn */
         }
         rv_print_str("[TRAP] illegal instruction (scause=2), sstatus.FS=");

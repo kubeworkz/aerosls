@@ -313,8 +313,12 @@ jobs:
             tail -30 boot_rv.log >&2
             exit 1
           }
-          [ "$(grep -ac '\[FP\] lazy-save:' boot_rv.log)" -eq 3 ] || {
-            echo "FAILED: expected exactly 3 lazy-saves (A cold start, B, A reload)" >&2
+          # 18 total = the smoke's 3 (A cold start, B, A reload) + the
+          # ready-queue demo's 15 (one per slice). Was -eq 3 from part 2
+          # until the demo's slices added theirs — a latent CI break the
+          # cadence stress work surfaced and fixed.
+          [ "$(grep -ac '\[FP\] lazy-save:' boot_rv.log)" -eq 18 ] || {
+            echo "FAILED: expected exactly 18 lazy-saves (3 smoke + 15 demo slices)" >&2
             tail -30 boot_rv.log >&2
             exit 1
           }
@@ -330,11 +334,15 @@ jobs:
           # ran the same 10x-heavy per-slice LCG work (1,000,000 each;
           # acc 0xf2dc5340 all three — the host-precomputed teeth) yet
           # still got exactly 5 preemptions — the round-robin is
-          # workload-oblivious. The demo runs at the tightened 5ms tick
-          # cadence (the ultra-fast-cadence stress, 20x the original
-          # 100ms rate) and the 15/15 accounting must survive it.
-          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 5ms tick cadence" boot_rv.log || {
-            echo "FAILED: the ready queue did not run at the 5ms tick cadence in S-mode" >&2
+          # workload-oblivious. The demo runs at the tightened 2ms tick
+          # cadence (the sub-print-cost stress, 50x the original 100ms
+          # rate) and the 15/15 accounting must survive it — the
+          # per-tick preempt prints are batched into the driver's
+          # [TASK] preempt log instead of printed inline, and the
+          # lazy-save line is shortened, to keep the print path inside
+          # the slice budget.
+          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 2ms tick cadence" boot_rv.log || {
+            echo "FAILED: the ready queue did not run at the 2ms tick cadence in S-mode" >&2
             tail -30 boot_rv.log >&2
             exit 1
           }
@@ -413,8 +421,9 @@ jobs:
             tail -30 boot_rv_m.log >&2
             exit 1
           }
-          [ "$(grep -ac '\[FP\] lazy-save:' boot_rv_m.log)" -eq 3 ] || {
-            echo "FAILED: expected exactly 3 lazy-saves (A cold start, B, A reload)" >&2
+          # 18 total = the smoke's 3 + the demo's 15 per-slice lazy-saves.
+          [ "$(grep -ac '\[FP\] lazy-save:' boot_rv_m.log)" -eq 18 ] || {
+            echo "FAILED: expected exactly 18 lazy-saves (3 smoke + 15 demo slices)" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
@@ -423,9 +432,11 @@ jobs:
           # tick-handler rotation + FP owner rows, 15 per-slice
           # lazy-saves and 15 preemptions after the smoke's 3, plus the
           # fairness probe (all-heavy extreme with exact accounting),
-          # all at the tightened 5ms tick cadence.
-          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 5ms tick cadence" boot_rv_m.log || {
-            echo "FAILED: the ready queue did not run at the 5ms tick cadence in M-mode" >&2
+          # all at the tightened 2ms tick cadence (with the batched
+          # preempt log + shortened lazy-save line keeping the print
+          # path inside the slice budget).
+          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 2ms tick cadence" boot_rv_m.log || {
+            echo "FAILED: the ready queue did not run at the 2ms tick cadence in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
