@@ -55,10 +55,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define AGG_RATIO_MEASURED 1.0674   /* A64 35032 / RV64 32820, 2026-08-09 */
+#define AGG_RATIO_MEASURED 0.7713   /* A64 6735795 / RV64 8733529, 2026-08-10 — re-measured when lcg_fairness joined: its loop-dominated ratios (0.770) swamp the tiny-fixture corpus, so the aggregate now pins the loop codegen mix */
 #define AGG_RATIO_BAND     0.25     /* +/-25% tolerance on the aggregate */
-#define EXP_A64_MEASURED   13.5520  /* a64/interp over the shared 96, 2026-08-09 */
-#define EXP_RV64_MEASURED  12.6963  /* rv64/interp over the shared 96, 2026-08-09 */
+#define EXP_A64_MEASURED   3.7367   /* a64/interp over the shared 99, 2026-08-10 (same lcg_fairness re-measure) */
+#define EXP_RV64_MEASURED  4.8449   /* rv64/interp over the shared 99, 2026-08-10 (same lcg_fairness re-measure) */
 #define EXP_BAND           0.25     /* +/-25% tolerance on the expansion factors */
 
 struct Row {

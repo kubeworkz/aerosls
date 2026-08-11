@@ -120,6 +120,7 @@ static const struct Rv64Baseline RV64_BASELINES[] = {
     { "jmpr_mix.simi", 256, 4608 },
     { "jmpr_table.simi", 262, 5367 },
     { "jmpr_unreach.simi", 478, 8424 },
+    { "lcg_fairness.simi", 8700265, 91445308 },
     { "loadi64.simi", 221, 5043 },
     { "loop_sum.simi", 411, 7277 },
     { "mem_neg.simi", 297, 6351 },

@@ -119,6 +119,7 @@ static const struct FixtureBaseline BASELINES[] = {
     { "jmpr_mix.simi", 261, 6050 },
     { "jmpr_table.simi", 272, 4223 },
     { "jmpr_unreach.simi", 498, 8481 },
+    { "lcg_fairness.simi", 6700281, 80012240 },
     { "loadi64.simi", 239, 5524 },
     { "loop_sum.simi", 439, 7377 },
     { "mem_neg.simi", 294, 6010 },
