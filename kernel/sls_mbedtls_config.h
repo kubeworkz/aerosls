@@ -115,6 +115,23 @@ long long sls_mbedtls_time(long long *t);
  * requiring a struct tm we have no header for. Verified by nm, not assumed. */
 #define MBEDTLS_PLATFORM_GMTIME_R_ALT
 
+/* ZEROIZE_ALT: platform_util.c detects "platforms known to support
+ * explicit_bzero()" and calls it (line 98). On this toolchain gcc rewrites
+ * that to glibc's fortified __explicit_bzero_chk, which does not exist in a
+ * freestanding link -- and the detection has no idea it is building for one.
+ *
+ * I called this a host-gcc artefact that would not appear under the
+ * cross-compiler. That was a guess stated as a finding, and the build proved
+ * it wrong: it is the FIRST symbol the real linker complained about after the
+ * others were routed.
+ *
+ * So mbedtls_platform_zeroize() becomes ours. It has one job that memset
+ * cannot be trusted with -- the compiler may delete a memset over a buffer it
+ * can prove is dead, which is exactly how key material survives on a stack.
+ * The volatile pointer is what stops that, and it is the same construction
+ * kernel/sha256.c already uses for the same reason. */
+#define MBEDTLS_PLATFORM_ZEROIZE_ALT
+
 void sls_mbedtls_exit(int status);
 
 /* ─── 5. TLS 1.3 only, ephemeral only ──────────────────────────────────────

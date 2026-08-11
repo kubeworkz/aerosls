@@ -242,3 +242,20 @@ long long mbedtls_ms_time(void)
 {
     return (long long)(kernel_tick_counter * 10ull);
 }
+
+/* ─── 5. Zeroization ───────────────────────────────────────────────────────
+ * MBEDTLS_PLATFORM_ZEROIZE_ALT. See sls_mbedtls_config.h for why upstream's
+ * version cannot be used here.
+ *
+ * A plain memset() would be wrong, not merely different: a compiler is
+ * entitled to delete a store to memory it can prove nothing reads again, and
+ * a buffer being wiped just before it goes out of scope is precisely that
+ * case. Writing through a volatile pointer removes that licence. */
+void mbedtls_platform_zeroize(void *buf, size_t len);
+
+void mbedtls_platform_zeroize(void *buf, size_t len)
+{
+    if (!buf || len == 0) return;
+    volatile unsigned char *p = (volatile unsigned char *)buf;
+    while (len--) *p++ = 0;
+}
