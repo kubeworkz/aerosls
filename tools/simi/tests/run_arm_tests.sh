@@ -78,6 +78,14 @@ for src in *.simi; do
         # arm64_boot_smoke model ("a row no bench maintains would be a
         # lie").
         "$VERIFY" "$name.tmo" main "$expected"
+    elif [ "$name" = mem_touch ]; then
+        # §10.202: kernel-embedded EL0 mem fixture (the arm64 kernel's
+        # EL0 excursion is its real gate — translate with scratch =
+        # USER_SCRATCH_VA + execute + serial assert of 0x0d15ea5e). It
+        # still RUNS here (a few hundred A64 steps) but without the
+        # --steps baseline check: no committed row, the arm64_boot_smoke
+        # model.
+        "$VERIFY" "$name.tmo" main "$expected"
     else
         "$VERIFY" "$name.tmo" main "$expected" --steps
     fi

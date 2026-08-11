@@ -24,6 +24,17 @@ for src in *.simi; do
         echo "SKIP  $name (kernel-embedded LCG fixture — the arm64 kernel boot is its gate, plan doc §10.200)"
         continue
     fi
+    if [ "$name" = "mem_touch" ]; then
+        # §10.202: the mem-touch fixture is kernel-embedded (the arm64
+        # kernel's EL0 excursion carries its real gate — translate with
+        # scratch = USER_SCRATCH_VA + execute + serial assert of
+        # 0x0d15ea5e). It is EL0-only: its baked scratch is a user VA
+        # the kernel's TTBR1 tables do not map, so it has no host-parity
+        # shape at all — the ARM runner still executes it (a few hundred
+        # A64 steps) and the size gate pins its emission.
+        echo "SKIP  $name (kernel-embedded EL0 mem fixture — the arm64 kernel EL0 excursion is its gate, plan doc §10.202)"
+        continue
+    fi
     if [ "$name" = "arm64_boot_smoke" ]; then
         # M5.2 (plan doc §10.196): the kernel-embedded boot fixture is a
         # DELIBERATELY long-running loop (1e8 iterations, so a tick can
