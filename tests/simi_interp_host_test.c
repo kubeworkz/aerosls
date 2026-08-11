@@ -188,8 +188,24 @@ int main(void) {
     int loaded = 0;
     for (size_t i = 0; i < NCASES; i++) {
         SimiObject obj = {0};
+        /* A corpus program that cannot be read is a FAILURE, not a skip.
+         *
+         * This used to print "(skip: ...)" and continue. The .tmo files are
+         * build artifacts -- untracked, not gitignored, and produced by
+         * nothing -- so on a fresh clone every one was missing, all twenty
+         * cases skipped, and this test reported PASS having executed no SIMI
+         * program whatsoever. The interpreter could have been arbitrarily
+         * broken and this file would have said so cheerfully.
+         *
+         * That is the rule the guard scripts apply everywhere else, broken
+         * here: a check that examined nothing must not pass. tests/run_all.sh
+         * now assembles the corpus before running, so the files exist; this
+         * makes their absence say so instead of hiding it. */
         if (simi_obj_read(cases[i].file, &obj) != 0) {
-            printf("      (skip: cannot read %s)\n", cases[i].file);
+            CHECK(0, "corpus program is readable");
+            printf("      cannot read %s -- build it with tools/simi/simi-asm,\n"
+                   "      or run tests/run_all.sh which assembles the corpus first.\n",
+                   cases[i].file);
             continue;
         }
         loaded++;

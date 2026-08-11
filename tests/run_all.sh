@@ -32,6 +32,46 @@ cd "$(dirname "$0")/.."   # repo root, so each file's own -I paths (kernel, driv
 BIN_DIR="$(mktemp -d)"
 trap 'rm -rf "$BIN_DIR"' EXIT
 
+# ─── Build the SIMI corpus before anything runs it ──────────────────────────
+# simi_interp_host_test.c executes .tmo programs from tools/simi/tests. Those
+# are build artifacts: not tracked, not gitignored, and until now produced by
+# nothing. They existed only because somebody had run tools/simi's Makefile at
+# some point on that machine.
+#
+# On a fresh clone every one of them was therefore missing -- and the test
+# SKIPS a corpus program it cannot read, so the suite reported PASS having
+# executed no SIMI program at all. Twenty checks quietly not happening, in the
+# harness this project relies on to know whether anything works. That is the
+# rule the guards apply everywhere else -- a check that examined nothing must
+# not pass -- being broken by the runner that enforces it.
+#
+# Assembling here fixes the cause. simi_interp_host_test.c now FAILS rather
+# than skips when a program is missing, which fixes the symptom; the two go
+# together, since making absence loud without making the files exist would
+# simply turn every fresh clone red.
+#
+# Failure to build the assembler is reported and not fatal: it means no host
+# toolchain, which is a different problem from a broken kernel, and the other
+# 89 tests still have something to say.
+if [ -d tools/simi ]; then
+    if make -C tools/simi simi-asm >/dev/null 2>&1; then
+        built=0
+        for src in tools/simi/tests/*.simi; do
+            [ -f "$src" ] || continue
+            out="${src%.simi}.tmo"
+            if [ ! -f "$out" ] || [ "$src" -nt "$out" ]; then
+                tools/simi/simi-asm "$src" "$out" >/dev/null 2>&1 && built=$((built + 1))
+            fi
+        done
+        [ "$built" -gt 0 ] && echo "corpus: assembled $built SIMI program(s)"
+    else
+        echo "corpus: WARNING -- could not build tools/simi/simi-asm."
+        echo "        Any SIMI program not already assembled will be reported"
+        echo "        as a failure below rather than skipped, which is correct:"
+        echo "        a corpus that cannot be read has not been tested."
+    fi
+fi
+
 pass=0
 fail=0
 skip=0
