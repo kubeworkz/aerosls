@@ -43,7 +43,7 @@ command beside it is a number nobody can re-check.
 | `gen_insn_end_off[TCG_MAX_INSNS]` fixed array | Cross-ISA §2 | **Confirmed**, `tcg.h:436` — line number still exact | `sed -n 436p ../qemu/include/tcg/tcg.h` |
 | QEMU has TCG backends for ARM64 and RISC-V | Cross-ISA §2 | **Both present**: `tcg/aarch64/`, `tcg/riscv64/` | `ls -d ../qemu/tcg/aarch64 ../qemu/tcg/riscv64` |
 | AeroSLS has a working RISC-V port | Cross-ISA §2 | **Present**: `arch/riscv/` — boot, traps, PLIC, SBI, page-table walker | `ls arch/riscv/` |
-| AeroSLS on ARM64 does not exist | Cross-ISA §4 | **Confirmed absent.** `arch/` contains `riscv` and `x86` only; zero `aarch64`/`arm64` matches in any source file | `ls arch/; grep -rli 'aarch64\|arm64' --include=*.c --include=*.h .` |
+| ~~AeroSLS on ARM64 does not exist~~ | Cross-ISA §4 | **NO LONGER TRUE — superseded 2026-08-06.** `arch/arm64/` exists: `boot_arm64.S`, `gic.{c,h}`, `mmu.{c,h}`, `uart_pl011.{c,h}`, `linker_arm64.ld`. `make arm64-elf` and `arm64-run` are targets, and `all` builds it. A `simi_arm.c` backend of 3,902 lines exists host-side and kernel-side, byte-identity enforced by `arm_kernel_copy_rediff_check.sh`. | `ls arch/arm64/; grep -nE '^(all\|arm64-elf):' Makefile` |
 | Kernel links 15 objects from `../qemu` | `boot.asm`, deploy.sh | **15** (`tci.x86.o` is deliberately excluded, in a comment) | `sed -n '145,160p' Makefile` |
 | `QEMU_GUEST_RAM_PAGES` = 65,536 = 256 MiB | Cross-ISA §6 | **65536U**, `kernel/qemu_sls_mmu.h:74` → 256 MiB exactly | `grep -n QEMU_GUEST_RAM_PAGES kernel/qemu_sls_mmu.h` |
 | GPA window at 32 TiB | Guest-Address-Space | **`0x200000000000`** = 32 TiB, `qemu_sls_mmu.h:70` | `grep -n QEMU_GPA_HOST_BASE kernel/qemu_sls_mmu.h` |
@@ -56,6 +56,39 @@ command beside it is a number nobody can re-check.
 | x86 guest frontend is minimal | Cross-ISA §4 | **18 case labels**; `0x8B`/`0x89` + ModRM as described | `grep -cE 'case 0x[0-9A-Fa-f]+:' ../qemu/sls/sls-x86-frontend.c` |
 | 89 host test files | session record | **89** | `ls tests/*_host_test.c \| wc -l` |
 | Stack is 1 MiB | `boot.asm` | **1,048,576 bytes**, read from the linked binary | `tests/stack_frame_budget_check.sh` |
+
+---
+
+## 1b. This document went stale, in six days, on its most important row
+
+**Recorded 2026-08-05 as verified: "AeroSLS on ARM64 does not exist — confirmed
+absent." Untrue by 2026-08-06.**
+
+An ARM64 port landed: `arch/arm64/` with boot, GIC, MMU, PL011 UART and its own
+linker script; `arm64-elf` and `arm64-run` targets; `all` building it alongside
+x86 and RISC-V. RISC-V grew to 18 files and four build variants. Six new guard
+scripts arrived with them.
+
+That row was not wrong when written — it was checked, with the command beside
+it, and the command still reproduces the check. It went stale because the world
+moved, which is the exact failure this document was created to catch. It is
+worth stating plainly rather than quietly editing:
+
+**The document written to catch stale claims went stale first, and on the single
+row with the most strategic weight in it.** Cross-ISA's whole repositioning
+turns on x86-64 guests running on non-x86 hosts, and "no ARM64 port exists" was
+the sentence standing between the technique and the market.
+
+Two things follow.
+
+**The rule this document proposes survives the embarrassment intact.** Every row
+here carries the command that reproduces it, so this took one command to detect
+and one to correct. A row asserting "ARM64 does not exist" with no command
+beside it would have been argued about instead.
+
+**Nothing here should be read as current without re-running it.** The header
+says each section carries its own date; treat those dates as the claim, not the
+prose. A verification document is a photograph, not a mirror.
 
 ---
 

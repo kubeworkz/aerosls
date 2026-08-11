@@ -151,8 +151,8 @@ identified — it was simply pointed at a market that KVM already owned.
 | Shadow page tables (RISC-V host, Sv39/Sv48) | **Does not exist.** `arch/riscv/walk_page_tables_riscv.c` is the starting point. |
 | TCG backend for RISC-V host | **Exists in QEMU** — `tcg/riscv64/`. Not yet built for `SLS_IN_KERNEL`. |
 | TCG backend for ARM64 host | **Exists in QEMU** — `tcg/aarch64/`. |
-| AeroSLS on RISC-V | **Exists.** `arch/riscv/`, target `riscv-elf`. Not integrated with `sls/`. |
-| AeroSLS on ARM64 | **Does not exist.** |
+| AeroSLS on RISC-V | **Exists.** `arch/riscv/` — 18 files, four build variants (`riscv-elf` builds M-mode and echo forms), vector state. Not integrated with `sls/`. |
+| AeroSLS on ARM64 | **EXISTS as of 2026-08-06.** `arch/arm64/`: `boot_arm64.S`, GIC, MMU, PL011 UART, own linker script. Targets `arm64-elf` and `arm64-run`; `all` builds it. Not integrated with `sls/`. |
 
 Two of the three hard pieces are already in the tree. That is the argument for
 repositioning rather than abandoning.
@@ -580,9 +580,26 @@ under `SLS_IN_KERNEL`) and produce the A/B.
 x86 — not as a product, but because it is the **only way to validate the shadow
 paging design before porting it to a second architecture.**
 
-**Step 4 — Decide the host architecture.** RISC-V (a port exists) or ARM64 (none
-does, but hardware is far easier to obtain and the guest ecosystem is larger).
-*Gate:* an explicit decision, recorded, with hardware on hand.
+**Step 4 — Decide the host architecture.** ~~RISC-V (a port exists) or ARM64
+(none does, but hardware is far easier to obtain and the guest ecosystem is
+larger).~~
+
+**Re-scoped 2026-08-06: the premise of this step is gone.** It was a choice
+between one port that existed and one that did not. Both now exist —
+`arch/arm64/` landed with boot, GIC, MMU and UART, and RISC-V grew to four
+build variants. There is also a `simi_arm.c` backend of 3,902 lines, host and
+kernel copies held byte-identical by `arm_kernel_copy_rediff_check.sh`.
+
+So this is no longer "which port do we write". What remains of the decision is
+narrower and still real: **which host gets shadow paging first**, since Step 5
+ports it to one of them and `arch/riscv/walk_page_tables_riscv.c` is the only
+starting point that exists for either.
+
+*Gate, unchanged in substance:* an explicit decision, recorded, with hardware on
+hand. §4's scope note still stands — a port under emulation is fine for
+correctness and useless for performance, and no timing claim is publishable
+without real non-x86 silicon. Having both ports does not change that; it moves
+the constraint from software to a purchase order.
 
 **Step 5 — Port shadow paging to the chosen host.** Sv39/Sv48 or ARM64 long-format
 descriptors. `arch/riscv/walk_page_tables_riscv.c` is the starting point on that
