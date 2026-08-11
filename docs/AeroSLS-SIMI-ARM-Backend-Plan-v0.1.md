@@ -8045,6 +8045,53 @@ Design decisions:
   discipline as the FP/SIMD and RV64 fp-save gates: a claim backed by
   a deliberately broken attempt that must fail loudly.
 
+### 10.204 M5.8 as built: the EL1h backstop reports the taking-EL from SPSR — the EL0-future distinction stays honest
+
+§10.203's handler assumed the fault was EL1-originated (the slot
+*is* the same-EL backstop), so its verdict hard-coded "from EL1".
+True for every committed gate — but a claim about the hardware's
+SPSR made without reading it. This change makes the report read
+SPSR_EL1: boot_arm64.S arm64_sync_el1h now also does
+`mrs x2, spsr_el1` and passes it to arm64_sync_el1h_c, which decodes
+M[3:0] (arm64_print_spsr_el: EL0t/EL1t/EL1h/EL2t/EL2h/EL3t/EL3h)
+and prints `-- taken from <EL>` on the [SYNC] report line. Booted on
+real A64, the teeth fault now reads:
+
+    [SYNC] EL1h synchronous exception: esr=0x0000000096000044
+      ec=0x0000000000000025 far=0x0000000010005000
+      spsr=0x00000000600003c5 -- taken from EL1h (M=0x5, current EL, SP_EL1)
+    [SYNC] Data Abort from EL1h (current EL, SPSR M=0x5): ... (teeth PASS)
+    [SYNC] unhandled -- halting (the hang is the teeth: rc=124)
+
+The verdicts are EL-aware instead of slot-assuming:
+- **EC=0x25 AND M=0x5** (same-EL Data Abort taken from EL1h): the
+  teeth PASS. BOTH conditions are required — a drift in SP selection
+  or routing that changes the taking-EL fails the gate rather than
+  passing silently.
+- **EC=0x24** (lower-EL Data Abort): the canonical EL0-originated
+  abort encoding. If a future EL0-fault path ever delivers one to
+  this backstop, the report line names the taking EL (`taken from
+  EL0t (M=0x0, lower EL, AArch64)`) and the verdict says so
+  explicitly — no teeth verdict, but the honest story is on the log.
+  Today a lower-EL fault goes to VBAR+0x400, so this branch is
+  reachable only if routing changes.
+- **EC=0x25 with M != 0x5**: same-EL encoding but a foreign
+  taking-EL — an inconsistency hardware cannot produce; FAIL.
+- **Any other EC**: the existing mismatch FAIL.
+
+CI's teeth step gained three asserts: `-- taken from EL1h (M=0x5,
+current EL, SP_EL1)` (the SPSR-derived report), the negative `taken
+from EL0t` (the EL0-future line must NOT appear), and the verdict's
+`Data Abort from EL1h (current EL, SPSR M=0x5)`. One LATENT BUG
+surfaced and was fixed in the same step: the old `grep "ec=0x25"`
+never matched the real log — print_u64 pads to 16 hex digits, so the
+line carries `ec=0x0000000000000025` (the far grep already used the
+padded form, which is why only EC was broken). The EC assert now
+uses the padded form, with a comment recording the pitfall. The
+stock boot never faults, so it is untouched (re-verified: rc=0,
+MISS=3, HIT=6, ticks=6, mem EL0=2, ordered stream exact) and both
+ELFs re-censused clean.
+
 ---
 
 

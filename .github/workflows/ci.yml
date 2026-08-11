@@ -910,12 +910,17 @@ jobs:
           # far=0x10005000 and halts — so qemu must HANG (rc=124 from
           # the timeout), the log must carry the [TEETH] attempt + the
           # [SYNC] lines, and must NOT carry a mem_touch result line or
-          # a [TEETH] FAIL line. If the fault does not fire, the kernel
-          # prints [TEETH] FAIL and the grep below fails; if it faults
-          # at the wrong VA or class, the [SYNC] line changes and the
-          # ec/far greps fail; if it completes, rc is 0 and the boot
-          # check fails. The teeth ELF is censused like the stock one
-          # (same sources + one -D — the M5 FP/SIMD zero-claim holds).
+          # a [TEETH] FAIL line. §10.204: the handler ALSO reports the
+          # taking-EL from SPSR_EL1 M[3:0] — the teeth fault is taken
+          # from EL1h (M=0x5), and an EL0-originated abort reaching
+          # this backstop (M=0x0/EC=0x24, the future path) would print
+          # "taken from EL0t" instead, which the greps below reject. If
+          # the fault does not fire, the kernel prints [TEETH] FAIL and
+          # the grep below fails; if it faults at the wrong VA, class,
+          # or taking-EL, the [SYNC] line changes and the greps fail;
+          # if it completes, rc is 0 and the boot check fails. The
+          # teeth ELF is censused like the stock one (same sources +
+          # one -D — the M5 FP/SIMD zero-claim holds).
           make arm64-teeth
           bash tools/simi/tests/arm64_fp_census.sh sls_arm64_kernel_teeth.elf || {
             echo "FAILED: the teeth ELF contains FP/SIMD instructions (the census above prints them)" >&2
@@ -952,7 +957,10 @@ jobs:
             tail -30 arm64_teeth.log >&2
             exit 1
           }
-          grep -a "ec=0x25" arm64_teeth.log || {
+          # print_u64 pads to 16 hex digits, so the EC asserts use the
+          # padded form (ec=0x0000000000000025) — the unpadded "ec=0x25"
+          # grep silently never matched (§10.204).
+          grep -a "ec=0x0000000000000025" arm64_teeth.log || {
             echo "FAILED: the fault was not a Data Abort from current EL (EC=0x25)" >&2
             tail -30 arm64_teeth.log >&2
             exit 1
@@ -962,8 +970,23 @@ jobs:
             tail -30 arm64_teeth.log >&2
             exit 1
           }
-          grep -a "Data Abort from EL1" arm64_teeth.log || {
-            echo "FAILED: the sync handler did not identify the Data Abort" >&2
+          # §10.204: the handler reports the ACTUAL taking-EL from SPSR_EL1's
+          # M[3:0] (not the slot). The teeth fault is taken from EL1h
+          # (M=0x5): assert the report names EL1h AND that it does NOT name
+          # EL0t — an EL0-originated abort (M=0x0, EC=0x24) reaching this
+          # backstop would print "taken from EL0t" and must fail the teeth.
+          grep -a -e "-- taken from EL1h (M=0x5, current EL, SP_EL1)" arm64_teeth.log || {
+            echo "FAILED: the sync handler did not report the taking-EL as EL1h from SPSR" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -aq "taken from EL0t" arm64_teeth.log && {
+            echo "FAILED: the sync handler reported an EL0-originated abort — the teeth fault must be taken from EL1h" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "Data Abort from EL1h (current EL, SPSR M=0x5)" arm64_teeth.log || {
+            echo "FAILED: the sync handler did not identify the Data Abort with its SPSR taking-EL" >&2
             tail -30 arm64_teeth.log >&2
             exit 1
           }
@@ -982,7 +1005,7 @@ jobs:
             tail -30 arm64_teeth.log >&2
             exit 1
           }
-          echo "OK: teeth — mem_touch at EL1 faulted (EC=0x25 Data Abort, far=0x10005000) and hung (rc=124): the EL0-only-by-construction claim is machine-checked"
+          echo "OK: teeth — mem_touch at EL1 faulted (EC=0x25 Data Abort taken from EL1h, SPSR M=0x5, far=0x10005000) and hung (rc=124): the EL0-only-by-construction claim is machine-checked, and the backstop reports the taking-EL honestly"
 
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |
