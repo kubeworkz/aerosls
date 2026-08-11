@@ -896,6 +896,94 @@ jobs:
           }
           echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2+M5.3 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + contention-probe GIC ticks [TICK 1..4] interleaved with the EL0 excursions + nested virtual-timer IRQ ([TICK 5] window, [TICK 6] preempts the physical handler) + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
 
+      - name: Teeth — the mem_touch EL0-only claim is machine-checked, not asserted (plan doc §10.203)
+        run: |
+          # §10.203: the stock boot asserts mem_touch returns its tooth
+          # 0x0d15ea5e twice from EL0 — but the "EL0-only by
+          # construction" property (its baked scratch is
+          # USER_SCRATCH_VA, unmapped in TTBR1) was only CLAIMED in the
+          # §10.202 design notes, never exercised. This teeth build
+          # (-DARM64_TEETH_EL1_MEMTOUCH, make arm64-teeth) attempts to
+          # run the fixture at EL1 with the SAME baked scratch: the
+          # first STORE faults, the new EL1h sync slot (boot_arm64.S
+          # arm64_sync_el1h) prints the Data Abort (EC=0x25) with
+          # far=0x10005000 and halts — so qemu must HANG (rc=124 from
+          # the timeout), the log must carry the [TEETH] attempt + the
+          # [SYNC] lines, and must NOT carry a mem_touch result line or
+          # a [TEETH] FAIL line. If the fault does not fire, the kernel
+          # prints [TEETH] FAIL and the grep below fails; if it faults
+          # at the wrong VA or class, the [SYNC] line changes and the
+          # ec/far greps fail; if it completes, rc is 0 and the boot
+          # check fails. The teeth ELF is censused like the stock one
+          # (same sources + one -D — the M5 FP/SIMD zero-claim holds).
+          make arm64-teeth
+          bash tools/simi/tests/arm64_fp_census.sh sls_arm64_kernel_teeth.elf || {
+            echo "FAILED: the teeth ELF contains FP/SIMD instructions (the census above prints them)" >&2
+            exit 1
+          }
+          if timeout 30 qemu-system-aarch64 -M virt,virtualization=on \
+             -cpu cortex-a53 -m 1G -kernel sls_arm64_kernel_teeth.elf \
+             -nographic -serial file:arm64_teeth.log -no-reboot; then
+            echo "FAILED: the teeth boot EXITED (rc=0) — mem_touch must fault and HANG at EL1, not complete" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          else
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+              echo "OK: qemu timed out (rc=124) — the mem_touch EL1 attempt hung, as the EL0-only claim requires"
+            else
+              echo "FAILED: the teeth boot exited early (rc=$rc) — expected the timeout hang (rc=124)" >&2
+              tail -30 arm64_teeth.log >&2
+              exit 1
+            fi
+          fi
+          grep -a "AeroSLS ARM64 Node Kernel Online!" arm64_teeth.log || {
+            echo "FAILED: teeth boot banner not seen" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "\[TEETH\] attempting mem_touch at EL1 (baked scratch=USER_SCRATCH_VA 0x10005000" arm64_teeth.log || {
+            echo "FAILED: the teeth attempt line not seen — the variant did not run" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "\[SYNC\] EL1h synchronous exception" arm64_teeth.log || {
+            echo "FAILED: no EL1h synchronous exception — mem_touch did not fault at EL1 (the EL0-only claim is false, or the fault path is broken)" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "ec=0x25" arm64_teeth.log || {
+            echo "FAILED: the fault was not a Data Abort from current EL (EC=0x25)" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "far=0x0000000010005000" arm64_teeth.log || {
+            echo "FAILED: the faulting VA was not the baked USER_SCRATCH_VA 0x10005000" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "Data Abort from EL1" arm64_teeth.log || {
+            echo "FAILED: the sync handler did not identify the Data Abort" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -a "unhandled -- halting" arm64_teeth.log || {
+            echo "FAILED: the sync handler did not halt after the fault" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -aq "\[TEETH\] FAIL" arm64_teeth.log && {
+            echo "FAILED: [TEETH] FAIL present — the attempt completed or errored instead of faulting" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          grep -aq "mem touch) -- user result" arm64_teeth.log && {
+            echo "FAILED: a mem_touch result line is present — the EL1 run must NEVER complete" >&2
+            tail -30 arm64_teeth.log >&2
+            exit 1
+          }
+          echo "OK: teeth — mem_touch at EL1 faulted (EC=0x25 Data Abort, far=0x10005000) and hung (rc=124): the EL0-only-by-construction claim is machine-checked"
+
       - name: Kernel copy compiles under aarch64 freestanding flags (M2 gate)
         run: |
           # The kernel half of M3 (plan doc §6): kernel/simi_arm.c is a
