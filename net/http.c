@@ -247,11 +247,36 @@ static int api_scan(char* body, int max) {
     return j.pos;
 }
 
+/* The architecture this kernel was COMPILED for, taken from the compiler's own
+ * target macros rather than a build variable or a literal.
+ *
+ * The distinction is the whole point. A -DARCH="x86-64" passed by the Makefile
+ * says what the build system intended; __x86_64__ says what the compiler
+ * actually targeted, and only the second one cannot drift. This file is in
+ * X86_C_SRC alone today -- the arm64 and RISC-V kernels are minimal and carry
+ * no HTTP server -- so a literal "x86-64" would be correct right now and would
+ * become a lie, silently and on the wrong screen, the first time net/http.c
+ * joins another target's source list.
+ *
+ * The #error is deliberate. A fourth architecture should fail to build here
+ * rather than report "unknown" to a status bar whose entire job is to say what
+ * it is running on. */
+#if   defined(__x86_64__)
+#  define SLS_ARCH_NAME "x86-64"
+#elif defined(__aarch64__)
+#  define SLS_ARCH_NAME "arm64"
+#elif defined(__riscv) && (__riscv_xlen == 64)
+#  define SLS_ARCH_NAME "riscv64"
+#else
+#  error "net/http.c: unrecognised target architecture -- add it to SLS_ARCH_NAME above rather than letting /api/health report a guess."
+#endif
+
 static int api_health(char* body, int max) {
     JSONBuf j = { body, 0, max };
     jb_obj_open(&j, 0);
     jb_str(&j,  "status",       "ok");                     jb_putc(&j, ',');
     jb_str(&j,  "system",       "AeroSLS 4.0");             jb_putc(&j, ',');
+    jb_str(&j,  "arch",         SLS_ARCH_NAME);            jb_putc(&j, ',');
     jb_uint(&j, "uptime_ticks", kernel_tick_counter);       jb_putc(&j, ',');
     jb_uint(&j, "object_count", object_catalog_count);
     jb_obj_close(&j);
