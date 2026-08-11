@@ -18,7 +18,7 @@
 #   3. line endings    — no committed text blob may contain a CR byte
 #      (binary-marked files are skipped: a PNG or PDF legitimately has CR).
 #
-# It inspects the INDEX (git ls-files -s -- . ':(exclude)vendor' / git cat-file -p :<path> /
+# It inspects the INDEX (git ls-files -s -z / git cat-file -p :<path> /
 # git grep --cached), not the working tree — on a Linux checkout the
 # `eol=lf` attribute would hide a CRLF blob by converting it on the way
 # out, and the executable bit is a property of the committed mode, not the
@@ -38,6 +38,15 @@ set -u
 cd "$(dirname "$0")/.."   # repo root, so the git index paths resolve
 
 # ─── vendor/ is exempt, deliberately ───────────────────────────────────────
+# NOTE ON THE PATHSPEC, because getting it wrong here is silent: every option
+# must come BEFORE the `--`. Everything after `--` is a pathspec, so
+#     git ls-files -s -- . ':(exclude)vendor' -z      <-- WRONG
+# passes `-z` as a PATH to match, not as an option. The output is then
+# newline-separated, the `read -d ''` loop consumes nothing, and the guard
+# reports "0 violations" while inspecting no files at all. That is exactly what
+# this file did when vendor/ was first excluded, and it is the failure mode a
+# guard is least able to notice about itself: passing is what it looked like.
+# tests/script_conventions_smoke.sh caught it -- two teeth stopped biting.
 # vendor/ holds third-party source vendored verbatim (see its PROVENANCE.txt).
 # 356 files under vendor/mbedtls contain CR bytes, and normalising them would
 # make the tree differ from upstream -- which breaks the two things vendoring
@@ -66,7 +75,7 @@ while IFS= read -r -d '' entry; do
                 ;;
         esac
     fi
-done < <(git ls-files -s -- . ':(exclude)vendor' -z)
+done < <(git ls-files -s -z -- . ':(exclude)vendor')
 
 # 3. line endings — one git grep over the index blobs for a CR byte, then
 # check the binary attribute only for the files it hit (usually none).
