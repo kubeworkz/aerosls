@@ -53,6 +53,13 @@ X86_LD      = x86_64-elf-ld
 # accepting a cache whose provenance cannot be established.
 AEROSLS_BUILD_ID := $(shell git rev-parse --short=12 HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)
 
+# Build time in Unix seconds, the floor kernel/rtc.c refuses to believe a clock
+# below. Taken from the commit date when there is one, so a reproducible build
+# of an old commit gets that commit's floor rather than today's -- using the
+# wall clock here would make the binary unreproducible AND would raise the
+# floor above times that commit could legitimately see.
+SLS_BUILD_EPOCH := $(shell git log -1 --format=%ct 2>/dev/null || date -u +%s)
+
 # ─── SLS_SOFTMMU: the A/B knob for the Cross-ISA §5c measurement ─────────────
 # The headline number -- 86 bytes of host code per guest load with QEMU's
 # software MMU, 16 without, a 5.41x ratio -- comes from building the same
@@ -115,12 +122,18 @@ SLS_STAMP := .sls-frontend.stamp
 # `make clean && make x86-iso` completely. Caught by a scratch-directory
 # reproduction of this exact logic, not by reading it.
 $(shell v='$(AB_DEFS)';  [ -f $(AB_STAMP) ]  && [ "$$(cat $(AB_STAMP))"  = "$$v" ] || printf '%s' "$$v" > $(AB_STAMP))
-$(shell v='$(AEROSLS_BUILD_ID)'; [ -f $(BID_STAMP) ] && [ "$$(cat $(BID_STAMP))" = "$$v" ] || printf '%s' "$$v" > $(BID_STAMP))
+$(shell v='$(AEROSLS_BUILD_ID):$(SLS_BUILD_EPOCH)'; [ -f $(BID_STAMP) ] && [ "$$(cat $(BID_STAMP))" = "$$v" ] || printf '%s' "$$v" > $(BID_STAMP))
 
 # Objects whose translation unit pulls in the identity function.
+# kernel/rtc.x86.o is here for SLS_BUILD_EPOCH, not AEROSLS_BUILD_ID. Same
+# hazard: the epoch is baked in at compile time and is the floor below which
+# rtc.c refuses to believe a clock. Without this dependency a commit moves the
+# floor, rtc.c is not recompiled, and the kernel silently keeps an older one --
+# which is the permissive direction, so nothing would ever look wrong.
 BUILD_ID_OBJS = kernel/checkpoint_mgr.x86.o kernel/kernel.x86.o \
                 kernel/qemu_sls_mmu.x86.o kernel/qemu_sls_pgo.x86.o \
-                kernel/qemu_sls_tcache.x86.o kernel/qemu_sls_vm.x86.o
+                kernel/qemu_sls_tcache.x86.o kernel/qemu_sls_vm.x86.o \
+                kernel/rtc.x86.o
 $(BUILD_ID_OBJS): $(BID_STAMP)
 
 X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
@@ -128,7 +141,7 @@ X86_CFLAGS  = -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone \
               -fno-pie -fno-pic -fno-tree-vectorize \
               -Wframe-larger-than=16384 \
               $(AB_DEFS) \
-              -DAEROSLS_BUILD_ID='"$(AEROSLS_BUILD_ID)"'
+              -DAEROSLS_BUILD_ID='"$(AEROSLS_BUILD_ID)"' -DSLS_BUILD_EPOCH=$(SLS_BUILD_EPOCH)ull
 X86_LDFLAGS = -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments
 
 X86_ASM_SRC = arch/x86/boot.asm arch/x86/interrupt.asm arch/x86/switch_lazy.asm arch/x86/syscall.asm arch/x86/vector_crypto.asm arch/x86/process_enter.asm
@@ -179,7 +192,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/row_constraint.c \
               kernel/row_journal.c \
               kernel/vecstore.c \
-              kernel/vec_index.c kernel/sha256.c kernel/entropy.c \
+              kernel/vec_index.c kernel/sha256.c kernel/entropy.c kernel/rtc.c \
               kernel/vec_join.c \
               kernel/agent.c \
               kernel/agent_tools.c \
