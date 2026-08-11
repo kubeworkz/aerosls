@@ -32,8 +32,17 @@ found and fixed during verification: the fixture's identity mapping wrote
 TEST_GVA 0x400000 share PT index 0), so the load resolved to GPA 0 instead of
 GPA 0x5000 — `EAX=0x001000bb`, the program's own first bytes. Fixed by giving
 the identity mapping its own PT page (`PT2_GPA`, `sls-launcher.c`), the same
-choice a real boot loader makes. The §3.2 invalidation policy (CR3/invlpg
-handling, guest-PT-page write-protect trapping) remains the outstanding M2 work.
+choice a real boot loader makes.
+
+**Update 2026-08-11: the §3.2 invalidation policy is LANDED too** — CR3 reload
+and `INVLPG` drop the populated shadow subtree / single PTE (kernel API +
+C-dispatcher wiring), and guest stores to the guest's own page-table pages
+fault and drop the subtree (table-page marks + install-time read-only mapping).
+One prerequisite defect was found and fixed during verification: CR0.WP was
+clear, so the write-protect traps never fired on real hardware — the launcher
+now sets it around guest execution. Verified on both builds by the new `qemu
+invl` fixture (res = A B C D), with `qemu paging` and the bench still passing;
+see §3.2 for the details.
 
 ---
 
@@ -198,16 +207,41 @@ permission-fault path in `shadow_fault()` (error_code bits 1+2) bumps the physic
 page's tcache generation, flushes the page's TBs, and reinstalls writable. The M2
 policy for guest-owned page tables, in three tiers:
 
-1. **CR3 write and `invlpg`** — already intercepted in the C dispatcher (MOV CR3). On
-   CR3 write: drop the guest window's populated subtree (the enable path already does
-   this via the slot zero + stash mechanism) so the next accesses repopulate from the
-   new root. This is the gate's primary path: the M2 fixture sets its tables up once
-   and runs.
-2. **Guest writes to its own page-table pages** — the honest gap, stated rather than
-   hidden: a guest that edits a live PT page in place without `invlpg` will not be
-   noticed by tier 1. The existing write-protect/generation machinery is the natural
-   follow-up (write-protect guest PT pages, trap the store, bump generation, rewalk).
-   Out of M2's scope; recorded here so it is a named gap, not a surprise.
+1. **CR3 write and `invlpg`** — **LANDED 2026-08-11.** The C dispatcher's MOV CR3
+   handler calls `qemu_sls_mmu_shadow_cr3_reload()` when paging is already on, which
+   zeroes the guest window's populated subtree and flushes the TLB so the next
+   accesses repopulate from the new root. `INVLPG` (0F 01 /7) is now decoded in the
+   dispatcher and calls `qemu_sls_mmu_shadow_invlpg()`, which walks the shadow's own
+   host tables and drops the one page's PTE (no-op if the page has none). Both are
+   no-ops while paging is off, where hardware ignores CR3. The decoder build's
+   `flush_page` helper stub still halts -- the decoder is not wired into execution
+   yet, so that call site is the M3 wiring point, not reachable today.
+2. **Guest writes to its own page-table pages** — **LANDED 2026-08-11.**
+   `guest_walk()` marks every page the guest's CURRENT tables use as a table (one
+   byte per guest page, cleared at paging enable/reset); `shadow_install()` maps any
+   marked frame PRESENT-without-WRITE, so a store to it faults; the permission path
+   resolves the write's GPA, sees a marked table page, and drops the whole populated
+   subtree (every leaf was derived from the pre-store tables) before reinstalling the
+   page writable so the store lands. A second store to the same page is SILENT from
+   then on — exactly hardware semantics, where a guest that edits a table it has
+   already translated must flush the affected translations itself (INVLPG / CR3
+   reload). The first store after every drop always traps, which is the guarantee:
+   no stale leaf can be served past an edit nobody noticed.
+
+   **One prerequisite defect found and fixed while implementing this:** CR0.WP was
+   clear, so CPL-0 stores to read-only supervisor pages succeeded and the
+   write-protect trap — this one AND the pre-existing code-page self-modifying trap —
+   never fired on real hardware. `sls-launcher.c` now sets CR0.WP (bit 16) around
+   guest execution and restores it after. This is what made tier 2 observable, and it
+   means the code-page trap (tier 3) now works on real hardware for the first time.
+
+   Verified on hardware, both builds: the new `qemu invl` fixture (POST
+   `/api/qemu/invl`) has the guest edit its PT page in place, execute `INVLPG`, and
+   reload CR3, storing a distinct magic after each phase; all four must read back
+   correct, and each stage can only pass if the invalidation before it actually
+   dropped the stale translation. res = A B C D on both the default and
+   `SLS_X86_FRONTEND=on` builds; the paging fixture still passes on both. The 107
+   host-test checks (including the reworked `test_shadow_install` signature) pass.
 3. **Self-modifying guest code** — already handled (generation bump + tcache flush),
    independent of paging.
 
@@ -254,9 +288,10 @@ The code has moved past its own documentation, and this project's rule is that
 
 ### Deferred (named gaps, not surprises)
 
-- Guest PT-page write-protect trapping (invalidation tier 2, §3.2).
 - Page-table reclaim walk at guest reset (pre-existing; recorded in the reset-defect
   doc — the paged subtree is stashed, not freed).
+- The decoder build's `flush_page` helper stub still halts (the decoder is not wired
+  into execution; `INVLPG` under the real decoder is the M3 wiring point).
 - MMIO regions (SCOPE.h CATEGORY 9: no devices in scope).
 
 ---
