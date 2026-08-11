@@ -54,9 +54,9 @@ struct RvTask {
                                       (only runnable-task preemptions count) */
     volatile uint64_t work_done;   /* total integer-work iterations this
                                       task executed across all slices
-                                      (the fairness probe: one task's
-                                      per-slice budget is 10x the
-                                      others', yet the scheduler still
+                                      (the fairness probe: two tasks'
+                                      per-slice budgets are 10x the
+                                      third's, yet the scheduler still
                                       grants equal slices — written by
                                       the task, read by the demo driver) */
     uint64_t lcg_acc;      /* the accumulated LCG work state — a
