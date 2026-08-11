@@ -52,6 +52,18 @@ struct RvTask {
     volatile uint64_t preemptions; /* how many times the tick-handler
                                       scheduler has preempted this task
                                       (only runnable-task preemptions count) */
+    volatile uint64_t work_done;   /* total integer-work iterations this
+                                      task executed across all slices
+                                      (the fairness probe: one task's
+                                      per-slice budget is 10x the
+                                      others', yet the scheduler still
+                                      grants equal slices — written by
+                                      the task, read by the demo driver) */
+    uint64_t lcg_acc;      /* the accumulated LCG work state — a
+                              deterministic function of work_done, so
+                              the work provably ran its iterations (the
+                              Phase 9l discipline: an observable result
+                              that depends on the budget) */
     uint64_t ctx[32];      /* preemptive-resume image: trap_frame[TF_RA..
                               TF_SEPC], the full 31 GPRs + sepc. Fabricated
                               at rv_task_init (sepc=entry, sp=stack top,
