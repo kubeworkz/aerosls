@@ -116,10 +116,32 @@ scanned=0
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
-for f in kernel/*.c net/*.c user/*.c arch/x86/*.c; do
+# Vendored sources are scanned too, but ONLY the ones actually linked --
+# detected by the presence of the object the Makefile built, so the list
+# tracks MBEDTLS_SRC without duplicating it here.
+#
+# This scope gap was real and would have widened silently: the first build to
+# link mbedTLS reported "109 file(s) scanned, every frame within budget" while
+# scanning none of the vendored code. mbedTLS's bignum and ECP paths are
+# exactly where large stack frames live, so a green result that excluded them
+# was answering a different question than the one it appeared to answer.
+#
+# Vendored files get the mbedTLS include path and config define, because that
+# is how the Makefile compiles them; scanning them under different flags would
+# measure frames the build never produces -- the same trap that broke the
+# tls_platform.c include path.
+VENDOR_SCAN=""
+for o in vendor/mbedtls/library/*.x86.o; do
+    [ -f "$o" ] || continue
+    VENDOR_SCAN="$VENDOR_SCAN ${o%.x86.o}.c"
+done
+VENDOR_FLAGS="-I vendor/mbedtls/include -I vendor/mbedtls/library -I kernel -DMBEDTLS_USER_CONFIG_FILE='\"sls_mbedtls_config.h\"'"
+
+for f in kernel/*.c net/*.c user/*.c arch/x86/*.c $VENDOR_SCAN; do
     [ -f "$f" ] || continue
     scanned=$((scanned + 1))
-    gcc $FLAGS -c "$f" -o /dev/null 2>&1 | awk -v F="$f" '
+    case "$f" in vendor/*) EXTRA="$VENDOR_FLAGS" ;; *) EXTRA="" ;; esac
+    gcc $FLAGS $EXTRA -c "$f" -o /dev/null 2>&1 | awk -v F="$f" '
         /In function/ { fn=$0; sub(/.*In function ./,"",fn); sub(/.:$/,"",fn) }
         /frame size of/ {
             match($0, /frame size of [0-9]+/)
