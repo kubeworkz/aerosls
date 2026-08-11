@@ -18,7 +18,7 @@
 #   3. line endings    — no committed text blob may contain a CR byte
 #      (binary-marked files are skipped: a PNG or PDF legitimately has CR).
 #
-# It inspects the INDEX (git ls-files -s / git cat-file -p :<path> /
+# It inspects the INDEX (git ls-files -s -- . ':(exclude)vendor' / git cat-file -p :<path> /
 # git grep --cached), not the working tree — on a Linux checkout the
 # `eol=lf` attribute would hide a CRLF blob by converting it on the way
 # out, and the executable bit is a property of the committed mode, not the
@@ -37,6 +37,13 @@
 set -u
 cd "$(dirname "$0")/.."   # repo root, so the git index paths resolve
 
+# ─── vendor/ is exempt, deliberately ───────────────────────────────────────
+# vendor/ holds third-party source vendored verbatim (see its PROVENANCE.txt).
+# 356 files under vendor/mbedtls contain CR bytes, and normalising them would
+# make the tree differ from upstream -- which breaks the two things vendoring
+# is for: a recorded commit hash that means something, and an upstream CVE
+# patch that still applies. House conventions are for OUR files; vendored code
+# is verified by provenance, not by style.
 fails=0
 
 # 1 + 2. every committed .sh: executable bit + shebang (one ls-files call,
@@ -59,7 +66,7 @@ while IFS= read -r -d '' entry; do
                 ;;
         esac
     fi
-done < <(git ls-files -s -z)
+done < <(git ls-files -s -- . ':(exclude)vendor' -z)
 
 # 3. line endings — one git grep over the index blobs for a CR byte, then
 # check the binary attribute only for the files it hit (usually none).
@@ -69,7 +76,7 @@ while IFS= read -r path; do
     fi
     echo "FAIL  $path: committed blob is stored CRLF (repo convention: * text=auto eol=lf in .gitattributes)"
     fails=$((fails + 1))
-done < <(git grep --cached -l -F "$(printf '\r')" 2>/dev/null || true)
+done < <(git grep --cached -l -F "$(printf '\r')" -- . ':(exclude)vendor' 2>/dev/null || true)
 
 echo "script_conventions_check: done, $fails violations"
 [ "$fails" -eq 0 ]

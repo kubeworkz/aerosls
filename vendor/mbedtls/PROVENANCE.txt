@@ -1,0 +1,6 @@
+upstream:   https://github.com/Mbed-TLS/mbedtls.git
+branch:     mbedtls-3.6
+commit:     35bc09db98b34535059123711023a1a1a927b86f
+version:    3.6.7
+framework:  a3079552234917a9831dd70693983af5e62c70de
+flattened:  2026-08-11T19:34:17Z

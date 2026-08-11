@@ -16,3 +16,4 @@
 *.iso  binary
 *.img  binary
 *.bin  binary
+vendor/** -text -diff
