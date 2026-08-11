@@ -268,35 +268,75 @@ static void print_u64_dec(uint64_t v)
     uart_puts(buf + i);
 }
 
+/* The SPSR_EL1.M[3:0] exception-taking EL (level + SP-selection). The
+ * EL1h slot (VBAR+0x200) is the same-EL backstop, so the teeth fault
+ * is taken with M=0x5 (EL1h). The honest report reads SPSR, NOT the
+ * slot: if a future routing change ever delivers an EL0-originated
+ * abort here (M=0x0, EL0t), the log says so instead of blindly
+ * printing "from EL1". M=0x1 (EL0 with a hypothetical SP selection)
+ * and other reserved encodings fall to the default. */
+static void arm64_print_spsr_el(uint64_t spsr)
+{
+    switch (spsr & 0xF) {
+    case 0x0: uart_puts("EL0t (M=0x0, lower EL, AArch64)"); break;
+    case 0x4: uart_puts("EL1t (M=0x4, current EL, SP_EL0)"); break;
+    case 0x5: uart_puts("EL1h (M=0x5, current EL, SP_EL1)"); break;
+    case 0x8: uart_puts("EL2t (M=0x8, lower EL, AArch64)"); break;
+    case 0x9: uart_puts("EL2h (M=0x9, current EL, SP_EL2)"); break;
+    case 0xC: uart_puts("EL3t (M=0xC, lower EL, AArch64)"); break;
+    case 0xD: uart_puts("EL3h (M=0xD, current EL, SP_EL3)"); break;
+    default:  uart_puts("unknown EL (reserved M)"); break;
+    }
+}
+
 /* The EL1h sync slot's C helper (boot_arm64.S arm64_sync_el1h): print
- * the exception syndrome, its EC class, and the faulting VA, then
- * return — the assembly halts. The unhandled-exception backstop: no
- * gate in the committed boot ever takes a sync-from-current-EL
- * exception (the svc-return path is the sync-from-lower-EL slot, the
- * tick path is IRQ), so this never fires in the normal sequence. Its
- * one caller today is the teeth build (§10.203,
- * -DARM64_TEETH_EL1_MEMTOUCH): the EL0-only mem_touch fixture is
- * deliberately run at EL1, its first STORE to the baked
+ * the exception syndrome, its EC class, the faulting VA, and
+ * SPSR_EL1's taking-EL, then return — the assembly halts. The
+ * unhandled-exception backstop: no gate in the committed boot ever
+ * takes a sync-from-current-EL exception (the svc-return path is the
+ * sync-from-lower-EL slot, the tick path is IRQ), so this never fires
+ * in the normal sequence. Its one caller today is the teeth build
+ * (§10.203, -DARM64_TEETH_EL1_MEMTOUCH): the EL0-only mem_touch
+ * fixture is deliberately run at EL1, its first STORE to the baked
  * USER_SCRATCH_VA (unmapped in TTBR1) faults HERE — EC=0x25 (Data
- * Abort from current EL) with far=0x0000000010005000 — and CI
- * asserts the lines plus the resulting hang (rc=124). Any other EC
- * prints the mismatch verdict and fails the teeth. */
-void arm64_sync_el1h_c(uint64_t esr, uint64_t far)
+ * Abort from current EL) taken from EL1h (SPSR M=0x5) with
+ * far=0x0000000010005000 — and CI asserts the lines plus the
+ * resulting hang (rc=124). The verdicts are EL-aware (§10.204): the
+ * teeth PASS requires BOTH the same-EL encoding (EC=0x25) AND the
+ * EL1h taking-EL (M=0x5); an EC=0x24 lower-EL Data Abort reaching
+ * this slot is reported as the future EL0-fault path (no teeth
+ * verdict, but the report line names the taking EL); any other
+ * mismatch prints the FAIL verdict. */
+void arm64_sync_el1h_c(uint64_t esr, uint64_t far, uint64_t spsr)
 {
     uint64_t ec = esr >> 26;
+    uint64_t m = spsr & 0xF;
     uart_puts("[SYNC] EL1h synchronous exception: esr=");
     print_u64(esr);
     uart_puts(" ec=");
     print_u64(ec);
     uart_puts(" far=");
     print_u64(far);
+    uart_puts(" spsr=");
+    print_u64(spsr);
+    uart_puts(" -- taken from ");
+    arm64_print_spsr_el(spsr);
     uart_puts("\\r\\n");
-    uart_puts(ec == 0x25
-        ? "[SYNC] Data Abort from EL1: the faulting VA is unmapped in the "
-          "kernel's TTBR1 tables -- the EL1 mem_touch attempt faulted as "
-          "designed (teeth PASS)\\r\\n"
-        : "[SYNC] unexpected exception class -- the EL1 mem_touch attempt "
-          "did NOT fault as designed (teeth FAIL)\\r\\n");
+    if (ec == 0x25 && m == 0x5) {
+        uart_puts("[SYNC] Data Abort from EL1h (current EL, SPSR M=0x5): the faulting "
+                  "VA is unmapped in the kernel's TTBR1 tables -- the EL1 mem_touch "
+                  "attempt faulted as designed (teeth PASS)\\r\\n");
+    } else if (ec == 0x24) {
+        uart_puts("[SYNC] Data Abort from a LOWER EL (EC=0x24) reached the EL1h "
+                  "backstop -- the future EL0-fault path, NOT the teeth (the report "
+                  "line above names the taking EL; no teeth verdict)\\r\\n");
+    } else if (ec == 0x25) {
+        uart_puts("[SYNC] same-EL Data Abort (EC=0x25) but SPSR M is not EL1h -- "
+                  "inconsistent taking-EL at the backstop (teeth FAIL)\\r\\n");
+    } else {
+        uart_puts("[SYNC] unexpected exception class -- the EL1 mem_touch attempt "
+                  "did NOT fault as designed (teeth FAIL)\\r\\n");
+    }
     uart_puts("[SYNC] unhandled -- halting (the hang is the teeth: rc=124)\\r\\n");
 }
 

@@ -260,14 +260,20 @@ arm64_vectors:
  * baked USER_SCRATCH_VA (unmapped in the kernel's TTBR1 tables)
  * faults HERE as a Data Abort from current EL (EC=0x25), the machine
  * check that the "EL0-only by construction" claim is real rather than
- * asserted. Print ESR_EL1/FAR_EL1 through the C helper (the kernel
- * stays TTBR1-pure — the faulting low VA is never dereferenced),
+ * asserted. Print ESR_EL1/FAR_EL1/SPSR_EL1 through the C helper (the
+ * kernel stays TTBR1-pure — the faulting low VA is never dereferenced),
  * then halt: the hang IS the honest unhandled behavior, and CI
- * asserts it (rc=124) plus the lines. The handler never returns, so
- * no register save is needed (bl clobbers x30, which nobody restores). */
+ * asserts it (rc=124) plus the lines. SPSR_EL1 is reported so the log
+ * names the ACTUAL taking EL (M[3:0]) instead of assuming the slot:
+ * today every fault here is taken from EL1h (M=0x5), but if a future
+ * routing change ever delivers an EL0-originated abort to this
+ * backstop (M=0x0, EC=0x24), the report says so. The handler never
+ * returns, so no register save is needed (bl clobbers x30, which
+ * nobody restores). */
 arm64_sync_el1h:
     mrs     x0, esr_el1
     mrs     x1, far_el1
+    mrs     x2, spsr_el1
     bl      arm64_sync_el1h_c
     wfi
     b       arm64_sync_el1h
