@@ -1,7 +1,54 @@
 # AeroSLS QEMU-SLS — the guest-paging reset defect, v0.1
 
-**Status: OPEN. Found 2026-08-05. Pre-existing; the Guest Runtime UI exposed it,
-did not cause it.**
+**Status: FIXED 2026-08-06 — correctness half. Leak half reduced, not closed.**
+Found 2026-08-05. Pre-existing; the Guest Runtime UI exposed it, did not cause
+it.
+
+---
+
+## FIX SUMMARY
+
+`qemu_sls_mmu_guest_paging_reset()` restores the guest window's identity
+mappings, clears `qemu_sls_guest_paging_on` and the guest CR3.
+`sls_launch_guest()` calls it unconditionally — launching a guest is a machine
+reset, and on real hardware a reset clears CR0.PG.
+
+**The insight was that nothing was ever destroyed.** `guest_paging_enable()`
+zeroes ONE PML4 entry; the PDPT/PD/PT subtree beneath it is orphaned, not
+freed, and still describes exactly the identity window a later guest needs. So
+the entry is stashed instead of discarded and put back on reset. Eight bytes
+turn "the mappings are gone forever" into "the mappings are set aside".
+
+**The launcher no longer refuses.** That refusal was a guard while this was
+being written; with a real reset it became an unnecessary restriction. A node
+that has run the paging test can now run guests again with no restart.
+
+**Coverage:** 10 new checks in `qemu_sls_mmu_host_test.c` (107 total), asserting
+the restored PML4 entry is byte-identical to the stashed one — not that the
+flag is clear. *"paging_on is 0"* is precisely the assertion that would have
+passed for the entire life of the defect, because the flag was never the broken
+thing; the mappings were. Includes ten enable/reset cycles, idempotency, and
+reset-without-prior-enable. Mutation tested: removing the stash, removing the
+restore, and leaving the flag set each fail 3, 3 and 2 checks.
+
+### What is NOT fixed
+
+**The leak is reduced, not eliminated.** Reset restores the identity subtree,
+so the ~130 frames it occupies are now *reused* across every cycle rather than
+abandoned — that half is genuinely closed. But whatever `shadow_fault()` built
+under the zeroed slot while the guest ran paged is still orphaned at reset,
+because this kernel still has no page-table reclaim walk.
+
+Size, stated rather than waved at: `shadow_fault` maps only pages the guest
+actually touches, so `qemu paging` orphans a handful of frames per run, not the
+65,536-page window. Strictly less than before, and now the smaller of the two
+halves instead of the larger.
+
+**So §4's gate is half-met.** The first half — paging then two benches giving
+cold-then-warm — should now pass. The second — an unchanged frame-pool count
+across ten paging runs — will not, and saying it passes would be false. Closing
+it needs the reclaim walk, which is a separate change with its own risk and
+deserves its own gate.
 
 ---
 

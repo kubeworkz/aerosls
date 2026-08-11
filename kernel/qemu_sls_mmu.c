@@ -28,6 +28,21 @@ static QemuGuestRegion  regions[QEMU_MAX_REGIONS];
 static int              region_count;
 static int              initialized;
 
+/* ─── The guest window's identity PML4 entry, stashed across paging ─────────
+ * qemu_sls_mmu_guest_paging_enable() drops the identity mappings by zeroing
+ * one PML4 entry. The PDPT/PD/PT subtree beneath it is untouched -- it is
+ * orphaned, not destroyed -- and it still describes exactly the identity
+ * window the next paging-off guest needs.
+ *
+ * Keeping the entry costs 8 bytes and turns "the mappings are gone forever"
+ * into "the mappings are set aside". That is the whole guest-paging reset
+ * defect: before this, nothing could restore them, so a node that ran
+ * `qemu paging` could never launch another guest.
+ *
+ * 0 means no stash is held, which is distinguishable from a valid entry
+ * because a present PML4 entry always has bit 0 set. */
+static uint64_t identity_pml4e_stash;
+
 /* Physical frame address for each guest 4 KiB page; 0 = unallocated. */
 static uint64_t guest_ram_frames[QEMU_GUEST_RAM_PAGES];
 
@@ -256,16 +271,30 @@ int qemu_sls_mmu_guest_paging_enable(void) {
      * the guest's tables on demand. The alternative -- unmapping 65,536 pages
      * individually -- is the same result for 65,536 times the work.
      *
-     * The PDPT/PD/PT frames below the entry are LEAKED, not freed. There is no
-     * page-table reclaim path in this kernel yet, and inventing one on the
-     * paging-enable path would be the largest untested thing in the change.
-     * Bounded and one-off: it happens at most once per guest launch, and costs
-     * the ~130 frames the identity window used. Recorded rather than hidden.
+     * ─── The subtree is STASHED, not leaked ───────────────────────────────
+     * This used to say the PDPT/PD/PT frames below the entry were leaked, with
+     * the argument that it was "bounded and one-off: at most once per guest
+     * launch". That argument stopped holding the moment `qemu paging` became a
+     * button, and the deeper problem was worse than the leak: nothing restored
+     * the mappings, so a node that enabled paging once could never launch
+     * another paging-off guest. See
+     * docs/AeroSLS-QEMU-SLS-Guest-Paging-Reset-Defect-v0.1.md.
+     *
+     * The subtree is not destroyed by zeroing the entry, only orphaned -- and
+     * it still describes exactly the identity window a later guest needs. So
+     * the entry is kept. qemu_sls_mmu_guest_paging_reset() puts it back,
+     * which both fixes the defect and un-leaks the ~130 frames the identity
+     * window uses, because they are now reused rather than abandoned.
+     *
+     * What shadow_fault() builds under the now-zero slot IS still leaked at
+     * reset -- see the note there. It is far smaller (pages the guest actually
+     * touched, not all 65,536) and it is recorded rather than implied.
      *
      * The emulator window is untouched, which is the entire reason it is a
      * separate slot: shadow_fault() is about to walk the guest's page tables
      * through it, on the very next fault. */
     unsigned slot = SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE);
+    identity_pml4e_stash = shadow_pml4[slot];
     shadow_pml4[slot] = 0;
 
     /* The identity translations are live in the TLB. invlpg-per-page is not
@@ -277,10 +306,77 @@ int qemu_sls_mmu_guest_paging_enable(void) {
     qemu_sls_guest_paging_on = 1;
     kernel_serial_printf(
         "[QEMU-SLS MMU] guest paging ENABLED, guest CR3=0x%016lx. Guest window "
-        "identity dropped (PML4 slot %u); accesses now resolve through the "
-        "guest's own tables.\n",
+        "identity dropped (PML4 slot %u) and STASHED; accesses now resolve "
+        "through the guest's own tables.\n",
         qemu_sls_guest_cr3, slot);
     return 0;
+}
+
+/* ─── qemu_sls_mmu_guest_paging_reset ───────────────────────────────────────
+ * Undo guest_paging_enable(), so the machine can host another guest.
+ *
+ * Launching a guest is a machine reset, and on real hardware a reset clears
+ * CR0.PG. This kernel had no equivalent: paging_on was set once and cleared
+ * nowhere, the identity mappings were dropped and never restored, and the
+ * result was a node that stayed up, served HTTP, looked healthy, and hung
+ * outright on the next guest launch.
+ *
+ * Idempotent and safe to call when paging was never enabled -- that is the
+ * common case, since every bench launch calls it.
+ *
+ * ─── What is reclaimed and what is not ─────────────────────────────────────
+ * Reclaimed: the identity subtree, which is put back rather than rebuilt. That
+ * is the ~130 frames the old comment described as leaked; they are now reused
+ * across every enable/reset cycle.
+ *
+ * NOT reclaimed: whatever shadow_fault() built under the zeroed slot while the
+ * guest ran paged. Those frames are orphaned here, and this kernel still has
+ * no page-table reclaim walk -- writing one is a separate change with its own
+ * risk, and doing it inside this function would put the largest untested thing
+ * in the fix on the path every launch takes.
+ *
+ * The size is worth stating rather than waving at: shadow_fault maps pages the
+ * guest actually touches, so `qemu paging` orphans a handful of frames, not
+ * the 65,536-page window. Strictly less than the previous behaviour leaked,
+ * and now the smaller of the two halves rather than the larger.
+ */
+void qemu_sls_mmu_guest_paging_reset(void) {
+    if (!initialized) return;
+    if (!qemu_sls_guest_paging_on && !identity_pml4e_stash) return;  /* nothing to undo */
+
+    unsigned slot = SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE);
+    uint64_t orphaned = shadow_pml4[slot];   /* the paged subtree, if any */
+
+    if (identity_pml4e_stash) {
+        shadow_pml4[slot] = identity_pml4e_stash;
+        identity_pml4e_stash = 0;
+    } else {
+        /* Paging was flagged on with no stash held. That should be
+         * unreachable -- enable() always stashes before zeroing -- so say so
+         * rather than carrying on with a window that maps nothing. A guest
+         * launched here would fault on its first access with no mapping to
+         * resolve, which is a much harder thing to diagnose than this line. */
+        kernel_serial_print(
+            "[QEMU-SLS MMU] paging reset: paging was ON but no identity stash "
+            "was held.\n[QEMU-SLS MMU] The guest window has no mappings and "
+            "cannot be restored -- this is a bug in the enable path, not a "
+            "recoverable state.\n");
+    }
+
+    /* The paged translations are live in the TLB, and the restored identity
+     * entries were installed while a different subtree was current. Same
+     * reasoning as enable(): invlpg-per-page is not viable across 512 GiB. */
+    qemu_sls_flush_tlb();
+
+    qemu_sls_guest_paging_on = 0;
+    qemu_sls_guest_cr3       = 0;
+
+    kernel_serial_printf(
+        "[QEMU-SLS MMU] guest paging RESET: identity window restored to PML4 "
+        "slot %u, CR3 cleared.\n"
+        "[QEMU-SLS MMU] Paged subtree 0x%016lx orphaned (no reclaim path yet); "
+        "the identity subtree is reused, not leaked.\n",
+        slot, orphaned);
 }
 
 /* ─── qemu_sls_mmu_write_protect_gpa ────────────────────────────────────── */
@@ -363,6 +459,15 @@ static int shadow_install(uint64_t gva, uint64_t frame, uint64_t guest_pte) {
     qemu_sls_invlpg(gva & ~(uint64_t)0xFFF);
     return 0;
 }
+
+#ifdef QEMU_SLS_MMU_TEST_HOOKS
+/* See the note in the header: lets a test observe that paging_reset() restored
+ * the identity subtree, not just that it cleared the flag. */
+uint64_t qemu_sls_mmu_test_guest_window_pml4e(void) {
+    if (!shadow_pml4) return 0;
+    return shadow_pml4[SHADOW_PML4_SLOT(QEMU_GUEST_WINDOW_BASE)];
+}
+#endif
 
 #ifdef QEMU_SLS_MMU_TEST_HOOKS
 /* ─── test-only reachability ───────────────────────────────────────────────

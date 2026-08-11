@@ -209,6 +209,17 @@ void qemu_sls_flush_tlb(void);
  */
 int qemu_sls_mmu_guest_paging_enable(void);
 
+/* Undo guest_paging_enable(): restore the guest window's identity mappings
+ * from the stash, clear paging_on and the guest CR3. Idempotent, and a no-op
+ * when paging was never enabled -- every guest launch calls it, because
+ * launching a guest is a machine reset and a reset clears CR0.PG.
+ *
+ * Without this a node that ran `qemu paging` once could never launch another
+ * guest: the identity mappings were gone with nothing to restore them, and
+ * the next launch hung the node outright. See
+ * docs/AeroSLS-QEMU-SLS-Guest-Paging-Reset-Defect-v0.1.md. */
+void qemu_sls_mmu_guest_paging_reset(void);
+
 /* ─── Self-modifying guest code: the only way to see a guest store ─────────
  *
  * With tcg_use_softmmu false, a guest store compiles to a bare host MOV. There
@@ -281,6 +292,18 @@ uint64_t qemu_sls_dma_frame_phys(uint64_t gpa);  /* physical frame for DMA hardw
  * rather than extern'd inside the test so the compiler checks the signature --
  * a mismatch across translation units would silently pass garbage to the one
  * function whose entire job is refusing bad addresses. */
+#ifdef QEMU_SLS_MMU_TEST_HOOKS
+/* The guest window's PML4 entry, so a test can assert that paging_reset()
+ * actually put the identity subtree back rather than merely clearing a flag.
+ * Without this the reset is only observable through its side effects, and
+ * "the flag is 0" is exactly the assertion that would have passed while the
+ * mappings stayed gone -- which is the defect this reset exists to fix.
+ *
+ * Test-only, like shadow_install's hook below: the kernel build never sees it,
+ * so nothing outside a test can reach into the shadow root. */
+uint64_t qemu_sls_mmu_test_guest_window_pml4e(void);
+#endif
+
 int qemu_sls_mmu_test_shadow_install(uint64_t gva, uint64_t frame,
                                      uint64_t guest_pte);
 #endif

@@ -962,6 +962,76 @@ int main(void) {
               "-- flushing the guest VA would flush an unrelated kernel page ***");
     }
 
+    /* ─── Guest paging reset ────────────────────────────────────────────────
+     * docs/AeroSLS-QEMU-SLS-Guest-Paging-Reset-Defect-v0.1.md.
+     *
+     * guest_paging_enable() drops the guest window's identity mappings by
+     * zeroing one PML4 entry. Nothing restored them and nothing cleared
+     * qemu_sls_guest_paging_on, so a node that ran `qemu paging` once could
+     * never launch another guest -- the next launch executed in the previous
+     * guest's address space and HUNG THE NODE, HTTP included.
+     *
+     * These assert the restore, not the flag. "paging_on is 0" is precisely
+     * the check that would have passed for the entire life of the defect,
+     * because the flag was never the thing that was broken -- the mappings
+     * were. That is why the test hook exposes the PML4 entry. */
+    printf("\n-- guest paging reset --\n");
+    {
+        qemu_sls_guest_paging_on = 0;
+        qemu_sls_guest_cr3       = 0;
+
+        uint64_t identity_before = qemu_sls_mmu_test_guest_window_pml4e();
+        CHECK(identity_before != 0,
+              "the guest window has identity mappings before paging is enabled");
+
+        /* enable() refuses with CR3 still 0, by design -- give it one. */
+        qemu_sls_guest_cr3 = (uint64_t)(uintptr_t)g_frame_pool & ~0xFFFULL;
+        int en = qemu_sls_mmu_guest_paging_enable();
+        CHECK(en == 0, "guest_paging_enable() succeeds with a non-zero CR3");
+        CHECK(qemu_sls_mmu_test_guest_window_pml4e() == 0,
+              "...and drops the guest window's PML4 entry");
+        CHECK(qemu_sls_guest_paging_on == 1, "...and sets paging_on");
+
+        qemu_sls_mmu_guest_paging_reset();
+
+        CHECK(qemu_sls_guest_paging_on == 0, "reset clears paging_on");
+        CHECK(qemu_sls_guest_cr3 == 0, "...and the guest CR3");
+        CHECK(qemu_sls_mmu_test_guest_window_pml4e() == identity_before,
+              "*** ...and RESTORES the exact identity PML4 entry it stashed -- not a "
+              "rebuilt one, the same subtree. This is the assertion the defect would "
+              "have failed for its whole life; the flag checks above would not ***");
+
+        /* Every launch calls reset, so the no-op paths carry real traffic. */
+        uint64_t after_first = qemu_sls_mmu_test_guest_window_pml4e();
+        qemu_sls_mmu_guest_paging_reset();
+        CHECK(qemu_sls_mmu_test_guest_window_pml4e() == after_first &&
+              qemu_sls_guest_paging_on == 0,
+              "*** reset is idempotent -- a second call does not clobber the window "
+              "it just restored ***");
+
+        /* And the common case: reset on a machine that never enabled paging.
+         * sls_launch_guest() calls this on every launch, so a no-op that was
+         * not actually a no-op would break every bench rather than only the
+         * ones following a paging test. */
+        qemu_sls_mmu_guest_paging_reset();
+        CHECK(qemu_sls_mmu_test_guest_window_pml4e() == identity_before,
+              "*** reset with no prior enable leaves the window untouched ***");
+
+        /* Enable/reset must survive repetition: the identity subtree is reused
+         * rather than rebuilt, so a stash that leaked or was consumed once
+         * would show up as a window that stops coming back. */
+        int cycles_ok = 1;
+        for (int c = 0; c < 10; c++) {
+            qemu_sls_guest_cr3 = (uint64_t)(uintptr_t)g_frame_pool & ~0xFFFULL;
+            if (qemu_sls_mmu_guest_paging_enable() != 0) { cycles_ok = 0; break; }
+            qemu_sls_mmu_guest_paging_reset();
+            if (qemu_sls_mmu_test_guest_window_pml4e() != identity_before) { cycles_ok = 0; break; }
+        }
+        CHECK(cycles_ok,
+              "*** ten enable/reset cycles all restore the SAME identity entry -- the "
+              "subtree is reused, so repeated paging tests do not consume it ***");
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     free(g_guest_ram); free(g_frame_pool);
     return checks_failed == 0 ? 0 : 1;
