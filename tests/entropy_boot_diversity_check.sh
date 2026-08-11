@@ -69,15 +69,44 @@ command -v curl >/dev/null 2>&1 || { echo "ABORT: curl not found."; exit 2; }
 # -- it reported "no node answered ... start a cluster first" to somebody who
 # had just started one. A diagnostic that names the wrong cause is worse than
 # no diagnostic: it sends the reader to fix something that was never broken.
-fetch() {   # $1 = port  ->  "<status> <body>"
+# Sets FETCH_STATUS / FETCH_RC / FETCH_BODY rather than returning a string,
+# because curl's EXIT CODE is the diagnosis whenever there is no HTTP status
+# and discarding it is how this script ended up telling a running cluster to
+# start itself.
+#
+# Status 000 does not mean "nothing is listening". On this deployment the
+# ports are QEMU hostfwd: QEMU accepts the TCP connection itself and forwards
+# into the guest over slirp, so connect() ALWAYS succeeds whether or not the
+# guest kernel is answering. curl then reports 000 for a timeout, an empty
+# reply, and a refused connection alike -- three different faults with three
+# different fixes. The exit code separates them.
+FETCH_STATUS=""; FETCH_RC=0; FETCH_BODY=""
+fetch() {   # $1 = port
+    local out
     if [ -n "$TOKEN" ]; then
-        curl -sS --max-time 5 -w '\n%{http_code}' \
-             -H "Authorization: Bearer $TOKEN" \
-             "http://127.0.0.1:$1/api/entropy" 2>/dev/null
+        out="$(curl -s --max-time 8 -w '\n%{http_code}' \
+                    -H "Authorization: Bearer $TOKEN" \
+                    "http://127.0.0.1:$1/api/entropy" 2>/dev/null)"
     else
-        curl -sS --max-time 5 -w '\n%{http_code}' \
-             "http://127.0.0.1:$1/api/entropy" 2>/dev/null
+        out="$(curl -s --max-time 8 -w '\n%{http_code}' \
+                    "http://127.0.0.1:$1/api/entropy" 2>/dev/null)"
     fi
+    FETCH_RC=$?
+    FETCH_STATUS="$(printf '%s' "$out" | tail -n1)"
+    FETCH_BODY="$(printf '%s' "$out" | sed '$d')"
+}
+
+# curl exit codes, named. Guessing from 000 alone is what this replaces.
+curl_reason() {
+    case "$1" in
+        7)  echo "connection refused -- nothing accepted the TCP connect" ;;
+        28) echo "TIMED OUT -- the connect succeeded but no HTTP response arrived. On a QEMU hostfwd port this means QEMU accepted and the GUEST did not answer" ;;
+        52) echo "empty reply -- the server accepted, then closed without sending anything" ;;
+        56) echo "receive failure -- the connection broke mid-response" ;;
+        6)  echo "could not resolve host" ;;
+        0)  echo "curl reported success but no HTTP status was parsed" ;;
+        *)  echo "curl exit $1" ;;
+    esac
 }
 
 # Extract a JSON string field without a JSON parser. The kernel emits flat
@@ -97,15 +126,17 @@ unseeded=""
 needs_token=""
 route_missing=""
 other_status=""
+silent=""
 
 for i in $(seq 1 "$MAX_NODES"); do
     port=$((HTTP_BASE + i))
-    raw="$(fetch "$port" || true)"
-    status="$(printf '%s' "$raw" | tail -n1)"
-    body="$(printf '%s' "$raw" | sed '$d')"
+    fetch "$port"
+    status="$FETCH_STATUS"; body="$FETCH_BODY"
 
     case "$status" in
-        000|"") continue ;;                       # nothing listening on this port
+        000|"")
+            silent="${silent}node $i (port $port): $(curl_reason "$FETCH_RC")"$'\n'
+            continue ;;
         200) ;;                                   # fall through and parse
         401|403)
             needs_token="${needs_token}node $i (port $port): HTTP $status"$'\n'
@@ -168,10 +199,17 @@ if [ -n "$other_status" ]; then
 fi
 
 if [ "$found" -eq 0 ]; then
-    echo "ABORT: nothing is listening on ports $((HTTP_BASE+1))..$((HTTP_BASE+MAX_NODES))."
-    echo "       No connection was refused-and-answered; the ports are silent."
-    echo "       Start a cluster:  ./run-cluster.sh --nodes 3"
-    echo "       If your nodes use a different base, set AEROSLS_HTTP_BASE."
+    echo "ABORT: no node produced an HTTP response on ports"
+    echo "       $((HTTP_BASE+1))..$((HTTP_BASE+MAX_NODES)). Per port:"
+    echo
+    printf '%s' "$silent" | sed 's/^/        /'
+    echo
+    echo "       Read the reason before assuming the cluster is down. If it says"
+    echo "       TIMED OUT, the port IS bound -- check with 'netstat -tulpn' --"
+    echo "       and the guest kernel is not answering that request. If it says"
+    echo "       connection refused, nothing is there and a cluster is needed:"
+    echo "           ./run-cluster.sh --nodes 3"
+    echo "       A different port base is set with AEROSLS_HTTP_BASE."
     exit 2
 fi
 
