@@ -4,6 +4,8 @@
 #include "kernel_io.h"
 #include "entropy.h"
 #include "rtc.h"
+int  sls_tls_memory_init(void);
+int  sls_tls_time_init(void);
 #include "../arch/x86/vga.h"
 #include "scheduler.h"
 #include "microkernel.h"
@@ -242,6 +244,24 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     if (rtc_init() != RTC_OK) {
         kernel_serial_print("[BOOT] no trusted wall clock -- certificate "
                             "validity cannot be checked. See the [RTC] line above.\n");
+    }
+
+    /* mbedTLS's fixed pool. Must come before any mbedtls_* call, because its
+     * calloc has nowhere to allocate from until this runs -- and mbedTLS does
+     * not check, it dereferences.
+     *
+     * Called here for the same reason entropy_init() is: the last time a
+     * subsystem in this file was written, linked and left uncalled, it took a
+     * cluster test and four wrong diagnoses to notice. tests/boot_init_check.sh
+     * now makes that a build failure rather than a discovery. */
+    sls_tls_memory_init();
+
+    /* NOT fatal, and not a listener gate either -- there is no TLS listener
+     * yet. It reports whether one COULD start, so the answer is on the console
+     * from the first boot rather than discovered when the listener is written. */
+    if (sls_tls_time_init() != 0) {
+        kernel_serial_print("[BOOT] TLS could not start on this node: no "
+                            "trusted clock for certificate validity.\n");
     }
 
     // ── 4f. Token authentication registry ─────────────────────────────────
