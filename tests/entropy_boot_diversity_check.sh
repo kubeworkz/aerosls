@@ -176,8 +176,18 @@ if [ -n "$needs_token" ]; then
     echo "       Set a token and re-run:"
     echo "           AEROSLS_TOKEN=<token> tests/entropy_boot_diversity_check.sh"
     echo
-    echo "       The token registry is printed on each node's serial console at"
-    echo "       boot ([AUTH] Token Registry)."
+    echo "       The four demo tokens are compiled in at kernel/auth.c:94 and"
+    echo "       printed on each node's console at boot ([AUTH] Token Registry)."
+    echo "       dave@gridworkz.com is ROLE_DB_ADMIN and will do:"
+    echo
+    echo "           AEROSLS_TOKEN=deadbeef01234567cafebabe76543210 \\"
+    echo "               tests/entropy_boot_diversity_check.sh"
+    echo
+    echo "       Naming it here costs nothing -- it is a fixed constant in the"
+    echo "       source and is printed in the clear at every boot. That is the"
+    echo "       point worth noticing: these four tokens never expire"
+    echo "       (no_expiry=1) and two of them are DB_ADMIN. Fine for a local"
+    echo "       simulator, not fine on a node a real user touches."
     exit 2
 fi
 
