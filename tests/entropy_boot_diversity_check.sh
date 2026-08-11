@@ -34,6 +34,22 @@
 # until a port does not answer), AEROSLS_TOKEN (bearer token for /api/*).
 #
 # Exit: 0 pass, 1 fail, 2 skip (no cluster reachable, or no token).
+#
+# GUARD-KIND: runtime
+#
+# That marker is read by tests/run_checks.sh and it matters. Every other guard
+# here inspects the SOURCE or a BUILD ARTEFACT, so on a build host its
+# prerequisite exists and --require-all is right to treat a skip as a failure.
+# This one needs a RUNNING CLUSTER, which deploy.sh cannot have: it runs the
+# guards against a freshly built image and has not restarted the kernel yet.
+# Under --require-all it therefore failed every deploy, unconditionally, and
+# blocked shipping for a reason that had nothing to do with the build.
+#
+# A guard that can never pass where it is run is not a strict gate, it is a
+# broken one -- and the pressure it creates is to pass --no-verify, which
+# disables the twelve guards that WERE meaningful. So this is skipped there and
+# reported as owed, loudly, rather than turned into noise everyone learns to
+# route around.
 set -u
 cd "$(dirname "$0")/.."
 

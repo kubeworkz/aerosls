@@ -68,6 +68,7 @@ pass=0
 fail=0
 skip=0
 skipped_names=""
+runtime_skipped=""
 
 echo "run_checks"
 echo "=========="
@@ -102,7 +103,19 @@ for g in "${guards[@]}"; do
             # Prerequisite missing. Show the guard's own explanation -- it
             # states what it needed, and that is the actionable part.
             reason="$(echo "$out" | grep -m1 -E 'ABORT|missing' || echo 'prerequisite missing')"
-            if [ "$REQUIRE_ALL" = "1" ]; then
+            # A guard marked GUARD-KIND: runtime needs a LIVE SYSTEM, not a
+            # build artefact. --require-all exists for hosts that can satisfy a
+            # prerequisite by building; it cannot conjure a running cluster, and
+            # deploy.sh runs these BEFORE restarting the kernel. Forcing such a
+            # guard to fail blocks every deploy for a reason unrelated to the
+            # build, and the only way out is --no-verify, which switches off the
+            # guards that were doing real work.
+            if grep -q '^# GUARD-KIND: runtime' "$g" 2>/dev/null; then
+                echo "SKIP  $name (runtime guard -- needs a live cluster, not a build)"
+                echo "      $reason"
+                runtime_skipped="$runtime_skipped $name"
+                skip=$((skip + 1))
+            elif [ "$REQUIRE_ALL" = "1" ]; then
                 echo "FAIL  $name (prerequisite missing, and --require-all is set)"
                 echo "      $reason"
                 fail=$((fail + 1))
@@ -126,10 +139,31 @@ echo "$pass passed, $fail failed, $skip skipped"
 
 if [ "$skip" -gt 0 ]; then
     echo
-    echo "Skipped guards inspected NOTHING:$skipped_names"
-    echo "They need a linked kernel or its objects. Run 'make x86-iso' first,"
-    echo "then re-run this. On a build host use --require-all so that a missing"
-    echo "prerequisite fails instead of passing quietly."
+    # Two kinds of skip, reported separately because they need different
+    # actions. Merging them produced an empty list and advice about linked
+    # kernels for a guard that wanted a running cluster.
+    build_skipped=""
+    for n in $skipped_names; do
+        case " $runtime_skipped " in *" $n "*) ;; *) build_skipped="$build_skipped $n" ;; esac
+    done
+
+    if [ -n "$build_skipped" ]; then
+        echo "Skipped guards inspected NOTHING:$build_skipped"
+        echo "They need a linked kernel or its objects. Run 'make x86-iso' first,"
+        echo "then re-run this. On a build host use --require-all so that a missing"
+        echo "prerequisite fails instead of passing quietly."
+    fi
+
+    if [ -n "$runtime_skipped" ]; then
+        [ -n "$build_skipped" ] && echo
+        echo "RUNTIME guards NOT RUN, and still owed:$runtime_skipped"
+        echo "These need a live cluster, which a build host does not have, so"
+        echo "--require-all deliberately does not force them. A green build gate"
+        echo "is therefore NOT evidence that they pass. Run them against a"
+        echo "started cluster before trusting the property they assert:"
+        echo "    ./run-cluster.sh --nodes 3"
+        echo "    tests/entropy_boot_diversity_check.sh"
+    fi
 fi
 
 [ "$fail" -eq 0 ]
