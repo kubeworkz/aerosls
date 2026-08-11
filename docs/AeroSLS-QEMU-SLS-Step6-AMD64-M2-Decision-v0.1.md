@@ -44,6 +44,23 @@ now sets it around guest execution. Verified on both builds by the new `qemu
 invl` fixture (res = A B C D), with `qemu paging` and the bench still passing;
 see §3.2 for the details.
 
+**Update 2026-08-11: the M3 wiring point is LANDED** — the decoder build's
+`flush_page` helper (`helper_flush_page`, the call site
+`gen_helper_flush_page()` emits for INVLPG/INVLPGA) no longer halts; it calls
+`qemu_sls_mmu_shadow_invlpg()`, so a TCG-translated INVLPG invalidates the
+guest-window shadow PTE. The C dispatcher's own INVLPG decode is routed
+through the same helper under `SLS_X86_FRONTEND=on`, making the hook live and
+tested on hardware before the decoder is wired into execution (one chokepoint
+for INVLPG in the decoder build). Also fixed: the Makefile's `QEMU_INC` was
+missing `-I ../qemu/target/i386`, so the `=on` build only ever compiled with a
+manual include override — it now builds from the committed tree. Verified on
+both builds: `qemu invl`/`paging`/`selfmod` all `pass:true`; the decoder
+build's serial log shows `helper_flush_page(0x400000): decoder INVLPG hook ->
+shadow invalidation` followed by the PTE drop. What remains before the decoder
+executes guest code is the Step 6.3 translator-loop wiring itself — `MOV CR3`
+under the real decoder (`helper_write_crN`) is the next stub that must become
+real.
+
 ---
 
 ## 0. The three options, as posed
@@ -213,9 +230,15 @@ policy for guest-owned page tables, in three tiers:
    accesses repopulate from the new root. `INVLPG` (0F 01 /7) is now decoded in the
    dispatcher and calls `qemu_sls_mmu_shadow_invlpg()`, which walks the shadow's own
    host tables and drops the one page's PTE (no-op if the page has none). Both are
-   no-ops while paging is off, where hardware ignores CR3. The decoder build's
-   `flush_page` helper stub still halts -- the decoder is not wired into execution
-   yet, so that call site is the M3 wiring point, not reachable today.
+   no-ops while paging is off, where hardware ignores CR3. **The M3 wiring point is
+   LANDED 2026-08-11:** the decoder's `flush_page` helper is real, not a stub —
+   `helper_flush_page()` (what `gen_helper_flush_page` calls for INVLPG 0F 01 /7
+   and INVLPGA 0F DF) calls `qemu_sls_mmu_shadow_invlpg()`, and the C dispatcher's
+   INVLPG decode routes through that same helper under `SLS_X86_FRONTEND=on` so the
+   hook is exercised on hardware today. When the decoder is wired into execution,
+   a TCG-translated INVLPG invalidates the guest-window shadow PTE with no further
+   change. The remaining decoder-path gap is `MOV CR3` (`helper_write_crN`, still a
+   halting stub), which is the Step 6.3 wiring milestone's problem, not M2's.
 2. **Guest writes to its own page-table pages** — **LANDED 2026-08-11.**
    `guest_walk()` marks every page the guest's CURRENT tables use as a table (one
    byte per guest page, cleared at paging enable/reset); `shadow_install()` maps any
@@ -295,8 +318,10 @@ The code has moved past its own documentation, and this project's rule is that
 
 - Page-table reclaim walk at guest reset (pre-existing; recorded in the reset-defect
   doc — the paged subtree is stashed, not freed).
-- The decoder build's `flush_page` helper stub still halts (the decoder is not wired
-  into execution; `INVLPG` under the real decoder is the M3 wiring point).
+- The decoder build is not wired into execution yet — the Step 6.3 translator-loop
+  wiring (launcher calls `x86_translate_code` instead of the 18-opcode frontend) is
+  the next milestone, and with it `MOV CR3` under the real decoder
+  (`helper_write_crN`). The M3 `flush_page` hook itself is LANDED (see §3.2 tier 1).
 - MMIO regions (SCOPE.h CATEGORY 9: no devices in scope).
 
 ---

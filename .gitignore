@@ -34,3 +34,4 @@ cluster/
 # Build-configuration stamps (see the SLS_SOFTMMU block in Makefile)
 .build-config.stamp
 .build-id.stamp
+.sls-frontend.stamp
