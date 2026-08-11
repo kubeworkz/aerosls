@@ -27,9 +27,10 @@
 
 int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t *olen);
 int sls_mbedtls_rng(void *p_rng, unsigned char *output, size_t output_size);
-size_t   sls_tls_pool_used(void);
-uint32_t sls_tls_pool_exhausted(void);
-void*    sls_tls_calloc_PLACEHOLDER(size_t n, size_t size);
+size_t sls_tls_pool_bytes(void);
+int    sls_tls_memory_init(void);
+void   sls_tls_memory_free(void);
+int    sls_tls_memory_ready(void);
 
 static int checks = 0, fails = 0;
 static void ok(int c, const char* w) {
@@ -86,33 +87,27 @@ int main(void) {
     ok(sls_mbedtls_rng(0, 0, 32) != 0,               "null output refused (rng)");
     ok(sls_mbedtls_rng(0, buf, 0) != 0,              "zero size refused (rng)");
 
-    printf("\n-- 4: the placeholder allocator, and its limit --\n");
-    {
-        void* p = sls_tls_calloc_PLACEHOLDER(4, 16);
-        ok(p != 0, "a small allocation succeeds");
-        int zeroed = 1;
-        for (int i = 0; i < 64; i++) if (((unsigned char*)p)[i]) zeroed = 0;
-        ok(zeroed, "  ...and is zeroed, as calloc must be");
-        ok(sls_tls_pool_used() >= 64, "  ...and is accounted in the pool");
+    printf("\n-- 4: the memory pool --\n");
 
-        ok(sls_tls_calloc_PLACEHOLDER((size_t)-1, 2) == 0,
-           "an overflowing size is refused rather than wrapping");
-
-        /* Exhaustion must be reported, not silently returned as a wild
-         * pointer. This is the failure a bump allocator with no reuse WILL
-         * reach in service -- which is why it is named PLACEHOLDER and why
-         * MBEDTLS_MEMORY_BUFFER_ALLOC_C replaces it before anything ships. */
-        while (sls_tls_calloc_PLACEHOLDER(1, 4096) != 0) { }
-        ok(sls_tls_pool_exhausted() > 0, "pool exhaustion is counted, not hidden");
-
-        /* Note what this does NOT assert. After 4096 is refused there may
-         * still be room for 16 -- refusing the large request does not mean
-         * the pool is empty, and an earlier version of this test claimed it
-         * did and failed. Drain with the small size before asserting. */
-        while (sls_tls_calloc_PLACEHOLDER(1, 16) != 0) { }
-        ok(sls_tls_calloc_PLACEHOLDER(1, 16) == 0,
-           "once genuinely full, every further allocation returns null");
-    }
+    /* The bump allocator this section used to test is gone. It was named
+     * PLACEHOLDER, never freed anything, and has been replaced by upstream's
+     * MBEDTLS_MEMORY_BUFFER_ALLOC_C -- a real free list over the same fixed
+     * buffer. Its behaviour is mbedTLS's to test, not ours; what remains ours
+     * is that the pool is a bounded, declared budget and that init is
+     * idempotent.
+     *
+     * The host build deliberately does NOT link the vendored library (see
+     * kernel/tls_platform.c), so these are the only allocator assertions this
+     * file can honestly make. Anything stronger belongs in a test that boots
+     * the kernel. */
+    ok(sls_tls_pool_bytes() == 256u * 1024u,
+       "the pool is a declared fixed budget (256 KiB), not an open heap");
+    ok(sls_tls_memory_ready() == 0, "not ready before init");
+    ok(sls_tls_memory_init() == 0,  "init succeeds");
+    ok(sls_tls_memory_ready() == 1, "  ...and reports ready");
+    ok(sls_tls_memory_init() == 0,  "init is idempotent");
+    sls_tls_memory_free();
+    ok(sls_tls_memory_ready() == 0, "free returns it to not-ready");
 
     printf("\n=== %d passed, %d failed ===\n", checks - fails, fails);
     return fails == 0 ? 0 : 1;

@@ -23,6 +23,13 @@
 #include "entropy.h"
 
 #ifndef TLS_PLATFORM_HOST_TEST
+/* The kernel build compiles against the vendored tree; the host test does not,
+ * so that the fail-closed RNG contract can be exercised without pulling 8 MB
+ * of library into a unit test. */
+#include "mbedtls/memory_buffer_alloc.h"
+#endif
+
+#ifndef TLS_PLATFORM_HOST_TEST
 #include "kernel_io.h"
 #else
 #include <stdio.h>
@@ -86,47 +93,57 @@ int sls_mbedtls_rng(void *p_rng, unsigned char *output, size_t output_size)
 
 /* ─── 2. Memory ────────────────────────────────────────────────────────────
  * mbedTLS wants calloc/free. This was the strongest argument for BearSSL,
- * which needs neither, and the amendment to the design doc says plainly that
- * moving to mbedTLS reduces rather than eliminates the problem.
+ * which needs neither, and the design doc amendment says plainly that moving
+ * to mbedTLS reduces rather than eliminates the problem.
  *
- * What reduces it: a FIXED POOL, not the kernel's general heap. TLS
- * allocation cannot then fragment or exhaust the arena the database lives in,
- * and the worst case is that a handshake fails rather than that the node
- * runs out of memory somewhere unrelated. The pool size is a budget to be
- * chosen against §3.2's per-connection figures, not a number to tune upward
- * when something fails.
+ * What reduces it is a FIXED POOL rather than the kernel's general heap: TLS
+ * allocation cannot fragment or exhaust the arena the database lives in, so
+ * the worst case is a refused handshake instead of a node dying somewhere
+ * unrelated.
  *
- * This is a bump allocator with no reuse, which is WRONG for a long-lived
- * server and is here as a placeholder with a loud name. mbedTLS's own
- * MBEDTLS_MEMORY_BUFFER_ALLOC_C provides a real fixed-pool allocator with
- * free-list handling; wiring that is the correct answer and is the next
- * commit. Shipping this as-is would exhaust the pool after N handshakes.  */
-
+ * The allocator itself is now upstream's MBEDTLS_MEMORY_BUFFER_ALLOC_C, not
+ * ours. The previous version here was a bump allocator named PLACEHOLDER
+ * because it never freed anything -- correct on overflow, correct on
+ * exhaustion, and guaranteed to run out after N handshakes. Upstream's keeps a
+ * real free list over the same buffer, so a connection's memory comes back
+ * when it closes. Writing our own allocator to sit under a TLS stack was never
+ * the right call when the library ships one built for exactly this.
+ *
+ * Size is a budget, not a tuning knob. TLS 1.3 records are up to 16 KB and
+ * neither MAX_FRAGMENT_LENGTH nor VARIABLE_BUFFER_LENGTH is supported under
+ * 1.3, so per-connection cost is fixed at full record size (design doc §3.2
+ * and the amendment). Raising this number to make a failure go away is
+ * choosing to run out later, in production, instead of now, in a test. */
 #define SLS_TLS_POOL_BYTES (256u * 1024u)
-static uint8_t  tls_pool[SLS_TLS_POOL_BYTES] __attribute__((aligned(16)));
-static size_t   tls_pool_used;
-static uint32_t tls_pool_exhausted;
+#ifndef TLS_PLATFORM_HOST_TEST
+static uint8_t tls_pool[SLS_TLS_POOL_BYTES] __attribute__((aligned(16)));
+#endif
+static uint8_t tls_pool_ready;
 
-void* sls_tls_calloc_PLACEHOLDER(size_t n, size_t size);
-void  sls_tls_free_PLACEHOLDER(void* p);
+int  sls_tls_memory_init(void);
+void sls_tls_memory_free(void);
 
-void* sls_tls_calloc_PLACEHOLDER(size_t n, size_t size)
+int sls_tls_memory_init(void)
 {
-    if (n && size > (size_t)-1 / n) return 0;       /* overflow */
-    size_t want = (n * size + 15u) & ~(size_t)15u;
-    if (want > SLS_TLS_POOL_BYTES - tls_pool_used) {
-        tls_pool_exhausted++;
-        return 0;
-    }
-    uint8_t* p = &tls_pool[tls_pool_used];
-    tls_pool_used += want;
-    for (size_t i = 0; i < want; i++) p[i] = 0;      /* calloc must zero */
-    return p;
+    if (tls_pool_ready) return 0;
+#ifndef TLS_PLATFORM_HOST_TEST
+    mbedtls_memory_buffer_alloc_init(tls_pool, sizeof tls_pool);
+#endif
+    tls_pool_ready = 1;
+    kernel_serial_print("[TLS] memory pool initialised (256 KiB, fixed).\n");
+    return 0;
 }
 
-void sls_tls_free_PLACEHOLDER(void* p) { (void)p; }
+void sls_tls_memory_free(void)
+{
+    if (!tls_pool_ready) return;
+#ifndef TLS_PLATFORM_HOST_TEST
+    mbedtls_memory_buffer_alloc_free();
+#endif
+    tls_pool_ready = 0;
+}
 
-size_t sls_tls_pool_used(void);
-size_t sls_tls_pool_used(void) { return tls_pool_used; }
-uint32_t sls_tls_pool_exhausted(void);
-uint32_t sls_tls_pool_exhausted(void) { return tls_pool_exhausted; }
+size_t sls_tls_pool_bytes(void);
+size_t sls_tls_pool_bytes(void) { return SLS_TLS_POOL_BYTES; }
+int    sls_tls_memory_ready(void);
+int    sls_tls_memory_ready(void) { return tls_pool_ready != 0; }
