@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 #include "kernel_io.h"
+#include "entropy.h"
+#include "rtc.h"
 #include "../arch/x86/vga.h"
 #include "scheduler.h"
 #include "microkernel.h"
@@ -214,6 +216,33 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
 
     // ── 4e. Web asset store ────────────────────────────────────────────────
     webapp_init();   // installs built-in Navigator welcome page
+
+    // ── 4e½. Entropy and wall clock (TLS Phase 0/1) ───────────────────────
+    // Placed BEFORE auth_init() so that anything which later wants to issue a
+    // real token has a CSPRNG available, and early enough that the console
+    // carries the result where a boot log will show it.
+    //
+    // Both are allowed to fail and neither is fatal. entropy_init() refuses
+    // when no source reaches the seeding threshold, and rtc_init() refuses a
+    // clock it cannot trust -- see kernel/entropy.h and kernel/rtc.h. A node
+    // that boots without them still serves HTTP; it just cannot start TLS,
+    // which is the intended fail-closed behaviour rather than a reason to
+    // halt.
+    //
+    // These calls did not exist until the boot-diversity gate ran against a
+    // real cluster and every node answered ready=false. The subsystem
+    // compiled, linked, and passed 31 host tests -- all of which call
+    // entropy_init() themselves -- while being completely inert in the actual
+    // kernel. Nothing in a unit test can catch "the boot path never invokes
+    // this"; only running the real thing can.
+    if (entropy_init() != ENTROPY_OK) {
+        kernel_serial_print("[BOOT] entropy NOT seeded -- TLS will refuse to "
+                            "start on this node. See the [ENTROPY] lines above.\n");
+    }
+    if (rtc_init() != RTC_OK) {
+        kernel_serial_print("[BOOT] no trusted wall clock -- certificate "
+                            "validity cannot be checked. See the [RTC] line above.\n");
+    }
 
     // ── 4f. Token authentication registry ─────────────────────────────────
     auth_init();     // registers 4 demo tokens; prints them to serial log
