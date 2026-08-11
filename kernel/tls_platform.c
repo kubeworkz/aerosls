@@ -236,12 +236,20 @@ void sls_mbedtls_exit(int status)
  * NOT the wall clock -- §3 is that, and using this for certificate validity
  * would put expiry on a counter that restarts at every boot. ~100 ticks per
  * second, matching net/http.c's own uptime conversion. */
-long long mbedtls_ms_time(void);
+/* Return type is mbedtls_ms_time_t, not `long long`. They are not the same:
+ * the typedef is int64_t, which on LP64 is `long`, and declaring it `long long`
+ * is a hard compile error at the header -- caught by building, after I wrote
+ * the obvious-looking type instead of the one the header names. */
+#ifndef TLS_PLATFORM_HOST_TEST
+#include "mbedtls/platform_time.h"
 
-long long mbedtls_ms_time(void)
+mbedtls_ms_time_t mbedtls_ms_time(void);
+
+mbedtls_ms_time_t mbedtls_ms_time(void)
 {
-    return (long long)(kernel_tick_counter * 10ull);
+    return (mbedtls_ms_time_t)(kernel_tick_counter * 10ull);
 }
+#endif
 
 /* ─── 5. Zeroization ───────────────────────────────────────────────────────
  * MBEDTLS_PLATFORM_ZEROIZE_ALT. See sls_mbedtls_config.h for why upstream's
@@ -259,3 +267,79 @@ void mbedtls_platform_zeroize(void *buf, size_t len)
     volatile unsigned char *p = (volatile unsigned char *)buf;
     while (len--) *p++ = 0;
 }
+
+/* ─── 6. The TCP bridge ────────────────────────────────────────────────────
+ * mbedTLS never sees a socket. It calls two callbacks and this file is where
+ * net/tcp.h meets them. Shapes are mbedtls_ssl_send_t and mbedtls_ssl_recv_t
+ * exactly (include/mbedtls/ssl.h:813 and :837): int (void*, buf, size_t).
+ *
+ * ─── The thing that had to be discovered before writing this ──────────────
+ * tcp_recv() BLOCKS. net/tcp.c:281 spins in net_event_hlt_wait() until data
+ * arrives or the connection closes; there is no "nothing yet" return.
+ *
+ * That is fine for the existing HTTP loop because it never actually lets it
+ * block -- net/http.c:6169 guards every call with `if (c->rbuf_used > 0)`, so
+ * tcp_recv() is only entered when the data is already buffered. The blocking
+ * path exists and is never taken.
+ *
+ * mbedTLS cannot do that. It decides when it needs bytes, and it needs them
+ * mid-record. A naive bridge that just called tcp_recv() would hand any client
+ * a trivial denial of service: open a connection, send one byte of a
+ * ClientHello, and the node stops -- not just TLS, EVERYTHING, because
+ * http_server_run() is a single loop that also drives the serial console
+ * (net/http.c:11).
+ *
+ * So the bridge applies the same guard the HTTP loop does and returns
+ * MBEDTLS_ERR_SSL_WANT_READ when the buffer is empty. That is precisely what
+ * that error code is for, it needs no change to net/tcp.c, and it keeps the
+ * handshake cooperative with the poll loop it lives inside.
+ *
+ * ctx is the connection id, passed as an integer through a void* -- the same
+ * id http_conns[] and tcp_conns[] are both indexed by. */
+
+#ifndef TLS_PLATFORM_HOST_TEST
+#include "../net/tcp.h"
+#include "mbedtls/ssl.h"
+
+int sls_tls_bio_send(void *ctx, const unsigned char *buf, size_t len);
+int sls_tls_bio_recv(void *ctx, unsigned char *buf, size_t len);
+
+int sls_tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    int id = (int)(long)ctx;
+    if (!buf || len == 0) return 0;
+
+    /* tcp_send takes uint32_t; a TLS record is at most ~16 KB so this cannot
+     * truncate, but the clamp is here rather than assumed because the day the
+     * types change silently is the day it does. */
+    uint32_t want = (len > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)len;
+    int sent = tcp_send(id, buf, want);
+    if (sent < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+
+    /* A short write is reported honestly. mbedTLS will call again with the
+     * remainder; claiming the full length would silently drop record bytes and
+     * the peer would fail a MAC check somewhere unrelated. */
+    return sent;
+}
+
+int sls_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
+{
+    int id = (int)(long)ctx;
+    if (!buf || len == 0) return 0;
+    if (id < 0 || id >= TCP_MAX_CONNS) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+
+    struct TCPConn *c = &tcp_conns[id];
+
+    /* The guard that stops one silent client halting the node. See above. */
+    if (c->rbuf_used == 0) {
+        if (c->state == TCP_CLOSE_WAIT || c->state == TCP_CLOSED)
+            return 0;                      /* peer closed: a real EOF */
+        return MBEDTLS_ERR_SSL_WANT_READ;  /* nothing yet: come back later */
+    }
+
+    uint16_t want = (len > 0xFFFFu) ? 0xFFFFu : (uint16_t)len;
+    int got = tcp_recv(id, buf, want);
+    if (got < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    return got;
+}
+#endif /* !TLS_PLATFORM_HOST_TEST */
