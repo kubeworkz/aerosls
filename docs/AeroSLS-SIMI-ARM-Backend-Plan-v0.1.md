@@ -7920,6 +7920,43 @@ and the kernel's PASS/FAIL verdict (and CI) fails; the host fixture's
 "Expected result: 191834688" is verified on all four engines (ARM
 1092 bytes, RV64 1116, x86 699, interp value-exact).
 
+### 10.201 M5.6 as built: the LCG through the EL0 containment path
+
+§10.200's EL1-only proof is extended to the containment path: the
+per-slice LCG now takes the activation cache + EL0 excursion, so the
+user-mode-containment proof executes the IDENTICAL work the EL1 boot
+slice runs — at the byte level, not the equal-results level. The
+cache gains a second slot (`ARM64_ACT_SLOTS 1 -> 2`) with a
+per-slot `code_buf` (slot 0 -> g_smoke_code_buf, slot 1 ->
+g_lcg_code_buf, now 4096-aligned so the user tree can map its page),
+and the EL0 machinery is parameterized (`arm64_el0_activate_for(prog)`
++ a per-program continuation in `arm64_el0_done`, driven by
+g_el0_program):
+
+- **The EL1 LCG slice is now cache-routed** (§10.200's direct
+translation is superseded): `arm64_lcg_slice_test` activates
+"lcg_slice" (MISS, slot 1) and blr's the entry. The two LCG EL0
+excursions then HIT the same slot — the SAME cached bytes are
+re-executed at EL0, which is what makes "the EL0 run executes the
+identical work" a byte-level claim (a discrepancy would be a
+containment/eret fault, not a codegen change). The `acc=... PASS`
+line shape is unchanged; one translation now serves all three LCG
+executions.
+- **The excursions run before the timer arms** (main launches the LCG
+pair; the continuation's handoff arms the timer, prints the M5.2
+probe line, and launches the smoke pair), so no tick can pend
+through the LCG windows — the M5.2/M5.3 tick stream (exactly 6,
+ordered) is unchanged by construction, and the new want= token
+stream in CI is just the committed stream with two leading `eret
+into EL0...` tokens (the LCG pair).
+- **The boot gate is now six entries, two translations**: smoke EL1
+MISS + HIT (42, 42), LCG EL1 MISS (0x0b6f2a40), LCG EL0 HIT + HIT
+(0x0b6f2a40, 0x0b6f2a40), smoke EL0 HIT + HIT (42, 42). CI counts:
+MISS = 2, HIT = 5, EL1 smoke = 2, EL0 smoke = 2, NEW LCG EL0 = 2,
+ticks = 6, ordered stream with the two leading erets. Boot-verified:
+rc=0 (PSCI), all counts exact, 0 FAIL lines, 4 user-tree builds, all
+pre-existing asserts intact.
+
 ---
 
 

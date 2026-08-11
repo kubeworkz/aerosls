@@ -9,9 +9,14 @@
  * SIMI program in EL0 from a USER VA that the kernel's own tables do
  * not map (the TTBR0/TTBR1 split), then ends in a clean power-off via
  * PSCI SYSTEM_OFF (`smc #0`, the SBI_SRST analog; qemu exits rc=0).
- * M5.1 adds the activation cache (translate-on-first-use, §10.192):
- * the boot gate is four entries — EL1 direct (MISS), EL1 direct (HIT),
- * EL0 (HIT), EL0 (HIT) — one translation, all returning 42.
+ * M5.1 adds the activation cache (translate-on-first-use, §10.192);
+ * §10.201 (this pass) extends it to two programs — the boot smoke
+ * (slot 0) and the per-slice LCG (slot 1, §10.200) — each with its
+ * own code buffer, and routes BOTH through the EL0 containment path.
+ * The boot gate: smoke EL1 (MISS), smoke EL1 (HIT), LCG EL1 (MISS),
+ * LCG EL0 x2 (HIT, HIT), smoke EL0 x2 (HIT, HIT) — two translations
+ * total, the LCG's EL0 runs re-executing literally the same cached
+ * bytes as its EL1 run (the "identical work at EL0" proof).
  *
  * The MMU is enabled by boot_arm64.S before this main runs: TTBR1
  * holds the kernel (high VAs), TTBR0 is parked on an all-invalid root,
@@ -53,7 +58,7 @@
 
 /* The svc-from-EL0 handshake (boot_arm64.S arm64_svc_from_el0): the
  * handler stores the user result (x9) here and erets to the address
- * here, which arm64_el0_activate sets before the eret into EL0. */
+ * here, which arm64_el0_activate_for sets before the eret into EL0. */
 uint64_t g_user_result;
 uint64_t g_user_ret_addr;
 
@@ -88,35 +93,42 @@ static uint8_t g_smoke_code_buf[ARM64_SMOKE_CODE_BUF_SIZE]
     __attribute__((aligned(4096)));
 static uint32_t g_code_len, g_entry_off;
 
-/* §10.200: the LCG slice's code buffer — a SECOND static buffer so the
- * boot smoke's translated code survives untouched for the EL0
- * excursions. The LCG program runs once, in EL1, before the timer
- * arms; it deliberately bypasses the activation cache (no reuse to
- * serve), so the M5.1 gate counts stay exact by construction. */
+/* §10.200/§10.201: the LCG slice's code buffer — a SECOND static
+ * buffer so the boot smoke's translated code survives untouched for
+ * the EL0 excursions. Page-aligned like g_smoke_code_buf: the EL0
+ * user tree maps the buffer's physical page at USER_CODE_VA, so the
+ * alignment is load-bearing for the LCG's own EL0 excursion too. */
 static uint8_t g_lcg_code_buf[ARM64_SMOKE_CODE_BUF_SIZE]
-    __attribute__((aligned(16)));
+    __attribute__((aligned(4096)));
 
-/* M5.1 activation cache (§10.192, the x86 kernel/simi_translate.c
+/* M5.1/M5.6 activation cache (§10.192, the x86 kernel/simi_translate.c
  * precedent, ISA doc §11): translate-on-first-use. The cache key is
  * object name + FNV-1a hash + .tmo byte size — re-uploading the same
- * name with different bytes is a MISS, not a stale HIT. The emitted
- * code lives in g_smoke_code_buf (one slot today — the array shape
- * generalizes, static-array discipline, no allocator). The register
- * frame is deliberately NOT cached: it is SP-relative, carved per entry
- * off the kernel stack (EL1) or a fresh user stack (EL0). */
-#define ARM64_ACT_SLOTS      1
+ * name with different bytes is a MISS, not a stale HIT. Each slot
+ * carries its OWN code buffer: slot 0 emits into g_smoke_code_buf
+ * (the boot smoke), slot 1 into g_lcg_code_buf (the LCG slice) — a
+ * cache HIT therefore means the SAME bytes are re-executed (no
+ * re-translation, no re-flush). Static-array discipline, no
+ * allocator. The register frame is deliberately NOT cached: it is
+ * SP-relative, carved per entry off the kernel stack (EL1) or a fresh
+ * user stack (EL0). */
+#define ARM64_ACT_SLOTS      2
 #define ARM64_ACT_NAME_LEN   24
 struct Arm64Activation {
     char     name[ARM64_ACT_NAME_LEN];
     uint32_t content_hash;   /* FNV-1a of the .tmo bytes */
     uint32_t tmo_len;        /* .tmo byte size */
     uint32_t code_len;       /* translated A64 length */
-    uint32_t entry_off;      /* entry offset within g_smoke_code_buf */
+    uint32_t entry_off;      /* entry offset within the slot's code buffer */
+    uint8_t  *code_buf;      /* where the translated bytes live */
     uint32_t valid;
 };
 static struct Arm64Activation g_act[ARM64_ACT_SLOTS];
-static uint32_t g_translate_count;   /* the M5.1 gate: exactly 1 at boot */
-static uint32_t g_el0_excursions;    /* the M5.1 gate: exactly 2 at boot */
+static uint32_t g_translate_count;   /* the M5.1 gate: exactly 2 at boot */
+static uint32_t g_el0_excursions;    /* erets into EL0: exactly 4 at boot */
+static uint8_t *g_act_code_buf;      /* the current activation's code buffer
+                                      * (set by arm64_activate, consumed by
+                                      * the EL0 user mapping) */
 
 /* M5.2: the tick counter, bumped by the EL1h IRQ handler. Volatile —
  * written by arm64_tick_irq, read by the wait loop. */
@@ -261,7 +273,7 @@ static void arm64_flush_icache(uintptr_t addr, size_t len)
 }
 
 /* M5 selfcheck, split in two: the kernel tree first (runs before the
- * user map exists), the user-tree proofs inside arm64_el0_activate. */
+ * user map exists), the user-tree proofs inside arm64_el0_activate_for. */
 static void mmu_selfcheck_kernel(void)
 {
     uint64_t d_img = mmu_walk_kernel(0xFFFF000040080000ULL);
@@ -300,12 +312,14 @@ static void mmu_selfcheck_user(void)
     uart_puts((d_user & (1UL << 54)) ? " uxn=1\\r\\n" : " uxn=0 (el0-exec)\\r\\n");
 }
 
-/* M5.1: the activation cache core (§10.192). MISS: translate the .tmo
- * into g_smoke_code_buf, flush the I-cache, record the slot, increment
- * g_translate_count. HIT (name+hash+size all match): skip the
- * translator entirely, reuse entry_off/len, no re-flush (bytes
+/* M5.1/M5.6: the activation cache core (§10.192). MISS: translate the
+ * .tmo into `out_buf` (the slot's own buffer — smoke vs LCG, so a HIT
+ * is literally the same bytes), flush the I-cache, record the slot,
+ * increment g_translate_count. HIT (name+hash+size all match): skip
+ * the translator entirely, reuse entry_off/len, no re-flush (bytes
  * unchanged). Returns TX_AR_OK or the translator's error (printed). */
-static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len)
+static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len,
+                          uint8_t *out_buf)
 {
     struct Arm64Activation *act = NULL;
     int i;
@@ -320,6 +334,7 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
         /* HIT — no translation, no flush, no counter bump. */
         g_code_len = act->code_len;
         g_entry_off = act->entry_off;
+        g_act_code_buf = act->code_buf;
         uart_puts("[SIMI] activation cache HIT (reusing entry_off=");
         print_u64(g_entry_off);
         uart_puts(")\\r\\n");
@@ -331,7 +346,7 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
     uart_puts(name);
     uart_puts(".tmo with kernel/simi_arm.c...\\r\\n");
     uint32_t len = 0, entry_off = 0;
-    int rc = simi_arm_translate(tmo, tmo_len, g_smoke_code_buf,
+    int rc = simi_arm_translate(tmo, tmo_len, out_buf,
                                 ARM64_SMOKE_CODE_BUF_SIZE,
                                 "main", 0, 0, 0, 0, &len, &entry_off);
     if (rc != TX_AR_OK) {
@@ -344,7 +359,8 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
     }
     g_code_len = len;
     g_entry_off = entry_off;
-    arm64_flush_icache((uintptr_t)g_smoke_code_buf, (size_t)len);
+    g_act_code_buf = out_buf;
+    arm64_flush_icache((uintptr_t)out_buf, (size_t)len);
     g_translate_count++;
     uart_puts("[SIMI] activation cache MISS (translated ");
     print_u64(len);
@@ -365,6 +381,7 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
         act->tmo_len = tmo_len;
         act->code_len = len;
         act->entry_off = entry_off;
+        act->code_buf = out_buf;
         act->valid = 1;
     }
     return TX_AR_OK;
@@ -383,7 +400,7 @@ static int arm64_activate(const char *name, const uint8_t *tmo, uint32_t tmo_len
 static void arm64_el1_entry(void)
 {
     int rc = arm64_activate("arm64_boot_smoke", g_arm64_boot_smoke_tmo,
-                            g_arm64_boot_smoke_tmo_len);
+                            g_arm64_boot_smoke_tmo_len, g_smoke_code_buf);
     if (rc != TX_AR_OK)
         return;
     uart_puts("[SIMI] calling entry directly...\\r\\n");
@@ -405,42 +422,35 @@ static void arm64_el1_entry(void)
     uart_puts(" (expected 0x2a = 42)\\r\\n");
 }
 
-/* §10.200: the per-slice LCG teeth on the arm64 kernel — the fairness
- * probe's "the work provably ran" proof, mirrored from the RISC-V
- * kernel's task LCG (kernel_riscv.c, rv_fp_task_common): translate the
- * embedded lcg_slice.tmo and call the entry as a real function. The
- * program runs one full per-slice budget (acc = acc*1664525 +
+/* §10.200/§10.201: the per-slice LCG teeth on the arm64 kernel — the
+ * fairness probe's "the work provably ran" proof, mirrored from the
+ * RISC-V kernel's task LCG (kernel_riscv.c, rv_fp_task_common): run
+ * the embedded lcg_slice.tmo and call the entry as a real function.
+ * The program runs one full per-slice budget (acc = acc*1664525 +
  * 1013904223 mod 2^32, exactly sp->work = 200,000 iterations from 0)
  * and RETURNS the acc tooth: 0x0b6f2a40 = 191834688 — the same value
  * the parity-corpus lcg_fairness.simi pins and the RISC-V kernel
  * accumulates five of to its 0xf2dc5340 all-heavy tooth. A wrong
  * recurrence (missing mod-2^32 mask, swapped constants, off-by-one
- * count) changes the value and the PASS/FAIL verdict fails. Direct
- * translation (not the activation cache — it runs once, before the
- * timer arms, so the M5.1 cache counts and the M5.2 tick interleave
- * stay untouched by construction). */
+ * count) changes the value and the PASS/FAIL verdict fails.
+ *
+ * §10.201: the activation CACHE now serves the LCG (MISS here at EL1,
+ * HIT at the two EL0 excursions) instead of the direct translation of
+ * §10.200 — the cache HIT means the EL0 runs execute literally the
+ * same bytes as this EL1 run, which is what makes "the user-mode
+ * containment path executes the identical work" a byte-level claim,
+ * not an equal-results coincidence. One translation serves all three
+ * executions; g_translate_count therefore ends at 2 (smoke + LCG) at
+ * boot. */
 static void arm64_lcg_slice_test(void)
 {
-    uart_puts("[SIMI] translating lcg_slice.tmo with kernel/simi_arm.c...\\r\\n");
-    uint32_t len = 0, entry_off = 0;
-    int rc = simi_arm_translate(g_arm64_lcg_slice_tmo, g_arm64_lcg_slice_tmo_len,
-                                g_lcg_code_buf, ARM64_SMOKE_CODE_BUF_SIZE,
-                                "main", 0, 0, 0, 0, &len, &entry_off);
-    if (rc != TX_AR_OK) {
-        uart_puts("[SIMI] lcg_slice translate FAILED, rc=");
-        print_u64((uint64_t)(unsigned)rc);
-        uart_puts(" (");
-        uart_puts(simi_arm_strerror(rc));
-        uart_puts(")\\r\\n");
+    int rc = arm64_activate("lcg_slice", g_arm64_lcg_slice_tmo,
+                            g_arm64_lcg_slice_tmo_len, g_lcg_code_buf);
+    if (rc != TX_AR_OK)
         return;
-    }
-    arm64_flush_icache((uintptr_t)g_lcg_code_buf, (size_t)len);
-    uart_puts("[SIMI] lcg_slice translated ");
-    print_u64(len);
-    uart_puts(" bytes\\r\\n");
 
     typedef int64_t (*SimiEntryFn)(void);
-    SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_lcg_code_buf + entry_off);
+    SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_lcg_code_buf + g_entry_off);
 
     register uint64_t result __asm__("x9");
     __asm__ volatile(
@@ -467,21 +477,50 @@ static void arm64_lcg_slice_test(void)
  * machine off before any epilogue could run). */
 static void psci_system_off(void);
 static void arm64_el0_done(void) __attribute__((noreturn));
-static void arm64_el0_activate(void) __attribute__((noreturn));
+static void arm64_el0_activate_for(int prog) __attribute__((noreturn));
 
-/* M5/M5.1: run the translated program in EL0 from USER_CODE_VA — a VA
- * the kernel's own tables do not map. Activates through the cache (a
- * HIT after the EL1 entries), builds the user TTBR0 tree, writes the
- * svc stub, erets into the blob with x30 = stub. The blob's trampoline
- * `br x30`s into the stub, `svc #0` traps to arm64_svc_from_el0, which
- * stores x9 (the result) and erets into arm64_el0_done — this function
- * NEVER returns. g_el0_excursions counts the erets into EL0 (the M5.1
- * gate wants exactly two). */
-static void arm64_el0_activate(void)
+/* Which program the current EL0 excursion runs — the continuation
+ * (arm64_el0_done) dispatches on this. §10.201: TWO programs now take
+ * the containment path — the M5 boot smoke (42) and the per-slice LCG
+ * (0x0b6f2a40) — each with its own cache slot, so both prove "the
+ * user-mode containment executes the identical work" at the byte
+ * level (a cache HIT = the same emitted words). */
+#define ARM64_EL0_SMOKE 0
+#define ARM64_EL0_LCG   1
+static int g_el0_program = ARM64_EL0_SMOKE;
+static uint32_t g_el0_smoke_done, g_el0_lcg_done;   /* excursions per program */
+
+/* M5/M5.1/M5.6: run the selected translated program in EL0 from
+ * USER_CODE_VA — a VA the kernel's own tables do not map. Activates
+ * through the cache (a HIT after the EL1 entries), builds the user
+ * TTBR0 tree, writes the svc stub, erets into the blob with x30 =
+ * stub. The blob's trampoline `br x30`s into the stub, `svc #0` traps
+ * to arm64_svc_from_el0, which stores x9 (the result) and erets into
+ * arm64_el0_done — this function NEVER returns. g_el0_excursions
+ * counts the erets into EL0 (the M5.1 gate wants exactly four at
+ * boot: LCG x2 then smoke x2). The user mapping uses g_act_code_buf
+ * — set by arm64_activate to the slot's OWN buffer, so the smoke
+ * excursion maps the smoke page and the LCG excursion maps the LCG
+ * page (distinct physical pages; each excursion builds a fresh tree). */
+static void arm64_el0_activate_for(int prog)
 {
     g_el0_excursions++;
-    int rc = arm64_activate("arm64_boot_smoke", g_arm64_boot_smoke_tmo,
-                            g_arm64_boot_smoke_tmo_len);
+    const char *name;
+    const uint8_t *tmo;
+    uint32_t tmo_len;
+    uint8_t *out_buf;
+    if (prog == ARM64_EL0_LCG) {
+        name = "lcg_slice";
+        tmo = g_arm64_lcg_slice_tmo;
+        tmo_len = g_arm64_lcg_slice_tmo_len;
+        out_buf = g_lcg_code_buf;
+    } else {
+        name = "arm64_boot_smoke";
+        tmo = g_arm64_boot_smoke_tmo;
+        tmo_len = g_arm64_boot_smoke_tmo_len;
+        out_buf = g_smoke_code_buf;
+    }
+    int rc = arm64_activate(name, tmo, tmo_len, out_buf);
     if (rc != TX_AR_OK) {
         uart_puts("[SIMI] EL0 entry aborted (activate failed)\\r\\n");
         for (;;)
@@ -496,7 +535,7 @@ static void arm64_el0_activate(void)
     /* Map the code buffer's physical page (the cached one, already
      * flushed at kernel VA) plus the stack/stub/scratch backing pages
      * into a FRESH user tree — only the code page is shared. */
-    uint64_t code_pa = (uint64_t)(uintptr_t)g_smoke_code_buf - KERNEL_VIRT_OFF;
+    uint64_t code_pa = (uint64_t)(uintptr_t)g_act_code_buf - KERNEL_VIRT_OFF;
     mmu_build_user(code_pa);
     /* The EL0 alias is a distinct VA from the kernel VA; flush it too
      * (dc cvau / ic ivau per line) so real silicon sees the cached bytes
@@ -509,6 +548,7 @@ static void arm64_el0_activate(void)
     /* The handshake: the svc handler erets to this address (boot_arm64.S
      * reads g_user_ret_addr, restores EL1h, erets). A real function
      * entry, not a computed-goto label — see arm64_el0_done above. */
+    g_el0_program = prog;
     g_user_result = 0;
     g_user_ret_addr = (uint64_t)(uintptr_t)arm64_el0_done;
 
@@ -543,9 +583,10 @@ static void arm64_el0_activate(void)
  * each iteration (the IRQ handler bumps it). */
 static void arm64_wait_ticks(uint32_t target)
 {
-    /* The timer was armed in main before the EL0 excursions (§10.196)
-     * and the handler re-arms on every tick, so there is nothing to arm
-     * here. Self-contained masking: unmask IRQs for the idle wait (the
+    /* The timer was armed by the LCG continuation's handoff before the
+     * smoke excursions (§10.196/§10.201) and the handler re-arms on
+     * every tick, so there is nothing to arm here. Self-contained
+     * masking: unmask IRQs for the idle wait (the
      * M5.3 phase calls this a SECOND time after the M5.2 gate re-masked,
      * so the mask state must not be assumed from the caller) and
      * re-mask before returning. Each tick pended through an EL0 window
@@ -565,10 +606,13 @@ static void arm64_wait_ticks(uint32_t target)
 /* The EL0 excursion's continuation (defined after psci_system_off):
  * entered via the svc handler's eret with TTBR0 still the user tables
  * and the kernel SP (SP_EL1 never changed across the excursion — the
- * eret into EL0 switched to SP_EL0). Prints the result; if this is the
- * first excursion, launches the SECOND EL0 excursion (the M5.1 gate:
- * two EL0 entries, both cache HITs, one translation total); after the
- * second, runs the M5.2 tick gate, then powers off. */
+ * eret into EL0 switched to SP_EL0). Dispatches on which program ran
+ * (§10.201): the LCG excursions come FIRST (both cache HITs — the
+ * containment path re-executes the EL1 slice's exact bytes), and the
+ * second LCG continuation performs the M5.2 handoff (arm the timer,
+ * launch the smoke excursions); the smoke excursions follow (both
+ * HITs, the committed M5.1 pair) and the second smoke continuation
+ * runs the M5.2 tick gate, the M5.3 nesting probe, then powers off. */
 static void arm64_el0_done(void)
 {
     /* M5.2 contention probe (§10.196): the svc handler returns with DAIF
@@ -581,14 +625,39 @@ static void arm64_el0_done(void)
      * prints and the next excursion's setup must run masked, so the
      * next physical fire pends deterministically and is taken at the
      * next daifclr boundary (the next el0_done or the wait phase) —
-     * every tick's position is pinned, independent of UART timing. */
+     * every tick's position is pinned, independent of UART timing. The
+     * LCG windows run before the timer arms, so the daifclr there has
+     * nothing pending by construction. */
     asm volatile("msr daifclr, #2" ::: "memory");   /* take the pended tick */
     asm volatile("msr daifset, #2" ::: "memory");   /* re-mask for the prints */
+    if (g_el0_program == ARM64_EL0_LCG) {
+        /* §10.201: the LCG excursion's continuation — the containment
+         * proof for the per-slice LCG. The value must equal the EL1
+         * slice's tooth 0x0b6f2a40 EXACTLY: the EL0 run re-executes
+         * the same cached bytes (cache HIT, no re-translation), so a
+         * discrepancy would be a containment/eret fault, not a codegen
+         * change. After the second LCG excursion, hand off to the
+         * M5.2 probe: arm the timer, then the smoke excursions pend
+         * the ticks through their windows exactly as the committed
+         * sequence did. */
+        uart_puts("[M5] returned from EL0 (lcg slice) -- user result=");
+        print_u64(g_user_result);
+        uart_puts(" (expected 0x0b6f2a40 = 191834688) ");
+        uart_puts(g_user_result == 0x0b6f2a40ULL ? "PASS\\r\\n" : "FAIL\\r\\n");
+        g_el0_lcg_done++;
+        if (g_el0_lcg_done < 2)
+            arm64_el0_activate_for(ARM64_EL0_LCG);   /* second LCG excursion (HIT) */
+        arm_timer_arm();
+        uart_puts("[M5.2] contention probe: 100 ms ticks armed before the EL0 "
+                  "excursions (they pend through each EL0 window)\\r\\n");
+        arm64_el0_activate_for(ARM64_EL0_SMOKE);
+    }
     uart_puts("[M5] returned from EL0 -- user result=");
     print_u64(g_user_result);
     uart_puts(" (expected 0x2a = 42)\\r\\n");
-    if (g_el0_excursions < 2)
-        arm64_el0_activate();   /* second EL0 excursion (HIT) */
+    g_el0_smoke_done++;
+    if (g_el0_smoke_done < 2)
+        arm64_el0_activate_for(ARM64_EL0_SMOKE);   /* second smoke excursion (HIT) */
     arm64_wait_ticks(M52_TICK_TARGET);
     /* M5.3 (§10.197): the nesting probe — a SEPARATE phase after the
      * M5.2 gate, so the M5.2 assertions stay byte-identical. Wait for
@@ -649,34 +718,33 @@ void kernel_arm64_main(void)
      * (arm64_wait_ticks), so no tick can fire during the entries. */
     gic_init();
     arm_timer_init();
-    /* M5.1 gate (four entries, one translation, all 42): the first EL1
-     * entry is the cache MISS (translate + call); the second EL1 entry
-     * and both EL0 excursions are HITs (reuse, no retranslation). The
-     * EL0 path never returns — arm64_el0_done launches the second EL0
-     * excursion, then runs the M5.2 tick gate, then PSCI SYSTEM_OFF. */
+    /* M5.1/M5.6 gate (six entries, two translations): smoke EL1 MISS +
+     * HIT (42, 42), then the LCG slice EL1 MISS (0x0b6f2a40), then the
+     * LCG's two EL0 excursions (HIT, HIT — the containment path
+     * re-executing the identical cached bytes), then the smoke's two
+     * EL0 excursions (HIT, HIT — the committed M5.1 pair). The EL0
+     * path never returns — arm64_el0_done chains the LCG pair, the
+     * M5.2 timer-arm handoff, the smoke pair, the tick gate, the M5.3
+     * nesting probe, then PSCI SYSTEM_OFF. */
     arm64_el1_entry();
     arm64_el1_entry();
-    /* §10.200: the per-slice LCG teeth — one full per-slice budget of
-     * the fairness probe's task LCG, translated + executed in EL1 and
+    /* §10.200/§10.201: the per-slice LCG teeth — one full per-slice
+     * budget of the fairness probe's task LCG, executed in EL1 through
+     * the activation cache (MISS: one translation, slot 1) and
      * asserted to 0x0b6f2a40 (the RISC-V kernel's per-slice tooth).
-     * Runs HERE, after the M5.1 four-entry gate and BEFORE the timer
-     * arms, with IRQs still masked — no tick can fire during the
-     * ~4.4M-A64-instruction run, so the M5.2 tick gate's count and
-     * interleave are untouched by construction. */
+     * Runs HERE, after the M5.1 smoke gate and BEFORE the timer arms,
+     * with IRQs still masked — no tick can fire during the run, so
+     * the M5.2 tick gate's count and interleave are untouched by
+     * construction. */
     arm64_lcg_slice_test();
-    /* M5.2 contention probe (§10.196): arm the timer BEFORE the EL0
-     * excursions. The EL0 program is a 1e8-iteration loop, so a 100 ms
-     * tick fires DURING each EL0 window, pends against the EL0 SPSR's I
-     * mask (0x3c0), and is taken exactly once when the continuation
-     * clears I on return — the [TICK N] lines interleave with the
-     * excursion logs, and the unbroken 1..4 stream is the zero-lost-tick
-     * proof. IRQs stay masked here; the unmask happens at the
-     * continuation entry (arm64_el0_done). */
-    arm_timer_arm();
-    uart_puts("[M5.2] contention probe: 100 ms ticks armed before the EL0 "
-              "excursions (they pend through each EL0 window)\\r\\n");
-    arm64_el0_activate();
-    /* Unreachable: arm64_el0_activate is noreturn. */
+    /* §10.201: the LCG EL0 excursions — the containment path
+     * re-executes the EL1 slice's EXACT cached bytes (both HITs) at
+     * EL0 and must return the same tooth 0x0b6f2a40. They run before
+     * the timer arms (no tick can pend through them); the M5.2 probe's
+     * arm and the smoke excursions launch from the LCG continuation's
+     * handoff (arm64_el0_done). */
+    arm64_el0_activate_for(ARM64_EL0_LCG);
+    /* Unreachable: arm64_el0_activate_for is noreturn. */
     for (;;)
         ;
 }
