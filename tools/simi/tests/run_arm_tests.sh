@@ -69,6 +69,15 @@ for src in *.simi; do
     # real gate for this program; here we assert the result (42) only.
     if [ "$name" = arm64_boot_smoke ]; then
         "$VERIFY" "$name.tmo" main "$expected" --max-steps 2000000000
+    elif [ "$name" = lcg_slice ]; then
+        # §10.200: kernel-embedded LCG fixture (the arm64 kernel boot is
+        # its real gate — translate + execute + serial assert of
+        # 0x0b6f2a40). It still RUNS here (its ~4.4M A64 steps fit the
+        # tight 10M budget — no raised budget needed) but without the
+        # --steps baseline check: it has no committed row, the
+        # arm64_boot_smoke model ("a row no bench maintains would be a
+        # lie").
+        "$VERIFY" "$name.tmo" main "$expected"
     else
         "$VERIFY" "$name.tmo" main "$expected" --steps
     fi

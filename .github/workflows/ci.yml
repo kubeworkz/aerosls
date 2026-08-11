@@ -702,6 +702,19 @@ jobs:
             tail -30 arm64_boot.log >&2
             exit 1
           }
+          # §10.200: the per-slice LCG teeth on the arm64 kernel — the
+          # embedded lcg_slice.tmo runs one full per-slice budget of the
+          # fairness probe's task LCG (200,000 iterations, mod 2^32) in
+          # EL1 and RETURNS the acc tooth; the serial log must assert
+          # 0x0b6f2a40 = 191834688 with a PASS verdict. A wrong
+          # recurrence (missing mask, swapped constants, off-by-one
+          # count) fails here — the "the work provably ran" proof,
+          # mirrored from the RISC-V kernel's task LCG.
+          grep -a "lcg slice executed (one per-slice budget) -- acc=0x000000000b6f2a40 (expected 0x0b6f2a40 = 191834688) PASS" arm64_boot.log || {
+            echo "FAILED: the LCG slice did not execute and return the per-slice tooth 0x0b6f2a40" >&2
+            tail -30 arm64_boot.log >&2
+            exit 1
+          }
           # M5 (plan doc §10.191): the kernel was relinked to TTBR1 high
           # VAs, so the first assert pins the TTBR1-pure claim (TTBR0 is
           # parked on an all-invalid root). The two walk lines pin the

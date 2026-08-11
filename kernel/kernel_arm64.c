@@ -45,6 +45,7 @@
 #include "arch/arm64/mmu.h"
 #include "arch/arm64/uart_pl011.h"
 #include "arm64_boot_smoke_tmo.h"
+#include "arm64_lcg_slice_tmo.h"
 #include "simi_arm.h"
 
 /* PSCI 0.2 function ids (smc #0 to the virt EL3 monitor). */
@@ -86,6 +87,14 @@ void *memset(void *s, int c, unsigned long n)
 static uint8_t g_smoke_code_buf[ARM64_SMOKE_CODE_BUF_SIZE]
     __attribute__((aligned(4096)));
 static uint32_t g_code_len, g_entry_off;
+
+/* §10.200: the LCG slice's code buffer — a SECOND static buffer so the
+ * boot smoke's translated code survives untouched for the EL0
+ * excursions. The LCG program runs once, in EL1, before the timer
+ * arms; it deliberately bypasses the activation cache (no reuse to
+ * serve), so the M5.1 gate counts stay exact by construction. */
+static uint8_t g_lcg_code_buf[ARM64_SMOKE_CODE_BUF_SIZE]
+    __attribute__((aligned(16)));
 
 /* M5.1 activation cache (§10.192, the x86 kernel/simi_translate.c
  * precedent, ISA doc §11): translate-on-first-use. The cache key is
@@ -396,6 +405,58 @@ static void arm64_el1_entry(void)
     uart_puts(" (expected 0x2a = 42)\\r\\n");
 }
 
+/* §10.200: the per-slice LCG teeth on the arm64 kernel — the fairness
+ * probe's "the work provably ran" proof, mirrored from the RISC-V
+ * kernel's task LCG (kernel_riscv.c, rv_fp_task_common): translate the
+ * embedded lcg_slice.tmo and call the entry as a real function. The
+ * program runs one full per-slice budget (acc = acc*1664525 +
+ * 1013904223 mod 2^32, exactly sp->work = 200,000 iterations from 0)
+ * and RETURNS the acc tooth: 0x0b6f2a40 = 191834688 — the same value
+ * the parity-corpus lcg_fairness.simi pins and the RISC-V kernel
+ * accumulates five of to its 0xf2dc5340 all-heavy tooth. A wrong
+ * recurrence (missing mod-2^32 mask, swapped constants, off-by-one
+ * count) changes the value and the PASS/FAIL verdict fails. Direct
+ * translation (not the activation cache — it runs once, before the
+ * timer arms, so the M5.1 cache counts and the M5.2 tick interleave
+ * stay untouched by construction). */
+static void arm64_lcg_slice_test(void)
+{
+    uart_puts("[SIMI] translating lcg_slice.tmo with kernel/simi_arm.c...\\r\\n");
+    uint32_t len = 0, entry_off = 0;
+    int rc = simi_arm_translate(g_arm64_lcg_slice_tmo, g_arm64_lcg_slice_tmo_len,
+                                g_lcg_code_buf, ARM64_SMOKE_CODE_BUF_SIZE,
+                                "main", 0, 0, 0, 0, &len, &entry_off);
+    if (rc != TX_AR_OK) {
+        uart_puts("[SIMI] lcg_slice translate FAILED, rc=");
+        print_u64((uint64_t)(unsigned)rc);
+        uart_puts(" (");
+        uart_puts(simi_arm_strerror(rc));
+        uart_puts(")\\r\\n");
+        return;
+    }
+    arm64_flush_icache((uintptr_t)g_lcg_code_buf, (size_t)len);
+    uart_puts("[SIMI] lcg_slice translated ");
+    print_u64(len);
+    uart_puts(" bytes\\r\\n");
+
+    typedef int64_t (*SimiEntryFn)(void);
+    SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_lcg_code_buf + entry_off);
+
+    register uint64_t result __asm__("x9");
+    __asm__ volatile(
+        "blr %[addr]\n"
+        : "+r"(result)
+        : [addr] "r"((unsigned long)(uintptr_t)fn)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+          "x10", "x11", "x12", "x29", "x30", "memory");
+    uint64_t acc = result;   /* captured from x9 before anything can clobber it */
+
+    uart_puts("[SIMI] lcg slice executed (one per-slice budget) -- acc=");
+    print_u64(acc);
+    uart_puts(" (expected 0x0b6f2a40 = 191834688) ");
+    uart_puts(acc == 0x0b6f2a40ULL ? "PASS\\r\\n" : "FAIL\\r\\n");
+}
+
 /* M5 continuation: the svc handler erets here (boot_arm64.S reads
  * g_user_ret_addr). A real function entry — deliberately NOT a
  * computed-goto label: the first M5 attempt used `&&after_eret` and GCC
@@ -595,6 +656,14 @@ void kernel_arm64_main(void)
      * excursion, then runs the M5.2 tick gate, then PSCI SYSTEM_OFF. */
     arm64_el1_entry();
     arm64_el1_entry();
+    /* §10.200: the per-slice LCG teeth — one full per-slice budget of
+     * the fairness probe's task LCG, translated + executed in EL1 and
+     * asserted to 0x0b6f2a40 (the RISC-V kernel's per-slice tooth).
+     * Runs HERE, after the M5.1 four-entry gate and BEFORE the timer
+     * arms, with IRQs still masked — no tick can fire during the
+     * ~4.4M-A64-instruction run, so the M5.2 tick gate's count and
+     * interleave are untouched by construction. */
+    arm64_lcg_slice_test();
     /* M5.2 contention probe (§10.196): arm the timer BEFORE the EL0
      * excursions. The EL0 program is a 1e8-iteration loop, so a 100 ms
      * tick fires DURING each EL0 window, pends against the EL0 SPSR's I

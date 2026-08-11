@@ -1,0 +1,40 @@
+; lcg_slice.simi — the per-slice LCG fixture, embedded into the arm64
+; kernel's boot smoke (kernel/arm64_lcg_slice_tmo.h) and executed there
+; by kernel/simi_arm.c so the kernel boot itself carries the fairness
+; probe's "the work provably ran" teeth (the RISC-V kernel's per-slice
+; LCG story, mirrored on AArch64). It runs ONE full per-slice budget of
+; the kernel's task LCG (kernel_riscv.c, rv_fp_task_common):
+; acc = acc * 1664525 + 1013904223 (mod 2^32, Numerical Recipes
+; constants) for exactly sp->work = 200,000 iterations from seed 0 —
+; the same recurrence lcg_fairness.simi pins in the four-way parity
+; corpus — and RETURNS the raw acc, so the kernel can print the tooth
+; itself: 0x0b6f2a40 = 191834688. The mod-2^32 AND is SIMI's explicit
+; truncation of the kernel's uint32_t wrap (64-bit SIMI registers); a
+; missing mask, swapped constants, or an off-by-one count changes the
+; value and the kernel's serial assert (and this fixture's Expected
+; result) fails.
+;
+; Kernel-embedded, NOT a parity-corpus fixture (the arm64_boot_smoke
+; model, plan doc §10.196): its real gate is the kernel boot's
+; translate + execute + serial assert, not the host parity tables. The
+; ARM runner still executes it (its ~4.4M A64 steps fit the tight 10M
+; budget — no raised budget needed) and the size gate pins its
+; emission; the interp/x86/RV64 runners and the bench tools skip it.
+; Expected result: 191834688
+.entry main
+main:
+    ENTER #8
+    LOADI64 r2, #1664525, i64        ; K1 = 1664525
+    LOADI64 r3, #1013904223, i64     ; K2 = 1013904223
+    LOADI64 r4, #4294967295, i64     ; 2^32-1 — the mod-2^32 mask (uint32_t acc)
+    LOADI r8, #0, i64                ; zero — for the NE count compare (CMP is reg+reg)
+    LOADI r0, #0, i64                ; acc = 0
+    LOADI r1, #200000, i64           ; w = 200,000 — one full per-slice budget
+loop:
+    MUL r0, r0, r2, i64              ; acc * K1
+    ADD r0, r0, r3, i64              ; + K2
+    AND r0, r0, r4, i64              ; & 0xFFFFFFFF (the kernel's uint32_t wrap)
+    SUB r1, r1, #1, i64              ; w--
+    CMP r5, r1, r8, i64, NE          ; r5 = (w != 0)
+    BC r5, loop
+    RET                              ; returns acc = 0x0b6f2a40 (191834688)

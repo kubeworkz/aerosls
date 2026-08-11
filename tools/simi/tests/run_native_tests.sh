@@ -21,6 +21,17 @@ skip=0
 
 for src in *.simi; do
     name="${src%.simi}"
+    if [ "$name" = "lcg_slice" ]; then
+        # §10.200: the per-slice LCG fixture is kernel-embedded (the
+        # arm64 kernel's SIMI smoke carries its real gate — translate +
+        # execute + serial assert of 0x0b6f2a40), NOT a parity-corpus
+        # fixture (the arm64_boot_smoke model, plan doc §10.196). Its
+        # host parity shape is covered by lcg_fairness.simi (same loop,
+        # committed with step baselines in the corpus).
+        echo "SKIP  $name (kernel-embedded LCG fixture — the arm64 kernel boot is its gate, plan doc §10.200)"
+        skip=$((skip+1))
+        continue
+    fi
     if [ "$name" = "mem_ops" ]; then
         echo "SKIP  $name (address-0 pointer is a Phase 1 interpreter-only convenience; see mem_ops_native)"
         skip=$((skip+1))

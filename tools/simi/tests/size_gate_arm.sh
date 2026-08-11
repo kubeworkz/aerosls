@@ -994,7 +994,7 @@ declare -A M0_BASELINES=(
     [jmpr_basic]=1088 [jmpr_calc]=1288 [jmpr_calc_bit]=1384 [jmpr_calc_mul]=1272
     [jmpr_callret]=2036 [jmpr_callret_arg]=3344 [jmpr_chain]=1256 [jmpr_chain2]=1248 [jmpr_chain3]=1248 [jmpr_chain4]=1248 [jmpr_chain5]=1824 [jmpr_chain6]=2460 [jmpr_chain7]=3020 [jmpr_chain8]=3064 [jmpr_chain9]=2828 [jmpr_chain10]=3064 [jmpr_chain11]=3100 [jmpr_chain12]=3140 [jmpr_chain13]=3492 [jmpr_chain14]=3368 [jmpr_chain15]=3492 [jmpr_chain16]=3944 [jmpr_chain17]=2852 [jmpr_chain18]=3956 [jmpr_chain19]=2824 [jmpr_chain20]=2864 [jmpr_chain21]=2880 [jmpr_chain22]=4864 [jmpr_chain23]=2248 [jmpr_chain24]=2364 [jmpr_chain25]=2964 [jmpr_chain26]=2344 [jmpr_chain27]=4500 [jmpr_chain28]=2248    [jmpr_chain29]=4600    [jmpr_chain30]=2888    [jmpr_chain31]=6204 [jmpr_chain32]=12828    [jmpr_chain33]=7468    [jmpr_chain34]=4796    [jmpr_chain35]=1240    [jmpr_chain36]=1180    [jmpr_chain37]=9348 [jmpr_chain38]=11364 [jmpr_chain39]=7964 [jmpr_chain40]=7508    [jmpr_chain41]=7556 [jmpr_chain42]=5612    [jmpr_chain43]=1748 [jmpr_chain44]=1332 [jmpr_cross]=1212 [jmpr_deadfull]=3316 [jmpr_deadmult]=3076 [jmpr_dyn]=1148 [jmpr_fall]=1376 [jmpr_fall2]=1228 [jmpr_foldreach]=3092 [jmpr_join]=1144 [jmpr_mid]=1200 [jmpr_mix]=1312 [jmpr_table]=1344 [jmpr_unreach]=3044
     [epi_merge]=1140 [epi_merge2]=1160 [epi_merge3]=1180 [epi_merge4]=1148 [epi_merge5]=1168 [epi_merge6]=1156
-    [lcg_fairness]=1304
+    [lcg_fairness]=1304 [lcg_slice]=1092
     [loadi64]=968
     [loop_sum]=1040 [mem_neg]=1308 [mem_ops_native]=1048 [mem_pre]=2012
     [mem_reg]=1764 [obj_ops]=1164 [ptr_ops]=1120
@@ -1012,6 +1012,17 @@ declare -A M0_BASELINES=(
     [rv64_float_smoke_a]=968 [rv64_float_smoke_b]=960 [src_resident]=1120
     [straight_line_bench]=1104 [stress_atomics]=2632 [tail_ret]=1048
 )
+
+# lcg_slice is the arm64 kernel-embedded LCG fixture (measured at this
+# commit — post-M0, same discipline as lcg_fairness): one full per-slice
+# LCG budget (200,000 iterations) returning the raw acc tooth
+# 0x0b6f2a40, whose real gate is the arm64 kernel boot's translate +
+# execute + serial assert (plan doc §10.200), NOT the parity corpus
+# (it is skipped there and in the bench tools — the arm64_boot_smoke
+# model). The ARM runner still executes it (its ~4.4M A64 steps fit the
+# tight 10M budget) without a steps row; this row pins its emission
+# (1092 bytes — a codegen regression that bloats the loop body fails
+# here).
 
 # lcg_fairness is the cross-ISA fairness fixture (measured at this
 # commit — a post-M0 row, so the baseline is the current emission, the
