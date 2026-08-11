@@ -8001,6 +8001,50 @@ Design decisions:
   steps, no steps row) and the real-A64 leg; the size gate pins the
   1212-byte emission.
 
+### 10.203 M5.7 teeth as built: the EL0-only claim machine-checked — the EL1 mem_touch attempt
+
+§10.202's "EL0-only by construction" was a claim (the baked scratch is
+USER_SCRATCH_VA, unmapped in TTBR1, so at EL1 it must fault) backed
+only by the design argument. This teeth closes that: a THIRD arm64
+kernel ELF, `sls_arm64_kernel_teeth.elf` (`make arm64-teeth`, the same
+sources with `kernel_arm64.c` compiled under
+`-DARM64_TEETH_EL1_MEMTOUCH`), whose main() skips the gate sequence
+and instead attempts to run the mem_touch fixture at EL1 with the
+SAME baked scratch (the slot's normal activation path, scratch
+= USER_SCRATCH_VA). Its first STORE faults — Data Abort from current
+EL, EC=0x25, far=0x10005000 — traps to the EL1h sync slot, and CI
+asserts the HANG (rc=124), the [TEETH] attempt line, the [SYNC]
+lines (ec=0x25, far=0x0000000010005000), and the ABSENCE of any
+result or [TEETH] FAIL line. Boot-verified on real A64: rc=124, the
+fault fires with exactly that syndrome/VA, and the hang is immediate
+(the fault happens microseconds after the translation MISS).
+
+Design decisions:
+- **The EL1h sync slot gained a real handler** (boot_arm64.S
+  arm64_sync_el1h): print ESR_EL1/FAR_EL1 through a C helper
+  (`arm64_sync_el1h_c`) and halt. Previously the slot was the silent
+  wfi stub; NO committed gate ever takes a sync-from-current-EL
+  exception (the svc-return path is the sync-from-lower-EL slot, the
+  tick path is IRQ), so the stock boot's log is byte-identical
+  (re-verified: rc=0, MISS=3, HIT=6, ticks=6, mem EL0=2, ordered
+  stream exact). A fault with any other EC prints the mismatch
+  verdict and fails the teeth greps.
+- **The teeth build is honest about dead code**: the gate-sequence
+  functions (arm64_el1_entry/arm64_el0_done/arm64_wait_ticks/...) are
+  never called in this variant, so its object rule adds
+  `-Wno-unused-function` (documented in the Makefile — expected
+  warnings, not bugs). The object is named `*.ar64.o` so the existing
+  `make clean` pattern removes it.
+- **Teeth-asserted, not just logged**: the CI step fails on rc=0
+  (the program COMPLETED — the claim is false), on rc != 124 (early
+  crash, wrong failure), on a missing [SYNC] line (no fault fired),
+  on ec != 0x25 (wrong exception class), on far != 0x10005000 (wrong
+  faulting VA), on [TEETH] FAIL, or on a mem_touch result line. The
+  teeth ELF is censused like the stock one (same sources + one -D:
+  the zero-FP/SIMD claim holds). This is the same teeth-in-CI
+  discipline as the FP/SIMD and RV64 fp-save gates: a claim backed by
+  a deliberately broken attempt that must fail loudly.
+
 ---
 
 

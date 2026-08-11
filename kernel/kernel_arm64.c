@@ -268,6 +268,38 @@ static void print_u64_dec(uint64_t v)
     uart_puts(buf + i);
 }
 
+/* The EL1h sync slot's C helper (boot_arm64.S arm64_sync_el1h): print
+ * the exception syndrome, its EC class, and the faulting VA, then
+ * return — the assembly halts. The unhandled-exception backstop: no
+ * gate in the committed boot ever takes a sync-from-current-EL
+ * exception (the svc-return path is the sync-from-lower-EL slot, the
+ * tick path is IRQ), so this never fires in the normal sequence. Its
+ * one caller today is the teeth build (§10.203,
+ * -DARM64_TEETH_EL1_MEMTOUCH): the EL0-only mem_touch fixture is
+ * deliberately run at EL1, its first STORE to the baked
+ * USER_SCRATCH_VA (unmapped in TTBR1) faults HERE — EC=0x25 (Data
+ * Abort from current EL) with far=0x0000000010005000 — and CI
+ * asserts the lines plus the resulting hang (rc=124). Any other EC
+ * prints the mismatch verdict and fails the teeth. */
+void arm64_sync_el1h_c(uint64_t esr, uint64_t far)
+{
+    uint64_t ec = esr >> 26;
+    uart_puts("[SYNC] EL1h synchronous exception: esr=");
+    print_u64(esr);
+    uart_puts(" ec=");
+    print_u64(ec);
+    uart_puts(" far=");
+    print_u64(far);
+    uart_puts("\\r\\n");
+    uart_puts(ec == 0x25
+        ? "[SYNC] Data Abort from EL1: the faulting VA is unmapped in the "
+          "kernel's TTBR1 tables -- the EL1 mem_touch attempt faulted as "
+          "designed (teeth PASS)\\r\\n"
+        : "[SYNC] unexpected exception class -- the EL1 mem_touch attempt "
+          "did NOT fault as designed (teeth FAIL)\\r\\n");
+    uart_puts("[SYNC] unhandled -- halting (the hang is the teeth: rc=124)\\r\\n");
+}
+
 /* M4c: the translated code is DATA until it runs; the I-cache must be
  * invalidated (and the D-cache line cleaned to the point of
  * unification) before the first execute, or real silicon can run stale
@@ -482,6 +514,55 @@ static void arm64_lcg_slice_test(void)
     uart_puts(" (expected 0x0b6f2a40 = 191834688) ");
     uart_puts(acc == 0x0b6f2a40ULL ? "PASS\\r\\n" : "FAIL\\r\\n");
 }
+
+/* §10.203 teeth (ARM64_TEETH_EL1_MEMTOUCH build only): the
+ * "mem_touch is EL0-only by construction" claim, machine-checked.
+ * The fixture's baked scratch is USER_SCRATCH_VA — a VA the kernel's
+ * TTBR1 tables do NOT map — so the program CANNOT run at EL1: its
+ * first STORE faults, the EL1h sync slot (boot_arm64.S
+ * arm64_sync_el1h) prints the Data Abort (EC=0x25, far=0x10005000)
+ * and halts. This function prints the attempt, translates the mem
+ * slot through the SAME cache path the EL0 excursions use (scratch
+ * baked identically), and calls the entry directly at EL1. Reaching
+ * past the call is the teeth FAILING: the fault is expected BEFORE
+ * the first store completes, so a return means the baked VA was
+ * somehow mapped — the [TEETH] FAIL line + missing [SYNC] lines
+ * fail CI. */
+#ifdef ARM64_TEETH_EL1_MEMTOUCH
+static void arm64_teeth_el1_mem(void)
+{
+    uart_puts("[TEETH] attempting mem_touch at EL1 (baked scratch="
+              "USER_SCRATCH_VA 0x10005000, a VA the kernel's TTBR1 "
+              "tables do NOT map)...\\r\\n");
+    int rc = arm64_activate("mem_touch", g_arm64_mem_touch_tmo,
+                            g_arm64_mem_touch_tmo_len, g_mem_code_buf,
+                            USER_SCRATCH_VA);
+    if (rc != TX_AR_OK) {
+        uart_puts("[TEETH] FAIL: activate returned rc=");
+        print_u64((uint64_t)(unsigned)rc);
+        uart_puts("\\r\\n");
+        for (;;)
+            ;
+    }
+    typedef int64_t (*SimiEntryFn)(void);
+    SimiEntryFn fn = (SimiEntryFn)(uintptr_t)(g_mem_code_buf + g_entry_off);
+    register uint64_t result __asm__("x9");
+    __asm__ volatile(
+        "blr %[addr]\n"
+        : "+r"(result)
+        : [addr] "r"((unsigned long)(uintptr_t)fn)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+          "x10", "x11", "x12", "x29", "x30", "memory");
+    /* Unreachable by design: the first STORE faults and the EL1h sync
+     * slot halts. Reaching here means the EL0-only claim is wrong. */
+    uart_puts("[TEETH] FAIL: mem_touch executed at EL1 without faulting "
+              "(result=");
+    print_u64(result);
+    uart_puts(")\\r\\n");
+    for (;;)
+        ;
+}
+#endif
 
 /* M5 continuation: the svc handler erets here (boot_arm64.S reads
  * g_user_ret_addr). A real function entry — deliberately NOT a
@@ -769,6 +850,19 @@ void kernel_arm64_main(void)
     uart_puts("[M5] cpacr_el1=");
     print_u64(cpacr);
     uart_puts(" (FPEN=0: FP/SIMD accesses trap to EL1)\\r\\n");
+#ifdef ARM64_TEETH_EL1_MEMTOUCH
+    /* §10.203 teeth build (-DARM64_TEETH_EL1_MEMTOUCH): machine-check
+     * the "mem_touch is EL0-only by construction" claim by attempting
+     * it at EL1 — the baked user scratch faults, the EL1h sync slot
+     * prints the Data Abort (EC=0x25, far=0x10005000) and halts, and
+     * CI asserts the hang (rc=124) + the [TEETH]/[SYNC] lines + the
+     * ABSENCE of any result/FAIL line. The gate sequence below is
+     * skipped entirely in this build (its entries are asserted on the
+     * stock ELF). */
+    arm64_teeth_el1_mem();
+    for (;;)
+        ;
+#else
     /* M5.2: the GIC and the generic timer (CNTFRQ read) are init once,
      * before any entry; the timer is armed when the wait phase starts
      * (arm64_wait_ticks), so no tick can fire during the entries. */
@@ -805,4 +899,5 @@ void kernel_arm64_main(void)
     /* Unreachable: arm64_el0_activate_for is noreturn. */
     for (;;)
         ;
+#endif
 }

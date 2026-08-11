@@ -238,7 +238,7 @@ arm64_vectors:
     VEC_SLOT arm64_vector_stub      /* 0x080 IRQ,   EL1t  */
     VEC_SLOT arm64_vector_stub      /* 0x100 FIQ,   EL1t  */
     VEC_SLOT arm64_vector_stub      /* 0x180 SError, EL1t */
-    VEC_SLOT arm64_vector_stub      /* 0x200 sync,  EL1h  */
+    VEC_SLOT arm64_sync_el1h       /* 0x200 sync,  EL1h  ← unhandled backstop */
     VEC_SLOT arm64_irq_el1h        /* 0x280 IRQ,   EL1h  ← M5.2 tick */
     VEC_SLOT arm64_vector_stub      /* 0x300 FIQ,   EL1h  */
     VEC_SLOT arm64_vector_stub      /* 0x380 SError, EL1h */
@@ -250,6 +250,27 @@ arm64_vectors:
     VEC_SLOT arm64_vector_stub      /* 0x680 IRQ,   lower A32 */
     VEC_SLOT arm64_vector_stub      /* 0x700 FIQ,   lower A32 */
     VEC_SLOT arm64_vector_stub      /* 0x780 SError, lower A32 */
+
+/* EL1h synchronous exception (VBAR+0x200): the unhandled-exception
+ * backstop. NO gate in the committed boot takes one (the svc-return
+ * path is the sync-from-lower-EL slot, VBAR+0x400, and the tick path
+ * is IRQ) — the only caller today is the teeth build
+ * (-DARM64_TEETH_EL1_MEMTOUCH, plan doc §10.203), which deliberately
+ * runs the EL0-only mem_touch fixture at EL1: its first STORE to the
+ * baked USER_SCRATCH_VA (unmapped in the kernel's TTBR1 tables)
+ * faults HERE as a Data Abort from current EL (EC=0x25), the machine
+ * check that the "EL0-only by construction" claim is real rather than
+ * asserted. Print ESR_EL1/FAR_EL1 through the C helper (the kernel
+ * stays TTBR1-pure — the faulting low VA is never dereferenced),
+ * then halt: the hang IS the honest unhandled behavior, and CI
+ * asserts it (rc=124) plus the lines. The handler never returns, so
+ * no register save is needed (bl clobbers x30, which nobody restores). */
+arm64_sync_el1h:
+    mrs     x0, esr_el1
+    mrs     x1, far_el1
+    bl      arm64_sync_el1h_c
+    wfi
+    b       arm64_sync_el1h
 
 /* M5.2 EL1h IRQ entry (VBAR+0x280): the generic-timer tick. The
  * interrupted C code (the idle loop in kernel_arm64.c) may hold live

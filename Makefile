@@ -331,7 +331,7 @@ RV_ELF_E     = sls_riscv_kernel_echo.elf
 RV_OBJECTS_ME = $(RV_OBJECTS:.rv.o=.m.e.rv.o)
 RV_ELF_ME     = sls_riscv_kernel_echo_m.elf
 
-.PHONY: all clean x86-run riscv-run arm64-run plugins
+.PHONY: all clean x86-run riscv-run arm64-run arm64-teeth plugins
 
 all: plugins x86-iso riscv-elf arm64-elf
 
@@ -539,6 +539,31 @@ arm64-run: arm64-elf
 	# QEMU's PSCI emulation, so qemu exits rc=0 (the SBI_SRST analog).
 	qemu-system-aarch64 -M virt,virtualization=on -cpu cortex-a53 -m 1G \
 		-kernel $(AR_ELF) -nographic -serial file:sls_arm64_boot.log -no-reboot
+
+# §10.203 teeth: the EL0-only-by-construction machine check
+# (-DARM64_TEETH_EL1_MEMTOUCH). Same sources, but kernel_arm64.c's main
+# skips the gate sequence and instead attempts to run the mem_touch
+# fixture at EL1: its baked user scratch (USER_SCRATCH_VA 0x10005000,
+# unmapped in TTBR1) faults, the EL1h sync slot (boot_arm64.S
+# arm64_sync_el1h) prints the Data Abort (EC=0x25, far=0x10005000) and
+# halts. CI boots this ELF under a timeout and asserts the HANG (rc=124)
+# + the [TEETH]/[SYNC] lines + the absence of any result/FAIL line.
+# -Wno-unused-function: this variant never calls the gate-sequence
+# functions (arm64_el1_entry/arm64_el0_done/arm64_wait_ticks/...), so
+# the compiler's unused-static warnings are expected, not bugs. The
+# object name ends in .ar64.o so `make clean`'s existing pattern removes
+# it, and the teeth ELF matches `rm -f *.elf`.
+AR_TEETH_ELF  = sls_arm64_kernel_teeth.elf
+AR_TEETH_OBJS = $(filter-out kernel/kernel_arm64.ar64.o,$(AR_OBJECTS)) \
+                kernel/kernel_arm64_teeth.ar64.o
+
+kernel/kernel_arm64_teeth.ar64.o: kernel/kernel_arm64.c
+	$(AR_CC) $(AR_CFLAGS) -DARM64_TEETH_EL1_MEMTOUCH -Wno-unused-function -c $< -o $@
+
+$(AR_TEETH_ELF): $(AR_TEETH_OBJS)
+	$(AR_LD) $(AR_LDFLAGS) $(AR_TEETH_OBJS) -o $(AR_TEETH_ELF)
+
+arm64-teeth: $(AR_TEETH_ELF)
 
 riscv-run: riscv-elf
 	@if [ ! -f sls_storage_rv64.img ]; then qemu-img create -f raw sls_storage_rv64.img 10G; fi
