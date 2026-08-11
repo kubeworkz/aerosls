@@ -500,7 +500,7 @@ static void rv_fp_task_common(void) {
          * re-execute it on resume and burn the grant that just woke us,
          * drifting the per-task preemptions accounting (the
          * spurious-wake lesson of part 3's 11th lazy-save, in spin
-         * form). The task spends ~20ms in this spin per slice vs.
+         * form). The task spends ~5ms in this spin per slice vs.
          * microseconds on the work below, so the tick lands here —
          * exactly one preemption per slice. */
         while (me->preemptions < (uint64_t)(s + 1)) { }
@@ -527,10 +527,11 @@ static void rv_fp_task_common(void) {
          * acc is observable (stored back to the task), so the loop can
          * never be dead-code-eliminated. Integer only — no FP, so the
          * census allow-list and the per-slice lazy-save discipline are
-         * untouched. 200k iterations (~1M guest ops) fits comfortably
-         * inside one 20ms slice even on the slowest CI host, so the
-         * tick still lands in the spin and the preemption accounting
-         * stays exact. */
+         * untouched. 200k iterations (~1M guest ops) plus the UART
+         * prints fits inside one 5ms slice on this host (verified
+         * under WSL2, the slowest QEMU environment; native-Linux CI is
+         * faster), so the tick still lands in the spin and the
+         * preemption accounting stays exact. */
         uint32_t acc = (uint32_t)me->lcg_acc;
         for (uint32_t w = 0; w < sp->work; w++)
             acc = acc * 1664525u + 1013904223u;
@@ -560,10 +561,10 @@ static void rv_fp_task_common(void) {
 
 /* The demo driver: reset the FP registry (the float smoke left rows 0/1
  * holding its +inf/20.0 state), initialize the N-task ready queue, run
- * the round-robin at a fast 20ms tick cadence (the fast-cadence
- * stress: 15 slice boundaries in ~300ms of wall time, and the 15/15
- * preemption/lazy-save accounting must still be exact), then assert
- * the FINAL
+ * the round-robin at a 5ms tick cadence (the ultra-fast-cadence
+ * stress: 15 slice boundaries in ~75ms of wall time — 20x the
+ * original 100ms rate — and the 15/15 preemption/lazy-save
+ * accounting must still be exact), then assert the FINAL
  * fp_save rows (one per task owner), the lazy-save delta (one per
  * task-slice = RV_TASK_COUNT*RV_TASK_SLICES = 15), and the preemption
  * accounting (one tick-handler rotation per slice boundary, also 15).
@@ -580,7 +581,7 @@ static void rv_fp_task_common(void) {
 static void rv_fp_round_robin_demo(void) __attribute__((unused)); /* the echo build never calls it (wfi loop) */
 static void rv_fp_round_robin_demo(void) {
     struct RvPerHartData* phd = &g_hart0_data;
-    rv_boot_print("[TASK] three-task FP ready queue (preemptive, real register contexts, 20ms tick cadence, Design B part 3 + preemption follow-up)...\n");
+    rv_boot_print("[TASK] three-task FP ready queue (preemptive, real register contexts, 5ms tick cadence, Design B part 3 + preemption follow-up)...\n");
     for (uint64_t o = 0; o < RV_FP_OWNERS; o++)
         for (int i = 0; i < 33; i++) phd->fp_save[o][i] = 0;
     phd->fp_owner = 0;
@@ -600,17 +601,19 @@ static void rv_fp_round_robin_demo(void) {
     for (uint64_t i = 0; i < RV_TASK_COUNT; i++)
         rv_task_init(&g_rv_tasks[i], rv_fp_task_common, i, g_rv_spec[i].name);
     uint64_t lazy_before = g_fp_lazy_count;
-    /* 20ms slices for the demo — the fast-cadence stress: the 10MHz
-     * timebase counts 200,000 ticks per 20ms period, so the 15 slice
-     * boundaries arrive in 300ms of wall time (vs 1.5s at the original
-     * 100ms) and the 15/15 preemption/lazy-save accounting must still
-     * come out exact. The per-slice LCG work (~1M guest ops) fits well
-     * inside one 20ms period even on slow hosts, so the tick keeps
-     * landing in the tasks' spins. The first boundary may still be up
-     * to the production 1s cadence away (the pending arm pre-dates the
-     * override), which only stretches the demo's wall time, never the
-     * accounting. */
-    sbi_set_tick_period(200000UL);
+    /* 5ms slices for the demo — the ultra-fast-cadence stress: the
+     * 10MHz timebase counts 50,000 ticks per 5ms period, so the 15
+     * slice boundaries arrive in 75ms of wall time (vs 1.5s at the
+     * original 100ms — a 20x preemption rate) and the 15/15
+     * preemption/lazy-save accounting must still come out exact. The
+     * per-slice LCG work (~1M guest ops) plus the UART prints fits
+     * inside one 5ms period on this host (verified under WSL2, the
+     * slowest QEMU environment; native-Linux CI is faster), so the
+     * tick keeps landing in the tasks' spins. The first boundary may
+     * still be up to the production 1s cadence away (the pending arm
+     * pre-dates the override), which only stretches the demo's wall
+     * time, never the accounting. */
+    sbi_set_tick_period(50000UL);
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     rv_task_switch_fp(&g_rv_main_ctx, &g_rv_tasks[0]);
     /* Back here when the last task finishes and no ready task remains. */

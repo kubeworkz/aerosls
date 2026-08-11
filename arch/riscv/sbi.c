@@ -158,7 +158,7 @@ void sbi_system_reset(void) {
 static uint64_t g_next_tick;
 
 /* Design B part 3: a runtime override for the tick period, so the
- * N-task round-robin demo can run tick-cadenced slices at 20ms
+ * N-task round-robin demo can run tick-cadenced slices at 5ms
  * without a rebuild. 0 (the default) = the compile-time
  * SBI_TIMER_TICK_PERIOD. The demo sets it, then restores 0. */
 static uint64_t g_tick_period_override;
@@ -407,7 +407,7 @@ void handle_riscv_supervisor_interrupt(uint64_t scause, uint64_t stval) {
              * contention, and the level-pending bit guarantees no tick
              * is lost to an interrupt that arrives while disabled.
              * Design B part 3: the demo's sbi_set_tick_period override
-             * (20ms on the demo's fairness probe) wins while it is
+             * (5ms on the demo's fairness probe) wins while it is
              * set, so the N-task round-robin
              * gets fast, deterministic slice cadence. */
             sbi_arm_timer(g_tick_period_override ? g_tick_period_override

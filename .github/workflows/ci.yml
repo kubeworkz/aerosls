@@ -330,11 +330,11 @@ jobs:
           # ran the same 10x-heavy per-slice LCG work (1,000,000 each;
           # acc 0xf2dc5340 all three — the host-precomputed teeth) yet
           # still got exactly 5 preemptions — the round-robin is
-          # workload-oblivious. The demo runs at the tightened 20ms
-          # tick cadence (the fast-cadence stress) and the 15/15
-          # accounting must survive it.
-          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 20ms tick cadence" boot_rv.log || {
-            echo "FAILED: the ready queue did not run at the 20ms tick cadence in S-mode" >&2
+          # workload-oblivious. The demo runs at the tightened 5ms tick
+          # cadence (the ultra-fast-cadence stress, 20x the original
+          # 100ms rate) and the 15/15 accounting must survive it.
+          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 5ms tick cadence" boot_rv.log || {
+            echo "FAILED: the ready queue did not run at the 5ms tick cadence in S-mode" >&2
             tail -30 boot_rv.log >&2
             exit 1
           }
@@ -423,9 +423,9 @@ jobs:
           # tick-handler rotation + FP owner rows, 15 per-slice
           # lazy-saves and 15 preemptions after the smoke's 3, plus the
           # fairness probe (all-heavy extreme with exact accounting),
-          # all at the tightened 20ms tick cadence.
-          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 20ms tick cadence" boot_rv_m.log || {
-            echo "FAILED: the ready queue did not run at the 20ms tick cadence in M-mode" >&2
+          # all at the tightened 5ms tick cadence.
+          grep -a "\[TASK\] three-task FP ready queue (preemptive, real register contexts, 5ms tick cadence" boot_rv_m.log || {
+            echo "FAILED: the ready queue did not run at the 5ms tick cadence in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
