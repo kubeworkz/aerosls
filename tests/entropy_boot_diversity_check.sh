@@ -59,12 +59,24 @@ MAX_NODES="${AEROSLS_NODES:-8}"
 
 command -v curl >/dev/null 2>&1 || { echo "ABORT: curl not found."; exit 2; }
 
-fetch() {   # $1 = port
+# Returns "<http_status> <body>". Deliberately NOT curl -f: -f makes curl exit
+# non-zero on 401/404 with no output, and the caller then cannot tell "nothing
+# is listening" from "the node answered, and said no".
+#
+# That distinction is the entire point of this function. The first version of
+# this script used -f, and when a running cluster returned 401 -- because
+# /api/entropy sits behind the same bearer-token gate as every other /api route
+# -- it reported "no node answered ... start a cluster first" to somebody who
+# had just started one. A diagnostic that names the wrong cause is worse than
+# no diagnostic: it sends the reader to fix something that was never broken.
+fetch() {   # $1 = port  ->  "<status> <body>"
     if [ -n "$TOKEN" ]; then
-        curl -fsS --max-time 5 -H "Authorization: Bearer $TOKEN" \
+        curl -sS --max-time 5 -w '\n%{http_code}' \
+             -H "Authorization: Bearer $TOKEN" \
              "http://127.0.0.1:$1/api/entropy" 2>/dev/null
     else
-        curl -fsS --max-time 5 "http://127.0.0.1:$1/api/entropy" 2>/dev/null
+        curl -sS --max-time 5 -w '\n%{http_code}' \
+             "http://127.0.0.1:$1/api/entropy" 2>/dev/null
     fi
 }
 
@@ -82,10 +94,29 @@ ids=""
 found=0
 unseeded=""
 
+needs_token=""
+route_missing=""
+other_status=""
+
 for i in $(seq 1 "$MAX_NODES"); do
     port=$((HTTP_BASE + i))
-    body="$(fetch "$port")" || continue
-    [ -z "$body" ] && continue
+    raw="$(fetch "$port" || true)"
+    status="$(printf '%s' "$raw" | tail -n1)"
+    body="$(printf '%s' "$raw" | sed '$d')"
+
+    case "$status" in
+        000|"") continue ;;                       # nothing listening on this port
+        200) ;;                                   # fall through and parse
+        401|403)
+            needs_token="${needs_token}node $i (port $port): HTTP $status"$'\n'
+            found=$((found + 1)); continue ;;
+        404)
+            route_missing="${route_missing}node $i (port $port): HTTP 404"$'\n'
+            found=$((found + 1)); continue ;;
+        *)
+            other_status="${other_status}node $i (port $port): HTTP $status"$'\n'
+            found=$((found + 1)); continue ;;
+    esac
     found=$((found + 1))
 
     ready="$(jfield "$body" ready)"
@@ -103,10 +134,44 @@ for i in $(seq 1 "$MAX_NODES"); do
     fps="${fps}$fp $i"$'\n'
 done
 
+if [ -n "$needs_token" ]; then
+    echo "ABORT: node(s) are UP and answered, but rejected the request:"
+    printf '%s' "$needs_token" | sed 's/^/        /'
+    echo
+    echo "       /api/entropy sits behind the same bearer-token gate as every"
+    echo "       other /api route -- only /api/health is exempt. The cluster is"
+    echo "       fine; this script has no credentials."
+    echo
+    echo "       Set a token and re-run:"
+    echo "           AEROSLS_TOKEN=<token> tests/entropy_boot_diversity_check.sh"
+    echo
+    echo "       The token registry is printed on each node's serial console at"
+    echo "       boot ([AUTH] Token Registry)."
+    exit 2
+fi
+
+if [ -n "$route_missing" ]; then
+    echo "ABORT: node(s) are UP but have no /api/entropy route:"
+    printf '%s' "$route_missing" | sed 's/^/        /'
+    echo
+    echo "       That route was added with the boot fingerprint. A 404 means the"
+    echo "       RUNNING kernel predates it -- most likely a deploy aborted at a"
+    echo "       guard and left the previous build running, which deploy.sh says"
+    echo "       explicitly when it happens. Rebuild and restart, then re-run."
+    exit 2
+fi
+
+if [ -n "$other_status" ]; then
+    echo "ABORT: node(s) answered with an unexpected status:"
+    printf '%s' "$other_status" | sed 's/^/        /'
+    exit 2
+fi
+
 if [ "$found" -eq 0 ]; then
-    echo "ABORT: no node answered /api/entropy on ports $((HTTP_BASE+1))..$((HTTP_BASE+MAX_NODES))."
-    echo "       Start a cluster first:  ./run-cluster.sh --nodes 3"
-    echo "       If /api/* needs a token, set AEROSLS_TOKEN."
+    echo "ABORT: nothing is listening on ports $((HTTP_BASE+1))..$((HTTP_BASE+MAX_NODES))."
+    echo "       No connection was refused-and-answered; the ports are silent."
+    echo "       Start a cluster:  ./run-cluster.sh --nodes 3"
+    echo "       If your nodes use a different base, set AEROSLS_HTTP_BASE."
     exit 2
 fi
 
