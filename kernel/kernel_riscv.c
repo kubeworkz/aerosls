@@ -23,6 +23,7 @@
 #include "rv64_boot_smoke_tmo.h"
 #include "rv64_float_smoke_a_tmo.h"
 #include "rv64_float_smoke_b_tmo.h"
+#include "rv64_lcg_slice_tmo.h"
 
 extern void sbi_putchar(char c);
 
@@ -745,6 +746,34 @@ static void rv_fp_round_robin_demo(void) {
                       : "[TASK] ready queue: FAIL\n");
 }
 
+/* ISA doc §16, Design B part 3 follow-up #11: the per-slice LCG teeth
+ * on the RISC-V kernel boot — the fairness probe's "the work provably
+ * ran" proof, mirrored from the arm64 kernel's LCG slice (plan doc
+ * §10.200). Translates the embedded lcg_slice.tmo through the shared
+ * rv64_translate_and_call helper and prints the returned acc tooth:
+ * one full per-slice budget (acc = acc*1664525 + 1013904223 mod 2^32,
+ * exactly sp->work = 200,000 iterations from 0) -> 0x0b6f2a40 =
+ * 191834688 — the same value the parity-corpus lcg_fairness.simi pins
+ * and this kernel's own tasks accumulate five of to their 0xf2dc5340
+ * all-heavy tooth. Integer only — no FP, so the census allow-list and
+ * the lazy-save discipline are untouched. Runs between the float
+ * smoke and the ready-queue demo: a tick firing during the run is a
+ * scheduler no-op (g_rv_current == NULL until the demo starts), so
+ * the demo's 15/15 preemption/lazy-save accounting and its mtime
+ * window (stamped at its own FIRST rotation) are unaffected by
+ * construction. */
+static void rv64_lcg_slice_test(void) __attribute__((unused));
+static void rv64_lcg_slice_test(void) {
+    rv_boot_print("[SIMI] translating lcg_slice.tmo with kernel/simi_riscv.c...\n");
+    uint64_t acc = rv64_translate_and_call(g_rv64_lcg_slice_tmo,
+                                           g_rv64_lcg_slice_tmo_len);
+    rv_boot_print("[SIMI] lcg slice executed (one per-slice budget) -- acc=");
+    rv_boot_print_hex64(acc);
+    rv_boot_print(acc == 0x0b6f2a40ULL
+                      ? " (expected 0x0b6f2a40 = 191834688) PASS\n"
+                      : " (expected 0x0b6f2a40 = 191834688) FAIL\n");
+}
+
 static void rv64_boot_smoke_test(void) __attribute__((unused));
 static void rv64_boot_smoke_test(void) {
     rv_boot_print("[SIMI] RV64 boot smoke test: translating rv64_boot_smoke.tmo...\n");
@@ -944,6 +973,7 @@ void kernel_riscv_main(unsigned long hart_id, unsigned long fdt) {
     while (1) { asm volatile("wfi"); }
 #else
     rv64_float_smoke_test();     /* Design B part 2 -- before the boot smoke, which powers off */
+    rv64_lcg_slice_test();       /* follow-up #11 -- the per-slice LCG teeth (0x0b6f2a40) */
     rv_fp_round_robin_demo();    /* Design B part 3 -- the N-task FP ready queue */
     rv64_boot_smoke_test();
 #endif

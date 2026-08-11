@@ -322,6 +322,19 @@ jobs:
             tail -30 boot_rv.log >&2
             exit 1
           }
+          # Follow-up #11: the per-slice LCG teeth — the embedded
+          # lcg_slice.tmo runs one full per-slice budget of the task LCG
+          # (200,000 iterations, mod 2^32) through the RV translator and
+          # RETURNS the acc tooth; the serial log must assert
+          # 0x0b6f2a40 = 191834688 with a PASS verdict (the arm64
+          # kernel's identical teeth, mirrored on the RISC-V boot). A
+          # wrong recurrence (missing mask, swapped constants, off-by-
+          # one count) fails here.
+          grep -a "lcg slice executed (one per-slice budget) -- acc=0x000000000b6f2a40 (expected 0x0b6f2a40 = 191834688) PASS" boot_rv.log || {
+            echo "FAILED: the LCG slice did not execute and return the per-slice tooth 0x0b6f2a40" >&2
+            tail -30 boot_rv.log >&2
+            exit 1
+          }
           # Design B part 3 + preemption follow-up: the three-task FP
           # ready queue with TRUE preemption — the tick handler itself
           # rotates the running task (rv_scheduler_tick swaps the
@@ -434,6 +447,14 @@ jobs:
           # 18 total = the smoke's 3 + the demo's 15 per-slice lazy-saves.
           [ "$(grep -ac '\[FP\] lazy-save:' boot_rv_m.log)" -eq 18 ] || {
             echo "FAILED: expected exactly 18 lazy-saves (3 smoke + 15 demo slices)" >&2
+            tail -30 boot_rv_m.log >&2
+            exit 1
+          }
+          # Follow-up #11: the per-slice LCG teeth on the bare-metal path
+          # too — same embedded program, same 0x0b6f2a40 assert, now
+          # through the M-mode translator/executor.
+          grep -a "lcg slice executed (one per-slice budget) -- acc=0x000000000b6f2a40 (expected 0x0b6f2a40 = 191834688) PASS" boot_rv_m.log || {
+            echo "FAILED: the LCG slice did not return the per-slice tooth 0x0b6f2a40 in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
