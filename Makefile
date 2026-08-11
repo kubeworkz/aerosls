@@ -383,7 +383,8 @@ MBEDTLS_INC   = -I vendor/mbedtls/include
 # __memcpy_chk and friends -- glibc functions absent from a freestanding link.
 # It is also what produced __explicit_bzero_chk, which an earlier commit
 # treated with ZEROIZE_ALT: a good fix for the wrong reason.
-MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"' -U_FORTIFY_SOURCE
+MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"' -U_FORTIFY_SOURCE \
+                -Uunix -U__unix -U__unix__
 
 kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@

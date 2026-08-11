@@ -134,6 +134,21 @@ long long sls_mbedtls_time(long long *t);
  * implementation. Used for selection, not for testing; the name is upstream's. */
 #define MBEDTLS_TEST_SW_INET_PTON
 
+/* snprintf. mbedTLS uses it in oid.c's numeric-OID formatting and x509.c's
+ * mbedtls_x509_dn_gets, neither removed by X509_REMOVE_INFO because dn_gets is
+ * reachable from the verify path.
+ *
+ * I argued twice against writing a format-string parser in a kernel, and this
+ * is still not a general printf. The complete set of conversions those two
+ * files use was extracted from their sources -- %s %u %c %d %x %X with an
+ * optional 0-pad width -- and sls_snprintf implements exactly those and
+ * REFUSES anything else rather than skipping it silently. A formatter that
+ * ignores what it does not understand produces a plausible wrong string; one
+ * that stops produces a visibly truncated one. */
+#define MBEDTLS_PLATFORM_SNPRINTF_MACRO sls_snprintf
+
+int sls_snprintf(char *buf, unsigned long size, const char *fmt, ...);
+
 /* ZEROIZE_ALT: platform_util.c detects "platforms known to support
  * explicit_bzero()" and calls it (line 98). On this toolchain gcc rewrites
  * that to glibc's fortified __explicit_bzero_chk, which does not exist in a

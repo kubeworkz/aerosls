@@ -547,3 +547,79 @@ char* strstr(const char* hay, const char* needle) {
     }
     return 0;
 }
+
+/* ─── A deliberately small snprintf ────────────────────────────────────────
+ * NOT a general printf. It implements the conversions mbedTLS's oid.c and
+ * x509.c actually use, extracted from those files: %s %u %c %d %x %X, an
+ * optional zero-padded width (%02X), and %%. Anything else stops the format
+ * and is reported through the return value, because a formatter that silently
+ * skips a directive it does not understand emits a plausible wrong string --
+ * and these strings end up in certificate subject names.
+ *
+ * Returns the length that WOULD have been written, C99 semantics, because
+ * mbedTLS's callers add the return to a pointer and compare against the
+ * remaining size to detect truncation. Returning the truncated length instead
+ * would make them believe a truncated name was complete. */
+#include <stdarg.h>
+
+static void sn_putc(char* buf, unsigned long size, unsigned long* n, char c) {
+    if (*n + 1 < size) buf[*n] = c;
+    (*n)++;
+}
+
+static void sn_str(char* buf, unsigned long size, unsigned long* n, const char* s) {
+    if (!s) s = "(null)";
+    while (*s) sn_putc(buf, size, n, *s++);
+}
+
+static void sn_num(char* buf, unsigned long size, unsigned long* n,
+                   unsigned long long v, unsigned base, int upper,
+                   unsigned width, int zero_pad) {
+    char tmp[32];
+    const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    unsigned i = 0;
+    if (v == 0) tmp[i++] = '0';
+    while (v && i < sizeof tmp) { tmp[i++] = digits[v % base]; v /= base; }
+    while (i < width && i < sizeof tmp) tmp[i++] = zero_pad ? '0' : ' ';
+    while (i) sn_putc(buf, size, n, tmp[--i]);
+}
+
+int sls_snprintf(char* buf, unsigned long size, const char* fmt, ...) {
+    va_list ap;
+    unsigned long n = 0;
+    va_start(ap, fmt);
+
+    for (const char* p = fmt; *p; p++) {
+        if (*p != '%') { sn_putc(buf, size, &n, *p); continue; }
+        p++;
+        if (*p == '%') { sn_putc(buf, size, &n, '%'); continue; }
+
+        int zero_pad = 0;
+        unsigned width = 0;
+        if (*p == '0') { zero_pad = 1; p++; }
+        while (*p >= '0' && *p <= '9') { width = width * 10 + (unsigned)(*p - '0'); p++; }
+
+        switch (*p) {
+            case 's': sn_str(buf, size, &n, va_arg(ap, const char*)); break;
+            case 'c': sn_putc(buf, size, &n, (char)va_arg(ap, int)); break;
+            case 'u': sn_num(buf, size, &n, va_arg(ap, unsigned int), 10, 0, width, zero_pad); break;
+            case 'd': {
+                int v = va_arg(ap, int);
+                if (v < 0) { sn_putc(buf, size, &n, '-'); sn_num(buf, size, &n, (unsigned long long)(-(long long)v), 10, 0, width, zero_pad); }
+                else sn_num(buf, size, &n, (unsigned long long)v, 10, 0, width, zero_pad);
+                break;
+            }
+            case 'x': sn_num(buf, size, &n, va_arg(ap, unsigned int), 16, 0, width, zero_pad); break;
+            case 'X': sn_num(buf, size, &n, va_arg(ap, unsigned int), 16, 1, width, zero_pad); break;
+            default:
+                /* Unsupported directive. Stop rather than guess: the caller
+                 * sees a short result and a visibly incomplete string. */
+                p--;
+                goto done;
+        }
+    }
+done:
+    va_end(ap);
+    if (size > 0) buf[(n < size) ? n : size - 1] = '\0';
+    return (int)n;
+}
