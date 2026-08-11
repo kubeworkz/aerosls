@@ -52,13 +52,13 @@ static int vi_valid_name(const char* name) {
 // run -- useful for this phase's own host test assertions, and harmless
 // for a first-cut approximate index that never claimed cryptographic or
 // even statistically rigorous randomness. ───────────────────────────────
-static uint32_t vi_rng_state = 0x9E3779B9u;   // nonzero seed -- xorshift's fixed point is all-zero, never reached from here
-static uint32_t vi_rand32(void) {
-    uint32_t x = vi_rng_state;
+static uint32_t vi_testonly_rng_state = 0x9E3779B9u;   // nonzero seed -- xorshift's fixed point is all-zero, never reached from here
+static uint32_t vi_testonly_rand32(void) {
+    uint32_t x = vi_testonly_rng_state;
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
-    vi_rng_state = x;
+    vi_testonly_rng_state = x;
     return x;
 }
 
@@ -66,7 +66,7 @@ static uint32_t vi_rand32(void) {
 // point 1 on why this replaces the paper's ln()-based formula.
 static uint32_t vi_random_layer(void) {
     uint32_t layer = 0;
-    while (layer < VEC_INDEX_MAX_LAYERS - 1 && (vi_rand32() % VEC_INDEX_M) == 0) layer++;
+    while (layer < VEC_INDEX_MAX_LAYERS - 1 && (vi_testonly_rand32() % VEC_INDEX_M) == 0) layer++;
     return layer;
 }
 
@@ -367,7 +367,7 @@ void vec_index_init(void) {
         vec_indexes[i].top_layer = 0;
     }
     vec_index_next_free_node = 0;
-    vi_rng_state = 0x9E3779B9u;   // reset to a fixed, reproducible seed -- see header comment
+    vi_testonly_rng_state = 0x9E3779B9u;   // reset to a fixed, reproducible seed -- see header comment
 }
 
 int vec_index_create(uint32_t caller_uid, const char* index_name,
