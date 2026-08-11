@@ -250,6 +250,18 @@ static struct RvTask g_rv_tasks[RV_TASK_COUNT];
 static uint64_t g_rv_cursor;
 static struct RvTask* g_rv_current;
 
+/* The preemption log: the tick handler RECORDS each rotation instead of
+ * printing it inline — a UART print inside the tick costs ~0.15ms at
+ * 115200 baud, a meaningful chunk of a 2ms slice, so the lines are
+ * batched and printed by the demo driver once the queue empties (the
+ * cadence stress tightens the print path itself). 32 slots covers the
+ * 17 rotations (15 runnable + 2 done-task clears). Written by the tick
+ * handler, read by the boot-context driver. */
+#define RV_PREEMPT_LOG_MAX 32
+static uint8_t g_rv_preempt_from[RV_PREEMPT_LOG_MAX];
+static uint8_t g_rv_preempt_to[RV_PREEMPT_LOG_MAX];
+static uint64_t g_rv_preempt_n;
+
 /* The preemption guard: 1 while a COOPERATIVE switch is in flight
  * (rv_task_switch_fp's FP save/load + coroutine handoff), so the tick
  * handler's rv_scheduler_tick no-ops rather than preempt a task whose
@@ -404,11 +416,14 @@ void rv_scheduler_tick(void) {
      * load + disarm makes that trap a 0->0 no-op round-trip through its
      * own row, exactly like the cooperative path. */
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
-    rv_boot_print("[TASK] preempt ");
-    rv_boot_print(cur->name);
-    rv_boot_print(" -> ");
-    rv_boot_print(next->name);
-    rv_boot_print("\n");
+    /* Record the rotation for the driver's batched preempt log — no
+     * inline print: at the demo's 2ms cadence a UART print here would
+     * steal ~0.15ms from the incoming task's slice. */
+    if (g_rv_preempt_n < RV_PREEMPT_LOG_MAX) {
+        g_rv_preempt_from[g_rv_preempt_n] = (uint8_t)(cur - g_rv_tasks);
+        g_rv_preempt_to[g_rv_preempt_n] = (uint8_t)(next - g_rv_tasks);
+        g_rv_preempt_n++;
+    }
 }
 
 /* The FP work of the tasks — the ONLY FP instructions outside the
@@ -500,7 +515,7 @@ static void rv_fp_task_common(void) {
          * re-execute it on resume and burn the grant that just woke us,
          * drifting the per-task preemptions accounting (the
          * spurious-wake lesson of part 3's 11th lazy-save, in spin
-         * form). The task spends ~5ms in this spin per slice vs.
+         * form). The task spends ~2ms in this spin per slice vs.
          * microseconds on the work below, so the tick lands here —
          * exactly one preemption per slice. */
         while (me->preemptions < (uint64_t)(s + 1)) { }
@@ -528,7 +543,7 @@ static void rv_fp_task_common(void) {
          * never be dead-code-eliminated. Integer only — no FP, so the
          * census allow-list and the per-slice lazy-save discipline are
          * untouched. 200k iterations (~1M guest ops) plus the UART
-         * prints fits inside one 5ms slice on this host (verified
+         * prints fits inside one 2ms slice on this host (verified
          * under WSL2, the slowest QEMU environment; native-Linux CI is
          * faster), so the tick still lands in the spin and the
          * preemption accounting stays exact. */
@@ -561,10 +576,11 @@ static void rv_fp_task_common(void) {
 
 /* The demo driver: reset the FP registry (the float smoke left rows 0/1
  * holding its +inf/20.0 state), initialize the N-task ready queue, run
- * the round-robin at a 5ms tick cadence (the ultra-fast-cadence
- * stress: 15 slice boundaries in ~75ms of wall time — 20x the
- * original 100ms rate — and the 15/15 preemption/lazy-save
- * accounting must still be exact), then assert the FINAL
+ * the round-robin at a 2ms tick cadence (the sub-print-cost
+ * stress: 15 slice boundaries in ~30ms of wall time — 50x the
+ * original 100ms rate, below the per-line UART print cost — and the
+ * 15/15 preemption/lazy-save accounting must still be exact), then
+ * assert the FINAL
  * fp_save rows (one per task owner), the lazy-save delta (one per
  * task-slice = RV_TASK_COUNT*RV_TASK_SLICES = 15), and the preemption
  * accounting (one tick-handler rotation per slice boundary, also 15).
@@ -581,7 +597,7 @@ static void rv_fp_task_common(void) {
 static void rv_fp_round_robin_demo(void) __attribute__((unused)); /* the echo build never calls it (wfi loop) */
 static void rv_fp_round_robin_demo(void) {
     struct RvPerHartData* phd = &g_hart0_data;
-    rv_boot_print("[TASK] three-task FP ready queue (preemptive, real register contexts, 5ms tick cadence, Design B part 3 + preemption follow-up)...\n");
+    rv_boot_print("[TASK] three-task FP ready queue (preemptive, real register contexts, 2ms tick cadence, Design B part 3 + preemption follow-up)...\n");
     for (uint64_t o = 0; o < RV_FP_OWNERS; o++)
         for (int i = 0; i < 33; i++) phd->fp_save[o][i] = 0;
     phd->fp_owner = 0;
@@ -600,24 +616,41 @@ static void rv_fp_round_robin_demo(void) {
     g_rv_current = NULL;               /* boot context runs the driver */
     for (uint64_t i = 0; i < RV_TASK_COUNT; i++)
         rv_task_init(&g_rv_tasks[i], rv_fp_task_common, i, g_rv_spec[i].name);
+    g_rv_preempt_n = 0;   /* fresh preempt log for this run */
     uint64_t lazy_before = g_fp_lazy_count;
-    /* 5ms slices for the demo — the ultra-fast-cadence stress: the
-     * 10MHz timebase counts 50,000 ticks per 5ms period, so the 15
-     * slice boundaries arrive in 75ms of wall time (vs 1.5s at the
-     * original 100ms — a 20x preemption rate) and the 15/15
-     * preemption/lazy-save accounting must still come out exact. The
-     * per-slice LCG work (~1M guest ops) plus the UART prints fits
-     * inside one 5ms period on this host (verified under WSL2, the
-     * slowest QEMU environment; native-Linux CI is faster), so the
-     * tick keeps landing in the tasks' spins. The first boundary may
-     * still be up to the production 1s cadence away (the pending arm
-     * pre-dates the override), which only stretches the demo's wall
-     * time, never the accounting. */
-    sbi_set_tick_period(50000UL);
+    /* 2ms slices for the demo — the sub-print-cost stress: the 10MHz
+     * timebase counts 20,000 ticks per 2ms period, so the 15 slice
+     * boundaries arrive in 30ms of wall time (vs 1.5s at the original
+     * 100ms — a 50x preemption rate) and the 15/15
+     * preemption/lazy-save accounting must still come out exact. At
+     * this cadence the UART print path itself is the binding
+     * constraint (~0.5ms/slice of lines at 115200 baud), so the prints
+     * were tightened: the preempt lines are batched into a ring buffer
+     * and printed here after the queue empties (never inline in the
+     * tick), and the lazy-save line was shortened. The per-slice LCG
+     * work budget was calibrated so work + prints fits inside one 2ms
+     * period on this host (verified under WSL2, the slowest QEMU
+     * environment; native-Linux CI is faster), so the tick keeps
+     * landing in the tasks' spins. The first boundary may still be up
+     * to the production 1s cadence away (the pending arm pre-dates the
+     * override), which only stretches the demo's wall time, never the
+     * accounting. */
+    sbi_set_tick_period(20000UL);
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     rv_task_switch_fp(&g_rv_main_ctx, &g_rv_tasks[0]);
     /* Back here when the last task finishes and no ready task remains. */
     sbi_set_tick_period(0);
+    /* The batched preempt log — printed now, after the queue emptied,
+     * instead of inline in the tick handler (the 2ms cadence made the
+     * inline prints the slice bottleneck). */
+    rv_boot_print("[TASK] preempt log:");
+    for (uint64_t i = 0; i < g_rv_preempt_n; i++) {
+        rv_boot_print(" ");
+        rv_boot_print(g_rv_spec[g_rv_preempt_from[i]].name);
+        rv_boot_print("->");
+        rv_boot_print(g_rv_spec[g_rv_preempt_to[i]].name);
+    }
+    rv_boot_print("\n");
     uint64_t lazy_delta = g_fp_lazy_count - lazy_before;
     int rows_ok = (phd->fp_save[0][10] == 0x4014000000000000ULL) &&  /* A: 5.0 */
                   (phd->fp_save[1][10] == 0x4004000000000000ULL) &&  /* B: 2.5 */
