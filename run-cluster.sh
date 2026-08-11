@@ -131,22 +131,130 @@ done
 # ─── --stop ────────────────────────────────────────────────────────────
 # Reads the pid file rather than pattern-matching `ps`, so it cannot
 # mistake somebody else's qemu for one of ours.
+#
+# This used to send SIGTERM and report success on the strength of `kill`
+# returning 0 -- which only means the signal was DELIVERED, not that anything
+# died -- and then rm'd the pid file unconditionally, including for pids it had
+# failed to kill. On a box where pm2 supervises the kernel, that combination is
+# actively misleading: pm2 respawns the node a moment after SIGTERM, --stop
+# prints "stopped 3", and the pid file that named the survivors is gone, so a
+# second --stop answers "no cluster to stop" while three nodes are still up.
+#
+# So: signal, wait, verify the pid is actually gone, escalate to SIGKILL, and
+# keep the pid file if anything survives. A stop command that cannot fail out
+# loud is not a stop command.
 if [ "$DO_STOP" -eq 1 ]; then
     if [ ! -f "$PID_FILE" ]; then
         echo "no cluster to stop (no $PID_FILE)."
         exit 0
     fi
-    stopped=0; gone=0
+
+    # kill -0 tests for existence without signalling. It fails on a pid we do
+    # not own as well as on one that does not exist, which is the right answer
+    # either way: a pid we cannot signal is a pid we cannot stop.
+    alive() { kill -0 "$1" 2>/dev/null; }
+
+    # Waits up to $2 tenths of a second for $1 to disappear. Polls rather than
+    # `wait`, which only works for children of this shell -- and --stop is
+    # normally run from a different shell than the one that launched.
+    reap() {
+        local pid="$1" tenths="$2"
+        while [ "$tenths" -gt 0 ]; do
+            alive "$pid" || return 0
+            sleep 0.1
+            tenths=$((tenths - 1))
+        done
+        ! alive "$pid"
+    }
+
+    # Connects and immediately closes. Used only to WARN after a stop, never to
+    # decide what to kill -- the pid file remains the sole authority for that.
+    # /dev/tcp is a bash builtin, so this adds no dependency on curl or nc.
+    port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+    stopped=0; gone=0; killed=0
+    survivors=""
+    settled=""          # node ids we believe we stopped, to re-check below
     while read -r nid pid; do
         [ -z "${pid:-}" ] && continue
-        if kill "$pid" 2>/dev/null; then
-            echo "  stopped node $nid (pid $pid)"; stopped=$((stopped+1))
-        else
+        if ! alive "$pid"; then
             echo "  node $nid (pid $pid) was not running"; gone=$((gone+1))
+            continue
         fi
+
+        kill -TERM "$pid" 2>/dev/null || true
+        if reap "$pid" 50; then                      # 5s for a clean exit
+            echo "  stopped node $nid (pid $pid)"; stopped=$((stopped+1))
+            settled="$settled $nid"
+            continue
+        fi
+
+        echo "  node $nid (pid $pid) ignored SIGTERM after 5s -- sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        if reap "$pid" 30; then                      # 3s; SIGKILL is not refusable
+            echo "  killed node $nid (pid $pid)"; killed=$((killed+1))
+            settled="$settled $nid"
+            continue
+        fi
+
+        # Survived SIGKILL. Either it is unkillable (uninterruptible sleep) or
+        # it is not ours to kill. Naming both is more useful than a bare pid.
+        echo "  FAILED to stop node $nid (pid $pid) -- still alive after SIGKILL"
+        survivors="${survivors}${nid} ${pid}"$'\n'
     done < "$PID_FILE"
+
+    if [ -n "$survivors" ]; then
+        # Keep the pid file, holding ONLY the survivors, so a second --stop
+        # retries exactly those and the operator can see which they are.
+        printf '%s' "$survivors" > "$PID_FILE"
+        echo "==> stopped $stopped, killed $killed, already gone $gone," \
+             "SURVIVED $(printf '%s' "$survivors" | grep -c .)."
+        echo
+        echo "    Pids left in $PID_FILE, so a second --stop retries exactly"
+        echo "    these. Surviving SIGKILL means the process is either wedged"
+        echo "    in uninterruptible sleep (usually blocked I/O -- check its"
+        echo "    disk image) or is not ours to signal. It does NOT mean a"
+        echo "    supervisor respawned it: a respawn comes back under a new"
+        echo "    pid, which this loop would have scored as a clean stop. The"
+        echo "    port check below is what catches that."
+        exit 1
+    fi
+
     rm -f "$PID_FILE"
-    echo "==> stopped $stopped, already gone $gone."
+    echo "==> stopped $stopped, killed $killed, already gone $gone."
+
+    # ─── Did anything put them back? ───────────────────────────────────
+    # Every pid above is confirmed dead, which is NOT the same as the cluster
+    # being down. A supervisor -- pm2 on the deploy host -- respawns the node
+    # under a fresh pid, and a fresh pid is invisible to a loop that only knows
+    # the old ones. The stop looks perfect and the node never goes away.
+    #
+    # Ports are the honest test, because they are what a respawn has to
+    # reacquire. Checked a beat later: the old process has to release the
+    # listener and the new one has to bind it, and probing in between would
+    # report all-clear for the wrong reason.
+    if [ -n "$settled" ]; then
+        sleep 2
+        respawned=""
+        for nid in $settled; do
+            if port_open "$((HTTP_BASE + nid))"; then respawned="$respawned $nid"; fi
+        done
+        if [ -n "$respawned" ]; then
+            echo
+            echo "==> WARNING: node(s)$respawned are answering on their HTTP"
+            echo "    port again, seconds after being stopped. Every pid this"
+            echo "    script knew about is dead, so something respawned them"
+            echo "    under new pids -- a supervisor, most likely pm2."
+            echo
+            echo "    Stop it at the supervisor instead:"
+            echo "        pm2 list                # find the app name"
+            echo "        pm2 stop <app>          # or: pm2 delete <app>"
+            echo
+            echo "    This script kills processes. Putting them back is exactly"
+            echo "    what a supervisor is for, and it will win every time."
+            exit 1
+        fi
+    fi
     exit 0
 fi
 
