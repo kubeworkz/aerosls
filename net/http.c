@@ -1864,6 +1864,7 @@ static int api_shell_exec_post(const char* body, char* buf, int max, uint32_t re
 extern int      sls_bench_load_path(uint32_t n_loads, uint64_t *cycles, uint32_t *insns);
 extern int      sls_test_guest_paging(void);
 extern int      sls_test_guest_invl(void);
+extern int      sls_test_guest_selfmod(void);
 extern int      sls_softmmu_enabled(void);
 extern uint64_t sls_heap_used(void);
 extern uint64_t sls_heap_total(void);
@@ -2032,6 +2033,20 @@ static int api_qemu_invl_post(char* buf, int max) {
     // executes INVLPG, and reloads CR3; passes only if every stale shadow
     // translation was dropped, with each stage checked against its own magic.
     int rc = sls_test_guest_invl();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+static int api_qemu_selfmod_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // Self-modifying guest code (paging off): the store to the code page must
+    // fault, bump the page generation, and force a re-translation that serves
+    // the patched bytes. Passes only if the guest halts with the patched
+    // immediate in EAX.
+    int rc = sls_test_guest_selfmod();
     jb_obj_open(&j, 0);
     jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
     jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
@@ -5391,6 +5406,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/invl")) {
             blen = api_qemu_invl_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/selfmod")) {
+            blen = api_qemu_selfmod_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // Destructive. Requires {"confirm":"reboot"}; see the handler.

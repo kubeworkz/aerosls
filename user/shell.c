@@ -2058,6 +2058,13 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             extern int sls_test_guest_invl(void);
             sls_test_guest_invl();
         }
+        else if (sh_starts(input_buffer, "qemu selfmod")) {
+            /* Self-modifying guest code (paging off): the store to the code
+             * page must fault, bump the page generation, and force a
+             * re-translation that serves the patched bytes. */
+            extern int sls_test_guest_selfmod(void);
+            sls_test_guest_selfmod();
+        }
         else if (sh_starts(input_buffer, "qemu bench")) {
             /* Measures the guest LOAD path -- the only thing the shadow-PT
              * change affects. Optional argument = number of unrolled loads;
