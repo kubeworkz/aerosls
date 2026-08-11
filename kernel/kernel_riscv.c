@@ -262,6 +262,17 @@ static uint8_t g_rv_preempt_from[RV_PREEMPT_LOG_MAX];
 static uint8_t g_rv_preempt_to[RV_PREEMPT_LOG_MAX];
 static uint64_t g_rv_preempt_n;
 
+/* The demo's tick cadence and the wall-clock cadence teeth: the mtime
+ * at the FIRST preemption (recorded by rv_scheduler_tick, so the
+ * pending-arm delay before the first tick is excluded), and the
+ * elapsed assert bounds. 16 intervals between the 17 rotations at the
+ * 2ms period = 320,000 ticks, plus the last task's tail work — so a
+ * correct run lands in [300,000, 500,000): the lower bound proves the
+ * cadence was NOT faster than 2ms, the upper bound proves it was NOT
+ * 4ms or slower (16 x 40,000 = 640,000 would fail it). */
+#define RV_DEMO_TICK_TICKS (SBI_TIMER_TICKS_PER_SEC / 500)   /* 2ms at 10 MHz */
+static uint64_t g_rv_t0;
+
 /* The preemption guard: 1 while a COOPERATIVE switch is in flight
  * (rv_task_switch_fp's FP save/load + coroutine handoff), so the tick
  * handler's rv_scheduler_tick no-ops rather than preempt a task whose
@@ -418,7 +429,9 @@ void rv_scheduler_tick(void) {
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     /* Record the rotation for the driver's batched preempt log — no
      * inline print: at the demo's 2ms cadence a UART print here would
-     * steal ~0.15ms from the incoming task's slice. */
+     * steal ~0.15ms from the incoming task's slice. The first rotation
+     * also stamps the wall-clock start of the cadence measurement. */
+    if (g_rv_preempt_n == 0) g_rv_t0 = rv_rdtime();
     if (g_rv_preempt_n < RV_PREEMPT_LOG_MAX) {
         g_rv_preempt_from[g_rv_preempt_n] = (uint8_t)(cur - g_rv_tasks);
         g_rv_preempt_to[g_rv_preempt_n] = (uint8_t)(next - g_rv_tasks);
@@ -635,7 +648,7 @@ static void rv_fp_round_robin_demo(void) {
      * to the production 1s cadence away (the pending arm pre-dates the
      * override), which only stretches the demo's wall time, never the
      * accounting. */
-    sbi_set_tick_period(20000UL);
+    sbi_set_tick_period(RV_DEMO_TICK_TICKS);
     __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     rv_task_switch_fp(&g_rv_main_ctx, &g_rv_tasks[0]);
     /* Back here when the last task finishes and no ready task remains. */
@@ -687,6 +700,16 @@ static void rv_fp_round_robin_demo(void) {
     int acc_ok = (g_rv_tasks[0].lcg_acc == 0xf2dc5340ULL) &&
                  (g_rv_tasks[1].lcg_acc == 0xf2dc5340ULL) &&
                  (g_rv_tasks[2].lcg_acc == 0xf2dc5340ULL);
+    /* The wall-clock cadence teeth: elapsed mtime from the FIRST
+     * preemption to the queue emptying. 16 intervals between the 17
+     * rotations at RV_DEMO_TICK_TICKS = 320,000, plus the last task's
+     * tail work (well under the margins on any host that passes the
+     * 15/15 accounting): the assert proves the measured cadence is the
+     * 2ms the demo set — not faster (lower bound) and not slower
+     * (upper bound: 16 intervals at 4ms would be 640,000 >= 500,000). */
+    uint64_t elapsed = rv_rdtime() - g_rv_t0;
+    int mtime_ok = (elapsed >= RV_TASK_SLICES * RV_DEMO_TICK_TICKS) &&
+                   (elapsed < 25 * RV_DEMO_TICK_TICKS);
     rv_boot_print("[TASK] fp_save rows: A=");
     rv_boot_print_hex64(phd->fp_save[0][10]);
     rv_boot_print(" B=");
@@ -712,8 +735,12 @@ static void rv_fp_round_robin_demo(void) {
     rv_boot_print_hex64(g_rv_tasks[1].lcg_acc);
     rv_boot_print("/");
     rv_boot_print_hex64(g_rv_tasks[2].lcg_acc);
-    rv_boot_print(acc_ok ? " PASS\n" : " FAIL\n");
-    rv_boot_print(rows_ok && lazy_ok && preempt_ok && work_ok && acc_ok
+    rv_boot_print(acc_ok ? " PASS;" : " FAIL;");
+    rv_boot_print(" mtime: ");
+    rv_boot_print_udec64(elapsed);
+    rv_boot_print(mtime_ok ? " PASS\n" : " FAIL\n");
+    rv_boot_print(rows_ok && lazy_ok && preempt_ok && work_ok && acc_ok &&
+                          mtime_ok
                       ? "[TASK] ready queue: ALL PASS\n"
                       : "[TASK] ready queue: FAIL\n");
 }
