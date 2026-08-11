@@ -131,6 +131,36 @@ int main(void) {
        "2100-02-28 is fine, so the rejection above is about the 29th");
     rtc_test_set_build_epoch(TEST_EPOCH);
 
+    printf("\n-- 3b: civil_from_days, the inverse --\n");
+
+    /* Added because mbedTLS's X.509 validity checks call gmtime_r, and
+     * kernel/tls_platform.c builds it on this. Both directions of the
+     * conversion now live together and are tested together.
+     *
+     * Round-tripping is the strong assertion: any single-day error in either
+     * direction breaks it, and a certificate window shifted by one day is
+     * exactly the kind of wrong that looks fine until a renewal. */
+    {
+        int64_t y; unsigned m, d;
+        int rt_ok = 1;
+        for (int64_t day = -25000; day <= 60000; day += 7) {
+            rtc_civil_from_days(day, &y, &m, &d);
+            if (rtc_days_from_civil(y, m, d) != day) { rt_ok = 0; break; }
+        }
+        ok(rt_ok, "round-trips for every 7th day across 1901..2134");
+
+        rtc_civil_from_days(0, &y, &m, &d);
+        ok(y == 1970 && m == 1 && d == 1, "day 0 is 1970-01-01");
+        rtc_civil_from_days(-1, &y, &m, &d);
+        ok(y == 1969 && m == 12 && d == 31, "day -1 is 1969-12-31");
+        rtc_civil_from_days(19782, &y, &m, &d);
+        ok(y == 2024 && m == 2 && d == 29, "day 19782 is 2024-02-29 (a leap day)");
+        rtc_civil_from_days(47541, &y, &m, &d);
+        ok(y == 2100 && m == 3 && d == 1, "day 47541 is 2100-03-01, not 02-29");
+        rtc_civil_from_days(20676, &y, &m, &d);
+        ok(y == 2026 && m == 8 && d == 11, "day 20676 is 2026-08-11");
+    }
+
     printf("\n-- 4: CMOS decode --\n");
     {
         /* Status B: bit 1 = 24-hour, bit 2 = binary.

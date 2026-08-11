@@ -55,6 +55,26 @@ int64_t rtc_days_from_civil(int64_t y, unsigned m, unsigned d) {
     return era * 146097 + (int64_t)doe - 719468;
 }
 
+void rtc_civil_from_days(int64_t z, int64_t* y, unsigned* m, unsigned* d)
+{
+    /* Same era-shifted-to-March trick as days_from_civil, run backwards, so
+     * February's variable length again falls at the end of the year and needs
+     * no special case. The +719468 undoes the epoch shift. */
+    z += 719468;
+    const int64_t  era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);                  /* [0,146096] */
+    const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    const int64_t  yy  = (int64_t)yoe + era * 400;
+    const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);             /* [0,365] */
+    const unsigned mp  = (5*doy + 2)/153;                               /* [0,11] */
+    const unsigned dd  = doy - (153*mp+2)/5 + 1;                        /* [1,31] */
+    const unsigned mm  = mp + (mp < 10 ? 3 : -9);                       /* [1,12] */
+
+    if (y) *y = yy + (mm <= 2);
+    if (m) *m = mm;
+    if (d) *d = dd;
+}
+
 int rtc_compose(unsigned year, unsigned mon, unsigned day,
                 unsigned hour, unsigned min, unsigned sec, uint64_t* out) {
     /* Field-range checks first. A CMOS register holding 0xFF decodes to

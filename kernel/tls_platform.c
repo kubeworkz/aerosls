@@ -343,3 +343,49 @@ int sls_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
     return got;
 }
 #endif /* !TLS_PLATFORM_HOST_TEST */
+
+/* ─── 7. gmtime_r for X.509 validity ───────────────────────────────────────
+ * MBEDTLS_PLATFORM_GMTIME_R_ALT, so this is the implementation the library
+ * uses. x509.c calls it directly from mbedtls_x509_time_is_past() and
+ * _is_future() -- the two functions that decide whether a certificate is
+ * currently valid.
+ *
+ * The calendar arithmetic lives in kernel/rtc.c next to its inverse, where
+ * both directions are tested against Python's datetime. This is the struct
+ * marshalling and nothing else.
+ *
+ * struct tm's conventions are a well-known source of off-by-one: tm_year is
+ * years since 1900 and tm_mon is 0-based, while tm_mday is 1-based. Getting
+ * either wrong shifts every certificate's validity window by a year or a
+ * month, in the permissive direction as often as not. */
+#ifndef TLS_PLATFORM_HOST_TEST
+#include <time.h>
+
+struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt, struct tm *tm_buf);
+
+struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt, struct tm *tm_buf)
+{
+    if (!tt || !tm_buf) return 0;
+
+    long long t = (long long)*tt;
+    long long days = t / 86400;
+    long long rem  = t % 86400;
+    if (rem < 0) { rem += 86400; days -= 1; }   /* floor, not truncate */
+
+    int64_t  y = 0; unsigned m = 0, d = 0;
+    rtc_civil_from_days((int64_t)days, &y, &m, &d);
+
+    tm_buf->tm_year = (int)(y - 1900);   /* years since 1900 */
+    tm_buf->tm_mon  = (int)m - 1;        /* 0-based */
+    tm_buf->tm_mday = (int)d;            /* 1-based */
+    tm_buf->tm_hour = (int)(rem / 3600);
+    tm_buf->tm_min  = (int)((rem % 3600) / 60);
+    tm_buf->tm_sec  = (int)(rem % 60);
+    tm_buf->tm_wday = (int)((days + 4) % 7);   /* 1970-01-01 was a Thursday */
+    if (tm_buf->tm_wday < 0) tm_buf->tm_wday += 7;
+    tm_buf->tm_yday = 0;                 /* not computed; mbedTLS does not read it */
+    tm_buf->tm_isdst = 0;                /* UTC has no DST, by definition */
+
+    return tm_buf;
+}
+#endif

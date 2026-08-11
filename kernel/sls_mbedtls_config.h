@@ -112,8 +112,27 @@ long long sls_mbedtls_time(long long *t);
  * its #include <time.h>, which a freestanding build cannot satisfy. Nothing
  * in the linked set calls mbedtls_platform_gmtime_r (x509.c uses its own
  * mbedtls_x509_time_gmtime), so excluding it removes the symbol rather than
- * requiring a struct tm we have no header for. Verified by nm, not assumed. */
+ * requiring a struct tm we have no header for. Verified by nm, not assumed.
+ *
+ * CORRECTION, from the link: "nothing calls it" was true of the three-file
+ * platform set I ran nm over, and false the moment x509.c joined -- it calls
+ * mbedtls_platform_gmtime_r directly in mbedtls_x509_time_is_past() and
+ * _is_future(). The nm run was real; the population was wrong. Verifying
+ * correctly against the wrong set is its own failure mode and this is what it
+ * looks like.
+ *
+ * So ALT stays, and kernel/tls_platform.c now SUPPLIES the function. struct tm
+ * is available: platform_util.h includes <time.h> whenever HAVE_TIME_DATE is
+ * set, and the cross-compiler provides one. */
 #define MBEDTLS_PLATFORM_GMTIME_R_ALT
+
+/* x509_crt.c picks the platform inet_pton() when AF_INET6 is visible and its
+ * own software version otherwise. On this target it chose the platform one and
+ * the link had nowhere to send it. MBEDTLS_TEST_SW_INET_PTON is upstream's own
+ * bypass for exactly this -- "force testing of this code despite having a
+ * platform that has inet_pton" (x509_crt.c:2723) -- and selects the local
+ * implementation. Used for selection, not for testing; the name is upstream's. */
+#define MBEDTLS_TEST_SW_INET_PTON
 
 /* ZEROIZE_ALT: platform_util.c detects "platforms known to support
  * explicit_bzero()" and calls it (line 98). On this toolchain gcc rewrites

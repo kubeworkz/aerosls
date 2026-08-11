@@ -530,6 +530,13 @@ char* strncpy(char* dst, const char* src, size_t n) {
     return dst;
 }
 
+char* strchr(const char* s, int c) {
+    for (; *s; s++) if (*s == (char)c) return (char*)s;
+    /* A search for '\0' finds the terminator, not NULL -- C requires it and
+     * x509_create.c's name parser relies on it to find the end of a field. */
+    return (c == 0) ? (char*)s : 0;
+}
+
 char* strstr(const char* hay, const char* needle) {
     if (!*needle) return (char*)hay;
     for (; *hay; hay++) {

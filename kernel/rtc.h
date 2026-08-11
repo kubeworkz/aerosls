@@ -97,6 +97,17 @@ int64_t rtc_days_from_civil(int64_t y, unsigned m, unsigned d);
  * rules. Returns RTC_OK or RTC_E_INVALID / RTC_E_NOT_SET. Also exposed for
  * testing: this is where a wrong century or a mis-decoded PM bit turns into a
  * wrong-but-plausible answer. */
+/* The inverse of rtc_days_from_civil: days since the epoch back to a civil
+ * date. Howard Hinnant's civil_from_days, the companion algorithm, and exposed
+ * for the same reason -- it is the part worth testing against an independent
+ * implementation.
+ *
+ * Exists because mbedTLS's X.509 validity checks need gmtime_r, and
+ * kernel/tls_platform.c builds mbedtls_platform_gmtime_r on top of this.
+ * Putting the calendar arithmetic here rather than there keeps both directions
+ * of the conversion in one file, tested together. */
+void rtc_civil_from_days(int64_t z, int64_t* y, unsigned* m, unsigned* d);
+
 int rtc_compose(unsigned year, unsigned mon, unsigned day,
                 unsigned hour, unsigned min, unsigned sec, uint64_t* out);
 
