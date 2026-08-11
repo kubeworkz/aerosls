@@ -116,6 +116,7 @@ static const struct X86Baseline X86_BASELINES[] = {
     { "jmpr_mix.simi", 791 },
     { "jmpr_table.simi", 817 },
     { "jmpr_unreach.simi", 1567 },
+    { "lcg_fairness.simi", 1086 },
     { "loadi64.simi", 429 },
     { "loop_sum.simi", 583 },
     { "mem_neg.simi", 719 },

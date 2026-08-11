@@ -43,7 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define AGG_RATIO_MEASURED 0.9092  /* A64 M1 207808 / x86 228549, 2026-08-09 */
+#define AGG_RATIO_MEASURED 0.9155  /* A64 M1 211028 / x86 230505, 2026-08-10 (re-measured with lcg_fairness's row: 1304 A64 / 1086 x86) */
 #define AGG_RATIO_BAND     0.25   /* +/-25% tolerance on the aggregate */
 
 #define CODE_CAP 262144u   /* same as the other ARM tools */

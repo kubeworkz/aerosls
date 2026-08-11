@@ -122,6 +122,7 @@ static const struct InterpBaseline INTERP_BASELINES[] = {
     { "jmpr_mix.simi", 10, 3133 },
     { "jmpr_table.simi", 11, 2633 },
     { "jmpr_unreach.simi", 12, 3484 },
+    { "lcg_fairness.simi", 1800015, 10807429 },
     { "loadi64.simi", 5, 2513 },
     { "loop_sum.simi", 58, 3142 },
     { "mem_neg.simi", 18, 2675 },

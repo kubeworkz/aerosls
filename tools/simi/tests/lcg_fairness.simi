@@ -1,0 +1,64 @@
+; lcg_fairness.simi — the fairness probe, committed as a cross-ISA
+; fixture. The RISC-V kernel's tasks (kernel_riscv.c, rv_fp_task_common)
+; step the LCG  acc = acc * 1664525 + 1013904223 (mod 2^32, Numerical
+; Recipes constants) exactly sp->work = 200,000 times per slice — the
+; per-slice step count of the fairness probe (ISA doc §16). This
+; fixture translates that exact loop into SIMI and executes it on all
+; four engines: loop 1 runs one full per-slice budget (200,000
+; iterations -> acc = 0x0b6f2a40), loop 2 runs the historic light
+; baseline (100,000 iterations -> acc = 0x0abe2d20, the committed
+; one-heavy/two-heavy tooth). The kernel's own per-task teeth are the
+; 5-slice totals: five consecutive 200,000-iteration slices accumulate
+; to exactly the committed all-heavy tooth 0xf2dc5340 (verified by the
+; kernel's acc asserts and cross-checked by the five-iteration
+; composition of this fixture's loop, host-computed) — so this fixture
+; pins the per-slice loop structure the kernel runs, at the slice
+; scale that fits the parity corpus's tight 10M-step budget (the full
+; 1M-iteration task total would need ~24M A64 / ~32M RV64 executed
+; instructions — the arm64_boot_smoke-class of out-of-budget rows the
+; corpus deliberately excludes).
+;
+; The recurrence needs the mod-2^32 mask (the kernel's acc is uint32_t,
+; so the multiply/add wrap at 2^32; SIMI registers are 64-bit, so the
+; AND is the explicit truncation). A wrong recurrence — a missing mask,
+; swapped constants, an off-by-one count — lands on different acc
+; values and the two EQ checks return 0, caught by the four-way parity.
+; The committed step baselines (bench_baselines*.h) pin the exact
+; executed-instruction counts (~1.8M SIMI / ~6.6M A64 / ~8.7M RV64),
+; the same machine-independent tripwire that guards every corpus
+; fixture (M2.75/76/81); the size gate's M0_BASELINES row pins the A64
+; emission, and bench_baselines_x86.h pins the native bytes.
+; Expected result: 1
+.entry main
+main:
+    ENTER #8
+    LOADI64 r2, #1664525, i64        ; K1 = 1664525
+    LOADI64 r3, #1013904223, i64     ; K2 = 1013904223
+    LOADI64 r4, #4294967295, i64     ; 2^32-1 — the mod-2^32 mask (uint32_t acc)
+    LOADI r8, #0, i64                ; zero — for the NE count compare (CMP is reg+reg)
+    ; --- loop 1: 200,000 iterations — one per-slice budget (sp->work) ---
+    LOADI r0, #0, i64                ; acc = 0
+    LOADI r1, #200000, i64           ; w = 200,000 (the kernel's per-slice step count)
+loop1:
+    MUL r0, r0, r2, i64              ; acc * K1
+    ADD r0, r0, r3, i64              ; + K2
+    AND r0, r0, r4, i64              ; & 0xFFFFFFFF (the kernel's uint32_t wrap)
+    SUB r1, r1, #1, i64              ; w--
+    CMP r5, r1, r8, i64, NE          ; r5 = (w != 0)
+    BC r5, loop1
+    LOADI64 r6, #191834688, i64      ; 0x0b6f2a40 — the per-slice tooth (f^200000(0))
+    CMP r5, r0, r6, i64, EQ          ; chk1 = (acc == 0x0b6f2a40)
+    ; --- loop 2: 100,000 iterations — the historic light baseline ---
+    LOADI r0, #0, i64                ; acc = 0 (fresh seed, like a fresh task)
+    LOADI r1, #100000, i64           ; w = 100,000
+loop2:
+    MUL r0, r0, r2, i64
+    ADD r0, r0, r3, i64
+    AND r0, r0, r4, i64
+    SUB r1, r1, #1, i64
+    CMP r7, r1, r8, i64, NE
+    BC r7, loop2
+    LOADI64 r6, #180235552, i64      ; 0x0abe2d20 — the committed 100k-iteration tooth
+    CMP r7, r0, r6, i64, EQ          ; chk2 = (acc == 0x0abe2d20)
+    AND r0, r5, r7, i64              ; result = chk1 && chk2 — 1 only if both teeth match
+    RET
