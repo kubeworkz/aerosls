@@ -22,6 +22,19 @@ guest's tables made the old omission a fault). The §5 gates have **not** been r
 no toolchain or hardware in the working environment. Build + `qemu paging` from the
 main tree remain the verification.
 
+**Gate results 2026-08-11 (WSL x86_64 toolchain, QEMU boot): PASS.**
+`make x86-iso SLS_X86_FRONTEND=on` (QEMU's decoder) and the default 18-opcode
+frontend build both; the `qemu paging` fixture passes on **both** builds
+(`pass:true`, EAX=0x5a5ac0de, 7/7 insns, paging_on=1, CR3=0x1000) and the
+paging-off bench runs `ok:true` (256 loads, softmmu off). One real defect was
+found and fixed during verification: the fixture's identity mapping wrote
+`PT[0]=PTE(0)` into the SAME PT page the data mapping uses (GVA 0 and
+TEST_GVA 0x400000 share PT index 0), so the load resolved to GPA 0 instead of
+GPA 0x5000 — `EAX=0x001000bb`, the program's own first bytes. Fixed by giving
+the identity mapping its own PT page (`PT2_GPA`, `sls-launcher.c`), the same
+choice a real boot loader makes. The §3.2 invalidation policy (CR3/invlpg
+handling, guest-PT-page write-protect trapping) remains the outstanding M2 work.
+
 ---
 
 ## 0. The three options, as posed
