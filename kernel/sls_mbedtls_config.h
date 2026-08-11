@@ -141,13 +141,31 @@ long long sls_mbedtls_time(long long *t);
  * I argued twice against writing a format-string parser in a kernel, and this
  * is still not a general printf. The complete set of conversions those two
  * files use was extracted from their sources -- %s %u %c %d %x %X with an
- * optional 0-pad width -- and sls_snprintf implements exactly those and
+ * optional 0-pad width -- and sls_tls_snprintf implements exactly those and
  * REFUSES anything else rather than skipping it silently. A formatter that
  * ignores what it does not understand produces a plausible wrong string; one
  * that stops produces a visibly truncated one. */
-#define MBEDTLS_PLATFORM_SNPRINTF_MACRO sls_snprintf
+#define MBEDTLS_PLATFORM_SNPRINTF_MACRO sls_tls_snprintf
 
-int sls_snprintf(char *buf, unsigned long size, const char *fmt, ...);
+/* NAMED sls_tls_snprintf, not sls_snprintf: that name is taken. The QEMU-SLS
+ * layer already defines one (../qemu/sls/sls-runtime.c:376), reached because
+ * sls-osdep.h does `#define snprintf sls_snprintf` for TCG. I chose a name in
+ * this project's own prefix without checking whether it was free, and the link
+ * caught it.
+ *
+ * Worth knowing what that one is, because reusing it would have been a silent
+ * disaster rather than a link error: it IGNORES the format entirely and writes
+ * the literal "<nofmt>". Correct for its purpose -- a TCG debug dump where a
+ * blank operand would look like an IR bug -- and catastrophic here, where the
+ * output is a certificate subject name.
+ *
+ * Two implementations of nearly the same name now coexist, one of which is a
+ * placeholder. That is worth collapsing: this one could replace the TCG stub
+ * and its own comment says "a real vsnprintf is the fix if the dump is ever
+ * needed". Left as a separate change because it touches the QEMU-SLS layer,
+ * which has work in flight. */
+
+int sls_tls_snprintf(char *buf, unsigned long size, const char *fmt, ...);
 
 /* ZEROIZE_ALT: platform_util.c detects "platforms known to support
  * explicit_bzero()" and calls it (line 98). On this toolchain gcc rewrites

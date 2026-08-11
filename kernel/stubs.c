@@ -584,7 +584,7 @@ static void sn_num(char* buf, unsigned long size, unsigned long* n,
     while (i) sn_putc(buf, size, n, tmp[--i]);
 }
 
-int sls_snprintf(char* buf, unsigned long size, const char* fmt, ...) {
+int sls_tls_snprintf(char* buf, unsigned long size, const char* fmt, ...) {
     va_list ap;
     unsigned long n = 0;
     va_start(ap, fmt);
