@@ -282,6 +282,40 @@ Functional tests cannot validate a CSPRNG. These can:
 **Gate for Phase 0:** all five green on x86-64 *and* ARM64, plus a boot with
 every hardware source disabled that correctly refuses to serve TLS.
 
+### Gate result, 2026-08-11: MET on x86-64
+
+```
+AEROSLS_TOKEN=... tests/entropy_boot_diversity_check.sh
+  nodes seeded:        4  (ids: 1 2 3 4)
+  distinct fingerprints: 4
+PASS  every node seeded differently (4/4 distinct)
+```
+
+Four nodes, one image, four distinct fingerprints. Test 3 -- the one that
+would have caught Debian -- has now actually run against real hardware rather
+than being asserted.
+
+**What it found on its first real run was not what it was built for.**
+`entropy_init()` was never called. The subsystem compiled, linked, and passed
+31 host tests while being completely inert in the booted kernel; every host
+test calls `entropy_init()` itself as setup, so none of them could see it. A
+unit test cannot detect "the boot path never invokes this" -- the call it needs
+is the call under test. Fixed in `83e1134`.
+
+That is the argument for a runtime gate, made better than §2.5 made it. The
+value was not the assertion; it was that something finally exercised the real
+system instead of a harness that supplied the missing piece.
+
+`tests/entropy_boot_diversity_smoke.sh` now plants teeth against fake nodes and
+requires the guard to reach the right verdict for all five shapes -- including
+that a node with NO entropy is not blamed on diversity, which is a wording
+failure this script shipped twice. Mutation tested: forcing the guard to always
+PASS is caught.
+
+**Still owed: the same gate on ARM64.** x86-64 has RDSEED and RDRAND; ARM64 has
+neither and runs on jitter alone (§2.3). A pass here says nothing about the
+target the roadmap actually optimises for.
+
 ---
 
 ## 3. BearSSL port
