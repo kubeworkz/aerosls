@@ -324,14 +324,19 @@ jobs:
           # trap-frame ctx image; the coroutine switch is left to the
           # boot-context entry/handoff only). FP state rides the fp_save
           # owner rows, one lazy-save per slice = exactly 15 more after
-          # the smoke's 3, and the preemption accounting (one tick
-          # rotation per slice boundary per task) is the same 15.
+          # the smoke's 3, the preemption accounting (one tick rotation
+          # per slice boundary per task) is the same 15, and the
+          # FAIRNESS probe holds: task A ran 10x the per-slice LCG work
+          # (1,000,000 vs 100,000 iterations, acc 0xf2dc5340 vs
+          # 0x0abe2d20 — the host-precomputed teeth) yet still got
+          # exactly 5 preemptions like B/C — the round-robin is
+          # workload-oblivious.
           grep -a "\[TASK\] ready queue: ALL PASS" boot_rv.log || {
             echo "FAILED: the three-task FP ready queue did not pass in S-mode" >&2
             tail -30 boot_rv.log >&2
             exit 1
           }
-          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS; preemptions: 15 PASS" boot_rv.log || {
+          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS; preemptions: 15 PASS; work: 1000000/100000/100000 (10x) PASS; acc: 0x00000000f2dc5340/0x000000000abe2d20 PASS" boot_rv.log || {
             echo "FAILED: the ready-queue final rows/count did not hold in S-mode" >&2
             tail -30 boot_rv.log >&2
             exit 1
@@ -409,13 +414,14 @@ jobs:
           # Design B part 3 + preemption follow-up: the three-task FP
           # ready queue on the bare-metal path too — the same preemptive
           # tick-handler rotation + FP owner rows, 15 per-slice
-          # lazy-saves and 15 preemptions after the smoke's 3.
+          # lazy-saves and 15 preemptions after the smoke's 3, plus the
+          # fairness probe (10x work ratio with exact accounting).
           grep -a "\[TASK\] ready queue: ALL PASS" boot_rv_m.log || {
             echo "FAILED: the three-task FP ready queue did not pass in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1
           }
-          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS; preemptions: 15 PASS" boot_rv_m.log || {
+          grep -a "\[TASK\] fp_save rows: A=0x4014000000000000 B=0x4004000000000000 C=0x3ff4000000000000 PASS; lazy-saves during demo: 15 PASS; preemptions: 15 PASS; work: 1000000/100000/100000 (10x) PASS; acc: 0x00000000f2dc5340/0x000000000abe2d20 PASS" boot_rv_m.log || {
             echo "FAILED: the ready-queue final rows/count did not hold in M-mode" >&2
             tail -30 boot_rv_m.log >&2
             exit 1

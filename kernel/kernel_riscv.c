@@ -282,6 +282,8 @@ static void rv_task_init(struct RvTask* t, void (*fn)(void), uint64_t owner,
     t->slices = 0;
     t->done = 0;
     t->preemptions = 0;
+    t->work_done = 0;
+    t->lcg_acc = 0;
     register uint64_t gp_v __asm__("gp");
     register uint64_t tp_v __asm__("tp");
     for (int i = 0; i < 32; i++) t->ctx[i] = 0;
@@ -413,26 +415,31 @@ void rv_scheduler_tick(void) {
  * fp_save_all/fp_load_all plumbing, and the rv64_fp_census allow-list
  * sanctions exactly rv_fp_task_common (an injected fadd.d in any other
  * kernel function still fails the gate). One generic runner drives all
- * N tasks off a per-task spec (step, expected bit patterns, name): each
- * slice does one fadd.d accumulating the task's step into f10, reads it
- * back with fmv.x.d, asserts the exact bit pattern (the expected
- * constants are precomputed double(s) bit patterns — no FP conversion
- * needed in C), then waits for the tick's slice-boundary flag and
- * yields to the next ready task. Because every switch disarms FP, each
- * slice's first fadd.d traps and lazy-saves — one trap per slice. The
- * step constant rides in a GPR and is materialized INSIDE the asm via
- * fmv.d.x into scratch ft0: the compiler therefore sees no FP value
- * live in this function, so it cannot hoist a loop-invariant double
- * into callee-saved fs0 (which would put a compiler-generated fld in
- * the epilogue AFTER the handback switch disarms FS -- the spurious
- * 11th lazy-save that broke the per-slice trap count). The only FP
- * instructions in this function are the asm blocks themselves. */
+ * N tasks off a per-task spec (step, expected bit patterns, name,
+ * per-slice work budget): each slice does one fadd.d accumulating the
+ * task's step into f10, reads it back with fmv.x.d, asserts the exact
+ * bit pattern (the expected constants are precomputed double(s) bit
+ * patterns — no FP conversion needed in C), then runs its per-slice
+ * integer work budget (a deterministic LCG, the FAIRNESS probe: task A
+ * is 10x heavier per slice than B/C, yet the tick's round-robin still
+ * grants every task the same slice count), and waits for the next
+ * tick-granted boundary in its spin. Because every switch disarms FP,
+ * each slice's first fadd.d traps and lazy-saves — one trap per slice.
+ * The step constant rides in a GPR and is materialized INSIDE the asm
+ * via fmv.d.x into scratch ft0: the compiler therefore sees no FP
+ * value live in this function, so it cannot hoist a loop-invariant
+ * double into callee-saved fs0 (which would put a compiler-generated
+ * fld in the epilogue AFTER the handback switch disarms FS -- the
+ * spurious 11th lazy-save that broke the per-slice trap count). The
+ * only FP instructions in this function are the asm blocks themselves. */
 #define RV_TASK_SLICES 5
 
 struct RvTaskSpec {
     uint64_t step;            /* f10 += step per slice, as double bits */
     const uint64_t* exp;      /* RV_TASK_SLICES expected f10 bit patterns */
     const char* name;         /* "fp-a" / "fp-b" / "fp-c" for the [TASK] log */
+    uint32_t work;            /* per-slice LCG iterations — the fairness
+                                 probe: task A's budget is 10x B/C's */
 };
 
 /* Task A: f10 += 1.0 -> 1.0..5.0. Task B: f10 += 0.5 -> 0.5..2.5.
@@ -460,10 +467,19 @@ static const uint64_t g_rv_exp_c[RV_TASK_SLICES] = {
     0x3FF0000000000000ULL, /* 1.0 */
     0x3FF4000000000000ULL, /* 1.25 */
 };
+/* The work budgets are the fairness probe: A (200k LCG iterations per
+ * slice) does 10x the per-slice work of B/C (20k) — yet the preemptive
+ * round-robin must still grant every task exactly RV_TASK_SLICES
+ * slices/preemptions, because the rotation is tick-cadence-driven, not
+ * work-driven. The end-of-demo lcg_acc values (A=0xf2dc5340 after
+ * 5*200k=1M iterations, B/C=0x0abe2d20 after 5*20k=100k, starting from
+ * 0) are precomputed on the host — the acc is a deterministic function
+ * of the budget, so the work provably ran its iterations (the Phase 9l
+ * discipline). */
 static const struct RvTaskSpec g_rv_spec[RV_TASK_COUNT] = {
-    { 0x3FF0000000000000ULL, g_rv_exp_a, "fp-a" },   /* += 1.0   -> 1.0..5.0  */
-    { 0x3FE0000000000000ULL, g_rv_exp_b, "fp-b" },   /* += 0.5   -> 0.5..2.5  */
-    { 0x3FD0000000000000ULL, g_rv_exp_c, "fp-c" },   /* += 0.25  -> 0.25..1.25 */
+    { 0x3FF0000000000000ULL, g_rv_exp_a, "fp-a", 200000u },  /* += 1.0   -> 1.0..5.0  */
+    { 0x3FE0000000000000ULL, g_rv_exp_b, "fp-b", 20000u  },  /* += 0.5   -> 0.5..2.5  */
+    { 0x3FD0000000000000ULL, g_rv_exp_c, "fp-c", 20000u  },  /* += 0.25  -> 0.25..1.25 */
 };
 
 static void rv_fp_task_common(void) {
@@ -504,6 +520,21 @@ static void rv_fp_task_common(void) {
         rv_boot_print(": ");
         rv_boot_print_hex64(got);
         rv_boot_print(got == sp->exp[s] ? " PASS\n" : " FAIL\n");
+        /* The per-slice integer work — the fairness probe's heavy
+         * lift: a deterministic LCG (Numerical Recipes constants)
+         * stepped exactly sp->work times, accumulating across slices
+         * so the final lcg_acc is a function of the TOTAL budget. The
+         * acc is observable (stored back to the task), so the loop can
+         * never be dead-code-eliminated. Integer only — no FP, so the
+         * census allow-list and the per-slice lazy-save discipline are
+         * untouched. 200k iterations is a small fraction of the 100ms
+         * slice even on the slowest CI host, so the tick still lands
+         * in the spin and the preemption accounting stays exact. */
+        uint32_t acc = (uint32_t)me->lcg_acc;
+        for (uint32_t w = 0; w < sp->work; w++)
+            acc = acc * 1664525u + 1013904223u;
+        me->lcg_acc = acc;
+        me->work_done += sp->work;
     }
     /* All slices done: mark finished. The handoff discipline matters
      * here: a task that was PREEMPTIVELY suspended holds its resume
@@ -532,8 +563,13 @@ static void rv_fp_task_common(void) {
  * fp_save rows (one per task owner), the lazy-save delta (one per
  * task-slice = RV_TASK_COUNT*RV_TASK_SLICES = 15), and the preemption
  * accounting (one tick-handler rotation per slice boundary, also 15).
- * Task 0 is entered COOPERATIVELY by the driver (rv_task_switch_fp);
- * every subsequent rotation is the tick handler's rv_scheduler_tick
+ * The FAIRNESS probe rides along: task A's per-slice work budget is
+ * 10x B/C's, so the demo also asserts A did 1,000,000 vs 100,000 LCG
+ * iterations (with the host-precomputed lcg_acc end-states as proof)
+ * while STILL getting exactly RV_TASK_SLICES preemptions like everyone
+ * else — the preemptive round-robin is workload-oblivious. Task 0 is
+ * entered COOPERATIVELY by the driver (rv_task_switch_fp); every
+ * subsequent rotation is the tick handler's rv_scheduler_tick
  * preempting the running task — the demo's only cooperative switches
  * are the entry and the queue-empty handoff back to this driver. */
 static void rv_fp_round_robin_demo(void) __attribute__((unused)); /* the echo build never calls it (wfi loop) */
@@ -582,6 +618,23 @@ static void rv_fp_round_robin_demo(void) {
         if (g_rv_tasks[i].preemptions != RV_TASK_SLICES) preempt_ok = 0;
     }
     if (preempt_sum != RV_TASK_COUNT * RV_TASK_SLICES) preempt_ok = 0;
+    /* The fairness probe asserts: the heavy task (A) did exactly 10x
+     * the per-slice work of B/C (1,000,000 vs 100,000 total LCG
+     * iterations) AND still got exactly RV_TASK_SLICES
+     * preemptions/slices like everyone else — the preemptive
+     * round-robin is workload-oblivious, the property this probe
+     * exists to pin. The lcg_acc end-states are the "the work provably
+     * ran" teeth: precomputed on the host (A = 0xf2dc5340 after 1M
+     * steps, B/C = 0x0abe2d20 after 100k, both from 0). */
+    uint64_t wa = g_rv_tasks[0].work_done;
+    uint64_t wb = g_rv_tasks[1].work_done;
+    uint64_t wc = g_rv_tasks[2].work_done;
+    int work_ok = (wa == 10 * wb) && (wb == wc) &&
+                  (wa == (uint64_t)g_rv_spec[0].work * RV_TASK_SLICES) &&
+                  (wb == (uint64_t)g_rv_spec[1].work * RV_TASK_SLICES);
+    int acc_ok = (g_rv_tasks[0].lcg_acc == 0xf2dc5340ULL) &&
+                 (g_rv_tasks[1].lcg_acc == 0x0abe2d20ULL) &&
+                 (g_rv_tasks[2].lcg_acc == 0x0abe2d20ULL);
     rv_boot_print("[TASK] fp_save rows: A=");
     rv_boot_print_hex64(phd->fp_save[0][10]);
     rv_boot_print(" B=");
@@ -594,8 +647,19 @@ static void rv_fp_round_robin_demo(void) {
     rv_boot_print(lazy_ok ? " PASS;" : " FAIL;");
     rv_boot_print(" preemptions: ");
     rv_boot_print_udec64(preempt_sum);
-    rv_boot_print(preempt_ok ? " PASS\n" : " FAIL\n");
-    rv_boot_print(rows_ok && lazy_ok && preempt_ok
+    rv_boot_print(preempt_ok ? " PASS;" : " FAIL;");
+    rv_boot_print(" work: ");
+    rv_boot_print_udec64(wa);
+    rv_boot_print("/");
+    rv_boot_print_udec64(wb);
+    rv_boot_print("/");
+    rv_boot_print_udec64(wc);
+    rv_boot_print(work_ok ? " (10x) PASS; acc: " : " (10x) FAIL; acc: ");
+    rv_boot_print_hex64(g_rv_tasks[0].lcg_acc);
+    rv_boot_print("/");
+    rv_boot_print_hex64(g_rv_tasks[1].lcg_acc);
+    rv_boot_print(acc_ok ? " PASS\n" : " FAIL\n");
+    rv_boot_print(rows_ok && lazy_ok && preempt_ok && work_ok && acc_ok
                       ? "[TASK] ready queue: ALL PASS\n"
                       : "[TASK] ready queue: FAIL\n");
 }
