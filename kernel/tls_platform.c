@@ -203,3 +203,42 @@ int sls_tls_time_init(void)
 }
 
 int sls_tls_time_trusted(void) { return rtc_is_trusted(); }
+
+/* ─── 4. The two remaining platform hooks ──────────────────────────────────
+ * Both exist because a freestanding link named them, not because a design
+ * document predicted them. See sls_mbedtls_config.h §4b.
+ */
+
+#ifndef TLS_PLATFORM_HOST_TEST
+extern volatile uint64_t kernel_tick_counter;
+#else
+static uint64_t kernel_tick_counter;
+#endif
+
+/* mbedtls_exit(). There is nothing to exit to in a kernel, and returning would
+ * continue executing on state mbedTLS has already declared unusable. Say so
+ * loudly and stop. Not a panic() call: this is reached only from library
+ * internals, and a halt that names its cause is easier to diagnose than a
+ * generic fault several frames away. */
+void sls_mbedtls_exit(int status);
+
+void sls_mbedtls_exit(int status)
+{
+    (void)status;
+    kernel_serial_print("[TLS] mbedTLS called exit() -- unrecoverable library "
+                        "state. Halting rather than continuing on it.\n");
+#ifndef TLS_PLATFORM_HOST_TEST
+    for (;;) { __asm__ volatile("cli; hlt"); }
+#endif
+}
+
+/* mbedtls_ms_time(): a MONOTONIC millisecond counter for timeouts. Explicitly
+ * NOT the wall clock -- §3 is that, and using this for certificate validity
+ * would put expiry on a counter that restarts at every boot. ~100 ticks per
+ * second, matching net/http.c's own uptime conversion. */
+long long mbedtls_ms_time(void);
+
+long long mbedtls_ms_time(void)
+{
+    return (long long)(kernel_tick_counter * 10ull);
+}

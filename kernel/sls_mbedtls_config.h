@@ -91,6 +91,32 @@ long long sls_mbedtls_time(long long *t);
  * amendment, §"Costs". */
 #define MBEDTLS_MEMORY_BUFFER_ALLOC_C
 
+/* ─── 4b. The hosted symbols the platform layer still reaches for ─────────
+ * Measured, not guessed: with the config above, memory_buffer_alloc.o still
+ * wants exit(), and platform_util.o wants clock_gettime()/gmtime_r()/time().
+ * PLATFORM_NO_STD_FUNCTIONS removes the DEFAULTS but leaves these three hooks
+ * needing a target, and a freestanding link fails on each one by name.
+ *
+ * EXIT_MACRO: mbedTLS calls mbedtls_exit() on unrecoverable internal state.
+ * In a kernel there is nothing to exit TO, so it routes to a function that
+ * says so on the console and halts rather than returning into corrupted state.
+ *
+ * MS_TIME_ALT: mbedtls_ms_time() is a MONOTONIC millisecond counter used for
+ * timeouts -- deliberately not the same thing as the wall clock in §2, and
+ * conflating them would put certificate validity on a counter that restarts
+ * every boot. kernel_tick_counter is the right source. */
+#define MBEDTLS_PLATFORM_EXIT_MACRO sls_mbedtls_exit
+#define MBEDTLS_PLATFORM_MS_TIME_ALT
+
+/* GMTIME_R_ALT excludes platform_util.c's whole gmtime_r block -- including
+ * its #include <time.h>, which a freestanding build cannot satisfy. Nothing
+ * in the linked set calls mbedtls_platform_gmtime_r (x509.c uses its own
+ * mbedtls_x509_time_gmtime), so excluding it removes the symbol rather than
+ * requiring a struct tm we have no header for. Verified by nm, not assumed. */
+#define MBEDTLS_PLATFORM_GMTIME_R_ALT
+
+void sls_mbedtls_exit(int status);
+
 /* ─── 5. TLS 1.3 only, ephemeral only ──────────────────────────────────────
  * 1.2 is disabled: there is no legacy peer to support, both ends of the
  * cluster are ours, and the browser side speaks 1.3. Carrying 1.2 would mean

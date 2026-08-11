@@ -382,6 +382,26 @@ MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"'
 kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@
 
+# ── The mbedTLS objects the kernel actually links ──────────────────────────
+# THREE files, not all 107, because three is the measured closure of what
+# kernel/tls_platform.c references today. There is no TLS server yet; adding
+# the rest would link ~1 MB of code nothing calls and would put the image-end
+# and frame-budget guards under load for no benefit. This list grows when a
+# caller appears, not in anticipation of one.
+#
+# library/ IS on the include path here (unlike the tls_platform rule) because
+# these sources include library/common.h and friends. That is safe for the
+# vendored files themselves and unsafe for kernel files, which is why the two
+# rules differ rather than sharing flags.
+MBEDTLS_SRC  = vendor/mbedtls/library/memory_buffer_alloc.c \
+               vendor/mbedtls/library/platform.c \
+               vendor/mbedtls/library/platform_util.c
+MBEDTLS_OBJS = $(MBEDTLS_SRC:.c=.x86.o)
+
+$(MBEDTLS_OBJS): %.x86.o: %.c $(AB_STAMP)
+	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) -I vendor/mbedtls/library \
+	          $(MBEDTLS_DEFS) -I kernel -c $< -o $@
+
 $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
@@ -479,8 +499,8 @@ arch/x86/trampoline.o: arch/x86/trampoline.asm
 		--redefine-sym _binary_arch_x86_trampoline_bin_end=trampoline_end \
 		arch/x86/trampoline.bin arch/x86/trampoline.o
 
-$(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS)
-	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) -o $(X86_BIN)
+$(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS)
+	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS) -o $(X86_BIN)
 
 x86-iso: $(X86_BIN)
 	mkdir -p isodir/boot/grub
