@@ -188,10 +188,22 @@ NB="$(openssl x509 -in "$WORK/crt.pem" -noout -startdate | cut -d= -f2)"
 NA="$(openssl x509 -in "$WORK/crt.pem" -noout -enddate | cut -d= -f2)"
 SAN="$(openssl x509 -in "$WORK/crt.pem" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' ' | tr '\n' ' ')"
 PUBSHA="$(openssl x509 -in "$WORK/crt.pem" -pubkey -noout | openssl dgst -sha256 | awk '{print $NF}')"
+# basicConstraints and keyUsage were not captured until a Firefox failure
+# needed them. MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT does not distinguish "never
+# imported" from "imported a different certificate" from "imported one that is
+# not a CA", and the one fact that separates them -- whether the RUNNING node
+# presents CA:TRUE -- was the one field this capture did not record. A capture
+# that omits the field currently under discussion is not evidence.
+BC="$(openssl x509 -in "$WORK/crt.pem" -noout -ext basicConstraints 2>/dev/null | tail -n +2 | tr -d ' ' | tr '\n' ' ')"
+KU="$(openssl x509 -in "$WORK/crt.pem" -noout -ext keyUsage 2>/dev/null | tail -n +2 | tr -d ' ' | tr '\n' ' ')"
+FP="$(openssl x509 -in "$WORK/crt.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
 note "serial  : $SERIAL"
 note "subject : $SUBJ"
 note "validity: $NB  ->  $NA"
 note "san     : ${SAN:-<NONE>}"
+note "basic   : ${BC:-<none>}"
+note "keyusage: ${KU:-<none>}"
+note "sha256  : $FP"
 
 if [ -n "$VER" ] && [ -n "$CIPH" ] && [ "$VER" != "unknown" ]; then
     ok "negotiated parameters captured ($VER / $CIPH)"
@@ -199,6 +211,15 @@ else
     bad "could not read the negotiated version or cipher -- the capture is
         missing the field it exists to record"
 fi
+
+case "$BC" in
+    *CA:TRUE*) ok "basicConstraints says CA:TRUE -- a trust store can anchor it" ;;
+    *)         bad "basicConstraints is '${BC:-absent}'. A self-signed certificate that
+        does not assert CA:TRUE cannot be installed as a trust anchor:
+        Windows files it under Intermediate rather than Trusted Root, and
+        Firefox reports MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT however many
+        times it is imported." ;;
+esac
 
 [ -n "$SAN" ] && ok "the certificate carries a subjectAltName" \
               || bad "NO subjectAltName -- Chrome has ignored commonName since Chrome 58"
@@ -262,6 +283,9 @@ if [ -n "$OUT" ]; then
         echo "not_before: $NB"
         echo "not_after: $NA"
         echo "san: $SAN"
+        echo "basic_constraints: ${BC:-none}"
+        echo "key_usage: ${KU:-none}"
+        echo "fingerprint_sha256: $FP"
         echo "pubkey_sha256: $PUBSHA"
         echo "uptime_ticks: ${UPTIME:-unknown}"
         echo "captured_at: $(date -u +%s)"
