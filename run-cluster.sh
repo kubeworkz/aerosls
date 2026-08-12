@@ -70,6 +70,11 @@ MCAST_GROUP="${AEROSLS_MCAST:-239.192.152.40}"
 MCAST_PORT="${AEROSLS_MCAST_PORT:-12340}"
 CON_BASE="${AEROSLS_CON_BASE:-12340}"   # node i's console is CON_BASE + i
 HTTP_BASE="${AEROSLS_HTTP_BASE:-3000}"  # node i's REST API is HTTP_BASE + i
+# node i's TLS listener is HTTPS_BASE + i. A separate base rather than an
+# offset off HTTP_BASE so the two can be moved independently when one of them
+# collides -- which HTTP_BASE already does with `make x86-run`, see the port
+# check below.
+HTTPS_BASE="${AEROSLS_HTTPS_BASE:-8443}"
 MAC_PREFIX="52:54:00:AE:51"             # cluster NIC:    ...:51:0<i>
 MGMT_MAC_PREFIX="52:54:00:AE:52"        # management NIC: ...:52:0<i>
 
@@ -464,6 +469,7 @@ node_mac()      { printf '%s:%02x' "$MAC_PREFIX" "$1"; }
 node_mgmt_mac() { printf '%s:%02x' "$MGMT_MAC_PREFIX" "$1"; }
 node_con()      { echo $(( CON_BASE + $1 )); }
 node_http()     { echo $(( HTTP_BASE + $1 )); }
+node_https()    { echo $(( HTTPS_BASE + $1 )); }
 node_iso()  { echo "$CLUSTER_DIR/node$1.iso"; }
 node_img()  { echo "$CLUSTER_DIR/node$1.img"; }
 node_log()  { echo "$CLUSTER_DIR/node$1.log"; }
@@ -484,7 +490,13 @@ node_argv() {
     # never meets a peer, plus a host port forward that gives this node a
     # URL. slirp also runs a DHCP server, which is why net/dhcp.c finally
     # gets a lease here instead of timing out to the compiled-in default.
-    a+=(-netdev "user,id=mgmt0,hostfwd=tcp:127.0.0.1:$(node_http "$i")-:3000")
+    # Two forwards: the REST API and the TLS listener (net/net.h's
+    # NET_HTTPS_PORT). Without the second, the guest listens on 8443 and
+    # nothing outside QEMU can reach it -- 10.0.2.15 is slirp's own address
+    # and is not routable from the host, which is exactly how the first
+    # attempt at a handshake failed: `curl https://10.0.2.15:8443` left the
+    # box and timed out against the internet.
+    a+=(-netdev "user,id=mgmt0,hostfwd=tcp:127.0.0.1:$(node_http "$i")-:3000,hostfwd=tcp:127.0.0.1:$(node_https "$i")-:8443")
     a+=(-device "e1000,netdev=mgmt0,mac=$(node_mgmt_mac "$i"),addr=0x4")
 
     # nic1 -- CLUSTER. The shared multicast L2 segment carrying DSPP.
@@ -506,13 +518,15 @@ echo "      segment          $MCAST_GROUP:$MCAST_PORT (shared, all nodes)"
 echo "      display          $DISPLAY_BACKEND"
 echo "      consoles         $(node_con 1)..$(node_con "$NODES") on 127.0.0.1"
 echo "      REST API         http://localhost:$(node_http 1)..$(node_http "$NODES")"
+echo "      TLS              https://localhost:$(node_https 1)..$(node_https "$NODES")"
 
 # Only CONSOLE ports are checked. The segment port is bound by every node
 # on purpose -- that shared bind IS the segment -- so treating it as a
 # clash would refuse a launch working exactly as designed.
 for i in $(seq 1 "$NODES"); do
     for spec in "console:$(node_con "$i"):AEROSLS_CON_BASE" \
-                "REST API:$(node_http "$i"):AEROSLS_HTTP_BASE"; do
+                "REST API:$(node_http "$i"):AEROSLS_HTTP_BASE" \
+                "TLS:$(node_https "$i"):AEROSLS_HTTPS_BASE"; do
         what="${spec%%:*}"; rest="${spec#*:}"; p="${rest%%:*}"; var="${rest#*:}"
         if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$p "; then
             echo "error: $what port $p (node $i) is already in use." >&2
