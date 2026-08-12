@@ -4,8 +4,9 @@
 x86-64 kernel image. Phase 3 (a listener) is next and nothing calls the library
 yet. See "Phase 2 result" below. Phase 2 library choice REVERSED — see
 the amendment immediately below before reading §3.
-**The image-end number has been taken** (2026-08-11): mbedTLS costs **512 KiB**
-of a 223 MiB image. Trimming the module list is housekeeping, not urgent. See
+**The image-end number has been taken** (2026-08-11) and **confirmed on the
+real toolchain**: `_kernel_image_end = 0x0df88000`, 223 MiB, of which mbedTLS
+is **512 KiB**. Trimming the module list is housekeeping, not urgent. See
 "Image-end measurement" at the foot of this document; the request is closed.
 **Decided:** port **mbedTLS 3.6 LTS** (not BearSSL, not write-our-own); private
 CA with per-node certificates; first shippable version is server-side TLS
@@ -834,7 +835,8 @@ either. The check's own header says it: *"Run `make` first."*
 |---|---|---|
 | Their real pre-mbedTLS build (`x86_64-elf-gcc` 13.2.0 / binutils 2.42) | `0x0deb6000` | 222.711 |
 | Control: HEAD tree, mbedTLS objects removed from the link | `0x0defc000` | 222.984 |
-| **HEAD, all 107 mbedTLS modules linked** | **`0x0df7c000`** | **223.484** |
+| HEAD, all 107 mbedTLS modules linked — *substitute toolchain* | `0x0df7c000` | 223.484 |
+| **HEAD, real toolchain — confirmed on hardware, see below** | **`0x0df88000`** | **223.531** |
 
 - **mbedTLS delta: 524,288 B = 512 KiB exactly.** Rows 2→3. One tree, one
   toolchain, one link; the only variable is the presence of the 107 objects.
@@ -865,20 +867,66 @@ and the nineteen TCG objects (nasm and `../qemu` both being absent too).
 That gap is the 280 KiB in row 1→2, mixed together with thirteen genuinely
 changed source files. Which is exactly why the control link exists: **the
 512 KiB is a within-toolchain difference and does not depend on any of it.**
-The absolute 223.484 MiB does. Projecting the clean delta onto the real
-baseline gives **223.211 MiB (`0x0df36000`)** as the expected reading from a
-real `make` — and the check prints whole MiB, so it will say **223 MiB** either
-way.
+The absolute 223.484 MiB does.
 
-**Reproduce it properly with one command** when convenient — it is now a
-one-liner, because the objects exist:
+### Confirmed on the real toolchain, and one prediction corrected
+
+Run on `ubuntu-16gb-fsn1-1` — a different machine and a different checkout,
+which makes the agreement worth more than a same-box rerun would have been:
+
+```
+_kernel_image_end = 0x000000000df88000 (223 MiB)
+bootstrap stack   [0x000000000de873c0, 0x000000000df873c0) = 1024 KiB
+---- passed=5 failed=0
+```
+
+**223 MiB and five `ok:` lines. The headline stands, and the delta stands.**
+
+The substitute toolchain came in **48 KiB low**, and the bootstrap stack moved
+by exactly 48 KiB as well (`0x0de873c0` against `0x0de7b3c0`) — a *uniform
+shift of the whole image*, not scattered codegen noise. That is the best shape
+this error could have taken, because the delta rides through it unchanged:
+
+| | |
+|---|---|
+| Real HEAD | `0x0df88000` |
+| Implied real control (my control + the same 48 KiB) | `0x0df08000` |
+| **mbedTLS delta in the real toolchain** | **524,288 B = 512 KiB** |
+
+512 KiB from a second direction. Trimming is still housekeeping.
+
+**What this section got wrong.** It predicted `223.211 MiB (0x0df36000)`. The
+real reading is `0x0df88000` — **out by 328 KiB**, and the reasoning was wrong
+in a way that is a variant of the mistake this document keeps catching.
+
+The 280 KiB between the control and the old baseline was labelled
+"toolchain-and-commit skew" and then subtracted whole to project. Only the
+*toolchain* part was skew. The rest was those thirteen changed source files —
+`tls_platform.c` and the others — which are real code, present in the real
+build too. Subtracting them removed something that was actually there.
+
+It reconciles exactly, which is how the error is confirmed rather than
+explained away. Total growth from the old baseline is **840 KiB**: 512 KiB of
+mbedTLS and **328 KiB of new kernel code** — and 328 KiB is precisely the
+projection error, because that new code is precisely what was subtracted. The
+toolchain's own contribution was **48 KiB**, a fifth of what was charged to it.
+
+**The rule this earns:** a difference measured across two variables is not
+skew, it is a difference across two variables. Naming it after only one of them
+("toolchain-and-commit skew" — the *and* was right there in the label) licensed
+subtracting the whole of it. The control link was built specifically to avoid
+this and it did its job; the projection was a separate, avoidable arithmetic
+laid on top of a sound measurement, and it made a 48 KiB toolchain gap look
+like a 280 KiB one.
+
+Reproducing it is a one-liner, and the five `ok:` lines above are now the real
+ones — the orphan-section sweep and both stack checks have passed against an
+image linked by the toolchain that will actually ship it, which is the only
+place that invariant means anything:
 
 ```
 make my_sls_kernel.bin && tests/kernel_image_end_check.sh
 ```
-
-If that prints anything other than 223 MiB and five `ok:` lines, this section
-is wrong and should be corrected rather than defended.
 
 ### What the number decides, and what it does not
 
