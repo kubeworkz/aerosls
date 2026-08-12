@@ -45,6 +45,13 @@
 static int entropy_refuses = 0;
 static unsigned char counter = 0;
 
+/* --seed varies the stream so two runs produce two different certificates.
+ * The default is 0 and deterministic, because tls_cert_oracle_smoke.sh's
+ * expected values depend on it; the seed exists so
+ * tls_gate_evidence.sh --compare can be shown detecting a DIFFERENCE, which
+ * an unvarying harness cannot demonstrate. A test whose positive path has
+ * never been observed is half a test. */
+
 /* Deterministic, so the smoke's expected values are stable. On refusal the
  * buffer is left UNTOUCHED, which is entropy_get()'s real contract and the
  * whole reason the serial path copies through a local. */
@@ -76,7 +83,12 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--no-entropy") == 0)      { entropy_refuses = 1; }
         else if (strcmp(argv[i], "--crt") == 0 && i + 1 < argc) { crt_path = argv[++i]; }
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) { key_path = argv[++i]; }
-        else { fprintf(stderr, "usage: %s [--no-entropy] --crt F --key F\n", argv[0]); return 2; }
+        else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            unsigned v = 0; const char *q = argv[++i];
+            while (*q >= '0' && *q <= '9') { v = v * 10u + (unsigned)(*q++ - '0'); }
+            counter = (unsigned char)v;
+        }
+        else { fprintf(stderr, "usage: %s [--no-entropy] [--seed N] --crt F --key F\n", argv[0]); return 2; }
     }
 
     /* kernel.c:257 does this at boot. Without it mbedtls_calloc has no pool and
