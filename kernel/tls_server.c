@@ -53,8 +53,10 @@ static int                  g_ready;
 /* Kept so an operator (and tests/tls_cert_oracle_smoke.sh's sibling on a live
  * node) can see exactly what is being presented. 2 KiB is generous for a
  * P-256 self-signed leaf, which measured 430 bytes. */
-static unsigned char g_crt_der[2048];
+static unsigned char g_crt_der[2048];      /* the leaf: what the node presents */
 static size_t        g_crt_der_len;
+static unsigned char g_ca_der[2048];       /* the CA: what an operator imports */
+static size_t        g_ca_der_len;
 
 struct tls_session {
     int                 in_use;
@@ -83,7 +85,14 @@ const unsigned char *tls_server_cert_der(size_t *len)
     return g_crt_der;
 }
 
-int tls_server_init(const char *dn,
+const unsigned char *tls_server_ca_der(size_t *len)
+{
+    if (!g_ready) { return 0; }
+    if (len) { *len = g_ca_der_len; }
+    return g_ca_der;
+}
+
+int tls_server_init(const char *ca_dn, const char *dn,
                     const struct tls_cert_san *sans, size_t san_count)
 {
     unsigned char key_der[512];
@@ -91,7 +100,7 @@ int tls_server_init(const char *dn,
     int rc;
 
     if (g_ready) { return TLS_SRV_OK; }
-    if (!dn) { return TLS_SRV_E_BADARG; }
+    if (!dn || !ca_dn) { return TLS_SRV_E_BADARG; }
 
     /* Fail closed, and say which prerequisite is missing rather than making
      * an operator bisect it. Both of these are real states on real hardware:
@@ -103,10 +112,14 @@ int tls_server_init(const char *dn,
         return TLS_SRV_E_NOT_READY;
     }
 
-    rc = tls_cert_self_signed(dn, sans, san_count,
-                              90ULL * 24ULL * 60ULL * 60ULL,
-                              g_crt_der, sizeof g_crt_der, &g_crt_der_len,
-                              key_der, sizeof key_der, &key_len);
+    /* Two certificates, not one. A single self-signed certificate cannot
+     * satisfy Chrome and Firefox at once -- see tls_cert.h. The CA private key
+     * is destroyed inside this call and never reaches this file. */
+    rc = tls_cert_chain(ca_dn, dn, sans, san_count,
+                        90ULL * 24ULL * 60ULL * 60ULL,
+                        g_ca_der, sizeof g_ca_der, &g_ca_der_len,
+                        g_crt_der, sizeof g_crt_der, &g_crt_der_len,
+                        key_der, sizeof key_der, &key_len);
     if (rc != TLS_CERT_OK) {
         kernel_serial_printf("[TLS] certificate generation failed: rc=%d step=%s\n",
                              rc, tls_cert_last_step());
@@ -117,8 +130,17 @@ int tls_server_init(const char *dn,
     mbedtls_pk_init(&g_key);
     mbedtls_ssl_config_init(&g_conf);
 
+    /* Both, in order: leaf first, then the CA that signed it. mbedTLS sends
+     * the whole chain, and including a self-signed root is redundant for a
+     * client that already trusts it -- but it is what lets `openssl s_client
+     * -showcerts` hand a verifier the anchor, which is how every diagnostic
+     * in tests/ gets one. Browsers ignore the extra. */
     if (mbedtls_x509_crt_parse_der(&g_crt, g_crt_der, g_crt_der_len) != 0) {
-        kernel_serial_print("[TLS] our own certificate did not parse back.\n");
+        kernel_serial_print("[TLS] our own leaf certificate did not parse back.\n");
+        goto fail;
+    }
+    if (mbedtls_x509_crt_parse_der(&g_crt, g_ca_der, g_ca_der_len) != 0) {
+        kernel_serial_print("[TLS] our own CA certificate did not parse back.\n");
         goto fail;
     }
     /* Parsing our own key back rather than keeping the mbedtls_pk_context from
@@ -159,8 +181,10 @@ int tls_server_init(const char *dn,
     }
 
     g_ready = 1;
-    kernel_serial_printf("[TLS] server ready: TLS 1.3, P-256, %u-byte certificate.\n",
-                         (unsigned)g_crt_der_len);
+    kernel_serial_printf("[TLS] server ready: TLS 1.3, P-256. "
+                         "leaf %u bytes, CA %u bytes.\n",
+                         (unsigned)g_crt_der_len, (unsigned)g_ca_der_len);
+    kernel_serial_print("[TLS] import the CA (not the leaf) to trust this node.\n");
     return TLS_SRV_OK;
 
 fail:
@@ -169,6 +193,7 @@ fail:
     mbedtls_pk_free(&g_key);
     mbedtls_x509_crt_free(&g_crt);
     g_crt_der_len = 0;
+    g_ca_der_len = 0;
     return TLS_SRV_E_NOT_READY;
 }
 

@@ -67,8 +67,8 @@ int entropy_get(void *out, size_t len)
 
 int main(int argc, char **argv)
 {
-    unsigned char crt[4096], key[2048];
-    size_t crt_len = 0, key_len = 0;
+    unsigned char crt[4096], key[2048], ca[4096];
+    size_t crt_len = 0, key_len = 0, ca_len = 0;
     /* The same set net/http.c installs, so this smoke judges the certificate
      * a node actually presents rather than a simpler one made for the test. */
     static const struct tls_cert_san sans[] = {
@@ -76,13 +76,14 @@ int main(int argc, char **argv)
         { 0,            { 127, 0, 0, 1 } },
         { 0,            { 10, 0, 2, 15 } },
     };
-    const char *crt_path = NULL, *key_path = NULL;
+    const char *crt_path = NULL, *key_path = NULL, *ca_path = NULL;
     int rc;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-entropy") == 0)      { entropy_refuses = 1; }
         else if (strcmp(argv[i], "--crt") == 0 && i + 1 < argc) { crt_path = argv[++i]; }
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) { key_path = argv[++i]; }
+        else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) { ca_path = argv[++i]; }
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             unsigned v = 0; const char *q = argv[++i];
             while (*q >= '0' && *q <= '9') { v = v * 10u + (unsigned)(*q++ - '0'); }
@@ -102,11 +103,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "rtc_set_unix refused the time\n"); return 1;
     }
 
-    rc = tls_cert_self_signed("CN=AeroSLS node 1,O=AeroSLS",
-                              sans, sizeof sans / sizeof sans[0],
-                              90ULL * 24 * 60 * 60,
-                              crt, sizeof crt, &crt_len,
-                              key, sizeof key, &key_len);
+    rc = tls_cert_chain("CN=AeroSLS node 1 CA,O=AeroSLS",
+                        "CN=AeroSLS node 1,O=AeroSLS",
+                        sans, sizeof sans / sizeof sans[0],
+                        90ULL * 24 * 60 * 60,
+                        ca, sizeof ca, &ca_len,
+                        crt, sizeof crt, &crt_len,
+                        key, sizeof key, &key_len);
     if (rc != TLS_CERT_OK) {
         fprintf(stderr, "tls_cert_self_signed: rc=%d step=%s mbedtls=-0x%04x\n",
                 rc, tls_cert_last_step(), (unsigned)(-tls_cert_last_mbedtls_ret()));
@@ -123,6 +126,11 @@ int main(int argc, char **argv)
         if (!f) { perror("key"); return 1; }
         fwrite(key, 1, key_len, f); fclose(f);
     }
-    fprintf(stderr, "generated: cert %zu bytes, key %zu bytes\n", crt_len, key_len);
+    if (ca_path) {
+        FILE *f = fopen(ca_path, "wb");
+        if (!f) { perror("ca"); return 1; }
+        fwrite(ca, 1, ca_len, f); fclose(f);
+    }
+    fprintf(stderr, "generated: ca %zu, leaf %zu, key %zu bytes\n", ca_len, crt_len, key_len);
     return 0;
 }

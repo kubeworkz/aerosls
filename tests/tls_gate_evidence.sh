@@ -152,9 +152,20 @@ if ! openssl s_client -connect "$TLS" -showcerts -alpn http/1.1 \
     sed 's/^/      /' "$WORK/hs.txt" | head -12
     echo; echo "---- passed=$pass failed=$fail"; exit 1
 fi
-openssl x509 -in "$WORK/hs.txt" -out "$WORK/crt.pem" 2>/dev/null \
-    || { bad "the peer sent no parseable certificate"; exit 1; }
-ok "handshake completed and a certificate was presented"
+# The node sends a CHAIN: leaf first, then the CA that signed it. Split them.
+# Taking only the first certificate and using it as its own anchor -- which
+# this script did while the node was self-signed -- silently stops verifying
+# anything the moment a real chain appears.
+awk '/-----BEGIN CERTIFICATE-----/{n++} n{print > ("'"$WORK"'/c" n ".pem")}' "$WORK/hs.txt"
+NCERTS="$(ls "$WORK"/c*.pem 2>/dev/null | wc -l)"
+[ "$NCERTS" -ge 1 ] || { bad "the peer sent no parseable certificate"; exit 1; }
+cp "$WORK/c1.pem" "$WORK/crt.pem"
+if [ "$NCERTS" -ge 2 ]; then
+    cp "$WORK/c$NCERTS.pem" "$WORK/ca.pem"
+else
+    cp "$WORK/c1.pem" "$WORK/ca.pem"     # self-signed: its own anchor
+fi
+ok "handshake completed; the peer sent $NCERTS certificate(s)"
 
 # Negotiated parameters, verbatim rather than interpreted.
 # Two sources, because the SSL-Session summary block is not always emitted --
@@ -203,7 +214,9 @@ note "validity: $NB  ->  $NA"
 note "san     : ${SAN:-<NONE>}"
 note "basic   : ${BC:-<none>}"
 note "keyusage: ${KU:-<none>}"
-note "sha256  : $FP"
+note "sha256  : $FP  (leaf)"
+[ "$NCERTS" -ge 2 ] && note "ca      : $(openssl x509 -in "$WORK/ca.pem" -noout -subject | sed 's/^subject=//')" 
+[ "$NCERTS" -ge 2 ] && note "ca sha  : $(openssl x509 -in "$WORK/ca.pem" -noout -fingerprint -sha256 | cut -d= -f2)  <- IMPORT THIS ONE"
 
 if [ -n "$VER" ] && [ -n "$CIPH" ] && [ "$VER" != "unknown" ]; then
     ok "negotiated parameters captured ($VER / $CIPH)"
@@ -212,14 +225,28 @@ else
         missing the field it exists to record"
 fi
 
-case "$BC" in
-    *CA:TRUE*) ok "basicConstraints says CA:TRUE -- a trust store can anchor it" ;;
-    *)         bad "basicConstraints is '${BC:-absent}'. A self-signed certificate that
-        does not assert CA:TRUE cannot be installed as a trust anchor:
-        Windows files it under Intermediate rather than Trusted Root, and
-        Firefox reports MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT however many
-        times it is imported." ;;
-esac
+# Chrome will not anchor a certificate that is not a CA; Firefox will not
+# accept one that IS a CA at the end-entity position. Both are only satisfiable
+# with two certificates, so check the shape rather than one flag.
+CABC="$(openssl x509 -in "$WORK/ca.pem" -noout -ext basicConstraints 2>/dev/null | tail -n +2 | tr -d ' ')"
+if [ "$NCERTS" -lt 2 ]; then
+    bad "the node sent ONE certificate. A single self-signed certificate cannot
+        satisfy both browsers: Chrome will not anchor CA:FALSE, and Firefox
+        rejects CA:TRUE at the end entity with
+        MOZILLA_PKIX_ERROR_CA_CERT_USED_AS_END_ENTITY. It needs a CA and a
+        leaf."
+else
+    case "$BC" in
+        *CA:FALSE*) ok "the leaf is CA:FALSE (Firefox rejects a CA at the end entity)" ;;
+        *)          bad "the leaf's basicConstraints is '${BC:-absent}', not CA:FALSE --
+        Firefox will report MOZILLA_PKIX_ERROR_CA_CERT_USED_AS_END_ENTITY" ;;
+    esac
+    case "$CABC" in
+        *CA:TRUE*) ok "the issuer is CA:TRUE (a trust store can anchor it)" ;;
+        *)         bad "the issuer's basicConstraints is '${CABC:-absent}', not CA:TRUE --
+        Windows will file it under Intermediate rather than Trusted Root" ;;
+    esac
+fi
 
 [ -n "$SAN" ] && ok "the certificate carries a subjectAltName" \
               || bad "NO subjectAltName -- Chrome has ignored commonName since Chrome 58"
@@ -227,8 +254,8 @@ esac
 # The certificate is presented as its own CA: self-consistency and a name
 # match, NOT trust. See the header.
 HOSTONLY="${TLS%%:*}"
-if curl -sS --cacert "$WORK/crt.pem" "https://$TLS$PATH_" -o "$WORK/tls.body" 2>"$WORK/curl.err"; then
-    ok "curl verified the chain and the name '$HOSTONLY', and fetched the body"
+if curl -sS --cacert "$WORK/ca.pem" "https://$TLS$PATH_" -o "$WORK/tls.body" 2>"$WORK/curl.err"; then
+    ok "curl built leaf -> CA and matched the name '$HOSTONLY', then fetched the body"
 else
     bad "curl --cacert failed: $(head -1 "$WORK/curl.err")"
 fi

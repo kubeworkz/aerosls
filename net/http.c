@@ -6216,7 +6216,8 @@ void http_server_run(void) {
             { 0,            { 127, 0, 0, 1 } },
             { 0,            { 10, 0, 2, 15 } },
         };
-        if (tls_server_init("CN=AeroSLS node,O=AeroSLS", node_sans,
+        if (tls_server_init("CN=AeroSLS node CA,O=AeroSLS",
+                            "CN=AeroSLS node,O=AeroSLS", node_sans,
                             sizeof node_sans / sizeof node_sans[0]) == TLS_SRV_OK) {
             tls_listen_fd = tcp_listen(NET_HTTPS_PORT);
             if (tls_listen_fd < 0) {

@@ -217,6 +217,18 @@ int tls_cert_make_serial(unsigned char *out, size_t len)
 
 size_t strlen(const char *s);
 
+static int has_eq(const char *s)
+{
+    while (*s) { if (*s == '=') { return 1; } s++; }
+    return 0;
+}
+
+static int str_eq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
 /* mbedTLS writes DER at the END of the buffer and returns its length. Every
  * caller has to move it, and a caller that forgets gets a buffer whose first
  * bytes are zero and whose content is somewhere in the middle -- which parses
@@ -270,11 +282,7 @@ int tls_cert_self_signed(const char *dn,
     }
     /* "node1" is not a DN. Catch it here rather than inside mbedTLS's name
      * parser, where it becomes a number. */
-    {
-        const char *p = dn; int has_eq = 0;
-        while (*p) { if (*p == '=') { has_eq = 1; break; } p++; }
-        if (!has_eq) { return TLS_CERT_E_BADARG; }
-    }
+    if (!has_eq(dn)) { return TLS_CERT_E_BADARG; }
     g_step = ""; g_ret = 0;
 
     mbedtls_pk_init(&key);
@@ -388,4 +396,172 @@ done:
     return rc;
 }
 
+
+/* Two tiny predicates, named because the checks they express are the two
+ * ways a chain silently degenerates: a DN with no '=' is not a DN at all, and
+ * a leaf whose subject equals its issuer reads as self-signed to a path
+ * builder no matter who signed it. */
+/* ─── The two-certificate chain ────────────────────────────────────────────
+ * See tls_cert.h for why one certificate cannot work. Briefly: Chrome needs
+ * CA:TRUE to anchor it, Firefox refuses CA:TRUE at the end-entity position,
+ * and those cannot both be satisfied by one certificate.
+ *
+ * Shared by both certificates so the two are consistent by construction
+ * rather than by two call sites agreeing: the same validity window, the same
+ * backdate, the same clock read. A leaf valid outside its issuer's window is
+ * a failure every verifier reports as something else.
+ */
+static int write_one(mbedtls_x509write_cert *crt,
+                     const char *subject_dn, const char *issuer_dn,
+                     mbedtls_pk_context *subject_key,
+                     mbedtls_pk_context *issuer_key,
+                     const char *nb, const char *na,
+                     int is_ca,
+                     const struct tls_cert_san *sans, size_t san_count,
+                     unsigned char *out, size_t out_size, size_t *out_len)
+{
+    unsigned char serial[TLS_CERT_SERIAL_LEN];
+    mbedtls_x509_san_list san_node[TLS_CERT_MAX_SANS];
+    int rc, ret;
+
+    if ((rc = tls_cert_make_serial(serial, sizeof serial)) != TLS_CERT_OK) {
+        return rc;
+    }
+
+    rc = TLS_CERT_E_MBEDTLS;
+    TRY("set_subject_name", mbedtls_x509write_crt_set_subject_name(crt, subject_dn));
+    TRY("set_issuer_name",  mbedtls_x509write_crt_set_issuer_name(crt, issuer_dn));
+    mbedtls_x509write_crt_set_subject_key(crt, subject_key);
+    mbedtls_x509write_crt_set_issuer_key(crt, issuer_key);
+    mbedtls_x509write_crt_set_md_alg(crt, MBEDTLS_MD_SHA256);
+    TRY("set_validity", mbedtls_x509write_crt_set_validity(crt, nb, na));
+    TRY("set_serial_raw", mbedtls_x509write_crt_set_serial_raw(crt, serial, sizeof serial));
+    TRY("set_basic_constraints",
+        mbedtls_x509write_crt_set_basic_constraints(crt, is_ca, is_ca ? 0 : -1));
+    TRY("set_subject_key_identifier", mbedtls_x509write_crt_set_subject_key_identifier(crt));
+    /* The leaf needs to point at its issuer. Without an authorityKeyIdentifier
+     * a path builder matches on name alone, which is enough here but stops
+     * being enough the moment a second CA exists. */
+    TRY("set_authority_key_identifier", mbedtls_x509write_crt_set_authority_key_identifier(crt));
+
+    /* keyUsage, now that the two roles are separate and can be stated
+     * honestly. The CA signs certificates and nothing else; the leaf signs
+     * handshakes and never certificates. That separation is the entire point
+     * of splitting them, and leaving it unstated would waste it. */
+    if (is_ca) {
+        TRY("set_key_usage",
+            mbedtls_x509write_crt_set_key_usage(crt, MBEDTLS_X509_KU_KEY_CERT_SIGN |
+                                                     MBEDTLS_X509_KU_CRL_SIGN));
+    } else {
+        TRY("set_key_usage",
+            mbedtls_x509write_crt_set_key_usage(crt, MBEDTLS_X509_KU_DIGITAL_SIGNATURE));
+    }
+
+    if (san_count > 0) {
+        for (size_t i = 0; i < san_count; i++) {
+            mbedtls_x509_san_list *n = &san_node[i];
+            if (sans[i].dns) {
+                n->node.type = MBEDTLS_X509_SAN_DNS_NAME;
+                n->node.san.unstructured_name.tag = MBEDTLS_ASN1_IA5_STRING;
+                n->node.san.unstructured_name.p   = (unsigned char *)(uintptr_t)sans[i].dns;
+                n->node.san.unstructured_name.len = strlen(sans[i].dns);
+                if (n->node.san.unstructured_name.len == 0) { rc = TLS_CERT_E_BADARG; goto done; }
+            } else {
+                n->node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+                n->node.san.unstructured_name.tag = MBEDTLS_ASN1_OCTET_STRING;
+                n->node.san.unstructured_name.p   = (unsigned char *)(uintptr_t)sans[i].ip4;
+                n->node.san.unstructured_name.len = 4;
+            }
+            n->next = (i + 1 < san_count) ? &san_node[i + 1] : NULL;
+        }
+        TRY("set_subject_alternative_name",
+            mbedtls_x509write_crt_set_subject_alternative_name(crt, &san_node[0]));
+    }
+
+    ret = mbedtls_x509write_crt_der(crt, out, out_size, sls_mbedtls_rng, NULL);
+    if (ret < 0) { g_step = "crt_der"; g_ret = ret; goto done; }
+    *out_len = (size_t)ret;
+    der_to_front(out, out_size, *out_len);
+    rc = TLS_CERT_OK;
+
+done:
+    secure_zero(serial, sizeof serial);
+    return rc;
+}
+
+int tls_cert_chain(const char *ca_dn, const char *leaf_dn,
+                   const struct tls_cert_san *sans, size_t san_count,
+                   uint64_t lifetime_seconds,
+                   unsigned char *ca_der, size_t ca_size, size_t *ca_len,
+                   unsigned char *leaf_der, size_t leaf_size, size_t *leaf_len,
+                   unsigned char *leaf_key_der, size_t lk_size, size_t *lk_len)
+{
+    mbedtls_pk_context ca_key, leaf_key;
+    mbedtls_x509write_cert crt;
+    char nb[TLS_CERT_TIME_BUF], na[TLS_CERT_TIME_BUF];
+    int rc, ret;
+
+    if (!ca_dn || !leaf_dn || !ca_der || !ca_len ||
+        !leaf_der || !leaf_len || !leaf_key_der || !lk_len) {
+        return TLS_CERT_E_BADARG;
+    }
+    if (!sans || san_count == 0 || san_count > TLS_CERT_MAX_SANS) {
+        return TLS_CERT_E_BADARG;
+    }
+    /* Identical subject and issuer makes the leaf look self-signed to a path
+     * builder no matter who actually signed it, which puts us straight back
+     * into the failure this function exists to escape. */
+    if (str_eq(ca_dn, leaf_dn)) { return TLS_CERT_E_BADARG; }
+    if (!has_eq(ca_dn) || !has_eq(leaf_dn)) { return TLS_CERT_E_BADARG; }
+
+    g_step = ""; g_ret = 0;
+    mbedtls_pk_init(&ca_key);
+    mbedtls_pk_init(&leaf_key);
+
+    /* One clock read for both, so the windows cannot disagree. */
+    if ((rc = tls_cert_validity_window(lifetime_seconds,
+                                       nb, sizeof nb, na, sizeof na)) != TLS_CERT_OK) {
+        goto out;
+    }
+
+    rc = TLS_CERT_E_MBEDTLS;
+    if (mbedtls_pk_setup(&ca_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0 ||
+        mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(ca_key),
+                            sls_mbedtls_rng, NULL) != 0) {
+        g_step = "ca_keygen"; goto out;
+    }
+    if (mbedtls_pk_setup(&leaf_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0 ||
+        mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(leaf_key),
+                            sls_mbedtls_rng, NULL) != 0) {
+        g_step = "leaf_keygen"; goto out;
+    }
+
+    /* The CA: self-signed, CA:TRUE, no SAN. It never terminates a connection,
+     * so it has no names to assert. */
+    mbedtls_x509write_crt_init(&crt);
+    rc = write_one(&crt, ca_dn, ca_dn, &ca_key, &ca_key, nb, na, 1, NULL, 0,
+                   ca_der, ca_size, ca_len);
+    mbedtls_x509write_crt_free(&crt);
+    if (rc != TLS_CERT_OK) { goto out; }
+
+    /* The leaf: CA:FALSE, carries the names, signed by the CA key. */
+    mbedtls_x509write_crt_init(&crt);
+    rc = write_one(&crt, leaf_dn, ca_dn, &leaf_key, &ca_key, nb, na, 0, sans, san_count,
+                   leaf_der, leaf_size, leaf_len);
+    mbedtls_x509write_crt_free(&crt);
+    if (rc != TLS_CERT_OK) { goto out; }
+
+    ret = mbedtls_pk_write_key_der(&leaf_key, leaf_key_der, lk_size);
+    if (ret < 0) { g_step = "pk_write_key_der"; g_ret = ret; rc = TLS_CERT_E_MBEDTLS; goto out; }
+    *lk_len = (size_t)ret;
+    der_to_front(leaf_key_der, lk_size, *lk_len);
+    rc = TLS_CERT_OK;
+
+out:
+    /* The CA key dies here, on every path. Nothing can ask for it later
+     * because there is nothing left to ask. */
+    mbedtls_pk_free(&ca_key);
+    mbedtls_pk_free(&leaf_key);
+    return rc;
+}
 #endif /* TLS_CERT_HOST_TEST */

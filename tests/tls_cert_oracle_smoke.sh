@@ -72,9 +72,11 @@ $CC -Wall -Wextra -std=c11 -DSLS_BUILD_EPOCH=${EPOCH}ull \
     kernel/tls_cert.c kernel/rtc.c kernel/tls_platform.c kernel/stubs.c \
     "$BUILD/libmbedtls_host.a" || { echo "FAIL  linking the oracle"; exit 1; }
 
-CRT="$BUILD/crt.der"; KEY="$BUILD/key.der"
-rm -f "$CRT" "$KEY"
-"$BUILD/oracle" --crt "$CRT" --key "$KEY" || { echo "FAIL  generation failed"; exit 1; }
+CRT="$BUILD/crt.der"; KEY="$BUILD/key.der"; CA="$BUILD/ca.der"
+rm -f "$CRT" "$KEY" "$CA"
+"$BUILD/oracle" --crt "$CRT" --key "$KEY" --ca "$CA" || { echo "FAIL  generation failed"; exit 1; }
+openssl x509 -inform DER -in "$CA" -out "$BUILD/ca.pem" 2>/dev/null
+CATXT="$(openssl x509 -in "$BUILD/ca.pem" -noout -text)"
 
 echo
 echo "=== what OpenSSL ($(openssl version | cut -d' ' -f1-2)) makes of it ==="
@@ -84,14 +86,23 @@ echo
 
 grep -q 'Signature Algorithm: ecdsa-with-SHA256' <<<"$TXT" && ok "signed ecdsa-with-SHA256" || bad "wrong signature algorithm"
 grep -q 'NIST CURVE: P-256'                      <<<"$TXT" && ok "P-256 public key"          || bad "wrong curve"
-# CA:TRUE with pathlen 0. Not because this is really a certificate authority,
-# but because Windows will not file a non-CA certificate as a trusted root --
-# it went to Intermediate Certification Authorities instead, and Chrome
-# reported ERR_CERT_AUTHORITY_INVALID because an intermediate is not an
-# anchor. pathlen 0 keeps it from signing further CAs. §4's private CA is what
-# removes the compromise properly.
-grep -q 'CA:TRUE'                               <<<"$TXT" && ok "basicConstraints CA:TRUE (needed to be a trusted root)" || bad "CA flag wrong"
-grep -q 'pathlen:0'                             <<<"$TXT" && ok "pathlen 0 -- it may sign leaves, not further CAs" || bad "pathlen not 0"
+# ─── the two certificates have OPPOSITE constraints, and must ─────────────
+# One certificate could not satisfy both browsers: Chrome will not anchor
+# CA:FALSE, Firefox rejects CA:TRUE at the end-entity position
+# (MOZILLA_PKIX_ERROR_CA_CERT_USED_AS_END_ENTITY). So the CA asserts CA:TRUE
+# and signs certificates; the leaf asserts CA:FALSE and signs handshakes.
+# Checking both is the only way to notice if they ever collapse back into one.
+grep -q 'CA:FALSE'  <<<"$TXT"   && ok "leaf is CA:FALSE (Firefox rejects a CA at the end entity)" || bad "leaf CA flag wrong"
+grep -q 'CA:TRUE'   <<<"$CATXT" && ok "CA is CA:TRUE (Chrome will not anchor anything else)"      || bad "CA flag wrong"
+grep -q 'pathlen:0' <<<"$CATXT" && ok "CA pathlen 0 -- it may sign leaves, not further CAs"       || bad "CA pathlen not 0"
+grep -A1 'Key Usage' <<<"$TXT"   | grep -q 'Digital Signature' && ok "leaf keyUsage is digitalSignature" || bad "leaf keyUsage wrong"
+grep -A1 'Key Usage' <<<"$CATXT" | grep -q 'Certificate Sign'  && ok "CA keyUsage is keyCertSign"        || bad "CA keyUsage wrong"
+
+# A leaf whose subject equals its issuer reads as self-signed to a path builder
+# however it was signed, which is the failure this split exists to escape.
+LSUB="$(openssl x509 -in "$BUILD/crt.pem" -noout -subject 2>/dev/null || openssl x509 -inform DER -in "$CRT" -noout -subject)"
+LISS="$(openssl x509 -inform DER -in "$CRT" -noout -issuer)"
+[ "${LSUB#subject=}" != "${LISS#issuer=}" ] && ok "the leaf's issuer is not itself" || bad "leaf is self-issued -- the split has collapsed"
 grep -q 'X509v3 Subject Key Identifier'          <<<"$TXT" && ok "subject key identifier present" || bad "no SKI"
 
 # ─── validity: the backdate is only visible from outside ───────────────────
@@ -133,20 +144,20 @@ PY
 openssl x509 -inform DER -in "$CRT" -out "$BUILD/crt.pem" 2>/dev/null
 name_ok=1
 for h in localhost; do
-    openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_hostname "$h" \
+    openssl verify -CAfile "$BUILD/ca.pem" -verify_hostname "$h" \
         "$BUILD/crt.pem" >/dev/null 2>&1 || { name_ok=0; echo "      (rejected DNS $h)"; }
 done
 for a in 127.0.0.1 10.0.2.15; do
-    openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_ip "$a" \
+    openssl verify -CAfile "$BUILD/ca.pem" -verify_ip "$a" \
         "$BUILD/crt.pem" >/dev/null 2>&1 || { name_ok=0; echo "      (rejected IP $a)"; }
 done
 [ "$name_ok" = 1 ] && ok "a verifier accepts localhost, 127.0.0.1 and 10.0.2.15" \
                    || bad "a verifier rejected a name this node is reached by"
 
-if openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_hostname evil.example \
+if openssl verify -CAfile "$BUILD/ca.pem" -verify_hostname evil.example \
        "$BUILD/crt.pem" >/dev/null 2>&1; then
     bad "a verifier accepted evil.example -- the name check is not being applied"
-elif openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_ip 8.8.8.8 \
+elif openssl verify -CAfile "$BUILD/ca.pem" -verify_ip 8.8.8.8 \
          "$BUILD/crt.pem" >/dev/null 2>&1; then
     bad "a verifier accepted 8.8.8.8 -- the name check is not being applied"
 else
@@ -165,12 +176,19 @@ first = d[i+2]
 sys.exit(0 if (first & 0x80) == 0 and first != 0 else 1)
 PY
 
-# ─── does it verify, the way curl --cacert verifies ────────────────────────
+# ─── the leaf verifies against the CA, which is what a browser does ────────
 openssl x509 -inform DER -in "$CRT" -out "$BUILD/crt.pem" 2>/dev/null
-if openssl verify -CAfile "$BUILD/crt.pem" -partial_chain "$BUILD/crt.pem" >/dev/null 2>&1; then
-    ok "verifies as its own trust anchor (the curl --cacert path)"
+if openssl verify -CAfile "$BUILD/ca.pem" "$BUILD/crt.pem" >/dev/null 2>&1; then
+    ok "the leaf verifies against the CA (a full chain, not a partial one)"
 else
-    bad "openssl verify rejected it"
+    bad "openssl verify could not build leaf -> CA: $(openssl verify -CAfile "$BUILD/ca.pem" "$BUILD/crt.pem" 2>&1 | tail -1)"
+fi
+# And the CA alone must NOT verify the leaf if the leaf is swapped in as its
+# own anchor -- that would mean the split bought nothing.
+if openssl verify -CAfile "$BUILD/crt.pem" "$BUILD/crt.pem" >/dev/null 2>&1; then
+    bad "the leaf still verifies as its own anchor -- it is not really issued by the CA"
+else
+    ok "the leaf does NOT verify standalone (it genuinely needs the CA)"
 fi
 
 a="$(openssl pkey -inform DER -in "$KEY" -pubout -outform DER 2>/dev/null | openssl dgst -sha256)"

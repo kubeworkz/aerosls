@@ -44,7 +44,7 @@
  * Safe to call more than once; the second call is a no-op. Returns TLS_SRV_OK
  * or negative -- and on failure TLS must not start, which is §2.4's
  * fail-closed rule reaching its last consumer. */
-int tls_server_init(const char *dn,
+int tls_server_init(const char *ca_dn, const char *dn,
                     const struct tls_cert_san *sans, size_t san_count);
 
 /* Non-zero once init has succeeded. */
@@ -72,5 +72,9 @@ void tls_server_close(int conn_id);
 /* Certificate DER, for operators and for anything that wants to inspect what
  * this node actually presents. NULL before init succeeds. */
 const unsigned char *tls_server_cert_der(size_t *len);
+
+/* The CA certificate. THIS is the one an operator imports into a trust store;
+ * importing the leaf achieves nothing. NULL before init succeeds. */
+const unsigned char *tls_server_ca_der(size_t *len);
 
 #endif /* SLS_TLS_SERVER_H */

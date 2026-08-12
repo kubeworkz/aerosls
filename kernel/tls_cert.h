@@ -82,6 +82,31 @@ struct tls_cert_san {
     unsigned char ip4[4];     /* used only when dns == NULL */
 };
 
+/* ─── Why this produces TWO certificates ───────────────────────────────────
+ * A single self-signed certificate cannot satisfy both browsers. This was
+ * established by trying:
+ *
+ *   Windows/Chrome  needs CA:TRUE  -- the import wizard classifies by type and
+ *                   files a non-CA certificate under Intermediate Certification
+ *                   Authorities, which is not a trust anchor. Chrome then says
+ *                   ERR_CERT_AUTHORITY_INVALID.
+ *   Firefox         needs CA:FALSE -- mozilla::pkix rejects a CA certificate
+ *                   presented as the end entity outright:
+ *                   MOZILLA_PKIX_ERROR_CA_CERT_USED_AS_END_ENTITY.
+ *
+ * There is no value of basicConstraints that satisfies both, so the shortcut
+ * was never going to work and Firefox is what proved it. The answer is the
+ * shape the whole PKI is built around and the one §4 already specifies: a CA
+ * certificate that never serves traffic, and a leaf signed by it that does.
+ *
+ * The CA private key is destroyed as soon as the leaf is signed. It is never
+ * returned, never stored, and never leaves this function -- so §6.1's "the
+ * private key gets checkpointed in plaintext" question applies only to the
+ * leaf key. That is a real reduction in exposure and it is free here, because
+ * nothing yet needs to issue a second certificate. It stops being free the
+ * moment certificates outlive a boot, which is what §4 has to solve properly.
+ */
+
 /* Generate an EC P-256 key and a self-signed certificate over it.
  *
  * `dn` is a full distinguished name in mbedTLS's string form -- "CN=node1" or
@@ -106,6 +131,20 @@ int tls_cert_self_signed(const char *dn,
                          uint64_t lifetime_seconds,
                          unsigned char *crt_der, size_t crt_size, size_t *crt_len,
                          unsigned char *key_der, size_t key_size, size_t *key_len);
+
+/* The two-certificate form. `ca_dn` and `leaf_dn` are full DNs and MUST
+ * differ -- a leaf whose subject equals its issuer looks self-signed to a
+ * path builder however it is signed.
+ *
+ * Outputs: the CA certificate (import this into a trust store), the leaf
+ * certificate (the node presents this), and the leaf's private key. The CA
+ * key is zeroized before returning and cannot be recovered. */
+int tls_cert_chain(const char *ca_dn, const char *leaf_dn,
+                   const struct tls_cert_san *sans, size_t san_count,
+                   uint64_t lifetime_seconds,
+                   unsigned char *ca_der, size_t ca_size, size_t *ca_len,
+                   unsigned char *leaf_der, size_t leaf_size, size_t *leaf_len,
+                   unsigned char *leaf_key_der, size_t lk_size, size_t *lk_len);
 
 /* Which mbedTLS call failed, and its return code, after TLS_CERT_E_MBEDTLS.
  * Exists because working out that a bare CN was the problem took building a
