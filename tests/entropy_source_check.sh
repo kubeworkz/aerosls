@@ -69,12 +69,70 @@ if [ -n "$susp" ]; then
 fi
 
 # ─── 3. entropy_get()'s return value is never discarded ────────────────────
-# A call is acceptable if the line assigns it, tests it, or returns it. A bare
-# `entropy_get(buf, n);` statement is the failure: the buffer is untouched on
-# error and the caller cannot tell.
-bare=$(grep -rn "entropy_get *(" --include=*.c kernel/ net/ arch/ 2>/dev/null \
-       | grep -v "^kernel/entropy\.c:" \
-       | grep -vE "(=|==|!=|<|>|return|if *\(|while *\(|\|\||&&)" || true)
+# A bare `entropy_get(buf, n);` statement is the failure: the buffer is
+# UNTOUCHED on error and the caller cannot tell.
+#
+# ─── How the first version of this rule was wrong, in both directions ──────
+# It grepped for lines matching `entropy_get *(` and then removed any line
+# containing = == != < > return if( while( || &&. That is a deny-list over
+# LINES, and a line is the wrong unit twice over:
+#
+#   FALSE POSITIVE. Comments are lines too. kernel/tls_cert.c:28 is prose
+#   about this very rule -- "matching entropy_get() and rtc_get_unix()" --
+#   which contains no deny-list token, so the guard failed a deploy over a
+#   sentence. A guard that fires on documentation gets worked around, and a
+#   worked-around guard is worse than no guard.
+#
+#   FALSE NEGATIVE, which is the serious half. Any unrelated `=` anywhere on
+#   the line suppressed the check. All three of these passed it:
+#       entropy_get(buf, n);          /* the x = 1 in this comment hides it */
+#       node->seeded = 1; entropy_get(buf, n);
+#       int x = 1; entropy_get(buf, n);
+#   Two of the three are exactly the bug this rule exists to catch.
+#
+# So: strip comments properly, split into STATEMENTS on `;` rather than on
+# newlines, and use an ALLOW-list -- a statement that BEGINS with the call
+# (optionally cast to void) is the one discarding the result. Everything else
+# assigns it, tests it, or returns it. Splitting on `;` across line boundaries
+# also means `rc =\n    entropy_get(...)` reads as one statement, which a
+# line-oriented matcher would have flagged.
+#
+# tests/entropy_source_smoke.sh plants all of these and asserts the verdict.
+bare=$(find kernel net arch -name '*.c' 2>/dev/null | grep -v '^kernel/entropy\.c$' \
+  | xargs awk '
+    FNR == 1 { inc = 0; stmt = ""; stmtline = 0 }
+    {
+        line = $0; out = ""
+        while (length(line) > 0) {
+            if (inc) {
+                p = index(line, "*/")
+                if (p == 0) { line = "" } else { inc = 0; line = substr(line, p + 2) }
+            } else {
+                p = index(line, "/*"); q = index(line, "//")
+                if (q > 0 && (p == 0 || q < p)) { out = out substr(line, 1, q - 1); line = "" }
+                else if (p > 0) { out = out substr(line, 1, p - 1); inc = 1; line = substr(line, p + 2) }
+                else { out = out line; line = "" }
+            }
+        }
+        n = split(out, part, ";")
+        for (i = 1; i <= n; i++) {
+            if (stmt ~ /^[ \t]*$/ && part[i] ~ /[^ \t]/) stmtline = FNR
+            # Only the START of a statement decides this rule, so keep a prefix
+            # and drop the rest. Without the cap, kernel/webapp_bundle.c -- 54k
+            # generated lines holding one array initialiser, hence one `;` --
+            # accumulates the whole file into stmt and the concatenation goes
+            # quadratic. It does not hang, it just takes longer than anyone
+            # waits, which is indistinguishable from hanging in a deploy gate.
+            if (length(stmt) < 200) stmt = stmt " " part[i]
+            if (i < n) {
+                s = stmt
+                sub(/^[ \t{}]+/, "", s)
+                if (s ~ /^(\(void\)[ \t]*)?entropy_get[ \t]*\(/)
+                    printf "%s:%d: %s\n", FILENAME, stmtline, substr(s, 1, 90)
+                stmt = ""
+            }
+        }
+    }' 2>/dev/null || true)
 if [ -n "$bare" ]; then
     echo "FAIL  entropy_get() called without inspecting its return value:"
     printf '        %s\n' "$bare"
