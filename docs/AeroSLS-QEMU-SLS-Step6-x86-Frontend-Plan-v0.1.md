@@ -342,6 +342,28 @@ C expectation bit-for-bit, so the F2/F3 prefix plumbing and the lazy-flag
 machinery are both right. `invl`/`paging`/`selfmod` still pass and the bench
 still runs.
 
+**Iteration 4 (2026-08-12): `popfq` — the write side of the flags, one
+helper, and the cross-block handoff proven.** The halt was exactly the
+predicted `helper_write_eflags` (POPF is one of the two flag helpers
+`emit.c.inc`'s `gen_POPF` emits, with a CPL-dependent update mask, followed
+by `set_cc_op(CC_OP_EFLAGS)` and `DISAS_EOB_NEXT`). Its body is misc_helper.c's
+`cpu_load_eflags` verbatim — CC bits into `cc_src` with `CC_OP = EFLAGS`, the
+DF bit decoded into `env->df` as +1/−1 (`1 - 2*DF`), the update mask routing
+non-CC bits into `env->eflags` with bit 1 forced — so `read_eflags` (iteration
+3) and `write_eflags` are now both real and the flags are a closed loop. The
+interesting gate was not the helper itself but what it makes observable: each
+popfq ends its TB, so every `jz`/`jc` after it decodes in a fresh block
+against the env state the helper left — the guest proves that handoff five
+ways (jz taken after ZF=1, jz skipped after ZF=0, jc taken after CF=1, a
+pushfq read-back of the popped ZF, and the sharpest one: popfq with DF set
+followed by `rep movsb` from src+7/dst+7 copies BACKWARD, which is only true
+if the DF bit really reached `env->df`). 423 instructions to HLT; the packed
+result and the backward-copied value match C exactly, and
+`invl`/`paging`/`selfmod` still pass with the bench running. One fixture
+mistake on the way (the expected constant dropped the CF bit — the helper
+was right, the fixture was wrong) was caught by the failing read-back, not by
+a guest hang.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
