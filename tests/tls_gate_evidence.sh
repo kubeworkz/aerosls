@@ -65,6 +65,24 @@ if [ "${1:-}" = "--compare" ]; then
     else
         ok "serials differ between captures (entropy is not stuck)"
     fi
+    ua="$(awk -F': ' '/^uptime_ticks: /{print $2}' "$A")"
+    ub="$(awk -F': ' '/^uptime_ticks: /{print $2}' "$B")"
+    case "${ua:-unknown}${ub:-unknown}" in
+        *unknown*)
+            note "uptime not recorded in one or both captures -- pass --plain HOST:PORT"
+            note "so this can tell a reboot from two reads of one boot" ;;
+        *)
+            if [ "$ub" -lt "$ua" ] 2>/dev/null; then
+                ok "the node rebooted between captures (uptime $ua -> $ub)"
+            else
+                bad "NOT TWO BOOTS: uptime went $ua -> $ub, so these captures are
+        from the SAME boot. Whatever the serials say below, this is not
+        evidence about boot diversity -- and if the serials DO differ, the
+        certificate is being regenerated within a single boot, which is its
+        own defect: it burns entropy and invalidates every trust decision a
+        client has already made."
+            fi ;;
+    esac
     ka="$(awk -F': ' '/^pubkey_sha256: /{print $2}' "$A")"
     kb="$(awk -F': ' '/^pubkey_sha256: /{print $2}' "$B")"
     if [ -n "$ka" ] && [ "$ka" = "$kb" ]; then
@@ -188,6 +206,24 @@ if [ -n "$PLAIN" ]; then
     fi
 fi
 
+# ─── did this node reboot? ─────────────────────────────────────────────────
+# The serial comparison below is only entropy evidence if the two captures are
+# two BOOTS. Nothing in a certificate says which boot produced it, and a node
+# that regenerated its certificate for some other reason would make the
+# comparison pass for entirely the wrong reason -- which is the failure mode
+# this project keeps finding, not a hypothetical one.
+#
+# /api/health is public (net/http.c exempts it from the token requirement) and
+# reports uptime_ticks, so the capture can record which boot it belongs to and
+# --compare can check rather than assume.
+UPTIME=""
+if [ -n "$PLAIN" ]; then
+    UPTIME="$(curl -sS --max-time 5 "http://$PLAIN/api/health" 2>/dev/null \
+              | tr ',{}' '\n\n\n' | awk -F': *' '/"uptime_ticks"/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+    [ -n "$UPTIME" ] && note "uptime  : $UPTIME ticks" \
+                     || note "uptime  : <unavailable -- --compare cannot confirm a reboot>"
+fi
+
 if [ -n "$OUT" ]; then
     {
         echo "host: $TLS"
@@ -202,6 +238,7 @@ if [ -n "$OUT" ]; then
         echo "not_after: $NA"
         echo "san: $SAN"
         echo "pubkey_sha256: $PUBSHA"
+        echo "uptime_ticks: ${UPTIME:-unknown}"
         echo "body_sha256: ${TLSSHA:-none}"
     } > "$OUT"
     note "capture written to $OUT"
