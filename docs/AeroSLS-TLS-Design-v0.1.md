@@ -518,6 +518,11 @@ misunderstanding stays invisible.
    somewhere less careful. Decide the storage story *before* generating the
    first key: a dedicated encrypted region, or an explicit exclusion in the
    checkpoint walk with a guard test asserting it.
+   → **Settled 2026-08-12**; see "§6.1 settled" at the end of this document.
+   The answer turned out to be neither of the two options listed here: the
+   region is outside the checkpoint walk *by construction*, so there is no
+   exclusion to add. It is still in plaintext, and that cost is stated there
+   rather than softened.
 2. **Timing side channels through the record layer.** BearSSL's primitives are
    constant-time; glue code is not automatically. Padding checks, error paths
    that return early, and length-dependent branches in the bridge are all live
@@ -1197,3 +1202,197 @@ did not capture: the negotiated parameters recorded verbatim, a hash of the
 Navigator payload matched against the same fetch over plaintext, and **two
 consecutive boots with differing serials**, which is the one line of the
 browser gate that would notice §0's failure mode.
+
+---
+
+## §6.1 settled, 2026-08-12: the CA survives a reboot, the leaf does not
+
+Committed as `a60a170`.
+
+This closes the first item in §6 — "decide the storage story *before*
+generating the first key" — and it was forced rather than chosen. The gate
+above passed in Chrome and then in Firefox, and each pass was followed by a
+reboot that invalidated it. **Three re-imports in one afternoon**, by hand,
+into two trust stores with separate UIs and separate ways of getting it wrong.
+An anchor that changes every boot is not a trust store entry; it is a chore.
+
+### The shape: one long-lived secret, not two
+
+**The CA certificate and CA private key persist. The leaf and its key do not.**
+The leaf is regenerated with a fresh key on every boot and signed by the stored
+CA.
+
+That asymmetry is the whole design, and each half of it earns its place:
+
+- **Persisting the CA** is the only thing that makes an operator's import
+  survive a reboot. Nothing else was ever the problem.
+- **Not persisting the leaf** keeps exactly one long-lived secret on disk
+  instead of two, bounds the leaf key's exposure to a single uptime, and leaves
+  the SAN list following the *build* rather than the *disk* — so changing the
+  names a node answers to takes a reboot, not a wipe. The cost is one P-256
+  keygen at startup.
+
+Layout: one 4 KiB frame at `PERSIST_TLS_LBA` (7680), after `checkpoint_mgr`'s
+entries end at 7672 with the same one-frame gap every other boundary in
+`persist.h` uses. 504 sectors still free before `STREAM_DIR_LBA`.
+
+### What this costs, written where it will be read
+
+The CA private key is now on an unencrypted disk at a fixed LBA. **Whoever
+reads that frame can mint certificates this node's operators trust, and nothing
+in the chain will look wrong to any verifier.** That is a real and permanent
+increase in what a stolen disk is worth.
+
+It is not avoidable while the requirement stands: reboot-survivable trust is
+not available without a secret that survives reboots. §4.1's "root key never
+leaves that node in plaintext" is the *cluster* CA and still stands; this is a
+per-node anchor for browser access, and it is a weaker thing deliberately.
+
+What is **not** acceptable is the same key reaching a *second* place. A
+checkpoint, a snapshot, a migration stream — each has its own lifetime, its own
+copies, and its own audience, and every one of those paths was written by
+someone who had no idea a private key would ever pass through it. Nothing about
+that failure is visible: the node works, the browsers are happy, and the key is
+in a stream file on another host.
+
+### §6.1's guard, and what it does not cover
+
+§6 asked for "an explicit exclusion in the checkpoint walk with a guard test
+asserting it". What landed is slightly different and stronger on one axis:
+**the region is outside the walk by construction.** It is in no `persist_*`
+region and no `persist_*` function knows the LBA, so there is no exclusion to
+add — there is nothing to exclude *from*.
+
+`tests/tls_key_containment_check.sh` asserts that in two ways, because neither
+is enough alone:
+
+1. **Structural.** `PERSIST_TLS_LBA`, `PERSIST_TLS_MAGIC` and
+   `tls_store_load/save/wipe` have exactly one user each. A grep, and a
+   weak-looking one — but it is the check that fires when someone adds the
+   frame to a checkpoint walk, because they would have to name the LBA or call
+   the store to do it. Exclusions in it are *named filenames*, not globs: a
+   `tests/` pattern would also excuse a future test that copied the key
+   somewhere.
+2. **Behavioural.** A host harness with a simulated disk plants a key made of
+   bytes nothing else would produce and goes looking for it. It must be in
+   **exactly one frame** of the disk — not zero, not two — and in **none** of
+   the module's staging buffer, on every path including the early returns.
+   `tls_store.h` claims that zeroize on every path; this is what stops it from
+   being a claim. 24 assertions.
+
+**What it does not cover, and this matters:** it cannot prove a *running*
+kernel's checkpoint is clean. That needs a live node and its real disk image,
+and no such check exists. The structural half is a real argument for why a
+checkpoint cannot contain the key, and it is not the same as having looked. A
+green line here is not "the key has been confirmed absent from a written
+checkpoint", and the script's own header says so.
+
+### Three checks in `tls_cert_sign_leaf` that nothing checked before
+
+Each exists because the failure it prevents is *unreadable at the far end* —
+the browser reports something true and useless.
+
+**1. `mbedtls_pk_check_pair` on the stored certificate and key.** A torn 4 KiB
+write, a half-updated frame, or a key from a different CA otherwise produces
+leaves whose signature does not verify. Firefox reports that as
+`SEC_ERROR_BAD_SIGNATURE`, which is correct and says nothing whatsoever about
+which of the two blobs on disk was wrong.
+
+This is also **why the frame carries no CRC**, which is a decision and not an
+omission. A CRC catches a torn write; so does handing both blobs to real
+parsers and then proving the key matches the certificate. The pairing check is
+*strictly stronger* over the same bytes — it also catches a wrong key and a
+stale pairing, neither of which a checksum notices. A third `crc32`
+implementation in this tree would have been cost without coverage. What the
+parsers cannot catch is a header that disagrees with its payload, so the
+**lengths** are checked in `tls_store.c` before any byte reaches a parser.
+
+**2. The finished leaf's `issuer_raw` against the CA's `subject_raw`, byte for
+byte.** `ca_dn` is a *string* that mbedTLS re-encodes into DER. Path builders
+match encoded bytes, not meaning. The future this is for: **someone edits the
+DN constant in a later build while a CA made with the old one is still on
+disk** — a one-line change with no visible connection to certificates,
+producing a leaf that is internally valid, signed by the right key, and which
+no path builder will join to its issuer. `tls_server_init` answers it by
+discarding the stored CA, which is the correct repair.
+
+**3. The leaf's window clamped into the issuer's, both ends.** The CA is made
+once and the leaf every boot, so without the `notAfter` clamp the leaf's expiry
+marches past its issuer's and the chain becomes unverifiable at a moment
+nothing in the logs explains. `notBefore` is clamped *up* for the narrower case
+of an RTC that has moved backwards — which can put `notBefore` slightly in this
+node's future, and that is correct: the verifier's clock is the one being
+satisfied.
+
+### Lifetimes, and why the third number is not arbitrary
+
+| | Value | Why |
+|---|---|---|
+| CA | 5 years | It is what an operator imports by hand, twice. Its expiry is the only thing that makes them do it again. Five and not ten because the key is in plaintext on an unencrypted disk, and an open-ended commitment to a secret in that position is not one worth making. |
+| Leaf | 1 year | **About uptime, not key exposure.** The key is fresh every boot; the lifetime only has to outlast the longest run. Nothing re-issues a leaf while the node is running, so a shorter one would expire a certificate underneath a node that is serving happily — no log line at the moment it happens, browser errors afterwards. |
+| Renewal margin | = leaf lifetime | Deliberately not a fourth number. It states the actual rule — *replace the CA when it can no longer issue a full-length leaf* — so the two cannot drift apart, and it means a leaf is never silently short-changed by the clamp into a nearly-expired issuer's window. |
+
+The leaf's year is **a bound, not a solution.** In-flight re-issue is the real
+fix and is not written.
+
+### Everything that can be wrong converges on one repair
+
+Absent, older format, torn, wrong key, wrong DN, expired: every one of them is
+answered by *throw it away and make a new one*. So the cases in
+`tls_server_init` differ in **what they log** and not in what they do. A node
+that silently serves nothing because its stored CA was unreadable is worse than
+one that costs an import — and the log line is what tells the operator which of
+the two afternoons they are having.
+
+### Testing, because none of this is visible from a single generation
+
+Everything the oracle asserted before this judged **one** generation. The
+property that had to hold is about a **second boot**, and nothing in a
+single-shot test can see it.
+
+`tests/tls_cert_oracle.c --persist` makes a CA, moves its clock forward twice,
+and signs a leaf at each stop — two reboots, minus the reboots. Then:
+
+- both leaves verify against the **same** anchor, with `openssl verify
+  -attime`. The instants come from the oracle itself rather than being
+  recomputed in the shell, so the two cannot drift apart from what was actually
+  signed;
+- a leaf must **not** verify against a CA that did not sign it — without that
+  negative, "verify succeeded" could mean the flags were wrong and openssl
+  checked nothing;
+- the serials and public keys differ, so the fresh-key-per-boot claim is not
+  just a comment;
+- the over-long leaf lands on the CA's **exact** `notAfter`, and a normal leaf
+  does **not** — otherwise the clamp assertion would pass for the wrong reason.
+
+The three refusals — wrong key, wrong DN, expired CA — are asserted in C,
+because *"this must fail, with THIS code"* is not something OpenSSL can be
+asked.
+
+**41 assertions, up from 22.** Host test 42/42. Containment 29/29.
+
+### Measurement
+
+- Image end `0x000000000dfc5000`, **+7,016 bytes** of image for the whole
+  change — measured on the native-gcc control build, which is the
+  toolchain-independent delta the image-end section above established. Nothing
+  here moves the "trim mbedTLS modules" question.
+- Every frame within the 25% advisory; `stack_frame_budget_check` scans 219
+  files clean.
+- CA certificate plus key measured well inside one 4 KiB frame, and the oracle
+  asserts that rather than assuming it — a future key type that broke it should
+  fail there, not in a store that silently refuses to save.
+
+### Still owed
+
+- **The live-node half of the containment guard.** Boot a node, trigger a
+  checkpoint, and grep the written frames for the CA key's bytes. The
+  structural argument says it cannot be there; nobody has looked.
+- **In-flight leaf re-issue**, so the leaf's lifetime stops being a bet on
+  uptime.
+- **The ciphersuite decision.** `TLS_AES_256_GCM_SHA384` is confirmed live, but
+  the amendment's table names two others as wanted. Pin via
+  `conf_ciphersuites` or amend the table — the table currently describes an
+  intention, not the build.
+- **ARM64 entropy diversity**, still unmet from Phase 0 and still needing
+  hardware.
