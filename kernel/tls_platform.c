@@ -156,7 +156,15 @@ int sls_tls_memory_init(void)
     mbedtls_memory_buffer_alloc_init(tls_pool, sizeof tls_pool);
 #endif
     tls_pool_ready = 1;
-    kernel_serial_print("[TLS] memory pool initialised (256 KiB, fixed).\n");
+    /* Derived from the constant, not written out again. This line said
+     * "256 KiB" for as long as the pool WAS 512 KiB, because raising
+     * SLS_TLS_POOL_BYTES changed the array and not the string beside it. An
+     * operator sizing anything from the console would have been out by a
+     * factor of two, and /api/health -- which reads the constant -- would have
+     * flatly contradicted it. Two places holding one number is the whole bug;
+     * printing the number is the fix, not correcting the literal. */
+    kernel_serial_printf("[TLS] memory pool initialised (%u KiB, fixed).\n",
+                         (unsigned)(SLS_TLS_POOL_BYTES / 1024u));
     return 0;
 }
 
