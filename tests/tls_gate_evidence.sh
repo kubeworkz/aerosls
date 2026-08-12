@@ -72,15 +72,40 @@ if [ "${1:-}" = "--compare" ]; then
             note "uptime not recorded in one or both captures -- pass --plain HOST:PORT"
             note "so this can tell a reboot from two reads of one boot" ;;
         *)
+            # ─── This test is SOUND but INCOMPLETE, deliberately ───────
+            # Uptime only ever rises within a boot, so uptime going DOWN
+            # proves a restart. The converse does not hold: a node that
+            # rebooted and then ran longer before the second capture shows a
+            # HIGHER uptime, and is indistinguishable here from one that never
+            # restarted.
+            #
+            # It is left asymmetric on purpose. Getting this wrong in the
+            # other direction -- crediting a reboot that did not happen --
+            # would make the serial comparison below pass for the wrong
+            # reason, which is the entire failure this file exists to avoid.
+            # An unconfirmed reboot is reported as unconfirmed, not as absent.
+            #
+            # Worth knowing that the first real run passed this by luck: 1387
+            # -> 1197 ticks, two captures each taken about a dozen seconds
+            # after their own boot. A few seconds more before the second and a
+            # genuine reboot would have read as unconfirmed.
+            ta="$(awk -F': ' '/^captured_at: /{print $2}' "$A")"
+            tb="$(awk -F': ' '/^captured_at: /{print $2}' "$B")"
+            elapsed=""
+            [ -n "$ta" ] && [ -n "$tb" ] && elapsed=$((tb - ta))
             if [ "$ub" -lt "$ua" ] 2>/dev/null; then
-                ok "the node rebooted between captures (uptime $ua -> $ub)"
+                ok "the node restarted between captures (uptime $ua -> $ub)"
             else
-                bad "NOT TWO BOOTS: uptime went $ua -> $ub, so these captures are
-        from the SAME boot. Whatever the serials say below, this is not
-        evidence about boot diversity -- and if the serials DO differ, the
-        certificate is being regenerated within a single boot, which is its
-        own defect: it burns entropy and invalidates every trust decision a
-        client has already made."
+                bad "CANNOT CONFIRM A RESTART: uptime went $ua -> $ub${elapsed:+, over ${elapsed}s of wall clock}.
+        Uptime rising is consistent with BOTH a node that never restarted and
+        one that restarted and then ran longer before the second capture, so
+        this proves nothing either way and the serial comparison above is not
+        boot-diversity evidence until it does.
+        Capture the second reading sooner after the restart, or read the
+        node's boot banner. And if the node genuinely did NOT restart, the
+        certificate changing is its own defect: regenerating within a boot
+        burns entropy and invalidates every trust decision a client already
+        made."
             fi ;;
     esac
     ka="$(awk -F': ' '/^pubkey_sha256: /{print $2}' "$A")"
@@ -239,6 +264,7 @@ if [ -n "$OUT" ]; then
         echo "san: $SAN"
         echo "pubkey_sha256: $PUBSHA"
         echo "uptime_ticks: ${UPTIME:-unknown}"
+        echo "captured_at: $(date -u +%s)"
         echo "body_sha256: ${TLSSHA:-none}"
     } > "$OUT"
     note "capture written to $OUT"
