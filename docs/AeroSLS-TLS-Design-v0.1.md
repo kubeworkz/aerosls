@@ -1373,12 +1373,40 @@ asked.
 
 ### Measurement
 
-- Image end `0x000000000dfc5000`, **+7,016 bytes** of image for the whole
-  change — measured on the native-gcc control build, which is the
-  toolchain-independent delta the image-end section above established. Nothing
-  here moves the "trim mbedTLS modules" question.
-- Every frame within the 25% advisory; `stack_frame_budget_check` scans 219
-  files clean.
+Measured as a real A/B on the native-gcc control build — `a14c92c` and this
+change, same toolchain, same flags, both links complete:
+
+| | Image bytes | `_kernel_image_end` |
+|---|---|---|
+| `a14c92c` (before) | 2,770,488 | `0x000000000dfc1000` |
+| after | 2,778,088 | `0x000000000dfc5000` |
+| **delta** | **+7,600** | +16 KiB (page-rounded) |
+
+The 16 KiB on `_kernel_image_end` is page granularity crossing a boundary, not
+16 KiB of content; the 4 KiB staging frame in BSS is most of what pushed it.
+Nothing here moves the "trim mbedTLS modules" question. Every frame stays
+within the 25% advisory and `stack_frame_budget_check` scans 219 files clean.
+
+**A correction, because the first number was wrong.** The commit message for
+`a60a170` says +7,016 bytes. It is not right, and the way it was wrong is worth
+more than the number: the "before" side was a binary in the control tree that
+had been linked with a **stale `net/http.x86.o`** — an object predating a
+symbol the current source references. Both sides shared the stale object, so
+the comparison looked internally consistent, and it silently excluded the
+`/api/health` change and any drift in `http.c`. Recompiling `http.c` is what
+exposed it, by failing to link at all.
+
+This is the **third** time in this project that a stale artifact produced a
+confident wrong number — after the `my_sls_kernel.bin` that predated the
+mbedTLS link, and the mutation run that restored `rtc.c` through a path it did
+not own. The pattern each time is the same: the measurement was reproducible,
+self-consistent, and about a program that was not the one being asked about.
+`stack_frame_budget_check.sh` refuses a binary older than its sources for
+exactly this reason, and it is the guard that has caught the most.
+
+The control tree now links a one-line stub for the missing symbol. It is
+identical on both sides of the A/B and therefore cancels, and it exists only in
+`/tmp/ab` — the repo has no such file.
 - CA certificate plus key measured well inside one 4 KiB frame, and the oracle
   asserts that rather than assuming it — a future key type that broke it should
   fail there, not in a store that silently refuses to save.

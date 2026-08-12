@@ -2,6 +2,7 @@
 #include "../kernel/entropy.h"
 #include "tcp.h"
 #include "../kernel/tls_server.h"
+#include "../kernel/tls_store.h"
 #include "net.h"
 #include "http_rate_limit.h"   // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1
 #include "tcp_quota.h"         // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1, Network Fairness Phase 2
@@ -294,6 +295,19 @@ static int api_health(char* body, int max) {
         jb_uint(&j, "tls_pool_bytes", (uint64_t)pool_bytes);                jb_putc(&j, ',');
         jb_uint(&j, "tls_pool_peak", (uint64_t)pool_peak);                  jb_putc(&j, ',');
         jb_uint(&j, "tls_pool_blocks", (uint64_t)pool_blocks);              jb_putc(&j, ',');
+
+        /* Whether this boot's CA came off disk or was made fresh. It is the
+         * one fact that decides whether an operator's existing import is still
+         * good, and the alternative to reporting it is asking them to compare
+         * certificate serials across a reboot to find out. tls_ca_stored=0 on
+         * a second boot means the import they already did is now worthless,
+         * and this is where they see that without reading a serial console. */
+        {
+            int ca_loaded = 0; uint64_t ca_written = 0;
+            tls_store_stats(&ca_loaded, &ca_written);
+            jb_uint(&j, "tls_ca_stored",  (uint64_t)(ca_loaded ? 1 : 0));   jb_putc(&j, ',');
+            jb_uint(&j, "tls_ca_written", (uint64_t)ca_written);            jb_putc(&j, ',');
+        }
     }
     jb_uint(&j, "object_count", object_catalog_count);
     jb_obj_close(&j);
