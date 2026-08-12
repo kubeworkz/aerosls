@@ -292,6 +292,21 @@ completion. **The work list is no longer a file.** It is whatever helper a
 running guest halts on first — launch, read the name, implement it, repeat.
 Ordering by anything else is guessing at what a guest executes.
 
+**First compiled guest reached 2026-08-12 — the loop works.**
+`sls/guest/guest.c` is a real `gcc -static -nostdlib` x86-64 binary (71
+bytes, `-mno-sse -mno-sse2` so the first milestone measures the integer
+path, born in long mode with a stack from the launcher's boot state, paging
+off) launched through the decoder by the `qemu compiled` fixture. It divides
+`u64/u64` and `u32/u32` from a parameter block and writes the result to a
+fixed GPA, so the result is checked against the same arithmetic in C — a
+wrong helper fails, not just a missing one. The run sequence was exactly the
+predicted one: halt on `helper_divq_EAX`, implement (int_helper.c semantics,
+128/64 via `__int128`/libgcc, #DE as a halting kernel panic since guest
+exception delivery does not exist yet), re-run, halt on `helper_divl_EAX`,
+implement, re-run — **16 instructions to HLT, result matches C, all other
+fixtures still pass.** The next halt is whichever helper the next guest
+crosses; growing the guest is what finds the next one.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
