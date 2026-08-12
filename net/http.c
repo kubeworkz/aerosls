@@ -1,6 +1,7 @@
 #include "http.h"
 #include "../kernel/entropy.h"
 #include "tcp.h"
+#include "../kernel/tls_server.h"
 #include "net.h"
 #include "http_rate_limit.h"   // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1
 #include "tcp_quota.h"         // Multitenant Isolation Gap Analysis §5 item 4 / §7 item 1, Network Fairness Phase 2
@@ -399,6 +400,45 @@ static const char* const CORS_ALLOWED_ORIGINS[] = {
 static char g_cors_origin_hdr[128];  // "" (no header) or "Access-Control-Allow-Origin: <origin>\r\n"
 
 // ─── HTTP response helper ─────────────────────────────────────────────────────
+/* ─── One place where bytes leave, so TLS is not nine separate decisions ───
+ * Every response path in this file used tcp_send() directly. Rather than teach
+ * nine call sites about TLS -- and leave the tenth, written later, to be the
+ * one that leaks a plaintext response onto an encrypted connection -- they all
+ * go through here.
+ *
+ * mbedtls_ssl_write() may accept fewer bytes than offered and may ask to be
+ * called again with THE SAME arguments, so the retry advances only by what was
+ * actually taken. The attempt count is bounded because this runs inside the
+ * single poll loop that also drives the serial console: spinning here to push
+ * out a response would be the same denial of service the BIO bridge was
+ * written to avoid, just moved to the write side. Giving up loses the tail of
+ * one response and says so; it does not stall the node. */
+#define HTTP_TLS_WRITE_ATTEMPTS 64
+
+/* http_conns[] is declared ~5,700 lines below, next to the poll loop that owns
+ * it. Rather than hoist the whole structure up here purely so this function
+ * can read one flag, the flag is read through an accessor defined beside the
+ * array. */
+static int http_conn_is_tls(int conn);
+
+static int http_send(int conn, const void* buf, uint32_t len) {
+    if (conn < 0 || conn >= TCP_MAX_CONNS || !http_conn_is_tls(conn)) {
+        return tcp_send(conn, buf, len);
+    }
+    const unsigned char* p = (const unsigned char*)buf;
+    uint32_t off = 0;
+    for (int attempt = 0; attempt < HTTP_TLS_WRITE_ATTEMPTS && off < len; attempt++) {
+        int w = tls_server_write(conn, p + off, (size_t)(len - off));
+        if (w < 0) return w;          /* dead session; caller tears down */
+        off += (uint32_t)w;           /* w == 0 is back-pressure: try again */
+    }
+    if (off < len) {
+        kernel_serial_printf("[TLS] conn %d: gave up with %u of %u bytes written\n",
+                             conn, (unsigned)off, (unsigned)len);
+    }
+    return (int)off;
+}
+
 static void http_respond(int conn, int status, const char* ctype,
                           const char* body, int blen) {
     char hdr[256];
@@ -435,8 +475,8 @@ static void http_respond(int conn, int status, const char* ctype,
     while (*cors) hdr[hpos++] = *cors++;
     hdr[hpos++] = '\r'; hdr[hpos++] = '\n';  // end of headers
 
-    tcp_send(conn, hdr, (uint32_t)hpos);
-    if (blen > 0) tcp_send(conn, body, (uint32_t)blen);
+    http_send(conn, hdr, (uint32_t)hpos);
+    if (blen > 0) http_send(conn, body, (uint32_t)blen);
 }
 
 // Like http_respond but for binary/large assets from the compiled-in bundle.
@@ -465,8 +505,8 @@ static void http_respond_raw(int conn, const char* ctype,
     const char* crlf2 = "\r\n";
     while (*crlf2) hdr[hpos++] = *crlf2++;
 
-    tcp_send(conn, hdr, (uint32_t)hpos);
-    if (blen > 0) tcp_send(conn, data, blen);
+    http_send(conn, hdr, (uint32_t)hpos);
+    if (blen > 0) http_send(conn, data, blen);
 }
 
 // Forward declarations for helpers defined in the Phase F section below
@@ -781,7 +821,7 @@ static void http_options(int conn) {
                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                        "Content-Length: 0\r\n\r\n";
     while (*rest) h[hp++] = *rest++;
-    tcp_send(conn, h, (uint32_t)hp);
+    http_send(conn, h, (uint32_t)hp);
 }
 
 // Resolves the current request's Origin header against CORS_ALLOWED_ORIGINS
@@ -1588,7 +1628,7 @@ static void http_respond_stream(int conn, struct StreamEntry* se) {
     hdr[hp++]='\r'; hdr[hp++]='\n';
     const char* co=g_cors_origin_hdr; while(*co) hdr[hp++]=*co++;
     hdr[hp++]='\r'; hdr[hp++]='\n';
-    tcp_send(conn, hdr, (uint32_t)hp);
+    http_send(conn, hdr, (uint32_t)hp);
     /* Send content frame-by-frame; lazy-load from NVMe if frame not in RAM
        (happens on first download after a reboot). */
     if (se->size > 0) {
@@ -1600,7 +1640,7 @@ static void http_respond_stream(int conn, struct StreamEntry* se) {
                 if (!frame_data) break;  /* NVMe read failed — truncate response */
             }
             uint32_t to_send = remaining < 4096u ? remaining : 4096u;
-            tcp_send(conn, (const char*)frame_data, to_send);
+            http_send(conn, (const char*)frame_data, to_send);
             remaining -= to_send;
         }
     }
@@ -1629,9 +1669,9 @@ static void http_respond_program_binary(int conn, struct ServiceBinary* sb) {
     hdr[hp++] = '\r'; hdr[hp++] = '\n';
     const char* co = g_cors_origin_hdr; while (*co) hdr[hp++] = *co++;
     hdr[hp++] = '\r'; hdr[hp++] = '\n';
-    tcp_send(conn, hdr, (uint32_t)hp);
+    http_send(conn, hdr, (uint32_t)hp);
     if (sb->size > 0)
-        tcp_send(conn, (const char*)sb->data, sb->size);
+        http_send(conn, (const char*)sb->data, sb->size);
 }
 
 // ─── POST /api/stream/create ──────────────────────────────────────────────────
@@ -6086,6 +6126,11 @@ static void http_route(int conn, char* req) {
 
 struct HttpConnState {
     uint8_t  in_use;   // 1 while we're accumulating this connection's request
+    /* 1 when this connection arrived on the TLS listener. Set at pickup from
+     * the local port it landed on, never inferred from the bytes: a client
+     * that speaks plaintext to the TLS port must fail the handshake, not be
+     * quietly served in the clear. */
+    uint8_t  tls;
     // Network Fairness Phase 2: 1 once this connection has been attributed
     // to a partition's connection quota (net/tcp_quota.h) -- set the first
     // sweep an Authorization header is found in the accumulating buffer,
@@ -6101,6 +6146,10 @@ struct HttpConnState {
 // allocation bookkeeping, since conn_id is already the stable identity tcp.c
 // hands out for the lifetime of a connection.
 static struct HttpConnState http_conns[TCP_MAX_CONNS];
+
+/* See http_send(). Bounds are checked by the caller; this is deliberately not
+ * defensive twice, so there is one place the range rule lives. */
+static int http_conn_is_tls(int conn) { return http_conns[conn].tls != 0; }
 
 // Returns 1 once buf[0..len) holds a complete HTTP request (full headers,
 // and full body per Content-Length if one is present), or once `len` has
@@ -6139,7 +6188,38 @@ void http_server_run(void) {
                          "GET http://10.0.2.15:3000/api/scan\n",
                          NET_HTTP_PORT);
 
-    for (int i = 0; i < TCP_MAX_CONNS; i++) { http_conns[i].in_use = 0; http_conns[i].attributed = 0; }
+    /* ── The TLS listener ──────────────────────────────────────────────
+     * A SEPARATE PORT, not an upgrade of 3000. The design doc says "on the
+     * HTTP port" and this deliberately does not do that yet, because during
+     * bring-up the plaintext path is the instrument: it is how the
+     * certificate DER gets off the node for `openssl x509` to read, and how
+     * the node stays reachable when the handshake is the thing that is
+     * broken. Moving TLS onto 3000 is a one-line change once a browser has
+     * completed a handshake; doing it first would mean debugging the record
+     * layer with no way in.
+     *
+     * TLS init failing is NOT fatal to HTTP. It is fatal to TLS: no listener
+     * is opened, and nothing falls back to serving 8443 in the clear. */
+    int tls_listen_fd = -1;
+    uint16_t tls_port = 0;
+    {
+        static const unsigned char node_ip[4] = { 10, 0, 2, 15 };
+        if (tls_server_init("CN=AeroSLS node,O=AeroSLS", 0, node_ip) == TLS_SRV_OK) {
+            tls_listen_fd = tcp_listen(NET_HTTPS_PORT);
+            if (tls_listen_fd < 0) {
+                kernel_serial_print("[TLS] could not bind the TLS port.\n");
+            } else {
+                tls_port = tcp_conns[tls_listen_fd].local_port;
+                kernel_serial_printf("[TLS] Listening on port %u. "
+                                     "https://10.0.2.15:%u/\n",
+                                     NET_HTTPS_PORT, NET_HTTPS_PORT);
+            }
+        } else {
+            kernel_serial_print("[TLS] not started -- serving plaintext only.\n");
+        }
+    }
+
+    for (int i = 0; i < TCP_MAX_CONNS; i++) { http_conns[i].in_use = 0; http_conns[i].attributed = 0; http_conns[i].tls = 0; }
 
     for (;;) {
         int did_work = 0;
@@ -6150,13 +6230,29 @@ void http_server_run(void) {
         for (int i = 0; i < TCP_MAX_CONNS; i++) {
             if (i == listen_fd) continue;
             struct TCPConn* c = &tcp_conns[i];
-            if (c->active && c->local_port == tcp_conns[listen_fd].local_port &&
+            if (i == tls_listen_fd) continue;
+            int on_plain = (c->local_port == tcp_conns[listen_fd].local_port);
+            int on_tls   = (tls_listen_fd >= 0 && c->local_port == tls_port);
+            if (c->active && (on_plain || on_tls) &&
                 c->state == TCP_ESTABLISHED && !http_conns[i].in_use) {
                 http_conns[i].in_use = 1;
                 http_conns[i].attributed = 0;   // Network Fairness Phase 2 -- fresh occupant of this slot, not yet quota-attributed
                 http_conns[i].len   = 0;
+                http_conns[i].tls   = on_tls ? 1 : 0;
                 http_conns[i].last_activity_tick = kernel_tick_counter;
                 did_work = 1;
+
+                /* Claim a session slot now, at pickup, so the refusal happens
+                 * before any client bytes are read. At the cap the connection
+                 * is closed -- never served plaintext, which would be a
+                 * downgrade this client has no way to detect. */
+                if (on_tls && tls_server_open(i) != TLS_SRV_OK) {
+                    kernel_serial_printf("[TLS] conn %d refused: no session slot "
+                                         "(cap is %d).\n", i, TLS_SERVER_MAX_SESSIONS);
+                    tcp_close(i);
+                    http_conns[i].in_use = 0;
+                    http_conns[i].tls = 0;
+                }
             }
         }
 
@@ -6166,17 +6262,68 @@ void http_server_run(void) {
             struct HttpConnState* hc = &http_conns[i];
             struct TCPConn* c = &tcp_conns[i];
 
-            if (c->rbuf_used > 0) {
+            /* A TLS connection reads nothing as HTTP until the handshake is
+             * done. TLS_SRV_HANDSHAKING is the normal case for several
+             * sweeps -- mbedTLS asked for bytes that have not arrived -- and
+             * yielding here rather than waiting is what stops one client
+             * stalling the console this loop also drives. */
+            if (hc->tls) {
+                int hs = tls_server_handshake(i);
+                if (hs == TLS_SRV_HANDSHAKING) {
+                    if (c->rbuf_used > 0) { hc->last_activity_tick = kernel_tick_counter; did_work = 1; }
+                    if (kernel_tick_counter - hc->last_activity_tick > HTTP_IDLE_TIMEOUT_TICKS) {
+                        tls_server_close(i); tcp_close(i);
+                        hc->in_use = 0; hc->tls = 0;
+                        tcp_conn_release(i); hc->attributed = 0;
+                    }
+                    continue;
+                }
+                if (hs != TLS_SRV_OK) {
+                    tls_server_close(i); tcp_close(i);
+                    hc->in_use = 0; hc->tls = 0;
+                    tcp_conn_release(i); hc->attributed = 0;
+                    did_work = 1;
+                    continue;
+                }
+            }
+
+            /* `|| hc->tls` is not redundant. mbedTLS buffers a whole record
+             * internally; once it has been pulled off TCP, c->rbuf_used is 0
+             * while decrypted bytes are still sitting in the ssl context
+             * waiting to be read. Gating on the TCP buffer alone would leave
+             * a complete request unread until more bytes happened to arrive,
+             * or the idle timeout fired -- a stall that looks like a slow
+             * client and is not. mbedtls_ssl_read() reports WANT_READ, which
+             * tls_server_read() returns as 0, so asking when there is nothing
+             * costs one call. */
+            if (c->rbuf_used > 0 || hc->tls) {
                 int space = (int)sizeof(hc->buf) - 1 - hc->len;
                 if (space > 0) {
-                    int got = tcp_recv(i, hc->buf + hc->len, (uint16_t)space);
+                    int got = hc->tls
+                        ? tls_server_read(i, (unsigned char*)hc->buf + hc->len, (size_t)space)
+                        : tcp_recv(i, hc->buf + hc->len, (uint16_t)space);
+                    /* A negative read is a dead session -- close_notify, a
+                     * fatal alert, or a decrypt failure. Reap it now rather
+                     * than let it hold a slot (one of TWO) until the idle
+                     * timeout. tcp_recv() does not return negatives here, so
+                     * this branch is the TLS path's alone. */
+                    if (got < 0) {
+                        tls_server_close(i);
+                        tcp_close(i);
+                        hc->in_use = 0;
+                        hc->tls = 0;
+                        tcp_conn_release(i);
+                        hc->attributed = 0;
+                        did_work = 1;
+                        continue;
+                    }
                     if (got > 0) {
                         hc->len += got;
                         hc->buf[hc->len] = '\0';
                         hc->last_activity_tick = kernel_tick_counter;
                     }
                 }
-                did_work = 1;
+                if (c->rbuf_used > 0) did_work = 1;
             }
 
             // Network Fairness Phase 2: attribute this connection to its
@@ -6200,8 +6347,10 @@ void http_server_run(void) {
                         did_work = 1;
                         const char* e429c = "{\"error\":\"Too many concurrent connections for this partition — try again shortly\"}";
                         http_respond(i, 429, "application/json", e429c, (int)strlen(e429c));
+                        tls_server_close(i);   /* no-op unless this conn had a session */
                         tcp_close(i);
                         hc->in_use = 0;
+                        hc->tls = 0;
                         hc->attributed = 0;
                         continue;
                     }
@@ -6215,8 +6364,10 @@ void http_server_run(void) {
             if (ready || (peer_done && c->rbuf_used == 0)) {
                 did_work = 1;
                 if (hc->len > 0) http_route(i, hc->buf);
+                tls_server_close(i);   /* no-op unless this conn had a session */
                 tcp_close(i);
                 hc->in_use = 0;
+                hc->tls = 0;
                 tcp_conn_release(i);   // Network Fairness Phase 2 -- safe no-op if never attributed
                 hc->attributed = 0;
                 continue;
@@ -6224,8 +6375,10 @@ void http_server_run(void) {
 
             if (kernel_tick_counter - hc->last_activity_tick > HTTP_IDLE_TIMEOUT_TICKS) {
                 did_work = 1;
+                tls_server_close(i);   /* no-op unless this conn had a session */
                 tcp_close(i);
                 hc->in_use = 0;
+                hc->tls = 0;
                 tcp_conn_release(i);   // Network Fairness Phase 2 -- safe no-op if never attributed
                 hc->attributed = 0;
             }

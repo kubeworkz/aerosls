@@ -128,6 +128,19 @@ extern MACAddr  net_my_mac;
 
 #define NET_HTTP_PORT  KERNEL_HTTP_PORT
 
+/* The TLS listener. A separate port from NET_HTTP_PORT during Phase 3
+ * bring-up: the plaintext path is how the certificate gets off the node to be
+ * read by openssl, and how the node stays reachable when the handshake is the
+ * broken thing. The design doc's §7 says server-side TLS goes "on the HTTP
+ * port" -- that is still the destination, and it is a one-line change here
+ * once a browser has completed a handshake. Doing it before that would mean
+ * debugging a record layer with no way in.
+ *
+ * 8443 rather than 443: nothing in this kernel runs privileged-port checks,
+ * but 443 invites a browser to assume the plaintext port is a redirect target
+ * and 8443 does not. */
+#define NET_HTTPS_PORT 8443
+
 // ─── Syscalls ─────────────────────────────────────────────────────────────────
 // Navigator-Parity Gap Roadmap Phase 5c: this networking subsystem never had
 // a syscall surface of its own before -- everything reachable today goes
