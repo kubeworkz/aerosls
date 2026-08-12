@@ -381,7 +381,14 @@ TARGET_OBJS = tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o \
 # invalidated through the same function a TCG-translated INVLPG will call.
 # The define gates that routing in sls-launcher.c; the default build does not
 # link the helper layer and keeps its direct call.
-TCG_CFLAGS += -DSLS_X86_FRONTEND=1
+#
+# Step 6.3: TARGET_X86_64 and CONFIG_SYSTEM_ONLY make the decoder the 64-bit
+# system-mode decoder it is upstream. Without TARGET_X86_64, translate.c's
+# REX/CODE64/LMA machinery is compiled out and CPU_NB_REGS drops to 8 -- the
+# decoder links and even runs, but as a 32-bit decoder that mis-decodes any
+# REX-prefixed instruction. CONFIG_SYSTEM_ONLY gates gen_HLT() (emit.c.inc:
+# 2054) -- without it, HLT translates to nothing and falls through.
+TCG_CFLAGS += -DSLS_X86_FRONTEND=1 -DTARGET_X86_64 -DCONFIG_SYSTEM_ONLY
 else ifneq ($(SLS_X86_FRONTEND),off)
 $(error SLS_X86_FRONTEND must be 'on' or 'off', got '$(SLS_X86_FRONTEND)')
 endif
@@ -414,7 +421,7 @@ tcg-objs/i386-translate.x86.o: ../qemu/target/i386/tcg/translate.c $(AB_STAMP) $
 # VPATH would resolve it. Uniformity within this group is worth one line: the
 # neighbouring translate.c has 20+ namesakes, and a reader comparing the two
 # rules should not have to work out why one is safe and the other is not.
-tcg-objs/translator.x86.o: ../qemu/accel/tcg/translator.c $(AB_STAMP)
+tcg-objs/translator.x86.o: ../qemu/accel/tcg/translator.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
 
