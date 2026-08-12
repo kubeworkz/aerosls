@@ -84,7 +84,14 @@ echo
 
 grep -q 'Signature Algorithm: ecdsa-with-SHA256' <<<"$TXT" && ok "signed ecdsa-with-SHA256" || bad "wrong signature algorithm"
 grep -q 'NIST CURVE: P-256'                      <<<"$TXT" && ok "P-256 public key"          || bad "wrong curve"
-grep -q 'CA:FALSE'                               <<<"$TXT" && ok "basicConstraints CA:FALSE" || bad "CA flag wrong"
+# CA:TRUE with pathlen 0. Not because this is really a certificate authority,
+# but because Windows will not file a non-CA certificate as a trusted root --
+# it went to Intermediate Certification Authorities instead, and Chrome
+# reported ERR_CERT_AUTHORITY_INVALID because an intermediate is not an
+# anchor. pathlen 0 keeps it from signing further CAs. §4's private CA is what
+# removes the compromise properly.
+grep -q 'CA:TRUE'                               <<<"$TXT" && ok "basicConstraints CA:TRUE (needed to be a trusted root)" || bad "CA flag wrong"
+grep -q 'pathlen:0'                             <<<"$TXT" && ok "pathlen 0 -- it may sign leaves, not further CAs" || bad "pathlen not 0"
 grep -q 'X509v3 Subject Key Identifier'          <<<"$TXT" && ok "subject key identifier present" || bad "no SKI"
 
 # ─── validity: the backdate is only visible from outside ───────────────────

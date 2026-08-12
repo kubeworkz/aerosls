@@ -309,11 +309,29 @@ int tls_cert_self_signed(const char *dn,
 
     TRY("set_validity", mbedtls_x509write_crt_set_validity(&crt, nb, na));
     TRY("set_serial_raw", mbedtls_x509write_crt_set_serial_raw(&crt, serial, sizeof serial));
-    /* CA:FALSE. This is a leaf that happens to be its own issuer, not a CA.
-     * Browsers and curl --cacert both accept a self-signed leaf as its own
-     * trust anchor; asserting CA:TRUE would additionally claim it may sign
-     * others, which is not true and not needed. */
-    TRY("set_basic_constraints", mbedtls_x509write_crt_set_basic_constraints(&crt, 0, -1));
+    /* ─── CA:TRUE, and it is a trade rather than a flag ───────────────────
+     * This started as CA:FALSE, on the reasoning that a leaf which happens to
+     * be its own issuer is not a certificate authority. curl --cacert agreed
+     * and verified it happily.
+     *
+     * Windows did not. Importing it put "AeroSLS node" into Intermediate
+     * Certification Authorities rather than Trusted Root, because the import
+     * wizard classifies by certificate type and a certificate that does not
+     * assert CA:TRUE is not a root. An intermediate is not a trust anchor, so
+     * Chrome walked the chain, found nothing trusted at the end of it, and
+     * reported ERR_CERT_AUTHORITY_INVALID -- correctly.
+     *
+     * What this costs, stated rather than discovered later: a certificate
+     * that both serves traffic and asserts CA:TRUE can, if its key leaks,
+     * mint certificates for any name a client trusts it for. pathlen 0 limits
+     * it to signing leaves, not further CAs, which narrows the blast radius
+     * without removing it.
+     *
+     * This is a Phase 3 expedient with a stated expiry. §4's private CA
+     * removes it properly, by making the trust anchor a separate key that
+     * never serves traffic -- which is the actual answer, and is why the
+     * roadmap has that phase at all. */
+    TRY("set_basic_constraints", mbedtls_x509write_crt_set_basic_constraints(&crt, 1, 0));
     TRY("set_subject_key_identifier", mbedtls_x509write_crt_set_subject_key_identifier(&crt));
 
     /* SubjectAltName. Read out of library/x509write.c rather than from the
