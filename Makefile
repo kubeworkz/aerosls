@@ -192,7 +192,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/row_constraint.c \
               kernel/row_journal.c \
               kernel/vecstore.c \
-              kernel/vec_index.c kernel/sha256.c kernel/entropy.c kernel/rtc.c kernel/tls_platform.c kernel/tls_cert.c \
+              kernel/vec_index.c kernel/sha256.c kernel/entropy.c kernel/rtc.c kernel/tls_platform.c kernel/tls_cert.c kernel/tls_server.c \
               kernel/vec_join.c \
               kernel/agent.c \
               kernel/agent_tools.c \
@@ -397,6 +397,10 @@ kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 # was built and its image-end measured through `make`, not by hand.
 kernel/tls_cert.x86.o: kernel/tls_cert.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@
+
+# Third and last of the mbedTLS-facing kernel files: the listener needs ssl.h.
+kernel/tls_server.x86.o: kernel/tls_server.c $(AB_STAMP)
+	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -I net -c $< -o $@
 
 # ── The mbedTLS objects the kernel actually links ──────────────────────────
 # THREE files, not all 107, because three is the measured closure of what
