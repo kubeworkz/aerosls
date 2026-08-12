@@ -39,7 +39,7 @@ bad() { echo "FAIL: $1"; fail=$((fail+1)); }
 note(){ echo "      $1"; }
 
 usage() {
-    echo "usage: $0 --tls HOST:PORT [--plain HOST:PORT] [--path /] [--out FILE]"
+    echo "usage: $0 --tls HOST:PORT [--plain HOST:PORT] [--path /] [--out FILE] [--save-ca FILE]"
     echo "       $0 --compare FILE_A FILE_B"
     exit 2
 }
@@ -124,13 +124,14 @@ if [ "${1:-}" = "--compare" ]; then
 fi
 
 # ─── capture mode ──────────────────────────────────────────────────────────
-TLS=""; PLAIN=""; OUT=""; PATH_="/"
+TLS=""; PLAIN=""; OUT=""; PATH_="/"; SAVECA=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --tls)   TLS="${2:-}"; shift 2 ;;
         --plain) PLAIN="${2:-}"; shift 2 ;;
         --out)   OUT="${2:-}"; shift 2 ;;
         --path)  PATH_="${2:-}"; shift 2 ;;
+        --save-ca) SAVECA="${2:-}"; shift 2 ;;
         *) usage ;;
     esac
 done
@@ -295,6 +296,21 @@ if [ -n "$PLAIN" ]; then
               | tr ',{}' '\n\n\n' | awk -F': *' '/"uptime_ticks"/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
     [ -n "$UPTIME" ] && note "uptime  : $UPTIME ticks" \
                      || note "uptime  : <unavailable -- --compare cannot confirm a reboot>"
+fi
+
+# The CA is what goes into a trust store, and it changes on every boot until
+# the key and certificate persist. Extracting it by hand means an awk
+# incantation over -showcerts output every single time, and picking the wrong
+# certificate out of that is exactly the mistake that has already cost two
+# rounds here -- importing the leaf achieves nothing.
+if [ -n "$SAVECA" ]; then
+    if [ "$NCERTS" -ge 2 ]; then
+        cp "$WORK/ca.pem" "$SAVECA"
+        note "CA written to $SAVECA -- import THIS, not the leaf"
+    else
+        bad "refusing to write $SAVECA: the peer sent one certificate, so there
+        is no CA to save"
+    fi
 fi
 
 if [ -n "$OUT" ]; then
