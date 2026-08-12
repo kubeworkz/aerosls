@@ -364,6 +364,46 @@ mistake on the way (the expected constant dropped the CF bit — the helper
 was right, the fixture was wrong) was caught by the failing read-back, not by
 a guest hang.
 
+**Iteration 5 (2026-08-12): `lahf`/`sahf` — no new helper, but the first
+structural bug of the integration: the CPUState/CPUArchState alignment gap.**
+LAHF/SAHF are INLINE TCG in this QEMU (gen_LAHF/gen_SAHF in emit.c.inc) —
+there is no `helper_lahf`/`helper_sahf` — but two real gates surface: in
+64-bit mode both decode is gated on CPUID_EXT3_LAHF_LM (else gen_illegal_opcode
+→ #UD), and SAHF must leave the flags readable as EFLAGS. The launcher's
+"conservative feature set" never seeded FEAT_8000_0001_ECX, so the first run
+#UD'd at the very first sahf (guest eip 0x1a4) even after the boot state was
+fixed — the diagnostic that named the fault (a temporary print in
+helper_raise_exception) showed `feats[ECX]=0x1` at execute time but
+`ext3=0x0` at translate time, and the launcher's own X-DIAG prints finally
+pinned the cause: **env_ptr itself was corrupted by a TCG-generated store.**
+`sizeof(CPUState)` is 0x10888, CPUArchState is 16-byte aligned, so in
+SLSX86CPU the env landed at cpu+0x10890 — an 8-byte gap — and every
+negative-offset field access from env computed its address 8 bytes too far:
+the `can_do_io` byte store (`offsetof` 0x10870, emitted as env-0x18) wrote
+0x01 into env_ptr. Iterations 1–4 never noticed because a broken env_ptr only
+matters when a later translation reads feature bits through it; iteration 5's
+sahf is the first feature-gated instruction. The fix is a contract the
+launcher's comment already stated but nothing enforced: `CPUState` now pads
+itself to a 16-byte multiple (sls/include/hw/core/cpu.h), so env sits exactly
+at cpu+sizeof(CPUState).
+
+Second, `gen_SAHF` in this tree's emit.c.inc never set cc_op — after the
+preceding ALU op the next jcc/lahf computed flags from the stale cc_dst
+instead of the sahf-written cc_src — so `set_cc_op(CC_OP_EFLAGS)` was added,
+matching gen_POPF and upstream. Third, the guest test itself was wrong twice:
+the asm loaded `mov $0x40` into **AL** (AH was 0 everywhere, so every sahf
+wrote ZF=CF=0 and the fixture's real jcc semantics were never exercised), and
+the regenerated guest-bytes.h never actually contained the new binary (a
+regen that produced a stale, differently-compiled 71-byte guest — caught by
+reading the "launching guest: N bytes" line and fixed by regenerating from
+the verified guest.bin). Result: 460 instructions to HLT,
+`ahf=0x4047010101` bit-for-bit the C expectation (jz taken after AH=0x40,
+jz skipped after AH=0, jc taken after AH=0x01, lahf read-back of AH=0x45 is
+0x47 with bit 1 forced, pushfq reads the sahf'd ZF back), every prior check
+intact (movsb, stos, cmps ECX/ZF, popf, DF-set backward copy, 62 tcache
+hits), and `invl`/`paging`/`selfmod` still pass with the bench running. All
+diagnostics removed before commit.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
