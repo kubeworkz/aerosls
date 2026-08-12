@@ -109,7 +109,16 @@ const unsigned char *tls_server_ca_der(size_t *len);
  * peak usage. TLS_SERVER_MAX_SESSIONS above says to raise it only against
  * measured pool high-water; this is that measurement. Any argument may be
  * NULL. */
-void tls_server_stats(unsigned long *refused, unsigned *live_peak,
+/* `live_peak` is the high-water mark since boot; `live` is how many slots are
+ * occupied RIGHT NOW. Both, because they answer different questions and the
+ * peak alone cannot answer either. A node reporting peak=6 with a stream of
+ * refusals is EITHER saturated this second OR leaked its slots an hour ago,
+ * and those need opposite responses -- wait, versus find the leak. Reading a
+ * peak and inferring the present is the same mistake as counting refusals with
+ * no denominator, which is what TLS_SERVER_MAX_SESSIONS above was raised to
+ * fix. Peak said 6 and refusals said 1295 on a node whose slots were merely
+ * busy; nothing in that pair distinguished it from a leak. */
+void tls_server_stats(unsigned long *refused, unsigned *live_peak, unsigned *live,
                       size_t *pool_bytes, size_t *pool_peak, size_t *pool_blocks);
 
 #endif /* SLS_TLS_SERVER_H */

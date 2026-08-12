@@ -448,15 +448,16 @@ void tls_server_close(int conn_id)
  * refused is the demand the cap turned away. Both are needed: refusals alone
  * cannot distinguish a cap one too low from one ten too low, and they inflate
  * themselves, because every refusal makes a browser retry. */
-void tls_server_stats(unsigned long *refused, unsigned *live_peak,
+void tls_server_stats(unsigned long *refused, unsigned *live_peak, unsigned *live,
                       size_t *pool_bytes, size_t *pool_peak, size_t *pool_blocks);
-void tls_server_stats(unsigned long *refused, unsigned *live_peak,
+void tls_server_stats(unsigned long *refused, unsigned *live_peak, unsigned *live,
                       size_t *pool_bytes, size_t *pool_peak, size_t *pool_blocks)
 {
     size_t used = 0, blocks = 0;
     sls_tls_pool_high_water(&used, &blocks);
     if (refused)     { *refused = g_refused; }
     if (live_peak)   { *live_peak = g_live_peak; }
+    if (live)        { *live = g_live; }
     if (pool_bytes)  { *pool_bytes = sls_tls_pool_bytes(); }
     if (pool_peak)   { *pool_peak = used; }
     if (pool_blocks) { *pool_blocks = blocks; }

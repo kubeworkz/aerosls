@@ -286,10 +286,11 @@ static int api_health(char* body, int max) {
      * -- has to be readable from whatever machine is driving the browsers,
      * and /api/health is already the endpoint that answers without a token. */
     {
-        unsigned long tls_refused = 0; unsigned tls_peak = 0;
+        unsigned long tls_refused = 0; unsigned tls_peak = 0, tls_live = 0;
         size_t pool_bytes = 0, pool_peak = 0, pool_blocks = 0;
-        tls_server_stats(&tls_refused, &tls_peak, &pool_bytes, &pool_peak, &pool_blocks);
+        tls_server_stats(&tls_refused, &tls_peak, &tls_live, &pool_bytes, &pool_peak, &pool_blocks);
         jb_uint(&j, "tls_sessions_max", (uint64_t)TLS_SERVER_MAX_SESSIONS); jb_putc(&j, ',');
+        jb_uint(&j, "tls_sessions_live", (uint64_t)tls_live);               jb_putc(&j, ',');
         jb_uint(&j, "tls_sessions_peak", (uint64_t)tls_peak);               jb_putc(&j, ',');
         jb_uint(&j, "tls_refused", (uint64_t)tls_refused);                  jb_putc(&j, ',');
         jb_uint(&j, "tls_pool_bytes", (uint64_t)pool_bytes);                jb_putc(&j, ',');
@@ -6315,6 +6316,14 @@ void http_server_run(void) {
                     tcp_close(i);
                     http_conns[i].in_use = 0;
                     http_conns[i].tls = 0;
+                    /* Currently a no-op -- attributed was set to 0 at pickup a
+                     * few lines above and release is documented safe in that
+                     * state. Called anyway, because this was the ONE teardown
+                     * of five that did not, and an asymmetry that is harmless
+                     * only because of a fact established elsewhere is a bug
+                     * waiting for that fact to change. */
+                    tcp_conn_release(i);
+                    http_conns[i].attributed = 0;
                 }
             }
         }
