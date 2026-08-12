@@ -242,16 +242,18 @@ int tls_cert_last_mbedtls_ret(void) { return g_ret; }
     if (r_ != 0) { g_step = (name); g_ret = r_; goto done; } \
 } while (0)
 
-int tls_cert_self_signed(const char *dn, const char *dns,
-                         const unsigned char *ip4,
+int tls_cert_self_signed(const char *dn,
+                         const struct tls_cert_san *sans, size_t san_count,
                          uint64_t lifetime_seconds,
                          unsigned char *crt_der, size_t crt_size, size_t *crt_len,
                          unsigned char *key_der, size_t key_size, size_t *key_len)
 {
     mbedtls_pk_context key;
     mbedtls_x509write_cert crt;
-    mbedtls_x509_san_list san_dns, san_ip;
-    mbedtls_x509_san_list *san_head = NULL;
+    /* The nodes must outlive the set_subject_alternative_name() call, which
+     * walks the list, so they are locals of this function and not of the loop
+     * that fills them. */
+    mbedtls_x509_san_list san_node[TLS_CERT_MAX_SANS];
     unsigned char serial[TLS_CERT_SERIAL_LEN];
     char nb[TLS_CERT_TIME_BUF], na[TLS_CERT_TIME_BUF];
     int rc = TLS_CERT_E_MBEDTLS;
@@ -263,7 +265,7 @@ int tls_cert_self_signed(const char *dn, const char *dns,
     /* Chrome 58 removed commonName matching entirely. A certificate whose
      * identity lives only in the CN is not "less good"; it is rejected, and
      * the failure looks like a TLS bug. Refuse to build one. */
-    if (!dns && !ip4) {
+    if (!sans || san_count == 0 || san_count > TLS_CERT_MAX_SANS) {
         return TLS_CERT_E_BADARG;
     }
     /* "node1" is not a DN. Catch it here rather than inside mbedTLS's name
@@ -319,26 +321,32 @@ int tls_cert_self_signed(const char *dn, const char *dns,
      * are supported -- that comment describes the PARSE side and is wrong for
      * writing. mbedtls_x509_write_set_san_common() handles IP_ADDRESS, taking
      * the bytes from san.unstructured_name and writing them raw under the
-     * context tag. So ip4 is FOUR BYTES; a dotted-quad string here would
+     * context tag. So an IP entry is FOUR BYTES; a dotted-quad string would
      * encode the ASCII text under the iPAddress tag and every verifier would
      * reject it. */
-    if (dns) {
-        san_dns.node.type = MBEDTLS_X509_SAN_DNS_NAME;
-        san_dns.node.san.unstructured_name.tag = MBEDTLS_ASN1_IA5_STRING;
-        san_dns.node.san.unstructured_name.p = (unsigned char *)(uintptr_t)dns;
-        san_dns.node.san.unstructured_name.len = strlen(dns);
-        san_dns.next = NULL;
-        san_head = &san_dns;
+    for (size_t i = 0; i < san_count; i++) {
+        mbedtls_x509_san_list *n = &san_node[i];
+        if (sans[i].dns) {
+            n->node.type = MBEDTLS_X509_SAN_DNS_NAME;
+            n->node.san.unstructured_name.tag = MBEDTLS_ASN1_IA5_STRING;
+            n->node.san.unstructured_name.p   = (unsigned char *)(uintptr_t)sans[i].dns;
+            n->node.san.unstructured_name.len = strlen(sans[i].dns);
+            /* An empty dNSName encodes as a zero-length name, which is not a
+             * name and which some verifiers treat as matching nothing and
+             * others as malformed. Refuse rather than find out which. */
+            if (n->node.san.unstructured_name.len == 0) {
+                rc = TLS_CERT_E_BADARG;
+                goto done;
+            }
+        } else {
+            n->node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+            n->node.san.unstructured_name.tag = MBEDTLS_ASN1_OCTET_STRING;
+            n->node.san.unstructured_name.p   = (unsigned char *)(uintptr_t)sans[i].ip4;
+            n->node.san.unstructured_name.len = 4;
+        }
+        n->next = (i + 1 < san_count) ? &san_node[i + 1] : NULL;
     }
-    if (ip4) {
-        san_ip.node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
-        san_ip.node.san.unstructured_name.tag = MBEDTLS_ASN1_OCTET_STRING;
-        san_ip.node.san.unstructured_name.p = (unsigned char *)(uintptr_t)ip4;
-        san_ip.node.san.unstructured_name.len = 4;
-        san_ip.next = NULL;
-        if (san_head) { san_dns.next = &san_ip; } else { san_head = &san_ip; }
-    }
-    TRY("set_subject_alternative_name", mbedtls_x509write_crt_set_subject_alternative_name(&crt, san_head));
+    TRY("set_subject_alternative_name", mbedtls_x509write_crt_set_subject_alternative_name(&crt, &san_node[0]));
 
     /* Signing needs randomness too: ECDSA draws a per-signature nonce, and a
      * reused or predictable one recovers the private key outright. Same RNG,

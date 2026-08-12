@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "tls_cert.h"   /* struct tls_cert_san */
+
 #define TLS_SRV_OK             0
 #define TLS_SRV_HANDSHAKING    1   /* not an error: call again next poll */
 #define TLS_SRV_E_NOT_READY  (-1)  /* tls_server_init() has not succeeded */
@@ -42,7 +44,8 @@
  * Safe to call more than once; the second call is a no-op. Returns TLS_SRV_OK
  * or negative -- and on failure TLS must not start, which is §2.4's
  * fail-closed rule reaching its last consumer. */
-int tls_server_init(const char *dn, const char *dns, const unsigned char *ip4);
+int tls_server_init(const char *dn,
+                    const struct tls_cert_san *sans, size_t san_count);
 
 /* Non-zero once init has succeeded. */
 int tls_server_ready(void);

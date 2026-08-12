@@ -6203,8 +6203,21 @@ void http_server_run(void) {
     int tls_listen_fd = -1;
     uint16_t tls_port = 0;
     {
-        static const unsigned char node_ip[4] = { 10, 0, 2, 15 };
-        if (tls_server_init("CN=AeroSLS node,O=AeroSLS", 0, node_ip) == TLS_SRV_OK) {
+        /* Every name a client might actually use, because a verifier checks
+         * the name the CLIENT typed, not the one this node thinks it has.
+         * 10.0.2.15 is slirp's guest address -- correct from inside QEMU and
+         * useless from outside it. Reaching a node from the host goes through
+         * run-cluster.sh's port forward, so the name on the wire is localhost
+         * or 127.0.0.1, and a certificate without those fails every verifier
+         * that actually checks. The first live handshake had only the guest
+         * address and passed solely because curl -k skips verification. */
+        static const struct tls_cert_san node_sans[] = {
+            { "localhost",  { 0, 0, 0, 0 } },
+            { 0,            { 127, 0, 0, 1 } },
+            { 0,            { 10, 0, 2, 15 } },
+        };
+        if (tls_server_init("CN=AeroSLS node,O=AeroSLS", node_sans,
+                            sizeof node_sans / sizeof node_sans[0]) == TLS_SRV_OK) {
             tls_listen_fd = tcp_listen(NET_HTTPS_PORT);
             if (tls_listen_fd < 0) {
                 kernel_serial_print("[TLS] could not bind the TLS port.\n");

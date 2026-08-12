@@ -102,13 +102,49 @@ grep -q 'Not After : Nov 10 00:00:00 2026 GMT' <<<"$TXT" \
 # Chrome has ignored commonName since Chrome 58. Text alone is not enough: an
 # IP written as a dotted STRING would still print as something, so check the
 # DER tag. [7] with four raw bytes is an iPAddress; anything else is not.
-grep -q 'DNS:node1.aerosls.local'  <<<"$TXT" && ok "SAN carries the dNSName"   || bad "no dNSName in SAN"
-grep -q 'IP Address:10.0.2.15'     <<<"$TXT" && ok "SAN carries the IP address" || bad "no iPAddress in SAN"
-python3 - "$CRT" <<'PY' && ok "the IP is context tag [7] with four RAW bytes, not a dotted string" || bad "iPAddress is not encoded as [7] + 4 bytes"
+# Three names, because a verifier checks the one the CLIENT used. A node is
+# reached as localhost through run-cluster.sh's port forward; 10.0.2.15 is
+# slirp's guest address and is only meaningful inside QEMU. The first live
+# handshake shipped with the guest address alone and passed only because
+# curl -k skips verification.
+grep -q 'DNS:localhost'        <<<"$TXT" && ok "SAN carries DNS:localhost"      || bad "no DNS:localhost in SAN"
+grep -q 'IP Address:127.0.0.1' <<<"$TXT" && ok "SAN carries IP Address:127.0.0.1" || bad "no loopback IP in SAN"
+grep -q 'IP Address:10.0.2.15' <<<"$TXT" && ok "SAN carries the slirp guest address" || bad "no guest IP in SAN"
+python3 - "$CRT" <<'PY' && ok "both IPs are context tag [7] with four RAW bytes, not dotted strings" || bad "an iPAddress is not encoded as [7] + 4 bytes"
 import sys
 d = open(sys.argv[1], 'rb').read()
-sys.exit(0 if d.find(bytes([0x87, 0x04, 10, 0, 2, 15])) >= 0 else 1)
+want = [bytes([0x87, 0x04, 127, 0, 0, 1]), bytes([0x87, 0x04, 10, 0, 2, 15])]
+sys.exit(0 if all(d.find(w) >= 0 for w in want) else 1)
 PY
+
+# ─── the name check a verifier actually performs ───────────────────────────
+# grep proves the string is in the certificate. It does not prove a verifier
+# accepts it -- and accepting the name the CLIENT used is the entire job of a
+# SAN. openssl -verify_hostname / -verify_ip run the real matcher, and the
+# negative cases are what make the positives mean anything: a test that only
+# ever asserts success cannot tell you it is capable of failing.
+openssl x509 -inform DER -in "$CRT" -out "$BUILD/crt.pem" 2>/dev/null
+name_ok=1
+for h in localhost; do
+    openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_hostname "$h" \
+        "$BUILD/crt.pem" >/dev/null 2>&1 || { name_ok=0; echo "      (rejected DNS $h)"; }
+done
+for a in 127.0.0.1 10.0.2.15; do
+    openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_ip "$a" \
+        "$BUILD/crt.pem" >/dev/null 2>&1 || { name_ok=0; echo "      (rejected IP $a)"; }
+done
+[ "$name_ok" = 1 ] && ok "a verifier accepts localhost, 127.0.0.1 and 10.0.2.15" \
+                   || bad "a verifier rejected a name this node is reached by"
+
+if openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_hostname evil.example \
+       "$BUILD/crt.pem" >/dev/null 2>&1; then
+    bad "a verifier accepted evil.example -- the name check is not being applied"
+elif openssl verify -CAfile "$BUILD/crt.pem" -partial_chain -verify_ip 8.8.8.8 \
+         "$BUILD/crt.pem" >/dev/null 2>&1; then
+    bad "a verifier accepted 8.8.8.8 -- the name check is not being applied"
+else
+    ok "and rejects a name that is not in the SAN (so the check above can fail)"
+fi
 
 # ─── the serial ────────────────────────────────────────────────────────────
 # mbedTLS prepends 0x00 when the top bit is set, silently making 21 octets --
@@ -145,6 +181,10 @@ b="$(openssl x509 -inform DER -in "$CRT" -pubkey -noout 2>/dev/null | openssl pk
 #
 # tests/tls_cert_host_test.c covers that specifically, and its mutation run
 # catches it. Do not read a green line here as covering the serial path.
+# Regenerate afterwards: the fail-closed case below deletes the certificate on
+# purpose, and leaving the run with no artefact means the first thing anyone
+# does after a green run -- look at what it actually produced -- fails.
+cp "$CRT" "$BUILD/crt.last.der" 2>/dev/null
 rm -f "$CRT"
 if "$BUILD/oracle" --no-entropy --crt "$CRT" --key "$KEY" >/dev/null 2>&1; then
     bad "generation SUCCEEDED with entropy refusing"
@@ -154,6 +194,10 @@ else
     ok "entropy refusing means no certificate, and nothing written"
 fi
 
+mv -f "$BUILD/crt.last.der" "$CRT" 2>/dev/null
+
 echo
+echo "      certificate left at $CRT for inspection:"
+echo "        openssl x509 -inform DER -in $CRT -noout -text"
 echo "---- passed=$pass failed=$fail"
 [ "$fail" -eq 0 ] || exit 1

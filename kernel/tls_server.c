@@ -83,7 +83,8 @@ const unsigned char *tls_server_cert_der(size_t *len)
     return g_crt_der;
 }
 
-int tls_server_init(const char *dn, const char *dns, const unsigned char *ip4)
+int tls_server_init(const char *dn,
+                    const struct tls_cert_san *sans, size_t san_count)
 {
     unsigned char key_der[512];
     size_t key_len = 0;
@@ -102,7 +103,7 @@ int tls_server_init(const char *dn, const char *dns, const unsigned char *ip4)
         return TLS_SRV_E_NOT_READY;
     }
 
-    rc = tls_cert_self_signed(dn, dns, ip4,
+    rc = tls_cert_self_signed(dn, sans, san_count,
                               90ULL * 24ULL * 60ULL * 60ULL,
                               g_crt_der, sizeof g_crt_der, &g_crt_der_len,
                               key_der, sizeof key_der, &key_len);
@@ -143,6 +144,17 @@ int tls_server_init(const char *dn, const char *dns, const unsigned char *ip4)
      * it does not have. */
     mbedtls_ssl_conf_authmode(&g_conf, MBEDTLS_SSL_VERIFY_NONE);
     if (mbedtls_ssl_conf_own_cert(&g_conf, &g_crt, &g_key) != 0) {
+        goto fail;
+    }
+    /* Advertise http/1.1 explicitly. curl offered h2 and http/1.1 on the first
+     * live handshake and got "server did not agree on a protocol" -- harmless
+     * for HTTP/1.1, but it leaves the client to guess, and a client that
+     * guesses h2 against a server that only speaks HTTP/1.1 fails in a way
+     * that looks like a TLS problem. This kernel has no HTTP/2, so say so.
+     *
+     * The array must outlive the config: mbedTLS stores the pointer. */
+    static const char *const alpn[] = { "http/1.1", 0 };
+    if (mbedtls_ssl_conf_alpn_protocols(&g_conf, (const char **)alpn) != 0) {
         goto fail;
     }
 

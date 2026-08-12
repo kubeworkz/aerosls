@@ -63,6 +63,25 @@ int tls_cert_validity_window(uint64_t lifetime_seconds,
 #define TLS_CERT_E_MBEDTLS    (-5)  /* an mbedTLS call failed; see the log */
 int tls_cert_make_serial(unsigned char *out, size_t len);
 
+/* ─── Subject alternative names ────────────────────────────────────────────
+ * One entry per name the certificate should be valid for. `dns` non-NULL
+ * makes it a dNSName; `dns == NULL` makes it an iPAddress from `ip4`.
+ *
+ * A list rather than one of each, because a node is reached by more than one
+ * name and a verifier checks the name the CLIENT used, not the one the node
+ * believes it has. The first live handshake made that concrete: the
+ * certificate carried only IP Address:10.0.2.15 -- slirp's guest address --
+ * while every client reaches the node as localhost through a QEMU port
+ * forward. `curl -k` did not care, because -k skips verification entirely.
+ * `curl --cacert` and both browsers would have rejected it, with an error
+ * that reads as a certificate fault and is really an addressing one. */
+#define TLS_CERT_MAX_SANS 8
+
+struct tls_cert_san {
+    const char   *dns;        /* dNSName, or NULL for an iPAddress entry */
+    unsigned char ip4[4];     /* used only when dns == NULL */
+};
+
 /* Generate an EC P-256 key and a self-signed certificate over it.
  *
  * `dn` is a full distinguished name in mbedTLS's string form -- "CN=node1" or
@@ -70,11 +89,11 @@ int tls_cert_make_serial(unsigned char *out, size_t len);
  * subject_name() parses it with mbedtls_x509_string_to_names(), which needs
  * the attribute prefix; a bare "node1" fails deep inside that parser and
  * surfaces as an opaque error. This function rejects a `dn` with no '=' at
- * the boundary instead, where the message can say which argument was wrong. At least one of `dns` and `ip4` must
- * be given: Chrome has ignored commonName since Chrome 58, so a certificate
- * whose identity is only in the CN fails the Phase 3 gate outright. `ip4` is
- * FOUR RAW BYTES, not a dotted string -- mbedTLS writes the buffer verbatim
- * under the iPAddress tag.
+ * the boundary instead, where the message can say which argument was wrong.
+ *
+ * At least one SAN must be given and at most TLS_CERT_MAX_SANS: Chrome has
+ * ignored commonName since Chrome 58, so a certificate whose identity lives
+ * only in the CN fails the Phase 3 gate outright.
  *
  * Both outputs are DER. mbedTLS writes DER at the END of the buffer it is
  * given; this function moves it to the front, so crt_der[0..*crt_len) and
@@ -82,8 +101,8 @@ int tls_cert_make_serial(unsigned char *out, size_t len);
  *
  * The key DER is private key material. It must not be logged, and §6.1's
  * checkpoint question applies to wherever the caller puts it. */
-int tls_cert_self_signed(const char *dn, const char *dns,
-                         const unsigned char *ip4,
+int tls_cert_self_signed(const char *dn,
+                         const struct tls_cert_san *sans, size_t san_count,
                          uint64_t lifetime_seconds,
                          unsigned char *crt_der, size_t crt_size, size_t *crt_len,
                          unsigned char *key_der, size_t key_size, size_t *key_len);

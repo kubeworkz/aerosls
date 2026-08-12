@@ -62,7 +62,13 @@ int main(int argc, char **argv)
 {
     unsigned char crt[4096], key[2048];
     size_t crt_len = 0, key_len = 0;
-    const unsigned char ip4[4] = { 10, 0, 2, 15 };
+    /* The same set net/http.c installs, so this smoke judges the certificate
+     * a node actually presents rather than a simpler one made for the test. */
+    static const struct tls_cert_san sans[] = {
+        { "localhost",  { 0, 0, 0, 0 } },
+        { 0,            { 127, 0, 0, 1 } },
+        { 0,            { 10, 0, 2, 15 } },
+    };
     const char *crt_path = NULL, *key_path = NULL;
     int rc;
 
@@ -85,7 +91,7 @@ int main(int argc, char **argv)
     }
 
     rc = tls_cert_self_signed("CN=AeroSLS node 1,O=AeroSLS",
-                              "node1.aerosls.local", ip4,
+                              sans, sizeof sans / sizeof sans[0],
                               90ULL * 24 * 60 * 60,
                               crt, sizeof crt, &crt_len,
                               key, sizeof key, &key_len);
