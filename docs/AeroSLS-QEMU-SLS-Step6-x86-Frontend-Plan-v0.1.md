@@ -307,6 +307,19 @@ implement, re-run — **16 instructions to HLT, result matches C, all other
 fixtures still pass.** The next halt is whichever helper the next guest
 crosses; growing the guest is what finds the next one.
 
+**Iteration 2 (2026-08-12): `rep movsb` + a counted backward-branch loop —
+no new helper needed, one launcher defect found.** REP string ops and the
+loop are both inline TCG here (`do_gen_rep`, translate.c), so the run passed
+without implementing anything — 353 instructions to HLT, the 64-iteration
+loop re-entering through the tcache (62 hits), and the result matching C.
+The run did surface a real launcher bug: the boot state zeroed `env->df`,
+but the decoder stores it as +1/−1 (`tcg-cpu.c`'s `1 - 2*((eflags>>10)&1)`),
+so `dshift = df << ot` was 0 and every `rep movsb` byte landed at the same
+address (`copied` read back as 0x88, the low byte only). The launcher now
+sets `df = 1` (forward) at boot, matching EFLAGS.DF=0 on a fresh machine.
+This is the first guest with control flow and the first string op under the
+decoder, and both held up.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
