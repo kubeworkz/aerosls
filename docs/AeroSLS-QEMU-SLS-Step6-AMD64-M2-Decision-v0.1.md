@@ -61,6 +61,40 @@ executes guest code is the Step 6.3 translator-loop wiring itself — `MOV CR3`
 under the real decoder (`helper_write_crN`) is the next stub that must become
 real.
 
+**Update 2026-08-12: the Step 6.3 translator-loop wiring is LANDED** — the
+decoder executes guest code end to end, replacing the 18-opcode frontend. The
+launcher's exec loop calls `x86_translate_code` through `translator_loop()`
+(one file from `accel/tcg`, as the plan's 6.3 decision requires) under
+`SLS_X86_FRONTEND=on`; `SLSCPUState` becomes the real `CPUX86State`, with boot
+state (hflags, CRs, segment bases, CPUID feature bits incl. long mode) set so
+the decoder sees a 64-bit long-mode-capable machine. The first helpers the
+fixtures demand are real: `helper_write_crN` (CR0/CR3/CR4 with the same
+shadow-MMU semantics the C dispatcher owned) and `helper_hlt` (halt + return
+to the launcher loop). Build side: the `=on` build defines `TARGET_X86_64` +
+`CONFIG_SYSTEM_ONLY` (the decoder was previously compiled 32-bit-only), a
+`cpu-mmu-index.h` shim lets `translator_loop` resolve `mmu_index`, and the
+`translator.x86.o` rule gained the `$(SLS_STAMP)` dependency it was missing.
+
+One real defect was found and fixed during verification — and it is worth
+recording precisely because every surface around it was correct. The launcher
+stubbed glib's `g_once_init_enter` as a **global one-shot flag**: TCG lazily
+computes each `TCGHelperInfo`'s call layout on first use, keyed off that
+info's own `init` field, so exactly ONE helper (the first call ever emitted)
+was initialized and every later helper kept `nr_in == 0`. The generated code
+for the decoder's `INVLPG` therefore called `helper_flush_page` with **zero
+argument setup** — the helper received the prologue's leftover registers: `env`
+in rdi and the TB pointer in rsi (`0x7abb070`, page-masked to `0x7abb000`),
+not the guest's `EBX=0x400000`. The fix restores per-address once semantics
+(the guest is single-threaded, so a plain check-and-set suffices).
+
+**Gate results 2026-08-12 (WSL x86_64 toolchain, QEMU boot): PASS.** On the
+`SLS_X86_FRONTEND=on` build: `qemu invl` (the §3.2 gate), `qemu paging`, and
+`qemu selfmod` all `pass:true` — the serial log shows
+`helper_flush_page(0x400000): decoder INVLPG hook -> shadow invalidation`
+followed by the PTE drop, and the invl fixture's four stages read the values
+its tables currently say. The paging-off bench runs (`ok:true`, 64 loads, 2
+blocks, 907 code bytes). The default 18-opcode frontend still builds clean.
+
 ---
 
 ## 0. The three options, as posed
@@ -318,11 +352,11 @@ The code has moved past its own documentation, and this project's rule is that
 
 - Page-table reclaim walk at guest reset (pre-existing; recorded in the reset-defect
   doc — the paged subtree is stashed, not freed).
-- The decoder build is not wired into execution yet — the Step 6.3 translator-loop
-  wiring (launcher calls `x86_translate_code` instead of the 18-opcode frontend) is
-  the next milestone, and with it `MOV CR3` under the real decoder
-  (`helper_write_crN`). The M3 `flush_page` hook itself is LANDED (see §3.2 tier 1).
-- MMIO regions (SCOPE.h CATEGORY 9: no devices in scope).
+- The decoder build is wired into execution as of 2026-08-12 (Step 6.3
+  translator-loop wiring; see the update block above) — `helper_write_crN` and
+  `helper_hlt` are real, and the invl/paging/selfmod fixtures pass under the
+  decoder. Still deferred: the 765-helper long tail of Step 6.4 (SSE/AVX/x87),
+  MMIO regions (SCOPE.h CATEGORY 9: no devices in scope).
 
 ---
 

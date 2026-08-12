@@ -229,6 +229,22 @@ to emit the instruction-budget check into every block. A member that must exist
 *at the right offset*, in a struct generated code indexes into. It compiled
 everywhere else and would have failed exactly there.
 
+**LANDED 2026-08-12 — the loop runs the decoder, and the fixtures pass on
+hardware.** `sls-launcher.c`'s exec loop now calls `x86_translate_code`
+through `translator_loop()` under `SLS_X86_FRONTEND=on`, with `SLSCPUState`
+becoming the real `CPUX86State` and boot state (hflags, CRs, segments, CPUID
+incl. long mode) set so the decoder sees a 64-bit machine. The first helpers
+are real — `helper_write_crN` (CR0/CR3/CR4, shadow-MMU semantics) and
+`helper_hlt` — and `qemu invl`/`paging`/`selfmod` all pass on the decoder
+build with the paging-off bench running. The one real defect found in
+verification: the launcher's `g_once_init_enter` stub was a **global
+one-shot flag**, so TCG's lazy per-helper call-layout init ran for exactly one
+helper and every later helper (e.g. `flush_page`) emitted its calls with zero
+argument setup — the INVLPG helper received the prologue's leftover TB pointer
+instead of the guest address. Fixed to per-address once semantics (the guest
+is single-threaded). The next milestone is Step 6.4's helper long tail,
+ordered by what a running guest actually calls.
+
 **Step 6.4 — Implement helpers, measured by a real binary.** *In progress.*
 
 **First milestone reached 2026-08-05: every QEMU-side symbol resolves.** The
