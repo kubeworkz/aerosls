@@ -118,6 +118,46 @@ if [ "${1:-}" = "--compare" ]; then
     elif [ -n "$ka" ]; then
         ok "public keys differ between captures"
     fi
+
+    # ─── and the CA, which must NOT have changed ───────────────────────────
+    # Every check above wants the two captures to DIFFER. This one wants them
+    # identical, and the pair together is the whole assertion: a fresh leaf
+    # signed by a stable anchor. Either half alone is satisfied by a failure --
+    # "everything regenerated" passes the serial check, "nothing regenerated"
+    # passes this one -- so neither means anything without the other.
+    ca="$(awk -F': ' '/^ca_fingerprint_sha256: /{print $2}' "$A")"
+    cb="$(awk -F': ' '/^ca_fingerprint_sha256: /{print $2}' "$B")"
+    note "A CA    : ${ca:-<none>}"
+    note "B CA    : ${cb:-<none>}"
+    if [ -z "$ca" ] || [ "$ca" = "none" ] || [ -z "$cb" ] || [ "$cb" = "none" ]; then
+        note "one of the captures has no CA fingerprint -- it predates this field,
+        or the peer sent a single certificate. No verdict on persistence."
+    elif [ "$ca" = "$cb" ]; then
+        ok "the CA is IDENTICAL across captures -- an existing import still holds"
+    else
+        bad "*** THE CA CHANGED BETWEEN CAPTURES ***
+        A trust store entry made from capture A does not verify capture B.
+        This is the failure the CA store exists to prevent, and its symptom is
+        a browser that trusted this node before the reboot and does not after.
+        Check the node's serial log: 'CA loaded from disk' means it read one,
+        anything else names the reason it did not."
+    fi
+
+    # The node's own claim, checked against the fingerprints rather than
+    # instead of them. A node reporting tls_ca_stored=1 while its CA changed is
+    # a worse bug than either fact alone, because the health endpoint is what
+    # an operator would check.
+    sa="$(awk -F': ' '/^ca_stored: /{print $2}' "$B")"
+    if [ "$sa" = "1" ] && [ -n "$ca" ] && [ -n "$cb" ] && [ "$ca" != "$cb" ]; then
+        bad "capture B reports tls_ca_stored=1 while presenting a DIFFERENT CA
+        -- the node's own account of itself does not match what it served."
+    elif [ "$sa" = "0" ] && [ -n "$ca" ] && [ "$ca" = "$cb" ]; then
+        bad "capture B reports tls_ca_stored=0 while presenting the SAME CA
+        -- one of the two is wrong and both are load-bearing."
+    elif [ "$sa" = "1" ]; then
+        ok "  and capture B agrees it loaded that CA from disk"
+    fi
+
     echo; echo "---- passed=$pass failed=$fail"
     [ "$fail" -eq 0 ] || exit 1
     exit 0
@@ -209,6 +249,13 @@ PUBSHA="$(openssl x509 -in "$WORK/crt.pem" -pubkey -noout | openssl dgst -sha256
 BC="$(openssl x509 -in "$WORK/crt.pem" -noout -ext basicConstraints 2>/dev/null | tail -n +2 | tr -d ' ' | tr '\n' ' ')"
 KU="$(openssl x509 -in "$WORK/crt.pem" -noout -ext keyUsage 2>/dev/null | tail -n +2 | tr -d ' ' | tr '\n' ' ')"
 FP="$(openssl x509 -in "$WORK/crt.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
+# The CA's own fingerprint. Until the CA persisted, this changed every boot and
+# recording it would have said nothing. It is now the single most informative
+# field in the capture: across two boots the LEAF must change and the CA must
+# NOT, and no other pair of facts distinguishes "persistence works" from
+# "nothing is being regenerated" or "everything is".
+CAFP=""
+[ "$NCERTS" -ge 2 ] && CAFP="$(openssl x509 -in "$WORK/ca.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
 note "serial  : $SERIAL"
 note "subject : $SUBJ"
 note "validity: $NB  ->  $NA"
@@ -296,13 +343,25 @@ if [ -n "$PLAIN" ]; then
               | tr ',{}' '\n\n\n' | awk -F': *' '/"uptime_ticks"/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
     [ -n "$UPTIME" ] && note "uptime  : $UPTIME ticks" \
                      || note "uptime  : <unavailable -- --compare cannot confirm a reboot>"
+    # The node's own account of where its CA came from. Not trusted in place of
+    # the fingerprint comparison -- it is the node marking its own homework --
+    # but when the two disagree, that disagreement is the finding.
+    CASTORED="$(curl -sS --max-time 5 "http://$PLAIN/api/health" 2>/dev/null \
+                | tr ',{}' '\n\n\n' | awk -F': *' '/"tls_ca_stored"/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+    case "${CASTORED:-}" in
+        1) note "ca      : loaded from disk (tls_ca_stored=1)" ;;
+        0) note "ca      : generated this boot (tls_ca_stored=0) -- an earlier import is now stale" ;;
+        *) note "ca      : <this build does not report tls_ca_stored>" ;;
+    esac
 fi
 
-# The CA is what goes into a trust store, and it changes on every boot until
-# the key and certificate persist. Extracting it by hand means an awk
-# incantation over -showcerts output every single time, and picking the wrong
-# certificate out of that is exactly the mistake that has already cost two
-# rounds here -- importing the leaf achieves nothing.
+# The CA is what goes into a trust store. It used to change on every boot,
+# which is what made --save-ca necessary and what made importing it a chore;
+# since the CA persists it should be the SAME file every time, and --compare
+# now checks that rather than taking it on trust. Extracting it by hand means
+# an awk incantation over -showcerts output every single time, and picking the
+# wrong certificate out of that is exactly the mistake that has already cost
+# two rounds here -- importing the leaf achieves nothing.
 if [ -n "$SAVECA" ]; then
     if [ "$NCERTS" -ge 2 ]; then
         cp "$WORK/ca.pem" "$SAVECA"
@@ -331,6 +390,8 @@ if [ -n "$OUT" ]; then
         echo "fingerprint_sha256: $FP"
         echo "pubkey_sha256: $PUBSHA"
         echo "uptime_ticks: ${UPTIME:-unknown}"
+        echo "ca_fingerprint_sha256: ${CAFP:-none}"
+        echo "ca_stored: ${CASTORED:-unknown}"
         echo "captured_at: $(date -u +%s)"
         echo "body_sha256: ${TLSSHA:-none}"
     } > "$OUT"
