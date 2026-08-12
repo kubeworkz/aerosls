@@ -8,6 +8,9 @@ the amendment immediately below before reading §3.
 real toolchain**: `_kernel_image_end = 0x0df88000`, 223 MiB, of which mbedTLS
 is **512 KiB**. Trimming the module list is housekeeping, not urgent. See
 "Image-end measurement" at the foot of this document; the request is closed.
+**Phase 3's gate is two-thirds met** (2026-08-12): curl completes a verified
+handshake and Chrome serves the Navigator with no interstitial. Firefox is
+outstanding. See "Phase 3 gate result" at the foot.
 **Decided:** port **mbedTLS 3.6 LTS** (not BearSSL, not write-our-own); private
 CA with per-node certificates; first shippable version is server-side TLS
 **plus** mutual TLS between nodes.
@@ -1093,3 +1096,104 @@ of being green for the wrong reason. Capture evidence that is hard to fake:
 - **Two consecutive boots, and the serials must differ.** This costs nothing,
   runs in the same harness, and is the one line of the browser gate that would
   notice §0's failure mode.
+
+---
+
+## Phase 3 gate result, 2026-08-12: two of three
+
+**curl and Chrome both complete a handshake and fetch the Navigator. Firefox
+is outstanding.** The listener is `net/http.c` driving `kernel/tls_server.c`
+over the BIO bridge, on port 8443 (a separate port from 3000 — see below).
+
+### What each client actually verified, which is not the same thing
+
+| | Proved | Did not |
+|---|---|---|
+| `curl -k` | record layer, key exchange, an HTTP response with a correct `Content-Length` | **nothing about the certificate** — `-k` disables verification entirely |
+| `curl --cacert` | signature over the certificate, `notBefore`/`notAfter` against a real wall clock, hostname match | client authentication (Phase 5) |
+| Chrome | all of the above, plus a trust decision it made itself, plus the steady state — page assets fetched over separate sequential sessions | anything about entropy |
+
+The distinction between the first two rows is the reason `-k` is worth running
+first and worth never mistaking for a pass. It exercises everything *except*
+the three things §"The three, settled" was about.
+
+Chrome's pass is the one the gate's wording was chosen for: **no interstitial,
+no override.** Clicking Advanced → Proceed would have been Chrome recording
+that verification failed and a human overruling it, which is the opposite of
+what this gate exists to establish.
+
+### Five things the live runs settled that nothing in this repo could
+
+Each of these was invisible to every test that passes, and each cost one round
+trip against a real client to find.
+
+**1. The listener was unreachable, and it was not a TLS problem.** The first
+attempt timed out after 133 seconds. `10.0.2.15` is slirp's guest address:
+correct inside QEMU, not routable from the host, and `run-cluster.sh` forwarded
+only 3000. The failure had nothing to do with the record layer, the
+certificate, or the handshake — it was a missing line in the launcher. Worth
+recording because "TLS does not work" was the obvious reading and was wrong.
+
+**2. A verifier checks the name the CLIENT used.** The certificate carried one
+SAN, `IP Address:10.0.2.15`, because that is the address the node believes it
+has. Every client reaches it as `localhost` through the port forward. `curl -k`
+passed anyway — it was not checking — and both browsers would have rejected it
+with an error that reads as a certificate fault and is really an addressing
+one.
+
+**The oracle should have caught this and did not.** It asserted the SAN it
+had itself chosen, not the SAN `net/http.c` installs. An independent parser
+judging a specimen the test invented is only independent about the encoding.
+The harness now builds the same list the kernel does, and the smoke checks
+names through `openssl -verify_hostname` / `-verify_ip` — with a negative case,
+because an assertion that only ever succeeds cannot show it is able to fail.
+
+**3. `CA:FALSE` was an accurate description and the wrong one.** Windows filed
+the certificate under Intermediate Certification Authorities rather than
+Trusted Root — its import wizard classifies by type, and a certificate not
+asserting `CA:TRUE` is not a root. An intermediate is not a trust anchor, so
+Chrome reported `ERR_CERT_AUTHORITY_INVALID`, correctly. A certificate you
+deliberately install as an anchor *is* acting as a CA; saying otherwise while
+asking a browser to treat it as one is the encoding disagreeing with the
+intent. Now `CA:TRUE` with `pathlen 0`, which is a Phase 3 expedient with a
+stated expiry: §4's private CA removes it by making the anchor a separate key
+that never serves traffic.
+
+**4. The negotiated suite is `TLS_AES_256_GCM_SHA384`.** The amendment's table
+lists `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256` under "Suites
+we want", verified. That verification was real but it established
+*availability*, not *selection* — nothing ever called
+`mbedtls_ssl_conf_ciphersuites`, so mbedTLS's default preference won and the
+document describes a choice that was never made. Nothing is wrong with the
+suite. What is wrong is a table that reads as a decision. Either pin the list
+or amend the table; do not leave a reader believing a knob was set.
+
+**5. The session cap has met browser parallelism and has not been measured
+against it.** `TLS_SERVER_MAX_SESSIONS` is 2, derived from §3.2's per-connection
+estimate against a 256 KiB pool. Chrome opens up to six connections per host.
+The Navigator and its assets loaded, so Chrome recovered from whatever was
+refused — but the header's own instruction was to raise that number only
+against measured pool high-water under real handshakes, and there is now a real
+workload to measure it against for the first time. Check the serial log for
+`[TLS] conn N refused: no session slot` before touching the constant.
+
+### What two of three still does not prove
+
+**Entropy.** All three clients complete a handshake against a node whose
+CSPRNG is broken and report success. That is §0's entire argument, and it is
+not weakened by a green padlock — Debian, Netscape and ROCA all shipped
+correct protocol implementations that interoperated with everything.
+
+The pairing in "Phase 3's gate is a browser" holds exactly as written: this
+gate says the protocol and the certificate are conformant, and
+`entropy_boot_diversity_check.sh` says the key material is unpredictable.
+Neither substitutes for the other, and passing this one must not be read as
+"TLS works".
+
+**Still owed on the gate itself:** Firefox, which has its own trust store and
+is therefore a second installation and a genuinely independent verifier — NSS
+rather than BoringSSL. And the evidence the gate section asks for and this run
+did not capture: the negotiated parameters recorded verbatim, a hash of the
+Navigator payload matched against the same fetch over plaintext, and **two
+consecutive boots with differing serials**, which is the one line of the
+browser gate that would notice §0's failure mode.
