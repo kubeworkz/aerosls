@@ -320,6 +320,28 @@ sets `df = 1` (forward) at boot, matching EFLAGS.DF=0 on a fresh machine.
 This is the first guest with control flow and the first string op under the
 decoder, and both held up.
 
+**Iteration 3 (2026-08-12): `rep stosb` + the REPZ/REPNZ flag-consuming path
+— the string ops are still helper-free, and the flag core became real.** The
+first run halted exactly where the design predicts pushfq lands:
+`helper_read_eflags`. CMPS/SCAS are inline TCG in this QEMU (`do_gen_rep`
+with a per-iteration `gen_jcc_noeob` on ZF — there is no `repz_cmps`
+helper), so the *string* path needed nothing; what the guest needed was
+`pushfq` to capture ZF, and PUSHF emits `gen_helper_read_eflags`. That
+helper materializes EFLAGS from the lazy cc state through
+`cpu_cc_compute_all`, which lives in `cc_helper.c` (not in this link) — so
+the whole flag-computation core came over in one unit: `helper_read_eflags`
+plus `helper_cc_compute_all` / `helper_cc_compute_c` / `helper_cc_compute_nz`
+(translate.c's `gen_prepare_cc` emits all three for condition codes it
+cannot express inline, so the next guest with a CF-consuming or complex jcc
+would have hit those stubs anyway), with the upstream
+`cc_helper_template.h.inc` expanded through a relative include. Result: 385
+instructions to HLT; `rep stosb` filled all 16 bytes; the repz run over
+equal strings left ECX=0 with ZF set, the repnz run over strings differing
+in bytes 0..4 left ECX=10 with ZF set — the packed ECX/ZF result matched the
+C expectation bit-for-bit, so the F2/F3 prefix plumbing and the lazy-flag
+machinery are both right. `invl`/`paging`/`selfmod` still pass and the bench
+still runs.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
