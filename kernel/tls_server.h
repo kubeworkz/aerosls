@@ -19,26 +19,27 @@
 #define TLS_SRV_E_BADARG     (-3)
 #define TLS_SRV_E_FATAL      (-4)  /* session is dead; close it */
 
-/* ─── The concurrent-session cap, and why it is this small ─────────────────
- * §3.2 of the design doc: TLS 1.3 records are up to 16 KB, and a server
- * context with full buffers is ~32-35 KB of I/O buffer per connection plus
- * ~25 KB of handshake context. MBEDTLS_SSL_MAX_FRAGMENT_LENGTH and
- * MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH are both unsupported under TLS 1.3, so
- * that is not tunable down -- the buffer is fixed at full record size.
+/* ─── The concurrent-session cap, now measured ─────────────────────────────
+ * Was 2, derived from §3.2's estimate. It refused 964 connections on its first
+ * real browser run, which measured the symptom and not the cause: refusals
+ * cannot distinguish a cap one too low from ten too low, and they inflate
+ * themselves because every refusal makes a browser retry.
  *
- * The pool is SLS_TLS_POOL_BYTES = 256 KiB, fixed, deliberately separate from
- * the database's arena. Two sessions is ~120 KB of that before fragmentation.
+ * MEASURED, after both browsers loaded the Navigator:
+ *   tls_pool_peak 99416 bytes at tls_sessions_peak 2  ->  ~49.7 KB/session
  *
- * TCP_MAX_CONNS is 512. Nothing about TCP's capacity has any bearing here, and
- * that mismatch is the entire reason this constant exists: the doc's
- * instruction is that the connection limit "must be enforced rather than
- * discovered", because discovering it means a pool allocation failing
- * mid-handshake under load.
+ * 6 is what a browser opens per host, so it is the number that stops the
+ * refusals rather than merely reducing them. 6 x 49.7 KB is ~298 KB, which is
+ * why SLS_TLS_POOL_BYTES went to 512 KiB in the same change -- raising this
+ * alone would have moved the failure from a clean refusal at the cap to a
+ * pool allocation failing mid-handshake, which is exactly what the original
+ * comment said must not happen.
  *
- * Raise this only against a measurement of real pool high-water under real
- * handshakes -- not against this arithmetic, which is an estimate carried over
- * from a document that has been wrong about magnitudes before. */
-#define TLS_SERVER_MAX_SESSIONS 2
+ * TCP_MAX_CONNS is still 512 and still has no bearing. The limit is the pool.
+ *
+ * Read tls_server_stats() / GET /api/health after changing either number.
+ * That is not advice, it is how these two were arrived at. */
+#define TLS_SERVER_MAX_SESSIONS 6
 
 /* Generate a self-signed certificate and build the shared server config.
  * Safe to call more than once; the second call is a no-op. Returns TLS_SRV_OK

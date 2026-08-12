@@ -116,7 +116,31 @@ int sls_mbedtls_rng(void *p_rng, unsigned char *output, size_t output_size)
  * 1.3, so per-connection cost is fixed at full record size (design doc §3.2
  * and the amendment). Raising this number to make a failure go away is
  * choosing to run out later, in production, instead of now, in a test. */
-#define SLS_TLS_POOL_BYTES (256u * 1024u)
+/* 512 KiB, raised from 256 KiB against a MEASUREMENT rather than an estimate.
+ *
+ * Measured on a node after both browsers had loaded the Navigator:
+ *   tls_pool_peak 99416 bytes at tls_sessions_peak 2  ->  ~49.7 KB/session
+ *   tls_pool_blocks 87
+ *
+ * §3.2 estimated 57-60 KB (32-35 KB of I/O buffer plus ~25 KB of handshake
+ * context). The estimate was the right magnitude and slightly pessimistic,
+ * which is worth recording because most of this document's magnitudes have
+ * not been.
+ *
+ * Six concurrent sessions is what a browser actually opens per host, and six
+ * simultaneous HANDSHAKES is the peak case because the handshake context is
+ * transient: 6 x 49.7 KB is ~298 KB, which does not fit 256 KiB. At 512 KiB it
+ * fits with about 40% spare, and the spare is not padding -- 87 blocks at peak
+ * means the fixed-pool allocator is fragmenting, and a first-fit allocator
+ * under fragmentation fails well before it is nominally full.
+ *
+ * The cost is 256 KiB of .bss, against an image whose .bss is already 219 MiB.
+ * It is not measurable in the image-end number.
+ *
+ * This is a hypothesis with an instrument attached: reload the Navigator and
+ * read tls_pool_peak against tls_sessions_peak again. If peak lands near
+ * 300 KB with six sessions live, the arithmetic held. */
+#define SLS_TLS_POOL_BYTES (512u * 1024u)
 #ifndef TLS_PLATFORM_HOST_TEST
 static uint8_t tls_pool[SLS_TLS_POOL_BYTES] __attribute__((aligned(16)));
 #endif
