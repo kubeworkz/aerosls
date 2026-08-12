@@ -146,7 +146,31 @@ void sls_tls_memory_free(void)
 }
 
 size_t sls_tls_pool_bytes(void);
+/* Receives mbedTLS's memory-debug output with the stream argument already
+ * dropped by the macro in sls_mbedtls_config.h. Prints the format string
+ * verbatim -- see that comment for why that is enough for the messages this
+ * actually carries, and why it is bounded. */
+int sls_tls_debug_line(const char *fmt, ...)
+{
+    if (fmt) { kernel_serial_print(fmt); }
+    return 0;
+}
+
 size_t sls_tls_pool_bytes(void) { return SLS_TLS_POOL_BYTES; }
+
+/* Peak pool usage since boot, in bytes, and the peak block count. Zero when
+ * MBEDTLS_MEMORY_DEBUG is off. This is the instrument tls_server.h's cap was
+ * always supposed to be sized against. */
+void sls_tls_pool_high_water(size_t *max_used, size_t *max_blocks);
+void sls_tls_pool_high_water(size_t *max_used, size_t *max_blocks)
+{
+#if defined(MBEDTLS_MEMORY_DEBUG)
+    mbedtls_memory_buffer_alloc_max_get(max_used, max_blocks);
+#else
+    if (max_used) { *max_used = 0; }
+    if (max_blocks) { *max_blocks = 0; }
+#endif
+}
 int    sls_tls_memory_ready(void);
 int    sls_tls_memory_ready(void) { return tls_pool_ready != 0; }
 

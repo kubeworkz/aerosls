@@ -91,6 +91,42 @@ long long sls_mbedtls_time(long long *t);
  * amendment, §"Costs". */
 #define MBEDTLS_MEMORY_BUFFER_ALLOC_C
 
+/* MBEDTLS_MEMORY_DEBUG: the high-water counters on the fixed pool.
+ *
+ * On because TLS_SERVER_MAX_SESSIONS was derived from an ESTIMATE -- §3.2's
+ * "~32-35 KB of I/O buffer plus ~25 KB of handshake context" -- and its own
+ * header says to raise it only against a measurement of real pool high-water
+ * under real handshakes. There was no way to take that measurement. A first
+ * browser run refused 964 connections at the cap of 2, which measures the
+ * symptom and says nothing about what a session actually costs.
+ *
+ * It costs two counters and a comparison per allocation, which is nothing
+ * against a P-256 keygen, and it is the difference between sizing this from
+ * a document and sizing it from the machine. */
+#define MBEDTLS_MEMORY_DEBUG
+
+/* MEMORY_DEBUG's printing goes through mbedtls_fprintf(stderr, ...), and a
+ * freestanding kernel has neither fprintf nor stderr -- the build failed on
+ * "'stderr' undeclared" the moment the flag went on.
+ *
+ * platform.h substitutes this object-like (`#define mbedtls_fprintf
+ * MBEDTLS_PLATFORM_FPRINTF_MACRO`), so a FUNCTION-LIKE macro here receives the
+ * stream as a parameter and can simply not use it. `stderr` is then never
+ * emitted by the preprocessor and never has to exist. No fake FILE, no stdio.
+ *
+ * %-DIRECTIVES ARE NOT SUBSTITUTED: the format string is printed literally.
+ * That is a deliberate bound, not an oversight, and it is the same shape as
+ * the QEMU-SLS snprintf that ignores its format and writes "<nofmt>" -- the
+ * one that would have put that literal into a certificate subject name if a
+ * link had resolved silently. Here it is confined to a debug path, and the
+ * messages that path actually carries -- "FATAL: MAGIC1 mismatch" and its
+ * siblings, meaning the pool's headers are corrupt -- contain no directives
+ * and arrive intact. The ones that do are debug_header()'s pointer dumps,
+ * reachable only from mbedtls_memory_buffer_alloc_status(), which this kernel
+ * never calls. */
+#define MBEDTLS_PLATFORM_FPRINTF_MACRO(stream, ...) sls_tls_debug_line(__VA_ARGS__)
+int sls_tls_debug_line(const char *fmt, ...);
+
 /* ─── 4b. The hosted symbols the platform layer still reaches for ─────────
  * Measured, not guessed: with the config above, memory_buffer_alloc.o still
  * wants exit(), and platform_util.o wants clock_gettime()/gmtime_r()/time().

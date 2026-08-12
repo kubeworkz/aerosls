@@ -280,6 +280,21 @@ static int api_health(char* body, int max) {
     jb_str(&j,  "system",       "AeroSLS 4.0");             jb_putc(&j, ',');
     jb_str(&j,  "arch",         SLS_ARCH_NAME);            jb_putc(&j, ',');
     jb_uint(&j, "uptime_ticks", kernel_tick_counter);       jb_putc(&j, ',');
+    /* TLS pool accounting. Here rather than only on the serial console
+     * because the number that matters -- peak bytes taken from the fixed pool
+     * -- has to be readable from whatever machine is driving the browsers,
+     * and /api/health is already the endpoint that answers without a token. */
+    {
+        unsigned long tls_refused = 0; unsigned tls_peak = 0;
+        size_t pool_bytes = 0, pool_peak = 0, pool_blocks = 0;
+        tls_server_stats(&tls_refused, &tls_peak, &pool_bytes, &pool_peak, &pool_blocks);
+        jb_uint(&j, "tls_sessions_max", (uint64_t)TLS_SERVER_MAX_SESSIONS); jb_putc(&j, ',');
+        jb_uint(&j, "tls_sessions_peak", (uint64_t)tls_peak);               jb_putc(&j, ',');
+        jb_uint(&j, "tls_refused", (uint64_t)tls_refused);                  jb_putc(&j, ',');
+        jb_uint(&j, "tls_pool_bytes", (uint64_t)pool_bytes);                jb_putc(&j, ',');
+        jb_uint(&j, "tls_pool_peak", (uint64_t)pool_peak);                  jb_putc(&j, ',');
+        jb_uint(&j, "tls_pool_blocks", (uint64_t)pool_blocks);              jb_putc(&j, ',');
+    }
     jb_uint(&j, "object_count", object_catalog_count);
     jb_obj_close(&j);
     j.buf[j.pos] = '\0';

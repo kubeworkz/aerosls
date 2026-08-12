@@ -77,4 +77,11 @@ const unsigned char *tls_server_cert_der(size_t *len);
  * importing the leaf achieves nothing. NULL before init succeeds. */
 const unsigned char *tls_server_ca_der(size_t *len);
 
+/* Refusals since boot, peak concurrent sessions, and the fixed pool's size and
+ * peak usage. TLS_SERVER_MAX_SESSIONS above says to raise it only against
+ * measured pool high-water; this is that measurement. Any argument may be
+ * NULL. */
+void tls_server_stats(unsigned long *refused, unsigned *live_peak,
+                      size_t *pool_bytes, size_t *pool_peak, size_t *pool_blocks);
+
 #endif /* SLS_TLS_SERVER_H */

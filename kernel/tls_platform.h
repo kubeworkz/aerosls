@@ -21,4 +21,10 @@
  * signing. */
 int sls_mbedtls_rng(void *p_rng, unsigned char *output, size_t output_size);
 
+/* The fixed pool's size, and its peak usage since boot. The second is what
+ * TLS_SERVER_MAX_SESSIONS must be sized against -- see that constant's
+ * comment, which asked for exactly this measurement and could not have it. */
+size_t sls_tls_pool_bytes(void);
+void   sls_tls_pool_high_water(size_t *max_used, size_t *max_blocks);
+
 #endif /* SLS_TLS_PLATFORM_H */

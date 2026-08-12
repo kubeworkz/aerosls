@@ -66,6 +66,15 @@ struct tls_session {
 };
 static struct tls_session g_sessions[TLS_SERVER_MAX_SESSIONS];
 
+/* Refusals since boot, and peak concurrent sessions. Counted because 964
+ * "no session slot" lines in a log is a symptom with no denominator: it does
+ * not say whether the cap is one too low or ten too low, and grep cannot tell
+ * a browser opening six parallel connections from a retry storm caused by the
+ * refusals themselves. */
+static unsigned long g_refused;
+static unsigned      g_live;
+static unsigned      g_live_peak;
+
 static struct tls_session *find(int conn_id)
 {
     for (int i = 0; i < TLS_SERVER_MAX_SESSIONS; i++) {
@@ -211,7 +220,7 @@ int tls_server_open(int conn_id)
     /* At the cap. The caller closes the connection. It must NOT serve this
      * client over plaintext instead: a downgrade the client cannot see is
      * worse than a refusal it can. */
-    if (!s) { return TLS_SRV_E_NO_SLOT; }
+    if (!s) { g_refused++; return TLS_SRV_E_NO_SLOT; }
 
     s->in_use = 1;
     s->conn_id = conn_id;
@@ -232,6 +241,7 @@ int tls_server_open(int conn_id)
      * and tcp_conns[] are indexed by. */
     mbedtls_ssl_set_bio(&s->ssl, (void *)(long)conn_id,
                         sls_tls_bio_send, sls_tls_bio_recv, 0);
+    if (++g_live > g_live_peak) { g_live_peak = g_live; }
     return TLS_SRV_OK;
 }
 
@@ -246,10 +256,18 @@ int tls_server_handshake(int conn_id)
     r = mbedtls_ssl_handshake(&s->ssl);
     if (r == 0) {
         s->established = 1;
-        kernel_serial_printf("[TLS] conn %d: handshake complete, %s / %s\n",
-                             conn_id,
-                             mbedtls_ssl_get_version(&s->ssl),
-                             mbedtls_ssl_get_ciphersuite(&s->ssl));
+        {
+            size_t used = 0, blocks = 0;
+            sls_tls_pool_high_water(&used, &blocks);
+            kernel_serial_printf("[TLS] conn %d: handshake complete, %s / %s "
+                                 "(pool peak %u/%u bytes, %u live, peak %u, "
+                                 "refused %u)\n",
+                                 conn_id,
+                                 mbedtls_ssl_get_version(&s->ssl),
+                                 mbedtls_ssl_get_ciphersuite(&s->ssl),
+                                 (unsigned)used, (unsigned)sls_tls_pool_bytes(),
+                                 g_live, g_live_peak, (unsigned)g_refused);
+        }
         return TLS_SRV_OK;
     }
     if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -310,4 +328,27 @@ void tls_server_close(int conn_id)
     s->in_use = 0;
     s->conn_id = -1;
     s->established = 0;
+    if (g_live > 0) { g_live--; }
+}
+
+/* ─── The numbers TLS_SERVER_MAX_SESSIONS should have been sized against ───
+ * pool_peak is the honest per-session cost: peak bytes actually taken from
+ * the 256 KiB pool, divided by the peak number of sessions that were live at
+ * once. §3.2 estimated 50-60 KB from a document. This measures it.
+ *
+ * refused is the demand the cap turned away. Both are needed: refusals alone
+ * cannot distinguish a cap one too low from one ten too low, and they inflate
+ * themselves, because every refusal makes a browser retry. */
+void tls_server_stats(unsigned long *refused, unsigned *live_peak,
+                      size_t *pool_bytes, size_t *pool_peak, size_t *pool_blocks);
+void tls_server_stats(unsigned long *refused, unsigned *live_peak,
+                      size_t *pool_bytes, size_t *pool_peak, size_t *pool_blocks)
+{
+    size_t used = 0, blocks = 0;
+    sls_tls_pool_high_water(&used, &blocks);
+    if (refused)     { *refused = g_refused; }
+    if (live_peak)   { *live_peak = g_live_peak; }
+    if (pool_bytes)  { *pool_bytes = sls_tls_pool_bytes(); }
+    if (pool_peak)   { *pool_peak = used; }
+    if (pool_blocks) { *pool_blocks = blocks; }
 }
