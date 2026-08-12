@@ -111,6 +111,17 @@ void rtc_civil_from_days(int64_t z, int64_t* y, unsigned* m, unsigned* d);
 int rtc_compose(unsigned year, unsigned mon, unsigned day,
                 unsigned hour, unsigned min, unsigned sec, uint64_t* out);
 
+/* Unix seconds to civil fields: the caller-facing form of
+ * rtc_civil_from_days(), which stops at the date and leaves every caller to
+ * split the seconds-of-day for itself. Two now need it (gmtime_r for X.509
+ * validity checking, tls_cert.c for writing validity strings), so the split
+ * lives here rather than in both. Signed for the same reason gmtime_r is:
+ * pre-1970 times need floor division, not C's truncation.
+ *
+ * All out-parameters are optional; pass NULL for what you do not want. */
+void rtc_break_down(int64_t t, int64_t* y, unsigned* mon, unsigned* day,
+                    unsigned* hour, unsigned* min, unsigned* sec, int* wday);
+
 #ifdef RTC_TEST_HOOKS
 /* Feed raw CMOS register values instead of reading ports, so the decode path
  * -- BCD vs binary, 12- vs 24-hour, the PM bit -- is testable on a host with

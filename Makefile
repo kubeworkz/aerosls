@@ -192,7 +192,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/row_constraint.c \
               kernel/row_journal.c \
               kernel/vecstore.c \
-              kernel/vec_index.c kernel/sha256.c kernel/entropy.c kernel/rtc.c kernel/tls_platform.c \
+              kernel/vec_index.c kernel/sha256.c kernel/entropy.c kernel/rtc.c kernel/tls_platform.c kernel/tls_cert.c \
               kernel/vec_join.c \
               kernel/agent.c \
               kernel/agent_tools.c \

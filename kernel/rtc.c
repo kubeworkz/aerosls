@@ -342,3 +342,39 @@ int rtc_set_unix(uint64_t t) {
 int rtc_is_trusted(void) { return trusted != 0; }
 
 rtc_source_t rtc_get_source(void) { return source; }
+
+/* --- One decomposition, two consumers -------------------------------------
+ * Unix seconds to civil fields. The counterpart to rtc_compose(), and the
+ * caller-facing form of rtc_civil_from_days(): that one stops at the date,
+ * because the day count is the interesting half of the arithmetic, and every
+ * caller then has to split the seconds-of-day itself.
+ *
+ * Two callers now do -- mbedtls_platform_gmtime_r() in tls_platform.c and
+ * tls_cert_format_time() in tls_cert.c -- so the split lives here once rather
+ * than in each of them. It was written in tls_platform.c first; this is that
+ * code moved, not a second version of it. A project carrying two snprintfs by
+ * accident should not acquire two calendars on purpose.
+ *
+ * Signed, because gmtime_r's contract admits times before 1970 and the floor
+ * division below is the whole reason: C truncates toward zero, so -1 / 86400
+ * is 0 and the last second of 1969 would decode as 1970-01-01T00:00:-1.
+ *
+ * Every out-parameter is optional; pass NULL for the fields you do not want. */
+void rtc_break_down(int64_t t, int64_t* y, unsigned* mon, unsigned* day,
+                    unsigned* hour, unsigned* min, unsigned* sec, int* wday) {
+    int64_t days = t / 86400;
+    int64_t rem  = t % 86400;
+    if (rem < 0) { rem += 86400; days -= 1; }   /* floor, not truncate */
+
+    int64_t yy = 0; unsigned mm = 0, dd = 0;
+    rtc_civil_from_days(days, &yy, &mm, &dd);
+
+    if (y)    *y    = yy;
+    if (mon)  *mon  = mm;
+    if (day)  *day  = dd;
+    if (hour) *hour = (unsigned)(rem / 3600);
+    if (min)  *min  = (unsigned)((rem % 3600) / 60);
+    if (sec)  *sec  = (unsigned)(rem % 60);
+    /* 1970-01-01 was a Thursday, so day 0 is weekday 4. */
+    if (wday) { int w = (int)((days + 4) % 7); if (w < 0) w += 7; *wday = w; }
+}

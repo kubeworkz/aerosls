@@ -367,22 +367,21 @@ struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt, struct tm *tm_buf
 {
     if (!tt || !tm_buf) return 0;
 
-    long long t = (long long)*tt;
-    long long days = t / 86400;
-    long long rem  = t % 86400;
-    if (rem < 0) { rem += 86400; days -= 1; }   /* floor, not truncate */
-
-    int64_t  y = 0; unsigned m = 0, d = 0;
-    rtc_civil_from_days((int64_t)days, &y, &m, &d);
+    /* The arithmetic moved to rtc_break_down() in rtc.c so that this and
+     * tls_cert_format_time() share one calendar rather than two. rtc.h asked
+     * for exactly this: both directions of the conversion in one file, tested
+     * together. Behaviour here is unchanged -- same floor division, same
+     * civil_from_days, same Thursday. */
+    int64_t  y = 0; unsigned m = 0, d = 0, hh = 0, mi = 0, ss = 0; int wd = 0;
+    rtc_break_down((int64_t)*tt, &y, &m, &d, &hh, &mi, &ss, &wd);
 
     tm_buf->tm_year = (int)(y - 1900);   /* years since 1900 */
     tm_buf->tm_mon  = (int)m - 1;        /* 0-based */
     tm_buf->tm_mday = (int)d;            /* 1-based */
-    tm_buf->tm_hour = (int)(rem / 3600);
-    tm_buf->tm_min  = (int)((rem % 3600) / 60);
-    tm_buf->tm_sec  = (int)(rem % 60);
-    tm_buf->tm_wday = (int)((days + 4) % 7);   /* 1970-01-01 was a Thursday */
-    if (tm_buf->tm_wday < 0) tm_buf->tm_wday += 7;
+    tm_buf->tm_hour = (int)hh;
+    tm_buf->tm_min  = (int)mi;
+    tm_buf->tm_sec  = (int)ss;
+    tm_buf->tm_wday = wd;
     tm_buf->tm_yday = 0;                 /* not computed; mbedTLS does not read it */
     tm_buf->tm_isdst = 0;                /* UTC has no DST, by definition */
 
