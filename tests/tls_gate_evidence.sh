@@ -100,7 +100,11 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 echo "=== handshake against $TLS ==="
-if ! openssl s_client -connect "$TLS" -showcerts </dev/null >"$WORK/hs.txt" 2>&1; then
+# -alpn is not optional here: s_client offers nothing by default, so a server
+# that selects http/1.1 correctly still reports "<none negotiated>" and the
+# capture cannot tell that apart from a server with no ALPN at all.
+if ! openssl s_client -connect "$TLS" -showcerts -alpn http/1.1 \
+        </dev/null >"$WORK/hs.txt" 2>&1; then
     bad "no handshake -- $(grep -m1 -i 'error\|refused\|unable' "$WORK/hs.txt" || echo 'see below')"
     sed 's/^/      /' "$WORK/hs.txt" | head -12
     echo; echo "---- passed=$pass failed=$fail"; exit 1
@@ -110,8 +114,23 @@ openssl x509 -in "$WORK/hs.txt" -out "$WORK/crt.pem" 2>/dev/null \
 ok "handshake completed and a certificate was presented"
 
 # Negotiated parameters, verbatim rather than interpreted.
+# Two sources, because the SSL-Session summary block is not always emitted --
+# a server that closes promptly after responding can leave s_client printing
+# only the one-line "New, TLSv1.3, Cipher is ..." banner. Parsing only the
+# block reported version and cipher as "unknown" against the real node while
+# working perfectly against the openssl s_server this script was developed
+# against: a parser tuned to a specimen the test itself created. That is the
+# same mistake tls_cert_oracle_smoke.sh made asserting its own SAN instead of
+# the kernel's, and it hid exactly the field the design doc wanted settled.
 VER="$(awk -F': ' '/^ *Protocol *:/{print $2; exit}' "$WORK/hs.txt")"
 CIPH="$(awk -F': ' '/^ *Cipher *:/{print $2; exit}' "$WORK/hs.txt")"
+if [ -z "$VER" ] || [ -z "$CIPH" ]; then
+    NEW="$(grep -m1 '^New, ' "$WORK/hs.txt")"
+    [ -n "$NEW" ] && {
+        [ -n "$VER"  ] || VER="$(echo "$NEW"  | sed -E 's/^New, ([^,]+),.*/\1/')"
+        [ -n "$CIPH" ] || CIPH="$(echo "$NEW" | sed -E 's/.*Cipher is (.*)$/\1/')"
+    }
+fi
 GROUP="$(awk -F': ' '/Negotiated TLS1.3 group:/{print $2; exit}' "$WORK/hs.txt")"
 [ -n "$GROUP" ] || GROUP="$(awk -F': ' '/^Server Temp Key:/{print $2; exit}' "$WORK/hs.txt")"
 ALPN="$(awk -F': ' '/^ALPN protocol:/{print $2; exit}' "$WORK/hs.txt")"
@@ -130,6 +149,13 @@ note "serial  : $SERIAL"
 note "subject : $SUBJ"
 note "validity: $NB  ->  $NA"
 note "san     : ${SAN:-<NONE>}"
+
+if [ -n "$VER" ] && [ -n "$CIPH" ] && [ "$VER" != "unknown" ]; then
+    ok "negotiated parameters captured ($VER / $CIPH)"
+else
+    bad "could not read the negotiated version or cipher -- the capture is
+        missing the field it exists to record"
+fi
 
 [ -n "$SAN" ] && ok "the certificate carries a subjectAltName" \
               || bad "NO subjectAltName -- Chrome has ignored commonName since Chrome 58"
