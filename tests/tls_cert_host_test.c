@@ -3,7 +3,7 @@
  * will judge, and the refusals that keep a wrong one off the wire.
  *
  * Build and run:
- *   gcc -Wall -Wextra -std=c11 -DRTC_HOST_TEST -DRTC_TEST_HOOKS \
+ *   gcc -Wall -Wextra -std=c11 -DTLS_CERT_HOST_TEST -DRTC_HOST_TEST -DRTC_TEST_HOOKS \
  *       -I . -I kernel -o /tmp/tls_cert_host_test \
  *       tests/tls_cert_host_test.c kernel/tls_cert.c kernel/rtc.c
  *   /tmp/tls_cert_host_test
@@ -40,6 +40,24 @@
 #include <stdint.h>
 #include "tls_cert.h"
 #include "rtc.h"
+#include "entropy.h"
+
+/* A controllable entropy_get(). This is the harness supplying a dependency,
+ * which is the pattern that hid the entropy_init() bug for 31 host tests -- so
+ * be exact about what it does and does not establish. It establishes the
+ * SHAPING of a serial and the propagation of a refusal. It establishes nothing
+ * about the real generator, which needs the boot path.
+ *
+ * The critical behaviour it reproduces is the real one's contract: on failure
+ * the output buffer is left UNTOUCHED, not zeroed. */
+static int entropy_refuses = 0;
+static unsigned char entropy_fill = 0xff;
+int entropy_get(void *out, size_t len) {
+    if (entropy_refuses) return ENTROPY_E_NOT_SEEDED;
+    unsigned char *p = out;
+    for (size_t i = 0; i < len; i++) p[i] = entropy_fill;
+    return ENTROPY_OK;
+}
 
 static int checks = 0, fails = 0;
 static void ok(int cond, const char* what) {
@@ -174,6 +192,41 @@ int main(void) {
          * be a crash in the certificate path, so it is worth one line. */
         rtc_break_down(1786490497LL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
         ok(1, "all-NULL out-parameters do not fault");
+    }
+
+    printf("\n=== serials ===\n\n");
+    {
+        unsigned char ser[TLS_CERT_SERIAL_LEN];
+
+        /* 0xff everywhere is the worst case: top bit set (mbedTLS would
+         * prepend 0x00 and emit 21 octets, one over RFC 5280) and the byte
+         * non-zero. */
+        entropy_refuses = 0; entropy_fill = 0xff;
+        memset(ser, 0x00, sizeof ser);
+        ok(tls_cert_make_serial(ser, sizeof ser) == TLS_CERT_OK, "a serial is produced");
+        ok((ser[0] & 0x80) == 0, "  top bit clear -- mbedTLS will not prepend 0x00 and make it 21 octets");
+        ok(ser[0] != 0x00, "  first byte non-zero -- no non-minimal leading zero");
+        ok(ser[19] == 0xff, "  the remaining 19 bytes are untouched entropy");
+
+        /* 0x00 everywhere is the other end: a leading zero byte would be
+         * written verbatim as a non-minimal INTEGER, 1 time in 256. */
+        entropy_fill = 0x00;
+        ok(tls_cert_make_serial(ser, sizeof ser) == TLS_CERT_OK, "an all-zero draw still produces a serial");
+        ok(ser[0] != 0x00, "  and its first byte is still non-zero");
+
+        /* The one that matters most. */
+        entropy_refuses = 1;
+        memset(ser, 0x5a, sizeof ser);
+        ok(tls_cert_make_serial(ser, sizeof ser) == TLS_CERT_E_NO_ENTROPY,
+           "a refused draw returns TLS_CERT_E_NO_ENTROPY");
+        int untouched = 1;
+        for (size_t i = 0; i < sizeof ser; i++) if (ser[i] != 0x5a) untouched = 0;
+        ok(untouched, "  and the caller's buffer is UNTOUCHED -- not zeroed, not partially written");
+        entropy_refuses = 0;
+
+        ok(tls_cert_make_serial(ser, 19) == TLS_CERT_E_BADARG, "a 19-byte serial buffer is refused");
+        ok(tls_cert_make_serial(NULL, TLS_CERT_SERIAL_LEN) == TLS_CERT_E_BADARG, "a NULL serial buffer is refused");
+        ok(TLS_CERT_SERIAL_LEN == 20, "TLS_CERT_SERIAL_LEN is 20, matching MBEDTLS_X509_RFC5280_MAX_SERIAL_LEN");
     }
 
     printf("\n---- checks=%d failed=%d\n", checks, fails);

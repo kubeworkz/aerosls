@@ -46,4 +46,54 @@ int tls_cert_validity_window(uint64_t lifetime_seconds,
                              char *not_before, size_t nb_size,
                              char *not_after, size_t na_size);
 
+
+/* RFC 5280 caps the serial at 20 octets and MBEDTLS_X509_RFC5280_MAX_SERIAL_LEN
+ * is 20 to match. Note that mbedTLS prepends a 0x00 when the top bit is set, so
+ * 20 random bytes can become a 21-octet INTEGER on the wire -- one over the
+ * limit set_serial_raw() just enforced. tls_cert_make_serial() shapes the bytes
+ * so that cannot happen. */
+#define TLS_CERT_SERIAL_LEN 20
+
+/* Fill `out` with a positive, minimally-encoded, non-zero serial from
+ * entropy_get(). Returns TLS_CERT_OK, or TLS_CERT_E_NO_ENTROPY with `out`
+ * UNTOUCHED -- which is the whole point: entropy_get() does not zero the
+ * buffer on failure, so a caller that ignores this return publishes its own
+ * uninitialised stack in a certificate. */
+#define TLS_CERT_E_NO_ENTROPY (-4)
+#define TLS_CERT_E_MBEDTLS    (-5)  /* an mbedTLS call failed; see the log */
+int tls_cert_make_serial(unsigned char *out, size_t len);
+
+/* Generate an EC P-256 key and a self-signed certificate over it.
+ *
+ * `dn` is a full distinguished name in mbedTLS's string form -- "CN=node1" or
+ * "CN=node1,O=AeroSLS" -- NOT a bare common name. mbedtls_x509write_crt_set_
+ * subject_name() parses it with mbedtls_x509_string_to_names(), which needs
+ * the attribute prefix; a bare "node1" fails deep inside that parser and
+ * surfaces as an opaque error. This function rejects a `dn` with no '=' at
+ * the boundary instead, where the message can say which argument was wrong. At least one of `dns` and `ip4` must
+ * be given: Chrome has ignored commonName since Chrome 58, so a certificate
+ * whose identity is only in the CN fails the Phase 3 gate outright. `ip4` is
+ * FOUR RAW BYTES, not a dotted string -- mbedTLS writes the buffer verbatim
+ * under the iPAddress tag.
+ *
+ * Both outputs are DER. mbedTLS writes DER at the END of the buffer it is
+ * given; this function moves it to the front, so crt_der[0..*crt_len) and
+ * key_der[0..*key_len) are the whole encodings.
+ *
+ * The key DER is private key material. It must not be logged, and §6.1's
+ * checkpoint question applies to wherever the caller puts it. */
+int tls_cert_self_signed(const char *dn, const char *dns,
+                         const unsigned char *ip4,
+                         uint64_t lifetime_seconds,
+                         unsigned char *crt_der, size_t crt_size, size_t *crt_len,
+                         unsigned char *key_der, size_t key_size, size_t *key_len);
+
+/* Which mbedTLS call failed, and its return code, after TLS_CERT_E_MBEDTLS.
+ * Exists because working out that a bare CN was the problem took building a
+ * separate probe that replayed the whole sequence with the codes printed --
+ * a diagnostic round that a two-line accessor removes. Not thread-safe; there
+ * is one certificate generator and it runs at provisioning. */
+const char *tls_cert_last_step(void);
+int tls_cert_last_mbedtls_ret(void);
+
 #endif /* SLS_TLS_CERT_H */

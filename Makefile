@@ -389,6 +389,15 @@ MBEDTLS_DEFS  = -DMBEDTLS_USER_CONFIG_FILE='"sls_mbedtls_config.h"' -U_FORTIFY_S
 kernel/tls_platform.x86.o: kernel/tls_platform.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@
 
+# kernel/tls_cert.c is the second file to need them, for the certificate
+# WRITER (x509_crt.h, pk.h, ecp.h). Same rule, same reasoning: include/ only,
+# on exactly the two files that need it. The header comment above records that
+# the build broke once because tls_platform.c's mbedTLS include was verified
+# with hand-typed gcc flags instead of through this Makefile -- so tls_cert.c
+# was built and its image-end measured through `make`, not by hand.
+kernel/tls_cert.x86.o: kernel/tls_cert.c $(AB_STAMP)
+	$(X86_CC) $(X86_CFLAGS) $(MBEDTLS_INC) $(MBEDTLS_DEFS) -I kernel -c $< -o $@
+
 # ── The mbedTLS objects the kernel actually links ──────────────────────────
 # THREE files, not all 107, because three is the measured closure of what
 # kernel/tls_platform.c references today. There is no TLS server yet; adding

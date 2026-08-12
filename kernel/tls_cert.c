@@ -34,6 +34,7 @@
 
 #include "tls_cert.h"
 #include "rtc.h"
+#include "entropy.h"
 
 /* Two zero-padded decimal digits at p[0..1]. v is already range-checked by the
  * caller; the % 10 on the tens digit is belt-and-braces so a value above 99
@@ -146,3 +147,219 @@ int tls_cert_validity_window(uint64_t lifetime_seconds,
     }
     return TLS_CERT_OK;
 }
+
+/* Local rather than mbedtls_platform_zeroize(): that lives in tls_platform.c,
+ * which the host test does not link, and the serial path must stay testable
+ * without pulling 8 MB of library into a unit test. volatile so the store is
+ * not optimised away on a buffer nothing reads again. */
+static void secure_zero(unsigned char *p, size_t n)
+{
+    volatile unsigned char *v = p;
+    while (n--) { *v++ = 0; }
+}
+
+/* ─── Serial numbers ───────────────────────────────────────────────────────
+ * Two things mbedTLS does NOT do for us, both from reading x509write_crt.c:
+ *
+ *   set_serial_raw() is a bounds check and a memcpy. It rejects more than 20
+ *   octets and stores the rest verbatim.
+ *
+ *   mbedtls_x509write_crt_der() then prepends 0x00 when the top bit of the
+ *   first byte is set, which is correct DER for a positive INTEGER and
+ *   silently produces a 21-OCTET serial -- one over the RFC 5280 ceiling that
+ *   set_serial_raw() just finished enforcing. Half of all random 20-byte
+ *   serials do this.
+ *
+ * And a first byte of 0x00 would be written verbatim, giving a non-minimal
+ * INTEGER: a DER violation with a 1-in-256 incidence, which is the sort of
+ * defect that reproduces once a fortnight and gets blamed on the network.
+ *
+ * So: clear the top bit, force the low bit. 158 bits of entropy against the
+ * 64 anyone asks for, and the encoding is positive, minimal and non-zero by
+ * construction rather than by luck. */
+int tls_cert_make_serial(unsigned char *out, size_t len)
+{
+    unsigned char tmp[TLS_CERT_SERIAL_LEN];
+
+    if (!out || len != TLS_CERT_SERIAL_LEN) {
+        return TLS_CERT_E_BADARG;
+    }
+
+    /* Into tmp, not out: entropy_get() leaves its buffer UNTOUCHED on failure,
+     * so writing straight into the caller's buffer and returning an error
+     * would leave them holding their own uninitialised stack -- which is a
+     * disclosure bug, not a weak-serial bug, because the serial is published
+     * to every client that connects. */
+    if (entropy_get(tmp, sizeof tmp) != ENTROPY_OK) {
+        return TLS_CERT_E_NO_ENTROPY;
+    }
+
+    tmp[0] = (unsigned char)((tmp[0] & 0x7f) | 0x01);
+
+    for (size_t i = 0; i < sizeof tmp; i++) {
+        out[i] = tmp[i];
+    }
+    secure_zero(tmp, sizeof tmp);
+    return TLS_CERT_OK;
+}
+
+
+#ifndef TLS_CERT_HOST_TEST
+/* Everything below needs the vendored tree. Guarded the way tls_platform.c
+ * guards its own mbedTLS half, so the validity and serial logic above stays
+ * compilable against rtc.c alone. */
+#include "mbedtls/x509_crt.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/ecp.h"
+#include "mbedtls/asn1.h"
+#include "mbedtls/platform_util.h"
+#include "tls_platform.h"
+
+size_t strlen(const char *s);
+
+/* mbedTLS writes DER at the END of the buffer and returns its length. Every
+ * caller has to move it, and a caller that forgets gets a buffer whose first
+ * bytes are zero and whose content is somewhere in the middle -- which parses
+ * as nothing and looks like a generation failure rather than a copy failure. */
+static void der_to_front(unsigned char *buf, size_t size, size_t len)
+{
+    unsigned char *start = buf + size - len;
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = start[i];
+    }
+}
+
+static const char *g_step = "";
+static int g_ret = 0;
+const char *tls_cert_last_step(void) { return g_step; }
+int tls_cert_last_mbedtls_ret(void) { return g_ret; }
+
+/* Record the step name and mbedTLS's own return code, then bail. Every
+ * mbedTLS call below goes through this, so TLS_CERT_E_MBEDTLS always comes
+ * with the answer to "which one". */
+#define TRY(name, call) do { \
+    int r_ = (call); \
+    if (r_ != 0) { g_step = (name); g_ret = r_; goto done; } \
+} while (0)
+
+int tls_cert_self_signed(const char *dn, const char *dns,
+                         const unsigned char *ip4,
+                         uint64_t lifetime_seconds,
+                         unsigned char *crt_der, size_t crt_size, size_t *crt_len,
+                         unsigned char *key_der, size_t key_size, size_t *key_len)
+{
+    mbedtls_pk_context key;
+    mbedtls_x509write_cert crt;
+    mbedtls_x509_san_list san_dns, san_ip;
+    mbedtls_x509_san_list *san_head = NULL;
+    unsigned char serial[TLS_CERT_SERIAL_LEN];
+    char nb[TLS_CERT_TIME_BUF], na[TLS_CERT_TIME_BUF];
+    int rc = TLS_CERT_E_MBEDTLS;
+    int ret;
+
+    if (!dn || !crt_der || !crt_len || !key_der || !key_len) {
+        return TLS_CERT_E_BADARG;
+    }
+    /* Chrome 58 removed commonName matching entirely. A certificate whose
+     * identity lives only in the CN is not "less good"; it is rejected, and
+     * the failure looks like a TLS bug. Refuse to build one. */
+    if (!dns && !ip4) {
+        return TLS_CERT_E_BADARG;
+    }
+    /* "node1" is not a DN. Catch it here rather than inside mbedTLS's name
+     * parser, where it becomes a number. */
+    {
+        const char *p = dn; int has_eq = 0;
+        while (*p) { if (*p == '=') { has_eq = 1; break; } p++; }
+        if (!has_eq) { return TLS_CERT_E_BADARG; }
+    }
+    g_step = ""; g_ret = 0;
+
+    mbedtls_pk_init(&key);
+    mbedtls_x509write_crt_init(&crt);
+
+    /* Order matters: everything that can fail WITHOUT generating key material
+     * goes first, so a node with no clock never reaches the generator. */
+    if ((rc = tls_cert_validity_window(lifetime_seconds,
+                                       nb, sizeof nb, na, sizeof na)) != TLS_CERT_OK) {
+        goto done;
+    }
+    if ((rc = tls_cert_make_serial(serial, sizeof serial)) != TLS_CERT_OK) {
+        goto done;
+    }
+
+    rc = TLS_CERT_E_MBEDTLS;
+    TRY("pk_setup", mbedtls_pk_setup(&key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)));
+    /* mbedtls_ecp_gen_key() takes the group id directly, so there is no
+     * separate group_load step. The design doc inferred from a negative grep
+     * that only mbedtls_ecp_gen_keypair_base existed; it is at ecp.h:1248. */
+    TRY("ecp_gen_key", mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,
+                                           mbedtls_pk_ec(key), sls_mbedtls_rng, NULL));
+
+    /* Self-signed: subject and issuer are the same name and the same key. */
+    TRY("set_subject_name", mbedtls_x509write_crt_set_subject_name(&crt, dn));
+    TRY("set_issuer_name",  mbedtls_x509write_crt_set_issuer_name(&crt, dn));
+    /* These three return void. That inference in the design doc was correct;
+     * unlike the ecp_gen_key one, it has now been confirmed by reading. */
+    mbedtls_x509write_crt_set_subject_key(&crt, &key);
+    mbedtls_x509write_crt_set_issuer_key(&crt, &key);
+    mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+
+    TRY("set_validity", mbedtls_x509write_crt_set_validity(&crt, nb, na));
+    TRY("set_serial_raw", mbedtls_x509write_crt_set_serial_raw(&crt, serial, sizeof serial));
+    /* CA:FALSE. This is a leaf that happens to be its own issuer, not a CA.
+     * Browsers and curl --cacert both accept a self-signed leaf as its own
+     * trust anchor; asserting CA:TRUE would additionally claim it may sign
+     * others, which is not true and not needed. */
+    TRY("set_basic_constraints", mbedtls_x509write_crt_set_basic_constraints(&crt, 0, -1));
+    TRY("set_subject_key_identifier", mbedtls_x509write_crt_set_subject_key_identifier(&crt));
+
+    /* SubjectAltName. Read out of library/x509write.c rather than from the
+     * struct's own field comment, which says only rfc822Name, dnsName and URI
+     * are supported -- that comment describes the PARSE side and is wrong for
+     * writing. mbedtls_x509_write_set_san_common() handles IP_ADDRESS, taking
+     * the bytes from san.unstructured_name and writing them raw under the
+     * context tag. So ip4 is FOUR BYTES; a dotted-quad string here would
+     * encode the ASCII text under the iPAddress tag and every verifier would
+     * reject it. */
+    if (dns) {
+        san_dns.node.type = MBEDTLS_X509_SAN_DNS_NAME;
+        san_dns.node.san.unstructured_name.tag = MBEDTLS_ASN1_IA5_STRING;
+        san_dns.node.san.unstructured_name.p = (unsigned char *)(uintptr_t)dns;
+        san_dns.node.san.unstructured_name.len = strlen(dns);
+        san_dns.next = NULL;
+        san_head = &san_dns;
+    }
+    if (ip4) {
+        san_ip.node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+        san_ip.node.san.unstructured_name.tag = MBEDTLS_ASN1_OCTET_STRING;
+        san_ip.node.san.unstructured_name.p = (unsigned char *)(uintptr_t)ip4;
+        san_ip.node.san.unstructured_name.len = 4;
+        san_ip.next = NULL;
+        if (san_head) { san_dns.next = &san_ip; } else { san_head = &san_ip; }
+    }
+    TRY("set_subject_alternative_name", mbedtls_x509write_crt_set_subject_alternative_name(&crt, san_head));
+
+    /* Signing needs randomness too: ECDSA draws a per-signature nonce, and a
+     * reused or predictable one recovers the private key outright. Same RNG,
+     * same fail-closed path. */
+    ret = mbedtls_x509write_crt_der(&crt, crt_der, crt_size, sls_mbedtls_rng, NULL);
+    if (ret < 0) { g_step = "crt_der"; g_ret = ret; goto done; }
+    *crt_len = (size_t)ret;
+    der_to_front(crt_der, crt_size, *crt_len);
+
+    ret = mbedtls_pk_write_key_der(&key, key_der, key_size);
+    if (ret < 0) { g_step = "pk_write_key_der"; g_ret = ret; goto done; }
+    *key_len = (size_t)ret;
+    der_to_front(key_der, key_size, *key_len);
+
+    rc = TLS_CERT_OK;
+
+done:
+    mbedtls_platform_zeroize(serial, sizeof serial);
+    mbedtls_x509write_crt_free(&crt);
+    mbedtls_pk_free(&key);
+    return rc;
+}
+
+#endif /* TLS_CERT_HOST_TEST */
