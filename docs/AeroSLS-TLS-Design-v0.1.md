@@ -4,6 +4,9 @@
 x86-64 kernel image. Phase 3 (a listener) is next and nothing calls the library
 yet. See "Phase 2 result" below. Phase 2 library choice REVERSED — see
 the amendment immediately below before reading §3.
+**The image-end number has been taken** (2026-08-11): mbedTLS costs **512 KiB**
+of a 223 MiB image. Trimming the module list is housekeeping, not urgent. See
+"Image-end measurement" at the foot of this document; the request is closed.
 **Decided:** port **mbedTLS 3.6 LTS** (not BearSSL, not write-our-own); private
 CA with per-node certificates; first shippable version is server-side TLS
 **plus** mutual TLS between nodes.
@@ -129,10 +132,13 @@ certificate subject names had the link resolved silently.
 
 ### Owed
 
-- **Trim the module list.** Everything is linked because nothing was called
-  yet and no closure could be measured. `oid.c` and `x509_csr.c` demonstrated
-  the cost. Once a listener exists the real closure is measurable and this
-  becomes a real task with the image-end number as its instrument.
+- ~~**Trim the module list.**~~ **Answered, and the answer is no.** The
+  instrument has now been read: linking all 107 modules costs **512 KiB** of a
+  **223 MiB** image — 0.22%. See "Image-end measurement" below. This stays on
+  the list as tidiness, not as a task with a deadline, and it should not be
+  allowed to block Phase 3. What the number does *not* retire is §3.2's
+  per-connection RAM, which is a different quantity that trimming would not
+  improve either.
 - **Collapse the two snprintfs.** `sls_tls_snprintf` could replace the TCG
   stub, whose own comment says a real one is the fix.
 - **The ARM64 entropy gate** (§2.5), still unrun on hardware with no RNG
@@ -603,6 +609,36 @@ produced the `gmtime_r` error in Phase 2.
 `mbedtls_ecp_gen_key` likewise did not match; only `mbedtls_ecp_gen_keypair_base`
 (ecp.h:1201) did. Check which generator this version actually exposes.
 
+#### Both inferences resolved, 2026-08-11 — one held, one did not
+
+Read out of the vendored tree rather than inferred:
+
+- **The `void` inference was right.** `mbedtls_x509write_crt_set_subject_key`,
+  `_set_issuer_key` and `_set_md_alg` all return `void`. Nothing to check at
+  those call sites, and nothing to handle.
+- **The `mbedtls_ecp_gen_key` inference was WRONG.** It is right there at
+  `vendor/mbedtls/include/mbedtls/ecp.h:1248`:
+
+  ```c
+  int mbedtls_ecp_gen_key(mbedtls_ecp_group_id grp_id, mbedtls_ecp_keypair *key,
+                          mbedtls_f_rng_t *f_rng, void *p_rng);
+  ```
+
+  So is `mbedtls_ecp_gen_keypair`. The grep that "did not match" was reading a
+  population that did not contain the answer — the same failure mode as
+  `gmtime_r`, in the same document, two sections apart, and this time the
+  section flagged the risk in its own text and then filed the conclusion anyway.
+
+  **The rule this earns:** a negative grep is not a finding, it is a failed
+  search. Write the positive form (`grep -n 'mbedtls_ecp_gen' <file>` and read
+  every hit) or write nothing. Note also that this one survived a first attempt
+  at confirmation — an independent reader of `ecp.h` also reported the symbol
+  absent before an exact-string search found it. Two negative results are not a
+  measurement either.
+
+`mbedtls_ecp_gen_key` is the one to call: it takes the group id directly, so
+there is no separate `mbedtls_ecp_group_load` step and no `G` to pass.
+
 ### Three things to settle when writing kernel/tls_cert.c
 
 1. **Validity strings.** `set_validity` takes `YYYYMMDDHHMMSS` text, so the
@@ -616,11 +652,396 @@ produced the `gmtime_r` error in Phase 2.
    `entropy_get()` and the fail-closed path must be honoured — no serial rather
    than a predictable one.
 
+### The three, settled — 2026-08-11
+
+Read out of `vendor/mbedtls/` and `kernel/rtc.h`, `kernel/entropy.h`. Line
+numbers are this vendored 3.6.7 tree.
+
+#### 1. Validity strings — exactly 14 characters, and no `Z`
+
+`MBEDTLS_X509_RFC5280_UTC_TIME_LEN` is **15** (`x509_crt.h:140`) and
+`set_validity` demands `strlen(s) == LEN - 1`, i.e. **exactly 14**, for both
+arguments or it returns `MBEDTLS_ERR_X509_BAD_INPUT_DATA`. It then copies the
+14 and writes `'Z'` into index 14 itself:
+
+```c
+ctx->not_before[MBEDTLS_X509_RFC5280_UTC_TIME_LEN - 1] = 'Z';
+```
+
+So the string we build is `YYYYMMDDhhmmss` with **no trailing `Z`** — mbedTLS
+appends it. The field is `char not_before[MBEDTLS_X509_RFC5280_UTC_TIME_LEN + 1]`
+(`x509_crt.h:226`), zeroed by `_init`, so it ends up a well-formed
+`"YYYYMMDDhhmmssZ"`. Adding the `Z` ourselves makes the argument 15 characters
+and the call fails the length test outright.
+
+**UTCTime vs GeneralizedTime is not our problem.** `x509_write_time`
+(`x509write_crt.c:393`) picks between them by *reading the first three
+characters as text* — `t[0] < '2' || (t[0]=='2' && t[1]=='0' && t[2] < '5')` —
+so 2049 encodes as UTCTime (it drops `t+2`, writing the 2-digit year RFC 5280
+requires) and 2050 as GeneralizedTime. Nothing to configure and nothing to get
+wrong, provided the year is really 4 digits.
+
+**What the formatter actually needs.** `rtc_civil_from_days` is
+`void rtc_civil_from_days(int64_t z, int64_t* y, unsigned* m, unsigned* d)`
+(`rtc.h:109`) — it yields **the date only**. Time of day is our arithmetic on
+the same `uint64_t`: `days = t / 86400`, `sod = t % 86400`, then
+`hh = sod/3600`, `mm = sod%3600/60`, `ss = sod%60`. And the year comes back as
+`int64_t`, so it needs narrowing before a 4-digit conversion.
+
+**The prediction worth writing down:** this needs zero-padded fixed-width
+integer conversion (`%04`/`%02`). `sls_tls_snprintf` was written days ago for
+a library that mostly wanted `%s` and `%d`. If it does not implement width and
+zero-fill, the string comes out short — and `set_validity`'s exact-length test
+catches it immediately and by name. That is the good failure, and it is worth
+noticing that it is only good because someone upstream wrote `!= LEN - 1`
+instead of `> LEN - 1`. Assert `strlen == 14` at our own call site anyway, so
+the message names the formatter rather than the certificate.
+
+**And the prior question underneath it:** `rtc_get_unix()` returns `int` and is
+allowed to fail (`rtc.h:59`, and the header's own comment says it "fails on
+plausible-looking" input). No trusted time means no defensible `notBefore`, so
+§1.1's fail-closed path gets its first real consumer here too: refuse to
+generate the certificate and say why. Do not fall back to the boot epoch.
+
+#### 2. notBefore skew — backdate by a day, not by a second
+
+There is no grace period in any verifier; mbedTLS, NSS, BoringSSL and OpenSSL
+all compare `notBefore` against now and reject a certificate that is not yet
+valid. So the only question is how far back, and "a second behind" is the
+smallest of the three risks actually in play:
+
+| Risk | Size |
+|---|---|
+| Peer clock unsynchronised (no NTP, drifting RTC) | minutes to hours |
+| **Our own CMOS RTC read as UTC when the firmware holds local time** | up to ±14 hours |
+| Handshake happening one second after issuance | one second |
+
+The middle row is the one that will bite, it is ours rather than the peer's,
+and it is invisible in QEMU if the host and guest agree. **Backdate 24 hours.**
+On a self-signed certificate that is regenerated anyway it costs nothing, and
+it covers a whole-timezone error in `rtc.c` that would otherwise present as an
+intermittent, geography-dependent handshake failure.
+
+Keep `notAfter` short for the same reason — the certificate is cheap to
+reissue. A long validity buys nothing here and only raises the question of
+which browser validity ceiling applies to a certificate that does not chain to
+an installed root, which is not a question worth answering experimentally.
+
+**Operational consequence to expect in Phase 3:** if the certificate is
+regenerated on every boot, every browser trust exception is invalidated on
+every boot. That is going to make the gate below tedious long before it makes
+it fail. Persisting the key and certificate in the object catalogue (§3.1) is
+what fixes it, and that pulls §6.1's "where does the private key live" decision
+forward into Phase 3 rather than Phase 4.
+
+#### 3. Serial numbers — the fail-closed path is worse than "predictable"
+
+`MBEDTLS_X509_RFC5280_MAX_SERIAL_LEN` is **20** (`x509_crt.h:139`), matching
+RFC 5280. `set_serial_raw` is a bounds check and a `memcpy` and nothing else:
+
+```c
+if (serial_len > MBEDTLS_X509_RFC5280_MAX_SERIAL_LEN) {
+    return MBEDTLS_ERR_X509_BAD_INPUT_DATA;
+}
+ctx->serial_len = serial_len;
+memcpy(ctx->serial, serial, serial_len);
+```
+
+Two things it does not do, both of which are ours:
+
+- **The sign byte.** `mbedtls_x509write_crt_der` prepends `0x00` when the top
+  bit of the first byte is set, which is correct DER — and silently produces a
+  **21-octet** INTEGER, one over the RFC 5280 ceiling that `set_serial_raw`
+  just finished enforcing. Half of all random 20-byte serials do this.
+- **The leading zero.** A first byte that comes back `0x00` is written
+  verbatim, giving a non-minimal INTEGER. That is a DER violation with a 1-in-256
+  incidence — the sort of defect that reproduces once a fortnight and gets
+  blamed on the network.
+
+So:
+
+```c
+unsigned char serial[20];
+if (entropy_get(serial, sizeof serial) != ENTROPY_OK) {
+    /* refuse — do not generate a certificate */
+}
+serial[0] = (serial[0] & 0x7f) | 0x01;   /* positive, minimal, non-zero */
+```
+
+158 bits, against the 64 anyone asks for.
+
+**And the part the original note undersold.** `entropy.h:78` is explicit:
+`entropy_get()` returns `ENTROPY_OK` or negative **with `out` UNTOUCHED**. So
+ignoring the return does not give a predictable serial. It gives whatever was
+in that stack slot — uninitialised kernel stack, published in a certificate, to
+every client that connects. That is a disclosure bug, not a weak-serial bug.
+Zero-initialising the buffer first only downgrades it to serial `0`, which
+RFC 5280 forbids (the serial MUST be a positive integer). **Testing the return
+is the only handling that is correct**, and it is worth a mutation test in the
+§2.5 style: force `entropy_get()` to fail and assert no certificate is
+produced.
+
+#### 4. The one that was not on the list: signing consumes entropy too
+
+`mbedtls_x509write_crt_der` takes `f_rng`/`p_rng` (`x509_crt.h:1178`) because
+ECDSA needs a per-signature nonce. A nonce reused or made predictable across two
+signatures recovers the private key outright — the PlayStation 3 result, and a
+much shorter path to catastrophe than a weak serial.
+
+So the fail-closed path has to be honoured in the `f_rng` **wrapper** as well,
+and the wrapper is where it is easiest to get wrong: mbedTLS's convention is
+`0` for success, so a wrapper that forwards `entropy_get()`'s return directly
+inverts the meaning of every error — `ENTROPY_E_NOT_SEEDED` is `-1`, which is
+non-zero and therefore correctly read as failure, but `ENTROPY_OK` is `0` and
+so is mbedTLS's success. That happens to line up. It lines up *by coincidence*,
+between two enumerations neither of which was written with the other in mind,
+and the coincidence should be stated in a comment at the wrapper rather than
+relied on silently.
+
 ### Still owed from Phase 2
 
-- The **image-end number** from `tests/kernel_image_end_check.sh` on the linking
-  build. Baseline was 223 MiB pre-mbedTLS. Requested four times, still not
-  obtained; it is the instrument for deciding whether trimming the module list
-  is housekeeping or the next real task.
+- ~~The **image-end number**~~ — **obtained 2026-08-11, fifth time of asking.**
+  512 KiB for all 107 mbedTLS modules, against a 223 MiB image. Section below.
 - Collapse the two snprintfs (`sls_tls_snprintf` vs the TCG `<nofmt>` stub).
+  Now has a second reason: `sls_tls_snprintf` is about to become load-bearing
+  for validity strings, so whichever survives needs width and zero-fill.
 - Run the ARM64 entropy diversity gate on hardware with no RNG instruction.
+
+---
+
+## Image-end measurement, 2026-08-11
+
+**`_kernel_image_end` at HEAD (`9060e89`), mbedTLS linked: 223 MiB. mbedTLS's
+share of that is 512 KiB — 0.22%. Trimming the module list is housekeeping.**
+
+### The first thing found, before any number
+
+`my_sls_kernel.bin` in the tree was **not the linking build**. It was built at
+17:40 UTC, five hours before the mbedTLS commits (`c0bdc0f`..`9060e89`,
+22:54–23:21 UTC), and `nm` finds **zero** `mbedtls_*` symbols in it. None of
+the 107 `vendor/mbedtls/library/*.x86.o` objects existed on disk at all.
+
+Running the check against it would have produced a clean five-line PASS and a
+plausible 222 MiB, and that number would have been the *baseline* answering a
+question nobody asked. Four requests for this number were four requests for a
+build that did not exist yet — which is worth knowing, because it means the
+number was never one command away, and a fifth ask would not have produced it
+either. The check's own header says it: *"Run `make` first."*
+
+### The three measurements
+
+| | `_kernel_image_end` | MiB |
+|---|---|---|
+| Their real pre-mbedTLS build (`x86_64-elf-gcc` 13.2.0 / binutils 2.42) | `0x0deb6000` | 222.711 |
+| Control: HEAD tree, mbedTLS objects removed from the link | `0x0defc000` | 222.984 |
+| **HEAD, all 107 mbedTLS modules linked** | **`0x0df7c000`** | **223.484** |
+
+- **mbedTLS delta: 524,288 B = 512 KiB exactly.** Rows 2→3. One tree, one
+  toolchain, one link; the only variable is the presence of the 107 objects.
+- Toolchain-and-commit skew: 286,720 B = 280 KiB. Rows 1→2.
+
+Corroborated independently: `size -t` over the 107 objects totals 524,856 B of
+text+data+bss, which page-aligns to exactly the observed 0x80000.
+
+Where it went, by section (control → linked):
+
+| Section | Before | After | Δ |
+|---|---|---|---|
+| `.text` | 770,561 | 1,136,008 | +357 KiB |
+| `.rodata` | 1,165,880 | 1,311,912 | +143 KiB |
+| `.data` | 31,800 | 31,844 | +44 B |
+| `.bss` | 229,746,896 | 229,757,880 | +10.7 KiB |
+| `.bootstrap_stack` | 1,048,576 | 1,048,576 | — |
+
+### The caveat, stated rather than discovered later
+
+**This was not built with the project's toolchain.** `x86_64-elf-gcc` lives in
+Dave's WSL2 at `~/opt/cross/bin` and is not reachable from where this ran; the
+build used the Linux VM's native `gcc 11.4.0` / `ld 2.38` with
+`-fno-stack-protector -U_FORTIFY_SOURCE` added to match the cross compiler's
+defaults, reusing the genuine cross-toolchain objects for the six NASM sources
+and the nineteen TCG objects (nasm and `../qemu` both being absent too).
+
+That gap is the 280 KiB in row 1→2, mixed together with thirteen genuinely
+changed source files. Which is exactly why the control link exists: **the
+512 KiB is a within-toolchain difference and does not depend on any of it.**
+The absolute 223.484 MiB does. Projecting the clean delta onto the real
+baseline gives **223.211 MiB (`0x0df36000`)** as the expected reading from a
+real `make` — and the check prints whole MiB, so it will say **223 MiB** either
+way.
+
+**Reproduce it properly with one command** when convenient — it is now a
+one-liner, because the objects exist:
+
+```
+make my_sls_kernel.bin && tests/kernel_image_end_check.sh
+```
+
+If that prints anything other than 223 MiB and five `ok:` lines, this section
+is wrong and should be corrected rather than defended.
+
+### What the number decides, and what it does not
+
+**Decides:** trimming the module list is housekeeping. 512 KiB on a 223 MiB
+image is 0.22%, and even a perfect trim — deleting every module the listener
+does not reach — recovers some fraction of that 512 KiB. It should not be
+allowed to delay Phase 3, and `oid.c`/`x509_csr.c` are worth removing when
+convenient rather than as a work item.
+
+**Does not decide, and must not be read as deciding:** §3.2's per-connection
+RAM. That is ~32–35 KB of I/O buffer plus ~25 KB of handshake context *per
+connection*, allocated at run time, and the image-end number cannot see it.
+Ten connections is ~500 KB — comparable to the entire static cost of the
+library. Trimming modules does not reduce it by a byte. **The memory question
+in this document was always the connection budget, and it is still open.**
+
+**The number nobody asked about.** `.bss` is 229.7 MB — **98% of the image**.
+The 512 KiB that took five requests to measure is 0.2% of a figure sitting next
+to it that has not been questioned once, and `arch/x86/linker.ld`'s own comment
+still describes it as "117 MiB of .bss", roughly half what it now is. Whatever
+doubled it did so unremarked. That is the memory question worth a section, and
+this document is not the place for it.
+
+---
+
+## Phase 3's gate is a browser, not a test suite
+
+**Gate (unchanged): Chrome, Firefox and curl complete a handshake and fetch the
+Navigator.** This section is about why that wording is load-bearing, and what
+it does and does not buy.
+
+### Why it is harder to fool than anything asserted from inside
+
+A test suite written alongside an implementation shares the implementation's
+misunderstandings. Phase 2 has two worked examples of exactly this, four days
+apart and both in this document: `stack_frame_budget_check.sh` reported "109
+files scanned, all within budget" while scanning none of mbedTLS, and 31 host
+tests passed against an entropy subsystem that the booted kernel never
+initialised, because every one of them called `entropy_init()` as setup. In
+both cases the test was green, the code was wrong, and the test was green
+*because* it was written by the same understanding that wrote the code.
+
+A browser cannot be recruited into that. It was written years ago, by people
+who have never seen this kernel, against the RFC rather than against our
+reading of it. It has no setup function it can call on our behalf, no
+sympathetic default, and no interest in the handshake succeeding.
+
+**But the strength is not "three user agents". It is three independent
+implementations of X.509 and TLS 1.3:**
+
+| Client | Stack | Trust store |
+|---|---|---|
+| Chrome | BoringSSL | Chrome's own bundled root store |
+| Firefox | NSS | Firefox's own, independent of the OS |
+| curl | OpenSSL or GnuTLS depending on build | System store, or `--cacert` |
+
+Three codebases that share no common ancestor closer than SSLeay, disagreeing
+about nothing except by accident. A certificate all three accept is a
+certificate that is actually conformant, rather than one that happens to suit
+whichever parser we tested against first. That is the property worth having,
+and it is why dropping any one of the three costs more than a third of the
+gate.
+
+### The trap the gate walks straight into: no SAN, no Chrome
+
+**Chrome has ignored `commonName` entirely since Chrome 58.** A certificate
+whose identity lives only in the CN is rejected — the name is simply not read.
+The identity has to be in a `subjectAltName`, and for a node reached by IP
+address (which is every node in `run-cluster.sh` today) it must be an
+`iPAddress` SAN, **not** a `dNSName` containing a dotted quad. Those are
+different ASN.1 types and Chrome will not substitute one for the other.
+
+**This is not in the confirmed-API list above.** That list has
+`set_subject_name`, `set_validity`, `set_serial_raw`, `set_basic_constraints`,
+`set_subject_key_identifier` and `crt_der` — and no SAN setter, which means a
+`tls_cert.c` written from that list alone produces a certificate that fails the
+gate on its first contact with Chrome, for a reason that looks like a TLS bug
+and is not one.
+
+It is present, and it does what is needed:
+
+```c
+/* vendor/mbedtls/include/mbedtls/x509_crt.h:244 */
+int mbedtls_x509write_crt_set_subject_alternative_name(
+        mbedtls_x509write_cert *ctx, const mbedtls_x509_san_list *san_list);
+```
+
+with `MBEDTLS_X509_SAN_DNS_NAME = 2` and `MBEDTLS_X509_SAN_IP_ADDRESS = 7`
+(`x509.h:129`, `:134`); its own doc comment lists dnsName, URI, IP address,
+otherName and DirectoryName as supported. `MBEDTLS_X509_CRT_WRITE_C` and
+`MBEDTLS_X509_CREATE_C` are both on in the base config and
+`sls_mbedtls_config.h` does not disable them — it only adds
+`MBEDTLS_X509_REMOVE_INFO`, which removes pretty-printers, not writers. Worth
+confirming at first link rather than at first handshake.
+
+### `curl -k` is not a participant
+
+`curl -k` disables verification. It proves the record layer, the key exchange
+and the HTTP response — genuinely useful, and the right first target because
+its failures are legible. It proves **nothing whatsoever** about the
+certificate: not the validity dates, not the SAN, not the serial encoding, not
+the signature.
+
+So the gate needs the certificate exported and pinned:
+
+```
+curl --cacert node.pem https://<node>/           # self-signed acts as its own root
+```
+
+That path runs real chain validation, and it is the one that will tell us
+whether the 14-character validity string and the 20-byte serial actually
+encode. **Both forms should be run**, and the log should record which is which,
+because `-k` passing while `--cacert` fails is the single most informative
+outcome the gate can produce: it localises the fault to the certificate and
+away from everything else.
+
+The same distinction applies to the browsers. Clicking through an interstitial
+is *not* a pass — it is the browser recording that verification failed and the
+human overriding it. A pass means the certificate is installed in that
+browser's trust store and the padlock appears without an override. Firefox's
+store being separate from the OS store makes that two installations, not one,
+which is a feature here rather than an annoyance.
+
+### What the gate cannot see, and this is §0's whole argument
+
+**Every one of these three clients will complete a handshake against a node
+whose CSPRNG is broken, and report success.**
+
+That is not a hypothetical: it is the Debian OpenSSL failure exactly, and
+Netscape's, and ROCA's. All three shipped correct protocol implementations that
+interoperated with everything. A browser validates the protocol and the
+certificate encoding. It has no view of whether the private key it just
+negotiated against was drawn from 32,767 possibilities.
+
+So the Phase 3 gate and the §2.5 boot-diversity gate are not two tests of the
+same thing at different levels. They are the only two tests here, and each is
+blind exactly where the other sees:
+
+| | Protocol and encoding correct | Key material unpredictable |
+|---|---|---|
+| Chrome / Firefox / curl | **yes** | no — cannot see it |
+| `entropy_boot_diversity_check.sh` | no — never speaks TLS | **yes** |
+
+Neither substitutes for the other, and passing Phase 3 must not be allowed to
+read as "TLS works". It reads as "the protocol and the certificate are
+conformant" — which is what it says, and all it says.
+
+### What to capture, so the gate cannot be fooled either
+
+The gate is itself an assertion, and assertions in this project have a record
+of being green for the wrong reason. Capture evidence that is hard to fake:
+
+- The negotiated version, cipher suite and key-share group from
+  `openssl s_client -connect <node>:443 -tls1_3`, recorded verbatim. TLS 1.3
+  with `TLS_AES_128_GCM_SHA256` and x25519 is the expected line; anything else
+  means the config did not land the way §3 says it did.
+- The certificate as the peer actually sent it, `openssl x509 -noout -text`,
+  with the serial, the SAN block and both validity timestamps read back — the
+  three things settled above, verified from the wire rather than from the
+  generator.
+- A hash of the fetched Navigator payload, matched against the same fetch over
+  plain HTTP. A handshake that completes and then serves a truncated or empty
+  body is a passing handshake and a failing gate.
+- **Two consecutive boots, and the serials must differ.** This costs nothing,
+  runs in the same harness, and is the one line of the browser gate that would
+  notice §0's failure mode.
