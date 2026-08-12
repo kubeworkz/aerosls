@@ -65,6 +65,248 @@ int entropy_get(void *out, size_t len)
     return ENTROPY_OK;
 }
 
+
+/* ─── The reboot scenario, without rebooting ────────────────────────────────
+ * Everything above judges ONE generation. The change that made the CA survive
+ * a reboot is not testable that way: what has to hold is that a CA made on one
+ * boot still signs a usable leaf on a LATER one, and that the anchor an
+ * operator imported does not change underneath them.
+ *
+ * So this mode makes a CA once, moves the clock forward twice, and signs a
+ * leaf at each stop -- which is exactly what two reboots do, minus the reboot.
+ * The DER goes to disk for OpenSSL to judge; the return codes are judged here,
+ * because "this call must fail, with THIS code" is not something openssl can
+ * be asked.
+ *
+ * The negative cases are the load-bearing ones. A stored CA can be paired with
+ * the wrong key or made with a DN a later build no longer uses, and BOTH
+ * produce a certificate that is internally valid and that no browser will
+ * accept -- Firefox says SEC_ERROR_BAD_SIGNATURE for the first and nothing
+ * intelligible for the second. Asserting they are refused at generation is the
+ * difference between a named error in a boot log and an afternoon in a trust
+ * store.
+ */
+static int p_ok, p_fail;
+static void pok(const char *m)  { printf("ok:   %s\n", m); p_ok++; }
+static void pbad(const char *m) { printf("FAIL: %s\n", m); p_fail++; }
+
+static int dump(const char *dir, const char *name,
+                const unsigned char *b, size_t n)
+{
+    char path[512];
+    FILE *f;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    f = fopen(path, "wb");
+    if (!f) { perror(path); return 1; }
+    fwrite(b, 1, n, f);
+    fclose(f);
+    return 0;
+}
+
+#define DAY (24ULL * 60ULL * 60ULL)
+
+static int persist_mode(const char *dir, const struct tls_cert_san *sans,
+                        size_t san_count)
+{
+    static unsigned char ca[4096], ca_key[2048];
+    static unsigned char ca2[4096], ca2_key[2048];
+    static unsigned char l1[4096], l1k[2048];
+    static unsigned char l2[4096], l2k[2048];
+    static unsigned char lc[4096], lck[2048];
+    size_t ca_len = 0, ca_key_len = 0, ca2_len = 0, ca2_key_len = 0;
+    size_t l1_len = 0, l1k_len = 0, l2_len = 0, l2k_len = 0;
+    size_t lc_len = 0, lck_len = 0;
+    const char *CA_DN   = "CN=AeroSLS node 1 CA,O=AeroSLS";
+    const char *LEAF_DN = "CN=AeroSLS node 1,O=AeroSLS";
+    int rc;
+
+    /* Boot 1: no store on disk, so a CA is made. Five years, as
+     * TLS_SERVER_CA_SECONDS specifies. */
+    rc = tls_cert_make_ca(CA_DN, 5ULL * 365ULL * DAY,
+                          ca, sizeof ca, &ca_len,
+                          ca_key, sizeof ca_key, &ca_key_len);
+    if (rc != TLS_CERT_OK) {
+        fprintf(stderr, "make_ca: rc=%d step=%s\n", rc, tls_cert_last_step());
+        return 1;
+    }
+    pok("a CA is generated with its key handed back, not destroyed");
+
+    /* The CA key has to be small enough to share one 4 KiB frame with the CA
+     * certificate. If a future key type blows that, this is where it should be
+     * noticed -- not by a store that silently refuses to save. */
+    if (ca_len + ca_key_len <= 4096u - 32u) {
+        pok("CA certificate and key fit one 4 KiB frame with the header");
+    } else {
+        pbad("CA certificate and key do NOT fit one 4 KiB frame");
+    }
+
+    /* Boot 2, thirty days later. The CA comes off disk; only the leaf is new. */
+    if (rtc_set_unix(ORACLE_NOW + 30ULL * DAY) != RTC_OK) {
+        fprintf(stderr, "rtc_set_unix refused +30d\n"); return 1;
+    }
+    rc = tls_cert_sign_leaf(ca, ca_len, ca_key, ca_key_len, CA_DN, LEAF_DN,
+                            sans, san_count, 365ULL * DAY,
+                            l1, sizeof l1, &l1_len, l1k, sizeof l1k, &l1k_len);
+    if (rc != TLS_CERT_OK) {
+        fprintf(stderr, "sign_leaf #1: rc=%d step=%s\n", rc, tls_cert_last_step());
+        return 1;
+    }
+    pok("a 30-day-old CA signs a fresh leaf");
+
+    /* Boot 3, thirty days after that. Same CA, another new leaf. */
+    if (rtc_set_unix(ORACLE_NOW + 60ULL * DAY) != RTC_OK) {
+        fprintf(stderr, "rtc_set_unix refused +60d\n"); return 1;
+    }
+    rc = tls_cert_sign_leaf(ca, ca_len, ca_key, ca_key_len, CA_DN, LEAF_DN,
+                            sans, san_count, 365ULL * DAY,
+                            l2, sizeof l2, &l2_len, l2k, sizeof l2k, &l2k_len);
+    if (rc != TLS_CERT_OK) {
+        fprintf(stderr, "sign_leaf #2: rc=%d step=%s\n", rc, tls_cert_last_step());
+        return 1;
+    }
+    pok("and signs a second one thirty days after that");
+
+    if (l1_len != l2_len || memcmp(l1, l2, l1_len) != 0) {
+        pok("the two leaves differ -- each boot really does mint a new one");
+    } else {
+        pbad("the two leaves are IDENTICAL -- the leaf is not being regenerated");
+    }
+    if (l1k_len != l2k_len || memcmp(l1k, l2k, l1k_len) != 0) {
+        pok("and so do their private keys -- a fresh key per boot, as designed");
+    } else {
+        pbad("the two leaf KEYS are identical -- the key is being reused");
+    }
+
+    /* Clamping. A leaf asking for ten years from a CA with under five left
+     * must come back with the CA's own notAfter, not its own. Without this the
+     * leaf outlives its issuer and the chain fails at a moment nothing
+     * explains. OpenSSL checks the actual dates; this checks it was accepted. */
+    rc = tls_cert_sign_leaf(ca, ca_len, ca_key, ca_key_len, CA_DN, LEAF_DN,
+                            sans, san_count, 10ULL * 365ULL * DAY,
+                            lc, sizeof lc, &lc_len, lck, sizeof lck, &lck_len);
+    if (rc == TLS_CERT_OK) {
+        pok("a leaf asking for ten years from a five-year CA is issued, not refused");
+    } else {
+        pbad("a leaf asking beyond the CA's window was refused outright");
+    }
+
+    /* ─── The negatives ─────────────────────────────────────────────────── */
+
+    /* A second CA, to borrow a wrong key from. */
+    if (tls_cert_make_ca("CN=AeroSLS node 2 CA,O=AeroSLS", 5ULL * 365ULL * DAY,
+                         ca2, sizeof ca2, &ca2_len,
+                         ca2_key, sizeof ca2_key, &ca2_key_len) != TLS_CERT_OK) {
+        fprintf(stderr, "make_ca #2 failed\n"); return 1;
+    }
+
+    /* CA #1's certificate with CA #2's key. This is what a torn 4 KiB write or
+     * a half-updated store looks like from here, and mbedtls_pk_check_pair()
+     * is what catches it. Left uncaught it produces leaves whose signature
+     * does not verify -- Firefox's SEC_ERROR_BAD_SIGNATURE, which says nothing
+     * about which of the two blobs on disk was wrong. */
+    rc = tls_cert_sign_leaf(ca, ca_len, ca2_key, ca2_key_len, CA_DN, LEAF_DN,
+                            sans, san_count, 365ULL * DAY,
+                            l1, sizeof l1, &l1_len, l1k, sizeof l1k, &l1k_len);
+    if (rc == TLS_CERT_E_CA_MISMATCH) {
+        pok("a CA certificate paired with the wrong key is refused (E_CA_MISMATCH)");
+    } else {
+        pbad("a CA certificate paired with the WRONG KEY was accepted");
+    }
+    if (l1_len == 0) {
+        pok("  and nothing was left in the caller's leaf buffer");
+    } else {
+        pbad("  but a leaf length was left set after the refusal");
+    }
+
+    /* The DN changed between builds while an older CA is still on disk. One
+     * line in a header, no visible connection to certificates, and a chain no
+     * path builder will join -- because issuer and subject are matched on
+     * encoded bytes, not on meaning. */
+    rc = tls_cert_sign_leaf(ca, ca_len, ca_key, ca_key_len,
+                            "CN=AeroSLS node 1 CA,O=SomethingElse", LEAF_DN,
+                            sans, san_count, 365ULL * DAY,
+                            l1, sizeof l1, &l1_len, l1k, sizeof l1k, &l1k_len);
+    if (rc == TLS_CERT_E_CA_MISMATCH) {
+        pok("a DN that no longer matches the stored CA is refused (E_CA_MISMATCH)");
+    } else {
+        pbad("a leaf was signed with an issuer name the CA does not have");
+    }
+
+    /* An expired CA. Made with two days of life, asked to sign eight days
+     * later. The clamp collapses the window and E_CA_EXPIRED falls out of it,
+     * rather than a leaf whose notAfter is before its notBefore. */
+    {
+        static unsigned char sca[4096], sca_key[2048];
+        size_t sca_len = 0, sca_key_len = 0;
+        if (rtc_set_unix(ORACLE_NOW) != RTC_OK) {
+            fprintf(stderr, "rtc_set_unix refused the base time\n"); return 1;
+        }
+        if (tls_cert_make_ca(CA_DN, 2ULL * DAY, sca, sizeof sca, &sca_len,
+                             sca_key, sizeof sca_key, &sca_key_len) != TLS_CERT_OK) {
+            fprintf(stderr, "make_ca (short) failed\n"); return 1;
+        }
+        if (rtc_set_unix(ORACLE_NOW + 8ULL * DAY) != RTC_OK) {
+            fprintf(stderr, "rtc_set_unix refused +8d\n"); return 1;
+        }
+        rc = tls_cert_sign_leaf(sca, sca_len, sca_key, sca_key_len,
+                                CA_DN, LEAF_DN, sans, san_count, 365ULL * DAY,
+                                l1, sizeof l1, &l1_len, l1k, sizeof l1k, &l1k_len);
+        if (rc == TLS_CERT_E_CA_EXPIRED) {
+            pok("an expired CA is refused (E_CA_EXPIRED), not used to sign anyway");
+        } else {
+            pbad("an EXPIRED CA was used to sign a leaf");
+        }
+    }
+
+    /* Seconds remaining, the number tls_server_init() renews on. Back at the
+     * base clock the five-year CA should read close to five years; the
+     * tolerance is a day because the certificate stores whole seconds and the
+     * comparison is against a clock this test set itself. */
+    {
+        uint64_t left = 0;
+        if (rtc_set_unix(ORACLE_NOW) != RTC_OK) { return 1; }
+        rc = tls_cert_ca_seconds_remaining(ca, ca_len, &left);
+        if (rc == TLS_CERT_OK && left > (5ULL * 365ULL - 1ULL) * DAY &&
+            left <= 5ULL * 365ULL * DAY) {
+            pok("tls_cert_ca_seconds_remaining reads the CA's own notAfter back");
+        } else {
+            pbad("tls_cert_ca_seconds_remaining disagrees with the CA it read");
+            fprintf(stderr, "      rc=%d left=%llu expected ~%llu\n",
+                    rc, (unsigned long long)left,
+                    (unsigned long long)(5ULL * 365ULL * DAY));
+        }
+    }
+
+    /* l1 was reused as scratch by the negative cases above -- deliberately, to
+     * prove they leave nothing usable behind -- so boot 2's leaf is signed
+     * again here rather than writing whatever the last refusal left in the
+     * buffer. l2 was never touched after boot 3 and goes out as it stands. */
+    if (rtc_set_unix(ORACLE_NOW + 30ULL * DAY) != RTC_OK) { return 1; }
+    if (tls_cert_sign_leaf(ca, ca_len, ca_key, ca_key_len, CA_DN, LEAF_DN,
+                           sans, san_count, 365ULL * DAY,
+                           l1, sizeof l1, &l1_len,
+                           l1k, sizeof l1k, &l1k_len) != TLS_CERT_OK) {
+        fprintf(stderr, "re-sign leaf1 failed\n"); return 1;
+    }
+    /* The simulated boot times, emitted rather than left for the shell to
+     * recompute. OpenSSL judges validity against the REAL clock, so verifying
+     * a leaf dated thirty days from now needs -attime -- and a second copy of
+     * this arithmetic in the shell would be one edit away from testing a
+     * different instant than the one the certificate was signed at. */
+    printf("attime-boot2: %llu\n", (unsigned long long)(ORACLE_NOW + 30ULL * DAY));
+    printf("attime-boot3: %llu\n", (unsigned long long)(ORACLE_NOW + 60ULL * DAY));
+
+    if (dump(dir, "p_ca.der",      ca, ca_len)  ||
+        dump(dir, "p_leaf1.der",   l1, l1_len)  ||
+        dump(dir, "p_leaf2.der",   l2, l2_len)  ||
+        dump(dir, "p_clamped.der", lc, lc_len)) {
+        return 1;
+    }
+
+    printf("---- persist checks: passed=%d failed=%d\n", p_ok, p_fail);
+    return p_fail == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     unsigned char crt[4096], key[2048], ca[4096];
@@ -77,6 +319,7 @@ int main(int argc, char **argv)
         { 0,            { 10, 0, 2, 15 } },
     };
     const char *crt_path = NULL, *key_path = NULL, *ca_path = NULL;
+    const char *persist_dir = NULL;
     int rc;
 
     for (int i = 1; i < argc; i++) {
@@ -89,7 +332,8 @@ int main(int argc, char **argv)
             while (*q >= '0' && *q <= '9') { v = v * 10u + (unsigned)(*q++ - '0'); }
             counter = (unsigned char)v;
         }
-        else { fprintf(stderr, "usage: %s [--no-entropy] [--seed N] --crt F --key F\n", argv[0]); return 2; }
+        else if (strcmp(argv[i], "--persist") == 0 && i + 1 < argc) { persist_dir = argv[++i]; }
+        else { fprintf(stderr, "usage: %s [--no-entropy] [--seed N] [--persist DIR] --crt F --key F\n", argv[0]); return 2; }
     }
 
     /* kernel.c:257 does this at boot. Without it mbedtls_calloc has no pool and
@@ -101,6 +345,10 @@ int main(int argc, char **argv)
 
     if (rtc_set_unix(ORACLE_NOW) != RTC_OK) {
         fprintf(stderr, "rtc_set_unix refused the time\n"); return 1;
+    }
+
+    if (persist_dir) {
+        return persist_mode(persist_dir, sans, sizeof sans / sizeof sans[0]);
     }
 
     rc = tls_cert_chain("CN=AeroSLS node 1 CA,O=AeroSLS",

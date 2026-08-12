@@ -61,6 +61,10 @@ int tls_cert_validity_window(uint64_t lifetime_seconds,
  * uninitialised stack in a certificate. */
 #define TLS_CERT_E_NO_ENTROPY (-4)
 #define TLS_CERT_E_MBEDTLS    (-5)  /* an mbedTLS call failed; see the log */
+#define TLS_CERT_E_CA_EXPIRED (-6)  /* stored CA has no usable validity left */
+#define TLS_CERT_E_CA_MISMATCH (-7) /* CA cert and key are not a pair, or the
+                                     * leaf's issuer did not match the CA's
+                                     * subject byte-for-byte */
 int tls_cert_make_serial(unsigned char *out, size_t len);
 
 /* ─── Subject alternative names ────────────────────────────────────────────
@@ -132,13 +136,77 @@ int tls_cert_self_signed(const char *dn,
                          unsigned char *crt_der, size_t crt_size, size_t *crt_len,
                          unsigned char *key_der, size_t key_size, size_t *key_len);
 
-/* The two-certificate form. `ca_dn` and `leaf_dn` are full DNs and MUST
- * differ -- a leaf whose subject equals its issuer looks self-signed to a
- * path builder however it is signed.
+/* ─── The CA and the leaf, separately ──────────────────────────────────────
+ * tls_cert_chain() below does both in one call and destroys the CA key on the
+ * way out. That was right while certificates lived for one boot. It is no
+ * longer enough: a CA whose key is destroyed can never sign a second leaf, so
+ * every reboot produced a NEW trust anchor and every reboot cost a re-import
+ * in two trust stores. Three of those in one afternoon is what forced the
+ * split.
+ *
+ * So the two halves are now callable independently, and tls_cert_chain() is
+ * written in terms of them -- one implementation, so the oracle test still
+ * exercises exactly what the kernel runs.
+ *
+ * The cost is stated plainly because it is the whole of §6.1: make_ca() now
+ * HANDS BACK the CA private key, where before it destroyed it. That key is
+ * the node's one long-lived secret. Whoever holds it decides what this node
+ * is, for as long as the CA is trusted. kernel/tls_store.c is the only thing
+ * that may keep it, and the guard test is what makes that more than a rule in
+ * a comment.
+ */
+
+/* Generate the CA: a self-signed, CA:TRUE, pathlen-0 certificate with no SAN,
+ * plus its private key in DER. Give this a long lifetime -- it is what an
+ * operator imports, and its expiry is the only thing that forces them to do
+ * it again. */
+int tls_cert_make_ca(const char *ca_dn, uint64_t lifetime_seconds,
+                     unsigned char *ca_der, size_t ca_size, size_t *ca_len,
+                     unsigned char *ca_key_der, size_t ck_size, size_t *ck_len);
+
+/* Sign a fresh leaf (and generate its key) with an existing CA.
+ *
+ * `ca_dn` must be the DN the stored CA was actually made with. It is not
+ * taken on trust: the finished leaf is parsed back and its issuer_raw
+ * compared byte-for-byte against the CA's subject_raw, and a mismatch is
+ * TLS_CERT_E_CA_MISMATCH rather than a chain that no path builder can join.
+ * That check exists for one specific future: someone edits the DN constant in
+ * a later build while a CA made with the old one is still on disk. Without
+ * it, that ships a node whose certificate looks fine in isolation and fails
+ * in every browser.
+ *
+ * The leaf's window is clamped INTO the CA's -- notAfter to the CA's notAfter,
+ * notBefore up to the CA's notBefore. A leaf outliving its issuer is a state
+ * every verifier reports as something other than what it is, and a backwards
+ * RTC is enough to produce one.
+ *
+ * `ca_key_der` is private key material on the way in and is zeroized in the
+ * caller's buffer by nobody -- the caller owns it and must clear it. */
+int tls_cert_sign_leaf(const unsigned char *ca_der, size_t ca_len,
+                       const unsigned char *ca_key_der, size_t ca_key_len,
+                       const char *ca_dn, const char *leaf_dn,
+                       const struct tls_cert_san *sans, size_t san_count,
+                       uint64_t lifetime_seconds,
+                       unsigned char *leaf_der, size_t leaf_size, size_t *leaf_len,
+                       unsigned char *leaf_key_der, size_t lk_size, size_t *lk_len);
+
+/* Seconds of validity a CA certificate has left, 0 if it has none. Separate
+ * from sign_leaf()'s hard failure on an unusable CA because the two questions
+ * are different: sign_leaf() answers "can I", this answers "should I still",
+ * and a node should replace its anchor on a schedule rather than at the
+ * moment it stops working. */
+int tls_cert_ca_seconds_remaining(const unsigned char *ca_der, size_t ca_len,
+                                  uint64_t *out);
+
+/* The two-certificate form, in one call, with the CA key destroyed before
+ * returning. `ca_dn` and `leaf_dn` are full DNs and MUST differ -- a leaf
+ * whose subject equals its issuer looks self-signed to a path builder however
+ * it is signed.
  *
  * Outputs: the CA certificate (import this into a trust store), the leaf
  * certificate (the node presents this), and the leaf's private key. The CA
- * key is zeroized before returning and cannot be recovered. */
+ * key is zeroized before returning and cannot be recovered -- which is also
+ * why a node built on this call alone cannot survive a reboot. */
 int tls_cert_chain(const char *ca_dn, const char *leaf_dn,
                    const struct tls_cert_san *sans, size_t san_count,
                    uint64_t lifetime_seconds,

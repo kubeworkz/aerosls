@@ -24,6 +24,7 @@
 
 #include "tls_server.h"
 #include "tls_cert.h"
+#include "tls_store.h"
 #include "tls_platform.h"
 #include "entropy.h"
 #include "rtc.h"
@@ -105,7 +106,9 @@ int tls_server_init(const char *ca_dn, const char *dn,
                     const struct tls_cert_san *sans, size_t san_count)
 {
     unsigned char key_der[512];
-    size_t key_len = 0;
+    unsigned char ca_key_der[512];
+    size_t key_len = 0, ca_key_len = 0;
+    int have_ca = 0;
     int rc;
 
     if (g_ready) { return TLS_SRV_OK; }
@@ -121,19 +124,124 @@ int tls_server_init(const char *ca_dn, const char *dn,
         return TLS_SRV_E_NOT_READY;
     }
 
-    /* Two certificates, not one. A single self-signed certificate cannot
-     * satisfy Chrome and Firefox at once -- see tls_cert.h. The CA private key
-     * is destroyed inside this call and never reaches this file. */
-    rc = tls_cert_chain(ca_dn, dn, sans, san_count,
-                        90ULL * 24ULL * 60ULL * 60ULL,
-                        g_ca_der, sizeof g_ca_der, &g_ca_der_len,
-                        g_crt_der, sizeof g_crt_der, &g_crt_der_len,
-                        key_der, sizeof key_der, &key_len);
-    if (rc != TLS_CERT_OK) {
-        kernel_serial_printf("[TLS] certificate generation failed: rc=%d step=%s\n",
-                             rc, tls_cert_last_step());
-        return TLS_SRV_E_NOT_READY;
+    /* ─── The CA: from disk if it is there and usable, otherwise new ───────
+     *
+     * Two certificates, not one. A single self-signed certificate cannot
+     * satisfy Chrome and Firefox at once -- see tls_cert.h.
+     *
+     * The CA is loaded rather than generated because an anchor that changes
+     * every boot has to be re-imported every boot, in two trust stores, by
+     * hand. The leaf is still generated every boot, with a fresh key. See
+     * tls_store.h for what keeping the CA key on disk costs.
+     *
+     * Everything that can be wrong with a stored CA -- absent, written by an
+     * older format, torn, paired with the wrong key, made with a DN this build
+     * no longer uses, or simply expired -- converges on ONE repair: throw it
+     * away and make a new one. The operator re-imports once. That is why the
+     * cases below differ in what they LOG and not in what they do: a node that
+     * silently serves nothing because its stored CA was unreadable is worse
+     * than one that costs an import. */
+    rc = tls_store_load(g_ca_der, sizeof g_ca_der, &g_ca_der_len,
+                        ca_key_der, sizeof ca_key_der, &ca_key_len);
+    if (rc == TLS_STORE_OK) {
+        uint64_t left = 0;
+        if (tls_cert_ca_seconds_remaining(g_ca_der, g_ca_der_len, &left)
+                != TLS_CERT_OK) {
+            kernel_serial_print("[TLS] stored CA has an unreadable validity "
+                                "window -- replacing it.\n");
+            have_ca = 0;
+        } else if (left < TLS_SERVER_CA_RENEW_SECONDS) {
+            /* Replaced on a schedule rather than at the moment it stops
+             * working, so the re-import happens when someone is looking at it
+             * and not in the middle of an outage. */
+            kernel_serial_printf("[TLS] stored CA expires in %u day(s) -- "
+                                 "replacing it now rather than mid-flight. "
+                                 "Re-import the CA.\n",
+                                 (unsigned)(left / (24ULL * 60ULL * 60ULL)));
+            have_ca = 0;
+        } else {
+            have_ca = 1;
+            kernel_serial_printf("[TLS] CA loaded from disk, %u day(s) left. "
+                                 "An existing import is still good.\n",
+                                 (unsigned)(left / (24ULL * 60ULL * 60ULL)));
+        }
+    } else if (rc == TLS_STORE_E_EMPTY) {
+        kernel_serial_print("[TLS] no stored CA -- first boot on this disk.\n");
+    } else if (rc == TLS_STORE_E_NO_NVME) {
+        /* Not fatal, and worth being loud about: TLS still works, but this
+         * boot's anchor dies with it and the operator will be re-importing
+         * again next time without being told why. */
+        kernel_serial_print("[TLS] no NVMe -- the CA cannot be stored and will "
+                            "not survive this boot.\n");
+    } else {
+        kernel_serial_printf("[TLS] stored CA unusable (rc=%d) -- replacing "
+                             "it. Re-import the CA.\n", rc);
     }
+
+    if (have_ca) {
+        rc = tls_cert_sign_leaf(g_ca_der, g_ca_der_len, ca_key_der, ca_key_len,
+                                ca_dn, dn, sans, san_count,
+                                TLS_SERVER_LEAF_SECONDS,
+                                g_crt_der, sizeof g_crt_der, &g_crt_der_len,
+                                key_der, sizeof key_der, &key_len);
+        if (rc != TLS_CERT_OK) {
+            /* The stored CA parsed and had time left, and still could not sign.
+             * TLS_CERT_E_CA_MISMATCH here is the DN-changed-between-builds case
+             * tls_cert.h describes; anything else is a stored key that is not
+             * what it claims. Either way the frame is now known-bad, so wipe it
+             * rather than leave a private key on disk that nothing will ever
+             * use again. */
+            kernel_serial_printf("[TLS] stored CA could not sign a leaf: rc=%d "
+                                 "step=%s -- discarding it.\n",
+                                 rc, tls_cert_last_step());
+            tls_store_wipe();
+            have_ca = 0;
+        }
+    }
+
+    if (!have_ca) {
+        mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
+        ca_key_len = 0;
+        rc = tls_cert_make_ca(ca_dn, TLS_SERVER_CA_SECONDS,
+                              g_ca_der, sizeof g_ca_der, &g_ca_der_len,
+                              ca_key_der, sizeof ca_key_der, &ca_key_len);
+        if (rc == TLS_CERT_OK) {
+            rc = tls_cert_sign_leaf(g_ca_der, g_ca_der_len,
+                                    ca_key_der, ca_key_len,
+                                    ca_dn, dn, sans, san_count,
+                                    TLS_SERVER_LEAF_SECONDS,
+                                    g_crt_der, sizeof g_crt_der, &g_crt_der_len,
+                                    key_der, sizeof key_der, &key_len);
+        }
+        if (rc != TLS_CERT_OK) {
+            kernel_serial_printf("[TLS] certificate generation failed: rc=%d step=%s\n",
+                                 rc, tls_cert_last_step());
+            mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
+            mbedtls_platform_zeroize(key_der, sizeof key_der);
+            return TLS_SRV_E_NOT_READY;
+        }
+
+        /* Store it only AFTER it has proved it can sign, so a CA that cannot
+         * be used never becomes the CA that gets loaded next boot. A failure
+         * here is not fatal -- the node serves fine this uptime -- but it does
+         * mean another re-import, so it is said out loud. */
+        if (tls_store_save(g_ca_der, g_ca_der_len,
+                           ca_key_der, ca_key_len) != TLS_STORE_OK) {
+            kernel_serial_print("[TLS] new CA could NOT be stored -- it will "
+                                "not survive a reboot.\n");
+        } else {
+            kernel_serial_print("[TLS] new CA generated and stored. Import it "
+                                "once; it now survives reboots.\n");
+        }
+    }
+
+    /* The CA key's whole life in this file ends on this line. It was needed to
+     * sign the leaf and is needed for nothing else: mbedTLS holds the LEAF key
+     * for the handshake, and the copy on disk is where the next boot gets it
+     * from. Anything below this point that wanted the CA key would be a bug,
+     * and there is nothing left for it to read. */
+    mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
+    ca_key_len = 0;
 
     mbedtls_x509_crt_init(&g_crt);
     mbedtls_pk_init(&g_key);
@@ -197,6 +305,7 @@ int tls_server_init(const char *ca_dn, const char *dn,
     return TLS_SRV_OK;
 
 fail:
+    mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
     mbedtls_platform_zeroize(key_der, sizeof key_der);
     mbedtls_ssl_config_free(&g_conf);
     mbedtls_pk_free(&g_key);

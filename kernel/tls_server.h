@@ -41,6 +41,33 @@
  * That is not advice, it is how these two were arrived at. */
 #define TLS_SERVER_MAX_SESSIONS 6
 
+/* ─── Certificate lifetimes ────────────────────────────────────────────────
+ * Three numbers, and the relationship between them matters more than any one
+ * of them does.
+ *
+ * The CA is what an operator imports by hand into Chrome's store and again
+ * into Firefox's. Its expiry is the ONLY thing that makes them do it again, so
+ * it is long. Five years, not ten: the key sits in plaintext on an unencrypted
+ * disk (tls_store.h says why), and an open-ended commitment to a secret in
+ * that position is not one worth making.
+ *
+ * The leaf is regenerated with a fresh key on every boot, so its lifetime is
+ * not about key exposure -- it is about UPTIME. Nothing re-issues the leaf
+ * while the node is running, so a lifetime shorter than the longest expected
+ * uptime would expire a certificate underneath a node that is serving happily,
+ * with no log line at the moment it happens and browser errors afterwards. A
+ * year is comfortably beyond any uptime this has seen. It is a bound, not a
+ * solution: in-flight re-issue is the real fix and is not written yet.
+ *
+ * The renewal margin is deliberately EQUAL to the leaf lifetime rather than
+ * being a fourth arbitrary number. It states the actual rule -- replace the CA
+ * when it can no longer issue a full-length leaf -- so the two cannot drift
+ * apart, and it means a leaf is never silently short-changed by
+ * tls_cert_sign_leaf()'s clamp into a nearly-expired issuer's window. */
+#define TLS_SERVER_CA_SECONDS      (5ULL * 365ULL * 24ULL * 60ULL * 60ULL)
+#define TLS_SERVER_LEAF_SECONDS    (365ULL * 24ULL * 60ULL * 60ULL)
+#define TLS_SERVER_CA_RENEW_SECONDS TLS_SERVER_LEAF_SECONDS
+
 /* Generate a self-signed certificate and build the shared server config.
  * Safe to call more than once; the second call is a no-op. Returns TLS_SRV_OK
  * or negative -- and on failure TLS must not start, which is §2.4's

@@ -251,6 +251,27 @@
 #define PERSIST_WORKLOAD_HDR_LBA        7608ULL
 #define PERSIST_WORKLOAD_ENT_LBA        7624ULL
 
+// ─── TLS trust anchor ────────────────────────────────────────────────────────
+// One frame at LBA 7680, after checkpoint_mgr's entries.
+//
+//   PERSIST_CKPT_ENT_LBA 7664 + SECTORS_PER_FRAME 8  -> ends 7672
+//   +1 frame safety gap, matching every other boundary in this file
+//   PERSIST_TLS_LBA      7680 + 8                    -> ends 7688
+//   STREAM_DIR_LBA       8192                        -> 504 sectors still free
+//
+// Holds the node's CA certificate and CA private key, and nothing else. The
+// LEAF certificate and its key are deliberately NOT stored: they are
+// regenerated every boot and signed by this CA, so the only long-lived secret
+// on disk is the one that has to be. A browser that has imported this CA stays
+// trusting across reboots, which is the entire point -- three re-imports in one
+// afternoon is what made this necessary.
+//
+// §6.1 applies to exactly one thing now: these bytes. The CA key must be
+// provably absent from checkpoint_mgr's walk, and a guard test is what makes
+// that more than an intention.
+#define PERSIST_TLS_LBA                 7680ULL
+#define PERSIST_TLS_MAGIC               0x534C53544C533031ULL   /* "SLSTLS01" */
+
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously
 // always 0) -- see the LBA layout comment above for the full reasoning.

@@ -221,6 +221,95 @@ fi
 
 mv -f "$BUILD/crt.last.der" "$CRT" 2>/dev/null
 
+# ─── the CA outliving the boot that made it ────────────────────────────────
+# Everything above judges ONE generation. The whole point of storing the CA is
+# that a LATER boot signs a new leaf with it and the operator's import stays
+# good -- and nothing above can see that, because nothing above involves a
+# second boot.
+#
+# The oracle's --persist mode makes a CA, moves its clock forward twice, and
+# signs a leaf at each stop. It prints its own ok:/FAIL: lines for the return
+# codes (OpenSSL cannot be asked "this call must fail, with THIS code"); they
+# are folded into this script's tally below so a failure there fails here.
+# The DER it leaves behind is judged by OpenSSL, as everything else is.
+echo
+echo "=== the CA across three boots ==="
+P="$BUILD/persist"
+rm -rf "$P"; mkdir -p "$P"
+POUT="$("$BUILD/oracle" --persist "$P" 2>&1)"; prc=$?
+echo "$POUT" | grep -E '^(ok|FAIL):' | sed 's/^/    /'
+pass=$(( pass + $(echo "$POUT" | grep -c '^ok:') ))
+fail=$(( fail + $(echo "$POUT" | grep -c '^FAIL:') ))
+if [ "$prc" -ne 0 ] && [ "$(echo "$POUT" | grep -c '^FAIL:')" -eq 0 ]; then
+    # Exited non-zero with no FAIL line: it died before it could report.
+    echo "$POUT" | sed 's/^/    /'
+    bad "the persist-mode oracle exited $prc without reporting"
+fi
+
+if [ -s "$P/p_ca.der" ] && [ -s "$P/p_leaf1.der" ] && [ -s "$P/p_leaf2.der" ]; then
+    openssl x509 -inform DER -in "$P/p_ca.der"      -out "$P/ca.pem"   2>/dev/null
+    openssl x509 -inform DER -in "$P/p_leaf1.der"   -out "$P/l1.pem"   2>/dev/null
+    openssl x509 -inform DER -in "$P/p_leaf2.der"   -out "$P/l2.pem"   2>/dev/null
+    openssl x509 -inform DER -in "$P/p_clamped.der" -out "$P/lc.pem"   2>/dev/null
+
+    # The one that matters: an operator imported p_ca.der once. Both leaves --
+    # thirty simulated days apart -- must verify against that same import.
+    # -attime, because these leaves are dated thirty and sixty days from the
+    # oracle's clock and OpenSSL judges against the real one -- without it both
+    # verifies fail with "certificate is not yet valid", which is true and has
+    # nothing to do with what is being tested. The instants come from the
+    # oracle itself so the shell cannot drift from what was signed.
+    T2="$(echo "$POUT" | sed -n 's/^attime-boot2: //p')"
+    T3="$(echo "$POUT" | sed -n 's/^attime-boot3: //p')"
+    if [ -z "$T2" ] || [ -z "$T3" ]; then
+        bad "the oracle did not report its simulated boot times"
+        T2=0; T3=0
+    fi
+    openssl verify -attime "$T2" -CAfile "$P/ca.pem" -verify_hostname localhost "$P/l1.pem" >/dev/null 2>&1 \
+        && ok "boot 2's leaf verifies against the stored CA" \
+        || bad "boot 2's leaf does NOT verify against the stored CA"
+    openssl verify -attime "$T3" -CAfile "$P/ca.pem" -verify_hostname localhost "$P/l2.pem" >/dev/null 2>&1 \
+        && ok "boot 3's leaf verifies against the SAME stored CA -- the import held" \
+        || bad "boot 3's leaf does not verify against the stored CA"
+
+    # The negative that keeps the two above honest: a leaf must NOT verify
+    # against a CA it was not signed by. Without this, "verify succeeded" could
+    # mean the flags were wrong and openssl checked nothing.
+    openssl verify -attime "$T2" -CAfile "$P/l2.pem" "$P/l1.pem" >/dev/null 2>&1 \
+        && bad "a leaf verified against something that is not its issuer" \
+        || ok "  and does not verify against a CA that did not sign it"
+
+    # Different serials, different keys. If these ever matched, the leaf would
+    # be being reused across boots and the fresh-key-per-boot claim would be
+    # false -- which is the sort of thing that stays true in a comment long
+    # after it stops being true in the code.
+    s1="$(openssl x509 -in "$P/l1.pem" -noout -serial)"
+    s2="$(openssl x509 -in "$P/l2.pem" -noout -serial)"
+    [ "$s1" != "$s2" ] && ok "the two leaves carry different serials" \
+                       || bad "the two leaves share a serial"
+    k1="$(openssl x509 -in "$P/l1.pem" -noout -pubkey)"
+    k2="$(openssl x509 -in "$P/l2.pem" -noout -pubkey)"
+    [ "$k1" != "$k2" ] && ok "and different public keys -- a new key each boot" \
+                       || bad "the two leaves share a public key"
+
+    # The clamp, in dates rather than return codes. A leaf that asked for ten
+    # years from a five-year CA must expire exactly when its issuer does.
+    cna="$(openssl x509 -in "$P/ca.pem" -noout -enddate)"
+    lna="$(openssl x509 -in "$P/lc.pem" -noout -enddate)"
+    [ "$cna" = "$lna" ] \
+        && ok "an over-long leaf is clamped to the CA's exact notAfter (${cna#notAfter=})" \
+        || bad "leaf notAfter ($lna) is not the CA's ($cna) -- the clamp did not hold"
+
+    # And an ordinary leaf must land INSIDE the issuer, not on its boundary --
+    # otherwise the check above would pass for the wrong reason.
+    l1na="$(openssl x509 -in "$P/l1.pem" -noout -enddate)"
+    [ "$l1na" != "$cna" ] \
+        && ok "a normal leaf expires before the CA, so the clamp above meant something" \
+        || bad "every leaf is landing on the CA's notAfter -- the clamp test proves nothing"
+else
+    bad "the persist-mode oracle wrote no certificates"
+fi
+
 echo
 echo "      certificate left at $CRT for inspection:"
 echo "        openssl x509 -inform DER -in $CRT -noout -text"
