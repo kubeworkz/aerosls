@@ -22,7 +22,7 @@ set -u
 
 # Confirm/override with `pm2 list` -- this script doesn't know your actual
 # process name, only that pm2 is what manages it.
-PM2_APP_NAME="${PM2_APP_NAME:-aerosls}"
+PM2_APP_NAME="${PM2_APP_NAME:-aerosls-kernel}"
 # Hits the kernel directly, not through nginx/Cloudflare -- this script is
 # verifying the KERNEL came up correctly, not the whole public chain, which
 # has its own separate failure modes this isn't trying to catch.
