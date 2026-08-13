@@ -23,12 +23,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: aerosls2
+
+      # The host suite's sls_alloc_host_test.c greps the REAL
+      # qemu/sls/sls-runtime.c to prove its extracted allocator copy has
+      # not diverged from the shipped source (see the last check in its
+      # main()). run_all.sh runs from the repo root, so the sibling must
+      # be at ../qemu relative to it. Without this checkout that one
+      # check failed in CI while passing on any machine that happened to
+      # have a qemu sibling -- a machine-dependent pass. Same guard as
+      # the kernel-needing jobs: qemu-sls is private, so it needs
+      # QEMU_SLS_PAT.
+      - name: Guard the qemu-sls checkout (private repo requires QEMU_SLS_PAT)
+        env:
+          QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
+        run: |
+          set -u
+          if [ -n "${QEMU_SLS_PAT:-}" ]; then
+            echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
+            exit 0
+          fi
+          code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
+            https://api.github.com/repos/kubeworkz/qemu-sls)
+          if [ "$code" = "200" ]; then
+            echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
+            exit 0
+          fi
+          echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
+          echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
+          echo "::error::The host suite's sls_alloc_host_test reads ../qemu/sls/sls-runtime.c,"
+          echo "::error::so verify cannot pass without this checkout. Fix: add a read-access"
+          echo "::error::fine-grained PAT for kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
+          echo "::error::https://github.com/kubeworkz/aerosls/settings/secrets/actions"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kubeworkz/qemu-sls
+          path: qemu
+          token: ${{ secrets.QEMU_SLS_PAT }}
+          fetch-depth: 1
 
       - name: Host test suite (tests/*_host_test.c)
         run: bash tests/run_all.sh
+        working-directory: aerosls2
 
       - name: Kernel syntax check (gcc -fsyntax-only, X86_C_SRC)
         run: bash tools/syntax_check_all.sh
+        working-directory: aerosls2
 
       # ─── The *_check.sh guards ──────────────────────────────────────────
       # These were run by nothing until now: run_all.sh globs *_host_test.c,
@@ -49,6 +92,7 @@ jobs:
       # exist and "could not check" must not resemble "it is fine".
       - name: Guard scripts (tests/*_check.sh)
         run: bash tests/run_checks.sh
+        working-directory: aerosls2
 
       # The step above proves the guards pass; the smokes prove they can
       # fail. Each *_smoke.sh deliberately breaks one guard's input and
@@ -68,12 +112,15 @@ jobs:
       # even on a build host.
       - name: Script-conventions guard teeth (smoke)
         run: bash tests/script_conventions_smoke.sh
+        working-directory: aerosls2
 
       - name: Makefile-sources guard teeth (smoke)
         run: bash tests/makefile_sources_smoke.sh
+        working-directory: aerosls2
 
       - name: Commands-doc guard teeth (smoke)
         run: bash tests/commands_doc_smoke.sh
+        working-directory: aerosls2
 
   kernel-guards:
     # The five kernel-needing guards (stack_frame_budget, kernel_image_end,
