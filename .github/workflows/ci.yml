@@ -40,16 +40,88 @@ jobs:
           QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
         run: |
           set -u
+          # Probe helper: echo the HTTP code for a URL, with the PAT as a
+          # Bearer when one is set. `|| echo 000` keeps a curl failure
+          # (network, DNS, TLS) from aborting under bash -e with zero
+          # output; 000 means "no response" and every caller checks for it.
+          probe() {
+            if [ -n "$2" ]; then
+              curl -sL --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $2" "$1" || echo 000
+            else
+              curl -sL --max-time 15 -o /dev/null -w '%{http_code}' "$1" || echo 000
+            fi
+          }
           if [ -n "${QEMU_SLS_PAT:-}" ]; then
-            echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
-            exit 0
+            # Secret set: validate it actually covers the repo BEFORE the
+            # checkout, so a mis-configured token fails here with the
+            # cause instead of burning retries on a raw git 403. Probe 1
+            # = repo metadata (GET /repos/...): needs only Metadata: Read
+            # on the repo. Probe 2 = the root contents listing (GET
+            # /repos/.../contents/): needs Contents: Read -- the
+            # permission git smart-HTTP actually uses. The failure modes
+            # map one-to-one:
+            #   401          -> the secret holds an invalid/expired token
+            #                  (stale or truncated value -- re-paste the
+            #                  current token from the PAT edit page)
+            #   403/404 on 1 -> token authenticates but is not granted
+            #                  this repo (wrong repo selected, wrong
+            #                  owner account, or the org never approved
+            #                  the fine-grained token)
+            #   200 then 403 -> metadata-only token: Contents: Read
+            #                  missing. Invisible to the anonymous probe
+            #                  and to the API repo endpoint (curl says
+            #                  200, git says 403) -- the exact failure
+            #                  that took three CI cycles to find.
+            meta=$(probe https://api.github.com/repos/kubeworkz/qemu-sls "$QEMU_SLS_PAT")
+            case "$meta" in
+              000*)
+                echo "::error::could not reach api.github.com to validate QEMU_SLS_PAT (HTTP $meta) --"
+                echo "::error::retry the run; CI cannot verify the checkout without the probe."
+                exit 1 ;;
+              200) ;;
+              401)
+                echo "::error::QEMU_SLS_PAT is set but GitHub rejects it as a credential (HTTP 401) --"
+                echo "::error::the secret likely holds a stale, truncated, or revoked token value;"
+                echo "::error::copy the current token from the fine-grained PAT edit page and re-save"
+                echo "::error::the QEMU_SLS_PAT secret with it."
+                exit 1 ;;
+              403|404)
+                echo "::error::QEMU_SLS_PAT is set but GitHub denies it on kubeworkz/qemu-sls (HTTP $meta)."
+                echo "::error::The token authenticates but is not granted this repository -- on the"
+                echo "::error::fine-grained PAT's edit page check that Repository access includes"
+                echo "::error::kubeworkz/qemu-sls, that the token was created in the account that"
+                echo "::error::owns/admins the repo, and that any required org approval was granted."
+                exit 1 ;;
+              *)
+                echo "::error::unexpected HTTP $meta probing kubeworkz/qemu-sls with QEMU_SLS_PAT -- retry the run."
+                exit 1 ;;
+            esac
+            contents=$(probe "https://api.github.com/repos/kubeworkz/qemu-sls/contents/" "$QEMU_SLS_PAT")
+            case "$contents" in
+              200)
+                echo "QEMU_SLS_PAT validated on kubeworkz/qemu-sls (metadata + contents read) -- proceeding to the checkout."
+                exit 0 ;;
+              000*)
+                echo "::error::could not reach api.github.com validating QEMU_SLS_PAT contents access (HTTP $contents) -- retry the run."
+                exit 1 ;;
+              403|404)
+                echo "::error::QEMU_SLS_PAT can read the repo's metadata but NOT its contents (HTTP $contents)."
+                echo "::error::git clone/fetch needs Contents: Read, not just Metadata. On the fine-grained"
+                echo "::error::PAT's edit page for kubeworkz/qemu-sls set Permissions -> Repository"
+                echo "::error::permissions -> Contents: Read-only (Metadata: Read is auto-granted)."
+                exit 1 ;;
+              *)
+                echo "::error::unexpected HTTP $contents probing qemu-sls contents with QEMU_SLS_PAT -- retry the run."
+                exit 1 ;;
+            esac
           fi
-          # `|| echo 000`: a curl network failure exits non-zero, and
-          # under bash -e that would abort the step with zero output.
-          # 000 means "no response" -- checked below so it is not
-          # misreported as a private repo.
-          code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/kubeworkz/qemu-sls || echo 000)
+          # No secret set: probe the repo anonymously -- a 200 means it
+          # went public (no secret needed, checkout works anonymously),
+          # anything else means the checkout would fail, so name the fix
+          # and stop. -L: the API answers 301 (moved to a repository-ID
+          # URL) for public repos; without following it a public repo
+          # would be misread as private and the guard would fail wrongly.
+          code=$(probe https://api.github.com/repos/kubeworkz/qemu-sls "")
           if [ "$code" = "200" ]; then
             echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
             exit 0
@@ -192,19 +264,88 @@ jobs:
           QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
         run: |
           set -u
+          # Probe helper: echo the HTTP code for a URL, with the PAT as a
+          # Bearer when one is set. `|| echo 000` keeps a curl failure
+          # (network, DNS, TLS) from aborting under bash -e with zero
+          # output; 000 means "no response" and every caller checks for it.
+          probe() {
+            if [ -n "$2" ]; then
+              curl -sL --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $2" "$1" || echo 000
+            else
+              curl -sL --max-time 15 -o /dev/null -w '%{http_code}' "$1" || echo 000
+            fi
+          }
           if [ -n "${QEMU_SLS_PAT:-}" ]; then
-            echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
-            exit 0
+            # Secret set: validate it actually covers the repo BEFORE the
+            # checkout, so a mis-configured token fails here with the
+            # cause instead of burning retries on a raw git 403. Probe 1
+            # = repo metadata (GET /repos/...): needs only Metadata: Read
+            # on the repo. Probe 2 = the root contents listing (GET
+            # /repos/.../contents/): needs Contents: Read -- the
+            # permission git smart-HTTP actually uses. The failure modes
+            # map one-to-one:
+            #   401          -> the secret holds an invalid/expired token
+            #                  (stale or truncated value -- re-paste the
+            #                  current token from the PAT edit page)
+            #   403/404 on 1 -> token authenticates but is not granted
+            #                  this repo (wrong repo selected, wrong
+            #                  owner account, or the org never approved
+            #                  the fine-grained token)
+            #   200 then 403 -> metadata-only token: Contents: Read
+            #                  missing. Invisible to the anonymous probe
+            #                  and to the API repo endpoint (curl says
+            #                  200, git says 403) -- the exact failure
+            #                  that took three CI cycles to find.
+            meta=$(probe https://api.github.com/repos/kubeworkz/qemu-sls "$QEMU_SLS_PAT")
+            case "$meta" in
+              000*)
+                echo "::error::could not reach api.github.com to validate QEMU_SLS_PAT (HTTP $meta) --"
+                echo "::error::retry the run; CI cannot verify the checkout without the probe."
+                exit 1 ;;
+              200) ;;
+              401)
+                echo "::error::QEMU_SLS_PAT is set but GitHub rejects it as a credential (HTTP 401) --"
+                echo "::error::the secret likely holds a stale, truncated, or revoked token value;"
+                echo "::error::copy the current token from the fine-grained PAT edit page and re-save"
+                echo "::error::the QEMU_SLS_PAT secret with it."
+                exit 1 ;;
+              403|404)
+                echo "::error::QEMU_SLS_PAT is set but GitHub denies it on kubeworkz/qemu-sls (HTTP $meta)."
+                echo "::error::The token authenticates but is not granted this repository -- on the"
+                echo "::error::fine-grained PAT's edit page check that Repository access includes"
+                echo "::error::kubeworkz/qemu-sls, that the token was created in the account that"
+                echo "::error::owns/admins the repo, and that any required org approval was granted."
+                exit 1 ;;
+              *)
+                echo "::error::unexpected HTTP $meta probing kubeworkz/qemu-sls with QEMU_SLS_PAT -- retry the run."
+                exit 1 ;;
+            esac
+            contents=$(probe "https://api.github.com/repos/kubeworkz/qemu-sls/contents/" "$QEMU_SLS_PAT")
+            case "$contents" in
+              200)
+                echo "QEMU_SLS_PAT validated on kubeworkz/qemu-sls (metadata + contents read) -- proceeding to the checkout."
+                exit 0 ;;
+              000*)
+                echo "::error::could not reach api.github.com validating QEMU_SLS_PAT contents access (HTTP $contents) -- retry the run."
+                exit 1 ;;
+              403|404)
+                echo "::error::QEMU_SLS_PAT can read the repo's metadata but NOT its contents (HTTP $contents)."
+                echo "::error::git clone/fetch needs Contents: Read, not just Metadata. On the fine-grained"
+                echo "::error::PAT's edit page for kubeworkz/qemu-sls set Permissions -> Repository"
+                echo "::error::permissions -> Contents: Read-only (Metadata: Read is auto-granted)."
+                exit 1 ;;
+              *)
+                echo "::error::unexpected HTTP $contents probing qemu-sls contents with QEMU_SLS_PAT -- retry the run."
+                exit 1 ;;
+            esac
           fi
-          # -L: the API answers 301 (moved to a repository-ID URL) for
-          # public repos; without following it a public repo would be
-          # misread as private and the guard would fail wrongly.
-          # `|| echo 000`: a curl network failure exits non-zero, and
-          # under bash -e that would abort the step with zero output.
-          # 000 means "no response" -- checked below so it is not
-          # misreported as a private repo.
-          code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/kubeworkz/qemu-sls || echo 000)
+          # No secret set: probe the repo anonymously -- a 200 means it
+          # went public (no secret needed, checkout works anonymously),
+          # anything else means the checkout would fail, so name the fix
+          # and stop. -L: the API answers 301 (moved to a repository-ID
+          # URL) for public repos; without following it a public repo
+          # would be misread as private and the guard would fail wrongly.
+          code=$(probe https://api.github.com/repos/kubeworkz/qemu-sls "")
           if [ "$code" = "200" ]; then
             echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
             exit 0
@@ -221,8 +362,8 @@ jobs:
           echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
           echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
           echo "::error::The kernel links objects out of ../qemu, so CI cannot build without"
-          echo "::error::this checkout. Fix: add a read-access fine-grained PAT for"
-          echo "::error::kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
+          echo "::error::this checkout. Fix: add a read-access"
+          echo "::error::fine-grained PAT for kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
           echo "::error::https://github.com/kubeworkz/aerosls/settings/secrets/actions"
           exit 1
 
@@ -359,19 +500,88 @@ jobs:
           QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
         run: |
           set -u
+          # Probe helper: echo the HTTP code for a URL, with the PAT as a
+          # Bearer when one is set. `|| echo 000` keeps a curl failure
+          # (network, DNS, TLS) from aborting under bash -e with zero
+          # output; 000 means "no response" and every caller checks for it.
+          probe() {
+            if [ -n "$2" ]; then
+              curl -sL --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $2" "$1" || echo 000
+            else
+              curl -sL --max-time 15 -o /dev/null -w '%{http_code}' "$1" || echo 000
+            fi
+          }
           if [ -n "${QEMU_SLS_PAT:-}" ]; then
-            echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
-            exit 0
+            # Secret set: validate it actually covers the repo BEFORE the
+            # checkout, so a mis-configured token fails here with the
+            # cause instead of burning retries on a raw git 403. Probe 1
+            # = repo metadata (GET /repos/...): needs only Metadata: Read
+            # on the repo. Probe 2 = the root contents listing (GET
+            # /repos/.../contents/): needs Contents: Read -- the
+            # permission git smart-HTTP actually uses. The failure modes
+            # map one-to-one:
+            #   401          -> the secret holds an invalid/expired token
+            #                  (stale or truncated value -- re-paste the
+            #                  current token from the PAT edit page)
+            #   403/404 on 1 -> token authenticates but is not granted
+            #                  this repo (wrong repo selected, wrong
+            #                  owner account, or the org never approved
+            #                  the fine-grained token)
+            #   200 then 403 -> metadata-only token: Contents: Read
+            #                  missing. Invisible to the anonymous probe
+            #                  and to the API repo endpoint (curl says
+            #                  200, git says 403) -- the exact failure
+            #                  that took three CI cycles to find.
+            meta=$(probe https://api.github.com/repos/kubeworkz/qemu-sls "$QEMU_SLS_PAT")
+            case "$meta" in
+              000*)
+                echo "::error::could not reach api.github.com to validate QEMU_SLS_PAT (HTTP $meta) --"
+                echo "::error::retry the run; CI cannot verify the checkout without the probe."
+                exit 1 ;;
+              200) ;;
+              401)
+                echo "::error::QEMU_SLS_PAT is set but GitHub rejects it as a credential (HTTP 401) --"
+                echo "::error::the secret likely holds a stale, truncated, or revoked token value;"
+                echo "::error::copy the current token from the fine-grained PAT edit page and re-save"
+                echo "::error::the QEMU_SLS_PAT secret with it."
+                exit 1 ;;
+              403|404)
+                echo "::error::QEMU_SLS_PAT is set but GitHub denies it on kubeworkz/qemu-sls (HTTP $meta)."
+                echo "::error::The token authenticates but is not granted this repository -- on the"
+                echo "::error::fine-grained PAT's edit page check that Repository access includes"
+                echo "::error::kubeworkz/qemu-sls, that the token was created in the account that"
+                echo "::error::owns/admins the repo, and that any required org approval was granted."
+                exit 1 ;;
+              *)
+                echo "::error::unexpected HTTP $meta probing kubeworkz/qemu-sls with QEMU_SLS_PAT -- retry the run."
+                exit 1 ;;
+            esac
+            contents=$(probe "https://api.github.com/repos/kubeworkz/qemu-sls/contents/" "$QEMU_SLS_PAT")
+            case "$contents" in
+              200)
+                echo "QEMU_SLS_PAT validated on kubeworkz/qemu-sls (metadata + contents read) -- proceeding to the checkout."
+                exit 0 ;;
+              000*)
+                echo "::error::could not reach api.github.com validating QEMU_SLS_PAT contents access (HTTP $contents) -- retry the run."
+                exit 1 ;;
+              403|404)
+                echo "::error::QEMU_SLS_PAT can read the repo's metadata but NOT its contents (HTTP $contents)."
+                echo "::error::git clone/fetch needs Contents: Read, not just Metadata. On the fine-grained"
+                echo "::error::PAT's edit page for kubeworkz/qemu-sls set Permissions -> Repository"
+                echo "::error::permissions -> Contents: Read-only (Metadata: Read is auto-granted)."
+                exit 1 ;;
+              *)
+                echo "::error::unexpected HTTP $contents probing qemu-sls contents with QEMU_SLS_PAT -- retry the run."
+                exit 1 ;;
+            esac
           fi
-          # -L: the API answers 301 (moved to a repository-ID URL) for
-          # public repos; without following it a public repo would be
-          # misread as private and the guard would fail wrongly.
-          # `|| echo 000`: a curl network failure exits non-zero, and
-          # under bash -e that would abort the step with zero output.
-          # 000 means "no response" -- checked below so it is not
-          # misreported as a private repo.
-          code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/kubeworkz/qemu-sls || echo 000)
+          # No secret set: probe the repo anonymously -- a 200 means it
+          # went public (no secret needed, checkout works anonymously),
+          # anything else means the checkout would fail, so name the fix
+          # and stop. -L: the API answers 301 (moved to a repository-ID
+          # URL) for public repos; without following it a public repo
+          # would be misread as private and the guard would fail wrongly.
+          code=$(probe https://api.github.com/repos/kubeworkz/qemu-sls "")
           if [ "$code" = "200" ]; then
             echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
             exit 0
@@ -388,8 +598,8 @@ jobs:
           echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
           echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
           echo "::error::The kernel links objects out of ../qemu, so CI cannot build without"
-          echo "::error::this checkout. Fix: add a read-access fine-grained PAT for"
-          echo "::error::kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
+          echo "::error::this checkout. Fix: add a read-access"
+          echo "::error::fine-grained PAT for kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
           echo "::error::https://github.com/kubeworkz/aerosls/settings/secrets/actions"
           exit 1
 
