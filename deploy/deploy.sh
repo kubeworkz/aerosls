@@ -27,7 +27,11 @@ PM2_APP_NAME="${PM2_APP_NAME:-aerosls-kernel}"
 # verifying the KERNEL came up correctly, not the whole public chain, which
 # has its own separate failure modes this isn't trying to catch.
 HEALTH_URL="${HEALTH_URL:-http://localhost:3001/api/health}"
-HEALTH_RETRIES="${HEALTH_RETRIES:-15}"
+# 30 x 2s = 60s: the window must cover old-process port release PLUS a
+# fresh TCG boot of the new kernel. The pre-fix check "succeeded" in the
+# first poll because it accepted the dying process -- the honest wait is
+# longer than that.
+HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
 HEALTH_RETRY_DELAY_SECS="${HEALTH_RETRY_DELAY_SECS:-2}"
 
 cd "$(dirname "$0")/.."   # aerosls2 repo root
@@ -300,7 +304,7 @@ HEALTH_PORT="$(printf '%s' "$HEALTH_URL" | sed -nE 's#.*:([0-9]+)/.*#\1#p')"
 [ -n "$HEALTH_PORT" ] || HEALTH_PORT="3001"
 
 echo "[deploy] Recording pre-restart state (who answers $HEALTH_URL)..."
-OLD_PID="$(ss -ltnp 2>/dev/null | awk -v p=":$HEALTH_PORT " '$4 ~ p {print $NF}' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)"
+OLD_PID="$(ss -ltnp 2>/dev/null | awk -v p=":$HEALTH_PORT" 'index($4, p) {print $NF}' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)"
 OLD_UPTIME="$(curl -sf --max-time 3 "$HEALTH_URL" 2>/dev/null | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("uptime_ticks",""))
 except Exception: print("")' 2>/dev/null)"
@@ -319,7 +323,7 @@ last_pid=""
 last_uptime=""
 for i in $(seq 1 "$HEALTH_RETRIES"); do
     if curl -sf --max-time 3 "$HEALTH_URL" > "$health_tmp" 2>/dev/null; then
-        last_pid="$(ss -ltnp 2>/dev/null | awk -v p=":$HEALTH_PORT " '$4 ~ p {print $NF}' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)"
+        last_pid="$(ss -ltnp 2>/dev/null | awk -v p=":$HEALTH_PORT" 'index($4, p) {print $NF}' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)"
         last_uptime="$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("uptime_ticks",""))
 except Exception: print("")' "$health_tmp" 2>/dev/null)"
