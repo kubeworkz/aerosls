@@ -306,6 +306,14 @@ rule (a claim without a measurement is a hypothesis) applied to the plan itself.
   launcher prints correctly. This proves the full decode→emit→helper→C boundary for
   the one instruction every Linux binary eventually executes.
 
+**Status: CLOSED 2026-08-13 (iterations 12–14).** The compiled guest fixture now
+executes all three: `syscall`/`sysret` (iteration 12, the CPL handoff with R11 flags
+and RCX→RIP), `cpuid` (iteration 13, the seeded feature leaves LM|SYSCALL/LAHF_LM/
+MMX|SSE|SSE2 returned exactly), and `rdtsc` (iteration 14, helper_rdtsc reading the
+HOST TSC through lfence; the fixture proves nonzero, monotonic, strictly advancing
+reads with the raw delta packed into the marker's high dword). The launcher's
+print/compare block shows all three markers green on a single end-to-end run.
+
 ### M5 — ELF64 loader, guest bootstrap, and the Linux-compat syscall shim.
 
 - `sls-elf64-loader.c`: parse ELF64 (static only — PT_INTERP rejected loudly), place
