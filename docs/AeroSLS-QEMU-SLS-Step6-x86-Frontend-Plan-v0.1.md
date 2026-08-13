@@ -531,6 +531,24 @@ Two build-flow slips on the way, both now fixed for good:
   staging copy. The regen now writes the real path and staging is
   synced FROM it.
 
+**Iteration 11 (2026-08-12): the write side — `wrmsr` on EFER and STAR,
+helper_wrmsr (misc_helper.c).** gen_WRMSR (emit.c.inc) emits
+helper_wrmsr and ends the TB (DISAS_EOB_NEXT). val is assembled from
+EDX:EAX as upstream; the modelled set mirrors the rdmsr side and the
+default halts naming the MSR (upstream's `goto error` is #GP(0), no
+delivery here). The EFER write keeps the feature-mask semantics
+verbatim — the boot seeds CPUID LM alone among the EFER features, so
+the update mask is LME, and the value goes through cpu_load_efer's
+body (helper.c, not in this link — inlined) so hflags' LMA/SVME stay
+coherent and the post-write TB still decodes long mode. The guest
+(v11, 1399 bytes) proves six things: writing 0 clears LME, LMA
+survives the write across a TB boundary (not directly writable), a
+write carrying SCE (0x1) has it dropped, writing LME back restores the
+0x500 seed, and a full 64-bit STAR write/read round-trips the EDX:EAX
+halves. 691 instructions to HLT, `wmsr=0x010101010101` bit-for-bit,
+every prior check intact, and `invl`/`paging`/`selfmod` still pass
+with the bench running. First run, no slips.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
