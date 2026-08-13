@@ -28,12 +28,22 @@
 # a driver, or on demand -- do not add it. The list is a statement about what
 # the boot path owes, and it is only useful while it is honest.
 #
-# Exit: 0 pass, 1 fail (never 2 -- it reads source, which is always present).
+# Exit: 0 pass, 1 fail, 2 abort (prerequisite missing: the call-site
+# matcher runs in python3, which is the one tool this guard needs).
 set -u
 cd "$(dirname "$0")/.."
 
 BOOT=kernel/kernel.c
 [ -f "$BOOT" ] || { echo "FAIL: $BOOT not found."; exit 1; }
+
+# A guard that examined nothing must not pass: without python3 the matcher
+# below produces an empty report, the missing loop never fires, and the
+# verdict would be PASS on a host that checked nothing. Pre-check the tool
+# like every other guard pre-checks its tools (gcc, nm, readelf, curl).
+command -v python3 >/dev/null 2>&1 || {
+    echo "ABORT: python3 not found -- the call-site matcher runs in python." >&2
+    exit 2
+}
 
 # Subsystem inits that MUST be reached from the boot path, and why they matter
 # if they are not. The reason is printed on failure -- "not called" is a fact,

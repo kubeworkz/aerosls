@@ -30,6 +30,15 @@ bad()  { echo "FAIL: $1"; fail=$((fail+1)); }
 
 [ -f "$DOC" ] || { echo "FAIL: $DOC missing"; exit 1; }
 
+# The matchers below run in python3 (the first version was fooled twice by
+# grep). Without python3 every capture comes back empty and each check
+# reports "ok" -- a guard that examined nothing passing with authority.
+# Pre-check the tool; missing python3 is an abort, never a pass.
+command -v python3 >/dev/null 2>&1 || {
+    echo "ABORT: python3 not found -- the dispatch matchers run in python." >&2
+    exit 2
+}
+
 # ── 1. Every dispatched shell command is documented ───────────────────────
 # Both matchers: sh_starts()/sh_streq()/strcmp() for commands with arguments,
 # and sh_eq() for argless ones. Missing sh_eq was itself a mistake made while
