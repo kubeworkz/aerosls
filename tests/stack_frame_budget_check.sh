@@ -73,8 +73,20 @@ command -v nm >/dev/null || { echo "ABORT: nm not found (binutils)" >&2; exit 2;
 # measuring current frames against a 64 KiB stack that had already been raised
 # to 1 MiB. It reported a confident FAILED. A stale-binary run must abort, not
 # produce a number; the same mtime rule guards deploy.sh for the same reason.
-NEWER="$(find . -name '*.c' -o -name '*.h' -o -name '*.asm' 2>/dev/null \
-         | while read -r f; do [ "$f" -nt "$KERNEL" ] && echo "$f"; done | head -5)"
+#
+# Only files git tracks are judged. Untracked sources -- in-flight host-test
+# harnesses, editor-saved scratch -- never reach the kernel build, so their
+# mtimes say nothing about whether this binary is current; they only flake
+# local runs (rowstore_io_host_test.c cost exactly that round). git also skips
+# ignored dirs like .freebuff/ worktrees that `find .` would descend into.
+# Fall back to find when there is no .git (a bare source export).
+if git ls-files '*.c' '*.h' '*.asm' >/dev/null 2>&1; then
+    SOURCES="$(git ls-files '*.c' '*.h' '*.asm')"
+else
+    SOURCES="$(find . -name '*.c' -o -name '*.h' -o -name '*.asm' 2>/dev/null)"
+fi
+NEWER="$(echo "$SOURCES" \
+         | while read -r f; do [ -f "$f" ] && [ "$f" -nt "$KERNEL" ] && echo "$f"; done | head -5)"
 if [ -n "$NEWER" ]; then
     echo "ABORT: $KERNEL is older than the sources this check reads." >&2
     echo "       Newer than the binary (first few):" >&2
