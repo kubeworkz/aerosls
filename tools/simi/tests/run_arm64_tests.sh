@@ -62,7 +62,13 @@ else
     fi
 fi
 
-if ! make -C .. simi-arm-jit >/dev/null 2>&1; then
+# simi-asm is a gitignored host build artifact, absent on a fresh
+# checkout; every fixture must be assembled with it before execution,
+# so build it alongside the JIT or the whole corpus dies with
+# "assembler error" the way it did in CI (the arm64-guards job built
+# only simi-arm-jit). Same on-demand build discipline as run_all.sh's
+# corpus setup and the Makefile's M2.27 stale-binary lesson.
+if ! make -C .. simi-asm simi-arm-jit >/dev/null 2>&1; then
     # On a native host this is not an environment problem, so it is fatal.
     if [ "$NATIVE" = "1" ]; then
         echo "FAIL  arm64-jit (build failed on a native $HOST_ARCH host)"

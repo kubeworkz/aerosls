@@ -870,7 +870,12 @@ jobs:
 
       - name: Execute the corpus on real A64 and assert all-pass
         run: |
-          out=$(tools/simi/tests/run_arm64_tests.sh 2>&1)
+          # `|| true` on the capture: under the default bash -e shell, a
+          # non-zero exit from the command substitution aborts the step
+          # BEFORE echo runs, swallowing the runner's diagnostics (the
+          # failure showed as zero output plus a generic FAILED line).
+          # The grep below owns the verdict; the output stays visible.
+          out=$(tools/simi/tests/run_arm64_tests.sh 2>&1) || true
           echo "$out"
           echo "$out" | grep -q "0 failed" || {
             echo "FAILED: M3 real-execution leg has failures — the emitted A64 code misbehaves on real A64" >&2
