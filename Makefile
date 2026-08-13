@@ -542,6 +542,14 @@ tcg-objs/i386-helper-stubs.x86.o: ../qemu/sls/sls-i386-helper-stubs.c $(AB_STAMP
 # no-ops translator.c needs. Upstream gets both from cputlb.c (the soft MMU we
 # exclude) or user-exec.c (1,271 lines of qemu-user process model). Ours reads
 # straight through the GPA window, which IS what softmmu=OFF means.
+# The compiled-guest fixture embeds guest-bytes.h (sls-launcher.c includes
+# it), so a guest change that regenerates ONLY the header must still rebuild
+# the launcher object. Without this dependency a header-only regen silently
+# ships the previous guest -- the pattern rule below compiles sls-launcher.c
+# from its .c + stamps alone. This rule adds the header as a prerequisite;
+# it has no recipe, so the pattern rule still provides the compile.
+tcg-objs/sls-launcher.x86.o: ../qemu/sls/guest/guest-bytes.h
+
 tcg-objs/i386-codefetch.x86.o: ../qemu/sls/sls-i386-codefetch.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
