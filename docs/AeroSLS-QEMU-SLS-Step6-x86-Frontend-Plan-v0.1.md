@@ -440,7 +440,27 @@ in sls_mbedtls_config.h (skips inttypes.h; long long == int64_t on LP64, so
 mbedtls_ms_time_t is ABI-identical), and a freestanding shim
 `vendor/mbedtls/shim/time.h` (struct tm + time_t — the full C11 nine-field
 layout tls_platform.c's gmtime_r writes) wired into MBEDTLS_INC. The TLS
-files now compile in the kernel build.
+files now compile in the kernel build. (Landed as aerosls2 3481908, a
+separate commit so it is a one-line revert if the user prefers to handle
+that area themselves.)
+
+**Iteration 7 (2026-08-12): `clts` — the first CR0 helper.** Unlike
+CLI/STI, CLTS DOES cross a helper: gen_CLTS (emit.c.inc) calls
+helper_clts with env only, then ends the TB (DISAS_EOB_NEXT). The
+surrounding CR0 plumbing was already real: MOV CR0, r64 goes through
+helper_write_crN (Step 6.3 — stores cr[0], keeps hflags PE coherent) and
+MOV r64, CR0 is an inline tcg_gen_ld_tl of env->cr[0] in gen_load, no
+helper. So the only stub to implement was helper_clts itself, and it is
+cc_helper.c's verbatim body: `env->cr[0] &= ~CR0_TS_MASK;
+env->hflags &= ~HF_TS_MASK;`. The guest writes CR0 = PE|TS (0x9), reads
+it back to prove the write took, clts, and reads again — 506
+instructions to HLT, `clts=0x10101` bit-for-bit the C expectation (TS
+present before, TS clear after, PE intact), every prior check intact
+(movsb, stos, cmps, popf, sahf/lahf, cli/sti, DF-set backward copy, 62
+tcache hits), and `invl`/`paging`/`selfmod` still pass with the bench
+running. All three instructions (MOV r64,CR0 / MOV CR0,r64 / CLTS) are
+chk(cpl0) in the decoder; the guest runs at CPL 0, and the write->read->
+clear round-trip through env->cr[0] crosses two block ends.
 
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
