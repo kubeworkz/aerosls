@@ -543,11 +543,46 @@ body (helper.c, not in this link — inlined) so hflags' LMA/SVME stay
 coherent and the post-write TB still decodes long mode. The guest
 (v11, 1399 bytes) proves six things: writing 0 clears LME, LMA
 survives the write across a TB boundary (not directly writable), a
-write carrying SCE (0x1) has it dropped, writing LME back restores the
-0x500 seed, and a full 64-bit STAR write/read round-trips the EDX:EAX
+write carrying SCE (0x1) has it dropped, writing LME back restoresthe 0x500 seed, and a full 64-bit STAR write/read round-trips the EDX:EAX
 halves. 691 instructions to HLT, `wmsr=0x010101010101` bit-for-bit,
 every prior check intact, and `invl`/`paging`/`selfmod` still pass
 with the bench running. First run, no slips.
+
+**Iteration 12 (2026-08-12): SYSCALL/SYSRET — helper_syscall /
+helper_sysret (seg_helper.c) and the CPL handoff.** gen_SYSCALL emits
+helper_syscall(env, next_eip_addend) and ends the TB with
+DISAS_EOB_RECHECK_TF — a normal block end here, but it adds
+helper_rechecking_single_step (bpt_helper.c) to the stub list, since
+gen_eob emits it at every such boundary. Both bodies are upstream's
+verbatim apart from the fault paths (!SCE is a #UD, sysret at cpl!=0 or
+!PE is a #GP — both halt naming the fault) and the dropped IS_INTEL_CPU
+canonicality check on RCX. Two link shims had to be provided:
+cpu_sync_bndcs_hflags (called by cpu_x86_load_seg_cache's SS branch;
+helper.c's body verbatim, inert here) and the tcg_allowed global
+(cpu_compute_eflags's tcg_enabled(); true — TCG is the only backend).
+The boot CPUID seed now advertises CPUID_EXT2_SYSCALL, so EFER.SCE is
+writable via the wrmsr update mask — which flips iteration 11's sce_drop
+marker to sce_take (real CPUs advertise SYSCALL; the old seed was the
+artifact). The guest does two legs: syscall -> handler sysret -> back at
+CPL 3 (ZF=1 set before the syscall must ride through R11 and drive a jz
+at the return point, also proving RCX->RIP), then a second syscall from
+CPL 3 to CPL 0, where the handler HLTs — HLT is chk(cpl0), so the
+fixture's halted=1 is itself the CPL-3 proof. 719 instructions to HLT,
+`sc=0x1` bit-for-bit, every prior check intact, and
+`invl`/`paging`/`selfmod` still pass with the bench running.
+
+The sharpest debugging session yet, and the bug was a GUEST bug, not a
+helper gap: the first sysret arrived with dflag=1 and silently dropped
+HF_CS64 (the compat branch loads a CS without DESC_L), so the second
+syscall — now in 32-bit compat mode — took helper_syscall's code64=0
+path to cstar=0 and restarted the guest from GPA 0 (the fixture's
+unwritten RESULT_SC slot read back boot garbage; the budget died in the
+second pass's div loop at rip=0x70). Instrumenting the helpers showed
+the dflag=1: in 64-bit mode the decoder defaults dflag=MO_32 and only
+REX.W selects 64-bit operands, so a bare `sysret` (0F 07) IS the compat
+return — on real hardware too. The fix is `sysretq` (48 0F 07); the
+assembler's "using default for sysret" warning was the tell, and the
+guest comment now says why the suffix is load-bearing.
 
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
