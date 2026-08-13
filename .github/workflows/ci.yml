@@ -207,6 +207,106 @@ jobs:
           echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
 
+  decoder-build:
+    # The kernel-guards job builds the SHIPPING config (SLS_X86_FRONTEND
+    # off -- what deploy.sh builds and what runs in production). The
+    # decoder build (SLS_X86_FRONTEND=on, QEMU's real x86-64 frontend
+    # driving the Step 6.3 translator loop) is a SEPARATE configuration
+    # with its own TCG_CFLAGS and its own object list, and launcher code
+    # must link in BOTH. It is not enough to be right in the config you
+    # happened to test locally: the M5 exit-status global landed inside
+    # the frontend ifdef, the decoder build linked fine, and the default
+    # build failed to link at deploy time -- the exact gap this job
+    # closes. Building both configs on every push means a launcher
+    # change that breaks one of them fails CI instead of the first
+    # deploy after it lands.
+    #
+    # The decoder build is also where the M5 gate lives: /api/qemu/elf
+    # (a real `gcc -static` ELF64 parsed and placed by sls-elf64-loader,
+    # run to exit_group(0) through the Linux-compat syscall shim) and
+    # /api/qemu/elf-reject (a PT_INTERP dynamic binary must be refused
+    # loudly). The compiled fixture (/api/qemu/compiled, the M4-era
+    # regression) must still pass on this config too -- a decoder change
+    # that regresses it fails here.
+    #
+    # Endpoints require a non-GUEST bearer token. Dave's fixed
+    # DB_ADMIN demo token (kernel/auth.c) is deterministic and
+    # no-expiry, so CI can use it directly -- same as the deployed
+    # simulator's login flow.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: aerosls2
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kubeworkz/qemu-sls
+          path: qemu
+          token: ${{ secrets.QEMU_SLS_PAT }}
+          fetch-depth: 1
+
+      - name: Kernel build tools (nasm, grub, qemu)
+        run: sudo apt-get update && sudo apt-get install -y nasm grub-pc-bin xorriso qemu-system-x86
+
+      - name: Build the decoder kernel ISO (SLS_X86_FRONTEND=on)
+        run: make X86_CC=gcc X86_LD=ld SLS_X86_FRONTEND=on x86-iso
+        working-directory: aerosls2
+
+      - name: Boot the decoder ISO and run the Step 6.4/M5 guest fixtures
+        run: |
+          qemu-img create -f raw sls_storage.img 10G >/dev/null
+          qemu-system-x86_64 -cdrom sls_operating_system.iso \
+              -drive id=disk,file=sls_storage.img,if=none,format=raw \
+              -device nvme,drive=disk,serial=slsdev0 \
+              -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+              -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
+              -display none -m 4G -smp 4 -boot d -no-reboot \
+              -serial file:decoder_boot.log 2>/dev/null &
+          QPID=$!
+          healthy=0
+          for i in $(seq 1 75); do
+            if curl -sf --max-time 2 http://localhost:3001/api/health >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            if ! kill -0 "$QPID" 2>/dev/null; then break; fi
+            sleep 2
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "FAILED: decoder kernel never answered /api/health" >&2
+            tail -30 decoder_boot.log >&2
+            kill "$QPID" 2>/dev/null || true
+            exit 1
+          fi
+          TOK=deadbeef01234567cafebabe76543210   # dave, DB_ADMIN
+          fail=0
+          for ep in compiled elf elf-reject; do
+            body=$(curl -s --max-time 120 -X POST \
+              "http://localhost:3001/api/qemu/$ep" \
+              -H "Authorization: Bearer $TOK")
+            echo "$ep -> $body"
+            echo "$body" | grep -q '"pass":"true"' || {
+              echo "FAILED: /api/qemu/$ep did not pass ($body)" >&2
+              fail=1
+            }
+          done
+          kill "$QPID" 2>/dev/null || true
+          wait "$QPID" 2>/dev/null || true
+          grep -q "SLS-ELF-TEST] PASS" decoder_boot.log || {
+            echo "FAILED: [SLS-ELF-TEST] PASS not in the serial log" >&2
+            tail -30 decoder_boot.log >&2
+            fail=1
+          }
+          grep -q "SLS-ELF-REJECT] PASS" decoder_boot.log || {
+            echo "FAILED: [SLS-ELF-REJECT] PASS not in the serial log" >&2
+            tail -30 decoder_boot.log >&2
+            fail=1
+          }
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: decoder build links and boots; compiled + elf + elf-reject fixtures all pass"
+        working-directory: aerosls2
+
   riscv-guards:
     # The RISC-V kernel's boot smoke, mirrored from the x86 kernel-guards
     # job. The RV kernel is self-contained (its sources are all in
