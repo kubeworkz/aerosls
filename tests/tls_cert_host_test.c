@@ -140,6 +140,60 @@ int main(void) {
     ok(TLS_CERT_BACKDATE_SECONDS == 86400ULL,
        "notBefore is backdated a full day, not a second (see the design doc)");
 
+    /* ─── When a certificate is due for replacement ─────────────────────────
+     * tls_cert_renew_due() is what stops the leaf's lifetime from being a bet
+     * that no node runs longer than a year. It is pure arithmetic on supplied
+     * times, which is the only reason the boundary can be driven from both
+     * sides here rather than by waiting eight months.
+     *
+     * The bias is the part worth testing hardest. Every degenerate input must
+     * come back DUE, because the two failure directions are not symmetric: a
+     * needless renewal costs one keygen, and a missed one costs an outage that
+     * begins silently and is diagnosed in somebody's browser. A test that only
+     * checked the happy path would let a future "tidy up the edge cases" turn
+     * every one of those into a quiet no. */
+    printf("\n=== renewal timing ===\n\n");
+    {
+        const uint64_t YEAR = 365ULL * 86400ULL;
+        const uint64_t T    = 1786492800ULL;          /* an arbitrary "now" */
+        const uint64_t THIRD = YEAR / 3u;
+
+        ok(tls_cert_renew_due(T, T + YEAR, YEAR) == 0,
+           "a leaf issued this second is not due");
+        ok(tls_cert_renew_due(T, T + THIRD + 1, YEAR) == 0,
+           "one second inside the margin is not due");
+        ok(tls_cert_renew_due(T, T + THIRD, YEAR) == 1,
+           "  and exactly on the margin IS due -- the boundary is closed");
+        ok(tls_cert_renew_due(T, T + THIRD - 1, YEAR) == 1,
+           "  one second past it, likewise");
+        ok(tls_cert_renew_due(T, T + 1, YEAR) == 1,
+           "a leaf with one second left is due");
+
+        ok(tls_cert_renew_due(T, T, YEAR) == 1,
+           "a leaf expiring exactly now is due, not 'not yet'");
+        ok(tls_cert_renew_due(T, T - 1, YEAR) == 1,
+           "an already-expired leaf is due (and does not underflow)");
+        ok(tls_cert_renew_due(T, 0, YEAR) == 1,
+           "a notAfter of zero -- an unreadable window -- is due");
+        ok(tls_cert_renew_due(T, T + YEAR, 0) == 1,
+           "a lifetime of zero is due rather than never");
+        ok(tls_cert_renew_due(T, T + YEAR, 2) == 1,
+           "a lifetime too short to have a third is due rather than never");
+
+        /* The margin has to be big enough to retry into, not just to exist.
+         * At the check interval this is what turns "renewal failed" from an
+         * outage into a log line nobody has to act on today. */
+        ok(THIRD / 3600ULL > 2000ULL,
+           "the margin is thousands of hourly retries, not a handful");
+
+        /* Scaling, not a hardcoded 121 days: the rule is a third of whatever
+         * the lifetime is, so changing TLS_SERVER_LEAF_SECONDS cannot silently
+         * leave this behind. */
+        ok(tls_cert_renew_due(T, T + 40ULL * 86400ULL, 90ULL * 86400ULL) == 0 &&
+           tls_cert_renew_due(T, T + 20ULL * 86400ULL, 90ULL * 86400ULL) == 1,
+           "the margin is a THIRD of the lifetime, whatever the lifetime is");
+    }
+
 
     /* ─── rtc_break_down directly, because tls_cert cannot reach half of it ──
      * tls_cert_format_time() takes a uint64_t, so no vector above can ever

@@ -190,13 +190,40 @@ int tls_cert_sign_leaf(const unsigned char *ca_der, size_t ca_len,
                        unsigned char *leaf_der, size_t leaf_size, size_t *leaf_len,
                        unsigned char *leaf_key_der, size_t lk_size, size_t *lk_len);
 
-/* Seconds of validity a CA certificate has left, 0 if it has none. Separate
- * from sign_leaf()'s hard failure on an unusable CA because the two questions
- * are different: sign_leaf() answers "can I", this answers "should I still",
- * and a node should replace its anchor on a schedule rather than at the
- * moment it stops working. */
-int tls_cert_ca_seconds_remaining(const unsigned char *ca_der, size_t ca_len,
-                                  uint64_t *out);
+/* Seconds of validity a certificate has left, 0 if it has none. Separate from
+ * sign_leaf()'s hard failure on an unusable CA because the two questions are
+ * different: sign_leaf() answers "can I", this answers "should I still", and a
+ * node should replace a certificate on a schedule rather than at the moment it
+ * stops working.
+ *
+ * Named for certificates in general, not for CAs. It was `..._ca_seconds_...`
+ * while the CA was its only caller; in-flight leaf renewal made that name a
+ * lie about what the function does, and a name that describes one caller
+ * rather than the behaviour is how the second caller ends up writing a
+ * duplicate. */
+int tls_cert_seconds_remaining(const unsigned char *der, size_t len,
+                               uint64_t *out);
+
+/* ─── When a certificate should be replaced ────────────────────────────────
+ * True once a THIRD or less of the lifetime remains, so the last third is
+ * retry window rather than cliff edge. The boundary is closed deliberately --
+ * see the note in tls_cert.c; /api/health publishes the exact instant, and it
+ * has to be an instant at which the answer is yes. Derived from the lifetime rather than
+ * being a separate constant, for the reason TLS_SERVER_CA_RENEW_SECONDS is
+ * derived too: a fourth number is a fourth thing that can drift.
+ *
+ * A third is not arbitrary. Renewal here can fail for reasons that clear on
+ * their own -- the node is busy, entropy is momentarily unavailable, the store
+ * cannot be read -- so what the margin has to buy is MANY attempts, not one.
+ * On a 365-day leaf checked hourly, a third is roughly 2,900 chances.
+ *
+ * Degenerate inputs return DUE. Every one of them (an unreadable window, a
+ * lifetime of zero, a notAfter already behind us) means something is wrong
+ * with the certificate currently being served, and the two failure directions
+ * are not symmetric: renewing when it was unnecessary costs one P-256 keygen,
+ * and not renewing when it was necessary costs an outage that starts silently
+ * and is diagnosed in a browser. When in doubt, renew. */
+int tls_cert_renew_due(uint64_t now, uint64_t not_after, uint64_t lifetime_seconds);
 
 /* The two-certificate form, in one call, with the CA key destroyed before
  * returning. `ca_dn` and `leaf_dn` are full DNs and MUST differ -- a leaf

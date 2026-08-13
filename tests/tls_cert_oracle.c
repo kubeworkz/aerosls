@@ -265,12 +265,12 @@ static int persist_mode(const char *dir, const struct tls_cert_san *sans,
     {
         uint64_t left = 0;
         if (rtc_set_unix(ORACLE_NOW) != RTC_OK) { return 1; }
-        rc = tls_cert_ca_seconds_remaining(ca, ca_len, &left);
+        rc = tls_cert_seconds_remaining(ca, ca_len, &left);
         if (rc == TLS_CERT_OK && left > (5ULL * 365ULL - 1ULL) * DAY &&
             left <= 5ULL * 365ULL * DAY) {
-            pok("tls_cert_ca_seconds_remaining reads the CA's own notAfter back");
+            pok("tls_cert_seconds_remaining reads the CA's own notAfter back");
         } else {
-            pbad("tls_cert_ca_seconds_remaining disagrees with the CA it read");
+            pbad("tls_cert_seconds_remaining disagrees with the CA it read");
             fprintf(stderr, "      rc=%d left=%llu expected ~%llu\n",
                     rc, (unsigned long long)left,
                     (unsigned long long)(5ULL * 365ULL * DAY));

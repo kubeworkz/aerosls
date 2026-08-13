@@ -309,6 +309,22 @@ static int api_health(char* body, int max) {
             jb_uint(&j, "tls_ca_stored",  (uint64_t)(ca_loaded ? 1 : 0));   jb_putc(&j, ',');
             jb_uint(&j, "tls_ca_written", (uint64_t)ca_written);            jb_putc(&j, ',');
         }
+
+        /* Leaf renewal. tls_leaf_renewable is the one to read first: 0 means
+         * nothing can replace this leaf when it expires, which is a fault an
+         * operator has a year to notice and will only notice if something
+         * shows it. tls_leaf_deferrals climbing without tls_leaf_renewals
+         * moving means the node is never idle long enough to swap -- also
+         * silent, also only visible here. */
+        {
+            uint64_t renew_at = 0; unsigned long renewals = 0, deferrals = 0;
+            int renewable = 0;
+            tls_server_renewal_status(&renew_at, &renewals, &deferrals, &renewable);
+            jb_uint(&j, "tls_leaf_renew_at",  (uint64_t)renew_at);            jb_putc(&j, ',');
+            jb_uint(&j, "tls_leaf_renewals",  (uint64_t)renewals);            jb_putc(&j, ',');
+            jb_uint(&j, "tls_leaf_deferrals", (uint64_t)deferrals);           jb_putc(&j, ',');
+            jb_uint(&j, "tls_leaf_renewable", (uint64_t)(renewable ? 1 : 0)); jb_putc(&j, ',');
+        }
     }
     jb_uint(&j, "object_count", object_catalog_count);
     jb_obj_close(&j);
@@ -6287,6 +6303,15 @@ void http_server_run(void) {
 
     for (;;) {
         int did_work = 0;
+
+        /* Leaf renewal. Cheap to call every sweep -- it compares two integers
+         * and returns -- and does real work at most once an hour. Placed here,
+         * BEFORE connections are picked up, so the zero-live-sessions window it
+         * needs is the one that occurs naturally between sweeps rather than one
+         * it has to wait for. Nothing re-issued the leaf while a node ran, so
+         * its lifetime was a bet that no node runs longer than a year; this is
+         * what settles the bet. */
+        tls_server_maybe_renew();
 
         // Opportunistically pick up any newly-ESTABLISHED connection we
         // aren't already tracking -- the same scan tcp_accept() itself did,

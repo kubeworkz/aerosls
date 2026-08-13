@@ -247,6 +247,32 @@ int tls_cert_make_serial(unsigned char *out, size_t len)
 }
 
 
+/* See tls_cert.h. Pure: no clock, no parsing, no allocation -- `now` and
+ * `not_after` are supplied, so a test can drive the boundary at both sides of
+ * the exact second without owning a clock. */
+int tls_cert_renew_due(uint64_t now, uint64_t not_after, uint64_t lifetime_seconds)
+{
+    uint64_t remaining, margin;
+
+    if (lifetime_seconds == 0) { return 1; }
+    if (not_after <= now)      { return 1; }   /* expired, or expiring this second */
+
+    remaining = not_after - now;
+    margin    = lifetime_seconds / 3u;
+    if (margin == 0) { return 1; }             /* a lifetime under 3s is not one */
+
+    /* <=, not <. The boundary is CLOSED, and that is not a coin flip:
+     * tls_server.c publishes `not_after - margin` to /api/health as
+     * tls_leaf_renew_at, the second at which renewal becomes due. With a
+     * strict < that published instant would be the one second at which it is
+     * NOT due, and the number an operator reads would disagree with the
+     * behaviour it describes. The check runs hourly, so nothing practical
+     * turns on the single second -- but a number that contradicts the code
+     * beside it is how the next person loses an afternoon. */
+    return remaining <= margin;
+}
+
+
 #ifndef TLS_CERT_HOST_TEST
 /* Everything below needs the vendored tree. Guarded the way tls_platform.c
  * guards its own mbedTLS half, so the validity and serial logic above stays
@@ -638,20 +664,20 @@ out:
     return rc;
 }
 
-int tls_cert_ca_seconds_remaining(const unsigned char *ca_der, size_t ca_len,
-                                  uint64_t *out)
+int tls_cert_seconds_remaining(const unsigned char *der, size_t len,
+                               uint64_t *out)
 {
     mbedtls_x509_crt ca;
     uint64_t now = 0, expiry = 0;
     int rc;
 
-    if (!ca_der || ca_len == 0 || !out) { return TLS_CERT_E_BADARG; }
+    if (!der || len == 0 || !out) { return TLS_CERT_E_BADARG; }
     if (rtc_get_unix(&now) != RTC_OK) { return TLS_CERT_E_NO_TIME; }
 
     mbedtls_x509_crt_init(&ca);
     rc = TLS_CERT_E_MBEDTLS;
-    if (mbedtls_x509_crt_parse_der(&ca, ca_der, ca_len) != 0) {
-        g_step = "remaining_parse_ca"; goto out;
+    if (mbedtls_x509_crt_parse_der(&ca, der, len) != 0) {
+        g_step = "remaining_parse"; goto out;
     }
     /* The forward direction of the calendar, from rtc.c -- the same file that
      * owns the inverse used to write the string in the first place. */

@@ -28,6 +28,7 @@
 #include "tls_platform.h"
 #include "entropy.h"
 #include "rtc.h"
+#include "timer.h"   /* kernel_tick_counter -- the renewal check's cheap gate */
 
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
@@ -76,6 +77,28 @@ static unsigned long g_refused;
 static unsigned      g_live;
 static unsigned      g_live_peak;
 
+/* ─── What renewal needs to remember ───────────────────────────────────────
+ * The identity arguments, kept as POINTERS. They must outlive this module,
+ * which is the same precondition the ALPN array below carries and for the same
+ * mbedTLS-adjacent reason. net/http.c's are a `static const` array and string
+ * literals, so this holds; a caller passing stack data would be handing this
+ * file a dangling pointer to use a year later, when nothing would connect the
+ * crash to the call. Stated in tls_server.h as a requirement rather than left
+ * to be discovered. */
+static const char *g_ca_dn;
+static const char *g_dn;
+static const struct tls_cert_san *g_sans;
+static size_t      g_san_count;
+
+/* Absolute Unix seconds, not ticks -- see TLS_SERVER_RENEW_CHECK_TICKS. */
+static uint64_t      g_leaf_not_after;
+static uint64_t      g_leaf_renew_at;
+static uint64_t      g_next_check_tick;
+static int           g_renewable;
+static int           g_unrenewable_warned;
+static unsigned long g_renewals;
+static unsigned long g_deferrals;
+
 static struct tls_session *find(int conn_id)
 {
     for (int i = 0; i < TLS_SERVER_MAX_SESSIONS; i++) {
@@ -102,17 +125,26 @@ const unsigned char *tls_server_ca_der(size_t *len)
     return g_ca_der;
 }
 
+static void teardown_tls(void);
+static int  install_leaf(const unsigned char *key_der, size_t key_len);
+static void note_leaf_window(void);
+
 int tls_server_init(const char *ca_dn, const char *dn,
                     const struct tls_cert_san *sans, size_t san_count)
 {
     unsigned char key_der[512];
     unsigned char ca_key_der[512];
     size_t key_len = 0, ca_key_len = 0;
-    int have_ca = 0;
+    int have_ca = 0, stored_ok = 0;
     int rc;
 
     if (g_ready) { return TLS_SRV_OK; }
     if (!dn || !ca_dn) { return TLS_SRV_E_BADARG; }
+    if (!sans || san_count == 0) { return TLS_SRV_E_BADARG; }
+
+    /* Kept for renewal. See the note on g_ca_dn: these must outlive the
+     * module, and net/http.c's do. */
+    g_ca_dn = ca_dn; g_dn = dn; g_sans = sans; g_san_count = san_count;
 
     /* Fail closed, and say which prerequisite is missing rather than making
      * an operator bisect it. Both of these are real states on real hardware:
@@ -145,7 +177,7 @@ int tls_server_init(const char *ca_dn, const char *dn,
                         ca_key_der, sizeof ca_key_der, &ca_key_len);
     if (rc == TLS_STORE_OK) {
         uint64_t left = 0;
-        if (tls_cert_ca_seconds_remaining(g_ca_der, g_ca_der_len, &left)
+        if (tls_cert_seconds_remaining(g_ca_der, g_ca_der_len, &left)
                 != TLS_CERT_OK) {
             kernel_serial_print("[TLS] stored CA has an unreadable validity "
                                 "window -- replacing it.\n");
@@ -161,6 +193,7 @@ int tls_server_init(const char *ca_dn, const char *dn,
             have_ca = 0;
         } else {
             have_ca = 1;
+            stored_ok = 1;
             kernel_serial_printf("[TLS] CA loaded from disk, %u day(s) left. "
                                  "An existing import is still good.\n",
                                  (unsigned)(left / (24ULL * 60ULL * 60ULL)));
@@ -230,6 +263,7 @@ int tls_server_init(const char *ca_dn, const char *dn,
             kernel_serial_print("[TLS] new CA could NOT be stored -- it will "
                                 "not survive a reboot.\n");
         } else {
+            stored_ok = 1;
             kernel_serial_print("[TLS] new CA generated and stored. Import it "
                                 "once; it now survives reboots.\n");
         }
@@ -243,6 +277,51 @@ int tls_server_init(const char *ca_dn, const char *dn,
     mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
     ca_key_len = 0;
 
+    if (install_leaf(key_der, key_len) != 0) { goto fail; }
+    /* The plaintext leaf key leaves this function here and nowhere else. */
+    mbedtls_platform_zeroize(key_der, sizeof key_der);
+
+    /* Renewal is only possible if the CA can be read back later. A node whose
+     * CA lives only in this boot's RAM cannot re-sign anything, and the honest
+     * time to say so is now -- a year before it matters -- not when the leaf
+     * expires. */
+    g_renewable = stored_ok;
+    note_leaf_window();
+
+    g_ready = 1;
+    kernel_serial_printf("[TLS] server ready: TLS 1.3, P-256. "
+                         "leaf %u bytes, CA %u bytes.\n",
+                         (unsigned)g_crt_der_len, (unsigned)g_ca_der_len);
+    if (!g_renewable) {
+        kernel_serial_print("[TLS] this leaf CANNOT be renewed in flight -- no "
+                            "CA on disk. It expires when it expires.\n");
+    }
+    kernel_serial_print("[TLS] import the CA (not the leaf) to trust this node.\n");
+    return TLS_SRV_OK;
+
+fail:
+    mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
+    mbedtls_platform_zeroize(key_der, sizeof key_der);
+    teardown_tls();
+    g_crt_der_len = 0;
+    g_ca_der_len = 0;
+    return TLS_SRV_E_NOT_READY;
+}
+
+/* ─── The parts renewal reuses ─────────────────────────────────────────────
+ * install_leaf() is the second half of what tls_server_init() used to do
+ * inline. It is factored out rather than duplicated because a renewal that
+ * built its config even slightly differently from boot would be a difference
+ * that shows up once a year, in production, on one node. */
+static void teardown_tls(void)
+{
+    mbedtls_ssl_config_free(&g_conf);
+    mbedtls_pk_free(&g_key);
+    mbedtls_x509_crt_free(&g_crt);
+}
+
+static int install_leaf(const unsigned char *key_der, size_t key_len)
+{
     mbedtls_x509_crt_init(&g_crt);
     mbedtls_pk_init(&g_key);
     mbedtls_ssl_config_init(&g_conf);
@@ -269,8 +348,6 @@ int tls_server_init(const char *ca_dn, const char *dn,
         kernel_serial_print("[TLS] our own private key did not parse back.\n");
         goto fail;
     }
-    /* The plaintext key leaves this function here and nowhere else. */
-    mbedtls_platform_zeroize(key_der, sizeof key_der);
 
     if (mbedtls_ssl_config_defaults(&g_conf, MBEDTLS_SSL_IS_SERVER,
                                     MBEDTLS_SSL_TRANSPORT_STREAM,
@@ -296,23 +373,200 @@ int tls_server_init(const char *ca_dn, const char *dn,
     if (mbedtls_ssl_conf_alpn_protocols(&g_conf, (const char **)alpn) != 0) {
         goto fail;
     }
-
-    g_ready = 1;
-    kernel_serial_printf("[TLS] server ready: TLS 1.3, P-256. "
-                         "leaf %u bytes, CA %u bytes.\n",
-                         (unsigned)g_crt_der_len, (unsigned)g_ca_der_len);
-    kernel_serial_print("[TLS] import the CA (not the leaf) to trust this node.\n");
-    return TLS_SRV_OK;
+    return 0;
 
 fail:
+    teardown_tls();
+    return -1;
+}
+
+/* Record when the leaf now installed becomes due for replacement. Derived from
+ * the certificate itself rather than from "now plus the lifetime we asked
+ * for", because the two differ whenever tls_cert_sign_leaf() clamped the
+ * window into the CA's -- and the clamped case is exactly the one where
+ * getting this wrong means a leaf that expires before anything looks at it. */
+static void note_leaf_window(void)
+{
+    uint64_t now = 0, left = 0, margin = TLS_SERVER_LEAF_SECONDS / 3u;
+
+    g_leaf_not_after = 0;
+    g_leaf_renew_at  = 0;
+    if (rtc_get_unix(&now) != RTC_OK) { return; }
+    if (tls_cert_seconds_remaining(g_crt_der, g_crt_der_len, &left) != TLS_CERT_OK) {
+        return;
+    }
+    g_leaf_not_after = now + left;
+    g_leaf_renew_at  = (g_leaf_not_after > margin) ? (g_leaf_not_after - margin) : now;
+}
+
+
+/* ─── In-flight leaf renewal ───────────────────────────────────────────────
+ * See tls_server.h for the shape and the three safety properties. The order of
+ * the guards below is the design: cheapest first, and nothing is torn down
+ * until a replacement exists.
+ */
+int tls_server_maybe_renew(void)
+{
+    /* All locals, deliberately. A static buffer for the CA key would put the
+     * node's one long-lived secret back in RAM for the whole uptime, which is
+     * the property tls_server_init() ends with a zeroize to establish. Here it
+     * lives for the length of this call, once a year. The frame is ~5 KiB
+     * against a 256 KiB advisory. */
+    unsigned char ca_der[2048], ca_key_der[512];
+    unsigned char new_leaf[2048], new_key[512];
+    size_t ca_len = 0, ca_key_len = 0, nl_len = 0, nk_len = 0;
+    uint64_t now = 0;
+    int rc, same;
+
+    if (!g_ready) { return TLS_SRV_E_NOT_READY; }
+
+    /* The gate. Ticks, because this runs on every sweep of the server loop and
+     * an RTC read is port I/O. Never the decision -- see the header. */
+    if (kernel_tick_counter < g_next_check_tick) { return TLS_SRV_E_NOT_READY; }
+    g_next_check_tick = kernel_tick_counter + TLS_SERVER_RENEW_CHECK_TICKS;
+
+    if (rtc_get_unix(&now) != RTC_OK) {
+        /* A node that has lost its clock cannot judge expiry. It also could
+         * not have issued this certificate. Say nothing and try again in an
+         * hour -- the clock is somebody else's problem and shouting about it
+         * hourly would bury the line that matters. */
+        return TLS_SRV_E_NOT_READY;
+    }
+    if (!tls_cert_renew_due(now, g_leaf_not_after, TLS_SERVER_LEAF_SECONDS)) {
+        return TLS_SRV_E_NOT_READY;
+    }
+
+    if (!g_renewable) {
+        if (!g_unrenewable_warned) {
+            g_unrenewable_warned = 1;
+            kernel_serial_print("[TLS] the leaf is due for renewal and this node "
+                                "has NO CA on disk to sign a new one. It will "
+                                "expire and stay expired. Reboot to reissue.\n");
+        }
+        return TLS_SRV_E_NOT_READY;
+    }
+
+    /* Live sessions hold pointers into g_conf, and replacing the certificate
+     * means freeing and rebuilding it -- mbedtls_ssl_conf_own_cert() appends
+     * rather than replaces, and 3.6 exposes no way to clear the list. With a
+     * third of the leaf's life as the window, waiting for an idle moment costs
+     * nothing and a use-after-free costs everything. */
+    if (g_live > 0) {
+        g_deferrals++;
+        kernel_serial_printf("[TLS] leaf renewal due, deferred: %u session(s) "
+                             "live. Retrying in about an hour.\n", g_live);
+        return TLS_SRV_E_NOT_READY;
+    }
+
+    /* The CA key comes off the disk, is used, and is gone before this function
+     * returns -- on every path, including the failures. It is never held
+     * between renewals. */
+    rc = tls_store_load(ca_der, sizeof ca_der, &ca_len,
+                        ca_key_der, sizeof ca_key_der, &ca_key_len);
+    if (rc != TLS_STORE_OK) {
+        kernel_serial_printf("[TLS] leaf renewal: the stored CA could not be "
+                             "read (rc=%d). Serving the old leaf.\n", rc);
+        mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
+        return TLS_SRV_E_NOT_READY;
+    }
+
+    /* The CA on disk must still be the CA we are presenting. If it is not,
+     * something rewrote the store underneath a running node, and signing with
+     * it would hand clients a chain that does not lead to the anchor they
+     * imported. Cheap to check, and the alternative is discovering it in a
+     * browser. */
+    same = (ca_len == g_ca_der_len);
+    if (same) {
+        for (size_t i = 0; i < ca_len; i++) {
+            if (ca_der[i] != g_ca_der[i]) { same = 0; break; }
+        }
+    }
+    if (!same) {
+        kernel_serial_print("[TLS] leaf renewal: the CA on disk is NOT the one "
+                            "this node is serving. Refusing to sign. Reboot to "
+                            "pick up the stored CA deliberately.\n");
+        mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
+        return TLS_SRV_E_NOT_READY;
+    }
+
+    rc = tls_cert_sign_leaf(ca_der, ca_len, ca_key_der, ca_key_len,
+                            g_ca_dn, g_dn, g_sans, g_san_count,
+                            TLS_SERVER_LEAF_SECONDS,
+                            new_leaf, sizeof new_leaf, &nl_len,
+                            new_key, sizeof new_key, &nk_len);
     mbedtls_platform_zeroize(ca_key_der, sizeof ca_key_der);
-    mbedtls_platform_zeroize(key_der, sizeof key_der);
-    mbedtls_ssl_config_free(&g_conf);
-    mbedtls_pk_free(&g_key);
-    mbedtls_x509_crt_free(&g_crt);
-    g_crt_der_len = 0;
-    g_ca_der_len = 0;
-    return TLS_SRV_E_NOT_READY;
+    if (rc != TLS_CERT_OK) {
+        /* Nothing has been torn down. The old leaf is still installed and
+         * still being served; we simply try again next hour, and there are
+         * thousands of hours left in the margin. */
+        kernel_serial_printf("[TLS] leaf renewal failed: rc=%d step=%s. Still "
+                             "serving the previous leaf.\n",
+                             rc, tls_cert_last_step());
+        mbedtls_platform_zeroize(new_key, sizeof new_key);
+        return TLS_SRV_E_NOT_READY;
+    }
+
+    /* ─── The swap ──────────────────────────────────────────────────────────
+     * Past this line there is no way back, and it is worth being explicit
+     * about why rather than leaving it to be discovered: rolling back would
+     * mean reinstalling the OLD leaf, which needs the old leaf's private key,
+     * which was zeroized the moment it was installed. Keeping it would mean a
+     * second private key resident for a year to cover a failure that
+     * tls_cert_sign_leaf() has already ruled out -- it parses the finished
+     * certificate back before returning, so "the DER does not parse" cannot
+     * reach here.
+     *
+     * What remains is an allocation failure inside the rebuild, at the one
+     * moment the pool is at its emptiest (zero live sessions, by the guard
+     * above) and doing exactly what succeeded at boot. If it happens anyway,
+     * g_ready goes to 0 and every TLS connection is refused -- loudly, and
+     * visibly in /api/health -- rather than served with something broken. */
+    teardown_tls();
+    for (size_t i = 0; i < nl_len; i++) { g_crt_der[i] = new_leaf[i]; }
+    g_crt_der_len = nl_len;
+
+    if (install_leaf(new_key, nk_len) != 0) {
+        g_ready = 0;
+        g_crt_der_len = 0;
+        kernel_serial_print("[TLS] CATASTROPHIC: the renewed leaf could not be "
+                            "installed and the previous one is gone. TLS is "
+                            "down on this node until it reboots.\n");
+        mbedtls_platform_zeroize(new_key, sizeof new_key);
+        return TLS_SRV_E_NOT_READY;
+    }
+    mbedtls_platform_zeroize(new_key, sizeof new_key);
+
+    g_renewals++;
+    g_unrenewable_warned = 0;
+    note_leaf_window();
+    kernel_serial_printf("[TLS] leaf renewed in flight (%lu since boot), %u "
+                         "bytes. No re-import is needed -- the CA is unchanged.\n",
+                         g_renewals, (unsigned)g_crt_der_len);
+
+    /* And while we have the CA parsed anyway: the anchor itself expires, and
+     * that one DOES cost a re-import. Only tls_server_init() replaces it, so
+     * the useful thing here is warning far enough ahead that the reboot can be
+     * scheduled rather than forced. */
+    {
+        uint64_t ca_left = 0;
+        if (tls_cert_seconds_remaining(g_ca_der, g_ca_der_len, &ca_left) == TLS_CERT_OK &&
+            ca_left < TLS_SERVER_CA_RENEW_SECONDS) {
+            kernel_serial_printf("[TLS] note: the CA has %u day(s) left. The next "
+                                 "REBOOT will replace it, and that one does need "
+                                 "a re-import in every trust store.\n",
+                                 (unsigned)(ca_left / (24ULL * 60ULL * 60ULL)));
+        }
+    }
+    return TLS_SRV_OK;
+}
+
+void tls_server_renewal_status(uint64_t *renew_at, unsigned long *renewals,
+                               unsigned long *deferrals, int *renewable)
+{
+    if (renew_at)  { *renew_at  = g_leaf_renew_at; }
+    if (renewals)  { *renewals  = g_renewals; }
+    if (deferrals) { *deferrals = g_deferrals; }
+    if (renewable) { *renewable = g_renewable; }
 }
 
 int tls_server_open(int conn_id)

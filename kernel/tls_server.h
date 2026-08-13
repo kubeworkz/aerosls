@@ -68,6 +68,21 @@
 #define TLS_SERVER_LEAF_SECONDS    (365ULL * 24ULL * 60ULL * 60ULL)
 #define TLS_SERVER_CA_RENEW_SECONDS TLS_SERVER_LEAF_SECONDS
 
+/* How often the renewal check bothers to read the clock, in TIMER TICKS.
+ *
+ * Ticks and only ticks, for the gate -- and never for the decision. The LAPIC
+ * timer is programmed for ~100 Hz but kernel/timer.c says outright that "exact
+ * rate is calibration-dependent", so a tick is not a unit of time this code
+ * may reason about. It is a cheap monotonic counter, which is precisely what a
+ * "should I bother looking?" gate needs and precisely what a "has it expired?"
+ * decision must not use. The decision below reads rtc_get_unix().
+ *
+ * At the nominal rate this is about an hour. If the calibration is off by 3x
+ * in either direction it becomes 20 minutes or 3 hours, and nothing cares --
+ * which is the test for whether a tick-derived number is being used for the
+ * right kind of thing. */
+#define TLS_SERVER_RENEW_CHECK_TICKS  360000ULL
+
 /* Generate a self-signed certificate and build the shared server config.
  * Safe to call more than once; the second call is a no-op. Returns TLS_SRV_OK
  * or negative -- and on failure TLS must not start, which is §2.4's
@@ -81,6 +96,49 @@ int tls_server_ready(void);
 /* Claim a session slot for a TCP connection id. TLS_SRV_E_NO_SLOT when the cap
  * is reached -- the caller must close the connection rather than fall back to
  * plaintext, which would be a downgrade a client cannot see. */
+/* ─── In-flight leaf renewal ───────────────────────────────────────────────
+ * Call from the server loop; it is cheap to call every sweep and does real
+ * work at most once every TLS_SERVER_RENEW_CHECK_TICKS.
+ *
+ * Nothing re-issued the leaf while a node was running, so its lifetime was a
+ * bet that no node runs longer than a year. A lost bet expires a certificate
+ * underneath a server that is otherwise healthy, with no log line at the
+ * moment it happens and the first symptom appearing in somebody's browser.
+ *
+ * Three things make this safe rather than clever:
+ *
+ *   The CA key is NOT held in memory for this. It is re-read from the store,
+ *   used, and zeroized -- so the key's residency in RAM goes from "the whole
+ *   uptime" to "milliseconds, once a year". A node with no stored CA
+ *   therefore cannot renew at all, which is reported rather than discovered.
+ *
+ *   The new leaf is generated and validated BEFORE anything is torn down. A
+ *   renewal that fails leaves the working certificate in place.
+ *
+ *   The swap only happens with ZERO live sessions. mbedtls_ssl_conf_own_cert()
+ *   appends rather than replaces and 3.6 exposes no way to clear the list, so
+ *   replacing the certificate means freeing and rebuilding the whole
+ *   mbedtls_ssl_config -- which every live mbedtls_ssl_context points at. With
+ *   a third of the leaf's life as the window there is no urgency worth a
+ *   use-after-free.
+ *
+ * Returns TLS_SRV_OK when a renewal actually happened, and TLS_SRV_E_NOT_READY
+ * otherwise -- including the ordinary "nothing to do", which is almost every
+ * call. Callers are not expected to check it; the log and /api/health are how
+ * this reports. */
+int tls_server_maybe_renew(void);
+
+/* Leaf renewal state, for /api/health.
+ *   renew_at   Unix second the leaf becomes due for replacement, 0 if unknown.
+ *   renewals   completed in-flight renewals since boot.
+ *   deferrals  times a due renewal was postponed because sessions were live.
+ *   renewable  1 if a renewal is possible at all. ZERO IS THE INTERESTING ONE:
+ *              it means no CA is stored, so this node's leaf will expire and
+ *              nothing will replace it. An operator has a year to see that,
+ *              and only if something shows it to them. */
+void tls_server_renewal_status(uint64_t *renew_at, unsigned long *renewals,
+                               unsigned long *deferrals, int *renewable);
+
 int tls_server_open(int conn_id);
 
 /* Drive the handshake one step. TLS_SRV_HANDSHAKING means "no progress
