@@ -1262,8 +1262,13 @@ jobs:
             echo "FAILED: kernel/simi_arm.c does not compile clean under freestanding flags" >&2
             exit 1
           }
+          # `|| true` on the pipeline: grep -vx exits 1 when it selects
+          # nothing -- the PASS case here (no bad symbols) -- and under
+          # the default bash -e shell that aborted the step with a
+          # silent exit 1 before the check below could pass. The
+          # [ -z "$bad" ] test owns the verdict.
           bad=$(aarch64-linux-gnu-nm -u /tmp/kernel_simi_arm.o | awk '$1 == "U" { print $2 }' \
-                | grep -vx 'memcpy\|memset')
+                | grep -vx 'memcpy\|memset' || true)
           [ -z "$bad" ] || {
             echo "FAILED: kernel/simi_arm.o has libc references beyond {memcpy, memset}:" >&2
             echo "$bad" >&2
