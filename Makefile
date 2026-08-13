@@ -376,7 +376,14 @@ plugins: compiler/SLSAllocationPassV2.cpp
 # never through the Makefile that actually builds it. Compiling a file under
 # different flags than the real build uses is not verification of the real
 # build.
-MBEDTLS_INC   = -I vendor/mbedtls/include
+MBEDTLS_INC   = -I vendor/mbedtls/include -I vendor/mbedtls/shim
+# vendor/mbedtls/shim/ is the freestanding libc-header stand-in for this
+# build: the x86_64-elf cross toolchain ships no libc headers, but
+# mbedTLS 3.6's public headers include <time.h> under HAVE_TIME_DATE
+# (platform_util.h) and platform_time.h wants <inttypes.h> for
+# mbedtls_ms_time_t unless MBEDTLS_PLATFORM_MS_TIME_TYPE_MACRO is set
+# (it is, in sls_mbedtls_config.h). shim/time.h supplies struct tm and
+# time_t; nothing in the linked set calls into libc.
 # -U_FORTIFY_SOURCE is the root cause of a whole family of link errors, not a
 # style preference. This toolchain defines _FORTIFY_SOURCE=2 by default, so gcc
 # rewrites memcpy/memset/memmove with a compile-time-known size into

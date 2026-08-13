@@ -59,6 +59,12 @@
 #define MBEDTLS_HAVE_TIME_DATE
 #define MBEDTLS_PLATFORM_TIME_TYPE_MACRO long long
 #define MBEDTLS_PLATFORM_TIME_MACRO      sls_mbedtls_time
+/* mbedTLS 3.6's ms-time typedef (mbedtls_ms_time_t) is int64_t via
+ * <inttypes.h> unless this is defined -- and a freestanding toolchain
+ * has no inttypes.h. Same type on LP64 (long long == int64_t), so this
+ * only skips the header. Without it the TLS files cannot compile in the
+ * kernel build. */
+#define MBEDTLS_PLATFORM_MS_TIME_TYPE_MACRO long long
 
 /* Declared here because mbedtls_time expands to it inside library sources
  * that include no header of ours. */
