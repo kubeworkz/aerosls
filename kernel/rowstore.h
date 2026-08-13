@@ -320,6 +320,31 @@ int rowstore_add_column(uint32_t caller_uid, const char* table_name,
 //       STRING value is too long (>= ROWSTORE_STRING_LEN bytes) — rejected,
 //       never silently truncated
 //   6 = page pool exhausted (insert only)
+//   7 = ROWSTORE_RC_NOT_DURABLE -- see below
+//
+// ─── 7 is not an error, and that is the whole point ────────────────────────
+// The row operation SUCCEEDED. The row is live, queryable, and out_id is
+// filled. What failed is the write that would have put it on the disk, so it
+// will not survive a reboot.
+//
+// Before this code existed, rowstore_flush_page() returned void and discarded
+// nvme_write_sync()'s status, so insert/update/delete returned 0 whatever the
+// disk did: the caller was told the row was stored, it was gone on the next
+// boot, and nothing logged anything. tests/rowstore_io_host_test.c reproduces
+// that against a fake NVMe rigged to fail.
+//
+// A plain error would have been a different lie. The row IS there and IS
+// readable this boot; a caller that treats 7 as "insert failed" and retries
+// gets two rows. So callers must decide deliberately:
+//
+//   care about durability   -> treat 7 as a failure, and do NOT retry blindly
+//   care about the row      -> treat 7 as success; the log and the
+//                              rowstore_undurable_writes() counter are how the
+//                              lost write surfaces
+//
+// kernel/mvcc.c takes the second position explicitly, in code, with a comment
+// saying so. It is a decision, not an oversight.
+#define ROWSTORE_RC_NOT_DURABLE 7
 int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
                         const struct RowValues* values, struct RowId* out_id);
 int rowstore_row_get(uint32_t caller_uid, const char* table_name,
@@ -328,6 +353,12 @@ int rowstore_row_update(uint32_t caller_uid, const char* table_name,
                         struct RowId id, const struct RowValues* values);
 int rowstore_row_delete(uint32_t caller_uid, const char* table_name,
                         struct RowId id);
+
+/* Pages whose write to NVMe failed since boot. Non-zero means at least one
+ * row operation returned ROWSTORE_RC_NOT_DURABLE, and the rows involved are in
+ * RAM only. Exposed through /api/health because a counter nobody can read is a
+ * counter nobody acts on. */
+uint64_t rowstore_undurable_writes(void);
 
 // Full-table scan in physical (page, then slot) order, invoking cb() for
 // every active (non-tombstoned) row. The only "query" primitive this phase

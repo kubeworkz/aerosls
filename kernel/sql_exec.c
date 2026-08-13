@@ -2366,6 +2366,11 @@ static void exec_alter_table(uint32_t caller_uid, struct SqlAlterTableStmt* s, s
     }
 
     int rc = rowstore_add_column(caller_uid, s->table_name, s->column_name, s->column_type);
+    /* The migration happened; only its durability failed. Falling through to
+     * case 0 is correct -- every row was rewritten into the new layout and the
+     * table is usable. rowstore.h explains why this is not an error, and the
+     * [ROWSTORE] log plus rowstore_undurable_writes() are where it surfaces. */
+    if (rc == ROWSTORE_RC_NOT_DURABLE) { rc = 0; }
     switch (rc) {
         case 0: {
             // rowstore_add_column() gave every row a brand-new physical

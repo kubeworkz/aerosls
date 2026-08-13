@@ -191,6 +191,11 @@ static int api_scan(char* body, int max) {
     JSONBuf j = { body, 0, max };
     jb_obj_open(&j, 0);
     jb_str(&j, "build", "4.0-SLS"); jb_putc(&j, ',');
+    /* Rows that exist in RAM but whose page never reached the disk. Non-zero
+     * means data on this node will not survive a reboot, and there is no other
+     * way to learn that: the row operations succeed, the rows read back
+     * correctly, and only the serial console says otherwise. */
+    jb_uint(&j, "rowstore_undurable_writes", rowstore_undurable_writes()); jb_putc(&j, ',');
     jb_uint(&j, "object_count", object_catalog_count); jb_putc(&j, ',');
     jb_arr_open(&j, "objects");
     int first = 1;

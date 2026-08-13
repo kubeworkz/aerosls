@@ -163,6 +163,11 @@ static MvccError map_rowstore_err(int rc) {
         case 5: return MVCC_ERR_VALUES_INVALID;
         case 6: return MVCC_ERR_VERSION_POOL_FULL;   // rowstore's own page pool, not ours --
                                                       // still "storage exhausted" from the caller's view
+        /* 7 (ROWSTORE_RC_NOT_DURABLE) deliberately does NOT appear: every
+         * call site above filters it before mapping, because it means the row
+         * exists. If it ever reaches here that filtering has been lost, and
+         * VALUES_INVALID is a wrong-but-safe answer -- it fails the operation
+         * rather than pretending a lost write was fine. */
         default: return MVCC_ERR_VALUES_INVALID;
     }
 }
@@ -299,8 +304,19 @@ MvccError mvcc_row_insert(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     if (cres != ROW_CONSTRAINT_OK) return map_constraint_violation(cres);
 
     struct RowId phys;
+    /* ROWSTORE_RC_NOT_DURABLE is NOT an error here, and treating it as one
+     * would be worse than ignoring it: the physical row EXISTS. Returning a
+     * failure would leave it orphaned and invite the caller to retry, giving
+     * two rows for one insert. MVCC therefore takes rowstore.h's second
+     * position deliberately -- the row is what MVCC is responsible for, and
+     * the lost write surfaces through the [ROWSTORE] log line and
+     * rowstore_undurable_writes() rather than through this return.
+     *
+     * Threading durability through MvccError is a separate change; inventing
+     * an MVCC durability state here, under this one call, is how an enum
+     * grows a member nobody else honours. */
     int rc = rowstore_row_insert(caller_uid, table_name, values, &phys);
-    if (rc != 0) return map_rowstore_err(rc);
+    if (rc != 0 && rc != ROWSTORE_RC_NOT_DURABLE) return map_rowstore_err(rc);
 
     if (mvcc_version_count >= MVCC_MAX_VERSIONS) {
         rowstore_row_delete(caller_uid, table_name, phys);   // don't leave an orphan physical row
@@ -370,8 +386,10 @@ MvccError mvcc_row_update(uint64_t txn_id, uint32_t caller_uid, const char* tabl
     int have_before = (rowstore_row_get(caller_uid, table_name, old->physical_id, &before) == 0);
 
     struct RowId phys;
+    /* Same as mvcc_insert(): the row exists, so a durability failure must not
+     * be reported as an insert failure. See the note there. */
     int rc = rowstore_row_insert(caller_uid, table_name, values, &phys);
-    if (rc != 0) return map_rowstore_err(rc);
+    if (rc != 0 && rc != ROWSTORE_RC_NOT_DURABLE) return map_rowstore_err(rc);
 
     if (mvcc_version_count >= MVCC_MAX_VERSIONS) {
         rowstore_row_delete(caller_uid, table_name, phys);

@@ -99,12 +99,13 @@ int main(void)
     {
         unsigned long before;
         int rc;
+        struct RowId last_id;
         unsigned char frame[FAKE_NVME_FRAME];
 
         fresh_table();
         before = fake_nvme_ops();
         fake_nvme_fail_at(before + 1, 1);   /* persistent: every write from now */
-        rc = insert_row(1, 100, NULL);
+        rc = insert_row(1, 100, &last_id);
 
         if (rc == 0) {
             bad("*** rowstore_row_insert() returned SUCCESS while every write "
@@ -115,8 +116,35 @@ int main(void)
                 "This is\n"
                 "      rowstore_flush_page() discarding nvme_write_sync()'s "
                 "status.");
+        } else if (rc == ROWSTORE_RC_NOT_DURABLE) {
+            ok("rowstore_row_insert() returns ROWSTORE_RC_NOT_DURABLE");
         } else {
-            ok("rowstore_row_insert() reports the write failure (rc != 0)");
+            printf("FAIL: rowstore_row_insert() returned %d -- a write failure "
+                   "must be ROWSTORE_RC_NOT_DURABLE (%d), not some other error, "
+                   "or a caller cannot tell 'not stored' from 'not inserted'\n",
+                   rc, ROWSTORE_RC_NOT_DURABLE);
+            fail++;
+        }
+
+        /* The half that makes 7 different from an error, and the reason a
+         * plain failure code would have been wrong: the row IS there. A
+         * caller that treats this as "insert failed" and retries gets two
+         * rows. */
+        {
+            struct RowValues got;
+            memset(&got, 0, sizeof got);
+            if (rowstore_row_get(UID, TBL, last_id, &got) == 0) {
+                ok("  and the row IS live and readable -- 7 is not a failure");
+            } else {
+                bad("  but the row is not readable, so 7 is being returned for "
+                    "an operation that did not actually happen");
+            }
+        }
+
+        if (rowstore_undurable_writes() > 0) {
+            ok("  and the undurable-write counter moved (visible in /api/health)");
+        } else {
+            bad("  but the undurable-write counter did not move");
         }
 
         /* Independently of what the caller was told: is the page actually

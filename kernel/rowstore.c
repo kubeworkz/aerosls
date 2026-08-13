@@ -266,9 +266,32 @@ static uint8_t* rowstore_load_page(uint32_t page_id) {
     return frame;
 }
 
-static void rowstore_flush_page(uint32_t page_id) {
-    if (page_id >= ROWSTORE_MAX_PAGES || !row_pages[page_id]) return;
-    nvme_write_sync(ROWSTORE_LBA_BASE + (uint64_t)page_id * 8, row_pages[page_id]);
+/* Returns 0 when the page reached the disk, non-zero when it did not.
+ *
+ * This returned void until tests/rowstore_io_host_test.c drove an insert
+ * against an NVMe rigged to fail every write and watched
+ * rowstore_row_insert() return SUCCESS anyway. The row was in RAM, the caller
+ * had been told it was stored, and it was gone on the next boot with nothing
+ * in any log. The status was always there; nothing looked at it.
+ *
+ * It logs as well as returning, because most callers of a void function do not
+ * grow a check the day it starts returning something, and a line on the
+ * console is what an operator actually sees. */
+static uint64_t rowstore_undurable;
+
+uint64_t rowstore_undurable_writes(void) { return rowstore_undurable; }
+
+static int rowstore_flush_page(uint32_t page_id) {
+    if (page_id >= ROWSTORE_MAX_PAGES || !row_pages[page_id]) return 0;
+    if (nvme_write_sync(ROWSTORE_LBA_BASE + (uint64_t)page_id * 8,
+                        row_pages[page_id]) != 0) {
+        rowstore_undurable++;
+        kernel_serial_printf("[ROWSTORE] page %u did NOT reach the disk -- the "
+                             "row(s) on it are in RAM only and will not survive "
+                             "a reboot.\n", page_id);
+        return 1;
+    }
+    return 0;
 }
 
 // Allocates a brand-new page from partition_id's OWN reserved sub-range of
@@ -498,6 +521,7 @@ static void add_column_collect_cb(struct RowId id, const struct RowValues* value
 
 int rowstore_add_column(uint32_t caller_uid, const char* table_name,
                         const char* column_name, SLSFieldType column_type) {
+    int undurable = 0;   /* set by any flush that did not reach the disk */
     int idx = find_active_table(table_name);
     if (idx < 0) return 1;
     if (!catalog_check_access(caller_uid, table_name, PERM_WRITE)) return 2;
@@ -574,7 +598,7 @@ int rowstore_add_column(uint32_t caller_uid, const char* table_name,
                 migrate_hdr.first_page_id = new_page;
             } else {
                 uint8_t* prev = rowstore_load_page(migrate_hdr.last_page_id);
-                if (prev) { rs_memcpy(prev, &new_page, 4); rowstore_flush_page(migrate_hdr.last_page_id); }
+                if (prev) { rs_memcpy(prev, &new_page, 4); undurable |= rowstore_flush_page(migrate_hdr.last_page_id); }
             }
             migrate_hdr.last_page_id = new_page;
             migrate_hdr.rows_in_last_page = 0;
@@ -585,7 +609,7 @@ int rowstore_add_column(uint32_t caller_uid, const char* table_name,
         uint32_t slot = migrate_hdr.rows_in_last_page;
         uint8_t* slot_ptr = page + 4 + slot * migrate_hdr.layout.row_width;
         rs_memcpy(slot_ptr, row_buf, migrate_hdr.layout.row_width);
-        rowstore_flush_page(migrate_hdr.last_page_id);
+        undurable |= rowstore_flush_page(migrate_hdr.last_page_id);
         migrate_hdr.rows_in_last_page++;
         migrate_hdr.row_count++;
     }
@@ -617,12 +641,14 @@ int rowstore_add_column(uint32_t caller_uid, const char* table_name,
         row_index_create(0, rebuild_name[i], table_name, rebuild_col[i]);
     }
 
-    return 0;
+    /* The operation succeeded; only its durability is in question. See
+     * ROWSTORE_RC_NOT_DURABLE in rowstore.h for why this is not an error. */
+    return undurable ? ROWSTORE_RC_NOT_DURABLE : 0;
 }
-
 // ─── Row CRUD ────────────────────────────────────────────────────────────────
 int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
                         const struct RowValues* values, struct RowId* out_id) {
+    int undurable = 0;   /* set by any flush that did not reach the disk */
     if (!table_name || !values) return 5;
     int idx = find_active_table(table_name);
     if (idx < 0) return 1;
@@ -642,7 +668,9 @@ int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
             h->first_page_id = new_page;
         } else {
             uint8_t* prev = rowstore_load_page(h->last_page_id);
-            if (prev) { rs_memcpy(prev, &new_page, 4); rowstore_flush_page(h->last_page_id); }
+            /* The chain link matters as much as the row: a next_page_id that
+             * never reached the disk orphans the new page on reboot. */
+            if (prev) { rs_memcpy(prev, &new_page, 4); undurable |= rowstore_flush_page(h->last_page_id); }
         }
         h->last_page_id = new_page;
         h->rows_in_last_page = 0;
@@ -654,7 +682,7 @@ int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
     uint32_t slot = h->rows_in_last_page;
     uint8_t* slot_ptr = page + 4 + slot * h->layout.row_width;
     rs_memcpy(slot_ptr, row_buf, h->layout.row_width);
-    rowstore_flush_page(h->last_page_id);
+    undurable |= rowstore_flush_page(h->last_page_id);
 
     h->rows_in_last_page++;
     h->row_count++;
@@ -668,7 +696,9 @@ int rowstore_row_insert(uint32_t caller_uid, const char* table_name,
     // -- see row_index.h for why this lives here rather than being an
     // opt-in step a caller has to remember.
     row_index_notify_insert(object_catalog[idx].object_id, new_id, values, &h->layout);
-    return 0;
+    /* The operation succeeded; only its durability is in question. See
+     * ROWSTORE_RC_NOT_DURABLE in rowstore.h for why this is not an error. */
+    return undurable ? ROWSTORE_RC_NOT_DURABLE : 0;
 }
 
 int rowstore_row_get(uint32_t caller_uid, const char* table_name,
@@ -691,6 +721,7 @@ int rowstore_row_get(uint32_t caller_uid, const char* table_name,
 
 int rowstore_row_update(uint32_t caller_uid, const char* table_name,
                         struct RowId id, const struct RowValues* values) {
+    int undurable = 0;   /* set by any flush that did not reach the disk */
     if (!values) return 5;
     int idx = find_active_table(table_name);
     if (idx < 0) return 1;
@@ -716,13 +747,16 @@ int rowstore_row_update(uint32_t caller_uid, const char* table_name,
     deserialize_row(&h->layout, slot, &old_values);
 
     rs_memcpy(slot, row_buf, h->layout.row_width);
-    rowstore_flush_page(id.page_id);
+    undurable |= rowstore_flush_page(id.page_id);
 
     row_index_notify_update(object_catalog[idx].object_id, id, &old_values, values, &h->layout);
-    return 0;
+    /* The operation succeeded; only its durability is in question. See
+     * ROWSTORE_RC_NOT_DURABLE in rowstore.h for why this is not an error. */
+    return undurable ? ROWSTORE_RC_NOT_DURABLE : 0;
 }
 
 int rowstore_row_delete(uint32_t caller_uid, const char* table_name, struct RowId id) {
+    int undurable = 0;   /* set by any flush that did not reach the disk */
     int idx = find_active_table(table_name);
     if (idx < 0) return 1;
     struct RowTableHeader* h = &table_headers[idx];
@@ -742,12 +776,16 @@ int rowstore_row_delete(uint32_t caller_uid, const char* table_name, struct RowI
     deserialize_row(&h->layout, slot, &old_values);
 
     slot[0] = 0;   // tombstone -- slot is NOT reclaimed for reuse in this first cut
-    rowstore_flush_page(id.page_id);
+    /* A tombstone that does not reach the disk means the row comes BACK on
+     * reboot, which is the delete equivalent of losing an insert. */
+    undurable |= rowstore_flush_page(id.page_id);
     h->row_count--;
     persist_rowstore_headers();
 
     row_index_notify_delete(object_catalog[idx].object_id, id, &old_values, &h->layout);
-    return 0;
+    /* The operation succeeded; only its durability is in question. See
+     * ROWSTORE_RC_NOT_DURABLE in rowstore.h for why this is not an error. */
+    return undurable ? ROWSTORE_RC_NOT_DURABLE : 0;
 }
 
 // ─── Scan ────────────────────────────────────────────────────────────────────
