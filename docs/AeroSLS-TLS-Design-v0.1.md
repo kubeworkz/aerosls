@@ -1782,12 +1782,50 @@ static-asserts each number against the `MBEDTLS_TLS1_3_*` macro it stands for,
 so a transposed digit is a build failure rather than a suite that quietly never
 negotiates.
 
-**Still owed:** a live ChaCha20 handshake. The check above proves the suite is
-*available*; only a client forcing it proves it *works*:
+#### The fallback, negotiated — 2026-08-13
+
+Forced from a client and completed:
 
 ```
 openssl s_client -connect localhost:8444 -ciphersuites TLS_CHACHA20_POLY1305_SHA256
+  New, TLSv1.3, Cipher is TLS_CHACHA20_POLY1305_SHA256
+  Server Temp Key: X25519, 253 bits
+  SSL handshake has read 1337 bytes and written 353 bytes
 ```
+
+The suite that existed only as a line in a list has now carried a handshake.
+Every claim in the pinned table is live except the hardware it was written for.
+
+Two things fell out of the same capture, neither of them the point of the test:
+
+**The chain and the anchor are unchanged.** The CA is `NotBefore Aug 11
+23:32:33 2026, NotAfter Aug 11 23:32:33 2031` — byte-for-byte the window
+Firefox showed, still being read off `PERSIST_TLS_LBA` several boots later. The
+leaf is a fourth distinct one, `notBefore Aug 12 01:01:46` plus the 24-hour
+backdate, `notAfter` exactly **365 days** after generation.
+
+**The serial invariants hold on the wire.** `tls_cert_make_serial()` promises a
+20-octet, positive, minimally-encoded, non-zero serial, and the reasoning
+behind it is a page of this document about how mbedTLS prepends `0x00` when the
+top bit is set. Decoded from the certificate the server actually sent:
+
+```
+serial      53CFD77FE74FC505AF331E5E85DF39F455290B05
+octets      20        (RFC 5280 maximum)
+first byte  0x53      top bit clear, non-zero
+```
+
+Along with `CA:FALSE`, `keyUsage: critical, Digital Signature`, and all three
+SANs — `IP Address:10.0.2.15, IP Address:127.0.0.1, DNS:localhost`. Every one
+of those was asserted by the oracle against a certificate the oracle itself
+generated; this is the same set read off a live node by OpenSSL.
+
+Two lines in that output are expected and not faults. `Verification error:
+self-signed certificate in certificate chain` is `s_client` without `-CAfile`
+being handed a chain whose anchor it has never seen — the point of the anchor
+being one an operator installs. `No ALPN negotiated` is `s_client` not offering
+ALPN; the server advertises `http/1.1` and does not require it, which is why
+`tls_gate_evidence.sh` passes `-alpn http/1.1` explicitly.
 
 The ChaCha20 entry is not a new argument. §2 already chose ChaCha20 over AES
 for the DRBG, for exactly this reason — *"it is constant-time in software by
