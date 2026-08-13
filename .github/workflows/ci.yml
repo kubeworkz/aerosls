@@ -1191,30 +1191,47 @@ jobs:
           # ELR_EL1/SPSR_EL1 save/restore (a nested fire overwrites
           # both with the spin's PC; without the save/restore the outer
           # eret returns to the stale spin and loops). The ordered
-          # stream asserts the whole M5.2 interleave + the nesting
-          # phase, in this exact order.
-          # `|| true` on the capture: grep exits 1 when the stream pattern
-          # is ABSENT -- the exact failure this step exists to report --
-          # and under bash -e that abort would swallow the got-vs-want
-          # diagnostic below. Empty seq fails the [ "$seq" = "$want" ]
-          # check with the full diff printed.
+          # stream's stable ORDERING TEETH. The exact interleave is
+          # phase-dependent -- which side of the nesting window [TICK 6]
+          # lands on, and how many EL0 excursions run before the first
+          # tick -- so an exact-string want flakes; assert instead:
+          # (1) >= 4 leading EL0 excursions before [TICK 1] (the LCG
+          # pair then the mem pair, which run before the timer arms, so
+          # no tick can fire during them); (2) an unbroken, unduplicated
+          # [TICK 1..6] run; (3) [TICK 4] before the first 'tick gate
+          # reached' before [TICK 5] before 'nesting window'; (4) inside
+          # that window BOTH [TICK 6] and 'nested: virtual timer
+          # preempted' fire, in either order, before the closing gate.
+          # `|| true` on the captures: grep exits 1 when a pattern is
+          # ABSENT -- the exact failure this step exists to report --
+          # and under bash -e -o pipefail that abort would swallow the
+          # got-vs-want diagnostic below.
           seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached|nesting window|nested: virtual timer preempted' arm64_boot.log) || true
-          # §10.201/§10.202: the four LEADING erets are the LCG pair
-          # then the mem pair — they run before the timer arms (the
-          # M5.2 probe is armed by the mem continuation's handoff), so
-          # no tick can fire during them; [TICK 1]/[TICK 2] then pend
-          # through the smoke windows exactly as the committed sequence
-          # did.
-          want=$'[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[M5] eret into EL0...\n[TICK 1]\n[M5] eret into EL0...\n[TICK 2]\n[TICK 3]\n[TICK 4]\ntick gate reached\n[TICK 5]\nnesting window\n[TICK 6]\nnested: virtual timer preempted\ntick gate reached'
-          [ "$seq" = "$want" ] || {
-            echo "FAILED: the tick stream does not interleave with the EL0 excursions and the M5.3 nested phase (a tick was lost, duplicated, or taken out of order)" >&2
-            echo "--- got:" >&2
-            echo "$seq" >&2
-            echo "--- want:" >&2
-            echo "$want" >&2
-            tail -30 arm64_boot.log >&2
-            exit 1
-          }
+          fail() { echo "FAILED: $*" >&2; echo "--- got:" >&2; echo "$seq" >&2; tail -30 arm64_boot.log >&2; exit 1; }
+          L() { printf '%s\n' "$seq" | grep -nF -m1 "$1" | cut -d: -f1 || true; }
+          t1=$(L '[TICK 1]'); t2=$(L '[TICK 2]'); t3=$(L '[TICK 3]'); t4=$(L '[TICK 4]'); t5=$(L '[TICK 5]'); t6=$(L '[TICK 6]')
+          g1=$(L 'tick gate reached'); g2=$(printf '%s\n' "$seq" | grep -nF 'tick gate reached' | tail -1 | cut -d: -f1) || true
+          w=$(L 'nesting window'); n=$(L 'nested: virtual timer preempted')
+          [ -n "$t1" ] && [ -n "$t2" ] && [ -n "$t3" ] && [ -n "$t4" ] && [ -n "$t5" ] && [ -n "$t6" ] && [ -n "$g1" ] && [ -n "$g2" ] && [ -n "$w" ] && [ -n "$n" ] || fail "a required marker never printed -- a tick was lost or the gate/nesting phase is missing"
+          for i in 1 2 3 4 5 6; do
+            c=$(printf '%s\n' "$seq" | grep -cF "[TICK $i]") || true
+            [ "$c" -eq 1 ] || fail "[TICK $i] appears $c times (want exactly 1 -- a tick was duplicated)"
+          done
+          gc=$(printf '%s\n' "$seq" | grep -cF 'tick gate reached') || true
+          [ "$gc" -eq 2 ] || fail "'tick gate reached' appears $gc times (want exactly 2 -- before [TICK 5] and after the nested phase)"
+          lead=$(printf '%s\n' "$seq" | sed -n "1,$((t1-1))p")
+          lead_n=$(printf '%s\n' "$lead" | grep -cF '[M5] eret into EL0...') || true
+          lead_total=$(printf '%s\n' "$lead" | grep -c '')
+          [ "$lead_total" -eq "$lead_n" ] || fail "$lead_n/$lead_total leading markers are erets (want an all-eret prefix before [TICK 1])"
+          [ "$lead_n" -ge 4 ] || fail "only $lead_n leading EL0 excursions (want >= 4: the LCG pair + mem pair run before the timer arms)"
+          [ "$t1" -lt "$t2" ] && [ "$t2" -lt "$t3" ] && [ "$t3" -lt "$t4" ] || fail "[TICK 1..4] out of order"
+          [ "$t4" -lt "$g1" ] || fail "[TICK 4] must precede the first 'tick gate reached'"
+          [ "$g1" -lt "$t5" ] || fail "the first 'tick gate reached' must precede [TICK 5]"
+          [ "$t5" -lt "$w" ] || fail "[TICK 5] must open the 'nesting window'"
+          { [ "$w" -lt "$t6" ] && [ "$t6" -lt "$g2" ]; } || fail "[TICK 6] must fire inside the nesting window (after 'nesting window', before the closing gate)"
+          { [ "$w" -lt "$n" ] && [ "$n" -lt "$g2" ]; } || fail "'nested: virtual timer preempted' must fire inside the nesting window"
+          mid=$(printf '%s\n' "$seq" | sed -n "$((t1+1)),$((t2-1))p" | grep -cF '[M5] eret into EL0...') || true
+          [ "$mid" -ge 1 ] || fail "no EL0 excursion between [TICK 1] and [TICK 2]"
           echo "OK: M4a+M4b+M4c+M5+M5.1+M5.2+M5.3 arm64 kernel booted — banner + TTBR1 kernel + EL0 user pages + activation cache (1 MISS / 3 HITs) + contention-probe GIC ticks [TICK 1..4] interleaved with the EL0 excursions + nested virtual-timer IRQ ([TICK 5] window, [TICK 6] preempts the physical handler) + SIMI result 42 x4 + PSCI SYSTEM_OFF (rc=0)"
 
       - name: Teeth — the mem_touch EL0-only claim is machine-checked, not asserted (plan doc §10.203)
