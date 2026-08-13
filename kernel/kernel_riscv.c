@@ -594,6 +594,19 @@ static void rv_fp_task_common(void) {
             acc = acc * 1664525u + 1013904223u;
         me->lcg_acc = acc;
         me->work_done += sp->work;
+        /* Mark finished BEFORE clearing in_work: the tick gate counts a
+         * preemption only while the task is neither done nor in work, so
+         * the in_work=0 tail of the FINAL slice (the loop back-edge and
+         * the done store) is exactly the window where a tick would count
+         * a phantom grant the task can never consume -- a 6th preemption
+         * for a 5-slice task, drifting the 15/15 accounting (observed on
+         * loaded runners: preemptions: 16 FAIL). Setting done first
+         * closes the window: any tick landing in the tail sees a
+         * finished task and cannot count it. Slices 1..N-1 are
+         * unchanged -- done stays 0 through their spins, so every grant
+         * they consume still counts. */
+        if (s + 1 == RV_TASK_SLICES)
+            me->done = 1;
         me->in_work = 0;   /* back to the boundary spin for the next slice */
     }
     /* All slices done: mark finished. The handoff discipline matters
