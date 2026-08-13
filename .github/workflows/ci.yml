@@ -44,12 +44,25 @@ jobs:
             echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
             exit 0
           fi
+          # `|| echo 000`: a curl network failure exits non-zero, and
+          # under bash -e that would abort the step with zero output.
+          # 000 means "no response" -- checked below so it is not
+          # misreported as a private repo.
           code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/kubeworkz/qemu-sls)
+            https://api.github.com/repos/kubeworkz/qemu-sls || echo 000)
           if [ "$code" = "200" ]; then
             echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
             exit 0
           fi
+          # curl writes the -w code once per connection attempt, so a
+          # failed probe can be "000" or "000000" -- match the all-zeros
+          # family rather than an exact "000".
+          case "$code" in
+            000*)
+              echo "::error::could not reach api.github.com to probe qemu-sls visibility (HTTP $code) --"
+              echo "::error::retry the run; CI cannot verify the checkout without the probe."
+              exit 1 ;;
+          esac
           echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
           echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
           echo "::error::The host suite's sls_alloc_host_test reads ../qemu/sls/sls-runtime.c,"
@@ -186,12 +199,25 @@ jobs:
           # -L: the API answers 301 (moved to a repository-ID URL) for
           # public repos; without following it a public repo would be
           # misread as private and the guard would fail wrongly.
+          # `|| echo 000`: a curl network failure exits non-zero, and
+          # under bash -e that would abort the step with zero output.
+          # 000 means "no response" -- checked below so it is not
+          # misreported as a private repo.
           code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/kubeworkz/qemu-sls)
+            https://api.github.com/repos/kubeworkz/qemu-sls || echo 000)
           if [ "$code" = "200" ]; then
             echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
             exit 0
           fi
+          # curl writes the -w code once per connection attempt, so a
+          # failed probe can be "000" or "000000" -- match the all-zeros
+          # family rather than an exact "000".
+          case "$code" in
+            000*)
+              echo "::error::could not reach api.github.com to probe qemu-sls visibility (HTTP $code) --"
+              echo "::error::retry the run; CI cannot verify the checkout without the probe."
+              exit 1 ;;
+          esac
           echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
           echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
           echo "::error::The kernel links objects out of ../qemu, so CI cannot build without"
@@ -340,12 +366,25 @@ jobs:
           # -L: the API answers 301 (moved to a repository-ID URL) for
           # public repos; without following it a public repo would be
           # misread as private and the guard would fail wrongly.
+          # `|| echo 000`: a curl network failure exits non-zero, and
+          # under bash -e that would abort the step with zero output.
+          # 000 means "no response" -- checked below so it is not
+          # misreported as a private repo.
           code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/kubeworkz/qemu-sls)
+            https://api.github.com/repos/kubeworkz/qemu-sls || echo 000)
           if [ "$code" = "200" ]; then
             echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
             exit 0
           fi
+          # curl writes the -w code once per connection attempt, so a
+          # failed probe can be "000" or "000000" -- match the all-zeros
+          # family rather than an exact "000".
+          case "$code" in
+            000*)
+              echo "::error::could not reach api.github.com to probe qemu-sls visibility (HTTP $code) --"
+              echo "::error::retry the run; CI cannot verify the checkout without the probe."
+              exit 1 ;;
+          esac
           echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
           echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
           echo "::error::The kernel links objects out of ../qemu, so CI cannot build without"
@@ -397,9 +436,13 @@ jobs:
           TOK=deadbeef01234567cafebabe76543210   # dave, DB_ADMIN
           fail=0
           for ep in compiled elf elf-reject; do
+            # `|| true` on the capture: a curl failure (kernel wedged,
+            # connection refused) exits non-zero, and under bash -e that
+            # would abort the step BEFORE the pass check runs. Empty body
+            # fails the grep below with the endpoint named.
             body=$(curl -s --max-time 120 -X POST \
               "http://localhost:3001/api/qemu/$ep" \
-              -H "Authorization: Bearer $TOK")
+              -H "Authorization: Bearer $TOK") || true
             echo "$ep -> $body"
             echo "$body" | grep -q '"pass":"true"' || {
               echo "FAILED: /api/qemu/$ep did not pass ($body)" >&2
@@ -823,7 +866,13 @@ jobs:
           # is strictly empty — any symbol (printf, malloc, or a GCC-
           # synthesized memcpy) would fail the link. The toolchain here is
           # the same one that built `make riscv-elf` above.
-          out=$(bash tools/simi/tests/simi_riscv_kernel_check.sh 2>&1)
+          # `|| true` on the capture: under the default bash -e shell, a
+          # non-zero exit from the command substitution aborts the step
+          # BEFORE echo runs, swallowing the script's diagnostics (the
+          # failure would show as zero output plus a generic FAILED
+          # line). The grep below owns the verdict; the output stays
+          # visible.
+          out=$(bash tools/simi/tests/simi_riscv_kernel_check.sh 2>&1) || true
           echo "$out"
           echo "$out" | grep -q "0 violations" || {
             echo "FAILED: kernel/simi_riscv.c does not compile clean under RV_CFLAGS or has undefined symbols" >&2
@@ -838,7 +887,13 @@ jobs:
           # into throwaway copies and asserts the SAME checks fail, plus
           # asserts the clean copy still passes (so the teeth are
           # meaningful). A check that has gone blind fails here.
-          out=$(bash tools/simi/tests/simi_riscv_kernel_smoke.sh 2>&1)
+          # `|| true` on the capture: under the default bash -e shell, a
+          # non-zero exit from the command substitution aborts the step
+          # BEFORE echo runs, swallowing the script's diagnostics (the
+          # failure would show as zero output plus a generic FAILED
+          # line). The grep below owns the verdict; the output stays
+          # visible.
+          out=$(bash tools/simi/tests/simi_riscv_kernel_smoke.sh 2>&1) || true
           echo "$out"
           echo "$out" | grep -q "3 passed, 0 failed" || {
             echo "FAILED: RV64 kernel-copy gate teeth — a deliberate violation slipped through" >&2
@@ -861,7 +916,13 @@ jobs:
           # the same instruction execute silently, which is exactly why
           # the census tooth must fire.) A gate that has gone blind fails
           # here.
-          out=$(bash tools/simi/tests/rv64_fp_gate_smoke.sh 2>&1)
+          # `|| true` on the capture: under the default bash -e shell, a
+          # non-zero exit from the command substitution aborts the step
+          # BEFORE echo runs, swallowing the script's diagnostics (the
+          # failure would show as zero output plus a generic FAILED
+          # line). The grep below owns the verdict; the output stays
+          # visible.
+          out=$(bash tools/simi/tests/rv64_fp_gate_smoke.sh 2>&1) || true
           echo "$out"
           echo "$out" | grep -q "4 passed, 0 failed" || {
             echo "FAILED: RV64 FP gate teeth — a deliberate FP violation slipped through" >&2
@@ -1132,7 +1193,12 @@ jobs:
           # eret returns to the stale spin and loops). The ordered
           # stream asserts the whole M5.2 interleave + the nesting
           # phase, in this exact order.
-          seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached|nesting window|nested: virtual timer preempted' arm64_boot.log)
+          # `|| true` on the capture: grep exits 1 when the stream pattern
+          # is ABSENT -- the exact failure this step exists to report --
+          # and under bash -e that abort would swallow the got-vs-want
+          # diagnostic below. Empty seq fails the [ "$seq" = "$want" ]
+          # check with the full diff printed.
+          seq=$(grep -aoE '\[M5\] eret into EL0\.\.\.|\[TICK [0-9]*\]|tick gate reached|nesting window|nested: virtual timer preempted' arm64_boot.log) || true
           # §10.201/§10.202: the four LEADING erets are the LCG pair
           # then the mem pair — they run before the timer arms (the
           # M5.2 probe is armed by the mem continuation's handoff), so
@@ -1278,8 +1344,13 @@ jobs:
           # the freestanding pair", and ANY other symbol (printf, malloc,
           # ...) fails the gate. A divergence from the host copy surfaces
           # as a behavior difference under the real-A64 leg above.
+          # `|| true` on the capture: a failed compile exits non-zero --
+          # the exact failure this gate exists to catch -- and under
+          # bash -e that abort would kill the step BEFORE echo shows the
+          # compiler output or the [ -z "$out" ] check runs. The check
+          # owns the verdict; the compiler's errors stay visible.
           out=$(aarch64-linux-gnu-gcc -ffreestanding -O2 -Wall -Wextra \
-                -ffunction-sections -fdata-sections -c kernel/simi_arm.c -o /tmp/kernel_simi_arm.o 2>&1)
+                -ffunction-sections -fdata-sections -c kernel/simi_arm.c -o /tmp/kernel_simi_arm.o 2>&1) || true
           echo "$out"
           [ -z "$out" ] || {
             echo "FAILED: kernel/simi_arm.c does not compile clean under freestanding flags" >&2
@@ -1306,7 +1377,13 @@ jobs:
           # variable into throwaway copies and asserts the SAME checks
           # fail, plus asserts the clean copy still passes (so the teeth
           # are meaningful). A gate that has gone blind fails here.
-          out=$(bash tools/simi/tests/arm64_kernel_copy_smoke.sh 2>&1)
+          # `|| true` on the capture: under the default bash -e shell, a
+          # non-zero exit from the command substitution aborts the step
+          # BEFORE echo runs, swallowing the script's diagnostics (the
+          # failure would show as zero output plus a generic FAILED
+          # line). The grep below owns the verdict; the output stays
+          # visible.
+          out=$(bash tools/simi/tests/arm64_kernel_copy_smoke.sh 2>&1) || true
           echo "$out"
           echo "$out" | grep -q "3 passed, 0 failed" || {
             echo "FAILED: kernel-copy gate teeth — a deliberate violation slipped through" >&2
@@ -1323,7 +1400,13 @@ jobs:
           # backstop: the probe's "before" line prints, the "after" never
           # does, rc=124 — then restores the tree. A gate that has gone
           # blind fails here.
-          out=$(bash tools/simi/tests/arm64_fp_gate_smoke.sh 2>&1)
+          # `|| true` on the capture: under the default bash -e shell, a
+          # non-zero exit from the command substitution aborts the step
+          # BEFORE echo runs, swallowing the script's diagnostics (the
+          # failure would show as zero output plus a generic FAILED
+          # line). The grep below owns the verdict; the output stays
+          # visible.
+          out=$(bash tools/simi/tests/arm64_fp_gate_smoke.sh 2>&1) || true
           echo "$out"
           echo "$out" | grep -q "4 passed, 0 failed" || {
             echo "FAILED: FP/SIMD gate teeth — a deliberate SIMD violation slipped through" >&2
