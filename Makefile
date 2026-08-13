@@ -250,6 +250,7 @@ TCG_CFLAGS = -ffreestanding -O2 -mcmodel=small -mno-red-zone \
 TCG_OBJS = \
     tcg-objs/sls-runtime.x86.o \
     tcg-objs/sls-launcher.x86.o \
+    tcg-objs/sls-elf64-loader.x86.o \
     tcg-objs/sls-x86-frontend.x86.o \
     tcg-objs/sls-tcg-wrappers.x86.o \
     tcg-objs/tcg.x86.o \

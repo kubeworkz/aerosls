@@ -2038,6 +2038,8 @@ extern int      sls_test_guest_paging(void);
 extern int      sls_test_guest_invl(void);
 extern int      sls_test_guest_selfmod(void);
 extern int      sls_test_guest_compiled(void);
+extern int      sls_test_guest_elf(void);
+extern int      sls_test_guest_elf_reject(void);
 extern int      sls_softmmu_enabled(void);
 extern uint64_t sls_heap_used(void);
 extern uint64_t sls_heap_total(void);
@@ -2221,6 +2223,33 @@ static int api_qemu_compiled_post(char* buf, int max) {
     // arithmetic in C. Until the helpers it crosses are implemented, a stub
     // halts the kernel and this endpoint never answers.
     int rc = sls_test_guest_compiled();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+static int api_qemu_elf_reject_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M5: a dynamic ELF (PT_INTERP) must be refused loudly with
+    // no segment placed -- this kernel has no dynamic loader.
+    int rc = sls_test_guest_elf_reject();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+static int api_qemu_elf_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M5: a real gcc -static ELF64 (sls/guest/hello.c) parsed and
+    // placed by sls_elf64_load(), booted through the decoder, whose
+    // write(1,...) syscall must print to serial and exit_group(0)
+    // must return control to the launcher. Same shape as the
+    // compiled endpoint: a halting stub means this never answers.
+    int rc = sls_test_guest_elf();
     jb_obj_open(&j, 0);
     jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
     jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
@@ -5607,6 +5636,14 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/compiled")) {
             blen = api_qemu_compiled_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/elf")) {
+            blen = api_qemu_elf_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/elf-reject")) {
+            blen = api_qemu_elf_reject_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // Destructive. Requires {"confirm":"reboot"}; see the handler.

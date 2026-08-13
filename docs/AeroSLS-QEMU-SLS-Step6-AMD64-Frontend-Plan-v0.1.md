@@ -326,6 +326,28 @@ print/compare block shows all three markers green on a single end-to-end run.
   and exits 0, delivered back to the launcher. This is the milestone the whole plan
   exists for; M1–M4 are its prerequisites, and everything after is depth.
 
+**Status: the loader milestone landed 2026-08-13 (iteration 15).** `sls-elf64-loader.c`
+parses a static ELF64 (magic/class/endian/machine validated, ET_EXEC only), rejects
+PT_INTERP loudly *before* any segment is placed, loads each PT_LOAD at its p_vaddr
+(paging off: guest linear == guest physical, so p_vaddr IS the GPA), zeroes the BSS
+tail (p_memsz − p_filesz) with tcache flush, and builds the System V initial stack:
+argc/argv/envp plus the auxv vector (AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_ENTRY/
+AT_UID/AT_GID/AT_RANDOM/AT_EXECFN) with the strings and 16 AT_RANDOM bytes above the
+pointer array, 16-aligned RSP. The M5 syscall shim (Gap D option 3) lives in
+helper_syscall: a guest that never installed LSTAR is a Linux binary asking this build
+to be its kernel — `write`→serial (fd 1/2, up to 512 bytes), `exit`/`exit_group`→the
+launcher with the status in sls_last_guest_exit_code, anything else halts naming the
+number. The gate fixture (sls/guest/hello.c, `gcc -static -nostdlib`, embedded as
+hello-bytes.h) checks .data round-trip and .bss-zeroing internally, writes "hello from
+the ELF loader" to serial, and exits 0; the companion dynhello fixture proves PT_INTERP
+rejection. Both endpoints green in a single boot (22 guest insns, exit_code=0, and the
+reject case rc=-1 with the interpreter named).
+
+**Still owed before a full `gcc -static` glibc binary runs:** the PT_TLS TCB at FS:0
+(static glibc demands tcbhead_t before `__libc_start_main`) and the rest of the shim
+surface (`brk`/`mmap`/`munmap`→SLS frames, `read`, `futex`, `clock_gettime` as the
+binary demands them) — per the stub-halt discipline, each lands when a fixture calls it.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
