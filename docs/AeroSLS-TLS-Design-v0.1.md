@@ -1424,3 +1424,71 @@ identical on both sides of the A/B and therefore cancels, and it exists only in
   intention, not the build.
 - **ARM64 entropy diversity**, still unmet from Phase 0 and still needing
   hardware.
+
+---
+
+## Persistence gate result, 2026-08-13: the anchor held across a reboot
+
+Two captures from a live node, four minutes and one reboot apart.
+
+| | boot A | boot B |
+|---|---|---|
+| uptime at capture | 12056 ticks | 1493 ticks |
+| leaf serial | `17E599AA…5DD8` | `1D9ECEE1…0015` |
+| leaf SHA-256 | `15:EE:36:FA…F8:EA` | `CF:8D:02:3E…A0:8D` |
+| **CA SHA-256** | **`E6:1B:32:32:8C:A5:7F:87:0A:90:B1:EB:8A:6A:CB:CF:F8:7E:F6:D3:58:92:AA:19:66:03:C1:BA:EF:F6:2A:46`** | **identical** |
+| `tls_ca_stored` | 1 | 1 |
+
+`--compare`: 5/5. Each capture: 8/8. TLS 1.3, `TLS_AES_256_GCM_SHA384`, X25519
+(253 bits), ALPN `http/1.1`. Leaf 474 bytes, CA 451. The Navigator body over
+TLS is byte-identical to the same fetch over plaintext (`40efa0ff…`, 481 bytes).
+
+### Why this is the property and not a weaker one
+
+Each half of the comparison is satisfied by a *failure* on its own. "Everything
+regenerated" passes the serial check. "Nothing regenerated" passes the CA
+check. Only the pair means anything, and the uptime counter is what stops
+"nothing regenerated" from being explained by "nothing restarted":
+
+- the node **restarted** — 12056 → 1493 ticks;
+- the leaf **changed** — different serial, different SHA-256, different public
+  key, so a new key was generated on boot B;
+- the CA **did not** — byte-identical fingerprint, which is only reachable by
+  reading it back off NVMe;
+- and the node's own `tls_ca_stored=1` agrees with what it served, which is the
+  check that would catch a health endpoint telling an operator a comfortable
+  story about a certificate it was not presenting.
+
+### Two constants read off the wire, neither of them asserted from inside
+
+The validity strings turn out to carry `TLS_CERT_BACKDATE_SECONDS` and
+`TLS_SERVER_LEAF_SECONDS` in a form a verifier can check:
+
+```
+boot A notBefore  2026-08-11 23:55:06
+       + 24h  ->  generated 2026-08-12 23:55:06   (the backdate, exactly)
+boot A notAfter   2027-08-12 23:55:06
+       - generation = 365 days                    (the leaf lifetime, exactly)
+```
+
+Both are what `tls_server.h` says they are, measured from a certificate OpenSSL
+parsed, on a node this repository cannot interrogate. That is the same
+reasoning as "Phase 3's gate is a browser": the number is confirmed by
+something that had no access to the constant.
+
+The leaf's 365 days sits well inside the CA's remaining 1824, so the clamp did
+not engage here. It stays unexercised in production until the CA is within a
+year of expiry — the oracle's `--persist` mode is the only thing that has ever
+run it, which is exactly why that assertion exists.
+
+### What this does not show
+
+**The browser half.** `--compare` says "an existing import still holds", and
+that is an *inference* from the fingerprints, not an observation. Chrome and
+Firefox reloading without a re-import is the actual claim, and until that is
+seen it is not evidence. The whole point of "Phase 3's gate is a browser, not a
+test suite" applies here unchanged: this section is a test suite.
+
+**Anything about the key's protection.** The CA key is in plaintext on the disk
+this reboot read it from. That is the design and §6.1 states it; a green result
+here is not a security property, it is a durability one.
