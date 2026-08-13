@@ -486,4 +486,24 @@ int      persist_verify_get(void);
 /* Frames actually put on the wire by the last shadow-compared write. */
 uint32_t persist_last_frames_written(void);
 
+/* ─── Writes this kernel believed it made and did not ──────────────────────
+ * Incremented when a write, a multi-page write, or a commit barrier returns a
+ * non-zero NVMe status. Non-zero means at least one region's newest bytes are
+ * in RAM only.
+ *
+ * The counter exists because the failure it counts used to be completely
+ * invisible: every nvme_*_sync() status in this file was discarded, and the
+ * shadow above was then updated as though the write had happened -- so the
+ * next shadow-compare found no difference, skipped the frame, and skipped it
+ * forever. A transient error became permanent loss with nothing logged.
+ *
+ * The comment above says deriving dirtiness from the bytes makes that failure
+ * "impossible". That is true of a MISSED MARK and was never true of a FAILED
+ * WRITE. Both are now handled: a failure invalidates the shadow, so the next
+ * write rewrites the region in full.
+ *
+ * Exposed through /api/health. Found by tests/io_fault_host_test.c's
+ * fault-injection seam. */
+uint64_t persist_undurable_writes(void);
+
 #endif /* PERSIST_H */

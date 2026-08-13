@@ -196,6 +196,8 @@ static int api_scan(char* body, int max) {
      * way to learn that: the row operations succeed, the rows read back
      * correctly, and only the serial console says otherwise. */
     jb_uint(&j, "rowstore_undurable_writes", rowstore_undurable_writes()); jb_putc(&j, ',');
+    jb_uint(&j, "vecstore_undurable_writes", vecstore_undurable_writes()); jb_putc(&j, ',');
+    jb_uint(&j, "persist_undurable_writes", persist_undurable_writes()); jb_putc(&j, ',');
     jb_uint(&j, "object_count", object_catalog_count); jb_putc(&j, ',');
     jb_arr_open(&j, "objects");
     int first = 1;

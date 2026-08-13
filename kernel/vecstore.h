@@ -218,6 +218,11 @@ void vecstore_init(void);
 
 // Enables vector-collection storage for an already-valloc'd catalog object
 // (no schema step required -- see header comment). dimension must be in
+#define VECSTORE_RC_NOT_DURABLE 7
+
+/* Pages whose write to NVMe failed since boot; see VECSTORE_RC_NOT_DURABLE. */
+uint64_t vecstore_undurable_writes(void);
+
 // [1, VECSTORE_MAX_DIMENSION]. Returns 0 on success; 1 if the object
 // doesn't exist, already has a vector collection, or dimension is out of
 // range; 2 if catalog_check_access() denies caller_uid PERM_WRITE on the
@@ -246,6 +251,11 @@ int vecstore_create_collection(uint32_t caller_uid, const char* collection_name,
 //   3 = entry not found (bad/stale VecId, or already deleted)
 //   4 = values->count doesn't match the collection's dimension
 //   5 = page pool exhausted (insert only)
+//   7 = VECSTORE_RC_NOT_DURABLE -- the vector is live and queryable, but the
+//       page holding it did NOT reach the disk and will not survive a reboot.
+//       NOT an error: a caller that treats it as one and retries inserts the
+//       vector twice. Identical in shape and reasoning to
+//       ROWSTORE_RC_NOT_DURABLE; see rowstore.h for the full argument.
 //   6 = duplicate external_id rejected (insert only -- see VectorStore Gap
 //       Analysis §1.3 below; only possible if the collection has opted in
 //       via vecstore_set_unique_external_id())

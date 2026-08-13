@@ -155,10 +155,29 @@ static uint8_t* vecstore_load_page(uint32_t page_id) {
 // Gap fix: same (io_sq && io_cq) guard as vecstore_load_page() above -- see
 // that function's comment for the full story. No-op (RAM-only, this boot)
 // rather than a doomed write when the NVMe I/O queue never came up.
-static void vecstore_flush_page(uint32_t page_id) {
-    if (page_id >= VECSTORE_MAX_PAGES || !vec_pages[page_id]) return;
-    if (!(io_sq && io_cq)) return;
-    nvme_write_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8, vec_pages[page_id]);
+/* Returns 0 when the page reached the disk, non-zero when it did not.
+ *
+ * The (io_sq && io_cq) guard above is a DIFFERENT condition and still returns
+ * 0: a node whose I/O queue never came up is the documented "RAM-only this
+ * boot" degradation, not a write that failed. Conflating the two would make
+ * every insert on such a node report a durability failure it already knows
+ * about. */
+static uint64_t vecstore_undurable;
+
+uint64_t vecstore_undurable_writes(void) { return vecstore_undurable; }
+
+static int vecstore_flush_page(uint32_t page_id) {
+    if (page_id >= VECSTORE_MAX_PAGES || !vec_pages[page_id]) return 0;
+    if (!(io_sq && io_cq)) return 0;
+    if (nvme_write_sync(VECSTORE_LBA_BASE + (uint64_t)page_id * 8,
+                        vec_pages[page_id]) != 0) {
+        vecstore_undurable++;
+        kernel_serial_printf("[VECSTORE] page %u did NOT reach the disk -- the "
+                             "vector(s) on it are in RAM only and will not "
+                             "survive a reboot.\n", page_id);
+        return 1;
+    }
+    return 0;
 }
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -270,6 +289,7 @@ int vecstore_set_unique_external_id(uint32_t caller_uid, const char* collection_
 int vecstore_insert(uint32_t caller_uid, const char* collection_name,
                     uint64_t external_id, const struct VecValues* values,
                     struct VecId* out_id) {
+    int undurable = 0;   /* set by any flush that did not reach the disk */
     if (!collection_name || !values) return 3;
     int idx = find_active_collection(collection_name);
     if (idx < 0) return 1;
@@ -291,7 +311,7 @@ int vecstore_insert(uint32_t caller_uid, const char* collection_name,
             h->first_page_id = new_page;
         } else {
             uint8_t* prev = vecstore_load_page(h->last_page_id);
-            if (prev) { vs_memcpy(prev, &new_page, 4); vecstore_flush_page(h->last_page_id); }
+            if (prev) { vs_memcpy(prev, &new_page, 4); undurable |= vecstore_flush_page(h->last_page_id); }
         }
         h->last_page_id = new_page;
         h->entries_in_last_page = 0;
@@ -303,7 +323,7 @@ int vecstore_insert(uint32_t caller_uid, const char* collection_name,
     uint32_t slot_idx = h->entries_in_last_page;
     uint8_t* slot = page + 4 + slot_idx * h->entry_width;
     vs_write_entry(slot, external_id, values, h->dimension);
-    vecstore_flush_page(h->last_page_id);   // Gap Remediation Phase D
+    undurable |= vecstore_flush_page(h->last_page_id);   // Gap Remediation Phase D
 
     h->entries_in_last_page++;
     h->entry_count++;
@@ -319,7 +339,9 @@ int vecstore_insert(uint32_t caller_uid, const char* collection_name,
     // rowstore.c). Not separately access-gated -- catalog_check_access()
     // already ran above.
     vec_index_notify_insert(caller_uid, collection_name, new_id, external_id, values);
-    return 0;
+    /* The operation succeeded; only its durability is in question. See
+     * VECSTORE_RC_NOT_DURABLE in vecstore.h. */
+    return undurable ? VECSTORE_RC_NOT_DURABLE : 0;
 }
 
 int vecstore_get(uint32_t caller_uid, const char* collection_name,
@@ -345,6 +367,7 @@ int vecstore_get(uint32_t caller_uid, const char* collection_name,
 }
 
 int vecstore_delete(uint32_t caller_uid, const char* collection_name, struct VecId id) {
+    int undurable = 0;   /* set by any flush that did not reach the disk */
     int idx = find_active_collection(collection_name);
     if (idx < 0) return 1;
     struct VecCollectionHeader* h = &vector_collections[idx];
@@ -358,14 +381,16 @@ int vecstore_delete(uint32_t caller_uid, const char* collection_name, struct Vec
     if (!slot[0]) return 3;   // already deleted / never written
 
     slot[0] = 0;   // tombstone -- slot is NOT reclaimed for reuse in this first cut
-    vecstore_flush_page(id.page_id);   // Gap Remediation Phase D
+    undurable |= vecstore_flush_page(id.page_id);   // Gap Remediation Phase D
     h->entry_count--;
     persist_vecstore_headers();        // Gap Remediation Phase D
 
     // Phase 6: auto-maintenance -- see the identical comment in
     // vecstore_insert() above.
     vec_index_notify_delete(collection_name, id);
-    return 0;
+    /* The operation succeeded; only its durability is in question. See
+     * VECSTORE_RC_NOT_DURABLE in vecstore.h. */
+    return undurable ? VECSTORE_RC_NOT_DURABLE : 0;
 }
 
 // ─── Scan ────────────────────────────────────────────────────────────────────

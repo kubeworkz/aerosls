@@ -127,23 +127,42 @@ static uint8_t __attribute__((aligned(4096)))
 // multi-page batches; only a trailing partial frame still needs the
 // zero-padded single-page path (the on-disk image must have that tail
 // zero-filled rather than carrying whatever followed the array in memory).
-static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t lba) {
+/* Pages this kernel believed it wrote and did not. See persist.h. */
+static uint64_t p_undurable;
+uint64_t persist_undurable_writes(void) { return p_undurable; }
+
+/* Returns 0 when every frame of the region reached the disk, non-zero when at
+ * least one did not.
+ *
+ * It returned void, and every nvme_*_sync() status inside it was discarded.
+ * That is survivable on its own -- the next write of the region rewrites
+ * everything anyway. It stops being survivable the moment the SHADOW is
+ * updated as though the write happened, which is what
+ * persist_write_array_diffed() did below. */
+static int persist_write_array(const void* src, uint32_t total_bytes, uint64_t lba) {
     // Fold before the availability check so the checksum reflects the region's
     // logical content regardless of whether NVMe is up, keeping multi-array
     // regions consistent.
     if (p_region_open) p_region_csum = p_csum_fold(p_region_csum, src, total_bytes);
-    if (!persist_nvme_available()) return;
+    /* 0, not a failure. A node with no I/O queue is a documented, tolerated
+     * state -- the same "RAM-only this boot" degradation vecstore.c and
+     * stream.c describe -- and every caller is gated by
+     * persist_nvme_available() anyway. Counting it as an undurable write would
+     * make p_undurable mean two different things, and a counter that means two
+     * things gets ignored. */
+    if (!persist_nvme_available()) return 0;
     const uint8_t* p = (const uint8_t*)src;
 
     uint32_t full_pages = total_bytes / NVME_PAGE_SIZE;
     uint32_t tail_bytes = total_bytes % NVME_PAGE_SIZE;
+    int failed = 0;
 
     while (full_pages > 0) {
         uint32_t batch = full_pages < NVME_MAX_PAGES_PER_XFER
                        ? full_pages : NVME_MAX_PAGES_PER_XFER;
         uint32_t bytes = batch * NVME_PAGE_SIZE;
         p_memcpy(p_batch, p, bytes);
-        nvme_write_pages_sync(lba, p_batch, batch);
+        failed |= (nvme_write_pages_sync(lba, p_batch, batch) != 0);
         p          += bytes;
         lba        += (uint64_t)batch * NVME_SECTORS_PER_PAGE;
         full_pages -= batch;
@@ -152,8 +171,10 @@ static void persist_write_array(const void* src, uint32_t total_bytes, uint64_t 
     if (tail_bytes > 0) {
         p_memset(p_buf, 0, NVME_PAGE_SIZE);
         p_memcpy(p_buf, p, tail_bytes);
-        nvme_write_sync(lba, p_buf);
+        failed |= (nvme_write_sync(lba, p_buf) != 0);
     }
+    if (failed) { p_undurable++; }
+    return failed;
 }
 
 // ─── Shadow-compare writes (write only the frames that actually changed) ─────
@@ -272,10 +293,21 @@ static void persist_write_array_diffed(const void* src, uint32_t total_bytes, ui
     if (!*shadow_valid) {
         int reopen = p_region_open;
         p_region_open = 0;              /* already folded above -- don't double-count */
-        persist_write_array(src, total_bytes, lba);
+        int rc = persist_write_array(src, total_bytes, lba);
         p_region_open = reopen;
-        p_memcpy(shadow, src, total_bytes);
-        *shadow_valid = 1;
+        /* Same rule as below: a shadow is only valid if the write it claims to
+         * mirror actually happened. Marking it valid here after a failed full
+         * write would make the NEXT call skip clean-looking frames that are not
+         * on the disk at all. */
+        if (rc == 0) {
+            p_memcpy(shadow, src, total_bytes);
+            *shadow_valid = 1;
+        } else {
+            kernel_serial_printf(
+                "[PERSIST] the full write of the region at LBA %lu FAILED; the "
+                "shadow stays invalid so the next write retries all of it.\n",
+                (unsigned long)lba);
+        }
         p_last_frames_written = (total_bytes + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
         return;
     }
@@ -283,6 +315,7 @@ static void persist_write_array_diffed(const void* src, uint32_t total_bytes, ui
     const uint8_t* p = (const uint8_t*)src;
     uint32_t full_pages = total_bytes / NVME_PAGE_SIZE;
     uint32_t tail_bytes = total_bytes % NVME_PAGE_SIZE;
+    int failed = 0;
     uint32_t written    = 0;
 
     uint32_t run_start = 0;   // first page index of the current dirty run
@@ -306,8 +339,8 @@ static void persist_write_array_diffed(const void* src, uint32_t total_bytes, ui
         // Flush the accumulated run.
         uint32_t bytes = run_len * NVME_PAGE_SIZE;
         p_memcpy(p_batch, p + run_start * NVME_PAGE_SIZE, bytes);
-        nvme_write_pages_sync(lba + (uint64_t)run_start * NVME_SECTORS_PER_PAGE,
-                              p_batch, run_len);
+        failed |= (nvme_write_pages_sync(lba + (uint64_t)run_start * NVME_SECTORS_PER_PAGE,
+                                         p_batch, run_len) != 0);
         written += run_len;
         run_len  = 0;
     }
@@ -321,13 +354,39 @@ static void persist_write_array_diffed(const void* src, uint32_t total_bytes, ui
         if (p_memcmp(p + off, shadow + off, tail_bytes) != 0) {
             p_memset(p_buf, 0, NVME_PAGE_SIZE);
             p_memcpy(p_buf, p + off, tail_bytes);
-            nvme_write_sync(lba + (uint64_t)full_pages * NVME_SECTORS_PER_PAGE, p_buf);
+            failed |= (nvme_write_sync(lba + (uint64_t)full_pages * NVME_SECTORS_PER_PAGE,
+                                       p_buf) != 0);
             written++;
         }
     }
 
-    // Shadow now mirrors the on-disk image.
-    p_memcpy(shadow, src, total_bytes);
+    /* ─── The shadow may only claim what actually landed ───────────────────
+     * This used to mirror unconditionally, and that turned a TRANSIENT write
+     * failure into PERMANENT loss. The next call compares memory against a
+     * shadow that says the bytes are already on disk, finds no difference,
+     * skips the frame -- and skips it forever. Nothing retries, nothing logs,
+     * and the data is gone at the next reboot.
+     *
+     * persist.h says deriving dirtiness from the bytes makes that failure
+     * "impossible". It makes it impossible for a MISSED MARK. It did nothing
+     * about a failed write, because the shadow was updated as though the write
+     * had happened.
+     *
+     * The repair is the one this function already uses when verify mode finds
+     * divergence: invalidate, and let the next write rewrite the region in
+     * full. That path is tested and understood, so a write failure now joins
+     * it rather than inventing a second recovery mechanism. */
+    if (failed) {
+        p_undurable++;
+        kernel_serial_printf(
+            "[PERSIST] a write to the region at LBA %lu FAILED. The shadow is "
+            "invalidated so the next write rewrites it in full; until then this "
+            "region's newest bytes are in RAM only.\n", (unsigned long)lba);
+        *shadow_valid = 0;
+    } else {
+        // Shadow now mirrors the on-disk image.
+        p_memcpy(shadow, src, total_bytes);
+    }
     p_last_frames_written = written;
 
     if (p_verify_mode) {
@@ -431,7 +490,7 @@ static void persist_region_commit(void) {
 
     // Barrier 1: every data frame of this region reaches media before the
     // header that vouches for it is even submitted.
-    nvme_flush_sync();
+    int barrier_failed = (nvme_flush_sync() != 0);
 
     uint64_t csum = p_region_csum;
     if (csum == 0) csum = 1;   /* 0 is the "no checksum recorded" sentinel */
@@ -442,11 +501,34 @@ static void persist_region_commit(void) {
     p_memcpy(p_buf + 12, &p_region_v1, 4);
     p_memcpy(p_buf + 16, &p_region_v2, 4);
     p_memcpy(p_buf + P_HDR_CSUM_OFF, &csum, 8);
-    nvme_write_sync(p_region_hdr_lba, p_buf);
+    barrier_failed |= (nvme_write_sync(p_region_hdr_lba, p_buf) != 0);
 
     // Barrier 2: the region is genuinely durable when this returns, rather
     // than merely acknowledged by a volatile controller cache.
-    nvme_flush_sync();
+    barrier_failed |= (nvme_flush_sync() != 0);
+
+    /* ─── The comment above is a claim, so it has to be checked ────────────
+     * "genuinely durable when this returns" was asserted while all three of
+     * these calls discarded their status. If the header write fails, the data
+     * frames are on the disk and the header that vouches for them is not, so
+     * the restore-side checksum scan refuses the whole region on the next boot
+     * -- correctly, and silently, and looking exactly like corruption.
+     *
+     * Failing the flushes is worse: the controller acknowledged the writes
+     * from a volatile cache and nothing forced them out, which is precisely
+     * the state the barriers exist to prevent and precisely what their names
+     * promise they have prevented.
+     *
+     * Nothing here can repair it. What it can do is stop the promise being
+     * silent when it is not kept. */
+    if (barrier_failed) {
+        p_undurable++;
+        kernel_serial_printf(
+            "[PERSIST] the commit barrier for the region at LBA %lu FAILED. Its "
+            "header or flush did not complete, so this region is NOT durable and "
+            "may be refused on the next boot.\n",
+            (unsigned long)p_region_hdr_lba);
+    }
 }
 
 
