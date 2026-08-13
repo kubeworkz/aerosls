@@ -1492,3 +1492,79 @@ test suite" applies here unchanged: this section is a test suite.
 **Anything about the key's protection.** The CA key is in plaintext on the disk
 this reboot read it from. That is the design and §6.1 states it; a green result
 here is not a security property, it is a durability one.
+
+---
+
+## §6.1's last gap closed by looking, 2026-08-13
+
+The previous section said: *"the structural argument says it cannot be there;
+nobody has looked."* Someone has now looked.
+
+```
+POST /api/checkpoint          -> {"status":0,"seq":1,"count":1}
+tests/tls_key_disk_containment_smoke.sh --self-test     passed=2 failed=0
+tests/tls_key_disk_containment_smoke.sh --image cluster/node1.img
+
+      store v1 at LBA 7680: CA 451 bytes, key 121 bytes
+      private scalar at byte offset 3932650
+      scanned 10737418240 bytes (10.0 GiB)
+ok:   the private scalar appears exactly once, in the TLS frame
+```
+
+### Why this is the strong form of the test, and it was luck
+
+`count: 1` means that was the node's FIRST checkpoint. `checkpoint_trigger()`
+computes `is_full = ckpt_should_force_full() || ckpt_count == 0` and then calls
+`ckpt_mark_all_dirty()`, so a first checkpoint is unconditionally a **full**
+one: every region `checkpoint_mgr` knows about was written to that disk, not a
+delta of whatever happened to be dirty.
+
+So the scan did not merely fail to find the key in a few incremental frames. It
+searched 10 GiB after every checkpointed region had been written out, and found
+the CA private scalar exactly once, at the offset `tls_store.c` put it.
+
+### What was searched, and why it is the scalar
+
+Not the stored DER. A DER search only catches a byte-for-byte copy of
+`tls_store.c`'s frame, and nothing that would leak the key copies that frame --
+a checkpoint or a migration stream re-encodes, and PKCS#8 or a raw scalar dump
+would slip past a DER search while containing the identical secret. The 32-byte
+private scalar is the same in every encoding, so one occurrence on the disk
+means one copy.
+
+The real key parsed at 121 bytes (SEC1 P-256 `ECPrivateKey`), against the
+synthetic 51-byte fixture the self-test uses -- worth noting only because it
+confirms the parser was reading a genuine key and not pattern-matching the
+fixture it was written against.
+
+### The caveats, which are real
+
+- **The cluster was running during the scan.** The stop step was skipped, so
+  the image was being written underneath a sequential read. A copy present for
+  the whole scan would still have been found, and the checkpoint had already
+  completed, so this is unlikely to have hidden anything -- but "unlikely to
+  have hidden anything" is the honest phrasing and "clean" is not.
+- **One node, one checkpoint.** `stream_*` and the migration path have not run
+  on this disk. Those are the other two writers §6.1 named, and neither has
+  been exercised. The structural guard covers them by argument; this one does
+  not cover them at all.
+- **This says nothing about protection.** The key was found, in plaintext, by a
+  script with read access to the image. That is exactly the deal §6.1 struck.
+  What has been shown is that there is ONE copy, not that the copy is safe.
+
+### The guard's own teeth
+
+`--self-test` plants a re-encoded copy of the scalar 1 MiB past the frame and
+requires the scan to find it, and both modes were verified against synthetic
+images before the real one was touched: clean exits 0, leaked exits 1 and names
+the offending LBA.
+
+That is not ceremony. The first version of the script counted its results
+inside a **pipeline**, so `pass`/`fail` incremented in a subshell and came back
+zero -- on every path, including the real one. It would have exited 0 on a disk
+with the key copied all over it. The self-test's own tally is what exposed it:
+two `ok:` lines, reported as one.
+
+Third guard in this project shipped toothless and caught. The pattern is now
+consistent enough to state as a rule: **a guard that has never been shown to
+fail is not evidence, it is decoration.**
