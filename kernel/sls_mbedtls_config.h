@@ -65,6 +65,15 @@
  * only skips the header. Without it the TLS files cannot compile in the
  * kernel build. */
 #define MBEDTLS_PLATFORM_MS_TIME_TYPE_MACRO long long
+/* debug.h includes <inttypes.h> for PRId64 unless MBEDTLS_PRINTF_MS_TIME is
+ * defined — and PRId64 would be WRONG here even if inttypes.h existed:
+ * mbedtls_ms_time_t is forced to long long above, while LP64's PRId64 is
+ * "ld". Upstream's own fallback (MBEDTLS_PRINTF_LONGLONG, "lld") is the
+ * correct value, so naming it skips the hosted header — the same move
+ * MS_TIME_TYPE_MACRO makes for platform_time.h. Only debug.c would print
+ * mbedtls_ms_time_t, and MBEDTLS_DEBUG_C is off; the define exists so the
+ * include is skipped in every file that pulls debug.h. */
+#define MBEDTLS_PRINTF_MS_TIME "lld"
 
 /* Declared here because mbedtls_time expands to it inside library sources
  * that include no header of ours. */

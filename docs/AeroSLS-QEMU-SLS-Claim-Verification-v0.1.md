@@ -207,9 +207,9 @@ recorded run.
 
 | Claim | Source | Status |
 |---|---|---|
-| 86 bytes of host code per guest load (softmmu ON) | Cross-ISA §5b | Runtime. 9 samples, zero variance reported. |
+| 86 bytes of host code per guest load (softmmu ON) | Cross-ISA §5b | Runtime. 9 samples, zero variance reported. **RE-MEASURED 2026-08-13 on `c85ea56`: 90 bytes/load (45,041 bytes) — see §3e.** |
 | 16 bytes per guest load (softmmu OFF) | Cross-ISA §5c | **RE-VERIFIED 2026-08-05** on `88003e7`: `CODE 8003 bytes → 16 bytes/load`, exact match. **Re-confirmed 2026-08-13 on `a031cb6` — see §3e** (`CODE 8105 bytes`, still **16 bytes/load**). |
-| CODE 43,293 → 8,003 bytes, **5.41×** | Cross-ISA §5c | **FULLY RE-VERIFIED 2026-08-05** at `bebbc6e421df`. Both sides re-run from one flag apart: 43,293 and 8,003, ratio 5.4096×, all four figures bit-identical to 2026-08-04. See §3d. **2026-08-13 on `a031cb6`: OFF side re-measured at 8,105 bytes (moved); ON side not re-runnable on the local bare-metal toolchain — ratio unre-measured, see §3e.** |
+| CODE 43,293 → 8,003 bytes, **5.41×** | Cross-ISA §5c | **FULLY RE-VERIFIED 2026-08-05** at `bebbc6e421df`. Both sides re-run from one flag apart: 43,293 and 8,003, ratio 5.4096×, all four figures bit-identical to 2026-08-04. See §3d. **RE-MEASURED 2026-08-13 on `c85ea56`: 45,041 → 8,105 = 5.56× (90 vs 16 bytes/load) — see §3e.** |
 | EXEC ratio 7.56×, excess **~1.4×** real work | Cross-ISA §5c | **DID NOT REPRODUCE.** 2026-08-05 A/B gave exec_ratio 6.12× and excess **1.13×**, below §5c's own 1.30–1.50 range. n=1 per side against §5c's n=5, so not a refutation — but unreproduced, and not quotable until re-run at n=5. See §3d. |
 | Node 2 silent halt in `map_guest_ram` | Cross-ISA §6 | **No longer reproduces (2026-08-05), not diagnosed.** `guest RAM mapped: 256 MiB` now prints. §8's gate required a root cause and was not met; see §6. |
 | Arena leak, 10,353,840 bytes/launch | Phase2 App. | **Superseded.** 1,507,392 cold, **0** warm, 7 free/7 reuse. Leak fixed; see Phase2 appendix. |
@@ -639,37 +639,42 @@ to guarantee.
 
 ---
 
-## 3e. Re-run on current HEAD — 2026-08-13 (`a031cb6`)
+## 3e. Re-run on current HEAD — 2026-08-13 (`c85ea56`)
 
 The rows above were measured at `bebbc6e421df`/`88003e7` (2026-08-04/05); the
 tree has moved a week and the decoder frontend since. Per the note under the
-§3 table, re-run before quoting. Node 2 (3002) for the first two rows, node 1
-for the reboot trial; 512 MiB/node, TCG, no KVM. Build ID `a031cb6d92c6`.
+§3 table, re-run before quoting. Both sides built from identical sources one
+flag apart (`SLS_SOFTMMU=on|off`), first launch after boot, cold; 512
+MiB/node, TCG, no KVM. Build ID `c85ea5683337`.
 
-| Claim | 2026-08-04/05 | **2026-08-13 (`a031cb6`)** | Verdict |
+| Claim | 2026-08-04/05 | **2026-08-13 (`c85ea56`)** | Verdict |
 |---|---|---|---|
 | `CODE`, softmmu OFF | 8,003 bytes | **8,105 bytes** | moved +1.3%; still **16 bytes/load** |
-| bytes per guest load, OFF | 16 | **16** | unchanged |
-| instructions executed | 502 | **502** | bit-identical |
+| `CODE`, softmmu ON | 43,293 bytes | **45,041 bytes** | moved +4.0%; now **90 bytes/load** |
+| **ratio, `CODE`** | **5.41×** | **5.56×** (45,041 / 8,105) | re-measured; moved UP |
+| **ratio, bytes/load** | 5.38× | **5.63×** (90 / 16) | re-measured |
+| instructions executed | 502 | **502** (both sides) | bit-identical |
 | arena, cold launch | 1,507,392 B | **1,507,392 B** | bit-identical |
 | TCACHE cold → warm | 0/8 → 8/0 | **0/8 → 8/0** | identical regimes |
 | cache survives reboot | warm start; first bench 8/0, `TRANSLATE` 0, `CODE` 0 | **warm start `codebuf_used=8174` (= checkpoint's `synced: 8174`); first bench 8 hit / 0 miss, `TRANSLATE` 0, `CODE` 0, `ALLOC` 4 calls / 842 B** | re-verified end to end |
 | cold EXEC | 5,939 / 5,434 cyc/load | 4,810 | inside §5b's cross-boot band; not a result |
 | warm EXEC | 251 / 455 | 372 | inside the documented noisy band; still no quotable value |
 
-**The softmmu ON side could not be re-run on this build host.** The A/B's ON
-side forces a full rebuild (AB_STAMP), which recompiles mbedTLS — and this
-host's cross toolchain (`$HOME/opt/cross`, bare-metal `x86_64-elf-gcc`
-13.2.0) carries **no libc headers**, so mbedTLS `alignment.h`'s
-`#include <string.h>` fails. The vendored freestanding shim
-(`vendor/mbedtls/shim/`) supplies only `time.h`. The deploy host's toolchain
-(`/usr/local/bin/x86_64-elf-gcc`) has headers and builds both sides, so the
-A/B is still reproducible there — but on current HEAD the ON figure (and the
-5.41× ratio) is **unre-measured**, and since the OFF side alone has moved
-(8,003 → 8,105) the ratio must not be quoted as current until the ON side is
-re-run on a toolchain with libc headers. Because the mbedTLS objects are
-stamp-guarded, a bare-metal toolchain can rebuild everything else; only a flag
-change or `make clean` forces the mbedTLS recompile.
+**Why the ON side could not run on a bare-metal toolchain until now — and
+what fixed it.** The ON side forces a full rebuild (AB_STAMP), which
+recompiles mbedTLS, and this host's cross toolchain (`$HOME/opt/cross`,
+bare-metal `x86_64-elf-gcc` 13.2.0) ships **no libc headers** — mbedTLS
+`alignment.h`'s `#include <string.h>` failed the first attempt. The
+freestanding shim dir (`vendor/mbedtls/shim/`) previously supplied only
+`time.h`; it now also supplies `string.h`, `stdlib.h`, `assert.h` and
+`stdio.h`, each declaring only the measured set of symbols the 107 compiled
+library files reference — so a future mbedTLS bump that needs more fails at
+compile/link time rather than silently. The config additionally defines
+`MBEDTLS_PRINTF_MS_TIME "lld"` so debug.h skips `<inttypes.h>` (whose PRId64
+would be wrong for the forced-`long long` `mbedtls_ms_time_t` anyway). Both
+sides now build on the freestanding toolchain; the deploy host's
+libc-equipped toolchain is unaffected — the shims shadow its headers with the
+same declarations, exactly as shim/time.h already did.
 
 ---
 
