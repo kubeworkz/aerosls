@@ -481,6 +481,27 @@ the C expectation, every prior check intact (movsb, stos, cmps, popf,
 sahf/lahf, cli/sti, clts, DF-set backward copy, 62 tcache hits), and
 `invl`/`paging`/`selfmod` still pass with the bench running.
 
+**Iteration 9 (2026-08-12): the debug-register move — helper_get_dr /
+helper_set_dr (bpt_helper.c), the first system-helper round since
+clts.** MOV r64, DRn reads through gen_load -> gen_helper_get_dr and
+MOV DRn, r64 writes through gen_store -> gen_helper_set_dr
+(emit.c.inc) — both halting stubs until now. bpt_helper.c's bodies
+have three parts this build deliberately trims: the DR7.GD #DB path,
+the hw_breakpoint_insert/remove dance for DR0-3 (bpt_helper.c is not
+part of the link), and the DR6/7 reserved-mask #GP — none of which
+have guest-exception delivery or a link surface here, so they would
+halt anyway. What IS kept is the DR4/5 aliasing, verbatim: with
+CR4.DE clear (the boot state — CR4 = PAE only) DR4 accesses address
+DR6 and DR5 address DR7; with DE set the access is a #UD, which halts
+naming the fault. The guest does a DR0 write->read round-trip and a
+DR4->DR6 aliasing round-trip. 543 instructions to HLT, `dr=0x101`
+bit-for-bit the C expectation, every prior check intact, and
+`invl`/`paging`/`selfmod` still pass with the bench running. (One
+fixture-editing slip on the way, same shape as iteration 6's: the enum
+replacement dropped the closing RESULT64/RESULT32 lines and the
+launcher object failed to compile — caught by the build, fixed in
+seconds.)
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
