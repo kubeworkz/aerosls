@@ -306,6 +306,7 @@ static void rv_task_init(struct RvTask* t, void (*fn)(void), uint64_t owner,
     t->slices = 0;
     t->done = 0;
     t->preemptions = 0;
+    t->in_work = 0;
     t->work_done = 0;
     t->lcg_acc = 0;
     register uint64_t gp_v __asm__("gp");
@@ -408,7 +409,14 @@ void rv_scheduler_tick(void) {
     /* 1. The interrupted task's context: trap_frame[TF_RA..TF_SEPC] is
      * slots 0..31 (TF_RA is 0), mirroring ctx[i] 1:1. */
     for (int i = 0; i < 32; i++) cur->ctx[i] = phd->trap_frame[i];
-    if (!cur->done) cur->preemptions++;
+    /* The in_work gate: only a preemption taken while the task is in its
+     * boundary spin counts toward its slice grant. A tick that lands
+     * mid-work (the fadd/print/LCG phase) rotates the task -- the eager
+     * FP save/load below is always correct -- but does not increment
+     * preemptions, so a work phase that overruns the tick window on a
+     * slow host cannot inflate the count. Exactly one counted preemption
+     * per slice boundary, by construction, on any host. */
+    if (!cur->done && !cur->in_work) cur->preemptions++;
     /* 2. Its FP state into its owner row (FS=Dirty first: an fsd with
      * FS=Off would itself trap). fp_current == cur->fp_owner: the last
      * rotation loaded THIS task's row and folded the registry, and the
@@ -423,11 +431,22 @@ void rv_scheduler_tick(void) {
     phd->fp_owner = next->fp_owner;
     phd->fp_current = next->fp_owner;
     g_rv_current = next;
-    /* 4. Disarm FS: the incoming task's first FP instruction lazy-saves
-     * — one trap per slice, the count the demo and CI pin. The eager
-     * load + disarm makes that trap a 0->0 no-op round-trip through its
-     * own row, exactly like the cooperative path. */
-    __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
+    /* 4. Disarm FS only for a SPIN-entry (the incoming task was
+     * preempted in its boundary spin, in_work == 0): its next slice
+     * fadd must trap, the one lazy-save per slice the demo and CI pin.
+     * A MID-WORK entry (in_work == 1) must NOT be disarmed: its
+     * slice-start fadd may be mid-re-execution after its lazy-save trap
+     * (the handler re-executes with sepc unchanged; a tick in that
+     * window saves sepc = the fadd, and disarming FS would re-trap it
+     * on resume, inflating the lazy-save count past 15 while the fadd
+     * itself still executes exactly once). FS=Dirty is correct there:
+     * the eager fp_load_all above already materialized the row, and the
+     * task's next slice fadd is still preceded by a spin-entry's
+     * disarm. The eager load + disarm keeps the spin-entry trap a 0->0
+     * no-op round-trip through its own row, exactly like the
+     * cooperative path. */
+    if (!next->in_work)
+        __asm__ volatile("csrc sstatus, %0" : : "r"(3ULL << 13) : "memory");
     /* Record the rotation for the driver's batched preempt log — no
      * inline print: at the demo's 2ms cadence a UART print here would
      * steal ~0.15ms from the incoming task's slice. The first rotation
@@ -529,10 +548,19 @@ static void rv_fp_task_common(void) {
          * re-execute it on resume and burn the grant that just woke us,
          * drifting the per-task preemptions accounting (the
          * spurious-wake lesson of part 3's 11th lazy-save, in spin
-         * form). The task spends ~2ms in this spin per slice vs.
-         * microseconds on the work below, so the tick lands here —
-         * exactly one preemption per slice. */
+         * form). The in_work gate makes the accounting exact even when a
+         * slice's work overruns the tick window: the tick handler counts a
+         * rotation only while the task is in this spin, so a slow host (or
+         * a long UART line) can never inflate the count — the grant that
+         * exits this spin is always the (s+1)th counted preemption, and
+         * work-phase ticks are rotation-only. */
         while (me->preemptions < (uint64_t)(s + 1)) { }
+        /* Leave the spin: the grant is banked. From here through the end
+         * of the slice's work we are in_work -- the tick handler rotates
+         * us (its eager FP save/load keeps the register file honest) but
+         * does not count the rotation, so the 15/15 accounting cannot be
+         * drifted by a slice that overruns the 2ms tick window. */
+        me->in_work = 1;
         uint64_t got;
         __asm__ volatile(
             "fmv.d.x ft0, %1\n\t"
@@ -566,6 +594,7 @@ static void rv_fp_task_common(void) {
             acc = acc * 1664525u + 1013904223u;
         me->lcg_acc = acc;
         me->work_done += sp->work;
+        me->in_work = 0;   /* back to the boundary spin for the next slice */
     }
     /* All slices done: mark finished. The handoff discipline matters
      * here: a task that was PREEMPTIVELY suspended holds its resume
@@ -644,8 +673,11 @@ static void rv_fp_round_robin_demo(void) {
      * tick), and the lazy-save line was shortened. The per-slice LCG
      * work budget was calibrated so work + prints fits inside one 2ms
      * period on this host (verified under WSL2, the slowest QEMU
-     * environment; native-Linux CI is faster), so the tick keeps
-     * landing in the tasks' spins. The first boundary may still be up
+     * environment; native-Linux CI is faster). Hosts where a slice
+     * overruns the window are handled by the in_work gate: the tick
+     * still rotates mid-work, but only spin-phase preemptions count,
+     * so the 15/15 accounting stays exact and the demo's wall time is
+     * simply stretched. The first boundary may still be up
      * to the production 1s cadence away (the pending arm pre-dates the
      * override), which only stretches the demo's wall time, never the
      * accounting. */
@@ -701,16 +733,28 @@ static void rv_fp_round_robin_demo(void) {
     int acc_ok = (g_rv_tasks[0].lcg_acc == 0xf2dc5340ULL) &&
                  (g_rv_tasks[1].lcg_acc == 0xf2dc5340ULL) &&
                  (g_rv_tasks[2].lcg_acc == 0xf2dc5340ULL);
-    /* The wall-clock cadence teeth: elapsed mtime from the FIRST
-     * preemption to the queue emptying. 16 intervals between the 17
-     * rotations at RV_DEMO_TICK_TICKS = 320,000, plus the last task's
-     * tail work (well under the margins on any host that passes the
-     * 15/15 accounting): the assert proves the measured cadence is the
-     * 2ms the demo set — not faster (lower bound) and not slower
-     * (upper bound: 16 intervals at 4ms would be 640,000 >= 500,000). */
+    /* The wall-clock cadence teeth, re-aimed for the in_work gate:
+     * elapsed mtime from the FIRST preemption to the queue emptying.
+     * The lower bound (>= RV_TASK_SLICES ticks) proves the cadence was
+     * never faster than 2ms — 15 slice boundaries cannot pass in less
+     * wall time at the set period. The upper bound must be RELATIVE to
+     * the actual rotation count, not a flat constant: work-phase ticks
+     * are now uncounted, so on a slow host the demo's wall time can
+     * stretch arbitrarily (rotations pile up in overruns, the average
+     * interval stays ~2ms) and any flat bound wide enough to absorb
+     * that would also admit a real 4ms cadence. Assert the average
+     * interval instead, below 1.5 ticks: rotations happen only at
+     * ticks, so every interval is exactly the set period and the only
+     * excess is the last task's tail work — a 2ms cadence averages
+     * ~1.1 ticks at most, while a genuine 4ms cadence averages exactly
+     * 2.0 ticks. (Caveat: the preempt log caps at 32 rotations, so an
+     * EXTREME stretch could undercount intervals and false-fail the
+     * bound; observed maxima on WSL2 are ~30 rotations, and native-Linux
+     * CI is faster — the cap does not bind in practice.) */
     uint64_t elapsed = rv_rdtime() - g_rv_t0;
+    uint64_t intervals = g_rv_preempt_n > 1 ? g_rv_preempt_n - 1 : 1;
     int mtime_ok = (elapsed >= RV_TASK_SLICES * RV_DEMO_TICK_TICKS) &&
-                   (elapsed < 25 * RV_DEMO_TICK_TICKS);
+                   (elapsed * 2 < 3 * intervals * RV_DEMO_TICK_TICKS);
     rv_boot_print("[TASK] fp_save rows: A=");
     rv_boot_print_hex64(phd->fp_save[0][10]);
     rv_boot_print(" B=");

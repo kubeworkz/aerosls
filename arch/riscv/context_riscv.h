@@ -51,7 +51,23 @@ struct RvTask {
     volatile uint64_t done;        /* 1 = finished — the scheduler skips it */
     volatile uint64_t preemptions; /* how many times the tick-handler
                                       scheduler has preempted this task
-                                      (only runnable-task preemptions count) */
+                                      (only runnable-task preemptions
+                                      count, and only while the task is
+                                      in its boundary spin, not mid-work --
+                                      see the in_work gate below) */
+    volatile uint64_t in_work;    /* 1 while the task runs its per-slice
+                                      work (the fadd + prints + LCG, i.e.
+                                      everything between the boundary
+                                      spin's grant and the next spin).
+                                      Written by the task, read by the
+                                      tick handler: a tick that lands
+                                      mid-work still rotates the task, but
+                                      does NOT increment preemptions -- so
+                                      a slice that overruns the tick
+                                      window on a slow host can never
+                                      inflate the 15/15 accounting. The
+                                      count stays exactly one per slice
+                                      boundary by construction. */
     volatile uint64_t work_done;   /* total integer-work iterations this
                                       task executed across all slices
                                       (the fairness probe: all tasks run
