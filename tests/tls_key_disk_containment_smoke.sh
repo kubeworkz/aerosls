@@ -26,20 +26,40 @@
 # occurrence on a 10 GiB disk means the key is where it is supposed to be and
 # nowhere else. Two means something copied it, and the second offset says what.
 #
-# ─── smoke, not check ──────────────────────────────────────────────────────
-# It needs a disk image from a node that has actually run. deploy.sh's gate has
-# no such thing, and a guard that skips in the gate protects nothing. Run it
-# after a cluster has been up.
+# ─── Two modes, and why they share a file ──────────────────────────────────
+# This is unusual for tests/ and the reason is worth stating. Everywhere else a
+# guard lives in X_check.sh and its teeth are proven by X_smoke.sh. The scan
+# here cannot be a _check.sh: it needs a disk image from a node that has
+# actually run, and deploy.sh's gate has no such thing.
 #
-# Usage:
-#   tests/tls_key_disk_containment_smoke.sh --image cluster/node1.img
-#   tests/tls_key_disk_containment_smoke.sh --self-test
+# So the scan and its teeth live together:
+#
+#   (no arguments)   the SMOKE. Builds two synthetic images -- one with the key
+#                    only where it belongs, one with a re-encoded copy planted
+#                    1 MiB later -- and requires the scan to pass the first and
+#                    FAIL the second. This is what run_guard_smokes.sh runs, and
+#                    it is the whole of what a green line in the deploy gate
+#                    means. It says the scan works. It says NOTHING about any
+#                    real disk.
+#
+#   --image FILE     the actual scan, against a node's image. Operator-invoked,
+#                    after a cluster has been up and checkpointed.
+#
+# Bare invocation used to print usage and exit 2, which failed the deploy gate
+# the first time this script met it -- correctly: run_guard_smokes.sh treats a
+# smoke that cannot run as a failure, because a smoke that cannot run proves
+# nothing.
 #
 # Exit: 0 pass, 1 fail, 2 prerequisite missing.
 set -u
 cd "$(dirname "$0")/.."
 
 IMAGE=""; SELFTEST=0
+# No arguments is the SMOKE, not a usage error. run_guard_smokes.sh invokes
+# every tests/*_smoke.sh bare and treats a non-zero exit as a failed guard --
+# so a smoke whose default is "print usage" reports itself broken, which is
+# what happened the first time this script reached a deploy gate.
+[ $# -eq 0 ] && SELFTEST=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="${2:-}"; shift 2 ;;
@@ -232,12 +252,16 @@ PYEOF
     fi
     rm -rf "$T"
     echo
+    echo "      This proves the SCAN works. It says nothing about any real"
+    echo "      disk -- for that, after a cluster has been up and checkpointed:"
+    echo "        $0 --image cluster/node1.img"
+    echo
     echo "---- passed=$pass failed=$fail"
     [ "$fail" -eq 0 ] || exit 1
     exit 0
 fi
 
-[ -n "$IMAGE" ] || { echo "usage: $0 --image FILE | --self-test" >&2; exit 2; }
+[ -n "$IMAGE" ] || { echo "usage: $0 [--self-test] | --image FILE" >&2; exit 2; }
 [ -f "$IMAGE" ] || { echo "ABORT: no such image: $IMAGE" >&2; exit 2; }
 
 echo "=== the CA private key on $IMAGE ==="
