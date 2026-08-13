@@ -82,11 +82,16 @@ for sym in PERSIST_TLS_LBA PERSIST_TLS_MAGIC; do
     fi
 done
 
-# The store's API. tls_server.c is the only caller; tls_store.h declares it and
-# tls_store.c defines it. Anything else -- checkpoint_mgr, stream, persist --
-# is the failure this guard exists for.
+# The store's API. tls_server.c is the only PRODUCTION caller; tls_store.h
+# declares it and tls_store.c defines it. Anything else -- checkpoint_mgr,
+# stream, persist -- is the failure this guard exists for. Two test harnesses
+# are named, the same way tls_key_containment.c already is: tls_key_containment.c
+# plants a marker key and goes looking for it, and io_fault_host_test.c sweeps
+# save/load/wipe against a fake NVMe that can be made to fail. Both are test-only
+# callers of the same API the production path uses, so they exercise the real
+# store and are named here so they cannot silently multiply.
 callers="$(git grep -l --cached -E 'tls_store_(load|save|wipe)\(' -- '*.c' \
-           | grep -vE '^(kernel/tls_store\.c|tests/tls_key_containment\.c)$' | sort)"
+           | grep -vE '^(kernel/tls_store\.c|tests/tls_key_containment\.c|tests/io_fault_host_test\.c)$' | sort)"
 if [ "$callers" = "kernel/tls_server.c" ]; then
     ok "tls_store_load/save/wipe are called only from kernel/tls_server.c"
 elif [ -z "$callers" ]; then
