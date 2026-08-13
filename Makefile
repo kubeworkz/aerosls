@@ -382,8 +382,10 @@ MBEDTLS_INC   = -I vendor/mbedtls/include -I vendor/mbedtls/shim
 # mbedTLS 3.6's public headers include <time.h> under HAVE_TIME_DATE
 # (platform_util.h) and platform_time.h wants <inttypes.h> for
 # mbedtls_ms_time_t unless MBEDTLS_PLATFORM_MS_TIME_TYPE_MACRO is set
-# (it is, in sls_mbedtls_config.h). shim/time.h supplies struct tm and
-# time_t; nothing in the linked set calls into libc.
+# (it is, in sls_mbedtls_config.h). shim/time.h supplies struct tm only
+# -- deliberately no time_t typedef, since a libc-equipped build (the
+# deploy server) defines time_t itself and nothing here uses it; the
+# shim is a no-op there and the struct tm supplier on a freestanding one.
 # -U_FORTIFY_SOURCE is the root cause of a whole family of link errors, not a
 # style preference. This toolchain defines _FORTIFY_SOURCE=2 by default, so gcc
 # rewrites memcpy/memset/memmove with a compile-time-known size into
