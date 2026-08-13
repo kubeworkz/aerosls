@@ -273,6 +273,37 @@ else
         missing the field it exists to record"
 fi
 
+# ─── the suite is one this node CHOSE to offer ─────────────────────────────
+# kernel/tls_server.c pins an explicit ordered list. Before it did, mbedTLS's
+# default preference won and the design doc described a decision nobody had
+# made. Recording the negotiated suite proves what was picked; this asserts it
+# was picked from the pinned set, which is what would notice a config change
+# quietly re-enabling something -- the CCM suites in particular, which are
+# excluded on purpose and one of which truncates its tag to 64 bits.
+#
+# s_client offers everything it has, so the top of the pinned list is what
+# should come back. A suite from further down means either the pin is not
+# taking effect or the preference order is not being honoured, and those are
+# different bugs from "an unexpected suite is available".
+case "${CIPH:-}" in
+    TLS_AES_256_GCM_SHA384)
+        ok "the suite is the pinned first preference (TLS_AES_256_GCM_SHA384)" ;;
+    TLS_CHACHA20_POLY1305_SHA256|TLS_AES_128_GCM_SHA256)
+        bad "negotiated $CIPH -- in the pinned set, but NOT the first preference.
+        openssl s_client offers everything, so the top of the list should have
+        won. Either conf_ciphersuites is not taking effect or the server is
+        deferring to the client's order."
+        ;;
+    ""|unknown)
+        : ;;   # already reported above
+    *)
+        bad "negotiated $CIPH, which is NOT in the pinned list. kernel/tls_server.c
+        offers exactly AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256 and
+        AES_128_GCM_SHA256. Anything else means the pin is absent from this
+        build."
+        ;;
+esac
+
 # Chrome will not anchor a certificate that is not a CA; Firefox will not
 # accept one that IS a CA at the end-entity position. Both are only satisfiable
 # with two certificates, so check the shape rather than one flag.

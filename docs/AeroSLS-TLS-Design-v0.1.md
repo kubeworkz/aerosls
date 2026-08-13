@@ -42,7 +42,7 @@ the project README rather than recollection:
 | Property | Verified |
 |---|---|
 | TLS 1.3, client **and** server | Yes — `MBEDTLS_SSL_PROTO_TLS1_3` |
-| Suites we want | `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256` |
+| Suites AVAILABLE | `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256` — renamed from "suites we want" on 2026-08-13: this row was verified against the mbedTLS docs and is true, but it read as a decision and none had been made. The decision, and the pinned order, is at the end of this document. |
 | Groups | x25519, secp256r1, secp384r1, secp521r1 |
 | 1.2 and 1.3 together, independently enableable | Yes, with version negotiation |
 | Licence | Dual Apache-2.0 OR GPL-2.0-or-later — take Apache-2.0 |
@@ -1644,3 +1644,116 @@ nothing can mint against them; the cost is not exposure, it is that a dead
 trust anchor named `AeroSLS node` is exactly what a future debugging session
 will find and believe. They are residue from the re-import-every-boot workflow
 this change exists to end, and clearing them is part of ending it.
+
+---
+
+## Two things settled, 2026-08-13: renewal in flight, and the suite list
+
+### 1. The leaf renews itself
+
+The leaf was issued once, at boot, and nothing ever replaced it. Its 365-day
+lifetime was therefore **a bet that no node runs longer than a year**, and
+losing it expires a certificate underneath a server that is otherwise perfectly
+healthy — with no log line at the moment it happens, and the first symptom
+appearing in somebody's browser weeks later.
+
+`tls_server_maybe_renew()` is called from the server loop. Three properties
+make it safe rather than clever, and each was a choice with a worse obvious
+alternative:
+
+**The CA key is not held in RAM for it.** The obvious implementation keeps the
+key from boot so it is there when needed. That would silently undo the zeroize
+`tls_server_init()` ends with, and put the node's one long-lived secret in
+memory for the entire uptime. Instead the key is re-read from the store, used,
+and zeroized — residency goes from *the whole uptime* to *milliseconds, once a
+year*. The consequence is real and is reported rather than hidden: **a node
+with no stored CA cannot renew at all**, which is now said at boot and exposed
+as `tls_leaf_renewable` in `/api/health`.
+
+**The replacement is built and validated before anything is torn down.** Every
+failure before the swap leaves the working certificate serving, and there are
+thousands of hourly retries inside the margin.
+
+**The swap requires zero live sessions.** `mbedtls_ssl_conf_own_cert()` appends
+rather than replaces, and 3.6 exposes no way to clear the list, so replacing the
+certificate means freeing and rebuilding the whole `mbedtls_ssl_config` — which
+every live `mbedtls_ssl_context` points at. With a third of the leaf's life as
+window there is no urgency worth a use-after-free.
+
+Past the swap there is no rollback, and the code says why rather than leaving
+it to be discovered: rolling back needs the old leaf's private key, which was
+zeroized when it was installed. Keeping it would mean a second private key
+resident for a year to insure against a failure `tls_cert_sign_leaf()` has
+already ruled out — it parses the finished certificate back before returning.
+
+#### Ticks gate the check; they never make the decision
+
+`kernel/timer.c` programs the LAPIC for ~100 Hz and says outright that the
+"exact rate is calibration-dependent". So a tick is a cheap monotonic counter
+and **not a unit of time this code may reason about**. It answers *should I
+bother looking?*; `rtc_get_unix()` answers *has it expired?*. If the
+calibration is off by 3× the check runs every 20 minutes or every 3 hours and
+nothing cares — which is the test for whether a tick-derived number is being
+used for the right kind of thing.
+
+#### A boundary the test caught, and it was not a preference
+
+The predicate was `remaining < margin`, while `/api/health` publishes
+`not_after - margin` as `tls_leaf_renew_at` — the instant renewal becomes due.
+With a strict `<`, that published instant is the one second at which it is *not*
+due. Two places holding one fact and disagreeing, which is the same defect as
+the console printing `256 KiB` beside a health endpoint reporting `524288`.
+Boundary closed. Nothing practical turns on one second in an hourly check; a
+number that contradicts the code beside it is how the next person loses an
+afternoon.
+
+12 new host-test checks, weighted on the degenerate inputs — unreadable window,
+lifetime of zero, already expired, lifetime too short to have a third. **All of
+them must answer DUE**, because the two failure directions are not symmetric: a
+needless renewal costs one P-256 keygen, a missed one costs an outage that
+starts silently.
+
+**Not yet observed live.** `tls_leaf_deferrals` climbing while
+`tls_leaf_renewals` stays at zero would mean a node never idle long enough to
+swap. Reaching that state takes a year or a clock jump, so this is the one path
+here with no evidence behind it.
+
+### 2. The ciphersuite list is now a decision
+
+§7's amendment listed two suites under "suites we want". That row was verified
+and true about **availability**, and it read as a decision — but nothing ever
+called `mbedtls_ssl_conf_ciphersuites()`, so mbedTLS's built-in preference won
+and the negotiated suite was `TLS_AES_256_GCM_SHA384` by default rather than by
+choice. The row is renamed to "suites AVAILABLE"; the decision is here.
+
+Pinned, in server-preference order (`ssl.h`: the server picks its own favourite
+among those the client offers, and `mbedtls_ssl_conf_preference_order()` is not
+called):
+
+| | Suite | Why it is there |
+|---|---|---|
+| 1 | `TLS_AES_256_GCM_SHA384` | Every current target has hardware AES — AESNI on x86-64, AESCE on the ARM64 parts — so it is both fastest and constant-time. It is also what curl, Chrome and Firefox already negotiated through the Phase 3 gate. |
+| 2 | `TLS_CHACHA20_POLY1305_SHA256` | The one that earns its place. Without AES acceleration mbedTLS falls back to table-driven AES, which is cache-timing vulnerable — §6's item 2 arriving through the cipher rather than the glue. ChaCha20 is constant-time in software by construction. |
+| 3 | `TLS_AES_128_GCM_SHA256` | So a client that has only this still connects. |
+
+Excluded on purpose: `TLS_AES_128_CCM_SHA256` and `TLS_AES_128_CCM_8_SHA256`.
+CCM exists for constrained devices and nothing here is constrained; CCM_8
+additionally truncates the tag to 64 bits, a real reduction in forgery
+resistance accepted elsewhere to save six bytes per record. Neither trade is
+one this node needs to offer, **and a suite that is offered can be selected.**
+
+The ChaCha20 entry is not a new argument. §2 already chose ChaCha20 over AES
+for the DRBG, for exactly this reason — *"it is constant-time in software by
+construction"*. Having made that argument once, leaving the record layer's
+fallback to chance would have been odd.
+
+#### Pinning changes nothing that has been tested
+
+AES-256-GCM stays first, so the negotiated suite is identical to the one three
+clients already accepted. That is the point of the ordering: the accidental
+becomes deliberate and the tested path does not move.
+`tests/tls_gate_evidence.sh` now asserts the negotiated suite is the pinned
+first preference, and distinguishes three failures that would otherwise look
+alike — a suite from further down the list (the pin is not taking effect, or
+the order is not honoured), a suite from outside it (the pin is absent from
+this build), and no suite at all.

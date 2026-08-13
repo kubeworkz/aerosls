@@ -31,6 +31,7 @@
 #include "timer.h"   /* kernel_tick_counter -- the renewal check's cheap gate */
 
 #include "mbedtls/ssl.h"
+#include "mbedtls/ssl_ciphersuites.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/platform_util.h"
@@ -373,6 +374,54 @@ static int install_leaf(const unsigned char *key_der, size_t key_len)
     if (mbedtls_ssl_conf_alpn_protocols(&g_conf, (const char **)alpn) != 0) {
         goto fail;
     }
+
+    /* ─── The ciphersuites, decided rather than defaulted ──────────────────
+     * Nothing ever called this before, so mbedTLS's built-in preference won
+     * and the design doc's "suites we want" table described a choice that was
+     * never made. The table was not wrong about what is AVAILABLE; it read as
+     * a decision, and there was no decision. This is the decision.
+     *
+     * Order is server preference: ssl.h states the server picks its own
+     * favourite among those the client offers, unless
+     * mbedtls_ssl_conf_preference_order() says otherwise, and it is not
+     * called. So this list is read top-down.
+     *
+     *   AES_256_GCM_SHA384 first. Every target this runs on today has
+     *   hardware AES -- AESNI on x86-64, AESCE on the ARM64 parts -- so it is
+     *   both the fastest and constant-time. It is also what curl, Chrome and
+     *   Firefox already negotiated through the Phase 3 gate, which is the
+     *   point: pinning changes NOTHING that has been tested. It makes the
+     *   accidental deliberate, and leaves the tested path exactly where it is.
+     *
+     *   CHACHA20_POLY1305_SHA256 second, and this is the one that earns its
+     *   place. On a part without AES acceleration mbedTLS falls back to
+     *   table-driven AES, which is cache-timing vulnerable -- §6's item 2,
+     *   "timing side channels through the record layer", arriving through the
+     *   cipher rather than through the glue. ChaCha20 is constant-time in
+     *   software by construction. This is the same argument §2 already makes
+     *   for choosing ChaCha20 over AES as the DRBG; it applies to the record
+     *   layer for the same reason, and having made it once it would be odd to
+     *   leave the fallback to chance.
+     *
+     *   AES_128_GCM_SHA256 third, so a client that has only that still
+     *   connects.
+     *
+     * The two CCM suites are left out on purpose. CCM exists for constrained
+     * devices and nothing here is constrained; CCM_8 additionally truncates
+     * the tag to 64 bits, which is a real reduction in forgery resistance
+     * accepted elsewhere to save six bytes a record. Neither trade is one this
+     * node needs to offer, and a suite that is offered can be selected.
+     *
+     * Static, because ssl.h warns the array is NOT copied and must outlive the
+     * config -- the same footgun as the ALPN list directly above. */
+    static const int suites[] = {
+        MBEDTLS_TLS1_3_AES_256_GCM_SHA384,
+        MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256,
+        MBEDTLS_TLS1_3_AES_128_GCM_SHA256,
+        0
+    };
+    mbedtls_ssl_conf_ciphersuites(&g_conf, suites);
+
     return 0;
 
 fail:
