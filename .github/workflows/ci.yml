@@ -119,6 +119,40 @@ jobs:
         with:
           path: aerosls2
 
+      # qemu-sls (kubeworkz/qemu-sls) is a private repo, so the
+      # checkout below needs the QEMU_SLS_PAT secret. When the secret
+      # is missing, actions/checkout fails with a bare "Authentication
+      # failed" that says nothing about what to fix. This guard fails
+      # first with the actual cause and the fix: if no secret is set,
+      # probe the repo anonymously -- a 200 means it went public (no
+      # secret needed, checkout works anonymously), anything else means
+      # the checkout would fail, so name the fix and stop.
+      - name: Guard the qemu-sls checkout (private repo requires QEMU_SLS_PAT)
+        env:
+          QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
+        run: |
+          set -u
+          if [ -n "${QEMU_SLS_PAT:-}" ]; then
+            echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
+            exit 0
+          fi
+          # -L: the API answers 301 (moved to a repository-ID URL) for
+          # public repos; without following it a public repo would be
+          # misread as private and the guard would fail wrongly.
+          code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
+            https://api.github.com/repos/kubeworkz/qemu-sls)
+          if [ "$code" = "200" ]; then
+            echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
+            exit 0
+          fi
+          echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
+          echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
+          echo "::error::The kernel links objects out of ../qemu, so CI cannot build without"
+          echo "::error::this checkout. Fix: add a read-access fine-grained PAT for"
+          echo "::error::kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
+          echo "::error::https://github.com/kubeworkz/aerosls/settings/secrets/actions"
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           repository: kubeworkz/qemu-sls
@@ -238,6 +272,40 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: aerosls2
+
+      # qemu-sls (kubeworkz/qemu-sls) is a private repo, so the
+      # checkout below needs the QEMU_SLS_PAT secret. When the secret
+      # is missing, actions/checkout fails with a bare "Authentication
+      # failed" that says nothing about what to fix. This guard fails
+      # first with the actual cause and the fix: if no secret is set,
+      # probe the repo anonymously -- a 200 means it went public (no
+      # secret needed, checkout works anonymously), anything else means
+      # the checkout would fail, so name the fix and stop.
+      - name: Guard the qemu-sls checkout (private repo requires QEMU_SLS_PAT)
+        env:
+          QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
+        run: |
+          set -u
+          if [ -n "${QEMU_SLS_PAT:-}" ]; then
+            echo "QEMU_SLS_PAT is configured -- proceeding to the qemu-sls checkout."
+            exit 0
+          fi
+          # -L: the API answers 301 (moved to a repository-ID URL) for
+          # public repos; without following it a public repo would be
+          # misread as private and the guard would fail wrongly.
+          code=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code}' \
+            https://api.github.com/repos/kubeworkz/qemu-sls)
+          if [ "$code" = "200" ]; then
+            echo "qemu-sls is public -- no secret needed, checkout will work anonymously."
+            exit 0
+          fi
+          echo "::error::qemu-sls (kubeworkz/qemu-sls) is PRIVATE but the QEMU_SLS_PAT"
+          echo "::error::secret is not configured (anonymous probe returned HTTP $code)."
+          echo "::error::The kernel links objects out of ../qemu, so CI cannot build without"
+          echo "::error::this checkout. Fix: add a read-access fine-grained PAT for"
+          echo "::error::kubeworkz/qemu-sls as the QEMU_SLS_PAT secret at"
+          echo "::error::https://github.com/kubeworkz/aerosls/settings/secrets/actions"
+          exit 1
 
       - uses: actions/checkout@v4
         with:
