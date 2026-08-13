@@ -752,8 +752,13 @@ jobs:
           qpid=$!
           python3 tools/simi/tests/echo_client.py /tmp/sls_echo.sock tick >echo_client.log 2>&1
           crc=$?
-          wait $qpid
-          rc=$?
+          # `wait` returns 124 when QEMU is killed by the timeout -- the
+          # EXPECTED outcome for the M-mode kernel (no firmware to power
+          # off with), and the S-mode kernel's timeout-kill failure mode.
+          # Under the step shell's `bash -e` a bare `wait` aborting on
+          # 124 would kill the step BEFORE the rc check below runs, so
+          # capture the status through `||` (exempt from set -e) instead.
+          wait $qpid || rc=$?
           if [ "$rc" -eq 0 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_client.log; then
             echo "OK: device-driven UART RX interrupt echo + command loop + 100ms periodic timer + round-robin time-slicing + wall-clock uptime + no-missed-re-arm contention probe verified ([TICK 2 Us], tasks table, exit -> rc=0)"
           else
@@ -785,8 +790,13 @@ jobs:
           qpid=$!
           python3 tools/simi/tests/echo_client.py /tmp/sls_echo_m.sock tick >echo_m_client.log 2>&1
           crc=$?
-          wait $qpid
-          rc=$?
+          # `wait` returns 124 when QEMU is killed by the timeout -- the
+          # EXPECTED outcome for the M-mode kernel (no firmware to power
+          # off with), and the S-mode kernel's timeout-kill failure mode.
+          # Under the step shell's `bash -e` a bare `wait` aborting on
+          # 124 would kill the step BEFORE the rc check below runs, so
+          # capture the status through `||` (exempt from set -e) instead.
+          wait $qpid || rc=$?
           if [ "$rc" -eq 124 ] && [ "$crc" -eq 0 ] && grep -q "ECHO_OK" echo_m_client.log; then
             echo "OK: M-mode device-driven UART RX interrupt echo + 100ms periodic timer + round-robin time-slicing + wall-clock uptime + no-missed-re-arm contention probe verified ([TICK 2 Us] via CLINT mtimecmp, tasks table)"
           else
