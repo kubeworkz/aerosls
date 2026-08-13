@@ -64,6 +64,26 @@ if [ -z "${SELF_REEXEC:-}" ] && [ -n "$_hash_before" ]; then
     fi
 fi
 
+# ─── Node via nvm's default, falling back to the system node ────────────────────────────
+# The frontend build must run under a MODERN npm. The system npm 9 on this
+# box (node 18) has a known optional-dependencies bug (npm/cli#4828) that
+# skips platform-specific native bindings -- @tailwindcss/oxide-linux-x64-gnu
+# in particular -- so `npm run build` dies with "Cannot find native binding".
+# An interactive shell gets node 24 because .bashrc sources nvm; a
+# non-interactive run (cron, CI, a bare ssh command) does not, which is how
+# a deploy that built fine by hand fails unattended. Sourcing nvm here makes
+# the two identical. If nvm is absent, fall back to whatever node is on PATH.
+if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+    # shellcheck disable=SC1090
+    . "${NVM_DIR:-$HOME/.nvm}/nvm.sh"
+    # `nvm use default` can fail when no default alias exists -- the system
+    # node then stays in place, which is the same fallback as no nvm at all.
+    nvm use default >/dev/null 2>&1 || true
+    echo "[deploy] node: $(node --version) via $(command -v node)"
+else
+    echo "[deploy] node: $(node --version) (system, no nvm found)"
+fi
+
 # The Makefile's own `bundle` target runs `npm run build --silent
 # 2>/dev/null || true` -- the `|| true` means a frontend build failure
 # there is silently swallowed and `make bundle` proceeds anyway, re-bundling
