@@ -35,6 +35,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "tls_cert.h"
+#include "tls_server.h"   /* TLS_SERVER_CIPHERSUITE_LIST -- the list itself, not a copy */
+/* Needed for mbedtls_ssl_list_ciphersuites(). Without it the implicit
+ * declaration returns int, the 64-bit pointer is truncated, and --suites
+ * segfaults before printing anything -- which is exactly what it did. */
+#include "mbedtls/ssl_ciphersuites.h"
 #include "entropy.h"
 #include "rtc.h"
 
@@ -307,6 +312,67 @@ static int persist_mode(const char *dir, const struct tls_cert_san *sans,
     return p_fail == 0 ? 0 : 1;
 }
 
+
+/* ─── Every pinned suite must actually exist in this build ─────────────────
+ * kernel/tls_server.c hands mbedtls_ssl_conf_ciphersuites() a fixed list. A
+ * suite in that list which is NOT compiled into this configuration is silently
+ * dropped -- no error, no log, nothing. The server simply never offers it, and
+ * a client that supports only that suite gets a handshake failure.
+ *
+ * That matters most for ChaCha20, which is in the list precisely as the
+ * FALLBACK for parts without hardware AES. A fallback that was quietly absent
+ * would be discovered on the one machine it was put there for, which is the
+ * worst possible place to discover it. Nothing has ever negotiated ChaCha20 on
+ * a real node -- every handshake so far picked AES-256 -- so until this check
+ * existed the claim rested entirely on the list being written down.
+ *
+ * The list comes from tls_server.h, not from a copy here. A test with its own
+ * copy of the list would agree with itself forever.
+ */
+static int suite_mode(void)
+{
+    static const int pinned[] = { TLS_SERVER_CIPHERSUITE_LIST };
+    static const char *names[] = {
+        "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_128_GCM_SHA256"
+    };
+    const int *avail = mbedtls_ssl_list_ciphersuites();
+    size_t n = sizeof pinned / sizeof pinned[0];
+    int fails = 0;
+
+    if (!avail) { printf("FAIL: mbedtls_ssl_list_ciphersuites() returned nothing\n"); return 1; }
+
+    for (size_t i = 0; i < n; i++) {
+        int found = 0;
+        for (const int *p = avail; *p; p++) { if (*p == pinned[i]) { found = 1; break; } }
+        if (found) {
+            printf("ok:   %s (0x%04x) is compiled in and can be offered\n",
+                   names[i], (unsigned)pinned[i]);
+        } else {
+            printf("FAIL: %s (0x%04x) is PINNED but not compiled into this "
+                   "configuration -- it will be silently dropped\n",
+                   names[i], (unsigned)pinned[i]);
+            fails++;
+        }
+    }
+
+    /* The CCM suites are excluded from the pinned list on purpose. Whether
+     * they are compiled in is not the point -- what matters is that they are
+     * not offered, and the pinned list is the whole of what is offered. Stated
+     * here so a reader does not go looking for a check that would be
+     * meaningless. */
+    {
+        const char *info = "";
+        for (const int *p = avail; *p; p++) {
+            if (*p == 0x1304 || *p == 0x1305) { info = " (compiled in, but not offered -- correct)"; break; }
+        }
+        printf("      CCM suites: excluded from the pinned list%s\n", info);
+    }
+
+    printf("---- suite checks: passed=%d failed=%d\n", (int)n - fails, fails);
+    return fails == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     unsigned char crt[4096], key[2048], ca[4096];
@@ -320,6 +386,7 @@ int main(int argc, char **argv)
     };
     const char *crt_path = NULL, *key_path = NULL, *ca_path = NULL;
     const char *persist_dir = NULL;
+    int suites_mode = 0;
     int rc;
 
     for (int i = 1; i < argc; i++) {
@@ -333,6 +400,7 @@ int main(int argc, char **argv)
             counter = (unsigned char)v;
         }
         else if (strcmp(argv[i], "--persist") == 0 && i + 1 < argc) { persist_dir = argv[++i]; }
+        else if (strcmp(argv[i], "--suites") == 0) { suites_mode = 1; }
         else { fprintf(stderr, "usage: %s [--no-entropy] [--seed N] [--persist DIR] --crt F --key F\n", argv[0]); return 2; }
     }
 
@@ -346,6 +414,8 @@ int main(int argc, char **argv)
     if (rtc_set_unix(ORACLE_NOW) != RTC_OK) {
         fprintf(stderr, "rtc_set_unix refused the time\n"); return 1;
     }
+
+    if (suites_mode) { return suite_mode(); }
 
     if (persist_dir) {
         return persist_mode(persist_dir, sans, sizeof sans / sizeof sans[0]);

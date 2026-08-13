@@ -83,6 +83,24 @@
  * right kind of thing. */
 #define TLS_SERVER_RENEW_CHECK_TICKS  360000ULL
 
+/* ─── The ciphersuites this node offers, in preference order ───────────────
+ * Raw IANA identifiers rather than the MBEDTLS_TLS1_3_* macros, because this
+ * header is included by net/http.c, which does not have the vendored tree on
+ * its include path and must not need it. kernel/tls_server.c static-asserts
+ * each number against the macro it stands for, so the two cannot drift and a
+ * typo here is a compile error rather than a suite nobody notices is missing.
+ *
+ * The list lives in a header at all so that tests can read the SAME list the
+ * server offers. A test with its own copy would agree with itself forever.
+ *
+ * Order is server preference; see the long note at the use site for why each
+ * one is here and why the two CCM suites are not. */
+#define TLS_SERVER_SUITE_AES256   0x1302   /* TLS_AES_256_GCM_SHA384       */
+#define TLS_SERVER_SUITE_CHACHA   0x1303   /* TLS_CHACHA20_POLY1305_SHA256 */
+#define TLS_SERVER_SUITE_AES128   0x1301   /* TLS_AES_128_GCM_SHA256       */
+#define TLS_SERVER_CIPHERSUITE_LIST \
+    TLS_SERVER_SUITE_AES256, TLS_SERVER_SUITE_CHACHA, TLS_SERVER_SUITE_AES128
+
 /* Generate a self-signed certificate and build the shared server config.
  * Safe to call more than once; the second call is a no-op. Returns TLS_SRV_OK
  * or negative -- and on failure TLS must not start, which is §2.4's

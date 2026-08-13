@@ -221,6 +221,28 @@ fi
 
 mv -f "$BUILD/crt.last.der" "$CRT" 2>/dev/null
 
+# ─── every pinned suite is actually in this build ──────────────────────────
+# kernel/tls_server.c pins three ciphersuites. A pinned suite that is not
+# compiled in is dropped silently -- the server just never offers it. ChaCha20
+# is in that list specifically as the fallback for parts with no hardware AES,
+# and nothing has ever negotiated it on a real node: every handshake so far
+# picked AES-256. So without this the fallback's existence rested entirely on
+# it being written down.
+#
+# The oracle reads the list from kernel/tls_server.h rather than keeping its
+# own, so this cannot pass by agreeing with a stale copy of itself.
+echo
+echo "=== the pinned ciphersuites exist in this configuration ==="
+echo
+SOUT="$("$BUILD/oracle" --suites 2>&1)"; src=$?
+echo "$SOUT" | grep -E "^(ok|FAIL|      )" | sed 's/^ok:   /    ok:   /; s/^FAIL: /    FAIL: /'
+pass=$(( pass + $(echo "$SOUT" | grep -c '^ok:') ))
+sf=$(echo "$SOUT" | grep -c '^FAIL:')
+fail=$(( fail + sf ))
+if [ "$src" -ne 0 ] && [ "$sf" -eq 0 ]; then
+    bad "the suite check exited $src without reporting a failure"
+fi
+
 # ─── the CA outliving the boot that made it ────────────────────────────────
 # Everything above judges ONE generation. The whole point of storing the CA is
 # that a LATER boot signs a new leaf with it and the operator's import stays

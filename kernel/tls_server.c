@@ -86,6 +86,16 @@ static unsigned      g_live_peak;
  * file a dangling pointer to use a year later, when nothing would connect the
  * crash to the call. Stated in tls_server.h as a requirement rather than left
  * to be discovered. */
+/* The header carries raw IANA numbers so net/http.c need not see mbedTLS.
+ * These are what make them honest: a transposed digit is a build failure here
+ * rather than a suite that silently never negotiates. */
+_Static_assert(TLS_SERVER_SUITE_AES256 == MBEDTLS_TLS1_3_AES_256_GCM_SHA384,
+               "TLS_SERVER_SUITE_AES256 is not TLS_AES_256_GCM_SHA384");
+_Static_assert(TLS_SERVER_SUITE_CHACHA == MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256,
+               "TLS_SERVER_SUITE_CHACHA is not TLS_CHACHA20_POLY1305_SHA256");
+_Static_assert(TLS_SERVER_SUITE_AES128 == MBEDTLS_TLS1_3_AES_128_GCM_SHA256,
+               "TLS_SERVER_SUITE_AES128 is not TLS_AES_128_GCM_SHA256");
+
 static const char *g_ca_dn;
 static const char *g_dn;
 static const struct tls_cert_san *g_sans;
@@ -414,12 +424,7 @@ static int install_leaf(const unsigned char *key_der, size_t key_len)
      *
      * Static, because ssl.h warns the array is NOT copied and must outlive the
      * config -- the same footgun as the ALPN list directly above. */
-    static const int suites[] = {
-        MBEDTLS_TLS1_3_AES_256_GCM_SHA384,
-        MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256,
-        MBEDTLS_TLS1_3_AES_128_GCM_SHA256,
-        0
-    };
+    static const int suites[] = { TLS_SERVER_CIPHERSUITE_LIST, 0 };
     mbedtls_ssl_conf_ciphersuites(&g_conf, suites);
 
     return 0;

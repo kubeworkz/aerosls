@@ -1742,6 +1742,53 @@ additionally truncates the tag to 64 bits, a real reduction in forgery
 resistance accepted elsewhere to save six bytes per record. Neither trade is
 one this node needs to offer, **and a suite that is offered can be selected.**
 
+#### This turned out not to be housekeeping
+
+Writing the exclusion down was meant to be tidiness. Checking it was not:
+
+- `mbedtls_ssl_config_defaults()` with `MBEDTLS_SSL_PRESET_DEFAULT` sets
+  `conf->ciphersuite_list = mbedtls_ssl_list_ciphersuites()` — *everything
+  compiled in* (`ssl_tls.c:6128`).
+- `MBEDTLS_CHACHA20_C`, `MBEDTLS_CHACHAPOLY_C` and `MBEDTLS_POLY1305_C` are on
+  by default and `sls_mbedtls_config.h` does not undefine them — and neither
+  are the CCM ones.
+- The oracle's new `--suites` mode reports both CCM suites present in this
+  configuration.
+
+So **before this pin, every client that connected to a node was offered
+`TLS_AES_128_CCM_8_SHA256`** — the 64-bit-tag suite — not because anyone chose
+to offer it, but because it compiles in and nothing said otherwise. No client
+selected it, because no client prefers it. That is luck, and it is the shape of
+the whole finding: "the table read as a decision when no decision had been
+made" had a consequence on the wire, and the consequence was invisible for
+exactly as long as the clients happened to agree with us.
+
+#### The fallback nobody has ever used
+
+ChaCha20 is in the list as the fallback for parts without hardware AES, and
+**nothing has ever negotiated it on a real node** — every handshake so far, in
+curl and both browsers, picked AES-256. A pinned suite that is not compiled in
+is dropped *silently*: no error, no log, the server simply never offers it. So
+until this was checked, the fallback's existence rested entirely on it being
+written down, and it would have been discovered missing on the one machine it
+was put there for.
+
+`tests/tls_cert_oracle.c --suites` now asserts every pinned suite is present in
+`mbedtls_ssl_list_ciphersuites()` under the kernel's own config. It reads the
+list from `kernel/tls_server.h` rather than keeping a copy — a test with its
+own copy of the list agrees with itself forever. The header carries raw IANA
+numbers so `net/http.c` need not see the vendored tree, and `tls_server.c`
+static-asserts each number against the `MBEDTLS_TLS1_3_*` macro it stands for,
+so a transposed digit is a build failure rather than a suite that quietly never
+negotiates.
+
+**Still owed:** a live ChaCha20 handshake. The check above proves the suite is
+*available*; only a client forcing it proves it *works*:
+
+```
+openssl s_client -connect localhost:8444 -ciphersuites TLS_CHACHA20_POLY1305_SHA256
+```
+
 The ChaCha20 entry is not a new argument. §2 already chose ChaCha20 over AES
 for the DRBG, for exactly this reason — *"it is constant-time in software by
 construction"*. Having made that argument once, leaving the record layer's
