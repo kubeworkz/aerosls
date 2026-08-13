@@ -584,6 +584,28 @@ return — on real hardware too. The fix is `sysretq` (48 0F 07); the
 assembler's "using default for sysret" warning was the tell, and the
 guest comment now says why the suffix is load-bearing.
 
+**Iteration 13 (2026-08-12): CPUID — helper_cpuid (misc_helper.c) and the
+seeded feature leaves.** gen_CPUID emits gen_helper_cpuid with no TB end;
+upstream routes through cpu_x86_cpuid (cpu.c, not in this link), so the
+implementation answers from the launcher's seeded feature arrays and
+nothing else: FEAT_1_EDX = MMX|SSE|SSE2, FEAT_8000_0001_EDX = LM|SYSCALL,
+FEAT_8000_0001_ECX = LAHF_LM, max-leaf answers of 1 and 0x80000001, and
+zeros for the vendor string and family/model (the zeroed env). The guest
+reads each leaf and compares EXACTLY — no extras — packing three markers
+into RESULT_CP. First run was a FAIL, and the defect was a guest literal:
+MMX|SSE|SSE2 is (1<<23)|(1<<25)|(1<<26) = 0x6800000, but the asm compared
+0x6400000 (bit 22 instead of bit 23), so the leaf-1 marker read 0. The
+fixture's detail line pinned it byte-for-byte (cp=0x101: first two markers
+1, third 0). Fixed, rebuilt, and clean: `cp=0x10101` bit-for-bit, every
+prior check intact (all twelve iterations), and `invl`/`paging`/`selfmod`
+still pass with the bench running.
+
+Also surfaced a build-flow footgun worth a line: the guest must be built
+with `-O2 -T guest.ld` + `objcopy -O binary` (a default -O0 ELF build is
+4.7x bigger and would silently ship a bloated guest), and the x86_64-elf
+toolchain lives at $HOME/opt/cross/bin, which `bash -l` from WSL does not
+always source — both cost this iteration a rebuild.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
