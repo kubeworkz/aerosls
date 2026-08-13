@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "tls_platform.h"
 #include "entropy.h"
 #include "rtc.h"
 
@@ -140,7 +141,6 @@ int sls_mbedtls_rng(void *p_rng, unsigned char *output, size_t output_size)
  * This is a hypothesis with an instrument attached: reload the Navigator and
  * read tls_pool_peak against tls_sessions_peak again. If peak lands near
  * 300 KB with six sessions live, the arithmetic held. */
-#define SLS_TLS_POOL_BYTES (512u * 1024u)
 #ifndef TLS_PLATFORM_HOST_TEST
 static uint8_t tls_pool[SLS_TLS_POOL_BYTES] __attribute__((aligned(16)));
 #endif
@@ -163,8 +163,10 @@ int sls_tls_memory_init(void)
      * factor of two, and /api/health -- which reads the constant -- would have
      * flatly contradicted it. Two places holding one number is the whole bug;
      * printing the number is the fix, not correcting the literal. */
+#ifndef TLS_PLATFORM_HOST_TEST
     kernel_serial_printf("[TLS] memory pool initialised (%u KiB, fixed).\n",
                          (unsigned)(SLS_TLS_POOL_BYTES / 1024u));
+#endif
     return 0;
 }
 

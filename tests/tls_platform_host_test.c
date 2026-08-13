@@ -3,7 +3,8 @@
  *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -DTLS_PLATFORM_HOST_TEST -DENTROPY_HOST_TEST \
- *       -DENTROPY_TEST_HOOKS -I . -I kernel -o /tmp/tls_platform_host_test \
+ *       -DENTROPY_TEST_HOOKS -DRTC_HOST_TEST -DRTC_TEST_HOOKS \
+ *       -I . -I kernel -o /tmp/tls_platform_host_test \
  *       tests/tls_platform_host_test.c kernel/tls_platform.c kernel/entropy.c \
  *       kernel/sha256.c kernel/rtc.c
  *   /tmp/tls_platform_host_test
@@ -23,6 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "tls_platform.h"
 #include "entropy.h"
 #include "rtc.h"
 
@@ -104,8 +106,8 @@ int main(void) {
      * kernel/tls_platform.c), so these are the only allocator assertions this
      * file can honestly make. Anything stronger belongs in a test that boots
      * the kernel. */
-    ok(sls_tls_pool_bytes() == 256u * 1024u,
-       "the pool is a declared fixed budget (256 KiB), not an open heap");
+    ok(sls_tls_pool_bytes() == SLS_TLS_POOL_BYTES,
+       "the pool is the declared fixed budget, not an open heap");
     ok(sls_tls_memory_ready() == 0, "not ready before init");
     ok(sls_tls_memory_init() == 0,  "init succeeds");
     ok(sls_tls_memory_ready() == 1, "  ...and reports ready");

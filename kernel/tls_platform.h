@@ -27,4 +27,13 @@ int sls_mbedtls_rng(void *p_rng, unsigned char *output, size_t output_size);
 size_t sls_tls_pool_bytes(void);
 void   sls_tls_pool_high_water(size_t *max_used, size_t *max_blocks);
 
+/* The pool's declared size, in bytes -- the single source of truth. It
+ * used to be defined only in tls_platform.c, which let the host test
+ * freeze its own copy (256 KiB) that survived the measured raise to
+ * 512 KiB -- the "two places holding one number" bug the init-time
+ * printf comment describes. Any other number that must track this one
+ * (TLS_SERVER_MAX_SESSIONS against the peak, for instance) reads it
+ * here. */
+#define SLS_TLS_POOL_BYTES (512u * 1024u)
+
 #endif /* SLS_TLS_PLATFORM_H */
