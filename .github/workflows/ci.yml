@@ -36,9 +36,9 @@ jobs:
       # review and inspecting nothing. Each was written after the bug it
       # catches had already cost a diagnostic round.
       #
-      # Three of the seventeen (makefile_sources, commands_doc,
+      # Three of the eighteen (makefile_sources, commands_doc,
       # script_conventions) read only sources and run here. The other
-      # fourteen need a linked kernel or its objects, and this runner has no
+      # fifteen need a linked kernel or its objects, and this runner has no
       # x86_64-elf-gcc -- see the note at the top of this file -- so they
       # exit 2 and are reported as SKIP with the reason printed. A skip is
       # counted separately and never mistaken for a pass; read the step's
@@ -61,9 +61,9 @@ jobs:
       # not *_check.sh, so run_checks.sh and deploy.sh's guard gate never
       # run them.
       #
-      # The four kernel-needing guards cannot run here (no cross
+      # The five kernel-needing guards cannot run here (no cross
       # toolchain). The kernel-guards job below builds the real binary and
-      # runs all seventeen guards and all eighteen smokes for real -- the
+      # runs all eighteen guards and all nineteen smokes for real -- the
       # only skip is the runtime entropy guard, which needs a live cluster
       # even on a build host.
       - name: Script-conventions guard teeth (smoke)
@@ -76,10 +76,13 @@ jobs:
         run: bash tests/commands_doc_smoke.sh
 
   kernel-guards:
-    # The four kernel-needing guards (stack_frame_budget, kernel_image_end,
-    # no_tls_relocations, no_hosted_link) need the linked kernel and its
-    # objects, so they skip in `verify` and were proven only on a build
-    # host. no_hosted_link is the machine-checked form of the core
+    # The five kernel-needing guards (stack_frame_budget, kernel_image_end,
+    # no_tls_relocations, no_hosted_link, code_buffer_budget) need the
+    # linked kernel and its objects, so they skip in `verify` and were
+    # proven only on a build host. code_buffer_budget asserts the two
+    # translation-cache buffers link at their declared sizes (32 MiB /
+    # 4 MiB, read from the sources) and stay distinct. no_hosted_link is
+    # the machine-checked form of the core
     # no-glibc/no-user-space property: the linked image must have zero
     # undefined symbols, no dynamic section, and no ELF interpreter -- a
     # hosted leak (-lc in the link, a hosted object linked in, a weak
@@ -87,15 +90,15 @@ jobs:
     # runtime. This job builds the real shipping artifact (the bootable
     # ISO, via make x86-iso) and runs the deploy gate's two commands --
     # run_checks.sh --require-all and run_guard_smokes.sh -- so all
-    # seventeen guards pass AND all eighteen smokes prove their teeth on
+    # eighteen guards pass AND all nineteen smokes prove their teeth on
     # every push (the one runtime guard, entropy_boot_diversity, still
     # reports its owed skip: it needs a live cluster). Then it boots the
     # ISO under QEMU and checks the service end to end: the kernel's first
     # serial banner must appear, and its webapp must answer /api/health on
     # the forwarded port (the exact endpoint deploy.sh gates on) — proving
     # the webapp serves, not just that the kernel boots. Verified
-    # end-to-end on a fresh checkout: the ISO builds, all seventeen guards
-    # + all eighteen smokes pass, the ISO boots under QEMU, and /api/health
+    # end-to-end on a fresh checkout: the ISO builds, all eighteen guards
+    # + all nineteen smokes pass, the ISO boots under QEMU, and /api/health
     # answers in ~10s.
     #
     # Toolchain: the cross compiler (x86_64-elf-gcc) is replaced by the

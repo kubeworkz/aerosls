@@ -47,9 +47,9 @@ command beside it is a number nobody can re-check.
 | Kernel links 15 objects from `../qemu` | `boot.asm`, deploy.sh | **15** (`tci.x86.o` is deliberately excluded, in a comment) | `sed -n '145,160p' Makefile` |
 | `QEMU_GUEST_RAM_PAGES` = 65,536 = 256 MiB | Cross-ISA §6 | **65536U**, `kernel/qemu_sls_mmu.h:74` → 256 MiB exactly | `grep -n QEMU_GUEST_RAM_PAGES kernel/qemu_sls_mmu.h` |
 | GPA window at 32 TiB | Guest-Address-Space | **`0x200000000000`** = 32 TiB, `qemu_sls_mmu.h:70` | `grep -n QEMU_GPA_HOST_BASE kernel/qemu_sls_mmu.h` |
-| `sls_code_buffer` is 32 MiB | Phase2 §1 | **32 MiB** declared, **32.00 MiB** in `.bss` | `grep -n SLS_CODE_BUFFER_SIZE ../qemu/sls/sls-runtime.c` |
-| `qemu_sls_codebuf` is 4 MiB | Phase2 §1 | **4 MiB** declared, **4.00 MiB** (`codebuf_storage`) in `.bss` | `grep -n QEMU_TCACHE_CODEBUF_SIZE kernel/qemu_sls_tcache.h` |
-| The two code buffers are different buffers | Phase2 §1 | **Confirmed** — 32 MiB and 4 MiB, separate symbols, both present | `nm --size-sort -S my_sls_kernel.bin` |
+| `sls_code_buffer` is 32 MiB | Phase2 §1 | **32 MiB** declared, **32.00 MiB** in `.bss` | `tests/code_buffer_budget_check.sh` |
+| `qemu_sls_codebuf` is 4 MiB | Phase2 §1 | **4 MiB** declared, **4.00 MiB** (`codebuf_storage`) in `.bss` | `tests/code_buffer_budget_check.sh` |
+| The two code buffers are different buffers | Phase2 §1 | **Confirmed** — 32 MiB and 4 MiB, separate symbols, both present | `tests/code_buffer_budget_check.sh` (also asserts the buffers are distinct) |
 | `QemuTBDesc` 32 bytes, `tb_table[4096]` | Phase2 §1 | **Consistent**: 4096 × 32 = 128 KiB, as the header states | `grep -n 'tb_table\|32 bytes' kernel/qemu_sls_tcache.h` |
 | `qemu_sls_page_gen[65536]` | Phase2 §1 | **65536U** via `QEMU_TCACHE_GEN_PAGES` | `grep -n QEMU_TCACHE_GEN_PAGES kernel/qemu_sls_tcache.h` |
 | `max_insns` bug is clamped | Cross-ISA App. A | **Fixed**, two places: refusal at `sls-launcher.c:1185`, hard clamp at `sls-x86-frontend.c:96` | `grep -n TCG_MAX_INSNS ../qemu/sls/*.c` |
@@ -736,6 +736,7 @@ merely unverified.
 make x86-iso                          # staleness guards need a current binary
 tests/stack_frame_budget_check.sh     # stack + frame budget, from the linked binary
 tests/no_hosted_link_check.sh     # freestanding image: 0 undefined symbols, no dynamic section, no interpreter
+tests/code_buffer_budget_check.sh # code buffers link at their declared budgets (32 MiB / 4 MiB) and are distinct
 size my_sls_kernel.bin                # text / data / bss
 readelf -lW my_sls_kernel.bin         # memsz — the number that matters for footprint
 nm --size-sort -S my_sls_kernel.bin | tail -20
