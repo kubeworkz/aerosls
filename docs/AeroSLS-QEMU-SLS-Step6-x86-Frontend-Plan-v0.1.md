@@ -502,6 +502,35 @@ replacement dropped the closing RESULT64/RESULT32 lines and the
 launcher object failed to compile — caught by the build, fixed in
 seconds.)
 
+**Iteration 10 (2026-08-12): the first MSR instruction — `rdmsr` on
+MSR_EFER, helper_rdmsr (misc_helper.c).** gen_RDMSR (emit.c.inc) emits
+gen_helper_rdmsr, which was a macro-generated halting stub (the
+DEF_HELPER machinery emits every unlisted helper with a body that halts
+naming itself). Upstream's body routes through
+cpu_svm_check_intercept_param and the APIC; this build has neither, so
+the modelled set is the plain env-backed MSRs — EFER, the SYSENTER
+triplet, STAR, PAT, PKRS, VM_HSAVE_PA, PERF_STATUS (a constant), and
+under TARGET_X86_64 the long-mode pointers (LSTAR/CSTAR/FMASK/FSBASE/
+GSBASE/KERNELGSBASE) and TSC_AUX — and anything else halts naming the
+MSR rather than upstream's silent val=0. The exit convention is the
+verbatim one: env->regs[R_EAX] = lo, env->regs[R_EDX] = hi. The guest
+(v10, 1116 bytes) reads EFER three times — the launcher seeds
+EFER = LME|LMA (0x500) — checking LMA (bit 10), LME (bit 8), and a zero
+high dword. 630 instructions to HLT, `msr=0x10101` bit-for-bit, every
+prior check intact, and `invl`/`paging`/`selfmod` still pass with the
+bench running.
+
+Two build-flow slips on the way, both now fixed for good:
+- The launcher object rule (tcg-objs/%.x86.o: %.c + stamps) did not
+  depend on guest-bytes.h, so a header-only regen silently shipped the
+  previous guest — the fixture printed the new msr= field with the old
+  1001-byte guest (garbage in the unwritten RESULT_MSR slot, caught
+  instantly). Added a dependency-only rule
+  `tcg-objs/sls-launcher.x86.o: ../qemu/sls/guest/guest-bytes.h`;
+- a mid-flow cp clobbered the freshly regenerated header with the stale
+  staging copy. The regen now writes the real path and staging is
+  synced FROM it.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
