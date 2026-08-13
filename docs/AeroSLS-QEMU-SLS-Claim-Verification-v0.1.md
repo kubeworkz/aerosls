@@ -57,6 +57,7 @@ command beside it is a number nobody can re-check.
 | 89 host test files | session record | **89** | `ls tests/*_host_test.c \| wc -l` |
 | Stack is 1 MiB | `boot.asm` | **1,048,576 bytes**, read from the linked binary | `tests/stack_frame_budget_check.sh` |
 | Two nodes booted from one image seed differently | `entropy_boot_diversity_check.sh` (GUARD-KIND: runtime — needs a live cluster, so it is owed on build hosts) | **3/3 distinct on 2026-08-13** — live 3-node run (512 MiB/node, TCG, no KVM): `cac65cf8…` / `bc2da14b…` / `091bb9b4…` | `./run-cluster.sh --nodes 3`, then `AEROSLS_TOKEN=<token> tests/entropy_boot_diversity_check.sh` |
+| Kernel image is freestanding — no glibc, no user space | checked at the link, not the headers | **0 undefined symbols, no `.dynamic`, no `PT_INTERP` on 2026-08-13** — verified on the shim-built `my_sls_kernel.bin` | `tests/no_hosted_link_check.sh` |
 
 ---
 
@@ -734,6 +735,7 @@ merely unverified.
 ```bash
 make x86-iso                          # staleness guards need a current binary
 tests/stack_frame_budget_check.sh     # stack + frame budget, from the linked binary
+tests/no_hosted_link_check.sh     # freestanding image: 0 undefined symbols, no dynamic section, no interpreter
 size my_sls_kernel.bin                # text / data / bss
 readelf -lW my_sls_kernel.bin         # memsz — the number that matters for footprint
 nm --size-sort -S my_sls_kernel.bin | tail -20
