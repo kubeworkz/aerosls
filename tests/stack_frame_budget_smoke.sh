@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # tests/stack_frame_budget_smoke.sh — proves the stack-frame-budget
-# guard's teeth bite, by planting a frame that exceeds the hard-fail line
-# and asserting the guard fails on it.
+# guard's teeth bite. Two sets of teeth, both asserted here:
+#   FRAME tier: a planted frame above the hard-fail line makes the guard
+#     fail (exit 1) naming it.
+#   SWEEP tier: the 0b staleness sweep must IGNORE untracked sources newer
+#     than the binary (they never reach the kernel build -- the rowstore_io
+#     harness flaked exactly that way) while still ABORTING on a TRACKED
+#     source newer than the binary, which is the real stale-binary signal.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # tests/stack_frame_budget_check.sh asserts the RELATIONAL property that
@@ -50,7 +55,13 @@ TOOTH=kernel/zz_frame_tooth.c
 [ -f "$KERNEL" ] || { echo "ABORT: $KERNEL not found — run 'make' first (build-host smoke)" >&2; exit 2; }
 command -v nm >/dev/null || { echo "ABORT: nm not found (binutils)" >&2; exit 2; }
 
-trap 'rm -f "$TOOTH"' EXIT
+# Sweep-teeth state: the tracked source the STALE test flips, its original
+# mtime (so the trap can put it back on any exit), and the untracked plant.
+TRACKED_SRC=arch/x86/boot.asm
+TRACKED_MTIME="$(stat -c %y "$TRACKED_SRC" 2>/dev/null || true)"
+UNT_SRC=tests/zz_sweep_untracked.c
+
+trap 'rm -f "$TOOTH" "$UNT_SRC"; [ -n "${TRACKED_MTIME:-}" ] && touch -d "$TRACKED_MTIME" "$TRACKED_SRC" 2>/dev/null || true' EXIT
 
 SB="$(nm "$KERNEL" | awk '$3=="stack_bottom"{print $1}')"
 ST="$(nm "$KERNEL" | awk '$3=="stack_top"{print $1}')"
@@ -84,6 +95,49 @@ else
     echo "TOOTH FAIL over-budget frame — guard rc=$rc, expected failure '$expected'"
     printf '%s\n' "$out" | sed 's/^/           /'
     fails=$((fails + 1))
+fi
+
+# ─── SWEEP teeth: the 0b staleness sweep, in both directions ───────────────
+# The sweep used to be `find .`, so an untracked .c/.h/.asm ANYWHERE newer
+# than the binary aborted the guard -- including in-flight host-test
+# harnesses and editor-saved scratch that never reach the kernel build
+# (tests/rowstore_io_host_test.c cost exactly that round). It now sweeps
+# git-tracked files only. Two assertions lock both directions:
+#   1. an UNTRACKED .c newer than the binary must be ignored (guard rc=0)
+#   2. a TRACKED source newer than the binary must still abort, NAMING the
+#      file (guard rc=2) -- losing that signal would let a stale binary
+#      through the gate, which is the exact failure this whole guard exists
+#      to stop (a two-week-old binary judged against current sources).
+printf 'int zz_sweep_untracked;\n' > "$UNT_SRC"
+touch -d '+5 seconds' "$UNT_SRC"   # strictly newer than the binary
+
+out="$(bash "$guard" 2>&1)"
+rc=$?
+rm -f "$UNT_SRC"
+
+if [ "$rc" -eq 0 ]; then
+    echo "SWEEP OK   untracked .c newer than the binary -- ignored, guard passes"
+else
+    echo "SWEEP FAIL untracked .c newer than the binary -- guard rc=$rc, expected pass"
+    printf '%s\n' "$out" | sed 's/^/           /'
+    fails=$((fails + 1))
+fi
+
+if [ ! -f "$TRACKED_SRC" ]; then
+    echo "STALE ABORT $TRACKED_SRC missing (broken checkout?)"
+    fails=$((fails + 1))
+else
+    touch -d '+5 seconds' "$TRACKED_SRC"   # the real stale-binary signal
+    out="$(bash "$guard" 2>&1)"
+    rc=$?
+    touch -d "$TRACKED_MTIME" "$TRACKED_SRC" 2>/dev/null
+    if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qF "$TRACKED_SRC"; then
+        echo "STALE OK   tracked source newer than the binary -- aborted, naming it"
+    else
+        echo "STALE FAIL tracked source newer than the binary -- guard rc=$rc, expected abort naming $TRACKED_SRC"
+        printf '%s\n' "$out" | sed 's/^/           /'
+        fails=$((fails + 1))
+    fi
 fi
 
 # Final restore check — prove the tree is byte-identical again, so this
