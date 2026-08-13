@@ -462,6 +462,25 @@ running. All three instructions (MOV r64,CR0 / MOV CR0,r64 / CLTS) are
 chk(cpl0) in the decoder; the guest runs at CPL 0, and the write->read->
 clear round-trip through env->cr[0] crosses two block ends.
 
+**Iteration 8 (2026-08-12): the carry path — helper_cc_compute_c on the
+DYNAMIC boundary, another no-helper round.** The cc core is fully real
+(iterations 3-4), and gen_prepare_eflags_c (translate.c) computes CF
+INLINE for every concrete CC_OP — SUB/ADD via LTU compares, SHL via the
+top bit of cc_src, SAR via bit 0 — so helper_cc_compute_c runs only on
+CC_OP_DYNAMIC. That is exactly what a jcc sees as the FIRST
+flag-consuming instruction of a fresh TB: i386_tr_init_disas_context
+seeds cc_op=DYNAMIC with cc_op_dirty=false, so gen_update_cc_op does not
+overwrite the env's stored op, and the helper resolves CF against the
+previous block's cc_dst/cc_src/cc_op. The guest forces it: `shl` that
+sets CF (CC_OP_SHLQ in env), `clts` to end the block, then a jc at the
+head of the next TB. Three markers in RESULT_CF: jc taken with CF=1,
+jnc taken with CF=0 (both through the helper on DYNAMIC), and an
+add-wrap (0xFFFF..+1, CF=1) feeding `adc $0` in the same block for the
+inline carry-IN path. 528 instructions to HLT, `cf=0x10101` bit-for-bit
+the C expectation, every prior check intact (movsb, stos, cmps, popf,
+sahf/lahf, cli/sti, clts, DF-set backward copy, 62 tcache hits), and
+`invl`/`paging`/`selfmod` still pass with the bench running.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
