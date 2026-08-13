@@ -404,6 +404,44 @@ intact (movsb, stos, cmps ECX/ZF, popf, DF-set backward copy, 62 tcache
 hits), and `invl`/`paging`/`selfmod` still pass with the bench running. All
 diagnostics removed before commit.
 
+**Iteration 6 (2026-08-12): `cli`/`sti` — the interrupt-flag write path,
+and a second no-helper round.** Like LAHF/SAHF, CLI/STI are INLINE TCG in
+this QEMU: gen_CLI/gen_STI (emit.c.inc) call gen_reset_eflags/gen_set_eflags
+(translate.c), a read-modify-write of the IF bit (0x200) in env->eflags —
+there is no `helper_cli`/`helper_sti` anywhere in target/ or sls/. STI
+additionally ends the TB (DISAS_EOB_INHIBIT_IRQ), which i386_tr_tb_stop
+handles inline (gen_set_hflag(HF_INHIBIT_IRQ_MASK) + exit_tb); the launcher
+ignores is_jmp and just executes, so the only effect is that everything
+after an sti decodes in a fresh block. The gate is the STATIC-flag
+plumbing: IF lives in env->eflags while the CC bits live in cc_src under
+cc_op, so a pushfq read-back (helper_read_eflags, real since iteration 3)
+must see the written IF bit, and a jcc after cli/sti must still compute
+from the lazy cc state. The guest proves four things: IF=1 after sti and
+IF=0 after cli (both read back through pushfq), and a ZF=1 from `test`
+still driving jz across sti (which ends the block) and across cli (which
+does not). 489 instructions to HLT, `if=0x01010101` bit-for-bit the C
+expectation, every prior check intact (movsb, stos, cmps ECX/ZF, popf,
+sahf/lahf, DF-set backward copy, 62 tcache hits), and
+`invl`/`paging`/`selfmod` still pass with the bench running. One fixture
+mistake on the way, the same shape as iteration 4's: the expected constant
+dropped the cli_zf bit (0x10101 vs the correct 0x01010101) — the machine
+was right and the fixture was wrong, caught by the failing read-back.
+
+**Build note — the TLS kernel build was broken on `main` by the user's
+in-flight TLS commits, independent of this work:** mbedTLS 3.6.7's public
+headers include `<time.h>` (platform_util.h, under HAVE_TIME_DATE) and
+`<inttypes.h>` (platform_time.h, for mbedtls_ms_time_t), and the
+x86_64-elf freestanding toolchain ships neither — the config comment's
+"the cross-compiler provides one" was never true in this environment. The
+kernel would not link at all (http.c's fresh object referenced the two new
+tls_server renewal symbols). Unblocked by two additive changes in the
+user's TLS area, flagged for their review: `MBEDTLS_PLATFORM_MS_TIME_TYPE_MACRO long long`
+in sls_mbedtls_config.h (skips inttypes.h; long long == int64_t on LP64, so
+mbedtls_ms_time_t is ABI-identical), and a freestanding shim
+`vendor/mbedtls/shim/time.h` (struct tm + time_t — the full C11 nine-field
+layout tls_platform.c's gmtime_r writes) wired into MBEDTLS_INC. The TLS
+files now compile in the kernel build.
+
 **Step 6.5 — Retire or keep `sls-x86-frontend.c`.** If translate.c carries
 everything, our 308-line frontend becomes dead code and should go, or be kept
 deliberately as a fast path with that stated in its header.
