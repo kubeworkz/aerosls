@@ -1568,3 +1568,79 @@ two `ok:` lines, reported as one.
 Third guard in this project shipped toothless and caught. The pattern is now
 consistent enough to state as a rule: **a guard that has never been shown to
 fail is not evidence, it is decoration.**
+
+---
+
+## The browser confirmation, 2026-08-13: both, against an anchor older than the reboot
+
+The persistence section above ended by saying its own result was an inference:
+`--compare` reported *"an existing import still holds"* from two matching
+fingerprints, having never asked a verifier. Two verifiers have now been asked.
+
+**Firefox** (NSS / mozilla::pkix, its own trust store), showing the CA it
+validated against:
+
+```
+Subject / Issuer   CN = AeroSLS node CA, O = AeroSLS   (self-signed, as a root is)
+Not Before         Tue, 11 Aug 2026 23:32:33 GMT
+Not After          Mon, 11 Aug 2031 23:32:33 GMT
+SHA-256            E6:1B:32:32:8C:A5:7F:87:0A:90:B1:EB:8A:6A:CB:CF:F8:7E:F6:D3:58:92:AA:19:66:0…
+```
+
+**Chrome** (BoringSSL over the Windows trust store), showing the certificate it
+received on the live connection to `localhost:8444`:
+
+```
+Issued To          CN = AeroSLS node,    O = AeroSLS
+Issued By          CN = AeroSLS node CA, O = AeroSLS
+Issued  On         Tue, 11 Aug 2026 20:17:17
+Expires On         Thu, 12 Aug 2027 20:17:17
+SHA-256            ba960f59fda4031f97fef305c3512cb15790daff086f6c58c9b790fae07ac2ca
+```
+
+Both quiet, no interstitial, the Navigator rendering.
+
+### What each one independently establishes
+
+- Firefox's fingerprint is a **byte-exact match** for the CA in both captures
+  and therefore for the frame at `PERSIST_TLS_LBA`. Its notBefore plus the
+  24-hour backdate to its notAfter is **1825 days** — `TLS_SERVER_CA_SECONDS`,
+  5 × 365, read off a certificate rather than asserted from a header.
+- Chrome's leaf is a **third distinct leaf**: `ba960f59…` matches neither
+  capture's (`15:EE:36…`, `CF:8D:02…`). Same issuer, new key, another boot.
+  Its window is 365 days past the backdate — `TLS_SERVER_LEAF_SECONDS`, again
+  from the wire.
+- Chrome validating a leaf whose issuer is `AeroSLS node CA` **is** proof it
+  trusts `E6:1B:32:32…`, by construction: the node holds exactly one CA, the
+  one it read off disk, so that is the only key that could have signed what
+  Chrome accepted.
+
+Three of the four constants in this design — the backdate, the leaf lifetime,
+the CA lifetime — have now been confirmed by parsers with no access to the
+constants. That was not planned; it fell out of reading dates in a certificate
+viewer.
+
+### Phase 3's gate, complete
+
+`curl`, Chrome and Firefox all complete a handshake and fetch the Navigator —
+and now they do it **across a reboot, without a re-import**. Two independent
+path builders, two separate trust stores, one anchor that predates the restart.
+
+### Still not shown, and it is the same thing as before
+
+**Entropy.** Every clause above would read identically on a node whose CSPRNG
+was broken. Three green padlocks say the protocol and the certificates are
+conformant; `entropy_boot_diversity_check.sh` is what says the key material is
+unpredictable. §0's argument is untouched by any of this, and a padlock is not
+a substitute for it.
+
+**Trust-store hygiene, now a real finding.** Chrome's Windows store holds
+several stale `AeroSLS node` entries — self-signed, `CA:TRUE`, ~90-day
+lifetimes, one expiring 10 Nov 2026. They are pre-split certificates from the
+era when a single certificate was trying to satisfy both browsers, and the
+first Chrome screenshot taken for this gate was of one of them rather than of
+the live chain. Their private keys died with the boots that made them, so
+nothing can mint against them; the cost is not exposure, it is that a dead
+trust anchor named `AeroSLS node` is exactly what a future debugging session
+will find and believe. They are residue from the re-import-every-boot workflow
+this change exists to end, and clearing them is part of ending it.
