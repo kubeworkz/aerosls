@@ -274,25 +274,84 @@ if ! bash tests/run_guard_smokes.sh; then
     exit 1
 fi
 
+# ─── Who answers health, and how the restart is verified ───────────────────
+# /api/health is served by whatever QEMU holds the forwarded port, so a
+# health answer is only meaningful if it comes from the process this
+# restart just started. A plain "did anything answer?" loop is satisfied by
+# the process being REPLACED: pm2 kills the old QEMU and spawns a new one,
+# and if the old one still holds the port while the new one cannot bind
+# ("Could not set up host forwarding rule 'tcp::3001-:3000'"), the old
+# process keeps answering with a climbing uptime while pm2 crash-loops and
+# eventually gives up (status: errored). That is not theoretical: on
+# 2026-08-13 a deploy printed "[deploy] Deploy succeeded." while no new
+# QEMU was serving at all -- the old process had satisfied the health wait
+# during the restart race.
+#
+# So the pre-restart state is captured first -- the listener PID on the
+# health port AND the kernel's own uptime counter -- and the post-restart
+# loop accepts an answer only when BOTH prove it is a different, freshly
+# booted process. Both identifiers are RELATIONAL (no absolute thresholds):
+# the new listener must not be the old PID, and the answering kernel's
+# uptime must be younger than the one being replaced. When the service was
+# already down before the deploy (no old PID / uptime to compare against),
+# any answering listener is accepted -- the deploy is the only thing that
+# could have started it.
+HEALTH_PORT="$(printf '%s' "$HEALTH_URL" | sed -nE 's#.*:([0-9]+)/.*#\1#p')"
+[ -n "$HEALTH_PORT" ] || HEALTH_PORT="3001"
+
+echo "[deploy] Recording pre-restart state (who answers $HEALTH_URL)..."
+OLD_PID="$(ss -ltnp 2>/dev/null | awk -v p=":$HEALTH_PORT " '$4 ~ p {print $NF}' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)"
+OLD_UPTIME="$(curl -sf --max-time 3 "$HEALTH_URL" 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("uptime_ticks",""))
+except Exception: print("")' 2>/dev/null)"
+echo "[deploy]   pre-restart listener pid: ${OLD_PID:-<none>}, kernel uptime_ticks: ${OLD_UPTIME:-<none>}"
+
 echo "[deploy] Restarting pm2 process '$PM2_APP_NAME'..."
 if ! pm2 restart "$PM2_APP_NAME"; then
     echo "[deploy] FAILED: pm2 restart failed. Check 'pm2 list' -- is PM2_APP_NAME=$PM2_APP_NAME the right process name?"
     exit 1
 fi
 
-echo "[deploy] Waiting for $HEALTH_URL to answer (up to $((HEALTH_RETRIES * HEALTH_RETRY_DELAY_SECS))s)..."
+echo "[deploy] Waiting for $HEALTH_URL to answer from the NEW process (up to $((HEALTH_RETRIES * HEALTH_RETRY_DELAY_SECS))s)..."
 healthy=0
 health_tmp="$(mktemp)"
+last_pid=""
+last_uptime=""
 for i in $(seq 1 "$HEALTH_RETRIES"); do
     if curl -sf --max-time 3 "$HEALTH_URL" > "$health_tmp" 2>/dev/null; then
-        healthy=1
-        break
+        last_pid="$(ss -ltnp 2>/dev/null | awk -v p=":$HEALTH_PORT " '$4 ~ p {print $NF}' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)"
+        last_uptime="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("uptime_ticks",""))
+except Exception: print("")' "$health_tmp" 2>/dev/null)"
+        # The answer must come from a DIFFERENT process than the one being
+        # replaced, and its kernel must be younger. An answer from the old
+        # process is exactly the failure this check exists to catch -- keep
+        # waiting (or time out below).
+        if [ -n "$last_pid" ] \
+           && { [ -z "$OLD_PID" ] || [ "$last_pid" != "$OLD_PID" ]; } \
+           && { [ -z "$OLD_UPTIME" ] || { [ -n "$last_uptime" ] && [ "$last_uptime" -lt "$OLD_UPTIME" ]; }; }; then
+            healthy=1
+            break
+        fi
     fi
     sleep "$HEALTH_RETRY_DELAY_SECS"
 done
 
 if [ "$healthy" -ne 1 ]; then
-    echo "[deploy] FAILED: $HEALTH_URL never answered a healthy response."
+    echo "[deploy] FAILED: $HEALTH_URL did not answer from the NEW process within the window."
+    if [ -n "$last_pid" ]; then
+        echo "[deploy]   Last answer came from pid $last_pid (uptime_ticks ${last_uptime:-?})."
+        if [ "$last_pid" = "$OLD_PID" ]; then
+            echo "[deploy]   That is the SAME process that was being replaced -- the restart"
+            echo "[deploy]   race: the old process kept the port while the new one could not"
+            echo "[deploy]   bind. Check the error log for 'Could not set up host forwarding rule'."
+        elif [ -n "$last_uptime" ] && [ -n "$OLD_UPTIME" ] && [ "$last_uptime" -ge "$OLD_UPTIME" ]; then
+            echo "[deploy]   Its uptime ($last_uptime) is not younger than the pre-restart"
+            echo "[deploy]   kernel's ($OLD_UPTIME) -- it is not the freshly booted process."
+        fi
+    else
+        echo "[deploy]   Nothing answered at all."
+    fi
     echo "[deploy] Last pm2 logs for '$PM2_APP_NAME':"
     pm2 logs "$PM2_APP_NAME" --lines 40 --nostream
     echo "[deploy] The process was restarted but is NOT confirmed healthy -- do not assume this deploy succeeded."
@@ -300,7 +359,7 @@ if [ "$healthy" -ne 1 ]; then
     exit 1
 fi
 
-echo "[deploy] Healthy:"
+echo "[deploy] Healthy (listener pid ${last_pid:-?}, uptime_ticks ${last_uptime:-?}):"
 cat "$health_tmp"
 echo ""
 rm -f "$health_tmp"
