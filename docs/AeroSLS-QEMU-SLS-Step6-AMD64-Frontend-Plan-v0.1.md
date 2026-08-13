@@ -343,8 +343,28 @@ the ELF loader" to serial, and exits 0; the companion dynhello fixture proves PT
 rejection. Both endpoints green in a single boot (22 guest insns, exit_code=0, and the
 reject case rc=-1 with the interpreter named).
 
-**Still owed before a full `gcc -static` glibc binary runs:** the PT_TLS TCB at FS:0
-(static glibc demands tcbhead_t before `__libc_start_main`) and the rest of the shim
+**Update 2026-08-13 (iteration 16): the PT_TLS TCB at FS:0 landed.** The loader's
+Pass 3 copies the PT_TLS template (which the linker parks OUTSIDE every PT_LOAD — the
+fixture's TLS segment is the canonical case), zeroes the .tbss tail, and builds the
+tcbhead_t immediately above the aligned block: tcb=self, a minimal static DTV at
+tp+0x100, self=tp, multiple_threads/gscope_flag zeroed, and fixed stack/pointer
+guards — the exact spot the linker's local-exec tpoffs assume (TP = tls_vaddr +
+round_up(memsz, align)). The launcher threads the loader's thread pointer into the
+CPU reset via sls_guest_tls_fs_base and installs it as env.segs[R_FS].base, so every
+%fs:offset access resolves from the first translated instruction. Two real defects
+surfaced on the way, both of which the -nostdlib fixtures had masked: the loader was
+handing the guest a HOST-space initial RSP (hello.c never touched the stack, so its
+`push`-free _start ran fine; the TLS fixture's first `push %rbx` faulted at
+guest_base + host_va − 8), and the launch-time CPU reset zeroed the entire static CPU
+object, silently wiping a caller's pre-set FS base (the decoder then folded FS base 0
+and the `mov %fs:-16` local-exec read faulted at guest_base − 16). Both fixed and
+verified on hardware: the gate fixture (sls/guest/tls.c, embedded as tls-bytes.h)
+checks .tdata reads back its link-time initializer, .tbss reads back zero, the TCB is
+self-referential (tcb/self/dt at +0/+8/+0x10, block below TP), and exits 0 — 43 guest
+insns, exit_code=0, PASS in the same boot as the elf/elf-reject gates, with the new
+/api/qemu/tls endpoint added to the decoder-build CI gate list.
+
+**Still owed before a full `gcc -static` glibc binary runs:** the rest of the shim
 surface (`brk`/`mmap`/`munmap`→SLS frames, `read`, `futex`, `clock_gettime` as the
 binary demands them) — per the stub-halt discipline, each lands when a fixture calls it.
 

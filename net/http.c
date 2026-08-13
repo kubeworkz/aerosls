@@ -2271,6 +2271,23 @@ static int api_qemu_selfmod_post(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+static int api_qemu_tls_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M5: the PT_TLS gate -- sls/guest/tls.c compiled -static and embedded
+    // by the launcher. The loader must place the TLS template (which the
+    // linker parks OUTSIDE every PT_LOAD), zero .tbss, build the TCB
+    // (tcbhead_t with self/dt/multiple_threads/stack_guard), and the
+    // launcher must install the FS base for the guest's local-exec %fs
+    // reads to land. The guest checks every offset and its own TCB, then
+    // exit_group(0). Same shape as the compiled endpoint.
+    int rc = sls_test_guest_tls();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_sql_post(const char* body, char* buf, int max, uint32_t req_uid) {
     JSONBuf j = { buf, 0, max };
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
@@ -5632,6 +5649,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/selfmod")) {
             blen = api_qemu_selfmod_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/tls")) {
+            blen = api_qemu_tls_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/qemu/compiled")) {
