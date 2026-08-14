@@ -61,6 +61,13 @@
 # be asserting the same shape five times. Strict increase pins that the
 # multi-block-count claim is real.
 #
+# And the block counts are pinned to the measured sequence (1..11 then
+# 13..17 — see the values above for the 12-block gap): a cold sweep whose
+# blocks differ is a stale measurement OR a deliberate translator change.
+# The former must fail loudly; the latter is blessed with
+# --shape '<new sequence>', the explicit acknowledgment that the measured
+# property changed.
+#
 # ─── RAM requirement (a real pitfall, not a footnote) ─────────────────────
 # Must run with -m 1G, the cluster default. The NVMe device's 64-bit BAR
 # lands ABOVE 4 GiB at higher RAM — outside the kernel's identity map — and
@@ -73,8 +80,10 @@
 # ─── Replay mode (how the smoke proves the teeth bite) ────────────────────
 # --replay DIR runs ONLY the validation half against recorded artifacts
 # (cold_sweep.json, checkpoint.json, boot.log, warm_sweep.json) — no boot,
-# no qemu, no ISO. tests/tcache_roundtrip_smoke.sh synthesizes a
-# well-formed artifact set, mutates each assertion input, and asserts the
+# no qemu, no ISO. --shape SEQ (with --replay) replaces the pinned
+# block-count sequence with an explicit one, the documented way to bless a
+# deliberate translator change. tests/tcache_roundtrip_smoke.sh synthesizes
+# a well-formed artifact set, mutates each assertion input, and asserts the
 # guard fails on each — so a regression that makes the guard blind (a wrong
 # field, a dropped grep) fails the smoke instead of passing authority.
 #
@@ -99,11 +108,31 @@ TOK="deadbeef01234567cafebabe76543210"   # dave, DB_ADMIN — kernel/auth.c
 SWEEP="1 65 129 193 257 321 385 449 513 577 641 682 750 833 897 961"
 SWEEP_JSON="[1,65,129,193,257,321,385,449,513,577,641,682,750,833,897,961]"
 
+# ─── The pinned block-count sequence (iteration 37) ────────────────────────
+# The measured shape for the sweep is 1..11 then 13..17 (one TB holds 64
+# instructions, so loads 64k-63 -> k blocks while the program fits one page;
+# a larger program always starts at 13 — the documented 12-block gap). That
+# sequence is PINNED as a second canary: a cold sweep whose blocks differ
+# from the pin is either a stale measurement or a deliberate translator
+# change. The latter is blessed explicitly with --shape '<new sequence>';
+# the former fails loudly. The 12-block gap check below only runs while the
+# default pin is in force — an explicit --shape is the acknowledgment that
+# the measured property changed.
+PINNED_SHAPE="1 2 3 4 5 6 7 8 9 10 11 13 14 15 16 17"
+SHAPE=""
+SHAPE_DEFAULTED=1
 REPLAY=""
-if [ "${1:-}" = "--replay" ]; then
-    REPLAY="${2:-}"
-    [ -d "$REPLAY" ] || { echo "ABORT: --replay dir '$REPLAY' not found" >&2; exit 2; }
-fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --replay) REPLAY="${2:-}"; shift 2 ;;
+        --shape)  SHAPE="${2:-}"; SHAPE_DEFAULTED=0; shift 2 ;;
+        *) echo "ABORT: unknown argument '$1' (usage: $0 [--replay DIR] [--shape '1 2 3 ... 17'])" >&2; exit 2 ;;
+    esac
+done
+[ -z "$SHAPE" ] && SHAPE="$PINNED_SHAPE"
+[ -z "$REPLAY" ] || [ -d "$REPLAY" ] || {
+    echo "ABORT: --replay dir '$REPLAY' not found" >&2; exit 2
+}
 
 command -v python3 >/dev/null 2>&1 || {
     echo "ABORT: python3 not found — the JSON assertions run in python." >&2
@@ -115,10 +144,11 @@ command -v python3 >/dev/null 2>&1 || {
 # line. Missing or unparseable artifacts are failures too — a guard that
 # could not read its inputs must not pass.
 validate() {   # $1 = workdir
-    python3 - "$1" "$SWEEP" <<'PYEOF'
+    python3 - "$1" "$SWEEP" "$SHAPE" "$SHAPE_DEFAULTED" <<'PYEOF'
 import json, os, re, sys
-W, sweep_csv = sys.argv[1], sys.argv[2]
+W, sweep_csv, shape_csv, shape_defaulted = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 expected = [int(x) for x in sweep_csv.split()]
+shape = [int(x) for x in shape_csv.split()]
 fails = []
 
 def art(name):
@@ -243,6 +273,21 @@ if cr is not None and wr is not None:
                              "counts, or the multi-count claim is vacuous"
                              % cold_blocks)
 
+    # ── the pinned block-count sequence (iteration 37) ────────────────────
+    # The measured shape 1..11,13..17 is a canary on the translator's block
+    # split, one level up from the round-trip invariants: a cold sweep whose
+    # blocks differ from the pin means either the sweep values or the
+    # iteration-35 doc are stale, or the translator changed deliberately.
+    # The deliberate path is blessed with --shape '<new sequence>'; anything
+    # else must fail loudly with the exact mismatch so the fix is obvious.
+    if cold_blocks != shape:
+        fails.append("cold sweep blocks %s != pinned shape (%s) -- the measured "
+                     "block-count sequence changed; if this is a deliberate "
+                     "translator change, re-run with --shape '%s' to bless the "
+                     "new sequence, otherwise the sweep values and the "
+                     "iteration-35 doc are stale"
+                     % (cold_blocks, shape, " ".join(str(x) for x in shape)))
+
     # ── the documented 12-block gap (iteration 35) ────────────────────────
     # The bench program can never compile exactly 12 blocks: while it fits
     # one 4 KiB page, blocks == ceil((loads+2)/64) (1..11); any larger
@@ -250,10 +295,13 @@ if cr is not None and wr is not None:
     # at 13. A value reporting 12 therefore means the translator's split
     # changed -- the sweep's value set and the iteration-35 doc are stale,
     # and that must be a loud failure, not a silently-accepted new shape.
-    # (This is a canary on a measured translator property, not a
-    # correctness invariant: the round-trip itself is still asserted per
+    # Runs only under the DEFAULT pin: an explicit --shape is the
+    # acknowledgment that the measured property changed, so a blessed
+    # sequence containing 12 must not be rejected by the stale negative.
+    # (Both are canaries on measured translator properties, not
+    # correctness invariants: the round-trip itself is still asserted per
     # value above.)
-    if 12 in cold_blocks:
+    if shape_defaulted == "1" and 12 in cold_blocks:
         fails.append("cold sweep contains a 12-block value (%s) -- the "
                      "documented page-crossing gap says 12 is unattainable with "
                      "the bench's straight-line shape; if the translator changed, "

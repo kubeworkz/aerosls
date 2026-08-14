@@ -1021,6 +1021,31 @@ live 16-value round-trip still green with the canary silent, source
 smokes 15/15, guard smokes 20/20. aerosls2-only commit.
 
 
+**Update 2026-08-14 (iteration 37, M8): the block-count sequence is now
+pinned end to end, with an explicit override for deliberate changes.** The
+iteration-36 canary pinned only the negative — no sweep value may report 12
+blocks. That left the rest of the measured shape (1..11, 13..17) enforced
+only by the strict-increase check, which says "many counts, in order" but
+not "these counts". A translator change that shifted the split 11 -> 13
+could have kept the sweep monotonic and still silently stranded the doc.
+
+The guard now compares the cold sweep's blocks to the pinned default
+sequence `1 2 3 4 5 6 7 8 9 10 11 13 14 15 16 17` and fails on any
+mismatch with the exact block lists. The deliberate-change path is an
+explicit `--shape '<new sequence>'` flag: it replaces the pin, so a real
+translator change is blessed by naming the new measurement instead of by
+deleting the canary (the override also disarms the iteration-35 12-gap
+check, which would otherwise reject a legitimately-reachable 12). The
+smoke grew three teeth: 16 mutates value 16's blocks 17 -> 18 (warm hits
+follow, so the round-trip still agrees internally and only the pin fires);
+17 proves `--shape` ACCEPTS that blessed sequence; 18 proves a wrong
+`--shape` still fails exactly like the default pin. **Measured:** smoke
+2 accept + 17 reject teeth all bite, live 16-value round-trip green with
+the default pin silent, guard gate 19/19 + the owed entropy runtime skip,
+guard smokes 20/20, source smokes 15/15. aerosls2-only commit.
+
+
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.

@@ -45,6 +45,13 @@
 #   14. cold sweep with a stray value  -> the shape-match tooth (length)
 #   15. a value claims 12 blocks       -> the documented unattainable-count
 #                                         tooth (the page-crossing gap)
+#   16. value 16's blocks 17 -> 18     -> the pinned-sequence canary (the
+#                                         round-trip still agrees internally,
+#                                         only the pin may fire)
+#   17. --shape blesses 17 -> 18       -> the deliberate-change override
+#                                         ACCEPTS the blessed sequence
+#   18. --shape names 19 instead       -> the override still asserts the
+#                                         sequence it was given
 #
 # Exit: 0 if every tooth bit, 1 otherwise, 2 if python3 is missing.
 set -u
@@ -241,9 +248,51 @@ sed -i '13s/"blocks":13/"blocks":12/' "$TD/art/cold_sweep.json"
 sed -i '13s/"tcache_hits":13/"tcache_hits":12/' "$TD/art/warm_sweep.json"
 tooth "15 (unattainable 12)" "12 is unattainable"
 
+# ─── Tooth 16: the full block-count sequence is pinned (iteration 37). ─────
+# The 12-gap tooth pins one negative; the sequence canary pins the whole
+# measured shape 1..11,13..17. Value 16's blocks 17 -> 18 keeps the sweep
+# strictly increasing (18 > 16) and the round-trip internally consistent
+# (warm hits move WITH cold blocks) with no 12 in sight -- so ONLY the
+# sequence pin may fire.
+make_artifacts "$TD/art"
+sed -i '17s/"blocks":17/"blocks":18/' "$TD/art/cold_sweep.json"
+sed -i '17s/"tcache_hits":17/"tcache_hits":18/' "$TD/art/warm_sweep.json"
+tooth "16 (shape off by one)" "pinned shape"
+
+# ─── Tooth 17: --shape blesses a deliberate translator change. ─────────────
+# Same mutated artifacts as tooth 16, now blessed by an explicit --shape:
+# the guard must ACCEPT the new sequence. Without this escape hatch the pin
+# could only be deleted, never updated, and the canary would teach everyone
+# to remove canaries. An override is the documented way to say "this is the
+# new measured shape".
+if out="$(bash "$guard" --replay "$TD/art" --shape "1 2 3 4 5 6 7 8 9 10 11 13 14 15 16 18" 2>&1)"; then
+    echo "TOOTH 17 OK   (--shape override accepts a blessed sequence)"
+else
+    echo "TOOTH 17 FAIL  --shape rejected a sequence the caller blessed:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+    fails=$((fails + 1))
+fi
+
+# ─── Tooth 18: --shape still asserts the sequence it was given. ────────────
+# The override is a blessing, not a bypass: a shape that does not match the
+# artifacts must fail exactly like the default pin would.
+make_artifacts "$TD/art"
+sed -i '17s/"blocks":17/"blocks":18/' "$TD/art/cold_sweep.json"
+sed -i '17s/"tcache_hits":17/"tcache_hits":18/' "$TD/art/warm_sweep.json"
+out="$(bash "$guard" --replay "$TD/art" --shape "1 2 3 4 5 6 7 8 9 10 11 13 14 15 16 19" 2>&1)"
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pinned shape"; then
+    echo "TOOTH 18 OK   (--shape still asserts its sequence)"
+else
+    echo "TOOTH 18 FAIL  --shape with a wrong sequence did not fail for the "
+    echo "               sequence reason (rc=$rc):"
+    printf '%s\n' "$out" | sed 's/^/      /'
+    fails=$((fails + 1))
+fi
+
 if [ "$fails" -eq 0 ]; then
     echo
-    echo "PASS  tcache_roundtrip guard: 1 accept + 15 reject teeth all bite"
+    echo "PASS  tcache_roundtrip guard: 2 accept + 17 reject teeth all bite"
     exit 0
 fi
 
