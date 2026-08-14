@@ -420,9 +420,27 @@ gates, with the new /api/qemu/futex endpoint added to the decoder-build CI gate 
 
 **The M5 shim surface is now complete.** Every Linux-compat syscall the freestanding
 fixtures demand — write, exit/exit_group, brk, mmap, munmap, read, clock_gettime,
-futex — is real, verified on hardware, and gated in CI; the remaining milestones are
-M6 (SSE2 scalar, dropping the -mno-sse -msoft-float crutch) and M7 (fault semantics
-delivered to C).
+futex — is real, verified on hardware, and gated in CI.
+
+**Update 2026-08-13 (iteration 20, M6): the SSE2 scalar slice.** The M1-M5
+-mno-sse -msoft-float crutch is dropped: sls/guest/sse2.c builds with the plain
+x86-64 recipe (-fno-math-errno so __builtin_sqrt lowers to sqrtsd instead of a
+libm call), and every operand is a runtime volatile so gcc emits real SSE2
+instructions instead of constant-folding. The decoder already advertised
+CPUID SSE/SSE2 and decodes the aligned 128-bit load/store path inline; the
+helpers behind the scalar ops are implemented in the guest-helper layer with
+host IEEE double math (this build has no softfloat, so the four basic ops +
+sqrt of finite values round identically to round-to-nearest-even; MXCSR is
+stored and round-tripped but the host FPU stays round-to-nearest — documented,
+not silent). The gate fixture verifies the 128-bit aligned constant store (the
+movdqa/movaps path that #UD'd under the futex fixture), scalar
+add/sub/mul/div/sqrt with exact IEEE results, int<->double converts (32- and
+64-bit sources), the float path + float->double widen, ucomisd branches, and
+the MXCSR round-trip — PASS in the same boot as the compiled/elf/elf-reject/
+tls/brkmmap/rdclock/futex gates, with the new /api/qemu/sse2 endpoint added to
+the decoder-build CI gate list. M6's permanent-unsupported remainder (packed
+vector, x87, AVX) stays as halting stubs, which become the documented spec of
+what this build does not run at M7.
 
 ### M6 — SSE2 scalar slice.
 

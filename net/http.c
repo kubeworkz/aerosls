@@ -2305,6 +2305,24 @@ static int api_qemu_futex_post(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+static int api_qemu_sse2_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M6: the SSE2 scalar slice gate -- sls/guest/sse2.c compiled
+    // -static WITHOUT the M1-M5 -mno-sse -msoft-float crutch and
+    // embedded by the launcher. The x86-64 compiler ABI is SSE2 for
+    // scalar floating point, so the fixture's double/float expressions
+    // are real SSE2 instructions with runtime (volatile) operands: the
+    // 128-bit aligned store, scalar add/sub/mul/div/sqrt, int<->double
+    // converts, the float path, ucomisd branches, and the MXCSR
+    // round-trip, then exit_group(0).
+    int rc = sls_test_guest_sse2();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_qemu_brkmmap_post(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     // M5: the guest-heap shim gate -- sls/guest/brkmmap.c compiled
@@ -5712,6 +5730,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/rdclock")) {
             blen = api_qemu_rdclock_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/sse2")) {
+            blen = api_qemu_sse2_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/qemu/futex")) {
