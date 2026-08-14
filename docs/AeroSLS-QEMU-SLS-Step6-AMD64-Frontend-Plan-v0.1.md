@@ -849,6 +849,44 @@ and rep-prefixed ops its dispatcher never handled (iteration-26 doc).
    smokes pass. The one M8 item not taken here is the size + tcache
    measurement, which is its own step (the Phase 2 round-trip).
 
+**Update 2026-08-14 (iteration 32, M8): the size + tcache measurement
+is DONE — the Phase 2 cache round-trips 64-bit decoder TBs across a
+reboot.** Both halves of the M8 gate's second bullet, measured on the
+default build:
+
+1. **Image size (readelf -lW my_sls_kernel.bin, decoder default):**
+   LOAD0 file 0x2DD9A4 (3,004,836 B, text+rodata+data), LOAD1 .bss
+   memsz 0xDC78DA0 (231,181,728 B), **total memsz 0xDF85744 =
+   234,186,564 B = 223.34 MiB**. Step 6's footprint warning quoted
+   221.6 MiB for the pre-decoder image; the decoder objects
+   (i386-translate, i386-helper-stubs, i386-codefetch, i386-stub-class,
+   translator) add **+1.74 MiB**. The .bss number is dominated by the
+   two translation-cache buffers the code_buffer_budget guard pins (32
+   MiB sls_code_buffer + 4 MiB qemu_sls_codebuf), both at linker-fixed
+   VAs — the invariant the tcache's reserve/commit depends on.
+2. **The tcache round-trip, on the decoder build.** The Phase 2
+   results (plan §3b-3e) predate the M8 flip; this re-measures the
+   same chain with QEMU's decoder as the translator (the TBs are the
+   decoder's 64-bit TCG output, generated at their permanent .bss
+   address by reserve/commit):
+   ```
+   boot 1:  [QEMU-SLS TCACHE] no snapshot — cold start
+   bench:   blocks=8 insns=502 code_bytes=8105 hits=0 miss=8 cold=true
+   checkpt: synced: 8 TBs, 8174 code bytes        ({"status":0,"seq":1})
+   <reboot via /api/node/reboot>
+   boot 2:  [QEMU-SLS TCACHE] warm start — codebuf_used=8174, codebuf=0x7ae0000
+   bench:   blocks=0 insns=502 code_bytes=0 translate_cycles=0 hits=8 miss=0
+            cold=false arena_consumed=0
+   ```
+   **8/8 hits, 0 blocks compiled, identical 502-insn guest result** —
+   100% of translation eliminated on the warm boot, exactly the Phase 2
+   headline, now on the default build. The measurement must run with
+   the cluster's 1G RAM config: at 4G the NVMe 64-bit BAR lands at
+   0xC000000000, above the kernel's 4 GiB identity map, and the whole
+   persistence stack (tcache, stream, persist) honestly cold-starts
+   with "[NVME] MMIO above 4 GiB" — the loud message, not a silent
+   degradation.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
