@@ -545,6 +545,29 @@ The plan's later milestones -- syscall
 interception, and the permanent-unsupported list -- remain, with this delivery
 path as their base.
 
+**Update 2026-08-14 (iteration 25, M8.2): the TSS-family faults #TS and #NP
+delivered as first-class classes.** M8.1's `helper_ltr` folded a busy TSS into
+#GP, and #NP was only ever produced as a record; this iteration makes both
+real deliveries with their selector error codes. `helper_ltr` now follows the
+SDM exactly: an S=1 descriptor or a non-64-bit-TSS type is #GP(selector); a
+BUSY 64-bit TSS (type 11 -- the M8.1 load marks the fixture's GDT[2] busy) is
+#TS(selector) (upstream QEMU folds this into #GP; this build diverges toward
+hardware); a NOT-present descriptor is #NP(selector) (now via the proper
+EXCP0B_NOSEG macro). Two new fixture entries provoke them at CPL 0 and deliver
+through guest IDT gates at vectors 10 and 11, mirroring the #GP-SEL flow:
+`_ts` calls `setup_tss` (first ltr on 0x10 succeeds) then ltr's 0x10 again --
+the descriptor is now type 11, so #TS(0x10); `_np` ltr's a second 64-bit TSS
+descriptor the setup builds at GDT[4..5] (selector 0x20) with P=0 -- #NP(0x20).
+A 64-bit TSS descriptor spans two GDT slots, so the non-present twin gets its
+own 16 bytes rather than reusing GDT[3] (the live TSS's high half). The
+decoder fix the faulting-RIP needed: `gen_LTR` never synced eip before the
+helper call, so a faulting ltr recorded the block-start address -- the same
+gap M8 closed for gen_DIV and the far transfers; `gen_update_eip_cur` now
+precedes `gen_helper_ltr`, and the deliveries show the exact ltr addresses
+(0x401609 / 0x401679). The gate asserts the frame error codes (0x10 for #TS,
+0x20 for #NP), handler status 2, and recovery_ok -- all nine fixtures green in
+one boot, the faults gate now eight cases.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
