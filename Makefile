@@ -457,13 +457,20 @@ $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP) $(SLS_STAMP)
 # ─── Step 6.2: QEMU's own x86-64 guest frontend ──────────────────────────────
 # docs/AeroSLS-QEMU-SLS-Step6-x86-Frontend-Plan-v0.1.md.
 #
-# OFF BY DEFAULT, and it must stay that way until Step 6.4. translate.c
-# references 765 helper_* symbols against sls-helper-stubs.c's ~130, so linking
-# it today fails. Gating it keeps the default build -- and therefore deploy.sh
-# -- exactly as it was, while the work proceeds behind a flag:
+# M8 (Step 6.4): the decoder is the DEFAULT build. QEMU's own x86-64 guest
+# frontend (translate.c through the Step 6.3 translator loop) is what
+# deploy.sh builds and what runs in production, and the full M1-M8.5 gate
+# (compiled elf elf-reject tls brkmmap rdclock futex sse2 faults) is the
+# default build's regression. The retired 18-opcode C frontend remains
+# selectable as a documented fixture:
 #
-#   make x86-iso                        # unchanged, our 18-opcode frontend
-#   make x86-iso SLS_X86_FRONTEND=on    # QEMU's decoder; will not link yet
+#   make x86-iso                        # QEMU's decoder (default)
+#   make x86-iso SLS_X86_FRONTEND=off   # the retired 18-opcode frontend
+#
+# The legacy config is kept compiling by CI (decoder-build's legacy-link
+# step); it can no longer run the current fixture images, which begin with
+# endbr64 (0xf3) and rep-prefixed ops the 18-opcode dispatcher never handled
+# (iteration-26 doc).
 #
 # EXPLICIT PATH, NOT VPATH, and deliberately so. There are 20+ files named
 # translate.c in the QEMU tree, one per guest architecture. Resolving this
@@ -476,7 +483,7 @@ $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP) $(SLS_STAMP)
 # exec/helper-head.h.inc, which is meaningful only for per-target files;
 # defining it globally would apply a guest-word-size assumption to the
 # generic TCG core, where it has no business.
-SLS_X86_FRONTEND ?= off
+SLS_X86_FRONTEND ?= on
 ifeq ($(SLS_X86_FRONTEND),on)
 TARGET_OBJS = tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o \
               tcg-objs/i386-helper-stubs.x86.o tcg-objs/i386-codefetch.x86.o \

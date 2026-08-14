@@ -815,6 +815,40 @@ NaN-aware fmax probe that stays libm-free via `__builtin_isnan`
    96/96. The one SSE compare family member the slice has not taken is
    the vector (non-scalar) cmp forms — still §4.5-owed, still classified.
 
+**Update 2026-08-14 (iteration 31, M8): the 18-opcode frontend is
+RETIRED — the decoder is the default build.** Step 6.5's decision,
+forced by §3, is landed. `make x86-iso` now runs QEMU's real x86-64
+decoder with no flag — which is also what deploy.sh ships and what the
+kernel-guards/verify CI jobs gate — and the full M1–M8.5 corpus
+(compiled elf elf-reject tls brkmmap rdclock futex sse2 faults) is the
+default build's regression, verified 9/9 green in one boot on a fresh
+no-flag build. The retired 18-opcode C frontend remains selectable as a
+documented fixture (`make x86-iso SLS_X86_FRONTEND=off`) and is kept
+from rotting by a link-only step in CI's decoder-build job; it can no
+longer run the current fixture images, which begin with endbr64 (0xf3)
+and rep-prefixed ops its dispatcher never handled (iteration-26 doc).
+
+1. **The flip surface.** `SLS_X86_FRONTEND ?= on` in the Makefile; the
+   Step 6.2 comment block rewritten to name the decoder the default and
+   the legacy config the fixture; CI's decoder-build job builds the
+   default ISO (its explicit `SLS_X86_FRONTEND=on` removed as
+   redundant) and gains the legacy-link step; the kernel-guards job
+   comment updated to say the default build is the decoder. No guard or
+   deploy.sh change was needed — none referenced the frontend config.
+2. **The stamp path is exercised both ways.** The SLS_STAMP mechanism
+   rewrites `.sls-frontend.stamp` on every config change and forces the
+   TCG-object rebuild, so a plain rebuild after the flip picks up the
+   decoder objects and the legacy-link step's flip back to `off` (then
+   back to `on`) proves the flip is not a one-way ratchet. Verified
+   locally: default build links the decoder objects (i386-translate,
+   i386-helper-stubs, i386-codefetch, i386-stub-class) and boots the
+   9/9 gate; `SLS_X86_FRONTEND=off` still compiles and links.
+3. **The default build's guards are green.** Against the no-flag image:
+   `run_checks.sh --require-all` 18 passed / 0 failed (entropy
+   diversity still owed — needs a live cluster) and all 19 guard
+   smokes pass. The one M8 item not taken here is the size + tcache
+   measurement, which is its own step (the Phase 2 round-trip).
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.

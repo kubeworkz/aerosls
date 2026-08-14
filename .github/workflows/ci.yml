@@ -220,7 +220,9 @@ jobs:
     # hosted leak (-lc in the link, a hosted object linked in, a weak
     # undefined resolved to 0) fails the gate instead of halting a node at
     # runtime. This job builds the real shipping artifact (the bootable
-    # ISO, via make x86-iso) and runs the deploy gate's two commands --
+    # ISO, via make x86-iso -- since M8 the default build is the decoder,
+    # SLS_X86_FRONTEND=on, the same frontend deploy.sh ships) and runs
+    # the deploy gate's two commands --
     # run_checks.sh --require-all and run_guard_smokes.sh -- so all
     # eighteen guards pass AND all nineteen smokes prove their teeth on
     # every push (the one runtime guard, entropy_boot_diversity, still
@@ -456,20 +458,19 @@ jobs:
         working-directory: aerosls2
 
   decoder-build:
-    # The kernel-guards job builds the SHIPPING config (SLS_X86_FRONTEND
-    # off -- what deploy.sh builds and what runs in production). The
-    # decoder build (SLS_X86_FRONTEND=on, QEMU's real x86-64 frontend
-    # driving the Step 6.3 translator loop) is a SEPARATE configuration
-    # with its own TCG_CFLAGS and its own object list, and launcher code
-    # must link in BOTH. It is not enough to be right in the config you
-    # happened to test locally: the M5 exit-status global landed inside
-    # the frontend ifdef, the decoder build linked fine, and the default
-    # build failed to link at deploy time -- the exact gap this job
-    # closes. Building both configs on every push means a launcher
-    # change that breaks one of them fails CI instead of the first
-    # deploy after it lands.
+    # M8 (Step 6.4): the decoder is the DEFAULT build -- this job builds
+    # the shipping config (what deploy.sh builds and what runs in
+    # production) and gates it with the M5 guest fixtures. The retired
+    # 18-opcode frontend (SLS_X86_FRONTEND=off) is a documented fixture
+    # kept compiling by the legacy-link step at the end of this job; it
+    # can no longer run the current fixture images (endbr64 / rep
+    # prefixes), so the check is link-only. It is not enough to be
+    # right in the config you happened to test locally: the M5
+    # exit-status global landed inside the frontend ifdef, the decoder
+    # build linked fine, and the default build failed to link at deploy
+    # time -- the exact gap this job closes.
     #
-    # The decoder build is also where the M5 gate lives: /api/qemu/elf
+    # The M5 gate lives here: /api/qemu/elf
     # (a real `gcc -static` ELF64 parsed and placed by sls-elf64-loader,
     # run to exit_group(0) through the Linux-compat syscall shim) and
     # /api/qemu/elf-reject (a PT_INTERP dynamic binary must be refused
@@ -613,8 +614,8 @@ jobs:
       - name: Kernel build tools (nasm, grub, qemu)
         run: sudo apt-get update && sudo apt-get install -y nasm grub-pc-bin mtools xorriso qemu-system-x86
 
-      - name: Build the decoder kernel ISO (SLS_X86_FRONTEND=on)
-        run: make X86_CC=gcc X86_LD=ld SLS_X86_FRONTEND=on x86-iso
+      - name: Build the default kernel ISO (the decoder, SLS_X86_FRONTEND=on)
+        run: make X86_CC=gcc X86_LD=ld x86-iso
         working-directory: aerosls2
 
       - name: Boot the decoder ISO and run the Step 6.4/M5 guest fixtures
@@ -673,6 +674,19 @@ jobs:
           }
           [ "$fail" -eq 0 ] || exit 1
           echo "OK: decoder build links and boots; compiled + elf + elf-reject fixtures all pass"
+        working-directory: aerosls2
+
+      - name: Legacy frontend still links (SLS_X86_FRONTEND=off, link-only fixture)
+        run: |
+          # The retired 18-opcode frontend is a documented fixture; the
+          # flip cannot silently rot it. Link-only: the current fixture
+          # images begin with endbr64 (0xf3) / rep prefixes the legacy
+          # dispatcher never handled (iteration-26 doc), so it must
+          # compile and link but is not expected to run them. The
+          # SLS_STAMP mechanism forces the object rebuild on the config
+          # flip, so this step also exercises that path.
+          make X86_CC=gcc X86_LD=ld SLS_X86_FRONTEND=off x86-iso
+          echo "OK: legacy frontend (SLS_X86_FRONTEND=off) still links"
         working-directory: aerosls2
 
   riscv-guards:
