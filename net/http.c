@@ -2271,6 +2271,23 @@ static int api_qemu_selfmod_post(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+static int api_qemu_brkmmap_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M5: the guest-heap shim gate -- sls/guest/brkmmap.c compiled
+    // -static and embedded by the launcher. The guest demands brk
+    // (syscall 12), mmap (9, the 6-arg R10/R8/R9 form) and munmap (11)
+    // from the Linux-compat shim: grow/shrink the break with a pattern
+    // round-trip, map an anonymous private page (zero-read, write,
+    // read-back), unmap it (a double-unmap must fail), map again, then
+    // exit_group(0). Same shape as the other qemu gates.
+    int rc = sls_test_guest_brkmmap();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_qemu_tls_post(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     // M5: the PT_TLS gate -- sls/guest/tls.c compiled -static and embedded
@@ -5653,6 +5670,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/tls")) {
             blen = api_qemu_tls_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/brkmmap")) {
+            blen = api_qemu_brkmmap_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/qemu/compiled")) {

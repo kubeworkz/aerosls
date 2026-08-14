@@ -372,8 +372,23 @@ self-referential (tcb/self/dt at +0/+8/+0x10, block below TP), and exits 0 — 4
 insns, exit_code=0, PASS in the same boot as the elf/elf-reject gates, with the new
 /api/qemu/tls endpoint added to the decoder-build CI gate list.
 
+**Update 2026-08-13 (iteration 17): the guest-heap shim landed.** `brk`
+(syscall 12), `mmap` (9, the 6-arg R10/R8/R9 form) and `munmap` (11) are real
+cases in the M5 shim's helper_syscall. "SLS frames" is a guest-address carve of
+the already-mapped 256 MiB emulator window: brk moves a single program break up
+from 32 MiB, mmap bumps a page allocator up from 48 MiB, munmap releases an
+exact recorded range (a double-unmap is -EINVAL), and both stay below a 1 MiB
+stack-margin ceiling. State is per-launch (sls_shim_heap_reset, called beside
+the sls_last_* resets), failure returns match Linux's raw-syscall convention
+(negative errno in RAX; brk returns the unchanged break). The gate fixture
+(sls/guest/brkmmap.c, embedded as brkmmap-bytes.h) grows/shrinks the break with
+a pattern round-trip, maps an anonymous private page (zero-read, write,
+read-back), unmaps it, maps again, and exits 0 - PASS in the same boot as the
+compiled/elf/elf-reject/tls gates, with the new /api/qemu/brkmmap endpoint
+added to the decoder-build CI gate list.
+
 **Still owed before a full freestanding `gcc -static -nostdlib` binary runs:** the rest of the shim
-surface (`brk`/`mmap`/`munmap`→SLS frames, `read`, `futex`, `clock_gettime` as the
+surface (`read`, `futex`, `clock_gettime` as the
 binary demands them) — per the stub-halt discipline, each lands when a fixture calls it.
 
 ### M6 — SSE2 scalar slice.
