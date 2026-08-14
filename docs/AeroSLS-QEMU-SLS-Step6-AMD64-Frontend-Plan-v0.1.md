@@ -772,6 +772,49 @@ deliverables land it:
    the full M1–M8.5 gate green; the frontend-off build is untouched (the
    classifier object is frontend-only).
 
+**Update 2026-08-14 (iteration 30, M6.5): the SSE2-scalar min/max gap the
+iteration-29 audit flagged is CLOSED, and the census now measures 621
+survivors.** The §4.5 audit named `maxsd`/`minsd`/`maxss`/`minss` as
+"owed, not permanent" — the M6 slice had left them unwritten. The sse2
+fixture (sls/guest/sse2.c) now drives them through the `<emmintrin.h>`
+intrinsics (`_mm_max_sd` etc., which ARE the instructions — gcc will not
+lower `a > b ? a : b` to maxsd without fast-math), plus the first
+compare-family member: `cmpeqsd` read back through `movmskpd` (the
+`_mm_cmpeq_sd` all-ones/all-zeros mask via `_mm_movemask_pd`), and a
+NaN-aware fmax probe that stays libm-free via `__builtin_isnan`
+(ucomisd + branch — ucomisd is real).
+
+1. **Five new real helpers** (sls/sls-i386-helper-stubs.c): the min/max
+   macro bodies keep all double arithmetic in locals — the kernel builds
+   `-mno-sse`, so no helper may RETURN a double through XMM0, the exact
+   ABI rule the M6 section states (the comparison is inlined into the
+   macro rather than factored into a static function for that reason).
+   `cmpeqsd` is the direct `==` with the upper lane UNCHANGED per the
+   SDM (the intrinsic's mask read depends on it); `movmskpd_xmm/_ymm`
+   extract the sign bits to EAX (int32, no SSE crossing) — the ymm form
+   was surfaced by the rename covering the vex_l decode path too. The
+   fixture's `-fno-math-errno` build flag is documented in the file
+   header (it is what lets `__builtin_sqrt` inline instead of calling a
+   libm that a `-nostdlib` guest does not have).
+2. **A generator bug the new renames exposed.** `#define movmskpd` is a
+   glue-BASE rename — in the stubs TU it lands on `glue(movmskpd,
+   SUFFIX)`, killing the generated stub for movmskpd_mmx/xmm/ymm alike,
+   but `gen_unsupported_list.py`'s `real_bodies()` subtracted only the
+   bare token, so the census kept counting the two now-real bodies as
+   halting stubs. `real_bodies()` now expands glue-base renames into
+   their suffixed forms (only when the suffixed forms exist in the
+   universe; cmpeqsd — whose CMP family is not enumerated — subtracts
+   nothing, which is correct since it was never a row).
+3. **The measured result:** 676 declared, 57 real bodies, **621 surviving
+   halting stubs** (the seven new helpers — 4 min/max + movmskpd_xmm +
+   movmskpd_ymm + the renamed-away movmskpd_mmx — leave the survivor
+   set). The sse2 fixture runs 241 instructions and the gate passes:
+   the full M1–M8.5 corpus (compiled elf elf-reject tls brkmmap rdclock
+   futex sse2 faults) is 9/9 green in one boot on the decoder build, the
+   frontend-off build still compiles and links, and the host suite stays
+   96/96. The one SSE compare family member the slice has not taken is
+   the vector (non-scalar) cmp forms — still §4.5-owed, still classified.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
