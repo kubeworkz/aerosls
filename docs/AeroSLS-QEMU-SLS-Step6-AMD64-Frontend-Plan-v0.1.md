@@ -472,6 +472,46 @@ record #GP with the selector pushed as the error code -- the raise_exception_err
 path M7 records. swapgs-at-CPL3 remains #GP(0), which is its true hardware code
 and is asserted as such.
 
+**Update 2026-08-13 (iteration 23, M8): guest IDT + iretq delivery.** M7's
+fault-record was the foundation; this iteration turns a recorded fault into a
+DELIVERED one when the guest has installed an IDT. The fixture now installs a
+gate per vector (lidt, P bit set), and the fault paths -- helper_raise_exception
+(#UD/#GP), the divide-error path (#DE), the far-transfer #GP path, and the
+kernel's #PF hook -- first ask whether the guest's IDT has a present gate for
+the vector (`sls_i386_try_deliver`). If it does, the fault is captured from the
+committed CPU state (the TCG block unwinds via the longjmp, so env is synced)
+and the exec loop pushes the hardware 64-bit interrupt frame -- [err]? RIP CS
+RFLAGS RSP SS -- at the guest RSP and vectors into the handler (`CS` = the gate
+selector, CPL from its RPL). The handler records its vector, stashes the
+popped error code (and CR2 for #PF), skips the faulting instruction in the
+saved RIP, and iretq's: `helper_iret_protected` pops the frame back (synthetic
+flat segments, RPL from the selector -- the sysret approach) and the guest
+resumes at the instruction after the fault, at its original CPL, with its
+original stack. A gate-less fault still falls through to the M7 record.
+
+Two decoder gaps surfaced and were fixed at the source: `gen_DIV` and
+`gen_far_call`/`gen_far_jmp` never synced eip before their helper calls, so the
+#DE and #GP-SEL faulting RIPs were block-start addresses -- `gen_update_eip_cur`
+now precedes them. The kernel #PF hook's `saved_rip` is a HOST address for
+mid-block faults (translating it needs TCG's search_pc machinery, which this
+build does not use), so the fixture's #PF handler iretq's to a recovery label
+recorded in guest memory rather than skipping a stale rip; the M7 #PF record's
+rip field has the same limitation and is not asserted.
+
+The gate: five launches (ud2, div-by-zero, swapgs-at-CPL3, unresolvable
+far-call selector, unmapped paged store), each of which must now run to a clean
+HLT with no recorded fault, `fault_status[vec]==2` (1 = handler entered, 2 =
+recovered after iretq), the exact frame error codes (0, 0, 0, 0x10, 0x2), CR2 =
+0x8000000 read by the #PF handler from env->cr[2], and recovery_ok set. The
+swapgs-at-CPL3 recovery cannot hlt at CPL 3 (HLT is privileged), so it records
+its status, sets a flag, and syscalls back to CPL 0 where the shared syscall
+handler halts. All nine gates (compiled, elf, elf-reject, tls, brkmmap,
+rdclock, futex, sse2, faults) are green in one boot.
+
+The plan's later milestones -- the IDT ring transitions/TSS switch, syscall
+interception, and the permanent-unsupported list -- remain, with this delivery
+path as their base.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
