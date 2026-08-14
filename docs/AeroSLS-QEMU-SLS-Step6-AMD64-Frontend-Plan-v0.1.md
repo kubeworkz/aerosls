@@ -661,6 +661,47 @@ proving the delivery was abandoned, not completed. The faults gate is now
 eleven cases; the full M1-M8.3 regression stays green on the decoder build,
 and the frontend-off (shipping) build still compiles and links.
 
+**Update 2026-08-14 (iteration 28, M8.5): the nested #PF -- Table 6-5's
+"second exception is #PF" row -- is now a delivered, gated class.** The row
+already existed in the `sls_i386_fault_record` chokepoint (the M8.3
+table), but it was unreachable from the one path that can actually raise a
+#PF inside the delivery window: the kernel's guest-#PF hook. `sls_i386_guest_pf`
+(sls-launcher.c) called `try_deliver(14)` directly, so a frame-push fault
+during a delivery silently overwrote the pending state without the nested
+row's bookkeeping. The hook now routes through a new
+`sls_i386_raise_guest_pf` (sls-i386-helper-stubs.c) that funnels into the
+SAME Table 6-5 chokepoint as the helper path -- the fix that made the row
+reachable at all.
+
+The `_pf_nested` fixture provokes the row with hardware's own mechanism:
+the guest runs PAGED (the `_pf` tables: identity 2 MiB pages for the
+code/.bss window and the loader stack, everything else unmapped), at CPL 3
+via the syscall round trip, and swapgs raises #GP(0) through a DPL-0 gate.
+The gate's delivery switches to TSS.RSP0 -- which the fixture points at the
+top of an UNMAPPED page (0x0C000000). The delivery's first frame push (SS
+at 0x0BFFFFF8) faults in the kernel's window walk, and the hook raises
+guest #PF (error 0x2 -- write, not-present -- CR2 0x0BFFFFF8) WHILE the
+#GP delivery is pending. Table 6-5 nests it: the DPL-3 #PF gate (CS 0x1b)
+delivers same-CPL at the faulting CPL3 RSP (the only mapped stack
+available -- the TSS.RSP0 the original delivery was pushing at is
+deliberately unmapped), the `pf_handler` runs, iretq's to a recovery label,
+and the guest halts cleanly. The launcher gate asserts the row's shape:
+`status[14]=2` (the #PF handler ran and recovered), err=0x2 and
+CR2=0x0BFFFFF8 came back exactly, recovery_ok=1 -- and, the row's point,
+`status[13]=0`: the ORIGINAL #GP handler never ran, because `try_deliver`
+overwrote the pending delivery. The serial record shows the whole chain:
+the #GP delivery's `deliver-rsp=0xc000000`, the hook's
+`guest #PF: cr2=0xbfffff8`, the nested row's log line, and the #PF's
+same-CPL delivery through gate 0x1b.
+
+The faults gate is now twelve cases, all green in one boot; the full
+M1-M8.4 regression (compiled elf elf-reject tls brkmmap rdclock futex sse2
+faults) passes on the decoder build, and the frontend-off (shipping) build
+still compiles and links (the launcher hook change links in both configs).
+The Table 6-5 matrix is complete: every row -- masked #NP/#SS, nested #PF,
+escalation to #DF, the #DF-own-delivery triple fault -- now has a fixture
+behind it, delivered through guest IDT gates on the decoder path.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
