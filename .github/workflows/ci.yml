@@ -207,6 +207,28 @@ jobs:
         run: bash tests/commands_doc_smoke.sh
         working-directory: aerosls2
 
+      # ─── The TLS certificate oracle smoke ────────────────────────────────
+      # tls_cert_oracle_smoke.sh is ALSO source-only, but it earned its own
+      # step here rather than joining the three above. It links the REAL
+      # kernel/tls_cert.c, rtc.c, tls_platform.c and stubs.c against a host
+      # build of vendor/mbedtls and judges the DER with OpenSSL. Because
+      # kernel/stubs.c is linked in FULL, the oracle carries the same
+      # link contract the kernel does -- and that contract has silently
+      # rotted twice. The M7 guest-#PF hook made handle_page_fault
+      # reference qemu_sls_guest_active / qemu_sls_guest_paging_on /
+      # sls_i386_guest_pf, and tls_cert_oracle_stubs.c did not provide
+      # them: the smoke failed at link from M7 until 2026-08-14, invisible
+      # because kernel-guards (which also globs *_smoke.sh) never reached
+      # its smoke step -- that job's frontend-off build was itself broken
+      # since M5. Running the oracle here, before any kernel build exists,
+      # pins the stubs.c <-> oracle-stub contract on every push with a
+      # ~40s source-only step instead of a deploy round trip. It needs
+      # only gcc, ar, openssl and python3 -- all on this runner; it skips
+      # (exit 0) if any are missing.
+      - name: TLS certificate oracle (links real kernel stubs, judged by OpenSSL)
+        run: bash tests/tls_cert_oracle_smoke.sh
+        working-directory: aerosls2
+
   kernel-guards:
     # The five kernel-needing guards (stack_frame_budget, kernel_image_end,
     # no_tls_relocations, no_hosted_link, code_buffer_budget) need the
