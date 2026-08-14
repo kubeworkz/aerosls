@@ -442,6 +442,23 @@ the decoder-build CI gate list. M6's permanent-unsupported remainder (packed
 vector, x87, AVX) stays as halting stubs, which become the documented spec of
 what this build does not run at M7.
 
+**Update 2026-08-13 (iteration 21, M7): fault semantics delivered to C.** The M7
+gate is fault RECORDING: this build has no exception delivery (no IDT, no vectoring),
+so a fault ends the launch with the fault class written into the launcher's record
+(vector, error code, CR2, faulting RIP -- reset per launch beside the exit code),
+distinguishable from a launch that ran to HLT. Four classes are wired and gated by
+the faults fixture (sls/guest/faults.c, one entry per fault, launched separately):
+ud2 raises #UD(6) through the decoder's gen_illegal_opcode path; DIV r/m64 by zero
+raises #DE(0) through helper_divq_EAX; swapgs at CPL 3 (reached via the iteration-12
+syscall/sysret round trip) raises #GP(13) through check_cpl0; and a paged guest's
+store to an unmapped VA raises #PF(14) -- the shadow walk fails, and the kernel's
+handle_page_fault hook (guest active + paging on + in-window) records the fault
+with CR2 = the guest VA instead of panicking. All four record correctly in one boot
+with the new /api/qemu/faults endpoint added to the decoder-build CI gate list;
+the raise_exception body that previously named-and-halted is now the M7 record path,
+and the #DE path routes through it instead of a kernel panic. M7's boundary, stated
+in the plan: delivery (IDT, iretq, ring transitions) remains a later milestone.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.

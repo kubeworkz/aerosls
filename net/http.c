@@ -2305,6 +2305,21 @@ static int api_qemu_futex_post(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+static int api_qemu_faults_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M7: the fault-semantics gate -- the embedded faults fixture
+    // (sls/guest/faults.c) is launched once per fault class (ud2->#UD,
+    // div0->#DE, swapgs-at-CPL3->#GP, unmapped paged store->#PF with CR2);
+    // each launch must record exactly the expected vector in the launcher's
+    // fault record, then the test reports PASS.
+    int rc = sls_test_guest_faults();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_qemu_sse2_post(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     // M6: the SSE2 scalar slice gate -- sls/guest/sse2.c compiled
@@ -5730,6 +5745,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/rdclock")) {
             blen = api_qemu_rdclock_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/faults")) {
+            blen = api_qemu_faults_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/qemu/sse2")) {

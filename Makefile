@@ -563,7 +563,9 @@ tcg-objs/sls-launcher.x86.o: ../qemu/sls/guest/guest-bytes.h \
                              ../qemu/sls/guest/brkmmap-bytes.h \
                              ../qemu/sls/guest/rdclock-bytes.h \
                              ../qemu/sls/guest/futex-bytes.h \
-                             ../qemu/sls/guest/sse2-bytes.h
+                             ../qemu/sls/guest/sse2-bytes.h \
+                             ../qemu/sls/guest/faults-bytes.h \
+                             ../qemu/sls/guest/faults-entries.h
 
 tcg-objs/i386-codefetch.x86.o: ../qemu/sls/sls-i386-codefetch.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs

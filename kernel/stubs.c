@@ -83,6 +83,33 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
     if (qemu_sls_mmu_shadow_fault((uint64_t)faulting_address,
                                    (uint32_t)error_code) == 0)
         return;
+
+    /* ─── M7: a genuine guest #PF ────────────────────────────────────────
+     * shadow_fault() refused, and a kernel #PF is the usual reason. But when
+     * ALL of these hold -- the fault was taken by translated guest code
+     * (guest active), the guest has paging enabled, and the address is
+     * inside the guest window -- the ONLY remaining reason is that the
+     * guest's OWN page tables do not map the address. On hardware that is
+     * guest #PF(14) with CR2 = the faulting VA, and this build has no
+     * exception delivery, so M7's gate is fault RECORDING: sls_i386_guest_pf
+     * (sls-launcher.c) writes vector 14, CR2, the error code and the
+     * faulting RIP into the launcher's fault record and returns to the
+     * launcher -- a launch ending in a guest fault is a recorded, diagnosable
+     * outcome instead of a kernel panic. CR2 is converted to the guest VA
+     * (the faulting host address is guest_va + the window base).
+     *
+     * The in-window test is the same PML4-slot check shadow_fault() uses
+     * (shadow_va_in_window); everything failing the three conditions is a
+     * real kernel fault and falls through to the panic below, unchanged. */
+    if (qemu_sls_guest_active && qemu_sls_guest_paging_on &&
+        ((faulting_address >> 39) & 0x1FF) ==
+            ((QEMU_GUEST_WINDOW_BASE >> 39) & 0x1FF)) {
+        extern void sls_i386_guest_pf(uint64_t cr2, uint32_t error_code,
+                                      uint64_t rip);
+        sls_i386_guest_pf(faulting_address - QEMU_GUEST_WINDOW_BASE,
+                          (uint32_t)error_code, saved_rip);
+        /* does not return */
+    }
     /* ─── kernel_panic_puts(), NOT kernel_serial_printf() ──────────────────
      * This line used kernel_serial_printf(). While an HTTP shell command is
      * running, user/shell.c:457 has redirected kernel_serial_putchar() into a
