@@ -164,14 +164,21 @@ jobs:
       # review and inspecting nothing. Each was written after the bug it
       # catches had already cost a diagnostic round.
       #
-      # Three of the eighteen (makefile_sources, commands_doc,
-      # script_conventions) read only sources and run here. The other
-      # fifteen need a linked kernel or its objects, and this runner has no
-      # x86_64-elf-gcc -- see the note at the top of this file -- so they
-      # exit 2 and are reported as SKIP with the reason printed. A skip is
-      # counted separately and never mistaken for a pass; read the step's
-      # output rather than just its green tick. Those three are run for
-      # real, with their teeth proven, in the kernel-guards job below.
+      # Thirteen of the nineteen read only sources and run here. The five
+      # GUARD-KIND: build guards (code_buffer_budget, kernel_image_end,
+      # no_hosted_link, no_tls_relocations, stack_frame_budget) need the
+      # linked kernel or its objects, and this runner has no x86_64-elf-gcc
+      # -- see the note at the top of this file -- so they are registered
+      # skips, reported with the reason printed. A skip is counted
+      # separately and never mistaken for a pass; read the step's output
+      # rather than just its green tick. Those five are run for real, with
+      # their teeth proven, in the kernel-guards job below.
+      #
+      # A guard that exits 2 WITHOUT the GUARD-KIND: build (or runtime)
+      # marker is a FAILURE here, fail-closed: a guard that stops being
+      # source-only cannot silently go dark, which is exactly how the M5/M7
+      # era rotted (the frontend-off build broke, kernel-guards never
+      # reached its guards, and CI stayed green anyway).
       #
       # Use --require-all on a build host, where the prerequisites must
       # exist and "could not check" must not resemble "it is fine".
@@ -183,50 +190,21 @@ jobs:
       # fail. Each *_smoke.sh deliberately breaks one guard's input and
       # asserts the guard exits 1 and names the violation — so a
       # regression that made a guard blind fails CI instead of sailing
-      # through green. All three source-only guards have a smoke now:
-      # script_conventions (index teeth: mode, shebang, CRLF),
-      # makefile_sources (an unbuilt .c and a stale list entry),
-      # commands_doc (the hex-vs-data field bug). They are *smoke.sh*,
-      # not *_check.sh, so run_checks.sh and deploy.sh's guard gate never
-      # run them.
+      # through green. They are *smoke.sh*, not *_check.sh, so
+      # run_checks.sh and deploy.sh's guard gate never run them.
       #
-      # The five kernel-needing guards cannot run here (no cross
-      # toolchain). The kernel-guards job below builds the real binary and
-      # runs all eighteen guards and all nineteen smokes for real -- the
-      # only skip is the runtime entropy guard, which needs a live cluster
-      # even on a build host.
-      - name: Script-conventions guard teeth (smoke)
-        run: bash tests/script_conventions_smoke.sh
-        working-directory: aerosls2
-
-      - name: Makefile-sources guard teeth (smoke)
-        run: bash tests/makefile_sources_smoke.sh
-        working-directory: aerosls2
-
-      - name: Commands-doc guard teeth (smoke)
-        run: bash tests/commands_doc_smoke.sh
-        working-directory: aerosls2
-
-      # ─── The TLS certificate oracle smoke ────────────────────────────────
-      # tls_cert_oracle_smoke.sh is ALSO source-only, but it earned its own
-      # step here rather than joining the three above. It links the REAL
-      # kernel/tls_cert.c, rtc.c, tls_platform.c and stubs.c against a host
-      # build of vendor/mbedtls and judges the DER with OpenSSL. Because
-      # kernel/stubs.c is linked in FULL, the oracle carries the same
-      # link contract the kernel does -- and that contract has silently
-      # rotted twice. The M7 guest-#PF hook made handle_page_fault
-      # reference qemu_sls_guest_active / qemu_sls_guest_paging_on /
-      # sls_i386_guest_pf, and tls_cert_oracle_stubs.c did not provide
-      # them: the smoke failed at link from M7 until 2026-08-14, invisible
-      # because kernel-guards (which also globs *_smoke.sh) never reached
-      # its smoke step -- that job's frontend-off build was itself broken
-      # since M5. Running the oracle here, before any kernel build exists,
-      # pins the stubs.c <-> oracle-stub contract on every push with a
-      # ~40s source-only step instead of a deploy round trip. It needs
-      # only gcc, ar, openssl and python3 -- all on this runner; it skips
-      # (exit 0) if any are missing.
-      - name: TLS certificate oracle (links real kernel stubs, judged by OpenSSL)
-        run: bash tests/tls_cert_oracle_smoke.sh
+      # run_guard_smokes.sh runs all nineteen, but five need the linked
+      # kernel or its objects, so that runner needs a build host. The
+      # other fourteen are source-only — gcc/binutils/python3/openssl and
+      # the sources in the tree, nothing built — so they run HERE, on
+      # every push, independent of the kernel build. That independence is
+      # the point: tls_cert_oracle_smoke.sh failed at link for months,
+      # invisible because the build-host job (kernel-guards) died at its
+      # build step before reaching its smokes. run_source_smokes.sh keeps
+      # the source-only set green on its own, and fails any smoke that
+      # cannot run without being on its build-needed exclusion list.
+      - name: Source-only guard teeth (all 14 smokes that need no build)
+        run: bash tests/run_source_smokes.sh
         working-directory: aerosls2
 
   kernel-guards:

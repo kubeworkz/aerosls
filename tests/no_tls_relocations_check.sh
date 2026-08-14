@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+# GUARD-KIND: build -- cannot run without the linked kernel or its objects
+# (nm/readelf on my_sls_kernel.bin / tcg-objs). CI's verify job has no
+# build, so this is a REGISTERED skip there; kernel-guards and the deploy
+# gate run it for real. Without this marker, a guard that cannot run in
+# verify is a failure, not a skip (run_checks.sh is fail-closed on
+# unclassified guards).
+#
 # no_tls_relocations_check.sh — asserts that no object linked into the kernel
 # contains a thread-local-storage relocation.
 #

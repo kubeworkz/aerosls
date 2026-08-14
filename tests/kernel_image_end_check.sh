@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+# GUARD-KIND: build -- cannot run without the linked kernel or its objects
+# (nm/readelf on my_sls_kernel.bin / tcg-objs). CI's verify job has no
+# build, so this is a REGISTERED skip there; kernel-guards and the deploy
+# gate run it for real. Without this marker, a guard that cannot run in
+# verify is a failure, not a skip (run_checks.sh is fail-closed on
+# unclassified guards).
+#
 # kernel_image_end_check.sh — no allocated section may lie at or above
 # _kernel_image_end, and the bootstrap stack must be strictly inside it.
 #

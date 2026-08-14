@@ -30,6 +30,16 @@
 #   1  fail -- the property it asserts is violated
 #   2  abort -- a prerequisite is missing (no binary, no objects, no readelf)
 #
+# A guard that aborts is classified by a header marker, and the classes are
+# enforced differently:
+#   GUARD-KIND: runtime  -> owed skip (needs a live cluster, never a build)
+#   GUARD-KIND: build    -> registered skip on source-only runners (needs the
+#                           linked kernel/objects; kernel-guards + deploy run
+#                           it for real)
+#   no marker            -> FAILURE. "Could not check" must not look like
+#                           "it is fine" -- that is the silent-rot failure
+#                           mode this runner exists to end.
+#
 # That third case is the reason this runner exists rather than a line of CI
 # YAML per script. Three of the five need a linked kernel or its objects, and
 # CI has no x86_64-elf-gcc (see .github/workflows/ci.yml, which says so). In
@@ -119,11 +129,27 @@ for g in "${guards[@]}"; do
                 echo "FAIL  $name (prerequisite missing, and --require-all is set)"
                 echo "      $reason"
                 fail=$((fail + 1))
-            else
-                echo "SKIP  $name"
+            elif grep -q '^# GUARD-KIND: build' "$g" 2>/dev/null; then
+                # A REGISTERED build-needing guard: it inspects the linked
+                # kernel or its objects, which a source-only runner does not
+                # have. The skip is legitimate ONLY because the guard is
+                # classified -- kernel-guards and the deploy gate run it for
+                # real. The else below fails any guard that cannot run
+                # without a marker, so a guard that stops being source-only
+                # cannot silently go dark.
+                echo "SKIP  $name (build guard -- needs a linked kernel; enforced by kernel-guards)"
                 echo "      $reason"
                 skip=$((skip + 1))
                 skipped_names="$skipped_names $name"
+            else
+                # FAIL-CLOSED. An unclassified guard that could not run is
+                # rot, not a skip -- the exact silent failure this file was
+                # written against, one level up. Mark it GUARD-KIND: build
+                # (or runtime) if the prerequisite is legitimately absent
+                # from this environment.
+                echo "FAIL  $name (unclassified guard could not run -- prerequisite missing)"
+                echo "      $reason"
+                fail=$((fail + 1))
             fi
             ;;
         *)

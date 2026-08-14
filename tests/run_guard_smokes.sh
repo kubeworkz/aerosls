@@ -4,11 +4,12 @@
 # ─── Why this exists ───────────────────────────────────────────────────────
 # tests/run_checks.sh runs every tests/*_check.sh guard; the guards' TEETH
 # are proven by the tests/*_smoke.sh scripts, which deliberately break a
-# guard's input and assert it fails. Three smokes (script_conventions,
-# makefile_sources, commands_doc) run anywhere and are wired into CI.
-# Three (stack_frame_budget, kernel_image_end, no_tls_relocations) need a
-# built kernel and its objects — CI has no cross toolchain, so they run on
-# a build host:
+# guard's input and assert it fails. Fourteen smokes are source-only (they
+# need only gcc/binutils/python3/openssl and the tree's sources) and run
+# anywhere -- CI runs them on every push via tests/run_source_smokes.sh.
+# Five (code_buffer_budget, kernel_image_end, no_hosted_link,
+# no_tls_relocations, stack_frame_budget) need a built kernel and its
+# objects -- CI has no cross toolchain, so they run on a build host:
 #
 #     make            # or make x86-iso — build the kernel and objects
 #     bash tests/run_guard_smokes.sh
