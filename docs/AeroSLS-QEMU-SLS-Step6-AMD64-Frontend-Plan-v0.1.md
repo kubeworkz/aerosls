@@ -887,6 +887,40 @@ default build:
    with "[NVME] MMIO above 4 GiB" — the loud message, not a silent
    degradation.
 
+**Update 2026-08-14 (iteration 33, M8): the round-trip is now a GUARD —
+`tests/tcache_roundtrip_check.sh`, run on every kernel-guards CI push and
+in the deploy gate.** A property that is only verified when someone
+remembers to measure it rots the day a change silently stops the
+round-trip from happening; the iteration-32 measurement was by hand, so
+this makes it a machine.
+
+1. **The check.** Boots the ISO (-m 1G, the cluster default, with the
+   NVMe-BAR caveat below enforced rather than assumed), benches
+   (everything compiled), checkpoints (TBs to NVMe), reboots via
+   /api/node/reboot, benches again, and asserts the round-trip in
+   invariant form — **warm tcache_hits == cold blocks, warm blocks == 0,
+   warm misses == 0, warm insns == cold insns** — so a TCG change that
+   moves the block count (8 → 9) follows the kernel instead of
+   false-failing. It also asserts boot 1 read "no snapshot" and never
+   "NVMe unavailable": the >4 GiB BAR degradation would otherwise turn
+   every run into a no-op-shaped pass. `GUARD-KIND: build` — it needs a
+   built ISO and QEMU, so source-only runners skip it legitimately and
+   kernel-guards/deploy run it for real. Its port auto-advances
+   (3001..3020) so it cannot collide with a live node on a deploy host.
+2. **The teeth.** `tests/tcache_roundtrip_smoke.sh` is source-only and
+   runs on EVERY push (verify job, via run_source_smokes.sh): it feeds
+   the guard's --replay mode a well-formed artifact set and asserts the
+   guard ACCEPTS it, then mutates each assertion input (warm hits→0,
+   warm blocks→3, warm cold→true, banner deleted, "NVMe unavailable",
+   checkpoint status→2, cold cold→false, cold hits→8) and asserts the
+   guard fails each time for the right reason — 1 accept + 8 reject
+   teeth. A regression that makes the guard blind fails the smoke, not
+   the next deploy.
+3. **Measured:** guard gate 19/19 (was 18 + this check), guard smokes
+   20/20, source smokes 15/15. The live check passed end to end on the
+   decoder default build against the iteration-32 numbers (8 blocks,
+   502 insns, 8/8 warm hits, 0 compiled).
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
