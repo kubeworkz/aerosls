@@ -732,6 +732,37 @@ static int json_float_array(const char* json, const char* key, float* out, int m
     return n;
 }
 
+// Extract "key": [n0, n1, ...] as uint32_t values -- the integer sibling
+// of json_float_array() above, added for POST /api/qemu/bench_sweep. The
+// bench sweep takes an explicit loads list so the caller controls which
+// block counts get exercised, rather than every value in 1..510 (each
+// launch costs arena; a full sweep would exhaust it). Returns the number
+// of values written (0..max); 0 on a missing key or a non-array, the same
+// contract json_float_array() has. Out-of-range or duplicate values are
+// the caller's job to reject -- this just parses.
+static int json_uint_array(const char* json, const char* key, uint32_t* out, int max) {
+    char srch[128]; int si = 0;
+    srch[si++] = '"';
+    for (int i = 0; key[i]&&si<120; i++) srch[si++] = key[i];
+    srch[si++] = '"'; srch[si++] = ':'; srch[si] = '\0';
+    const char* p = str_find(json, srch);
+    if (!p) return 0;
+    p += si;
+    while (*p==' '||*p=='\t') p++;
+    if (*p != '[') return 0;
+    p++;
+    int n = 0;
+    while (*p && *p != ']' && n < max) {
+        while (*p==' '||*p=='\t'||*p==',') p++;
+        if (*p == ']' || !*p) break;
+        uint64_t v = 0;
+        while (*p>='0'&&*p<='9') { v = v*10 + (uint64_t)(*p-'0'); p++; }
+        out[n++] = (uint32_t)v;
+        while (*p==' '||*p=='\t') p++;
+    }
+    return n;
+}
+
 // Fills out[] with json_str(json, key, ...)'s result, or with def if the
 // key was absent/empty -- json_str() itself leaves out[] untouched (not
 // even null-terminated) on failure, so a caller that needs a guaranteed
@@ -2034,6 +2065,8 @@ static int api_shell_exec_post(const char* body, char* buf, int max, uint32_t re
 // same symbols the same way at its own `qemu` handlers. Definitions and full
 // commentary live in sls-launcher.h.
 extern int      sls_bench_load_path(uint32_t n_loads, uint64_t *cycles, uint32_t *insns);
+extern int      sls_bench_load_path_at(uint32_t n_loads, uint64_t prog_gpa,
+                                       uint64_t *cycles, uint32_t *insns);
 extern int      sls_test_guest_paging(void);
 extern int      sls_test_guest_invl(void);
 extern int      sls_test_guest_selfmod(void);
@@ -2143,6 +2176,83 @@ static int api_qemu_bench_post(const char* body, char* buf, int max) {
     // compare an ON run against an OFF run and see a 5.4x "improvement" that is
     // only the build flag.
     jb_str(&j, "softmmu", sls_softmmu_enabled() ? "on" : "off");
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+// ─── POST /api/qemu/bench_sweep ───────────────────────────────────────────
+// The tcache round-trip guard's second shape. The single bench exercises
+// ONE program shape: one loads value, one block count. A sweep places each
+// loads value's program at its own guest GPA via sls_bench_load_path_at(),
+// so several bench programs coexist in guest RAM -- and in the persistent
+// translation cache -- without invalidating each other: every program owns
+// its own page and its own tcache page digest, so a checkpoint after a
+// cold sweep followed by a reboot and the same warm sweep hits EVERY
+// value's blocks. That is the round-trip asserted at multiple block counts
+// (tests/tcache_roundtrip_check.sh), not just the one 8-block shape.
+//
+// The response is an array of per-value objects, each carrying exactly the
+// fields the single bench reports, read from the same sls_last_* globals so
+// the route cannot disagree with the console about the same run. The sweep
+// is capped at BENCH_SWEEP_MAX values and each loads value is validated the
+// way the single bench does (1..TCG_MAX_INSNS-2), plus a distinctness check:
+// two identical values would bench the same GPA twice and the second run's
+// "hits" would be indistinguishable from the first's, which a round-trip
+// assertion must not silently depend on.
+#define BENCH_SWEEP_MAX 16
+static int api_qemu_bench_sweep_post(const char* body, char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    uint32_t loads[BENCH_SWEEP_MAX];
+    int n = body ? json_uint_array(body, "loads", loads, BENCH_SWEEP_MAX) : 0;
+
+    const char* err = 0;
+    if (n < 1)
+        err = "missing or empty \"loads\" array";
+    for (int i = 0; !err && i < n; i++) {
+        if (loads[i] < 1 || loads[i] > 510) { err = "loads out of range"; break; }
+        for (int k = 0; k < i; k++)
+            if (loads[k] == loads[i]) { err = "duplicate loads value"; break; }
+    }
+    if (err) {
+        jb_obj_open(&j, 0);
+        jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", err);
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok", "true");        jb_putc(&j, ',');
+    jb_uint(&j, "count", (uint64_t)n); jb_putc(&j, ',');
+    jb_arr_open(&j, "results");
+    for (int i = 0; i < n; i++) {
+        uint64_t cycles = 0;
+        uint32_t insns  = 0;
+        /* 64 KiB per slot: the program (< 4 KiB) and its buffer (< 32 KiB
+         * for 500 loads) stay inside one slot, so no two values touch a
+         * shared page. The response carries the GPA so the guard can
+         * distinguish the sweep's shape from a single-bench response. */
+        uint64_t gpa = (uint64_t)(i + 1) * 0x10000;
+        int rc = sls_bench_load_path_at(loads[i], gpa, &cycles, &insns);
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_str(&j, "ok", rc < 0 ? "false" : "true"); jb_putc(&j, ',');
+        jb_uint(&j, "loads",            (uint64_t)loads[i]);      jb_putc(&j, ',');
+        jb_uint(&j, "gpa",              gpa);                     jb_putc(&j, ',');
+        jb_uint(&j, "insns",            (uint64_t)insns);         jb_putc(&j, ',');
+        jb_uint(&j, "total_cycles",     cycles);                  jb_putc(&j, ',');
+        jb_uint(&j, "exec_cycles",      sls_last_exec_cycles);    jb_putc(&j, ',');
+        jb_uint(&j, "translate_cycles", sls_last_translate_cycles); jb_putc(&j, ',');
+        jb_uint(&j, "blocks",           (uint64_t)sls_last_tb_count); jb_putc(&j, ',');
+        jb_uint(&j, "code_bytes",       sls_last_code_bytes);     jb_putc(&j, ',');
+        jb_uint(&j, "tcache_hits",      (uint64_t)sls_last_tcache_hits);   jb_putc(&j, ',');
+        jb_uint(&j, "tcache_misses",    (uint64_t)sls_last_tcache_misses); jb_putc(&j, ',');
+        jb_str(&j, "cold", sls_last_tcache_hits == 0 ? "true" : "false"); jb_putc(&j, ',');
+        jb_uint(&j, "arena_consumed",   sls_last_arena_consumed); jb_putc(&j, ',');
+        jb_uint(&j, "arena_used",       sls_heap_used());         jb_putc(&j, ',');
+        jb_uint(&j, "arena_total",      sls_heap_total());        jb_putc(&j, ',');
+        jb_str(&j, "softmmu", sls_softmmu_enabled() ? "on" : "off");
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
@@ -5721,6 +5831,10 @@ static void http_route(int conn, char* req) {
         //    /api/qemu/run to go with these. ────────────────────────────────
         if (!strcmp(path, "/api/qemu/bench")) {
             blen = api_qemu_bench_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/bench_sweep")) {
+            blen = api_qemu_bench_sweep_post(body_ptr, resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/qemu/paging")) {

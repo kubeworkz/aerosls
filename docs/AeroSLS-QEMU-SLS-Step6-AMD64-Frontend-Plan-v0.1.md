@@ -921,6 +921,45 @@ this makes it a machine.
    decoder default build against the iteration-32 numbers (8 blocks,
    502 insns, 8/8 warm hits, 0 compiled).
 
+**Update 2026-08-14 (iteration 34, M8): the round-trip guard now asserts
+MULTIPLE block counts, not just the one 8-block shape.** The iteration-33
+check benched one loads value (500 → 8 blocks); a regression that broke,
+say, single-block launches would have sailed through. The sweep closes
+that hole.
+
+1. **The endpoint.** `POST /api/qemu/bench_sweep` (net/http.c) takes an
+   explicit loads list and runs each value through a new
+   `sls_bench_load_path_at()` (sls-launcher.c) that places the program at
+   its own 64 KiB-aligned guest GPA instead of guest physical 0. That
+   placement is what makes a multi-count round-trip possible in ONE
+   checkpoint + reboot: each program owns its own page — and its own
+   tcache page digest — so the values do not invalidate each other the way
+   two programs at the same GPA would (the iteration-32/33 pitfall: a
+   different-length program at GPA 0 flushes the previous value's blocks).
+   The launcher change parameterizes the image-copy target in
+   `sls_launch_guest_at()` (image now copies to entry_gpa; every legacy
+   caller passes 0, so behaviour is unchanged).
+2. **The check.** The guard sweeps loads {1, 64, 128, 256, 500} → block
+   counts {1, 2, 3, 5, 8} (one TB holds 64 instructions), and asserts the
+   round-trip PER VALUE: warm tcache_hits == cold blocks, warm blocks ==
+   0, warm misses == 0, warm insns == cold insns, cold insns == loads+2
+   (the bench program completes), plus a strictly-increasing cold-blocks
+   check so the sweep cannot silently collapse to one shape.
+3. **The teeth.** The smoke's artifacts are now the sweep shape and add
+   per-value mutations (warm hits→0, warm blocks→3, warm cold→true, warm
+   insns≠cold, cold blocks→0, cold cold→false, cold insns short, cold
+   hits→3, blocks not increasing, sweep-length mismatch on both sides) on
+   top of the existing banner/NVMe/checkpoint teeth — 1 accept + 14
+   reject teeth.
+4. **Measured (decoder default build):** cold sweep compiles 1,2,3,5,8
+   blocks (19 TBs, 15246 code bytes synced); after the reboot the warm
+   sweep shows 0 blocks compiled and hits 1,2,3,5,8 — every value
+   round-trips, identical insns. Full M1–M8.5 gate 9/9, guard gate
+   19/19 + the owed entropy runtime skip, guard smokes 20/20, source
+   smokes 15/15, frontend-off build still links. Two commits: qemu-sls
+   (launcher) + aerosls2 (endpoint, guard, smoke, doc).
+
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.

@@ -3,37 +3,61 @@
 # must survive a reboot, on the decoder build, every time it is measured.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
-# The Phase 2 headline (plan §3b-3e, 2026-08-04) — 8 blocks compiled on a
-# cold boot, 0 after a checkpoint + reboot, identical guest result — was
-# measured by hand on a cluster node. It predates the M8 flip, and the
-# re-measurement on the decoder build (iteration 32) was ALSO by hand. A
-# property that is only verified when someone remembers to measure it rots
-# the day a change makes the round-trip silently not happen: the guard
-# passes nothing and nobody notices, until a warm boot recompiles the world
-# and the "compiled code survives reboot" claim quietly dies.
+# The Phase 2 headline (plan §3b-3e, 2026-08-04) — blocks compiled on a cold
+# boot, 0 after a checkpoint + reboot, identical guest result — was measured
+# by hand on a cluster node. It predates the M8 flip, and the re-measurement
+# on the decoder build (iteration 32) was ALSO by hand. A property that is
+# only verified when someone remembers to measure it rots the day a change
+# makes the round-trip silently not happen: the guard passes nothing and
+# nobody notices, until a warm boot recompiles the world and the "compiled
+# code survives reboot" claim quietly dies.
 #
-# This guard is the machine: boot, bench (everything compiled), checkpoint
-# (TBs to NVMe), reboot, bench again (everything hit, nothing compiled),
-# assert the invariant. It runs on every kernel-guards CI push and in the
-# deploy gate, so a regression in the chain fails a build instead of
-# waiting for someone to re-measure.
+# This guard is the machine: boot, sweep-bench (everything compiled),
+# checkpoint (TBs to NVMe), reboot, sweep-bench again (everything hit,
+# nothing compiled), assert the invariant per loads value.
+#
+# ─── Why a sweep, not one bench ────────────────────────────────────────────
+# The original guard benched ONE shape: loads=500, which translates to 8
+# blocks. A round-trip that only ever proves one block count says nothing
+# about the others — a regression that broke, say, single-block launches
+# would sail through. The sweep benches several loads values at once:
+#
+#     loads:  1   64  128  256  500
+#     blocks: 1   2    3    5    8      (one TB holds 64 instructions)
+#
+# Five distinct block counts round-trip through ONE checkpoint + reboot.
+# The trick that makes that possible is per-GPA placement: POST
+# /api/qemu/bench_sweep (net/http.c) runs each value through
+# sls_bench_load_path_at(), which places the program at its own 64 KiB-
+# aligned guest GPA instead of guest physical 0. Each program then owns its
+# own page — and its own tcache page digest — so the values do not
+# invalidate each other (the way two programs at the same GPA would), and a
+# warm sweep hits every value's blocks, not just the last one benched.
 #
 # ─── What it asserts, and why in invariant form ────────────────────────────
 # The plan's "8/8 hits, 0 blocks compiled, identical 502 insns" is asserted
-# as the invariant it really is, not as magic numbers:
+# per value, as the invariant it really is, not as magic numbers:
 #
-#   cold.json:  ok=true, cold=true, tcache_hits=0, blocks>=1, insns>=1
-#   checkpoint: status=0, and the log shows "synced: N TBs"
-#   boot 1 log: "no snapshot" (NVMe up AND the disk was fresh), and NOT
-#               "NVMe unavailable" (the >4 GiB BAR degradation, below)
-#   boot 2 log: "warm start" (the cache was restored from NVMe)
-#   warm.json:  ok=true, cold=false, blocks=0, tcache_misses=0,
-#               tcache_hits == cold blocks, insns == cold insns
+#   cold value:  ok=true, cold=true, tcache_hits=0, blocks>=1,
+#                insns == loads+2 (the bench program completes)
+#   checkpoint:  status=0, and the log shows "synced: N TBs"
+#   boot 1 log:  "no snapshot" (NVMe up AND the disk was fresh), and NOT
+#                "NVMe unavailable" (the >4 GiB BAR degradation, below)
+#   boot 2 log:  "warm start" (the cache was restored from NVMe)
+#   warm value:  ok=true, cold=false, blocks=0, tcache_misses=0,
+#                tcache_hits == cold blocks, insns == cold insns
 #
-# warm_hits == cold_blocks is the round-trip contract: every block compiled
-# on the cold boot must be a hit on the warm boot, with nothing new
-# compiled and the same instruction count. If TCG changes the block count
-# (8 -> 9), the guard follows the kernel instead of false-failing.
+# warm_hits == cold_blocks per value is the round-trip contract: every block
+# compiled for that value on the cold boot must be a hit on the warm boot,
+# with nothing new compiled and the same instruction count. If TCG changes
+# the block count (8 -> 9), the guard follows the kernel instead of
+# false-failing.
+#
+# The sweep must ALSO span multiple block counts: the cold blocks must be
+# strictly increasing in loads. If a TCG change merged everything into one
+# block per value, every value would still round-trip — and the guard would
+# be asserting the same shape five times. Strict increase pins that the
+# multi-block-count claim is real.
 #
 # ─── RAM requirement (a real pitfall, not a footnote) ─────────────────────
 # Must run with -m 1G, the cluster default. The NVMe device's 64-bit BAR
@@ -46,11 +70,11 @@
 #
 # ─── Replay mode (how the smoke proves the teeth bite) ────────────────────
 # --replay DIR runs ONLY the validation half against recorded artifacts
-# (cold.json, checkpoint.json, boot.log, warm.json) — no boot, no qemu, no
-# ISO. tests/tcache_roundtrip_smoke.sh synthesizes a well-formed artifact
-# set, mutates each assertion input, and asserts the guard fails on each —
-# so a regression that makes the guard blind (a wrong field, a dropped
-# grep) fails the smoke instead of passing authority.
+# (cold_sweep.json, checkpoint.json, boot.log, warm_sweep.json) — no boot,
+# no qemu, no ISO. tests/tcache_roundtrip_smoke.sh synthesizes a
+# well-formed artifact set, mutates each assertion input, and asserts the
+# guard fails on each — so a regression that makes the guard blind (a wrong
+# field, a dropped grep) fails the smoke instead of passing authority.
 #
 # Exit: 0 pass, 1 fail, 2 abort (prerequisite missing).
 # GUARD-KIND: build
@@ -60,6 +84,13 @@ cd "$(dirname "$0")/.."   # repo root
 ISO="${TCACHE_ISO:-sls_operating_system.iso}"
 PORT="${TCACHE_PORT:-}"
 TOK="deadbeef01234567cafebabe76543210"   # dave, DB_ADMIN — kernel/auth.c
+
+# The sweep: five loads values whose programs translate to five distinct
+# block counts (one TB holds 64 instructions): 1,2,3,5,8. The JSON form is
+# the request body; the comma form is handed to the validator so it can
+# check every requested value actually came back.
+SWEEP="1 64 128 256 500"
+SWEEP_JSON="[1,64,128,256,500]"
 
 REPLAY=""
 if [ "${1:-}" = "--replay" ]; then
@@ -77,9 +108,10 @@ command -v python3 >/dev/null 2>&1 || {
 # line. Missing or unparseable artifacts are failures too — a guard that
 # could not read its inputs must not pass.
 validate() {   # $1 = workdir
-    python3 - "$1" <<'PYEOF'
+    python3 - "$1" "$SWEEP" <<'PYEOF'
 import json, os, re, sys
-W = sys.argv[1]
+W, sweep_csv = sys.argv[1], sys.argv[2]
+expected = [int(x) for x in sweep_csv.split()]
 fails = []
 
 def art(name):
@@ -100,9 +132,9 @@ def jf(name):
                      "inputs must not pass" % (name, e))
         return None
 
-cold = jf("cold.json")
+cold = jf("cold_sweep.json")
 chk  = jf("checkpoint.json")
-warm = jf("warm.json")
+warm = jf("warm_sweep.json")
 log  = art("boot.log")
 
 if log is not None:
@@ -120,43 +152,93 @@ if log is not None:
         fails.append("boot log: missing 'synced: N TBs' line -- the checkpoint "
                      "never wrote the cache to NVMe")
 
-if cold is not None:
-    if cold.get("ok") != "true":
-        fails.append("cold bench ok=%r -- expected true" % cold.get("ok"))
-    if cold.get("cold") != "true":
-        fails.append("cold bench cold=%r -- expected true: the first launch must "
-                     "be a fresh cold start" % cold.get("cold"))
-    if cold.get("tcache_hits") != 0:
-        fails.append("cold bench tcache_hits=%r -- expected 0: a cold boot must "
-                     "compile everything" % cold.get("tcache_hits"))
-    cb = cold.get("blocks"); ci = cold.get("insns")
-    if not isinstance(cb, int) or cb < 1:
-        fails.append("cold bench blocks=%r -- expected >= 1 compiled" % cb)
-    if not isinstance(ci, int) or ci < 1:
-        fails.append("cold bench insns=%r -- expected >= 1" % ci)
+def sweep_results(doc, name):
+    if doc is None:
+        return None
+    if not isinstance(doc, dict) or "results" not in doc:
+        fails.append("%s: missing 'results' array -- this is not a bench_sweep "
+                     "response (the single-bench shape proves nothing here)" % name)
+        return None
+    r = doc["results"]
+    if not isinstance(r, list):
+        fails.append("%s: 'results' is not an array" % name)
+        return None
+    if len(r) != len(expected):
+        fails.append("%s: %d results, expected %d -- the sweep shape changed "
+                     "(did the endpoint start dropping or duplicating values?)"
+                     % (name, len(r), len(expected)))
+        return None
+    return r
+
+cr = sweep_results(cold, "cold_sweep.json")
+wr = sweep_results(warm, "warm_sweep.json")
+
+if cr is not None and wr is not None:
+    cold_blocks = []
+    for i, want in enumerate(expected):
+        c, w = cr[i], wr[i]
+        # ── the cold half: everything compiled, nothing cached ──────────
+        if c.get("loads") != want:
+            fails.append("cold value %d: loads=%r -- expected %d (the sweep "
+                         "order must be preserved)" % (i, c.get("loads"), want))
+        if c.get("ok") != "true":
+            fails.append("cold value %d (loads=%d): ok=%r -- expected true"
+                         % (i, want, c.get("ok")))
+        if c.get("cold") != "true":
+            fails.append("cold value %d (loads=%d): cold=%r -- expected true: "
+                         "the first launch must be a fresh cold start"
+                         % (i, want, c.get("cold")))
+        if c.get("tcache_hits") != 0:
+            fails.append("cold value %d (loads=%d): tcache_hits=%r -- expected "
+                         "0: a cold boot must compile everything"
+                         % (i, want, c.get("tcache_hits")))
+        cb = c.get("blocks"); ci = c.get("insns")
+        if not isinstance(cb, int) or cb < 1:
+            fails.append("cold value %d (loads=%d): blocks=%r -- expected >= 1 "
+                         "compiled" % (i, want, cb))
+        if not isinstance(ci, int) or ci != want + 2:
+            fails.append("cold value %d (loads=%d): insns=%r -- expected %d: "
+                         "the bench program is loads+2 instructions and must "
+                         "complete" % (i, want, ci, want + 2))
+        cold_blocks.append(cb)
+        # ── the warm half: the restored cache, nothing recompiled ───────
+        if w.get("loads") != want:
+            fails.append("warm value %d: loads=%r -- expected %d (the sweep "
+                         "order must be preserved)" % (i, w.get("loads"), want))
+        if w.get("ok") != "true":
+            fails.append("warm value %d (loads=%d): ok=%r -- expected true"
+                         % (i, want, w.get("ok")))
+        if w.get("cold") != "false":
+            fails.append("warm value %d (loads=%d): cold=%r -- expected false: "
+                         "the warm run must hit the restored cache, not recompile"
+                         % (i, want, w.get("cold")))
+        if w.get("blocks") != 0:
+            fails.append("warm value %d (loads=%d): blocks=%r -- expected 0: "
+                         "nothing may be compiled on the warm run"
+                         % (i, want, w.get("blocks")))
+        if w.get("tcache_misses") != 0:
+            fails.append("warm value %d (loads=%d): tcache_misses=%r -- "
+                         "expected 0" % (i, want, w.get("tcache_misses")))
+        if w.get("tcache_hits") != cb:
+            fails.append("warm value %d (loads=%d): tcache_hits=%r != cold "
+                         "blocks=%r -- the restored TBs were not all hit (the "
+                         "round-trip contract)" % (i, want, w.get("tcache_hits"), cb))
+        if w.get("insns") != ci:
+            fails.append("warm value %d (loads=%d): insns=%r != cold insns=%r -- "
+                         "the guest result differed across the reboot"
+                         % (i, want, w.get("insns"), ci))
+    # ── the sweep must actually span multiple block counts ──────────────
+    if len(cold_blocks) >= 2:
+        for i in range(1, len(cold_blocks)):
+            if cold_blocks[i] <= cold_blocks[i - 1]:
+                fails.append("cold blocks not strictly increasing across the "
+                             "sweep (%s) -- the sweep must span multiple block "
+                             "counts, or the multi-count claim is vacuous"
+                             % cold_blocks)
 
 if chk is not None and chk.get("status") != 0:
     fails.append("checkpoint status=%r -- expected 0 (the tcache sync to NVMe "
                  "failed)" % chk.get("status"))
-
-if warm is not None and cold is not None:
-    if warm.get("ok") != "true":
-        fails.append("warm bench ok=%r -- expected true" % warm.get("ok"))
-    if warm.get("cold") != "false":
-        fails.append("warm bench cold=%r -- expected false: the warm run must "
-                     "hit the restored cache, not recompile" % warm.get("cold"))
-    if warm.get("blocks") != 0:
-        fails.append("warm bench blocks=%r -- expected 0: nothing may be "
-                     "compiled on the warm run" % warm.get("blocks"))
-    if warm.get("tcache_misses") != 0:
-        fails.append("warm bench tcache_misses=%r -- expected 0" % warm.get("tcache_misses"))
-    if warm.get("tcache_hits") != cold.get("blocks"):
-        fails.append("warm bench tcache_hits=%r != cold blocks=%r -- the restored "
-                     "TBs were not all hit (the round-trip contract)"
-                     % (warm.get("tcache_hits"), cold.get("blocks")))
-    if warm.get("insns") != cold.get("insns"):
-        fails.append("warm insns=%r != cold insns=%r -- the guest result differed "
-                     "across the reboot" % (warm.get("insns"), cold.get("insns")))
 
 print("\n".join(fails))
 sys.exit(1 if fails else 0)
@@ -166,11 +248,11 @@ PYEOF
 # ─── Replay mode: validate recorded artifacts, no boot. ────────────────────
 if [ -n "$REPLAY" ]; then
     if out="$(validate "$REPLAY")"; then
-        echo "PASS  replay: artifacts in $REPLAY satisfy the round-trip"
+        echo "PASS  replay: artifacts in $REPLAY satisfy the sweep round-trip"
         exit 0
     fi
     echo "$out" | sed 's/^/      /'
-    echo "FAIL  replay: artifacts in $REPLAY violate the round-trip"
+    echo "FAIL  replay: artifacts in $REPLAY violate the sweep round-trip"
     exit 1
 fi
 
@@ -240,13 +322,13 @@ if ! wait_health "cold boot"; then
     exit 1
 fi
 
-# ─── Cold bench: everything compiled, nothing cached. ──────────────────────
-body="$(curl -s -X POST "http://127.0.0.1:$PORT/api/qemu/bench" \
-    -H "Authorization: Bearer $TOK" -d '{"loads":500}' --max-time 120 2>&1)" || {
-    echo "FAIL  cold bench request failed: $body" >&2
+# ─── Cold sweep: every value compiled, nothing cached. ─────────────────────
+body="$(curl -s -X POST "http://127.0.0.1:$PORT/api/qemu/bench_sweep" \
+    -H "Authorization: Bearer $TOK" -d "{\"loads\":$SWEEP_JSON}" --max-time 180 2>&1)" || {
+    echo "FAIL  cold sweep request failed: $body" >&2
     exit 1
 }
-printf '%s' "$body" > "$W/cold.json"
+printf '%s' "$body" > "$W/cold_sweep.json"
 
 # ─── Checkpoint: TBs written to NVMe. ──────────────────────────────────────
 body="$(curl -s -X POST "http://127.0.0.1:$PORT/api/checkpoint" \
@@ -266,19 +348,19 @@ if ! wait_health "warm boot"; then
     exit 1
 fi
 
-# ─── Warm bench: everything hit, nothing compiled. ─────────────────────────
-body="$(curl -s -X POST "http://127.0.0.1:$PORT/api/qemu/bench" \
-    -H "Authorization: Bearer $TOK" -d '{"loads":500}' --max-time 120 2>&1)" || {
-    echo "FAIL  warm bench request failed: $body" >&2
+# ─── Warm sweep: every value hit, nothing compiled. ────────────────────────
+body="$(curl -s -X POST "http://127.0.0.1:$PORT/api/qemu/bench_sweep" \
+    -H "Authorization: Bearer $TOK" -d "{\"loads\":$SWEEP_JSON}" --max-time 180 2>&1)" || {
+    echo "FAIL  warm sweep request failed: $body" >&2
     exit 1
 }
-printf '%s' "$body" > "$W/warm.json"
+printf '%s' "$body" > "$W/warm_sweep.json"
 
 kill "$QPID" 2>/dev/null || true
 QPID=""
 
 if out="$(validate "$W")"; then
-    echo "PASS  tcache round-trip: cold compiled, checkpoint synced, reboot restored, warm all-hit"
+    echo "PASS  tcache round-trip: sweep cold-compiled, checkpoint synced, reboot restored, warm all-hit at $SWEEP"
     exit 0
 fi
 echo "$out" | sed 's/^/      /'
