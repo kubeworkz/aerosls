@@ -568,6 +568,68 @@ precedes `gen_helper_ltr`, and the deliveries show the exact ltr addresses
 0x20 for #NP), handler status 2, and recovery_ok -- all nine fixtures green in
 one boot, the faults gate now eight cases.
 
+**Update 2026-08-14 (iteration 26, M8.3): the double-fault #DF and the
+stack fault #SS delivered as first-class classes.** The fault delivery path
+gains Table 6-5's second-exception rules, and the last two hardware fault
+classes of the M8 list become real deliveries with their exact error-code
+semantics.
+
+The mechanism: a `sls_delivery_in_progress` window, armed by
+`sls_i386_try_deliver` the moment a delivery is decided and cleared by
+`sls_i386_deliver_fault` when the frame is on the stack -- exactly the
+delivery mechanism (gate fetch, TSS read, frame push), never the handler.
+`sls_i386_fault_record` (the chokepoint every raise path funnels through)
+now applies Table 6-5: a second exception inside the window that is #DF is a
+TRIPLE FAULT (recorded and halted); #NP/#SS are masked (the original
+delivery proceeds); #PF nests (the page-fault handler runs, the original is
+abandoned); every other vector escalates to #DF(8) with error code 0. #DF
+pushes an error code that is ALWAYS zero (Intel 386 manual §9.8; QEMU's
+`exception_has_error_code` lists 8), which the fixture asserts.
+
+That escalation exposed an M8.1 defect: the CPL3->CPL0 delivery with no TSS
+loaded previously RECORDED #TS(selector) and halted, but the #TS is raised
+while the delivery is pending, so Table 6-5 escalates it to #DF. The `_df`
+fixture proves the whole chain: at CPL 3 (the syscall/sysret round trip) the
+guest ud2's through a DPL-0 gate with no TSS loaded; the delivery's #TS
+escalates to #DF(8); the #DF gate's CS is the CPL3 selector 0x1b, so the #DF
+itself delivers same-CPL on the CPL3 stack (no TSS is needed -- or
+available); the handler pops the always-zero error code, skips the ud2, and
+iretq's back to the CPL3 recovery. The serial record shows the chain: "the
+delivery's #TS(0x8) escalates to #DF(8) (Table 6-5)" then "delivery: vector
+8 err=0x0 via IDT gate 0x001b ... frame from rip=0x401972" -- the exact ud2.
+
+The #SS side: `helper_load_seg` (MOV Sreg under the decoder) was a halting
+stub; it now has a real body (seg_helper.c's, with the descriptor read
+through the guest window like `helper_ltr` and the faults routed through the
+delivery path). The SDM's asymmetry is the trigger: a NOT-present SS
+descriptor is #SS(selector) -- NOT #NP, which is the DS/ES/FS/GS case. The
+`_ss` fixture loads a not-present writable data descriptor the setup builds
+at GDT[6] (selector 0x30): `mov %eax,%ss` (8e d0) -> #SS(0x30), the
+selector as the error code. `gen_movl_seg` now syncs eip before the helper
+call -- the same gap M8.2 closed for gen_LTR -- so the delivered frame's RIP
+is the exact mov (0x401759), and the handler's skip lands.
+
+Two supporting fixes the new cases surfaced. First, a genuine launch-order
+bug: the `_pf` case leaves guest paging enabled (the window's identity
+mapping swapped for the guest's own tables), and `sls_elf64_load` runs
+BEFORE `sls_launch_guest_at`'s paging reset -- so a load following a
+paging-on launch faulted through the stale tables and kernel-#PF'd. The
+loader now resets the guest address space itself (idempotent, no-op when
+paging is off), the same rule launch_guest_at applies. Second, the
+frontend-off (shipping) build's `compiled`/`elf` fixtures fail on the clean
+tree with "unimplemented opcode 0xf3": the legacy C frontend never handled
+REP/CET prefix bytes that the current fixture images emit (endbr64, rep
+movsb), a pre-existing gap invisible to CI and deploy (neither exercises
+those endpoints on the shipping build) -- recorded here, not fixed in this
+iteration.
+
+The gate: all ten fixtures green in one boot -- the faults gate is now ten
+cases, #DF delivering err=0 (the always-zero double-fault error code) and
+#SS delivering err=0x30 (the selector), each through a guest IDT gate with
+the handler recovering to a clean HLT. The full M1-M8.2 regression
+(compiled elf elf-reject tls brkmmap rdclock futex sse2 faults) passes on
+the decoder build.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
