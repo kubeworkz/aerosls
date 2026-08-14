@@ -246,16 +246,56 @@ per SCOPE.h CATEGORY 9), `cli`/`sti`/`hlt`, `invlpg`.
 
 ### 4.5 Deferred — with reasons, not silence
 
-| Class | Count (of 765) | Reason |
+**Measured, not estimated (M7.5, iteration 29):** the census below is the
+actual surviving halting-stub universe at qemu-sls `9b61143` — 676 declared
+helpers, 48 with real bodies, **628 surviving halting stubs** — derived by
+`sls/gen_unsupported_list.py` from the same sources the kernel links
+(`target/i386/helper.h` + `ops_sse_header.h.inc` minus the real-body
+renames in `sls-i386-helper-stubs.c`). The count moved from the plan's
+"~600" guess to a number that regenerates on every commit; the vector
+family split carries the usual glue-family imprecision, the x87/3DNow/SHA/
+MPX/tail counts are exact.
+
+| Class | Stub helpers | Why permanent |
 |---|---|---|
-| AVX/AVX2/AVX-512 | ~400 of the 507 vector | The agreed target's compiler output needs SSE2, not AVX; a halting stub is correct until then |
-| MMX | subset of 507 | Dead in 64-bit compiler output; x87-era |
-| x87 FPU (all 59) | 59 | gcc emits x87 only for `long double`; fixtures use `-mlong-double-64` or `-msoft-float` — document the flag, don't implement 80-bit math in M1–M6 |
-| 3DNow!, transactional memory, VMX/SVM, sysenter/sysexit | tail | Never in static-Linux-binary output |
+| AVX/AVX-512 (ymm) | 131 | gcc -mno-avx output never emits a ymm op; the agreed target needs SSE2 scalar only |
+| SSE vector (xmm) | 176 | the M6 scalar slice took the arithmetic/convert/compare the compiler emits; the packed family is not in its output |
+| MMX | 135 | dead in 64-bit compiler output (x87-era); the 118 `_mmx` glue helpers exist only for QEMU's unified vector backend |
+| x87 FPU | 80 | gcc emits x87 only for `long double`; fixtures use `-mlong-double-64` / `-msoft-float` (documented flag, no 80-bit math). The old "59" was per-instruction-class; the helper-name count is 80 |
+| 3DNow! | 19 | never in any 64-bit compiler output (removed from hardware after AMD K6-2/K7) |
+| SHA | 10 | gcc emits SHA extensions only under `-msha`; the agreed target does not |
+| MPX bounds | 6 | Intel MPX was removed from hardware in 2021; never in modern compiler output |
+| AVX-FMA | 8 | fma4 was AMD-only and never shipped in 64-bit gcc output; the agreed target is SSE2 |
+| system/legacy (state save) | 2 | `fxsave`/`fxrstor` belong to the x87/MMX class the target never uses |
+| system/legacy | 55 | sysenter/sysexit, monitor/mwait, pause, xsave/xrstor, SVM/VMX, in/out, BCD/bound, lar/lsl/lldt, lret, rsm, rdpmc/rdrand/rdpid, pkru/xgetbv, pdep/pext — never in static-Linux-binary output |
 | Real-mode / protected-mode boot sequence | — | Guest starts in long mode (Gap A decision); the legacy path emulates nothing |
 
-The permanent-unsupported list is a *documented output* of M7, not a hidden assumption:
-at the end, the remaining halting stubs are the spec of what this build does not run.
+**One row is NOT permanent.** The signed/byte divide forms `divb_AL`,
+`divw_AX`, `idivb_AL`, `idivl_EAX`, `idivq_EAX`, `idivw_AX` — the M3
+integer debt the agreed target's compiler DOES emit (gcc `idiv`). The
+classifier returns NULL for these so the halting message says "owed", never
+§4.5. The M6 slice also left the SSE2 scalar `maxsd`/`maxss`/`minsd`/`minss`
+unwritten (they classify as SSE, owed, and would be a two-line body each if
+a fixture demanded them).
+
+The permanent-unsupported list is a *documented output* of M7, not a hidden
+assumption: the surviving halting stubs ARE the spec of what this build
+does not run. Two mechanisms keep that spec honest and rot-proof:
+
+- **The halting message names the class.** `sls_i386_helper_unimplemented`
+  (sls-i386-helper-stubs.c) routes every stub name through
+  `sls_i386_stub_class` (sls/sls-i386-stub-class.c) and prints the §4.5
+  class: "Class: AVX/AVX-512 (ymm) -- permanent-unsupported (§4.5 of the
+  AMD64 plan): the agreed target's compiler output never emits this." No
+  stub reads as live-but-is-not — the old "the next thing to write" text is
+  gone from the permanent classes, and the owed div/idiv family gets the
+  honest "not implemented by this build (owed, not permanent)".
+- **The classifier is pinned by a host test.** The classifier is pure C
+  with no QEMU headers, so the same file compiles in the kernel AND in
+  `tests/unsupported_class_host_test.c` (aerosls2), which asserts 39
+  representative names per class plus the NULL family — the two can never
+  drift, and the rules were validated against every one of the 628
+  survivors.
 
 ---
 
@@ -701,6 +741,36 @@ still compiles and links (the launcher hook change links in both configs).
 The Table 6-5 matrix is complete: every row -- masked #NP/#SS, nested #PF,
 escalation to #DF, the #DF-own-delivery triple fault -- now has a fixture
 behind it, delivered through guest IDT gates on the decoder path.
+
+**Update 2026-08-14 (iteration 29, M7.5): the §4.5 permanent-unsupported
+list is now WRITTEN — measured, class-named, and machine-checked.** M7's
+documented output (the plan's §4.5, "the surviving halting stubs are the
+spec of what this build does not run") was counts, not names. Three
+deliverables land it:
+
+1. **The measured census.** `sls/gen_unsupported_list.py` (qemu-sls)
+   derives the survivor universe from the same sources the kernel links
+   (helper.h + ops_sse_header.h.inc minus the real-body renames): 676
+   declared, 48 real, 628 surviving stubs — 131 AVX/AVX-512 (ymm), 176 SSE
+   vector (xmm), 135 MMX, 80 x87, 19 3DNow!, 10 SHA, 6 MPX, 8 AVX-FMA, 57
+   system/legacy (+2 state-save), regenerable at any commit. The plan's
+   "~600" estimate is now a number that cannot rot.
+2. **Honest halting.** `sls_i386_helper_unimplemented` now prints the §4.5
+   class for every permanent stub ("Class: x87 FPU -- permanent-unsupported
+   (§4.5)") instead of the old "the next thing to write", which read as
+   live for classes the agreed target never emits. The one genuinely-owed
+   family — the signed/byte divides `divb_AL`..`idivq_EAX`, the M3 integer
+   debt — classifies NULL and gets "owed, not permanent". The audit also
+   found the M6 slice left SSE2-scalar `maxsd`/`maxss`/`minsd`/`minss`
+   unwritten (classified SSE, owed — two-line bodies if a fixture demands
+   them).
+3. **A pin.** The classifier is pure C (sls/sls-i386-stub-class.c, no QEMU
+   headers), compiled both into the kernel and into
+   `tests/unsupported_class_host_test.c`, which asserts 39 representative
+   names per class + the NULL family — 96/96 host checks green, the rules
+   validated against all 628 survivors. The decoder build links and boots
+   the full M1–M8.5 gate green; the frontend-off build is untouched (the
+   classifier object is frontend-only).
 
 ### M6 — SSE2 scalar slice.
 

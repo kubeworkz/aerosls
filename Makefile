@@ -479,7 +479,8 @@ $(TCG_OBJS): tcg-objs/%.x86.o: %.c $(AB_STAMP) $(SLS_STAMP)
 SLS_X86_FRONTEND ?= off
 ifeq ($(SLS_X86_FRONTEND),on)
 TARGET_OBJS = tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o \
-              tcg-objs/i386-helper-stubs.x86.o tcg-objs/i386-codefetch.x86.o
+              tcg-objs/i386-helper-stubs.x86.o tcg-objs/i386-codefetch.x86.o \
+              tcg-objs/i386-stub-class.x86.o
 # M3: the decoder build's INVLPG hook (helper_flush_page) is wired into the C
 # dispatcher's INVLPG decode, so the guest window's shadow PTEs are
 # invalidated through the same function a TCG-translated INVLPG will call.
@@ -538,6 +539,13 @@ tcg-objs/translator.x86.o: ../qemu/accel/tcg/translator.c $(AB_STAMP) $(SLS_STAM
 tcg-objs/i386-helper-stubs.x86.o: ../qemu/sls/sls-i386-helper-stubs.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs
 	$(X86_CC) $(TCG_CFLAGS) -DCOMPILING_PER_TARGET -c $< -o $@
+
+# M7.5: the §4.5 permanent-unsupported classifier -- pure C, no QEMU
+# headers, so the same file compiles in the host tests (aerosls2
+# tests/unsupported_class_host_test.c) that pin it against the census.
+tcg-objs/i386-stub-class.x86.o: ../qemu/sls/sls-i386-stub-class.c ../qemu/sls/sls-i386-stub-class.h $(AB_STAMP) $(SLS_STAMP)
+	@mkdir -p tcg-objs
+	$(X86_CC) $(TCG_CFLAGS) -c $< -o $@
 
 # Guest instruction fetch for the softmmu=OFF path, plus the TB page-lock
 # no-ops translator.c needs. Upstream gets both from cputlb.c (the soft MMU we
