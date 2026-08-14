@@ -630,6 +630,37 @@ the handler recovering to a clean HLT. The full M1-M8.2 regression
 (compiled elf elf-reject tls brkmmap rdclock futex sse2 faults) passes on
 the decoder build.
 
+**Update 2026-08-14 (iteration 27, M8.4): the triple fault as a recorded
+class -- and the recursion it exposed.** Designing the _tft fixture found a
+real defect in iteration 26's escalation: a DPL-0 #DF gate with no TSS
+loaded would NOT have triple-faulted -- the #DF's own delivery faults (the
+delivery's #TS again), escalates again, calls try_deliver(8) again, forever.
+A stack-overflow crash in the host kernel, not a shutdown.
+
+The fix is Table 6-5 read precisely. Escalating to #DF is only valid when
+the delivery already in progress is NOT the #DF's own; a fault raised while
+delivering #DF is the triple fault (hardware shuts the machine down). The
+escalation branch now checks `sls_pending_vector == EXCP08_DBLE` and, when
+true, records the triple fault instead of escalating. The record (the
+machine's "shutdown"): vector 8, error 0, the current RIP, exit code -1 --
+no delivery attempt, because the guest's own IDT can no longer help. The
+record logic is factored into `sls_i386_triple_fault`, shared by the direct
+"#DF raised while a delivery is pending" row of Table 6-5 and the new
+"fault raised while delivering #DF" case.
+
+The `_tft` fixture proves the shutdown end to end: the same CPL3 ud2 entry
+as `_df` (no TSS loaded), but the #DF gate's CS is KERNEL_CS (DPL 0), so
+the escalated #DF's OWN delivery also needs the TSS -- the second
+escalation is the triple fault. The serial record shows the full chain and
+the new halt: the #UD delivery's #TS escalates, the #DF delivery's #TS
+escalates, then "M8.4: TRIPLE FAULT -- fault raised while delivering #DF.
+Halting (a real CPU shuts down here)." The launcher gate asserts the
+shutdown shape: the launch ends halted with fault_vector 8 and error 0, and
+the #DF handler NEVER ran (fault_status[8] stays 0, recovery_ok stays 0) --
+proving the delivery was abandoned, not completed. The faults gate is now
+eleven cases; the full M1-M8.3 regression stays green on the decoder build,
+and the frontend-off (shipping) build still compiles and links.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
