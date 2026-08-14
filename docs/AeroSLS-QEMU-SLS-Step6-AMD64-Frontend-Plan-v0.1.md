@@ -387,8 +387,24 @@ read-back), unmaps it, maps again, and exits 0 - PASS in the same boot as the
 compiled/elf/elf-reject/tls gates, with the new /api/qemu/brkmmap endpoint
 added to the decoder-build CI gate list.
 
+**Update 2026-08-13 (iteration 18): read and clock_gettime landed.** `read`
+(syscall 0) serves a fixed boot-data stream — this kernel has no input devices
+for the guest (the emulator's serial is output-only), so the only source of guest
+input is the loader, and here it is bytes, not just addresses (the honest analogue
+of AT_RANDOM's fixed pattern); nonzero fds are -EBADF (there are no files).
+`clock_gettime` (228) supports CLOCK_MONOTONIC only: the build has no calibrated
+TSC-to-wallclock ratio (kernel/auth.h), so the monotonic clock is ticks-since-launch
+carried in a timespec - a real, strictly advancing counter, exactly what
+CLOCK_MONOTONIC promises; any other clockid is -EINVAL with the reason named (no
+wall clock). The gate fixture (sls/guest/rdclock.c, embedded as rdclock-bytes.h)
+drains the stream in three reads (head, short-read tail, EOF), proves a nonzero fd
+fails, takes two monotonic reads around a spin (sane nsec, non-decreasing total),
+proves an unknown clockid fails, and exits 0 - PASS in the same boot as the
+compiled/elf/elf-reject/tls/brkmmap gates, with the new /api/qemu/rdclock endpoint
+added to the decoder-build CI gate list.
+
 **Still owed before a full freestanding `gcc -static -nostdlib` binary runs:** the rest of the shim
-surface (`read`, `futex`, `clock_gettime` as the
+surface (`futex` as the
 binary demands them) — per the stub-halt discipline, each lands when a fixture calls it.
 
 ### M6 — SSE2 scalar slice.

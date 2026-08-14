@@ -549,7 +549,19 @@ tcg-objs/i386-helper-stubs.x86.o: ../qemu/sls/sls-i386-helper-stubs.c $(AB_STAMP
 # ships the previous guest -- the pattern rule below compiles sls-launcher.c
 # from its .c + stamps alone. This rule adds the header as a prerequisite;
 # it has no recipe, so the pattern rule still provides the compile.
-tcg-objs/sls-launcher.x86.o: ../qemu/sls/guest/guest-bytes.h
+# All EMBEDDED fixture headers are the same hazard as guest-bytes.h: a
+# fixture change that regenerates ONLY a header must still rebuild the
+# launcher object. This bit once: rdclock-bytes.h was regenerated after a
+# fixture fix and make (dependent only on guest-bytes.h) shipped the stale
+# bytes for four verification runs -- the gate kept failing for a defect
+# that was already fixed, because the embedded fixture was still the old
+# one. Every -bytes.h the launcher #includes is listed here.
+tcg-objs/sls-launcher.x86.o: ../qemu/sls/guest/guest-bytes.h \
+                             ../qemu/sls/guest/hello-bytes.h \
+                             ../qemu/sls/guest/dynhello-bytes.h \
+                             ../qemu/sls/guest/tls-bytes.h \
+                             ../qemu/sls/guest/brkmmap-bytes.h \
+                             ../qemu/sls/guest/rdclock-bytes.h
 
 tcg-objs/i386-codefetch.x86.o: ../qemu/sls/sls-i386-codefetch.c $(AB_STAMP) $(SLS_STAMP)
 	@mkdir -p tcg-objs

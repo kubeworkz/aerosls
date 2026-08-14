@@ -645,7 +645,7 @@ jobs:
           fi
           TOK=deadbeef01234567cafebabe76543210   # dave, DB_ADMIN
           fail=0
-          for ep in compiled elf elf-reject tls brkmmap; do
+          for ep in compiled elf elf-reject tls brkmmap rdclock; do
             # `|| true` on the capture: a curl failure (kernel wedged,
             # connection refused) exits non-zero, and under bash -e that
             # would abort the step BEFORE the pass check runs. Empty body

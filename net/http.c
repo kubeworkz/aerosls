@@ -2271,6 +2271,22 @@ static int api_qemu_selfmod_post(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
+static int api_qemu_rdclock_post(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    // M5: the input-and-clock gate -- sls/guest/rdclock.c compiled
+    // -static and embedded by the launcher. The guest drains the
+    // boot-data stream via read (syscall 0): head, short-read tail,
+    // EOF, plus a nonzero-fd refusal; then clock_gettime (228) on
+    // CLOCK_MONOTONIC twice around a spin (sane nsec, non-decreasing
+    // total) and an unknown clockid refusal, then exit_group(0).
+    int rc = sls_test_guest_rdclock();
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok",   rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_str(&j, "pass", rc == 0 ? "true" : "false"); jb_putc(&j, ',');
+    jb_uint(&j, "rc", (uint64_t)(rc < 0 ? (uint64_t)(-rc) : (uint64_t)rc));
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 static int api_qemu_brkmmap_post(char* buf, int max) {
     JSONBuf j = { buf, 0, max };
     // M5: the guest-heap shim gate -- sls/guest/brkmmap.c compiled
@@ -5674,6 +5690,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/qemu/brkmmap")) {
             blen = api_qemu_brkmmap_post(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/qemu/rdclock")) {
+            blen = api_qemu_rdclock_post(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/qemu/compiled")) {
