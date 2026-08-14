@@ -960,6 +960,45 @@ that hole.
    (launcher) + aerosls2 (endpoint, guard, smoke, doc).
 
 
+**Update 2026-08-14 (iteration 35, M8): the sweep reaches the endpoint's
+16-value cap — block counts 1..11 then 13..17, not just five shapes.** The
+iteration-34 sweep stopped at 8 blocks. Raising the bench cap was the
+enabler, and it surfaced a genuine property of the translator worth
+knowing.
+
+1. **The cap.** The bench's refusal limit was `TCG_MAX_INSNS - 2` (510
+   loads), a leftover from the one-TB-per-program frontend era. The
+   decoder splits blocks at the launcher's 64-instruction per-TB budget
+   (the `max_insns = 64` the exec loop passes to `x86_translate_code`),
+   so a long straight-line program spans several TBs and every load still
+   executes. The cap is now a named 16-block budget (1022 loads), and the
+   program buffer is sized for it. `/api/qemu/bench` and
+   `/api/qemu/bench_sweep` validation follow.
+2. **The 12-block gap (measured, then explained).** While the program
+   fits one 4 KiB page (loads ≤ 681), blocks == ceil((loads+2)/64)
+   exactly: loads 64k-63 → k blocks for k ≤ 11. A larger program always
+   lands 682 instructions on its first page (the MOV + 681 loads fill
+   exactly 4091 bytes, and the crossing instruction starts at byte 4091),
+   and the page-crossing split costs enough that the first crossing value
+   (loads 682) compiles 13 blocks, not 12 — so **12 is unattainable** with
+   the bench's straight-line shape. Measured bands: 682–720 → 13,
+   750–800 → 14, 833–860 → 15, 897–930 → 16, 961–1022 → 17–18. The sweep
+   therefore asserts the honest set: counts 1..11 then 13..17.
+3. **Arena: verified, not assumed.** Sixteen cold launches (141 blocks)
+   leave `arena_used` at 1,508,448 of 67,108,864 bytes — 2.25% — because
+   the arena free-list reuses blocks between launches (measured: launch 1
+   consumes ~1.5 MB, every later launch 0). The "64 MiB / ~43 blocks"
+   figure is about live blocks, not cumulative. The cold sweep fits with
+   two orders of magnitude to spare.
+4. **Measured (decoder default build):** 16 values cold-compile
+   [1..11, 13..17] blocks (141 TBs); after the checkpoint + reboot every
+   value warms with 0 blocks compiled, hits == cold blocks, 0 misses,
+   identical insns. M1–M8.5 gate 9/9, guard gate 19/19 + the owed entropy
+   runtime skip, guard smokes 20/20, source smokes 15/15, frontend-off
+   build still links. Two commits: qemu-sls (cap + buffer) + aerosls2
+   (validation, stride, guard, smoke, doc).
+
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.

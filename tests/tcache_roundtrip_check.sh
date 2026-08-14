@@ -20,15 +20,17 @@
 # The original guard benched ONE shape: loads=500, which translates to 8
 # blocks. A round-trip that only ever proves one block count says nothing
 # about the others — a regression that broke, say, single-block launches
-# would sail through. The sweep benches several loads values at once:
+# would sail through. The sweep benches sixteen loads values at once, one
+# per block count 1..11 then 13..17 (measured; see the values above for why
+# 12 is skipped):
 #
-#     loads:  1   64  128  256  500
-#     blocks: 1   2    3    5    8      (one TB holds 64 instructions)
+#     loads:  1  65  129  193  ...  641  682  750  833  897  961
+#     blocks: 1   2    3    4    ...   11   13   14   15   16   17
 #
-# Five distinct block counts round-trip through ONE checkpoint + reboot.
+# Sixteen distinct block counts round-trip through ONE checkpoint + reboot.
 # The trick that makes that possible is per-GPA placement: POST
 # /api/qemu/bench_sweep (net/http.c) runs each value through
-# sls_bench_load_path_at(), which places the program at its own 64 KiB-
+# sls_bench_load_path_at(), which places the program at its own 128 KiB-
 # aligned guest GPA instead of guest physical 0. Each program then owns its
 # own page — and its own tcache page digest — so the values do not
 # invalidate each other (the way two programs at the same GPA would), and a
@@ -85,12 +87,17 @@ ISO="${TCACHE_ISO:-sls_operating_system.iso}"
 PORT="${TCACHE_PORT:-}"
 TOK="deadbeef01234567cafebabe76543210"   # dave, DB_ADMIN — kernel/auth.c
 
-# The sweep: five loads values whose programs translate to five distinct
-# block counts (one TB holds 64 instructions): 1,2,3,5,8. The JSON form is
-# the request body; the comma form is handed to the validator so it can
-# check every requested value actually came back.
-SWEEP="1 64 128 256 500"
-SWEEP_JSON="[1,64,128,256,500]"
+# The sweep: sixteen loads values whose programs translate to sixteen
+# distinct block counts. One TB holds 64 instructions, so loads 64k-63 -> k
+# blocks while the program fits one 4 KiB page (k <= 11). A program larger
+# than one page always lands 682 instructions on page 1, whose split wastes
+# enough that the crossing starts at 13 blocks -- so 12 is genuinely
+# unattainable with the bench's straight-line shape, and the sweep is
+# counts 1..11 then 13..17 (loads 682..961, each at its own GPA). The JSON
+# form is the request body; the space form is handed to the validator so it
+# can check every requested value actually came back.
+SWEEP="1 65 129 193 257 321 385 449 513 577 641 682 750 833 897 961"
+SWEEP_JSON="[1,65,129,193,257,321,385,449,513,577,641,682,750,833,897,961]"
 
 REPLAY=""
 if [ "${1:-}" = "--replay" ]; then

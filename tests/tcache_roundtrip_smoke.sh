@@ -4,8 +4,8 @@
 # each one is mutated.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
-# tests/tcache_roundtrip_check.sh boots the ISO, sweep-benches (loads
-# 1,64,128,256,500 -> block counts 1,2,3,5,8), checkpoints, reboots, and
+# tests/tcache_roundtrip_check.sh boots the ISO, sweep-benches (sixteen
+# loads values -> block counts 1..11 then 13..17), checkpoints, reboots, and
 # asserts the Phase 2 cache round-tripped (cold compiled, warm all-hit,
 # identical insns) PER VALUE. Its teeth were proven by one hand-run
 # measurement. Nothing made it fail automatically, so a regression that made
@@ -25,18 +25,18 @@
 # guard cannot go blind while it is running there.
 #
 # ─── The teeth ─────────────────────────────────────────────────────────────
-# The artifact values mirror the sweep shape: five loads values at their own
-# GPAs (0x10000 * (i+1)), block counts 1,2,3,5,8. Each tooth breaks ONE
-# assertion input:
+# The artifact values mirror the measured sweep shape: sixteen loads values
+# (one per block count 1..11 then 13..17) at their own 128 KiB-aligned GPAs
+# (0x20000 * (i+1)). Each tooth breaks ONE assertion input:
 #
-#   1.  warm value 0 hits 0            -> the per-value "all hit" contract
-#   2.  warm value 1 blocks 3          -> the "0 blocks compiled" contract
-#   3.  warm value 2 cold=true         -> the "warm run must be warm" contract
-#   4.  warm value 3 insns changed     -> the "identical result" contract
-#   5.  cold value 4 blocks 0          -> the "each value compiled >= 1" tooth
-#   6.  cold value 0 cold=false        -> the cold-start tooth
-#   7.  cold value 1 insns != loads+2  -> the "program completed" tooth
-#   8.  cold value 2 hits 3            -> the "cold compiles everything" tooth
+#   1.  warm value 1 hits 0            -> the per-value "all hit" contract
+#   2.  warm value 2 blocks 3          -> the "0 blocks compiled" contract
+#   3.  warm value 3 cold=true         -> the "warm run must be warm" contract
+#   4.  warm value 4 insns changed     -> the "identical result" contract
+#   5.  cold value 16 blocks 0         -> the "each value compiled >= 1" tooth
+#   6.  cold value 1 cold=false        -> the cold-start tooth
+#   7.  cold value 2 insns != loads+2  -> the "program completed" tooth
+#   8.  cold value 3 hits 3            -> the "cold compiles everything" tooth
 #   9.  cold blocks not increasing     -> the "multiple block counts" tooth
 #   10. boot.log without "warm start"  -> the restore-banner grep
 #   11. boot.log "NVMe unavailable"    -> the >4 GiB BAR degradation grep
@@ -57,32 +57,62 @@ trap 'rm -rf "$TD"' EXIT
 
 # ─── The well-formed artifact set (mirrors the sweep shape) ────────────────
 # One JSON object per line so a tooth can sed one value without touching the
-# others; JSON does not care about the whitespace.
+# others; JSON does not care about the whitespace. The loads -> blocks map
+# is the measured one: loads 64k-63 -> k blocks while the program fits one
+# 4 KiB page (k <= 11); a larger program always crosses the page after 682
+# instructions and starts at 13 blocks, so 12 is skipped (see the guard).
+# gpa = 0x20000 * (i+1); insns = loads + 2.
 make_artifacts() {   # $1 = directory
     mkdir -p "$1"
-    cat > "$1/cold_sweep.json" <<'EOF'
-{"ok":"true","count":5,"results":[
- {"ok":"true","loads":1,"gpa":65536,"insns":3,"blocks":1,"code_bytes":1024,"tcache_hits":0,"tcache_misses":1,"cold":"true","arena_consumed":100000,"arena_used":100000,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":64,"gpa":131072,"insns":66,"blocks":2,"code_bytes":2048,"tcache_hits":0,"tcache_misses":2,"cold":"true","arena_consumed":110000,"arena_used":210000,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":128,"gpa":196608,"insns":130,"blocks":3,"code_bytes":3072,"tcache_hits":0,"tcache_misses":3,"cold":"true","arena_consumed":120000,"arena_used":330000,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":256,"gpa":262144,"insns":258,"blocks":5,"code_bytes":5120,"tcache_hits":0,"tcache_misses":5,"cold":"true","arena_consumed":130000,"arena_used":460000,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":500,"gpa":327680,"insns":502,"blocks":8,"code_bytes":8105,"tcache_hits":0,"tcache_misses":8,"cold":"true","arena_consumed":1507392,"arena_used":1508448,"arena_total":67108864,"softmmu":"off"}
-]}
-EOF
-    cat > "$1/warm_sweep.json" <<'EOF'
-{"ok":"true","count":5,"results":[
- {"ok":"true","loads":1,"gpa":65536,"insns":3,"blocks":0,"code_bytes":0,"tcache_hits":1,"tcache_misses":0,"cold":"false","arena_consumed":0,"arena_used":1056,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":64,"gpa":131072,"insns":66,"blocks":0,"code_bytes":0,"tcache_hits":2,"tcache_misses":0,"cold":"false","arena_consumed":0,"arena_used":1056,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":128,"gpa":196608,"insns":130,"blocks":0,"code_bytes":0,"tcache_hits":3,"tcache_misses":0,"cold":"false","arena_consumed":0,"arena_used":1056,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":256,"gpa":262144,"insns":258,"blocks":0,"code_bytes":0,"tcache_hits":5,"tcache_misses":0,"cold":"false","arena_consumed":0,"arena_used":1056,"arena_total":67108864,"softmmu":"off"},
- {"ok":"true","loads":500,"gpa":327680,"insns":502,"blocks":0,"code_bytes":0,"tcache_hits":8,"tcache_misses":0,"cold":"false","arena_consumed":0,"arena_used":1056,"arena_total":67108864,"softmmu":"off"}
-]}
-EOF
+    # pairs: "loads blocks"
+    pairs="1 1
+65 2
+129 3
+193 4
+257 5
+321 6
+385 7
+449 8
+513 9
+577 10
+641 11
+682 13
+750 14
+833 15
+897 16
+961 17"
+    {
+        echo '{"ok":"true","count":16,"results":['
+        i=0
+        echo "$pairs" | while read -r loads blocks; do
+            i=$((i + 1))
+            insns=$((loads + 2))
+            gpa=$((i * 0x20000))
+            if [ "$i" -lt 16 ]; then sep=','; else sep=''; fi
+            if [ "$i" -eq 1 ]; then arena=1507392; else arena=0; fi
+            printf ' {"ok":"true","loads":%d,"gpa":%d,"insns":%d,"blocks":%d,"code_bytes":%d,"tcache_hits":0,"tcache_misses":%d,"cold":"true","arena_consumed":%d,"arena_used":1508448,"arena_total":67108864,"softmmu":"off"}%s\n' \
+                "$loads" "$gpa" "$insns" "$blocks" $((1024 * blocks)) "$blocks" "$arena" "$sep"
+        done
+        echo ']}'
+    } > "$1/cold_sweep.json"
+    {
+        echo '{"ok":"true","count":16,"results":['
+        i=0
+        echo "$pairs" | while read -r loads blocks; do
+            i=$((i + 1))
+            insns=$((loads + 2))
+            gpa=$((i * 0x20000))
+            if [ "$i" -lt 16 ]; then sep=','; else sep=''; fi
+            printf ' {"ok":"true","loads":%d,"gpa":%d,"insns":%d,"blocks":0,"code_bytes":0,"tcache_hits":%d,"tcache_misses":0,"cold":"false","arena_consumed":0,"arena_used":1056,"arena_total":67108864,"softmmu":"off"}%s\n' \
+                "$loads" "$gpa" "$insns" "$blocks" "$sep"
+        done
+        echo ']}'
+    } > "$1/warm_sweep.json"
     printf '%s\n' \
         '[QEMU-SLS TCACHE] no snapshot — cold start' \
-        '[QEMU-SLS TCACHE] synced: 19 TBs, 19477 code bytes (buffer high-water, includes inter-block alignment)' \
-        '[QEMU-SLS TCACHE] warm start — codebuf_used=19477, codebuf=0x0000000007ae0000' > "$1/boot.log"
-    printf '%s' '{"status":0,"seq":1,"count":19}' > "$1/checkpoint.json"
+        '[QEMU-SLS TCACHE] synced: 141 TBs, 126686 code bytes (buffer high-water, includes inter-block alignment)' \
+        '[QEMU-SLS TCACHE] warm start — codebuf_used=126686, codebuf=0x0000000007ae1000' > "$1/boot.log"
+    printf '%s' '{"status":0,"seq":1,"count":141}' > "$1/checkpoint.json"
 }
 
 # tooth NAME  -> runs the guard against the current artifacts
@@ -118,49 +148,52 @@ else
     fails=$((fails + 1))
 fi
 
-# ─── Tooth 1: warm value 0 with 0 hits — its restored TBs were ignored. ────
+# ─── Tooth 1: warm value 1 with 0 hits — its restored TBs were ignored. ────
+# Line-targeted: a global s/ would also hit "tcache_hits":16 (value 16) and
+# turn it into ":06", which is invalid JSON and would fail for the wrong
+# reason.
 make_artifacts "$TD/art"
-sed -i 's/"tcache_hits":1/"tcache_hits":0/' "$TD/art/warm_sweep.json"
+sed -i '2s/"tcache_hits":1/"tcache_hits":0/' "$TD/art/warm_sweep.json"
 tooth "1 (warm hits=0)"     "not all hit"
 
-# ─── Tooth 2: warm value 1 compiled 3 new blocks. ──────────────────────────
+# ─── Tooth 2: warm value 2 compiled 3 new blocks. ──────────────────────────
 make_artifacts "$TD/art"
 sed -i '3s/"blocks":0/"blocks":3/' "$TD/art/warm_sweep.json"
 tooth "2 (warm blocks=3)"   "nothing may be compiled"
 
-# ─── Tooth 3: warm value 2 reported cold=true — cache not consulted. ───────
+# ─── Tooth 3: warm value 3 reported cold=true — cache not consulted. ───────
 make_artifacts "$TD/art"
 sed -i '4s/"cold":"false"/"cold":"true"/' "$TD/art/warm_sweep.json"
 tooth "3 (warm cold=true)"  "must hit the restored cache"
 
-# ─── Tooth 4: warm value 3 insns differ — result changed across reboot. ────
+# ─── Tooth 4: warm value 4 insns differ — result changed across reboot. ────
 make_artifacts "$TD/art"
-sed -i '5s/"insns":258/"insns":257/' "$TD/art/warm_sweep.json"
+sed -i '5s/"insns":195/"insns":194/' "$TD/art/warm_sweep.json"
 tooth "4 (warm insns!=cold)" "differed across the reboot"
 
-# ─── Tooth 5: cold value 4 compiled 0 blocks — the value never ran. ────────
+# ─── Tooth 5: cold value 16 compiled 0 blocks — the value never ran. ───────
 make_artifacts "$TD/art"
-sed -i '6s/"blocks":8/"blocks":0/' "$TD/art/cold_sweep.json"
+sed -i '17s/"blocks":17/"blocks":0/' "$TD/art/cold_sweep.json"
 tooth "5 (cold blocks=0)"   "expected >= 1 compiled"
 
-# ─── Tooth 6: cold value 0 reported cold=false — the disk was reused. ──────
+# ─── Tooth 6: cold value 1 reported cold=false — the disk was reused. ──────
 make_artifacts "$TD/art"
 sed -i '2s/"cold":"true"/"cold":"false"/' "$TD/art/cold_sweep.json"
 tooth "6 (cold cold=false)" "fresh cold start"
 
-# ─── Tooth 7: cold value 1 did not complete — insns != loads+2. ────────────
+# ─── Tooth 7: cold value 2 did not complete — insns != loads+2. ────────────
 make_artifacts "$TD/art"
-sed -i '3s/"insns":66/"insns":65/' "$TD/art/cold_sweep.json"
+sed -i '3s/"insns":67/"insns":66/' "$TD/art/cold_sweep.json"
 tooth "7 (cold insns short)" "the bench program is"
 
-# ─── Tooth 8: cold value 2 already hit the cache — nothing compiled. ───────
+# ─── Tooth 8: cold value 3 already hit the cache — nothing compiled. ───────
 make_artifacts "$TD/art"
 sed -i '4s/"tcache_hits":0/"tcache_hits":3/' "$TD/art/cold_sweep.json"
 tooth "8 (cold hits=3)"     "compile everything"
 
 # ─── Tooth 9: cold blocks not strictly increasing — single-count sweep. ────
 make_artifacts "$TD/art"
-sed -i '5s/"blocks":5/"blocks":3/' "$TD/art/cold_sweep.json"
+sed -i '9s/"blocks":8/"blocks":7/' "$TD/art/cold_sweep.json"
 tooth "9 (blocks not incr)" "span multiple block counts"
 
 # ─── Tooth 10: the restore banner never appeared. ──────────────────────────
@@ -179,18 +212,20 @@ sed -i 's/"status":0/"status":2/' "$TD/art/checkpoint.json"
 tooth "12 (checkpoint=2)"   "sync to NVMe"
 
 # ─── Tooth 13: the warm sweep lost a value — shape must match. ─────────────
-# Deleted value 4 and its trailing comma, so the artifact is still valid JSON
-# and the guard must fail on the LENGTH check, not on a parse error.
+# Deletes the LAST value (line 17) and its trailing comma (from line 16), so
+# the artifact stays valid JSON and the guard must fail on the LENGTH check,
+# not on a parse error. (Deleting a MIDDLE value would leave two values
+# adjacent with no comma -- a parse error, the wrong failure.)
 make_artifacts "$TD/art"
-sed -i -e '6d' -e '5s/,$//' "$TD/art/warm_sweep.json"
+sed -i -e '17d' -e '16s/,$//' "$TD/art/warm_sweep.json"
 tooth "13 (warm short)"     "sweep shape changed"
 
 # ─── Tooth 14: the cold sweep gained a stray value — shape must match. ─────
-# Splices a 6th value in before the closing bracket, valid JSON, so the
+# Splices a 17th value in before the closing bracket, valid JSON, so the
 # guard must fail on the LENGTH check (its per-value loop only walks the
-# expected five).
+# expected sixteen).
 make_artifacts "$TD/art"
-sed -i '6s/}$/},\n {"ok":"true","loads":999,"gpa":393216,"insns":1001,"blocks":1,"code_bytes":1024,"tcache_hits":0,"tcache_misses":1,"cold":"true","arena_consumed":100000,"arena_used":100000,"arena_total":67108864,"softmmu":"off"}/' "$TD/art/cold_sweep.json"
+sed -i '17s/}$/},\n {"ok":"true","loads":1023,"gpa":2179072,"insns":1025,"blocks":1,"code_bytes":1024,"tcache_hits":0,"tcache_misses":1,"cold":"true","arena_consumed":100000,"arena_used":100000,"arena_total":67108864,"softmmu":"off"}/' "$TD/art/cold_sweep.json"
 tooth "14 (cold long)"      "sweep shape changed"
 
 if [ "$fails" -eq 0 ]; then

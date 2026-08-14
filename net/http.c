@@ -2088,22 +2088,23 @@ static int api_qemu_bench_post(const char* body, char* buf, int max) {
     JSONBuf j = { buf, 0, max };
 
     // Default 256 matches user/shell.c's `qemu bench`. The launcher refuses
-    // anything above TCG_MAX_INSNS - 2 (510) because one TB holds at most
-    // TCG_MAX_INSNS instructions and the program needs two more for setup and
-    // halt. Validated HERE rather than left to the launcher: its refusal goes
-    // to the serial console, which an HTTP caller never sees, so it would look
-    // like an empty success.
+    // anything above 1022 (16 blocks of the decoder's 64-insn per-TB budget,
+    // minus the two setup/halt instructions) -- the old TCG_MAX_INSNS - 2
+    // cap assumed one TB held the whole program, which stopped being true
+    // when the decoder split blocks at 64. Validated HERE rather than left
+    // to the launcher: its refusal goes to the serial console, which an HTTP
+    // caller never sees, so it would look like an empty success.
     uint32_t loads = 256;
     if (body) {
         uint64_t v = json_uint64(body, "loads");
         if (v) loads = (uint32_t)v;
     }
-    if (loads < 1 || loads > 510) {
+    if (loads < 1 || loads > 1022) {
         jb_obj_open(&j, 0);
         jb_str(&j, "error", "loads out of range");
         jb_putc(&j, ',');
         jb_uint(&j, "min", 1); jb_putc(&j, ',');
-        jb_uint(&j, "max", 510); jb_putc(&j, ',');
+        jb_uint(&j, "max", 1022); jb_putc(&j, ',');
         jb_uint(&j, "requested", (uint64_t)loads);
         jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
     }
@@ -2208,7 +2209,7 @@ static int api_qemu_bench_sweep_post(const char* body, char* buf, int max) {
     if (n < 1)
         err = "missing or empty \"loads\" array";
     for (int i = 0; !err && i < n; i++) {
-        if (loads[i] < 1 || loads[i] > 510) { err = "loads out of range"; break; }
+        if (loads[i] < 1 || loads[i] > 1022) { err = "loads out of range"; break; }
         for (int k = 0; k < i; k++)
             if (loads[k] == loads[i]) { err = "duplicate loads value"; break; }
     }
@@ -2226,11 +2227,11 @@ static int api_qemu_bench_sweep_post(const char* body, char* buf, int max) {
     for (int i = 0; i < n; i++) {
         uint64_t cycles = 0;
         uint32_t insns  = 0;
-        /* 64 KiB per slot: the program (< 4 KiB) and its buffer (< 32 KiB
-         * for 500 loads) stay inside one slot, so no two values touch a
-         * shared page. The response carries the GPA so the guard can
-         * distinguish the sweep's shape from a single-bench response. */
-        uint64_t gpa = (uint64_t)(i + 1) * 0x10000;
+        /* 128 KiB per slot: the worst case (loads=1022) is a ~6 KiB program
+         * plus a ~65 KiB buffer, so no two values touch a shared page. The
+         * response carries the GPA so the guard can distinguish the sweep's
+         * shape from a single-bench response. */
+        uint64_t gpa = (uint64_t)(i + 1) * 0x20000;
         int rc = sls_bench_load_path_at(loads[i], gpa, &cycles, &insns);
         if (i) jb_putc(&j, ',');
         jb_obj_open(&j, 0);
