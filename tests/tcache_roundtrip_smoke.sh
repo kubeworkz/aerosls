@@ -43,6 +43,8 @@
 #   12. checkpoint status 2            -> the sync-status tooth
 #   13. warm sweep missing a value     -> the shape-match tooth (length)
 #   14. cold sweep with a stray value  -> the shape-match tooth (length)
+#   15. a value claims 12 blocks       -> the documented unattainable-count
+#                                         tooth (the page-crossing gap)
 #
 # Exit: 0 if every tooth bit, 1 otherwise, 2 if python3 is missing.
 set -u
@@ -228,9 +230,20 @@ make_artifacts "$TD/art"
 sed -i '17s/}$/},\n {"ok":"true","loads":1023,"gpa":2179072,"insns":1025,"blocks":1,"code_bytes":1024,"tcache_hits":0,"tcache_misses":1,"cold":"true","arena_consumed":100000,"arena_used":100000,"arena_total":67108864,"softmmu":"off"}/' "$TD/art/cold_sweep.json"
 tooth "14 (cold long)"      "sweep shape changed"
 
+# ─── Tooth 15: a cold value claims the unattainable 12-block count. ────────
+# The documented page-crossing gap (iteration 35) says 12 blocks is
+# impossible with the bench's straight-line shape; a measurement showing it
+# means the sweep values and the doc are stale. Cold blocks AND warm hits
+# are mutated together (line 13 = value 12) so the round-trip still agrees
+# internally -- only the gap check may fire.
+make_artifacts "$TD/art"
+sed -i '13s/"blocks":13/"blocks":12/' "$TD/art/cold_sweep.json"
+sed -i '13s/"tcache_hits":13/"tcache_hits":12/' "$TD/art/warm_sweep.json"
+tooth "15 (unattainable 12)" "12 is unattainable"
+
 if [ "$fails" -eq 0 ]; then
     echo
-    echo "PASS  tcache_roundtrip guard: 1 accept + 14 reject teeth all bite"
+    echo "PASS  tcache_roundtrip guard: 1 accept + 15 reject teeth all bite"
     exit 0
 fi
 

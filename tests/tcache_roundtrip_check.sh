@@ -243,6 +243,23 @@ if cr is not None and wr is not None:
                              "counts, or the multi-count claim is vacuous"
                              % cold_blocks)
 
+    # ── the documented 12-block gap (iteration 35) ────────────────────────
+    # The bench program can never compile exactly 12 blocks: while it fits
+    # one 4 KiB page, blocks == ceil((loads+2)/64) (1..11); any larger
+    # program always lands 682 instructions on its first page and starts
+    # at 13. A value reporting 12 therefore means the translator's split
+    # changed -- the sweep's value set and the iteration-35 doc are stale,
+    # and that must be a loud failure, not a silently-accepted new shape.
+    # (This is a canary on a measured translator property, not a
+    # correctness invariant: the round-trip itself is still asserted per
+    # value above.)
+    if 12 in cold_blocks:
+        fails.append("cold sweep contains a 12-block value (%s) -- the "
+                     "documented page-crossing gap says 12 is unattainable with "
+                     "the bench's straight-line shape; if the translator changed, "
+                     "update the sweep values and the iteration-35 doc"
+                     % cold_blocks)
+
 if chk is not None and chk.get("status") != 0:
     fails.append("checkpoint status=%r -- expected 0 (the tcache sync to NVMe "
                  "failed)" % chk.get("status"))

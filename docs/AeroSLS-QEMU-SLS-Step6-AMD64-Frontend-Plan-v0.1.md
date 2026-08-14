@@ -999,6 +999,28 @@ knowing.
    (validation, stride, guard, smoke, doc).
 
 
+**Update 2026-08-14 (iteration 36, M8): the 12-block gap is now
+machine-checked.** The iteration-35 finding — the bench's straight-line
+program can never compile exactly 12 blocks, because any program larger
+than one 4 KiB page always lands 682 instructions on its first page and
+starts at 13 — was a documented measurement with no enforcement. A future
+translator change that shifted the split could have made 12 reachable
+without breaking anything, silently stranding the doc's claim and the
+sweep's value set.
+
+The guard's validator now rejects any sweep whose cold blocks contain a
+12-block value, citing the documented gap and pointing at the stale
+artifacts (sweep values + this doc) that would have to be updated. It is
+a canary on a measured translator property, not a correctness invariant —
+the per-value round-trip is still asserted separately — so it fires only
+when the claim itself stops being true. The smoke grew tooth 15: it
+mutates value 12's cold blocks (and the matching warm hits, so the
+round-trip still agrees internally) to 12 and asserts the guard fails for
+the gap reason. **Measured:** smoke 1 accept + 15 reject teeth all bite,
+live 16-value round-trip still green with the canary silent, source
+smokes 15/15, guard smokes 20/20. aerosls2-only commit.
+
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
