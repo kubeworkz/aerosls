@@ -459,6 +459,19 @@ the raise_exception body that previously named-and-halted is now the M7 record p
 and the #DE path routes through it instead of a kernel panic. M7's boundary, stated
 in the plan: delivery (IDT, iretq, ring transitions) remains a later milestone.
 
+**Update 2026-08-13 (iteration 22, M7): error codes carried in the record.** The
+fault-record's error field is no longer silently 0 for the two classes whose
+hardware error code is meaningful. #PF already carried the real faulting PTE bits
+through the kernel hook (error=0x2 for the fixture's write-to-not-present store,
+CPL 0) -- the gate now asserts them. #GP gains a real selector code: the fixture
+adds a far call through memory (lcallq *mem, FF /3 -- the only far-call form long
+mode allows) to a selector no descriptor table can resolve. This build maintains
+no GDT/LDT, so hardware semantics are exactly #GP(selector), and the
+helper_lcall_protected/helper_ljmp_protected stubs (previously halting) now
+record #GP with the selector pushed as the error code -- the raise_exception_err
+path M7 records. swapgs-at-CPL3 remains #GP(0), which is its true hardware code
+and is asserted as such.
+
 ### M6 — SSE2 scalar slice.
 
 - xmm register state in the env, the §4.3 instruction set, mxcsr flag helpers.
