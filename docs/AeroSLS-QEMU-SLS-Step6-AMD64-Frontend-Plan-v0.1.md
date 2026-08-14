@@ -403,9 +403,26 @@ proves an unknown clockid fails, and exits 0 - PASS in the same boot as the
 compiled/elf/elf-reject/tls/brkmmap gates, with the new /api/qemu/rdclock endpoint
 added to the decoder-build CI gate list.
 
-**Still owed before a full freestanding `gcc -static -nostdlib` binary runs:** the rest of the shim
-surface (`futex` as the
-binary demands them) — per the stub-halt discipline, each lands when a fixture calls it.
+**Update 2026-08-13 (iteration 19): futex landed, closing the M5 shim surface.** `futex`
+(202, the 6-arg form: RDI=uaddr, RSI=op, RDX=val, R10=timeout, R8=uaddr2, R9=val3)
+models single-context honesty: this kernel runs exactly one execution context and has
+no scheduler, so a wake is only ever observable as a value change — the wait loop is
+Linux's own: check the word (mismatch = the release already happened -> -EAGAIN),
+then poll the word and the tick deadline. WAKE reports the true count (0: no
+concurrent waiter can exist), the op's low 7 bits are the command (the PRIVATE bit is
+a hint), unknown ops are -EINVAL, and a wait with NO timeout halts naming that it
+could never return (no waker can exist) instead of hanging the kernel. The gate
+fixture (sls/guest/futex.c, embedded as futex-bytes.h) proves the fast path, the
+private-hint equivalence, wake==0, -EINVAL, and a matched-word 20M-tick wait that
+really sleeps: -ETIMEDOUT with the monotonic clock advanced by about the requested
+interval — PASS in the same boot as the compiled/elf/elf-reject/tls/brkmmap/rdclock
+gates, with the new /api/qemu/futex endpoint added to the decoder-build CI gate list.
+
+**The M5 shim surface is now complete.** Every Linux-compat syscall the freestanding
+fixtures demand — write, exit/exit_group, brk, mmap, munmap, read, clock_gettime,
+futex — is real, verified on hardware, and gated in CI; the remaining milestones are
+M6 (SSE2 scalar, dropping the -mno-sse -msoft-float crutch) and M7 (fault semantics
+delivered to C).
 
 ### M6 — SSE2 scalar slice.
 
