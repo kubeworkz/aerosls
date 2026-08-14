@@ -508,7 +508,40 @@ its status, sets a flag, and syscalls back to CPL 0 where the shared syscall
 handler halts. All nine gates (compiled, elf, elf-reject, tls, brkmmap,
 rdclock, futex, sse2, faults) are green in one boot.
 
-The plan's later milestones -- the IDT ring transitions/TSS switch, syscall
+**Update 2026-08-13 (iteration 24, M8.1): the TSS stack switch.** M8's
+delivery pushed the frame at the faulting RSP for every delivery; this
+iteration makes the privilege-changing case real. A fault at CPL 3 through a
+gate whose CS is DPL 0 now switches stacks: `sls_i386_try_deliver` sees gate
+RPL < faulting CPL, reads RSP0 from the loaded TSS (env->tr.base + 4), pushes
+the frame THERE, and `sls_i386_deliver_fault` loads a null DPL-0 SS -- long-mode
+hardware behavior -- so the handler genuinely runs at CPL 0 on the TSS stack
+while the frame's RSP/SS slots carry the faulting CPL3 context for the iretq
+to restore. The guest side needs a real TR: `helper_ltr` (formerly a halting
+stub) now validates an available 64-bit TSS descriptor (S=0, type 9, present,
+within the GDT limit) from the guest's GDT through the window, loads
+env->tr, and marks the descriptor busy in the GDT -- LGDT was already inline
+in translate.c. A privilege-changing delivery with no TSS loaded is recorded
+as #TS(selector) (hardware semantics) rather than silently delivered on the
+wrong stack, so a fixture that forgets the GDT/TSS fails the gate instead of
+passing on a lie. The fixture's `_gp` entry (CPL3 swapgs) now sets up the
+GDT/TSS too -- the same path, verified twice -- and the new `_tss` entry runs
+the same fault through `tss_gp_handler`, which stashes its own entry RSP and
+the frame's CS/RSP/SS. The gate asserts the handler RSP is exactly
+TSS.RSP0 - 48 (the six-slot frame with the error code), the frame carries the
+CPL3 selectors this build's sysretq produces (CS=0x13, SS=0xb for
+STAR=0x00080008, measured identically by both CPL3 fixtures), and the frame
+RSP is the loader stack, not the TSS stack.
+
+One latent defect surfaced while wiring this: the M8 commit's faults-test doc
+comment had lost its closing `*/` (a review-time sed), silently commenting out
+`sls_test_guest_faults` -- the M8 object shipped without the symbol and the
+kernel could not have linked the endpoint. It is fixed here (the comment now
+closes), and the gate runs the function for real. All nine gates remain green
+in one boot, with the faults gate now six cases: ud2, div-by-zero,
+swapgs-at-CPL3 (TSS-delivered), the unresolvable far-call selector, the
+CPL3->CPL0 TSS stack switch, and the unmapped paged store.
+
+The plan's later milestones -- syscall
 interception, and the permanent-unsupported list -- remain, with this delivery
 path as their base.
 
