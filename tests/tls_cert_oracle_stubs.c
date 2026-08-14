@@ -19,6 +19,14 @@ void kernel_panic_dec(long long v);      void kernel_panic_dec(long long v) { (v
 void process_exit(int c);                void process_exit(int c) { (void)c; }
 int  kernel_get_current_thread_id(void); int kernel_get_current_thread_id(void) { return 0; }
 void qemu_sls_mmu_shadow_fault(void);    void qemu_sls_mmu_shadow_fault(void) {}
+/* M7's guest-#PF hook: kernel/stubs.c's handle_page_fault references the
+ * guest-paging flags and the launcher hook. Certificate generation never
+ * enables guest paging, so the flags stay 0 and sls_i386_guest_pf is never
+ * reached; they must exist for the link, not for the semantics. */
+int qemu_sls_guest_active = 0;
+int qemu_sls_guest_paging_on = 0;
+void sls_i386_guest_pf(uint64_t cr2, uint32_t error_code, uint64_t rip)
+{ (void)cr2; (void)error_code; (void)rip; }
 void *object_catalog = 0;
 unsigned long object_catalog_count = 0;
 char stack_bottom[1], stack_top[1];
