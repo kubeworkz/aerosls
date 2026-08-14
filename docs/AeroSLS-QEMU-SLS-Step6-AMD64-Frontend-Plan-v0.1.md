@@ -79,8 +79,9 @@ Every `CODE64`/`LMA` decision in `translate.c` reads `dc->flags` — `HF_CS64_MA
   waste. State this choice explicitly in the code: the guest starts at its ELF entry
   with long mode already on.
 - `CPUX86State` fields the decoder reads that `SLSCPUState` does not have: `eip` under
-  `env`, the segment registers and their bases (FS/GS base matter — static glibc uses
-  FS:0 as the thread pointer), `a20_mask`, the xmm/fp register files (Gap D), and the
+  `env`, the segment registers and their bases (FS/GS base matter — local-exec TLS
+  resolves every `%fs:offset` access through the FS base, the thread pointer),
+  `a20_mask`, the xmm/fp register files (Gap D), and the
   TCG env global layout `translate.c` binds via `offsetof`. The Step 6.1 shim already
   provides the real `CPUX86State`; the work is *initializing* it and keeping the two
   state structs coherent (or replacing `SLSCPUState` with `CPUX86State` outright —
@@ -148,9 +149,11 @@ Linux kernel underneath the guest, so the helper must route somewhere real:
    syscall number + args and stops. Proves the decode/emit/helper path end-to-end.
 2. **Route to the AeroSLS syscall surface** (`SYS_SLS_*`) — natural for SIMI-era
    guests, but the agreed target is *Linux* binaries that issue Linux syscall numbers.
-3. **A minimal Linux-compat shim inside SLS** — the endpoint for the agreed target:
-   `write`→serial, `exit`/`exit_group`, `brk`/`mmap`→SLS frames, plus whatever
-   `__libc_start_main`'s teardown needs (`read`, `futex`, `clock_gettime`). **M5.**
+3. **A minimal Linux-compat shim inside SLS** — `write`→serial,
+   `exit`/`exit_group`, `brk`/`mmap`/`munmap`→SLS frames, plus `read`, `futex`,
+   `clock_gettime` as the freestanding fixtures call them (stub-halt discipline:
+   implement what the fixture demands, nothing else — there is no libc in the
+   picture to demand a fixed surface). **M5.**
 
 The plan's position: (1) is the first milestone, (3) is the target, (2) is a parallel
 lane for SIMI guests that does not block the Linux-binary track. `swapgs` is already
@@ -164,11 +167,13 @@ machine code at a fixed GPA). "Arbitrary statically-linked Linux x86-64 binaries
 requires a loader before execution even starts:
 
 - Parse ELF64 (no interpreter — static means no PT_INTERP), place PT_LOAD segments,
-  zero BSS, honor PT_TLS (static glibc requires a TCB at FS:0 with the `tcbhead_t`
-  self-pointer — glibc will crash at `_dl_tls_setup`/`__libc_start_main` without it).
+  zero BSS, honor PT_TLS (the CPU has no TLS of its own: a fixture with `__thread`
+  locals reads them through `%fs:offset` immediates the linker baked against a thread
+  pointer at `tls_vaddr + round_up(memsz, align)`, so the loader must place the
+  template, zero `.tbss`, and build the TCB with the self-pointer that layout demands).
 - Build the initial stack in guest RAM: argc/argv/envp **and the auxv vector**
   (AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_ENTRY/AT_UID/AT_GID/AT_RANDOM/AT_EXECFN) —
-  static glibc reads these before main.
+  the System V ABI every ELF64 entry point expects to find at RSP.
 - Enter long mode at the ELF entry with the launcher-built identity tables covering the
   loaded segments and the stack (Gap A + B).
 
@@ -322,9 +327,12 @@ print/compare block shows all three markers green on a single end-to-end run.
 - Syscall shim (option 3 of Gap D): `write`→serial, `exit`/`exit_group`→launcher,
   `brk`/`mmap`/`munmap`→SLS frames, plus `read`, `futex`, `clock_gettime` as the
   binary demands them (stub-halt discipline: implement what the fixture calls).
-- **Gate — the agreed target, in one line:** `gcc -static` hello world prints to serial
-  and exits 0, delivered back to the launcher. This is the milestone the whole plan
-  exists for; M1–M4 are its prerequisites, and everything after is depth.
+- **Gate — the agreed target, in one line:** a freestanding static ELF64 fixture
+  (`gcc -static -nostdlib`, no libc and no user space — the payload obeys the same
+  constraint as the implementation) prints to serial and exits 0, delivered back to
+  the launcher, with its local-exec TLS reads resolving through the loader-built TCB.
+  This is the milestone the whole plan exists for; M1–M4 are its prerequisites,
+  and everything after is depth.
 
 **Status: the loader milestone landed 2026-08-13 (iteration 15).** `sls-elf64-loader.c`
 parses a static ELF64 (magic/class/endian/machine validated, ET_EXEC only), rejects
@@ -364,7 +372,7 @@ self-referential (tcb/self/dt at +0/+8/+0x10, block below TP), and exits 0 — 4
 insns, exit_code=0, PASS in the same boot as the elf/elf-reject gates, with the new
 /api/qemu/tls endpoint added to the decoder-build CI gate list.
 
-**Still owed before a full `gcc -static` glibc binary runs:** the rest of the shim
+**Still owed before a full freestanding `gcc -static -nostdlib` binary runs:** the rest of the shim
 surface (`brk`/`mmap`/`munmap`→SLS frames, `read`, `futex`, `clock_gettime` as the
 binary demands them) — per the stub-halt discipline, each lands when a fixture calls it.
 
@@ -419,21 +427,24 @@ binary demands them) — per the stub-halt discipline, each lands when a fixture
 - **The helper subset estimate is an estimate.** §4.2's "≈30–60" is derived from the
   census plus what gcc emits; the real list is whatever the M3/M5 fixtures halt on.
   That is why the milestones are binary-gated rather than count-gated.
-- **glibc's surface is not "hello world".** Even trivial `-static` binaries touch
-  `brk`, `mmap`, `futex`, `clock_gettime`, `read`, and TLS init in
-  `__libc_start_main`. M5's shim will grow by whatever the first real binary halts on
-  — the same discipline as 6.4, expected.
+- **The shim surface is fixture-driven, not libc-driven.** There is no libc; the
+  shim grows only by what the freestanding fixtures call — same discipline as
+  6.4. The risk note that motivated this row is now moot by construction: no
+  `__libc_start_main`, no hidden `brk`/`futex`/`clock_gettime` demand.
 - **The market honesty note (from the Repositioning plan, unchanged):** this frontend's
   value is x86-64 guests on *non-x86* hosts. On x86 hosts, hardware virtualization
   owns the row. A complete AMD64 frontend on x86-only hardware demonstrates the
   technique; it does not reach the market the Repositioning plan identified. The ARM64
   host port is the independent track that completes the story — this plan is
   deliberately frontend-only and does not pretend otherwise.
-- **"No user space or glibc" applies to the implementation, not the payload.** The
-  emulator is freestanding in-kernel code (as every `sls/` file already is); the guest
-  binaries the frontend runs are, by the agreed target, statically linked *with*
-  glibc. The constraint and the target live on opposite sides of the emulator boundary,
-  and both are satisfied by this plan.
+- **"No user space or glibc" is one constraint, on both sides of the boundary.**
+  The emulator is freestanding in-kernel code (as every `sls/` file already is), and
+  the guest binaries the frontend runs are freestanding too — `gcc -static
+  -nostdlib` fixtures compiled against the bare ABI, not a libc. A single-level storage
+  architecture has no libc to host a libc-linked payload: the loader rejects
+  PT_INTERP loudly for exactly this reason. This plan never changes that; glibc's
+  runtime (its own TLS setup, `__libc_start_main`, its syscall envelope) is the kind
+  of user space the architecture refuses, and the guest side stays on the same diet.
 
 ---
 
