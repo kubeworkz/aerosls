@@ -246,9 +246,9 @@ per SCOPE.h CATEGORY 9), `cli`/`sti`/`hlt`, `invlpg`.
 
 ### 4.5 Deferred — with reasons, not silence
 
-**Measured, not estimated (M7.5, iteration 29, resynced at iteration 38):**
+**Measured, not estimated (M7.5, iteration 29, resynced at iteration 39):**
 the census below is the actual surviving halting-stub universe at qemu-sls
-`56f4b5a` — 886 declared helpers, 133 with real bodies, **789 surviving
+`34c7fb9` — 886 declared helpers, 160 with real bodies, **765 surviving
 halting stubs** — derived by `sls/gen_unsupported_list.py` from the same
 sources the kernel links (`target/i386/helper.h` +
 `ops_sse_header.h.inc` minus the real-body renames in
@@ -262,9 +262,9 @@ exact.
 
 | Class | Stub helpers | Why permanent |
 |---|---|---|
-| AVX/AVX-512 (ymm) | 181 | gcc -mno-avx output never emits a ymm op; the agreed target needs SSE2 scalar only |
-| SSE vector (xmm) | 285 | the M6 scalar slice took the arithmetic/convert/compare the compiler emits; the packed family is not in its output |
-| MMX | 137 | dead in 64-bit compiler output (x87-era); the 118 `_mmx` glue helpers exist only for QEMU's unified vector backend |
+| AVX/AVX-512 (ymm) | 178 | gcc -mno-avx output never emits a ymm op; the agreed target needs SSE2 scalar only |
+| SSE vector (xmm) | 267 | the M6 scalar slice took the arithmetic/convert/compare the compiler emits; the packed family is not in its output |
+| MMX | 134 | dead in 64-bit compiler output (x87-era); the 118 `_mmx` glue helpers exist only for QEMU's unified vector backend |
 | x87 FPU | 80 | gcc emits x87 only for `long double`; fixtures use `-mlong-double-64` / `-msoft-float` (documented flag, no 80-bit math). The old "59" was per-instruction-class; the helper-name count is 80 |
 | 3DNow! | 19 | never in any 64-bit compiler output (removed from hardware after AMD K6-2/K7) |
 | SHA | 10 | gcc emits SHA extensions only under `-msha`; the agreed target does not |
@@ -278,12 +278,11 @@ exact.
 `divw_AX`, `idivb_AL`, `idivl_EAX`, `idivq_EAX`, `idivw_AX` — the M3
 integer debt the agreed target's compiler DOES emit (gcc `idiv`). The
 classifier returns NULL for these so the halting message says "owed", never
-§4.5. The SSE2 scalar min/max (`maxsd`/`maxss`/`minsd`/`minss`) and the
-packed compare family's imm-0..7 predicates (CMPPS/CMPPD, iteration 30 and
-38) are now real; the compare family's remaining rows are the scalar ss/sd
-forms (`cmpeqss`, `cmpltsd`, ... -- reachable by CMPSS/CMPSD, still stubs)
-and the AVX-only predicate bases (`cmpequ`..`cmptrue`, `cmpeqs`..`cmptrues`
--- never in `-mno-avx` output).
+§4.5. The SSE2 scalar min/max (`maxsd`/`maxss`/`minsd`/`minss`), the packed
+compare family's imm-0..7 predicates (CMPPS/CMPPD, iterations 30 and 38)
+and the scalar ss/sd forms (CMPSS/CMPSD, iteration 39) are now real; the
+compare family's only remaining rows are the AVX-only predicate bases
+(`cmpequ`..`cmptrue`, `cmpeqs`..`cmptrues` -- never in `-mno-avx` output).
 
 The permanent-unsupported list is a *documented output* of M7, not a hidden
 assumption: the surviving halting stubs ARE the spec of what this build
@@ -301,8 +300,8 @@ does not run. Two mechanisms keep that spec honest and rot-proof:
   with no QEMU headers, so the same file compiles in the kernel AND in
   `tests/unsupported_class_host_test.c` (aerosls2), which asserts 42
   representative names per class plus the NULL family — the two can never
-  drift, and the rules were validated against every one of the 789
-  survivors (iteration 38 added the scalar ss/sd cmp rows).
+  drift, and the rules were validated against every one of the 765
+  survivors (iteration 38 added the scalar ss/sd cmp classifier rule).
 
 ---
 
@@ -1103,6 +1102,52 @@ executed it.
    families became visible — the real progress is 42 new real bodies with
    the family now structurally enumerated, the same honesty the iteration
    29 audit restored for the other classes.
+
+**Update 2026-08-14 (iteration 39, M6.5): the scalar CMPSS/CMPSD family is
+CLOSED — the last compare rows the agreed compiler actually emits are real,
+and the census now measures 765 survivors at qemu-sls `34c7fb9`.** The
+iteration-38 payment took the packed forms and left the scalar ss/sd
+forms §4.5-owed; this payment closed them, and the fixture caught TWO
+value bugs of its own along the way.
+
+1. **The fixture (sls/guest/sse2.c, now 627 instructions, was 422).** All
+   eight imm-0..7 predicates on CMPSS and CMPSD through the intrinsics
+   (`_mm_cmpeq_ss` … `_mm_cmpord_sd`), with the low-lane mask read back
+   through `_mm_movemask_ps`/`_mm_movemask_pd` bit 0 and the upper-lane
+   copies from the first source pinned by storing result and source and
+   comparing lanes 1..3 (ss) / lane 1 (sd) exactly — CMPSS/CMPSD compare
+   ONLY the low lane and copy the upper lanes from the first source, the
+   scalar semantic that differs from the packed forms.
+2. **The fixture's low-lane values were wrong twice over — the honest
+   finding of this payment.** The `ssa`/`ssb` lane sets BOTH had low 1.0
+   (`ffe = 1.0f`), so `cmpltss` computed 1<1=false and the "1 < 9" comments
+   could never hold (the guest halted at cmpltss, and the other three
+   "failures" in the serial log were the 64-byte fail write sweeping
+   adjacent rodata strings — one real failure, three artifacts). The
+   strict/equality checks now use `ss9`/`sd9` — the b lane set with the
+   low lane replaced by 9.0 — for a real 1-vs-9 comparison; the negated
+   nlt/nle checks compare 3 against 1 so `!(3 < 1)`/`!(3 <= 1)` are TRUE,
+   the mask-1 path the section's `!= 1` checks are written for. The sd
+   upper-lane check had the same 1-vs-1 bug (`cmpneq_sd(sda, sdb)` could
+   never be ~0) and now uses sd9 too.
+3. **Fifteen real helpers** (sls/sls-i386-helper-stubs.c): cmpeqss through
+   cmpordss (8) and cmpltsd through cmpordsd (7; cmpeqsd was already real)
+   via one macro per lane family, the same exact IEEE truth table as the
+   packed forms. The corrected 1-vs-9 constructions surfaced THREE more
+   helpers as real compiler output: `pshufd` (dword shuffle), `punpckhdq`
+   (high-dword unpack) and `shufpd` (quadword shuffle, per QEMU's own
+   helper_shufpd) — the shufps twin stays a classified stub until a
+   fixture demands it.
+4. **Measured:** 886 declared, 160 real, **765 surviving stubs** (+27 real
+   over iteration 38: the 15 ss/sd forms plus the pshufd/punpckhdq/shufpd
+   forms). The compare family is now fully real for everything the agreed
+   target's compiler emits; only the AVX-only predicate bases
+   (`cmpequ`..`cmptrues`) remain, never reachable in `-mno-avx` output.
+   The sse2 fixture runs 627 instructions and the full M1–M8.5 corpus is
+   9/9 green in one boot on the decoder build; guard gate 19/19 + the owed
+   entropy runtime skip, guard smokes 20/20, source smokes 15/15, host
+   suite 96/96 (42 classifier checks), frontend-off build still links.
+
 
 ### M6 — SSE2 scalar slice.
 
