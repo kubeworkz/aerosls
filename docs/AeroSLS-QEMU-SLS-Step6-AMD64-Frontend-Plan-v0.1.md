@@ -246,9 +246,9 @@ per SCOPE.h CATEGORY 9), `cli`/`sti`/`hlt`, `invlpg`.
 
 ### 4.5 Deferred — with reasons, not silence
 
-**Measured, not estimated (M7.5, iteration 29, resynced at iteration 39):**
+**Measured, not estimated (M7.5, iteration 29, resynced at iteration 40):**
 the census below is the actual surviving halting-stub universe at qemu-sls
-`34c7fb9` — 886 declared helpers, 160 with real bodies, **765 surviving
+`734cbef` — 886 declared helpers, 166 with real bodies, **759 surviving
 halting stubs** — derived by `sls/gen_unsupported_list.py` from the same
 sources the kernel links (`target/i386/helper.h` +
 `ops_sse_header.h.inc` minus the real-body renames in
@@ -274,14 +274,16 @@ exact.
 | system/legacy | 55 | sysenter/sysexit, monitor/mwait, pause, xsave/xrstor, SVM/VMX, in/out, BCD/bound, lar/lsl/lldt, lret, rsm, rdpmc/rdrand/rdpid, pkru/xgetbv, pdep/pext — never in static-Linux-binary output |
 | Real-mode / protected-mode boot sequence | — | Guest starts in long mode (Gap A decision); the legacy path emulates nothing |
 
-**One row is NOT permanent.** The signed/byte divide forms `divb_AL`,
-`divw_AX`, `idivb_AL`, `idivl_EAX`, `idivq_EAX`, `idivw_AX` — the M3
-integer debt the agreed target's compiler DOES emit (gcc `idiv`). The
-classifier returns NULL for these so the halting message says "owed", never
-§4.5. The SSE2 scalar min/max (`maxsd`/`maxss`/`minsd`/`minss`), the packed
-compare family's imm-0..7 predicates (CMPPS/CMPPD, iterations 30 and 38)
-and the scalar ss/sd forms (CMPSS/CMPSD, iteration 39) are now real; the
-compare family's only remaining rows are the AVX-only predicate bases
+**The M3 divide debt is CLOSED (iteration 40).** The signed/byte divide
+forms `divb_AL`, `divw_AX`, `idivb_AL`, `idivl_EAX`, `idivq_EAX`,
+`idivw_AX` — the family the agreed target's compiler DOES emit (gcc
+`div`/`idiv`) — were the one "owed, not permanent" class, and all six are
+now real (with divq/divl, all eight forms; the classifier's NULL-returning
+owed path is no longer reachable from any emitted instruction). The SSE2
+scalar min/max (`maxsd`/`maxss`/`minsd`/`minss`), the packed compare
+family's imm-0..7 predicates (CMPPS/CMPPD, iterations 30 and 38) and the
+scalar ss/sd forms (CMPSS/CMPSD, iteration 39) are all real; the compare
+family's only remaining rows are the AVX-only predicate bases
 (`cmpequ`..`cmptrue`, `cmpeqs`..`cmptrues` -- never in `-mno-avx` output).
 
 The permanent-unsupported list is a *documented output* of M7, not a hidden
@@ -300,7 +302,7 @@ does not run. Two mechanisms keep that spec honest and rot-proof:
   with no QEMU headers, so the same file compiles in the kernel AND in
   `tests/unsupported_class_host_test.c` (aerosls2), which asserts 42
   representative names per class plus the NULL family — the two can never
-  drift, and the rules were validated against every one of the 765
+  drift, and the rules were validated against every one of the 759
   survivors (iteration 38 added the scalar ss/sd cmp classifier rule).
 
 ---
@@ -1145,6 +1147,50 @@ value bugs of its own along the way.
    (`cmpequ`..`cmptrues`) remain, never reachable in `-mno-avx` output.
    The sse2 fixture runs 627 instructions and the full M1–M8.5 corpus is
    9/9 green in one boot on the decoder build; guard gate 19/19 + the owed
+   entropy runtime skip, guard smokes 20/20, source smokes 15/15, host
+   suite 96/96 (42 classifier checks), frontend-off build still links.
+
+
+**Update 2026-08-14 (iteration 40, M6.5): the M3 integer divide debt is
+CLOSED — all eight div/idiv forms are real, the "owed" class has no
+remaining emitted instruction, and the census now measures 759 survivors
+at qemu-sls `734cbef`.** The signed/byte divide forms were the last
+NULL-classified (owed, not permanent) family the agreed compiler actually
+emits. divq/divl were already real (Step 6.4); this payment took the six
+owed stubs and drove all of them through the compiled guest.
+
+1. **The fixture (sls/guest/guest.c, now 1039 instructions).** gcc widens
+   C u8/u16 division to 16/32 bits, so the byte/word forms are reachable
+   only through real `divb`/`divw`/`idivb`/`idivw` instructions — inline
+   asm with a/d/c constraint operands, the dividend pieces in AX and
+   DX:AX exactly as the ISA demands, quotient/remainder extracted from
+   the AX/DX outputs in C. The signed 32/64 forms are plain C
+   (`int/int` -> idivl, `long/long` -> idivq). Every operand is a runtime
+   PARAM value; the launcher recomputes each quotient and remainder on the
+   host and compares the packed result words exactly — 300/7, 123456/234,
+   -249/7, -123456/234, -2000000000/97, -5000000000/123.
+2. **Six real helpers** (sls/sls-i386-helper-stubs.c), int_helper.c's
+   bodies verbatim with the #DE path through sls_i386_div_error (recorded
+   or delivered through the guest IDT, M7/M8): divb_AL, divw_AX, idivb_AL,
+   idivw_AX, idivl_EAX, and idivq_EAX — the last via `__int128` with the
+   one UB division (INT128_MIN / -1) guarded before dividing, matching
+   int_helper.c's idiv64 representability rule.
+3. **Two real bugs the fixture caught, both in the fixture's own first
+   draft.** (a) The first div/idiv asm used internal `movq %1, %%rax`
+   moves; the compiler had allocated an input operand in RAX, so the move
+   destroyed it and divw #DE'd (divisor == dividend's low bits). The
+   constraint-based rewrite has no internal moves. (b) The launcher's
+   divb/divw expectation packed the divw halves with 32-bit shifts (UB),
+   silently dropping them — the guest's own result was right and the
+   launcher's was not. Both are exactly the failure mode the fixture is
+   for.
+4. **Measured:** 886 declared, 166 real, **759 surviving stubs** (+6 real
+   over iteration 39; the owed NULL-classified family is gone — the
+   classifier's "owed, not permanent" path still exists for future
+   discoveries, but no emitted instruction reaches it). The compiled
+   fixture runs 1039 instructions (the launch budget was raised 1024 ->
+   4096 to cover the new section) and the full M1–M8.5 corpus is 9/9
+   green in one boot on the decoder build; guard gate 19/19 + the owed
    entropy runtime skip, guard smokes 20/20, source smokes 15/15, host
    suite 96/96 (42 classifier checks), frontend-off build still links.
 
