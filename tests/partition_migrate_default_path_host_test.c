@@ -73,6 +73,8 @@ static int checks_failed = 0;
  * tests/migration_data_movement_host_test.c's own choices, for the
  * identical reasons (see that file's header comment). ────────────────── */
 void kernel_serial_print(const char* s) { (void)s; }
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_partitions(void) { }
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }

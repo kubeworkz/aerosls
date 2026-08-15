@@ -63,6 +63,8 @@ void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (v
 static void log_reset(void) { g_log_len = 0; g_log[0] = '\0'; }
 static int  logged(const char* needle) { return strstr(g_log, needle) != NULL; }
 
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void persist_partitions(void) { }
 volatile uint64_t kernel_tick_counter = 0;
 

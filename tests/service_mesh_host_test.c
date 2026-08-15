@@ -45,6 +45,8 @@ static int checks_failed = 0;
 } while (0)
 
 void kernel_serial_print(const char* s) { (void)s; }
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_services(void) { }
 void persist_partitions(void) { }

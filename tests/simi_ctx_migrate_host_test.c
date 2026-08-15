@@ -94,6 +94,8 @@ uint64_t simi_rt_objtype(uint64_t v) {
     return 0xFFFFFFFFu;
 }
 void kernel_serial_print(const char* s) { (void)s; }
+void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id, const char* name, uint32_t source_node_id) { (void)partition_id; (void)owner_node_id; (void)name; (void)source_node_id; }
+void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) { (void)partition_id; (void)source_node_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
 /* ─── net/dspp.c dependencies outside this test's scope ────────────────

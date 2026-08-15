@@ -69,6 +69,8 @@ static int checks_failed = 0;
  * Faithful where faithfulness is observable, permissive where the
  * subsystem is out of scope and has its own coverage elsewhere. */
 void kernel_serial_print(const char* s) { (void)s; }
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
 /* persist_services() is counted, not performed: this test asserts that

@@ -80,6 +80,8 @@ static int checks_failed = 0;
 /* ─── Stubs for kernel/stream.c's dependencies (mirrors tests/migration_
  * data_movement_host_test.c's own identical choices) ────────────────────── */
 void kernel_serial_print(const char* s) { (void)s; }
+void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id, const char* name, uint32_t source_node_id) { (void)partition_id; (void)owner_node_id; (void)name; (void)source_node_id; }
+void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) { (void)partition_id; (void)source_node_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
 uint64_t sys_sls_insert(struct SLSRecordRequest* req) { (void)req; return 0; }

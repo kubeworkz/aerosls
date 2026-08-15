@@ -61,6 +61,8 @@ _Static_assert(sizeof(struct DSPPPacketHeader) <= DSPP_MAX_WIRE_PAYLOAD,
                "DSPPPacketHeader does not fit an Ethernet frame");
 _Static_assert(sizeof(struct DSPPServiceHeader) <= DSPP_MAX_WIRE_PAYLOAD,
                "DSPPServiceHeader does not fit an Ethernet frame");
+_Static_assert(sizeof(struct DSPPPartitionSyncHeader) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPPPartitionSyncHeader does not fit an Ethernet frame");
 _Static_assert(sizeof(struct DSPPMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
                "DSPPMigrateHeader does not fit an Ethernet frame");
 _Static_assert(sizeof(struct DSPPCtxMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
@@ -529,6 +531,18 @@ DSPP_SVC_SAME_OFFSET(transfer_id);
 DSPP_SVC_SAME_OFFSET(partition_id);
 DSPP_SVC_SAME_OFFSET(status);
 #undef DSPP_SVC_SAME_OFFSET
+#define DSPP_PART_SAME_OFFSET(f) \
+    _Static_assert(__builtin_offsetof(struct DSPPPartitionSyncHeader, f) == \
+                   __builtin_offsetof(struct DSPPMigrateHeader, f), \
+                   "DSPP partition header prefix drifted: " #f)
+DSPP_PART_SAME_OFFSET(magic);
+DSPP_PART_SAME_OFFSET(opcode);
+DSPP_PART_SAME_OFFSET(node_source_id);
+DSPP_PART_SAME_OFFSET(node_dest_id);
+DSPP_PART_SAME_OFFSET(transfer_id);
+DSPP_PART_SAME_OFFSET(partition_id);
+DSPP_PART_SAME_OFFSET(status);
+#undef DSPP_PART_SAME_OFFSET
 #undef DSPP_SAME_OFFSET
 
 static void dspp_ctx_hdr_init(struct DSPPCtxMigrateHeader* h, uint16_t opcode,
@@ -688,6 +702,54 @@ void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len) {
     }
 }
 
+/* ─── Partition-table replication send side ──────────────────────────── */
+static void dspp_part_send(uint16_t opcode, uint32_t partition_id,
+                           const char* name, uint32_t owner_node_id) {
+    struct DSPPPartitionSyncHeader h;
+    h.magic          = DSPP_MIGRATE_MAGIC;
+    h.opcode         = opcode;
+    h.node_source_id = (uint16_t)cluster_local_node_id();
+    h.node_dest_id   = 0;              /* broadcast -- everyone applies this */
+    h.transfer_id    = 0;
+    h.partition_id   = partition_id;
+    h.chunk_index    = 0;
+    h.status         = 0;
+    h.owner_node_id  = owner_node_id;
+    dspp_strncpy(h.partition_name, name ? name : "", sizeof(h.partition_name));
+
+    dspp_transmit_raw(&h, (uint16_t)sizeof(h));
+}
+
+void dspp_partition_announce(uint32_t partition_id, const char* name,
+                             uint32_t owner_node_id) {
+    /* Silent on a node with no cluster identity, same rule as the service
+     * family: announcing from node 0 would teach the segment a partition
+     * owned by a node that does not exist. */
+    if (cluster_local_node_id() == 0) return;
+    dspp_part_send(DSPP_PARTITION_ANNOUNCE, partition_id, name, owner_node_id);
+}
+
+void dspp_partition_withdraw(uint32_t partition_id) {
+    if (cluster_local_node_id() == 0) return;
+    dspp_part_send(DSPP_PARTITION_WITHDRAW, partition_id, "", 0);
+}
+
+void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len) {
+    if (!h || len < sizeof(struct DSPPPartitionSyncHeader)) return;
+
+    /* Ignore our own broadcast, same source self-filter as the service
+     * family: applying our own announce would just re-write the rows the
+     * announce was built from. */
+    if (h->node_source_id == (uint16_t)cluster_local_node_id()) return;
+
+    if (h->opcode == DSPP_PARTITION_ANNOUNCE) {
+        partition_sync_upsert(h->partition_id, h->owner_node_id,
+                              h->partition_name, h->node_source_id);
+    } else if (h->opcode == DSPP_PARTITION_WITHDRAW) {
+        partition_sync_withdraw(h->partition_id, h->node_source_id);
+    }
+}
+
 void dspp_rx_dispatch(void* buf, uint16_t len) {
     if (!buf || len < sizeof(uint64_t)) return;
     uint64_t magic;
@@ -708,6 +770,12 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
         if (opcode == DSPP_SVC_ANNOUNCE || opcode == DSPP_SVC_WITHDRAW) {
             if (len < sizeof(struct DSPPServiceHeader)) return;
             dspp_service_rx((struct DSPPServiceHeader*)buf, len);
+            return;
+        }
+
+        if (opcode == DSPP_PARTITION_ANNOUNCE || opcode == DSPP_PARTITION_WITHDRAW) {
+            if (len < sizeof(struct DSPPPartitionSyncHeader)) return;
+            dspp_partition_rx((struct DSPPPartitionSyncHeader*)buf, len);
             return;
         }
 

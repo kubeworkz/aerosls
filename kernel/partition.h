@@ -143,6 +143,20 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id);
  * Phase 2 scope note. */
 int partition_is_local(uint32_t partition_id);
 
+/* Partition-table replication RX (Multi-Node Phase 2): apply a partition
+ * row announced over DSPP (net/dspp.c's DSPP_PARTITION_ANNOUNCE/WITHDRAW).
+ * Called from dspp_partition_rx() -- the RX path (timer ISR), so neither
+ * function persists: replicated rows are runtime state, re-converged on
+ * the next announce, matching the service-registry remote cache rule.
+ * upsert: learn/refresh {name, owner} for partition_id from source_node;
+ * last announce wins, logged when it overwrites a different owner.
+ * withdraw: remove the row, but only if this node's owner row says
+ * source_node owned it (a non-owner cannot delete another node's
+ * partition -- the service family's source-scoped forget rule). */
+void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
+                           const char* name, uint32_t source_node_id);
+void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id);
+
 /* "Is this an active, defined partition?" (Orchestration Plan Phase 4)
  * PARTITION_SYSTEM always is. Public wrapper over the check
  * partition_create()/_destroy()/_migrate() already apply internally. */

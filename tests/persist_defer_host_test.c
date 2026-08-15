@@ -152,6 +152,8 @@ void vec_index_notify_insert(uint32_t u, const char* n, struct VecId id,
     (void)u; (void)n; (void)id; (void)eid; (void)v;
 }
 void kernel_serial_print(const char* s) { (void)s; }
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 int stream_relocate_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }

@@ -120,6 +120,8 @@ static int checks_failed = 0;
 /* ─── Stubs for kernel/partition.c's dependencies (Phase 8/10/14 precedent,
  * identical set dspp_phase5_host_test.c already uses) ──────────────────── */
 void kernel_serial_print(const char* s) { (void)s; }
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
 void persist_partitions(void) {}

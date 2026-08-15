@@ -16,6 +16,7 @@
 #include "object_catalog.h"
 #include "frame_pool.h"
 #include "../net/consensus.h"   // Multi-Node Partition Scaling Roadmap Phase 2 -- cluster_local_node_id()
+#include "../net/dspp.h"         // Multi-Node Phase 2 -- partition-row replication over DSPP (announce/withdraw)
 #include "stream.h"             // Multi-Node Phase 6 addendum -- stream_relocate_partition() (real migration data movement)
 #include "simi_ctx_migrate.h"   // PEC Phase 3 -- simi_ctx_migrate_send_partition()
 #include "service_registry.h"  // Orchestration Plan Phase 4 -- service_unregister_partition()
@@ -87,6 +88,11 @@ uint32_t partition_create(const char* name) {
             kernel_serial_printf("[PARTITION] created '%s' (id=%u, owner node=%u).\n",
                                  name, (unsigned)i, (unsigned)partition_owner_table[i].node_id);
             persist_partitions();   // Phase 10 (now also covers partition_owner_table[], Phase 2)
+            /* Multi-Node Phase 2: tell the cluster. dspp_partition_announce()
+             * is silent on an unclustered node (node id 0), so this stays a
+             * no-op for every single-node deployment. */
+            dspp_partition_announce((uint32_t)i, partition_table[i].name,
+                                    partition_owner_table[i].node_id);
             return (uint32_t)i;
         }
     }
@@ -174,6 +180,10 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
             kernel_serial_printf("[PARTITION] partition %u ownership set to node %u.\n",
                                  (unsigned)partition_id, (unsigned)node_id);
             persist_partitions();
+            /* Replicate the ownership change -- this is the one choke point
+             * every handoff goes through: partition_migrate() (Phase 6) and
+             * failover_recover_from()'s adoption both land here. */
+            dspp_partition_announce(partition_id, partition_table[partition_id].name, node_id);
             return 0;
         }
     }
@@ -189,6 +199,7 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
             kernel_serial_printf("[PARTITION] partition %u ownership row created, set to node %u.\n",
                                  (unsigned)partition_id, (unsigned)node_id);
             persist_partitions();
+            dspp_partition_announce(partition_id, partition_table[partition_id].name, node_id);
             return 0;
         }
     }
@@ -288,6 +299,9 @@ int partition_destroy(uint32_t partition_id) {
         (unsigned)cleared_assignments, (unsigned)frames_reclaimed);
 
     persist_partitions();   // Phase 10 -- partition_table[]/partition_assign_table[] mutated
+    /* Multi-Node Phase 2: tell the cluster the row is gone, so followers
+     * drop it instead of keeping a partition that no longer exists. */
+    dspp_partition_withdraw(partition_id);
     return 0;
 }
 
@@ -610,4 +624,90 @@ void sys_sls_partition_list(void) {
     }
     kernel_serial_printf(" %u assignment(s), all other uids -> partition %u (default/system).\n\n",
                          (unsigned)nassign, (unsigned)PARTITION_DEFAULT);
+}
+
+// ─── Multi-Node Partition Scaling Roadmap, Phase 2: replication RX ───────────
+// The apply half of partition-table replication. Called from
+// dspp_partition_rx() (net/dspp.c) on the wire path -- the timer ISR -- so
+// neither function persists and neither calls anything that blocks or does
+// I/O (see dspp.h's partition-sync comment for why that matches the
+// service-registry remote-cache rule). Both mirror service_remote_learn()/
+// _forget()'s rules: last announce wins (logged when it overwrites a
+// different owner), and a withdraw only applies if the source owned the row.
+void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
+                           const char* name, uint32_t source_node_id) {
+    if (partition_id == PARTITION_SYSTEM || partition_id >= PARTITION_MAX) return;
+    if (!name || !name[0] || owner_node_id == 0 || source_node_id == 0) return;
+
+    int had = partition_exists(partition_id);
+    uint32_t cur = had ? partition_get_owner_node(partition_id) : 0;
+    if (had && cur != 0 && cur != owner_node_id) {
+        /* Two nodes claiming one partition id. Same rule as a duplicate
+         * service name: last announce wins, logged rather than resolved
+         * silently -- this is an operator error (ids are local slot
+         * numbers, so two creators can collide). */
+        kernel_serial_printf(
+            "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
+            "taking the newer.\n",
+            (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id);
+    }
+
+    if (!had) {
+        partition_table[partition_id].partition_id = partition_id;
+        partition_table[partition_id].active = 1;
+    }
+    pt_strcpy(partition_table[partition_id].name, name, PARTITION_NAME_LEN);
+
+    /* Owner row written directly rather than via partition_set_owner_node():
+     * that function persists, and this path must not (RX ISR). */
+    int found = 0;
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (partition_owner_table[i].active &&
+            partition_owner_table[i].partition_id == partition_id) {
+            partition_owner_table[i].node_id = owner_node_id;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        for (int i = 0; i < PARTITION_MAX; i++) {
+            if (!partition_owner_table[i].active) {
+                partition_owner_table[i].partition_id = partition_id;
+                partition_owner_table[i].node_id      = owner_node_id;
+                partition_owner_table[i].active       = 1;
+                break;
+            }
+        }
+    }
+
+    kernel_serial_printf(
+        "[PARTITION] sync: partition %u '%s' (owner node %u) learned from node %u.\n",
+        (unsigned)partition_id, partition_table[partition_id].name,
+        (unsigned)owner_node_id, (unsigned)source_node_id);
+}
+
+void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) {
+    if (partition_id == PARTITION_SYSTEM || partition_id >= PARTITION_MAX) return;
+
+    uint32_t cur = partition_get_owner_node(partition_id);
+    if (cur != source_node_id) {
+        kernel_serial_printf(
+            "[PARTITION] sync: ignoring withdraw of partition %u from node %u "
+            "(owner is node %u) -- a non-owner cannot delete another node's "
+            "partition.\n",
+            (unsigned)partition_id, (unsigned)source_node_id, (unsigned)cur);
+        return;
+    }
+
+    partition_table[partition_id].active = 0;
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (partition_owner_table[i].active &&
+            partition_owner_table[i].partition_id == partition_id) {
+            partition_owner_table[i].active = 0;
+            break;
+        }
+    }
+    kernel_serial_printf(
+        "[PARTITION] sync: partition %u withdrawn by node %u.\n",
+        (unsigned)partition_id, (unsigned)source_node_id);
 }

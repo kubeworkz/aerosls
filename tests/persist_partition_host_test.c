@@ -132,6 +132,8 @@ struct SLSDatabaseEntry databases[DATABASE_MAX];
 struct SLSDatabaseGrant database_grants[DATABASE_GRANT_MAX];
 uint32_t database_next_id = 1;
 uint32_t database_grant_count = 0;
+void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
+void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
 /* Phase 14 (LPAR): partition.c's partition_destroy() (added this phase)

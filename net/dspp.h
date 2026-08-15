@@ -390,6 +390,71 @@ void dspp_service_announce(const char* name, uint32_t partition_id,
 void dspp_service_withdraw(const char* name);
 void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len);
 
+/* ─── Partition-table replication (Multi-Node Phase 2 gap) ─────────────
+ * Partition tables were local-only: a partition created on node 1 did
+ * not exist on node 2, and the failover doc row's honest boundary said
+ * so. This announces partition rows (id, name, owner) to the segment so
+ * every node's table converges on change -- create, migrate/adopt (both
+ * go through partition_set_owner_node()), and destroy.
+ *
+ * The same "announce, do not query" shape as the service family above,
+ * and for the same reason: each node ANNOUNCES what it owns and every
+ * other node applies what it hears. Broadcast (node_dest_id 0), exactly
+ * like the service family -- partition rows are cluster state, not a
+ * point-to-point transfer.
+ *
+ * ─── What is NOT replicated ───────────────────────────────────────────
+ * Only the table rows. The catalog objects and stream bytes inside a
+ * partition still move only via the migrate families; the checkpoint
+ * broadcast (failover) still carries the leader's tree. And, matching
+ * the service family's "must never be persisted" rule, a row learned
+ * from the wire is RUNTIME state on this node -- the RX path runs in
+ * the timer ISR, where persist_partitions()'s NVMe write must not run.
+ * A reboot re-converges on the next announce.
+ *
+ * ─── Last announce wins ───────────────────────────────────────────────
+ * Same conflict rule as service_remote_learn(): two nodes claiming one
+ * partition id is an operator error (ids are local slot numbers), and
+ * the only thing worse than picking one is picking one quietly -- so it
+ * is logged and the newer announce is taken. A withdraw applies only if
+ * this node's current owner row says the announcing node owned it (the
+ * service family's own source-scoped forget rule). */
+enum DSPPPartitionOpcode {
+    DSPP_PARTITION_ANNOUNCE = 15,  /* "partition <id> is named <name>, owned by <node>" */
+    DSPP_PARTITION_WITHDRAW = 16,  /* "partition <id> no longer exists" */
+};
+
+/* Mirrors PARTITION_NAME_LEN (kernel/partition.h) -- the same
+ * wire-vs-kernel constant pair DSPP_CTX_NAME_LEN already is. */
+#define DSPP_PARTITION_NAME_LEN 32
+
+struct DSPPPartitionSyncHeader {
+    /* Same prefix layout as the migrate/service headers -- static-asserted
+     * in dspp.c, for the same dispatcher reason. */
+    uint64_t magic;             /* DSPP_MIGRATE_MAGIC (shared family) */
+    uint16_t opcode;
+    uint16_t node_source_id;
+    uint32_t node_dest_id;      /* 0 == broadcast to the segment */
+    uint64_t transfer_id;       /* unused; keeps the prefix identical */
+    uint32_t partition_id;
+    uint32_t chunk_index;       /* unused */
+    uint8_t  status;
+    /* ── Partition-specific tail ──────────────────────────────────── */
+    uint32_t owner_node_id;     /* ANNOUNCE: who owns the partition now */
+    char     partition_name[DSPP_PARTITION_NAME_LEN];
+} __attribute__((packed));
+
+/* Sender side, called by kernel/partition.c's mutators. Silent on a node
+ * with no cluster identity (node id 0 is the Phase 1 uninitialized
+ * sentinel), same rule as dspp_service_announce(). */
+void dspp_partition_announce(uint32_t partition_id, const char* name,
+                             uint32_t owner_node_id);
+void dspp_partition_withdraw(uint32_t partition_id);
+/* Receiver side: called from dspp_rx_dispatch() for DSPP_PARTITION_*;
+ * applies the row via kernel/partition.c's partition_sync_upsert()/
+ * partition_sync_withdraw(). */
+void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len);
+
 /* Wraps dspp_len bytes at dspp_payload in a broadcast Ethernet frame
  * (ethertype ETHERTYPE_DSPP, net/net.h) and transmits it -- the one real
  * framing helper every DSPP send site (old and new) now goes through

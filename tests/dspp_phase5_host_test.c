@@ -265,7 +265,7 @@ int main(void) {
         req.header.opcode = DSPP_PAGE_READ_ACK;   /* not a routing opcode this function handles */
         CHECK(process_dspp_page_packet(&req) == 0, "an unrelated opcode (READ_ACK) is not serviced by process_dspp_page_packet");
     }
-    CHECK(transmit_call_count == 1, "exactly 1 real packet was transmitted total -- partition_lease_trigger_election()'s own REQUEST_VOTE in Scenario 4. Feeding the VOTE_REPLY in that same scenario does not itself transmit (a granted vote just updates local state), and process_dspp_page_packet() never transmits either (no page-move plumbing exists, by design)");
+    CHECK(transmit_call_count == 5, "exactly 5 real packets were transmitted total -- three partition_create() announcements + one partition_set_owner_node() announcement from partition-table replication over DSPP (Multi-Node Phase 2, dspp_partition_announce()), plus partition_lease_trigger_election()'s own REQUEST_VOTE in Scenario 4. Feeding the VOTE_REPLY in that same scenario does not itself transmit (a granted vote just updates local state), and process_dspp_page_packet() never transmits either (no page-move plumbing exists, by design)");
 
     /* ═══════════════════════════════════════════════════════════════════════
      * FRAME SIZE vs THE LINK
