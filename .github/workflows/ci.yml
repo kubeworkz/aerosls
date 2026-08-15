@@ -193,9 +193,9 @@ jobs:
       # through green. They are *smoke.sh*, not *_check.sh, so
       # run_checks.sh and deploy.sh's guard gate never run them.
       #
-      # run_guard_smokes.sh runs all twenty-two, but five need the linked
+      # run_guard_smokes.sh runs all twenty-three, but five need the linked
       # kernel or its objects, so that runner needs a build host. The
-      # other seventeen are source-only — gcc/binutils/python3/openssl and
+      # other eighteen are source-only — gcc/binutils/python3/openssl and
       # the sources in the tree, nothing built — so they run HERE, on
       # every push, independent of the kernel build. That independence is
       # the point: tls_cert_oracle_smoke.sh failed at link for months,
@@ -203,7 +203,7 @@ jobs:
       # build step before reaching its smokes. run_source_smokes.sh keeps
       # the source-only set green on its own, and fails any smoke that
       # cannot run without being on its build-needed exclusion list.
-      - name: Source-only guard teeth (all 17 smokes that need no build)
+      - name: Source-only guard teeth (all 18 smokes that need no build)
         run: bash tests/run_source_smokes.sh
         working-directory: aerosls2
 
@@ -224,15 +224,17 @@ jobs:
     # SLS_X86_FRONTEND=on, the same frontend deploy.sh ships) and runs
     # the deploy gate's two commands --
     # run_checks.sh --require-all and run_guard_smokes.sh -- so all
-    # eighteen guards pass AND all nineteen smokes prove their teeth on
-    # every push (the one runtime guard, entropy_boot_diversity, still
-    # reports its owed skip: it needs a live cluster). Then it boots the
+    # twenty-three guards pass AND all twenty-three smokes prove their teeth
+    # on every push (the four runtime guards -- entropy_boot_diversity,
+    # partition_reannounce_live, partition_ownedset_gc_live, failover_adoption
+    # -- still report their owed skips: they need a live cluster). Then it
+    # boots the
     # ISO under QEMU and checks the service end to end: the kernel's first
     # serial banner must appear, and its webapp must answer /api/health on
     # the forwarded port (the exact endpoint deploy.sh gates on) — proving
     # the webapp serves, not just that the kernel boots. Verified
-    # end-to-end on a fresh checkout: the ISO builds, all eighteen guards
-    # + all nineteen smokes pass, the ISO boots under QEMU, and /api/health
+    # end-to-end on a fresh checkout: the ISO builds, all twenty-three guards
+    # + all twenty-three smokes pass, the ISO boots under QEMU, and /api/health
     # answers in ~10s.
     #
     # Toolchain: the cross compiler (x86_64-elf-gcc) is replaced by the
