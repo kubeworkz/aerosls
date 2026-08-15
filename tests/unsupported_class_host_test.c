@@ -15,7 +15,7 @@
  * debt -- the agreed target's compiler DOES emit them, so the classifier
  * returns NULL and the halting message says "owed", not §4.5.
  *
- * The classifier's rules were validated against the full 630-name survivor
+ * The classifier's rules were validated against the full 777-name survivor
  * census (sls/gen_unsupported_list.py): every name maps, only the six
  * div/idiv forms are NULL. This test pins representative names per class
  * plus the NULL family; the census-to-rules agreement is a documented
@@ -71,6 +71,11 @@ int main(void)
     /* SSE vector (xmm): the _xmm family, scalar-xmm, SSE3 scalar. */
     expect("addps_xmm", "SSE vector (xmm)");
     expect("cmpeqps_xmm", "SSE vector (xmm)");
+    /* iteration 38: the scalar compare ss/sd forms are the same SSE
+     * compare family, not the system/legacy tail. */
+    expect("cmpeqss", "SSE vector (xmm)");
+    expect("cmpltsd", "SSE vector (xmm)");
+    expect("cmpordsd", "SSE vector (xmm)");
     expect("crc32", "SSE vector (xmm)");
     expect("addsubsd", "SSE vector (xmm)");
     expect("haddpd_xmm", "SSE vector (xmm)");
