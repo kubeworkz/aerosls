@@ -41,7 +41,21 @@ Modes (written to <statedir>/mode by the smoke):
                   learn gate
     nockpt        followers learn but no checkpoint flows -> guard FAIL at
                   the checkpoint gate
-    splitbrain    BOTH survivors become leader -> guard FAIL (split-brain)
+    splitbrain    BOTH survivors become leader at once -> guard FAIL at the
+                  step-7 simultaneous split-brain check
+    observeradopts  node 2 adopts normally, but node 3 (the observer) ALSO
+                  prints the Adopted line while staying FOLLOWER -- a
+                  follower that recovered -> guard FAIL at the step-9
+                  never-adopt check (cluster_is_leader gate)
+    lateflip      node 2 adopts normally; node 3 stays FOLLOWER through the
+                  adoption, then flips to LEADER after a delay -> guard
+                  FAIL at the step-9 stays-FOLLOWER check (late
+                  split-brain)
+
+Both survivors DECLARE the death (every node runs failover_tick); only the
+leader recovers. So the observer's log always carries its own declaration
+line -- that is what the step-9 log check compares the Adopted line
+against.
 """
 
 import http.server
@@ -72,6 +86,10 @@ else:
     my_transition = "LEADER" if (role == "follower" and node_id == 2) else "FOLLOWER"
 
 transitioned = False
+# lateflip: the observer flips to LEADER AFTER the adoption has been
+# observed (a late split-brain), so the guard's step-9 watch catches it
+# rather than the step-7 simultaneous-flip check.
+late_flipped = False
 
 
 def log(line):
@@ -147,7 +165,7 @@ threading.Thread(target=rx_thread, daemon=True).start()
 # splitbrain) flips to LEADER and logs the death + (unless notadopted) the
 # adoption; the observer (node 3 in adopted) logs the handoff.
 def death_thread():
-    global transitioned
+    global transitioned, late_flipped
     if role != "follower":
         return
     for _ in range(600):
@@ -163,20 +181,38 @@ def death_thread():
                 time.sleep(0.2)
                 continue
             transitioned = True
+            # Every node that observes the death DECLARES it (failover_tick
+            # runs everywhere); only the leader recovers.
+            log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
+            row = read_created()
             if my_transition == "LEADER":
-                log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
-                row = read_created()
                 if mode != "notadopted" and row:
                     log("[FAILOVER] Adopted partition %s from dead node %u"
                         % (row["id"], leader_id))
                     log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
                         % leader_id)
             else:
-                # The observer: only the leader adopts, so it merely learns
-                # the handoff announce from the adopter.
-                row = read_created()
-                if row and mode == "adopted":
+                # The observer: it merely learns the handoff announce from
+                # the adopter -- except in the misbehaviour modes.
+                if row and mode in ("adopted", "observeradopts", "lateflip"):
                     log(learn_line(row, 2))
+                if row and mode == "observeradopts":
+                    # The bug: a FOLLOWER that recovered. cluster_is_leader()
+                    # should have gated this to the leader; the guard's
+                    # step-9 log check must catch the second Adopted line.
+                    log("[FAILOVER] Adopted partition %s from dead node %u"
+                        % (row["id"], leader_id))
+                    log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
+                        % leader_id)
+                if mode == "lateflip":
+                    # The other bug: the loser flips to LEADER after the
+                    # adoption (late split-brain). Delay so the step-7
+                    # simultaneous-flip check has already broken out.
+                    def flip():
+                        global late_flipped
+                        time.sleep(1.5)
+                        late_flipped = True
+                    threading.Thread(target=flip, daemon=True).start()
             return
         time.sleep(0.2)
 
@@ -197,6 +233,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if role == "leader":
             return "LEADER"
         if transitioned:
+            if late_flipped:
+                return "LEADER"
             return my_transition
         return "FOLLOWER"
 

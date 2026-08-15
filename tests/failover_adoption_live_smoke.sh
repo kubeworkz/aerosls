@@ -30,8 +30,15 @@
 #   nockpt      -> FAIL  (followers learn but no checkpoint flows; the
 #                         checkpoint gate must bite -- without it the held
 #                         checkpoint predates the create)
-#   splitbrain  -> FAIL  (BOTH survivors become leader; the guard must
-#                         detect the split and fail loudly)
+#   splitbrain  -> FAIL  (BOTH survivors become leader at once; the guard
+#                         must detect the split and fail loudly)
+#   observeradopts -> FAIL (the observer ALSO prints the Adopted line
+#                         while staying FOLLOWER -- a follower that
+#                         recovered; the step-9 never-adopt check must bite,
+#                         pinning cluster_is_leader())
+#   lateflip    -> FAIL  (the observer stays FOLLOWER through the adoption,
+#                         then flips to LEADER; the step-9 stays-FOLLOWER
+#                         watch must catch the late split-brain)
 #   silent      -> ABORT (no cluster.pids at all; the guard must say how to
 #                         start one)
 #
@@ -151,11 +158,13 @@ tooth() {
     esac
 }
 
-tooth adopted     0 "PASS"      "adopted -> PASS (and the leader was really killed)"
-tooth notadopted  1 "never adopted" "notadopted -> FAIL (the leader leads but the adoption never fires)"
-tooth nolearn     1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
-tooth nockpt      1 "no checkpoint" "nockpt -> FAIL (the checkpoint never carried the row)"
-tooth splitbrain  1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER)"
+tooth adopted          0 "PASS"      "adopted -> PASS (and the leader was really killed)"
+tooth notadopted       1 "never adopted" "notadopted -> FAIL (the leader leads but the adoption never fires)"
+tooth nolearn          1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
+tooth nockpt           1 "no checkpoint" "nockpt -> FAIL (the checkpoint never carried the row)"
+tooth splitbrain       1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER at once)"
+tooth observeradopts   1 "ALSO recovered" "observeradopts -> FAIL (a follower that recovered must be caught by step 9)"
+tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to LEADER must be caught by step 9)"
 
 # The silent tooth: no cluster at all. The guard must abort (2) and say how
 # to start one -- not pass, and not blame the wrong layer.

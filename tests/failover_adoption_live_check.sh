@@ -105,9 +105,9 @@ NAME="guard-failover-$$"             # unique per run, so a stale persisted
                                      # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
-    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6
+    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60
 fi
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
@@ -417,12 +417,86 @@ done
        replication of the handoff is broken. $observer's list held:
 $(get200 "$((HTTP_BASE + observer))" /api/partitions && dump_rows "$FETCH_BODY")"
 
+# ─── 9. the loser must stay FOLLOWER and never adopt ──────────────────────
+# The step-7 loop breaks the moment ONE survivor's adoption evidence is
+# complete, so a misbehaviour that lands after that -- a follower that ALSO
+# recovers, or a late flip to LEADER -- would otherwise slip past. Both are
+# the other half of the split-brain property, and they pin the two gates:
+#   * cluster_is_leader() in failover_tick(): every node that observes the
+#     death DECLARES it (the observer's log must carry its own declaration
+#     -- it observed), but only the leader calls failover_recover_from().
+#     An Adopted or recovery line on the OBSERVER, after its declaration,
+#     means a follower recovered too: two owners of one partition.
+#   * the election: the loser's consensus role must stay FOLLOWER. A flip
+#     to LEADER after the adoption window is a late split-brain -- two
+#     leaders, two owners.
+OBS_PORT=$((HTTP_BASE + observer))
+echo "==> watching node $observer stay FOLLOWER and never adopt (up to ${WAIT_OBSERVER}s)"
+# The watch HOLDS THE FULL WINDOW: it must not break on the first clean
+# poll, or a late misbehaviour -- a follower that recovers after the
+# adoption, or a flip to LEADER that lands a moment later -- would slip
+# past. It passes only if EVERY poll observed the loser as FOLLOWER and no
+# Adopted/recovery line ever appeared after the declaration. A transient
+# fetch failure does NOT fail the watch -- only a 200 that says LEADER, or
+# a late Adopted line, does.
+loser_ok=1
+loser_why=""
+decl_seen=0
+deadline=$(( $(date +%s) + WAIT_OBSERVER ))
+while :; do
+    # 9a. role: must be FOLLOWER at EVERY poll. Once flipped, the loser is
+    # out -- a second LEADER means a second owner of '$NAME'.
+    if get200 "$OBS_PORT" /api/cluster; then
+        [ "$(jget "$FETCH_BODY" role)" = "FOLLOWER" ] || { loser_ok=0; loser_why="flipped to LEADER"; }
+    fi
+    # 9b. log: the observer must have declared the death (it observed), and
+    # must NOT have printed an Adopted or recovery line AFTER that
+    # declaration. (A stale line from a previous run of this guard against
+    # the same cluster would sit BEFORE this run's declaration -- last_line
+    # takes the LAST match, so the comparison is scoped to this run.)
+    obs_decl="$(last_line "$OBS_LOG" "FAILOVER] Node $leader declared DEAD")"
+    obs_adopt="$(last_line "$OBS_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
+    obs_rec="$(last_line "$OBS_LOG" "FAILOVER] recovery for dead node $leader")"
+    if [ -n "$obs_decl" ]; then
+        decl_seen=1
+        [ -z "$obs_adopt" ] || [ "$obs_adopt" -lt "$obs_decl" ] || { loser_ok=0; loser_why="printed its own Adopted line"; }
+        [ -z "$obs_rec" ] || [ "$obs_rec" -lt "$obs_decl" ] || { loser_ok=0; loser_why="printed its own recovery line"; }
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$decl_seen" -eq 1 ] || { loser_ok=0; loser_why="never observed the death (no declaration in $OBS_LOG)"; }
+if [ "$loser_ok" -ne 1 ]; then
+    # Which gate failed? Report the specific violation.
+    if get200 "$OBS_PORT" /api/cluster && [ "$(jget "$FETCH_BODY" role)" != "FOLLOWER" ]; then
+        fail "node $observer flipped to $(jget "$FETCH_BODY" role) after node $adopter
+       adopted -- a late split-brain. The surviving pair must elect exactly
+       one leader and the loser stays FOLLOWER; a second leader means two
+       owners of '$NAME'. Stop the cluster and inspect the consensus logs."
+    fi
+    obs_adopt="$(last_line "$OBS_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
+    obs_rec="$(last_line "$OBS_LOG" "FAILOVER] recovery for dead node $leader")"
+    if [ -n "$obs_adopt" ] || [ -n "$obs_rec" ]; then
+        fail "node $observer ALSO recovered from dead node $leader -- a follower
+       must never adopt (cluster_is_leader() in failover_tick gates recovery
+       to the leader). The observer's log shows:
+$(grep -h "FAILOVER] Adopted partition.*dead node $leader\|FAILOVER] recovery for dead node $leader" "$OBS_LOG" 2>/dev/null | tail -2 | sed 's/^/         /')
+       Two Adopted lines means two owners of '$NAME'."
+    fi
+    fail "node $observer neither stayed FOLLOWER nor observed the death cleanly
+       (role check / declaration check failed: ${loser_why:-unknown}) within
+       ${WAIT_OBSERVER}s. Inspect $OBS_LOG."
+fi
+echo "   node $observer stayed FOLLOWER and never adopted (observed the death only)"
+
 echo
 echo "PASS  node $leader was killed; node $adopter adopted '$NAME' from the held"
-echo "      checkpoint and the owner handoff replicated to node $observer."
+echo "      checkpoint, the owner handoff replicated to node $observer, and the"
+echo "      loser stayed FOLLOWER without adopting."
 echo "      evidence:"
 printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Adopted partition.*dead node $leader" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] recovery for dead node $leader: rc=0" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*owner node $adopter.*learned from node $adopter" "$OBS_LOG" 2>/dev/null | tail -1)"
+printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
 exit 0
