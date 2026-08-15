@@ -56,7 +56,7 @@ command beside it is a number nobody can re-check.
 | x86 guest frontend is minimal | Cross-ISA §4 | **18 case labels**; `0x8B`/`0x89` + ModRM as described | `grep -cE 'case 0x[0-9A-Fa-f]+:' ../qemu/sls/sls-x86-frontend.c` |
 | 89 host test files | session record | **89** | `ls tests/*_host_test.c \| wc -l` |
 | Stack is 1 MiB | `boot.asm` | **1,048,576 bytes**, read from the linked binary | `tests/stack_frame_budget_check.sh` |
-| Two nodes booted from one image seed differently | `entropy_boot_diversity_check.sh` (GUARD-KIND: runtime — needs a live cluster, so it is owed on build hosts) | **3/3 distinct on 2026-08-13** — live 3-node run (512 MiB/node, TCG, no KVM): `cac65cf8…` / `bc2da14b…` / `091bb9b4…` | `./run-cluster.sh --nodes 3`, then `AEROSLS_TOKEN=<token> tests/entropy_boot_diversity_check.sh` |
+| Two nodes booted from one image seed differently | `entropy_boot_diversity_check.sh` (GUARD-KIND: runtime — needs a live cluster, so it is owed on build hosts) | **3/3 distinct on 2026-08-15** — live 3-node run on current HEAD (512 MiB/node, TCG, no KVM, `--force`): `1afb842a…` / `b46e561a…` / `b15aade1…`; earlier: **3/3 distinct on 2026-08-13** — `cac65cf8…` / `bc2da14b…` / `091bb9b4…` | `./run-cluster.sh --nodes 3`, then `AEROSLS_TOKEN=<token> tests/entropy_boot_diversity_check.sh` |
 | Kernel image is freestanding — no glibc, no user space | checked at the link, not the headers | **0 undefined symbols, no `.dynamic`, no `PT_INTERP` on 2026-08-13** — verified on the shim-built `my_sls_kernel.bin` | `tests/no_hosted_link_check.sh` |
 
 ---
