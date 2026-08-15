@@ -22,6 +22,7 @@
 // ─── Peer Liveness ────────────────────────────────────────────────────────────
 #define FAILOVER_MAX_PEERS       8
 #define FAILOVER_DEAD_TICKS    300u  /* 3 seconds at ~100 Hz — 2x election timeout */
+#define FAILOVER_CKPT_PERIOD_TICKS 100u  /* leader checkpoint broadcast period */
 
 /* Peer liveness state */
 #define PEER_ALIVE     0
@@ -59,6 +60,15 @@ int failover_peer_status(uint32_t node_id);
 /* Attempt to recover dead_node_id's partitions from a received checkpoint.
  * Returns FAILOVER_* status. */
 int failover_recover_from(uint32_t dead_node_id);
+
+/* Leader's periodic state-tree checkpoint broadcast (live cluster wiring).
+ * Called from the BSP sweep; it TRANSMITS, so like the consensus heartbeat
+ * it must stay off the AP tick. The leader serializes its own partition
+ * table (state_tree_build) and pushes the transfer to every roster peer
+ * via dspp_ckpt_send(), rate-limited to one per FAILOVER_CKPT_PERIOD_TICKS.
+ * Followers hold the latest transfer in the single-slot RX buffer, which
+ * failover_recover_from() consumes when the leader is declared dead. */
+void failover_live_checkpoint_broadcast(uint64_t now);
 
 /* How many partitions were adopted in the last failover_recover_from() call. */
 uint32_t failover_last_adopted_count(void);

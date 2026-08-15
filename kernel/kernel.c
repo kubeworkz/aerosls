@@ -25,6 +25,7 @@ extern int sls_launch_guest(const void *image, uint32_t len,
                              uint64_t entry_gpa, uint32_t max_insns);
 #include "boot_params.h"   // boot-time cluster identity (node=<n>)
 #include "smp.h"           // AP bring-up + the uniprocessor fallback
+#include "failover.h"      // Step 5 -- peer liveness + checkpoint recovery
 #include "partition.h"
 #include "service_registry.h"
 #include "service_mesh.h"
@@ -212,6 +213,7 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     mesh_init();               // Orchestration Plan Phase 6 -- circuit breakers
     workload_init();           // Orchestration Plan Phase 5 -- declarative workloads (reconciler OFF by default)
     wlctx_init();              // live execution contexts -- the producer partition_migrate() needs
+    failover_init();           // Step 5 -- peer liveness + checkpoint recovery (after cluster identity)
 
     // ── 4d. Service binary loader ───────────────────────────────────────────
     loader_init();

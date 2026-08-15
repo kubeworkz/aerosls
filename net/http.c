@@ -39,6 +39,7 @@
 #include "../kernel/vec_join.h"   // Gap Remediation Phase C -- POST /api/vec/join
 #include "../kernel/vec_index.h"  // Gap Remediation Phase C -- POST /api/vec/indexes, /api/vec/index/search
 #include "../kernel/partition.h"  // Gap Remediation Phase F -- partition create/list/destroy/assign/pause/resume
+#include "../kernel/failover.h"     // Step 5 wired live -- liveness tick + leader checkpoint broadcast
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
 #include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- GET /api/partition/storagequotas, POST /api/partition/storagequota
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
@@ -6823,6 +6824,18 @@ void http_server_run(void) {
          * "Election timing" block. */
         check_consensus_heartbeat_tick(kernel_tick_counter);
         check_partition_lease_heartbeat_tick(kernel_tick_counter);
+        /* Failover (Core Backup Strategies Step 5, wired live):
+         * failover_tick() is pure memory and could run anywhere; the
+         * leader's checkpoint broadcast TRANSMITS, so like the heartbeat
+         * above it must stay on this BSP sweep rather than the AP tick --
+         * the NIC TX path is not safe to drive from two cores at once.
+         * Together they close the two gaps the comment above names for
+         * the consensus heartbeat: peer death is now detected every
+         * sweep, and a checkpoint actually flows from leader to
+         * followers so the adoption path (failover_recover_from()) has
+         * real data when the leader dies. */
+        failover_tick(kernel_tick_counter);
+        failover_live_checkpoint_broadcast(kernel_tick_counter);
         /* BSP-only half of peer discovery. The ISR that receives consensus
          * frames only sets a bit; the roster mutation has to happen here,
          * where nothing is reading it concurrently. */

@@ -121,6 +121,7 @@ static int checks_failed = 0;
  * identical set dspp_phase5_host_test.c already uses) ──────────────────── */
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
 void persist_partitions(void) {}
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }

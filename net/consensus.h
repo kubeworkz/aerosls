@@ -456,6 +456,13 @@ const char* consensus_role_name(enum NodeRole r);
 uint32_t cluster_local_node_id(void);
 uint32_t cluster_active_node_count(void);
 
+/* 1 if this node currently holds the cluster-wide ROLE_LEADER, else 0.
+ * The failover subsystem gates recovery on this: a partition has exactly
+ * one owner, so only the node the cluster elected to lead after a death
+ * may adopt the dead node's partitions (failover_tick()/failover_recover
+ * _from(), kernel/failover.c). */
+int cluster_is_leader(void);
+
 /* Pre-existing gap this phase found and closed in passing: none of these
  * three were ever declared in this header, only defined in consensus.c --
  * harmless while nothing outside consensus.c called them (confirmed true

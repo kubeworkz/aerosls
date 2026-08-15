@@ -59,6 +59,7 @@ void kernel_serial_printf(const char* fmt, ...) {
     va_end(ap);
     if (g_log_len > (int)sizeof(g_log) - 1) g_log_len = (int)sizeof(g_log) - 1;
 }
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
 static void log_reset(void) { g_log_len = 0; g_log[0] = '\0'; }
 static int  logged(const char* needle) { return strstr(g_log, needle) != NULL; }
 

@@ -19,6 +19,7 @@
 #include "net/dspp.h"
 #include "net/net.h"
 #include "net/e1000.h"
+#include "net/consensus.h"   /* struct ClusterPeer, CLUSTER_NODE_MAX */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -45,6 +46,15 @@ uint64_t dspp_tx_reentrant_dropped = 0;
 
 static uint32_t g_local_node = 2;
 uint32_t cluster_local_node_id(void) { return g_local_node; }
+
+/* The test node is a follower -- recovery is exercised by calling
+ * failover_recover_from() directly, not via failover_tick()'s leader gate. */
+int cluster_is_leader(void) { return 0; }
+
+/* Roster stubs -- failover.c's leader broadcast iterates these; an empty
+ * roster makes it a no-op in this test (no live cluster). */
+struct ClusterPeer cluster_roster[CLUSTER_NODE_MAX];
+uint32_t cluster_roster_count = 0;
 
 static uint64_t g_tsc = 1000;
 uint64_t read_tsc(void) { return g_tsc++; }
@@ -83,6 +93,13 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
 }
 
 void persist_partitions(void) { /* no-op in test */ }
+
+/* partition_exists stub -- mirrors partition.c's partition_id_valid(). */
+int partition_exists(uint32_t partition_id) {
+    if (partition_id == PARTITION_SYSTEM) return 1;
+    if (partition_id >= PARTITION_MAX) return 0;
+    return partition_table[partition_id].active;
+}
 
 /* DSPP transmit stub */
 void e1000_transmit(NicRole role, void* buf, uint16_t size) {

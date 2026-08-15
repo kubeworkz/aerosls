@@ -1,5 +1,6 @@
 #include "consensus.h"
 #include "dspp.h"
+#include "../kernel/failover.h"
 
 // Multi-Node Partition Scaling Roadmap Phase 7: every send site in this file
 // now goes through dspp_transmit_raw() (net/dspp.c), which adds the real
@@ -226,6 +227,8 @@ uint32_t cluster_drain_discovered_peers(void) {
 }
 
 uint32_t cluster_local_node_id(void)     { return local_cluster_state.node_id; }
+
+int cluster_is_leader(void)              { return local_cluster_state.role == ROLE_LEADER; }
 uint32_t cluster_active_node_count(void) { return local_cluster_state.active_nodes_count; }
 
 // ─── Syscalls: operator-driven node identity configuration ────────────
@@ -375,6 +378,14 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
 
     if (packet->header.opcode == DSPP_CMD_HEARTBEAT) {
         uint32_t hb_term = packet->header.transaction_id;
+        /* Liveness for the failover subsystem, noted BEFORE the stale-term
+         * return for the same reason cluster_note_peer_seen() runs at the
+         * top of this function: a stale-term heartbeat is still a node
+         * provably talking. The leader is the only heartbeat sender, so
+         * followers track the leader here; when it dies, the silence is
+         * what failover_tick() (net/http.c BSP sweep) turns into a DEAD
+         * declaration after FAILOVER_DEAD_TICKS. */
+        failover_note_heartbeat((uint32_t)packet->header.node_source_id, now);
         if (hb_term < local_cluster_state.current_term) return;   /* stale */
 
         /* Resetting the watchdog is right for ANY term at least ours: an

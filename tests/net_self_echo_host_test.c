@@ -56,6 +56,7 @@ static int checks_failed = 0;
 
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
 volatile uint64_t kernel_tick_counter = 0;
 
 /* Counting stubs for the three protocol handlers net_rx_dispatch() routes

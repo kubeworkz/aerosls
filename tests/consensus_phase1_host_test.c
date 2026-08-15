@@ -117,6 +117,7 @@ void kernel_serial_printf(const char* fmt, ...) {
             if (p[0]=='E'&&p[1]=='R'&&p[2]=='R'&&p[3]=='O'&&p[4]=='R') { serial_error_lines++; break; } }
 }
 void update_page_table_permissions_globally(uint32_t force_read_only) { (void)force_read_only; }
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
 
 /* Phase 4: call-tracked, unlike the global stub above -- Scenario 13 below
  * needs to prove partition_lease_trigger_election()/the quorum-achieved
