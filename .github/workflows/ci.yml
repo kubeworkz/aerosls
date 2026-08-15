@@ -193,9 +193,9 @@ jobs:
       # through green. They are *smoke.sh*, not *_check.sh, so
       # run_checks.sh and deploy.sh's guard gate never run them.
       #
-      # run_guard_smokes.sh runs all nineteen, but five need the linked
+      # run_guard_smokes.sh runs all twenty-two, but five need the linked
       # kernel or its objects, so that runner needs a build host. The
-      # other fourteen are source-only — gcc/binutils/python3/openssl and
+      # other seventeen are source-only — gcc/binutils/python3/openssl and
       # the sources in the tree, nothing built — so they run HERE, on
       # every push, independent of the kernel build. That independence is
       # the point: tls_cert_oracle_smoke.sh failed at link for months,
@@ -203,7 +203,7 @@ jobs:
       # build step before reaching its smokes. run_source_smokes.sh keeps
       # the source-only set green on its own, and fails any smoke that
       # cannot run without being on its build-needed exclusion list.
-      - name: Source-only guard teeth (all 14 smokes that need no build)
+      - name: Source-only guard teeth (all 17 smokes that need no build)
         run: bash tests/run_source_smokes.sh
         working-directory: aerosls2
 
