@@ -6836,6 +6836,12 @@ void http_server_run(void) {
          * real data when the leader dies. */
         failover_tick(kernel_tick_counter);
         failover_live_checkpoint_broadcast(kernel_tick_counter);
+        /* Partition-table convergence for late joiners (Multi-Node Phase 2):
+         * each node re-announces the rows it owns on a schedule, so a node
+         * that boots after a create converges within one period instead of
+         * waiting for the next mutation. TRANSMITS, so it lives here on the
+         * BSP sweep with the heartbeat and the checkpoint broadcast. */
+        partition_reannounce_tick(kernel_tick_counter);
         /* BSP-only half of peer discovery. The ISR that receives consensus
          * frames only sets a bit; the roster mutation has to happen here,
          * where nothing is reading it concurrently. */

@@ -157,6 +157,14 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
                            const char* name, uint32_t source_node_id);
 void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id);
 
+/* Periodic re-announce (Phase 2 convergence): announce-on-change reaches
+ * nodes that were up for the change, but a node that boots AFTER a create
+ * never hears it. On a schedule, each node re-broadcasts the rows it OWNS
+ * (owner == local node id), so a late joiner converges within one period
+ * without waiting for the next mutation. Rate-limited inside; call from
+ * the BSP sweep -- it TRANSMITS, so it must stay off the AP tick. */
+void partition_reannounce_tick(uint64_t now);
+
 /* "Is this an active, defined partition?" (Orchestration Plan Phase 4)
  * PARTITION_SYSTEM always is. Public wrapper over the check
  * partition_create()/_destroy()/_migrate() already apply internally. */

@@ -711,3 +711,35 @@ void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) {
         "[PARTITION] sync: partition %u withdrawn by node %u.\n",
         (unsigned)partition_id, (unsigned)source_node_id);
 }
+
+// ─── Multi-Node Partition Scaling Roadmap, Phase 2: periodic re-announce ────
+// Announce-on-change converges the nodes that were up for the change, but a
+// node that boots AFTER a create never hears it and waits forever for the
+// next mutation. On a schedule, each node re-broadcasts the rows it OWNS
+// (owner == local node id), so a late joiner converges within one period.
+// Rows a node merely LEARNED (owner elsewhere) are not re-announced: the
+// owner announces its own, and re-broadcasting someone else's row under
+// this node's source id would break the withdraw rule (which requires the
+// source to own the row). Rate-limited like the checkpoint broadcast --
+// the sweep is load-dependent and unbounded, so the period is measured in
+// kernel_tick_counter (nominal 100 Hz), not call count.
+#define PARTITION_REANNOUNCE_TICKS 1000u  /* ~10 s at the nominal sweep rate */
+
+static uint64_t partition_last_reannounce_tick = 0;
+
+void partition_reannounce_tick(uint64_t now) {
+    if (now - partition_last_reannounce_tick < PARTITION_REANNOUNCE_TICKS) return;
+    partition_last_reannounce_tick = now;
+
+    uint32_t me = cluster_local_node_id();
+    if (me == 0) return;   /* unclustered: nothing to converge and nobody to tell */
+
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (!partition_owner_table[i].active) continue;
+        uint32_t part_id = partition_owner_table[i].partition_id;
+        if (part_id == PARTITION_SYSTEM || part_id >= PARTITION_MAX) continue;
+        if (partition_owner_table[i].node_id != me) continue;
+        if (!partition_table[part_id].active) continue;   /* owner row without a table row is not a real partition */
+        dspp_partition_announce(part_id, partition_table[part_id].name, me);
+    }
+}
