@@ -190,6 +190,8 @@ if [ "$skip" -gt 0 ]; then
         echo "    ./run-cluster.sh --nodes 3"
         echo "    tests/entropy_boot_diversity_check.sh"
         echo "    tests/partition_reannounce_live_check.sh"
+        echo "    tests/partition_ownedset_gc_live_check.sh"
+        echo "    tests/partition_ownedset_gc_live_check.sh"
     fi
 fi
 
