@@ -6842,6 +6842,10 @@ void http_server_run(void) {
          * waiting for the next mutation. TRANSMITS, so it lives here on the
          * BSP sweep with the heartbeat and the checkpoint broadcast. */
         partition_reannounce_tick(kernel_tick_counter);
+        /* Deferred persistence of learned rows: the RX apply (timer ISR)
+         * only set the dirty flag; the NVMe write happens here, on the BSP
+         * sweep, in the same context partition_create() persists from. */
+        partition_persist_flush();
         /* BSP-only half of peer discovery. The ISR that receives consensus
          * frames only sets a bit; the roster mutation has to happen here,
          * where nothing is reading it concurrently. */

@@ -452,7 +452,9 @@ void dspp_partition_announce(uint32_t partition_id, const char* name,
 void dspp_partition_withdraw(uint32_t partition_id);
 /* Receiver side: called from dspp_rx_dispatch() for DSPP_PARTITION_*;
  * applies the row via kernel/partition.c's partition_sync_upsert()/
- * partition_sync_withdraw(). */
+ * partition_sync_withdraw(). Those run on the RX path (timer ISR), so
+ * they mark a dirty flag instead of persisting; the BSP sweep's
+ * partition_persist_flush() (net/http.c) writes the table out. */
 void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len);
 
 /* Wraps dspp_len bytes at dspp_payload in a broadcast Ethernet frame

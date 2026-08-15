@@ -629,11 +629,38 @@ void sys_sls_partition_list(void) {
 // ─── Multi-Node Partition Scaling Roadmap, Phase 2: replication RX ───────────
 // The apply half of partition-table replication. Called from
 // dspp_partition_rx() (net/dspp.c) on the wire path -- the timer ISR -- so
-// neither function persists and neither calls anything that blocks or does
-// I/O (see dspp.h's partition-sync comment for why that matches the
-// service-registry remote-cache rule). Both mirror service_remote_learn()/
-// _forget()'s rules: last announce wins (logged when it overwrites a
-// different owner), and a withdraw only applies if the source owned the row.
+// neither function persists DIRECTLY and neither calls anything that blocks
+// or does I/O: nvme_write_sync() spins on a doorbell/completion and cannot
+// run in interrupt context. Persistence is deferred instead -- a successful
+// apply only sets the partition_persist_dirty flag (a volatile byte; safe
+// to write from the ISR), and the BSP sweep calls partition_persist_flush()
+// on its next iteration, in the same non-ISR context partition_create()/
+// partition_destroy() already persist from. A rebooted node therefore keeps
+// the cluster view it learned instead of re-converging from zero.
+//
+// The deferred design is the one that survives the ISR constraint:
+//   - Persist directly in the RX path -- impossible: the write blocks on
+//     NVMe completion and would re-enter the interrupt machinery it runs in.
+//   - Persist via checkpoint_mgr's dirty-region bitmap -- possible, but the
+//     checkpoint is IPC-triggered and writes every dirty region, so one
+//     partition announce would cost a catalog-wide snapshot write.
+//   - This flag + sweep flush -- one volatile byte set in the ISR, cleared
+//     and written out by the BSP sweep, coalescing N announces into one
+//     write. Exposures, weighed and accepted: a row mutated by an ISR apply
+//     mid-flush can land torn in the snapshot (header magic/size guards
+//     protect the snapshot's structure, a torn single row self-heals on the
+//     next announce, and the flag re-set by that apply forces a rewrite);
+//     and a node DOWN during a destroy keeps the destroyed row on disk
+//     after reboot, because withdraws are mutation-only and nothing ever
+//     re-announces a row's absence -- the known eventual-consistency debt a
+//     future periodic full-owned-set reconciliation would close.
+//
+// Both mirror service_remote_learn()/_forget()'s rules: last announce wins
+// (logged when it overwrites a different owner), and a withdraw only applies
+// if the source owned the row. (The service registry itself remains
+// runtime-only; this persistence is for the partition table, whose rows are
+// the cluster view a node must keep across a reboot.)
+static volatile uint8_t partition_persist_dirty = 0;
 void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
                            const char* name, uint32_t source_node_id) {
     if (partition_id == PARTITION_SYSTEM || partition_id >= PARTITION_MAX) return;
@@ -680,6 +707,10 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
         }
     }
 
+    /* Applied: the row changed (or was created) in the local table, so a
+     * reboot must keep it. The ISR cannot write NVMe, so the sweep's
+     * partition_persist_flush() is what writes -- see the RX comment. */
+    partition_persist_dirty = 1;
     kernel_serial_printf(
         "[PARTITION] sync: partition %u '%s' (owner node %u) learned from node %u.\n",
         (unsigned)partition_id, partition_table[partition_id].name,
@@ -707,9 +738,28 @@ void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) {
             break;
         }
     }
+    /* The removal must also survive a reboot, or a node that restarts after
+     * the withdraw would resurrect the row from the pre-withdraw snapshot. */
+    partition_persist_dirty = 1;
     kernel_serial_printf(
         "[PARTITION] sync: partition %u withdrawn by node %u.\n",
         (unsigned)partition_id, (unsigned)source_node_id);
+}
+
+// ─── Deferred persistence of learned rows ──────────────────────────────────
+// The sweep's call site sits in net/http.c next to partition_reannounce_tick().
+// Clear-then-write: clearing first guarantees that any apply landing
+// mid-write re-sets the flag and is covered by the next sweep, so no applied
+// change is ever permanently missed -- the worst case is one redundant
+// write. The clear is not atomic against the ISR's set, but every
+// interleaving stays correct: an apply before the clear is in this write; an
+// apply after the clear leaves the flag set for the next flush. NVMe writes
+// are already coalesced by the flag, so this is at most one extra write per
+// sweep under announce load.
+void partition_persist_flush(void) {
+    if (!partition_persist_dirty) return;
+    partition_persist_dirty = 0;
+    persist_partitions();
 }
 
 // ─── Multi-Node Partition Scaling Roadmap, Phase 2: periodic re-announce ────

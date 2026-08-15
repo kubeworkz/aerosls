@@ -378,6 +378,57 @@ int main(void) {
     CHECK(partition_get_for_uid(42) == PARTITION_DEFAULT,
           "corrupted magic: restore correctly refuses to load, state stays at cold-start default");
 
+    /* ── Learned-row persistence (Multi-Node Phase 2): the RX apply runs on
+     * the timer ISR and cannot call persist_partitions() (NVMe writes block
+     * on doorbell/completion), so it marks a dirty flag that the BSP sweep
+     * flushes via partition_persist_flush(). These teeth pin that deferred
+     * path: a learned row must NOT survive a reboot without the flush
+     * (still runtime state -- the property the re-announce guard depends
+     * on), and MUST survive it once the flush ran. Note the partition
+     * header's magic is still 0xFF from the corrupted-magic check above:
+     * the first flush below is what rewrites a valid snapshot. ─────────── */
+    partition_sync_upsert(40, 7, "learned-a", 7);   /* learn, owner node 7 */
+    CHECK(partition_get_owner_node(40) == 7,
+          "learned row applies to the local table (owner node 7) before any flush");
+    CHECK(partition_table[40].active == 1 && strcmp(partition_table[40].name, "learned-a") == 0,
+          "learned row's table entry (name) is present before any flush");
+
+    /* NO flush here -- this is the negative tooth. */
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_assign_table, 0, sizeof(partition_assign_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+    partition_init();          /* 'reboot' */
+    persist_restore_all();     /* still the corrupted-magic snapshot: cold start */
+    CHECK(partition_table[40].active == 0,
+          "a learned row that was never flushed is still runtime state -- it does NOT survive the reboot");
+    CHECK(partition_get_owner_node(40) == 0,
+          "an unflushed learned row leaves no owner row behind after the reboot");
+
+    /* Positive tooth: the sweep's flush writes it out, so the reboot keeps it. */
+    partition_sync_upsert(40, 7, "learned-a", 7);
+    partition_persist_flush();           /* the BSP sweep's deferred write */
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_assign_table, 0, sizeof(partition_assign_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+    partition_init();                    /* 'reboot' */
+    persist_restore_all();
+    CHECK(partition_table[40].active == 1 && strcmp(partition_table[40].name, "learned-a") == 0,
+          "a learned row survives the reboot once partition_persist_flush() ran");
+    CHECK(partition_get_owner_node(40) == 7,
+          "the flushed learned row's owner (node 7) also survives the reboot");
+
+    /* Withdraw tooth: the removal must be flushed too, or the reboot would
+     * resurrect the row from the pre-withdraw snapshot. */
+    partition_sync_withdraw(40, 7);      /* source owns it -> applies */
+    partition_persist_flush();
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_assign_table, 0, sizeof(partition_assign_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+    partition_init();                    /* 'reboot' */
+    persist_restore_all();
+    CHECK(partition_table[40].active == 0 && partition_get_owner_node(40) == 0,
+          "a flushed withdraw is durable -- the row stays gone after the reboot");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

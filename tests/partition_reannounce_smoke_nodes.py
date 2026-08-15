@@ -11,24 +11,26 @@ property depends on.
 That piece is the announce. The fake leader "creates" a partition by writing
 a row file; the fake follower "learns" it by reading that file -- the wire
 in miniature. And the follower's behaviour across a restart is what makes
-the teeth bite: the guard SIGKILLs the follower and relaunches it with the
-SAME argv, so the fake counts its own boots in a file and behaves
-differently the second time, exactly as the real kernel does (learned rows
-are runtime state and vanish on reboot):
+the teeth bite. The guard's reworked scenario (the persistence change made
+learned rows durable, so a plain reboot no longer loses them) kills the
+follower FIRST, then creates the partition the convergence check targets
+WHILE it is down -- a row that was never learned and is on nobody's disk
+but the creator's. So the fake counts its own boots and behaves differently
+the second time, exactly as the real kernel does for that row:
 
     boot 1 (before the kill):
-        serve the row unless mode == "nolearn"
-        -- so the guard's pre-reboot gate can pass, or fail, as scripted.
-    boot 2 (the relaunch):
-        serve the row only when mode == "converged"
-        -- so the guard's convergence check can pass, or fail, as scripted.
+        serve rows from the row file unless mode == "nolearn"
+        -- so the guard's pre-reboot learn gate (row A) can pass, or fail.
+    boot 2 (the relaunch, after the guard created row B while down):
+        serve the row file only when mode == "converged"
+        -- so the guard's convergence check on B can pass, or fail.
 
 Modes (written to <statedir>/mode by the smoke):
-    converged     boot 1 and boot 2 both serve the row -> guard PASS
-    notconverged  boot 1 serves, boot 2 does not       -> guard FAIL
-                  (the convergence poll runs out)
-    nolearn       boot 1 does not serve                -> guard FAIL
-                  (the pre-reboot learn gate runs out)
+    converged     boot 1 and boot 2 both serve -> guard PASS
+    notconverged  boot 1 serves, boot 2 does not -> guard FAIL
+                  (the convergence poll on B runs out)
+    nolearn       boot 1 does not serve -> guard FAIL
+                  (the pre-reboot learn gate on A runs out)
 """
 
 import http.server

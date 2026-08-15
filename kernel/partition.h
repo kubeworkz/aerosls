@@ -146,8 +146,10 @@ int partition_is_local(uint32_t partition_id);
 /* Partition-table replication RX (Multi-Node Phase 2): apply a partition
  * row announced over DSPP (net/dspp.c's DSPP_PARTITION_ANNOUNCE/WITHDRAW).
  * Called from dspp_partition_rx() -- the RX path (timer ISR), so neither
- * function persists: replicated rows are runtime state, re-converged on
- * the next announce, matching the service-registry remote cache rule.
+ * function persists directly: each successful apply sets a dirty flag that
+ * the BSP sweep flushes via partition_persist_flush() (see partition.c's
+ * RX comment for the ISR constraint and why deferred persistence was the
+ * design that survives it). A rebooted node keeps the rows it learned.
  * upsert: learn/refresh {name, owner} for partition_id from source_node;
  * last announce wins, logged when it overwrites a different owner.
  * withdraw: remove the row, but only if this node's owner row says
@@ -156,6 +158,12 @@ int partition_is_local(uint32_t partition_id);
 void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
                            const char* name, uint32_t source_node_id);
 void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id);
+
+/* Deferred persistence of learned rows: write out any RX-applied change
+ * (upsert or withdraw) from BSP context. Call from the BSP sweep -- it
+ * does real NVMe I/O, so it must never run on the ISR path that set the
+ * dirty flag. No-op when nothing changed. */
+void partition_persist_flush(void);
 
 /* Periodic re-announce (Phase 2 convergence): announce-on-change reaches
  * nodes that were up for the change, but a node that boots AFTER a create

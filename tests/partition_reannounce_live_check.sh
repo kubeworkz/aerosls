@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# tests/partition_reannounce_live_check.sh — a node that boots after a
-# partition exists must converge to it from the periodic re-announce, with
-# no partition mutation in between.
+# tests/partition_reannounce_live_check.sh — a node that was DOWN when a
+# partition was created must converge to it from the periodic re-announce.
 #
 # ─── Why this is the gate that matters ─────────────────────────────────────
 # Partition rows replicate two ways. A mutation (create/migrate/adopt/
 # destroy) broadcasts once; that is the path the replication work verified.
-# But a node that boots AFTER a create has missed that one broadcast, and
-# the row it needs is runtime state -- the RX apply runs in the timer ISR
-# and deliberately does not persist (see the service-registry remote-cache
-# rule). Nothing brings the row back except partition_reannounce_tick():
-# every 1000 ticks (~10s), each node re-broadcasts the rows it OWNS, so a
-# late joiner converges within one period without waiting for the next
+# A node that is DOWN for that one broadcast never hears it. Since the
+# replication work landed, learned rows are PERSISTED (the RX apply marks a
+# dirty flag; the BSP sweep's partition_persist_flush() writes the table out
+# -- see partition.c), so a rebooted node restores what it learned and the
+# row it needs can also come back from disk. But a row created while the
+# node was DOWN is on nobody's disk but the creator's, and nothing restores
+# it -- only partition_reannounce_tick() brings it across: every 1000 ticks
+# (~10s), each node re-broadcasts the rows it OWNS, so a node that was down
+# for the create converges within one period without waiting for the next
 # mutation.
 #
 # That function has no host test: it is called from the BSP sweep in
@@ -19,20 +21,30 @@
 # it worked was a hand-run cluster session -- which is exactly how the
 # entropy path rotted unseen here for days (entropy_init was never called
 # and every host test passed anyway). This guard is the repeatable version
-# of that session: it creates a partition, SIGKILLs a follower, relaunches
-# it with the same argv, and asserts the rebooted node's partition list
-# converges to the row. Nothing mutates the cluster between the kill and
-# the convergence check, so a converged list can only have come from the
+# of that session, shaped to stay meaningful now that learned rows persist:
+# it creates partition A while both nodes are up (proving the replication
+# gate), SIGKILLs the follower, creates partition B while the follower is
+# DOWN (so B cannot be on its disk and cannot have been learned), relaunches
+# the follower with the same argv, and asserts the rebooted node's partition
+# list converges to B. Nothing mutates the cluster between B's create and
+# the convergence check, so a converged B can only have come from the
 # periodic re-announce.
 #
 # The sync evidence pins the PATH, not just the outcome: the rebooted
 # node's serial log carries `[PARTITION] sync: partition N '<name>' ...
 # learned from node <L>` lines, and that string is emitted only by
-# partition_sync_upsert() on DSPP_PARTITION_ANNOUNCE RX (kernel/partition.c
-# line ~684). The checkpoint broadcast -- the other periodic thing that
-# flows -- has no partition reference at all (net/dspp_checkpoint.c), so a
-# learned row with sync lines in a fresh (post-reboot) log can only have
-# come over the announce family.
+# partition_sync_upsert() on DSPP_PARTITION_ANNOUNCE RX (kernel/partition.c).
+# The checkpoint broadcast -- the other periodic thing that flows -- has no
+# partition reference at all (net/dspp_checkpoint.c), so a learned row with
+# sync lines in a fresh (post-reboot) log can only have come over the
+# announce family.
+#
+# Learned-row PERSISTENCE itself is not this guard's job: a rebooted node
+# keeping rows it learned is pinned deterministically by
+# tests/persist_partition_host_test.c (negative tooth: unflushed learn
+# vanishes; positive tooth: flushed learn survives; withdraw tooth). The
+# guard's create-while-down shape exists precisely so persistence cannot
+# fake the re-announce result.
 #
 # ─── Why it does not launch a cluster ─────────────────────────────────────
 # This guard REBOOTS one node of the cluster it runs against, so it must
@@ -83,8 +95,10 @@ FAST="${AEROSLS_REANNOUNCE_FAST:-0}"
 CTL="tools/aeroslsctl"
 CLUSTER_DIR="cluster"
 PID_FILE="$CLUSTER_DIR/cluster.pids"
-NAME="guard-reannounce-$$"     # unique per run: a stale persisted row can
-                               # never be mistaken for a converged one
+NAME_A="guard-reannounce-$$"          # created while both nodes are up
+NAME_B="guard-reannounce-$$-late"     # created while the follower is DOWN:
+                                      # unique per run, so a stale persisted
+                                      # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
     POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_BOOT=8; WAIT_CONV=8
@@ -190,9 +204,10 @@ PY
 # ─── 1. the cluster must exist ────────────────────────────────────────────
 [ -f "$PID_FILE" ] || die "no $PID_FILE -- is a cluster running? Start one first:
        ./run-cluster.sh --nodes 2
-       then re-run this guard against it. (A node that boots after a create
-       must converge from the periodic re-announce -- that is the property
-       being checked, and it cannot be checked without a cluster.)"
+       then re-run this guard against it. (A node that is DOWN when a
+       partition is created must converge from the periodic re-announce --
+       that is the property being checked, and it cannot be checked without
+       a cluster.)"
 NODE_IDS="$(awk '{print $1}' "$PID_FILE")"
 [ -n "$NODE_IDS" ] || die "$PID_FILE is empty -- nothing to test."
 
@@ -235,35 +250,35 @@ echo "   leader node $leader, follower node $follower"
 L_PORT=$((HTTP_BASE + leader))
 F_PORT=$((HTTP_BASE + follower))
 
-# ─── 3. create a partition on the leader ──────────────────────────────────
-echo "==> creating partition '$NAME' on node $leader"
+# ─── 3. create partition A on the leader; the follower must learn it ───────
+# The pre-reboot gate. If the mutation-driven announce is broken, nothing
+# after this point is meaningful -- and it also lets the follower persist
+# its learned row (partition_persist_flush in the sweep), which is what the
+# host test pins; here it just proves the replication path still works.
+echo "==> creating partition '$NAME_A' on node $leader (both nodes up)"
 "$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
-    shell partition create "$NAME" >/dev/null \
+    shell partition create "$NAME_A" >/dev/null \
     || die "partition create failed on node $leader (aeroslsctl output above)"
 
-# ─── 4. GATE: the follower must learn it from the CREATE announce ─────────
-# If the mutation-driven announce is broken, the periodic re-announce test
-# cannot be meaningfully run, and failing here names the right layer instead
-# of blaming the re-announce for a replication regression.
-echo "==> waiting for node $follower to learn '$NAME' from the create announce (up to ${WAIT_LEARN}s)"
+echo "==> waiting for node $follower to learn '$NAME_A' from the create announce (up to ${WAIT_LEARN}s)"
 learned=""
 deadline=$(( $(date +%s) + WAIT_LEARN ))
 while :; do
     if get200 "$F_PORT" /api/partitions; then
-        learned="$(row_if "$FETCH_BODY" "$NAME" "$leader")"
+        learned="$(row_if "$FETCH_BODY" "$NAME_A" "$leader")"
         [ -n "$learned" ] && break
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
-[ -n "$learned" ] || fail "node $follower never learned partition '$NAME' from the
+[ -n "$learned" ] || fail "node $follower never learned partition '$NAME_A' from the
        create announce within ${WAIT_LEARN}s. DSPP_PARTITION_ANNOUNCE
        replication is broken -- the re-announce test cannot proceed. The
        follower's list held:
 $(dump_rows "$FETCH_BODY")"
 echo "   node $follower learned $learned"
 
-# ─── 5. capture the follower's identity BEFORE touching it ────────────────
+# ─── 4. capture the follower's identity BEFORE touching it ────────────────
 F_PID="$(awk -v n="$follower" '$1==n{print $2}' "$PID_FILE")"
 [ -n "$F_PID" ] || die "no pid for node $follower in $PID_FILE"
 kill -0 "$F_PID" 2>/dev/null || die "node $follower (pid $F_PID) is not running"
@@ -283,7 +298,7 @@ if [ "$FAKE" != "1" ]; then
 fi
 echo "   node $follower = pid $F_PID, ${#F_ARGV[@]} argv elements, ${F_ARGV[0]##*/}"
 
-# ─── 6. kill the follower ─────────────────────────────────────────────────
+# ─── 5. kill the follower ─────────────────────────────────────────────────
 echo "==> SIGKILL node $follower (pid $F_PID)"
 kill -9 "$F_PID" 2>/dev/null || true
 gone=0
@@ -294,6 +309,17 @@ done
 [ "$gone" -eq 1 ] || die "node $follower (pid $F_PID) survived SIGKILL"
 # Let the console/REST hostfwd ports drain before the relaunch binds them.
 sleep 1
+
+# ─── 6. create partition B while the follower is DOWN ─────────────────────
+# The tooth of this guard. B is announced once (nobody hears it) and then
+# re-announced on the leader's period; the follower is down for BOTH. B is
+# on the leader's disk only -- the follower never learned it, so its own
+# disk cannot hold it, and learned-row persistence cannot fake this result.
+echo "==> creating partition '$NAME_B' on node $leader while node $follower is DOWN"
+"$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    shell partition create "$NAME_B" >/dev/null \
+    || die "partition create failed on node $leader (aeroslsctl output above)"
+echo "   '$NAME_B' was never announced to a live follower and cannot be on its disk"
 
 # ─── 7. relaunch it with the same argv ────────────────────────────────────
 # setsid: the relaunched node must outlive this script. It is the contract
@@ -326,30 +352,32 @@ done
 echo "   node $follower is up"
 
 # ─── 9. convergence: the periodic re-announce, with no mutation ───────────
-# Between the kill and this check nothing mutates the cluster. The rebooted
-# node's learned rows were runtime state and died with it, so a converged
-# list can only have come from the leader's periodic re-announce.
-echo "==> waiting for node $follower to converge to '$NAME' (up to ${WAIT_CONV}s; the re-announce period is 1000 ticks ~= 10s)"
+# Between B's create and this check nothing mutates the cluster. B was
+# never learned and is on nobody's disk but the leader's, so a converged B
+# on the rebooted follower can only have come from the periodic re-announce.
+echo "==> waiting for node $follower to converge to '$NAME_B' (up to ${WAIT_CONV}s; the re-announce period is 1000 ticks ~= 10s)"
 conv=""
 deadline=$(( $(date +%s) + WAIT_CONV ))
 while :; do
     if get200 "$F_PORT" /api/partitions; then
-        conv="$(row_if "$FETCH_BODY" "$NAME" "$leader")"
+        conv="$(row_if "$FETCH_BODY" "$NAME_B" "$leader")"
         [ -n "$conv" ] && break
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
-[ -n "$conv" ] || fail "node $follower never converged to partition '$NAME' within
-       ${WAIT_CONV}s -- the periodic re-announce did not reach it. Its list held:
-$(dump_rows "$FETCH_BODY")
-       No partition mutation happened between the kill and this check, so a
-       converged list can only come from partition_reannounce_tick()."
+[ -n "$conv" ] || fail "node $follower never converged to partition '$NAME_B' within
+       ${WAIT_CONV}s -- the periodic re-announce did not reach it. '$NAME_B'
+       was created while this node was DOWN, so it cannot be on disk and
+       cannot have been learned; a converged row can only come from
+       partition_reannounce_tick(). Its list held:
+$(dump_rows "$FETCH_BODY")"
 
-sync_ev="$(grep -h "PARTITION] sync.*$NAME" "$CLUSTER_DIR/node$follower.log" 2>/dev/null | tail -2)"
+sync_ev="$(grep -h "PARTITION] sync.*$NAME_B" "$CLUSTER_DIR/node$follower.log" 2>/dev/null | tail -2)"
 echo
 echo "PASS  node $follower converged to $conv after a reboot, with no partition"
-echo "      mutation in between -- the row came from the periodic re-announce."
+echo "      mutation in between -- the row was created while it was DOWN and came"
+echo "      from the periodic re-announce."
 if [ -n "$sync_ev" ]; then
     echo "      sync evidence ([PARTITION] sync is emitted only by the announce RX):"
     printf '%s\n' "$sync_ev" | sed 's/^/        /'

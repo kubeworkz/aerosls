@@ -15,15 +15,19 @@
 # implement only the handful of routes the guard touches, plus one piece of
 # real state: the leader "announces" a created partition to a row file the
 # follower "learns" from, and the follower counts its own boots so it can
-# behave differently AFTER the guard kills and relaunches it -- which is
-# exactly how the real kernel differs (learned rows are runtime state).
+# behave differently AFTER the guard kills and relaunches it. The guard's
+# scenario is shaped for the persistence change: it creates row A while
+# both nodes are up (learn gate), kills the follower, creates row B WHILE
+# it is down, and relaunches -- so the follower's second boot serves B only
+# if the re-announce delivered it, exactly like the real kernel (B was
+# never learned and is on nobody's disk but the creator's).
 #
 # The teeth:
-#   converged     -> PASS  (follower serves the row after the relaunch)
-#   notconverged  -> FAIL  (follower never serves it; the convergence poll
+#   converged     -> PASS  (follower serves row B after the relaunch)
+#   notconverged  -> FAIL  (follower never serves B; the convergence poll
 #                           must run out and say so)
-#   nolearn       -> FAIL  (follower does not even learn from the create
-#                           announce; the pre-reboot gate must bite)
+#   nolearn       -> FAIL  (follower does not even learn row A from the
+#                           create announce; the pre-reboot gate must bite)
 #   silent        -> ABORT (no cluster.pids at all; the guard must say how
 #                           to start one)
 #
@@ -81,7 +85,7 @@ cleanup_fakes() {
         rm -f "$PID_FILE"
     fi
     [ -n "$FAKE_PIDS" ] && kill $FAKE_PIDS 2>/dev/null || true
-    wait 2>/dev/null
+    wait 2>/dev/null   # silence the "Killed" job notices for the SIGKILLed fakes
     return 0
 }
 cleanup() { cleanup_fakes; [ -n "$STATE" ] && rm -rf "$STATE"; return 0; }
