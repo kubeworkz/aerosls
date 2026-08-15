@@ -756,6 +756,61 @@ void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) {
 // apply after the clear leaves the flag set for the next flush. NVMe writes
 // are already coalesced by the flag, so this is at most one extra write per
 // sweep under announce load.
+// ─── Owned-set reconciliation (closes the destroy-while-down staleness) ────
+// Called from dspp_partition_ownedset_rx() (net/dspp.c) on the RX path --
+// the timer ISR -- so like the sync functions it only marks the dirty flag
+// and never blocks or does I/O. The payload is the source's COMPLETE owned
+// partition-id set; any row in OUR table whose owner is the source but
+// whose id is NOT in the set is garbage: either it was destroyed while we
+// were down (the durable-staleness case learned-row persistence created --
+// withdraws are mutation-only, so nothing else ever re-announces a row's
+// absence) or the source never owned it in the first place. Rows owned by
+// other nodes are left for THEIR sets; the source's set is the only
+// authority on what the source owns.
+//
+// Ordering: correctness relies on per-source FIFO delivery (single shared
+// segment, per-source ring RX), so a set is never processed against rows
+// created by a LATER announce the set predates. The generation counter
+// catches duplicates (same generation twice) but deliberately ACCEPTS a
+// lower one -- the only way a source's counter goes backwards is a reboot,
+// and the rebooted source's first set is fresh truth.
+void partition_sync_ownedset(uint32_t source_node_id, uint32_t generation,
+                             const uint32_t* ids, uint32_t count) {
+    if (source_node_id == 0) return;
+    if (source_node_id > CLUSTER_NODE_MAX) return;
+    if (count > 0 && !ids) return;   /* count==0 with NULL ids is a legitimate EMPTY set */
+
+    static uint32_t partition_ownedset_seen[CLUSTER_NODE_MAX + 1];
+    uint32_t* seen = &partition_ownedset_seen[source_node_id];
+    if (generation != 0 && generation == *seen) return;   /* duplicate set */
+    *seen = generation;
+
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (!partition_owner_table[i].active) continue;
+        if (partition_owner_table[i].node_id != source_node_id) continue;
+        uint32_t part_id = partition_owner_table[i].partition_id;
+        if (part_id == PARTITION_SYSTEM || part_id >= PARTITION_MAX) continue;
+        if (!partition_table[part_id].active) continue;
+
+        int in_set = 0;
+        for (uint32_t j = 0; j < count; j++) {
+            if (ids[j] == part_id) { in_set = 1; break; }
+        }
+        if (in_set) continue;
+
+        /* Stale: the source no longer owns this partition. Remove the row
+         * AND the owner row, and persist the removal -- an unpersisted GC
+         * would resurrect the ghost at the very next reboot. */
+        partition_table[part_id].active = 0;
+        partition_owner_table[i].active = 0;
+        partition_persist_dirty = 1;
+        kernel_serial_printf(
+            "[PARTITION] sync: partition %u (owner node %u) no longer owned -- "
+            "collected from the owned-set.\n",
+            (unsigned)part_id, (unsigned)source_node_id);
+    }
+}
+
 void partition_persist_flush(void) {
     if (!partition_persist_dirty) return;
     partition_persist_dirty = 0;
@@ -774,8 +829,22 @@ void partition_persist_flush(void) {
 // the sweep is load-dependent and unbounded, so the period is measured in
 // kernel_tick_counter (nominal 100 Hz), not call count.
 #define PARTITION_REANNOUNCE_TICKS 1000u  /* ~10 s at the nominal sweep rate */
+/* Every N re-announce periods, each node ALSO broadcasts the full set of
+ * partition ids it owns (DSPP_PARTITION_OWNEDSET). The per-row announce
+ * converges creates; the owned-set reconciles DESTROYS -- a node that was
+ * down for a withdraw keeps the destroyed row (learned rows persist now),
+ * and since withdraws are mutation-only, the full set is the only thing
+ * that ever tells listeners "this row no longer exists". ~100 s at the
+ * nominal sweep rate: slow enough to be cheap (one frame per node), fast
+ * enough that a rebooted node's stale rows are collected within a couple
+ * of minutes. */
+#define PARTITION_OWNEDSET_EVERY 10u
 
 static uint64_t partition_last_reannounce_tick = 0;
+static uint32_t partition_reannounce_periods  = 0;
+static uint32_t partition_ownedset_generation = 0;
+/* Static, not stack: up to PARTITION_MAX ids, past single-local budget. */
+static uint32_t partition_ownedset_ids[PARTITION_MAX];
 
 void partition_reannounce_tick(uint64_t now) {
     if (now - partition_last_reannounce_tick < PARTITION_REANNOUNCE_TICKS) return;
@@ -784,6 +853,7 @@ void partition_reannounce_tick(uint64_t now) {
     uint32_t me = cluster_local_node_id();
     if (me == 0) return;   /* unclustered: nothing to converge and nobody to tell */
 
+    uint32_t owned_count = 0;
     for (int i = 0; i < PARTITION_MAX; i++) {
         if (!partition_owner_table[i].active) continue;
         uint32_t part_id = partition_owner_table[i].partition_id;
@@ -791,5 +861,13 @@ void partition_reannounce_tick(uint64_t now) {
         if (partition_owner_table[i].node_id != me) continue;
         if (!partition_table[part_id].active) continue;   /* owner row without a table row is not a real partition */
         dspp_partition_announce(part_id, partition_table[part_id].name, me);
+        partition_ownedset_ids[owned_count++] = part_id;
     }
+
+    partition_reannounce_periods++;
+    if (partition_reannounce_periods < PARTITION_OWNEDSET_EVERY) return;
+    partition_reannounce_periods = 0;
+    partition_ownedset_generation++;
+    dspp_partition_ownedset_send(partition_ownedset_generation,
+                                 partition_ownedset_ids, owned_count);
 }

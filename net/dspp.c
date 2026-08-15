@@ -62,7 +62,15 @@ _Static_assert(sizeof(struct DSPPPacketHeader) <= DSPP_MAX_WIRE_PAYLOAD,
 _Static_assert(sizeof(struct DSPPServiceHeader) <= DSPP_MAX_WIRE_PAYLOAD,
                "DSPPServiceHeader does not fit an Ethernet frame");
 _Static_assert(sizeof(struct DSPPPartitionSyncHeader) <= DSPP_MAX_WIRE_PAYLOAD,
-               "DSPPPartitionSyncHeader does not fit an Ethernet frame");
+                  "partition sync header exceeds the wire payload");
+/* The owned-set tail is a flexible array; the assert covers the fixed part,
+ * and the FULL frame (fixed part + PARTITION_MAX ids at 4 bytes each) must
+ * also fit -- that is the whole-set guarantee, and 32 + 4*256 = 1056 < 1486.
+ * Kept as an explicit compile-time claim so a PARTITION_MAX growth that
+ * would silently start dropping reconciliation frames fails the build. */
+_Static_assert(sizeof(struct DSPPPartitionOwnedSetHeader) +
+                   PARTITION_MAX * 4u <= DSPP_MAX_WIRE_PAYLOAD,
+               "a full owned-set frame would exceed the wire payload");
 _Static_assert(sizeof(struct DSPPMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
                "DSPPMigrateHeader does not fit an Ethernet frame");
 _Static_assert(sizeof(struct DSPPCtxMigrateHeader) <= DSPP_MAX_WIRE_PAYLOAD,
@@ -528,6 +536,15 @@ DSPP_SVC_SAME_OFFSET(opcode);
 DSPP_SVC_SAME_OFFSET(node_source_id);
 DSPP_SVC_SAME_OFFSET(node_dest_id);
 DSPP_SVC_SAME_OFFSET(transfer_id);
+#define DSPP_PART_SAME_OFFSET(f) \
+    _Static_assert(__builtin_offsetof(struct DSPPPartitionOwnedSetHeader, f) == \
+                   __builtin_offsetof(struct DSPPMigrateHeader, f), \
+                   "DSPP owned-set header prefix drifted: " #f)
+DSPP_PART_SAME_OFFSET(magic);
+DSPP_PART_SAME_OFFSET(opcode);
+DSPP_PART_SAME_OFFSET(node_source_id);
+DSPP_PART_SAME_OFFSET(node_dest_id);
+DSPP_PART_SAME_OFFSET(transfer_id);
 DSPP_SVC_SAME_OFFSET(partition_id);
 DSPP_SVC_SAME_OFFSET(status);
 #undef DSPP_SVC_SAME_OFFSET
@@ -750,6 +767,55 @@ void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len) {
     }
 }
 
+void dspp_partition_ownedset_send(uint32_t generation,
+                                  const uint32_t* partition_ids,
+                                  uint32_t count) {
+    if (cluster_local_node_id() == 0) return;   /* same silence rule as the mutators */
+    if (count > PARTITION_MAX) {
+        kernel_serial_printf("[DSPP] owned-set send: %u ids > PARTITION_MAX -- dropped.\n",
+                             (unsigned)count);
+        return;
+    }
+    /* Static, not stack: the full set is up to ~1 KiB, past this kernel's
+     * single-local stack discipline (the same convention dspp_transmit_raw's
+     * own frame_buf documents). Reentrancy is not a concern -- this is only
+     * called from the BSP sweep's partition_reannounce_tick(). */
+    static uint8_t buf[sizeof(struct DSPPPartitionOwnedSetHeader) + PARTITION_MAX * 4u];
+    struct DSPPPartitionOwnedSetHeader* h = (struct DSPPPartitionOwnedSetHeader*)buf;
+    h->magic          = DSPP_MIGRATE_MAGIC;
+    h->opcode         = DSPP_PARTITION_OWNEDSET;
+    h->node_source_id = (uint16_t)cluster_local_node_id();
+    h->node_dest_id   = 0;              /* broadcast -- everyone reconciles */
+    h->transfer_id    = 0;
+    h->generation     = generation;
+    h->count          = count;
+    for (uint32_t i = 0; i < count; i++) h->partition_ids[i] = partition_ids[i];
+
+    uint16_t len = (uint16_t)(sizeof(struct DSPPPartitionOwnedSetHeader) + count * 4u);
+    if (len > DSPP_MAX_WIRE_PAYLOAD) {
+        /* Can only happen if PARTITION_MAX outgrew the frame; the static
+         * assert above makes this dead, kept as a belt for the runtime. */
+        kernel_serial_printf("[DSPP] owned-set send: frame %u exceeds the wire -- dropped.\n",
+                             (unsigned)len);
+        return;
+    }
+    dspp_transmit_raw(buf, len);
+}
+
+void dspp_partition_ownedset_rx(struct DSPPPartitionOwnedSetHeader* h, uint16_t len) {
+    if (!h || len < sizeof(struct DSPPPartitionOwnedSetHeader)) return;
+    /* Ignore our own broadcast, same self-filter as the sync family. */
+    if (h->node_source_id == (uint16_t)cluster_local_node_id()) return;
+    /* Bounds-check the variable tail against the ACTUAL frame length before
+     * touching a single id: a short or malformed frame must be dropped, not
+     * walked past its end. This is the one partition frame with a variable
+     * array, so it is the one that needs the explicit check. */
+    if (h->count > PARTITION_MAX) return;
+    if (len < sizeof(struct DSPPPartitionOwnedSetHeader) + h->count * 4u) return;
+    partition_sync_ownedset(h->node_source_id, h->generation,
+                            h->partition_ids, h->count);
+}
+
 void dspp_rx_dispatch(void* buf, uint16_t len) {
     if (!buf || len < sizeof(uint64_t)) return;
     uint64_t magic;
@@ -776,6 +842,11 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
         if (opcode == DSPP_PARTITION_ANNOUNCE || opcode == DSPP_PARTITION_WITHDRAW) {
             if (len < sizeof(struct DSPPPartitionSyncHeader)) return;
             dspp_partition_rx((struct DSPPPartitionSyncHeader*)buf, len);
+            return;
+        }
+
+        if (opcode == DSPP_PARTITION_OWNEDSET) {
+            dspp_partition_ownedset_rx((struct DSPPPartitionOwnedSetHeader*)buf, len);
             return;
         }
 

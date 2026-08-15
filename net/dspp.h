@@ -422,6 +422,7 @@ void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len);
 enum DSPPPartitionOpcode {
     DSPP_PARTITION_ANNOUNCE = 15,  /* "partition <id> is named <name>, owned by <node>" */
     DSPP_PARTITION_WITHDRAW = 16,  /* "partition <id> no longer exists" */
+    DSPP_PARTITION_OWNEDSET = 17,  /* "here is the COMPLETE set of partition ids I own" */
 };
 
 /* Mirrors PARTITION_NAME_LEN (kernel/partition.h) -- the same
@@ -444,18 +445,53 @@ struct DSPPPartitionSyncHeader {
     char     partition_name[DSPP_PARTITION_NAME_LEN];
 } __attribute__((packed));
 
+/* The reconciliation frame. Same prefix layout as every other header in
+ * the migrate-magic family; the tail is a generation counter and the
+ * source's COMPLETE owned partition-id set. Sent by each node on a slower
+ * cadence than the per-row re-announce (every PARTITION_OWNEDSET_EVERY
+ * re-announce periods, kernel/partition.c). Listeners GC any row whose
+ * owner is this source but whose id is NOT in the set -- the fix for the
+ * stale-row case learned-row persistence made durable: a node that was
+ * DOWN during a destroy keeps the destroyed row on disk, and since
+ * withdraws are mutation-only nothing ever re-announces a row's absence,
+ * so without this frame the ghost would live forever. Full-set, not a
+ * diff, deliberately: a listener that was down for N periods must still
+ * converge, and a diff cannot express "this row no longer exists". */
+struct DSPPPartitionOwnedSetHeader {
+    /* Same prefix layout as the migrate/service/partition-sync headers --
+     * static-asserted in dspp.c, for the same dispatcher reason. */
+    uint64_t magic;             /* DSPP_MIGRATE_MAGIC (shared family) */
+    uint16_t opcode;            /* DSPP_PARTITION_OWNEDSET */
+    uint16_t node_source_id;
+    uint32_t node_dest_id;      /* 0 == broadcast to the segment */
+    uint64_t transfer_id;       /* unused; keeps the prefix identical */
+    /* ── Owned-set tail ───────────────────────────────────────────── */
+    uint32_t generation;        /* source's monotonic set counter; a LOWER
+                                 * value means the source rebooted and its
+                                 * counter restarted, so it is accepted too */
+    uint32_t count;             /* ids[] entries (<= PARTITION_MAX) */
+    uint32_t partition_ids[];   /* the complete set, dense */
+} __attribute__((packed));
+
 /* Sender side, called by kernel/partition.c's mutators. Silent on a node
  * with no cluster identity (node id 0 is the Phase 1 uninitialized
  * sentinel), same rule as dspp_service_announce(). */
 void dspp_partition_announce(uint32_t partition_id, const char* name,
                              uint32_t owner_node_id);
 void dspp_partition_withdraw(uint32_t partition_id);
+/* Periodic reconciliation (see the owned-set header comment above). */
+void dspp_partition_ownedset_send(uint32_t generation,
+                                  const uint32_t* partition_ids,
+                                  uint32_t count);
 /* Receiver side: called from dspp_rx_dispatch() for DSPP_PARTITION_*;
  * applies the row via kernel/partition.c's partition_sync_upsert()/
- * partition_sync_withdraw(). Those run on the RX path (timer ISR), so
- * they mark a dirty flag instead of persisting; the BSP sweep's
- * partition_persist_flush() (net/http.c) writes the table out. */
+ * partition_sync_withdraw()/partition_sync_ownedset(). Those run on the
+ * RX path (timer ISR), so they mark a dirty flag instead of persisting;
+ * the BSP sweep's partition_persist_flush() (net/http.c) writes the
+ * table out. */
 void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len);
+void dspp_partition_ownedset_rx(struct DSPPPartitionOwnedSetHeader* h,
+                                uint16_t len);
 
 /* Wraps dspp_len bytes at dspp_payload in a broadcast Ethernet frame
  * (ethertype ETHERTYPE_DSPP, net/net.h) and transmits it -- the one real

@@ -159,6 +159,15 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
                            const char* name, uint32_t source_node_id);
 void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id);
 
+/* Owned-set reconciliation RX: the source's COMPLETE owned partition-id
+ * set. GCs any row in our table whose owner is the source but whose id is
+ * not in the set -- the durable fix for rows destroyed while we were down
+ * (see partition.c's reconciliation comment for ordering + generation
+ * rules). Called from the RX path, so like the sync functions it only
+ * marks the dirty flag. */
+void partition_sync_ownedset(uint32_t source_node_id, uint32_t generation,
+                             const uint32_t* ids, uint32_t count);
+
 /* Deferred persistence of learned rows: write out any RX-applied change
  * (upsert or withdraw) from BSP context. Call from the BSP sweep -- it
  * does real NVMe I/O, so it must never run on the ISR path that set the

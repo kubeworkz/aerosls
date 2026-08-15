@@ -82,6 +82,7 @@ static int checks_failed = 0;
 void kernel_serial_print(const char* s) { (void)s; }
 void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id, const char* name, uint32_t source_node_id) { (void)partition_id; (void)owner_node_id; (void)name; (void)source_node_id; }
 void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) { (void)partition_id; (void)source_node_id; }
+void partition_sync_ownedset(uint32_t source_node_id, uint32_t generation, const uint32_t* ids, uint32_t count) { (void)source_node_id; (void)generation; (void)ids; (void)count; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
 uint64_t sys_sls_insert(struct SLSRecordRequest* req) { (void)req; return 0; }

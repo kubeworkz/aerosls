@@ -134,6 +134,7 @@ uint32_t database_next_id = 1;
 uint32_t database_grant_count = 0;
 void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
 void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
+void dspp_partition_ownedset_send(uint32_t generation, const uint32_t* partition_ids, uint32_t count) { (void)generation; (void)partition_ids; (void)count; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
 /* Phase 14 (LPAR): partition.c's partition_destroy() (added this phase)
@@ -428,6 +429,54 @@ int main(void) {
     persist_restore_all();
     CHECK(partition_table[40].active == 0 && partition_get_owner_node(40) == 0,
           "a flushed withdraw is durable -- the row stays gone after the reboot");
+
+    /* ── Owned-set reconciliation (closes the destroy-while-down staleness):
+     * partition_sync_ownedset() GCs any row whose owner is the source but
+     * whose id is missing from the source's COMPLETE owned set -- the one
+     * thing that ever tells a node "this row no longer exists" after a
+     * destroy it was down for. Teeth: only the source's rows are touched,
+     * other owners and PARTITION_SYSTEM are left alone, the removal is
+     * durable (dirty flag + flush), and a duplicate set is a no-op. ─────── */
+    uint32_t two_ids[2] = { 40, 41 };
+    partition_sync_upsert(40, 7, "gc-a", 7);   /* node 7 owns these two */
+    partition_sync_upsert(41, 7, "gc-b", 7);
+    partition_sync_upsert(42, 9, "other", 9);  /* node 9 owns this one */
+
+    uint32_t set1[1] = { 40 };
+    partition_sync_ownedset(7, 1, set1, 1);    /* node 7 owns ONLY 40 now */
+    CHECK(partition_table[40].active == 1 && partition_get_owner_node(40) == 7,
+          "owned-set GC keeps a row that IS in the source's set");
+    CHECK(partition_table[41].active == 0 && partition_get_owner_node(41) == 0,
+          "owned-set GC removes a row the source no longer owns (the destroy-while-down ghost)");
+    CHECK(partition_table[42].active == 1 && partition_get_owner_node(42) == 9,
+          "owned-set GC touches only the SOURCE's rows -- node 9's row survives node 7's set");
+    CHECK(partition_table[PARTITION_SYSTEM].active == 1,
+          "owned-set GC never touches PARTITION_SYSTEM");
+
+    /* Duplicate set (same generation) is a no-op: nothing further changes. */
+    uint32_t before = partition_table[40].active;
+    partition_sync_ownedset(7, 1, set1, 1);
+    CHECK(partition_table[40].active == before,
+          "a duplicate owned-set (same generation) is a no-op");
+
+    /* The GC removal must be durable, or the ghost returns at the next
+     * reboot -- flush it, reboot, and confirm it stays gone. */
+    partition_persist_flush();
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_assign_table, 0, sizeof(partition_assign_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+    partition_init();                    /* 'reboot' */
+    persist_restore_all();
+    CHECK(partition_table[41].active == 0 && partition_get_owner_node(41) == 0,
+          "a GC'd row stays gone after a reboot -- the removal was flushed, not runtime-only");
+    CHECK(partition_table[40].active == 1 && strcmp(partition_table[40].name, "gc-a") == 0,
+          "the kept row survives the reboot with its name intact");
+
+    /* An EMPTY set means the source owns nothing: everything learned from
+     * it must go. */
+    partition_sync_ownedset(7, 2, NULL, 0);
+    CHECK(partition_table[40].active == 0,
+          "an empty owned-set collects every remaining row the source owned");
 
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;

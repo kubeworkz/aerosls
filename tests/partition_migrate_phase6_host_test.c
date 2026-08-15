@@ -122,6 +122,7 @@ static int checks_failed = 0;
 void kernel_serial_print(const char* s) { (void)s; }
 void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
 void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
+void dspp_partition_ownedset_send(uint32_t generation, const uint32_t* partition_ids, uint32_t count) { (void)generation; (void)partition_ids; (void)count; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
 void persist_partitions(void) {}

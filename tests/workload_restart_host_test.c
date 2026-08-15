@@ -68,6 +68,7 @@ void persist_services(void) { }
 void persist_workloads(void) { }
 void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
 void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
+void dspp_partition_ownedset_send(uint32_t generation, const uint32_t* partition_ids, uint32_t count) { (void)generation; (void)partition_ids; (void)count; }
 void persist_partitions(void) { }
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 uint32_t cluster_local_node_id(void) { return 1; }

@@ -115,6 +115,7 @@ uint32_t simi_ctx_migrate_send_partition(uint32_t partition_id, uint32_t dest_no
 void kernel_serial_print(const char* s) { (void)s; }
 void dspp_partition_announce(uint32_t partition_id, const char* name, uint32_t owner_node_id) { (void)partition_id; (void)name; (void)owner_node_id; }
 void dspp_partition_withdraw(uint32_t partition_id) { (void)partition_id; }
+void dspp_partition_ownedset_send(uint32_t generation, const uint32_t* partition_ids, uint32_t count) { (void)generation; (void)partition_ids; (void)count; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void persist_partitions(void) { }
 uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; return 0; }
