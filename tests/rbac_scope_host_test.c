@@ -122,6 +122,7 @@ uint32_t process_kill_partition(uint32_t partition_id) { (void)partition_id; ret
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t partition_reclaim_all_frames(uint32_t partition_id) { (void)partition_id; return 0; }
 uint32_t cluster_local_node_id(void) { return 0; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }
 
 /* ─── Settable-fake catalog_get_role() (see header comment above) ───────── */

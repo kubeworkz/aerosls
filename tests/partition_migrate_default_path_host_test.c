@@ -89,6 +89,7 @@ int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; retur
  * -- the exact posture every real single-node deployment and every
  * pre-Phase-7 host test has today. */
 uint32_t cluster_local_node_id(void) { return 0; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 
 /* Call-counting stubs -- what this whole file exists to check. */
 static int relocate_calls = 0;

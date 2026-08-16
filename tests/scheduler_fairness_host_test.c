@@ -104,6 +104,7 @@ uint32_t partition_reclaim_all_frames(uint32_t partition_id) {
     return 7;   /* pretend value, only used to confirm it's plumbed through into the log line if needed */
 }
 uint32_t cluster_local_node_id(void) { return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 2 */
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }   /* Multi-Node Partition Scaling Roadmap Phase 6 -- not exercised by this test, safe "nothing to relinquish" stub */
 
 /* Pull in process.c itself — this is what makes pick_next_partition()/

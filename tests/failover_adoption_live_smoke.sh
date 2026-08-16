@@ -39,6 +39,15 @@
 #   lateflip    -> FAIL  (the observer stays FOLLOWER through the adoption,
 #                         then flips to LEADER; the step-9 stays-FOLLOWER
 #                         watch must catch the late split-brain)
+#   resurrect_stable -> PASS (the guard RELAUNCHES the killed leader
+#                         mid-adoption; its stale re-announce is rejected by
+#                         both survivors, the partition does not flap, and
+#                         the leader converges to the new owner)
+#   resurrect_flap    -> FAIL  (the survivors APPLY the stale claim -- the
+#                         old "last announce wins" bug -- and the partition
+#                         flaps back to the resurrected owner)
+#   resurrect_nostale -> FAIL  (the relaunched leader never restores its
+#                         stale row, so the conflict never manifests)
 #   silent      -> ABORT (no cluster.pids at all; the guard must say how to
 #                         start one)
 #
@@ -165,6 +174,9 @@ tooth nockpt           1 "no checkpoint" "nockpt -> FAIL (the checkpoint never c
 tooth splitbrain       1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER at once)"
 tooth observeradopts   1 "ALSO recovered" "observeradopts -> FAIL (a follower that recovered must be caught by step 9)"
 tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to LEADER must be caught by step 9)"
+tooth resurrect_stable 0 "PASS"   "resurrect_stable -> PASS (stale claim rejected by both survivors, no flap, leader converged)"
+tooth resurrect_flap   1 "FLAPPED" "resurrect_flap -> FAIL (the old last-wins apply of the stale claim must be caught)"
+tooth resurrect_nostale 1 "never restored" "resurrect_nostale -> FAIL (a leader whose stale row never came back must be caught)"
 
 # The silent tooth: no cluster at all. The guard must abort (2) and say how
 # to start one -- not pass, and not blame the wrong layer.

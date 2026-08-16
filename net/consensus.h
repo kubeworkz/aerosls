@@ -463,6 +463,16 @@ uint32_t cluster_active_node_count(void);
  * _from(), kernel/failover.c). */
 int cluster_is_leader(void);
 
+/* The node id of the cluster-wide leader as last seen on heartbeat RX
+ * (0 = none known yet). Only leaders send heartbeats, so the heartbeat
+ * sender is by construction the leader. Read by the partition-sync
+ * conflict resolution (partition_sync_upsert, kernel/partition.c) on the
+ * RX path to tell a leader's own claim (adoption / re-assert -- applies)
+ * apart from a resurrected non-leader's stale claim (rejected): a plain
+ * read, safe on the timer ISR, the same class as
+ * cluster_local_node_id(). */
+uint32_t cluster_leader_id(void);
+
 /* Pre-existing gap this phase found and closed in passing: none of these
  * three were ever declared in this header, only defined in consensus.c --
  * harmless while nothing outside consensus.c called them (confirmed true

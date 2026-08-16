@@ -24,6 +24,18 @@ struct ClusterNode  local_cluster_state = {0};
 struct ClusterPeer  cluster_roster[CLUSTER_NODE_MAX];
 uint32_t             cluster_roster_count = 0;
 
+/* The leader's node id as last observed on heartbeat RX. Only leaders
+ * send heartbeats, so the sender of a heartbeat AT OUR TERM OR HIGHER is
+ * by construction the current leader -- see cluster_leader_id()'s header
+ * comment in consensus.h for who reads it and why. Deliberately a
+ * file-static rather than a field on local_cluster_state: it is
+ * peer-observed evidence, not this node's own consensus state, and no
+ * other consensus.c function needs it. Cleared to 0 at cluster_init()
+ * ("nobody known yet") and set when this node wins an election. */
+static uint32_t s_leader_id = 0;
+
+uint32_t cluster_leader_id(void) { return s_leader_id; }
+
 /* ─── How much of a consensus packet actually goes on the wire ────────────
  *
  * Every send site below builds a struct DSPPFullPagePacket and used to
@@ -88,6 +100,7 @@ int cluster_init(uint32_t local_node_id) {
     local_cluster_state.last_heartbeat_tick     = 0;
     local_cluster_state.last_beat_sent_tick     = 0;
     local_cluster_state.accumulated_votes       = 1;   /* self */
+    s_leader_id                                = 0;   /* nobody known yet */
 
     for (uint32_t i = 0; i < CLUSTER_NODE_MAX; i++) cluster_roster[i].active = 0;
     cluster_roster_count = 0;
@@ -394,6 +407,13 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
          * time out and depose a healthy leader. */
         local_cluster_state.last_heartbeat_tick = now;
 
+        /* The heartbeat sender is the leader; record it for the
+         * partition-sync conflict resolution (cluster_leader_id()). Set
+         * only past the stale-term return above: a stale-term heartbeat
+         * identifies the OLD leader, and using it to resolve an ownership
+         * conflict would be exactly the wrong authority. */
+        s_leader_id = (uint32_t)packet->header.node_source_id;
+
         if (hb_term > local_cluster_state.current_term) {
             /* Genuinely ahead: adopt it and stand down whatever we were. */
             local_cluster_state.current_term = hb_term;
@@ -524,6 +544,9 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
 
                 // Restore full Read-Write authorizations down into Process page tables
                 update_page_table_permissions_globally(0);
+                /* This node IS the leader now; record itself so its own
+                 * adoption/ownership announces resolve as leader claims. */
+                s_leader_id = local_cluster_state.node_id;
                 kernel_serial_printf("[CONSENSUS] Quorum stable. Node %u elected LEADER for term %d.\n",
                                       (unsigned)local_cluster_state.node_id, local_cluster_state.current_term);
             }

@@ -143,6 +143,7 @@ void service_remote_forget(const char* name, uint32_t node_id) {
  * partition_host_test.c already established for this exact function. */
 static uint32_t g_fake_local_node_id = 0;
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 
 /* net/net.c's real global -- not linked here; a plain zero-init stand-in
  * is fine since this test only checks ethertype/opcode/payload fields, not

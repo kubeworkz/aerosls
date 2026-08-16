@@ -53,6 +53,7 @@ void persist_services(void) { }
 void persist_partitions(void) { }
 SLSRole catalog_get_role(uint32_t uid) { (void)uid; return ROLE_SYSTEM_KERNEL; }
 uint32_t cluster_local_node_id(void) { return 1; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 volatile uint64_t kernel_tick_counter = 0;
 
 struct SLSObjectEntry object_catalog[CATALOG_MAX_OBJECTS];

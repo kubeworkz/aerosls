@@ -157,6 +157,7 @@ int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; retu
 int stream_migrate_send_partition(uint32_t p, uint32_t d) { (void)p; (void)d; return 0; }
 static uint32_t g_fake_local_node_id = 0;
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 uint32_t process_kill_partition(uint32_t p) { (void)p; return 0; }
 uint32_t catalog_vfree_partition(uint32_t p) { (void)p; return 0; }
 uint32_t partition_reclaim_all_frames(uint32_t p) { (void)p; return 0; }

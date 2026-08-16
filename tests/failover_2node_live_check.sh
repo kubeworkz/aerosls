@@ -59,11 +59,12 @@
 # nolearn (create announce broken), nockpt (checkpoint pipeline broken).
 #
 # ─── What this guard does NOT do ──────────────────────────────────────────
-# Exactly one node is killed and it is left dead -- the same contract as
-# failover_adoption_live_check.sh. The operator stops the cluster
-# afterwards (./run-cluster.sh --stop). It also does NOT relaunch the dead
-# leader: a resurrected owner would re-announce its stale row and the
-# kernel logs but does not resolve the collision.
+# Exactly one node is killed and it is left dead. The operator stops the
+# cluster afterwards (./run-cluster.sh --stop). It does not RELAUNCH the
+# dead leader the way failover_adoption_live_check.sh now does -- there is
+# no adoption here to protect (the survivor never adopts at all), and the
+# resurrected-owner resolution itself is pinned by the 3-node guard's step
+# 10, so relaunching would add nothing this guard is about.
 #
 # ─── Why it does not launch a cluster ─────────────────────────────────────
 # This guard KILLS the leader of the cluster it runs against, so it must

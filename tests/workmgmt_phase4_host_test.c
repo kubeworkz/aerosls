@@ -71,6 +71,7 @@ static int      g_vfree_partition_calls = 0;
 uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; g_vfree_partition_calls++; return 0; }
 uint32_t partition_reclaim_all_frames(uint32_t partition_id) { (void)partition_id; return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 3 -- replaces partition_reset_frame_usage() at partition_destroy()'s call site */
 uint32_t cluster_local_node_id(void) { return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 2 */
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }   /* Multi-Node Partition Scaling Roadmap Phase 6 -- not exercised by this test, safe "nothing to relinquish" stub */
 
 /* msgqueue.c's own dependency (timer.h's kernel_tick_counter) — same

@@ -149,6 +149,7 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) { (void)partition_id; re
 uint32_t partition_reclaim_all_frames(uint32_t partition_id) { (void)partition_id; return 0; }   /* Multi-Node Partition Scaling Roadmap Phase 3 -- replaces partition_reset_frame_usage() at partition_destroy()'s call site */
 static uint32_t g_fake_local_node_id = 0;   /* Multi-Node Partition Scaling Roadmap Phase 2 — settable */
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }   /* Multi-Node Partition Scaling Roadmap Phase 6 -- not exercised by this test, safe "nothing to relinquish" stub */
 
 /* ─── Fake NVMe: an in-memory map from frame-aligned LBA to 4KiB bytes ── */

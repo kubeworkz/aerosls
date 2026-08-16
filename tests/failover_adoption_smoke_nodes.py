@@ -51,11 +51,28 @@ Modes (written to <statedir>/mode by the smoke):
                   adoption, then flips to LEADER after a delay -> guard
                   FAIL at the step-9 stays-FOLLOWER check (late
                   split-brain)
+    resurrect_stable  the guard RELAUNCHES the killed leader mid-adoption.
+                  The relaunched leader restores its stale row from disk
+                  (logs the restore) and re-announces it; both survivors
+                  REJECT the stale claim (log the reject) and keep owner 2,
+                  and the leader CONVERGES to owner 2 -> guard PASS
+    resurrect_flap  the survivors APPLY the stale claim instead of
+                  rejecting it (the old "last announce wins" bug): the
+                  partition flaps back to owner 1 -> guard FAIL
+    resurrect_nostale  the relaunched leader never restores its stale row
+                  (no restore log, no re-announce): there is nothing to
+                  conflict over -> guard FAIL
 
 Both survivors DECLARE the death (every node runs failover_tick); only the
 leader recovers. So the observer's log always carries its own declaration
 line -- that is what the step-9 log check compares the Adopted line
 against.
+
+The resurrect choreography is a second wire-in-miniature: the relaunched
+leader writes <state>/resurrect_claim (its periodic re-announce), the
+survivors poll it and log their verdict, and (stable) write
+<state>/resurrect_rejected so the leader can log its convergence -- the
+same file-passing the learn/death threads already use.
 """
 
 import http.server
@@ -193,8 +210,12 @@ def death_thread():
                         % leader_id)
             else:
                 # The observer: it merely learns the handoff announce from
-                # the adopter -- except in the misbehaviour modes.
-                if row and mode in ("adopted", "observeradopts", "lateflip"):
+                # the adopter -- except in the misbehaviour modes. The
+                # resurrect modes adopt exactly like "adopted" for the
+                # death phase; the extra step is the relaunch.
+                if row and mode in ("adopted", "observeradopts", "lateflip",
+                                    "resurrect_stable", "resurrect_flap",
+                                    "resurrect_nostale"):
                     log(learn_line(row, 2))
                 if row and mode == "observeradopts":
                     # The bug: a FOLLOWER that recovered. cluster_is_leader()
@@ -218,6 +239,82 @@ def death_thread():
 
 
 threading.Thread(target=death_thread, daemon=True).start()
+
+
+# ─── Resurrected-owner choreography (the guard's step 10) ────────────────
+# The guard relaunches the killed leader from its saved argv. The relaunched
+# fake boots fresh; because created.json already exists (the guard created
+# the partition before the kill), the "boot restore" brings the stale row
+# back -- except in resurrect_nostale, where the restore silently drops it
+# (the bug: a boot that loses the stale row leaves nothing to conflict
+# over). The leader then re-announces its owned row after a delay (the
+# periodic re-announce), and the survivors' claim thread logs the verdict:
+# reject + keep the adopter (stable), or apply + flap (flap).
+if role == "leader":
+
+    def resurrect_thread():
+        row = None
+        for _ in range(200):
+            row = read_created()
+            if row:
+                break
+            time.sleep(0.05)
+        if not row or mode == "resurrect_nostale":
+            return
+        # The boot restore: the stale row (owner = this node) is durable.
+        log("[PERSIST] Partition ownership restored from NVMe.")
+        time.sleep(1.0)   # the re-announce period, scaled by FAST
+        # The periodic re-announce of the row this node still owns.
+        with open(os.path.join(state, "resurrect_claim"), "w") as f:
+            f.write(json.dumps(row))
+        # Convergence runs for the pass modes (the guard's step 10 runs
+        # unconditionally, so "adopted" now exercises the full chain too).
+        if mode not in ("resurrect_stable", "adopted"):
+            return
+        # Convergence: the leader's own periodic re-announce of the row it
+        # adopted reaches us; its claim is the leader's, so it wins and we
+        # learn the new owner. (Wire-in-miniature: the survivors signal
+        # their rejection, standing in for the leader's re-announce.)
+        for _ in range(200):
+            if os.path.exists(os.path.join(state, "resurrect_rejected")):
+                break
+            time.sleep(0.05)
+        log("[PARTITION] sync: partition %s '%s' claimed by node 1 and node 2 -- "
+            "leader node 2's claim wins, applying." % (row["id"], row["name"]))
+        log(learn_line(row, 2))
+
+    threading.Thread(target=resurrect_thread, daemon=True).start()
+
+if role == "follower":
+    flapped = False
+
+    def claim_thread():
+        global flapped
+        claim = os.path.join(state, "resurrect_claim")
+        for _ in range(600):
+            if os.path.exists(claim):
+                row = read_created()
+                if not row:
+                    return
+                if mode == "resurrect_flap":
+                    # The bug: the survivors APPLY the stale claim (the old
+                    # "last announce wins" rule). The partition flaps back
+                    # to the resurrected owner.
+                    log("[PARTITION] sync: partition %s claimed by node 2 and "
+                        "node 1 -- taking the newer." % row["id"])
+                    log(learn_line(row, 1))
+                    flapped = True
+                elif mode in ("resurrect_stable", "adopted"):
+                    log("[PARTITION] sync: partition %s claimed by node 2 and "
+                        "node 1 -- keeping node 2 (live owner), rejecting the "
+                        "stale claim." % row["id"])
+                    if not os.path.exists(os.path.join(state, "resurrect_rejected")):
+                        with open(os.path.join(state, "resurrect_rejected"), "w") as f:
+                            f.write("1")
+                return
+            time.sleep(0.05)
+
+    threading.Thread(target=claim_thread, daemon=True).start()
 
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -261,11 +358,21 @@ class H(http.server.BaseHTTPRequestHandler):
                 if mode == "notadopted":
                     # Adopted nothing: the row still claims the DEAD leader.
                     return {"partitions": [row] if row else []}
+                # resurrect_flap: the stale claim was applied, owner = 1.
+                if mode == "resurrect_flap" and "flapped" in globals() and flapped:
+                    r = dict(row)
+                    r["owner_node"] = 1
+                    return {"partitions": [r] if row else []}
                 # Adopted: owner = this node.
                 r = dict(row)
                 r["owner_node"] = node_id
                 return {"partitions": [r] if row else []}
             # Observer: learned the handoff, owner = the adopter (node 2).
+            # resurrect_flap: the stale claim was applied, owner = node 1.
+            if mode == "resurrect_flap" and "flapped" in globals() and flapped:
+                r = dict(row)
+                r["owner_node"] = 1
+                return {"partitions": [r] if row else []}
             r = dict(row)
             r["owner_node"] = 2
             return {"partitions": [r] if row else []}

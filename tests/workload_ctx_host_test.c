@@ -119,6 +119,7 @@ int  stream_migrate_recv_page(uint64_t t, uint32_t i, uint32_t f, const uint8_t*
 
 static uint32_t g_local_node = 1;
 uint32_t cluster_local_node_id(void) { return g_local_node; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 MACAddr net_my_mac;
 
 /* ─── The program image ───────────────────────────────────────────────

@@ -92,6 +92,7 @@ SLSRole catalog_get_role(uint32_t uid) { (void)uid; return g_role; }
  * the cross-node tests already use. */
 static uint32_t g_local_node = 0;
 uint32_t cluster_local_node_id(void) { return g_local_node; }
+uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 
 /* partition.c dependencies outside this test's scope. */
 struct SLSObjectEntry object_catalog[CATALOG_MAX_OBJECTS];

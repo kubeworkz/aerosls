@@ -26,9 +26,16 @@
 #      came from the dead node (hdr.node_id), adopts each partition node it
 #      contains (partition_set_owner_node -> owner = this node), and the
 #      owner handoff ANNOUNCES over DSPP, so the OTHER survivor learns the
-#      row's new owner from the periodic/mutation announce.
+#      row's new owner from the periodic/mutation announce;
+#   4. RELAUNCHING the dead leader mid-adoption is safe: the resurrected
+#      owner restores its stale row (it still owns the adopted partition on
+#      disk) and re-announces it, and the kernel's claimed-by-both conflict
+#      path (partition_sync_upsert) rejects the stale claim -- the adopted
+#      partition does NOT flap back to the node that lost it -- and the
+#      leader's own periodic re-announce teaches the resurrected node the
+#      new owner (it converges).
 #
-# The evidence pins the PATH, not just the outcome. Four strings, each
+# The evidence pins the PATH, not just the outcome. Seven strings, each
 # emitted by exactly one code site:
 #   * `[DSPP-CKPT] RX: COMPLETE`      -- net/dspp_checkpoint.c, only by the
 #     checkpoint RX; gates that the create reached the held checkpoint.
@@ -39,16 +46,28 @@
 #   * `[PARTITION] sync: partition <id> '<name>' (owner node <M>) learned
 #     from node <M>` -- only by partition_sync_upsert() on announce RX;
 #     proves the owner handoff reached the other survivor.
+#   * `[PERSIST] Partition ownership restored from NVMe.` -- persist.c,
+#     boot restore; the relaunched leader brought the stale row back from
+#     disk (only the restore prints it).
+#   * `keeping node <M> (live owner), rejecting the stale claim` --
+#     partition_sync_upsert()'s reject branch; the conflict path logged AND
+#     resolved in the failover-safe direction.
+#   * `leader node <M>'s claim wins, applying` -- partition_sync_upsert()'s
+#     leader-wins branch on the resurrected node; the leader's periodic
+#     re-announce taught it the new owner (the stale row converges away).
 #
-# ─── What this guard does NOT do ──────────────────────────────────────────
-# It does NOT relaunch the dead leader. A relaunched old leader restores its
-# OWN local partition table from disk, where it still owns the adopted
-# partition, and its periodic re-announce would claim the same id -- the
-# kernel's "claimed by node X and node Y -- taking the newer" conflict path
-# (partition_sync_upsert) logs the collision but does not resolve it, so the
-# adoption could flap. The honest contract: the guard kills the leader and
-# leaves it dead; the operator stops the cluster afterwards
-# (./run-cluster.sh --stop).
+# ─── What this guard does, step by step ───────────────────────────────────
+# It kills the leader, waits for a survivor to adopt, verifies the handoff
+# and the loser's role, and then RELAUNCHES the dead leader from its saved
+# argv. That used to be unsafe: the old "last announce wins" conflict rule
+# meant the resurrected owner's stale re-announce would steal the adopted
+# partition back (flap). partition_sync_upsert now resolves the conflict by
+# claim class -- the leader's own claim wins, an owner-initiated transfer
+# applies, and any other claim against a live owner is REJECTED -- so the
+# relaunch is the point of the test, not a hazard: it proves the conflict
+# path logs and resolves without flapping. The guard leaves the relaunched
+# leader running, rejoined to the cluster as a follower; the operator stops
+# the cluster afterwards (./run-cluster.sh --stop).
 #
 # ─── Why it does not launch a cluster ─────────────────────────────────────
 # This guard KILLS the leader of the cluster it runs against, so it must
@@ -61,8 +80,9 @@
 #   ./run-cluster.sh --nodes 3          # in another shell (>= 3 nodes)
 #   tests/failover_adoption_live_check.sh
 #
-# The guard will SIGKILL the leader it picks and leave it dead. It does not
-# stop the cluster.
+# The guard will SIGKILL the leader it picks, wait for the adoption, then
+# RELAUNCH it from the argv captured in /proc and leave it running (rejoined
+# to your cluster as a follower). It does not stop the cluster.
 #
 # Environment:
 #   AEROSLS_HTTP_BASE            port base (default 3000)
@@ -105,9 +125,9 @@ NAME="guard-failover-$$"             # unique per run, so a stale persisted
                                      # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
-    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5
+    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180
 fi
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
@@ -309,16 +329,21 @@ echo "   checkpoint carrying '$NAME' held by both survivors"
 L_PID="$(awk -v n="$leader" '$1==n{print $2}' "$PID_FILE")"
 [ -n "$L_PID" ] || die "no pid for node $leader in $PID_FILE"
 kill -0 "$L_PID" 2>/dev/null || die "node $leader (pid $L_PID) is not running"
+# The FULL argv, captured now: step 10 relaunches the killed leader with
+# exactly these arguments, so its NVMe disk (the stale partition row), its
+# serial logfile and its node identity all survive the restart -- the same
+# pattern partition_ownedset_gc_live_check.sh already uses.
+mapfile -t -d '' L_ARGV < "/proc/$L_PID/cmdline" \
+    || die "cannot read /proc/$L_PID/cmdline"
+[ "${#L_ARGV[@]}" -gt 3 ] || die "node $leader's argv came back with only ${#L_ARGV[@]} element(s)"
 if [ "$FAKE" != "1" ]; then
-    read -r -d '' _ < "/proc/$L_PID/cmdline" 2>/dev/null
-    argv0="$(tr '\0' ' ' < "/proc/$L_PID/cmdline" 2>/dev/null | awk '{print $1}')"
-    case "$argv0" in
+    case "${L_ARGV[0]}" in
         *qemu*) ;;
-        *) die "pid $L_PID does not look like QEMU (argv[0]='${argv0:-<unreadable>}') --
-       refusing to kill something unidentified." ;;
+        *) die "pid $L_PID does not look like QEMU (argv[0]='${L_ARGV[0]}') --
+       refusing to kill and relaunch something unidentified." ;;
     esac
 fi
-echo "   node $leader = pid $L_PID"
+echo "   node $leader = pid $L_PID, ${#L_ARGV[@]} argv elements, ${L_ARGV[0]##*/}"
 
 # ─── 6. kill the leader ───────────────────────────────────────────────────
 echo "==> SIGKILL node $leader (pid $L_PID)"
@@ -489,14 +514,160 @@ $(grep -h "FAILOVER] Adopted partition.*dead node $leader\|FAILOVER] recovery fo
 fi
 echo "   node $observer stayed FOLLOWER and never adopted (observed the death only)"
 
+# ─── 10. the resurrected owner: the conflict must log and resolve ────────
+# Relaunch the killed leader MID-adoption. It restores its stale row (it
+# still owns the adopted partition on disk), re-announces it, and the
+# claimed-by-both conflict path must REJECT the stale claim -- the adopted
+# partition must not flap back to the node that lost it -- and the leader's
+# own periodic re-announce must teach the resurrected node the new owner.
+# Four evidence gates, each scoped to THIS run by line-number ordering
+# against the adoption evidence:
+#   1. the relaunched leader restored the stale row ("Partition ownership
+#      restored from NVMe", only persist.c prints it) -- without the row
+#      there is nothing to conflict over;
+#   2. BOTH survivors log the reject ("keeping node ... , rejecting the
+#      stale claim", only partition_sync_upsert's reject branch prints it)
+#      AFTER their adoption evidence -- proving the claimed-by-both path
+#      ran and resolved in the failover-safe direction;
+#   3. the owner does NOT flap: no "learned from node $leader" for '$NAME'
+#      after the adoption, and the live lists on BOTH survivors still name
+#      the adopter;
+#   4. the resurrected node CONVERGES: the leader's periodic re-announce
+#      reaches it ("leader node $adopter's claim wins, applying" then the
+#      learn) AFTER the boot restore -- the stale row does not survive.
+CAN_LOG="$LOG_DIR/node$adopter.log"
+adopt_line="$(last_line "$CAN_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
+handoff_line="$(last_line "$OBS_LOG" "PARTITION] sync.*$NAME.*learned from node $adopter")"
+L_LOG="$LOG_DIR/node$leader.log"
+L_PORT=$((HTTP_BASE + leader))
+
+echo "==> relaunching the dead leader node $leader to prove the resurrected-owner conflict resolves"
+setsid "${L_ARGV[@]}" </dev/null >/dev/null 2>"$LOG_DIR/node$leader.stderr" &
+NEW_L_PID=$!
+echo "   relaunched as pid $NEW_L_PID"
+awk -v n="$leader" -v p="$NEW_L_PID" \
+    '$1==n {print n, p; next} {print}' "$PID_FILE" \
+    > "$PID_FILE.new" && mv "$PID_FILE.new" "$PID_FILE"
+
+echo "==> waiting for node $leader to come back up (up to ${WAIT_BOOT}s)"
+up=0
+deadline=$(( $(date +%s) + WAIT_BOOT ))
+while :; do
+    if get200 "$L_PORT" /api/cluster; then up=1; break; fi
+    kill -0 "$NEW_L_PID" 2>/dev/null || die "node $leader died during relaunch boot. stderr:
+$(sed 's/^/       /' "$LOG_DIR/node$leader.stderr" | tail -5)"
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$up" -eq 1 ] || die "relaunched node $leader never answered on port $L_PORT within ${WAIT_BOOT}s"
+echo "   node $leader is back up"
+
+echo "==> waiting for the resurrected-owner conflict to log and resolve (up to ${WAIT_CLAIM}s; the re-announce period is 1000 ticks)"
+restored=0; rej_s=0; rej_o=0; lw=0
+deadline=$(( $(date +%s) + WAIT_CLAIM ))
+while :; do
+    # Each gate latches independently -- they land on different polls.
+    restore_line="$(last_line "$L_LOG" "Partition ownership restored from NVMe")"
+    [ -n "$restore_line" ] && restored=1
+    # Path (a): the stale claim escaped -- both survivors rejected it.
+    rej_s_line="$(last_line "$CAN_LOG" "rejecting the stale claim")"
+    rej_o_line="$(last_line "$OBS_LOG" "rejecting the stale claim")"
+    [ -n "$rej_s_line" ] && [ "$rej_s_line" -gt "$adopt_line" ] && rej_s=1
+    [ -n "$rej_o_line" ] && [ "$rej_o_line" -gt "$handoff_line" ] && rej_o=1
+    # Path (b): the leader's claim reached the resurrected node before its
+    # own stale re-announce fired (the common live case -- the leader's
+    # re-announce tick is partway while the rebooted node's starts at
+    # zero) -- the conflict logged on the RESURRECTED node, resolved
+    # leader-wins, scoped to $NAME by the partition id in the line.
+    lw_line="$(last_line "$L_LOG" "PARTITION] sync.*$NAME.*leader node $adopter's claim wins")"
+    [ -n "$lw_line" ] && [ -n "$restore_line" ] && [ "$lw_line" -gt "$restore_line" ] && lw=1
+    if [ "$restored" -eq 1 ] && { { [ "$rej_s" -eq 1 ] && [ "$rej_o" -eq 1 ]; } || [ "$lw" -eq 1 ]; }; then
+        break
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$restored" -eq 1 ] || fail "the relaunched leader never restored its stale row
+       ('Partition ownership restored from NVMe' absent from $L_LOG within
+       ${WAIT_CLAIM}s). Without the stale row there is nothing to conflict
+       over -- the resurrected-owner resolution cannot be exercised."
+
+# no-flap: the owner must still be the adopter on BOTH survivors, and no
+# learn from the dead leader may have arrived after the adoption.
+flap_s="$(last_line "$CAN_LOG" "PARTITION] sync.*$NAME.*learned from node $leader")"
+flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*$NAME.*learned from node $leader")"
+still_s=""; still_o=""
+if get200 "$((HTTP_BASE + adopter))" /api/partitions; then
+    still_s="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"
+fi
+if get200 "$OBS_PORT" /api/partitions; then
+    still_o="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"
+fi
+if [ -n "$flap_s" ] && [ "$flap_s" -gt "$adopt_line" ]; then
+    fail "the adopted partition FLAPPED: node $adopter re-learned '$NAME' from the
+       resurrected node $leader (learn line at $flap_s, after the adoption).
+       The conflict path must reject the stale claim, not apply it."
+fi
+if [ -n "$flap_o" ] && [ "$flap_o" -gt "$handoff_line" ]; then
+    fail "the adopted partition FLAPPED: node $observer re-learned '$NAME' from the
+       resurrected node $leader (learn line at $flap_o, after the handoff).
+       The conflict path must reject the stale claim, not apply it."
+fi
+[ -n "$still_s" ] && [ -n "$still_o" ] || fail "the survivors no longer agree on the owner of
+       '$NAME': adopter list held '${still_s:-<none>}', observer list held
+       '${still_o:-<none>}'. The resurrected node's stale claim stole the
+       partition -- the conflict path must keep the live owner."
+
+# conflict evidence: the claimed-by-both path must have LOGGED its
+# resolution -- either the survivors' rejects (path a: the stale claim
+# escaped before the resurrected node converged) or the resurrected
+# node's own leader-wins (path b: the leader's re-announce beat it, the
+# common live case). The no-flap checks above already ruled out the wrong
+# direction; this gate rules out "the conflict never happened at all".
+conflict_ok=0
+{ [ "$rej_s" -eq 1 ] && [ "$rej_o" -eq 1 ]; } && conflict_ok=1
+[ "$lw" -eq 1 ] && conflict_ok=1
+[ "$conflict_ok" -eq 1 ] || fail "the claimed-by-both conflict path never logged its
+       resolution within ${WAIT_CLAIM}s: neither survivor logged 'rejecting the
+       stale claim' after the adoption, nor did the resurrected node log
+       'leader node $adopter's claim wins' after its boot restore. Either the
+       stale row never escaped (announce broken) or both resolution branches
+       are gone."
+
+# convergence: the leader's periodic re-announce teaches the resurrected
+# node the new owner.
+echo "==> waiting for the resurrected node to converge to the adopter (up to ${WAIT_CONV}s)"
+converged=0
+deadline=$(( $(date +%s) + WAIT_CONV ))
+while :; do
+    conv_learn="$(last_line "$L_LOG" "PARTITION] sync.*$NAME.*learned from node $adopter")"
+    restore_line="$(last_line "$L_LOG" "Partition ownership restored from NVMe")"
+    if [ -n "$conv_learn" ] && [ -n "$restore_line" ] && [ "$conv_learn" -gt "$restore_line" ]; then
+        converged=1; break
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$converged" -eq 1 ] || fail "the resurrected node $leader never converged to the new
+       owner ('learned from node $adopter' for '$NAME' absent after its boot
+       restore in $L_LOG within ${WAIT_CONV}s). The leader's periodic
+       re-announce must teach the stale node the truth, or the stale row
+       survives in its table forever."
+
 echo
 echo "PASS  node $leader was killed; node $adopter adopted '$NAME' from the held"
 echo "      checkpoint, the owner handoff replicated to node $observer, and the"
-echo "      loser stayed FOLLOWER without adopting."
+echo "      loser stayed FOLLOWER without adopting. Relaunching node $leader"
+echo "      mid-adoption: its stale re-announce was REJECTED by both survivors,"
+echo "      the partition did not flap, and the leader converged to the new owner."
 echo "      evidence:"
 printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Adopted partition.*dead node $leader" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] recovery for dead node $leader: rc=0" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*owner node $adopter.*learned from node $adopter" "$OBS_LOG" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
+printf '        %s\n' "$(grep -h "Partition ownership restored from NVMe" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
+printf '        %s\n' "$(grep -h "rejecting the stale claim" "$CAN_LOG" 2>/dev/null | tail -1 | sed 's/^/adopter: /')"
+printf '        %s\n' "$(grep -h "rejecting the stale claim" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
+printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*learned from node $adopter" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
 exit 0

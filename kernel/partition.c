@@ -669,14 +669,52 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
     int had = partition_exists(partition_id);
     uint32_t cur = had ? partition_get_owner_node(partition_id) : 0;
     if (had && cur != 0 && cur != owner_node_id) {
-        /* Two nodes claiming one partition id. Same rule as a duplicate
-         * service name: last announce wins, logged rather than resolved
-         * silently -- this is an operator error (ids are local slot
-         * numbers, so two creators can collide). */
-        kernel_serial_printf(
-            "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
-            "taking the newer.\n",
-            (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id);
+        /* Two nodes claiming one partition id. The old rule -- "last
+         * announce wins", mirroring the duplicate-service-name rule --
+         * was safe for the case that invented it (two concurrent creators
+         * colliding on a local slot id) but FATAL for failover: a
+         * resurrected owner restores its stale row from disk at boot and
+         * re-announces it, and "last wins" hands the adopted partition
+         * back to the node that lost it -- flapping the ownership the
+         * adoption just settled. Resolve by claim class instead, still
+         * logged loudly (any conflict is operator-visible):
+         *   * source == current owner  -- an owner-initiated transfer
+         *     (partition_migrate()): the owner is handing the row off,
+         *     apply it.
+         *   * source == owner == the cluster leader -- the leader's own
+         *     claim (failover adoption via partition_set_owner_node, or a
+         *     leader re-assert): the leader's view is authoritative,
+         *     apply it.
+         *   * anything else -- a non-owner, non-leader self-claim
+         *     colliding with a live owner: the resurrected-owner shape.
+         *     KEEP the live owner and reject the stale claim, so an
+         *     adopted partition can never flap back to the node that
+         *     lost it. The claimant converges when the leader's own
+         *     periodic re-announce reaches it.
+         * Same rule as a duplicate service name: this stays an operator
+         * error (ids are local slot numbers, so two creators can
+         * collide), but it must resolve deterministically in the
+         * failover-safe direction, not by arrival order. */
+        if (source_node_id == cur) {
+            kernel_serial_printf(
+                "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
+                "owner-initiated transfer, applying.\n",
+                (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id);
+        } else if (owner_node_id == source_node_id &&
+                   cluster_leader_id() == source_node_id) {
+            kernel_serial_printf(
+                "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
+                "leader node %u's claim wins, applying.\n",
+                (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id,
+                (unsigned)source_node_id);
+        } else {
+            kernel_serial_printf(
+                "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
+                "keeping node %u (live owner), rejecting the stale claim.\n",
+                (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id,
+                (unsigned)cur);
+            return;
+        }
     }
 
     if (!had) {
