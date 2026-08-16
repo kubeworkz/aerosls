@@ -47,6 +47,17 @@
 #include <string.h>
 #include <stdarg.h>
 #include "../net/consensus.h"
+/* Scenario 19b (the lease sweep's ownership gate) needs partition ownership
+ * to be observable from consensus.c, but this consensus-focused test does
+ * not link kernel/partition.c (it would drag in storage/stream deps). So
+ * ownership is a test-side table with a stub for partition_get_owner_node --
+ * the same pattern as the cluster_leader_id stub: consensus.c reads it,
+ * the test decides what it returns. */
+static uint32_t t_part_owner[64];
+uint32_t partition_get_owner_node(uint32_t partition_id) {
+    if (partition_id < 64) return t_part_owner[partition_id];
+    return 0;   /* mirrors partition.c's honest "no row" answer */
+}
 #include "../net/dspp.h"
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
 
@@ -455,6 +466,67 @@ int main(void) {
     transmit_call_count = 0;
     check_partition_lease_heartbeat_tick(T_NOW);
     CHECK(transmit_call_count == 1, "check_partition_lease_heartbeat_tick(): exactly one transmission -- only partition 5's LEADER heartbeat, not one per active row");
+
+    /* Scenario 19b: the write lease follows OWNERSHIP -- the sweep must not
+     * re-campaign (or heartbeat for) a lease row whose partition this node
+     * no longer owns. partition_migrate() steps the source down to
+     * FOLLOWER at the handoff but the row survives; without the gate it
+     * re-campaigns on the next election timeout and, once the destination
+     * is back up, the 2-of-3 quorum is reachable -- so the EX-owner
+     * re-acquires the write lease for a partition it no longer owns, the
+     * page-level split-brain the migrate was supposed to end. Caught live
+     * by the failover adoption guard's step 11f: after the migrate +
+     * mid-flight destination relaunch, the adopter reported holds_lease=1
+     * for a partition owned by the destination. */
+    {
+        /* Real owners: partition 5 owned by node 99 (it migrated away),
+         * partition 6 owned by the local node (55). */
+        t_part_owner[5] = 99;
+        t_part_owner[6] = 55;
+
+        /* Partition 5's lease row is LEADER (Scenario 15's quorum) but the
+         * partition is owned by node 99: the tick must step the lease DOWN
+         * -- a LEADER row on a non-owner is the lease lying -- and must
+         * transmit nothing (no heartbeat for a partition we do not own). */
+        transmit_call_count = 0;
+        partition_lease_heartbeat_tick(5, T_NOW);
+        CHECK(partition_lease_get_role(5) == ROLE_FOLLOWER,
+              "a LEADER lease row for a partition owned elsewhere is stepped down, not heartbeated");
+        CHECK(transmit_call_count == 0,
+              "the step-down transmits nothing -- no PARTITION_HEARTBEAT for a partition this node does not own");
+
+        /* Partition 6 is FOLLOWER and owned by the LOCAL node: its timeout
+         * still re-campaigns -- that is how the real owner re-acquires the
+         * lease after ownership moves. */
+        {
+            uint64_t far = T_NOW + 10 * consensus_election_timeout(55);
+            transmit_call_count = 0;
+            partition_lease_heartbeat_tick(6, far);
+            CHECK(transmit_call_count == 1,
+                  "a FOLLOWER row for a partition the LOCAL node owns still re-campaigns on timeout -- the owner can re-acquire");
+            CHECK(partition_lease_get_role(6) == ROLE_CANDIDATE,
+                  "...partition 6 is back to CANDIDATE after the owner's own re-campaign");
+        }
+
+        /* Partition 5 (owned by node 99, this node's row now FOLLOWER)
+         * must NOT re-campaign even far past its election timeout: the
+         * ex-owner must never campaign for a partition it no longer owns,
+         * and its term must not climb. */
+        {
+            uint32_t term_before = partition_lease_get_term(5);
+            uint64_t far = T_NOW + 10 * consensus_election_timeout(55);
+            transmit_call_count = 0;
+            partition_lease_heartbeat_tick(5, far);
+            CHECK(transmit_call_count == 0,
+                  "a FOLLOWER row for a partition owned ELSEWHERE never re-campaigns -- no REQUEST_VOTE from the ex-owner");
+            CHECK(partition_lease_get_role(5) == ROLE_FOLLOWER,
+                  "...partition 5 stays FOLLOWER -- the ex-owner never campaigns for it");
+            CHECK(partition_lease_get_term(5) == term_before,
+                  "...and its term does not climb -- the stale row is inert, not campaigning");
+            CHECK(partition_holds_write_lease(5) == 0,
+                  "partition_holds_write_lease(5) stays false on the ex-owner -- the page-level split-brain is closed");
+        }
+    }
 
     /* Scenario 20: sys_sls_cluster_init()/sys_sls_cluster_status() --
      * Multi-Node Partition Scaling Roadmap Phase 7 addendum. These are thin

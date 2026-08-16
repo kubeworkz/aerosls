@@ -69,6 +69,17 @@
 # leader running, rejoined to the cluster as a follower; the operator stops
 # the cluster afterwards (./run-cluster.sh --stop).
 #
+# Step 11 then proves the same claim-class resolution on the MIGRATE path
+# (Multi-Node Phase 4/6), with the write-lease layer pinned end to end: the
+# adopter holds the write lease (2-of-3 quorum), migrates the partition
+# back to the original leader (the destination step 10 resurrected, whose
+# table still holds the stale learned row), the owner-initiated transfer
+# out-resolves that stale row on the destination and the observer, the
+# destination is killed mid-flight and relaunched and must restore the
+# TRANSFERRED row, the cluster converges with no flap, and the lease is
+# relinquished at the migrate (holds_lease 0 everywhere) and re-acquired
+# on the new owner only through a fresh 2-of-3 quorum.
+#
 # ─── Why it does not launch a cluster ─────────────────────────────────────
 # This guard KILLS the leader of the cluster it runs against, so it must
 # only ever touch a cluster its operator started deliberately -- the same
@@ -125,9 +136,9 @@ NAME="guard-failover-$$"             # unique per run, so a stale persisted
                                      # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
-    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8
+    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8; WAIT_MIGRATE=8; WAIT_TRANSFER=8; WAIT_LEASE=8
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120
 fi
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
@@ -210,6 +221,36 @@ PY
 
 last_line() {
     grep -n "$2" "$1" 2>/dev/null | tail -n1 | cut -d: -f1
+}
+
+row_id() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+name = sys.argv[2]
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+for p in rows:
+    if p.get("name") == name:
+        print(p.get("id", ""))
+        break
+PY
+}
+
+holds_lease_row() {   # $1 = json, $2 = name; exits 0 when holds_lease=1
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+name = sys.argv[2]
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+for p in rows:
+    if p.get("name") == name and str(p.get("holds_lease")) == "1":
+        sys.exit(0)
+sys.exit(1)
+PY
 }
 
 # ─── 1. the cluster must exist with >= 3 nodes ────────────────────────────
@@ -515,6 +556,11 @@ fi
 echo "   node $observer stayed FOLLOWER and never adopted (observed the death only)"
 
 # ─── 10. the resurrected owner: the conflict must log and resolve ────────
+# The partition id is needed for the claim-class evidence below: the
+# conflict lines carry the partition id, not the name (partition_sync_upsert
+# logs the claimed-by pair before the name is in scope).
+PART_ID="$(get200 "$((HTTP_BASE + adopter))" /api/partitions && row_id "$FETCH_BODY" "$NAME")"
+[ -n "$PART_ID" ] || die "could not read the partition id for '$NAME' from node $adopter"
 # Relaunch the killed leader MID-adoption. It restores its stale row (it
 # still owns the adopted partition on disk), re-announces it, and the
 # claimed-by-both conflict path must REJECT the stale claim -- the adopted
@@ -579,7 +625,7 @@ while :; do
     # re-announce tick is partway while the rebooted node's starts at
     # zero) -- the conflict logged on the RESURRECTED node, resolved
     # leader-wins, scoped to $NAME by the partition id in the line.
-    lw_line="$(last_line "$L_LOG" "PARTITION] sync.*$NAME.*leader node $adopter's claim wins")"
+    lw_line="$(last_line "$L_LOG" "PARTITION] sync: partition $PART_ID claimed by node $leader and node $adopter -- leader node $adopter's claim wins")"
     [ -n "$lw_line" ] && [ -n "$restore_line" ] && [ "$lw_line" -gt "$restore_line" ] && lw=1
     if [ "$restored" -eq 1 ] && { { [ "$rej_s" -eq 1 ] && [ "$rej_o" -eq 1 ]; } || [ "$lw" -eq 1 ]; }; then
         break
@@ -654,12 +700,333 @@ done
        re-announce must teach the stale node the truth, or the stale row
        survives in its table forever."
 
+# ─── 11. the migration return: the owner-initiated claim out-resolves ─────
+# the resurrected destination's stale row, and the write lease follows the
+# new owner only through a fresh quorum election.
+#
+# Step 10 proved the ADOPTION stays put against a resurrected owner. This
+# step proves the same claim-class resolution on the MIGRATE path, with
+# the write-lease layer pinned end to end:
+#   * the adopter (current owner AND lease holder) migrates the partition
+#     back to the original leader -- the destination step 10 resurrected,
+#     whose table still holds the stale LEARNED row (owner = the adopter);
+#   * the destination is ALIVE for the migrate (it must ACK the stream
+#     data), so the transfer announce (owner = leader, source = adopter)
+#     reaches it and partition_sync_upsert's owner-initiated branch
+#     (source == current owner) OUT-RESOLVES the stale learned row --
+#     "claimed by node <adopter> and node <leader> -- owner-initiated
+#     transfer, applying" on the destination AND the observer;
+#   * the destination is then killed MID-FLIGHT (its apply of the transfer
+#     is still settling to NVMe) and relaunched: it must restore the
+#     TRANSFERRED row (owner = leader) -- never the stale learned row --
+#     and the whole cluster must converge to exactly one owner with no
+#     flap back to the adopter;
+#   * the lease layer: the adopter holds the write lease before the migrate
+#     (2-of-3 quorum; the [MMU-LEASE] strip on campaign and restore on
+#     win), relinquishes it at the migrate (holds_lease drops to 0,
+#     "Lease relinquished=yes"), and NOBODY holds it while the destination
+#     is down (the lease table is runtime-only -- a resurrected node
+#     cannot resurrect write permission); the new owner re-acquires it
+#     only through a fresh 2-of-3 quorum election, and the other two nodes
+#     hold 0.
+#
+# The kernel change that would make this fail is exactly the unsafe one: an
+# ownership transfer the destination can LOSE (it cannot -- the destination
+# participates in the stream handshake and the transfer's owner-initiated
+# branch applies over its stale row), a lease restore without a quorum, or
+# partition_holds_write_lease() true on a node that did not win one.
+ADP_LOG="$CAN_LOG"
+ADP_PORT=$((HTTP_BASE + adopter))
+
+# 11a. the adopter holds the write lease BEFORE the migrate: the 2-of-3
+# quorum is reachable with the resurrected leader back up, so a no-win is
+# a broken lease layer, not a quorum gate.
+echo "==> acquiring the write lease for '$NAME' (partition $PART_ID) on node $adopter"
+"$CTL" --host "localhost:$ADP_PORT" "${TOKEN_ARGS[@]}" \
+    shell partition lease acquire "$PART_ID" >/dev/null \
+    || die "partition lease acquire $PART_ID failed on node $adopter (aeroslsctl output above)"
+adp_held=0
+deadline=$(( $(date +%s) + WAIT_LEASE ))
+while :; do
+    if get200 "$ADP_PORT" /api/partitions; then
+        if holds_lease_row "$FETCH_BODY" "$NAME"; then adp_held=1; break; fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$adp_held" -eq 1 ] || fail "node $adopter never held the write lease for '$NAME' before
+       the migrate (holds_lease stayed 0 in /api/partitions within ${WAIT_LEASE}s). With
+       the resurrected leader back up the 2-of-3 quorum IS reachable -- a no-win means
+       the lease layer is broken (acquire inert or the vote exchange incomplete)."
+echo "   node $adopter holds the write lease for '$NAME'"
+echo "==> waiting for node $observer to LEARN the lease row (up to ${WAIT_LEASE}s)"
+lease_init_obs=""
+deadline=$(( $(date +%s) + WAIT_LEASE ))
+while :; do
+    lease_init_obs="$(last_line "$OBS_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+    [ -n "$lease_init_obs" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ -n "$lease_init_obs" ] || fail "node $observer never created a lease row for partition
+       $PART_ID (no 'partition $PART_ID lease initialised' in $OBS_LOG within ${WAIT_LEASE}s).
+       Without a row the absence of a restore on the resurrected node would be vacuous."
+echo "   $observer learned the lease row"
+
+# 11b. the migrate itself: adopter -> original leader (the destination step
+# 10 resurrected). The migrate line proves the lease was relinquished at
+# the handoff (partition_migrate step 2).
+#
+# EVIDENCE PATH: partition_migrate() prints its success line and the lease
+# step-down SYNCHRONOUSLY, inside the shell's capture window
+# (kernel_serial_capture_start -- sls_shell_execute diverts every character
+# the command produces into the HTTP response and nothing reaches the UART).
+# So the migrate evidence lives in the aeroslsctl RESPONSE, never the serial
+# log. Grepping $ADP_LOG for it is how a successful migrate once read as
+# "inert" on a live cluster (the row moved -- the adopter's table flipped
+# to owner = node $leader and announced it -- while the log never showed
+# the line). The response is the evidence.
+echo "==> migrating '$NAME' (partition $PART_ID) from node $adopter back to node $leader"
+mig_resp="$("$CTL" --host "localhost:$ADP_PORT" "${TOKEN_ARGS[@]}" \
+    shell partition migrate "$PART_ID" "$leader" 2>&1)" \
+    || die "partition migrate $PART_ID -> $leader failed on node $adopter (aeroslsctl output above)"
+case "$mig_resp" in
+    *"migrated partition $PART_ID: node $adopter -> node $leader"*) ;;
+    *) fail "the migrate of partition $PART_ID never ran on node $adopter
+       ('migrated partition $PART_ID: node $adopter -> node $leader' absent from the
+       shell response: $(printf '%s' "$mig_resp" | tail -3 | sed 's/^/       /')). The
+       migrate command is inert or refused." ;;
+esac
+echo "   migrate confirmed: $(printf '%s' "$mig_resp" | grep -m1 'migrated partition' | sed 's/^/      /')"
+case "$mig_resp" in
+    *"Lease relinquished=yes"*) ;;
+    *) fail "the migrate of partition $PART_ID did NOT relinquish the write lease (no
+       'Lease relinquished=yes' in the migrate response). partition_migrate's step 2 must
+       step the lease down -- a source that keeps write permission after handing the
+       row off is the page-level split-brain." ;;
+esac
+case "$mig_resp" in
+    *"voluntarily stepped down from LEADER"*) ;;
+    *) fail "the migrate of partition $PART_ID did NOT step the lease row down (no
+       'voluntarily stepped down from LEADER' in the migrate response). partition_lease_
+       step_down never ran -- the source keeps its lease row over a partition it no
+       longer owns." ;;
+esac
+echo "   lease relinquished at the migrate"
+echo "==> waiting for node $adopter's holds_lease to drop to 0 (up to ${WAIT_LEASE}s)"
+adp_dropped=0
+deadline=$(( $(date +%s) + WAIT_LEASE ))
+while :; do
+    if get200 "$ADP_PORT" /api/partitions; then
+        if ! holds_lease_row "$FETCH_BODY" "$NAME"; then adp_dropped=1; break; fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$adp_dropped" -eq 1 ] || fail "node $adopter still reports holds_lease=1 for '$NAME' after
+       the migrate. partition_lease_step_down did not clear the lease -- the source keeps
+       write permission over a partition it no longer owns."
+
+# 11c. the owner-initiated claim must out-resolve the destination's stale
+# LEARNED row (owner = adopter) BEFORE anything is killed. The destination
+# is alive here (it ACKed the stream data), so the transfer announce
+# (owner = leader, source = adopter) reaches it, and partition_sync_upsert
+# applies it via the source == current-owner branch -- logged on the
+# destination AND the observer, scoped AFTER the migrate line.
+echo "==> waiting for the owner-initiated transfer to out-resolve the stale row (up to ${WAIT_TRANSFER}s)"
+tr_leader=""; tr_obs=""
+deadline=$(( $(date +%s) + WAIT_TRANSFER ))
+while :; do
+    tr_leader="$(last_line "$L_LOG" "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying")"
+    tr_obs="$(last_line "$OBS_LOG" "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying")"
+    [ -n "$tr_leader" ] && [ -n "$tr_obs" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+lease_init_leader="$(last_line "$L_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+[ -n "$tr_leader" ] && [ -n "$lease_init_leader" ] && [ "$tr_leader" -gt "$lease_init_leader" ]     || fail "the destination node $leader never
+       logged the owner-initiated transfer ('claimed by node $adopter and node $leader --
+       owner-initiated transfer, applying' absent from $L_LOG after the step-11 lease
+       acquire). The stale learned row (owner = node $adopter) was NOT out-resolved on the
+       destination."
+[ -n "$tr_obs" ] && [ -n "$lease_init_obs" ] && [ "$tr_obs" -gt "$lease_init_obs" ]     || fail "node $observer never logged the
+       owner-initiated transfer for '$NAME' after the step-11 lease acquire. The transfer
+       claim must reach and apply on every node."
+echo "   owner-initiated transfer applied on node $leader and node $observer"
+# Settle: the transfer's apply is RX-path (dirty flag, sweep flush). Give
+# the sweep a beat before the kill so the destination's NVMe holds the
+# TRANSFERRED row -- that is what makes the relaunch below deterministic.
+sleep "$POLL"
+
+# 11d. kill the destination MID-FLIGHT and relaunch it, exactly like step
+# 10: same argv (node identity, NVMe disk, serial log all survive), same
+# pid-file surgery. The destination must restore the TRANSFERRED row
+# (owner = leader), never the stale learned row it resurrected in step 10.
+D_PID="$NEW_L_PID"
+kill -0 "$D_PID" 2>/dev/null || die "destination node $leader (pid $D_PID) is not running"
+mapfile -t -d '' D_ARGV < "/proc/$D_PID/cmdline" \
+    || die "cannot read /proc/$D_PID/cmdline"
+[ "${#D_ARGV[@]}" -gt 3 ] || die "node $leader's argv came back with only ${#D_ARGV[@]} element(s)"
+echo "==> SIGKILL node $leader (the migration destination, pid $D_PID) mid-flight"
+kill -9 "$D_PID" 2>/dev/null || true
+gone=0
+for _ in $(seq 1 50); do
+    kill -0 "$D_PID" 2>/dev/null || { gone=1; break; }
+    sleep 0.1
+done
+[ "$gone" -eq 1 ] || die "node $leader (pid $D_PID) survived SIGKILL"
+setsid "${D_ARGV[@]}" </dev/null >/dev/null 2>"$LOG_DIR/node$leader.stderr" &
+NEW_D_PID=$!
+echo "   relaunched as pid $NEW_D_PID"
+awk -v n="$leader" -v p="$NEW_D_PID" \
+    '$1==n {print n, p; next} {print}' "$PID_FILE" \
+    > "$PID_FILE.new" && mv "$PID_FILE.new" "$PID_FILE"
+echo "==> waiting for node $leader to come back up (up to ${WAIT_BOOT}s)"
+up=0
+deadline=$(( $(date +%s) + WAIT_BOOT ))
+while :; do
+    if get200 "$L_PORT" /api/cluster; then up=1; break; fi
+    kill -0 "$NEW_D_PID" 2>/dev/null || die "node $leader died during relaunch boot. stderr:
+$(sed 's/^/       /' "$LOG_DIR/node$leader.stderr" | tail -5)"
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$up" -eq 1 ] || die "relaunched node $leader never answered on port $L_PORT within ${WAIT_BOOT}s"
+echo "   node $leader is back up"
+
+# 11e. the destination must restore the TRANSFERRED row and the whole
+# cluster must converge to owner = node $leader, with no flap back to the
+# adopter.
+echo "==> waiting for the destination to restore the transferred row and converge (up to ${WAIT_CONV}s)"
+# SCOPING: the step-11 relaunch TRUNCATES the destination's serial log --
+# QEMU's chardev logfile starts a fresh file on every process start, so
+# the transfer line latched at 11c (previous generation) is gone by the
+# time this boot's restore lands. Comparing line numbers across the
+# truncation boundary is meaningless (a successful migrate once read as
+# "never restored its row" that way on a live cluster). Scope the restore
+# against THIS boot's own generation marker instead: kernel.c prints
+# "[AEROSLS BOOT LOGGER V1.0.0 RUNNING]" as line 1 of every boot, so the
+# current boot's restore must land after the LAST such marker. The
+# convergence gates below then pin WHICH row was restored (the transferred
+# one, owner = node $leader) on all three nodes.
+restore2=""
+deadline=$(( $(date +%s) + WAIT_CONV ))
+while :; do
+    boot_gen="$(last_line "$L_LOG" "AEROSLS BOOT LOGGER")"
+    restore2="$(last_line "$L_LOG" "Partition ownership restored from NVMe")"
+    [ -n "$restore2" ] && [ -n "$boot_gen" ] && [ "$restore2" -gt "$boot_gen" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ -n "$restore2" ] && [ -n "$boot_gen" ] && [ "$restore2" -gt "$boot_gen" ]     || fail "the relaunched destination node $leader never restored its row
+       ('Partition ownership restored from NVMe' absent from $L_LOG within
+       ${WAIT_CONV}s after this boot's 'AEROSLS BOOT LOGGER' marker). A step-11
+       relaunch that loses the transferred row leaves the destination without
+       the row it must converge on."
+conv_l=0; conv_a=0; conv_o=0
+deadline=$(( $(date +%s) + WAIT_CONV ))
+while :; do
+    [ "$conv_l" -eq 1 ] || { if get200 "$L_PORT" /api/partitions; then [ -n "$(row_if "$FETCH_BODY" "$NAME" "$leader")" ] && conv_l=1; fi; }
+    [ "$conv_a" -eq 1 ] || { if get200 "$ADP_PORT" /api/partitions; then [ -n "$(row_if "$FETCH_BODY" "$NAME" "$leader")" ] && conv_a=1; fi; }
+    [ "$conv_o" -eq 1 ] || { if get200 "$OBS_PORT" /api/partitions; then [ -n "$(row_if "$FETCH_BODY" "$NAME" "$leader")" ] && conv_o=1; fi; }
+    [ "$conv_l" -eq 1 ] && [ "$conv_a" -eq 1 ] && [ "$conv_o" -eq 1 ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$conv_l" -eq 1 ] && [ "$conv_a" -eq 1 ] && [ "$conv_o" -eq 1 ] || fail "the cluster did not
+       converge to owner = node $leader after the migrate + mid-flight relaunch within
+       ${WAIT_CONV}s (node $leader:'${conv_l:-no}' node $adopter:'${conv_a:-no}' node
+       $observer:'${conv_o:-no}'). The owner-initiated claim must out-resolve the
+       resurrected destination's stale row on EVERY node -- a node that keeps the
+       adopter's ownership is a split view."
+echo "   all three nodes agree: owner = node $leader"
+
+# no-flap: after the transfer, nothing may re-learn the row from the
+# adopter. Scope per node against its own transfer-era line (the migrate
+# summary on the adopter, the owner-initiated apply on the other two).
+#
+# The learn pattern is deliberately the SPECIFIC "(owner node $adopter)
+# learned from node $adopter", not any "learned from node $adopter": the
+# transfer itself is an announce FROM the adopter (owner = node $leader,
+# source = node $adopter), so on a node whose row already matches it lands
+# as a plain learn -- "(owner node $leader) learned from node $adopter" --
+# AFTER the owner-initiated apply. Matching that would flag the transfer
+# itself as the flap (a false positive seen live: the transfer learn sat
+# one line after the apply and the guard reported FLAPPED on a converged
+# cluster). A real flap is the ADOPTER'S OWNERSHIP coming back -- the
+# adopter announcing owner = itself after handing the row off.
+flap_a="$(last_line "$ADP_LOG" "PARTITION] sync.*$NAME.*(owner node $adopter) learned from node $adopter")"
+flap_l="$(last_line "$L_LOG" "PARTITION] sync.*$NAME.*(owner node $adopter) learned from node $adopter")"
+flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*$NAME.*(owner node $adopter) learned from node $adopter")"
+tr_l="$(last_line "$L_LOG" "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying")"
+tr_o="$(last_line "$OBS_LOG" "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying")"
+if [ -n "$flap_a" ] && [ "$flap_a" -gt "$mig_line" ]; then
+    fail "the migrated partition FLAPPED: node $adopter re-learned '$NAME' from itself
+       (learn line at $flap_a, after the migrate at $mig_line)."
+fi
+if [ -n "$flap_l" ] && [ -n "$tr_l" ] && [ "$flap_l" -gt "$tr_l" ]; then
+    fail "the migrated partition FLAPPED: the destination re-learned '$NAME' from the
+       adopter (learn line at $flap_l, after the transfer at $tr_l)."
+fi
+if [ -n "$flap_o" ] && [ -n "$tr_o" ] && [ "$flap_o" -gt "$tr_o" ]; then
+    fail "the migrated partition FLAPPED: node $observer re-learned '$NAME' from the
+       adopter (learn line at $flap_o, after the transfer at $tr_o)."
+fi
+
+# 11f. the write lease after the dust settles: nobody holds it while the
+# destination was down (runtime-only lease table -- a resurrected node has
+# no row, and the source stepped down), and the new owner re-acquires it
+# ONLY through a fresh 2-of-3 quorum.
+for node in "$leader" "$adopter" "$observer"; do
+    port=$((HTTP_BASE + node))
+    if get200 "$port" /api/partitions && holds_lease_row "$FETCH_BODY" "$NAME"; then
+        fail "node $node reports holds_lease=1 for '$NAME' after the migrate + relaunch --
+       write permission survived the ownership transfer (or a resurrected node
+       resurrected it). partition_holds_write_lease() must be false here until a
+       fresh quorum election."
+    fi
+done
+echo "   holds_lease=0 on all three nodes after the migrate + relaunch"
+
+echo "==> re-acquiring the write lease on the new owner node $leader (fresh 2-of-3 quorum)"
+"$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    shell partition lease acquire "$PART_ID" >/dev/null \
+    || die "partition lease acquire $PART_ID failed on node $leader (aeroslsctl output above)"
+newheld=0
+deadline=$(( $(date +%s) + WAIT_LEASE ))
+while :; do
+    if get200 "$L_PORT" /api/partitions; then
+        if holds_lease_row "$FETCH_BODY" "$NAME"; then newheld=1; break; fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$newheld" -eq 1 ] || fail "the new owner node $leader never re-acquired the write lease for
+       '$NAME' within ${WAIT_LEASE}s. The migrated owner must be able to win a fresh quorum
+       -- a lease the migration cannot re-establish leaves the partition read-only forever."
+for node in "$adopter" "$observer"; do
+    port=$((HTTP_BASE + node))
+    if get200 "$port" /api/partitions && holds_lease_row "$FETCH_BODY" "$NAME"; then
+        fail "node $node ALSO holds the write lease for '$NAME' after node $leader re-acquired
+       it -- two lease holders is the page-level split-brain."
+    fi
+done
+echo "   node $leader holds the write lease; nodes $adopter and $observer hold 0"
+
+echo
 echo
 echo "PASS  node $leader was killed; node $adopter adopted '$NAME' from the held"
 echo "      checkpoint, the owner handoff replicated to node $observer, and the"
 echo "      loser stayed FOLLOWER without adopting. Relaunching node $leader"
 echo "      mid-adoption: its stale re-announce was REJECTED by both survivors,"
 echo "      the partition did not flap, and the leader converged to the new owner."
+echo "      Then node $adopter migrated '$NAME' back to node $leader: the"
+echo "      owner-initiated transfer out-resolved the destination's resurrected"
+echo "      stale row on every node, the mid-flight relaunch of the destination"
+echo "      restored the TRANSFERRED row, the cluster converged with no flap, the"
+echo "      write lease was relinquished at the migrate (holds_lease 0 on all"
+echo "      three nodes) and re-acquired on the new owner only by a fresh"
+echo "      2-of-3 quorum."
 echo "      evidence:"
 printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Adopted partition.*dead node $leader" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
@@ -670,4 +1037,9 @@ printf '        %s\n' "$(grep -h "Partition ownership restored from NVMe" "$L_LO
 printf '        %s\n' "$(grep -h "rejecting the stale claim" "$CAN_LOG" 2>/dev/null | tail -1 | sed 's/^/adopter: /')"
 printf '        %s\n' "$(grep -h "rejecting the stale claim" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
 printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*learned from node $adopter" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
+printf '        %s\n' "$(grep -h "PARTITION] migrated partition $PART_ID: node $adopter -> node $leader" "$ADP_LOG" 2>/dev/null | tail -1 | sed 's/^/migrate: /')"
+printf '        %s\n' "$(grep -h "CONSENSUS] partition $PART_ID: node $adopter voluntarily stepped down from LEADER" "$ADP_LOG" 2>/dev/null | tail -1 | sed 's/^/lease: /')"
+printf '        %s\n' "$(grep -h "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/transfer on destination: /')"
+printf '        %s\n' "$(grep -h "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/transfer on observer: /')"
+printf '        %s\n' "$(grep -h "CONSENSUS] partition $PART_ID: quorum stable, node $leader elected LEADER (write lease)" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/re-acquired: /')"
 exit 0

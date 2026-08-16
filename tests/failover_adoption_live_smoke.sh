@@ -48,6 +48,26 @@
 #                         flaps back to the resurrected owner)
 #   resurrect_nostale -> FAIL  (the relaunched leader never restores its
 #                         stale row, so the conflict never manifests)
+#   migrate_stable -> PASS  (step 11: the adopter migrates the partition
+#                         back to the resurrected original leader; the
+#                         owner-initiated transfer out-resolves its stale
+#                         learned row on the destination AND the observer,
+#                         the destination is killed mid-flight and
+#                         relaunched, the cluster converges to owner 1 with
+#                         no flap, the adopter's write lease is relinquished
+#                         at the migrate and re-acquired on the new owner by
+#                         a fresh 2-of-3 quorum)
+#   migrate_flap -> FAIL  (the transfer is applied to the wrong owner -- the
+#                         flap -- and the step-11 convergence gate must bite:
+#                         the receivers report owner = the adopter)
+#   migrate_nolease -> FAIL  (the adopter's pre-migrate `partition lease
+#                         acquire` never holds; the lease-held gate must bite)
+#   migrate_noapply -> FAIL  (the transfer announce never reaches the
+#                         receivers; the step-11 transfer gate must bite)
+#   migrate_nostale -> FAIL  (the step-11 relaunch of the destination never
+#                         restores its row; the step-11 restore gate must bite)
+#   migrate_noreacquire -> FAIL  (the destination's re-acquire never holds;
+#                         the step-11 re-acquire gate must bite)
 #   silent      -> ABORT (no cluster.pids at all; the guard must say how to
 #                         start one)
 #
@@ -177,6 +197,12 @@ tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to
 tooth resurrect_stable 0 "PASS"   "resurrect_stable -> PASS (stale claim rejected by both survivors, no flap, leader converged)"
 tooth resurrect_flap   1 "FLAPPED" "resurrect_flap -> FAIL (the old last-wins apply of the stale claim must be caught)"
 tooth resurrect_nostale 1 "never restored" "resurrect_nostale -> FAIL (a leader whose stale row never came back must be caught)"
+tooth migrate_stable 0 "PASS"   "migrate_stable -> PASS (step 11: the owner-initiated transfer out-resolves the destination's stale row, mid-flight relaunch converges, lease relinquished + re-acquired)"
+tooth migrate_flap   1 "converge to owner" "migrate_flap -> FAIL (step 11's transfer applied to the wrong owner must be caught -- the receivers report owner = the adopter, so the step-11 convergence gate bites)"
+tooth migrate_nolease 1 "never held the write lease" "migrate_nolease -> FAIL (the adopter's pre-migrate lease acquire never holds must be caught)"
+tooth migrate_noapply 1 "logged the owner-initiated transfer" "migrate_noapply -> FAIL (a transfer the destination never receives must be caught)"
+tooth migrate_nostale 1 "never restored its row" "migrate_nostale -> FAIL (a step-11 relaunch that loses the transferred row must be caught)"
+tooth migrate_noreacquire 1 "never re-acquired the write lease" "migrate_noreacquire -> FAIL (the destination's re-acquire never holds must be caught)"
 
 # The silent tooth: no cluster at all. The guard must abort (2) and say how
 # to start one -- not pass, and not blame the wrong layer.

@@ -39,6 +39,13 @@
  *   /tmp/net_self_echo_host_test
  */
 #include "net/net.h"
+/* The lease sweep's ownership gate (net/consensus.c) reads partition
+ * ownership; this test does not link kernel/partition.c, so ownership is a
+ * stub -- same pattern as the cluster_leader_id stub. */
+uint32_t partition_get_owner_node(uint32_t partition_id) {
+    (void)partition_id;
+    return 0;   /* no partition table here -- every row reads as unowned */
+}
 #include "net/e1000.h"
 #include "kernel/boot_params.h"
 #include "net/tcp.h"

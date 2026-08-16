@@ -1,6 +1,13 @@
 #include "consensus.h"
 #include "dspp.h"
 #include "../kernel/failover.h"
+#include "../kernel/partition.h"   /* partition_get_owner_node -- the lease
+                                      sweep's ownership gate (the write
+                                      lease follows ownership) */
+
+/* The include above pulls partition.h's declarations; these two stay
+ * extern because their definitions live in kernel/stubs.c, exactly as
+ * before. */
 
 // Multi-Node Partition Scaling Roadmap Phase 7: every send site in this file
 // now goes through dspp_transmit_raw() (net/dspp.c), which adds the real
@@ -679,6 +686,36 @@ int partition_lease_step_down(uint32_t partition_id) {
 void partition_lease_heartbeat_tick(uint32_t partition_id, uint64_t now) {
     struct PartitionLease* row = find_lease_row(partition_id);
     if (!row) return;   /* no lease established for this partition yet -- nothing to tick */
+
+    /* The write lease follows OWNERSHIP. A lease row is only meaningful on
+     * the node that owns the partition, so the sweep must never campaign
+     * for (or heartbeat for) a partition this node knows is owned
+     * elsewhere. (owner == 0 -- no row learned yet -- keeps the legacy
+     * behavior: the pre-ownership lease scenarios in the consensus host
+     * test campaign without owner rows, and a fresh boot may not have
+     * learned the owner of a partition it is being asked to lease.)
+     *
+     * Without this gate, a row left behind by partition_migrate()'s step 2
+     * (the source steps down to FOLLOWER but the row survives) re-campaigns
+     * on the sweep's next election timeout -- and once the destination is
+     * back up, the 2-of-3 quorum is reachable, so the EX-owner re-acquires
+     * the write lease for a partition it no longer owns: the page-level
+     * split-brain the migrate was supposed to end. Caught live by the
+     * failover adoption guard's step 11f: after the migrate + mid-flight
+     * destination relaunch, the adopter reported holds_lease=1 for a
+     * partition owned by the destination. */
+    uint32_t lease_owner = partition_get_owner_node(partition_id);
+    if (lease_owner != 0 && lease_owner != cluster_local_node_id()) {
+        if (row->role == ROLE_LEADER) {
+            /* Should never happen post-migrate (the source steps down at
+             * the handoff, and adoption's dead owner carries no row across
+             * a reboot), but a LEADER row on a non-owner is the lease
+             * lying: relinquish it so partition_holds_write_lease() reads
+             * false and no heartbeat keeps the lie alive. */
+            partition_lease_step_down(partition_id);
+        }
+        return;   /* not ours any more -- never campaign or heartbeat for it */
+    }
 
     if (row->role == ROLE_LEADER) {
         /* Rate-limited exactly as the cluster-wide heartbeat is, and it
