@@ -38,6 +38,28 @@ GUARD="tests/failover_2node_live_check.sh"
 FAKE="tests/failover_2node_smoke_nodes.py"
 PID_FILE="cluster/cluster.pids"
 BASE=59600
+
+[ -f "$GUARD" ] || { echo "ABORT: $GUARD not found or not executable."; exit 2; }
+[ -f "$FAKE" ]  || { echo "ABORT: $FAKE not found."; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "ABORT: python3 needed to stand up fake nodes."; exit 2; }
+command -v curl    >/dev/null 2>&1 || { echo "ABORT: curl not found."; exit 2; }
+
+# A real cluster must not be running: this smoke writes cluster/cluster.pids
+# and the guard kills whatever that file names. Refuse rather than guess.
+if [ -s "$PID_FILE" ]; then
+    while read -r _ pid; do
+        if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "ABORT: $PID_FILE names live pid $pid -- a real cluster is running." >&2
+            echo "       Stop it first (./run-cluster.sh --stop) -- this smoke uses" >&2
+            echo "       fake nodes on port base $BASE and must not touch it." >&2
+            exit 2
+        fi
+    done < "$PID_FILE"
+    echo "note: $PID_FILE was stale (no live pids); removing it." >&2
+    rm -f "$PID_FILE"
+fi
+mkdir -p cluster
+
 fails=0
 STATE=""
 FAKE_PIDS=""
