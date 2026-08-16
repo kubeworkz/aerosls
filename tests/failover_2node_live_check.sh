@@ -59,6 +59,33 @@
 # nolearn (create announce broken), nockpt (checkpoint pipeline broken).
 #
 # ─── What this guard does NOT do ──────────────────────────────────────────
+# ─── The write-lease layer (Multi-Node Partition Scaling Roadmap Phase 4) ──
+# The partition table is only HALF the ownership story. Writes are actually
+# gated by a per-partition write LEASE: partition_holds_write_lease() is the
+# exact check dspp_page_write_allowed() makes before a node may modify a
+# partition's pages. In a 2-node cluster the lease quorum is the SAME 2-of-2
+# majority as the election quorum (cluster_recompute_quorum() feeds both),
+# so the same math that denies a lone survivor the leadership also denies it
+# the lease -- with one extra, page-level guarantee worth pinning:
+#
+#   - the survivor must STRIP write permission when it starts campaigning
+#     (update_page_table_permissions_for_partition(pid, 1), logged as
+#     `[MMU-LEASE] partition <pid>: page permissions force_read_only=1`) --
+#     reads-only must hold at the page-permission call site, not just in
+#     the table;
+#   - it must NEVER restore (force_read_only=0) -- a restore only fires on
+#     lease quorum-achieved, which a lone 2-node survivor can never reach.
+#
+# The guard therefore acquires the write lease BEFORE the kill (the only
+# live trigger is the shell `partition lease acquire <pid>`; a lease row is
+# created by the first campaign), gates that the leader won it while both
+# nodes were alive AND that the survivor learned the row (without a row,
+# the strip gate below would be vacuous), then after the kill asserts
+# partition_holds_write_lease() stays false (holds_lease=0 in /api/
+# partitions the whole window) and the survivor's log shows the strip with
+# never a restore.
+#
+# ─── What this guard does NOT do ─────────────────────────────────────────
 # Exactly one node is killed and it is left dead. The operator stops the
 # cluster afterwards (./run-cluster.sh --stop). It does not RELAUNCH the
 # dead leader the way failover_adoption_live_check.sh now does -- there is
@@ -184,6 +211,36 @@ for p in rows:
 PY
 }
 
+row_id() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+name = sys.argv[2]
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+for p in rows:
+    if p.get("name") == name:
+        print(p.get("id", ""))
+        break
+PY
+}
+
+holds_lease_of() {   # $1 = json, $2 = name -- prints 1/0 for the row
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+name = sys.argv[2]
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+for p in rows:
+    if p.get("name") == name:
+        print(p.get("holds_lease", "?"))
+        break
+PY
+}
+
 dump_rows() {
     python3 - "$1" <<'PY'
 import json, sys
@@ -299,6 +356,77 @@ done
        'nothing to adopt'."
 echo "   checkpoint carrying '$NAME' held by the survivor"
 
+# ─── 4.5 the write-lease layer must be LIVE and CONTESTED before the kill ─
+# The page-permission gate (step 7d/7e below) is only meaningful if the
+# partition actually HAS a write lease that can be contested. A lease row
+# is created by the FIRST campaign; the only live trigger is the shell
+# `partition lease acquire <pid>`. So, before the kill, the leader acquires
+# the lease (winning the 2-of-2 quorum while BOTH nodes are alive -- the
+# same quorum that will deny the survivor after the kill), and the guard
+# gates that BOTH sides went live:
+#   - leader holds_lease=1 in /api/partitions: partition_holds_write_lease()
+#     returned true -- the exact gate dspp_page_write_allowed() checks;
+#   - survivor logged `partition <pid> lease initialised`: it RXed the
+#     campaign and created its own row. Without a row the strip gate would
+#     be vacuous (no row = no campaign = no strip and no restore), so the
+#     guard must prove the row exists before it may trust the absence of a
+#     restore.
+echo "==> acquiring the write lease for '$NAME' on node $leader"
+PART_ID="$(get200 "$L_PORT" /api/partitions && row_id "$FETCH_BODY" "$NAME")"
+[ -n "$PART_ID" ] || die "could not read the partition id for '$NAME' from node $leader"
+echo "   partition '$NAME' is id $PART_ID"
+"$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    shell partition lease acquire "$PART_ID" >/dev/null \
+    || die "partition lease acquire $PART_ID failed on node $leader (shell command output above)"
+
+echo "==> waiting for node $leader to HOLD the write lease (up to ${WAIT_LEARN}s)"
+held=0
+deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    if get200 "$L_PORT" /api/partitions; then
+        if python3 - "$FETCH_BODY" "$NAME" <<'PY'
+import json, sys
+name = sys.argv[2]
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+for p in rows:
+    if p.get("name") == name and str(p.get("holds_lease")) == "1":
+        sys.exit(0)
+sys.exit(1)
+PY
+        then held=1; break; fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$held" -eq 1 ] || fail "node $leader never HOLD the write lease for '$NAME' within
+       ${WAIT_LEARN}s (holds_lease stayed 0 in /api/partitions). The lease
+       campaign never won -- but with both nodes alive the 2-of-2 quorum IS
+       reachable, so a no-win means the lease layer is broken (not the
+       quorum gate): either `partition lease acquire` is inert or the vote
+       exchange never completed. A guard that cannot make the lease layer
+       live cannot assert it stays read-only."
+echo "   node $leader holds the write lease for '$NAME'"
+
+echo "==> waiting for node $survivor to LEARN the lease row (up to ${WAIT_LEARN}s)"
+lease_init=""
+deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    lease_init="$(last_line "$S_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+    [ -n "$lease_init" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ -n "$lease_init" ] || fail "node $survivor never created a lease row for partition
+       $PART_ID (no 'partition $PART_ID lease initialised' line in $S_LOG within
+       ${WAIT_LEARN}s). Without a row the survivor has nothing to contest --
+       the strip gate below would be vacuous, so the guard refuses to run
+       blind. The leader's REQUEST_VOTE RX path (process_partition_
+       consensus_packet's find-or-create) is broken."
+echo "   $survivor learned the lease row: $(sed -n "${lease_init}p" "$S_LOG" | sed 's/^/      /')"
+
 # ─── 5. capture the leader's identity BEFORE killing it ───────────────────
 L_PID="$(awk -v n="$leader" '$1==n{print $2}' "$PID_FILE")"
 [ -n "$L_PID" ] || die "no pid for node $leader in $PID_FILE"
@@ -363,11 +491,51 @@ while :; do
         if [ -n "$(row_if "$FETCH_BODY" "$NAME" "$survivor")" ]; then
             survivor_ok=0; survivor_why="serves the row with owner = itself (adopted)"
         fi
+        # 7d. write lease: partition_holds_write_lease() must stay FALSE on
+        # the survivor the whole window. holds_lease is the raw output of
+        # that function in /api/partitions -- the exact gate
+        # dspp_page_write_allowed() checks before a page write. The
+        # partition-table check above (7c) pins who OWNS the row; this pins
+        # whether the survivor could actually WRITE it. A survivor that
+        # keeps ownership but gains the lease is the page-level split-brain
+        # this gate exists to catch.
+        if python3 - "$FETCH_BODY" "$NAME" <<'PY'
+import json, sys
+name = sys.argv[2]
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+for p in rows:
+    if p.get("name") == name and str(p.get("holds_lease")) == "1":
+        sys.exit(0)
+sys.exit(1)
+PY
+        then
+            survivor_ok=0; survivor_why="reports holds_lease=1 (partition_holds_write_lease() true)"
+        fi
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
 [ "$decl_seen" -eq 1 ] || { survivor_ok=0; survivor_why="never observed the death (no declaration in $S_LOG)"; }
+
+# 7e. the page-permission level: the survivor must have STRIPPED write
+# permission when it started campaigning ([MMU-LEASE] force_read_only=1)
+# and must NEVER have restored it (=0). The strip is logged by
+# update_page_table_permissions_for_partition() on every campaign start;
+# the restore only fires on lease quorum-achieved, unreachable for a lone
+# 2-node survivor. A survivor with the strip but a restore is the page-
+# level split-brain; a survivor with NEITHER means the lease layer never
+# engaged (vacuous -- caught earlier at the lease-learn gate, but the
+# strip is re-checked here against the final log).
+strip_n=$(grep -hc "MMU-LEASE] partition $PART_ID: page permissions force_read_only=1" "$S_LOG" 2>/dev/null || true)
+restore_n=$(grep -hc "MMU-LEASE] partition $PART_ID: page permissions force_read_only=0" "$S_LOG" 2>/dev/null || true)
+if [ "$strip_n" -eq 0 ]; then
+    survivor_ok=0; survivor_why="never stripped write permission (no [MMU-LEASE] force_read_only=1 line for partition $PART_ID)"
+elif [ "$restore_n" -gt 0 ]; then
+    survivor_ok=0; survivor_why="RESTORED write permission after campaigning ([MMU-LEASE] force_read_only=0 line for partition $PART_ID)"
+fi
 
 if [ "$survivor_ok" -ne 1 ]; then
     # Which gate failed? Report the specific violation.
@@ -394,6 +562,23 @@ $(grep -h "FAILOVER] Adopted partition.*dead node $leader\|FAILOVER] recovery fo
        bypassed end to end; '$NAME' now has two owners (the dead leader's
        persisted row and the survivor's)."
     fi
+    if [ "${survivor_why:-}" = "reports holds_lease=1 (partition_holds_write_lease() true)" ]; then
+        fail "node $survivor reports holds_lease=1 for '$NAME' after node $leader died
+       -- partition_holds_write_lease() came back TRUE, which is the exact
+       check dspp_page_write_allowed() makes. A lone 2-node survivor can
+       never reach the 2-of-2 lease quorum, so holding the lease means the
+       lease layer was bypassed: writes to '$NAME' would be allowed on a
+       node that does not own it. This is the page-permission split-brain."
+    fi
+    if printf '%s' "${survivor_why:-}" | grep -q "force_read_only=0"; then
+        fail "node $survivor RESTORED write permission for partition $PART_ID after
+       campaigning (a [MMU-LEASE] force_read_only=0 line is in $S_LOG). The
+       restore only fires on lease quorum-achieved, which a lone 2-node
+       survivor can never reach -- so this is the page-permission layer
+       re-enabling writes without a lease. The survivor correctly stripped
+       on campaign, then illegally restored:
+$(grep -h "MMU-LEASE] partition $PART_ID" "$S_LOG" 2>/dev/null | tail -3 | sed 's/^/         /')"
+    fi
     fail "node $survivor neither stayed a non-leader nor observed the death
        cleanly (${survivor_why:-unknown}) within ${WAIT_OBSERVER}s. Inspect $S_LOG."
 fi
@@ -410,5 +595,7 @@ printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$S_LOG"
 printf '        %s\n' "$(grep -h "DSPP-CKPT] RX: COMPLETE" "$S_LOG" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME" "$S_LOG" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Adopted partition" "$S_LOG" 2>/dev/null | tail -1 | sed 's/^/adopted lines: /' || echo 'adopted lines: (none)')"
+echo "      write lease: holds_lease=$(get200 "$S_PORT" /api/partitions && holds_lease_of "$FETCH_BODY" "$NAME")"
+printf '        %s\n' "$(grep -h "MMU-LEASE] partition $PART_ID" "$S_LOG" 2>/dev/null | tail -2 | sed 's/^/mmu-lease: /' || echo 'mmu-lease: (none)')"
 echo "      role now: $(get200 "$S_PORT" /api/cluster && jget "$FETCH_BODY" role)"
 exit 0

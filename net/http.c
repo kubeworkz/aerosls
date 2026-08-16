@@ -2744,6 +2744,19 @@ static int api_partitions_list(char* buf, int max) {
          * `partition list` in kernel/partition.c. */
         jb_uint(&j, "owner_node", partition_get_owner_node(partition_table[i].partition_id));
         jb_putc(&j, ',');
+        /* The write-lease state for this partition ON THIS NODE (Multi-Node
+         * Partition Scaling Roadmap Phase 4). holds_lease is
+         * partition_holds_write_lease() -- the exact gate
+         * dspp_page_write_allowed() checks -- and lease_role is its
+         * consensus role. A node can own the data and still not hold the
+         * write lease (mid-migration, or a split-brain window where the
+         * lease is contested), so the two are surfaced separately. The
+         * 2-node failover guard asserts the survivor's holds_lease stays 0
+         * after the leader dies. */
+        jb_str(&j, "lease_role", consensus_role_name(partition_lease_get_role(partition_table[i].partition_id)));
+        jb_putc(&j, ',');
+        jb_uint(&j, "holds_lease", (uint32_t)partition_holds_write_lease(partition_table[i].partition_id));
+        jb_putc(&j, ',');
         jb_uint(&j, "frame_usage", (uint32_t)partition_get_frame_usage(i)); jb_putc(&j, ',');
         uint64_t quota = partition_get_frame_quota(i);
         jb_uint(&j, "frame_quota", (uint32_t)quota); jb_putc(&j, ',');

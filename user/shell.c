@@ -40,6 +40,7 @@
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- message queues
 #include "../net/net.h"               // Navigator-Parity Gap Roadmap Phase 5c -- SYS_SLS_NET_STATUS
 #include "../net/consensus.h"
+#include "../kernel/timer.h"            // kernel_tick_counter -- partition lease acquire
 #include "../kernel/service_registry.h"
 #include "../kernel/service_mesh.h"
 #include "../kernel/workload.h"
@@ -357,6 +358,9 @@ static void print_help(void) {
         "                                            another node (Multi-Node Phase 6;\n"
         "                                            pauses, hands off, reclaims frames --\n"
         "                                            leaves it paused, see shell help text)\n"
+        "  partition lease acquire <pid>            campaign for this partition's write\n"
+        "                                            lease (Multi-Node Phase 4; only a\n"
+        "                                            majority quorum wins it)\n"
         "  partition connquota set <id> <quota>     set max concurrent inbound\n"
         "                                            connections for a partition (0=unlimited)\n"
         "  partition connquotas                     list per-partition connection usage/quota\n"
@@ -1290,6 +1294,18 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint32_t pid = sh_atoi(input_buffer + 17);
             uint64_t rc = do_syscall(SYS_SLS_PARTITION_RESUME, (void*)(uintptr_t)pid);
             kernel_serial_printf("[PARTITION] resume %u -> %s\n", pid, rc == 0 ? "OK" : "FAILED");
+        }
+        else if (sh_starts(input_buffer, "partition lease acquire ")) {
+            // Multi-Node Partition Scaling Roadmap Phase 4: operator-driven
+            // write-lease acquisition. The campaign was previously
+            // unreachable from any live surface -- the only callers of
+            // partition_lease_trigger_election() were the BSP sweep (for
+            // rows that already exist) and host tests -- and a lease row
+            // for a partition can only exist if someone campaigns first.
+            // Same single-uint32_t shape "partition destroy " above
+            // already established. strlen("partition lease acquire ") = 24.
+            uint32_t pid = sh_atoi(input_buffer + 24);
+            partition_lease_trigger_election(pid, kernel_tick_counter);
         }
         else if (sh_starts(input_buffer, "partition migrate ")) {
             // Multi-Node Partition Scaling Roadmap Phase 6: cold migration.

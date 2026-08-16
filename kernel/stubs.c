@@ -420,8 +420,16 @@ void update_page_table_permissions_globally(uint32_t force_read_only) {
 // deferred until page table management is complete. Both stubs will need
 // real bodies together, not one before the other.
 void update_page_table_permissions_for_partition(uint32_t partition_id, uint32_t force_read_only) {
-    (void)partition_id;
-    (void)force_read_only;
+    /* Diagnostic until the real PTE-walk lands (see the comment above):
+     * the write-lease campaign strips this partition's write permission
+     * (force_read_only=1) and ONLY a lease quorum restores it (=0). The
+     * 2-node failover guard gates on these lines: a survivor that can
+     * never win the 2-of-2 lease quorum must log the strip on every
+     * campaign and NEVER a restore -- reads-only holding at the
+     * page-permission call site, not just in the partition table. */
+    kernel_serial_printf(
+        "[MMU-LEASE] partition %u: page permissions force_read_only=%u\n",
+        (unsigned)partition_id, (unsigned)force_read_only);
 }
 
 // ─── Security matrix verification stub ───────────────────────────────────────

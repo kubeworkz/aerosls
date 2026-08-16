@@ -10,11 +10,12 @@ evidence gates on and the one piece of real state the property depends on:
 the leader's death.
 
 The property: in a 2-node cluster, when the leader dies the sole survivor
-must NOT become a second leader and must NOT adopt. The kernel's majority
-quorum for 2 nodes is 2-of-2, nothing shrinks the roster on death, and
-failover recovery is gated on cluster_is_leader() -- so a lone survivor can
-never be elected and never recovers. This fake models the kernel's log
-strings the guard gates on (each printed by exactly one real site):
+must NOT become a second leader, must NOT adopt, and must NOT hold the
+partition's write lease. The kernel's majority quorum for 2 nodes is 2-of-2,
+nothing shrinks the roster on death, and failover recovery is gated on
+cluster_is_leader() -- so a lone survivor can never be elected, never
+recovers, and can never win the lease quorum. This fake models the kernel's
+log strings the guard gates on (each printed by exactly one real site):
 
     RX (create learned):  "[PARTITION] sync: partition N '<name>' (owner
     node L) learned from node L." then "[DSPP-CKPT] RX: COMPLETE seq=N" --
@@ -24,6 +25,14 @@ strings the guard gates on (each printed by exactly one real site):
     ticks)" -- every node runs failover_tick and declares; only the leader
     would recover. The guard requires the declaration, and requires NO
     Adopted/recovery line after it.
+    lease row create:      "[CONSENSUS] partition N lease initialised
+    (FOLLOWER, term=0)." -- RXed the leader's campaign; the guard requires
+    the survivor to hold a row before it may trust the absence of a
+    restore (no row = no contest = vacuous).
+    lease strip/restore:   "[MMU-LEASE] partition N: page permissions
+    force_read_only=1" on every campaign start, "=0" only on lease
+    quorum-achieved. The guard requires the strip and forbids the restore
+    on the survivor.
 
 The survivor's death detection mirrors the kernel's: it polls the leader's
 HTTP port; when it stops answering, it transitions. What it does then is
@@ -31,7 +40,8 @@ the mode:
 
 Modes (written to <statedir>/mode by the smoke):
     staysfollower  node 2 declares the death and stays FOLLOWER forever,
-                   never adopting; the row stays owned by node 1 -> PASS
+                   never adopting; the row stays owned by node 1; the
+                   lease strip is logged and never restored -> PASS
     flipsleader    node 2 declares the death, then flips to LEADER after a
                    delay (a late second leader) -> guard FAIL at the
                    never-LEADER watch
@@ -43,6 +53,19 @@ Modes (written to <statedir>/mode by the smoke):
                    learn gate
     nockpt         node 2 learns but no checkpoint line flows -> guard
                    FAIL at the checkpoint gate
+    nolease        the leader's `partition lease acquire` never takes (the
+                   command succeeds, no row is held) -> guard FAIL at the
+                   lease-held gate
+    nolearnlease   node 2 never creates its lease row (the REQUEST_VOTE RX
+                   path broken) -> guard FAIL at the lease-learn gate
+    leasestrip     node 2 declares the death but never logs the MMU-LEASE
+                   strip -> guard FAIL at the strip gate
+    leaserestore   node 2 logs the strip AND then a restore (lease
+                   quorum-achieved on a 2-node survivor -- impossible) ->
+                   guard FAIL at the restore gate
+    leasehold      node 2 reports holds_lease=1 in /api/partitions after
+                   the death (partition_holds_write_lease() true on the
+                   survivor) -> guard FAIL at the holds_lease watch
 
 The no-cluster tooth starts NO fakes at all.
 """
@@ -65,11 +88,14 @@ mode = open(os.path.join(state, "mode")).read().strip()
 leader_id = int(open(os.path.join(state, "leader")).read().strip())
 
 created = os.path.join(state, "created.json")
+lease = os.path.join(state, "lease.json")
 logfile = os.path.join(logdir, f"node{node_id}.log")
 lock = threading.Lock()
 
 transitioned = False
 flipped = False
+lease_held_leader = False
+lease_held_survivor = False
 
 
 def log(line):
@@ -137,6 +163,33 @@ def rx_thread():
 threading.Thread(target=rx_thread, daemon=True).start()
 
 
+# ─── Lease RX thread: create the survivor's lease row when the leader's
+# campaign arrives (here: when lease.json appears). The guard requires
+# `[CONSENSUS] partition N lease initialised` in the survivor's log BEFORE
+# the kill -- without a row, the absence of a restore would be vacuous.
+# nolearnlease never logs it (the lease-learn gate must bite). The leader
+# side creates its own row on `partition lease acquire` (below).
+def lease_rx_thread():
+    global lease_held_survivor
+    if role != "follower":
+        return
+    for _ in range(200):
+        if os.path.exists(lease):
+            break
+        time.sleep(0.05)
+    if os.path.exists(lease) and mode != "nolearnlease":
+        # A lease row exists but the survivor does NOT hold it -- the
+        # global lease_held_survivor stays False (default).
+        log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)."
+            % json.load(open(lease)).get("partition_id", "1"))
+        # A lease row exists but the survivor does NOT hold it. The leader
+        # does (its own acquire below) -- the row here is the follower's
+        # mirror of the same partition's lease state.
+
+
+threading.Thread(target=lease_rx_thread, daemon=True).start()
+
+
 # ─── Death-detection thread: the guard SIGKILLs the leader ────────────────
 # The follower polls the leader's port; when it stops answering, it logs
 # the death declaration (every node runs failover_tick) and then behaves
@@ -159,6 +212,23 @@ def death_thread():
                 continue
             transitioned = True
             log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
+            # The write-lease strip: the survivor campaigns for the lease
+            # (its row times out, update_page_table_permissions_for_
+            # partition(pid, 1)) -- logged unless leasestrip suppresses it.
+            if mode != "leasestrip":
+                log("[MMU-LEASE] partition 1: page permissions force_read_only=1")
+            if mode == "leaserestore":
+                # The bug: a 2-node survivor that "wins" the 2-of-2 lease
+                # quorum and restores write permission. The guard's restore
+                # gate must catch this line.
+                log("[MMU-LEASE] partition 1: page permissions force_read_only=0")
+            if mode == "leasehold":
+                # The bug at the API level: partition_holds_write_lease()
+                # returning true on the survivor. The guard's holds_lease
+                # watch must catch it.
+                with lock:
+                    global lease_held_survivor
+                    lease_held_survivor = True
             row = read_created()
             if mode == "adopts":
                 # The bug: a FOLLOWER that recovered. cluster_is_leader()
@@ -213,13 +283,26 @@ class H(http.server.BaseHTTPRequestHandler):
             return 1
         return 2
 
+    def _holds_lease(self):
+        # The exact function the API surfaces: on the leader it holds the
+        # lease once acquired; on the survivor it must stay false unless
+        # the leasehold bug mode flips it after the death.
+        if role == "leader":
+            return 1 if lease_held_leader else 0
+        return 1 if lease_held_survivor else 0
+
     def _partitions(self):
         """The /api/partitions body. The leader serves the current created
         row; the follower serves the row once learned, owner = the leader,
         except in 'adopts' mode where the buggy recovery claims it."""
         row = read_created()
         if role == "leader":
-            return {"partitions": [row] if row else []}
+            if not row:
+                return {"partitions": []}
+            r = dict(row)
+            r["lease_role"] = "LEADER"
+            r["holds_lease"] = self._holds_lease()
+            return {"partitions": [r]}
         if mode == "nolearn":
             return {"partitions": []}
         if not learned:
@@ -227,8 +310,13 @@ class H(http.server.BaseHTTPRequestHandler):
         if transitioned and mode == "adopts":
             r = dict(row)
             r["owner_node"] = node_id
+            r["lease_role"] = "CANDIDATE"
+            r["holds_lease"] = self._holds_lease()
             return {"partitions": [r] if row else []}
-        return {"partitions": [row] if row else []}
+        r = dict(row)
+        r["lease_role"] = "FOLLOWER" if not transitioned else "CANDIDATE"
+        r["holds_lease"] = self._holds_lease()
+        return {"partitions": [r] if row else []}
 
     def do_GET(self):
         if self.path == "/api/health":
@@ -258,6 +346,26 @@ class H(http.server.BaseHTTPRequestHandler):
                                "state": "active"}, f, separators=(",", ":"))
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": f"created partition 1 ({name})"})
+            elif role == "leader" and command.startswith("partition lease acquire "):
+                # The kernel: partition_lease_trigger_election(pid, now)
+                # creates the row if missing, campaigns, and wins the 2-of-2
+                # quorum while both nodes are alive. nolease suppresses the
+                # hold (the command succeeds -- so the guard's acquire
+                # shell step does not die -- but no row is held, and the
+                # lease-held gate must bite).
+                pid = command[len("partition lease acquire "):].strip()
+                if mode != "nolease":
+                    with open(lease, "w") as f:
+                        json.dump({"partition_id": int(pid), "term": 1},
+                                  f, separators=(",", ":"))
+                    with lock:
+                        global lease_held_leader
+                        lease_held_leader = True
+                    log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)." % pid)
+                    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term 1." % (pid, node_id))
+                    log("[CONSENSUS] partition %s: quorum stable, node %u elected LEADER (write lease) for term 1." % (pid, node_id))
+                self._json(200, {"ok": "true", "recognized": "true",
+                                 "output": f"lease acquire {pid} issued"})
             else:
                 self._json(200, {"ok": "false", "error": f"not a create: {command}"})
         else:

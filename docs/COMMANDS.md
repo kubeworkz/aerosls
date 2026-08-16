@@ -683,6 +683,7 @@ Real resource and execution isolation within one kernel — a `partition_id` tag
 | `partition destroy <partition_id>`                           | Tear down a partition (kills its processes, vfrees its objects)                                                          |
 | `partition pause <partition_id>`                             | Stop scheduling this partition                                                                                           |
 | `partition resume <partition_id>`                            | Resume scheduling this partition                                                                                         |
+| `partition lease acquire <partition_id>`                     | Campaign for this partition's **write lease** (Multi-Node Partition Scaling Roadmap Phase 4) — only a majority quorum wins it; a node that wins may write the partition's pages, every other node is read-only at the page-permission call site until it steps down or dies |
 | `partition quota <partition_id> <frames>`                    | Set a physical RAM frame quota (0 = unlimited)                                                                            |
 | `partition quotas`                                           | List per-partition frame usage/quota                                                                                     |
 | `partition cpuweight set <id> <weight>`                      | Set CPU scheduling weight — a partition at weight 3 gets 3 consecutive scheduler turns per round vs. a sibling at weight 1 (0 = default 1) |
