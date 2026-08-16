@@ -68,6 +68,19 @@
 #                         restores its row; the step-11 restore gate must bite)
 #   migrate_noreacquire -> FAIL  (the destination's re-acquire never holds;
 #                         the step-11 re-acquire gate must bite)
+#   svc_stable  -> PASS  (step 12: the guard registers a service twin on the
+#                         owner, re-registers it on the adopter, and when the
+#                         resurrected owner re-announces the SAME name the
+#                         claim-class resolver in service_remote_learn()
+#                         REJECTS it -- the observer's cache keeps the
+#                         adopter, every node still resolves to the adopter,
+#                         and the kernel logs the rejection)
+#   svc_flap    -> FAIL  (the survivors APPLY the stale service claim -- the
+#                         old "last announce wins" bug -- and the name flaps
+#                         back to the resurrected owner; the step-12 no-flap
+#                         gate must bite)
+#   svc_nostale -> FAIL  (the stale service re-announce never fires, so the
+#                         reject never logs; the step-12 reject gate must bite)
 #   silent      -> ABORT (no cluster.pids at all; the guard must say how to
 #                         start one)
 #
@@ -160,7 +173,7 @@ tooth() {
            AEROSLS_FAILOVER_FAST=1 AEROSLS_LOG_DIR=$STATE bash "$GUARD" 2>&1)"
     rc=$?
 
-    if [ "$mode" = "adopted" ]; then
+    if [ "$mode" = "adopted" ] || [ "$mode" = "svc_stable" ]; then
         # A PASS that never killed the leader proves nothing: the whole
         # point is that the ADOPTION happens after the leader dies.
         if kill -0 "$lpid" 2>/dev/null; then
@@ -203,6 +216,9 @@ tooth migrate_nolease 1 "never held the write lease" "migrate_nolease -> FAIL (t
 tooth migrate_noapply 1 "logged the owner-initiated transfer" "migrate_noapply -> FAIL (a transfer the destination never receives must be caught)"
 tooth migrate_nostale 1 "never restored its row" "migrate_nostale -> FAIL (a step-11 relaunch that loses the transferred row must be caught)"
 tooth migrate_noreacquire 1 "never re-acquired the write lease" "migrate_noreacquire -> FAIL (the destination's re-acquire never holds must be caught)"
+tooth svc_stable  0 "PASS"   "svc_stable -> PASS (the service twin survives the resurrected owner's stale re-announce: rejected on the observer, every node still resolves to the adopter)"
+tooth svc_flap    1 "service registration FLAPPED" "svc_flap -> FAIL (the old last-wins apply of the stale service claim must be caught by step 12)"
+tooth svc_nostale 1 "never rejected" "svc_nostale -> FAIL (a stale service re-announce that never fires must be caught by step 12)"
 
 # The silent tooth: no cluster at all. The guard must abort (2) and say how
 # to start one -- not pass, and not blame the wrong layer.

@@ -284,12 +284,47 @@ void service_remote_learn(const char* name, uint32_t node_id, uint32_t partition
 
     struct SLSRemoteService* r = sr_find_remote(name);
     if (r && r->node_id != node_id) {
-        /* Two nodes claiming the same name. Last announcement wins, and it
-         * is logged rather than silently resolved: this is an operator
-         * error (a duplicate registration across the cluster), and the
-         * only thing worse than picking one is picking one quietly. */
-        kernel_serial_printf("[SERVICE] '%s' claimed by node %u and node %u -- taking the newer.\n",
-                             name, (unsigned)r->node_id, (unsigned)node_id);
+        /* Two nodes claiming the same name. The old rule -- "last announce
+         * wins" -- was safe for the case that invented it (two concurrent
+         * registrations of the same name) but FATAL for failover: a
+         * resurrected service owner restores its persisted registry at
+         * boot and re-announces its service, and "last wins" hands the
+         * adopted service name back to the node that lost its partition --
+         * flapping the registration the adoption just settled. Resolve by
+         * claim class instead, still logged loudly (any conflict is
+         * operator-visible):
+         *   * node_id == the CURRENT owner of the partition the service
+         *     lives on -- an owner-initiated claim (the partition was
+         *     adopted or migrated and its new owner re-registered the
+         *     service): apply it.
+         *   * node_id == the cluster leader -- the leader's own claim (a
+         *     leader re-assert): the leader's view is authoritative,
+         *     apply it.
+         *   * anything else -- a non-owner, non-leader self-claim
+         *     colliding with a live entry: the resurrected-owner shape.
+         *     KEEP the live entry and reject the stale claim, so an
+         *     adopted service name can never flap back to the node that
+         *     lost it. The claimant converges when the leader's own
+         *     periodic re-announce reaches it.
+         * Mirrors partition_sync_upsert()'s claim-class resolver. */
+        uint32_t cur = r->node_id;
+        if (partition_get_owner_node(partition_id) == node_id) {
+            kernel_serial_printf(
+                "[SERVICE] '%s' claimed by node %u and node %u -- "
+                "partition owner node %u's claim wins, applying.\n",
+                name, (unsigned)cur, (unsigned)node_id, (unsigned)node_id);
+        } else if (node_id == cluster_leader_id()) {
+            kernel_serial_printf(
+                "[SERVICE] '%s' claimed by node %u and node %u -- "
+                "leader node %u's claim wins, applying.\n",
+                name, (unsigned)cur, (unsigned)node_id, (unsigned)node_id);
+        } else {
+            kernel_serial_printf(
+                "[SERVICE] '%s' claimed by node %u and node %u -- "
+                "keeping node %u (live owner), rejecting the stale claim.\n",
+                name, (unsigned)cur, (unsigned)node_id, (unsigned)cur);
+            return;
+        }
     }
     if (!r) {
         for (int i = 0; i < SERVICE_REMOTE_MAX; i++) {

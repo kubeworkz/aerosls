@@ -136,6 +136,16 @@ leader_id = int(open(os.path.join(state, "leader")).read().strip())
 created = os.path.join(state, "created.json")
 lease = os.path.join(state, "lease.json")
 migrate = os.path.join(state, "migrate.json")
+# True only on the RELAUNCHED leader process: the guard creates the
+# partition AFTER the original process boots, so the original sees
+# created.json appear mid-session, while every relaunch (step 10/11) boots
+# with it already present. resurrect_thread must run only on the relaunched
+# process -- on the original it fired the moment the create landed,
+# truncating the log and (in STEP10 modes) writing leader_converged, which
+# flipped svc_owner() to the adopter DURING the guard's step 3.5 and made
+# the service-resolve gate intermittently read the pre-kill registration as
+# owned by node 2.
+created_preexisting = os.path.exists(created)
 logfile = os.path.join(logdir, f"node{node_id}.log")
 lock = threading.Lock()
 
@@ -153,6 +163,17 @@ late_flipped = False
 # Step 11 lease/migrate state on this process.
 lease_held = False
 migrated_to = 0        # owner this node serves after the migrate (0 = none yet)
+
+# Service-registry state (the guard's steps 3.5 / 7.5 / 12). Mirrors
+# kernel/service_registry.c: svc_local is this process's LOCAL registration
+# (its own declare), svc_remote is the node_id of the accepted remote
+# announce. Resolution prefers local; local node_id is DERIVED from the
+# partition owner, remote node_id is the announcing node -- exactly like the
+# real kernel.
+svc = os.path.join(state, "svc.json")
+svc_local = False
+svc_remote = 0
+svc_last_gen = 0
 
 
 def log(line):
@@ -243,6 +264,86 @@ def lease_rx_thread():
 threading.Thread(target=lease_rx_thread, daemon=True).start()
 
 
+# ─── Service-registry modeling ───────────────────────────────────────────
+# The wire-in-miniature for services is <state>/svc.json, one generation
+# per declare (the declaring process bumps "gen"). Every other process's
+# svc_rx thread applies service_remote_learn()'s claim-class resolver:
+# accept when the declarer is the CURRENT partition owner (owner-initiated
+# claim), otherwise REJECT when a live entry from another node exists (the
+# resurrected-owner shape) -- or APPLY in svc_flap (the old "last announce
+# wins" bug, so the guard's step-12 no-flap gate can bite). svc_nostale
+# suppresses the stale declare entirely (the announce never fires).
+def svc_owner():
+    # Same owner derivation as _partitions(): the original leader (or the
+    # step-11 destination), node 2 once the adopter transitioned, and node
+    # 2 on the leader once it converged (step 10).
+    row = read_created()
+    if not row:
+        return 0
+    if role == "leader":
+        if migrated_to:
+            return migrated_to
+        if os.path.exists(os.path.join(state, "leader_converged")):
+            return 2
+        return node_id
+    if migrated_to:
+        return migrated_to
+    if transitioned:
+        return 2
+    return leader_id
+
+
+def svc_rx_thread():
+    global svc_local, svc_remote, svc_last_gen
+    if role == "leader":
+        return   # local registrations shadow everything on the owner
+    for _ in range(900):
+        if not os.path.exists(svc):
+            time.sleep(0.05)
+            continue
+        try:
+            d = json.load(open(svc))
+        except ValueError:
+            time.sleep(0.05)
+            continue
+        gen = d.get("gen", 0)
+        if gen <= svc_last_gen:
+            time.sleep(0.05)
+            continue
+        svc_last_gen = gen
+        name = d.get("name", "svc")
+        pid = d.get("partition_id", 1)
+        declarer = d.get("declarer", 0)
+        if declarer == node_id:
+            svc_local = True
+            continue   # our own registration; local always wins
+        owner = svc_owner()
+        if declarer == owner:
+            if svc_remote and svc_remote != declarer:
+                log("[SERVICE] '%s' claimed by node %u and node %u -- "
+                    "partition owner node %u's claim wins, applying."
+                    % (name, svc_remote, declarer, declarer))
+            svc_remote = declarer
+            continue
+        if svc_remote and svc_remote != declarer:
+            if mode == "svc_flap":
+                # The bug: the old "last announce wins" rule applies the
+                # stale claim and the registration flaps.
+                log("[SERVICE] '%s' claimed by node %u and node %u -- "
+                    "taking the newer." % (name, svc_remote, declarer))
+                svc_remote = declarer
+            else:
+                log("[SERVICE] '%s' claimed by node %u and node %u -- "
+                    "keeping node %u (live owner), rejecting the stale "
+                    "claim." % (name, svc_remote, declarer, svc_remote))
+            continue
+        # First claim for this name: nothing to protect, it lands.
+        svc_remote = declarer
+
+
+threading.Thread(target=svc_rx_thread, daemon=True).start()
+
+
 # ─── Death-detection thread: the guard SIGKILLs the leader ────────────────
 # The follower polls the leader's port; when it stops answering, the
 # follower transitions: the adopter (node 2 in adopted/notadopted, both in
@@ -286,7 +387,8 @@ def death_thread():
                                     "resurrect_nostale", "migrate_stable",
                                     "migrate_flap", "migrate_nolease",
                                     "migrate_noapply", "migrate_nostale",
-                                    "migrate_noreacquire"):
+                                    "migrate_noreacquire", "svc_stable",
+                                    "svc_flap", "svc_nostale"):
                     log(learn_line(row, 2))
                 if row and mode == "observeradopts":
                     # The bug: a FOLLOWER that recovered. cluster_is_leader()
@@ -332,10 +434,15 @@ threading.Thread(target=death_thread, daemon=True).start()
 # teeth can only fail at a step-11 gate if step 10 got them there first.
 STEP10_MODES = ("adopted", "resurrect_stable", "migrate_stable",
                 "migrate_flap", "migrate_nolease", "migrate_noapply",
-                "migrate_nostale", "migrate_noreacquire")
+                "migrate_nostale", "migrate_noreacquire", "svc_stable",
+                "svc_flap", "svc_nostale")
 if role == "leader":
 
     def resurrect_thread():
+        if not created_preexisting:
+            return   # the ORIGINAL leader process: the guard SIGKILLs us
+                     # and relaunches; only the relaunched process restores
+                     # and re-announces its row
         row = None
         for _ in range(200):
             row = read_created()
@@ -392,6 +499,10 @@ if role == "leader":
         log("[PARTITION] sync: partition %s claimed by node 1 and node 2 -- "
             "leader node 2's claim wins, applying." % row["id"])
         log(learn_line(row, 2))
+        # Step 12's service resolve on this node derives the node from the
+        # partition owner; the owner is 2 once the leader has converged.
+        with open(os.path.join(state, "leader_converged"), "w") as fc:
+            fc.write("1")
 
     threading.Thread(target=resurrect_thread, daemon=True).start()
 
@@ -606,6 +717,20 @@ class H(http.server.BaseHTTPRequestHandler):
                              "quorum_threshold": 2})
         elif self.path == "/api/partitions":
             self._json(200, self._partitions())
+        elif self.path.startswith("/api/service/resolve/"):
+            name = self.path[len("/api/service/resolve/"):]
+            if svc_local:
+                nid = svc_owner()
+                self._json(200, {"ok": "true", "name": name,
+                                 "partition_id": 1, "node_id": nid,
+                                 "is_local": "true", "is_remote": "false"})
+            elif svc_remote:
+                self._json(200, {"ok": "true", "name": name,
+                                 "partition_id": 1, "node_id": svc_remote,
+                                 "is_local": "false", "is_remote": "true"})
+            else:
+                self._json(200, {"ok": "false", "name": name,
+                                 "error": "not found"})
         else:
             self._json(404, {"error": f"no fake route {self.path}"})
 
@@ -615,6 +740,41 @@ class H(http.server.BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n).decode() or "{}")
         except ValueError:
             req = {}
+        if self.path == "/api/service":
+            global svc_local
+            name = req.get("name", "")
+            pid = int(req.get("partition_id", 1))
+            gen = 0
+            prev_declarer = 0
+            if os.path.exists(svc):
+                try:
+                    pd = json.load(open(svc))
+                    gen = pd.get("gen", 0)
+                    prev_declarer = pd.get("declarer", 0)
+                except ValueError:
+                    pass
+            if (mode == "svc_nostale" and prev_declarer
+                    and prev_declarer != node_id and node_id != svc_owner()):
+                # The bug: the resurrected owner's stale re-announce never
+                # fires (the announce is broken), so no reject can log.
+                # Narrowed to the NON-OWNER re-announce shape: the adopter's
+                # own re-registration after the adoption (owner-initiated,
+                # node_id == svc_owner()) must NOT be suppressed -- a buggy
+                # suppression once made the step-7.5 gate read the adopter's
+                # re-registration as inert.
+                self._json(200, {"ok": "true", "recognized": "true",
+                                 "output": "declared (announce suppressed)"})
+                return
+            with open(svc, "w") as f:
+                json.dump({"name": name, "partition_id": pid,
+                           "declarer": node_id, "gen": gen + 1},
+                          f, separators=(",", ":"))
+            svc_local = True
+            log("[SERVICE] registered '%s' -> partition %s, TCP port %s."
+                % (name, pid, req.get("endpoint_port", 0)))
+            self._json(200, {"ok": "true", "recognized": "true",
+                             "output": "declared"})
+            return
         if self.path == "/api/shell/exec":
             command = req.get("command", "")
             if role == "leader" and command.startswith("partition create "):

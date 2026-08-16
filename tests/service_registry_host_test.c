@@ -91,8 +91,9 @@ SLSRole catalog_get_role(uint32_t uid) { (void)uid; return g_role; }
 /* Settable node identity -- the same fake tests/partition_host_test.c and
  * the cross-node tests already use. */
 static uint32_t g_local_node = 0;
+static uint32_t g_leader_node = 0;   /* settable: Scenario 12 exercises the leader-wins branch both ways */
 uint32_t cluster_local_node_id(void) { return g_local_node; }
-uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
+uint32_t cluster_leader_id(void) { return g_leader_node; }
 
 /* partition.c dependencies outside this test's scope. */
 struct SLSObjectEntry object_catalog[CATALOG_MAX_OBJECTS];
@@ -598,6 +599,77 @@ int main(void) {
         service_resolve("both", &loc);
         CHECK(loc.health == SVC_HEALTH_STALE && loc.serving == SVC_SERVING_UP,
               "*** STALE + UP: the last thing we heard was good, but we have not heard lately ***");
+    }
+
+    /* ═══ Scenario 12: claim-class conflict resolution ═══════════════════════════════════════════════
+     * Scenario 8's "a repeated announcement updates in place" was safe for
+     * the case that invented it (two concurrent registrations of one name)
+     * but FATAL for failover: a resurrected service owner restores its
+     * persisted registry at boot and re-announces its service, and "last
+     * announce wins" hands the adopted name back to the node that lost the
+     * partition -- flapping the registration the adoption just settled.
+     * service_remote_learn() now resolves conflicts by CLAIM CLASS,
+     * mirroring partition_sync_upsert(): the current partition owner's
+     * claim applies (the adoption re-registered the service), the leader's
+     * own claim applies (its view is authoritative), and anything else
+     * colliding with a live entry is REJECTED -- the resurrected-owner
+     * shape. */
+    printf("\n-- Scenario 12: claim-class conflict resolution --\n");
+    {
+        service_registry_init();
+        g_local_node = 3;          /* the observer */
+        g_leader_node = 2;
+        uint32_t padopt = partition_create("adopted");
+        partition_owner_table[padopt].node_id = 2;   /* adopted by node 2 */
+
+        struct SLSServiceLocation loc;
+
+        /* The live entry: the adopter re-registered after the adoption. */
+        service_remote_learn("svc", 2, padopt, SVC_ENDPOINT_TCP, 5000, 0, SVC_SERVING_UP);
+        CHECK(service_resolve("svc", &loc) == SVC_REG_OK && loc.node_id == 2,
+              "the adopter's live registration resolves to node 2");
+
+        /* The resurrected owner (node 1) restores its persisted registry
+         * and re-announces the same name: it is neither the current owner
+         * nor the leader, so the claim-class resolver REJECTS it. */
+        service_remote_learn("svc", 1, padopt, SVC_ENDPOINT_TCP, 5000, 0, SVC_SERVING_UP);
+        CHECK(service_resolve("svc", &loc) == SVC_REG_OK && loc.node_id == 2,
+              "*** the resurrected owner's stale re-announce is REJECTED -- the live entry survives ***");
+        CHECK(service_remote_count() == 1,
+              "...and the cache holds one entry, not two (the stale claim was not cached)");
+
+        /* Even if a stale claim DID slip in (the old rule), the owner's
+         * own re-announce out-resolves it: the owner-initiated claim wins,
+         * and the cache converges back. */
+        service_remote_learn("svc2", 1, padopt, SVC_ENDPOINT_TCP, 5000, 0, SVC_SERVING_UP);
+        service_remote_learn("svc2", 2, padopt, SVC_ENDPOINT_TCP, 6000, 0, SVC_SERVING_UP);
+        CHECK(service_resolve("svc2", &loc) == SVC_REG_OK && loc.node_id == 2
+              && loc.endpoint_port == 6000,
+              "*** the current owner's claim out-resolves the stale one (convergence) ***");
+
+        /* The leader's own claim applies even on a partition it does not
+         * own: the leader's view is authoritative, so a leader re-assert
+         * wins over a live non-owner entry. */
+        uint32_t pother = partition_create("other");
+        partition_owner_table[pother].node_id = 5;
+        service_remote_learn("ldr", 3, pother, SVC_ENDPOINT_TCP, 7000, 0, SVC_SERVING_UP);
+        service_remote_learn("ldr", 2, pother, SVC_ENDPOINT_TCP, 8000, 0, SVC_SERVING_UP);
+        CHECK(service_resolve("ldr", &loc) == SVC_REG_OK && loc.node_id == 2
+              && loc.endpoint_port == 8000,
+              "*** the leader's own claim wins on a partition it does not own ***");
+
+        /* A first-time claim from a non-owner is NOT a conflict: with no
+         * live entry there is nothing to protect, so it lands (the
+         * resurrected node converges when nothing contradicts it). */
+        service_remote_learn("fresh", 1, padopt, SVC_ENDPOINT_TCP, 9000, 0, SVC_SERVING_UP);
+        CHECK(service_resolve("fresh", &loc) == SVC_REG_OK && loc.node_id == 1,
+              "a first-time claim from any node lands (nothing to protect yet)");
+
+        /* Repeated stale re-announces never stick. */
+        service_remote_learn("svc", 1, padopt, SVC_ENDPOINT_TCP, 5000, 0, SVC_SERVING_UP);
+        service_remote_learn("svc", 1, padopt, SVC_ENDPOINT_TCP, 5000, 0, SVC_SERVING_UP);
+        CHECK(service_resolve("svc", &loc) == SVC_REG_OK && loc.node_id == 2,
+              "repeated stale re-announces never stick");
     }
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);

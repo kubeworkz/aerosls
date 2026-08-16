@@ -80,6 +80,18 @@
 # relinquished at the migrate (holds_lease 0 everywhere) and re-acquired
 # on the new owner only through a fresh 2-of-3 quorum.
 #
+# Step 12 then pins the same claim-class resolution on the SERVICE registry
+# (kernel/service_registry.c): the guard registers a service twin on the
+# owner before the kill, re-registers it on the adopter after the adoption,
+# and -- once the resurrected owner is back -- has it re-announce the SAME
+# name (its persisted registry restores it at boot; the guard's declare
+# stands in for that re-announce deterministically). service_remote_learn()
+# must REJECT the stale claim the way partition_sync_upsert() rejected the
+# stale row: the observer's cache keeps the adopter, every node still
+# resolves the name to the adopter, and the kernel logs the rejection. The
+# old rule -- "last announce wins" -- would hand the adopted name back to
+# the node that lost the partition.
+#
 # ─── Why it does not launch a cluster ─────────────────────────────────────
 # This guard KILLS the leader of the cluster it runs against, so it must
 # only ever touch a cluster its operator started deliberately -- the same
@@ -133,6 +145,10 @@ CLUSTER_DIR="cluster"
 LOG_DIR="${AEROSLS_LOG_DIR:-$CLUSTER_DIR}"
 PID_FILE="$CLUSTER_DIR/cluster.pids"
 NAME="guard-failover-$$"             # unique per run, so a stale persisted
+SVC="svc-$NAME"                      # the service-registry twin: registered on the
+                                     # owner pre-kill, re-registered on the adopter
+                                     # after adoption; the resurrected owner
+                                     # stale re-announce must be REJECTED (step 12)
                                      # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
@@ -238,6 +254,20 @@ for p in rows:
 PY
 }
 
+# svc_node <json> -- prints the node_id a service resolves to on this node
+# (empty when it does not resolve). Reads /api/service/resolve responses.
+svc_node() {
+    python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    d = {}
+if d.get("ok") == "true":
+    print(d.get("node_id", ""))
+PY
+}
+
 holds_lease_row() {   # $1 = json, $2 = name; exits 0 when holds_lease=1
     python3 - "$1" "$2" <<'PY'
 import json, sys
@@ -336,6 +366,40 @@ done
        the failover test cannot proceed."
 echo "   $f1 learned $learned1"
 echo "   $f2 learned $learned2"
+
+# ─── 3.5. register the service twin on the owner; all three resolve ───────
+# service_resolve() derives the node from the partition owner for local
+# entries and from the announcing node for remote ones, so the pre-kill
+# registration must resolve to $leader everywhere. This is the baseline
+# step 12 compares against: the same name must STILL resolve to the
+# adopter after the resurrected owner re-announces it.
+SVC_PORT=9999
+PART_ID="$(get200 "$L_PORT" /api/partitions && row_id "$FETCH_BODY" "$NAME")"
+[ -n "$PART_ID" ] || die "could not read the partition id for '$NAME' from node $leader"
+echo "==> registering service '$SVC' on node $leader (the partition owner)"
+"$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    services declare --name "$SVC" --partition "$PART_ID" --kind tcp --port "$SVC_PORT" >/dev/null \
+    || die "service declare failed on node $leader (aeroslsctl output above)"
+echo "==> waiting for all three nodes to resolve '$SVC' to node $leader (up to ${WAIT_LEARN}s)"
+svc_base_ok=0
+deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    r_ok=1
+    for pn in "$L_PORT" "$F1_PORT" "$F2_PORT"; do
+        if get200 "$pn" "/api/service/resolve/$SVC"; then
+            [ "$(svc_node "$FETCH_BODY")" = "$leader" ] || r_ok=0
+        else
+            r_ok=0
+        fi
+    done
+    [ "$r_ok" -eq 1 ] && { svc_base_ok=1; break; }
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$svc_base_ok" -eq 1 ] || fail "the service registration '$SVC' never resolved to node
+       $leader on all three nodes within ${WAIT_LEARN}s. The registration or its DSPP
+       replication is broken -- the service tooth cannot proceed."
+echo "   '$SVC' resolves to node $leader on all three nodes"
 
 # ─── 4. the checkpoint must carry the row before the leader dies ──────────
 # failover_recover_from() adopts what is in the held checkpoint, and the
@@ -460,6 +524,36 @@ if [ -z "$adopter" ]; then
        the held checkpoint did not carry the row."
 fi
 echo "   $adopter became leader, declared node $leader DEAD, and adopted $owned"
+
+# ─── 7.5. the adopter re-registers the service twin ───────────────────────
+# The adoption moved ownership; the service twin moves with it. The adopter
+# re-registers the same name (standing in for the adoption path re-issuing
+# its services) and every up node must resolve it to the adopter. This is
+# the LIVE entry step 12's stale claim must not displace.
+echo "==> re-registering service '$SVC' on node $adopter (the new owner)"
+"$CTL" --host "localhost:$((HTTP_BASE + adopter))" "${TOKEN_ARGS[@]}" \
+    services declare --name "$SVC" --partition "$PART_ID" --kind tcp --port "$SVC_PORT" >/dev/null \
+    || die "service re-declare failed on node $adopter (aeroslsctl output above)"
+echo "==> waiting for the survivors to resolve '$SVC' to node $adopter (up to ${WAIT_LEARN}s)"
+svc_adopt_ok=0
+deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    r_ok=1
+    for pn in "$((HTTP_BASE + adopter))" "$((HTTP_BASE + observer))"; do
+        if get200 "$pn" "/api/service/resolve/$SVC"; then
+            [ "$(svc_node "$FETCH_BODY")" = "$adopter" ] || r_ok=0
+        else
+            r_ok=0
+        fi
+    done
+    [ "$r_ok" -eq 1 ] && { svc_adopt_ok=1; break; }
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$svc_adopt_ok" -eq 1 ] || fail "the service '$SVC' never resolved to the adopter (node
+       $adopter) after its re-registration within ${WAIT_LEARN}s. The owner-initiated
+       re-announce did not replicate -- the service tooth cannot proceed."
+echo "   '$SVC' resolves to node $adopter on the survivors"
 
 # ─── 8. the owner handoff must replicate to the other survivor ────────────
 # partition_set_owner_node() announces the new owner, and the observer's
@@ -699,6 +793,65 @@ done
        restore in $L_LOG within ${WAIT_CONV}s). The leader's periodic
        re-announce must teach the stale node the truth, or the stale row
        survives in its table forever."
+
+# ─── 12. the service twin: the resurrected owner's stale re-announce ──────
+# Step 10 resolved the PARTITION claim; the SERVICE registration must
+# resolve the same way or the adoption is not durable. The resurrected
+# owner's persisted registry (persist_services restored it at boot) holds
+# the pre-kill registration and re-announces it; the guard's declare here
+# makes that re-announce deterministic. service_remote_learn()'s
+# claim-class resolver (mirroring partition_sync_upsert) must REJECT the
+# stale claim on the observer -- which holds the adopter's live entry -- so
+# the name keeps resolving to the adopter on EVERY node, and the kernel
+# logs the rejection. The old rule -- "last announce wins" -- would hand
+# the adopted name back to the node that lost the partition.
+echo "==> resurrected owner node $leader re-announces service '$SVC' (stale claim)"
+"$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    services declare --name "$SVC" --partition "$PART_ID" --kind tcp --port "$SVC_PORT" >/dev/null \
+    || die "stale service declare failed on node $leader (aeroslsctl output above)"
+
+echo "==> waiting for the survivors to reject the stale claim (up to ${WAIT_CLAIM}s)"
+svc_rej=0
+svc_flapped=""
+deadline=$(( $(date +%s) + WAIT_CLAIM ))
+while :; do
+    # The rejection must be logged AFTER the step-8 handoff to scope it to
+    # this run, and must name OUR service (the line carries the name, so a
+    # stale run's reject against the same cluster cannot match).
+    rej_svc="$(last_line "$OBS_LOG" "\[SERVICE\].*$SVC.*rejecting the stale claim")"
+    [ -n "$rej_svc" ] && [ -n "$handoff_line" ] && [ "$rej_svc" -gt "$handoff_line" ] && svc_rej=1
+    # No-flap: EVERY node must still resolve the name to the adopter; the
+    # moment any node reports the resurrected owner, the stale claim won.
+    r_ok=1
+    for pn in "$L_PORT" "$((HTTP_BASE + adopter))" "$((HTTP_BASE + observer))"; do
+        if get200 "$pn" "/api/service/resolve/$SVC"; then
+            n="$(svc_node "$FETCH_BODY")"
+            if [ "$n" = "$leader" ]; then
+                svc_flapped=1; r_ok=0
+            elif [ "$n" != "$adopter" ]; then
+                r_ok=0
+            fi
+        else
+            r_ok=0
+        fi
+    done
+    if [ "$svc_rej" -eq 1 ] && [ "$r_ok" -eq 1 ]; then break; fi
+    [ -n "$svc_flapped" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+if [ -n "$svc_flapped" ]; then
+    fail "the service registration FLAPPED: a node resolved '$SVC' back to the
+       resurrected owner (node $leader) after its stale re-announce. The
+       claim-class resolver must keep the live registration (node $adopter) --
+       the old 'last announce wins' rule hands the adopted name back to the
+       node that lost the partition."
+fi
+[ "$svc_rej" -eq 1 ] || fail "the stale service re-announce was never rejected: no
+       '[SERVICE] ... rejecting the stale claim' for '$SVC' appeared in $OBS_LOG after
+       the handoff within ${WAIT_CLAIM}s. Either the stale announce never escaped
+       (replication broken) or service_remote_learn()'s claim-class resolver is gone."
+echo "   '$SVC' still resolves to node $adopter on all three nodes (stale claim rejected)"
 
 # ─── 11. the migration return: the owner-initiated claim out-resolves ─────
 # the resurrected destination's stale row, and the write lease follows the
@@ -1037,6 +1190,7 @@ printf '        %s\n' "$(grep -h "Partition ownership restored from NVMe" "$L_LO
 printf '        %s\n' "$(grep -h "rejecting the stale claim" "$CAN_LOG" 2>/dev/null | tail -1 | sed 's/^/adopter: /')"
 printf '        %s\n' "$(grep -h "rejecting the stale claim" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
 printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*learned from node $adopter" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
+printf '        %s\n' "$(grep -h "\[SERVICE\].*$SVC.*rejecting the stale claim" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/service: /')"
 printf '        %s\n' "$(grep -h "PARTITION] migrated partition $PART_ID: node $adopter -> node $leader" "$ADP_LOG" 2>/dev/null | tail -1 | sed 's/^/migrate: /')"
 printf '        %s\n' "$(grep -h "CONSENSUS] partition $PART_ID: node $adopter voluntarily stepped down from LEADER" "$ADP_LOG" 2>/dev/null | tail -1 | sed 's/^/lease: /')"
 printf '        %s\n' "$(grep -h "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/transfer on destination: /')"

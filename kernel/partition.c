@@ -655,11 +655,16 @@ void sys_sls_partition_list(void) {
 //     re-announces a row's absence -- the known eventual-consistency debt a
 //     future periodic full-owned-set reconciliation would close.
 //
-// Both mirror service_remote_learn()/_forget()'s rules: last announce wins
-// (logged when it overwrites a different owner), and a withdraw only applies
-// if the source owned the row. (The service registry itself remains
-// runtime-only; this persistence is for the partition table, whose rows are
-// the cluster view a node must keep across a reboot.)
+// Both sides now share the claim-class resolver in the sync paths below
+// (and in service_remote_learn()): "last announce wins" no longer holds
+// anywhere -- a resurrected owner's stale re-announce must not flap a
+// settled partition ownership or a settled service registration. A
+// withdraw only applies if the source owned the row. (The service registry
+// persists its LOCAL registrations -- persist_services, restored at boot,
+// which is exactly why a resurrected owner can re-announce at all -- and
+// only its remote cache is runtime-only; this persistence is for the
+// partition table, whose rows are the cluster view a node must keep across
+// a reboot.)
 static volatile uint8_t partition_persist_dirty = 0;
 void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
                            const char* name, uint32_t source_node_id) {
