@@ -20,7 +20,7 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -250,7 +250,7 @@ jobs:
     # path). qemu-sls is kubeworkz/qemu-sls: if it is private, set the
     # QEMU_SLS_PAT secret to a token with read access; if public, no secret
     # is needed.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -485,7 +485,7 @@ jobs:
     # DB_ADMIN demo token (kernel/auth.c) is deterministic and
     # no-expiry, so CI can use it directly -- same as the deployed
     # simulator's login flow.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -723,7 +723,7 @@ jobs:
     # off with, so its smoke ends in a reported, deliberate halt (rc=124
     # timeout) instead of a clean shutdown. Both boot paths are asserted
     # below. See AeroSLS-SIMI-ISA-v0.1.md §16 Phase 9, 9g addendum.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
 
@@ -1169,7 +1169,7 @@ jobs:
     # translator (simi_arm.c) that will port into the kernel. The runner
     # skips cleanly without the toolchain; here it is installed, so the
     # run must be all-pass.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
 
