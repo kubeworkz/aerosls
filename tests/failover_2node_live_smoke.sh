@@ -114,17 +114,33 @@ tooth() {
     echo "$mode" > "$STATE/mode"
     echo 1 > "$STATE/leader"   # node 1 is the leader
 
-    python3 "$FAKE" 1 leader   $((BASE+1)) "$STATE" "$STATE" >/dev/null 2>&1 &
-    local lpid=$!
-    python3 "$FAKE" 2 follower $((BASE+2)) "$STATE" "$STATE" >/dev/null 2>&1 &
-    local fpid=$!
-    FAKE_PIDS="$lpid $fpid"
+    # A slow python cold start on a loaded runner must not abort a tooth:
+    # retry the pair (up to 3 times), keep each attempt's stderr in $STATE
+    # so a real fake crash is diagnosable instead of vanishing to /dev/null.
+    local lpid fpid attempt
+    FAKE_PIDS=""
+    for attempt in 1 2 3; do
+        [ -n "$FAKE_PIDS" ] && kill $FAKE_PIDS 2>/dev/null || true
+        FAKE_PIDS=""
+        python3 "$FAKE" 1 leader   $((BASE+1)) "$STATE" "$STATE" >"$STATE/fake1.err" 2>&1 &
+        lpid=$!
+        python3 "$FAKE" 2 follower $((BASE+2)) "$STATE" "$STATE" >"$STATE/fake2.err" 2>&1 &
+        fpid=$!
+        FAKE_PIDS="$lpid $fpid"
 
-    for _ in $(seq 1 40); do
-        curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$((BASE+1))/api/health" \
-            && curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$((BASE+2))/api/health" \
-            && break
-        sleep 0.1
+        local up=0
+        for _ in $(seq 1 60); do
+            if curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$((BASE+1))/api/health" \
+                && curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$((BASE+2))/api/health"; then
+                up=1
+                break
+            fi
+            sleep 0.2
+        done
+        if [ "$up" -eq 1 ]; then
+            break
+        fi
+        echo "  note: fake nodes not up on attempt $attempt (retrying)" >&2
     done
     printf '1 %s\n2 %s\n' "$lpid" "$fpid" > "$PID_FILE"
 
