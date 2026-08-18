@@ -9,6 +9,14 @@
 # assertion across the whole loop plus the parent's final cap_list dump
 # (objects active=0, arena free=16384/16384).
 #
+# Phase 14a (LPAR) destroy-time object story: after the 4 real cycles the
+# program runs 13 spawnless probe cycles (create -> assign -> valloc ->
+# upload -> destroy) that together MUST exhaust the 16-slot binary store
+# unless every destroy also frees its partition's slots — probe 12 is the
+# tooth (see part_recycle.c's Phase 14a comment for the arithmetic). The
+# per-object half is probed too: upload 400 bytes, vfree, re-upload 96 —
+# the re-upload must log total=96 (fresh slot), not total=400 (stale).
+#
 # GUARD-KIND: runtime (needs the built ISO + QEMU + a serial pipe).
 #
 # Usage:
@@ -100,6 +108,57 @@ grep -aq "\[prec\] done (FAILURES)" boot_part.log && {
     echo "FAILED: part_recycle reported failures" >&2
     fail=1
 }
+# Phase 14a (LPAR) destroy-time object story: every destroy must also
+# free the binary-store slots the partition's uploads consumed. Each real
+# cycle uploads one child binary, and each of the 13 probes uploads one
+# more into its own fresh partition — with only 16 slots total and no
+# destroy-time free, probe 12 would hit "binary store full" and the probe
+# summary would not reach 13/13.
+grep -aq "\[prec\] probe DONE: 13/13 uploads ok" boot_part.log || {
+    echo "FAILED: binary-store probe loop did not reach 13/13 (slots leaked?)" >&2
+    grep -a "prec\] probe\|LOADER\] upload: binary store full\|prec\]" boot_part.log | tail -30 >&2
+    fail=1
+}
+grep -aq "\[LOADER\] upload: binary store full" boot_part.log && {
+    echo "FAILED: binary store ran full during the recycle loop" >&2
+    fail=1
+}
+# The loader-side teardown must have run: at least one slot freed per
+# real cycle (cr_c0..cr_c3) plus one per probe partition.
+loader_vfree_n=$(grep -ac "\[LOADER\] vfree (partition .* teardown): 'cr_c" boot_part.log)
+if [ "$loader_vfree_n" -lt 4 ]; then
+    echo "FAILED: expected >=4 loader slot frees for the real cycles, saw $loader_vfree_n" >&2
+    grep -a "LOADER\] vfree\|LOADER\] upload: binary store full" boot_part.log | head -20 >&2
+    fail=1
+else
+    echo "ok:   $loader_vfree_n child binary-store slots freed at teardown"
+fi
+# Per-object half: sys_sls_vfree must free the object's binary-store slot.
+# The vfree probe uploads 400 bytes, vfrees, then re-uploads 96 bytes of
+# the same name — the re-upload must log total=96 (a fresh slot). Without
+# the slot free, loader_get_or_alloc() reuses the stale active slot and
+# only grows size, so the kernel would log total=400 instead: the 96-byte
+# line is the tooth.
+grep -aq "\[prec\] vfree probe DONE" boot_part.log || {
+    echo "FAILED: vfree probe did not complete" >&2
+    grep -a "prec\] vfree probe\|vfreeprobe" boot_part.log | tail -20 >&2
+    fail=1
+}
+grep -aq "\[prec\] vfree probe FAILED" boot_part.log && {
+    echo "FAILED: vfree probe reported failure" >&2
+    fail=1
+}
+grep -aq "\[LOADER\] 'vfreeprobe': wrote 96 bytes at offset 0 (total=96, flat)" boot_part.log || {
+    echo "FAILED: vfree probe re-upload logged total=96 — stale slot state inherited" >&2
+    grep -a "vfreeprobe" boot_part.log | tail -10 >&2
+    fail=1
+}
+grep -aq "\[LOADER\] vfree (object vfree): 'vfreeprobe'" boot_part.log || {
+    echo "FAILED: sys_sls_vfree did not free the binary-store slot" >&2
+    grep -a "vfreeprobe\|CATALOG\] vfree" boot_part.log | tail -10 >&2
+    fail=1
+}
+echo "ok:   sys_sls_vfree frees the binary-store slot (vfree probe)"
 # Each child exits WITHOUT revoking its kept MEM cap — only teardown
 # (child exit or partition_destroy) can return its arena frame. The final
 # cap_list dump must show a fully returned arena and zero live objects.
