@@ -72,6 +72,28 @@ if [ -d tools/simi ]; then
     fi
 fi
 
+# ─── Build the ring-3 user programs before the blob guard runs ────────────
+# tests/blob_guard_host_test.c re-extracts CAP_RECYCLE_CHILD_BLOB from
+# user/examples/cap_recycle_child_blob.h and compares it byte-for-byte
+# against user/examples/cap_recycle_child.bin. That .bin is a gitignored
+# build artifact (built by "make user-programs" from user/examples/*.c),
+# so on a fresh clone it does not exist -- without building it here the
+# guard would fail every fresh checkout even though the tree is fine.
+# Same rule as the SIMI corpus above: the test FAILS rather than skips
+# when the file is missing, and this build makes the file exist.
+# Failure to build is reported and not fatal: no host toolchain is a
+# different problem from a broken kernel, and the other tests still have
+# something to say.
+if make user-programs >/dev/null 2>&1; then
+    echo "user-programs: built ring-3 examples for the embedded-child blob guard"
+else
+    echo "user-programs: WARNING -- could not build ring-3 examples."
+    echo "        tests/blob_guard_host_test.c will FAIL if"
+    echo "        user/examples/cap_recycle_child.bin is missing, which is"
+    echo "        correct: an embedded child that cannot be compared against"
+    echo "        its source binary has not been checked."
+fi
+
 pass=0
 fail=0
 skip=0

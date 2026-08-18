@@ -111,134 +111,134 @@ syscall_entry_stub:
 
 .do_sls_allocate:
     call sys_sls_allocate
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_valloc:
     ; RDI = pointer to SLSVallocRequest
     call sys_sls_valloc
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_vfree:
     ; RDI = const char* name
     call sys_sls_vfree
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_obj_stat:
     ; RDI = const char* name
     call sys_sls_obj_stat
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_obj_list:
     ; no arguments
     call sys_sls_obj_list
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_role_set:
     ; RDI = pointer to SLSRoleRequest
     call sys_sls_role_set
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_grant:
     ; RDI = pointer to args[2] = { req_ptr, is_grant }
     mov  rsi, [rdi + 8]     ; is_grant = args[1]
     mov  rdi, [rdi]         ; req      = args[0]
     call sys_sls_grant
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_select:
     call sys_sls_select
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_update:
     call sys_sls_update
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_insert:
     call sys_sls_insert
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tx_begin:
     ; RDI = thread_id (passed as pointer-sized integer)
     ; Convert pointer to uint32_t by truncation — ABI-safe on x86_64
     call sys_sls_tx_begin
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tx_commit:
     call sys_sls_tx_commit
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tx_rollback:
     call sys_sls_tx_rollback
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tx_recover:
     call sys_sls_tx_recover
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_svc_list:
     ; no arguments
     call sys_sls_svc_list
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_svc_crash:
     ; RDI = const char* name
     call sys_sls_svc_crash
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_svc_restart:
     ; RDI = const char* name
     call sys_sls_svc_restart
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_ipc_stat:
     ; no arguments — print inline
     call sys_sls_svc_list   ; reuse svc_list for combined IPC/service stats
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_ipc_post:
     ; RDI = pointer to IPCPostRequest
     call sys_sls_ipc_post
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tier_list:
     ; no arguments
     call sys_sls_tier_list
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tier_promote:
     ; RDI = const char* name
     call sys_sls_tier_promote
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_tier_demote:
     ; RDI = const char* name
     call sys_sls_tier_demote
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_delete:
     ; RDI = pointer to SLSRecordRequest
     call sys_sls_delete
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_schema_set:
     ; RDI = pointer to SLSSchemaRequest
     call sys_sls_schema_set
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_schema_show:
     ; RDI = const char* name
     call sys_sls_schema_show
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_query:
     ; RDI = const char* query text
     call sys_sls_query
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .do_sls_query_scan:
     ; no arguments
     call sys_sls_query_scan
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
 .unknown_syscall:
     ; Fall through to the C dispatcher for any syscall number not handled above.
@@ -247,9 +247,17 @@ syscall_entry_stub:
     mov  rdi, rax          ; syscall number from RAX
     call do_syscall
     ; return value already in RAX
-    jmp  .syscall_return
+    jmp  syscall_return_path
 
-.syscall_return:
+; Phase 1.5: cap_recv_resume() (process.c) re-runs a parked recv and then
+; jumps HERE to reuse the canonical syscall-return sequence — the eight pops
+; undo the entry pushes (r11, rcx, r15..rbp), [gs:0] holds the user RSP the
+; resume path restored, and the trailing swapgs+sysret lands back in Ring-3.
+; (Note: this label is deliberately NOT named `.syscall_return` — a leading
+; dot would scope it to the previous non-local label and every `jmp` above
+; would break. It is the shared return path for both entry modes.)
+global syscall_return_path
+syscall_return_path:
     pop  r11
     pop  rcx
     pop  r15

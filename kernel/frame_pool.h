@@ -105,6 +105,23 @@ int frame_pool_frame_is_machine_owned(uint64_t frame_index);
  * trusting that _kernel_image_end happens to sit above it. */
 void frame_pool_reserve_range(uint64_t lo_addr, uint64_t hi_addr);
 
+/* Finds the first aligned run of `nframes` consecutive free frames (frame 0
+ * skipped; free = bitmap bit clear, i.e. never allocated AND not covered by
+ * any boot reservation), marks every frame of it used, and folds the run
+ * into the machine-owned watermark (reserved_below) so no partition
+ * reclamation can ever free it. Returns the physical base address of the
+ * run, or 0 when no such run exists (nothing mutated in that case).
+ *
+ * This is the Seed Kernel capability layer's arena carve (kernel/cap.c):
+ * the shared-memory arena must be one physically contiguous span, which the
+ * per-frame allocate_physical_ram_frame() path cannot guarantee.
+ *
+ * align_frames must be a power of two (callers pass 512 for 2 MiB
+ * alignment); candidate runs start at multiples of it. If no aligned run
+ * fits, the call FAILS rather than silently returning a misaligned one --
+ * alignment is a contract (future 2 MiB pages), not a preference. */
+uint64_t frame_pool_reserve_contiguous(uint64_t nframes, uint64_t align_frames);
+
 /* True if `addr` (when nonzero) falls inside the 4 KiB frame at frame_base.
  * alloc_raw_frame() uses it against the live stack pointer so the allocator can
  * never return the memory it is running on. Exposed for testing. */
@@ -132,6 +149,18 @@ int frame_pool_stack_still_reserved(void);
 /* Introspection for the boot log and the host test. */
 uint64_t frame_pool_reserved_count(void);
 int      frame_pool_is_reserved(uint64_t frame_index);
+
+/* Phase 2 (Seed Kernel teardown): the partition id a frame was allocated
+ * to (frame_owner[]), or PARTITION_SYSTEM (0) for out-of-range indices and
+ * for never-allocated/reserved frames (the BSS-zero default, same value
+ * as a genuine PARTITION_SYSTEM allocation). Exposed so the per-process
+ * page-table teardown (user_destroy_page_table, arch/x86/user_paging.c)
+ * can free each owned frame through
+ * free_physical_ram_frame_for_partition() with the SAME partition_id it
+ * was allocated with — keeping the quota counters exact for accounted
+ * (loader/stack) frames and for the unaccounted (page-table/SIMI-scratch)
+ * frames, whose owner tag is PARTITION_SYSTEM either way. */
+uint32_t frame_pool_frame_owner(uint64_t frame_index);
 
 /* Clears the bitmap back to its boot state (every frame free, nothing
  * reserved). Exists for the host test, which has to reproduce the

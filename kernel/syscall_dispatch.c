@@ -31,6 +31,22 @@
 #include "tenant.h"        // Multitenant Isolation Gap Analysis §5 item 1 -- SYS_SLS_TENANT_*
 #include "usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- SYS_SLS_USAGE_REPORT
 #include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
+#include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
+
+// ─── spawn owner-uid resolution ──────────────────────────────────────────────
+// The owner_uid threaded into program_spawn*()/program_load()/sys_sls_load()
+// decides the child's catalog-authority check AND which partition it lands
+// in (partition_get_for_uid()). These used kernel_get_current_thread_id(),
+// which returns the microkernel task-table id — 0 for every ring-3 caller —
+// so every ring-3-spawned child was silently owned by the kernel (uid 0:
+// always-passing authority, PARTITION_SYSTEM placement), the same gap the
+// HTTP path's req_uid threading already closed for /api/program/spawn. The
+// real caller identity is the currently-executing process's owner_uid;
+// kernel context (no ring-3 process) keeps the historical uid 0.
+static uint32_t spawn_owner_uid(void) {
+    struct ProcessDescriptor* cur = process_find_current();
+    return cur ? cur->owner_uid : 0;
+}
 
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
@@ -208,8 +224,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
 
     // ── Phase C: Loader (170–171) ───────────────────────────────────────
     case SYS_SLS_LOAD:
-        return sys_sls_load((const char*)arg,
-                            kernel_get_current_thread_id());
+        return sys_sls_load((const char*)arg, spawn_owner_uid());
     case SYS_SLS_UPLOAD_BINARY:
         return sys_sls_upload_binary((struct SLSUploadRequest*)arg);
     case 172: /* loader_list */
@@ -219,8 +234,17 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_SIMI_INFO:
         return sys_sls_simi_info((struct SLSSimiInfoRequest*)arg);
     case SYS_SLS_PROGRAM_SPAWN:
-        return program_load((const char*)arg,
-                            kernel_get_current_thread_id());
+        return program_load((const char*)arg, spawn_owner_uid());
+    // Seed Kernel Phase 1.5: NON-BLOCKING spawn — the child is queued with
+    // a synthetic ring-3 context and the spawn returns immediately, so two
+    // processes can be live at once (the blocking-cap_recv overlap test).
+    case SYS_SLS_PROGRAM_SPAWN_NB:
+        return program_spawn_nb((const char*)arg, spawn_owner_uid());
+    // Phase 1.5 (gated async spawn): child starts PROC_HELD — the spawner
+    // provisions its channel first, then releases it (SYS_SLS_PROC_RELEASE),
+    // closing the spawn-then-provision timer race.
+    case SYS_SLS_PROGRAM_SPAWN_NB_HELD:
+        return program_spawn_nb_held((const char*)arg, spawn_owner_uid());
 
     // ── Phase D: Web App (180–182) ───────────────────────────────────────
     case SYS_SLS_WEBAPP_SET:
@@ -496,6 +520,44 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_partition_conn_quota_set((struct SLSPartitionConnQuotaSetRequest*)arg);
     case SYS_SLS_PARTITION_CONN_QUOTA_LIST:
         sys_sls_partition_conn_quota_list(); return 0;
+
+    // ─── Seed Kernel Phase 1: capability layer (289-297) ─────────────────
+    // docs/AeroSLS-Capability-SDK-Phase1-Seed-Kernel-Design-v0.1.md. The
+    // caller's identity is resolved inside each wrapper via
+    // cap_current_pid() (process.c's strong hook), never from a request
+    // field -- same trusted-resolution discipline as the IPC cases above.
+    case SYS_SLS_CAP_CREATE_MEM:
+        return sys_sls_cap_create_mem((struct SLSCapCreateMemRequest*)arg);
+    case SYS_SLS_CAP_ARENA_ALLOC:
+        return sys_sls_cap_arena_alloc((struct SLSCapArenaAllocRequest*)arg);
+    case SYS_SLS_CHAN_CREATE:
+        return sys_sls_chan_create((struct SLSCapChanCreateRequest*)arg);
+    case SYS_SLS_CAP_SEND:
+        return sys_sls_cap_send((struct SLSCapSendRequest*)arg);
+    case SYS_SLS_CAP_RECV:
+        return sys_sls_cap_recv((struct SLSCapRecvRequest*)arg);
+    case SYS_SLS_CAP_REVOKE:
+        return sys_sls_cap_revoke((struct SLSCapRevokeRequest*)arg);
+    case SYS_SLS_CAP_MAP:
+        return sys_sls_cap_map((struct SLSCapMapRequest*)arg);
+    case SYS_SLS_CAP_UNMAP:
+        return sys_sls_cap_unmap((struct SLSCapUnmapRequest*)arg);
+    case SYS_SLS_CAP_LIST:
+        sys_sls_cap_list(); return 0;
+
+    // ─── Seed Kernel Phase 1, two-party verification (298) ───────────────
+    // Child resolves its spawner's pid so it can mint a channel's far-end
+    // caps directly into the parent's capability table.
+    case SYS_SLS_GETPPID:
+        return sys_sls_getppid();
+
+    // ─── Seed Kernel Phase 1.5, immediate wake (300) ─────────────────────
+    // Voluntary yield: the entry frame stays on the process's syscall stack
+    // and it resumes at .syscall_return on its next schedule — the yield
+    // looks to ring-3 like a syscall that took a while. Used to hand the
+    // CPU back to an async child so it can exit cleanly.
+    case SYS_SLS_YIELD:
+        return sys_sls_yield();
 
     default:
         return 0;

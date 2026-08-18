@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include "tests/process_host_stubs.h"   /* stack_bottom/stack_top (frame_pool_init reservation bounds) */
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -55,7 +56,8 @@ char _kernel_image_end[1];
 /* arch/x86/boot.asm exports these as the two ends of one 64 KiB region, an
  * adjacency the linker script establishes and that C cannot reproduce: two
  * separate objects have no guaranteed order or spacing. They exist here only
- * to satisfy the link.
+ * to satisfy the link -- the symbols themselves (stack_bottom/stack_top) now
+ * come from tests/process_host_stubs.h, included above.
  *
  * So frame_pool_init() is deliberately NOT exercised by this test, and that is
  * a real gap stated rather than papered over -- a stub where stack_top happens
@@ -65,8 +67,6 @@ char _kernel_image_end[1];
  * is the whole substance of the change; frame_pool_init() only supplies the
  * two addresses. The wiring itself is checked at runtime by the [FRAME] ERROR
  * line it prints when the image-end reservation fails to cover the stack. */
-char stack_bottom[16];
-char stack_top[16];
 
 /* Mirrors the real image layout closely enough to be meaningful: the
  * measured link put the end at 0x7781000 (119.5 MiB). */
@@ -269,6 +269,61 @@ int main(void) {
               "*** reclaiming a real tenant still frees exactly its frame ***");
         CHECK(!frame_pool_is_reserved(tenant_idx),
               "...and that frame really is back in the pool");
+    }
+
+    /* ─── Seed Kernel Phase 2: the contiguous reservation (arena) must not
+     * make the ALLOCATABLE frames below it machine-owned ───────────────────
+     * Historical bug: frame_pool_reserve_contiguous() folded its range into
+     * the reserved_below watermark, which then covered every frame between
+     * the image and the arena -- and this kernel's processes and streams
+     * all live there -- so partition_reclaim_all_frames() skipped them all
+     * and every partition destroy leaked. The reservation must be tracked
+     * as its OWN range: the arena frames are machine-owned, the frames
+     * below it are not, and reclaiming a tenant below the arena works. */
+    {
+        frame_pool_reset();
+        frame_pool_reserve_below(64 * 1024);        /* frames 0..15 = "the kernel" */
+        frame_pool_limit_ram(1024 * 1024);          /* frames 256.. = "no RAM there" */
+        /* Carve a 16-frame contiguous reservation at frame 64 (2 MiB-
+         * aligned in real boots; any power-of-two align works here) -- the
+         * cap arena's carve. */
+        uint64_t reserved_before_arena = frame_pool_reserved_count();
+        uint64_t arena = frame_pool_reserve_contiguous(16, 64);
+        CHECK(arena == 64 * 4096,
+              "the contiguous reservation lands at frame 64");
+        CHECK(frame_pool_frame_is_machine_owned(64) &&
+              frame_pool_frame_is_machine_owned(79),
+              "*** the contiguous reservation itself is machine-owned ***");
+        CHECK(!frame_pool_frame_is_machine_owned(16) &&
+              !frame_pool_frame_is_machine_owned(63),
+              "*** frames between the image and the reservation are NOT "
+              "machine-owned -- the historical bug marked them so ***");
+        CHECK(frame_pool_reserved_count() == reserved_before_arena + 16,
+              "the contiguous reservation added exactly its 16 frames to the "
+              "reserved count");
+
+        /* A real tenant allocation below the arena must be reclaimable. */
+        void* tenant = allocate_physical_ram_frame_for_partition(9);
+        CHECK(tenant != 0, "a tenant frame was allocated");
+        uint64_t t_idx = (uint64_t)(uintptr_t)tenant / FRAME_SIZE;
+        CHECK(t_idx < 64,
+              "the allocator handed out a frame BELOW the arena (the range "
+              "the historical watermark wrongly machine-owned)");
+        CHECK(frame_pool_frame_is_machine_owned(t_idx) == 0,
+              "*** the tenant's own frame is not machine-owned ***");
+        CHECK(partition_reclaim_all_frames(9) == 1,
+              "*** reclaiming partition 9 frees the frame below the arena -- "
+              "the watermark fix ***");
+        CHECK(!frame_pool_is_reserved(t_idx),
+              "...and that frame is truly back in the pool");
+
+        /* The reservation itself must survive the reclaim untouched. */
+        CHECK(frame_pool_is_reserved(64) && frame_pool_is_reserved(79),
+              "*** the contiguous reservation is still reserved after the "
+              "reclaim ***");
+        CHECK(frame_pool_reserved_count() == reserved_before_arena + 16,
+              "...and the reserved count is unchanged by the tenant reclaim "
+              "(frames_reserved tracks reservations only)");
     }
 
     /* ─── Reserving the stack by its own bounds ────────────────────────────

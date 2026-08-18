@@ -158,6 +158,29 @@ int simi_activation_query(const char* object_name, struct SimiActivationStatus* 
     return 1;
 }
 
+/* Phase 2 (Seed Kernel teardown): is this physical frame one of the SHARED
+ * cached SIMI code pages? The activation cache's code frames are mapped
+ * into every process that spawns the object (correct only because
+ * base_vaddr is invariant — see the header comment), so a per-process
+ * page-table teardown MUST NOT free them: freeing on the first process's
+ * exit would yank the code out from under every other live activation.
+ * The per-activation SCRATCH page is never in the cache (each activation
+ * gets a fresh frame) and is therefore NOT reported here — teardown frees
+ * it as an ordinary owned leaf. Scans the valid activation slots' frame[]
+ * arrays; O(SIMI_MAX_ACTIVATIONS * SIMI_ACT_MAX_PAGES) worst case, called
+ * once per leaf PTE during teardown only. */
+int simi_frame_is_cached(uint64_t paddr) {
+    if (paddr == 0) return 0;
+    for (int i = 0; i < SIMI_MAX_ACTIVATIONS; i++) {
+        const struct SimiActivation* act = &g_activations[i];
+        if (!act->valid) continue;
+        for (uint32_t p = 0; p < act->code_pages; p++) {
+            if (act->frame[p] == paddr) return 1;
+        }
+    }
+    return 0;
+}
+
 void simi_activation_info(const char* object_name) {
     struct SimiActivationStatus st;
     if (!simi_activation_query(object_name, &st)) {

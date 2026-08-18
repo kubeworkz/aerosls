@@ -16,6 +16,7 @@ int  sls_tls_time_init(void);
 #include "timer.h"
 #include "process.h"
 #include "frame_pool.h"
+#include "cap.h"   // Seed Kernel Phase 1 -- cap_init() after the RAM top is bounded
 #include "qemu_sls_mmu.h"
 #include "qemu_sls_tcache.h"
 #include "qemu_sls_pgo.h"
@@ -177,6 +178,13 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
      * does not have. The bitmap spans a fixed 4 GiB regardless of the
      * real amount installed. */
     frame_pool_limit_ram(top_usable);
+
+    // ── 2b½. Seed Kernel Phase 1: capability layer ───────────────────────
+    // Must run AFTER frame_pool_limit_ram(): the shared-memory arena carve
+    // (frame_pool_reserve_contiguous) scans the frame-pool bitmap for a
+    // free run, and scanning before the top bound is set would happily
+    // pick memory the machine does not have. Before any process can spawn.
+    cap_init();
 
     // ── 2c. QEMU-SLS Phase 1: shadow page table subsystem ─────────────────
     qemu_sls_mmu_init();

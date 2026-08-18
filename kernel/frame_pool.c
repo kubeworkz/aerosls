@@ -79,15 +79,49 @@ static uint64_t frames_reserved = 0;
  * could gain a third, and the failure mode is the kernel handing out its own
  * running stack as scratch memory.
  *
- * These two watermarks bound the reserved regions: everything below
- * `reserved_below` (the kernel image) and everything at or above
- * `reserved_above` (memory that does not physically exist) is machine state
- * that no partition owns and no reclaim may touch. */
+ * These watermarks bound the reserved regions: everything below
+ * `reserved_below` (the kernel image + low memory + bootstrap stack) and
+ * everything at or above `reserved_above` (memory that does not physically
+ * exist) is machine state that no partition owns and no reclaim may touch.
+ *
+ * CORRECTION (Seed Kernel Phase 2, partition teardown). The contiguous
+ * reservation -- the cap arena, the only caller of
+ * frame_pool_reserve_contiguous() -- used to fold its range into
+ * `reserved_below`, on the claim that "frames between the image and the
+ * arena were never allocatable anyway." That claim is FALSE: the allocator
+ * hands out frames in [image_end, arena_base) to processes and streams
+ * (this kernel's process frames all live below the arena), so folding made
+ * every live allocation below the arena report machine-owned, and
+ * partition_reclaim_all_frames() silently skipped all of them -- a real,
+ * permanent leak on every partition destroy. The arena range is now tracked
+ * SEPARATELY (contig_lo_frame/contig_hi_frame below), so machine-ownership
+ * is precise: the image/stack below reserved_below, the contiguous
+ * reservation itself, and absent RAM at/above reserved_above. Everything in
+ * between is real allocatable memory and is reclaimable when a partition
+ * owns it. */
 static uint64_t reserved_below = 0;              /* frames [0, reserved_below) */
 static uint64_t reserved_above = TOTAL_FRAMES;   /* frames [reserved_above, TOTAL_FRAMES) */
 
+/* The contiguous reservation made by frame_pool_reserve_contiguous() --
+ * today exactly one call site, the cap arena carve (kernel/cap.c). Kept as
+ * its own range rather than folded into reserved_below so frames BETWEEN
+ * the image and the reservation stay allocatable and reclaimable (see the
+ * correction above). BSS defaults (lo=TOTAL_FRAMES, hi=0) mean "nothing
+ * reserved". */
+static uint64_t contig_lo_frame = TOTAL_FRAMES;
+static uint64_t contig_hi_frame = 0;
+
 int frame_pool_frame_is_machine_owned(uint64_t frame_index) {
-    return frame_index < reserved_below || frame_index >= reserved_above;
+    if (frame_index < reserved_below) return 1;                       /* image + low memory + stack */
+    if (frame_index >= reserved_above) return 1;                      /* memory that does not exist */
+    if (frame_index >= contig_lo_frame && frame_index < contig_hi_frame)
+        return 1;                                                     /* the contiguous reservation */
+    return 0;
+}
+
+uint32_t frame_pool_frame_owner(uint64_t frame_index) {
+    if (frame_index >= TOTAL_FRAMES) return PARTITION_SYSTEM;
+    return frame_owner[frame_index];
 }
 
 static void fp_mark_used(uint64_t frame_index) {
@@ -197,6 +231,39 @@ void frame_pool_limit_ram(uint64_t top_addr) {
         (unsigned long long)top_addr);
 }
 
+uint64_t frame_pool_reserve_contiguous(uint64_t nframes, uint64_t align_frames) {
+    if (nframes == 0 || nframes > TOTAL_FRAMES) return 0;
+    if (align_frames == 0 || (align_frames & (align_frames - 1)) != 0)
+        return 0;   /* must be a power of two */
+    /* Candidate runs start at aligned multiples of align_frames, skipping
+     * frame 0 (address 0x0 == NULL) and any start that would overrun. */
+    uint64_t start;
+    for (start = align_frames; start + nframes <= TOTAL_FRAMES; start += align_frames) {
+        int free_run = 1;
+        for (uint64_t f = start; f < start + nframes; f++) {
+            if (physical_memory_bitmap[f / 64] & (1ULL << (f % 64))) {
+                free_run = 0;
+                break;
+            }
+        }
+        if (!free_run) continue;
+        for (uint64_t f = start; f < start + nframes; f++) fp_mark_used(f);
+        /* The reservation is machine state, exactly like the kernel image:
+         * record its OWN range so frame_pool_frame_is_machine_owned()
+         * reports true for every frame of it and partition reclamation can
+         * never touch it. Deliberately NOT folded into reserved_below --
+         * that would also mark every ALLOCATABLE frame between the image
+         * and this reservation machine-owned, and partition reclaim would
+         * skip real allocations there forever (see the correction comment
+         * on the watermarks above; caught live as partition destroy
+         * leaking every frame below the arena). */
+        if (start < contig_lo_frame) contig_lo_frame = start;
+        if (start + nframes > contig_hi_frame) contig_hi_frame = start + nframes;
+        return start * FRAME_SIZE;
+    }
+    return 0;
+}
+
 uint64_t frame_pool_reserved_count(void) { return frames_reserved; }
 
 int frame_pool_is_reserved(uint64_t frame_index) {
@@ -210,6 +277,8 @@ void frame_pool_reset(void) {
     frames_reserved = 0;
     reserved_below  = 0;
     reserved_above  = TOTAL_FRAMES;
+    contig_lo_frame = TOTAL_FRAMES;
+    contig_hi_frame = 0;
     frame_pool_stack_lo_frame = 0;
     frame_pool_stack_hi_frame = 0;
     frame_pool_stack_covered  = 0;

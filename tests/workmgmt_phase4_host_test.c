@@ -11,7 +11,11 @@
  * object_catalog/kernel_enter_ring3) it never actually calls in this test"
  * approach tests/scheduler_fairness_host_test.c already established — see
  * that file's own header comment for the full rationale. This test's stub
- * list is identical to that one's. kernel/msgqueue.c has a much smaller
+ * list is identical to that one's; the Seed Kernel Phase 1.5/2 additions
+ * (per_cpu_data, do_syscall, syscall_return_path, the Phase 2 teardown
+ * trio, stack_bottom/stack_top) are the shared tests/process_host_stubs.h
+ * included above rather than inline copies in either file, so they cannot
+ * drift again. kernel/msgqueue.c has a much smaller
  * dependency footprint (just kernel_io.h's print functions and timer.h's
  * kernel_tick_counter) so it's linked as a real, separate object file rather
  * than needing any stubs of its own.
@@ -27,6 +31,7 @@
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
 #include "kernel/msgqueue.h"
+#include "tests/process_host_stubs.h"   /* Seed Kernel Phase 1.5/2 stubs + stack pair -- shared, see its header */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -83,6 +88,7 @@ volatile uint64_t kernel_tick_counter = 0;
  * proc_table[]/proc_count globals — see scheduler_fairness_host_test.c. */
 #include "kernel/process.c"
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+
 
 /* ─── Orchestration Plan Phase 4 stub: partition_destroy()'s registry
  * cleanup. FAITHFUL, not a no-op: the real

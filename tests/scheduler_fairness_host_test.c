@@ -29,6 +29,7 @@
 #include "kernel/partition.h"
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
+#include "tests/process_host_stubs.h"   /* Seed Kernel Phase 1.5/2 stubs + stack pair -- shared, see its header */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,7 +39,12 @@
  * doesn't invoke — they exist purely so #include-ing process.c as source
  * compiles and links. Signatures must match the real headers exactly
  * (process.c includes those same headers, so a mismatch would be a
- * compile error, not a silent bug). */
+ * compile error, not a silent bug).
+ * The Seed Kernel Phase 1.5/2 additions (per_cpu_data, do_syscall,
+ * syscall_return_path, the teardown trio, stack_bottom/stack_top) are no
+ * longer inline here — they live in tests/process_host_stubs.h, included
+ * above, shared with workmgmt_phase4_host_test.c (and stack pair-only with
+ * cap_lifecycle_host_test.c) so the copies cannot drift again. */
 void kernel_serial_print(const char* s) { (void)s; }
 int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 6 addendum -- not exercised by this test, permissive "nothing to relocate" stub */
 /* Paired with the relocate/send stubs above: a test that stands in "nothing
@@ -113,15 +119,6 @@ int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; retur
  * process.c defines, rather than redefining our own. */
 #include "kernel/process.c"
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
-
-/* arch/x86/boot.asm's exported bootstrap-stack bounds. frame_pool_init() now
- * reserves [stack_bottom, stack_top) by name instead of trusting
- * _kernel_image_end to cover it, so every test that links frame_pool.c has to
- * supply them. This file does not call frame_pool_init(); see
- * frame_pool_reserve_host_test.c for why the adjacency of these two symbols
- * cannot be reproduced honestly in C. */
-char stack_bottom[16];
-char stack_top[16];
 
 
 /* ─── Orchestration Plan Phase 4 stub: partition_destroy()'s registry
