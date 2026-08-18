@@ -1,11 +1,13 @@
-/* user/examples/simi_recycle.c — Phase 14b SIMI activation-cache teardown
- * verification
+/* user/examples/simi_recycle.c — Phase 14b/14c SIMI activation-cache
+ * teardown verification
  *
  * Proves that destroying a partition reclaims the SIMI activation-cache
  * code frames its objects' spawns cached, via repeated create → assign →
- * valloc → upload-SIMI → spawn → destroy cycles from ring-3. Each cycle,
- * THIS process (spawned via HTTP while uid 1000 was unassigned, so it
- * lives in the default partition and survives every destroy below) does:
+ * valloc → upload-SIMI → spawn → destroy cycles from ring-3, and that a
+ * vfree'd (retired) activation's frames are freed the moment the LAST
+ * process mapping them exits. Each cycle, THIS process (spawned via HTTP
+ * while uid 1000 was unassigned, so it lives in the default partition and
+ * survives every destroy below) does:
  *
  *   1. sls_partition_create() — a fresh partition.
  *   2. sls_partition_assign(uid 1000) — route uid 1000 into it.
@@ -25,17 +27,11 @@
  *      SYS_SLS_EXIT stub. The second spawn is a cache HIT: same code
  *      frames mapped, fresh scratch page, no re-translation — proving the
  *      shared-frame path still works while the activation is live.
- *   6. Cycle 0 ONLY: sls_obj_vfree() — the per-object half's retire path.
- *      The activation's name is cleared (retired) while its code frames
- *      are held for the owning partition's destroy. The destroy below must
- *      still reclaim them: the boot check asserts the activation vfree
- *      line appears at destroy time even though the object itself was
- *      already vfree'd.
- *   7. sls_partition_destroy() — kills any remaining process, vfrees the
+ *   6. sls_partition_destroy() — kills any remaining process, vfrees the
  *      catalog objects / binary slots, and (Phase 14b) frees this
  *      partition's SIMI activation code frames via simi_vfree_partition().
  *
- * The tooth is arithmetic: the activation cache has 16 slots
+ * The destroy tooth is arithmetic: the activation cache has 16 slots
  * (SIMI_MAX_ACTIVATIONS == MAX_SERVICE_BINARIES). Every cycle uses a
  * unique object name (simo0..simo17). WITHOUT the destroy-time activation
  * free, the slots fill up and cycle 16's spawn logs "activation table is
@@ -43,6 +39,15 @@
  * line's absence and for 18 per-cycle activation-vfree lines. WITH the
  * fix, every destroy returns its partition's slots and all 18 cycles stay
  * cached.
+ *
+ * The Phase 14c eager-free probe (after the 18 cycles) proves the
+ * refcount half: a gated (HELD) async spawn maps the translated frames
+ * with mappers=1 but never runs; the object is then vfree'd while that
+ * mapper is LIVE — the activation must be RETIRED (frames held), not
+ * freed — and killing the held child drops the refcount to 0, which must
+ * free the frames IMMEDIATELY (the kernel logs "last mapper exited"),
+ * not at the probe partition's destroy. The boot check greps for both
+ * log lines.
  *
  * Build:
  *   make user-programs
@@ -61,6 +66,12 @@
 #define DEMO_UID 1000
 /* 16 cache slots + 2: cycles 16-17 are the tooth (see header comment). */
 #define CYCLES   18
+
+/* SYS_SLS_PROC_KILL (161) — the kernel's syscall_dispatch.c dispatches it
+ * with the pid as the bare argument (0 = self), no request struct. Not in
+ * sls.h (the demo binary hardcodes it); keep the number in sync with
+ * kernel/syscall_dispatch.c. */
+#define SLS_SYS_PROC_KILL 161
 
 static void put_u32(uint32_t v) {
     char buf[12];
@@ -165,19 +176,7 @@ int main(void) {
             return 1;
         }
 
-        /* 6. Cycle 0 only: exercise the per-object half — vfree the
-         * object while its activation is still cached. The activation is
-         * RETIRED (name cleared, frames held); the destroy in step 7 must
-         * still reclaim the frames (the boot check greps for the
-         * activation-vfree line at destroy time). */
-        if (cycle == 0) {
-            if (sls_obj_vfree(obj_name) != 0) {
-                sls_puts("[sirc] vfree (retire) FAILED at cycle 0\n");
-                return 1;
-            }
-        }
-
-        /* 7. Destroy the partition — kills any remaining process, vfrees
+        /* 6. Destroy the partition — kills any remaining process, vfrees
          * its catalog objects / binary slots, and frees this partition's
          * SIMI activation code frames (Phase 14b). */
         if (sls_partition_destroy((uint32_t)part_id) != 0) {
@@ -190,6 +189,55 @@ int main(void) {
         sls_puts("[sirc] cycle ");
         put_u32(cycle);
         sls_puts(" ok\n");
+    }
+
+    /* ── Phase 14c probe: eager free on the last mapper's exit ─────────────
+     *
+     * Proves the mapper refcount reclaims a retired activation's frames
+     * the moment the last live mapper dies, not at partition destroy.
+     * Sequence: gated async spawn (the child is HELD — never scheduled —
+     * but its page table ALREADY maps the translated code frames, so the
+     * activation's mappers=1), vfree the object while that mapper is live
+     * (the activation must be RETIRED, frames held — the kernel logs
+     * "retired, 1 live mapper(s)"), then kill the held child (its
+     * teardown walk decrements mappers to 0, which must free the frames
+     * NOW — the kernel logs "last mapper exited"). The probe partition's
+     * destroy then has nothing SIMI left to free: the boot check asserts
+     * the eager-free line exists and that the probe contributes no
+     * destroy-time activation-vfree line. */
+#define EAGER_OBJ "simoeager"
+    {
+        char pname[32];
+        build_name(pname, "seager", 0);
+        uint64_t pid3 = sls_partition_create(pname);
+        int probe_ok = 0;
+        if (pid3 != SLS_PARTITION_INVALID_ID &&
+            sls_partition_assign(DEMO_UID, (uint32_t)pid3) == 0) {
+            uint64_t oid = 0;
+            if (sls_obj_valloc(EAGER_OBJ, SLS_OBJ_PROGRAM, 4 /* pages */,
+                               DEMO_UID,
+                               SLS_PERM_READ | SLS_PERM_EXECUTE | SLS_PERM_OWNER,
+                               0 /* partition: default to owner's */,
+                               &oid) == 0 &&
+                sls_upload_binary(EAGER_OBJ, SIMI_RECYCLE_TMO_BLOB,
+                                  SIMI_RECYCLE_TMO_BLOB_LEN, 0, 1) == 0) {
+                uint64_t held = sls_program_spawn_nb_held(EAGER_OBJ);
+                if (held != 0 &&
+                    sls_obj_vfree(EAGER_OBJ) == 0 &&
+                    _sls_syscall(SLS_SYS_PROC_KILL,
+                                 (void*)(uintptr_t)held) == 0) {
+                    probe_ok = 1;
+                }
+            }
+        }
+        if (pid3 != SLS_PARTITION_INVALID_ID)
+            sls_partition_destroy((uint32_t)pid3);
+        if (probe_ok) {
+            sls_puts("[sirc] eager-free probe DONE\n");
+        } else {
+            sls_puts("[sirc] eager-free probe FAILED\n");
+            fail = 1;
+        }
     }
 
     sls_puts(fail ? "[sirc] done (FAILURES)\n"

@@ -14,9 +14,16 @@
 # MISS (translate + cache + map), the second a HIT (reuse the shared code
 # frames) — so the check also proves the shared-frame path survives
 # teardown and that per-process teardown still skips the cached frames
-# (simi_frame_is_cached). Cycle 0 additionally vfrees the object before
-# destroy, exercising the retire path: the activation-vfree line must still
-# appear at destroy time (frames held until destroy, then reclaimed).
+# (simi_frame_is_cached).
+#
+# After the 18 cycles, simi_recycle runs the Phase 14c eager-free probe:
+# a HELD async spawn maps the frames (mappers=1), the object is vfree'd
+# while that mapper is live (activation RETIRED, frames held — the kernel
+# must log "retired, 1 live mapper(s)", NOT a free), then the held child
+# is killed — its teardown walk drops the refcount to 0, which must free
+# the frames IMMEDIATELY (the kernel logs "last mapper exited"), not at
+# the probe partition's destroy (which must contribute no destroy-time
+# activation-vfree line).
 #
 # GUARD-KIND: runtime (needs the built ISO + QEMU + a serial pipe).
 #
@@ -124,10 +131,14 @@ else
     echo "ok:   $hit_n activation-cache HIT (shared code frames reused)"
 fi
 # The Phase 14b destroy-time story: every destroy must free its
-# partition's activation code frames — one vfree line per cycle (cycle 0
-# included: the object was retired by vfree, but the frames are held until
-# destroy, so the line still appears at destroy time).
-simi_vfree_n=$(grep -ac "\[SIMI\] activation vfree (partition .* teardown)" boot_simi.log)
+# partition's activation code frames — exactly one vfree line per cycle
+# (18 total; the eager-free probe's activation is freed BEFORE its
+# partition's destroy, so it must contribute none).
+# Count only the real frees — exclude the defensive WARNING lines that a
+# broken refcount produces ("frames NOT freed"), so a sabotage can't
+# inflate this count into a false pass.
+simi_vfree_n=$(grep -a "\[SIMI\] activation vfree (partition .* teardown)" boot_simi.log \
+               | grep -av 'WARNING' | wc -l)
 if [ "$simi_vfree_n" -lt 18 ]; then
     echo "FAILED: expected >=18 SIMI activation vfree lines, saw $simi_vfree_n" >&2
     grep -a "SIMI\].*activation vfree\|sirc\]" boot_simi.log | tail -20 >&2
@@ -135,11 +146,36 @@ if [ "$simi_vfree_n" -lt 18 ]; then
 else
     echo "ok:   $simi_vfree_n SIMI activation code-frame frees at teardown"
 fi
-# Cycle 0's retire path: the object was vfree'd before destroy, so its
-# activation vfree line must carry the "<retired>" marker (name cleared).
-grep -aq "\[SIMI\] activation vfree (partition .* teardown): '<retired>'" boot_simi.log || {
-    echo "FAILED: cycle 0's retired activation was not reclaimed at destroy" >&2
-    grep -a "SIMI\].*activation vfree" boot_simi.log | head -10 >&2
+# Phase 14c eager-free probe, step 1: vfree while a mapper is LIVE must
+# retire (hold the frames), not free them — the kernel logs the retired
+# line with the live-mapper count.
+grep -aq "\[SIMI\] activation vfree (object vfree): 'simoeager' — retired, 1 live mapper(s)" boot_simi.log || {
+    echo "FAILED: vfree with a live mapper did not retire the activation (frames freed early?)" >&2
+    grep -a "SIMI\].*vfree" boot_simi.log | head -10 >&2
+    fail=1
+}
+# Phase 14c eager-free probe, step 2: killing the held child must drop the
+# refcount to 0 and free the frames IMMEDIATELY — the kernel logs the
+# "last mapper exited" line, and the probe's destroy must NOT log a
+# destroy-time vfree for 'simoeager' (nothing left to free).
+grep -aq "\[SIMI\] activation vfree (last mapper exited): 'simoeager'" boot_simi.log || {
+    echo "FAILED: last mapper's exit did not free the retired activation eagerly" >&2
+    grep -a "SIMI\].*vfree\|sirc\] eager" boot_simi.log | tail -10 >&2
+    fail=1
+}
+grep -aq "\[SIMI\] activation vfree (partition .* teardown): 'simoeager'" boot_simi.log && {
+    echo "FAILED: 'simoeager' frames were freed at destroy, not when the last mapper exited" >&2
+    grep -a "SIMI\].*vfree" boot_simi.log | head -10 >&2
+    fail=1
+}
+grep -aq "\[sirc\] eager-free probe DONE" boot_simi.log || {
+    echo "FAILED: eager-free probe did not complete" >&2
+    grep -a "sirc\] eager\|SIMI\].*vfree" boot_simi.log | tail -10 >&2
+    fail=1
+}
+# The probe program itself must not have reported failure.
+grep -aq "\[sirc\] eager-free probe FAILED" boot_simi.log && {
+    echo "FAILED: eager-free probe reported failure" >&2
     fail=1
 }
 # The arithmetic tooth: with 18 unique object names against a 16-slot
