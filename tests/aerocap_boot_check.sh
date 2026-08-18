@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Boot the ISO under QEMU with the NIC, upload user/examples/cap_roundtrip.bin
-# through the kernel's HTTP API (hostfwd localhost:3001 -> guest :3000), spawn
+# through the kernel's HTTP API (hostfwd localhost:3011 -> guest :3000), spawn
 # the ring-3 program, and verify the libaerocap SDK lifecycle from its serial
 # output. Phases 2-3 add the two-party handoff and the live-overlap
 # (Phase 1.5) flows; Phase 4 verifies Phase-2 teardown with 20 repeated
@@ -19,6 +19,18 @@ mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
 
 cat "$SER.out" > boot_aerocap.log &
 CATPID=$!
+
+# The binaries this check uploads are gitignored build artifacts
+# (user/examples/*.bin), so a fresh checkout — the server's deploy gate,
+# CI, a new clone — has none, and program_upload.py fails reading them.
+# Build on the spot: host gcc + objcopy, no cross toolchain (the Makefile's
+# "user-programs" rules; the embedded blob headers regenerate via xxd and
+# the SIMI host tools when their sources are newer). Fails fast, before
+# QEMU boots.
+make user-programs || {
+    echo "FAILED: could not build the ring-3 programs (make user-programs)" >&2
+    exit 1;
+}
 
 # The storage image this check boots is a PRIVATE FRESH one in a temp dir,
 # deleted on exit — never the repo's sls_storage.img. Why:
@@ -62,7 +74,7 @@ fi
 qemu-system-x86_64 -cdrom sls_operating_system.iso \
     -drive id=disk,file="$IMG",if=none,format=raw \
     -device nvme,drive=disk,serial=slsdev0 \
-    -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+    -netdev user,id=net0,hostfwd=tcp::3011-:3000 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -display none -m 4G -smp 4 -boot d -no-reboot \
     $ACCEL \
@@ -93,14 +105,15 @@ done
 
 # Give the e1000/DHCP a moment to settle, then upload the ring-3 example.
 sleep 2
-python3 utils/program_upload.py --file user/examples/cap_roundtrip.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_roundtrip.bin \
                                 --name cap_roundtrip >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_roundtrip" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
 
 # Spawn it via the HTTP API.
-curl -s --max-time 300 -X POST http://localhost:3001/api/program/spawn \
+curl -s --max-time 300 -X POST http://localhost:3011/api/program/spawn \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
      -d '{"name":"cap_roundtrip"}' >/dev/null 2>&1 || {
@@ -115,17 +128,19 @@ sleep 8
 # Upload both binaries, then spawn the parent; the parent spawns the child
 # itself via SYS_SLS_PROGRAM_SPAWN (synchronous: child runs to completion,
 # parent resumes). Same boot, same QEMU.
-python3 utils/program_upload.py --file user/examples/cap_peer.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_peer.bin \
                                 --name cap_peer >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_peer" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
-python3 utils/program_upload.py --file user/examples/cap_two_party.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_two_party.bin \
                                 --name cap_two_party >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_two_party" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
-curl -s --max-time 300 -X POST http://localhost:3001/api/program/spawn \
+curl -s --max-time 300 -X POST http://localhost:3011/api/program/spawn \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
      -d '{"name":"cap_two_party"}' >/dev/null 2>&1 || {
@@ -141,17 +156,19 @@ sleep 8
 # spins (proving both are live), sends a 'done' marker, and exits; the parent
 # resumes inside its recv, reads 'Hello' back, re-parks for the marker, and
 # tears down.
-python3 utils/program_upload.py --file user/examples/cap_peer_ovl.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_peer_ovl.bin \
                                 --name cap_peer_ovl >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_peer_ovl" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
-python3 utils/program_upload.py --file user/examples/cap_overlap.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_overlap.bin \
                                 --name cap_overlap >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_overlap" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
-curl -s --max-time 300 -X POST http://localhost:3001/api/program/spawn \
+curl -s --max-time 300 -X POST http://localhost:3011/api/program/spawn \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
      -d '{"name":"cap_overlap"}' >/dev/null 2>&1 || {
@@ -169,23 +186,25 @@ sleep 8
 # bindings fails the loop itself; the /api/metrics frame count must not
 # grow across the whole loop.
 metrics_frames() {
-    curl -s --max-time 300 http://localhost:3001/api/metrics \
+    curl -s --max-time 300 http://localhost:3011/api/metrics \
          -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
          2>/dev/null | sed -n 's/.*"ram_allocated_frames":\([0-9]*\).*/\1/p'
 }
 frames_before=$(metrics_frames)
 
-python3 utils/program_upload.py --file user/examples/cap_recycle_child.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_recycle_child.bin \
                                 --name cap_recycle_child >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_recycle_child" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
-python3 utils/program_upload.py --file user/examples/cap_recycle.bin \
+python3 utils/program_upload.py --host http://localhost:3011 \
+                                --file user/examples/cap_recycle.bin \
                                 --name cap_recycle >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload cap_recycle" >&2
     kill "$QPID" 2>/dev/null; exit 1;
 }
-curl -s --max-time 300 -X POST http://localhost:3001/api/program/spawn \
+curl -s --max-time 300 -X POST http://localhost:3011/api/program/spawn \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
      -d '{"name":"cap_recycle"}' >/dev/null 2>&1 || {

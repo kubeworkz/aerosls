@@ -31,6 +31,18 @@ mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
 cat "$SER.out" > boot_part.log &
 CATPID=$!
 
+# The binaries this check uploads are gitignored build artifacts
+# (user/examples/*.bin), so a fresh checkout — the server's deploy gate,
+# CI, a new clone — has none, and program_upload.py fails reading them.
+# Build on the spot: host gcc + objcopy, no cross toolchain (the Makefile's
+# "user-programs" rules; the embedded blob headers regenerate via xxd and
+# the SIMI host tools when their sources are newer). Fails fast, before
+# QEMU boots.
+make user-programs || {
+    echo "FAILED: could not build the ring-3 programs (make user-programs)" >&2
+    exit 1;
+}
+
 # The storage image this check boots is a PRIVATE FRESH one in a temp dir,
 # deleted on exit — never the repo's sls_storage.img. Why:
 #   1. The deploy gate (deploy/deploy.sh) runs these checks while the live
