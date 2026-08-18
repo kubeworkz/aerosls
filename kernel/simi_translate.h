@@ -55,15 +55,29 @@ void simi_activation_info(const char* object_name);
  *     the code frames are SHARED across all of the activation's mappers.
  *
  *   simi_vfree_object(name) — the per-object half, called from
- *     loader_vfree(). Does NOT free the frames: it RETIRES the slot
- *     (clears the name so no future find_activation() can match it; keeps
- *     partition_id + frames so the owning partition's destroy still
- *     reclaims them exactly once). Retiring — not freeing — is what keeps
- *     "an activation's frames are only mapped by processes in the
- *     activation's own partition" true across name reuse, and what keeps
- *     the destroy-time free safe even if a vfree races a live mapper.
- *     Returns 1 if a slot was retired, 0 if no activation existed. */
+ *     loader_vfree(). RETIRES the slot (the retired flag makes it
+ *     unmatchable by future find_activation() calls, so a re-valloc'd
+ *     object of the same name translates fresh instead of inheriting a
+ *     stale cross-partition activation), then frees the frames at the
+ *     earliest safe moment: immediately if no process maps them, or the
+ *     moment the LAST mapper's teardown walk drops the Phase 14c mapper
+ *     refcount to 0 (see simi_frame_is_cached()); the owning partition's
+ *     destroy remains the backstop. Retiring — never freeing while a
+ *     mapper is live — is what keeps "an activation's frames are only
+ *     mapped by processes in the activation's own partition" true across
+ *     name reuse, and what keeps the destroy-time free safe even if a
+ *     vfree races a live mapper. Returns 1 if a slot was retired/freed,
+ *     0 if no activation existed. */
 uint32_t simi_vfree_partition(uint32_t partition_id);
 uint32_t simi_vfree_object(const char* name);
+
+/* Phase 14c: the per-process page-table teardown hook. Returns 1 if
+ * `paddr` is one of the SHARED cached code frames (the walker must skip
+ * freeing it), 0 otherwise. When `seen` is non-NULL (a per-walk uint32_t
+ * bitmap the walker carries), a hit also accounts this process's mapping
+ * of the owning activation exactly once — decrementing the mapper
+ * refcount and, if that was the LAST mapper of a RETIRED activation,
+ * freeing its frames immediately. See the .c file for the full comment. */
+int simi_frame_is_cached(uint64_t paddr, uint32_t* seen);
 
 #endif /* SIMI_TRANSLATE_H */

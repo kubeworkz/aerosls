@@ -82,6 +82,26 @@ static uint8_t g_simi_code_buf[SIMI_CODE_BUF_SIZE];
 struct SimiActivation {
     char     object_name[PROC_NAME_LEN];   /* [0] == '\0' means unused slot */
     uint8_t  valid;
+    // Phase 14c (LPAR eager-free SIMI cache story): 1 = this slot's frames
+    // are held only for its live mappers, not for future cache hits — set
+    // by simi_vfree_object() on an object whose activation is still mapped
+    // by a live process. A retired slot keeps its object_name (for logs /
+    // diagnostics) but tt_find_activation()/simi_activation_query() skip
+    // it, so it can never serve a future spawn of the same name. When the
+    // LAST mapper's teardown drops mappers to 0, the frames are freed
+    // immediately (see simi_frame_is_cached()); the owning partition's
+    // destroy frees any that outlive every mapper.
+    uint8_t  retired;
+    // Phase 14c: number of live processes currently mapping this
+    // activation's shared code frames. Incremented on every successful
+    // simi_translate_and_map() (MISS and HIT — each spawn maps the code
+    // pages), decremented exactly once per process per activation by the
+    // per-process page-table teardown walker (simi_frame_is_cached()'s
+    // `seen` bitmap), which is also where mappers==0 && retired triggers
+    // the eager frame free. A VALID, non-retired activation sits at
+    // mappers==0 between spawns — that is the cache's resting state, NOT
+    // a free trigger; only retired slots are freed on 0.
+    uint32_t mappers;
     // Phase 14b (LPAR destroy-time SIMI cache story): the partition that
     // owns this activation, captured at translation time from the
     // ServiceBinary's partition_id (loader.c re-tags that field from the
@@ -134,7 +154,7 @@ static uint32_t tt_fnv1a(const uint8_t* data, uint32_t len) {
 
 static struct SimiActivation* tt_find_activation(const char* object_name) {
     for (int i = 0; i < SIMI_MAX_ACTIVATIONS; i++) {
-        if (g_activations[i].object_name[0] &&
+        if (g_activations[i].object_name[0] && !g_activations[i].retired &&
             tt_streq(g_activations[i].object_name, object_name)) {
             return &g_activations[i];
         }
@@ -146,7 +166,11 @@ static struct SimiActivation* tt_find_or_alloc_activation(const char* object_nam
     struct SimiActivation* act = tt_find_activation(object_name);
     if (act) return act;
     for (int i = 0; i < SIMI_MAX_ACTIVATIONS; i++) {
-        if (!g_activations[i].object_name[0]) {
+        /* Phase 14c: a retired slot keeps its object_name, so it fails the
+         * name-empty check anyway; the !retired guard is belt-and-suspenders
+         * so a retired slot can never be recycled into a live cache entry
+         * (its frames belong to the retiring object's mappers). */
+        if (!g_activations[i].object_name[0] && !g_activations[i].retired) {
             tt_strcpy(g_activations[i].object_name, object_name, PROC_NAME_LEN);
             return &g_activations[i];
         }
@@ -170,6 +194,8 @@ int simi_activation_query(const char* object_name, struct SimiActivationStatus* 
     return 1;
 }
 
+static void simi_activation_slot_reset(struct SimiActivation* act);
+
 /* Phase 2 (Seed Kernel teardown): is this physical frame one of the SHARED
  * cached SIMI code pages? The activation cache's code frames are mapped
  * into every process that spawns the object (correct only because
@@ -180,14 +206,54 @@ int simi_activation_query(const char* object_name, struct SimiActivationStatus* 
  * gets a fresh frame) and is therefore NOT reported here — teardown frees
  * it as an ordinary owned leaf. Scans the valid activation slots' frame[]
  * arrays; O(SIMI_MAX_ACTIVATIONS * SIMI_ACT_MAX_PAGES) worst case, called
- * once per leaf PTE during teardown only. */
-int simi_frame_is_cached(uint64_t paddr) {
+ * once per leaf PTE during teardown only.
+ *
+ * Phase 14c: when `seen` is non-NULL (the teardown walker passes a
+ * per-walk uint32_t bitmap), a hit also ACCOUNTS this process's mapping
+ * of the activation exactly once: the walker visits every code page as a
+ * separate leaf, so without the bitmap it would decrement mappers once
+ * per page; the bitmap makes it once per process per activation. The
+ * decrement is where the eager free fires: a RETIRED activation whose
+ * last mapper just exited has dead-weight frames, so they are freed here
+ * instead of waiting for the owning partition's destroy (see the Phase
+ * 14c comment block). A valid, non-retired activation reaching mappers==0
+ * is just the cache's resting state between spawns — nothing is freed.
+ * Callers that only want the boolean (no process context) pass NULL. */
+int simi_frame_is_cached(uint64_t paddr, uint32_t* seen) {
     if (paddr == 0) return 0;
     for (int i = 0; i < SIMI_MAX_ACTIVATIONS; i++) {
         const struct SimiActivation* act = &g_activations[i];
         if (!act->valid) continue;
         for (uint32_t p = 0; p < act->code_pages; p++) {
-            if (act->frame[p] == paddr) return 1;
+            if (act->frame[p] == paddr) {
+                if (seen && !(*seen & (1u << i))) {
+                    *seen |= (1u << i);
+                    struct SimiActivation* a = &g_activations[i];
+                    if (a->mappers > 0) a->mappers--;
+                    if (a->mappers == 0 && a->retired) {
+                        /* Last mapper of a retired activation exited: its
+                         * frames can never serve a future spawn (retired
+                         * slots never match find_activation) and no process
+                         * maps them anymore — free now, reclaiming the
+                         * memory at the earliest safe moment instead of at
+                         * the owning partition's destroy. Safe mid-walk:
+                         * the walker already decided to skip this leaf, the
+                         * frames are not aliased anywhere else in this
+                         * address space, and the walk runs with IF=0 so no
+                         * allocation can re-hand them in between. */
+                        kernel_serial_printf(
+                            "[SIMI] activation vfree (last mapper exited): "
+                            "'%s' (%u code page(s))\n",
+                            a->object_name, (unsigned)a->code_pages);
+                        for (uint32_t q = 0; q < a->code_pages; q++) {
+                            free_physical_ram_frame(
+                                (void*)(uintptr_t)a->frame[q]);
+                        }
+                        simi_activation_slot_reset(a);
+                    }
+                }
+                return 1;
+            }
         }
     }
     return 0;
@@ -252,6 +318,8 @@ uint64_t simi_translate_and_map(const char* object_name, uint64_t base_vaddr, ui
         user_map_page(pml4, scratch_vaddr, (uint64_t)(uintptr_t)scratch_frame,
                       USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE | USER_PTE_NOEXEC);
 
+        /* Phase 14c: this process now maps the shared code frames. */
+        act->mappers++;
         kernel_serial_printf(
             "[SIMI] '%s' activation cache HIT — reused %u page(s), skipped "
             "translation, fresh scratch page @0x%016lx, entry @0x%016lx\n",
@@ -383,6 +451,8 @@ uint64_t simi_translate_and_map(const char* object_name, uint64_t base_vaddr, ui
     if (act) {
         act->valid         = 1;
         act->partition_id  = sb->partition_id;   /* Phase 14b: tag at stash */
+        act->retired       = 0;   /* Phase 14c: a recycled slot starts live */
+        act->mappers       = 1;   /* Phase 14c: this spawn maps the frames */
         act->content_hash  = hash;
         act->content_size  = sb->size;
         act->code_pages    = total_pages;
@@ -434,24 +504,38 @@ uint64_t simi_translate_and_map(const char* object_name, uint64_t base_vaddr, ui
 //   the partition's processes are gone — that is guaranteed by the caller
 //   (loader_vfree_partition() runs in partition_destroy()'s Step 2).
 //
-// The per-object half (simi_vfree_object) deliberately RETIRES instead of
-// freeing: a vfree can be issued while the object's activation is still
-// mapped by live processes (nothing in the syscall ABI forbids it — today's
-// synchronous spawns can't reach it, but async SIMI spawns would), and
-// freeing shared frames out from under a live mapper is exactly the crash
-// simi_frame_is_cached() exists to prevent. Retiring clears the name so the
-// slot can never match a future find_activation() — a re-valloc'd object of
-// the same name therefore translates fresh instead of inheriting a stale
-// cross-partition activation, which is what keeps invariant (1) above true
-// across name reuse — while partition_id and the frames are kept so the
-// owning partition's destroy still reclaims them exactly once. Retired
-// frames therefore outlive the vfree until partition destroy: a deliberate,
-// bounded retention — never a use-after-free, reclaimed once at destroy.
+// The per-object half (simi_vfree_object) RETIRES instead of freeing: a
+// vfree can be issued while the object's activation is still mapped by
+// live processes (nothing in the syscall ABI forbids it), and freeing
+// shared frames out from under a live mapper is exactly the crash
+// simi_frame_is_cached() exists to prevent. Retiring sets the retired
+// flag so the slot can never match a future find_activation() — a
+// re-valloc'd object of the same name therefore translates fresh instead
+// of inheriting a stale cross-partition activation, which is what keeps
+// invariant (1) above true across name reuse.
+//
+// Phase 14c (the eager-free refinement): the retire was originally a
+// hold-until-partition-destroy retention — safe, but it kept dead-weight
+// frames alive arbitrarily long for a vfree'd object nobody spawns
+// anymore. This phase tracks exactly how many live processes map each
+// activation (mappers, incremented on every successful spawn, decremented
+// once per process by the teardown walker via simi_frame_is_cached()'s
+// seen-bitmap) and frees a retired activation's frames at the EARLIEST
+// safe moment: immediately if no mapper is live at vfree time, otherwise
+// the moment the last mapper's teardown walk drops mappers to 0. The
+// owning partition's destroy remains the backstop (simi_vfree_partition
+// matches retired slots too), so a retired activation is reclaimed exactly
+// once — either eagerly or at destroy, never twice, never while a live
+// process maps it. A valid, non-retired activation sits at mappers==0
+// between spawns; that is the cache's resting state and is NOT a free
+// trigger.
 
 static void simi_activation_slot_reset(struct SimiActivation* act) {
     tt_memset(act->frame, 0, sizeof(act->frame));
     act->object_name[0] = '\0';
     act->valid          = 0;
+    act->retired        = 0;   /* Phase 14c */
+    act->mappers        = 0;   /* Phase 14c */
     act->partition_id   = 0;
     act->content_hash   = 0;
     act->content_size   = 0;
@@ -466,13 +550,32 @@ uint32_t simi_vfree_partition(uint32_t partition_id) {
         if (!act->valid) continue;
         if (act->partition_id != partition_id) continue;
         /* Matches valid AND retired slots: retirement (simi_vfree_object)
-         * clears the name but keeps valid + partition_id + frames, so the
-         * owning partition's destroy reclaims the frames exactly once. */
+         * keeps valid + partition_id + frames, so the owning partition's
+         * destroy reclaims the frames exactly once (any slot whose last
+         * mapper already exited was freed eagerly by Phase 14c — see
+         * simi_frame_is_cached()). */
+        if (act->mappers > 0) {
+            /* Should be unreachable: partition_destroy() Step 1 killed
+             * every process in this partition (and, per the partition
+             * boundary, every possible mapper of this activation) before
+             * this Step-2 pass runs, and each kill's teardown walk
+             * decremented mappers to 0. If it DOES happen, the safety
+             * argument that makes destroy-time free safe is broken —
+             * refuse rather than yank the frames out from under a live
+             * process, and make the invariant violation loud instead of
+             * a silent corruption. The frames are leaked (bounded) so the
+             * live mapper keeps running. */
+            kernel_serial_printf(
+                "[SIMI] activation vfree (partition %u teardown): WARNING "
+                "'%s' still has %u live mapper(s) — frames NOT freed\n",
+                (unsigned)partition_id, act->object_name,
+                (unsigned)act->mappers);
+            continue;
+        }
         kernel_serial_printf(
             "[SIMI] activation vfree (partition %u teardown): '%s' "
             "(%u code page(s))\n",
-            (unsigned)partition_id,
-            act->object_name[0] ? act->object_name : "<retired>",
+            (unsigned)partition_id, act->object_name,
             (unsigned)act->code_pages);
         for (uint32_t p = 0; p < act->code_pages; p++) {
             free_physical_ram_frame((void*)(uintptr_t)act->frame[p]);
@@ -487,11 +590,30 @@ uint32_t simi_vfree_object(const char* name) {
     if (!name || !name[0]) return 0;
     struct SimiActivation* act = tt_find_activation(name);
     if (!act || !act->valid) return 0;
-    kernel_serial_printf(
-        "[SIMI] activation vfree (object vfree): '%s' — retired (%u code "
-        "page(s) held until partition destroy)\n",
-        name, (unsigned)act->code_pages);
-    /* Retire, don't free — see the Phase 14b comment block above. */
-    act->object_name[0] = '\0';
+    /* Phase 14c: retire the slot (so no future find_activation() can match
+     * it — a re-valloc'd object of the same name translates fresh instead
+     * of inheriting a stale cross-partition activation), then free the
+     * frames at the earliest SAFE moment. That moment is now if no live
+     * process maps them; otherwise it is when the LAST mapper's teardown
+     * walk drops mappers to 0 (simi_frame_is_cached()'s eager free), with
+     * the owning partition's destroy as the backstop. Never free while a
+     * mapper is live: that is exactly the crash simi_frame_is_cached()
+     * exists to prevent. */
+    act->retired = 1;
+    if (act->mappers == 0) {
+        kernel_serial_printf(
+            "[SIMI] activation vfree (object vfree): '%s' — no live "
+            "mappers, %u code page(s) freed immediately\n",
+            name, (unsigned)act->code_pages);
+        for (uint32_t p = 0; p < act->code_pages; p++) {
+            free_physical_ram_frame((void*)(uintptr_t)act->frame[p]);
+        }
+        simi_activation_slot_reset(act);
+    } else {
+        kernel_serial_printf(
+            "[SIMI] activation vfree (object vfree): '%s' — retired, %u "
+            "live mapper(s); %u code page(s) freed when the last one exits\n",
+            name, (unsigned)act->mappers, (unsigned)act->code_pages);
+    }
     return 1;
 }

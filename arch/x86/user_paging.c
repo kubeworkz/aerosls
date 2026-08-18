@@ -17,7 +17,7 @@ extern void* allocate_physical_ram_frame(void);
  * process's address space. Forward-declared here, same style as the
  * allocate_physical_ram_frame extern above, to avoid pulling simi_x86.h's
  * dependency tree into the page-table unit. */
-extern int simi_frame_is_cached(uint64_t paddr);
+extern int simi_frame_is_cached(uint64_t paddr, uint32_t* seen);
 
 struct PerCPUData per_cpu_data[4];
 
@@ -232,7 +232,7 @@ static int user_frame_refused(uint64_t pa) {
     return 0;
 }
 
-static uint32_t user_free_subtree(uint64_t* tbl, int depth) {
+static uint32_t user_free_subtree(uint64_t* tbl, int depth, uint32_t* seen) {
     uint32_t freed = 0;
     for (int i = 0; i < 512; i++) {
         uint64_t e = tbl[i];
@@ -243,7 +243,13 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth) {
          * depth check first.) */
         if (depth >= 3 || (depth > 0 && (e & 0x80))) {
             uint64_t pa = e & USER_PTE_FRAME_MASK;
-            if (!user_frame_refused(pa) && !simi_frame_is_cached(pa) &&
+            /* Phase 14c: `seen` (a per-walk bitmap owned by
+             * user_destroy_page_table) makes the cached-frame check also
+             * account this process's mapping of each SIMI activation
+             * exactly once — a process maps every code page of an
+             * activation, so without it the walker would decrement the
+             * mapper refcount once per page. See simi_frame_is_cached(). */
+            if (!user_frame_refused(pa) && !simi_frame_is_cached(pa, seen) &&
                 free_physical_ram_frame_for_partition(
                     (void*)(uintptr_t)pa,
                     frame_pool_frame_owner(pa / 4096)) == 0) {
@@ -254,7 +260,7 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth) {
         /* Intermediate table: recurse first (its children are read before
          * anything is freed), then free the table frame itself. */
         uint64_t* child = (uint64_t*)(uintptr_t)(e & USER_PTE_FRAME_MASK);
-        freed += user_free_subtree(child, depth + 1);
+        freed += user_free_subtree(child, depth + 1, seen);
         uint64_t cpa = (uint64_t)(uintptr_t)child;
         if (!user_frame_refused(cpa) &&
             free_physical_ram_frame_for_partition(
@@ -268,7 +274,8 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth) {
 void user_destroy_page_table(uint64_t pml4_phys) {
     if (!pml4_phys) return;
     uint64_t* pml4 = (uint64_t*)(uintptr_t)pml4_phys;
-    uint32_t freed = user_free_subtree(pml4, 0);   /* user half: tables + leaves */
+    uint32_t seen = 0;   /* Phase 14c: SIMI-activation bitmap for this walk */
+    uint32_t freed = user_free_subtree(pml4, 0, &seen);   /* user half */
     if (!user_frame_refused(pml4_phys) &&
         free_physical_ram_frame_for_partition(
             (void*)(uintptr_t)pml4_phys,

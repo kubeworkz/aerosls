@@ -236,10 +236,12 @@ uint32_t loader_vfree_partition(uint32_t partition_id);
 // name starts byte-for-byte fresh instead of inheriting the previous
 // binary's size/format state. Returns 1 if a slot was freed (persisting
 // via persist_programs()), 0 if the object was never uploaded.
-// Phase 14b: also RETIRES the object's SIMI activation via
-// simi_vfree_object() (name cleared, frames held until the owning
-// partition's destroy reclaims them) — see simi_translate.h for why
-// retiring beats freeing on the per-object path.
+// Phase 14b/14c: also RETIRES the object's SIMI activation via
+// simi_vfree_object() (unmatchable by future spawns, frames freed at the
+// earliest safe moment: immediately if no process maps them, otherwise
+// when the LAST mapper's teardown drops the refcount to 0, with the
+// owning partition's destroy as backstop) — see simi_translate.h for why
+// retiring beats freeing while a mapper is live.
 uint32_t loader_vfree(const char* name);
 
 // Load the binary for the named SERVICE_PROCESS object into the process's page
