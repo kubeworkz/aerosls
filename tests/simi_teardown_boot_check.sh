@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Boot the ISO under QEMU with the NIC, upload simi_recycle.bin, spawn it
+# through the HTTP API with dave's token (uid 1000), and verify the
+# Phase 14b (LPAR) SIMI activation-cache destroy-time story: each
+# create -> assign(uid 1000) -> valloc -> upload-SIMI -> spawn -> destroy
+# cycle must reclaim the SIMI activation-cache code frames its spawns
+# cached, proven by (a) 18 per-cycle "[SIMI] activation vfree" lines,
+# (b) the absence of "activation table is full" — the arithmetic tooth:
+# the cache has 16 slots and the 18 cycles use 18 unique object names, so
+# without the destroy-time free cycle 16 would fill the table — and
+# (c) a system-wide frame-count stability assertion across the loop.
+#
+# Each cycle spawns the SIMI object TWICE: the first is an activation-cache
+# MISS (translate + cache + map), the second a HIT (reuse the shared code
+# frames) — so the check also proves the shared-frame path survives
+# teardown and that per-process teardown still skips the cached frames
+# (simi_frame_is_cached). Cycle 0 additionally vfrees the object before
+# destroy, exercising the retire path: the activation-vfree line must still
+# appear at destroy time (frames held until destroy, then reclaimed).
+#
+# GUARD-KIND: runtime (needs the built ISO + QEMU + a serial pipe).
+#
+# Usage:
+#   bash tests/simi_teardown_boot_check.sh   # from the repo root
+set -u
+cd "$(dirname "$0")/.." || exit 1
+
+SER=/tmp/sls_serial_simi
+rm -f "$SER.in" "$SER.out" boot_simi.log
+mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
+
+cat "$SER.out" > boot_simi.log &
+CATPID=$!
+
+qemu-system-x86_64 -cdrom sls_operating_system.iso \
+    -drive id=disk,file=sls_storage.img,if=none,format=raw \
+    -device nvme,drive=disk,serial=slsdev0 \
+    -netdev user,id=net0,hostfwd=tcp::3003-:3000 \
+    -device e1000,netdev=net0,mac=52:54:00:12:34:03 \
+    -display none -m 4G -smp 4 -boot d -no-reboot \
+    -serial pipe:"$SER" 2>/dev/null &
+QPID=$!
+
+# Wait for the HTTP API to come up (boot log prints the listener line).
+saw_http=0
+for i in $(seq 1 120); do
+    if [ -f boot_simi.log ] && grep -aq "Listening on port 3000" boot_simi.log 2>/dev/null; then
+        saw_http=1
+        break
+    fi
+    if ! kill -0 "$QPID" 2>/dev/null; then break; fi
+    sleep 1
+done
+[ "$saw_http" -eq 1 ] || { echo "FAILED: HTTP listener not seen"; kill "$QPID" 2>/dev/null; exit 1; }
+
+sleep 2
+python3 utils/program_upload.py --host http://localhost:3003 \
+                                --file user/examples/simi_recycle.bin \
+                                --name simi_recycle >/dev/null 2>&1 || {
+    echo "FAILED: program_upload.py could not upload simi_recycle" >&2
+    kill "$QPID" 2>/dev/null; exit 1;
+}
+
+metrics_frames() {
+    curl -s http://localhost:3003/api/metrics \
+         -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
+         2>/dev/null | sed -n 's/.*"ram_allocated_frames":\([0-9]*\).*/\1/p'
+}
+frames_before=$(metrics_frames)
+
+curl -s -X POST http://localhost:3003/api/program/spawn \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
+     -d '{"name":"simi_recycle"}' >/dev/null 2>&1 || {
+    echo "FAILED: spawn request failed" >&2
+    kill "$QPID" 2>/dev/null; exit 1;
+}
+sleep 25
+frames_after=$(metrics_frames)
+
+kill "$QPID" 2>/dev/null || true
+wait "$QPID" 2>/dev/null || true
+kill "$CATPID" 2>/dev/null || true
+
+fail=0
+grep -aq "\[sirc\] SIMI activation teardown recycle test starting" boot_simi.log || {
+    echo "FAILED: simi_recycle did not start" >&2
+    fail=1
+}
+# Every cycle must complete: create -> assign -> valloc -> upload -> spawn
+# x2 -> destroy.
+for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
+    grep -aq "\[sirc\] cycle $c ok" boot_simi.log || {
+        echo "FAILED: cycle $c did not complete" >&2
+        grep -a "sirc\]" boot_simi.log | tail -20 >&2
+        fail=1
+    }
+done
+grep -aq "\[sirc\] DONE: 18/18 cycles passed" boot_simi.log || {
+    echo "FAILED: recycle loop did not complete 18/18" >&2
+    grep -a "sirc\]" boot_simi.log | tail -30 >&2
+    fail=1
+}
+grep -aq "\[sirc\] done (FAILURES)" boot_simi.log && {
+    echo "FAILED: simi_recycle reported failures" >&2
+    fail=1
+}
+# Each cycle's first spawn must have translated + cached (MISS) and its
+# second must have reused the shared code frames (HIT).
+miss_n=$(grep -ac "activation cache MISS — translated" boot_simi.log)
+if [ "$miss_n" -lt 18 ]; then
+    echo "FAILED: expected >=18 activation-cache MISS lines, saw $miss_n" >&2
+    grep -a "SIMI\].*cache" boot_simi.log | head -20 >&2
+    fail=1
+else
+    echo "ok:   $miss_n activation-cache MISS (translate + cache)"
+fi
+hit_n=$(grep -ac "activation cache HIT" boot_simi.log)
+if [ "$hit_n" -lt 18 ]; then
+    echo "FAILED: expected >=18 activation-cache HIT lines, saw $hit_n" >&2
+    grep -a "SIMI\].*cache" boot_simi.log | head -20 >&2
+    fail=1
+else
+    echo "ok:   $hit_n activation-cache HIT (shared code frames reused)"
+fi
+# The Phase 14b destroy-time story: every destroy must free its
+# partition's activation code frames — one vfree line per cycle (cycle 0
+# included: the object was retired by vfree, but the frames are held until
+# destroy, so the line still appears at destroy time).
+simi_vfree_n=$(grep -ac "\[SIMI\] activation vfree (partition .* teardown)" boot_simi.log)
+if [ "$simi_vfree_n" -lt 18 ]; then
+    echo "FAILED: expected >=18 SIMI activation vfree lines, saw $simi_vfree_n" >&2
+    grep -a "SIMI\].*activation vfree\|sirc\]" boot_simi.log | tail -20 >&2
+    fail=1
+else
+    echo "ok:   $simi_vfree_n SIMI activation code-frame frees at teardown"
+fi
+# Cycle 0's retire path: the object was vfree'd before destroy, so its
+# activation vfree line must carry the "<retired>" marker (name cleared).
+grep -aq "\[SIMI\] activation vfree (partition .* teardown): '<retired>'" boot_simi.log || {
+    echo "FAILED: cycle 0's retired activation was not reclaimed at destroy" >&2
+    grep -a "SIMI\].*activation vfree" boot_simi.log | head -10 >&2
+    fail=1
+}
+# The arithmetic tooth: with 18 unique object names against a 16-slot
+# activation table, ANY cycle that fails to free its slot on destroy must
+# log "activation table is full" — the direct signature of the leak the
+# destroy-time free closes.
+grep -aq "activation table is full" boot_simi.log && {
+    echo "FAILED: activation table ran full — destroy-time free missing" >&2
+    grep -a "SIMI\]" boot_simi.log | tail -30 >&2
+    fail=1
+}
+# The strongest proof: the system-wide frame count must not grow across
+# the create/spawn/destroy cycles (activation code frames fully reclaimed
+# each time). Without the fix, 16 cycles x 1 code page leak ~16 frames —
+# beyond the tolerance.
+if [ -n "$frames_before" ] && [ -n "$frames_after" ]; then
+    if [ "$frames_after" -gt $((frames_before + 6)) ]; then
+        echo "FAILED: frame count grew across the SIMI recycle loop ($frames_before -> $frames_after)" >&2
+        grep -a "SIMI\].*activation vfree\|sirc\]" boot_simi.log | tail -30 >&2
+        fail=1
+    else
+        echo "ok:   frame count stable across SIMI recycle loop ($frames_before -> $frames_after)"
+    fi
+else
+    echo "FAILED: could not read ram_allocated_frames from /api/metrics" >&2
+    fail=1
+fi
+[ "$fail" -eq 0 ] || { tail -40 boot_simi.log >&2; exit 1; }
+
+echo "OK: SIMI activation-cache teardown reclaims code frames across create/destroy cycles"
+exit 0

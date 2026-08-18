@@ -41,4 +41,29 @@ int simi_activation_query(const char* object_name, struct SimiActivationStatus* 
  * above (single source of truth) rather than its own independent lookup. */
 void simi_activation_info(const char* object_name);
 
+/* Phase 14b (LPAR destroy-time SIMI cache story): the two teardown halves
+ * of the activation cache, called from loader.c's own vfree paths so the
+ * cache's lifetime mirrors the binary store's:
+ *
+ *   simi_vfree_partition(pid) — the destroy-time half, called from
+ *     loader_vfree_partition() during partition_destroy() Step 2. Frees
+ *     the code frames of every activation whose partition_id matches
+ *     (valid AND retired slots — retired slots keep their frames and tag
+ *     for exactly this) and fully resets each slot. Returns the count
+ *     freed. See the .c file for the safety argument: this is only safe
+ *     after Step 1 has torn down every process in the partition, because
+ *     the code frames are SHARED across all of the activation's mappers.
+ *
+ *   simi_vfree_object(name) — the per-object half, called from
+ *     loader_vfree(). Does NOT free the frames: it RETIRES the slot
+ *     (clears the name so no future find_activation() can match it; keeps
+ *     partition_id + frames so the owning partition's destroy still
+ *     reclaims them exactly once). Retiring — not freeing — is what keeps
+ *     "an activation's frames are only mapped by processes in the
+ *     activation's own partition" true across name reuse, and what keeps
+ *     the destroy-time free safe even if a vfree races a live mapper.
+ *     Returns 1 if a slot was retired, 0 if no activation existed. */
+uint32_t simi_vfree_partition(uint32_t partition_id);
+uint32_t simi_vfree_object(const char* name);
+
 #endif /* SIMI_TRANSLATE_H */
