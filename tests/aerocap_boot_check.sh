@@ -24,10 +24,16 @@ CATPID=$!
 # (user/examples/*.bin), so a fresh checkout — the server's deploy gate,
 # CI, a new clone — has none, and program_upload.py fails reading them.
 # Build on the spot: host gcc + objcopy, no cross toolchain (the Makefile's
-# "user-programs" rules; the embedded blob headers regenerate via xxd and
-# the SIMI host tools when their sources are newer). Fails fast, before
-# QEMU boots.
-make user-programs || {
+# "user-programs" rules). The embedded blob headers are TRACKED generated
+# artifacts whose content is already byte-identical to what the build embeds
+# (the *_blob_guard checks prove it), so `make -o` keeps them from being
+# regenerated: a regen would flip their mtimes to after the kernel build
+# and trip stack_frame_budget_check's deliberately strict binary-newer-
+# than-sources rule (a false abort — the 2026-08-18 deploy hit exactly
+# that). Fails fast, before QEMU boots.
+make -o user/examples/cap_recycle_child_blob.h \
+     -o user/examples/simi_recycle_tmo_blob.h \
+     user-programs || {
     echo "FAILED: could not build the ring-3 programs (make user-programs)" >&2
     exit 1;
 }
