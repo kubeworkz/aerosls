@@ -353,4 +353,28 @@ echo "[deploy] Healthy (listener pid ${last_pid:-?}, uptime_ticks ${last_uptime:
 cat "$health_tmp"
 echo ""
 rm -f "$health_tmp"
+
+# ─── The NEW kernel must serve exactly the committed webapp bundle ─────────
+# The health wait proves a fresh process answers /api/health; this proves
+# what that process SERVES. The webapp is compiled in from the committed
+# kernel/webapp_bundle.c, so drift here means the kernel's HTTP layer is not
+# serving the bundle it was built with (or a future deploy regressed to
+# regenerating the file) -- the 2026-08-18 failure mode, on the served side.
+# tests/webapp_served_check.sh fetches every asset the bundle table names
+# and byte-compares against the committed file; its GUARD-KIND: runtime
+# marker makes it an owed skip in the pre-restart gate, and THIS call is
+# where it is authoritative -- the instance being verified is the one this
+# deploy just started.
+SERVED_BASE="${SERVED_BASE:-$(printf '%s' "$HEALTH_URL" | sed -E 's#/api/health/?$##')}"
+[ -n "$SERVED_BASE" ] || SERVED_BASE="http://localhost:3001"
+echo "[deploy] Verifying the NEW kernel serves exactly the committed webapp bundle..."
+if ! bash tests/webapp_served_check.sh --url "$SERVED_BASE"; then
+    echo "[deploy] FAILED: the restarted kernel does not serve the committed webapp bundle."
+    echo "         The new kernel IS running and answered health, but a served asset"
+    echo "         drifts from kernel/webapp_bundle.c -- investigate before trusting"
+    echo "         this deploy. This is the served-side half of the 2026-08-18"
+    echo "         incident: a webapp that exists nowhere in the repo."
+    exit 1
+fi
+
 echo "[deploy] Deploy succeeded."
