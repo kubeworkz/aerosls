@@ -40,6 +40,16 @@ qemu-system-x86_64 -cdrom sls_operating_system.iso \
     -serial pipe:"$SER" 2>/dev/null &
 QPID=$!
 
+# Cleanup on any exit path (including SIGTERM from run_checks.sh's per-guard
+# timeout): a wedged QEMU must not outlive the check. ${VAR:-} keeps the
+# trap safe under `set -u` even if it fires before the vars are set. EXIT
+# and TERM/INT are separate: an `exit` inside the EXIT trap would corrupt
+# the guard's normal exit status, and a signal trap must terminate the
+# script (bash would otherwise resume it after the trap ran).
+cleanup() { kill ${QPID:-} 2>/dev/null; kill ${CATPID:-} 2>/dev/null; }
+trap cleanup EXIT
+trap 'cleanup; exit 1' TERM INT
+
 # Wait for the HTTP API to come up (boot log prints the listener line).
 saw_http=0
 for i in $(seq 1 120); do
@@ -66,13 +76,13 @@ python3 utils/program_upload.py --host http://localhost:3002 \
 }
 
 metrics_frames() {
-    curl -s http://localhost:3002/api/metrics \
+    curl -s --max-time 300 http://localhost:3002/api/metrics \
          -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
          2>/dev/null | sed -n 's/.*"ram_allocated_frames":\([0-9]*\).*/\1/p'
 }
 frames_before=$(metrics_frames)
 
-curl -s -X POST http://localhost:3002/api/program/spawn \
+curl -s --max-time 300 -X POST http://localhost:3002/api/program/spawn \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
      -d '{"name":"part_recycle"}' >/dev/null 2>&1 || {
@@ -82,7 +92,20 @@ curl -s -X POST http://localhost:3002/api/program/spawn \
 sleep 20
 frames_after=$(metrics_frames)
 
+# Stop QEMU. Bounded so a wedged QEMU (SIGTERM-ignoring, stuck in D state,
+# etc.) can never block the check forever: SIGTERM, 10s grace, SIGKILL.
+# kill -0 succeeds on a ZOMBIE (a just-killed QEMU not yet reaped), so the
+# poll also breaks on stat Z — otherwise every normal exit would burn the
+# full 10s waiting on a corpse; `wait` below then reaps it instantly.
 kill "$QPID" 2>/dev/null || true
+for _i in $(seq 1 10); do
+    kill -0 "$QPID" 2>/dev/null || break
+    case "$(ps -o stat= -p "$QPID" 2>/dev/null)" in
+        Z*|'') break ;;
+    esac
+    sleep 1
+done
+kill -9 "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
 kill "$CATPID" 2>/dev/null || true
 

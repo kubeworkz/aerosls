@@ -56,9 +56,26 @@
 # a build host, a release gate, deploy.sh -- to turn every skip into a
 # failure. There, "I could not check" and "it is fine" must not look alike.
 #
+# ─── Why a guard can never be allowed to hang the run ─────────────────────
+# Each guard's output is captured with a command substitution
+# (out="$(bash "$g" 2>&1)") and only printed when the guard EXITS — so a
+# guard that blocks without terminating produces exactly "run_checks,
+# banner, then silence": the run hangs with no error messages and no
+# indication of WHICH guard is stuck. Two defences make that impossible:
+#   1. The guard's name is printed BEFORE it runs, so the currently-
+#      executing guard is always visible on the terminal (a silent hang
+#      becomes "which guard has been running for 20 minutes").
+#   2. Each guard runs under `timeout` (GUARD_TIMEOUT seconds, default
+#      1800): a guard that exceeds the budget is SIGKILLed and reported as
+#      a FAIL with its partial output, instead of blocking the run
+#      forever. A runtime guard (QEMU boot etc.) can legitimately take
+#      minutes on a slow/no-KVM host — that is what the generous default
+#      is for; GUARD_TIMEOUT is the knob when a host needs more.
+#
 # Usage:
 #   tests/run_checks.sh                # skips are reported, not fatal
 #   tests/run_checks.sh --require-all  # a skip is a failure
+#   GUARD_TIMEOUT=300 tests/run_checks.sh   # tighter per-guard budget
 #
 set -u
 cd "$(dirname "$0")/.."   # repo root, so each guard's own relative paths resolve
@@ -73,6 +90,13 @@ for arg in "$@"; do
         *) echo "error: unknown option '$arg'" >&2; exit 1 ;;
     esac
 done
+
+# Seconds each guard may run before it is declared hung. Overridable via the
+# environment (GUARD_TIMEOUT) so a slow build host can raise it without
+# editing the runner. 0 disables the timeout entirely.
+GUARD_TIMEOUT="${GUARD_TIMEOUT:-1800}"
+HAVE_TIMEOUT=0
+command -v timeout >/dev/null 2>&1 && HAVE_TIMEOUT=1
 
 pass=0
 fail=0
@@ -101,8 +125,23 @@ fi
 
 for g in "${guards[@]}"; do
     name="$(basename "$g")"
-    out="$("bash" "$g" 2>&1)"
-    rc=$?
+    # Print the name BEFORE running so a hung guard is never silent: the
+    # terminal always shows which guard is currently executing.
+    if [ "$HAVE_TIMEOUT" = "1" ] && [ "$GUARD_TIMEOUT" -gt 0 ] 2>/dev/null; then
+        echo "--- $name (budget ${GUARD_TIMEOUT}s)"
+        out="$(timeout -k 30 "$GUARD_TIMEOUT" bash "$g" 2>&1)"
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+            echo "FAIL  $name (timed out after ${GUARD_TIMEOUT}s — treated as hung)"
+            echo "$out" | sed 's/^/      /'
+            fail=$((fail + 1))
+            continue
+        fi
+    else
+        echo "--- $name (no timeout)"
+        out="$(bash "$g" 2>&1)"
+        rc=$?
+    fi
 
     case "$rc" in
         0)
