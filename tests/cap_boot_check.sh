@@ -19,12 +19,29 @@ mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
 cat "$SER.out" > boot_cap.log &
 CATPID=$!
 
+# Accelerator: KVM when the host exposes it; otherwise an explicit,
+# multi-threaded TCG fallback — the documented no-KVM mode. QEMU's own
+# fallback to TCG is silent and single-threaded, so on a host without
+# /dev/kvm (e.g. this project's Hetzner VPS build host: no vmx/svm, no
+# nested virt) every boot check ran TCG anyway — choosing it explicitly
+# makes the mode visible and gives SMP guests the MTTCG threads.
+# QEMU_ACCEL overrides the detection entirely (e.g. QEMU_ACCEL="-accel kvm").
+ACCEL="${QEMU_ACCEL:-}"
+if [ -z "$ACCEL" ]; then
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+        ACCEL="-accel kvm"
+    else
+        ACCEL="-accel tcg,thread=multi"
+    fi
+fi
+
 qemu-system-x86_64 -cdrom sls_operating_system.iso \
     -drive id=disk,file=sls_storage.img,if=none,format=raw \
     -device nvme,drive=disk,serial=slsdev0 \
     -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -display none -m 4G -smp 4 -boot d -no-reboot \
+    $ACCEL \
     -serial pipe:"$SER" 2>/dev/null &
 QPID=$!
 

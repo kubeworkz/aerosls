@@ -362,6 +362,22 @@ trap cleanup EXIT
 
 qemu-img create -f raw "$IMG" 10G >/dev/null 2>&1
 
+# Accelerator: KVM when the host exposes it; otherwise an explicit,
+# multi-threaded TCG fallback — the documented no-KVM mode. QEMU's own
+# fallback to TCG is silent and single-threaded, so on a host without
+# /dev/kvm (e.g. this project's Hetzner VPS build host: no vmx/svm, no
+# nested virt) every runtime guard ran TCG anyway — choosing it explicitly
+# makes the mode visible and gives SMP guests the MTTCG threads.
+# QEMU_ACCEL overrides the detection entirely (e.g. QEMU_ACCEL="-accel kvm").
+ACCEL="${QEMU_ACCEL:-}"
+if [ -z "$ACCEL" ]; then
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+        ACCEL="-accel kvm"
+    else
+        ACCEL="-accel tcg,thread=multi"
+    fi
+fi
+
 # -m 1G is deliberate — see the RAM requirement at the top. NOT -no-reboot:
 # the reboot endpoint resets the machine in place, which -no-reboot turns
 # into a QEMU exit.
@@ -371,6 +387,7 @@ qemu-system-x86_64 -cdrom "$ISO" \
     -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:3000 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -display none -m 1G -smp 1 -boot d -monitor none \
+    $ACCEL \
     -serial file:"$LOG" 2>/dev/null &
 QPID=$!
 
