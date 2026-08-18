@@ -57,12 +57,17 @@ make x86-iso
 
 This produces `sls_operating_system.iso` — a UEFI + BIOS bootable GRUB2 disc image with the kernel binary and the full Navigator SPA **embedded inside the kernel itself**.
 
-> **Rebuilding the Navigator UI:** if you change `slsos-sim/src/`, regenerate the embedded bundle and rebuild the ISO:
+> **Rebuilding the Navigator UI:** if you change `slsos-sim/src/`, regenerate the embedded bundle, **commit it**, and rebuild the ISO:
 >
 > ```bash
 > make bundle   # runs npm build in slsos-sim/, regenerates kernel/webapp_bundle.c
+> git commit -am "build: regenerate Navigator bundle"   # the committed file is canonical
 > make x86-iso
 > ```
+>
+> The committed `kernel/webapp_bundle.c` is the source of truth -- CI and the
+> deploy both build from it, and `tests/webapp_bundle_guard_check.sh` fails a
+> build whose committed bundle does not match the recorded slsos-sim revision.
 
 ### Step 2: Create a persistent storage image (first run only)
 

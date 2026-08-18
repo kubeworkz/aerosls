@@ -879,5 +879,5 @@ bundle:
 	@cd ../slsos-sim && npm run build --silent 2>/dev/null || true
 	@python3 tools/bundle_webapp.py ../slsos-sim/dist > kernel/webapp_bundle.c
 	@echo "[BUNDLE] Done — $$(wc -l < kernel/webapp_bundle.c) lines generated."
-	find . -name "*.o" -type f -delete
-	find . -name "*.bin" -type f -delete
+	@echo "[BUNDLE] Reminder: commit the regenerated kernel/webapp_bundle.c -- the"
+	@echo "          committed file is canonical (tests/webapp_bundle_guard_check.sh)."

@@ -15,9 +15,10 @@
 # checkout, where pm2 manages the kernel process (confirmed with Dave --
 # local dev is unaffected, `make x86-run` there is unchanged).
 #
-# Assumes slsos-sim is checked out as a sibling directory (../slsos-sim),
-# matching the Makefile's own `bundle` target, which already expects that
-# layout.
+# Assumes the kernel's build dependencies (../qemu) are checked out as
+# sibling directories. The webapp bundle does NOT need ../slsos-sim: it is
+# committed as kernel/webapp_bundle.c and built from the committed file (see
+# the bundle note further down).
 set -u
 
 # Confirm/override with `pm2 list` -- this script doesn't know your actual
@@ -53,6 +54,20 @@ _self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 _hash_before=""
 command -v md5sum >/dev/null && _hash_before="$(md5sum "$_self" 2>/dev/null | cut -d' ' -f1)"
 
+# ─── The tracked bundle must be clean BEFORE the pull ──────────────────────
+# Older deploys regenerated kernel/webapp_bundle.c from the server's local
+# dist and left the tracked file DIRTY (the 2026-08-18 incident). The next
+# pull then refuses to merge over it with a bare "local changes would be
+# overwritten", which looks like a network failure. The committed file is
+# canonical -- a dirty bundle is drift by definition, so discard it here,
+# deliberately, before git has a chance to refuse.
+if ! git diff --quiet -- kernel/webapp_bundle.c; then
+    echo "[deploy] NOTE: kernel/webapp_bundle.c is locally modified (a previous deploy's"
+    echo "         regeneration). The committed file is canonical -- discarding the"
+    echo "         local copy before pulling."
+    git checkout -- kernel/webapp_bundle.c
+fi
+
 echo "[deploy] Pulling latest aerosls2..."
 if ! git pull; then
     echo "[deploy] FAILED: git pull (aerosls2) failed. Aborting -- nothing rebuilt or restarted."
@@ -68,46 +83,29 @@ if [ -z "${SELF_REEXEC:-}" ] && [ -n "$_hash_before" ]; then
     fi
 fi
 
-# ─── Node via nvm's default, falling back to the system node ────────────────────────────
-# The frontend build must run under a MODERN npm. The system npm 9 on this
-# box (node 18) has a known optional-dependencies bug (npm/cli#4828) that
-# skips platform-specific native bindings -- @tailwindcss/oxide-linux-x64-gnu
-# in particular -- so `npm run build` dies with "Cannot find native binding".
-# An interactive shell gets node 24 because .bashrc sources nvm; a
-# non-interactive run (cron, CI, a bare ssh command) does not, which is how
-# a deploy that built fine by hand fails unattended. Sourcing nvm here makes
-# the two identical. If nvm is absent, fall back to whatever node is on PATH.
-if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
-    # shellcheck disable=SC1090
-    . "${NVM_DIR:-$HOME/.nvm}/nvm.sh"
-    # `nvm use default` can fail when no default alias exists -- the system
-    # node then stays in place, which is the same fallback as no nvm at all.
-    nvm use default >/dev/null 2>&1 || true
-    echo "[deploy] node: $(node --version) via $(command -v node)"
-else
-    echo "[deploy] node: $(node --version) (system, no nvm found)"
-fi
-
-# The Makefile's own `bundle` target runs `npm run build --silent
-# 2>/dev/null || true` -- the `|| true` means a frontend build failure
-# there is silently swallowed and `make bundle` proceeds anyway, re-bundling
-# whatever old slsos-sim/dist/ happens to already be on disk. That's a
-# separate, pre-existing gap in the Makefile itself (not fixed here --
-# changing it affects every existing caller of `make bundle`, including
-# local dev, a bigger blast radius than this one new script justifies).
-# Instead, this script does its own explicit, properly-checked frontend
-# pull+build BEFORE calling `make bundle`, so a real frontend build failure
-# stops this deploy instead of silently shipping a stale bundle.
-echo "[deploy] Pulling latest slsos-sim..."
-if ! (cd ../slsos-sim && git pull); then
-    echo "[deploy] FAILED: git pull (slsos-sim) failed. Aborting -- nothing rebuilt or restarted."
-    exit 1
-fi
+# ─── The webapp bundle is COMMITTED, and this deploy builds from it ────────
+# kernel/webapp_bundle.c (the compiled-in Navigator SPA) is a TRACKED file
+# in X86_C_SRC. The committed file is canonical -- CI builds the kernel from
+# it with no ../slsos-sim present at all, so a deploy that regenerated it
+# from the server's local dist produced a DIFFERENT kernel than CI for the
+# same commit. That happened on 2026-08-18: deploy.sh pulled the unpinned
+# sibling ../slsos-sim, ran `npm ci && npm run build`, then `make bundle`
+# overwrote the tracked file from the server's 942 KiB dist while the repo's
+# committed bundle was 870 KiB -- the server served a webapp that did not
+# exist in the repo, and every deploy dirtied the working tree.
+#
+# The webapp now flows through git like any other source: change slsos-sim,
+# run `make bundle`, COMMIT the regenerated kernel/webapp_bundle.c, then
+# deploy. tests/webapp_bundle_guard_check.sh (part of the guard gate below)
+# proves the committed file matches the recorded slsos-sim revision, so a
+# webapp advance that was not regenerated and committed fails the deploy
+# instead of silently drifting. This script deliberately does NOT touch
+# slsos-sim: no git pull, no npm, no make bundle.
 
 # ─── ../qemu: pulled because the kernel is BUILT from it ───────────────────
 # The Makefile links 15 objects out of ../qemu (tcg/, accel/tcg/ and all of
-# sls/ -- see TCG_OBJS and the VPATH line). This script pulled aerosls2 and
-# slsos-sim and built from three repositories, so every change under
+# sls/ -- see TCG_OBJS and the VPATH line). This script pulls aerosls2 and
+# ../qemu and builds from two repositories, so every change under
 # qemu/sls/ silently deployed as whatever happened to be on the server's
 # disk.
 #
@@ -137,18 +135,6 @@ elif [ -d ../qemu ]; then
     echo "         if they were not."
 else
     echo "[deploy] FAILED: ../qemu not found. The kernel cannot link without it."
-    exit 1
-fi
-
-echo "[deploy] Building frontend (npm ci && npm run build)..."
-if ! (cd ../slsos-sim && npm ci && npm run build); then
-    echo "[deploy] FAILED: frontend build failed. Aborting -- kernel NOT restarted, still running the previous build."
-    exit 1
-fi
-
-echo "[deploy] Generating kernel/webapp_bundle.c (make bundle)..."
-if ! make bundle; then
-    echo "[deploy] FAILED: make bundle failed. Aborting -- kernel NOT restarted, still running the previous build."
     exit 1
 fi
 
