@@ -61,7 +61,7 @@ fi
 qemu-system-x86_64 -cdrom sls_operating_system.iso \
     -drive id=disk,file="$IMG",if=none,format=raw \
     -device nvme,drive=disk,serial=slsdev0 \
-    -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+    -netdev user,id=net0,hostfwd=tcp::3012-:3000 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -display none -m 4G -smp 4 -boot d -no-reboot \
     $ACCEL \
