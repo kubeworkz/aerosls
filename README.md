@@ -68,6 +68,8 @@ This produces `sls_operating_system.iso` — a UEFI + BIOS bootable GRUB2 disc i
 > The committed `kernel/webapp_bundle.c` is the source of truth -- CI and the
 > deploy both build from it, and `tests/webapp_bundle_guard_check.sh` fails a
 > build whose committed bundle does not match the recorded slsos-sim revision.
+> After every deploy, `tests/webapp_served_check.sh` additionally verifies the
+> running kernel serves that committed bundle byte-for-byte.
 
 ### Step 2: Create a persistent storage image (first run only)
 
