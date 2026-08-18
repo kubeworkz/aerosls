@@ -39,6 +39,21 @@ enter_user_process:
 ;   rcx = user RIP
 ;   r8  = user RSP
 kernel_enter_ring3:
+    ; 0. Save the callee-saved registers the C caller's continuation relies
+    ;    on. This function never returns normally (SYSRETQ) and the register
+    ;    clears below are a security measure, so without this a C caller's
+    ;    rbx/rbp/r12-r15 would be zeroed when process_exit() rets back into
+    ;    the continuation — a latent ABI bug that only shows on nested spawn
+    ;    (the single-process path survived by luck). process_exit() pops
+    ;    these before ret. pd->kernel_rsp is saved AFTER the pushes, so it
+    ;    points at the r15 slot; process_exit pops 6 regs then rets.
+    push  rbx
+    push  rbp
+    push  r12
+    push  r13
+    push  r14
+    push  r15
+
     ; 1. Save kernel RSP — [rsp] is the return address back to process.c
     mov   [rdi], rsp
 

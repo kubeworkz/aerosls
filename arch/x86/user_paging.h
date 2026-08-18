@@ -49,6 +49,21 @@ uint64_t user_clone_page_table(void);
 // Allocates intermediate tables from the physical frame pool as needed.
 void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags);
 
+// Clear the leaf PTE for vaddr (if any level of the walk exists). The
+// intermediate tables are left in place -- Phase 1 does no page-table
+// garbage collection, same posture as the rest of the kernel. Non-
+// allocating: unlike get_or_alloc(), this never creates missing levels.
+void user_unmap_page(uint64_t* pml4, uint64_t vaddr);
+
+// Phase 2 teardown: free EVERY frame a process's address space owns -- the
+// user-half intermediate tables, the process's own leaf data frames
+// (binary/stack/SIMI-scratch; the cap arena and the shared SIMI activation
+// cache are refused), and finally the PML4 itself. Kernel-half slots are
+// shared by pointer and never touched. Called from process_exit()/
+// process_kill() AFTER cap_table_teardown() has unmapped all cap-derived
+// PTEs. See the definition in user_paging.c for the full safety argument.
+void user_destroy_page_table(uint64_t pml4_phys);
+
 /* Reads CR3. A named function rather than inline asm at each site because
  * `mov %%cr3` is privileged: any host test that links a translation unit
  * containing it dies before main() gets anywhere -- which is exactly what

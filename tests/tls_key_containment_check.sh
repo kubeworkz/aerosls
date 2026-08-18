@@ -38,10 +38,15 @@
 # real argument and it is not the same as having looked. Do not read a green
 # line as "the key has been confirmed absent from a written checkpoint".
 #
+# The structural half reads the COMMITTED index (git grep --cached), so a
+# usable git is a hard prerequisite: when git cannot resolve the repo, every
+# grep comes back empty and the guard would report a wiring finding that does
+# not exist. It probes git up front and ABORTS (exit 2) rather than lie.
+#
 # Runs under tests/run_checks.sh (the tests/*_check.sh glob) and therefore in
 # deploy.sh's guard gate.
 #
-# Exit: 0 pass, 1 fail, 2 prerequisite missing.
+# Exit: 0 pass, 1 fail, 2 prerequisite missing (missing gcc / git / tls_store.c).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -57,6 +62,31 @@ command -v "$CC" >/dev/null 2>&1 || {
     exit 2
 }
 [ -f kernel/tls_store.c ] || { echo "ABORT: kernel/tls_store.c missing." >&2; exit 2; }
+
+# The structural half below reads the COMMITTED index (git grep --cached) on
+# purpose -- the containment argument is about what is committed, not what
+# happens to be in a worktree. A git that cannot resolve the repo would make
+# every one of those greps come back EMPTY, and the guard would report
+# "defined but used by NOTHING -- the store is not wired up" for a store that
+# is fully wired: a false alarm aimed at the wrong half of the system. That
+# happened once (a worktree whose .git gitdir line the local git could not
+# resolve). So git is probed up front, and a broken git is an ABORT with the
+# real reason -- never a fabricated wiring finding. `git rev-parse --git-dir`
+# resolves the same .git path every later grep depends on, so it fails exactly
+# when they would.
+command -v git >/dev/null 2>&1 || {
+    echo "ABORT: git not available; the structural half of this guard reads the" >&2
+    echo "       committed index and cannot run without it." >&2
+    exit 2
+}
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "ABORT: git cannot resolve this repository -- every structural grep below" >&2
+    echo "       would come back empty and this guard would report the store as" >&2
+    echo "       unwired when it is not. The check did NOT run; fix git and re-run." >&2
+    echo "       Typical cause: a worktree whose .git gitdir path the local git" >&2
+    echo "       cannot resolve (e.g. Windows-style paths under WSL)." >&2
+    exit 2
+fi
 
 echo "=== 1. who may name the region, and who may call the store ==="
 echo

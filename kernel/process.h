@@ -32,6 +32,12 @@ typedef enum {
     PROC_SUSPENDED = 1,
     PROC_ZOMBIE    = 2,
     PROC_HELD      = 3,
+    PROC_BLOCKED   = 4,   // Seed Kernel Phase 1 (two-party): a process that
+                          // spawned a child is blocked inside its syscall until
+                          // the child exits — distinct from PROC_HELD (operator
+                          // hold); non-schedulable and invisible to
+                          // process_find_current()/cap_current_pid() meanwhile
+                          // (same exact-value checks that exclude HELD).
 } ProcState;
 
 static inline const char* proc_state_name(ProcState s) {
@@ -40,6 +46,7 @@ static inline const char* proc_state_name(ProcState s) {
         case PROC_SUSPENDED: return "SUSPENDED";
         case PROC_ZOMBIE:    return "ZOMBIE";
         case PROC_HELD:      return "HELD";
+        case PROC_BLOCKED:   return "BLOCKED";
         default:             return "UNKNOWN";
     }
 }
@@ -74,7 +81,27 @@ static inline const char* proc_priority_name(ProcPriority p) {
 // ─── Process descriptor ───────────────────────────────────────────────────────
 #define PROC_MAX       16
 #define PROC_NAME_LEN  64
-#define PROC_USER_STACK_PAGES  4    // 16 KiB ring-3 stack per process
+#define PROC_USER_STACK_PAGES  8    // 32 KiB ring-3 stack per process
+                                      // (16 KiB could not hold SLSUploadRequest,
+                                      //  a 16,457-byte ring-3 ABI struct — see
+                                      //  loader.h; the upload syscall was
+                                      //  unusable from ring-3 until this grew)
+
+// User register state captured when a blocking cap_recv parks a process
+// mid-syscall — exactly the eight values syscall_entry_stub pushed on entry
+// (r11 = user RFLAGS, rcx = user RIP, then the six callee-saved regs) plus
+// the user RSP that lives in per_cpu_data[0].user_rsp at park time.
+// cap_recv_resume() pushes these back onto a fresh syscall stack so the
+// stub's .syscall_return path can pop them and sysret with the user's
+// registers intact. Field order is load-bearing (process.c's resume asm
+// indexes it as [0..8]).
+struct CapParkCtx {
+    uint64_t r11;                 /* user RFLAGS (sysret needs R11)  */
+    uint64_t rcx;                 /* user RIP (sysret target)        */
+    uint64_t r15, r14, r13, r12;  /* user callee-saved               */
+    uint64_t rbx, rbp;
+    uint64_t user_rsp;            /* [gs:0] at park time             */
+};
 
 struct ProcessDescriptor {
     uint32_t   pid;
@@ -87,7 +114,27 @@ struct ProcessDescriptor {
     uint64_t   kernel_rsp;            // saved kernel RSP — restored on exit
     uint64_t   kernel_cr3;            // saved kernel CR3 — restored on exit
     struct TaskContext ring3_ctx;     // full Ring-3 context saved by timer ISR
+    uint64_t   syscall_stack_top;     // Seed Kernel Phase 1 (two-party): top of
+                                       // this process's DEDICATED kernel syscall
+                                       // stack (an allocated, identity-mapped
+                                       // frame). The shared fixed syscall stack
+                                       // sits directly above proc_table in
+                                       // .bss, so nested spawns' child frames
+                                       // would otherwise grow down into kernel
+                                       // state; [gs:8] is pointed here at
+                                       // kernel_enter_ring3 time.
+    uint64_t   parent_user_rsp;       // Seed Kernel Phase 1 (two-party): the
+                                       // parent's Ring-3 RSP at the moment it
+                                       // spawned this process (captured from
+                                       // gs:0 by the nested-spawn prep; the
+                                       // child's syscall entries overwrite gs:0,
+                                       // so process_exit() restores it).
     uint32_t   owner_uid;
+    uint32_t   parent_pid;            // Seed Kernel Phase 1 (two-party cap
+                                       // handoff): pid of the process that
+                                       // spawned this one, resolved via
+                                       // process_find_current() at spawn time
+                                       // (0 = spawned from kernel context).
     uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
                                        // at spawn time — see partition.h
     ProcState  state;
@@ -96,6 +143,50 @@ struct ProcessDescriptor {
                                        // (process_create()/program_spawn()) —
                                        // see pick_next_process_in_partition()
                                        // (process.c) for how this is consulted.
+
+    // ── Seed Kernel Phase 1.5 (blocking cap_recv / live overlap) ─────────
+    // A process parked mid-syscall by a blocking cap_recv saves the user
+    // state its syscall entry frame held here. On wake, cap_recv_resume()
+    // (process.c) rebuilds a FRESH syscall entry frame from these values and
+    // re-runs the recv — the old kernel call chain on the syscall stack is
+    // abandoned, never unwound (one dead frame per park; bounded, Phase-1
+    // posture). Layout order is load-bearing: [r11, rcx, r15..rbp] match
+    // syscall_entry_stub's push order exactly.
+    struct CapParkCtx park_ctx;
+    uint64_t   park_req;              // the SLSCapRecvRequest pointer the resume re-runs
+    uint16_t   waiting_chan;          // channel id this process is BLOCKED on, or
+                                       // CAP_NONE (0xFFFF) when not parked
+    uint8_t    has_ring3_ctx;         // ring3_ctx holds a valid iretq frame: set at
+                                       // async spawn (synthetic) and whenever a timer
+                                       // preemption saves real context. kernel_rsp
+                                       // alone no longer implies schedulability —
+                                       // async children never call kernel_enter_ring3.
+    uint8_t    resume_kernel;         // the next schedule of this process must resume
+                                       // via the kernel iretq path (cap_recv_resume),
+                                       // not ring3_ctx — set by cap_wake_chan(),
+                                       // consumed by schedule_ring3()/kernel_switch_next()
+    uint8_t    resume_sysret;         // Seed Kernel Phase 1.5 (immediate wake): the
+                                       // next schedule of this process must resume at
+                                       // .syscall_return (cap_sysret_resume) — its
+                                       // ORIGINAL syscall entry frame is still on its
+                                       // syscall stack at [top-8..top-64], so the
+                                       // process sysrets to ring-3 as if its syscall
+                                       // (send, yield) had simply taken a while. Set
+                                       // by cap_maybe_handoff()/sys_sls_yield(),
+                                       // consumed by schedule_ring3()/kernel_switch_next().
+    struct ProcessDescriptor* handoff_target;  // Phase 1.5: the process this one
+                                       // just WOKE with cap_wake_chan() — the send
+                                       // hands the CPU to it immediately
+                                       // (cap_maybe_handoff) instead of letting the
+                                       // receiver wait for the next tick.
+    uint8_t    pending_teardown;   // Phase 2: a kill targeted this process while it
+                                       // was RUNNING (self-kill via SYS_SLS_PROC_KILL
+                                       // with one's own pid, or any hypothetical
+                                       // cross-CPU kill). Its page tables are live,
+                                       // so teardown was deferred: the next timer
+                                       // tick saves its context, runs the full
+                                       // Phase-2 teardown, and switches away (see
+                                       // schedule_ring3). Reset at spawn/exit.
     uint8_t    active;
 };
 
@@ -112,6 +203,35 @@ struct ProcessDescriptor {
 #define SYS_SLS_PROC_HOLD          245
 #define SYS_SLS_PROC_RELEASE       246
 #define SYS_SLS_PROC_PRIORITY_SET  247
+
+// Seed Kernel Phase 1 (two-party verification): the child resolves its
+// spawner's pid so it can call cap_chan_create(far_pid=...) and have the
+// far-end caps minted directly into the parent's capability table. 298 is
+// the next free number after the capability layer's 289-297.
+#define SYS_SLS_GETPPID            298
+
+// Seed Kernel Phase 1.5 (live overlap): NON-BLOCKING spawn. The child is
+// created with a synthetic ring-3 context and marked runnable; the spawn
+// returns to the caller immediately and the scheduler iretq's into the
+// child on the next tick (or when the caller blocks). 299 is the next free
+// number after SYS_SLS_GETPPID — confirmed via grep across every kernel
+// header defining SYS_SLS_* before picking, per this repo's convention.
+#define SYS_SLS_PROGRAM_SPAWN_NB   299
+
+// Seed Kernel Phase 1.5 (immediate wake): VOLUNTARY yield. The process's
+// syscall entry frame stays on its syscall stack and the scheduler switches
+// to the next runnable process; on its next schedule it resumes at
+// .syscall_return (cap_sysret_resume) exactly as if the yield syscall had
+// taken a while. Used by the overlap test to hand the CPU back to an async
+// child so it can exit cleanly after the parent's last recv. 300 is the next
+// free number after SYS_SLS_PROGRAM_SPAWN_NB.
+#define SYS_SLS_YIELD              300
+
+// Seed Kernel Phase 1.5 (gated async spawn): like SYS_SLS_PROGRAM_SPAWN_NB
+// but the child starts PROC_HELD (non-schedulable) until the spawner
+// releases it via SYS_SLS_PROC_RELEASE. 301 is the next free number after
+// SYS_SLS_YIELD.
+#define SYS_SLS_PROGRAM_SPAWN_NB_HELD  301
 
 struct SLSProcPrioritySetRequest {
     uint32_t pid;
@@ -144,8 +264,38 @@ extern uint32_t                 proc_count;
 
 void     process_init(void);
 uint32_t process_create(struct ProcCreateRequest* req);  // returns PID or 0
+uint32_t program_spawn_nb(const char* object_name, uint32_t owner_uid);
+
+// Phase 1.5 (immediate wake, gated spawn): like program_spawn_nb, but the
+// child starts in PROC_HELD — not schedulable — until the spawner calls
+// process_release(pid) (SYS_SLS_PROC_RELEASE). The gated child lets the
+// spawner provision resources (channel far-end caps) before the child can
+// run, closing the spawn-then-provision timer race.
+uint32_t program_spawn_nb_held(const char* object_name, uint32_t owner_uid);
 void     process_kill(uint32_t pid);
 void     sys_sls_proc_list(void);
+
+// ─── Seed Kernel Phase 1.5: blocking cap_recv park/wake hooks ──────────────
+// Strong overrides of cap.c's weak defaults (which let the capability layer
+// stay host-testable without the scheduler). cap_wait_chan() parks the
+// calling process on the channel and switches to the next runnable process;
+// it returns only when it could NOT park (no runnable process — the caller
+// then returns CAP_EAGAIN). cap_wake_chan() marks the parked process
+// runnable again (resume via the kernel path). cap_recv_resume() is the
+// kernel-mode resume entry point (iretq'd to after wake).
+int  cap_wait_chan(uint32_t chan_id, void* recv_req);
+void cap_wake_chan(uint32_t chan_id);
+void cap_recv_resume(struct ProcessDescriptor* pd);   /* noreturn */
+
+// Seed Kernel Phase 1.5 (immediate wake): strong override of cap.c's weak
+// hook, called by cap_send() right after cap_wake_chan(). If the wake
+// parked-process is stashed in cur->handoff_target, the sender yields the
+// CPU to it NOW (direct handoff, seL4-style) instead of letting it wait
+// for the next timer tick — the receiver runs before the sender's send
+// even returns to ring-3. cap_sysret_resume() is the kernel-mode resume
+// entry point that sysrets the yielded process back into its own syscall.
+void cap_maybe_handoff(void);
+void cap_sysret_resume(struct ProcessDescriptor* pd);   /* noreturn */
 
 // Phase 14 (LPAR): kills every active process in partition_id, reusing
 // process_kill() per-pid. Returns the number of processes killed. Called
@@ -242,6 +392,8 @@ void process_exit(uint32_t exit_code);
 // kernel_enter_ring3). Returns NULL if no Ring-3 process is currently
 // running (e.g. a call made from pure kernel context).
 struct ProcessDescriptor* process_find_current(void);
+uint32_t sys_sls_getppid(void);
+uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */
 
 // Called from isr32_stub when a Ring-3 timer interrupt fires.
 // Saves the current Ring-3 process context from the interrupt stack,

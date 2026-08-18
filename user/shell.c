@@ -45,6 +45,7 @@
 #include "../kernel/service_mesh.h"
 #include "../kernel/workload.h"
 #include "../kernel/workload_ctx.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
+#include "../kernel/cap.h"            // Capability SDK Phase 1 -- SYS_SLS_CAP_*
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -248,6 +249,10 @@ static void print_help(void) {
         "  loader list                   show all binaries in the store\n"
         "  simi info <name>               structured SIMI header/entries/names/\n"
         "                                   activation-cache dump (Gap Remediation Phase G)\n"
+        "  -- Capability SDK (Phase 1) --\n"
+        "  cap list                      show all capability tables (SYS_SLS_CAP_LIST)\n"
+        "  cap demo                      run the Phase-1 acceptance scenario live (alloc ->\n"
+        "                                   send -> recv -> write/read Hello -> revoke)\n"
         "  -- Process Isolation (Phase B) --\n"
         "  proc list                     show all Ring-3 processes\n"
         "  proc spawn <object>           create a process from SERVICE_PROCESS object\n"
@@ -417,6 +422,100 @@ static uint32_t parse_hex(const char* s) {
         s++;
     }
     return v;
+}
+
+// ─── Capability SDK Phase 1: cap demo ────────────────────────────────────────
+// Runs the Seed-Kernel acceptance scenario live on the real kernel: A arena-
+// allocates a 4 KiB MEM cap, sends it over a channel to B, B writes "Hello"
+// to the shared page, sends the cap back, A reads "Hello", then everything
+// is revoked and the leak counters return to zero.
+//
+// The shell is kernel context (pid 0, no user CR3), so cap_map() honestly
+// returns CAP_ENOSYS here by design (ring-3 PTE install needs a user page
+// table; tests/cap_lifecycle_host_test.c exercises it with a fake one). The
+// memory model is still demonstrated for real: the arena is carved from RAM
+// the kernel identity-maps (boot.asm maps 0-4 GiB), so the MEM cap's
+// physical range is directly writable at its physical address -- exactly
+// what the cap grants. Two pids (A=0 the shell, B=1 a second lazily-created
+// cap table) make the channel's pid-keyed direction logic route A->B through
+// q[1] and B->A through q[0].
+static void cap_demo(void) {
+    const uint32_t A = 0;   /* the kernel shell itself */
+    const uint32_t B = 1;   /* far endpoint: its own cap table (created lazily) */
+
+    kernel_serial_print("\n[CAP-DEMO] Phase-1 acceptance scenario (kernel context, A=pid0 B=pid1)\n");
+
+    uint16_t rd = CAP_NONE, wr = CAP_NONE, frd = CAP_NONE, fwr = CAP_NONE;
+    int r = cap_chan_create(A, B, &rd, &wr, &frd, &fwr);
+    kernel_serial_printf("[CAP-DEMO] chan_create: rc=%d A{rd=%u,wr=%u} B{frd=%u,fwr=%u}\n",
+                         r, rd, wr, frd, fwr);
+    if (r) { kernel_serial_print("[CAP-DEMO] ABORT: channel bootstrap failed\n"); return; }
+
+    uint16_t mem_a = CAP_NONE;
+    r = cap_arena_alloc(A, 1, CAP_PERM_R | CAP_PERM_W | CAP_PERM_MAP, &mem_a);
+    uint32_t mem_obj = cap_debug_objid(A, mem_a);
+    uint64_t phys = cap_debug_obj_phys(mem_obj);
+    kernel_serial_printf("[CAP-DEMO] arena_alloc: rc=%d cap=%u obj=%u phys=0x%llx\n",
+                         r, mem_a, mem_obj, (unsigned long long)phys);
+    if (r) { kernel_serial_print("[CAP-DEMO] ABORT: arena alloc failed\n"); return; }
+
+    uint64_t cookie = 0;
+    r = cap_send(A, wr, mem_a, 0xC0FFEE42u);
+    kernel_serial_printf("[CAP-DEMO] send(A->B): rc=%d  A slot %u %s (refcount=%u)\n",
+                         r, mem_a,
+                         cap_debug_objid(A, mem_a) == 0xFFFFFFFFu ? "freed (moved)" : "still live",
+                         cap_debug_refcount(mem_obj));
+    if (r) { kernel_serial_print("[CAP-DEMO] ABORT: send failed\n"); return; }
+
+    uint16_t mem_b = CAP_NONE;
+    r = cap_recv(B, frd, 0, &cookie, &mem_b);
+    kernel_serial_printf("[CAP-DEMO] recv(B): rc=%d cap=%u obj=%u cookie=0x%llx\n",
+                         r, mem_b, cap_debug_objid(B, mem_b), (unsigned long long)cookie);
+    if (r) { kernel_serial_print("[CAP-DEMO] ABORT: recv failed\n"); return; }
+
+    /* "Map" step: cap_map needs a user CR3, which kernel context (pid 0)
+     * does not have -- CAP_ENOSYS is the designed, documented answer. The
+     * memory model is demonstrated through the kernel identity map: the
+     * arena page is writable at its physical address. */
+    r = cap_map(B, mem_b, 0x70000000ULL, CAP_PERM_R | CAP_PERM_W);
+    kernel_serial_printf("[CAP-DEMO] map(B, cap=%u): rc=%d (CAP_ENOSYS = kernel context, "
+                         "no user CR3; ring-3 PTE install is host-tested)\n", mem_b, r);
+    volatile char* p = (volatile char*)(uintptr_t)phys;
+    const char hello[] = "Hello";
+    for (int i = 0; i < 5; i++) p[i] = hello[i];
+    int match = 1;
+    for (int i = 0; i < 5; i++) if (p[i] != hello[i]) match = 0;
+    kernel_serial_printf("[CAP-DEMO] B writes 'Hello' @phys 0x%llx, read back: %s\n",
+                         (unsigned long long)phys, match ? "PASS" : "FAIL");
+
+    /* Return trip: B sends the cap back; A receives and reads "Hello". */
+    r = cap_send(B, fwr, mem_b, 0x51524358u);
+    kernel_serial_printf("[CAP-DEMO] send(B->A): rc=%d\n", r);
+    if (r) { kernel_serial_print("[CAP-DEMO] ABORT: return-trip send failed\n"); return; }
+    uint16_t mem_back = CAP_NONE;
+    cookie = 0;
+    r = cap_recv(A, rd, 0, &cookie, &mem_back);
+    kernel_serial_printf("[CAP-DEMO] recv(A): rc=%d cap=%u cookie=0x%llx\n",
+                         r, mem_back, (unsigned long long)cookie);
+    if (r) { kernel_serial_print("[CAP-DEMO] ABORT: return-trip recv failed\n"); return; }
+
+    match = 1;
+    for (int i = 0; i < 5; i++) if (p[i] != hello[i]) match = 0;
+    kernel_serial_printf("[CAP-DEMO] A reads 'Hello' back: %s\n", match ? "PASS" : "FAIL");
+
+    /* Revoke everything: the MEM cap, then the four channel caps. */
+    r = cap_revoke(A, mem_back);
+    kernel_serial_printf("[CAP-DEMO] revoke(MEM cap=%u): rc=%d  refcount=%s arena_free=%u/%u objects=%u\n",
+                         mem_back, r,
+                         cap_debug_refcount(mem_obj) == 0xFFFFFFFFu ? "0 (destroyed)" : "LIVE",
+                         cap_arena_free_frames(), CAP_ARENA_FRAMES, cap_object_count());
+    cap_revoke(A, rd);
+    cap_revoke(A, wr);
+    cap_revoke(B, frd);
+    cap_revoke(B, fwr);
+    kernel_serial_printf("[CAP-DEMO] revoke(channel caps): arena_free=%u/%u objects=%u\n",
+                         cap_arena_free_frames(), CAP_ARENA_FRAMES, cap_object_count());
+    kernel_serial_print("[CAP-DEMO] done\n");
 }
 
 // ─── Main Shell Loop ──────────────────────────────────────────────────────────
@@ -2215,6 +2314,16 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
                     kernel_serial_printf("  activation: not cached\n");
                 }
             }
+        }
+
+        // ── Capability SDK Phase 1: cap list ─────────────────────────────────
+        else if (sh_eq(input_buffer, "cap list")) {
+            do_syscall(SYS_SLS_CAP_LIST, 0);
+        }
+
+        // ── Capability SDK Phase 1: cap demo ─────────────────────────────────
+        else if (sh_eq(input_buffer, "cap demo")) {
+            cap_demo();
         }
 
         // ── Phase B: proc list ───────────────────────────────────────────────

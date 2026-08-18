@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Boot the ISO under QEMU with the NIC, upload part_recycle.bin, spawn it
+# through the HTTP API with
+# dave's token (uid 1000), and verify the Phase-2 partition-teardown wiring:
+# each create -> assign(uid 1000) -> gated-spawn-into -> recv -> destroy
+# cycle must reclaim the child's cap table, arena frames, page tables, and
+# syscall stack, and partition_destroy must reclaim every frame the
+# partition still owns — proven by a system-wide frame-count stability
+# assertion across the whole loop plus the parent's final cap_list dump
+# (objects active=0, arena free=16384/16384).
+#
+# GUARD-KIND: runtime (needs the built ISO + QEMU + a serial pipe).
+#
+# Usage:
+#   bash tests/partition_teardown_boot_check.sh   # from the repo root
+set -u
+cd "$(dirname "$0")/.." || exit 1
+
+SER=/tmp/sls_serial
+rm -f "$SER.in" "$SER.out" boot_part.log
+mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
+
+cat "$SER.out" > boot_part.log &
+CATPID=$!
+
+qemu-system-x86_64 -cdrom sls_operating_system.iso \
+    -drive id=disk,file=sls_storage.img,if=none,format=raw \
+    -device nvme,drive=disk,serial=slsdev0 \
+    -netdev user,id=net0,hostfwd=tcp::3002-:3000 \
+    -device e1000,netdev=net0,mac=52:54:00:12:34:02 \
+    -display none -m 4G -smp 4 -boot d -no-reboot \
+    -serial pipe:"$SER" 2>/dev/null &
+QPID=$!
+
+# Wait for the HTTP API to come up (boot log prints the listener line).
+saw_http=0
+for i in $(seq 1 120); do
+    if [ -f boot_part.log ] && grep -aq "Listening on port 3000" boot_part.log 2>/dev/null; then
+        saw_http=1
+        break
+    fi
+    if ! kill -0 "$QPID" 2>/dev/null; then break; fi
+    sleep 1
+done
+[ "$saw_http" -eq 1 ] || { echo "FAILED: HTTP listener not seen"; kill "$QPID" 2>/dev/null; exit 1; }
+
+sleep 2
+# The child (cap_recycle_child) is NOT uploaded here: part_recycle
+# creates its PROGRAM object and uploads the embedded child binary from
+# ring-3 each cycle, so the object is born inside the fresh partition
+# (HTTP uploads would create a partition-0 object, which the partition
+# boundary in catalog_check_access() would deny at spawn time).
+python3 utils/program_upload.py --host http://localhost:3002 \
+                                --file user/examples/part_recycle.bin \
+                                --name part_recycle >/dev/null 2>&1 || {
+    echo "FAILED: program_upload.py could not upload part_recycle" >&2
+    kill "$QPID" 2>/dev/null; exit 1;
+}
+
+metrics_frames() {
+    curl -s http://localhost:3002/api/metrics \
+         -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
+         2>/dev/null | sed -n 's/.*"ram_allocated_frames":\([0-9]*\).*/\1/p'
+}
+frames_before=$(metrics_frames)
+
+curl -s -X POST http://localhost:3002/api/program/spawn \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
+     -d '{"name":"part_recycle"}' >/dev/null 2>&1 || {
+    echo "FAILED: spawn request failed" >&2
+    kill "$QPID" 2>/dev/null; exit 1;
+}
+sleep 20
+frames_after=$(metrics_frames)
+
+kill "$QPID" 2>/dev/null || true
+wait "$QPID" 2>/dev/null || true
+kill "$CATPID" 2>/dev/null || true
+
+fail=0
+grep -aq "\[prec\] partition teardown recycle test starting" boot_part.log || {
+    echo "FAILED: part_recycle did not start" >&2
+    fail=1
+}
+# Every cycle must complete: create -> assign -> spawn -> recv -> destroy.
+for c in 0 1 2 3; do
+    grep -aq "\[prec\] cycle $c ok" boot_part.log || {
+        echo "FAILED: cycle $c did not complete" >&2
+        grep -a "prec\]" boot_part.log | tail -20 >&2
+        fail=1
+    }
+done
+grep -aq "\[prec\] DONE: 4/4 cycles passed" boot_part.log || {
+    echo "FAILED: recycle loop did not complete 4/4" >&2
+    grep -a "prec\]" boot_part.log | tail -30 >&2
+    fail=1
+}
+grep -aq "\[prec\] done (FAILURES)" boot_part.log && {
+    echo "FAILED: part_recycle reported failures" >&2
+    fail=1
+}
+# Each child exits WITHOUT revoking its kept MEM cap — only teardown
+# (child exit or partition_destroy) can return its arena frame. The final
+# cap_list dump must show a fully returned arena and zero live objects.
+grep -aq "\[CAP\] objects active=0/1024  arena free=16384/16384 frames" boot_part.log || {
+    echo "FAILED: arena / objects not fully reclaimed after 4 cycles (leak)" >&2
+    grep -a "CAP\] objects\|TORE\]\|prec\]" boot_part.log | tail -30 >&2
+    fail=1
+}
+# Every child exit (or partition kill) ran the Phase-2 cap-table teardown.
+tore_n=$(grep -ac "\[TORE\] PID .* teardown:" boot_part.log)
+if [ "$tore_n" -lt 4 ]; then
+    echo "FAILED: expected >=4 cap-table teardown lines, saw $tore_n" >&2
+    grep -a "TORE\]" boot_part.log | head -20 >&2
+    fail=1
+else
+    echo "ok:   $tore_n cap-table teardowns ran"
+fi
+# The strongest proof: the system-wide frame count must not grow across the
+# create/spawn/destroy cycles (partition frames fully reclaimed each time).
+if [ -n "$frames_before" ] && [ -n "$frames_after" ]; then
+    if [ "$frames_after" -gt $((frames_before + 16)) ]; then
+        echo "FAILED: frame count grew across the partition recycle loop ($frames_before -> $frames_after)" >&2
+        grep -a "TORE\]\|PART\]\|prec\]" boot_part.log | tail -30 >&2
+        fail=1
+    else
+        echo "ok:   frame count stable across partition recycle loop ($frames_before -> $frames_after)"
+    fi
+else
+    echo "FAILED: could not read ram_allocated_frames from /api/metrics" >&2
+    fail=1
+fi
+[ "$fail" -eq 0 ] || { tail -40 boot_part.log >&2; exit 1; }
+
+echo "OK: partition teardown reclaims everything across create/destroy cycles"
+exit 0

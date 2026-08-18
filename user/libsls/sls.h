@@ -20,7 +20,13 @@
 #define SLS_SYS_INSERT          119   /* insert a new record field            */
 #define SLS_SYS_DELETE          143   /* delete a record field                */
 #define SLS_SYS_EXIT            164   /* terminate process, return to kernel  */
+#define SLS_SYS_PROGRAM_SPAWN   163   /* spawn an OBJ_TYPE_PROGRAM by name    */
 #define SLS_SYS_SERIAL_WRITE    165   /* write string to kernel serial log    */
+#define SLS_SYS_GETPPID         298   /* parent pid (Seed Kernel Phase 1)     */
+#define SLS_SYS_PROGRAM_SPAWN_NB 299   /* non-blocking spawn (Phase 1.5)       */
+#define SLS_SYS_YIELD           300   /* voluntary yield (Phase 1.5)           */
+#define SLS_SYS_PROGRAM_SPAWN_NB_HELD 301  /* gated async spawn (Phase 1.5)     */
+#define SLS_SYS_PROC_RELEASE    246   /* release a HELD process (Phase 1.5)    */
 #define SLS_SYS_IPC_BIND        166   /* bind process to a user IPC port      */
 #define SLS_SYS_IPC_SEND        167   /* send message to any port             */
 #define SLS_SYS_IPC_RECV        168   /* non-blocking recv from user port     */
@@ -65,12 +71,19 @@
 #define SLS_VAL_LEN    256
 
 /* ── Request structs — layout MUST be identical to kernel definitions ────── */
+/* 7 fields, byte-for-byte kernel/object_catalog.h's SLSVallocRequest. The
+ * partition_id/database_id fields were missing in an earlier copy of this
+ * struct (5 fields) — the kernel reads them, so a ring-3 call would have
+ * consumed whatever stack bytes followed the struct (garbage). partition_id
+ * 0 = default to the owner_uid's current partition (partition_get_for_uid). */
 struct sls_valloc_req {
     char     name[SLS_NAME_LEN];
     uint32_t type;
     uint32_t size_pages;
     uint32_t owner_uid;
     uint32_t perm_mask;
+    uint32_t partition_id;
+    uint32_t database_id;
 };
 
 struct sls_record_req {
@@ -163,18 +176,27 @@ static inline void sls_memset(void *dst, int val, size_t n) {
 /* ── Raw syscall ────────────────────────────────────────────────────────── */
 /* Clobber list tells GCC which registers the kernel may modify.
  * RAX = return value (output).  RCX and R11 are trashed by the CPU's
- * SYSCALL/SYSRETQ mechanism.  R8-R10, RSI, RDX are caller-saved in the C
- * ABI and not preserved by our kernel stub — list them so GCC spills any
- * live values around each syscall. */
+ * SYSCALL/SYSRETQ mechanism.  RDI, RSI, RDX, R8-R10 are caller-saved in
+ * the C ABI and not preserved by our kernel stub — list them ALL so GCC
+ * spills any live values around each syscall.
+ *
+ * RDI is the easy one to forget: it is also the input register for `arg`
+ * ("D" constraint), but the kernel's syscall_entry_stub clobbers it
+ * (.unknown_syscall does `mov rsi,rdi; mov rdi,rax` before calling the C
+ * dispatcher) and never restores it before SYSRET. If RDI is not listed
+ * here, GCC is free to keep a live value in it across the syscall and the
+ * kernel will silently destroy it — caught live when cap_revoke() reused
+ * the request pointer GCC had parked in RDI across an earlier syscall. */
 static inline uint64_t _sls_syscall(uint64_t num, void *arg) {
     uint64_t ret;
     __asm__ volatile (
+        "mov %1, %%rdi\n\t"   /* load arg ourselves so RDI can be a clobber */
         "syscall"
         : "=a" (ret)
-        : "a"  (num), "D" (arg)
+        : "r"  (arg), "0" (num)
         : "rcx", "r11",
+          "rdi", "rsi", "rdx",
           "r8", "r9", "r10",
-          "rsi", "rdx",
           "memory"
     );
     return ret;
@@ -186,6 +208,58 @@ static inline uint64_t _sls_syscall(uint64_t num, void *arg) {
 static inline void __attribute__((noreturn)) sls_exit(int code) {
     _sls_syscall(SLS_SYS_EXIT, (void *)(uintptr_t)(unsigned int)code);
     for (;;) __asm__ volatile ("hlt");
+}
+
+/* Pid of the process that spawned us (0 = spawned from kernel context).
+ * Seed Kernel Phase 1: the two-party channel pattern uses this as
+ * cap_chan_create(far_pid = parent) so the far-end caps are minted directly
+ * into the parent's capability table. */
+static inline uint32_t sls_getppid(void) {
+    return (uint32_t)_sls_syscall(SLS_SYS_GETPPID, 0);
+}
+
+/* Spawn an OBJ_TYPE_PROGRAM catalog object as a Ring-3 process.
+ * Blocks until the child exits (this kernel's spawn is synchronous — one
+ * Ring-3 process runs at a time, timer-preempted), then returns the child's
+ * pid. Returns 0 on failure. */
+static inline uint64_t sls_program_spawn(const char* object_name) {
+    return _sls_syscall(SLS_SYS_PROGRAM_SPAWN, (void*)object_name);
+}
+
+/* Spawn an OBJ_TYPE_PROGRAM catalog object WITHOUT blocking (Seed Kernel
+ * Phase 1.5). The child is queued with a synthetic ring-3 context and the
+ * spawn returns immediately with its pid; the scheduler iretq's into it on
+ * the next tick (or when the caller blocks). Two processes can be LIVE at
+ * once — the caller can then block in cap_recv() and be woken by the
+ * child's send. Returns 0 on failure. */
+static inline uint64_t sls_program_spawn_nb(const char* object_name) {
+    return _sls_syscall(SLS_SYS_PROGRAM_SPAWN_NB, (void*)object_name);
+}
+
+/* Gated async spawn (Seed Kernel Phase 1.5): like sls_program_spawn_nb, but
+ * the child starts PROC_HELD (non-schedulable) until sls_proc_release(pid)
+ * is called — so the spawner can provision resources (e.g. the channel's
+ * far-end caps) before the child can run, closing the spawn-then-provision
+ * timer race. */
+static inline uint64_t sls_program_spawn_nb_held(const char* object_name) {
+    return _sls_syscall(SLS_SYS_PROGRAM_SPAWN_NB_HELD, (void*)object_name);
+}
+
+/* Release a PROC_HELD process so the scheduler can run it (Seed Kernel
+ * Phase 1.5 gated spawn). Returns 0 on success. */
+static inline uint32_t sls_proc_release(uint32_t pid) {
+    return (uint32_t)_sls_syscall(SLS_SYS_PROC_RELEASE,
+                                  (void*)(uintptr_t)pid);
+}
+
+/* Voluntarily give up the CPU (Seed Kernel Phase 1.5, immediate wake). The
+ * kernel leaves this process's syscall entry frame on its stack and switches
+ * to the next runnable process; on the next schedule the process resumes at
+ * .syscall_return — to ring-3 this syscall simply took a while. Returns 0.
+ * Used to hand the CPU back to an async child so it can exit cleanly after
+ * the parent's last blocking recv. */
+static inline uint32_t sls_yield(void) {
+    return (uint32_t)_sls_syscall(SLS_SYS_YIELD, 0);
 }
 
 /* ── Debug output ────────────────────────────────────────────────────────── */

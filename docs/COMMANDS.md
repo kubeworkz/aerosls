@@ -551,6 +551,28 @@ Spawn ELF64 or flat-binary services in isolated Ring-3 address spaces.
 
 ---
 
+### Capability SDK (Phase 1)
+
+Seed-Kernel capability lifecycle over the serial console: per-process capability
+index (like a file descriptor) → typed capability (MEM / CHAN_R / CHAN_W), with
+kernel-managed channels and atomic capability transfer (SYS_SLS_CAP_*).
+
+
+| Command    | Description                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------------- |
+| `cap list` | Show every capability table (SYS_SLS_CAP_LIST): per-process cap index → type, object id, permission mask |
+| `cap demo` | Run the Phase-1 acceptance scenario live: arena-alloc a 4 KiB MEM cap, send it over a channel, recv + write/read `Hello`, return the cap, then revoke everything — printing each step's result |
+
+
+**Note:** `cap demo` runs in kernel context (pid 0, no user CR3), so its map step
+returns `CAP_ENOSYS` by design — ring-3 PTE install needs a user page table and is
+exercised by `tests/cap_lifecycle_host_test.c`; the scenario demonstrates the memory
+model through the kernel identity map instead (the arena page is written at its
+physical address).
+
+
+---
+
 ### Web Assets
 
 Dynamic web asset store (served alongside the compiled-in Navigator bundle).

@@ -225,7 +225,18 @@ int partition_destroy(uint32_t partition_id) {
     }
 
     // Step 1: kill every process in this partition (process.c, reuses
-    // process_kill() per-pid).
+    // process_kill() per-pid). Seed Kernel Phase 2: each process_kill()
+    // runs the FULL Phase-2 teardown on its target — cap_table_teardown()
+    // (drop caps, return arena frames, unmap cap PTEs, unbind the cap
+    // table), user_destroy_page_table() (free the user-half page tables
+    // and the process's own frames), proc_free_syscall_stack(). A process
+    // in this partition that already exited has already been reclaimed by
+    // its exit teardown (active=0, so the kill is a no-op). A process that
+    // is suspended (the normal case here — the destroy runs in kernel
+    // context, never while a ring-3 process is executing) is torn down
+    // synchronously; a hypothetical RUNNING target (self-kill) is deferred
+    // to its next schedule. So by the time Step 3 runs, nothing this
+    // partition's processes owned is left tagged with partition_id.
     uint32_t killed = process_kill_partition(partition_id);
 
     // Step 2: vfree every catalog object in this partition
@@ -249,6 +260,17 @@ int partition_destroy(uint32_t partition_id) {
     // infrastructure allocations, permanently attributed to
     // PARTITION_SYSTEM, which can never itself be destroyed).
     uint32_t frames_reclaimed = partition_reclaim_all_frames(partition_id);
+
+    // Seed Kernel Phase 2: with the watermark fix (frame_pool.c — the
+    // contiguous arena reservation is tracked as its own range instead of
+    // being folded into reserved_below, which had wrongly marked every
+    // ALLOCATABLE frame below the arena machine-owned), this walk now
+    // reclaims EVERY frame this partition still owns — including the
+    // page-table/binary/stack frames of a process whose kill raced ahead
+    // of its deferred teardown, and any non-process allocation (streams)
+    // made through the accounted path. Frames already freed by the
+    // per-process teardowns above have their bits clear and owner tag
+    // reset, so they are skipped, not double-freed.
 
     // Step 3b (Orchestration Plan Phase 4): drop this partition's service
     // registrations. A registration resolves name -> partition -> node, so

@@ -18,6 +18,7 @@
 #include "kernel/frame_pool.h"
 #include <stdio.h>
 #include <stdint.h>
+#include "tests/process_host_stubs.h"   /* stack_bottom/stack_top (frame_pool_init reservation bounds) */
 
 /* kernel/frame_pool.c now reserves the kernel image before allocating
  * (the linker provides this symbol; see frame_pool.h). Its ADDRESS is the
@@ -27,13 +28,10 @@
  * covered by tests/frame_pool_reserve_host_test.c. */
 char _kernel_image_end[1];
 
-/* arch/x86/boot.asm's exported bootstrap-stack bounds, which frame_pool_init()
- * now reserves by name rather than trusting _kernel_image_end to cover. Only
- * needed to satisfy the link here: this file tests quota accounting and never
- * calls frame_pool_init(). See frame_pool_reserve_host_test.c for why the
- * adjacency of these two symbols cannot be reproduced honestly in C. */
-char stack_bottom[16];
-char stack_top[16];
+/* arch/x86/boot.asm's bootstrap-stack bounds (stack_bottom/stack_top) come
+ * from tests/process_host_stubs.h, included above -- the frame_pool_init()
+ * reservation bounds, whose adjacency cannot be reproduced honestly in C
+ * (see frame_pool_reserve_host_test.c). */
 
 
 void kernel_serial_print(const char* s) { (void)s; }
