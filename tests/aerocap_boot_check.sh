@@ -20,6 +20,29 @@ mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
 cat "$SER.out" > boot_aerocap.log &
 CATPID=$!
 
+# The storage image this check boots is a PRIVATE FRESH one in a temp dir,
+# deleted on exit — never the repo's sls_storage.img. Why:
+#   1. The deploy gate (deploy/deploy.sh) runs these checks while the live
+#      instance still serves. QEMU opens a raw image read-write with an
+#      exclusive flock, so a second QEMU on the real image dies instantly
+#      ("Failed to get \"write\" lock — Is another process using the image").
+#      That is exactly the 2026-08-18 deploy-gate failure: four boot checks
+#      with four zero-byte serial logs, while tcache_roundtrip_check — which
+#      boots a private image — stayed green.
+#   2. CI runs run_checks.sh --require-all on a fresh checkout where
+#      sls_storage.img does not exist at all.
+#   3. A fresh image is deterministic: this check uploads the programs it
+#      asserts on and never reads persisted state, so booting empty storage
+#      is the cleanest baseline (the empty-disk init path is itself proven —
+#      CI's runtime smoke and tcache both boot fresh images).
+# STORAGE_IMG overrides the private image with an explicit path (the
+# backup/*.sh convention) for pointing a check at a real image on purpose.
+W="$(mktemp -d)"
+IMG="${STORAGE_IMG:-$W/disk.img}"
+if [ -z "${STORAGE_IMG:-}" ]; then
+    qemu-img create -f raw "$IMG" 10G >/dev/null 2>&1
+fi
+
 # Accelerator: KVM when the host exposes it; otherwise an explicit,
 # multi-threaded TCG fallback — the documented no-KVM mode. QEMU's own
 # fallback to TCG is silent and single-threaded, so on a host without
@@ -37,7 +60,7 @@ if [ -z "$ACCEL" ]; then
 fi
 
 qemu-system-x86_64 -cdrom sls_operating_system.iso \
-    -drive id=disk,file=sls_storage.img,if=none,format=raw \
+    -drive id=disk,file="$IMG",if=none,format=raw \
     -device nvme,drive=disk,serial=slsdev0 \
     -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
@@ -52,7 +75,7 @@ QPID=$!
 # and TERM/INT are separate: an `exit` inside the EXIT trap would corrupt
 # the guard's normal exit status, and a signal trap must terminate the
 # script (bash would otherwise resume it after the trap ran).
-cleanup() { kill ${QPID:-} 2>/dev/null; kill ${CATPID:-} 2>/dev/null; }
+cleanup() { kill ${QPID:-} 2>/dev/null; kill ${CATPID:-} 2>/dev/null; rm -rf ${W:-}; }
 trap cleanup EXIT
 trap 'cleanup; exit 1' TERM INT
 
