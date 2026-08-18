@@ -102,41 +102,32 @@ static uint64_t* get_or_alloc(uint64_t* parent, size_t idx) {
 // SHARED by pointer — the kernel identity map (slots 0-1) is what keeps
 // interrupt/syscall handlers reachable after the CR3 switch, and its PTEs
 // have U/S=0 so Ring-3 can never touch them. USER-mapped slots (U/S=1) are
-// DEEP-COPIED: the child gets its own PDPT/PD/PT pages so that later
-// user_map_page() calls for the child (loading its binary, mapping its stack)
-// rewrite only the CHILD's tables.
+// deliberately left EMPTY: the child gets a fresh, empty user half, and the
+// spawn path (program_spawn/process_create) maps the child's own binary and
+// stack into it.
 //
-// The all-slot shallow copy this replaces was a fork-without-COW bug: the
-// child's PML4 initially shared the parent's lower-level pages, so loading
-// the child's binary at the same vaddr (USER_PROC_CODE_BASE) walked into the
-// SHARED PT/PD/PDPT pages and rewrote them — corrupting the PARENT's address
-// space. Verified live in the two-party capability test: after the child was
-// loaded, the parent "ran" the child's code at its own RIP (its PML4 mapped
-// cap_peer.bin where cap_two_party.bin should be) and exited with the
-// child's failure path.
-static int clone_user_levels(uint64_t* dst, uint64_t* src, int depth) {
+// Why empty, not deep-copied (LPAR Phase 14a destroy-time finding, caught by
+// the partition-teardown boot check's valloc probe): the earlier deep-copy
+// gave the child its own PDPT/PD/PT pages (fixing the original all-slot
+// shallow-copy bug, where loading the child at the same vaddr rewrote the
+// SHARED intermediate tables) BUT still copied the parent's depth-3 leaf
+// PTEs VERBATIM — sharing the parent's binary/stack physical frames. The
+// loader/spawn then remapped the pages the CHILD needs, but any parent
+// mapping the child didn't overwrite stayed mapped (e.g. the parent's second
+// binary page when the child's binary is one page). The child's exit
+// teardown then walked ITS tables and freed those frames as its own —
+// freeing the PARENT's live binary/stack frames out from under it; the
+// freed frames were reallocated (the next child's PML4 landed in the
+// parent's binary page) and zero-filled, corrupting the still-running
+// parent (its next valloc request struct read back as zeros). An empty user
+// half has no leftovers to leak: every frame the child's walker frees is
+// genuinely the child's.
+static void clone_kernel_slots(uint64_t* dst, uint64_t* src) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = src[i];
         if (!(e & USER_PTE_PRESENT)) continue;
-        if (depth == 0 && !(e & USER_PTE_USER)) {
-            dst[i] = e;    /* kernel/supervisor slot: share by pointer */
-            continue;
-        }
-        /* Leaf entries: PTEs at depth 3 are copied verbatim; at depth 1-2 a
-         * set PS bit (bit 7) marks a 1 GiB / 2 MiB large page — also a leaf.
-         * (At depth 3 bit 7 is PAT, which is why the depth check comes first.) */
-        if (depth >= 3 || (depth > 0 && (e & 0x80))) {
-            dst[i] = e;
-            continue;
-        }
-        uint64_t* src_child = (uint64_t*)(uintptr_t)(e & USER_PTE_FRAME_MASK);
-        uint64_t* new_child = alloc_page_table();
-        if (!new_child) return -1;
-        if (clone_user_levels(new_child, src_child, depth + 1) != 0) return -1;
-        dst[i] = ((uint64_t)(uintptr_t)new_child & USER_PTE_FRAME_MASK)
-                 | (e & ~USER_PTE_FRAME_MASK);
+        if (!(e & USER_PTE_USER)) dst[i] = e;   /* kernel slot: share by pointer */
     }
-    return 0;
 }
 
 uint64_t user_clone_page_table(void) {
@@ -147,9 +138,7 @@ uint64_t user_clone_page_table(void) {
     uint64_t* new_pml4 = alloc_page_table();
     if (!new_pml4) return 0;
 
-    // PML4 level: share supervisor slots, deep-copy user slots (which recurses
-    // down through PDPT and PD; PTEs at depth 3 are copied verbatim).
-    if (clone_user_levels(new_pml4, kernel_pml4, 0) != 0) return 0;
+    clone_kernel_slots(new_pml4, kernel_pml4);   /* user slots stay zero */
 
     kernel_serial_printf("[PAGING] New user PML4 at 0x%016lx\n",
                          (uint64_t)(uintptr_t)new_pml4);

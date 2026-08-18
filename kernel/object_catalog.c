@@ -43,6 +43,20 @@ extern uint32_t kernel_get_current_thread_id(void);
 // vector collection (see vecstore_notify_object_freed()'s own comment).
 extern void vecstore_notify_object_freed(const char* collection_name);
 
+// Forward declaration -- Phase 14a (LPAR) destroy-time object story. The
+// loader owns the binary store (service_binaries[]), so catalog teardown
+// delegates to it rather than reaching into the array directly: every
+// catalog object freed below has an uploaded binary in the store, and
+// without this call its slot would stay active forever, permanently
+// leaking one of the 16 binary-store slots per destroy (repeated
+// create/upload/destroy cycles exhaust the store). A bare extern here
+// (not a #include), same convention as vecstore_notify_object_freed()
+// just above -- loader.h's include graph (process.h, simi_translate.h)
+// is exactly the heavy dependency this file's "bare extern" style exists
+// to avoid. A no-op call if the partition uploaded no binaries.
+extern uint32_t loader_vfree_partition(uint32_t partition_id);
+extern uint32_t loader_vfree(const char* name);
+
 // ─── Globals ──────────────────────────────────────────────────────────────────
 struct SLSObjectEntry  object_catalog[CATALOG_MAX_OBJECTS];
 struct SLSObjectRecord object_records[CATALOG_MAX_OBJECTS];
@@ -363,6 +377,14 @@ uint64_t sys_sls_vfree(const char* name) {
     vecstore_notify_object_freed(name);
     object_catalog[idx].active = 0;
     object_records[idx].field_count = 0;
+    // Phase 14a (LPAR) destroy-time object story, per-object half: free the
+    // binary-store slot this object was uploaded into, so a vfree + re-upload
+    // of a recycled name starts byte-for-byte fresh instead of inheriting the
+    // previous binary's stale size/format state (a smaller re-upload would
+    // otherwise keep the larger stale size — see loader_vfree()'s comment).
+    // No-op if the object was never uploaded; independent of the catalog
+    // entry above, which is why it can run after it is cleared.
+    loader_vfree(name);
     kernel_serial_printf("[CATALOG] vfree: '%s' released from address space.\n",
                          name);
     persist_catalog();
@@ -436,6 +458,21 @@ uint32_t catalog_vfree_partition(uint32_t partition_id) {
         object_records[i].field_count = 0;
         freed++;
     }
+    // Phase 14a (LPAR) destroy-time object story: free the binary-store
+    // slots the destroyed partition's objects were uploaded into. Each
+    // upload tags its slot with the owning object's resolved partition_id
+    // (loader.c), so this is a pure match-and-clear — independent of the
+    // catalog loop above, which is why it can run after it. Runs
+    // unconditionally and cheaply: an individually vfree'd object already
+    // freed its own slot via sys_sls_vfree -> loader_vfree(), so by
+    // destroy time any slot still matching must belong to an object the
+    // catalog loop is freeing anyway — but the scan costs nothing when
+    // nothing matches.
+    uint32_t freed_bins = loader_vfree_partition(partition_id);
+    if (freed_bins)
+        kernel_serial_printf("[CATALOG] vfree (partition %u teardown): "
+                             "%u binary-store slot(s) freed\n",
+                             (unsigned)partition_id, (unsigned)freed_bins);
     if (freed) persist_catalog();
     return freed;
 }

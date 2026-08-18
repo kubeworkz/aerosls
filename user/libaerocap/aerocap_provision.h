@@ -15,11 +15,15 @@
  *                         partition objects; it cannot set owner_uid,
  *                         perm_mask, or partition_id).
  *   sls_upload_binary() — write a program's binary bytes into an object.
+ *   sls_obj_vfree()     — delete an object AND its binary-store slot (the
+ *                         destroy-time companion to sls_obj_valloc(); the
+ *                         slot free is what makes a later valloc + upload
+ *                         of the same name start fresh).
  *
  * A program that provisions partitions and children includes this header
  * (which pulls in sls.h) and calls sls_partition_create / assign / destroy
- * (sls.h) plus sls_obj_valloc / sls_upload_binary (here); it never sees a
- * request struct or a raw syscall number.
+ * (sls.h) plus sls_obj_valloc / sls_upload_binary / sls_obj_vfree (here);
+ * it never sees a request struct or a raw syscall number.
  *
  * Conventions (matching kernel/object_catalog.h and kernel/loader.h — kept
  * in sync by hand, same posture as aerocap.h):
@@ -108,6 +112,17 @@ static inline int sls_obj_valloc(const char* name, uint32_t type,
     if (r == 0) return -1;
     if (out_obj_id) *out_obj_id = r;
     return 0;
+}
+
+/* Delete a catalog object and its binary-store slot (SYS_SLS_VFREE) — the
+ * destroy-time companion to sls_obj_valloc(). Phase 14a: the slot free is
+ * what guarantees a later valloc + upload of the same name starts
+ * byte-for-byte fresh (without it, a smaller re-upload would inherit the
+ * previous binary's stale size). Returns 0 on success, -1 if no such
+ * object. */
+static inline int sls_obj_vfree(const char* name) {
+    if (!name || !name[0]) return -1;
+    return (int)(int64_t)_sls_syscall(SLS_SYS_VFREE, (void*)name);
 }
 
 /* Write one chunk of binary data into the object's store. A single chunk

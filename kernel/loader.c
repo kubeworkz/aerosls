@@ -127,12 +127,18 @@ struct ServiceBinary* loader_get_or_alloc(const char* name, uint64_t obj_id) {
 uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
     if (!req || !req->chunk_len) return 1;
 
-    // Resolve object_id from the catalog
+    // Resolve object_id AND partition_id from the catalog. partition_id is
+    // captured on every upload (not just slot alloc) so the slot always
+    // tracks the object's current partition — a recycled object name
+    // re-tags its slot, which is what lets loader_vfree_partition() free
+    // exactly the right slots at partition_destroy() time.
     uint64_t obj_id = 0;
+    uint32_t partition_id = 0;
     for (uint32_t i = 0; i < object_catalog_count; i++) {
         if (!object_catalog[i].active) continue;
         if (ld_streq(object_catalog[i].name, req->object_name)) {
-            obj_id = object_catalog[i].object_id;
+            obj_id         = object_catalog[i].object_id;
+            partition_id   = object_catalog[i].partition_id;
             break;
         }
     }
@@ -142,6 +148,7 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req) {
         kernel_serial_print("[LOADER] upload: binary store full.\n");
         return 1;
     }
+    sb->partition_id = partition_id;
 
     uint32_t end = req->byte_offset + req->chunk_len;
     if (end > LOADER_MAX_BINARY_SIZE) {
@@ -471,6 +478,70 @@ uint64_t sys_sls_simi_info(struct SLSSimiInfoRequest* req) {
     if (!req) return 1;
     loader_simi_info_query(req->object_name, &req->result);
     return req->result.status == SIMI_INFO_STATUS_OK ? 0 : 1;
+}
+
+// ─── loader_slot_reset ────────────────────────────────────────────────────────
+// Phase 14a: the full reset shared by both vfree paths. The slot is reset
+// (not just active=0): size, format flags, name, and the 16 KiB payload
+// are all cleared, so a later upload of a recycled name starts byte-for-
+// byte fresh instead of inheriting stale size/format state. The payload
+// zeroise mirrors this project's zeroisation posture (see tls_store.c's
+// staging-buffer handling) — freed code bytes are not left resident for a
+// future slot owner to inherit.
+static void loader_slot_reset(struct ServiceBinary* sb) {
+    ld_memset(sb->data, 0, sizeof(sb->data));
+    sb->object_name[0] = '\0';
+    sb->object_id      = 0;
+    sb->partition_id   = 0;
+    sb->size           = 0;
+    sb->active         = 0;
+    sb->is_elf         = 0;
+    sb->is_simi        = 0;
+}
+
+// ─── loader_vfree_partition ───────────────────────────────────────────────────
+// Phase 14a (LPAR destroy-time object story): the loader-side half of
+// partition teardown. Every upload tags its slot with the owning object's
+// resolved partition_id (see sys_sls_upload_binary above), so freeing the
+// slots of a destroyed partition is a pure match-and-clear over the store —
+// no catalog lookup needed, and safe to run at any point in teardown.
+uint32_t loader_vfree_partition(uint32_t partition_id) {
+    uint32_t freed = 0;
+    for (uint32_t i = 0; i < MAX_SERVICE_BINARIES; i++) {
+        struct ServiceBinary* sb = &service_binaries[i];
+        if (!sb->active) continue;
+        if (sb->partition_id != partition_id) continue;
+        kernel_serial_printf("[LOADER] vfree (partition %u teardown): '%s'\n",
+                             (unsigned)partition_id, sb->object_name);
+        loader_slot_reset(sb);
+        freed++;
+    }
+    if (freed) persist_programs();   // batched, one persist for the whole pass
+    return freed;
+}
+
+// ─── loader_vfree ─────────────────────────────────────────────────────────────
+// Phase 14a per-object half: deactivates the binary-store slot whose
+// object_name matches, called from sys_sls_vfree() alongside the catalog
+// deactivation. Without this, a vfree + re-upload of a recycled object
+// name would inherit the previous binary's state: loader_get_or_alloc()
+// finds the still-active slot by name and only ever GROWS sb->size, so a
+// smaller re-upload keeps the stale larger size (and the stale bytes past
+// the new end) instead of starting fresh. Returns 1 if a slot was freed,
+// 0 if the object was never uploaded (or no such name).
+uint32_t loader_vfree(const char* name) {
+    if (!name || !name[0]) return 0;
+    for (uint32_t i = 0; i < MAX_SERVICE_BINARIES; i++) {
+        struct ServiceBinary* sb = &service_binaries[i];
+        if (!sb->active) continue;
+        if (!ld_streq(sb->object_name, name)) continue;
+        kernel_serial_printf("[LOADER] vfree (object vfree): '%s'\n",
+                             sb->object_name);
+        loader_slot_reset(sb);
+        persist_programs();
+        return 1;
+    }
+    return 0;
 }
 
 // ─── sys_sls_load ─────────────────────────────────────────────────────────────

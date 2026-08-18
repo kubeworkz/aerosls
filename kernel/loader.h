@@ -13,6 +13,15 @@
 struct ServiceBinary {
     char     object_name[PROC_NAME_LEN];
     uint64_t object_id;
+    // Phase 14a (LPAR destroy-time object story): the partition that owns
+    // this slot, resolved from the catalog entry at upload time (valloc
+    // normalises 0 -> the owner's current partition, so this is always the
+    // real partition, never a 0 placeholder). Re-tagged on EVERY upload
+    // (not just slot alloc) so a re-upload of a recycled name always
+    // reflects the object's current partition. Consulted by
+    // loader_vfree_partition() below to free a partition's slots at
+    // partition_destroy() time.
+    uint32_t partition_id;
     uint8_t  data[LOADER_MAX_BINARY_SIZE];
     uint32_t size;        // bytes written so far
     uint8_t  active;
@@ -205,6 +214,24 @@ struct ServiceBinary* loader_get_or_alloc(const char* object_name, uint64_t obj_
 
 // Write a chunk into the binary store
 uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req);
+
+// Phase 14a (LPAR destroy-time object story): deactivates every active
+// binary-store slot whose partition_id matches — the loader-side half of
+// partition teardown (called from catalog_vfree_partition()). Mirrors
+// sys_sls_vfree()'s per-entry shape: slot zeroed (active=0, size=0,
+// format flags cleared, name emptied, payload zeroised) so a later upload
+// of the same name starts fresh. Returns the number of slots freed.
+// Persists once at the end (persist_programs()) if anything was freed,
+// matching catalog_vfree_partition()'s batched-persist pattern.
+uint32_t loader_vfree_partition(uint32_t partition_id);
+
+// Phase 14a per-object half: deactivates the binary-store slot whose
+// object_name matches (called from sys_sls_vfree()). Same full reset as
+// loader_vfree_partition(), so a vfree + re-upload of a recycled object
+// name starts byte-for-byte fresh instead of inheriting the previous
+// binary's size/format state. Returns 1 if a slot was freed (persisting
+// via persist_programs()), 0 if the object was never uploaded.
+uint32_t loader_vfree(const char* name);
 
 // Load the binary for the named SERVICE_PROCESS object into the process's page
 // table.  Returns the detected entry point (e_entry for ELF, base_vaddr for flat).
