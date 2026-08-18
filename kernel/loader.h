@@ -223,6 +223,11 @@ uint64_t sys_sls_upload_binary(struct SLSUploadRequest* req);
 // of the same name starts fresh. Returns the number of slots freed.
 // Persists once at the end (persist_programs()) if anything was freed,
 // matching catalog_vfree_partition()'s batched-persist pattern.
+// Phase 14b (LPAR destroy-time SIMI cache story): also frees this
+// partition's SIMI activation-cache code frames via simi_vfree_partition()
+// (kernel/simi_translate.c) — safe only because partition_destroy() kills
+// the partition's processes (Step 1) before this runs (Step 2); see that
+// function's comment for the full safety argument.
 uint32_t loader_vfree_partition(uint32_t partition_id);
 
 // Phase 14a per-object half: deactivates the binary-store slot whose
@@ -231,6 +236,10 @@ uint32_t loader_vfree_partition(uint32_t partition_id);
 // name starts byte-for-byte fresh instead of inheriting the previous
 // binary's size/format state. Returns 1 if a slot was freed (persisting
 // via persist_programs()), 0 if the object was never uploaded.
+// Phase 14b: also RETIRES the object's SIMI activation via
+// simi_vfree_object() (name cleared, frames held until the owning
+// partition's destroy reclaims them) — see simi_translate.h for why
+// retiring beats freeing on the per-object path.
 uint32_t loader_vfree(const char* name);
 
 // Load the binary for the named SERVICE_PROCESS object into the process's page

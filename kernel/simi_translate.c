@@ -82,6 +82,18 @@ static uint8_t g_simi_code_buf[SIMI_CODE_BUF_SIZE];
 struct SimiActivation {
     char     object_name[PROC_NAME_LEN];   /* [0] == '\0' means unused slot */
     uint8_t  valid;
+    // Phase 14b (LPAR destroy-time SIMI cache story): the partition that
+    // owns this activation, captured at translation time from the
+    // ServiceBinary's partition_id (loader.c re-tags that field from the
+    // catalog entry on EVERY upload — see the Phase 14a comment there),
+    // so the tag always equals the catalog partition of the object that
+    // produced this translation. Re-tagged on every cache hit too: a
+    // retired slot (simi_vfree_object) reused by a same-content re-upload
+    // from a new partition must carry the NEW partition so the OLD
+    // partition's destroy can't free frames the new owner maps. Consulted
+    // by simi_vfree_partition() to free a partition's activations at
+    // partition_destroy() time.
+    uint32_t partition_id;
     uint32_t content_hash;
     uint32_t content_size;
     uint32_t code_pages;
@@ -221,6 +233,11 @@ uint64_t simi_translate_and_map(const char* object_name, uint64_t base_vaddr, ui
      * so it's identical this time too. Only the scratch page is
      * per-activation private state and always gets a fresh frame below. */
     if (act && act->valid && act->content_hash == hash && act->content_size == sb->size) {
+        /* Phase 14b: re-tag on hit — see the partition_id field comment.
+         * A retired slot reused by a same-content re-upload from a new
+         * partition must carry the new partition's tag, or the old
+         * partition's destroy would free frames the new owner maps. */
+        act->partition_id = sb->partition_id;
         for (uint32_t i = 0; i < act->code_pages; i++) {
             user_map_page(pml4, base_vaddr + (uint64_t)i * 4096, act->frame[i],
                           USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_EXEC);
@@ -365,6 +382,7 @@ uint64_t simi_translate_and_map(const char* object_name, uint64_t base_vaddr, ui
 
     if (act) {
         act->valid         = 1;
+        act->partition_id  = sb->partition_id;   /* Phase 14b: tag at stash */
         act->content_hash  = hash;
         act->content_size  = sb->size;
         act->code_pages    = total_pages;
@@ -382,4 +400,98 @@ uint64_t simi_translate_and_map(const char* object_name, uint64_t base_vaddr, ui
         object_name, total_len, total_pages, scratch_vaddr, base_vaddr + stub_off);
 
     return base_vaddr + stub_off;
+}
+
+// ─── Phase 14b (LPAR): destroy-time activation-cache teardown ────────────────
+// The shared cache is deliberately partition-agnostic in Phase 4 (one slot
+// per object name, code frames shared across every process that spawns the
+// object — see the header comment for why that's correct). This phase gives
+// it a destroy-time story: activations are now tagged with the owning
+// partition, and partition teardown frees them. Before this phase, the code
+// frames of a destroyed partition's SIMI objects were never reclaimed — the
+// frames are allocated via allocate_physical_ram_frame() (owner =
+// PARTITION_SYSTEM), so partition_reclaim_all_frames() can't see them, and
+// per-process teardown deliberately skips them (simi_frame_is_cached), so
+// repeated create -> SIMI-spawn -> destroy cycles leaked code frames until
+// the activation table (16 slots) filled up and every spawn degraded to a
+// retranslation.
+//
+// WHY freeing SHARED code frames at destroy is safe (the decision):
+//   1. Both spawn paths (process_create and program_spawn_common) enforce
+//      catalog_check_access()'s partition boundary, so a process can only
+//      ever spawn an object whose catalog partition matches its own —
+//      every process mapping an activation's frames lives in the
+//      activation's OWN partition (the tag == the catalog partition, see
+//      the partition_id field comment).
+//   2. partition_destroy() Step 1 (process_kill_partition) synchronously
+//      tears down every process in the partition — including all of the
+//      activation's mappers — BEFORE Step 2 (catalog/loader vfree) reaches
+//      simi_vfree_partition() here. The per-process teardown walks run
+//      while the slots are still valid, so they see the code frames as
+//      cached and skip them (no double-free); only then does this pass
+//      free the frames, when no live process anywhere maps them.
+//   Ordering is load-bearing: simi_vfree_partition() must never run before
+//   the partition's processes are gone — that is guaranteed by the caller
+//   (loader_vfree_partition() runs in partition_destroy()'s Step 2).
+//
+// The per-object half (simi_vfree_object) deliberately RETIRES instead of
+// freeing: a vfree can be issued while the object's activation is still
+// mapped by live processes (nothing in the syscall ABI forbids it — today's
+// synchronous spawns can't reach it, but async SIMI spawns would), and
+// freeing shared frames out from under a live mapper is exactly the crash
+// simi_frame_is_cached() exists to prevent. Retiring clears the name so the
+// slot can never match a future find_activation() — a re-valloc'd object of
+// the same name therefore translates fresh instead of inheriting a stale
+// cross-partition activation, which is what keeps invariant (1) above true
+// across name reuse — while partition_id and the frames are kept so the
+// owning partition's destroy still reclaims them exactly once. Retired
+// frames therefore outlive the vfree until partition destroy: a deliberate,
+// bounded retention — never a use-after-free, reclaimed once at destroy.
+
+static void simi_activation_slot_reset(struct SimiActivation* act) {
+    tt_memset(act->frame, 0, sizeof(act->frame));
+    act->object_name[0] = '\0';
+    act->valid          = 0;
+    act->partition_id   = 0;
+    act->content_hash   = 0;
+    act->content_size   = 0;
+    act->code_pages     = 0;
+    act->entry_off      = 0;
+}
+
+uint32_t simi_vfree_partition(uint32_t partition_id) {
+    uint32_t freed = 0;
+    for (int i = 0; i < SIMI_MAX_ACTIVATIONS; i++) {
+        struct SimiActivation* act = &g_activations[i];
+        if (!act->valid) continue;
+        if (act->partition_id != partition_id) continue;
+        /* Matches valid AND retired slots: retirement (simi_vfree_object)
+         * clears the name but keeps valid + partition_id + frames, so the
+         * owning partition's destroy reclaims the frames exactly once. */
+        kernel_serial_printf(
+            "[SIMI] activation vfree (partition %u teardown): '%s' "
+            "(%u code page(s))\n",
+            (unsigned)partition_id,
+            act->object_name[0] ? act->object_name : "<retired>",
+            (unsigned)act->code_pages);
+        for (uint32_t p = 0; p < act->code_pages; p++) {
+            free_physical_ram_frame((void*)(uintptr_t)act->frame[p]);
+        }
+        simi_activation_slot_reset(act);
+        freed++;
+    }
+    return freed;
+}
+
+uint32_t simi_vfree_object(const char* name) {
+    if (!name || !name[0]) return 0;
+    struct SimiActivation* act = tt_find_activation(name);
+    if (!act || !act->valid) return 0;
+    kernel_serial_printf(
+        "[SIMI] activation vfree (object vfree): '%s' — retired (%u code "
+        "page(s) held until partition destroy)\n",
+        name, (unsigned)act->code_pages);
+    /* Retire, don't free — see the Phase 14b comment block above. */
+    act->object_name[0] = '\0';
+    return 1;
 }

@@ -516,6 +516,21 @@ uint32_t loader_vfree_partition(uint32_t partition_id) {
         loader_slot_reset(sb);
         freed++;
     }
+    // Phase 14b (LPAR) destroy-time SIMI cache story: free the matching
+    // activation-cache slots' code frames too. Independent of the binary-
+    // slot loop above (an activation can outlive its object's binary slot
+    // via the retire path — see simi_translate.c's Phase 14b block), which
+    // is why this runs unconditionally, matching catalog_vfree_partition()'s
+    // own "scan costs nothing when nothing matches" posture. Safe only here
+    // (partition_destroy() Step 2, after Step 1 killed every process in the
+    // partition): the code frames are SHARED across the activation's
+    // mappers, all of which live in this partition — see simi_vfree_
+    // partition()'s comment for the full safety argument.
+    uint32_t freed_acts = simi_vfree_partition(partition_id);
+    if (freed_acts)
+        kernel_serial_printf("[LOADER] vfree (partition %u teardown): "
+                             "%u SIMI activation(s) freed\n",
+                             (unsigned)partition_id, (unsigned)freed_acts);
     if (freed) persist_programs();   // batched, one persist for the whole pass
     return freed;
 }
@@ -538,6 +553,11 @@ uint32_t loader_vfree(const char* name) {
         kernel_serial_printf("[LOADER] vfree (object vfree): '%s'\n",
                              sb->object_name);
         loader_slot_reset(sb);
+        // Phase 14b: retire the object's activation (simi_vfree_object —
+        // retire, not free; see its comment for why freeing shared code
+        // frames here could yank them out from under a live mapper). The
+        // frames are reclaimed when the owning partition is destroyed.
+        simi_vfree_object(name);
         persist_programs();
         return 1;
     }
