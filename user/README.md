@@ -74,7 +74,8 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # named files, parking on a full pipe without
                   # rewriting the files), echo, sh (minimal
                   # interactive shell — console
-                  # commands, | pipelines, $? last-exit-status,
+                  # commands, | pipelines (waiting for every stage,
+                  # $? = the last stage's status),
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
                   # variable expansion, export/setenv/unset/unsetenv
                   # builtins + NAME=value scoped assignments that mutate
@@ -298,11 +299,15 @@ script + the manifest's `image` record) is the sidecar build step; see
   (all 10000 lines through repeated park/wake cycles) — and a
   multi-line-chunk pair (`cat /etc/mixed.txt | grep fig` and
   `| head -n 2`) pinning per-line extraction when a single read
-  holds several lines — plus a tee session (`seq 5 | tee /tmp/t5.out`
+  holds several lines —  plus a tee session (`seq 5 | tee /tmp/t5.out`
   round-tripped through `cat`, and `seq 10000 | tee /tmp/tee.out
   | head -n 3`, where tee's stdout wakes to `EPIPE` while the file
-  keeps the whole stream prefix) — through the real driver,
-  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  keeps the whole stream prefix), and a pipeline-status matrix
+  pinning last-stage-wins: `false | echo hi` → 0, `echo hi | false`
+  → 1, three-stage `false | seq 3 | true` → 0 and `seq 3 | true
+  | false` → 1, and a missing last command (`echo hi | nope`) → 127
+  — through the real driver, asserting the console transcript byte
+  for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.

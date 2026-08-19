@@ -166,6 +166,7 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/seq", b"seq\n", 0o755);
     b.add_file("/bin/tee", b"tee\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
+    b.add_file("/bin/true", b"true\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
     // A second bin dir so PATH-driven lookup has somewhere to search:
     // greet lives only under /usr/bin.
@@ -578,10 +579,36 @@ fn boot_runs_an_interactive_shell() {
     booted.run(100);
     console.console_io().push_input(b"seq 10000 | tee /tmp/tee.out | head -n 3\n");
     booted.run(100);
+    // The pipeline waits for EVERY stage and `$?` is the LAST stage's
+    // status (not the first failure, not the first stage): `false | echo
+    // hi` exits 0 (echo last), `echo hi | false` exits 1 (false last —
+    // and hi is correctly lost in the pipe), the three-stage `false |
+    // seq 3 | true` exits 0 while `seq 3 | true | false` exits 1, and a
+    // missing last command (`echo hi | nope`) exits 127.
+    console.console_io().push_input(b"false | echo hi\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo hi | false\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    console.console_io().push_input(b"false | seq 3 | true\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 3 | true | false\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo hi | nope\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
     assert_eq!(
         console.console_io().output(),
-        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ ",
-        "tee fanned the stream to the console and the file, and outlived head's early exit"
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ hi\n$ 0\n$ $ 1\n$ $ 0\n$ $ 1\n$ $ 127\n$ ",
+        "tee fanned the stream to the console and the file, outlived head's early exit, and $? followed the last pipeline stage"
     );
 
     // The file side of the fan-out: t5.out holds the exact stream, and

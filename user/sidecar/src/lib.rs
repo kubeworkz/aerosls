@@ -13,7 +13,8 @@
 //!   (Phase 2 §6.2).
 //! - `applets`    — the built-in registry: the `init` boot-script runner
 //!   (executes `/etc/init.rc`, one forked child per command), `cat`, `echo`,
-//!   `sh` (the minimal interactive shell — console commands, pipelines,
+//!   `sh` (the minimal interactive shell — console commands, pipelines
+//!   (waiting for every stage, with `$?` = the last stage's status),
 //!   `<`/`>` redirects, `'...'`/`"..."` quoting, backslash escapes,
 //!   `$?` and `$VAR`/`${VAR}` expansion, `export`/`setenv`/`unset`/
 //!   `unsetenv` builtins and `NAME=value` scoped assignments that
