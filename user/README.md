@@ -65,7 +65,8 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # cat, echo, sh (minimal interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
-                  # variable expansion, < and > redirects), true/false
+                  # variable expansion, export/setenv builtins that
+                  # mutate the env, < and > redirects), true/false
                   # + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
                   # and boot(): handshake with the ramdisk driver, mount /
@@ -237,19 +238,23 @@ script + the manifest's `image` record) is the sidecar build step; see
   single / double quotes (grouping whitespace into one
   argument — `'…'` fully literal, `"…"` still expanding `$?`) plus
   backslash escapes (`\ `, `\$`, `\|`, … are literal; inside double
-  quotes only `$`, `"`, `\` are escapable, per POSIX), with `$VAR` /
+  quotes only `$`, `"`, `\` are escapable, per POSIX), with  `$VAR` /
   `${VAR}` expansion against a persistent shell environment (`PATH=/bin`,
   `HOME=/root`; unset names expand to nothing — the env region survives
-  pipeline waits and batch reaps), waits, and tracks the
+  pipeline waits and batch reaps), with `export` (list or set `NAME=value`
+  entries in place) and `setenv NAME value` builtins that run in the
+  shell itself and mutate that region, waits, and tracks the
   last exit status as `$?` — the boot test drives a full
   `echo hello | cat` pipeline, a `false` → `echo $?` sequence, an
   `echo saved > /tmp/saved` file write, a `cat < /etc/passwd` read,
   a pasted two-line batch, quoted/escaped arguments
   (`echo "hello world" | cat`, `echo '$?'` printed literally,
   `echo hello\ world`, a quoted double space surviving the fork
-  snapshot exactly, and `echo $PATH ${HOME}` expanding the shell's
-  environment) through the real driver, asserting the console
-  transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  snapshot exactly, `echo $PATH ${HOME}` expanding the shell's
+  environment, and an `export`/`setenv` session that sets `FOO`, sets a
+  quoted `GREETING`, overwrites `HOME` in place, turns a usage error
+  into `$? = 2`, and lists the mutated environment) through the real
+  driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.

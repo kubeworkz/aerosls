@@ -15,7 +15,8 @@
 //!   (executes `/etc/init.rc`, one forked child per command), `cat`, `echo`,
 //!   `sh` (the minimal interactive shell — console commands, pipelines,
 //!   `<`/`>` redirects, `'...'`/`"..."` quoting, backslash escapes,
-//!   `$?` and `$VAR`/`${VAR}` expansion), `true`/`false` — plus
+//!   `$?` and `$VAR`/`${VAR}` expansion, `export`/`setenv` builtins
+//!   that mutate the env), `true`/`false` — plus
 //!   `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.

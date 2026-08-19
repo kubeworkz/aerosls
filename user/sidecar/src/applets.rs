@@ -29,8 +29,10 @@
 //!   `>` redirect stdin/stdout per stage (the redirect overrides the
 //!   pipeline connection, like POSIX), single / double quotes group
 //!   whitespace into one argument (`'…'` fully literal, `"…"` still
-//!   expanding `$?`), and backslash escapes the next character outside
-//!   quotes (so `\ `, `\$`, `\|`, … are literal).
+//!   expanding `$?`), backslash escapes the next character outside
+//!   quotes (so `\ `, `\$`, `\|`, … are literal), and the builtins
+//!   `export` (set / list the environment) and `setenv NAME value` run
+//!   in the shell itself, mutating the persistent env region.
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
@@ -159,26 +161,8 @@ fn init_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     if stage.argv.is_empty() {
         return Step::Exit(127);
     }
-    let task = ctx.task;
-    if let Some(path) = &stage.out_redir {
-        let fd = match ctx.vfs().open(task, path, O_CREAT | O_WRONLY | O_TRUNC, 0o644) {
-            Ok(fd) => fd,
-            Err(_) => return Step::Exit(127),
-        };
-        if ctx.vfs().dup2(task, fd, 1).is_err() {
-            return Step::Exit(127);
-        }
-        ctx.vfs().close(task, fd).ok();
-    }
-    if let Some(path) = &stage.in_redir {
-        let fd = match ctx.vfs().open(task, path, O_RDONLY, 0) {
-            Ok(fd) => fd,
-            Err(_) => return Step::Exit(127),
-        };
-        if ctx.vfs().dup2(task, fd, 0).is_err() {
-            return Step::Exit(127);
-        }
-        ctx.vfs().close(task, fd).ok();
+    if !apply_redirects(ctx, stage) {
+        return Step::Exit(127);
     }
     let argv: Vec<&str> = stage.argv.iter().map(|a| a.as_str()).collect();
     match ctx.exec(stage.argv[0].as_str(), &argv) {
@@ -275,10 +259,12 @@ pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// Append a length-prefixed env region to `data`: `[n, (name_len, name,
-/// val_len, val)...]` — the shell's variable table (see `sh`).
-fn env_push(data: &mut Vec<u8>, entries: &[(&str, &str)]) {
+/// val_len, val)...]` — the shell's variable table (see `sh`). Accepts
+/// either `(&str, &str)` or `(String, String)` pairs.
+fn env_push<S: AsRef<str>>(data: &mut Vec<u8>, entries: &[(S, S)]) {
     data.push(entries.len() as u8);
     for (k, v) in entries {
+        let (k, v) = (k.as_ref(), v.as_ref());
         data.push(k.len() as u8);
         data.extend_from_slice(k.as_bytes());
         data.push(v.len() as u8);
@@ -341,6 +327,62 @@ fn env_pairs(data: &[u8], start: usize) -> Vec<(String, String)> {
         out.push((name.to_string(), val.to_string()));
     }
     out
+}
+
+/// Upsert a variable in an env pair list: replace in place (keeping the
+/// region order) or append a new entry.
+fn set_var(env: &mut Vec<(String, String)>, name: String, value: String) {
+    match env.iter_mut().find(|(k, _)| *k == name) {
+        Some(slot) => slot.1 = value,
+        None => env.push((name, value)),
+    }
+}
+
+/// A valid shell variable name: letters, digits and `_`, starting with a
+/// letter or `_` (the same rule the tokenizer's `$NAME` expansion uses).
+fn valid_name(name: &str) -> bool {
+    let mut cs = name.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A command the shell runs itself instead of forking: builtins mutate
+/// the shell's persistent env region, so they must execute in the shell
+/// task. v1: recognized only as the bare name (no `/`), standalone
+/// (no pipeline) — see `run_line`.
+fn is_builtin(name: &str) -> bool {
+    matches!(name, "export" | "setenv")
+}
+
+/// Apply a stage's `<` / `>` redirects at fd 0 / fd 1. Returns false on
+/// failure — the caller picks the exit status (127 for a program child,
+/// 2 for a builtin).
+fn apply_redirects<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>, stage: &Stage) -> bool {
+    let task = ctx.task;
+    if let Some(path) = &stage.out_redir {
+        let fd = match ctx.vfs().open(task, path, O_CREAT | O_WRONLY | O_TRUNC, 0o644) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        if ctx.vfs().dup2(task, fd, 1).is_err() {
+            return false;
+        }
+        ctx.vfs().close(task, fd).ok();
+    }
+    if let Some(path) = &stage.in_redir {
+        let fd = match ctx.vfs().open(task, path, O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        if ctx.vfs().dup2(task, fd, 0).is_err() {
+            return false;
+        }
+        ctx.vfs().close(task, fd).ok();
+    }
+    true
 }
 
 /// `sh`: the minimal interactive shell. Data layout: `data[0]` = phase,
@@ -414,10 +456,13 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
-/// Phase 2: run the first complete line of the buffered batch. The queued
-/// remainder is appended after every fork snapshot and the wait state, so
-/// multi-line input runs line by line and nothing is dropped. See
-/// `sh_child` for the fork-snapshot layout.
+/// Phase 2: run the first complete line of the buffered batch. A
+/// standalone `export`/`setenv` command is intercepted as a builtin and
+/// runs in the shell task (it mutates the env region); anything else
+/// forks one child per pipeline stage. The queued remainder is appended
+/// after every fork snapshot and the wait state, so multi-line input
+/// runs line by line and nothing is dropped. See `sh_child` for the
+/// fork-snapshot layout.
 fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     let status = ctx.data[1];
@@ -446,6 +491,13 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data.extend_from_slice(&env_region);
         ctx.data.extend_from_slice(&remainder);
         return Step::Yield;
+    }
+    // A standalone builtin (export/setenv) runs in the shell itself — it
+    // mutates the persistent env region, so it can't be a forked child.
+    // In a pipeline it resolves as a program and fails 127 like any
+    // unknown command.
+    if stages.len() == 1 && is_builtin(&stages[0].argv[0]) {
+        return run_builtin(ctx, &stages[0], &remainder, &env);
     }
     // Inter-stage pipes; the fds land above stdio (0,1,2 = console).
     let mut pipes: Vec<u32> = Vec::new();
@@ -565,6 +617,101 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             Step::Yield
         }
     }
+}
+
+/// Run a builtin command in the shell task: apply the stage's redirects
+/// (so `export > file` writes the listing there), execute the builtin
+/// against a copy of the env, and rebuild the persistent data — the new
+/// env region, the exit status (for the next `$?`), and the unconsumed
+/// batch — then continue to the next buffered line or the prompt.
+fn run_builtin<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    stage: &Stage,
+    remainder: &[u8],
+    env: &[(String, String)],
+) -> Step {
+    let task = ctx.task;
+    if !apply_redirects(ctx, stage) {
+        return builtin_done(ctx, remainder, env, 2);
+    }
+    let mut new_env = env.to_vec();
+    let code = match stage.argv[0].as_str() {
+        "export" => do_export(&mut new_env, &stage.argv[1..], task, ctx),
+        "setenv" => do_setenv(&mut new_env, &stage.argv[1..]),
+        _ => 2, // unreachable: is_builtin guards the call
+    };
+    builtin_done(ctx, remainder, &new_env, code)
+}
+
+/// Rebuild the shell's persistent data after a builtin: `[phase, status,
+/// env..., remainder...]` — phase 0 (prompt) if the batch drained,
+/// else phase 1 (next buffered line).
+fn builtin_done<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    remainder: &[u8],
+    env: &[(String, String)],
+    code: u8,
+) -> Step {
+    ctx.data.clear();
+    ctx.data.push(if remainder.is_empty() { 0 } else { 1 });
+    ctx.data.push(code);
+    env_push(&mut ctx.data, env);
+    ctx.data.extend_from_slice(remainder);
+    Step::Yield
+}
+
+/// `export` builtin: no args lists the environment (NAME=value lines in
+/// region order); `export NAME=value` sets a variable (upsert); `export
+/// NAME` is a no-op success — v1 exports everything implicitly, so there
+/// is nothing to mark. A bad name is a usage error (2).
+fn do_export<K: Kernel, A: BufferAlloc>(
+    env: &mut Vec<(String, String)>,
+    args: &[String],
+    task: u32,
+    ctx: &mut Ctx<'_, K, A>,
+) -> u8 {
+    if args.is_empty() {
+        let mut text = String::new();
+        for (k, v) in env.iter() {
+            text.push_str(k);
+            text.push('=');
+            text.push_str(v);
+            text.push('\n');
+        }
+        return if ctx.vfs().write(task, 1, text.as_bytes()).is_err() {
+            2
+        } else {
+            0
+        };
+    }
+    for a in args {
+        match a.find('=') {
+            Some(eq) => {
+                let (name, value) = a.split_at(eq);
+                if !valid_name(name) {
+                    return 2;
+                }
+                set_var(env, name.to_string(), value[1..].to_string());
+            }
+            None => {
+                if !valid_name(a) {
+                    return 2;
+                }
+                // `export NAME` without `=` — mark-export is a no-op.
+            }
+        }
+    }
+    0
+}
+
+/// `setenv` builtin: `setenv NAME value` sets a variable (upsert). Any
+/// other arity, or a bad name, is a usage error (2).
+fn do_setenv(env: &mut Vec<(String, String)>, args: &[String]) -> u8 {
+    if args.len() != 2 || !valid_name(&args[0]) {
+        return 2;
+    }
+    set_var(env, args[0].clone(), args[1].clone());
+    0
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,

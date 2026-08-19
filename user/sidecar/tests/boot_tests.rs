@@ -317,6 +317,51 @@ fn boot_runs_an_interactive_shell() {
         "variable expansion reached the applet through the shell"
     );
 
+    // Builtins: `export NAME=value` and `setenv NAME value` mutate the
+    // shell's persistent env region, so `$VAR` expands to the new value
+    // in the next command.
+    console.console_io().push_input(b"export FOO=bar\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $FOO\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ ",
+        "export's variable set was visible to the next command's expansion"
+    );
+
+    // setenv takes the value as a separate (quoted) argument.
+    console.console_io().push_input(b"setenv GREETING \"hi there\"\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $GREETING\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ ",
+        "setenv's quoted value survived expansion in the next command"
+    );
+
+    // A usage error (setenv with one argument) exits 2, which becomes $?.
+    console.console_io().push_input(b"export HOME=/home/root\nsetenv onlyname\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ ",
+        "the builtin's usage error became the next $?"
+    );
+
+    // `export` with no args lists the environment in region order: PATH
+    // first, HOME overwritten in place, then the appended FOO/GREETING.
+    console.console_io().push_input(b"export\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ ",
+        "export listed the mutated environment in region order"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }
