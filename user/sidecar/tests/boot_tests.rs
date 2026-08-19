@@ -307,6 +307,16 @@ fn boot_runs_an_interactive_shell() {
         "quoted spacing arrived at the applet exactly as typed"
     );
 
+    // Variable expansion: $PATH and ${HOME} resolve from the shell's
+    // built-in environment (the env region survives the pipeline waits).
+    console.console_io().push_input(b"echo $PATH ${HOME}\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ ",
+        "variable expansion reached the applet through the shell"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }

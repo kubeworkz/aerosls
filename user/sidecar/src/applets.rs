@@ -10,7 +10,8 @@
 //!   line, forking one child per command and waiting for it (the design's
 //!   "rc scripts" step). Commands parse through the same word parser as
 //!   `sh` — quotes, backslash escapes, `<`/`>` redirects (`$?` expands to
-//!   0, since init tracks no status). A line containing `|` fails 127:
+//!   0 and `$VAR` to nothing, since init tracks no status and has no
+//!   environment). A line containing `|` fails 127:
 //!   init runs one command per line, and a piped line is an error, not a
 //!   silently dropped stage. `#` comments and blank lines are skipped.
 //!   When the script is consumed, init exits 0 (a real init would park
@@ -148,8 +149,9 @@ fn init_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         Ok(s) => s,
         Err(_) => return Step::Exit(127),
     };
-    // `$?` is always 0: init tracks no exit status.
-    let stages = parse_line(line, 0);
+    // `$?` is always 0 (init tracks no status) and `$VAR` expands to
+    // nothing (init has no environment).
+    let stages = parse_line(line, 0, &[]);
     if stages.len() != 1 {
         return Step::Exit(127);
     }
@@ -272,21 +274,98 @@ pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     Step::Exit(1)
 }
 
+/// Append a length-prefixed env region to `data`: `[n, (name_len, name,
+/// val_len, val)...]` — the shell's variable table (see `sh`).
+fn env_push(data: &mut Vec<u8>, entries: &[(&str, &str)]) {
+    data.push(entries.len() as u8);
+    for (k, v) in entries {
+        data.push(k.len() as u8);
+        data.extend_from_slice(k.as_bytes());
+        data.push(v.len() as u8);
+        data.extend_from_slice(v.as_bytes());
+    }
+}
+
+/// The index just past the env region starting at `start` — where the
+/// input queue begins. A malformed or truncated region is treated as
+/// consuming the rest of the data (defensive; the shell never builds one).
+fn env_end(data: &[u8], start: usize) -> usize {
+    let Some(&n) = data.get(start) else {
+        return data.len();
+    };
+    let mut p = start + 1;
+    for _ in 0..n {
+        let Some(&nl) = data.get(p) else {
+            return data.len();
+        };
+        p += 1 + nl as usize;
+        let Some(&vl) = data.get(p) else {
+            return data.len();
+        };
+        p += 1 + vl as usize;
+    }
+    p
+}
+
+/// Decode the env region starting at `start` into name/value pairs (a
+/// malformed region yields what was decodable).
+fn env_pairs(data: &[u8], start: usize) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(&n) = data.get(start) else {
+        return out;
+    };
+    let mut p = start + 1;
+    for _ in 0..n {
+        let Some(&nl) = data.get(p) else {
+            break;
+        };
+        let nl = nl as usize;
+        let Some(name) = data
+            .get(p + 1..p + 1 + nl)
+            .and_then(|b| core::str::from_utf8(b).ok())
+        else {
+            break;
+        };
+        p += 1 + nl;
+        let Some(&vl) = data.get(p) else {
+            break;
+        };
+        let vl = vl as usize;
+        let Some(val) = data
+            .get(p + 1..p + 1 + vl)
+            .and_then(|b| core::str::from_utf8(b).ok())
+        else {
+            break;
+        };
+        p += 1 + vl;
+        out.push((name.to_string(), val.to_string()));
+    }
+    out
+}
+
 /// `sh`: the minimal interactive shell. Data layout: `data[0]` = phase,
-/// `data[1]` = last exit status (`$?`), `data[2..]` = the input batch
-/// queue (unconsumed console bytes, possibly several lines). Phase 0
-/// prints the prompt, phase 1 consumes a complete buffered line or reads
-/// more console input (parking on an empty console via `read_blocking`),
-/// phase 2 runs the first buffered line, phase 3 reaps the pipeline's
-/// children in order — the queued remainder survives all of it, so a
+/// `data[1]` = last exit status (`$?`), `data[2..]` = the env region
+/// (length-prefixed name/value list — `env_end` finds where it ends), and
+/// after that the input batch queue (unconsumed console bytes, possibly
+/// several lines). Phase 0 prints the prompt (initializing the default
+/// environment: `PATH=/bin`, `HOME=/root`), phase 1 consumes a complete
+/// buffered line or reads more console input (parking on an empty console
+/// via `read_blocking`), phase 2 runs the first buffered line, phase 3
+/// reaps the pipeline's children in order — the env region and the queued
+/// remainder survive all of it (rebuilt after the wait state), so a
 /// multi-line read runs line by line with a single prompt around the
-/// batch. A pipeline child's fork snapshot carries `[2, status, stage,
-/// n_stages, nfd, pipes..., in_len, in..., out_len, out..., n_args,
-/// (arg_len, arg...)..., queue, FORK_MARKER]` — see `sh_child`.
+/// batch and `$VAR` expansion keeps working. A pipeline child's fork
+/// snapshot carries `[2, status, stage, n_stages, nfd, pipes..., in_len,
+/// in..., out_len, out..., n_args, (arg_len, arg...)..., queue,
+/// FORK_MARKER]` — argv is already expanded on the parent side, so the
+/// child needs no env — see `sh_child`.
 pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     if ctx.data.is_empty() {
+        // Default environment: PATH=/bin (the directory resolve_path
+        // searches) and HOME=/root, encoded as the env region.
         ctx.data.extend_from_slice(&[0, 0]); // phase, last status
+        env_push(&mut ctx.data, &[("PATH", "/bin"), ("HOME", "/root")]);
         return Step::Yield;
     }
     if is_child(&ctx.data) {
@@ -301,8 +380,9 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             Step::Yield
         }
         1 => {
+            let qstart = env_end(&ctx.data, 2);
             // A buffered complete line runs without touching the console.
-            if ctx.data[2..].contains(&b'\n') {
+            if ctx.data[qstart..].contains(&b'\n') {
                 ctx.data[0] = 2;
                 return Step::Yield;
             }
@@ -310,7 +390,7 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             match ctx.read_blocking(0, &mut buf) {
                 // EOF: run any partial buffered line, then exit.
                 ReadBlock::Data(0) => {
-                    if ctx.data.len() > 2 {
+                    if ctx.data.len() > qstart {
                         ctx.data[0] = 2;
                         Step::Yield
                     } else {
@@ -319,7 +399,7 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                 }
                 ReadBlock::Data(n) => {
                     ctx.data.extend_from_slice(&buf[..n]);
-                    if ctx.data[2..].contains(&b'\n') {
+                    if ctx.data[qstart..].contains(&b'\n') {
                         ctx.data[0] = 2;
                     }
                     Step::Yield
@@ -341,23 +421,29 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     let status = ctx.data[1];
-    // The first complete line (or the whole buffer at EOF) and the rest.
-    let nl = ctx.data[2..].iter().position(|&b| b == b'\n');
+    // The env region sits between phase/status and the queue; both the
+    // line and the unconsumed remainder live after it.
+    let qstart = env_end(&ctx.data, 2);
+    let env_region = ctx.data[2..qstart].to_vec();
+    let nl = ctx.data[qstart..].iter().position(|&b| b == b'\n');
     let (line, remainder) = match nl {
-        Some(i) => (ctx.data[2..2 + i].to_vec(), ctx.data[2 + i + 1..].to_vec()),
-        None => (ctx.data[2..].to_vec(), Vec::new()),
+        Some(i) => (ctx.data[qstart..qstart + i].to_vec(), ctx.data[qstart + i + 1..].to_vec()),
+        None => (ctx.data[qstart..].to_vec(), Vec::new()),
     };
     let line = match core::str::from_utf8(&line) {
         Ok(s) => s.trim(),
         Err(_) => "", // garbage: drop the line like a comment
     };
-    let stages = parse_line(line, status);
+    let env = env_pairs(&ctx.data, 2);
+    let stages = parse_line(line, status, &env);
     if stages.is_empty() {
         // Blank or comment line: drop it; re-prompt only if the batch is
         // drained, otherwise continue straight to the next buffered line.
+        // The env region survives the rebuild.
         ctx.data.clear();
         ctx.data.push(if remainder.is_empty() { 0 } else { 1 });
         ctx.data.push(status);
+        ctx.data.extend_from_slice(&env_region);
         ctx.data.extend_from_slice(&remainder);
         return Step::Yield;
     }
@@ -419,7 +505,7 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     for fd in &pipes {
         ctx.vfs().close(task, *fd).ok();
     }
-    // Wait state: [3, status, n, reaped, children..., remainder].
+    // Wait state: [3, status, n, reaped, children..., env..., remainder].
     ctx.data.clear();
     ctx.data.push(3);
     ctx.data.push(status);
@@ -428,6 +514,7 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     for c in &children {
         ctx.data.push(*c as u8);
     }
+    ctx.data.extend_from_slice(&env_region);
     ctx.data.extend_from_slice(&remainder);
     let c = children[0];
     match ctx.wait(c) {
@@ -450,12 +537,16 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let n = ctx.data[2] as usize;
     let reaped = ctx.data[3] as usize;
     if reaped >= n {
-        // The queued remainder survives at data[4+n..].
-        let queue = ctx.data[4 + n..].to_vec();
+        // Children ids sit at data[4..4+n]; the env region and the queued
+        // remainder survive after them.
+        let qstart = env_end(&ctx.data, 4 + n);
+        let env_region = ctx.data[4 + n..qstart].to_vec();
+        let queue = ctx.data[qstart..].to_vec();
         let status = ctx.data[1];
         ctx.data.clear();
         ctx.data.push(if queue.is_empty() { 0 } else { 1 });
         ctx.data.push(status);
+        ctx.data.extend_from_slice(&env_region);
         ctx.data.extend_from_slice(&queue);
         return Step::Yield;
     }
@@ -597,20 +688,83 @@ enum Tok {
     RedirectOut,
 }
 
+/// Expand a `$...` variable reference starting at `chars[i]` (a `$`) into
+/// `word`, returning the index just past the expansion. `$?` / `${?}` is
+/// the last exit status; `$NAME` / `${NAME}` resolves through `env` (a
+/// name is letters, digits and `_`, starting with a letter or `_`; an
+/// unset name expands to nothing — POSIX). A `$` not followed by a name
+/// or `{` is literal; an unterminated `${` is literal too (v1 lenient).
+fn expand_var(
+    chars: &[char],
+    i: usize,
+    last_status: u8,
+    env: &[(String, String)],
+    word: &mut String,
+) -> usize {
+    debug_assert_eq!(chars[i], '$');
+    let next = match chars.get(i + 1) {
+        Some(&c) => c,
+        None => {
+            word.push('$');
+            return i + 1;
+        }
+    };
+    if next == '{' {
+        match chars[i + 2..].iter().position(|&c| c == '}') {
+            Some(rel) => {
+                let name: String = chars[i + 2..i + 2 + rel].iter().collect();
+                let val = if name == "?" {
+                    Some(last_status.to_string())
+                } else {
+                    env.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone())
+                };
+                word.push_str(&val.unwrap_or_default());
+                i + 3 + rel
+            }
+            None => {
+                // Unterminated `${` — literal (v1 lenient).
+                word.push('$');
+                word.push('{');
+                i + 2
+            }
+        }
+    } else if next == '?' {
+        word.push_str(&last_status.to_string());
+        i + 2
+    } else if next.is_ascii_alphabetic() || next == '_' {
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        let name: String = chars[i + 1..j].iter().collect();
+        let val = env
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        word.push_str(val);
+        j
+    } else {
+        word.push('$');
+        i + 1
+    }
+}
+
 /// Tokenize a command line into words and metacharacters, honoring single
-/// and double quotes and backslash escapes. A quoted section is a literal
-/// part of its word, so quotes group whitespace — and, quoted, the
-/// metacharacters `|` `<` `>` — into a single argument. `$?` expands to
-/// the last exit status wherever it appears: unquoted, and inside double
-/// quotes (POSIX). Single quotes are fully literal, so `'$?'` stays `$?`
-/// and `'\'` is a backslash. Outside quotes, backslash removes the
-/// special meaning of the next character (POSIX): `\ ` is a literal
-/// space, `\$` suppresses `$?` expansion, and `\|` is a word, not a
-/// pipe; a trailing backslash is dropped (v1 lenient). Inside double
-/// quotes, backslash escapes only `$`, `"` and `\` (POSIX); elsewhere it
-/// stays literal. An unterminated quote runs to the end of the line (v1
-/// is lenient — no syntax error).
-fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
+/// and double quotes, backslash escapes, and `$` variable expansion. A
+/// quoted section is a literal part of its word, so quotes group
+/// whitespace — and, quoted, the metacharacters `|` `<` `>` — into a
+/// single argument. `$?` expands to the last exit status and `$NAME` /
+/// `${NAME}` expand through `env` (the shell's environment), wherever
+/// they appear: unquoted, and inside double quotes (POSIX). Single
+/// quotes are fully literal, so `'$?'` stays `$?` and `'\'` is a
+/// backslash. Outside quotes, backslash removes the special meaning of
+/// the next character (POSIX): `\ ` is a literal space, `\$` suppresses
+/// expansion, and `\|` is a word, not a pipe; a trailing backslash is
+/// dropped (v1 lenient). Inside double quotes, backslash escapes only
+/// `$`, `"` and `\` (POSIX); elsewhere it stays literal. An unterminated
+/// quote runs to the end of the line (v1 is lenient — no syntax error).
+fn tokenize(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Tok> {
     let chars: Vec<char> = line.chars().collect();
     let mut toks: Vec<Tok> = Vec::new();
     let mut word = String::new();
@@ -688,18 +842,16 @@ fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
                     {
                         word.push(chars[i + 1]);
                         i += 2;
-                    } else if d == '$' && chars.get(i + 1) == Some(&'?') {
-                        word.push_str(&last_status.to_string());
-                        i += 2;
+                    } else if d == '$' {
+                        i = expand_var(&chars, i, last_status, env, &mut word);
                     } else {
                         word.push(d);
                         i += 1;
                     }
                 }
             }
-            '$' if chars.get(i + 1) == Some(&'?') => {
-                word.push_str(&last_status.to_string());
-                i += 2;
+            '$' => {
+                i = expand_var(&chars, i, last_status, env, &mut word);
             }
             _ => {
                 word.push(c);
@@ -714,16 +866,17 @@ fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
 }
 
 /// Parse one command line into pipeline stages. `tokenize` splits it into
-/// words and metacharacters (see `tokenize` for the quote semantics); a
-/// lone unquoted `|` token separates stages; `>` / `<` mark the next word
-/// as the stdout / stdin redirect target (the target is not part of argv;
-/// a trailing or metachar redirect records an empty path, which the stage
-/// child fails to open → exit 127). Empty stages are skipped (a stray `|`
-/// cannot produce a stage with no command). Returns [] for a blank line.
-/// v1: no `>>`, and `|` / redirects need surrounding spaces (a quoted
-/// version is a literal word).
-fn parse_line(line: &str, last_status: u8) -> Vec<Stage> {
-    let toks = tokenize(line, last_status);
+/// words and metacharacters (see `tokenize` for the quote, escape and
+/// variable semantics); a lone unquoted `|` token separates stages; `>` /
+/// `<` mark the next word as the stdout / stdin redirect target (the
+/// target is not part of argv; a trailing or metachar redirect records an
+/// empty path, which the stage child fails to open → exit 127). Empty
+/// stages are skipped (a stray `|` cannot produce a stage with no
+/// command). Returns [] for a blank line. v1: no `>>`, and `|` /
+/// redirects need surrounding spaces (a quoted or escaped version is a
+/// literal word).
+fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stage> {
+    let toks = tokenize(line, last_status, env);
     let mut stages: Vec<Stage> = Vec::new();
     let mut argv: Vec<String> = Vec::new();
     let mut in_redir: Option<String> = None;
@@ -789,7 +942,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_line, Stage};
+    use super::{parse_line as parse_line_raw, Stage};
 
     fn st(argv: &[&str]) -> Stage {
         Stage {
@@ -797,6 +950,20 @@ mod tests {
             in_redir: None,
             out_redir: None,
         }
+    }
+
+    /// Parse with an empty environment (all `$VAR` expand to nothing) —
+    /// the default for the existing tests, which predate variables.
+    fn parse_line(line: &str, status: u8) -> Vec<Stage> {
+        parse_line_raw(line, status, &[])
+    }
+
+    /// Build an environment from `(name, value)` string pairs.
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -939,5 +1106,47 @@ mod tests {
         assert_eq!(parse_line("echo 'a\\b'", 0), vec![st(&["echo", "a\\b"])]);
         // A trailing backslash is dropped (v1 lenient).
         assert_eq!(parse_line("echo x\\", 0), vec![st(&["echo", "x"])]);
+    }
+
+    #[test]
+    fn parse_line_expands_variables() {
+        let env = vars(&[("PATH", "/bin"), ("HOME", "/root")]);
+        // $NAME and ${NAME} both resolve; ${?} is the status.
+        assert_eq!(
+            parse_line_raw("echo $PATH ${HOME}", 0, &env),
+            vec![st(&["echo", "/bin", "/root"])]
+        );
+        // An unset name expands to nothing — and an unquoted empty
+        // expansion produces no field at all (POSIX), while a quoted one
+        // is a real empty argument.
+        assert_eq!(
+            parse_line_raw("echo $UNSET ${?}", 7, &env),
+            vec![st(&["echo", "7"])]
+        );
+        assert_eq!(
+            parse_line_raw("echo \"$UNSET\"", 0, &env),
+            vec![st(&["echo", ""])]
+        );                // An unset name mid-word expands to nothing (POSIX). Name chars
+        // are greedy, so `a$UNSETb` is `$UNSETb` (unset → empty); a
+        // boundary like `.` keeps the name short.
+        assert_eq!(
+            parse_line_raw("echo a$UNSETb", 0, &env),
+            vec![st(&["echo", "a"])]
+        );
+        assert_eq!(
+            parse_line_raw("echo a$UNSET.b", 0, &env),
+            vec![st(&["echo", "a.b"])]
+        );
+        // A lone `$` or a `$` before a non-name stays literal.
+        assert_eq!(
+            parse_line_raw("echo $ a$b", 3, &env),
+            vec![st(&["echo", "$", "a"])]
+        );
+        // $PATH expands inside double quotes, not inside single quotes or
+        // after a backslash escape.
+        assert_eq!(
+            parse_line_raw("echo \"$PATH\" '$PATH' \\$PATH", 0, &env),
+            vec![st(&["echo", "/bin", "$PATH", "$PATH"])]
+        );
     }
 }
