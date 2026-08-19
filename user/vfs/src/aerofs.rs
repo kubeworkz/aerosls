@@ -45,19 +45,31 @@ pub const NINDIRECT: usize = 128;
 /// Max blocks per file.
 pub const MAX_BLOCKS: u64 = (NDIRECT + NINDIRECT) as u64;
 
-/// Directory entry type bytes (mirror Linux's DT_*).
+/// Directory entry type bytes (mirror Linux's DT_*). `DT_FIFO`/`DT_CHR`
+/// never appear in aerofs-lite images (the builder never makes them); they
+/// exist for in-memory dirents (`/dev`, pipe `fstat`). Values are local to
+/// this format (note: not Linux's numbers — `DT_REG`/`DT_DIR` are baked
+/// into every existing image, so they cannot change).
 pub const DT_REG: u8 = 1;
 pub const DT_DIR: u8 = 2;
+pub const DT_FIFO: u8 = 3;
+pub const DT_CHR: u8 = 4;
 
 /// Mode type bits (mirror S_IFMT).
 pub const S_IFMT: u16 = 0o170000;
 pub const S_IFREG: u16 = 0o100000;
 pub const S_IFDIR: u16 = 0o040000;
+pub const S_IFCHR: u16 = 0o020000;
+pub const S_IFIFO: u16 = 0o010000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileType {
     File,
     Dir,
+    /// A pipe (never on disk; only in-memory objects, e.g. pipe fds).
+    Fifo,
+    /// A character device node (never on disk; only `/dev` entries).
+    Char,
 }
 
 impl FileType {
@@ -65,6 +77,8 @@ impl FileType {
         match dt {
             DT_REG => Some(FileType::File),
             DT_DIR => Some(FileType::Dir),
+            DT_FIFO => Some(FileType::Fifo),
+            DT_CHR => Some(FileType::Char),
             _ => None,
         }
     }
@@ -72,6 +86,8 @@ impl FileType {
         match self {
             FileType::File => DT_REG,
             FileType::Dir => DT_DIR,
+            FileType::Fifo => DT_FIFO,
+            FileType::Char => DT_CHR,
         }
     }
 }
@@ -108,6 +124,8 @@ impl Inode {
         match self.mode & S_IFMT {
             S_IFREG => Some(FileType::File),
             S_IFDIR => Some(FileType::Dir),
+            S_IFCHR => Some(FileType::Char),
+            S_IFIFO => Some(FileType::Fifo),
             _ => None,
         }
     }

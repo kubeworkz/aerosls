@@ -20,6 +20,9 @@
 //! - `aerofs` — the aerofs-lite on-disk format + the `genrootfs` image
 //!   builder (pure, no I/O).
 //! - `ramfs` — the in-memory `/tmp` filesystem (never stale).
+//! - `fileobj` — file-like objects: pipes (`pipe()`), character devices
+//!   (`/dev/console`, `/dev/null`) — everything an fd can name that is not
+//!   a file on a mount.
 //! - `vfs` — mounts, path resolution, fd tables, the syscall surface.
 //! - `errno` — the shared POSIX errno set.
 
@@ -29,12 +32,14 @@ extern crate alloc;
 
 pub mod aerofs;
 pub mod errno;
+pub mod fileobj;
 pub mod ramfs;
 pub mod vfs;
 
 pub use aerofs::{FileType, ImageBuilder, SuperblockRecord};
 pub use aerosls_blockcache::BufferAlloc;
 pub use errno::{DirEnt, Errno, Stat};
+pub use fileobj::{CharNode, ConsoleIo, FileObj, PipeNode, PIPE_CAP};
 pub use vfs::{
     rights_of, FileNode, FdEntry, MountState, Vfs, CLONE_FILES, O_ACCMODE, O_APPEND, O_CREAT,
     O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET,

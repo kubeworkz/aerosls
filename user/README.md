@@ -35,17 +35,23 @@ vfs/              # the POSIX sidecar's VFS — the layer above the block cache
   src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32,
                   # 11 direct + 1 indirect block) + the genrootfs image builder
   src/ramfs.rs    # in-memory /tmp filesystem (never stale)
+  src/fileobj.rs  # file-like objects: PipeNode (ends counted by the VFS, so
+                  # EOF/EPIPE/EAGAIN are exact), CharNode (/dev/console — the
+                  # in-memory ChanDev the kernel channel plugs into — and
+                  # /dev/null)
   src/vfs.rs      # mounts, longest-prefix path resolution, per-task fd tables
                   # (pooled: fork copies a table sharing FileNodes; CLONE_FILES
                   # shares the table object), shared-offset FileNode, the
-                  # syscall surface, stale→EIO, fail-permanently
+                  # syscall surface, pipe(), devfs (/dev), fd dispatch over
+                  # FileObj (file/pipe/device), stale→EIO, fail-permanently
   src/errno.rs    # shared POSIX errno set
 procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
                   # the VFS (Phase 2 §3.2–§3.3, §4)
   src/procmgr.rs  # ProcManager: run queue, Program/step model, Ctx, fork
                   # (fd-table copy, shared offsets), fork_thread (CLONE_FILES),
                   # exit/zombie/wait with orphan reparenting, exec (applet
-                  # registry through the mount chain)
+                  # registry through the mount chain), shell pipelines
+                  # (pipe fds dup2'd onto stdio, inherited by fork)
 kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 ```
 
@@ -61,7 +67,8 @@ kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 #                         cache, incl. driver death → EIO + remount
 #   - procmgr/tests/      the proc manager: fork sharing file offsets,
 #                         CLONE_FILES threads sharing the fd table, exec,
-#                         round-robin interleaving
+#                         round-robin interleaving, and a real
+#                         cat | grep pipeline through pipe fds
 cargo test --workspace
 ```
 
@@ -115,3 +122,15 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   a live child blocks until the exit wakes it. `exec` resolves the file
   through the mount chain and dispatches on its first line into an applet
   registry — BusyBox argv[0]-dispatch in miniature.
+- Pipes are core objects, not fs objects: `pipe()` mints read/write ends as
+  `FileObj` variants sharing an `Arc<PipeNode>`, and the VFS recounts the
+  live ends at every fd mutation (open/close/dup/dup2/fork-copy/exit), so a
+  reader sees **EOF** once the last writer is gone, a writer fails
+  **EPIPE** once the last reader is gone, and an empty/full pipe fails
+  **EAGAIN** — the cooperative scheduler's "would block". Devices live in
+  `/dev` (devfs names them; an fd on a device holds `FileObj::Char` and its
+  I/O bypasses the mount layer): `/dev/console` is the sidecar's ChanDev,
+  in-memory until the bootstrap wires the kernel-console channel, and
+  `/dev/null` discards. The `cat | grep` integration test drives the whole
+  path: shell creates the pipe, dup2's an end onto each child's stdio,
+  `exec`s the applets, closes its own copies, and reaps both stages.

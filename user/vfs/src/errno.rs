@@ -42,6 +42,10 @@ pub enum Errno {
     EMfile,
     /// Exec format error (the file is not a runnable image).
     ENoexec,
+    /// Illegal seek — the fd names a non-seekable object (pipe, device).
+    ESPipe,
+    /// Broken pipe — a write to a pipe whose read ends are all closed.
+    EPipe,
 }
 
 impl Errno {
@@ -64,6 +68,8 @@ impl Errno {
             Errno::EBusy => 16,
             Errno::EMfile => 24,
             Errno::ENoexec => 8,
+            Errno::ESPipe => 29,
+            Errno::EPipe => 32,
         }
     }
 }

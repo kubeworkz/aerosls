@@ -10,8 +10,9 @@ use aerosls_proto::kabi::SendCap;
 use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
-use aerosls_vfs::{Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR};
+use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
 use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, Program, Step, WaitOutcome};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 type FC = FakeClient;
@@ -24,6 +25,8 @@ fn pm_image() -> Vec<u8> {
     b.add_file("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", 0o644);
     b.add_file("/etc/group", b"root:x:0:\n", 0o644);
     b.add_file("/bin/applet", b"hello\n", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/grep", b"grep\n", 0o755);
     b.build()
 }
 
@@ -73,6 +76,7 @@ fn pm() -> (ProcManager<FC, FA>, JoinHandle<()>, FakeClient) {
     let mut vfs = Vfs::new();
     vfs.mount_aerofs("/", cache).unwrap();
     vfs.mount_ramfs("/tmp").unwrap();
+    vfs.mount_devfs("/dev", Arc::new(CharNode::console())).unwrap();
     (ProcManager::new(vfs), t, client)
 }
 
@@ -230,6 +234,148 @@ fn spinner(ctx: &mut Ctx<FC, FA>) -> Step {
     Step::Yield
 }
 
+/// The `cat` applet: copies /etc/passwd to fd 1 (its stdout — the pipe
+/// write end the shell dup2'd there before exec'ing it).
+fn cat(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let fd = ctx.vfs().open(task, "/etc/passwd", O_RDONLY, 0).unwrap();
+        ctx.data.push(fd as u8);
+        return Step::Yield;
+    }
+    let fd = ctx.data[0] as u32;
+    let mut buf = [0u8; 16];
+    match ctx.vfs().read(task, fd, &mut buf) {
+        Ok(0) => {
+            ctx.vfs().close(task, fd).unwrap();
+            Step::Exit(0)
+        }
+        Ok(n) => {
+            ctx.vfs().write(task, 1, &buf[..n]).unwrap();
+            Step::Yield
+        }
+        Err(_) => Step::Exit(2),
+    }
+}
+
+/// The `grep` applet: reads fd 0 (its stdin — the pipe read end) to EOF,
+/// keeps the lines containing "root", writes them to /tmp/out.
+fn grep(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    let mut buf = [0u8; 16];
+    match ctx.vfs().read(task, 0, &mut buf) {
+        Ok(0) => {
+            // EOF: the writer side is gone. Filter what we accumulated
+            // (owned, so the borrow of `ctx.data` ends before I/O).
+            let text = core::str::from_utf8(&ctx.data).unwrap_or("");
+            let matches: Vec<String> = text
+                .lines()
+                .filter(|l| l.contains("root"))
+                .map(|l| l.to_string())
+                .collect();
+            let out = ctx
+                .vfs()
+                .open(task, "/tmp/out", O_CREAT | O_WRONLY, 0o644)
+                .unwrap();
+            for l in &matches {
+                ctx.vfs().write(task, out, l.as_bytes()).unwrap();
+                ctx.vfs().write(task, out, b"\n").unwrap();
+            }
+            ctx.vfs().close(task, out).unwrap();
+            Step::Exit(0)
+        }
+        Ok(n) => {
+            ctx.data.extend_from_slice(&buf[..n]);
+            Step::Yield
+        }
+        // Nothing in the pipe yet — the producer hasn't run; yield.
+        Err(Errno::EAgain) => Step::Yield,
+        Err(_) => Step::Exit(3),
+    }
+}
+
+/// The shell: `cat /etc/passwd | grep root > /tmp/out`. Creates the pipe,
+/// forks cat (stdout → write end) and grep (stdin → read end), closes its
+/// own copies, waits for both, exits with grep's status.
+fn pipeline(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // Shell stdio is the console: 0,1,2 = /dev/console. The pipe then
+        // lands at 3,4, so the children's dup2 actually *moves* an end
+        // into place instead of no-op'ing onto itself.
+        for _ in 0..3 {
+            ctx.vfs().open(task, "/dev/console", O_RDWR, 0).unwrap();
+        }
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1); // phase (data[0])
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        return Step::Yield;
+    }
+    let r = ctx.data[1] as u32;
+    let w = ctx.data[2] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            // Fork cat. The child resumes at (1, true); we record its id.
+            let c = ctx.fork().unwrap();
+            ctx.data.push(c as u8);
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (1, true) => {
+            ctx.data[0] = 3; // the cat child
+            Step::Yield
+        }
+        (2, false) => {
+            let c = ctx.fork().unwrap();
+            ctx.data.push(c as u8);
+            ctx.data[0] = 5;
+            Step::Yield
+        }
+        (2, true) => {
+            ctx.data[0] = 4; // the grep child
+            Step::Yield
+        }
+        (3, _) => {
+            // cat: stdout → pipe write end; drop its own pipe fds.
+            ctx.vfs().dup2(task, w, 1).unwrap();
+            ctx.vfs().close(task, r).unwrap();
+            ctx.vfs().close(task, w).unwrap();
+            ctx.exec("/bin/cat").unwrap();
+            Step::Yield
+        }
+        (4, _) => {
+            // grep: stdin → pipe read end; drop its own pipe fds.
+            ctx.vfs().dup2(task, r, 0).unwrap();
+            ctx.vfs().close(task, r).unwrap();
+            ctx.vfs().close(task, w).unwrap();
+            ctx.exec("/bin/grep").unwrap();
+            Step::Yield
+        }
+        (5, _) => {
+            // Shell: drop its own pipe copies, then wait for both.
+            ctx.vfs().close(task, r).unwrap();
+            ctx.vfs().close(task, w).unwrap();
+            ctx.data[0] = 6;
+            Step::Yield
+        }
+        (6, _) => {
+            let cat_c = ctx.data[3] as u32;
+            let grep_c = ctx.data[4] as u32;
+            match ctx.wait(cat_c) {
+                WaitOutcome::Reaped(_) => match ctx.wait(grep_c) {
+                    WaitOutcome::Reaped(code) => ctx.exit(code),
+                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(grep_c)),
+                    WaitOutcome::NoSuchChild => Step::Exit(90),
+                },
+                WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(cat_c)),
+                WaitOutcome::NoSuchChild => Step::Exit(90),
+            }
+        }
+        _ => Step::Exit(1),
+    }
+}
+
 /// Set cwd `/etc` + creds, fork; the child resolves relative paths (cwd
 /// inherited), then the parent switches ITS cwd — which must not leak.
 fn cwd_child(ctx: &mut Ctx<FC, FA>) -> Step {
@@ -376,6 +522,30 @@ fn fork_inherits_cwd_and_creds_per_task() {
         Some(5),
         "child resolved 'passwd' relative to the inherited /etc cwd"
     );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn cat_grep_pipeline_through_the_proc_manager() {
+    let (mut p, t, client) = pm();
+    p.register_applet("cat", cat);
+    p.register_applet("grep", grep);
+    p.spawn_init(Program::new("pipeline", pipeline));
+    p.run_until_quiet(100);
+
+    // cat wrote the passwd line into the pipe; grep's EOF read saw the
+    // writer side fully closed (cat exited), filtered, and wrote the match.
+    assert_eq!(p.exit_code(0), Some(0), "shell exited with grep's status");
+    assert_eq!(
+        read_all(&mut p.vfs, "/tmp/out"),
+        b"root:x:0:0:root:/root:/bin/sh\n",
+        "the matching line flowed cat → pipe → grep → file"
+    );
+    // Both pipeline stages were reaped; nothing left in the run queue.
+    assert_eq!(p.state(1), None);
+    assert_eq!(p.state(2), None);
 
     client.kill_driver(0);
     t.join().unwrap();

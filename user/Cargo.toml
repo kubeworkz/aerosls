@@ -1,6 +1,6 @@
 # AeroSLS sidecar workspace.
 #
-# Five crates:
+# Six crates:
 #   proto/      shared wire-format definitions (RD_* + channel envelope) and
 #               the kernel ABI (Kernel trait, cap types, error codes), no_std
 #   ramdisk/    the aerosls.ramdisk.v1 driver sidecar, no_std
