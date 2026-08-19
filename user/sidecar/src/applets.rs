@@ -23,6 +23,9 @@
 //! - **`grep`** — prints the lines of stdin (or the named files) matching
 //!   a small glob pattern (`*` any run, `.` any one char, `\x` literal
 //!   `x`, substring match); exits 0/1 on match/no-match, like grep.
+//! - **`wc`** — counts lines / words / bytes of stdin (or named files),
+//!   right-aligned like coreutils; the count ends only at EOF, so it
+//!   exercises pipe fd closure (`echo hi | wc`).
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -372,6 +375,120 @@ pub fn grep<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                                 ctx.data[3] = 1;
                             }
                         }
+                    }
+                    ReadBlock::WouldBlock => {
+                        return Step::Blocked(BlockReason::Readable(fd));
+                    }
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
+/// Accumulate `lines` / `words` for one chunk of bytes. `prev_ws` is the
+/// whitespace state carried across chunks — input start counts as
+/// whitespace, so the first word is counted when its first character
+/// arrives (a word is a maximal run of non-whitespace; space, tab and
+/// newline are the separators).
+fn count_chunk(chunk: &[u8], lines: &mut u32, words: &mut u32, prev_ws: &mut bool) {
+    for &b in chunk {
+        if b == b'\n' {
+            *lines += 1;
+            *prev_ws = true;
+        } else if b == b' ' || b == b'\t' {
+            *prev_ws = true;
+        } else if *prev_ws {
+            *words += 1;
+            *prev_ws = false;
+        }
+    }
+}
+
+/// Read a u32 (LE) at `off` in the applet data.
+fn read_u32(data: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+/// `wc`: counts lines, words and bytes of its input — stdin, or the
+/// named files in order. Output is `{:>7}`-aligned, one line per source
+/// with the filename for files (v1: no total line). Exits 0 on success,
+/// 2 on error. Reads via `read_blocking`, so an empty pipe stdin parks
+/// instead of spinning — and the count terminates only on EOF, which
+/// pipe fd closure delivers once every writer (the shell's own copies
+/// and the writing child) is gone: `echo hi | wc` proves it. Data
+/// layout: `[lines u32, words u32, bytes u32, prev_ws, phase, file_idx,
+/// fd]`.
+pub fn wc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // lines, words, bytes (u32 LE), prev_ws, phase, file_idx, fd
+        ctx.data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+    }
+    loop {
+        match ctx.data[13] {
+            // Choose the next source: stdin when no files were given,
+            // otherwise the file at file_idx.
+            0 => {
+                let src = if ctx.data[14] == 0 && ctx.argv().len() <= 1 {
+                    0
+                } else {
+                    let path = match ctx.argv().get(1 + ctx.data[14] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(0),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => return Step::Exit(2),
+                    }
+                };
+                ctx.data[13] = 1;
+                ctx.data[15] = src as u8;
+            }
+            1 => {
+                let fd = ctx.data[15] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(fd, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        // EOF (all writers gone): print this source's
+                        // counts, then move to the next source.
+                        let mut text = alloc::format!(
+                            "{:>7} {:>7} {:>7}",
+                            read_u32(&ctx.data, 0),
+                            read_u32(&ctx.data, 4),
+                            read_u32(&ctx.data, 8)
+                        );
+                        if ctx.data[14] > 0 || ctx.argv().len() > 1 {
+                            if let Some(p) = ctx.argv().get(1 + ctx.data[14] as usize) {
+                                text.push(' ');
+                                text.push_str(p);
+                            }
+                        }
+                        text.push('\n');
+                        if ctx.vfs().write(task, 1, text.as_bytes()).is_err() {
+                            return Step::Exit(2);
+                        }
+                        if fd != 0 {
+                            ctx.vfs().close(task, fd).ok();
+                        }
+                        // Reset the counters for the next source.
+                        ctx.data[0..12].fill(0);
+                        ctx.data[12] = 1; // prev_ws
+                        ctx.data[13] = 0; // phase: next source
+                        ctx.data[14] += 1;
+                        ctx.data[15] = 0;
+                    }
+                    ReadBlock::Data(n) => {
+                        let mut lines = read_u32(&ctx.data, 0);
+                        let mut words = read_u32(&ctx.data, 4);
+                        let bytes = read_u32(&ctx.data, 8) + n as u32;
+                        let mut prev_ws = ctx.data[12] == 1;
+                        count_chunk(&buf[..n], &mut lines, &mut words, &mut prev_ws);
+                        ctx.data[0..4].copy_from_slice(&lines.to_le_bytes());
+                        ctx.data[4..8].copy_from_slice(&words.to_le_bytes());
+                        ctx.data[8..12].copy_from_slice(&bytes.to_le_bytes());
+                        ctx.data[12] = prev_ws as u8;
                     }
                     ReadBlock::WouldBlock => {
                         return Step::Blocked(BlockReason::Readable(fd));
@@ -1367,6 +1484,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("init", init);
     pm.register_applet("cat", cat);
     pm.register_applet("grep", grep);
+    pm.register_applet("wc", wc);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -1664,6 +1782,32 @@ mod tests {
         assert!(!is_match("a\\.b", b"xaxb"));
         // An empty pattern matches everything (like grep).
         assert!(is_match("", b"anything"));
+    }
+
+    #[test]
+    fn wc_counts_across_chunk_boundaries() {
+        use super::count_chunk;
+        // A word split across chunks keeps its count; the whitespace
+        // state carries the boundary.
+        let mut lines = 0u32;
+        let mut words = 0u32;
+        let mut prev_ws = true;
+        count_chunk(b"hello wor", &mut lines, &mut words, &mut prev_ws);
+        assert_eq!((lines, words, prev_ws), (0, 2, false));
+        count_chunk(b"ld\nnext", &mut lines, &mut words, &mut prev_ws);
+        assert_eq!((lines, words, prev_ws), (1, 3, false));
+        // Leading/tab whitespace and trailing newlines.
+        let mut lines = 0u32;
+        let mut words = 0u32;
+        let mut prev_ws = true;
+        count_chunk(b"   hi \t yo\n", &mut lines, &mut words, &mut prev_ws);
+        assert_eq!((lines, words), (1, 2));
+        // An empty chunk is a no-op.
+        let mut lines = 0u32;
+        let mut words = 0u32;
+        let mut prev_ws = false;
+        count_chunk(b"", &mut lines, &mut words, &mut prev_ws);
+        assert_eq!((lines, words, prev_ws), (0, 0, false));
     }
 
     #[test]

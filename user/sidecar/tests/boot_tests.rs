@@ -159,6 +159,7 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/cat", b"cat\n", 0o755);
     b.add_file("/bin/echo", b"echo\n", 0o755);
     b.add_file("/bin/grep", b"grep\n", 0o755);
+    b.add_file("/bin/wc", b"wc\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
     // A second bin dir so PATH-driven lookup has somewhere to search:
@@ -457,6 +458,23 @@ fn boot_runs_an_interactive_shell() {
         console.console_io().output(),
         b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$ ",
         "grep filtered the pipeline: fixed match, no-match exit 1, dot and star wildcards"
+    );
+
+    // wc counts lines/words/bytes through the pipe — the count ends only
+    // when EOF arrives, which pipe fd closure delivers once the writer
+    // child exits and the shell drops its own pipe copies. The spaced
+    // argument exercises the word-transition counting through the pipe,
+    // and the file form shows the per-source line with its name.
+    console.console_io().push_input(b"echo \"hello world\" | wc\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo \"  spaced   out \" | wc\n");
+    booted.run(100);
+    console.console_io().push_input(b"wc /etc/passwd\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ ",
+        "wc counted through closed pipes and named files: 1/2/12, 1/2/16, and the passwd file"
     );
 
     client.kill_driver(0);

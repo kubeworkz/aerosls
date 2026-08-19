@@ -63,7 +63,8 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # runner — one forked child per command, sharing sh's word
                   # parser: quotes, backslash escapes, < and > redirects),
                   # cat, grep (glob patterns: * any-run, . any-char, \
-                  # escape; exit 0/1 on match/no-match), echo, sh (minimal
+                  # escape; exit 0/1 on match/no-match), wc (lines /
+                  # words / bytes counts), echo, sh (minimal
                   # interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
@@ -270,8 +271,11 @@ script + the manifest's `image` record) is the sidecar build step; see
   removes it, and `PATH=/usr/bin greet hi` resolves through the
   scoped path while the shell's PATH stays put — and grep filter
   pipelines (`echo hello | grep ell` matches, `grep zzz` exits 1 into
-  `$?`, `h.llo` and `h*o` wildcards match) through the real driver,
-  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  `$?`, `h.llo` and `h*o` wildcards match), and a wc counting
+  session — `echo "hello world" | wc` prints `1 2 12` and
+  `wc /etc/passwd` counts the rootfs file — where each pipeline
+  exercises EOF propagation through pipe fd closure, through the
+  real driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
