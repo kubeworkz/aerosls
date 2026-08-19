@@ -7,6 +7,7 @@ Cargo workspace for the capability-based sidecars designed in `docs/`:
 | `proto/` | — (shared wire format + kernel ABI) | `docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md`, `docs/AeroSLS-POSIX-Sidecar-Phase2-Design-v0.1.md` §5 |
 | `ramdisk/` | `aerosls.ramdisk.v1` | `docs/AeroSLS-Ramdisk-Driver-Implementation-Plan-v0.1.md` |
 | `blockcache/` | — (POSIX sidecar component) | respawn decision §4.1 (device states), Phase 2 §3.4/§5.2 |
+| `vfs/` | — (POSIX sidecar component) | Phase 2 §3.2/§3.4/§6.3, respawn decision §4.2/§5.9/§6 |
 | `kernel-sim/` | — (host-only test fake) | capability-layer spec §3–§4, transport spec §3–§6 |
 
 ## Layout
@@ -26,19 +27,30 @@ ramdisk/          # the aerosls.ramdisk.v1 driver sidecar (dumb RD_* server)
   manifest.json   # sidecar manifest source (genmanifest → packed TLV)
 blockcache/       # the POSIX sidecar's block cache — the ramdisk protocol client
   src/cache.rs    # BlockCache: handshake, RD_READ/RD_WRITE/RD_FLUSH/RD_MAP,
-                  # direct-mapped read cache, stale-on-close (device state)
+                  # direct-mapped read cache, stale-on-close (device state),
+                  # poll_dead (observe a queued close without a request)
   src/copy.rs     # the client's entire unsafe surface (raw memory copies)
+vfs/              # the POSIX sidecar's VFS — the layer above the block cache
+  src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32,
+                  # 11 direct + 1 indirect block) + the genrootfs image builder
+  src/ramfs.rs    # in-memory /tmp filesystem (never stale)
+  src/vfs.rs      # mounts, longest-prefix path resolution, per-task fd tables,
+                  # shared-offset FileNode, open/read/write/lseek/dup/stat/
+                  # read_dir/mkdir/unlink/rmdir, stale→EIO, fail-permanently
+  src/errno.rs    # shared POSIX errno set
 kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 ```
 
 ## Build and test (host)
 
 ```sh
-# All tests: unit tests (proto, heap, copy, bootinfo, endpoints, blockcache)
-# plus two integration suites against the fake kernel in kernel-sim/:
+# All tests: unit tests (proto, aerofs format, ramfs, vfs logic) plus three
+# integration suites against the fake kernel in kernel-sim/, each driving the
+# *real* driver end to end:
 #   - ramdisk/tests/      the driver (server side)
-#   - blockcache/tests/   the block cache, run end to end against the *real*
-#                         driver on the fake kernel (client side)
+#   - blockcache/tests/   the block cache (protocol client)
+#   - vfs/tests/          the VFS: aerofs-lite mounted on a connected block
+#                         cache, incl. driver death → EIO + remount
 cargo test --workspace
 ```
 
@@ -73,7 +85,15 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   outstanding per endpoint (window=1 by construction), driver error replies
   (`RD_ERR_*`) never stale the device, and a close event or failed send flips
   it to `STALE` and drops the mapped view — recovery (respawn) is the
-  respawn layer's job (respawn decision §4–§6).
+  respawn layer's job (respawn decision §4–§6). `poll_dead()` lets the VFS
+  observe a close that arrived with no request in flight (respawn §5 steps
+  1–3), so a cache hit is never served from a dead device.
 - `RD_MAP` grants are durable views of the storage cap, so they die with the
   driver through lineage revocation — exactly what the POSIX VFS's
   drop-on-stale policy expects (respawn decision §6).
+- The VFS pins the respawn semantics: stale mounts fail `EIO` (never
+  `ENOENT` — path resolution stays table-only), fds mint rights at `open`
+  and re-check on every op, `dup`/`dup2` share the offset via
+  `Arc<FileNode>`, and a pre-death fd fails permanently across a remount
+  (the node pins the fs generation; `remount_aerofs` revalidates the
+  superblock identity before replacing the fs in place).

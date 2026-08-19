@@ -955,4 +955,12 @@ impl Kernel for FakeClient {
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
         self.cap_info(handle)
     }
+
+    fn poll(&self, chan: u32) -> Result<u16, i32> {
+        let st = self.state.lock().unwrap();
+        if st.shutdown {
+            return Err(kabi::ERR_SHUTDOWN);
+        }
+        Ok(client_ready_kind(&st, chan).unwrap_or(CH_KIND_NONE))
+    }
 }

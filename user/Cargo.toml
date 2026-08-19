@@ -1,17 +1,19 @@
 # AeroSLS sidecar workspace.
 #
-# Four crates:
+# Five crates:
 #   proto/      shared wire-format definitions (RD_* + channel envelope) and
 #               the kernel ABI (Kernel trait, cap types, error codes), no_std
 #   ramdisk/    the aerosls.ramdisk.v1 driver sidecar, no_std
 #   blockcache/ the POSIX sidecar's block cache (the ramdisk protocol
 #               client), no_std
-#   kernel-sim/ host-only fake kernel used by the ramdisk and blockcache
-#               integration tests
+#   vfs/        the POSIX sidecar's VFS (aerofs-lite + ramfs mounts, fd
+#               tables, the syscall surface), no_std
+#   kernel-sim/ host-only fake kernel used by the ramdisk, blockcache and
+#               vfs integration tests
 #
 # The ramdisk crate defaults to the *host* build (no kernel ABI) so it can be
 # tested against the fake kernel in tests/. The real sidecar image is built
 # with `--features target` (see user/README.md).
 [workspace]
-members = ["proto", "kernel-sim", "ramdisk", "blockcache"]
+members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs"]
 resolver = "2"

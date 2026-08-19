@@ -124,4 +124,17 @@ pub trait Kernel {
 
     /// Introspect one of the caller's own caps (capability-layer spec §3.5).
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32>;
+
+    /// Non-blocking peek: is a message or control event already queued on
+    /// `chan`? Returns the head's kind (`CH_KIND_*`, or `CH_KIND_NONE`).
+    /// Peeks only — the event is consumed by the next `recv`. This is how
+    /// a sidecar learns a peer died *without* an outstanding request
+    /// (respawn decision §5 steps 1–3: the kernel queues the close and the
+    /// block cache polls before serving a cache hit — a cache hit must
+    /// never come from a dead device). Default: nothing queued, for
+    /// implementations that never poll.
+    fn poll(&self, chan: u32) -> Result<u16, i32> {
+        let _ = chan;
+        Ok(crate::CH_KIND_NONE)
+    }
 }

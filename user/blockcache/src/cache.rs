@@ -377,6 +377,31 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         Ok(())
     }
 
+    /// Observe a close event already queued on the endpoint — the
+    /// respawn-decision §5 steps 1–3 path where the kernel delivered the
+    /// close while no request was in flight (the sidecar event loop would
+    /// call this on wake; here the VFS polls before every operation). If a
+    /// close is queued it is consumed and the device marked stale ("drop on
+    /// stale, always"); a cache hit must never come from a dead device.
+    /// `Ok(())` otherwise (no event, or an MSG/NEW_CHANNEL the cache does
+    /// not act on).
+    pub fn poll_dead(&mut self) -> Result<(), Error> {
+        match self.k.poll(self.chan).map_err(|e| self.kernel_fail(e))? {
+            CH_KIND_CLOSE => {
+                let mut buf = [0u8; 64];
+                let mut caps = [GrantedCap::default(); 1];
+                let rr = self
+                    .k
+                    .recv(self.chan, &mut buf, &mut caps)
+                    .map_err(|e| self.kernel_fail(e))?;
+                let (reason, detail) =
+                    parse_close_body(&buf[..rr.len]).unwrap_or((CLOSE_PEER, 0));
+                Err(self.close_fail(reason, detail))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// `RD_MAP`: establish a durable view of the whole device. The reply
     /// carries a persist MEM grant derived from the driver's storage cap;
     /// the view is stored and returned. It dies with the driver (lineage),

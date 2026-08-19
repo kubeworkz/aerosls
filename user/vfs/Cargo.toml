@@ -1,0 +1,16 @@
+[package]
+name = "aerosls-vfs"
+version = "0.1.0"
+edition = "2021"
+description = "The POSIX sidecar's VFS: aerofs-lite + ramfs mounts over the block cache"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+aerosls-blockcache = { path = "../blockcache" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+aerosls-ramdisk = { path = "../ramdisk" }
+
+[features]
+default = []

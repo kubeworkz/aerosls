@@ -40,6 +40,8 @@ pub const CH_VERSION: u16 = 1;
 pub const CH_KIND_MSG: u16 = 0;
 pub const CH_KIND_CLOSE: u16 = 1;
 pub const CH_KIND_NEW_CHANNEL: u16 = 2;
+/// `Kernel::poll`: nothing is queued on the endpoint.
+pub const CH_KIND_NONE: u16 = 3;
 
 /// Envelope flags.
 pub const F_REPLY: u16 = 0x0001;
