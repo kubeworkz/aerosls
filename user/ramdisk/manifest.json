@@ -1,0 +1,30 @@
+{
+  "format": "aerosls/sidecar-manifest",
+  "version": "1.0",
+  "personality": "aerosls.ramdisk.v1",
+
+  "image": { "kind": "elf", "offset": 0x8000, "size": 0x4000, "entry": "_start" },
+
+  "budget": { "mem_bytes": 262144, "stack_bytes": 16384, "heap_initial_bytes": 65536 },
+
+  "cpu": { "share": 50, "preemptible": true },
+
+  "limits": {
+    "max_tasks": 1,
+    "max_fds": 0,
+    "max_channels": 16,
+    "max_open_files": 0,
+    "chan_queue_depth": 32
+  },
+
+  "caps": [
+    { "name": "budget",  "type": "mem",  "size": 262144,   "rights": "rw" },
+    { "name": "storage", "type": "mem",  "size": 33554432, "rights": "r" },
+    { "name": "console", "type": "chan", "peer": "kernel.debug.console", "rights": "rw" },
+    { "name": "img.ro",  "type": "mem",  "size": 16384,    "rights": "rx" }
+  ],
+
+  "bootstrap": { "console_channel": "console", "log_level": "info" },
+
+  "flags": { "isolated": false, "wx_policy": "w^x" }
+}

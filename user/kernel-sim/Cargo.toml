@@ -1,0 +1,9 @@
+[package]
+name = "aerosls-kernel-sim"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS host-side fake kernel for testing sidecars (driver and client roles)"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }

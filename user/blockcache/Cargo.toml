@@ -1,0 +1,13 @@
+[package]
+name = "aerosls-blockcache"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS POSIX sidecar block cache — the ramdisk protocol client (handshake, RD_READ/RD_WRITE/RD_MAP with transient grants, stale on peer death)"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+aerosls-ramdisk = { path = "../ramdisk" }

@@ -1,0 +1,8 @@
+[package]
+name = "aerosls-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Shared AeroSLS sidecar wire-format definitions (RD_* protocol + channel envelope)"
+license = "MIT"
+
+[dependencies]

@@ -1,0 +1,20 @@
+[package]
+name = "aerosls-ramdisk"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS ramdisk driver sidecar (aerosls.ramdisk.v1) — dumb, passive, connection-agnostic RD_* block server"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+# The `target` feature selects the real kernel ABI (extern "C" syscalls) and
+# the sidecar entry point. The default (host) build omits them so the crate
+# links cleanly into the test harness. Build the sidecar image with:
+#   cargo build --features target
+[features]
+default = []
+target = []
