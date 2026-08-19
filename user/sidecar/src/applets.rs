@@ -30,9 +30,10 @@
 //!   pipeline connection, like POSIX), single / double quotes group
 //!   whitespace into one argument (`'…'` fully literal, `"…"` still
 //!   expanding `$?`), backslash escapes the next character outside
-//!   quotes (so `\ `, `\$`, `\|`, … are literal), and the builtins
-//!   `export` (set / list the environment) and `setenv NAME value` run
-//!   in the shell itself, mutating the persistent env region.
+//!   quotes (so `\ `, `\$`, `\|`, … are literal), bare command names
+//!   resolve through the exported `PATH` (default `/bin`), and the
+//!   builtins `export` (set / list the environment) and `setenv NAME
+//!   value` run in the shell itself, mutating the persistent env region.
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
@@ -49,7 +50,7 @@ use alloc::vec::Vec;
 
 use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, ReadBlock, Step, WaitOutcome};
 use aerosls_proto::kabi::Kernel;
-use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY};
+use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
 /// The boot script every POSIX sidecar init runs.
 pub const INIT_RC: &str = "/etc/init.rc";
@@ -398,14 +399,15 @@ fn apply_redirects<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>, stage: &S
 /// multi-line read runs line by line with a single prompt around the
 /// batch and `$VAR` expansion keeps working. A pipeline child's fork
 /// snapshot carries `[2, status, stage, n_stages, nfd, pipes..., in_len,
-/// in..., out_len, out..., n_args, (arg_len, arg...)..., queue,
-/// FORK_MARKER]` — argv is already expanded on the parent side, so the
-/// child needs no env — see `sh_child`.
+/// in..., out_len, out..., prog_len, prog..., n_args, (arg_len,
+/// arg...)..., queue, FORK_MARKER]` — argv is already expanded and the
+/// program resolved on the parent side, so the child needs no env — see
+/// `sh_child`.
 pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     if ctx.data.is_empty() {
-        // Default environment: PATH=/bin (the directory resolve_path
-        // searches) and HOME=/root, encoded as the env region.
+        // Default environment: PATH=/bin (the default search path for
+        // bare command names) and HOME=/root, encoded as the env region.
         ctx.data.extend_from_slice(&[0, 0]); // phase, last status
         env_push(&mut ctx.data, &[("PATH", "/bin"), ("HOME", "/root")]);
         return Step::Yield;
@@ -510,10 +512,19 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         pipes.push(w);
     }
     let nfd = (stages.len() - 1) * 2;
+    // The search path for bare command names, from the shell's env
+    // (v1 default /bin when unset).
+    let path = env
+        .iter()
+        .find(|(k, _)| *k == "PATH")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "/bin".to_string());
     // Fork one child per stage; each snapshot carries its stage index, the
-    // pipe fds, the `<` / `>` redirect targets (length-prefixed), the argv
-    // (one length-prefixed field per argument, so words containing spaces
-    // — quoted or backslash-escaped — arrive at the child exactly as
+    // pipe fds, the `<` / `>` redirect targets (length-prefixed), the
+    // program file resolved through PATH (length-prefixed — computed
+    // here in the parent, which has the env), the argv (one
+    // length-prefixed field per argument, so words containing spaces —
+    // quoted or backslash-escaped — arrive at the child exactly as
     // parsed; the child stops before the queue), and the queued
     // remainder — see `sh_child`.
     let mut children: Vec<u32> = Vec::new();
@@ -541,6 +552,9 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             None => ctx.data.push(0),
         }
+        let prog = resolve_path(ctx.vfs(), task, &stage.argv[0], &path);
+        ctx.data.push(prog.len() as u8);
+        ctx.data.extend_from_slice(prog.as_bytes());
         ctx.data.push(stage.argv.len() as u8); // n_args
         for a in &stage.argv {
             ctx.data.push(a.len() as u8);
@@ -715,15 +729,16 @@ fn do_setenv(env: &mut Vec<(String, String)>, args: &[String]) -> u8 {
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
-/// nfd, pipes..., in_len, in_path..., out_len, out_path..., n_args,
-/// (arg_len, arg...)..., queue, FORK_MARKER]` — one length-prefixed field
-/// per argument, so each argv word (even one containing spaces, from
-/// quoting or backslash escapes) arrives exactly as parsed and the child
-/// stops before the shell's queued input batch. Wire stdin/stdout to the
-/// pipe ends (or the console for the first/last stage), apply the stage's
-/// `<` / `>` redirects (which override the pipeline connection at fd 0 /
-/// fd 1, like POSIX), drop every pipe fd, and exec — on any failure the
-/// child exits 127, which the shell reaps.
+/// nfd, pipes..., in_len, in_path..., out_len, out_path..., prog_len,
+/// prog..., n_args, (arg_len, arg...)..., queue, FORK_MARKER]` — one
+/// length-prefixed field per argument, so each argv word (even one
+/// containing spaces, from quoting or backslash escapes) arrives exactly
+/// as parsed and the child stops before the shell's queued input batch;
+/// `prog` is the program file the parent already resolved through PATH.
+/// Wire stdin/stdout to the pipe ends (or the console for the first/last
+/// stage), apply the stage's `<` / `>` redirects (which override the
+/// pipeline connection at fd 0 / fd 1, like POSIX), drop every pipe fd,
+/// and exec — on any failure the child exits 127, which the shell reaps.
 fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     // The fork marker is the last byte.
@@ -753,6 +768,12 @@ fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         None
     };
     p += 1 + out_len;
+    let prog_len = d[p] as usize;
+    let prog = match core::str::from_utf8(&d[p + 1..p + 1 + prog_len]) {
+        Ok(s) => s.to_string(),
+        Err(_) => return Step::Exit(127),
+    };
+    p += 1 + prog_len;
     let n_args = d[p] as usize;
     p += 1;
     let mut tokens: Vec<String> = Vec::new();
@@ -797,23 +818,50 @@ fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.vfs().close(task, *fd).ok();
     }
     let argv: Vec<&str> = tokens.iter().map(|t| t.as_str()).collect();
-    // argv[0] stays as typed; the file to exec is resolved through PATH.
-    let prog = resolve_path(&tokens[0]);
+    // argv[0] stays as typed; the program file was resolved through PATH
+    // in the parent (run_line), which holds the shell's environment.
     match ctx.exec(&prog, &argv) {
         Ok(()) => Step::Yield,
         Err(_) => Step::Exit(127),
     }
 }
 
-/// Minimal PATH resolution: a token containing `/` is used as-is (a
-/// relative path resolves against the task's cwd); otherwise the command
-/// names an applet under `/bin` (v1: a single search directory, no envp).
-fn resolve_path(tok: &str) -> String {
+/// The candidate paths for `tok` under a `:`-separated search `path`: a
+/// token containing `/` is used as-is with no lookup; otherwise each
+/// non-empty directory yields `<dir>/<tok>` in order. An empty `path`
+/// yields no candidates (the command is unresolvable → 127).
+fn path_candidates(tok: &str, path: &str) -> Vec<String> {
     if tok.contains('/') {
-        tok.to_string()
-    } else {
-        alloc::format!("/bin/{}", tok)
+        return alloc::vec![tok.to_string()];
     }
+    let mut out = Vec::new();
+    for dir in path.split(':') {
+        if !dir.is_empty() {
+            out.push(alloc::format!("{}/{}", dir, tok));
+        }
+    }
+    out
+}
+
+/// Resolve a command name through the shell's `PATH` by probing each
+/// candidate with an open — the fs is a script store, so a readable file
+/// is executable. A token containing `/` is used as-is; a bare name with
+/// no hit returns `tok` itself, and the child's exec fails 127, which the
+/// shell reaps. Runs in the parent (which holds the env); the resolved
+/// path travels in the fork snapshot.
+fn resolve_path<K: Kernel, A: BufferAlloc>(
+    vfs: &mut Vfs<K, A>,
+    task: u32,
+    tok: &str,
+    path: &str,
+) -> String {
+    for candidate in path_candidates(tok, path) {
+        if let Ok(fd) = vfs.open(task, &candidate, O_RDONLY, 0) {
+            vfs.close(task, fd).ok();
+            return candidate;
+        }
+    }
+    tok.to_string()
 }
 
 /// One pipeline stage: the command's argv plus optional `<` stdin / `>`
@@ -1295,5 +1343,32 @@ mod tests {
             parse_line_raw("echo \"$PATH\" '$PATH' \\$PATH", 0, &env),
             vec![st(&["echo", "/bin", "$PATH", "$PATH"])]
         );
+    }
+
+    #[test]
+    fn path_candidates_searches_path_dirs() {
+        use super::path_candidates;
+        // A slash token skips the search path entirely.
+        assert_eq!(
+            path_candidates("/bin/cat", "/usr/bin:/bin"),
+            vec!["/bin/cat"]
+        );
+        // Bare names try each directory in order.
+        assert_eq!(
+            path_candidates("cat", "/usr/bin:/bin"),
+            vec!["/usr/bin/cat", "/bin/cat"]
+        );
+        // Empty directories are skipped (double colons, trailing colon);
+        // an empty PATH yields no candidates (unresolvable → 127).
+        assert_eq!(
+            path_candidates("cat", "/bin::/usr"),
+            vec!["/bin/cat", "/usr/cat"]
+        );
+        // PATH dirs are used literally, so a trailing slash doubles up.
+        assert_eq!(
+            path_candidates("cat", "/usr/bin/"),
+            alloc::vec!["/usr/bin//cat"]
+        );
+        assert_eq!(path_candidates("cat", ""), Vec::<String>::new());
     }
 }

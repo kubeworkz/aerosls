@@ -160,6 +160,11 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/echo", b"echo\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
+    // A second bin dir so PATH-driven lookup has somewhere to search:
+    // greet lives only under /usr/bin.
+    b.add_dir("/usr", 0o755);
+    b.add_dir("/usr/bin", 0o755);
+    b.add_file("/usr/bin/greet", b"echo\n", 0o755);
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
@@ -360,6 +365,36 @@ fn boot_runs_an_interactive_shell() {
         console.console_io().output(),
         b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ ",
         "export listed the mutated environment in region order"
+    );
+
+    // PATH-driven lookup: with PATH=/usr/bin:/bin, a bare name resolves
+    // through the search path — greet lives only in /usr/bin (first hit),
+    // echo falls through to /bin.
+    console.console_io().push_input(b"export PATH=/usr/bin:/bin\n");
+    booted.run(100);
+    console.console_io().push_input(b"greet hello\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo fallback\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ ",
+        "bare commands resolved through the exported PATH (usr/bin hit, /bin fallback)"
+    );
+
+    // A PATH miss: with PATH=/usr/bin only, `false` has no candidate and
+    // the child exec fails 127. Check it with a slash-qualified command
+    // (slash tokens skip the search path — a bare `echo` would fail too).
+    console.console_io().push_input(b"export PATH=/usr/bin\n");
+    booted.run(100);
+    console.console_io().push_input(b"false\n");
+    booted.run(100);
+    console.console_io().push_input(b"/bin/echo $?\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ ",
+        "an unresolvable bare command failed 127 and fed $?"
     );
 
     client.kill_driver(0);

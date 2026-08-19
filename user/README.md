@@ -231,9 +231,11 @@ script + the manifest's `image` record) is the sidecar build step; see
   piped line each exit 127 without stopping init, and the manifest/BIB
   cap names line up end to end. On top of init sits `applets::sh`, a minimal interactive shell:
   it prompts on the console, parks on empty input via the blocking-read
-  machinery, buffers multi-line input into a batch queue (a pasted chunk
-  runs line by line with one prompt around it, nothing dropped),  forks one child per pipeline stage (resolving bare command names through
-  `/bin`, like BusyBox), applies per-stage `<` /  `>` redirects (which
+  machinery,  buffers multi-line input into a batch queue (a pasted chunk
+  runs line by line with one prompt around it, nothing dropped), forks
+  one child per pipeline stage (resolving bare command names through the
+  exported `PATH`, probing each `:`-separated directory — default
+  `/bin`), applies per-stage `<` / `>` redirects (which
   override the pipeline connection at fd 0/1, like POSIX), and parses
   single / double quotes (grouping whitespace into one
   argument — `'…'` fully literal, `"…"` still expanding `$?`) plus
@@ -249,12 +251,15 @@ script + the manifest's `image` record) is the sidecar build step; see
   `echo saved > /tmp/saved` file write, a `cat < /etc/passwd` read,
   a pasted two-line batch, quoted/escaped arguments
   (`echo "hello world" | cat`, `echo '$?'` printed literally,
-  `echo hello\ world`, a quoted double space surviving the fork
+  `echo hello\ world`,  a quoted double space surviving the fork
   snapshot exactly, `echo $PATH ${HOME}` expanding the shell's
-  environment, and an `export`/`setenv` session that sets `FOO`, sets a
+  environment, an `export`/`setenv` session that sets `FOO`, sets a
   quoted `GREETING`, overwrites `HOME` in place, turns a usage error
-  into `$? = 2`, and lists the mutated environment) through the real
-  driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  into `$? = 2`, and lists the mutated environment, and a PATH-driven
+  lookup session — `export PATH=/usr/bin:/bin` finds `greet` in
+  `/usr/bin` with `/bin` fallback, and a PATH miss turns `false` into
+  `$? = 127`) through the real driver, asserting the console
+  transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
