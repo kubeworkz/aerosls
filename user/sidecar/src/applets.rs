@@ -38,6 +38,10 @@
 //! - **`seq`** — the pure producer: prints integers `FIRST..LAST` (step
 //!   `STEP`), one per line, filling the 4 KiB pipe and parking, so the
 //!   reader-side applets get a real fast writer (`seq 10000 | head`).
+//! - **`tee`** — the two-writer fan-out: copies stdin to stdout and to
+//!   each named file per chunk; a full stdout pipe parks without
+//!   rewriting the files, and an early-exiting reader (`tee | head`)
+//!   wakes the stdout retry to `EPIPE`.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -1053,6 +1057,93 @@ fn advance_seq(data: &mut Vec<u8>) {
     }
 }
 
+/// `tee [file...]`: copies stdin to stdout AND to each named file,
+/// fanning every chunk out to all destinations (no files = plain
+/// stdin→stdout copy). The chunk is written to the files first, then to
+/// stdout with `write_blocking` — so a full stdout pipe parks with the
+/// chunk still pending, and the files are NOT rewritten when the park
+/// ends. If the downstream reader leaves early (`seq 10000 | tee
+/// /tmp/out | head -n 3`), the stdout retry wakes to `EPIPE` and tee
+/// exits 2, leaving the file with everything written so far. Data
+/// layout: `[phase, fd, nfiles, file_fds..., pending...]` — `pending`
+/// is the chunk read but not yet fully written to stdout.
+pub fn tee<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // Copy the paths out: argv is borrowed from the manager, and
+        // open needs the vfs mutably.
+        let paths: Vec<String> = ctx.argv().iter().skip(1).map(|s| s.clone()).collect();
+        ctx.data.push(1); // phase: read a chunk
+        ctx.data.push(0); // fd: stdin
+        ctx.data.push(paths.len() as u8); // nfiles
+        for p in &paths {
+            match ctx.vfs().open(task, p, O_CREAT | O_WRONLY | O_TRUNC, 0o644) {
+                Ok(fd) => ctx.data.push(fd as u8),
+                Err(_) => return Step::Exit(2),
+            }
+        }
+    }
+    loop {
+        let nfiles = ctx.data[2] as usize;
+        let hdr = 3 + nfiles; // file fds at 3..hdr, pending at hdr..
+        match ctx.data[0] {
+            // Read a chunk into the pending buffer.
+            1 => {
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(0, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        let fds: Vec<u32> =
+                            ctx.data[3..hdr].iter().map(|&b| b as u32).collect();
+                        for fd in &fds {
+                            ctx.vfs().close(task, *fd).ok();
+                        }
+                        return Step::Exit(0);
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                        ctx.data[0] = 2; // fan out to the files first
+                    }
+                    ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(0)),
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            // Write the pending chunk to every file (files never block;
+            // this runs once per chunk, before the stdout write).
+            2 => {
+                let pending = ctx.data[hdr..].to_vec();
+                let fds: Vec<u32> =
+                    ctx.data[3..hdr].iter().map(|&b| b as u32).collect();
+                for fd in &fds {
+                    if ctx.vfs().write(task, *fd, &pending).is_err() {
+                        return Step::Exit(2);
+                    }
+                }
+                ctx.data[0] = 3; // then stdout, which can park
+            }
+            // Write the pending chunk to stdout, parking on a full
+            // pipe. The chunk stays pending (and the files are not
+            // rewritten) until it fully lands.
+            3 => {
+                let pending = ctx.data[hdr..].to_vec();
+                let plen = pending.len();
+                match ctx.write_blocking(1, &pending) {
+                    WriteBlock::Data(k) => {
+                        if k == plen {
+                            ctx.data.truncate(hdr);
+                            ctx.data[0] = 1; // back to reading
+                        } else {
+                            ctx.data.drain(hdr..hdr + k);
+                        }
+                    }
+                    WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                    WriteBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
 /// `echo`: writes its arguments (space-joined, newline-terminated) to fd 1.
 pub fn echo<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let mut text = String::new();
@@ -2041,6 +2132,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("tail", tail);
     pm.register_applet("sort", sort);
     pm.register_applet("seq", seq);
+    pm.register_applet("tee", tee);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);

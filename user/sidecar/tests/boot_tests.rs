@@ -164,6 +164,7 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/tail", b"tail\n", 0o755);
     b.add_file("/bin/sort", b"sort\n", 0o755);
     b.add_file("/bin/seq", b"seq\n", 0o755);
+    b.add_file("/bin/tee", b"tee\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
     // A second bin dir so PATH-driven lookup has somewhere to search:
@@ -562,6 +563,47 @@ fn boot_runs_an_interactive_shell() {
         console.console_io().output(),
         b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ ",
         "seq produced the three range forms, parked against head, and streamed all 10000 lines to wc"
+    );
+
+    // tee fans every chunk out to the console and the file: the simple
+    // round-trip (`seq 5 | tee /tmp/t5.out`, then cat it back) proves
+    // the file write, and the three-stage `seq 10000 | tee /tmp/tee.out
+    // | head -n 3` proves the interleaved drains — tee parks when the
+    // full pipe blocks, head takes three lines and leaves, and tee's
+    // stdout retry wakes to EPIPE while the file keeps the whole prefix
+    // that passed through (more than head ever consumed).
+    console.console_io().push_input(b"seq 5 | tee /tmp/t5.out\n");
+    booted.run(100);
+    console.console_io().push_input(b"cat /tmp/t5.out\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 10000 | tee /tmp/tee.out | head -n 3\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ ",
+        "tee fanned the stream to the console and the file, and outlived head's early exit"
+    );
+
+    // The file side of the fan-out: t5.out holds the exact stream, and
+    // tee.out is a prefix of the full seq stream — everything that
+    // passed through before head's exit woke tee's stdout to EPIPE.
+    assert_eq!(
+        read_all(&mut booted.proc.vfs, "/tmp/t5.out"),
+        b"1\n2\n3\n4\n5\n"
+    );
+    let full: Vec<u8> = (1..=10000)
+        .flat_map(|i| format!("{}\n", i).into_bytes())
+        .collect();
+    let got = read_all(&mut booted.proc.vfs, "/tmp/tee.out");
+    assert!(
+        full.starts_with(&got),
+        "tee.out is a prefix of the seq stream (got {} bytes)",
+        got.len()
+    );
+    assert!(
+        got.len() > 4096,
+        "tee.out outlived head's early exit (got {} bytes)",
+        got.len()
     );
 
     client.kill_driver(0);

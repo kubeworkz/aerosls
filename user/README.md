@@ -70,7 +70,9 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # EOF), sort (buffers the whole input, emits in
                   # lexicographic byte order), seq (the pure producer:
                   # integers FIRST..LAST by STEP, filling the pipe and
-                  # parking), echo, sh (minimal
+                  # parking), tee (fans each chunk to stdout and to
+                  # named files, parking on a full pipe without
+                  # rewriting the files), echo, sh (minimal
                   # interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
@@ -296,8 +298,11 @@ script + the manifest's `image` record) is the sidecar build step; see
   (all 10000 lines through repeated park/wake cycles) — and a
   multi-line-chunk pair (`cat /etc/mixed.txt | grep fig` and
   `| head -n 2`) pinning per-line extraction when a single read
-  holds several lines — through the real driver, asserting the
-  console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  holds several lines — plus a tee session (`seq 5 | tee /tmp/t5.out`
+  round-tripped through `cat`, and `seq 10000 | tee /tmp/tee.out
+  | head -n 3`, where tee's stdout wakes to `EPIPE` while the file
+  keeps the whole stream prefix) — through the real driver,
+  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.

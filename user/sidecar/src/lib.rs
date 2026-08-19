@@ -24,8 +24,10 @@
 //!   — partial-pipe semantics — tail buffers a sliding window to
 //!   EOF), `sort` (buffers the whole input across reads, then emits
 //!   in lexicographic byte order), `seq` (the pure producer:
-//!   integers `FIRST..LAST` by `STEP`, one per line), `true`/`false`
-//!   — plus `register_default_applets`.
+//!   integers `FIRST..LAST` by `STEP`, one per line), `tee` (fans
+//!   each chunk to stdout and named files, parking on a full pipe
+//!   without rewriting the files), `true`/`false` — plus
+//!   `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.
 //! - `heap`       — bump allocator over the budget region (v1 reserves it).
