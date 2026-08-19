@@ -32,8 +32,12 @@
 //!   expanding `$?`), backslash escapes the next character outside
 //!   quotes (so `\ `, `\$`, `\|`, … are literal), bare command names
 //!   resolve through the exported `PATH` (default `/bin`), and the
-//!   builtins `export` (set / list the environment) and `setenv NAME
-//!   value` run in the shell itself, mutating the persistent env region.
+//!   builtins `export` (set / list), `setenv NAME value`, `unset NAME...`
+//!   and `unsetenv NAME` run in the shell itself, mutating the persistent
+//!   env region. Leading `NAME=value` words are scoped assignments: they
+//!   persist only for a builtin (POSIX special-builtin rule) or a bare
+//!   assignment line, and `PATH=x cmd` scopes the search path to that
+//!   command only.
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
@@ -355,7 +359,7 @@ fn valid_name(name: &str) -> bool {
 /// task. v1: recognized only as the bare name (no `/`), standalone
 /// (no pipeline) — see `run_line`.
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "export" | "setenv")
+    matches!(name, "export" | "setenv" | "unset" | "unsetenv")
 }
 
 /// Apply a stage's `<` / `>` redirects at fd 0 / fd 1. Returns false on
@@ -494,12 +498,19 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data.extend_from_slice(&remainder);
         return Step::Yield;
     }
-    // A standalone builtin (export/setenv) runs in the shell itself — it
-    // mutates the persistent env region, so it can't be a forked child.
-    // In a pipeline it resolves as a program and fails 127 like any
-    // unknown command.
-    if stages.len() == 1 && is_builtin(&stages[0].argv[0]) {
-        return run_builtin(ctx, &stages[0], &remainder, &env);
+    // A standalone line with no command word: leading assignments persist
+    // in the shell (POSIX); a builtin (export/setenv/unset/unsetenv) runs
+    // in the shell itself — both mutate the env region, so neither can be
+    // a forked child. In a pipeline they resolve as a program and fail
+    // 127 like any unknown command.
+    if stages.len() == 1 {
+        let st = &stages[0];
+        if st.argv.is_empty() && !st.assigns.is_empty() {
+            return assign_line(ctx, st, &remainder, &env);
+        }
+        if !st.argv.is_empty() && is_builtin(&st.argv[0]) {
+            return run_builtin(ctx, st, &remainder, &env);
+        }
     }
     // Inter-stage pipes; the fds land above stdio (0,1,2 = console).
     let mut pipes: Vec<u32> = Vec::new();
@@ -552,7 +563,22 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             None => ctx.data.push(0),
         }
-        let prog = resolve_path(ctx.vfs(), task, &stage.argv[0], &path);
+        // A stage's assignments scope its own resolution: a leading
+        // `PATH=/usr/bin cmd` searches /usr/bin for this command only
+        // (the shell's PATH is untouched).
+        let mut stage_path = path.clone();
+        for (k, v) in &stage.assigns {
+            if k == "PATH" {
+                stage_path = v.clone();
+            }
+        }
+        // An empty argv (assigns-only stage inside a pipeline) has no
+        // program: resolve to nothing, the child exits 127.
+        let prog = if stage.argv.is_empty() {
+            String::new()
+        } else {
+            resolve_path(ctx.vfs(), task, &stage.argv[0], &stage_path)
+        };
         ctx.data.push(prog.len() as u8);
         ctx.data.extend_from_slice(prog.as_bytes());
         ctx.data.push(stage.argv.len() as u8); // n_args
@@ -634,10 +660,12 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// Run a builtin command in the shell task: apply the stage's redirects
-/// (so `export > file` writes the listing there), execute the builtin
-/// against a copy of the env, and rebuild the persistent data — the new
-/// env region, the exit status (for the next `$?`), and the unconsumed
-/// batch — then continue to the next buffered line or the prompt.
+/// (so `export > file` writes the listing there), apply the stage's
+/// `NAME=value` assignments FIRST (they persist for special builtins,
+/// per POSIX — `FOO=bar export` exports FOO=bar), execute the builtin
+/// against the env copy, and rebuild the persistent data — the new env
+/// region, the exit status (for the next `$?`), and the unconsumed batch
+/// — then continue to the next buffered line or the prompt.
 fn run_builtin<K: Kernel, A: BufferAlloc>(
     ctx: &mut Ctx<'_, K, A>,
     stage: &Stage,
@@ -649,12 +677,33 @@ fn run_builtin<K: Kernel, A: BufferAlloc>(
         return builtin_done(ctx, remainder, env, 2);
     }
     let mut new_env = env.to_vec();
+    for (k, v) in &stage.assigns {
+        set_var(&mut new_env, k.clone(), v.clone());
+    }
     let code = match stage.argv[0].as_str() {
         "export" => do_export(&mut new_env, &stage.argv[1..], task, ctx),
         "setenv" => do_setenv(&mut new_env, &stage.argv[1..]),
+        "unset" => do_unset(&mut new_env, &stage.argv[1..], false),
+        "unsetenv" => do_unset(&mut new_env, &stage.argv[1..], true),
         _ => 2, // unreachable: is_builtin guards the call
     };
     builtin_done(ctx, remainder, &new_env, code)
+}
+
+/// A bare-assignment line (`FOO=bar` with no command): the assignments
+/// affect the shell itself (POSIX — with no command name they persist),
+/// silently, with status 0.
+fn assign_line<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    stage: &Stage,
+    remainder: &[u8],
+    env: &[(String, String)],
+) -> Step {
+    let mut new_env = env.to_vec();
+    for (k, v) in &stage.assigns {
+        set_var(&mut new_env, k.clone(), v.clone());
+    }
+    builtin_done(ctx, remainder, &new_env, 0)
 }
 
 /// Rebuild the shell's persistent data after a builtin: `[phase, status,
@@ -725,6 +774,23 @@ fn do_setenv(env: &mut Vec<(String, String)>, args: &[String]) -> u8 {
         return 2;
     }
     set_var(env, args[0].clone(), args[1].clone());
+    0
+}
+
+/// `unset` / `unsetenv` builtin: removes variables from the env region.
+/// `unset NAME...` takes one or more names; `unsetenv` (csh-style) takes
+/// exactly one. A missing variable is a no-op success; a bad name or
+/// wrong arity is a usage error (2).
+fn do_unset(env: &mut Vec<(String, String)>, args: &[String], one_only: bool) -> u8 {
+    if args.is_empty() || (one_only && args.len() != 1) {
+        return 2;
+    }
+    for a in args {
+        if !valid_name(a) {
+            return 2;
+        }
+    }
+    env.retain(|(k, _)| !args.iter().any(|a| a == k));
     0
 }
 
@@ -865,12 +931,15 @@ fn resolve_path<K: Kernel, A: BufferAlloc>(
 }
 
 /// One pipeline stage: the command's argv plus optional `<` stdin / `>`
-/// stdout redirect targets (v1: truncating `>`, no `>>`).
+/// stdout redirect targets (v1: truncating `>`, no `>>`) and leading
+/// `NAME=value` assignment words (scoped to the stage; persisted only for
+/// special builtins or a bare-assignment line — see `run_line`).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Stage {
     pub argv: Vec<String>,
     pub in_redir: Option<String>,
     pub out_redir: Option<String>,
+    pub assigns: Vec<(String, String)>,
 }
 
 /// One token of a parsed command line: a word (possibly empty — `""` is
@@ -1076,17 +1145,22 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
     let mut argv: Vec<String> = Vec::new();
     let mut in_redir: Option<String> = None;
     let mut out_redir: Option<String> = None;
+    let mut assigns: Vec<(String, String)> = Vec::new();
+    let mut command_seen = false;
     let mut i = 0;
     while i < toks.len() {
         match &toks[i] {
             Tok::Pipe => {
-                if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() {
+                if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() || !assigns.is_empty()
+                {
                     stages.push(Stage {
                         argv: core::mem::take(&mut argv),
                         in_redir: in_redir.take(),
                         out_redir: out_redir.take(),
+                        assigns: core::mem::take(&mut assigns),
                     });
                 }
+                command_seen = false;
                 i += 1;
             }
             Tok::RedirectOut => match toks.get(i + 1) {
@@ -1110,16 +1184,31 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
                 }
             },
             Tok::Word(w) => {
+                // Leading NAME=value words with a valid name are scoped
+                // assignments, not argv (POSIX); the first non-assignment
+                // word is the command. Redirects may sit in between.
+                if !command_seen {
+                    if let Some(eq) = w.find('=') {
+                        let name = &w[..eq];
+                        if valid_name(name) {
+                            assigns.push((name.to_string(), w[eq + 1..].to_string()));
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    command_seen = true;
+                }
                 argv.push(w.clone());
                 i += 1;
             }
         }
     }
-    if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() {
+    if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() || !assigns.is_empty() {
         stages.push(Stage {
             argv,
             in_redir,
             out_redir,
+            assigns,
         });
     }
     stages
@@ -1144,6 +1233,7 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             in_redir: None,
             out_redir: None,
+            assigns: Vec::new(),
         }
     }
 
@@ -1177,6 +1267,7 @@ mod tests {
                 argv: vec!["echo".to_string(), "7".to_string()],
                 in_redir: None,
                 out_redir: None,
+                assigns: Vec::new(),
             }]
         );
         assert_eq!(parse_line("$? | cat", 3), vec![st(&["3"]), st(&["cat"])]);
@@ -1191,6 +1282,7 @@ mod tests {
                 argv: vec!["echo".to_string(), "hi".to_string()],
                 in_redir: None,
                 out_redir: Some("/tmp/x".to_string()),
+                assigns: Vec::new(),
             }]
         );
         assert_eq!(
@@ -1200,11 +1292,13 @@ mod tests {
                     argv: vec!["cat".to_string()],
                     in_redir: Some("/etc/passwd".to_string()),
                     out_redir: None,
+                    assigns: Vec::new(),
                 },
                 Stage {
                     argv: vec!["grep".to_string(), "root".to_string()],
                     in_redir: None,
                     out_redir: Some("/tmp/out".to_string()),
+                    assigns: Vec::new(),
                 },
             ]
         );
@@ -1216,6 +1310,7 @@ mod tests {
                 argv: vec!["echo".to_string(), "a".to_string()],
                 in_redir: None,
                 out_redir: Some("/tmp/y".to_string()),
+                assigns: Vec::new(),
             }]
         );
         assert_eq!(
@@ -1224,6 +1319,7 @@ mod tests {
                 argv: vec!["echo".to_string(), "hi".to_string()],
                 in_redir: None,
                 out_redir: Some(String::new()),
+                assigns: Vec::new(),
             }]
         );
     }
@@ -1270,6 +1366,7 @@ mod tests {
                 argv: vec!["cat".to_string()],
                 in_redir: Some("my file".to_string()),
                 out_redir: None,
+                assigns: Vec::new(),
             }]
         );
         // An unterminated quote runs to the end of the line (v1 lenient).
@@ -1342,6 +1439,57 @@ mod tests {
         assert_eq!(
             parse_line_raw("echo \"$PATH\" '$PATH' \\$PATH", 0, &env),
             vec![st(&["echo", "/bin", "$PATH", "$PATH"])]
+        );
+    }
+
+    #[test]
+    fn parse_line_extracts_assignments() {
+        // Leading NAME=value words become scoped assignments, not argv.
+        assert_eq!(
+            parse_line("FOO=bar echo hi", 0),
+            vec![Stage {
+                argv: vec!["echo".to_string(), "hi".to_string()],
+                in_redir: None,
+                out_redir: None,
+                assigns: vec![("FOO".to_string(), "bar".to_string())],
+            }]
+        );
+        // Several assignments accumulate; a word after the command is an
+        // ordinary argument, even if it looks like an assignment.
+        assert_eq!(
+            parse_line("A=1 B=2 echo x A=3", 0),
+            vec![Stage {
+                argv: vec!["echo".to_string(), "x".to_string(), "A=3".to_string()],
+                in_redir: None,
+                out_redir: None,
+                assigns: vec![
+                    ("A".to_string(), "1".to_string()),
+                    ("B".to_string(), "2".to_string()),
+                ],
+            }]
+        );
+        // An invalid name is a command word, not an assignment.
+        assert_eq!(parse_line("1BAD=x cmd", 0), vec![st(&["1BAD=x", "cmd"])]);
+        // A bare assignment line is a kept stage (it persists in the
+        // shell — run_line's assign_line path).
+        assert_eq!(
+            parse_line("FOO=bar", 0),
+            vec![Stage {
+                argv: Vec::new(),
+                in_redir: None,
+                out_redir: None,
+                assigns: vec![("FOO".to_string(), "bar".to_string())],
+            }]
+        );
+        // Redirects may sit between assignments and the command.
+        assert_eq!(
+            parse_line("FOO=bar > /tmp/x echo hi", 0),
+            vec![Stage {
+                argv: vec!["echo".to_string(), "hi".to_string()],
+                in_redir: None,
+                out_redir: Some("/tmp/x".to_string()),
+                assigns: vec![("FOO".to_string(), "bar".to_string())],
+            }]
         );
     }
 

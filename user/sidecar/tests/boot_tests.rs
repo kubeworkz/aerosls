@@ -397,6 +397,50 @@ fn boot_runs_an_interactive_shell() {
         "an unresolvable bare command failed 127 and fed $?"
     );
 
+    // Restore PATH=/bin (the earlier PATH-miss test left it /usr/bin, so
+    // a bare `echo` would fail 127), then unset GREETING: it vanishes from
+    // the env region, `$GREETING` expands to nothing (an unquoted empty
+    // expansion leaves echo with no argument → one blank line), and the
+    // listing drops it.
+    console.console_io().push_input(b"export PATH=/bin\nunset GREETING\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $GREETING\n");
+    booted.run(100);
+    console.console_io().push_input(b"export\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ ",
+        "unset removed GREETING: empty expansion and no listing entry"
+    );
+
+    // A bare assignment line persists in the shell (POSIX, no command
+    // name); echo sees it. unsetenv removes it again.
+    console.console_io().push_input(b"FOO=scoped\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $FOO\n");
+    booted.run(100);
+    console.console_io().push_input(b"unsetenv FOO\nexport\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ ",
+        "a bare assignment persisted for the next command; unsetenv removed it"
+    );
+
+    // Assignment-scoped PATH: `PATH=/usr/bin greet hi` resolves greet
+    // through /usr/bin for that command only, while the shell's own PATH
+    // stays /bin — the follow-up `greet` fails 127.
+    console.console_io().push_input(b"PATH=/usr/bin greet hi\n");
+    booted.run(100);
+    console.console_io().push_input(b"greet\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ ",
+        "an assignment scoped PATH to one command; the shell's PATH was untouched"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }

@@ -65,8 +65,9 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # cat, echo, sh (minimal interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
-                  # variable expansion, export/setenv builtins that
-                  # mutate the env, < and > redirects), true/false
+                  # variable expansion, export/setenv/unset/unsetenv
+                  # builtins + NAME=value scoped assignments that mutate
+                  # the env, < and > redirects), true/false
                   # + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
                   # and boot(): handshake with the ramdisk driver, mount /
@@ -243,9 +244,13 @@ script + the manifest's `image` record) is the sidecar build step; see
   quotes only `$`, `"`, `\` are escapable, per POSIX), with  `$VAR` /
   `${VAR}` expansion against a persistent shell environment (`PATH=/bin`,
   `HOME=/root`; unset names expand to nothing — the env region survives
-  pipeline waits and batch reaps), with `export` (list or set `NAME=value`
-  entries in place) and `setenv NAME value` builtins that run in the
-  shell itself and mutate that region, waits, and tracks the
+  pipeline waits and batch reaps),  with `export` (list or set `NAME=value`
+  entries in place), `setenv NAME value`, `unset NAME...` and
+  `unsetenv NAME` builtins that run in the shell itself and mutate that
+  region, plus leading `NAME=value` scoped assignments (`PATH=x cmd`
+  searches `x` for that command only; a bare `FOO=bar` line persists,
+  as does an assignment on a builtin, per the POSIX special-builtin
+  rule), waits, and tracks the
   last exit status as `$?` — the boot test drives a full
   `echo hello | cat` pipeline, a `false` → `echo $?` sequence, an
   `echo saved > /tmp/saved` file write, a `cat < /etc/passwd` read,
@@ -258,8 +263,11 @@ script + the manifest's `image` record) is the sidecar build step; see
   into `$? = 2`, and lists the mutated environment, and a PATH-driven
   lookup session — `export PATH=/usr/bin:/bin` finds `greet` in
   `/usr/bin` with `/bin` fallback, and a PATH miss turns `false` into
-  `$? = 127`) through the real driver, asserting the console
-  transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  `$? = 127`, then an env-mutation session — `unset GREETING` empties
+  its expansion, a bare `FOO=scoped` line persists and `unsetenv FOO`
+  removes it, and `PATH=/usr/bin greet hi` resolves through the
+  scoped path while the shell's PATH stays put) through the real
+  driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
