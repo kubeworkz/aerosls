@@ -281,6 +281,27 @@ fn boot_runs_an_interactive_shell() {
         "single quotes kept the $? token literal"
     );
 
+    // Backslash escapes: `\ ` keeps a space inside one word, so the shell
+    // prints a single argument with a space instead of splitting it.
+    console.console_io().push_input(b"echo hello\\ world\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ ",
+        "the backslash-escaped space kept the two words as one argument"
+    );
+
+    // Exact argv through the fork snapshot: a quoted double space survives
+    // the per-argument encoding (a join/split round-trip would collapse it
+    // to a single space).
+    console.console_io().push_input(b"echo \"a  b\"\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ ",
+        "quoted spacing arrived at the applet exactly as typed"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }

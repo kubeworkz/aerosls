@@ -23,9 +23,10 @@
 //!   console), forks one child per pipeline stage, waits, and tracks the
 //!   last exit status as `$?` (expandable in the next command). `<` /
 //!   `>` redirect stdin/stdout per stage (the redirect overrides the
-//!   pipeline connection, like POSIX), and single / double quotes group
+//!   pipeline connection, like POSIX), single / double quotes group
 //!   whitespace into one argument (`'…'` fully literal, `"…"` still
-//!   expanding `$?`).
+//!   expanding `$?`), and backslash escapes the next character outside
+//!   quotes (so `\ `, `\$`, `\|`, … are literal).
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
@@ -267,8 +268,8 @@ pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
 /// children in order — the queued remainder survives all of it, so a
 /// multi-line read runs line by line with a single prompt around the
 /// batch. A pipeline child's fork snapshot carries `[2, status, stage,
-/// n_stages, nfd, pipes..., in_len, in..., out_len, out..., argv_len,
-/// argv..., queue, FORK_MARKER]` — see `sh_child`.
+/// n_stages, nfd, pipes..., in_len, in..., out_len, out..., n_args,
+/// (arg_len, arg...)..., queue, FORK_MARKER]` — see `sh_child`.
 pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     if ctx.data.is_empty() {
@@ -360,8 +361,10 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let nfd = (stages.len() - 1) * 2;
     // Fork one child per stage; each snapshot carries its stage index, the
     // pipe fds, the `<` / `>` redirect targets (length-prefixed), the argv
-    // (length-prefixed, so the child stops before the queue), and the
-    // queued remainder — see `sh_child`.
+    // (one length-prefixed field per argument, so words containing spaces
+    // — quoted or backslash-escaped — arrive at the child exactly as
+    // parsed; the child stops before the queue), and the queued
+    // remainder — see `sh_child`.
     let mut children: Vec<u32> = Vec::new();
     for (s, stage) in stages.iter().enumerate() {
         ctx.data.clear();
@@ -387,9 +390,11 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             None => ctx.data.push(0),
         }
-        let argv_text = stage.argv.join(" ");
-        ctx.data.push(argv_text.len() as u8);
-        ctx.data.extend_from_slice(argv_text.as_bytes());
+        ctx.data.push(stage.argv.len() as u8); // n_args
+        for a in &stage.argv {
+            ctx.data.push(a.len() as u8);
+            ctx.data.extend_from_slice(a.as_bytes());
+        }
         ctx.data.extend_from_slice(&remainder); // the queue survives forks
         match ctx.fork() {
             Ok(c) => children.push(c),
@@ -459,13 +464,15 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
-/// nfd, pipes..., in_len, in_path..., out_len, out_path..., argv_len,
-/// argv..., queue, FORK_MARKER]` — the argv is length-prefixed so the
-/// child stops before the shell's queued input batch. Wire stdin/stdout
-/// to the pipe ends (or the console for the first/last stage), apply the
-/// stage's `<` / `>` redirects (which override the pipeline connection at
-/// fd 0 / fd 1, like POSIX), drop every pipe fd, and exec — on any
-/// failure the child exits 127, which the shell reaps.
+/// nfd, pipes..., in_len, in_path..., out_len, out_path..., n_args,
+/// (arg_len, arg...)..., queue, FORK_MARKER]` — one length-prefixed field
+/// per argument, so each argv word (even one containing spaces, from
+/// quoting or backslash escapes) arrives exactly as parsed and the child
+/// stops before the shell's queued input batch. Wire stdin/stdout to the
+/// pipe ends (or the console for the first/last stage), apply the stage's
+/// `<` / `>` redirects (which override the pipeline connection at fd 0 /
+/// fd 1, like POSIX), drop every pipe fd, and exec — on any failure the
+/// child exits 127, which the shell reaps.
 fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     // The fork marker is the last byte.
@@ -495,12 +502,17 @@ fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         None
     };
     p += 1 + out_len;
-    let argv_len = d[p] as usize;
-    let text = match core::str::from_utf8(&d[p + 1..p + 1 + argv_len]) {
-        Ok(s) => s,
-        Err(_) => return Step::Exit(127),
-    };
-    let tokens: Vec<String> = text.split_whitespace().map(|t| t.to_string()).collect();
+    let n_args = d[p] as usize;
+    p += 1;
+    let mut tokens: Vec<String> = Vec::new();
+    for _ in 0..n_args {
+        let alen = d[p] as usize;
+        match core::str::from_utf8(&d[p + 1..p + 1 + alen]) {
+            Ok(s) => tokens.push(s.to_string()),
+            Err(_) => return Step::Exit(127),
+        }
+        p += 1 + alen;
+    }
     if tokens.is_empty() {
         return Step::Exit(127);
     }
@@ -573,13 +585,18 @@ enum Tok {
 }
 
 /// Tokenize a command line into words and metacharacters, honoring single
-/// and double quotes. A quoted section is a literal part of its word, so
-/// quotes group whitespace — and, quoted, the metacharacters `|` `<` `>`
-/// — into a single argument. `$?` expands to the last exit status
-/// wherever it appears: unquoted, and inside double quotes (POSIX).
-/// Single quotes are fully literal, so `'$?'` stays `$?`. An unterminated
-/// quote runs to the end of the line (v1 is lenient — no syntax error).
-/// Backslash is literal (no escapes in v1).
+/// and double quotes and backslash escapes. A quoted section is a literal
+/// part of its word, so quotes group whitespace — and, quoted, the
+/// metacharacters `|` `<` `>` — into a single argument. `$?` expands to
+/// the last exit status wherever it appears: unquoted, and inside double
+/// quotes (POSIX). Single quotes are fully literal, so `'$?'` stays `$?`
+/// and `'\'` is a backslash. Outside quotes, backslash removes the
+/// special meaning of the next character (POSIX): `\ ` is a literal
+/// space, `\$` suppresses `$?` expansion, and `\|` is a word, not a
+/// pipe; a trailing backslash is dropped (v1 lenient). Inside double
+/// quotes, backslash escapes only `$`, `"` and `\` (POSIX); elsewhere it
+/// stays literal. An unterminated quote runs to the end of the line (v1
+/// is lenient — no syntax error).
 fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
     let chars: Vec<char> = line.chars().collect();
     let mut toks: Vec<Tok> = Vec::new();
@@ -602,8 +619,8 @@ fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
                 i += 1;
             }
             // Unquoted metacharacters end the current word and stand
-            // alone; quoted versions (handled in the quote arms) stay
-            // literal parts of a word.
+            // alone; quoted or escaped versions (handled in the quote and
+            // backslash arms) stay literal parts of a word.
             '|' => {
                 flush!();
                 toks.push(Tok::Pipe);
@@ -618,6 +635,16 @@ fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
                 flush!();
                 toks.push(Tok::RedirectOut);
                 i += 1;
+            }
+            // Outside quotes, backslash removes the next character's
+            // special meaning (POSIX); a trailing backslash is dropped.
+            '\\' => {
+                if i + 1 < chars.len() {
+                    word.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             '\'' => {
                 quoted = true;
@@ -637,15 +664,22 @@ fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
                     if i >= chars.len() {
                         break;
                     }
-                    if chars[i] == '"' {
+                    let d = chars[i];
+                    if d == '"' {
                         i += 1;
                         break;
                     }
-                    if chars[i] == '$' && chars.get(i + 1) == Some(&'?') {
+                    // Inside double quotes, backslash escapes only `$`,
+                    // `"` and `\` (POSIX); everything else stays literal.
+                    if d == '\\' && matches!(chars.get(i + 1), Some('$') | Some('"') | Some('\\'))
+                    {
+                        word.push(chars[i + 1]);
+                        i += 2;
+                    } else if d == '$' && chars.get(i + 1) == Some(&'?') {
                         word.push_str(&last_status.to_string());
                         i += 2;
                     } else {
-                        word.push(chars[i]);
+                        word.push(d);
                         i += 1;
                     }
                 }
@@ -865,5 +899,32 @@ mod tests {
         );
         // An unterminated quote runs to the end of the line (v1 lenient).
         assert_eq!(parse_line("echo 'oops", 0), vec![st(&["echo", "oops"])]);
+    }
+
+    #[test]
+    fn parse_line_backslash_escapes() {
+        // `\ ` is a literal space inside one word — no token split.
+        assert_eq!(
+            parse_line("echo hello\\ world", 0),
+            vec![st(&["echo", "hello world"])]
+        );
+        // `\$` suppresses `$?` expansion; `\\` is a literal backslash.
+        assert_eq!(parse_line("echo \\$? \\\\", 7), vec![st(&["echo", "$?", "\\"])]);
+        // Escaped metacharacters are words, not operators.
+        assert_eq!(
+            parse_line("echo \\| \\> \\<", 0),
+            vec![st(&["echo", "|", ">", "<"])]
+        );
+        // Inside double quotes, backslash escapes only `$`, `"`, `\\`
+        // (POSIX).
+        assert_eq!(parse_line("echo \"a\\\"b\"", 0), vec![st(&["echo", "a\"b"])]);
+        assert_eq!(parse_line("echo \"\\$\"", 7), vec![st(&["echo", "$"])]); // no expansion
+        assert_eq!(parse_line("echo \"\\\\\"", 0), vec![st(&["echo", "\\"])]);
+        // Other backslashes inside double quotes stay literal...
+        assert_eq!(parse_line("echo \"a\\ b\"", 0), vec![st(&["echo", "a\\ b"])]);
+        // ...and so do backslashes inside single quotes.
+        assert_eq!(parse_line("echo 'a\\b'", 0), vec![st(&["echo", "a\\b"])]);
+        // A trailing backslash is dropped (v1 lenient).
+        assert_eq!(parse_line("echo x\\", 0), vec![st(&["echo", "x"])]);
     }
 }

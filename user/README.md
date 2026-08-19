@@ -229,15 +229,18 @@ script + the manifest's `image` record) is the sidecar build step; see
   machinery, buffers multi-line input into a batch queue (a pasted chunk
   runs line by line with one prompt around it, nothing dropped),  forks one child per pipeline stage (resolving bare command names through
   `/bin`, like BusyBox), applies per-stage `<` / `>` redirects (which
-  override the pipeline connection at fd 0/1, like POSIX), and parses
-  single / double quotes (grouping whitespace into one argument — `'…'`
-  fully literal, `"…"` still expanding `$?`), waits, and tracks the
+  override the pipeline connection at fd 0/1, like POSIX),  and parses single / double quotes (grouping whitespace into one
+  argument — `'…'` fully literal, `"…"` still expanding `$?`) plus
+  backslash escapes (`\ `, `\$`, `\|`, … are literal; inside double
+  quotes only `$`, `"`, `\` are escapable, per POSIX), waits, and tracks the
   last exit status as `$?` — the boot test drives a full
   `echo hello | cat` pipeline, a `false` → `echo $?` sequence, an
   `echo saved > /tmp/saved` file write, a `cat < /etc/passwd` read,
-  a pasted two-line batch, and quoted arguments
-  (`echo "hello world" | cat`, `echo '$?'` printed literally) through
-  the real driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  a pasted two-line batch, and quoted/escaped arguments
+  (`echo "hello world" | cat`, `echo '$?'` printed literally,
+  `echo hello\ world`, and a quoted double space surviving the fork
+  snapshot exactly) through the real driver, asserting the console
+  transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
