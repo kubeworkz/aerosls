@@ -18,7 +18,11 @@
 //!   `read_blocking` so it parks on an empty stdin instead of spinning.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
-//! - **`true`** — exits 0.
+//! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
+//!   commands from fd 0 with a blocking read (parking on an empty
+//!   console), forks one child per pipeline stage, waits, and tracks the
+//!   last exit status as `$?` (expandable in the next command).
+//! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
 //! children: `data[0]` = phase, `data[1..5]` = u32 LE line cursor (phase 1
@@ -26,6 +30,8 @@
 //! child's snapshot carries `[1, cursor, script, FORK_MARKER]`; the child
 //! parses the line at the cursor, sets up stdio, and execs — one command
 //! per child, exactly like the `cat | grep` pipeline test's phase machine.
+//! `sh`'s pipeline children use the same pattern with their own layout
+//! (see `sh_child`).
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -243,10 +249,280 @@ pub fn do_true<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     Step::Exit(0)
 }
 
+/// `false`: exits 1 (for `sh`'s `$?` and the like).
+pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
+    Step::Exit(1)
+}
+
+/// `sh`: the minimal interactive shell. Data layout: `data[0]` = phase,
+/// `data[1]` = last exit status (`$?`). Phase 0 prints the prompt, phase 1
+/// accumulates console input until a newline (parking on an empty console
+/// via `read_blocking`), phase 2 runs the parsed command, phase 3 reaps
+/// the pipeline's children in order. A pipeline child's fork snapshot
+/// carries `[2, status, stage, n_stages, pipes..., stage_text,
+/// FORK_MARKER]` — see `sh_child`.
+pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        ctx.data.extend_from_slice(&[0, 0]); // phase, last status
+        return Step::Yield;
+    }
+    if is_child(&ctx.data) {
+        return sh_child(ctx);
+    }
+    match ctx.data[0] {
+        0 => {
+            if ctx.vfs().write(task, 1, b"$ ").is_err() {
+                return Step::Exit(2);
+            }
+            ctx.data[0] = 1;
+            Step::Yield
+        }
+        1 => {
+            let mut buf = [0u8; 16];
+            match ctx.read_blocking(0, &mut buf) {
+                ReadBlock::Data(0) => Step::Exit(0), // console closed: EOF
+                ReadBlock::Data(n) => {
+                    ctx.data.extend_from_slice(&buf[..n]);
+                    if ctx.data[2..].contains(&b'\n') {
+                        ctx.data[0] = 2;
+                    }
+                    Step::Yield
+                }
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(0)),
+                ReadBlock::Err(_) => Step::Exit(2),
+            }
+        }
+        2 => run_line(ctx),
+        3 => reap_next(ctx),
+        _ => Step::Exit(2),
+    }
+}
+
+/// Phase 2: parse the accumulated line, fork one child per pipeline stage,
+/// close the shell's own pipe copies (or the readers never see EOF), and
+/// wait for the first child.
+fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let status = ctx.data[1];
+    let nl = match ctx.data[2..].iter().position(|&b| b == b'\n') {
+        Some(i) => i,
+        None => return Step::Exit(2), // phase 2 without a newline: impossible
+    };
+    let line = match core::str::from_utf8(&ctx.data[2..2 + nl]) {
+        Ok(s) => s.trim(),
+        Err(_) => return Step::Exit(2),
+    };
+    let stages = parse_line(line, status);
+    if stages.is_empty() {
+        ctx.data.truncate(2);
+        ctx.data[0] = 0; // blank line: straight back to the prompt
+        return Step::Yield;
+    }
+    // Inter-stage pipes; the fds land above stdio (0,1,2 = console).
+    let mut pipes: Vec<u32> = Vec::new();
+    for _ in 0..stages.len() - 1 {
+        let (r, w) = match ctx.vfs().pipe(task) {
+            Ok(p) => p,
+            Err(_) => return Step::Exit(2),
+        };
+        pipes.push(r);
+        pipes.push(w);
+    }
+    // Fork one child per stage; each snapshot carries its stage index, the
+    // pipe fds, and its token text (plus the fork marker).
+    let mut children: Vec<u32> = Vec::new();
+    for (s, stage) in stages.iter().enumerate() {
+        ctx.data.clear();
+        ctx.data.push(2); // phase
+        ctx.data.push(status);
+        ctx.data.push(s as u8);
+        ctx.data.push(stages.len() as u8);
+        for fd in &pipes {
+            ctx.data.push(*fd as u8);
+        }
+        ctx.data.extend_from_slice(stage.join(" ").as_bytes());
+        match ctx.fork() {
+            Ok(c) => children.push(c),
+            Err(_) => return Step::Exit(2),
+        }
+    }
+    // The shell's own pipe copies must go, or the readers never see EOF
+    // (same rule as the cat | grep test's shell).
+    for fd in &pipes {
+        ctx.vfs().close(task, *fd).ok();
+    }
+    // Wait state: [3, status, n, reaped, children...].
+    ctx.data.clear();
+    ctx.data.push(3);
+    ctx.data.push(status);
+    ctx.data.push(children.len() as u8);
+    ctx.data.push(0); // reaped count
+    for c in &children {
+        ctx.data.push(*c as u8);
+    }
+    let c = children[0];
+    match ctx.wait(c) {
+        WaitOutcome::Reaped(code) => {
+            ctx.data[3] = 1;
+            if children.len() == 1 {
+                ctx.data[1] = code as u8;
+            }
+            Step::Yield
+        }
+        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+        WaitOutcome::NoSuchChild => Step::Exit(2),
+    }
+}
+
+/// Phase 3: reap the pipeline's children in order; the last stage's status
+/// becomes `$?`. When all are reaped, back to the prompt.
+fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let n = ctx.data[2] as usize;
+    let reaped = ctx.data[3] as usize;
+    if reaped >= n {
+        ctx.data.truncate(2);
+        ctx.data[0] = 0;
+        return Step::Yield;
+    }
+    let c = ctx.data[4 + reaped] as u32;
+    match ctx.wait(c) {
+        WaitOutcome::Reaped(code) => {
+            ctx.data[3] = (reaped + 1) as u8;
+            if reaped + 1 == n {
+                ctx.data[1] = code as u8;
+            }
+            Step::Yield
+        }
+        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+        WaitOutcome::NoSuchChild => {
+            ctx.data[3] = (reaped + 1) as u8;
+            Step::Yield
+        }
+    }
+}
+
+/// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
+/// pipes..., stage_text, FORK_MARKER]`. Wire stdin/stdout to the pipe ends
+/// (or the console for the first/last stage), drop every pipe fd, and exec
+/// — on exec failure the child exits 127, which the shell reaps.
+fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    // The fork marker is the last byte.
+    let d = &ctx.data[..ctx.data.len() - 1];
+    let stage = d[2] as usize;
+    let n = d[3] as usize;
+    let nfd = (n - 1) * 2;
+    let pipes: Vec<u32> = d[4..4 + nfd].iter().map(|&b| b as u32).collect();
+    let text = match core::str::from_utf8(&d[4 + nfd..]) {
+        Ok(s) => s,
+        Err(_) => return Step::Exit(127),
+    };
+    let tokens: Vec<String> = text.split_whitespace().map(|t| t.to_string()).collect();
+    if tokens.is_empty() {
+        return Step::Exit(127);
+    }
+    let in_fd = if stage == 0 { 0 } else { pipes[(stage - 1) * 2] };
+    let out_fd = if stage == n - 1 { 1 } else { pipes[stage * 2 + 1] };
+    if ctx.vfs().dup2(task, in_fd, 0).is_err() || ctx.vfs().dup2(task, out_fd, 1).is_err() {
+        return Step::Exit(127);
+    }
+    for fd in &pipes {
+        ctx.vfs().close(task, *fd).ok();
+    }
+    let argv: Vec<&str> = tokens.iter().map(|t| t.as_str()).collect();
+    // argv[0] stays as typed; the file to exec is resolved through PATH.
+    let prog = resolve_path(&tokens[0]);
+    match ctx.exec(&prog, &argv) {
+        Ok(()) => Step::Yield,
+        Err(_) => Step::Exit(127),
+    }
+}
+
+/// Minimal PATH resolution: a token containing `/` is used as-is (a
+/// relative path resolves against the task's cwd); otherwise the command
+/// names an applet under `/bin` (v1: a single search directory, no envp).
+fn resolve_path(tok: &str) -> String {
+    if tok.contains('/') {
+        tok.to_string()
+    } else {
+        alloc::format!("/bin/{}", tok)
+    }
+}
+
+/// Parse one command line into pipeline stages. Tokens are
+/// whitespace-split; a lone `|` token separates stages; a token equal to
+/// `$?` expands to the last exit status. Empty stages are skipped (a stray
+/// `|` cannot produce a stage with no command). Returns [] for a blank
+/// line. v1: no quoting, no redirection, spaces required around `|`.
+fn parse_line(line: &str, last_status: u8) -> Vec<Vec<String>> {
+    let mut stages: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for t in line.split_whitespace() {
+        if t == "|" {
+            if !cur.is_empty() {
+                stages.push(core::mem::take(&mut cur));
+            }
+        } else if t == "$?" {
+            cur.push(last_status.to_string());
+        } else {
+            cur.push(t.to_string());
+        }
+    }
+    if !cur.is_empty() {
+        stages.push(cur);
+    }
+    stages
+}
+
 /// Install the system applets into a proc manager (called by `boot()`).
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
     pm.register_applet("cat", cat);
     pm.register_applet("echo", echo);
+    pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
+    pm.register_applet("false", do_false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_line;
+
+    #[test]
+    fn parse_line_splits_pipeline_stages() {
+        assert_eq!(
+            parse_line("echo hello | cat", 0),
+            vec![
+                vec!["echo".to_string(), "hello".to_string()],
+                vec!["cat".to_string()]
+            ]
+        );
+        assert_eq!(
+            parse_line("cat < nothing", 0),
+            vec![vec!["cat".to_string(), "<".to_string(), "nothing".to_string()]]
+        );
+    }
+
+    #[test]
+    fn parse_line_expands_last_status() {
+        assert_eq!(
+            parse_line("echo $?", 7),
+            vec![vec!["echo".to_string(), "7".to_string()]]
+        );
+        assert_eq!(
+            parse_line("$? | cat", 3),
+            vec![
+                vec!["3".to_string()],
+                vec!["cat".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_line_blank_and_stray_pipes() {
+        assert_eq!(parse_line("", 0), Vec::<Vec<String>>::new());
+        assert_eq!(parse_line("   \t ", 3), Vec::<Vec<String>>::new());
+        assert_eq!(parse_line("| true |", 0), vec![vec!["true".to_string()]]);
+    }
 }

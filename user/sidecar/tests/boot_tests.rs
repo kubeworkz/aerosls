@@ -140,6 +140,88 @@ fn boot_mounts_and_runs_init() {
     t.join().unwrap();
 }
 
+/// The interactive-shell boot: init runs a script whose last line is
+/// `/bin/sh`; the shell prompts on the console, parks for input, and the
+/// test types commands — a two-stage pipeline, a failing command, and a
+/// `$?` expansion — asserting the console transcript at each step and the
+/// parked shell state between them.
+#[test]
+fn boot_runs_an_interactive_shell() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", 0o644);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/false", b"false\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    // Boot: init forks the shell (task 1), which prints its first prompt
+    // and parks on console input; init parks waiting for it.
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ ",
+        "the shell's first prompt"
+    );
+    assert_eq!(
+        booted.proc.state(1),
+        Some(aerosls_procmgr::TaskState::Blocked(
+            aerosls_procmgr::BlockReason::Readable(0)
+        )),
+        "the shell parks on the empty console"
+    );
+    assert_eq!(
+        booted.proc.state(0),
+        Some(aerosls_procmgr::TaskState::Blocked(
+            aerosls_procmgr::BlockReason::WaitingChild(1)
+        )),
+        "init waits for the shell"
+    );
+
+    // `echo hello | cat`: the shell forks a two-stage pipeline; cat (the
+    // last stage) writes the payload to the console.
+    console.console_io().push_input(b"echo hello | cat\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ ",
+        "the pipeline's output, then the next prompt"
+    );
+
+    // `false` exits 1 silently; the shell tracks it as `$?`.
+    console.console_io().push_input(b"false\n");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ hello\n$ $ ");
+
+    // `echo $?` expands the last exit status: 1 from the `false`.
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ ",
+        "$? carried false's 1 into the next command"
+    );
+    assert_eq!(
+        booted.proc.state(1),
+        Some(aerosls_procmgr::TaskState::Blocked(
+            aerosls_procmgr::BlockReason::Readable(0)
+        )),
+        "the shell parked again awaiting the next command"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 /// `BootCaps::from_bib` resolves the initial caps by manifest name from a
 /// kernel-filled Boot Info Block.
 #[test]

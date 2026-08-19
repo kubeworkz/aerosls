@@ -61,7 +61,9 @@ procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
 sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
   src/applets.rs  # the built-in registry: init (the /etc/init.rc boot-script
                   # runner — one forked child per command, with a > stdout
-                  # redirect), cat, echo, true + register_default_applets
+                  # redirect), cat, echo, sh (minimal interactive shell —
+                  # console commands, | pipelines, $? last-exit-status),
+                  # true/false + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
                   # and boot(): handshake with the ramdisk driver, mount /
                   # (aerofs), /dev (console + null), /tmp (ramfs), install
@@ -94,9 +96,10 @@ kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 #   - sidecar/tests/      the bootstrap: manifest → BIB cap resolution, and
 #                         boot() against the real driver — init (the boot
 #                         script runner) forks one child per /etc/init.rc
-#                         line; cat/echo run from the rootfs, init runs with
-#                         console stdio, reads /etc/passwd through the
-#                         whole chain, writes /tmp
+#                         line; cat/echo run from the rootfs, console stdio
+#                         carries a rootfs read out, /tmp is writable; and
+#                         an interactive sh session (pipeline + $?) typed
+#                         at the console
 cargo test --workspace
 ```
 
@@ -220,7 +223,13 @@ script + the manifest's `image` record) is the sidecar build step; see
   the script's `cat` carries a rootfs read out to console stdout, its
   `echo booted > /tmp/out` lands on the ramfs, a bogus command exits 127
   without stopping init, and the manifest/BIB cap names line up end to
-  end. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  end. On top of init sits `applets::sh`, a minimal interactive shell:
+  it prompts on the console, parks on empty input via the blocking-read
+  machinery, forks one child per pipeline stage (resolving bare command
+  names through `/bin`, like BusyBox), waits, and tracks the last exit
+  status as `$?` — the boot test drives a full `echo hello | cat`
+  pipeline and a `false` → `echo $?` sequence through the real driver,
+  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
