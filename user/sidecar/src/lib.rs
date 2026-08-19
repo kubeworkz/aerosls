@@ -17,7 +17,8 @@
 //!   `<`/`>` redirects, `'...'`/`"..."` quoting, backslash escapes,
 //!   `$?` and `$VAR`/`${VAR}` expansion, `export`/`setenv`/`unset`/
 //!   `unsetenv` builtins and `NAME=value` scoped assignments that
-//!   mutate the env), `true`/`false` — plus
+//!   mutate the env), `grep` (glob patterns: `*` any run, `.` any
+//!   char, `\` escape), `true`/`false` — plus
 //!   `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.

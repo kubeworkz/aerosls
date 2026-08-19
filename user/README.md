@@ -62,7 +62,9 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
   src/applets.rs  # the built-in registry: init (the /etc/init.rc boot-script
                   # runner — one forked child per command, sharing sh's word
                   # parser: quotes, backslash escapes, < and > redirects),
-                  # cat, echo, sh (minimal interactive shell — console
+                  # cat, grep (glob patterns: * any-run, . any-char, \
+                  # escape; exit 0/1 on match/no-match), echo, sh (minimal
+                  # interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
                   # variable expansion, export/setenv/unset/unsetenv
@@ -260,14 +262,16 @@ script + the manifest's `image` record) is the sidecar build step; see
   snapshot exactly, `echo $PATH ${HOME}` expanding the shell's
   environment, an `export`/`setenv` session that sets `FOO`, sets a
   quoted `GREETING`, overwrites `HOME` in place, turns a usage error
-  into `$? = 2`, and lists the mutated environment, and a PATH-driven
+  into `$? = 2`, and lists the mutated environment, a PATH-driven
   lookup session — `export PATH=/usr/bin:/bin` finds `greet` in
   `/usr/bin` with `/bin` fallback, and a PATH miss turns `false` into
-  `$? = 127`, then an env-mutation session — `unset GREETING` empties
+  `$? = 127`, an env-mutation session — `unset GREETING` empties
   its expansion, a bare `FOO=scoped` line persists and `unsetenv FOO`
   removes it, and `PATH=/usr/bin greet hi` resolves through the
-  scoped path while the shell's PATH stays put) through the real
-  driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  scoped path while the shell's PATH stays put — and grep filter
+  pipelines (`echo hello | grep ell` matches, `grep zzz` exits 1 into
+  `$?`, `h.llo` and `h*o` wildcards match) through the real driver,
+  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.

@@ -20,6 +20,9 @@
 //!   "never exits" half).
 //! - **`cat`** — copies its first argument (or stdin) to fd 1, using
 //!   `read_blocking` so it parks on an empty stdin instead of spinning.
+//! - **`grep`** — prints the lines of stdin (or the named files) matching
+//!   a small glob pattern (`*` any run, `.` any one char, `\x` literal
+//!   `x`, substring match); exits 0/1 on match/no-match, like grep.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -232,6 +235,151 @@ pub fn cat<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(src)),
             ReadBlock::Err(_) => return Step::Exit(2),
+        }
+    }
+}
+
+/// The glob-style core matcher: `*` matches any run of characters (incl.
+/// none), `.` matches any single character, `\x` a literal `x` (a
+/// trailing `\` is a literal backslash); everything else is literal.
+/// `p` must match a *prefix* of `t` (any trailing text is ignored) —
+/// `is_match` scans the line for the offset where a prefix match holds.
+fn glob_match(p: &[u8], t: &[u8]) -> bool {
+    if p.is_empty() {
+        return true;
+    }
+    match p[0] {
+        b'*' => {
+            for i in 0..=t.len() {
+                if glob_match(&p[1..], &t[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        b'.' => !t.is_empty() && glob_match(&p[1..], &t[1..]),
+        b'\\' => {
+            if p.len() >= 2 {
+                !t.is_empty() && t[0] == p[1] && glob_match(&p[2..], &t[1..])
+            } else {
+                !t.is_empty() && t[0] == b'\\' && glob_match(&p[1..], &t[1..])
+            }
+        }
+        c => !t.is_empty() && t[0] == c && glob_match(&p[1..], &t[1..]),
+    }
+}
+
+/// Does `line` contain a match for `pat`? Substring semantics (the match
+/// may start anywhere in the line, like grep); `*` = any run, `.` = any
+/// one char, `\x` = literal `x`. An empty pattern matches everything.
+fn is_match(pat: &str, line: &[u8]) -> bool {
+    if pat.is_empty() {
+        return true;
+    }
+    let p = pat.as_bytes();
+    for start in 0..=line.len() {
+        if glob_match(p, &line[start..]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `grep`: prints the lines of its input — stdin, or the named files in
+/// order — that match a pattern (a small glob: `*` any run, `.` any one
+/// char, `\x` literal `x`, everything else literal; case-sensitive;
+/// substring match anywhere in the line). Exit status: 0 if any line
+/// matched, 1 if none did, 2 on error (usage, unreadable file, write
+/// failure). Reads via `read_blocking`, so an empty pipe/console stdin
+/// parks instead of spinning. Data layout: `[phase, file_idx, fd,
+/// matched, partial-line...]` — the trailing partial line survives the
+/// parks; a file's final unterminated line is flushed at EOF without a
+/// newline.
+pub fn grep<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        ctx.data.extend_from_slice(&[0, 0, 0, 0]); // phase, file_idx, fd, matched
+    }
+    // Copy the pattern out (argv borrows the manager).
+    let pattern = match ctx.argv().get(1) {
+        Some(p) => p.clone(),
+        None => return Step::Exit(2),
+    };
+    loop {
+        match ctx.data[0] {
+            // Choose the next source: stdin when no files were given,
+            // otherwise the file at file_idx.
+            0 => {
+                let src = if ctx.data[1] == 0 && ctx.argv().len() <= 2 {
+                    0
+                } else {
+                    let path = match ctx.argv().get(2 + ctx.data[1] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(if ctx.data[3] == 1 { 0 } else { 1 }),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => return Step::Exit(2),
+                    }
+                };
+                ctx.data[0] = 1;
+                ctx.data[2] = src as u8;
+            }
+            1 => {
+                let fd = ctx.data[2] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(fd, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        // EOF: flush the trailing partial line (no
+                        // newline), then move to the next source.
+                        let tail = ctx.data[4..].to_vec();
+                        if ctx.data.len() > 4 && is_match(&pattern, &tail) {
+                            if ctx.vfs().write(task, 1, &tail).is_err() {
+                                return Step::Exit(2);
+                            }
+                            ctx.data[3] = 1;
+                        }
+                        if fd != 0 {
+                            ctx.vfs().close(task, fd).ok();
+                        }
+                        ctx.data.truncate(4);
+                        ctx.data[0] = 0; // next source
+                        ctx.data[1] += 1;
+                        ctx.data[2] = 0;
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                        // Extract the complete lines (newline included)
+                        // into owned buffers first — the writes below need
+                        // no borrow of ctx.data. The trailing partial line
+                        // stays in the data for the next read.
+                        let mut lines: Vec<Vec<u8>> = Vec::new();
+                        let mut consumed = 0;
+                        for (i, &b) in ctx.data[4..].iter().enumerate() {
+                            if b == b'\n' {
+                                lines.push(ctx.data[4..=4 + i].to_vec());
+                                consumed = i + 1;
+                            }
+                        }
+                        if consumed > 0 {
+                            ctx.data.drain(4..4 + consumed);
+                        }
+                        for line in &lines {
+                            if is_match(&pattern, &line[..line.len() - 1]) {
+                                if ctx.vfs().write(task, 1, line).is_err() {
+                                    return Step::Exit(2);
+                                }
+                                ctx.data[3] = 1;
+                            }
+                        }
+                    }
+                    ReadBlock::WouldBlock => {
+                        return Step::Blocked(BlockReason::Readable(fd));
+                    }
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
         }
     }
 }
@@ -1218,6 +1366,7 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
     pm.register_applet("cat", cat);
+    pm.register_applet("grep", grep);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -1491,6 +1640,30 @@ mod tests {
                 assigns: vec![("FOO".to_string(), "bar".to_string())],
             }]
         );
+    }
+
+    #[test]
+    fn grep_matches_patterns() {
+        use super::is_match;
+        // Fixed substring, matching anywhere in the line.
+        assert!(is_match("root", b"root:x:0:0"));
+        assert!(is_match("root", b"x root y"));
+        assert!(!is_match("nope", b"root:x:0:0"));
+        // `.` matches exactly one character.
+        assert!(is_match("r..t", b"root:x"));
+        assert!(!is_match("r..t", b"rt"));
+        // `*` matches any run, including none.
+        assert!(is_match("r*t", b"root"));
+        assert!(is_match("r*t", b"rt"));
+        assert!(is_match("a*b", b"xaxxb"));
+        assert!(!is_match("a*b", b"xb"));
+        // Backslash escapes make `*` / `.` literal.
+        assert!(is_match("\\*", b"a*b"));
+        assert!(!is_match("\\*", b"abc"));
+        assert!(is_match("a\\.b", b"xa.b"));
+        assert!(!is_match("a\\.b", b"xaxb"));
+        // An empty pattern matches everything (like grep).
+        assert!(is_match("", b"anything"));
     }
 
     #[test]
