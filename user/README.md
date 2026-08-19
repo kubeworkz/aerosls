@@ -51,7 +51,9 @@ procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
                   # (fd-table copy, shared offsets), fork_thread (CLONE_FILES),
                   # exit/zombie/wait with orphan reparenting, exec (applet
                   # registry through the mount chain), shell pipelines
-                  # (pipe fds dup2'd onto stdio, inherited by fork)
+                  # (pipe fds dup2'd onto stdio, inherited by fork), and
+                  # blocking reads (park on an empty pipe/console, wake on
+                  # data/EOF/input via the read-wake drain)
 kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 ```
 
@@ -67,8 +69,10 @@ kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 #                         cache, incl. driver death → EIO + remount
 #   - procmgr/tests/      the proc manager: fork sharing file offsets,
 #                         CLONE_FILES threads sharing the fd table, exec,
-#                         round-robin interleaving, and a real
-#                         cat | grep pipeline through pipe fds
+#                         round-robin interleaving, a real
+#                         cat | grep pipeline through pipe fds, and a shell
+#                         that parks on an empty pipe until an exec'd
+#                         writer delivers data + EOF
 cargo test --workspace
 ```
 
@@ -127,10 +131,23 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   live ends at every fd mutation (open/close/dup/dup2/fork-copy/exit), so a
   reader sees **EOF** once the last writer is gone, a writer fails
   **EPIPE** once the last reader is gone, and an empty/full pipe fails
-  **EAGAIN** — the cooperative scheduler's "would block". Devices live in
-  `/dev` (devfs names them; an fd on a device holds `FileObj::Char` and its
-  I/O bypasses the mount layer): `/dev/console` is the sidecar's ChanDev,
-  in-memory until the bootstrap wires the kernel-console channel, and
-  `/dev/null` discards. The `cat | grep` integration test drives the whole
-  path: shell creates the pipe, dup2's an end onto each child's stdio,
-  `exec`s the applets, closes its own copies, and reaps both stages.
+  **EAGAIN**. Devices live in `/dev` (devfs names them; an fd on a device
+  holds `FileObj::Char` and its I/O bypasses the mount layer):
+  `/dev/console` is the sidecar's ChanDev, in-memory until the bootstrap
+  wires the kernel-console channel, and `/dev/null` discards.
+- Blocking reads park instead of spin: `Ctx::read_blocking` turns a pipe's
+  `EAGAIN` into a VFS-registered wait (`Vfs::wait_readable`) and a
+  `Step::Blocked(Readable(fd))`; the VFS holds one waiter per task, keyed
+  by the object's `Arc` (so the readiness check never touches a freed
+  object). The proc manager drains satisfied waits at every scheduler step
+  (`take_woken_readers` + `drain_read_wakes`) against a pure predicate —
+  data present, or the last writer gone (EOF), or console input arrived —
+  and requeues the task, whose program simply retries the read (re-parking
+  on would-block). Because the sidecar is single-threaded and cooperative,
+  no per-event notification is needed: a write or writer-exit in any
+  task's step, or console input pushed between runs, is visible at the
+  next drain. The `cat | grep` and blocking-shell integration tests drive
+  the whole path: shell creates the pipe, dup2's an end onto each child's
+  stdio, `exec`s the applets, closes its own copies, and reaps both
+  stages — with grep provably parking on the transient empty pipe between
+  the producer's partial writes.

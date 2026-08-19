@@ -11,7 +11,7 @@ use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
 use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
-use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, Program, Step, WaitOutcome};
+use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -27,6 +27,7 @@ fn pm_image() -> Vec<u8> {
     b.add_file("/bin/applet", b"hello\n", 0o755);
     b.add_file("/bin/cat", b"cat\n", 0o755);
     b.add_file("/bin/grep", b"grep\n", 0o755);
+    b.add_file("/bin/writer", b"writer\n", 0o755);
     b.build()
 }
 
@@ -259,12 +260,14 @@ fn cat(ctx: &mut Ctx<FC, FA>) -> Step {
 }
 
 /// The `grep` applet: reads fd 0 (its stdin — the pipe read end) to EOF,
-/// keeps the lines containing "root", writes them to /tmp/out.
+/// keeps the lines containing "root", writes them to /tmp/out. Reads with
+/// `read_blocking`, so it *parks* on the transient empty pipe between the
+/// producer's partial writes instead of spinning.
 fn grep(ctx: &mut Ctx<FC, FA>) -> Step {
     let task = ctx.task;
     let mut buf = [0u8; 16];
-    match ctx.vfs().read(task, 0, &mut buf) {
-        Ok(0) => {
+    match ctx.read_blocking(0, &mut buf) {
+        ReadBlock::Data(0) => {
             // EOF: the writer side is gone. Filter what we accumulated
             // (owned, so the borrow of `ctx.data` ends before I/O).
             let text = core::str::from_utf8(&ctx.data).unwrap_or("");
@@ -284,13 +287,12 @@ fn grep(ctx: &mut Ctx<FC, FA>) -> Step {
             ctx.vfs().close(task, out).unwrap();
             Step::Exit(0)
         }
-        Ok(n) => {
+        ReadBlock::Data(n) => {
             ctx.data.extend_from_slice(&buf[..n]);
             Step::Yield
         }
-        // Nothing in the pipe yet — the producer hasn't run; yield.
-        Err(Errno::EAgain) => Step::Yield,
-        Err(_) => Step::Exit(3),
+        ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(0)),
+        ReadBlock::Err(_) => Step::Exit(3),
     }
 }
 
@@ -546,6 +548,132 @@ fn cat_grep_pipeline_through_the_proc_manager() {
     // Both pipeline stages were reaped; nothing left in the run queue.
     assert_eq!(p.state(1), None);
     assert_eq!(p.state(2), None);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// The `writer` applet: yields once (so the shell can park first), then
+/// writes "hello" to fd 1 (its stdout — the pipe write end) and exits,
+/// which drops the last write end and makes EOF visible to the reader.
+fn writer_applet(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        ctx.data.push(1);
+        return Step::Yield;
+    }
+    ctx.vfs().write(task, 1, b"hello").unwrap();
+    Step::Exit(0)
+}
+
+/// The shell: creates a pipe, forks a writer child (stdout → write end,
+/// exec'd into the `writer` applet), then *blocks reading* the pipe. The
+/// writer's delivery — and its exit dropping the last write end (EOF) —
+/// must wake the parked shell, which saves the data to /tmp/out.
+fn blocking_shell(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // stdio = console (pipe lands at 3,4 so dup2 moves ends properly).
+        for _ in 0..3 {
+            ctx.vfs().open(task, "/dev/console", O_RDWR, 0).unwrap();
+        }
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1);
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        return Step::Yield;
+    }
+    let r = ctx.data[1] as u32;
+    let w = ctx.data[2] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            let c = ctx.fork().unwrap();
+            ctx.data.push(c as u8);
+            ctx.data[0] = 3;
+            Step::Yield
+        }
+        (1, true) => {
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (2, _) => {
+            // writer child: stdout → pipe write end, drop its pipe fds.
+            ctx.vfs().dup2(task, w, 1).unwrap();
+            ctx.vfs().close(task, r).unwrap();
+            ctx.vfs().close(task, w).unwrap();
+            ctx.exec("/bin/writer").unwrap();
+            Step::Yield
+        }
+        (3, _) => {
+            // Shell: drop its own write end, then park reading.
+            ctx.vfs().close(task, w).unwrap();
+            ctx.data[0] = 4;
+            Step::Yield
+        }
+        (4, _) => {
+            let mut buf = [0u8; 16];
+            match ctx.read_blocking(r, &mut buf) {
+                ReadBlock::Data(0) => Step::Exit(9), // EOF before data — wrong
+                ReadBlock::Data(n) => {
+                    let out = ctx
+                        .vfs()
+                        .open(task, "/tmp/out", O_CREAT | O_WRONLY, 0o644)
+                        .unwrap();
+                    ctx.vfs().write(task, out, &buf[..n]).unwrap();
+                    ctx.vfs().close(task, out).unwrap();
+                    ctx.data[0] = 5;
+                    Step::Yield
+                }
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(r)),
+                ReadBlock::Err(_) => Step::Exit(6),
+            }
+        }
+        (5, _) => {
+            // EOF after the data: the writer child exited. Reap and exit
+            // with its status.
+            let mut buf = [0u8; 16];
+            match ctx.read_blocking(r, &mut buf) {
+                ReadBlock::Data(0) => {
+                    let child = ctx.data[3] as u32;
+                    match ctx.wait(child) {
+                        WaitOutcome::Reaped(code) => ctx.exit(code),
+                        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
+                        WaitOutcome::NoSuchChild => Step::Exit(90),
+                    }
+                }
+                ReadBlock::Data(_) => Step::Exit(7),
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(r)),
+                ReadBlock::Err(_) => Step::Exit(6),
+            }
+        }
+        _ => Step::Exit(1),
+    }
+}
+
+#[test]
+fn blocking_read_parks_the_shell_until_the_writer_delivers() {
+    let (mut p, t, client) = pm();
+    p.register_applet("writer", writer_applet);
+    p.spawn_init(Program::new("blocking_shell", blocking_shell));
+
+    // Drive step-by-step until the shell is provably parked on the pipe.
+    let mut steps = 0;
+    loop {
+        if matches!(p.state(0), Some(TaskState::Blocked(BlockReason::Readable(_)))) {
+            break;
+        }
+        assert!(p.run_next().is_some(), "scheduler should make progress");
+        steps += 1;
+        assert!(steps < 30, "shell never parked");
+    }
+    assert_eq!(p.runnable(), 1, "only the writer child is left runnable");
+
+    // The writer delivers; the scheduler's drain wakes the parked shell,
+    // which reads the data, sees EOF, reaps the writer, and exits 0.
+    p.run_until_quiet(50);
+    assert_eq!(p.exit_code(0), Some(0), "shell exited with the writer's status");
+    assert_eq!(read_all(&mut p.vfs, "/tmp/out"), b"hello");
+    assert_eq!(p.state(1), None, "writer reaped");
 
     client.kill_driver(0);
     t.join().unwrap();

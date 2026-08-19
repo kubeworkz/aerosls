@@ -27,6 +27,15 @@
 //!   through the VFS (the full mount chain), the first line names an
 //!   applet from the registry, and the task's program is replaced. Open fds
 //!   are preserved (no CLOEXEC in v1).
+//! - **Blocking reads**: `Ctx::read_blocking` turns a would-block (an
+//!   empty pipe, a console with no input) into `Vfs::wait_readable`
+//!   registration plus `Step::Blocked(Readable(fd))` — the task parks. The
+//!   scheduler's `drain_read_wakes` re-checks each parked task against a
+//!   pure readiness predicate at every step (data arrived, last writer
+//!   gone → EOF, console input pushed between runs) and requeues the task;
+//!   the program just retries the read, re-parking if it would-block
+//!   again. No per-event notification needed in a cooperative model — any
+//!   writer's step or external input is visible at the next drain.
 //!
 //! The proc manager **owns the VFS** (in-core call path). The
 //! architecture's internal-bus message exchange between components is the
@@ -68,8 +77,26 @@ pub enum TaskState {
 pub enum BlockReason {
     /// Waiting for a specific child to exit.
     WaitingChild(u32),
+    /// Blocked reading `fd` until it becomes readable (data, EOF, or
+    /// console input). The VFS registered the wait; the scheduler's
+    /// read-wake drain requeues the task and it retries the read.
+    Readable(u32),
     /// The program chose to block (I/O wait, etc.).
     User,
+}
+
+/// Outcome of a blocking read (`Ctx::read_blocking`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadBlock {
+    /// Bytes read (`0` = EOF).
+    Data(usize),
+    /// The object would block; the wait is registered with the VFS. The
+    /// program must return `Step::Blocked(BlockReason::Readable(fd))` —
+    /// the scheduler parks it and wakes it when the object becomes
+    /// readable.
+    WouldBlock,
+    /// A hard error (`EBADF`, `EIO`, ...).
+    Err(Errno),
 }
 
 /// What one cooperative step of a program produced.
@@ -414,6 +441,22 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         Some(outcome)
     }
 
+    /// Wake tasks parked on a readable fd whose wait is now satisfied
+    /// (data arrived, EOF, console input pushed). Called at every
+    /// scheduler step; also public so an event-loop driver can re-arm
+    /// blocked readers after external input arrives between runs.
+    pub fn drain_read_wakes(&mut self) {
+        let woken = self.vfs.take_woken_readers();
+        for t in woken {
+            if let Some(tc) = self.tasks.get_mut(&t) {
+                if matches!(tc.state, TaskState::Blocked(BlockReason::Readable(_))) {
+                    tc.state = TaskState::Runnable;
+                    self.run.push_back(t);
+                }
+            }
+        }
+    }
+
     /// Run the cooperative scheduler until the run queue is empty (or
     /// `max_steps` steps). Returns the number of steps run. A non-empty
     /// result at `max_steps` with tasks still blocked means the remaining
@@ -421,6 +464,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
     pub fn run_until_quiet(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while steps < max_steps {
+            self.drain_read_wakes();
             match self.run_next() {
                 Some(_) => steps += 1,
                 None => break,
@@ -484,6 +528,26 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
 
     pub fn exec(&mut self, path: &str) -> Result<(), Errno> {
         self.pm.exec(self.task, path)
+    }
+
+    /// Blocking read: like `Vfs::read`, but on would-block (`EAGAIN` — an
+    /// empty pipe, a console with no input) registers the task with the
+    /// VFS and returns `ReadBlock::WouldBlock`. The program must then
+    /// return `Step::Blocked(BlockReason::Readable(fd))`; the scheduler
+    /// parks the task and the read-wake drain requeues it when the object
+    /// becomes readable, at which point the program retries. Mount-table
+    /// files never block (EOF reads return 0), so this only parks on
+    /// pipes and devices.
+    pub fn read_blocking(&mut self, fd: u32, buf: &mut [u8]) -> ReadBlock {
+        let task = self.task;
+        match self.pm.vfs.read(task, fd, buf) {
+            Ok(n) => ReadBlock::Data(n),
+            Err(Errno::EAgain) => match self.pm.vfs.wait_readable(task, fd) {
+                Ok(()) => ReadBlock::WouldBlock,
+                Err(e) => ReadBlock::Err(e),
+            },
+            Err(e) => ReadBlock::Err(e),
+        }
     }
 
     /// Return `Step::Blocked` for the given reason.

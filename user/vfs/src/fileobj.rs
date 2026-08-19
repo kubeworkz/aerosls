@@ -80,6 +80,10 @@ impl PipeNode {
     pub fn writers(&self) -> u32 {
         self.writers.get()
     }
+    /// Buffered data exists (a read will return at least one byte).
+    pub fn has_data(&self) -> bool {
+        !self.buf.borrow().is_empty()
+    }
 
     /// Called by the VFS when an fd holding this end is created.
     pub fn bump_readers(&self, d: i32) {
@@ -185,6 +189,15 @@ impl CharNode {
         self.gid
     }
 
+    /// Input is available (a console read will return at least one byte).
+    /// Null is always "ready" — its reads never block (instant EOF).
+    pub fn has_input(&self) -> bool {
+        match &self.kind {
+            CharKind::Console(c) => !c.input_empty(),
+            CharKind::Null => true,
+        }
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         match &self.kind {
             CharKind::Console(c) => c.read(buf),
@@ -238,8 +251,14 @@ impl ConsoleIo {
     }
 
     /// Feed input as if typed at the console (the driver would push here).
+    /// The sidecar core runs the scheduler after external input arrives,
+    /// and its read-wake drain re-arms tasks blocked on the console.
     pub fn push_input(&self, bytes: &[u8]) {
         self.input.borrow_mut().extend(bytes);
+    }
+
+    pub(crate) fn input_empty(&self) -> bool {
+        self.input.borrow().is_empty()
     }
 
     /// Everything written to the console so far (the driver would drain

@@ -4,8 +4,11 @@
 //! semantics of §4: cooperative tasks over the VFS's per-task fd tables,
 //! cwd and credentials; `fork` (fd-table copy with shared `FileNode`s, so
 //! offsets are shared) and `fork_thread` (CLONE_FILES — the table object
-//! itself is shared); exit/zombie/wait with orphan reparenting to init; and
-//! `exec` through the mount chain into a BusyBox-style applet registry.
+//! itself is shared); exit/zombie/wait with orphan reparenting to init;
+//! `exec` through the mount chain into a BusyBox-style applet registry;
+//! and blocking reads (`Ctx::read_blocking`) that park a task on an empty
+//! pipe or console instead of spinning, woken by the scheduler's
+//! read-wake drain when data, EOF, or input arrives.
 //!
 //! The manager **owns the VFS** (the in-core call path); the
 //! architecture's internal-bus message exchange between components is the
@@ -25,6 +28,6 @@ pub mod procmgr;
 mod tests;
 
 pub use procmgr::{
-    is_child, BlockReason, Ctx, ProcManager, Program, Step, TaskCtl, TaskState, WaitOutcome,
-    FORK_MARKER,
+    is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskCtl, TaskState,
+    WaitOutcome, FORK_MARKER,
 };

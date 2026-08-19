@@ -731,6 +731,36 @@ pub struct Vfs<K: Kernel, A: BufferAlloc> {
     /// number of fork/clone events.
     table_pool: Vec<FdTable>,
     tasks: Vec<Task>,
+    /// Tasks parked on an fd becoming readable (a pipe with data or EOF,
+    /// console input). One entry per task. The proc manager drains
+    /// satisfied waits each scheduler step (`take_woken_readers`); the
+    /// wait is re-registered by the program if its retry would-block
+    /// again. `obj` is kept alive by the waiter so the readiness check
+    /// never touches a freed object even if the fd's table slot changed.
+    waiters: Vec<Waiter>,
+}
+
+/// A parked reader. `ready()` is the *only* wake condition — it is
+/// re-checked at every scheduler drain, so no per-event notification is
+/// needed: a pipe write or writer-exit in any task's step, or console
+/// input pushed between runs, is seen at the next drain.
+struct Waiter {
+    task: u32,
+    obj: Arc<FileObj>,
+}
+
+impl Waiter {
+    fn ready(&self) -> bool {
+        match &*self.obj {
+            // Data, or EOF (last writer gone) — both make read() return.
+            FileObj::PipeRead(p) => p.has_data() || p.writers() == 0,
+            // Console input arrived. (Null reads never block; true keeps
+            // any stray registration from wedging.)
+            FileObj::Char(c) => c.has_input(),
+            // Nothing else can be blocked on (wait_readable rejects them).
+            _ => false,
+        }
+    }
 }
 
 impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
@@ -746,6 +776,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 euid: 0,
                 egid: 0,
             }],
+            waiters: Vec::new(),
         }
     }
 
@@ -1068,6 +1099,51 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok((r, w))
     }
 
+    /// Park the task on `fd` becoming readable. Called by the blocking
+    /// read path after a read returned `EAGAIN` (empty pipe, console with
+    /// no input). The proc manager drains satisfied waits at each
+    /// scheduler step and requeues the task; its program retries the read
+    /// and re-registers if it would-block again.
+    ///
+    /// Rejects fds that can never block: mount-table files read `Ok(0)`
+    /// at EOF (never `EAGAIN`), and write-only pipe ends aren't readable.
+    pub fn wait_readable(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
+        let idx = self.task_mut(task)?.fds;
+        let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+        match &*e.node {
+            FileObj::PipeRead(_) | FileObj::Char(_) => {
+                // A task parks on one thing at a time; replace any prior
+                // registration (bounded by the number of tasks).
+                self.waiters.retain(|w| w.task != task);
+                self.waiters.push(Waiter {
+                    task,
+                    obj: e.node.clone(),
+                });
+                Ok(())
+            }
+            _ => Err(Errno::EInval),
+        }
+    }
+
+    /// Drain the waits whose object is ready (data/EOF/console input) and
+    /// return the tasks to wake. Called by the proc manager at every
+    /// scheduler step (and by an event-loop driver when external input
+    /// arrives between runs). A task whose fd vanished wakes too — its
+    /// retry observes `EBADF` rather than wedging.
+    pub fn take_woken_readers(&mut self) -> Vec<u32> {
+        let mut woken = Vec::new();
+        let mut i = 0;
+        while i < self.waiters.len() {
+            if self.waiters[i].ready() {
+                let w = self.waiters.swap_remove(i);
+                woken.push(w.task);
+            } else {
+                i += 1;
+            }
+        }
+        woken
+    }
+
     pub fn close(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
         let idx = self.task_mut(task)?.fds;
         let slot = self.table_pool[idx]
@@ -1372,6 +1448,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             }
             t.fds
         };
+        // An exited task is no longer waiting on anything readable.
+        self.waiters.retain(|w| w.task != task);
         let shared = self
             .tasks
             .iter()
@@ -1695,6 +1773,37 @@ mod tests {
         // Root regains the console.
         v.set_cred(0, 0, 0).unwrap();
         assert!(v.open(0, "/dev/console", O_RDWR, 0).is_ok());
+    }
+
+    #[test]
+    fn wait_readable_validation_and_wake() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        // Objects that can never block are rejected up front.
+        v.mount_ramfs("/tmp").unwrap();
+        let f = v.open(0, "/tmp/f", O_CREAT | O_RDWR, 0o644).unwrap();
+        assert_eq!(v.wait_readable(0, f), Err(Errno::EInval), "files never block");
+        assert_eq!(v.wait_readable(0, w), Err(Errno::EInval), "write end isn't readable");
+        assert_eq!(v.wait_readable(0, 99), Err(Errno::EBadf));
+        // Empty pipe with a live writer: parked, nothing woken.
+        v.wait_readable(0, r).unwrap();
+        assert_eq!(v.take_woken_readers(), Vec::<u32>::new());
+        // Data arrives (a write in any task's step): the drain wakes it.
+        v.write(0, w, b"x").unwrap();
+        assert_eq!(v.take_woken_readers(), vec![0]);
+        // The woken *program* consumes the data on its retry; the drain
+        // only wakes. Re-register (empty again, writer alive): parked.
+        let mut tmp = [0u8; 4];
+        assert_eq!(v.read(0, r, &mut tmp).unwrap(), 1);
+        v.wait_readable(0, r).unwrap();
+        assert_eq!(v.take_woken_readers(), Vec::<u32>::new());
+        // The last writer closing makes EOF ready.
+        v.close(0, w).unwrap();
+        assert_eq!(v.take_woken_readers(), vec![0], "EOF wakes the reader");
+        // One wait per task: re-registering replaces (no duplicates).
+        v.wait_readable(0, r).unwrap();
+        v.wait_readable(0, r).unwrap();
+        assert_eq!(v.take_woken_readers().len(), 1);
     }
 
     #[test]

@@ -1,10 +1,13 @@
-//! Unit tests for the proc manager: scheduler, fork, exit/zombie/wait —
-//! no device, no VFS mounts. The kernel and allocator stand-ins below
-//! satisfy the generics; no op ever reaches them.
+//! Unit tests for the proc manager: scheduler, fork, exit/zombie/wait, and
+//! blocking reads (park on an empty pipe or console, wake on data/EOF).
+//! No device, no VFS mounts beyond devfs in the console test. The kernel
+//! and allocator stand-ins satisfy the generics; no op reaches them.
 
-use aerosls_vfs::Vfs;
+use alloc::sync::Arc;
 
-use crate::{BlockReason, Ctx, ProcManager, Program, Step, TaskState, WaitOutcome};
+use aerosls_vfs::{CharNode, Vfs, O_RDONLY};
+
+use crate::{is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome};
 
 mod dummy {
     use aerosls_proto::kabi::{CapInfo, ERR_STATE, GrantedCap, Kernel, RecvResult, SendCap};
@@ -69,6 +72,165 @@ fn reaper(ctx: &mut Ctx<D, M>) -> Step {
         WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(1)),
         WaitOutcome::NoSuchChild => Step::Exit(99),
     }
+}
+
+// ── blocking reads ───────────────────────────────────────────────────────────
+
+/// Init: pipe + fork. The child parks on the empty read end; the parent
+/// writes "ping" and exits. Exit codes: 5 = got "ping", 4 = wrong bytes,
+/// 6 = hard error.
+fn pipe_owner(ctx: &mut Ctx<D, M>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1);
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        return Step::Yield;
+    }
+    let r = ctx.data[1] as u32;
+    let w = ctx.data[2] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            ctx.fork().unwrap();
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (1, true) => {
+            // Child: park on the empty read end right away — the parent's
+            // write comes in a later round-robin turn, so this genuinely
+            // would-block.
+            let mut buf = [0u8; 8];
+            match ctx.read_blocking(r, &mut buf) {
+                ReadBlock::Data(n) if &buf[..n] == b"ping" => Step::Exit(5),
+                ReadBlock::Data(_) => Step::Exit(4),
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(r)),
+                ReadBlock::Err(_) => Step::Exit(6),
+            }
+        }
+        (2, _) => {
+            ctx.vfs().write(task, w, b"ping").unwrap();
+            Step::Exit(0)
+        }
+        _ => Step::Exit(1),
+    }
+}
+
+#[test]
+fn blocking_read_parks_until_data_wakes_it() {
+    let mut p = pm();
+    p.spawn_init(Program::new("pipe_owner", pipe_owner));
+
+    p.run_next().unwrap(); // init: pipe
+    p.run_next().unwrap(); // init: fork
+    // The child parks on the empty read end — provably not runnable.
+    assert_eq!(p.run_next(), Some(Step::Blocked(BlockReason::Readable(0))));
+    assert_eq!(p.state(1), Some(TaskState::Blocked(BlockReason::Readable(0))));
+    assert_eq!(p.runnable(), 1, "only the parent remains runnable");
+    // The parent's write is a scheduler event; the drain wakes the reader.
+    assert_eq!(p.run_next(), Some(Step::Exit(0)));
+    p.drain_read_wakes();
+    assert_eq!(p.state(1), Some(TaskState::Runnable));
+    // The retry completes with the data.
+    assert_eq!(p.run_next(), Some(Step::Exit(5)));
+    assert_eq!(p.exit_code(1), Some(5));
+}
+
+/// Like `pipe_owner`, but the child drops its own write end and parks; the
+/// parent exits without writing, so the last writer's exit must wake the
+/// child with EOF. Exit codes: 7 = EOF, 4 = data, 6 = error.
+fn pipe_eof_owner(ctx: &mut Ctx<D, M>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1);
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        return Step::Yield;
+    }
+    let r = ctx.data[1] as u32;
+    let w = ctx.data[2] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            ctx.fork().unwrap();
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (1, true) => {
+            // Child: drop its own write end once, then park — the parent's
+            // end is still live, so the read would-block (not EOF yet). On
+            // the wake this phase re-runs; the once-guard keeps the close
+            // from firing twice (the fd is already gone).
+            if ctx.data.len() == 4 {
+                ctx.vfs().close(task, w).unwrap();
+                ctx.data.push(1);
+            }
+            let mut buf = [0u8; 8];
+            match ctx.read_blocking(r, &mut buf) {
+                ReadBlock::Data(0) => Step::Exit(7),
+                ReadBlock::Data(_) => Step::Exit(4),
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(r)),
+                ReadBlock::Err(_) => Step::Exit(6),
+            }
+        }
+        (2, _) => Step::Exit(0), // parent exits → last writer gone
+        _ => Step::Exit(1),
+    }
+}
+
+#[test]
+fn blocking_read_wakes_on_eof_when_last_writer_exits() {
+    let mut p = pm();
+    p.spawn_init(Program::new("pipe_eof_owner", pipe_eof_owner));
+
+    p.run_next().unwrap(); // init: pipe
+    p.run_next().unwrap(); // init: fork
+    // Child parks (parent's write end still open, pipe empty).
+    assert_eq!(p.run_next(), Some(Step::Blocked(BlockReason::Readable(0))));
+    assert_eq!(p.state(1), Some(TaskState::Blocked(BlockReason::Readable(0))));
+    // Parent exits: its write end drops. The drain makes EOF visible.
+    assert_eq!(p.run_next(), Some(Step::Exit(0)));
+    p.drain_read_wakes();
+    assert_eq!(p.state(1), Some(TaskState::Runnable));
+    assert_eq!(p.run_next(), Some(Step::Exit(7)), "retry sees EOF");
+}
+
+/// Reads /dev/console with a blocking read: parks until input is pushed
+/// (external event — the event loop re-enters the scheduler).
+fn console_reader(ctx: &mut Ctx<D, M>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let fd = ctx.vfs().open(task, "/dev/console", O_RDONLY, 0).unwrap();
+        ctx.data.push(fd as u8);
+        return Step::Yield;
+    }
+    let fd = ctx.data[0] as u32;
+    let mut buf = [0u8; 8];
+    match ctx.read_blocking(fd, &mut buf) {
+        ReadBlock::Data(n) if &buf[..n] == b"hi" => Step::Exit(8),
+        ReadBlock::Data(_) => Step::Exit(4),
+        ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(fd)),
+        ReadBlock::Err(_) => Step::Exit(6),
+    }
+}
+
+#[test]
+fn blocking_console_read_parks_until_input() {
+    let console = Arc::new(CharNode::console());
+    let mut vfs = Vfs::new();
+    vfs.mount_devfs("/dev", console.clone()).unwrap();
+    let mut p = ProcManager::new(vfs);
+    p.spawn_init(Program::new("console_reader", console_reader));
+
+    p.run_next().unwrap(); // open the console, yield
+    assert_eq!(p.run_next(), Some(Step::Blocked(BlockReason::Readable(0))));
+    assert_eq!(p.state(0), Some(TaskState::Blocked(BlockReason::Readable(0))));
+    // Input arrives from outside the scheduler (the driver / test); the
+    // event loop re-enters and the drain re-arms the parked reader.
+    console.console_io().push_input(b"hi");
+    p.drain_read_wakes();
+    assert_eq!(p.state(0), Some(TaskState::Runnable));
+    assert_eq!(p.run_next(), Some(Step::Exit(8)));
 }
 
 /// Parent: wait *before* the child runs (must block, then be woken).
