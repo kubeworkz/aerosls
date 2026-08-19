@@ -76,6 +76,10 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # 256-byte table built once at init, or deletes
                   # them — ranges a-z and \n/\t/\\ escapes in the
                   # sets, SET2's last byte repeats for a longer SET1),
+                  # cut (extracts fields -d DELIM -f LIST or byte
+                  # positions -c/-b LIST per line — 1-based lists of
+                  # positions and ranges like 1,3-5,2-, parsed once at
+                  # init; lines buffer across reads),
                   # echo, sh (minimal
                   # interactive shell — console
                   # commands, | pipelines (waiting for every stage,
@@ -313,7 +317,13 @@ script + the manifest's `image` record) is the sidecar build step; see
   — plus a tr session (`echo hello | tr h H`, `echo hello | tr
   a-z A-Z`, `echo hello | tr -d l`, `seq 5 | tr 1-3 XYZ`, and
   `cat /etc/passwd | tr : ,` — the map, the range, the delete,
-  and the byte-stream pipeline forms) — through the real driver,
+  and the byte-stream pipeline forms) — and a cut session
+  (`echo hello | cut -c1-3`, `-c2-`, `echo abcde | cut -c1,3,5`,
+  `echo "a:b:c" | cut -d: -f2`/`-f2-3`/`-f3-`,
+  `cat /etc/passwd | cut -d: -f1` and `-f1,3,5`, the file forms
+  `cut -d: -f1 /etc/cols.txt` and `cut -c1 /etc/cols.txt` where
+  the 15-17 byte lines span reads, and the usage-error path
+  `cut /etc/passwd` → 2 via `$?`) — through the real driver,
   asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in

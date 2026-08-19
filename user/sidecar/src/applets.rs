@@ -47,6 +47,12 @@
 //!   repeats for a longer `SET1`) and `tr -d SET1` deletes, with ranges
 //!   (`a-z`) and backslash escapes in the sets; a full pipe parks with
 //!   the translated chunk pending.
+//! - **`cut`** — the column extractor: `cut -d DELIM -f LIST` emits the
+//!   selected fields joined with the delimiter, `cut -c LIST` (or `-b`)
+//!   the selected byte positions concatenated — lists of 1-based
+//!   positions and ranges (`1`, `3-5`, `2-`, `-3`, `-`) parsed once at
+//!   init; lines buffer across reads and each complete line is written
+//!   with blocking writes.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -658,6 +664,81 @@ fn tr_chunk(chunk: &[u8], table: &[u8], delete: bool) -> Vec<u8> {
     } else {
         chunk.iter().map(|&b| table[b as usize]).collect()
     }
+}
+
+/// Parse `cut`'s `-f`/`-c` list: comma-separated positions and ranges,
+/// each `N` (a single position), `N-M`, `N-` (open-ended to the end),
+/// `-M` (from the start), or `-` (everything). Positions are 1-based;
+/// an open end is stored as `end == 0`. Errors (`None`): an empty
+/// list, a zero position, a descending range, or an unparsable member.
+fn parse_cut_ranges(list: &str) -> Option<Vec<(u32, u32)>> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    for spec in list.split(',') {
+        if spec.is_empty() {
+            return None;
+        }
+        if spec == "-" {
+            ranges.push((1, 0));
+            continue;
+        }
+        if let Some((a, b)) = spec.split_once('-') {
+            let start = if a.is_empty() { 1 } else { a.parse().ok()? };
+            let end = if b.is_empty() { 0 } else { b.parse().ok()? };
+            if start == 0 || (end != 0 && end < start) {
+                return None;
+            }
+            ranges.push((start, end));
+        } else {
+            let n: u32 = spec.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            ranges.push((n, n));
+        }
+    }
+    Some(ranges)
+}
+
+/// Apply `cut`'s selection to one line (without its newline) and return
+/// the output line, newline included. Field mode (`mode` 0) splits the
+/// line on `delim` and emits the selected fields joined with `delim`;
+/// char mode (`mode` 1) emits the selected byte positions concatenated.
+/// An open range (`end == 0`) extends to the last field / last byte.
+/// Out-of-range selections contribute nothing — so a fully out-of-range
+/// selection yields a bare newline, and a missing field never joins.
+fn cut_line(line: &[u8], mode: u8, delim: u8, ranges: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if mode == 0 {
+        // Split into fields; an empty line is one empty field.
+        let fields: Vec<&[u8]> = line.split(|&b| b == delim).collect();
+        let mut first = true;
+        for &(start, end) in ranges {
+            let last = if end == 0 { fields.len() as u32 } else { end };
+            for pos in start..=last {
+                if let Some(f) = fields.get(pos as usize - 1) {
+                    if !first {
+                        out.push(delim);
+                    }
+                    out.extend_from_slice(f);
+                    first = false;
+                }
+            }
+        }
+    } else {
+        for &(start, end) in ranges {
+            let last = if end == 0 { line.len() as u32 } else { end };
+            for pos in start..=last {
+                if let Some(&b) = line.get(pos as usize - 1) {
+                    out.push(b);
+                }
+            }
+        }
+    }
+    out.push(b'\n');
+    out
 }
 
 /// `wc`: counts lines, words and bytes of its input — stdin, or the
@@ -1309,6 +1390,265 @@ pub fn tr<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                             ctx.data[0] = 0;
                         } else {
                             ctx.data.drain(258..258 + k);
+                        }
+                    }
+                    WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                    WriteBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
+/// Read `cut`'s ranges back out of the data header (`[start u32 LE, end
+/// u32 LE]` each, `end` 0 = open).
+fn read_cut_ranges(data: &[u8]) -> Vec<(u32, u32)> {
+    let n = data[6] as usize;
+    let mut r = Vec::new();
+    for i in 0..n {
+        let base = 7 + 8 * i; // each range is a (start u32, end u32) pair
+        r.push((read_u32(data, base), read_u32(data, base + 4)));
+    }
+    r
+}
+
+/// Write `cut`'s pending-output length into the data header at `h`.
+fn write_out_len(data: &mut [u8], h: usize, len: usize) {
+    data[h..h + 4].copy_from_slice(&(len as u32).to_le_bytes());
+}
+
+/// `cut -d DELIM -f LIST [file...]` / `cut -c LIST [file...]` (and the
+/// `-b` alias): the column extractor. Field mode splits each line on the
+/// delimiter (default tab) and emits the selected fields joined with it;
+/// char mode emits the selected byte positions concatenated. Lists are
+/// comma-separated 1-based positions and ranges (`1`, `3-5`, `2-`,
+/// `-3`, `-`), parsed once at init; an open range extends to the last
+/// field/byte and out-of-range selections contribute nothing. Options
+/// may be attached (`-d:`) or separate (`-d :`); exactly one of
+/// `-f`/`-c`/`-b` is required (`-d` only with `-f`), a descending range
+/// or unknown option is a usage error (exit 2). Lines are buffered
+/// across reads (a line may span chunks; the partial line survives
+/// parks), each complete line is extracted and written with
+/// `write_blocking` — a full pipe parks with the pending output intact
+/// and an early-exiting reader (`cut | head`) wakes the retry to
+/// `EPIPE`. Data layout: `[phase, file_idx, first_file_arg, fd, mode,
+/// delim, nranges, ranges..., out_len u32, in (partial line)..., out
+/// (pending output)...]` — `first_file_arg` is the argv index of the
+/// first file (255 for stdin only), `in` is everything between the
+/// header and the pending output.
+pub fn cut<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // Parse the options: attached or separate forms, in any order;
+        // non-option args are files. `mode` is None until one of
+        // -f/-c/-b appears; a second one (or -d without -f) is an error.
+        let argv = ctx.argv();
+        let mut mode: Option<u8> = None;
+        let mut delim = b'\t';
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut first_file_arg = 255u8;
+        let mut i = 1;
+        while i < argv.len() {
+            let a = &argv[i];
+            if let Some(rest) = a.strip_prefix("-d") {
+                let d = if rest.is_empty() {
+                    i += 1;
+                    match argv.get(i) {
+                        Some(s) if s.len() == 1 => s.as_bytes()[0],
+                        _ => return Step::Exit(2),
+                    }
+                } else if rest.len() == 1 {
+                    rest.as_bytes()[0]
+                } else {
+                    return Step::Exit(2); // multi-char delimiter
+                };
+                delim = d;
+            } else if let Some(rest) = a.strip_prefix("-f") {
+                if mode.is_some() {
+                    return Step::Exit(2); // -b/-c/-f are exclusive
+                }
+                let list = if rest.is_empty() {
+                    i += 1;
+                    match argv.get(i) {
+                        Some(s) => s.clone(),
+                        None => return Step::Exit(2),
+                    }
+                } else {
+                    rest.to_string()
+                };
+                ranges = match parse_cut_ranges(&list) {
+                    Some(r) => r,
+                    None => return Step::Exit(2),
+                };
+                mode = Some(0);
+            } else if let Some(rest) = a.strip_prefix("-c") {
+                if mode.is_some() {
+                    return Step::Exit(2);
+                }
+                let list = if rest.is_empty() {
+                    i += 1;
+                    match argv.get(i) {
+                        Some(s) => s.clone(),
+                        None => return Step::Exit(2),
+                    }
+                } else {
+                    rest.to_string()
+                };
+                ranges = match parse_cut_ranges(&list) {
+                    Some(r) => r,
+                    None => return Step::Exit(2),
+                };
+                mode = Some(1);
+            } else if let Some(rest) = a.strip_prefix("-b") {
+                // -b is a byte alias of -c in this byte-oriented world.
+                if mode.is_some() {
+                    return Step::Exit(2);
+                }
+                let list = if rest.is_empty() {
+                    i += 1;
+                    match argv.get(i) {
+                        Some(s) => s.clone(),
+                        None => return Step::Exit(2),
+                    }
+                } else {
+                    rest.to_string()
+                };
+                ranges = match parse_cut_ranges(&list) {
+                    Some(r) => r,
+                    None => return Step::Exit(2),
+                };
+                mode = Some(1);
+            } else if a.starts_with('-') && a.len() > 1 {
+                return Step::Exit(2); // unknown option
+            } else if first_file_arg == 255 {
+                first_file_arg = i as u8;
+            }
+            i += 1;
+        }
+        let mode = match mode {
+            Some(m) => m,
+            None => return Step::Exit(2), // one of -f/-c/-b is required
+        };
+        if delim != b'\t' && mode != 0 {
+            return Step::Exit(2); // -d only makes sense with -f
+        }
+        if ranges.len() > 255 {
+            return Step::Exit(2); // header byte budget
+        }
+        ctx.data.push(0); // phase
+        ctx.data.push(0); // file_idx
+        ctx.data.push(first_file_arg);
+        ctx.data.push(0); // fd
+        ctx.data.push(mode);
+        ctx.data.push(delim);
+        ctx.data.push(ranges.len() as u8); // nranges
+        for (s, e) in &ranges {
+            ctx.data.extend_from_slice(&s.to_le_bytes());
+            ctx.data.extend_from_slice(&e.to_le_bytes());
+        }
+        ctx.data.extend_from_slice(&0u32.to_le_bytes()); // out_len
+    }
+    loop {
+        let nranges = ctx.data[6] as usize;
+        let h = 7 + 8 * nranges; // out_len at h..h + 4
+        let in_start = h + 4; // in = data[in_start..len - out_len]
+        let out_len = read_u32(&ctx.data, h) as usize;
+        match ctx.data[0] {
+            // Pick the next source: stdin when no files were given,
+            // otherwise the file at argv[first_file_arg + file_idx].
+            0 => {
+                if ctx.data[2] == 255 {
+                    ctx.data[0] = 1; // stdin
+                } else {
+                    let path = match ctx.argv().get(ctx.data[2] as usize + ctx.data[1] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(2),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => {
+                            ctx.data[3] = fd as u8;
+                            ctx.data[0] = 1;
+                        }
+                        Err(_) => return Step::Exit(2),
+                    }
+                }
+            }
+            // Read into the partial-line region; on a complete line,
+            // extract it and move to the write phase. The newline is
+            // the terminator, not a selected byte.
+            1 => {
+                let src = ctx.data[3] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(src, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        if ctx.data.len() - out_len > in_start {
+                            // EOF: flush the final line — the in region
+                            // minus a trailing newline, so a terminated
+                            // last line is not double-newlined.
+                            let mut line = ctx.data[in_start..ctx.data.len() - out_len].to_vec();
+                            if line.ends_with(b"\n") {
+                                line.pop();
+                            }
+                            ctx.data.truncate(in_start);
+                            let ranges = read_cut_ranges(&ctx.data);
+                            let out = cut_line(&line, ctx.data[4], ctx.data[5], &ranges);
+                            ctx.data.extend_from_slice(&out);
+                            write_out_len(&mut ctx.data, h, out.len());
+                            ctx.data[0] = 2;
+                        } else {
+                            // Advance to the next source.
+                            let fd = ctx.data[3];
+                            if fd != 0 {
+                                ctx.vfs().close(task, fd as u32).ok();
+                                ctx.data[3] = 0;
+                            }
+                            if ctx.data[2] == 255 {
+                                return Step::Exit(0);
+                            }
+                            let nfiles = ctx.argv().len() as u8 - ctx.data[2];
+                            ctx.data[1] += 1;
+                            if ctx.data[1] >= nfiles {
+                                return Step::Exit(0);
+                            }
+                            ctx.data[0] = 0;
+                        }
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                        if let Some(nl) = ctx.data[in_start..ctx.data.len() - out_len]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                        {
+                            // Extract the first complete line (newline
+                            // excluded), leaving the rest in the region.
+                            let line = ctx.data[in_start..in_start + nl].to_vec();
+                            ctx.data.drain(in_start..in_start + nl + 1);
+                            let ranges = read_cut_ranges(&ctx.data);
+                            let out = cut_line(&line, ctx.data[4], ctx.data[5], &ranges);
+                            ctx.data.extend_from_slice(&out);
+                            write_out_len(&mut ctx.data, h, out.len());
+                            ctx.data[0] = 2;
+                        }
+                    }
+                    ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(src)),
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            // Write the pending output line, parking on a full pipe.
+            // The copy keeps ctx.data unborrowed across the write.
+            2 => {
+                let pending = ctx.data[ctx.data.len() - out_len..].to_vec();
+                match ctx.write_blocking(1, &pending) {
+                    WriteBlock::Data(k) => {
+                        if k == pending.len() {
+                            ctx.data.truncate(ctx.data.len() - out_len);
+                            write_out_len(&mut ctx.data, h, 0);
+                            ctx.data[0] = 1;
+                        } else {
+                            let out_start = ctx.data.len() - out_len;
+                            ctx.data.drain(out_start..out_start + k);
+                            write_out_len(&mut ctx.data, h, out_len - k);
                         }
                     }
                     WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
@@ -2310,6 +2650,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("seq", seq);
     pm.register_applet("tee", tee);
     pm.register_applet("tr", tr);
+    pm.register_applet("cut", cut);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -2758,6 +3099,49 @@ mod tests {
         // An empty delete set keeps everything.
         let t = build_delete(b"");
         assert_eq!(tr_chunk(b"abc", &t, true), b"abc".to_vec());
+    }
+
+    #[test]
+    fn parse_cut_ranges_reads_lists() {
+        use super::parse_cut_ranges;
+        // A lone position, mixed lists, open and from-start ranges.
+        assert_eq!(parse_cut_ranges("1"), Some(vec![(1, 1)]));
+        assert_eq!(parse_cut_ranges("1,3-5"), Some(vec![(1, 1), (3, 5)]));
+        assert_eq!(parse_cut_ranges("-3"), Some(vec![(1, 3)]));
+        assert_eq!(parse_cut_ranges("2-"), Some(vec![(2, 0)]));
+        assert_eq!(parse_cut_ranges("-"), Some(vec![(1, 0)]));
+        assert_eq!(parse_cut_ranges("5-7,1,9-"), Some(vec![(5, 7), (1, 1), (9, 0)]));
+        // Errors: empty list, zero, descending, unparsable, empty member.
+        assert_eq!(parse_cut_ranges(""), None);
+        assert_eq!(parse_cut_ranges("0"), None);
+        assert_eq!(parse_cut_ranges("3-2"), None);
+        assert_eq!(parse_cut_ranges("abc"), None);
+        assert_eq!(parse_cut_ranges("1,"), None);
+        assert_eq!(parse_cut_ranges("1-2-"), None);
+    }
+
+    #[test]
+    fn cut_line_selects_fields_and_chars() {
+        use super::cut_line;
+        // Field mode: single, multiple, and open ranges; the join uses
+        // the delimiter; out-of-range fields are omitted entirely.
+        assert_eq!(cut_line(b"a:b:c", 0, b':', &[(2, 2)]), b"b\n");
+        assert_eq!(cut_line(b"a:b:c", 0, b':', &[(1, 1), (3, 3)]), b"a:c\n");
+        assert_eq!(cut_line(b"a:b:c", 0, b':', &[(2, 0)]), b"b:c\n");
+        assert_eq!(cut_line(b"a:b:c", 0, b':', &[(1, 0)]), b"a:b:c\n");
+        assert_eq!(cut_line(b"a:b:c", 0, b':', &[(1, 1), (9, 9)]), b"a\n");
+        assert_eq!(cut_line(b"a::c", 0, b':', &[(2, 2)]), b"\n"); // empty field
+        assert_eq!(cut_line(b"a::c", 0, b':', &[(1, 2)]), b"a:\n");
+        assert_eq!(cut_line(b"hello", 0, b'\t', &[(1, 1)]), b"hello\n"); // no delim
+        // Char mode: positions concatenated, open range to line end.
+        assert_eq!(cut_line(b"hello", 1, b'\t', &[(1, 3)]), b"hel\n");
+        assert_eq!(cut_line(b"hello", 1, b'\t', &[(2, 0)]), b"ello\n");
+        assert_eq!(cut_line(b"hello", 1, b'\t', &[(1, 2)]), b"he\n");
+        assert_eq!(cut_line(b"hello", 1, b'\t', &[(1, 1), (3, 3), (5, 5)]), b"hlo\n");
+        assert_eq!(cut_line(b"hello", 1, b'\t', &[(9, 9)]), b"\n"); // all out of range
+        // An empty line yields a bare newline in both modes.
+        assert_eq!(cut_line(b"", 1, b'\t', &[(1, 1)]), b"\n");
+        assert_eq!(cut_line(b"", 0, b':', &[(1, 1)]), b"\n");
     }
 
     #[test]

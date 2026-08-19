@@ -30,8 +30,11 @@
 //!   without rewriting the files), `tr` (maps each byte through a
 //!   256-byte table built once at init, or deletes them — ranges
 //!   `a-z` and `\n`/`\t`/`\\` escapes in the sets, `SET2`'s last
-//!   byte repeating for a longer `SET1`), `true`/`false` — plus
-//!   `register_default_applets`.
+//!   byte repeating for a longer `SET1`), `cut` (extracts fields
+//!   `-d DELIM -f LIST` or byte positions `-c`/`-b LIST` per line —
+//!   lists of 1-based positions and ranges like `1,3-5`, `2-`, parsed
+//!   once at init, with lines buffered across reads), `true`/`false`
+//!   — plus `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.
 //! - `heap`       — bump allocator over the budget region (v1 reserves it).
