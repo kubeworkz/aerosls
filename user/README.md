@@ -15,10 +15,13 @@ Cargo workspace for the capability-based sidecars designed in `docs/`:
 
 ```
 proto/            # no_std: RD_* frames + channel envelope + the kernel ABI
-                  # (Kernel trait, cap types, error codes) in kabi.rs
+                  # (Kernel trait, cap types, error codes, the real extern
+                  # "C" ABI behind feature `target`) in kabi.rs; plus the
+                  # kernel ↔ sidecar contracts: bootinfo.rs (Boot Info Block,
+                  # Phase 2 §6.1) and manifest.rs (the packed AERSLSM1
+                  # manifest, §2.2 — bounded TLV parse + build)
 ramdisk/          # the aerosls.ramdisk.v1 driver sidecar (dumb RD_* server)
-  src/kapi.rs     # re-exports proto::kabi + the real extern "C" ABI (feature `target`)
-  src/bootinfo.rs # Boot Info Block parsing (Phase 2 §6.1)
+  src/kapi.rs     # re-exports proto::kabi (incl. RealKernel under `target`)
   src/heap.rs     # bump allocator over the budget region (reserved)
   src/endpoints.rs# RD_* endpoint set: adoption + handshake state
   src/server.rs   # the RD_* dispatch and handlers
@@ -54,6 +57,16 @@ procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
                   # (pipe fds dup2'd onto stdio, inherited by fork), and
                   # blocking reads (park on an empty pipe/console, wake on
                   # data/EOF/input via the read-wake drain)
+sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
+  src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
+                  # and boot(): handshake with the ramdisk driver, mount /
+                  # (aerofs), /dev (console + null), /tmp (ramfs), then spawn
+                  # init with console stdio (Phase 2 §6.2 steps 4–9)
+  src/allocator.rs# BudgetAlloc: request buffers carved from the budget MEM cap
+  src/heap.rs     # bump allocator over the budget region (reserved)
+  src/entry.rs    # rust_entry over the real ABI (feature `target`): BIB →
+                  # heap → boot() → scheduler, parking on the console
+                  # channel when quiesced
 kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 ```
 
@@ -73,6 +86,10 @@ kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 #                         cat | grep pipeline through pipe fds, and a shell
 #                         that parks on an empty pipe until an exec'd
 #                         writer delivers data + EOF
+#   - sidecar/tests/      the bootstrap: manifest → BIB cap resolution, and
+#                         boot() against the real driver — init runs with
+#                         console stdio, reads /etc/passwd through the
+#                         whole chain, writes /tmp
 cargo test --workspace
 ```
 
@@ -85,15 +102,18 @@ injection, close events waking blocked recv/wait).
 ## Build the sidecar image
 
 ```sh
-cargo build -p aerosls-ramdisk --features target
+cargo build -p aerosls-ramdisk --features target   # the driver
+cargo build -p aerosls-sidecar --features target   # the POSIX sidecar
 ```
 
 `--features target` selects the real kernel ABI (`extern "C"` syscalls:
-`k_chan_wait/recv/send/close`, `k_cap_info`) and the `rust_entry` bootstrap.
-The kernel does not exist yet — those symbols are forward declarations to be
-implemented in `kernel/cap.c` and `kernel/chan.c` per the capability-layer
-and transport specs. Image assembly (crt0 + linker script + the manifest's
-`image` record) is the sidecar build step; see `src/crt0.S`.
+`k_chan_wait/recv/send/close`, `k_cap_info` — defined in `proto/src/kabi.rs`,
+shared by every sidecar) and the `rust_entry` bootstrap (`ramdisk/src/entry.rs`,
+`sidecar/src/entry.rs`). The kernel does not exist yet — those symbols are
+forward declarations to be implemented in `kernel/cap.c` and `kernel/chan.c`
+per the capability-layer and transport specs. Image assembly (crt0 + linker
+script + the manifest's `image` record) is the sidecar build step; see
+`ramdisk/src/crt0.S`.
 
 ## Design notes
 
@@ -174,3 +194,18 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   exercising the chunk-preservation rule too: a program must stash a
   read-but-unwritten chunk in its state before parking, since the step's
   stack dies with the step.
+- The bootstrap ties the chain together (`sidecar/`): the kernel ↔ sidecar
+  contract lives in `proto` as two checked formats — the packed manifest
+  (`manifest.rs`, AERSLSM1, bounded TLV with a CRC verified before any
+  field is trusted) and the Boot Info Block (`bootinfo.rs`, which the
+  kernel fills from the manifest). `BootCaps::from_bib` resolves the
+  initial caps by name (`budget`, `console`, `ramdisk`), and `boot()` runs
+  the Phase 2 §6.2 sequence: block-cache handshake → mount `/`, `/dev`,
+  `/tmp` → spawn init with console stdio (fds 0,1,2 opened by the
+  bootstrap). `BudgetAlloc` carves RD request buffers out of the sidecar's
+  own budget cap (grants with no amplification), and the `target` entry
+  points (ramdisk + sidecar) share the real `extern "C"` ABI in
+  `proto::kabi`. The boot integration test runs init to completion
+  against the real driver: console stdio carries a rootfs read out to the
+  console, `/tmp` is writable, and the manifest/BIB cap names line up end
+  to end.

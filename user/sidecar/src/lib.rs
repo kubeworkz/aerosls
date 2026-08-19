@@ -1,0 +1,34 @@
+//! The AeroSLS POSIX sidecar (`aerosls.posix.v1`) — bootstrap and entry.
+//!
+//! This crate is the top of the phase-2 stack: it takes the kernel's Boot
+//! Info Block (built from the sidecar manifest), stands the device layer
+//! up, and hands control to init. Everything below is already in the
+//! chain — `aerosls-blockcache` (the ramdisk protocol client), `aerosls-vfs`
+//! (mounts, fds, the syscall surface), `aerosls-procmgr` (cooperative
+//! tasks) — and the manifest/BIB formats live in `aerosls-proto`.
+//!
+//! - `boot`       — `BootCaps` (initial caps by manifest name) and `boot()`,
+//!   the dependency-ordered bootstrap: connect the block cache, mount `/`,
+//!   `/dev`, `/tmp`, spawn init with console stdio (Phase 2 §6.2).
+//! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
+//!   own budget MEM cap.
+//! - `heap`       — bump allocator over the budget region (v1 reserves it).
+//! - `entry`      — the real `extern "C"` entry point (feature `target`).
+//!
+//! Like every crate in the chain, `boot` is generic over
+//! `aerosls_proto::kabi::Kernel` + `BufferAlloc`, so the identical code
+//! runs against the host fake kernel (`tests/boot_tests.rs`) and the real
+//! kernel ABI.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+pub mod allocator;
+pub mod boot;
+pub mod heap;
+
+#[cfg(feature = "target")]
+mod entry;
+
+pub use boot::{boot, BootCaps, BootErr, Booted};

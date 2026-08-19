@@ -10,12 +10,14 @@
 #               tables, the syscall surface), no_std
 #   procmgr/    the POSIX sidecar's proc manager (cooperative tasks over
 #               the VFS: fork/exec/exit/wait), no_std
+#   sidecar/    the POSIX sidecar itself: manifest/BIB handling, the
+#               bootstrap (mount + init spawn), and the entry point, no_std
 #   kernel-sim/ host-only fake kernel used by the ramdisk, blockcache,
-#               vfs and procmgr integration tests
+#               vfs, procmgr and sidecar integration tests
 #
-# The ramdisk crate defaults to the *host* build (no kernel ABI) so it can be
-# tested against the fake kernel in tests/. The real sidecar image is built
-# with `--features target` (see user/README.md).
+# The ramdisk and sidecar crates default to the *host* build (no kernel ABI)
+# so they can be tested against the fake kernel in tests/. The real sidecar
+# images are built with `--features target` (see user/README.md).
 [workspace]
-members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs", "procmgr"]
+members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs", "procmgr", "sidecar"]
 resolver = "2"

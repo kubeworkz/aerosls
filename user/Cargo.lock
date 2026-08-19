@@ -42,6 +42,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerosls-sidecar"
+version = "0.1.0"
+dependencies = [
+ "aerosls-blockcache",
+ "aerosls-kernel-sim",
+ "aerosls-procmgr",
+ "aerosls-proto",
+ "aerosls-ramdisk",
+ "aerosls-vfs",
+]
+
+[[package]]
 name = "aerosls-vfs"
 version = "0.1.0"
 dependencies = [

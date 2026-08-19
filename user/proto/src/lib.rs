@@ -25,12 +25,19 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
 /// ── Kernel ABI (shared by every sidecar) ────────────────────────────────────
 
 pub mod kabi;
+
+/// ── Boot Info Block + packed sidecar manifest (kernel ↔ sidecar contract) ──
+
+pub mod bootinfo;
+pub mod manifest;
 
 /// ── Channel envelope (Layer 2, transport spec §3.1) ────────────────────────
 

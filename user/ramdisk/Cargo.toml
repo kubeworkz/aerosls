@@ -17,4 +17,5 @@ aerosls-kernel-sim = { path = "../kernel-sim" }
 #   cargo build --features target
 [features]
 default = []
-target = []
+# `target` also enables the real kernel ABI in aerosls-proto.
+target = ["aerosls-proto/target"]

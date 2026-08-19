@@ -1,0 +1,25 @@
+[package]
+name = "aerosls-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "The AeroSLS POSIX sidecar (aerosls.posix.v1) — manifest/boot handling, entry point, and the bootstrap that mounts the ramdisk and spawns init"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+aerosls-blockcache = { path = "../blockcache" }
+aerosls-vfs = { path = "../vfs" }
+aerosls-procmgr = { path = "../procmgr" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+aerosls-ramdisk = { path = "../ramdisk" }
+
+# The `target` feature selects the real kernel ABI (extern "C" syscalls, via
+# aerosls_proto::kabi::RealKernel) and the sidecar entry point. The default
+# (host) build omits them so the crate links cleanly into the test harness.
+# Build the sidecar image with: cargo build -p aerosls-sidecar --features target
+[features]
+default = []
+# `target` also enables the real kernel ABI in aerosls-proto.
+target = ["aerosls-proto/target"]

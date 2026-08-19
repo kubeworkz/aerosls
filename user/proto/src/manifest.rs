@@ -1,0 +1,643 @@
+//! The packed sidecar manifest (`aerosls/sidecar-manifest` §2.2).
+//!
+//! The manifest is the entire contract between the kernel and a sidecar:
+//! identity, initial authority, resources, and debug plumbing. Source form
+//! is JSON (for `genmanifest`); this module is the **packed binary form**
+//! the kernel parses at `create_sidecar()` time — zero string parsing for
+//! the kernel is approximated by a bounded, checked TLV walk over a
+//! fixed header:
+//!
+//! ```text
+//! offset  size  field
+//! 0       8     magic          "AERSLSM1"
+//! 8       2     version_major  = 1
+//! 10      2     version_minor  = 0
+//! 12      2     record_count
+//! 14      2     flags          bit0 tolerate_unknown | bit1 strict_caps
+//! 16      4     total_len      (whole blob, for bounds checking)
+//! 20      4     body_crc32     (CRC-32 of the records, bytes 24..total_len)
+//! 24      ...   records        (record_count × TLV)
+//! ```
+//!
+//! Record: `{ tag: u16, len: u16, payload }` (4-byte header, payload `len`
+//! bytes, back-to-back). Every read is bounds-checked against `total_len`,
+//! so a malformed or truncated manifest fails here instead of overrunning;
+//! the CRC is verified before any field is trusted (a corrupted manifest
+//! fails at load, before any cap is minted — §2.3).
+//!
+//! The parser is `no_std` and allocation-free: caps live in a fixed array
+//! (matching `BootInfo`'s cap array — the kernel builds the initial
+//! capability table from these in record order, and the BIB reports the
+//! same order, so the two can never disagree).
+
+use core::str;
+
+pub const MANIFEST_MAGIC: [u8; 8] = *b"AERSLSM1";
+/// Major version this parser understands. The kernel supports `[1, N]` and
+/// refuses newer majors; the loader refuses anything it can't parse.
+pub const MANIFEST_VERSION_MAJOR: u16 = 1;
+pub const MANIFEST_VERSION_MINOR: u16 = 0;
+
+/// Header flag bit 0: unknown tags are skippable (else fatal).
+pub const FLAG_TOLERATE_UNKNOWN: u16 = 0x0001;
+/// Header flag bit 1: any unrecognized cap record is fatal.
+pub const FLAG_STRICT_CAPS: u16 = 0x0002;
+
+pub const MAX_MANIFEST_CAPS: usize = 16;
+
+/// Record tags (§2.2 table).
+pub const TAG_PERSONALITY: u16 = 0x0001;
+pub const TAG_IMAGE: u16 = 0x0002;
+pub const TAG_BUDGET: u16 = 0x0003;
+pub const TAG_CPU: u16 = 0x0004;
+pub const TAG_LIMITS: u16 = 0x0005;
+pub const TAG_CAP_MEM: u16 = 0x0006;
+pub const TAG_CAP_CHAN: u16 = 0x0007;
+pub const TAG_BOOTSTRAP: u16 = 0x0008;
+pub const TAG_FLAGS: u16 = 0x0009;
+/// Reserved for Phase 3 signed manifests; ignored by v1.
+pub const TAG_SIGNATURE: u16 = 0x7F00;
+
+const HEADER_LEN: usize = 24;
+
+/// Manifest parse failures. All are "this blob is not a manifest we can
+/// load" — the kernel refuses `create_sidecar` on any of them, before any
+/// cap is minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestErr {
+    /// Bad magic, or a blob shorter than the fixed header.
+    BadHeader,
+    /// `version_major` is outside what this loader understands.
+    BadVersion,
+    /// `total_len` is inconsistent with the header (too small, or the blob
+    /// is shorter than `total_len`).
+    BadLength,
+    /// The stored CRC-32 of the records does not match.
+    CrcMismatch,
+    /// A record header runs past `total_len`.
+    Truncated,
+    /// A record payload is longer than `total_len` allows.
+    BadRecordLen,
+    /// A variable-length field (name/peer) is not valid UTF-8.
+    BadUtf8,
+    /// Too many cap records for the fixed cap array.
+    TooManyCaps,
+    /// An unknown tag with `tolerate_unknown` clear, or — under
+    /// `strict_caps` — a cap record with an unknown capability type.
+    UnknownTag(u16),
+}
+
+impl core::fmt::Display for ManifestErr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ManifestErr::BadHeader => write!(f, "bad manifest header"),
+            ManifestErr::BadVersion => write!(f, "unsupported manifest version"),
+            ManifestErr::BadLength => write!(f, "manifest length inconsistent"),
+            ManifestErr::CrcMismatch => write!(f, "manifest CRC mismatch"),
+            ManifestErr::Truncated => write!(f, "manifest truncated"),
+            ManifestErr::BadRecordLen => write!(f, "manifest record overruns blob"),
+            ManifestErr::BadUtf8 => write!(f, "manifest name not UTF-8"),
+            ManifestErr::TooManyCaps => write!(f, "manifest has too many caps"),
+            ManifestErr::UnknownTag(t) => write!(f, "unknown manifest tag 0x{t:04x}"),
+        }
+    }
+}
+
+/// The `IMAGE` record (§2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub offset: u32,
+    pub size: u32,
+    pub entry: u64,
+}
+
+/// The `BUDGET` record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub mem_bytes: u64,
+    pub stack_bytes: u32,
+    pub heap_initial: u32,
+}
+
+/// The `CPU` record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cpu {
+    pub share: u16,
+    pub preemptible: bool,
+}
+
+/// The `LIMITS` record — resource ceilings enforced *inside* the sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_tasks: u16,
+    pub max_fds: u16,
+    pub max_channels: u16,
+    pub max_open_files: u16,
+    pub chan_queue_depth: u16,
+}
+
+/// One initial capability — a `CAP_MEM` or `CAP_CHAN` record. The kernel
+/// builds the sidecar's initial table from these, in record order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManifestCap<'a> {
+    pub name: &'a str,
+    pub rights: u16,
+    pub kind: CapKind<'a>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapKind<'a> {
+    /// `CAP_MEM`: base + size in the kernel's address space.
+    Mem { base: u64, size: u64 },
+    /// `CAP_CHAN`: the wired peer's name (opaque to the kernel).
+    Chan { peer: Option<&'a str>, flags: u8 },
+}
+
+/// The `BOOTSTRAP` record — debug plumbing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bootstrap<'a> {
+    pub console: Option<&'a str>,
+    pub debug: Option<&'a str>,
+    pub log_level: u8,
+}
+
+/// A parsed manifest. Names are borrowed from the blob, which must outlive
+/// the manifest (same lifetime contract as `BootInfo`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Manifest<'a> {
+    pub version_major: u16,
+    pub version_minor: u16,
+    pub flags: u16,
+    pub personality: Option<&'a str>,
+    pub image: Option<Image>,
+    pub budget: Option<Budget>,
+    pub cpu: Option<Cpu>,
+    pub limits: Option<Limits>,
+    pub caps: [Option<ManifestCap<'a>>; MAX_MANIFEST_CAPS],
+    pub n_caps: usize,
+    pub bootstrap: Option<Bootstrap<'a>>,
+    pub flags_value: Option<u32>,
+    /// The raw `SIGNATURE` payload (opaque to v1; `None` when absent).
+    pub signature: Option<&'a [u8]>,
+}
+
+impl<'a> Manifest<'a> {
+    pub fn caps(&self) -> &[Option<ManifestCap<'a>>] {
+        &self.caps[..self.n_caps]
+    }
+
+    /// Find an initial cap by name (names are only meaningful inside the
+    /// sidecar; the kernel just builds the table).
+    pub fn find_cap(&self, name: &str) -> Option<&ManifestCap<'a>> {
+        self.caps().iter().flatten().find(|c| c.name == name)
+    }
+}
+
+/// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) — the same algorithm the
+/// aerofs-lite superblock uses.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// Parse the packed manifest at `blob`. Every byte read is bounded by
+/// `total_len`; the CRC is verified before any field is trusted. `strict`
+/// semantics come from the header flags: unknown tags are skipped only when
+/// `FLAG_TOLERATE_UNKNOWN` is set, and `FLAG_STRICT_CAPS` makes a cap
+/// record with a type other than `CAP_MEM`/`CAP_CHAN` fatal.
+pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
+    if blob.len() < HEADER_LEN || &blob[..8] != &MANIFEST_MAGIC {
+        return Err(ManifestErr::BadHeader);
+    }
+    let version_major = le_u16(blob, 8);
+    let version_minor = le_u16(blob, 10);
+    if version_major != MANIFEST_VERSION_MAJOR {
+        return Err(ManifestErr::BadVersion);
+    }
+    let record_count = le_u16(blob, 12) as usize;
+    let flags = le_u16(blob, 14);
+    let total_len = le_u32(blob, 16) as usize;
+    if total_len < HEADER_LEN || total_len > blob.len() {
+        return Err(ManifestErr::BadLength);
+    }
+    let want_crc = le_u32(blob, 20);
+    if crc32(&blob[HEADER_LEN..total_len]) != want_crc {
+        return Err(ManifestErr::CrcMismatch);
+    }
+
+    let tolerate = flags & FLAG_TOLERATE_UNKNOWN != 0;
+    // `strict_caps` (flag bit 1) has no v1 effect: CAP_MEM/CAP_CHAN are the
+    // only cap tags, so the unknown-tag policy above already covers it.
+
+    let mut m = Manifest {
+        version_major,
+        version_minor,
+        flags,
+        personality: None,
+        image: None,
+        budget: None,
+        cpu: None,
+        limits: None,
+        caps: [None; MAX_MANIFEST_CAPS],
+        n_caps: 0,
+        bootstrap: None,
+        flags_value: None,
+        signature: None,
+    };
+
+    let mut off = HEADER_LEN;
+    for _ in 0..record_count {
+        if off + 4 > total_len {
+            return Err(ManifestErr::Truncated);
+        }
+        let tag = le_u16(blob, off);
+        let len = le_u16(blob, off + 2) as usize;
+        off += 4;
+        if off + len > total_len {
+            return Err(ManifestErr::BadRecordLen);
+        }
+        let p = &blob[off..off + len];
+        off += len;
+        match tag {
+            TAG_PERSONALITY => {
+                // `name_len u16 + name` — like every other name field.
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                if !rest.is_empty() {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.personality = Some(name);
+            }
+            TAG_IMAGE => {
+                if p.len() != 16 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.image = Some(Image {
+                    offset: le_u32(p, 0),
+                    size: le_u32(p, 4),
+                    entry: le_u64(p, 8),
+                });
+            }
+            TAG_BUDGET => {
+                if p.len() != 16 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.budget = Some(Budget {
+                    mem_bytes: le_u64(p, 0),
+                    stack_bytes: le_u32(p, 8),
+                    heap_initial: le_u32(p, 12),
+                });
+            }
+            TAG_CPU => {
+                if p.len() != 3 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.cpu = Some(Cpu {
+                    share: le_u16(p, 0),
+                    preemptible: p[2] & 1 != 0,
+                });
+            }
+            TAG_LIMITS => {
+                if p.len() != 10 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.limits = Some(Limits {
+                    max_tasks: le_u16(p, 0),
+                    max_fds: le_u16(p, 2),
+                    max_channels: le_u16(p, 4),
+                    max_open_files: le_u16(p, 6),
+                    chan_queue_depth: le_u16(p, 8),
+                });
+            }
+            TAG_CAP_MEM => {
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                if rest.len() != 17 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.push_cap(ManifestCap {
+                    name,
+                    rights: rest[16] as u16,
+                    kind: CapKind::Mem {
+                        base: le_u64(rest, 0),
+                        size: le_u64(rest, 8),
+                    },
+                })?;
+            }
+            TAG_CAP_CHAN => {
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                let (peer, rest) = split_name(rest).ok_or(ManifestErr::BadRecordLen)?;
+                if rest.len() != 2 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.push_cap(ManifestCap {
+                    name,
+                    rights: rest[0] as u16,
+                    kind: CapKind::Chan {
+                        peer: if peer.is_empty() { None } else { Some(peer) },
+                        flags: rest[1],
+                    },
+                })?;
+            }
+            TAG_BOOTSTRAP => {
+                let (console, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                let (debug, rest) = split_name(rest).ok_or(ManifestErr::BadRecordLen)?;
+                if rest.len() != 1 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.bootstrap = Some(Bootstrap {
+                    console: if console.is_empty() { None } else { Some(console) },
+                    debug: if debug.is_empty() { None } else { Some(debug) },
+                    log_level: rest[0],
+                });
+            }
+            TAG_FLAGS => {
+                if p.len() != 4 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.flags_value = Some(le_u32(p, 0));
+            }
+            TAG_SIGNATURE => m.signature = Some(p),
+            other => {
+                if tolerate {
+                    continue;
+                }
+                return Err(ManifestErr::UnknownTag(other));
+            }
+        }
+    }
+    Ok(m)
+}
+
+impl<'a> Manifest<'a> {
+    fn push_cap(&mut self, c: ManifestCap<'a>) -> Result<(), ManifestErr> {
+        if self.n_caps >= MAX_MANIFEST_CAPS {
+            return Err(ManifestErr::TooManyCaps);
+        }
+        self.caps[self.n_caps] = Some(c);
+        self.n_caps += 1;
+        Ok(())
+    }
+}
+
+fn utf8(b: &[u8], e: ManifestErr) -> Result<&str, ManifestErr> {
+    str::from_utf8(b).map_err(|_| e)
+}
+
+/// Split a `len u16 + bytes` name field off the front of a record payload.
+fn split_name(p: &[u8]) -> Option<(&str, &[u8])> {
+    if p.len() < 2 {
+        return None;
+    }
+    let n = le_u16(p, 0) as usize;
+    if p.len() < 2 + n {
+        return None;
+    }
+    Some((utf8(&p[2..2 + n], ManifestErr::BadUtf8).ok()?, &p[2 + n..]))
+}
+
+fn le_u16(b: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes([b[i], b[i + 1]])
+}
+
+fn le_u32(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+fn le_u64(b: &[u8], i: usize) -> u64 {
+    let mut m = [0u8; 8];
+    m.copy_from_slice(&b[i..i + 8]);
+    u64::from_le_bytes(m)
+}
+
+// ── builder (host tooling / tests; the kernel never builds manifests) ───────
+
+/// Build the packed form of `m` — the `genmanifest` equivalent. Returns the
+/// blob exactly as `parse_manifest` expects it (header + CRC + records).
+pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
+    let mut recs = alloc::vec::Vec::new();
+    if let Some(p) = m.personality {
+        recs.push((TAG_PERSONALITY, enc_name(p)));
+    }
+    if let Some(i) = m.image {
+        let mut p = alloc::vec::Vec::with_capacity(16);
+        p.extend_from_slice(&i.offset.to_le_bytes());
+        p.extend_from_slice(&i.size.to_le_bytes());
+        p.extend_from_slice(&i.entry.to_le_bytes());
+        recs.push((TAG_IMAGE, p));
+    }
+    if let Some(b) = m.budget {
+        let mut p = alloc::vec::Vec::with_capacity(16);
+        p.extend_from_slice(&b.mem_bytes.to_le_bytes());
+        p.extend_from_slice(&b.stack_bytes.to_le_bytes());
+        p.extend_from_slice(&b.heap_initial.to_le_bytes());
+        recs.push((TAG_BUDGET, p));
+    }
+    if let Some(c) = m.cpu {
+        let mut p = alloc::vec::Vec::with_capacity(3);
+        p.extend_from_slice(&c.share.to_le_bytes());
+        p.push(c.preemptible as u8);
+        recs.push((TAG_CPU, p));
+    }
+    if let Some(l) = m.limits {
+        let mut p = alloc::vec::Vec::with_capacity(10);
+        p.extend_from_slice(&l.max_tasks.to_le_bytes());
+        p.extend_from_slice(&l.max_fds.to_le_bytes());
+        p.extend_from_slice(&l.max_channels.to_le_bytes());
+        p.extend_from_slice(&l.max_open_files.to_le_bytes());
+        p.extend_from_slice(&l.chan_queue_depth.to_le_bytes());
+        recs.push((TAG_LIMITS, p));
+    }
+    for c in m.caps().iter().flatten() {
+        match c.kind {
+            CapKind::Mem { base, size } => {
+                let mut p = alloc::vec::Vec::new();
+                p.extend_from_slice(&enc_name(c.name));
+                p.extend_from_slice(&base.to_le_bytes());
+                p.extend_from_slice(&size.to_le_bytes());
+                p.push(c.rights as u8);
+                recs.push((TAG_CAP_MEM, p));
+            }
+            CapKind::Chan { peer, flags } => {
+                let mut p = alloc::vec::Vec::new();
+                p.extend_from_slice(&enc_name(c.name));
+                p.extend_from_slice(&enc_name(peer.unwrap_or("")));
+                p.push(c.rights as u8);
+                p.push(flags);
+                recs.push((TAG_CAP_CHAN, p));
+            }
+        }
+    }
+    if let Some(b) = m.bootstrap {
+        let mut p = alloc::vec::Vec::new();
+        p.extend_from_slice(&enc_name(b.console.unwrap_or("")));
+        p.extend_from_slice(&enc_name(b.debug.unwrap_or("")));
+        p.push(b.log_level);
+        recs.push((TAG_BOOTSTRAP, p));
+    }
+    if let Some(f) = m.flags_value {
+        recs.push((TAG_FLAGS, f.to_le_bytes().to_vec()));
+    }
+    if let Some(s) = m.signature {
+        recs.push((TAG_SIGNATURE, s.to_vec()));
+    }
+
+    let total_len = HEADER_LEN
+        + recs.iter().map(|(_, p)| 4 + p.len()).sum::<usize>();
+    let mut blob = alloc::vec::Vec::with_capacity(total_len);
+    blob.extend_from_slice(&MANIFEST_MAGIC);
+    blob.extend_from_slice(&m.version_major.to_le_bytes());
+    blob.extend_from_slice(&m.version_minor.to_le_bytes());
+    blob.extend_from_slice(&(recs.len() as u16).to_le_bytes());
+    blob.extend_from_slice(&m.flags.to_le_bytes());
+    blob.extend_from_slice(&(total_len as u32).to_le_bytes());
+    // CRC of the records — filled after the records are appended.
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    for (tag, p) in &recs {
+        blob.extend_from_slice(&tag.to_le_bytes());
+        blob.extend_from_slice(&(p.len() as u16).to_le_bytes());
+        blob.extend_from_slice(p);
+    }
+    let crc = crc32(&blob[HEADER_LEN..]);
+    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    debug_assert_eq!(blob.len(), total_len);
+    blob
+}
+
+fn enc_name(s: &str) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(2 + s.len());
+    v.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    v.extend_from_slice(s.as_bytes());
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn sample() -> Manifest<'static> {
+        Manifest {
+            version_major: 1,
+            version_minor: 0,
+            flags: 0,
+            personality: Some("aerosls.posix.v1"),
+            image: Some(Image { offset: 0x4000, size: 0xC000, entry: 0x4000 }),
+            budget: Some(Budget { mem_bytes: 1 << 25, stack_bytes: 1 << 18, heap_initial: 1 << 23 }),
+            cpu: Some(Cpu { share: 200, preemptible: true }),
+            limits: Some(Limits { max_tasks: 64, max_fds: 4096, max_channels: 128, max_open_files: 512, chan_queue_depth: 64 }),
+            caps: [
+                Some(ManifestCap { name: "budget", rights: 0x3, kind: CapKind::Mem { base: 0x1000_0000, size: 1 << 25 } }),
+                Some(ManifestCap { name: "img.ro", rights: 0x4, kind: CapKind::Mem { base: 0x2000_0000, size: 1 << 20 } }),
+                Some(ManifestCap { name: "console", rights: 0x7, kind: CapKind::Chan { peer: Some("kernel.debug.console"), flags: 0 } }),
+                Some(ManifestCap { name: "ramdisk", rights: 0x7, kind: CapKind::Chan { peer: Some("drv.ramdisk.0"), flags: 0 } }),
+                None, None, None, None, None, None, None, None, None, None, None, None,
+            ],
+            n_caps: 4,
+            bootstrap: Some(Bootstrap { console: Some("console"), debug: None, log_level: 1 }),
+            flags_value: Some(0),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn build_parse_roundtrip() {
+        let blob = build_manifest(&sample());
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.personality, Some("aerosls.posix.v1"));
+        assert_eq!(m.image.unwrap().entry, 0x4000);
+        assert_eq!(m.budget.unwrap().mem_bytes, 1 << 25);
+        assert_eq!(m.cpu.unwrap().share, 200);
+        assert_eq!(m.limits.unwrap().max_tasks, 64);
+        assert_eq!(m.n_caps, 4);
+        let budget = m.find_cap("budget").unwrap();
+        assert_eq!(budget.kind, CapKind::Mem { base: 0x1000_0000, size: 1 << 25 });
+        let ramdisk = m.find_cap("ramdisk").unwrap();
+        assert!(matches!(ramdisk.kind, CapKind::Chan { peer: Some("drv.ramdisk.0"), .. }));
+        assert!(m.find_cap("nope").is_none());
+        assert_eq!(m.bootstrap.unwrap().console, Some("console"));
+    }
+
+    #[test]
+    fn rejects_corruption() {
+        let mut blob = build_manifest(&sample());
+        blob[0] = b'X';
+        assert_eq!(parse_manifest(&blob), Err(ManifestErr::BadHeader));
+
+        let mut blob = build_manifest(&sample());
+        blob[20] ^= 0xFF; // corrupt the stored CRC
+        assert_eq!(parse_manifest(&blob), Err(ManifestErr::CrcMismatch));
+
+        let mut blob = build_manifest(&sample());
+        blob[8] = 2; // version_major = 2
+        assert_eq!(parse_manifest(&blob), Err(ManifestErr::BadVersion));
+    }
+
+    #[test]
+    fn rejects_truncation() {
+        let blob = build_manifest(&sample());
+        // Chop the tail and make total_len agree with the truncation (and
+        // the CRC cover the truncated records) — the record walk must fail,
+        // not overrun.
+        let mut v = blob[..blob.len() - 3].to_vec();
+        let len = v.len() as u32;
+        v[16..20].copy_from_slice(&len.to_le_bytes());
+        let crc = crc32(&v[HEADER_LEN..]);
+        v[20..24].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+    }
+
+    /// Build a blob with the given header flags and an extra set of records
+    /// *inside* `record_count` (the walk is bounded by the header count, so
+    /// an appended record would never be seen).
+    fn blob_with_extra(flags: u16, extra: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut recs: Vec<(u16, Vec<u8>)> = vec![(TAG_PERSONALITY, enc_name("t.personality"))];
+        recs.extend(extra.iter().map(|(t, p)| (*t, p.to_vec())));
+        let total_len = HEADER_LEN + recs.iter().map(|(_, p)| 4 + p.len()).sum::<usize>();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&MANIFEST_MAGIC);
+        blob.extend_from_slice(&1u16.to_le_bytes()); // version_major
+        blob.extend_from_slice(&0u16.to_le_bytes()); // version_minor
+        blob.extend_from_slice(&(recs.len() as u16).to_le_bytes());
+        blob.extend_from_slice(&flags.to_le_bytes());
+        blob.extend_from_slice(&(total_len as u32).to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+        for (t, p) in &recs {
+            blob.extend_from_slice(&t.to_le_bytes());
+            blob.extend_from_slice(&(p.len() as u16).to_le_bytes());
+            blob.extend_from_slice(p);
+        }
+        let crc = crc32(&blob[HEADER_LEN..]);
+        blob[20..24].copy_from_slice(&crc.to_le_bytes());
+        blob
+    }
+
+    #[test]
+    fn unknown_tags_respect_tolerate_flag() {
+        // An unknown tag inside record_count: fatal by default…
+        let v = blob_with_extra(0, &[(0x1234, &[0xAB])]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::UnknownTag(0x1234)));
+        // …skipped when tolerate_unknown is set.
+        let v = blob_with_extra(FLAG_TOLERATE_UNKNOWN, &[(0x1234, &[0xAB])]);
+        let m = parse_manifest(&v).unwrap();
+        assert_eq!(m.personality, Some("t.personality"));
+        assert_eq!(m.n_caps, 0);
+    }
+
+    #[test]
+    fn signature_slot_is_ignored() {
+        // 0x7F00 is reserved and known-but-ignored in v1.
+        let v = blob_with_extra(0, &[(TAG_SIGNATURE, &[1, 2, 3])]);
+        let m = parse_manifest(&v).unwrap();
+        assert_eq!(m.signature, Some(&[1u8, 2, 3][..]));
+    }
+}
