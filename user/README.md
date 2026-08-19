@@ -60,11 +60,12 @@ procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
                   # data/EOF/input via the read-wake drain)
 sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
   src/applets.rs  # the built-in registry: init (the /etc/init.rc boot-script
-                  # runner — one forked child per command, with a > stdout
-                  # redirect), cat, echo, sh (minimal interactive shell —
-                  # console commands, | pipelines, $? last-exit-status,
-                  # '...'/"..." quoting, < and > redirects), true/false
-                  # + register_default_applets
+                  # runner — one forked child per command, sharing sh's word
+                  # parser: quotes, backslash escapes, < and > redirects),
+                  # cat, echo, sh (minimal interactive shell — console
+                  # commands, | pipelines, $? last-exit-status,
+                  # '...'/"..." quoting, backslash escapes, < and >
+                  # redirects), true/false + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
                   # and boot(): handshake with the ramdisk driver, mount /
                   # (aerofs), /dev (console + null), /tmp (ramfs), install
@@ -214,17 +215,19 @@ script + the manifest's `image` record) is the sidecar build step; see
   the Phase 2 §6.2 sequence: block-cache handshake → mount `/`, `/dev`,
   `/tmp` → install the applet registry → spawn init with console stdio
   (fds 0,1,2 opened by the bootstrap). Init is no placeholder: it is the
-  `applets::init` boot-script runner, which executes `/etc/init.rc` line
-  by line — forking one child per command (`path arg...`, with a single
-  `>` stdout redirect), waiting for each, reaping 127-failing children,
-  and exiting when the script is consumed. Applets read their arguments
+  `applets::init` boot-script  runner, which executes `/etc/init.rc` line by
+  line — forking one child per command (parsed with the same word parser
+  as `sh`: quotes, backslash escapes, `<`/`>` redirects; a piped line
+  fails 127, since init runs one command per line), waiting for each,
+  reaping 127-failing children, and exiting when the script is consumed. Applets read their arguments
   from `Ctx::argv`, set by the spawner or the last `exec` (design §6.2's
   `ExecSpec.argv`); exec failure costs the child 127, never init. The
   boot integration test runs the whole thing against the real driver:
-  the script's `cat` carries a rootfs read out to console stdout, its
-  `echo booted > /tmp/out` lands on the ramfs, a bogus command exits 127
-  without stopping init, and the manifest/BIB cap names line up end to
-  end. On top of init sits `applets::sh`, a minimal interactive shell:
+  the script's quoted and backslash-escaped echoes reach console stdout,
+  its `cat < /etc/passwd` carries a rootfs read out to the console, its
+  `echo booted > /tmp/out` lands on the ramfs, a bogus command and a
+  piped line each exit 127 without stopping init, and the manifest/BIB
+  cap names line up end to end. On top of init sits `applets::sh`, a minimal interactive shell:
   it prompts on the console, parks on empty input via the blocking-read
   machinery, buffers multi-line input into a batch queue (a pasted chunk
   runs line by line with one prompt around it, nothing dropped),  forks one child per pipeline stage (resolving bare command names through

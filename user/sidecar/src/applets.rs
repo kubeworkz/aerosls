@@ -8,12 +8,15 @@
 //!
 //! - **`init`** — the boot script runner. Executes `/etc/init.rc` line by
 //!   line, forking one child per command and waiting for it (the design's
-//!   "rc scripts" step). v1 commands are whitespace-tokenized: `path
-//!   arg1 arg2`, with one `>` stdout redirect; `#` comments and blank
-//!   lines are skipped. When the script is consumed, init exits 0 (a real
-//!   init would park forever and reap orphans — the `WaitingChild` park +
-//!   orphan-reparent machinery is already there, and the entry's event
-//!   loop owns the "never exits" half).
+//!   "rc scripts" step). Commands parse through the same word parser as
+//!   `sh` — quotes, backslash escapes, `<`/`>` redirects (`$?` expands to
+//!   0, since init tracks no status). A line containing `|` fails 127:
+//!   init runs one command per line, and a piped line is an error, not a
+//!   silently dropped stage. `#` comments and blank lines are skipped.
+//!   When the script is consumed, init exits 0 (a real init would park
+//!   forever and reap orphans — the `WaitingChild` park + orphan-reparent
+//!   machinery is already there, and the entry's event loop owns the
+//!   "never exits" half).
 //! - **`cat`** — copies its first argument (or stdin) to fd 1, using
 //!   `read_blocking` so it parks on an empty stdin instead of spinning.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
@@ -125,8 +128,12 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// The fork child of a script line: its snapshot is `[1, cursor, script,
-/// FORK_MARKER]`. Parse the command at the cursor, set up stdio (v1: one
-/// `>` stdout redirect), and exec it. On any failure the child exits 127 —
+/// FORK_MARKER]`. Parse the command at the cursor through the shared word
+/// parser (`parse_line` — quotes, backslash escapes, `<`/`>` redirects),
+/// apply the stage's redirects at fd 0 / fd 1, and exec it with the
+/// parsed argv (argv[0] stays a full path, as rc scripts specify). A line
+/// that parses to more than one stage (a `|`) or to nothing fails 127 —
+/// init runs one command per line. On any failure the child exits 127 —
 /// the parent reaps the status and moves on to the next line.
 fn init_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let cursor = u32::from_le_bytes([ctx.data[1], ctx.data[2], ctx.data[3], ctx.data[4]]) as usize;
@@ -137,36 +144,42 @@ fn init_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         Some(i) => cursor + i,
         None => script.len(),
     };
-    let tokens: Vec<String> = match core::str::from_utf8(&script[cursor..end]) {
-        Ok(s) => s.split_whitespace().map(|t| t.to_string()).collect(),
+    let line = match core::str::from_utf8(&script[cursor..end]) {
+        Ok(s) => s,
         Err(_) => return Step::Exit(127),
     };
-    // Split at the redirect: everything before `>` is argv; the token after
-    // names the target. (One redirect, v1.)
-    let cut = tokens.iter().position(|t| t == ">");
-    let argv: Vec<String> = match cut {
-        Some(i) => match tokens.get(i + 1) {
-            Some(target) => {
-                let task = ctx.task;
-                let fd = match ctx.vfs().open(task, target, O_CREAT | O_WRONLY | O_TRUNC, 0o644) {
-                    Ok(fd) => fd,
-                    Err(_) => return Step::Exit(127),
-                };
-                if ctx.vfs().dup2(task, fd, 1).is_err() {
-                    return Step::Exit(127);
-                }
-                ctx.vfs().close(task, fd).ok();
-                tokens[..i].to_vec()
-            }
-            None => return Step::Exit(127),
-        },
-        None => tokens.to_vec(),
-    };
-    if argv.is_empty() {
+    // `$?` is always 0: init tracks no exit status.
+    let stages = parse_line(line, 0);
+    if stages.len() != 1 {
         return Step::Exit(127);
     }
-    let argv_refs: Vec<&str> = argv.iter().map(|a| a.as_str()).collect();
-    match ctx.exec(argv[0].as_str(), &argv_refs) {
+    let stage = &stages[0];
+    if stage.argv.is_empty() {
+        return Step::Exit(127);
+    }
+    let task = ctx.task;
+    if let Some(path) = &stage.out_redir {
+        let fd = match ctx.vfs().open(task, path, O_CREAT | O_WRONLY | O_TRUNC, 0o644) {
+            Ok(fd) => fd,
+            Err(_) => return Step::Exit(127),
+        };
+        if ctx.vfs().dup2(task, fd, 1).is_err() {
+            return Step::Exit(127);
+        }
+        ctx.vfs().close(task, fd).ok();
+    }
+    if let Some(path) = &stage.in_redir {
+        let fd = match ctx.vfs().open(task, path, O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(_) => return Step::Exit(127),
+        };
+        if ctx.vfs().dup2(task, fd, 0).is_err() {
+            return Step::Exit(127);
+        }
+        ctx.vfs().close(task, fd).ok();
+    }
+    let argv: Vec<&str> = stage.argv.iter().map(|a| a.as_str()).collect();
+    match ctx.exec(stage.argv[0].as_str(), &argv) {
         Ok(()) => Step::Yield,
         Err(_) => Step::Exit(127),
     }

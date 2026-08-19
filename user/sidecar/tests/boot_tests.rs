@@ -19,9 +19,11 @@ type FC = FakeClient;
 type FA = FakeAlloc;
 
 /// The rootfs the booted sidecar runs: applet script files (first line
-/// names the applet) plus the boot script init executes. The last line
-/// names a nonexistent program — the child must exit 127 and init must
-/// reap it and carry on.
+/// names the applet) plus the boot script init executes. The script
+/// exercises init's shared word parser — a quoted argument, a
+/// backslash-escaped space, a `<` stdin redirect — and two lines that
+/// must fail 127 without stopping init: a nonexistent program and a
+/// piped line (init runs one command per line).
 fn image() -> Vec<u8> {
     let mut b = ImageBuilder::new();
     b.add_dir("/etc", 0o755);
@@ -32,7 +34,7 @@ fn image() -> Vec<u8> {
     b.add_file("/bin/echo", b"echo\n", 0o755);
     b.add_file(
         "/etc/init.rc",
-        b"# Boot script - v1: path arg... one > redirect\n\n/bin/cat /etc/passwd\n/bin/echo booted > /tmp/out\n/bin/nope\n",
+        b"# Boot script: full-path commands, quoted/escaped args, < and > redirects\n\n/bin/echo \"init says hi\"\n/bin/echo spaced\\ out\n/bin/cat < /etc/passwd\n/bin/echo booted > /tmp/out\n/bin/nope\n/bin/echo piped | /bin/cat\n",
         0o644,
     );
     b.build()
@@ -111,14 +113,15 @@ fn boot_mounts_and_runs_init() {
     booted.run(200);
 
     assert_eq!(booted.proc.exit_code(0), Some(0), "init exited cleanly");
-    // The script's `/bin/cat /etc/passwd` wrote the passwd line to console
-    // stdout (fd 1), read through the full chain: cache → driver → storage.
+    // The script's quoted / escaped echo lines print to console stdout
+    // (fd 1), then `/bin/cat < /etc/passwd` carries the rootfs read out
+    // through the full chain: cache → driver → storage.
     assert_eq!(
         console.console_io().output(),
-        b"root:x:0:0:root:/root:/bin/sh\n",
-        "the boot script's cat carried the rootfs read to the console"
+        b"init says hi\nspaced out\nroot:x:0:0:root:/root:/bin/sh\n",
+        "the boot script's quoted/escaped echoes and < redirect reached the console"
     );
-    // `/bin/echo booted > /tmp/out`: the script runner's one `>` redirect
+    // `/bin/echo booted > /tmp/out`: the script runner's `>` redirect
     // pointed the child's fd 1 at the ramfs file.
     assert_eq!(read_all(&mut booted.proc.vfs, "/tmp/out"), b"booted\n");
     // The root mount is a real aerofs on the cache, not a shadow.
@@ -126,8 +129,10 @@ fn boot_mounts_and_runs_init() {
         read_all(&mut booted.proc.vfs, "/etc/passwd"),
         b"root:x:0:0:root:/root:/bin/sh\n"
     );
-    // The bogus /bin/nope line cost a 127-exiting child; init reaped it and
-    // still finished the script cleanly (proved by the exit above).
+    // The /bin/nope and piped lines cost two 127-exiting children (the
+    // piped line proves the single-stage rule — init runs one command per
+    // line); init reaped both and still finished the script cleanly
+    // (proved by the exit above).
     assert!(booted
         .proc
         .wake_trace
