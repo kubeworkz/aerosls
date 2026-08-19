@@ -361,10 +361,10 @@ rm -f "$health_tmp"
 # serving the bundle it was built with (or a future deploy regressed to
 # regenerating the file) -- the 2026-08-18 failure mode, on the served side.
 # tests/webapp_served_check.sh fetches every asset the bundle table names
-# and byte-compares against the committed file; its GUARD-KIND: runtime
-# marker makes it an owed skip in the pre-restart gate, and THIS call is
-# where it is authoritative -- the instance being verified is the one this
-# deploy just started.
+# and asserts body, Content-Type, and Content-Length all match the committed
+# file; its GUARD-KIND: runtime marker makes it an owed skip in the
+# pre-restart gate, and THIS call is where it is authoritative -- the
+# instance being verified is the one this deploy just started.
 SERVED_BASE="${SERVED_BASE:-$(printf '%s' "$HEALTH_URL" | sed -E 's#/api/health/?$##')}"
 [ -n "$SERVED_BASE" ] || SERVED_BASE="http://localhost:3001"
 echo "[deploy] Verifying the NEW kernel serves exactly the committed webapp bundle..."

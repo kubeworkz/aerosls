@@ -69,7 +69,8 @@ This produces `sls_operating_system.iso` — a UEFI + BIOS bootable GRUB2 disc i
 > deploy both build from it, and `tests/webapp_bundle_guard_check.sh` fails a
 > build whose committed bundle does not match the recorded slsos-sim revision.
 > After every deploy, `tests/webapp_served_check.sh` additionally verifies the
-> running kernel serves that committed bundle byte-for-byte.
+> running kernel serves that committed bundle byte-for-byte, with the correct
+> Content-Type and Content-Length headers.
 
 ### Step 2: Create a persistent storage image (first run only)
 

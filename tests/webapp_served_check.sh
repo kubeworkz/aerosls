@@ -13,7 +13,11 @@
 # with every guard above green. The 2026-08-18 incident was precisely a
 # served webapp that existed nowhere in the repo; this guard closes the loop
 # on the SERVED side: every asset a deployed instance serves must be
-# byte-identical to the committed bundle it was built from.
+# byte-identical to the committed bundle it was built from, AND the response
+# must carry the right headers -- Content-Type equal to the table's MIME and
+# Content-Length equal to the embedded length. The kernel's http_respond_raw
+# emits exactly those (net/http.c), so a serving path that returns the right
+# bytes under wrong headers is still drift.
 #
 # ─── Where it runs ─────────────────────────────────────────────────────────
 # Authoritative call: deploy.sh, AFTER the pm2 restart and the relational
@@ -62,12 +66,15 @@ if ! curl -sf --max-time 5 "$URL/" >/dev/null 2>&1; then
 fi
 
 python3 - "$BUNDLE" "$URL" <<'PY'
-import re, sys, urllib.request
+import http.client, re, sys
+from urllib.parse import urlsplit
 
 bundle_path, base = sys.argv[1], sys.argv[2]
-src = open(bundle_path).read()
+parts = urlsplit(base)
+host, port = parts.hostname, parts.port or 80
 
 # Parse the embedded arrays and the bundle table out of the committed file.
+src = open(bundle_path).read()
 arrays = {}
 for m in re.finditer(r'static const uint8_t (_bundle_\w+)\[\] = \{(.*?)\};', src, re.S):
     arrays[m.group(1)] = bytes(int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]{2})', m.group(2)))
@@ -80,11 +87,20 @@ if not arrays or not table:
     print("FAIL  could not parse embedded arrays/table from %s" % bundle_path)
     sys.exit(1)
 
+# A fresh connection per asset (the kernel does not keep-alive, and a wrong
+# Content-Length can leave bytes stranded in the socket). http.client, not
+# urllib, so the raw headers the kernel emitted are visible for assertion.
 def fetch(path):
-    req = urllib.request.Request(base + path,
-                                 headers={'User-Agent': 'webapp-served-check'})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return r.read()
+    conn = http.client.HTTPConnection(host, port, timeout=10)
+    try:
+        conn.request('GET', path, headers={'User-Agent': 'webapp-served-check'})
+        resp = conn.getresponse()
+        return (resp.status,
+                resp.getheader('Content-Type'),
+                resp.getheader('Content-Length'),
+                resp.read())
+    finally:
+        conn.close()
 
 ok = True
 for path, mime, ident, length in table:
@@ -94,19 +110,33 @@ for path, mime, ident, length in table:
         ok = False
         continue
     try:
-        served = fetch(path)
+        status, ctype, clen, served = fetch(path)
     except Exception as e:
         print("FAIL  %-30s fetch failed: %s" % (path, e))
         ok = False
         continue
-    same = emb == served
-    ok = ok and same
-    print("%s  %-30s %8d served vs %8d embedded%s"
-          % ("OK" if same else "FAIL", path, len(served), len(emb),
-             "" if same else "  -- DRIFT"))
+    bad = []
+    if status != 200:
+        bad.append("status %d, expected 200" % status)
+    if ctype != mime:
+        bad.append("Content-Type '%s', expected '%s'" % (ctype, mime))
+    try:
+        cl_ok = clen is not None and int(clen) == len(emb)
+    except ValueError:
+        cl_ok = False
+    if not cl_ok:
+        bad.append("Content-Length '%s', expected %d" % (clen, len(emb)))
+    if served != emb:
+        bad.append("%d served vs %d embedded bytes differ" % (len(served), len(emb)))
+    if bad:
+        ok = False
+        print("FAIL  %-30s %s" % (path, "; ".join(bad)))
+    else:
+        print("OK    %-30s %8d bytes  %s  CL %s" % (path, len(served), ctype, clen))
 
 if not ok:
     print("webapp_served_check: FAILED -- the served webapp drifts from the committed bundle")
     sys.exit(1)
-print("webapp_served_check: done, all %d assets byte-identical to %s" % (len(table), bundle_path))
+print("webapp_served_check: done, all %d assets byte-identical (body + headers) to %s"
+      % (len(table), bundle_path))
 PY
