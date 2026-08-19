@@ -161,10 +161,15 @@ pub enum WaitOutcome {
 }
 
 /// A program image. At this crate's level: a step function plus its state
-/// (the stand-in for an address space's registers/stack). `fork` clones the
-/// whole thing — that is the register/stack copy of design §4.
+/// (the stand-in for an address space's registers/stack) and argv (design
+/// §6.2's `ExecSpec.argv`). `fork` clones the whole thing — that is the
+/// register/stack copy of design §4.
 pub struct Program<K: Kernel, A: BufferAlloc> {
     pub name: String,
+    /// The argument vector, as set by the spawner or the last `exec`.
+    /// `argv[0]` conventionally names the program (the exec'd script path);
+    /// applets read their arguments from `Ctx::argv()[1..]`.
+    pub argv: Vec<String>,
     /// Program state (the child of a fork carries a snapshot of the
     /// parent's, with the fork marker appended).
     pub data: Vec<u8>,
@@ -183,6 +188,19 @@ impl<K: Kernel, A: BufferAlloc> Program<K, A> {
     pub fn new(name: &str, step: AppletStep<K, A>) -> Program<K, A> {
         Program {
             name: name.to_string(),
+            argv: Vec::new(),
+            data: Vec::new(),
+            step,
+            gen: 0,
+        }
+    }
+
+    /// Spawn/exec a program with an argument vector (design §6.2's
+    /// `ExecSpec`). `argv[0]` conventionally names the program.
+    pub fn with_argv(name: &str, step: AppletStep<K, A>, argv: Vec<String>) -> Program<K, A> {
+        Program {
+            name: name.to_string(),
+            argv,
             data: Vec::new(),
             step,
             gen: 0,
@@ -194,6 +212,7 @@ impl<K: Kernel, A: BufferAlloc> Clone for Program<K, A> {
     fn clone(&self) -> Self {
         Program {
             name: self.name.clone(),
+            argv: self.argv.clone(),
             data: self.data.clone(),
             step: self.step,
             gen: self.gen,
@@ -318,6 +337,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             .get(&parent)
             .map(|t| Program {
                 name: t.program.name.clone(),
+                argv: t.program.argv.clone(),
                 data,
                 step: t.program.step,
                 gen: t.program.gen,
@@ -404,10 +424,13 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         }
     }
 
-    /// `exec`: replace the task's image. Resolves and reads the file
+    /// `exec`: replace the task's image with the applet its file names, and
+    /// set the new image's argv (design §6.2's `ExecSpec`: the caller — a
+    /// shell, init, a spawner — supplies the argument vector; `argv[0]`
+    /// conventionally names the program). Resolves and reads the file
     /// through the VFS; the first non-empty line names the applet. Open fds
     /// are preserved (no CLOEXEC in v1).
-    pub fn exec(&mut self, task: u32, path: &str) -> Result<(), Errno> {
+    pub fn exec(&mut self, task: u32, path: &str, argv: &[&str]) -> Result<(), Errno> {
         let fd = self.vfs.open(task, path, O_RDONLY, 0)?;
         let mut buf = [0u8; 4096];
         let n = self.vfs.read(task, fd, &mut buf)?;
@@ -419,10 +442,12 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             .filter(|s| !s.is_empty())
             .ok_or(Errno::ENoexec)?;
         let step = *self.applets.get(name).ok_or(Errno::ENoexec)?;
+        let argv = argv.iter().map(|a| a.to_string()).collect::<Vec<_>>();
         if let Some(tc) = self.tasks.get_mut(&task) {
             let gen = tc.program.gen.wrapping_add(1);
             tc.program = Program {
                 name: name.to_string(),
+                argv,
                 data: Vec::new(),
                 step,
                 gen,
@@ -579,8 +604,17 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
         self.pm.wait(self.task, child)
     }
 
-    pub fn exec(&mut self, path: &str) -> Result<(), Errno> {
-        self.pm.exec(self.task, path)
+    pub fn exec(&mut self, path: &str, argv: &[&str]) -> Result<(), Errno> {
+        self.pm.exec(self.task, path, argv)
+    }
+
+    /// The calling task's argument vector (set by `exec` or the spawner).
+    pub fn argv(&self) -> &[String] {
+        self.pm
+            .tasks
+            .get(&self.task)
+            .map(|t| t.program.argv.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Blocking read: like `Vfs::read`, but on would-block (`EAGAIN` — an

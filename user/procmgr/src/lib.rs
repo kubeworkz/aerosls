@@ -5,8 +5,10 @@
 //! cwd and credentials; `fork` (fd-table copy with shared `FileNode`s, so
 //! offsets are shared) and `fork_thread` (CLONE_FILES — the table object
 //! itself is shared); exit/zombie/wait with orphan reparenting to init;
-//! `exec` through the mount chain into a BusyBox-style applet registry;
-//! and blocking I/O (`Ctx::read_blocking` / `Ctx::write_blocking`) that
+//! `exec` through the mount chain into a BusyBox-style applet registry,
+//! with the new image's argv set by the caller (design §6.2's `ExecSpec`
+//! — `Program::with_argv` / `Ctx::argv`); and blocking I/O
+//! (`Ctx::read_blocking` / `Ctx::write_blocking`) that
 //! park a task on an empty pipe or console, or on a full pipe, instead of
 //! spinning — woken by the scheduler's wake drain when data, EOF, input,
 //! the console-close event, or free space arrives.

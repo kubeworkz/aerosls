@@ -6,13 +6,16 @@
 //!
 //! 1. the caller hands us the initial caps (from the Boot Info Block, which
 //!    the kernel filled from the manifest — §6.1), the console, and the
-//!    init program;
+//!    request-buffer allocator;
 //! 2. `boot()` connects the block cache to the ramdisk channel and
 //!    handshakes (`RD_INFO` — the device geometry is fixed here);
 //! 3. mounts `/` (aerofs-lite, superblock validated through the cache),
 //!    `/dev` (the console + `/dev/null`), and `/tmp` (ramfs);
-//! 4. spawns init as task 0's program and opens `/dev/console` on its
-//!    stdio (fds 0,1,2 — the design's `stdio: [console, console, console]`).
+//! 4. installs the built-in applet registry, spawns init — the boot script
+//!    runner (`applets::init`, which executes `/etc/init.rc`, one forked
+//!    child per command) — as task 0's program, and opens `/dev/console` on
+//!    its stdio (fds 0,1,2 — the design's `stdio: [console, console,
+//!    console]`). Init's fork children inherit that stdio.
 //!
 //! `boot` is generic over `Kernel` + `BufferAlloc`, so the identical code
 //! runs against the host fake kernel (`aerosls-kernel-sim`, see
@@ -26,6 +29,8 @@ use aerosls_procmgr::{ProcManager, Program};
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{CAP_CHAN, CAP_MEM, Kernel};
 use aerosls_vfs::{CharNode, Errno, Vfs, O_RDWR};
+
+use crate::applets;
 
 /// The initial caps the bootstrap needs, by manifest name (the kernel built
 /// the table from the manifest in record order; the BIB reports the same
@@ -120,13 +125,13 @@ impl<K: Kernel, A: BufferAlloc> Booted<K, A> {
 }
 
 /// Boot the POSIX sidecar: handshake with the ramdisk driver, mount `/`,
-/// `/dev`, and `/tmp`, then spawn `init` with console stdio. See the module
-/// docs for the ordering contract.
+/// `/dev`, and `/tmp`, install the built-in applet registry, then spawn
+/// init — the boot script runner — with console stdio. See the module docs
+/// for the ordering contract.
 pub fn boot<K: Kernel, A: BufferAlloc>(
     k: K,
     caps: &BootCaps,
     console: Arc<CharNode>,
-    init: Program<K, A>,
     alloc: A,
 ) -> Result<Booted<K, A>, BootErr> {
     // 2. Device attach + handshake (RD_INFO). The device geometry is fixed
@@ -142,9 +147,11 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
         .map_err(BootErr::Mount)?;
     vfs.mount_ramfs("/tmp").map_err(BootErr::Mount)?;
 
-    // 4. Init: task 0's program, with console stdio on fds 0,1,2.
+    // 4. System applets + init (the boot script runner), with console
+    //    stdio on fds 0,1,2. Init's fork children inherit the stdio.
     let mut proc = ProcManager::new(vfs);
-    proc.spawn_init(init);
+    applets::register_default_applets(&mut proc);
+    proc.spawn_init(Program::new("init", applets::init));
     for _ in 0..3 {
         proc.vfs
             .open(0, "/dev/console", O_RDWR, 0)

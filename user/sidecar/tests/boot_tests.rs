@@ -5,27 +5,36 @@
 
 use aerosls_blockcache::BufferAlloc;
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
-use aerosls_procmgr::{Ctx, Program, Step};
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{SendCap, CAP_CHAN, CAP_MEM};
 use aerosls_proto::{R, W};
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
 use aerosls_sidecar::{boot, BootCaps};
-use aerosls_vfs::{CharNode, Errno, ImageBuilder, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
+use aerosls_vfs::{CharNode, ImageBuilder, O_RDONLY};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 type FC = FakeClient;
 type FA = FakeAlloc;
 
+/// The rootfs the booted sidecar runs: applet script files (first line
+/// names the applet) plus the boot script init executes. The last line
+/// names a nonexistent program — the child must exit 127 and init must
+/// reap it and carry on.
 fn image() -> Vec<u8> {
     let mut b = ImageBuilder::new();
     b.add_dir("/etc", 0o755);
     b.add_dir("/bin", 0o755);
     b.add_file("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", 0o644);
     b.add_file("/etc/group", b"root:x:0:\n", 0o644);
-    b.add_file("/bin/applet", b"hello\n", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file(
+        "/etc/init.rc",
+        b"# Boot script - v1: path arg... one > redirect\n\n/bin/cat /etc/passwd\n/bin/echo booted > /tmp/out\n/bin/nope\n",
+        0o644,
+    );
     b.build()
 }
 
@@ -66,61 +75,6 @@ impl BufferAlloc for FakeAlloc {
     }
 }
 
-/// The init program: reads /etc/passwd through the booted VFS, echoes it to
-/// its console stdout (fd 1 — opened by the bootstrap), writes /tmp/out,
-/// and exits. Exit codes: 0 = clean, 1 = unexpected phase, 2 = I/O error.
-fn init(ctx: &mut Ctx<FC, FA>) -> Step {
-    let task = ctx.task;
-    if ctx.data.is_empty() {
-        ctx.data.push(1);
-        return Step::Yield;
-    }
-    match ctx.data[0] {
-        1 => {
-            // stdio: fd 0 is a live console (read would-block, not EBADF).
-            let mut t = [0u8; 1];
-            if !matches!(ctx.vfs().read(task, 0, &mut t), Err(Errno::EAgain)) {
-                return Step::Exit(2);
-            }
-            let fd = match ctx.vfs().open(task, "/etc/passwd", O_RDONLY, 0) {
-                Ok(fd) => fd,
-                Err(_) => return Step::Exit(2),
-            };
-            let mut buf = [0u8; 64];
-            let n = match ctx.vfs().read(task, fd, &mut buf) {
-                Ok(n) => n,
-                Err(_) => return Step::Exit(2),
-            };
-            ctx.vfs().close(task, fd).unwrap();
-            ctx.vfs().write(task, 1, b">").unwrap();
-            ctx.vfs().write(task, 1, &buf[..n]).unwrap();
-            ctx.data[0] = 2;
-            Step::Yield
-        }
-        2 => {
-            // /dev/null works, and /tmp is a writable ramfs.
-            let null = match ctx.vfs().open(task, "/dev/null", O_RDWR, 0) {
-                Ok(fd) => fd,
-                Err(_) => return Step::Exit(2),
-            };
-            let mut t = [0u8; 1];
-            if !matches!(ctx.vfs().read(task, null, &mut t), Ok(0)) {
-                return Step::Exit(2);
-            }
-            let out = match ctx.vfs().open(task, "/tmp/out", O_CREAT | O_WRONLY, 0o644) {
-                Ok(fd) => fd,
-                Err(_) => return Step::Exit(2),
-            };
-            if ctx.vfs().write(task, out, b"booted\n").is_err() {
-                return Step::Exit(2);
-            }
-            ctx.vfs().close(task, out).unwrap();
-            Step::Exit(0)
-        }
-        _ => Step::Exit(1),
-    }
-}
-
 /// Read a whole file through a *fresh* VFS task (the booted init has
 /// exited, so task 0's fd table is gone).
 fn read_all(vfs: &mut aerosls_vfs::Vfs<FC, FA>, path: &str) -> Vec<u8> {
@@ -139,8 +93,9 @@ fn read_all(vfs: &mut aerosls_vfs::Vfs<FC, FA>, path: &str) -> Vec<u8> {
     out
 }
 
-/// The full boot: BIB-shaped caps → handshake → mounts → init with console
-/// stdio → init runs to completion through the booted VFS.
+/// The full boot: BIB-shaped caps → handshake → mounts → the boot script
+/// runner as init with console stdio → init forks one child per
+/// `/etc/init.rc` line and runs the system to completion.
 #[test]
 fn boot_mounts_and_runs_init() {
     let (fake, client) = FakeKernel::new(image(), 1);
@@ -150,31 +105,35 @@ fn boot_mounts_and_runs_init() {
     // is the first wired handle (0).
     let caps = BootCaps::new(0, 0, 0, None, 0);
     let console = Arc::new(CharNode::console());
-    let mut booted = boot(
-        client.clone(),
-        &caps,
-        console.clone(),
-        Program::new("init", init),
-        FakeAlloc(client.clone()),
-    )
-    .expect("boot");
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
 
-    booted.run(100);
+    booted.run(200);
 
     assert_eq!(booted.proc.exit_code(0), Some(0), "init exited cleanly");
-    // The boot banner went out on console stdout (fd 1), carrying the
-    // passwd line read through the full chain: cache → driver → storage.
+    // The script's `/bin/cat /etc/passwd` wrote the passwd line to console
+    // stdout (fd 1), read through the full chain: cache → driver → storage.
     assert_eq!(
         console.console_io().output(),
-        b">root:x:0:0:root:/root:/bin/sh\n",
-        "console stdio carried the rootfs read"
+        b"root:x:0:0:root:/root:/bin/sh\n",
+        "the boot script's cat carried the rootfs read to the console"
     );
-    // /tmp is the ramfs mount the bootstrap stood up.
+    // `/bin/echo booted > /tmp/out`: the script runner's one `>` redirect
+    // pointed the child's fd 1 at the ramfs file.
     assert_eq!(read_all(&mut booted.proc.vfs, "/tmp/out"), b"booted\n");
     // The root mount is a real aerofs on the cache, not a shadow.
     assert_eq!(
         read_all(&mut booted.proc.vfs, "/etc/passwd"),
         b"root:x:0:0:root:/root:/bin/sh\n"
+    );
+    // The bogus /bin/nope line cost a 127-exiting child; init reaped it and
+    // still finished the script cleanly (proved by the exit above).
+    assert!(booted
+        .proc
+        .wake_trace
+        .iter()
+        .any(|w| matches!(w, aerosls_procmgr::WakeEvent::Parked(0, aerosls_procmgr::BlockReason::WaitingChild(_)))),
+        "init parked waiting for at least one script child"
     );
 
     client.kill_driver(0);

@@ -9,7 +9,11 @@
 //!
 //! - `boot`       — `BootCaps` (initial caps by manifest name) and `boot()`,
 //!   the dependency-ordered bootstrap: connect the block cache, mount `/`,
-//!   `/dev`, `/tmp`, spawn init with console stdio (Phase 2 §6.2).
+//!   `/dev`, `/tmp`, spawn init (the boot script runner) with console stdio
+//!   (Phase 2 §6.2).
+//! - `applets`    — the built-in registry: the `init` boot-script runner
+//!   (executes `/etc/init.rc`, one forked child per command), `cat`, `echo`,
+//!   `true` — plus `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.
 //! - `heap`       — bump allocator over the budget region (v1 reserves it).
@@ -25,6 +29,7 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod applets;
 pub mod boot;
 pub mod heap;
 

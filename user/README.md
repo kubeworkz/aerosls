@@ -53,15 +53,20 @@ procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
   src/procmgr.rs  # ProcManager: run queue, Program/step model, Ctx, fork
                   # (fd-table copy, shared offsets), fork_thread (CLONE_FILES),
                   # exit/zombie/wait with orphan reparenting, exec (applet
-                  # registry through the mount chain), shell pipelines
+                  # registry through the mount chain, argv per design §6.2's
+                  # ExecSpec), shell pipelines
                   # (pipe fds dup2'd onto stdio, inherited by fork), and
                   # blocking reads (park on an empty pipe/console, wake on
                   # data/EOF/input via the read-wake drain)
 sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
+  src/applets.rs  # the built-in registry: init (the /etc/init.rc boot-script
+                  # runner — one forked child per command, with a > stdout
+                  # redirect), cat, echo, true + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
                   # and boot(): handshake with the ramdisk driver, mount /
-                  # (aerofs), /dev (console + null), /tmp (ramfs), then spawn
-                  # init with console stdio (Phase 2 §6.2 steps 4–9)
+                  # (aerofs), /dev (console + null), /tmp (ramfs), install
+                  # the applet registry, then spawn init with console stdio
+                  # (Phase 2 §6.2 steps 4–9)
   src/allocator.rs# BudgetAlloc: request buffers carved from the budget MEM cap
   src/heap.rs     # bump allocator over the budget region (reserved)
   src/entry.rs    # rust_entry over the real ABI (feature `target`): BIB →
@@ -87,7 +92,9 @@ kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 #                         that parks on an empty pipe until an exec'd
 #                         writer delivers data + EOF
 #   - sidecar/tests/      the bootstrap: manifest → BIB cap resolution, and
-#                         boot() against the real driver — init runs with
+#                         boot() against the real driver — init (the boot
+#                         script runner) forks one child per /etc/init.rc
+#                         line; cat/echo run from the rootfs, init runs with
 #                         console stdio, reads /etc/passwd through the
 #                         whole chain, writes /tmp
 cargo test --workspace
@@ -201,11 +208,19 @@ script + the manifest's `image` record) is the sidecar build step; see
   kernel fills from the manifest). `BootCaps::from_bib` resolves the
   initial caps by name (`budget`, `console`, `ramdisk`), and `boot()` runs
   the Phase 2 §6.2 sequence: block-cache handshake → mount `/`, `/dev`,
-  `/tmp` → spawn init with console stdio (fds 0,1,2 opened by the
-  bootstrap). `BudgetAlloc` carves RD request buffers out of the sidecar's
-  own budget cap (grants with no amplification), and the `target` entry
+  `/tmp` → install the applet registry → spawn init with console stdio
+  (fds 0,1,2 opened by the bootstrap). Init is no placeholder: it is the
+  `applets::init` boot-script runner, which executes `/etc/init.rc` line
+  by line — forking one child per command (`path arg...`, with a single
+  `>` stdout redirect), waiting for each, reaping 127-failing children,
+  and exiting when the script is consumed. Applets read their arguments
+  from `Ctx::argv`, set by the spawner or the last `exec` (design §6.2's
+  `ExecSpec.argv`); exec failure costs the child 127, never init. The
+  boot integration test runs the whole thing against the real driver:
+  the script's `cat` carries a rootfs read out to console stdout, its
+  `echo booted > /tmp/out` lands on the ramfs, a bogus command exits 127
+  without stopping init, and the manifest/BIB cap names line up end to
+  end. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
-  `proto::kabi`. The boot integration test runs init to completion
-  against the real driver: console stdio carries a rootfs read out to the
-  console, `/tmp` is writable, and the manifest/BIB cap names line up end
-  to end.
+  `proto::kabi`.

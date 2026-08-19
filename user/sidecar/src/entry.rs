@@ -6,7 +6,8 @@
 //! 3. Init the heap over the budget region; bind `BudgetAlloc` to the
 //!    budget cap for request buffers.
 //! 4. `boot()`: connect the block cache to the ramdisk channel, mount
-//!    `/`, `/dev`, `/tmp`, spawn init with console stdio.
+//!    `/`, `/dev`, `/tmp`, install the applet registry, spawn init (the
+//!    boot script runner — it executes `/etc/init.rc`) with console stdio.
 //! 5. Run the scheduler; when it quiesces, park on the console channel
 //!    (the event loop — typed input arrives there as messages; the ChanDev
 //!    adapter that feeds the in-memory console is future work, so v1 just
@@ -14,32 +15,18 @@
 //!
 //! Like the ramdisk driver's entry, this is forward-declared: it compiles
 //! against the not-yet-existing kernel (`k_chan_*` externs in
-//! `aerosls_proto::kabi`) and the init image is the image-build's business
-//! (`PLACEHOLDER_INIT` below is replaced by the real shell).
+//! `aerosls_proto::kabi`); the rootfs image (with `/etc/init.rc` and the
+//! applet script files) is the image-build's business.
 
 use crate::allocator::BudgetAlloc;
 use crate::boot::{boot, BootCaps};
 use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, TIMEOUT_NONE};
-use aerosls_procmgr::{Ctx, Program, Step};
 
 /// Reserved heap over the budget region (single-threaded sidecar; access is
 /// confined to `rust_entry`).
 static mut HEAP: Bump = Bump::new();
-
-/// A placeholder init: print a boot banner on the console and live forever.
-/// The image build replaces this with the real init/shell.
-fn placeholder_init(ctx: &mut Ctx<'_, RealKernel, BudgetAlloc>) -> Step {
-    let task = ctx.task;
-    if ctx.data.is_empty() {
-        ctx.data.push(1);
-        // fd 1 is the console stdout the bootstrap opened.
-        let _ = ctx.vfs().write(task, 1, b"aerosls.posix.v1: init up\r\n");
-        return Step::Yield;
-    }
-    Step::Yield
-}
 
 #[no_mangle]
 // The `static mut` heap is deliberate on a bare-metal single-threaded
@@ -57,8 +44,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let alloc = BudgetAlloc::new(caps.budget_slot, caps.budget_base, caps.budget_len);
 
     let console = alloc::sync::Arc::new(aerosls_vfs::CharNode::console());
-    let init = Program::new("init", placeholder_init);
-    let mut booted = boot(RealKernel, &caps, console, init, alloc)
+    let mut booted = boot(RealKernel, &caps, console, alloc)
         .unwrap_or_else(|e| panic!("sidecar boot failed: {e:?}"));
 
     loop {

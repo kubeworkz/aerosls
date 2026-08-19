@@ -45,6 +45,7 @@ fn pm_image() -> Vec<u8> {
     b.add_file("/bin/cat", b"cat\n", 0o755);
     b.add_file("/bin/grep", b"grep\n", 0o755);
     b.add_file("/bin/writer", b"writer\n", 0o755);
+    b.add_file("/bin/argvapplet", b"argv_catcher\n", 0o755);
     b.build()
 }
 
@@ -214,15 +215,43 @@ fn hello(ctx: &mut Ctx<FC, FA>) -> Step {
 
 fn execer(ctx: &mut Ctx<FC, FA>) -> Step {
     if ctx.data.is_empty() {
-        ctx.exec("/bin/applet").unwrap();
+        ctx.exec("/bin/applet", &[]).unwrap();
         return Step::Yield; // next step runs the applet (fresh data)
+    }
+    Step::Exit(1)
+}
+
+/// The execer variant that passes an argument vector (design §6.2's
+/// `ExecSpec.argv`) to the applet it execs.
+fn execer_with_args(ctx: &mut Ctx<FC, FA>) -> Step {
+    if ctx.data.is_empty() {
+        ctx.exec("/bin/argvapplet", &["argvapplet", "alpha", "beta"])
+            .unwrap();
+        return Step::Yield; // next step runs the applet (fresh data)
+    }
+    Step::Exit(1)
+}
+
+/// Writes its argv (joined by `|`) to /tmp/argv so the argv plumbing is
+/// observable end to end, then exits 0.
+fn argv_catcher(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let text = ctx.argv().join("|");
+        let fd = ctx
+            .vfs()
+            .open(task, "/tmp/argv", O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+        ctx.vfs().write(task, fd, text.as_bytes()).unwrap();
+        ctx.vfs().close(task, fd).unwrap();
+        return Step::Exit(0);
     }
     Step::Exit(1)
 }
 
 fn failed_exec(ctx: &mut Ctx<FC, FA>) -> Step {
     if ctx.data.is_empty() {
-        if ctx.exec("/no/such/applet").is_err() {
+        if ctx.exec("/no/such/applet", &[]).is_err() {
             return Step::Exit(11);
         }
         return Step::Exit(12);
@@ -360,7 +389,7 @@ fn pipeline(ctx: &mut Ctx<FC, FA>) -> Step {
             ctx.vfs().dup2(task, w, 1).unwrap();
             ctx.vfs().close(task, r).unwrap();
             ctx.vfs().close(task, w).unwrap();
-            ctx.exec("/bin/cat").unwrap();
+            ctx.exec("/bin/cat", &[]).unwrap();
             Step::Yield
         }
         (4, _) => {
@@ -368,7 +397,7 @@ fn pipeline(ctx: &mut Ctx<FC, FA>) -> Step {
             ctx.vfs().dup2(task, r, 0).unwrap();
             ctx.vfs().close(task, r).unwrap();
             ctx.vfs().close(task, w).unwrap();
-            ctx.exec("/bin/grep").unwrap();
+            ctx.exec("/bin/grep", &[]).unwrap();
             Step::Yield
         }
         (5, _) => {
@@ -486,6 +515,42 @@ fn exec_switches_to_the_applet() {
         read_all(&mut p.vfs, "/tmp/out"),
         b"hello from applet",
         "the applet wrote through the VFS"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn spawn_sets_the_program_argv() {
+    let (mut p, t, client) = pm();
+    p.register_applet("argv_catcher", argv_catcher);
+    p.spawn_init(Program::with_argv(
+        "argv_catcher",
+        argv_catcher,
+        vec!["init".into(), "spawn-arg".into()],
+    ));
+    p.run_until_quiet(100);
+    assert_eq!(
+        read_all(&mut p.vfs, "/tmp/argv"),
+        b"init|spawn-arg",
+        "the spawner's argv reached the applet"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn exec_sets_the_new_images_argv() {
+    let (mut p, t, client) = pm();
+    p.register_applet("argv_catcher", argv_catcher);
+    p.spawn_init(Program::new("execer_args", execer_with_args));
+    p.run_until_quiet(100);
+    assert_eq!(
+        read_all(&mut p.vfs, "/tmp/argv"),
+        b"argvapplet|alpha|beta",
+        "exec's argv replaced the old image's"
     );
 
     client.kill_driver(0);
@@ -771,7 +836,7 @@ fn blocking_shell(ctx: &mut Ctx<FC, FA>) -> Step {
             ctx.vfs().dup2(task, w, 1).unwrap();
             ctx.vfs().close(task, r).unwrap();
             ctx.vfs().close(task, w).unwrap();
-            ctx.exec("/bin/writer").unwrap();
+            ctx.exec("/bin/writer", &[]).unwrap();
             Step::Yield
         }
         (3, _) => {
