@@ -2,7 +2,7 @@
 // Regenerate with:  make bundle  (then COMMIT the result -- the committed
 //                   file is canonical; see tests/webapp_bundle_guard_check.sh)
 //
-// Source: slsos-sim/dist (rev 2ecd45d25a27)
+// Source: slsos-sim/dist (rev 5fb4e0cca86d)
 // Files:  6
 // Total:  942,765 bytes (920 KiB)
 
