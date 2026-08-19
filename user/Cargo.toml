@@ -8,12 +8,14 @@
 #               client), no_std
 #   vfs/        the POSIX sidecar's VFS (aerofs-lite + ramfs mounts, fd
 #               tables, the syscall surface), no_std
-#   kernel-sim/ host-only fake kernel used by the ramdisk, blockcache and
-#               vfs integration tests
+#   procmgr/    the POSIX sidecar's proc manager (cooperative tasks over
+#               the VFS: fork/exec/exit/wait), no_std
+#   kernel-sim/ host-only fake kernel used by the ramdisk, blockcache,
+#               vfs and procmgr integration tests
 #
 # The ramdisk crate defaults to the *host* build (no kernel ABI) so it can be
 # tested against the fake kernel in tests/. The real sidecar image is built
 # with `--features target` (see user/README.md).
 [workspace]
-members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs"]
+members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs", "procmgr"]
 resolver = "2"

@@ -1,0 +1,17 @@
+[package]
+name = "aerosls-procmgr"
+version = "0.1.0"
+edition = "2021"
+description = "The POSIX sidecar's proc manager: cooperative tasks over the VFS"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+aerosls-vfs = { path = "../vfs" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+aerosls-ramdisk = { path = "../ramdisk" }
+aerosls-blockcache = { path = "../blockcache" }
+
+[features]
+default = []

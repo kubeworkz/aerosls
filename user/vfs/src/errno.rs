@@ -40,6 +40,8 @@ pub enum Errno {
     EBusy,
     /// Too many open files.
     EMfile,
+    /// Exec format error (the file is not a runnable image).
+    ENoexec,
 }
 
 impl Errno {
@@ -61,6 +63,7 @@ impl Errno {
             Errno::EAgain => 11,
             Errno::EBusy => 16,
             Errno::EMfile => 24,
+            Errno::ENoexec => 8,
         }
     }
 }

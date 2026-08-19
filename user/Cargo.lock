@@ -19,6 +19,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerosls-procmgr"
+version = "0.1.0"
+dependencies = [
+ "aerosls-blockcache",
+ "aerosls-kernel-sim",
+ "aerosls-proto",
+ "aerosls-ramdisk",
+ "aerosls-vfs",
+]
+
+[[package]]
 name = "aerosls-proto"
 version = "0.1.0"
 

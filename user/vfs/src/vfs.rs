@@ -63,6 +63,11 @@ pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
 
+/// `clone_task` flags: the child shares the parent's fd table object
+/// itself (threads) instead of a copy (fork). A shared table means a
+/// `close`/`dup2` in one task is visible in all holders — POSIX threads.
+pub const CLONE_FILES: u32 = 1;
+
 pub const MAX_TASKS: usize = 256;
 pub const MAX_FDS: usize = 256;
 
@@ -490,6 +495,7 @@ pub struct FileNode {
 }
 
 /// One fd-table slot.
+#[derive(Clone)]
 pub struct FdEntry {
     pub node: Arc<FileNode>,
     /// Rights minted at open from the access mode (proto `R`/`W` bits).
@@ -497,6 +503,7 @@ pub struct FdEntry {
     pub flags: u16,
 }
 
+#[derive(Clone)]
 struct FdTable {
     entries: Vec<Option<FdEntry>>,
 }
@@ -526,7 +533,8 @@ impl FdTable {
 }
 
 struct Task {
-    fds: FdTable,
+    /// Index into `Vfs::table_pool`. `usize::MAX` = no table (exited).
+    fds: usize,
     cwd: String,
     euid: u16,
     egid: u16,
@@ -538,6 +546,12 @@ pub struct Vfs<K: Kernel, A: BufferAlloc> {
     fss: Vec<Fs<K, A>>,
     mounts: Vec<Mount>,
     next_fs_id: u64,
+    /// The fd-table registry. Tasks reference tables by index; a table is
+    /// *shared* when two tasks carry the same index (CLONE_FILES threads)
+    /// and *copied* when a fork pushed a fresh clone. Entries are never
+    /// removed (indices must stay stable); the pool is bounded by the
+    /// number of fork/clone events.
+    table_pool: Vec<FdTable>,
     tasks: Vec<Task>,
 }
 
@@ -547,8 +561,9 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             fss: Vec::new(),
             mounts: Vec::new(),
             next_fs_id: 1,
+            table_pool: vec![FdTable::new()],
             tasks: vec![Task {
-                fds: FdTable::new(),
+                fds: 0,
                 cwd: String::from("/"),
                 euid: 0,
                 egid: 0,
@@ -654,8 +669,10 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             return Err(Errno::EAgain);
         }
         let id = self.tasks.len() as u32;
+        let table = self.table_pool.len();
+        self.table_pool.push(FdTable::new());
         self.tasks.push(Task {
-            fds: FdTable::new(),
+            fds: table,
             cwd: String::from("/"),
             euid: 0,
             egid: 0,
@@ -748,17 +765,23 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             ino,
             offset: Cell::new(0),
         });
-        let fd = self.task_mut(task)?.fds.alloc(FdEntry {
-            node,
-            rights: want,
-            flags,
-        })?;
+        let fd = {
+            let idx = self.task_mut(task)?.fds;
+            self.table_pool[idx].alloc(FdEntry {
+                node,
+                rights: want,
+                flags,
+            })?
+        };
         Ok(fd)
     }
 
     pub fn close(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
-        let t = self.task_mut(task)?;
-        let slot = t.fds.entries.get_mut(fd as usize).ok_or(Errno::EBadf)?;
+        let idx = self.task_mut(task)?.fds;
+        let slot = self.table_pool[idx]
+            .entries
+            .get_mut(fd as usize)
+            .ok_or(Errno::EBadf)?;
         if slot.is_none() {
             return Err(Errno::EBadf);
         }
@@ -767,14 +790,16 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     }
 
     pub fn dup(&mut self, task: u32, fd: u32) -> Result<u32, Errno> {
-        let t = self.task_mut(task)?;
-        let entry = t.fds.get(fd).ok_or(Errno::EBadf)?;
-        let copy = FdEntry {
-            node: entry.node.clone(),
-            rights: entry.rights,
-            flags: entry.flags,
+        let idx = self.task_mut(task)?.fds;
+        let copy = {
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+            FdEntry {
+                node: e.node.clone(),
+                rights: e.rights,
+                flags: e.flags,
+            }
         };
-        t.fds.alloc(copy)
+        self.table_pool[idx].alloc(copy)
     }
 
     pub fn dup2(&mut self, task: u32, oldfd: u32, newfd: u32) -> Result<u32, Errno> {
@@ -785,30 +810,31 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             return Err(Errno::EBadf);
         }
         let entry = {
-            let t = self.task_mut(task)?;
-            let e = t.fds.get(oldfd).ok_or(Errno::EBadf)?;
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(oldfd).ok_or(Errno::EBadf)?;
             FdEntry {
                 node: e.node.clone(),
                 rights: e.rights,
                 flags: e.flags,
             }
         };
-        let t = self.task_mut(task)?;
-        if (newfd as usize) < t.fds.entries.len() {
-            t.fds.entries[newfd as usize] = Some(entry);
+        let idx = self.task_mut(task)?.fds;
+        let table = &mut self.table_pool[idx];
+        if (newfd as usize) < table.entries.len() {
+            table.entries[newfd as usize] = Some(entry);
         } else {
-            while (t.fds.entries.len() as u32) < newfd {
-                t.fds.entries.push(None);
+            while (table.entries.len() as u32) < newfd {
+                table.entries.push(None);
             }
-            t.fds.entries.push(Some(entry));
+            table.entries.push(Some(entry));
         }
         Ok(newfd)
     }
 
     pub fn read(&mut self, task: u32, fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
         let node = {
-            let t = self.task_mut(task)?;
-            let e = t.fds.get(fd).ok_or(Errno::EBadf)?;
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
             if e.rights & R == 0 {
                 return Err(Errno::EBadf);
             }
@@ -824,8 +850,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     pub fn write(&mut self, task: u32, fd: u32, buf: &[u8]) -> Result<usize, Errno> {
         let (node, append) = {
-            let t = self.task_mut(task)?;
-            let e = t.fds.get(fd).ok_or(Errno::EBadf)?;
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
             if e.rights & W == 0 {
                 return Err(Errno::EBadf);
             }
@@ -850,8 +876,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     pub fn lseek(&mut self, task: u32, fd: u32, off: i64, whence: u32) -> Result<u64, Errno> {
         let node = {
-            let t = self.task_mut(task)?;
-            let e = t.fds.get(fd).ok_or(Errno::EBadf)?;
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
             e.node.clone()
         };
         // Every whence touches the device: lseek on a dead device fails
@@ -888,8 +914,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     pub fn fstat(&mut self, task: u32, fd: u32) -> Result<Stat, Errno> {
         let (fs_idx, fs_id, ino) = {
-            let t = self.task_mut(task)?;
-            let e = t.fds.get(fd).ok_or(Errno::EBadf)?;
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
             (e.node.fs, e.node.fs_id, e.node.ino)
         };
         let fs = self.fs_mut_id(fs_idx, fs_id)?;
@@ -943,17 +969,56 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     /// An fd's current offset (test/observability helper).
     pub fn offset_of(&self, task: u32, fd: u32) -> Option<u64> {
-        self.tasks
-            .get(task as usize)?
-            .fds
-            .get(fd)
-            .map(|e| e.node.offset.get())
+        let idx = self.tasks.get(task as usize)?.fds;
+        self.table_pool.get(idx)?.get(fd).map(|e| e.node.offset.get())
     }
 
     /// The inode an fd names (test/observability helper: dup/dup2 must
     /// share the node).
     pub fn fd_ino(&self, task: u32, fd: u32) -> Option<u64> {
-        self.tasks.get(task as usize)?.fds.get(fd).map(|e| e.node.ino)
+        let idx = self.tasks.get(task as usize)?.fds;
+        self.table_pool.get(idx)?.get(fd).map(|e| e.node.ino)
+    }
+
+    /// How many fds a task holds (0 after exit).
+    pub fn fd_count(&self, task: u32) -> Option<usize> {
+        let idx = self.tasks.get(task as usize)?.fds;
+        Some(self.table_pool.get(idx)?.entries.len())
+    }
+
+    /// Fork support: a new task whose fd table is a *copy* of the parent's
+    /// (entries share their `Arc<FileNode>`, so parent and child correctly
+    /// share open-file offsets), with cwd and credentials copied. With
+    /// `CLONE_FILES`, the child shares the parent's table *object* instead
+    /// (threads: `close`/`dup2` in one is visible in all holders).
+    pub fn clone_task(&mut self, parent: u32, flags: u32) -> Result<u32, Errno> {
+        let (cwd, euid, egid, table_idx) = {
+            let p = self.task(parent)?;
+            (p.cwd.clone(), p.euid, p.egid, p.fds)
+        };
+        let table = if flags & CLONE_FILES != 0 {
+            table_idx
+        } else {
+            let copy = self.table_pool[table_idx].clone();
+            let idx = self.table_pool.len();
+            self.table_pool.push(copy);
+            idx
+        };
+        let id = self.tasks.len() as u32;
+        self.tasks.push(Task {
+            fds: table,
+            cwd,
+            euid,
+            egid,
+        });
+        Ok(id)
+    }
+
+    /// Drop a task's fd table (the exit path). A table shared via
+    /// `CLONE_FILES` survives as long as any holder remains.
+    pub fn exit_task(&mut self, task: u32) -> Result<(), Errno> {
+        self.task_mut(task)?.fds = usize::MAX;
+        Ok(())
     }
 
     // ── internals ─────────────────────────────────────────────────────────────

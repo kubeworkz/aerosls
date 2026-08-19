@@ -33,8 +33,9 @@ pub mod ramfs;
 pub mod vfs;
 
 pub use aerofs::{FileType, ImageBuilder, SuperblockRecord};
+pub use aerosls_blockcache::BufferAlloc;
 pub use errno::{DirEnt, Errno, Stat};
 pub use vfs::{
-    rights_of, FileNode, FdEntry, MountState, Vfs, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY,
-    O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET,
+    rights_of, FileNode, FdEntry, MountState, Vfs, CLONE_FILES, O_ACCMODE, O_APPEND, O_CREAT,
+    O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET,
 };

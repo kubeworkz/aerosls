@@ -8,6 +8,7 @@ Cargo workspace for the capability-based sidecars designed in `docs/`:
 | `ramdisk/` | `aerosls.ramdisk.v1` | `docs/AeroSLS-Ramdisk-Driver-Implementation-Plan-v0.1.md` |
 | `blockcache/` | — (POSIX sidecar component) | respawn decision §4.1 (device states), Phase 2 §3.4/§5.2 |
 | `vfs/` | — (POSIX sidecar component) | Phase 2 §3.2/§3.4/§6.3, respawn decision §4.2/§5.9/§6 |
+| `procmgr/` | — (POSIX sidecar component) | Phase 2 §3.2/§3.3/§4 (fork/exec) |
 | `kernel-sim/` | — (host-only test fake) | capability-layer spec §3–§4, transport spec §3–§6 |
 
 ## Layout
@@ -34,23 +35,33 @@ vfs/              # the POSIX sidecar's VFS — the layer above the block cache
   src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32,
                   # 11 direct + 1 indirect block) + the genrootfs image builder
   src/ramfs.rs    # in-memory /tmp filesystem (never stale)
-  src/vfs.rs      # mounts, longest-prefix path resolution, per-task fd tables,
-                  # shared-offset FileNode, open/read/write/lseek/dup/stat/
-                  # read_dir/mkdir/unlink/rmdir, stale→EIO, fail-permanently
+  src/vfs.rs      # mounts, longest-prefix path resolution, per-task fd tables
+                  # (pooled: fork copies a table sharing FileNodes; CLONE_FILES
+                  # shares the table object), shared-offset FileNode, the
+                  # syscall surface, stale→EIO, fail-permanently
   src/errno.rs    # shared POSIX errno set
+procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
+                  # the VFS (Phase 2 §3.2–§3.3, §4)
+  src/procmgr.rs  # ProcManager: run queue, Program/step model, Ctx, fork
+                  # (fd-table copy, shared offsets), fork_thread (CLONE_FILES),
+                  # exit/zombie/wait with orphan reparenting, exec (applet
+                  # registry through the mount chain)
 kernel-sim/       # host fake kernel: driver-side Kernel + client-side Kernel
 ```
 
 ## Build and test (host)
 
 ```sh
-# All tests: unit tests (proto, aerofs format, ramfs, vfs logic) plus three
-# integration suites against the fake kernel in kernel-sim/, each driving the
-# *real* driver end to end:
+# All tests: unit tests (proto, aerofs format, ramfs, vfs logic, proc-manager
+# scheduler/fork/wait) plus four integration suites against the fake kernel in
+# kernel-sim/, each driving the *real* driver end to end:
 #   - ramdisk/tests/      the driver (server side)
 #   - blockcache/tests/   the block cache (protocol client)
 #   - vfs/tests/          the VFS: aerofs-lite mounted on a connected block
 #                         cache, incl. driver death → EIO + remount
+#   - procmgr/tests/      the proc manager: fork sharing file offsets,
+#                         CLONE_FILES threads sharing the fd table, exec,
+#                         round-robin interleaving
 cargo test --workspace
 ```
 
@@ -97,3 +108,10 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   `Arc<FileNode>`, and a pre-death fd fails permanently across a remount
   (the node pins the fs generation; `remount_aerofs` revalidates the
   superblock identity before replacing the fs in place).
+- The proc manager pins the process semantics: `fork` copies the parent's fd
+  table with shared `FileNode`s (correct shared-offset POSIX), `fork_thread`
+  shares the table object (CLONE_FILES), an exited task is a zombie until
+  its parent reaps it (orphans reparent to init), and a parent that waits on
+  a live child blocks until the exit wakes it. `exec` resolves the file
+  through the mount chain and dispatches on its first line into an applet
+  registry — BusyBox argv[0]-dispatch in miniature.
