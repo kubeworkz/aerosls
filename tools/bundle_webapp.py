@@ -9,6 +9,12 @@ Usage:
 The generated file embeds every file under <dist-dir> as a const uint8_t[]
 in .rodata and produces a bundle_find() lookup function used by the kernel's
 HTTP server to serve the Navigator SPA directly from the running OS.
+
+Note: `make bundle` runs the frontend build in ../slsos-sim first. That step
+requires node 20+ (node 18 hits npm/cli#4828 -- "Cannot find native
+binding" for @tailwindcss/oxide -- and the Makefile's `|| true` swallows
+the failure, silently re-bundling a stale dist). This script itself only
+needs python3.
 """
 import os, subprocess, sys
 

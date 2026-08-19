@@ -874,6 +874,29 @@ simi-test: simi-tools
 
 .PHONY: simi-tools simi-test
 
+# ── bundle: regenerate kernel/webapp_bundle.c from ../slsos-sim/dist ──────
+# The committed kernel/webapp_bundle.c is CANONICAL -- CI and the deploy both
+# build the kernel from it, and tests/webapp_bundle_guard_check.sh enforces
+# it. Regenerate only after changing slsos-sim, review the diff, and COMMIT
+# the result; never let a build host regenerate it.
+#
+# ─── Toolchain requirement: node 20+ (node 18 breaks the frontend build) ──
+# `npm run build` inside ../slsos-sim dies on node 18 with the npm/cli#4828
+# optional-dependencies bug:
+#     Error: Cannot find native binding. ... @tailwindcss/oxide ...
+#     https://github.com/npm/cli/issues/4828
+# (npm 9 skips platform-specific native bindings; node 20+/npm 10+ installs
+# them.) Proven on the 2026-08-18 reproducibility check: a fresh slsos-sim
+# clone built fine under node 24 (via nvm) and failed under the system node
+# 18. Use a modern node, e.g.  source ~/.nvm/nvm.sh && nvm use default
+# (upstream workaround, if you must stay on node 18: delete package-lock.json
+# and node_modules, then `npm i`).
+#
+# NOTE the `|| true` below: a frontend build failure is SILENTLY SWALLOWED,
+# so `make bundle` proceeds with whatever ../slsos-sim/dist already happens
+# to exist -- on a node-18 machine this target can quietly produce a STALE
+# bundle. Check the npm output; the dist must be the one you intend to
+# commit.
 bundle:
 	@echo "[BUNDLE] Generating kernel/webapp_bundle.c from slsos-sim/dist..."
 	@cd ../slsos-sim && npm run build --silent 2>/dev/null || true
