@@ -23,8 +23,9 @@
 //!   (line windows: head exits at N lines without draining the input
 //!   — partial-pipe semantics — tail buffers a sliding window to
 //!   EOF), `sort` (buffers the whole input across reads, then emits
-//!   in lexicographic byte order), `true`/`false` — plus
-//!   `register_default_applets`.
+//!   in lexicographic byte order), `seq` (the pure producer:
+//!   integers `FIRST..LAST` by `STEP`, one per line), `true`/`false`
+//!   — plus `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.
 //! - `heap`       — bump allocator over the budget region (v1 reserves it).

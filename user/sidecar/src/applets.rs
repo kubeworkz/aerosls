@@ -35,6 +35,9 @@
 //!   concatenated) across reads, then emits the lines in lexicographic
 //!   byte order; the emit phase parks on a full pipe like `cat` and
 //!   observes `EPIPE` if the reader leaves early (`cat | sort | head`).
+//! - **`seq`** — the pure producer: prints integers `FIRST..LAST` (step
+//!   `STEP`), one per line, filling the 4 KiB pipe and parking, so the
+//!   reader-side applets get a real fast writer (`seq 10000 | head`).
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -392,14 +395,18 @@ pub fn grep<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         ctx.data.extend_from_slice(&buf[..n]);
                         // Extract the complete lines (newline included)
                         // into owned buffers first — the writes below need
-                        // no borrow of ctx.data. The trailing partial line
+                        // no borrow of ctx.data. Each line runs from just
+                        // after the previous newline to this one (a chunk
+                        // can hold several); the trailing partial line
                         // stays in the data for the next read.
                         let mut lines: Vec<Vec<u8>> = Vec::new();
                         let mut consumed = 0;
+                        let mut line_start = 0;
                         for (i, &b) in ctx.data[4..].iter().enumerate() {
                             if b == b'\n' {
-                                lines.push(ctx.data[4..=4 + i].to_vec());
+                                lines.push(ctx.data[4 + line_start..=4 + i].to_vec());
                                 consumed = i + 1;
+                                line_start = i + 1;
                             }
                         }
                         if consumed > 0 {
@@ -447,6 +454,36 @@ fn count_chunk(chunk: &[u8], lines: &mut u32, words: &mut u32, prev_ws: &mut boo
 /// Read a u32 (LE) at `off` in the applet data.
 fn read_u32(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+/// Read a u64 (LE) at `off` in the applet data.
+fn read_u64(data: &[u8], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[off..off + 8]);
+    u64::from_le_bytes(b)
+}
+
+/// Parse `seq`'s arguments: `[LAST]`, `[FIRST LAST]`, or `[FIRST STEP
+/// LAST]` — non-negative integers; the one-arg form starts at 1 and the
+/// two-arg form steps by 1. A missing/wrong arity, an unparsable value,
+/// or a zero STEP (which would never terminate) → `None` (usage error,
+/// exit 2).
+fn parse_seq_args(argv: &[String]) -> Option<(u64, u64, u64)> {
+    let (first, last, step) = match argv.len() {
+        2 => (1u64, argv[1].parse::<u64>().ok()?, 1u64),
+        3 => (argv[1].parse::<u64>().ok()?, argv[2].parse::<u64>().ok()?, 1u64),
+        // `FIRST STEP LAST`: the middle argument is the step.
+        4 => (
+            argv[1].parse::<u64>().ok()?,
+            argv[3].parse::<u64>().ok()?,
+            argv[2].parse::<u64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if step == 0 {
+        return None;
+    }
+    Some((first, last, step))
 }
 
 /// Parse `head`/`tail`'s line count: no `-n` → `(10, 1)` (default, first
@@ -685,13 +722,18 @@ pub fn head<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         ctx.data.extend_from_slice(&buf[..n]);
                         // Extract the complete lines (newline included)
                         // into owned buffers — the writes below need no
-                        // borrow of ctx.data. The trailing partial stays.
+                        // borrow of ctx.data. Each line runs from just
+                        // after the previous newline to this one (a
+                        // chunk can hold several); the trailing partial
+                        // stays in the data.
                         let mut lines: Vec<Vec<u8>> = Vec::new();
                         let mut consumed = 0;
+                        let mut line_start = 0;
                         for (i, &b) in ctx.data[8..].iter().enumerate() {
                             if b == b'\n' {
-                                lines.push(ctx.data[8..=8 + i].to_vec());
+                                lines.push(ctx.data[8 + line_start..=8 + i].to_vec());
                                 consumed = i + 1;
+                                line_start = i + 1;
                             }
                         }
                         if consumed > 0 {
@@ -927,6 +969,87 @@ pub fn sort<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             _ => return Step::Exit(2),
         }
+    }
+}
+
+/// `seq [FIRST [STEP]] LAST`: prints the integers FIRST, FIRST+STEP, ...,
+/// up to LAST, one per line (the one-arg form starts at 1, the two-arg
+/// form steps by 1). It is a pure producer — it never reads — so a
+/// pipeline gets a fast writer that fills the 4 KiB pipe and parks on
+/// `Writable`, waking to `EPIPE` if the reader leaves early
+/// (`seq 10000 | head -n 3`). `FIRST > LAST` prints nothing and exits 0;
+/// an unparsable value or a zero STEP (which would never terminate) exits
+/// 2. v1: non-negative integers only. Data layout: `[phase, i u64 LE,
+/// last u64 LE, step u64 LE, done, pending_len, pending...]` — a line
+/// left by a short pipe write survives the parks, and `done` stops the
+/// loop if advancing past `u64::MAX`.
+pub fn seq<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if ctx.data.is_empty() {
+        let (first, last, step) = match parse_seq_args(ctx.argv()) {
+            Some(x) => x,
+            None => return Step::Exit(2),
+        };
+        ctx.data.push(1); // phase
+        ctx.data.extend_from_slice(&first.to_le_bytes());
+        ctx.data.extend_from_slice(&last.to_le_bytes());
+        ctx.data.extend_from_slice(&step.to_le_bytes());
+        ctx.data.push(0); // done
+        ctx.data.push(0); // pending_len
+    }
+    loop {
+        let i = read_u64(&ctx.data, 1);
+        let last = read_u64(&ctx.data, 9);
+        if ctx.data[25] == 1 || i > last {
+            return Step::Exit(0);
+        }
+        if ctx.data[26] > 0 {
+            // Finish a line left by a short write; advancing happens
+            // only once the whole line is out.
+            let pending = ctx.data[27..].to_vec();
+            let plen = ctx.data[26] as usize;
+            match ctx.write_blocking(1, &pending) {
+                WriteBlock::Data(k) => {
+                    if k == plen {
+                        ctx.data.truncate(27);
+                        ctx.data[26] = 0;
+                        advance_seq(&mut ctx.data);
+                    } else {
+                        ctx.data.drain(27..27 + k);
+                        ctx.data[26] -= k as u8;
+                    }
+                }
+                WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                WriteBlock::Err(_) => return Step::Exit(2),
+            }
+        } else {
+            let text = alloc::format!("{}\n", i);
+            let n = text.len();
+            match ctx.write_blocking(1, text.as_bytes()) {
+                WriteBlock::Data(k) => {
+                    if k == n {
+                        advance_seq(&mut ctx.data);
+                    } else {
+                        // A short write (unreachable for lines ≤ 21 B in
+                        // a 4 KiB pipe, but kept correct): stash the tail.
+                        ctx.data[26] = (n - k) as u8;
+                        ctx.data.extend_from_slice(&text.as_bytes()[k..n]);
+                    }
+                }
+                WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                WriteBlock::Err(_) => return Step::Exit(2),
+            }
+        }
+    }
+}
+
+/// Advance `seq`'s counter by its step; if the addition would overflow
+/// `u64`, set the `done` flag instead so the next loop stops.
+fn advance_seq(data: &mut Vec<u8>) {
+    let i = read_u64(data, 1);
+    let step = read_u64(data, 17);
+    match i.checked_add(step) {
+        Some(next) => data[1..9].copy_from_slice(&next.to_le_bytes()),
+        None => data[25] = 1,
     }
 }
 
@@ -1917,6 +2040,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("head", head);
     pm.register_applet("tail", tail);
     pm.register_applet("sort", sort);
+    pm.register_applet("seq", seq);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -2303,6 +2427,26 @@ mod tests {
         // A lone newline is one empty line; empty input yields none.
         assert_eq!(split_lines(b"\n"), vec![b"\n".to_vec()]);
         assert!(split_lines(b"").is_empty());
+    }
+
+    #[test]
+    fn parse_seq_args_reads_the_range() {
+        use super::parse_seq_args;
+        let av = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The three forms: LAST, FIRST LAST, FIRST STEP LAST.
+        assert_eq!(parse_seq_args(&av(&["seq", "5"])), Some((1, 5, 1)));
+        assert_eq!(parse_seq_args(&av(&["seq", "3", "7"])), Some((3, 7, 1)));
+        assert_eq!(parse_seq_args(&av(&["seq", "2", "2", "10"])), Some((2, 10, 2)));
+        // Zero is a valid start; FIRST > LAST is valid (prints nothing).
+        assert_eq!(parse_seq_args(&av(&["seq", "0", "5"])), Some((0, 5, 1)));
+        assert_eq!(parse_seq_args(&av(&["seq", "9", "5"])), Some((9, 5, 1)));
+        // Errors: wrong arity, unparsable values, zero step.
+        assert_eq!(parse_seq_args(&av(&["seq"])), None);
+        assert_eq!(parse_seq_args(&av(&["seq", "1", "2", "3", "4"])), None);
+        assert_eq!(parse_seq_args(&av(&["seq", "x"])), None);
+        assert_eq!(parse_seq_args(&av(&["seq", "1", "0", "5"])), None);
+        // Negative values are rejected (v1 is non-negative integers).
+        assert_eq!(parse_seq_args(&av(&["seq", "-5"])), None);
     }
 
     #[test]

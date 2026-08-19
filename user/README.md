@@ -68,7 +68,9 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # head exits at N lines without draining the input
                   # (partial-pipe), tail buffers a sliding window to
                   # EOF), sort (buffers the whole input, emits in
-                  # lexicographic byte order), echo, sh (minimal
+                  # lexicographic byte order), seq (the pure producer:
+                  # integers FIRST..LAST by STEP, filling the pipe and
+                  # parking), echo, sh (minimal
                   # interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
@@ -284,12 +286,18 @@ script + the manifest's `image` record) is the sidecar build step; see
   exits without draining, so cat wakes to `EPIPE` and `$?` stays
   0), `head -n 2 /etc/passwd`,  `cat /etc/passwd | tail -n 1`
   and `cat /etc/big.txt | tail -n 2` (the sliding window to
-  EOF), and a sort session — `sort /etc/mixed.txt` orders the
+  EOF),  and a sort session — `sort /etc/mixed.txt` orders the
   four out-of-order file lines, and a three-stage
   `cat /etc/big.txt | sort | head -n 2` proves the multi-read
   accumulation and the sorted emit through a second pipe —
-  through the real driver, asserting the console transcript
-  byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  plus a seq session — the three range forms, `seq 10000 | head -n 3`
+  (seq fills the 4 KiB pipe and parks, head takes three lines and
+  leaves, so seq wakes to `EPIPE`), and `seq 10000 | wc`
+  (all 10000 lines through repeated park/wake cycles) — and a
+  multi-line-chunk pair (`cat /etc/mixed.txt | grep fig` and
+  `| head -n 2`) pinning per-line extraction when a single read
+  holds several lines — through the real driver, asserting the
+  console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.

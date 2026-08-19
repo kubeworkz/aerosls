@@ -163,6 +163,7 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/head", b"head\n", 0o755);
     b.add_file("/bin/tail", b"tail\n", 0o755);
     b.add_file("/bin/sort", b"sort\n", 0o755);
+    b.add_file("/bin/seq", b"seq\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
     // A second bin dir so PATH-driven lookup has somewhere to search:
@@ -518,6 +519,14 @@ fn boot_runs_an_interactive_shell() {
         "head exited early on the count (cat woke to EPIPE, $? stayed 0) and tail buffered the window to EOF"
     );
 
+    // A multi-line chunk exercises the per-line extraction (each line
+    // runs from just after the previous newline to this one): mixed.txt's
+    // 22 bytes arrive as one chunk holding three complete lines, so grep
+    // must print exactly `fig` and head must stop at exactly two.
+    console.console_io().push_input(b"cat /etc/mixed.txt | grep fig\n");
+    booted.run(100);
+    console.console_io().push_input(b"cat /etc/mixed.txt | head -n 2\n");
+    booted.run(100);
     // sort buffers everything to EOF, then emits in lexicographic order:
     // the file form sorts the four out-of-order lines, and a three-stage
     // cat | sort | head pipeline proves the accumulation across reads and
@@ -529,8 +538,30 @@ fn boot_runs_an_interactive_shell() {
     booted.run(100);
     assert_eq!(
         console.console_io().output(),
-        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ ",
-        "sort ordered the file lines and the three-stage pipeline's buffered output"
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ ",
+        "grep and head handled multi-line chunks, sort ordered the file lines and the three-stage pipeline's buffered output"
+    );
+
+    // seq is the pure producer: the three range forms print straight to
+    // the console, `seq 10000 | head -n 3` fills the 4 KiB pipe and parks
+    // before head takes three lines and leaves (seq's next write wakes to
+    // EPIPE, `$?` is head's 0), and `seq 10000 | wc` proves the full
+    // stream — every number reaches wc through repeated park/wake cycles
+    // and the count emits only at seq's EOF.
+    console.console_io().push_input(b"seq 5\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 3 5\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 2 2 8\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 10000 | head -n 3\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 10000 | wc\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ ",
+        "seq produced the three range forms, parked against head, and streamed all 10000 lines to wc"
     );
 
     client.kill_driver(0);
