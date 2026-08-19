@@ -243,6 +243,24 @@ fn boot_runs_an_interactive_shell() {
         "the shell's < redirect fed cat from the rootfs"
     );
 
+    // A pasted batch: two lines arrive in one read. The shell buffers the
+    // whole chunk and runs them in order — one prompt around the batch,
+    // nothing dropped.
+    console.console_io().push_input(b"echo one\necho two\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ ",
+        "the batch ran line by line with a single prompt around it"
+    );
+    assert_eq!(
+        booted.proc.state(1),
+        Some(aerosls_procmgr::TaskState::Blocked(
+            aerosls_procmgr::BlockReason::Readable(0)
+        )),
+        "the shell parked after draining the batch"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }

@@ -257,12 +257,16 @@ pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// `sh`: the minimal interactive shell. Data layout: `data[0]` = phase,
-/// `data[1]` = last exit status (`$?`). Phase 0 prints the prompt, phase 1
-/// accumulates console input until a newline (parking on an empty console
-/// via `read_blocking`), phase 2 runs the parsed command, phase 3 reaps
-/// the pipeline's children in order. A pipeline child's fork snapshot
-/// carries `[2, status, stage, n_stages, pipes..., stage_text,
-/// FORK_MARKER]` — see `sh_child`.
+/// `data[1]` = last exit status (`$?`), `data[2..]` = the input batch
+/// queue (unconsumed console bytes, possibly several lines). Phase 0
+/// prints the prompt, phase 1 consumes a complete buffered line or reads
+/// more console input (parking on an empty console via `read_blocking`),
+/// phase 2 runs the first buffered line, phase 3 reaps the pipeline's
+/// children in order — the queued remainder survives all of it, so a
+/// multi-line read runs line by line with a single prompt around the
+/// batch. A pipeline child's fork snapshot carries `[2, status, stage,
+/// n_stages, nfd, pipes..., in_len, in..., out_len, out..., argv_len,
+/// argv..., queue, FORK_MARKER]` — see `sh_child`.
 pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     if ctx.data.is_empty() {
@@ -281,9 +285,22 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             Step::Yield
         }
         1 => {
+            // A buffered complete line runs without touching the console.
+            if ctx.data[2..].contains(&b'\n') {
+                ctx.data[0] = 2;
+                return Step::Yield;
+            }
             let mut buf = [0u8; 16];
             match ctx.read_blocking(0, &mut buf) {
-                ReadBlock::Data(0) => Step::Exit(0), // console closed: EOF
+                // EOF: run any partial buffered line, then exit.
+                ReadBlock::Data(0) => {
+                    if ctx.data.len() > 2 {
+                        ctx.data[0] = 2;
+                        Step::Yield
+                    } else {
+                        Step::Exit(0)
+                    }
+                }
                 ReadBlock::Data(n) => {
                     ctx.data.extend_from_slice(&buf[..n]);
                     if ctx.data[2..].contains(&b'\n') {
@@ -301,24 +318,31 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
-/// Phase 2: parse the accumulated line, fork one child per pipeline stage,
-/// close the shell's own pipe copies (or the readers never see EOF), and
-/// wait for the first child.
+/// Phase 2: run the first complete line of the buffered batch. The queued
+/// remainder is appended after every fork snapshot and the wait state, so
+/// multi-line input runs line by line and nothing is dropped. See
+/// `sh_child` for the fork-snapshot layout.
 fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     let status = ctx.data[1];
-    let nl = match ctx.data[2..].iter().position(|&b| b == b'\n') {
-        Some(i) => i,
-        None => return Step::Exit(2), // phase 2 without a newline: impossible
+    // The first complete line (or the whole buffer at EOF) and the rest.
+    let nl = ctx.data[2..].iter().position(|&b| b == b'\n');
+    let (line, remainder) = match nl {
+        Some(i) => (ctx.data[2..2 + i].to_vec(), ctx.data[2 + i + 1..].to_vec()),
+        None => (ctx.data[2..].to_vec(), Vec::new()),
     };
-    let line = match core::str::from_utf8(&ctx.data[2..2 + nl]) {
+    let line = match core::str::from_utf8(&line) {
         Ok(s) => s.trim(),
-        Err(_) => return Step::Exit(2),
+        Err(_) => "", // garbage: drop the line like a comment
     };
     let stages = parse_line(line, status);
     if stages.is_empty() {
-        ctx.data.truncate(2);
-        ctx.data[0] = 0; // blank line: straight back to the prompt
+        // Blank or comment line: drop it; re-prompt only if the batch is
+        // drained, otherwise continue straight to the next buffered line.
+        ctx.data.clear();
+        ctx.data.push(if remainder.is_empty() { 0 } else { 1 });
+        ctx.data.push(status);
+        ctx.data.extend_from_slice(&remainder);
         return Step::Yield;
     }
     // Inter-stage pipes; the fds land above stdio (0,1,2 = console).
@@ -333,8 +357,9 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
     let nfd = (stages.len() - 1) * 2;
     // Fork one child per stage; each snapshot carries its stage index, the
-    // pipe fds, the `<` / `>` redirect targets (length-prefixed), and its
-    // argv text (plus the fork marker) — see `sh_child`.
+    // pipe fds, the `<` / `>` redirect targets (length-prefixed), the argv
+    // (length-prefixed, so the child stops before the queue), and the
+    // queued remainder — see `sh_child`.
     let mut children: Vec<u32> = Vec::new();
     for (s, stage) in stages.iter().enumerate() {
         ctx.data.clear();
@@ -360,7 +385,10 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             None => ctx.data.push(0),
         }
-        ctx.data.extend_from_slice(stage.argv.join(" ").as_bytes());
+        let argv_text = stage.argv.join(" ");
+        ctx.data.push(argv_text.len() as u8);
+        ctx.data.extend_from_slice(argv_text.as_bytes());
+        ctx.data.extend_from_slice(&remainder); // the queue survives forks
         match ctx.fork() {
             Ok(c) => children.push(c),
             Err(_) => return Step::Exit(2),
@@ -371,7 +399,7 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     for fd in &pipes {
         ctx.vfs().close(task, *fd).ok();
     }
-    // Wait state: [3, status, n, reaped, children...].
+    // Wait state: [3, status, n, reaped, children..., remainder].
     ctx.data.clear();
     ctx.data.push(3);
     ctx.data.push(status);
@@ -380,6 +408,7 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     for c in &children {
         ctx.data.push(*c as u8);
     }
+    ctx.data.extend_from_slice(&remainder);
     let c = children[0];
     match ctx.wait(c) {
         WaitOutcome::Reaped(code) => {
@@ -395,13 +424,19 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// Phase 3: reap the pipeline's children in order; the last stage's status
-/// becomes `$?`. When all are reaped, back to the prompt.
+/// becomes `$?`. When all are reaped, back to the prompt if the batch is
+/// drained, else straight on to the next buffered line (no new prompt).
 fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let n = ctx.data[2] as usize;
     let reaped = ctx.data[3] as usize;
     if reaped >= n {
-        ctx.data.truncate(2);
-        ctx.data[0] = 0;
+        // The queued remainder survives at data[4+n..].
+        let queue = ctx.data[4 + n..].to_vec();
+        let status = ctx.data[1];
+        ctx.data.clear();
+        ctx.data.push(if queue.is_empty() { 0 } else { 1 });
+        ctx.data.push(status);
+        ctx.data.extend_from_slice(&queue);
         return Step::Yield;
     }
     let c = ctx.data[4 + reaped] as u32;
@@ -422,12 +457,13 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
-/// nfd, pipes..., in_len, in_path..., out_len, out_path..., argv_text,
-/// FORK_MARKER]`. Wire stdin/stdout to the pipe ends (or the console for
-/// the first/last stage), apply the stage's `<` / `>` redirects (which
-/// override the pipeline connection at fd 0 / fd 1, like POSIX), drop
-/// every pipe fd, and exec — on any failure the child exits 127, which
-/// the shell reaps.
+/// nfd, pipes..., in_len, in_path..., out_len, out_path..., argv_len,
+/// argv..., queue, FORK_MARKER]` — the argv is length-prefixed so the
+/// child stops before the shell's queued input batch. Wire stdin/stdout
+/// to the pipe ends (or the console for the first/last stage), apply the
+/// stage's `<` / `>` redirects (which override the pipeline connection at
+/// fd 0 / fd 1, like POSIX), drop every pipe fd, and exec — on any
+/// failure the child exits 127, which the shell reaps.
 fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     // The fork marker is the last byte.
@@ -457,7 +493,8 @@ fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         None
     };
     p += 1 + out_len;
-    let text = match core::str::from_utf8(&d[p..]) {
+    let argv_len = d[p] as usize;
+    let text = match core::str::from_utf8(&d[p + 1..p + 1 + argv_len]) {
         Ok(s) => s,
         Err(_) => return Step::Exit(127),
     };
