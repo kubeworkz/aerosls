@@ -21,7 +21,9 @@
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
 //!   commands from fd 0 with a blocking read (parking on an empty
 //!   console), forks one child per pipeline stage, waits, and tracks the
-//!   last exit status as `$?` (expandable in the next command).
+//!   last exit status as `$?` (expandable in the next command). `<` /
+//!   `>` redirect stdin/stdout per stage (the redirect overrides the
+//!   pipeline connection, like POSIX).
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
@@ -329,8 +331,10 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         pipes.push(r);
         pipes.push(w);
     }
+    let nfd = (stages.len() - 1) * 2;
     // Fork one child per stage; each snapshot carries its stage index, the
-    // pipe fds, and its token text (plus the fork marker).
+    // pipe fds, the `<` / `>` redirect targets (length-prefixed), and its
+    // argv text (plus the fork marker) — see `sh_child`.
     let mut children: Vec<u32> = Vec::new();
     for (s, stage) in stages.iter().enumerate() {
         ctx.data.clear();
@@ -338,10 +342,25 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data.push(status);
         ctx.data.push(s as u8);
         ctx.data.push(stages.len() as u8);
+        ctx.data.push(nfd as u8);
         for fd in &pipes {
             ctx.data.push(*fd as u8);
         }
-        ctx.data.extend_from_slice(stage.join(" ").as_bytes());
+        match &stage.in_redir {
+            Some(p) => {
+                ctx.data.push(p.len() as u8);
+                ctx.data.extend_from_slice(p.as_bytes());
+            }
+            None => ctx.data.push(0),
+        }
+        match &stage.out_redir {
+            Some(p) => {
+                ctx.data.push(p.len() as u8);
+                ctx.data.extend_from_slice(p.as_bytes());
+            }
+            None => ctx.data.push(0),
+        }
+        ctx.data.extend_from_slice(stage.argv.join(" ").as_bytes());
         match ctx.fork() {
             Ok(c) => children.push(c),
             Err(_) => return Step::Exit(2),
@@ -403,18 +422,42 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
-/// pipes..., stage_text, FORK_MARKER]`. Wire stdin/stdout to the pipe ends
-/// (or the console for the first/last stage), drop every pipe fd, and exec
-/// — on exec failure the child exits 127, which the shell reaps.
+/// nfd, pipes..., in_len, in_path..., out_len, out_path..., argv_text,
+/// FORK_MARKER]`. Wire stdin/stdout to the pipe ends (or the console for
+/// the first/last stage), apply the stage's `<` / `>` redirects (which
+/// override the pipeline connection at fd 0 / fd 1, like POSIX), drop
+/// every pipe fd, and exec — on any failure the child exits 127, which
+/// the shell reaps.
 fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     // The fork marker is the last byte.
     let d = &ctx.data[..ctx.data.len() - 1];
     let stage = d[2] as usize;
     let n = d[3] as usize;
-    let nfd = (n - 1) * 2;
-    let pipes: Vec<u32> = d[4..4 + nfd].iter().map(|&b| b as u32).collect();
-    let text = match core::str::from_utf8(&d[4 + nfd..]) {
+    let nfd = d[4] as usize;
+    let pipes: Vec<u32> = d[5..5 + nfd].iter().map(|&b| b as u32).collect();
+    let mut p = 5 + nfd;
+    let in_len = d[p] as usize;
+    let in_redir = if in_len > 0 {
+        match core::str::from_utf8(&d[p + 1..p + 1 + in_len]) {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return Step::Exit(127),
+        }
+    } else {
+        None
+    };
+    p += 1 + in_len;
+    let out_len = d[p] as usize;
+    let out_redir = if out_len > 0 {
+        match core::str::from_utf8(&d[p + 1..p + 1 + out_len]) {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return Step::Exit(127),
+        }
+    } else {
+        None
+    };
+    p += 1 + out_len;
+    let text = match core::str::from_utf8(&d[p..]) {
         Ok(s) => s,
         Err(_) => return Step::Exit(127),
     };
@@ -426,6 +469,27 @@ fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let out_fd = if stage == n - 1 { 1 } else { pipes[stage * 2 + 1] };
     if ctx.vfs().dup2(task, in_fd, 0).is_err() || ctx.vfs().dup2(task, out_fd, 1).is_err() {
         return Step::Exit(127);
+    }
+    // Redirects override the pipeline connection at fd 0 / fd 1.
+    if let Some(path) = &in_redir {
+        let fd = match ctx.vfs().open(task, path, O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(_) => return Step::Exit(127),
+        };
+        if ctx.vfs().dup2(task, fd, 0).is_err() {
+            return Step::Exit(127);
+        }
+        ctx.vfs().close(task, fd).ok();
+    }
+    if let Some(path) = &out_redir {
+        let fd = match ctx.vfs().open(task, path, O_CREAT | O_WRONLY | O_TRUNC, 0o644) {
+            Ok(fd) => fd,
+            Err(_) => return Step::Exit(127),
+        };
+        if ctx.vfs().dup2(task, fd, 1).is_err() {
+            return Step::Exit(127);
+        }
+        ctx.vfs().close(task, fd).ok();
     }
     for fd in &pipes {
         ctx.vfs().close(task, *fd).ok();
@@ -450,27 +514,52 @@ fn resolve_path(tok: &str) -> String {
     }
 }
 
+/// One pipeline stage: the command's argv plus optional `<` stdin / `>`
+/// stdout redirect targets (v1: truncating `>`, no `>>`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stage {
+    pub argv: Vec<String>,
+    pub in_redir: Option<String>,
+    pub out_redir: Option<String>,
+}
+
 /// Parse one command line into pipeline stages. Tokens are
-/// whitespace-split; a lone `|` token separates stages; a token equal to
-/// `$?` expands to the last exit status. Empty stages are skipped (a stray
-/// `|` cannot produce a stage with no command). Returns [] for a blank
-/// line. v1: no quoting, no redirection, spaces required around `|`.
-fn parse_line(line: &str, last_status: u8) -> Vec<Vec<String>> {
-    let mut stages: Vec<Vec<String>> = Vec::new();
-    let mut cur: Vec<String> = Vec::new();
-    for t in line.split_whitespace() {
-        if t == "|" {
-            if !cur.is_empty() {
-                stages.push(core::mem::take(&mut cur));
+/// whitespace-split; a lone `|` token separates stages; `>` / `<` mark
+/// the next token as the stdout / stdin redirect target (the target is
+/// not part of argv; a trailing redirect with no target records an empty
+/// path, which the stage child fails to open → exit 127). `$?` expands to
+/// the last exit status. Empty stages are skipped (a stray `|` cannot
+/// produce a stage with no command). Returns [] for a blank line. v1: no
+/// quoting, no `>>`, spaces required around `|`.
+fn parse_line(line: &str, last_status: u8) -> Vec<Stage> {
+    let mut stages: Vec<Stage> = Vec::new();
+    let mut argv: Vec<String> = Vec::new();
+    let mut in_redir: Option<String> = None;
+    let mut out_redir: Option<String> = None;
+    let mut tokens = line.split_whitespace();
+    while let Some(t) = tokens.next() {
+        match t {
+            "|" => {
+                if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() {
+                    stages.push(Stage {
+                        argv: core::mem::take(&mut argv),
+                        in_redir: in_redir.take(),
+                        out_redir: out_redir.take(),
+                    });
+                }
             }
-        } else if t == "$?" {
-            cur.push(last_status.to_string());
-        } else {
-            cur.push(t.to_string());
+            ">" => out_redir = Some(tokens.next().unwrap_or("").to_string()),
+            "<" => in_redir = Some(tokens.next().unwrap_or("").to_string()),
+            "$?" => argv.push(last_status.to_string()),
+            _ => argv.push(t.to_string()),
         }
     }
-    if !cur.is_empty() {
-        stages.push(cur);
+    if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() {
+        stages.push(Stage {
+            argv,
+            in_redir,
+            out_redir,
+        });
     }
     stages
 }
@@ -487,20 +576,21 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
 
 #[cfg(test)]
 mod tests {
-    use super::parse_line;
+    use super::{parse_line, Stage};
+
+    fn st(argv: &[&str]) -> Stage {
+        Stage {
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            in_redir: None,
+            out_redir: None,
+        }
+    }
 
     #[test]
     fn parse_line_splits_pipeline_stages() {
         assert_eq!(
             parse_line("echo hello | cat", 0),
-            vec![
-                vec!["echo".to_string(), "hello".to_string()],
-                vec!["cat".to_string()]
-            ]
-        );
-        assert_eq!(
-            parse_line("cat < nothing", 0),
-            vec![vec!["cat".to_string(), "<".to_string(), "nothing".to_string()]]
+            vec![st(&["echo", "hello"]), st(&["cat"])]
         );
     }
 
@@ -508,21 +598,65 @@ mod tests {
     fn parse_line_expands_last_status() {
         assert_eq!(
             parse_line("echo $?", 7),
-            vec![vec!["echo".to_string(), "7".to_string()]]
+            vec![Stage {
+                argv: vec!["echo".to_string(), "7".to_string()],
+                in_redir: None,
+                out_redir: None,
+            }]
+        );
+        assert_eq!(parse_line("$? | cat", 3), vec![st(&["3"]), st(&["cat"])]);
+    }
+
+    #[test]
+    fn parse_line_extracts_redirects() {
+        // `>` / `<` targets leave argv; they become the stage's redirects.
+        assert_eq!(
+            parse_line("echo hi > /tmp/x", 0),
+            vec![Stage {
+                argv: vec!["echo".to_string(), "hi".to_string()],
+                in_redir: None,
+                out_redir: Some("/tmp/x".to_string()),
+            }]
         );
         assert_eq!(
-            parse_line("$? | cat", 3),
+            parse_line("cat < /etc/passwd | grep root > /tmp/out", 0),
             vec![
-                vec!["3".to_string()],
-                vec!["cat".to_string()]
+                Stage {
+                    argv: vec!["cat".to_string()],
+                    in_redir: Some("/etc/passwd".to_string()),
+                    out_redir: None,
+                },
+                Stage {
+                    argv: vec!["grep".to_string(), "root".to_string()],
+                    in_redir: None,
+                    out_redir: Some("/tmp/out".to_string()),
+                },
             ]
+        );
+        // Last redirect of a kind wins; a trailing redirect records an
+        // empty path (the stage child fails to open it → exit 127).
+        assert_eq!(
+            parse_line("echo a > /tmp/x > /tmp/y", 0),
+            vec![Stage {
+                argv: vec!["echo".to_string(), "a".to_string()],
+                in_redir: None,
+                out_redir: Some("/tmp/y".to_string()),
+            }]
+        );
+        assert_eq!(
+            parse_line("echo hi >", 0),
+            vec![Stage {
+                argv: vec!["echo".to_string(), "hi".to_string()],
+                in_redir: None,
+                out_redir: Some(String::new()),
+            }]
         );
     }
 
     #[test]
     fn parse_line_blank_and_stray_pipes() {
-        assert_eq!(parse_line("", 0), Vec::<Vec<String>>::new());
-        assert_eq!(parse_line("   \t ", 3), Vec::<Vec<String>>::new());
-        assert_eq!(parse_line("| true |", 0), vec![vec!["true".to_string()]]);
+        assert_eq!(parse_line("", 0), Vec::<Stage>::new());
+        assert_eq!(parse_line("   \t ", 3), Vec::<Stage>::new());
+        assert_eq!(parse_line("| true |", 0), vec![st(&["true"])]);
     }
 }

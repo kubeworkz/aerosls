@@ -218,6 +218,31 @@ fn boot_runs_an_interactive_shell() {
         "the shell parked again awaiting the next command"
     );
 
+    // `>` redirect: echo's stdout lands in /tmp/saved, not on the console
+    // (the transcript only gains the prompt).
+    console.console_io().push_input(b"echo saved > /tmp/saved\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ ",
+        "the redirect kept the payload off the console"
+    );
+    assert_eq!(
+        read_all(&mut booted.proc.vfs, "/tmp/saved"),
+        b"saved\n",
+        "the shell's > redirect wrote the ramfs file"
+    );
+
+    // `<` redirect: cat reads the rootfs file from stdin (fd 0) and the
+    // passwd line reaches the console through the shell.
+    console.console_io().push_input(b"cat < /etc/passwd\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ ",
+        "the shell's < redirect fed cat from the rootfs"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }

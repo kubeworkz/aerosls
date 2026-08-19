@@ -226,10 +226,13 @@ script + the manifest's `image` record) is the sidecar build step; see
   end. On top of init sits `applets::sh`, a minimal interactive shell:
   it prompts on the console, parks on empty input via the blocking-read
   machinery, forks one child per pipeline stage (resolving bare command
-  names through `/bin`, like BusyBox), waits, and tracks the last exit
-  status as `$?` — the boot test drives a full `echo hello | cat`
-  pipeline and a `false` → `echo $?` sequence through the real driver,
-  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  names through `/bin`, like BusyBox), applies per-stage `<` / `>`
+  redirects (which override the pipeline connection at fd 0/1, like
+  POSIX), waits, and tracks the last exit status as `$?` — the boot test
+  drives a full `echo hello | cat` pipeline, a `false` → `echo $?`
+  sequence, an `echo saved > /tmp/saved` file write, and a
+  `cat < /etc/passwd` read through the real driver, asserting the
+  console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
