@@ -31,6 +31,10 @@
 //!   semantics — a still-writing child's next write fails `EPIPE` once
 //!   head's fd table drops), while `tail -n N` buffers a sliding window
 //!   to EOF (parking like `wc`) and prints the last N lines.
+//! - **`sort`** — buffers the whole input (stdin or named files
+//!   concatenated) across reads, then emits the lines in lexicographic
+//!   byte order; the emit phase parks on a full pipe like `cat` and
+//!   observes `EPIPE` if the reader leaves early (`cat | sort | head`).
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -493,6 +497,34 @@ fn drop_lines(buf: &[u8], k: u32) -> &[u8] {
     &buf[skip..]
 }
 
+/// Split `raw` into lines, each kept with its trailing newline; a final
+/// unterminated fragment (input not ending in `\n`) is a line without
+/// one. An empty input yields no lines.
+fn split_lines(raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut cur = Vec::new();
+    for &b in raw {
+        cur.push(b);
+        if b == b'\n' {
+            lines.push(core::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur); // unterminated final line
+    }
+    lines
+}
+
+/// The sort key of a line: its bytes minus a single trailing newline (the
+/// newline is a line terminator, not part of the key).
+fn line_key(line: &[u8]) -> &[u8] {
+    if line.ends_with(b"\n") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    }
+}
+
 /// `wc`: counts lines, words and bytes of its input — stdin, or the
 /// named files in order. Output is `{:>7}`-aligned, one line per source
 /// with the filename for files (v1: no total line). Exits 0 on success,
@@ -785,6 +817,112 @@ pub fn tail<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         return Step::Blocked(BlockReason::Readable(fd));
                     }
                     ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
+/// `sort [file...]`: reads its input to EOF — stdin, or the named files
+/// concatenated (GNU semantics), buffering every line across reads — then
+/// emits the lines in lexicographic byte order (the C-locale order: the
+/// newline is a terminator, not part of the key; a final unterminated
+/// line is emitted as stored). Reads park on an empty pipe like `wc`;
+/// the emit phase writes with `write_blocking`, so a full output pipe
+/// parks instead of failing — and if the reader leaves early (e.g. a
+/// downstream `head`), the retry observes `EPIPE` and sort exits 2.
+/// v1: no options (a leading `-` is treated as a file name) and the
+/// whole input is buffered in the applet data (the pipeline tests feed
+/// it a few KiB). Data layout: read phases `[phase, file_idx, fd,
+/// files, raw...]`; the sort phase rebuilds it to `[3, off u32 LE,
+/// count u32 LE, sorted...]` where `off` survives blocked writes.
+pub fn sort<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        ctx.data.extend_from_slice(&[0, 0, 0, 1]); // phase, file_idx, fd, files
+    }
+    loop {
+        match ctx.data[0] {
+            // Choose the next source: stdin when no files were given,
+            // otherwise the file at file_idx.
+            0 => {
+                let files = ctx.data[3] as usize;
+                let src = if ctx.data[1] == 0 && ctx.argv().len() <= files {
+                    0
+                } else {
+                    let path = match ctx.argv().get(files + ctx.data[1] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(2),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => return Step::Exit(2),
+                    }
+                };
+                ctx.data[0] = 1;
+                ctx.data[2] = src as u8;
+            }
+            // Read chunks into the raw buffer until EOF.
+            1 => {
+                let fd = ctx.data[2] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(fd, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        if fd != 0 {
+                            ctx.vfs().close(task, fd).ok();
+                        }
+                        ctx.data[1] += 1; // next source index
+                        ctx.data[2] = 0;
+                        let files = ctx.data[3] as usize;
+                        if ctx.argv().len() > files
+                            && ctx.argv().get(files + ctx.data[1] as usize).is_some()
+                        {
+                            ctx.data[0] = 0; // choose the next file
+                        } else {
+                            ctx.data[0] = 2; // all sources read: sort
+                        }
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                    }
+                    ReadBlock::WouldBlock => {
+                        return Step::Blocked(BlockReason::Readable(fd));
+                    }
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            // Sort: split the accumulated raw buffer into lines, sort
+            // them, and rebuild the data as the sorted output with an
+            // emit cursor (`off`).
+            2 => {
+                let raw = ctx.data[4..].to_vec();
+                let mut lines = split_lines(&raw);
+                lines.sort_by(|a, b| line_key(a).cmp(line_key(b)));
+                ctx.data.clear();
+                ctx.data.push(3); // phase: emit
+                ctx.data.extend_from_slice(&0u32.to_le_bytes()); // off
+                ctx.data.extend_from_slice(&(lines.len() as u32).to_le_bytes()); // count
+                for line in &lines {
+                    ctx.data.extend_from_slice(line);
+                }
+            }
+            // Emit the sorted text, parking on a full output pipe.
+            3 => {
+                let off = read_u32(&ctx.data, 1) as usize;
+                let count = read_u32(&ctx.data, 5);
+                if count == 0 || off >= ctx.data.len() - 9 {
+                    return Step::Exit(0);
+                }
+                // The copy keeps ctx.data unborrowed across the write.
+                let pending = ctx.data[9 + off..].to_vec();
+                match ctx.write_blocking(1, &pending) {
+                    WriteBlock::Data(k) => {
+                        ctx.data[1..5]
+                            .copy_from_slice(&((off + k) as u32).to_le_bytes());
+                    }
+                    WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                    WriteBlock::Err(_) => return Step::Exit(2),
                 }
             }
             _ => return Step::Exit(2),
@@ -1778,6 +1916,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("wc", wc);
     pm.register_applet("head", head);
     pm.register_applet("tail", tail);
+    pm.register_applet("sort", sort);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -2153,6 +2292,43 @@ mod tests {
         assert_eq!(count_lines(b"ab"), 0);
         assert_eq!(count_lines(b"a\nb\n"), 2);
         assert_eq!(count_lines(b"a\nb"), 1); // trailing partial is not a line
+    }
+
+    #[test]
+    fn split_lines_keeps_terminators_and_the_final_fragment() {
+        use super::split_lines;
+        assert_eq!(split_lines(b"a\nb\n"), vec![b"a\n".to_vec(), b"b\n".to_vec()]);
+        // An unterminated final fragment is a line without a newline.
+        assert_eq!(split_lines(b"a\nb"), vec![b"a\n".to_vec(), b"b".to_vec()]);
+        // A lone newline is one empty line; empty input yields none.
+        assert_eq!(split_lines(b"\n"), vec![b"\n".to_vec()]);
+        assert!(split_lines(b"").is_empty());
+    }
+
+    #[test]
+    fn sort_orders_lines_lexicographically() {
+        use super::{line_key, split_lines};
+        let mut lines = split_lines(b"pear\napple\nfig\ndate\n");
+        lines.sort_by(|a, b| line_key(a).cmp(line_key(b)));
+        let out: Vec<Vec<u8>> = vec![b"apple\n".to_vec(), b"date\n".to_vec(), b"fig\n".to_vec(), b"pear\n".to_vec()];
+        assert_eq!(lines, out);
+        // Byte (C-locale) order, not numeric: "a10" sorts before "a2".
+        let mut lines = split_lines(b"a2\na10\n");
+        lines.sort_by(|a, b| line_key(a).cmp(line_key(b)));
+        assert_eq!(lines, vec![b"a10\n".to_vec(), b"a2\n".to_vec()]);
+        // Empty lines sort first; the unterminated final line sorts by
+        // its content (the key strips the terminator).
+        let mut lines = split_lines(b"z\n\nb\na");
+        lines.sort_by(|a, b| line_key(a).cmp(line_key(b)));
+        assert_eq!(
+            lines,
+            vec![
+                b"\n".to_vec(),
+                b"a".to_vec(),
+                b"b\n".to_vec(),
+                b"z\n".to_vec()
+            ]
+        );
     }
 
     #[test]

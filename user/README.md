@@ -67,7 +67,8 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # words / bytes counts), head/tail (line windows —
                   # head exits at N lines without draining the input
                   # (partial-pipe), tail buffers a sliding window to
-                  # EOF), echo, sh (minimal
+                  # EOF), sort (buffers the whole input, emits in
+                  # lexicographic byte order), echo, sh (minimal
                   # interactive shell — console
                   # commands, | pipelines, $? last-exit-status,
                   # '...'/"..." quoting, backslash escapes, $PATH/$HOME
@@ -281,9 +282,13 @@ script + the manifest's `image` record) is the sidecar build step; see
   head/tail session — `cat /etc/big.txt | head -n 1` (a 500-line,
   >4 KiB file: cat parks on the full pipe, head prints line 1 and
   exits without draining, so cat wakes to `EPIPE` and `$?` stays
-  0), `head -n 2 /etc/passwd`, `cat /etc/passwd | tail -n 1`
+  0), `head -n 2 /etc/passwd`,  `cat /etc/passwd | tail -n 1`
   and `cat /etc/big.txt | tail -n 2` (the sliding window to
-  EOF) — through the real driver, asserting the console transcript
+  EOF), and a sort session — `sort /etc/mixed.txt` orders the
+  four out-of-order file lines, and a three-stage
+  `cat /etc/big.txt | sort | head -n 2` proves the multi-read
+  accumulation and the sorted emit through a second pipe —
+  through the real driver, asserting the console transcript
   byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
