@@ -11,7 +11,24 @@ use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
 use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
-use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome};
+use aerosls_procmgr::{
+    is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome,
+    WakeEvent, WriteBlock,
+};
+
+/// Assert the wake trace records a task's park and its matching wake, in
+/// that order — the blocked-task liveness contract (a park without a
+/// later wake for the same reason would be a wedged task).
+fn assert_park_wake(trace: &[WakeEvent], task: u32, reason: BlockReason) {
+    let park = trace.iter().position(|e| *e == WakeEvent::Parked(task, reason));
+    let wake = trace.iter().position(|e| *e == WakeEvent::Woken(task, reason));
+    assert!(park.is_some(), "task {task} never parked on {reason:?}: {trace:?}");
+    assert!(wake.is_some(), "task {task} never woke from {reason:?}: {trace:?}");
+    assert!(
+        park.unwrap() < wake.unwrap(),
+        "wake precedes park for task {task}: {trace:?}"
+    );
+}
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -548,6 +565,159 @@ fn cat_grep_pipeline_through_the_proc_manager() {
     // Both pipeline stages were reaped; nothing left in the run queue.
     assert_eq!(p.state(1), None);
     assert_eq!(p.state(2), None);
+    // The shell's wait for the first stage is traced: it parked on
+    // WaitingChild(cat) and cat's exit woke it. (Grep itself never parks
+    // in this interleaving — cat's 16-byte chunks always refill the pipe
+    // before grep's round-robin turn, so its reads never hit EAGAIN; the
+    // blocking-shell test below covers the read-park end to end.)
+    assert_park_wake(&p.wake_trace, 0, BlockReason::WaitingChild(1));
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// A producer/consumer through a 4 KiB pipe with 8 KiB of data: the
+/// producer (init) reads /tmp/src in 4 KiB chunks and `write_blocking`s
+/// them into the pipe — parking when it fills; the consumer (the fork
+/// child) yields a few turns, then `read_blocking`s the pipe into
+/// /tmp/out, getting EOF once the producer exits. Exit 0 both ways; every
+/// byte must arrive in order.
+fn big_pipe_owner(ctx: &mut Ctx<FC, FA>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // stdio = console (fds 0,1,2); /tmp/src at 3; pipe at 4,5.
+        for _ in 0..3 {
+            ctx.vfs().open(task, "/dev/console", O_RDWR, 0).unwrap();
+        }
+        let src = ctx.vfs().open(task, "/tmp/src", O_RDONLY, 0).unwrap();
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1); // phase
+        ctx.data.push(src as u8);
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        return Step::Yield;
+    }
+    let src = ctx.data[1] as u32;
+    let r = ctx.data[2] as u32;
+    let w = ctx.data[3] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            ctx.fork().unwrap();
+            // Producer keeps only its write end (and the source file).
+            ctx.vfs().close(task, r).unwrap();
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (1, true) => {
+            // Consumer: drop its write end (else the producer's exit never
+            // becomes EOF), open /tmp/out, and arm a yield counter so the
+            // producer can fill the pipe and provably park first.
+            ctx.vfs().close(task, w).unwrap();
+            let out = ctx
+                .vfs()
+                .open(task, "/tmp/out", O_CREAT | O_APPEND | O_WRONLY, 0o644)
+                .unwrap();
+            ctx.data.push(out as u8); // data[4]
+            ctx.data.push(0); // data[5] = yield counter
+            ctx.data[0] = 3;
+            Step::Yield
+        }
+        (2, _) => {
+            // Producer: flush a partial-write remainder, else read src and
+            // push it through the pipe.
+            if ctx.data.len() > 4 {
+                let rem: Vec<u8> = ctx.data[4..].to_vec();
+                match ctx.write_blocking(w, &rem) {
+                    WriteBlock::Data(m) => {
+                        // Drop the bytes that made it into the pipe; keep
+                        // the unwritten tail for the next flush.
+                        ctx.data.drain(4..4 + m);
+                        Step::Yield
+                    }
+                    WriteBlock::WouldBlock => Step::Blocked(BlockReason::Writable(w)),
+                    WriteBlock::Err(_) => Step::Exit(6),
+                }
+            } else {
+                let mut buf = [0u8; 4096];
+                match ctx.vfs().read(task, src, &mut buf) {
+                    Ok(0) => {
+                        ctx.vfs().close(task, src).unwrap();
+                        Step::Exit(0)
+                    }
+                    Ok(n) => match ctx.write_blocking(w, &buf[..n]) {
+                        WriteBlock::Data(m) => {
+                            if m < n {
+                                ctx.data.extend_from_slice(&buf[m..n]);
+                            }
+                            Step::Yield
+                        }
+                        WriteBlock::WouldBlock => {
+                            // Preserve the chunk across the park: the local
+                            // `buf` dies with the step, so the retry after
+                            // the wake must find it in ctx.data.
+                            ctx.data.extend_from_slice(&buf[..n]);
+                            Step::Blocked(BlockReason::Writable(w))
+                        }
+                        WriteBlock::Err(_) => Step::Exit(6),
+                    },
+                    Err(_) => Step::Exit(7),
+                }
+            }
+        }
+        (3, _) => {
+            // Consumer: yield 3 turns (producer fills + parks), then drain.
+            // Layout: [3, src, r, w, marker, out, counter].
+            if ctx.data[6] < 3 {
+                ctx.data[6] += 1;
+                return Step::Yield;
+            }
+            let out = ctx.data[5] as u32;
+            let mut buf = [0u8; 512];
+            match ctx.read_blocking(r, &mut buf) {
+                ReadBlock::Data(0) => Step::Exit(0),
+                ReadBlock::Data(n) => {
+                    ctx.vfs().write(task, out, &buf[..n]).unwrap();
+                    Step::Yield
+                }
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(r)),
+                ReadBlock::Err(_) => Step::Exit(8),
+            }
+        }
+        _ => Step::Exit(1),
+    }
+}
+
+#[test]
+fn blocking_write_parks_the_producer_until_the_consumer_drains() {
+    let (mut p, t, client) = pm();
+    let payload: Vec<u8> = b"ABCDEFGH".repeat(1024); // 8 KiB
+    // Seed /tmp/src before init runs.
+    let f = p.vfs.open(0, "/tmp/src", O_CREAT | O_RDWR, 0o644).unwrap();
+    p.vfs.write(0, f, &payload).unwrap();
+    p.vfs.close(0, f).unwrap();
+    p.spawn_init(Program::new("big_pipe_owner", big_pipe_owner));
+
+    // Drive until the producer provably parks on the full pipe.
+    let mut steps = 0;
+    loop {
+        if matches!(p.state(0), Some(TaskState::Blocked(BlockReason::Writable(_)))) {
+            break;
+        }
+        assert!(p.run_next().is_some(), "scheduler should make progress");
+        steps += 1;
+        assert!(steps < 30, "producer never parked");
+    }
+
+    // The consumer drains; the scheduler's drain wakes the producer, and
+    // the whole payload flows through the pipe before EOF.
+    p.run_until_quiet(300);
+    assert_eq!(p.exit_code(0), Some(0), "producer drained /tmp/src");
+    assert_eq!(p.exit_code(1), Some(0), "consumer drained the pipe to EOF");
+    assert_eq!(
+        read_all(&mut p.vfs, "/tmp/out"),
+        payload,
+        "every byte arrived, in order"
+    );
 
     client.kill_driver(0);
     t.join().unwrap();
@@ -674,6 +844,12 @@ fn blocking_read_parks_the_shell_until_the_writer_delivers() {
     assert_eq!(p.exit_code(0), Some(0), "shell exited with the writer's status");
     assert_eq!(read_all(&mut p.vfs, "/tmp/out"), b"hello");
     assert_eq!(p.state(1), None, "writer reaped");
+    // The shell's pipe park/wake is traced end to end (stdio is the
+    // console, so the pipe read end is fd 3). Note the shell's `wait`
+    // never parks here — the writer child had already exited before the
+    // shell got the data, so the reap is immediate; the waiting-parent
+    // park/wake pair is covered by the unit tests instead.
+    assert_park_wake(&p.wake_trace, 0, BlockReason::Readable(3));
 
     client.kill_driver(0);
     t.join().unwrap();

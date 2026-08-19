@@ -84,6 +84,10 @@ impl PipeNode {
     pub fn has_data(&self) -> bool {
         !self.buf.borrow().is_empty()
     }
+    /// Free buffer space (a write of up to this many bytes succeeds).
+    pub fn space(&self) -> usize {
+        self.cap - self.buf.borrow().len()
+    }
 
     /// Called by the VFS when an fd holding this end is created.
     pub fn bump_readers(&self, d: i32) {
@@ -189,11 +193,12 @@ impl CharNode {
         self.gid
     }
 
-    /// Input is available (a console read will return at least one byte).
-    /// Null is always "ready" — its reads never block (instant EOF).
-    pub fn has_input(&self) -> bool {
+    /// The readiness predicate for a blocked *reader*: a console read will
+    /// return (input arrived, or the channel closed → EOF). Null is always
+    /// ready — its reads never block (instant EOF).
+    pub fn read_ready(&self) -> bool {
         match &self.kind {
-            CharKind::Console(c) => !c.input_empty(),
+            CharKind::Console(c) => !c.input_empty() || c.is_closed(),
             CharKind::Null => true,
         }
     }
@@ -231,24 +236,42 @@ impl CharNode {
             CharKind::Null => panic!("not a console"),
         }
     }
-}
-
-/// The console's I/O. In the full sidecar this is the channel to the
-/// kernel's console driver (`ChanDev`); here it is an in-memory terminal:
-/// reads consume `input`, writes append to `output`. The bootstrap wires
-/// the real channel into this slot without the VFS changing.
-pub struct ConsoleIo {
-    input: RefCell<VecDeque<u8>>,
-    output: RefCell<Vec<u8>>,
-}
-
-impl ConsoleIo {
-    pub fn new() -> ConsoleIo {
-        ConsoleIo {
-            input: RefCell::new(VecDeque::new()),
-            output: RefCell::new(Vec::new()),
-        }
+}    /// The console's I/O. In the full sidecar this is the channel to the
+    /// kernel's console driver (`ChanDev`); here it is an in-memory terminal:
+    /// reads consume `input`, writes append to `output`. The bootstrap wires
+    /// the real channel into this slot without the VFS changing.
+    ///
+    /// `close` is the **channel-close event**: the kernel console's channel
+    /// went away. A closed console is EOF — reads return `Ok(0)` once the
+    /// already-buffered input is drained, and parked readers are woken by
+    /// the scheduler's drain (the readiness predicate includes the flag).
+    pub struct ConsoleIo {
+        input: RefCell<VecDeque<u8>>,
+        output: RefCell<Vec<u8>>,
+        closed: Cell<bool>,
     }
+
+    impl ConsoleIo {
+        pub fn new() -> ConsoleIo {
+            ConsoleIo {
+                input: RefCell::new(VecDeque::new()),
+                output: RefCell::new(Vec::new()),
+                closed: Cell::new(false),
+            }
+        }
+
+        /// The console-close event: the kernel-console channel closed (the
+        /// driver is gone or the channel was torn down). Delivered the way
+        /// input is — from outside the scheduler, seen by the next wake
+        /// drain. Buffered input already delivered over the channel stays
+        /// readable; reads return `Ok(0)` (EOF) once it is drained.
+        pub fn close(&self) {
+            self.closed.set(true);
+        }
+
+        pub fn is_closed(&self) -> bool {
+            self.closed.get()
+        }
 
     /// Feed input as if typed at the console (the driver would push here).
     /// The sidecar core runs the scheduler after external input arrives,
@@ -269,16 +292,24 @@ impl ConsoleIo {
 
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let n = core::cmp::min(buf.len(), self.input.borrow().len());
-        if n == 0 {
-            return Err(Errno::EAgain); // nothing typed — "would block"
+        if n > 0 {
+            // Buffered input first — data already delivered over the
+            // channel is consumed even after a close.
+            for b in buf[..n].iter_mut() {
+                *b = self.input.borrow_mut().pop_front().unwrap();
+            }
+            return Ok(n);
         }
-        for b in buf[..n].iter_mut() {
-            *b = self.input.borrow_mut().pop_front().unwrap();
+        if self.closed.get() {
+            return Ok(0); // channel closed — EOF
         }
-        Ok(n)
+        Err(Errno::EAgain) // nothing typed — "would block"
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        if self.closed.get() {
+            return Err(Errno::EIo); // the channel is dead
+        }
         self.output.borrow_mut().extend_from_slice(buf);
         Ok(buf.len())
     }

@@ -27,15 +27,18 @@
 //!   through the VFS (the full mount chain), the first line names an
 //!   applet from the registry, and the task's program is replaced. Open fds
 //!   are preserved (no CLOEXEC in v1).
-//! - **Blocking reads**: `Ctx::read_blocking` turns a would-block (an
-//!   empty pipe, a console with no input) into `Vfs::wait_readable`
-//!   registration plus `Step::Blocked(Readable(fd))` — the task parks. The
-//!   scheduler's `drain_read_wakes` re-checks each parked task against a
-//!   pure readiness predicate at every step (data arrived, last writer
-//!   gone → EOF, console input pushed between runs) and requeues the task;
-//!   the program just retries the read, re-parking if it would-block
-//!   again. No per-event notification needed in a cooperative model — any
-//!   writer's step or external input is visible at the next drain.
+//! - **Blocking reads and writes**: `Ctx::read_blocking` turns a
+//!   would-block (an empty pipe, a console with no input) into
+//!   `Vfs::wait_readable` registration plus `Step::Blocked(Readable(fd))`;
+//!   `Ctx::write_blocking` mirrors it for a full pipe with
+//!   `Vfs::wait_writable` + `Step::Blocked(Writable(fd))`. The scheduler's
+//!   unified wake drain re-checks each parked task against a pure
+//!   readiness predicate at every step (data arrived, last writer gone →
+//!   EOF, free space, last reader gone → EPIPE, console input pushed
+//!   between runs) and requeues the task; the program just retries the
+//!   I/O, re-parking if it would-block again. No per-event notification
+//!   needed in a cooperative model — any other task's step or external
+//!   input is visible at the next drain.
 //!
 //! The proc manager **owns the VFS** (in-core call path). The
 //! architecture's internal-bus message exchange between components is the
@@ -72,6 +75,21 @@ pub enum TaskState {
     Exited(i32),
 }
 
+/// One entry in the wake trace: a task parked or was woken, with the
+/// reason. `Woken` carries the reason the task was blocked on, so a park
+/// and its wake pair up. This is the blocked-task liveness observable:
+/// every park has a matching wake (or the task is wedged — the tests
+/// assert the pairs, and a live system can log them for the debug
+/// channel).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeEvent {
+    /// The task transitioned to `Blocked(reason)` (it left the run queue).
+    Parked(u32, BlockReason),
+    /// The task left `Blocked(reason)` and was requeued (data/EOF/space
+    /// arrived, a waited child exited, or the console closed).
+    Woken(u32, BlockReason),
+}
+
 /// Why a task is blocked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockReason {
@@ -79,8 +97,11 @@ pub enum BlockReason {
     WaitingChild(u32),
     /// Blocked reading `fd` until it becomes readable (data, EOF, or
     /// console input). The VFS registered the wait; the scheduler's
-    /// read-wake drain requeues the task and it retries the read.
+    /// wake drain requeues the task and it retries the read.
     Readable(u32),
+    /// Blocked writing `fd` until space frees up (a reader drained the
+    /// pipe) or the last reader closes (the retry observes `EPIPE`).
+    Writable(u32),
     /// The program chose to block (I/O wait, etc.).
     User,
 }
@@ -96,6 +117,21 @@ pub enum ReadBlock {
     /// readable.
     WouldBlock,
     /// A hard error (`EBADF`, `EIO`, ...).
+    Err(Errno),
+}
+
+/// Outcome of a blocking write (`Ctx::write_blocking`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteBlock {
+    /// Bytes written (a short write is allowed — the program retries the
+    /// remainder).
+    Data(usize),
+    /// The object would block; the wait is registered with the VFS. The
+    /// program must return `Step::Blocked(BlockReason::Writable(fd))` —
+    /// the scheduler parks it and wakes it when space frees up or the
+    /// last reader closes.
+    WouldBlock,
+    /// A hard error (`EBADF`, `EPIPE`, `EIO`, ...).
     Err(Errno),
 }
 
@@ -179,6 +215,10 @@ pub struct ProcManager<K: Kernel, A: BufferAlloc> {
     /// Scheduler trace (task ids in run order) — the sidecar's scheduler
     /// observability; tests assert round-robin interleaving with it.
     pub sched_trace: Vec<u32>,
+    /// Wake trace: every `Parked`/`Woken` event with its reason, in
+    /// order. Blocked-task liveness is observable through it — a task
+    /// that parks without a later `Woken` for the same reason is wedged.
+    pub wake_trace: Vec<WakeEvent>,
     tasks: BTreeMap<u32, TaskCtl<K, A>>,
     run: VecDeque<u32>,
     applets: BTreeMap<String, AppletStep<K, A>>,
@@ -197,6 +237,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         ProcManager {
             vfs,
             sched_trace: Vec::new(),
+            wake_trace: Vec::new(),
             tasks: BTreeMap::new(),
             run: VecDeque::new(),
             applets: BTreeMap::new(),
@@ -340,6 +381,8 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                     tc.state = TaskState::Runnable;
                 }
                 self.run.push_back(p);
+                self.wake_trace
+                    .push(WakeEvent::Woken(p, BlockReason::WaitingChild(id)));
             }
         }
     }
@@ -426,6 +469,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 if let Some(tc) = self.tasks.get_mut(&id) {
                     tc.state = TaskState::Blocked(reason);
                 }
+                self.wake_trace.push(WakeEvent::Parked(id, reason));
             }
             Step::Exit(code) => {
                 let already = matches!(
@@ -441,18 +485,27 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         Some(outcome)
     }
 
-    /// Wake tasks parked on a readable fd whose wait is now satisfied
-    /// (data arrived, EOF, console input pushed). Called at every
-    /// scheduler step; also public so an event-loop driver can re-arm
-    /// blocked readers after external input arrives between runs.
-    pub fn drain_read_wakes(&mut self) {
-        let woken = self.vfs.take_woken_readers();
+    /// Wake tasks parked on a readable or writable fd whose wait is now
+    /// satisfied (pipe data/EOF, console input, pipe space freed, last
+    /// reader gone). Called at every scheduler step; also public so an
+    /// event-loop driver can re-arm blocked tasks after external input
+    /// arrives between runs.
+    pub fn drain_wakes(&mut self) {
+        let mut woken = self.vfs.take_woken_readers();
+        woken.extend(self.vfs.take_woken_writers());
         for t in woken {
             if let Some(tc) = self.tasks.get_mut(&t) {
-                if matches!(tc.state, TaskState::Blocked(BlockReason::Readable(_))) {
-                    tc.state = TaskState::Runnable;
-                    self.run.push_back(t);
-                }
+                // Capture the blocked reason for the trace before the
+                // transition; only read/write-fd parks are woken here.
+                let reason = match tc.state {
+                    TaskState::Blocked(
+                        r @ (BlockReason::Readable(_) | BlockReason::Writable(_)),
+                    ) => r,
+                    _ => continue,
+                };
+                tc.state = TaskState::Runnable;
+                self.run.push_back(t);
+                self.wake_trace.push(WakeEvent::Woken(t, reason));
             }
         }
     }
@@ -464,7 +517,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
     pub fn run_until_quiet(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while steps < max_steps {
-            self.drain_read_wakes();
+            self.drain_wakes();
             match self.run_next() {
                 Some(_) => steps += 1,
                 None => break,
@@ -547,6 +600,26 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
                 Err(e) => ReadBlock::Err(e),
             },
             Err(e) => ReadBlock::Err(e),
+        }
+    }
+
+    /// Blocking write: like `Vfs::write`, but on would-block (`EAGAIN` —
+    /// a full pipe) registers the task with the VFS and returns
+    /// `WriteBlock::WouldBlock`. The program must then return
+    /// `Step::Blocked(BlockReason::Writable(fd))`; the scheduler parks the
+    /// task and the wake drain requeues it when a reader frees space (or
+    /// the last reader closes — the retry observes `EPIPE`), at which
+    /// point the program retries. Files and the console never block on
+    /// write in v1, so this only parks on pipes.
+    pub fn write_blocking(&mut self, fd: u32, buf: &[u8]) -> WriteBlock {
+        let task = self.task;
+        match self.pm.vfs.write(task, fd, buf) {
+            Ok(n) => WriteBlock::Data(n),
+            Err(Errno::EAgain) => match self.pm.vfs.wait_writable(task, fd) {
+                Ok(()) => WriteBlock::WouldBlock,
+                Err(e) => WriteBlock::Err(e),
+            },
+            Err(e) => WriteBlock::Err(e),
         }
     }
 

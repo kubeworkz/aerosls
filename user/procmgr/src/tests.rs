@@ -5,9 +5,26 @@
 
 use alloc::sync::Arc;
 
-use aerosls_vfs::{CharNode, Vfs, O_RDONLY};
+use aerosls_vfs::{CharNode, Errno, Vfs, O_RDONLY};
 
-use crate::{is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome};
+use crate::{
+    is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome,
+    WakeEvent, WriteBlock,
+};
+
+/// Assert the wake trace records a task's park and its matching wake, in
+/// that order — the blocked-task liveness contract (a park without a
+/// later wake for the same reason would be a wedged task).
+fn assert_park_wake(trace: &[WakeEvent], task: u32, reason: BlockReason) {
+    let park = trace.iter().position(|e| *e == WakeEvent::Parked(task, reason));
+    let wake = trace.iter().position(|e| *e == WakeEvent::Woken(task, reason));
+    assert!(park.is_some(), "task {task} never parked on {reason:?}: {trace:?}");
+    assert!(wake.is_some(), "task {task} never woke from {reason:?}: {trace:?}");
+    assert!(
+        park.unwrap() < wake.unwrap(),
+        "wake precedes park for task {task}: {trace:?}"
+    );
+}
 
 mod dummy {
     use aerosls_proto::kabi::{CapInfo, ERR_STATE, GrantedCap, Kernel, RecvResult, SendCap};
@@ -129,11 +146,13 @@ fn blocking_read_parks_until_data_wakes_it() {
     assert_eq!(p.runnable(), 1, "only the parent remains runnable");
     // The parent's write is a scheduler event; the drain wakes the reader.
     assert_eq!(p.run_next(), Some(Step::Exit(0)));
-    p.drain_read_wakes();
+    p.drain_wakes();
     assert_eq!(p.state(1), Some(TaskState::Runnable));
     // The retry completes with the data.
     assert_eq!(p.run_next(), Some(Step::Exit(5)));
     assert_eq!(p.exit_code(1), Some(5));
+    // The wake trace records the park and the wake, in order.
+    assert_park_wake(&p.wake_trace, 1, BlockReason::Readable(0));
 }
 
 /// Like `pipe_owner`, but the child drops its own write end and parks; the
@@ -190,9 +209,11 @@ fn blocking_read_wakes_on_eof_when_last_writer_exits() {
     assert_eq!(p.state(1), Some(TaskState::Blocked(BlockReason::Readable(0))));
     // Parent exits: its write end drops. The drain makes EOF visible.
     assert_eq!(p.run_next(), Some(Step::Exit(0)));
-    p.drain_read_wakes();
+    p.drain_wakes();
     assert_eq!(p.state(1), Some(TaskState::Runnable));
     assert_eq!(p.run_next(), Some(Step::Exit(7)), "retry sees EOF");
+    // EOF also pairs a park with its wake in the trace.
+    assert_park_wake(&p.wake_trace, 1, BlockReason::Readable(0));
 }
 
 /// Reads /dev/console with a blocking read: parks until input is pushed
@@ -228,9 +249,225 @@ fn blocking_console_read_parks_until_input() {
     // Input arrives from outside the scheduler (the driver / test); the
     // event loop re-enters and the drain re-arms the parked reader.
     console.console_io().push_input(b"hi");
-    p.drain_read_wakes();
+    p.drain_wakes();
     assert_eq!(p.state(0), Some(TaskState::Runnable));
     assert_eq!(p.run_next(), Some(Step::Exit(8)));
+    // The console park/wake is traced like any other.
+    assert_park_wake(&p.wake_trace, 0, BlockReason::Readable(0));
+}
+
+/// Reads /dev/console with a blocking read; exits 9 on EOF (`Ok(0)` — the
+/// console channel closed), 8 on data, 6 on error.
+fn console_eof_reader(ctx: &mut Ctx<D, M>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let fd = ctx.vfs().open(task, "/dev/console", O_RDONLY, 0).unwrap();
+        ctx.data.push(fd as u8);
+        return Step::Yield;
+    }
+    let fd = ctx.data[0] as u32;
+    let mut buf = [0u8; 8];
+    match ctx.read_blocking(fd, &mut buf) {
+        ReadBlock::Data(0) => Step::Exit(9), // EOF — the channel closed
+        ReadBlock::Data(_) => Step::Exit(8),
+        ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(fd)),
+        ReadBlock::Err(_) => Step::Exit(6),
+    }
+}
+
+#[test]
+fn blocking_console_read_parks_until_close_eof() {
+    let console = Arc::new(CharNode::console());
+    let mut vfs = Vfs::new();
+    vfs.mount_devfs("/dev", console.clone()).unwrap();
+    let mut p = ProcManager::new(vfs);
+    p.spawn_init(Program::new("console_eof_reader", console_eof_reader));
+
+    p.run_next().unwrap(); // open the console, yield
+    assert_eq!(p.run_next(), Some(Step::Blocked(BlockReason::Readable(0))));
+    assert_eq!(p.state(0), Some(TaskState::Blocked(BlockReason::Readable(0))));
+    // The channel-close event fires from outside the scheduler (the
+    // kernel console driver went away); the next drain sees the flag and
+    // wakes the parked reader, whose retry observes Ok(0) — EOF.
+    console.console_io().close();
+    assert_eq!(p.state(0), Some(TaskState::Blocked(BlockReason::Readable(0))));
+    p.drain_wakes();
+    assert_eq!(p.state(0), Some(TaskState::Runnable));
+    assert_eq!(p.run_next(), Some(Step::Exit(9)));
+    // The close event woke the reader: a traced park/wake pair.
+    assert_park_wake(&p.wake_trace, 0, BlockReason::Readable(0));
+}
+
+// ── blocking writes ─────────────────────────────────────────────────────────
+
+/// Init: pipe + 8 KiB payload in `data` (after the [phase, r, w] header),
+/// fork. The parent is the writer: it drains the payload through the pipe
+/// with `write_blocking`, parking when the 4 KiB pipe fills. The child is
+/// the reader: it yields a few turns (letting the writer fill the pipe and
+/// park), then drains. Exit codes: 0 = done, 6 = write error.
+fn pipe_writer_owner(ctx: &mut Ctx<D, M>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1); // phase
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        for _ in 0..4096 {
+            ctx.data.extend_from_slice(b"AB"); // 8 KiB payload
+        }
+        return Step::Yield;
+    }
+    let r = ctx.data[1] as u32;
+    let w = ctx.data[2] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            ctx.fork().unwrap();
+            // The writer keeps only its write end: with its own read end
+            // closed, the reader's close is the LAST reader (EPIPE case).
+            ctx.vfs().close(task, r).unwrap();
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (1, true) => {
+            // Reader: drop its own write end (else the writer's exit never
+            // becomes EOF — the reader's own end keeps the pipe open),
+            // then arm the yield counter at data[3] and drain.
+            ctx.vfs().close(task, w).unwrap();
+            ctx.data.insert(3, 0);
+            ctx.data[0] = 3;
+            Step::Yield
+        }
+        (2, _) => {
+            // Writer: push the payload through the (4 KiB) pipe.
+            if ctx.data.len() <= 3 {
+                return Step::Exit(0); // payload fully drained
+            }
+            let n = core::cmp::min(ctx.data.len() - 3, 4096);
+            let chunk = ctx.data[3..3 + n].to_vec();
+            match ctx.write_blocking(w, &chunk) {
+                WriteBlock::Data(m) => {
+                    ctx.data.drain(3..3 + m);
+                    Step::Yield
+                }
+                WriteBlock::WouldBlock => Step::Blocked(BlockReason::Writable(w)),
+                WriteBlock::Err(_) => Step::Exit(6),
+            }
+        }
+        (3, _) => {
+            if ctx.data[3] < 3 {
+                ctx.data[3] += 1;
+                return Step::Yield; // let the writer fill the pipe
+            }
+            let mut buf = [0u8; 512];
+            match ctx.read_blocking(r, &mut buf) {
+                ReadBlock::Data(0) => Step::Exit(0),
+                ReadBlock::Data(_) => Step::Yield,
+                ReadBlock::WouldBlock => Step::Blocked(BlockReason::Readable(r)),
+                ReadBlock::Err(_) => Step::Exit(7),
+            }
+        }
+        _ => Step::Exit(1),
+    }
+}
+
+#[test]
+fn blocking_write_parks_on_a_full_pipe_until_the_reader_drains() {
+    let mut p = pm();
+    p.spawn_init(Program::new("pipe_writer_owner", pipe_writer_owner));
+
+    p.run_next().unwrap(); // init: pipe + payload
+    p.run_next().unwrap(); // init: fork (writer closes its read end)
+    p.run_next().unwrap(); // reader: arm the yield counter
+    p.run_next().unwrap(); // writer: fill the 4 KiB pipe
+    p.run_next().unwrap(); // reader: yield
+    // The writer parks on the full pipe — provably not runnable.
+    assert_eq!(p.run_next(), Some(Step::Blocked(BlockReason::Writable(1))));
+    assert_eq!(p.state(0), Some(TaskState::Blocked(BlockReason::Writable(1))));
+    assert_eq!(p.runnable(), 1, "only the reader remains runnable");
+
+    // The reader drains; the scheduler's drain wakes the writer, and the
+    // whole payload flows before the reader sees EOF.
+    p.run_until_quiet(300);
+    assert_eq!(p.exit_code(0), Some(0), "writer drained the whole payload");
+    assert_eq!(p.exit_code(1), Some(0), "reader drained the pipe to EOF");
+}
+
+/// Like `pipe_writer_owner`, but the reader closes its read end instead of
+/// draining: the parked writer must wake (last reader gone) and its retry
+/// observes `EPIPE`. Exit codes: 9 = EPIPE on the retry.
+fn pipe_writer_epipe_owner(ctx: &mut Ctx<D, M>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let (r, w) = ctx.vfs().pipe(task).unwrap();
+        ctx.data.push(1);
+        ctx.data.push(r as u8);
+        ctx.data.push(w as u8);
+        for _ in 0..4096 {
+            ctx.data.extend_from_slice(b"AB");
+        }
+        return Step::Yield;
+    }
+    let r = ctx.data[1] as u32;
+    let w = ctx.data[2] as u32;
+    match (ctx.data[0], is_child(&ctx.data)) {
+        (1, false) => {
+            ctx.fork().unwrap();
+            ctx.vfs().close(task, r).unwrap();
+            ctx.data[0] = 2;
+            Step::Yield
+        }
+        (1, true) => {
+            ctx.data.insert(3, 0);
+            ctx.data[0] = 3;
+            Step::Yield
+        }
+        (2, _) => {
+            if ctx.data.len() <= 3 {
+                return Step::Exit(0);
+            }
+            let n = core::cmp::min(ctx.data.len() - 3, 4096);
+            let chunk = ctx.data[3..3 + n].to_vec();
+            match ctx.write_blocking(w, &chunk) {
+                WriteBlock::Data(m) => {
+                    ctx.data.drain(3..3 + m);
+                    Step::Yield
+                }
+                WriteBlock::WouldBlock => Step::Blocked(BlockReason::Writable(w)),
+                WriteBlock::Err(Errno::EPipe) => Step::Exit(9),
+                WriteBlock::Err(_) => Step::Exit(6),
+            }
+        }
+        (3, _) => {
+            // Reader: yield twice, then close its read end and exit — the
+            // last reader is gone, so the parked writer must wake to EPIPE.
+            if ctx.data[3] < 2 {
+                ctx.data[3] += 1;
+                return Step::Yield;
+            }
+            ctx.vfs().close(task, r).unwrap();
+            Step::Exit(0)
+        }
+        _ => Step::Exit(1),
+    }
+}
+
+#[test]
+fn blocking_write_wakes_with_epipe_when_the_last_reader_closes() {
+    let mut p = pm();
+    p.spawn_init(Program::new("pipe_writer_epipe_owner", pipe_writer_epipe_owner));
+
+    p.run_next().unwrap(); // init: pipe + payload
+    p.run_next().unwrap(); // init: fork
+    p.run_next().unwrap(); // reader: arm the counter
+    p.run_next().unwrap(); // writer: fill the pipe
+    p.run_next().unwrap(); // reader: yield
+    assert_eq!(p.run_next(), Some(Step::Blocked(BlockReason::Writable(1))));
+    assert_eq!(p.state(0), Some(TaskState::Blocked(BlockReason::Writable(1))));
+
+    // Reader closes its end and exits; the drain wakes the writer to EPIPE.
+    p.run_until_quiet(100);
+    assert_eq!(p.exit_code(0), Some(9), "retry observed EPIPE");
+    assert_eq!(p.exit_code(1), Some(0), "reader exited cleanly");
 }
 
 /// Parent: wait *before* the child runs (must block, then be woken).
@@ -302,6 +539,8 @@ fn wait_on_live_child_blocks_then_wakes() {
     assert_eq!(p.exit_code(0), Some(3));
     assert_eq!(p.state(1), None, "child reaped");
     assert_eq!(p.task_count(), 1, "only init's zombie remains (nothing reaps init)");
+    // The exit-wake is traced: the child's death woke the parent's wait.
+    assert_park_wake(&p.wake_trace, 0, BlockReason::WaitingChild(1));
 }
 
 #[test]

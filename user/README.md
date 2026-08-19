@@ -134,14 +134,17 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   **EAGAIN**. Devices live in `/dev` (devfs names them; an fd on a device
   holds `FileObj::Char` and its I/O bypasses the mount layer):
   `/dev/console` is the sidecar's ChanDev, in-memory until the bootstrap
-  wires the kernel-console channel, and `/dev/null` discards.
+  wires the kernel-console channel (its `close` event — the channel dying
+  — makes console reads EOF: buffered input is served first, then
+  `Ok(0)`, and parked readers are woken by the drain), and `/dev/null`
+  discards.
 - Blocking reads park instead of spin: `Ctx::read_blocking` turns a pipe's
   `EAGAIN` into a VFS-registered wait (`Vfs::wait_readable`) and a
   `Step::Blocked(Readable(fd))`; the VFS holds one waiter per task, keyed
   by the object's `Arc` (so the readiness check never touches a freed
   object). The proc manager drains satisfied waits at every scheduler step
-  (`take_woken_readers` + `drain_read_wakes`) against a pure predicate —
-  data present, or the last writer gone (EOF), or console input arrived —
+  (the unified wake drain) against a pure predicate —
+  data present, or the last writer gone (EOF), or console input/close —
   and requeues the task, whose program simply retries the read (re-parking
   on would-block). Because the sidecar is single-threaded and cooperative,
   no per-event notification is needed: a write or writer-exit in any
@@ -149,5 +152,25 @@ and transport specs. Image assembly (crt0 + linker script + the manifest's
   next drain. The `cat | grep` and blocking-shell integration tests drive
   the whole path: shell creates the pipe, dup2's an end onto each child's
   stdio, `exec`s the applets, closes its own copies, and reaps both
-  stages — with grep provably parking on the transient empty pipe between
-  the producer's partial writes.
+  stages (in the pipeline interleaving grep never actually hits an empty
+  pipe — cat's 16-byte chunks refill it before grep's round-robin turn;
+  the blocking-shell test is where a read-park is proven end to end).
+- Blocked-task liveness is observable: the proc manager keeps a wake
+  trace (`wake_trace`) of `Parked`/`Woken` events with their `BlockReason`
+  — every park records why the task left the run queue, every wake
+  records the reason it was blocked on (data/EOF/space arrived, the
+  console closed, a waited child exited). A park without a later wake is
+  a wedged task, so the trace doubles as the deadlock check; the
+  blocking-read, blocking-write, console-close, and wait unit/integration
+  tests assert the park→wake pairs.
+- Blocking writes are the mirror image: `Ctx::write_blocking` turns a
+  pipe's `EAGAIN` (full) into a `Vfs::wait_writable` registration and a
+  `Step::Blocked(Writable(fd))`, and the same scheduler drain wakes the
+  writer when a reader frees space (or the last reader closes — the retry
+  observes `EPIPE`). Files and the console never block on write in v1.
+  The 8 KiB producer/consumer integration test proves it end to end: the
+  producer provably parks with a 4 KiB pipe full, the consumer drains it
+  in 512-byte chunks, and every byte arrives in order at `/tmp/out` —
+  exercising the chunk-preservation rule too: a program must stash a
+  read-but-unwritten chunk in its state before parking, since the step's
+  stack dies with the step.

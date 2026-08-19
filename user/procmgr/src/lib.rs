@@ -6,9 +6,15 @@
 //! offsets are shared) and `fork_thread` (CLONE_FILES — the table object
 //! itself is shared); exit/zombie/wait with orphan reparenting to init;
 //! `exec` through the mount chain into a BusyBox-style applet registry;
-//! and blocking reads (`Ctx::read_blocking`) that park a task on an empty
-//! pipe or console instead of spinning, woken by the scheduler's
-//! read-wake drain when data, EOF, or input arrives.
+//! and blocking I/O (`Ctx::read_blocking` / `Ctx::write_blocking`) that
+//! park a task on an empty pipe or console, or on a full pipe, instead of
+//! spinning — woken by the scheduler's wake drain when data, EOF, input,
+//! the console-close event, or free space arrives.
+//!
+//! Blocked-task liveness is observable through `wake_trace` (`WakeEvent::
+//! Parked`/`Woken`, each carrying the `BlockReason`) — every park records
+//! why a task left the run queue, every wake records the reason it was
+//! blocked on; a park without a later wake is a wedged task.
 //!
 //! The manager **owns the VFS** (the in-core call path); the
 //! architecture's internal-bus message exchange between components is the
@@ -29,5 +35,5 @@ mod tests;
 
 pub use procmgr::{
     is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskCtl, TaskState,
-    WaitOutcome, FORK_MARKER,
+    WaitOutcome, WakeEvent, WriteBlock, FORK_MARKER,
 };

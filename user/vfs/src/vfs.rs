@@ -750,15 +750,23 @@ struct Waiter {
 }
 
 impl Waiter {
+    /// The *only* wake condition, re-checked at every scheduler drain. The
+    /// object kind determines the predicate (no kind field needed — the
+    /// `FileObj` variant *is* the wait's kind): a reader wakes on data or
+    /// EOF, a writer wakes on free space or the last reader closing (its
+    /// retry observes `EPIPE`), a console reader wakes on input **or the
+    /// channel-close event** (its retry observes `Ok(0)` — EOF).
     fn ready(&self) -> bool {
         match &*self.obj {
-            // Data, or EOF (last writer gone) — both make read() return.
             FileObj::PipeRead(p) => p.has_data() || p.writers() == 0,
-            // Console input arrived. (Null reads never block; true keeps
-            // any stray registration from wedging.)
-            FileObj::Char(c) => c.has_input(),
-            // Nothing else can be blocked on (wait_readable rejects them).
-            _ => false,
+            FileObj::PipeWrite(p) => p.space() > 0 || p.readers() == 0,
+            // Console input arrived, or the console channel closed (EOF).
+            // (Null reads never block; true keeps any stray registration
+            // from wedging.)
+            FileObj::Char(c) => c.read_ready(),
+            // Nothing else can be blocked on (the wait_* validators
+            // reject them).
+            FileObj::File(_) => false,
         }
     }
 }
@@ -1103,7 +1111,9 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     /// read path after a read returned `EAGAIN` (empty pipe, console with
     /// no input). The proc manager drains satisfied waits at each
     /// scheduler step and requeues the task; its program retries the read
-    /// and re-registers if it would-block again.
+    /// and re-registers if it would-block again. A console reader is
+    /// woken by input **or the console-close event** — its retry then
+    /// sees `Ok(0)`.
     ///
     /// Rejects fds that can never block: mount-table files read `Ok(0)`
     /// at EOF (never `EAGAIN`), and write-only pipe ends aren't readable.
@@ -1125,16 +1135,52 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         }
     }
 
-    /// Drain the waits whose object is ready (data/EOF/console input) and
-    /// return the tasks to wake. Called by the proc manager at every
-    /// scheduler step (and by an event-loop driver when external input
-    /// arrives between runs). A task whose fd vanished wakes too — its
-    /// retry observes `EBADF` rather than wedging.
+    /// Park the task on `fd` becoming writable. Called by the blocking
+    /// write path after a write returned `EAGAIN` (a full pipe). The proc
+    /// manager drains satisfied waits at each scheduler step and requeues
+    /// the task; its program retries the write and re-registers if it
+    /// would-block again.
+    ///
+    /// Rejects fds that can never block on write: mount-table files and
+    /// the console grow their storage (no backpressure in v1), and a
+    /// read-only pipe end isn't writable.
+    pub fn wait_writable(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
+        let idx = self.task_mut(task)?.fds;
+        let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+        match &*e.node {
+            FileObj::PipeWrite(_) => {
+                // A task parks on one thing at a time; replace any prior
+                // registration (bounded by the number of tasks).
+                self.waiters.retain(|w| w.task != task);
+                self.waiters.push(Waiter {
+                    task,
+                    obj: e.node.clone(),
+                });
+                Ok(())
+            }
+            _ => Err(Errno::EInval),
+        }
+    }
+
+    /// Drain the read-waits whose object is ready (pipe data/EOF, console
+    /// input) and return the tasks to wake. Called by the proc manager at
+    /// every scheduler step (and by an event-loop driver when external
+    /// input arrives between runs).
     pub fn take_woken_readers(&mut self) -> Vec<u32> {
+        self.take_woken(|w| matches!(&*w.obj, FileObj::PipeRead(_) | FileObj::Char(_)))
+    }
+
+    /// Drain the write-waits whose object is ready (pipe space freed by a
+    /// reader, or the last reader gone) and return the tasks to wake.
+    pub fn take_woken_writers(&mut self) -> Vec<u32> {
+        self.take_woken(|w| matches!(&*w.obj, FileObj::PipeWrite(_)))
+    }
+
+    fn take_woken<F: Fn(&Waiter) -> bool>(&mut self, kind: F) -> Vec<u32> {
         let mut woken = Vec::new();
         let mut i = 0;
         while i < self.waiters.len() {
-            if self.waiters[i].ready() {
+            if kind(&self.waiters[i]) && self.waiters[i].ready() {
                 let w = self.waiters.swap_remove(i);
                 woken.push(w.task);
             } else {
@@ -1762,6 +1808,39 @@ mod tests {
     }
 
     #[test]
+    fn console_close_is_eof_and_wakes() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let console = Arc::new(CharNode::console());
+        v.mount_devfs("/dev", console.clone()).unwrap();
+
+        let r = v.open(0, "/dev/console", O_RDONLY, 0).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, r, &mut buf), Err(Errno::EAgain), "open console blocks");
+
+        // The channel-close event: buffered input is still served first…
+        console.console_io().push_input(b"hi");
+        console.console_io().close();
+        assert_eq!(v.read(0, r, &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"hi");
+        // …then reads are EOF, and the parked-reader predicate fires.
+        assert_eq!(v.read(0, r, &mut buf).unwrap(), 0);
+        assert!(console.read_ready());
+        assert!(v.wait_readable(0, r).is_ok(), "closed console accepts waits");
+
+        // Writes to a closed channel fail: the device is dead.
+        let rw = v.open(0, "/dev/console", O_RDWR, 0).unwrap();
+        assert_eq!(v.write(0, rw, b"x"), Err(Errno::EIo));
+        v.close(0, r).unwrap();
+        v.close(0, rw).unwrap();
+
+        // A second open of the closed console is still EOF, not EAGAIN
+        // (the node is the singleton; the event is on the channel).
+        let r2 = v.open(0, "/dev/console", O_RDONLY, 0).unwrap();
+        assert_eq!(v.read(0, r2, &mut buf).unwrap(), 0);
+        v.close(0, r2).unwrap();
+    }
+
+    #[test]
     fn console_perms_checked_against_creds() {
         let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
         v.mount_devfs("/dev", Arc::new(CharNode::console())).unwrap();
@@ -1804,6 +1883,36 @@ mod tests {
         v.wait_readable(0, r).unwrap();
         v.wait_readable(0, r).unwrap();
         assert_eq!(v.take_woken_readers().len(), 1);
+    }
+
+    #[test]
+    fn wait_writable_validation_and_wake() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        // Objects that can never block on write are rejected up front.
+        v.mount_ramfs("/tmp").unwrap();
+        let f = v.open(0, "/tmp/f", O_CREAT | O_RDWR, 0o644).unwrap();
+        assert_eq!(v.wait_writable(0, f), Err(Errno::EInval), "files never block");
+        assert_eq!(v.wait_writable(0, r), Err(Errno::EInval), "read end isn't writable");
+        assert_eq!(v.wait_writable(0, 99), Err(Errno::EBadf));
+        // Fill the pipe, then park the writer.
+        let big = [0u8; PIPE_CAP + 1];
+        assert_eq!(v.write(0, w, &big).unwrap(), PIPE_CAP, "pipe full");
+        assert_eq!(v.write(0, w, b"x"), Err(Errno::EAgain));
+        v.wait_writable(0, w).unwrap();
+        assert_eq!(v.take_woken_writers(), Vec::<u32>::new());
+        // A reader drains: the drain wakes the writer.
+        let mut tmp = [0u8; 16];
+        assert_eq!(v.read(0, r, &mut tmp).unwrap(), 16);
+        assert_eq!(v.take_woken_writers(), vec![0], "space freed → woken");
+        // Fill again, re-register; the last reader closing makes the
+        // retry EPIPE (never block again).
+        assert_eq!(v.write(0, w, b"xxxxxxxxxxxxxxxx").unwrap(), 16);
+        v.wait_writable(0, w).unwrap();
+        assert_eq!(v.take_woken_writers(), Vec::<u32>::new());
+        v.close(0, r).unwrap();
+        assert_eq!(v.take_woken_writers(), vec![0], "no readers → woken");
+        assert_eq!(v.write(0, w, b"x"), Err(Errno::EPipe));
     }
 
     #[test]
