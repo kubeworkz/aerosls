@@ -160,6 +160,8 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/echo", b"echo\n", 0o755);
     b.add_file("/bin/grep", b"grep\n", 0o755);
     b.add_file("/bin/wc", b"wc\n", 0o755);
+    b.add_file("/bin/head", b"head\n", 0o755);
+    b.add_file("/bin/tail", b"tail\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
     // A second bin dir so PATH-driven lookup has somewhere to search:
@@ -167,6 +169,14 @@ fn boot_runs_an_interactive_shell() {
     b.add_dir("/usr", 0o755);
     b.add_dir("/usr/bin", 0o755);
     b.add_file("/usr/bin/greet", b"echo\n", 0o755);
+    // A > 4 KiB file (500 lines), so `cat big.txt | head -n 1` forces cat
+    // to fill the pipe buffer and park on a full pipe before head exits
+    // early — the partial-pipe case the head session exercises.
+    let mut big = Vec::new();
+    for i in 0..500 {
+        big.extend_from_slice(format!("line-{:03}\n", i).as_bytes());
+    }
+    b.add_file("/etc/big.txt", &big, 0o644);
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
@@ -475,6 +485,32 @@ fn boot_runs_an_interactive_shell() {
         console.console_io().output(),
         b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ ",
         "wc counted through closed pipes and named files: 1/2/12, 1/2/16, and the passwd file"
+    );
+
+    // head terminates early: `cat big.txt | head -n 1` makes cat fill the
+    // 4 KiB pipe and park on a full pipe; head prints the first line and
+    // exits WITHOUT draining, so cat's next write wakes to EPIPE and exits
+    // 2. The shell reaps both and `$?` is head's status (0) — the partial-
+    // pipe read path end to end.
+    console.console_io().push_input(b"cat /etc/big.txt | head -n 1\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
+    // The file form with a line count: head reads the 31-byte passwd line
+    // across two 16-byte chunks and stops at the count, not at EOF.
+    console.console_io().push_input(b"head -n 2 /etc/passwd\n");
+    booted.run(100);
+    // tail is head's opposite — it must read to EOF to know the last
+    // lines: the pipe's fd closure (cat exits, the shell drops its
+    // copies) delivers EOF, and the window keeps the last 1 / 2 lines.
+    console.console_io().push_input(b"cat /etc/passwd | tail -n 1\n");
+    booted.run(100);
+    console.console_io().push_input(b"cat /etc/big.txt | tail -n 2\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ ",
+        "head exited early on the count (cat woke to EPIPE, $? stayed 0) and tail buffered the window to EOF"
     );
 
     client.kill_driver(0);

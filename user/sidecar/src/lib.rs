@@ -19,8 +19,10 @@
 //!   `unsetenv` builtins and `NAME=value` scoped assignments that
 //!   mutate the env), `grep` (glob patterns: `*` any run, `.` any
 //!   char, `\` escape; exits 0/1 on match/no-match), `wc` (line /
-//!   word / byte counts with pipe EOF propagation), `true`/`false`
-//!   — plus `register_default_applets`.
+//!   word / byte counts with pipe EOF propagation), `head`/`tail`
+//!   (line windows: head exits at N lines without draining the input
+//!   — partial-pipe semantics — tail buffers a sliding window to
+//!   EOF), `true`/`false` — plus `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.
 //! - `heap`       — bump allocator over the budget region (v1 reserves it).

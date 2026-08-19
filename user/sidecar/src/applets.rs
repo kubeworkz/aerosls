@@ -26,6 +26,11 @@
 //! - **`wc`** — counts lines / words / bytes of stdin (or named files),
 //!   right-aligned like coreutils; the count ends only at EOF, so it
 //!   exercises pipe fd closure (`echo hi | wc`).
+//! - **`head` / `tail`** — the line-window pair: `head -n N` prints the
+//!   first N lines and exits without draining the input (partial-pipe
+//!   semantics — a still-writing child's next write fails `EPIPE` once
+//!   head's fd table drops), while `tail -n N` buffers a sliding window
+//!   to EOF (parking like `wc`) and prints the last N lines.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -58,7 +63,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, ReadBlock, Step, WaitOutcome};
+use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, ReadBlock, Step, WaitOutcome, WriteBlock};
 use aerosls_proto::kabi::Kernel;
 use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
@@ -209,35 +214,64 @@ fn next_command(data: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// `cat`: copies argv[1] (or stdin) to fd 1. Reads block — a console stdin
-/// parks the task until input arrives instead of spinning.
+/// parks the task until input arrives instead of spinning — and writes
+/// park too: a full pipe blocks the task (`BlockReason::Writable`) instead
+/// of failing, so a long stream survives a slow reader. When the last
+/// reader leaves (e.g. `head` exiting early), the retry observes `EPIPE`
+/// and cat exits 2. Data layout: `[fd, phase, pending...]` — `pending` is
+/// a chunk read from the source but not yet fully written; it survives
+/// the parks, so no bytes are lost.
 pub fn cat<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
-    // Copy the path out: argv is borrowed from the manager, and open needs
-    // it mutably.
-    let arg = ctx.argv().get(1).map(|s| s.clone());
-    let src = match arg {
-        Some(p) => match ctx.vfs().open(task, &p, O_RDONLY, 0) {
-            Ok(fd) => fd,
-            Err(_) => return Step::Exit(2),
-        },
-        None => 0, // stdin
-    };
-    let mut buf = [0u8; 16];
+    if ctx.data.is_empty() {
+        // Copy the path out: argv is borrowed from the manager, and open
+        // needs it mutably.
+        let arg = ctx.argv().get(1).map(|s| s.clone());
+        let src = match arg {
+            Some(p) => match ctx.vfs().open(task, &p, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => return Step::Exit(2),
+            },
+            None => 0, // stdin
+        };
+        ctx.data.push(src as u8);
+        ctx.data.push(0); // phase: read a chunk
+    }
     loop {
-        match ctx.read_blocking(src, &mut buf) {
-            ReadBlock::Data(0) => {
-                if src != 0 {
-                    ctx.vfs().close(task, src).ok();
+        let src = ctx.data[0] as u32;
+        if ctx.data[1] == 0 {
+            // Read a chunk into the pending buffer (phase 0).
+            let mut buf = [0u8; 16];
+            match ctx.read_blocking(src, &mut buf) {
+                ReadBlock::Data(0) => {
+                    if src != 0 {
+                        ctx.vfs().close(task, src).ok();
+                    }
+                    return Step::Exit(0);
                 }
-                return Step::Exit(0);
-            }
-            ReadBlock::Data(n) => {
-                if ctx.vfs().write(task, 1, &buf[..n]).is_err() {
-                    return Step::Exit(2);
+                ReadBlock::Data(n) => {
+                    ctx.data.extend_from_slice(&buf[..n]);
+                    ctx.data[1] = 1; // phase: write the pending chunk
                 }
+                ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(src)),
+                ReadBlock::Err(_) => return Step::Exit(2),
             }
-            ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(src)),
-            ReadBlock::Err(_) => return Step::Exit(2),
+        } else {
+            // Write the pending chunk (phase 1), parking on a full pipe.
+            // The copy keeps ctx.data unborrowed across the write.
+            let pending = ctx.data[2..].to_vec();
+            match ctx.write_blocking(1, &pending) {
+                WriteBlock::Data(k) => {
+                    if k == pending.len() {
+                        ctx.data.truncate(2); // all written: back to reading
+                        ctx.data[1] = 0;
+                    } else {
+                        ctx.data.drain(2..2 + k); // retry the remainder
+                    }
+                }
+                WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                WriteBlock::Err(_) => return Step::Exit(2),
+            }
         }
     }
 }
@@ -411,6 +445,54 @@ fn read_u32(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
 
+/// Parse `head`/`tail`'s line count: no `-n` → `(10, 1)` (default, first
+/// file arg at argv[1]); `-n N` → `(N, 3)`; `-nN` → `(N, 2)`. An unknown
+/// option or an unparsable `N` → `None` (usage error, exit 2).
+fn parse_n(argv: &[String]) -> Option<(u32, usize)> {
+    if argv.len() <= 1 {
+        return Some((10, 1));
+    }
+    let a = &argv[1];
+    if let Some(rest) = a.strip_prefix("-n") {
+        if rest.is_empty() {
+            let n = argv.get(2)?.parse().ok()?;
+            Some((n, 3))
+        } else {
+            let n = rest.parse().ok()?;
+            Some((n, 2))
+        }
+    } else if a.starts_with('-') && a.len() > 1 {
+        None // an unknown option is a usage error
+    } else {
+        Some((10, 1)) // the first arg is a file name
+    }
+}
+
+/// Count the complete (newline-terminated) lines in `buf`.
+fn count_lines(buf: &[u8]) -> u32 {
+    buf.iter().filter(|&&b| b == b'\n').count() as u32
+}
+
+/// Drop the first `k` complete lines (each newline-terminated) from the
+/// front of `buf`. If `buf` holds fewer complete lines than `k` — e.g. `k`
+/// lines plus a trailing unterminated one — everything is dropped. Used by
+/// `tail` to trim its window at EOF, where an unterminated final line
+/// counts as a line.
+fn drop_lines(buf: &[u8], k: u32) -> &[u8] {
+    let mut skip = 0usize;
+    let mut dropped = 0u32;
+    while dropped < k {
+        match buf[skip..].iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                skip += i + 1;
+                dropped += 1;
+            }
+            None => return &[], // fewer complete lines than k: drop all
+        }
+    }
+    &buf[skip..]
+}
+
 /// `wc`: counts lines, words and bytes of its input — stdin, or the
 /// named files in order. Output is `{:>7}`-aligned, one line per source
 /// with the filename for files (v1: no total line). Exits 0 on success,
@@ -489,6 +571,215 @@ pub fn wc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         ctx.data[4..8].copy_from_slice(&words.to_le_bytes());
                         ctx.data[8..12].copy_from_slice(&bytes.to_le_bytes());
                         ctx.data[12] = prev_ws as u8;
+                    }
+                    ReadBlock::WouldBlock => {
+                        return Step::Blocked(BlockReason::Readable(fd));
+                    }
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
+/// `head [-n N] [file...]`: prints the first N lines (default 10) of each
+/// source (stdin, or the named files in order), then exits immediately —
+/// WITHOUT draining the rest of the input. That is the partial-pipe
+/// semantics: the reader leaves the pipe while the writer is still
+/// producing, so once head's fd table is dropped (the shell already
+/// closed its own pipe copies) the writer's next write observes `EPIPE`;
+/// the shell reaps both and `$?` is head's status (0). `-n 0` prints
+/// nothing and exits at once. Data layout: `[phase, file_idx, fd,
+/// remaining u32 LE, files, partial...]` — the trailing partial line
+/// survives the parks and is flushed at EOF without a newline.
+pub fn head<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let (remaining, files) = match parse_n(ctx.argv()) {
+            Some(x) => x,
+            None => return Step::Exit(2),
+        };
+        ctx.data.extend_from_slice(&[0, 0, 0]); // phase, file_idx, fd
+        ctx.data.extend_from_slice(&remaining.to_le_bytes());
+        ctx.data.push(files as u8);
+    }
+    loop {
+        if read_u32(&ctx.data, 3) == 0 {
+            return Step::Exit(0); // `-n 0` (or exhausted): never read
+        }
+        match ctx.data[0] {
+            // Choose the next source: stdin when no files were given,
+            // otherwise the file at file_idx.
+            0 => {
+                let files = ctx.data[7] as usize;
+                let src = if ctx.data[1] == 0 && ctx.argv().len() <= files {
+                    0
+                } else {
+                    let path = match ctx.argv().get(files + ctx.data[1] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(0),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => return Step::Exit(2),
+                    }
+                };
+                ctx.data[0] = 1;
+                ctx.data[2] = src as u8;
+            }
+            1 => {
+                let fd = ctx.data[2] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(fd, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        // EOF: flush the trailing partial line (no
+                        // newline, like head), then the next source.
+                        if ctx.data.len() > 8 {
+                            let tail = ctx.data[8..].to_vec();
+                            if ctx.vfs().write(task, 1, &tail).is_err() {
+                                return Step::Exit(2);
+                            }
+                        }
+                        if fd != 0 {
+                            ctx.vfs().close(task, fd).ok();
+                        }
+                        ctx.data.truncate(8);
+                        ctx.data[0] = 0; // next source
+                        ctx.data[1] += 1;
+                        ctx.data[2] = 0;
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                        // Extract the complete lines (newline included)
+                        // into owned buffers — the writes below need no
+                        // borrow of ctx.data. The trailing partial stays.
+                        let mut lines: Vec<Vec<u8>> = Vec::new();
+                        let mut consumed = 0;
+                        for (i, &b) in ctx.data[8..].iter().enumerate() {
+                            if b == b'\n' {
+                                lines.push(ctx.data[8..=8 + i].to_vec());
+                                consumed = i + 1;
+                            }
+                        }
+                        if consumed > 0 {
+                            ctx.data.drain(8..8 + consumed);
+                        }
+                        let mut remaining = read_u32(&ctx.data, 3);
+                        for line in &lines {
+                            if remaining == 0 {
+                                break;
+                            }
+                            if ctx.vfs().write(task, 1, line).is_err() {
+                                return Step::Exit(2);
+                            }
+                            remaining -= 1;
+                        }
+                        ctx.data[3..7].copy_from_slice(&remaining.to_le_bytes());
+                        if remaining == 0 {
+                            // The N lines are out: leave now, without
+                            // draining the input (partial-pipe semantics
+                            // — the writer's next write fails EPIPE).
+                            return Step::Exit(0);
+                        }
+                    }
+                    ReadBlock::WouldBlock => {
+                        return Step::Blocked(BlockReason::Readable(fd));
+                    }
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
+/// `tail [-n N] [file...]`: prints the last N lines (default 10) of each
+/// source (stdin, or the named files in order). Tail is head's opposite —
+/// it must see EOF to know which lines are last, so it reads the whole
+/// stream (parking on empty pipes like `wc`) and keeps only a sliding
+/// window of the last N complete lines, dropping the oldest as new ones
+/// arrive; an unterminated final line counts as a line at EOF. Data
+/// layout: `[phase, file_idx, fd, n u32 LE, seen u32 LE, files, lines...]`
+/// — `lines` is the raw buffered text; complete lines (newline-terminated)
+/// count into `seen`, and the window keeps `seen <= n`.
+pub fn tail<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let (n, files) = match parse_n(ctx.argv()) {
+            Some(x) => x,
+            None => return Step::Exit(2),
+        };
+        ctx.data.extend_from_slice(&[0, 0, 0]); // phase, file_idx, fd
+        ctx.data.extend_from_slice(&n.to_le_bytes());
+        ctx.data.extend_from_slice(&0u32.to_le_bytes()); // seen
+        ctx.data.push(files as u8);
+    }
+    loop {
+        match ctx.data[0] {
+            // Choose the next source: stdin when no files were given,
+            // otherwise the file at file_idx.
+            0 => {
+                let files = ctx.data[11] as usize;
+                let src = if ctx.data[1] == 0 && ctx.argv().len() <= files {
+                    0
+                } else {
+                    let path = match ctx.argv().get(files + ctx.data[1] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(0),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => return Step::Exit(2),
+                    }
+                };
+                ctx.data[0] = 1;
+                ctx.data[2] = src as u8;
+            }
+            1 => {
+                let fd = ctx.data[2] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(fd, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        // EOF: an unterminated final line counts as one
+                        // more; drop any overflow, then emit the window.
+                        let n = read_u32(&ctx.data, 3);
+                        let seen = read_u32(&ctx.data, 7);
+                        let partial =
+                            ctx.data.len() > 12 && ctx.data[ctx.data.len() - 1] != b'\n';
+                        let total = seen + partial as u32;
+                        let drop = total.saturating_sub(n);
+                        let out = if drop > 0 {
+                            drop_lines(&ctx.data[12..], drop).to_vec()
+                        } else {
+                            ctx.data[12..].to_vec()
+                        };
+                        if ctx.vfs().write(task, 1, &out).is_err() {
+                            return Step::Exit(2);
+                        }
+                        if fd != 0 {
+                            ctx.vfs().close(task, fd).ok();
+                        }
+                        ctx.data.truncate(12);
+                        ctx.data[0] = 0; // next source
+                        ctx.data[1] += 1;
+                        ctx.data[2] = 0;
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                        let n_total = read_u32(&ctx.data, 3);
+                        // Re-count the complete lines now in the buffer and
+                        // trim the window from the front.
+                        let mut seen = count_lines(&ctx.data[12..]);
+                        while seen > n_total {
+                            let idx = ctx.data[12..]
+                                .iter()
+                                .position(|&b| b == b'\n')
+                                .expect("seen counts newlines");
+                            ctx.data.drain(12..=12 + idx);
+                            seen -= 1;
+                        }
+                        ctx.data[7..11].copy_from_slice(&seen.to_le_bytes());
                     }
                     ReadBlock::WouldBlock => {
                         return Step::Blocked(BlockReason::Readable(fd));
@@ -1485,6 +1776,8 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("cat", cat);
     pm.register_applet("grep", grep);
     pm.register_applet("wc", wc);
+    pm.register_applet("head", head);
+    pm.register_applet("tail", tail);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -1808,6 +2101,58 @@ mod tests {
         let mut prev_ws = false;
         count_chunk(b"", &mut lines, &mut words, &mut prev_ws);
         assert_eq!((lines, words, prev_ws), (0, 0, false));
+    }
+
+    #[test]
+    fn parse_n_reads_the_line_count() {
+        use super::parse_n;
+        let av = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Default: 10 lines, first file arg at argv[1].
+        assert_eq!(parse_n(&av(&["head"])), Some((10, 1)));
+        assert_eq!(parse_n(&av(&["head", "file"])), Some((10, 1)));
+        // `-n N` (two-arg form) and `-nN` (attached) shift the file args.
+        assert_eq!(parse_n(&av(&["head", "-n", "5"])), Some((5, 3)));
+        assert_eq!(parse_n(&av(&["tail", "-n5"])), Some((5, 2)));
+        assert_eq!(parse_n(&av(&["head", "-n", "0"])), Some((0, 3)));
+        assert_eq!(
+            parse_n(&av(&["head", "-n", "5", "a", "b"])),
+            Some((5, 3))
+        );
+        // An unparsable count or an unknown option is a usage error.
+        assert_eq!(parse_n(&av(&["head", "-n", "abc"])), None);
+        assert_eq!(parse_n(&av(&["head", "-x"])), None);
+        assert_eq!(parse_n(&av(&["head", "-n"])), None); // missing count
+        // A negative count is not supported (usage error).
+        assert_eq!(parse_n(&av(&["head", "-n", "-5"])), None);
+    }
+
+    #[test]
+    fn drop_lines_trims_the_window() {
+        use super::drop_lines;
+        assert_eq!(drop_lines(b"a\nb\nc\n", 0), b"a\nb\nc\n");
+        assert_eq!(drop_lines(b"a\nb\nc\n", 1), b"b\nc\n");
+        assert_eq!(drop_lines(b"a\nb\nc\n", 2), b"c\n");
+        assert_eq!(drop_lines(b"a\nb\nc\n", 3), b"");
+        // Dropping more complete lines than exist drops everything,
+        // including a trailing unterminated line.
+        assert_eq!(drop_lines(b"a\nb\nc\n", 5), b"");
+        // A partial (unterminated) final line survives the drop of the
+        // complete lines before it...
+        assert_eq!(drop_lines(b"a\npartial", 1), b"partial");
+        // ...but is gone when it must be dropped too.
+        assert_eq!(drop_lines(b"a\npartial", 2), b"");
+        // A buffer with no newline at all is one (unterminated) line.
+        assert_eq!(drop_lines(b"partial", 1), b"");
+        assert_eq!(drop_lines(b"", 1), b"");
+    }
+
+    #[test]
+    fn count_lines_counts_newlines() {
+        use super::count_lines;
+        assert_eq!(count_lines(b""), 0);
+        assert_eq!(count_lines(b"ab"), 0);
+        assert_eq!(count_lines(b"a\nb\n"), 2);
+        assert_eq!(count_lines(b"a\nb"), 1); // trailing partial is not a line
     }
 
     #[test]
