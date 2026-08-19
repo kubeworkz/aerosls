@@ -27,7 +27,10 @@
 //!   in lexicographic byte order), `seq` (the pure producer:
 //!   integers `FIRST..LAST` by `STEP`, one per line), `tee` (fans
 //!   each chunk to stdout and named files, parking on a full pipe
-//!   without rewriting the files), `true`/`false` — plus
+//!   without rewriting the files), `tr` (maps each byte through a
+//!   256-byte table built once at init, or deletes them — ranges
+//!   `a-z` and `\n`/`\t`/`\\` escapes in the sets, `SET2`'s last
+//!   byte repeating for a longer `SET1`), `true`/`false` — plus
 //!   `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.

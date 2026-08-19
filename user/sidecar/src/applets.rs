@@ -42,6 +42,11 @@
 //!   each named file per chunk; a full stdout pipe parks without
 //!   rewriting the files, and an early-exiting reader (`tee | head`)
 //!   wakes the stdout retry to `EPIPE`.
+//! - **`tr`** — the streaming character filter: `tr SET1 SET2` maps
+//!   each byte (a 256-byte table built once at init; `SET2`'s last byte
+//!   repeats for a longer `SET1`) and `tr -d SET1` deletes, with ranges
+//!   (`a-z`) and backslash escapes in the sets; a full pipe parks with
+//!   the translated chunk pending.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -563,6 +568,95 @@ fn line_key(line: &[u8]) -> &[u8] {
         &line[..line.len() - 1]
     } else {
         line
+    }
+}
+
+/// Parse one character of a `tr` SET: a literal byte, or a backslash
+/// escape (`\n` `\t` `\r` `\\`; an unknown escape is the literal
+/// character — `\x` is `x`). Returns the byte and the index after it;
+/// a trailing backslash is malformed (`None`).
+fn parse_set_char(b: &[u8], i: usize) -> Option<(u8, usize)> {
+    match *b.get(i)? {
+        b'\\' => {
+            let e = *b.get(i + 1)?;
+            let c = match e {
+                b'n' => b'\n',
+                b't' => b'\t',
+                b'r' => b'\r',
+                b'\\' => b'\\',
+                other => other,
+            };
+            Some((c, i + 2))
+        }
+        c => Some((c, i + 1)),
+    }
+}
+
+/// Expand a `tr` SET string into its byte sequence: literal characters,
+/// ranges `c1-c2` (ascending; a descending range like `z-a` is an
+/// error), and backslash escapes. A `-` at the start or end of the set
+/// is a literal minus, and a range never extends past an escape — so
+/// `a-\\n` is `a`, `-`, newline. A trailing backslash is malformed
+/// (`None`).
+fn expand_set(set: &str) -> Option<Vec<u8>> {
+    let b = set.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let (c1, next) = parse_set_char(b, i)?;
+        // A range only when a `-` follows and the char after it is a
+        // literal (not an escape and not the end of the set).
+        if next < b.len() && b[next] == b'-' && next + 1 < b.len() && b[next + 1] != b'\\' {
+            let (c2, after) = parse_set_char(b, next + 1)?;
+            if c1 > c2 {
+                return None;
+            }
+            out.extend(c1..=c2);
+            i = after;
+        } else {
+            out.push(c1);
+            i = next;
+        }
+    }
+    Some(out)
+}
+
+/// Build `tr`'s map table: byte → its translation. Bytes in `s1` map to
+/// the corresponding `s2` byte, with `s2`'s last byte repeated for a
+/// longer `s1` (GNU semantics); everything else is the identity. `s2`
+/// must be non-empty (the caller rejects an empty second set).
+fn build_map(s1: &[u8], s2: &[u8]) -> [u8; 256] {
+    let mut t = [0u8; 256];
+    for (i, slot) in t.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    for (i, &b) in s1.iter().enumerate() {
+        t[b as usize] = s2[i.min(s2.len() - 1)];
+    }
+    t
+}
+
+/// Build `tr -d`'s membership table: 1 for the bytes in `s1`, else 0.
+fn build_delete(s1: &[u8]) -> [u8; 256] {
+    let mut t = [0u8; 256];
+    for &b in s1 {
+        t[b as usize] = 1;
+    }
+    t
+}
+
+/// Apply the table to a chunk: map mode (`delete` false) translates
+/// every byte through the table; delete mode drops the bytes the table
+/// marks.
+fn tr_chunk(chunk: &[u8], table: &[u8], delete: bool) -> Vec<u8> {
+    if delete {
+        chunk
+            .iter()
+            .filter(|&&b| table[b as usize] == 0)
+            .copied()
+            .collect()
+    } else {
+        chunk.iter().map(|&b| table[b as usize]).collect()
     }
 }
 
@@ -1133,6 +1227,88 @@ pub fn tee<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                             ctx.data[0] = 1; // back to reading
                         } else {
                             ctx.data.drain(hdr..hdr + k);
+                        }
+                    }
+                    WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                    WriteBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
+/// `tr SET1 SET2` / `tr -d SET1`: the streaming character filter. Map
+/// mode translates each input byte through a 256-byte table built once
+/// at init (`SET1` → corresponding `SET2` byte, `SET2`'s last byte
+/// repeated for a longer `SET1`); delete mode drops the `SET1` bytes.
+/// Sets support ranges (`a-z`) and backslash escapes (`\n` `\t` `\r`
+/// `\\`); a descending range (`z-a`), an empty `SET2`, or a trailing
+/// backslash is a usage error (exit 2). Reads via `read_blocking` and
+/// writes via `write_blocking` — an empty pipe parks on `Readable`, a
+/// full one on `Writable` with the translated chunk still pending, and
+/// an early-exiting reader (`tr | head`) wakes the retry to `EPIPE`
+/// (exit 2). Data layout: `[phase, mode, table (256 B), pending...]` —
+/// `mode` 0 = map, 1 = delete; the pending buffer is the translated
+/// chunk not yet fully written.
+pub fn tr<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if ctx.data.is_empty() {
+        // Copy the args out: argv borrows the manager, and building the
+        // table pushes into ctx.data.
+        let (delete, s1, s2) = match ctx.argv().len() {
+            3 if ctx.argv()[1] == "-d" => (true, ctx.argv()[2].clone(), String::new()),
+            3 => (false, ctx.argv()[1].clone(), ctx.argv()[2].clone()),
+            _ => return Step::Exit(2),
+        };
+        let s1 = match expand_set(&s1) {
+            Some(v) => v,
+            None => return Step::Exit(2),
+        };
+        let table: Vec<u8> = if delete {
+            build_delete(&s1).to_vec()
+        } else {
+            if s2.is_empty() {
+                return Step::Exit(2); // empty SET2: nothing to map to
+            }
+            let s2 = match expand_set(&s2) {
+                Some(v) => v,
+                None => return Step::Exit(2),
+            };
+            build_map(&s1, &s2).to_vec()
+        };
+        ctx.data.push(0); // phase: read a chunk
+        ctx.data.push(delete as u8); // mode
+        ctx.data.extend_from_slice(&table); // table at 2..258
+    }
+    let delete = ctx.data[1] == 1;
+    loop {
+        match ctx.data[0] {
+            // Read a chunk, translate it, append to pending.
+            0 => {
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(0, &mut buf) {
+                    ReadBlock::Data(0) => return Step::Exit(0),
+                    ReadBlock::Data(n) => {
+                        let table = ctx.data[2..258].to_vec();
+                        let out = tr_chunk(&buf[..n], &table, delete);
+                        ctx.data.extend_from_slice(&out);
+                        ctx.data[0] = 1;
+                    }
+                    ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(0)),
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            // Write the pending chunk, parking on a full pipe. The copy
+            // keeps ctx.data unborrowed across the write.
+            1 => {
+                let pending = ctx.data[258..].to_vec();
+                match ctx.write_blocking(1, &pending) {
+                    WriteBlock::Data(k) => {
+                        if k == pending.len() {
+                            ctx.data.truncate(258);
+                            ctx.data[0] = 0;
+                        } else {
+                            ctx.data.drain(258..258 + k);
                         }
                     }
                     WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
@@ -2133,6 +2309,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("sort", sort);
     pm.register_applet("seq", seq);
     pm.register_applet("tee", tee);
+    pm.register_applet("tr", tr);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -2539,6 +2716,48 @@ mod tests {
         assert_eq!(parse_seq_args(&av(&["seq", "1", "0", "5"])), None);
         // Negative values are rejected (v1 is non-negative integers).
         assert_eq!(parse_seq_args(&av(&["seq", "-5"])), None);
+    }
+
+    #[test]
+    fn expand_set_expands_ranges_and_escapes() {
+        use super::expand_set;
+        // Literals pass through; ranges expand ascending.
+        assert_eq!(expand_set("abc"), Some(b"abc".to_vec()));
+        assert_eq!(expand_set("a-cx-z"), Some(b"abcxyz".to_vec()));
+        assert_eq!(expand_set("a-z"), Some(b"abcdefghijklmnopqrstuvwxyz".to_vec()));
+        // A leading or trailing `-` is a literal minus.
+        assert_eq!(expand_set("-a"), Some(b"-a".to_vec()));
+        assert_eq!(expand_set("a-"), Some(b"a-".to_vec()));
+        assert_eq!(expand_set("a-z-"), Some(b"abcdefghijklmnopqrstuvwxyz-".to_vec()));
+        // Escapes: newline, tab, CR, backslash.
+        assert_eq!(expand_set("\\n\\t\\r\\\\"), Some(vec![b'\n', b'\t', b'\r', b'\\']));
+        // A range never extends past an escape: `a-\n` is a, -, newline.
+        assert_eq!(expand_set("a-\\n"), Some(b"a-\n".to_vec()));
+        // Malformed sets: descending range, trailing backslash.
+        assert_eq!(expand_set("z-a"), None);
+        assert_eq!(expand_set("a\\"), None);
+    }
+
+    #[test]
+    fn build_table_and_tr_chunk_translate_and_delete() {
+        use super::{build_delete, build_map, tr_chunk};
+        // `tr a-z A-Z`: lower-case maps to upper, everything else passes.
+        let t = build_map(b"abcdefghijklmnopqrstuvwxyz", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        assert_eq!(tr_chunk(b"hello world", &t, false), b"HELLO WORLD".to_vec());
+        // A longer SET1 repeats SET2's last byte (GNU semantics).
+        let t = build_map(b"abc", b"x");
+        assert_eq!(tr_chunk(b"abcabc", &t, false), b"xxxxxx".to_vec());
+        // Bytes outside SET1 are the identity.
+        let t = build_map(b"aeiou", b"AEIOU");
+        assert_eq!(tr_chunk(b"hello", &t, false), b"hEllO".to_vec());
+        // `tr -d`: set members drop, everything else passes.
+        let t = build_delete(b"l");
+        assert_eq!(tr_chunk(b"hello", &t, true), b"heo".to_vec());
+        let t = build_delete(b"aeiou");
+        assert_eq!(tr_chunk(b"hello world", &t, true), b"hll wrld".to_vec());
+        // An empty delete set keeps everything.
+        let t = build_delete(b"");
+        assert_eq!(tr_chunk(b"abc", &t, true), b"abc".to_vec());
     }
 
     #[test]

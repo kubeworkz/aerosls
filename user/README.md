@@ -72,7 +72,11 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # integers FIRST..LAST by STEP, filling the pipe and
                   # parking), tee (fans each chunk to stdout and to
                   # named files, parking on a full pipe without
-                  # rewriting the files), echo, sh (minimal
+                  # rewriting the files), tr (maps bytes through a
+                  # 256-byte table built once at init, or deletes
+                  # them — ranges a-z and \n/\t/\\ escapes in the
+                  # sets, SET2's last byte repeats for a longer SET1),
+                  # echo, sh (minimal
                   # interactive shell — console
                   # commands, | pipelines (waiting for every stage,
                   # $? = the last stage's status),
@@ -306,8 +310,11 @@ script + the manifest's `image` record) is the sidecar build step; see
   pinning last-stage-wins: `false | echo hi` → 0, `echo hi | false`
   → 1, three-stage `false | seq 3 | true` → 0 and `seq 3 | true
   | false` → 1, and a missing last command (`echo hi | nope`) → 127
-  — through the real driver, asserting the console transcript byte
-  for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  — plus a tr session (`echo hello | tr h H`, `echo hello | tr
+  a-z A-Z`, `echo hello | tr -d l`, `seq 5 | tr 1-3 XYZ`, and
+  `cat /etc/passwd | tr : ,` — the map, the range, the delete,
+  and the byte-stream pipeline forms) — through the real driver,
+  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.

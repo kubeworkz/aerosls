@@ -165,6 +165,7 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/sort", b"sort\n", 0o755);
     b.add_file("/bin/seq", b"seq\n", 0o755);
     b.add_file("/bin/tee", b"tee\n", 0o755);
+    b.add_file("/bin/tr", b"tr\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/true", b"true\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
@@ -605,10 +606,25 @@ fn boot_runs_an_interactive_shell() {
     booted.run(100);
     console.console_io().push_input(b"echo $?\n");
     booted.run(100);
+    // tr maps and deletes per byte, with ranges in the sets: the h→H
+    // single-char map, the a-z→A-Z range, the -d deletion, the digit
+    // range through a seq pipeline, and the passwd field separator swap
+    // through a file pipeline — each chunk translated once, EOF from the
+    // pipe fd closure driving the filter to its end.
+    console.console_io().push_input(b"echo hello | tr h H\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo hello | tr a-z A-Z\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo hello | tr -d l\n");
+    booted.run(100);
+    console.console_io().push_input(b"seq 5 | tr 1-3 XYZ\n");
+    booted.run(100);
+    console.console_io().push_input(b"cat /etc/passwd | tr : ,\n");
+    booted.run(100);
     assert_eq!(
         console.console_io().output(),
-        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ hi\n$ 0\n$ $ 1\n$ $ 0\n$ $ 1\n$ $ 127\n$ ",
-        "tee fanned the stream to the console and the file, outlived head's early exit, and $? followed the last pipeline stage"
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ hi\n$ 0\n$ $ 1\n$ $ 0\n$ $ 1\n$ $ 127\n$ Hello\n$ HELLO\n$ heo\n$ X\nY\nZ\n4\n5\n$ root,x,0,0,root,/root,/bin/sh\n$ ",
+        "tee fanned the stream to the console and the file, $? followed the last pipeline stage, and tr mapped/deleted per byte through pipelines"
     );
 
     // The file side of the fan-out: t5.out holds the exact stream, and
