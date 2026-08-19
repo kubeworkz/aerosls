@@ -14,7 +14,8 @@
 //! - `applets`    — the built-in registry: the `init` boot-script runner
 //!   (executes `/etc/init.rc`, one forked child per command), `cat`, `echo`,
 //!   `sh` (the minimal interactive shell — console commands, pipelines,
-//!   `<`/`>` redirects, `$?`), `true`/`false` — plus
+//!   `<`/`>` redirects, `'...'`/`"..."` quoting, `$?`), `true`/`false`
+//!   — plus
 //!   `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.

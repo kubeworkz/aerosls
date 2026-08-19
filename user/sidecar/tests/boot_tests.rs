@@ -261,6 +261,26 @@ fn boot_runs_an_interactive_shell() {
         "the shell parked after draining the batch"
     );
 
+    // Quoting: double quotes keep a space inside one argument, so the
+    // two-word payload survives tokenization through the pipeline.
+    console.console_io().push_input(b"echo \"hello world\" | cat\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ ",
+        "double quotes grouped the two-word argument through the pipeline"
+    );
+
+    // Single quotes keep `$?` literal — no expansion inside, so the shell
+    // prints the two characters instead of the last status.
+    console.console_io().push_input(b"echo '$?'\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ ",
+        "single quotes kept the $? token literal"
+    );
+
     client.kill_driver(0);
     t.join().unwrap();
 }

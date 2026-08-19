@@ -23,7 +23,9 @@
 //!   console), forks one child per pipeline stage, waits, and tracks the
 //!   last exit status as `$?` (expandable in the next command). `<` /
 //!   `>` redirect stdin/stdout per stage (the redirect overrides the
-//!   pipeline connection, like POSIX).
+//!   pipeline connection, like POSIX), and single / double quotes group
+//!   whitespace into one argument (`'…'` fully literal, `"…"` still
+//!   expanding `$?`).
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
@@ -560,23 +562,129 @@ pub(crate) struct Stage {
     pub out_redir: Option<String>,
 }
 
-/// Parse one command line into pipeline stages. Tokens are
-/// whitespace-split; a lone `|` token separates stages; `>` / `<` mark
-/// the next token as the stdout / stdin redirect target (the target is
-/// not part of argv; a trailing redirect with no target records an empty
-/// path, which the stage child fails to open → exit 127). `$?` expands to
-/// the last exit status. Empty stages are skipped (a stray `|` cannot
-/// produce a stage with no command). Returns [] for a blank line. v1: no
-/// quoting, no `>>`, spaces required around `|`.
+/// One token of a parsed command line: a word (possibly empty — `""` is
+/// still an argument, like POSIX), or a pipeline / redirect metacharacter.
+#[derive(Debug, PartialEq, Eq)]
+enum Tok {
+    Word(String),
+    Pipe,
+    RedirectIn,
+    RedirectOut,
+}
+
+/// Tokenize a command line into words and metacharacters, honoring single
+/// and double quotes. A quoted section is a literal part of its word, so
+/// quotes group whitespace — and, quoted, the metacharacters `|` `<` `>`
+/// — into a single argument. `$?` expands to the last exit status
+/// wherever it appears: unquoted, and inside double quotes (POSIX).
+/// Single quotes are fully literal, so `'$?'` stays `$?`. An unterminated
+/// quote runs to the end of the line (v1 is lenient — no syntax error).
+/// Backslash is literal (no escapes in v1).
+fn tokenize(line: &str, last_status: u8) -> Vec<Tok> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false; // the current word contains a quoted part
+    macro_rules! flush {
+        () => {
+            if !word.is_empty() || quoted {
+                toks.push(Tok::Word(core::mem::take(&mut word)));
+                quoted = false;
+            }
+        };
+    }
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            ' ' | '\t' => {
+                flush!();
+                i += 1;
+            }
+            // Unquoted metacharacters end the current word and stand
+            // alone; quoted versions (handled in the quote arms) stay
+            // literal parts of a word.
+            '|' => {
+                flush!();
+                toks.push(Tok::Pipe);
+                i += 1;
+            }
+            '<' => {
+                flush!();
+                toks.push(Tok::RedirectIn);
+                i += 1;
+            }
+            '>' => {
+                flush!();
+                toks.push(Tok::RedirectOut);
+                i += 1;
+            }
+            '\'' => {
+                quoted = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    word.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1; // the closing quote
+                }
+            }
+            '"' => {
+                quoted = true;
+                i += 1;
+                loop {
+                    if i >= chars.len() {
+                        break;
+                    }
+                    if chars[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    if chars[i] == '$' && chars.get(i + 1) == Some(&'?') {
+                        word.push_str(&last_status.to_string());
+                        i += 2;
+                    } else {
+                        word.push(chars[i]);
+                        i += 1;
+                    }
+                }
+            }
+            '$' if chars.get(i + 1) == Some(&'?') => {
+                word.push_str(&last_status.to_string());
+                i += 2;
+            }
+            _ => {
+                word.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !word.is_empty() || quoted {
+        toks.push(Tok::Word(word));
+    }
+    toks
+}
+
+/// Parse one command line into pipeline stages. `tokenize` splits it into
+/// words and metacharacters (see `tokenize` for the quote semantics); a
+/// lone unquoted `|` token separates stages; `>` / `<` mark the next word
+/// as the stdout / stdin redirect target (the target is not part of argv;
+/// a trailing or metachar redirect records an empty path, which the stage
+/// child fails to open → exit 127). Empty stages are skipped (a stray `|`
+/// cannot produce a stage with no command). Returns [] for a blank line.
+/// v1: no `>>`, and `|` / redirects need surrounding spaces (a quoted
+/// version is a literal word).
 fn parse_line(line: &str, last_status: u8) -> Vec<Stage> {
+    let toks = tokenize(line, last_status);
     let mut stages: Vec<Stage> = Vec::new();
     let mut argv: Vec<String> = Vec::new();
     let mut in_redir: Option<String> = None;
     let mut out_redir: Option<String> = None;
-    let mut tokens = line.split_whitespace();
-    while let Some(t) = tokens.next() {
-        match t {
-            "|" => {
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Tok::Pipe => {
                 if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() {
                     stages.push(Stage {
                         argv: core::mem::take(&mut argv),
@@ -584,11 +692,32 @@ fn parse_line(line: &str, last_status: u8) -> Vec<Stage> {
                         out_redir: out_redir.take(),
                     });
                 }
+                i += 1;
             }
-            ">" => out_redir = Some(tokens.next().unwrap_or("").to_string()),
-            "<" => in_redir = Some(tokens.next().unwrap_or("").to_string()),
-            "$?" => argv.push(last_status.to_string()),
-            _ => argv.push(t.to_string()),
+            Tok::RedirectOut => match toks.get(i + 1) {
+                Some(Tok::Word(w)) => {
+                    out_redir = Some(w.clone());
+                    i += 2;
+                }
+                _ => {
+                    out_redir = Some(String::new());
+                    i += 1;
+                }
+            },
+            Tok::RedirectIn => match toks.get(i + 1) {
+                Some(Tok::Word(w)) => {
+                    in_redir = Some(w.clone());
+                    i += 2;
+                }
+                _ => {
+                    in_redir = Some(String::new());
+                    i += 1;
+                }
+            },
+            Tok::Word(w) => {
+                argv.push(w.clone());
+                i += 1;
+            }
         }
     }
     if !argv.is_empty() || in_redir.is_some() || out_redir.is_some() {
@@ -695,5 +824,46 @@ mod tests {
         assert_eq!(parse_line("", 0), Vec::<Stage>::new());
         assert_eq!(parse_line("   \t ", 3), Vec::<Stage>::new());
         assert_eq!(parse_line("| true |", 0), vec![st(&["true"])]);
+    }
+
+    #[test]
+    fn parse_line_quotes_group_whitespace() {
+        // Double quotes keep a space inside one argument.
+        assert_eq!(
+            parse_line("echo \"hello world\" | cat", 0),
+            vec![st(&["echo", "hello world"]), st(&["cat"])]
+        );
+        // Single quotes behave the same way.
+        assert_eq!(parse_line("echo 'a b' c", 0), vec![st(&["echo", "a b", "c"])]);
+        // Quoted sections join with the surrounding unquoted word.
+        assert_eq!(parse_line("echo a\"b c\"d", 0), vec![st(&["echo", "ab cd"])]);
+        // An empty quoted word is still an argument (POSIX: echo "" passes
+        // it through — the applet prints an empty line).
+        assert_eq!(parse_line("echo \"\"", 0), vec![st(&["echo", ""])]);
+    }
+
+    #[test]
+    fn parse_line_quotes_are_literal() {
+        // Quoted metacharacters are words, not operators.
+        assert_eq!(
+            parse_line("echo \"|\" | cat", 0),
+            vec![st(&["echo", "|"]), st(&["cat"])]
+        );
+        assert_eq!(parse_line("echo \"x > y\"", 0), vec![st(&["echo", "x > y"])]);
+        // `$?` is literal inside single quotes...
+        assert_eq!(parse_line("echo '$?'", 7), vec![st(&["echo", "$?"])]);
+        // ...but expands inside double quotes, like POSIX.
+        assert_eq!(parse_line("echo \"$?\"", 7), vec![st(&["echo", "7"])]);
+        // Redirect targets can be quoted paths (spaces survive).
+        assert_eq!(
+            parse_line("cat < \"my file\"", 0),
+            vec![Stage {
+                argv: vec!["cat".to_string()],
+                in_redir: Some("my file".to_string()),
+                out_redir: None,
+            }]
+        );
+        // An unterminated quote runs to the end of the line (v1 lenient).
+        assert_eq!(parse_line("echo 'oops", 0), vec![st(&["echo", "oops"])]);
     }
 }

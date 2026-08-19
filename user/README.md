@@ -62,8 +62,9 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
   src/applets.rs  # the built-in registry: init (the /etc/init.rc boot-script
                   # runner — one forked child per command, with a > stdout
                   # redirect), cat, echo, sh (minimal interactive shell —
-                  # console commands, | pipelines, $? last-exit-status),
-                  # true/false + register_default_applets
+                  # console commands, | pipelines, $? last-exit-status,
+                  # '...'/"..." quoting, < and > redirects), true/false
+                  # + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
                   # and boot(): handshake with the ramdisk driver, mount /
                   # (aerofs), /dev (console + null), /tmp (ramfs), install
@@ -226,15 +227,17 @@ script + the manifest's `image` record) is the sidecar build step; see
   end. On top of init sits `applets::sh`, a minimal interactive shell:
   it prompts on the console, parks on empty input via the blocking-read
   machinery, buffers multi-line input into a batch queue (a pasted chunk
-  runs line by line with one prompt around it, nothing dropped), forks
-  one child per pipeline stage (resolving bare command names through
+  runs line by line with one prompt around it, nothing dropped),  forks one child per pipeline stage (resolving bare command names through
   `/bin`, like BusyBox), applies per-stage `<` / `>` redirects (which
-  override the pipeline connection at fd 0/1, like POSIX), waits, and
-  tracks the last exit status as `$?` — the boot test drives a full
+  override the pipeline connection at fd 0/1, like POSIX), and parses
+  single / double quotes (grouping whitespace into one argument — `'…'`
+  fully literal, `"…"` still expanding `$?`), waits, and tracks the
+  last exit status as `$?` — the boot test drives a full
   `echo hello | cat` pipeline, a `false` → `echo $?` sequence, an
-  `echo saved > /tmp/saved` file write, a `cat < /etc/passwd` read, and
-  a pasted two-line batch through the real driver, asserting the console
-  transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  `echo saved > /tmp/saved` file write, a `cat < /etc/passwd` read,
+  a pasted two-line batch, and quoted arguments
+  (`echo "hello world" | cat`, `echo '$?'` printed literally) through
+  the real driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
