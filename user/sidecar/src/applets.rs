@@ -2029,7 +2029,7 @@ fn valid_name(name: &str) -> bool {
 /// task. v1: recognized only as the bare name (no `/`), standalone
 /// (no pipeline) — see `run_line`.
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill" | "cd" | "pwd" | "jobs" | "fg")
+    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill" | "cd" | "pwd" | "jobs" | "fg" | "bg")
 }
 
 /// Apply a stage's `<` / `>` redirects at fd 0 / fd 1. Returns false on
@@ -2718,6 +2718,7 @@ fn run_builtin<K: Kernel, A: BufferAlloc>(
         "cd" => do_cd(ctx, &stage.argv[1..]),
         "pwd" => do_pwd(ctx),
         "jobs" => do_jobs(ctx),
+        "bg" => do_bg(ctx, &stage.argv[1..]),
         _ => 2, // unreachable: is_builtin guards the call
     };
     builtin_done(ctx, remainder, &new_env, code)
@@ -2944,6 +2945,41 @@ fn do_jobs<K: Kernel, A: BufferAlloc>(
     } else {
         0
     }
+}
+
+/// `bg` builtin: resume a background job (mark it as running). In our
+/// cooperative scheduler there is no real SIGTSTP, so this is a no-op
+/// that validates the job exists and prints a diagnostic.  Accepts an
+/// optional job ID (`bg` or `bg %1`); defaults to the most recent job.
+fn do_bg<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    args: &[String],
+) -> u8 {
+    let task = ctx.task;
+    let (_nj, entries) = jobs_decode(&ctx.data);
+    if entries.is_empty() {
+        let msg = alloc::format!("bg: no current job\n");
+        ctx.vfs().write(task, 1, msg.as_bytes()).ok();
+        return 1;
+    }
+    let idx = if let Some(arg) = args.first() {
+        let num_str = arg.trim_start_matches('%');
+        match num_str.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= entries.len() => n - 1,
+            _ => {
+                let msg = alloc::format!("bg: invalid job id\n");
+                ctx.vfs().write(task, 1, msg.as_bytes()).ok();
+                return 1;
+            }
+        }
+    } else {
+        entries.len() - 1
+    };
+    // In v1 there is no real stop/continue, so bg is a no-op that
+    // confirms the job is running.
+    let msg = alloc::format!("[{}] {}\n", idx + 1, entries[idx].1);
+    ctx.vfs().write(task, 1, msg.as_bytes()).ok();
+    0
 }
 
 /// `fg` builtin: bring a background job to the foreground. Waits for

@@ -1862,3 +1862,104 @@ fn sigint_kills_foreground_not_background() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// fg with a job number argument targets the specified background job.
+#[test]
+fn fg_percent_number_targets_specific_job() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start two background jobs: echo A (fast) and sleep 999 (slow).
+    console.console_io().push_input(b"echo A &\n");
+    booted.run(200);
+    console.console_io().push_input(b"sleep 999 &\n");
+    booted.run(200);
+
+    // jobs should show both.
+    console.console_io().push_input(b"jobs\n");
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    assert!(out.windows(2).any(|w| w == b"A\n"),
+        "jobs shows echo A output, got: {:?}", out);
+
+    // fg %1 should target the first (echo) job.
+    console.console_io().push_input(b"fg %1\n");
+    booted.run(200);
+
+    // fg %2 should target the second (sleep 999) job — timeout.
+    console.console_io().push_input(b"fg %2\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    let prompt_count = out.windows(2).filter(|w| *w == b"$ ").count();
+    assert!(prompt_count >= 4,
+        "fg %2 timed out and re-prompted ({} prompts), got: {:?}", prompt_count, out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// bg builtin validates and lists the background job.
+#[test]
+fn bg_builtin_lists_background_job() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a background job.
+    console.console_io().push_input(b"sleep 5 &\n");
+    booted.run(200);
+
+    // bg should report the job.
+    console.console_io().push_input(b"bg\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(3).any(|w| w == b"[1]"),
+        "bg shows job [1], got: {:?}", out);
+    assert!(out.windows(5).any(|w| w == b"sleep"),
+        "bg shows sleep command, got: {:?}", out);
+    assert!(out.ends_with(b"$ "), "back to prompt, got: {:?}", out);
+
+    // Start a long-running job so the table is non-empty.
+    console.console_io().push_input(b"sleep 999 &\n");
+    booted.run(200);
+
+    // bg with invalid job id should fail.
+    console.console_io().push_input(b"bg %99\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(7).any(|w| w == b"invalid"),
+        "bg %99 reports error, got: {:?}", out);
+
+    // bg with no jobs should fail — wait for sleep to finish.
+    booted.run(1000);
+    // Push an empty line to trigger the done check.
+    console.console_io().push_input(b"\n");
+    booted.run(200);
+    console.console_io().push_input(b"bg\n");
+    booted.run(200);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
