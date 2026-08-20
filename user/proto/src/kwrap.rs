@@ -6,8 +6,27 @@
 //! changing the generic `K: Kernel` bound everywhere.
 
 use alloc::sync::Arc;
+use spin::Mutex;
 
 use crate::kabi::{CapInfo, GrantedCap, Kernel, RecvResult, SendCap};
+
+/// Buffer acquisition for request grants. Moved here from blockcache so
+/// both blockcache and net_client can share the same allocator type.
+pub trait BufferAlloc {
+    fn alloc(&mut self, len: usize) -> Result<(SendCap, u64), i32>;
+}
+
+/// An `Arc`-wrapped buffer allocator with interior mutability.
+/// Uses `spin::Mutex` (not `RefCell`) so the wrapper is `Send + Sync`
+/// and can be moved across threads (e.g. the block cache driver thread).
+#[derive(Clone)]
+pub struct AWrap<A: BufferAlloc>(pub Arc<Mutex<A>>);
+
+impl<A: BufferAlloc> BufferAlloc for AWrap<A> {
+    fn alloc(&mut self, size: usize) -> Result<(SendCap, u64), i32> {
+        self.0.lock().alloc(size)
+    }
+}
 
 /// An `Arc`-wrapped kernel. Implements `Kernel` by delegating to the
 /// inner `K`. `Clone` is cheap (Arc pointer copy).
@@ -42,5 +61,8 @@ impl<K: Kernel> Kernel for KWrap<K> {
     }
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
         self.0.cap_info(handle)
+    }
+    fn poll(&self, chan: u32) -> Result<u16, i32> {
+        self.0.poll(chan)
     }
 }

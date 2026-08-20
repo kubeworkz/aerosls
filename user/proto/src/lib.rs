@@ -36,6 +36,9 @@ pub mod kabi;
 pub mod kwrap;
 pub mod sockops;
 
+/// Re-export `spin::Mutex` for use in AWrap constructors across crates.
+pub use spin::Mutex;
+
 /// ── Boot Info Block + packed sidecar manifest (kernel ↔ sidecar contract) ──
 
 pub mod bootinfo;

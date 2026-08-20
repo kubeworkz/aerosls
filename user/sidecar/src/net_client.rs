@@ -19,25 +19,12 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 
-use core::cell::RefCell;
-use alloc::sync::Arc;
-
 use aerosls_blockcache::BufferAlloc;
 use aerosls_proto::kabi::{GrantedCap, Kernel, RecvResult, SendCap, TIMEOUT_NONE};
-use aerosls_proto::kwrap::KWrap;
+use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_proto::*;
 
-/// An `Arc`-wrapped buffer allocator with interior mutability. Allows
-/// `&self` calls to satisfy the `BufferAlloc` trait's `&mut self`
-/// requirement.
-#[derive(Clone)]
-pub struct AWrap<A: BufferAlloc>(pub Arc<RefCell<A>>);
 
-impl<A: BufferAlloc> BufferAlloc for AWrap<A> {
-    fn alloc(&mut self, size: usize) -> Result<(SendCap, u64), i32> {
-        self.0.borrow_mut().alloc(size)
-    }
-}
 
 #[allow(dead_code)]
 /// Maximum number of sockets a single client tracks.
@@ -601,9 +588,8 @@ mod tests {
     #[test]
     fn client_creation() {
         use alloc::sync::Arc;
-        use core::cell::RefCell;
         let k = KWrap(Arc::new(TestKernel));
-        let alloc = AWrap(Arc::new(RefCell::new(NoAlloc)));
+        let alloc = AWrap(Arc::new(aerosls_proto::Mutex::new(NoAlloc)));
         let _client: NetClient<TestKernel, NoAlloc> = NetClient::new(k, 7, alloc);
     }
 

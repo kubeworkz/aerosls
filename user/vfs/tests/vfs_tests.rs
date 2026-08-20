@@ -6,9 +6,12 @@
 //! replacement, exactly as the device half of the respawn state machine
 //! prescribes (respawn decision §5, §6).
 
+use std::sync::Arc;
+
 use aerosls_blockcache::{BlockCache, BufferAlloc};
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
 use aerosls_proto::kabi::SendCap;
+use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
@@ -97,7 +100,12 @@ fn boot(img: Vec<u8>) -> (FakeKernel, FakeClient, JoinHandle<()>) {
 
 /// A VFS with `/` mounted on the connected aerofs device and `/tmp` ramfs.
 fn mount_root(client: &FakeClient) -> Vfs<FakeClient, FakeAlloc> {
-    let cache = BlockCache::connect(client.clone(), 0, FakeAlloc(client.clone())).unwrap();
+    let cache = BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
     let mut vfs = Vfs::new();
     vfs.mount_aerofs("/", cache).unwrap();
     vfs.mount_ramfs("/tmp").unwrap();
@@ -319,7 +327,12 @@ fn open_fd_fails_permanently_across_remount() {
 
     // Respawn: a *fresh* driver serving the *same* image, re-attached.
     let (fake2, client2, t2) = boot(img);
-    let new_cache = BlockCache::connect(client2.clone(), 0, FakeAlloc(client2.clone())).unwrap();
+    let new_cache = BlockCache::connect(
+        KWrap(Arc::new(client2.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client2.clone())))),
+    )
+    .unwrap();
     vfs.remount_aerofs(0, new_cache).unwrap();
 
     // The mount is live again; fresh opens work and see the same content.
@@ -351,7 +364,12 @@ fn remount_revalidation_rejects_different_device() {
 
     // A replacement driver behind the same name serves a *different* image.
     let (_fake2, client2, t2) = boot(other_image());
-    let new_cache = BlockCache::connect(client2.clone(), 0, FakeAlloc(client2.clone())).unwrap();
+    let new_cache = BlockCache::connect(
+        KWrap(Arc::new(client2.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client2.clone())))),
+    )
+    .unwrap();
     assert_eq!(
         vfs.remount_aerofs(0, new_cache),
         Err(Errno::EIo),
@@ -445,10 +463,20 @@ fn block_cache_is_used_under_the_vfs() {
 #[test]
 fn mount_table_rejects_duplicates_and_longest_prefix_wins() {
     let (fake, client, t) = boot(sample_image());
-    let cache = BlockCache::connect(client.clone(), 0, FakeAlloc(client.clone())).unwrap();
+    let cache = BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
     let mut vfs = Vfs::new();
     vfs.mount_aerofs("/", cache).unwrap();
-    let cache2 = BlockCache::connect(client.clone(), 0, FakeAlloc(client.clone())).unwrap();
+    let cache2 = BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
     assert_eq!(vfs.mount_aerofs("/", cache2), Err(Errno::EExist));
 
     // /tmp goes to ramfs; a sibling /tmpx path does NOT match /tmp.

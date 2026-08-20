@@ -4,9 +4,12 @@
 //! CLONE_FILES / exec / exit-wait semantics are exercised with real fds and
 //! real files, so shared offsets and shared tables are observable.
 
+use std::sync::Arc;
+
 use aerosls_blockcache::{BlockCache, BufferAlloc};
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
 use aerosls_proto::kabi::SendCap;
+use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
@@ -29,7 +32,6 @@ fn assert_park_wake(trace: &[WakeEvent], task: u32, reason: BlockReason) {
         "wake precedes park for task {task}: {trace:?}"
     );
 }
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 type FC = FakeClient;
@@ -91,7 +93,12 @@ impl BufferAlloc for FakeAlloc {
 fn pm() -> (ProcManager<FC, FA>, JoinHandle<()>, FakeClient) {
     let (fake, client) = FakeKernel::new(pm_image(), 1);
     let t = boot_driver(fake);
-    let cache = BlockCache::connect(client.clone(), 0, FakeAlloc(client.clone())).unwrap();
+    let cache = BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
     let mut vfs = Vfs::new();
     vfs.mount_aerofs("/", cache).unwrap();
     vfs.mount_ramfs("/tmp").unwrap();

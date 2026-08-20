@@ -13,6 +13,7 @@ use aerosls_kernel_sim::{
     FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE,
 };
 use aerosls_proto::kabi::{GrantedCap, Kernel, SendCap, ERR_REVOKED, ERR_SHUTDOWN, TIMEOUT_NONE};
+use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
@@ -87,7 +88,12 @@ fn setup_writable(blocks: usize) -> (FakeKernel, FakeClient, JoinHandle<()>, Vec
 }
 
 fn connect(client: &FakeClient) -> BlockCache<FakeClient, FakeAlloc> {
-    BlockCache::connect(client.clone(), 0, FakeAlloc(client.clone())).unwrap()
+    BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -340,7 +346,12 @@ fn in_flight_read_aborts_with_close() {
     let seen_read = Arc::new(AtomicBool::new(false));
     let t = scripted_stall_driver(fake.clone(), seen_read.clone());
 
-    let mut cache = BlockCache::connect(client.clone(), 0, FakeAlloc(client.clone())).unwrap();
+    let mut cache = BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
     let mut d = [0u8; BLOCK_SIZE as usize];
     let reader = std::thread::spawn(move || cache.read_block(1, &mut d).map(|()| d));
 

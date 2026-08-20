@@ -30,6 +30,7 @@ use aerosls_blockcache::{BlockCache, BufferAlloc};
 use aerosls_procmgr::{ProcManager, Program};
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{CAP_CHAN, CAP_MEM, Kernel};
+use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_vfs::{CharNode, Errno, Vfs, O_RDWR};
 
 use crate::applets;
@@ -149,9 +150,16 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     console: Arc<CharNode>,
     alloc: A,
 ) -> Result<Booted<K, A>, BootErr> {
+    // Wrap K and A in Arc so both BlockCache and NetClient can share
+    // the same instance.
+    let k_arc = Arc::new(k);
+    let alloc_arc = Arc::new(aerosls_proto::Mutex::new(alloc));
+    let k_wrap = KWrap(k_arc.clone());
+    let alloc_wrap = AWrap(alloc_arc.clone());
+
     // 2. Device attach + handshake (RD_INFO). The device geometry is fixed
     //    here; the driver thread must be serving.
-    let cache = BlockCache::connect(k, caps.ramdisk_chan, alloc)
+    let cache = BlockCache::connect(k_wrap, caps.ramdisk_chan, alloc_wrap)
         .map_err(|e| BootErr::Handshake(handshake_class(&e)))?;
 
     // 3. Mounts, in order (path resolution is longest-prefix; /dev and /tmp
@@ -173,11 +181,16 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
             .map_err(BootErr::Console)?;
     }
 
-    // 5. Network client (optional): store the net channel for later use.
-    //    The actual NetClient is created when a net_chan is provided and
-    //    the caller has access to K/A via Arc. For now we store None and
-    //    let the sidecar's entry point set it up with the Arc-wrapped K/A.
-    let net: Option<NetClient<K, A>> = None;
+    // 5. Network client (optional): connect and handshake with the
+    //    network driver when a net_chan was declared in the manifest.
+    let net: Option<NetClient<K, A>> = caps.net_chan.map(|chan| {
+        let mut nc = NetClient::new(KWrap(k_arc), chan, AWrap(alloc_arc));
+        // Handshake: NET_INFO must be the first message.
+        let _ = nc.info();
+        nc
+    });
+
+
 
     Ok(Booted {
         proc,

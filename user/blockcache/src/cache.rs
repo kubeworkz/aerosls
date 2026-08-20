@@ -25,6 +25,7 @@
 
 use crate::copy;
 use aerosls_proto::kabi::{GrantedCap, Kernel, RecvResult, SendCap, TIMEOUT_NONE};
+use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_proto::*;
 
 /// Number of direct-mapped cache slots (blocks). The cache pool in the Phase
@@ -103,19 +104,7 @@ impl MappedView {
     }
 }
 
-/// Buffer acquisition for request grants.
-///
-/// Every `RD_READ`/`RD_WRITE` needs a client-owned buffer to grant the
-/// driver (W-only for reads, R-only for writes). The allocator owns how
-/// those buffers come to be: on the real sidecar they are carved from the
-/// budget MEM cap (a single reusable request buffer suffices — window=1);
-/// in tests they are fake-kernel regions.
-pub trait BufferAlloc {
-    /// Allocate `len` bytes of client-owned memory. Returns the grant
-    /// descriptor describing the region (rights held; the caller requests a
-    /// subset on the wire) and the region's base address.
-    fn alloc(&mut self, len: usize) -> Result<(SendCap, u64), i32>;
-}
+pub use aerosls_proto::kwrap::BufferAlloc;
 
 #[derive(Clone, Copy, Debug)]
 struct Slot {
@@ -137,9 +126,9 @@ impl Slot {
 /// The block cache. Generic over `K: Kernel` (host tests use the fake,
 /// the sidecar image uses the real ABI) and `A: BufferAlloc`.
 pub struct BlockCache<K: Kernel, A: BufferAlloc> {
-    k: K,
+    k: KWrap<K>,
     chan: u32,
-    alloc: A,
+    alloc: AWrap<A>,
     next_tag: u32,
     info: DeviceInfo,
     state: State,
@@ -151,7 +140,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
     /// Connect and handshake: `RD_INFO` must be the first message on the
     /// endpoint (the driver's implicit-handshake rule); on success the
     /// device is `Live` with its geometry fixed.
-    pub fn connect(k: K, chan: u32, alloc: A) -> Result<Self, Error> {
+    pub fn connect(k: KWrap<K>, chan: u32, alloc: AWrap<A>) -> Result<Self, Error> {
         let mut bc = BlockCache {
             k,
             chan,

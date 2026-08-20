@@ -6,6 +6,7 @@ description = "Shared AeroSLS sidecar wire-format definitions (RD_* protocol + c
 license = "MIT"
 
 [dependencies]
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 # The `target` feature selects the real kernel ABI (extern "C" syscalls) and
 # the sidecar entry points. The default (host) build omits them so the crate
