@@ -41,6 +41,9 @@
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.
 //! - `heap`       — bump allocator over the budget region (v1 reserves it).
+//! - `net_client` — `NetClient`: NET_* protocol client for socket I/O
+//!   (handshake, connect, send/recv over a channel endpoint to the network
+//!   driver sidecar).
 //! - `entry`      — the real `extern "C"` entry point (feature `target`).
 //!
 //! Like every crate in the chain, `boot` is generic over
@@ -56,6 +59,7 @@ pub mod allocator;
 pub mod applets;
 pub mod boot;
 pub mod heap;
+pub mod net_client;
 
 #[cfg(feature = "target")]
 mod entry;

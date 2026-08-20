@@ -105,7 +105,7 @@ fn boot_mounts_and_runs_init() {
 
     // The sim's client table: no budget/console caps; the ramdisk endpoint
     // is the first wired handle (0).
-    let caps = BootCaps::new(0, 0, 0, None, 0);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -197,7 +197,7 @@ fn boot_runs_an_interactive_shell() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");

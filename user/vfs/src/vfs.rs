@@ -720,6 +720,8 @@ struct Task {
 
 // ── the VFS ─────────────────────────────────────────────────────────────────
 
+
+
 pub struct Vfs<K: Kernel, A: BufferAlloc> {
     fss: Vec<Fs<K, A>>,
     mounts: Vec<Mount>,
@@ -738,6 +740,10 @@ pub struct Vfs<K: Kernel, A: BufferAlloc> {
     /// again. `obj` is kept alive by the waiter so the readiness check
     /// never touches a freed object even if the fd's table slot changed.
     waiters: Vec<Waiter>,
+    /// Shared kernel handle for socket NET_* RPCs (set after boot).
+    net_k: Option<alloc::sync::Arc<K>>,
+    /// Shared allocator handle for socket buffer grants (set after boot).
+    net_alloc: Option<alloc::sync::Arc<core::cell::RefCell<A>>>,
 }
 
 /// A parked reader. `ready()` is the *only* wake condition — it is
@@ -764,6 +770,10 @@ impl Waiter {
             // (Null reads never block; true keeps any stray registration
             // from wedging.)
             FileObj::Char(c) => c.read_ready(),
+            // Sockets: not yet wired for readiness polling — the driver
+            // handles backpressure. Always report ready so a stray
+            // registration doesn't wedge the task.
+            FileObj::Socket(_) => true,
             // Nothing else can be blocked on (the wait_* validators
             // reject them).
             FileObj::File(_) => false,
@@ -785,7 +795,31 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 egid: 0,
             }],
             waiters: Vec::new(),
+            net_k: None,
+            net_alloc: None,
         }
+    }
+
+    /// Set the shared kernel/allocator handles for socket NET_* RPCs.
+    /// Called once at boot, after the block cache is connected.
+    pub fn set_net_handles(
+        &mut self,
+        k: alloc::sync::Arc<K>,
+        alloc: alloc::sync::Arc<core::cell::RefCell<A>>,
+    ) {
+        self.net_k = Some(k);
+        self.net_alloc = Some(alloc);
+    }
+
+    /// Shared kernel handle (for socket operations from callers that have
+    /// &Vfs but not &K directly).
+    pub fn net_k(&self) -> Option<&alloc::sync::Arc<K>> {
+        self.net_k.as_ref()
+    }
+
+    /// Shared allocator handle (for socket buffer grants).
+    pub fn net_alloc(&self) -> Option<&alloc::sync::Arc<core::cell::RefCell<A>>> {
+        self.net_alloc.as_ref()
     }
 
     // ── mount management ───────────────────────────────────────────────────
@@ -1107,6 +1141,65 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok((r, w))
     }
 
+    /// Create a network socket fd. The VFS tracks only metadata; actual
+    /// NET_* I/O goes through `Vfs::net_k()` / `Vfs::net_alloc()` at the
+    /// caller level (the `Ctx`). Returns the fd number.
+    pub fn socket_open(
+        &mut self,
+        task: u32,
+        sock_id: u32,
+        chan: u32,
+        sock_type: u16,
+    ) -> Result<u32, Errno> {
+        let meta = Arc::new(crate::fileobj::SocketMeta {
+            sock_id,
+            chan,
+            sock_type,
+            state: crate::fileobj::SocketState::Created,
+            remote_ip: 0,
+            remote_port: 0,
+        });
+        let idx = self.task_mut(task)?.fds;
+        self.table_pool[idx].alloc(FdEntry {
+            node: Arc::new(FileObj::Socket(meta)),
+            rights: R | W,
+            flags: 0,
+        })
+    }
+
+    /// The sock_id stored in an fd (observability helper for socket
+    /// operations at the `Ctx` level).
+    pub fn fd_sock_id(&self, task: u32, fd: u32) -> Option<u32> {
+        let idx = self.tasks.get(task as usize)?.fds;
+        let e = self.table_pool.get(idx)?.get(fd)?;
+        match &*e.node {
+            FileObj::Socket(m) => Some(m.sock_id),
+            _ => None,
+        }
+    }
+
+    /// The channel endpoint stored in a socket fd.
+    pub fn fd_sock_chan(&self, task: u32, fd: u32) -> Option<u32> {
+        let idx = self.tasks.get(task as usize)?.fds;
+        let e = self.table_pool.get(idx)?.get(fd)?;
+        match &*e.node {
+            FileObj::Socket(m) => Some(m.chan),
+            _ => None,
+        }
+    }
+
+    /// Whether an fd names a socket.
+    pub fn is_socket_fd(&self, task: u32, fd: u32) -> bool {
+        let idx = match self.tasks.get(task as usize) {
+            Some(t) => t.fds,
+            None => return false,
+        };
+        match self.table_pool.get(idx).and_then(|t| t.get(fd)) {
+            Some(e) => matches!(&*e.node, FileObj::Socket(_)),
+            None => false,
+        }
+    }
+
     /// Park the task on `fd` becoming readable. Called by the blocking
     /// read path after a read returned `EAGAIN` (empty pipe, console with
     /// no input). The proc manager drains satisfied waits at each
@@ -1121,7 +1214,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let idx = self.task_mut(task)?.fds;
         let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
         match &*e.node {
-            FileObj::PipeRead(_) | FileObj::Char(_) => {
+            FileObj::PipeRead(_) | FileObj::Char(_) | FileObj::Socket(_) => {
                 // A task parks on one thing at a time; replace any prior
                 // registration (bounded by the number of tasks).
                 self.waiters.retain(|w| w.task != task);
@@ -1148,7 +1241,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let idx = self.task_mut(task)?.fds;
         let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
         match &*e.node {
-            FileObj::PipeWrite(_) => {
+            FileObj::PipeWrite(_) | FileObj::Socket(_) => {
                 // A task parks on one thing at a time; replace any prior
                 // registration (bounded by the number of tasks).
                 self.waiters.retain(|w| w.task != task);
@@ -1281,6 +1374,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             // A write-only pipe end: the rights check above already
             // refused; this arm is defensive.
             FileObj::PipeWrite(_) => Err(Errno::EBadf),
+            // Socket read is handled at the Ctx level (net_client).
+            FileObj::Socket(_) => Err(Errno::EInval),
         }
     }
 
@@ -1314,6 +1409,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             FileObj::PipeWrite(p) => p.write(buf),
             FileObj::Char(c) => c.write(buf),
             FileObj::PipeRead(_) => Err(Errno::EBadf),
+            // Socket write is handled at the Ctx level (net_client).
+            FileObj::Socket(_) => Err(Errno::EInval),
         }
     }
 
@@ -1372,6 +1469,14 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             }
             FileObj::PipeRead(p) | FileObj::PipeWrite(p) => Ok(p.stat()),
             FileObj::Char(c) => Ok(c.stat()),
+            FileObj::Socket(_) => Ok(Stat {
+                mode: 0o140000, // S_IFSOCK
+                uid: 0,
+                gid: 0,
+                size: 0,
+                mtime: 0,
+                ty: FileType::File, // no S_IFSOCK in v1, use File
+            }),
         }
     }
 

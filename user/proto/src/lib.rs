@@ -33,6 +33,7 @@ extern crate std;
 /// ── Kernel ABI (shared by every sidecar) ────────────────────────────────────
 
 pub mod kabi;
+pub mod kwrap;
 
 /// ── Boot Info Block + packed sidecar manifest (kernel ↔ sidecar contract) ──
 

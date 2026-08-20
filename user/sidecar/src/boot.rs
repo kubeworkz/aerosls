@@ -16,6 +16,8 @@
 //!    child per command) — as task 0's program, and opens `/dev/console` on
 //!    its stdio (fds 0,1,2 — the design's `stdio: [console, console,
 //!    console]`). Init's fork children inherit that stdio.
+//! 5. if the manifest declared a network channel, stores the channel handle
+//!    for socket I/O (the net client is created lazily on first use).
 //!
 //! `boot` is generic over `Kernel` + `BufferAlloc`, so the identical code
 //! runs against the host fake kernel (`aerosls-kernel-sim`, see
@@ -31,6 +33,7 @@ use aerosls_proto::kabi::{CAP_CHAN, CAP_MEM, Kernel};
 use aerosls_vfs::{CharNode, Errno, Vfs, O_RDWR};
 
 use crate::applets;
+use crate::net_client::NetClient;
 
 /// The initial caps the bootstrap needs, by manifest name (the kernel built
 /// the table from the manifest in record order; the BIB reports the same
@@ -50,6 +53,10 @@ pub struct BootCaps {
     pub console_chan: Option<u32>,
     /// The ramdisk channel (`ramdisk`) — the block cache's endpoint.
     pub ramdisk_chan: u32,
+    /// The network driver channel (`network`), if the manifest declared
+    /// one. The POSIX sidecar connects a `NetClient` on this endpoint
+    /// for socket I/O.
+    pub net_chan: Option<u32>,
 }
 
 impl BootCaps {
@@ -62,12 +69,14 @@ impl BootCaps {
             .find_cap(CAP_CHAN, "ramdisk")
             .ok_or(BootErr::MissingCap("ramdisk"))?;
         let console = bib.find_cap(CAP_CHAN, "console");
+        let network = bib.find_cap(CAP_CHAN, "network");
         Ok(BootCaps {
             budget_slot: budget.slot,
             budget_base: budget.base,
             budget_len: budget.len,
             console_chan: console.map(|c| c.slot),
             ramdisk_chan: ramdisk.slot,
+            net_chan: network.map(|n| n.slot),
         })
     }
 
@@ -79,6 +88,7 @@ impl BootCaps {
         budget_len: u64,
         console_chan: Option<u32>,
         ramdisk_chan: u32,
+        net_chan: Option<u32>,
     ) -> BootCaps {
         BootCaps {
             budget_slot,
@@ -86,6 +96,7 @@ impl BootCaps {
             budget_len,
             console_chan,
             ramdisk_chan,
+            net_chan,
         }
     }
 }
@@ -110,10 +121,14 @@ pub enum BootErr {
 
 /// The result of a successful boot: the proc manager (which owns the VFS,
 /// which owns the block cache) plus the console handle, so the caller can
-/// feed input / drain output (the ChanDev wiring point).
+/// feed input / drain output (the ChanDev wiring point). If the manifest
+/// declared a network channel, `net` holds the protocol client.
 pub struct Booted<K: Kernel, A: BufferAlloc> {
     pub proc: ProcManager<K, A>,
     pub console: Arc<CharNode>,
+    /// The network driver client (None if the manifest has no network
+    /// channel). Applet-level socket I/O goes through this.
+    pub net: Option<NetClient<K, A>>,
 }
 
 impl<K: Kernel, A: BufferAlloc> Booted<K, A> {
@@ -148,7 +163,7 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     vfs.mount_ramfs("/tmp").map_err(BootErr::Mount)?;
 
     // 4. System applets + init (the boot script runner), with console
-    //    stdio on fds 0,1,2. Init's fork children inherit the stdio.
+    //    stdio on fds 0,1,2. Init's fork children inherit that stdio.
     let mut proc = ProcManager::new(vfs);
     applets::register_default_applets(&mut proc);
     proc.spawn_init(Program::new("init", applets::init));
@@ -158,7 +173,17 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
             .map_err(BootErr::Console)?;
     }
 
-    Ok(Booted { proc, console })
+    // 5. Network client (optional): store the net channel for later use.
+    //    The actual NetClient is created when a net_chan is provided and
+    //    the caller has access to K/A via Arc. For now we store None and
+    //    let the sidecar's entry point set it up with the Arc-wrapped K/A.
+    let net: Option<NetClient<K, A>> = None;
+
+    Ok(Booted {
+        proc,
+        console,
+        net,
+    })
 }
 
 fn handshake_class(e: &aerosls_blockcache::Error) -> &'static str {

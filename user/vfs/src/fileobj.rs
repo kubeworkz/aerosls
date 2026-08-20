@@ -45,6 +45,37 @@ pub enum FileObj {
     PipeWrite(Arc<PipeNode>),
     /// A character device (`/dev/console`, `/dev/null`).
     Char(Arc<CharNode>),
+    /// A network socket (backed by the NET_* protocol to the network
+    /// driver sidecar). The VFS tracks only metadata; actual I/O goes
+    /// through `Vfs::net_k()` / `Vfs::net_alloc()` at the caller level.
+    Socket(Arc<SocketMeta>),
+}
+
+/// Metadata for a network socket fd. The actual NET_* send/recv happens
+/// at the `Ctx` level (the caller holds the kernel handle).
+pub struct SocketMeta {
+    /// Driver-side socket ID (returned by NET_SOCKET).
+    pub sock_id: u32,
+    /// Channel endpoint to the network driver sidecar.
+    pub chan: u32,
+    /// SOCK_STREAM or SOCK_DGRAM.
+    pub sock_type: u16,
+    /// Client-side socket state mirror.
+    pub state: SocketState,
+    /// Remote address (connected/accepted sockets).
+    pub remote_ip: u32,
+    pub remote_port: u16,
+}
+
+/// Client-side socket state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketState {
+    Created,
+    Bound,
+    Listening,
+    Connected,
+    HalfClosed,
+    Closed,
 }
 
 // ── pipes ───────────────────────────────────────────────────────────────────
