@@ -1447,6 +1447,66 @@ fn nc_loopback_client_server() {
     );
 }
 
+/// The cloexec pipeline test: a 3-stage pipeline `echo hello | cat | cat`
+/// would deadlock if pipe fds leaked through exec. Without cloexec, the
+/// middle `cat` inherits pipe0[1] (the write end of the first pipe) and
+/// pipe1[0] (the read end of the second pipe) from the fork. After dup2
+/// it still holds those extra fds. When echo exits, the shell closes its
+/// copy of pipe0[1], but the middle cat's leaked copy keeps the pipe
+/// open — so the middle cat never sees EOF, never exits, and the last
+/// stage never sees EOF either. With cloexec, the extra fds are closed
+/// before the exec'd image starts, the pipeline completes cleanly.
+#[test]
+fn cloexec_prevents_pipe_fd_leak_in_pipeline() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    // Boot: init forks the shell, which prints its prompt and parks.
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "shell prompt");
+
+    // Type a 3-stage pipeline: echo | cat | cat.
+    // Without cloexec the middle cat would hold leaked pipe fds open,
+    // preventing EOF propagation and deadlocking the pipeline.
+    console.console_io().push_input(b"echo hello | cat | cat\n");
+    booted.run(200);
+
+    let out = console.console_io().output();
+    assert!(
+        out.windows(7).any(|w| w == b"hello\n\x24"),
+        "pipeline should output 'hello' and return to prompt, got: {:?}",
+        out
+    );
+    assert!(
+        out.ends_with(b"$ "),
+        "shell should return to prompt after the pipeline, got: {:?}",
+        out
+    );
+    // The pipeline stages all exited; init is waiting for the shell.
+    assert_eq!(
+        booted.proc.state(0),
+        Some(aerosls_procmgr::TaskState::Blocked(
+            aerosls_procmgr::BlockReason::WaitingChild(1)
+        )),
+        "init waits for the shell"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
     const HEADER_LEN: usize = 32;
     let mut b = Vec::new();
