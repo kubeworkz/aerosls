@@ -656,6 +656,11 @@ pub struct FdEntry {
     /// Rights minted at open from the access mode (proto `R`/`W` bits).
     pub rights: u8,
     pub flags: u16,
+    /// Close-on-exec: the fd is automatically closed when the task execs.
+    /// Set by pipe fds created for pipeline stages, and by any fd opened
+    /// with O_CLOEXEC. Prevents stale pipe ends from leaking into exec'd
+    /// programs.
+    pub cloexec: bool,
 }
 
 impl FdEntry {
@@ -1062,6 +1067,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                     node: obj,
                     rights: want,
                     flags,
+                    cloexec: false,
                 })?
             };
             return Ok(fd);
@@ -1103,6 +1109,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 node,
                 rights: want,
                 flags,
+                cloexec: false,
             })?
         };
         Ok(fd)
@@ -1138,11 +1145,13 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 node: Arc::new(FileObj::PipeRead(node.clone())),
                 rights: R,
                 flags: 0,
+                cloexec: false,
             })?;
             let w = table.alloc(FdEntry {
                 node: Arc::new(FileObj::PipeWrite(node)),
                 rights: W,
                 flags: 0,
+                cloexec: false,
             })?;
             (r, w)
         };
@@ -1180,6 +1189,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             node: Arc::new(FileObj::Socket(meta)),
             rights: R | W,
             flags: 0,
+            cloexec: false,
         })
     }
 
@@ -1314,6 +1324,39 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok(())
     }
 
+    /// Close every fd with the `cloexec` flag set on this task. Called
+    /// by `ProcManager::exec()` before replacing the program image so
+    /// that pipe fds and other internal descriptors don't leak into the
+    /// exec'd program.
+    pub fn close_cloexec(&mut self, task: u32) {
+        let idx = match self.tasks.get(task as usize) {
+            Some(t) => t.fds,
+            None => return,
+        };
+        let table = match self.table_pool.get_mut(idx) {
+            Some(t) => t,
+            None => return,
+        };
+        for slot in table.entries.iter_mut() {
+            if let Some(e) = slot {
+                if e.cloexec {
+                    let gone = slot.take().unwrap();
+                    gone.note_removed();
+                }
+            }
+        }
+    }
+
+    /// Set or clear the `cloexec` flag on an fd. The shell calls this
+    /// after creating pipe fds to mark them as close-on-exec so they
+    /// don't leak into child programs.
+    pub fn set_cloexec(&mut self, task: u32, fd: u32, cloexec: bool) -> Result<(), Errno> {
+        let idx = self.task_mut(task)?.fds;
+        let e = self.table_pool[idx].entries.get_mut(fd as usize).ok_or(Errno::EBadf)?.as_mut().ok_or(Errno::EBadf)?;
+        e.cloexec = cloexec;
+        Ok(())
+    }
+
     pub fn dup(&mut self, task: u32, fd: u32) -> Result<u32, Errno> {
         let idx = self.task_mut(task)?.fds;
         let copy = {
@@ -1322,6 +1365,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 node: e.node.clone(),
                 rights: e.rights,
                 flags: e.flags,
+                cloexec: false,
             }
         };
         let nfd = self.table_pool[idx].alloc(copy)?;
@@ -1346,6 +1390,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 node: e.node.clone(),
                 rights: e.rights,
                 flags: e.flags,
+                cloexec: false,
             }
         };
         let idx = self.task_mut(task)?.fds;
@@ -1885,6 +1930,80 @@ mod tests {
         let mut buf = [0u8; 4];
         assert_eq!(v.read(0, r, &mut buf).unwrap(), 1);
         assert_eq!(&buf[..1], b"x");
+    }
+
+    // ── cloexec ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn close_cloexec_only_closes_marked_fds() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        v.mount_ramfs("/tmp").unwrap();
+        let f1 = v.open(0, "/tmp/a", O_CREAT | O_RDWR, 0o644).unwrap();
+        let f2 = v.open(0, "/tmp/b", O_CREAT | O_RDWR, 0o644).unwrap();
+        // Mark only f1 as cloexec.
+        v.set_cloexec(0, f1, true).unwrap();
+        v.close_cloexec(0);
+        // f1 is gone (cloexec).
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, f1, &mut buf), Err(Errno::EBadf));
+        // f2 survives (not cloexec).
+        assert_eq!(v.write(0, f2, b"x").unwrap(), 1);
+    }
+
+    #[test]
+    fn close_cloexec_preserves_non_cloexec_fds() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        // Neither end is cloexec — close_cloexec is a no-op.
+        v.close_cloexec(0);
+        let mut buf = [0u8; 4];
+        assert_eq!(v.write(0, w, b"abc").unwrap(), 3);
+        assert_eq!(v.read(0, r, &mut buf).unwrap(), 3);
+    }
+
+    #[test]
+    fn dup_clears_cloexec_on_new_fd() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.set_cloexec(0, r, true).unwrap();
+        // dup creates a new fd with cloexec cleared (POSIX semantics).
+        let r2 = v.dup(0, r).unwrap();
+        v.close_cloexec(0);
+        // Original read end is cloexec → gone.
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, r, &mut buf), Err(Errno::EBadf));
+        // Dup'd fd is NOT cloexec → survives.
+        assert_eq!(v.read(0, r2, &mut buf), Err(Errno::EAgain));
+        // Write end survives.
+        assert_eq!(v.write(0, w, b"x").unwrap(), 1);
+    }
+
+    #[test]
+    fn dup2_clears_cloexec_on_target() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.set_cloexec(0, w, true).unwrap();
+        // dup2 the write end to fd 5; the target fd clears cloexec.
+        v.dup2(0, w, 5).unwrap();
+        v.close_cloexec(0);
+        // fd 5 is NOT cloexec → survives.
+        assert_eq!(v.write(0, 5, b"x").unwrap(), 1);
+        // Original write end (cloexec) is gone.
+        assert_eq!(v.write(0, w, b"x"), Err(Errno::EBadf));
+        // Read end survives.
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, r, &mut buf).unwrap(), 1);
+    }
+
+    #[test]
+    fn set_cloexec_toggles() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (_r, w) = v.pipe(0).unwrap();
+        v.set_cloexec(0, w, true).unwrap();
+        v.set_cloexec(0, w, false).unwrap();
+        // Toggle off — close_cloexec should not close it.
+        v.close_cloexec(0);
+        assert_eq!(v.write(0, w, b"x").unwrap(), 1);
     }
 
     // ── /dev ─────────────────────────────────────────────────────────────────

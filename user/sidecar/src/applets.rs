@@ -2190,12 +2190,17 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         }
     }
     // Inter-stage pipes; the fds land above stdio (0,1,2 = console).
+    // Each end is marked cloexec so exec'd programs don't inherit stale
+    // pipe fds — only the stage's own stdin/stdout remain open after
+    // dup2 + close + exec.
     let mut pipes: Vec<u32> = Vec::new();
     for _ in 0..stages.len() - 1 {
         let (r, w) = match ctx.vfs().pipe(task) {
             Ok(p) => p,
             Err(_) => return Step::Exit(2),
         };
+        ctx.set_cloexec(r, true).ok();
+        ctx.set_cloexec(w, true).ok();
         pipes.push(r);
         pipes.push(w);
     }

@@ -518,9 +518,14 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
     /// set the new image's argv (design §6.2's `ExecSpec`: the caller — a
     /// shell, init, a spawner — supplies the argument vector; `argv[0]`
     /// conventionally names the program). Resolves and reads the file
-    /// through the VFS; the first non-empty line names the applet. Open fds
-    /// are preserved (no CLOEXEC in v1).
+    /// through the VFS; the first non-empty line names the applet. Fds
+    /// with the `cloexec` flag are closed before the image is replaced.
     pub fn exec(&mut self, task: u32, path: &str, argv: &[&str]) -> Result<(), Errno> {
+        // Close every fd with the cloexec flag before replacing the image.
+        // This is the POSIX O_CLOEXEC / FD_CLOEXEC semantics: pipe fds
+        // and other internal descriptors marked cloexec don't leak into
+        // the exec'd program.
+        self.vfs.close_cloexec(task);
         let fd = self.vfs.open(task, path, O_RDONLY, 0)?;
         let mut buf = [0u8; 4096];
         let n = self.vfs.read(task, fd, &mut buf)?;
@@ -759,6 +764,17 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
 
     pub fn exec(&mut self, path: &str, argv: &[&str]) -> Result<(), Errno> {
         self.pm.exec(self.task, path, argv)
+    }
+
+    /// Close every fd with the `cloexec` flag set. Called by exec to
+    /// prevent pipe fds from leaking into the new program image.
+    pub fn close_cloexec(&mut self) {
+        self.pm.vfs.close_cloexec(self.task);
+    }
+
+    /// Set or clear the `cloexec` flag on an fd.
+    pub fn set_cloexec(&mut self, fd: u32, cloexec: bool) -> Result<(), Errno> {
+        self.pm.vfs.set_cloexec(self.task, fd, cloexec)
     }
 
     /// The calling task's argument vector (set by `exec` or the spawner).
