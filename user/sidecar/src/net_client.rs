@@ -509,6 +509,59 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
     }
 }
 
+// ── SocketOps trait implementation ───────────────────────────────────────
+
+impl<K: Kernel, A: BufferAlloc> aerosls_proto::sockops::SocketOps for NetClient<K, A> {
+    fn socket(&mut self, sock_type: u16) -> Result<u32, u16> {
+        NetClient::socket(self, sock_type).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn connect(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16> {
+        NetClient::connect(self, id, ip, port).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn send(&mut self, id: u32, data: &[u8]) -> Result<usize, u16> {
+        NetClient::send(self, id, data).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16> {
+        NetClient::recv(self, id, buf).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn close_socket(&mut self, id: u32) -> Result<(), u16> {
+        NetClient::close_socket(self, id).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn poll(&mut self, id: u32) -> Result<u16, u16> {
+        NetClient::poll(self, id).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn shutdown(&mut self, id: u32, how: u8) -> Result<(), u16> {
+        NetClient::shutdown(self, id, how).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

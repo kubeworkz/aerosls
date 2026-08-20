@@ -44,12 +44,14 @@
 //! architecture's internal-bus message exchange between components is the
 //! future split; the call path here is direct and synchronous.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use aerosls_proto::kabi::Kernel;
+use aerosls_proto::sockops::SocketOps;
 use aerosls_vfs::{BufferAlloc, Errno, Vfs, CLONE_FILES, O_RDONLY};
 
 /// Appended to a forked child's cloned program data so it can distinguish
@@ -241,6 +243,9 @@ pub struct ProcManager<K: Kernel, A: BufferAlloc> {
     tasks: BTreeMap<u32, TaskCtl<K, A>>,
     run: VecDeque<u32>,
     applets: BTreeMap<String, AppletStep<K, A>>,
+    /// Optional network driver client for socket I/O. Set after boot
+    /// when a network channel is available.
+    pub net: Option<Box<dyn SocketOps>>,
 }
 
 /// The execution context handed to a program's step: the manager, the
@@ -260,7 +265,13 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             tasks: BTreeMap::new(),
             run: VecDeque::new(),
             applets: BTreeMap::new(),
+            net: None,
         }
+    }
+
+    /// Install a network driver client after boot.
+    pub fn set_net(&mut self, net: Box<dyn SocketOps>) {
+        self.net = Some(net);
     }
 
     /// Register task 0 (the VFS's initial task) as init, with `program`.
@@ -664,5 +675,10 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
 
     pub fn yield_now(&self) -> Step {
         Step::Yield
+    }
+
+    /// Access the network driver client (if one was installed at boot).
+    pub fn net(&mut self) -> Option<&mut Box<dyn SocketOps>> {
+        self.pm.net.as_mut()
     }
 }

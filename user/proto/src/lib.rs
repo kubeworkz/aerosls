@@ -34,6 +34,7 @@ extern crate std;
 
 pub mod kabi;
 pub mod kwrap;
+pub mod sockops;
 
 /// ── Boot Info Block + packed sidecar manifest (kernel ↔ sidecar contract) ──
 

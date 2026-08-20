@@ -2871,6 +2871,213 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
     stages
 }
 
+/// `nc` (netcat): minimal TCP client that connects to a remote
+/// `host:port`, relays stdin↔socket in a cooperative loop, and exits
+/// when either side EOFs.
+///
+/// Data layout (`ctx.data`):
+///
+/// ```text
+/// [0]    phase:
+///        0 = create socket
+///        1 = connect
+///        2 = relay: read socket → write stdout
+///        3 = relay: read stdin → write socket
+///        4 = done (exit)
+/// [1]    sock_id (driver-side socket ID)
+/// [2..6] dest_ip   (u32 LE)
+/// [6..8] dest_port (u16 LE)
+/// [8..]  pending I/O data (read buffer or write remainder)
+/// ```
+///
+/// Usage: `nc <host> <port>`
+///
+/// The host is an IPv4 dotted-quad (e.g. `10.0.2.2`).
+/// Each step does at most one kernel call; on would-block the task
+/// parks on the fd and is woken by the scheduler's wake drain.
+pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if ctx.data.is_empty() {
+        // Phase 0: parse args, create socket.
+        let argv = ctx.argv().to_vec();
+        let has_net = ctx.net().is_some();
+        if !has_net {
+            return Step::Exit(1);
+        }
+        let host_str = match argv.get(1).map(|s| s.as_str()) {
+            Some(h) => h,
+            None => return Step::Exit(2),
+        };
+        let port_str = match argv.get(2).map(|s| s.as_str()) {
+            Some(p) => p,
+            None => return Step::Exit(2),
+        };
+        let port: u16 = match port_str.parse() {
+            Ok(p) => p,
+            Err(_) => return Step::Exit(2),
+        };
+        // Parse IPv4 dotted-quad.
+        let mut ip_bytes = [0u8; 4];
+        for (idx, octet) in host_str.split('.').enumerate() {
+            if idx >= 4 {
+                return Step::Exit(2);
+            }
+            ip_bytes[idx] = match octet.parse() {
+                Ok(v) => v,
+                Err(_) => return Step::Exit(2),
+            };
+        }
+        let ip = u32::from_le_bytes(ip_bytes);
+
+        // Create socket.
+        let sock_id = match ctx.net().unwrap().socket(aerosls_proto::SOCK_STREAM) {
+            Ok(id) => id,
+            Err(_) => return Step::Exit(1),
+        };
+        ctx.data.resize(8, 0);
+        ctx.data[1] = sock_id as u8;
+        ctx.data[2..6].copy_from_slice(&ip.to_le_bytes());
+        ctx.data[6..8].copy_from_slice(&port.to_le_bytes());
+        ctx.data[0] = 1; // → connect phase
+    }
+
+    // Each phase does exactly one operation so we never hold two
+    // conflicting borrows on ctx.
+    match ctx.data[0] {
+        1 => {
+            // Connect phase.
+            let sock_id = ctx.data[1] as u32;
+            let ip = u32::from_le_bytes([
+                ctx.data[2], ctx.data[3], ctx.data[4], ctx.data[5],
+            ]);
+            let port = u16::from_le_bytes([ctx.data[6], ctx.data[7]]);
+            match ctx.net().unwrap().connect(sock_id, ip, port) {
+                Ok(()) => {
+                    ctx.data[0] = 2; // → relay: net→stdout
+                    Step::Yield
+                }
+                Err(_) => Step::Exit(1),
+            }
+        }
+        2 => {
+            // Relay: read socket → write stdout.
+            let sock_id = ctx.data[1] as u32;
+            match ctx.net().unwrap().poll(sock_id) {
+                Ok(events) if events & 0x01 != 0 => {
+                    // POLLIN — try recv.
+                    let mut buf = [0u8; 16];
+                    let n = match ctx.net().unwrap().recv(sock_id, &mut buf) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            ctx.data[0] = 4;
+                            return Step::Yield;
+                        }
+                    };
+                    if n == 0 {
+                        ctx.data[0] = 4;
+                        return Step::Yield;
+                    }
+                    ctx.data.truncate(8);
+                    ctx.data.extend_from_slice(&buf[..n]);
+                    ctx.data[0] = 3; // → write to stdout
+                    Step::Yield
+                }
+                _ => {
+                    // Socket not readable yet — try reading stdin.
+                    let mut buf = [0u8; 16];
+                    match ctx.read_blocking(0, &mut buf) {
+                        ReadBlock::Data(0) => {
+                            {
+                                let sid = ctx.data[1] as u32;
+                                let _ = ctx.net().unwrap().shutdown(sid, 1);
+                            }
+                            ctx.data[0] = 2;
+                            Step::Yield
+                        }
+                        ReadBlock::Data(n) => {
+                            let send_result = {
+                                let sid = ctx.data[1] as u32;
+                                ctx.net().unwrap().send(sid, &buf[..n])
+                            };
+                            match send_result {
+                                Ok(_) => {
+                                    ctx.data.truncate(8);
+                                    ctx.data[0] = 2;
+                                }
+                                Err(_) => {
+                                    ctx.data[0] = 4;
+                                }
+                            }
+                            Step::Yield
+                        }
+                        ReadBlock::WouldBlock => {
+                            Step::Blocked(BlockReason::Readable(0))
+                        }
+                        ReadBlock::Err(_) => Step::Exit(1),
+                    }
+                },
+            }
+        }
+        3 => {
+            // Write the pending chunk to stdout.
+            let pending = ctx.data[8..].to_vec();
+            match ctx.write_blocking(1, &pending) {
+                WriteBlock::Data(k) => {
+                    if k == pending.len() {
+                        ctx.data.truncate(8);
+                        ctx.data[0] = 2; // back to socket poll
+                    } else {
+                        ctx.data.drain(8..8 + k);
+                    }
+                    Step::Yield
+                }
+                WriteBlock::WouldBlock => {
+                    Step::Blocked(BlockReason::Writable(1))
+                }
+                WriteBlock::Err(_) => Step::Exit(1),
+            }
+        }
+        0xFF => {
+            // Read from stdin and send to socket.
+            let mut buf = [0u8; 16];
+            match ctx.read_blocking(0, &mut buf) {
+                ReadBlock::Data(0) => {
+                    let sock_id = ctx.data[1] as u32;
+                    let _ = ctx.net().unwrap().shutdown(sock_id, 1);
+                    ctx.data[0] = 2; // back to socket poll
+                    Step::Yield
+                }
+                ReadBlock::Data(n) => {
+                    let send_result = {
+                        let sock_id = ctx.data[1] as u32;
+                        ctx.net().unwrap().send(sock_id, &buf[..n])
+                    };
+                    match send_result {
+                        Ok(_) => {
+                            ctx.data.truncate(8);
+                            ctx.data[0] = 2; // back to socket poll
+                        }
+                        Err(_) => {
+                            ctx.data[0] = 4;
+                        }
+                    }
+                    Step::Yield
+                }
+                ReadBlock::WouldBlock => {
+                    Step::Blocked(BlockReason::Readable(0))
+                }
+                ReadBlock::Err(_) => Step::Exit(1),
+            }
+        }
+        4 => {
+            // Done — close socket and exit.
+            let sock_id = ctx.data[1] as u32;
+            let _ = ctx.net().unwrap().close_socket(sock_id);
+            Step::Exit(0)
+        }
+        _ => Step::Exit(1),
+    }
+}
+
 /// Install the system applets into a proc manager (called by `boot()`).
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
@@ -2886,6 +3093,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("cut", cut);
     pm.register_applet("uniq", uniq);
     pm.register_applet("echo", echo);
+    pm.register_applet("nc", nc);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
     pm.register_applet("false", do_false);
