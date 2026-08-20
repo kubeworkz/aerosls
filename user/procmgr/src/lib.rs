@@ -38,5 +38,5 @@ mod tests;
 pub use procmgr::{
     is_child, signal_exit_code, BlockReason, Ctx, ProcManager, Program, ReadBlock,
     SIGHUP, SIGINT, SIGQUIT, SIGKILL, SIGPIPE, SIGTERM, SignalSet, Step, TaskCtl,
-    TaskState, WaitOutcome, WakeEvent, WriteBlock, FORK_MARKER,
+    TaskState, WaitOutcome, WakeEvent, WriteBlock, WNOHANG, FORK_MARKER,
 };

@@ -16,7 +16,7 @@ use aerosls_ramdisk::server::{self, Device};
 use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
 use aerosls_procmgr::{
     is_child, signal_exit_code, BlockReason, Ctx, ProcManager, Program, ReadBlock, SIGINT,
-    SIGKILL, SIGTERM, Step, TaskState, WaitOutcome, WakeEvent, WriteBlock,
+    SIGKILL, SIGTERM, Step, TaskState, WaitOutcome, WakeEvent, WriteBlock, WNOHANG,
 };
 
 /// Assert the wake trace records a task's park and its matching wake, in
@@ -1083,4 +1083,100 @@ fn kill_wakes_blocked_task() {
 fn kill_nonexistent_returns_esrch() {
     let (mut p, _t, _client) = pm();
     assert_eq!(p.kill(999, SIGTERM), Err(Errno::ESRCH));
+}
+
+// ── WNOHANG tests ───────────────────────────────────────────────────────
+
+/// A step function that forks a child, polls with WNOHANG, and
+/// writes outcomes to /tmp/wnohang: "BLOCKED REAPED".
+/// A two-phase step: phase 0 forks a child and immediately polls
+/// WNOHANG (the child is still Runnable → Blocked). Phase 1 polls
+/// again after the child has run and exited (→ Reaped).
+fn wnohang_parent(ctx: &mut Ctx<FC, FA>) -> Step {
+    // Child: exit immediately.
+    if aerosls_procmgr::is_child(&ctx.data) {
+        return ctx.exit(0);
+    }
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        // Phase 0: fork + immediate WNOHANG poll.
+        let c = ctx.fork().unwrap();
+        let outcome = ctx.waitpid(c, WNOHANG);
+        let tag: &[u8] = match outcome {
+            WaitOutcome::Reaped(_) => b"REAPED",
+            WaitOutcome::Blocked => b"BLOCKED",
+            WaitOutcome::NoSuchChild => b"NOCHILD",
+        };
+        let fd = ctx.vfs().open(task, "/tmp/wnohang", aerosls_vfs::O_CREAT | aerosls_vfs::O_WRONLY, 0o644).unwrap();
+        ctx.vfs().write(task, fd, tag).unwrap();
+        ctx.vfs().close(task, fd).unwrap();
+        // Store child id; phase = 1 on next call.
+        ctx.data.push(c as u8);
+        ctx.data.push(1); // phase 1
+        Step::Yield
+    } else {
+        // Phase 1: child has exited; poll again.
+        let c = ctx.data[0] as u32;
+        let outcome = ctx.waitpid(c, WNOHANG);
+        let tag: &[u8] = match outcome {
+            WaitOutcome::Reaped(_) => b"REAPED",
+            WaitOutcome::Blocked => b"BLOCKED",
+            WaitOutcome::NoSuchChild => b"NOCHILD",
+        };
+        let fd = ctx.vfs().open(task, "/tmp/wnohang2", aerosls_vfs::O_CREAT | aerosls_vfs::O_WRONLY, 0o644).unwrap();
+        ctx.vfs().write(task, fd, tag).unwrap();
+        ctx.vfs().close(task, fd).unwrap();
+        ctx.exit(0)
+    }
+}
+
+#[test]
+fn wnohang_blocks_on_live_child_then_reaps() {
+    let (mut p, t, client) = pm();
+    p.spawn_init(Program::new("wnohang_parent", wnohang_parent));
+    p.run_until_quiet(30);
+    // Phase 0: WNOHANG on live child → BLOCKED.
+    assert_eq!(read_all(&mut p.vfs, "/tmp/wnohang"), b"BLOCKED");
+    // Phase 1: WNOHANG after child exit → REAPED.
+    assert_eq!(read_all(&mut p.vfs, "/tmp/wnohang2"), b"REAPED");
+    assert_eq!(p.exit_code(0), Some(0));
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn wnohang_returns_nosuchchild_for_unknown() {
+    let (mut p, _t, _client) = pm();
+    assert_eq!(p.waitpid(0, 999, WNOHANG), WaitOutcome::NoSuchChild);
+}
+
+/// A step function that forks, polls with WNOHANG (gets Blocked), then
+/// does a blocking wait — proving the child is still in the table.
+/// Fork a child, poll with WNOHANG (→ Blocked), then blocking wait
+/// (→ Blocked too — child hasn't been scheduled yet). This proves
+/// WNOHANG does not destroy the child table entry.
+fn wnohang_then_blocking(ctx: &mut Ctx<FC, FA>) -> Step {
+    if aerosls_procmgr::is_child(&ctx.data) {
+        return ctx.exit(0);
+    }
+    let c = ctx.fork().unwrap();
+    // WNOHANG on a live child → Blocked.
+    let o = ctx.waitpid(c, WNOHANG);
+    assert_eq!(o, WaitOutcome::Blocked, "WNOHANG on live child");
+    // Blocking wait on the same live child → also Blocked.
+    let o = ctx.wait(c);
+    assert_eq!(o, WaitOutcome::Blocked, "blocking wait on live child");
+    ctx.exit(0)
+}
+
+#[test]
+fn wnohang_does_not_destroy_child() {
+    let (mut p, t, client) = pm();
+    p.spawn_init(Program::new("wnohang_then_blocking", wnohang_then_blocking));
+    p.run_until_quiet(30);
+    assert_eq!(p.exit_code(0), Some(0));
+
+    client.kill_driver(0);
+    t.join().unwrap();
 }

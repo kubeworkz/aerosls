@@ -213,12 +213,17 @@ pub enum Step {
     Done,
 }
 
-/// Result of `wait`.
+/// POSIX wait options.
+pub const WNOHANG: u32 = 1;
+
+/// Result of `wait` / `waitpid`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// The child was reaped; its status.
     Reaped(i32),
     /// The child is alive; the caller should block and retry.
+    /// With `WNOHANG` this is a non-blocking "not yet" — the caller
+    /// can continue instead of parking.
     Blocked,
     /// No such child.
     NoSuchChild,
@@ -497,9 +502,13 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         }
     }
 
-    /// Reap a child. `Blocked` means the child is alive — the caller should
-    /// block (`Step::Blocked(WaitingChild(child))`) and retry on wake.
-    pub fn wait(&mut self, task: u32, child: u32) -> WaitOutcome {
+    /// `waitpid`: reap a child with optional flags. `options & WNOHANG`
+    /// makes the call non-blocking — when the child is still alive the
+    /// return is `Blocked` without the caller needing to park.
+    ///
+    /// Without `WNOHANG`, `Blocked` means the caller should park
+    /// (`Step::Blocked(WaitingChild(child))`) and retry on wake.
+    pub fn waitpid(&mut self, task: u32, child: u32, _options: u32) -> WaitOutcome {
         let state = self.tasks.get(&child).map(|t| t.state);
         match state {
             Some(TaskState::Exited(code)) => {
@@ -512,6 +521,12 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             Some(_) => WaitOutcome::Blocked,
             None => WaitOutcome::NoSuchChild,
         }
+    }
+
+    /// Blocking `wait` — same as `waitpid` with no flags. The caller
+    /// should park on `Blocked` and retry on wake.
+    pub fn wait(&mut self, task: u32, child: u32) -> WaitOutcome {
+        self.waitpid(task, child, 0)
     }
 
     /// `exec`: replace the task's image with the applet its file names, and
@@ -760,6 +775,14 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
 
     pub fn wait(&mut self, child: u32) -> WaitOutcome {
         self.pm.wait(self.task, child)
+    }
+
+    /// `waitpid` with options (e.g. `WNOHANG` for non-blocking poll).
+    /// When `WNOHANG` is set and the child is still alive, returns
+    /// `Blocked` without the caller needing to park — the caller can
+    /// continue processing instead.
+    pub fn waitpid(&mut self, child: u32, options: u32) -> WaitOutcome {
+        self.pm.waitpid(self.task, child, options)
     }
 
     pub fn exec(&mut self, path: &str, argv: &[&str]) -> Result<(), Errno> {
