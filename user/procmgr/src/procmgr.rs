@@ -54,6 +54,68 @@ use aerosls_proto::kabi::Kernel;
 use aerosls_proto::sockops::SocketOps;
 use aerosls_vfs::{BufferAlloc, Errno, Vfs, CLONE_FILES, O_RDONLY};
 
+// ── Signals ────────────────────────────────────────────────────────────────
+
+/// POSIX signal numbers used by the sidecar. v1: a small set; extensible.
+pub const SIGHUP: i32 = 1;
+pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
+pub const SIGKILL: i32 = 9;
+pub const SIGPIPE: i32 = 13;
+pub const SIGTERM: i32 = 15;
+
+/// The "raised by signal" exit-status convention: a task killed by signal
+/// N exits with status `128 + N`. This encodes the POSIX `WIFSIGNALED` /
+/// `WTERMSIG` convention without needing a separate channel.
+pub fn signal_exit_code(sig: i32) -> i32 {
+    128 + sig
+}
+
+/// A compact pending-signal set stored as a bitmask (bit N = signal N).
+/// v1: only signals 1..=31 fit; the mask is 32 bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignalSet(u32);
+
+impl SignalSet {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Enqueue a signal. Silently ignores out-of-range signal numbers.
+    pub fn add(&mut self, sig: i32) {
+        if sig > 0 && sig <= 31 {
+            self.0 |= 1 << sig;
+        }
+    }
+
+    /// Is a specific signal pending?
+    pub const fn contains(self, sig: i32) -> bool {
+        sig > 0 && sig <= 31 && (self.0 & (1 << sig)) != 0
+    }
+
+    /// Dequeue a specific signal (clear the bit).
+    pub fn remove(&mut self, sig: i32) {
+        if sig > 0 && sig <= 31 {
+            self.0 &= !(1 << sig);
+        }
+    }
+
+    /// Take the highest-priority pending signal and clear it.
+    /// Priority: lower signal number first (POSIX: lower = more urgent).
+    pub fn take_one(&mut self) -> Option<i32> {
+        if self.0 == 0 {
+            return None;
+        }
+        let bit = self.0.trailing_zeros() as i32;
+        self.0 &= !(1 << bit);
+        Some(bit)
+    }
+}
+
 /// Appended to a forked child's cloned program data so it can distinguish
 /// its fork-return from the parent's (the crate's stand-in for the copied
 /// register file: `fork()` returns the child id to the parent and "0" to
@@ -228,6 +290,10 @@ pub struct TaskCtl<K: Kernel, A: BufferAlloc> {
     pub parent: Option<u32>,
     pub children: BTreeSet<u32>,
     pub program: Program<K, A>,
+    /// Signals delivered but not yet checked by the task's cooperative
+    /// step. Checked by `check_signals` at blocking I/O and between
+    /// pipeline stages. Clear + delivered atomically to the task.
+    pub pending: SignalSet,
 }
 
 /// The proc manager. Owns the VFS and the task registry + run queue.
@@ -284,6 +350,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 parent: None,
                 children: BTreeSet::new(),
                 program,
+                pending: SignalSet::empty(),
             },
         );
         self.run.push_back(0);
@@ -300,6 +367,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 parent: Some(0),
                 children: BTreeSet::new(),
                 program,
+                pending: SignalSet::empty(),
             },
         );
         self.tasks.get_mut(&0).map(|t| t.children.insert(id));
@@ -361,6 +429,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 parent: Some(parent),
                 children: BTreeSet::new(),
                 program,
+                pending: SignalSet::empty(),
             },
         );
         if let Some(tc) = self.tasks.get_mut(&parent) {
@@ -494,6 +563,22 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             Step::Done => Step::Exit(0),
             o => o,
         };
+        // After each step, check for pending fatal signals. If one is
+        // pending and the task did not already exit, override the outcome
+        // to a signal death — this is the cooperative delivery path.
+        let outcome = if !matches!(outcome, Step::Exit(_)) {
+            if let Some(sig) = self.check_signals(id) {
+                if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
+                    Step::Exit(signal_exit_code(sig))
+                } else {
+                    outcome
+                }
+            } else {
+                outcome
+            }
+        } else {
+            outcome
+        };
         match outcome {
             Step::Yield => {
                 if let Some(tc) = self.tasks.get_mut(&id) {
@@ -573,6 +658,53 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             Some(TaskState::Exited(code)) => Some(code),
             _ => None,
         }
+    }
+
+    // ── Signal delivery ──────────────────────────────────────────────────
+
+    /// Enqueue a signal on a task. The signal is delivered cooperatively:
+    /// the task observes it at the next `check_signals()` call (at blocking
+    /// I/O or between pipeline stages). Returns `Ok(())` on success, or
+    /// `Err(ESRCH)` if the task does not exist.
+    pub fn kill(&mut self, task: u32, sig: i32) -> Result<(), Errno> {
+        let tc = self.tasks.get_mut(&task).ok_or(Errno::ESRCH)?;
+        tc.pending.add(sig);
+        // A blocked task with a pending fatal signal must not stay parked:
+        // wake it so it can observe the signal and exit.
+        if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
+            if let TaskState::Blocked(reason) = tc.state {
+                tc.state = TaskState::Runnable;
+                self.run.push_back(task);
+                self.wake_trace.push(WakeEvent::Woken(task, reason));
+            }
+        }
+        Ok(())
+    }
+
+    /// Deliver a signal to every task in a process group (all tasks
+    /// sharing the same parent, minus the sender). Used by the shell to
+    /// send SIGINT to an entire pipeline on Ctrl-C.
+    pub fn kill_group(&mut self, sender: u32, sig: i32) {
+        // Collect the sender's children (the pipeline stages) first to
+        // avoid borrowing conflicts with kill().
+        let children: Vec<u32> = {
+            match self.tasks.get(&sender) {
+                Some(tc) => tc.children.iter().copied().collect(),
+                None => Vec::new(),
+            }
+        };
+        for c in children {
+            self.kill(c, sig).ok();
+        }
+    }
+
+    /// Check and consume pending signals for a task. Returns the highest-
+    /// priority pending signal (lower number = more urgent), or `None` if
+    /// no signal is pending. The caller should act on the returned signal
+    /// immediately (e.g. exit with `signal_exit_code(sig)`).
+    pub fn check_signals(&mut self, task: u32) -> Option<i32> {
+        let tc = self.tasks.get_mut(&task)?;
+        tc.pending.take_one()
     }
 
     pub fn task_count(&self) -> usize {
@@ -680,5 +812,28 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// Access the network driver client (if one was installed at boot).
     pub fn net(&mut self) -> Option<&mut Box<dyn SocketOps>> {
         self.pm.net.as_mut()
+    }
+
+    // ── Signals ──────────────────────────────────────────────────────────
+
+    /// Check for pending signals on the calling task. Returns the highest-
+    /// priority signal (lower number = more urgent), or `None`. Applets
+    /// should call this at the top of their main loop and before/after
+    /// blocking I/O. A returned SIGKILL/SIGINT/SIGTERM means the task
+    /// should exit with `signal_exit_code(sig)`.
+    pub fn check_signal(&mut self) -> Option<i32> {
+        self.pm.check_signals(self.task)
+    }
+
+    /// Deliver a signal to a specific task (by task id).
+    pub fn kill(&mut self, task: u32, sig: i32) -> Result<(), Errno> {
+        self.pm.kill(task, sig)
+    }
+
+    /// Deliver a signal to the caller's process group (all siblings,
+    /// excluding the sender). Used by the shell for Ctrl-C → SIGINT
+    /// to an entire pipeline.
+    pub fn kill_group(&mut self, sig: i32) {
+        self.pm.kill_group(self.task, sig);
     }
 }

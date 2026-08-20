@@ -46,6 +46,8 @@ pub enum Errno {
     ESPipe,
     /// Broken pipe — a write to a pipe whose read ends are all closed.
     EPipe,
+    /// No such process (used by signal delivery to a nonexistent task).
+    ESRCH,
 }
 
 impl Errno {
@@ -70,6 +72,7 @@ impl Errno {
             Errno::ENoexec => 8,
             Errno::ESPipe => 29,
             Errno::EPipe => 32,
+            Errno::ESRCH => 3,
         }
     }
 }

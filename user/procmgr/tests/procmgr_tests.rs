@@ -15,8 +15,8 @@ use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
 use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
 use aerosls_procmgr::{
-    is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome,
-    WakeEvent, WriteBlock,
+    is_child, signal_exit_code, BlockReason, Ctx, ProcManager, Program, ReadBlock, SIGINT,
+    SIGKILL, SIGTERM, Step, TaskState, WaitOutcome, WakeEvent, WriteBlock,
 };
 
 /// Assert the wake trace records a task's park and its matching wake, in
@@ -945,4 +945,142 @@ fn exit_drops_the_tasks_fds() {
 
     client.kill_driver(0);
     t.join().unwrap();
+}
+
+// ── Signal tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn signalset_basic_ops() {
+    use aerosls_procmgr::SignalSet;
+    let mut s = SignalSet::empty();
+    assert!(s.is_empty());
+    s.add(2);
+    assert!(!s.is_empty());
+    assert!(s.contains(2));
+    assert!(!s.contains(3));
+    s.remove(2);
+    assert!(!s.contains(2));
+    assert!(s.is_empty());
+}
+
+#[test]
+fn signalset_take_one_priority() {
+    use aerosls_procmgr::SignalSet;
+    let mut s = SignalSet::empty();
+    s.add(9);
+    s.add(2);
+    s.add(15);
+    assert_eq!(s.take_one(), Some(2));
+    assert_eq!(s.take_one(), Some(9));
+    assert_eq!(s.take_one(), Some(15));
+    assert_eq!(s.take_one(), None);
+}
+
+#[test]
+fn kill_delivers_signal_and_run_next_checks_it() {
+    let (mut p, t, client) = pm();
+    p.spawn_init(Program::new("loop", |ctx: &mut Ctx<FC, FA>| {
+        if ctx.data.is_empty() {
+            return Step::Yield;
+        }
+        Step::Exit(0)
+    }));
+    p.kill(0, SIGINT).unwrap();
+    let step = p.run_next();
+    assert_eq!(step, Some(Step::Exit(signal_exit_code(SIGINT))));
+    assert_eq!(p.exit_code(0), Some(signal_exit_code(SIGINT)));
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn kill_group_sends_to_siblings() {
+    let (mut p, t, client) = pm();
+    // Parent uses data[0] as phase: 0 = fork+wait, 1 = reaped.
+    p.spawn_init(Program::new("parent", |ctx: &mut Ctx<FC, FA>| {
+        if is_child(&ctx.data) {
+            return Step::Yield;
+        }
+        if ctx.data.is_empty() {
+            ctx.data.push(0); // phase
+        }
+        match ctx.data[0] {
+            0 => {
+                let c1 = ctx.fork().unwrap();
+                let _c2 = ctx.fork().unwrap();
+                ctx.data[0] = 1;
+                ctx.data.extend_from_slice(&c1.to_le_bytes());
+                match ctx.wait(c1) {
+                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c1)),
+                    _ => Step::Yield,
+                }
+            }
+            1 => {
+                let c1 = u32::from_le_bytes(ctx.data[1..5].try_into().unwrap());
+                match ctx.wait(c1) {
+                    WaitOutcome::Reaped(_) => Step::Exit(0),
+                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c1)),
+                    _ => Step::Exit(0),
+                }
+            }
+            _ => Step::Exit(2),
+        }
+    }));
+    p.run_until_quiet(5);
+    p.kill_group(0, SIGTERM);
+    p.run_until_quiet(15);
+    let c1_exit = p.exit_code(1);
+    let c2_exit = p.exit_code(2);
+    // c1 was reaped by the parent — the parent exits 0. // c2 is still a zombie with the signal exit code.
+    assert_eq!(c1_exit, None, "c1 was reaped by parent");
+    assert_eq!(c2_exit, Some(signal_exit_code(SIGTERM)), "c2 is still a zombie");
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn kill_wakes_blocked_task() {
+    let (mut p, t, client) = pm();
+    p.spawn_init(Program::new("waiter", |ctx: &mut Ctx<FC, FA>| {
+        if is_child(&ctx.data) {
+            return Step::Yield;
+        }
+        if ctx.data.is_empty() {
+            ctx.data.push(0);
+        }
+        match ctx.data[0] {
+            0 => {
+                let c = ctx.fork().unwrap();
+                ctx.data[0] = 1;
+                ctx.data.extend_from_slice(&c.to_le_bytes());
+                match ctx.wait(c) {
+                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+                    WaitOutcome::Reaped(code) => Step::Exit(code),
+                    _ => Step::Exit(2),
+                }
+            }
+            1 => {
+                let c = u32::from_le_bytes(ctx.data[1..5].try_into().unwrap());
+                match ctx.wait(c) {
+                    WaitOutcome::Reaped(code) => Step::Exit(code),
+                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+                    _ => Step::Exit(0),
+                }
+            }
+            _ => Step::Exit(2),
+        }
+    }));
+    p.run_until_quiet(5);
+    assert!(matches!(p.state(0), Some(TaskState::Blocked(BlockReason::WaitingChild(1)))));
+    p.kill(1, SIGKILL).unwrap();
+    p.run_until_quiet(10);
+    assert_eq!(p.exit_code(0), Some(signal_exit_code(9)), "parent exits with child signal code");
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn kill_nonexistent_returns_esrch() {
+    let (mut p, _t, _client) = pm();
+    assert_eq!(p.kill(999, SIGTERM), Err(Errno::ESRCH));
 }

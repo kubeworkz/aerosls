@@ -92,7 +92,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use aerosls_procmgr::{is_child, BlockReason, Ctx, ProcManager, ReadBlock, Step, WaitOutcome, WriteBlock};
+use aerosls_procmgr::{is_child, signal_exit_code, BlockReason, Ctx, ProcManager, ReadBlock, SIGINT, Step, WaitOutcome, WriteBlock};
 use aerosls_proto::kabi::Kernel;
 use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
@@ -2009,7 +2009,7 @@ fn valid_name(name: &str) -> bool {
 /// task. v1: recognized only as the bare name (no `/`), standalone
 /// (no pipeline) — see `run_line`.
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "export" | "setenv" | "unset" | "unsetenv")
+    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill")
 }
 
 /// Apply a stage's `<` / `>` redirects at fd 0 / fd 1. Returns false on
@@ -2069,6 +2069,22 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     if is_child(&ctx.data) {
         return sh_child(ctx);
     }
+    if let Some(sig) = ctx.check_signal() {
+        if sig == SIGINT {
+            if ctx.data[0] == 3 {
+                ctx.kill_group(SIGINT);
+            }
+            let qstart = env_end(&ctx.data, 2);
+            let env_reg = ctx.data[2..qstart].to_vec();
+            let status = signal_exit_code(SIGINT) as u8;
+            ctx.data.clear();
+            ctx.data.push(0);
+            ctx.data.push(status);
+            ctx.data.extend_from_slice(&env_reg);
+            return Step::Yield;
+        }
+        return Step::Exit(signal_exit_code(sig));
+    }
     match ctx.data[0] {
         0 => {
             if ctx.vfs().write(task, 1, b"$ ").is_err() {
@@ -2096,7 +2112,17 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     }
                 }
                 ReadBlock::Data(n) => {
-                    ctx.data.extend_from_slice(&buf[..n]);
+                    // Scan for Ctrl-C (\x03) in the console input. If
+                    // found, discard the partial line, send SIGINT to
+                    // the process group, and re-prompt.
+                    let chunk = &buf[..n];
+                    if chunk.contains(&0x03) {
+                        ctx.kill_group(SIGINT);
+                        ctx.data.truncate(qstart);
+                        ctx.data[0] = 0; // re-prompt
+                        return Step::Yield;
+                    }
+                    ctx.data.extend_from_slice(chunk);
                     if ctx.data[qstart..].contains(&b'\n') {
                         ctx.data[0] = 2;
                     }
@@ -2338,6 +2364,7 @@ fn run_builtin<K: Kernel, A: BufferAlloc>(
         "setenv" => do_setenv(&mut new_env, &stage.argv[1..]),
         "unset" => do_unset(&mut new_env, &stage.argv[1..], false),
         "unsetenv" => do_unset(&mut new_env, &stage.argv[1..], true),
+        "kill" => do_kill(ctx, &stage.argv[1..]),
         _ => 2, // unreachable: is_builtin guards the call
     };
     builtin_done(ctx, remainder, &new_env, code)
@@ -2445,6 +2472,58 @@ fn do_unset(env: &mut Vec<(String, String)>, args: &[String], one_only: bool) ->
     }
     env.retain(|(k, _)| !args.iter().any(|a| a == k));
     0
+}
+
+/// Parse a signal number from a string: a bare decimal (`9`), or a name
+/// with optional `-`/`SIG` prefix (`-9`, `SIGINT`, `-SIGTERM`, `INT`).
+fn parse_signal(s: &str) -> Option<i32> {
+    let s = s.trim_start_matches('-');
+    let s = s.strip_prefix("SIG").unwrap_or(s);
+    match s {
+        "HUP" => Some(1), "INT" => Some(2), "QUIT" => Some(3),
+        "KILL" => Some(9), "PIPE" => Some(13), "TERM" => Some(15),
+        _ => s.parse().ok(),
+    }
+}
+
+/// `kill` builtin: `kill [-SIGNAL] PID...` sends a signal to each PID.
+/// Default signal is SIGTERM (15). A PID of 0 sends to the shell's
+/// process group (`kill_group`). Returns 0 on success, 1 if any
+/// signal could not be delivered.
+fn do_kill<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    args: &[String],
+) -> u8 {
+    if args.is_empty() {
+        return 2; // usage error
+    }
+    let mut sig = 15i32; // default: SIGTERM
+    let mut pid_start = 0;
+    if args[0].starts_with('-') && args[0].len() > 1 {
+        match parse_signal(&args[0]) {
+            Some(s) => {
+                sig = s;
+                pid_start = 1;
+            }
+            None => return 2,
+        }
+    }
+    if pid_start >= args.len() {
+        return 2;
+    }
+    let mut ok = true;
+    for a in &args[pid_start..] {
+        if a == "0" {
+            ctx.kill_group(sig);
+        } else if let Ok(pid) = a.parse::<u32>() {
+            if ctx.kill(pid, sig).is_err() {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if ok { 0 } else { 1 }
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
