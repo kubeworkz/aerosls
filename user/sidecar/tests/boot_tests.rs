@@ -1528,3 +1528,41 @@ fn sh_cd_pwd_changes_working_directory() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+#[test]
+fn sh_export_persists_env_through_pipeline() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    console.console_io().push_input(b"export GREETING=hello\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $GREETING\n");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ $ hello\n$ ", "export + echo uses the variable");
+
+    console.console_io().push_input(b"export ITEM=widget\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $ITEM | cat\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ $ hello\n$ $ widget\n$ ",
+        "env survives into pipeline"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

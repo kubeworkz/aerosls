@@ -294,6 +294,10 @@ pub struct TaskCtl<K: Kernel, A: BufferAlloc> {
     /// step. Checked by `check_signals` at blocking I/O and between
     /// pipeline stages. Clear + delivered atomically to the task.
     pub pending: SignalSet,
+    /// Inherited environment variables. Copied from parent on fork so
+    /// exec'd programs can read PATH, HOME, etc. The shell syncs its
+    /// own env region into this table after builtins modify it.
+    pub env: Vec<(String, String)>,
 }
 
 /// The proc manager. Owns the VFS and the task registry + run queue.
@@ -351,6 +355,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 children: BTreeSet::new(),
                 program,
                 pending: SignalSet::empty(),
+                env: Vec::new(),
             },
         );
         self.run.push_back(0);
@@ -368,6 +373,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 children: BTreeSet::new(),
                 program,
                 pending: SignalSet::empty(),
+                env: Vec::new(),
             },
         );
         self.tasks.get_mut(&0).map(|t| t.children.insert(id));
@@ -411,15 +417,18 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
     /// Register a child task: cloned program (with the fork marker), parent
     /// link, queued.
     fn register_child(&mut self, parent: u32, child: u32, data: Vec<u8>) -> Result<(), Errno> {
-        let program = self
+        let (program, parent_env) = self
             .tasks
             .get(&parent)
-            .map(|t| Program {
-                name: t.program.name.clone(),
-                argv: t.program.argv.clone(),
-                data,
-                step: t.program.step,
-                gen: t.program.gen,
+            .map(|t| {
+                let p = Program {
+                    name: t.program.name.clone(),
+                    argv: t.program.argv.clone(),
+                    data,
+                    step: t.program.step,
+                    gen: t.program.gen,
+                };
+                (p, t.env.clone())
             })
             .ok_or(Errno::EInval)?;
         self.tasks.insert(
@@ -430,6 +439,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 children: BTreeSet::new(),
                 program,
                 pending: SignalSet::empty(),
+                env: parent_env,
             },
         );
         if let Some(tc) = self.tasks.get_mut(&parent) {
@@ -845,5 +855,23 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// Return the calling task's current working directory.
     pub fn getcwd(&self) -> Result<&str, Errno> {
         self.pm.vfs.get_cwd(self.task)
+    }
+
+    /// Return a reference to the calling task's inherited environment
+    /// variables. Programs use this to read PATH, HOME, etc.
+    pub fn get_env(&self) -> &[(String, String)] {
+        self.pm
+            .tasks
+            .get(&self.task)
+            .map(|t| t.env.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Replace the calling task's environment. The shell calls this after
+    /// builtins modify the env region so the TaskCtl stays in sync.
+    pub fn set_env(&mut self, env: Vec<(String, String)>) {
+        if let Some(tc) = self.pm.tasks.get_mut(&self.task) {
+            tc.env = env;
+        }
     }
 }

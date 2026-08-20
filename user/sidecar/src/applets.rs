@@ -2064,6 +2064,7 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         // bare command names) and HOME=/root, encoded as the env region.
         ctx.data.extend_from_slice(&[0, 0]); // phase, last status
         env_push(&mut ctx.data, &[("PATH", "/bin"), ("HOME", "/root")]);
+        ctx.set_env(alloc::vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/root".into())]);
         return Step::Yield;
     }
     if is_child(&ctx.data) {
@@ -2402,6 +2403,8 @@ fn builtin_done<K: Kernel, A: BufferAlloc>(
     ctx.data.push(code);
     env_push(&mut ctx.data, env);
     ctx.data.extend_from_slice(remainder);
+    // Sync env to TaskCtl so forked children inherit the changes.
+    ctx.set_env(env.to_vec());
     Step::Yield
 }
 
