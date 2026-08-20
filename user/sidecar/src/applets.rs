@@ -1913,6 +1913,26 @@ pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     Step::Exit(1)
 }
 
+/// `sleep N`: park the calling task for N scheduler ticks.  The
+/// scheduler's drain-wake loop decrements the counter each step and
+/// requeues the task when it reaches zero.  This is a *cooperative*
+/// delay — one tick per scheduler step, not wall-clock time.
+///
+/// State machine (driven by `ctx.data[0]`):
+///   0 = first call → parse N, park for N ticks.
+///   1 = woken after sleep → exit 0.
+pub fn sleep<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if ctx.data.is_empty() {
+        let ticks: u32 = ctx.argv().get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        ctx.data.push(1); // mark: "about to sleep"
+        ctx.sleep(ticks)
+    } else {
+        Step::Exit(0)
+    }
+}
+
 /// Append a length-prefixed env region to `data`: `[n, (name_len, name,
 /// val_len, val)...]` — the shell's variable table (see `sh`). Accepts
 /// either `(&str, &str)` or `(String, String)` pairs.
@@ -3713,6 +3733,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
     pm.register_applet("false", do_false);
+    pm.register_applet("sleep", sleep);
 }
 
 #[cfg(test)]

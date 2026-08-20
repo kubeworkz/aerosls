@@ -1720,3 +1720,51 @@ fn sh_multiple_background_jobs() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Background sleep + foreground pipeline: prove that a sleeping
+/// background task does not block foreground work.  The sequence:
+///   1. Start `sleep 2 &` — parks for 2 ticks.
+///   2. While it sleeps, run `echo hello | cat` — foreground pipeline.
+///   3. The pipeline completes while sleep is still parked.
+///   4. Eventually sleep wakes and exits; [done] appears.
+#[test]
+fn sh_sleep_background_does_not_block_foreground() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    // Start a background sleep for 2 ticks.
+    console.console_io().push_input(b"sleep 2 &\n");
+    booted.run(100);
+
+    // Run a foreground pipeline while the sleep is still parked.
+    console.console_io().push_input(b"echo hello | cat\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.windows(6).any(|w| w == b"hello\n"),
+        "foreground pipeline ran while sleep was parked, got: {:?}", out);
+
+    // Eventually (after enough steps) the sleep wakes, exits, and
+    // [done] is printed.
+    booted.run(50);
+    let out = console.console_io().output();
+    assert!(out.windows(7).any(|w| w == b"[done] "),
+        "[done] appeared after sleep finished, got: {:?}", out);
+    assert!(out.ends_with(b"$ "), "back to prompt, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

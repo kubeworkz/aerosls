@@ -168,6 +168,8 @@ pub enum BlockReason {
     Writable(u32),
     /// The program chose to block (I/O wait, etc.).
     User,
+    /// Sleep for N scheduler ticks (cooperative).
+    Sleep(u32),
 }
 
 /// Outcome of a blocking read (`Ctx::read_blocking`).
@@ -659,6 +661,26 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 self.wake_trace.push(WakeEvent::Woken(t, reason));
             }
         }
+        // Tick down sleep timers. Any task blocked on Sleep(n) gets
+        // n decremented; when it reaches 0 the task is woken.
+        let mut sleepers = Vec::new();
+        for (&id, tc) in self.tasks.iter_mut() {
+            if let TaskState::Blocked(BlockReason::Sleep(n)) = &mut tc.state {
+                if *n == 0 {
+                    sleepers.push(id);
+                } else {
+                    *n -= 1;
+                }
+            }
+        }
+        for id in sleepers {
+            if let Some(tc) = self.tasks.get_mut(&id) {
+                tc.state = TaskState::Runnable;
+                self.run.push_back(id);
+                self.wake_trace
+                    .push(WakeEvent::Woken(id, BlockReason::Sleep(0)));
+            }
+        }
     }
 
     /// Run the cooperative scheduler until the run queue is empty (or
@@ -894,6 +916,13 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// Return the calling task's current working directory.
     pub fn getcwd(&self) -> Result<&str, Errno> {
         self.pm.vfs.get_cwd(self.task)
+    }
+
+    /// Park the calling task for `ticks` scheduler ticks (cooperative
+    /// sleep).  The drain-wake countdown decrements each step and
+    /// requeues the task when it reaches zero.
+    pub fn sleep(&mut self, ticks: u32) -> Step {
+        Step::Blocked(BlockReason::Sleep(ticks))
     }
 
     /// Return a reference to the calling task's inherited environment
