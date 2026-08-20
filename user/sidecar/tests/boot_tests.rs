@@ -1769,6 +1769,45 @@ fn sh_sleep_background_does_not_block_foreground() {
     t.join().unwrap();
 }
 
+/// fg times out on a never-exiting background job instead of hanging.
+/// The background sleep is set to 999 ticks; fg's 100-tick timeout
+/// expires, kills the child, and returns status 124 (like timeout(1)).
+#[test]
+fn fg_times_out_on_stuck_background_job() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    // Start a background sleep for 999 ticks (way longer than fg's timeout).
+    console.console_io().push_input(b"sleep 999 &\n");
+    booted.run(200);
+
+    // fg with the background job — should timeout after 100 ticks.
+    console.console_io().push_input(b"fg\n");
+    booted.run(200);
+
+    // The shell should have re-prompted (fg timed out, killed the child).
+    let out = console.console_io().output();
+    let prompt_count = out.windows(2).filter(|w| *w == b"$ ").count();
+    assert!(prompt_count >= 3,
+        "shell re-prompted after fg timeout ({} prompts), got: {:?}", prompt_count, out);
+    assert!(out.ends_with(b"$ "), "back to prompt, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 /// Ctrl-C kills the foreground pipeline but leaves background jobs alive.
 /// Sequence:
 ///   1. Start `sleep 10 &` — background, parks for 10 ticks.

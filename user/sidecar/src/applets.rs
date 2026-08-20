@@ -2303,6 +2303,58 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         }
         2 => run_line(ctx),
         3 => reap_next(ctx),
+        FG_WAIT => {
+            // Wakeup from fg wait — check if it was a timeout.
+            let timed_out = ctx.check_wait_timeout();
+            let child_id = u32::from_le_bytes([
+                ctx.data[2], ctx.data[3], ctx.data[4], ctx.data[5],
+            ]);
+            let env_end_off = env_end(&ctx.data, 6);
+            let env_region = ctx.data[6..env_end_off].to_vec();
+            // FG_WAIT layout: [FG_WAIT(1), status(1), child_id(4),
+            // env..., job_table..., queue...].  queue_start() assumes
+            // env at offset 2, but here it starts at 6.  Compute qstart
+            // by parsing the job table starting at env_end_off.
+            let qstart = {
+                let off = env_end_off;
+                if off >= ctx.data.len() {
+                    ctx.data.len()
+                } else {
+                    let n_jobs = ctx.data[off] as usize;
+                    let mut p = off + 1;
+                    for _ in 0..n_jobs {
+                        if p + 5 > ctx.data.len() { break; }
+                        p += 4; // child_id
+                        let cmd_len = ctx.data[p] as usize;
+                        p += 1;
+                        if p + cmd_len > ctx.data.len() { break; }
+                        p += cmd_len;
+                    }
+                    p
+                }
+            };
+            let queue = ctx.data[qstart..].to_vec();
+            let code = if timed_out {
+                124 // timeout exit code (like timeout(1))
+            } else {
+                match ctx.wait(child_id) {
+                    WaitOutcome::Reaped(c) => c as u8,
+                    _ => 0,
+                }
+            };
+            ctx.data.clear();
+            ctx.data.push(if queue.is_empty() { 0 } else { 1 });
+            ctx.data.push(code);
+            ctx.data.extend_from_slice(&env_region);
+            let (_nj, job_entries) = jobs_decode(&ctx.data);
+            let refs: alloc::vec::Vec<(u32, &str)> = job_entries
+                .iter()
+                .map(|(id, c)| (*id, c.as_str()))
+                .collect();
+            jobs_encode(&mut ctx.data, &refs);
+            ctx.data.extend_from_slice(&queue);
+            Step::Yield
+        }
         _ => Step::Exit(2),
     }
 }
@@ -2899,6 +2951,11 @@ fn do_jobs<K: Kernel, A: BufferAlloc>(
 /// argument is given, waits for the most recent (last) job. The child
 /// is removed from the job table. Returns a Step because it blocks
 /// when the child is still running.
+/// Phase for fg wait-wakeup: `sh()` enters this when a fg wait
+/// completes.  data layout: `[FG_WAIT, status, child_id(u32 LE),
+/// env..., n_jobs, job_entries..., remainder...]`.
+const FG_WAIT: u8 = 4;
+
 fn do_fg<K: Kernel, A: BufferAlloc>(
     ctx: &mut Ctx<'_, K, A>,
     args: &[String],
@@ -2908,12 +2965,10 @@ fn do_fg<K: Kernel, A: BufferAlloc>(
     let task = ctx.task;
     let (_nj, mut entries) = jobs_decode(&ctx.data);
     if entries.is_empty() {
-        // No background jobs.
         let msg = alloc::format!("fg: no current job\n");
         ctx.vfs().write(task, 1, msg.as_bytes()).ok();
         return builtin_done(ctx, remainder, env, 1);
     }
-    // Determine which job: `fg %N` or last.
     let idx = if let Some(arg) = args.first() {
         let num_str = arg.trim_start_matches('%');
         match num_str.parse::<usize>() {
@@ -2925,46 +2980,28 @@ fn do_fg<K: Kernel, A: BufferAlloc>(
             }
         }
     } else {
-        entries.len() - 1 // last job
+        entries.len() - 1
     };
     let child_id = entries[idx].0;
     entries.remove(idx);
-    // Rebuild the job table without this entry.
-    {
-        let refs: alloc::vec::Vec<(u32, &str)> = entries
-            .iter()
-            .map(|(id, c)| (*id, c.as_str()))
-            .collect();
-        jobs_encode(&mut ctx.data, &refs);
-    }
-    // Now wait for the child.
-    match ctx.wait(child_id) {
-        WaitOutcome::Reaped(code) => {
-            // Update $?
-            let env_end_off = env_end(&ctx.data, 2);
-            let env_region = ctx.data[2..env_end_off].to_vec();
-            let qstart = queue_start(&ctx.data);
-            let queue = ctx.data[qstart..].to_vec();
-            ctx.data.clear();
-            ctx.data.push(if queue.is_empty() { 0 } else { 1 });
-            ctx.data.push(code as u8);
-            ctx.data.extend_from_slice(&env_region);
-            // Preserve job table.
-            let (_nj2, job_entries2) = jobs_decode(&ctx.data);
-            let refs2: alloc::vec::Vec<(u32, &str)> = job_entries2
-                .iter()
-                .map(|(id, c)| (*id, c.as_str()))
-                .collect();
-            jobs_encode(&mut ctx.data, &refs2);
-            ctx.data.extend_from_slice(&queue);
-            Step::Yield
-        }
-        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child_id)),
-        WaitOutcome::NoSuchChild => {
-            // Already reaped — just continue.
-            Step::Yield
-        }
-    }
+    // Build FG_WAIT data so sh() can resume after the wait.
+    let env_end_off = env_end(&ctx.data, 2);
+    let env_region = ctx.data[2..env_end_off].to_vec();
+    let qstart = queue_start(&ctx.data);
+    let queue = ctx.data[qstart..].to_vec();
+    ctx.data.clear();
+    ctx.data.push(FG_WAIT);
+    ctx.data.push(0); // status placeholder
+    ctx.data.extend_from_slice(&child_id.to_le_bytes());
+    ctx.data.extend_from_slice(&env_region);
+    let refs: alloc::vec::Vec<(u32, &str)> = entries
+        .iter()
+        .map(|(id, c)| (*id, c.as_str()))
+        .collect();
+    jobs_encode(&mut ctx.data, &refs);
+    ctx.data.extend_from_slice(&queue);
+    // Park with a 100-tick timeout.
+    ctx.wait_timeout(child_id, 100)
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,

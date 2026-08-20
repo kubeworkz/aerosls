@@ -170,6 +170,9 @@ pub enum BlockReason {
     User,
     /// Sleep for N scheduler ticks (cooperative).
     Sleep(u32),
+    /// Wait for a specific child OR for N ticks, whichever comes first.
+    /// Payload: (child_id, remaining_ticks).
+    WaitChildTimeout(u32, u32),
 }
 
 /// Outcome of a blocking read (`Ctx::read_blocking`).
@@ -309,6 +312,10 @@ pub struct TaskCtl<K: Kernel, A: BufferAlloc> {
     /// only to these — background jobs are not killed by the terminal
     /// interrupt.  Cleared when the pipeline completes.
     pub foreground: BTreeSet<u32>,
+    /// Set by `drain_wakes` when a `WaitChildTimeout` expires.
+    /// The task checks and clears this on its next step to detect
+    /// that it was woken by a timeout rather than a child exit.
+    pub wait_timed_out: bool,
 }
 
 /// The proc manager. Owns the VFS and the task registry + run queue.
@@ -368,6 +375,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 pending: SignalSet::empty(),
                 env: Vec::new(),
                 foreground: BTreeSet::new(),
+                wait_timed_out: false,
             },
         );
         self.run.push_back(0);
@@ -387,6 +395,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 pending: SignalSet::empty(),
                 env: Vec::new(),
                 foreground: BTreeSet::new(),
+                wait_timed_out: false,
             },
         );
         self.tasks.get_mut(&0).map(|t| t.children.insert(id));
@@ -454,6 +463,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 pending: SignalSet::empty(),
                 env: parent_env,
                 foreground: BTreeSet::new(),
+                wait_timed_out: false,
             },
         );
         if let Some(tc) = self.tasks.get_mut(&parent) {
@@ -728,19 +738,81 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 self.kill(c, SIGINT).ok();
             }
         }
+        // Handle WaitChildTimeout: check if the child exited or the
+        // timer expired.  This is how `fg` avoids hanging forever on a
+        // background job that never exits.
+        //
+        // Phase 1: collect decisions without borrowing self.tasks mutably.
+        let mut wake_list: Vec<(u32, BlockReason)> = Vec::new();
+        let mut decrement_list: Vec<u32> = Vec::new();
+        let mut kill_list: Vec<u32> = Vec::new();
+        for (&id, tc) in self.tasks.iter() {
+            if let TaskState::Blocked(BlockReason::WaitChildTimeout(child, ticks)) = tc.state {
+                let child_done = self.tasks.get(&child)
+                    .map(|c| matches!(c.state, TaskState::Exited(_)))
+                    .unwrap_or(true);
+                if child_done || ticks == 0 {
+                    wake_list.push((id, BlockReason::WaitChildTimeout(child, 0)));
+                    if !child_done {
+                        kill_list.push(child);
+                    }
+                } else {
+                    decrement_list.push(id);
+                }
+            }
+        }
+        // Phase 2: mutate (kills, decrements, wakes).
+        for child in kill_list {
+            self.kill(child, SIGTERM).ok();
+        }
+        for id in decrement_list {
+            if let Some(tc) = self.tasks.get_mut(&id) {
+                if let TaskState::Blocked(BlockReason::WaitChildTimeout(_, ref mut t)) = tc.state {
+                    *t -= 1;
+                }
+            }
+        }
+        for (id, reason) in wake_list {
+            if let Some(tc) = self.tasks.get_mut(&id) {
+                let timed_out = matches!(reason, BlockReason::WaitChildTimeout(_, 0));
+                tc.wait_timed_out = timed_out;
+                tc.state = TaskState::Runnable;
+                self.run.push_back(id);
+                self.wake_trace.push(WakeEvent::Woken(id, reason));
+            }
+        }
     }
 
     /// Run the cooperative scheduler until the run queue is empty (or
     /// `max_steps` steps). Returns the number of steps run. A non-empty
     /// result at `max_steps` with tasks still blocked means the remaining
     /// tasks are wedged (deadlock — the caller's problem).
+    /// Return true if any task has an active timer (Sleep or
+    /// WaitChildTimeout) that hasn't expired yet.  The scheduler must
+    /// keep calling drain_wakes to tick those down.
+    fn has_active_timers(&self) -> bool {
+        self.tasks.values().any(|tc| matches!(
+            tc.state,
+            TaskState::Blocked(BlockReason::Sleep(n) | BlockReason::WaitChildTimeout(_, n)) if n > 0
+        ))
+    }
+
     pub fn run_until_quiet(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while steps < max_steps {
             self.drain_wakes();
             match self.run_next() {
                 Some(_) => steps += 1,
-                None => break,
+                None => {
+                    // No runnable task.  If timers are still counting
+                    // down (Sleep or WaitChildTimeout), keep calling
+                    // drain_wakes so they can expire.
+                    if self.has_active_timers() {
+                        steps += 1;
+                        continue;
+                    }
+                    break;
+                }
             }
         }
         steps
@@ -876,6 +948,24 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
         self.pm.waitpid(self.task, child, options)
     }
 
+    /// Wait for a child with a tick-based timeout.  If the child exits
+    /// before `ticks` scheduler steps, returns `Reaped`.  If the timer
+    /// expires first, the child is killed with SIGTERM and the caller
+    /// is woken with `Blocked(WaitChildTimeout(child, 0))`.
+    pub fn wait_timeout(&mut self, child: u32, ticks: u32) -> Step {
+        // Fast path: already reaped or gone.
+        match self.pm.wait(self.task, child) {
+            WaitOutcome::Reaped(_code) => {
+                return Step::Yield;
+            }
+            WaitOutcome::NoSuchChild => {
+                return Step::Yield;
+            }
+            WaitOutcome::Blocked => {}
+        }
+        Step::Blocked(BlockReason::WaitChildTimeout(child, ticks))
+    }
+
     pub fn exec(&mut self, path: &str, argv: &[&str]) -> Result<(), Errno> {
         self.pm.exec(self.task, path, argv)
     }
@@ -1008,6 +1098,19 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// requeues the task when it reaches zero.
     pub fn sleep(&mut self, ticks: u32) -> Step {
         Step::Blocked(BlockReason::Sleep(ticks))
+    }
+
+    /// Check (and clear) the `wait_timed_out` flag.  Returns true if
+    /// the task was woken because a `WaitChildTimeout` expired rather
+    /// than because the child exited.
+    pub fn check_wait_timeout(&mut self) -> bool {
+        if let Some(tc) = self.pm.tasks.get_mut(&self.task) {
+            let v = tc.wait_timed_out;
+            tc.wait_timed_out = false;
+            v
+        } else {
+            false
+        }
     }
 
     /// Return a reference to the calling task's inherited environment
