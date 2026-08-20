@@ -1108,6 +1108,122 @@ fn nc_listen_mode_exercises_bind_listen_accept() {
     t.join().unwrap();
 }
 
+/// Mock socket for the UDP client test. Simulates a connected datagram
+/// peer: `connect()` records the address, `send()` accepts data,
+/// `recv()` returns a one-line response, then EOF.
+struct UdpClientMock {
+    next_id: u32,
+    response: Vec<u8>,
+    recv_count: u32,
+    log: Vec<MockEvent>,
+}
+
+impl UdpClientMock {
+    fn new(response: &[u8]) -> UdpClientMock {
+        UdpClientMock {
+            next_id: 1,
+            response: response.to_vec(),
+            recv_count: 0,
+            log: Vec::new(),
+        }
+    }
+}
+
+impl aerosls_proto::sockops::SocketOps for UdpClientMock {
+    fn socket(&mut self, sock_type: u16) -> Result<u32, u16> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.log.push(MockEvent::Socket(sock_type));
+        Ok(id)
+    }
+    fn connect(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16> {
+        self.log.push(MockEvent::Connect(id, ip, port));
+        Ok(())
+    }
+    fn bind(&mut self, _id: u32, _ip: u32, _port: u16) -> Result<(), u16> {
+        Ok(())
+    }
+    fn listen(&mut self, _id: u32) -> Result<(), u16> {
+        Ok(())
+    }
+    fn accept(&mut self, _id: u32) -> Result<u32, u16> {
+        Err(0)
+    }
+    fn send(&mut self, id: u32, data: &[u8]) -> Result<usize, u16> {
+        self.log.push(MockEvent::Send(id, data.len()));
+        Ok(data.len())
+    }
+    fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16> {
+        self.log.push(MockEvent::Recv(id));
+        self.recv_count += 1;
+        if self.recv_count == 1 && !self.response.is_empty() {
+            let n = core::cmp::min(buf.len(), self.response.len());
+            buf[..n].copy_from_slice(&self.response[..n]);
+            Ok(n)
+        } else {
+            Ok(0) // EOF
+        }
+    }
+    fn close_socket(&mut self, id: u32) -> Result<(), u16> {
+        self.log.push(MockEvent::CloseSocket(id));
+        Ok(())
+    }
+    fn poll(&mut self, id: u32) -> Result<u16, u16> {
+        self.log.push(MockEvent::Poll(id));
+        Ok(0x01) // POLLIN
+    }
+    fn shutdown(&mut self, id: u32, how: u8) -> Result<(), u16> {
+        self.log.push(MockEvent::Shutdown(id, how));
+        Ok(())
+    }
+}
+
+/// The nc UDP client: boot with `nc -u 127.0.0.1 9000`, install a
+/// UdpClientMock that echoes a datagram response, and verify the full
+/// lifecycle — SOCK_DGRAM socket create, connect, poll, recv, send,
+/// close.
+#[test]
+fn nc_udp_client_exercises_dgram_lifecycle() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/nc", b"nc\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    // init runs nc in UDP client mode
+    b.add_file("/etc/init.rc", b"/bin/nc -u 127.0.0.1 9000\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    // Install UDP mock: simulates a peer that responds with "pong\n".
+    let mock = UdpClientMock::new(b"pong\n");
+    booted.proc.set_net(Box::new(mock));
+
+    // Run to completion.
+    booted.run(200);
+
+    // nc should have exited cleanly.
+    assert_eq!(
+        booted.proc.exit_code(0),
+        Some(0),
+        "nc -u should exit 0"
+    );
+
+    // The console should show the UDP peer's response.
+    assert_eq!(
+        console.console_io().output(),
+        b"pong\n",
+        "nc -u relayed the UDP peer's response to stdout"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
     const HEADER_LEN: usize = 32;
     let mut b = Vec::new();

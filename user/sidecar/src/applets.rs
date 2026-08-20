@@ -2893,16 +2893,61 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
 /// [6..8] dest_port (u16 LE)
 /// [8..]  pending I/O data (read buffer or write remainder)
 /// ```
+/// `nc` (netcat): minimal TCP/UDP client/server. Three modes:
+///
+/// - **TCP client**: `nc <host> <port>` — connect, relay stdin↔socket.
+/// - **TCP listen**: `nc -l <port>` — bind, listen, accept, relay.
+/// - **UDP client**: `nc -u <host> <port>` — create SOCK_DGRAM, connect,
+///   relay. No listen/accept (UDP is connectionless).
+/// - **UDP listen**: `nc -u -l <port>` — create SOCK_DGRAM, bind, relay
+///   (recv gives datagrams, send replies to last sender).
+///
+/// Data layout (`ctx.data`):
+///
+/// ```text
+/// [0]    phase:
+///        1   = TCP connect
+///        2   = relay: read socket → write stdout (TCP + UDP)
+///        3   = write pending chunk to stdout
+///        0xFF = read stdin → send to socket
+///        4   = done (exit)
+///        10  = TCP bind + listen
+///        11  = TCP poll + accept
+///        12  = UDP bind (listen mode)
+/// [1]    sock_id (driver-side socket ID)
+/// [2..6] dest_ip   (client: connect target; listen: unused)
+/// [6..8] dest_port (u16 LE)
+/// [8]    flags: bit 0 = UDP mode
+/// [9..]  pending I/O data (read buffer or write remainder)
+/// ```
 pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     if ctx.data.is_empty() {
         let argv = ctx.argv().to_vec();
         if ctx.net().is_none() {
             return Step::Exit(1);
         }
-        // Detect listen mode: nc -l <port>
-        let listen_mode = argv.get(1).map(|s| s.as_str()) == Some("-l");
-        if listen_mode {
-            let port_str = match argv.get(2).map(|s| s.as_str()) {
+
+        // Scan argv for flags: -l (listen), -u (UDP).
+        let mut flags: u8 = 0;
+        let mut positional: Vec<&str> = Vec::new();
+        for arg in argv.iter().skip(1) {
+            match arg.as_str() {
+                "-l" => flags |= 0x02,
+                "-u" => flags |= 0x01,
+                other => positional.push(other),
+            }
+        }
+        let listen = flags & 0x02 != 0;
+        let udp = flags & 0x01 != 0;
+        let sock_type = if udp {
+            aerosls_proto::SOCK_DGRAM
+        } else {
+            aerosls_proto::SOCK_STREAM
+        };
+
+        if listen {
+            // Listen mode: nc [-u] -l <port>
+            let port_str = match positional.first() {
                 Some(p) => p,
                 None => return Step::Exit(2),
             };
@@ -2910,22 +2955,29 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                 Ok(p) => p,
                 Err(_) => return Step::Exit(2),
             };
-            let sock_id = match ctx.net().unwrap().socket(aerosls_proto::SOCK_STREAM) {
+            let sock_id = match ctx.net().unwrap().socket(sock_type) {
                 Ok(id) => id,
                 Err(_) => return Step::Exit(1),
             };
-            ctx.data.resize(8, 0);
+            ctx.data.resize(9, 0);
             ctx.data[1] = sock_id as u8;
             ctx.data[6..8].copy_from_slice(&port.to_le_bytes());
-            ctx.data[0] = 10; // → bind + listen
+            ctx.data[8] = flags;
+            if udp {
+                // UDP: just bind, no listen.
+                ctx.data[0] = 12;
+            } else {
+                ctx.data[0] = 10; // TCP: bind + listen
+            }
             return Step::Yield;
         }
-        // Client mode: nc <host> <port>
-        let host_str = match argv.get(1).map(|s| s.as_str()) {
+
+        // Client mode: nc [-u] <host> <port>
+        let host_str = match positional.first() {
             Some(h) => h,
             None => return Step::Exit(2),
         };
-        let port_str = match argv.get(2).map(|s| s.as_str()) {
+        let port_str = match positional.get(1) {
             Some(p) => p,
             None => return Step::Exit(2),
         };
@@ -2944,19 +2996,27 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             };
         }
         let ip = u32::from_le_bytes(ip_bytes);
-        let sock_id = match ctx.net().unwrap().socket(aerosls_proto::SOCK_STREAM) {
+        let sock_id = match ctx.net().unwrap().socket(sock_type) {
             Ok(id) => id,
             Err(_) => return Step::Exit(1),
         };
-        ctx.data.resize(8, 0);
+        ctx.data.resize(9, 0);
         ctx.data[1] = sock_id as u8;
         ctx.data[2..6].copy_from_slice(&ip.to_le_bytes());
         ctx.data[6..8].copy_from_slice(&port.to_le_bytes());
-        ctx.data[0] = 1; // → connect phase
+        ctx.data[8] = flags;
+        if udp {
+            // UDP client: connect (sets default destination), then relay.
+            ctx.data[0] = 1;
+        } else {
+            ctx.data[0] = 1; // TCP: connect
+        }
     }
 
+    let udp = ctx.data.get(8).copied().unwrap_or(0) & 0x01 != 0;
+
     match ctx.data[0] {
-        // ── client connect ────────────────────────────────────────────
+        // ── TCP/UDP connect ───────────────────────────────────────────
         1 => {
             let sock_id = ctx.data[1] as u32;
             let ip = u32::from_le_bytes([
@@ -2965,13 +3025,13 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             let port = u16::from_le_bytes([ctx.data[6], ctx.data[7]]);
             match ctx.net().unwrap().connect(sock_id, ip, port) {
                 Ok(()) => {
-                    ctx.data[0] = 2;
+                    ctx.data[0] = 2; // → relay
                     Step::Yield
                 }
                 Err(_) => Step::Exit(1),
             }
         }
-        // ── listen: bind + listen ─────────────────────────────────────
+        // ── TCP listen: bind + listen ─────────────────────────────────
         10 => {
             let sock_id = ctx.data[1] as u32;
             let port = u16::from_le_bytes([ctx.data[6], ctx.data[7]]);
@@ -2985,7 +3045,7 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             ctx.data[0] = 11; // → accept
             Step::Yield
         }
-        // ── listen: poll + accept ─────────────────────────────────────
+        // ── TCP listen: poll + accept ─────────────────────────────────
         11 => {
             let sock_id = ctx.data[1] as u32;
             match ctx.net().unwrap().poll(sock_id) {
@@ -2994,12 +3054,23 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         Ok(id) => id,
                         Err(_) => return Step::Exit(1),
                     };
-                    // Switch to the accepted socket for relay.
                     ctx.data[1] = accepted as u8;
                     ctx.data[0] = 2; // → relay
                     Step::Yield
                 }
                 _ => Step::Yield,
+            }
+        }
+        // ── UDP listen: bind only ─────────────────────────────────────
+        12 => {
+            let sock_id = ctx.data[1] as u32;
+            let port = u16::from_le_bytes([ctx.data[6], ctx.data[7]]);
+            match ctx.net().unwrap().bind(sock_id, 0, port) {
+                Ok(()) => {
+                    ctx.data[0] = 2; // → relay (recv/send datagrams)
+                    Step::Yield
+                }
+                Err(_) => Step::Exit(1),
             }
         }
         // ── relay: read socket → write stdout ─────────────────────────
@@ -3019,7 +3090,7 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         ctx.data[0] = 4;
                         return Step::Yield;
                     }
-                    ctx.data.truncate(8);
+                    ctx.data.truncate(9);
                     ctx.data.extend_from_slice(&buf[..n]);
                     ctx.data[0] = 3;
                     Step::Yield
@@ -3028,11 +3099,11 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     let mut buf = [0u8; 16];
                     match ctx.read_blocking(0, &mut buf) {
                         ReadBlock::Data(0) => {
-                            {
+                            if !udp {
                                 let sid = ctx.data[1] as u32;
                                 let _ = ctx.net().unwrap().shutdown(sid, 1);
                             }
-                            ctx.data[0] = 2;
+                            ctx.data[0] = 4; // done
                             Step::Yield
                         }
                         ReadBlock::Data(n) => {
@@ -3042,7 +3113,7 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                             };
                             match send_result {
                                 Ok(_) => {
-                                    ctx.data.truncate(8);
+                                    ctx.data.truncate(9);
                                     ctx.data[0] = 2;
                                 }
                                 Err(_) => {
@@ -3061,14 +3132,14 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         }
         // ── relay: write pending chunk to stdout ──────────────────────
         3 => {
-            let pending = ctx.data[8..].to_vec();
+            let pending = ctx.data[9..].to_vec();
             match ctx.write_blocking(1, &pending) {
                 WriteBlock::Data(k) => {
                     if k == pending.len() {
-                        ctx.data.truncate(8);
+                        ctx.data.truncate(9);
                         ctx.data[0] = 2;
                     } else {
-                        ctx.data.drain(8..8 + k);
+                        ctx.data.drain(9..9 + k);
                     }
                     Step::Yield
                 }
@@ -3076,38 +3147,6 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     Step::Blocked(BlockReason::Writable(1))
                 }
                 WriteBlock::Err(_) => Step::Exit(1),
-            }
-        }
-        // ── relay: read stdin → send to socket ────────────────────────
-        0xFF => {
-            let mut buf = [0u8; 16];
-            match ctx.read_blocking(0, &mut buf) {
-                ReadBlock::Data(0) => {
-                    let sock_id = ctx.data[1] as u32;
-                    let _ = ctx.net().unwrap().shutdown(sock_id, 1);
-                    ctx.data[0] = 2;
-                    Step::Yield
-                }
-                ReadBlock::Data(n) => {
-                    let send_result = {
-                        let sock_id = ctx.data[1] as u32;
-                        ctx.net().unwrap().send(sock_id, &buf[..n])
-                    };
-                    match send_result {
-                        Ok(_) => {
-                            ctx.data.truncate(8);
-                            ctx.data[0] = 2;
-                        }
-                        Err(_) => {
-                            ctx.data[0] = 4;
-                        }
-                    }
-                    Step::Yield
-                }
-                ReadBlock::WouldBlock => {
-                    Step::Blocked(BlockReason::Readable(0))
-                }
-                ReadBlock::Err(_) => Step::Exit(1),
             }
         }
         // ── done: close socket and exit ───────────────────────────────
