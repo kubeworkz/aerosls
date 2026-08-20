@@ -1472,3 +1472,59 @@ fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
     }
     b
 }
+
+#[test]
+fn sh_cd_pwd_changes_working_directory() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/bin/pwd", b"pwd\n", 0o755);
+    b.add_dir("/tmp", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    // pwd: should print /
+    console.console_io().push_input(b"pwd\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ /\n$ ",
+        "pwd prints the root"
+    );
+
+    // cd /tmp
+    console.console_io().push_input(b"cd /tmp\n");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ /\n$ $ ");
+
+    // pwd: should print /tmp
+    console.console_io().push_input(b"pwd\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ /\n$ $ /tmp\n$ ",
+        "pwd prints /tmp after cd"
+    );
+
+    // cd .. from /tmp goes back to /
+    console.console_io().push_input(b"cd ..\n");
+    booted.run(100);
+    console.console_io().push_input(b"pwd\n");
+    booted.run(100);
+    assert_eq!(
+        console.console_io().output(),
+        b"$ /\n$ $ /tmp\n$ $ /\n$ ",
+        "cd .. returns to root"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

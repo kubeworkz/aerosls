@@ -979,7 +979,18 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     }
 
     pub fn set_cwd(&mut self, task: u32, path: &str) -> Result<(), Errno> {
-        let norm = crate::aerofs::normalize_path(path);
+        // Resolve relative paths against the current cwd.
+        let full = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            let cwd = self.task(task)?.cwd.clone();
+            if cwd == "/" {
+                format!("/{}", path)
+            } else {
+                format!("{}/{}", cwd, path)
+            }
+        };
+        let norm = crate::aerofs::normalize_path(&full);
         // Validate: the cwd must resolve through the mount table.
         let (fs_idx, rel) = self.resolve(&norm)?;
         let fs = self.fs_mut(fs_idx)?;
@@ -989,6 +1000,11 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         }
         self.task_mut(task)?.cwd = norm;
         Ok(())
+    }
+
+    /// Return the current working directory for a task.
+    pub fn get_cwd(&self, task: u32) -> Result<&str, Errno> {
+        Ok(&self.task(task)?.cwd)
     }
 
     // ── the syscall surface ────────────────────────────────────────────────

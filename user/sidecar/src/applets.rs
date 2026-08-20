@@ -2009,7 +2009,7 @@ fn valid_name(name: &str) -> bool {
 /// task. v1: recognized only as the bare name (no `/`), standalone
 /// (no pipeline) — see `run_line`.
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill")
+    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill" | "cd" | "pwd")
 }
 
 /// Apply a stage's `<` / `>` redirects at fd 0 / fd 1. Returns false on
@@ -2365,6 +2365,8 @@ fn run_builtin<K: Kernel, A: BufferAlloc>(
         "unset" => do_unset(&mut new_env, &stage.argv[1..], false),
         "unsetenv" => do_unset(&mut new_env, &stage.argv[1..], true),
         "kill" => do_kill(ctx, &stage.argv[1..]),
+        "cd" => do_cd(ctx, &stage.argv[1..]),
+        "pwd" => do_pwd(ctx),
         _ => 2, // unreachable: is_builtin guards the call
     };
     builtin_done(ctx, remainder, &new_env, code)
@@ -2524,6 +2526,44 @@ fn do_kill<K: Kernel, A: BufferAlloc>(
         }
     }
     if ok { 0 } else { 1 }
+}
+
+/// `cd` builtin: `cd [DIR]` changes the working directory. With no
+/// arguments, changes to `$HOME` (default `/`). Returns 0 on success, 1
+/// on failure.
+fn do_cd<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    args: &[String],
+) -> u8 {
+    let dir = if args.is_empty() {
+        "/".to_string()
+    } else {
+        args[0].clone()
+    };
+    match ctx.chdir(&dir) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// `pwd` builtin: prints the current working directory to stdout.
+/// Returns 0 on success, 1 on failure.
+fn do_pwd<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+) -> u8 {
+    let task = ctx.task;
+    match ctx.getcwd() {
+        Ok(cwd) => {
+            let mut out = String::from(cwd);
+            out.push('\n');
+            if ctx.vfs().write(task, 1, out.as_bytes()).is_err() {
+                1
+            } else {
+                0
+            }
+        }
+        Err(_) => 1,
+    }
 }
 
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,

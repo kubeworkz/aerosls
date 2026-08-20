@@ -836,4 +836,14 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     pub fn kill_group(&mut self, sig: i32) {
         self.pm.kill_group(self.task, sig);
     }
+
+    /// Change the calling task's working directory.
+    pub fn chdir(&mut self, path: &str) -> Result<(), Errno> {
+        self.pm.vfs.set_cwd(self.task, path)
+    }
+
+    /// Return the calling task's current working directory.
+    pub fn getcwd(&self) -> Result<&str, Errno> {
+        self.pm.vfs.get_cwd(self.task)
+    }
 }
