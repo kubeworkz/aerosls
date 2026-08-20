@@ -749,6 +749,8 @@ pub struct Vfs<K: Kernel, A: BufferAlloc> {
     net_k: Option<alloc::sync::Arc<K>>,
     /// Shared allocator handle for socket buffer grants (set after boot).
     net_alloc: Option<alloc::sync::Arc<core::cell::RefCell<A>>>,
+    /// The console node, kept alive for Ctrl-C detection in drain_wakes.
+    console_node: Option<Arc<CharNode>>,
 }
 
 /// A parked reader. `ready()` is the *only* wake condition — it is
@@ -802,6 +804,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             waiters: Vec::new(),
             net_k: None,
             net_alloc: None,
+            console_node: None,
         }
     }
 
@@ -870,6 +873,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     pub fn mount_devfs(&mut self, path: &str, console: Arc<CharNode>) -> Result<(), Errno> {
         let comps = mount_comps(path);
         self.check_mount_free(&comps)?;
+        self.console_node = Some(console.clone());
         let mut dev = DevFs::new();
         dev.add("console", console)?;
         dev.add("null", Arc::new(CharNode::null()))?;
@@ -1293,6 +1297,24 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     /// reader, or the last reader gone) and return the tasks to wake.
     pub fn take_woken_writers(&mut self) -> Vec<u32> {
         self.take_woken(|w| matches!(&*w.obj, FileObj::PipeWrite(_)))
+    }
+
+    /// Check if the console input buffer contains a specific byte.
+    /// Used by the scheduler's drain_wakes to detect Ctrl-C (0x03)
+    /// while the shell is blocked on WaitingChild.
+    pub fn has_console_byte(&self, byte: u8) -> bool {
+        self.console_node
+            .as_ref()
+            .map(|c| c.input_contains(byte))
+            .unwrap_or(false)
+    }
+
+    /// Remove the first occurrence of a specific byte from the console
+    /// input buffer.  Pairs with `has_console_byte` for Ctrl-C processing.
+    pub fn discard_console_byte(&self, byte: u8) {
+        if let Some(c) = &self.console_node {
+            c.discard_byte(byte);
+        }
     }
 
     fn take_woken<F: Fn(&Waiter) -> bool>(&mut self, kind: F) -> Vec<u32> {

@@ -241,6 +241,21 @@ impl CharNode {
         }
     }
 
+    /// Check if the console input buffer contains a specific byte.
+    pub fn input_contains(&self, byte: u8) -> bool {
+        match &self.kind {
+            CharKind::Console(c) => c.input_contains(byte),
+            CharKind::Null => false,
+        }
+    }
+
+    /// Remove the first occurrence of a byte from the console input buffer.
+    pub fn discard_byte(&self, byte: u8) {
+        if let CharKind::Console(c) = &self.kind {
+            c.discard_byte(byte);
+        }
+    }
+
     pub fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         match &self.kind {
             CharKind::Console(c) => c.write(buf),
@@ -313,6 +328,19 @@ impl CharNode {
 
     pub(crate) fn input_empty(&self) -> bool {
         self.input.borrow().is_empty()
+    }
+
+    /// Check if the input buffer contains a specific byte.
+    pub(crate) fn input_contains(&self, byte: u8) -> bool {
+        self.input.borrow().contains(&byte)
+    }
+
+    /// Remove the first occurrence of a specific byte from the input buffer.
+    pub(crate) fn discard_byte(&self, byte: u8) {
+        let mut buf = self.input.borrow_mut();
+        if let Some(pos) = buf.iter().position(|&b| b == byte) {
+            buf.remove(pos);
+        }
     }
 
     /// Everything written to the console so far (the driver would drain

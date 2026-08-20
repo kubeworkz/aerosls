@@ -305,6 +305,10 @@ pub struct TaskCtl<K: Kernel, A: BufferAlloc> {
     /// exec'd programs can read PATH, HOME, etc. The shell syncs its
     /// own env region into this table after builtins modify it.
     pub env: Vec<(String, String)>,
+    /// The foreground pipeline's child ids.  Ctrl-C / SIGINT is delivered
+    /// only to these — background jobs are not killed by the terminal
+    /// interrupt.  Cleared when the pipeline completes.
+    pub foreground: BTreeSet<u32>,
 }
 
 /// The proc manager. Owns the VFS and the task registry + run queue.
@@ -363,6 +367,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 program,
                 pending: SignalSet::empty(),
                 env: Vec::new(),
+                foreground: BTreeSet::new(),
             },
         );
         self.run.push_back(0);
@@ -381,6 +386,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 program,
                 pending: SignalSet::empty(),
                 env: Vec::new(),
+                foreground: BTreeSet::new(),
             },
         );
         self.tasks.get_mut(&0).map(|t| t.children.insert(id));
@@ -447,6 +453,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 program,
                 pending: SignalSet::empty(),
                 env: parent_env,
+                foreground: BTreeSet::new(),
             },
         );
         if let Some(tc) = self.tasks.get_mut(&parent) {
@@ -681,6 +688,46 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                     .push(WakeEvent::Woken(id, BlockReason::Sleep(0)));
             }
         }
+        // Wake blocked tasks that have pending fatal signals (SIGINT,
+        // SIGTERM, SIGKILL).  Without this, a task blocked on
+        // WaitingChild would never observe a Ctrl-C until the child
+        // exits on its own.
+        let mut sig_woken = Vec::new();
+        for (&id, tc) in self.tasks.iter() {
+            if let TaskState::Blocked(_) = tc.state {
+                if tc.pending.contains(SIGINT)
+                    || tc.pending.contains(SIGTERM)
+                    || tc.pending.contains(SIGKILL)
+                {
+                    sig_woken.push(id);
+                }
+            }
+        }
+        for id in sig_woken {
+            if let Some(tc) = self.tasks.get_mut(&id) {
+                let reason = match tc.state {
+                    TaskState::Blocked(r) => r,
+                    _ => continue,
+                };
+                tc.state = TaskState::Runnable;
+                self.run.push_back(id);
+                self.wake_trace.push(WakeEvent::Woken(id, reason));
+            }
+        }
+        // Terminal interrupt: when the console has a Ctrl-C (0x03) in its
+        // input buffer, deliver SIGINT to every task's foreground children
+        // immediately.  This is how a blocked shell (WaitingChild) still
+        // observes Ctrl-C — the signal kills the foreground child, which
+        // unblocks the wait, and the shell re-prompts on its next step.
+        if self.vfs.has_console_byte(0x03) {
+            self.vfs.discard_console_byte(0x03);
+            let fg_children: Vec<u32> = self.tasks.values()
+                .flat_map(|tc| tc.foreground.iter().copied())
+                .collect();
+            for c in fg_children {
+                self.kill(c, SIGINT).ok();
+            }
+        }
     }
 
     /// Run the cooperative scheduler until the run queue is empty (or
@@ -747,6 +794,28 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         };
         for c in children {
             self.kill(c, sig).ok();
+        }
+    }
+
+    /// Deliver a signal only to the sender's foreground children
+    /// (the current pipeline).  Background jobs are not affected.
+    /// This is what Ctrl-C / SIGINT uses — POSIX job control semantics.
+    pub fn kill_group_fg(&mut self, sender: u32, sig: i32) {
+        let fg: Vec<u32> = {
+            match self.tasks.get(&sender) {
+                Some(tc) => tc.foreground.iter().copied().collect(),
+                None => Vec::new(),
+            }
+        };
+        for c in fg {
+            self.kill(c, sig).ok();
+        }
+    }
+
+    /// Set the foreground pipeline children for a task.
+    pub fn set_foreground(&mut self, task: u32, children: BTreeSet<u32>) {
+        if let Some(tc) = self.tasks.get_mut(&task) {
+            tc.foreground = children;
         }
     }
 
@@ -906,6 +975,22 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// to an entire pipeline.
     pub fn kill_group(&mut self, sig: i32) {
         self.pm.kill_group(self.task, sig);
+    }
+
+    /// Deliver a signal only to the foreground pipeline children.
+    /// Background jobs are not affected — POSIX job control semantics.
+    pub fn kill_group_fg(&mut self, sig: i32) {
+        self.pm.kill_group_fg(self.task, sig);
+    }
+
+    /// Set the foreground pipeline children for this task.
+    pub fn set_foreground(&mut self, children: alloc::collections::BTreeSet<u32>) {
+        self.pm.set_foreground(self.task, children);
+    }
+
+    /// Clear the foreground pipeline children (pipeline completed).
+    pub fn clear_foreground(&mut self) {
+        self.pm.set_foreground(self.task, alloc::collections::BTreeSet::new());
     }
 
     /// Change the calling task's working directory.

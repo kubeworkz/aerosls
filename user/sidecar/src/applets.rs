@@ -2194,8 +2194,9 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
     if let Some(sig) = ctx.check_signal() {
         if sig == SIGINT {
+            // SIGINT kills only the foreground pipeline, not background jobs.
             if ctx.data[0] == 3 {
-                ctx.kill_group(SIGINT);
+                ctx.kill_group_fg(SIGINT);
             }
             let env_end_off = env_end(&ctx.data, 2);
             let env_reg = ctx.data[2..env_end_off].to_vec();
@@ -2284,7 +2285,8 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     // the process group, and re-prompt.
                     let chunk = &buf[..n];
                     if chunk.contains(&0x03) {
-                        ctx.kill_group(SIGINT);
+                        // Ctrl-C: kill only the foreground pipeline.
+                        ctx.kill_group_fg(SIGINT);
                         ctx.data.truncate(qstart);
                         ctx.data[0] = 0; // re-prompt
                         return Step::Yield;
@@ -2505,6 +2507,13 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     // first child to the job table and return to the prompt without
     // waiting.
     let is_bg = stages.last().map(|s| s.background).unwrap_or(false);
+    // Record the foreground pipeline children so Ctrl-C only kills
+    // them (not background jobs).
+    if !is_bg {
+        let fg: alloc::collections::BTreeSet<u32> =
+            children.iter().copied().collect();
+        ctx.set_foreground(fg);
+    }
     if is_bg {
         let cmd_str = stages
             .iter()
@@ -2557,6 +2566,9 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let n = ctx.data[2] as usize;
     let reaped = ctx.data[3] as usize;
     if reaped >= n {
+        // All pipeline stages reaped — clear the foreground set so
+        // Ctrl-C no longer targets these (now dead) children.
+        ctx.clear_foreground();
         // Children ids sit at data[4..4+4n] (u32 LE); the env region,
         // job table, and queued remainder survive after them.
         let env_start = 4 + 4 * n;

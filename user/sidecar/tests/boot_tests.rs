@@ -1768,3 +1768,58 @@ fn sh_sleep_background_does_not_block_foreground() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Ctrl-C kills the foreground pipeline but leaves background jobs alive.
+/// Sequence:
+///   1. Start `sleep 10 &` — background, parks for 10 ticks.
+///   2. Start `sleep 10` (foreground) — parks for 10 ticks.
+///   3. Send Ctrl-C (\x03) — should kill the foreground sleep, not the bg one.
+///   4. The bg sleep eventually finishes → [done] /// Ctrl-C kills the foreground pipeline but leaves background jobs alive.
+#[test]
+fn sigint_kills_foreground_not_background() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    // Background sleep for 5 ticks.
+    console.console_io().push_input(b"sleep 5 &\n");
+    booted.run(100);
+
+    // Foreground sleep for 5 ticks (will be interrupted).
+    console.console_io().push_input(b"sleep 5\n");
+    booted.run(5); // let it start and park
+
+    // Send Ctrl-C — kills the foreground sleep, not the bg one.
+    console.console_io().push_input(b"\x03");
+    booted.run(50); // shell re-prompts after SIGINT
+
+    // The shell should have re-prompted ($  visible).
+    let out = console.console_io().output();
+    let prompt_count = out.windows(2).filter(|w| *w == b"$ ").count();
+    assert!(prompt_count >= 3,
+        "shell re-prompted after Ctrl-C ({} prompts), got: {:?}", prompt_count, out);
+
+    // The background sleep still has ticks left — wait for it to finish.
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(
+        out.windows(7).any(|w| w == b"[done] "),
+        "[done] after bg sleep, got: {:?}", out
+    );
+    assert!(out.ends_with(b"$ "), "back to prompt, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
