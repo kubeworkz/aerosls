@@ -527,6 +527,29 @@ impl<K: Kernel, A: BufferAlloc> aerosls_proto::sockops::SocketOps for NetClient<
         })
     }
 
+    fn bind(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16> {
+        NetClient::bind(self, id, ip, port).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn listen(&mut self, id: u32) -> Result<(), u16> {
+        NetClient::listen(self, id).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn accept(&mut self, id: u32) -> Result<u32, u16> {
+        NetClient::accept(self, id)
+            .map(|(new_id, _, _)| new_id)
+            .map_err(|e| match e {
+                NetError::Status(s) => s,
+                _ => NET_ERR_IO,
+            })
+    }
+
     fn close_socket(&mut self, id: u32) -> Result<(), u16> {
         NetClient::close_socket(self, id).map_err(|e| match e {
             NetError::Status(s) => s,

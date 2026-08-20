@@ -866,6 +866,9 @@ struct MockSocket {
 enum MockEvent {
     Socket(u16),
     Connect(u32, u32, u16),
+    Bind(u32, u32, u16),
+    Listen(u32),
+    Accept(u32),
     Send(u32, usize),
     Recv(u32),
     Poll(u32),
@@ -894,6 +897,16 @@ impl aerosls_proto::sockops::SocketOps for MockSocket {
     fn connect(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16> {
         self.log.push(MockEvent::Connect(id, ip, port));
         Ok(())
+    }
+    fn bind(&mut self, _id: u32, _ip: u32, _port: u16) -> Result<(), u16> {
+        Ok(())
+    }
+    fn listen(&mut self, _id: u32) -> Result<(), u16> {
+        Ok(())
+    }
+    fn accept(&mut self, _id: u32) -> Result<u32, u16> {
+        // Not used in client mode.
+        Err(0)
     }
     fn send(&mut self, id: u32, data: &[u8]) -> Result<usize, u16> {
         self.log.push(MockEvent::Send(id, data.len()));
@@ -970,6 +983,126 @@ fn nc_applet_exercises_full_lifecycle() {
     // Verify mock events include the full lifecycle.
     // Access the mock via booted.proc.net — it was consumed, so we
     // can't. Instead, just verify via the console output above.
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// Mock socket for the listen/accept echo test. Simulates a client
+/// connecting to a listening nc server: `accept()` returns a new socket
+/// that has one line of data ready, then EOF.
+struct ListenMock {
+    next_id: u32,
+    pending_data: Vec<u8>,
+    recv_count: u32,
+    log: Vec<MockEvent>,
+}
+
+impl ListenMock {
+    fn new(data: &[u8]) -> ListenMock {
+        ListenMock {
+            next_id: 2, // 1 is the listening socket
+            pending_data: data.to_vec(),
+            recv_count: 0,
+            log: Vec::new(),
+        }
+    }
+}
+
+impl aerosls_proto::sockops::SocketOps for ListenMock {
+    fn socket(&mut self, sock_type: u16) -> Result<u32, u16> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.log.push(MockEvent::Socket(sock_type));
+        Ok(id)
+    }
+    fn connect(&mut self, _id: u32, _ip: u32, _port: u16) -> Result<(), u16> {
+        Err(0)
+    }
+    fn bind(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16> {
+        self.log.push(MockEvent::Bind(id, ip, port));
+        Ok(())
+    }
+    fn listen(&mut self, id: u32) -> Result<(), u16> {
+        self.log.push(MockEvent::Listen(id));
+        Ok(())
+    }
+    fn accept(&mut self, _id: u32) -> Result<u32, u16> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.log.push(MockEvent::Accept(_id));
+        Ok(id)
+    }
+    fn send(&mut self, id: u32, data: &[u8]) -> Result<usize, u16> {
+        self.log.push(MockEvent::Send(id, data.len()));
+        Ok(data.len())
+    }
+    fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16> {
+        self.log.push(MockEvent::Recv(id));
+        self.recv_count += 1;
+        if self.recv_count == 1 && !self.pending_data.is_empty() {
+            let n = core::cmp::min(buf.len(), self.pending_data.len());
+            buf[..n].copy_from_slice(&self.pending_data[..n]);
+            Ok(n)
+        } else {
+            Ok(0) // EOF
+        }
+    }
+    fn close_socket(&mut self, id: u32) -> Result<(), u16> {
+        self.log.push(MockEvent::CloseSocket(id));
+        Ok(())
+    }
+    fn poll(&mut self, id: u32) -> Result<u16, u16> {
+        self.log.push(MockEvent::Poll(id));
+        Ok(0x01) // POLLIN
+    }
+    fn shutdown(&mut self, id: u32, how: u8) -> Result<(), u16> {
+        self.log.push(MockEvent::Shutdown(id, how));
+        Ok(())
+    }
+}
+
+/// The nc listen mode: boot with `nc -l 8080`, install a ListenMock that
+/// simulates a client sending one line, and verify the server echoes it
+/// to the console. Exercises bind → listen → accept → recv → send →
+/// close through the full sidecar stack.
+#[test]
+fn nc_listen_mode_exercises_bind_listen_accept() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/nc", b"nc\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    // init runs nc in listen mode
+    b.add_file("/etc/init.rc", b"/bin/nc -l 8080\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    // Install listen mock: simulates a client that sends "echo me\n".
+    let mock = ListenMock::new(b"echo me\n");
+    booted.proc.set_net(Box::new(mock));
+
+    // Run to completion.
+    booted.run(200);
+
+    // nc should have exited cleanly.
+    assert_eq!(
+        booted.proc.exit_code(0),
+        Some(0),
+        "nc -l should exit 0 after serving one client"
+    );
+
+    // The console should show the echoed data from the mock client.
+    assert_eq!(
+        console.console_io().output(),
+        b"echo me\n",
+        "nc -l echoed the mock client's data to stdout"
+    );
 
     client.kill_driver(0);
     t.join().unwrap();

@@ -20,6 +20,15 @@ pub trait SocketOps {
     /// Receive data from a socket. Returns bytes read.
     fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16>;
 
+    /// Bind a socket to a local address.
+    fn bind(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16>;
+
+    /// Transition a bound socket to listening.
+    fn listen(&mut self, id: u32) -> Result<(), u16>;
+
+    /// Accept a pending connection. Returns a new socket ID.
+    fn accept(&mut self, id: u32) -> Result<u32, u16>;
+
     /// Close a socket on the driver side.
     fn close_socket(&mut self, id: u32) -> Result<(), u16>;
 

@@ -2871,38 +2871,56 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
     stages
 }
 
-/// `nc` (netcat): minimal TCP client that connects to a remote
-/// `host:port`, relays stdin↔socket in a cooperative loop, and exits
-/// when either side EOFs.
+/// `nc` (netcat): minimal TCP client/server. Two modes:
+///
+/// - **Client**: `nc <host> <port>` — connect, relay stdin↔socket.
+/// - **Listen**: `nc -l <port>` — bind, listen, accept one client,
+///   relay stdin↔accepted socket.
 ///
 /// Data layout (`ctx.data`):
 ///
 /// ```text
 /// [0]    phase:
-///        0 = create socket
-///        1 = connect
-///        2 = relay: read socket → write stdout
-///        3 = relay: read stdin → write socket
-///        4 = done (exit)
+///        1   = connect (client)
+///        2   = relay: read socket → write stdout
+///        3   = relay: write pending chunk to stdout
+///        0xFF = relay: read stdin → send to socket
+///        4   = done (exit)
+///        10  = bind + listen
+///        11  = poll for incoming + accept
 /// [1]    sock_id (driver-side socket ID)
-/// [2..6] dest_ip   (u32 LE)
+/// [2..6] dest_ip / port  (client: connect target; listen: unused)
 /// [6..8] dest_port (u16 LE)
 /// [8..]  pending I/O data (read buffer or write remainder)
 /// ```
-///
-/// Usage: `nc <host> <port>`
-///
-/// The host is an IPv4 dotted-quad (e.g. `10.0.2.2`).
-/// Each step does at most one kernel call; on would-block the task
-/// parks on the fd and is woken by the scheduler's wake drain.
 pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     if ctx.data.is_empty() {
-        // Phase 0: parse args, create socket.
         let argv = ctx.argv().to_vec();
-        let has_net = ctx.net().is_some();
-        if !has_net {
+        if ctx.net().is_none() {
             return Step::Exit(1);
         }
+        // Detect listen mode: nc -l <port>
+        let listen_mode = argv.get(1).map(|s| s.as_str()) == Some("-l");
+        if listen_mode {
+            let port_str = match argv.get(2).map(|s| s.as_str()) {
+                Some(p) => p,
+                None => return Step::Exit(2),
+            };
+            let port: u16 = match port_str.parse() {
+                Ok(p) => p,
+                Err(_) => return Step::Exit(2),
+            };
+            let sock_id = match ctx.net().unwrap().socket(aerosls_proto::SOCK_STREAM) {
+                Ok(id) => id,
+                Err(_) => return Step::Exit(1),
+            };
+            ctx.data.resize(8, 0);
+            ctx.data[1] = sock_id as u8;
+            ctx.data[6..8].copy_from_slice(&port.to_le_bytes());
+            ctx.data[0] = 10; // → bind + listen
+            return Step::Yield;
+        }
+        // Client mode: nc <host> <port>
         let host_str = match argv.get(1).map(|s| s.as_str()) {
             Some(h) => h,
             None => return Step::Exit(2),
@@ -2915,7 +2933,6 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             Ok(p) => p,
             Err(_) => return Step::Exit(2),
         };
-        // Parse IPv4 dotted-quad.
         let mut ip_bytes = [0u8; 4];
         for (idx, octet) in host_str.split('.').enumerate() {
             if idx >= 4 {
@@ -2927,8 +2944,6 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             };
         }
         let ip = u32::from_le_bytes(ip_bytes);
-
-        // Create socket.
         let sock_id = match ctx.net().unwrap().socket(aerosls_proto::SOCK_STREAM) {
             Ok(id) => id,
             Err(_) => return Step::Exit(1),
@@ -2940,11 +2955,9 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data[0] = 1; // → connect phase
     }
 
-    // Each phase does exactly one operation so we never hold two
-    // conflicting borrows on ctx.
     match ctx.data[0] {
+        // ── client connect ────────────────────────────────────────────
         1 => {
-            // Connect phase.
             let sock_id = ctx.data[1] as u32;
             let ip = u32::from_le_bytes([
                 ctx.data[2], ctx.data[3], ctx.data[4], ctx.data[5],
@@ -2952,18 +2965,48 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             let port = u16::from_le_bytes([ctx.data[6], ctx.data[7]]);
             match ctx.net().unwrap().connect(sock_id, ip, port) {
                 Ok(()) => {
-                    ctx.data[0] = 2; // → relay: net→stdout
+                    ctx.data[0] = 2;
                     Step::Yield
                 }
                 Err(_) => Step::Exit(1),
             }
         }
-        2 => {
-            // Relay: read socket → write stdout.
+        // ── listen: bind + listen ─────────────────────────────────────
+        10 => {
+            let sock_id = ctx.data[1] as u32;
+            let port = u16::from_le_bytes([ctx.data[6], ctx.data[7]]);
+            let net = ctx.net().unwrap();
+            if net.bind(sock_id, 0, port).is_err() {
+                return Step::Exit(1);
+            }
+            if net.listen(sock_id).is_err() {
+                return Step::Exit(1);
+            }
+            ctx.data[0] = 11; // → accept
+            Step::Yield
+        }
+        // ── listen: poll + accept ─────────────────────────────────────
+        11 => {
             let sock_id = ctx.data[1] as u32;
             match ctx.net().unwrap().poll(sock_id) {
                 Ok(events) if events & 0x01 != 0 => {
-                    // POLLIN — try recv.
+                    let accepted = match ctx.net().unwrap().accept(sock_id) {
+                        Ok(id) => id,
+                        Err(_) => return Step::Exit(1),
+                    };
+                    // Switch to the accepted socket for relay.
+                    ctx.data[1] = accepted as u8;
+                    ctx.data[0] = 2; // → relay
+                    Step::Yield
+                }
+                _ => Step::Yield,
+            }
+        }
+        // ── relay: read socket → write stdout ─────────────────────────
+        2 => {
+            let sock_id = ctx.data[1] as u32;
+            match ctx.net().unwrap().poll(sock_id) {
+                Ok(events) if events & 0x01 != 0 => {
                     let mut buf = [0u8; 16];
                     let n = match ctx.net().unwrap().recv(sock_id, &mut buf) {
                         Ok(n) => n,
@@ -2978,11 +3021,10 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     }
                     ctx.data.truncate(8);
                     ctx.data.extend_from_slice(&buf[..n]);
-                    ctx.data[0] = 3; // → write to stdout
+                    ctx.data[0] = 3;
                     Step::Yield
                 }
                 _ => {
-                    // Socket not readable yet — try reading stdin.
                     let mut buf = [0u8; 16];
                     match ctx.read_blocking(0, &mut buf) {
                         ReadBlock::Data(0) => {
@@ -3017,14 +3059,14 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                 },
             }
         }
+        // ── relay: write pending chunk to stdout ──────────────────────
         3 => {
-            // Write the pending chunk to stdout.
             let pending = ctx.data[8..].to_vec();
             match ctx.write_blocking(1, &pending) {
                 WriteBlock::Data(k) => {
                     if k == pending.len() {
                         ctx.data.truncate(8);
-                        ctx.data[0] = 2; // back to socket poll
+                        ctx.data[0] = 2;
                     } else {
                         ctx.data.drain(8..8 + k);
                     }
@@ -3036,14 +3078,14 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                 WriteBlock::Err(_) => Step::Exit(1),
             }
         }
+        // ── relay: read stdin → send to socket ────────────────────────
         0xFF => {
-            // Read from stdin and send to socket.
             let mut buf = [0u8; 16];
             match ctx.read_blocking(0, &mut buf) {
                 ReadBlock::Data(0) => {
                     let sock_id = ctx.data[1] as u32;
                     let _ = ctx.net().unwrap().shutdown(sock_id, 1);
-                    ctx.data[0] = 2; // back to socket poll
+                    ctx.data[0] = 2;
                     Step::Yield
                 }
                 ReadBlock::Data(n) => {
@@ -3054,7 +3096,7 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     match send_result {
                         Ok(_) => {
                             ctx.data.truncate(8);
-                            ctx.data[0] = 2; // back to socket poll
+                            ctx.data[0] = 2;
                         }
                         Err(_) => {
                             ctx.data[0] = 4;
@@ -3068,8 +3110,8 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                 ReadBlock::Err(_) => Step::Exit(1),
             }
         }
+        // ── done: close socket and exit ───────────────────────────────
         4 => {
-            // Done — close socket and exit.
             let sock_id = ctx.data[1] as u32;
             let _ = ctx.net().unwrap().close_socket(sock_id);
             Step::Exit(0)
