@@ -2009,7 +2009,7 @@ fn valid_name(name: &str) -> bool {
 /// task. v1: recognized only as the bare name (no `/`), standalone
 /// (no pipeline) — see `run_line`.
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill" | "cd" | "pwd")
+    matches!(name, "export" | "setenv" | "unset" | "unsetenv" | "kill" | "cd" | "pwd" | "jobs" | "fg")
 }
 
 /// Apply a stage's `<` / `>` redirects at fd 0 / fd 1. Returns false on
@@ -2057,6 +2057,106 @@ fn apply_redirects<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>, stage: &S
 /// arg...)..., queue, FORK_MARKER]` — argv is already expanded and the
 /// program resolved on the parent side, so the child needs no env — see
 /// `sh_child`.
+
+// ── job table helpers ────────────────────────────────────────────────────
+
+/// Job states stored in the shell's data buffer.
+const _JOB_RUNNING: u8 = 0;
+
+/// The job table lives in the shell's data buffer between the env region
+/// and the queue: `[phase, status, env..., n_jobs, job_entries..., queue...]`
+/// Each job entry: `[child_id(4 LE), cmd_len(1), cmd_bytes...]`
+/// (state is always RUNNING — Done jobs are removed immediately).
+
+/// Offset of the job-count byte (just past the env region).
+fn job_count_off(data: &[u8]) -> usize {
+    env_end(data, 2)
+}
+
+/// Return the byte offset where the queue starts (past env + job table).
+fn queue_start(data: &[u8]) -> usize {
+    let off = job_count_off(data);
+    if off >= data.len() {
+        return off;
+    }
+    let n = data[off] as usize;
+    let mut p = off + 1;
+    for _ in 0..n {
+        if p + 5 > data.len() {
+            return data.len();
+        }
+        p += 4; // child_id
+        let cmd_len = data[p] as usize;
+        p += 1;
+        if p + cmd_len > data.len() {
+            return data.len();
+        }
+        p += cmd_len;
+    }
+    p
+}
+
+/// Parse the job table. Returns `(n_jobs, entries)` where each entry is
+/// `(child_id, command_string)`.
+fn jobs_decode(data: &[u8]) -> (usize, alloc::vec::Vec<(u32, alloc::string::String)>) {
+    let off = job_count_off(data);
+    if off >= data.len() {
+        return (0, alloc::vec::Vec::new());
+    }
+    let n = data[off] as usize;
+    let mut p = off + 1;
+    let mut entries = alloc::vec::Vec::new();
+    for _ in 0..n {
+        if p + 5 > data.len() {
+            break;
+        }
+        let child_id = u32::from_le_bytes([
+            data[p], data[p + 1], data[p + 2], data[p + 3],
+        ]);
+        p += 4;
+        let cmd_len = data[p] as usize;
+        p += 1;
+        if p + cmd_len > data.len() {
+            break;
+        }
+        let cmd = core::str::from_utf8(&data[p..p + cmd_len])
+            .unwrap_or("?")
+            .to_string();
+        p += cmd_len;
+        entries.push((child_id, cmd));
+    }
+    (n, entries)
+}
+
+/// Rebuild the job-table portion of the data buffer. Keeps the env
+/// region and queue intact, replacing only count + entries.
+fn jobs_encode(data: &mut alloc::vec::Vec<u8>, entries: &[(u32, &str)]) {
+    let off = job_count_off(data);
+    let qstart = queue_start(data);
+    let queue = data[qstart..].to_vec();
+    data.truncate(off);
+    data.push(entries.len() as u8);
+    for (id, cmd) in entries {
+        data.extend_from_slice(&id.to_le_bytes());
+        data.push(cmd.len() as u8);
+        data.extend_from_slice(cmd.as_bytes());
+    }
+    data.extend_from_slice(&queue);
+}
+
+/// Add a background job to the table. Returns the 1-based job number.
+fn jobs_add(data: &mut alloc::vec::Vec<u8>, child_id: u32, cmd: &str) -> u8 {
+    let (_n, mut entries) = jobs_decode(data);
+    entries.push((child_id, cmd.to_string()));
+    let num = entries.len() as u8;
+    let refs: alloc::vec::Vec<(u32, &str)> = entries
+        .iter()
+        .map(|(id, c)| (*id, c.as_str()))
+        .collect();
+    jobs_encode(data, &refs);
+    num
+}
+
 pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     if ctx.data.is_empty() {
@@ -2064,6 +2164,8 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         // bare command names) and HOME=/root, encoded as the env region.
         ctx.data.extend_from_slice(&[0, 0]); // phase, last status
         env_push(&mut ctx.data, &[("PATH", "/bin"), ("HOME", "/root")]);
+        // Empty job table: n_jobs = 0 (the byte after the env region).
+        ctx.data.push(0);
         ctx.set_env(alloc::vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/root".into())]);
         return Step::Yield;
     }
@@ -2075,19 +2177,63 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             if ctx.data[0] == 3 {
                 ctx.kill_group(SIGINT);
             }
-            let qstart = env_end(&ctx.data, 2);
-            let env_reg = ctx.data[2..qstart].to_vec();
+            let env_end_off = env_end(&ctx.data, 2);
+            let env_reg = ctx.data[2..env_end_off].to_vec();
+            let (_nj, job_entries) = jobs_decode(&ctx.data);
             let status = signal_exit_code(SIGINT) as u8;
             ctx.data.clear();
             ctx.data.push(0);
             ctx.data.push(status);
             ctx.data.extend_from_slice(&env_reg);
+            let refs: alloc::vec::Vec<(u32, &str)> = job_entries
+                .iter()
+                .map(|(id, c)| (*id, c.as_str()))
+                .collect();
+            jobs_encode(&mut ctx.data, &refs);
             return Step::Yield;
         }
         return Step::Exit(signal_exit_code(sig));
     }
     match ctx.data[0] {
         0 => {
+            // Before prompting, check background jobs and print Done messages.
+            let done_jobs = {
+                let (n, entries) = jobs_decode(&ctx.data);
+                let mut done = alloc::vec::Vec::new();
+                let mut keep = alloc::vec::Vec::new();
+                for (child_id, cmd) in entries {
+                    match ctx.waitpid(child_id, aerosls_procmgr::WNOHANG) {
+                        aerosls_procmgr::WaitOutcome::Reaped(_code) => {
+                            done.push(cmd);
+                        }
+                        _ => {
+                            keep.push((child_id, cmd));
+                        }
+                    }
+                }
+                if keep.len() < n {
+                    let refs: alloc::vec::Vec<(u32, &str)> = keep
+                        .iter()
+                        .map(|(id, c)| (*id, c.as_str()))
+                        .collect();
+                    let status = ctx.data[1];
+                    let q = queue_start(&ctx.data);
+                    let env_off = env_end(&ctx.data, 2);
+                    let env_reg = ctx.data[2..env_off].to_vec();
+                    let queue = ctx.data[q..].to_vec();
+                    ctx.data.clear();
+                    ctx.data.push(0);
+                    ctx.data.push(status);
+                    ctx.data.extend_from_slice(&env_reg);
+                    jobs_encode(&mut ctx.data, &refs);
+                    ctx.data.extend_from_slice(&queue);
+                }
+                done
+            };
+            for cmd in &done_jobs {
+                let msg = alloc::format!("[done] {}\n", cmd);
+                ctx.vfs().write(task, 1, msg.as_bytes()).ok();
+            }
             if ctx.vfs().write(task, 1, b"$ ").is_err() {
                 return Step::Exit(2);
             }
@@ -2095,7 +2241,7 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             Step::Yield
         }
         1 => {
-            let qstart = env_end(&ctx.data, 2);
+            let qstart = queue_start(&ctx.data);
             // A buffered complete line runs without touching the console.
             if ctx.data[qstart..].contains(&b'\n') {
                 ctx.data[0] = 2;
@@ -2149,10 +2295,11 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
     let status = ctx.data[1];
-    // The env region sits between phase/status and the queue; both the
-    // line and the unconsumed remainder live after it.
-    let qstart = env_end(&ctx.data, 2);
-    let env_region = ctx.data[2..qstart].to_vec();
+    // The env region sits between phase/status and the job table; the
+    // queue (unconsumed lines) starts after the job table.
+    let env_end_off = env_end(&ctx.data, 2);
+    let env_region = ctx.data[2..env_end_off].to_vec();
+    let qstart = queue_start(&ctx.data);
     let nl = ctx.data[qstart..].iter().position(|&b| b == b'\n');
     let (line, remainder) = match nl {
         Some(i) => (ctx.data[qstart..qstart + i].to_vec(), ctx.data[qstart + i + 1..].to_vec()),
@@ -2167,11 +2314,17 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     if stages.is_empty() {
         // Blank or comment line: drop it; re-prompt only if the batch is
         // drained, otherwise continue straight to the next buffered line.
-        // The env region survives the rebuild.
+        // The env region and job table survive the rebuild.
+        let (_nj, job_entries) = jobs_decode(&ctx.data);
         ctx.data.clear();
         ctx.data.push(if remainder.is_empty() { 0 } else { 1 });
         ctx.data.push(status);
         ctx.data.extend_from_slice(&env_region);
+        let refs: alloc::vec::Vec<(u32, &str)> = job_entries
+            .iter()
+            .map(|(id, c)| (*id, c.as_str()))
+            .collect();
+        jobs_encode(&mut ctx.data, &refs);
         ctx.data.extend_from_slice(&remainder);
         return Step::Yield;
     }
@@ -2186,6 +2339,10 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             return assign_line(ctx, st, &remainder, &env);
         }
         if !st.argv.is_empty() && is_builtin(&st.argv[0]) {
+            // `fg` is handled specially because it blocks on the child.
+            if st.argv[0] == "fg" {
+                return do_fg(ctx, &st.argv[1..], &remainder, &env);
+            }
             return run_builtin(ctx, st, &remainder, &env);
         }
     }
@@ -2220,6 +2377,28 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     // quoted or backslash-escaped — arrive at the child exactly as
     // parsed; the child stops before the queue), and the queued
     // remainder — see `sh_child`.
+    // Extract the job table and its raw bytes before the forking loop
+    // clears ctx.data with child snapshots.
+    let (_nj, _job_entries) = jobs_decode(&ctx.data);
+    let job_table_bytes_pre = {
+        let off = job_count_off(&ctx.data);
+        if off < ctx.data.len() {
+            let n = ctx.data[off] as usize;
+            let mut p = off + 1;
+            for _ in 0..n {
+                if p + 5 > ctx.data.len() { break; }
+                p += 4;
+                let cmd_len = ctx.data[p] as usize;
+                p += 1;
+                if p + cmd_len > ctx.data.len() { break; }
+                p += cmd_len;
+            }
+            if p > ctx.data.len() { p = ctx.data.len(); }
+            ctx.data[off..p].to_vec()
+        } else {
+            alloc::vec![0u8]
+        }
+    };
     let mut children: Vec<u32> = Vec::new();
     for (s, stage) in stages.iter().enumerate() {
         ctx.data.clear();
@@ -2279,9 +2458,29 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     for fd in &pipes {
         ctx.vfs().close(task, *fd).ok();
     }
+    // Background: the last stage was `cmd &` — add the pipeline's
+    // first child to the job table and return to the prompt without
+    // waiting.
+    let is_bg = stages.last().map(|s| s.background).unwrap_or(false);
+    if is_bg {
+        let cmd_str = stages
+            .iter()
+            .map(|s| s.argv.first().map(|a| a.as_str()).unwrap_or(""))
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" | ");
+        // Rebuild the data buffer: [phase, status, env..., queue...]
+        // then add the job table between env and queue.
+        let queue = remainder;
+        ctx.data.clear();
+        ctx.data.push(0); // phase: back to prompt
+        ctx.data.push(status);
+        ctx.data.extend_from_slice(&env_region);
+        jobs_add(&mut ctx.data, children[0], &cmd_str);
+        ctx.data.extend_from_slice(&queue);
+        return Step::Yield;
+    }
     // Wait state: [3, status, n, reaped, children (u32 LE each)..., env...,
-    // remainder]. Child ids are 4 bytes: task ids come from a monotonic
-    // counter, so a long session exceeds 255 forks.
+    // n_jobs, job_entries..., remainder].
     ctx.data.clear();
     ctx.data.push(3);
     ctx.data.push(status);
@@ -2291,6 +2490,7 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data.extend_from_slice(&c.to_le_bytes());
     }
     ctx.data.extend_from_slice(&env_region);
+    ctx.data.extend_from_slice(&job_table_bytes_pre);
     ctx.data.extend_from_slice(&remainder);
     let c = children[0];
     match ctx.wait(c) {
@@ -2313,16 +2513,52 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let n = ctx.data[2] as usize;
     let reaped = ctx.data[3] as usize;
     if reaped >= n {
-        // Children ids sit at data[4..4+4n] (u32 LE); the env region and
-        // the queued remainder survive after them.
-        let qstart = env_end(&ctx.data, 4 + 4 * n);
-        let env_region = ctx.data[4 + 4 * n..qstart].to_vec();
-        let queue = ctx.data[qstart..].to_vec();
+        // Children ids sit at data[4..4+4n] (u32 LE); the env region,
+        // job table, and queued remainder survive after them.
+        let env_start = 4 + 4 * n;
+        let env_end_off = env_end(&ctx.data, env_start);
+        let env_region = ctx.data[env_start..env_end_off].to_vec();
+        // Skip past the job table that follows the env to find the queue.
+        let nj_byte = if env_end_off < ctx.data.len() {
+            ctx.data[env_end_off]
+        } else {
+            0
+        };
+        let mut p = env_end_off + 1; // skip n_jobs byte
+        for _ in 0..nj_byte as usize {
+            if p + 5 > ctx.data.len() {
+                p = ctx.data.len();
+                break;
+            }
+            p += 4; // child_id
+            let cmd_len = ctx.data[p] as usize;
+            p += 1;
+            if p + cmd_len > ctx.data.len() {
+                p = ctx.data.len();
+                break;
+            }
+            p += cmd_len;
+        }
+        if p > ctx.data.len() {
+            p = ctx.data.len();
+        }
+        // Copy the raw job-table bytes (n_jobs + entries) before clearing.
+        let job_table_bytes = if env_end_off <= p && p <= ctx.data.len() {
+            ctx.data[env_end_off..p].to_vec()
+        } else {
+            alloc::vec![0u8] // empty job table
+        };
+        let queue = if p <= ctx.data.len() {
+            ctx.data[p..].to_vec()
+        } else {
+            alloc::vec::Vec::new()
+        };
         let status = ctx.data[1];
         ctx.data.clear();
         ctx.data.push(if queue.is_empty() { 0 } else { 1 });
         ctx.data.push(status);
         ctx.data.extend_from_slice(&env_region);
+        ctx.data.extend_from_slice(&job_table_bytes);
         ctx.data.extend_from_slice(&queue);
         return Step::Yield;
     }
@@ -2373,6 +2609,7 @@ fn run_builtin<K: Kernel, A: BufferAlloc>(
         "kill" => do_kill(ctx, &stage.argv[1..]),
         "cd" => do_cd(ctx, &stage.argv[1..]),
         "pwd" => do_pwd(ctx),
+        "jobs" => do_jobs(ctx),
         _ => 2, // unreachable: is_builtin guards the call
     };
     builtin_done(ctx, remainder, &new_env, code)
@@ -2395,18 +2632,25 @@ fn assign_line<K: Kernel, A: BufferAlloc>(
 }
 
 /// Rebuild the shell's persistent data after a builtin: `[phase, status,
-/// env..., remainder...]` — phase 0 (prompt) if the batch drained,
-/// else phase 1 (next buffered line).
+/// env..., n_jobs, job_entries..., remainder...]` — phase 0 (prompt) if
+/// the batch drained, else phase 1 (next buffered line).
 fn builtin_done<K: Kernel, A: BufferAlloc>(
     ctx: &mut Ctx<'_, K, A>,
     remainder: &[u8],
     env: &[(String, String)],
     code: u8,
 ) -> Step {
+    // Preserve the existing job table.
+    let (_nj, job_entries) = jobs_decode(&ctx.data);
     ctx.data.clear();
     ctx.data.push(if remainder.is_empty() { 0 } else { 1 });
     ctx.data.push(code);
     env_push(&mut ctx.data, env);
+    let refs: alloc::vec::Vec<(u32, &str)> = job_entries
+        .iter()
+        .map(|(id, c)| (*id, c.as_str()))
+        .collect();
+    jobs_encode(&mut ctx.data, &refs);
     ctx.data.extend_from_slice(remainder);
     // Sync env to TaskCtl so forked children inherit the changes.
     ctx.set_env(env.to_vec());
@@ -2574,6 +2818,99 @@ fn do_pwd<K: Kernel, A: BufferAlloc>(
     }
 }
 
+/// `jobs` builtin: list background jobs.
+fn do_jobs<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+) -> u8 {
+    let task = ctx.task;
+    let (n, entries) = jobs_decode(&ctx.data);
+    if n == 0 {
+        return 0;
+    }
+    let mut out = alloc::string::String::new();
+    for (i, (_child_id, cmd)) in entries.iter().enumerate() {
+        out.push_str(&alloc::format!("[{}] {}\n", i + 1, cmd));
+    }
+    if ctx.vfs().write(task, 1, out.as_bytes()).is_err() {
+        1
+    } else {
+        0
+    }
+}
+
+/// `fg` builtin: bring a background job to the foreground. Waits for
+/// the specified child to exit and reports its exit status. If no
+/// argument is given, waits for the most recent (last) job. The child
+/// is removed from the job table. Returns a Step because it blocks
+/// when the child is still running.
+fn do_fg<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    args: &[String],
+    remainder: &[u8],
+    env: &[(String, String)],
+) -> Step {
+    let task = ctx.task;
+    let (_nj, mut entries) = jobs_decode(&ctx.data);
+    if entries.is_empty() {
+        // No background jobs.
+        let msg = alloc::format!("fg: no current job\n");
+        ctx.vfs().write(task, 1, msg.as_bytes()).ok();
+        return builtin_done(ctx, remainder, env, 1);
+    }
+    // Determine which job: `fg %N` or last.
+    let idx = if let Some(arg) = args.first() {
+        let num_str = arg.trim_start_matches('%');
+        match num_str.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= entries.len() => n - 1,
+            _ => {
+                let msg = alloc::format!("fg: invalid job id\n");
+                ctx.vfs().write(task, 1, msg.as_bytes()).ok();
+                return builtin_done(ctx, remainder, env, 1);
+            }
+        }
+    } else {
+        entries.len() - 1 // last job
+    };
+    let child_id = entries[idx].0;
+    entries.remove(idx);
+    // Rebuild the job table without this entry.
+    {
+        let refs: alloc::vec::Vec<(u32, &str)> = entries
+            .iter()
+            .map(|(id, c)| (*id, c.as_str()))
+            .collect();
+        jobs_encode(&mut ctx.data, &refs);
+    }
+    // Now wait for the child.
+    match ctx.wait(child_id) {
+        WaitOutcome::Reaped(code) => {
+            // Update $?
+            let env_end_off = env_end(&ctx.data, 2);
+            let env_region = ctx.data[2..env_end_off].to_vec();
+            let qstart = queue_start(&ctx.data);
+            let queue = ctx.data[qstart..].to_vec();
+            ctx.data.clear();
+            ctx.data.push(if queue.is_empty() { 0 } else { 1 });
+            ctx.data.push(code as u8);
+            ctx.data.extend_from_slice(&env_region);
+            // Preserve job table.
+            let (_nj2, job_entries2) = jobs_decode(&ctx.data);
+            let refs2: alloc::vec::Vec<(u32, &str)> = job_entries2
+                .iter()
+                .map(|(id, c)| (*id, c.as_str()))
+                .collect();
+            jobs_encode(&mut ctx.data, &refs2);
+            ctx.data.extend_from_slice(&queue);
+            Step::Yield
+        }
+        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child_id)),
+        WaitOutcome::NoSuchChild => {
+            // Already reaped — just continue.
+            Step::Yield
+        }
+    }
+}
+
 /// A pipeline stage child: its snapshot is `[2, status, stage, n_stages,
 /// nfd, pipes..., in_len, in_path..., out_len, out_path..., prog_len,
 /// prog..., n_args, (arg_len, arg...)..., queue, FORK_MARKER]` — one
@@ -2724,6 +3061,7 @@ pub(crate) struct Stage {
     pub in_redir: Option<String>,
     pub out_redir: Option<String>,
     pub assigns: Vec<(String, String)>,
+    pub background: bool,
 }
 
 /// One token of a parsed command line: a word (possibly empty — `""` is
@@ -2734,6 +3072,7 @@ enum Tok {
     Pipe,
     RedirectIn,
     RedirectOut,
+    Background,
 }
 
 /// Expand a `$...` variable reference starting at `chars[i]` (a `$`) into
@@ -2851,6 +3190,11 @@ fn tokenize(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Tok> {
                 toks.push(Tok::RedirectOut);
                 i += 1;
             }
+            '&' => {
+                flush!();
+                toks.push(Tok::Background);
+                i += 1;
+            }
             // Outside quotes, backslash removes the next character's
             // special meaning (POSIX); a trailing backslash is dropped.
             '\\' => {
@@ -2931,6 +3275,7 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
     let mut out_redir: Option<String> = None;
     let mut assigns: Vec<(String, String)> = Vec::new();
     let mut command_seen = false;
+    let mut background = false;
     let mut i = 0;
     while i < toks.len() {
         match &toks[i] {
@@ -2942,6 +3287,7 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
                         in_redir: in_redir.take(),
                         out_redir: out_redir.take(),
                         assigns: core::mem::take(&mut assigns),
+                        background: false,
                     });
                 }
                 command_seen = false;
@@ -2967,6 +3313,10 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
                     i += 1;
                 }
             },
+            Tok::Background => {
+                background = true;
+                i += 1;
+            }
             Tok::Word(w) => {
                 // Leading NAME=value words with a valid name are scoped
                 // assignments, not argv (POSIX); the first non-assignment
@@ -2993,6 +3343,7 @@ fn parse_line(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Stag
             in_redir,
             out_redir,
             assigns,
+            background,
         });
     }
     stages
@@ -3317,6 +3668,7 @@ mod tests {
             in_redir: None,
             out_redir: None,
             assigns: Vec::new(),
+            background: false,
         }
     }
 
@@ -3351,6 +3703,7 @@ mod tests {
                 in_redir: None,
                 out_redir: None,
                 assigns: Vec::new(),
+                background: false,
             }]
         );
         assert_eq!(parse_line("$? | cat", 3), vec![st(&["3"]), st(&["cat"])]);
@@ -3366,6 +3719,7 @@ mod tests {
                 in_redir: None,
                 out_redir: Some("/tmp/x".to_string()),
                 assigns: Vec::new(),
+                background: false,
             }]
         );
         assert_eq!(
@@ -3375,11 +3729,13 @@ mod tests {
                     argv: vec!["cat".to_string()],
                     in_redir: Some("/etc/passwd".to_string()),
                     out_redir: None,
+                    background: false,
                     assigns: Vec::new(),
                 },
                 Stage {
                     argv: vec!["grep".to_string(), "root".to_string()],
                     in_redir: None,
+                    background: false,
                     out_redir: Some("/tmp/out".to_string()),
                     assigns: Vec::new(),
                 },
@@ -3391,6 +3747,7 @@ mod tests {
             parse_line("echo a > /tmp/x > /tmp/y", 0),
             vec![Stage {
                 argv: vec!["echo".to_string(), "a".to_string()],
+                background: false,
                 in_redir: None,
                 out_redir: Some("/tmp/y".to_string()),
                 assigns: Vec::new(),
@@ -3399,6 +3756,7 @@ mod tests {
         assert_eq!(
             parse_line("echo hi >", 0),
             vec![Stage {
+                background: false,
                 argv: vec!["echo".to_string(), "hi".to_string()],
                 in_redir: None,
                 out_redir: Some(String::new()),
@@ -3450,6 +3808,7 @@ mod tests {
                 in_redir: Some("my file".to_string()),
                 out_redir: None,
                 assigns: Vec::new(),
+                background: false,
             }]
         );
         // An unterminated quote runs to the end of the line (v1 lenient).
@@ -3535,6 +3894,7 @@ mod tests {
                 in_redir: None,
                 out_redir: None,
                 assigns: vec![("FOO".to_string(), "bar".to_string())],
+                background: false,
             }]
         );
         // Several assignments accumulate; a word after the command is an
@@ -3549,6 +3909,7 @@ mod tests {
                     ("A".to_string(), "1".to_string()),
                     ("B".to_string(), "2".to_string()),
                 ],
+                background: false,
             }]
         );
         // An invalid name is a command word, not an assignment.
@@ -3561,6 +3922,7 @@ mod tests {
                 argv: Vec::new(),
                 in_redir: None,
                 out_redir: None,
+                background: false,
                 assigns: vec![("FOO".to_string(), "bar".to_string())],
             }]
         );
@@ -3570,6 +3932,7 @@ mod tests {
             vec![Stage {
                 argv: vec!["echo".to_string(), "hi".to_string()],
                 in_redir: None,
+                background: false,
                 out_redir: Some("/tmp/x".to_string()),
                 assigns: vec![("FOO".to_string(), "bar".to_string())],
             }]

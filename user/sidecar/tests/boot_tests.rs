@@ -1626,3 +1626,54 @@ fn sh_export_persists_env_through_pipeline() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Background jobs: `echo hello &` runs without blocking, `jobs` lists
+/// it, and `fg` waits for it. This exercises the `&` syntax, the job
+/// table, the `jobs` builtin, and the `fg` builtin through the boot
+/// harness.
+#[test]
+fn sh_background_jobs_fg_and_jobs_builtins() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    // `echo hello &`: background, shell returns immediately.
+    // After the background command the output is `$ $ hello\n` —
+    // the initial prompt, the re-prompt, then the child's output.
+    console.console_io().push_input(b"echo hello &\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.windows(5).any(|w| w == b"hello"), "bg echo output, got: {:?}", out);
+    // Two prompts: initial + re-prompt after background.
+    assert!(out.windows(2).filter(|w| *w == b"$ ").count() >= 2,
+        "two prompts after bg, got: {:?}", out);
+
+    // Push an empty line to trigger the next phase-0 cycle, which reaps
+    // the (now exited) background child and prints `[done] echo`.
+    console.console_io().push_input(b"\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.windows(8).any(|w| w == b"[done] e"), "[done] printed, got: {:?}", out);
+    assert!(out.ends_with(b"$ "), "prompt after done, got: {:?}", out);
+
+    // `jobs` should now be empty (the done check reaped the child).
+    console.console_io().push_input(b"jobs\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.ends_with(b"$ "), "final prompt, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
