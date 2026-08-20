@@ -1,0 +1,30 @@
+{
+  "format": "aerosls/sidecar-manifest",
+  "version": "1.0",
+  "personality": "aerosls.network.v1",
+
+  "image": { "kind": "elf", "offset": 0x8000, "size": 0x4000, "entry": "_start" },
+
+  "budget": { "mem_bytes": 131072, "stack_bytes": 8192, "heap_initial_bytes": 32768 },
+
+  "cpu": { "share": 30, "preemptible": true },
+
+  "limits": {
+    "max_tasks": 1,
+    "max_fds": 0,
+    "max_channels": 16,
+    "max_open_files": 0,
+    "chan_queue_depth": 32
+  },
+
+  "caps": [
+    { "name": "budget",  "type": "mem",  "size": 131072,  "rights": "rw" },
+    { "name": "network", "type": "mem",  "size": 1048576, "rights": "rw" },
+    { "name": "console", "type": "chan", "peer": "kernel.debug.console", "rights": "rw" },
+    { "name": "img.ro",  "type": "mem",  "size": 16384,   "rights": "rx" }
+  ],
+
+  "bootstrap": { "console_channel": "console", "log_level": "info" },
+
+  "flags": { "isolated": false, "wx_policy": "w^x" }
+}

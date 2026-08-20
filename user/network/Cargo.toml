@@ -1,0 +1,16 @@
+[package]
+name = "aerosls-network"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS network driver sidecar (aerosls.network.v1) — dumb, passive, connection-agnostic NET_* server"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+[features]
+default = []
+target = ["aerosls-proto/target"]

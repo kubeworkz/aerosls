@@ -296,6 +296,197 @@ pub fn parse_status_body(p: &[u8]) -> Option<(u16, u64)> {
     Some((read_u16(p, 0), read_u64(p, 2)))
 }
 
+/// ── NET_* protocol (Layer 3 — network driver sidecar) ────────────────────────
+
+pub const NET_MAGIC: [u8; 8] = *b"AEROSNT\x01";
+pub const NET_VERSION: u16 = 1;
+
+pub const NET_INFO: u16 = 1;
+pub const NET_SOCKET: u16 = 2;
+pub const NET_BIND: u16 = 3;
+pub const NET_CONNECT: u16 = 4;
+pub const NET_LISTEN: u16 = 5;
+pub const NET_ACCEPT: u16 = 6;
+pub const NET_SEND: u16 = 7;
+pub const NET_RECV: u16 = 8;
+pub const NET_SHUTDOWN: u16 = 9;
+pub const NET_CLOSE_SOCK: u16 = 10;
+pub const NET_POLL: u16 = 11;
+
+/// Protocol-level frame flag: set on error replies.
+pub const NET_FLAG_ERROR: u16 = 0x0001;
+
+/// NET_* status codes.
+pub const NET_OK: u16 = 0;
+pub const NET_ERR_INVAL: u16 = 1;
+pub const NET_ERR_CONNRESET: u16 = 2;
+pub const NET_ERR_NOTCONN: u16 = 3;
+pub const NET_ERR_ADDRINUSE: u16 = 4;
+pub const NET_ERR_ADDRNOTAVAIL: u16 = 5;
+pub const NET_ERR_MSGSIZE: u16 = 6;
+pub const NET_ERR_NOMEM: u16 = 7;
+pub const NET_ERR_IO: u16 = 8;
+pub const NET_ERR_CAP: u16 = 9;
+pub const NET_ERR_WOULDBLOCK: u16 = 10;
+pub const NET_ERR_INUSE: u16 = 11;
+pub const NET_ERR_PROTO: u16 = 12;
+
+/// Socket types.
+pub const SOCK_STREAM: u16 = 1;
+pub const SOCK_DGRAM: u16 = 2;
+
+/// Socket states.
+pub const NET_STATE_LISTENING: u8 = 1;
+pub const NET_STATE_CONNECTED: u8 = 2;
+pub const NET_STATE_CLOSED: u8 = 3;
+
+/// The 16-byte NET_* frame header — the payload of a channel MSG envelope.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetFrame {
+    pub magic: [u8; 8],
+    pub version: u16,
+    pub ty: u16,
+    pub flags: u16,
+    pub pad: u16,
+}
+
+impl NetFrame {
+    pub const SIZE: usize = 16;
+
+    pub fn new(ty: u16, error: bool) -> NetFrame {
+        NetFrame {
+            magic: NET_MAGIC,
+            version: NET_VERSION,
+            ty,
+            flags: if error { NET_FLAG_ERROR } else { 0 },
+            pad: 0,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..8].copy_from_slice(&self.magic);
+        put_u16(&mut b, 8, self.version);
+        put_u16(&mut b, 10, self.ty);
+        put_u16(&mut b, 12, self.flags);
+        put_u16(&mut b, 14, self.pad);
+        b
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.flags & NET_FLAG_ERROR != 0
+    }
+
+    /// Length check only; the caller validates magic/version.
+    pub fn parse(b: &[u8]) -> Option<NetFrame> {
+        if b.len() < Self::SIZE {
+            return None;
+        }
+        Some(NetFrame {
+            magic: read8(b, 0),
+            version: read_u16(b, 8),
+            ty: read_u16(b, 10),
+            flags: read_u16(b, 12),
+            pad: read_u16(b, 14),
+        })
+    }
+}
+
+/// NET_INFO reply body: `{max_sockets u32, mtu u32, flags u32}` (12 bytes).
+pub fn encode_net_info_body(max_sockets: u32, mtu: u32, flags: u32) -> [u8; 12] {
+    let mut b = [0u8; 12];
+    put_u32(&mut b, 0, max_sockets);
+    put_u32(&mut b, 4, mtu);
+    put_u32(&mut b, 8, flags);
+    b
+}
+
+pub fn parse_net_info_body(p: &[u8]) -> Option<(u32, u32, u32)> {
+    if p.len() < 12 {
+        return None;
+    }
+    Some((read_u32(p, 0), read_u32(p, 4), read_u32(p, 8)))
+}
+
+/// NET_SOCKET request body: `{sock_type u16, protocol u16}` (4 bytes).
+pub fn encode_net_socket_body(sock_type: u16, protocol: u16) -> [u8; 4] {
+    let mut b = [0u8; 4];
+    put_u16(&mut b, 0, sock_type);
+    put_u16(&mut b, 2, protocol);
+    b
+}
+
+pub fn parse_net_socket_body(p: &[u8]) -> Option<(u16, u16)> {
+    if p.len() < 4 {
+        return None;
+    }
+    Some((read_u16(p, 0), read_u16(p, 2)))
+}
+
+/// Socket address: `{ip u32, port u16}` (6 bytes, IPv4 only in v1).
+pub fn encode_sockaddr(ip: u32, port: u16) -> [u8; 6] {
+    let mut b = [0u8; 6];
+    put_u32(&mut b, 0, ip);
+    put_u16(&mut b, 4, port);
+    b
+}
+
+pub fn parse_sockaddr(p: &[u8]) -> Option<(u32, u16)> {
+    if p.len() < 6 {
+        return None;
+    }
+    Some((read_u32(p, 0), read_u16(p, 4)))
+}
+
+/// NET_BIND/NET_CONNECT request body: `{addr: [u8; 6]}` (6 bytes).
+/// (Reuses sockaddr encoding.)
+
+/// NET_ACCEPT reply body: `{new_sock_id u32, addr: [u8; 6]}` (10 bytes).
+pub fn encode_net_accept_body(sock_id: u32, ip: u32, port: u16) -> [u8; 10] {
+    let mut b = [0u8; 10];
+    put_u32(&mut b, 0, sock_id);
+    b[4..10].copy_from_slice(&encode_sockaddr(ip, port));
+    b
+}
+
+pub fn parse_net_accept_body(p: &[u8]) -> Option<(u32, u32, u16)> {
+    if p.len() < 10 {
+        return None;
+    }
+    Some((read_u32(p, 0), read_u32(p, 4), read_u16(p, 8)))
+}
+
+/// NET_SHUTDOWN request body: `{sock_id u32, how u8}` (5 bytes).
+pub fn encode_net_shutdown_body(sock_id: u32, how: u8) -> [u8; 5] {
+    let mut b = [0u8; 5];
+    put_u32(&mut b, 0, sock_id);
+    b[4] = how;
+    b
+}
+
+pub fn parse_net_shutdown_body(p: &[u8]) -> Option<(u32, u8)> {
+    if p.len() < 5 {
+        return None;
+    }
+    Some((read_u32(p, 0), p[4]))
+}
+
+/// NET_POLL reply body: `{sock_id u32, events u16}` (6 bytes).
+pub fn encode_net_poll_body(sock_id: u32, events: u16) -> [u8; 6] {
+    let mut b = [0u8; 6];
+    put_u32(&mut b, 0, sock_id);
+    put_u16(&mut b, 4, events);
+    b
+}
+
+pub fn parse_net_poll_body(p: &[u8]) -> Option<(u32, u16)> {
+    if p.len() < 6 {
+        return None;
+    }
+    Some((read_u32(p, 0), read_u16(p, 4)))
+}
+
 /// NEW_CHANNEL control-event payload: `{handle u32, rights u16, flags u16,
 /// tag u32}` (12 bytes, transport spec §3.1).
 pub fn encode_new_channel(handle: u32, rights: u16, flags: u16, tag: u32) -> [u8; 12] {
@@ -456,8 +647,38 @@ mod tests {
     }
 
     #[test]
+    fn net_frame_roundtrip() {
+        let f = NetFrame::new(NET_CONNECT, false);
+        let bytes = f.encode();
+        let back = NetFrame::parse(&bytes).unwrap();
+        assert_eq!(back, f);
+        assert_eq!(back.ty, NET_CONNECT);
+        assert!(!back.is_error());
+        assert!(NetFrame::new(NET_SEND, true).is_error());
+    }
+
+    #[test]
+    fn net_addr_roundtrip() {
+        let b = encode_sockaddr(0xC0A80001, 8080);
+        assert_eq!(parse_sockaddr(&b), Some((0xC0A80001, 8080)));
+    }
+
+    #[test]
+    fn net_info_body_roundtrip() {
+        let b = encode_net_info_body(16, 1500, 0);
+        assert_eq!(parse_net_info_body(&b), Some((16, 1500, 0)));
+    }
+
+    #[test]
+    fn net_socket_body_roundtrip() {
+        let b = encode_net_socket_body(SOCK_STREAM, 0);
+        assert_eq!(parse_net_socket_body(&b), Some((SOCK_STREAM, 0)));
+    }
+
+    #[test]
     fn magic_bytes() {
         assert_eq!(&CH_MAGIC, b"AEROSCH\x01");
         assert_eq!(&RD_MAGIC, b"AEROSRD\x01");
+        assert_eq!(&NET_MAGIC, b"AEROSNT\x01");
     }
 }

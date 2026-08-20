@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerosls-network"
+version = "0.1.0"
+dependencies = [
+ "aerosls-kernel-sim",
+ "aerosls-proto",
+]
+
+[[package]]
 name = "aerosls-procmgr"
 version = "0.1.0"
 dependencies = [
