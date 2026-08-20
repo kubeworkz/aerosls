@@ -33,7 +33,10 @@
 //!   byte repeating for a longer `SET1`), `cut` (extracts fields
 //!   `-d DELIM -f LIST` or byte positions `-c`/`-b LIST` per line —
 //!   lists of 1-based positions and ranges like `1,3-5`, `2-`, parsed
-//!   once at init, with lines buffered across reads), `true`/`false`
+//!   once at init, with lines buffered across reads), `uniq` (collapses
+//!   adjacent duplicate lines: default prints each run once, `-c` prefixes
+//!   the count, `-d` repeats-only, `-u` unique-only; lines may span reads
+//!   and run output writes with blocking writes), `true`/`false`
 //!   — plus `register_default_applets`.
 //! - `allocator`  — `BudgetAlloc`: request buffers carved from the sidecar's
 //!   own budget MEM cap.

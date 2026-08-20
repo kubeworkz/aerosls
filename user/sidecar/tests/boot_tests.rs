@@ -167,6 +167,7 @@ fn boot_runs_an_interactive_shell() {
     b.add_file("/bin/tee", b"tee\n", 0o755);
     b.add_file("/bin/tr", b"tr\n", 0o755);
     b.add_file("/bin/cut", b"cut\n", 0o755);
+    b.add_file("/bin/uniq", b"uniq\n", 0o755);
     b.add_file("/bin/false", b"false\n", 0o755);
     b.add_file("/bin/true", b"true\n", 0o755);
     b.add_file("/bin/sh", b"sh\n", 0o755);
@@ -190,6 +191,8 @@ fn boot_runs_an_interactive_shell() {
     // Three passwd-shaped lines (15-17 bytes each, so a line spans
     // reads), for cut's file loop and multi-line extraction.
     b.add_file("/etc/cols.txt", b"root:x:0:0\nbin:x:1:1\ndaemon:x:2:2\n", 0o644);
+    b.add_file("/etc/dup.txt", b"apple\napple\npear\npear\npear\nfig\n", 0o644);
+    b.add_file("/etc/adj.txt", b"a\nb\na\n", 0o644);
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
@@ -655,10 +658,31 @@ fn boot_runs_an_interactive_shell() {
     booted.run(100);
     console.console_io().push_input(b"echo $?\n");
     booted.run(100);
+    // uniq section
+    console.console_io().push_input(b"uniq /etc/dup.txt\n");
+    booted.run(100);
+    console.console_io().push_input(b"uniq -c /etc/dup.txt\n");
+    booted.run(100);
+    console.console_io().push_input(b"uniq -d /etc/dup.txt\n");
+    booted.run(100);
+    console.console_io().push_input(b"uniq -u /etc/dup.txt\n");
+    booted.run(100);
+    console.console_io().push_input(b"cat /etc/dup.txt | uniq | wc\n");
+    booted.run(100);
+    console.console_io().push_input(b"cat /etc/adj.txt | uniq\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo \"x x x\" | tr ' ' '\\n' | uniq\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo \"a a b a\" | tr ' ' '\\n' | uniq -c\n");
+    booted.run(100);
+    console.console_io().push_input(b"uniq -c -d /etc/dup.txt\n");
+    booted.run(100);
+    console.console_io().push_input(b"echo $?\n");
+    booted.run(100);
     assert_eq!(
         console.console_io().output(),
-        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ hi\n$ 0\n$ $ 1\n$ $ 0\n$ $ 1\n$ $ 127\n$ Hello\n$ HELLO\n$ heo\n$ X\nY\nZ\n4\n5\n$ root,x,0,0,root,/root,/bin/sh\n$ hel\n$ ello\n$ ace\n$ b\n$ b:c\n$ c\n$ root\n$ root:0:root\n$ root\nbin\ndaemon\n$ r\nb\nd\n$ $ 2\n$ ",
-        "tee fanned the stream, $? followed the last stage, tr mapped/deleted per byte, and cut extracted fields and byte ranges per line"
+        b"$ hello\n$ $ 1\n$ $ root:x:0:0:root:/root:/bin/sh\n$ one\ntwo\n$ hello world\n$ $?\n$ hello world\n$ a  b\n$ /bin /root\n$ $ bar\n$ $ hi there\n$ $ 2\n$ PATH=/bin\nHOME=/home/root\nFOO=bar\nGREETING=hi there\n$ $ hello\n$ fallback\n$ $ $ 127\n$ $ \n$ PATH=/bin\nHOME=/home/root\nFOO=bar\n$ $ scoped\n$ PATH=/bin\nHOME=/home/root\n$ hi\n$ $ hello\n$ 1\n$ hello\n$ hello\n$       1       2      12\n$       1       2      16\n$       1       1      30 /etc/passwd\n$ line-000\n$ 0\n$ root:x:0:0:root:/root:/bin/sh\n$ root:x:0:0:root:/root:/bin/sh\n$ line-498\nline-499\n$ fig\n$ pear\napple\n$ apple\ndate\nfig\npear\n$ line-000\nline-001\n$ 1\n2\n3\n4\n5\n$ 3\n4\n5\n$ 2\n4\n6\n8\n$ 1\n2\n3\n$   10000   10000   48894\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n4\n5\n$ 1\n2\n3\n$ hi\n$ 0\n$ $ 1\n$ $ 0\n$ $ 1\n$ $ 127\n$ Hello\n$ HELLO\n$ heo\n$ X\nY\nZ\n4\n5\n$ root,x,0,0,root,/root,/bin/sh\n$ hel\n$ ello\n$ ace\n$ b\n$ b:c\n$ c\n$ root\n$ root:0:root\n$ root\nbin\ndaemon\n$ r\nb\nd\n$ $ 2\n$ apple\npear\nfig\n$       2 apple\n      3 pear\n      1 fig\n$ apple\npear\n$ fig\n$       3       3      15\n$ a\nb\na\n$ x\n$       2 a\n      1 b\n      1 a\n$ $ 2\n$ ",
+        "tee fanned the stream, $? followed the last stage, tr mapped/deleted per byte, cut extracted fields and byte ranges, and uniq collapsed adjacent duplicate runs"
     );
 
     // The file side of the fan-out: t5.out holds the exact stream, and

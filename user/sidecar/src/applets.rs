@@ -53,6 +53,12 @@
 //!   positions and ranges (`1`, `3-5`, `2-`, `-3`, `-`) parsed once at
 //!   init; lines buffer across reads and each complete line is written
 //!   with blocking writes.
+//! - **`uniq`** — collapses adjacent duplicate lines into runs: default
+//!   prints each run's representative once, `-c` prefixes the `{:>7}`
+//!   count, `-d` prints only runs longer than one line, `-u` only runs
+//!   of exactly one; only ADJACENT lines dedup (`a b a` keeps both `a`
+//!   lines), lines may span reads, and run output writes with blocking
+//!   writes.
 //! - **`echo`** — writes its arguments (space-joined, newline-terminated)
 //!   to fd 1.
 //! - **`sh`** — the minimal interactive shell: prompts on fd 1, reads
@@ -74,8 +80,9 @@
 //! - **`true`** / **`false`** — exit 0 / 1.
 //!
 //! The script runner's data layout is the applet's contract with its fork
-//! children: `data[0]` = phase, `data[1..5]` = u32 LE line cursor (phase 1
-//! parent) or child id (phase 2), then the immutable script text. A fork
+//! children: `data[0]` = phase, `data[1..5]` = u32 LE line cursor, then
+//! the immutable script text; phase 2 appends the u32 LE child id at the
+//! end (it dies with the completed wait). A fork
 //! child's snapshot carries `[1, cursor, script, FORK_MARKER]`; the child
 //! parses the line at the cursor, sets up stdio, and execs — one command
 //! per child, exactly like the `cat | grep` pipeline test's phase machine.
@@ -140,23 +147,25 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             };
             ctx.data[1..5].copy_from_slice(&(le + 1).to_le_bytes());
             ctx.data[0] = 2;
-            ctx.data.push(child as u8);
+            ctx.data.extend_from_slice(&child.to_le_bytes()); // u32 LE
             match ctx.wait(child) {
                 WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
                 WaitOutcome::Reaped(_) => {
-                    ctx.data.pop();
+                    ctx.data.truncate(ctx.data.len() - 4);
                     ctx.data[0] = 1;
                     Step::Yield
                 }
                 WaitOutcome::NoSuchChild => Step::Exit(2),
             }
         }
-        // A child finished (we woke); reap it and resume the loop.
+        // A child finished (we woke); reap it and resume the loop. The
+        // child id sits in the last 4 bytes (u32 LE).
         2 => {
-            let child = *ctx.data.last().unwrap() as u32;
+            let n = ctx.data.len();
+            let child = u32::from_le_bytes(ctx.data[n - 4..n].try_into().unwrap());
             match ctx.wait(child) {
                 WaitOutcome::Reaped(_) => {
-                    ctx.data.pop();
+                    ctx.data.truncate(n - 4);
                     ctx.data[0] = 1;
                     Step::Yield
                 }
@@ -1660,6 +1669,223 @@ pub fn cut<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
+/// Build the output for a completed run — the run's representative line
+/// plus a newline — honoring the mode: default prints every run, `-c`
+/// prefixes a `{:>7}` count (GNU's `%7d `), `-d` prints only runs longer
+/// than one line, `-u` only runs of exactly one. An empty output is a
+/// valid no-op (`-d`/`-u` on a non-matching run).
+fn uniq_run_output(data: &[u8], mode: u8) -> Vec<u8> {
+    let rep_len = read_u32(data, 9) as usize;
+    let count = read_u32(data, 5);
+    let rep = &data[18..18 + rep_len];
+    let mut out = Vec::new();
+    match mode {
+        1 => out.extend_from_slice(alloc::format!("{:>7} ", count).as_bytes()),
+        2 if count <= 1 => return out,
+        3 if count != 1 => return out,
+        _ => {}
+    }
+    out.extend_from_slice(rep);
+    out.push(b'\n');
+    out
+}
+
+/// Process one complete line (content, newline excluded) against the
+/// run state in `data`: an empty representative (no run yet) makes the
+/// line the representative, an equal line grows the run's count, and a
+/// different line emits the completed run's output and starts a new run
+/// with this line. Emission sets phase 2 and the pending out_len; the
+/// new representative replaces the old in place (the partial input after
+/// it shifts, sizes are tiny). The `have_rep` flag distinguishes an
+/// empty representative line from "no run yet".
+fn uniq_process_line(data: &mut Vec<u8>, line: Vec<u8>) {
+    let mode = data[4];
+    if data[17] == 0 {
+        // First line of the run: it becomes the representative, inserted
+        // at the fixed rep slot (the partial region may hold leftover
+        // input after it, which shifts — sizes are tiny).
+        data.splice(18..18, line.iter().copied());
+        data[9..13].copy_from_slice(&(line.len() as u32).to_le_bytes());
+        data[5..9].copy_from_slice(&1u32.to_le_bytes());
+        data[17] = 1;
+    } else {
+        let rep_len = read_u32(data, 9) as usize;
+        if data[18..18 + rep_len] == line[..] {
+            // Same content: grow the run.
+            let count = read_u32(data, 5) + 1;
+            data[5..9].copy_from_slice(&count.to_le_bytes());
+        } else {
+            // Different: emit the completed run, then start a new one.
+            let out = uniq_run_output(data, mode);
+            data.splice(18..18 + rep_len, line.iter().copied());
+            data[9..13].copy_from_slice(&(line.len() as u32).to_le_bytes());
+            data[5..9].copy_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&out);
+            data[13..17].copy_from_slice(&(out.len() as u32).to_le_bytes());
+            data[0] = 2;
+        }
+    }
+}
+
+/// `uniq [OPTION]... [FILE]`: filters adjacent duplicate lines — a line
+/// equal to the previous one is folded into its run, and only the run's
+/// representative is printed. Default prints every run once; `-c`
+/// prefixes each line with the `{:>7}` run count; `-d` prints only
+/// runs longer than one line; `-u` only runs of exactly one. The
+/// options are mutually exclusive (like GNU), an unknown option or more
+/// than one file is a usage error (exit 2). Comparison is on the line
+/// content without the newline (so a final unterminated line matches a
+/// terminated equal line), and only ADJACENT lines dedup — `a b a`
+/// keeps both `a` lines. Reads via `read_blocking`, so an empty pipe
+/// stdin parks; a line may span reads (the partial line survives
+/// parks), and each run's output is written with `write_blocking` — a
+/// full pipe parks with the pending output intact and an early-exiting
+/// reader (`uniq | head`) wakes the retry to `EPIPE`. Data layout:
+/// `[phase, file_idx, first_file_arg, fd, mode, count u32, rep_len u32,
+/// out_len u32, have_rep, rep..., in (partial line)..., out (pending)...]`.
+pub fn uniq<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let argv = ctx.argv();
+        let mut mode = 0u8;
+        let mut first_file_arg = 255u8;
+        let mut i = 1;
+        while i < argv.len() {
+            let a = &argv[i];
+            if a == "-c" || a == "-d" || a == "-u" {
+                if mode != 0 {
+                    return Step::Exit(2); // -c/-d/-u are exclusive
+                }
+                mode = if a == "-c" { 1 } else if a == "-d" { 2 } else { 3 };
+            } else if a.starts_with('-') && a.len() > 1 {
+                return Step::Exit(2); // unknown option
+            } else if first_file_arg == 255 {
+                first_file_arg = i as u8;
+            }
+            i += 1;
+        }
+        if first_file_arg != 255 && argv.len() - first_file_arg as usize > 1 {
+            return Step::Exit(2); // v1: stdin or one file
+        }
+        ctx.data.extend_from_slice(&[0, 0, first_file_arg, 0, mode]);
+        ctx.data.extend_from_slice(&0u32.to_le_bytes()); // count
+        ctx.data.extend_from_slice(&0u32.to_le_bytes()); // rep_len
+        ctx.data.extend_from_slice(&0u32.to_le_bytes()); // out_len
+        ctx.data.push(0); // have_rep
+    }
+    loop {
+        let rep_len = read_u32(&ctx.data, 9) as usize;
+        let in_start = 18 + rep_len; // in = data[in_start..len - out_len]
+        let out_len = read_u32(&ctx.data, 13) as usize;
+        match ctx.data[0] {
+            // Pick the source: stdin when no file, else the file.
+            0 => {
+                if ctx.data[2] == 255 {
+                    ctx.data[0] = 1; // stdin
+                } else {
+                    let path = match ctx.argv().get(ctx.data[2] as usize) {
+                        Some(p) => p.clone(),
+                        None => return Step::Exit(2),
+                    };
+                    match ctx.vfs().open(task, &path, O_RDONLY, 0) {
+                        Ok(fd) => {
+                            ctx.data[3] = fd as u8;
+                            ctx.data[0] = 1;
+                        }
+                        Err(_) => return Step::Exit(2),
+                    }
+                }
+            }
+            // Read into the partial-line region; on a complete line,
+            // process it. At EOF, process a pending final line (content
+            // minus a trailing newline), then flush the final run, then
+            // advance to the next source.
+            1 => {
+                let src = ctx.data[3] as u32;
+                let mut buf = [0u8; 16];
+                match ctx.read_blocking(src, &mut buf) {
+                    ReadBlock::Data(0) => {
+                        // Drain the remaining complete lines one per
+                        // visit — a chunk can hold several, and
+                        // process_line may emit (phase 2), parking the
+                        // write while the leftover stays in the region.
+                        let rep_len = read_u32(&ctx.data, 9) as usize;
+                        let in_start = 18 + rep_len;
+                        if let Some(nl) = ctx.data[in_start..ctx.data.len() - out_len]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                        {
+                            let line = ctx.data[in_start..in_start + nl].to_vec();
+                            ctx.data.drain(in_start..in_start + nl + 1);
+                            uniq_process_line(&mut ctx.data, line);
+                        } else if ctx.data.len() - out_len > in_start {
+                            // A final unterminated fragment is a line.
+                            let line = ctx.data[in_start..ctx.data.len() - out_len].to_vec();
+                            ctx.data.truncate(in_start);
+                            uniq_process_line(&mut ctx.data, line);
+                        } else if ctx.data[17] == 1 {
+                            // EOF: emit the final run.
+                            let out = uniq_run_output(&ctx.data, ctx.data[4]);
+                            ctx.data.truncate(18);
+                            ctx.data[5..9].copy_from_slice(&0u32.to_le_bytes());
+                            ctx.data[9..13].copy_from_slice(&0u32.to_le_bytes());
+                            ctx.data[17] = 0;
+                            ctx.data.extend_from_slice(&out);
+                            ctx.data[13..17].copy_from_slice(&(out.len() as u32).to_le_bytes());
+                            ctx.data[0] = 2;
+                        } else {
+                            // Advance to the next source (at most one
+                            // file, so this exits).
+                            let fd = ctx.data[3];
+                            if fd != 0 {
+                                ctx.vfs().close(task, fd as u32).ok();
+                            }
+                            return Step::Exit(0);
+                        }
+                    }
+                    ReadBlock::Data(n) => {
+                        ctx.data.extend_from_slice(&buf[..n]);
+                        if let Some(nl) = ctx.data[in_start..ctx.data.len() - out_len]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                        {
+                            // Process the first complete line, leaving the
+                            // rest of the chunk in the partial region.
+                            let line = ctx.data[in_start..in_start + nl].to_vec();
+                            ctx.data.drain(in_start..in_start + nl + 1);
+                            uniq_process_line(&mut ctx.data, line);
+                        }
+                    }
+                    ReadBlock::WouldBlock => return Step::Blocked(BlockReason::Readable(src)),
+                    ReadBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            // Write the pending run output, parking on a full pipe. The
+            // copy keeps ctx.data unborrowed across the write.
+            2 => {
+                let pending = ctx.data[ctx.data.len() - out_len..].to_vec();
+                match ctx.write_blocking(1, &pending) {
+                    WriteBlock::Data(k) => {
+                        if k == pending.len() {
+                            ctx.data.truncate(ctx.data.len() - out_len);
+                            ctx.data[13..17].copy_from_slice(&0u32.to_le_bytes());
+                            ctx.data[0] = 1;
+                        } else {
+                            let out_start = ctx.data.len() - out_len;
+                            ctx.data.drain(out_start..out_start + k);
+                            ctx.data[13..17]
+                                .copy_from_slice(&((out_len - k) as u32).to_le_bytes());
+                        }
+                    }
+                    WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+                    WriteBlock::Err(_) => return Step::Exit(2),
+                }
+            }
+            _ => return Step::Exit(2),
+        }
+    }
+}
+
 /// `echo`: writes its arguments (space-joined, newline-terminated) to fd 1.
 pub fn echo<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let mut text = String::new();
@@ -2021,14 +2247,16 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     for fd in &pipes {
         ctx.vfs().close(task, *fd).ok();
     }
-    // Wait state: [3, status, n, reaped, children..., env..., remainder].
+    // Wait state: [3, status, n, reaped, children (u32 LE each)..., env...,
+    // remainder]. Child ids are 4 bytes: task ids come from a monotonic
+    // counter, so a long session exceeds 255 forks.
     ctx.data.clear();
     ctx.data.push(3);
     ctx.data.push(status);
     ctx.data.push(children.len() as u8);
     ctx.data.push(0); // reaped count
     for c in &children {
-        ctx.data.push(*c as u8);
+        ctx.data.extend_from_slice(&c.to_le_bytes());
     }
     ctx.data.extend_from_slice(&env_region);
     ctx.data.extend_from_slice(&remainder);
@@ -2053,10 +2281,10 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let n = ctx.data[2] as usize;
     let reaped = ctx.data[3] as usize;
     if reaped >= n {
-        // Children ids sit at data[4..4+n]; the env region and the queued
-        // remainder survive after them.
-        let qstart = env_end(&ctx.data, 4 + n);
-        let env_region = ctx.data[4 + n..qstart].to_vec();
+        // Children ids sit at data[4..4+4n] (u32 LE); the env region and
+        // the queued remainder survive after them.
+        let qstart = env_end(&ctx.data, 4 + 4 * n);
+        let env_region = ctx.data[4 + 4 * n..qstart].to_vec();
         let queue = ctx.data[qstart..].to_vec();
         let status = ctx.data[1];
         ctx.data.clear();
@@ -2066,7 +2294,8 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data.extend_from_slice(&queue);
         return Step::Yield;
     }
-    let c = ctx.data[4 + reaped] as u32;
+    let off = 4 + 4 * reaped;
+    let c = u32::from_le_bytes(ctx.data[off..off + 4].try_into().unwrap());
     match ctx.wait(c) {
         WaitOutcome::Reaped(code) => {
             ctx.data[3] = (reaped + 1) as u8;
@@ -2231,11 +2460,15 @@ fn do_unset(env: &mut Vec<(String, String)>, args: &[String], one_only: bool) ->
 /// and exec — on any failure the child exits 127, which the shell reaps.
 fn sh_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let task = ctx.task;
-    // The fork marker is the last byte.
-    let d = &ctx.data[..ctx.data.len() - 1];
+    // The fork marker is the last byte; copy the snapshot out so the
+    // parse borrows a local, not ctx.data.
+    let d = ctx.data[..ctx.data.len() - 1].to_vec();
     let stage = d[2] as usize;
     let n = d[3] as usize;
     let nfd = d[4] as usize;
+    if d.len() < 5 + nfd {
+        return Step::Exit(127);
+    }
     let pipes: Vec<u32> = d[5..5 + nfd].iter().map(|&b| b as u32).collect();
     let mut p = 5 + nfd;
     let in_len = d[p] as usize;
@@ -2651,6 +2884,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("tee", tee);
     pm.register_applet("tr", tr);
     pm.register_applet("cut", cut);
+    pm.register_applet("uniq", uniq);
     pm.register_applet("echo", echo);
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
@@ -3142,6 +3376,70 @@ mod tests {
         // An empty line yields a bare newline in both modes.
         assert_eq!(cut_line(b"", 1, b'\t', &[(1, 1)]), b"\n");
         assert_eq!(cut_line(b"", 0, b':', &[(1, 1)]), b"\n");
+    }
+
+    #[test]
+    fn uniq_run_output_formats_runs() {
+        use super::{read_u32, uniq_run_output};
+        // A data vec holding the representative "pear" with a count.
+        let build = |count: u32| {
+            let mut d = vec![0u8; 18];
+            d[5..9].copy_from_slice(&count.to_le_bytes());
+            d[9..13].copy_from_slice(&4u32.to_le_bytes());
+            d[17] = 1;
+            d.extend_from_slice(b"pear");
+            d
+        };
+        // Default: every run prints, count ignored.
+        assert_eq!(uniq_run_output(&build(3), 0), b"pear\n");
+        assert_eq!(uniq_run_output(&build(1), 0), b"pear\n");
+        // -c: the {:>7} count prefix.
+        assert_eq!(uniq_run_output(&build(3), 1), b"      3 pear\n");
+        assert_eq!(uniq_run_output(&build(12), 1), b"     12 pear\n");
+        // -d: only runs longer than one line.
+        assert_eq!(uniq_run_output(&build(3), 2), b"pear\n");
+        assert_eq!(uniq_run_output(&build(1), 2), b"");
+        // -u: only runs of exactly one.
+        assert_eq!(uniq_run_output(&build(1), 3), b"pear\n");
+        assert_eq!(uniq_run_output(&build(3), 3), b"");
+        // The helper reads rep_len/count from the header itself.
+        assert_eq!(read_u32(&build(7), 5), 7);
+    }
+
+    #[test]
+    fn uniq_process_line_tracks_runs() {
+        use super::{read_u32, uniq_process_line};
+        // Empty header: phase 0, mode 0, no run yet.
+        let mut d = vec![0u8; 18];
+        // The first line becomes the representative, no emission.
+        uniq_process_line(&mut d, b"a".to_vec());
+        assert_eq!(&d[18..19], b"a");
+        assert_eq!(read_u32(&d, 5), 1); // count
+        assert_eq!(read_u32(&d, 9), 1); // rep_len
+        assert_eq!(d[17], 1); // have_rep
+        assert_eq!(d[0], 0); // phase unchanged
+        // An equal line grows the run, still no emission.
+        uniq_process_line(&mut d, b"a".to_vec());
+        assert_eq!(read_u32(&d, 5), 2);
+        assert_eq!(d[0], 0);
+        // A different line emits the run (phase 2, pending set) and
+        // becomes the new representative.
+        uniq_process_line(&mut d, b"b".to_vec());
+        assert_eq!(d[0], 2);
+        assert_eq!(read_u32(&d, 13), 2); // out_len = "a\n"
+        let out_len = read_u32(&d, 13) as usize;
+        assert_eq!(&d[d.len() - out_len..], b"a\n");
+        assert_eq!(&d[18..19], b"b");
+        assert_eq!(read_u32(&d, 5), 1);
+        // An empty line is a valid representative: have_rep keeps it
+        // distinct from "no run yet", so a second empty line matches.
+        let mut d = vec![0u8; 18];
+        uniq_process_line(&mut d, Vec::new());
+        assert_eq!(d[17], 1);
+        assert_eq!(read_u32(&d, 9), 0); // rep_len 0, but have_rep set
+        uniq_process_line(&mut d, Vec::new());
+        assert_eq!(read_u32(&d, 5), 2);
+        assert_eq!(d[0], 0);
     }
 
     #[test]

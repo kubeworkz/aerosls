@@ -323,8 +323,12 @@ script + the manifest's `image` record) is the sidecar build step; see
   `cat /etc/passwd | cut -d: -f1` and `-f1,3,5`, the file forms
   `cut -d: -f1 /etc/cols.txt` and `cut -c1 /etc/cols.txt` where
   the 15-17 byte lines span reads, and the usage-error path
-  `cut /etc/passwd` → 2 via `$?`) — through the real driver,
-  asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
+  `cut /etc/passwd` → 2 via `$?`) — and a uniq session
+  (`uniq /etc/dup.txt`, `-c` counts, `-d` repeats-only, `-u` unique-only,
+  `cat /etc/dup.txt | uniq | wc` and `cat /etc/adj.txt | uniq` for
+  adjacent-only semantics, streaming tr→uniq pipelines with `-c`,
+  and the usage-error path `uniq -c -d` → 2 via `$?`) — through
+  the real driver, asserting the console transcript byte for byte. `BudgetAlloc` carves RD request buffers out of the sidecar's own
   budget cap (grants with no amplification), and the `target` entry
   points (ramdisk + sidecar) share the real `extern "C"` ABI in
   `proto::kabi`.
