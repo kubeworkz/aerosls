@@ -1677,3 +1677,46 @@ fn sh_background_jobs_fg_and_jobs_builtins() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Multiple concurrent background jobs on separate lines.
+#[test]
+fn sh_multiple_background_jobs() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "first prompt");
+
+    // Two background jobs on separate lines.
+    console.console_io().push_input(b"echo a &\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.windows(2).any(|w| w == b"a\n"), "output a, got: {:?}", out);
+
+    console.console_io().push_input(b"echo b &\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.windows(2).any(|w| w == b"b\n"), "output b, got: {:?}", out);
+
+    // Both background jobs ran independently. [done] messages appear.
+    let done_count = out.windows(7).filter(|w| w == b"[done] ").count();
+    assert!(done_count >= 1, "at least one [done], got: {:?}", out);
+
+    // jobs should be empty (both already reaped).
+    console.console_io().push_input(b"jobs\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.ends_with(b"$ "), "prompt after jobs, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

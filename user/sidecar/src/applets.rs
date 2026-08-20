@@ -2305,12 +2305,35 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         Some(i) => (ctx.data[qstart..qstart + i].to_vec(), ctx.data[qstart + i + 1..].to_vec()),
         None => (ctx.data[qstart..].to_vec(), Vec::new()),
     };
-    let line = match core::str::from_utf8(&line) {
+    let line_raw = match core::str::from_utf8(&line) {
         Ok(s) => s.trim(),
         Err(_) => "", // garbage: drop the line like a comment
     };
+    // Split on the first unquoted `&`: `echo a & echo b &` becomes
+    // command `echo a &` (background) with remainder `echo b &`.
+    let (line, bg_remainder, has_amp) = match find_unquoted_amp(line_raw) {
+        Some(pos) => (&line_raw[..pos], line_raw[pos + 1..].trim_start(), true),
+        None => (line_raw, "", false),
+    };
+    let mut remainder: Vec<u8> = remainder;
+    if !bg_remainder.is_empty() {
+        // Prepend the remainder after `&` to the existing queue,
+        // terminated by a newline so the shell sees a complete line.
+        let mut new_remainder = Vec::with_capacity(bg_remainder.len() + 1 + remainder.len());
+        new_remainder.extend_from_slice(bg_remainder.as_bytes());
+        new_remainder.push(b'\n');
+        new_remainder.extend_from_slice(&remainder);
+        remainder = new_remainder;
+    }
     let env = env_pairs(&ctx.data, 2);
-    let stages = parse_line(line, status, &env);
+    let mut stages = parse_line(line, status, &env);
+    // `find_unquoted_amp` stripped the `&` before parse_line, so the
+    // stage wasn't marked as background.  Fix that now.
+    if has_amp {
+        if let Some(last) = stages.last_mut() {
+            last.background = true;
+        }
+    }
     if stages.is_empty() {
         // Blank or comment line: drop it; re-prompt only if the batch is
         // drained, otherwise continue straight to the next buffered line.
@@ -2468,13 +2491,14 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             .map(|s| s.argv.first().map(|a| a.as_str()).unwrap_or(""))
             .collect::<alloc::vec::Vec<_>>()
             .join(" | ");
-        // Rebuild the data buffer: [phase, status, env..., queue...]
-        // then add the job table between env and queue.
+        // Rebuild the data buffer: [phase, status, env..., existing
+        // jobs..., new_job, queue...].
         let queue = remainder;
         ctx.data.clear();
         ctx.data.push(0); // phase: back to prompt
         ctx.data.push(status);
         ctx.data.extend_from_slice(&env_region);
+        ctx.data.extend_from_slice(&job_table_bytes_pre);
         jobs_add(&mut ctx.data, children[0], &cmd_str);
         ctx.data.extend_from_slice(&queue);
         return Step::Yield;
@@ -3137,20 +3161,53 @@ fn expand_var(
     }
 }
 
-/// Tokenize a command line into words and metacharacters, honoring single
-/// and double quotes, backslash escapes, and `$` variable expansion. A
-/// quoted section is a literal part of its word, so quotes group
-/// whitespace — and, quoted, the metacharacters `|` `<` `>` — into a
-/// single argument. `$?` expands to the last exit status and `$NAME` /
-/// `${NAME}` expand through `env` (the shell's environment), wherever
-/// they appear: unquoted, and inside double quotes (POSIX). Single
-/// quotes are fully literal, so `'$?'` stays `$?` and `'\'` is a
-/// backslash. Outside quotes, backslash removes the special meaning of
-/// the next character (POSIX): `\ ` is a literal space, `\$` suppresses
-/// expansion, and `\|` is a word, not a pipe; a trailing backslash is
-/// dropped (v1 lenient). Inside double quotes, backslash escapes only
-/// `$`, `"` and `\` (POSIX); elsewhere it stays literal. An unterminated
-/// quote runs to the end of the line (v1 is lenient — no syntax error).
+/// Find the byte offset of the first unquoted ampersand in the line.
+/// Returns None if there is no unquoted ampersand. Quoted regions
+/// (single or double) and backslash escapes are respected.
+fn find_unquoted_amp(line: &str) -> Option<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let mut byte = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_dq {
+            if c == '"' {
+                in_dq = false;
+            } else if c == '\\' && i + 1 < chars.len() {
+                byte += c.len_utf8();
+                i += 1;
+                byte += chars[i].len_utf8();
+            }
+        } else if in_sq {
+            if c == '\'' {
+                in_sq = false;
+            }
+        } else {
+            match c {
+                '&' => return Some(byte),
+                '"' => in_dq = true,
+                '\'' => in_sq = true,
+                '\\' => {
+                    byte += c.len_utf8();
+                    i += 1;
+                    if i < chars.len() {
+                        byte += chars[i].len_utf8();
+                    }
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        byte += c.len_utf8();
+        i += 1;
+    }
+    None
+}
+
+
 fn tokenize(line: &str, last_status: u8, env: &[(String, String)]) -> Vec<Tok> {
     let chars: Vec<char> = line.chars().collect();
     let mut toks: Vec<Tok> = Vec::new();
