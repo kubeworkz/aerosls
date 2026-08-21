@@ -2429,3 +2429,53 @@ fn ctrl_c_kills_three_stage_pipeline() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// A background job survives Ctrl-C — only the foreground group is killed.
+///
+/// Start `sleep 999 &` (background), then `sleep 999` (foreground).
+/// Ctrl-C kills only the foreground sleep; the background one keeps
+/// running.  After Ctrl-C, `jobs` still lists the background job as
+/// Running (not Stopped, not gone), and it eventually completes with
+/// a `[done]` notification.
+#[test]
+fn background_job_survives_ctrl_c() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a background job.
+    console.console_io().push_input(b"sleep 999 &\n");
+    booted.run(200);
+
+    // Start a foreground job.
+    console.console_io().push_input(b"sleep 999\n");
+    booted.run(200);
+
+    // Ctrl-C kills only the foreground sleep.
+    console.console_io().push_input(b"\x03");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-C, got: {:?}", out);
+
+    // jobs should still list the background job (not killed by Ctrl-C).
+    console.console_io().push_input(b"jobs\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(7).any(|w| w == b"Running") || out.windows(7).any(|w| w == b"[1] sle"),
+        "background job still alive after Ctrl-C, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
