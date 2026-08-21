@@ -2327,7 +2327,7 @@ fn mount_comps(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fileobj::{TIOCGWINSZ, TIOCSWINSZ, TIOCSCTTY, WinSize};
+    use crate::fileobj::{TIOCGWINSZ, TIOCSWINSZ, TIOCSCTTY, TCSETS, TCGETS, Termios, ECHO, ISIG, ICANON, ICRNL, WinSize};
 
     #[test]
     fn rights_of_access_modes() {
@@ -3166,6 +3166,144 @@ mod tests {
         assert!(res.readfds.contains(fd));
     }
 
+
+    // -- line discipline tests (cooked mode via TCSETS) ------------------------
+
+    #[test]
+    fn pty_cooked_echo_returns_chars_to_master() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Switch to cooked mode: echo + isig + icrnl.
+        let cooked = Termios {
+            iflag: ICRNL,
+            oflag: 0,
+            lflag: ECHO | ISIG | ICANON,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13],
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Write 'a' to the master (simulating user typing).
+        v.write(0, master, b"a").unwrap();
+        // Echo: 'a' should appear in the master's read buffer.
+        let mut buf = [0u8; 8];
+        let n = v.read(0, master, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'a');
+        // Data: 'a' should also be in the slave's read buffer.
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'a');
+    }
+
+    #[test]
+    fn pty_cooked_isig_intercepts_ctrl_c() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        // Cooked mode with isig enabled.
+        let cooked = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ECHO | ISIG,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13], // INTR = 3 (Ctrl-C)
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Write Ctrl-C (0x03) to the master.
+        v.write(0, master, b"\x03").unwrap();
+        // Echo: should see "^C" in the master buffer.
+        let mut buf = [0u8; 8];
+        let n = v.read(0, master, &mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"^C");
+    }
+
+    #[test]
+    fn pty_cooked_isig_intercepts_ctrl_z() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        let cooked = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ECHO | ISIG,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13], // SUSP = 26 (Ctrl-Z)
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Write Ctrl-Z (0x1a = 26) to the master.
+        v.write(0, master, b"\x1a").unwrap();
+        let mut buf = [0u8; 8];
+        let n = v.read(0, master, &mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"^Z");
+    }
+
+    #[test]
+    fn pty_cooked_icrnl_translates_cr_to_nl() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        let cooked = Termios {
+            iflag: ICRNL,
+            oflag: 0,
+            lflag: ECHO | ICANON,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13],
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Write CR (0x0d) to the master.
+        v.write(0, master, b"\r").unwrap();
+        // Echo: should see NL (\n) in the master buffer.
+        let mut buf = [0u8; 8];
+        let n = v.read(0, master, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'\n');
+        // Slave also gets NL.
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'\n');
+    }
+
+    #[test]
+    fn pty_raw_mode_no_echo() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Default is raw mode (no echo). Write 'x' to master.
+        v.write(0, master, b"x").unwrap();
+        // No echo: master read buffer should be empty.
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, master, &mut buf), Err(Errno::EAgain));
+        // Data still reaches the slave.
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'x');
+    }
+
+    #[test]
+    fn pty_tcgets_returns_current_termios() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        // Set a known termios.
+        let custom = Termios {
+            iflag: ICRNL,
+            oflag: 0,
+            lflag: ECHO | ISIG,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13],
+        };
+        let mut arg = [0u8; 36];
+        custom.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Read it back with TCGETS.
+        let mut out = [0u8; 36];
+        v.ioctl(0, master, TCGETS, &mut out).unwrap();
+        let read_back = Termios::decode(&out).unwrap();
+        assert_eq!(read_back.iflag, ICRNL);
+        assert!(read_back.echo());
+        assert!(read_back.isig());
+        assert!(!read_back.canonical()); // ICANON was not set
+    }
 
     /// Kernelless stand-ins for unit tests that don't touch the device.
     mod dummy {
