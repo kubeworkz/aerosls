@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::sockops::SocketOps;
-use aerosls_vfs::{BufferAlloc, Errno, PollFd, SelectFdSet, SelectResult, Vfs, CLONE_FILES, O_RDONLY};
+use aerosls_vfs::{BufferAlloc, Errno, PollFd, SelectFdSet, SelectResult, TIOCSCTTY, Vfs, CLONE_FILES, O_RDONLY};
 
 // ── Signals ────────────────────────────────────────────────────────────────
 
@@ -1089,6 +1089,55 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// Set or clear the `cloexec` flag on an fd.
     pub fn set_cloexec(&mut self, fd: u32, cloexec: bool) -> Result<(), Errno> {
         self.pm.vfs.set_cloexec(self.task, fd, cloexec)
+    }
+
+    /// `setsid()`: create a new session. The calling task becomes the
+    /// session leader.
+    pub fn setsid(&mut self) -> Result<u32, Errno> {
+        self.pm.vfs.setsid(self.task)
+    }
+
+    /// `forkpty()`: create a child process connected to a new PTY pair.
+    /// The child gets a new session (setsid), its stdin/stdout/stderr
+    /// wired to the PTY slave, and the PTY as its controlling terminal.
+    /// Returns `(child_id, master_fd)` in the parent. The child is
+    /// queued but not yet scheduled.
+    pub fn forkpty(&mut self) -> Result<(u32, u32), Errno> {
+        // 1. Create the PTY pair on the parent's fd table.
+        let (master_fd, slave_fd) = self.pm.vfs.openpty(self.task)?;
+        // 2. Fork a child (copies parent's fd table, including the PTY fds).
+        let child = self.fork()?;
+        // 3. In the child: new session, wire stdin/stdout/stderr to slave,
+        //    set controlling terminal, close extras.
+        {
+            // setsid — child becomes session leader.
+            self.pm.vfs.setsid(child)?;
+            // dup2 slave to fd 0, 1, 2.
+            let slave_clone = self.pm.vfs.dup(child, slave_fd)?;
+            if slave_clone != 0 {
+                self.pm.vfs.dup2(child, slave_clone, 0)?;
+                self.pm.vfs.close(child, slave_clone)?;
+            }
+            let slave_clone2 = self.pm.vfs.dup(child, 0)?;
+            if slave_clone2 != 1 {
+                self.pm.vfs.dup2(child, slave_clone2, 1)?;
+                self.pm.vfs.close(child, slave_clone2)?;
+            }
+            let slave_clone3 = self.pm.vfs.dup(child, 0)?;
+            if slave_clone3 != 2 {
+                self.pm.vfs.dup2(child, slave_clone3, 2)?;
+                self.pm.vfs.close(child, slave_clone3)?;
+            }
+            // Close the original slave and master fds in the child.
+            self.pm.vfs.close(child, slave_fd)?;
+            self.pm.vfs.close(child, master_fd)?;
+            // TIOCSCTTY: set controlling terminal (arg = pgid 0 = session).
+            let mut arg = [0u8; 4];
+            self.pm.vfs.ioctl(child, 0, TIOCSCTTY, &mut arg)?;
+        }
+        // 4. In the parent: close the slave fd (parent uses the master).
+        self.pm.vfs.close(self.task, slave_fd)?;
+        Ok((child, master_fd))
     }
 
     /// The calling task's argument vector (set by `exec` or the spawner).

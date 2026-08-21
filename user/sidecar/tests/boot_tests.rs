@@ -2566,6 +2566,7 @@ fn ctrl_c_kills_init_script_line() {
 
     client.kill_driver(0);
     t.join().unwrap();
+}
 
 /// Verify the shell still boots and runs commands after the PTY code was
 /// added. The PTY itself is tested by VFS unit tests; this boot test
@@ -2600,4 +2601,32 @@ fn shell_works_after_pty_addition() {
     t.join().unwrap();
 }
 
+#[test]
+fn forkpty_child_writes_to_master() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/forkpty_test\n", 0o644);
+    b.add_file("/bin/forkpty_test", b"forkpty_test\n", 0o755);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    // init runs forkpty_test from the rc script.
+    booted.run(200);
+    let out = console.console_io().output();
+    // The applet writes "master=N\n" (parent) and the child writes
+    // "child-ok\n" to the PTY slave. The parent reads from master and
+    // writes it to stdout via write_blocking.
+    assert!(out.windows(7).any(|w| w == b"master="),
+        "forkpty_test wrote master fd, got: {:?}", out);
+    assert!(out.windows(8).any(|w| w == b"child-ok"),
+        "child wrote through PTY, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
 }

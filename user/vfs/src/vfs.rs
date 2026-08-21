@@ -866,6 +866,8 @@ struct Task {
     cwd: String,
     euid: u16,
     egid: u16,
+    /// Session ID: 0 = inherited from parent, nonzero = session leader.
+    session_id: u32,
 }
 
 // ── the VFS ─────────────────────────────────────────────────────────────────
@@ -989,6 +991,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 cwd: String::from("/"),
                 euid: 0,
                 egid: 0,
+                session_id: 0,
             }],
             waiters: Vec::new(),
             net_k: None,
@@ -1178,6 +1181,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             cwd: String::from("/"),
             euid: 0,
             egid: 0,
+            session_id: 0,
         });
         Ok(id)
     }
@@ -1216,6 +1220,15 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     /// Return the current working directory for a task.
     pub fn get_cwd(&self, task: u32) -> Result<&str, Errno> {
         Ok(&self.task(task)?.cwd)
+    }
+
+    /// `setsid()`: create a new session. The calling task becomes the
+    /// session leader (`session_id` = its own task id). Returns the new
+    /// session id.
+    pub fn setsid(&mut self, task: u32) -> Result<u32, Errno> {
+        let t = self.task_mut(task)?;
+        t.session_id = task;
+        Ok(task)
     }
 
     // ── the syscall surface ────────────────────────────────────────────────
@@ -2193,6 +2206,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             cwd,
             euid,
             egid,
+            session_id: 0,
         });
         Ok(id)
     }
@@ -3002,6 +3016,39 @@ mod tests {
         assert_eq!(fds[0].revents, POLLIN);
     }
 
+
+    // -- setsid tests -----------------------------------------------------------
+
+    #[test]
+    fn setsid_returns_task_as_session_id() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let sid = v.setsid(0).unwrap();
+        assert_eq!(sid, 0); // task 0 becomes session leader
+    }
+
+    #[test]
+    fn pty_fork_building_blocks() {
+        // Exercises the VFS primitives that forkpty() orchestrates:
+        // openpty + dup2 + ioctl TIOCSCTTY + setsid.
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        // 1. Create a PTY pair.
+        let (master, slave) = v.openpty(0).unwrap();
+        assert_ne!(master, slave);
+        // 2. dup2 slave to a high fd (fd 10) to simulate wiring stdin.
+        let target = v.dup2(0, slave, 10).unwrap();
+        assert_eq!(target, 10);
+        // 3. Write to the master, read from fd 10 (the slave copy).
+        v.write(0, master, b"hello").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, 10, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        // 4. setsid creates a session.
+        let sid = v.setsid(0).unwrap();
+        assert_eq!(sid, 0);
+        // 5. TIOCSCTTY sets the controlling terminal (stub, no-op but must not fail).
+        let mut arg = [0u8; 4];
+        v.ioctl(0, 10, crate::fileobj::TIOCSCTTY, &mut arg).unwrap();
+    }
 
     // -- select tests -----------------------------------------------------------
 

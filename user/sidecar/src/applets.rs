@@ -3969,6 +3969,58 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
+/// `forkpty_test`: exercises `ctx.forkpty()`. Forks a child on a PTY,
+/// the child writes "child-ok" to its stdout (the PTY slave), the parent
+/// reads from the master. Writes "master=N" where N is the master fd.
+pub fn forkpty_test<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if is_child(&ctx.data) {
+        // Child: we are connected to a PTY slave as fd 0/1/2.
+        let _ = ctx.write_blocking(1, b"child-ok\n");
+        return ctx.exit(0);
+    }
+    // Parent phases: 0 = fork+wait, 1 = read master + done.
+    if ctx.data.is_empty() {
+        ctx.data.push(0); // phase byte
+    }
+    match ctx.data[0] {
+        0 => {
+            let (child, master_fd) = match ctx.forkpty() {
+                Ok(r) => r,
+                Err(_) => return Step::Exit(1),
+            };
+            let msg = alloc::format!("master={}\n", master_fd);
+            let _ = ctx.write_blocking(1, msg.as_bytes());
+            // Save master_fd (2 bytes LE) after the phase byte.
+            ctx.data.push((master_fd & 0xFF) as u8);
+            ctx.data.push(((master_fd >> 8) & 0xFF) as u8);
+            ctx.data[0] = 1;
+            ctx.wait(child);
+            match ctx.pm.wait(ctx.task, child) {
+                aerosls_procmgr::WaitOutcome::Reaped(_) => {
+                    // Child already exited; read immediately.
+                }
+                _ => return aerosls_procmgr::Step::Blocked(
+                    aerosls_procmgr::BlockReason::WaitingChild(child),
+                ),
+            }
+            // Fall through to phase 1.
+            1
+        }
+        1 => 1,
+        _ => return Step::Exit(1),
+    };
+    // Phase 1: read from master.
+    let master_fd = ctx.data[1] as u32 | ((ctx.data[2] as u32) << 8);
+    let task = ctx.task;
+    let mut buf = [0u8; 64];
+    if let Ok(n) = ctx.vfs().read(task, master_fd, &mut buf) {
+        if n > 0 {
+            let _ = ctx.write_blocking(1, &buf[..n]);
+        }
+    }
+    Step::Done
+}
+
 /// Install the system applets into a proc manager (called by `boot()`).
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
@@ -3990,6 +4042,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("false", do_false);
     pm.register_applet("sleep", sleep);
     pm.register_applet("timeout", timeout);
+    pm.register_applet("forkpty_test", forkpty_test);
 }
 
 #[cfg(test)]
