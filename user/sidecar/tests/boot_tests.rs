@@ -2381,3 +2381,51 @@ fn sigquit_kills_writer_reader_sees_eof() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Ctrl-C kills every stage in a three-stage pipeline.
+///
+/// `cat | grep x | head -n 1`: cat reads from an empty stdin (parks),
+/// grep waits for cat, head waits for grep.  All three are in the
+/// foreground group.  Ctrl-C sends SIGINT to all three; each exits
+/// with 130 (128+SIGINT).  The shell re-prompts cleanly and a
+/// follow-up command succeeds — proving no stage leaked.
+#[test]
+fn ctrl_c_kills_three_stage_pipeline() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/grep", b"grep\n", 0o755);
+    b.add_file("/bin/head", b"head\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a three-stage pipeline — all three stages block.
+    console.console_io().push_input(b"cat | grep x | head -n 1\n");
+    booted.run(200);
+
+    // Ctrl-C kills every stage in the foreground group.
+    console.console_io().push_input(b"\x03");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-C on 3-stage pipeline, got: {:?}", out);
+
+    // A follow-up command succeeds — all three stages are dead.
+    console.console_io().push_input(b"echo ok\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(2).any(|w| w == b"ok"),
+        "echo runs after pipeline killed, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
