@@ -54,6 +54,8 @@ pub enum Errno {
     EAddrInuse,
     /// Cross-device link (rename across mounts).
     EXDev,
+    /// Address family not supported.
+    EAfNoSupport,
 }
 
 impl Errno {
@@ -82,6 +84,7 @@ impl Errno {
             Errno::ENotty => 25,
             Errno::EAddrInuse => 98,
             Errno::EXDev => 18,
+            Errno::EAfNoSupport => 97,
         }
     }
 }

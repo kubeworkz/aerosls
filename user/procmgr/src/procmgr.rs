@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::sockops::SocketOps;
-use aerosls_vfs::{BufferAlloc, Errno, PollFd, SelectFdSet, SelectResult, TIOCSCTTY, Vfs, CLONE_FILES, O_RDONLY};
+use aerosls_vfs::{BufferAlloc, Errno, PollFd, SelectFdSet, SelectResult, TIOCSCTTY, Vfs, CLONE_FILES, O_RDONLY, AF_UNIX};
 
 // ── Signals ────────────────────────────────────────────────────────────────
 
@@ -1244,6 +1244,50 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// Get a socket option (delegates to the network driver).
     pub fn getsockopt(&mut self, id: u32, level: u32, optname: u32, optval: &mut [u8]) -> Result<usize, u16> {
         self.pm.net.as_mut().ok_or(0u16)?.getsockopt(id, level, optname, optval)
+    }
+
+    // ── Unix domain sockets (AF_UNIX) ─────────────────────────────────────
+
+    /// Create a socket (POSIX-compatible entry point).
+    /// `domain`=AF_UNIX(1), `sock_type`=SOCK_STREAM(1) or SOCK_DGRAM(2).
+    pub fn socket(&mut self, domain: u16, sock_type: u16) -> Result<u32, Errno> {
+        if domain == AF_UNIX {
+            self.pm.vfs.unix_socket(self.task)
+        } else {
+            Err(Errno::EAfNoSupport)
+        }
+    }
+
+    /// Create a Unix domain socket. Returns the fd.
+    pub fn unix_socket(&mut self) -> Result<u32, Errno> {
+        self.pm.vfs.unix_socket(self.task)
+    }
+
+    /// Bind a Unix socket to a filesystem path.
+    pub fn unix_bind(&mut self, fd: u32, path: &str) -> Result<(), Errno> {
+        self.pm.vfs.unix_bind(self.task, fd, path)
+    }
+
+    /// Transition a bound Unix socket to listening.
+    pub fn unix_listen(&mut self, fd: u32) -> Result<(), Errno> {
+        self.pm.vfs.unix_listen(self.task, fd)
+    }
+
+    /// Accept a pending connection on a listening Unix socket.
+    /// Returns a new fd for the connected peer.
+    pub fn unix_accept(&mut self, fd: u32) -> Result<u32, Errno> {
+        self.pm.vfs.unix_accept(self.task, fd)
+    }
+
+    /// Connect a Unix socket to a path. Fails with `ENoent` if no
+    /// socket is listening at `path`.
+    pub fn unix_connect(&mut self, fd: u32, path: &str) -> Result<(), Errno> {
+        self.pm.vfs.unix_connect(self.task, fd, path)
+    }
+
+    /// Remove a Unix socket path from the namespace.
+    pub fn unix_unlink(&mut self, path: &str) {
+        self.pm.vfs.unix_unlink(path)
     }
 
     // ── Signals ──────────────────────────────────────────────────────────
