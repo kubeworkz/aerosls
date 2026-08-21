@@ -2334,3 +2334,50 @@ fn ctrlquit_kills_foreground_pipeline() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// SIGQUIT kills the writer in a pipeline; the reader sees EOF and exits.
+///
+/// `sleep 999 | head -n 1`: head is the reader parked on `Readable(fd)`,
+/// sleep is the writer producing nothing.  We send SIGQUIT which kills
+/// the entire foreground group (both sleep and head).  The shell
+/// re-prompts cleanly — proving both stages were terminated and the
+/// pipe fd cleanup didn't leave the reader wedged.
+#[test]
+fn sigquit_kills_writer_reader_sees_eof() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/head", b"head\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a pipeline where the reader (head) blocks on an empty pipe.
+    console.console_io().push_input(b"sleep 999 | head -n 1\n");
+    booted.run(200);
+
+    // Ctrl-\ kills the entire foreground group (sleep + head).
+    console.console_io().push_input(b"\x1c");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-\\ on pipeline, got: {:?}", out);
+
+    // A second command should execute cleanly — both stages are dead.
+    console.console_io().push_input(b"echo ok\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(2).any(|w| w == b"ok"),
+        "echo runs after pipeline killed, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
