@@ -43,7 +43,7 @@ use crate::aerofs::{
     Superblock, SuperblockRecord, DIRENT_SIZE, NDIRECT, S_IFDIR,
 };
 use crate::errno::{DirEnt, Errno, Stat};
-use crate::fileobj::{CharNode, FileObj, PipeNode, PIPE_CAP};
+use crate::fileobj::{CharNode, FileObj, PipeNode, PtyState, PIPE_CAP};
 use crate::ramfs::RamFs;
 
 /// Block size in bytes (a const for const-context array sizes).
@@ -275,6 +275,10 @@ pub struct DevFs {
     names: BTreeMap<String, u64>,
     nodes: BTreeMap<u64, DevEntry>,
     next_ino: u64,
+    /// PTY slave devices: name -> FileObj::PtySlave.  These bypass
+    /// the DevEntry layer because they need PtyState access, not
+    /// CharNode dispatch.
+    pty_slaves: BTreeMap<String, Arc<FileObj>>,
 }
 
 struct DevEntry {
@@ -292,6 +296,7 @@ impl DevFs {
             names: BTreeMap::new(),
             nodes: BTreeMap::new(),
             next_ino: DEV_ROOT + 1,
+            pty_slaves: BTreeMap::new(),
         }
     }
 
@@ -316,9 +321,33 @@ impl DevFs {
         Ok(())
     }
 
+    /// Register a PTY slave device.  Unlike `add`, this stores the
+    /// FileObj::PtySlave directly so open_dev returns it without
+    /// wrapping in a CharNode.
+    pub fn add_pty_slave(&mut self, name: &str, obj: Arc<FileObj>) -> Result<(), Errno> {
+        if name.is_empty() || name.contains('/') {
+            return Err(Errno::EInval);
+        }
+        if self.pty_slaves.contains_key(name) || self.names.contains_key(name) {
+            return Err(Errno::EExist);
+        }
+        self.pty_slaves.insert(name.to_string(), obj);
+        Ok(())
+    }
+
     /// The node an entry names (fd minting: `open("/dev/console")`).
     fn open_dev(&self, ino: u64) -> Result<Arc<FileObj>, Errno> {
         self.nodes.get(&ino).map(|e| e.obj.clone()).ok_or(Errno::ENoent)
+    }
+
+    /// Look up a PTY slave by name (e.g. "pts_0").
+    pub fn open_pty_slave(&self, name: &str) -> Result<Arc<FileObj>, Errno> {
+        self.pty_slaves.get(name).cloned().ok_or(Errno::ENoent)
+    }
+
+    /// Whether a name is a PTY slave device (for Vfs::open to dispatch).
+    pub fn is_pty_slave(&self, name: &str) -> bool {
+        self.pty_slaves.contains_key(name)
     }
 
     fn lookup(&self, comps: &[&str]) -> Result<(u64, FileType), Errno> {
@@ -693,6 +722,16 @@ impl FdEntry {
         match &*self.node {
             FileObj::PipeRead(p) => p.bump_readers(1),
             FileObj::PipeWrite(p) => p.bump_writers(1),
+            // PTY fds are bidirectional: a single fd is both read and
+            // write end (unlike pipes which are unidirectional).
+            FileObj::PtyMaster(p) => {
+                p.bump_master_readers(1);
+                p.bump_master_writers(1);
+            }
+            FileObj::PtySlave(p) => {
+                p.bump_slave_readers(1);
+                p.bump_slave_writers(1);
+            }
             _ => {}
         }
     }
@@ -703,6 +742,14 @@ impl FdEntry {
         match &*self.node {
             FileObj::PipeRead(p) => p.bump_readers(-1),
             FileObj::PipeWrite(p) => p.bump_writers(-1),
+            FileObj::PtyMaster(p) => {
+                p.bump_master_readers(-1);
+                p.bump_master_writers(-1);
+            }
+            FileObj::PtySlave(p) => {
+                p.bump_slave_readers(-1);
+                p.bump_slave_writers(-1);
+            }
             _ => {}
         }
     }
@@ -749,6 +796,46 @@ struct Task {
 
 
 
+// -- PTY multiplexer ---------------------------------------------------------
+
+/// The PTY multiplexer: tracks /dev/ptmx and the /dev/pts_N device tree.
+/// Each open of /dev/ptmx creates a new PTY pair; the slave is registered
+/// at /dev/pts_N in the devfs.
+pub struct PtyMultiplexer {
+    next_pts: u32,
+    /// All live PTY pairs, keyed by slave number.
+    pairs: alloc::collections::BTreeMap<u32, Arc<PtyState>>,
+}
+
+impl PtyMultiplexer {
+    pub fn new() -> PtyMultiplexer {
+        PtyMultiplexer {
+            next_pts: 0,
+            pairs: alloc::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Allocate a new PTY pair and return its slave number.
+    pub fn allocate(&mut self) -> u32 {
+        let n = self.next_pts;
+        self.next_pts += 1;
+        let pty = Arc::new(PtyState::new());
+        self.pairs.insert(n, pty);
+        n
+    }
+
+    /// The PtyState for a slave number.
+    pub fn get(&self, n: u32) -> Option<Arc<PtyState>> {
+        self.pairs.get(&n).cloned()
+    }
+}
+
+impl Default for PtyMultiplexer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Vfs<K: Kernel, A: BufferAlloc> {
     fss: Vec<Fs<K, A>>,
     mounts: Vec<Mount>,
@@ -773,6 +860,8 @@ pub struct Vfs<K: Kernel, A: BufferAlloc> {
     net_alloc: Option<alloc::sync::Arc<core::cell::RefCell<A>>>,
     /// The console node, kept alive for Ctrl-C detection in drain_wakes.
     console_node: Option<Arc<CharNode>>,
+    /// PTY multiplexer (allocated when /dev/ptmx is first opened).
+    pty_mux: Option<PtyMultiplexer>,
 }
 
 /// A parked reader. `ready()` is the *only* wake condition — it is
@@ -802,6 +891,8 @@ impl Waiter {
             // Sockets: not yet wired for readiness polling — the driver
             // handles backpressure. Always report ready so a stray
             // registration doesn't wedge the task.
+            FileObj::PtyMaster(p) => p.master_has_data() || p.slave_writers.get() == 0,
+            FileObj::PtySlave(p) => p.slave_has_data() || p.master_writers.get() == 0,
             FileObj::Socket(_) => true,
             // Nothing else can be blocked on (the wait_* validators
             // reject them).
@@ -827,6 +918,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             net_k: None,
             net_alloc: None,
             console_node: None,
+            pty_mux: None,
         }
     }
 
@@ -911,7 +1003,19 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     /// Add a device node to an existing devfs mount (drivers register their
     /// channels here). `path` names the mount (e.g. `/dev`).
+    /// Register a PTY slave in the devfs at /dev. The slave is a
+    /// FileObj::PtySlave stored directly (not wrapped in CharNode).
+    pub fn add_pty_slave_dev(&mut self, name: &str, obj: Arc<FileObj>) -> Result<(), Errno> {
+        let full = crate::aerofs::normalize_path("/dev");
+        let (fs_idx, _rel) = self.resolve(&full)?;
+        match self.fss.get_mut(fs_idx) {
+            Some(Fs::Dev(d)) => d.add_pty_slave(name, obj),
+            _ => Err(Errno::EInval),
+        }
+    }
+
     pub fn add_dev_node(
+
         &mut self,
         path: &str,
         name: &str,
@@ -1083,6 +1187,34 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 fs.stat(ino)?
             };
             self.check_open_perms(want, st, task)?;
+            // Check if this is ptmx (by ino identity: we detect it by name).
+            let is_ptmx = rel.last().map_or(false, |n| *n == "ptmx");
+            if is_ptmx && self.pty_mux.is_some() {
+                // Lazy-init multiplexer if not already done.
+            }
+            if is_ptmx {
+                let (master_fd, _slave_fd) = self.openpty(task)?;
+                return Ok(master_fd);
+            }
+            // Check if this is a PTY slave device.
+            if let Some(name) = rel.last() {
+                let fs = self.fss.get(fs_idx);
+                if let Some(Fs::Dev(d)) = fs {
+                    if d.is_pty_slave(name) {
+                        let obj = d.open_pty_slave(name)?;
+                        let fd = {
+                            let idx = self.task_mut(task)?.fds;
+                            self.table_pool[idx].alloc(FdEntry {
+                                node: obj,
+                                rights: want,
+                                flags,
+                                cloexec: false,
+                            })?
+                        };
+                        return Ok(fd);
+                    }
+                }
+            }
             let obj = {
                 let fs = self.fs_mut(fs_idx)?;
                 fs.open_dev(ino)?
@@ -1219,6 +1351,94 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         })
     }
 
+    // -- PTY methods -----------------------------------------------------------
+
+    /// Create a pseudo-terminal pair: master + slave.  Returns the
+    /// (master_fd, slave_fd) pair.  The slave is registered in the
+    /// devfs at /dev/pts_N.  The multiplexer is lazily created.
+    pub fn openpty(&mut self, task: u32) -> Result<(u32, u32), Errno> {
+        // Lazily create the multiplexer.
+        if self.pty_mux.is_none() {
+            self.pty_mux = Some(PtyMultiplexer::new());
+        }
+        let pts_num = self.pty_mux.as_mut().unwrap().allocate();
+        let pty = self.pty_mux.as_ref().unwrap().get(pts_num).ok_or(Errno::EIo)?;
+        // Register slave in devfs at /dev/pts_N.
+        let slave_name = alloc::format!("pts_{}", pts_num);
+        // Best-effort: register in devfs if /dev is mounted (tests may not have it).
+        let _ = self.add_pty_slave_dev(&slave_name, Arc::new(FileObj::PtySlave(pty.clone())));
+        // Mint master fd.
+        let master_fd = {
+            let idx = self.task_mut(task)?.fds;
+            self.table_pool[idx].alloc(FdEntry {
+                node: Arc::new(FileObj::PtyMaster(pty.clone())),
+                rights: R | W,
+                flags: 0,
+                cloexec: false,
+            })?
+        };
+        // Mint slave fd.
+        let slave_fd = {
+            let idx = self.task_mut(task)?.fds;
+            self.table_pool[idx].alloc(FdEntry {
+                node: Arc::new(FileObj::PtySlave(pty)),
+                rights: R | W,
+                flags: 0,
+                cloexec: false,
+            })?
+        };
+        // Bump end counts for both fds.
+        {
+            let idx = self.task_mut(task)?.fds;
+            let me = self.table_pool[idx].get(master_fd).unwrap();
+            me.note_added();
+            let se = self.table_pool[idx].get(slave_fd).unwrap();
+            se.note_added();
+        }
+        Ok((master_fd, slave_fd))
+    }
+
+    /// ioctl on a PTY fd.  Currently supports TIOCGWINSZ, TIOCSWINSZ,
+    /// and TIOCSCTTY.  Returns ENOTTY for unsupported requests.
+    pub fn ioctl(&self, task: u32, fd: u32, request: u32,
+                 arg: &mut [u8]) -> Result<(), Errno> {
+        let idx = self.tasks.get(task as usize).ok_or(Errno::EInval)?.fds;
+        let e = self.table_pool.get(idx).ok_or(Errno::EInval)?
+            .get(fd).ok_or(Errno::EBadf)?;
+        match &*e.node {
+            FileObj::PtyMaster(p) | FileObj::PtySlave(p) => {
+                match request {
+                    crate::fileobj::TIOCGWINSZ => {
+                        if arg.len() < 8 { return Err(Errno::EInval); }
+                        let ws = p.win_size.get();
+                        arg[0..2].copy_from_slice(&ws.cols.to_le_bytes());
+                        arg[2..4].copy_from_slice(&ws.rows.to_le_bytes());
+                        arg[4..6].copy_from_slice(&ws.xpixel.to_le_bytes());
+                        arg[6..8].copy_from_slice(&ws.ypixel.to_le_bytes());
+                        Ok(())
+                    }
+                    crate::fileobj::TIOCSWINSZ => {
+                        if arg.len() < 8 { return Err(Errno::EInval); }
+                        let ws = crate::fileobj::WinSize {
+                            cols: u16::from_le_bytes([arg[0], arg[1]]),
+                            rows: u16::from_le_bytes([arg[2], arg[3]]),
+                            xpixel: u16::from_le_bytes([arg[4], arg[5]]),
+                            ypixel: u16::from_le_bytes([arg[6], arg[7]]),
+                        };
+                        p.win_size.set(ws);
+                        Ok(())
+                    }
+                    crate::fileobj::TIOCSCTTY => {
+                        // v1 stub: no controlling terminal tracking yet.
+                        Ok(())
+                    }
+                    _ => Err(Errno::ENotty),
+                }
+            }
+            _ => Err(Errno::ENotty),
+        }
+    }
+
     /// The sock_id stored in an fd (observability helper for socket
     /// operations at the `Ctx` level).
     pub fn fd_sock_id(&self, task: u32, fd: u32) -> Option<u32> {
@@ -1266,7 +1486,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let idx = self.task_mut(task)?.fds;
         let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
         match &*e.node {
-            FileObj::PipeRead(_) | FileObj::Char(_) | FileObj::Socket(_) => {
+            FileObj::PipeRead(_) | FileObj::Char(_) | FileObj::Socket(_)
+            | FileObj::PtyMaster(_) | FileObj::PtySlave(_) => {
                 // A task parks on one thing at a time; replace any prior
                 // registration (bounded by the number of tasks).
                 self.waiters.retain(|w| w.task != task);
@@ -1293,7 +1514,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let idx = self.task_mut(task)?.fds;
         let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
         match &*e.node {
-            FileObj::PipeWrite(_) | FileObj::Socket(_) => {
+            FileObj::PipeWrite(_) | FileObj::Socket(_)
+            | FileObj::PtyMaster(_) | FileObj::PtySlave(_) => {
                 // A task parks on one thing at a time; replace any prior
                 // registration (bounded by the number of tasks).
                 self.waiters.retain(|w| w.task != task);
@@ -1312,13 +1534,15 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     /// every scheduler step (and by an event-loop driver when external
     /// input arrives between runs).
     pub fn take_woken_readers(&mut self) -> Vec<u32> {
-        self.take_woken(|w| matches!(&*w.obj, FileObj::PipeRead(_) | FileObj::Char(_)))
+        self.take_woken(|w| matches!(&*w.obj, FileObj::PipeRead(_) | FileObj::Char(_)
+            | FileObj::PtyMaster(_) | FileObj::PtySlave(_)))
     }
 
     /// Drain the write-waits whose object is ready (pipe space freed by a
     /// reader, or the last reader gone) and return the tasks to wake.
     pub fn take_woken_writers(&mut self) -> Vec<u32> {
-        self.take_woken(|w| matches!(&*w.obj, FileObj::PipeWrite(_)))
+        self.take_woken(|w| matches!(&*w.obj, FileObj::PipeWrite(_)
+            | FileObj::PtyMaster(_) | FileObj::PtySlave(_)))
     }
 
     /// Check if the console input buffer contains a specific byte.
@@ -1479,8 +1703,9 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             // A write-only pipe end: the rights check above already
             // refused; this arm is defensive.
             FileObj::PipeWrite(_) => Err(Errno::EBadf),
-            // Socket read is handled at the Ctx level (net_client).
-            FileObj::Socket(_) => Err(Errno::EInval),
+            FileObj::PtyMaster(p) => p.master_read(buf),
+            FileObj::PtySlave(p) => p.slave_read(buf),
+            FileObj::Socket(_) => Err(Errno::EBadf),
         }
     }
 
@@ -1514,8 +1739,9 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             FileObj::PipeWrite(p) => p.write(buf),
             FileObj::Char(c) => c.write(buf),
             FileObj::PipeRead(_) => Err(Errno::EBadf),
-            // Socket write is handled at the Ctx level (net_client).
-            FileObj::Socket(_) => Err(Errno::EInval),
+            FileObj::PtyMaster(p) => p.master_write(buf),
+            FileObj::PtySlave(p) => p.slave_write(buf),
+            FileObj::Socket(_) => Err(Errno::EBadf),
         }
     }
 
@@ -1526,7 +1752,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             e.node.clone()
         };
         let FileObj::File(node) = &*obj else {
-            // Pipes and devices are not seekable.
+            // Pipes, devices, sockets, and PTYs are not seekable.
             return Err(Errno::ESPipe);
         };
         // Every whence touches the device: lseek on a dead device fails
@@ -1574,6 +1800,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             }
             FileObj::PipeRead(p) | FileObj::PipeWrite(p) => Ok(p.stat()),
             FileObj::Char(c) => Ok(c.stat()),
+            FileObj::PtyMaster(p) | FileObj::PtySlave(p) => Ok(p.stat()),
             FileObj::Socket(_) => Ok(Stat {
                 mode: 0o140000, // S_IFSOCK
                 uid: 0,
@@ -1756,9 +1983,30 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                     _ => {}
                 }
             }
+            FileObj::PtyMaster(p) => {
+                if (events & POLLIN) != 0 && (p.master_has_data() || p.slave_writers.get() == 0) {
+                    revents |= POLLIN;
+                }
+                if (events & POLLOUT) != 0 && (p.master_has_space() || p.slave_readers.get() == 0) {
+                    revents |= POLLOUT;
+                }
+                if p.slave_readers.get() == 0 {
+                    revents |= POLLHUP;
+                }
+            }
+            FileObj::PtySlave(p) => {
+                if (events & POLLIN) != 0 && (p.slave_has_data() || p.master_writers.get() == 0) {
+                    revents |= POLLIN;
+                }
+                if (events & POLLOUT) != 0 && (p.slave_has_space() || p.master_readers.get() == 0) {
+                    revents |= POLLOUT;
+                }
+                if p.master_readers.get() == 0 {
+                    revents |= POLLHUP;
+                }
+            }
             FileObj::File(_) => {
-                // Regular files on a mount are always ready (no buffering
-                // backpressure for our read-only aerofs / small ramfs).
+                // Regular files on a mount are always ready.
                 if (events & POLLIN) != 0 {
                     revents |= POLLIN;
                 }
@@ -1920,6 +2168,7 @@ fn mount_comps(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fileobj::{TIOCGWINSZ, TIOCSWINSZ, TIOCSCTTY, WinSize};
 
     #[test]
     fn rights_of_access_modes() {
@@ -2469,6 +2718,143 @@ mod tests {
         let n = v.poll(0, &mut fds).unwrap();
         assert_eq!(n, 0, "POLLIN not masked for write end");
         assert_eq!(fds[0].revents, 0);
+    }
+
+
+    // -- PTY tests ---------------------------------------------------------------
+
+    #[test]
+    fn openpty_returns_master_and_slave() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        assert_ne!(master, slave);
+    }
+
+    #[test]
+    fn pty_master_write_slave_read() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Master writes -> Slave reads
+        assert_eq!(v.write(0, master, b"hello").unwrap(), 5);
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, slave, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn pty_slave_write_master_read() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Slave writes -> Master reads
+        assert_eq!(v.write(0, slave, b"world").unwrap(), 5);
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, master, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"world");
+    }
+
+    #[test]
+    fn pty_bidirectional_simultaneous() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Both directions at once
+        v.write(0, master, b"to-slave").unwrap();
+        v.write(0, slave, b"to-master").unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(v.read(0, slave, &mut buf).unwrap(), 8);
+        assert_eq!(&buf[..8], b"to-slave");
+        assert_eq!(v.read(0, master, &mut buf).unwrap(), 9);
+        assert_eq!(&buf[..9], b"to-master");
+    }
+
+    #[test]
+    fn pty_empty_read_would_block() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        let mut buf = [0u8; 4];
+        // No data written yet: would-block
+        assert_eq!(v.read(0, master, &mut buf), Err(Errno::EAgain));
+        assert_eq!(v.read(0, slave, &mut buf), Err(Errno::EAgain));
+    }
+
+    #[test]
+    fn pty_master_read_eof_when_slave_closed() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        v.close(0, slave).unwrap();
+        let mut buf = [0u8; 4];
+        // Slave gone: master reads EOF
+        assert_eq!(v.read(0, master, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn pty_slave_read_eof_when_master_closed() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        v.close(0, master).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, slave, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn pty_ioctl_tiocgwinsz() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        // Get default window size (24x80)
+        let mut buf = [0u8; 8];
+        v.ioctl(0, master, TIOCGWINSZ, &mut buf).unwrap();
+        let cols = u16::from_le_bytes([buf[0], buf[1]]);
+        let rows = u16::from_le_bytes([buf[2], buf[3]]);
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
+    }
+
+    #[test]
+    fn pty_ioctl_tiocswinsz() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        // Set window size to 50x120
+        let mut buf = [0u8; 8];
+        buf[0..2].copy_from_slice(&120u16.to_le_bytes()); // cols
+        buf[2..4].copy_from_slice(&50u16.to_le_bytes());  // rows
+        v.ioctl(0, master, TIOCSWINSZ, &mut buf).unwrap();
+        // Read it back
+        let mut buf2 = [0u8; 8];
+        v.ioctl(0, master, TIOCGWINSZ, &mut buf2).unwrap();
+        assert_eq!(u16::from_le_bytes([buf2[0], buf2[1]]), 120);
+        assert_eq!(u16::from_le_bytes([buf2[2], buf2[3]]), 50);
+    }
+
+    #[test]
+    fn pty_ioctl_enotty_for_nonpty() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        v.mount_ramfs("/tmp").unwrap();
+        let f = v.open(0, "/tmp/f", O_CREAT | O_RDWR, 0o644).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(v.ioctl(0, f, TIOCGWINSZ, &mut buf), Err(Errno::ENotty));
+    }
+
+    #[test]
+    fn pty_fstat_returns_char_device() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        let st = v.fstat(0, master).unwrap();
+        assert_eq!(st.ty, FileType::Char);
+        let st2 = v.fstat(0, slave).unwrap();
+        assert_eq!(st2.ty, FileType::Char);
+    }
+
+    #[test]
+    fn pty_poll_readiness() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // No data: not readable
+        let mut fds = vec![PollFd::new(master, POLLIN)];
+        assert_eq!(v.poll(0, &mut fds).unwrap(), 0);
+        // Write from slave: master becomes readable
+        v.write(0, slave, b"x").unwrap();
+        let mut fds = vec![PollFd::new(master, POLLIN)];
+        assert_eq!(v.poll(0, &mut fds).unwrap(), 1);
+        assert_eq!(fds[0].revents, POLLIN);
     }
 
 

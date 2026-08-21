@@ -48,6 +48,8 @@ pub enum Errno {
     EPipe,
     /// No such process (used by signal delivery to a nonexistent task).
     ESRCH,
+    /// Inappropriate ioctl for device.
+    ENotty,
 }
 
 impl Errno {
@@ -73,6 +75,7 @@ impl Errno {
             Errno::ESPipe => 29,
             Errno::EPipe => 32,
             Errno::ESRCH => 3,
+            Errno::ENotty => 25,
         }
     }
 }

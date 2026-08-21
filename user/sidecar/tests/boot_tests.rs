@@ -2566,4 +2566,38 @@ fn ctrl_c_kills_init_script_line() {
 
     client.kill_driver(0);
     t.join().unwrap();
+
+/// Verify the shell still boots and runs commands after the PTY code was
+/// added. The PTY itself is tested by VFS unit tests; this boot test
+/// ensures the integration didn't break the existing stack.
+#[test]
+fn shell_works_after_pty_addition() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    booted.run(100);
+    assert_eq!(console.console_io().output(), b"$ ", "shell prompt");
+
+    // Run echo through the shell
+    console.console_io().push_input(b"echo pty-ok\n");
+    booted.run(100);
+    let out = console.console_io().output();
+    assert!(out.windows(6).any(|w| w == b"pty-ok"),
+        "echo works after PTY addition, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 }

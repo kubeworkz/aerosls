@@ -30,6 +30,30 @@ use crate::errno::{Errno, Stat};
 /// pipeline walkthrough assumes small streams (a cat of a few lines).
 pub const PIPE_CAP: usize = 4096;
 
+/// Terminal window size (matches struct winsize).
+#[derive(Clone, Copy, Debug)]
+pub struct WinSize {
+    pub rows: u16,
+    pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+impl Default for WinSize {
+    fn default() -> Self {
+        WinSize { rows: 24, cols: 80, xpixel: 0, ypixel: 0 }
+    }
+}
+
+/// ioctl request codes (Linux values).
+pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
+pub const TIOCSCTTY: u32 = 0x540e;
+pub const FIONBIO: u32 = 0x5421;
+
+/// PTY buffer capacity.
+pub const PTY_BUF_CAP: usize = 4096;
+
 // ── the file-like object ────────────────────────────────────────────────────
 
 /// Everything an fd can name. `File(FileNode)` is the existing mount-table
@@ -49,6 +73,12 @@ pub enum FileObj {
     /// driver sidecar). The VFS tracks only metadata; actual I/O goes
     /// through `Vfs::net_k()` / `Vfs::net_alloc()` at the caller level.
     Socket(Arc<SocketMeta>),
+    /// The master side of a pseudo-terminal (PTY). Reads from
+    /// `master_buf`, writes to `slave_buf`.
+    PtyMaster(Arc<PtyState>),
+    /// The slave side of a pseudo-terminal. Reads from `slave_buf`,
+    /// writes to `master_buf`.
+    PtySlave(Arc<PtyState>),
 }
 
 /// Metadata for a network socket fd. The actual NET_* send/recv happens
@@ -187,6 +217,8 @@ pub struct CharNode {
 }
 
 enum CharKind {
+    /// A PTY slave (backed by a shared PtyState).
+    PtySlave(alloc::sync::Arc<PtyState>),
     /// The console — a channel device (see `ConsoleIo`).
     Console(ConsoleIo),
     /// `/dev/null`: writes are discarded, reads are EOF.
@@ -194,6 +226,16 @@ enum CharKind {
 }
 
 impl CharNode {
+    /// A PTY slave node (backed by an existing PtyState).
+    pub fn pty_slave(pty: alloc::sync::Arc<PtyState>) -> CharNode {
+        CharNode {
+            kind: CharKind::PtySlave(pty),
+            mode: S_IFCHR | 0o620,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
     /// The sidecar console, root-owned (`/dev/console`).
     pub fn console() -> CharNode {
         CharNode {
@@ -231,6 +273,7 @@ impl CharNode {
         match &self.kind {
             CharKind::Console(c) => !c.input_empty() || c.is_closed(),
             CharKind::Null => true,
+            CharKind::PtySlave(p) => p.slave_has_data() || p.master_writers.get() == 0,
         }
     }
 
@@ -238,6 +281,7 @@ impl CharNode {
         match &self.kind {
             CharKind::Console(c) => c.read(buf),
             CharKind::Null => Ok(0), // EOF
+            CharKind::PtySlave(p) => p.slave_read(buf),
         }
     }
 
@@ -245,7 +289,7 @@ impl CharNode {
     pub fn input_contains(&self, byte: u8) -> bool {
         match &self.kind {
             CharKind::Console(c) => c.input_contains(byte),
-            CharKind::Null => false,
+            CharKind::Null | CharKind::PtySlave(_) => false,
         }
     }
 
@@ -260,6 +304,7 @@ impl CharNode {
         match &self.kind {
             CharKind::Console(c) => c.write(buf),
             CharKind::Null => Ok(buf.len()), // discard
+            CharKind::PtySlave(p) => p.slave_write(buf),
         }
     }
 
@@ -279,7 +324,7 @@ impl CharNode {
     pub fn console_io(&self) -> &ConsoleIo {
         match &self.kind {
             CharKind::Console(c) => c,
-            CharKind::Null => panic!("not a console"),
+            _ => panic!("not a console"),
         }
     }
 }    /// The console's I/O. In the full sidecar this is the channel to the
@@ -375,6 +420,152 @@ impl CharNode {
 }
 
 impl Default for ConsoleIo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// -- pseudo-terminals (PTYs) ------------------------------------------------
+
+/// Shared state between the master and slave sides of a PTY.
+/// Each side has its own read buffer and end counts, matching
+/// the bidirectional pipe model: master reads return what the
+/// slave wrote, and vice versa.
+pub struct PtyState {
+    /// Data written by the slave, waiting for the master to read.
+    pub master_buf: RefCell<VecDeque<u8>>,
+    /// Data written by the master, waiting for the slave to read.
+    pub slave_buf: RefCell<VecDeque<u8>>,
+    /// Master side: live read ends.
+    pub master_readers: Cell<u32>,
+    /// Master side: live write ends.
+    pub master_writers: Cell<u32>,
+    /// Slave side: live read ends.
+    pub slave_readers: Cell<u32>,
+    /// Slave side: live write ends.
+    pub slave_writers: Cell<u32>,
+    /// Terminal window size.
+    pub win_size: Cell<WinSize>,
+}
+
+impl PtyState {
+    pub fn new() -> PtyState {
+        PtyState {
+            master_buf: RefCell::new(VecDeque::new()),
+            slave_buf: RefCell::new(VecDeque::new()),
+            master_readers: Cell::new(0),
+            master_writers: Cell::new(0),
+            slave_readers: Cell::new(0),
+            slave_writers: Cell::new(0),
+            win_size: Cell::new(WinSize::default()),
+        }
+    }
+
+    /// Master read: data from the slave's writes.
+    pub fn master_read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.slave_writers.get() == 0 && self.master_buf.borrow().is_empty() {
+            return Ok(0); // EOF: slave side gone
+        }
+        let n = core::cmp::min(buf.len(), self.master_buf.borrow().len());
+        if n == 0 {
+            return Err(Errno::EAgain);
+        }
+        for b in buf[..n].iter_mut() {
+            *b = self.master_buf.borrow_mut().pop_front().unwrap();
+        }
+        Ok(n)
+    }
+
+    /// Master write: data goes to the slave's read buffer.
+    pub fn master_write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        if self.slave_readers.get() == 0 {
+            return Err(Errno::EPipe);
+        }
+        let space = PTY_BUF_CAP - self.slave_buf.borrow().len();
+        if space == 0 {
+            return Err(Errno::EAgain);
+        }
+        let n = core::cmp::min(buf.len(), space);
+        self.slave_buf.borrow_mut().extend(&buf[..n]);
+        Ok(n)
+    }
+
+    /// Slave read: data from the master's writes.
+    pub fn slave_read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.master_writers.get() == 0 && self.slave_buf.borrow().is_empty() {
+            return Ok(0); // EOF: master side gone
+        }
+        let n = core::cmp::min(buf.len(), self.slave_buf.borrow().len());
+        if n == 0 {
+            return Err(Errno::EAgain);
+        }
+        for b in buf[..n].iter_mut() {
+            *b = self.slave_buf.borrow_mut().pop_front().unwrap();
+        }
+        Ok(n)
+    }
+
+    /// Slave write: data goes to the master's read buffer.
+    pub fn slave_write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        if self.master_readers.get() == 0 {
+            return Err(Errno::EPipe);
+        }
+        let space = PTY_BUF_CAP - self.master_buf.borrow().len();
+        if space == 0 {
+            return Err(Errno::EAgain);
+        }
+        let n = core::cmp::min(buf.len(), space);
+        self.master_buf.borrow_mut().extend(&buf[..n]);
+        Ok(n)
+    }
+
+    /// Master-side readiness: readable if slave wrote data or slave gone.
+    pub fn master_has_data(&self) -> bool {
+        !self.master_buf.borrow().is_empty() || self.slave_writers.get() == 0
+    }
+    /// Master-side writability: has space or slave reader closed.
+    pub fn master_has_space(&self) -> bool {
+        self.slave_buf.borrow().len() < PTY_BUF_CAP || self.slave_readers.get() == 0
+    }
+    /// Slave-side readiness: readable if master wrote data or master gone.
+    pub fn slave_has_data(&self) -> bool {
+        !self.slave_buf.borrow().is_empty() || self.master_writers.get() == 0
+    }
+    /// Slave-side writability: has space or master reader closed.
+    pub fn slave_has_space(&self) -> bool {
+        self.master_buf.borrow().len() < PTY_BUF_CAP || self.master_readers.get() == 0
+    }
+
+    /// Bump master read end count.
+    pub fn bump_master_readers(&self, d: i32) {
+        self.master_readers.set((self.master_readers.get() as i32 + d) as u32);
+    }
+    /// Bump master write end count.
+    pub fn bump_master_writers(&self, d: i32) {
+        self.master_writers.set((self.master_writers.get() as i32 + d) as u32);
+    }
+    /// Bump slave read end count.
+    pub fn bump_slave_readers(&self, d: i32) {
+        self.slave_readers.set((self.slave_readers.get() as i32 + d) as u32);
+    }
+    /// Bump slave write end count.
+    pub fn bump_slave_writers(&self, d: i32) {
+        self.slave_writers.set((self.slave_writers.get() as i32 + d) as u32);
+    }
+
+    pub fn stat(&self) -> Stat {
+        Stat {
+            mode: S_IFCHR | 0o620,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: 0,
+            ty: FileType::Char,
+        }
+    }
+}
+
+impl Default for PtyState {
     fn default() -> Self {
         Self::new()
     }
