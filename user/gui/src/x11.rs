@@ -387,6 +387,24 @@ pub fn build_map_notify(window_id: u32, event_window: u32) -> Vec<u8> {
     evt
 }
 
+/// Build an X11 `ConfigureNotify` event (type 22) for window resize.
+pub fn build_configure_notify(window_id: u32, width: u16, height: u16) -> Vec<u8> {
+    let mut evt = Vec::with_capacity(32);
+    evt.push(22); // ConfigureNotify
+    evt.push(0); // unused
+    evt.extend_from_slice(&0u32.to_le_bytes()); // sequence number
+    evt.extend_from_slice(&window_id.to_le_bytes()); // event window
+    evt.extend_from_slice(&window_id.to_le_bytes()); // window
+    evt.extend_from_slice(&0i16.to_le_bytes()); // x
+    evt.extend_from_slice(&0i16.to_le_bytes()); // y
+    evt.extend_from_slice(&width.to_le_bytes()); // width
+    evt.extend_from_slice(&height.to_le_bytes()); // height
+    evt.extend_from_slice(&0i16.to_le_bytes()); // border width
+    evt.push(0); // override redirect
+    evt.extend_from_slice(&[0u8; 10]); // unused
+    evt
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -495,5 +513,18 @@ mod tests {
             }
             _ => panic!("expected MotionNotify"),
         }
+    }
+
+    #[test]
+    fn build_configure_notify_size() {
+        let evt = build_configure_notify(1, 800, 600);
+        assert_eq!(evt.len(), 32);
+        assert_eq!(evt[0], 22); // ConfigureNotify
+        // Width at bytes 16-17.
+        let w = u16::from_le_bytes([evt[16], evt[17]]);
+        assert_eq!(w, 800);
+        // Height at bytes 18-19.
+        let h = u16::from_le_bytes([evt[18], evt[19]]);
+        assert_eq!(h, 600);
     }
 }
