@@ -1933,6 +1933,109 @@ pub fn sleep<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
+/// `timeout` applet: run a command with a deadline. Usage:
+///   timeout TICKS CMD [ARGS...]
+/// Forks CMD as a child, parks with WaitChildTimeout, and returns 124
+/// if the deadline expires before the child exits.  On normal child
+/// exit, returns the child's exit code.
+///
+/// Data layout:
+///   Child marker:  [CHILD, cmd_len(1), cmd..., 0, arg..., 0, ...]
+///   Parent wait:   [PARENT, child_id(4 LE)]
+pub fn timeout<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    const PARENT: u8 = 1;
+    const CHILD: u8 = 2;
+
+    // Child: data starts with CHILD marker — exec the command.
+    if !ctx.data.is_empty() && ctx.data[0] == CHILD {
+        let p = 1;
+        let cmd_end = ctx.data[p..].iter().position(|&b| b == 0).unwrap_or(0);
+        let cmd = match core::str::from_utf8(&ctx.data[p..p + cmd_end]) {
+            Ok(s) => s.to_string(),
+            Err(_) => return Step::Exit(127),
+        };
+        let mut argv: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        argv.push(cmd.clone());
+        let mut q = p + cmd_end + 1;
+        while q < ctx.data.len() {
+            let end = ctx.data[q..].iter().position(|&b| b == 0).unwrap_or(ctx.data.len() - q);
+            if let Ok(s) = core::str::from_utf8(&ctx.data[q..q + end]) {
+                argv.push(s.to_string());
+            }
+            q += end + 1;
+        }
+        // Resolve through PATH.
+        let task = ctx.task;
+        let path_val = {
+            let env = ctx.get_env();
+            env.iter().find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "/bin".into())
+        };
+        let resolved = resolve_path(&mut ctx.vfs(), task, &cmd, &path_val);
+        let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let _ = ctx.exec(&resolved, &argv_refs);
+        return Step::Yield;
+    }
+
+    // Parent woken from WaitChildTimeout — check outcome.
+    if !ctx.data.is_empty() && ctx.data[0] == PARENT {
+        let timed_out = ctx.check_wait_timeout();
+        let child_id = u32::from_le_bytes([
+            ctx.data[1], ctx.data[2], ctx.data[3], ctx.data[4],
+        ]);
+        if timed_out {
+            ctx.kill(child_id, aerosls_procmgr::SIGTERM).ok();
+            return Step::Exit(124);
+        }
+        return match ctx.wait(child_id) {
+            aerosls_procmgr::WaitOutcome::Reaped(code) => Step::Exit(code),
+            _ => Step::Exit(0),
+        };
+    }
+
+    // Phase 0: parse args, build child data, fork, park with timeout.
+    let ticks: u32 = ctx.argv().get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let cmd = match ctx.argv().get(2) {
+        Some(c) => c.clone(),
+        None => return Step::Exit(124),
+    };
+    let extra: alloc::vec::Vec<String> = ctx.argv()[3..].iter().cloned().collect();
+
+    // Build child snapshot: [CHILD, cmd, \0, arg1, \0, arg2, \0, ...]
+    ctx.data.clear();
+    ctx.data.push(CHILD);
+    ctx.data.extend_from_slice(cmd.as_bytes());
+    ctx.data.push(0);
+    for a in &extra {
+        ctx.data.extend_from_slice(a.as_bytes());
+        ctx.data.push(0);
+    }
+
+    let child = match ctx.fork() {
+        Ok(c) => c,
+        Err(_) => return Step::Exit(127),
+    };
+
+    // Parent: restore wait data and park.
+    ctx.data.clear();
+    ctx.data.push(PARENT);
+    ctx.data.extend_from_slice(&child.to_le_bytes());
+    if ticks == 0 {
+        match ctx.wait(child) {
+            aerosls_procmgr::WaitOutcome::Reaped(code) => Step::Exit(code),
+            aerosls_procmgr::WaitOutcome::Blocked => {
+                ctx.block(aerosls_procmgr::BlockReason::WaitingChild(child))
+            }
+            _ => Step::Exit(127),
+        }
+    } else {
+        ctx.wait_timeout(child, ticks)
+    }
+}
+
 /// Append a length-prefixed env region to `data`: `[n, (name_len, name,
 /// val_len, val)...]` — the shell's variable table (see `sh`). Accepts
 /// either `(&str, &str)` or `(String, String)` pairs.
@@ -3819,6 +3922,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("true", do_true);
     pm.register_applet("false", do_false);
     pm.register_applet("sleep", sleep);
+    pm.register_applet("timeout", timeout);
 }
 
 #[cfg(test)]

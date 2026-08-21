@@ -1963,3 +1963,93 @@ fn bg_builtin_lists_background_job() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// timeout kills a long command and returns exit code 124.
+#[test]
+fn timeout_kills_long_command_and_returns_124() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/timeout", b"timeout\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // timeout 5 sleep 999 — sleep exceeds timeout, child killed → exit 124.
+    console.console_io().push_input(b"timeout 5 sleep 999\n");
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    assert!(out.windows(2).any(|w| w == b"$ "),
+        "prompt after timeout, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// timeout succeeds when the command finishes before the deadline.
+#[test]
+fn timeout_succeeds_when_command_finishes_early() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/timeout", b"timeout\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // timeout 100 echo hello — echo finishes instantly, exit 0.
+    console.console_io().push_input(b"timeout 100 echo hello\n");
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    assert!(out.windows(2).any(|w| w == b"lo"),
+        "echo output present, got: {:?}", out);
+    assert!(out.windows(2).any(|w| w == b"$ "),
+        "prompt after timeout, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// timeout with no command argument returns 124.
+#[test]
+fn timeout_no_command_returns_124() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/timeout", b"timeout\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // timeout 5 with no command — should exit 124.
+    console.console_io().push_input(b"timeout 5\n");
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    assert!(out.windows(2).any(|w| w == b"$ "),
+        "prompt after timeout with no cmd, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
