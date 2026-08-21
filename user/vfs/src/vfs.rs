@@ -25,14 +25,14 @@
 //!   silently reconnects to a different device (respawn §6).
 //! - **`/tmp` (ramfs) never goes stale** — it is core memory, not a device.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use aerosls_blockcache::{BlockCache, BufferAlloc, Error as CacheError};
 use aerosls_proto::kabi::Kernel;
@@ -808,6 +808,10 @@ impl FdEntry {
                 p.bump_slave_readers(1);
                 p.bump_slave_writers(1);
             }
+            FileObj::UnixSocket(s) => {
+                s.bump_readers(1);
+                s.bump_writers(1);
+            }
             _ => {}
         }
     }
@@ -825,6 +829,10 @@ impl FdEntry {
             FileObj::PtySlave(p) => {
                 p.bump_slave_readers(-1);
                 p.bump_slave_writers(-1);
+            }
+            FileObj::UnixSocket(s) => {
+                s.bump_readers(-1);
+                s.bump_writers(-1);
             }
             _ => {}
         }
@@ -940,6 +948,9 @@ pub struct Vfs<K: Kernel, A: BufferAlloc> {
     console_node: Option<Arc<CharNode>>,
     /// PTY multiplexer (allocated when /dev/ptmx is first opened).
     pty_mux: Option<PtyMultiplexer>,
+    /// Unix domain socket path → listener registry. `connect()` looks
+    /// up the path here; `bind()` registers; `unlink()` removes.
+    unix_sockets: alloc::collections::BTreeMap<String, Arc<crate::fileobj::UnixSocketState>>,
 }
 
 /// A parked reader. `ready()` is the *only* wake condition — it is
@@ -972,6 +983,7 @@ impl Waiter {
             FileObj::PtyMaster(p) => p.master_has_data() || p.slave_writers.get() == 0,
             FileObj::PtySlave(p) => p.slave_has_data() || p.master_writers.get() == 0,
             FileObj::Socket(_) => true,
+            FileObj::UnixSocket(s) => s.has_data(),
             // Nothing else can be blocked on (the wait_* validators
             // reject them).
             FileObj::File(_) => false,
@@ -998,6 +1010,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             net_alloc: None,
             console_node: None,
             pty_mux: None,
+            unix_sockets: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -1593,7 +1606,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
         match &*e.node {
             FileObj::PipeRead(_) | FileObj::Char(_) | FileObj::Socket(_)
-            | FileObj::PtyMaster(_) | FileObj::PtySlave(_) => {
+            | FileObj::PtyMaster(_) | FileObj::PtySlave(_)
+            | FileObj::UnixSocket(_) => {
                 // A task parks on one thing at a time; replace any prior
                 // registration (bounded by the number of tasks).
                 self.waiters.retain(|w| w.task != task);
@@ -1621,7 +1635,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
         match &*e.node {
             FileObj::PipeWrite(_) | FileObj::Socket(_)
-            | FileObj::PtyMaster(_) | FileObj::PtySlave(_) => {
+            | FileObj::PtyMaster(_) | FileObj::PtySlave(_)
+            | FileObj::UnixSocket(_) => {
                 // A task parks on one thing at a time; replace any prior
                 // registration (bounded by the number of tasks).
                 self.waiters.retain(|w| w.task != task);
@@ -1681,6 +1696,170 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             }
         }
         woken
+    }
+
+    // -- Unix domain socket methods -------------------------------------------
+
+    /// Create an unbound Unix domain socket (AF_UNIX, SOCK_STREAM).
+    pub fn unix_socket(&mut self, task: u32) -> Result<u32, Errno> {
+        let state = crate::fileobj::UnixSocketState::new();
+        let idx = self.task_mut(task)?.fds;
+        self.table_pool[idx].alloc(FdEntry {
+            node: Arc::new(FileObj::UnixSocket(state)),
+            rights: R | W,
+            flags: 0,
+            cloexec: false,
+        })
+    }
+
+    /// Bind a Unix socket to a filesystem path. Registers in the global
+    /// path → listener registry. Fails with `EAddrInuse` if the path
+    /// is already bound.
+    pub fn unix_bind(&mut self, task: u32, fd: u32, path: &str) -> Result<(), Errno> {
+        let idx = self.task_mut(task)?.fds;
+        // Must be an unbound Unix socket.
+        {
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+            match &*e.node {
+                FileObj::UnixSocket(s) => match &**s {
+                    crate::fileobj::UnixSocketState::Unbound => {}
+                    _ => return Err(Errno::EInval),
+                },
+                _ => return Err(Errno::EBadf),
+            }
+        }
+        // Check for duplicate path.
+        if self.unix_sockets.contains_key(path) {
+            return Err(Errno::EAddrInuse);
+        }
+        let new_state = Arc::new(crate::fileobj::UnixSocketState::Bound { path: path.to_string() });
+        let new_entry = FdEntry {
+            node: Arc::new(FileObj::UnixSocket(new_state.clone())),
+            rights: R | W,
+            flags: 0,
+            cloexec: false,
+        };
+        self.table_pool[idx].entries[fd as usize] = Some(new_entry);
+        self.unix_sockets.insert(path.to_string(), new_state);
+        Ok(())
+    }
+
+    /// Mark a bound socket as listening. Transitions Bound → Listening.
+    pub fn unix_listen(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
+        let idx = self.task_mut(task)?.fds;
+        let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+        let path = match &*e.node {
+            FileObj::UnixSocket(s) => match &**s {
+                crate::fileobj::UnixSocketState::Bound { path } => path.clone(),
+                crate::fileobj::UnixSocketState::Listening { .. } => return Ok(()),
+                _ => return Err(Errno::EInval),
+            },
+            _ => return Err(Errno::EBadf),
+        };
+        let listening = Arc::new(crate::fileobj::UnixSocketState::Listening {
+            path: path.clone(),
+            pending: RefCell::new(Vec::new()),
+        });
+        let new_entry = FdEntry {
+            node: Arc::new(FileObj::UnixSocket(listening.clone())),
+            rights: R,
+            flags: 0,
+            cloexec: false,
+        };
+        self.table_pool[idx].entries[fd as usize] = Some(new_entry);
+        self.unix_sockets.insert(path, listening);
+        Ok(())
+    }
+
+    /// Accept a pending connection on a listening Unix socket. Returns
+    /// the new fd for the connected socket. If no pending connection
+    /// exists, registers a waiter and returns `EAgain`.
+    pub fn unix_accept(&mut self, task: u32, fd: u32) -> Result<u32, Errno> {
+        let idx = self.task_mut(task)?.fds;
+        let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+        let pending = match &*e.node {
+            FileObj::UnixSocket(s) => match &**s {
+                crate::fileobj::UnixSocketState::Listening { pending, .. } => {
+                    pending.borrow().len()
+                }
+                _ => return Err(Errno::EInval),
+            },
+            _ => return Err(Errno::EBadf),
+        };
+        if pending == 0 {
+            // No pending connection — register waiter.
+            let node = e.node.clone();
+            _ = e; // release borrow on table_pool
+            self.waiters.push(Waiter { task, obj: node });
+            return Err(Errno::EAgain);
+        }
+        // Pop the first pending connection.
+        let connected = {
+            if let FileObj::UnixSocket(s) = &*e.node {
+                if let crate::fileobj::UnixSocketState::Listening { pending, .. } = &**s {
+                    pending.borrow_mut().remove(0)
+                } else {
+                    unreachable!()
+                }
+            } else {
+                unreachable!()
+            }
+        };
+        _ = e; // release borrow on table_pool
+        // Mint a new fd for the accepted connection.
+        let idx = self.task_mut(task)?.fds;
+        self.table_pool[idx].alloc(FdEntry {
+            node: Arc::new(FileObj::UnixSocket(connected)),
+            rights: R | W,
+            flags: 0,
+            cloexec: false,
+        })
+    }
+
+    /// Connect to a Unix socket at `path`. Creates a connected pair:
+    /// one end for the caller, the other pushed to the listener's pending
+    /// queue. Fails with `ENoent` if no socket is bound at `path`.
+    pub fn unix_connect(&mut self, task: u32, fd: u32, path: &str) -> Result<(), Errno> {
+        let listener = self.unix_sockets.get(path).ok_or(Errno::ENoent)?.clone();
+        // Shared buffers: a_to_b = A's snd = B's rcv, b_to_a = B's snd = A's rcv.
+        let a_to_b: Arc<RefCell<VecDeque<u8>>> = Arc::new(RefCell::new(VecDeque::new()));
+        let b_to_a: Arc<RefCell<VecDeque<u8>>> = Arc::new(RefCell::new(VecDeque::new()));
+        // Shared reader/writer counts: both ends see the same Cell.
+        let readers: Arc<Cell<u32>> = Arc::new(Cell::new(1));
+        let writers: Arc<Cell<u32>> = Arc::new(Cell::new(1));
+        let a = Arc::new(crate::fileobj::UnixSocketState::Connected {
+            rcv: b_to_a.clone(),
+            snd: a_to_b.clone(),
+            readers: readers.clone(),
+            writers: writers.clone(),
+        });
+        let b = Arc::new(crate::fileobj::UnixSocketState::Connected {
+            rcv: a_to_b,
+            snd: b_to_a,
+            readers,
+            writers,
+        });
+        // Push B into the listener's pending queue.
+        match &*listener {
+            crate::fileobj::UnixSocketState::Listening { pending, .. } => {
+                pending.borrow_mut().push(b);
+            }
+            _ => return Err(Errno::EInval),
+        }
+        // Replace the caller's fd with A (the connected end).
+        let idx = self.task_mut(task)?.fds;
+        self.table_pool[idx].entries[fd as usize] = Some(FdEntry {
+            node: Arc::new(FileObj::UnixSocket(a)),
+            rights: R | W,
+            flags: 0,
+            cloexec: false,
+        });
+        Ok(())
+    }
+
+    /// Unregister a Unix socket path from the registry.
+    pub fn unix_unlink(&mut self, path: &str) {
+        self.unix_sockets.remove(path);
     }
 
     pub fn close(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
@@ -1812,6 +1991,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             FileObj::PtyMaster(p) => p.master_read(buf),
             FileObj::PtySlave(p) => p.slave_read(buf),
             FileObj::Socket(_) => Err(Errno::EBadf),
+            FileObj::UnixSocket(s) => s.read(buf),
         }
     }
 
@@ -1848,6 +2028,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             FileObj::PtyMaster(p) => p.master_input(buf),
             FileObj::PtySlave(p) => p.slave_write(buf),
             FileObj::Socket(_) => Err(Errno::EBadf),
+            FileObj::UnixSocket(s) => s.write(buf),
         }
     }
 
@@ -1907,7 +2088,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             FileObj::PipeRead(p) | FileObj::PipeWrite(p) => Ok(p.stat()),
             FileObj::Char(c) => Ok(c.stat()),
             FileObj::PtyMaster(p) | FileObj::PtySlave(p) => Ok(p.stat()),
-            FileObj::Socket(_) => Ok(Stat {
+            FileObj::Socket(_) | FileObj::UnixSocket(_) => Ok(Stat {
                 mode: 0o140000, // S_IFSOCK
                 uid: 0,
                 gid: 0,
@@ -2161,6 +2342,14 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                 }
                 if p.master_readers.get() == 0 {
                     revents |= POLLHUP;
+                }
+            }
+            FileObj::UnixSocket(s) => {
+                if (events & POLLIN) != 0 && s.has_data() {
+                    revents |= POLLIN;
+                }
+                if (events & POLLOUT) != 0 && s.has_space() {
+                    revents |= POLLOUT;
                 }
             }
             FileObj::File(_) => {
@@ -3303,6 +3492,105 @@ mod tests {
         assert!(read_back.echo());
         assert!(read_back.isig());
         assert!(!read_back.canonical()); // ICANON was not set
+    }
+
+    // -- Unix domain socket tests ----------------------------------------------
+
+    #[test]
+    fn unix_socket_bind_and_listen() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let fd = v.unix_socket(0).unwrap();
+        v.unix_bind(0, fd, "/tmp/test.sock").unwrap();
+        v.unix_listen(0, fd).unwrap();
+        assert!(v.unix_sockets.contains_key("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn unix_socket_bind_duplicate_fails() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let fd1 = v.unix_socket(0).unwrap();
+        v.unix_bind(0, fd1, "/tmp/dup.sock").unwrap();
+        let fd2 = v.unix_socket(0).unwrap();
+        assert_eq!(v.unix_bind(0, fd2, "/tmp/dup.sock"), Err(Errno::EAddrInuse));
+    }
+
+    #[test]
+    fn unix_socket_connect_and_rw() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        // Server: create, bind, listen.
+        let srv = v.unix_socket(0).unwrap();
+        v.unix_bind(0, srv, "/tmp/x11").unwrap();
+        v.unix_listen(0, srv).unwrap();
+        // Client: create, connect.
+        let cli = v.unix_socket(0).unwrap();
+        v.unix_connect(0, cli, "/tmp/x11").unwrap();
+        // Server accepts.
+        let accepted = v.unix_accept(0, srv).unwrap();
+        // Client writes, server reads.
+        v.write(0, cli, b"hello").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, accepted, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        // Server writes, client reads.
+        v.write(0, accepted, b"world").unwrap();
+        assert_eq!(v.read(0, cli, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"world");
+    }
+
+    #[test]
+    fn unix_socket_connect_no_listener_fails() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let cli = v.unix_socket(0).unwrap();
+        assert_eq!(v.unix_connect(0, cli, "/nonexistent"), Err(Errno::ENoent));
+    }
+
+    #[test]
+    fn unix_socket_bidirectional_simultaneous() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let srv = v.unix_socket(0).unwrap();
+        v.unix_bind(0, srv, "/tmp/bidi").unwrap();
+        v.unix_listen(0, srv).unwrap();
+        let cli = v.unix_socket(0).unwrap();
+        v.unix_connect(0, cli, "/tmp/bidi").unwrap();
+        let acc = v.unix_accept(0, srv).unwrap();
+        // Both directions at once.
+        v.write(0, cli, b"to-srv").unwrap();
+        v.write(0, acc, b"to-cli").unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(v.read(0, acc, &mut buf).unwrap(), 6);
+        assert_eq!(&buf[..6], b"to-srv");
+        assert_eq!(v.read(0, cli, &mut buf).unwrap(), 6);
+        assert_eq!(&buf[..6], b"to-cli");
+    }
+
+    #[test]
+    fn unix_socket_empty_read_would_block() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let srv = v.unix_socket(0).unwrap();
+        v.unix_bind(0, srv, "/tmp/empty").unwrap();
+        v.unix_listen(0, srv).unwrap();
+        let cli = v.unix_socket(0).unwrap();
+        v.unix_connect(0, cli, "/tmp/empty").unwrap();
+        let acc = v.unix_accept(0, srv).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, acc, &mut buf), Err(Errno::EAgain));
+        assert_eq!(v.read(0, cli, &mut buf), Err(Errno::EAgain));
+    }
+
+    #[test]
+    fn unix_socket_eof_when_peer_closed() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let srv = v.unix_socket(0).unwrap();
+        v.unix_bind(0, srv, "/tmp/eof").unwrap();
+        v.unix_listen(0, srv).unwrap();
+        let cli = v.unix_socket(0).unwrap();
+        v.unix_connect(0, cli, "/tmp/eof").unwrap();
+        let acc = v.unix_accept(0, srv).unwrap();
+        // Close the client end.
+        v.close(0, cli).unwrap();
+        // Server reads EOF.
+        let mut buf = [0u8; 4];
+        assert_eq!(v.read(0, acc, &mut buf).unwrap(), 0);
     }
 
     /// Kernelless stand-ins for unit tests that don't touch the device.

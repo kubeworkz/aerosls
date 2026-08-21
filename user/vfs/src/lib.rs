@@ -39,7 +39,7 @@ pub mod vfs;
 pub use aerofs::{FileType, ImageBuilder, SuperblockRecord};
 pub use aerosls_blockcache::BufferAlloc;
 pub use errno::{DirEnt, Errno, Stat};
-pub use fileobj::{CharNode, ConsoleIo, FileObj, PipeNode, PtyState, SocketMeta, SocketState, PIPE_CAP, Termios, TCGETS, TCSETS, TIOCGWINSZ, TIOCSWINSZ, TIOCSCTTY, WinSize};
+pub use fileobj::{CharNode, ConsoleIo, FileObj, PipeNode, PtyState, SocketMeta, SocketState, PIPE_CAP, Termios, TCGETS, TCSETS, TIOCGWINSZ, TIOCSWINSZ, TIOCSCTTY, WinSize, AF_UNIX, SOCK_STREAM, UnixSocketState};
 pub use vfs::{
     rights_of, FileNode, FdEntry, MountState, Vfs, CLONE_FILES, O_ACCMODE, O_APPEND, O_CREAT,
     O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, POLLIN, POLLOUT, POLLERR, POLLHUP,

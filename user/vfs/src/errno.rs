@@ -50,6 +50,8 @@ pub enum Errno {
     ESRCH,
     /// Inappropriate ioctl for device.
     ENotty,
+    /// Address already in use.
+    EAddrInuse,
 }
 
 impl Errno {
@@ -76,6 +78,7 @@ impl Errno {
             Errno::EPipe => 32,
             Errno::ESRCH => 3,
             Errno::ENotty => 25,
+            Errno::EAddrInuse => 98,
         }
     }
 }

@@ -2630,3 +2630,28 @@ fn forkpty_child_writes_to_master() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+#[test]
+fn unix_socket_echo_roundtrip() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/unix_echo\n", 0o644);
+    b.add_file("/bin/unix_echo", b"unix_echo\n", 0o755);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    booted.run(500);
+    let out = console.console_io().output();
+    // The applet echoes "hello-ux" back through the Unix socket.
+    assert!(out.windows(8).any(|w| w == b"hello-ux"),
+        "unix_echo echoed data through Unix socket, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

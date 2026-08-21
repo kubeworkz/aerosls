@@ -3969,6 +3969,71 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
+/// `unix_echo`: exercises the full Unix domain socket lifecycle.
+/// Single task: creates a listening socket, connects a client socket
+/// to it (both in the same task), accepts, echoes data back.
+pub fn unix_echo<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    // Create server socket.
+    let srv = match ctx.vfs().unix_socket(task) {
+        Ok(f) => f,
+        Err(_) => return Step::Exit(1),
+    };
+    if ctx.vfs().unix_bind(task, srv, "/tmp/echo.sock").is_err() {
+        return Step::Exit(1);
+    }
+    if ctx.vfs().unix_listen(task, srv).is_err() {
+        return Step::Exit(1);
+    }
+    // Create client socket and connect.
+    let cli = match ctx.vfs().unix_socket(task) {
+        Ok(f) => f,
+        Err(_) => return Step::Exit(1),
+    };
+    if ctx.vfs().unix_connect(task, cli, "/tmp/echo.sock").is_err() {
+        let _ = ctx.vfs().close(task, srv);
+        let _ = ctx.vfs().unix_unlink("/tmp/echo.sock");
+        return Step::Exit(1);
+    }
+    // Accept the connection.
+    let acc = match ctx.vfs().unix_accept(task, srv) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = ctx.vfs().close(task, cli);
+            let _ = ctx.vfs().close(task, srv);
+            let _ = ctx.vfs().unix_unlink("/tmp/echo.sock");
+            return Step::Exit(1);
+        }
+    };
+    // Client writes test data.
+    let _ = ctx.vfs().write(task, cli, b"hello-ux");
+    // Server reads and echoes back.
+    let mut buf = [0u8; 16];
+    let n = match ctx.vfs().read(task, acc, &mut buf) {
+        Ok(n) => n,
+        Err(_) => {
+            let _ = ctx.vfs().close(task, acc);
+            let _ = ctx.vfs().close(task, cli);
+            let _ = ctx.vfs().close(task, srv);
+            let _ = ctx.vfs().unix_unlink("/tmp/echo.sock");
+            return Step::Exit(1);
+        }
+    };
+    let _ = ctx.vfs().write(task, acc, &buf[..n]);
+    // Client reads the echo.
+    let task = ctx.task;
+    let mut rbuf = [0u8; 16];
+    if let Ok(n) = ctx.vfs().read(task, cli, &mut rbuf) {
+        let _ = ctx.write_blocking(1, &rbuf[..n]);
+    }
+    // Cleanup.
+    let _ = ctx.vfs().close(task, acc);
+    let _ = ctx.vfs().close(task, cli);
+    let _ = ctx.vfs().close(task, srv);
+    let _ = ctx.vfs().unix_unlink("/tmp/echo.sock");
+    Step::Done
+}
+
 /// `forkpty_test`: exercises `ctx.forkpty()`. Forks a child on a PTY,
 /// the child writes "child-ok" to its stdout (the PTY slave), the parent
 /// reads from the master. Writes "master=N" where N is the master fd.
@@ -4043,6 +4108,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("sleep", sleep);
     pm.register_applet("timeout", timeout);
     pm.register_applet("forkpty_test", forkpty_test);
+    pm.register_applet("unix_echo", unix_echo);
 }
 
 #[cfg(test)]

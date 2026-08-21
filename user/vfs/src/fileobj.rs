@@ -19,6 +19,7 @@
 //! the concrete set of object kinds is closed, and every arm is explicit.
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -54,6 +55,15 @@ pub const FIONBIO: u32 = 0x5421;
 /// PTY buffer capacity.
 pub const PTY_BUF_CAP: usize = 4096;
 
+/// Address families.
+pub const AF_UNIX: u16 = 1;
+
+/// Socket types.
+pub const SOCK_STREAM: u16 = 1;
+
+/// Unix domain socket buffer capacity.
+pub const UNIX_SOCK_BUF_CAP: usize = 65536;
+
 // ── the file-like object ────────────────────────────────────────────────────
 
 /// Everything an fd can name. `File(FileNode)` is the existing mount-table
@@ -79,6 +89,10 @@ pub enum FileObj {
     /// The slave side of a pseudo-terminal. Reads from `slave_buf`,
     /// writes to `master_buf`.
     PtySlave(Arc<PtyState>),
+    /// A Unix domain socket (AF_UNIX). Connected pairs share a
+    /// `UnixSocketState`; the VFS reads/writes the cross-linked buffers
+    /// directly — no sidecar needed.
+    UnixSocket(Arc<UnixSocketState>),
 }
 
 /// Metadata for a network socket fd. The actual NET_* send/recv happens
@@ -744,5 +758,119 @@ impl PtyState {
 impl Default for PtyState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Unix domain sockets ──────────────────────────────────────────────────────
+
+/// State of an unbound or listening Unix domain socket.
+pub enum UnixSocketState {
+    /// Created but not bound. `bind()` transitions to `Bound`.
+    Unbound,
+    /// Bound to a filesystem path. `listen()` transitions to `Listening`.
+    Bound {
+        path: String,
+    },
+    /// Listening for incoming connections. The `pending` queue holds
+    /// connected pairs created by `connect()` — `accept()` pops from it.
+    Listening {
+        path: String,
+        pending: RefCell<Vec<Arc<UnixSocketState>>>,
+    },
+    /// Connected to a peer. Uses shared `Arc<RefCell<VecDeque>>` buffers
+    /// so both ends see the same data. A's `snd` IS B's `rcv` (same Arc).
+    Connected {
+        /// Shared receive buffer (I read, peer writes via its snd Arc).
+        rcv: Arc<RefCell<VecDeque<u8>>>,
+        /// Shared send buffer (I write, peer reads via its rcv Arc).
+        snd: Arc<RefCell<VecDeque<u8>>>,
+        /// Shared live read-end count across both sides (for EOF detection).
+        /// When either side's read fd is closed, this decrements. A reader
+        /// sees EOF when writers==0 and rcv is empty.
+        readers: Arc<Cell<u32>>,
+        /// Shared live write-end count across both sides (for EPIPE detection).
+        writers: Arc<Cell<u32>>,
+    },
+}
+
+impl UnixSocketState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(UnixSocketState::Unbound)
+    }
+
+    /// Read from the receive buffer. Returns `Ok(0)` (EOF) when the peer
+    /// has no writers and the buffer is empty. `EAGAIN` when empty but
+    /// the peer may still write.
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        match self {
+            UnixSocketState::Connected { rcv, writers, .. } => {
+                if writers.get() == 0 && rcv.borrow().is_empty() {
+                    return Ok(0); // EOF
+                }
+                let n = core::cmp::min(buf.len(), rcv.borrow().len());
+                if n == 0 {
+                    return Err(Errno::EAgain);
+                }
+                for b in buf[..n].iter_mut() {
+                    *b = rcv.borrow_mut().pop_front().unwrap();
+                }
+                Ok(n)
+            }
+            _ => Err(Errno::EBadf),
+        }
+    }
+
+    /// Write to the peer's receive buffer (via my send buffer). Returns
+    /// `EPIPE` when the peer has no readers. `EAGAIN` when the peer's
+    /// buffer is full.
+    pub fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        match self {
+            UnixSocketState::Connected { snd, readers, .. } => {
+                if readers.get() == 0 {
+                    return Err(Errno::EPipe);
+                }
+                let space = UNIX_SOCK_BUF_CAP - snd.borrow().len();
+                if space == 0 {
+                    return Err(Errno::EAgain);
+                }
+                let n = core::cmp::min(buf.len(), space);
+                snd.borrow_mut().extend(&buf[..n]);
+                Ok(n)
+            }
+            _ => Err(Errno::EBadf),
+        }
+    }
+
+    /// Whether the receive buffer has data or the peer has no writers (EOF).
+    pub fn has_data(&self) -> bool {
+        match self {
+            UnixSocketState::Connected { rcv, writers, .. } => {
+                !rcv.borrow().is_empty() || writers.get() == 0
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the send buffer has free space or the peer has no readers.
+    pub fn has_space(&self) -> bool {
+        match self {
+            UnixSocketState::Connected { snd, readers, .. } => {
+                snd.borrow().len() < UNIX_SOCK_BUF_CAP || readers.get() == 0
+            }
+            _ => false,
+        }
+    }
+
+    /// Bump read end count.
+    pub fn bump_readers(&self, d: i32) {
+        if let UnixSocketState::Connected { readers, .. } = self {
+            readers.set((readers.get() as i32 + d) as u32);
+        }
+    }
+    /// Bump write end count.
+    pub fn bump_writers(&self, d: i32) {
+        if let UnixSocketState::Connected { writers, .. } = self {
+            writers.set((writers.get() as i32 + d) as u32);
+        }
     }
 }
