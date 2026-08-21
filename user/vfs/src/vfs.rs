@@ -3447,9 +3447,14 @@ mod tests {
         let n = v.read(0, master, &mut buf).unwrap();
         assert_eq!(n, 1);
         assert_eq!(buf[0], b'a');
-        // Data: 'a' should also be in the slave's read buffer.
+        // ICANON holds data until newline — send CR to flush.
+        v.write(0, master, b"\r").unwrap();
+        // The newline (translated from CR by ICRNL) appears on master echo.
+        let n = v.read(0, master, &mut buf).unwrap();
+        assert!(n >= 1);
+        // Data: 'a' + newline should be in the slave's read buffer.
         let n = v.read(0, slave, &mut buf).unwrap();
-        assert_eq!(n, 1);
+        assert!(n >= 1);
         assert_eq!(buf[0], b'a');
     }
 
@@ -3687,6 +3692,139 @@ mod tests {
         let (r, _w) = v.pipe(0).unwrap();
         let optval = 1u32.to_le_bytes();
         assert_eq!(v.setsockopt(0, r, 1, 2, &optval), Err(Errno::ENotty));
+    }
+
+
+    // -- ICANON canonical mode tests --------------------------------------------
+
+    #[test]
+    fn icanon_buffers_until_newline() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Enable canonical mode + echo.
+        let cooked = Termios {
+            iflag: ICRNL,
+            oflag: 0,
+            lflag: ICANON | ECHO,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13],
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Write "hello" without newline — nothing reaches slave yet.
+        v.write(0, master, b"hello").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, slave, &mut buf), Err(Errno::EAgain));
+        // Write newline — now the line is flushed.
+        v.write(0, master, b"\n").unwrap();
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 6); // "hello\n"
+        assert_eq!(&buf[..6], b"hello\n");
+    }
+
+    #[test]
+    fn icanon_erase_removes_last_char() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        let cooked = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ICANON | ECHO,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13], // ERASE=127 (DEL)
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Type "abc", erase 'c', type "d", newline.
+        v.write(0, master, b"abc").unwrap();
+        v.write(0, master, b"\x7f").unwrap(); // ERASE
+        v.write(0, master, b"d\n").unwrap();
+        let mut buf = [0u8; 8];
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..4], b"abd\n");
+    }
+
+    #[test]
+    fn icanon_kill_clears_line() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        let cooked = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ICANON | ECHO,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13], // KILL=21 (Ctrl-U)
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Type "hello", kill, type "world", newline.
+        v.write(0, master, b"hello").unwrap();
+        v.write(0, master, b"\x15").unwrap(); // KILL
+        v.write(0, master, b"world\n").unwrap();
+        let mut buf = [0u8; 16];
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(&buf[..6], b"world\n");
+    }
+
+    #[test]
+    fn icanon_eof_flushes_empty_line() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        let cooked = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ICANON | ECHO,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13], // EOF=4 (Ctrl-D)
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // EOF on empty line: should flush nothing (Ok(0) from slave read).
+        v.write(0, master, b"\x04").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, slave, &mut buf), Err(Errno::EAgain));
+        // EOF with partial data: flushes the partial line.
+        v.write(0, master, b"partial").unwrap();
+        v.write(0, master, b"\x04").unwrap();
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(&buf[..7], b"partial");
+    }
+
+    #[test]
+    fn icanon_echo_sends_to_master() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        let cooked = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ICANON | ECHO,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13],
+        };
+        let mut arg = [0u8; 36];
+        cooked.encode(&mut arg);
+        v.ioctl(0, master, TCSETS, &mut arg).unwrap();
+        // Type "ab" — echo should appear on master.
+        v.write(0, master, b"ab").unwrap();
+        let mut buf = [0u8; 8];
+        let n = v.read(0, master, &mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"ab");
+    }
+
+    #[test]
+    fn raw_mode_no_line_buffering() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Default is raw mode — no ICANON.
+        // Write "hello" — should reach slave immediately (no buffering).
+        v.write(0, master, b"hello").unwrap();
+        let mut buf = [0u8; 8];
+        let n = v.read(0, slave, &mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"hello");
     }
 
     /// Kernelless stand-ins for unit tests that don't touch the device.

@@ -543,6 +543,9 @@ pub struct PtyState {
     pub termios: RefCell<Termios>,
     /// Foreground process group ID for signal delivery (set by shell via TIOCSCTTY).
     pub foreground_pgid: Cell<u32>,
+    /// Canonical mode line buffer: accumulates input until \n or EOF,
+    /// then flushes to the slave buffer.  Only used when ICANON is set.
+    pub line_buf: RefCell<VecDeque<u8>>,
 }
 
 impl PtyState {
@@ -554,9 +557,9 @@ impl PtyState {
             master_writers: Cell::new(0),
             slave_readers: Cell::new(0),
             slave_writers: Cell::new(0),
-            win_size: Cell::new(WinSize::default()),
-            termios: RefCell::new(Termios::default_raw()),
-            foreground_pgid: Cell::new(0),
+            win_size: Cell::new(WinSize::default()),        termios: RefCell::new(Termios::default_raw()),
+        foreground_pgid: Cell::new(0),
+        line_buf: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -620,6 +623,15 @@ impl PtyState {
         Ok(n)
     }
 
+    fn flush_line_to_slave(&self) {
+        let line: Vec<u8> = self.line_buf.borrow_mut().drain(..).collect();
+        if !line.is_empty() && self.slave_buf.borrow().len() < PTY_BUF_CAP {
+            let space = PTY_BUF_CAP - self.slave_buf.borrow().len();
+            let n = core::cmp::min(line.len(), space);
+            self.slave_buf.borrow_mut().extend(&line[..n]);
+        }
+    }
+
     /// Master write: user input goes through the line discipline, then
     /// to the slave's read buffer. In cooked mode: signal chars (INTR,
     /// QUIT, SUSP) are intercepted and raised, CR→NL translation
@@ -634,15 +646,20 @@ impl PtyState {
         let isig = tty.isig();
         let echo = tty.echo();
         let icrnl = tty.icrnl();
+        let canon = tty.canonical();
         let intr = tty.cc[0];
         let quit = tty.cc[1];
         let susp = tty.cc[2];
+        let erase = tty.cc[3];
+        let kill = tty.cc[4];
+        let eof_ch = tty.cc[5];
         drop(tty);
         let mut written = 0usize;
         for &byte in buf.iter() {
             let mut ch = byte;
             // Signal character interception.
             if isig && ch == intr {
+                if canon { self.flush_line_to_slave(); }
                 self.raise_signal(2); // SIGINT
                 if echo {
                     self.master_buf.borrow_mut().push_back(b'^');
@@ -652,6 +669,7 @@ impl PtyState {
                 continue;
             }
             if isig && ch == quit {
+                if canon { self.flush_line_to_slave(); }
                 self.raise_signal(3); // SIGQUIT
                 if echo {
                     self.master_buf.borrow_mut().push_back(b'^');
@@ -661,6 +679,7 @@ impl PtyState {
                 continue;
             }
             if isig && ch == susp {
+                if canon { self.flush_line_to_slave(); }
                 self.raise_signal(20); // SIGTSTP
                 if echo {
                     self.master_buf.borrow_mut().push_back(b'^');
@@ -669,15 +688,62 @@ impl PtyState {
                 written += 1;
                 continue;
             }
-            // CR → NL translation.
+            // CR -> NL translation.
             if icrnl && ch == b'\r' {
                 ch = b'\n';
             }
-            // Echo: send back to master buffer for terminal display.
+            // -- Canonical mode: line-buffered input --
+            if canon {
+                if ch == erase {
+                    // ERASE: remove last char from line buffer.
+                    let removed = self.line_buf.borrow_mut().pop_back();
+                    if echo && removed.is_some() {
+                        self.master_buf.borrow_mut().push_back(b'\x08');
+                        self.master_buf.borrow_mut().push_back(b' ');
+                        self.master_buf.borrow_mut().push_back(b'\x08');
+                    }
+                    written += 1;
+                    continue;
+                }
+                if ch == kill {
+                    // KILL: clear line buffer.
+                    self.line_buf.borrow_mut().clear();
+                    if echo {
+                        self.master_buf.borrow_mut().push_back(b'^');
+                        self.master_buf.borrow_mut().push_back(b'U');
+                        self.master_buf.borrow_mut().push_back(b'\n');
+                    }
+                    written += 1;
+                    continue;
+                }
+                if ch == eof_ch {
+                    // EOF: flush whatever is in the line buffer (may be empty).
+                    self.flush_line_to_slave();
+                    written += 1;
+                    continue;
+                }
+                if ch == b'\n' {
+                    // Newline: flush line buffer including the newline.
+                    self.line_buf.borrow_mut().push_back(b'\n');
+                    self.flush_line_to_slave();
+                    if echo {
+                        self.master_buf.borrow_mut().push_back(b'\n');
+                    }
+                    written += 1;
+                    continue;
+                }
+                // Regular character: buffer it.
+                self.line_buf.borrow_mut().push_back(ch);
+                if echo {
+                    self.master_buf.borrow_mut().push_back(ch);
+                }
+                written += 1;
+                continue;
+            }
+            // -- Raw mode: pass through directly --
             if echo {
                 self.master_buf.borrow_mut().push_back(ch);
             }
-            // Write to slave buffer (the program reads this).
             if self.slave_buf.borrow().len() >= PTY_BUF_CAP {
                 break;
             }
