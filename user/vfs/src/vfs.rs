@@ -58,6 +58,28 @@ pub const O_CREAT: u16 = 0o100;
 pub const O_EXCL: u16 = 0o200;
 pub const O_TRUNC: u16 = 0o1000;
 pub const O_APPEND: u16 = 0o2000;
+/// poll() event bitmask -- matches Linux/POSIX values.
+pub const POLLIN: u16 = 0x001;
+pub const POLLPRI: u16 = 0x002;
+pub const POLLOUT: u16 = 0x004;
+pub const POLLERR: u16 = 0x008;
+pub const POLLHUP: u16 = 0x010;
+pub const POLLNVAL: u16 = 0x020;
+
+/// A single entry in a poll() set: an fd to check, the events the caller
+/// is interested in, and the events that actually occurred (filled in by
+/// Vfs::poll()).
+pub struct PollFd {
+    pub fd: u32,
+    pub events: u16,
+    pub revents: u16,
+}
+
+impl PollFd {
+    pub fn new(fd: u32, events: u16) -> PollFd {
+        PollFd { fd, events, revents: 0 }
+    }
+}
 
 /// lseek whence values.
 pub const SEEK_SET: u32 = 0;
@@ -1636,6 +1658,118 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Some(self.table_pool.get(idx)?.entries.len())
     }
 
+    /// Unified poll: check readiness across the task's open fds. For each
+    /// entry in `fds`, `revents` is filled with the subset of `events`
+    /// that the fd is ready for right now (POLLIN if data/EOF is available,
+    /// POLLOUT if buffer space is available, POLLNVAL if the fd is bad,
+    /// POLLERR if the device is dead).
+    ///
+    /// This is a stateless, non-blocking check -- it does not register any
+    /// waits.  For pipes and character devices it queries the in-core state;
+    /// for network sockets it checks the client-side state (actual driver
+    /// polling happens at the Ctx level via SocketOps::poll).
+    ///
+    /// Returns the number of fds with non-zero revents.
+    pub fn poll(
+        &self,
+        task: u32,
+        fds: &mut [PollFd],
+    ) -> Result<usize, Errno> {
+        let idx = self.tasks.get(task as usize).ok_or(Errno::EInval)?.fds;
+        let table = self.table_pool.get(idx).ok_or(Errno::EInval)?;
+        let mut n_ready = 0usize;
+        for f in fds.iter_mut() {
+            let revents = match table.get(f.fd) {
+                None => POLLNVAL,
+                Some(e) => Self::fd_ready(&e.node, f.events),
+            };
+            // POLLNVAL and POLLERR are always reported per POSIX, even
+            // if not in the requested events mask.
+            let always = revents & (POLLNVAL | POLLERR);
+            f.revents = always | ((revents & !always) & f.events);
+            if f.revents != 0 {
+                n_ready += 1;
+            }
+        }
+        Ok(n_ready)
+    }
+
+    /// The readiness bitmask for a single file-like object.  Returns the
+    /// events the object is *currently* ready for, regardless of what the
+    /// caller asked for (the caller masks with `events`).
+    fn fd_ready(obj: &FileObj, events: u16) -> u16 {
+        let mut revents = 0u16;
+        match obj {
+            FileObj::PipeRead(p) => {
+                if (events & POLLIN) != 0 && (p.has_data() || p.writers() == 0) {
+                    revents |= POLLIN;
+                }
+                if (events & POLLOUT) != 0 && p.readers() == 0 {
+                    revents |= POLLHUP;
+                }
+            }
+            FileObj::PipeWrite(p) => {
+                if (events & POLLIN) != 0 && p.readers() == 0 {
+                    revents |= POLLERR;
+                }
+                if (events & POLLOUT) != 0 && (p.space() > 0 || p.readers() == 0) {
+                    revents |= POLLOUT;
+                }
+                if p.readers() == 0 {
+                    revents |= POLLERR; // EPIPE condition
+                }
+            }
+            FileObj::Char(c) => {
+                if (events & POLLIN) != 0 && c.read_ready() {
+                    revents |= POLLIN;
+                }
+                // Console/null never block on write.
+                if (events & POLLOUT) != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+            FileObj::Socket(meta) => {
+                // Socket readiness is derived from client-side state.
+                // The caller can additionally query the network driver via
+                // SocketOps::poll for more accurate results.
+                match meta.state {
+                    crate::fileobj::SocketState::Connected
+                    | crate::fileobj::SocketState::Listening => {
+                        if (events & POLLIN) != 0 {
+                            revents |= POLLIN;
+                        }
+                        if (events & POLLOUT) != 0
+                            && meta.state != crate::fileobj::SocketState::HalfClosed
+                        {
+                            revents |= POLLOUT;
+                        }
+                    }
+                    crate::fileobj::SocketState::HalfClosed => {
+                        if (events & POLLIN) != 0 {
+                            revents |= POLLIN;
+                        }
+                        revents |= POLLHUP;
+                    }
+                    crate::fileobj::SocketState::Closed => {
+                        revents |= POLLERR;
+                    }
+                    _ => {}
+                }
+            }
+            FileObj::File(_) => {
+                // Regular files on a mount are always ready (no buffering
+                // backpressure for our read-only aerofs / small ramfs).
+                if (events & POLLIN) != 0 {
+                    revents |= POLLIN;
+                }
+                if (events & POLLOUT) != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+        }
+        revents
+    }
+
     /// Fork support: a new task whose fd table is a *copy* of the parent's
     /// (entries share their `Arc<FileObj>`, so parent and child correctly
     /// share open-file offsets and pipe ends), with cwd and credentials
@@ -2188,6 +2322,155 @@ mod tests {
         // Not a devfs mount: rejected.
         assert_eq!(v.add_dev_node("/tmp", "x", bell), Err(Errno::EInval));
     }
+
+    // ── poll ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn poll_bad_fd_returns_pollnval() {
+        let v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let mut fds = vec![PollFd::new(99, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        // POLLNVAL is always reported per POSIX, even if not in events.
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLNVAL);
+    }
+
+    #[test]
+    fn poll_empty_pipe_read_not_ready() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (_r, _w) = v.pipe(0).unwrap();
+        // Empty pipe with writer alive: not readable, not writable (full = 0%)
+        let mut fds = vec![PollFd::new(_r, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 0, "empty pipe read end not ready");
+        assert_eq!(fds[0].revents, 0);
+    }
+
+    #[test]
+    fn poll_pipe_read_ready_on_data() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.write(0, w, b"hello").unwrap();
+        let mut fds = vec![PollFd::new(r, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLIN);
+    }
+
+    #[test]
+    fn poll_pipe_read_ready_on_eof() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.close(0, w).unwrap();
+        let mut fds = vec![PollFd::new(r, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLIN);
+    }
+
+    #[test]
+    fn poll_pipe_write_ready_when_space() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (_r, w) = v.pipe(0).unwrap();
+        let mut fds = vec![PollFd::new(w, POLLOUT)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLOUT);
+    }
+
+    #[test]
+    fn poll_pipe_write_epipe_when_no_readers() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.close(0, r).unwrap();
+        let mut fds = vec![PollFd::new(w, POLLOUT | POLLERR)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        // POLLERR because no readers (EPIPE condition)
+        assert_eq!(fds[0].revents & POLLERR, POLLERR);
+    }
+
+    #[test]
+    fn poll_console_not_ready_without_input() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let console = Arc::new(CharNode::console());
+        v.mount_devfs("/dev", console).unwrap();
+        let fd = v.open(0, "/dev/console", O_RDONLY, 0).unwrap();
+        let mut fds = vec![PollFd::new(fd, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 0, "console not ready without input");
+        assert_eq!(fds[0].revents, 0);
+    }
+
+    #[test]
+    fn poll_console_ready_with_input() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let console = Arc::new(CharNode::console());
+        console.console_io().push_input(b"hello");
+        v.mount_devfs("/dev", console).unwrap();
+        let fd = v.open(0, "/dev/console", O_RDONLY, 0).unwrap();
+        let mut fds = vec![PollFd::new(fd, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLIN);
+    }
+
+    #[test]
+    fn poll_null_always_ready() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let console = Arc::new(CharNode::console());
+        v.mount_devfs("/dev", console).unwrap();
+        let fd = v.open(0, "/dev/null", O_RDONLY, 0).unwrap();
+        let mut fds = vec![PollFd::new(fd, POLLIN | POLLOUT)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLIN | POLLOUT);
+    }
+
+    #[test]
+    fn poll_ramfs_file_always_ready() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        v.mount_ramfs("/tmp").unwrap();
+        let fd = v.open(0, "/tmp/f", O_CREAT | O_RDWR, 0o644).unwrap();
+        v.write(0, fd, b"data").unwrap();
+        let mut fds = vec![PollFd::new(fd, POLLIN | POLLOUT)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fds[0].revents, POLLIN | POLLOUT);
+    }
+
+    #[test]
+    fn poll_mixed_fds() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.write(0, w, b"data").unwrap();
+        v.mount_ramfs("/tmp").unwrap();
+        let f = v.open(0, "/tmp/f", O_CREAT | O_RDWR, 0o644).unwrap();
+        // fd 99 doesn't exist (POLLNVAL), r has data (POLLIN), f is a file (POLLIN|POLLOUT)
+        let mut fds = vec![
+            PollFd::new(99, POLLIN),
+            PollFd::new(r, POLLIN),
+            PollFd::new(f, POLLIN | POLLOUT),
+        ];
+        let n = v.poll(0, &mut fds).unwrap();
+        // POLLNVAL on fd 99 counts as ready (always reported per POSIX).
+        assert_eq!(n, 3, "three fds ready (bad fd, r, and f)");
+        assert_eq!(fds[0].revents, POLLNVAL);
+        assert_eq!(fds[1].revents, POLLIN);
+        assert_eq!(fds[2].revents, POLLIN | POLLOUT);
+    }
+
+    #[test]
+    fn poll_events_masking() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (_r, w) = v.pipe(0).unwrap();
+        // Write end is writable, but we only ask for POLLIN (which won't be set)
+        let mut fds = vec![PollFd::new(w, POLLIN)];
+        let n = v.poll(0, &mut fds).unwrap();
+        assert_eq!(n, 0, "POLLIN not masked for write end");
+        assert_eq!(fds[0].revents, 0);
+    }
+
 
     /// Kernelless stand-ins for unit tests that don't touch the device.
     mod dummy {

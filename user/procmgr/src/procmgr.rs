@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::sockops::SocketOps;
-use aerosls_vfs::{BufferAlloc, Errno, Vfs, CLONE_FILES, O_RDONLY};
+use aerosls_vfs::{BufferAlloc, Errno, PollFd, Vfs, CLONE_FILES, O_RDONLY};
 
 // ── Signals ────────────────────────────────────────────────────────────────
 
@@ -1233,11 +1233,24 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
             .unwrap_or(&[])
     }
 
+
     /// Replace the calling task's environment. The shell calls this after
     /// builtins modify the env region so the TaskCtl stays in sync.
     pub fn set_env(&mut self, env: Vec<(String, String)>) {
         if let Some(tc) = self.pm.tasks.get_mut(&self.task) {
             tc.env = env;
         }
+    }
+
+    /// Unified poll: check readiness across the task's open fds.
+    /// Delegates to Vfs::poll(). Socket readiness is derived from
+    /// client-side state; the caller can additionally query the network
+    /// driver via SocketOps::poll for more accurate socket results.
+    pub fn poll(
+        &mut self,
+        fds: &mut [PollFd],
+    ) -> Result<usize, Errno> {
+        let task = self.task;
+        self.pm.vfs.poll(task, fds)
     }
 }
