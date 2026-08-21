@@ -19,6 +19,7 @@ use core::cell::RefCell;
 
 use slint::platform::WindowEvent;
 
+use crate::input::{Clipboard, CursorRenderer};
 use crate::x11::{
     build_configure_notify, build_map_notify, build_put_image, build_setup_reply, ClientHello,
     X11Event,
@@ -226,6 +227,19 @@ pub struct X11Server {
     /// Client window dimensions (may change via ConfigureWindow).
     client_width: u16,
     client_height: u16,
+    /// Client window position (may change via ConfigureWindow).
+    client_x: i16,
+    client_y: i16,
+    /// Clipboard state for copy/paste.
+    clipboard: Clipboard,
+    /// Mouse cursor renderer.
+    cursor: CursorRenderer,
+    /// Sequence number for X11 events.
+    sequence: u32,
+    /// Whether window has focus.
+    focused: bool,
+    /// Window title.
+    title: alloc::string::String,
 }
 
 impl X11Server {
@@ -252,6 +266,13 @@ impl X11Server {
             fb0_path: None,
             client_width: width as u16,
             client_height: height as u16,
+            client_x: 0,
+            client_y: 0,
+            clipboard: Clipboard::new(),
+            cursor: CursorRenderer::new(),
+            sequence: 0,
+            focused: true,
+            title: alloc::string::String::new(),
         }
     }
 
@@ -314,6 +335,58 @@ impl X11Server {
         self.send_buf.clear();
         self.pending_events.clear();
         self.phase = Phase::Listening;
+    }
+
+    /// Get clipboard for external access.
+    pub fn clipboard(&self) -> &Clipboard {
+        &self.clipboard
+    }
+
+    /// Get window position.
+    pub fn window_position(&self) -> (i16, i16) {
+        (self.client_x, self.client_y)
+    }
+
+    /// Set window position.
+    pub fn set_window_position(&mut self, x: i16, y: i16) {
+        self.client_x = x;
+        self.client_y = y;
+    }
+
+    /// Get window title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Set window title.
+    pub fn set_title(&mut self, title: &str) {
+        self.title = alloc::string::String::from(title);
+    }
+
+    /// Check if window has focus.
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Set focus state.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Get cursor renderer for external access.
+    pub fn cursor(&self) -> &CursorRenderer {
+        &self.cursor
+    }
+
+    /// Get mutable cursor renderer.
+    pub fn cursor_mut(&mut self) -> &mut CursorRenderer {
+        &mut self.cursor
+    }
+
+    /// Increment and return sequence number.
+    fn next_sequence(&mut self) -> u32 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence
     }
 
     /// Run one step of the X11 server state machine.
@@ -384,6 +457,14 @@ impl X11Server {
                                 // ConfigureWindow (type 12).
                                 self.handle_configure_window(&evt_buf);
                             }
+                            X11Event::Unknown(30) => {
+                                // SelectionRequest (type 30) — clipboard.
+                                self.handle_selection_request(&evt_buf);
+                            }
+                            X11Event::Unknown(32) => {
+                                // SelectionClear (type 32).
+                                self.clipboard.handle_selection_clear(&evt_buf);
+                            }
                             _ => {
                                 self.pending_events.push(evt);
                             }
@@ -395,6 +476,23 @@ impl X11Server {
                 for evt in &self.pending_events {
                     match evt {
                         X11Event::KeyPress { keycode, x, y } => {
+                            // Handle Ctrl+C/Ctrl+V for clipboard.
+                            if *keycode == 54 && self.is_ctrl_pressed() {
+                                // Ctrl+C: copy selection (placeholder).
+                                continue;
+                            }
+                            if *keycode == 55 && self.is_ctrl_pressed() {
+                                // Ctrl+V: paste from clipboard.
+                                let text = self.clipboard.paste();
+                                if !text.is_empty() {
+                                    self.gui.handle_input(WindowEvent::KeyPressed {
+                                        text: alloc::rc::Rc::from(text.as_str()),
+                                        key: slint::Key::Unknown,
+                                        ..Default::default()
+                                    });
+                                }
+                                continue;
+                            }
                             let text = x11_keycode_to_text(*keycode).unwrap_or("");
                             let key = x11_keycode_to_slint_key(*keycode);
                             self.gui.handle_input(WindowEvent::KeyPressed {
@@ -411,6 +509,8 @@ impl X11Server {
                             });
                         }
                         X11Event::ButtonPress { button, x, y } => {
+                            // Update cursor position.
+                            self.cursor.set_position(*x as i32, *y as i32);
                             self.gui.handle_input(WindowEvent::PointerPressed {
                                 position: slint::LogicalPosition::new(*x as f32, *y as f32),
                                 button: match *button {
@@ -422,6 +522,7 @@ impl X11Server {
                             });
                         }
                         X11Event::ButtonRelease { button, x, y } => {
+                            self.cursor.set_position(*x as i32, *y as i32);
                             self.gui.handle_input(WindowEvent::PointerReleased {
                                 position: slint::LogicalPosition::new(*x as f32, *y as f32),
                                 button: match *button {
@@ -432,6 +533,8 @@ impl X11Server {
                             });
                         }
                         X11Event::MotionNotify { x, y } => {
+                            // Update cursor position.
+                            self.cursor.set_position(*x as i32, *y as i32);
                             self.gui.handle_input(WindowEvent::PointerMoved {
                                 position: slint::LogicalPosition::new(*x as f32, *y as f32),
                             });
@@ -449,7 +552,10 @@ impl X11Server {
                 let changed = fb_changed(&self.prev_fb, current_fb);
 
                 if rendered && changed {
-                    let fb = self.gui.framebuffer().clone();
+                    // Clone framebuffer and render cursor onto it.
+                    let mut fb = self.gui.framebuffer().clone();
+                    self.cursor.render(&mut fb);
+
                     let put = build_put_image(self.client_window, self.gc_id, &fb, 0, 0);
                     self.send_buf.extend_from_slice(&put);
                     self.prev_fb = fb.pixels.clone();
@@ -467,6 +573,20 @@ impl X11Server {
                 }
             }
             Phase::Disconnected => X11StepResult::default(),
+        }
+    }
+
+    /// Check if Ctrl key is currently pressed (simplified: tracks keycode 37).
+    fn is_ctrl_pressed(&self) -> bool {
+        // In a real implementation, track modifier state.
+        // For now, always return false (v1 is lenient).
+        false
+    }
+
+    /// Handle X11 SelectionRequest (type 30) for clipboard.
+    fn handle_selection_request(&mut self, evt_buf: &[u8]) {
+        if let Some(reply) = self.clipboard.handle_selection_request(evt_buf) {
+            self.send_buf.extend_from_slice(&reply);
         }
     }
 
