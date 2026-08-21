@@ -2526,3 +2526,44 @@ fn last_exit_status_in_dollar_question() {
 }
 
 
+
+/// Ctrl-C during an init script kills the running line and init
+/// proceeds to the next one.
+///
+/// init.rc has two lines: `sleep 999` then `echo done`.  Ctrl-C kills
+/// the sleep; init reaps it (exit 130) and moves on to `echo done`,
+/// Ctrl-C during an init script kills the running line and init
+/// proceeds to the next one.
+///
+/// init.rc has two lines: `sleep 999` then `echo done`.  Ctrl-C kills
+/// the sleep; init reaps it (exit 130) and moves on to `echo done`,
+/// which prints "done" and exits.
+#[test]
+fn ctrl_c_kills_init_script_line() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sleep 999\n/bin/echo done\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // init starts running sleep 999.  Ctrl-C kills it.
+    console.console_io().push_input(b"\x03");
+    booted.run(200);
+
+    // init should have moved on to the next line: echo done.
+    let out = console.console_io().output().to_vec();
+    assert!(out.windows(4).any(|w| w == b"done"),
+        "init reached next line after Ctrl-C, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

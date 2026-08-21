@@ -741,22 +741,29 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             }
         }
         // Terminal interrupt: when the console has a Ctrl-C (0x03) in its
-        // input buffer, deliver SIGINT to every task's foreground children
-        // immediately.  This is how a blocked shell (WaitingChild) still
-        // observes Ctrl-C — the signal kills the foreground child, which
-        // unblocks the wait, and the shell re-prompts on its next step.
+        // input buffer, deliver SIGINT to foreground children.  Falls
+        // back to ALL children when no foreground set exists (e.g. init,
+        // which doesn't use the shell's foreground mechanism).
         if self.vfs.has_console_byte(0x03) {
             self.vfs.discard_console_byte(0x03);
             let fg_children: Vec<u32> = self.tasks.values()
                 .flat_map(|tc| tc.foreground.iter().copied())
                 .collect();
-            for c in fg_children {
+            let targets: Vec<u32> = if fg_children.is_empty() {
+                self.tasks.values()
+                    .flat_map(|tc| tc.children.iter().copied())
+                    .collect()
+            } else {
+                fg_children
+            };
+            for c in targets {
                 self.kill(c, SIGINT).ok();
             }
         }
-        // Quit: Ctrl-\\ (0x1c) sends SIGQUIT to every foreground child,
+        // Quit: Ctrl-\\ (0x1c) sends SIGQUIT to foreground children,
         // terminating them with exit 128+3=131.  The parent is woken
-        // from WaitingChild so the shell can re-prompt.
+        // from WaitingChild so the shell can re-prompt.  Falls back to
+        // all children when no foreground set exists (init mode).
         if self.vfs.has_console_byte(0x1c) {
             self.vfs.discard_console_byte(0x1c);
             let fg_children: Vec<u32> = self.tasks.values()
