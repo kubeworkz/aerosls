@@ -1,0 +1,13 @@
+[package]
+name = "aerosls-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Slint GUI integration for the AeroSLS POSIX sidecar — software-rendered UI for embedded ARM"
+license = "MIT"
+
+[dependencies]
+slint = { version = "1.9", default-features = false, features = [
+    "renderer-software",
+    "unsafe-single-threaded",
+    "compat-1-0",
+] }
