@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod x11;
 pub mod server;
 pub mod input;
+pub mod wm;
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
