@@ -1505,7 +1505,24 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                         Ok(())
                     }
                     crate::fileobj::TIOCSCTTY => {
-                        // v1 stub: no controlling terminal tracking yet.
+                        // v1 stub: set controlling terminal (set foreground pgid).
+                        // arg[0..4] = pgid.
+                        if arg.len() >= 4 {
+                            let pgid = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]);
+                            p.foreground_pgid.set(pgid);
+                        }
+                        Ok(())
+                    }
+                    crate::fileobj::TCGETS => {
+                        if arg.len() < 36 { return Err(Errno::EInval); }
+                        let tty = p.get_termios();
+                        tty.encode(arg);
+                        Ok(())
+                    }
+                    crate::fileobj::TCSETS => {
+                        if arg.len() < 20 { return Err(Errno::EInval); }
+                        let tty = crate::fileobj::Termios::decode(arg).ok_or(Errno::EInval)?;
+                        p.set_termios(tty);
                         Ok(())
                     }
                     _ => Err(Errno::ENotty),
@@ -1815,7 +1832,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             FileObj::PipeWrite(p) => p.write(buf),
             FileObj::Char(c) => c.write(buf),
             FileObj::PipeRead(_) => Err(Errno::EBadf),
-            FileObj::PtyMaster(p) => p.master_write(buf),
+            FileObj::PtyMaster(p) => p.master_input(buf),
             FileObj::PtySlave(p) => p.slave_write(buf),
             FileObj::Socket(_) => Err(Errno::EBadf),
         }

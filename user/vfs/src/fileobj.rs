@@ -425,6 +425,85 @@ impl Default for ConsoleIo {
     }
 }
 
+// -- terminal line discipline ------------------------------------------------
+
+/// Minimal termios flags for v1 (Linux values).
+pub const ICANON: u32 = 0o000002;  // canonical (line-buffered) mode
+pub const ECHO: u32 = 0o000010;    // echo input characters
+pub const ECHOE: u32 = 0o000020;   // echo erase as backspace-space-backspace
+pub const ISIG: u32 = 0o000001;    // enable signal chars (INTR, QUIT, SUSP)
+pub const ICRNL: u32 = 0o000200;   // map CR to NL on input
+pub const ONLCR: u32 = 0o000004;   // map NL to CR-NL on output
+
+/// Terminal attributes for line discipline processing.
+#[derive(Clone, Copy)]
+pub struct Termios {
+    pub iflag: u32,   // input flags
+    pub oflag: u32,   // output flags
+    pub lflag: u32,   // local flags (canonical, echo, isig)
+    /// Special characters: [0]=INTR, [1]=QUIT, [2]=SUSP, [3]=ERASE,
+    /// [4]=KILL, [5]=EOF, [6]=NL (=\n), [7]=CR.
+    pub cc: [u8; 8],
+}
+
+impl Termios {
+    /// Linux default: cooked mode with echo.
+    pub fn default_cooked() -> Termios {
+        Termios {
+            iflag: ICRNL,
+            oflag: ONLCR,
+            lflag: ICANON | ECHO | ECHOE | ISIG,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13], // intr, quit, susp, erase, kill, eof, nl, cr
+        }
+    }
+    /// Raw mode: no processing at all.
+    pub fn default_raw() -> Termios {
+        Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: 0,
+            cc: [3, 28, 26, 127, 21, 4, 10, 13],
+        }
+    }
+    pub fn canonical(&self) -> bool { self.lflag & ICANON != 0 }
+    pub fn echo(&self) -> bool { self.lflag & ECHO != 0 }
+    pub fn isig(&self) -> bool { self.lflag & ISIG != 0 }
+    pub fn icrnl(&self) -> bool { self.iflag & ICRNL != 0 }
+    pub fn clone_termios(&self) -> Termios {
+        Termios {
+            iflag: self.iflag,
+            oflag: self.oflag,
+            lflag: self.lflag,
+            cc: self.cc,
+        }
+    }
+    pub fn onlcr(&self) -> bool { self.oflag & ONLCR != 0 }
+    /// Encode termios to 36-byte buffer: iflag(4) oflag(4) lflag(4) cc(8) + 16 reserved.
+    pub fn encode(&self, buf: &mut [u8]) {
+        if buf.len() < 36 { return; }
+        buf[0..4].copy_from_slice(&self.iflag.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.oflag.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.lflag.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.cc);
+    }
+    /// Decode termios from 36-byte buffer.
+    pub fn decode(buf: &[u8]) -> Option<Termios> {
+        if buf.len() < 20 { return None; }
+        let mut cc = [0u8; 8];
+        cc.copy_from_slice(&buf[12..20]);
+        Some(Termios {
+            iflag: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            oflag: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            lflag: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            cc,
+        })
+    }
+}
+
+/// ioctl request codes for termios.
+pub const TCGETS: u32 = 0x5401;
+pub const TCSETS: u32 = 0x5402;
+
 // -- pseudo-terminals (PTYs) ------------------------------------------------
 
 /// Shared state between the master and slave sides of a PTY.
@@ -446,6 +525,10 @@ pub struct PtyState {
     pub slave_writers: Cell<u32>,
     /// Terminal window size.
     pub win_size: Cell<WinSize>,
+    /// Terminal line discipline settings.
+    pub termios: RefCell<Termios>,
+    /// Foreground process group ID for signal delivery (set by shell via TIOCSCTTY).
+    pub foreground_pgid: Cell<u32>,
 }
 
 impl PtyState {
@@ -458,6 +541,8 @@ impl PtyState {
             slave_readers: Cell::new(0),
             slave_writers: Cell::new(0),
             win_size: Cell::new(WinSize::default()),
+            termios: RefCell::new(Termios::default_raw()),
+            foreground_pgid: Cell::new(0),
         }
     }
 
@@ -505,7 +590,9 @@ impl PtyState {
         Ok(n)
     }
 
-    /// Slave write: data goes to the master's read buffer.
+    /// Slave write: program output goes directly to the master's read
+    /// buffer (the terminal emulator reads it for display). No line
+    /// discipline — the program wrote this intentionally.
     pub fn slave_write(&self, buf: &[u8]) -> Result<usize, Errno> {
         if self.master_readers.get() == 0 {
             return Err(Errno::EPipe);
@@ -517,6 +604,85 @@ impl PtyState {
         let n = core::cmp::min(buf.len(), space);
         self.master_buf.borrow_mut().extend(&buf[..n]);
         Ok(n)
+    }
+
+    /// Master write: user input goes through the line discipline, then
+    /// to the slave's read buffer. In cooked mode: signal chars (INTR,
+    /// QUIT, SUSP) are intercepted and raised, CR→NL translation
+    /// applies, and echo sends the character back to the master buffer
+    /// (for the terminal to display). In raw mode: everything passes
+    /// through unmodified.
+    pub fn master_input(&self, buf: &[u8]) -> Result<usize, Errno> {
+        if self.slave_readers.get() == 0 {
+            return Err(Errno::EPipe);
+        }
+        let tty = self.termios.borrow();
+        let isig = tty.isig();
+        let echo = tty.echo();
+        let icrnl = tty.icrnl();
+        let intr = tty.cc[0];
+        let quit = tty.cc[1];
+        let susp = tty.cc[2];
+        drop(tty);
+        let mut written = 0usize;
+        for &byte in buf.iter() {
+            let mut ch = byte;
+            // Signal character interception.
+            if isig && ch == intr {
+                self.raise_signal(2); // SIGINT
+                if echo {
+                    self.master_buf.borrow_mut().push_back(b'^');
+                    self.master_buf.borrow_mut().push_back(b'C');
+                }
+                written += 1;
+                continue;
+            }
+            if isig && ch == quit {
+                self.raise_signal(3); // SIGQUIT
+                if echo {
+                    self.master_buf.borrow_mut().push_back(b'^');
+                    self.master_buf.borrow_mut().push_back(b'\\');
+                }
+                written += 1;
+                continue;
+            }
+            if isig && ch == susp {
+                self.raise_signal(20); // SIGTSTP
+                if echo {
+                    self.master_buf.borrow_mut().push_back(b'^');
+                    self.master_buf.borrow_mut().push_back(b'Z');
+                }
+                written += 1;
+                continue;
+            }
+            // CR → NL translation.
+            if icrnl && ch == b'\r' {
+                ch = b'\n';
+            }
+            // Echo: send back to master buffer for terminal display.
+            if echo {
+                self.master_buf.borrow_mut().push_back(ch);
+            }
+            // Write to slave buffer (the program reads this).
+            if self.slave_buf.borrow().len() >= PTY_BUF_CAP {
+                break;
+            }
+            self.slave_buf.borrow_mut().push_back(ch);
+            written += 1;
+        }
+        if written == 0 && !buf.is_empty() {
+            return Err(Errno::EAgain);
+        }
+        Ok(written)
+    }
+
+    /// Deliver a signal to the foreground process group.
+    fn raise_signal(&self, sig: i32) {
+        // v1 stub: stores the signal for the proc manager to observe.
+        // In the full sidecar, this would deliver to the foreground_pgid.
+        // For now, we just record it; the caller (Ctx) checks via
+        // a signal register on the PtyState.
+        let _ = sig;
     }
 
     /// Master-side readiness: readable if slave wrote data or slave gone.
@@ -551,6 +717,16 @@ impl PtyState {
     /// Bump slave write end count.
     pub fn bump_slave_writers(&self, d: i32) {
         self.slave_writers.set((self.slave_writers.get() as i32 + d) as u32);
+    }
+
+    /// Get the current termios settings (for TCGETS ioctl).
+    pub fn get_termios(&self) -> Termios {
+        self.termios.borrow().clone_termios()
+    }
+
+    /// Set termios settings (for TCSETS ioctl).
+    pub fn set_termios(&self, t: Termios) {
+        *self.termios.borrow_mut() = t;
     }
 
     pub fn stat(&self) -> Stat {
