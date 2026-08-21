@@ -2694,3 +2694,207 @@ fn coreutils_lifecycle() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Mock SSH client for the sshd boot test. Returns pre-crafted SSH
+/// protocol messages in sequence: version string → KEXINIT →
+/// SERVICE_REQUEST → USERAUTH_REQUEST → CHANNEL_OPEN →
+/// CHANNEL_REQUEST(pty-req) → CHANNEL_REQUEST(shell) → EOF.
+struct SshClientMock {
+    next_id: u32,
+    recv_seq: u32,
+    log: Vec<MockEvent>,
+}
+
+impl SshClientMock {
+    fn new() -> SshClientMock {
+        SshClientMock {
+            next_id: 2,
+            recv_seq: 0,
+            log: Vec::new(),
+        }
+    }
+
+    /// Build a minimal SSH binary packet.
+    fn ssh_encode(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let block_size: usize = 8;
+        let content_len = 1 + payload.len();
+        let min_total = 1 + content_len + 4;
+        let total = if min_total % block_size == 0 {
+            min_total
+        } else {
+            min_total + block_size - (min_total % block_size)
+        };
+        let padding = total - 1 - content_len;
+        let mut p = Vec::with_capacity(4 + total);
+        p.extend_from_slice(&(total as u32).to_le_bytes());
+        p.push(padding as u8);
+        p.push(msg_type);
+        p.extend_from_slice(payload);
+        for _ in 0..padding {
+            p.push(0);
+        }
+        p
+    }
+
+    fn ssh_string(s: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + s.len());
+        v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        v.extend_from_slice(s);
+        v
+    }
+
+    /// KEXINIT payload with "none" for all algorithms.
+    fn kexinit_payload() -> Vec<u8> {
+        let mut p = Vec::with_capacity(220);
+        p.extend_from_slice(&[0u8; 16]);
+        let none = b"none";
+        for _ in 0..10 {
+            p.extend_from_slice(&(none.len() as u32).to_le_bytes());
+            p.extend_from_slice(none);
+        }
+        p.push(0);
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p
+    }
+
+    /// Return the next response for a recv() call.
+    fn next_recv(&mut self) -> Vec<u8> {
+        let seq = self.recv_seq;
+        self.recv_seq += 1;
+        match seq {
+            0 => b"SSH-2.0-client_0.1\r\n".to_vec(),
+            1 => Self::ssh_encode(20, &Self::kexinit_payload()),
+            2 => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&Self::ssh_string(b"ssh-userauth"));
+                Self::ssh_encode(5, &payload)
+            }
+            3 => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&Self::ssh_string(b"test"));
+                payload.extend_from_slice(&Self::ssh_string(b"ssh-connection"));
+                payload.extend_from_slice(&Self::ssh_string(b"password"));
+                payload.push(0);
+                payload.extend_from_slice(&Self::ssh_string(b"secret"));
+                Self::ssh_encode(50, &payload)
+            }
+            4 => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&Self::ssh_string(b"session"));
+                payload.extend_from_slice(&65536u32.to_le_bytes());
+                payload.extend_from_slice(&32768u32.to_le_bytes());
+                Self::ssh_encode(90, &payload)
+            }
+            5 => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&Self::ssh_string(b"pty-req"));
+                payload.push(1);
+                payload.extend_from_slice(&Self::ssh_string(b"xterm"));
+                payload.extend_from_slice(&80u32.to_le_bytes());
+                payload.extend_from_slice(&24u32.to_le_bytes());
+                payload.extend_from_slice(&640u32.to_le_bytes());
+                payload.extend_from_slice(&480u32.to_le_bytes());
+                payload.extend_from_slice(&Self::ssh_string(b""));
+                Self::ssh_encode(98, &payload)
+            }
+            6 => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&Self::ssh_string(b"shell"));
+                payload.push(1);
+                Self::ssh_encode(98, &payload)
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl aerosls_proto::sockops::SocketOps for SshClientMock {
+    fn socket(&mut self, _sock_type: u16) -> Result<u32, u16> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.log.push(MockEvent::Socket(_sock_type));
+        Ok(id)
+    }
+    fn connect(&mut self, _id: u32, _ip: u32, _port: u16) -> Result<(), u16> {
+        Err(0)
+    }
+    fn bind(&mut self, id: u32, ip: u32, port: u16) -> Result<(), u16> {
+        self.log.push(MockEvent::Bind(id, ip, port));
+        Ok(())
+    }
+    fn listen(&mut self, id: u32) -> Result<(), u16> {
+        self.log.push(MockEvent::Listen(id));
+        Ok(())
+    }
+    fn accept(&mut self, _id: u32) -> Result<u32, u16> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.log.push(MockEvent::Accept(_id));
+        Ok(id)
+    }
+    fn send(&mut self, id: u32, data: &[u8]) -> Result<usize, u16> {
+        self.log.push(MockEvent::Send(id, data.len()));
+        Ok(data.len())
+    }
+    fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16> {
+        self.log.push(MockEvent::Recv(id));
+        let data = self.next_recv();
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let n = core::cmp::min(buf.len(), data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
+    fn close_socket(&mut self, id: u32) -> Result<(), u16> {
+        self.log.push(MockEvent::CloseSocket(id));
+        Ok(())
+    }
+    fn poll(&mut self, _id: u32) -> Result<u16, u16> {
+        if self.recv_seq <= 6 {
+            Ok(0x01)
+        } else {
+            Ok(0)
+        }
+    }
+    fn shutdown(&mut self, id: u32, how: u8) -> Result<(), u16> {
+        self.log.push(MockEvent::Shutdown(id, how));
+        Ok(())
+    }
+}
+
+/// sshd accepts a TCP connection, performs SSH handshake, forks a PTY,
+/// and relays data. The mock client sends a full handshake sequence
+/// and then EOF — the server should exit cleanly.
+#[test]
+fn sshd_handshake_and_pty_relay() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sshd", b"sshd\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sshd 22\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    let mock = SshClientMock::new();
+    booted.proc.set_net(Box::new(mock));
+
+    booted.run(500);
+
+    assert_eq!(
+        booted.proc.exit_code(0),
+        Some(0),
+        "sshd should exit 0 after mock client EOF"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

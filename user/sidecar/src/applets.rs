@@ -4034,6 +4034,460 @@ pub fn unix_echo<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     Step::Done
 }
 
+// ── SSH packet helpers ──────────────────────────────────────────────────────
+
+/// Encode an SSH binary packet (RFC 4253 §6).
+fn ssh_encode(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+    let block_size: usize = 8;
+    let content_len = 1 + payload.len();
+    let min_total = 1 + content_len + 4;
+    let total = if min_total % block_size == 0 {
+        min_total
+    } else {
+        min_total + block_size - (min_total % block_size)
+    };
+    let padding = total - 1 - content_len;
+    let packet_length = total as u32;
+    let mut p = Vec::with_capacity(4 + total);
+    p.extend_from_slice(&packet_length.to_le_bytes());
+    p.push(padding as u8);
+    p.push(msg_type);
+    p.extend_from_slice(payload);
+    for _ in 0..padding {
+        p.push(0);
+    }
+    p
+}
+
+/// Try to parse an SSH binary packet from `buf`.
+/// Returns `(bytes_consumed, msg_type, payload)` or `None` if incomplete.
+fn ssh_decode(buf: &[u8]) -> Option<(usize, u8, Vec<u8>)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if buf.len() < 4 + len {
+        return None;
+    }
+    let pad_len = buf[4] as usize;
+    let payload_len = len.saturating_sub(1 + pad_len);
+    if payload_len == 0 {
+        return Some((4 + len, buf[5], Vec::new()));
+    }
+    let msg_type = buf[5];
+    let payload = buf[6..6 + payload_len].to_vec();
+    Some((4 + len, msg_type, payload))
+}
+
+/// Encode an SSH string (uint32 length + bytes).
+fn ssh_string(s: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + s.len());
+    v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    v.extend_from_slice(s);
+    v
+}
+
+/// Build a KEXINIT payload with "none" for all algorithms.
+fn ssh_kexinit_payload() -> Vec<u8> {
+    let mut p = Vec::with_capacity(220);
+    // 16-byte cookie (zeros for simplicity).
+    p.extend_from_slice(&[0u8; 16]);
+    let none = b"none";
+    for _ in 0..10 {
+        // 10 name-lists: kex, hostkey, enc_c2s, enc_s2c, mac_c2s, mac_s2c,
+        // comp_c2s, comp_s2c, lang_c2s, lang_s2c
+        p.extend_from_slice(&(none.len() as u32).to_le_bytes());
+        p.extend_from_slice(none);
+    }
+    p.push(0); // first_kex_packet_follows = false
+    p.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    p
+}
+
+/// Build a CHANNEL_OPEN_CONFIRMATION payload.
+fn ssh_channel_open_conf_payload(
+    recipient: u32, sender: u32, window: u32, max_pkt: u32,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(16);
+    p.extend_from_slice(&recipient.to_le_bytes());
+    p.extend_from_slice(&sender.to_le_bytes());
+    p.extend_from_slice(&window.to_le_bytes());
+    p.extend_from_slice(&max_pkt.to_le_bytes());
+    p
+}
+
+/// Build a CHANNEL_DATA payload.
+fn ssh_channel_data_payload(ch: u32, data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 + 4 + data.len());
+    p.extend_from_slice(&ch.to_le_bytes());
+    p.extend_from_slice(&ssh_string(data));
+    p
+}
+
+/// Build a CHANNEL_SUCCESS payload.
+fn ssh_channel_success_payload(ch: u32) -> Vec<u8> {
+    ch.to_le_bytes().to_vec()
+}
+
+/// Minimal SSH server: listens on TCP, accepts one connection, performs
+/// SSH handshake (version exchange → KEXINIT → auth → channel open →
+/// pty-req → shell), forks a child on a PTY, and relays data between
+/// the TCP socket and the PTY master.
+///
+/// argv: `["sshd", PORT]` (default 22).
+///
+/// Data layout:
+/// `[0]`    phase (0=init 1=accept 2=version 3=kex 4=auth 5=chan 6=fork 7=relay)
+/// `[1]`    listen socket id
+/// `[2]`    accepted socket id
+/// `[3..5]` recv buf length (LE u16)
+/// `[5]`    child forked flag (1=yes)
+/// `[6..8]` master fd (LE u16)
+/// `[8]`    relay sub-phase (0=read sock, 1=write pty, 2=read pty, 3=write sock)
+/// `[9..13]` our channel id (LE u32)
+/// `[13..17]` peer channel id (LE u32)
+/// `[17..]` recv buffer
+const SSH_RECV_BUF: usize = 17;
+const SSH_BUF_CAP: usize = 1024;
+
+pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if is_child(&ctx.data) {
+        return ctx.exit(0);
+    }
+
+    // ── Phase 0: init ────────────────────────────────────────────────
+    if ctx.data.is_empty() {
+        let port: u16 = ctx.argv().get(1).and_then(|s| s.parse().ok()).unwrap_or(22);
+        if ctx.net().is_none() {
+            return Step::Exit(1);
+        }
+        let sock_id = match ctx.net().unwrap().socket(aerosls_proto::SOCK_STREAM) {
+            Ok(id) => id,
+            Err(_) => return Step::Exit(1),
+        };
+        let _ = ctx.setsockopt(
+            sock_id,
+            aerosls_proto::sockops::SOL_SOCKET,
+            aerosls_proto::sockops::SO_REUSEADDR,
+            &[1, 0, 0, 0],
+        );
+        if ctx.net().unwrap().bind(sock_id, 0, port).is_err() {
+            return Step::Exit(1);
+        }
+        if ctx.net().unwrap().listen(sock_id).is_err() {
+            return Step::Exit(1);
+        }
+        ctx.data.resize(SSH_RECV_BUF + SSH_BUF_CAP, 0);
+        ctx.data[1] = sock_id as u8;
+        ctx.data[0] = 1; // → accept
+        return Step::Yield;
+    }
+
+    match ctx.data[0] {
+        // ── Phase 1: accept ──────────────────────────────────────────
+        1 => {
+            let listen_id = ctx.data[1] as u32;
+            match ctx.net().unwrap().poll(listen_id) {
+                Ok(ev) if ev & 0x01 != 0 => {
+                    let acc = match ctx.net().unwrap().accept(listen_id) {
+                        Ok(id) => id,
+                        Err(_) => return Step::Exit(1),
+                    };
+                    ctx.data[2] = acc as u8;
+                    // Send server version string.
+                    let ver = b"SSH-2.0-aerosls_0.1\r\n";
+                    let _ = ctx.net().unwrap().send(acc, ver);
+                    ctx.data[0] = 2; // → read client version
+                    ctx.data[3] = 0; // recv buf len = 0
+                    Step::Yield
+                }
+                _ => Step::Yield,
+            }
+        }
+        // ── Phase 2: read client version ─────────────────────────────
+        2 => {
+            let acc = ctx.data[2] as u32;
+            if !try_recv(ctx, acc) {
+                return Step::Yield;
+            }
+            // Look for \n in the recv buffer.
+            let end = find_byte(ctx, b'\n');
+            if end.is_none() {
+                return Step::Yield;
+            }
+            let end = end.unwrap();
+            consume(ctx, end + 1);
+            // Send KEXINIT.
+            let kex = ssh_encode(20, &ssh_kexinit_payload());
+            let _ = ctx.net().unwrap().send(acc, &kex);
+            ctx.data[0] = 3; // → read client KEXINIT
+            Step::Yield
+        }
+        // ── Phase 3: read client KEXINIT ────────────────────────────
+        3 => {
+            let acc = ctx.data[2] as u32;
+            if !try_recv(ctx, acc) {
+                return Step::Yield;
+            }
+            match ssh_decode(ctx_get_buf(ctx)) {
+                Some((consumed, 20, _)) => {
+                    consume(ctx, consumed);
+                    // Send NEWKEYS (type 21, empty payload).
+                    let newkeys = ssh_encode(21, &[]);
+                    let _ = ctx.net().unwrap().send(acc, &newkeys);
+                    ctx.data[0] = 4; // → read auth messages
+                    Step::Yield
+                }
+                _ => Step::Yield,
+            }
+        }
+        // ── Phase 4: read auth messages ─────────────────────────────
+        4 => {
+            let acc = ctx.data[2] as u32;
+            if !try_recv(ctx, acc) {
+                return Step::Yield;
+            }
+            match ssh_decode(ctx_get_buf(ctx)) {
+                Some((consumed, 5, _payload)) => {
+                    // SERVICE_REQUEST — respond with SERVICE_ACCEPT.
+                    consume(ctx, consumed);
+                    // payload: string service_name
+                    let accept = ssh_encode(6, &ctx_get_buf_slice(ctx, consumed));
+                    let _ = ctx.net().unwrap().send(acc, &accept);
+                    Step::Yield
+                }
+                Some((consumed, 50, _)) => {
+                    // USERAUTH_REQUEST — respond with USERAUTH_SUCCESS.
+                    consume(ctx, consumed);
+                    let success = ssh_encode(52, &[]);
+                    let _ = ctx.net().unwrap().send(acc, &success);
+                    ctx.data[0] = 5; // → channel setup
+                    Step::Yield
+                }
+                Some((consumed, _, _)) => {
+                    consume(ctx, consumed);
+                    Step::Yield
+                }
+                None => Step::Yield,
+            }
+        }
+        // ── Phase 5: channel setup ──────────────────────────────────
+        5 => {
+            let acc = ctx.data[2] as u32;
+            if !try_recv(ctx, acc) {
+                return Step::Yield;
+            }
+            match ssh_decode(ctx_get_buf(ctx)) {
+                Some((consumed, 90, payload)) => {
+                    // CHANNEL_OPEN (session).
+                    consume(ctx, consumed);
+                    // payload: uint32 recipient, string type, uint32 window, uint32 max_pkt
+                    if payload.len() >= 4 {
+                        let peer_ch = u32::from_le_bytes([
+                            payload[0], payload[1], payload[2], payload[3],
+                        ]);
+                        let our_ch = 0u32;
+                        ctx.data[9..13].copy_from_slice(&our_ch.to_le_bytes());
+                        ctx.data[13..17].copy_from_slice(&peer_ch.to_le_bytes());
+                        let conf = ssh_encode(
+                            91,
+                            &ssh_channel_open_conf_payload(peer_ch, our_ch, 65536, 32768),
+                        );
+                        let _ = ctx.net().unwrap().send(acc, &conf);
+                    }
+                    Step::Yield
+                }
+                Some((consumed, 98, payload)) => {
+                    // CHANNEL_REQUEST (pty-req or shell).
+                    consume(ctx, consumed);
+                    if payload.len() >= 4 {
+                        let ch = u32::from_le_bytes([
+                            payload[0], payload[1], payload[2], payload[3],
+                        ]);
+                        let resp = ssh_encode(99, &ssh_channel_success_payload(ch));
+                        let _ = ctx.net().unwrap().send(acc, &resp);
+                        // Check if this was a "shell" request.
+                        if payload.len() > 5 {
+                            let str_len = u32::from_le_bytes([
+                                payload[4], payload[5],
+                                if payload.len() > 6 { payload[6] } else { 0 },
+                                if payload.len() > 7 { payload[7] } else { 0 },
+                            ]) as usize;
+                            if payload.len() >= 8 + str_len {
+                                let req = &payload[8..8 + str_len];
+                                if req == b"shell" {
+                                    ctx.data[0] = 6; // → fork PTY
+                                    return Step::Yield;
+                                }
+                            }
+                        }
+                    }
+                    Step::Yield
+                }
+                Some((consumed, _, _)) => {
+                    consume(ctx, consumed);
+                    Step::Yield
+                }
+                None => Step::Yield,
+            }
+        }
+        // ── Phase 6: fork PTY ───────────────────────────────────────
+        6 => {
+            let (child, master_fd) = match ctx.forkpty() {
+                Ok(r) => r,
+                Err(_) => return Step::Exit(1),
+            };
+            let _ = child; // We don't need the child id in the parent.
+            ctx.data[5] = 1; // child forked
+            ctx.data[6..8].copy_from_slice(&((master_fd & 0xFFFF) as u16).to_le_bytes());
+            ctx.data[0] = 7; // → relay
+            ctx.data[8] = 0; // relay sub-phase
+            Step::Yield
+        }
+        // ── Phase 7: relay (socket ↔ PTY master) ───────────────────
+        7 => {
+            let acc = ctx.data[2] as u32;
+            let master_fd = u16::from_le_bytes([ctx.data[6], ctx.data[7]]) as u32;
+            let sub = ctx.data[8];
+            let task = ctx.task;
+
+            match sub {
+                0 => {
+                    // Read from socket → write to PTY master.
+                    match ctx.net().unwrap().poll(acc) {
+                        Ok(ev) if ev & 0x01 != 0 => {
+                            let mut buf = [0u8; 256];
+                            match ctx.net().unwrap().recv(acc, &mut buf) {
+                                Ok(0) => {
+                                    // Client disconnected — close PTY.
+                                    let _ = ctx.vfs().close(task, master_fd);
+                                    return Step::Done;
+                                }
+                                Ok(n) => {
+                                    // Parse SSH CHANNEL_DATA and extract payload.
+                                    if let Some((_, 94, ch_payload)) =
+                                        ssh_decode(&buf[..n])
+                                    {
+                                        // ch_payload: uint32 channel + string data
+                                        if ch_payload.len() > 4 {
+                                            let data = &ch_payload[5..];
+                                            let _ = ctx.vfs().write(task, master_fd, data);
+                                        }
+                                    }
+                                    ctx.data[8] = 0; // back to read socket
+                                    Step::Yield
+                                }
+                                Err(_) => {
+                                    let _ = ctx.vfs().close(task, master_fd);
+                                    Step::Done
+                                }
+                            }
+                        }
+                        _ => {
+                            ctx.data[8] = 2; // → read PTY master
+                            Step::Yield
+                        }
+                    }
+                }
+                2 => {
+                    // Read from PTY master → send to socket.
+                    let mut buf = [0u8; 256];
+                    match ctx.vfs().read(task, master_fd, &mut buf) {
+                        Ok(0) => {
+                            // PTY closed — disconnect.
+                            let _ = ctx.net().unwrap().shutdown(acc, 1);
+                            Step::Done
+                        }
+                        Ok(n) => {
+                            let our_ch = u32::from_le_bytes([
+                                ctx.data[9], ctx.data[10],
+                                ctx.data[11], ctx.data[12],
+                            ]);
+                            let pkt = ssh_encode(
+                                94,
+                                &ssh_channel_data_payload(our_ch, &buf[..n]),
+                            );
+                            let _ = ctx.net().unwrap().send(acc, &pkt);
+                            ctx.data[8] = 0; // → read socket
+                            Step::Yield
+                        }
+                        Err(aerosls_vfs::Errno::EAgain) => {
+                            ctx.data[8] = 0; // → read socket
+                            Step::Yield
+                        }
+                        Err(_) => {
+                            let _ = ctx.net().unwrap().shutdown(acc, 1);
+                            Step::Done
+                        }
+                    }
+                }
+                _ => {
+                    ctx.data[8] = 0;
+                    Step::Yield
+                }
+            }
+        }
+        _ => Step::Exit(1),
+    }
+}
+
+/// Try to recv data into the sshd recv buffer. Returns true if data is available.
+fn try_recv<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>, sock: u32) -> bool {
+    let cur_len = u16::from_le_bytes([ctx.data[3], ctx.data[4]]) as usize;
+    if cur_len >= SSH_BUF_CAP {
+        return true; // buffer full, process what we have
+    }
+    let offset = SSH_RECV_BUF + cur_len;
+    let cap = SSH_BUF_CAP - cur_len;
+    let mut tmp = alloc::vec![0u8; cap];
+    match ctx.net().unwrap().recv(sock, &mut tmp) {
+        Ok(0) => false,
+        Ok(n) => {
+            let end = core::cmp::min(offset + n, SSH_RECV_BUF + SSH_BUF_CAP);
+            ctx.data[offset..end].copy_from_slice(&tmp[..n]);
+            let new_len = cur_len + n;
+            ctx.data[3..5].copy_from_slice(&(new_len as u16).to_le_bytes());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Find the first occurrence of `byte` in the recv buffer.
+fn find_byte<K: Kernel, A: BufferAlloc>(ctx: &Ctx<'_, K, A>, byte: u8) -> Option<usize> {
+    let len = u16::from_le_bytes([ctx.data[3], ctx.data[4]]) as usize;
+    let buf = &ctx.data[SSH_RECV_BUF..SSH_RECV_BUF + len];
+    buf.iter().position(|&b| b == byte)
+}
+
+/// Consume `n` bytes from the front of the recv buffer.
+fn consume<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>, n: usize) {
+    let cur_len = u16::from_le_bytes([ctx.data[3], ctx.data[4]]) as usize;
+    let keep = cur_len.saturating_sub(n);
+    if keep > 0 {
+        // Shift remaining data to the front.
+        let src = SSH_RECV_BUF + n;
+        let dst = SSH_RECV_BUF;
+        for i in 0..keep {
+            ctx.data[dst + i] = ctx.data[src + i];
+        }
+    }
+    ctx.data[3..5].copy_from_slice(&(keep as u16).to_le_bytes());
+}
+
+/// Get a slice of the recv buffer.
+fn ctx_get_buf<'c, K: Kernel, A: BufferAlloc>(ctx: &'c Ctx<'_, K, A>) -> &'c [u8] {
+    let len = u16::from_le_bytes([ctx.data[3], ctx.data[4]]) as usize;
+    &ctx.data[SSH_RECV_BUF..SSH_RECV_BUF + len]
+}
+
+/// Get the first `n` bytes of the recv buffer (for forwarding service name).
+fn ctx_get_buf_slice<K: Kernel, A: BufferAlloc>(ctx: &Ctx<'_, K, A>, n: usize) -> Vec<u8> {
+    let len = u16::from_le_bytes([ctx.data[3], ctx.data[4]]) as usize;
+    let end = core::cmp::min(n, len);
+    ctx.data[SSH_RECV_BUF..SSH_RECV_BUF + end].to_vec()
+}
+
 /// `forkpty_test`: exercises `ctx.forkpty()`. Forks a child on a PTY,
 /// the child writes "child-ok" to its stdout (the PTY slave), the parent
 /// reads from the master. Writes "master=N" where N is the master fd.
@@ -4247,6 +4701,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("mv", mv);
     pm.register_applet("cp", cp);
     pm.register_applet("touch", touch);
+    pm.register_applet("sshd", sshd);
 }
 
 #[cfg(test)]
