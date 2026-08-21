@@ -2294,3 +2294,43 @@ fn timeout_expiry_during_stopped_job() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Ctrl-\ (SIGQUIT) kills the foreground pipeline and re-prompts.
+#[test]
+fn ctrlquit_kills_foreground_pipeline() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a long-running foreground job.
+    console.console_io().push_input(b"sleep 999\n");
+    booted.run(200);
+
+    // Ctrl-\ sends SIGQUIT — kills the foreground sleep.
+    console.console_io().push_input(b"\x1c");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-\\, got: {:?}", out);
+
+    // Verify the sleep was killed (not still running).
+    console.console_io().push_input(b"echo done\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(4).any(|w| w == b"done"),
+        "echo runs after Ctrl-\\, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}

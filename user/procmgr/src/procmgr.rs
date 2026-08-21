@@ -626,7 +626,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         // to a signal death — this is the cooperative delivery path.
         let outcome = if !matches!(outcome, Step::Exit(_)) {
             if let Some(sig) = self.check_signals(id) {
-                if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
+                if matches!(sig, SIGINT | SIGQUIT | SIGTERM | SIGKILL) {
                     Step::Exit(signal_exit_code(sig))
                 } else if sig == SIGTSTP {
                     // SIGTSTP stops the task.  Park it and do not re-enqueue.
@@ -754,7 +754,34 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 self.kill(c, SIGINT).ok();
             }
         }
-        // Terminal stop: when the console has a Ctrl-Z (0x1a) in its
+        // Quit: Ctrl-\\ (0x1c) sends SIGQUIT to every foreground child,
+        // terminating them with exit 128+3=131.  The parent is woken
+        // from WaitingChild so the shell can re-prompt.
+        if self.vfs.has_console_byte(0x1c) {
+            self.vfs.discard_console_byte(0x1c);
+            let fg_children: Vec<u32> = self.tasks.values()
+                .flat_map(|tc| tc.foreground.iter().copied())
+                .collect();
+            for c in &fg_children {
+                self.kill(*c, SIGQUIT).ok();
+            }
+            // Wake parents blocked on WaitingChild for the killed children.
+            let mut wake_parents: Vec<u32> = Vec::new();
+            for (&id, tc) in self.tasks.iter() {
+                if let TaskState::Blocked(BlockReason::WaitingChild(c)) = tc.state {
+                    if fg_children.contains(&c) {
+                        wake_parents.push(id);
+                    }
+                }
+            }
+            for id in wake_parents {
+                if let Some(tc) = self.tasks.get_mut(&id) {
+                    tc.state = TaskState::Runnable;
+                    self.run.push_back(id);
+                }
+            }
+        }
+                // Terminal stop: when the console has a Ctrl-Z (0x1a) in its
         // input buffer, deliver SIGTSTP to every task's foreground children
         // immediately.  This suspends the foreground pipeline; the shell
         // observes the stopped children and re-prompts.
@@ -913,7 +940,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 self.run.push_back(task);
                 self.wake_trace.push(WakeEvent::Woken(task, BlockReason::Stopped));
             }
-        } else if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
+        } else if matches!(sig, SIGINT | SIGQUIT | SIGTERM | SIGKILL) {
             // A blocked task with a pending fatal signal must not stay parked:
             // wake it so it can observe the signal and exit.
             if let TaskState::Blocked(reason) = tc.state {
