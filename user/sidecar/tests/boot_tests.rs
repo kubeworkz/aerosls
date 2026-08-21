@@ -2479,3 +2479,50 @@ fn background_job_survives_ctrl_c() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// Dollar-question reflects the last pipeline's exit code.
+///
+/// false exits 1; echo $? should output 1.  Also true exits 0;
+/// Dollar-question reflects the last pipeline's exit code.
+///
+/// false exits 1 on its own line; then echo $? outputs 1.
+/// Also true exits 0; echo $? outputs 0.
+#[test]
+fn last_exit_status_in_dollar_question() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/false", b"false\n", 0o755);
+    b.add_file("/bin/true", b"true\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // false exits 1; then echo $? should print 1.
+    console.console_io().push_input(b"false\necho $?\n");
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    assert!(out.windows(2).any(|w| w == b"1\n"),
+        "false then echo $? prints 1, got: {:?}", out);
+
+    // true exits 0; then echo $? should print 0.
+    let len_before = console.console_io().output().len();
+    console.console_io().push_input(b"true\necho $?\n");
+    booted.run(200);
+    let all = console.console_io().output();
+    let recent = &all[len_before..];
+    assert!(recent.windows(2).any(|w| w == b"0\n"),
+        "true then echo $? prints 0, got: {:?}", recent);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+
