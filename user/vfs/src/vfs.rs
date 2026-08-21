@@ -339,6 +339,13 @@ impl<K: Kernel, A: BufferAlloc> Fs<K, A> {
             Fs::Dev(_) => Err(Errno::ERofs),
         }
     }
+    fn rename(&mut self, old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) -> Result<(), Errno> {
+        match self {
+            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Ram(f) => f.rename(old_parent, old_name, new_parent, new_name),
+            Fs::Dev(_) => Err(Errno::ERofs),
+        }
+    }
 }
 
 // ── /dev (devfs) ────────────────────────────────────────────────────────────
@@ -2169,6 +2176,40 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let fs = self.fs_mut(fs_idx)?;
         let parent = fs.lookup(&rel[..rel.len() - 1])?;
         fs.rmdir(parent.0, rel.last().unwrap())
+    }
+
+    /// Rename (move) `old_path` to `new_path`.  Both paths must
+    /// resolve to the same underlying filesystem (cross-mount rename
+    /// is not supported in v1).
+    pub fn rename(&mut self, task: u32, old_path: &str, new_path: &str) -> Result<(), Errno> {
+        let old_full = self.full_path(task, old_path)?;
+        let (old_fs, old_rel) = self.resolve(&old_full)?;
+        let new_full = self.full_path(task, new_path)?;
+        let (new_fs, new_rel) = self.resolve(&new_full)?;
+        if old_fs != new_fs {
+            return Err(Errno::EXDev); // cross-device rename
+        }
+        if old_rel.is_empty() || new_rel.is_empty() {
+            return Err(Errno::EBusy);
+        }
+        let fs = self.fs_mut(old_fs)?;
+        let old_parent = fs.lookup(&old_rel[..old_rel.len() - 1])?;
+        let new_parent = fs.lookup(&new_rel[..new_rel.len() - 1])?;
+        fs.rename(old_parent.0, old_rel.last().unwrap(), new_parent.0, new_rel.last().unwrap())
+    }
+
+    /// Check file accessibility (POSIX `access(2)`).  In v1 this
+    /// simply verifies the path exists; permission bits are not
+    /// enforced.
+    pub fn access(&mut self, task: u32, path: &str, _mode: u32) -> Result<(), Errno> {
+        let full = self.full_path(task, path)?;
+        let (fs_idx, rel) = self.resolve(&full)?;
+        if rel.is_empty() {
+            return Ok(()); // root always accessible
+        }
+        let fs = self.fs_mut(fs_idx)?;
+        fs.lookup(&rel)?;
+        Ok(())
     }
 
     /// An fd's current offset (test/observability helper). Only seekable

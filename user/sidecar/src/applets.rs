@@ -4087,6 +4087,138 @@ pub fn forkpty_test<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step 
 }
 
 /// Install the system applets into a proc manager (called by `boot()`).
+// ── coreutils ────────────────────────────────────────────────────────────────
+
+/// `ls [path]`: list directory entries. Prints one name per line.
+pub fn ls<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let path = ctx.argv().get(1).cloned().unwrap_or_else(|| ".".to_string());
+    let entries = match ctx.vfs().read_dir(task, &path) {
+        Ok(e) => e,
+        Err(_) => return Step::Exit(1),
+    };
+    for ent in &entries {
+        let line = alloc::format!("{}\n", ent.name);
+        let _ = ctx.write_blocking(1, line.as_bytes());
+    }
+    Step::Done
+}
+
+/// `mkdir path`: create a directory.
+pub fn mkdir_applet<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let path = match ctx.argv().get(1) {
+        Some(p) => p.clone(),
+        None => return Step::Exit(1),
+    };
+    match ctx.vfs().mkdir(task, &path, 0o755) {
+        Ok(()) => Step::Done,
+        Err(_) => Step::Exit(1),
+    }
+}
+
+/// `rm path`: remove a file (unlink). For directories, uses rmdir.
+pub fn rm<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let path = match ctx.argv().get(1) {
+        Some(p) => p.clone(),
+        None => return Step::Exit(1),
+    };
+    // Try unlink first; if it's a directory, try rmdir.
+    if ctx.vfs().unlink(task, &path).is_err() {
+        if ctx.vfs().rmdir(task, &path).is_err() {
+            return Step::Exit(1);
+        }
+    }
+    Step::Done
+}
+
+/// `mv src dst`: rename (move) a file or directory.
+pub fn mv<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let src = match ctx.argv().get(1) {
+        Some(p) => p.clone(),
+        None => return Step::Exit(1),
+    };
+    let dst = match ctx.argv().get(2) {
+        Some(p) => p.clone(),
+        None => return Step::Exit(1),
+    };
+    match ctx.vfs().rename(task, &src, &dst) {
+        Ok(()) => Step::Done,
+        Err(_) => Step::Exit(1),
+    }
+}
+
+/// `cp src dst`: copy a file.
+pub fn cp<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let src_path = ctx.argv().get(1).cloned();
+    let dst_path = ctx.argv().get(2).cloned();
+    let src_path = match src_path {
+        Some(p) => p,
+        None => return Step::Exit(1),
+    };
+    let dst_path = match dst_path {
+        Some(p) => p,
+        None => return Step::Exit(1),
+    };
+    let src_fd = match ctx.vfs().open(task, &src_path, O_RDONLY, 0) {
+        Ok(f) => f,
+        Err(_) => return Step::Exit(1),
+    };
+    let dst_fd = match ctx.vfs().open(task, &dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0o644) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = ctx.vfs().close(task, src_fd);
+            return Step::Exit(1);
+        }
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match ctx.vfs().read(task, src_fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => {
+                let _ = ctx.vfs().close(task, src_fd);
+                let _ = ctx.vfs().close(task, dst_fd);
+                return Step::Exit(1);
+            }
+        };
+        let mut written = 0;
+        while written < n {
+            match ctx.vfs().write(task, dst_fd, &buf[written..n]) {
+                Ok(k) => written += k,
+                Err(_) => {
+                    let _ = ctx.vfs().close(task, src_fd);
+                    let _ = ctx.vfs().close(task, dst_fd);
+                    return Step::Exit(1);
+                }
+            }
+        }
+    }
+    let _ = ctx.vfs().close(task, src_fd);
+    let _ = ctx.vfs().close(task, dst_fd);
+    Step::Done
+}
+
+/// `touch path`: create a file if it doesn't exist, or update its
+/// timestamp (v1: just open+close with O_CREAT).
+pub fn touch<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    let path = match ctx.argv().get(1) {
+        Some(p) => p.clone(),
+        None => return Step::Exit(1),
+    };
+    match ctx.vfs().open(task, &path, O_WRONLY | O_CREAT, 0o644) {
+        Ok(fd) => {
+            let _ = ctx.vfs().close(task, fd);
+            Step::Done
+        }
+        Err(_) => Step::Exit(1),
+    }
+}
+
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
     pm.register_applet("cat", cat);
@@ -4109,6 +4241,12 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("timeout", timeout);
     pm.register_applet("forkpty_test", forkpty_test);
     pm.register_applet("unix_echo", unix_echo);
+    pm.register_applet("ls", ls);
+    pm.register_applet("mkdir", mkdir_applet);
+    pm.register_applet("rm", rm);
+    pm.register_applet("mv", mv);
+    pm.register_applet("cp", cp);
+    pm.register_applet("touch", touch);
 }
 
 #[cfg(test)]

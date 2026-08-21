@@ -52,6 +52,8 @@ pub enum Errno {
     ENotty,
     /// Address already in use.
     EAddrInuse,
+    /// Cross-device link (rename across mounts).
+    EXDev,
 }
 
 impl Errno {
@@ -79,6 +81,7 @@ impl Errno {
             Errno::ESRCH => 3,
             Errno::ENotty => 25,
             Errno::EAddrInuse => 98,
+            Errno::EXDev => 18,
         }
     }
 }

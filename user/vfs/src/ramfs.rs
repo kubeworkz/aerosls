@@ -284,6 +284,31 @@ impl RamFs {
         Ok(())
     }
 
+    /// Rename: move `old_name` from `old_parent` to `new_parent` as
+    /// `new_name`.  If `new_name` already exists it is overwritten
+    /// (POSIX `rename(2)` semantics).  Cross-directory moves are
+    /// supported within the same RamFs.
+    pub fn rename(&mut self, old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) -> Result<(), Errno> {
+        // Look up the source entry.
+        let ino = *self
+            .nodes
+            .get(&old_parent)
+            .ok_or(Errno::ENoent)?
+            .children
+            .get(old_name)
+            .ok_or(Errno::ENoent)?;
+        // Remove from old parent.
+        self.nodes.get_mut(&old_parent).unwrap().children.remove(old_name);
+        // If the target already exists, remove it first (POSIX overwrite).
+        if let Some(&target_ino) = self.nodes.get(&new_parent).and_then(|n| n.children.get(new_name)) {
+            self.nodes.remove(&target_ino);
+        }
+        // Insert into new parent.
+        self.nodes.get_mut(&new_parent).ok_or(Errno::ENoent)?
+            .children.insert(new_name.to_string(), ino);
+        Ok(())
+    }
+
     pub fn stale(&self) -> bool {
         false
     }

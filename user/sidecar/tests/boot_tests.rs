@@ -2655,3 +2655,42 @@ fn unix_socket_echo_roundtrip() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+#[test]
+fn coreutils_lifecycle() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_dir("/tmp", 0o755);
+    // Script: touch, ls, cat, mkdir, cp, mv, rm.
+    b.add_file("/etc/init.rc",
+        b"/bin/touch /tmp/hello\n/bin/ls /tmp\n/bin/cat /tmp/hello\n/bin/mkdir /tmp/subdir\n/bin/cp /tmp/hello /tmp/subdir/goodbye\n/bin/mv /tmp/subdir/goodbye /tmp/moved\n/bin/rm /tmp/moved\n/bin/ls /tmp\n",
+        0o644);
+    b.add_file("/bin/touch", b"touch\n", 0o755);
+    b.add_file("/bin/ls", b"ls\n", 0o755);
+    b.add_file("/bin/cat", b"cat\n", 0o755);
+    b.add_file("/bin/mkdir", b"mkdir\n", 0o755);
+    b.add_file("/bin/cp", b"cp\n", 0o755);
+    b.add_file("/bin/mv", b"mv\n", 0o755);
+    b.add_file("/bin/rm", b"rm\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    booted.run(500);
+    let out = console.console_io().output();
+    // ls should show "hello" after touch.
+    assert!(out.windows(5).any(|w| w == b"hello"),
+        "ls shows hello after touch, got: {:?}", out);
+    // After mv + rm, ls should show "subdir" and "hello" but not "moved".
+    assert!(!out.windows(5).any(|w| w == b"moved"),
+        "moved file should be removed, got: {:?}", out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
