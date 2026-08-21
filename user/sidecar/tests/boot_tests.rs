@@ -2214,3 +2214,83 @@ fn ctrlz_then_bg_resumes_foreground_job() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+
+/// timeout 10 sleep 999: the timeout fires before the sleep finishes,
+/// the child is killed, and the shell re-prompts (exit 124).
+#[test]
+fn timeout_kills_long_sleep() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/timeout", b"timeout\n", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // timeout 10 sleep 999 — timeout fires after 10 ticks, kills sleep.
+    console.console_io().push_input(b"timeout 10 sleep 999\n");
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    // The shell should have re-prompts after the timeout expired.
+    let prompt_count = out.windows(2).filter(|w| *w == b"$ ").count();
+    assert!(prompt_count >= 2,
+        "timeout killed sleep and shell re-prompts ({} prompts), got: {:?}",
+        prompt_count, out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// timeout 10 sleep 999, then Ctrl-Z stops it, then fg resumes it.
+/// The timeout expiry fires while the job is stopped (via
+/// WaitChildTimeout) and kills the child after SIGCONT resumes it.
+#[test]
+fn timeout_expiry_during_stopped_job() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/timeout", b"timeout\n", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // timeout 10 sleep 999 — the timeout parent is now in the foreground.
+    console.console_io().push_input(b"timeout 10 sleep 999\n");
+    booted.run(200);
+
+    // Ctrl-Z suspends the timeout (and its child sleep).
+    console.console_io().push_input(b"\x1a");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-Z on timeout, got: {:?}", out);
+
+    // fg resumes the stopped timeout.  The WaitChildTimeout timer
+    // resumes ticking; after it expires the child is killed (exit 124).
+    console.console_io().push_input(b"fg\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    let prompt_count = out.windows(2).filter(|w| *w == b"$ ").count();
+    assert!(prompt_count >= 3,
+        "fg + timeout expiry ({} prompts), got: {:?}",
+        prompt_count, out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
