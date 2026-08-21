@@ -455,4 +455,45 @@ mod tests {
         assert_eq!(evt.len(), 32);
         assert_eq!(evt[0], 19); // MapNotify
     }
+
+    #[test]
+    fn put_image_pixel_conversion() {
+        // 2x1 framebuffer with known ARGB pixels.
+        let mut fb = Framebuffer::new(2, 1);
+        fb.pixels[0] = 0xFF_FF0000; // red
+        fb.pixels[1] = 0xFF_00FF00; // green
+
+        let pkt = build_put_image(1, 2, &fb, 0, 0);
+        // Header is 28 bytes, pixel data starts at byte 28.
+        // X11 expects BGRA order in LSB_FIRST mode.
+        // Red pixel: ARGB=0xFF_FF0000 → BGRA=[0x00, 0x00, 0xFF, 0xFF]
+        assert_eq!(pkt[28], 0x00); // B
+        assert_eq!(pkt[29], 0x00); // G
+        assert_eq!(pkt[30], 0xFF); // R
+        assert_eq!(pkt[31], 0xFF); // A
+        // Green pixel: ARGB=0xFF_00FF00 → BGRA=[0x00, 0xFF, 0x00, 0xFF]
+        assert_eq!(pkt[32], 0x00); // B
+        assert_eq!(pkt[33], 0xFF); // G
+        assert_eq!(pkt[34], 0x00); // R
+        assert_eq!(pkt[35], 0xFF); // A
+    }
+
+    #[test]
+    fn parse_motion_notify() {
+        let mut buf = vec![0u8; 32];
+        buf[0] = 6; // MotionNotify
+        buf[20] = 50; // x
+        buf[21] = 0;
+        buf[22] = 75; // y
+        buf[23] = 0;
+
+        let evt = X11Event::parse(&buf).unwrap();
+        match evt {
+            X11Event::MotionNotify { x, y } => {
+                assert_eq!(x, 50);
+                assert_eq!(y, 75);
+            }
+            _ => panic!("expected MotionNotify"),
+        }
+    }
 }

@@ -368,4 +368,122 @@ mod tests {
         assert_eq!(fb.height, 50);
         assert_eq!(fb.pixels.len(), 5000);
     }
+
+    #[test]
+    fn full_x11_handshake_and_frame_cycle() {
+        let mut server = X11Server::new(32, 32);
+        assert_eq!(server.phase(), Phase::Listening);
+
+        // 1. Client connects.
+        server.set_client_fd(5);
+        assert_eq!(server.phase(), Phase::RecvHello);
+
+        // 2. Client sends ClientHello.
+        let mut hello = vec![0u8; 12 + 4];
+        hello[0] = 0x6C; // LSB first
+        hello[2] = 11; // major
+        hello[4] = 0; // minor
+        hello[6] = 0; // auth name len = 0
+        server.feed_recv(&hello);
+        server.step();
+        assert_eq!(server.phase(), Phase::SendHello);
+
+        // 3. Server sends SetupReply.
+        let reply = server.take_send_buf();
+        assert_eq!(reply[0], 1); // success
+        let major = u16::from_le_bytes([reply[2], reply[3]]);
+        assert_eq!(major, 11);
+
+        // 4. Send buffer drained → WaitMap.
+        server.step();
+        assert_eq!(server.phase(), Phase::WaitMap);
+
+        // 5. Client sends CreateWindow (type 42) with window ID = 42.
+        let mut create_win = vec![0u8; 32];
+        create_win[0] = 42; // CreateWindow
+        create_win[4] = 42; // window ID = 42
+        create_win[5] = 0;
+        create_win[6] = 0;
+        create_win[7] = 0;
+        server.feed_recv(&create_win);
+        server.step();
+        assert_eq!(server.client_window, 42);
+        assert!(server.gc_id > 0);
+
+        // 6. Client sends MapWindow (type 8).
+        let mut map_win = vec![0u8; 32];
+        map_win[0] = 8; // MapWindow
+        server.feed_recv(&map_win);
+        server.step();
+        assert_eq!(server.phase(), Phase::Rendering);
+
+        // 7. Server sends MapNotify.
+        let notify = server.take_send_buf();
+        assert_eq!(notify[0], 19); // MapNotify
+
+        // 8. Server renders first frame → PutImage.
+        let result = server.step();
+        assert!(result.rendered);
+        assert_eq!(result.frame_count, 1);
+
+        let put = server.take_send_buf();
+        assert_eq!(put[0], 72); // PutImage
+        // Verify dimensions in the PutImage header.
+        let width = u16::from_le_bytes([put[8], put[9]]);
+        let height = u16::from_le_bytes([put[10], put[11]]);
+        assert_eq!(width, 32);
+        assert_eq!(height, 32);
+
+        // 9. Client sends a mouse click (ButtonPress, type 4).
+        let mut click = vec![0u8; 32];
+        click[0] = 4; // ButtonPress
+        click[1] = 1; // button 1 (left)
+        click[20] = 16; // x = 16
+        click[22] = 16; // y = 16
+        server.feed_recv(&click);
+        let result = server.step();
+        let events = server.take_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            X11Event::ButtonPress { button, x, y } => {
+                assert_eq!(*button, 1);
+                assert_eq!(*x, 16);
+                assert_eq!(*y, 16);
+            }
+            _ => panic!("expected ButtonPress"),
+        }
+    }
+
+    #[test]
+    fn multiple_frames_sequential() {
+        let mut server = X11Server::new(16, 16);
+
+        // Fast-forward through handshake.
+        server.set_client_fd(5);
+        let mut hello = vec![0u8; 12 + 4];
+        hello[0] = 0x6C;
+        hello[2] = 11;
+        server.feed_recv(&hello);
+        server.step();
+        server.take_send_buf();
+        server.step();
+
+        let mut map_win = vec![0u8; 32];
+        map_win[0] = 8;
+        server.feed_recv(&map_win);
+        server.step();
+        server.take_send_buf(); // MapNotify
+
+        // Render multiple frames.
+        let mut total_frames = 0u64;
+        for _ in 0..10 {
+            let result = server.step();
+            let put = server.take_send_buf();
+            if result.rendered {
+                assert_eq!(put[0], 72, "expected PutImage");
+                total_frames += 1;
+            }
+        }
+        assert!(total_frames >= 1, "should render at least one frame");
+    }
 }
