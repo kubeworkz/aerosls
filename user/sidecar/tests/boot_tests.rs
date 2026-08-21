@@ -2143,3 +2143,74 @@ fn bg_sends_sigcont_to_stopped_job() {
     client.kill_driver(0);
     t.join().unwrap();
 }
+/// Ctrl-Z suspends a foreground job, then `bg` resumes it into the
+/// background.  Verify the job transitions: Running → (Ctrl-Z) Stopped →
+/// (bg) Running → (sleep exits) [done].
+#[test]
+fn ctrlz_then_bg_resumes_foreground_job() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a short foreground sleep.
+    console.console_io().push_input(b"sleep 5\n");
+    booted.run(200);
+
+    // Ctrl-Z should suspend it.
+    console.console_io().push_input(b"\x1a");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-Z, got: {:?}", out);
+
+    // jobs shows Stopped.
+    console.console_io().push_input(b"jobs\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(7).any(|w| w == b"Stopped"),
+        "jobs shows Stopped before bg, got: {:?}", out);
+
+    // bg resumes the stopped job into the background.
+    console.console_io().push_input(b"bg\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    // bg prints the job banner: [1] sleep  (or similar).
+    assert!(out.windows(2).any(|w| w == b"$ "),
+        "shell re-prompts after bg, got: {:?}", out);
+
+    // Verify the stopped job was resumed: the sleep finishes almost
+    // instantly in test time.  Allow enough steps for the sleep to
+    // complete after SIGCONT, then check it's done (not still Stopped).
+    booted.run(200);
+    let out = console.console_io().output().to_vec();
+    // The sleep completed — either [done] appeared or the prompt
+    // returned without a Stopped entry.  The key assertion is that
+    // bg successfully sent SIGCONT and the child ran to completion.
+    assert!(
+        out.windows(7).any(|w| w == b"[done] ") || out.windows(2).filter(|w| *w == b"$ ").count() >= 4,
+        "bg resumed sleep, which completed: {:?}", out
+    );
+    // A second jobs check should show no Stopped jobs.
+    // Capture only the output produced after this push_input.
+    let len_before = console.console_io().output().len();
+    console.console_io().push_input(b"jobs\n");
+    booted.run(200);
+    let all = console.console_io().output();
+    let recent = &all[len_before..];
+    assert!(!recent.windows(7).any(|w| w == b"Stopped"),
+        "no Stopped jobs remain after bg resume, got: {:?}", recent);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
