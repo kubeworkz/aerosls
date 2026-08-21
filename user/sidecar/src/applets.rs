@@ -4148,8 +4148,9 @@ fn ssh_channel_success_payload(ch: u32) -> Vec<u8> {
 /// `[13..17]` peer channel id (LE u32)
 /// `[17]`   x11 state (0=none, 1=requested, 2=connected)
 /// `[18..20]` x11 socket fd (LE u16)
-/// `[20..]` recv buffer
-const SSH_RECV_BUF: usize = 20;
+/// `[20..36]` x11 cookie (16 bytes, MIT-MAGIC-COOKIE-1)
+/// `[36..]` recv buffer
+const SSH_RECV_BUF: usize = 36;
 const SSH_BUF_CAP: usize = 1024;
 
 pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
@@ -4318,8 +4319,25 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                             if payload.len() >= 8 + str_len {
                                 let req = &payload[8..8 + str_len];
                                 if req == b"x11-req" {
-                                    // X11 forwarding requested — flag it.
-                                    // The socket will be opened when relay starts.
+                                    // X11 forwarding requested — parse the cookie.
+                                    // Payload after req string: want_reply(1) +
+                                    // single_connection(1) + protocol(string) +
+                                    // cookie(16 bytes) + screen(u32).
+                                    let off = 8 + str_len;
+                                    if payload.len() >= off + 2 + 4 + 4 + 16 + 4 {
+                                        let proto_len_off = off + 2; // skip want_reply + single_connection
+                                        let proto_len = u32::from_le_bytes([
+                                            payload[proto_len_off],
+                                            payload[proto_len_off + 1],
+                                            payload[proto_len_off + 2],
+                                            payload[proto_len_off + 3],
+                                        ]) as usize;
+                                        let cookie_off = proto_len_off + 4 + proto_len;
+                                        if payload.len() >= cookie_off + 16 {
+                                            ctx.data[20..36]
+                                                .copy_from_slice(&payload[cookie_off..cookie_off + 16]);
+                                        }
+                                    }
                                     ctx.data[17] = 1; // x11 requested
                                 } else if req == b"shell" {
                                     ctx.data[0] = 6; // → fork PTY
@@ -4339,11 +4357,40 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         }
         // ── Phase 6: fork PTY ───────────────────────────────────────
         6 => {
+            // If X11 cookie was received, write it to /tmp/.Xauthority
+            // so the child shell (and x11rb) can read it.
+            if ctx.data[17] != 0 {
+                let task = ctx.task;
+                let cookie: [u8; 16] = [
+                    ctx.data[20], ctx.data[21], ctx.data[22], ctx.data[23],
+                    ctx.data[24], ctx.data[25], ctx.data[26], ctx.data[27],
+                    ctx.data[28], ctx.data[29], ctx.data[30], ctx.data[31],
+                    ctx.data[32], ctx.data[33], ctx.data[34], ctx.data[35],
+                ];
+                // Write cookie to /tmp/.Xauthority for the child shell.
+                if let Ok(fd) = ctx.vfs().open(
+                    task, "/tmp/.Xauthority",
+                    aerosls_vfs::O_WRONLY | aerosls_vfs::O_CREAT | aerosls_vfs::O_TRUNC,
+                    0o600,
+                ) {
+                    let _ = ctx.vfs().write(task, fd, &cookie);
+                    let _ = ctx.vfs().close(task, fd);
+                }
+                // Emit xauth cookie to stdout for observability.
+                let hex: Vec<u8> = cookie.iter()
+                    .flat_map(|b| alloc::vec![
+                        b"0123456789abcdef"[(*b >> 4) as usize],
+                        b"0123456789abcdef"[(*b & 0xf) as usize],
+                    ])
+                    .collect();
+                let msg = alloc::format!("xauth:{}\n", core::str::from_utf8(&hex).unwrap_or("?"));
+                let _ = ctx.write_blocking(1, msg.as_bytes());
+            }
             let (child, master_fd) = match ctx.forkpty() {
                 Ok(r) => r,
                 Err(_) => return Step::Exit(1),
             };
-            let _ = child; // We don't need the child id in the parent.
+            let _ = child;
             ctx.data[5] = 1; // child forked
             ctx.data[6..8].copy_from_slice(&((master_fd & 0xFFFF) as u16).to_le_bytes());
             ctx.data[0] = 7; // → relay

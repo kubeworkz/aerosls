@@ -2807,7 +2807,10 @@ impl SshClientMock {
                 payload.push(1); // want_reply = true
                 payload.push(0); // single_connection = false
                 payload.extend_from_slice(&Self::ssh_string(b"MIT-MAGIC-COOKIE-1"));
-                payload.extend_from_slice(&[0u8; 16]); // fake cookie
+                payload.extend_from_slice(&[0xAB, 0xCD, 0x12, 0x34,
+                    0xEF, 0x56, 0x78, 0x90,
+                    0xDE, 0xAD, 0xBE, 0xEF,
+                    0xCA, 0xFE, 0xBA, 0xBE]); // test cookie
                 payload.extend_from_slice(&0u32.to_le_bytes()); // screen 0
                 Self::ssh_encode(98, &payload)
             }
@@ -2906,6 +2909,11 @@ fn sshd_handshake_and_pty_relay() {
         Some(0),
         "sshd should exit 0 after mock client EOF"
     );
+
+    // Verify the xauth cookie was emitted to stdout.
+    let out = console.console_io().output();
+    assert!(out.windows(38).any(|w| w == b"xauth:abcd1234ef567890deadbeefcafebabe"),
+        "sshd should emit xauth cookie hex to stdout, got: {:?}", out);
 
     client.kill_driver(0);
     t.join().unwrap();
