@@ -875,14 +875,14 @@ impl FdTable {
     }
 }
 
-struct Task {
+pub struct Task {
     /// Index into `Vfs::table_pool`. `usize::MAX` = no table (exited).
-    fds: usize,
-    cwd: String,
-    euid: u16,
-    egid: u16,
+    pub fds: usize,
+    pub cwd: String,
+    pub euid: u16,
+    pub egid: u16,
     /// Session ID: 0 = inherited from parent, nonzero = session leader.
-    session_id: u32,
+    pub session_id: u32,
 }
 
 // ── the VFS ─────────────────────────────────────────────────────────────────
@@ -2500,7 +2500,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     // ── internals ─────────────────────────────────────────────────────────────
 
-    fn task(&self, task: u32) -> Result<&Task, Errno> {
+    pub fn task(&self, task: u32) -> Result<&Task, Errno> {
         self.tasks.get(task as usize).ok_or(Errno::EInval)
     }
     fn task_mut(&mut self, task: u32) -> Result<&mut Task, Errno> {

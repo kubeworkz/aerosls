@@ -1097,6 +1097,39 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
         self.pm.vfs.setsid(self.task)
     }
 
+    // ── Process identity ────────────────────────────────────────────────
+
+    /// Process ID (the VFS task id).
+    pub fn getpid(&self) -> u32 {
+        self.task
+    }
+
+    /// Parent process ID (0 if init / no parent).
+    pub fn getppid(&self) -> u32 {
+        self.pm.tasks.get(&self.task)
+            .and_then(|t| t.parent)
+            .unwrap_or(0)
+    }
+
+    /// Effective user ID (v1: always 0 = root).
+    pub fn getuid(&self) -> u16 {
+        self.pm.vfs.task(self.task)
+            .map(|t| t.euid)
+            .unwrap_or(0)
+    }
+
+    /// Effective group ID (v1: always 0).
+    pub fn getgid(&self) -> u16 {
+        self.pm.vfs.task(self.task)
+            .map(|t| t.egid)
+            .unwrap_or(0)
+    }
+
+    /// Set effective user ID (v1: no-op, always root).
+    pub fn setuid(&mut self, _uid: u16) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// `forkpty()`: create a child process connected to a new PTY pair.
     /// The child gets a new session (setsid), its stdin/stdout/stderr
     /// wired to the PTY slave, and the PTY as its controlling terminal.
