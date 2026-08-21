@@ -2800,6 +2800,18 @@ impl SshClientMock {
                 Self::ssh_encode(98, &payload)
             }
             6 => {
+                // x11-req: request X11 forwarding on channel 0.
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&0u32.to_le_bytes()); // channel
+                payload.extend_from_slice(&Self::ssh_string(b"x11-req"));
+                payload.push(1); // want_reply = true
+                payload.push(0); // single_connection = false
+                payload.extend_from_slice(&Self::ssh_string(b"MIT-MAGIC-COOKIE-1"));
+                payload.extend_from_slice(&[0u8; 16]); // fake cookie
+                payload.extend_from_slice(&0u32.to_le_bytes()); // screen 0
+                Self::ssh_encode(98, &payload)
+            }
+            7 => {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&0u32.to_le_bytes());
                 payload.extend_from_slice(&Self::ssh_string(b"shell"));
@@ -2854,7 +2866,7 @@ impl aerosls_proto::sockops::SocketOps for SshClientMock {
         Ok(())
     }
     fn poll(&mut self, _id: u32) -> Result<u16, u16> {
-        if self.recv_seq <= 6 {
+        if self.recv_seq <= 7 {
             Ok(0x01)
         } else {
             Ok(0)

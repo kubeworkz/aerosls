@@ -4137,17 +4137,19 @@ fn ssh_channel_success_payload(ch: u32) -> Vec<u8> {
 /// argv: `["sshd", PORT]` (default 22).
 ///
 /// Data layout:
-/// `[0]`    phase (0=init 1=accept 2=version 3=kex 4=auth 5=chan 6=fork 7=relay)
+/// `[0]`    phase (0=init 1=accept 2=version 3=kex 4=auth 5=chan 6=fork 7=relay 8=x11-relay)
 /// `[1]`    listen socket id
 /// `[2]`    accepted socket id
 /// `[3..5]` recv buf length (LE u16)
 /// `[5]`    child forked flag (1=yes)
 /// `[6..8]` master fd (LE u16)
-/// `[8]`    relay sub-phase (0=read sock, 1=write pty, 2=read pty, 3=write sock)
+/// `[8]`    relay sub-phase
 /// `[9..13]` our channel id (LE u32)
 /// `[13..17]` peer channel id (LE u32)
-/// `[17..]` recv buffer
-const SSH_RECV_BUF: usize = 17;
+/// `[17]`   x11 state (0=none, 1=requested, 2=connected)
+/// `[18..20]` x11 socket fd (LE u16)
+/// `[20..]` recv buffer
+const SSH_RECV_BUF: usize = 20;
 const SSH_BUF_CAP: usize = 1024;
 
 pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
@@ -4298,7 +4300,7 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     Step::Yield
                 }
                 Some((consumed, 98, payload)) => {
-                    // CHANNEL_REQUEST (pty-req or shell).
+                    // CHANNEL_REQUEST (pty-req, x11-req, or shell).
                     consume(ctx, consumed);
                     if payload.len() >= 4 {
                         let ch = u32::from_le_bytes([
@@ -4306,7 +4308,7 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                         ]);
                         let resp = ssh_encode(99, &ssh_channel_success_payload(ch));
                         let _ = ctx.net().unwrap().send(acc, &resp);
-                        // Check if this was a "shell" request.
+                        // Parse the request type string.
                         if payload.len() > 5 {
                             let str_len = u32::from_le_bytes([
                                 payload[4], payload[5],
@@ -4315,7 +4317,11 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                             ]) as usize;
                             if payload.len() >= 8 + str_len {
                                 let req = &payload[8..8 + str_len];
-                                if req == b"shell" {
+                                if req == b"x11-req" {
+                                    // X11 forwarding requested — flag it.
+                                    // The socket will be opened when relay starts.
+                                    ctx.data[17] = 1; // x11 requested
+                                } else if req == b"shell" {
                                     ctx.data[0] = 6; // → fork PTY
                                     return Step::Yield;
                                 }
@@ -4346,6 +4352,25 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         }
         // ── Phase 7: relay (socket ↔ PTY master) ───────────────────
         7 => {
+            // If x11-req was received, open the X11 Unix socket.
+            if ctx.data[17] == 1 {
+                let task = ctx.task;
+                if let Ok(x11_fd) = ctx.vfs().unix_socket(task) {
+                    if ctx.vfs().unix_connect(task, x11_fd, "/tmp/.X11-unix/X0").is_ok() {
+                        ctx.data[17] = 2; // x11 connected
+                        ctx.data[18..20]
+                            .copy_from_slice(&((x11_fd & 0xFFFF) as u16).to_le_bytes());
+                        ctx.data[0] = 8; // → x11 relay
+                        ctx.data[8] = 0; // sub-phase
+                        return Step::Yield;
+                    } else {
+                        let _ = ctx.vfs().close(task, x11_fd);
+                        ctx.data[17] = 0; // x11 failed, continue PTY relay
+                    }
+                } else {
+                    ctx.data[17] = 0; // x11 failed, continue PTY relay
+                }
+            }
             let acc = ctx.data[2] as u32;
             let master_fd = u16::from_le_bytes([ctx.data[6], ctx.data[7]]) as u32;
             let sub = ctx.data[8];
@@ -4359,22 +4384,19 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                             let mut buf = [0u8; 256];
                             match ctx.net().unwrap().recv(acc, &mut buf) {
                                 Ok(0) => {
-                                    // Client disconnected — close PTY.
                                     let _ = ctx.vfs().close(task, master_fd);
                                     return Step::Done;
                                 }
                                 Ok(n) => {
-                                    // Parse SSH CHANNEL_DATA and extract payload.
                                     if let Some((_, 94, ch_payload)) =
                                         ssh_decode(&buf[..n])
                                     {
-                                        // ch_payload: uint32 channel + string data
                                         if ch_payload.len() > 4 {
                                             let data = &ch_payload[5..];
                                             let _ = ctx.vfs().write(task, master_fd, data);
                                         }
                                     }
-                                    ctx.data[8] = 0; // back to read socket
+                                    ctx.data[8] = 0;
                                     Step::Yield
                                 }
                                 Err(_) => {
@@ -4394,7 +4416,6 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     let mut buf = [0u8; 256];
                     match ctx.vfs().read(task, master_fd, &mut buf) {
                         Ok(0) => {
-                            // PTY closed — disconnect.
                             let _ = ctx.net().unwrap().shutdown(acc, 1);
                             Step::Done
                         }
@@ -4408,11 +4429,90 @@ pub fn sshd<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                                 &ssh_channel_data_payload(our_ch, &buf[..n]),
                             );
                             let _ = ctx.net().unwrap().send(acc, &pkt);
-                            ctx.data[8] = 0; // → read socket
+                            ctx.data[8] = 0;
                             Step::Yield
                         }
                         Err(aerosls_vfs::Errno::EAgain) => {
-                            ctx.data[8] = 0; // → read socket
+                            ctx.data[8] = 0;
+                            Step::Yield
+                        }
+                        Err(_) => {
+                            let _ = ctx.net().unwrap().shutdown(acc, 1);
+                            Step::Done
+                        }
+                    }
+                }
+                _ => {
+                    ctx.data[8] = 0;
+                    Step::Yield
+                }
+            }
+        }
+        // ── Phase 8: X11 relay (socket ↔ X11 Unix socket) ───────────
+        8 => {
+            let acc = ctx.data[2] as u32;
+            let x11_fd = u16::from_le_bytes([ctx.data[18], ctx.data[19]]) as u32;
+            let sub = ctx.data[8];
+            let task = ctx.task;
+
+            match sub {
+                0 => {
+                    // Read from SSH socket → write to X11 Unix socket.
+                    match ctx.net().unwrap().poll(acc) {
+                        Ok(ev) if ev & 0x01 != 0 => {
+                            let mut buf = [0u8; 256];
+                            match ctx.net().unwrap().recv(acc, &mut buf) {
+                                Ok(0) => {
+                                    let _ = ctx.vfs().close(task, x11_fd);
+                                    return Step::Done;
+                                }
+                                Ok(n) => {
+                                    if let Some((_, 94, ch_payload)) =
+                                        ssh_decode(&buf[..n])
+                                    {
+                                        if ch_payload.len() > 4 {
+                                            let data = &ch_payload[5..];
+                                            let _ = ctx.vfs().write(task, x11_fd, data);
+                                        }
+                                    }
+                                    ctx.data[8] = 0;
+                                    Step::Yield
+                                }
+                                Err(_) => {
+                                    let _ = ctx.vfs().close(task, x11_fd);
+                                    Step::Done
+                                }
+                            }
+                        }
+                        _ => {
+                            ctx.data[8] = 2; // → read X11 socket
+                            Step::Yield
+                        }
+                    }
+                }
+                2 => {
+                    // Read from X11 Unix socket → send as SSH CHANNEL_DATA.
+                    let mut buf = [0u8; 256];
+                    match ctx.vfs().read(task, x11_fd, &mut buf) {
+                        Ok(0) => {
+                            let _ = ctx.net().unwrap().shutdown(acc, 1);
+                            Step::Done
+                        }
+                        Ok(n) => {
+                            let our_ch = u32::from_le_bytes([
+                                ctx.data[9], ctx.data[10],
+                                ctx.data[11], ctx.data[12],
+                            ]);
+                            let pkt = ssh_encode(
+                                94,
+                                &ssh_channel_data_payload(our_ch, &buf[..n]),
+                            );
+                            let _ = ctx.net().unwrap().send(acc, &pkt);
+                            ctx.data[8] = 0;
+                            Step::Yield
+                        }
+                        Err(aerosls_vfs::Errno::EAgain) => {
+                            ctx.data[8] = 0;
                             Step::Yield
                         }
                         Err(_) => {
