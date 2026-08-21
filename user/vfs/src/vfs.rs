@@ -1862,6 +1862,33 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         self.unix_sockets.remove(path);
     }
 
+    /// VFS-level setsockopt stub. For TCP sockets this is a no-op at
+    /// the VFS layer — the actual option is forwarded to the network
+    /// driver via `Ctx::setsockopt()`. For non-socket fds, returns
+    /// `ENOTTY`.
+    pub fn setsockopt(&self, task: u32, fd: u32, _level: u32, _optname: u32, _optval: &[u8]) -> Result<(), Errno> {
+        let idx = self.tasks.get(task as usize).ok_or(Errno::EInval)?.fds;
+        let e = self.table_pool.get(idx).ok_or(Errno::EInval)?.get(fd).ok_or(Errno::EBadf)?;
+        match &*e.node {
+            FileObj::Socket(_) => Ok(()), // TCP: handled by NetClient
+            FileObj::UnixSocket(_) => Ok(()), // v1: accepted, no-op
+            _ => Err(Errno::ENotty),
+        }
+    }
+
+    /// VFS-level getsockopt stub.
+    pub fn getsockopt(&self, task: u32, fd: u32, _level: u32, _optname: u32, optval: &mut [u8]) -> Result<usize, Errno> {
+        let idx = self.tasks.get(task as usize).ok_or(Errno::EInval)?.fds;
+        let e = self.table_pool.get(idx).ok_or(Errno::EInval)?.get(fd).ok_or(Errno::EBadf)?;
+        match &*e.node {
+            FileObj::Socket(_) | FileObj::UnixSocket(_) => {
+                for b in optval.iter_mut() { *b = 0; }
+                Ok(optval.len())
+            }
+            _ => Err(Errno::ENotty),
+        }
+    }
+
     pub fn close(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
         let idx = self.task_mut(task)?.fds;
         let slot = self.table_pool[idx]
@@ -3591,6 +3618,34 @@ mod tests {
         // Server reads EOF.
         let mut buf = [0u8; 4];
         assert_eq!(v.read(0, acc, &mut buf).unwrap(), 0);
+    }
+
+    // -- setsockopt/getsockopt tests ------------------------------------------
+
+    #[test]
+    fn setsockopt_on_unix_socket_succeeds() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let fd = v.unix_socket(0).unwrap();
+        let optval = 1u32.to_le_bytes();
+        assert!(v.setsockopt(0, fd, 1, 2, &optval).is_ok()); // SOL_SOCKET, SO_REUSEADDR
+    }
+
+    #[test]
+    fn getsockopt_on_unix_socket_returns_zeros() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let fd = v.unix_socket(0).unwrap();
+        let mut buf = [0xFFu8; 4];
+        let n = v.getsockopt(0, fd, 1, 2, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(buf, [0, 0, 0, 0]); // default returns zeros
+    }
+
+    #[test]
+    fn setsockopt_on_pipe_fails_enotty() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, _w) = v.pipe(0).unwrap();
+        let optval = 1u32.to_le_bytes();
+        assert_eq!(v.setsockopt(0, r, 1, 2, &optval), Err(Errno::ENotty));
     }
 
     /// Kernelless stand-ins for unit tests that don't touch the device.

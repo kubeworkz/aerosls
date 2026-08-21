@@ -1203,6 +1203,16 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
         self.pm.net.as_mut()
     }
 
+    /// Set a socket option (delegates to the network driver).
+    pub fn setsockopt(&mut self, id: u32, level: u32, optname: u32, optval: &[u8]) -> Result<(), u16> {
+        self.pm.net.as_mut().ok_or(0u16)?.setsockopt(id, level, optname, optval)
+    }
+
+    /// Get a socket option (delegates to the network driver).
+    pub fn getsockopt(&mut self, id: u32, level: u32, optname: u32, optval: &mut [u8]) -> Result<usize, u16> {
+        self.pm.net.as_mut().ok_or(0u16)?.getsockopt(id, level, optname, optval)
+    }
+
     // ── Signals ──────────────────────────────────────────────────────────
 
     /// Check for pending signals on the calling task. Returns the highest-

@@ -5,6 +5,17 @@
 //! trait; procmgr stores `Box<dyn SocketOps>` to dispatch socket reads
 //! and writes from applets.
 
+/// SOL_SOCKET level for setsockopt/getsockopt.
+pub const SOL_SOCKET: u32 = 1;
+/// IPPROTO_TCP level.
+pub const IPPROTO_TCP: u32 = 6;
+/// SO_REUSEADDR: allow reuse of local addresses.
+pub const SO_REUSEADDR: u32 = 2;
+/// TCP_NODELAY: disable Nagle's algorithm.
+pub const TCP_NODELAY: u32 = 1;
+/// SO_KEEPALIVE: enable TCP keepalive.
+pub const SO_KEEPALIVE: u32 = 9;
+
 /// Socket operations that the proc manager dispatches for socket FDs.
 /// Implemented by the sidecar's `NetClient<K, A>`.
 pub trait SocketOps {
@@ -37,4 +48,21 @@ pub trait SocketOps {
 
     /// Shutdown part of a socket: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR.
     fn shutdown(&mut self, id: u32, how: u8) -> Result<(), u16>;
+
+    /// Set a socket option. `level`=SOL_SOCKET(0) or IPPROTO_TCP(6),
+    /// `optname` is the option code (e.g. SO_REUSEADDR=2, TCP_NODELAY=1).
+    /// `optval` carries the option value (typically 4 bytes for int flags).
+    /// Returns Ok(()) on success; the driver may ignore unknown options.
+    fn setsockopt(&mut self, id: u32, level: u32, optname: u32, optval: &[u8]) -> Result<(), u16> {
+        let _ = (id, level, optname, optval);
+        Ok(())
+    }
+
+    /// Get a socket option. Returns the option value in `optval`.
+    fn getsockopt(&mut self, id: u32, level: u32, optname: u32, optval: &mut [u8]) -> Result<usize, u16> {
+        let _ = (id, level, optname);
+        // Default: fill with zeros.
+        for b in optval.iter_mut() { *b = 0; }
+        Ok(optval.len())
+    }
 }
