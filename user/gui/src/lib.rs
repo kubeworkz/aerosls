@@ -21,6 +21,11 @@ pub mod server;
 pub mod input;
 pub mod wm;
 
+// Include compiled Slint modules (only when slint-build is available).
+// On Windows, this is skipped — the GUI still works with programmatic UIs.
+#[cfg(not(target_os = "windows"))]
+slint::include_modules!();
+
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;

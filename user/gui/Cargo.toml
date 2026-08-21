@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Slint GUI integration for the AeroSLS POSIX sidecar — software-rendered UI for embedded ARM"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
 slint = { version = "1.9", default-features = false, features = [
@@ -11,3 +12,14 @@ slint = { version = "1.9", default-features = false, features = [
     "unsafe-single-threaded",
     "compat-1-0",
 ] }
+
+[build-dependencies]
+# slint-build compiles .slint files at build time.
+# Only available on Linux/ARM targets (not Windows due to euclid issues).
+[target.'cfg(not(target_os = "windows"))'.build-dependencies]
+slint-build = { version = "1.9", optional = true }
+
+[features]
+default = ["slint-build"]
+# Enable .slint file compilation (disable on Windows)
+slint-build = ["dep:slint-build"]

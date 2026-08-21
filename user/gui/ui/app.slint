@@ -1,0 +1,126 @@
+// AeroSLS GUI — Hello World component
+//
+// This is a minimal Slint UI that demonstrates the software renderer
+// pipeline. It renders a window with a title, greeting text, and a
+// button — all without GPU acceleration.
+
+import { Button, VerticalBox, HorizontalBox, TextEdit, LineEdit, Slider, CheckBox } from "std-widgets.slint";
+
+export component HelloWorld inherits Window {
+    title: "AeroSLS GUI";
+    preferred-width: 400px;
+    preferred-height: 300px;
+
+    VerticalBox {
+        alignment: center;
+        padding: 20px;
+        spacing: 10px;
+
+        // Title
+        Text {
+            text: "AeroSLS POSIX Sidecar";
+            font-size: 24px;
+            font-weight: bold;
+            color: #2B5797;
+            horizontal-alignment: center;
+        }
+
+        // Subtitle
+        Text {
+            text: "Slint Software Renderer";
+            font-size: 16px;
+            color: #666666;
+            horizontal-alignment: center;
+        }
+
+        // Separator
+        Rectangle {
+            height: 2px;
+            background: #E0E0E0;
+        }
+
+        // Input area
+        VerticalBox {
+            spacing: 5px;
+
+            Text {
+                text: "Enter your name:";
+                font-size: 14px;
+                color: #333333;
+            }
+
+            name-input := LineEdit {
+                placeholder-text: "Type here...";
+                text: "";
+            }
+        }
+
+        // Button row
+        HorizontalBox {
+            alignment: center;
+            spacing: 10px;
+
+            Button {
+                text: "Greet";
+                clicked => {
+                    greet-text.text = "Hello, " + name-input.text + "!";
+                }
+            }
+
+            Button {
+                text: "Clear";
+                clicked => {
+                    name-input.text = "";
+                    greet-text.text = "";
+                }
+            }
+        }
+
+        // Greeting output
+        greet-text := Text {
+            text: "";
+            font-size: 20px;
+            font-weight: bold;
+            color: #2B5797;
+            horizontal-alignment: center;
+        }
+
+        // Status bar
+        Rectangle {
+            height: 30px;
+            background: #F5F5F5;
+            border-radius: 4px;
+
+            HorizontalBox {
+                padding: 5px;
+                alignment: space-between;
+
+                Text {
+                    text: "Renderer: Software";
+                    font-size: 12px;
+                    color: #888888;
+                }
+
+                Text {
+                    text: "Platform: AeroSLS";
+                    font-size: 12px;
+                    color: #888888;
+                }
+            }
+        }
+    }
+}
+
+// Standalone test component for unit tests
+export component TestWidget inherits Rectangle {
+    preferred-width: 100px;
+    preferred-height: 100px;
+    background: #FF0000;
+
+    Text {
+        text: "Test";
+        color: white;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
