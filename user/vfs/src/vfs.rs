@@ -81,6 +81,82 @@ impl PollFd {
     }
 }
 
+/// Maximum number of file descriptors for select/poll (Linux default).
+pub const FD_SETSIZE: usize = 256;
+
+/// A bitmask-based fd set for select(). Each bit position corresponds
+/// to an fd number. Bit N is set if fd N is in the set.
+/// Layout matches the Linux fd_set: an array of bytes where bit i is
+/// at byte (i/8), bit (i%8).
+pub struct SelectFdSet {
+    bytes: [u8; (FD_SETSIZE + 7) / 8],
+}
+
+impl SelectFdSet {
+    pub fn new() -> SelectFdSet {
+        SelectFdSet { bytes: [0u8; (FD_SETSIZE + 7) / 8] }
+    }
+
+    /// Check if fd is in the set.
+    pub fn contains(&self, fd: u32) -> bool {
+        let fd = fd as usize;
+        if fd >= FD_SETSIZE { return false; }
+        (self.bytes[fd / 8] >> (fd % 8)) & 1 != 0
+    }
+
+    /// Add an fd to the set.
+    pub fn set(&mut self, fd: u32) {
+        let fd = fd as usize;
+        if fd < FD_SETSIZE {
+            self.bytes[fd / 8] |= 1 << (fd % 8);
+        }
+    }
+
+    /// Remove an fd from the set.
+    pub fn clear_fd(&mut self, fd: u32) {
+        let fd = fd as usize;
+        if fd < FD_SETSIZE {
+            self.bytes[fd / 8] &= !(1 << (fd % 8));
+        }
+    }
+
+    /// Clear the entire set.
+    pub fn clear(&mut self) {
+        self.bytes = [0u8; (FD_SETSIZE + 7) / 8];
+    }
+
+    /// The raw bytes (for interop with C-like callers).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Mutable raw bytes (for populating from external sources).
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
+impl Default for SelectFdSet {
+    fn default() -> Self { Self::new() }
+}
+
+/// Timeout for select(). None means block indefinitely.
+pub struct SelectTimeout {
+    /// Seconds.
+    pub sec: u32,
+    /// Microseconds.
+    pub usec: u32,
+}
+
+/// Result of select(): which fd_sets have ready fds.
+pub struct SelectResult {
+    pub readfds: SelectFdSet,
+    pub writefds: SelectFdSet,
+    pub errorfds: SelectFdSet,
+    /// Number of ready fds (across all three sets).
+    pub nready: usize,
+}
+
 /// lseek whence values.
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -1921,6 +1997,58 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok(n_ready)
     }
 
+    /// select(): check readiness across up to nfds file descriptors.
+    /// Converts the three fd_sets to a PollFd array, calls poll(),
+    /// then writes the results back into the output fd_sets.
+    ///
+    /// - `readfds`: fds the caller wants to check for readability (POLLIN)
+    /// - `writefds`: fds the caller wants to check for writability (POLLOUT)
+    /// - `errorfds`: fds the caller wants to check for errors (POLLERR)
+    ///
+    /// On return, each output set contains only the fds that are ready.
+    /// Returns the total number of ready fds across all sets.
+    pub fn select(
+        &self,
+        task: u32,
+        nfds: u32,
+        readfds: &SelectFdSet,
+        writefds: &SelectFdSet,
+        errorfds: &SelectFdSet,
+    ) -> Result<SelectResult, Errno> {
+        let mut out_read = SelectFdSet::new();
+        let mut out_write = SelectFdSet::new();
+        let mut out_error = SelectFdSet::new();
+        let limit = core::cmp::min(nfds as usize, FD_SETSIZE);
+        let mut nready = 0usize;
+        for fd in 0..limit as u32 {
+            let want_in = readfds.contains(fd);
+            let want_out = writefds.contains(fd);
+            let want_err = errorfds.contains(fd);
+            if !want_in && !want_out && !want_err {
+                continue;
+            }
+            let mut events = 0u16;
+            if want_in { events |= POLLIN; }
+            if want_out { events |= POLLOUT; }
+            // POLLERR is always checked when requested.
+            if want_err { events |= POLLERR; }
+            let mut pfds = [PollFd::new(fd, events)];
+            self.poll(task, &mut pfds)?;
+            let r = pfds[0].revents;
+            if r & POLLIN != 0 { out_read.set(fd); }
+            if r & POLLOUT != 0 { out_write.set(fd); }
+            // POLLERR, POLLHUP, POLLNVAL all map to the error set.
+            if r & (POLLERR | POLLHUP | POLLNVAL) != 0 { out_error.set(fd); }
+            if r != 0 { nready += 1; }
+        }
+        Ok(SelectResult {
+            readfds: out_read,
+            writefds: out_write,
+            errorfds: out_error,
+            nready,
+        })
+    }
+
     /// The readiness bitmask for a single file-like object.  Returns the
     /// events the object is *currently* ready for, regardless of what the
     /// caller asked for (the caller masks with `events`).
@@ -2855,6 +2983,123 @@ mod tests {
         let mut fds = vec![PollFd::new(master, POLLIN)];
         assert_eq!(v.poll(0, &mut fds).unwrap(), 1);
         assert_eq!(fds[0].revents, POLLIN);
+    }
+
+
+    // -- select tests -----------------------------------------------------------
+
+    #[test]
+    fn select_pipe_data_ready() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, w) = v.pipe(0).unwrap();
+        v.write(0, w, b"data").unwrap();
+        let mut rfds = SelectFdSet::new();
+        rfds.set(r);
+        let wfds = SelectFdSet::new();
+        let efds = SelectFdSet::new();
+        let res = v.select(0, r + 1, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 1);
+        assert!(res.readfds.contains(r));
+    }
+
+    #[test]
+    fn select_empty_pipe_not_ready() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r, _w) = v.pipe(0).unwrap();
+        let mut rfds = SelectFdSet::new();
+        rfds.set(r);
+        let wfds = SelectFdSet::new();
+        let efds = SelectFdSet::new();
+        let res = v.select(0, r + 1, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 0);
+        assert!(!res.readfds.contains(r));
+    }
+
+    #[test]
+    fn select_pipe_write_ready() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (_r, w) = v.pipe(0).unwrap();
+        let rfds = SelectFdSet::new();
+        let mut wfds = SelectFdSet::new();
+        wfds.set(w);
+        let efds = SelectFdSet::new();
+        let res = v.select(0, w + 1, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 1);
+        assert!(res.writefds.contains(w));
+    }
+
+    #[test]
+    fn select_bad_fd_in_error_set() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let rfds = SelectFdSet::new();
+        let wfds = SelectFdSet::new();
+        let mut efds = SelectFdSet::new();
+        efds.set(99);
+        let res = v.select(0, 100, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 1);
+        assert!(res.errorfds.contains(99));
+    }
+
+    #[test]
+    fn select_nfds_limits_scan() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (_r, w) = v.pipe(0).unwrap();
+        let mut wfds = SelectFdSet::new();
+        wfds.set(w);
+        let rfds = SelectFdSet::new();
+        let efds = SelectFdSet::new();
+        // nfds=1 means only fd 0 is checked; fd w > 0 is not scanned.
+        let res = v.select(0, 1, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 0);
+    }
+
+    #[test]
+    fn select_multiple_fds() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (r1, w1) = v.pipe(0).unwrap();
+        let (r2, _w2) = v.pipe(0).unwrap();
+        v.write(0, w1, b"a").unwrap();
+        let mut rfds = SelectFdSet::new();
+        rfds.set(r1);
+        rfds.set(r2);
+        let wfds = SelectFdSet::new();
+        let efds = SelectFdSet::new();
+        let max_fd = core::cmp::max(r1, r2) + 1;
+        let res = v.select(0, max_fd, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 1);
+        assert!(res.readfds.contains(r1));
+        assert!(!res.readfds.contains(r2));
+    }
+
+    #[test]
+    fn select_fd_set_operations() {
+        let mut s = SelectFdSet::new();
+        assert!(!s.contains(0));
+        s.set(0);
+        assert!(s.contains(0));
+        s.clear_fd(0);
+        assert!(!s.contains(0));
+        // FD_SETSIZE boundary
+        s.set((FD_SETSIZE - 1) as u32);
+        assert!(s.contains((FD_SETSIZE - 1) as u32));
+        s.clear();
+        assert!(!s.contains((FD_SETSIZE - 1) as u32));
+    }
+
+    #[test]
+    fn select_console_ready_with_input() {
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let console = Arc::new(CharNode::console());
+        console.console_io().push_input(b"x");
+        v.mount_devfs("/dev", console).unwrap();
+        let fd = v.open(0, "/dev/console", O_RDONLY, 0).unwrap();
+        let mut rfds = SelectFdSet::new();
+        rfds.set(fd);
+        let wfds = SelectFdSet::new();
+        let efds = SelectFdSet::new();
+        let res = v.select(0, fd + 1, &rfds, &wfds, &efds).unwrap();
+        assert_eq!(res.nready, 1);
+        assert!(res.readfds.contains(fd));
     }
 
 

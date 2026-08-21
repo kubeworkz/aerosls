@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::sockops::SocketOps;
-use aerosls_vfs::{BufferAlloc, Errno, PollFd, Vfs, CLONE_FILES, O_RDONLY};
+use aerosls_vfs::{BufferAlloc, Errno, PollFd, SelectFdSet, SelectResult, Vfs, CLONE_FILES, O_RDONLY};
 
 // ── Signals ────────────────────────────────────────────────────────────────
 
@@ -1240,6 +1240,19 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
         if let Some(tc) = self.pm.tasks.get_mut(&self.task) {
             tc.env = env;
         }
+    }
+
+    /// select(): check readiness across up to nfds file descriptors.
+    /// Delegates to Vfs::select().
+    pub fn select(
+        &mut self,
+        nfds: u32,
+        readfds: &SelectFdSet,
+        writefds: &SelectFdSet,
+        errorfds: &SelectFdSet,
+    ) -> Result<SelectResult, Errno> {
+        let task = self.task;
+        self.pm.vfs.select(task, nfds, readfds, writefds, errorfds)
     }
 
     /// Unified poll: check readiness across the task's open fds.

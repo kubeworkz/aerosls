@@ -43,5 +43,5 @@ pub use fileobj::{CharNode, ConsoleIo, FileObj, PipeNode, SocketMeta, SocketStat
 pub use vfs::{
     rights_of, FileNode, FdEntry, MountState, Vfs, CLONE_FILES, O_ACCMODE, O_APPEND, O_CREAT,
     O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, POLLIN, POLLOUT, POLLERR, POLLHUP,
-    POLLNVAL, PollFd, SEEK_CUR, SEEK_END, SEEK_SET,
+    POLLNVAL, PollFd, SelectFdSet, SelectResult, FD_SETSIZE, SEEK_CUR, SEEK_END, SEEK_SET,
 };
