@@ -1250,7 +1250,7 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
 
     /// Create a socket (POSIX-compatible entry point).
     /// `domain`=AF_UNIX(1), `sock_type`=SOCK_STREAM(1) or SOCK_DGRAM(2).
-    pub fn socket(&mut self, domain: u16, sock_type: u16) -> Result<u32, Errno> {
+    pub fn socket(&mut self, domain: u16, _sock_type: u16) -> Result<u32, Errno> {
         if domain == AF_UNIX {
             self.pm.vfs.unix_socket(self.task)
         } else {

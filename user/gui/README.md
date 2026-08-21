@@ -18,7 +18,21 @@ MinimalSoftwareWindow + SoftwareRenderer
 Rgb565 framebuffer → ARGB conversion → Framebuffer
     ↓
 /dev/fb0 (ARM) or X11 PutImage (remote)
+    ↓
+X11Server (x11.rs) handles ClientHello/SetupReply handshake
+    ↓
+X11 PutImage protocol messages → Unix socket (/tmp/.X11-unix/X0)
+    ↓
+sshd phase 8 X11 relay → SSH channel → host X server
 ```
+
+## Modules
+
+| Module | What |
+|--------|------|
+| `lib.rs` | `GuiState` + `Framebuffer` + custom `Platform` backend |
+| `x11.rs` | X11 protocol: ClientHello parsing, SetupReply building, PutImage encoding, event parsing |
+| `server.rs` | `X11Server` state machine: accepts clients, handles handshake, sends rendered frames |
 
 ## Build Status
 
