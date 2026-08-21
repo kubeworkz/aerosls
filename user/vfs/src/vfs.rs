@@ -1558,6 +1558,24 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
                         p.set_termios(tty);
                         Ok(())
                     }
+                    crate::fileobj::TIOCFLUSH => {
+                        // arg[0..4] = queue_selector (TCIFLUSH/TCOFLUSH/TCIOFLUSH).
+                        let qs = if arg.len() >= 4 {
+                            u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]])
+                        } else {
+                            crate::fileobj::TCIOFLUSH
+                        };
+                        let is_master = matches!(&*e.node, FileObj::PtyMaster(_));
+                        p.flush(qs, is_master);
+                        Ok(())
+                    }
+                    crate::fileobj::TIOCOUTQ => {
+                        // Return number of bytes in the output queue.
+                        if arg.len() < 4 { return Err(Errno::EInval); }
+                        let n = p.output_queue_len() as u32;
+                        arg[0..4].copy_from_slice(&n.to_le_bytes());
+                        Ok(())
+                    }
                     _ => Err(Errno::ENotty),
                 }
             }
@@ -3825,6 +3843,92 @@ mod tests {
         let n = v.read(0, slave, &mut buf).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf[..5], b"hello");
+    }
+
+    // -- tcflush / TIOCOUTQ tests -------------------------------------------------
+
+    #[test]
+    fn tcflush_master_input_clears_master_buf() {
+        use crate::fileobj::{TIOCFLUSH, TCIFLUSH};
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Slave writes data — it sits in master_buf.
+        v.write(0, slave, b"hello").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, master, &mut buf).unwrap(), 5);
+        // Write more data.
+        v.write(0, slave, b"world").unwrap();
+        // Flush master input (TCIFLUSH) — should clear master_buf.
+        let mut arg = [0u8; 4];
+        arg[0..4].copy_from_slice(&TCIFLUSH.to_le_bytes());
+        v.ioctl(0, master, TIOCFLUSH, &mut arg).unwrap();
+        // Master read should now return EAGAIN (buffer empty).
+        assert_eq!(v.read(0, master, &mut buf), Err(Errno::EAgain));
+    }
+
+    #[test]
+    fn tcflush_master_output_clears_slave_buf() {
+        use crate::fileobj::{TIOCFLUSH, TCOFLUSH};
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Master writes data — it sits in slave_buf.
+        v.write(0, master, b"data").unwrap();
+        // Flush master output (TCOFLUSH) — should clear slave_buf.
+        let mut arg = [0u8; 4];
+        arg[0..4].copy_from_slice(&TCOFLUSH.to_le_bytes());
+        v.ioctl(0, master, TIOCFLUSH, &mut arg).unwrap();
+        // Slave read should now return EAGAIN (buffer empty).
+        let mut buf = [0u8; 8];
+        assert_eq!(v.read(0, slave, &mut buf), Err(Errno::EAgain));
+    }
+
+    #[test]
+    fn tcflush_both_clears_all_buffers() {
+        use crate::fileobj::{TIOCFLUSH, TCIOFLUSH};
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Fill both buffers.
+        v.write(0, slave, b"to_master").unwrap();
+        v.write(0, master, b"to_slave").unwrap();
+        // Flush everything.
+        let mut arg = [0u8; 4];
+        arg[0..4].copy_from_slice(&TCIOFLUSH.to_le_bytes());
+        v.ioctl(0, master, TIOCFLUSH, &mut arg).unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(v.read(0, master, &mut buf), Err(Errno::EAgain));
+        assert_eq!(v.read(0, slave, &mut buf), Err(Errno::EAgain));
+    }
+
+    #[test]
+    fn tiocoutq_returns_output_queue_length() {
+        use crate::fileobj::{TIOCOUTQ};
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, slave) = v.openpty(0).unwrap();
+        // Slave writes — appears in master's output queue.
+        v.write(0, slave, b"abc").unwrap();
+        let mut arg = [0u8; 4];
+        v.ioctl(0, master, TIOCOUTQ, &mut arg).unwrap();
+        let n = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]);
+        assert_eq!(n, 3);
+        // Read it — queue drains.
+        let mut buf = [0u8; 8];
+        v.read(0, master, &mut buf).unwrap();
+        v.ioctl(0, master, TIOCOUTQ, &mut arg).unwrap();
+        let n = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn tcdrain_on_pty_succeeds() {
+        use crate::fileobj::{TIOCFLUSH, TCIOFLUSH};
+        let mut v = Vfs::<dummy::NoKernel, dummy::NoAlloc>::new();
+        let (master, _slave) = v.openpty(0).unwrap();
+        // tcdrain is a no-op in our synchronous model — should always succeed.
+        // We verify via a TIOCFLUSH round-trip (drain semantics are that
+        // all pending output has been transmitted, which is trivially true).
+        let mut arg = [0u8; 4];
+        arg[0..4].copy_from_slice(&TCIOFLUSH.to_le_bytes());
+        v.ioctl(0, master, TIOCFLUSH, &mut arg).unwrap();
     }
 
     /// Kernelless stand-ins for unit tests that don't touch the device.

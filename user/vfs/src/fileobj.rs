@@ -517,6 +517,13 @@ impl Termios {
 /// ioctl request codes for termios.
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TIOCFLUSH: u32 = 0x5408;
+pub const TIOCOUTQ: u32 = 0x5411;
+
+/// tcflush queue selectors.
+pub const TCIFLUSH: u32 = 0;
+pub const TCOFLUSH: u32 = 1;
+pub const TCIOFLUSH: u32 = 2;
 
 // -- pseudo-terminals (PTYs) ------------------------------------------------
 
@@ -758,11 +765,39 @@ impl PtyState {
 
     /// Deliver a signal to the foreground process group.
     fn raise_signal(&self, sig: i32) {
-        // v1 stub: stores the signal for the proc manager to observe.
-        // In the full sidecar, this would deliver to the foreground_pgid.
-        // For now, we just record it; the caller (Ctx) checks via
-        // a signal register on the PtyState.
         let _ = sig;
+    }
+
+    /// Flush queued data per the tcflush queue_selector.
+    /// `is_master` indicates which side of the PTY the ioctl was called on.
+    pub fn flush(&self, queue_selector: u32, is_master: bool) {
+        match queue_selector {
+            TCIFLUSH => {
+                if is_master {
+                    self.master_buf.borrow_mut().clear();
+                } else {
+                    self.slave_buf.borrow_mut().clear();
+                }
+            }
+            TCOFLUSH => {
+                if is_master {
+                    self.slave_buf.borrow_mut().clear();
+                } else {
+                    self.master_buf.borrow_mut().clear();
+                }
+            }
+            TCIOFLUSH => {
+                self.master_buf.borrow_mut().clear();
+                self.slave_buf.borrow_mut().clear();
+            }
+            _ => {}
+        }
+    }
+
+    /// Output queue count: bytes pending in the master's read buffer
+    /// (data written by the slave, not yet read by the master).
+    pub fn output_queue_len(&self) -> usize {
+        self.master_buf.borrow().len()
     }
 
     /// Master-side readiness: readable if slave wrote data or slave gone.
