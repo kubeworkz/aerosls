@@ -88,6 +88,7 @@ fn reaper(ctx: &mut Ctx<D, M>) -> Step {
         WaitOutcome::Reaped(code) => ctx.exit(code),
         WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(1)),
         WaitOutcome::NoSuchChild => Step::Exit(99),
+        WaitOutcome::Stopped(_) => Step::Exit(97),
     }
 }
 
@@ -480,6 +481,7 @@ fn waiting_parent(ctx: &mut Ctx<D, M>) -> Step {
         WaitOutcome::Reaped(code) => ctx.exit(code),
         WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(1)),
         WaitOutcome::NoSuchChild => Step::Exit(98),
+        WaitOutcome::Stopped(_) => Step::Exit(97),
     }
 }
 

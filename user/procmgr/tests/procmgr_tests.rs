@@ -194,6 +194,7 @@ fn threader(ctx: &mut Ctx<FC, FA>) -> Step {
                 WaitOutcome::Reaped(c) => ctx.exit(c),
                 WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
                 WaitOutcome::NoSuchChild => Step::Exit(90),
+                    WaitOutcome::Stopped(_) => Step::Exit(90),
             }
         }
         3 => {
@@ -422,9 +423,11 @@ fn pipeline(ctx: &mut Ctx<FC, FA>) -> Step {
                     WaitOutcome::Reaped(code) => ctx.exit(code),
                     WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(grep_c)),
                     WaitOutcome::NoSuchChild => Step::Exit(90),
+                    WaitOutcome::Stopped(_) => Step::Exit(90),
                 },
                 WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(cat_c)),
                 WaitOutcome::NoSuchChild => Step::Exit(90),
+                    WaitOutcome::Stopped(_) => Step::Exit(90),
             }
         }
         _ => Step::Exit(1),
@@ -881,6 +884,7 @@ fn blocking_shell(ctx: &mut Ctx<FC, FA>) -> Step {
                         WaitOutcome::Reaped(code) => ctx.exit(code),
                         WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
                         WaitOutcome::NoSuchChild => Step::Exit(90),
+                    WaitOutcome::Stopped(_) => Step::Exit(90),
                     }
                 }
                 ReadBlock::Data(_) => Step::Exit(7),
@@ -1106,6 +1110,7 @@ fn wnohang_parent(ctx: &mut Ctx<FC, FA>) -> Step {
             WaitOutcome::Reaped(_) => b"REAPED",
             WaitOutcome::Blocked => b"BLOCKED",
             WaitOutcome::NoSuchChild => b"NOCHILD",
+            WaitOutcome::Stopped(_) => b"STOPPED",
         };
         let fd = ctx.vfs().open(task, "/tmp/wnohang", aerosls_vfs::O_CREAT | aerosls_vfs::O_WRONLY, 0o644).unwrap();
         ctx.vfs().write(task, fd, tag).unwrap();
@@ -1122,6 +1127,7 @@ fn wnohang_parent(ctx: &mut Ctx<FC, FA>) -> Step {
             WaitOutcome::Reaped(_) => b"REAPED",
             WaitOutcome::Blocked => b"BLOCKED",
             WaitOutcome::NoSuchChild => b"NOCHILD",
+            WaitOutcome::Stopped(_) => b"STOPPED",
         };
         let fd = ctx.vfs().open(task, "/tmp/wnohang2", aerosls_vfs::O_CREAT | aerosls_vfs::O_WRONLY, 0o644).unwrap();
         ctx.vfs().write(task, fd, tag).unwrap();

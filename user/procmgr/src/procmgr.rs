@@ -63,6 +63,8 @@ pub const SIGQUIT: i32 = 3;
 pub const SIGKILL: i32 = 9;
 pub const SIGPIPE: i32 = 13;
 pub const SIGTERM: i32 = 15;
+pub const SIGCONT: i32 = 18;
+pub const SIGTSTP: i32 = 20;
 
 /// The "raised by signal" exit-status convention: a task killed by signal
 /// N exits with status `128 + N`. This encodes the POSIX `WIFSIGNALED` /
@@ -173,6 +175,8 @@ pub enum BlockReason {
     /// Wait for a specific child OR for N ticks, whichever comes first.
     /// Payload: (child_id, remaining_ticks).
     WaitChildTimeout(u32, u32),
+    /// Task stopped by SIGTSTP (Ctrl-Z).  Resumed by SIGCONT.
+    Stopped,
 }
 
 /// Outcome of a blocking read (`Ctx::read_blocking`).
@@ -232,6 +236,10 @@ pub enum WaitOutcome {
     Blocked,
     /// No such child.
     NoSuchChild,
+    /// The child was stopped (SIGTSTP).  The caller should note it
+    /// in the job table and re-prompt (POSIX SIGTSTP/SIGCONT).
+    /// Payload: child_id.
+    Stopped(u32),
 }
 
 /// A program image. At this crate's level: a step function plus its state
@@ -537,6 +545,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 }
                 WaitOutcome::Reaped(code)
             }
+            Some(TaskState::Blocked(BlockReason::Stopped)) => WaitOutcome::Stopped(child),
             Some(_) => WaitOutcome::Blocked,
             None => WaitOutcome::NoSuchChild,
         }
@@ -619,6 +628,13 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             if let Some(sig) = self.check_signals(id) {
                 if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
                     Step::Exit(signal_exit_code(sig))
+                } else if sig == SIGTSTP {
+                    // SIGTSTP stops the task.  Park it and do not re-enqueue.
+                    if let Some(tc) = self.tasks.get_mut(&id) {
+                        tc.state = TaskState::Blocked(BlockReason::Stopped);
+                    }
+                    self.wake_trace.push(WakeEvent::Parked(id, BlockReason::Stopped));
+                    return Some(Step::Blocked(BlockReason::Stopped));
                 } else {
                     outcome
                 }
@@ -738,6 +754,39 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
                 self.kill(c, SIGINT).ok();
             }
         }
+        // Terminal stop: when the console has a Ctrl-Z (0x1a) in its
+        // input buffer, deliver SIGTSTP to every task's foreground children
+        // immediately.  This suspends the foreground pipeline; the shell
+        // observes the stopped children and re-prompts.
+        if self.vfs.has_console_byte(0x1a) {
+            self.vfs.discard_console_byte(0x1a);
+            let fg_children: Vec<u32> = self.tasks.values()
+                .flat_map(|tc| tc.foreground.iter().copied())
+                .collect();
+            for c in fg_children {
+                self.kill(c, SIGTSTP).ok();
+            }
+            // Wake any parent blocked on WaitingChild for a now-stopped
+            // child so the shell can observe the stop and re-prompt.
+            let stopped_set: Vec<u32> = self.tasks.iter()
+                .filter(|(_, tc)| matches!(tc.state, TaskState::Blocked(BlockReason::Stopped)))
+                .map(|(&id, _)| id)
+                .collect();
+            let mut wake_parents: Vec<u32> = Vec::new();
+            for (&id, tc) in self.tasks.iter() {
+                if let TaskState::Blocked(BlockReason::WaitingChild(c)) = tc.state {
+                    if stopped_set.contains(&c) {
+                        wake_parents.push(id);
+                    }
+                }
+            }
+            for id in wake_parents {
+                if let Some(tc) = self.tasks.get_mut(&id) {
+                    tc.state = TaskState::Runnable;
+                    self.run.push_back(id);
+                }
+            }
+        }
         // Handle WaitChildTimeout: check if the child exited or the
         // timer expired.  This is how `fg` avoids hanging forever on a
         // background job that never exits.
@@ -794,7 +843,7 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         self.tasks.values().any(|tc| matches!(
             tc.state,
             TaskState::Blocked(BlockReason::Sleep(n) | BlockReason::WaitChildTimeout(_, n)) if n > 0
-        ))
+        )) || self.tasks.values().any(|tc| matches!(tc.state, TaskState::Blocked(BlockReason::Stopped)))
     }
 
     pub fn run_until_quiet(&mut self, max_steps: usize) -> usize {
@@ -831,6 +880,13 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         }
     }
 
+    /// Return the program name of a task (for job-table display).
+    pub fn task_name(&self, task: u32) -> &str {
+        self.tasks.get(&task)
+            .map(|t| t.program.name.as_str())
+            .unwrap_or("?")
+    }
+
     // ── Signal delivery ──────────────────────────────────────────────────
 
     /// Enqueue a signal on a task. The signal is delivered cooperatively:
@@ -840,9 +896,26 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
     pub fn kill(&mut self, task: u32, sig: i32) -> Result<(), Errno> {
         let tc = self.tasks.get_mut(&task).ok_or(Errno::ESRCH)?;
         tc.pending.add(sig);
-        // A blocked task with a pending fatal signal must not stay parked:
-        // wake it so it can observe the signal and exit.
-        if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
+        if sig == SIGTSTP {
+            // SIGTSTP stops the task: transition to Stopped regardless of
+            // current state (Runnable → Stopped, Blocked → Stopped).
+            let was_running = matches!(tc.state, TaskState::Runnable);
+            tc.state = TaskState::Blocked(BlockReason::Stopped);
+            if was_running {
+                // Remove from run queue if present.
+                self.run.retain(|&id| id != task);
+            }
+            self.wake_trace.push(WakeEvent::Parked(task, BlockReason::Stopped));
+        } else if sig == SIGCONT {
+            // SIGCONT resumes a stopped task.
+            if let TaskState::Blocked(BlockReason::Stopped) = tc.state {
+                tc.state = TaskState::Runnable;
+                self.run.push_back(task);
+                self.wake_trace.push(WakeEvent::Woken(task, BlockReason::Stopped));
+            }
+        } else if matches!(sig, SIGINT | SIGTERM | SIGKILL) {
+            // A blocked task with a pending fatal signal must not stay parked:
+            // wake it so it can observe the signal and exit.
             if let TaskState::Blocked(reason) = tc.state {
                 tc.state = TaskState::Runnable;
                 self.run.push_back(task);
@@ -953,12 +1026,15 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// expires first, the child is killed with SIGTERM and the caller
     /// is woken with `Blocked(WaitChildTimeout(child, 0))`.
     pub fn wait_timeout(&mut self, child: u32, ticks: u32) -> Step {
-        // Fast path: already reaped or gone.
+        // Fast path: already reaped, gone, or stopped.
         match self.pm.wait(self.task, child) {
             WaitOutcome::Reaped(_code) => {
                 return Step::Yield;
             }
             WaitOutcome::NoSuchChild => {
+                return Step::Yield;
+            }
+            WaitOutcome::Stopped(_child_id) => {
                 return Step::Yield;
             }
             WaitOutcome::Blocked => {}

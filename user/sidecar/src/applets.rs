@@ -92,7 +92,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use aerosls_procmgr::{is_child, signal_exit_code, BlockReason, Ctx, ProcManager, ReadBlock, SIGINT, Step, WaitOutcome, WriteBlock};
+use aerosls_procmgr::{is_child, signal_exit_code, BlockReason, Ctx, ProcManager, ReadBlock, SIGCONT, SIGINT, SIGTSTP, Step, WaitOutcome, WriteBlock};
 use aerosls_proto::kabi::Kernel;
 use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
@@ -149,7 +149,7 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             ctx.data[0] = 2;
             ctx.data.extend_from_slice(&child.to_le_bytes()); // u32 LE
             match ctx.wait(child) {
-                WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
+                WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(child)),
                 WaitOutcome::Reaped(_) => {
                     ctx.data.truncate(ctx.data.len() - 4);
                     ctx.data[0] = 1;
@@ -169,7 +169,7 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     ctx.data[0] = 1;
                     Step::Yield
                 }
-                WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
+                WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(child)),
                 WaitOutcome::NoSuchChild => Step::Exit(2),
             }
         }
@@ -2316,6 +2316,27 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             jobs_encode(&mut ctx.data, &refs);
             return Step::Yield;
         }
+        if sig == SIGTSTP {
+            // SIGTSTP stops only the foreground pipeline.
+            if ctx.data[0] == 3 {
+                ctx.kill_group_fg(SIGTSTP);
+            }
+            // Re-prompt without changing $?.
+            let env_end_off = env_end(&ctx.data, 2);
+            let env_reg = ctx.data[2..env_end_off].to_vec();
+            let (_nj, job_entries) = jobs_decode(&ctx.data);
+            let status = ctx.data[1];
+            ctx.data.clear();
+            ctx.data.push(0);
+            ctx.data.push(status);
+            ctx.data.extend_from_slice(&env_reg);
+            let refs: alloc::vec::Vec<(u32, &str)> = job_entries
+                .iter()
+                .map(|(id, c)| (*id, c.as_str()))
+                .collect();
+            jobs_encode(&mut ctx.data, &refs);
+            return Step::Yield;
+        }
         return Step::Exit(signal_exit_code(sig));
     }
     match ctx.data[0] {
@@ -2390,6 +2411,13 @@ pub fn sh<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                     if chunk.contains(&0x03) {
                         // Ctrl-C: kill only the foreground pipeline.
                         ctx.kill_group_fg(SIGINT);
+                        ctx.data.truncate(qstart);
+                        ctx.data[0] = 0; // re-prompt
+                        return Step::Yield;
+                    }
+                    if chunk.contains(&0x1a) {
+                        // Ctrl-Z: stop only the foreground pipeline.
+                        ctx.kill_group_fg(SIGTSTP);
                         ctx.data.truncate(qstart);
                         ctx.data[0] = 0; // re-prompt
                         return Step::Yield;
@@ -2709,7 +2737,7 @@ fn run_line<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             }
             Step::Yield
         }
-        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+        WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(c)),
         WaitOutcome::NoSuchChild => Step::Exit(2),
     }
 }
@@ -2764,6 +2792,20 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         } else {
             alloc::vec::Vec::new()
         };
+        // Collect stopped children before clearing — they stay alive
+        // in Blocked(Stopped) and need to be added to the job table.
+        let stopped_children: alloc::vec::Vec<u32> = (0..n)
+            .filter_map(|i| {
+                let off = 4 + 4 * i;
+                let cid = u32::from_le_bytes(ctx.data[off..off + 4].try_into().unwrap());
+                match ctx.pm.state(cid) {
+                    Some(aerosls_procmgr::TaskState::Blocked(
+                        aerosls_procmgr::BlockReason::Stopped,
+                    )) => Some(cid),
+                    _ => None,
+                }
+            })
+            .collect();
         let status = ctx.data[1];
         ctx.data.clear();
         ctx.data.push(if queue.is_empty() { 0 } else { 1 });
@@ -2771,6 +2813,11 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         ctx.data.extend_from_slice(&env_region);
         ctx.data.extend_from_slice(&job_table_bytes);
         ctx.data.extend_from_slice(&queue);
+        // Now the layout is normal — safe to use jobs_add.
+        for cid in &stopped_children {
+            let cmd_name = ctx.pm.task_name(*cid);
+            jobs_add(&mut ctx.data, *cid, cmd_name);
+        }
         return Step::Yield;
     }
     let off = 4 + 4 * reaped;
@@ -2786,6 +2833,17 @@ fn reap_next<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
         WaitOutcome::NoSuchChild => {
             ctx.data[3] = (reaped + 1) as u8;
+            Step::Yield
+        }
+        WaitOutcome::Stopped(_child_id) => {
+            // The child was stopped by SIGTSTP (Ctrl-Z).  Skip it in
+            // the reaping pass — it stays alive in Blocked(Stopped).
+            // Stopped children are added to the job table when all
+            // pipeline stages finish (reaped >= n path below).
+            ctx.data[3] = (reaped + 1) as u8;
+            if reaped + 1 == n {
+                ctx.data[1] = 20; // SIGTSTP status
+            }
             Step::Yield
         }
     }
@@ -3040,8 +3098,14 @@ fn do_jobs<K: Kernel, A: BufferAlloc>(
         return 0;
     }
     let mut out = alloc::string::String::new();
-    for (i, (_child_id, cmd)) in entries.iter().enumerate() {
-        out.push_str(&alloc::format!("[{}] {}\n", i + 1, cmd));
+    for (i, (child_id, cmd)) in entries.iter().enumerate() {
+        let status = match ctx.pm.state(*child_id) {
+            Some(aerosls_procmgr::TaskState::Blocked(
+                aerosls_procmgr::BlockReason::Stopped,
+            )) => "Stopped",
+            _ => "Running",
+        };
+        out.push_str(&alloc::format!("[{}] {} {}\n", i + 1, status, cmd));
     }
     if ctx.vfs().write(task, 1, out.as_bytes()).is_err() {
         1
@@ -3078,8 +3142,9 @@ fn do_bg<K: Kernel, A: BufferAlloc>(
     } else {
         entries.len() - 1
     };
-    // In v1 there is no real stop/continue, so bg is a no-op that
-    // confirms the job is running.
+    // Send SIGCONT to resume the stopped job.
+    let child_id = entries[idx].0;
+    ctx.kill(child_id, SIGCONT).ok();
     let msg = alloc::format!("[{}] {}\n", idx + 1, entries[idx].1);
     ctx.vfs().write(task, 1, msg.as_bytes()).ok();
     0
@@ -3139,6 +3204,8 @@ fn do_fg<K: Kernel, A: BufferAlloc>(
         .collect();
     jobs_encode(&mut ctx.data, &refs);
     ctx.data.extend_from_slice(&queue);
+    // If the job is stopped, resume it with SIGCONT.
+    ctx.kill(child_id, SIGCONT).ok();
     // Park with a 100-tick timeout.
     ctx.wait_timeout(child_id, 100)
 }

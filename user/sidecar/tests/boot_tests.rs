@@ -2053,3 +2053,93 @@ fn timeout_no_command_returns_124() {
     t.join().unwrap();
 }
 
+/// Ctrl-Z suspends the foreground pipeline; bg resumes it; fg brings
+/// it back to the foreground and waits for it to complete.
+#[test]
+fn ctrlz_suspend_and_fg_bg_resume() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a long-running foreground job.
+    console.console_io().push_input(b"sleep 999\n");
+    booted.run(200);
+
+    // Ctrl-Z should suspend it — shell re-prompts.
+    console.console_io().push_input(b"\x1a");
+    booted.run(50);
+    let out = console.console_io().output().to_vec();
+    assert!(out.ends_with(b"$ "),
+        "shell re-prompts after Ctrl-Z, got: {:?}", out);
+
+    // jobs should show it as Stopped.
+    console.console_io().push_input(b"jobs\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(out.windows(7).any(|w| w == b"Stopped"),
+        "jobs shows Stopped, got: {:?}", out);
+
+    // fg should resume it and wait — timeout fires, exit 124.
+    console.console_io().push_input(b"fg\n");
+    booted.run(200);
+    let out = console.console_io().output();
+    let prompt_count = out.windows(2).filter(|w| *w == b"$ ").count();
+    assert!(prompt_count >= 3,
+        "fg resumed and timed out ({} prompts), got: {:?}", prompt_count, out);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// bg sends SIGCONT to a stopped job; the job resumes and completes.
+#[test]
+fn bg_sends_sigcont_to_stopped_job() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_dir("/bin", 0o755);
+    b.add_file("/bin/sleep", b"sleep\n", 0o755);
+    b.add_file("/bin/echo", b"echo\n", 0o755);
+    b.add_file("/bin/sh", b"sh\n", 0o755);
+    b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
+    let (fake, client) = FakeKernel::new(b.build(), 1);
+    let t = boot_driver(fake);
+    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    // Start a short background job.
+    console.console_io().push_input(b"sleep 5 &\n");
+    booted.run(200);
+
+    // Suspend it via kill -SIGTSTP (simulating Ctrl-Z on a bg job).
+    console.console_io().push_input(b"kill -SIGTSTP %1\n");
+    booted.run(200);
+
+    // bg should resume it.
+    console.console_io().push_input(b"bg\n");
+    booted.run(200);
+
+    // Wait for the job to finish.
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(
+        out.windows(7).any(|w| w == b"[done] ") || out.windows(2).any(|w| w == b"$ "),
+        "background job completed, got: {:?}", out
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
