@@ -218,13 +218,21 @@ fn print_bench(tag: &str, samples: &[u64], note: &str) {
         let median = s[n / 2];
         let p99 = s[((n as f64 * 0.99) as usize).min(n - 1)];
         let mean = s.iter().sum::<u64>() / n as u64;
+        let median_ns = cycles_to_ns(median);
+        let p99_ns = cycles_to_ns(p99);
+        let mean_ns = cycles_to_ns(mean);
         println!(
-            "BENCH_{tag}: N={n} median_cy={median} median_ns={} p99_cy={p99} p99_ns={} mean_cy={mean} ({note})",
-            cycles_to_ns(median),
-            cycles_to_ns(p99),
+            "BENCH_{tag}: N={n} median_cy={median} median_ns={median_ns} p99_cy={p99} p99_ns={p99_ns} mean_cy={mean} ({note})"
+        );
+        // Machine-readable line (one per leg) for CI archiving and drift
+        // tracking — grep'd out of the e2e output by the polyglot-e2e job.
+        let leg = tag.to_ascii_lowercase();
+        println!(
+            "BENCH_JSON {{\"leg\":\"{leg}\",\"n\":{n},\"median_cy\":{median},\"median_ns\":{median_ns},\"p99_cy\":{p99},\"p99_ns\":{p99_ns},\"mean_cy\":{mean},\"mean_ns\":{mean_ns}}}"
         );
     } else {
         println!("BENCH_{tag}: no round-trip samples ({note})");
+        println!("BENCH_JSON {{\"leg\":\"{}\",\"n\":0}}", tag.to_ascii_lowercase());
     }
 }
 

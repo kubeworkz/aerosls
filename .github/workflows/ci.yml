@@ -384,7 +384,25 @@ jobs:
           fi
           printf '%s\n' "$out" | grep -q 'test result: ok' || {
             echo "::error::polyglot e2e did not pass"; exit 1; }
+          # Archive the per-leg bench JSON (one BENCH_JSON line per leg, from
+          # the wasm-sidecar) for latency drift tracking. Missing JSON means
+          # the bench emission is broken — fail loudly.
+          printf '%s\n' "$out" | grep 'BENCH_JSON' > bench-polyglot.jsonl || true
+          if [ ! -s bench-polyglot.jsonl ]; then
+            echo "::error::no BENCH_JSON lines from the e2e — bench emission is broken"
+            exit 1
+          fi
         working-directory: aerosls2
+
+      # Persist the latency numbers from the step above as an artifact, so
+      # each run's per-leg medians/p99s can be compared over time (the
+      # wasm-sidecar emits one BENCH_JSON line per bench leg).
+      - name: Archive bench latency results
+        uses: actions/upload-artifact@v4
+        with:
+          name: polyglot-bench-latency
+          path: aerosls2/bench-polyglot.jsonl
+          if-no-files-found: error
 
       # ─── Polyglot latency gate teeth ───────────────────────────────────
       # The step above proves the gate passes; this proves it can fail.
