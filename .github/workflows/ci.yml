@@ -296,6 +296,88 @@ jobs:
         run: cargo build -p aerosls --features target --manifest-path user/Cargo.toml
         working-directory: aerosls2
 
+  polyglot-e2e:
+    # The Polyglot Nexus two-process e2e: sls-kerneld (arena + channel
+    # queues over TCP) + the wasmi-embedded Wasm sidecar + a real SBCL Lisp
+    # sidecar, all on one channel with a large byte array travelling through
+    # the shared arena by MEM cap (never across the wire) over syscalls
+    # 302-304. The sidecar binaries use Linux-only APIs (mmap, as_raw_fd),
+    # so this job is Linux-only and provisions both prerequisites here —
+    # the e2e test then runs natively (no WSL on this runner) instead of
+    # skipping. Same self-hosted runner and checkout layout as `verify`.
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      # The e2e test probes POLYGLOT_TARGET_DIR for the release bins;
+      # CARGO_TARGET_DIR must point at the same directory so the build and
+      # the probe agree (default matches the test's own fallback).
+      POLYGLOT_TARGET_DIR: /tmp/polyglot-target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: aerosls2
+
+      # Same probe as the verify job: the self-hosted runner may or may not
+      # have cargo; rustup is idempotent and installs a modern toolchain.
+      # No third-party action — same two-line fallback as `verify`.
+      - name: Ensure the Rust toolchain (cargo for the polyglot build)
+        run: |
+          set -e
+          if command -v cargo >/dev/null 2>&1; then
+            echo "cargo already available: $(cargo --version)"
+            exit 0
+          fi
+          if command -v rustup >/dev/null 2>&1; then
+            rustup update stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
+
+      # The Lisp sidecar is a real SBCL image; install it when the runner
+      # lacks it (apt-get is idempotent, matching the kernel-build jobs
+      # below). This is what lets the e2e run here instead of skipping on
+      # "no sbcl reachable".
+      - name: Ensure SBCL (Lisp sidecar runtime)
+        run: |
+          set -e
+          if command -v sbcl >/dev/null 2>&1; then
+            echo "sbcl already available: $(sbcl --version)"
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y sbcl
+          sbcl --version
+
+      # The sidecar binaries are gated behind the `linux` feature; build
+      # them into POLYGLOT_TARGET_DIR (via CARGO_TARGET_DIR) so the e2e
+      # test's bin probe finds them.
+      - name: Build the polyglot sidecar binaries (Linux)
+        run: |
+          set -e
+          export CARGO_TARGET_DIR="$POLYGLOT_TARGET_DIR"
+          cargo build -p polyglot --release --features linux --manifest-path user/Cargo.toml
+          test -x "$POLYGLOT_TARGET_DIR/release/sls-kerneld"
+          test -x "$POLYGLOT_TARGET_DIR/release/wasm-sidecar"
+        working-directory: aerosls2
+
+      # Run the real two-process e2e natively. The test skips (prints SKIP:
+      # and still passes) only when the bins or sbcl are missing — both are
+      # provisioned above, so treat any SKIP as a hard failure: the e2e
+      # must actually run on every push, not silently skip.
+      - name: Run the two-process wasm-lisp e2e (real transport)
+        run: |
+          set -e
+          out="$(cargo test -p polyglot --test e2e_two_process --manifest-path user/Cargo.toml -- --nocapture 2>&1)"
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q 'SKIP:'; then
+            echo "::error::polyglot e2e skipped (missing prerequisite); it must run on this job"
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q 'test result: ok' || {
+            echo "::error::polyglot e2e did not pass"; exit 1; }
+        working-directory: aerosls2
+
   kernel-guards:
     # The five kernel-needing guards (stack_frame_budget, kernel_image_end,
     # no_tls_relocations, no_hosted_link, code_buffer_budget) need the
