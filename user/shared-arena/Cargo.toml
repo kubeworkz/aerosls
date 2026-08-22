@@ -1,0 +1,10 @@
+[package]
+name = "aerosls-shared-arena"
+version = "0.1.0"
+edition = "2021"
+description = "Shared arena allocator for cross-sidecar zero-copy data sharing (Phase 3 Polyglot Nexus)"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]
