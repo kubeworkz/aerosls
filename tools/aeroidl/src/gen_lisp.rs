@@ -40,7 +40,7 @@ pub fn emit_lisp(ast: &Value) -> String {
     out.push_str("  (:use #:cl #:aerosls)\n");
     out.push_str("  (:export\n");
     for e in &exports {    out.push_str(&format!(
-                "           #:#{e}\n"
+                "           #:{e}\n"
             ));
     }
     out.push_str("           ))\n\n");
@@ -133,7 +133,7 @@ pub fn emit_lisp(ast: &Value) -> String {
                 "  (setf (getf *service-dispatch-table* :{pkg_prefix})\n"
             ));
             out.push_str(&format!(
-                "        (cons chan-endpoint #'#{pkg_prefix}-dispatch))\n"
+                "        (cons chan-endpoint #'{pkg_prefix}-dispatch))\n"
             ));
             out.push_str(&format!(
                 "  (format *debug-io* \"[aeroidl] {iface_name} registered on endpoint ~A~%\"\n"
@@ -226,6 +226,25 @@ fn emit_lisp_struct(out: &mut String, s: &Value, ast: &Value) {
         }
     }
     out.push_str(")\n\n");
+}
+
+/// Map a method's *declared* return type to the Lisp wire kind passed to
+/// `encode-result`. Never value-based — a small fixnum is both u16 and u32,
+/// so the runtime value cannot distinguish a MEM cap handle from an i32.
+fn lisp_result_wire_kind(m: &Value) -> &'static str {
+    let ret = m.get("return_type").unwrap_or(&Value::Null);
+    if ret["kind"].as_str() != Some("result") {
+        return "nil";
+    }
+    let inner = ret.get("inner").unwrap_or(&Value::Null);
+    match inner["kind"].as_str() {
+        Some("i32") | Some("u32") => ":u32",
+        Some("i64") | Some("u64") => ":i64",
+        Some("f64") => ":f64",
+        Some("named") => ":vec2", // structs are Vec2-sized inline (8-16 B)
+        Some("array") | Some("bytes") | Some("string") => ":cap", // MEM cap
+        _ => "nil",
+    }
 }
 
 // ── Result wrapper ──────────────────────────────────────────────────────────
@@ -418,8 +437,12 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
     out.push_str("           (type (unsigned-byte 8) n-caps))\n");
     out.push('\n');
 
-    // encode-result helper
-    out.push_str("  (flet ((encode-result (result)\n");
+    // encode-result helper — kind-driven: the caller passes the *declared*
+    // wire kind of the success value (:cap for MEM cap handles, :u32/:i64/
+    // :f64/:vec2 for inline values). Never value-based etypecase: a small
+    // fixnum is both (unsigned-byte 16) and (unsigned-byte 32), so the
+    // runtime value cannot distinguish a cap handle from an i32.
+    out.push_str("  (flet ((encode-result (result kind)\n");
     out.push_str(&format!(
         "           \"Encode a {pkg_prefix}-result into reply payload bytes + reply caps.\"\n"
     ));
@@ -436,8 +459,11 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
     out.push_str(&format!(
         "                   (let ((v ({pkg_prefix}-result-value result)))\n"
     ));
-    out.push_str("                     (etypecase v\n");
-    out.push_str("                       ((unsigned-byte 32)\n");
+    out.push_str("                     (ecase kind\n");
+    out.push_str("                       (:cap   ; MEM cap handle\n");
+    out.push_str("                        (setf (aref reply-caps 0) v)\n");
+    out.push_str("                        (setf n-reply-caps 1))\n");
+    out.push_str("                       (:u32\n");
     out.push_str(
         "                        (setf (aref reply-payload 4) (ldb (byte 8 0) v))\n",
     );
@@ -450,7 +476,7 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
     out.push_str(
         "                        (setf (aref reply-payload 7) (ldb (byte 8 24) v)))\n",
     );
-    out.push_str("                       ((signed-byte 64)\n");
+    out.push_str("                       (:i64\n");
     out.push_str(
         "                        (dotimes (i 8)\n",
     );
@@ -460,7 +486,7 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
     out.push_str(
         "                                (ldb (byte 8 (* 8 i)) v))))\n",
     );
-    out.push_str("                       (double-float\n");
+    out.push_str("                       (:f64\n");
     out.push_str("                        (let ((bits (sb-kernel:double-float-bits v)))\n");
     out.push_str(
         "                          (dotimes (i 8)\n",
@@ -469,11 +495,8 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
         "                            (setf (aref reply-payload (+ 8 i))\n",
     );
     out.push_str(
-        "                                  (ldb (byte 8 (* 8 i)) bits)))))\n",
+        "                                  (ldb (byte 8 (* 8 i)) bits))))))))\n",
     );
-    out.push_str("                       ((unsigned-byte 16)  ; MEM cap handle\n");
-    out.push_str("                        (setf (aref reply-caps 0) v)\n");
-    out.push_str("                        (setf n-reply-caps 1)))))\n");
     out.push_str("                 ;; Error path\n");
     out.push_str(&format!(
         "                 (let ((err ({pkg_prefix}-result-error result)))\n"
@@ -499,8 +522,9 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
         }
     }
     out.push_str("                                 (otherwise 0))\n");
-    out.push_str("                             0))))\n");
-    out.push_str("             (values reply-payload reply-caps n-reply-caps)))))\n\n");
+    // Close: let-kw, if-slot-boundp, setf, let-err, and the outer if(result-ok)
+    out.push_str(&"                             0)))))~\n".replace("~", "\n"));
+    out.push_str("             (values reply-payload reply-caps n-reply-caps))))\n\n");
 
     // Dispatch by opcode
     out.push_str("    ;; ── Dispatch by opcode ──\n");
@@ -535,7 +559,7 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
                 let kind = p["ty"]["kind"].as_str().unwrap_or("array");
                 if kind == "array" {
                     deserialized_params.push(format!(
-                        "({lisp_pname}-count (sb-sys:sap-ref-32 (sb-sys:sap payload) {offset}))"
+                        "({lisp_pname}-count (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) {offset}))"
                     ));
                     offset += 4;
                 }
@@ -545,38 +569,38 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
                 match kind {
                     "i8" | "u8" | "bool" => {
                         deserialized_params.push(format!(
-                            "({lisp_pname} (sb-sys:sap-ref-8 (sb-sys:sap payload) {offset}))"
+                            "({lisp_pname} (sb-sys:sap-ref-8 (sb-sys:vector-sap payload) {offset}))"
                         ));
                         offset += 1;
                     }
                     "i16" | "u16" => {
                         deserialized_params.push(format!(
-                            "({lisp_pname} (sb-sys:sap-ref-16 (sb-sys:sap payload) {offset}))"
+                            "({lisp_pname} (sb-sys:sap-ref-16 (sb-sys:vector-sap payload) {offset}))"
                         ));
                         offset += 2;
                     }
                     "i32" | "u32" | "f32" => {
                         if kind == "f32" {
                             deserialized_params.push(format!(
-                                "({lisp_pname} (sb-kernel:single-float-from-bits\n                       (sb-sys:sap-ref-32 (sb-sys:sap payload) {offset})))"
+                                "({lisp_pname} (sb-kernel:make-single-float\n                       (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) {offset})))"
                             ));
                         } else {
                             deserialized_params.push(format!(
-                                "({lisp_pname} (sb-sys:sap-ref-32 (sb-sys:sap payload) {offset}))"
+                                "({lisp_pname} (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) {offset}))"
                             ));
                         }
                         offset += 4;
                     }
                     "i64" | "u64" => {
                         deserialized_params.push(format!(
-                            "({lisp_pname} (sb-sys:sap-ref-64 (sb-sys:sap payload) {offset}))"
+                            "({lisp_pname} (sb-sys:sap-ref-64 (sb-sys:vector-sap payload) {offset}))"
                         ));
                         offset += 8;
                     }
                     "f64" => {
                         let off2 = offset + 4;
                         deserialized_params.push(format!(
-                            "({lisp_pname} (sb-kernel:double-float-from-bits\n                       (sb-sys:sap-ref-32 (sb-sys:sap payload) {offset})\n                       (sb-sys:sap-ref-32 (sb-sys:sap payload) {off2})))"
+                            "({lisp_pname} (sb-kernel:make-double-float\n                       (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) {offset})\n                       (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) {off2})))"
                         ));
                         offset += 8;
                     }
@@ -595,10 +619,10 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
                                     let ftype = fkind;
                                     let part = match ftype {
                                         "i32" | "u32" => format!(
-                                            "(sb-sys:sap-ref-32 (sb-sys:sap payload) {offset})"
+                                            "(sb-sys:sap-ref-32 (sb-sys:vector-sap payload) {offset})"
                                         ),
                                         "i64" | "u64" | "f64" => format!(
-                                            "(sb-sys:sap-ref-64 (sb-sys:sap payload) {offset})"
+                                            "(sb-sys:sap-ref-64 (sb-sys:vector-sap payload) {offset})"
                                         ),
                                         "named" => "0".into(), // nested struct TODO
                                         _ => "0".into(),
@@ -673,8 +697,9 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
                 out.push_str("                 0))\n");
             } else {
                 out.push_str(&format!(
-                    "         (encode-result ({lisp_mname} {})))\n",
-                    call_args.join(" ")
+                    "         (encode-result ({lisp_mname} {}) {}))\n",
+                    call_args.join(" "),
+                    lisp_result_wire_kind(m)
                 ));
             }
             out.push_str("       )\n");
@@ -702,7 +727,8 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
                 out.push_str("               0))\n");
             } else {
                 out.push_str(&format!(
-                    "       (encode-result ({lisp_mname})))\n"
+                    "       (encode-result ({lisp_mname}) {}))\n",
+                    lisp_result_wire_kind(m)
                 ));
             }
         }

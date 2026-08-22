@@ -1,0 +1,106 @@
+;;; calc_guest.wat — the Wasm-sidecar guest module.
+;;;
+;;; This module is the "function written in WebAssembly" in the polyglot call
+;;; chain: it is the CALLER of the CalculatorService running in the Lisp
+;;; sidecar. It orchestrates two calls entirely from inside wasm:
+;;;
+;;;   1. add(2, 3) -> 5                    (inline args, no arena data)
+;;;   2. sqrt_batch over N=4096 f64s       (arena array handed by capability)
+;;;
+;;; The array itself never crosses the wire: the guest writes it into the
+;;; shared arena through host_* imports (which address the shared mapping
+;;; directly) and hands the callee a MEM cap. Verification reads the output
+;;; array straight back from the shared arena — zero serialization.
+;;;
+;;; Host imports (implemented by the Rust sidecar host):
+;;;   host.call_add(i32 a, i32 b) -> i64   ; hi=status, lo=result
+;;;   host.call_sqrt_batch(i32 count, i32 input_cap) -> i64 ; hi=status, lo=out_cap
+;;;   host.write_f64(i32 cap, i32 idx, i64 bits)
+;;;   host.read_f64(i32 cap, i32 idx) -> i64
+;;;   host.arena_alloc(i32 size) -> i32 cap
+;;;   host.arena_free(i32 cap)
+;;;   host.log(i32 ptr, i32 len)
+
+(module
+  (import "host" "call_add" (func $call_add (param i32 i32) (result i64)))
+  (import "host" "call_sqrt_batch" (func $call_sqrt_batch (param i32 i32) (result i64)))
+  (import "host" "write_f64" (func $write_f64 (param i32 i32 i64)))
+  (import "host" "read_f64" (func $read_f64 (param i32 i32) (result i64)))
+  (import "host" "arena_alloc" (func $arena_alloc (param i32) (result i32)))
+  (import "host" "arena_free" (func $arena_free (param i32)))
+  (import "host" "log" (func $log (param i32 i32)))
+
+  (memory (export "memory") 1)
+
+  (data (i32.const 64) "PASS add(2,3)=5 sqrt verified\00")
+  (data (i32.const 160) "FAIL add\00")
+  (data (i32.const 192) "FAIL sqrt\00")
+
+  (func (export "run") (result i32)
+    (local $r i64) (local $r2 i64)
+    (local $status i32) (local $n i32) (local $in_cap i32) (local $i i32)
+    (local $out_cap i32) (local $v f64) (local $err f64)
+
+    ;; ── add(2, 3) must return 5 ───────────────────────────────────────────
+    (local.set $r (call $call_add (i32.const 2) (i32.const 3)))
+    (local.set $status
+      (i32.wrap_i64 (i64.shr_u (local.get $r) (i64.const 32))))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (call $log (i32.const 160) (i32.const 8)) (return (i32.const 1))))
+    (local.set $status
+      (i32.wrap_i64 (i64.and (local.get $r) (i64.const 0xffffffff))))
+    (if (i32.ne (local.get $status) (i32.const 5))
+      (then (call $log (i32.const 160) (i32.const 8)) (return (i32.const 2))))
+
+    ;; ── sqrt_batch: N = 4096 f64s through the shared arena ───────────────
+    (local.set $n (i32.const 4096))
+
+    ;; allocate the input buffer from the arena
+    (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
+    (if (i32.eqz (local.get $in_cap))
+      (then (call $log (i32.const 192) (i32.const 9)) (return (i32.const 3))))
+
+    ;; fill: for i in 0..N: write_f64(in_cap, i, f64(i))
+    (local.set $i (i32.const 0))
+    (block $fill_done
+      (loop $fill
+        (br_if $fill_done (i32.ge_u (local.get $i) (local.get $n)))
+        (call $write_f64
+          (local.get $in_cap)
+          (local.get $i)
+          (i64.reinterpret_f64 (f64.convert_i32_u (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $fill)))
+
+    ;; call into Lisp: sqrt_batch(count, input_cap) -> ArenaSlice<f64>
+    (local.set $r2 (call $call_sqrt_batch (local.get $n) (local.get $in_cap)))
+    (local.set $out_cap
+      (i32.wrap_i64 (i64.shr_u (local.get $r2) (i64.const 32))))
+    (if (i32.ne (local.get $out_cap) (i32.const 0))
+      (then (call $log (i32.const 192) (i32.const 9)) (return (i32.const 4))))
+    (local.set $out_cap
+      (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff))))
+    (if (i32.eqz (local.get $out_cap))
+      (then (call $log (i32.const 192) (i32.const 9)) (return (i32.const 5))))
+
+    ;; verify: for i in 0..N: |v*v - i| < 1e-6  (v = read_f64(out_cap, i))
+    (local.set $i (i32.const 0))
+    (block $verify_done
+      (loop $verify
+        (br_if $verify_done (i32.ge_u (local.get $i) (local.get $n)))
+        (local.set $v (f64.reinterpret_i64 (call $read_f64 (local.get $out_cap) (local.get $i))))
+        (local.set $err
+          (f64.sub (f64.mul (local.get $v) (local.get $v))
+                   (f64.convert_i32_u (local.get $i))))
+        (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
+          (then (call $log (i32.const 192) (i32.const 9)) (return (i32.const 6))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $verify)))
+
+    ;; done: release both arena buffers (ownership accounting is in the kernel)
+    (call $arena_free (local.get $out_cap))
+    (call $arena_free (local.get $in_cap))
+
+    (call $log (i32.const 64) (i32.const 34))
+    (i32.const 0))
+)

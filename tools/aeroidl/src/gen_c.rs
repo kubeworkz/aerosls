@@ -402,7 +402,7 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
     if is_async {
         out.push_str(&format!(
             "    aerosls_chan_send(g_{mod_name}_chan_w, {const_name}, req_id,\n",
-            mod_name = to_c_name_from_prefix(prefix)
+            mod_name = mod_name
         ));
         out.push_str("                     payload, sizeof(payload),\n");
         if param_cap_count > 0 {
@@ -414,7 +414,7 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
     } else {
         out.push_str(&format!(
             "    aerosls_chan_send(g_{mod_name}_chan_w, {const_name}, req_id,\n",
-            mod_name = to_c_name_from_prefix(prefix)
+            mod_name = mod_name
         ));
         out.push_str("                     payload, sizeof(payload),\n");
         if param_cap_count > 0 {
@@ -434,7 +434,7 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
 
         out.push_str(&format!(
             "    aerosls_chan_recv(g_{mod_name}_chan_r,\n",
-            mod_name = to_c_name_from_prefix(prefix)
+            mod_name = mod_name
         ));
         out.push_str("                     reply_buf, sizeof(reply_buf),\n");
         out.push_str("                     cap_slots, 8,\n");
@@ -522,14 +522,33 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
             match err_kind {
                 "named" => {
                     let err_name = err_type["name"].as_str().unwrap_or("Error");
-                    // Convention: struct Foo has enum FooKind
+                    // The wire carries the error discriminant/code as a u32 at
+                    // reply_buf[4]. Assign it to the error struct's first
+                    // field (CalcError.kind, LogError.code, ...) so the header
+                    // works for any error struct, not just the calculator
+                    // `{Err}Kind` convention.
+                    let err_fields = find_struct_fields(ast, err_name);
+                    let first_field = err_fields
+                        .as_ref()
+                        .and_then(|f| f.first())
+                        .and_then(|f| f["name"].as_str())
+                        .unwrap_or("kind");
                     out.push_str(&format!(
-                        "        result.err.kind = *({err_name}Kind *)(reply_buf + 4);\n"
+                        "        result.err.{first_field} = *(uint32_t *)(reply_buf + 4);\n"
                     ));
-                    out.push_str("        result.err.message = NULL;\n");
+                    if err_fields
+                        .as_ref()
+                        .map(|f| f.iter().any(|f| f["name"].as_str() == Some("message")))
+                        .unwrap_or(false)
+                    {
+                        out.push_str("        result.err.message = NULL;\n");
+                    }
                 }
                 "string" => {
-                    out.push_str("        result.err = (ErrorType){ .code = 0, .message = NULL };\n");
+                    // String errors carry a code on the wire (reply_buf[4])
+                    // but no struct member to hold a C string; leave the
+                    // error code at a well-known offset for the caller.
+                    out.push_str("        /* string error: code = *(uint32_t *)(reply_buf + 4) */\n");
                 }
                 _ => {
                     out.push_str("        /* TODO: deserialize error */\n");

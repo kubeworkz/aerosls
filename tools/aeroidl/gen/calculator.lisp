@@ -61,7 +61,7 @@
   (make-calc-result :ok t :value value))
 
 (defun calc-failure (kind message)
-  (make-calc-result :ok nil :error (make-calc-error :kind kind :message message)))
+  (make-calc-result :ok nil :error (make-calc-error kind message)))
 
 ;;; ─── Service methods ───────────────────────────────────────────────────────
 
@@ -140,6 +140,8 @@
                       (sqrt val)))))
         (calc-success out-cap))   ; return the cap handle
     (error (e)
+      (format t "[lisp] sqrt_batch error: ~A~%" e)
+      (finish-output t)
       (calc-failure :internal
                     (format nil "sqrt_batch failed: ~A" e)))))
 
@@ -148,14 +150,18 @@
 (defun calculator-dispatch (opcode payload payload-len cap-slots n-caps)
   "Main entry point called by the Lisp sidecar's channel event loop.
    Decodes the opcode and arguments from the payload bytes, calls the
-   appropriate method, and returns (values reply-payload reply-caps)."
+   appropriate method, and returns (values reply-payload reply-caps n-caps)."
   (declare (type (unsigned-byte 16) opcode)
            (type (simple-array (unsigned-byte 8)) payload)
            (type fixnum payload-len)
            (type (simple-array (unsigned-byte 16)) cap-slots)
            (type (unsigned-byte 8) n-caps))
-  (flet ((encode-result (result)
-           "Encode a calc-result into reply payload bytes + reply caps."
+  (flet ((encode-result (result kind)
+           "Encode a calc-result into reply payload bytes + reply caps.
+            KIND is the *declared* wire kind of the success value — :cap for
+            a MEM cap handle, :u32/:i64/:f64/:vec2 for inline values. It is
+            decided by the IDL return type per method (never by the runtime
+            value, since e.g. a small fixnum is both u16 and u32)."
            (let ((reply-payload (make-array 32 :element-type '(unsigned-byte 8)
                                                 :initial-element 0))
                  (reply-caps    (make-array 8  :element-type '(unsigned-byte 16)
@@ -164,30 +170,35 @@
              (if (calc-result-ok result)
                  (progn
                    (setf (aref reply-payload 0) 1)   ; ok = true
-                   (etypecase (calc-result-value result)
-                     ((unsigned-byte 32)
-                      (setf (aref reply-payload 4) (ldb (byte 8 0) (calc-result-value result)))
-                      (setf (aref reply-payload 5) (ldb (byte 8 8) (calc-result-value result)))
-                      (setf (aref reply-payload 6) (ldb (byte 8 16) (calc-result-value result)))
-                      (setf (aref reply-payload 7) (ldb (byte 8 24) (calc-result-value result))))
-                     ((signed-byte 64)
-                      (let ((v (calc-result-value result)))
+                   (let ((v (calc-result-value result)))
+                     (ecase kind
+                       (:cap   ; MEM cap handle
+                        (setf (aref reply-caps 0) v)
+                        (setf n-reply-caps 1))
+                       (:u32
+                        (setf (aref reply-payload 4) (ldb (byte 8 0) v))
+                        (setf (aref reply-payload 5) (ldb (byte 8 8) v))
+                        (setf (aref reply-payload 6) (ldb (byte 8 16) v))
+                        (setf (aref reply-payload 7) (ldb (byte 8 24) v)))
+                       (:i64
                         (dotimes (i 8)
                           (setf (aref reply-payload (+ 8 i))
-                                (ldb (byte 8 (* 8 i)) v)))))
-                     (double-float
-                      (let ((bits (sb-kernel:double-float-bits
-                                    (calc-result-value result))))
-                        (dotimes (i 8)
-                          (setf (aref reply-payload (+ 8 i))
-                                (ldb (byte 8 (* 8 i)) bits)))))
-                     (vec2
-                      (let ((v (calc-result-value result)))
-                        (setf (sb-kernel:double-float-bits ...)
-                              ...))
-                     ((unsigned-byte 16)  ; MEM cap handle
-                      (setf (aref reply-caps 0) (calc-result-value result))
-                      (setf n-reply-caps 1))))
+                                (ldb (byte 8 (* 8 i)) v))))
+                       (:f64
+                        (let ((bits (sb-kernel:double-float-bits v)))
+                          (dotimes (i 8)
+                            (setf (aref reply-payload (+ 8 i))
+                                  (ldb (byte 8 (* 8 i)) bits)))))
+                       (:vec2
+                        (let ((bx (sb-kernel:double-float-bits (vec2-x v)))
+                              (by (sb-kernel:double-float-bits (vec2-y v))))
+                          ;; Vec2 reply layout: ok@0, x@8, y@16 (matches the
+                          ;; C union / Rust client deserialize convention)
+                          (dotimes (i 8)
+                            (setf (aref reply-payload (+ 8 i))
+                                  (ldb (byte 8 (* 8 i)) bx))
+                            (setf (aref reply-payload (+ 16 i))
+                                  (ldb (byte 8 (* 8 i)) by))))))))
                  ;; Error path
                  (let ((err (calc-result-error result)))
                    (setf (aref reply-payload 0) 0)   ; ok = false
@@ -203,52 +214,62 @@
     ;; ── Dispatch by opcode ──
     (ecase opcode
       (#.+op-add+
-       (let ((a (sb-sys:sap-ref-32 (sb-sys:sap payload) 0))
-             (b (sb-sys:sap-ref-32 (sb-sys:sap payload) 4)))
-         (encode-result (calculator-add a b))))
+       (let ((a (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0))
+             (b (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 4)))
+         (encode-result (calculator-add a b) :u32)))
 
       (#.+op-div+
-       (let ((a (sb-sys:sap-ref-64 (sb-sys:sap payload) 0))
-             (b (sb-sys:sap-ref-64 (sb-sys:sap payload) 8)))
-         (encode-result (calculator-div a b))))
+       (let ((a (sb-sys:sap-ref-64 (sb-sys:vector-sap payload) 0))
+             (b (sb-sys:sap-ref-64 (sb-sys:vector-sap payload) 8)))
+         (encode-result (calculator-div a b) :i64)))
 
       (#.+op-dot+
-       (let* ((ax (sb-kernel:double-float-from-bits
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 0)
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 4)))
-              (ay (sb-kernel:double-float-from-bits
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 8)
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 12)))
-              (bx (sb-kernel:double-float-from-bits
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 16)
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 20)))
-              (by (sb-kernel:double-float-from-bits
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 24)
-                    (sb-sys:sap-ref-32 (sb-sys:sap payload) 28))))
+       (let* ((ax (sb-kernel:make-double-float
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 4)
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0)))
+              (ay (sb-kernel:make-double-float
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 12)
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 8)))
+              (bx (sb-kernel:make-double-float
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 20)
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 16)))
+              (by (sb-kernel:make-double-float
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 28)
+                    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 24))))
          (encode-result
-           (calculator-dot (make-vec2 ax ay) (make-vec2 bx by)))))
+           (calculator-dot (make-vec2 ax ay) (make-vec2 bx by)) :f64)))
 
       (#.+op-matmul-vec+
        (let* ((mat-cap (aref cap-slots 0))
-              (rows    (sb-sys:sap-ref-32 (sb-sys:sap payload) 0))
-              (cols    (sb-sys:sap-ref-32 (sb-sys:sap payload) 4))
-              (vx      (sb-kernel:double-float-from-bits
-                         (sb-sys:sap-ref-32 (sb-sys:sap payload) 8)
-                         (sb-sys:sap-ref-32 (sb-sys:sap payload) 12)))
-              (vy      (sb-kernel:double-float-from-bits
-                         (sb-sys:sap-ref-32 (sb-sys:sap payload) 16)
-                         (sb-sys:sap-ref-32 (sb-sys:sap payload) 20))))
+              (rows    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0))
+              (cols    (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 4))
+              (vx      (sb-kernel:make-double-float
+                         (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 12)
+                         (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 8)))
+              (vy      (sb-kernel:make-double-float
+                         (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 20)
+                         (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 16))))
          (encode-result
-           (calculator-matmul-vec mat-cap rows cols (make-vec2 vx vy)))))
+           (calculator-matmul-vec mat-cap rows cols (make-vec2 vx vy)) :vec2)))
 
       (#.+op-sqrt-batch+
        (let ((input-cap (aref cap-slots 0))
-             (count     (sb-sys:sap-ref-32 (sb-sys:sap payload) 0)))
-         (encode-result (calculator-sqrt-batch input-cap count))))
+             (count     (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0)))
+         ;; Arena-return wire convention: the output f64 count goes in
+         ;; reply-payload[4..8] next to the ok byte (matches the Rust
+         ;; client's deserialize for ArenaSlice results).
+         (multiple-value-bind (reply-payload reply-caps n-reply-caps)
+             (encode-result (calculator-sqrt-batch input-cap count) :cap)
+           (when (and (= (aref reply-payload 0) 1) (> n-reply-caps 0))
+             (setf (aref reply-payload 4) (ldb (byte 8 0) count))
+             (setf (aref reply-payload 5) (ldb (byte 8 8) count))
+             (setf (aref reply-payload 6) (ldb (byte 8 16) count))
+             (setf (aref reply-payload 7) (ldb (byte 8 24) count)))
+           (values reply-payload reply-caps n-reply-caps))))
 
       (#.+op-heavy-reduce+
        (let ((input-cap (aref cap-slots 0))
-             (count     (sb-sys:sap-ref-32 (sb-sys:sap payload) 0)))
+             (count     (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0)))
          ;; Async: spawn a Lisp thread, acknowledge immediately
          (bt:make-thread
            (lambda ()
@@ -263,7 +284,7 @@
          (values (make-array 4 :element-type '(unsigned-byte 8)
                                 :initial-contents '(#x01 0 0 0))
                  (make-array 8 :element-type '(unsigned-byte 16))
-                 0)))))
+                 0))))))
 
 ;;; ─── Bootstrap: register dispatch with the sidecar runtime ─────────────────
 

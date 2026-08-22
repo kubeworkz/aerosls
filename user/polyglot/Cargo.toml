@@ -1,0 +1,37 @@
+[package]
+name = "polyglot"
+version = "0.1.0"
+edition = "2021"
+description = "Polyglot Nexus two-process e2e: sls-kerneld transport (syscalls 290/295-296/302-304 wire ABI over TCP), a wasmi-embedding Wasm sidecar, and a real SBCL Lisp sidecar sharing one arena"
+license = "MIT"
+
+# This crate is host-only (std): it links the `aerosls` runtime in its host-fake
+# mode so the generated client stubs run over a real TCP transport to
+# `sls-kerneld` instead of the panic-on-call mock. The sidecar binaries are
+# built for Linux and executed inside WSL on dev machines; on CI (Linux
+# self-hosted runner) they run natively.
+#
+#   cargo build -p polyglot --release
+#   bash user/polyglot/run_e2e.sh          # build (WSL) + run the e2e
+#   cargo test -p polyglot --test e2e_two_process
+# The sidecar binaries use Linux-only APIs (mmap, as_raw_fd) and only ever
+# run inside WSL / on the Linux CI runner — gate them behind `linux` so
+# `cargo test` on a Windows dev box builds the lib + test only.
+[features]
+linux = []
+
+[[bin]]
+name = "sls-kerneld"
+path = "src/bin/sls_kerneld.rs"
+required-features = ["linux"]
+
+[[bin]]
+name = "wasm-sidecar"
+path = "src/bin/wasm_sidecar.rs"
+required-features = ["linux"]
+
+[dependencies]
+aerosls = { path = "../aerosls", features = ["host-fake"] }
+wasmi = { version = "0.31", default-features = false }
+wat = "1"
+libc = "0.2"

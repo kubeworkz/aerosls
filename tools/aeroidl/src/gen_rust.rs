@@ -279,13 +279,16 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, _mod_name: &str) {
             if p["needs_cap"].as_bool().unwrap_or(false) {
                 let pname = p["name"].as_str().unwrap();
                 let ownership = p["ownership"].as_str().unwrap_or("borrowed");
-                let perm = if ownership == "arena" {
-                    "CAP_PERM_R | CAP_PERM_W"
-                } else {
-                    "CAP_PERM_R"
+                // Encode the IDL ownership annotation into the cap descriptor
+                // flags (same mapping as the C generator): BORROWED keeps the
+                // caller's slot, ARENA_OWNED transfers it to the callee.
+                let (perm, flag) = match ownership {
+                    "arena" => ("CAP_PERM_R | CAP_PERM_W", "CAP_FLAG_ARENA"),
+                    "owned" => ("CAP_PERM_R | CAP_PERM_W", "CAP_FLAG_ARENA_OWNED"),
+                    _ => ("CAP_PERM_R", "CAP_FLAG_BORROWED"),
                 };
                 out.push_str(&format!(
-                    "            CapDescriptor {{ slot: {pname}_cap as u32, offset: 0, len: {pname}_len, rights: {perm}, flags: 0, pad: 0 }},\n"
+                    "            CapDescriptor {{ slot: {pname}_cap as u32, offset: 0, len: {pname}_len, rights: {perm}, flags: {flag}, pad: 0 }},\n"
                 ));
             }
         }
@@ -832,6 +835,13 @@ pub struct CapDescriptor {
 // Permission constants (matching cap.h)
 pub const CAP_PERM_R: u8 = 0x01;
 pub const CAP_PERM_W: u8 = 0x02;
+
+// Capability ownership flags (matching user/libaerocap/aerosls_cap.h
+// AEROSLS_CAP_FLAG_*): BORROWED = caller retains ownership, ARENA = shared
+// arena slot, ARENA_OWNED = ownership transfers to the callee on send.
+pub const CAP_FLAG_BORROWED: u8 = 0x00;
+pub const CAP_FLAG_ARENA: u8 = 0x01;
+pub const CAP_FLAG_ARENA_OWNED: u8 = 0x02;
 
 // Channel flag constants — kernel message flags (kernel/cap.h ChanMsg.flags,
 // bit0 = NO_REPLY). MUST match user/libaerocap/aerosls_cap.h's
