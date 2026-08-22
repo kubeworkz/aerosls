@@ -473,7 +473,7 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
     );
     out.push_str("                       ((unsigned-byte 16)  ; MEM cap handle\n");
     out.push_str("                        (setf (aref reply-caps 0) v)\n");
-    out.push_str("                        (setf n-reply-caps 1))))\n");
+    out.push_str("                        (setf n-reply-caps 1)))))\n");
     out.push_str("                 ;; Error path\n");
     out.push_str(&format!(
         "                 (let ((err ({pkg_prefix}-result-error result)))\n"
@@ -500,7 +500,7 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
     }
     out.push_str("                                 (otherwise 0))\n");
     out.push_str("                             0))))\n");
-    out.push_str("             (values reply-payload reply-caps n-reply-caps))))\n\n");
+    out.push_str("             (values reply-payload reply-caps n-reply-caps)))))\n\n");
 
     // Dispatch by opcode
     out.push_str("    ;; ── Dispatch by opcode ──\n");
@@ -708,7 +708,7 @@ fn emit_lisp_dispatch(out: &mut String, methods: &[Value], pkg_prefix: &str, ast
         }
     }
 
-    out.push_str("    ))\n\n");
+    out.push_str("    )))\n\n");
 }
 
 // ── Type helpers ────────────────────────────────────────────────────────────
@@ -737,16 +737,14 @@ fn json_type_to_lisp_type(ty: &Value, _ast: &Value) -> String {
             to_lisp_snake(name)
         }
         "array" => {
-            let inner = ty
-                .get("inner")
-                .map(|i| json_type_to_lisp_type(i, _ast))
-                .unwrap_or_else(|| "t".into());
-            format!("(unsigned-byte 16)  ; {inner}[] via MEM cap")
+            // NOTE: the comment stays OUTSIDE the type string so the field's
+            // closing paren is not swallowed by a `;` comment.
+            "(unsigned-byte 16)".into()
         }
         "option" => "t".into(),
         "result" => "t".into(),
         "unit" => "null".into(),
-        "map" => "(unsigned-byte 16)  ; map via MEM cap".into(),
+        "map" => "(unsigned-byte 16)".into(),
         _ => "t".into(),
     }
 }

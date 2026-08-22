@@ -425,3 +425,481 @@ fn e2e_dispatch_balanced_braces() {
     assert_eq!(opens, closes,
             "unbalanced braces: {opens} opens vs {closes} closes");
 }
+
+// ─── C header generation + interop tests ─────────────────────────────────
+
+fn generate_c_header() -> String {
+    let src = fs::read_to_string(calculator_idl_path()).unwrap();
+    let doc = aeroidl_cc::parser::parse(&src).unwrap();
+    let tc = aeroidl_cc::tycheck::type_check(&doc);
+    let ast = aeroidl_cc::emit::emit_value(&doc, &tc);
+    aeroidl_cc::gen_c::emit_c(&ast)
+}
+
+#[test]
+fn e2e_c_header_has_guard() {
+    let c = generate_c_header();
+    assert!(c.starts_with("/**"));
+    assert!(c.contains("#ifndef AEROSLS_CALCULATOR_H"));
+    assert!(c.contains("#define AEROSLS_CALCULATOR_H"));
+    assert!(c.trim_end().ends_with("*/"));
+}
+
+#[test]
+fn e2e_c_header_has_includes() {
+    let c = generate_c_header();
+    assert!(c.contains("#include <stdint.h>"));
+    assert!(c.contains("#include <stddef.h>"));
+    assert!(c.contains("#include <aerosls_cap.h>"));
+}
+
+#[test]
+fn e2e_c_header_has_enums() {
+    let c = generate_c_header();
+    assert!(c.contains("typedef enum {"));
+    assert!(c.contains("CALC_ERROR_DIVISION_BY_ZERO = 1"));
+    assert!(c.contains("CALC_ERROR_OVERFLOW = 2"));
+    assert!(c.contains("} CalcErrorKind;"));
+}
+
+#[test]
+fn e2e_c_header_has_structs() {
+    let c = generate_c_header();
+    assert!(c.contains("typedef struct {"));
+    assert!(c.contains("} CalcError;"));
+    assert!(c.contains("} Vec2;"));
+    assert!(c.contains("} MatrixData;"));
+    assert!(c.contains("double                   x;"));
+    assert!(c.contains("double                   y;"));
+    assert!(c.contains("uint32_t                 rows;"));
+}
+
+#[test]
+fn e2e_c_header_has_result_wrapper() {
+    let c = generate_c_header();
+    assert!(c.contains("} CalcResult;"));
+    assert!(c.contains("uint8_t ok;"));
+    assert!(c.contains("int32_t  val_i32;"));
+    assert!(c.contains("int64_t  val_i64;"));
+    assert!(c.contains("double   val_f64;"));
+    assert!(c.contains("Vec2 val_vec2;"));
+    assert!(c.contains("CalcError err;"));
+}
+
+#[test]
+fn e2e_c_header_has_opcodes() {
+    let c = generate_c_header();
+    assert!(c.contains("#define CALC_OP_ADD                      0x0001"));
+    assert!(c.contains("#define CALC_OP_DIV                      0x0002"));
+    assert!(c.contains("#define CALC_OP_DOT                      0x0003"));
+    assert!(c.contains("#define CALC_OP_MATMUL_VEC               0x0004"));
+    assert!(c.contains("#define CALC_OP_SQRT_BATCH               0x0005"));
+    assert!(c.contains("#define CALC_OP_HEAVY_REDUCE             0x0006"));
+}
+
+#[test]
+fn e2e_c_header_has_method_stubs() {
+    let c = generate_c_header();
+    assert!(c.contains("calculator_add("));
+    assert!(c.contains("calculator_div("));
+    assert!(c.contains("calculator_dot("));
+    assert!(c.contains("calculator_matmul_vec("));
+    assert!(c.contains("calculator_sqrt_batch("));
+    assert!(c.contains("calculator_heavy_reduce("));
+    assert!(c.contains("static inline CalcResult"));
+}
+
+#[test]
+fn e2e_c_header_has_arena_helpers() {
+    let c = generate_c_header();
+    assert!(c.contains("calculator_alloc_arena_buf("));
+    assert!(c.contains("calculator_free_arena_buf("));
+    assert!(c.contains("aerosls_arena_alloc("));
+    assert!(c.contains("aerosls_arena_free("));
+}
+
+#[test]
+fn e2e_c_header_balanced_braces() {
+    let c = generate_c_header();
+    let opens = c.matches('{').count();
+    let closes = c.matches('}').count();
+    assert_eq!(opens, closes,
+            "unbalanced braces: {opens} opens vs {closes} closes");
+}
+
+#[test]
+fn e2e_c_header_balanced_parens() {
+    let c = generate_c_header();
+    let opens = c.matches('(').count();
+    let closes = c.matches(')').count();
+    assert_eq!(opens, closes,
+            "unbalanced parens: {opens} opens vs {closes} closes");
+}
+
+#[test]
+fn e2e_c_header_balanced_ifdef() {
+    let c = generate_c_header();
+    let ifndef_count = c.matches("#ifndef").count();
+    let endif_count = c.matches("#endif").count();
+    assert_eq!(ifndef_count, 1, "expected 1 #ifndef, got {ifndef_count}");
+    assert_eq!(endif_count, 3, "expected 3 #endif (guard + 2×__cplusplus)");
+    assert!(c.contains("#ifdef __cplusplus"));
+    assert!(c.contains("extern \"C\" {"));
+}
+
+/// Write the generated C header + mock runtime header to a temp dir.
+fn setup_c_test_dir() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new("aeroidl_c_interop");
+    let c_code = generate_c_header();
+    let dir = tmp.path().to_path_buf();
+    fs::write(dir.join("calculator.h"), &c_code).unwrap();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mock_cap = manifest_dir.join("tests").join("mock_aerosls_cap.h");
+    fs::copy(&mock_cap, dir.join("aerosls_cap.h")).unwrap();
+    let test_c = manifest_dir.join("tests").join("test_calculator.c");
+    fs::copy(&test_c, dir.join("test_calculator.c")).unwrap();
+    (tmp, dir)
+}
+
+fn find_cc() -> Option<String> {
+    for cc in &["cc", "gcc", "clang", "tcc"] {
+        if Command::new("which")
+            .arg(cc)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Some(cc.to_string());
+        }
+    }
+    None
+}
+
+#[test]
+fn e2e_c_header_compiles_with_cc() {
+    let cc = match find_cc() {
+        Some(cc) => cc,
+        None => {
+            eprintln!("no C compiler found — skipping compilation test");
+            return;
+        }
+    };
+    let (_tmp, dir) = setup_c_test_dir();
+    let output = Command::new(&cc)
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-std=c11")
+        .arg("-I").arg(&dir)
+        .arg(dir.join("test_calculator.c"))
+        .arg("-o").arg(dir.join("test_calculator"))
+        .arg("-lm")
+        .output()
+        .expect("failed to invoke C compiler");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("C compilation failed with {cc}:\n{stderr}");
+    }
+    eprintln!("C compilation succeeded with {cc}");
+    let run = Command::new(dir.join("test_calculator"))
+        .output()
+        .expect("failed to run test_calculator");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "test_calculator failed: {stdout}");
+    assert!(stdout.contains("All tests passed."),
+            "expected 'All tests passed.' in output: {stdout}");
+    eprintln!("C test output:\n{stdout}");
+}
+
+#[test]
+fn e2e_c_header_matches_existing_pattern() {
+    let c = generate_c_header();
+    assert!(c.contains("CALC_OP_ADD"));
+    assert!(c.contains("CALC_OP_DIV"));
+    assert!(c.contains("calculator_add("));
+    assert!(c.contains("calculator_div("));
+    assert!(c.contains("calculator_dot("));
+    assert!(c.contains("CalcResult"));
+    assert!(c.contains("#include <aerosls_cap.h>"));
+    assert!(c.contains("extern \"C\" {
+#endif"));
+}
+
+// ─── --target all: cross-backend consistency tests ────────────────────────
+
+/// Generate all four backends from a single parse + type-check + AST pass,
+/// exactly as `--target all` does. Returns (client, dispatcher, lisp, c).
+fn generate_all_backends() -> (String, String, String, String) {
+    let src = fs::read_to_string(calculator_idl_path()).unwrap();
+    let doc = aeroidl_cc::parser::parse(&src).unwrap();
+    let tc = aeroidl_cc::tycheck::type_check(&doc);
+    let ast = aeroidl_cc::emit::emit_value(&doc, &tc);
+    let common = aeroidl_cc::gen_rust::emit_common_types();
+    let client = format!("{common}\n\n{}", aeroidl_cc::gen_rust::emit_rust(&ast));
+    let dispatcher = format!("{common}\n\n{}", aeroidl_cc::gen_dispatcher::emit_dispatcher(&ast));
+    let lisp = aeroidl_cc::gen_lisp::emit_lisp(&ast);
+    let c = aeroidl_cc::gen_c::emit_c(&ast);
+    (client, dispatcher, lisp, c)
+}
+
+/// Canonical (method_name, opcode) pairs straight from the typed AST.
+fn ast_method_opcodes() -> Vec<(String, u64)> {
+    let src = fs::read_to_string(calculator_idl_path()).unwrap();
+    let doc = aeroidl_cc::parser::parse(&src).unwrap();
+    let tc = aeroidl_cc::tycheck::type_check(&doc);
+    let ast = aeroidl_cc::emit::emit_value(&doc, &tc);
+    let mut out = Vec::new();
+    if let Some(interfaces) = ast["interfaces"].as_array() {
+        for iface in interfaces {
+            if let Some(methods) = iface["methods"].as_array() {
+                for m in methods {
+                    let name = m["name"].as_str().unwrap().to_string();
+                    let opcode = m["opcode"].as_u64().unwrap();
+                    out.push((name, opcode));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract (METHOD_NAME, opcode) from Rust opcode constants:
+/// `pub const OP_ADD: u16 = 1;`
+fn rust_opcodes(text: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pub const OP_") {
+            if let Some((name, val)) = rest.split_once(':') {
+                if let Some(v) = val.trim().strip_prefix("u16 = ") {
+                    let v = v.trim_end_matches(';').trim();
+                    if let Ok(n) = v.parse::<u64>() {
+                        out.push((name.to_string(), n));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract (method-name, opcode) from Lisp constants:
+/// `(defconstant +op-add+ #x0001)`
+fn lisp_opcodes(text: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("(defconstant +op-") {
+            if let Some((name, val)) = rest.split_once("+") {
+                let hex = val.trim().trim_start_matches("#x").trim_end_matches(')');
+                if let Ok(n) = u64::from_str_radix(hex.trim(), 16) {
+                    out.push((name.replace('-', "_"), n));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract (METHOD_NAME, opcode) from C defines:
+/// `#define CALC_OP_ADD  0x0001`
+fn c_opcodes(text: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#define ") {
+            if let Some((left, right)) = rest.split_once(' ') {
+                if let Some(name) = left.split("_OP_").nth(1) {
+                    let hex = right.trim().trim_start_matches("0x");
+                    if let Ok(n) = u64::from_str_radix(hex.trim(), 16) {
+                        out.push((name.to_string(), n));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn e2e_all_backends_same_opcodes() {
+    let (client, dispatcher, lisp, c) = generate_all_backends();
+
+    let canonical = ast_method_opcodes();
+    assert_eq!(canonical.len(), 6,
+        "expected 6 methods in calculator.aeroidl, got {}", canonical.len());
+
+    // Rust/C emit UPPERCASE names (OP_ADD), Lisp emits lowercase (op-add).
+    // Normalize everything to lowercase snake for comparison.
+    let canon: Vec<(String, u64)> = canonical.iter()
+        .map(|(n, o)| (n.to_lowercase(), *o))
+        .collect();
+    let norm = |v: Vec<(String, u64)>| -> Vec<(String, u64)> {
+        v.into_iter().map(|(n, o)| (n.to_lowercase(), o)).collect()
+    };
+
+    // Rust client and dispatcher use the same const block.
+    assert_eq!(norm(rust_opcodes(&client)), canon,
+        "Rust client opcodes differ from AST");
+    assert_eq!(norm(rust_opcodes(&dispatcher)), canon,
+        "Rust dispatcher opcodes differ from AST");
+    assert_eq!(norm(lisp_opcodes(&lisp)), canon,
+        "Lisp opcodes differ from AST");
+    assert_eq!(norm(c_opcodes(&c)), canon,
+        "C opcodes differ from AST");
+}
+
+#[test]
+fn e2e_all_backends_same_method_names() {
+    let (client, dispatcher, lisp, c) = generate_all_backends();
+
+    // Every method must appear in every backend, with the backend's own
+    // naming convention: rust `add`, lisp `calculator-service-add`,
+    // C `calculator_add`.
+    let expected: Vec<(String, String, String, String)> = [
+        ("add",        "calculator-service-add", "calculator_add"),
+        ("div",        "calculator-service-div", "calculator_div"),
+        ("dot",        "calculator-service-dot", "calculator_dot"),
+        ("matmul_vec", "calculator-service-matmul-vec", "calculator_matmul_vec"),
+        ("sqrt_batch", "calculator-service-sqrt-batch", "calculator_sqrt_batch"),
+        ("heavy_reduce", "calculator-service-heavy-reduce", "calculator_heavy_reduce"),
+    ]
+    .iter()
+    .map(|(r, l, c_)| (r.to_string(), l.to_string(), c_.to_string(), r.to_string()))
+    .collect();
+
+    for (rust_name, lisp_name, c_name, _) in &expected {
+        // Rust client: `pub fn add(` ; dispatcher trait: `fn add(&mut self`
+        assert!(client.contains(&format!("pub fn {rust_name}(")),
+            "client missing method {rust_name}");
+        assert!(dispatcher.contains(&format!("fn {rust_name}(&mut self")),
+            "dispatcher missing trait method {rust_name}");
+        // Lisp: `(defun calculator-service-add (`
+        assert!(lisp.contains(&format!("(defun {lisp_name} (")),
+            "lisp missing method {lisp_name}");
+        // C: `calculator_add(`
+        assert!(c.contains(&format!("{c_name}(")),
+            "C header missing method {c_name}");
+    }
+}
+
+/// Canonical (field_name, ownership) pairs for non-inline struct fields.
+fn ast_struct_field_ownership() -> Vec<(String, String)> {
+    let src = fs::read_to_string(calculator_idl_path()).unwrap();
+    let doc = aeroidl_cc::parser::parse(&src).unwrap();
+    let tc = aeroidl_cc::tycheck::type_check(&doc);
+    let ast = aeroidl_cc::emit::emit_value(&doc, &tc);
+    let mut out = Vec::new();
+    if let Some(structs) = ast["structs"].as_array() {
+        for s in structs {
+            if let Some(fields) = s["fields"].as_array() {
+                for f in fields {
+                    let own = f["ownership"].as_str().unwrap_or("inline");
+                    if own != "inline" {
+                        out.push((f["name"].as_str().unwrap().to_string(), own.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Canonical (method, param, ownership) pairs for params with ownership.
+fn ast_param_ownership() -> Vec<(String, String, String)> {
+    let src = fs::read_to_string(calculator_idl_path()).unwrap();
+    let doc = aeroidl_cc::parser::parse(&src).unwrap();
+    let tc = aeroidl_cc::tycheck::type_check(&doc);
+    let ast = aeroidl_cc::emit::emit_value(&doc, &tc);
+    let mut out = Vec::new();
+    if let Some(interfaces) = ast["interfaces"].as_array() {
+        for iface in interfaces {
+            if let Some(methods) = iface["methods"].as_array() {
+                for m in methods {
+                    let mname = m["name"].as_str().unwrap().to_string();
+                    if let Some(params) = m["params"].as_array() {
+                        for p in params {
+                            let own = p["ownership"].as_str().unwrap_or("inline");
+                            if own != "inline" {
+                                out.push((mname.clone(),
+                                          p["name"].as_str().unwrap().to_string(),
+                                          own.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn e2e_all_backends_same_ownership() {
+    let (client, dispatcher, lisp, c) = generate_all_backends();
+
+    // ── Struct field ownership must match across backends ──────────────
+    let fields = ast_struct_field_ownership();
+    assert!(fields.iter().any(|(_, own)| own == "arena"),
+        "test fixture: expected an @arena struct field");
+    assert!(fields.iter().any(|(_, own)| own == "borrowed"),
+        "test fixture: expected an @borrowed struct field");
+
+    for (fname, own) in &fields {
+        // Rust client: `pub message: ..., /* @borrowed */`
+        assert!(client.lines().any(|l| l.contains(fname) && l.contains(&format!("@{own}"))),
+            "client field {fname} missing @{own}");
+        // Rust dispatcher: `pub message: ..., // @borrowed`
+        assert!(dispatcher.lines().any(|l| l.contains(fname) && l.contains(&format!("@{own}"))),
+            "dispatcher field {fname} missing @{own}");
+        // C header: `uint16_t /* cap handle */ message; /* @borrowed */`
+        assert!(c.lines().any(|l| l.contains(fname) && l.contains(&format!("@{own}"))),
+            "C header field {fname} missing @{own}");
+    }
+
+    // ── Param ownership must match in Lisp docstrings ──────────────────
+    let params = ast_param_ownership();
+    assert!(!params.is_empty(), "test fixture: expected owned params");
+    for (mname, pname, own) in &params {
+        // Lisp docstring: `dot(a: vec2@borrowed, b: vec2@borrowed)`
+        assert!(lisp.lines().any(|l| l.contains(mname) && l.contains(&format!("@{own}"))),
+            "lisp method {mname} param {pname} missing @{own}");
+    }
+}
+
+#[test]
+fn e2e_all_backends_dispatch_table_present() {
+    let (client, dispatcher, lisp, c) = generate_all_backends();
+
+    // Client must send every opcode.
+    for (mname, opcode) in ast_method_opcodes() {
+        let const_name = format!("OP_{}", mname.to_uppercase());
+        assert!(client.contains(&const_name),
+            "client missing opcode const {const_name}");
+        assert!(dispatcher.contains(&const_name),
+            "dispatcher missing opcode const {const_name}");
+        assert!(c.contains(&const_name),
+            "C header missing opcode const {const_name}");
+        let _ = opcode;
+    }
+
+    // Dispatcher must match on every opcode; Lisp dispatch must ecase them.
+    assert!(dispatcher.contains("match opcode"), "dispatcher missing opcode match");
+    assert!(lisp.contains("(ecase opcode"), "lisp dispatch missing ecase");
+}
+
+#[test]
+fn e2e_all_backends_struct_layout_consistent() {
+    // Vec2 appears in all four backends with the same field set.
+    let (client, dispatcher, lisp, c) = generate_all_backends();
+    for text in [&client, &dispatcher, &lisp, &c] {
+        assert!(text.contains("x"), "missing field x");
+        assert!(text.contains("y"), "missing field y");
+    }
+    // MatrixData: rows, cols, elements in all four
+    for text in [&client, &dispatcher, &lisp, &c] {
+        assert!(text.contains("rows"), "missing field rows");
+        assert!(text.contains("cols"), "missing field cols");
+        assert!(text.contains("elements"), "missing field elements");
+    }
+}

@@ -489,6 +489,22 @@ fn emit_deserialize_params(out: &mut String, ast: &Value, params: &[Value], inde
                 }
                 "named" => {
                     let type_name = ty["name"].as_str().unwrap_or("Unknown");
+                    // Enum params deserialize via from_raw with a fallback variant.
+                    if is_enum_type(ast, type_name) {
+                        let first = enum_first_variant(ast, type_name)
+                            .unwrap_or_else(|| "UNKNOWN".into());
+                        out.push_str(&format!(
+                            "{indent}let {pname} = {type_name}::from_raw(u32::from_le_bytes(\n"
+                        ));
+                        out.push_str(&format!(
+                            "{indent}    payload[{offset}..{offset}+4].try_into().unwrap()\n"
+                        ));
+                        out.push_str(&format!(
+                            "{indent})).unwrap_or({type_name}::{first});\n"
+                        ));
+                        offset += 4;
+                        continue;
+                    }
                     let struct_def = find_struct(ast, type_name);
                     if let Some(s) = struct_def {
                         let fields = s["fields"].as_array().unwrap();
@@ -520,9 +536,18 @@ fn emit_deserialize_params(out: &mut String, ast: &Value, params: &[Value], inde
                                 }
                                 "named" => {
                                     let nested_name = f["ty"]["name"].as_str().unwrap_or("_");
-                                    out.push_str(&format!(
-                                        "{indent}    {fname}: {nested_name}::default(), // TODO: deserialize nested\n"
-                                    ));
+                                    // Enums deserialize via from_raw; structs keep the TODO.
+                                    if is_enum_type(ast, nested_name) {
+                                        let first = enum_first_variant(ast, nested_name)
+                                            .unwrap_or_else(|| "UNKNOWN".into());
+                                        out.push_str(&format!(
+                                            "{indent}    {fname}: {nested_name}::from_raw(u32::from_le_bytes(payload[{offset}..{offset}+4].try_into().unwrap())).unwrap_or({nested_name}::{first}),\n"
+                                        ));
+                                    } else {
+                                        out.push_str(&format!(
+                                            "{indent}    {fname}: {nested_name}::default(), // TODO: deserialize nested struct\n"
+                                        ));
+                                    }
                                 }
                                 "array" | "bytes" | "map" => {
                                     out.push_str(&format!(
@@ -720,6 +745,28 @@ fn find_struct<'a>(ast: &'a Value, name: &str) -> Option<&'a Value> {
         .find(|s| s["name"].as_str() == Some(name))
 }
 
+/// True if `name` refers to an enum type in the AST.
+fn is_enum_type(ast: &Value, name: &str) -> bool {
+    ast["enums"]
+        .as_array()
+        .map(|es| es.iter().any(|e| e["name"].as_str() == Some(name)))
+        .unwrap_or(false)
+}
+
+/// Name of the first variant of an enum (used as a `from_raw` fallback).
+fn enum_first_variant(ast: &Value, name: &str) -> Option<String> {
+    ast["enums"]
+        .as_array()?
+        .iter()
+        .find(|e| e["name"].as_str() == Some(name))?
+        .get("variants")?
+        .as_array()?
+        .first()?
+        .get("name")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 fn get_struct_field_names(ast: &Value, type_name: &str) -> Vec<Value> {
     find_struct(ast, type_name)
         .and_then(|s| s["fields"].as_array())
@@ -753,7 +800,9 @@ fn json_type_to_rust(ty: &Value) -> String {
         "f32" => "f32".into(),
         "f64" => "f64".into(),
         "bool" => "bool".into(),
-        "string" | "bytes" => "alloc::string::String".into(),
+        "string" => "alloc::string::String".into(),
+        // Bytes always travel through the arena via a MEM cap.
+        "bytes" => "ArenaSlice<u8>".into(),
         "named" => {
             let name = ty["name"].as_str().unwrap_or("Unknown");
             name.to_string()

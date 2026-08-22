@@ -874,6 +874,48 @@ simi-test: simi-tools
 
 .PHONY: simi-tools simi-test
 
+# ── aeroidl-check: the Polyglot Nexus codegen gate ──────────────────────────
+# Parses, type-checks, and generates all four backends (Rust client, Rust
+# dispatcher, Common Lisp, C header) from every .aeroidl file under idl/,
+# then COMPILES the generated code: cargo check on the Rust client +
+# dispatcher, gcc/clang on the C header (skipped gracefully when no C
+# compiler exists), and a paren-balance structural check on the Lisp.
+#
+# This is the gate --check-all exists for. A codegen change that breaks any
+# backend fails here with exit 1, so a generator regression cannot ship
+# silently (it has caught real bugs: unbalanced Lisp parens, a missing C
+# count param, and enum/arena type mismatches in the Rust dispatcher).
+# Run it before merging any change to tools/aeroidl/ or idl/:
+#
+#   make aeroidl-check
+#
+# Requires the Rust toolchain (cargo) for the parser/compiler itself; the
+# Lisp check is structural (no Lisp runtime needed).
+aeroidl-check:
+	@echo "[AEROIDL] Building the AeroIDL compiler..."
+	cargo build --manifest-path tools/aeroidl/Cargo.toml
+	@echo "[AEROIDL] Running the AeroIDL test suite..."
+	cargo test --manifest-path tools/aeroidl/Cargo.toml
+	@echo "[AEROIDL] Checking all IDL files (all 4 backends must compile)..."
+	@fail=0; for f in $$(ls idl/*.aeroidl 2>/dev/null); do \
+		cargo run --quiet --manifest-path tools/aeroidl/Cargo.toml -- "$$f" --check-all || fail=1; \
+	done; \
+	if [ "$$fail" -ne 0 ]; then \
+		echo "[AEROIDL] check-all FAILED"; exit 1; \
+	fi; \
+	echo "[AEROIDL] all IDL files: all backends OK"
+
+# ── aeroidl-teeth: prove the aeroidl-check gate can FAIL ───────────────────
+# tests/aeroidl_gate_smoke.sh breaks each of the four generators one at a
+# time and requires `make aeroidl-check`'s check-all to fail, then restores
+# the files byte-identically and requires it to pass again. A gate whose
+# teeth are never shown to bite can go blind; this is the tooth-proving
+# companion to the gate itself.
+aeroidl-teeth:
+	bash tests/aeroidl_gate_smoke.sh
+
+.PHONY: aeroidl-check aeroidl-teeth
+
 # ── bundle: regenerate kernel/webapp_bundle.c from ../slsos-sim/dist ──────
 # The committed kernel/webapp_bundle.c is CANONICAL -- CI and the deploy both
 # build the kernel from it, and tests/webapp_bundle_guard_check.sh enforces

@@ -483,9 +483,19 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                                     ));
                                 }
                                 "named" => {
-                                    out.push_str(&format!(
-                                        "{indent}    let {fname} = 0; // TODO: deserialize nested {field_kind}\n"
-                                    ));
+                                    let nested_name = f["ty"]["name"].as_str().unwrap_or("_");
+                                    // Enums deserialize via from_raw; structs keep the TODO.
+                                    if is_enum_type(ast, nested_name) {
+                                        let first = enum_first_variant(ast, nested_name)
+                                            .unwrap_or_else(|| "UNKNOWN".into());
+                                        out.push_str(&format!(
+                                            "{indent}    let {fname} = {nested_name}::from_raw(u32::from_le_bytes(reply_buf[{inner_offset}..{inner_offset}+4].try_into().unwrap())).unwrap_or({nested_name}::{first});\n"
+                                        ));
+                                    } else {
+                                        out.push_str(&format!(
+                                            "{indent}    let {fname} = 0; // TODO: deserialize nested {field_kind}\n"
+                                        ));
+                                    }
                                 }
                                 "string" | "bytes" => {
                                     out.push_str(&format!(
@@ -500,17 +510,23 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                             }
                             inner_offset += ws as usize;
                         }
-                        let field_vals: Vec<String> = fields
+                        // Enum fields are already typed via from_raw — no `as` cast.
+                        let field_exprs: Vec<String> = fields
                             .iter()
-                            .map(|f| f["name"].as_str().unwrap_or("_").to_string())
+                            .map(|f| {
+                                let fname = f["name"].as_str().unwrap_or("_");
+                                let is_enum = f["ty"]["kind"].as_str() == Some("named")
+                                    && is_enum_type(ast, f["ty"]["name"].as_str().unwrap_or("_"));
+                                if is_enum {
+                                    format!("{fname}: {fname}")
+                                } else {
+                                    format!("{fname}: {fname} as _")
+                                }
+                            })
                             .collect();
                         out.push_str(&format!(
                             "{indent}    Ok({type_name} {{ {} }})\n",
-                            field_vals
-                                .iter()
-                                .map(|f| format!("{f}: {f} as _"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            field_exprs.join(", ")
                         ));
                     } else {
                         out.push_str(&format!(
@@ -703,6 +719,28 @@ fn calculate_reply_size(return_type: &Value) -> usize {
 /// Look up a struct definition by name from the AST.
 fn find_struct<'a>(ast: &'a Value, name: &str) -> Option<&'a Value> {
     ast["structs"].as_array()?.iter().find(|s| s["name"].as_str() == Some(name))
+}
+
+/// True if `name` refers to an enum type in the AST.
+fn is_enum_type(ast: &Value, name: &str) -> bool {
+    ast["enums"]
+        .as_array()
+        .map(|es| es.iter().any(|e| e["name"].as_str() == Some(name)))
+        .unwrap_or(false)
+}
+
+/// Name of the first variant of an enum (used as a `from_raw` fallback).
+fn enum_first_variant(ast: &Value, name: &str) -> Option<String> {
+    ast["enums"]
+        .as_array()?
+        .iter()
+        .find(|e| e["name"].as_str() == Some(name))?
+        .get("variants")?
+        .as_array()?
+        .first()?
+        .get("name")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Get struct field names from the AST.

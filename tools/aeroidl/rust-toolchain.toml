@@ -1,0 +1,19 @@
+# tools/aeroidl/rust-toolchain.toml — pinned toolchain for the AeroIDL
+# compiler and its generated Rust output.
+#
+# rustup reads this file automatically when invoked from tools/aeroidl/ (or
+# any subdirectory), installing the specified toolchain on first use if it
+# is not present.  All AeroIDL builds — CI's aeroidl-check gate, the gate
+# teeth smoke, and local development — converge on the same rustc version,
+# so a regression that only appears on a newer (or older) nightly can
+# never hide behind a version mismatch.
+#
+# To update: change the version below, commit, and verify `cargo test`
+# passes in tools/aeroidl/.  The CI Rust toolchain step (ci.yml) only
+# ensures rustup itself is present; it does not pin a version, so this
+# file is the single source of truth.
+
+[toolchain]
+channel  = "stable"
+version  = "1.97.1"
+profile  = "minimal"

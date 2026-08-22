@@ -14,6 +14,7 @@
 
 pub mod ast;
 pub mod emit;
+pub mod gen_c;
 pub mod gen_dispatcher;
 pub mod gen_lisp;
 pub mod gen_rust;
