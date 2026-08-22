@@ -230,6 +230,10 @@ fn main() {
 }
 
 fn handle_conn(k: &Kernel, mut stream: TcpStream) -> std::io::Result<()> {
+    // Request/response protocol: no Nagle. Without this, the two writes of
+    // each reply frame (header + body) stall on the delayed-ACK timer
+    // (~40ms per exchange) — the classic TCP ping-pong latency trap.
+    stream.set_nodelay(true)?;
     loop {
         // Blocking read: a full frame or connection EOF. The blocking-recv
         // semantics live at the syscall level (condvar), not here.

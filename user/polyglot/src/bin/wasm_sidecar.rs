@@ -33,6 +33,24 @@ static TRANSPORT: Mutex<Option<TcpStream>> = Mutex::new(None);
 static CAP_TABLE: Mutex<Vec<(u16, u32, u32)>> = Mutex::new(Vec::new());
 /// Base of the sidecar's MAP_SHARED mapping of the arena file.
 static MAP_BASE: AtomicUsize = AtomicUsize::new(0);
+/// rdtsc round-trip samples collected inside the `call_add` host import.
+static BENCH_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Monotonic cycle counter for round-trip timing. On x86_64 this is the real
+/// TSC (constant-rate on modern CPUs); elsewhere it falls back to monotonic
+/// nanoseconds, so relative deltas are still meaningful.
+#[cfg(target_arch = "x86_64")]
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn rdtsc() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
 
 fn rpc(syscall: u32, body: &[u8]) -> Vec<u8> {
     let mut g = TRANSPORT.lock().unwrap();
@@ -208,9 +226,12 @@ fn main() {
     drop(file);
 
     // Connect the transport and point the runtime's syscall seam at it.
-    *TRANSPORT.lock().unwrap() = Some(
-        TcpStream::connect(("127.0.0.1", port)).expect("connect to sls-kerneld"),
-    );
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to sls-kerneld");
+    // Request/response protocol — disable Nagle so the two writes of each
+    // frame (header + body) and the ping-pong exchange don't stall on
+    // delayed ACKs (the classic ~40ms-per-exchange TCP latency trap).
+    stream.set_nodelay(true).expect("set_nodelay");
+    *TRANSPORT.lock().unwrap() = Some(stream);
     aerosls::set_fake_syscall(Some(fake_syscall));
     // Bootstrap the generated client's endpoints (ch1 = request, ch2 = reply).
     unsafe {
@@ -228,10 +249,15 @@ fn main() {
 
     linker
         .func_wrap("host", "call_add", |_caller: wasmi::Caller<'_, ()>, a: i32, b: i32| -> i64 {
-            match gen_calculator::calculator_service::add(a, b) {
+            let t0 = rdtsc();
+            let r = match gen_calculator::calculator_service::add(a, b) {
                 Ok(v) => pack(0, v as u32 as u64),
                 Err(e) => pack(1, e.code as u64),
-            }
+            };
+            // Record the full wasm -> lisp -> wasm round trip in cycles. The
+            // push happens after the stop timestamp, so it can't inflate it.
+            BENCH_SAMPLES.lock().unwrap().push(rdtsc().wrapping_sub(t0));
+            r
         })
         .unwrap();
     linker
@@ -309,6 +335,26 @@ fn main() {
         .expect("run export");
 
     let status = run.call(&mut store, ()).expect("guest run");
+
+    // ── latency report: median/p99 of the guest's add() round trips ───────
+    let samples = {
+        let mut s = BENCH_SAMPLES.lock().unwrap();
+        s.sort_unstable();
+        std::mem::take(&mut *s)
+    };
+    // Drop the first sample — the guest's verification add(2,3), i.e. the
+    // cold path (warmup for connection/TCP/buffers).
+    let samples = samples.get(1..).unwrap_or(&samples[..]);
+    if !samples.is_empty() {
+        let n = samples.len();
+        let median = samples[n / 2];
+        let p99 = samples[((n as f64 * 0.99) as usize).min(n - 1)];
+        let mean = samples.iter().sum::<u64>() / n as u64;
+        println!("BENCH: N={n} wasm->lisp->wasm median={median} p99={p99} mean={mean} cycles");
+    } else {
+        println!("BENCH: no round-trip samples (guest did not call add)");
+    }
+
     if status == 0 {
         println!("WASM_SIDECAR PASS");
         std::process::exit(0);

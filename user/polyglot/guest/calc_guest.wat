@@ -5,7 +5,10 @@
 ;;; sidecar. It orchestrates two calls entirely from inside wasm:
 ;;;
 ;;;   1. add(2, 3) -> 5                    (inline args, no arena data)
-;;;   2. sqrt_batch over N=4096 f64s       (arena array handed by capability)
+;;;   2. latency benchmark: 1000 add() round trips into Lisp (the host
+;;;      times each call with rdtsc inside the call_add import and reports
+;;;      median/p99 after run)
+;;;   3. sqrt_batch over N=4096 f64s       (arena array handed by capability)
 ;;;
 ;;; The array itself never crosses the wire: the guest writes it into the
 ;;; shared arena through host_* imports (which address the shared mapping
@@ -51,6 +54,18 @@
       (i32.wrap_i64 (i64.and (local.get $r) (i64.const 0xffffffff))))
     (if (i32.ne (local.get $status) (i32.const 5))
       (then (call $log (i32.const 160) (i32.const 8)) (return (i32.const 2))))
+
+    ;; ── latency benchmark: 1000 add() round trips into Lisp ──────────────
+    ;; each call crosses wasm -> host import -> TCP -> kerneld -> Lisp -> back;
+    ;; the host import times every call with rdtsc and the sidecar reports
+    ;; median/p99 after run() returns.
+    (local.set $i (i32.const 0))
+    (block $bench_done
+      (loop $bench
+        (br_if $bench_done (i32.ge_u (local.get $i) (i32.const 1000)))
+        (drop (call $call_add (i32.const 7) (i32.const 8)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $bench)))
 
     ;; ── sqrt_batch: N = 4096 f64s through the shared arena ───────────────
     (local.set $n (i32.const 4096))

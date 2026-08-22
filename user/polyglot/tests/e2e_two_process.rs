@@ -212,6 +212,9 @@ fn two_process_wasm_lisp_arena_roundtrip() {
         &["--port", &port.to_string(), "--arena", &arena_path],
         &[],
     );
+    // The sidecar prints the rdtsc latency report first, then the verdict.
+    // The channel is FIFO, so consume BENCH before WASM_SIDECAR.
+    let bench_line = wait_for_marker(&wasm_out, "BENCH", Duration::from_secs(60));
     let wasm_line = wait_for_marker(&wasm_out, "WASM_SIDECAR", Duration::from_secs(30));
     let status = wasm.wait().expect("wasm exit");
     let Some(wasm_line) = wasm_line else {
@@ -222,6 +225,10 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     assert!(
         status.success() && wasm_line.contains("PASS"),
         "wasm-sidecar failed: {wasm_line} (exit {status})"
+    );
+    assert!(
+        bench_line.is_some(),
+        "wasm-sidecar produced no BENCH latency report"
     );
 
     // ── teardown ─────────────────────────────────────────────────────────

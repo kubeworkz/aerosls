@@ -247,6 +247,7 @@
   (format t "[lisp] connecting to 127.0.0.1:~A~%" *kernel-port*)
   (finish-output t)
   (let ((s (sb-bsd-sockets:make-inet-socket :stream :tcp)))
+    (setf (sb-bsd-sockets:sockopt-tcp-nodelay s) t)  ; no Nagle: ping-pong frames
     (sb-bsd-sockets:socket-connect s #(127 0 0 1) *kernel-port*)
     (setf *sock*
           (sb-bsd-sockets:socket-make-stream

@@ -64,8 +64,12 @@ pub fn write_frame(stream: &mut TcpStream, syscall: u32, body: &[u8]) -> std::io
     let mut hdr = [0u8; 8];
     hdr[0..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
     hdr[4..8].copy_from_slice(&syscall.to_le_bytes());
-    stream.write_all(&hdr)?;
-    stream.write_all(body)?;
+    // Single write: avoids the Nagle/delayed-ACK interaction between the
+    // header and body packets on request/response exchanges.
+    let mut frame = Vec::with_capacity(8 + body.len());
+    frame.extend_from_slice(&hdr);
+    frame.extend_from_slice(body);
+    stream.write_all(&frame)?;
     stream.flush()
 }
 
