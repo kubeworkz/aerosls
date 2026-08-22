@@ -386,6 +386,20 @@ jobs:
             echo "::error::polyglot e2e did not pass"; exit 1; }
         working-directory: aerosls2
 
+      # ─── Polyglot latency gate teeth ───────────────────────────────────
+      # The step above proves the gate passes; this proves it can fail.
+      # tests/polyglot_latency_gate_smoke.sh reverts the two transport
+      # fixes that cured the original Nagle/delayed-ACK stall (single-write
+      # frames + TCP_NODELAY on kerneld) and requires the e2e latency gate
+      # to FAIL with the regression in place, then restores the sources
+      # byte-identically and requires the gate to PASS again — so a change
+      # that made the gate blind fails CI instead of sailing through green.
+      # The mutated run takes ~1min (each round trip inflates to ~40-50ms),
+      # which is why this lives in this job and not in the default gate.
+      - name: Polyglot latency gate teeth (a transport regression must fail the e2e)
+        run: bash tests/polyglot_latency_gate_smoke.sh
+        working-directory: aerosls2
+
   kernel-guards:
     # The five kernel-needing guards (stack_frame_budget, kernel_image_end,
     # no_tls_relocations, no_hosted_link, code_buffer_budget) need the
