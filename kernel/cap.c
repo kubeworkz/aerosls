@@ -110,6 +110,35 @@ static uint8_t  cap_arena_bitmap[(CAP_ARENA_FRAMES + 7) / 8];
 static uint32_t cap_arena_owner[CAP_ARENA_FRAMES];   /* owning object id, 0 = free */
 static uint32_t cap_arena_free_count = 0;
 
+/* Phase 3 message payload staging pool. Fixed-size buffers, chained through
+ * a parallel `next` array (the payload bytes themselves are arbitrary data,
+ * so the freelist cannot chain through them like the holder pool does).
+ * Single CPU, one syscall at a time: a plain static freelist is safe. */
+static uint8_t  cap_msg_payload[CAP_MSG_PAYLOAD_POOL][CAP_MSG_MAX_PAYLOAD];
+static uint16_t cap_msg_payload_next[CAP_MSG_PAYLOAD_POOL];
+static uint16_t cap_msg_payload_free_head = CAP_FREELIST_END;
+
+static void cap_msg_payload_init(void) {
+    cap_msg_payload_free_head = 0;
+    for (int i = 0; i < CAP_MSG_PAYLOAD_POOL - 1; i++)
+        cap_msg_payload_next[i] = (uint16_t)(i + 1);
+    cap_msg_payload_next[CAP_MSG_PAYLOAD_POOL - 1] = CAP_FREELIST_END;
+}
+
+static int cap_msg_payload_alloc(uint16_t* out_idx) {
+    if (cap_msg_payload_free_head == CAP_FREELIST_END) return -1;
+    uint16_t i = cap_msg_payload_free_head;
+    cap_msg_payload_free_head = cap_msg_payload_next[i];
+    *out_idx = i;
+    return 0;
+}
+
+static void cap_msg_payload_free(uint16_t idx) {
+    if (idx == CAP_NONE || idx >= CAP_MSG_PAYLOAD_POOL) return;
+    cap_msg_payload_next[idx] = cap_msg_payload_free_head;
+    cap_msg_payload_free_head = idx;
+}
+
 /* ─── Spinlock ─────────────────────────────────────────────────────────────── */
 
 void cap_lock_init(struct CapSpinlock* l) { l->v = 0; }
@@ -460,10 +489,11 @@ void cap_init(void) {
     cap_obj_next = 0;
     cap_chan_next = 0;
     cap_arena_init();
+    cap_msg_payload_init();
 
     kernel_serial_print("[CAP] Seed kernel capability layer online: "
                         "512-slot tables, 1024-object ceiling, holders, "
-                        "channels, arena, syscalls 289-297.\n");
+                        "channels, arena, message transport, syscalls 289-304.\n");
 }
 
 /* ─── cap_create_mem ───────────────────────────────────────────────────────── */
@@ -748,6 +778,11 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
     return 0;
 }
 
+/* Free a dead object's machine resources (arena frames / channel slot);
+ * defined after cap_revoke. Forward-declared here because cap_recv's
+ * defensive multi-cap drain and cap_arena_free both call it. */
+static uint32_t cap_object_free_resources(uint32_t obj_id);
+
 /* ─── cap_send ─────────────────────────────────────────────────────────────── */
 /* MOVE a capability (or send a plain message) into the channel's directional
  * queue, atomically with respect to revocation:
@@ -813,6 +848,16 @@ int cap_send(uint32_t pid, uint16_t ch_w_idx, uint16_t cap_idx, uint64_t cookie)
     /* qtail is the write cursor, qhead the read cursor — a plain fixed-size
      * ring (same shape as ipc.c's queues). */
     uint32_t entry = ch->qtail[dest] % CHAN_QUEUE_DEPTH;
+    /* Zero the whole entry: ring slots are reused, and cap_drain_queue /
+     * cap_revoke scan cap_word[] for nonzero words, so a stale word from a
+     * previous multi-cap message must never survive into a new message. */
+    for (int i = 0; i < CAP_MSG_MAX_CAPS; i++) {
+        ch->q[dest][entry].cap_word[i] = 0;
+        ch->q[dest][entry].cap_off[i] = 0;
+        ch->q[dest][entry].cap_len[i] = 0;
+        ch->q[dest][entry].cap_rights[i] = 0;
+        ch->q[dest][entry].cap_flags[i] = 0;
+    }
 
     if (obj) {
         cap_lock(&obj->lock);
@@ -827,29 +872,36 @@ int cap_send(uint32_t pid, uint16_t ch_w_idx, uint16_t cap_idx, uint64_t cookie)
         }
         /* Pre-reserve the queue holder node BEFORE mutating anything, so
          * pool exhaustion can never leave a half-moved holder (slot freed
-         * but no queue holder to account for the cap). */
+         * but no queue holder to account for the cap). ref = entry*MAX + 0
+         * keeps the encoding uniform with cap_send_msg's per-cap holders. */
         uint16_t hq;
         if (cap_holder_alloc(obj->id, HOLDER_QUEUE, (uint16_t)cobj->chan_id,
-                             (uint16_t)entry, (uint8_t)dest, &hq)) {
+                             (uint16_t)(entry * CAP_MSG_MAX_CAPS), (uint8_t)dest, &hq)) {
             cap_unlock(&obj->lock);
             cap_unlock(&ch->lock);
             cap_unlock(&t->lock);
             return CAP_ENOMEM;   /* nothing mutated: sender keeps its cap */
         }
-        /* Holder move: sender slot → queue entry. refcount unchanged. */
+        /* Holder move: sender slot → queue entry. refcount unchanged. The holder's
+     * `ref` encodes (entry, cap index) as entry*CAP_MSG_MAX_CAPS + i so
+     * multi-cap messages can carry several holders per ring entry — see
+     * cap_send_msg. A single-cap legacy message is just the i=0 case. */
         cap_holder_remove(obj->id, HOLDER_SLOT, (uint16_t)pid, cap_idx);
         t->slots[cap_idx].word = 0;
         cap_slot_push(ti, cap_idx);
         cap_holder_link(hq, obj);
-        ch->q[dest][entry].cap_word = payload;
-        ch->q[dest][entry].has_cap = 1;
+        ch->q[dest][entry].cap_word[0] = payload;
+        ch->q[dest][entry].n_caps = 1;
         cap_unlock(&obj->lock);
     } else {
-        ch->q[dest][entry].has_cap = 0;
-        ch->q[dest][entry].cap_word = 0;
+        ch->q[dest][entry].n_caps = 0;
+        ch->q[dest][entry].cap_word[0] = 0;
     }
 
     ch->q[dest][entry].cookie = cookie;
+    ch->q[dest][entry].payload_len = 0;
+    ch->q[dest][entry].payload_idx = CAP_NONE;
+    ch->q[dest][entry].flags = 0;
     ch->qtail[dest]++;
     ch->qdepth[dest]++;
     cap_unlock(&ch->lock);
@@ -866,6 +918,36 @@ int cap_send(uint32_t pid, uint16_t ch_w_idx, uint16_t cap_idx, uint64_t cookie)
     cap_wake_chan(cobj->chan_id);
     cap_maybe_handoff();
     return 0;
+}
+
+/* ─── cap_msg_drain_tail ──────────────────────────────────────────────────── */
+/* Drain the caps AFTER index 0 of a message whose first cap is being
+ * skipped (stale word for a dead object, or revoked — in both cases cap 0's
+ * holder was already accounted by destroy/revoke). Each remaining LIVE cap's
+ * HOLDER_QUEUE node is removed from its object, the object is freed at
+ * refcount 0 (its arena frames return), and the word is zeroed, so a
+ * multi-cap message can never leave holders behind when it is dequeued.
+ * Caller holds the table + channel locks; per-object locks are taken inside
+ * (order table < channel < object, same as cap_recv). */
+static void cap_msg_drain_tail(struct CapChannel* ch, uint16_t chan_id,
+                               uint32_t entry, struct ChanMsg* m) {
+    for (int i = 1; i < m->n_caps; i++) {
+        if (m->cap_word[i] == 0) continue;
+        uint32_t xid = (uint32_t)((m->cap_word[i] >> CAP_OBJ_SHIFT) &
+                                  CAP_OBJ_MASK);
+        struct CapObject* xo = cap_object_get(xid);
+        if (xo) {
+            cap_lock(&xo->lock);
+            cap_holder_remove(xo->id, HOLDER_QUEUE, chan_id,
+                              (uint16_t)(entry * CAP_MSG_MAX_CAPS + i));
+            if (xo->refcount == 0) {
+                cap_object_free_resources(xo->id);
+                cap_object_destroy(xo->id);
+            }
+            cap_unlock(&xo->lock);
+        }
+        m->cap_word[i] = 0;
+    }
 }
 
 /* ─── cap_recv ─────────────────────────────────────────────────────────────── */
@@ -925,12 +1007,19 @@ int cap_recv(uint32_t pid, uint16_t ch_r_idx, int block,
     uint32_t entry = ch->qhead[dir] % CHAN_QUEUE_DEPTH;
     struct ChanMsg* m = &ch->q[dir][entry];
 
-    if (m->has_cap) {
-        uint32_t obj_id = (uint32_t)((m->cap_word >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    if (m->n_caps > 0) {
+        uint32_t obj_id = (uint32_t)((m->cap_word[0] >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
         struct CapObject* obj = cap_object_get(obj_id);
         if (!obj) {
-            /* Stale word for a dead object: drain and skip (defensive). */
-            m->has_cap = 0;
+            /* Stale word for a dead object: cap 0's holder is already gone
+             * (the object was destroyed); drain any LIVE extra caps — a
+             * multi-cap message must never leave holders behind — then
+             * skip the message (defensive). */
+            cap_msg_drain_tail(ch, cobj->chan_id, entry, m);
+            m->n_caps = 0;
+            m->payload_len = 0;
+            cap_msg_payload_free(m->payload_idx);
+            m->payload_idx = CAP_NONE;
             *cookie_out = m->cookie;
             ch->qhead[dir]++;
             ch->qdepth[dir]--;
@@ -939,11 +1028,16 @@ int cap_recv(uint32_t pid, uint16_t ch_r_idx, int block,
             return CAP_ECAPREVOKED;
         }
         cap_lock(&obj->lock);
-        if (((m->cap_word >> CAP_STATE_SHIFT) & CAP_STATE_MASK) == CAP_STATE_REVOKED ||
+        if (((m->cap_word[0] >> CAP_STATE_SHIFT) & CAP_STATE_MASK) == CAP_STATE_REVOKED ||
             obj->revoking) {
-            /* Revoked in flight: refcount was already accounted by revoke;
-             * just drain the dead entry — no double-count. */
-            m->has_cap = 0;
+            /* Revoked in flight: cap 0's refcount was already accounted by
+             * revoke (its holder is gone); drain any LIVE extra caps, then
+             * skip the message — no double-count. */
+            cap_msg_drain_tail(ch, cobj->chan_id, entry, m);
+            m->n_caps = 0;
+            m->payload_len = 0;
+            cap_msg_payload_free(m->payload_idx);
+            m->payload_idx = CAP_NONE;
             *cookie_out = m->cookie;
             ch->qhead[dir]++;
             ch->qdepth[dir]--;
@@ -971,21 +1065,410 @@ int cap_recv(uint32_t pid, uint16_t ch_r_idx, int block,
             return CAP_ENOMEM;   /* message STAYS queued */
         }
         cap_holder_remove(obj->id, HOLDER_QUEUE, (uint16_t)cobj->chan_id,
-                          (uint16_t)entry);
+                          (uint16_t)(entry * CAP_MSG_MAX_CAPS));
         cap_holder_link(hs, obj);
-        t->slots[nslot].word = m->cap_word;
-        m->has_cap = 0;
+        t->slots[nslot].word = m->cap_word[0];
+        m->cap_word[0] = 0;
         *out_cap = nslot;
         cap_unlock(&obj->lock);
+
+        /* Defensive: a legacy single-cap recv on a multi-cap message. The
+         * Phase-3 path uses cap_recv_msg (which installs all caps); this
+         * branch exists so a mismatch can never leak holders. Drain the
+         * extras exactly as revoke would — remove each queue holder, free
+         * the object at refcount 0 — without installing them. */
+        cap_msg_drain_tail(ch, cobj->chan_id, entry, m);
     } else {
         *out_cap = CAP_NONE;
     }
 
     *cookie_out = m->cookie;
+    m->payload_len = 0;
+    cap_msg_payload_free(m->payload_idx);
+    m->payload_idx = CAP_NONE;
     ch->qhead[dir]++;
     ch->qdepth[dir]--;
     cap_unlock(&ch->lock);
     cap_unlock(&t->lock);
+    return 0;
+}
+
+/* ─── Phase 3 message transport ───────────────────────────────────────────────
+ * cap_send_msg / cap_recv_msg — the SEND_CAP / RECV_CAP of the Polyglot
+ * Nexus design (§2.2-2.3): a channel message carries a staged payload (the
+ * IDL envelope, opaque to the kernel) plus up to CAP_MSG_MAX_CAPS moved MEM
+ * caps, each with the byte-level descriptor (offset/len/rights/flags) the
+ * IDL attached. The cap movement reuses the exact single-cap holder
+ * machinery of cap_send/cap_recv, one holder per cap, ref encoded as
+ * entry*CAP_MSG_MAX_CAPS + i so revoke can stamp the right word.
+ *
+ * Lock order (table < channel < object) and fail-before-mutate discipline
+ * are identical to the single-cap path. */
+
+/* cap_arena_free needs cap_object_free_resources (defined after cap_revoke);
+ * forward-declared here so this section stands on its own. */
+static uint32_t cap_object_free_resources(uint32_t obj_id);
+
+/* ─── cap_send_msg ─────────────────────────────────────────────────────────── */
+int cap_send_msg(uint32_t pid, uint16_t ch_w_idx, const void* payload,
+                 uint32_t payload_len, const struct SLSCapDesc* descs,
+                 uint16_t n_caps, uint32_t tag, uint32_t flags) {
+    if (n_caps > CAP_MSG_MAX_CAPS) return CAP_ERANGE;
+    if (payload_len > CAP_MSG_MAX_PAYLOAD) return CAP_ERANGE;
+    if (payload_len > 0 && !payload) return CAP_EINVAL;
+
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+    struct CapTable* t = &cap_tables[ti];
+
+    cap_lock(&t->lock);
+
+    uint64_t w = t->slots[ch_w_idx].word;
+    if (!cap_word_valid(w) ||
+        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_W ||
+        !((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    uint32_t chan_obj = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* cobj = cap_object_get(chan_obj);
+    if (!cobj || cobj->kind != CAP_OBJ_KIND_CHAN) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    struct CapChannel* ch = &cap_channels[cobj->chan_id];
+    if (!ch->active) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    int dest = (pid == ch->end0_pid) ? 1 : 0;
+
+    /* Validate every descriptor up front: each names a valid MEM cap in the
+     * sender's table. The words are snapshotted here; the holder moves below
+     * re-validate under the object lock (revoke race, same as cap_send). */
+    uint64_t words[CAP_MSG_MAX_CAPS];
+    struct CapObject* objs[CAP_MSG_MAX_CAPS];
+    for (int i = 0; i < n_caps; i++) {
+        uint16_t slot = descs[i].slot;
+        uint64_t pw = t->slots[slot].word;
+        if (!cap_word_valid(pw) ||
+            ((pw >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_MEM) {
+            cap_unlock(&t->lock);
+            return CAP_EINVAL;
+        }
+        words[i] = pw;
+        objs[i] = cap_object_get((uint32_t)((pw >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK));
+        if (!objs[i]) {
+            cap_unlock(&t->lock);
+            return CAP_EINVAL;
+        }
+    }
+
+    /* Stage the payload BEFORE taking the channel lock: pool exhaustion must
+     * fail without touching the queue. */
+    uint16_t pidx = CAP_NONE;
+    if (payload_len > 0) {
+        if (cap_msg_payload_alloc(&pidx)) {
+            cap_unlock(&t->lock);
+            return CAP_ENOSPC;
+        }
+        for (uint32_t i = 0; i < payload_len; i++)
+            cap_msg_payload[pidx][i] = ((const uint8_t*)payload)[i];
+    }
+
+    cap_lock(&ch->lock);
+    if (ch->qdepth[dest] >= CHAN_QUEUE_DEPTH) {
+        cap_unlock(&ch->lock);
+        if (pidx != CAP_NONE) cap_msg_payload_free(pidx);
+        cap_unlock(&t->lock);
+        return CAP_EAGAIN;
+    }
+    uint32_t entry = ch->qtail[dest] % CHAN_QUEUE_DEPTH;
+    struct ChanMsg* m = &ch->q[dest][entry];
+    /* Zero the whole entry first (ring slots are reused; drain/revoke scan
+     * cap_word[] for nonzero words). */
+    for (int i = 0; i < CAP_MSG_MAX_CAPS; i++) {
+        m->cap_word[i] = 0;
+        m->cap_off[i] = 0;
+        m->cap_len[i] = 0;
+        m->cap_rights[i] = 0;
+        m->cap_flags[i] = 0;
+    }
+
+    /* Move each cap: check revoking under the object lock, pre-reserve the
+     * queue holder, move slot → queue. A revoke race on cap i aborts the
+     * whole send — earlier caps are moved BACK so nothing is half-sent. */
+    int moved = 0;
+    int fail = 0;
+    uint16_t hq[CAP_MSG_MAX_CAPS];
+    for (int i = 0; i < n_caps; i++) {
+        struct CapObject* obj = objs[i];
+        cap_lock(&obj->lock);
+        if (obj->revoking) {
+            cap_unlock(&obj->lock);
+            fail = 1;
+            break;
+        }
+        uint16_t slot = descs[i].slot;
+        if (cap_holder_alloc(obj->id, HOLDER_QUEUE, (uint16_t)cobj->chan_id,
+                             (uint16_t)(entry * CAP_MSG_MAX_CAPS + i),
+                             (uint8_t)dest, &hq[i])) {
+            cap_unlock(&obj->lock);
+            fail = 1;
+            break;
+        }
+        cap_holder_remove(obj->id, HOLDER_SLOT, (uint16_t)pid, slot);
+        t->slots[slot].word = 0;
+        cap_slot_push(ti, slot);
+        cap_holder_link(hq[i], obj);
+        m->cap_word[i] = words[i];
+        m->cap_off[i] = descs[i].offset;
+        m->cap_len[i] = descs[i].len;
+        m->cap_rights[i] = descs[i].rights;
+        m->cap_flags[i] = descs[i].flags;
+        cap_unlock(&obj->lock);
+        moved++;
+    }
+
+    if (fail) {
+        /* Roll back: move moved caps back to fresh slots in the sender's
+         * table, free staged payload, leave the queue untouched. */
+        for (int i = 0; i < moved; i++) {
+            struct CapObject* obj = objs[i];
+            cap_lock(&obj->lock);
+            uint16_t slot;
+            if (cap_slot_pop(ti, &slot) == 0) {
+                cap_holder_remove(obj->id, HOLDER_QUEUE,
+                                  (uint16_t)cobj->chan_id,
+                                  (uint16_t)(entry * CAP_MSG_MAX_CAPS + i));
+                uint16_t hs;
+                if (cap_holder_alloc(obj->id, HOLDER_SLOT, (uint16_t)pid,
+                                     slot, 0, &hs) == 0) {
+                    cap_holder_link(hs, obj);
+                    t->slots[slot].word = words[i];
+                } else {
+                    /* holder pool exhausted mid-rollback: never lose the
+                     * slot (a leaked free slot breaks the freelist) */
+                    cap_slot_push(ti, slot);
+                }
+            }
+            m->cap_word[i] = 0;
+            cap_unlock(&obj->lock);
+        }
+        m->n_caps = 0;
+        cap_unlock(&ch->lock);
+        if (pidx != CAP_NONE) cap_msg_payload_free(pidx);
+        cap_unlock(&t->lock);
+        return CAP_ECAPREVOKED;
+    }
+
+    m->n_caps = (uint8_t)n_caps;
+    m->cookie = tag;
+    m->flags = (uint8_t)flags;
+    m->payload_len = (uint16_t)payload_len;
+    m->payload_idx = pidx;
+    ch->qtail[dest]++;
+    ch->qdepth[dest]++;
+    cap_unlock(&ch->lock);
+    cap_unlock(&t->lock);
+
+    cap_wake_chan(cobj->chan_id);
+    cap_maybe_handoff();
+    return 0;
+}
+
+/* ─── cap_recv_msg ─────────────────────────────────────────────────────────── */
+int cap_recv_msg(uint32_t pid, uint16_t ch_r_idx,
+                 void* buf, uint32_t buf_len, uint32_t* out_payload_len,
+                 uint16_t max_caps, struct SLSCapDesc* out_caps,
+                 uint16_t* out_n_caps, uint32_t* out_tag, uint32_t* out_flags) {
+    if (max_caps > CAP_MSG_MAX_CAPS) max_caps = CAP_MSG_MAX_CAPS;
+    if (out_n_caps) *out_n_caps = 0;
+    if (out_payload_len) *out_payload_len = 0;
+    if (out_tag) *out_tag = 0;
+    if (out_flags) *out_flags = 0;
+
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+    struct CapTable* t = &cap_tables[ti];
+
+    cap_lock(&t->lock);
+
+    uint64_t w = t->slots[ch_r_idx].word;
+    if (!cap_word_valid(w) ||
+        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_R ||
+        !((w >> CAP_PERM_SHIFT) & CAP_PERM_RECV)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    uint32_t chan_obj = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* cobj = cap_object_get(chan_obj);
+    if (!cobj || cobj->kind != CAP_OBJ_KIND_CHAN) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    struct CapChannel* ch = &cap_channels[cobj->chan_id];
+    if (!ch->active) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    int dir = (pid == ch->end0_pid) ? 0 : 1;
+
+    cap_lock(&ch->lock);
+    if (ch->qdepth[dir] == 0) {
+        cap_unlock(&ch->lock);
+        cap_unlock(&t->lock);
+        return CAP_EAGAIN;
+    }
+    uint32_t entry = ch->qhead[dir] % CHAN_QUEUE_DEPTH;
+    struct ChanMsg* m = &ch->q[dir][entry];
+
+    uint16_t n_installed = 0;
+    for (int i = 0; i < m->n_caps && i < max_caps; i++) {
+        if (m->cap_word[i] == 0) continue;  /* installed by an earlier
+                                             * partial recv (ETABLEFULL /
+                                             * ENOMEM retry): the word was
+                                             * zeroed; the holder already
+                                             * moved. obj_id 0 is a REAL
+                                             * object here, so a zeroed word
+                                             * must never reach the install. */
+        uint32_t obj_id =
+            (uint32_t)((m->cap_word[i] >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+        struct CapObject* obj = cap_object_get(obj_id);
+        if (!obj) continue;   /* defensive: stale word, skip */
+        cap_lock(&obj->lock);
+        if (((m->cap_word[i] >> CAP_STATE_SHIFT) & CAP_STATE_MASK)
+                == CAP_STATE_REVOKED || obj->revoking) {
+            /* Revoked in flight: revoke already accounted the holder; drain
+             * this word without installing (no double-count). */
+            m->cap_word[i] = 0;
+            cap_unlock(&obj->lock);
+            continue;
+        }
+        uint16_t nslot;
+        if (cap_slot_pop(ti, &nslot)) {
+            /* Table full: the message STAYS queued; caps already installed
+             * this call are left installed (they were moved out of the
+             * queue); retry drains the remainder. */
+            cap_unlock(&obj->lock);
+            cap_unlock(&ch->lock);
+            cap_unlock(&t->lock);
+            return CAP_ETABLEFULL;
+        }
+        uint16_t hs;
+        if (cap_holder_alloc(obj->id, HOLDER_SLOT, (uint16_t)pid, nslot, 0,
+                             &hs)) {
+            cap_slot_push(ti, nslot);
+            cap_unlock(&obj->lock);
+            cap_unlock(&ch->lock);
+            cap_unlock(&t->lock);
+            return CAP_ENOMEM;
+        }
+        cap_holder_remove(obj->id, HOLDER_QUEUE, (uint16_t)cobj->chan_id,
+                          (uint16_t)(entry * CAP_MSG_MAX_CAPS + i));
+        cap_holder_link(hs, obj);
+        t->slots[nslot].word = m->cap_word[i];
+        if (out_caps && n_installed < max_caps) {
+            out_caps[n_installed].slot = nslot;
+            out_caps[n_installed].offset = m->cap_off[i];
+            out_caps[n_installed].len = m->cap_len[i];
+            out_caps[n_installed].rights = m->cap_rights[i];
+            out_caps[n_installed].flags = m->cap_flags[i];
+        }
+        m->cap_word[i] = 0;
+        n_installed++;
+        cap_unlock(&obj->lock);
+    }
+
+    /* Drain any caps beyond max_caps (or skipped as revoked): remove each
+     * leftover queue holder, freeing the object at refcount 0 — a message
+     * must never leave holders behind when it is dequeued. */
+    for (int i = 0; i < m->n_caps; i++) {
+        if (m->cap_word[i] == 0) continue;   /* installed or revoked above */
+        uint32_t xid = (uint32_t)((m->cap_word[i] >> CAP_OBJ_SHIFT) &
+                                  CAP_OBJ_MASK);
+        struct CapObject* xo = cap_object_get(xid);
+        if (xo) {
+            cap_lock(&xo->lock);
+            cap_holder_remove(xo->id, HOLDER_QUEUE, (uint16_t)cobj->chan_id,
+                              (uint16_t)(entry * CAP_MSG_MAX_CAPS + i));
+            if (xo->refcount == 0) {
+                cap_object_free_resources(xo->id);
+                cap_object_destroy(xo->id);
+            }
+            cap_unlock(&xo->lock);
+        }
+        m->cap_word[i] = 0;
+    }
+
+    /* Copy the payload out and release the staging buffer. */
+    uint32_t copy_len = m->payload_len;
+    if (copy_len > buf_len) copy_len = buf_len;
+    if (copy_len > 0 && buf) {
+        for (uint32_t i = 0; i < copy_len; i++)
+            ((uint8_t*)buf)[i] = cap_msg_payload[m->payload_idx][i];
+    }
+    if (out_payload_len) *out_payload_len = m->payload_len;
+    if (out_tag) *out_tag = (uint32_t)m->cookie;
+    if (out_flags) *out_flags = m->flags;
+    if (out_n_caps) *out_n_caps = n_installed;
+    cap_msg_payload_free(m->payload_idx);
+    m->payload_idx = CAP_NONE;
+    m->payload_len = 0;
+    m->n_caps = 0;
+    m->flags = 0;
+    ch->qhead[dir]++;
+    ch->qdepth[dir]--;
+    cap_unlock(&ch->lock);
+    cap_unlock(&t->lock);
+    return 0;
+}
+
+/* ─── cap_arena_free ───────────────────────────────────────────────────────── */
+/* Drop ONE MEM reference: remove the slot holder (the object's arena frames
+ * return at refcount 0). Unlike cap_revoke — which nukes every holder of the
+ * object including queued copies — this only drops the caller's own slot, so
+ * a cap that was also sent on a channel survives. Lock order table < object,
+ * same as cap_revoke's slot-zeroing phase. */
+int cap_arena_free(uint32_t pid, uint16_t cap_idx) {
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+    struct CapTable* t = &cap_tables[ti];
+
+    cap_lock(&t->lock);
+    uint64_t w = t->slots[cap_idx].word;
+    if (!cap_word_valid(w) ||
+        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_MEM) {
+        cap_unlock(&t->lock);
+        return CAP_EINVAL;
+    }
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* obj = cap_object_get(obj_id);
+    if (!obj) {
+        cap_unlock(&t->lock);
+        return CAP_EINVAL;
+    }
+
+    cap_lock(&obj->lock);
+    if (obj->revoking) {
+        /* Revoke in progress: its holder walk owns this slot; leave it. */
+        cap_unlock(&obj->lock);
+        cap_unlock(&t->lock);
+        return CAP_ECAPREVOKED;
+    }
+    cap_holder_remove(obj_id, HOLDER_SLOT, (uint16_t)pid, cap_idx);
+    uint32_t freed = 0;
+    if (obj->refcount == 0) {
+        freed = cap_object_free_resources(obj_id);
+        cap_object_destroy(obj_id);
+    }
+    cap_unlock(&obj->lock);
+
+    t->slots[cap_idx].word = 0;
+    cap_slot_push(ti, cap_idx);
+    cap_unlock(&t->lock);
+
+    (void)freed;
     return 0;
 }
 
@@ -1053,8 +1536,12 @@ int cap_revoke(uint32_t pid, uint16_t cap_idx) {
         node->prev = CAP_FREELIST_END;
         if (node->kind == HOLDER_QUEUE) {
             struct CapChannel* ch = &cap_channels[node->pid];
-            ch->q[node->qdir][node->ref].cap_word =
-                cap_word_stamp_revoked(ch->q[node->qdir][node->ref].cap_word);
+            /* ref encodes (ring entry, cap index): entry*MAX + i. */
+            uint32_t entry = node->ref / CAP_MSG_MAX_CAPS;
+            uint32_t cap_i = node->ref % CAP_MSG_MAX_CAPS;
+            ch->q[node->qdir][entry].cap_word[cap_i] =
+                cap_word_stamp_revoked(
+                    ch->q[node->qdir][entry].cap_word[cap_i]);
         }
     }
     cap_unlock(&obj->lock);
@@ -1133,9 +1620,10 @@ static uint32_t cap_drain_queue(uint16_t chan_id, struct CapChannel* ch,
     while (ch->qdepth[dir] > 0) {
         uint32_t entry = ch->qhead[dir] % CHAN_QUEUE_DEPTH;
         struct ChanMsg* m = &ch->q[dir][entry];
-        if (m->has_cap) {
+        for (int i = 0; i < CAP_MSG_MAX_CAPS; i++) {
+            if (m->cap_word[i] == 0) continue;
             uint32_t obj_id =
-                (uint32_t)((m->cap_word >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                (uint32_t)((m->cap_word[i] >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
             struct CapObject* obj = cap_object_get(obj_id);
             if (obj) {
                 /* The queued word is the cap's ONLY holder node here
@@ -1144,7 +1632,8 @@ static uint32_t cap_drain_queue(uint16_t chan_id, struct CapChannel* ch,
                  * revoke it exactly as cap_revoke drains a stamped entry:
                  * remove the holder, free the object at refcount 0. */
                 cap_lock(&obj->lock);
-                cap_holder_remove(obj_id, HOLDER_QUEUE, chan_id, (uint16_t)entry);
+                cap_holder_remove(obj_id, HOLDER_QUEUE, chan_id,
+                                  (uint16_t)(entry * CAP_MSG_MAX_CAPS + i));
                 if (obj->refcount == 0) {
                     freed += cap_object_free_resources(obj_id);
                     cap_object_destroy(obj_id);
@@ -1152,9 +1641,12 @@ static uint32_t cap_drain_queue(uint16_t chan_id, struct CapChannel* ch,
                 }
                 cap_unlock(&obj->lock);
             }
-            m->has_cap = 0;
-            m->cap_word = 0;
+            m->cap_word[i] = 0;
         }
+        m->n_caps = 0;
+        m->payload_len = 0;
+        cap_msg_payload_free(m->payload_idx);
+        m->payload_idx = CAP_NONE;
         ch->qhead[dir]++;
         ch->qdepth[dir]--;
     }
@@ -1576,4 +2068,30 @@ uint64_t sys_sls_cap_unmap(struct SLSCapUnmapRequest* req) {
 uint64_t sys_sls_cap_list(void) {
     cap_list();
     return 0;
+}
+
+uint64_t sys_sls_cap_send_msg(struct SLSCapSendMsgRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    int r = cap_send_msg(cap_current_pid(), req->ch_w_idx, req->payload,
+                         req->payload_len, req->caps, req->n_caps,
+                         req->tag, req->flags);
+    return (uint64_t)(int64_t)r;
+}
+
+uint64_t sys_sls_cap_recv_msg(struct SLSCapRecvMsgRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t out_n = 0;
+    int r = cap_recv_msg(cap_current_pid(), req->ch_r_idx, req->buf,
+                         req->buf_len, &req->out_payload_len,
+                         req->max_caps, req->out_caps, &out_n,
+                         &req->out_tag, &req->out_flags);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    req->out_n_caps = out_n;
+    return 0;
+}
+
+uint64_t sys_sls_cap_arena_free(struct SLSCapArenaFreeRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    int r = cap_arena_free(cap_current_pid(), req->cap_idx);
+    return (uint64_t)(int64_t)r;
 }

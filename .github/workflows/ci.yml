@@ -256,6 +256,20 @@ jobs:
         run: make aeroidl-check
         working-directory: aerosls2
 
+      # ─── AeroIDL cross-language constant consistency ───────────────────
+      # tools/aeroidl/tests/cross_lang_constants.rs greps every channel-flag
+      # and capability-permission constant across the kernel, C SDK, Rust
+      # runtime, mocks, and generated backends and fails if any disagrees
+      # with kernel/cap.h (the source of truth). It also runs inside
+      # `make aeroidl-check` above (via the aeroidl-consistency target, so
+      # it is part of the gate); this step surfaces it as its own named
+      # check so drift — like the CHAN_FLAG_NO_REPLY 0x0002 -> 0x0001 fix —
+      # is diagnosable from the log on every push instead of being buried
+      # in the test-suite output.
+      - name: AeroIDL cross-language constant consistency
+        run: make aeroidl-consistency
+        working-directory: aerosls2
+
       # ─── AeroIDL gate teeth ────────────────────────────────────────────
       # The step above proves the gate passes; this proves it can fail.
       # tests/aeroidl_gate_smoke.sh breaks each of the four generators one
@@ -267,6 +281,19 @@ jobs:
       # toolchain and gcc, so all four teeth (including the C one) bite.
       - name: AeroIDL gate teeth (every generator must be able to fail the gate)
         run: bash tests/aeroidl_gate_smoke.sh
+        working-directory: aerosls2
+
+      # ─── AeroSLS crate: no_std target build (compile-time ABI gate) ────
+      # user/aerosls embeds the compile-time ABI const asserts (req.rs:
+      # size_of!/align_of!/offset_of! on every wire struct) into EVERY
+      # build, so a layout drift fails `cargo build` itself — not just the
+      # tests. The `target` feature is the no_std path sidecar images ship
+      # with, so building it here proves both the compile-time ABI gate and
+      # the no_std compile on every push. Reuses the toolchain installed
+      # above; `-p aerosls` builds only that member (it has no deps), so
+      # unrelated workspace members never come into play.
+      - name: AeroSLS target build (no_std compile-time ABI gate)
+        run: cargo build -p aerosls --features target --manifest-path user/Cargo.toml
         working-directory: aerosls2
 
   kernel-guards:

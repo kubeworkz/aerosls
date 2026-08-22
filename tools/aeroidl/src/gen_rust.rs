@@ -833,8 +833,10 @@ pub struct CapDescriptor {
 pub const CAP_PERM_R: u8 = 0x01;
 pub const CAP_PERM_W: u8 = 0x02;
 
-// Channel flag constants (matching transport spec)
-pub const CHAN_FLAG_NO_REPLY: u16 = 0x0002;
+// Channel flag constants — kernel message flags (kernel/cap.h ChanMsg.flags,
+// bit0 = NO_REPLY). MUST match user/libaerocap/aerosls_cap.h's
+// AEROSLS_CHAN_FLAG_NO_REPLY and the runtime's req::CHAN_FLAG_NO_REPLY.
+pub const CHAN_FLAG_NO_REPLY: u16 = 0x0001;
 
 // Capability sentinel
 pub const CAP_NONE: u16 = 0xFFFF;

@@ -69,6 +69,22 @@
 #define CAP_CHAN_MAX         64    /* channel objects */
 #define CHAN_QUEUE_DEPTH     16    /* messages per directional queue */
 
+/* ─── Phase 3 message transport (Polyglot Nexus, docs/AeroSLS-Polyglot-
+ * Nexus-Phase3-Design-v0.1.md §2.3) ────────────────────────────────────────
+ * A channel message may carry a payload (the IDL envelope: opcode + args,
+ * opaque to the kernel) plus up to CAP_MSG_MAX_CAPS moved MEM caps. The
+ * payload is staged in a fixed pool (CAP_MSG_PAYLOAD_POOL ×
+ * CAP_MSG_MAX_PAYLOAD, 8 × 4 KiB = 32 KiB static) — same fixed-pool style
+ * as the holder pool; a send whose payload would exceed the pool returns
+ * CAP_ENOSPC (fail-before-mutate, nothing queued). The 4 KiB payload bound
+ * is exactly the AeroIDL compiler's own payload ceiling, so every
+ * generated stub fits. Cap descriptors travel with the message so the
+ * receiver learns the byte-level view (offset/len/rights/flags) the IDL
+ * attached to each moved cap. */
+#define CAP_MSG_MAX_CAPS      4
+#define CAP_MSG_MAX_PAYLOAD   4096
+#define CAP_MSG_PAYLOAD_POOL  8
+
 #define CAP_ARENA_SIZE       (64u * 1024u * 1024u)
 #define CAP_ARENA_FRAMES     (CAP_ARENA_SIZE / 4096u)
 #define CAP_VIEW_MAX_PAGES   4096  /* 12-bit len field in the cap word */
@@ -92,11 +108,18 @@ struct CapSpinlock {
     volatile uint32_t v;
 };
 
-struct ChanMsg {              /* 24 bytes — fixed, preallocated in the channel */
-    uint64_t cookie;          /* user-defined tag */
-    uint64_t cap_word;        /* the MOVED capability word, or 0 when !has_cap */
-    uint8_t  has_cap;
-    uint8_t  _pad[7];
+struct ChanMsg {              /* fixed, preallocated in the channel */
+    uint64_t cookie;          /* user-defined tag (request id for Phase 3) */
+    uint16_t payload_len;     /* bytes of staged payload, 0 = none */
+    uint8_t  n_caps;          /* 0..CAP_MSG_MAX_CAPS moved caps */
+    uint8_t  flags;           /* bit0 = NO_REPLY (async) */
+    uint16_t payload_idx;     /* pool buffer index, CAP_NONE = no payload */
+    uint8_t  _pad[1];
+    uint64_t cap_word[CAP_MSG_MAX_CAPS];   /* MOVED cap words (0 = unused slot) */
+    uint32_t cap_off[CAP_MSG_MAX_CAPS];    /* byte offset into the arena region */
+    uint32_t cap_len[CAP_MSG_MAX_CAPS];    /* bytes granted */
+    uint8_t  cap_rights[CAP_MSG_MAX_CAPS]; /* R/W (never X over channels) */
+    uint8_t  cap_flags[CAP_MSG_MAX_CAPS];  /* borrowed/arena/owned */
 };
 
 /* One directional queue per end. q[0] carries messages bound FOR end0,
@@ -188,6 +211,14 @@ extern struct CapTable cap_tables[CAP_TABLE_MAX];   /* defined in cap.c */
 #define SYS_SLS_CAP_UNMAP        296
 #define SYS_SLS_CAP_LIST         297
 
+/* ─── Phase 3 message syscalls (302-304 — 298-301 are taken by Phase 1.5
+ * GETPPID / PROGRAM_SPAWN_NB / YIELD / PROGRAM_SPAWN_NB_HELD; the design
+ * doc's Appendix C numbers 298-300 collided with those and are superseded
+ * here, recorded in the doc addendum) ─────────────────────────────────── */
+#define SYS_SLS_CAP_SEND_MSG    302
+#define SYS_SLS_CAP_RECV_MSG    303
+#define SYS_SLS_CAP_ARENA_FREE  304
+
 /* ─── Request structs (single opaque arg through do_syscall, repo ABI) ───── */
 struct SLSCapCreateMemRequest {
     uint64_t phys_base;
@@ -241,6 +272,56 @@ struct SLSCapRevokeRequest {
     uint8_t  _pad[6];
 };
 
+/* Phase 3: cap descriptor passed over a channel — the IDL layer's view of
+ * a moved MEM cap (matches aerosls_cap_desc_t in the Ring-3 SDK). slot is
+ * the SENDER's table slot on send; on recv the kernel replaces it with the
+ * receiver's NEW slot index. offset/len are the byte-level region view the
+ * IDL attached; the cap word itself remains page-granular. */
+struct SLSCapDesc {
+    uint16_t slot;            /* sender's cap-table slot (u16 — MEM tables) */
+    uint32_t offset;          /* byte offset into the arena region */
+    uint32_t len;             /* bytes granted (≤ region − offset) */
+    uint8_t  rights;          /* R=0x1 W=0x2 (never X) */
+    uint8_t  flags;           /* borrowed/arena/owned (wire metadata) */
+};
+
+struct SLSCapSendMsgRequest {
+    uint16_t ch_w_idx;        /* caller's CHAN_W slot */
+    uint16_t n_caps;          /* 0..CAP_MSG_MAX_CAPS */
+    uint8_t  _pad[4];
+    uint32_t tag;             /* request id, echoed by the receiver */
+    uint32_t flags;           /* bit0 = NO_REPLY (async) */
+    uint32_t payload_len;     /* ≤ CAP_MSG_MAX_PAYLOAD */
+    uint8_t  _pad2[4];
+    void*    payload;         /* user buffer the kernel copies payload from */
+    struct SLSCapDesc caps[CAP_MSG_MAX_CAPS];   /* sender's descriptors */
+};
+
+struct SLSCapRecvMsgRequest {
+    uint16_t ch_r_idx;        /* caller's CHAN_R slot */
+    uint8_t  block;           /* accepted for ABI symmetry; kernel-side park
+                               * is Phase-1.5 territory (single-cap path), so
+                               * recv_msg always returns CAP_EAGAIN when empty
+                               * and the Ring-3 SDK retries (Phase-1 pattern) */
+    uint8_t  _pad[1];
+    uint16_t max_caps;        /* capacity of out_caps (≤ CAP_MSG_MAX_CAPS) */
+    uint8_t  _pad2[2];
+    void*    buf;             /* user buffer the kernel copies payload out to */
+    uint32_t buf_len;         /* capacity of buf */
+    uint8_t  _pad3[4];
+    uint32_t out_tag;         /* [out] request id echoed */
+    uint32_t out_flags;       /* [out] message flags */
+    uint32_t out_payload_len; /* [out] payload bytes copied to buf */
+    uint16_t out_n_caps;      /* [out] caps installed (≤ max_caps) */
+    uint8_t  _pad4[2];
+    struct SLSCapDesc out_caps[CAP_MSG_MAX_CAPS];  /* [out] installed caps */
+};
+
+struct SLSCapArenaFreeRequest {
+    uint16_t cap_idx;         /* MEM cap to drop (refcount decrement) */
+    uint8_t  _pad[6];
+};
+
 struct SLSCapMapRequest {
     uint16_t cap_idx;
     uint8_t  _pad[6];
@@ -287,6 +368,21 @@ int cap_map(uint32_t pid, uint16_t cap_idx, uint64_t vaddr, uint32_t flags);
 int cap_unmap(uint32_t pid, uint16_t cap_idx, uint64_t vaddr);
 void cap_list(void);          /* serial introspection (SYS_SLS_CAP_LIST) */
 
+/* Phase 3 message transport. cap_send_msg stages the payload into the pool
+ * and MOVES up to CAP_MSG_MAX_CAPS MEM caps into the queue; cap_recv_msg
+ * installs them into fresh slots in the receiver's table and copies the
+ * payload out. cap_arena_free drops ONE MEM reference (removing the slot
+ * holder; the object's arena frames return at refcount 0) — the single-
+ * reference analogue of cap_revoke, which nukes every holder of an object. */
+int cap_send_msg(uint32_t pid, uint16_t ch_w_idx, const void* payload,
+                 uint32_t payload_len, const struct SLSCapDesc* descs,
+                 uint16_t n_caps, uint32_t tag, uint32_t flags);
+int cap_recv_msg(uint32_t pid, uint16_t ch_r_idx,
+                 void* buf, uint32_t buf_len, uint32_t* out_payload_len,
+                 uint16_t max_caps, struct SLSCapDesc* out_caps,
+                 uint16_t* out_n_caps, uint32_t* out_tag, uint32_t* out_flags);
+int cap_arena_free(uint32_t pid, uint16_t cap_idx);
+
 /* Debug introspection for the lifecycle host test / shell. */
 uint32_t cap_debug_objid(uint32_t pid, uint16_t cap_idx);
 uint32_t cap_debug_refcount(uint32_t obj_id);
@@ -332,5 +428,8 @@ uint64_t sys_sls_cap_revoke(struct SLSCapRevokeRequest* req);
 uint64_t sys_sls_cap_map(struct SLSCapMapRequest* req);
 uint64_t sys_sls_cap_unmap(struct SLSCapUnmapRequest* req);
 uint64_t sys_sls_cap_list(void);
+uint64_t sys_sls_cap_send_msg(struct SLSCapSendMsgRequest* req);
+uint64_t sys_sls_cap_recv_msg(struct SLSCapRecvMsgRequest* req);
+uint64_t sys_sls_cap_arena_free(struct SLSCapArenaFreeRequest* req);
 
 #endif /* CAP_H */

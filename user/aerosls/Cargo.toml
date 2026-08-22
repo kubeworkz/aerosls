@@ -1,0 +1,22 @@
+[package]
+name = "aerosls"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS sidecar channel runtime — the real Ring-3 transport behind AeroIDL-generated Rust stubs (kernel syscalls 290 / 295-296 / 302-304)"
+license = "MIT"
+
+# Default (host) build is test-only: the syscall layer panics unless a fake
+# is installed by the test harness. The `target` feature enables the real
+# kernel ABI — the `syscall` instruction with rax = number, rdi = arg, the
+# exact convention of user/libsls/sls.h's `_sls_syscall` — and is what
+# sidecar images are built with:
+#
+#   cargo build --features target
+[features]
+default = []
+# Real kernel ABI: the `syscall` instruction. Sidecar images build with this.
+target = []
+# Host-build test seam: makes the fake-syscall hook installable from OUTSIDE
+# the crate (integration tests drive the runtime against an in-process fake
+# kernel). Implies std. Never enable in a sidecar image.
+host-fake = []

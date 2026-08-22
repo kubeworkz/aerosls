@@ -90,6 +90,9 @@ static const int    kern_sys_revoke = SYS_SLS_CAP_REVOKE;
 static const int    kern_sys_map    = SYS_SLS_CAP_MAP;
 static const int    kern_sys_unmap  = SYS_SLS_CAP_UNMAP;
 static const int    kern_sys_list   = SYS_SLS_CAP_LIST;
+static const int    kern_sys_send_msg = SYS_SLS_CAP_SEND_MSG;
+static const int    kern_sys_recv_msg = SYS_SLS_CAP_RECV_MSG;
+static const int    kern_sys_arena_free = SYS_SLS_CAP_ARENA_FREE;
 
 /* The SDK redefines these names with the same values by design. */
 #undef CAP_NONE
@@ -110,6 +113,7 @@ static const int    kern_sys_list   = SYS_SLS_CAP_LIST;
 #undef CAP_ECONFLICT
 
 #include "../user/libaerocap/aerocap.h"
+#include "../user/libaerocap/aerosls_cap.h"   /* Phase 3 message transport */
 
 /* ── Provisioning ABI: kernel headers first, then the SDK skin ──────────────
  * The identifiers do not collide with anything above (SLS_SYS_* / SLS_OBJ_
@@ -201,6 +205,63 @@ int main(void) {
     CHECK(offsetof(struct sls_cap_unmap_req, vaddr) == offsetof(struct SLSCapUnmapRequest, vaddr),
           "unmap.vaddr offset");
 
+    /* ── Phase 3 message transport request structs ─────────────────────── */
+    CHECK(sizeof(struct sls_cap_send_msg_req) == sizeof(struct SLSCapSendMsgRequest),
+          "send_msg req size");
+    CHECK(offsetof(struct sls_cap_send_msg_req, ch_w_idx) == offsetof(struct SLSCapSendMsgRequest, ch_w_idx),
+          "send_msg.ch_w_idx offset");
+    CHECK(offsetof(struct sls_cap_send_msg_req, n_caps) == offsetof(struct SLSCapSendMsgRequest, n_caps),
+          "send_msg.n_caps offset");
+    CHECK(offsetof(struct sls_cap_send_msg_req, tag) == offsetof(struct SLSCapSendMsgRequest, tag),
+          "send_msg.tag offset");
+    CHECK(offsetof(struct sls_cap_send_msg_req, flags) == offsetof(struct SLSCapSendMsgRequest, flags),
+          "send_msg.flags offset");
+    CHECK(offsetof(struct sls_cap_send_msg_req, payload_len) == offsetof(struct SLSCapSendMsgRequest, payload_len),
+          "send_msg.payload_len offset");
+    CHECK(offsetof(struct sls_cap_send_msg_req, payload) == offsetof(struct SLSCapSendMsgRequest, payload),
+          "send_msg.payload offset");
+    CHECK(offsetof(struct sls_cap_send_msg_req, caps) == offsetof(struct SLSCapSendMsgRequest, caps),
+          "send_msg.caps offset");
+
+    CHECK(sizeof(struct sls_cap_recv_msg_req) == sizeof(struct SLSCapRecvMsgRequest),
+          "recv_msg req size");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, ch_r_idx) == offsetof(struct SLSCapRecvMsgRequest, ch_r_idx),
+          "recv_msg.ch_r_idx offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, max_caps) == offsetof(struct SLSCapRecvMsgRequest, max_caps),
+          "recv_msg.max_caps offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, buf) == offsetof(struct SLSCapRecvMsgRequest, buf),
+          "recv_msg.buf offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, buf_len) == offsetof(struct SLSCapRecvMsgRequest, buf_len),
+          "recv_msg.buf_len offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, out_tag) == offsetof(struct SLSCapRecvMsgRequest, out_tag),
+          "recv_msg.out_tag offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, out_flags) == offsetof(struct SLSCapRecvMsgRequest, out_flags),
+          "recv_msg.out_flags offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, out_payload_len) == offsetof(struct SLSCapRecvMsgRequest, out_payload_len),
+          "recv_msg.out_payload_len offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, out_n_caps) == offsetof(struct SLSCapRecvMsgRequest, out_n_caps),
+          "recv_msg.out_n_caps offset");
+    CHECK(offsetof(struct sls_cap_recv_msg_req, out_caps) == offsetof(struct SLSCapRecvMsgRequest, out_caps),
+          "recv_msg.out_caps offset");
+
+    CHECK(sizeof(struct sls_cap_arena_free_req) == sizeof(struct SLSCapArenaFreeRequest),
+          "arena_free req size");
+    CHECK(offsetof(struct sls_cap_arena_free_req, cap_idx) == offsetof(struct SLSCapArenaFreeRequest, cap_idx),
+          "arena_free.cap_idx offset");
+
+    CHECK(sizeof(aerosls_cap_desc_t) == sizeof(struct SLSCapDesc),
+          "cap desc size");
+    CHECK(offsetof(aerosls_cap_desc_t, slot) == offsetof(struct SLSCapDesc, slot),
+          "cap desc.slot offset");
+    CHECK(offsetof(aerosls_cap_desc_t, offset) == offsetof(struct SLSCapDesc, offset),
+          "cap desc.offset offset");
+    CHECK(offsetof(aerosls_cap_desc_t, len) == offsetof(struct SLSCapDesc, len),
+          "cap desc.len offset");
+    CHECK(offsetof(aerosls_cap_desc_t, rights) == offsetof(struct SLSCapDesc, rights),
+          "cap desc.rights offset");
+    CHECK(offsetof(aerosls_cap_desc_t, flags) == offsetof(struct SLSCapDesc, flags),
+          "cap desc.flags offset");
+
     /* ── shared constants ───────────────────────────────────────────────── */
     CHECK(CAP_NONE        == kern_cap_none,   "CAP_NONE");
     CHECK(CAP_PERM_R      == kern_perm_r,     "CAP_PERM_R");
@@ -229,6 +290,9 @@ int main(void) {
     CHECK(SLS_SYS_CAP_MAP         == kern_sys_map,    "SYS_SLS_CAP_MAP");
     CHECK(SLS_SYS_CAP_UNMAP       == kern_sys_unmap,  "SYS_SLS_CAP_UNMAP");
     CHECK(SLS_SYS_CAP_LIST        == kern_sys_list,   "SYS_SLS_CAP_LIST");
+    CHECK(SLS_SYS_CAP_SEND_MSG    == kern_sys_send_msg, "SYS_SLS_CAP_SEND_MSG");
+    CHECK(SLS_SYS_CAP_RECV_MSG    == kern_sys_recv_msg, "SYS_SLS_CAP_RECV_MSG");
+    CHECK(SLS_SYS_CAP_ARENA_FREE  == kern_sys_arena_free, "SYS_SLS_CAP_ARENA_FREE");
 
     /* ── provisioning request structs (aerocap_provision.h) ────────────── */
     CHECK(sizeof(struct sls_partition_create_req) == sizeof(struct SLSPartitionCreateRequest),

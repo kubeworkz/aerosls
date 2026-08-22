@@ -874,12 +874,31 @@ simi-test: simi-tools
 
 .PHONY: simi-tools simi-test
 
+# ── aeroidl-consistency: the cross-language constant gate ──────────────────
+# tools/aeroidl/tests/cross_lang_constants.rs greps every channel-flag and
+# capability-permission constant across the kernel, C SDK, Rust runtime,
+# mocks, and generated backends and fails if any disagrees with
+# kernel/cap.h (the source of truth). This is the check that caught the
+# CHAN_FLAG_NO_REPLY 0x0002 -> 0x0001 drift class: a constant changed in
+# one language and silently wire-mismatched in the others.
+#
+# It runs inside `make aeroidl-check` (and thus CI on every push) and can
+# be run standalone with:
+#
+#   make aeroidl-consistency
+aeroidl-consistency:
+	@echo "[AEROIDL] Cross-language constant consistency (kernel/cap.h is the source of truth)..."
+	cargo test --quiet --manifest-path tools/aeroidl/Cargo.toml --test cross_lang_constants
+
 # ── aeroidl-check: the Polyglot Nexus codegen gate ──────────────────────────
 # Parses, type-checks, and generates all four backends (Rust client, Rust
 # dispatcher, Common Lisp, C header) from every .aeroidl file under idl/,
 # then COMPILES the generated code: cargo check on the Rust client +
 # dispatcher, gcc/clang on the C header (skipped gracefully when no C
-# compiler exists), and a paren-balance structural check on the Lisp.
+# compiler exists), and a paren-balance structural check on the Lisp. It
+# also runs the full AeroIDL test suite (which includes
+# cross_lang_constants) plus the dedicated aeroidl-consistency target, so
+# constant drift across languages fails the gate like any other regression.
 #
 # This is the gate --check-all exists for. A codegen change that breaks any
 # backend fails here with exit 1, so a generator regression cannot ship
@@ -896,6 +915,8 @@ aeroidl-check:
 	cargo build --manifest-path tools/aeroidl/Cargo.toml
 	@echo "[AEROIDL] Running the AeroIDL test suite..."
 	cargo test --manifest-path tools/aeroidl/Cargo.toml
+	@echo "[AEROIDL] Cross-language constants must agree with the kernel..."
+	$(MAKE) -s aeroidl-consistency
 	@echo "[AEROIDL] Checking all IDL files (all 4 backends must compile)..."
 	@fail=0; for f in $$(ls idl/*.aeroidl 2>/dev/null); do \
 		cargo run --quiet --manifest-path tools/aeroidl/Cargo.toml -- "$$f" --check-all || fail=1; \
@@ -914,7 +935,7 @@ aeroidl-check:
 aeroidl-teeth:
 	bash tests/aeroidl_gate_smoke.sh
 
-.PHONY: aeroidl-check aeroidl-teeth
+.PHONY: aeroidl-check aeroidl-teeth aeroidl-consistency
 
 # ── bundle: regenerate kernel/webapp_bundle.c from ../slsos-sim/dist ──────
 # The committed kernel/webapp_bundle.c is CANONICAL -- CI and the deploy both

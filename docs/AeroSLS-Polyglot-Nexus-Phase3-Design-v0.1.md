@@ -1206,6 +1206,14 @@ int main(void) {
 | `tools/aeroidl/README.md` | IDL compiler reference |
 | `tools/aeroidl/gen/calculator.h` | Generated C header (caller side) |
 | `tools/aeroidl/gen/calculator.lisp` | Generated Lisp FFI (callee side) |
+| `kernel/cap.h` | Message syscalls 302-304, `SLSCapDesc`, request structs, extended `ChanMsg` |
+| `kernel/cap.c` | `cap_send_msg` / `cap_recv_msg` / `cap_arena_free`, payload pool, multi-cap holders |
+| `kernel/syscall_dispatch.c` | Dispatch wiring for 302-304 |
+| `user/libaerocap/aerosls_cap.h` | Ring-3 channel runtime behind the generated C stubs (real transport) |
+| `user/aerosls/` | Ring-3 channel runtime behind the generated RUST stubs: `chan_send`/`chan_recv`/`arena_alloc`/`arena_free`/`arena_mem`/`next_request_id`, same syscalls + framing as the C library (`target` feature = real ABI; `host-fake` = test seam) |
+| `tests/cap_msg_host_test.c` | Host test: message round-trip, zero-copy arena read, arena_free, hygiene |
+| `tests/aerocap_abi_host_test.c` | ABI pinning extended to the Phase 3 request structs + syscall numbers |
+| `tools/aeroidl/tests/e2e_real_transport.rs` | Generated calculator client + dispatcher LINKED against the real `aerosls` runtime, full `add(5,3) → Ok(8)` round trip over an in-process fake kernel |
 
 ## Appendix B — capability word layout (reference)
 
@@ -1227,6 +1235,22 @@ Phase 3 additions:
 
 ## Appendix C — syscall additions (Phase 3)
 
+### As implemented (v0.2)
+
+| Syscall number | Name | Purpose |
+|----------------|------|---------|
+| 302 | `SYS_SLS_CAP_SEND_MSG` | Send a channel message: staged payload + up to 4 moved MEM caps (§2.3) |
+| 303 | `SYS_SLS_CAP_RECV_MSG` | Receive a message: payload copied out, caps installed into fresh slots |
+| 304 | `SYS_SLS_CAP_ARENA_FREE` | Drop ONE MEM reference; arena frames return at refcount 0 |
+
+**Superseded numbers:** the draft's 298-300 collided with Phase 1.5 syscalls
+already in the tree (`GETPPID` 298, `PROGRAM_SPAWN_NB` 299, `YIELD` 300,
+`PROGRAM_SPAWN_NB_HELD` 301), so the implemented transport moved to 302-304.
+The trampoline syscalls (draft 299/300) are NOT yet implemented; when they
+land they should take 305-306.
+
+### As designed (v0.1, superseded)
+
 | Syscall number | Name | Purpose |
 |----------------|------|---------|
 | 298 | `SYS_SLS_ARENA_FREE` | Decrement refcount on arena object; free at 0 |
@@ -1236,3 +1260,45 @@ Phase 3 additions:
 The inline trampoline path (§5.4) uses `WRPKRU + JMP` directly from user
 space. `SYS_SLS_TRAMPOLINE_CALL` exists for callers that cannot use inline
 assembly (e.g., interpreted languages).
+
+**Implementation deltas from the draft** (this is the record of what the
+code actually does, for the Appendix A file inventory):
+
+- The kernel message envelope is payload-opaque: it stages the IDL bytes in
+a fixed 8 × 4 KiB pool, moves the caps, and echoes the tag. The
+`[opcode u16][payload_len u32]` request header is the Ring-3 library's
+concern (`user/libaerocap/aerosls_cap.h`), matching what the generated
+dispatcher parses — the kernel never interprets it.
+- **Flags are bit0-only.** The draft's envelope table (§2.3, "bit0 REPLY |
+bit1 NO_REPLY") describes a request/response pairing the implementation
+never adopted: replies are a user-level convention (opcode 0 = response),
+so the kernel `ChanMsg.flags` field carries a single bit — bit0 =
+`NO_REPLY` (async, `0x0001`) — matching the IDL payload table's "bit0 =
+async" line. The same value is used verbatim by all three Ring-3
+runtimes: C (`AEROSLS_CHAN_FLAG_NO_REPLY`), Rust runtime
+(`req::CHAN_FLAG_NO_REPLY`), and the AeroIDL Rust generator's emitted
+`CHAN_FLAG_NO_REPLY` constant, so a message's async flag reads the same
+in every language. (The separate sidecar-channels transport spec's
+`F_NO_REPLY = 0x0002` is a different envelope and is unaffected.)
+- Cap descriptors (`struct SLSCapDesc`, 16 bytes) travel with each message:
+sender slot, byte offset/len into the arena region, rights, flags. On recv
+the kernel installs each cap into a fresh receiver slot and rewrites the
+descriptor's `slot` field — the SEND_CAP / RECV_CAP sequence of §2.2.
+- Recv is non-blocking (returns `CAP_EAGAIN` on empty); the Ring-3 SDK
+retries. The kernel-side park/wake is Phase-1.5 territory (single-cap path)
+and is not extended to messages in this milestone. The Rust runtime's
+`chan_recv` reports `CAP_EAGAIN` faithfully; the generated Rust client is a
+single-shot poll, so a real deployment needs the caller to retry (or the
+kernel park, once extended).
+- Both Ring-3 runtimes (C: `user/libaerocap/aerosls_cap.h`; Rust:
+`user/aerosls`) speak the identical wire format: requests get the
+`[opcode u16][payload_len u32]` header, replies (opcode 0) are raw, and the
+request structs are byte-for-byte the kernel's. The Rust runtime adds
+`CAP_PERM_MAP` to every `arena_alloc` so `arena_mem` can map the buffer
+(the C library does the same), and maps caps on demand into a reserved
+32 TiB region (64 slots × 16 MiB).
+- `SYS_SLS_CAP_ARENA_FREE` (304) is the single-reference analogue of
+`cap_revoke`: it drops the caller's own slot holder and frees the object's
+arena frames only at refcount 0, so caps already sent on a channel survive.
+- Payload pool is 8 buffers; a send whose payload exceeds a free buffer
+returns `CAP_ENOSPC` before touching the queue (fail-before-mutate).

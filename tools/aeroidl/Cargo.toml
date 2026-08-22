@@ -21,6 +21,10 @@ path = "tests/parse_each.rs"
 name = "e2e_codegen"
 path = "tests/e2e_codegen.rs"
 
+[[test]]
+name = "cross_lang_constants"
+path = "tests/cross_lang_constants.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

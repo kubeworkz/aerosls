@@ -26,6 +26,24 @@
 #   lisp      gen_lisp.rs        defconstant loses its closing paren      -> paren check fails
 #   c         gen_c.rs           opcode #define gains `syntax_error`    -> gcc/clang fails
 #
+# The fifth through tenth teeth are different: they do not break a
+# generator but a CONSTANT, a STRUCT LAYOUT, the BUILD-TIME ABI gate,
+# KERNEL-SIDE drift, a SYSCALL NUMBER, and the DISPATCH WIRING. Tooth 5
+# flips CHAN_FLAG_NO_REPLY in the Rust mock (0x0001 -> 0x0002); tooth 6
+# narrows `offset` in the runtime's CapDesc (u32 -> u16); tooth 8 widens
+# `len` in the KERNEL's SLSCapDesc (u32 -> u64); tooth 9 bumps
+# SYS_CAP_SEND_MSG (302 -> 303); tooth 10 renames a case label in
+# syscall_dispatch.c — all five require the cross_lang_constants test to
+# fail. Tooth 7 widens `pad` in FfiCapDescriptor (u16 -> u32) and requires
+# the AEROSLS CRATE'S OWN cargo BUILD to fail on the compile-time const
+# asserts in req.rs (nothing else reads `pad`, so only the build gate
+# notices). The consistency test greps/parses files directly and the const
+# asserts run at compile time, so no separate test binary is involved —
+# cargo recompiles as needed. These prove the ABI gate bites from every
+# direction: Ring-3 constants, Ring-3 wire layout, the compiled Rust
+# layout, the kernel source, the syscall-number contract, and the dispatch
+# wiring that turns a number into a handler.
+#
 # The C tooth needs a C compiler: without one, check_c skips by design and
 # the gate cannot be made to fail on it, so it is reported as SKIP rather
 # than silently passed. (CI's self-hosted runner has gcc, so it runs there.)
@@ -48,6 +66,10 @@ GEN_LISP=tools/aeroidl/src/gen_lisp.rs
 GEN_C=tools/aeroidl/src/gen_c.rs
 GEN_RUST=tools/aeroidl/src/gen_rust.rs
 GEN_DISP=tools/aeroidl/src/gen_dispatcher.rs
+MOCK_RUST=tools/aeroidl/tests/mock_aerosls/src/lib.rs
+REQ_RUST=user/aerosls/src/req.rs
+KERNEL_CAP_H=kernel/cap.h
+KERNEL_DISPATCH=kernel/syscall_dispatch.c
 
 pass=0; fail=0
 ok()  { echo "ok:   $1"; pass=$((pass+1)); }
@@ -179,6 +201,100 @@ else
     skip "c header — no C compiler found (gcc/clang/cc/tcc); check_c skips by design"
 fi
 
+# 5–7 mutate req.rs/mock sources and require a CHECK to fail: the
+# cross_lang_constants test (tooth 5 constants, tooth 6 wire layout) or the
+# aerosls crate's own cargo build (tooth 7 — the compile-time const asserts
+# in req.rs, which fail the BUILD on layout drift).
+# mutate_tooth <name> <file> <sed-mutation> <check-command>
+# The check command is eval'd; a zero exit means the gate did not notice the
+# drift and is blind. The command must not emit anything (stderr suppressed).
+mutate_tooth() {
+    local name="$1" file="$2" mutation="$3" check_cmd="$4"
+    local snap; snap="${file}.smoke.bak"
+
+    cp "$file" "$snap" || { bad "$name: cannot snapshot $file"; return; }
+    trap "mv -f \"$snap\" \"$file\" 2>/dev/null; rm -f \"$snap\"" EXIT
+
+    if ! sed -i "$mutation" "$file"; then
+        bad "$name: sed failed to apply mutation"
+        restore_checked "$name" "$file" "$snap"; return
+    fi
+    if cmp -s "$file" "$snap"; then
+        bad "$name: mutation did not apply — the pattern no longer matches
+            $file, so this smoke is testing nothing. Fix the pattern."
+        restore_checked "$name" "$file" "$snap"; return
+    fi
+    touch "$file"
+    ok "$name: mutation applied"
+
+    if eval "$check_cmd" >/dev/null 2>&1; then
+        bad "$name: the check did NOT fail on the drift. It is blind."
+    else
+        ok "$name: check failed as required (drift detected)"
+    fi
+
+    restore_checked "$name" "$file" "$snap"
+}
+
+# The check command for the consistency teeth: the cross-language test.
+CONSISTENCY_CHECK="cargo test --quiet --test cross_lang_constants --manifest-path $MANIFEST"
+
+# 5. Cross-language constants: flip CHAN_FLAG_NO_REPLY in the Rust mock. The
+#    cross_lang_constants test greps every constant against kernel/cap.h and
+#    must fail — this is the exact drift class the check exists for. No
+#    compiler rebuild is needed: the mock is a test dependency, so `cargo
+#    test` recompiles it automatically.
+mutate_tooth "constants" "$MOCK_RUST" \
+    's@pub const CHAN_FLAG_NO_REPLY: u16 = 0x0001;@pub const CHAN_FLAG_NO_REPLY: u16 = 0x0002;@' \
+    "$CONSISTENCY_CHECK"
+
+# 6. Wire struct layout: narrow `offset` in the runtime's CapDesc (u32 ->
+#    u16). The cross_lang_constants layout engine computes offsets/sizes from
+#    the file and must fail on the drift — which propagates into
+#    SendMsgReq/RecvMsgReq too, since they embed the descriptor. (The first
+#    `pub offset: u32,` in req.rs is CapDesc's; FfiCapDescriptor comes later.)
+mutate_tooth "struct layout" "$REQ_RUST" \
+    '0,/pub offset: u32,/s/pub offset: u32,/pub offset: u16,/' \
+    "$CONSISTENCY_CHECK"
+
+# 7. Build-time ABI gate: widen `pad` in FfiCapDescriptor (u16 -> u32). The
+#    compile-time const asserts in req.rs make the AEROSLS CRATE'S OWN BUILD
+#    fail (size_of::<FfiCapDescriptor>() == 16) — nothing else reads `pad`,
+#    so the cross-language test still passes and only the build gate notices.
+#    This proves the const asserts bite in CI, not just in a local build.
+mutate_tooth "build-time ABI" "$REQ_RUST" \
+    '0,/pub pad: u16,/s/pub pad: u16,/pub pad: u32,/' \
+    "cargo build --quiet -p aerosls --manifest-path user/Cargo.toml"
+
+# 8. Kernel-side drift: widen `len` in the KERNEL's SLSCapDesc (u32 -> u64).
+#    The compile-time const asserts in req.rs cannot see cap.h (they pin the
+#    Rust structs against hardcoded numbers), so the aerosls build stays
+#    green; the drift is caught by the cross-language test, which parses the
+#    kernel as the comparison baseline — kernel_wire_layouts_anchored fails
+#    the moment the kernel deviates from the ABI table, and the descriptor
+#    consistency checks fail the moment the SDK/mocks/generated copies
+#    disagree with the mutated kernel. This proves the gate catches drift
+#    from the KERNEL side, not just from the Ring-3 runtimes.
+mutate_tooth "kernel-side drift" "$KERNEL_CAP_H" \
+    '0,/uint32_t len;/s/uint32_t len;/uint64_t len;/' \
+    "$CONSISTENCY_CHECK"
+
+# 9. Syscall numbers: bump SYS_CAP_SEND_MSG in the Rust runtime (302 -> 303).
+#    Only the runtime defines this name, so only the cross-language syscall
+#    pin notices — it catches the exact class of drift that would make a
+#    sidecar call the wrong kernel entry point.
+mutate_tooth "syscall numbers" "$REQ_RUST" \
+    '0,/SYS_CAP_SEND_MSG: u64 = 302;/s/SYS_CAP_SEND_MSG: u64 = 302;/SYS_CAP_SEND_MSG: u64 = 303;/' \
+    "$CONSISTENCY_CHECK"
+
+# 10. Dispatch wiring: rename a case label in the kernel's syscall dispatch.
+#     The dispatch_cases_wired test requires every cap-family case label to
+#     be a kernel/cap.h macro and every kernel syscall to reach a case — a
+#     renamed case (or a syscall defined but never dispatched) fails it.
+mutate_tooth "dispatch wiring" "$KERNEL_DISPATCH" \
+    '0,/case SYS_SLS_CAP_SEND_MSG:/s/case SYS_SLS_CAP_SEND_MSG:/case SYS_SLS_CAP_SEND_MSX:/' \
+    "$CONSISTENCY_CHECK"
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 echo
@@ -195,10 +311,25 @@ else
     printf '%s\n' "$out" | sed 's/^/        /'
 fi
 
-# The four generator files must be byte-identical to what the run started
-# with — this smoke must never leave a footprint behind.
+# The consistency test must pass on the restored tree too.
+if eval "$CONSISTENCY_CHECK" >/dev/null 2>&1; then
+    ok "constants restored — the consistency test passes again"
+else
+    bad "the consistency test still fails after the teeth were removed"
+fi
+
+# The build-time ABI gate must pass on the restored tree too.
+if cargo build --quiet -p aerosls --manifest-path user/Cargo.toml >/dev/null 2>&1; then
+    ok "aerosls restored — the build-time ABI gate passes again"
+else
+    bad "the aerosls build still fails after the teeth were removed"
+fi
+
+# The four generator files + the mock + the runtime + the kernel header must
+# be byte-identical to what the run started with — this smoke must never
+# leave a footprint.
 dirty=0
-for f in "$GEN_RUST" "$GEN_DISP" "$GEN_LISP" "$GEN_C"; do
+for f in "$GEN_RUST" "$GEN_DISP" "$GEN_LISP" "$GEN_C" "$MOCK_RUST" "$REQ_RUST" "$KERNEL_CAP_H" "$KERNEL_DISPATCH"; do
     # The snapshot was removed on restore; git diff against the committed
     # state is the wrong baseline (this worktree has uncommitted fixes), so
     # prove the FILE changed during the run only if the trap misfired:

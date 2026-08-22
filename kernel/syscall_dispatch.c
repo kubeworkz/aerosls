@@ -545,6 +545,19 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_CAP_LIST:
         sys_sls_cap_list(); return 0;
 
+    // ─── Polyglot Nexus Phase 3: message transport (302-304) ────────────
+    // docs/AeroSLS-Polyglot-Nexus-Phase3-Design-v0.1.md §2.2-2.3. The
+    // message syscalls carry an IDL payload plus up to CAP_MSG_MAX_CAPS
+    // moved MEM caps; the framing/opcode header is the user library's
+    // concern (the kernel envelope is payload-opaque). SYS_SLS_CAP_ARENA_FREE
+    // drops a single MEM reference (arena frames return at refcount 0).
+    case SYS_SLS_CAP_SEND_MSG:
+        return sys_sls_cap_send_msg((struct SLSCapSendMsgRequest*)arg);
+    case SYS_SLS_CAP_RECV_MSG:
+        return sys_sls_cap_recv_msg((struct SLSCapRecvMsgRequest*)arg);
+    case SYS_SLS_CAP_ARENA_FREE:
+        return sys_sls_cap_arena_free((struct SLSCapArenaFreeRequest*)arg);
+
     // ─── Seed Kernel Phase 1, two-party verification (298) ───────────────
     // Child resolves its spawner's pid so it can mint a channel's far-end
     // caps directly into the parent's capability table.

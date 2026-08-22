@@ -9,7 +9,7 @@
 
 pub const CAP_PERM_R: u8 = 0x01;
 pub const CAP_PERM_W: u8 = 0x02;
-pub const CHAN_FLAG_NO_REPLY: u16 = 0x0002;
+pub const CHAN_FLAG_NO_REPLY: u16 = 0x0001;
 pub const CAP_NONE: u16 = 0xFFFF;
 
 // ── Types ──────────────────────────────────────────────────────────────────
