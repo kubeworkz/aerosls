@@ -8,7 +8,10 @@
 ;;;   2. latency benchmark: 1000 add() round trips into Lisp (the host
 ;;;      times each call with rdtsc inside the call_add import and reports
 ;;;      median/p99 after run)
-;;;   3. sqrt_batch over N=4096 f64s       (arena array handed by capability)
+;;;   3. latency benchmark: 100 sqrt_batch calls, each moving a 4096-f64
+;;;      array through the shared arena by MEM cap (the host times each
+;;;      call_sqrt_batch import and reports a second median/p99 line)
+;;;   4. sqrt_batch over N=4096 f64s       (arena array handed by capability)
 ;;;
 ;;; The array itself never crosses the wire: the guest writes it into the
 ;;; shared arena through host_* imports (which address the shared mapping
@@ -43,6 +46,7 @@
     (local $r i64) (local $r2 i64)
     (local $status i32) (local $n i32) (local $in_cap i32) (local $i i32)
     (local $out_cap i32) (local $v f64) (local $err f64)
+    (local $j i32)
 
     ;; ── add(2, 3) must return 5 ───────────────────────────────────────────
     (local.set $r (call $call_add (i32.const 2) (i32.const 3)))
@@ -66,6 +70,33 @@
         (drop (call $call_add (i32.const 7) (i32.const 8)))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $bench)))
+
+    ;; ── sqrt_batch latency bench: 100 calls, 4096-f64 arena array each ──
+    ;; fresh input buffer per iteration (the host times call_sqrt_batch),
+    ;; results are owned caps we release immediately; correctness is covered
+    ;; by the single verified call below.
+    (local.set $i (i32.const 0))
+    (block $sqrt_bench_done
+      (loop $sqrt_bench
+        (br_if $sqrt_bench_done (i32.ge_u (local.get $i) (i32.const 100)))
+        (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
+        (local.set $j (i32.const 0))
+        (block $sqrt_fill_done
+          (loop $sqrt_fill
+            (br_if $sqrt_fill_done (i32.ge_u (local.get $j) (local.get $n)))
+            (call $write_f64
+              (local.get $in_cap)
+              (local.get $j)
+              (i64.reinterpret_f64 (f64.convert_i32_u (local.get $j))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $sqrt_fill)))
+        (local.set $r2 (call $call_sqrt_batch (local.get $n) (local.get $in_cap)))
+        (local.set $out_cap
+          (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff))))
+        (call $arena_free (local.get $out_cap))
+        (call $arena_free (local.get $in_cap))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $sqrt_bench)))
 
     ;; ── sqrt_batch: N = 4096 f64s through the shared arena ───────────────
     (local.set $n (i32.const 4096))

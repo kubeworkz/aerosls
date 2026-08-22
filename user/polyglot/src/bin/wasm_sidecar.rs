@@ -35,6 +35,8 @@ static CAP_TABLE: Mutex<Vec<(u16, u32, u32)>> = Mutex::new(Vec::new());
 static MAP_BASE: AtomicUsize = AtomicUsize::new(0);
 /// rdtsc round-trip samples collected inside the `call_add` host import.
 static BENCH_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// rdtsc samples for the arena-cap path, collected inside `call_sqrt_batch`.
+static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// Monotonic cycle counter for round-trip timing. On x86_64 this is the real
 /// TSC (constant-rate on modern CPUs); elsewhere it falls back to monotonic
@@ -184,6 +186,23 @@ fn pack(status: i64, value: u64) -> i64 {
     ((status as u64) << 32 | value) as i64
 }
 
+/// Print `BENCH_{tag}: ...` with median/p99/mean in cycles. The first sample
+/// is dropped (the guest's verification call — the cold path).
+fn print_bench(tag: &str, samples: &[u64], note: &str) {
+    let samples = samples.get(1..).unwrap_or(&samples[..]);
+    if !samples.is_empty() {
+        let mut s = samples.to_vec();
+        s.sort_unstable();
+        let n = s.len();
+        let median = s[n / 2];
+        let p99 = s[((n as f64 * 0.99) as usize).min(n - 1)];
+        let mean = s.iter().sum::<u64>() / n as u64;
+        println!("BENCH_{tag}: N={n} wasm->lisp->wasm median={median} p99={p99} mean={mean} cycles ({note})");
+    } else {
+        println!("BENCH_{tag}: no round-trip samples ({note})");
+    }
+}
+
 fn main() {
     let mut port = 0u16;
     let mut arena_path = String::new();
@@ -267,14 +286,19 @@ fn main() {
             |_caller: wasmi::Caller<'_, ()>, count: i32, input_cap: i32| -> i64 {
                 let count = count as u32;
                 let cap = input_cap as u16;
-                match gen_calculator::calculator_service::sqrt_batch(
+                let t0 = rdtsc();
+                let r = match gen_calculator::calculator_service::sqrt_batch(
                     gen_calculator::ArenaSlice::<f64>::new(cap, count),
                     cap,
                     count,
                 ) {
                     Ok(slice) => pack(0, slice.cap as u64),
                     Err(e) => pack(1, e.code as u64),
-                }
+                };
+                // Arena-cap round trip: the data stays in the shared mapping;
+                // only the MEM cap + refcounts cross the transport.
+                BENCH_SQRT_SAMPLES.lock().unwrap().push(rdtsc().wrapping_sub(t0));
+                r
             },
         )
         .unwrap();
@@ -336,24 +360,13 @@ fn main() {
 
     let status = run.call(&mut store, ()).expect("guest run");
 
-    // ── latency report: median/p99 of the guest's add() round trips ───────
-    let samples = {
-        let mut s = BENCH_SAMPLES.lock().unwrap();
-        s.sort_unstable();
-        std::mem::take(&mut *s)
-    };
-    // Drop the first sample — the guest's verification add(2,3), i.e. the
-    // cold path (warmup for connection/TCP/buffers).
-    let samples = samples.get(1..).unwrap_or(&samples[..]);
-    if !samples.is_empty() {
-        let n = samples.len();
-        let median = samples[n / 2];
-        let p99 = samples[((n as f64 * 0.99) as usize).min(n - 1)];
-        let mean = samples.iter().sum::<u64>() / n as u64;
-        println!("BENCH: N={n} wasm->lisp->wasm median={median} p99={p99} mean={mean} cycles");
-    } else {
-        println!("BENCH: no round-trip samples (guest did not call add)");
-    }
+    // ── latency reports: median/p99 of the guest's round trips ────────────
+    // Drop the first sample of each leg — the guest's verification calls,
+    // i.e. the cold path (warmup for connection/TCP/buffers).
+    let add_samples = std::mem::take(&mut *BENCH_SAMPLES.lock().unwrap());
+    let sqrt_samples = std::mem::take(&mut *BENCH_SQRT_SAMPLES.lock().unwrap());
+    print_bench("ADD", &add_samples, "add() — inline args");
+    print_bench("SQRT", &sqrt_samples, "sqrt_batch(4096 f64) — arena MEM cap");
 
     if status == 0 {
         println!("WASM_SIDECAR PASS");
