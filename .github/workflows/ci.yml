@@ -297,6 +297,12 @@ jobs:
         working-directory: aerosls2
 
   polyglot-e2e:
+    # actions: write is needed for upload-artifact (the bench archive) and
+    # for listing/downloading the previous run's artifact (drift baseline).
+    permissions:
+      contents: read
+      actions: write
+
     # The Polyglot Nexus two-process e2e: sls-kerneld (arena + channel
     # queues over TCP) + the wasmi-embedded Wasm sidecar + a real SBCL Lisp
     # sidecar, all on one channel with a large byte array travelling through
@@ -403,6 +409,105 @@ jobs:
           name: polyglot-bench-latency
           path: aerosls2/bench-polyglot.jsonl
           if-no-files-found: error
+
+      # Soft drift baseline: fetch the NEWEST completed-run artifact of the
+      # same name, excluding the artifact this run is about to produce (the
+      # archive step above just uploaded it) and any in-progress run. Pure
+      # advisory — if the API is unreachable, auth is missing, or this is
+      # the first run, skip gracefully (the drift step below then has no
+      # baseline and prints a notice instead of comparing).
+      - name: Download previous bench baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          api="https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=polyglot-bench-latency&per_page=10"
+          list="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$api" || true)"
+          if [ -z "$list" ]; then
+            echo "no previous artifact list (API unreachable / no auth) — skipping drift check"
+            exit 0
+          fi
+          id="$(printf '%s' "$list" | GH_RUN_ID="$GITHUB_RUN_ID" python3 -c '
+          import json, os, sys
+          run = os.environ.get("GH_RUN_ID", "")
+          for a in json.load(sys.stdin).get("artifacts", []):
+              wr = a.get("workflow_run") or {}
+              if str(wr.get("id", "")) == run:
+                  continue
+              if wr.get("status") != "completed":
+                  continue
+              print(a["id"])
+              break
+          ')"
+          if [ -z "$id" ]; then
+            echo "no previous completed-run artifact — first run (or API permission missing)"
+            exit 0
+          fi
+          echo "previous artifact id=$id"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$id/zip" \
+            -o previous-bench.zip
+          GH_FILE=previous-bench.zip python3 -c '
+          import os, zipfile
+          zipfile.ZipFile(os.environ["GH_FILE"]).extractall("previous-bench")
+          '
+          # The uploaded artifact preserves the checkout-relative path (e.g.
+          # aerosls2/bench-polyglot.jsonl); normalize to a flat location so
+          # the drift step can read it without knowing that structure.
+          found="$(find previous-bench -name bench-polyglot.jsonl | head -1)"
+          if [ -z "$found" ]; then
+            echo "previous artifact has no bench-polyglot.jsonl — skipping drift check"
+            exit 0
+          fi
+          cp "$found" previous-bench/bench-polyglot.jsonl
+          echo "baseline ready: previous-bench/bench-polyglot.jsonl"
+        working-directory: aerosls2
+
+      # Soft drift warning: compare each leg's median against the previous
+      # run's baseline and emit a ::warning:: annotation when it grew >= 2x
+      # — advisory only, never fails the build. The hard 5ms gate in the
+      # e2e step is the actual failure boundary; this surfaces drift well
+      # before that, so a slow 2-4x regression shows up as a warning even
+      # while still under the threshold.
+      - name: Warn on latency drift vs previous baseline (soft)
+        run: |
+          set -e
+          if [ ! -f previous-bench/bench-polyglot.jsonl ]; then
+            echo "no previous baseline — nothing to compare (first run)"
+            exit 0
+          fi
+          python3 - <<'EOF'
+          def load(path):
+              out = {}
+              for ln in open(path):
+                  ln = ln.strip()
+                  if not ln or "BENCH_JSON" not in ln:
+                      continue
+                  try:
+                      j = json.loads(ln.split("BENCH_JSON ", 1)[1])
+                  except Exception:
+                      continue
+                  out[j.get("leg")] = j
+              return out
+
+          import json
+          cur = load("bench-polyglot.jsonl")
+          prev = load("previous-bench/bench-polyglot.jsonl")
+          if not prev:
+              print("no previous baseline legs — nothing to compare (first run)")
+              raise SystemExit(0)
+          for leg in sorted(cur):
+              c, p = cur[leg], prev.get(leg)
+              if not p or not p.get("median_ns"):
+                  print(f"info: {leg}: no previous baseline — skipping")
+                  continue
+              cmed, pmed = c["median_ns"], p["median_ns"]
+              ratio = cmed / pmed if pmed else float("inf")
+              print(f"info: {leg}: median {cmed} ns vs previous {pmed} ns ({ratio:.2f}x)")
+              if ratio >= 2.0:
+                  print(f"::warning::latency drift: {leg} median {cmed} ns is {ratio:.2f}x the previous run's {pmed} ns — investigate before the hard 5ms gate trips")
+          EOF
+        working-directory: aerosls2
 
       # ─── Polyglot latency gate teeth ───────────────────────────────────
       # The step above proves the gate passes; this proves it can fail.
