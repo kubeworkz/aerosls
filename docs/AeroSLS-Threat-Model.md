@@ -226,3 +226,244 @@ A detailed security audit plan can be derived from the threats and invariants li
 ---
 
 *This document is a living artifact. Update it as the architecture evolves and new threats are identified.*
+
+---
+
+## AeroSLS Security Audit Plan
+
+### 0. First, Pin Down the Trust Model
+
+Before any audit, you need to answer these about the actual implementation:
+
+- Do all sidecars share **one virtual address space**, or does each sidecar have its own address space with shared arenas mapped in?
+- If they share one address space, is isolation enforced by **MPK/PKU**, **CHERI**, or only language memory safety?
+- Do sidecars run in **user mode** or in the **same privilege ring** as the kernel?
+- Is an **IOMMU** present and enabled for all DMA?
+- What languages are the sidecars written in? Rust? C? Lisp? WASM?
+
+These answers determine whether your isolation boundary is page tables, protection keys, or software fault isolation — and that changes the whole audit.
+
+---
+
+### 1. Define the Security Invariants
+
+##### The audit should prove these properties hold:
+
+<table>
+  <tr><th>#</th><th>Invariant</th></tr>
+  <tr><td>I1</td><td>Capabilities are unforgeable. A sidecar cannot create a capability it was not granted.</td></tr>
+  <tr><td>I2</td><td>Capability transfer is atomic. A capability cannot be duplicated or lost during cap_send/cap_recv.</td></tr>
+  <tr><td>I3</td><td>Revocation is total. Once a capability is revoked, no alias or copy can continue to grant access.</td></tr>
+  <tr><td>I4</td><td>Memory isolation holds. A sidecar can read/write/execute only memory mapped by a MEM cap it holds.</td></tr>
+  <tr><td>I5</td><td>Channels preserve integrity and ordering. Messages cannot be spoofed, replayed, or reordered by another sidecar.</td></tr>
+  <tr><td>I6</td><td>DMA is confined. Devices can only access physical memory granted via DMA_MEM caps.</td></tr>
+  <tr><td>I7</td><td>Interrupts are directed. An IRQ message is delivered only to the sidecar holding the corresponding IRQ cap.</td></tr>
+  <tr><td>I8</td><td>Resource limits are enforced. A malicious sidecar cannot exhaust kernel resources or starve others.</td></tr>
+</table>
+
+---
+
+### 2. Threat Model
+
+##### Assume these attackers:
+
+<table>
+  <tr><th>Attacker</th><th>Goal</th><th>Primary Attack Surface</th></tr>
+  <tr><td>Malicious sidecar author</td><td>Escape capability table, read other sidecars’ memory, forge caps</td><td>Cap syscalls, channel parser, shared memory manager</td></tr>
+  <tr><td>Compromised POSIX application</td><td>Break out of POSIX sidecar, reach kernel or other sidecars</td><td>POSIX VFS, fd/cap mapping, fork/exec inheritance</td></tr>
+  <tr><td>Remote attacker via network</td><td>Compromise NIC driver or TCP/IP sidecar, inject malicious packets</td><td>Driver sidecar, packet parsing, DMA buffers</td></tr>
+  <tr><td>Malicious or buggy device</td><td>DMA attacks, spoofed interrupts, MMIO abuse</td><td>IOMMU, IRQ channel, driver capabilities</td></tr>
+  <tr><td>Local user with physical access</td><td>Boot chain tampering, memory probing, JTAG</td><td>Firmware, secure boot, hardware root of trust</td></tr>
+  <tr><td>Supply chain attacker</td><td>Malicious driver/sidecar shipped in image</td><td>Manifest parser, initial capability grants</td></tr>
+</table>
+
+---
+
+### 3. Attack Surface by Phase
+
+Each phase you built has its own weak points.
+
+#### Phase 1 — Seed Kernel
+
+- Capability table index reuse after revoke → use‑after‑free of a capability slot.
+- Double‑free or capability duplication in `cap_send`/`cap_recv`.
+- Missing TLB shootdown after revocation → stale memory mapping.
+- Channel queue overflow / unbounded message queuing → DoS.
+- Integer overflow in memory size or offset calculations.
+
+#### Phase 2 — POSIX Sidecar
+
+- File descriptor ↔ capability mapping confusion.
+- Path traversal in the VFS layer.
+- `fork`/`exec` inheriting more capabilities than intended.
+- Race conditions between `open`, `read`, and capability revocation.
+
+#### Phase 3 — Polyglot Nexus
+
+- IDL deserialization type confusion.
+- Buffer overread/overflow in generated marshalling code.
+- Cross‑language garbage collection mismatches → use‑after‑free across sidecars.
+- A malicious WASM/Lisp function passing a forged capability via a channel message.
+
+#### Phase 4 — Device Drivers
+
+- DMA outside granted `DMA_MEM` regions if IOMMU is absent or misconfigured.
+- MMIO access outside the device’s BAR through a malformed `IO_PORT` cap.
+- IRQ spoofing or interrupt storms from a malicious device.
+- Freeing a DMA buffer while the device still has it queued.
+
+#### Phase 5 — Self‑Hosted System
+
+- Boot chain tampering if firmware verification is weak.
+- Filesystem image replacement or rollback.
+- Network service spoofing: a malicious sidecar advertising itself as `net.0`.
+- Crash/restart of a driver sidecar leaving dangling capability references in clients.
+
+---
+
+### 4. Audit Phases
+
+#### Phase A — Threat Modeling & TCB Definition
+
+- Produce a formal threat model document.
+- Define the exact trusted computing base:
+  - Kernel capability manager
+  - Channel implementation
+  - Shared memory manager
+  - MMU/IOMMU configuration
+  - Device Manager (if trusted)
+- Identify which components must be correct for security and which can fail safely.
+
+**Deliverable:** TCB document + attack trees.
+
+---
+
+#### Phase B — Code Audit & Static Analysis
+
+- Review all unsafe code paths, especially in the kernel capability subsystem.
+- Check for:
+  - Capability slot reuse
+  - Reference counting errors
+  - TOCTOU races in `cap_send`/`cap_recv`
+  - TLB invalidation on revocation
+  - Bounds checks in channel message parsing
+  - Integer overflows
+- Run static analyzers: `cargo clippy` if Rust, `clang-tidy` if C, plus formal linters.
+
+**Deliverable:** Findings list with severity ratings.
+
+---
+
+#### Phase C — Dynamic Fuzzing
+
+- Build a fuzzing harness for:
+  - Random `cap_create_mem` / `cap_send` / `cap_recv` / `cap_revoke` sequences.
+  - Malformed channel messages with bad lengths, invalid capability indices, truncated headers.
+  - Malformed sidecar manifests.
+  - Malformed IDL files and generated marshalling inputs.
+  - POSIX sidecar path inputs and fd operations.
+- Use a syzkaller‑style approach adapted to AeroSLS syscalls.
+- Stress test concurrent cap transfer and revocation to find races.
+
+**Deliverable:** Fuzzing harnesses + crash reports + regression tests.
+
+---
+
+#### Phase D — Isolation & Penetration Testing
+
+- Run an untrusted sidecar with minimal capabilities and attempt to:
+  - Access kernel memory
+  - Read another sidecar’s private heap
+  - Forge a channel message
+  - Exhaust kernel resources
+- Use fault injection:
+  - Revoke a capability while a sidecar is actively using it.
+  - Kill a driver sidecar during I/O.
+  - Trigger interrupt storms.
+- Test DMA attacks with and without IOMMU.
+- Test boot integrity by modifying the image and checking verification.
+
+**Deliverable:** Red team report with exploits demonstrated.
+
+---
+
+#### Phase E — Formal Verification of Critical Invariants
+
+- Model the capability lifecycle in TLA+ or a proof assistant (Coq, Isabelle, Lean).
+- Prove:
+  - No capability duplication.
+  - No capability forgery.
+  - Revocation removes all access.
+  - Channel message ordering and integrity.
+- Focus only on the kernel capability and channel code — not the whole OS.
+- If formal verification is too heavy, at least model‑check the state machine.
+
+**Deliverable:** Formal model + proof sketches or model‑checking results.
+
+---
+
+#### Phase F — External Review
+
+- Engage an external security firm or independent researchers.
+- Give them access to:
+  - AeroSLS running on QEMU and real hardware.
+  - The capability SDK documentation.
+  - The sidecar manifests and a sample driver.
+- Scope:
+  - Escape from POSIX sidecar.
+  - Cross‑sidecar capability forgery.
+  - Driver sidecar compromise.
+  - Network stack exploitation.
+  - Boot chain bypass.
+
+**Deliverable:** External audit report.
+
+---
+
+### 5. Tooling Recommendations
+
+<table>
+  <tr><th>Area</th><th>Tool</th></tr>
+  <tr><td>Static analysis</td><td>cargo clippy, clang-tidy, semgrep, codeql</td></tr>
+  <tr><td>Fuzzing</td><td>libFuzzer, AFL++, cargo-fuzz, syzkaller‑style harness</td></tr>
+  <tr><td>Concurrency testing</td><td>loom (Rust), ThreadSanitizer, stress harnesses</td></tr>
+  <tr><td>Formal modeling</td><td>TLA+, Coq, Isabelle, Lean, miri for Rust</td></tr>
+  <tr><td>DMA/IOMMU testing</td><td>QEMU with IOMMU enabled, hardware with VT‑d/IOMMU</td></tr>
+  <tr><td>Penetration testing</td><td>Custom harnesses, GDB, QEMU monitor, hardware probes</td></tr>
+</table>
+
+---
+
+### 6. Sample 12‑Week Timeline
+
+<table>
+  <tr><th>Weeks</th><th>Activity</th></tr>
+  <tr><td>1–2</td><td>Threat modeling, TCB definition, security invariants</td></tr>
+  <tr><td>3–5</td><td>Code audit + static analysis</td></tr>
+  <tr><td>5–7</td><td>Fuzzing harness development and crash fixing</td></tr>
+  <tr><td>8–9</td><td>Isolation testing + fault injection</td></tr>
+  <tr><td>10–11</td><td>Formal modeling of capability lifecycle</td></tr>
+  <tr><td>11–12</td><td>External review scoping, remediation, final report</td></tr>
+</table>
+
+---
+
+### 7. Prompt for DeepSeek v4 Flash / Pro
+
+Use this to generate a detailed, actionable security audit plan from the model:
+
+```plaintext
+You are a security architect for the AeroSLS operating system, a capability-based sidecar kernel. Phases 1–5 are built: seed kernel with capability tables and channels, POSIX sidecar, polyglot nexus, device driver SDK, and self-hosted system. We need a comprehensive security audit plan.
+
+Produce:
+1. Threat model with attacker personas, goals, and attack surfaces.
+2. Security invariants that must hold in the kernel and sidecar boundaries.
+3. A phase-by-phase audit plan covering static analysis, fuzzing, isolation testing, formal verification, and external review.
+4. Specific likely vulnerabilities in each phase and how to test for them.
+5. Tooling recommendations.
+6. A 12-week audit timeline.
+7. A list of deliverables.
+
+Assume sidecars run in user space with hardware memory isolation where possible, but also address the case where sidecars share a single address space using MPK/PKU.
+
+```
