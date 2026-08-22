@@ -364,8 +364,16 @@ jobs:
       # Run the real two-process e2e natively. The test skips (prints SKIP:
       # and still passes) only when the bins or sbcl are missing — both are
       # provisioned above, so treat any SKIP as a hard failure: the e2e
-      # must actually run on every push, not silently skip.
+      # must actually run on every push, not silently skip. The test also
+      # enforces a latency regression gate: either bench leg's median round
+      # trip must stay under POLYGLOT_BENCH_MEDIAN_NS (default 5ms; measured
+      # medians are ~0.6ms add / ~1.5ms sqrt), failing the build if it blows
+      # past the threshold.
       - name: Run the two-process wasm-lisp e2e (real transport)
+        env:
+          # ns; 5ms catches an order-of-magnitude transport regression with
+          # wide headroom over the ~0.6-1.5ms measured medians.
+          POLYGLOT_BENCH_MEDIAN_NS: 5000000
         run: |
           set -e
           out="$(cargo test -p polyglot --test e2e_two_process --manifest-path user/Cargo.toml -- --nocapture 2>&1)"

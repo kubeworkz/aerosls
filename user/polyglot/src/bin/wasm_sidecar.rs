@@ -54,6 +54,27 @@ fn rdtsc() -> u64 {
         .as_nanos() as u64
 }
 
+/// TSC → ns conversion factor (cycles per nanosecond), calibrated once at
+/// first use. On non-x86_64 the fallback rdtsc() already returns ns, so the
+/// ratio is 1.0 and the ns output stays correct.
+static CYCLES_PER_NS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+fn calibrate_tsc() -> f64 {
+    let t0 = rdtsc();
+    let i0 = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let t1 = rdtsc();
+    let i1 = std::time::Instant::now();
+    let dt_ns = i1.duration_since(i0).as_nanos() as f64;
+    t1.wrapping_sub(t0) as f64 / dt_ns
+}
+
+/// Convert a cycle-count delta to nanoseconds (wall clock, via calibration).
+fn cycles_to_ns(cycles: u64) -> u64 {
+    let cpn = *CYCLES_PER_NS.get_or_init(calibrate_tsc);
+    (cycles as f64 / cpn) as u64
+}
+
 fn rpc(syscall: u32, body: &[u8]) -> Vec<u8> {
     let mut g = TRANSPORT.lock().unwrap();
     let stream = g.as_mut().expect("transport not connected");
@@ -197,7 +218,11 @@ fn print_bench(tag: &str, samples: &[u64], note: &str) {
         let median = s[n / 2];
         let p99 = s[((n as f64 * 0.99) as usize).min(n - 1)];
         let mean = s.iter().sum::<u64>() / n as u64;
-        println!("BENCH_{tag}: N={n} wasm->lisp->wasm median={median} p99={p99} mean={mean} cycles ({note})");
+        println!(
+            "BENCH_{tag}: N={n} median_cy={median} median_ns={} p99_cy={p99} p99_ns={} mean_cy={mean} ({note})",
+            cycles_to_ns(median),
+            cycles_to_ns(p99),
+        );
     } else {
         println!("BENCH_{tag}: no round-trip samples ({note})");
     }

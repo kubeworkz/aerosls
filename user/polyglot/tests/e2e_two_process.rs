@@ -140,6 +140,16 @@ fn kill_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Parse `median_ns=<u64>` out of a BENCH line emitted by the wasm-sidecar.
+fn parse_median_ns(line: &str) -> Option<u64> {
+    line.split("median_ns=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 #[test]
 fn two_process_wasm_lisp_arena_roundtrip() {
     let root_linux = repo_root_linux();
@@ -227,14 +237,29 @@ fn two_process_wasm_lisp_arena_roundtrip() {
         status.success() && wasm_line.contains("PASS"),
         "wasm-sidecar failed: {wasm_line} (exit {status})"
     );
-    assert!(
-        bench_add.is_some(),
-        "wasm-sidecar produced no BENCH_ADD latency report"
-    );
-    assert!(
-        bench_sqrt.is_some(),
-        "wasm-sidecar produced no BENCH_SQRT latency report"
-    );
+
+    // ── latency regression gate ──────────────────────────────────────────
+    // Fail if either bench leg's median round trip exceeds the threshold.
+    // Measured medians are ~0.6ms (add) and ~1.5ms (sqrt), so the default
+    // 5ms catches an order-of-magnitude transport regression with wide
+    // headroom against runner noise. Override with POLYGLOT_BENCH_MEDIAN_NS.
+    let max_median_ns: u64 = std::env::var("POLYGLOT_BENCH_MEDIAN_NS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000);
+    for (name, bench) in [("BENCH_ADD", &bench_add), ("BENCH_SQRT", &bench_sqrt)] {
+        let Some(line) = bench else {
+            panic!("wasm-sidecar produced no {name} latency report");
+        };
+        let median_ns = parse_median_ns(line)
+            .unwrap_or_else(|| panic!("{name} line missing median_ns: {line}"));
+        assert!(
+            median_ns <= max_median_ns,
+            "{name} median {median_ns} ns exceeds the {max_median_ns} ns regression threshold — \
+             round-trip latency exploded (check transport/Nagle/queue changes)"
+        );
+        eprintln!("[gate] {name} median {median_ns} ns <= {max_median_ns} ns threshold — OK");
+    }
 
     // ── teardown ─────────────────────────────────────────────────────────
     kill_child(&mut lisp);
