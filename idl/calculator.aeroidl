@@ -1,0 +1,75 @@
+// AeroIDL — calculator.aeroidl
+// A calculator service exposed by a Common Lisp sidecar.
+// Demonstrates primitives, structs, arrays, error handling, and
+// both sync and async method annotations.
+
+@version("aeroidl/1.0")
+@namespace("aerosls.calculator")
+
+// ─── Error types ────────────────────────────────────────────────────────────
+
+enum CalcErrorKind {
+    DIVISION_BY_ZERO  = 1,
+    OVERFLOW          = 2,
+    UNDERFLOW         = 3,
+    INVALID_INPUT     = 4,
+    INTERNAL          = 5,
+}
+
+struct CalcError {
+    kind:    CalcErrorKind,
+    message: string @borrowed,
+}
+
+// ─── Structured result types ────────────────────────────────────────────────
+
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+struct MatrixData {
+    rows:    u32,
+    cols:    u32,
+    elements: f64[] @arena,       // row-major, in shared arena
+}
+
+// ─── Interface ──────────────────────────────────────────────────────────────
+
+interface CalculatorService {
+
+    // ── Scalar arithmetic ───────────────────────────────────────────────────
+
+    /// add(a, b) → a + b.  Both arguments fit in registers; no shared
+    /// memory needed.  This is the "trivial" case.
+    add(a: i32, b: i32) -> Result<i32, CalcError>
+
+    /// Divide two 64-bit integers, returning the quotient.
+    div(a: i64, b: i64) -> Result<i64, CalcError>
+
+    // ── Floating-point vector math ──────────────────────────────────────────
+
+    /// Dot product of two 2-element vectors.
+    dot(a: Vec2 @borrowed, b: Vec2 @borrowed) -> Result<f64, CalcError>
+
+    /// Multiply a matrix by a vector.  The matrix is in the shared arena;
+    /// the vector elements arrive inline (small struct).  The result is
+    /// placed in the caller's arena and returned as a MEM cap.
+    matmul_vec(m: MatrixData @arena, v: Vec2 @borrowed) -> Result<Vec2, CalcError>
+
+    // ── Bulk computation ────────────────────────────────────────────────────
+
+    /// Compute element-wise square root of an array of f64 values.
+    /// Input: MEM cap to shared arena buffer (borrowed).
+    /// Output: MEM cap to freshly allocated arena buffer (owned by caller,
+    ///         callee writes into it and transfers ownership back).
+    sqrt_batch(input: f64[] @borrowed) -> Result<f64[] @arena, CalcError>
+
+    // ── Async / fire-and-forget ─────────────────────────────────────────────
+
+    /// Asynchronously compute a heavy reduction. The callee acknowledges
+    /// receipt immediately; the result is delivered via a follow-up
+    /// RECV_CAP on a dedicated result channel.
+    @async
+    heavy_reduce(input: f64[] @arena) -> Result<u32, CalcError>
+}

@@ -1,0 +1,70 @@
+// AeroIDL — logging.aeroidl
+// A simple structured logging service exposed by a WASM sidecar.
+//
+// Types:
+//   i32, i64, u32, u64, f32, f64 — fixed-width primitives (C-compatible)
+//   string  — UTF-8 byte sequence (borrowed or owned)
+//   bytes   — raw byte sequence (borrowed or owned)
+//   struct  — aggregate of named fields
+//   enum    — sum type with explicit discriminant
+//   Option<T> — built-in optional
+//   Result<T, E> — built-in error union
+//
+// Ownership annotations:
+//   borrowed   — caller retains ownership; callee reads only
+//   owned      — callee takes ownership and must free (or transfer)
+//   arena      — lives in shared arena; lifetime managed by capability
+
+@version("aeroidl/1.0")
+@namespace("aerosls.logging")
+
+// ─── Error types ────────────────────────────────────────────────────────────
+
+enum LogLevel {
+    TRACE   = 0,
+    DEBUG   = 1,
+    INFO    = 2,
+    WARN    = 3,
+    ERROR   = 4,
+    FATAL   = 5,
+}
+
+struct LogError {
+    code:    u32,
+    message: string @borrowed,
+}
+
+// ─── Structured log record ─────────────────────────────────────────────────
+
+struct LogRecord {
+    timestamp_ms: u64,
+    level:        LogLevel,
+    facility:     string @borrowed,
+    message:      string @borrowed,
+    kvs:          LogKV[],          // array of key-value pairs
+}
+
+struct LogKV {
+    key:   string @borrowed,
+    value: string @borrowed,
+}
+
+// ─── Interface ──────────────────────────────────────────────────────────────
+
+interface LoggingService {
+
+    /// Emit a single log record. The record is borrowed from the caller's
+    /// memory; the callee reads it and does not retain a reference.
+    emit(record: LogRecord @borrowed) -> Result<(), LogError>
+
+    /// Emit a batch of log records. The array is in shared arena memory;
+    /// ownership of the arena slot transfers to the callee, which must
+    /// either consume or release it.
+    emit_batch(records: LogRecord[] @arena) -> Result<u32, LogError>
+
+    /// Flush all buffered logs to the backing store / console.
+    flush() -> Result<(), LogError>
+
+    /// Set the minimum log level for this session.
+    set_level(level: LogLevel) -> Result<(), LogError>
+}

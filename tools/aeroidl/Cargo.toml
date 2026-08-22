@@ -1,0 +1,29 @@
+[package]
+name = "aeroidl-cc"
+version = "0.1.0"
+edition = "2021"
+description = "AeroIDL compiler: parses .aeroidl files, type-checks, and emits typed AST JSON for code generators"
+license = "MIT"
+
+[[bin]]
+name = "aeroidl"
+path = "src/main.rs"
+
+[[test]]
+name = "smoke_test"
+path = "tests/smoke_test.rs"
+
+[[test]]
+name = "parse_each"
+path = "tests/parse_each.rs"
+
+[[test]]
+name = "e2e_codegen"
+path = "tests/e2e_codegen.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+

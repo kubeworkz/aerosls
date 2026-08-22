@@ -1,0 +1,52 @@
+// AeroIDL — imageproc.aeroidl
+// Image processing service: demonstrates complex types with arena data.
+// Exposed by a Python sidecar with PIL/numpy acceleration.
+
+@version("aeroidl/1.0")
+@namespace("aerosls.imageproc")
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+enum PixelFormat {
+    RGB8   = 0,
+    RGBA8  = 1,
+    YUV420 = 2,
+}
+
+struct ImageDescriptor {
+    width:  u32,
+    height: u32,
+    stride: u32,          // bytes per row
+    format: PixelFormat,
+    data:   bytes @arena,  // raw pixel data in shared arena
+}
+
+struct FilterParams {
+    sigma:  f32,
+    radius: u32,
+}
+
+// ─── Interface ──────────────────────────────────────────────────────────────
+
+interface ImageProcessingService {
+
+    /// Apply Gaussian blur. Input image is borrowed (read-only);
+    /// output is a new arena allocation returned to caller (owned).
+    blur(image: ImageDescriptor @borrowed, params: FilterParams @borrowed)
+        -> Result<ImageDescriptor @arena, string @borrowed>
+
+    /// Resize in-place: the callee writes into the caller's arena buffer.
+    /// The cap must be @borrowed with W rights.
+    resize_inplace(image: ImageDescriptor @borrowed, new_w: u32, new_h: u32)
+        -> Result<(), string @borrowed>
+
+    /// Compute histogram of luminance channel. Result is a 256-element
+    /// u32 array in the arena.
+    histogram(image: ImageDescriptor @borrowed)
+        -> Result<u32[] @arena, string @borrowed>
+
+    /// Composite two images (overlay). Both inputs borrowed; output arena-owned.
+    composite(base: ImageDescriptor @borrowed, overlay: ImageDescriptor @borrowed,
+              x: u32, y: u32)
+        -> Result<ImageDescriptor @arena, string @borrowed>
+}
