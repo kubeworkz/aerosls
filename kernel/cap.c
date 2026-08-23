@@ -47,6 +47,7 @@
  * behavior (CAP_EAGAIN) so host tests run without the scheduler.
  */
 #include "cap.h"
+#include "irq.h"
 #include "kernel_io.h"
 #include "frame_pool.h"
 #include <stddef.h>
@@ -785,7 +786,7 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
     return 0;
 }
 
-/* Forward declarations for Phase 4 weak hooks (defined later in this file) */
+/* Forward declarations for Phase 4 hooks (defined later in this file) */
 int cap_irq_source_valid(uint32_t irq_number);
 void cap_irq_mask_source(uint32_t irq_number, uint8_t masked);
 void cap_irq_eoi(uint32_t irq_number);
@@ -922,15 +923,20 @@ int cap_create_irq(uint32_t pid, uint32_t irq_number, uint8_t trigger,
         cap_unlock(&cap_tables[ti].lock);
         cap_object_destroy(obj_id);
         return CAP_ENOMEM;
-    }
-    cap_tables[ti].slots[idx].word =
+    }    cap_tables[ti].slots[idx].word =
         cap_word_make(CAP_TYPE_IRQ, obj_id, perm, 0, 0);
     cap_unlock(&o->lock);
     cap_unlock(&cap_tables[ti].lock);
 
+    /* Register in the IRQ delivery registry so the trap handler can
+     * deliver messages when this interrupt fires. */
+    irq_register(irq_number, obj_id, o->u.irq.irq_chan_id,
+                 trigger, coalesce_us);
+
     *out_idx = idx;
     return 0;
 }
+
 
 /* Free a dead object's machine resources (arena frames / channel slot);
  * defined after cap_revoke. Forward-declared here because cap_recv's
@@ -1677,12 +1683,11 @@ int cap_revoke(uint32_t pid, uint16_t cap_idx) {
      * prevents new IRQ messages from arriving after we begin tearing down
      * the channel. IOMMU unmap prevents the device from DMA-ing into
      * pages that are about to be freed. */
-    if (obj->kind == CAP_OBJ_KIND_IRQ && !(obj->max_perms & CAP_PERM_IRQ_MASK)) {
-        /* IRQ cap doesn't have MASK permission but was somehow live —
-         * mask it defensively on revoke anyway. */
-    }
     if (obj->kind == CAP_OBJ_KIND_IRQ) {
+        /* Mask at the interrupt controller and unregister from the
+         * delivery registry so no new messages arrive after revoke. */
         cap_irq_mask_source(obj->u.irq.irq_number, 1);  /* mask */
+        irq_unregister(obj->u.irq.irq_number);
     }
     if (obj->kind == CAP_OBJ_KIND_DMA_MEM) {
         cap_iommu_unmap(obj->u.dma.dma_iommu_domain,
@@ -2507,28 +2512,27 @@ uint64_t sys_sls_trampoline_call(struct SLSTrampolineCallRequest* req) {
 
 /* Validate an IRQ source number against the interrupt controller.
  * Strong override: plic.c checks the PLIC source ID register.
- * Weak default: accept all (Phase-4 stub; real validation deferred
- * to when the PLIC driver is wired). */
-__attribute__((weak))
+ * Default delegates to irq_source_valid() which validates against
+ * the PLIC source count. */
 int cap_irq_source_valid(uint32_t irq_number) {
-    (void)irq_number;
-    return 1;   /* accept all in stub */
+    return irq_source_valid(irq_number);
 }
 
 /* Mask or unmask an interrupt source at the hardware controller.
- * Called by cap_revoke() for IRQ caps and by cap_irq_mask(). */
-__attribute__((weak))
+ * Called by cap_revoke() for IRQ caps and by cap_irq_mask().
+ * Delegates to irq_mask()/irq_unmask() which program the PLIC. */
 void cap_irq_mask_source(uint32_t irq_number, uint8_t masked) {
-    (void)irq_number; (void)masked;
-    /* no-op in stub; strong override in plic.c */
+    if (masked)
+        irq_mask(irq_number);
+    else
+        irq_unmask(irq_number);
 }
 
 /* Acknowledge (EOI) an interrupt at the hardware controller.
- * RISC-V PLIC: write to CLAIM register. x86 APIC: write EOI. */
-__attribute__((weak))
+ * RISC-V PLIC: write to CLAIM register. x86 APIC: write EOI.
+ * Delegates to irq_eoi(). */
 void cap_irq_eoi(uint32_t irq_number) {
-    (void)irq_number;
-    /* no-op in stub */
+    irq_eoi(irq_number);
 }
 
 /* IOMMU mapping/unmapping (weak defaults; strong in kernel/iommu.c). */
