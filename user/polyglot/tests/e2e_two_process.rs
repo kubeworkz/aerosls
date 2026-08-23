@@ -108,16 +108,29 @@ fn spawn_linux(program: &str, args: &[&str], envs: &[(&str, &str)]) -> (Child, m
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().expect("spawn");
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let (tx, rx) = mpsc::channel::<String>();
     let program = program.to_string();
+    // Echo stdout lines to the test's stderr AND the marker channel.
+    let program_out = program.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             if let Ok(l) = line {
-                eprintln!("[{program}] {l}");
+                eprintln!("[{program_out}] {l}");
                 if tx.send(l).is_err() {
                     break;
                 }
+            }
+        }
+    });
+    // Echo stderr lines too (panics, guest logs) so a sidecar crash is
+    // visible in the test output instead of vanishing into the pipe.
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                eprintln!("[{program}:stderr] {l}");
             }
         }
     });
@@ -135,6 +148,28 @@ fn wait_for_marker(rx: &mpsc::Receiver<String>, marker: &str, timeout: Duration)
         }
     }
     None
+}
+
+/// Collect `count` lines containing `marker` (FIFO). Used for the T4-T8
+/// sweep reports: the sidecar prints 5 per-size lines per method before
+/// the verdict, so the gate needs all of them, not just the first.
+fn wait_for_markers(
+    rx: &mpsc::Receiver<String>,
+    marker: &str,
+    count: usize,
+    timeout: Duration,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    let deadline = Instant::now() + timeout;
+    while found.len() < count && Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) if line.contains(marker) => found.push(line),
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    found
 }
 
 fn free_port() -> u16 {
@@ -212,6 +247,10 @@ fn run_leg(
     let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
     let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
     let bench_str = wait_for_marker(&wasm_out, "BENCH_STR", Duration::from_secs(60));
+    // T4-T8 payload-size sweep: 5 per-size lines per method, printed after
+    // BENCH_STR and before WASM_SIDECAR (FIFO).
+    let sweep_sqrt = wait_for_markers(&wasm_out, "BENCH_SWEEP_SQRT:", 5, Duration::from_secs(120));
+    let sweep_str = wait_for_markers(&wasm_out, "BENCH_SWEEP_STR:", 5, Duration::from_secs(60));
     let wasm_line = wait_for_marker(&wasm_out, "WASM_SIDECAR", Duration::from_secs(30));
     let async_line = wait_for_marker(&wasm_out, "ASYNC_SIDECAR", Duration::from_secs(10));
     let status = wasm.wait().expect("wasm exit");
@@ -239,6 +278,62 @@ fn run_leg(
         eprintln!("[gate] ASYNC_SIDECAR: heavy_reduce result received+verified on result ring (shm) — OK");
     } else {
         eprintln!("[gate] ASYNC_SIDECAR skipped on tcp (no result ring by design) — OK");
+    }
+
+    // ── payload-size sweep gate (T4-T8) ─────────────────────────────────
+    // The sweep proves the zero-copy claim: the arena bytes never cross the
+    // transport, so per-size latency must scale with the *Lisp compute*
+    // (which grows with payload), not with a wire copy. Three checks:
+    //   (1) all 10 per-size lines (5 sqrt + 5 str) were produced;
+    //   (2) workload proof: compute_ns(1MiB) >= 10x compute_ns(4KiB) — the
+    //       payload really grew and was processed (a count=0 or
+    //       constant-payload regression collapses this ratio to ~1x);
+    //   (3) coarse per-size median cap (40ms) — the live medians are
+    //       0.07-19ms, so this catches a catastrophic blowup while the
+    //       per-size drift (archived via BENCH_JSON legs like sqrt-1024k)
+    //       soft-warns on slower degradations.
+    if sweep_sqrt.len() != 5 || sweep_str.len() != 5 {
+        kill_child(&mut lisp);
+        return Err(format!(
+            "T4-T8 sweep incomplete: got {} sqrt + {} str lines (need 5 each) (transport={transport})",
+            sweep_sqrt.len(),
+            sweep_str.len()
+        ));
+    }
+    for (name, lines) in [("SQRT", &sweep_sqrt), ("STR", &sweep_str)] {
+        let compute_4k = parse_field(&lines[0], "compute_ns=").unwrap_or(0);
+        let compute_1m = parse_field(&lines[4], "compute_ns=").unwrap_or(0);
+        if compute_4k == 0 || compute_1m < compute_4k * 10 {
+            kill_child(&mut lisp);
+            return Err(format!(
+                "T4-T8 {name} sweep workload is dead: compute_ns 4KiB={compute_4k} 1MiB={compute_1m} — \
+                 the payload never grew (count=0 or constant-payload regression) (transport={transport})"
+            ));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            let median_ns = parse_median_ns(line).unwrap_or(0);
+            // Catastrophe cap, size-aware: legit compute grows with the
+            // payload (a 1MiB SBCL byte-reversal measures tens of ms on
+            // cold arena pages), so a flat cap calibrated to the small
+            // sizes would false-positive on the largest. Cap each size at
+            // max(40ms, 8x its own measured compute + 10ms): a 4KiB
+            // payload taking 40ms is a catastrophe, while a 1MiB payload
+            // at 62ms compute gets ~0.5s headroom. A transport regression
+            // that stalls per-frame still blows the ADD/SQRT/STR median
+            // gates (5ms over 1000 samples) long before it hides here.
+            let compute_i = parse_field(line, "compute_ns=").unwrap_or(0);
+            let cap = 40_000_000u64.max(compute_i * 8 + 10_000_000);
+            if median_ns > cap {
+                kill_child(&mut lisp);
+                return Err(format!(
+                    "T4-T8 {name} sweep size[{}] median {median_ns} ns > {cap} ns catastrophe cap (compute_ns={compute_i}, transport={transport})",
+                    i
+                ));
+            }
+        }
+        eprintln!(
+            "[gate] T4-T8 {name} sweep: compute scales {compute_4k} -> {compute_1m} ns (1MiB/4KiB), all sizes within their size-aware caps — OK (transport={transport})"
+        );
     }
 
     // ── baseline gate (once per invocation, transport-independent) ───────
@@ -378,7 +473,13 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     let port = free_port();
     let (mut kerneld, kerneld_out) = spawn_linux(
         &kerneld_bin,
-        &["--port", &port.to_string(), "--arena-size", "64"],
+        // 256 MB: the T4-T8 payload sweep (up to 1 MiB arena buffers per
+        // call, allocated+freed per iteration across BOTH legs on the same
+        // kerneld) needs headroom over the fixed benches' footprint. The
+        // mock kernel's bump cursor never reclaims (free only drops the
+        // refcount), so the arena must cover the cumulative allocation
+        // volume of tcp + shm legs.
+        &["--port", &port.to_string(), "--arena-size", "256"],
         &[],
     );
     let Some(ready) = wait_for_marker(&kerneld_out, "READY arena=", Duration::from_secs(15)) else {

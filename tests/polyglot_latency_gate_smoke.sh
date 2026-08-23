@@ -632,6 +632,50 @@ mv -f "$SNAP_SIDECAR2" "$SIDECAR"
 trap - EXIT
 touch "$SIDECAR"
 
+# ─── thirteenth tooth: the T4-T8 payload-size sweep gate ─────────────────
+# The e2e now gates the sweep's workload proof: compute_ns at 1MiB must be
+# >= 10x compute_ns at 4KiB, proving the payload really grew and was
+# processed (a count=0 or constant-payload regression collapses the ratio
+# to ~1x). This tooth collapses the sweep's 1MiB bucket to 4KiB by mutating
+# the guest's sqrt count table (the LE u32 131072 = \00\00\02\00 becomes
+# 512 = \00\02\00\00), so the 1MiB bucket runs count=512 like the 4KiB one
+# and the gate must fail on both legs.
+echo
+echo "=== tooth: collapse the sweep's 1MiB bucket to 4KiB; the T4-T8 workload gate must fail ==="
+SNAP_GUEST2="${GUEST}.smoke2.bak"
+cp "$GUEST" "$SNAP_GUEST2" || { bad "cannot snapshot $GUEST (2nd)"; exit 1; }
+trap "mv -f \"$SNAP_GUEST2\" \"$GUEST\" 2>/dev/null; mv -f \"$SNAP_GUEST\" \"$GUEST\" 2>/dev/null; rm -f \"$SNAP_GUEST\" \"$SNAP_GUEST2\"" EXIT
+
+# (m) sqrt count table: the trailing 131072 (1MiB, \00\00\02\00) becomes
+# 512 (4KiB, \00\02\00\00). The literal-backslash sed needs the bytes
+# escaped once for bash and once for sed.
+sed -i 's@\\00\\00\\02\\00@\\00\\02\\00\\00@' "$GUEST"
+
+if cmp -s "$GUEST" "$SNAP_GUEST2"; then
+    bad "tooth: the sweep-collapse mutation did not apply — the count-table pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_GUEST2" "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: sweep-collapse mutation applied (1MiB sqrt bucket now runs count=512 — payload never grows)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated guest does not build"
+else
+    out="$(run_e2e)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        bad "tooth: the e2e did NOT fail on the collapsed sweep — the T4-T8 workload gate is blind."
+        printf '%s\n' "$out" | grep -E 'T4-T8|BENCH_SWEEP|panicked' | sed 's/^/        /'
+    else
+        ok "tooth: the e2e failed as required (T4-T8 workload gate caught the constant-payload sweep)"
+    fi
+fi
+
+# ─── restore byte-identically (3rd) ────────────────────────────────────────
+mv -f "$SNAP_GUEST2" "$GUEST"
+trap - EXIT
+touch "$GUEST"
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then

@@ -77,6 +77,16 @@ static RING_MODE: AtomicBool = AtomicBool::new(false);
 /// dedicated result ring. Guards against the async section being silently
 /// skipped (e.g. a broken transport probe) while the guest still exits 0.
 static ASYNC_RESULT_OK: AtomicBool = AtomicBool::new(false);
+/// T4-T8 payload-size sweep samples, bucketed by size index (5 sizes:
+/// 4KiB, 16KiB, 64KiB, 256KiB, 1MiB). One inner Vec per bucket, filled by
+/// call_sqrt_sweep / call_str_sweep; the report prints a per-size median
+/// and the e2e gates each size's transport sub-linearity (zero-copy claim:
+/// the arena bytes never cross the transport, so latency must NOT scale
+/// linearly with payload size).
+static BENCH_SWEEP_SQRT: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
+static BENCH_SWEEP_SQRT_COMPUTE: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
+static BENCH_SWEEP_STR: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
+static BENCH_SWEEP_STR_COMPUTE: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 
 /// Monotonic cycle counter for round-trip timing. On x86_64 this is the real
 /// TSC (constant-rate on modern CPUs); elsewhere it falls back to monotonic
@@ -452,6 +462,55 @@ fn print_bench_split(
     }
 }
 
+/// Print the T4-T8 payload-size sweep: one line per size with the
+/// total/compute/transport split (same machinery as print_bench_split) plus
+/// a BENCH_JSON line carrying the size (KiB) so CI can archive per-size
+/// medians. The zero-copy claim is that transport stays ~flat as the
+/// payload grows 4KiB -> 1MiB — the bytes never cross the transport.
+fn print_bench_sweep(
+    tag: &str,
+    total_buckets: &[Vec<u64>],
+    compute_buckets: &[Vec<u64>],
+    sizes_kib: &[u64],
+    note: &str,
+    transport: &str,
+) {
+    for (b, total_cy) in total_buckets.iter().enumerate() {
+        let compute_ns = compute_buckets.get(b).cloned().unwrap_or_default();
+        let n_common = total_cy.len().min(compute_ns.len());
+        let tc = total_cy.get(1..n_common).unwrap_or(&total_cy[..]);
+        let cc = compute_ns.get(1..n_common).unwrap_or(&compute_ns[..]);
+        let size = sizes_kib.get(b).copied().unwrap_or(0);
+        let leg = format!("{}-{}k", tag.to_ascii_lowercase(), size);
+        if tc.is_empty() || tc.len() != cc.len() {
+            println!("BENCH_SWEEP_{tag}: size={size}KiB no samples ({note}, transport={transport})");
+            println!(
+                "BENCH_JSON {{\"leg\":\"{leg}\",\"transport\":\"{transport}\",\"size_kib\":{size},\"n\":0}}"
+            );
+            continue;
+        }
+        let mut ts = tc.to_vec();
+        ts.sort_unstable();
+        let mut cs = cc.to_vec();
+        cs.sort_unstable();
+        let n = ts.len();
+        let median_cy = ts[n / 2];
+        let median_ns = cycles_to_ns(median_cy);
+        let p99_ns = cycles_to_ns(ts[((n as f64 * 0.99) as usize).min(n - 1)]);
+        let mean_ns = cycles_to_ns(ts.iter().sum::<u64>() / n as u64);
+        let median_compute = cs[n / 2];
+        let median_transport = median_ns.saturating_sub(median_compute);
+        println!(
+            "BENCH_SWEEP_{tag}: size={size}KiB N={n} median_cy={median_cy} median_ns={median_ns} \
+             p99_ns={p99_ns} compute_ns={median_compute} transport_ns={median_transport} \
+             mean_ns={mean_ns} ({note}, transport={transport})"
+        );
+        println!(
+            "BENCH_JSON {{\"leg\":\"{leg}\",\"transport\":\"{transport}\",\"size_kib\":{size},\"n\":{n},\"median_cy\":{median_cy},\"median_ns\":{median_ns},\"compute_ns\":{median_compute},\"transport_ns\":{median_transport},\"p99_ns\":{p99_ns},\"mean_ns\":{mean_ns}}}"
+        );
+    }
+}
+
 fn main() {
     let mut port = 0u16;
     let mut arena_path = String::new();
@@ -588,6 +647,42 @@ fn main() {
     linker
         .func_wrap(
             "host",
+            "call_sqrt_sweep",
+            |_caller: wasmi::Caller<'_, ()>, count: i32, input_cap: i32, bucket: i32| -> i64 {
+                let count = count as u32;
+                let cap = input_cap as u16;
+                let t0 = rdtsc();
+                let r = match gen_calculator::calculator_service::sqrt_batch(
+                    gen_calculator::ArenaSlice::<f64>::new(cap, count),
+                    cap,
+                    count,
+                ) {
+                    Ok(slice) => pack(0, slice.cap as u64),
+                    Err(e) => pack(1, e.code as u64),
+                };
+                // Same arena-cap round trip as call_sqrt_batch, but recorded
+                // into the per-size bucket so the report can gate the
+                // zero-copy claim: transport must stay ~flat as the payload
+                // grows 4KiB -> 1MiB (the bytes never cross the transport).
+                let total = rdtsc().wrapping_sub(t0);
+                let compute = unsafe { gen_calculator::calculator_service::LAST_SQRT_COMPUTE_NS };
+                let mut buckets = BENCH_SWEEP_SQRT.lock().unwrap();
+                while buckets.len() <= bucket as usize {
+                    buckets.push(Vec::new());
+                }
+                buckets[bucket as usize].push(total);
+                let mut comp = BENCH_SWEEP_SQRT_COMPUTE.lock().unwrap();
+                while comp.len() <= bucket as usize {
+                    comp.push(Vec::new());
+                }
+                comp[bucket as usize].push(compute);
+                r
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
             "write_f64",
             |_caller: wasmi::Caller<'_, ()>, cap: i32, idx: i32, bits: i64| {
                 unsafe {
@@ -642,6 +737,35 @@ fn main() {
                 BENCH_STR_SAMPLES.lock().unwrap().push(total);
                 let compute = unsafe { gen_calculator::calculator_service::LAST_REVERSE_COMPUTE_NS };
                 BENCH_STR_COMPUTE_NS.lock().unwrap().push(compute);
+                r
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "call_str_sweep",
+            |_caller: wasmi::Caller<'_, ()>, cap: i32, len: i32, bucket: i32| -> i64 {
+                let t0 = rdtsc();
+                let r = match gen_calculator::calculator_service::reverse(cap as u16, len as u32) {
+                    Ok(slice) => pack(0, slice.cap as u64),
+                    Err(e) => pack(1, e.code as u64),
+                };
+                // Byte/string arena path, recorded into the per-size bucket
+                // (T4-T8 sweep): the bytes never cross the transport, so the
+                // median must stay sub-linear in payload size.
+                let total = rdtsc().wrapping_sub(t0);
+                let compute = unsafe { gen_calculator::calculator_service::LAST_REVERSE_COMPUTE_NS };
+                let mut buckets = BENCH_SWEEP_STR.lock().unwrap();
+                while buckets.len() <= bucket as usize {
+                    buckets.push(Vec::new());
+                }
+                buckets[bucket as usize].push(total);
+                let mut comp = BENCH_SWEEP_STR_COMPUTE.lock().unwrap();
+                while comp.len() <= bucket as usize {
+                    comp.push(Vec::new());
+                }
+                comp[bucket as usize].push(compute);
                 r
             },
         )
@@ -760,6 +884,16 @@ fn main() {
     print_bench_split("ADD", &add_samples, &add_compute, "add() — inline args", &transport);
     print_bench_split("SQRT", &sqrt_samples, &sqrt_compute, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
     print_bench_split("STR", &str_samples, &str_compute, "reverse(32..63 B) — string arena MEM cap", &transport);
+    // T4-T8 payload-size sweep: per-size medians over 4KiB..1MiB. The gate
+    // (in the e2e) checks transport sub-linearity — the zero-copy claim
+    // that the arena bytes never cross the transport.
+    let sweep_sqrt = std::mem::take(&mut *BENCH_SWEEP_SQRT.lock().unwrap());
+    let sweep_sqrt_c = std::mem::take(&mut *BENCH_SWEEP_SQRT_COMPUTE.lock().unwrap());
+    let sweep_str = std::mem::take(&mut *BENCH_SWEEP_STR.lock().unwrap());
+    let sweep_str_c = std::mem::take(&mut *BENCH_SWEEP_STR_COMPUTE.lock().unwrap());
+    let sizes_kib = [4u64, 16, 64, 256, 1024];
+    print_bench_sweep("SQRT", &sweep_sqrt, &sweep_sqrt_c, &sizes_kib, "sqrt_batch size sweep (T4-T8)", &transport);
+    print_bench_sweep("STR", &sweep_str, &sweep_str_c, &sizes_kib, "reverse size sweep (T4-T8)", &transport);
 
     if status == 0 {
         println!("WASM_SIDECAR PASS");

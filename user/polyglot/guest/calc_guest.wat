@@ -33,7 +33,9 @@
 (module
   (import "host" "call_add" (func $call_add (param i32 i32) (result i64)))
   (import "host" "call_sqrt_batch" (func $call_sqrt_batch (param i32 i32) (result i64)))
+  (import "host" "call_sqrt_sweep" (func $call_sqrt_sweep (param i32 i32 i32) (result i64)))
   (import "host" "call_reverse" (func $call_reverse (param i32 i32) (result i64)))
+  (import "host" "call_str_sweep" (func $call_str_sweep (param i32 i32 i32) (result i64)))
   (import "host" "call_heavy_reduce" (func $call_heavy_reduce (param i32 i32) (result i64)))
   (import "host" "await_async_result" (func $await_async_result (result i64)))
   (import "host" "is_shm" (func $is_shm (result i32)))
@@ -55,12 +57,26 @@
   (data (i32.const 256) "FAIL str-bench\00")
   (data (i32.const 272) "FAIL async\00")
   (data (i32.const 288) "PASS async heavy_reduce=2016\00")
+  ;; T4-T8 payload-size sweep tables (LE u32). sqrt counts (f64s):
+  ;; 512 (4KiB), 2048 (16KiB), 8192 (64KiB), 32768 (256KiB), 131072 (1MiB).
+  (data (i32.const 320) "\00\02\00\00\00\08\00\00\00\20\00\00\00\80\00\00\00\00\02\00")
+  ;; sqrt iterations per size: 150, 80, 40, 20, 8 (fill + compute cost
+  ;; grows with size, so the tail buckets use fewer samples to bound the
+  ;; e2e wall time; medians stay stable at N>=8)
+  (data (i32.const 340) "\96\00\00\00\50\00\00\00\28\00\00\00\14\00\00\00\08\00\00\00")
+  ;; str counts (bytes): 4096 (4KiB), 16384 (16KiB), 65536 (64KiB),
+  ;; 262144 (256KiB), 1048576 (1MiB)
+  (data (i32.const 360) "\00\10\00\00\00\40\00\00\00\00\01\00\00\00\04\00\00\00\10\00")
+  ;; str iterations per size: 100, 50, 25, 8, 3 (Lisp byte-reversal of 1MiB
+  ;; is ~100ms, so the largest bucket uses only 3 samples)
+  (data (i32.const 380) "\64\00\00\00\32\00\00\00\19\00\00\00\08\00\00\00\03\00\00\00")
+  (data (i32.const 400) "FAIL sweep\00")
 
   (func (export "run") (result i32)
     (local $r i64) (local $r2 i64)
     (local $status i32) (local $n i32) (local $in_cap i32) (local $i i32)
     (local $out_cap i32) (local $v f64) (local $err f64)
-    (local $j i32)
+    (local $j i32) (local $k i32) (local $iters i32) (local $len i32)
 
     ;; ── add(2, 3) must return 5 ───────────────────────────────────────────
     (local.set $r (call $call_add (i32.const 2) (i32.const 3)))
@@ -264,6 +280,128 @@
     ;; done: release both arena buffers (ownership accounting is in the kernel)
     (call $arena_free (local.get $out_cap))
     (call $arena_free (local.get $in_cap))
+
+    ;; ── payload-size sweep (T4-T8): sqrt over 4KiB..1MiB ───────────────
+    ;; For each size k: load count and iters from the tables (mem 320/340);
+    ;; each iteration allocs a fresh arena input, fills it, times
+    ;; call_sqrt_sweep (host records into bucket k), verifies 2 sampled
+    ;; outputs, frees both. Runs on BOTH transports (unlike async — the
+    ;; arena is shared on tcp too, so the sweep is the T4-T8 measurement).
+    (local.set $k (i32.const 0))
+    (block $sweep_sqrt_done
+      (loop $sweep_sqrt
+        (br_if $sweep_sqrt_done (i32.ge_u (local.get $k) (i32.const 5)))
+        (local.set $n
+          (i32.load (i32.add (i32.const 320) (i32.mul (local.get $k) (i32.const 4)))))
+        (local.set $iters
+          (i32.load (i32.add (i32.const 340) (i32.mul (local.get $k) (i32.const 4)))))
+        (local.set $i (i32.const 0))
+        (block $sweep_sqrt_it_done
+          (loop $sweep_sqrt_it
+            (br_if $sweep_sqrt_it_done (i32.ge_u (local.get $i) (local.get $iters)))
+            (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
+            (if (i32.eqz (local.get $in_cap))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 14))))
+            (local.set $j (i32.const 0))
+            (block $sw_sqrt_fill_done
+              (loop $sw_sqrt_fill
+                (br_if $sw_sqrt_fill_done (i32.ge_u (local.get $j) (local.get $n)))
+                (call $write_f64
+                  (local.get $in_cap)
+                  (local.get $j)
+                  (i64.reinterpret_f64 (f64.convert_i32_u (local.get $j))))
+                (local.set $j (i32.add (local.get $j) (i32.const 1)))
+                (br $sw_sqrt_fill)))
+            (local.set $r2
+              (call $call_sqrt_sweep (local.get $n) (local.get $in_cap) (local.get $k)))
+            (local.set $out_cap
+              (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff))))
+            ;; guard: mid + last output must verify (workload really ran)
+            (local.set $j (i32.shr_u (local.get $n) (i32.const 1)))
+            (local.set $v
+              (f64.reinterpret_i64 (call $read_f64 (local.get $out_cap) (local.get $j))))
+            (local.set $err
+              (f64.sub (f64.mul (local.get $v) (local.get $v))
+                       (f64.convert_i32_u (local.get $j))))
+            (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 15))))
+            (local.set $j (i32.sub (local.get $n) (i32.const 1)))
+            (local.set $v
+              (f64.reinterpret_i64 (call $read_f64 (local.get $out_cap) (local.get $j))))
+            (local.set $err
+              (f64.sub (f64.mul (local.get $v) (local.get $v))
+                       (f64.convert_i32_u (local.get $j))))
+            (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 16))))
+            (call $arena_free (local.get $out_cap))
+            (call $arena_free (local.get $in_cap))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $sweep_sqrt_it)))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br $sweep_sqrt)))
+
+    ;; ── payload-size sweep (T4-T8): str over 4KiB..1MiB ────────────────
+    ;; Same pattern with byte lengths (mem 360/380). The fill pattern and
+    ;; guard mirror the fixed str bench (reply[j] = sent[n-1-j]).
+    (local.set $k (i32.const 0))
+    (block $sweep_str_done
+      (loop $sweep_str
+        (br_if $sweep_str_done (i32.ge_u (local.get $k) (i32.const 5)))
+        (local.set $len
+          (i32.load (i32.add (i32.const 360) (i32.mul (local.get $k) (i32.const 4)))))
+        (local.set $iters
+          (i32.load (i32.add (i32.const 380) (i32.mul (local.get $k) (i32.const 4)))))
+        (local.set $i (i32.const 0))
+        (block $sweep_str_it_done
+          (loop $sweep_str_it
+            (br_if $sweep_str_it_done (i32.ge_u (local.get $i) (local.get $iters)))
+            (local.set $in_cap (call $arena_alloc (local.get $len)))
+            (if (i32.eqz (local.get $in_cap))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 17))))
+            (local.set $j (i32.const 0))
+            (block $sw_str_fill_done
+              (loop $sw_str_fill
+                (br_if $sw_str_fill_done (i32.ge_u (local.get $j) (local.get $len)))
+                (call $write_u8
+                  (local.get $in_cap)
+                  (local.get $j)
+                  (i32.and (i32.add (i32.mul (local.get $j) (i32.const 7))
+                                    (i32.mul (local.get $i) (i32.const 11)))
+                           (i32.const 255)))
+                (local.set $j (i32.add (local.get $j) (i32.const 1)))
+                (br $sw_str_fill)))
+            (local.set $r2
+              (call $call_str_sweep (local.get $in_cap) (local.get $len) (local.get $k)))
+            (local.set $out_cap
+              (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff))))
+            ;; guard: reply[j] must equal sent[len-1-j] at 3 sampled offsets
+            (local.set $j (i32.const 0))
+            (local.set $status
+              (i32.and (i32.add (i32.mul (i32.sub (local.get $len) (i32.const 1)) (i32.const 7))
+                                (i32.mul (local.get $i) (i32.const 11)))
+                       (i32.const 255)))
+            (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 18))))
+            (local.set $j (i32.shr_u (local.get $len) (i32.const 1)))
+            (local.set $status
+              (i32.and (i32.add (i32.mul (i32.sub (i32.sub (local.get $len) (i32.const 1)) (local.get $j)) (i32.const 7))
+                                (i32.mul (local.get $i) (i32.const 11)))
+                       (i32.const 255)))
+            (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 19))))
+            (local.set $j (i32.sub (local.get $len) (i32.const 1)))
+            (local.set $status
+              (i32.and (i32.add (i32.mul (i32.sub (i32.sub (local.get $len) (i32.const 1)) (local.get $j)) (i32.const 7))
+                                (i32.mul (local.get $i) (i32.const 11)))
+                       (i32.const 255)))
+            (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
+              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 20))))
+            (call $arena_free (local.get $out_cap))
+            (call $arena_free (local.get $in_cap))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $sweep_str_it)))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br $sweep_str)))
 
     ;; ── async heavy_reduce: T13/T14 ───────────────────────────────────────
     ;; Fire-and-forget send (NO_REPLY), immediate ACK, then the real result
