@@ -144,11 +144,14 @@ mv -f "$SNAP_KERNELD" "$KERNELD"; touch "$KERNELD"
 trap - EXIT
 
 # ─── second tooth: the shared-ring path ───────────────────────────────────
-# The shm transport carries the message path in shared memory (no kernel in
-# the send/recv), so the TCP Nagle tooth above cannot catch a ring-specific
-# regression. This tooth delays the ring producer's cursor publish by 8ms
-# per frame — a stalled-producer regression that inflates the shm leg's
-# median (2us -> ~8ms) without touching TCP. The gate must fail on it.
+# The shm transport carries the ENTIRE sidecar path in shared memory — the
+# message frames (ring0/ring1) AND the arena alloc/free bookkeeping
+# (ring2/ring3 wasm<->kerneld, ring4/ring5 lisp<->kerneld) — so the TCP
+# Nagle tooth above cannot catch a ring-specific regression. This tooth
+# delays the Ring::send producer's cursor publish by 8ms per frame: every
+# ring send on the shm leg (message + arena alike) stalls, inflating the
+# shm medians (add ~2us -> ~16ms, sqrt -> ~90ms) without touching TCP. The
+# gate must fail on it.
 echo
 echo "=== tooth: delay the ring producer's publish; the shm gate must fail ==="
 RING=user/polyglot/src/ring.rs
@@ -176,7 +179,7 @@ if ! build_sidecars; then
     echo; echo "---- passed=$pass failed=$fail"; exit 1
 fi
 
-echo "running the e2e against the mutated ring (expect the gate to fail, ~15s)..."
+echo "running the e2e against the mutated ring (expect the gate to fail, ~30s)..."
 out="$(run_e2e)"; rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "tooth: the e2e latency gate did NOT fail on the ring regression — it is blind."

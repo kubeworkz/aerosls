@@ -1,9 +1,13 @@
 //! sls-kerneld — the Polyglot Nexus kernel transport for the two-process e2e.
 //!
 //! Implements the channel + arena semantics of syscalls 290 / 295 / 296 /
-//! 302 / 303 / 304 over TCP (see `polyglot::transport` for the wire format).
-//! It owns the shared arena file, the cap table (offset/len/refcount), and
-//! the per-channel FIFO queues. Capability ownership follows the IDL
+//! 302 / 303 / 304 (see `polyglot::transport` for the wire format). The
+//! message + arena paths run over TCP for the tcp transport leg, and over
+//! the shared-memory rings (`polyglot::ring`) for the shm leg: message
+//! rings ring0/ring1 between the sidecars, arena rings ring2/ring3 (wasm)
+//! and ring4/ring5 (lisp) against this process. It owns the shared arena
+//! file, the cap table (offset/len/refcount), and the per-channel FIFO
+//! queues. Capability ownership follows the IDL
 //! annotations: a descriptor flagged `CAP_FLAG_ARENA_OWNED` (0x02) is *moved*
 //! — the sender's refcount is dropped when the receiver takes delivery;
 //! `@borrowed` caps keep the sender's slot alive and the receiver drops its
@@ -222,9 +226,29 @@ fn main() {
 
     // The shared-memory channel file: the sidecars map it and exchange
     // request/reply frames directly through the ring buffers (zero-copy,
-    // no kernel in the message path). The kernel still owns the arena
-    // bookkeeping (alloc/free over TCP); only the queues moved to shm.
+    // no kernel in the message path). The arena bookkeeping (alloc/free,
+    // syscalls 290/304) also moved onto rings — each sidecar gets its own
+    // request/reply pair against this process, so no TCP round trip remains
+    // in the sidecar-to-kernel path either. The TCP listener below still
+    // serves the tcp transport leg of the e2e.
     ring::create_channel(&chan_path).expect("create channel shm");
+
+    // Arena ring threads: wasm sidecar requests (ring2 → ring3 replies),
+    // Lisp sidecar requests (ring4 → ring5 replies). Each ring is SPSC —
+    // one producer, one consumer — so the two loops never contend with
+    // each other or with the message rings.
+    {
+        let req = ring::Ring::open(&chan_path, ring::RING2_OFFSET).expect("open ring2");
+        let reply = ring::Ring::open(&chan_path, ring::RING3_OFFSET).expect("open ring3");
+        let k = Arc::clone(&kernel);
+        thread::spawn(move || ring_arena_loop(&k, req, reply));
+    }
+    {
+        let req = ring::Ring::open(&chan_path, ring::RING4_OFFSET).expect("open ring4");
+        let reply = ring::Ring::open(&chan_path, ring::RING5_OFFSET).expect("open ring5");
+        let k = Arc::clone(&kernel);
+        thread::spawn(move || ring_arena_loop(&k, req, reply));
+    }
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
     println!("READY arena={arena_path} chan={chan_path}");
@@ -236,6 +260,62 @@ fn main() {
         thread::spawn(move || {
             let _ = handle_conn(&kernel, stream);
         });
+    }
+}
+
+/// Serve arena alloc/free requests arriving on a shared ring.
+///
+/// Ring frames are `[syscall u32][req body]` — the syscall discriminates
+/// alloc (290) from free (304), mirroring the TCP frame header. The reply
+/// is the exact TCP reply body (`[rc i32][cap u16][offset u32][len u32]`
+/// for alloc, `[rc i32]` for free), so the sidecars parse ring replies and
+/// TCP replies with the same code.
+fn ring_arena_loop(k: &Kernel, req: ring::Ring, reply: ring::Ring) {
+    loop {
+        // Blocking recv (spin on the cursor — same protocol the sidecars use).
+        let Ok(body) = req.recv() else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        };
+        if body.len() < 4 {
+            reply.send(&encode_rc(CAP_EINVAL as i32)).ok();
+            continue;
+        }
+        let syscall = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let resp: Vec<u8> = match syscall {
+            SYS_ARENA_ALLOC => {
+                if body.len() < 12 {
+                    encode_rc(CAP_EINVAL as i32)
+                } else {
+                    let npages = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                    let perm = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                    let mut s = k.state.lock().unwrap();
+                    match s.alloc(npages, perm) {
+                        Ok((cap, offset, len)) => {
+                            let mut b = Vec::with_capacity(12);
+                            b.extend_from_slice(&0i32.to_le_bytes());
+                            b.extend_from_slice(&cap.to_le_bytes());
+                            b.extend_from_slice(&offset.to_le_bytes());
+                            b.extend_from_slice(&len.to_le_bytes());
+                            b
+                        }
+                        Err(rc) => encode_rc(rc as i32),
+                    }
+                }
+            }
+            SYS_CAP_ARENA_FREE => {
+                if body.len() < 6 {
+                    encode_rc(CAP_EINVAL as i32)
+                } else {
+                    let cap = u16::from_le_bytes(body[4..6].try_into().unwrap());
+                    let mut s = k.state.lock().unwrap();
+                    s.free(cap);
+                    encode_rc(0)
+                }
+            }
+            _ => encode_rc(CAP_EINVAL as i32),
+        };
+        reply.send(&resp).ok();
     }
 }
 

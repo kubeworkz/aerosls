@@ -6,12 +6,14 @@
 //! arena through host imports. The channel marshaling underneath is the real
 //! generated AeroIDL client (`gen_calculator`), whose six FFI externs are
 //! provided by the real `aerosls` runtime, whose `sls_syscall` is pointed at
-//! `sls-kerneld` over TCP.
+//! `sls-kerneld` — over TCP (`--transport tcp`) or over the shared-memory
+//! rings (`--transport shm`: message rings ring0/ring1, arena rings
+//! ring2/ring3), so the same stubs run against both transports.
 //!
 //!   guest .wat  →  host imports (this file)  →  generated client stubs
-//!      →  aerosls runtime externs  →  fake syscall  →  TCP  →  sls-kerneld
+//!      →  aerosls runtime externs  →  fake syscall  →  rings/TCP  →  sls-kerneld
 //!
-//! Usage: wasm-sidecar --port N --arena PATH
+//! Usage: wasm-sidecar --port N --arena PATH [--chan PATH] [--transport tcp|shm]
 
 extern crate alloc;
 
@@ -39,9 +41,12 @@ static BENCH_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the arena-cap path, collected inside `call_sqrt_batch`.
 static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
-/// requests, ring1 = lisp→wasm replies.
+/// requests, ring1 = lisp→wasm replies, ring2 = wasm→kerneld arena requests,
+/// ring3 = kerneld→wasm arena replies.
 static RING0: Mutex<Option<Ring>> = Mutex::new(None);
 static RING1: Mutex<Option<Ring>> = Mutex::new(None);
+static RING2: Mutex<Option<Ring>> = Mutex::new(None);
+static RING3: Mutex<Option<Ring>> = Mutex::new(None);
 /// True when the message path goes through the shared ring instead of TCP.
 static RING_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -119,11 +124,23 @@ fn ring_mode() -> bool {
     RING_MODE.load(Ordering::SeqCst)
 }
 
+/// Arena alloc/free over the shared ring: frame = `[syscall u32][req body]`
+/// (the syscall discriminates 290 alloc from 304 free, mirroring the TCP
+/// frame header); the reply is the exact TCP reply body, so the parsing
+/// below is shared with the TCP path.
+fn arena_rpc_ring(syscall: u32, req: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(4 + req.len());
+    frame.extend_from_slice(&syscall.to_le_bytes());
+    frame.extend_from_slice(req);
+    RING2.lock().unwrap().as_ref().unwrap().send(&frame).expect("ring2 send");
+    RING3.lock().unwrap().as_ref().unwrap().recv().expect("ring3 recv")
+}
+
 fn cap_table_remove(cap: u16) {
     CAP_TABLE.lock().unwrap().retain(|(c, _, _)| *c != cap);
 }
 
-// ── fake syscall: routes the real request structs over TCP ─────────────────
+// ── fake syscall: routes the real request structs over rings or TCP ────────
 
 // u64 const patterns (match arms can't use `X as u64` expressions).
 const S_ARENA_ALLOC: u64 = SYS_ARENA_ALLOC as u64;
@@ -137,10 +154,14 @@ fn fake_syscall(num: u64, arg: u64) -> u64 {
     match num {
         S_ARENA_ALLOC => {
             let req = unsafe { &*(arg as *const ArenaAllocReq) };
-            let reply = rpc(
-                SYS_ARENA_ALLOC,
-                &encode_alloc_in(req.npages, req.perm as u32),
-            );
+            let reply = if ring_mode() {
+                arena_rpc_ring(SYS_ARENA_ALLOC, &encode_alloc_in(req.npages, req.perm as u32))
+            } else {
+                rpc(
+                    SYS_ARENA_ALLOC,
+                    &encode_alloc_in(req.npages, req.perm as u32),
+                )
+            };
             let rc = i32::from_le_bytes(reply[0..4].try_into().unwrap());
             if rc != 0 {
                 return (rc as i64) as u64;
@@ -229,7 +250,11 @@ fn fake_syscall(num: u64, arg: u64) -> u64 {
         }
         S_ARENA_FREE => {
             let req = unsafe { &*(arg as *const ArenaFreeReq) };
-            let _ = rpc(SYS_CAP_ARENA_FREE, &encode_free_in(req.cap_idx));
+            if ring_mode() {
+                let _ = arena_rpc_ring(SYS_CAP_ARENA_FREE, &encode_free_in(req.cap_idx));
+            } else {
+                let _ = rpc(SYS_CAP_ARENA_FREE, &encode_free_in(req.cap_idx));
+            }
             cap_table_remove(req.cap_idx);
             0
         }
@@ -317,6 +342,8 @@ fn main() {
         }
         *RING0.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING0_OFFSET).expect("open ring0"));
         *RING1.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING1_OFFSET).expect("open ring1"));
+        *RING2.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING2_OFFSET).expect("open ring2"));
+        *RING3.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING3_OFFSET).expect("open ring3"));
         RING_MODE.store(true, Ordering::SeqCst);
         println!("TRANSPORT shm chan={chan_path}");
     } else {

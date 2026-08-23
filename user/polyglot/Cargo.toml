@@ -2,7 +2,7 @@
 name = "polyglot"
 version = "0.1.0"
 edition = "2021"
-description = "Polyglot Nexus two-process e2e: sls-kerneld transport (syscalls 290/295-296/302-304 wire ABI over TCP), a wasmi-embedding Wasm sidecar, and a real SBCL Lisp sidecar sharing one arena"
+description = "Polyglot Nexus two-process e2e: sls-kerneld transport (syscalls 290/295-296/302-304 wire ABI over TCP or shared-memory rings), a wasmi-embedding Wasm sidecar, and a real SBCL Lisp sidecar sharing one arena"
 license = "MIT"
 
 # This crate is host-only (std): it links the `aerosls` runtime in its host-fake

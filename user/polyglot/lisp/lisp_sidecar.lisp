@@ -1,7 +1,9 @@
 ;;; lisp_sidecar.lisp — the real Lisp sidecar of the two-process e2e.
 ;;;
 ;;; A SBCL process that:
-;;;   1. connects to sls-kerneld over TCP (the 302-304 wire ABI),
+;;;   1. connects to sls-kerneld over TCP (the 302-304 wire ABI) or, in
+;;;      TRANSPORT=shm mode, talks entirely through the shared rings (ring0
+;;;      messages, ring4/ring5 arena alloc/free) with no TCP at all,
 ;;;   2. mmaps the shared arena file (the zero-copy path — the same pages
 ;;;      the Wasm sidecar writes),
 ;;;   3. loads the generated tools/aeroidl/gen/calculator.lisp dispatch table,
@@ -71,20 +73,28 @@
 (defvar *chan-base* nil)           ; SAP into the shared channel mapping
 (defvar *chan-ring0* nil)          ; ring0 header: wasm->lisp (we consume)
 (defvar *chan-ring1* nil)          ; ring1 header: lisp->wasm (we produce)
+(defvar *chan-ring4* nil)          ; ring4 header: lisp->kerneld arena req (we produce)
+(defvar *chan-ring5* nil)          ; ring5 header: kerneld->lisp arena reply (we consume)
 (defvar *cap-table* '())           ; list of (cap offset len)
 (defvar *next-req-id* 0)
 (defvar *service-dispatch* nil)     ; bound after loading the generated table
 
 ;; ── shared ring layout (must match polyglot::ring in ring.rs) ─────────────
-;; ring0 header at 0, ring1 header at 32 + 4 MiB; each header is 32 bytes
-;; (magic u32 @0, version u32 @4, capacity u32 @8, pad u32 @12, write u64
-;; @16, read u64 @24) followed by a 4 MiB data region. Frames are
-;; [body_len u32][body]. Synchronization is the SPSC release/acquire cursor
-;; protocol; on x86 (the only platform this e2e runs on) plain 64-bit
-;; loads/stores under TSO give the same ordering as the Rust atomics.
+;; Six rings, each 32-byte header (magic u32 @0, version u32 @4, capacity
+;; u32 @8, pad u32 @12, write u64 @16, read u64 @24) + a 4 MiB data region,
+;; laid out consecutively in the channel file: ring0 wasm->lisp, ring1
+;; lisp->wasm, ring2 wasm->kerneld arena req, ring3 kerneld->wasm arena
+;; reply, ring4 lisp->kerneld arena req (we produce), ring5 kerneld->lisp
+;; arena reply (we consume). Frames are [body_len u32][body]. Synchronization
+;; is the SPSC release/acquire cursor protocol; on x86 (the only platform
+;; this e2e runs on) plain 64-bit loads/stores under TSO give the same
+;; ordering as the Rust atomics.
 (defparameter *ring-header-len* 32)
 (defparameter *ring-capacity* 4194304)   ; 4 MiB data per direction
-(defparameter *ring1-offset* (+ *ring-header-len* *ring-capacity*))
+(defparameter *ring-slot-size* (+ *ring-header-len* *ring-capacity*))
+(defparameter *ring1-offset* *ring-slot-size*)
+(defparameter *ring4-offset* (* 4 *ring-slot-size*))
+(defparameter *ring5-offset* (* 5 *ring-slot-size*))
 
 ;; ── little-endian helpers ──────────────────────────────────────────────────
 
@@ -209,16 +219,29 @@
 (defun aerosls:next-request-id ()
   (incf *next-req-id*))
 
+(defun arena-rpc (syscall req)
+  "Arena syscall over the current transport — returns the reply body.
+   TCP: rpc 290/304. Ring: push [syscall u32][req] into ring4 and block on
+   ring5 (kerneld's per-sidecar arena ring thread services it)."
+  (if *ring-mode*
+      (let ((frame (make-array (+ 4 (length req))
+                               :element-type '(unsigned-byte 8))))
+        (put-le32 frame 0 syscall)
+        (replace frame req :start1 4)
+        (ring-send *chan-ring4* frame)
+        (ring-recv *chan-ring5*))
+      (rpc syscall req)))
+
 (defun cap-table-find (cap)
   (assoc cap *cap-table*))
 
 (defun aerosls:arena-alloc (size &key (rights '(:read :write)))
   (declare (ignore rights))
   (let* ((npages (max 1 (ceiling size 4096)))
-         (body (make-array 8 :element-type '(unsigned-byte 8))))
-    (put-le32 body 0 npages)
-    (put-le32 body 4 3)               ; R | W
-    (let ((reply (rpc 290 body)))
+         (req (make-array 8 :element-type '(unsigned-byte 8))))
+    (put-le32 req 0 npages)
+    (put-le32 req 4 3)               ; R | W
+    (let ((reply (arena-rpc 290 req)))
       (if (/= (le32 reply 0) 0)
           (progn (format t "[lisp] arena-alloc failed rc=~A~%" (le32 reply 0)) nil)
           (let ((cap (le16 reply 4))
@@ -283,9 +306,9 @@
             (le32 reply 0))))))
 
 (defun aerosls:arena-free (cap)
-  (let ((body (make-array 2 :element-type '(unsigned-byte 8))))
-    (put-le16 body 0 cap)
-    (rpc 304 body)
+  (let ((req (make-array 2 :element-type '(unsigned-byte 8))))
+    (put-le16 req 0 cap)
+    (arena-rpc 304 req)
     (setf *cap-table* (remove cap *cap-table* :key #'first))
     nil))
 
@@ -388,11 +411,13 @@
       (error "CHAN_PATH is required with TRANSPORT=shm"))
     (let ((fd (sb-posix:open *chan-path* sb-posix:o-rdwr)))
       (setf *chan-base*
-            (sb-posix:mmap nil (+ (* 2 (+ *ring-header-len* *ring-capacity*)))
+            (sb-posix:mmap nil (* 6 *ring-slot-size*)
                            (logior sb-posix:prot-read sb-posix:prot-write)
                            sb-posix:map-shared fd 0))
       (setf *chan-ring0* (sb-sys:sap+ *chan-base* 0))
-      (setf *chan-ring1* (sb-sys:sap+ *chan-base* *ring1-offset*)))
+      (setf *chan-ring1* (sb-sys:sap+ *chan-base* *ring1-offset*))
+      (setf *chan-ring4* (sb-sys:sap+ *chan-base* *ring4-offset*))
+      (setf *chan-ring5* (sb-sys:sap+ *chan-base* *ring5-offset*)))
     (format t "[lisp] channel mapped, ring-mode ON~%")
     (finish-output t))
   (load *calc-lisp-path*)

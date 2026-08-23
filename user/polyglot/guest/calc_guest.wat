@@ -74,8 +74,11 @@
     ;; ── sqrt_batch latency bench: 100 calls, 4096-f64 arena array each ──
     ;; fresh input buffer per iteration (the host times call_sqrt_batch),
     ;; results are owned caps we release immediately; correctness is covered
-    ;; by the single verified call below.
+    ;; by the single verified call below. NB: $n must be set BEFORE the loop —
+    ;; it was previously 0 here (locals are zero-initialized), so the bench
+    ;; silently measured count=0 calls; the arena-ring change exposed it.
     (local.set $i (i32.const 0))
+    (local.set $n (i32.const 4096))
     (block $sqrt_bench_done
       (loop $sqrt_bench
         (br_if $sqrt_bench_done (i32.ge_u (local.get $i) (i32.const 100)))

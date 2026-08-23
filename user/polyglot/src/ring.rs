@@ -2,14 +2,18 @@
 //! single-consumer ring buffer per direction, mmap'd from a file both
 //! sidecars map (the channel file, created by `sls-kerneld`).
 //!
-//! This replaces the kernel in the message data path: a wasm→lisp call is
-//! now a frame pushed into ring0 (wasm produces, Lisp consumes) and the
-//! reply is a frame pushed into ring1 (Lisp produces, wasm consumes). The
-//! arena bytes and the cap descriptors inside the frames travel by
-//! reference (arena offset + len), never copied — the zero-copy gain the
-//! bench legs measure. `sls-kerneld` still owns the arena bookkeeping
-//! (alloc/free, syscalls 290/304) over TCP; only the message queues moved
-//! into shared memory.
+//! This replaces the kernel in the entire sidecar-to-kernel data path:
+//! a wasm→lisp call is a frame pushed into ring0 (wasm produces, Lisp
+//! consumes) and the reply is a frame pushed into ring1 (Lisp produces,
+//! wasm consumes). The arena bytes and the cap descriptors inside the
+//! frames travel by reference (arena offset + len), never copied — the
+//! zero-copy gain the bench legs measure. The arena bookkeeping (alloc /
+//! free, syscalls 290/304) also lives on rings: each sidecar gets its own
+//! request/reply pair against `sls-kerneld` (ring2 wasm→kerneld, ring3
+//! kerneld→wasm, ring4 lisp→kerneld, ring5 kerneld→lisp) so the kernel's
+//! bump cursor + refcounts are reached through shared memory, not TCP.
+//! SPSC is preserved per ring: each ring has exactly one producer and one
+//! consumer, so the release/acquire cursor protocol never contends.
 //!
 //! Synchronization is the textbook SPSC protocol with release/acquire
 //! cursors (plain movs on x86, so the SBCL side can speak the same wire
@@ -37,9 +41,15 @@ pub const RING_HEADER_LEN: usize = 32;
 /// Data region size per direction.
 pub const RING_CAPACITY: usize = 4 * 1024 * 1024;
 /// ring0: wasm→lisp requests. ring1: lisp→wasm replies.
+/// ring2: wasm→kerneld arena requests. ring3: kerneld→wasm arena replies.
+/// ring4: lisp→kerneld arena requests. ring5: kerneld→lisp arena replies.
 pub const RING0_OFFSET: usize = 0;
 pub const RING1_OFFSET: usize = RING_HEADER_LEN + RING_CAPACITY;
-pub const CHAN_FILE_SIZE: usize = RING_HEADER_LEN * 2 + RING_CAPACITY * 2;
+pub const RING2_OFFSET: usize = 2 * (RING_HEADER_LEN + RING_CAPACITY);
+pub const RING3_OFFSET: usize = 3 * (RING_HEADER_LEN + RING_CAPACITY);
+pub const RING4_OFFSET: usize = 4 * (RING_HEADER_LEN + RING_CAPACITY);
+pub const RING5_OFFSET: usize = 5 * (RING_HEADER_LEN + RING_CAPACITY);
+pub const CHAN_FILE_SIZE: usize = RING_HEADER_LEN * 6 + RING_CAPACITY * 6;
 
 /// Header layout: magic u32 @0, version u32 @4, capacity u32 @8, pad u32
 /// @12, write u64 @16, read u64 @24. 32 bytes, page-aligned by mmap.
@@ -116,7 +126,14 @@ pub fn create_channel(path: &str) -> io::Result<()> {
     }
     let (base, len) = map_channel(path)?;
     unsafe { std::slice::from_raw_parts_mut(base, len) }.fill(0);
-    for offset in [RING0_OFFSET, RING1_OFFSET] {
+    for offset in [
+        RING0_OFFSET,
+        RING1_OFFSET,
+        RING2_OFFSET,
+        RING3_OFFSET,
+        RING4_OFFSET,
+        RING5_OFFSET,
+    ] {
         unsafe {
             let b = base.add(offset);
             std::ptr::write_unaligned(b as *mut u32, RING_MAGIC);

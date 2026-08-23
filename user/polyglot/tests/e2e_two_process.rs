@@ -3,22 +3,24 @@
 //!
 //! ```text
 //!   sls-kerneld  (arena file + cap refcounts; message path is the choice)
-//!      ▲ 290/304 wire ABI (arena alloc/free)        ▲
-//!      │                                            │
-//!   wasm-sidecar (wasmi embedding)            lisp-sidecar (real SBCL)
-//!      │  shared arena mmap ◄─────────────────────►│
+//!      ▲ ring2/3 wasm alloc-free, ring4/5 lisp alloc-free     ▲
+//!      │                                                    │
+//!   wasm-sidecar (wasmi embedding)                    lisp-sidecar (real SBCL)
+//!      │  shared arena mmap ◄─────────────────────────────►│
 //!      └── transport: TCP via kerneld  OR  shared-memory ring (shm) ──┘
 //! ```
 //!
 //! Each leg spawns the wasm + lisp sidecars with `--transport tcp` or
 //! `--transport shm` and runs the same guest (add + sqrt_batch over a
 //! 4096-element f64 array, plus the 1000-call add latency bench and the
-//! 100-call arena sqrt bench). In the `shm` leg the request/reply frames
-//! travel through the shared channel rings (ring0 wasm→lisp, ring1
-//! lisp→wasm) — no kernel in the message path — while the array data still
-//! travels through the shared arena by MEM cap, never copied. Both legs
-//! must pass the latency gate; the BENCH_JSON lines carry a `transport`
-//! field so CI archives the two transports' medians separately.
+//! 100-call arena sqrt bench). In the `shm` leg the ENTIRE sidecar path is
+//! shared memory: the request/reply frames travel ring0/ring1 (wasm↔lisp,
+//! no kernel) and the arena alloc/free bookkeeping travels ring2/ring3
+//! (wasm↔kerneld) and ring4/ring5 (lisp↔kerneld) — no TCP round trip
+//! remains on the shm leg. The array data always travels through the
+//! shared arena by MEM cap, never copied. Both legs must pass the latency
+//! gate; the BENCH_JSON lines carry a `transport` field so CI archives
+//! the two transports' medians separately.
 //!
 //! Prerequisites (skipped with a clear message when absent):
 //!   - Linux binaries in `POLYGLOT_TARGET_DIR` (built by run_e2e.sh via WSL)
@@ -211,9 +213,11 @@ fn run_leg(
 
     // ── latency regression gate (per transport leg) ──────────────────────
     // Fail if either bench leg's median round trip exceeds the threshold.
-    // Measured medians are ~0.6ms (add) and ~1.5ms (sqrt) over TCP — the
-    // shared-ring leg is expected to be faster. 5ms default catches an
-    // order-of-magnitude transport regression with wide headroom.
+    // Measured medians are ~0.7ms (add) and ~1.5ms (sqrt) over TCP; the
+    // shared-ring leg is ~200x faster on add (~3us) and ~9x faster on sqrt
+    // (~175us, still dominated by 4096 real SBCL sqrts) — all sidecar
+    // traffic, message + arena bookkeeping, is shared memory. 5ms default
+    // catches an order-of-magnitude transport regression with wide headroom.
     for (name, bench) in [("BENCH_ADD", &bench_add), ("BENCH_SQRT", &bench_sqrt)] {
         let Some(line) = bench else {
             kill_child(&mut lisp);
