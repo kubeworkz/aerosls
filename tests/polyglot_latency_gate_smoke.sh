@@ -192,6 +192,57 @@ fi
 mv -f "$SNAP_RING" "$RING"; touch "$RING"
 trap - EXIT
 
+# ─── third tooth: the bench-workload guard ─────────────────────────────────
+# The sqrt bench must measure REAL 4096-element work. A count=0 regression
+# (the $n-before-loop bug: wasm locals zero-initialize, so the bench loop
+# silently passed count=0 — a 4KiB alloc, an empty fill, zero sqrts) sailed
+# through the latency gate because the exhaustive verification call re-set
+# $n=4096 itself. The guest now samples two outputs per timed iteration
+# (mid + last): unwritten elements are zeroed arena pages and sqrt(i) != 0,
+# so the |v*v - i| check trips and the guest returns FAIL. This tooth
+# removes the bench's $n=4096 set, recreating the count=0 bug, and
+# requires the e2e to FAIL on it.
+echo
+echo "=== tooth: drop the bench's \$n=4096 (count=0 regression); the workload guard must fail ==="
+GUEST=user/polyglot/guest/calc_guest.wat
+SNAP_GUEST="${GUEST}.smoke.bak"
+cp "$GUEST" "$SNAP_GUEST" || { bad "cannot snapshot $GUEST"; exit 1; }
+trap "mv -f \"$SNAP_GUEST\" \"$GUEST\" 2>/dev/null; rm -f \"$SNAP_GUEST\"" EXIT
+
+# (d) remove the FIRST `(local.set $n (i32.const 4096))` — the one before
+#     the bench loop. The verification call's later set stays, so the
+#     exhaustive check would still pass and only the guard can catch it.
+sed -i '0,/^    (local.set \$n (i32.const 4096))$/s@^    (local.set \$n (i32.const 4096))$@@' "$GUEST"
+
+if cmp -s "$GUEST" "$SNAP_GUEST"; then
+    bad "tooth: the guest mutation did not apply — the \$n pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_GUEST" "$GUEST"; touch "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+touch "$GUEST"   # make the mutation visible to cargo's include_str! tracking
+ok "tooth: guest mutation applied (bench \$n=4096 removed — count=0 regression recreated)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated guest does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_GUEST" "$GUEST"; touch "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+echo "running the e2e against the mutated guest (expect the workload guard to fail, ~5s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the count=0 bench regression — the workload guard is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|FAIL sqrt-bench|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (bench-workload guard caught the count=0 regression)"
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_GUEST" "$GUEST"; touch "$GUEST"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -208,13 +259,13 @@ else
 fi
 
 dirty=0
-for f in "$TRANSPORT" "$KERNELD"; do
+for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST"; do
     if [ -f "${f}.smoke.bak" ]; then
         bad "leftover ${f}.smoke.bak after restore"
         dirty=$((dirty+1))
     fi
 done
-[ "$dirty" -eq 0 ] && ok "no leftovers from the tooth"
+[ "$dirty" -eq 0 ] && ok "no leftovers from the teeth"
 
 echo
 echo "---- passed=$pass failed=$fail"

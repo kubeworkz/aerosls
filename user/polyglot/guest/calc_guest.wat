@@ -41,6 +41,7 @@
   (data (i32.const 64) "PASS add(2,3)=5 sqrt verified\00")
   (data (i32.const 160) "FAIL add\00")
   (data (i32.const 192) "FAIL sqrt\00")
+  (data (i32.const 224) "FAIL sqrt-bench\00")
 
   (func (export "run") (result i32)
     (local $r i64) (local $r2 i64)
@@ -96,6 +97,31 @@
         (local.set $r2 (call $call_sqrt_batch (local.get $n) (local.get $in_cap)))
         (local.set $out_cap
           (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff))))
+
+        ;; ── bench-workload guard ──────────────────────────────────────────
+        ;; The timed call must have done REAL 4096-element work. Sample two
+        ;; outputs (mid + last): if count <= index the element was never
+        ;; written (fresh arena pages are zeroed) and sqrt(i) != 0, so the
+        ;; |v*v - i| < 1e-6 check trips. This catches a silent count=0
+        ;; regression in the bench (the $n-before-loop bug) while the full
+        ;; 4096-element verification below stays the exhaustive check.
+        ;; These reads are OUTSIDE the timed host import, so they never
+        ;; inflate the measured round trip.
+        (local.set $j (i32.const 2048))
+        (local.set $v (f64.reinterpret_i64 (call $read_f64 (local.get $out_cap) (local.get $j))))
+        (local.set $err
+          (f64.sub (f64.mul (local.get $v) (local.get $v))
+                   (f64.convert_i32_u (local.get $j))))
+        (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
+          (then (call $log (i32.const 224) (i32.const 15)) (return (i32.const 7))))
+        (local.set $j (i32.const 4095))
+        (local.set $v (f64.reinterpret_i64 (call $read_f64 (local.get $out_cap) (local.get $j))))
+        (local.set $err
+          (f64.sub (f64.mul (local.get $v) (local.get $v))
+                   (f64.convert_i32_u (local.get $j))))
+        (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
+          (then (call $log (i32.const 224) (i32.const 15)) (return (i32.const 7))))
+
         (call $arena_free (local.get $out_cap))
         (call $arena_free (local.get $in_cap))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
