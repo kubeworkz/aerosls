@@ -542,11 +542,12 @@ mv -f "$SNAP_DRIFT" "$DRIFT"
 trap - EXIT
 
 # ─── eleventh tooth: the IPC baseline gate ────────────────────────────────
-# The e2e now gates the baseline legs (local call, pipe, Unix socketpair)
-# so "how fast is ordinary IPC" cannot silently degrade. This tooth makes
-# the pipe baseline unrealistically slow — a 1ms sleep inside the pipe
-# round trip — and requires the e2e to FAIL on the BENCH_PIPE baseline
-# gate, then restores byte-identically and requires it to PASS again.
+# The e2e now gates the baseline legs (local call, pipe, Unix socketpair —
+# each at 1-byte and 64-KiB payloads, the design doc's T9-T12) so "how fast
+# is ordinary IPC" cannot silently degrade. This tooth makes the 1-byte
+# pipe baseline unrealistically slow — a 600us sleep inside the pipe round
+# trip — and requires the e2e to FAIL on the BENCH_PIPE_1B baseline gate,
+# then restores byte-identically and requires it to PASS again.
 echo
 echo "=== tooth: the pipe baseline gate must catch a broken pipe path ==="
 SNAP_SIDECAR="${SIDECAR}.smoke.bak"
@@ -571,10 +572,10 @@ if ! build_sidecars; then
 else
     out="$(run_e2e)"; rc=$?
     if [ "$rc" -eq 0 ]; then
-        bad "tooth: the e2e did NOT fail on the broken pipe baseline — the BENCH_PIPE gate is blind."
+        bad "tooth: the e2e did NOT fail on the broken pipe baseline — the BENCH_PIPE_1B gate is blind."
         printf '%s\n' "$out" | grep -E 'BENCH_PIPE|baseline|panicked' | sed 's/^/        /'
     else
-        ok "tooth: the e2e failed as required (BENCH_PIPE baseline median >> 500us caught the broken pipe path)"
+        ok "tooth: the e2e failed as required (BENCH_PIPE_1B baseline median >> 500us caught the broken pipe path)"
     fi
 fi
 
@@ -728,6 +729,52 @@ fi
 mv -f "$SNAP_KERNELD2" "$KERNELD"
 trap - EXIT
 touch "$KERNELD"
+
+# ─── fifteenth tooth: the 64KiB IPC baseline gate (T10/T12) ──────────────
+# The baselines now bench the design doc's 64-KiB pipe and socketpair
+# round trips (T10/T12) alongside the 1-byte legs (T9/T11), gated at 5ms
+# each. The eleventh tooth stalls the 1-byte pipe at 600us — far under the
+# 5ms 64-KiB gate, so it cannot prove the 64-KiB gate bites. This tooth
+# stalls the 64-KiB pipe bench by 6ms per round trip (shrunken to 1000
+# iterations so the run finishes in seconds) and requires the e2e to FAIL
+# on BENCH_PIPE_64K, then restores byte-identically.
+echo
+echo "=== tooth: stall the 64-KiB pipe bench; the BENCH_PIPE_64K gate must fail ==="
+SNAP_SIDECAR3="${SIDECAR}.smoke3.bak"
+cp "$SIDECAR" "$SNAP_SIDECAR3" || { bad "cannot snapshot $SIDECAR (3rd)"; exit 1; }
+trap "mv -f \"$SNAP_SIDECAR3\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR2\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR\" \"$SIDECAR\" 2>/dev/null; rm -f \"$SNAP_SIDECAR\" \"$SNAP_SIDECAR2\" \"$SNAP_SIDECAR3\"" EXIT
+
+# (o) 6ms sleep per 64-KiB pipe round trip (median ~6ms vs the 5ms gate),
+# and shrink the bench to 1000 iterations so the run stays fast.
+sed -i 's@let pipe_64k = bench_roundtrip(20_000, || {@let pipe_64k = bench_roundtrip(1000, || {\n        std::thread::sleep(std::time::Duration::from_micros(6000));@' "$SIDECAR"
+
+if cmp -s "$SIDECAR" "$SNAP_SIDECAR3"; then
+    bad "tooth: the 64-KiB pipe mutation did not apply — the bench pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_SIDECAR3" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: 64-KiB pipe mutation applied (6ms sleep per round trip — median ~6ms vs the 5ms gate)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated sidecar does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_SIDECAR3" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the stalled 64-KiB pipe — the BENCH_PIPE_64K gate is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH_PIPE|baseline|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (BENCH_PIPE_64K median >> 5ms caught the broken 64-KiB pipe path)"
+fi
+
+# ─── restore byte-identically (5th) ────────────────────────────────────────
+mv -f "$SNAP_SIDECAR3" "$SIDECAR"
+trap - EXIT
+touch "$SIDECAR"
 
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="

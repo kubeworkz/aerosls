@@ -242,8 +242,10 @@ fn run_leg(
     // WASM_SIDECAR (the three baseline legs print before the three
     // cross-sidecar legs, both before the verdict).
     let bench_local = wait_for_marker(&wasm_out, "BENCH_LOCAL", Duration::from_secs(60));
-    let bench_pipe = wait_for_marker(&wasm_out, "BENCH_PIPE", Duration::from_secs(60));
-    let bench_sock = wait_for_marker(&wasm_out, "BENCH_SOCK", Duration::from_secs(60));
+    let bench_pipe = wait_for_marker(&wasm_out, "BENCH_PIPE_1B", Duration::from_secs(60));
+    let bench_pipe64k = wait_for_marker(&wasm_out, "BENCH_PIPE_64K", Duration::from_secs(60));
+    let bench_sock = wait_for_marker(&wasm_out, "BENCH_SOCK_1B", Duration::from_secs(60));
+    let bench_sock64k = wait_for_marker(&wasm_out, "BENCH_SOCK_64K", Duration::from_secs(60));
     let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
     let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
     let bench_str = wait_for_marker(&wasm_out, "BENCH_STR", Duration::from_secs(60));
@@ -338,16 +340,22 @@ fn run_leg(
     }
 
     // ── baseline gate (once per invocation, transport-independent) ───────
-    // The three baseline legs answer "how much faster is a cross-sidecar
+    // The five baseline legs answer "how much faster is a cross-sidecar
     // call than ordinary IPC": a local call is ~ns, a pipe ~1-5us, a Unix
-    // socketpair ~2-10us on any modern core. Gate them with wide headroom
-    // (local 1000x, pipe/socket 100x) so a host where the kernel IPC path
-    // went catastrophically wrong fails the build, while CI noise never
-    // trips it.
+    // socketpair ~2-10us on any modern core — at 1-byte payloads. The
+    // design doc's T10/T12 add the 64 KiB variants (pipe ~5us, socket
+    // ~10us) so the zero-copy transport can be compared against IPC at
+    // scale. Gate all of them with wide headroom (local 1000x, pipe/socket
+    // 100x) so a host where the kernel IPC path went catastrophically
+    // wrong fails the build, while CI noise never trips it. The 64 KiB legs
+    // get 10x the 1-byte headroom (moving 64 KiB through the kernel takes
+    // longer and is more scheduling-sensitive).
     for (name, bench, max) in [
         ("BENCH_LOCAL", &bench_local, 10_000),
-        ("BENCH_PIPE", &bench_pipe, 500_000),
-        ("BENCH_SOCK", &bench_sock, 500_000),
+        ("BENCH_PIPE_1B", &bench_pipe, 500_000),
+        ("BENCH_PIPE_64K", &bench_pipe64k, 5_000_000),
+        ("BENCH_SOCK_1B", &bench_sock, 500_000),
+        ("BENCH_SOCK_64K", &bench_sock64k, 5_000_000),
     ] {
         let Some(line) = bench else {
             kill_child(&mut lisp);

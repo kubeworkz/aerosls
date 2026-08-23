@@ -53,12 +53,15 @@ static BENCH_ADD_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// BENCH_STR_SAMPLES — same split convention as the SQRT leg.
 static BENCH_STR_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Baseline round-trip samples (cycles): local wasm-side call, Linux pipe,
-/// Unix socketpair. Collected once per sidecar run by `run_baseline_benches`
-/// (transport-independent), so both legs report the same numbers — the
-/// design's T1/T9/T10/T11/T12 comparison points for the cross-sidecar legs.
+/// Unix socketpair — each at 1-byte and 64-KiB payloads (the design doc's
+/// T9/T10 and T11/T12 pairs). Collected once per sidecar run by
+/// `run_baseline_benches` (transport-independent), so both legs report the
+/// same numbers — the design's T1/T9-T12 comparison points.
 static BENCH_LOCAL_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static BENCH_PIPE_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static BENCH_PIPE_64K_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static BENCH_SOCK_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static BENCH_SOCK_64K_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
 /// requests, ring1 = lisp→wasm replies, ring2 = wasm→kerneld arena requests,
 /// ring3 = kerneld→wasm arena replies.
@@ -335,10 +338,11 @@ fn bench_roundtrip<F: FnMut()>(n: usize, mut f: F) -> Vec<u64> {
 }
 
 /// Run the design's comparison baselines (T1/T9-T12) once per sidecar run:
-/// a local wasm-side function call, a Linux pipe write+read round trip, and
-/// a Unix socketpair send+recv round trip. They answer "how much faster is a
-/// cross-sidecar call than ordinary IPC" and are gated by the e2e like the
-/// cross-sidecar legs. Linux-only (the sidecar already is).
+/// a local wasm-side function call, Linux pipe write+read round trips at
+/// 1 byte and 64 KiB, and Unix socketpair send+recv round trips at the same
+/// two sizes. They answer "how much faster is a cross-sidecar call than
+/// ordinary IPC" and are gated by the e2e like the cross-sidecar legs.
+/// Linux-only (the sidecar already is).
 #[cfg(target_os = "linux")]
 fn run_baseline_benches() {
     // T1: local call — a plain function call with trivial body, no kernel
@@ -350,8 +354,8 @@ fn run_baseline_benches() {
     });
     BENCH_LOCAL_SAMPLES.lock().unwrap().extend(local);
 
-    // T9/T10: Linux pipe — write 1 byte, read it back (kernel buffer, two
-    // syscalls per round trip).
+    // T9: Linux pipe, 1 byte — write 1 byte, read it back (kernel buffer,
+    // two syscalls per round trip).
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     assert_eq!(rc, 0, "pipe() failed");
@@ -364,13 +368,32 @@ fn run_baseline_benches() {
         core::hint::black_box(&buf);
     });
     BENCH_PIPE_SAMPLES.lock().unwrap().extend(pipe);
+
+    // T10: Linux pipe, 64 KiB — write 64 KiB, read it back. Grow the pipe
+    // buffer first (F_SETPIPE_SZ) so a full 64 KiB write never blocks on a
+    // full buffer (the default 64 KiB pipe capacity would deadlock: the
+    // writer would block until a reader drains, but the reader is us, after
+    // the write). The payload stays in the arena-sized range the design's
+    // H6 covers.
+    let rc = unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 512 * 1024) };
+    assert!(rc >= 0, "F_SETPIPE_SZ failed");
+    let pipe_64k = bench_roundtrip(20_000, || {
+        let mut buf = [0x5au8; 64 * 1024];
+        unsafe {
+            assert_eq!(libc::write(fds[1], buf.as_ptr() as *const _, buf.len()), buf.len() as isize);
+            assert_eq!(libc::read(fds[0], buf.as_mut_ptr() as *mut _, buf.len()), buf.len() as isize);
+        }
+        core::hint::black_box(&buf);
+    });
+    BENCH_PIPE_64K_SAMPLES.lock().unwrap().extend(pipe_64k);
     unsafe {
         libc::close(fds[0]);
         libc::close(fds[1]);
     }
 
-    // T11/T12: Unix socketpair — send 1 byte, recv it back (stream socket,
-    // two syscalls per round trip, still the kernel's socket machinery).
+    // T11: Unix socketpair, 1 byte — send 1 byte, recv it back (stream
+    // socket, two syscalls per round trip, still the kernel's socket
+    // machinery).
     let mut sv = [0i32; 2];
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
     assert_eq!(rc, 0, "socketpair() failed");
@@ -383,6 +406,22 @@ fn run_baseline_benches() {
         core::hint::black_box(&buf);
     });
     BENCH_SOCK_SAMPLES.lock().unwrap().extend(sock);
+
+    // T12: Unix socketpair, 64 KiB — send 64 KiB, recv it back. MSG_WAITALL
+    // makes recv return the full payload instead of a partial stream read;
+    // the send buffer is large enough that a single 64 KiB send completes.
+    let sock_64k = bench_roundtrip(20_000, || {
+        let mut buf = [0x5au8; 64 * 1024];
+        unsafe {
+            assert_eq!(libc::send(sv[1], buf.as_ptr() as *const _, buf.len(), 0), buf.len() as isize);
+            assert_eq!(
+                libc::recv(sv[0], buf.as_mut_ptr() as *mut _, buf.len(), libc::MSG_WAITALL),
+                buf.len() as isize
+            );
+        }
+        core::hint::black_box(&buf);
+    });
+    BENCH_SOCK_64K_SAMPLES.lock().unwrap().extend(sock_64k);
     unsafe {
         libc::close(sv[0]);
         libc::close(sv[1]);
@@ -867,10 +906,14 @@ fn main() {
     run_baseline_benches();
     let local_samples = std::mem::take(&mut *BENCH_LOCAL_SAMPLES.lock().unwrap());
     let pipe_samples = std::mem::take(&mut *BENCH_PIPE_SAMPLES.lock().unwrap());
+    let pipe_64k = std::mem::take(&mut *BENCH_PIPE_64K_SAMPLES.lock().unwrap());
     let sock_samples = std::mem::take(&mut *BENCH_SOCK_SAMPLES.lock().unwrap());
+    let sock_64k = std::mem::take(&mut *BENCH_SOCK_64K_SAMPLES.lock().unwrap());
     print_bench_baseline("LOCAL", &local_samples, "local wasm-side function call (T1)");
-    print_bench_baseline("PIPE", &pipe_samples, "Linux pipe 1B write+read round trip (T9/T10)");
-    print_bench_baseline("SOCK", &sock_samples, "Unix socketpair 1B send+recv round trip (T11/T12)");
+    print_bench_baseline("PIPE_1B", &pipe_samples, "Linux pipe 1B write+read round trip (T9)");
+    print_bench_baseline("PIPE_64K", &pipe_64k, "Linux pipe 64KiB write+read round trip (T10)");
+    print_bench_baseline("SOCK_1B", &sock_samples, "Unix socketpair 1B send+recv round trip (T11)");
+    print_bench_baseline("SOCK_64K", &sock_64k, "Unix socketpair 64KiB send+recv round trip (T12)");
 
     // ── latency reports: median/p99 of the guest's round trips ────────────
     // Drop the first sample of each leg — the guest's verification calls,
