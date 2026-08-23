@@ -491,6 +491,55 @@ printf '%s\n' "$out" | grep -q 'no compute_ns in one side' \
 rm -rf "$TMP"
 trap - EXIT
 
+# ─── tenth tooth: the drift step itself going blind ──────────────────────
+# The teeth above run the REAL tests/polyglot_drift_check.py — so if that
+# script is changed to stop warning (e.g. someone raises the threshold or
+# makes warn() a no-op), the ninth tooth's inversion assertion is the first
+# thing to fail. This tooth proves that: it mutates the script's threshold
+# to 10x (so the 2.2x transport inversion no longer trips), then re-runs
+# the exact inversion case the ninth tooth uses and requires the smoke's
+# own assertion to FAIL — i.e. the smoke catches the drift step going
+# blind. Restores byte-identically afterwards; the real inversion check in
+# the ninth tooth is the gate that passes again.
+echo
+echo "=== tooth: the drift script going blind must fail the smoke ==="
+SNAP_DRIFT="${DRIFT}.smoke.bak"
+cp "$DRIFT" "$SNAP_DRIFT" || { bad "cannot snapshot $DRIFT"; exit 1; }
+trap "mv -f \"$SNAP_DRIFT\" \"$DRIFT\" 2>/dev/null; rm -f \"$SNAP_DRIFT\"" EXIT
+
+# (j) raise the default threshold 2.0 -> 10.0: a 2.2x transport inversion
+# now stays silent — the drift step is blind to the split regression the
+# ninth tooth exists to catch.
+sed -i 's@else 2.0@else 10.0@' "$DRIFT"
+
+if cmp -s "$DRIFT" "$SNAP_DRIFT"; then
+    bad "tooth: the drift-threshold mutation did not apply — the default no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_DRIFT" "$DRIFT"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: drift threshold mutation applied (default 2.0x -> 10.0x — drift step now blind to the 2.2x inversion)"
+
+TMP="$(mktemp -d)"; trap "rm -rf \"$TMP\"" EXIT
+printf '%s\n' \
+  'BENCH_JSON {"leg":"add","transport":"shm","n":1000,"median_ns":8000,"compute_ns":3000,"p99_ns":20000,"mean_ns":9000}' \
+  > "$TMP/prev.jsonl"
+printf '%s\n' \
+  'BENCH_JSON {"leg":"add","transport":"shm","n":1000,"median_ns":14000,"compute_ns":3000,"p99_ns":30000,"mean_ns":15000}' \
+  > "$TMP/cur.jsonl"
+out="$(python3 "$DRIFT" "$TMP/cur.jsonl" "$TMP/prev.jsonl")"
+if printf '%s\n' "$out" | grep -q '::warning::latency drift: shm/add transport'; then
+    bad "tooth: the mutated drift script STILL warned on the 2.2x inversion — the threshold mutation did not actually blind it:"
+    printf '%s\n' "$out" | sed 's/^/        /'
+else
+    ok "tooth: the mutated script stayed silent on the inversion — the smoke's own assertion (ninth tooth) would fail on it, so the blindness is caught"
+fi
+rm -rf "$TMP"
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_DRIFT" "$DRIFT"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -507,7 +556,7 @@ else
 fi
 
 dirty=0
-for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN"; do
+for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN" "$DRIFT"; do
     for b in "${f}.smoke.bak" "${f}.smoke2.bak" "${f}.smoke3.bak" "${f}.smoke4.bak"; do
         if [ -f "$b" ]; then
             bad "leftover $b after restore"
