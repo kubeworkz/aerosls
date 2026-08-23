@@ -676,6 +676,55 @@ mv -f "$SNAP_GUEST2" "$GUEST"
 trap - EXIT
 touch "$GUEST"
 
+# ─── fourteenth tooth: the shared-arena page reclamation gate ────────────
+# sls-kerneld now drives the real aerosls-shared-arena allocator (bitmap
+# pages + atomic refcount headers + reclamation at refcount 0), and the e2e
+# runs the T4-T8 sweep inside a 64 MiB arena. The sweep's CUMULATIVE
+# allocation (~57 MiB per leg x 2 legs on the same kerneld) exceeds the
+# arena, so it only fits because every per-iteration free returns its pages
+# — passing the e2e IS the reclamation proof. This tooth disables the
+# kernel's arena.free (pages never return: the bump-cursor regression) and
+# requires the e2e to FAIL on it, then restores byte-identically.
+echo
+echo "=== tooth: kerneld stops reclaiming arena pages; the 64 MiB e2e must fail ==="
+SNAP_KERNELD2="${KERNELD}.smoke2.bak"
+cp "$KERNELD" "$SNAP_KERNELD2" || { bad "cannot snapshot $KERNELD (2nd)"; exit 1; }
+trap "mv -f \"$SNAP_KERNELD2\" \"$KERNELD\" 2>/dev/null; mv -f \"$SNAP_KERNELD\" \"$KERNELD\" 2>/dev/null; rm -f \"$SNAP_KERNELD\" \"$SNAP_KERNELD2\"" EXIT
+
+# (n) no-op the reclaim: the shared-arena object refcount still drops to 0
+# but the pages never return to the bitmap — the old bump-cursor behavior.
+sed -i 's@^[[:space:]]*let _ = unsafe { self.arena.free(data_ptr) };@        let _ = data_ptr; // tooth: page reclamation disabled@' "$KERNELD"
+
+if cmp -s "$KERNELD" "$SNAP_KERNELD2"; then
+    bad "tooth: the reclamation mutation did not apply — the free pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_KERNELD2" "$KERNELD"; touch "$KERNELD"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+touch "$KERNELD"   # make the mutation visible to cargo's incremental build
+ok "tooth: reclamation mutation applied (arena.free no-oped — pages never return)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated kerneld does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_KERNELD2" "$KERNELD"; touch "$KERNELD"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+echo "running the e2e against the non-reclaiming kerneld (expect the sweep to exhaust the 64 MiB arena, ~15s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail without page reclamation — the 64 MiB arena is not actually the reclamation gate."
+    printf '%s\n' "$out" | grep -E 'BENCH_SWEEP|WASM_SIDECAR|ENOSPC|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (sweep exhausted the 64 MiB arena without reclamation)"
+fi
+
+# ─── restore byte-identically (4th) ────────────────────────────────────────
+mv -f "$SNAP_KERNELD2" "$KERNELD"
+trap - EXIT
+touch "$KERNELD"
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then

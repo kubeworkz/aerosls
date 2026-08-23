@@ -473,13 +473,15 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     let port = free_port();
     let (mut kerneld, kerneld_out) = spawn_linux(
         &kerneld_bin,
-        // 256 MB: the T4-T8 payload sweep (up to 1 MiB arena buffers per
-        // call, allocated+freed per iteration across BOTH legs on the same
-        // kerneld) needs headroom over the fixed benches' footprint. The
-        // mock kernel's bump cursor never reclaims (free only drops the
-        // refcount), so the arena must cover the cumulative allocation
-        // volume of tcp + shm legs.
-        &["--port", &port.to_string(), "--arena-size", "256"],
+        // 64 MB: the design-doc arena size AND the bitmap capacity of the
+        // real shared-arena allocator (aerosls-shared-arena tracks 16384
+        // pages x 4 KiB = 64 MiB). sls-kerneld now drives that allocator, so
+        // pages are reclaimed at refcount 0: the T4-T8 sweep (up to 1 MiB
+        // arena buffers per call, allocated+freed per iteration across BOTH
+        // legs on the same kerneld) only fits in 64 MiB if reclamation
+        // actually works — passing this e2e IS the reclamation proof. (The
+        // old bump cursor never reclaimed, which is why it needed 256 MB.)
+        &["--port", &port.to_string(), "--arena-size", "64"],
         &[],
     );
     let Some(ready) = wait_for_marker(&kerneld_out, "READY arena=", Duration::from_secs(15)) else {

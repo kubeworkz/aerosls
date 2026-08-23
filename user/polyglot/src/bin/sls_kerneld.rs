@@ -13,17 +13,24 @@
 //! `@borrowed` caps keep the sender's slot alive and the receiver drops its
 //! fresh handle after use.
 //!
-//! The arena bytes themselves are never touched here — the sidecars map the
-//! same file and read/write it directly (zero-copy); this process only keeps
-//! the bump cursor and the refcount bookkeeping.
+//! The arena bytes themselves are never copied here — the sidecars map the
+//! same file and read/write it directly (zero-copy). This process drives the
+//! real `aerosls-shared-arena` allocator over that mapping: a bitmap page
+//! allocator whose per-object atomic refcount headers live in the shared
+//! file and whose pages are reclaimed when the last reference dies.
+//! Allocation, transfer, and free all go through `Arena::alloc` /
+//! `Arena::inc_ref` / `Arena::free`, so the e2e exercises the real
+//! multi-sidecar allocator — not a bump cursor that never gives pages back.
 //!
 //! Usage: sls-kerneld --port N [--arena-size MB] [--arena-path PATH]
 
+use aerosls_shared_arena::{Arena, FLAG_BINARY};
 use polyglot::ring;
 use polyglot::transport::*;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -56,20 +63,36 @@ struct Msg {
 }
 
 struct KernelState {
-    arena_size: u32,
-    cursor: u32,
+    /// The real shared-arena allocator, mapped over the arena file both
+    /// sidecars map. Bitmap pages + per-object atomic refcount headers +
+    /// page reclamation at refcount 0 (aerosls-shared-arena).
+    arena: Arena,
     caps: HashMap<u16, Cap>,
     next_cap: u16,
     queues: [VecDeque<Msg>; 2],
 }
 
 impl KernelState {
+    /// Convert a shared-arena data pointer to the wire offset (file-relative
+    /// byte offset the sidecars add to their mapping base).
+    fn data_offset(&self, data_ptr: *mut u8) -> u32 {
+        (data_ptr as usize - self.arena.base() as usize) as u32
+    }
+
+    /// Convert a wire offset back to the shared-arena data pointer.
+    fn data_ptr(&self, offset: u32) -> *mut u8 {
+        unsafe { self.arena.base().add(offset as usize) }
+    }
+
     fn alloc(&mut self, npages: u32, _perm: u32) -> Result<(u16, u32, u32), i64> {
-        let len = (npages as u64 * 4096) as u32;
-        if self.cursor as u64 + len as u64 > self.arena_size as u64 {
-            return Err(CAP_ENOSPC);
-        }
-        let offset = (self.cursor + 7) & !7;
+        let size = (npages as u64 * 4096) as u32;
+        // The shared-arena writes an atomic refcount header (refcount = 1)
+        // just before the data and hands out pages from the real bitmap.
+        let (data_ptr, _total) = self
+            .arena
+            .alloc(size, 1 /* kerneld owns the allocator */, FLAG_BINARY)
+            .map_err(|_| CAP_ENOSPC)?;
+        let offset = self.data_offset(data_ptr);
         let cap = self.next_cap;
         self.next_cap = self.next_cap.wrapping_add(1);
         if cap == 0 || self.next_cap == 0 {
@@ -79,13 +102,33 @@ impl KernelState {
             cap,
             Cap {
                 offset,
-                len,
+                len: size,
                 rights: _perm as u8,
                 refcount: 1,
             },
         );
-        self.cursor = offset + len;
-        Ok((cap, offset, len))
+        Ok((cap, offset, size))
+    }
+
+    /// Drop one reference to the object behind `cap`. At refcount 0 the
+    /// shared-arena header refcount drops too; when that hits 0 the arena
+    /// pages are reclaimed (the real allocator's free path).
+    fn free(&mut self, cap: u16) {
+        let (reclaim, offset) = match self.caps.get_mut(&cap) {
+            Some(c) if c.refcount > 0 => {
+                c.refcount -= 1;
+                if c.refcount == 0 {
+                    (true, c.offset)
+                } else {
+                    (false, 0)
+                }
+            }
+            _ => (false, 0),
+        };
+        if reclaim {
+            let data_ptr = self.data_ptr(offset);
+            let _ = unsafe { self.arena.free(data_ptr) };
+        }
     }
 
     fn send(&mut self, ch_w: u16, tag: u32, flags: u32, descs: &[WireDesc], payload: &[u8]) -> Result<(), i64> {
@@ -116,8 +159,11 @@ impl KernelState {
         Ok(())
     }
 
-    /// Pop a message for `ch_r`, minting receiver caps. Moved caps (desc
-    /// flags 0x02) decrement the sender's refcount — ownership transfer.
+    /// Pop a message for `ch_r`, minting receiver caps. The receiver holds a
+    /// fresh reference to each object (arena header refcount +1). Moved caps
+    /// (desc flags 0x02) transfer the sender's reference to the receiver
+    /// (net 0: the sender's ref drops, the receiver's mint adds one);
+    /// `@borrowed` caps keep the sender's reference alive too (net +1).
     fn recv(&mut self, ch_r: u16) -> Option<(Msg, Vec<WireDesc>)> {
         let q = match ch_r {
             1 => 0,
@@ -138,12 +184,14 @@ impl KernelState {
                     refcount: 1,
                 },
             );
+            // The receiver now holds a reference to the object.
+            let data_ptr = self.data_ptr(*offset);
+            unsafe { self.arena.inc_ref(data_ptr) };
             if *desc_flags & CAP_FLAG_ARENA_OWNED != 0 {
-                if let Some(c) = self.caps.get_mut(sender_slot) {
-                    if c.refcount > 0 {
-                        c.refcount -= 1;
-                    }
-                }
+                // Ownership transfer: the sender's reference moves to the
+                // receiver — drop the sender's slot ref (arena header net
+                // unchanged: +1 mint, -1 sender).
+                self.free(*sender_slot);
             }
             out.push(WireDesc {
                 slot,
@@ -154,14 +202,6 @@ impl KernelState {
             });
         }
         Some((msg, out))
-    }
-
-    fn free(&mut self, cap: u16) {
-        if let Some(c) = self.caps.get_mut(&cap) {
-            if c.refcount > 0 {
-                c.refcount -= 1;
-            }
-        }
     }
 }
 
@@ -197,9 +237,12 @@ fn main() {
     let arena_size = arena_size_mb * 1024 * 1024;
     let chan_path = chan_path.unwrap_or_else(|| format!("/tmp/sls-chan-{port}.bin"));
 
-    // Create + size the arena file (sidecars mmap it; the kernel never
-    // dereferences the bytes, it only keeps the bump cursor + refcounts).
-    {
+    // Create + size the arena file, then map it and initialize the REAL
+    // shared-arena allocator over it (bitmap page allocator + atomic
+    // refcount headers, in the shared file both sidecars map). The kernel
+    // now drives allocation/reclamation through this allocator instead of a
+    // bump cursor; the sidecars still read/write the data pages directly.
+    let arena_fd = {
         use std::os::unix::fs::OpenOptionsExt;
         let f = std::fs::OpenOptions::new()
             .create(true)
@@ -211,12 +254,29 @@ fn main() {
             .unwrap_or_else(|e| panic!("arena file {arena_path}: {e}"));
         f.set_len(arena_size as u64).expect("ftruncate arena");
         f.sync_all().ok();
+        f
+    };
+    let arena_base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            arena_size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            arena_fd.as_raw_fd(),
+            0,
+        )
+    };
+    assert!(arena_base != libc::MAP_FAILED, "mmap arena failed");
+    let mut arena = Arena::new();
+    unsafe {
+        arena
+            .init(arena_base as *mut u8, arena_size as usize)
+            .expect("shared-arena init");
     }
 
     let kernel = Arc::new(Kernel {
         state: Mutex::new(KernelState {
-            arena_size,
-            cursor: 0,
+            arena,
             caps: HashMap::new(),
             next_cap: 1,
             queues: [VecDeque::new(), VecDeque::new()],

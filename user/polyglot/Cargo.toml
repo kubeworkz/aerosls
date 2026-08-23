@@ -32,6 +32,11 @@ required-features = ["linux"]
 
 [dependencies]
 aerosls = { path = "../aerosls", features = ["host-fake"] }
+# The real multi-sidecar arena: bitmap page allocator + atomic refcount
+# headers + page reclamation at refcount 0. sls-kerneld drives this
+# allocator over the same shared file the sidecars map, replacing its own
+# bump-cursor (which never reclaimed, so the arena had to be huge).
+aerosls-shared-arena = { path = "../shared-arena" }
 wasmi = { version = "0.31", default-features = false }
 wat = "1"
 libc = "0.2"

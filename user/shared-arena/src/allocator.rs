@@ -86,7 +86,9 @@ impl ArenaAllocator {
 
         let data_start = Self::compute_data_start();
         let data_size = region_size.saturating_sub(data_start);
-        let total_pages = (data_size / PAGE_SIZE) as u32;
+        // Clamp to the bitmap's capacity so a too-large region can never
+        // index `bitmap` out of bounds (MAX_PAGES * PAGE_SIZE = 64 MiB).
+        let total_pages = ((data_size / PAGE_SIZE) as u32).min(MAX_PAGES as u32);
 
         allocator.total_pages = total_pages;
         allocator.free_pages = total_pages;

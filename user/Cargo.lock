@@ -3299,6 +3299,7 @@ name = "polyglot"
 version = "0.1.0"
 dependencies = [
  "aerosls",
+ "aerosls-shared-arena",
  "libc",
  "wasmi",
  "wat",
