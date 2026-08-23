@@ -77,12 +77,12 @@ static RING_MODE: AtomicBool = AtomicBool::new(false);
 /// dedicated result ring. Guards against the async section being silently
 /// skipped (e.g. a broken transport probe) while the guest still exits 0.
 static ASYNC_RESULT_OK: AtomicBool = AtomicBool::new(false);
-/// T4-T8 payload-size sweep samples, bucketed by size index (5 sizes:
-/// 4KiB, 16KiB, 64KiB, 256KiB, 1MiB). One inner Vec per bucket, filled by
-/// call_sqrt_sweep / call_str_sweep; the report prints a per-size median
-/// and the e2e gates each size's transport sub-linearity (zero-copy claim:
-/// the arena bytes never cross the transport, so latency must NOT scale
-/// linearly with payload size).
+/// T4-T8 payload-size sweep samples, bucketed by size index (6 sizes:
+/// 4KiB, 16KiB, 64KiB, 256KiB, 1MiB, 8MiB). One inner Vec per bucket,
+/// filled by call_sqrt_sweep / call_str_sweep; the report prints a
+/// per-size median and the e2e gates each size's transport sub-linearity
+/// (zero-copy claim: the arena bytes never cross the transport, so latency
+/// must NOT scale linearly with payload size).
 static BENCH_SWEEP_SQRT: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 static BENCH_SWEEP_SQRT_COMPUTE: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 static BENCH_SWEEP_STR: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
@@ -466,7 +466,7 @@ fn print_bench_split(
 /// total/compute/transport split (same machinery as print_bench_split) plus
 /// a BENCH_JSON line carrying the size (KiB) so CI can archive per-size
 /// medians. The zero-copy claim is that transport stays ~flat as the
-/// payload grows 4KiB -> 1MiB — the bytes never cross the transport.
+/// payload grows 4KiB -> 8MiB — the bytes never cross the transport.
 fn print_bench_sweep(
     tag: &str,
     total_buckets: &[Vec<u64>],
@@ -891,7 +891,7 @@ fn main() {
     let sweep_sqrt_c = std::mem::take(&mut *BENCH_SWEEP_SQRT_COMPUTE.lock().unwrap());
     let sweep_str = std::mem::take(&mut *BENCH_SWEEP_STR.lock().unwrap());
     let sweep_str_c = std::mem::take(&mut *BENCH_SWEEP_STR_COMPUTE.lock().unwrap());
-    let sizes_kib = [4u64, 16, 64, 256, 1024];
+    let sizes_kib = [4u64, 16, 64, 256, 1024, 8192];
     print_bench_sweep("SQRT", &sweep_sqrt, &sweep_sqrt_c, &sizes_kib, "sqrt_batch size sweep (T4-T8)", &transport);
     print_bench_sweep("STR", &sweep_str, &sweep_str_c, &sizes_kib, "reverse size sweep (T4-T8)", &transport);
 

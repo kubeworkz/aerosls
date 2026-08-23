@@ -58,19 +58,20 @@
   (data (i32.const 272) "FAIL async\00")
   (data (i32.const 288) "PASS async heavy_reduce=2016\00")
   ;; T4-T8 payload-size sweep tables (LE u32). sqrt counts (f64s):
-  ;; 512 (4KiB), 2048 (16KiB), 8192 (64KiB), 32768 (256KiB), 131072 (1MiB).
-  (data (i32.const 320) "\00\02\00\00\00\08\00\00\00\20\00\00\00\80\00\00\00\00\02\00")
-  ;; sqrt iterations per size: 150, 80, 40, 20, 8 (fill + compute cost
+  ;; 512 (4KiB), 2048 (16KiB), 8192 (64KiB), 32768 (256KiB), 131072 (1MiB),
+  ;; 1048576 (8MiB — the design doc's H6 bandwidth-bound case).
+  (data (i32.const 320) "\00\02\00\00\00\08\00\00\00\20\00\00\00\80\00\00\00\00\02\00\00\00\10\00")
+  ;; sqrt iterations per size: 150, 80, 40, 20, 8, 3 (fill + compute cost
   ;; grows with size, so the tail buckets use fewer samples to bound the
-  ;; e2e wall time; medians stay stable at N>=8)
-  (data (i32.const 340) "\96\00\00\00\50\00\00\00\28\00\00\00\14\00\00\00\08\00\00\00")
+  ;; e2e wall time; medians stay stable at N>=3)
+  (data (i32.const 344) "\96\00\00\00\50\00\00\00\28\00\00\00\14\00\00\00\08\00\00\00\03\00\00\00")
   ;; str counts (bytes): 4096 (4KiB), 16384 (16KiB), 65536 (64KiB),
-  ;; 262144 (256KiB), 1048576 (1MiB)
-  (data (i32.const 360) "\00\10\00\00\00\40\00\00\00\00\01\00\00\00\04\00\00\00\10\00")
-  ;; str iterations per size: 100, 50, 25, 8, 3 (Lisp byte-reversal of 1MiB
-  ;; is ~100ms, so the largest bucket uses only 3 samples)
-  (data (i32.const 380) "\64\00\00\00\32\00\00\00\19\00\00\00\08\00\00\00\03\00\00\00")
-  (data (i32.const 400) "FAIL sweep\00")
+  ;; 262144 (256KiB), 1048576 (1MiB), 8388608 (8MiB)
+  (data (i32.const 368) "\00\10\00\00\00\40\00\00\00\00\01\00\00\00\04\00\00\00\10\00\00\00\80\00")
+  ;; str iterations per size: 100, 50, 25, 8, 3, 2 (Lisp byte-reversal of
+  ;; 8MiB is ~1s, so the largest bucket uses only 2 samples)
+  (data (i32.const 392) "\64\00\00\00\32\00\00\00\19\00\00\00\08\00\00\00\03\00\00\00\02\00\00\00")
+  (data (i32.const 416) "FAIL sweep\00")
 
   (func (export "run") (result i32)
     (local $r i64) (local $r2 i64)
@@ -290,18 +291,18 @@
     (local.set $k (i32.const 0))
     (block $sweep_sqrt_done
       (loop $sweep_sqrt
-        (br_if $sweep_sqrt_done (i32.ge_u (local.get $k) (i32.const 5)))
+        (br_if $sweep_sqrt_done (i32.ge_u (local.get $k) (i32.const 6)))
         (local.set $n
           (i32.load (i32.add (i32.const 320) (i32.mul (local.get $k) (i32.const 4)))))
         (local.set $iters
-          (i32.load (i32.add (i32.const 340) (i32.mul (local.get $k) (i32.const 4)))))
+          (i32.load (i32.add (i32.const 344) (i32.mul (local.get $k) (i32.const 4)))))
         (local.set $i (i32.const 0))
         (block $sweep_sqrt_it_done
           (loop $sweep_sqrt_it
             (br_if $sweep_sqrt_it_done (i32.ge_u (local.get $i) (local.get $iters)))
             (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
             (if (i32.eqz (local.get $in_cap))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 14))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 14))))
             (local.set $j (i32.const 0))
             (block $sw_sqrt_fill_done
               (loop $sw_sqrt_fill
@@ -324,7 +325,7 @@
               (f64.sub (f64.mul (local.get $v) (local.get $v))
                        (f64.convert_i32_u (local.get $j))))
             (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 15))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 15))))
             (local.set $j (i32.sub (local.get $n) (i32.const 1)))
             (local.set $v
               (f64.reinterpret_i64 (call $read_f64 (local.get $out_cap) (local.get $j))))
@@ -332,7 +333,7 @@
               (f64.sub (f64.mul (local.get $v) (local.get $v))
                        (f64.convert_i32_u (local.get $j))))
             (if (f64.gt (f64.abs (local.get $err)) (f64.const 1e-6))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 16))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 16))))
             (call $arena_free (local.get $out_cap))
             (call $arena_free (local.get $in_cap))
             (local.set $i (i32.add (local.get $i) (i32.const 1)))
@@ -346,18 +347,18 @@
     (local.set $k (i32.const 0))
     (block $sweep_str_done
       (loop $sweep_str
-        (br_if $sweep_str_done (i32.ge_u (local.get $k) (i32.const 5)))
+        (br_if $sweep_str_done (i32.ge_u (local.get $k) (i32.const 6)))
         (local.set $len
-          (i32.load (i32.add (i32.const 360) (i32.mul (local.get $k) (i32.const 4)))))
+          (i32.load (i32.add (i32.const 368) (i32.mul (local.get $k) (i32.const 4)))))
         (local.set $iters
-          (i32.load (i32.add (i32.const 380) (i32.mul (local.get $k) (i32.const 4)))))
+          (i32.load (i32.add (i32.const 392) (i32.mul (local.get $k) (i32.const 4)))))
         (local.set $i (i32.const 0))
         (block $sweep_str_it_done
           (loop $sweep_str_it
             (br_if $sweep_str_it_done (i32.ge_u (local.get $i) (local.get $iters)))
             (local.set $in_cap (call $arena_alloc (local.get $len)))
             (if (i32.eqz (local.get $in_cap))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 17))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 17))))
             (local.set $j (i32.const 0))
             (block $sw_str_fill_done
               (loop $sw_str_fill
@@ -381,21 +382,21 @@
                                 (i32.mul (local.get $i) (i32.const 11)))
                        (i32.const 255)))
             (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 18))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 18))))
             (local.set $j (i32.shr_u (local.get $len) (i32.const 1)))
             (local.set $status
               (i32.and (i32.add (i32.mul (i32.sub (i32.sub (local.get $len) (i32.const 1)) (local.get $j)) (i32.const 7))
                                 (i32.mul (local.get $i) (i32.const 11)))
                        (i32.const 255)))
             (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 19))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 19))))
             (local.set $j (i32.sub (local.get $len) (i32.const 1)))
             (local.set $status
               (i32.and (i32.add (i32.mul (i32.sub (i32.sub (local.get $len) (i32.const 1)) (local.get $j)) (i32.const 7))
                                 (i32.mul (local.get $i) (i32.const 11)))
                        (i32.const 255)))
             (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
-              (then (call $log (i32.const 400) (i32.const 10)) (return (i32.const 20))))
+              (then (call $log (i32.const 416) (i32.const 10)) (return (i32.const 20))))
             (call $arena_free (local.get $out_cap))
             (call $arena_free (local.get $in_cap))
             (local.set $i (i32.add (local.get $i) (i32.const 1)))

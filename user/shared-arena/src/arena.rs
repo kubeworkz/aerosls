@@ -380,13 +380,13 @@ mod tests {
     }
 
     /// The e2e's T4-T8 sweep pattern, at the crate level: repeatedly
-    /// allocate a large arena object (up to 1 MiB), touch it, and free it.
-    /// In a bump-cursor arena the pages would never return and a 64 MiB
-    /// region would exhaust after ~57 MiB of cumulative allocation — the
-    /// reason the old sls-kerneld needed a 256 MB arena. With the bitmap
-    /// allocator's reclamation every free must return exactly its pages, so
-    /// free_count comes back to baseline and a 64 MiB region sustains the
-    /// whole sweep.
+    /// allocate a large arena object (up to 8 MiB — the design doc's H6
+    /// bandwidth-bound case), touch it, and free it. In a bump-cursor arena
+    /// the pages would never return and a 64 MiB region would exhaust after
+    /// ~57 MiB of cumulative allocation — the reason the old sls-kerneld
+    /// needed a 256 MB arena. With the bitmap allocator's reclamation every
+    /// free must return exactly its pages, so free_count comes back to
+    /// baseline and a 64 MiB region sustains the whole sweep.
     #[test]
     fn arena_sweep_reclamation_returns_pages() {
         const MAX_REGION: usize = MAX_PAGES * PAGE_SIZE; // 64 MiB, the e2e arena
@@ -398,8 +398,8 @@ mod tests {
         let alloc = region.as_mut_ptr() as *mut ArenaAllocator;
         let initial_free = unsafe { ArenaAllocator::free_count(alloc) };
 
-        // Sizes (bytes) mirroring the guest's sweep buckets.
-        let sizes = [4096usize, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024];
+        // Sizes (bytes) mirroring the guest's sweep buckets (4KiB..8MiB).
+        let sizes = [4096usize, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 8 * 1024 * 1024];
         let mut peak_used = 0u32;
         for size in sizes {
             let used = initial_free - unsafe { ArenaAllocator::free_count(alloc) };

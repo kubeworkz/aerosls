@@ -633,23 +633,27 @@ trap - EXIT
 touch "$SIDECAR"
 
 # ─── thirteenth tooth: the T4-T8 payload-size sweep gate ─────────────────
-# The e2e now gates the sweep's workload proof: compute_ns at 1MiB must be
-# >= 10x compute_ns at 4KiB, proving the payload really grew and was
-# processed (a count=0 or constant-payload regression collapses the ratio
-# to ~1x). This tooth collapses the sweep's 1MiB bucket to 4KiB by mutating
-# the guest's sqrt count table (the LE u32 131072 = \00\00\02\00 becomes
-# 512 = \00\02\00\00), so the 1MiB bucket runs count=512 like the 4KiB one
-# and the gate must fail on both legs.
+# The e2e now gates the sweep's workload proof: compute_ns at 8MiB (the
+# design doc's H6 bandwidth-bound case) must be >= 10x compute_ns at 4KiB,
+# proving the payload really grew and was processed (a count=0 or
+# constant-payload regression collapses the ratio to ~1x). This tooth
+# collapses the sweep's 8MiB bucket to 4KiB by mutating the guest's sqrt
+# count table: the LE u32 1048576 (8MiB, \00\10\00\00) becomes 512 (4KiB,
+# \00\02\00\00). The match uses the 8-byte run \00\00\02\00\00\10\00\00
+# (1MiB then 8MiB counts) because \00\10\00\00 alone is not unique — the
+# str table's 4096-byte count has the same bytes. So the 8MiB bucket runs
+# count=512 like the 4KiB one and the gate must fail on both legs.
 echo
-echo "=== tooth: collapse the sweep's 1MiB bucket to 4KiB; the T4-T8 workload gate must fail ==="
+echo "=== tooth: collapse the sweep's 8MiB bucket to 4KiB; the T4-T8 workload gate must fail ==="
 SNAP_GUEST2="${GUEST}.smoke2.bak"
 cp "$GUEST" "$SNAP_GUEST2" || { bad "cannot snapshot $GUEST (2nd)"; exit 1; }
 trap "mv -f \"$SNAP_GUEST2\" \"$GUEST\" 2>/dev/null; mv -f \"$SNAP_GUEST\" \"$GUEST\" 2>/dev/null; rm -f \"$SNAP_GUEST\" \"$SNAP_GUEST2\"" EXIT
 
-# (m) sqrt count table: the trailing 131072 (1MiB, \00\00\02\00) becomes
-# 512 (4KiB, \00\02\00\00). The literal-backslash sed needs the bytes
-# escaped once for bash and once for sed.
-sed -i 's@\\00\\00\\02\\00@\\00\\02\\00\\00@' "$GUEST"
+# (m) sqrt count table: the trailing 131072+1048576 run (1MiB+8MiB, LE
+# u32 \00\00\02\00\00\00\10\00) becomes 131072+512, so the 8MiB bucket
+# silently runs count=512 like 4KiB. The literal-backslash sed needs the
+# bytes escaped once for bash and once for sed.
+sed -i 's@\\00\\00\\02\\00\\00\\00\\10\\00@\\00\\00\\02\\00\\00\\02\\00\\00@' "$GUEST"
 
 if cmp -s "$GUEST" "$SNAP_GUEST2"; then
     bad "tooth: the sweep-collapse mutation did not apply — the count-table pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
@@ -657,7 +661,7 @@ if cmp -s "$GUEST" "$SNAP_GUEST2"; then
     trap - EXIT
     echo; echo "---- passed=$pass failed=$fail"; exit 1
 fi
-ok "tooth: sweep-collapse mutation applied (1MiB sqrt bucket now runs count=512 — payload never grows)"
+ok "tooth: sweep-collapse mutation applied (8MiB sqrt bucket now runs count=512 — payload never grows)"
 
 if ! build_sidecars; then
     bad "tooth: the mutated guest does not build"

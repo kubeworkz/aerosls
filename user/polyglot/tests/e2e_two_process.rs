@@ -247,10 +247,11 @@ fn run_leg(
     let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
     let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
     let bench_str = wait_for_marker(&wasm_out, "BENCH_STR", Duration::from_secs(60));
-    // T4-T8 payload-size sweep: 5 per-size lines per method, printed after
-    // BENCH_STR and before WASM_SIDECAR (FIFO).
-    let sweep_sqrt = wait_for_markers(&wasm_out, "BENCH_SWEEP_SQRT:", 5, Duration::from_secs(120));
-    let sweep_str = wait_for_markers(&wasm_out, "BENCH_SWEEP_STR:", 5, Duration::from_secs(60));
+    // T4-T8 payload-size sweep: 6 per-size lines per method (4KiB .. 8MiB,
+    // the design doc's H6 bandwidth-bound case), printed after BENCH_STR
+    // and before WASM_SIDECAR (FIFO).
+    let sweep_sqrt = wait_for_markers(&wasm_out, "BENCH_SWEEP_SQRT:", 6, Duration::from_secs(180));
+    let sweep_str = wait_for_markers(&wasm_out, "BENCH_SWEEP_STR:", 6, Duration::from_secs(120));
     let wasm_line = wait_for_marker(&wasm_out, "WASM_SIDECAR", Duration::from_secs(30));
     let async_line = wait_for_marker(&wasm_out, "ASYNC_SIDECAR", Duration::from_secs(10));
     let status = wasm.wait().expect("wasm exit");
@@ -284,29 +285,29 @@ fn run_leg(
     // The sweep proves the zero-copy claim: the arena bytes never cross the
     // transport, so per-size latency must scale with the *Lisp compute*
     // (which grows with payload), not with a wire copy. Three checks:
-    //   (1) all 10 per-size lines (5 sqrt + 5 str) were produced;
-    //   (2) workload proof: compute_ns(1MiB) >= 10x compute_ns(4KiB) — the
+    //   (1) all 12 per-size lines (6 sqrt + 6 str, 4KiB..8MiB) were made;
+    //   (2) workload proof: compute_ns(8MiB) >= 10x compute_ns(4KiB) — the
     //       payload really grew and was processed (a count=0 or
     //       constant-payload regression collapses this ratio to ~1x);
     //   (3) coarse per-size median cap (40ms) — the live medians are
     //       0.07-19ms, so this catches a catastrophic blowup while the
-    //       per-size drift (archived via BENCH_JSON legs like sqrt-1024k)
+    //       per-size drift (archived via BENCH_JSON legs like sqrt-8192k)
     //       soft-warns on slower degradations.
-    if sweep_sqrt.len() != 5 || sweep_str.len() != 5 {
+    if sweep_sqrt.len() != 6 || sweep_str.len() != 6 {
         kill_child(&mut lisp);
         return Err(format!(
-            "T4-T8 sweep incomplete: got {} sqrt + {} str lines (need 5 each) (transport={transport})",
+            "T4-T8 sweep incomplete: got {} sqrt + {} str lines (need 6 each) (transport={transport})",
             sweep_sqrt.len(),
             sweep_str.len()
         ));
     }
     for (name, lines) in [("SQRT", &sweep_sqrt), ("STR", &sweep_str)] {
         let compute_4k = parse_field(&lines[0], "compute_ns=").unwrap_or(0);
-        let compute_1m = parse_field(&lines[4], "compute_ns=").unwrap_or(0);
-        if compute_4k == 0 || compute_1m < compute_4k * 10 {
+        let compute_8m = parse_field(&lines[5], "compute_ns=").unwrap_or(0);
+        if compute_4k == 0 || compute_8m < compute_4k * 10 {
             kill_child(&mut lisp);
             return Err(format!(
-                "T4-T8 {name} sweep workload is dead: compute_ns 4KiB={compute_4k} 1MiB={compute_1m} — \
+                "T4-T8 {name} sweep workload is dead: compute_ns 4KiB={compute_4k} 8MiB={compute_8m} — \
                  the payload never grew (count=0 or constant-payload regression) (transport={transport})"
             ));
         }
@@ -332,7 +333,7 @@ fn run_leg(
             }
         }
         eprintln!(
-            "[gate] T4-T8 {name} sweep: compute scales {compute_4k} -> {compute_1m} ns (1MiB/4KiB), all sizes within their size-aware caps — OK (transport={transport})"
+            "[gate] T4-T8 {name} sweep: compute scales {compute_4k} -> {compute_8m} ns (8MiB/4KiB), all sizes within their size-aware caps — OK (transport={transport})"
         );
     }
 
@@ -476,11 +477,12 @@ fn two_process_wasm_lisp_arena_roundtrip() {
         // 64 MB: the design-doc arena size AND the bitmap capacity of the
         // real shared-arena allocator (aerosls-shared-arena tracks 16384
         // pages x 4 KiB = 64 MiB). sls-kerneld now drives that allocator, so
-        // pages are reclaimed at refcount 0: the T4-T8 sweep (up to 1 MiB
-        // arena buffers per call, allocated+freed per iteration across BOTH
-        // legs on the same kerneld) only fits in 64 MiB if reclamation
-        // actually works — passing this e2e IS the reclamation proof. (The
-        // old bump cursor never reclaimed, which is why it needed 256 MB.)
+        // pages are reclaimed at refcount 0: the T4-T8 sweep (up to 8 MiB
+        // arena buffers per call — the design doc's H6 bandwidth-bound case
+        // — allocated+freed per iteration across BOTH legs on the same
+        // kerneld) only fits in 64 MiB if reclamation actually works —
+        // passing this e2e IS the reclamation proof. (The old bump cursor
+        // never reclaimed, which is why it needed 256 MB.)
         &["--port", &port.to_string(), "--arena-size", "64"],
         &[],
     );
