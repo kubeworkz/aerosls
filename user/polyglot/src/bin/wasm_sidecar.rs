@@ -66,8 +66,17 @@ static RING0: Mutex<Option<Ring>> = Mutex::new(None);
 static RING1: Mutex<Option<Ring>> = Mutex::new(None);
 static RING2: Mutex<Option<Ring>> = Mutex::new(None);
 static RING3: Mutex<Option<Ring>> = Mutex::new(None);
+/// Dedicated async result channel (T13/T14): ring6 = wasm→lisp async
+/// requests, ring7 = lisp→wasm async results. The heavy_reduce result
+/// arrives here, not on the sync reply ring.
+static RING6: Mutex<Option<Ring>> = Mutex::new(None);
+static RING7: Mutex<Option<Ring>> = Mutex::new(None);
 /// True when the message path goes through the shared ring instead of TCP.
 static RING_MODE: AtomicBool = AtomicBool::new(false);
+/// Set when the async result (T13/T14) was received AND verified on the
+/// dedicated result ring. Guards against the async section being silently
+/// skipped (e.g. a broken transport probe) while the guest still exits 0.
+static ASYNC_RESULT_OK: AtomicBool = AtomicBool::new(false);
 
 /// Monotonic cycle counter for round-trip timing. On x86_64 this is the real
 /// TSC (constant-rate on modern CPUs); elsewhere it falls back to monotonic
@@ -478,6 +487,8 @@ fn main() {
         *RING1.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING1_OFFSET).expect("open ring1"));
         *RING2.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING2_OFFSET).expect("open ring2"));
         *RING3.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING3_OFFSET).expect("open ring3"));
+        *RING6.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING6_OFFSET).expect("open ring6"));
+        *RING7.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING7_OFFSET).expect("open ring7"));
         RING_MODE.store(true, Ordering::SeqCst);
         println!("TRANSPORT shm chan={chan_path}");
     } else {
@@ -609,6 +620,11 @@ fn main() {
         })
         .unwrap();
     linker
+        .func_wrap("host", "is_shm", |_caller: wasmi::Caller<'_, ()>| -> i32 {
+            if ring_mode() { 1 } else { 0 }
+        })
+        .unwrap();
+    linker
         .func_wrap(
             "host",
             "call_reverse",
@@ -627,6 +643,55 @@ fn main() {
                 let compute = unsafe { gen_calculator::calculator_service::LAST_REVERSE_COMPUTE_NS };
                 BENCH_STR_COMPUTE_NS.lock().unwrap().push(compute);
                 r
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "call_heavy_reduce",
+            |_caller: wasmi::Caller<'_, ()>, input_cap: i32, count: i32| -> i64 {
+                // Async fire-and-forget: send heavy_reduce with NO_REPLY and
+                // return the immediate ACK status. The real result arrives
+                // later on the dedicated result ring (await_async_result).
+                let r = match gen_calculator::calculator_service::heavy_reduce(
+                    gen_calculator::ArenaSlice::<f64>::new(input_cap as u16, count as u32),
+                    input_cap as u16,
+                    count as u32,
+                ) {
+                    Ok(()) => pack(0, 0),
+                    Err(e) => pack(1, e.code as u64),
+                };
+                // NO_REPLY means the dispatch loop's immediate ACK still lands
+                // on ring1 — consume it so the sync reply path stays clean.
+                if ring_mode() {
+                    if let Some(ring1) = RING1.lock().unwrap().as_ref() {
+                        let _ack = ring1.recv().expect("ack recv");
+                    }
+                }
+                r
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "await_async_result",
+            |_caller: wasmi::Caller<'_, ()>| -> i64 {
+                // Block on the dedicated result ring until the async result
+                // arrives, then parse the 303-reply body: ok@0, u32 value@4..8.
+                let body = RING7.lock().unwrap().as_ref().expect("ring7 open").recv().expect("async result recv");
+                if body.len() < 22 {
+                    return pack(1, 1);
+                }
+                let ok = body[18];
+                let val = u32::from_le_bytes(body[22..26].try_into().unwrap_or([0; 4]));
+                // sum(0..63) = 2016: the guest verifies the same constant, so
+                // a successful await implies the worker's result was correct.
+                if ok == 1 && val == 2016 {
+                    ASYNC_RESULT_OK.store(true, Ordering::SeqCst);
+                }
+                pack(if ok == 1 { 0 } else { 1 }, val as u64)
             },
         )
         .unwrap();
@@ -698,6 +763,22 @@ fn main() {
 
     if status == 0 {
         println!("WASM_SIDECAR PASS");
+        // T13/T14 async verdict: on the shm leg the guest MUST have run the
+        // heavy_reduce async section (transport probe true) and received the
+        // verified result off the dedicated result ring. The wasm-side flag
+        // is set only by a successful await_async_result, so a skipped or
+        // failed async path cannot exit 0 silently. Printed after
+        // WASM_SIDECAR so CI logs show both lines; the exit code is what
+        // the e2e gates on.
+        if ring_mode() {
+            if ASYNC_RESULT_OK.load(Ordering::SeqCst) {
+                println!("ASYNC_SIDECAR PASS: heavy_reduce result received+verified on result ring");
+                std::process::exit(0);
+            } else {
+                println!("ASYNC_SIDECAR FAIL: async result never received/verified");
+                std::process::exit(1);
+            }
+        }
         std::process::exit(0);
     } else {
         println!("WASM_SIDECAR FAIL status={status}");

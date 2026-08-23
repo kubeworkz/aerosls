@@ -25,7 +25,8 @@
 (defpackage #:aerosls
   (:use #:cl)
   (:export #:chan-send #:chan-recv #:arena-alloc #:arena-free #:arena-mem
-           #:next-request-id #:cap-transfer))
+           #:next-request-id #:cap-transfer
+           #:generate-result-tag #:chan-send-result))
 
 (defpackage #:cffi (:use #:cl) (:export #:mem-aref))
 (defpackage #:bt (:use #:cl) (:export #:make-thread))
@@ -75,6 +76,7 @@
 (defvar *chan-ring1* nil)          ; ring1 header: lisp->wasm (we produce)
 (defvar *chan-ring4* nil)          ; ring4 header: lisp->kerneld arena req (we produce)
 (defvar *chan-ring5* nil)          ; ring5 header: kerneld->lisp arena reply (we consume)
+(defvar *chan-ring7* nil)          ; ring7 header: lisp->wasm async results (we produce)
 (defvar *cap-table* '())           ; list of (cap offset len)
 (defvar *next-req-id* 0)
 (defvar *service-dispatch* nil)     ; bound after loading the generated table
@@ -95,6 +97,7 @@
 (defparameter *ring1-offset* *ring-slot-size*)
 (defparameter *ring4-offset* (* 4 *ring-slot-size*))
 (defparameter *ring5-offset* (* 5 *ring-slot-size*))
+(defparameter *ring7-offset* (* 7 *ring-slot-size*))
 
 ;; ── little-endian helpers ──────────────────────────────────────────────────
 
@@ -218,6 +221,32 @@
 
 (defun aerosls:next-request-id ()
   (incf *next-req-id*))
+
+(defvar *result-ring* nil)
+(defvar *result-tag* 0)
+
+(defun aerosls:generate-result-tag ()
+  "Monotonic tag for async results (heavy_reduce). Distinct from the
+   request-id stream so the wasm side can tell an async result apart from
+   a synchronous reply."
+  (incf *result-tag*))
+
+(defun aerosls:chan-send-result (payload &key (tag (aerosls:generate-result-tag)))
+  "Deliver an async result on the dedicated result channel (ring7). The
+   body is the same 303-reply wire format the wasm side's chan_recv parses
+   (rc, plen, tag, flags, n-caps, descs, payload) — only the ring differs."
+  (when (null *result-ring*)
+    (error "*result-ring* is not set — async result channel unavailable"))
+  (let* ((n (length payload))
+         (body (make-array (+ 18 n) :element-type '(unsigned-byte 8))))
+    (put-le32 body 0 0)                                  ; rc
+    (put-le32 body 4 n)                                  ; payload_len
+    (put-le32 body 8 tag)
+    (put-le32 body 12 0)                                 ; flags
+    (put-le16 body 16 0)                                 ; n-caps
+    (replace body payload :start1 18)
+    (ring-send *result-ring* body)
+    0))
 
 (defun arena-rpc (syscall req)
   "Arena syscall over the current transport — returns the reply body.
@@ -348,7 +377,7 @@
   (handler-case
       (loop
         (multiple-value-bind (payload tag flags caps) (aerosls:chan-recv 1)
-          (declare (ignore tag flags))
+          (declare (ignore tag))
           (unless payload
             (sleep 0.01)
             (return))            ;; Parse the IDL header the Rust runtime prepends:
@@ -376,7 +405,12 @@
                             0)))
               (finish-output t)
               ;; The received input caps were @borrowed — drop our handles.
-              (dolist (c caps) (aerosls:arena-free c))
+              ;; EXCEPT on NO_REPLY (async): the callee keeps ownership (the
+              ;; heavy_reduce worker thread reads the input buffer after the
+              ;; dispatch returns), so freeing here would yank the cap out
+              ;; from under it.
+              (unless (logtest 1 flags)
+                (dolist (c caps) (aerosls:arena-free c)))
               ;; Reply raw (opcode 0); the output cap transfers to the caller.
               (let ((rc (aerosls:chan-send 2 0 reply-payload
                                    :caps (loop for i below n-reply-caps
@@ -411,13 +445,15 @@
       (error "CHAN_PATH is required with TRANSPORT=shm"))
     (let ((fd (sb-posix:open *chan-path* sb-posix:o-rdwr)))
       (setf *chan-base*
-            (sb-posix:mmap nil (* 6 *ring-slot-size*)
+            (sb-posix:mmap nil (* 8 *ring-slot-size*)
                            (logior sb-posix:prot-read sb-posix:prot-write)
                            sb-posix:map-shared fd 0))
       (setf *chan-ring0* (sb-sys:sap+ *chan-base* 0))
       (setf *chan-ring1* (sb-sys:sap+ *chan-base* *ring1-offset*))
       (setf *chan-ring4* (sb-sys:sap+ *chan-base* *ring4-offset*))
-      (setf *chan-ring5* (sb-sys:sap+ *chan-base* *ring5-offset*)))
+      (setf *chan-ring5* (sb-sys:sap+ *chan-base* *ring5-offset*))
+      (setf *chan-ring7* (sb-sys:sap+ *chan-base* *ring7-offset*))
+      (setf *result-ring* *chan-ring7*))
     (format t "[lisp] channel mapped, ring-mode ON~%")
     (finish-output t))
   (load *calc-lisp-path*)

@@ -341,17 +341,40 @@
       (#.+op-heavy-reduce+
        (let ((input-cap (aref cap-slots 0))
              (count     (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0)))
-         ;; Async: spawn a Lisp thread, acknowledge immediately
+         ;; Async: spawn a Lisp thread, acknowledge immediately. The worker
+         ;; sums the input f64 array (deterministic, so the guest can verify
+         ;; the result) and delivers it on the dedicated result channel
+         ;; (ring7) — the wasm side awaits it there (T13/T14 in the design
+         ;; matrix: NO_REPLY send + ACK + follow-up result channel).
          (bt:make-thread
            (lambda ()
-             (let ((result (heavy-reduce-worker input-cap count)))
-               ;; Deliver result on the dedicated result channel
-               (aerosls:chan-send *result-channel*
-                                  :tag (generate-result-tag)
-                                  :payload (encode-result-payload result)
-                                  :caps '())))
+             (handler-case
+                 (let* ((in-ptr (aerosls:arena-mem input-cap))
+                        (sum (loop for i below count
+                                   sum (sb-kernel:make-double-float
+                                        (ldb (byte 32 32)
+                                             (sb-sys:sap-ref-64 in-ptr (* i 8)))
+                                        (ldb (byte 32 0)
+                                             (sb-sys:sap-ref-64 in-ptr (* i 8)))))))
+                   ;; Encode ok=1 + u32 sum (the IDL return type is u32)
+                   (let ((payload (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)))
+                     (setf (aref payload 0) 1)
+                     (let ((v (logand #xffffffff (truncate sum))))
+                       (dotimes (k 4)
+                         (setf (aref payload (+ 4 k))
+                               (ldb (byte 8 (* 8 k)) v))))
+                     (aerosls:chan-send-result payload)))
+               (error (e)
+                 (format t "[lisp] heavy-reduce error: ~A~%" e)
+                 (let ((payload (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)))
+                   ;; ok=0, error code 5 (:internal)
+                   (setf (aref payload 4) 5)
+                   (aerosls:chan-send-result payload)))))
            :name "heavy-reduce-worker")
-         ;; Return immediate ACK (the actual result comes later)
+         ;; Return immediate ACK (the actual result comes later on the
+         ;; result channel)
          (values (make-array 4 :element-type '(unsigned-byte 8)
                                 :initial-contents '(#x01 0 0 0))
                  (make-array 8 :element-type '(unsigned-byte 16))

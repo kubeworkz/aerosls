@@ -34,6 +34,9 @@
   (import "host" "call_add" (func $call_add (param i32 i32) (result i64)))
   (import "host" "call_sqrt_batch" (func $call_sqrt_batch (param i32 i32) (result i64)))
   (import "host" "call_reverse" (func $call_reverse (param i32 i32) (result i64)))
+  (import "host" "call_heavy_reduce" (func $call_heavy_reduce (param i32 i32) (result i64)))
+  (import "host" "await_async_result" (func $await_async_result (result i64)))
+  (import "host" "is_shm" (func $is_shm (result i32)))
   (import "host" "write_f64" (func $write_f64 (param i32 i32 i64)))
   (import "host" "read_f64" (func $read_f64 (param i32 i32) (result i64)))
   (import "host" "write_u8" (func $write_u8 (param i32 i32 i32)))
@@ -50,6 +53,8 @@
   (data (i32.const 224) "FAIL sqrt-bench\00")
   (data (i32.const 240) "FAIL add-bench\00")
   (data (i32.const 256) "FAIL str-bench\00")
+  (data (i32.const 272) "FAIL async\00")
+  (data (i32.const 288) "PASS async heavy_reduce=2016\00")
 
   (func (export "run") (result i32)
     (local $r i64) (local $r2 i64)
@@ -260,6 +265,50 @@
     (call $arena_free (local.get $out_cap))
     (call $arena_free (local.get $in_cap))
 
+    ;; ── async heavy_reduce: T13/T14 ───────────────────────────────────────
+    ;; Fire-and-forget send (NO_REPLY), immediate ACK, then the real result
+    ;; arrives later on the dedicated result channel. Only the shared-ring
+    ;; transport has a dedicated result ring; on tcp the ring is not
+    ;; provisioned, so skip (the shm leg exercises the full path). Fill N=64
+    ;; f64s with i; the worker sums them -> sum(0..63) = 2016 (u32).
+    ;; (in_cap was already released above with out_cap — do NOT free again)
+    (if (i32.eqz (call $is_shm))
+      (then (return (i32.const 0))))
+    (local.set $n (i32.const 64))
+    (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
+    (if (i32.eqz (local.get $in_cap))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 10))))
+    (local.set $i (i32.const 0))
+    (block $async_fill_done
+      (loop $async_fill
+        (br_if $async_fill_done (i32.ge_u (local.get $i) (local.get $n)))
+        (call $write_f64
+          (local.get $in_cap)
+          (local.get $i)
+          (i64.reinterpret_f64 (f64.convert_i32_u (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $async_fill)))
+
+    ;; 1. send + immediate ACK (status 0 = request accepted)
+    (local.set $r2 (call $call_heavy_reduce (local.get $in_cap) (local.get $n)))
+    (local.set $status
+      (i32.wrap_i64 (i64.shr_u (local.get $r2) (i64.const 32))))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 11))))
+
+    ;; 2. block on the result channel until the async result arrives
+    (local.set $r2 (call $await_async_result))
+    (local.set $status
+      (i32.wrap_i64 (i64.shr_u (local.get $r2) (i64.const 32))))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 12))))
+    (local.set $v (f64.convert_i32_u (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff)))))
+    (if (f64.ne (local.get $v) (f64.const 2016))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 13))))
+
+    (call $arena_free (local.get $in_cap))
+
+    (call $log (i32.const 288) (i32.const 27))
     (call $log (i32.const 64) (i32.const 34))
     (i32.const 0))
 )

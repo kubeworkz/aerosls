@@ -43,13 +43,17 @@ pub const RING_CAPACITY: usize = 4 * 1024 * 1024;
 /// ring0: wasm→lisp requests. ring1: lisp→wasm replies.
 /// ring2: wasm→kerneld arena requests. ring3: kerneld→wasm arena replies.
 /// ring4: lisp→kerneld arena requests. ring5: kerneld→lisp arena replies.
+/// ring6: wasm→lisp async requests (heavy_reduce). ring7: lisp→wasm async
+/// results (the dedicated result channel — T13/T14 in the design matrix).
 pub const RING0_OFFSET: usize = 0;
 pub const RING1_OFFSET: usize = RING_HEADER_LEN + RING_CAPACITY;
 pub const RING2_OFFSET: usize = 2 * (RING_HEADER_LEN + RING_CAPACITY);
 pub const RING3_OFFSET: usize = 3 * (RING_HEADER_LEN + RING_CAPACITY);
 pub const RING4_OFFSET: usize = 4 * (RING_HEADER_LEN + RING_CAPACITY);
 pub const RING5_OFFSET: usize = 5 * (RING_HEADER_LEN + RING_CAPACITY);
-pub const CHAN_FILE_SIZE: usize = RING_HEADER_LEN * 6 + RING_CAPACITY * 6;
+pub const RING6_OFFSET: usize = 6 * (RING_HEADER_LEN + RING_CAPACITY);
+pub const RING7_OFFSET: usize = 7 * (RING_HEADER_LEN + RING_CAPACITY);
+pub const CHAN_FILE_SIZE: usize = RING_HEADER_LEN * 8 + RING_CAPACITY * 8;
 
 /// Header layout: magic u32 @0, version u32 @4, capacity u32 @8, pad u32
 /// @12, write u64 @16, read u64 @24. 32 bytes, page-aligned by mmap.
@@ -133,6 +137,8 @@ pub fn create_channel(path: &str) -> io::Result<()> {
         RING3_OFFSET,
         RING4_OFFSET,
         RING5_OFFSET,
+        RING6_OFFSET,
+        RING7_OFFSET,
     ] {
         unsafe {
             let b = base.add(offset);
