@@ -213,6 +213,11 @@ pub mod calculator_service {
     pub const OP_HEAVY_REDUCE: u16 = 6;
     pub const OP_REVERSE: u16 = 7;
 
+    /// Lisp-side compute time (nanoseconds) for the last sqrt_batch reply,
+    /// carried in reply bytes 8..16 as u64 microseconds. Lets the sidecar
+    /// split the SQRT bench into compute vs transport.
+    pub static mut LAST_SQRT_COMPUTE_NS: u64 = 0;
+
     /// Channel write endpoint (CHAN_W) to the remote sidecar.
     /// Set during bootstrap by the sidecar runtime.
     pub static mut CHAN_W: u16 = 0xFFFF; /* CAP_NONE */
@@ -506,6 +511,10 @@ pub mod calculator_service {
 
         // ── Step 4: deserialize reply ──
         let ok_byte = reply_buf[0];
+        // Lisp-side compute split: u64 microseconds at bytes 8..16 -> ns.
+        unsafe {
+            LAST_SQRT_COMPUTE_NS = u64::from_le_bytes(reply_buf[8..16].try_into().unwrap_or([0; 8])) * 1000;
+        }
         if ok_byte == 1 {
             // Arena cap handle is in cap_slots[0], count in reply_buf[4..8]
             let count = u32::from_le_bytes(reply_buf[4..8].try_into().unwrap());

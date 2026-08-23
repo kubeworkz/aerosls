@@ -331,6 +331,42 @@ fi
 mv -f "$SNAP_LISP" "$LISP_GEN"
 trap - EXIT
 
+# ─── sixth tooth: the sqrt compute/transport split guard ───────────────────
+# The SQRT leg reports total = compute (Lisp sqrts, timed on the Lisp side
+# and carried in the reply) + transport (derived). The e2e asserts both are
+# live: compute >= 10us (4096 real sqrts) and transport > 0. This tooth
+# zeroes the compute value the Lisp writes into the reply — a dead or stale
+# timing field — and requires the e2e to FAIL on the split guard.
+echo
+echo "=== tooth: Lisp stops reporting sqrt compute; the split guard must fail ==="
+SNAP_LISP2="${LISP_GEN}.smoke2.bak"
+cp "$LISP_GEN" "$SNAP_LISP2" || { bad "cannot snapshot $LISP_GEN"; exit 1; }
+trap "mv -f \"$SNAP_LISP2\" \"$LISP_GEN\" 2>/dev/null; rm -f \"$SNAP_LISP2\"" EXIT
+
+# (g) zero the compute field: read a literal 0 instead of the timed value.
+sed -i 's@(ldb (byte 8 (\* 8 k)) \*last-sqrt-compute-usec\*)@(ldb (byte 8 (* 8 k)) 0)@' "$LISP_GEN"
+
+if cmp -s "$LISP_GEN" "$SNAP_LISP2"; then
+    bad "tooth: the split mutation did not apply — the compute pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_LISP2" "$LISP_GEN"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: split mutation applied (Lisp reports compute=0 — timing field dead)"
+
+echo "running the e2e against the mutated Lisp dispatch (expect the split guard to fail, ~5s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the dead compute field — the split guard is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH_SQRT|WASM_SIDECAR|split is dead|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (split guard caught the dead compute field)"
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_LISP2" "$LISP_GEN"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then

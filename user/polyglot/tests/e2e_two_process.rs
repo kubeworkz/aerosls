@@ -152,7 +152,12 @@ fn kill_child(child: &mut Child) {
 
 /// Parse `median_ns=<u64>` out of a BENCH line emitted by the wasm-sidecar.
 fn parse_median_ns(line: &str) -> Option<u64> {
-    line.split("median_ns=")
+    parse_field(line, "median_ns=")
+}
+
+/// Parse `key=<u64>` out of a BENCH line (key includes the trailing '=').
+fn parse_field(line: &str, key: &str) -> Option<u64> {
+    line.split(key)
         .nth(1)?
         .split_whitespace()
         .next()?
@@ -242,6 +247,30 @@ fn run_leg(
         eprintln!(
             "[gate] {name} median {median_ns} ns <= {max_median_ns} ns threshold (transport={transport}) — OK"
         );
+
+        if name == "BENCH_SQRT" {
+            // ── compute/transport split guard ──────────────────────────────
+            // The SQRT leg reports total = compute (Lisp sqrts, timed on the
+            // Lisp side and carried in the reply) + transport (derived as
+            // total - compute). A dead or stale split shows compute_ns=0
+            // (the Lisp timing or its wire field broke) or transport_ns=0
+            // (the Lisp clock runs ahead of the wasm calibration). Both
+            // must be live: 4096 real sqrts cannot finish in <10us, and the
+            // message + arena bookkeeping cannot be zero.
+            let compute_ns = parse_field(line, "compute_ns=")
+                .unwrap_or_else(|| panic!("{name} line missing compute_ns: {line}"));
+            let transport_ns = parse_field(line, "transport_ns=")
+                .unwrap_or_else(|| panic!("{name} line missing transport_ns: {line}"));
+            if compute_ns < 10_000 || transport_ns == 0 {
+                kill_child(&mut lisp);
+                return Err(format!(
+                    "{name} compute/transport split is dead: compute_ns={compute_ns} transport_ns={transport_ns} total={median_ns} (transport={transport}) — the Lisp-side timing or its wire path broke"
+                ));
+            }
+            eprintln!(
+                "[gate] {name} split: compute {compute_ns} ns + transport {transport_ns} ns (total {median_ns} ns, transport={transport}) — OK"
+            );
+        }
     }
 
     kill_child(&mut lisp);

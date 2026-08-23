@@ -40,6 +40,10 @@ static MAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static BENCH_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the arena-cap path, collected inside `call_sqrt_batch`.
 static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Lisp-side compute samples (ns) for the sqrt bench, index-aligned with
+/// BENCH_SQRT_SAMPLES (same call order) — the split lets CI attribute the
+/// leg's latency to Lisp sqrts (compute) vs ring/dispatch overhead.
+static BENCH_SQRT_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the string path, collected inside `call_reverse`.
 static BENCH_STR_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
@@ -286,6 +290,55 @@ fn pack(status: i64, value: u64) -> i64 {
 
 /// Print `BENCH_{tag}: ...` with median/p99/mean in cycles. The first sample
 /// is dropped (the guest's verification call — the cold path).
+/// Print `BENCH_SQRT: ...` with the total/compute/transport split. The total
+/// is the wasm-side round trip (cycles), compute is the Lisp-side dotimes
+/// (ns, carried in the reply), transport is derived as total - compute — so
+/// CI can watch whether the leg is Lisp sqrts or ring overhead. The two
+/// sample vectors are index-aligned (same call order); the first sample of
+/// each is dropped as warmup.
+fn print_bench_split(
+    tag: &str,
+    total_cy: &[u64],
+    compute_ns: &[u64],
+    note: &str,
+    transport: &str,
+) {
+    let n_common = total_cy.len().min(compute_ns.len());
+    let total_cy = total_cy.get(1..n_common).unwrap_or(&total_cy[..]);
+    let compute_ns = compute_ns.get(1..n_common).unwrap_or(&compute_ns[..]);
+    if !total_cy.is_empty() && total_cy.len() == compute_ns.len() {
+        let mut ts = total_cy.to_vec();
+        ts.sort_unstable();
+        let mut cs = compute_ns.to_vec();
+        cs.sort_unstable();
+        let n = ts.len();
+        let median_cy = ts[n / 2];
+        let median_ns = cycles_to_ns(median_cy);
+        let p99_ns = cycles_to_ns(ts[((n as f64 * 0.99) as usize).min(n - 1)]);
+        let mean_ns = cycles_to_ns(ts.iter().sum::<u64>() / n as u64);
+        let median_compute = cs[n / 2];
+        let p99_compute = cs[((n as f64 * 0.99) as usize).min(n - 1)];
+        // transport = total - compute, clamped at 0 (a Lisp clock that runs
+        // ahead of the wasm calibration would otherwise go negative).
+        let median_transport = median_ns.saturating_sub(median_compute);
+        println!(
+            "BENCH_{tag}: N={n} median_cy={median_cy} median_ns={median_ns} p99_ns={p99_ns} \
+             compute_ns={median_compute} compute_p99_ns={p99_compute} transport_ns={median_transport} \
+             mean_ns={mean_ns} ({note}, transport={transport})"
+        );
+        let leg = tag.to_ascii_lowercase();
+        println!(
+            "BENCH_JSON {{\"leg\":\"{leg}\",\"transport\":\"{transport}\",\"n\":{n},\"median_cy\":{median_cy},\"median_ns\":{median_ns},\"compute_ns\":{median_compute},\"transport_ns\":{median_transport},\"p99_ns\":{p99_ns},\"mean_ns\":{mean_ns}}}"
+        );
+    } else {
+        println!("BENCH_{tag}: no round-trip samples ({note}, transport={transport})");
+        println!(
+            "BENCH_JSON {{\"leg\":\"{}\",\"transport\":\"{transport}\",\"n\":0}}",
+            tag.to_ascii_lowercase()
+        );
+    }
+}
+
 fn print_bench(tag: &str, samples: &[u64], note: &str, transport: &str) {
     let samples = samples.get(1..).unwrap_or(&samples[..]);
     if !samples.is_empty() {
@@ -433,8 +486,13 @@ fn main() {
                     Err(e) => pack(1, e.code as u64),
                 };
                 // Arena-cap round trip: the data stays in the shared mapping;
-                // only the MEM cap + refcounts cross the transport.
-                BENCH_SQRT_SAMPLES.lock().unwrap().push(rdtsc().wrapping_sub(t0));
+                // only the MEM cap + refcounts cross the transport. The
+                // Lisp-reported compute (ns) is recorded alongside so the
+                // report can split total into compute + transport.
+                let total = rdtsc().wrapping_sub(t0);
+                BENCH_SQRT_SAMPLES.lock().unwrap().push(total);
+                let compute = unsafe { gen_calculator::calculator_service::LAST_SQRT_COMPUTE_NS };
+                BENCH_SQRT_COMPUTE_NS.lock().unwrap().push(compute);
                 r
             },
         )
@@ -537,9 +595,10 @@ fn main() {
     // i.e. the cold path (warmup for connection/TCP/buffers).
     let add_samples = std::mem::take(&mut *BENCH_SAMPLES.lock().unwrap());
     let sqrt_samples = std::mem::take(&mut *BENCH_SQRT_SAMPLES.lock().unwrap());
+    let sqrt_compute = std::mem::take(&mut *BENCH_SQRT_COMPUTE_NS.lock().unwrap());
     let str_samples = std::mem::take(&mut *BENCH_STR_SAMPLES.lock().unwrap());
     print_bench("ADD", &add_samples, "add() — inline args", &transport);
-    print_bench("SQRT", &sqrt_samples, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
+    print_bench_split("SQRT", &sqrt_samples, &sqrt_compute, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
     print_bench("STR", &str_samples, "reverse(32..63 B) — string arena MEM cap", &transport);
 
     if status == 0 {

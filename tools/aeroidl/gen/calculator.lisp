@@ -32,6 +32,19 @@
 (defconstant +op-heavy-reduce+ #x0006)
 (defconstant +op-reverse+      #x0007)
 
+;; ── sqrt compute/transport split ───────────────────────────────────────────
+;; The Lisp side times ONLY the element-wise sqrt computation (the dotimes
+;; loop) and carries the elapsed microseconds to the caller in reply-payload
+;; bytes 8..16, next to the ok byte and the element count. The Rust client
+;; reads it and the sidecar derives transport = total - compute, so CI can
+;; see whether the SQRT leg's latency is Lisp sqrts or ring overhead.
+(defvar *last-sqrt-compute-usec* 0)
+
+(defun now-usec ()
+  "Wall-clock microseconds (matches the wasm side's calibrated rdtsc)."
+  (multiple-value-bind (s us) (sb-ext:get-time-of-day)
+    (+ (* s 1000000) us)))
+
 ;;; ─── Error enum ────────────────────────────────────────────────────────────
 
 (deftype calc-error-kind ()
@@ -133,13 +146,18 @@
              (out-cap   (aerosls:arena-alloc (* count 8)
                         :rights '(:read :write)))   ; arena ownership: returned to caller
              (out-ptr   (aerosls:arena-mem out-cap)))
-        ;; Element-wise sqrt — direct memory writes, zero copy to caller
-        (dotimes (i count)
-          (let ((val (cffi:mem-aref in-ptr :double i)))
-            (setf (cffi:mem-aref out-ptr :double i)
-                  (if (minusp val)
-                      0.0d0  ; or signal error
-                      (sqrt val)))))
+        ;; Element-wise sqrt — direct memory writes, zero copy to caller.
+        ;; Timed: this is the COMPUTE component of the bench; the arena
+        ;; allocs and the message round trip (transport) are measured by
+        ;; difference on the caller side.
+        (let ((t0 (now-usec)))
+          (dotimes (i count)
+            (let ((val (cffi:mem-aref in-ptr :double i)))
+              (setf (cffi:mem-aref out-ptr :double i)
+                    (if (minusp val)
+                        0.0d0  ; or signal error
+                        (sqrt val)))))
+          (setf *last-sqrt-compute-usec* (- (now-usec) t0)))
         (calc-success out-cap))   ; return the cap handle
     (error (e)
       (format t "[lisp] sqrt_batch error: ~A~%" e)
@@ -288,7 +306,11 @@
              (setf (aref reply-payload 4) (ldb (byte 8 0) count))
              (setf (aref reply-payload 5) (ldb (byte 8 8) count))
              (setf (aref reply-payload 6) (ldb (byte 8 16) count))
-             (setf (aref reply-payload 7) (ldb (byte 8 24) count)))
+             (setf (aref reply-payload 7) (ldb (byte 8 24) count))
+             ;; compute-time split: u64 microseconds at bytes 8..16
+             (dotimes (k 8)
+               (setf (aref reply-payload (+ 8 k))
+                     (ldb (byte 8 (* 8 k)) *last-sqrt-compute-usec*))))
            (values reply-payload reply-caps n-reply-caps))))
 
       (#.+op-heavy-reduce+
