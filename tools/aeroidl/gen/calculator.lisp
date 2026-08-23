@@ -39,6 +39,7 @@
 ;; reads it and the sidecar derives transport = total - compute, so CI can
 ;; see whether the SQRT leg's latency is Lisp sqrts or ring overhead.
 (defvar *last-sqrt-compute-usec* 0)
+(defvar *last-reverse-compute-usec* 0)
 
 (defun now-usec ()
   "Wall-clock microseconds (matches the wasm side's calibrated rdtsc)."
@@ -176,10 +177,14 @@
       (let* ((in-ptr  (aerosls:arena-mem text-cap))
              (out-cap (aerosls:arena-alloc len :rights '(:read :write)))
              (out-ptr (aerosls:arena-mem out-cap)))
-        ;; Byte-wise reversal — direct memory reads/writes, zero copy to caller
-        (dotimes (i len)
-          (setf (sb-sys:sap-ref-8 out-ptr i)
-                (sb-sys:sap-ref-8 in-ptr (- len 1 i))))
+        ;; Byte-wise reversal — direct memory reads/writes, zero copy to
+        ;; caller. Timed: this is the COMPUTE component of the string bench
+        ;; (the arena allocs + message round trip are transport).
+        (let ((t0 (now-usec)))
+          (dotimes (i len)
+            (setf (sb-sys:sap-ref-8 out-ptr i)
+                  (sb-sys:sap-ref-8 in-ptr (- len 1 i))))
+          (setf *last-reverse-compute-usec* (- (now-usec) t0)))
         (calc-success out-cap))
     (error (e)
       (format t "[lisp] reverse error: ~A~%" e)
@@ -345,7 +350,11 @@
              (setf (aref reply-payload 4) (ldb (byte 8 0) len))
              (setf (aref reply-payload 5) (ldb (byte 8 8) len))
              (setf (aref reply-payload 6) (ldb (byte 8 16) len))
-             (setf (aref reply-payload 7) (ldb (byte 8 24) len)))
+             (setf (aref reply-payload 7) (ldb (byte 8 24) len))
+             ;; compute-time split: u64 microseconds at bytes 8..16
+             (dotimes (k 8)
+               (setf (aref reply-payload (+ 8 k))
+                     (ldb (byte 8 (* 8 k)) *last-reverse-compute-usec*))))
            (values reply-payload reply-caps n-reply-caps)))))))
 
 ;;; ─── Bootstrap: register dispatch with the sidecar runtime ─────────────────

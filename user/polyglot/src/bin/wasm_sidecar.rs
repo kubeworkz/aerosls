@@ -46,6 +46,9 @@ static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static BENCH_SQRT_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the string path, collected inside `call_reverse`.
 static BENCH_STR_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Lisp-side compute samples (ns) for the string bench, index-aligned with
+/// BENCH_STR_SAMPLES — same split convention as the SQRT leg.
+static BENCH_STR_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
 /// requests, ring1 = lisp→wasm replies, ring2 = wasm→kerneld arena requests,
 /// ring3 = kerneld→wasm arena replies.
@@ -543,7 +546,12 @@ fn main() {
                 };
                 // String arena-cap round trip: input + reversed output stay in
                 // the shared mapping; only the MEM caps + bytes counts cross.
-                BENCH_STR_SAMPLES.lock().unwrap().push(rdtsc().wrapping_sub(t0));
+                // The Lisp-reported compute (ns) rides the reply so the
+                // report can split total into compute + transport.
+                let total = rdtsc().wrapping_sub(t0);
+                BENCH_STR_SAMPLES.lock().unwrap().push(total);
+                let compute = unsafe { gen_calculator::calculator_service::LAST_REVERSE_COMPUTE_NS };
+                BENCH_STR_COMPUTE_NS.lock().unwrap().push(compute);
                 r
             },
         )
@@ -597,9 +605,10 @@ fn main() {
     let sqrt_samples = std::mem::take(&mut *BENCH_SQRT_SAMPLES.lock().unwrap());
     let sqrt_compute = std::mem::take(&mut *BENCH_SQRT_COMPUTE_NS.lock().unwrap());
     let str_samples = std::mem::take(&mut *BENCH_STR_SAMPLES.lock().unwrap());
+    let str_compute = std::mem::take(&mut *BENCH_STR_COMPUTE_NS.lock().unwrap());
     print_bench("ADD", &add_samples, "add() — inline args", &transport);
     print_bench_split("SQRT", &sqrt_samples, &sqrt_compute, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
-    print_bench("STR", &str_samples, "reverse(32..63 B) — string arena MEM cap", &transport);
+    print_bench_split("STR", &str_samples, &str_compute, "reverse(32..63 B) — string arena MEM cap", &transport);
 
     if status == 0 {
         println!("WASM_SIDECAR PASS");

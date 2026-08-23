@@ -248,20 +248,24 @@ fn run_leg(
             "[gate] {name} median {median_ns} ns <= {max_median_ns} ns threshold (transport={transport}) — OK"
         );
 
-        if name == "BENCH_SQRT" {
+        if name == "BENCH_SQRT" || name == "BENCH_STR" {
             // ── compute/transport split guard ──────────────────────────────
-            // The SQRT leg reports total = compute (Lisp sqrts, timed on the
-            // Lisp side and carried in the reply) + transport (derived as
-            // total - compute). A dead or stale split shows compute_ns=0
+            // These legs report total = compute (Lisp-side work, timed on
+            // the Lisp side and carried in the reply) + transport (derived
+            // as total - compute). A dead or stale split shows compute_ns=0
             // (the Lisp timing or its wire field broke) or transport_ns=0
             // (the Lisp clock runs ahead of the wasm calibration). Both
-            // must be live: 4096 real sqrts cannot finish in <10us, and the
-            // message + arena bookkeeping cannot be zero.
+            // must be live; the floors sit far below the live medians:
+            // sqrt's 4096 sqrts cannot finish in <10us, and reverse's
+            // 32..63 B byte loop (with cold arena page faults) measures
+            // ~9us on shm and cannot finish in <1us. The message + arena
+            // bookkeeping can never be zero.
+            let min_compute = if name == "BENCH_SQRT" { 10_000 } else { 1_000 };
             let compute_ns = parse_field(line, "compute_ns=")
                 .unwrap_or_else(|| panic!("{name} line missing compute_ns: {line}"));
             let transport_ns = parse_field(line, "transport_ns=")
                 .unwrap_or_else(|| panic!("{name} line missing transport_ns: {line}"));
-            if compute_ns < 10_000 || transport_ns == 0 {
+            if compute_ns < min_compute || transport_ns == 0 {
                 kill_child(&mut lisp);
                 return Err(format!(
                     "{name} compute/transport split is dead: compute_ns={compute_ns} transport_ns={transport_ns} total={median_ns} (transport={transport}) — the Lisp-side timing or its wire path broke"
