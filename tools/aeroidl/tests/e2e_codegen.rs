@@ -403,9 +403,12 @@ fn e2e_dispatch_serializes_result_match() {
 fn e2e_dispatch_async_sends_ack() {
     let code = generate_dispatch_code();
 
-    // Verify async method (heavy_reduce) sends an immediate ack
+    // Verify async method (heavy_reduce) sends an immediate ack.
+    // Slice to the NEXT opcode arm (not the `_ =>` catch-all): the dispatch
+    // match gained a later arm (OP_REVERSE) whose result-matching pattern
+    // would otherwise leak into this slice.
     if let Some(start) = code.find("OP_HEAVY_REDUCE =>") {
-        let end = code[start..].find("\n                _ =>").unwrap_or(500);
+        let end = code[start..].find("\n                OP_").unwrap_or(500);
         let arm = &code[start..start + end];
         // Async arm should NOT use match result
         assert!(!arm.contains("match result"),
@@ -726,8 +729,8 @@ fn e2e_all_backends_same_opcodes() {
     let (client, dispatcher, lisp, c) = generate_all_backends();
 
     let canonical = ast_method_opcodes();
-    assert_eq!(canonical.len(), 6,
-        "expected 6 methods in calculator.aeroidl, got {}", canonical.len());
+    assert_eq!(canonical.len(), 7,
+        "expected 7 methods in calculator.aeroidl, got {}", canonical.len());
 
     // Rust/C emit UPPERCASE names (OP_ADD), Lisp emits lowercase (op-add).
     // Normalize everything to lowercase snake for comparison.

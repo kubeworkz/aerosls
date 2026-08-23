@@ -72,4 +72,13 @@ interface CalculatorService {
     /// RECV_CAP on a dedicated result channel.
     @async
     heavy_reduce(input: f64[] @arena) -> Result<u32, CalcError>
+
+    // ── String handling ─────────────────────────────────────────────────────
+
+    /// Reverse a UTF-8 string. The input arrives as a borrowed MEM cap; the
+    /// reversed string is returned in a freshly allocated arena buffer
+    /// (owned by the caller). This exercises the string (bytes) IDL path —
+    /// an arena-cap parameter and an arena-cap result — as opposed to the
+    /// scalar-inline (add) and f64-array (sqrt_batch) paths.
+    reverse(text: string @borrowed) -> Result<string @arena, CalcError>
 }

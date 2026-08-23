@@ -211,6 +211,7 @@ pub mod calculator_service {
     pub const OP_MATMUL_VEC: u16 = 4;
     pub const OP_SQRT_BATCH: u16 = 5;
     pub const OP_HEAVY_REDUCE: u16 = 6;
+    pub const OP_REVERSE: u16 = 7;
 
     /// Channel write endpoint (CHAN_W) to the remote sidecar.
     /// Set during bootstrap by the sidecar runtime.
@@ -549,6 +550,70 @@ pub mod calculator_service {
             }
         }
         Ok(())
+    }
+
+    /// `reverse` — opcode 7
+    ///
+    /// # Wire format
+    ///   SEND_CAP { opcode=7, payload=[text_len u32], caps=[MEM input @borrowed] }
+    ///   RECV_CAP { payload=[AeroidlResult], caps=[MEM output @arena] }
+    /// The reply string is an arena cap (ArenaSlice<u8>); the Lisp side
+    /// reverses the input bytes into a fresh arena buffer and transfers the
+    /// cap back.
+
+    pub fn reverse(text_cap: u16, text_len: u32) -> AeroidlResult<ArenaSlice<u8>> {
+        // ── Step 1: build request payload ──
+        let mut payload = [0u8; 4];
+        payload[0..0+4].copy_from_slice(&text_len.to_le_bytes());
+
+        // ── Step 2: send request ──
+        let flags: u16 = 0;
+        let cap_descs = [
+            CapDescriptor { slot: text_cap as u32, offset: 0, len: text_len, rights: CAP_PERM_R, flags: CAP_FLAG_BORROWED, pad: 0 },
+        ];
+        let n_caps_send: u32 = cap_descs.len() as u32;
+        unsafe {
+            let _rc = chan_send(
+                CHAN_W,
+                OP_REVERSE,
+                payload.as_ptr(),
+                payload.len() as u32,
+                cap_descs.as_ptr(),
+                n_caps_send,
+                flags,
+            );
+            if _rc != 0 {
+                return Err(AEROIDL_ERROR { code: _rc as u32, message: alloc::string::String::from("chan_send failed") });
+            }
+        }
+
+        // ── Step 3: receive reply ──
+        let mut reply_buf = [0u8; 32];
+        let mut cap_slots = [0u16; 8];
+        let mut n_caps: u16 = 0;
+        unsafe {
+            let _rc = chan_recv(
+                CHAN_R,
+                reply_buf.as_mut_ptr(),
+                reply_buf.len() as u32,
+                cap_slots.as_mut_ptr(),
+                &mut n_caps as *mut u16,
+            );
+            if _rc != 0 {
+                return Err(AEROIDL_ERROR { code: _rc as u32, message: alloc::string::String::from("chan_recv failed") });
+            }
+        }
+
+        // ── Step 4: deserialize reply ──
+        let ok_byte = reply_buf[0];
+        if ok_byte == 1 {
+            // Arena cap handle is in cap_slots[0], byte count in reply_buf[4..8]
+            let len = u32::from_le_bytes(reply_buf[4..8].try_into().unwrap());
+            Ok(ArenaSlice::new(cap_slots[0], len))
+        } else {
+            let code = u32::from_le_bytes(reply_buf[4..8].try_into().unwrap());
+            Err(AEROIDL_ERROR { code, message: alloc::string::String::new() })
+        }
     }
 
 }

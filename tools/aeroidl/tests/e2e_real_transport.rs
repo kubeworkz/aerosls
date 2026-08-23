@@ -203,6 +203,21 @@ impl calc_dispatch::calculator_service::CalculatorServiceImpl for CalcSvc {
         let _ = (input_cap, input_data, input_len);
         0
     }
+    fn reverse(
+        &mut self,
+        text_cap: u16,
+        text_data: *const u8,
+        text_len: u32,
+    ) -> Result<alloc::string::String, AEROIDL_ERROR> {
+        // Real implementation: reverse the bytes the caller placed in the
+        // shared arena and return the reversed string.
+        let bytes = unsafe { core::slice::from_raw_parts(text_data, text_len as usize) };
+        let _ = text_cap;
+        Ok(alloc::string::String::from_utf8_lossy(
+            &bytes.iter().rev().cloned().collect::<alloc::vec::Vec<u8>>(),
+        )
+        .into_owned())
+    }
 }
 
 fn main() {

@@ -21,8 +21,11 @@
 ;;; Host imports (implemented by the Rust sidecar host):
 ;;;   host.call_add(i32 a, i32 b) -> i64   ; hi=status, lo=result
 ;;;   host.call_sqrt_batch(i32 count, i32 input_cap) -> i64 ; hi=status, lo=out_cap
+;;;   host.call_reverse(i32 cap, i32 len) -> i64 ; hi=status, lo=out_cap (string path)
 ;;;   host.write_f64(i32 cap, i32 idx, i64 bits)
 ;;;   host.read_f64(i32 cap, i32 idx) -> i64
+;;;   host.write_u8(i32 cap, i32 idx, i32 byte)
+;;;   host.read_u8(i32 cap, i32 idx) -> i32
 ;;;   host.arena_alloc(i32 size) -> i32 cap
 ;;;   host.arena_free(i32 cap)
 ;;;   host.log(i32 ptr, i32 len)
@@ -30,8 +33,11 @@
 (module
   (import "host" "call_add" (func $call_add (param i32 i32) (result i64)))
   (import "host" "call_sqrt_batch" (func $call_sqrt_batch (param i32 i32) (result i64)))
+  (import "host" "call_reverse" (func $call_reverse (param i32 i32) (result i64)))
   (import "host" "write_f64" (func $write_f64 (param i32 i32 i64)))
   (import "host" "read_f64" (func $read_f64 (param i32 i32) (result i64)))
+  (import "host" "write_u8" (func $write_u8 (param i32 i32 i32)))
+  (import "host" "read_u8" (func $read_u8 (param i32 i32) (result i32)))
   (import "host" "arena_alloc" (func $arena_alloc (param i32) (result i32)))
   (import "host" "arena_free" (func $arena_free (param i32)))
   (import "host" "log" (func $log (param i32 i32)))
@@ -43,6 +49,7 @@
   (data (i32.const 192) "FAIL sqrt\00")
   (data (i32.const 224) "FAIL sqrt-bench\00")
   (data (i32.const 240) "FAIL add-bench\00")
+  (data (i32.const 256) "FAIL str-bench\00")
 
   (func (export "run") (result i32)
     (local $r i64) (local $r2 i64)
@@ -144,6 +151,65 @@
         (call $arena_free (local.get $in_cap))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $sqrt_bench)))
+
+    ;; ── reverse bench: 100 calls, variable-length string (32..63 B) ─────
+    ;; The string/bytes IDL path: a bytes MEM cap in, an arena MEM cap out.
+    ;; Byte j of the sent string is (j*7 + i*11) & 0xff; the Lisp side must
+    ;; return the REVERSED bytes, verified at 3 sampled offsets (outside the
+    ;; timed import). Varying length + content defeats input-keyed caching.
+    (local.set $i (i32.const 0))
+    (block $str_bench_done
+      (loop $str_bench
+        (br_if $str_bench_done (i32.ge_u (local.get $i) (i32.const 100)))
+        (local.set $n
+          (i32.add (i32.const 32) (i32.and (local.get $i) (i32.const 31))))
+        (local.set $in_cap (call $arena_alloc (local.get $n)))
+        (local.set $j (i32.const 0))
+        (block $str_fill_done
+          (loop $str_fill
+            (br_if $str_fill_done (i32.ge_u (local.get $j) (local.get $n)))
+            (call $write_u8
+              (local.get $in_cap)
+              (local.get $j)
+              (i32.and (i32.add (i32.mul (local.get $j) (i32.const 7))
+                                (i32.mul (local.get $i) (i32.const 11)))
+                       (i32.const 255)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $str_fill)))
+        (local.set $r2 (call $call_reverse (local.get $in_cap) (local.get $n)))
+        (local.set $out_cap
+          (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff))))
+
+        ;; ── reverse bench-workload guard ─────────────────────────────────
+        ;; reply[j] must equal sent[n-1-j] = ((n-1-j)*7 + i*11) & 255.
+        ;; Sample j = 0, n>>1, n-1. A forward-copy callee, a cached reply,
+        ;; or a constant-input bench fails on the first mismatch.
+        (local.set $j (i32.const 0))
+        (local.set $status
+          (i32.and (i32.add (i32.mul (i32.sub (local.get $n) (i32.const 1)) (i32.const 7))
+                            (i32.mul (local.get $i) (i32.const 11)))
+                   (i32.const 255)))
+        (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
+          (then (call $log (i32.const 256) (i32.const 14)) (return (i32.const 9))))
+        (local.set $j (i32.shr_u (local.get $n) (i32.const 1)))
+        (local.set $status
+          (i32.and (i32.add (i32.mul (i32.sub (i32.sub (local.get $n) (i32.const 1)) (local.get $j)) (i32.const 7))
+                            (i32.mul (local.get $i) (i32.const 11)))
+                   (i32.const 255)))
+        (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
+          (then (call $log (i32.const 256) (i32.const 14)) (return (i32.const 9))))
+        (local.set $j (i32.sub (local.get $n) (i32.const 1)))
+        (local.set $status
+          (i32.and (i32.add (i32.mul (i32.sub (i32.sub (local.get $n) (i32.const 1)) (local.get $j)) (i32.const 7))
+                            (i32.mul (local.get $i) (i32.const 11)))
+                   (i32.const 255)))
+        (if (i32.ne (call $read_u8 (local.get $out_cap) (local.get $j)) (local.get $status))
+          (then (call $log (i32.const 256) (i32.const 14)) (return (i32.const 9))))
+
+        (call $arena_free (local.get $out_cap))
+        (call $arena_free (local.get $in_cap))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $str_bench)))
 
     ;; ── sqrt_batch: N = 4096 f64s through the shared arena ───────────────
     (local.set $n (i32.const 4096))

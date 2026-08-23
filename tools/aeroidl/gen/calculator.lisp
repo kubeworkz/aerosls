@@ -17,7 +17,8 @@
            #:calculator-div
            #:calculator-dot
            #:calculator-matmul-vec
-           #:calculator-sqrt-batch))
+           #:calculator-sqrt-batch
+           #:calculator-reverse))
 
 (in-package #:aerosls.calculator)
 
@@ -29,6 +30,7 @@
 (defconstant +op-matmul-vec+  #x0004)
 (defconstant +op-sqrt-batch+  #x0005)
 (defconstant +op-heavy-reduce+ #x0006)
+(defconstant +op-reverse+      #x0007)
 
 ;;; ─── Error enum ────────────────────────────────────────────────────────────
 
@@ -144,6 +146,28 @@
       (finish-output t)
       (calc-failure :internal
                     (format nil "sqrt_batch failed: ~A" e)))))
+
+(defun calculator-reverse (text-cap len)
+  "reverse(text: string @borrowed) -> Result<string @arena, CalcError>
+   Zero-copy read: the input string arrives as a borrowed MEM cap — we read
+   its bytes directly from the shared arena, write them reversed into a
+   freshly allocated arena buffer, and return the MEM cap (owned by caller)."
+  (declare (type (unsigned-byte 16) text-cap)
+           (type (unsigned-byte 32) len))
+  (handler-case
+      (let* ((in-ptr  (aerosls:arena-mem text-cap))
+             (out-cap (aerosls:arena-alloc len :rights '(:read :write)))
+             (out-ptr (aerosls:arena-mem out-cap)))
+        ;; Byte-wise reversal — direct memory reads/writes, zero copy to caller
+        (dotimes (i len)
+          (setf (sb-sys:sap-ref-8 out-ptr i)
+                (sb-sys:sap-ref-8 in-ptr (- len 1 i))))
+        (calc-success out-cap))
+    (error (e)
+      (format t "[lisp] reverse error: ~A~%" e)
+      (finish-output t)
+      (calc-failure :internal
+                    (format nil "reverse failed: ~A" e)))))
 
 ;;; ─── Opcode dispatch table ─────────────────────────────────────────────────
 
@@ -284,7 +308,23 @@
          (values (make-array 4 :element-type '(unsigned-byte 8)
                                 :initial-contents '(#x01 0 0 0))
                  (make-array 8 :element-type '(unsigned-byte 16))
-                 0))))))
+                 0)))
+
+      (#.+op-reverse+
+       (let ((text-cap (aref cap-slots 0))
+             (len (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0)))
+         ;; String-arena return wire convention: the reply byte count goes in
+         ;; reply-payload[4..8] next to the ok byte (matches the Rust
+         ;; client's deserialize for ArenaSlice results), the MEM cap handle
+         ;; in reply-caps[0].
+         (multiple-value-bind (reply-payload reply-caps n-reply-caps)
+             (encode-result (calculator-reverse text-cap len) :cap)
+           (when (and (= (aref reply-payload 0) 1) (> n-reply-caps 0))
+             (setf (aref reply-payload 4) (ldb (byte 8 0) len))
+             (setf (aref reply-payload 5) (ldb (byte 8 8) len))
+             (setf (aref reply-payload 6) (ldb (byte 8 16) len))
+             (setf (aref reply-payload 7) (ldb (byte 8 24) len)))
+           (values reply-payload reply-caps n-reply-caps)))))))
 
 ;;; ─── Bootstrap: register dispatch with the sidecar runtime ─────────────────
 

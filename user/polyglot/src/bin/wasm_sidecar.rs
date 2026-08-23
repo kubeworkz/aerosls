@@ -40,6 +40,8 @@ static MAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static BENCH_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the arena-cap path, collected inside `call_sqrt_batch`.
 static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// rdtsc samples for the string path, collected inside `call_reverse`.
+static BENCH_STR_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
 /// requests, ring1 = lisp→wasm replies, ring2 = wasm→kerneld arena requests,
 /// ring3 = kerneld→wasm arena replies.
@@ -271,6 +273,13 @@ fn arena_ptr(cap: u16, idx: usize) -> *mut u8 {
     (base + off + idx * 8) as *mut u8
 }
 
+/// Byte-granular arena pointer (strings/bytes; no *8 element scaling).
+fn arena_byte_ptr(cap: u16, idx: usize) -> *mut u8 {
+    let base = MAP_BASE.load(Ordering::SeqCst);
+    let off = cap_table_offset(cap).expect("cap not in table") as usize;
+    (base + off + idx) as *mut u8
+}
+
 fn pack(status: i64, value: u64) -> i64 {
     ((status as u64) << 32 | value) as i64
 }
@@ -465,6 +474,41 @@ fn main() {
         })
         .unwrap();
     linker
+        .func_wrap(
+            "host",
+            "call_reverse",
+            |_caller: wasmi::Caller<'_, ()>, cap: i32, len: i32| -> i64 {
+                let t0 = rdtsc();
+                let r = match gen_calculator::calculator_service::reverse(cap as u16, len as u32) {
+                    Ok(slice) => pack(0, slice.cap as u64),
+                    Err(e) => pack(1, e.code as u64),
+                };
+                // String arena-cap round trip: input + reversed output stay in
+                // the shared mapping; only the MEM caps + bytes counts cross.
+                BENCH_STR_SAMPLES.lock().unwrap().push(rdtsc().wrapping_sub(t0));
+                r
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "write_u8",
+            |_caller: wasmi::Caller<'_, ()>, cap: i32, idx: i32, byte: i32| {
+                unsafe { *(arena_byte_ptr(cap as u16, idx as usize) as *mut u8) = byte as u8 };
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "read_u8",
+            |_caller: wasmi::Caller<'_, ()>, cap: i32, idx: i32| -> i32 {
+                unsafe { *(arena_byte_ptr(cap as u16, idx as usize) as *const u8) as i32 }
+            },
+        )
+        .unwrap();
+    linker
         .func_wrap("host", "log", |caller: wasmi::Caller<'_, ()>, ptr: i32, len: i32| {
             let mem = caller
                 .get_export("memory")
@@ -493,8 +537,10 @@ fn main() {
     // i.e. the cold path (warmup for connection/TCP/buffers).
     let add_samples = std::mem::take(&mut *BENCH_SAMPLES.lock().unwrap());
     let sqrt_samples = std::mem::take(&mut *BENCH_SQRT_SAMPLES.lock().unwrap());
+    let str_samples = std::mem::take(&mut *BENCH_STR_SAMPLES.lock().unwrap());
     print_bench("ADD", &add_samples, "add() — inline args", &transport);
     print_bench("SQRT", &sqrt_samples, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
+    print_bench("STR", &str_samples, "reverse(32..63 B) — string arena MEM cap", &transport);
 
     if status == 0 {
         println!("WASM_SIDECAR PASS");

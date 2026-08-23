@@ -12,8 +12,9 @@
 //!
 //! Each leg spawns the wasm + lisp sidecars with `--transport tcp` or
 //! `--transport shm` and runs the same guest (add + sqrt_batch over a
-//! 4096-element f64 array, plus the 1000-call add latency bench and the
-//! 100-call arena sqrt bench). In the `shm` leg the ENTIRE sidecar path is
+//! 4096-element f64 array + reverse over a variable-length string, plus the
+//! 1000-call add latency bench, the 100-call arena sqrt bench, and the
+//! 100-call string reverse bench). In the `shm` leg the ENTIRE sidecar path is
 //! shared memory: the request/reply frames travel ring0/ring1 (wasm↔lisp,
 //! no kernel) and the arena alloc/free bookkeeping travels ring2/ring3
 //! (wasm↔kerneld) and ring4/ring5 (lisp↔kerneld) — no TCP round trip
@@ -197,9 +198,11 @@ fn run_leg(
     }
     let (mut wasm, wasm_out) = spawn_linux(wasm_bin, &wasm_args, &[]);
     // The sidecar prints the rdtsc latency reports first, then the verdict.
-    // The channel is FIFO, so consume both BENCH lines before WASM_SIDECAR.
+    // The channel is FIFO, so consume all three BENCH lines before
+    // WASM_SIDECAR.
     let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
     let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
+    let bench_str = wait_for_marker(&wasm_out, "BENCH_STR", Duration::from_secs(60));
     let wasm_line = wait_for_marker(&wasm_out, "WASM_SIDECAR", Duration::from_secs(30));
     let status = wasm.wait().expect("wasm exit");
     let Some(wasm_line) = wasm_line else {
@@ -218,7 +221,11 @@ fn run_leg(
     // (~175us, still dominated by 4096 real SBCL sqrts) — all sidecar
     // traffic, message + arena bookkeeping, is shared memory. 5ms default
     // catches an order-of-magnitude transport regression with wide headroom.
-    for (name, bench) in [("BENCH_ADD", &bench_add), ("BENCH_SQRT", &bench_sqrt)] {
+    for (name, bench) in [
+        ("BENCH_ADD", &bench_add),
+        ("BENCH_SQRT", &bench_sqrt),
+        ("BENCH_STR", &bench_str),
+    ] {
         let Some(line) = bench else {
             kill_child(&mut lisp);
             return Err(format!("wasm-sidecar produced no {name} latency report (transport={transport})"));

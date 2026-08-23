@@ -290,6 +290,47 @@ fi
 mv -f "$SNAP_GUEST2" "$GUEST"; touch "$GUEST"
 trap - EXIT
 
+# ─── fifth tooth: the string bench-workload guard ───────────────────────────
+# The reverse bench measures the string/bytes IDL path: the guest sends a
+# variable-length string (bytes MEM cap), the Lisp side reverses it into a
+# fresh arena buffer, and the guest verifies reply[j] == sent[n-1-j] at
+# three sampled offsets. This tooth makes the Lisp side copy FORWARD instead
+# of reversing — the "callee stops processing the string" regression — and
+# requires the e2e to FAIL on the guard.
+echo
+echo "=== tooth: Lisp copies forward instead of reversing; the string guard must fail ==="
+LISP_GEN=tools/aeroidl/gen/calculator.lisp
+SNAP_LISP="${LISP_GEN}.smoke.bak"
+cp "$LISP_GEN" "$SNAP_LISP" || { bad "cannot snapshot $LISP_GEN"; exit 1; }
+trap "mv -f \"$SNAP_LISP\" \"$LISP_GEN\" 2>/dev/null; rm -f \"$SNAP_LISP\"" EXIT
+
+# (f) forward copy: read in-ptr i instead of in-ptr (- len 1 i). The guest
+#     then sees reply[j] == sent[j] != sent[n-1-j] and fails the guard.
+sed -i 's@(sb-sys:sap-ref-8 in-ptr (- len 1 i))@(sb-sys:sap-ref-8 in-ptr i)@' "$LISP_GEN"
+
+if cmp -s "$LISP_GEN" "$SNAP_LISP"; then
+    bad "tooth: the Lisp mutation did not apply — the reverse pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_LISP" "$LISP_GEN"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: Lisp mutation applied (reverse reads forward — string regression recreated)"
+
+# The Lisp file is loaded by SBCL at runtime — no rebuild needed for this
+# tooth; the e2e picks the mutation up directly.
+echo "running the e2e against the mutated Lisp dispatch (expect the string guard to fail, ~5s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the forward-copy regression — the string guard is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|FAIL str-bench|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (string bench-workload guard caught the forward-copy regression)"
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_LISP" "$LISP_GEN"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -306,7 +347,7 @@ else
 fi
 
 dirty=0
-for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST"; do
+for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN"; do
     for b in "${f}.smoke.bak" "${f}.smoke2.bak"; do
         if [ -f "$b" ]; then
             bad "leftover $b after restore"
