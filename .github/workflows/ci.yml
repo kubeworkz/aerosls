@@ -478,6 +478,9 @@ jobs:
           fi
           python3 - <<'EOF'
           def load(path):
+              # Key by (leg, transport) so the tcp and shm medians never
+              # cross-compare — a shm baseline is ~350x faster on the add
+              # leg, so mixing them would spam false drift warnings.
               out = {}
               for ln in open(path):
                   ln = ln.strip()
@@ -487,7 +490,7 @@ jobs:
                       j = json.loads(ln.split("BENCH_JSON ", 1)[1])
                   except Exception:
                       continue
-                  out[j.get("leg")] = j
+                  out[f"{j.get('transport', 'tcp')}/{j.get('leg')}"] = j
               return out
 
           import json
@@ -496,8 +499,9 @@ jobs:
           if not prev:
               print("no previous baseline legs — nothing to compare (first run)")
               raise SystemExit(0)
-          for leg in sorted(cur):
-              c, p = cur[leg], prev.get(leg)
+          for key in sorted(cur):
+              c, p = cur[key], prev.get(key)
+              leg = f"{c.get('transport', 'tcp')}/{c.get('leg')}"
               if not p or not p.get("median_ns"):
                   print(f"info: {leg}: no previous baseline — skipping")
                   continue

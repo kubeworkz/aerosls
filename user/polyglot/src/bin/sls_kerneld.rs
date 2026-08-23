@@ -15,6 +15,7 @@
 //!
 //! Usage: sls-kerneld --port N [--arena-size MB] [--arena-path PATH]
 
+use polyglot::ring;
 use polyglot::transport::*;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -169,14 +170,16 @@ fn main() {
     let mut port = 0u16;
     let mut arena_size_mb = 16u32;
     let mut arena_path: Option<String> = None;
+    let mut chan_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().unwrap().parse().unwrap(),
             "--arena-size" => arena_size_mb = args.next().unwrap().parse().unwrap(),
             "--arena-path" => arena_path = Some(args.next().unwrap()),
+            "--chan" => chan_path = Some(args.next().unwrap()),
             _ => {
-                eprintln!("usage: sls-kerneld --port N [--arena-size MB] [--arena-path PATH]");
+                eprintln!("usage: sls-kerneld --port N [--arena-size MB] [--arena-path PATH] [--chan PATH]");
                 std::process::exit(2);
             }
         }
@@ -188,6 +191,7 @@ fn main() {
 
     let arena_path = arena_path.unwrap_or_else(|| format!("/tmp/sls-arena-{port}.bin"));
     let arena_size = arena_size_mb * 1024 * 1024;
+    let chan_path = chan_path.unwrap_or_else(|| format!("/tmp/sls-chan-{port}.bin"));
 
     // Create + size the arena file (sidecars mmap it; the kernel never
     // dereferences the bytes, it only keeps the bump cursor + refcounts).
@@ -216,8 +220,14 @@ fn main() {
         ready: Condvar::new(),
     });
 
+    // The shared-memory channel file: the sidecars map it and exchange
+    // request/reply frames directly through the ring buffers (zero-copy,
+    // no kernel in the message path). The kernel still owns the arena
+    // bookkeeping (alloc/free over TCP); only the queues moved to shm.
+    ring::create_channel(&chan_path).expect("create channel shm");
+
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
-    println!("READY arena={arena_path}");
+    println!("READY arena={arena_path} chan={chan_path}");
     std::io::stdout().flush().ok();
 
     for conn in listener.incoming() {
@@ -273,7 +283,10 @@ fn handle_conn(k: &Kernel, mut stream: TcpStream) -> std::io::Result<()> {
                         k.ready.notify_all();
                         encode_rc(0)
                     }
-                    Err(rc) => encode_rc(rc as i32),
+                    Err(rc) => {
+                        eprintln!("[kerneld] send rejected ch_w={} n_caps={} rc={}", req.ch_w, req.descs.len(), rc);
+                        encode_rc(rc as i32)
+                    }
                 }
             }
             SYS_CAP_RECV_MSG => {

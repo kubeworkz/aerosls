@@ -7,3 +7,8 @@
 //! The request bodies are the exact pinned 302-304 wire layouts.
 
 pub mod transport;
+
+/// Shared-memory channel ring (unix-only: mmap). The bins are already gated
+/// behind the `linux` feature; this keeps the Windows lib build clean.
+#[cfg(unix)]
+pub mod ring;

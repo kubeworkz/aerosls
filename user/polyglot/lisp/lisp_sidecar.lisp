@@ -52,21 +52,39 @@
 
 (in-package #:cl)
 
-(format t "[lisp] boot: env KERNEL_PORT=~A ARENA=~A CALC=~A~%"
+(format t "[lisp] boot: env KERNEL_PORT=~A ARENA=~A CALC=~A TRANSPORT=~A~%"
         (sb-ext:posix-getenv "KERNEL_PORT")
         (sb-ext:posix-getenv "ARENA_PATH")
-        (sb-ext:posix-getenv "CALC_LISP_PATH"))
+        (sb-ext:posix-getenv "CALC_LISP_PATH")
+        (or (sb-ext:posix-getenv "TRANSPORT") "tcp"))
 (finish-output t)
 (defvar *kernel-port* (parse-integer (sb-ext:posix-getenv "KERNEL_PORT")))
 (defvar *arena-path* (sb-ext:posix-getenv "ARENA_PATH"))
 (defvar *calc-lisp-path* (sb-ext:posix-getenv "CALC_LISP_PATH"))
+(defvar *transport* (or (sb-ext:posix-getenv "TRANSPORT") "tcp"))
+(defvar *chan-path* (sb-ext:posix-getenv "CHAN_PATH"))
+(defvar *ring-mode* (string= *transport* "shm"))
 (defvar *sock* nil)
 (defvar *arena-fd* -1)
 (defvar *arena-size* 0)
-(defvar *arena-base* nil)          ; SAP into the shared mapping
+(defvar *arena-base* nil)          ; SAP into the shared arena mapping
+(defvar *chan-base* nil)           ; SAP into the shared channel mapping
+(defvar *chan-ring0* nil)          ; ring0 header: wasm->lisp (we consume)
+(defvar *chan-ring1* nil)          ; ring1 header: lisp->wasm (we produce)
 (defvar *cap-table* '())           ; list of (cap offset len)
 (defvar *next-req-id* 0)
 (defvar *service-dispatch* nil)     ; bound after loading the generated table
+
+;; ── shared ring layout (must match polyglot::ring in ring.rs) ─────────────
+;; ring0 header at 0, ring1 header at 32 + 4 MiB; each header is 32 bytes
+;; (magic u32 @0, version u32 @4, capacity u32 @8, pad u32 @12, write u64
+;; @16, read u64 @24) followed by a 4 MiB data region. Frames are
+;; [body_len u32][body]. Synchronization is the SPSC release/acquire cursor
+;; protocol; on x86 (the only platform this e2e runs on) plain 64-bit
+;; loads/stores under TSO give the same ordering as the Rust atomics.
+(defparameter *ring-header-len* 32)
+(defparameter *ring-capacity* 4194304)   ; 4 MiB data per direction
+(defparameter *ring1-offset* (+ *ring-header-len* *ring-capacity*))
 
 ;; ── little-endian helpers ──────────────────────────────────────────────────
 
@@ -114,6 +132,78 @@
     (declare (ignore s))
     reply))
 
+;; ── shared-memory ring: SPSC producer/consumer over the channel mapping ──
+
+(defun ring-write (ring) (sb-sys:sap-ref-64 ring 16))
+(defun ring-read (ring) (sb-sys:sap-ref-64 ring 24))
+(defun (setf ring-write) (v ring) (setf (sb-sys:sap-ref-64 ring 16) v))
+(defun (setf ring-read) (v ring) (setf (sb-sys:sap-ref-64 ring 24) v))
+(defun ring-data (ring) (sb-sys:sap+ ring *ring-header-len*))
+
+(defun ring-copy-out (ring offset buf start n)
+  "Copy n bytes from the ring at offset (mod capacity) into buf[start..]."
+  (let* ((pos (mod offset *ring-capacity*))
+         (d (ring-data ring))
+         (first (min (- *ring-capacity* pos) n)))
+    (loop for i below first
+          do (setf (aref buf (+ start i)) (sb-sys:sap-ref-8 (sb-sys:sap+ d pos) i)))
+    (loop for i below (- n first)
+          do (setf (aref buf (+ start first i)) (sb-sys:sap-ref-8 d i)))
+    n))
+
+(defun ring-copy-in (ring offset buf start n)
+  "Copy n bytes from buf[start..] into the ring at offset (mod capacity)."
+  (let* ((pos (mod offset *ring-capacity*))
+         (d (ring-data ring))
+         (first (min (- *ring-capacity* pos) n)))
+    (loop for i below first
+          do (setf (sb-sys:sap-ref-8 (sb-sys:sap+ d pos) i) (aref buf (+ start i))))
+    (loop for i below (- n first)
+          do (setf (sb-sys:sap-ref-8 d i) (aref buf (+ start first i))))
+    n))
+
+(defun ring-len (ring offset)
+  "Read the 4-byte LE frame length at offset (mod capacity), wrap-aware."
+  (let* ((pos (mod offset *ring-capacity*))
+         (d (ring-data ring))
+         (first (min 4 (- *ring-capacity* pos)))
+         (v 0))
+    (loop for i below first
+          do (setf v (+ v (* (sb-sys:sap-ref-8 (sb-sys:sap+ d pos) i) (expt 256 i)))))
+    (loop for i from first below 4
+          do (setf v (+ v (* (sb-sys:sap-ref-8 d (- i first)) (expt 256 i)))))
+    v))
+
+(defun ring-recv (ring)
+  "Blocking receive from a shared ring (consumer side). Returns the body."
+  (loop for w = (ring-write ring)
+        while (= w (ring-read ring))
+        do (sb-thread:thread-yield))
+  (let* ((r (ring-read ring))
+         (len (ring-len ring r))
+         (buf (make-array len :element-type '(unsigned-byte 8))))
+    (ring-copy-out ring (+ r 4) buf 0 len)
+    ;; publish the read cursor only after the data is consumed (TSO orders
+    ;; the loads above this store)
+    (setf (ring-read ring) (+ r 4 len))
+    buf))
+
+(defun ring-send (ring body)
+  "Push one frame [len u32][body] to a shared ring (producer side)."
+  (let ((total (+ 4 (length body))))
+    (loop for w = (ring-write ring)
+          for r = (ring-read ring)
+          while (> (- w r) (- *ring-capacity* total))
+          do (sb-thread:thread-yield))
+    (let ((w (ring-write ring)))
+      (let ((field (make-array 4 :element-type '(unsigned-byte 8))))
+        (put-le32 field 0 (length body))
+        (ring-copy-in ring w field 0 4))
+      (ring-copy-in ring (+ w 4) body 0 (length body))
+      ;; publish the write cursor only after the bytes are in place (TSO
+      ;; orders the stores above this one)
+      (setf (ring-write ring) (+ w total)))))
+
 ;; ── the aerosls package: sidecar runtime over the transport ───────────────
 
 (defun aerosls:next-request-id ()
@@ -143,6 +233,55 @@
       (error "arena-mem: unknown cap ~A" cap))
     (sb-sys:sap+ *arena-base* (second entry))))
 
+;; NOTE: in ring mode the cap descriptors carry the REAL arena offset+len
+;; (the sender resolves them from its cap table), because there is no kernel
+;; in the message path to map slot -> memory. In TCP mode kerneld ignores
+;; the wire values and uses its own table, so sending the real offset is
+;; harmless there too.
+(defun aerosls:chan-send (chan opcode payload &key (caps '()) (flags 0))
+  "Send a message. opcode 0 = reply (raw payload); any other opcode = the
+   runtime prepends [opcode u16][payload_len u32]. Reply caps are sent with
+   the ARENA_OWNED flag so ownership transfers to the caller."
+  (let* ((n-caps (length caps))
+         (descs (make-array (* n-caps 12) :element-type '(unsigned-byte 8))))
+    (loop for cap in caps
+          for i from 0
+          for entry = (cap-table-find cap)
+          do (let ((o (* i 12)))
+               (put-le16 descs o cap)
+               (put-le32 descs (+ o 2) (if entry (second entry) 0)) ; real offset
+               (put-le32 descs (+ o 6) (if entry (third entry) 0))   ; len
+               (setf (aref descs (+ o 10)) 1)          ; rights: R
+               (setf (aref descs (+ o 11)) #x02)))     ; ARENA_OWNED
+    (if *ring-mode*
+        ;; Shared ring: push the 303-reply wire body directly — that is what
+        ;; the caller-side chan_recv parses (rc, plen, tag, flags, n-caps,
+        ;; descs, payload). The kernel is not in the path to bridge formats.
+        (let* ((n (length payload))
+               (reply (make-array (+ 18 (* n-caps 12) n)
+                                  :element-type '(unsigned-byte 8))))
+          (put-le32 reply 0 0)                                  ; rc
+          (put-le32 reply 4 n)                                  ; payload_len
+          (put-le32 reply 8 (aerosls:next-request-id))          ; tag
+          (put-le32 reply 12 flags)
+          (put-le16 reply 16 n-caps)
+          (replace reply descs :start1 18)
+          (replace reply payload :start1 (+ 18 (* n-caps 12)))
+          (ring-send *chan-ring1* reply)
+          0)
+        ;; TCP path: rpc 302 with the SEND wire body; kerneld bridges it to
+        ;; the 303-reply format on recv. NB: fill the header BEFORE
+        ;; concatenating — `concatenate` copies the header's current bytes,
+        ;; and bind body in its own LET (init forms run in parallel).
+        (let* ((header (make-array 12 :element-type '(unsigned-byte 8))))
+          (put-le16 header 0 chan)
+          (put-le16 header 2 n-caps)
+          (put-le32 header 4 (aerosls:next-request-id))
+          (put-le32 header 8 flags)
+          (let* ((body (concatenate '(vector (unsigned-byte 8)) header descs payload))
+                 (reply (rpc 302 body)))
+            (le32 reply 0))))))
+
 (defun aerosls:arena-free (cap)
   (let ((body (make-array 2 :element-type '(unsigned-byte 8))))
     (put-le16 body 0 cap)
@@ -150,52 +289,35 @@
     (setf *cap-table* (remove cap *cap-table* :key #'first))
     nil))
 
-(defun aerosls:chan-send (chan opcode payload &key (caps '()) (flags 0))
-  "Send a message. opcode 0 = reply (raw payload); any other opcode = the
-   runtime prepends [opcode u16][payload_len u32]. Reply caps are sent with
-   the ARENA_OWNED flag so ownership transfers to the caller."
-  (let* ((n-caps (length caps))
-         (header (make-array 12 :element-type '(unsigned-byte 8)))
-         (descs (make-array (* n-caps 12) :element-type '(unsigned-byte 8))))
-    (put-le16 header 0 chan)
-    (put-le16 header 2 n-caps)
-    (put-le32 header 4 (aerosls:next-request-id))
-    (put-le32 header 8 flags)
-    (loop for cap in caps
-          for i from 0
-          for entry = (cap-table-find cap)
-          do (let ((o (* i 12)))
-               (put-le16 descs o cap)
-               (put-le32 descs (+ o 2) 0)              ; offset
-               (put-le32 descs (+ o 6) (if entry (third entry) 0)) ; len
-               (setf (aref descs (+ o 10)) 1)          ; rights: R
-               (setf (aref descs (+ o 11)) #x02)))     ; ARENA_OWNED
-    (let* ((body (concatenate '(vector (unsigned-byte 8)) header descs payload))
-           (reply (rpc 302 body)))
-      (le32 reply 0))))
+(defun tcp-recv-303 (chan)
+  "TCP 303-recv call — returns the reply body kerneld formats."
+  (let ((body (make-array 6 :element-type '(unsigned-byte 8))))
+    (put-le16 body 0 chan)
+    (put-le32 body 2 4096)
+    (rpc 303 body)))
 
 (defun aerosls:chan-recv (chan)
   "Blocking receive. Returns (values payload tag flags cap-list); on EAGAIN
    returns (values nil nil nil nil)."
-  (let ((body (make-array 6 :element-type '(unsigned-byte 8))))
-    (put-le16 body 0 chan)
-    (put-le32 body 2 4096)
-    (let ((reply (rpc 303 body)))
-      (if (/= (le32 reply 0) 0)
-          (values nil nil nil nil)
-          (let* ((plen (le32 reply 4))
-                 (n-caps (le16 reply 16))
-                 (payload (subseq reply (+ 18 (* n-caps 12))
-                                  (+ 18 (* n-caps 12) plen)))
-                 (caps '()))
-            (loop for i below n-caps
-                  for o = (+ 18 (* i 12))
-                  do (let ((slot (le16 reply o))
-                           (offset (le32 reply (+ o 2)))
-                           (len (le32 reply (+ o 6))))
-                       (push (list slot offset len) *cap-table*)
-                       (push slot caps)))
-            (values payload (le32 reply 8) (le32 reply 12) (nreverse caps)))))))
+  (let ((reply (if *ring-mode*
+                   ;; Shared ring: the frame body IS the 303-reply wire format.
+                   (ring-recv *chan-ring0*)
+                   (tcp-recv-303 chan))))
+    (if (/= (le32 reply 0) 0)
+        (values nil nil nil nil)
+        (let* ((plen (le32 reply 4))
+               (n-caps (le16 reply 16))
+               (payload (subseq reply (+ 18 (* n-caps 12))
+                                (+ 18 (* n-caps 12) plen)))
+               (caps '()))
+          (loop for i below n-caps
+                for o = (+ 18 (* i 12))
+                do (let ((slot (le16 reply o))
+                         (offset (le32 reply (+ o 2)))
+                         (len (le32 reply (+ o 6))))
+                     (push (list slot offset len) *cap-table*)
+                     (push slot caps)))
+          (values payload (le32 reply 8) (le32 reply 12) (nreverse caps))))))
 
 ;; ── event loop ─────────────────────────────────────────────────────────────
 
@@ -261,6 +383,18 @@
                        (logior sb-posix:prot-read sb-posix:prot-write)
                        sb-posix:map-shared *arena-fd* 0))
   (format t "[lisp] arena mapped ~D bytes at ~A~%" *arena-size* *arena-base*)
+  (when *ring-mode*
+    (unless *chan-path*
+      (error "CHAN_PATH is required with TRANSPORT=shm"))
+    (let ((fd (sb-posix:open *chan-path* sb-posix:o-rdwr)))
+      (setf *chan-base*
+            (sb-posix:mmap nil (+ (* 2 (+ *ring-header-len* *ring-capacity*)))
+                           (logior sb-posix:prot-read sb-posix:prot-write)
+                           sb-posix:map-shared fd 0))
+      (setf *chan-ring0* (sb-sys:sap+ *chan-base* 0))
+      (setf *chan-ring1* (sb-sys:sap+ *chan-base* *ring1-offset*)))
+    (format t "[lisp] channel mapped, ring-mode ON~%")
+    (finish-output t))
   (load *calc-lisp-path*)
   ;; Resolve the dispatch entry point at runtime — the generated package only
   ;; exists after (load), so the sidecar file must not name it at read time.

@@ -1,17 +1,24 @@
-//! Two-process Polyglot e2e: three real OS processes on one real channel.
+//! Two-process Polyglot e2e: three real OS processes on one real channel,
+//! run over BOTH transports so the zero-copy gain is measured side by side.
 //!
 //! ```text
-//!   sls-kerneld  (arena file + cap refcounts + channel queues, TCP)
-//!      ▲ 302/303/304 wire ABI                ▲
-//!      │                                      │
-//!   wasm-sidecar (wasmi embedding)      lisp-sidecar (real SBCL)
-//!      │  shared arena mmap ◄───────────────►│
+//!   sls-kerneld  (arena file + cap refcounts; message path is the choice)
+//!      ▲ 290/304 wire ABI (arena alloc/free)        ▲
+//!      │                                            │
+//!   wasm-sidecar (wasmi embedding)            lisp-sidecar (real SBCL)
+//!      │  shared arena mmap ◄─────────────────────►│
+//!      └── transport: TCP via kerneld  OR  shared-memory ring (shm) ──┘
 //! ```
 //!
-//! The Wasm sidecar's guest module drives two CalculatorService calls
-//! (add + sqrt_batch over a 4096-element f64 array) into the Lisp sidecar,
-//! which runs the generated `calculator.lisp` dispatch. The array travels
-//! through the shared arena by MEM cap — never across the wire.
+//! Each leg spawns the wasm + lisp sidecars with `--transport tcp` or
+//! `--transport shm` and runs the same guest (add + sqrt_batch over a
+//! 4096-element f64 array, plus the 1000-call add latency bench and the
+//! 100-call arena sqrt bench). In the `shm` leg the request/reply frames
+//! travel through the shared channel rings (ring0 wasm→lisp, ring1
+//! lisp→wasm) — no kernel in the message path — while the array data still
+//! travels through the shared arena by MEM cap, never copied. Both legs
+//! must pass the latency gate; the BENCH_JSON lines carry a `transport`
+//! field so CI archives the two transports' medians separately.
 //!
 //! Prerequisites (skipped with a clear message when absent):
 //!   - Linux binaries in `POLYGLOT_TARGET_DIR` (built by run_e2e.sh via WSL)
@@ -150,6 +157,87 @@ fn parse_median_ns(line: &str) -> Option<u64> {
         .ok()
 }
 
+/// Run one leg: spawn the Lisp sidecar (TRANSPORT env) + the Wasm sidecar
+/// (--transport), assert the latency gate on both bench legs, tear the Lisp
+/// sidecar down. Returns Err on any failure (the caller panics with context).
+fn run_leg(
+    transport: &str,
+    port: u16,
+    arena_path: &str,
+    chan_path: &str,
+    lisp_script: &str,
+    calc_lisp: &str,
+    wasm_bin: &str,
+    max_median_ns: u64,
+) -> Result<(), String> {
+    let port_s = port.to_string();
+    let mut lisp_envs: Vec<(&str, &str)> = vec![
+        ("KERNEL_PORT", &port_s),
+        ("ARENA_PATH", arena_path),
+        ("CALC_LISP_PATH", calc_lisp),
+        ("TRANSPORT", transport),
+    ];
+    if transport == "shm" {
+        lisp_envs.push(("CHAN_PATH", chan_path));
+    }
+    // NB: `--noinform --non-interactive --script` together swallow stdout in
+    // some SBCL builds — plain `--script` is what actually prints.
+    let (mut lisp, lisp_out) = spawn_linux("sbcl", &["--script", lisp_script], &lisp_envs);
+    if wait_for_marker(&lisp_out, "LISP READY", Duration::from_secs(20)).is_none() {
+        kill_child(&mut lisp);
+        return Err("Lisp sidecar did not become ready".to_string());
+    }
+
+    let mut wasm_args = vec!["--port", &port_s, "--arena", arena_path, "--transport", transport];
+    if transport == "shm" {
+        wasm_args.push("--chan");
+        wasm_args.push(chan_path);
+    }
+    let (mut wasm, wasm_out) = spawn_linux(wasm_bin, &wasm_args, &[]);
+    // The sidecar prints the rdtsc latency reports first, then the verdict.
+    // The channel is FIFO, so consume both BENCH lines before WASM_SIDECAR.
+    let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
+    let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
+    let wasm_line = wait_for_marker(&wasm_out, "WASM_SIDECAR", Duration::from_secs(30));
+    let status = wasm.wait().expect("wasm exit");
+    let Some(wasm_line) = wasm_line else {
+        kill_child(&mut lisp);
+        return Err("wasm-sidecar produced no verdict".to_string());
+    };
+    if !(status.success() && wasm_line.contains("PASS")) {
+        kill_child(&mut lisp);
+        return Err(format!("wasm-sidecar failed: {wasm_line} (exit {status})"));
+    }
+
+    // ── latency regression gate (per transport leg) ──────────────────────
+    // Fail if either bench leg's median round trip exceeds the threshold.
+    // Measured medians are ~0.6ms (add) and ~1.5ms (sqrt) over TCP — the
+    // shared-ring leg is expected to be faster. 5ms default catches an
+    // order-of-magnitude transport regression with wide headroom.
+    for (name, bench) in [("BENCH_ADD", &bench_add), ("BENCH_SQRT", &bench_sqrt)] {
+        let Some(line) = bench else {
+            kill_child(&mut lisp);
+            return Err(format!("wasm-sidecar produced no {name} latency report (transport={transport})"));
+        };
+        let median_ns = parse_median_ns(line)
+            .unwrap_or_else(|| panic!("{name} line missing median_ns: {line}"));
+        if median_ns > max_median_ns {
+            kill_child(&mut lisp);
+            return Err(format!(
+                "{name} median {median_ns} ns exceeds the {max_median_ns} ns regression threshold \
+                 (transport={transport}) — round-trip latency exploded"
+            ));
+        }
+        eprintln!(
+            "[gate] {name} median {median_ns} ns <= {max_median_ns} ns threshold (transport={transport}) — OK"
+        );
+    }
+
+    kill_child(&mut lisp);
+    eprintln!("leg {transport}: wasm(wasmi) -> lisp(SBCL) -> wasm PASS (arena={arena_path})");
+    Ok(())
+}
+
 #[test]
 fn two_process_wasm_lisp_arena_roundtrip() {
     let root_linux = repo_root_linux();
@@ -190,79 +278,57 @@ fn two_process_wasm_lisp_arena_roundtrip() {
 
     // ── launch the kernel transport ──────────────────────────────────────
     let port = free_port();
-    let (mut kerneld, kerneld_out) = spawn_linux(&kerneld_bin, &["--port", &port.to_string()], &[]);
+    let (mut kerneld, kerneld_out) = spawn_linux(
+        &kerneld_bin,
+        &["--port", &port.to_string(), "--arena-size", "64"],
+        &[],
+    );
     let Some(ready) = wait_for_marker(&kerneld_out, "READY arena=", Duration::from_secs(15)) else {
         kill_child(&mut kerneld);
         panic!("sls-kerneld did not become READY");
     };
-    let arena_path = ready
-        .split_once("arena=")
-        .map(|(_, p)| p.trim().to_string())
-        .expect("READY line carries arena path");
-
-    // ── launch the Lisp sidecar (real SBCL) ─────────────────────────────
-    let port_s = port.to_string();
-    let lisp_envs: Vec<(&str, &str)> = vec![
-        ("KERNEL_PORT", &port_s),
-        ("ARENA_PATH", &arena_path),
-        ("CALC_LISP_PATH", &calc_lisp),
-    ];
-    // NB: `--noinform --non-interactive --script` together swallow stdout in
-    // some SBCL builds — plain `--script` is what actually prints.
-    let (mut lisp, lisp_out) = spawn_linux("sbcl", &["--script", &lisp_script], &lisp_envs);
-    if wait_for_marker(&lisp_out, "LISP READY", Duration::from_secs(20)).is_none() {
-        kill_child(&mut kerneld);
-        kill_child(&mut lisp);
-        panic!("Lisp sidecar did not become ready");
-    }
-
-    // ── run the Wasm sidecar (wasmi embedding) ──────────────────────────
-    let (mut wasm, wasm_out) = spawn_linux(
-        &wasm_bin,
-        &["--port", &port.to_string(), "--arena", &arena_path],
-        &[],
-    );
-    // The sidecar prints the rdtsc latency reports first, then the verdict.
-    // The channel is FIFO, so consume both BENCH lines before WASM_SIDECAR.
-    let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
-    let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
-    let wasm_line = wait_for_marker(&wasm_out, "WASM_SIDECAR", Duration::from_secs(30));
-    let status = wasm.wait().expect("wasm exit");
-    let Some(wasm_line) = wasm_line else {
-        kill_child(&mut kerneld);
-        kill_child(&mut lisp);
-        panic!("wasm-sidecar produced no verdict");
+    // The READY line is `READY arena=PATH chan=PATH` — split each value at
+    // the next space so one marker's value can never swallow the other's.
+    let field = |marker: &str| -> String {
+        ready
+            .split_once(marker)
+            .map(|(_, p)| {
+                p.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| panic!("READY line missing {marker}: {ready}"))
     };
-    assert!(
-        status.success() && wasm_line.contains("PASS"),
-        "wasm-sidecar failed: {wasm_line} (exit {status})"
-    );
+    let arena_path = field("arena=");
+    let chan_path = field("chan=");
 
-    // ── latency regression gate ──────────────────────────────────────────
-    // Fail if either bench leg's median round trip exceeds the threshold.
-    // Measured medians are ~0.6ms (add) and ~1.5ms (sqrt), so the default
-    // 5ms catches an order-of-magnitude transport regression with wide
-    // headroom against runner noise. Override with POLYGLOT_BENCH_MEDIAN_NS.
+    // ── latency regression gate (shared by both legs) ────────────────────
     let max_median_ns: u64 = std::env::var("POLYGLOT_BENCH_MEDIAN_NS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5_000_000);
-    for (name, bench) in [("BENCH_ADD", &bench_add), ("BENCH_SQRT", &bench_sqrt)] {
-        let Some(line) = bench else {
-            panic!("wasm-sidecar produced no {name} latency report");
-        };
-        let median_ns = parse_median_ns(line)
-            .unwrap_or_else(|| panic!("{name} line missing median_ns: {line}"));
-        assert!(
-            median_ns <= max_median_ns,
-            "{name} median {median_ns} ns exceeds the {max_median_ns} ns regression threshold — \
-             round-trip latency exploded (check transport/Nagle/queue changes)"
-        );
-        eprintln!("[gate] {name} median {median_ns} ns <= {max_median_ns} ns threshold — OK");
+
+    // ── run both transports and require both to pass ─────────────────────
+    let mut failures = Vec::new();
+    for transport in ["tcp", "shm"] {
+        match run_leg(
+            transport,
+            port,
+            &arena_path,
+            &chan_path,
+            &lisp_script,
+            &calc_lisp,
+            &wasm_bin,
+            max_median_ns,
+        ) {
+            Ok(()) => {}
+            Err(e) => failures.push(format!("[{transport}] {e}")),
+        }
     }
 
     // ── teardown ─────────────────────────────────────────────────────────
-    kill_child(&mut lisp);
     kill_child(&mut kerneld);
     // Sweep stragglers (WSL does not always propagate SIGKILL to Linux
     // children when the wsl.exe handle dies).
@@ -271,7 +337,10 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     );
     let _ = linux_sh(&sweep).status();
 
+    if !failures.is_empty() {
+        panic!("polyglot e2e failed:\n{}", failures.join("\n"));
+    }
     eprintln!(
-        "e2e PASS: wasm(wasmi) -> lisp(SBCL) -> wasm over syscalls 302-304, arena={arena_path}"
+        "e2e PASS: wasm(wasmi) -> lisp(SBCL) -> wasm over tcp + shm transports, arena={arena_path}"
     );
 }

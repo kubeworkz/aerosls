@@ -16,10 +16,11 @@
 extern crate alloc;
 
 use aerosls::req::{ArenaAllocReq, ArenaFreeReq, CapDesc, SendMsgReq, RecvMsgReq, CAP_ENOSYS, CAP_PERM_R, CAP_PERM_W};
+use polyglot::ring::{self, Ring};
 use polyglot::transport::*;
 use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 #[path = "../gen_calculator.rs"]
@@ -37,6 +38,12 @@ static MAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static BENCH_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the arena-cap path, collected inside `call_sqrt_batch`.
 static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
+/// requests, ring1 = lisp→wasm replies.
+static RING0: Mutex<Option<Ring>> = Mutex::new(None);
+static RING1: Mutex<Option<Ring>> = Mutex::new(None);
+/// True when the message path goes through the shared ring instead of TCP.
+static RING_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Monotonic cycle counter for round-trip timing. On x86_64 this is the real
 /// TSC (constant-rate on modern CPUs); elsewhere it falls back to monotonic
@@ -99,6 +106,19 @@ fn cap_table_offset(cap: u16) -> Option<u32> {
         .map(|(_, o, _)| *o)
 }
 
+fn cap_table_lookup(cap: u16) -> Option<(u32, u32)> {
+    CAP_TABLE
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(c, _, _)| *c == cap)
+        .map(|(_, o, l)| (*o, *l))
+}
+
+fn ring_mode() -> bool {
+    RING_MODE.load(Ordering::SeqCst)
+}
+
 fn cap_table_remove(cap: u16) {
     CAP_TABLE.lock().unwrap().retain(|(c, _, _)| *c != cap);
 }
@@ -135,16 +155,32 @@ fn fake_syscall(num: u64, arg: u64) -> u64 {
             let req = unsafe { &*(arg as *const SendMsgReq) };
             let mut descs = Vec::with_capacity(req.n_caps as usize);
             for d in &req.caps[..req.n_caps as usize] {
+                // Resolve the real arena (offset, len) from the local cap
+                // table: in TCP mode kerneld ignores the wire values (it
+                // keeps its own table); in ring mode they ARE the memory
+                // capability the receiver addresses directly.
+                let (off, len) = cap_table_lookup(d.slot).unwrap_or((d.offset, d.len));
                 descs.push(WireDesc {
                     slot: d.slot,
-                    offset: d.offset,
-                    len: d.len,
+                    offset: off,
+                    len,
                     rights: d.rights,
                     flags: d.flags,
                 });
             }
             let payload =
                 unsafe { core::slice::from_raw_parts(req.payload, req.payload_len as usize) };
+            if ring_mode() {
+                // Zero-copy path: push the request straight into the shared
+                // ring — no kernel round trip for the message. Both ring
+                // directions use the 303-reply wire body (rc, plen, tag,
+                // flags, n_caps, descs, payload) because that is what both
+                // sides' chan_recv already parse; in the TCP path kerneld
+                // bridged the two formats, here the sidecars talk directly.
+                let frame = encode_recv_out(0, payload, req.tag, req.flags, &descs);
+                RING0.lock().unwrap().as_ref().unwrap().send(&frame).expect("ring0 send");
+                return 0;
+            }
             let reply = rpc(
                 SYS_CAP_SEND_MSG,
                 &encode_send_in(req.ch_w_idx, req.n_caps, req.tag, req.flags, &descs, payload),
@@ -153,8 +189,15 @@ fn fake_syscall(num: u64, arg: u64) -> u64 {
         }
         S_RECV_MSG => {
             let req = unsafe { &mut *(arg as *mut RecvMsgReq) };
-            let reply = rpc(SYS_CAP_RECV_MSG, &encode_recv_in(req.ch_r_idx, req.buf_len));
-            let out = parse_recv_out(&reply).expect("bad recv reply");
+            let out = if ring_mode() {
+                // Block until the reply arrives in ring1 (spin on the
+                // consumer cursor — the Lisp side pushes it after dispatch).
+                let body = RING1.lock().unwrap().as_ref().unwrap().recv().expect("ring1 recv");
+                parse_recv_out(&body).expect("bad ring recv body")
+            } else {
+                let reply = rpc(SYS_CAP_RECV_MSG, &encode_recv_in(req.ch_r_idx, req.buf_len));
+                parse_recv_out(&reply).expect("bad recv reply")
+            };
             if out.rc != 0 {
                 return (out.rc as i64) as u64;
             }
@@ -209,7 +252,7 @@ fn pack(status: i64, value: u64) -> i64 {
 
 /// Print `BENCH_{tag}: ...` with median/p99/mean in cycles. The first sample
 /// is dropped (the guest's verification call — the cold path).
-fn print_bench(tag: &str, samples: &[u64], note: &str) {
+fn print_bench(tag: &str, samples: &[u64], note: &str, transport: &str) {
     let samples = samples.get(1..).unwrap_or(&samples[..]);
     if !samples.is_empty() {
         let mut s = samples.to_vec();
@@ -222,30 +265,39 @@ fn print_bench(tag: &str, samples: &[u64], note: &str) {
         let p99_ns = cycles_to_ns(p99);
         let mean_ns = cycles_to_ns(mean);
         println!(
-            "BENCH_{tag}: N={n} median_cy={median} median_ns={median_ns} p99_cy={p99} p99_ns={p99_ns} mean_cy={mean} ({note})"
+            "BENCH_{tag}: N={n} median_cy={median} median_ns={median_ns} p99_cy={p99} p99_ns={p99_ns} mean_cy={mean} ({note}, transport={transport})"
         );
         // Machine-readable line (one per leg) for CI archiving and drift
         // tracking — grep'd out of the e2e output by the polyglot-e2e job.
+        // transport distinguishes the TCP leg from the shared-ring leg so
+        // drift baselines never cross-compare transports.
         let leg = tag.to_ascii_lowercase();
         println!(
-            "BENCH_JSON {{\"leg\":\"{leg}\",\"n\":{n},\"median_cy\":{median},\"median_ns\":{median_ns},\"p99_cy\":{p99},\"p99_ns\":{p99_ns},\"mean_cy\":{mean},\"mean_ns\":{mean_ns}}}"
+            "BENCH_JSON {{\"leg\":\"{leg}\",\"transport\":\"{transport}\",\"n\":{n},\"median_cy\":{median},\"median_ns\":{median_ns},\"p99_cy\":{p99},\"p99_ns\":{p99_ns},\"mean_cy\":{mean},\"mean_ns\":{mean_ns}}}"
         );
     } else {
-        println!("BENCH_{tag}: no round-trip samples ({note})");
-        println!("BENCH_JSON {{\"leg\":\"{}\",\"n\":0}}", tag.to_ascii_lowercase());
+        println!("BENCH_{tag}: no round-trip samples ({note}, transport={transport})");
+        println!(
+            "BENCH_JSON {{\"leg\":\"{}\",\"transport\":\"{transport}\",\"n\":0}}",
+            tag.to_ascii_lowercase()
+        );
     }
 }
 
 fn main() {
     let mut port = 0u16;
     let mut arena_path = String::new();
+    let mut chan_path = String::new();
+    let mut transport = String::from("tcp");
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().unwrap().parse().unwrap(),
             "--arena" => arena_path = args.next().unwrap(),
+            "--chan" => chan_path = args.next().unwrap(),
+            "--transport" => transport = args.next().unwrap(),
             _ => {
-                eprintln!("usage: wasm-sidecar --port N --arena PATH");
+                eprintln!("usage: wasm-sidecar --port N --arena PATH [--chan PATH] [--transport tcp|shm]");
                 std::process::exit(2);
             }
         }
@@ -253,6 +305,22 @@ fn main() {
     if port == 0 || arena_path.is_empty() {
         eprintln!("--port and --arena are required");
         std::process::exit(2);
+    }
+    if transport != "tcp" && transport != "shm" {
+        eprintln!("--transport must be tcp or shm");
+        std::process::exit(2);
+    }
+    if transport == "shm" {
+        if chan_path.is_empty() {
+            eprintln!("--chan is required with --transport shm");
+            std::process::exit(2);
+        }
+        *RING0.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING0_OFFSET).expect("open ring0"));
+        *RING1.lock().unwrap() = Some(Ring::open(&chan_path, ring::RING1_OFFSET).expect("open ring1"));
+        RING_MODE.store(true, Ordering::SeqCst);
+        println!("TRANSPORT shm chan={chan_path}");
+    } else {
+        println!("TRANSPORT tcp");
     }
 
     // Map the shared arena file (the zero-copy path: both sidecars see the
@@ -398,8 +466,8 @@ fn main() {
     // i.e. the cold path (warmup for connection/TCP/buffers).
     let add_samples = std::mem::take(&mut *BENCH_SAMPLES.lock().unwrap());
     let sqrt_samples = std::mem::take(&mut *BENCH_SQRT_SAMPLES.lock().unwrap());
-    print_bench("ADD", &add_samples, "add() — inline args");
-    print_bench("SQRT", &sqrt_samples, "sqrt_batch(4096 f64) — arena MEM cap");
+    print_bench("ADD", &add_samples, "add() — inline args", &transport);
+    print_bench("SQRT", &sqrt_samples, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
 
     if status == 0 {
         println!("WASM_SIDECAR PASS");

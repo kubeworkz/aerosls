@@ -143,6 +143,52 @@ mv -f "$SNAP_TRANSPORT" "$TRANSPORT"; touch "$TRANSPORT"
 mv -f "$SNAP_KERNELD" "$KERNELD"; touch "$KERNELD"
 trap - EXIT
 
+# ─── second tooth: the shared-ring path ───────────────────────────────────
+# The shm transport carries the message path in shared memory (no kernel in
+# the send/recv), so the TCP Nagle tooth above cannot catch a ring-specific
+# regression. This tooth delays the ring producer's cursor publish by 8ms
+# per frame — a stalled-producer regression that inflates the shm leg's
+# median (2us -> ~8ms) without touching TCP. The gate must fail on it.
+echo
+echo "=== tooth: delay the ring producer's publish; the shm gate must fail ==="
+RING=user/polyglot/src/ring.rs
+SNAP_RING="${RING}.smoke.bak"
+cp "$RING" "$SNAP_RING" || { bad "cannot snapshot $RING"; exit 1; }
+trap "mv -f \"$SNAP_RING\" \"$RING\" 2>/dev/null; rm -f \"$SNAP_RING\"" EXIT
+
+# (c) stall the producer: sleep before publishing the write cursor. The & is
+#     escaped so sed treats it literally (the replacement contains none).
+sed -i 's@        write_ptr.store(write + total as u64, Ordering::Release);@        std::thread::sleep(std::time::Duration::from_millis(8));\n        write_ptr.store(write + total as u64, Ordering::Release);@' "$RING"
+
+if cmp -s "$RING" "$SNAP_RING"; then
+    bad "tooth: the ring mutation did not apply — the publish pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_RING" "$RING"; touch "$RING"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+touch "$RING"   # make the mutation visible to cargo's incremental build
+ok "tooth: ring mutation applied (producer publish stalled 8ms/frame)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated ring does not compile — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_RING" "$RING"; touch "$RING"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+echo "running the e2e against the mutated ring (expect the gate to fail, ~15s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e latency gate did NOT fail on the ring regression — it is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the latency gate failed as required (shm median blew past the threshold)"
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_RING" "$RING"; touch "$RING"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
