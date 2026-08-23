@@ -243,6 +243,53 @@ fi
 mv -f "$SNAP_GUEST" "$GUEST"; touch "$GUEST"
 trap - EXIT
 
+# ─── fourth tooth: the add bench-workload guard ─────────────────────────────
+# The add bench must measure genuine per-call recomputation. It previously
+# called add(7, 8) with constant inputs 1000 times, so a cached or echoed
+# reply was indistinguishable from a real round trip. The guest now varies
+# the operands per iteration (add(i, i) == 2i, distinct for every i) and
+# verifies the reply inside the bench loop. This tooth reverts the bench to
+# constant inputs — the caching-enabling regression — and requires the e2e
+# to FAIL on the first mismatching iteration.
+echo
+echo "=== tooth: constant-input add bench (caching regression); the add guard must fail ==="
+SNAP_GUEST2="${GUEST}.smoke2.bak"
+cp "$GUEST" "$SNAP_GUEST2" || { bad "cannot snapshot $GUEST"; exit 1; }
+trap "mv -f \"$SNAP_GUEST2\" \"$GUEST\" 2>/dev/null; rm -f \"$SNAP_GUEST2\"" EXIT
+
+# (e) revert the varying-operand bench call to the old constant inputs. The
+#     guard then expects add(0, 0) == 0 but receives 15 on iteration 0.
+sed -i 's@(call \$call_add (local.get \$i) (local.get \$i))@(call $call_add (i32.const 7) (i32.const 8))@' "$GUEST"
+
+if cmp -s "$GUEST" "$SNAP_GUEST2"; then
+    bad "tooth: the add-bench mutation did not apply — the call pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_GUEST2" "$GUEST"; touch "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+touch "$GUEST"   # make the mutation visible to cargo's include_str! tracking
+ok "tooth: add-bench mutation applied (bench reverted to constant inputs)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated guest does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_GUEST2" "$GUEST"; touch "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+echo "running the e2e against the mutated guest (expect the add guard to fail, ~5s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the constant-input add bench — the add guard is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|FAIL add-bench|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (add bench-workload guard caught the caching regression)"
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_GUEST2" "$GUEST"; touch "$GUEST"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -260,10 +307,12 @@ fi
 
 dirty=0
 for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST"; do
-    if [ -f "${f}.smoke.bak" ]; then
-        bad "leftover ${f}.smoke.bak after restore"
-        dirty=$((dirty+1))
-    fi
+    for b in "${f}.smoke.bak" "${f}.smoke2.bak"; do
+        if [ -f "$b" ]; then
+            bad "leftover $b after restore"
+            dirty=$((dirty+1))
+        fi
+    done
 done
 [ "$dirty" -eq 0 ] && ok "no leftovers from the teeth"
 

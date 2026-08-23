@@ -42,6 +42,7 @@
   (data (i32.const 160) "FAIL add\00")
   (data (i32.const 192) "FAIL sqrt\00")
   (data (i32.const 224) "FAIL sqrt-bench\00")
+  (data (i32.const 240) "FAIL add-bench\00")
 
   (func (export "run") (result i32)
     (local $r i64) (local $r2 i64)
@@ -61,14 +62,31 @@
       (then (call $log (i32.const 160) (i32.const 8)) (return (i32.const 2))))
 
     ;; ── latency benchmark: 1000 add() round trips into Lisp ──────────────
-    ;; each call crosses wasm -> host import -> TCP -> kerneld -> Lisp -> back;
-    ;; the host import times every call with rdtsc and the sidecar reports
-    ;; median/p99 after run() returns.
+    ;; each call crosses wasm -> host import -> rings/TCP -> kerneld -> Lisp
+    ;; -> back; the host import times every call with rdtsc and the sidecar
+    ;; reports median/p99 after run() returns.
     (local.set $i (i32.const 0))
     (block $bench_done
       (loop $bench
         (br_if $bench_done (i32.ge_u (local.get $i) (i32.const 1000)))
-        (drop (call $call_add (i32.const 7) (i32.const 8)))
+
+        ;; ── add bench-workload guard ─────────────────────────────────────
+        ;; Vary the operands per iteration and verify the reply: the check
+        ;; expects add(i, i) == 2i, distinct for every i, so a cached or
+        ;; echoed reply (or a bench that regressed to constant inputs)
+        ;; fails on the first mismatching iteration. Proves each timed call
+        ;; is genuinely recomputed by Lisp. Runs OUTSIDE the timed host
+        ;; import, so the measured latency is unaffected.
+        (local.set $r (call $call_add (local.get $i) (local.get $i)))
+        (local.set $status
+          (i32.wrap_i64 (i64.shr_u (local.get $r) (i64.const 32))))
+        (if (i32.ne (local.get $status) (i32.const 0))
+          (then (call $log (i32.const 240) (i32.const 14)) (return (i32.const 8))))
+        (local.set $status
+          (i32.wrap_i64 (i64.and (local.get $r) (i64.const 0xffffffff))))
+        (if (i32.ne (local.get $status) (i32.add (local.get $i) (local.get $i)))
+          (then (call $log (i32.const 240) (i32.const 14)) (return (i32.const 8))))
+
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $bench)))
 
