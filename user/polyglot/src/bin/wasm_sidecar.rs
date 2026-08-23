@@ -52,6 +52,13 @@ static BENCH_ADD_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Lisp-side compute samples (ns) for the string bench, index-aligned with
 /// BENCH_STR_SAMPLES — same split convention as the SQRT leg.
 static BENCH_STR_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Baseline round-trip samples (cycles): local wasm-side call, Linux pipe,
+/// Unix socketpair. Collected once per sidecar run by `run_baseline_benches`
+/// (transport-independent), so both legs report the same numbers — the
+/// design's T1/T9/T10/T11/T12 comparison points for the cross-sidecar legs.
+static BENCH_LOCAL_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static BENCH_PIPE_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static BENCH_SOCK_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Shared-memory channel rings (set when --transport shm): ring0 = wasm→lisp
 /// requests, ring1 = lisp→wasm replies, ring2 = wasm→kerneld arena requests,
 /// ring3 = kerneld→wasm arena replies.
@@ -292,6 +299,97 @@ fn arena_byte_ptr(cap: u16, idx: usize) -> *mut u8 {
 
 fn pack(status: i64, value: u64) -> i64 {
     ((status as u64) << 32 | value) as i64
+}
+
+/// Time `f` N times with rdtsc and record every round trip (cycles). The
+/// vector is preallocated so nothing allocates during the measurement
+/// window. Used for the baseline legs (local call, pipe, Unix socketpair),
+/// which are transport-independent and run once per sidecar invocation.
+fn bench_roundtrip<F: FnMut()>(n: usize, mut f: F) -> Vec<u64> {
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t0 = rdtsc();
+        f();
+        samples.push(rdtsc().wrapping_sub(t0));
+    }
+    samples
+}
+
+/// Run the design's comparison baselines (T1/T9-T12) once per sidecar run:
+/// a local wasm-side function call, a Linux pipe write+read round trip, and
+/// a Unix socketpair send+recv round trip. They answer "how much faster is a
+/// cross-sidecar call than ordinary IPC" and are gated by the e2e like the
+/// cross-sidecar legs. Linux-only (the sidecar already is).
+#[cfg(target_os = "linux")]
+fn run_baseline_benches() {
+    // T1: local call — a plain function call with trivial body, no kernel
+    // involvement, ~ns on any modern core.
+    let mut sink = 0u64;
+    let local = bench_roundtrip(100_000, || {
+        sink = sink.wrapping_add(1);
+        core::hint::black_box(sink);
+    });
+    BENCH_LOCAL_SAMPLES.lock().unwrap().extend(local);
+
+    // T9/T10: Linux pipe — write 1 byte, read it back (kernel buffer, two
+    // syscalls per round trip).
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "pipe() failed");
+    let pipe = bench_roundtrip(100_000, || {
+        let mut buf = [0x5au8; 1];
+        unsafe {
+            assert_eq!(libc::write(fds[1], buf.as_ptr() as *const _, 1), 1);
+            assert_eq!(libc::read(fds[0], buf.as_mut_ptr() as *mut _, 1), 1);
+        }
+        core::hint::black_box(&buf);
+    });
+    BENCH_PIPE_SAMPLES.lock().unwrap().extend(pipe);
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+
+    // T11/T12: Unix socketpair — send 1 byte, recv it back (stream socket,
+    // two syscalls per round trip, still the kernel's socket machinery).
+    let mut sv = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+    assert_eq!(rc, 0, "socketpair() failed");
+    let sock = bench_roundtrip(100_000, || {
+        let mut buf = [0x5au8; 1];
+        unsafe {
+            assert_eq!(libc::send(sv[1], buf.as_ptr() as *const _, 1, 0), 1);
+            assert_eq!(libc::recv(sv[0], buf.as_mut_ptr() as *mut _, 1, 0), 1);
+        }
+        core::hint::black_box(&buf);
+    });
+    BENCH_SOCK_SAMPLES.lock().unwrap().extend(sock);
+    unsafe {
+        libc::close(sv[0]);
+        libc::close(sv[1]);
+    }
+}
+
+/// Median/p99/mean report for the baseline legs (no compute split — the
+/// baseline work is local, nothing crosses a language boundary).
+fn print_bench_baseline(tag: &str, samples: &[u64], note: &str) {
+    let samples = samples.get(1..).unwrap_or(&samples[..]);
+    if samples.is_empty() {
+        println!("BENCH_{tag}: no baseline samples ({note})");
+        return;
+    }
+    let mut s = samples.to_vec();
+    s.sort_unstable();
+    let n = s.len();
+    let median = s[n / 2];
+    let p99 = s[((n as f64 * 0.99) as usize).min(n - 1)];
+    let mean = s.iter().sum::<u64>() / n as u64;
+    println!(
+        "BENCH_{tag}: N={n} median_ns={} p99_ns={} mean_ns={} ({note})",
+        cycles_to_ns(median),
+        cycles_to_ns(p99),
+        cycles_to_ns(mean)
+    );
 }
 
 /// Print `BENCH_{tag}: ...` with median/p99/mean in cycles. The first sample
@@ -573,6 +671,17 @@ fn main() {
         .expect("run export");
 
     let status = run.call(&mut store, ()).expect("guest run");
+
+    // ── baseline reports (T1/T9-T12): local call, pipe, Unix socketpair ──
+    // Transport-independent; run once per sidecar invocation so both legs
+    // report the same ordinary-IPC comparison points.
+    run_baseline_benches();
+    let local_samples = std::mem::take(&mut *BENCH_LOCAL_SAMPLES.lock().unwrap());
+    let pipe_samples = std::mem::take(&mut *BENCH_PIPE_SAMPLES.lock().unwrap());
+    let sock_samples = std::mem::take(&mut *BENCH_SOCK_SAMPLES.lock().unwrap());
+    print_bench_baseline("LOCAL", &local_samples, "local wasm-side function call (T1)");
+    print_bench_baseline("PIPE", &pipe_samples, "Linux pipe 1B write+read round trip (T9/T10)");
+    print_bench_baseline("SOCK", &sock_samples, "Unix socketpair 1B send+recv round trip (T11/T12)");
 
     // ── latency reports: median/p99 of the guest's round trips ────────────
     // Drop the first sample of each leg — the guest's verification calls,

@@ -203,8 +203,12 @@ fn run_leg(
     }
     let (mut wasm, wasm_out) = spawn_linux(wasm_bin, &wasm_args, &[]);
     // The sidecar prints the rdtsc latency reports first, then the verdict.
-    // The channel is FIFO, so consume all three BENCH lines before
-    // WASM_SIDECAR.
+    // The channel is FIFO, so consume all six BENCH lines before
+    // WASM_SIDECAR (the three baseline legs print before the three
+    // cross-sidecar legs, both before the verdict).
+    let bench_local = wait_for_marker(&wasm_out, "BENCH_LOCAL", Duration::from_secs(60));
+    let bench_pipe = wait_for_marker(&wasm_out, "BENCH_PIPE", Duration::from_secs(60));
+    let bench_sock = wait_for_marker(&wasm_out, "BENCH_SOCK", Duration::from_secs(60));
     let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
     let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
     let bench_str = wait_for_marker(&wasm_out, "BENCH_STR", Duration::from_secs(60));
@@ -217,6 +221,34 @@ fn run_leg(
     if !(status.success() && wasm_line.contains("PASS")) {
         kill_child(&mut lisp);
         return Err(format!("wasm-sidecar failed: {wasm_line} (exit {status})"));
+    }
+
+    // ── baseline gate (once per invocation, transport-independent) ───────
+    // The three baseline legs answer "how much faster is a cross-sidecar
+    // call than ordinary IPC": a local call is ~ns, a pipe ~1-5us, a Unix
+    // socketpair ~2-10us on any modern core. Gate them with wide headroom
+    // (local 1000x, pipe/socket 100x) so a host where the kernel IPC path
+    // went catastrophically wrong fails the build, while CI noise never
+    // trips it.
+    for (name, bench, max) in [
+        ("BENCH_LOCAL", &bench_local, 10_000),
+        ("BENCH_PIPE", &bench_pipe, 500_000),
+        ("BENCH_SOCK", &bench_sock, 500_000),
+    ] {
+        let Some(line) = bench else {
+            kill_child(&mut lisp);
+            return Err(format!("wasm-sidecar produced no {name} baseline report (transport={transport})"));
+        };
+        let median_ns = parse_median_ns(line)
+            .unwrap_or_else(|| panic!("{name} line missing median_ns: {line}"));
+        if median_ns > max {
+            kill_child(&mut lisp);
+            return Err(format!(
+                "{name} baseline median {median_ns} ns exceeds the {max} ns threshold — \
+                 the local IPC path is broken (transport={transport})"
+            ));
+        }
+        eprintln!("[gate] {name} median {median_ns} ns <= {max} ns baseline threshold — OK");
     }
 
     // ── latency regression gate (per transport leg) ──────────────────────

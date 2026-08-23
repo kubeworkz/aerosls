@@ -450,6 +450,7 @@ trap - EXIT
 echo
 echo "=== tooth: split-aware drift warning must fire on a transport inversion ==="
 DRIFT=tests/polyglot_drift_check.py
+SIDECAR=user/polyglot/src/bin/wasm_sidecar.rs
 [ -f "$DRIFT" ] || { bad "missing $DRIFT"; exit 1; }
 TMP="$(mktemp -d)"; trap "rm -rf \"$TMP\"" EXIT
 # previous: total 8000 = compute 3000 + transport 5000
@@ -540,6 +541,52 @@ rm -rf "$TMP"
 mv -f "$SNAP_DRIFT" "$DRIFT"
 trap - EXIT
 
+# ─── eleventh tooth: the IPC baseline gate ────────────────────────────────
+# The e2e now gates the baseline legs (local call, pipe, Unix socketpair)
+# so "how fast is ordinary IPC" cannot silently degrade. This tooth makes
+# the pipe baseline unrealistically slow — a 1ms sleep inside the pipe
+# round trip — and requires the e2e to FAIL on the BENCH_PIPE baseline
+# gate, then restores byte-identically and requires it to PASS again.
+echo
+echo "=== tooth: the pipe baseline gate must catch a broken pipe path ==="
+SNAP_SIDECAR="${SIDECAR}.smoke.bak"
+cp "$SIDECAR" "$SNAP_SIDECAR" || { bad "cannot snapshot $SIDECAR"; exit 1; }
+trap "mv -f \"$SNAP_SIDECAR\" \"$SIDECAR\" 2>/dev/null; rm -f \"$SNAP_SIDECAR\"" EXIT
+
+# (k) stall every pipe round trip by 600us AND shrink the bench to 2000
+# iterations — median ~600us >> the 500us gate, while the mutated bench
+# finishes in ~1.2s instead of 100s (a 1ms x 100k sleep would crawl).
+sed -i 's@let pipe = bench_roundtrip(100_000, || {@let pipe = bench_roundtrip(2000, || {\n        std::thread::sleep(std::time::Duration::from_micros(600));@' "$SIDECAR"
+
+if cmp -s "$SIDECAR" "$SNAP_SIDECAR"; then
+    bad "tooth: the pipe-baseline mutation did not apply — the read pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_SIDECAR" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: pipe-baseline mutation applied (600us sleep per round trip, 2000 iterations — median ~600us vs the 500us gate)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated sidecar does not build"
+else
+    out="$(run_e2e)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        bad "tooth: the e2e did NOT fail on the broken pipe baseline — the BENCH_PIPE gate is blind."
+        printf '%s\n' "$out" | grep -E 'BENCH_PIPE|baseline|panicked' | sed 's/^/        /'
+    else
+        ok "tooth: the e2e failed as required (BENCH_PIPE baseline median >> 500us caught the broken pipe path)"
+    fi
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_SIDECAR" "$SIDECAR"
+trap - EXIT
+# The 9p mount (WSL /mnt/c) has coarse mtime resolution — cargo can miss a
+# restore that happens in the same second as the mutation and serve a stale
+# binary. touch forces the rebuild so the restore check runs the pristine
+# sidecar.
+touch "$SIDECAR"
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -556,7 +603,7 @@ else
 fi
 
 dirty=0
-for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN" "$DRIFT"; do
+for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN" "$DRIFT" "$SIDECAR"; do
     for b in "${f}.smoke.bak" "${f}.smoke2.bak" "${f}.smoke3.bak" "${f}.smoke4.bak"; do
         if [ -f "$b" ]; then
             bad "leftover $b after restore"
