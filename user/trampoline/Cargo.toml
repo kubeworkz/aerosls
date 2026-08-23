@@ -1,0 +1,16 @@
+[package]
+name = "aerols-trampoline"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS same-ring trampoline library — inline WRPKRU+JMP stubs for zero-copy cross-sidecar calls via Intel MPK / AMD PKU (Deliverable 5, Phase 3)"
+license = "MIT"
+
+[features]
+default = []
+# Real kernel ABI: the `syscall` instruction + inline WRPKRU+JMP. Sidecar images build with this.
+target = []
+# Host-build test seam: returns ENOSYS on trampoline calls (MPK unavailable in userspace).
+host-fake = []
+
+[dependencies]
+aerosls = { path = "../aerosls", default-features = false }

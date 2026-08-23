@@ -91,9 +91,24 @@ fn linux_sh(script: &str) -> Command {
 }
 
 /// Spawn a Linux program, echoing its stdout lines to stderr and a channel.
-fn spawn_linux(program: &str, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc::Receiver<String>) {
+/// When `pin_cpu` is Some, the program is launched under `taskset -c N` (a
+/// util-linux wrapper) so it stays on one core — the design doc's §6.1
+/// "pin the benchmark task to a single core (no migration)" requirement.
+/// The wasm-sidecar additionally self-pins via sched_setaffinity and prints
+/// `PINNED cpu=N`, which the leg gate asserts on; the taskset wrap covers
+/// the other two sidecars, whose stderr would not be a reliable marker.
+fn spawn_linux(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    pin_cpu: Option<&str>,
+) -> (Child, mpsc::Receiver<String>) {
+    let cmd = match pin_cpu {
+        Some(cpu) => format!("taskset -c {cpu} {program} {}", args.join(" ")),
+        None => format!("{program} {}", args.join(" ")),
+    };
     let mut c = if using_wsl() {
-        let script = format!("exec {program} {}", args.join(" "));
+        let script = format!("exec {cmd}");
         let mut c = Command::new("wsl");
         c.arg("-e").arg("bash").arg("-lc").arg(&script).arg("sh");
         c
@@ -212,6 +227,9 @@ fn run_leg(
     calc_lisp: &str,
     wasm_bin: &str,
     max_median_ns: u64,
+    pin_cpu: &str,
+    lisp_pin: &str,
+    kerneld_pin: &str,
 ) -> Result<(), String> {
     let port_s = port.to_string();
     let mut lisp_envs: Vec<(&str, &str)> = vec![
@@ -225,7 +243,7 @@ fn run_leg(
     }
     // NB: `--noinform --non-interactive --script` together swallow stdout in
     // some SBCL builds — plain `--script` is what actually prints.
-    let (mut lisp, lisp_out) = spawn_linux("sbcl", &["--script", lisp_script], &lisp_envs);
+    let (mut lisp, lisp_out) = spawn_linux("sbcl", &["--script", lisp_script], &lisp_envs, Some(&lisp_pin));
     if wait_for_marker(&lisp_out, "LISP READY", Duration::from_secs(20)).is_none() {
         kill_child(&mut lisp);
         return Err("Lisp sidecar did not become ready".to_string());
@@ -236,7 +254,34 @@ fn run_leg(
         wasm_args.push("--chan");
         wasm_args.push(chan_path);
     }
-    let (mut wasm, wasm_out) = spawn_linux(wasm_bin, &wasm_args, &[]);
+    wasm_args.push("--pin-cpu");
+    wasm_args.push(&pin_cpu);
+    let (mut wasm, wasm_out) = spawn_linux(wasm_bin, &wasm_args, &[], Some(&pin_cpu));
+    // Single-core isolation gate (design §6.1): the measurement process must
+    // pin itself — the in-process sched_setaffinity + PINNED marker is the
+    // proof (the taskset wrap alone could silently lose its affinity). The
+    // gate runs before any bench consumption so a missing marker fails the
+    // leg immediately with the methodology error, not a downstream one.
+    let pinned_line = wait_for_marker(&wasm_out, "PINNED cpu=", Duration::from_secs(30));
+    match &pinned_line {
+        Some(p) if p.contains(&format!("PINNED cpu={pin_cpu}")) => {
+            eprintln!("[gate] wasm-sidecar PINNED cpu={pin_cpu} (single-core isolation, design §6.1) — OK");
+        }
+        Some(p) => {
+            kill_child(&mut lisp);
+            return Err(format!(
+                "wasm-sidecar pinned to an unexpected core: {p} (expected PINNED cpu={pin_cpu})"
+            ));
+        }
+        None => {
+            kill_child(&mut lisp);
+            return Err(
+                "wasm-sidecar did not pin itself to a core (no PINNED cpu= marker) — bench \
+                 methodology requires single-core pinning (design §6.1)"
+                    .to_string(),
+            );
+        }
+    }
     // The sidecar prints the rdtsc latency reports first, then the verdict.
     // The channel is FIFO, so consume all six BENCH lines before
     // WASM_SIDECAR (the three baseline legs print before the three
@@ -246,6 +291,9 @@ fn run_leg(
     let bench_pipe64k = wait_for_marker(&wasm_out, "BENCH_PIPE_64K", Duration::from_secs(60));
     let bench_sock = wait_for_marker(&wasm_out, "BENCH_SOCK_1B", Duration::from_secs(60));
     let bench_sock64k = wait_for_marker(&wasm_out, "BENCH_SOCK_64K", Duration::from_secs(60));
+    // T3/T7 trampoline bench: may be MPK_UNAVAILABLE on hosts without MPK.
+    let bench_tramp_0b = wait_for_marker(&wasm_out, "BENCH_TRAMP_0B", Duration::from_secs(60));
+    let bench_tramp_1m = wait_for_marker(&wasm_out, "BENCH_TRAMP_1M", Duration::from_secs(60));
     let bench_add = wait_for_marker(&wasm_out, "BENCH_ADD", Duration::from_secs(60));
     let bench_sqrt = wait_for_marker(&wasm_out, "BENCH_SQRT", Duration::from_secs(60));
     let bench_str = wait_for_marker(&wasm_out, "BENCH_STR", Duration::from_secs(60));
@@ -374,6 +422,36 @@ fn run_leg(
         eprintln!("[gate] {name} median {median_ns} ns <= {max} ns baseline threshold — OK");
     }
 
+    // ── T3/T7 trampoline gate (Deliverable 5) ───────────────────────────
+    // On hosts with MPK, gate the trampoline legs against the design doc's
+    // expected latencies: T3 (0B) ~30 ns, T7 (1 MiB) ~200 ns. On hosts
+    // without MPK, the sidecar reports MPK_UNAVAILABLE and we skip the gate.
+    // The 30 ns T3 gate is ~30x the design doc's expected value; the 200 ns
+    // T7 gate is ~50x, giving wide headroom for CI noise.
+    for (name, bench, max) in [
+        ("BENCH_TRAMP_0B", &bench_tramp_0b, 1_000),   // ~30 ns * 30x headroom
+        ("BENCH_TRAMP_1M", &bench_tramp_1m, 10_000),  // ~200 ns * 50x headroom
+    ] {
+        let Some(line) = bench else {
+            kill_child(&mut lisp);
+            return Err(format!("wasm-sidecar produced no {name} trampoline report (transport={transport})"));
+        };
+        if line.contains("MPK_UNAVAILABLE") {
+            eprintln!("[gate] {name} MPK unavailable on this host — trampoline leg skipped");
+            continue;
+        }
+        let median_ns = parse_median_ns(line)
+            .unwrap_or_else(|| panic!("{name} line missing median_ns: {line}"));
+        if median_ns > max {
+            kill_child(&mut lisp);
+            return Err(format!(
+                "{name} trampoline median {median_ns} ns exceeds the {max} ns threshold — \
+                 the MPK trampoline path is broken (transport={transport})"
+            ));
+        }
+        eprintln!("[gate] {name} median {median_ns} ns <= {max} ns trampoline threshold — OK");
+    }
+
     // ── latency regression gate (per transport leg) ──────────────────────
     // Fail if either bench leg's median round trip exceeds the threshold.
     // Measured medians are ~0.7ms (add) and ~1.5ms (sqrt) over TCP; the
@@ -448,6 +526,17 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     // ── prerequisites ────────────────────────────────────────────────────
     let target_dir = std::env::var("POLYGLOT_TARGET_DIR")
         .unwrap_or_else(|_| "/tmp/polyglot-target".to_string());
+    // Single-core isolation (design §6.1): the measurement process must not
+    // migrate. Each sidecar gets its OWN core — the wasm-sidecar self-pins
+    // (sched_setaffinity + PINNED marker, gated below) and the lisp/kerneld
+    // spawns are wrapped in taskset. All-on-one-core was tried first and
+    // serialized the four processes through a single CPU (tcp ADD ~0.7ms ->
+    // ~1.8ms, SQRT ~1.5ms -> ~4.6ms — right at the 5ms gate), so distinct
+    // cores keep the numbers honest while still preventing migration.
+    // Overridable so CI can pick quiet cores.
+    let pin_cpu = std::env::var("POLYGLOT_PIN_CPU").unwrap_or_else(|_| "0".to_string());
+    let lisp_pin = std::env::var("POLYGLOT_PIN_LISP_CPU").unwrap_or_else(|_| "1".to_string());
+    let kerneld_pin = std::env::var("POLYGLOT_PIN_KERNELD_CPU").unwrap_or_else(|_| "2".to_string());
     let kerneld_bin = format!("{target_dir}/release/sls-kerneld");
     let wasm_bin = format!("{target_dir}/release/wasm-sidecar");
     let lisp_script = format!("{root_linux}/user/polyglot/lisp/lisp_sidecar.lisp");
@@ -494,6 +583,7 @@ fn two_process_wasm_lisp_arena_roundtrip() {
         // never reclaimed, which is why it needed 256 MB.)
         &["--port", &port.to_string(), "--arena-size", "64"],
         &[],
+        Some(&kerneld_pin),
     );
     let Some(ready) = wait_for_marker(&kerneld_out, "READY arena=", Duration::from_secs(15)) else {
         kill_child(&mut kerneld);
@@ -534,6 +624,9 @@ fn two_process_wasm_lisp_arena_roundtrip() {
             &calc_lisp,
             &wasm_bin,
             max_median_ns,
+            &pin_cpu,
+            &lisp_pin,
+            &kerneld_pin,
         ) {
             Ok(()) => {}
             Err(e) => failures.push(format!("[{transport}] {e}")),

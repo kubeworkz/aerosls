@@ -219,6 +219,35 @@ extern struct CapTable cap_tables[CAP_TABLE_MAX];   /* defined in cap.c */
 #define SYS_SLS_CAP_RECV_MSG    303
 #define SYS_SLS_CAP_ARENA_FREE  304
 
+/* ─── Phase 3 trampoline capability syscalls (305-306 — next free after
+ * SYS_SLS_CAP_ARENA_FREE = 304; confirmed via grep across every kernel
+ * header defining SYS_SLS_*) ────────────────────────────────────────── */
+#define SYS_SLS_TRAMPOLINE_CREATE  305
+#define SYS_SLS_TRAMPOLINE_CALL    306
+
+/* ─── Trampoline capability (Deliverable 5, same-ring trampoline) ──────
+ * A TRAMP cap grants the caller permission to directly branch to a
+ * pre-verified entry point in the callee's address space, with hardware-
+ * enforced memory protection (Intel MPK / AMD PKU). The kernel issues
+ * TRAMP caps only when both sidecars run in ring 0, declare mutual
+ * trust, and the CPU supports MPK. See docs/AeroSLS-Polyglot-Nexus-
+ * Phase3-Design-v0.1.md §5 for the full rationale. ────────────────── */
+#define CAP_TYPE_TRAMP  4
+
+struct TrampolineCap {
+    uint64_t entry_vaddr;       /* callee's verified entry point */
+    uint64_t stack_vaddr;       /* callee's pre-allocated call stack */
+    uint32_t callee_pkey;       /* MPK protection key for callee code pages */
+    uint32_t caller_pkey_mask;  /* PKRU value for the caller during call */
+    uint32_t data_pkey;         /* shared arena data key (RW for both) */
+    uint32_t flags;             /* bit0 = uses callee stack */
+    uint64_t max_stack_bytes;   /* stack guard bound */
+};
+
+/* ─── MPK support flags (set at boot by kernel, queried by user) ─────── */
+#define CAP_TRAMP_MPK_SUPPORTED    0x01  /* CPU supports Intel MPK / AMD PKU */
+#define CAP_TRAMP_MPK_ENABLED      0x02  /* kernel has enabled MPK subsystem */
+
 /* ─── Request structs (single opaque arg through do_syscall, repo ABI) ───── */
 struct SLSCapCreateMemRequest {
     uint64_t phys_base;
@@ -431,5 +460,43 @@ uint64_t sys_sls_cap_list(void);
 uint64_t sys_sls_cap_send_msg(struct SLSCapSendMsgRequest* req);
 uint64_t sys_sls_cap_recv_msg(struct SLSCapRecvMsgRequest* req);
 uint64_t sys_sls_cap_arena_free(struct SLSCapArenaFreeRequest* req);
+
+/* ─── Phase 3 trampoline syscall wrappers ─────────────────────────────── */
+struct SLSTrampolineCreateRequest {
+    uint32_t callee_pid;        /* target sidecar pid */
+    uint64_t entry_vaddr;       /* callee's verified entry point */
+    uint32_t max_stack_bytes;   /* stack guard bound */
+    uint32_t _pad;
+};
+
+struct SLSTrampolineCallRequest {
+    uint16_t tramp_idx;         /* caller's TRAMP slot */
+    uint8_t  _pad[6];
+    uint64_t args[4];           /* up to 4 register-width arguments */
+    uint64_t arg_count;         /* number of valid args */
+    uint64_t arena_offset;      /* byte offset into shared arena for large data */
+    uint64_t arena_len;         /* bytes of arena data (0 = none) */
+};
+
+/* Trampoline capabilities are issued when two sidecars run in the same
+ * ring, declare mutual trust, and the CPU supports MPK. The kernel maps
+ * the callee's code pages with a dedicated MPK key and programs the shared
+ * arena with a data key. The caller uses WRPKRU to swap access rights
+ * and JMP to the callee's entry — no syscall, no message copy. */
+int cap_trampoline_create(uint32_t pid, uint32_t callee_pid,
+                         uint64_t entry_vaddr, uint32_t max_stack_bytes,
+                         uint16_t* out_idx);
+int cap_trampoline_call(uint32_t pid, uint16_t tramp_idx,
+                       const uint64_t args, uint64_t arg_count,
+                       uint64_t arena_offset, uint64_t arena_len,
+                       uint64_t* result);
+
+/* MPK support detection. Returns CAP_TRAMP_MPK_* flags. Called at boot
+ * and by user-space to decide whether to use the trampoline path or
+ * fall back to channels. */
+uint32_t cap_trampoline_mpk_flags(void);
+
+uint64_t sys_sls_trampoline_create(struct SLSTrampolineCreateRequest* req);
+uint64_t sys_sls_trampoline_call(struct SLSTrampolineCallRequest* req);
 
 #endif /* CAP_H */

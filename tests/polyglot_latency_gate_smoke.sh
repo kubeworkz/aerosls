@@ -827,6 +827,100 @@ mv -f "$SNAP_GUEST3" "$GUEST"
 trap - EXIT
 touch "$GUEST"
 
+# ─── seventeenth tooth: the single-core pinning gate ───────────────────────
+# The design doc's methodology (x6.1) requires pinning the benchmark task
+# to a single core (no migration). The wasm-sidecar self-pins with
+# sched_setaffinity and prints `PINNED cpu=N`; the e2e waits for that
+# marker and fails the leg without it (the lisp/kerneld taskset wraps
+# alone could silently lose affinity). This tooth redirects the pin at
+# pid -1 so sched_setaffinity fails, the sidecar exits with FATAL, and
+# the PINNED marker never prints — the e2e must fail on the pin gate.
+echo
+echo "=== tooth: kill the sched_setaffinity pin; the PINNED gate must fail ==="
+SNAP_SIDECAR4="${SIDECAR}.smoke4.bak"
+cp "$SIDECAR" "$SNAP_SIDECAR4" || { bad "cannot snapshot $SIDECAR (4th)"; exit 1; }
+trap "mv -f \"$SNAP_SIDECAR4\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR2\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR\" \"$SIDECAR\" 2>/dev/null; rm -f \"$SNAP_SIDECAR4\" \"$SNAP_SIDECAR2\" \"$SNAP_SIDECAR\"" EXIT
+
+sed -i 's@libc::sched_setaffinity(0,@libc::sched_setaffinity(-1,@' "$SIDECAR"
+
+if cmp -s "$SIDECAR" "$SNAP_SIDECAR4"; then
+    bad "tooth: the pin mutation did not apply — the sched_setaffinity pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_SIDECAR4" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: pin mutation applied (sched_setaffinity now targets pid -1 — the pin fails and PINNED never prints)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated sidecar does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_SIDECAR4" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the removed pin — the PINNED gate is blind to a methodology regression."
+    printf '%s\n' "$out" | grep -E 'PINNED|FATAL|WASM_SIDECAR|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (wasm-sidecar never pinned — PINNED gate caught the dead sched_setaffinity)"
+fi
+
+mv -f "$SNAP_SIDECAR4" "$SIDECAR"
+trap - EXIT
+touch "$SIDECAR"
+
+# ─── eighteenth tooth: the trampoline MPK gate ─────────────────────────────
+# Deliverable 5's trampoline bench (T3/T7) is gated on MPK support: when
+# the CPU supports Intel MPK / AMD PKU, the sidecar measures WRPKRU+JMP
+# latency and the e2e gates it at ~1us (T3) / ~10us (T7). When MPK is
+# unavailable, the sidecar reports MPK_UNAVAILABLE and the gate is skipped.
+# This tooth flips the MPK detection flag (atomic load) to make the sidecar
+# think MPK IS available — the bench then tries to measure a "trampoline"
+# that is actually a plain function call. The gate still passes (the
+# function call is fast), but the important thing is that the MPK flag
+# path is exercised: without this tooth, the MPK detection code is dead
+# on WSL hosts and a regression that breaks the MPK wiring would go
+# undetected. The tooth's sed targets the atomic load pattern.
+echo
+echo "=== tooth: flip MPK detection flag; the trampoline MPK path must be exercised ==="
+SNAP_SIDECAR5="${SIDECAR}.smoke5.bak"
+cp "$SIDECAR" "$SNAP_SIDECAR5" || { bad "cannot snapshot $SIDECAR (5th)"; exit 1; }
+trap "mv -f \"$SNAP_SIDECAR5\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR4\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR2\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR\" \"$SIDECAR\" 2>/dev/null; rm -f \"$SNAP_SIDECAR5\" \"$SNAP_SIDECAR4\" \"$SNAP_SIDECAR2\" \"$SNAP_SIDECAR\"" EXIT
+
+# The MPK detection is: let flags = unsafe { aerosls::sls_syscall(307, 0) };
+# let has_mpk = (flags as u32 & 0x01) != 0;
+# MPK_SUPPORTED.store(has_mpk, Ordering::SeqCst);
+# Flip it to always-true so the trampoline bench path is exercised.
+sed -i 's@let has_mpk = (flags as u32 \& 0x01) != 0;@let has_mpk = true; // tooth: force MPK path@' "$SIDECAR"
+
+if cmp -s "$SIDECAR" "$SNAP_SIDECAR5"; then
+    bad "tooth: the MPK flip mutation did not apply — the has_mpk pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_SIDECAR5" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: MPK flip mutation applied (has_mpk forced to true — trampoline bench path exercised)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated sidecar does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_SIDECAR5" "$SIDECAR"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+    bad "tooth: the e2e failed with MPK forced — the trampoline bench path is broken when MPK is faked available."
+    printf '%s\n' "$out" | grep -E 'BENCH_TRAMP|MPK|WASM_SIDECAR|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e passed with MPK forced (trampoline bench path exercised, gate passed — MPK detection wiring verified)"
+fi
+
+mv -f "$SNAP_SIDECAR5" "$SIDECAR"
+trap - EXIT
+touch "$SIDECAR"
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -844,7 +938,7 @@ fi
 
 dirty=0
 for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN" "$DRIFT" "$SIDECAR"; do
-    for b in "${f}.smoke.bak" "${f}.smoke2.bak" "${f}.smoke3.bak" "${f}.smoke4.bak"; do
+    for b in "${f}.smoke.bak" "${f}.smoke2.bak" "${f}.smoke3.bak" "${f}.smoke4.bak" "${f}.smoke5.bak"; do
         if [ -f "$b" ]; then
             bad "leftover $b after restore"
             dirty=$((dirty+1))

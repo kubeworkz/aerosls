@@ -572,6 +572,13 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_YIELD:
         return sys_sls_yield();
 
+    // ─── Phase 3 trampoline capabilities (305-306) ─────────────────────
+    // Same-ring, zero-copy, hardware-enforced cross-sidecar calls via MPK.
+    case SYS_SLS_TRAMPOLINE_CREATE:
+        return sys_sls_trampoline_create((struct SLSTrampolineCreateRequest*)arg);
+    case SYS_SLS_TRAMPOLINE_CALL:
+        return sys_sls_trampoline_call((struct SLSTrampolineCallRequest*)arg);
+
     default:
         return 0;
     }
