@@ -479,70 +479,11 @@ jobs:
             echo "no previous baseline — nothing to compare (first run)"
             exit 0
           fi
-          python3 - <<'EOF'
-          def load(path):
-              # Key by (leg, transport) so the tcp and shm medians never
-              # cross-compare — a shm baseline is ~350x faster on the add
-              # leg, so mixing them would spam false drift warnings.
-              out = {}
-              for ln in open(path):
-                  ln = ln.strip()
-                  if not ln or "BENCH_JSON" not in ln:
-                      continue
-                  try:
-                      j = json.loads(ln.split("BENCH_JSON ", 1)[1])
-                  except Exception:
-                      continue
-                  out[f"{j.get('transport', 'tcp')}/{j.get('leg')}"] = j
-              return out
-
-          import json
-          cur = load("bench-polyglot.jsonl")
-          prev = load("previous-bench/bench-polyglot.jsonl")
-          if not prev:
-              print("no previous baseline legs — nothing to compare (first run)")
-              raise SystemExit(0)
-          def warn(what, leg, cval, pval, ratio):
-              print(
-                  f"::warning::latency drift: {leg} {what} {cval} ns is "
-                  f"{ratio:.2f}x the previous run's {pval} ns — investigate "
-                  f"before the hard 5ms gate trips"
-              )
-
-          for key in sorted(cur):
-              c, p = cur[key], prev.get(key)
-              leg = f"{c.get('transport', 'tcp')}/{c.get('leg')}"
-              if not p or not p.get("median_ns"):
-                  print(f"info: {leg}: no previous baseline — skipping")
-                  continue
-              # Total median.
-              cmed, pmed = c["median_ns"], p["median_ns"]
-              ratio = cmed / pmed if pmed else float("inf")
-              print(f"info: {leg}: median {cmed} ns vs previous {pmed} ns ({ratio:.2f}x)")
-              if ratio >= 2.0:
-                  warn("median", leg, cmed, pmed, ratio)
-              # Split components (compute + derived transport). Old baselines
-              # lack compute_ns — skip the split check when either side
-              # misses it, so a first-baseline-after-upgrade run is clean.
-              ccomp = c.get("compute_ns")
-              pcomp = p.get("compute_ns")
-              if ccomp is None or pcomp is None:
-                  continue
-              # transport is derived as total - compute (the sidecar only
-              # emits it in the human line, not the JSON), so recompute it
-              # here consistently for both runs.
-              ctrans = max(0, cmed - ccomp)
-              ptrans = max(0, pmed - pcomp)
-              cratio = ccomp / pcomp if pcomp else float("inf")
-              print(
-                  f"info: {leg}: compute {ccomp} ns vs previous {pcomp} ns ({cratio:.2f}x); "
-                  f"transport {ctrans} ns vs previous {ptrans} ns ({ctrans / ptrans:.2f}x if {ptrans} else inf)"
-              )
-              if cratio >= 2.0:
-                  warn("compute", leg, ccomp, pcomp, cratio)
-              if ptrans and ctrans / ptrans >= 2.0:
-                  warn("transport", leg, ctrans, ptrans, ctrans / ptrans)
-          EOF
+          # Single source of truth for the drift logic: tests/polyglot_drift_check.py
+          # (also invoked by the gate-teeth smoke, so a warning the teeth prove is
+          # the exact warning this step emits). Advisory — exits 0 either way.
+          python3 tests/polyglot_drift_check.py \
+            bench-polyglot.jsonl previous-bench/bench-polyglot.jsonl
         working-directory: aerosls2
 
       # ─── Polyglot latency gate teeth ───────────────────────────────────

@@ -439,6 +439,58 @@ fi
 mv -f "$SNAP_LISP4" "$LISP_GEN"
 trap - EXIT
 
+# ─── ninth tooth: the split-aware drift warning ───────────────────────────
+# The CI drift step compares each leg's median AND compute/transport split
+# against the previous run's baseline (tests/polyglot_drift_check.py) and
+# emits ::warning:: when a component grew >= 2x. This tooth feeds it
+# synthetic bench files: a transport inversion that the median-only check
+# would miss MUST warn, a no-drift pair must stay silent, and an old
+# baseline without compute_ns must skip cleanly — proving the drift step
+# cannot silently go blind on split regressions.
+echo
+echo "=== tooth: split-aware drift warning must fire on a transport inversion ==="
+DRIFT=tests/polyglot_drift_check.py
+[ -f "$DRIFT" ] || { bad "missing $DRIFT"; exit 1; }
+TMP="$(mktemp -d)"; trap "rm -rf \"$TMP\"" EXIT
+# previous: total 8000 = compute 3000 + transport 5000
+# current:  total 14000 = compute 3000 + transport 11000 (2.2x transport,
+#           median only 1.75x — the median-only check is blind here).
+printf '%s\n' \
+  'BENCH_JSON {"leg":"add","transport":"shm","n":1000,"median_ns":8000,"compute_ns":3000,"p99_ns":20000,"mean_ns":9000}' \
+  > "$TMP/prev.jsonl"
+printf '%s\n' \
+  'BENCH_JSON {"leg":"add","transport":"shm","n":1000,"median_ns":14000,"compute_ns":3000,"p99_ns":30000,"mean_ns":15000}' \
+  > "$TMP/cur.jsonl"
+out="$(python3 "$DRIFT" "$TMP/cur.jsonl" "$TMP/prev.jsonl")"; rc=$?
+if [ "$rc" -ne 0 ]; then
+    bad "tooth: the drift script crashed on the inversion case:"
+    printf '%s\n' "$out" | sed 's/^/        /'
+else
+    printf '%s\n' "$out" | grep -q '::warning::latency drift: shm/add transport' \
+        && ok "tooth: transport inversion 2.20x fired a warning (median-only check would have stayed silent)" \
+        || { bad "tooth: the transport-inversion warning did not fire:"; printf '%s\n' "$out" | sed 's/^/        /'; }
+fi
+
+# No-drift pair must stay silent.
+printf '%s\n' \
+  'BENCH_JSON {"leg":"add","transport":"shm","n":1000,"median_ns":9000,"compute_ns":3000,"p99_ns":21000,"mean_ns":9500}' \
+  > "$TMP/cur2.jsonl"
+out="$(python3 "$DRIFT" "$TMP/cur2.jsonl" "$TMP/prev.jsonl")"
+printf '%s\n' "$out" | grep -q '::warning::' \
+    && { bad "tooth: no-drift pair produced a warning:"; printf '%s\n' "$out" | sed 's/^/        /'; } \
+    || ok "tooth: no-drift pair stayed silent (no false positives)"
+
+# Old baseline without compute_ns must skip the split check cleanly.
+printf '%s\n' \
+  'BENCH_JSON {"leg":"add","transport":"shm","n":1000,"median_ns":8000,"p99_ns":20000,"mean_ns":9000}' \
+  > "$TMP/prev_old.jsonl"
+out="$(python3 "$DRIFT" "$TMP/cur2.jsonl" "$TMP/prev_old.jsonl")"
+printf '%s\n' "$out" | grep -q 'no compute_ns in one side' \
+    && ok "tooth: pre-split baseline skipped the split check cleanly" \
+    || { bad "tooth: old-baseline skip did not behave:"; printf '%s\n' "$out" | sed 's/^/        /'; }
+rm -rf "$TMP"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
