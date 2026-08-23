@@ -463,12 +463,15 @@ jobs:
           echo "baseline ready: previous-bench/bench-polyglot.jsonl"
         working-directory: aerosls2
 
-      # Soft drift warning: compare each leg's median against the previous
-      # run's baseline and emit a ::warning:: annotation when it grew >= 2x
-      # — advisory only, never fails the build. The hard 5ms gate in the
-      # e2e step is the actual failure boundary; this surfaces drift well
-      # before that, so a slow 2-4x regression shows up as a warning even
-      # while still under the threshold.
+      # Soft drift warning: compare each leg's median — AND its
+      # compute/transport split — against the previous run's baseline and
+      # emit a ::warning:: annotation when a component grew >= 2x. A split
+      # inversion (e.g. transport ballooning while total stays flat, or
+      # Lisp-side work silently getting slower) is caught here even when
+      # the total median hides it. Advisory only, never fails the build:
+      # the hard 5ms gate in the e2e step is the actual failure boundary;
+      # this surfaces drift well before that, so a slow 2-4x regression
+      # shows up as a warning even while still under the threshold.
       - name: Warn on latency drift vs previous baseline (soft)
         run: |
           set -e
@@ -499,17 +502,46 @@ jobs:
           if not prev:
               print("no previous baseline legs — nothing to compare (first run)")
               raise SystemExit(0)
+          def warn(what, leg, cval, pval, ratio):
+              print(
+                  f"::warning::latency drift: {leg} {what} {cval} ns is "
+                  f"{ratio:.2f}x the previous run's {pval} ns — investigate "
+                  f"before the hard 5ms gate trips"
+              )
+
           for key in sorted(cur):
               c, p = cur[key], prev.get(key)
               leg = f"{c.get('transport', 'tcp')}/{c.get('leg')}"
               if not p or not p.get("median_ns"):
                   print(f"info: {leg}: no previous baseline — skipping")
                   continue
+              # Total median.
               cmed, pmed = c["median_ns"], p["median_ns"]
               ratio = cmed / pmed if pmed else float("inf")
               print(f"info: {leg}: median {cmed} ns vs previous {pmed} ns ({ratio:.2f}x)")
               if ratio >= 2.0:
-                  print(f"::warning::latency drift: {leg} median {cmed} ns is {ratio:.2f}x the previous run's {pmed} ns — investigate before the hard 5ms gate trips")
+                  warn("median", leg, cmed, pmed, ratio)
+              # Split components (compute + derived transport). Old baselines
+              # lack compute_ns — skip the split check when either side
+              # misses it, so a first-baseline-after-upgrade run is clean.
+              ccomp = c.get("compute_ns")
+              pcomp = p.get("compute_ns")
+              if ccomp is None or pcomp is None:
+                  continue
+              # transport is derived as total - compute (the sidecar only
+              # emits it in the human line, not the JSON), so recompute it
+              # here consistently for both runs.
+              ctrans = max(0, cmed - ccomp)
+              ptrans = max(0, pmed - pcomp)
+              cratio = ccomp / pcomp if pcomp else float("inf")
+              print(
+                  f"info: {leg}: compute {ccomp} ns vs previous {pcomp} ns ({cratio:.2f}x); "
+                  f"transport {ctrans} ns vs previous {ptrans} ns ({ctrans / ptrans:.2f}x if {ptrans} else inf)"
+              )
+              if cratio >= 2.0:
+                  warn("compute", leg, ccomp, pcomp, cratio)
+              if ptrans and ctrans / ptrans >= 2.0:
+                  warn("transport", leg, ctrans, ptrans, ctrans / ptrans)
           EOF
         working-directory: aerosls2
 
