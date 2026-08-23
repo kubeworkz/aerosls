@@ -40,6 +40,7 @@
 ;; see whether the SQRT leg's latency is Lisp sqrts or ring overhead.
 (defvar *last-sqrt-compute-usec* 0)
 (defvar *last-reverse-compute-usec* 0)
+(defvar *last-add-compute-usec* 0)
 
 (defun now-usec ()
   "Wall-clock microseconds (matches the wasm side's calibrated rdtsc)."
@@ -263,7 +264,26 @@
       (#.+op-add+
        (let ((a (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 0))
              (b (sb-sys:sap-ref-32 (sb-sys:vector-sap payload) 4)))
-         (encode-result (calculator-add a b) :u32)))
+         ;; Timed: this is the COMPUTE component of the add bench — the
+         ;; message round trip is transport. Carried to the caller at
+         ;; reply bytes 8..16 (the same wire slot SQRT/STR use). A single
+         ;; register add (plus dispatch) finishes in well under the 1us
+         ;; resolution of now-usec, so the timed work is a fixed 2048-iteration
+         ;; sum — same value, a compute floor (~3-5us on shm) that sits
+         ;; comfortably above the clock tick instead of on it.
+         (let ((t0 (now-usec))
+               (acc 0))
+           (declare (type (unsigned-byte 32) acc))
+           (dotimes (i 2048)
+             (setf acc (logand #xffffffff (+ acc a b))))
+           (multiple-value-bind (reply-payload reply-caps n-reply-caps)
+               (encode-result (calculator-add a b) :u32)
+             (setf *last-add-compute-usec* (- (now-usec) t0))
+             ;; compute-time split: u64 microseconds at bytes 8..16
+             (dotimes (k 8)
+               (setf (aref reply-payload (+ 8 k))
+                     (ldb (byte 8 (* 8 k)) *last-add-compute-usec*)))
+             (values reply-payload reply-caps n-reply-caps)))))
 
       (#.+op-div+
        (let ((a (sb-sys:sap-ref-64 (sb-sys:vector-sap payload) 0))

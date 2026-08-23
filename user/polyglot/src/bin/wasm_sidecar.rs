@@ -46,6 +46,9 @@ static BENCH_SQRT_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static BENCH_SQRT_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// rdtsc samples for the string path, collected inside `call_reverse`.
 static BENCH_STR_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Lisp-side compute samples (ns) for the add bench, index-aligned with
+/// BENCH_SAMPLES — same split convention as the SQRT/STR legs.
+static BENCH_ADD_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Lisp-side compute samples (ns) for the string bench, index-aligned with
 /// BENCH_STR_SAMPLES — same split convention as the SQRT leg.
 static BENCH_STR_COMPUTE_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -342,38 +345,6 @@ fn print_bench_split(
     }
 }
 
-fn print_bench(tag: &str, samples: &[u64], note: &str, transport: &str) {
-    let samples = samples.get(1..).unwrap_or(&samples[..]);
-    if !samples.is_empty() {
-        let mut s = samples.to_vec();
-        s.sort_unstable();
-        let n = s.len();
-        let median = s[n / 2];
-        let p99 = s[((n as f64 * 0.99) as usize).min(n - 1)];
-        let mean = s.iter().sum::<u64>() / n as u64;
-        let median_ns = cycles_to_ns(median);
-        let p99_ns = cycles_to_ns(p99);
-        let mean_ns = cycles_to_ns(mean);
-        println!(
-            "BENCH_{tag}: N={n} median_cy={median} median_ns={median_ns} p99_cy={p99} p99_ns={p99_ns} mean_cy={mean} ({note}, transport={transport})"
-        );
-        // Machine-readable line (one per leg) for CI archiving and drift
-        // tracking — grep'd out of the e2e output by the polyglot-e2e job.
-        // transport distinguishes the TCP leg from the shared-ring leg so
-        // drift baselines never cross-compare transports.
-        let leg = tag.to_ascii_lowercase();
-        println!(
-            "BENCH_JSON {{\"leg\":\"{leg}\",\"transport\":\"{transport}\",\"n\":{n},\"median_cy\":{median},\"median_ns\":{median_ns},\"p99_cy\":{p99},\"p99_ns\":{p99_ns},\"mean_cy\":{mean},\"mean_ns\":{mean_ns}}}"
-        );
-    } else {
-        println!("BENCH_{tag}: no round-trip samples ({note}, transport={transport})");
-        println!(
-            "BENCH_JSON {{\"leg\":\"{}\",\"transport\":\"{transport}\",\"n\":0}}",
-            tag.to_ascii_lowercase()
-        );
-    }
-}
-
 fn main() {
     let mut port = 0u16;
     let mut arena_path = String::new();
@@ -468,7 +439,12 @@ fn main() {
             };
             // Record the full wasm -> lisp -> wasm round trip in cycles. The
             // push happens after the stop timestamp, so it can't inflate it.
-            BENCH_SAMPLES.lock().unwrap().push(rdtsc().wrapping_sub(t0));
+            // The Lisp-reported compute (ns) rides the reply so the report
+            // can split total into compute + transport.
+            let total = rdtsc().wrapping_sub(t0);
+            BENCH_SAMPLES.lock().unwrap().push(total);
+            let compute = unsafe { gen_calculator::calculator_service::LAST_ADD_COMPUTE_NS };
+            BENCH_ADD_COMPUTE_NS.lock().unwrap().push(compute);
             r
         })
         .unwrap();
@@ -602,11 +578,12 @@ fn main() {
     // Drop the first sample of each leg — the guest's verification calls,
     // i.e. the cold path (warmup for connection/TCP/buffers).
     let add_samples = std::mem::take(&mut *BENCH_SAMPLES.lock().unwrap());
+    let add_compute = std::mem::take(&mut *BENCH_ADD_COMPUTE_NS.lock().unwrap());
     let sqrt_samples = std::mem::take(&mut *BENCH_SQRT_SAMPLES.lock().unwrap());
     let sqrt_compute = std::mem::take(&mut *BENCH_SQRT_COMPUTE_NS.lock().unwrap());
     let str_samples = std::mem::take(&mut *BENCH_STR_SAMPLES.lock().unwrap());
     let str_compute = std::mem::take(&mut *BENCH_STR_COMPUTE_NS.lock().unwrap());
-    print_bench("ADD", &add_samples, "add() — inline args", &transport);
+    print_bench_split("ADD", &add_samples, &add_compute, "add() — inline args", &transport);
     print_bench_split("SQRT", &sqrt_samples, &sqrt_compute, "sqrt_batch(4096 f64) — arena MEM cap", &transport);
     print_bench_split("STR", &str_samples, &str_compute, "reverse(32..63 B) — string arena MEM cap", &transport);
 

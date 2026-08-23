@@ -403,6 +403,42 @@ fi
 mv -f "$SNAP_LISP3" "$LISP_GEN"
 trap - EXIT
 
+# ─── eighth tooth: the add compute/transport split guard ──────────────────
+# The add leg reports total = compute (Lisp-side arithmetic, timed on the
+# Lisp side and carried in the reply) + transport (derived), and the e2e
+# asserts the split is live (compute >= 100ns, transport > 0). This tooth
+# zeroes the compute value the Lisp writes for the add reply and requires
+# the e2e to FAIL on the split guard.
+echo
+echo "=== tooth: Lisp stops reporting add compute; the add split guard must fail ==="
+SNAP_LISP4="${LISP_GEN}.smoke4.bak"
+cp "$LISP_GEN" "$SNAP_LISP4" || { bad "cannot snapshot $LISP_GEN"; exit 1; }
+trap "mv -f \"$SNAP_LISP4\" \"$LISP_GEN\" 2>/dev/null; rm -f \"$SNAP_LISP4\"" EXIT
+
+# (i) zero the add compute field: read a literal 0 instead of the value.
+sed -i 's@(ldb (byte 8 (\* 8 k)) \*last-add-compute-usec\*)@(ldb (byte 8 (* 8 k)) 0)@' "$LISP_GEN"
+
+if cmp -s "$LISP_GEN" "$SNAP_LISP4"; then
+    bad "tooth: the add split mutation did not apply — the compute pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_LISP4" "$LISP_GEN"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: add split mutation applied (Lisp reports compute=0 — add timing field dead)"
+
+echo "running the e2e against the mutated Lisp dispatch (expect the add split guard to fail, ~5s)..."
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the dead add compute field — the add split guard is blind."
+    printf '%s\n' "$out" | grep -E 'BENCH_ADD|WASM_SIDECAR|split is dead|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (add split guard caught the dead compute field)"
+fi
+
+# ─── restore byte-identically ──────────────────────────────────────────────
+mv -f "$SNAP_LISP4" "$LISP_GEN"
+trap - EXIT
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -420,7 +456,7 @@ fi
 
 dirty=0
 for f in "$TRANSPORT" "$KERNELD" "$RING" "$GUEST" "$LISP_GEN"; do
-    for b in "${f}.smoke.bak" "${f}.smoke2.bak" "${f}.smoke3.bak"; do
+    for b in "${f}.smoke.bak" "${f}.smoke2.bak" "${f}.smoke3.bak" "${f}.smoke4.bak"; do
         if [ -f "$b" ]; then
             bad "leftover $b after restore"
             dirty=$((dirty+1))
