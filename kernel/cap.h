@@ -45,6 +45,12 @@
 #define CAP_TYPE_CHAN_R  2
 #define CAP_TYPE_CHAN_W  3
 
+/* Phase 4: device driver SDK types ────────────────────────────────────── */
+#define CAP_TYPE_IO_PORT    5   /* Port I/O (x86 in/out; RV: MMIO via PMP/IOMMU) */
+#define CAP_TYPE_IRQ        6   /* Hardware interrupt delivery */
+#define CAP_TYPE_DMA_MEM    7   /* Physically pinned memory for DMA */
+#define CAP_TYPE_BUS_ACCESS 8   /* PCIe config space / bus topology access */
+
 #define CAP_STATE_VALID       0
 #define CAP_STATE_IN_TRANSIT  1   /* reserved for Phase-2 blocked send */
 #define CAP_STATE_REVOKED     2   /* stamped into queued words by revoke */
@@ -57,6 +63,19 @@
 #define CAP_PERM_MAP   0x08
 #define CAP_PERM_SEND  0x01
 #define CAP_PERM_RECV  0x02
+
+/* Phase 4 permission bits (shared encoding; meaning depends on cap type) ── */
+#define CAP_PERM_IO_READ    0x01  /* IO_PORT: allow reads */
+#define CAP_PERM_IO_WRITE   0x02  /* IO_PORT: allow writes */
+#define CAP_PERM_IO_PF      0x04  /* IO_PORT: allow BAR sizing */
+#define CAP_PERM_IRQ_LISTEN 0x01  /* IRQ: receive interrupt messages */
+#define CAP_PERM_IRQ_ACK    0x02  /* IRQ: acknowledge (EOI) the interrupt */
+#define CAP_PERM_IRQ_MASK   0x04  /* IRQ: mask/unmask the interrupt */
+#define CAP_PERM_DMA_SHARE  0x10  /* DMA_MEM: allow sharing to other sidecars */
+#define CAP_PERM_DMA_MAP    0x20  /* DMA_MEM: allow IOMMU mapping */
+#define CAP_PERM_BUS_ENUM   0x01  /* BUS_ACCESS: enumerate devices */
+#define CAP_PERM_BUS_CFG_R  0x02  /* BUS_ACCESS: read config space */
+#define CAP_PERM_BUS_CFG_W  0x04  /* BUS_ACCESS: write config space */
 
 #define CAP_NONE 0xFFFF   /* "no capability" sentinel (slot index / syscall result) */
 
@@ -158,7 +177,7 @@ struct CapHolder {
 struct CapObject {
     struct CapSpinlock lock;
     uint32_t id;              /* == index into cap_objects[] (Phase 1: monotonic) */
-    uint8_t  kind;            /* CAP_TYPE_MEM / CAP_TYPE_CHAN_R? no: CAP_MEM or CHAN */
+    uint8_t  kind;            /* CAP_OBJ_KIND_* */
     uint8_t  revoking;        /* set at the revoke linearization point */
     uint8_t  active;
     uint8_t  _pad;
@@ -168,11 +187,57 @@ struct CapObject {
     uint64_t phys_base;       /* MEM: physical address of page 0 */
     uint32_t npages;          /* MEM: object length in pages */
     uint16_t chan_id;         /* CHAN: index into cap_channels[] */
-    uint8_t  _pad2[6];
+
+    /* ── Phase 4: device driver SDK fields ────────────────────────────────
+     * Union-style layout: each kind uses different fields. Because objects
+     * are monotonic (never recycled, Phase 1 invariant §3), a dead MEM
+     * object's phys_base never aliases a live IO_PORT — the kind discriminant
+     * is authoritative and validated on every use. */
+    union {
+        struct {                /* IO_PORT */
+            uint64_t io_phys_base;  /* physical base (MMIO on RV, port on x86) */
+            uint32_t io_length;     /* length in bytes or port count */
+            uint8_t  io_width;      /* 1, 2, or 4 bytes per access */
+            uint8_t  io_flags;      /* bit0=UNCACHEABLE, bit1=READ_ONLY */
+            uint16_t _io_pad;
+        } io;
+        struct {                /* IRQ */
+            uint32_t irq_number;        /* PLIC source ID or MSI vector */
+            uint8_t  irq_trigger;       /* 0=level-low, 1=edge-rising, 2=level-high */
+            uint8_t  irq_polarity;      /* reserved, must be 0 */
+            uint16_t irq_affinity_cpu;  /* target CPU (0xFFFF = any) */
+            uint32_t irq_chan_id;        /* channel id for IRQ message delivery */
+            uint32_t irq_masked;        /* 1 = masked, 0 = enabled */
+            uint64_t irq_coalesce_us;   /* min interval between IRQ messages */
+            uint64_t irq_last_us;       /* timestamp of last delivered IRQ */
+            uint32_t irq_coalesce_count; /* pending coalesced interrupt count */
+            uint32_t irq_sequence;       /* monotonic message sequence number */
+            uint32_t irq_dropped;        /* messages dropped (queue full) */
+        } irq;
+        struct {                /* DMA_MEM — extends MEM (phys_base/npages) */
+            uint32_t dma_iommu_domain;  /* IOMMU domain id (0 = no IOMMU) */
+            uint32_t dma_device_id;     /* owning device's object id */
+            uint8_t  dma_flags;         /* bit0=COHERENT, bit1=RO_DEV, bit2=WO_DEV */
+            uint8_t  _dma_pad[3];
+            uint32_t dma_shared_count;  /* number of MEM caps referencing this */
+        } dma;
+        struct {                /* BUS_ACCESS */
+            uint8_t  bus_root;           /* starting bus number */
+            uint8_t  bus_max;            /* ending bus number */
+            uint8_t  bus_flags;          /* bit0=ENUM, bit1=CFG_R, bit2=CFG_W */
+            uint8_t  _bus_pad;
+            uint32_t bus_domain;         /* IOMMU domain for bus-mastering devices */
+        } bus;
+    } u;
+    uint8_t  _pad2[4];
 };
 
-#define CAP_OBJ_KIND_MEM   1
-#define CAP_OBJ_KIND_CHAN  2
+#define CAP_OBJ_KIND_MEM      1
+#define CAP_OBJ_KIND_CHAN     2
+#define CAP_OBJ_KIND_IO_PORT  5
+#define CAP_OBJ_KIND_IRQ      6
+#define CAP_OBJ_KIND_DMA_MEM  7
+#define CAP_OBJ_KIND_BUS      8
 
 struct CapSlot {
     uint64_t word;            /* the capability word; type NONE == free */
@@ -225,6 +290,81 @@ extern struct CapTable cap_tables[CAP_TABLE_MAX];   /* defined in cap.c */
 #define SYS_SLS_TRAMPOLINE_CREATE  305
 #define SYS_SLS_TRAMPOLINE_CALL    306
 
+/* ─── Phase 4: device driver SDK syscalls (307-313 — next free after
+ * SYS_SLS_TRAMPOLINE_CALL = 306; confirmed via grep across every kernel
+ * header defining SYS_SLS_*) ────────────────────────────────────────── */
+#define SYS_SLS_CAP_CREATE_IO_PORT   307
+#define SYS_SLS_CAP_CREATE_IRQ       308
+#define SYS_SLS_IRQ_MASK             309
+#define SYS_SLS_IRQ_UNMASK           310
+#define SYS_SLS_IRQ_ACK              311
+#define SYS_SLS_CAP_CREATE_DMA_MEM   312
+#define SYS_SLS_CAP_CREATE_BUS       313
+
+/* ─── Phase 4: IRQ message format ─────────────────────────────────────────
+ * Hardware interrupts are translated into fixed-format channel messages.
+ * The kernel writes these into the IRQ channel; the driver reads them via
+ * cap_recv_msg(). Carries data only — no capability transfers. */
+struct IRQMessage {
+    uint32_t irq_number;        /* interrupt source (PLIC source ID or MSI vector) */
+    uint32_t timestamp_lo;      /* low 32 bits of hardware cycle counter */
+    uint32_t timestamp_hi;      /* high 32 bits */
+    uint16_t sequence;           /* monotonic per-IRQ-cap */
+    uint8_t  priority;           /* 0=lowest..255=highest */
+    uint8_t  flags;              /* bit0=COALESCED, bit1=SHARED_IRQ, bit7=OVERFLOW */
+    uint32_t coalesce_count;     /* if COALESCED: how many interrupts merged */
+    uint32_t device_status;      /* driver-specific (optional, read from device) */
+};
+
+#define CAP_IRQ_COALESCED  0x01
+#define CAP_IRQ_SHARED     0x02
+#define CAP_IRQ_OVERFLOW   0x80  /* channel queue full, messages dropped */
+
+/* ─── Phase 4: request structs ──────────────────────────────────────────── */
+struct SLSCapCreateIOPortRequest {
+    uint64_t phys_base;       /* physical address (or port number on x86) */
+    uint32_t length;          /* length in bytes (or port count) */
+    uint8_t  width;           /* 1, 2, or 4 bytes per access */
+    uint8_t  flags;           /* IO_FLAGS_* */
+    uint8_t  perm;            /* CAP_PERM_IO_READ | CAP_PERM_IO_WRITE */
+    uint8_t  _pad;
+};
+
+struct SLSCapCreateIRQRequest {
+    uint32_t irq_number;       /* PLIC source or MSI vector */
+    uint8_t  trigger;          /* edge/level, high/low */
+    uint8_t  perm;             /* CAP_PERM_IRQ_LISTEN | ACK | MASK */
+    uint16_t _pad;
+    uint64_t coalesce_us;      /* 0 = no coalescing */
+};
+
+struct SLSIRQMaskRequest {
+    uint16_t irq_cap_idx;      /* IRQ capability slot */
+    uint8_t  masked;            /* 1 = mask, 0 = unmask */
+    uint8_t  _pad;
+};
+
+struct SLSIRQAckRequest {
+    uint16_t irq_cap_idx;      /* IRQ capability slot */
+    uint8_t  _pad[6];
+};
+
+struct SLSCapCreateDMAMemRequest {
+    uint32_t npages;          /* number of 4K pages */
+    uint32_t align_pages;     /* minimum alignment in pages (1=4K, 16=64K, 512=2M) */
+    uint8_t  flags;           /* DMA_BUF_FLAG_* */
+    uint8_t  _pad[3];
+    uint32_t out_cap_idx;     /* [out] MEM cap index in caller's table */
+    uint32_t out_dma_buf_id;  /* [out] DMA buffer id */
+};
+
+struct SLSCapCreateBusRequest {
+    uint8_t  bus_root;        /* starting bus number */
+    uint8_t  bus_max;         /* ending bus number */
+    uint8_t  perm;            /* CAP_PERM_BUS_ENUM | CFG_R | CFG_W */
+    uint8_t  _pad;
+};
+
 /* ─── Trampoline capability (Deliverable 5, same-ring trampoline) ──────
  * A TRAMP cap grants the caller permission to directly branch to a
  * pre-verified entry point in the callee's address space, with hardware-
@@ -233,6 +373,16 @@ extern struct CapTable cap_tables[CAP_TABLE_MAX];   /* defined in cap.c */
  * trust, and the CPU supports MPK. See docs/AeroSLS-Polyglot-Nexus-
  * Phase3-Design-v0.1.md §5 for the full rationale. ────────────────── */
 #define CAP_TYPE_TRAMP  4
+
+/* Phase 4: IO_PORT flags (passed via SLSCapCreateIOPortRequest.flags) */
+#define CAP_IO_FLAG_UNCACHEABLE  0x01  /* map as UC (MTRR/MATR) */
+#define CAP_IO_FLAG_READ_ONLY    0x02  /* device read-only region */
+#define CAP_IO_FLAG_BE_MEM       0x04  /* big-endian MMIO */
+
+/* Phase 4: DMA buffer flags (passed via SLSCapCreateDMAMemRequest.flags) */
+#define CAP_DMA_FLAG_COHERENT    0x01  /* cache-coherent DMA */
+#define CAP_DMA_FLAG_RO_DEVICE   0x02  /* device reads only */
+#define CAP_DMA_FLAG_WO_DEVICE   0x04  /* device writes only */
 
 struct TrampolineCap {
     uint64_t entry_vaddr;       /* callee's verified entry point */
@@ -498,5 +648,50 @@ uint32_t cap_trampoline_mpk_flags(void);
 
 uint64_t sys_sls_trampoline_create(struct SLSTrampolineCreateRequest* req);
 uint64_t sys_sls_trampoline_call(struct SLSTrampolineCallRequest* req);
+
+/* ─── Phase 4: device driver SDK public API ────────────────────────────────
+ * Create capabilities for hardware access. All return 0 on success with
+ * *out_idx set to the new cap slot, or a negative CAP_E* on failure.
+ * `pid` is the caller. */
+int cap_create_io_port(uint32_t pid, uint64_t phys_base, uint32_t length,
+                       uint8_t width, uint8_t flags, uint8_t perm,
+                       uint16_t* out_idx);
+int cap_create_irq(uint32_t pid, uint32_t irq_number, uint8_t trigger,
+                   uint8_t perm, uint64_t coalesce_us, uint16_t* out_idx);
+int cap_create_dma_mem(uint32_t pid, uint32_t npages, uint32_t align_pages,
+                       uint8_t flags, uint16_t* out_cap_idx,
+                       uint32_t* out_dma_buf_id);
+int cap_create_bus(uint32_t pid, uint8_t bus_root, uint8_t bus_max,
+                   uint8_t perm, uint16_t* out_idx);
+
+/* IRQ control: mask/unmask at the interrupt controller, acknowledge (EOI). */
+int cap_irq_mask(uint32_t pid, uint16_t irq_cap_idx, uint8_t masked);
+int cap_irq_ack(uint32_t pid, uint16_t irq_cap_idx);
+
+/* Weak arch hooks for interrupt controller operations.
+ * RISC-V: PLIC claim/complete register. x86: APIC EOI register.
+ * cap.c ships weak defaults that are no-ops; the real kernel provides
+ * strong overrides. */
+void cap_irq_mask_source(uint32_t irq_number, uint8_t masked);
+void cap_irq_eoi(uint32_t irq_number);
+
+/* IOMMU hooks (weak defaults in cap.c, strong in kernel/iommu.c). */
+void cap_iommu_map(uint32_t domain_id, uint64_t phys_base, uint32_t npages);
+void cap_iommu_unmap(uint32_t domain_id, uint64_t phys_base, uint32_t npages);
+
+/* DMA buffer pool hooks (weak defaults in cap.c, strong in kernel/dma.c). */
+int  cap_dma_pin(uint64_t phys_base, uint32_t npages);
+void cap_dma_unpin(uint64_t phys_base, uint32_t npages);
+
+/* Debug: dump IRQ cap info. */
+void cap_irq_list(void);
+
+/* ─── Phase 4: syscall wrappers ──────────────────────────────────────────── */
+uint64_t sys_sls_cap_create_io_port(struct SLSCapCreateIOPortRequest* req);
+uint64_t sys_sls_cap_create_irq(struct SLSCapCreateIRQRequest* req);
+uint64_t sys_sls_irq_mask(struct SLSIRQMaskRequest* req);
+uint64_t sys_sls_irq_ack(struct SLSIRQAckRequest* req);
+uint64_t sys_sls_cap_create_dma_mem(struct SLSCapCreateDMAMemRequest* req);
+uint64_t sys_sls_cap_create_bus(struct SLSCapCreateBusRequest* req);
 
 #endif /* CAP_H */

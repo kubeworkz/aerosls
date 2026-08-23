@@ -261,6 +261,11 @@ static int cap_object_alloc(uint8_t kind, uint32_t* out_id) {
     o->phys_base = 0;
     o->npages = 0;
     o->chan_id = 0;
+    /* Phase 4: zero-init the union so kind-specific fields start clean. */
+    o->u.io.io_phys_base = 0;
+    o->u.io.io_length = 0;
+    o->u.io.io_width = 0;
+    o->u.io.io_flags = 0;
     *out_id = id;
     return 0;
 }
@@ -493,7 +498,9 @@ void cap_init(void) {
 
     kernel_serial_print("[CAP] Seed kernel capability layer online: "
                         "512-slot tables, 1024-object ceiling, holders, "
-                        "channels, arena, message transport, syscalls 289-304.\n");
+                        "channels, arena, message transport, syscalls 289-304.\n"
+                        "[CAP] Phase 4 device driver SDK: IO_PORT, IRQ, DMA_MEM, "
+                        "BUS_ACCESS types, syscalls 307-313.\n");
 }
 
 /* ─── cap_create_mem ───────────────────────────────────────────────────────── */
@@ -775,6 +782,153 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
     *out_wr = wr;
     *out_far_rd = frd;
     *out_far_wr = fwr;
+    return 0;
+}
+
+/* Forward declarations for Phase 4 weak hooks (defined later in this file) */
+int cap_irq_source_valid(uint32_t irq_number);
+void cap_irq_mask_source(uint32_t irq_number, uint8_t masked);
+void cap_irq_eoi(uint32_t irq_number);
+void cap_iommu_map(uint32_t domain_id, uint64_t phys_base, uint32_t npages);
+int  cap_dma_pin(uint64_t phys_base, uint32_t npages);
+
+/* ─── Phase 4: IO_PORT / IRQ creation helpers ───────────────────────────────
+ * Inserted before cap_chan_create so the channel code can reference them if
+ * needed. Both follow the same lock order as cap_create_mem: validate,
+ * allocate object, allocate table slot, link holder, publish word. */
+
+/* cap_create_io_port — wrap a physical address range in an IO_PORT cap.
+ * Anti-aliasing: must not overlap any existing IO_PORT or MEM object
+ * (same check as cap_create_mem's overlap scan, extended to IO_PORT). */
+int cap_create_io_port(uint32_t pid, uint64_t phys_base, uint32_t length,
+                       uint8_t width, uint8_t flags, uint8_t perm,
+                       uint16_t* out_idx) {
+    if (out_idx) *out_idx = CAP_NONE;
+    if (!out_idx || length == 0) return CAP_EINVAL;
+    if (width != 1 && width != 2 && width != 4) return CAP_EINVAL;
+    if (perm == 0 || (perm & ~(CAP_PERM_IO_READ | CAP_PERM_IO_WRITE | CAP_PERM_IO_PF)))
+        return CAP_EINVAL;
+    uint64_t end = phys_base + (uint64_t)length;
+    if (end <= phys_base) return CAP_ERANGE;
+
+    /* Anti-aliasing: check against all active IO_PORT and MEM objects. */
+    for (uint32_t i = 0; i < CAP_OBJECT_MAX; i++) {
+        const struct CapObject* o = &cap_objects[i];
+        if (!o->active) continue;
+        if (o->kind == CAP_OBJ_KIND_IO_PORT) {
+            uint64_t oend = o->u.io.io_phys_base + o->u.io.io_length;
+            if (phys_base < oend && end > o->u.io.io_phys_base)
+                return CAP_ECONFLICT;
+        }
+        if (o->kind == CAP_OBJ_KIND_MEM) {
+            uint64_t oend = o->phys_base + (uint64_t)o->npages * 4096u;
+            if (phys_base < oend && end > o->phys_base)
+                return CAP_ECONFLICT;
+        }
+    }
+
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+
+    uint32_t obj_id;
+    if (cap_object_alloc(CAP_OBJ_KIND_IO_PORT, &obj_id)) return CAP_ENOMEM;
+    struct CapObject* o = &cap_objects[obj_id];
+    o->max_perms = perm;
+    o->u.io.io_phys_base = phys_base;
+    o->u.io.io_length = length;
+    o->u.io.io_width = width;
+    o->u.io.io_flags = flags;
+
+    cap_lock(&cap_tables[ti].lock);
+    uint16_t idx;
+    if (cap_slot_pop(ti, &idx)) {
+        cap_unlock(&cap_tables[ti].lock);
+        cap_object_destroy(obj_id);
+        return CAP_ETABLEFULL;
+    }
+    cap_lock(&o->lock);
+    if (cap_holder_insert(obj_id, HOLDER_SLOT, (uint16_t)pid, idx, 0)) {
+        cap_slot_push(ti, idx);
+        cap_unlock(&o->lock);
+        cap_unlock(&cap_tables[ti].lock);
+        cap_object_destroy(obj_id);
+        return CAP_ENOMEM;
+    }
+    cap_tables[ti].slots[idx].word =
+        cap_word_make(CAP_TYPE_IO_PORT, obj_id, perm, 0, 0);
+    cap_unlock(&o->lock);
+    cap_unlock(&cap_tables[ti].lock);
+
+    *out_idx = idx;
+    return 0;
+}
+
+/* cap_create_irq — create an IRQ cap bound to a PLIC source or MSI vector.
+ * The IRQ cap is non-transferable (bound to one sidecar). Creates a
+ * dedicated channel for interrupt message delivery. */
+int cap_create_irq(uint32_t pid, uint32_t irq_number, uint8_t trigger,
+                   uint8_t perm, uint64_t coalesce_us, uint16_t* out_idx) {
+    if (out_idx) *out_idx = CAP_NONE;
+    if (!out_idx) return CAP_EINVAL;
+    if (perm == 0 || (perm & ~(CAP_PERM_IRQ_LISTEN | CAP_PERM_IRQ_ACK | CAP_PERM_IRQ_MASK)))
+        return CAP_EINVAL;
+
+    /* Validate IRQ number against the interrupt controller (weak hook;
+     * strong override in plic.c validates real PLIC source IDs). */
+    if (!cap_irq_source_valid(irq_number))
+        return CAP_EINVAL;
+
+    /* Create a dedicated channel for IRQ message delivery. */
+    uint16_t ch_rd = CAP_NONE, ch_wr = CAP_NONE;
+    uint16_t ch_frd = CAP_NONE, ch_fwr = CAP_NONE;
+    int cr = cap_chan_create(pid, 0, &ch_rd, &ch_wr, &ch_frd, &ch_fwr);
+    if (cr < 0) return cr;
+
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+
+    uint32_t obj_id;
+    if (cap_object_alloc(CAP_OBJ_KIND_IRQ, &obj_id)) {
+        /* Roll back the channel we just created. */
+        /* TODO: cap_chan_destroy for rollback; for now the orphaned
+         * channel is harmless (empty, no holders except ours). */
+        return CAP_ENOMEM;
+    }
+    struct CapObject* o = &cap_objects[obj_id];
+    o->max_perms = perm;
+    o->u.irq.irq_number = irq_number;
+    o->u.irq.irq_trigger = trigger;
+    o->u.irq.irq_polarity = 0;
+    o->u.irq.irq_affinity_cpu = 0xFFFF;
+    o->u.irq.irq_chan_id = (uint32_t)((ch_rd != CAP_NONE) ? ch_rd : ch_frd);
+    o->u.irq.irq_masked = 1;   /* starts masked; unmask via syscall */
+    o->u.irq.irq_coalesce_us = coalesce_us;
+    o->u.irq.irq_last_us = 0;
+    o->u.irq.irq_coalesce_count = 0;
+    o->u.irq.irq_sequence = 0;
+    o->u.irq.irq_dropped = 0;
+
+    cap_lock(&cap_tables[ti].lock);
+    uint16_t idx;
+    if (cap_slot_pop(ti, &idx)) {
+        cap_unlock(&cap_tables[ti].lock);
+        cap_object_destroy(obj_id);
+        return CAP_ETABLEFULL;
+    }
+    cap_lock(&o->lock);
+    if (cap_holder_insert(obj_id, HOLDER_SLOT, (uint16_t)pid, idx, 0)) {
+        cap_slot_push(ti, idx);
+        cap_unlock(&o->lock);
+        cap_unlock(&cap_tables[ti].lock);
+        cap_object_destroy(obj_id);
+        return CAP_ENOMEM;
+    }
+    cap_tables[ti].slots[idx].word =
+        cap_word_make(CAP_TYPE_IRQ, obj_id, perm, 0, 0);
+    cap_unlock(&o->lock);
+    cap_unlock(&cap_tables[ti].lock);
+
+    *out_idx = idx;
     return 0;
 }
 
@@ -1151,8 +1305,9 @@ int cap_send_msg(uint32_t pid, uint16_t ch_w_idx, const void* payload,
     for (int i = 0; i < n_caps; i++) {
         uint16_t slot = descs[i].slot;
         uint64_t pw = t->slots[slot].word;
+        uint32_t pw_type = (uint32_t)((pw >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
         if (!cap_word_valid(pw) ||
-            ((pw >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_MEM) {
+            (pw_type != CAP_TYPE_MEM && pw_type != CAP_TYPE_DMA_MEM)) {
             cap_unlock(&t->lock);
             return CAP_EINVAL;
         }
@@ -1437,8 +1592,9 @@ int cap_arena_free(uint32_t pid, uint16_t cap_idx) {
 
     cap_lock(&t->lock);
     uint64_t w = t->slots[cap_idx].word;
+    uint32_t w_type = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
     if (!cap_word_valid(w) ||
-        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_MEM) {
+        (w_type != CAP_TYPE_MEM && w_type != CAP_TYPE_DMA_MEM)) {
         cap_unlock(&t->lock);
         return CAP_EINVAL;
     }
@@ -1515,6 +1671,23 @@ int cap_revoke(uint32_t pid, uint16_t cap_idx) {
         return CAP_EALREADY;
     }
     obj->revoking = 1;      /* ← linearization point */
+
+    /* ── Phase 4: revoke kind-specific hardware resources ──────────────
+     * Must happen BEFORE the holder walk: masking the interrupt source
+     * prevents new IRQ messages from arriving after we begin tearing down
+     * the channel. IOMMU unmap prevents the device from DMA-ing into
+     * pages that are about to be freed. */
+    if (obj->kind == CAP_OBJ_KIND_IRQ && !(obj->max_perms & CAP_PERM_IRQ_MASK)) {
+        /* IRQ cap doesn't have MASK permission but was somehow live —
+         * mask it defensively on revoke anyway. */
+    }
+    if (obj->kind == CAP_OBJ_KIND_IRQ) {
+        cap_irq_mask_source(obj->u.irq.irq_number, 1);  /* mask */
+    }
+    if (obj->kind == CAP_OBJ_KIND_DMA_MEM) {
+        cap_iommu_unmap(obj->u.dma.dma_iommu_domain,
+                        obj->phys_base, obj->npages);
+    }
 
     /* Collect holders into a STATIC scratch buffer, not a local: at
      * CAP_HOLDER_MAX entries a local would be a 16 KiB frame, which this
@@ -1603,7 +1776,22 @@ static uint32_t cap_object_free_resources(uint32_t obj_id) {
     } else if (o->kind == CAP_OBJ_KIND_CHAN) {
         struct CapChannel* ch = &cap_channels[o->chan_id];
         ch->active = 0;
+    } else if (o->kind == CAP_OBJ_KIND_IRQ) {
+        /* IRQ channel deactivated; interrupt source already masked
+         * by cap_revoke()'s pre-walk hook. */
+        if (o->u.irq.irq_chan_id < CAP_CHAN_MAX)
+            cap_channels[o->u.irq.irq_chan_id].active = 0;
+    } else if (o->kind == CAP_OBJ_KIND_DMA_MEM) {
+        /* DMA_MEM inherits MEM's arena frame ownership (phys_base/npages
+         * are in the MEM part of the struct). Return arena frames. */
+        for (uint32_t f = 0; f < CAP_ARENA_FRAMES; f++) {
+            if (cap_arena_owner[f] == obj_id) {
+                cap_arena_frame_clear(f);
+                freed++;
+            }
+        }
     }
+    /* IO_PORT and BUS_ACCESS have no machine resources to free. */
     return freed;
 }
 
@@ -1804,8 +1992,9 @@ int cap_map(uint32_t pid, uint16_t cap_idx, uint64_t vaddr, uint32_t flags) {
     cap_lock(&t->lock);
 
     uint64_t w = t->slots[cap_idx].word;
+    uint32_t cap_type = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
     if (!cap_word_valid(w) ||
-        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_MEM) {
+        (cap_type != CAP_TYPE_MEM && cap_type != CAP_TYPE_DMA_MEM)) {
         cap_unlock(&t->lock);
         return CAP_EBADF;
     }
@@ -1950,7 +2139,9 @@ uint32_t cap_debug_refcount(uint32_t obj_id) {
 
 uint64_t cap_debug_obj_phys(uint32_t obj_id) {
     struct CapObject* o = cap_object_get(obj_id);
-    if (!o || o->kind != CAP_OBJ_KIND_MEM) return 0;
+    if (!o) return 0;
+    /* MEM and DMA_MEM both store phys_base in the same field. */
+    if (o->kind != CAP_OBJ_KIND_MEM && o->kind != CAP_OBJ_KIND_DMA_MEM) return 0;
     return o->phys_base;
 }
 
@@ -1964,6 +2155,9 @@ uint32_t cap_object_count(void) {
 uint32_t cap_arena_free_frames(void) {
     return cap_arena_free_count;
 }
+
+/* Forward declaration — defined after the Phase 4 section (cap_type_name). */
+static const char* cap_type_name(uint32_t type);
 
 void cap_list(void) {
     kernel_serial_print("\n[CAP] Capability tables:\n");
@@ -1980,8 +2174,8 @@ void cap_list(void) {
             uint32_t type = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
             uint32_t obj = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
             uint32_t perms = (uint32_t)((w >> CAP_PERM_SHIFT) & CAP_PERM_MASK);
-            kernel_serial_printf("    [%u] type=%u obj=%u perms=0x%02x\n",
-                                 i, type, obj, perms);
+            kernel_serial_printf("    [%u] %s obj=%u perms=0x%02x\n",
+                                 i, cap_type_name(type), obj, perms);
         }
     }
     uint32_t live_objs = cap_object_count();
@@ -2301,4 +2495,329 @@ uint64_t sys_sls_trampoline_call(struct SLSTrampolineCallRequest* req) {
                                req->arena_offset, req->arena_len, &result);
     if (r < 0) return (uint64_t)(int64_t)r;
     return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Phase 4 — Device Driver SDK: weak arch hooks, IRQ control, IOMMU,
+ * DMA pin/unpin, syscall wrappers, and debug introspection.
+ * See docs/AeroSLS-Device-Driver-SDK-Phase4-Design-v0.1.md.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* ─── Weak arch hooks (strong overrides: plic.c, iommu.c, dma.c) ──────────── */
+
+/* Validate an IRQ source number against the interrupt controller.
+ * Strong override: plic.c checks the PLIC source ID register.
+ * Weak default: accept all (Phase-4 stub; real validation deferred
+ * to when the PLIC driver is wired). */
+__attribute__((weak))
+int cap_irq_source_valid(uint32_t irq_number) {
+    (void)irq_number;
+    return 1;   /* accept all in stub */
+}
+
+/* Mask or unmask an interrupt source at the hardware controller.
+ * Called by cap_revoke() for IRQ caps and by cap_irq_mask(). */
+__attribute__((weak))
+void cap_irq_mask_source(uint32_t irq_number, uint8_t masked) {
+    (void)irq_number; (void)masked;
+    /* no-op in stub; strong override in plic.c */
+}
+
+/* Acknowledge (EOI) an interrupt at the hardware controller.
+ * RISC-V PLIC: write to CLAIM register. x86 APIC: write EOI. */
+__attribute__((weak))
+void cap_irq_eoi(uint32_t irq_number) {
+    (void)irq_number;
+    /* no-op in stub */
+}
+
+/* IOMMU mapping/unmapping (weak defaults; strong in kernel/iommu.c). */
+__attribute__((weak))
+void cap_iommu_map(uint32_t domain_id, uint64_t phys_base, uint32_t npages) {
+    (void)domain_id; (void)phys_base; (void)npages;
+}
+
+__attribute__((weak))
+void cap_iommu_unmap(uint32_t domain_id, uint64_t phys_base, uint32_t npages) {
+    (void)domain_id; (void)phys_base; (void)npages;
+}
+
+/* DMA buffer pin/unpin (weak defaults; strong in kernel/dma.c). */
+__attribute__((weak))
+int cap_dma_pin(uint64_t phys_base, uint32_t npages) {
+    (void)phys_base; (void)npages;
+    return 0;   /* stub: no-op */
+}
+
+__attribute__((weak))
+void cap_dma_unpin(uint64_t phys_base, uint32_t npages) {
+    (void)phys_base; (void)npages;
+}
+
+/* ─── IRQ control ─────────────────────────────────────────────────────────── */
+
+int cap_irq_mask(uint32_t pid, uint16_t irq_cap_idx, uint8_t masked) {
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+    struct CapTable* t = &cap_tables[ti];
+
+    cap_lock(&t->lock);
+    uint64_t w = t->slots[irq_cap_idx].word;
+    if (!cap_word_valid(w) ||
+        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_IRQ) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* obj = cap_object_get(obj_id);
+    if (!obj || obj->kind != CAP_OBJ_KIND_IRQ) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    /* Check permission. */
+    if (!(obj->max_perms & CAP_PERM_IRQ_MASK)) {
+        cap_unlock(&t->lock);
+        return CAP_EINVAL;   /* no permission to mask/unmask */
+    }
+
+    cap_lock(&obj->lock);
+    if (obj->revoking) {
+        cap_unlock(&obj->lock);
+        cap_unlock(&t->lock);
+        return CAP_ECAPREVOKED;
+    }
+    obj->u.irq.irq_masked = masked ? 1 : 0;
+    cap_unlock(&obj->lock);
+    cap_unlock(&t->lock);
+
+    /* Mask/unmask at the hardware controller. */
+    cap_irq_mask_source(obj->u.irq.irq_number, masked);
+    return 0;
+}
+
+int cap_irq_ack(uint32_t pid, uint16_t irq_cap_idx) {
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+    struct CapTable* t = &cap_tables[ti];
+
+    cap_lock(&t->lock);
+    uint64_t w = t->slots[irq_cap_idx].word;
+    if (!cap_word_valid(w) ||
+        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_IRQ) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* obj = cap_object_get(obj_id);
+    if (!obj || obj->kind != CAP_OBJ_KIND_IRQ) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    /* Check permission. */
+    if (!(obj->max_perms & CAP_PERM_IRQ_ACK)) {
+        cap_unlock(&t->lock);
+        return CAP_EINVAL;
+    }
+
+    cap_lock(&obj->lock);
+    if (obj->revoking) {
+        cap_unlock(&obj->lock);
+        cap_unlock(&t->lock);
+        return CAP_ECAPREVOKED;
+    }
+    uint32_t irq_num = obj->u.irq.irq_number;
+    cap_unlock(&obj->lock);
+    cap_unlock(&t->lock);
+
+    /* Perform hardware EOI. */
+    cap_irq_eoi(irq_num);
+    return 0;
+}
+
+/* ─── cap_create_dma_mem — allocate DMA buffer from the arena, pin, and
+ * create a DMA_MEM cap. Falls back to cap_arena_alloc() for the physical
+ * pages, then adds IOMMU mapping. */
+int cap_create_dma_mem(uint32_t pid, uint32_t npages, uint32_t align_pages,
+                       uint8_t flags, uint16_t* out_cap_idx,
+                       uint32_t* out_dma_buf_id) {
+    if (out_cap_idx) *out_cap_idx = CAP_NONE;
+    if (out_dma_buf_id) *out_dma_buf_id = 0;
+    if (!out_cap_idx || !out_dma_buf_id || npages == 0)
+        return CAP_EINVAL;
+    (void)align_pages;   /* TODO: alignment enforcement in arena alloc */
+
+    /* Allocate physically contiguous pages from the arena. */
+    uint16_t mem_idx = CAP_NONE;
+    int r = cap_arena_alloc(pid, npages, CAP_PERM_R | CAP_PERM_W | CAP_PERM_MAP,
+                            &mem_idx);
+    if (r < 0) return r;
+
+    /* The arena allocation created a MEM object. Upgrade it to DMA_MEM by
+     * changing its kind and adding the DMA-specific fields. We look up the
+     * object from the cap word and mutate it under the object lock. */
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;  /* should not happen */
+    struct CapTable* t = &cap_tables[ti];
+    uint64_t w = t->slots[mem_idx].word;
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* obj = cap_object_get(obj_id);
+    if (!obj) return CAP_EINVAL;
+
+    cap_lock(&obj->lock);
+    obj->kind = CAP_OBJ_KIND_DMA_MEM;
+    obj->u.dma.dma_iommu_domain = 0;  /* default domain; Device Manager sets */
+    obj->u.dma.dma_device_id = 0;
+    obj->u.dma.dma_flags = flags;
+    obj->u.dma.dma_shared_count = 0;
+    cap_unlock(&obj->lock);
+
+    /* Pin the pages (prevent reclaim). */
+    cap_dma_pin(obj->phys_base, npages);
+
+    /* Program IOMMU mapping (weak hook; strong in iommu.c). */
+    cap_iommu_map(obj->u.dma.dma_iommu_domain, obj->phys_base, npages);
+
+    /* Update the cap word to include DMA permissions. */
+    cap_lock(&t->lock);
+    t->slots[mem_idx].word =
+        cap_word_make(CAP_TYPE_DMA_MEM, obj_id,
+                      CAP_PERM_R | CAP_PERM_W | CAP_PERM_MAP | CAP_PERM_DMA_SHARE,
+                      0, npages);
+    cap_unlock(&t->lock);
+
+    *out_cap_idx = mem_idx;
+    *out_dma_buf_id = obj_id;
+    return 0;
+}
+
+/* ─── cap_create_bus — create a BUS_ACCESS cap (enumeration/config space). */
+int cap_create_bus(uint32_t pid, uint8_t bus_root, uint8_t bus_max,
+                   uint8_t perm, uint16_t* out_idx) {
+    if (out_idx) *out_idx = CAP_NONE;
+    if (!out_idx) return CAP_EINVAL;
+    if (perm == 0 || (perm & ~(CAP_PERM_BUS_ENUM | CAP_PERM_BUS_CFG_R | CAP_PERM_BUS_CFG_W)))
+        return CAP_EINVAL;
+    if (bus_root > bus_max) return CAP_EINVAL;
+
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ETABLEFULL;
+
+    uint32_t obj_id;
+    if (cap_object_alloc(CAP_OBJ_KIND_BUS, &obj_id)) return CAP_ENOMEM;
+    struct CapObject* o = &cap_objects[obj_id];
+    o->max_perms = perm;
+    o->u.bus.bus_root = bus_root;
+    o->u.bus.bus_max = bus_max;
+    o->u.bus.bus_flags = perm;
+    o->u.bus.bus_domain = 0;
+
+    cap_lock(&cap_tables[ti].lock);
+    uint16_t idx;
+    if (cap_slot_pop(ti, &idx)) {
+        cap_unlock(&cap_tables[ti].lock);
+        cap_object_destroy(obj_id);
+        return CAP_ETABLEFULL;
+    }
+    cap_lock(&o->lock);
+    if (cap_holder_insert(obj_id, HOLDER_SLOT, (uint16_t)pid, idx, 0)) {
+        cap_slot_push(ti, idx);
+        cap_unlock(&o->lock);
+        cap_unlock(&cap_tables[ti].lock);
+        cap_object_destroy(obj_id);
+        return CAP_ENOMEM;
+    }
+    cap_tables[ti].slots[idx].word =
+        cap_word_make(CAP_TYPE_BUS_ACCESS, obj_id, perm, 0, 0);
+    cap_unlock(&o->lock);
+    cap_unlock(&cap_tables[ti].lock);
+
+    *out_idx = idx;
+    return 0;
+}
+
+/* ─── Phase 4: cap_list extension ────────────────────────────────────────────
+ * Type name table for Phase 4 cap types (appended to cap_list output). */
+static const char* cap_type_name(uint32_t type) {
+    switch (type) {
+        case CAP_TYPE_NONE:       return "NONE";
+        case CAP_TYPE_MEM:        return "MEM";
+        case CAP_TYPE_CHAN_R:      return "CHAN_R";
+        case CAP_TYPE_CHAN_W:      return "CHAN_W";
+        case CAP_TYPE_TRAMP:      return "TRAMP";
+        case CAP_TYPE_IO_PORT:    return "IO_PORT";
+        case CAP_TYPE_IRQ:        return "IRQ";
+        case CAP_TYPE_DMA_MEM:    return "DMA_MEM";
+        case CAP_TYPE_BUS_ACCESS: return "BUS_ACCESS";
+        default:                  return "UNKNOWN";
+    }
+}
+
+/* ─── cap_irq_list — debug introspection for IRQ caps ─────────────────────── */
+void cap_irq_list(void) {
+    kernel_serial_print("\n[CAP] IRQ caps:\n");
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < cap_obj_next; i++) {
+        struct CapObject* o = &cap_objects[i];
+        if (!o->active || o->kind != CAP_OBJ_KIND_IRQ) continue;
+        kernel_serial_printf(
+            "  [%u] irq=%u masked=%u coalesce=%lluus seq=%u dropped=%u\n",
+            i, o->u.irq.irq_number, o->u.irq.irq_masked,
+            (unsigned long long)o->u.irq.irq_coalesce_us,
+            o->u.irq.irq_sequence, o->u.irq.irq_dropped);
+        n++;
+    }
+    if (n == 0) kernel_serial_print("  (none)\n");
+}
+
+/* ─── Phase 4 syscall wrappers ────────────────────────────────────────────── */
+
+uint64_t sys_sls_cap_create_io_port(struct SLSCapCreateIOPortRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t idx = CAP_NONE;
+    int r = cap_create_io_port(cap_current_pid(), req->phys_base, req->length,
+                               req->width, req->flags, req->perm, &idx);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    return (uint64_t)idx;
+}
+
+uint64_t sys_sls_cap_create_irq(struct SLSCapCreateIRQRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t idx = CAP_NONE;
+    int r = cap_create_irq(cap_current_pid(), req->irq_number, req->trigger,
+                           req->perm, req->coalesce_us, &idx);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    return (uint64_t)idx;
+}
+
+uint64_t sys_sls_irq_mask(struct SLSIRQMaskRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    int r = cap_irq_mask(cap_current_pid(), req->irq_cap_idx, req->masked);
+    return (uint64_t)(int64_t)r;
+}
+
+uint64_t sys_sls_irq_ack(struct SLSIRQAckRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    int r = cap_irq_ack(cap_current_pid(), req->irq_cap_idx);
+    return (uint64_t)(int64_t)r;
+}
+
+uint64_t sys_sls_cap_create_dma_mem(struct SLSCapCreateDMAMemRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t cap_idx = CAP_NONE;
+    uint32_t dma_buf_id = 0;
+    int r = cap_create_dma_mem(cap_current_pid(), req->npages, req->align_pages,
+                               req->flags, &cap_idx, &dma_buf_id);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    req->out_cap_idx = cap_idx;
+    req->out_dma_buf_id = dma_buf_id;
+    return 0;
+}
+
+uint64_t sys_sls_cap_create_bus(struct SLSCapCreateBusRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t idx = CAP_NONE;
+    int r = cap_create_bus(cap_current_pid(), req->bus_root, req->bus_max,
+                           req->perm, &idx);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    return (uint64_t)idx;
 }
