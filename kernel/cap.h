@@ -301,6 +301,17 @@ extern struct CapTable cap_tables[CAP_TABLE_MAX];   /* defined in cap.c */
 #define SYS_SLS_CAP_CREATE_DMA_MEM   312
 #define SYS_SLS_CAP_CREATE_BUS       313
 
+/* ─── Phase 4: DMA buffer allocator syscalls (314-320 — next free after
+ * SYS_SLS_CAP_CREATE_BUS = 313; confirmed via grep across every kernel
+ * header defining SYS_SLS_*) ────────────────────────────────────────── */
+#define SYS_SLS_DMA_ALLOC          314
+#define SYS_SLS_DMA_FREE           315
+#define SYS_SLS_DMA_SHARE          316
+#define SYS_SLS_DMA_PIN            317
+#define SYS_SLS_DMA_UNPIN          318
+#define SYS_SLS_DMA_IOMMU_MAP      319
+#define SYS_SLS_DMA_IOMMU_UNMAP    320
+
 /* ─── Phase 4: IRQ message format ─────────────────────────────────────────
  * Hardware interrupts are translated into fixed-format channel messages.
  * The kernel writes these into the IRQ channel; the driver reads them via

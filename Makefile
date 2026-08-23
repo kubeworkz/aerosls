@@ -158,6 +158,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               net/net.c net/arp.c net/ipv4.c net/tcp.c net/tcp_quota.c net/http.c net/http_rate_limit.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
               net/ollama_client.c \
               kernel/process.c arch/x86/user_paging.c kernel/cap.c \
+              kernel/dma.c \
               kernel/partition.c \
               kernel/boot_params.c kernel/node_reset.c \
               kernel/console.c \

@@ -32,6 +32,7 @@
 #include "usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- SYS_SLS_USAGE_REPORT
 #include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
+#include "dma.h"            // Phase 4 -- DMA buffer allocator syscalls (314-320)
 
 // ─── spawn owner-uid resolution ──────────────────────────────────────────────
 // The owner_uid threaded into program_spawn*()/program_load()/sys_sls_load()
@@ -578,6 +579,43 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_trampoline_create((struct SLSTrampolineCreateRequest*)arg);
     case SYS_SLS_TRAMPOLINE_CALL:
         return sys_sls_trampoline_call((struct SLSTrampolineCallRequest*)arg);
+
+    // ─── Phase 4: device driver SDK capabilities (307-313) ─────────────
+    case SYS_SLS_CAP_CREATE_IO_PORT:
+        return sys_sls_cap_create_io_port((struct SLSCapCreateIOPortRequest*)arg);
+    case SYS_SLS_CAP_CREATE_IRQ:
+        return sys_sls_cap_create_irq((struct SLSCapCreateIRQRequest*)arg);
+    case SYS_SLS_IRQ_MASK:
+        return sys_sls_irq_mask((struct SLSIRQMaskRequest*)arg);
+    case SYS_SLS_IRQ_UNMASK: {
+        struct SLSIRQMaskRequest mr;
+        mr.irq_cap_idx = ((struct SLSIRQMaskRequest*)arg)->irq_cap_idx;
+        mr.masked = 0;
+        mr._pad = 0;
+        return sys_sls_irq_mask(&mr);
+    }
+    case SYS_SLS_IRQ_ACK:
+        return sys_sls_irq_ack((struct SLSIRQAckRequest*)arg);
+    case SYS_SLS_CAP_CREATE_DMA_MEM:
+        return sys_sls_cap_create_dma_mem((struct SLSCapCreateDMAMemRequest*)arg);
+    case SYS_SLS_CAP_CREATE_BUS:
+        return sys_sls_cap_create_bus((struct SLSCapCreateBusRequest*)arg);
+
+    // ─── Phase 4: DMA buffer allocator (314-320) ──────────────────────
+    case SYS_SLS_DMA_ALLOC:
+        return sys_sls_dma_alloc((struct SLSDMAAllocRequest*)arg);
+    case SYS_SLS_DMA_FREE:
+        return sys_sls_dma_free((struct SLSDMAFreeRequest*)arg);
+    case SYS_SLS_DMA_SHARE:
+        return sys_sls_dma_share((struct SLSDMAShareRequest*)arg);
+    case SYS_SLS_DMA_PIN:
+        return sys_sls_dma_pin((struct SLSDMAPinRequest*)arg);
+    case SYS_SLS_DMA_UNPIN:
+        return sys_sls_dma_unpin((struct SLSDMAPinRequest*)arg);
+    case SYS_SLS_DMA_IOMMU_MAP:
+        return sys_sls_dma_iommu_map((struct SLSDMAIOMMUMapRequest*)arg);
+    case SYS_SLS_DMA_IOMMU_UNMAP:
+        return sys_sls_dma_iommu_unmap((struct SLSDMAIOMMUMapRequest*)arg);
 
     default:
         return 0;

@@ -17,6 +17,7 @@ int  sls_tls_time_init(void);
 #include "process.h"
 #include "frame_pool.h"
 #include "cap.h"   // Seed Kernel Phase 1 -- cap_init() after the RAM top is bounded
+#include "dma.h"   // Phase 4 -- DMA buffer pool, carved after cap arena
 #include "qemu_sls_mmu.h"
 #include "qemu_sls_tcache.h"
 #include "qemu_sls_pgo.h"
@@ -185,6 +186,9 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // free run, and scanning before the top bound is set would happily
     // pick memory the machine does not have. Before any process can spawn.
     cap_init();
+
+    // Phase 4: DMA buffer pool — carved from frame pool after cap arena.
+    dma_init();
 
     // ── 2c. QEMU-SLS Phase 1: shadow page table subsystem ─────────────────
     qemu_sls_mmu_init();
