@@ -22,7 +22,7 @@ use polyglot::ring::{self, Ring};
 use polyglot::transport::*;
 use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 #[path = "../gen_calculator.rs"]
@@ -76,10 +76,13 @@ static RING6: Mutex<Option<Ring>> = Mutex::new(None);
 static RING7: Mutex<Option<Ring>> = Mutex::new(None);
 /// True when the message path goes through the shared ring instead of TCP.
 static RING_MODE: AtomicBool = AtomicBool::new(false);
-/// Set when the async result (T13/T14) was received AND verified on the
-/// dedicated result ring. Guards against the async section being silently
-/// skipped (e.g. a broken transport probe) while the guest still exits 0.
-static ASYNC_RESULT_OK: AtomicBool = AtomicBool::new(false);
+/// Count of async results (T13/T14) received AND verified on the dedicated
+/// result ring. Guards against the async section being silently skipped
+/// (e.g. a broken transport probe) while the guest still exits 0: the
+/// verdict requires BOTH the small (64 f64s -> 2016) and the 1 MiB
+/// (131072 f64s -> 4128768) heavy_reduce results to verify, so a tooth
+/// that corrupts either variant's expected value makes the leg fail.
+static ASYNC_RESULTS_VERIFIED: AtomicU32 = AtomicU32::new(0);
 /// T4-T8 payload-size sweep samples, bucketed by size index (6 sizes:
 /// 4KiB, 16KiB, 64KiB, 256KiB, 1MiB, 8MiB). One inner Vec per bucket,
 /// filled by call_sqrt_sweep / call_str_sweep; the report prints a
@@ -840,19 +843,20 @@ fn main() {
         .func_wrap(
             "host",
             "await_async_result",
-            |_caller: wasmi::Caller<'_, ()>| -> i64 {
+            |_caller: wasmi::Caller<'_, ()>, expected: i32| -> i64 {
                 // Block on the dedicated result ring until the async result
                 // arrives, then parse the 303-reply body: ok@0, u32 value@4..8.
+                // The guest passes the expected sum for the variant it ran
+                // (T13: 2016, T14: 4128768), so a verified await implies the
+                // worker's result was correct AND the right variant ran.
                 let body = RING7.lock().unwrap().as_ref().expect("ring7 open").recv().expect("async result recv");
                 if body.len() < 22 {
                     return pack(1, 1);
                 }
                 let ok = body[18];
                 let val = u32::from_le_bytes(body[22..26].try_into().unwrap_or([0; 4]));
-                // sum(0..63) = 2016: the guest verifies the same constant, so
-                // a successful await implies the worker's result was correct.
-                if ok == 1 && val == 2016 {
-                    ASYNC_RESULT_OK.store(true, Ordering::SeqCst);
+                if ok == 1 && val == expected as u32 {
+                    ASYNC_RESULTS_VERIFIED.fetch_add(1, Ordering::SeqCst);
                 }
                 pack(if ok == 1 { 0 } else { 1 }, val as u64)
             },
@@ -941,18 +945,22 @@ fn main() {
     if status == 0 {
         println!("WASM_SIDECAR PASS");
         // T13/T14 async verdict: on the shm leg the guest MUST have run the
-        // heavy_reduce async section (transport probe true) and received the
-        // verified result off the dedicated result ring. The wasm-side flag
-        // is set only by a successful await_async_result, so a skipped or
-        // failed async path cannot exit 0 silently. Printed after
-        // WASM_SIDECAR so CI logs show both lines; the exit code is what
-        // the e2e gates on.
+        // heavy_reduce async section (transport probe true) and received BOTH
+        // verified results off the dedicated result ring — the small variant
+        // (64 f64s -> 2016) and the 1 MiB variant (131072 f64s -> 4128768).
+        // The count is incremented only by a successful await_async_result
+        // with the right expected sum, so a skipped or failed async path
+        // cannot exit 0 silently. Printed after WASM_SIDECAR so CI logs show
+        // both lines; the exit code is what the e2e gates on.
         if ring_mode() {
-            if ASYNC_RESULT_OK.load(Ordering::SeqCst) {
-                println!("ASYNC_SIDECAR PASS: heavy_reduce result received+verified on result ring");
+            if ASYNC_RESULTS_VERIFIED.load(Ordering::SeqCst) >= 2 {
+                println!("ASYNC_SIDECAR PASS: both heavy_reduce results (T13 + T14) received+verified on result ring");
                 std::process::exit(0);
             } else {
-                println!("ASYNC_SIDECAR FAIL: async result never received/verified");
+                println!(
+                    "ASYNC_SIDECAR FAIL: async results never received/verified (verified={})",
+                    ASYNC_RESULTS_VERIFIED.load(Ordering::SeqCst)
+                );
                 std::process::exit(1);
             }
         }

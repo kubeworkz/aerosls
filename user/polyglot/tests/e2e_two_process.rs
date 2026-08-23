@@ -266,9 +266,10 @@ fn run_leg(
         return Err(format!("wasm-sidecar failed: {wasm_line} (exit {status})"));
     }
     // T13/T14 async gate: on the shared-ring leg the guest MUST have run the
-    // heavy_reduce async section and received the verified result off the
-    // dedicated result ring. The sidecar prints ASYNC_SIDECAR only on shm;
-    // on tcp there is no result ring (async is skipped there by design).
+    // heavy_reduce async section and received BOTH verified results (the
+    // small 64-f64 variant and the 1 MiB variant) off the dedicated result
+    // ring. The sidecar prints ASYNC_SIDECAR only on shm; on tcp there is no
+    // result ring (async is skipped there by design).
     if transport == "shm" {
         let Some(async_line) = async_line else {
             kill_child(&mut lisp);
@@ -278,7 +279,7 @@ fn run_leg(
             kill_child(&mut lisp);
             return Err(format!("shm leg async gate failed: {async_line}"));
         }
-        eprintln!("[gate] ASYNC_SIDECAR: heavy_reduce result received+verified on result ring (shm) — OK");
+        eprintln!("[gate] ASYNC_SIDECAR: both heavy_reduce results (T13 + T14, up to 1 MiB) received+verified on result ring (shm) — OK");
     } else {
         eprintln!("[gate] ASYNC_SIDECAR skipped on tcp (no result ring by design) — OK");
     }

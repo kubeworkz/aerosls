@@ -590,31 +590,34 @@ touch "$SIDECAR"
 
 # ─── twelfth tooth: the async (T13/T14) result gate ───────────────────────
 # The e2e now gates the async heavy_reduce path: on the shm leg the guest
-# sends NO_REPLY, gets the ACK, and awaits the real result off the dedicated
-# result ring (ring7); the wasm-sidecar sets ASYNC_RESULT_OK only when the
-# worker's sum(0..63)=2016 comes back verified, and prints ASYNC_SIDECAR
-# FAIL + exits 1 otherwise — so a silently-skipped or broken async path
-# cannot pass the leg. This tooth corrupts the expected result constant so
-# the verification can never succeed, and requires the shm leg's async gate
-# to fail (tcp has no result ring by design — the guest skips async there,
-# so the tcp leg must still pass).
+# sends NO_REPLY, gets the ACK, and awaits the real results off the dedicated
+# result ring (ring7) — BOTH the small variant (64 f64s, sum 2016) and the
+# 1 MiB variant (131072 f64s, sum 4128768). The wasm-sidecar increments
+# ASYNC_RESULTS_VERIFIED only when a result matches the expected sum the
+# guest passed to await_async_result, and prints ASYNC_SIDECAR FAIL + exits
+# 1 unless BOTH verified — so a silently-skipped or broken async path cannot
+# pass the leg. This tooth flips the host verification to ok==2 (which the
+# Lisp worker never sends), so no result can ever verify and the shm leg's
+# async gate must fail (tcp has no result ring by design — the guest skips
+# async there, so the tcp leg must still pass).
 echo
-echo "=== tooth: corrupt the async result constant; the shm async gate must fail ==="
+echo "=== tooth: corrupt the async verification; the shm async gate must fail ==="
 SNAP_SIDECAR2="${SIDECAR}.smoke2.bak"
 cp "$SIDECAR" "$SNAP_SIDECAR2" || { bad "cannot snapshot $SIDECAR (2nd)"; exit 1; }
 trap "mv -f \"$SNAP_SIDECAR2\" \"$SIDECAR\" 2>/dev/null; mv -f \"$SNAP_SIDECAR\" \"$SIDECAR\" 2>/dev/null; rm -f \"$SNAP_SIDECAR\" \"$SNAP_SIDECAR2\"" EXIT
 
-# (l) the wasm-side verification: sum(0..63) = 2016. Corrupt it to 2017 so
-# ASYNC_RESULT_OK can never store true and the shm leg must fail.
-sed -i 's@if ok == 1 && val == 2016 {@if ok == 1 \&\& val == 2017 {@' "$SIDECAR"
+# (l) the wasm-side verification: ok==1 means the Lisp worker succeeded. Flip
+# it to ok==2 (never sent) so no async result can ever verify and the shm
+# leg must fail.
+sed -i 's@if ok == 1 && val == expected as u32 {@if ok == 2 \&\& val == expected as u32 {@' "$SIDECAR"
 
 if cmp -s "$SIDECAR" "$SNAP_SIDECAR2"; then
-    bad "tooth: the async-constant mutation did not apply — the verification pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    bad "tooth: the async-verification mutation did not apply — the verification pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
     mv -f "$SNAP_SIDECAR2" "$SIDECAR"
     trap - EXIT
     echo; echo "---- passed=$pass failed=$fail"; exit 1
 fi
-ok "tooth: async-constant mutation applied (expected 2016 -> 2017 — the verification can never succeed)"
+ok "tooth: async-verification mutation applied (ok==1 -> ok==2 — no async result can ever verify)"
 
 if ! build_sidecars; then
     bad "tooth: the mutated sidecar does not build"
@@ -775,6 +778,54 @@ fi
 mv -f "$SNAP_SIDECAR3" "$SIDECAR"
 trap - EXIT
 touch "$SIDECAR"
+
+# ─── sixteenth tooth: the 1 MiB async (T14) result gate ───────────────────
+# The async gate now requires BOTH heavy_reduce results to verify — the
+# small 64-f64 variant (sum 2016) AND the 1 MiB variant (131072 f64s, sum
+# 4128768) — and the sidecar increments ASYNC_RESULTS_VERIFIED only when a
+# result matches the expected sum the guest passed. The twelfth tooth flips
+# the host check (ok==2), which kills BOTH variants; this tooth isolates
+# the 1 MiB variant specifically: it corrupts the guest's T14 expected sum
+# (4128768 -> 4128769) so the host can never verify the 1 MiB result and
+# the counter can never reach 2. The small variant still verifies, so the
+# guest itself exits 0 — only the >=2 async counter catches it.
+echo
+echo "=== tooth: corrupt the guest's T14 expected sum; the shm async gate must fail ==="
+SNAP_GUEST3="${GUEST}.smoke3.bak"
+cp "$GUEST" "$SNAP_GUEST3" || { bad "cannot snapshot $GUEST (3rd)"; exit 1; }
+trap "mv -f \"$SNAP_GUEST3\" \"$GUEST\" 2>/dev/null; mv -f \"$SNAP_GUEST2\" \"$GUEST\" 2>/dev/null; mv -f \"$SNAP_GUEST\" \"$GUEST\" 2>/dev/null; rm -f \"$SNAP_GUEST\" \"$SNAP_GUEST2\" \"$SNAP_GUEST3\"" EXIT
+
+# (p) the guest's T14 await passes expected=4128768; corrupt it to 4128769
+# so the host's val == expected check can never fire for the 1 MiB result.
+sed -i 's@(call $await_async_result (i32.const 4128768))@(call $await_async_result (i32.const 4128769))@' "$GUEST"
+
+if cmp -s "$GUEST" "$SNAP_GUEST3"; then
+    bad "tooth: the T14-expected mutation did not apply — the await pattern no longer matches, so this smoke is testing nothing. Fix the pattern."
+    mv -f "$SNAP_GUEST3" "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+ok "tooth: T14-expected mutation applied (4128768 -> 4128769 — the 1 MiB result can never verify)"
+
+if ! build_sidecars; then
+    bad "tooth: the mutated guest does not build — the mutation is invalid, not a gate check. Fix the tooth."
+    mv -f "$SNAP_GUEST3" "$GUEST"
+    trap - EXIT
+    echo; echo "---- passed=$pass failed=$fail"; exit 1
+fi
+
+out="$(run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the e2e did NOT fail on the corrupted T14 expected sum — the shm async gate is blind to the 1 MiB variant."
+    printf '%s\n' "$out" | grep -E 'ASYNC|WASM_SIDECAR|panicked' | sed 's/^/        /'
+else
+    ok "tooth: the e2e failed as required (shm async gate caught the unverifiable 1 MiB result — ASYNC_SIDECAR FAIL)"
+fi
+
+# ─── restore byte-identically (6th) ────────────────────────────────────────
+mv -f "$SNAP_GUEST3" "$GUEST"
+trap - EXIT
+touch "$GUEST"
 
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="

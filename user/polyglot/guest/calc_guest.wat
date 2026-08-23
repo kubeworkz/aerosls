@@ -37,7 +37,7 @@
   (import "host" "call_reverse" (func $call_reverse (param i32 i32) (result i64)))
   (import "host" "call_str_sweep" (func $call_str_sweep (param i32 i32 i32) (result i64)))
   (import "host" "call_heavy_reduce" (func $call_heavy_reduce (param i32 i32) (result i64)))
-  (import "host" "await_async_result" (func $await_async_result (result i64)))
+  (import "host" "await_async_result" (func $await_async_result (param i32) (result i64)))
   (import "host" "is_shm" (func $is_shm (result i32)))
   (import "host" "write_f64" (func $write_f64 (param i32 i32 i64)))
   (import "host" "read_f64" (func $read_f64 (param i32 i32) (result i64)))
@@ -408,11 +408,11 @@
     ;; Fire-and-forget send (NO_REPLY), immediate ACK, then the real result
     ;; arrives later on the dedicated result channel. Only the shared-ring
     ;; transport has a dedicated result ring; on tcp the ring is not
-    ;; provisioned, so skip (the shm leg exercises the full path). Fill N=64
-    ;; f64s with i; the worker sums them -> sum(0..63) = 2016 (u32).
-    ;; (in_cap was already released above with out_cap — do NOT free again)
+    ;; provisioned, so skip (the shm leg exercises the full path).
     (if (i32.eqz (call $is_shm))
       (then (return (i32.const 0))))
+
+    ;; T13: 64 f64s filled with i -> sum(0..63) = 2016 (u32).
     (local.set $n (i32.const 64))
     (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
     (if (i32.eqz (local.get $in_cap))
@@ -435,8 +435,10 @@
     (if (i32.ne (local.get $status) (i32.const 0))
       (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 11))))
 
-    ;; 2. block on the result channel until the async result arrives
-    (local.set $r2 (call $await_async_result))
+    ;; 2. block on the result channel until the async result arrives. The
+    ;; expected sum (2016) is passed so the host can verify WHICH variant
+    ;; produced the result.
+    (local.set $r2 (call $await_async_result (i32.const 2016)))
     (local.set $status
       (i32.wrap_i64 (i64.shr_u (local.get $r2) (i64.const 32))))
     (if (i32.ne (local.get $status) (i32.const 0))
@@ -444,6 +446,43 @@
     (local.set $v (f64.convert_i32_u (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff)))))
     (if (f64.ne (local.get $v) (f64.const 2016))
       (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 13))))
+
+    (call $arena_free (local.get $in_cap))
+
+    ;; T14: 1 MiB variant — 131072 f64s filled with (i mod 64); the worker
+    ;; sums them -> 2048 cycles x sum(0..63) = 2048 x 2016 = 4128768 (u32).
+    ;; Same NO_REPLY send + ACK + result-channel await, now at the design
+    ;; doc's 1 MiB async payload.
+    (local.set $n (i32.const 131072))
+    (local.set $in_cap (call $arena_alloc (i32.mul (local.get $n) (i32.const 8))))
+    (if (i32.eqz (local.get $in_cap))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 21))))
+    (local.set $i (i32.const 0))
+    (block $async_fill2_done
+      (loop $async_fill2
+        (br_if $async_fill2_done (i32.ge_u (local.get $i) (local.get $n)))
+        (call $write_f64
+          (local.get $in_cap)
+          (local.get $i)
+          (i64.reinterpret_f64
+            (f64.convert_i32_u (i32.rem_u (local.get $i) (i32.const 64)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $async_fill2)))
+
+    (local.set $r2 (call $call_heavy_reduce (local.get $in_cap) (local.get $n)))
+    (local.set $status
+      (i32.wrap_i64 (i64.shr_u (local.get $r2) (i64.const 32))))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 22))))
+
+    (local.set $r2 (call $await_async_result (i32.const 4128768)))
+    (local.set $status
+      (i32.wrap_i64 (i64.shr_u (local.get $r2) (i64.const 32))))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 23))))
+    (local.set $v (f64.convert_i32_u (i32.wrap_i64 (i64.and (local.get $r2) (i64.const 0xffffffff)))))
+    (if (f64.ne (local.get $v) (f64.const 4128768))
+      (then (call $log (i32.const 272) (i32.const 10)) (return (i32.const 24))))
 
     (call $arena_free (local.get $in_cap))
 
