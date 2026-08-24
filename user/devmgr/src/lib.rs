@@ -17,10 +17,12 @@ use aerosls_proto::kabi::{Kernel, ERR_OK};
 pub mod pci;
 pub mod manifest;
 pub mod device;
+pub mod recovery;
 
 pub use pci::{PciDevice, PciBar, PciClass};
 pub use manifest::{DriverManifest, MatchResult};
 pub use device::{DeviceState, DeviceEvent, DeviceEntry};
+pub use recovery::{RecoveryManager, RecoveryConfig, CrashReason, RecoveryEvent};
 
 /// Maximum number of devices tracked by the Device Manager.
 pub const MAX_DEVICES: usize = 64;
@@ -230,11 +232,64 @@ impl<'a, K: Kernel> DeviceManager<'a, K> {
         );
     }
 
+    /// Handle a driver crash for a tracked device.
+    /// Performs quarantine (mask IRQs, revoke caps, notify clients)
+    /// and transitions the device to FAILED state.
+    pub fn on_driver_crashed(&mut self, device_idx: usize, reason: CrashReason, exit_code: u32, now_ns: u64) {
+        if device_idx >= self.devices.len() {
+            return;
+        }
+
+        // 1. Quarantine: mask IRQs, revoke caps
+        recovery::quarantine_driver(self.kernel, &mut self.devices[device_idx]);
+
+        // 2. Notify clients
+        self.notify_clients(
+            opcode::EVT_DRIVER_FAILED,
+            device_idx,
+            &[reason as u32, exit_code],
+        );
+
+        // 3. Transition to FAILED
+        self.devices[device_idx].transition(
+            DeviceEvent::DriverCrashed(exit_code),
+            now_ns,
+        );
+
+        // 4. Compute backoff for retry
+        self.devices[device_idx].backoff_ns = self.compute_backoff(
+            self.devices[device_idx].crash_count,
+        );
+    }
+
+    /// Handle a device removed event (hotplug).
+    pub fn on_device_removed(&mut self, device_idx: usize, now_ns: u64) {
+        if device_idx >= self.devices.len() {
+            return;
+        }
+
+        // 1. Mask IRQs (via cap revoke)
+        recovery::quarantine_driver(self.kernel, &mut self.devices[device_idx]);
+
+        // 2. Notify clients
+        self.notify_clients(
+            opcode::EVT_DEVICE_REMOVED,
+            device_idx,
+            &[],
+        );
+
+        // 3. Transition to REMOVED_WAIT
+        self.devices[device_idx].transition(
+            DeviceEvent::DeviceRemoved,
+            now_ns,
+        );
+    }
+
     /// Compute exponential backoff with jitter.
-    fn compute_backoff(&self, attempt: u32) -> u64 {
+    pub fn compute_backoff(&self, attempt: u32) -> u64 {
         let base_ns: u64 = 100_000_000; // 100ms
         let max_ns: u64 = 5_000_000_000; // 5s
-        let shift = core::cmp::min(attempt - 1, 16);
+        let shift = core::cmp::min(attempt.saturating_sub(1), 16);
         let backoff = core::cmp::min(base_ns << shift, max_ns);
         // Simple jitter: add up to 25% of the backoff
         let jitter = backoff / 4;

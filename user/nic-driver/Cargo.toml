@@ -1,0 +1,16 @@
+[package]
+name = "aerosls-nic-driver"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS NIC driver sidecar — e1000/virtio-net lifecycle, RX/TX rings, zero-copy to network stack"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+[features]
+default = []
+target = ["aerosls-proto/target"]
