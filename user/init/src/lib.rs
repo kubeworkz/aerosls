@@ -17,8 +17,10 @@
 //! - `devreg`     — device registry parser (reads the kernel-populated table).
 //! - `chan`       — thin channel helpers over the `Kernel` trait.
 //! - `demo`       — the demo server loop: blocking wait/send + the finite-
-//!                 deadline Device Manager handshake (the Phase 5
-//!                 "real sidecar workload" proof).
+//!                 deadline Device Manager handshake, plus the watchdog
+//!                 respawn (bounded backoff, crash-loop breaker) that
+//!                 self-heals a dead DM (the Phase 5 "real sidecar
+//!                 workload" proof).
 //! - `entry`      — the `extern "C"` entry point (feature `target`).
 //! - `sim`        — host-side fake kernel for testing.
 

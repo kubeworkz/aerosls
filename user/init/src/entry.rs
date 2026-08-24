@@ -229,16 +229,49 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
 
-    // ── 9. The demo server loop ───────────────────────────────────────────
+    // ── 9. The demo server loop (watchdog) ────────────────────────────────
     // Blocking k_chan_wait (TIMEOUT_NONE) on the Device Manager channel:
     // this sidecar parks (cap_wait_chans) until the DM queues a message or
     // a control event, and a wake re-runs the wait to return it. Console
-    // output inside the loop uses blocking sends (timeout 0). The loop
-    // exits only when the DM channel closes — a real init would respawn
-    // the DM from here; this demo parks forever instead.
-    log(&console, "[INIT] entering the event loop (blocking wait on the Device Manager channel)...");
-    match demo::run_event_loop(&console, &dm_channel) {
-        Ok(()) => log(&console, "[INIT] event loop exited: Device Manager channel closed."),
+    // output inside the loop uses blocking sends (timeout 0).
+    //
+    // Self-healing: when the DM channel closes (CLOSE_PEER_DEAD from the
+    // teardown scan, or an explicit close), the watchdog sleeps a bounded
+    // backoff (the deadline-wait-as-sleep trick: park on the dead channel
+    // with a finite deadline, the timer ISR wakes us, the re-run returns
+    // ERR_TIMEOUT), respawns a fresh DM, re-runs the registry handshake,
+    // and re-enters the loop on the new channel. The restart budget is
+    // bounded — a crash-looping DM makes the loop give up (crash-loop
+    // breaker) instead of respawning forever.
+    log(&console, "[INIT] entering the event loop (blocking wait + watchdog respawn)...");
+    let policy = demo::RespawnPolicy::default();
+    let respawn = |attempt: u32| -> Result<InitChannel<RealKernel>, ChannelError> {
+        log_fmt!(
+            &console,
+            "[INIT] Device Manager died; respawning (restart {}, backoff {} ns)...",
+            attempt,
+            policy.backoff_for(attempt),
+        );
+        let dm = spawn_device_manager(&console, spawn_cap.slot);
+        // Re-run the registry handshake against the fresh DM: blocking
+        // send (timeout 0 — a full queue parks us), then the
+        // finite-deadline wait for "devices ready".
+        demo::send_registry(&dm, MSG_DEVICE_REGISTRY, &payload, &devreg_send_cap)?;
+        let mut rb = [0u8; 256];
+        match demo::wait_devices_ready(&dm, &mut rb, DM_READY_DEADLINE_NS) {
+            Ok(()) => log(&console, "[INIT] respawned DM signalled ready."),
+            Err(ChannelError::Timeout) => {
+                log(&console, "[INIT] respawned DM not ready yet; serving anyway.")
+            }
+            Err(e) => log_fmt!(&console, "[INIT] respawn handshake failed: {}", e),
+        }
+        Ok(dm)
+    };
+    match demo::run_resilient_loop(&console, dm_channel, &policy, respawn) {
+        Ok(()) => log(&console, "[INIT] event loop exited."),
+        Err(ChannelError::TooManyRestarts) => {
+            log(&console, "[INIT] Device Manager crash-looped; giving up respawns.")
+        }
         Err(e) => log_fmt!(&console, "[INIT] event loop error: {}", e),
     }
     loop {

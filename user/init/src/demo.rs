@@ -16,6 +16,12 @@
 //!   parked wait when the deadline passes and the re-run returns
 //!   CAP_ERR_TIMEOUT, so a wedged DM is handled by the deadline + bounded
 //!   retries instead of unbounded blocking.
+//! - **Watchdog respawn (self-healing)** — when the DM channel closes
+//!   (`CLOSE_PEER_DEAD` from the teardown scan, or an explicit close),
+//!   `run_resilient_loop` sleeps a bounded backoff (`RespawnPolicy`:
+//!   base × 2^(n−1), capped) using the deadline-wait-as-sleep trick, then
+//!   respawns a fresh DM and re-enters the loop on the new channel. The
+//!   restart budget is bounded (crash-loop breaker: `TooManyRestarts`).
 //!
 //! The whole module is generic over `Kernel`, so the exact same code runs
 //! against `RealKernel` on the real machine (via `entry.rs`) and against
@@ -136,13 +142,97 @@ pub fn run_event_loop<K: Kernel>(
     }
 }
 
+/// Bounded-restart policy for the Device Manager watchdog (crash-loop
+/// breaker): each death costs `backoff_for(restart)` ns of sleep before a
+/// respawn, and after `max_restarts` consecutive deaths the loop gives up
+/// with `ChannelError::TooManyRestarts` instead of spinning forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RespawnPolicy {
+    /// First backoff delay (ns), doubled per restart.
+    pub base_backoff_ns: u64,
+    /// Backoff cap (ns) — exponential growth saturates here.
+    pub max_backoff_ns: u64,
+    /// Restart budget before the loop returns `TooManyRestarts`.
+    pub max_restarts: u32,
+}
+
+impl Default for RespawnPolicy {
+    fn default() -> Self {
+        Self {
+            base_backoff_ns: 100_000_000,  // 100 ms
+            max_backoff_ns: 5_000_000_000, // 5 s cap
+            max_restarts: 5,
+        }
+    }
+}
+
+impl RespawnPolicy {
+    /// The backoff delay for the `restart`-th respawn (1-based):
+    /// base × 2^(restart-1), saturating at `max_backoff_ns`. A crash loop
+    /// therefore ramps 100 ms → 200 ms → 400 ms → … → 5 s, never more.
+    pub fn backoff_for(&self, restart: u32) -> u64 {
+        if restart == 0 {
+            return self.base_backoff_ns;
+        }
+        let shift = (restart - 1).min(62);
+        self.base_backoff_ns
+            .saturating_mul(1u64 << shift)
+            .min(self.max_backoff_ns)
+    }
+}
+
+/// Sleep `ns` before a respawn. There is no sleep syscall: the kernel parks
+/// this sidecar on the DEAD peer's channel with the finite deadline (the
+/// close event was already consumed, so nothing is ready), and the timer
+/// ISR wakes the park when the deadline passes — the re-run then returns
+/// ERR_TIMEOUT. In the host sim, a finite deadline with nothing ready is
+/// ERR_TIMEOUT immediately, so tests do not actually wait.
+pub fn backoff_sleep<K: Kernel>(dm: &InitChannel<K>, ns: u64) {
+    let _ = dm.kernel().wait(&mut [dm.handle], ns);
+}
+
+/// The watchdog-respawned demo loop — the self-healing path (Phase 5
+/// reliability): block (TIMEOUT_NONE park) on the Device Manager channel;
+/// when the DM dies (`CLOSE_PEER_DEAD` from the teardown scan, or an
+/// explicit close), sleep the bounded backoff, respawn a fresh DM via
+/// `respawn(restart)`, and re-enter the loop on the new channel. When the
+/// restart budget is exhausted the loop returns `TooManyRestarts` — the
+/// crash-loop breaker.
+pub fn run_resilient_loop<K: Kernel, F>(
+    console: &InitChannel<K>,
+    mut dm: InitChannel<K>,
+    policy: &RespawnPolicy,
+    mut respawn: F,
+) -> Result<(), ChannelError>
+where
+    F: FnMut(u32) -> Result<InitChannel<K>, ChannelError>,
+{
+    let mut buf = [0u8; 128];
+    let mut restarts: u32 = 0;
+    loop {
+        match dispatch_event(console, &dm, &mut buf) {
+            EventOutcome::Continue => {}
+            EventOutcome::Closed(_reason, _detail) => {
+                if restarts >= policy.max_restarts {
+                    return Err(ChannelError::TooManyRestarts);
+                }
+                backoff_sleep(&dm, policy.backoff_for(restarts + 1));
+                dm = respawn(restarts + 1)?;
+                restarts += 1;
+            }
+            EventOutcome::Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chan::MSG_DEVICE_REGISTRY;
     use crate::sim::{SharedKernel, SimKernel};
     use aerosls_proto::kabi::{CapInfo, CAP_CHAN};
-    use aerosls_proto::CLOSE_PEER_DEAD;
+    use aerosls_proto::{CH_KIND_NONE, CLOSE_PEER_DEAD};
+    use alloc::vec::Vec;
 
     /// Build a shared sim with CHAN caps registered on the given handles
     /// (the kernel would mint these from the manifest's CHAN records; the
@@ -283,5 +373,94 @@ mod tests {
             wait_devices_ready(&dm, &mut buf, DM_READY_DEADLINE_NS),
             Err(ChannelError::UnexpectedTag(0xDEAD))
         );
+    }
+
+    #[test]
+    fn backoff_policy_doubles_and_caps() {
+        // base 10 ns, cap 40 ns: 1→10, 2→20, 3→40, 4→40 (saturated).
+        let p = RespawnPolicy {
+            base_backoff_ns: 10,
+            max_backoff_ns: 40,
+            max_restarts: 5,
+        };
+        assert_eq!(p.backoff_for(1), 10);
+        assert_eq!(p.backoff_for(2), 20);
+        assert_eq!(p.backoff_for(3), 40);
+        assert_eq!(p.backoff_for(4), 40);
+        // Never wraps even at absurd restart counts.
+        assert_eq!(p.backoff_for(u32::MAX), 40);
+    }
+
+    #[test]
+    fn resilient_loop_respawns_and_serves_new_channel() {
+        // ch1 = console, ch2 = DM, ch3 = the respawned DM's channel.
+        let k = shared_with_chans(&[1, 2, 3]);
+        let console = InitChannel::new(k.clone(), 1);
+        let dm = InitChannel::new(k.clone(), 2);
+
+        // The DM dies (teardown scan emits CLOSE_PEER_DEAD + the dead pid).
+        k.sim().inject_close(2, CLOSE_PEER_DEAD, 42);
+
+        // The respawn closure models a fresh DM coming up: it mints the
+        // new channel AND sends a notification on it immediately (a real
+        // DM's first act after init's registry handshake).
+        let policy = RespawnPolicy {
+            base_backoff_ns: 10,
+            max_backoff_ns: 40,
+            max_restarts: 3,
+        };
+        let mut respawns = 0;
+        let mut attempts = Vec::new();
+        let result = run_resilient_loop(&console, dm, &policy, |attempt| {
+            respawns += 1;
+            attempts.push(attempt);
+            k.sim().inject_msg(3, 0x99, b"alive after respawn");
+            Ok(InitChannel::new(k.clone(), 3))
+        });
+
+        // Exactly one respawn happened, with the 1-based attempt number.
+        assert_eq!(respawns, 1);
+        assert_eq!(attempts, vec![1]);
+
+        // The new channel's notification was DISPATCHED through the live
+        // loop: the console endpoint received the notification log (the
+        // blocking send after dispatch).
+        assert_eq!(k.sim().queue_len(1), 1);
+        assert_eq!(k.sim().peek_tag(1), Some(0));
+
+        // After the notification the new channel is empty; the sim cannot
+        // block forever, so the next TIMEOUT_NONE wait reports CH_KIND_NONE
+        // (the real kernel parks). The loop surfaces that as the sim's
+        // documented non-blocking outcome — the respawn path itself
+        // already succeeded.
+        assert_eq!(result, Err(ChannelError::UnexpectedKind(CH_KIND_NONE)));
+    }
+
+    #[test]
+    fn resilient_loop_crash_loop_breaker() {
+        // ch1 = console, ch2 = DM, ch3 = respawn target.
+        let k = shared_with_chans(&[1, 2, 3]);
+        let console = InitChannel::new(k.clone(), 1);
+        let dm = InitChannel::new(k.clone(), 2);
+
+        // DM dies once, respawns to ch3, and the respawned DM ALSO dies
+        // immediately (a crash loop) — the restart budget (1) is exhausted
+        // and the loop gives up instead of respawning forever.
+        k.sim().inject_close(2, CLOSE_PEER_DEAD, 42);
+        let policy = RespawnPolicy {
+            base_backoff_ns: 10,
+            max_backoff_ns: 40,
+            max_restarts: 1,
+        };
+        let mut respawns = 0;
+        let result = run_resilient_loop(&console, dm, &policy, |attempt| {
+            respawns += 1;
+            assert_eq!(attempt, 1);
+            k.sim().inject_close(3, CLOSE_PEER_DEAD, 43);
+            Ok(InitChannel::new(k.clone(), 3))
+        });
+
+        assert_eq!(respawns, 1);
+        assert_eq!(result, Err(ChannelError::TooManyRestarts));
     }
 }

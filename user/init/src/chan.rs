@@ -20,6 +20,10 @@ pub enum ChannelError {
     /// the parked wait at its deadline and the re-run returned
     /// `ERR_TIMEOUT`) — the caller retries or moves on.
     Timeout,
+    /// The watchdog's restart budget was exhausted (crash-loop breaker):
+    /// the peer died `RespawnPolicy::max_restarts` times in a row and the
+    /// demo loop gave up instead of respawning forever.
+    TooManyRestarts,
     /// Received a message but the payload was too short for the expected type.
     PayloadTooShort,
     /// Received an unexpected message kind (not MSG).
@@ -36,6 +40,9 @@ impl core::fmt::Display for ChannelError {
                 write!(f, "channel closed (reason={reason}, detail={detail})")
             }
             ChannelError::Timeout => write!(f, "reply deadline elapsed"),
+            ChannelError::TooManyRestarts => {
+                write!(f, "peer restarted too many times (crash-loop breaker)")
+            }
             ChannelError::PayloadTooShort => write!(f, "payload too short"),
             ChannelError::UnexpectedKind(k) => write!(f, "unexpected message kind {k}"),
             ChannelError::UnexpectedTag(t) => write!(f, "unexpected message tag 0x{t:08x}"),
