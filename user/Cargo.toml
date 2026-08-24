@@ -19,5 +19,5 @@
 # so they can be tested against the fake kernel in tests/. The real sidecar
 # images are built with `--features target` (see user/README.md).
 [workspace]
-members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs", "procmgr", "sidecar", "network", "gui", "shared-arena", "aerosls", "polyglot", "trampoline"]
+members = ["proto", "kernel-sim", "ramdisk", "blockcache", "vfs", "procmgr", "sidecar", "network", "gui", "shared-arena", "aerosls", "polyglot", "trampoline", "devmgr"]
 resolver = "2"

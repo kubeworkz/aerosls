@@ -1,0 +1,16 @@
+[package]
+name = "aerosls-devmgr"
+version = "0.1.0"
+edition = "2021"
+description = "The AeroSLS Device Manager sidecar — PCIe enumeration, driver manifest matching, device lifecycle, hotplug, and driver spawn/supervision"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+[features]
+default = []
+target = ["aerosls-proto/target"]
