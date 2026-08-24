@@ -6,12 +6,14 @@
 //! fake, and the real ABI (`RealKernel`, below, behind the `target`
 //! feature) links against the kernel proper.
 //!
-//! The extern "C" declarations in this module are the *kernel side of the
-//! contract* that `kernel/cap.c` and `kernel/chan.c` must implement per
-//! `docs/AeroSLS-Kernel-Capability-Layer-Spec-v0.1.md` and
-//! `docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md`. The kernel does
-//! not exist yet; these are forward declarations, linked only when a
-//! sidecar image is built with `--features target`.
+//! The kernel side of the contract lives in `kernel/chan.c` and
+//! `kernel/cap.c` per `docs/AeroSLS-Kernel-Capability-Layer-Spec-v0.1.md`
+//! and `docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md`. Behind the
+//! `target` feature, this module defines the `k_chan_*`/`k_cap_info`
+//! extern "C" symbols as real syscall shims (311-315), so a sidecar image
+//! links them; the kernel dispatches those syscalls to its own
+//! implementations in `kernel/chan.c`. The host build omits the shims so
+//! the crate links cleanly into the test harness.
 
 /// Capability types (capability-layer spec §1.1, respawn decision §2).
 pub const CAP_MEM: u16 = 1;
@@ -149,7 +151,7 @@ mod abi {
     use crate::CapDescriptor;
 
     #[repr(C)]
-    struct WaitOut {
+    pub struct WaitOut {
         idx: u32,
         kind: u16,
         pad: u16,
@@ -157,7 +159,7 @@ mod abi {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct CapRefOut {
+    pub struct CapRefOut {
         handle: u32,
         rights: u8,
         flags: u8,
@@ -167,7 +169,7 @@ mod abi {
     }
 
     #[repr(C)]
-    struct RecvOut {
+    pub struct RecvOut {
         kind: u16,
         flags: u16,
         tag: u32,
@@ -177,7 +179,7 @@ mod abi {
     }
 
     #[repr(C)]
-    struct CapInfoOut {
+    pub struct CapInfoOut {
         ty: u16,
         rights: u16,
         flags: u16,
@@ -185,35 +187,302 @@ mod abi {
         len: u64,
     }
 
-    extern "C" {
-        // kernel/chan.c — transport spec §3.4
-        fn k_chan_wait(
-            chans: *const u32,
-            n: u32,
-            timeout_ns: u64,
-            out: *mut WaitOut,
-        ) -> i32;
-        fn k_chan_recv(
-            chan: u32,
-            buf: *mut u8,
-            buf_len: u32,
-            slots: *mut CapRefOut,
-            n_slots: u32,
-            out: *mut RecvOut,
-        ) -> i32;
-        fn k_chan_send(
-            chan: u32,
-            tag: u32,
-            flags: u16,
-            payload: *const u8,
-            payload_len: u32,
-            caps: *const CapDescriptor,
-            n_caps: u32,
-            timeout_ns: u64,
-        ) -> i32;
-        fn k_chan_close(chan: u32, reason: u16, detail: u32) -> i32;
-        // kernel/cap.c — capability-layer spec §3.5
-        fn k_cap_info(handle: u32, out: *mut CapInfoOut) -> i32;
+    // ── Syscall shims (the real kernel side is kernel/chan.c) ─────────────
+    // The extern "C" symbols RealKernel links against: each builds the
+    // request struct the kernel's syscall wrapper unpacks (syscalls
+    // 311-315, layouts mirror kernel/cap.h exactly) and issues the raw
+    // syscall instruction. The kernel returns the transport's positive
+    // CAP_ERR_* codes (0 = CAP_ERR_OK), so `r != ERR_OK` below is exactly
+    // right — but note the kernel's codes are the spec's numbers (1..13),
+    // which this module's ERR_* constants already are.
+
+    const SYS_CHAN_WAIT: u64 = 311;
+    const SYS_CHAN_RECV: u64 = 312;
+    const SYS_CHAN_SEND: u64 = 313;
+    const SYS_CHAN_CLOSE: u64 = 314;
+    const SYS_CAP_INFO: u64 = 315;
+
+    /// The raw syscall instruction (same convention as
+    /// `aerosls::syscall::sls_syscall`): number in rax, one arg pointer in
+    /// rdi.
+    unsafe fn sls_syscall(num: u64, arg: u64) -> u64 {
+        let ret: u64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") num => ret,
+            in("rdi") arg,
+            lateout("rcx") _,
+            lateout("r11") _,
+            lateout("rsi") _,
+            lateout("rdx") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
+            options(nostack),
+        );
+        ret
+    }
+
+    // Request structs — mirror kernel/cap.h's SLSChan*Request layouts
+    // (repr(C), explicit padding) so the kernel reads exactly what the
+    // shim wrote.
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ChanWaitReq {
+        chans: [u16; 8],
+        n_chans: u16,
+        _pad: [u8; 4],
+        timeout_ns: u64,
+        out_idx: u32,
+        out_kind: u16,
+        _pad2: [u8; 2],
+    }
+
+    /// Kernel SLSCapDesc (slot u16 + pad; proto's CapDescriptor is slot
+    /// u32 — byte-compatible for offset/len/rights/flags, converted here).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct KernCapDesc {
+        slot: u16,
+        _pad: u16,
+        offset: u32,
+        len: u32,
+        rights: u8,
+        flags: u8,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ChanCapRef {
+        handle: u32,
+        rights: u8,
+        flags: u8,
+        pad: u16,
+        base: u64,
+        len: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ChanRecvOut {
+        kind: u16,
+        flags: u16,
+        tag: u32,
+        len: u32,
+        n_caps: u32,
+        needed: u32,
+    }
+
+    #[repr(C)]
+    struct ChanRecvReq {
+        chan: u16,
+        _pad: [u8; 6],
+        buf: *mut u8,
+        buf_len: u32,
+        n_slots: u32,
+        slots: [ChanCapRef; 8],
+        out: ChanRecvOut,
+    }
+
+    #[repr(C)]
+    struct ChanSendReq {
+        chan: u16,
+        _pad: [u8; 2],
+        tag: u32,
+        flags: u16,
+        _pad2: [u8; 2],
+        payload_len: u32,
+        _pad3: [u8; 4],
+        payload: *const u8,
+        caps: [KernCapDesc; 4],
+        n_caps: u16,
+        _pad4: [u8; 6],
+        timeout_ns: u64,
+    }
+
+    #[repr(C)]
+    struct ChanCloseReq {
+        chan: u16,
+        _pad: [u8; 2],
+        reason: u16,
+        _pad2: [u8; 2],
+        detail: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CapInfoOutReq {
+        ty: u16,
+        rights: u16,
+        flags: u16,
+        pad: u16,
+        base: u64,
+        len: u64,
+    }
+
+    #[repr(C)]
+    struct CapInfoReq {
+        handle: u16,
+        _pad: [u8; 6],
+        out: CapInfoOutReq,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_chan_wait(
+        chans: *const u32,
+        n: u32,
+        timeout_ns: u64,
+        out: *mut WaitOut,
+    ) -> i32 {
+        let mut req = ChanWaitReq {
+            chans: [0; 8],
+            n_chans: 0,
+            _pad: [0; 4],
+            timeout_ns,
+            out_idx: 0,
+            out_kind: 0,
+            _pad2: [0; 2],
+        };
+        let nc = (n as usize).min(8);
+        if !chans.is_null() {
+            for i in 0..nc {
+                req.chans[i] = unsafe { *chans.add(i) } as u16;
+            }
+        }
+        req.n_chans = nc as u16;
+        let rc = unsafe { sls_syscall(SYS_CHAN_WAIT, &req as *const ChanWaitReq as u64) };
+        if rc == 0 && !out.is_null() {
+            unsafe {
+                (*out).idx = req.out_idx;
+                (*out).kind = req.out_kind;
+            }
+        }
+        rc as i32
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_chan_recv(
+        chan: u32,
+        buf: *mut u8,
+        buf_len: u32,
+        slots: *mut CapRefOut,
+        n_slots: u32,
+        out: *mut RecvOut,
+    ) -> i32 {
+        let mut req = ChanRecvReq {
+            chan: chan as u16,
+            _pad: [0; 6],
+            buf,
+            buf_len,
+            n_slots: n_slots.min(8),
+            slots: [ChanCapRef::default(); 8],
+            out: ChanRecvOut::default(),
+        };
+        let rc = unsafe { sls_syscall(SYS_CHAN_RECV, &mut req as *mut ChanRecvReq as u64) };
+        if rc == 0 {
+            if !out.is_null() {
+                unsafe {
+                    (*out).kind = req.out.kind;
+                    (*out).flags = req.out.flags;
+                    (*out).tag = req.out.tag;
+                    (*out).len = req.out.len;
+                    (*out).n_caps = req.out.n_caps;
+                    (*out).needed = req.out.needed;
+                }
+            }
+            if !slots.is_null() {
+                let nc = (req.out.n_caps as usize).min(req.n_slots as usize);
+                for i in 0..nc {
+                    unsafe {
+                        (*slots.add(i)) = CapRefOut {
+                            handle: req.slots[i].handle,
+                            rights: req.slots[i].rights,
+                            flags: req.slots[i].flags,
+                            pad: 0,
+                            base: req.slots[i].base,
+                            len: req.slots[i].len,
+                        };
+                    }
+                }
+            }
+        }
+        rc as i32
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_chan_send(
+        chan: u32,
+        tag: u32,
+        flags: u16,
+        payload: *const u8,
+        payload_len: u32,
+        caps: *const CapDescriptor,
+        n_caps: u32,
+        timeout_ns: u64,
+    ) -> i32 {
+        let mut req = ChanSendReq {
+            chan: chan as u16,
+            _pad: [0; 2],
+            tag,
+            flags,
+            _pad2: [0; 2],
+            payload_len,
+            _pad3: [0; 4],
+            payload,
+            caps: [KernCapDesc::default(); 4],
+            n_caps: 0,
+            _pad4: [0; 6],
+            timeout_ns,
+        };
+        let nc = (n_caps as usize).min(4);
+        if !caps.is_null() {
+            for i in 0..nc {
+                let c = unsafe { *caps.add(i) };
+                req.caps[i] = KernCapDesc {
+                    slot: c.slot as u16,
+                    _pad: 0,
+                    offset: c.offset,
+                    len: c.len,
+                    rights: c.rights,
+                    flags: c.flags,
+                };
+            }
+        }
+        req.n_caps = nc as u16;
+        unsafe { sls_syscall(SYS_CHAN_SEND, &req as *const ChanSendReq as u64) as i32 }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_chan_close(chan: u32, reason: u16, detail: u32) -> i32 {
+        let req = ChanCloseReq {
+            chan: chan as u16,
+            _pad: [0; 2],
+            reason,
+            _pad2: [0; 2],
+            detail,
+        };
+        unsafe { sls_syscall(SYS_CHAN_CLOSE, &req as *const ChanCloseReq as u64) as i32 }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_cap_info(handle: u32, out: *mut CapInfoOut) -> i32 {
+        let mut req = CapInfoReq {
+            handle: handle as u16,
+            _pad: [0; 6],
+            out: CapInfoOutReq::default(),
+        };
+        let rc = unsafe { sls_syscall(SYS_CAP_INFO, &mut req as *mut CapInfoReq as u64) };
+        if rc == 0 && !out.is_null() {
+            unsafe {
+                (*out).ty = req.out.ty;
+                (*out).rights = req.out.rights;
+                (*out).flags = req.out.flags;
+                (*out).base = req.out.base;
+                (*out).len = req.out.len;
+            }
+        }
+        rc as i32
     }
 
     /// The real kernel ABI. Only constructible/usable on the sidecar target.
@@ -226,9 +495,7 @@ mod abi {
                 kind: 0,
                 pad: 0,
             };
-            let r = unsafe {
-                k_chan_wait(chans.as_ptr(), chans.len() as u32, timeout_ns, &mut out)
-            };
+            let r = k_chan_wait(chans.as_ptr(), chans.len() as u32, timeout_ns, &mut out);
             if r != ERR_OK {
                 Err(r)
             } else {
@@ -259,16 +526,14 @@ mod abi {
                 n_caps: 0,
                 needed: 0,
             };
-            let r = unsafe {
-                k_chan_recv(
-                    chan,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    refs.as_mut_ptr(),
-                    n_refs,
-                    &mut out,
-                )
-            };
+            let r = k_chan_recv(
+                chan,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                refs.as_mut_ptr(),
+                n_refs,
+                &mut out,
+            );
             if r != ERR_OK {
                 return Err(r);
             }
@@ -318,18 +583,16 @@ mod abi {
                     pad: 0,
                 };
             }
-            let r = unsafe {
-                k_chan_send(
-                    chan,
-                    tag,
-                    flags,
-                    payload.as_ptr(),
-                    payload.len() as u32,
-                    descs.as_ptr(),
-                    n as u32,
-                    timeout_ns,
-                )
-            };
+            let r = k_chan_send(
+                chan,
+                tag,
+                flags,
+                payload.as_ptr(),
+                payload.len() as u32,
+                descs.as_ptr(),
+                n as u32,
+                timeout_ns,
+            );
             if r != ERR_OK {
                 Err(r)
             } else {
@@ -338,7 +601,7 @@ mod abi {
         }
 
         fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32> {
-            let r = unsafe { k_chan_close(chan, reason, detail) };
+            let r = k_chan_close(chan, reason, detail);
             if r != ERR_OK {
                 Err(r)
             } else {
@@ -354,7 +617,7 @@ mod abi {
                 base: 0,
                 len: 0,
             };
-            let r = unsafe { k_cap_info(handle, &mut out) };
+            let r = k_cap_info(handle, &mut out);
             if r != ERR_OK {
                 Err(r)
             } else {

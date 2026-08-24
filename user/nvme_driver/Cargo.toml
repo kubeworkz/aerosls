@@ -1,0 +1,25 @@
+[package]
+name = "aerosls-nvme-driver"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS NVMe driver sidecar (aerosls.nvme.v1) — channel-based block I/O server over the blockdevice.aeroidl / RD_* protocol, Phase 5 storage stack bottom layer"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+# The `target` feature selects the real kernel ABI (extern "C" syscalls) and
+# the real NVMe MMIO backend + sidecar entry point. The default (host) build
+# omits them so the crate links cleanly into the test harness against the
+# fake kernel (`aerosls-kernel-sim`) and the sim block backend. Build the
+# sidecar image with:
+#   cargo build -p aerosls-nvme-driver --features target --target x86_64-unknown-none
+# and typecheck the real path from the host with:
+#   cargo check -p aerosls-nvme-driver --features target
+[features]
+default = []
+# `target` also enables the real kernel ABI in aerosls-proto.
+target = ["aerosls-proto/target"]

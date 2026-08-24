@@ -49,6 +49,8 @@
 #include "cap.h"
 #include "kernel_io.h"
 #include "frame_pool.h"
+#include "process.h"
+#include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
 /* ─── Phase 1.5: blocking-recv park/wake (weak defaults) ─────────────────────
@@ -143,11 +145,11 @@ static void cap_msg_payload_free(uint16_t idx) {
 
 void cap_lock_init(struct CapSpinlock* l) { l->v = 0; }
 
-static void cap_lock(struct CapSpinlock* l) {
+void cap_lock(struct CapSpinlock* l) {
     while (__atomic_exchange_n(&l->v, 1u, __ATOMIC_ACQUIRE)) { }
 }
 
-static void cap_unlock(struct CapSpinlock* l) {
+void cap_unlock(struct CapSpinlock* l) {
     __atomic_store_n(&l->v, 0u, __ATOMIC_RELEASE);
 }
 
@@ -490,6 +492,7 @@ void cap_init(void) {
     cap_chan_next = 0;
     cap_arena_init();
     cap_msg_payload_init();
+    sidecar_registry_init();
 
     kernel_serial_print("[CAP] Seed kernel capability layer online: "
                         "512-slot tables, 1024-object ceiling, holders, "
@@ -657,6 +660,12 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
         ch->qhead[d] = 0;
         ch->qtail[d] = 0;
         ch->qdepth[d] = 0;
+        /* Phase 5 close state (kernel/chan.c) — a reused channel must not
+         * inherit a stale close event from its previous incarnation. */
+        ch->closed[d]      = 0;
+        ch->close_evt[d]   = 0;
+        ch->close_reason[d] = 0;
+        ch->close_detail[d] = 0;
     }
 
     uint32_t obj_id;
@@ -1688,6 +1697,9 @@ static uint32_t cap_drain_queue(uint16_t chan_id, struct CapChannel* ch,
  * kernel. Static scratch arrays, single-writer by construction, same
  * discipline as cap_revoke's holder snapshot. */
 void cap_table_teardown(uint32_t pid) {
+    /* A dead sidecar stops resolving: drop its registry entry first so a
+     * later create_sidecar can never wire a channel to a corpse. */
+    sidecar_registry_remove_pid(pid);
     int ti = cap_table_find(pid);
     if (ti < 0) return;   /* never used capabilities: nothing to reclaim */
     struct CapTable* t = &cap_tables[ti];
@@ -2301,4 +2313,687 @@ uint64_t sys_sls_trampoline_call(struct SLSTrampolineCallRequest* req) {
                                req->arena_offset, req->arena_len, &result);
     if (r < 0) return (uint64_t)(int64_t)r;
     return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Phase 5 — create_sidecar (self-hosted boot, §1.5 of the design doc)
+ *
+ * SYS_SLS_CREATE_SIDECAR (310): accepts a packed sidecar manifest blob,
+ * creates a new process, maps the sidecar image, builds the initial
+ * capability table from manifest CAP records, writes a BootInfoBlock at
+ * the child's stack top, and enters ring-3 (async spawn, HELD state so
+ * the parent can provision resources before the child runs).
+ *
+ * Lock order: table < channel < object (same as all other cap paths).
+ * The child's cap table is pre-bound before spawn so cap_chan_create can
+ * mint the messenger channel's far-end caps directly into it.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* IEEE CRC-32 (reflected), same polynomial as user/proto/src/manifest.rs.
+ * Table-free, 256-byte stack budget. */
+static uint32_t cap_sidecar_crc32(const uint8_t* data, uint32_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (-(int)(crc & 1)));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/* Find the process descriptor for `pid`. Returns NULL if not found. */
+static struct ProcessDescriptor* sidecar_find_pid(uint32_t pid) {
+    for (int i = 0; i < PROC_MAX; i++)
+        if (proc_table[i].active && proc_table[i].pid == pid)
+            return &proc_table[i];
+    return 0;
+}
+
+/* ─── Freestanding string helpers (no libc in the kernel) ───────────────── */
+static int sidecar_streq(const char* a, const char* b) {
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+/* Returns 1 if `s` starts with `pre`. */
+static int sidecar_prefix(const char* s, const char* pre) {
+    while (*pre) { if (*s != *pre) return 0; s++; pre++; }
+    return 1;
+}
+static void sidecar_strcpy(char* d, const char* s, int n) {
+    int i; for (i = 0; i < n - 1 && s && s[i]; i++) d[i] = s[i]; d[i] = '\0';
+}
+
+/* ─── Sidecar registry (Phase 5: name → pid for CAP_CHAN wiring) ────────
+ * Populated by cap_create_sidecar from each manifest's NAME record;
+ * consulted when resolving CAP_CHAN peer_names. Small, fixed-size,
+ * freestanding — the same idiom as service_registry.c. */
+static struct SidecarRegistryEntry {
+    char     name[SIDECAR_REGISTRY_NAME_LEN];
+    uint32_t pid;
+    uint8_t  active;
+} sidecar_registry[SIDECAR_REGISTRY_MAX];
+
+void sidecar_registry_init(void) {
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++)
+        sidecar_registry[i].active = 0;
+}
+
+int sidecar_registry_register(const char* name, uint32_t pid) {
+    if (!name || !name[0] || pid == 0) return -1;
+    /* Re-registering an existing name UPDATES it in place (a restarted
+     * sidecar keeps its identity; later spawns simply re-point the name). */
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        struct SidecarRegistryEntry* e = &sidecar_registry[i];
+        if (e->active && sidecar_streq(e->name, name)) { e->pid = pid; return 0; }
+    }
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        struct SidecarRegistryEntry* e = &sidecar_registry[i];
+        if (e->active) continue;
+        sidecar_strcpy(e->name, name, SIDECAR_REGISTRY_NAME_LEN);
+        e->pid = pid;
+        e->active = 1;
+        return 0;
+    }
+    kernel_serial_print("[SIDECAR] registry full — sidecar name not registered\n");
+    return -1;
+}
+
+uint32_t sidecar_registry_resolve(const char* name) {
+    if (!name) return 0;
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        struct SidecarRegistryEntry* e = &sidecar_registry[i];
+        if (e->active && sidecar_streq(e->name, name)) return e->pid;
+    }
+    return 0;   /* not found */
+}
+
+uint32_t sidecar_registry_count(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++)
+        if (sidecar_registry[i].active) n++;
+    return n;
+}
+
+void sidecar_registry_remove_pid(uint32_t pid) {
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        struct SidecarRegistryEntry* e = &sidecar_registry[i];
+        if (e->active && e->pid == pid) e->active = 0;
+    }
+}
+
+/* Append one BIB cap entry — name_len u16 + name + slot u16 + ty u8 +
+ * rights u8 + base u64 + len u64, exactly what user/proto/src/bootinfo.rs
+ * parses (no 2-byte name padding). Returns the new offset, or 0 if the
+ * entry would overflow `buf_cap`. */
+static uint32_t bib_put_entry(uint8_t* buf, uint32_t off, uint32_t buf_cap,
+                              const char* name, uint16_t nlen, uint16_t slot,
+                              uint8_t ty, uint8_t rights,
+                              uint64_t base, uint64_t len) {
+    if (off + 2 + nlen + 2 + 1 + 1 + 8 + 8 > buf_cap) return 0;
+    *(uint16_t*)(buf + off) = nlen;  off += 2;
+    for (uint16_t j = 0; j < nlen; j++) buf[off + j] = (uint8_t)name[j];
+    off += nlen;
+    *(uint16_t*)(buf + off) = slot;  off += 2;
+    buf[off] = ty;      off += 1;
+    buf[off] = rights;  off += 1;
+    *(uint64_t*)(buf + off) = base;  off += 8;
+    *(uint64_t*)(buf + off) = len;   off += 8;
+    return off;
+}
+
+/* ─── cap_create_sidecar ────────────────────────────────────────────────────
+ * The heart of self-hosted AeroSLS boot. Creates one sidecar from a
+ * packed manifest. Returns 0 on success (*out_ch_r = parent's CHAN_R to
+ * the child for receiving replies, or CAP_NONE if no messenger channel
+ * was created).
+ *
+ * Steps:
+ *   1. Parse the packed manifest blob (bounds-checked TLV walk).
+ *   2. Look up the parent process, find a free process slot.
+ *   3. Clone the kernel page table, map the sidecar image from the blob.
+ *   4. Allocate and map a user stack; write the BootInfoBlock.
+ *   5. Pre-bind the child's cap table, spawn the child as HELD (async).
+ *   6. Create a messenger channel (cap_chan_create with far_pid).
+ *   7. Mint CAP_MEM capabilities into the child's table.
+ *   8. Restore the parent's kernel_rsp, release the child.
+ */
+int cap_create_sidecar(uint32_t parent_pid,
+                       const void* manifest, uint32_t manifest_len,
+                       uint16_t parent_ch_w, uint16_t console_ch_w,
+                       uint16_t* out_ch_r) {
+    if (out_ch_r) *out_ch_r = CAP_NONE;
+    (void)console_ch_w;  /* reserved: parent sends console cap via messenger */
+    if (!manifest || manifest_len < SIDECAR_MANIFEST_HEADER_LEN)
+        return CAP_EINVAL;
+
+    /* ── 1. Validate header ──────────────────────────────────────────── */
+    const uint8_t* blob = (const uint8_t*)manifest;
+    const struct SidecarManifestHeader* hdr =
+        (const struct SidecarManifestHeader*)blob;
+
+    for (int i = 0; i < 8; i++)
+        if (hdr->magic[i] != SIDECAR_MANIFEST_MAGIC[i])
+            return CAP_EINVAL;
+    if (hdr->version_major != SIDECAR_MANIFEST_VERSION_MAJOR)
+        return CAP_EINVAL;
+    if (hdr->total_len > manifest_len)
+        return CAP_ERANGE;
+
+    /* CRC-32 over the record body (bytes after header, including any
+     * appended BlobFooter with image_kaddr). */
+    uint32_t body_len = manifest_len - SIDECAR_MANIFEST_HEADER_LEN;
+    if (body_len > 0) {
+        uint32_t crc = cap_sidecar_crc32(blob + SIDECAR_MANIFEST_HEADER_LEN,
+                                         body_len);
+        if (crc != hdr->body_crc32)
+            return CAP_EINVAL;  /* corrupted manifest */
+    }
+
+    /* Caps (≤16) + the fixed records (personality, name, image, budget,
+     * cpu, limits, bootstrap, flags, signature = 9) + slack. */
+    if (hdr->record_count > SIDECAR_MANIFEST_MAX_CAPS + 10)
+        return CAP_ERANGE;
+
+    /* ── 2. Parse TLV records ────────────────────────────────────────── */
+    struct SidecarManifest m;
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(m)); i++)
+        ((uint8_t*)&m)[i] = 0;
+    m.record_count = hdr->record_count;
+
+    uint32_t off = SIDECAR_MANIFEST_HEADER_LEN;
+    for (uint16_t rec = 0; rec < hdr->record_count; rec++) {
+        if (off + 4 > hdr->total_len) return CAP_EINVAL;
+        uint16_t tag  = *(const uint16_t*)(blob + off);
+        uint16_t rlen = *(const uint16_t*)(blob + off + 2);
+        if (off + 4 + rlen > hdr->total_len) return CAP_EINVAL;
+        const uint8_t* rp = blob + off + 4;
+
+        switch (tag) {
+        case SIDECAR_TAG_PERSONALITY:
+            break;  /* informational only */
+
+        case SIDECAR_TAG_NAME: {
+            /* Sidecar identity: name_len u16 + name UTF-8. Registered in
+             * the sidecar registry below, so later manifests can wire
+             * CAP_CHAN channels to this sidecar by name. */
+            if (rlen < 2) return CAP_EINVAL;
+            uint16_t nlen = *(const uint16_t*)(rp + 0);
+            if ((int)rlen < (int)nlen + 2) return CAP_EINVAL;
+            uint8_t ml = (nlen < SIDECAR_MANIFEST_MAX_NAME - 1)
+                         ? (uint8_t)nlen
+                         : (uint8_t)(SIDECAR_MANIFEST_MAX_NAME - 1);
+            for (uint8_t j = 0; j < ml; j++)
+                m.name[j] = (char)rp[2 + j];
+            m.name[ml] = '\0';
+            m.name_len = ml;
+            break;
+        }
+
+        case SIDECAR_TAG_IMAGE: {
+            if (rlen < 24) return CAP_EINVAL;
+            m.image_entry = *(const uint64_t*)(rp + 0);
+            /* rp+8: blob_offset (u32) — image offset within the blob */
+            m.image_size  = *(const uint32_t*)(rp + 12);
+            /* rp+16: image_kaddr (u64) — physical addr of image data */
+            break;
+        }
+        case SIDECAR_TAG_BUDGET: {
+            if (rlen < 16) return CAP_EINVAL;
+            m.budget_mem_bytes    = *(const uint64_t*)(rp + 0);
+            m.budget_stack_bytes  = *(const uint32_t*)(rp + 8);
+            m.budget_heap_init    = *(const uint32_t*)(rp + 12);
+            break;
+        }
+        case SIDECAR_TAG_CPU: {
+            if (rlen < 4) return CAP_EINVAL;
+            /* share_pct, preemptible — informational */
+            break;
+        }
+        case SIDECAR_TAG_LIMITS: {
+            if (rlen < 12) return CAP_EINVAL;
+            /* max_tasks, max_fds, max_chans — informational */
+            break;
+        }
+        case SIDECAR_TAG_CAP_MEM: {
+            /* Record layout (matches user/proto/src/manifest.rs and Phase 2
+             * §2.2): name_len u16, name[nlen], phys_base u64, size u64
+             * (bytes), rights u8 = nlen + 19 bytes. */
+            if (rlen < 2) return CAP_EINVAL;
+            uint16_t nlen = *(const uint16_t*)(rp + 0);
+            if ((int)rlen < (int)nlen + 19) return CAP_EINVAL;
+            if (m.n_caps >= SIDECAR_MANIFEST_MAX_CAPS) return CAP_ERANGE;
+            struct SidecarCap* sc = &m.caps[m.n_caps];
+            sc->kind = SIDECAR_TAG_CAP_MEM;
+            sc->name_len = nlen;
+            for (uint16_t j = 0; j < nlen && j < SIDECAR_MANIFEST_MAX_NAME - 1; j++)
+                sc->name[j] = (char)rp[2 + j];
+            sc->name[nlen < SIDECAR_MANIFEST_MAX_NAME ? nlen : SIDECAR_MANIFEST_MAX_NAME - 1] = '\0';
+            sc->phys_base  = *(const uint64_t*)(rp + 2 + nlen);
+            sc->size_bytes = *(const uint64_t*)(rp + 2 + nlen + 8);
+            sc->rights     = rp[2 + nlen + 16];
+            m.n_caps++;
+            break;
+        }
+        case SIDECAR_TAG_CAP_CHAN: {
+            /* Record layout (matches manifest.rs and Phase 2 §2.2):
+             * name_len u16, name[nlen], peer_len u16, peer[plen],
+             * rights u8, flags u8 = nlen + plen + 6 bytes. */
+            if (rlen < 2) return CAP_EINVAL;
+            uint16_t nlen = *(const uint16_t*)(rp + 0);
+            if ((int)rlen < (int)nlen + 2) return CAP_EINVAL;   /* room for peer_len */
+            uint16_t plen = *(const uint16_t*)(rp + 2 + nlen);
+            if ((int)rlen < (int)nlen + (int)plen + 6) return CAP_EINVAL;
+            if (m.n_caps >= SIDECAR_MANIFEST_MAX_CAPS) return CAP_ERANGE;
+            struct SidecarCap* sc = &m.caps[m.n_caps];
+            sc->kind = SIDECAR_TAG_CAP_CHAN;
+            sc->name_len = nlen;
+            for (uint16_t j = 0; j < nlen && j < SIDECAR_MANIFEST_MAX_NAME - 1; j++)
+                sc->name[j] = (char)rp[2 + j];
+            sc->name[nlen < SIDECAR_MANIFEST_MAX_NAME ? nlen : SIDECAR_MANIFEST_MAX_NAME - 1] = '\0';
+            sc->peer_name_len = plen;
+            for (uint16_t j = 0; j < plen && j < SIDECAR_MANIFEST_MAX_NAME - 1; j++)
+                sc->peer_name[j] = (char)rp[2 + nlen + 2 + j];
+            sc->peer_name[plen < SIDECAR_MANIFEST_MAX_NAME ? plen : SIDECAR_MANIFEST_MAX_NAME - 1] = '\0';
+            sc->rights = rp[2 + nlen + 2 + plen];
+            sc->flags  = rp[2 + nlen + 2 + plen + 1];
+            m.n_caps++;
+            break;
+        }
+        case SIDECAR_TAG_BOOTSTRAP:
+        case SIDECAR_TAG_FLAGS:
+            break;  /* informational */
+        default:
+            if (!(hdr->flags & 0x0001))  /* tolerate_unknown */
+                return CAP_EINVAL;
+            break;
+        }
+        off += 4 + rlen;
+    }
+
+    /* ── 3. Validate parsed manifest ─────────────────────────────────── */
+    if (m.image_size == 0) return CAP_EINVAL;
+    if (m.image_entry >= m.image_size) return CAP_ERANGE;
+    if (m.budget_stack_bytes < 4096) return CAP_EINVAL;
+
+    /* ── 4. Look up parent process ───────────────────────────────────── */
+    struct ProcessDescriptor* parent = sidecar_find_pid(parent_pid);
+    if (!parent) return CAP_EINVAL;
+
+    int pi = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) { pi = i; break; }
+    }
+    if (pi < 0) return CAP_ETABLEFULL;
+
+    /* ── 5. Clone page table, map image ──────────────────────────────── */
+    uint64_t new_cr3 = user_clone_page_table();
+    if (!new_cr3) return CAP_ENOMEM;
+    uint64_t* pml4 = (uint64_t*)(uintptr_t)new_cr3;
+
+    /* Image physical address: stored in the blob's BlobFooter (appended
+     * after all TLV records by the image packer). The IMAGE record's
+     * blob_offset field is repurposed as image_kaddr when the blob is a
+     * flat image+manifest package. */
+    uint32_t footer_off = SIDECAR_MANIFEST_HEADER_LEN;
+    for (uint16_t rec = 0; rec < hdr->record_count; rec++) {
+        if (footer_off + 4 > hdr->total_len) break;
+        uint16_t rlen = *(const uint16_t*)(blob + footer_off + 2);
+        footer_off += 4 + rlen;
+    }
+    uint64_t image_kaddr = 0;
+    if (footer_off + 8 <= hdr->total_len)
+        image_kaddr = *(const uint64_t*)(blob + footer_off);
+
+    if (!image_kaddr || image_kaddr < 0x100000ULL) {
+        kernel_serial_printf("[SIDECAR] create: invalid image_kaddr 0x%llx\n",
+                             (unsigned long long)image_kaddr);
+        return CAP_EINVAL;
+    }
+
+    uint32_t n_img_pages = (m.image_size + 4095) / 4096;
+    uint64_t image_vbase = 0x400000000000ULL;  /* USER_PROC_CODE_BASE */
+    uint64_t bytes_left  = m.image_size;
+    for (uint32_t p = 0; p < n_img_pages; p++) {
+        void* frame = allocate_physical_ram_frame_for_partition(parent->partition_id);
+        if (!frame) {
+            kernel_serial_print("[SIDECAR] create: frame alloc failed\n");
+            return CAP_ENOMEM;
+        }
+        uint64_t faddr = (uint64_t)(uintptr_t)frame;
+        uint32_t chunk = (bytes_left > 4096) ? 4096 : (uint32_t)bytes_left;
+        const uint8_t* src = (const uint8_t*)(uintptr_t)(image_kaddr + (uint64_t)p * 4096);
+        uint8_t* dst = (uint8_t*)(uintptr_t)faddr;
+        for (uint32_t b = 0; b < chunk; b++) dst[b] = src[b];
+        user_map_page(pml4, image_vbase + (uint64_t)p * 4096, faddr,
+                      USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_EXEC);
+        bytes_left -= chunk;
+    }
+
+    /* ── 6. User stack ───────────────────────────────────────────────── */
+    uint64_t stack_base = image_vbase
+                        + (uint64_t)n_img_pages * 4096 + 4096;  /* guard pg */
+    uint32_t stk_pages = (m.budget_stack_bytes + 4095) / 4096;
+    if (stk_pages < 1) stk_pages = 1;
+    for (uint32_t p = 0; p < stk_pages; p++) {
+        void* frame = allocate_physical_ram_frame_for_partition(parent->partition_id);
+        if (!frame) {
+            kernel_serial_print("[SIDECAR] create: stack frame alloc failed\n");
+            return CAP_ENOMEM;
+        }
+        user_map_page(pml4, stack_base + (uint64_t)p * 4096,
+                      (uint64_t)(uintptr_t)frame,
+                      USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE
+                      | USER_PTE_NOEXEC);
+    }
+    uint64_t user_rsp = stack_base + (uint64_t)stk_pages * 4096 - 16;
+
+    /* ── 7. Populate process descriptor ──────────────────────────────── */
+    struct ProcessDescriptor* pd = &proc_table[pi];
+    pd->pid        = alloc_pid();
+    if (m.name_len > 0) {
+        /* Use the manifest's NAME record for the debug name. */
+        uint32_t nl = (m.name_len < PROC_NAME_LEN - 1) ? (uint32_t)m.name_len
+                                                       : (uint32_t)(PROC_NAME_LEN - 1);
+        for (uint32_t j = 0; j < nl; j++) pd->name[j] = m.name[j];
+        pd->name[nl] = '\0';
+    } else {
+        pd->name[0] = 's';  /* short name for debug */
+        pd->name[1]    = 'c';
+        pd->name[2]    = '\0';
+    }
+    pd->cr3        = new_cr3;
+    pd->user_rip   = image_vbase + m.image_entry;
+    pd->user_rsp   = user_rsp;
+    pd->owner_uid  = parent->owner_uid;
+    pd->parent_pid = parent_pid;
+    pd->partition_id = parent->partition_id;
+    pd->state      = PROC_HELD;   /* HELD: parent provisions before release */
+    pd->priority   = PROC_PRIO_NORMAL;
+    pd->active     = 1;
+    pd->pending_teardown = 0;
+    pd->waiting_chan = CAP_NONE;
+    pd->has_ring3_ctx = 1;  /* synthetic context (async spawn) */
+    pd->resume_kernel  = 0;
+    pd->resume_sysret  = 0;
+    pd->handoff_target = 0;
+    {   /* zero park_ctx to avoid stale state from a reused slot */
+        uint64_t* pc = (uint64_t*)&pd->park_ctx;
+        for (int _i = 0; _i < (int)(sizeof(pd->park_ctx) / sizeof(uint64_t)); _i++)
+            pc[_i] = 0;
+        pd->park_req = 0;
+    }
+    proc_count++;
+
+    /* ── 8. Bind cap table, create messenger channel ──────────────────── */
+    int cti = cap_table_index(pd->pid);
+    if (cti < 0) {
+        kernel_serial_print("[SIDECAR] create: cap table full\n");
+        pd->active = 0;
+        proc_count--;
+        return CAP_ETABLEFULL;
+    }
+
+    /* Messenger channel: cap_chan_create with far_pid inserts the child's
+     * CHAN_R and CHAN_W directly into the child's cap table (Phase 1.5
+     * two-party bootstrap). */
+    uint16_t parent_rd = CAP_NONE, parent_wr = CAP_NONE;
+    uint16_t child_rd  = CAP_NONE, child_wr  = CAP_NONE;
+    int ch_r = cap_chan_create(parent_pid, pd->pid,
+                               &parent_rd, &parent_wr,
+                               &child_rd,  &child_wr);
+    if (ch_r < 0) {
+        kernel_serial_printf("[SIDECAR] create: chan_create failed (%d)\n", ch_r);
+        pd->active = 0;
+        proc_count--;
+        return (int)ch_r;
+    }
+
+    /* Mint CAP_MEM capabilities from the manifest into the child's table.
+     * The manifest's size is in BYTES (Phase 2 §2.2); convert to whole
+     * pages for cap_create_mem. */
+    for (uint8_t ci = 0; ci < m.n_caps; ci++) {
+        struct SidecarCap* sc = &m.caps[ci];
+        if (sc->kind != SIDECAR_TAG_CAP_MEM) continue;
+        if (sc->phys_base == 0 || sc->size_bytes == 0) continue;
+        if ((sc->phys_base & 0xFFFULL) != 0) continue;
+        if (sc->phys_base + sc->size_bytes > 0x100000000ULL) continue;
+        uint32_t npages = (uint32_t)((sc->size_bytes + 4095u) / 4096u);
+        uint32_t perms = (uint32_t)sc->rights | CAP_PERM_MAP;
+        uint16_t mem_idx = CAP_NONE;
+        if (cap_create_mem(pd->pid, sc->phys_base, npages,
+                           perms, &mem_idx) < 0) {
+            kernel_serial_printf("[SIDECAR] create: mem cap '%s' failed\n",
+                                 sc->name);
+            /* Non-fatal: the sidecar can still boot without this cap. */
+        }
+    }
+
+    /* Wire CAP_CHAN records: resolve each peer_name against the sidecar
+     * registry and connect a real channel. The child's endpoints land in
+     * the child's cap table (the BIB reports them below); the peer's
+     * endpoints land in the peer's table. A peer named "kernel.*" is a
+     * kernel-owned service (e.g. the console): the kernel context (pid 0)
+     * is the peer and holds that end of the channel. An unresolvable peer
+     * leaves the cap unwired — non-fatal, the sidecar boots without it. */
+    for (uint8_t ci = 0; ci < m.n_caps; ci++) {
+        struct SidecarCap* sc = &m.caps[ci];
+        if (sc->kind != SIDECAR_TAG_CAP_CHAN) continue;
+        if (sc->peer_name_len == 0) continue;   /* nothing to connect to */
+        uint16_t c_rd = CAP_NONE, c_wr = CAP_NONE;
+        if (sidecar_prefix(sc->peer_name, "kernel.")) {
+            uint16_t k_rd = CAP_NONE, k_wr = CAP_NONE;
+            if (cap_chan_create(0, pd->pid, &k_rd, &k_wr,
+                                &c_rd, &c_wr) == 0) {
+                sc->wired = 1;
+                sc->wired_rd = c_rd;
+                sc->wired_wr = c_wr;
+                kernel_serial_printf(
+                    "[SIDECAR] PID %u '%s': wired chan '%s' to kernel service "
+                    "'%s' (slots %u/%u, kernel end %u/%u)\n",
+                    pd->pid, pd->name, sc->name, sc->peer_name,
+                    (unsigned)c_rd, (unsigned)c_wr, (unsigned)k_rd, (unsigned)k_wr);
+            }
+        } else {
+            uint32_t peer_pid = sidecar_registry_resolve(sc->peer_name);
+            if (peer_pid == 0 || peer_pid == pd->pid) {
+                kernel_serial_printf(
+                    "[SIDECAR] PID %u '%s': chan '%s' peer '%s' not "
+                    "registered — cap left unwired\n",
+                    pd->pid, pd->name, sc->name, sc->peer_name);
+                continue;
+            }
+            uint16_t p_rd = CAP_NONE, p_wr = CAP_NONE;
+            if (cap_chan_create(pd->pid, peer_pid, &c_rd, &c_wr,
+                                &p_rd, &p_wr) == 0) {
+                sc->wired = 1;
+                sc->wired_rd = c_rd;
+                sc->wired_wr = c_wr;
+                kernel_serial_printf(
+                    "[SIDECAR] PID %u '%s': wired chan '%s' to sidecar '%s' "
+                    "(PID %u, slots %u/%u)\n",
+                    pd->pid, pd->name, sc->name, sc->peer_name,
+                    (unsigned)peer_pid, (unsigned)c_rd, (unsigned)c_wr);
+            }
+        }
+    }
+
+    /* Register the sidecar's identity so later manifests can wire
+     * channels to it by name. */
+    if (m.name_len > 0) {
+        if (sidecar_registry_register(m.name, pd->pid) < 0)
+            kernel_serial_printf("[SIDECAR] PID %u '%s': registry registration failed\n",
+                                 pd->pid, m.name);
+    }
+
+    /* Restore parent's kernel_rsp — the async child's syscall stack
+     * overwrote per_cpu_data[0].kernel_rsp during process_spawn_nb_held;
+     * without this restore, the parent's next syscall would run on the
+     * child's (now-mapped) stack, corrupting the kernel stack chain. */
+    per_cpu_data[0].kernel_rsp = parent->syscall_stack_top;
+
+    /* ── 9. Write BootInfoBlock at child's stack top ─────────────────── */
+    /* BIB lives at the top 4 KiB of the stack. The sidecar _start reads
+     * RSP to find it (user/proto/src/bootinfo.rs: RSP → BIB). */
+    uint64_t bib_vaddr = stack_base + (uint64_t)stk_pages * 4096 - 4096;
+    uint64_t bib_paddr = 0;
+    /* Walk the page table to find the physical frame backing bib_vaddr. */
+    {
+        uint64_t pml4e = *(const uint64_t*)(uintptr_t)(new_cr3 +
+                          ((bib_vaddr >> 39) & 0x1FF) * 8);
+        if (!(pml4e & 1)) return CAP_ENOMEM;
+        uint64_t pdpt = pml4e & 0x000FFFFFFFFFF000ULL;
+        uint64_t pdpe = *(const uint64_t*)(uintptr_t)(pdpt +
+                         ((bib_vaddr >> 30) & 0x1FF) * 8);
+        if (!(pdpe & 1)) return CAP_ENOMEM;
+        if (pdpe & 0x80) { bib_paddr = pdpe & 0x000FFFFFC0000000ULL;
+                           bib_paddr |= bib_vaddr & 0x3FFFFFFFULL; }
+        else {
+            uint64_t pd = pdpe & 0x000FFFFFFFFFF000ULL;
+            uint64_t pde = *(const uint64_t*)(uintptr_t)(pd +
+                           ((bib_vaddr >> 21) & 0x1FF) * 8);
+            if (!(pde & 1)) return CAP_ENOMEM;
+            if (pde & 0x80) { bib_paddr = pde & 0x000FFFFFE0000000ULL;
+                              bib_paddr |= bib_vaddr & 0x1FFFFFULL; }
+            else {
+                uint64_t pt = pde & 0x000FFFFFFFFFF000ULL;
+                uint64_t pte = *(const uint64_t*)(uintptr_t)(pt +
+                               ((bib_vaddr >> 12) & 0x1FF) * 8);
+                if (!(pte & 1)) return CAP_ENOMEM;
+                bib_paddr = (pte & 0x000FFFFFFFFFF000ULL)
+                           | (bib_vaddr & 0xFFFULL);
+            }
+        }
+    }
+    if (!bib_paddr) return CAP_ENOMEM;
+
+    /* Build the BIB in kernel memory (static, 256 bytes max). */
+    static uint8_t bib_buf[256];
+    uint32_t bib_off = 0;
+
+    /* Header: magic(8) + version(2) + cap_count(2) + budget(8) +
+     * stack_top(8) + total_len(4) = 32 bytes. */
+    for (int i = 0; i < 8; i++) bib_buf[bib_off + i] = SIDECAR_BIB_MAGIC[i];
+    bib_off += 8;
+    *(uint16_t*)(bib_buf + bib_off) = SIDECAR_BIB_VERSION;  bib_off += 2;
+    uint32_t bib_n_caps = 0;  /* will be patched below */
+    *(uint16_t*)(bib_buf + bib_off) = 0;  bib_off += 2;  /* cap_count placeholder */
+    *(uint64_t*)(bib_buf + bib_off) = m.budget_mem_bytes;  bib_off += 8;
+    *(uint64_t*)(bib_buf + bib_off) = user_rsp + 16;  /* stack_top = RSP at _start */
+    bib_off += 8;
+    *(uint32_t*)(bib_buf + bib_off) = 0;  bib_off += 4;  /* total_len placeholder */
+
+    /* Cap 0: messenger CHAN_R (the child's read end of the messenger).
+     * Entry layout: name_len u16, name, slot u16, ty u8, rights u8,
+     * base u64, len u64 — exactly what user/proto/src/bootinfo.rs parses. */
+    if (child_rd != CAP_NONE) {
+        uint16_t c = child_rd;
+        *(uint16_t*)(bib_buf + bib_off) = 0;  /* name_len = 0 */
+        bib_off += 2;
+        *(uint16_t*)(bib_buf + bib_off) = c;  bib_off += 2;  /* slot */
+        bib_buf[bib_off] = CAP_TYPE_CHAN_R;   bib_off += 1;
+        bib_buf[bib_off] = CAP_PERM_RECV;     bib_off += 1;
+        *(uint64_t*)(bib_buf + bib_off) = 0;  bib_off += 8;  /* base */
+        *(uint64_t*)(bib_buf + bib_off) = 0;  bib_off += 8;  /* len */
+        bib_n_caps++;
+    }
+
+    /* Cap 1: messenger CHAN_W (the child's write end). */
+    if (child_wr != CAP_NONE) {
+        uint16_t c = child_wr;
+        *(uint16_t*)(bib_buf + bib_off) = 0;
+        bib_off += 2;
+        *(uint16_t*)(bib_buf + bib_off) = c;  bib_off += 2;
+        bib_buf[bib_off] = CAP_TYPE_CHAN_W;   bib_off += 1;
+        bib_buf[bib_off] = CAP_PERM_SEND;     bib_off += 1;
+        *(uint64_t*)(bib_buf + bib_off) = 0;  bib_off += 8;
+        *(uint64_t*)(bib_buf + bib_off) = 0;  bib_off += 8;
+        bib_n_caps++;
+    }
+
+    /* Subsequent caps: manifest caps in record order. A minted MEM cap is
+     * one entry; a wired CHAN cap is TWO entries (CHAN_R then CHAN_W),
+     * both named — the same shape as the messenger caps above. Caps that
+     * were not minted/wired are skipped. */
+    for (uint8_t ci = 0; ci < m.n_caps && bib_n_caps < SIDECAR_BIB_CAPS_MAX; ci++) {
+        struct SidecarCap* sc = &m.caps[ci];
+        uint16_t nlen = sc->name_len;
+        if (nlen > SIDECAR_MANIFEST_MAX_NAME - 1) nlen = SIDECAR_MANIFEST_MAX_NAME - 1;
+
+        if (sc->kind == SIDECAR_TAG_CAP_MEM) {
+            /* Find the cap's slot in the child's table by scanning for a
+             * MEM cap matching the phys_base (npages derived from
+             * size_bytes the same way as the mint loop above). */
+            uint32_t npages = (uint32_t)((sc->size_bytes + 4095u) / 4096u);
+            uint16_t found_slot = CAP_NONE;
+            for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+                uint64_t w = cap_tables[cti].slots[si].word;
+                if (!cap_word_valid(w)) continue;
+                if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_MEM) continue;
+                uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                struct CapObject* o = cap_object_get(oid);
+                if (o && o->phys_base == sc->phys_base && o->npages == npages) {
+                    found_slot = (uint16_t)si;
+                    break;
+                }
+            }
+            if (found_slot == CAP_NONE) continue;   /* not minted: skip */
+            uint32_t no = bib_put_entry(bib_buf, bib_off, sizeof(bib_buf),
+                                        sc->name, nlen, found_slot,
+                                        CAP_TYPE_MEM, (uint8_t)sc->rights,
+                                        sc->phys_base, sc->size_bytes);
+            if (no == 0) break;   /* BIB buffer full: stop appending */
+            bib_off = no;
+            bib_n_caps++;
+        } else if (sc->kind == SIDECAR_TAG_CAP_CHAN && sc->wired) {
+            uint32_t no = bib_put_entry(bib_buf, bib_off, sizeof(bib_buf),
+                                        sc->name, nlen, sc->wired_rd,
+                                        CAP_TYPE_CHAN_R, CAP_PERM_RECV, 0, 0);
+            if (no == 0) break;
+            bib_off = no;
+            bib_n_caps++;
+            no = bib_put_entry(bib_buf, bib_off, sizeof(bib_buf),
+                               sc->name, nlen, sc->wired_wr,
+                               CAP_TYPE_CHAN_W, CAP_PERM_SEND, 0, 0);
+            if (no == 0) break;
+            bib_off = no;
+            bib_n_caps++;
+        }
+    }
+
+    /* Patch cap_count and total_len. */
+    *(uint16_t*)(bib_buf + 10) = (uint16_t)bib_n_caps;
+    *(uint32_t*)(bib_buf + 28) = bib_off;
+
+    /* Copy BIB into the child's stack frame. */
+    uint8_t* dst = (uint8_t*)(uintptr_t)bib_paddr;
+    for (uint32_t i = 0; i < bib_off; i++) dst[i] = bib_buf[i];
+
+    /* ── 10. Release child from HELD state ───────────────────────────── */
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid == pd->pid
+            && proc_table[i].state == PROC_HELD) {
+            proc_table[i].state = PROC_SUSPENDED;
+            kernel_serial_printf(
+                "[SIDECAR] PID %u '%s' released — runs on next schedule "
+                "(BIB at 0x%016lx, entry 0x%016lx)\n",
+                pd->pid, pd->name, bib_vaddr, pd->user_rip);
+            break;
+        }
+    }
+
+    /* Return the parent's CHAN_R (for receiving the child's first reply). */
+    if (out_ch_r) *out_ch_r = parent_rd;
+    return 0;
+}
+
+/* ─── sys_sls_create_sidecar ──────────────────────────────────────────────── */
+uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t ch_r = CAP_NONE;
+    int r = cap_create_sidecar(cap_current_pid(),
+                               req->manifest, req->manifest_len,
+                               req->ch_w_idx, req->console_w_idx,
+                               &ch_r);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    return (uint64_t)ch_r;
 }

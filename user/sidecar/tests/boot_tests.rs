@@ -750,6 +750,7 @@ fn manifest_names_line_up_with_bib_caps() {
         version_major: 1,
         version_minor: 0,
         flags: 0,
+        name: None,
         personality: Some("aerosls.posix.v1"),
         image: Some(Image {
             offset: 0x4000,

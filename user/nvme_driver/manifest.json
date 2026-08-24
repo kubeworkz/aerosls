@@ -1,8 +1,8 @@
 {
   "format": "aerosls/sidecar-manifest",
   "version": "1.0",
-  "name": "drv.ramdisk.0",
-  "personality": "aerosls.ramdisk.v1",
+  "name": "drv.nvme.0",
+  "personality": "aerosls.nvme.v1",
 
   "image": { "kind": "elf", "offset": 0x8000, "size": 0x4000, "entry": "_start" },
 
@@ -19,10 +19,11 @@
   },
 
   "caps": [
-    { "name": "budget",  "type": "mem",  "size": 262144,   "rights": "rw" },
-    { "name": "storage", "type": "mem",  "size": 33554432, "rights": "r" },
+    { "name": "budget",  "type": "mem",  "size": 262144,  "rights": "rw" },
+    { "name": "bar0",    "type": "mem",  "size": 8192,    "rights": "rw" },
+    { "name": "dma",     "type": "mem",  "size": 1048576, "rights": "rw" },
     { "name": "console", "type": "chan", "peer": "kernel.debug.console", "rights": "rw" },
-    { "name": "img.ro",  "type": "mem",  "size": 16384,    "rights": "rx" }
+    { "name": "img.ro",  "type": "mem",  "size": 16384,   "rights": "rx" }
   ],
 
   "bootstrap": { "console_channel": "console", "log_level": "info" },

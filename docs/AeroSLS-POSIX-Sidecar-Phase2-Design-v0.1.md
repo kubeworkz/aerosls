@@ -164,6 +164,7 @@ bytes, records packed back-to-back.
 | 0x0007 | `CAP_CHAN` | `name_len u16, name, peer_len u16, peer, rights u8, flags u8` |
 | 0x0008 | `BOOTSTRAP` | `console_name_len u16, console_name, dbg_name_len u16, dbg_name, log_level u8` |
 | 0x0009 | `FLAGS` | `flags u32` (`isolated`, `wx_policy`) |
+| 0x000A | `NAME` | `name_len u16` + name bytes (UTF-8) — the sidecar's instance name; `create_sidecar` registers it in the kernel's sidecar registry so other manifests' `CAP_CHAN` peer fields can resolve to it |
 | 0x7F00 | `SIGNATURE` | reserved slot for Phase 3 (signed manifests); ignored by v1 kernel |
 
 `CAP_MEM`/`CAP_CHAN` map 1:1 to entries in the initial capability table, in

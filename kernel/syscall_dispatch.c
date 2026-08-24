@@ -579,6 +579,29 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_TRAMPOLINE_CALL:
         return sys_sls_trampoline_call((struct SLSTrampolineCallRequest*)arg);
 
+    // ─── Phase 5: create_sidecar (310) ─────────────────────────────────
+    // Self-hosted boot: accept a packed manifest blob, create a process,
+    // map the image, build the initial cap table, write a BIB, and enter
+    // ring-3 (async, HELD until parent provisions resources).
+    case SYS_SLS_CREATE_SIDECAR:
+        return sys_sls_create_sidecar((struct SLSCreateSidecarRequest*)arg);
+
+    // ─── Phase 5 channel transport (311-315) ───────────────────────────
+    // The kabi.rs k_chan_* contract over cap_send_msg/cap_recv_msg
+    // (kernel/chan.c, docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md
+    // §3-§5). These return the transport's POSITIVE CAP_ERR_* codes, not
+    // the negative CAP_E* codes of the Phase-3 message syscalls.
+    case SYS_SLS_CHAN_WAIT:
+        return sys_sls_chan_wait((struct SLSChanWaitRequest*)arg);
+    case SYS_SLS_CHAN_RECV:
+        return sys_sls_chan_recv((struct SLSChanRecvRequest*)arg);
+    case SYS_SLS_CHAN_SEND:
+        return sys_sls_chan_send((struct SLSChanSendRequest*)arg);
+    case SYS_SLS_CHAN_CLOSE:
+        return sys_sls_chan_close((struct SLSChanCloseRequest*)arg);
+    case SYS_SLS_CAP_INFO:
+        return sys_sls_cap_info((struct SLSCapInfoRequest*)arg);
+
     default:
         return 0;
     }

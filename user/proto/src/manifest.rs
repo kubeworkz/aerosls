@@ -25,6 +25,14 @@
 //! the CRC is verified before any field is trusted (a corrupted manifest
 //! fails at load, before any cap is minted — §2.3).
 //!
+//! Cap-record payloads (Phase 2 §2.2 — the kernel's `create_sidecar` parser
+//! in kernel/cap.c and the C host test tests/cap_create_sidecar_host_test.c
+//! share this exact layout; the golden tests below pin the bytes):
+//!   CAP_MEM   name_len u16, name, phys_base u64, size u64 (bytes), rights u8
+//!   CAP_CHAN  name_len u16, name, peer_len u16, peer, rights u8, flags u8
+//!   NAME      name_len u16, name (sidecar identity — the kernel registers
+//!             it in its sidecar registry so peers can wire channels to it)
+//!
 //! The parser is `no_std` and allocation-free: caps live in a fixed array
 //! (matching `BootInfo`'s cap array — the kernel builds the initial
 //! capability table from these in record order, and the BIB reports the
@@ -55,6 +63,9 @@ pub const TAG_CAP_MEM: u16 = 0x0006;
 pub const TAG_CAP_CHAN: u16 = 0x0007;
 pub const TAG_BOOTSTRAP: u16 = 0x0008;
 pub const TAG_FLAGS: u16 = 0x0009;
+/// Sidecar identity: the instance name other manifests' `CAP_CHAN` peer
+/// fields resolve against (registered in the kernel's sidecar registry).
+pub const TAG_NAME: u16 = 0x000A;
 /// Reserved for Phase 3 signed manifests; ignored by v1.
 pub const TAG_SIGNATURE: u16 = 0x7F00;
 
@@ -168,6 +179,9 @@ pub struct Manifest<'a> {
     pub version_major: u16,
     pub version_minor: u16,
     pub flags: u16,
+    /// Instance name (`TAG_NAME`) — registered in the kernel's sidecar
+    /// registry so other manifests can wire `CAP_CHAN` channels to it.
+    pub name: Option<&'a str>,
     pub personality: Option<&'a str>,
     pub image: Option<Image>,
     pub budget: Option<Budget>,
@@ -243,6 +257,7 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
         version_major,
         version_minor,
         flags,
+        name: None,
         personality: None,
         image: None,
         budget: None,
@@ -276,6 +291,13 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                     return Err(ManifestErr::BadRecordLen);
                 }
                 m.personality = Some(name);
+            }
+            TAG_NAME => {
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                if !rest.is_empty() {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.name = Some(name);
             }
             TAG_IMAGE => {
                 if p.len() != 16 {
@@ -424,6 +446,9 @@ fn le_u64(b: &[u8], i: usize) -> u64 {
 /// blob exactly as `parse_manifest` expects it (header + CRC + records).
 pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
     let mut recs = alloc::vec::Vec::new();
+    if let Some(n) = m.name {
+        recs.push((TAG_NAME, enc_name(n)));
+    }
     if let Some(p) = m.personality {
         recs.push((TAG_PERSONALITY, enc_name(p)));
     }
@@ -530,6 +555,7 @@ mod tests {
             version_major: 1,
             version_minor: 0,
             flags: 0,
+            name: Some("posix.0"),
             personality: Some("aerosls.posix.v1"),
             image: Some(Image { offset: 0x4000, size: 0xC000, entry: 0x4000 }),
             budget: Some(Budget { mem_bytes: 1 << 25, stack_bytes: 1 << 18, heap_initial: 1 << 23 }),
@@ -553,6 +579,7 @@ mod tests {
     fn build_parse_roundtrip() {
         let blob = build_manifest(&sample());
         let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.name, Some("posix.0"));
         assert_eq!(m.personality, Some("aerosls.posix.v1"));
         assert_eq!(m.image.unwrap().entry, 0x4000);
         assert_eq!(m.budget.unwrap().mem_bytes, 1 << 25);
@@ -639,5 +666,204 @@ mod tests {
         let v = blob_with_extra(0, &[(TAG_SIGNATURE, &[1, 2, 3])]);
         let m = parse_manifest(&v).unwrap();
         assert_eq!(m.signature, Some(&[1u8, 2, 3][..]));
+    }
+
+    /// A manifest containing exactly the given caps, in order, and no
+    /// other records except an optional identity name.
+    fn caps_only(name: Option<&'static str>, caps: Vec<ManifestCap<'static>>) -> Manifest<'static> {
+        let mut arr = [None; MAX_MANIFEST_CAPS];
+        for (i, c) in caps.iter().enumerate() {
+            arr[i] = Some(*c);
+        }
+        Manifest {
+            version_major: 1,
+            version_minor: 0,
+            flags: 0,
+            name,
+            personality: None,
+            image: None,
+            budget: None,
+            cpu: None,
+            limits: None,
+            caps: arr,
+            n_caps: caps.len(),
+            bootstrap: None,
+            flags_value: None,
+            signature: None,
+        }
+    }
+
+    /// Pin the exact CAP_MEM record bytes on the wire. The kernel parser
+    /// (kernel/cap.c `SIDECAR_TAG_CAP_MEM`) and the C host test's blob
+    /// builder emit/consume this layout byte-for-byte:
+    /// `name_len u16, name, phys_base u64, size u64 (bytes), rights u8`.
+    /// Pin the exact TAG_NAME record bytes — the sidecar identity the
+    /// kernel registers in its sidecar registry (kernel/cap.c
+    /// `SIDECAR_TAG_NAME`). Same `name_len u16 + name` shape as
+    /// PERSONALITY.
+    #[test]
+    fn name_wire_bytes_golden() {
+        let m = caps_only(Some("drv.child.0"), vec![]);
+        let blob = build_manifest(&m);
+        // Header (24) + one record { tag u16, len u16, payload }.
+        assert_eq!(&blob[24..26], &TAG_NAME.to_le_bytes());
+        assert_eq!(&blob[26..28], &13u16.to_le_bytes()); // 2 + 11
+        let mut want = Vec::new();
+        want.extend_from_slice(&11u16.to_le_bytes()); // name_len
+        want.extend_from_slice(b"drv.child.0");
+        assert_eq!(&blob[28..], &want[..]);
+    }
+
+    #[test]
+    fn cap_mem_wire_bytes_golden() {
+        let m = caps_only(None, vec![ManifestCap {
+            name: "budget",
+            rights: 0x3,
+            kind: CapKind::Mem { base: 0x2000_0000, size: 1 << 18 },
+        }]);
+        let blob = build_manifest(&m);
+        // Header (24) + one record { tag u16, len u16, payload }.
+        assert_eq!(&blob[24..26], &TAG_CAP_MEM.to_le_bytes());
+        assert_eq!(&blob[26..28], &25u16.to_le_bytes()); // 2 + 6 + 8 + 8 + 1
+        let mut want = Vec::new();
+        want.extend_from_slice(&6u16.to_le_bytes()); // name_len
+        want.extend_from_slice(b"budget");
+        want.extend_from_slice(&0x2000_0000u64.to_le_bytes()); // phys_base
+        want.extend_from_slice(&(1u64 << 18).to_le_bytes()); // size (bytes)
+        want.push(0x3); // rights
+        assert_eq!(&blob[28..], &want[..]);
+        assert_eq!(blob.len(), 24 + 4 + 25);
+    }
+
+    /// Same golden pin for CAP_CHAN:
+    /// `name_len u16, name, peer_len u16, peer, rights u8, flags u8`.
+    #[test]
+    fn cap_chan_wire_bytes_golden() {
+        let m = caps_only(None, vec![ManifestCap {
+            name: "console",
+            rights: 0x3,
+            kind: CapKind::Chan { peer: Some("kernel.debug.console"), flags: 0 },
+        }]);
+        let blob = build_manifest(&m);
+        assert_eq!(&blob[24..26], &TAG_CAP_CHAN.to_le_bytes());
+        assert_eq!(&blob[26..28], &33u16.to_le_bytes()); // 2+7 + 2+20 + 1+1
+        let mut want = Vec::new();
+        want.extend_from_slice(&7u16.to_le_bytes()); // name_len
+        want.extend_from_slice(b"console");
+        want.extend_from_slice(&20u16.to_le_bytes()); // peer_len
+        want.extend_from_slice(b"kernel.debug.console");
+        want.push(0x3); // rights
+        want.push(0); // flags
+        assert_eq!(&blob[28..], &want[..]);
+    }
+
+    /// Locate the payload of the first record with the given tag in a
+    /// packed blob (same TLV walk `parse_manifest` does).
+    fn record_payload<'a>(blob: &'a [u8], tag: u16) -> Option<&'a [u8]> {
+        let mut off = HEADER_LEN;
+        while off + 4 <= blob.len() {
+            let t = u16::from_le_bytes([blob[off], blob[off + 1]]);
+            let len = u16::from_le_bytes([blob[off + 2], blob[off + 3]]) as usize;
+            if off + 4 + len > blob.len() {
+                return None;
+            }
+            if t == tag {
+                return Some(&blob[off + 4..off + 4 + len]);
+            }
+            off += 4 + len;
+        }
+        None
+    }
+
+    /// Mirror one of the repo's manifest.json files (source form) as a
+    /// `Manifest`: the instance name, personality, and the shared
+    /// image/budget/cpu/limits plus the caps the JSON declares, in order.
+    fn repo_manifest(
+        name: &'static str,
+        personality: &'static str,
+        caps: Vec<ManifestCap<'static>>,
+    ) -> Manifest<'static> {
+        let mut arr = [None; MAX_MANIFEST_CAPS];
+        for (i, c) in caps.iter().enumerate() {
+            arr[i] = Some(*c);
+        }
+        Manifest {
+            version_major: 1,
+            version_minor: 0,
+            flags: 0,
+            name: Some(name),
+            personality: Some(personality),
+            image: Some(Image { offset: 0x8000, size: 0x4000, entry: 0x8000 }),
+            budget: Some(Budget {
+                mem_bytes: 262144,
+                stack_bytes: 16384,
+                heap_initial: 65536,
+            }),
+            cpu: Some(Cpu { share: 50, preemptible: true }),
+            limits: Some(Limits {
+                max_tasks: 1,
+                max_fds: 0,
+                max_channels: 16,
+                max_open_files: 0,
+                chan_queue_depth: 32,
+            }),
+            caps: arr,
+            n_caps: caps.len(),
+            bootstrap: None,
+            flags_value: None,
+            signature: None,
+        }
+    }
+
+    /// The repo's real manifests (user/ramdisk/manifest.json and
+    /// user/nvme_driver/manifest.json) declare an instance name.
+    /// cap_create_sidecar registers that name in the kernel's sidecar
+    /// registry (kernel/cap.c `SIDECAR_TAG_NAME` →
+    /// sidecar_registry_register), and it is the same name other
+    /// manifests' CAP_CHAN peer fields and the device registry's
+    /// `driver_manifest` (user/init/src/devreg.rs, e.g. "drv.nvme.0")
+    /// resolve against. Assert build_manifest emits the exact TAG_NAME
+    /// record for both, so the kernel-side registration sees these names.
+    #[test]
+    fn repo_manifest_names_emit_tag_name() {
+        let ramdisk = repo_manifest(
+            "drv.ramdisk.0",
+            "aerosls.ramdisk.v1",
+            vec![
+                ManifestCap { name: "budget", rights: 0x3, kind: CapKind::Mem { base: 0x1000_0000, size: 262144 } },
+                ManifestCap { name: "storage", rights: 0x1, kind: CapKind::Mem { base: 0x1040_0000, size: 33_554_432 } },
+                ManifestCap { name: "console", rights: 0x7, kind: CapKind::Chan { peer: Some("kernel.debug.console"), flags: 0 } },
+                ManifestCap { name: "img.ro", rights: 0x5, kind: CapKind::Mem { base: 0x2040_0000, size: 16384 } },
+            ],
+        );
+        let nvme = repo_manifest(
+            "drv.nvme.0",
+            "aerosls.nvme.v1",
+            vec![
+                ManifestCap { name: "budget", rights: 0x3, kind: CapKind::Mem { base: 0x1000_0000, size: 262144 } },
+                ManifestCap { name: "bar0", rights: 0x3, kind: CapKind::Mem { base: 0xfebf_0000, size: 8192 } },
+                ManifestCap { name: "dma", rights: 0x3, kind: CapKind::Mem { base: 0x1100_0000, size: 1_048_576 } },
+                ManifestCap { name: "console", rights: 0x7, kind: CapKind::Chan { peer: Some("kernel.debug.console"), flags: 0 } },
+                ManifestCap { name: "img.ro", rights: 0x5, kind: CapKind::Mem { base: 0x2020_0000, size: 16384 } },
+            ],
+        );
+
+        for m in [ramdisk, nvme] {
+            let blob = build_manifest(&m);
+            let name = m.name.unwrap();
+            let p = record_payload(&blob, TAG_NAME).expect("TAG_NAME record emitted");
+            let mut want = Vec::new();
+            want.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            want.extend_from_slice(name.as_bytes());
+            assert_eq!(p, &want[..], "TAG_NAME payload for '{name}'");
+
+            // The kernel-side parser sees the same identity — this is the
+            // name cap_create_sidecar registers in the sidecar registry.
+            let parsed = parse_manifest(&blob).unwrap();
+            assert_eq!(parsed.name, Some(name));
+            assert_eq!(parsed.n_caps, m.n_caps);
+            assert_eq!(parsed.find_cap("console").unwrap().name, "console");
+            assert!(parsed.find_cap("budget").is_some());
+        }
     }
 }

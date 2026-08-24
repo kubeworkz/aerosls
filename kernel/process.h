@@ -263,6 +263,7 @@ extern struct ProcessDescriptor proc_table[PROC_MAX];
 extern uint32_t                 proc_count;
 
 void     process_init(void);
+uint32_t alloc_pid(void);  // returns a fresh PID (no collision with existing active procs)
 uint32_t process_create(struct ProcCreateRequest* req);  // returns PID or 0
 uint32_t program_spawn_nb(const char* object_name, uint32_t owner_uid);
 

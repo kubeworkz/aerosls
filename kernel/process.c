@@ -103,6 +103,22 @@ void process_init(void) {
     kernel_serial_print("[PROC] Ring-3 process manager initialised.\n");
 }
 
+// ─── alloc_pid ───────────────────────────────────────────────────────────────
+// Returns a fresh PID that doesn't collide with any currently active process.
+// Used by cap_create_sidecar() which bypasses process_create()'s catalog
+// lookup (sidecar images are not SLS catalog objects).
+uint32_t alloc_pid(void) {
+    /* Scan for the highest active PID and return max+1. This is O(PROC_MAX)
+     * but that's 16 — negligible, and monotonic PIDs never recycle so no
+     * bitmap is needed. */
+    uint32_t max_pid = 99;  /* below the 100+ range */
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid > max_pid)
+            max_pid = proc_table[i].pid;
+    }
+    return max_pid + 1;
+}
+
 // ─── nested_ring3_prep ───────────────────────────────────────────────────────
 // Seed Kernel Phase 1 (two-party): called immediately before
 // kernel_enter_ring3() when the spawner is a live Ring-3 process — i.e. the

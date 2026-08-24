@@ -6,6 +6,7 @@
 #include "agent.h"
 #include "checkpoint_mgr.h"
 #include "../kernel/dashboard.h"
+#include "console_service.h"
 
 extern void tier_mgr_init(void);
 extern void tier_mgr_tick(void);
@@ -295,6 +296,10 @@ void microkernel_service_poll(void) {
     reconcile_tick();
     // Multitenant Isolation Gap Analysis §5 item 6: sample per-partition usage
     usage_metering_tick();
+    // Kernel-side console service: drain sidecars' wired console channels
+    // to serial. Same lock-taking context as the ticks above (see
+    // console_service.h for why it cannot run from the timer IRQ).
+    console_service_tick();
     // (E) Fire any scheduled agent runs
     agent_scheduler_tick();
 }

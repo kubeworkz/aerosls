@@ -58,6 +58,39 @@
 #define CAP_PERM_SEND  0x01
 #define CAP_PERM_RECV  0x02
 
+/* ─── Phase 5 channel transport constants (the kabi.rs k_chan_* contract,
+ * docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md §3/§5/§7). The
+ * kernel's k_chan_* functions return these POSITIVE CAP_ERR_* codes — NOT
+ * the negative CAP_E* codes of the Phase-3 syscalls; 0 = CAP_ERR_OK. */
+#define CAP_ERR_OK         0
+#define CAP_ERR_NOTFOUND   1
+#define CAP_ERR_REVOKED    2
+#define CAP_ERR_RIGHTS     3
+#define CAP_ERR_RANGE      4
+#define CAP_ERR_BUDGET     5
+#define CAP_ERR_SPACE      6
+#define CAP_ERR_TARGET     7
+#define CAP_ERR_STATE      8
+#define CAP_ERR_TYPE       9
+#define CAP_ERR_PROTO      10
+#define CAP_ERR_NOMEM      11
+#define CAP_ERR_BUFSZ      12
+#define CAP_ERR_TIMEOUT    13
+
+/* Envelope kinds (transport spec §5) and send flags (§3.4). CH_KIND_MSG is
+ * what k_chan_send produces; k_chan_recv/k_chan_wait report the head's
+ * kind. F_REPLY is accepted but window bookkeeping is deferred (Phase-1.5
+ * convention: the transport does not yet enforce the request/reply window). */
+#define CH_KIND_MSG         0
+#define CH_KIND_CLOSE       1
+#define CH_KIND_NEW_CHANNEL 2
+#define CH_KIND_NONE        3
+#define CH_F_REPLY          0x0001
+#define CH_F_NO_REPLY       0x0002
+
+/* Block forever (real kernel) — mirrored from kabi.rs TIMEOUT_NONE. */
+#define CH_TIMEOUT_NONE     0xFFFFFFFFFFFFFFFFULL
+
 #define CAP_NONE 0xFFFF   /* "no capability" sentinel (slot index / syscall result) */
 
 /* ─── Limits ──────────────────────────────────────────────────────────────── */
@@ -132,6 +165,15 @@ struct CapChannel {
     uint32_t qtail[2];        /* monotonically growing; entries are qtail%DEPTH */
     uint32_t qdepth[2];
     struct ChanMsg q[2][CHAN_QUEUE_DEPTH];
+    /* Phase 5 close state (kernel/chan.c). closed[d] = the owner of end d
+     * closed its endpoint (idempotent; its further sends/recvs fail with
+     * CAP_ERR_STATE). close_evt[d] = a CLOSE event awaits end d's owner
+     * (the PEER closed): delivered by k_chan_recv after the message queue
+     * drains, exactly once. Zeroed in cap_chan_create. */
+    uint8_t  closed[2];
+    uint8_t  close_evt[2];
+    uint16_t close_reason[2];
+    uint32_t close_detail[2];
     uint8_t  active;
     uint8_t  _pad[3];
 };
@@ -197,6 +239,8 @@ struct CapTable {
 };
 
 extern struct CapTable cap_tables[CAP_TABLE_MAX];   /* defined in cap.c */
+extern struct CapObject cap_objects[CAP_OBJECT_MAX];    /* defined in cap.c */
+extern struct CapChannel cap_channels[CAP_CHAN_MAX];    /* defined in cap.c */
 
 /* ─── Syscall numbers (289-297 — next free range after SYS_SLS_RECONCILE_
  * ENABLE = 288; confirmed via grep across every kernel header defining
@@ -365,6 +409,93 @@ struct SLSCapUnmapRequest {
     uint64_t vaddr;
 };
 
+/* ─── Phase 5 channel transport request structs (syscalls 311-315) ────────
+ * Layouts mirror kabi.rs's WaitOut/RecvOut/CapRefOut/CapInfoOut and the
+ * extern "C" k_chan_* signatures exactly (little-endian, repr(C) on the
+ * sidecar side). `handle`/`chan` fields are the CALLER's cap-table slots. */
+
+/* One granted cap written by k_chan_recv (kabi CapRefOut). */
+struct SLSChanCapRef {
+    uint32_t handle;          /* receiver-table slot of the minted cap */
+    uint8_t  rights;
+    uint8_t  flags;
+    uint16_t pad;
+    uint64_t base;            /* sender base + offset */
+    uint64_t len;
+};
+
+/* k_chan_recv's out block (kabi RecvOut). */
+struct SLSChanRecvOut {
+    uint16_t kind;            /* CH_KIND_MSG | CH_KIND_CLOSE */
+    uint16_t flags;           /* CH_F_REPLY | CH_F_NO_REPLY */
+    uint32_t tag;             /* request id echoed */
+    uint32_t len;             /* payload bytes copied into buf */
+    uint32_t n_caps;          /* granted caps written into slots[] */
+    uint32_t needed;          /* on CAP_ERR_BUFSZ: (caps_needed << 16) | payload_needed */
+};
+
+struct SLSChanWaitRequest {
+    uint16_t chans[8];        /* caller's CHAN_R slots to poll */
+    uint16_t n_chans;         /* 1..8 */
+    uint8_t  _pad[4];
+    uint64_t timeout_ns;      /* CH_TIMEOUT_NONE = block forever (park
+                               * deferred: today returns CAP_ERR_TIMEOUT
+                               * immediately when nothing is ready) */
+    uint32_t out_idx;         /* [out] index into chans[] */
+    uint16_t out_kind;        /* [out] CH_KIND_* of the head entry */
+    uint8_t  _pad2[2];
+};
+
+struct SLSChanRecvRequest {
+    uint16_t chan;            /* caller's CHAN_R slot */
+    uint8_t  _pad[6];
+    void*    buf;             /* user buffer for the payload / close body */
+    uint32_t buf_len;
+    uint32_t n_slots;         /* capacity of slots[] */
+    struct SLSChanCapRef slots[8];
+    struct SLSChanRecvOut out;   /* [out] */
+};
+
+struct SLSChanSendRequest {
+    uint16_t chan;            /* caller's CHAN_W slot */
+    uint8_t  _pad[2];
+    uint32_t tag;             /* request id (echoed in replies) */
+    uint16_t flags;           /* CH_F_REPLY | CH_F_NO_REPLY */
+    uint8_t  _pad2[2];
+    uint32_t payload_len;     /* ≤ CAP_MSG_MAX_PAYLOAD */
+    uint8_t  _pad3[4];
+    void*    payload;         /* user buffer the kernel copies from */
+    struct SLSCapDesc caps[CAP_MSG_MAX_CAPS];
+    uint16_t n_caps;          /* 0..CAP_MSG_MAX_CAPS */
+    uint8_t  _pad4[6];
+    uint64_t timeout_ns;      /* 0 = block until enqueued (park deferred:
+                               * queue-full returns CAP_ERR_TIMEOUT today) */
+};
+
+struct SLSChanCloseRequest {
+    uint16_t chan;            /* caller's CHAN_R or CHAN_W slot */
+    uint8_t  _pad[2];
+    uint16_t reason;          /* CLOSE_PEER | CLOSE_PEER_DEAD | ... */
+    uint8_t  _pad2[2];
+    uint32_t detail;
+};
+
+/* k_cap_info's out block (kabi CapInfoOut). */
+struct SLSCapInfoOut {
+    uint16_t ty;              /* CAP_TYPE_MEM | CAP_TYPE_CHAN_R | ... */
+    uint16_t rights;
+    uint16_t flags;
+    uint16_t pad;
+    uint64_t base;
+    uint64_t len;
+};
+
+struct SLSCapInfoRequest {
+    uint16_t handle;          /* caller's cap slot */
+    uint8_t  _pad[6];
+    struct SLSCapInfoOut out; /* [out] */
+};
+
 /* ─── Public API ──────────────────────────────────────────────────────────── */
 
 void cap_init(void);          /* boot: arena carve, table/holder/object setup */
@@ -460,6 +591,203 @@ uint64_t sys_sls_cap_list(void);
 uint64_t sys_sls_cap_send_msg(struct SLSCapSendMsgRequest* req);
 uint64_t sys_sls_cap_recv_msg(struct SLSCapRecvMsgRequest* req);
 uint64_t sys_sls_cap_arena_free(struct SLSCapArenaFreeRequest* req);
+
+/* Phase 5 channel transport (kernel/chan.c) — return POSITIVE CAP_ERR_*. */
+uint64_t sys_sls_chan_wait(struct SLSChanWaitRequest* req);
+uint64_t sys_sls_chan_recv(struct SLSChanRecvRequest* req);
+uint64_t sys_sls_chan_send(struct SLSChanSendRequest* req);
+uint64_t sys_sls_chan_close(struct SLSChanCloseRequest* req);
+uint64_t sys_sls_cap_info(struct SLSCapInfoRequest* req);
+
+/* Channel lock (defined in cap.c; chan.c peeks channel queues under it). */
+void cap_lock(struct CapSpinlock* l);
+void cap_unlock(struct CapSpinlock* l);
+
+/* ─── Phase 5: create_sidecar (self-hosted boot) ────────────────────────
+ * SYS_SLS_CREATE_SIDECAR (310) — next free after TRAMPOLINE_CALL (306);
+ * confirmed via grep across every kernel header defining SYS_SLS_*.
+ *
+ * The syscall accepts a packed sidecar manifest blob, creates a new
+ * process, maps the sidecar image, builds the initial capability table
+ * from the manifest's CAP records, writes a BootInfoBlock at the top of
+ * the child's stack, and enters ring-3 at the image entry point. On
+ * success the caller receives a CHAN cap to the child (the parent end
+ * of the messenger channel). The child's BIB lists the child end as
+ * cap #0.
+ *
+ * Packed manifest wire format (matches user/proto/src/manifest.rs):
+ *   Header (24 bytes):
+ *     magic[8]="AERSLSM1", version_major u16=1, version_minor u16=0,
+ *     record_count u16, flags u16, total_len u32, body_crc32 u32
+ *   Records (each: tag u16, len u16, payload[len]):
+ *     TAG_PERSONALITY 0x0001 — name_len u16, name UTF-8
+ *     TAG_IMAGE       0x0002 — entry_offset u64, image_size u32, _pad u32
+ *     TAG_BUDGET      0x0003 — mem_bytes u64, stack_bytes u32, heap_init u32
+ *     TAG_CPU         0x0004 — share_pct u16, preemptible u8, _pad u8
+ *     TAG_LIMITS      0x0005 — max_tasks u16, max_fds u16, max_chans u16,
+ *                              max_open_files u16, chan_qdepth u16, _pad u6
+ *     TAG_CAP_MEM     0x0006 — name_len u16, name[], phys_base u64,
+ *                              size u64 (bytes), rights u8
+ *     TAG_CAP_CHAN    0x0007 — name_len u16, name[], peer_len u16,
+ *                              peer[], rights u8, flags u8
+ *     TAG_BOOTSTRAP   0x0008 — cons_name_len u16, cons_name[],
+ *                              debug_name_len u16, debug_name[], log_level u8
+ *     TAG_FLAGS       0x0009 — flags_value u32
+ *     TAG_NAME        0x000A — name_len u16, name UTF-8 (sidecar identity;
+ *                              registered in the sidecar registry so peers
+ *                              can wire CAP_CHAN channels to it)
+ *
+ * BootInfoBlock wire format (filled by the kernel, read by sidecar _start):
+ *   Header (32 bytes):
+ *     magic[8]="AERSLSB1", version u16=1, cap_count u16,
+ *     budget_bytes u64, stack_top u64, total_len u32
+ *   Cap entries (each): name_len u16, name[], slot u16, ty u8,
+ *                       rights u8, base u64, len u64
+ */
+#define SYS_SLS_CREATE_SIDECAR 310
+
+/* ─── Phase 5 channel transport syscalls (311-315 — next free after
+ * SYS_SLS_CREATE_SIDECAR = 310; confirmed via grep across every kernel
+ * header defining SYS_SLS_*) — the kabi.rs k_chan_* contract over
+ * cap_send_msg/cap_recv_msg (kernel/chan.c). These return the transport's
+ * POSITIVE CAP_ERR_* codes, not the negative CAP_E* codes of the
+ * Phase-3 syscalls. ─────────────────────────────────────────────────── */
+#define SYS_SLS_CHAN_WAIT     311
+#define SYS_SLS_CHAN_RECV     312
+#define SYS_SLS_CHAN_SEND     313
+#define SYS_SLS_CHAN_CLOSE    314
+#define SYS_SLS_CAP_INFO      315
+
+/* Manifest record tags */
+#define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"
+#define SIDECAR_MANIFEST_VERSION_MAJOR 1
+#define SIDECAR_MANIFEST_HEADER_LEN    24
+
+#define SIDECAR_TAG_PERSONALITY  0x0001
+#define SIDECAR_TAG_IMAGE        0x0002
+#define SIDECAR_TAG_BUDGET       0x0003
+#define SIDECAR_TAG_CPU          0x0004
+#define SIDECAR_TAG_LIMITS       0x0005
+#define SIDECAR_TAG_CAP_MEM      0x0006
+#define SIDECAR_TAG_CAP_CHAN     0x0007
+#define SIDECAR_TAG_BOOTSTRAP    0x0008
+#define SIDECAR_TAG_FLAGS        0x0009
+#define SIDECAR_TAG_NAME         0x000A
+
+#define SIDECAR_MANIFEST_MAX_CAPS  16
+#define SIDECAR_MANIFEST_MAX_NAME  64
+
+struct SidecarManifestHeader {
+    uint8_t  magic[8];
+    uint16_t version_major;
+    uint16_t version_minor;
+    uint16_t record_count;
+    uint16_t flags;
+    uint32_t total_len;
+    uint32_t body_crc32;
+} __attribute__((packed));
+
+struct SidecarManifestRecord {
+    uint16_t tag;
+    uint16_t len;
+    /* payload[len] follows */
+} __attribute__((packed));
+
+/* Parsed cap record (CAP_MEM or CAP_CHAN from the manifest). Field widths
+ * and order mirror the wire layout exactly (name_len u16, peer_len u16,
+ * size in BYTES). `wired_rd`/`wired_wr`/`wired` are set by the CHAN wiring
+ * pass inside cap_create_sidecar (the child's endpoint slots once the
+ * channel to the peer exists). */
+struct SidecarCap {
+    char     name[SIDECAR_MANIFEST_MAX_NAME];
+    uint16_t name_len;          /* wire: u16 */
+    uint8_t  kind;              /* SIDECAR_TAG_CAP_MEM or SIDECAR_TAG_CAP_CHAN */
+    uint8_t  rights;            /* CAP_PERM_R|W bits */
+    uint8_t  flags;             /* CHAN: per-cap flags; MEM: unused */
+    uint64_t phys_base;         /* MEM: physical base address */
+    uint64_t size_bytes;        /* MEM: size in BYTES (not pages) */
+    char     peer_name[SIDECAR_MANIFEST_MAX_NAME]; /* CHAN: peer name */
+    uint16_t peer_name_len;     /* CHAN: length of peer_name (wire: u16) */
+    uint8_t  wired;             /* CHAN: channel created (child end minted) */
+    uint16_t wired_rd;          /* CHAN: child's CHAN_R slot in its table */
+    uint16_t wired_wr;          /* CHAN: child's CHAN_W slot in its table */
+};
+
+/* Parsed sidecar manifest (stack-allocated, no heap). */
+struct SidecarManifest {
+    uint16_t flags;
+    uint16_t record_count;
+    /* NAME record (sidecar identity) */
+    char     name[SIDECAR_MANIFEST_MAX_NAME];
+    uint8_t  name_len;
+    /* IMAGE record */
+    uint64_t image_entry;       /* entry point offset */
+    uint32_t image_size;        /* image size in bytes */
+    /* BUDGET record */
+    uint64_t budget_mem_bytes;
+    uint32_t budget_stack_bytes;
+    uint32_t budget_heap_init;
+    /* CAP records */
+    struct SidecarCap caps[SIDECAR_MANIFEST_MAX_CAPS];
+    uint8_t  n_caps;
+};
+
+/* BootInfoBlock — written by the kernel at the child's stack top.
+ * Read by sidecar _start (user/proto/src/bootinfo.rs defines the
+ * Rust parser for this exact wire format). */
+#define SIDECAR_BIB_MAGIC     "AERSLSB1"
+#define SIDECAR_BIB_VERSION   1
+#define SIDECAR_BIB_CAPS_MAX  16
+
+struct SidecarBib {
+    uint8_t  magic[8];
+    uint16_t version;
+    uint16_t cap_count;
+    uint64_t budget_bytes;
+    uint64_t stack_top;
+    uint32_t total_len;
+} __attribute__((packed));
+
+struct SidecarBibCap {
+    uint16_t name_len;
+    /* name[name_len] follows, UNPADDED — bootinfo.rs reads the slot field
+     * immediately after the name bytes. */
+    uint16_t slot;
+    uint8_t  ty;                /* 1=MEM, 2=CHAN_R, 3=CHAN_W */
+    uint8_t  rights;
+    uint64_t base;
+    uint64_t len;               /* MEM: byte size (not pages) */
+} __attribute__((packed));
+
+struct SLSCreateSidecarRequest {
+    const void*  manifest;     /* pointer to packed manifest blob */
+    uint32_t     manifest_len; /* blob size in bytes */
+    uint8_t      _pad[4];
+    uint16_t     ch_w_idx;     /* parent's CHAN_W to the child, or CAP_NONE */
+    uint16_t     console_w_idx; /* console CHAN_W, or CAP_NONE */
+    uint8_t      _pad2[4];
+};
+
+int cap_create_sidecar(uint32_t parent_pid,
+                       const void* manifest, uint32_t manifest_len,
+                       uint16_t parent_ch_w, uint16_t console_ch_w,
+                       uint16_t* out_ch_r);
+uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req);
+
+/* ─── Sidecar registry (Phase 5: name → pid for CAP_CHAN wiring) ────────
+ * cap_create_sidecar registers each new sidecar under its manifest's
+ * NAME record, and resolves CAP_CHAN peer_names against this table when
+ * connecting channels. A peer named "kernel.*" is a kernel-owned service
+ * (e.g. "kernel.debug.console"): the kernel context (pid 0) is the peer.
+ * Registrations are dropped when the sidecar's cap table is torn down. */
+#define SIDECAR_REGISTRY_MAX      16
+#define SIDECAR_REGISTRY_NAME_LEN 64
+
+void     sidecar_registry_init(void);
+int      sidecar_registry_register(const char* name, uint32_t pid);
+uint32_t sidecar_registry_resolve(const char* name);  /* pid, or 0 */
+uint32_t sidecar_registry_count(void);
+void     sidecar_registry_remove_pid(uint32_t pid);
 
 /* ─── Phase 3 trampoline syscall wrappers ─────────────────────────────── */
 struct SLSTrampolineCreateRequest {
