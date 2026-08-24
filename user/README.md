@@ -10,6 +10,9 @@ Cargo workspace for the capability-based sidecars designed in `docs/`:
 | `vfs/` | — (POSIX sidecar component) | Phase 2 §3.2/§3.4/§6.3, respawn decision §4.2/§5.9/§6 |
 | `procmgr/` | — (POSIX sidecar component) | Phase 2 §3.2/§3.3/§4 (fork/exec) |
 | `kernel-sim/` | — (host-only test fake) | capability-layer spec §3–§4, transport spec §3–§6 |
+| `init/` | `aerosls.init.v1` | Phase 5 §1.4–§1.5 (the boot sidecar; see the Phase 5 design doc) |
+| `dm/` | `aerosls.device_manager.v1` | Phase 5 §2 (receives the registry from init, serves the handshake, orchestrates driver composition) |
+| `bootimage/` | — (host build tool) | Phase 5 §7 (the sidecars.cpio newc initrd + ELF flattener) |
 
 ## Layout
 
@@ -139,16 +142,98 @@ injection, close events waking blocked recv/wait).
 ```sh
 cargo build -p aerosls-ramdisk --features target   # the driver
 cargo build -p aerosls-sidecar --features target   # the POSIX sidecar
+cargo build -p aerosls-init --features target --target x86_64-unknown-none \
+    --release --bin init                          # the init sidecar FLAT BINARY
+cargo build -p aerosls-dm --features target --target x86_64-unknown-none \
+    --release --bin dm                            # the Device Manager FLAT BINARY
 ```
 
-`--features target` selects the real kernel ABI (`extern "C"` syscalls:
-`k_chan_wait/recv/send/close`, `k_cap_info` — defined in `proto/src/kabi.rs`,
-shared by every sidecar) and the `rust_entry` bootstrap (`ramdisk/src/entry.rs`,
-`sidecar/src/entry.rs`). The kernel does not exist yet — those symbols are
-forward declarations to be implemented in `kernel/cap.c` and `kernel/chan.c`
-per the capability-layer and transport specs. Image assembly (crt0 + linker
-script + the manifest's `image` record) is the sidecar build step; see
-`ramdisk/src/crt0.S`.
+`--features target` selects the real kernel ABI (the `extern "C"` syscalls
+`k_chan_wait/recv/send/close`, `k_cap_info`, `k_create_sidecar` — defined in
+`proto/src/kabi.rs`, shared by every sidecar) and the `rust_entry` bootstrap
+(`ramdisk/src/entry.rs`, `sidecar/src/entry.rs`, `init/src/entry.rs`,
+`dm/src/entry.rs`). The kernel side of those syscalls lives in
+`kernel/chan.c` and `kernel/cap.c` per the capability-layer and transport
+specs.
+
+The **init** and **dm** crates have the complete image assembly: their crt0
+(`crt0.S`, assembled by rustc's own LLVM integrated assembler via
+`global_asm!` — no cross-GCC) is linked by `init.ld`/`dm.ld` at address 0
+(the first byte of the flat binary is `_start`, matching the manifest's
+`image.entry = 0`), and the panic handler logs `[PANIC] ...` to the kernel
+serial log before halting. `cargo build ... --bin init --bin dm` produces
+ELFs; flatten them to the flat images with `aerosls-bootimage flatten` (or
+`objcopy -O binary`). The ramdisk/sidecar crates still lack that link step
+— their flat binaries are the remaining image-assembly work.
+
+## Phase 5 self-hosted boot
+
+Build the initrd that boots the init sidecar on real hardware/QEMU:
+
+```sh
+make selfhost-bootimage        # cross-builds BOTH sidecars (init + dm),
+                               # flattens them, packs sidecars.cpio (needs
+                               # the x86_64-unknown-none target:
+                               # rustup target add x86_64-unknown-none)
+make x86-iso                   # ships sidecars.cpio into the ISO when present
+```
+
+The archive is a `newc` initrd (`boot/init.bin`, `boot/init.manifest`,
+`boot/dm.bin`, `boot/dm.manifest`, `boot/layout`) with every image at its
+manifest-declared physical address (see `user/bootimage/`). Both binaries
+come from the crates; override with `SIDECAR_INIT_BIN=`/`SIDECAR_DM_BIN=`
+when the cross target is unavailable.
+
+Boot under QEMU with the ISO's Phase 5 menuentry (GRUB loads sidecars.cpio
+as a Multiboot2 module):
+
+```sh
+qemu-system-x86_64 -cdrom sls_operating_system.iso \
+    -drive id=disk,file=sls_storage.img,if=none,format=raw \
+    -device nvme,drive=disk,serial=slsdev0 \
+    -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+    -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
+    -vga std -display gtk -m 4G -smp 4 -boot d -serial file:sls_kernel_debug.log
+```
+
+Or load the archive directly as an initrd (`-initrd sidecars.cpio` is the
+U-Boot/OpenSBI convention; QEMU maps it to a Multiboot2 module for the
+BIOS boot). The kernel logs `kernel_main` step 7d — `launch_init_sidecar`
+(`kernel/boot_image.c`) — then the init sidecar's console-channel output is
+drained by the console service, so the serial log (`sls_kernel_debug.log`)
+shows the whole boot:
+
+```
+[SIDECAR] boot image: init @0x20000000 (57360 B) dm @0x20105000 (40976 B) registry @0x20116000 (4096 B) — span 0x20000000..0x20117000
+[SIDECAR] device registry: N device(s) @0x20116000
+[SIDECAR] PID 2 'aerosls.init.v1': wired chan 'console' to kernel service 'kernel.debug.console' (slots …)
+[SIDECAR] PID 3 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots …)
+[SIDECAR] init sidecar created (PID 2, messenger CHAN_R …) — runs on next schedule
+[INIT] ── AeroSLS init sidecar booting ──
+[INIT] budget: 16 MiB
+[INIT] found N PCI device(s)
+[INIT] spawning Device Manager...
+[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x20105000, 40976 bytes)
+[INIT]   messenger: CHAN_R=… CHAN_W=…
+[INIT] sending device registry to Device Manager...
+[DM] ── AeroSLS Device Manager booting ──
+[DM] budget: 256 KiB heap
+[DM] waiting for the device registry from init...
+[DM]   adopt [0] drv.nvme.0 class=01:08 vendor=144d dev=a808 bar=0xfebf0000
+[DM] registry: N device(s) adopted
+[INIT] waiting for Device Manager to initialise devices...
+[INIT] all devices ready.            (or: DM did not signal ready in time; parking…)
+[INIT] ── Phase 5 init sidecar complete ──
+[INIT] system ready for POSIX sidecar creation.
+[INIT] entering the event loop (blocking wait + watchdog respawn)...
+```
+
+The last line parks init in the event loop (blocking `k_chan_wait` on the
+messenger); the DM parks in its own loop, and if the DM dies,
+`[INIT] Device Manager died; respawning…` appears with a bounded backoff
+(the watchdog respawns a fresh DM process through `k_create_sidecar`).
+Without the module/initrd the kernel boots exactly as before (HTTP/shell),
+with a single `[SIDECAR] no initrd module — init sidecar not launched` line.
 
 ## Design notes
 

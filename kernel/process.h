@@ -288,6 +288,14 @@ extern uint32_t                 proc_count;
 
 void     process_init(void);
 uint32_t alloc_pid(void);  // returns a fresh PID (no collision with existing active procs)
+
+// Allocates a process's dedicated 8 KiB kernel syscall stack (TWO contiguous
+// frames — see alloc_proc_syscall_stack's comment in process.c). Returns the
+// stack TOP, or 0 on failure. Shared by process_create()/program_spawn_common()
+// and cap_create_sidecar() (whose async children run through the scheduler
+// and must have their own syscall stack before their first syscall).
+uint64_t alloc_proc_syscall_stack(uint32_t partition_id);
+
 uint32_t process_create(struct ProcCreateRequest* req);  // returns PID or 0
 uint32_t program_spawn_nb(const char* object_name, uint32_t owner_uid);
 

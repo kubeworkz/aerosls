@@ -2795,6 +2795,32 @@ int cap_create_sidecar(uint32_t parent_pid,
     }
     proc_count++;
 
+    /* The async child runs through the scheduler, which iretq's from the
+     * synthetic ring3_ctx frame and repoints [gs:8] (per_cpu_data.kernel_rsp)
+     * at the child's OWN syscall stack on every switch — the child must
+     * have BOTH before it can be scheduled. Allocate the dedicated 8 KiB
+     * syscall stack (two contiguous frames, same as process_create) and
+     * fill the synthetic context exactly like the async spawn path in
+     * process.c. Without either, the child's first schedule would iretq
+     * from a zeroed frame and its first syscall would push onto the
+     * kernel's stack. */
+    pd->syscall_stack_top = alloc_proc_syscall_stack(parent->partition_id);
+    if (!pd->syscall_stack_top) {
+        kernel_serial_print("[SIDECAR] create: syscall stack allocation failed\n");
+        pd->active = 0;
+        proc_count--;
+        return CAP_ENOMEM;
+    }
+    {
+        uint64_t* ctx = (uint64_t*)&pd->ring3_ctx;
+        for (int i = 0; i < 15; i++) ctx[i] = 0;
+        ctx[15] = pd->user_rip;
+        ctx[16] = 0x23;      /* ring-3 code */
+        ctx[17] = 0x202;     /* IF on */
+        ctx[18] = pd->user_rsp;
+        ctx[19] = 0x1B;      /* ring-3 data */
+    }
+
     /* ── 8. Bind cap table, create messenger channel ──────────────────── */
     int cti = cap_table_index(pd->pid);
     if (cti < 0) {
@@ -2903,9 +2929,13 @@ int cap_create_sidecar(uint32_t parent_pid,
     per_cpu_data[0].kernel_rsp = parent->syscall_stack_top;
 
     /* ── 9. Write BootInfoBlock at child's stack top ─────────────────── */
-    /* BIB lives at the top 4 KiB of the stack. The sidecar _start reads
-     * RSP to find it (user/proto/src/bootinfo.rs: RSP → BIB). */
+    /* BIB lives at the top 4 KiB of the stack, and _start receives its
+     * VIRTUAL address in rdi — the sidecar crt0 contract (crt0.S: "the
+     * kernel jumps to _start with a pointer to the Boot Info Block in
+     * a0/rdi"). The synthetic frame zeroed all GPRs above, so rdi must
+     * be filled here or the child's first `mov %rdi, %r13` saves zero. */
     uint64_t bib_vaddr = stack_base + (uint64_t)stk_pages * 4096 - 4096;
+    ((uint64_t*)&pd->ring3_ctx)[9] = bib_vaddr;   /* TaskContext order: rdi */
     uint64_t bib_paddr = 0;
     /* Walk the page table to find the physical frame backing bib_vaddr. */
     {

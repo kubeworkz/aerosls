@@ -1,0 +1,32 @@
+[package]
+name = "aerosls-dm"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS Device Manager sidecar (aerosls.device_manager.v1 / drv.device_manager.0) — receives the device registry from init, serves the registry handshake, and orchestrates driver sidecar composition (Phase 5 §2)"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+[[bin]]
+name = "dm"
+path = "src/bin/dm.rs"
+required-features = ["target"]
+
+[features]
+default = []
+# `target` enables the real kernel ABI (extern "C" syscalls), the sidecar
+# entry point (rust_entry), the crt0 (crt0.S via global_asm!), and the
+# panic handler. Build the sidecar image with:
+#   cargo build -p aerosls-dm --features target --target x86_64-unknown-none \
+#       --release --bin dm
+# which produces target/x86_64-unknown-none/release/dm — an ELF whose
+# first byte is `_start` (dm.ld places .text._start at address 0);
+# flatten it (aerosls-bootimage flatten / objcopy -O binary) for the
+# kernel. The linker script is applied automatically via build.rs.
+# The default (host) build omits them so the crate links cleanly into the
+# test harness against the fake kernel (aerosls-kernel-sim).
+target = ["aerosls-proto/target"]

@@ -224,6 +224,16 @@ uint32_t alloc_pid(void) {
     return best + 1;
 }
 
+/* cap.c allocates the child's dedicated syscall stack via
+ * alloc_proc_syscall_stack (normally process.c, whose contiguous-frame
+ * allocator the host test does not link). Stub: a fixed non-zero top above
+ * the child's image/stack; the host test never schedules the child, so the
+ * value only has to be non-zero and stable for assertions. */
+uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
+    (void)partition_id;
+    return 0x400000007000ULL;
+}
+
 /* ─── Frame stubs: real host memory (see file header) ──────────────────────
  * malloc + manual 4 KiB alignment instead of aligned_alloc() (C11, absent
  * from some libcs). The slack per frame is wasted on purpose — nothing in
@@ -782,6 +792,23 @@ int main(void) {
         CHECK(b.version == SIDECAR_BIB_VERSION, "BIB version 1");
         CHECK(b.cap_count == 8, "BIB lists 8 caps (2 messenger + 2 MEM + 4 wired CHAN)");
         CHECK(b.budget_bytes == BUDGET_MEM, "BIB budget matches the manifest");
+        /* The async child is scheduled by the kernel, which iretq's from
+         * the synthetic ring3_ctx and repoints [gs:8] at the child's own
+         * syscall stack — both must be populated for the child to run. */
+        CHECK(child->syscall_stack_top == 0x400000007000ULL,
+              "child has a dedicated syscall stack (alloc_proc_syscall_stack)");
+        CHECK(child->ring3_ctx[15] == child->user_rip &&
+              child->ring3_ctx[16] == 0x23 &&
+              child->ring3_ctx[17] == 0x202 &&
+              child->ring3_ctx[18] == child->user_rsp &&
+              child->ring3_ctx[19] == 0x1B,
+              "synthetic ring3_ctx carries the entry rip/cs/rflags/rsp/ss");
+        /* The sidecar crt0 contract: _start receives the BIB pointer in
+         * rdi (TaskContext index 9) and saves it before switching to its
+         * own boot stack — without this the child's first instruction
+         * would save zero and rust_entry would parse garbage. */
+        CHECK(child->ring3_ctx[9] == BIB_VADDR,
+              "synthetic ring3_ctx carries the BIB pointer in rdi (crt0 contract)");
         CHECK(b.stack_top == BIB_STACK_TOP, "BIB stack_top = RSP at _start + 16");
         /* Entry = name_len u16 + name + slot u16 + ty u8 + rights u8 +
          * base u64 + len u64: 32 header + 22 (cap0) + 22 (cap1) + 28

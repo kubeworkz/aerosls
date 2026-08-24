@@ -20,8 +20,75 @@ use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
+/* The crt0 (crt0.S) is assembled by rustc's own LLVM integrated assembler
+ * through global_asm — no external cross-GCC — and linked at address 0 by
+ * init.ld (ENTRY(_start)). It saves rdi (the BIB pointer from the kernel's
+ * synthetic frame) before switching to the sidecar's own boot stack.
+ *
+ * `options(att_syntax)` is load-bearing: without it, rustc's global_asm
+ * defaults to INTEL syntax when this crate is compiled as a LIBRARY (the
+ * rlib the bin links against) but AT&T when linked as a bin — the same
+ * file must parse in both builds, so the dialect is pinned here instead
+ * of inside crt0.S (which also keeps crt0.S GAS-assemblable).
+ *
+ * `target_os = "none"` scopes all of this to the freestanding image: a
+ * host `cargo check --features target` (the documented way to typecheck
+ * the real path) builds the same crate for the host, where a custom
+ * #[panic_handler] conflicts with the host's panic=unwind and the crt0
+ * has no place. */
+#[cfg(all(feature = "target", target_arch = "x86_64", target_os = "none"))]
+core::arch::global_asm!(include_str!("crt0.S"), options(att_syntax));
+
 /// Reserved heap over the budget region (single-threaded sidecar).
 static mut HEAP: Bump = Bump::new();
+
+/* ── panic handler (freestanding image only) ────────────────────────────────
+ * rust_entry and the demo loop panic on unrecoverable contract failures
+ * (`.expect()` on missing caps, `create_sidecar` failure, ...). The host
+ * test harness keeps std's handler; the sidecar image needs its own, and
+ * without one the target build does not link. Best effort: log the panic
+ * to the kernel serial log through the legacy SYS_SLS_SERIAL_WRITE syscall
+ * (165, NUL-terminated string pointer in rdi — dispatch.c case 165), then
+ * park forever. A panic in a panic=abort sidecar must not unwind, and a
+ * visible halt beats a silent hang: the watchdog/console path can see the
+ * [PANIC] line even though this sidecar is done.
+ *
+ * `target_os = "none"`: the host test harness keeps std's handler and the
+ * host build links with panic=unwind — a custom handler is only valid in
+ * the freestanding image. */
+#[cfg(all(feature = "target", target_os = "none"))]
+struct PanicBuf([u8; 256]);
+
+#[cfg(all(feature = "target", target_os = "none"))]
+impl core::fmt::Write for PanicBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // At most 255 bytes written; byte 255 stays 0 (NUL terminator).
+        let n = s.len().min(255);
+        self.0[..n].copy_from_slice(&s.as_bytes()[..n]);
+        Ok(()) // truncates silently rather than failing
+    }
+}
+
+#[cfg(all(feature = "target", target_os = "none"))]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write as _;
+    let mut b = PanicBuf([0; 256]);
+    let _ = core::write!(&mut b, "[PANIC] {info}");
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 165u64 => _,  // SYS_SLS_SERIAL_WRITE
+            in("rdi") b.0.as_ptr(),
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 /* The budget MEM cap funds the heap; expose it as the crate's GLOBAL
  * allocator so the sidecar can use `alloc` (build_manifest in

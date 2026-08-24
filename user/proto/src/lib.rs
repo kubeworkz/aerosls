@@ -42,6 +42,7 @@ pub use spin::Mutex;
 /// ── Boot Info Block + packed sidecar manifest (kernel ↔ sidecar contract) ──
 
 pub mod bootinfo;
+pub mod devreg;
 pub mod manifest;
 
 /// ── Channel envelope (Layer 2, transport spec §3.1) ────────────────────────

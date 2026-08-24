@@ -29,6 +29,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerosls-bootimage"
+version = "0.1.0"
+dependencies = [
+ "aerosls-proto",
+]
+
+[[package]]
+name = "aerosls-dm"
+version = "0.1.0"
+dependencies = [
+ "aerosls-kernel-sim",
+ "aerosls-proto",
+]
+
+[[package]]
 name = "aerosls-gui"
 version = "0.1.0"
 dependencies = [

@@ -30,7 +30,6 @@ extern crate alloc;
 
 pub mod chan;
 pub mod demo;
-pub mod devreg;
 pub mod dm_manifest;
 pub mod heap;
 
@@ -40,6 +39,10 @@ mod entry;
 #[cfg(test)]
 pub mod sim;
 
+/// The device-registry wire format lives in `aerosls_proto` (shared with
+/// the Device Manager sidecar, which parses the same table from the MEM
+/// cap init grants it); re-export the module so `crate::devreg::*` keeps
+/// working exactly as before.
+pub use aerosls_proto::devreg;
 pub use chan::{ChannelError, InitChannel};
-pub use devreg::{DeviceEntry, DeviceRegistry, DevRegError, MAX_DEVICES};
 pub use heap::Bump;

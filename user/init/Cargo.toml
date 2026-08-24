@@ -11,9 +11,21 @@ aerosls-proto = { path = "../proto" }
 [dev-dependencies]
 aerosls-kernel-sim = { path = "../kernel-sim" }
 
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+required-features = ["target"]
+
 [features]
 default = []
-# `target` enables the real kernel ABI (extern "C" syscalls) and the sidecar
-# entry point.  Build the sidecar image with:
-#   cargo build -p aerosls-init --features target --target x86_64-unknown-none
+# `target` enables the real kernel ABI (extern "C" syscalls), the sidecar
+# entry point (rust_entry), the crt0 (crt0.S via global_asm!), and the
+# panic handler. Build the sidecar image with:
+#   cargo build -p aerosls-init --features target --target x86_64-unknown-none \
+#       --release --bin init
+# which produces target/x86_64-unknown-none/release/init — an ELF whose
+# first byte is `_start` (init.ld places .text._start at address 0);
+# flatten it (aerosls-bootimage flatten / objcopy -O binary) for the
+# kernel. The linker script is applied automatically via
+# user/.cargo/config.toml's rustflags for the x86_64-unknown-none target.
 target = ["aerosls-proto/target"]

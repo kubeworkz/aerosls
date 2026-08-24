@@ -187,7 +187,7 @@ static void nested_ring3_prep(struct ProcessDescriptor* spawner,
 // ASCENDING and the kernel is single-threaded, so two consecutive allocs
 // return adjacent frames; if they don't (defensive), free both and retry
 // once, then fail. Returns the stack TOP, or 0.
-static uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
+uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
     for (int attempt = 0; attempt < 2; attempt++) {
         void* a = allocate_physical_ram_frame_for_partition(partition_id);
         void* b = allocate_physical_ram_frame_for_partition(partition_id);

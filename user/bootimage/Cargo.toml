@@ -1,0 +1,17 @@
+[package]
+name = "aerosls-bootimage"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 5 boot image builder — packages the init and Device Manager sidecar binaries into an initrd CPIO archive with each image at its manifest-declared physical address"
+license = "MIT"
+
+# Host tool (std): packages sidecar binaries + packed manifests into a
+# newc CPIO initrd. Reuses aerosls-proto's build_manifest so the archive's
+# manifest blobs share the one wire-format source of truth with the kernel
+# parser and the runtime dm_manifest.rs packer.
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[[bin]]
+name = "aerosls-bootimage"
+path = "src/main.rs"

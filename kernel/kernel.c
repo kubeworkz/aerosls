@@ -25,6 +25,7 @@ int  sls_tls_time_init(void);
 extern int sls_launch_guest(const void *image, uint32_t len,
                              uint64_t entry_gpa, uint32_t max_insns);
 #include "boot_params.h"   // boot-time cluster identity (node=<n>)
+#include "boot_image.h"     // Phase 5: initrd boot image + init sidecar launch
 #include "smp.h"           // AP bring-up + the uniprocessor fallback
 #include "failover.h"      // Step 5 -- peer liveness + checkpoint recovery
 #include "partition.h"
@@ -172,6 +173,12 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
      * be settled before partition_init(), and print_hw_info() runs here only
      * for the memory map. */
     boot_params_scan_mb2(mb2_magic, mb2_phys);
+
+    /* Remember the first Multiboot2 module — the Phase 5 initrd (the
+     * sidecars.cpio boot image). Captured early, alongside the command
+     * line, while the mb2 info block is fresh; launch_init_sidecar()
+     * consumes it at step 7d. */
+    boot_image_capture_mb2(mb2_magic, mb2_phys);
 
     uint64_t top_usable = print_hw_info(mb2_magic, mb2_phys);
     /* ...and bound the top, so the pool never offers memory the machine
@@ -478,6 +485,14 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // demo account as ROLE_GUEST (its default for an unregistered uid),
     // which denied vector-store/table writes even for dave's DB_ADMIN token.
     auth_seed_default_roles();
+
+    // ── 7d. Sidecar subsystem: boot image + init sidecar launch ─────────────
+    // Phase 5 (self-hosted): reserve the boot-image span, copy the init/DM
+    // images to their declared addresses, build the device registry, and
+    // create the init sidecar (which then spawns the Device Manager at
+    // runtime via SYS_SLS_CREATE_SIDECAR). Non-fatal: with no initrd the
+    // kernel boots as before.
+    launch_init_sidecar();
 
     kernel_serial_print(
         "----------------------------------------------------------------------------------\n"

@@ -161,6 +161,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/partition.c \
               kernel/boot_params.c kernel/node_reset.c \
               kernel/console.c kernel/console_service.c \
+              kernel/boot_image.c \
               kernel/loader.c \
               kernel/simi_x86.c \
               kernel/simi_runtime.c \
@@ -599,6 +600,11 @@ $(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS)
 x86-iso: $(X86_BIN)
 	mkdir -p isodir/boot/grub
 	cp $(X86_BIN) isodir/boot/
+	# Phase 5: when the sidecars initrd exists, ship it so the Phase 5
+	# GRUB menuentry can load it as a Multiboot2 module (build it with
+	# `make selfhost-bootimage`). Without it, the ISO is byte-identical to
+	# the pre-Phase-5 image and boots exactly as before.
+	@if [ -s "$(SIDECAR_CPIO)" ]; then cp "$(SIDECAR_CPIO)" isodir/boot/; echo "[ISO] including $(SIDECAR_CPIO)"; fi
 	cp grub.cfg isodir/boot/grub/
 	grub-mkrescue --modules="normal multiboot2 iso9660 gfxterm font" \
 	              -o $(X86_ISO) isodir
@@ -750,7 +756,7 @@ clean:
 	find . -name '*.x86.o' -not -path './.git/*' -delete
 	find . -name '*.rv.o'  -not -path './.git/*' -delete
 	find . -name '*.ar64.o' -not -path './.git/*' -delete
-	rm -f *.o *.bin *.iso *.elf *.img *.log $(ALLOC_PLUGIN)
+	rm -f *.o *.bin *.iso *.elf *.img *.log *.cpio $(ALLOC_PLUGIN)
 	rm -f $(AB_STAMP) $(BID_STAMP) $(SLS_STAMP)
 	rm -rf tcg-objs
 
@@ -861,6 +867,56 @@ user/examples/simi_recycle.elf: user/examples/simi_recycle_tmo_blob.h
 user-programs: $(USER_BINS)
 
 .PHONY: user-programs
+
+# ── Phase 5 self-hosted boot image ──────────────────────────────────────────
+# Packages the init + Device Manager sidecar binaries into sidecars.cpio — a
+# `newc` initrd (GRUB Multiboot2 module, U-Boot `-initrd`/`bootm`, QEMU
+# `-initrd`) with each image at its manifest-declared physical address. The
+# producer is the host tool aerosls-bootimage (user/bootimage/); the
+# consumer contract lives in kernel/boot_image.h.
+#
+# BOTH sidecar binaries are produced HERE, end to end:
+#   cargo build -p aerosls-init -p aerosls-dm --features target \
+#       --target x86_64-unknown-none --release --bin init --bin dm
+#       -> two ELFs whose first byte is `_start` (crt0.S via global_asm!,
+#          linked by init.ld/dm.ld via build.rs — rustc's own rust-lld,
+#          no cross-GCC needed)
+#   aerosls-bootimage flatten   -> the flat binaries (PT_LOAD extraction,
+#                          mini-objcopy) at SIDECAR_INIT_BIN/SIDECAR_DM_BIN
+# If the cross target is not installed, cargo build fails and the target
+# warns and uses the SIDECAR_*_BIN paths as-is (set them to existing
+# binaries to build only the archive). The packaging itself is verified
+# independently by the crate's golden tests:
+#   cargo test -p aerosls-bootimage (user/Cargo.toml).
+CARGO            ?= cargo
+SIDECAR_INIT_ELF ?= user/target/x86_64-unknown-none/release/init
+SIDECAR_DM_ELF   ?= user/target/x86_64-unknown-none/release/dm
+SIDECAR_INIT_BIN ?= user/target/x86_64-unknown-none/release/init.bin
+SIDECAR_DM_BIN   ?= user/target/x86_64-unknown-none/release/dm.bin
+SIDECAR_CPIO     ?= sidecars.cpio
+
+.PHONY: selfhost-bootimage
+selfhost-bootimage:
+	@echo "[SELFHOST] building the init + Device Manager sidecars for x86_64-unknown-none..."
+	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init -p aerosls-dm \
+		--features target --target x86_64-unknown-none --release \
+		--bin init --bin dm 2>/dev/null \
+		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using SIDECAR_INIT_BIN/SIDECAR_DM_BIN as-is"
+	@if [ -s "$(SIDECAR_INIT_ELF)" ]; then \
+		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
+			flatten --input "$(SIDECAR_INIT_ELF)" --output "$(SIDECAR_INIT_BIN)"; \
+	fi
+	@if [ -s "$(SIDECAR_DM_ELF)" ]; then \
+		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
+			flatten --input "$(SIDECAR_DM_ELF)" --output "$(SIDECAR_DM_BIN)"; \
+	fi
+	@test -s "$(SIDECAR_INIT_BIN)" \
+		|| { echo "[SELFHOST] missing init binary: $(SIDECAR_INIT_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_INIT_BIN="; exit 1; }
+	@test -s "$(SIDECAR_DM_BIN)" \
+		|| { echo "[SELFHOST] missing DM binary: $(SIDECAR_DM_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_DM_BIN="; exit 1; }
+	$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
+		--init "$(SIDECAR_INIT_BIN)" --dm "$(SIDECAR_DM_BIN)" -o "$(SIDECAR_CPIO)"
+	@echo "[SELFHOST] boot image: $(SIDECAR_CPIO) (load as an initrd at the bootloader's module path)"
 
 # ── SIMI host toolchain ─────────────────────────────────────────────────────
 # Assembler/interpreter/disassembler/JIT-test for SIMI bytecode (tools/simi/).

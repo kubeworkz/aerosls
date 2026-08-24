@@ -8,6 +8,7 @@
 
 // ─── Tag types we care about ──────────────────────────────────────────────────
 #define MB2_TAG_END        0   // last tag
+#define MB2_TAG_MODULE     3   // a boot module (the initrd)
 #define MB2_TAG_MMAP       6   // memory map
 #define MB2_TAG_ACPI_OLD  14   // ACPI RSDP v1
 #define MB2_TAG_ACPI_NEW  15   // ACPI RSDP v2
@@ -23,6 +24,19 @@ struct mb2_info {
 struct mb2_tag {
     uint32_t type;
     uint32_t size;
+} __attribute__((packed));
+
+// ─── Module tag (type 3) ─────────────────────────────────────────────────────
+// A boot module GRUB loaded alongside the kernel — the Phase 5 initrd
+// (sidecars.cpio). mod_start/mod_end are physical addresses in the module's
+// memory region; the command line follows (NUL-terminated, then the tag is
+// 8-byte aligned via mb2_tag_next).
+struct mb2_tag_module {
+    uint32_t type;          // = 3
+    uint32_t size;
+    uint32_t mod_start;
+    uint32_t mod_end;
+    // char cmdline[];
 } __attribute__((packed));
 
 // ─── Memory map tag (type 6) ─────────────────────────────────────────────────
