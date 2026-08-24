@@ -497,6 +497,26 @@ __attribute__((weak)) int cap_arch_unmap_page(uint64_t pml4_phys, uint64_t vaddr
 
 __attribute__((weak)) void cap_arch_tlb_flush(void) { }
 
+/* Phase 5 sidecar MEM-cap grant: after the kernel moves a MEM cap across a
+ * channel (cap_recv_msg), the region must be Ring-3-accessible in the
+ * RECEIVER's address space — the BIB/MEM-cap contract is identity-mapped
+ * user access (kernel/cap.c writes the cap's PHYSICAL base into the BIB /
+ * cap_info and the sidecar reads it directly). For a manifest MEM cap,
+ * cap_create_sidecar calls user_map_identity during mint; a cap GRANTED
+ * over a channel reaches the receiver WITHOUT that step, so the receiver
+ * would fault with error=0x5 (present but supervisor-only) on the shared
+ * kernel identity map (observed under QEMU for the init→DM device-registry
+ * grant). This hook re-points only the receiver's own page-table copies of
+ * the path (arch/x86/user_paging.c user_map_identity), never the shared
+ * kernel tables. Weak default: no-op, matching the posture where host
+ * tests have no page tables. */
+__attribute__((weak))
+int cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
+                               uint32_t npages, uint32_t cap_perms) {
+    (void)pml4_phys; (void)phys; (void)npages; (void)cap_perms;
+    return 0;
+}
+
 /* ─── Init ─────────────────────────────────────────────────────────────────── */
 
 void cap_init(void) {
@@ -680,6 +700,7 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
     struct CapChannel* ch = &cap_channels[chan_id];
     cap_lock_init(&ch->lock);
     ch->end0_pid = (uint16_t)pid;
+    ch->end1_pid = (uint16_t)far_pid;   /* far-end owner at creation */
     ch->active = 1;
     for (int d = 0; d < 2; d++) {
         ch->qhead[d] = 0;
@@ -1402,6 +1423,21 @@ int cap_recv_msg(uint32_t pid, uint16_t ch_r_idx,
                           (uint16_t)(entry * CAP_MSG_MAX_CAPS + i));
         cap_holder_link(hs, obj);
         t->slots[nslot].word = m->cap_word[i];
+        /* A GRANTED MEM cap must be Ring-3-readable in the receiver's
+         * address space (Phase 5 sidecar contract): the shared kernel
+         * identity map is supervisor-only, so re-point the receiver's own
+         * page-table copies of this region (arch hook; no-op in host
+         * tests). Only MEM objects carry a physical region — CHAN objects
+         * are not identity-mapped. Called under the object lock so the
+         * phys_base/npages are stable; the receiver is `pid` whose table
+         * is stable while it runs this syscall. */
+        uint32_t moved_ty = (uint32_t)((m->cap_word[i] >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+        if (moved_ty == CAP_TYPE_MEM) {
+            uint64_t recv_cr3 = cap_proc_cr3(pid);
+            if (recv_cr3)
+                cap_arch_identity_map_user(recv_cr3, obj->phys_base,
+                                           obj->npages, (uint32_t)m->cap_rights[i]);
+        }
         if (out_caps && n_installed < max_caps) {
             out_caps[n_installed].slot = nslot;
             out_caps[n_installed].offset = m->cap_off[i];
@@ -2616,13 +2652,16 @@ int cap_create_sidecar(uint32_t parent_pid,
             break;
         }
         case SIDECAR_TAG_CPU: {
-            if (rlen < 4) return CAP_EINVAL;
-            /* share_pct, preemptible — informational */
+            /* Wire layout (manifest.rs, the format reference): share u16 +
+             * preemptible u8 = 3 bytes. Informational — not consumed. */
+            if (rlen < 3) return CAP_EINVAL;
             break;
         }
         case SIDECAR_TAG_LIMITS: {
-            if (rlen < 12) return CAP_EINVAL;
-            /* max_tasks, max_fds, max_chans — informational */
+            /* Wire layout (manifest.rs): max_tasks u16, max_fds u16,
+             * max_channels u16, max_open_files u16, chan_queue_depth u16
+             * = 10 bytes. Informational — not consumed. */
+            if (rlen < 10) return CAP_EINVAL;
             break;
         }
         case SIDECAR_TAG_CAP_MEM: {
@@ -2735,8 +2774,16 @@ int cap_create_sidecar(uint32_t parent_pid,
         const uint8_t* src = (const uint8_t*)(uintptr_t)(image_kaddr + (uint64_t)p * 4096);
         uint8_t* dst = (uint8_t*)(uintptr_t)faddr;
         for (uint32_t b = 0; b < chunk; b++) dst[b] = src[b];
+        /* Flat sidecar image: code, rodata, data and the crt0's .bss boot
+         * stack are interleaved with no per-page distinction (the flattener
+         * emits lowest→highest vaddr with zero-filled gaps), so every page
+         * is mapped WRITE+EXEC — the same RWX posture loader.c uses for
+         * flat binaries. The crt0 MUST be able to push onto its own .bss
+         * boot stack before rust_entry runs; EXEC-only made that first
+         * `call` a write-protection #PF (observed under QEMU). */
         user_map_page(pml4, image_vbase + (uint64_t)p * 4096, faddr,
-                      USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_EXEC);
+                      USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE
+                      | USER_PTE_EXEC);
         bytes_left -= chunk;
     }
 
@@ -2862,6 +2909,20 @@ int cap_create_sidecar(uint32_t parent_pid,
             kernel_serial_printf("[SIDECAR] create: mem cap '%s' failed\n",
                                  sc->name);
             /* Non-fatal: the sidecar can still boot without this cap. */
+            continue;
+        }
+        /* The BIB carries the cap's PHYSICAL base and the sidecar reads it
+         * directly, so the region must be identity-mapped with Ring-3 access
+         * in the child's address space. The shared kernel identity map is
+         * supervisor-only (ring-3 reads fault — observed under QEMU), and
+         * user_map_page() would corrupt the shared huge pages, so this uses
+         * the dedicated identity remap (arch/x86/user_paging.c). */
+        {
+            uint64_t leaf = USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_NOEXEC;
+            if (perms & CAP_PERM_W) leaf |= USER_PTE_WRITE;
+            if (user_map_identity(pml4, sc->phys_base, npages, leaf) != 0)
+                kernel_serial_printf("[SIDECAR] create: mem cap '%s' map failed\n",
+                                     sc->name);
         }
     }
 

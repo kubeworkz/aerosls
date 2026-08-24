@@ -381,7 +381,7 @@ void launch_init_sidecar(void) {
     /* 5. Create the init sidecar from boot/init.manifest. The manifest's
      *    caps (budget, console, device_registry, dm.image) are minted and
      *    wired by cap_create_sidecar; the child is released PROC_SUSPENDED
-     *    and runs on the next scheduler tick. */
+     *    with a synthetic ring3_ctx (BIB pointer in rdi). */
     uint16_t ch_r = CAP_NONE;
     r = cap_create_sidecar(BOOT_PARENT_PID, init_manifest, mlen,
                            CAP_NONE, CAP_NONE, &ch_r);
@@ -392,11 +392,38 @@ void launch_init_sidecar(void) {
     /* The child is the newest active process (cap_create_sidecar's async
      * spawn; the synthetic parent never runs). */
     uint32_t child_pid = 0;
+    struct ProcessDescriptor* child = 0;
     for (int i = 0; i < PROC_MAX; i++)
-        if (proc_table[i].active && proc_table[i].pid > child_pid)
+        if (proc_table[i].active && proc_table[i].pid > child_pid) {
             child_pid = proc_table[i].pid;
+            child = &proc_table[i];
+        }
     kernel_serial_printf(
         "[SIDECAR] init sidecar created (PID %u, messenger CHAN_R %u) — "
-        "runs on next schedule\n",
+        "entering ring 3\n",
         (unsigned)child_pid, (unsigned)ch_r);
+    if (!child) return;
+
+    /* 6. Hand the boot to the init sidecar. At boot nothing is ever in
+     *    ring 3 (the shell and HTTP server run in ring 0), so the ring-3
+     *    timer scheduler NEVER fires and a SUSPENDED child would sit
+     *    unrun forever. Enter the child directly via the sysret path with
+     *    the BIB pointer in rdi (kernel_enter_sidecar — the kernel_enter_
+     *    ring3 variant that does not zero rdi, which the sidecar crt0
+     *    contract requires). This never returns while init runs: init
+     *    parks in its event loop and the timer scheduler takes over from
+     *    there (preempting init in ring 3, switching to the DM child init
+     *    spawns, and so on). The pre-Phase-5 shell/HTTP boot is skipped
+     *    when an initrd is present — the sidecar system IS the boot.
+     *    kernel_rsp is saved by the asm before sysret, so on the first
+     *    timer preemption schedule_ring3 finds init as "current". */
+    child->state = PROC_RUNNING;
+    per_cpu_data[0].kernel_rsp = child->syscall_stack_top;
+    kernel_enter_sidecar(&child->kernel_rsp, &child->kernel_cr3,
+                         child->cr3, child->user_rip, child->user_rsp,
+                         ((uint64_t*)&child->ring3_ctx)[9]);  /* rdi = BIB */
+    /* Only reached if init exits — which it never does (it parks in the
+     * event loop); belt-and-braces, mirror the create-failed posture. */
+    kernel_serial_printf("[SIDECAR] init sidecar exited (PID %u)\n",
+                         (unsigned)child_pid);
 }

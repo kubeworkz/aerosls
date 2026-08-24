@@ -5,6 +5,14 @@
 #include <stddef.h>
 #include "scheduler.h"   /* struct TaskContext */
 
+/* Phase 5 wait park: the maximum number of channel endpoints one
+ * k_chan_wait may poll/park on. cap.h defines the same constant, but it
+ * must stay stdint-only by design (see its header comment), so process.h
+ * cannot include it — keep the two definitions in sync. */
+#ifndef CHAN_WAIT_MAX_CHANS
+#define CHAN_WAIT_MAX_CHANS 8
+#endif
+
 // ─── Process states ───────────────────────────────────────────────────────────
 // Navigator-Parity Gap Roadmap Phase 4: added PROC_HELD as a *distinct* state
 // from PROC_SUSPENDED, not a reuse of it. Investigation before writing any
@@ -321,7 +329,7 @@ void     sys_sls_proc_list(void);
 // (iretq'd to after wake); it re-runs whatever syscall park_syscall names.
 int  cap_wait_chan(uint32_t chan_id, void* recv_req);
 int  cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
-                    uint32_t park_syscall);
+                    uint32_t park_syscall, uint64_t deadline_ticks);
 void cap_wake_chan(uint32_t chan_id);
 void cap_recv_resume(struct ProcessDescriptor* pd);   /* noreturn */
 
@@ -444,6 +452,15 @@ uint64_t schedule_ring3(uint64_t ctx_rsp);
 // Returns after process_exit() restores the kernel continuation.
 void kernel_enter_ring3(uint64_t* rsp_save, uint64_t* cr3_save,
                          uint64_t cr3, uint64_t rip, uint64_t rsp);
+
+// kernel_enter_ring3() variant for the boot-time init sidecar: enters
+// Ring-3 via sysretq with rdi = the child's Boot Info Block VIRTUAL
+// address (the sidecar crt0 contract) instead of zeroing rdi like the
+// legacy entry. See process_enter.asm. Never returns while the sidecar
+// runs; process_exit() restores the saved kernel continuation.
+void kernel_enter_sidecar(uint64_t* rsp_save, uint64_t* cr3_save,
+                          uint64_t cr3, uint64_t rip, uint64_t rsp,
+                          uint64_t bib_vaddr);
 
 // Low-level: enter user space via sysretq (does not return in kernel context)
 void enter_user_process(uint64_t cr3, uint64_t rip, uint64_t rsp);

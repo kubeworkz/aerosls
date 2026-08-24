@@ -29,7 +29,9 @@
 //! wired by the DM) and is future work, deliberately not faked here.
 
 use aerosls_proto::devreg::{DevRegError, DeviceRegistry};
-use aerosls_proto::kabi::{GrantedCap, Kernel, TIMEOUT_NONE, CAP_NONE};
+use aerosls_proto::kabi::{
+    GrantedCap, Kernel, TIMEOUT_NONE, CAP_NONE, ERR_TIMEOUT,
+};
 use aerosls_proto::{CH_KIND_CLOSE, CH_KIND_MSG, R};
 
 /// Protocol message IDs — must match `user/init/src/chan.rs` (the init
@@ -89,6 +91,13 @@ pub enum DmOutcome {
     /// The registry handshake was served: `devices` entries adopted and
     /// `MSG_DEVICES_READY` replied.
     RegistryServed { devices: usize },
+    /// A `k_chan_wait` under TIMEOUT_NONE reported the caller could not
+    /// park (the real kernel returns CAP_ERR_TIMEOUT when every process is
+    /// parked and nothing is runnable to switch to — a boot-time artifact,
+    /// not a dead peer). This is NOT a server failure: the loop retries.
+    /// Only reachable in real-kernel boots where the scheduler hands
+    /// TIMEOUT back for an already-idle wait; host sims never see it.
+    Idle,
     /// A future protocol message was acknowledged (logged, no reply — the
     /// reply tags are per-message protocol, and v1 defines none yet).
     Acknowledged { tag: u32 },
@@ -167,10 +176,18 @@ impl<K: Kernel> DmServer<K> {
         slots: &mut [GrantedCap; 4],
     ) -> Result<DmOutcome, DmError> {
         let mut chans = [self.msg_r];
-        let (idx, kind) = self
-            .k
-            .wait(&mut chans, TIMEOUT_NONE)
-            .map_err(DmError::Kernel)?;
+        let (idx, kind) = match self.k.wait(&mut chans, TIMEOUT_NONE) {
+            Ok(v) => v,
+            Err(ERR_TIMEOUT) => {
+                // `serve_one` always waits with TIMEOUT_NONE, so a returned
+                // TIMEOUT can only mean the kernel could not park this
+                // process (every process is blocked and nothing is runnable
+                // to hand the CPU to). At end of a boot that's an idle demo,
+                // not a failure — retry rather than abort the server loop.
+                return Ok(DmOutcome::Idle);
+            }
+            Err(e) => return Err(DmError::Kernel(e)),
+        };
         if idx != 0 {
             return Err(DmError::Kernel(-1));
         }
@@ -264,9 +281,19 @@ impl<K: Kernel> DmServer<K> {
     /// then return — `entry.rs` parks/spins after. `buf` is scratch.
     pub fn run(&self, buf: &mut [u8]) -> Result<(), DmError> {
         let mut slots = [GrantedCap::default(); 4];
+        let mut idle_logged = false;
         loop {
             match self.serve_one(buf, &mut slots)? {
                 DmOutcome::Closed(_reason, _detail) => return Ok(()),
+                // Couldn't park (nothing runnable — idle demo boot tail):
+                // note it once and keep retrying for future messages; the
+                // retry is scheduler-tick-throttled, not a hot spin.
+                DmOutcome::Idle => {
+                    if !idle_logged {
+                        self.log("[DM] messenger idle (all peers parked); waiting for events");
+                        idle_logged = true;
+                    }
+                }
                 _ => {}
             }
         }

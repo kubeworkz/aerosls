@@ -130,15 +130,25 @@ static void clone_kernel_slots(uint64_t* dst, uint64_t* src) {
     }
 }
 
-uint64_t user_clone_page_table(void) {
-    uint64_t current_cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
-    uint64_t* kernel_pml4 = (uint64_t*)(uintptr_t)(current_cr3 & USER_PTE_FRAME_MASK);
+/* The kernel's own boot identity map (arch/x86/boot.asm): the canonical
+ * supervisor half every process table shares by pointer. Cloning from THIS
+ * table — rather than from the current CR3 — matters for sidecar spawns
+ * (Phase 5): a sidecar calls k_create_sidecar from ring 3, so the kernel
+ * handles that syscall with the SIDECAR's CR3 active. That table's identity
+ * slot (PML4[0]) may have been re-pointed to a USER PDPT by
+ * user_map_identity, and clone_kernel_slots skips USER entries — a child
+ * spawned from that state would inherit NO kernel identity map and the
+ * first kernel-code fetch after its CR3 switch would #PF (observed under
+ * QEMU: fault at 0x139d1e, CR2 = the schedule_ring3 continuation, right
+ * after mov cr3,<child>). boot.asm's p4_table is never modified after
+ * boot, so it is always the authoritative kernel half. */
+extern uint64_t p4_table[512];
 
+uint64_t user_clone_page_table(void) {
     uint64_t* new_pml4 = alloc_page_table();
     if (!new_pml4) return 0;
 
-    clone_kernel_slots(new_pml4, kernel_pml4);   /* user slots stay zero */
+    clone_kernel_slots(new_pml4, p4_table);   /* user slots stay zero */
 
     kernel_serial_printf("[PAGING] New user PML4 at 0x%016lx\n",
                          (uint64_t)(uintptr_t)new_pml4);
@@ -157,6 +167,100 @@ void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
     if (!pt)   return;
 
     pt[PT_IDX(vaddr)] = (paddr & USER_PTE_FRAME_MASK) | flags;
+}
+
+static uint64_t* own_table(uint64_t* parent, size_t idx, int copy_existing);
+
+// ─── user_map_identity ────────────────────────────────────────────────────────
+// Map `npages` of physical memory into a process's address space at the SAME
+// virtual addresses (identity), with Ring-3 access. This is what a sidecar's
+// BIB MEM cap contract needs (kernel/cap.c writes the cap's PHYSICAL base
+// into the BIB and the sidecar reads it directly — Phase 5 sidecar
+// bootinfo.rs), but it is NOT what user_map_page() does, and calling
+// user_map_page() here is actively dangerous: the child's PML4 shares the
+// kernel's low identity map by pointer (user_clone_page_table →
+// clone_kernel_slots), whose PTEs are supervisor 2 MiB huge pages. The
+// get_or_alloc() walk would treat a PRESENT huge-page PD entry as a table
+// pointer and write the leaf PTE through physical memory, corrupting the
+// huge page's frame and the SHARED kernel tables.
+//
+// Instead the walk re-points only the CHILD's own copies of the path:
+//   - a fresh PDPT at the PML4 slot (the shared entries copied, so the rest
+//     of low memory stays visible to the child's kernel-mode execution);
+//   - a fresh PD at the PDPT slot (shared entries copied, same reason);
+//   - a fresh PT per touched 2 MiB chunk, with the chunk's huge page
+//     REPLICATED at 4 KiB granularity (same frames, same flags minus PS) so
+//     the kernel keeps full visibility of the chunk, then the cap pages
+//     re-flagged with the requested (USER) flags.
+// The kernel's own tables are never modified — only the child's.
+int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
+                      uint64_t flags) {
+    for (uint32_t p = 0; p < npages; p++) {
+        uint64_t va = phys + (uint64_t)p * 4096;
+        uint64_t* pdpt = own_table(pml4, PML4_IDX(va), 1);
+        if (!pdpt) return -1;
+        uint64_t* pd = own_table(pdpt, PDPT_IDX(va), 1);
+        if (!pd) return -1;
+
+        uint64_t pe = pd[PD_IDX(va)];
+        uint64_t* pt;
+        if ((pe & USER_PTE_PRESENT) && (pe & USER_PTE_USER)) {
+            pt = (uint64_t*)(uintptr_t)(pe & USER_PTE_FRAME_MASK); /* ours already */
+        } else {
+            pt = alloc_page_table();
+            if (!pt) return -1;
+            if (pe & USER_PTE_PRESENT) {
+                if (pe & (1ULL << 7)) { /* PS: 2 MiB huge page — replicate at 4 KiB */
+                    uint64_t base = pe & USER_PTE_FRAME_MASK;
+                    uint64_t keep = pe & ~(USER_PTE_FRAME_MASK | (1ULL << 7));
+                    for (int i = 0; i < 512; i++)
+                        pt[i] = (base + (uint64_t)i * 4096) | keep;
+                } else { /* 4 KiB-level table — copy its entries */
+                    const uint64_t* shared =
+                        (const uint64_t*)(uintptr_t)(pe & USER_PTE_FRAME_MASK);
+                    for (int i = 0; i < 512; i++) pt[i] = shared[i];
+                }
+            }
+            pd[PD_IDX(va)] = ((uint64_t)(uintptr_t)pt & USER_PTE_FRAME_MASK)
+                             | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
+        }
+        pt[PT_IDX(va)] = (phys + (uint64_t)p * 4096) | flags;
+    }
+    return 0;
+}
+
+/* Strong override of cap.c's weak cap_arch_identity_map_user: the kernel's
+ * cap_recv_msg grants a MEM cap across a channel and must make the region
+ * Ring-3-readable in the RECEIVER's address space (kernel/cap.c CAP_TYPE_MEM
+ * install branch). Same identity-map as user_map_identity, with flags derived
+ * from the cap's CAP_PERM_* rights. cap_proc_cr3() gives the receiver's PML4. */
+int cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
+                               uint32_t npages, uint32_t cap_perms) {
+    uint64_t leaf = USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_NOEXEC;
+    if (cap_perms & 0x02u) leaf |= USER_PTE_WRITE;   /* CAP_PERM_W */
+    return user_map_identity((uint64_t*)(uintptr_t)pml4_phys, phys, npages,
+                             leaf);
+}
+
+// Get a table the CHILD owns at parent[idx]: reuse it if the existing entry
+// is already a USER table (fresh from a previous call here or from
+// user_map_page's get_or_alloc); otherwise allocate a fresh zeroed table and
+// re-point parent[idx] at it — copying the shared table's entries when
+// `copy_existing` is set, so untouched regions keep sharing the kernel's
+// mapping.
+static uint64_t* own_table(uint64_t* parent, size_t idx, int copy_existing) {
+    uint64_t e = parent[idx];
+    if ((e & USER_PTE_PRESENT) && (e & USER_PTE_USER))
+        return (uint64_t*)(uintptr_t)(e & USER_PTE_FRAME_MASK);
+    uint64_t* fresh = alloc_page_table();
+    if (!fresh) return 0;
+    if (copy_existing && (e & USER_PTE_PRESENT)) {
+        const uint64_t* shared = (const uint64_t*)(uintptr_t)(e & USER_PTE_FRAME_MASK);
+        for (int i = 0; i < 512; i++) fresh[i] = shared[i];
+    }
+    parent[idx] = ((uint64_t)(uintptr_t)fresh & USER_PTE_FRAME_MASK)
+                  | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
+    return fresh;
 }
 
 // ─── user_unmap_page ──────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ bits 64
 
 global enter_user_process
 global kernel_enter_ring3
+global kernel_enter_sidecar
 
 section .text
 
@@ -90,4 +91,57 @@ kernel_enter_ring3:
     xor   rbp, rbp
 
     ; 7. Enter Ring-3 (restores IF via R11)
+    o64 sysret
+
+; ─── kernel_enter_sidecar(rsp_save*, cr3_save*, cr3, user_rip, user_rsp, bib) ──
+; kernel_enter_ring3() variant for the boot-time init sidecar (Phase 5,
+; kernel/boot_image.c launch_init_sidecar). Identical in every respect —
+; saves the kernel continuation, enters Ring-3 via SYSRETQ, process_exit()
+; restores rsp_save — except one register: rdi is set to the sidecar's
+; Boot Info Block VIRTUAL address instead of being cleared. The sidecar
+; crt0 contract is "the kernel jumps to _start with the BIB pointer in
+; a0/rdi" (crt0.S saves it before switching stacks), so the zeroing in
+; kernel_enter_ring3 (correct for the legacy spawn path, whose programs
+; read no BIB) would hand the init sidecar rdi=0 and lose its caps.
+;
+;   rdi = uint64_t* rsp_save   (pd->kernel_rsp)
+;   rsi = uint64_t* cr3_save   (pd->kernel_cr3)
+;   rdx = new cr3
+;   rcx = user RIP
+;   r8  = user RSP
+;   r9  = BIB virtual address (ends up in user rdi)
+kernel_enter_sidecar:
+    push  rbx
+    push  rbp
+    push  r12
+    push  r13
+    push  r14
+    push  r15
+
+    mov   [rdi], rsp
+    mov   rax, cr3
+    mov   [rsi], rax
+
+    cli
+
+    mov   r11, 0x202
+    mov   rsp, r8
+    mov   rcx, rcx
+    mov   cr3, rdx
+
+    ; Clear every GPR except rdi, which carries the BIB pointer to _start.
+    xor   rax, rax
+    xor   rbx, rbx
+    xor   rdx, rdx
+    xor   rsi, rsi
+    mov   rdi, r9
+    xor   r8,  r8
+    xor   r9,  r9
+    xor   r10, r10
+    xor   r12, r12
+    xor   r13, r13
+    xor   r14, r14
+    xor   r15, r15
+    xor   rbp, rbp
+
     o64 sysret

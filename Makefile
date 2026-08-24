@@ -904,11 +904,13 @@ selfhost-bootimage:
 		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using SIDECAR_INIT_BIN/SIDECAR_DM_BIN as-is"
 	@if [ -s "$(SIDECAR_INIT_ELF)" ]; then \
 		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
-			flatten --input "$(SIDECAR_INIT_ELF)" --output "$(SIDECAR_INIT_BIN)"; \
+			flatten --input "$(SIDECAR_INIT_ELF)" --output "$(SIDECAR_INIT_BIN)" \
+			--load-vaddr 0x400000000000; \
 	fi
 	@if [ -s "$(SIDECAR_DM_ELF)" ]; then \
 		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
-			flatten --input "$(SIDECAR_DM_ELF)" --output "$(SIDECAR_DM_BIN)"; \
+			flatten --input "$(SIDECAR_DM_ELF)" --output "$(SIDECAR_DM_BIN)" \
+			--load-vaddr 0x400000000000; \
 	fi
 	@test -s "$(SIDECAR_INIT_BIN)" \
 		|| { echo "[SELFHOST] missing init binary: $(SIDECAR_INIT_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_INIT_BIN="; exit 1; }

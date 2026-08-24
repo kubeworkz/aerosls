@@ -300,6 +300,16 @@ void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
     pt[(vaddr >> 12) & 0x1FF] = (paddr & USER_PTE_FRAME_MASK) | flags;
 }
 
+/* The host test's PML4s are fresh/zeroed (no shared kernel identity map),
+ * so identity mapping here is exactly user_map_page at the same address. */
+int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
+                      uint64_t flags) {
+    for (uint32_t p = 0; p < npages; p++)
+        user_map_page(pml4, phys + (uint64_t)p * 4096, phys + (uint64_t)p * 4096,
+                      flags);
+    return 0;
+}
+
 /* Walk the last-cloned PML4 the way cap_create_sidecar's BIB walk does. */
 static uint64_t leaf_pte(uint64_t vaddr) {
     uint64_t pml4e = g_pml4[(vaddr >> 39) & 0x1FF];

@@ -49,6 +49,27 @@ uint64_t user_clone_page_table(void);
 // Allocates intermediate tables from the physical frame pool as needed.
 void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags);
 
+// Map `npages` of physical memory into the process's address space at the
+// SAME virtual addresses (identity) with Ring-3 access — the sidecar BIB
+// MEM cap contract (the BIB carries the cap's physical base and the sidecar
+// reads it directly). Unlike user_map_page() this is SAFE over the shared
+// kernel identity map: the walk re-points only the child's own copies of
+// the path (fresh PDPT/PD with shared entries copied, fresh PTs per touched
+// 2 MiB chunk with the huge page replicated at 4 KiB) and never writes into
+// the kernel's tables or treats a huge-page PD entry as a table pointer.
+// See the definition in user_paging.c. Returns 0 on success, -1 on frame
+// exhaustion.
+int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
+                      uint64_t flags);
+
+/* Strong override of cap.c's weak cap_arch_identity_map_user: called by the
+ * kernel after a MEM cap is granted across a channel (cap_recv_msg) so the
+ * receiver can read the region at its physical base in ring 3. Derives the
+ * leaf flags from the cap's CAP_PERM_* rights and identity-maps into the
+ * receiver's PML4. */
+int cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
+                               uint32_t npages, uint32_t cap_perms);
+
 // Clear the leaf PTE for vaddr (if any level of the walk exists). The
 // intermediate tables are left in place -- Phase 1 does no page-table
 // garbage collection, same posture as the rest of the kernel. Non-

@@ -117,16 +117,27 @@
  * A channel message may carry a payload (the IDL envelope: opcode + args,
  * opaque to the kernel) plus up to CAP_MSG_MAX_CAPS moved MEM caps. The
  * payload is staged in a fixed pool (CAP_MSG_PAYLOAD_POOL ×
- * CAP_MSG_MAX_PAYLOAD, 8 × 4 KiB = 32 KiB static) — same fixed-pool style
- * as the holder pool; a send whose payload would exceed the pool returns
- * CAP_ENOSPC (fail-before-mutate, nothing queued). The 4 KiB payload bound
- * is exactly the AeroIDL compiler's own payload ceiling, so every
- * generated stub fits. Cap descriptors travel with the message so the
- * receiver learns the byte-level view (offset/len/rights/flags) the IDL
- * attached to each moved cap. */
+ * CAP_MSG_MAX_PAYLOAD — 32 × 4 KiB = 128 KiB static) — same fixed-pool
+ * style as the holder pool; a send whose payload would exceed the pool
+ * returns CAP_ENOSPC (fail-before-mutate, nothing queued). The 4 KiB
+ * payload bound is exactly the AeroIDL compiler's own payload ceiling, so
+ * every generated stub fits. Cap descriptors travel with the message so
+ * the receiver learns the byte-level view (offset/len/rights/flags) the
+ * IDL attached to each moved cap.
+ *
+ * Why 32, not the original 8 (Phase 5 QEMU boot finding): the pool is
+ * GLOBAL — every channel's queued messages draw from it — but
+ * CHAN_QUEUE_DEPTH (16) is per-channel. A sidecar booting with a burst of
+ * console log messages (each a small payload) can fill 8 slots before the
+ * console service's next drain tick, and a concurrent critical send (the
+ * init→DM device-registry handshake) then fails CAP_ENOSPC/NOMEM — the
+ * exact failure seen under QEMU ("failed to send device registry: kernel
+ * error 11"). 32 = 2 × queue depth gives one channel's full burst plus a
+ * second channel's worth of headroom; the console drain returns slots
+ * within a tick, so steady state needs far fewer. */
 #define CAP_MSG_MAX_CAPS      4
 #define CAP_MSG_MAX_PAYLOAD   4096
-#define CAP_MSG_PAYLOAD_POOL  8
+#define CAP_MSG_PAYLOAD_POOL  32
 
 #define CAP_ARENA_SIZE       (64u * 1024u * 1024u)
 #define CAP_ARENA_FRAMES     (CAP_ARENA_SIZE / 4096u)
@@ -169,8 +180,12 @@ struct ChanMsg {              /* fixed, preallocated in the channel */
  * q[1] for end1. end0's CHAN_W enqueues q[1]; end1's CHAN_W enqueues q[0]. */
 struct CapChannel {
     struct CapSpinlock lock;
-    uint16_t end0_pid;        /* creator; end1 is whoever owns the far-end caps */
-    uint16_t _pad0;
+    uint16_t end0_pid;        /* creator */
+    uint16_t end1_pid;        /* pid the far-end caps were minted for at creation */
+                               /* (the peer; may drift if far-end caps are later
+                                * forwarded — the peer-death walk then misses the
+                                * close rather than falsely closing an unrelated
+                                * channel) */
     uint32_t qhead[2];
     uint32_t qtail[2];        /* monotonically growing; entries are qtail%DEPTH */
     uint32_t qdepth[2];
@@ -621,6 +636,11 @@ int  cap_arch_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr,
                        uint32_t cap_perms);
 int  cap_arch_unmap_page(uint64_t pml4_phys, uint64_t vaddr);
 void cap_arch_tlb_flush(void);
+/* Phase 5 sidecar MEM-cap grant mapping: after a MEM cap is moved across a
+ * channel (cap_recv_msg), make the region Ring-3-accessible in the
+ * receiver's address space (arch/x86/user_paging.c user_map_identity). */
+int  cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
+                                uint32_t npages, uint32_t cap_perms);
 
 /* Syscall wrappers (called from syscall_dispatch.c). */
 uint64_t sys_sls_cap_create_mem(struct SLSCapCreateMemRequest* req);

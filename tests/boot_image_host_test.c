@@ -134,12 +134,12 @@ static void build_init_manifest(struct Blob* b) {
     blob_u64(b, 16u * 1024 * 1024);       /* mem_bytes */
     blob_u32(b, 128 * 1024);              /* stack_bytes */
     blob_u32(b, 4 * 1024 * 1024);         /* heap_initial */
-    blob_record(b, 0x0004, 4); rc++;      /* cpu */
+    blob_record(b, 0x0004, 3); rc++;      /* cpu: share u16 + preemptible u8 */
     blob_u16(b, 300);
-    blob_u16(b, 0);
-    blob_record(b, 0x0005, 12); rc++;     /* limits */
+    blob_bytes(b, "\x00", 1);
+    blob_record(b, 0x0005, 10); rc++;     /* limits: 5 x u16 */
     blob_u16(b, 1); blob_u16(b, 32); blob_u16(b, 64);
-    blob_u16(b, 32); blob_u16(b, 16); blob_u16(b, 0);
+    blob_u16(b, 32); blob_u16(b, 16);
 
     /* budget MEM cap */
     blob_record(b, SIDECAR_TAG_CAP_MEM, 6 + 19); rc++;

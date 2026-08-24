@@ -23,7 +23,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> -o sidecars.cpio \
          [--init-entry <off>] [--dm-entry <off>] [--base-phys <addr>]\n\n\
-         aerosls-bootimage flatten --input <init.elf> --output <init.bin>"
+         aerosls-bootimage flatten --input <init.elf> --output <init.bin> \
+         [--load-vaddr <hex>]  (default 0x400000000000 = USER_PROC_CODE_BASE)"
     );
     std::process::exit(2);
 }
@@ -44,6 +45,11 @@ fn main() {
 fn cmd_flatten(mut args: impl Iterator<Item = String>) {
     let mut input = None;
     let mut output = None;
+    // The kernel maps sidecar images at USER_PROC_CODE_BASE (kernel/cap.c
+    // cap_create_sidecar step 5) and the ELF is ET_DYN (static PIE), so
+    // every relocation carries that runtime load bias. `flatten` must add
+    // it or the image's GOT points into the low address space.
+    let mut load_vaddr = 0x4000_0000_0000u64;
     while let Some(a) = args.next() {
         let mut next = || args.next().unwrap_or_else(|| {
             eprintln!("missing value for {a}");
@@ -52,6 +58,16 @@ fn cmd_flatten(mut args: impl Iterator<Item = String>) {
         match a.as_str() {
             "--input" => input = Some(PathBuf::from(next())),
             "--output" | "-o" => output = Some(PathBuf::from(next())),
+            "--load-vaddr" => {
+                load_vaddr = u64::from_str_radix(
+                    next().trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap_or_else(|_| {
+                    eprintln!("bad --load-vaddr");
+                    usage();
+                })
+            }
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -64,7 +80,7 @@ fn cmd_flatten(mut args: impl Iterator<Item = String>) {
         _ => usage(),
     };
     let elf = std::fs::read(&input).unwrap_or_else(|e| panic!("read {}: {e}", input.display()));
-    let flat = flatten_elf(&elf)
+    let flat = flatten_elf(&elf, load_vaddr)
         .unwrap_or_else(|e| panic!("flatten {}: {e}", input.display()));
     std::fs::write(&output, &flat.image)
         .unwrap_or_else(|e| panic!("write {}: {e}", output.display()));
