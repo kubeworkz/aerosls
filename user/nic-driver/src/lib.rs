@@ -500,11 +500,192 @@ mod tests {
     }
 
     #[test]
+    fn mac_display_all_zeros() {
+        let mac = MacAddress::default();
+        assert_eq!(alloc::format!("{}", mac), "00:00:00:00:00:00");
+    }
+
+    #[test]
+    fn mac_display_all_ff() {
+        let mac = MacAddress { octets: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] };
+        assert_eq!(alloc::format!("{}", mac), "ff:ff:ff:ff:ff:ff");
+    }
+
+    #[test]
+    fn mac_equality() {
+        let a = MacAddress { octets: [0x52, 0x54, 0x00, 0x12, 0x34, 0x01] };
+        let b = MacAddress { octets: [0x52, 0x54, 0x00, 0x12, 0x34, 0x01] };
+        let c = MacAddress { octets: [0x52, 0x54, 0x00, 0x12, 0x34, 0x02] };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn mac_clone() {
+        let a = MacAddress { octets: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06] };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mac_default() {
+        let mac = MacAddress::default();
+        assert_eq!(mac.octets, [0u8; 6]);
+    }
+
+    #[test]
     fn tx_desc_flags() {
         let mut desc = TxDesc::default();
         desc.cmd = TxDesc::CMD_EOP | TxDesc::CMD_IFCS | TxDesc::CMD_RS;
         assert!(desc.cmd & TxDesc::CMD_EOP != 0);
         assert!(desc.cmd & TxDesc::CMD_IFCS != 0);
         assert!(desc.cmd & TxDesc::CMD_RS != 0);
+    }
+
+    #[test]
+    fn tx_desc_status_dd() {
+        let mut desc = TxDesc::default();
+        assert_eq!(desc.status & TxDesc::STATUS_DD, 0);
+        desc.status = TxDesc::STATUS_DD;
+        assert!(desc.status & TxDesc::STATUS_DD != 0);
+    }
+
+    #[test]
+    fn tx_desc_default() {
+        let desc = TxDesc::default();
+        assert_eq!(desc.buffer_addr, 0);
+        assert_eq!(desc.length, 0);
+        assert_eq!(desc.cmd, 0);
+        assert_eq!(desc.status, 0);
+    }
+
+    #[test]
+    fn rx_desc_flags() {
+        let mut desc = RxDesc::default();
+        assert_eq!(desc.status & RxDesc::STATUS_DD, 0);
+        desc.status = RxDesc::STATUS_DD | RxDesc::STATUS_EOP;
+        assert!(desc.status & RxDesc::STATUS_DD != 0);
+        assert!(desc.status & RxDesc::STATUS_EOP != 0);
+    }
+
+    #[test]
+    fn rx_desc_default() {
+        let desc = RxDesc::default();
+        assert_eq!(desc.buffer_addr, 0);
+        assert_eq!(desc.length, 0);
+        assert_eq!(desc.status, 0);
+    }
+
+    #[test]
+    fn driver_state_default() {
+        assert_eq!(DriverState::default(), DriverState::Uninit);
+    }
+
+    #[test]
+    fn driver_state_equality() {
+        assert_eq!(DriverState::Ready, DriverState::Ready);
+        assert_ne!(DriverState::Ready, DriverState::Running);
+        assert_ne!(DriverState::Uninit, DriverState::Failed);
+    }
+
+    #[test]
+    fn nic_driver_new() {
+        let kernel = ();
+        let driver = NicDriver::new(&kernel);
+        assert_eq!(driver.state, DriverState::Uninit);
+        assert_eq!(driver.rx_packets, 0);
+        assert_eq!(driver.tx_packets, 0);
+        assert_eq!(driver.rx_dropped, 0);
+        assert_eq!(driver.mac, MacAddress::default());
+    }
+
+    #[test]
+    fn nic_driver_initial_caps() {
+        let kernel = ();
+        let driver = NicDriver::new(&kernel);
+        assert_eq!(driver.io_port_cap, 0xFFFF);
+        assert_eq!(driver.irq_cap, 0xFFFF);
+        assert_eq!(driver.stack_chan_wr, 0);
+        assert_eq!(driver.stack_chan_rd, 0);
+        assert_eq!(driver.control_chan_rd, 0);
+    }
+
+    #[test]
+    fn ring_size_constant() {
+        assert_eq!(RING_SIZE, 128);
+    }
+
+    #[test]
+    fn max_packet_size_constant() {
+        assert_eq!(MAX_PACKET_SIZE, 2048);
+    }
+
+    #[test]
+    fn rx_buf_count_constant() {
+        assert_eq!(RX_BUF_COUNT, 128);
+    }
+
+    #[test]
+    fn e1000_register_constants() {
+        // Verify key register offsets
+        assert_eq!(e1000_reg::CTRL, 0x0000);
+        assert_eq!(e1000_reg::STATUS, 0x0008);
+        assert_eq!(e1000_reg::RCTL, 0x0100);
+        assert_eq!(e1000_reg::TCTL, 0x0400);
+        assert_eq!(e1000_reg::RDBAL, 0x2800);
+        assert_eq!(e1000_reg::TDBAL, 0x3800);
+        assert_eq!(e1000_reg::RAL, 0x5400);
+        assert_eq!(e1000_reg::RAH, 0x5404);
+        assert_eq!(e1000_reg::ICR, 0x00C0);
+    }
+
+    #[test]
+    fn e1000_control_bits() {
+        assert_eq!(e1000_reg::CTRL_RST, 1 << 26);
+        assert_eq!(e1000_reg::CTRL_SLU, 1 << 6);
+        assert_eq!(e1000_reg::CTRL_ASDE, 1 << 5);
+    }
+
+    #[test]
+    fn e1000_icr_bits() {
+        assert_eq!(e1000_reg::ICR_RXT0, 1 << 7);
+        assert_eq!(e1000_reg::ICR_TXDW, 1 << 0);
+    }
+
+    #[test]
+    fn nic_opcode_constants() {
+        assert_eq!(nic_opcode::RX_PACKET, 0xA001);
+        assert_eq!(nic_opcode::TX_PACKET, 0xA002);
+        assert_eq!(nic_opcode::TX_DONE, 0xA003);
+        assert_eq!(nic_opcode::NIC_INFO, 0xA004);
+        assert_eq!(nic_opcode::SET_MAC, 0xA005);
+        assert_eq!(nic_opcode::GET_STATUS, 0xA006);
+        assert_eq!(nic_opcode::SET_LINK, 0xA007);
+    }
+
+    #[test]
+    fn tx_desc_full_cmd() {
+        let mut desc = TxDesc::default();
+        desc.cmd = TxDesc::CMD_EOP | TxDesc::CMD_IFCS | TxDesc::CMD_RS;
+        desc.length = 1514;
+        desc.buffer_addr = 0x1000;
+
+        assert_eq!(desc.cmd & TxDesc::CMD_EOP, TxDesc::CMD_EOP);
+        assert_eq!(desc.cmd & TxDesc::CMD_IFCS, TxDesc::CMD_IFCS);
+        assert_eq!(desc.cmd & TxDesc::CMD_RS, TxDesc::CMD_RS);
+        assert_eq!(desc.length, 1514);
+        assert_eq!(desc.buffer_addr, 0x1000);
+    }
+
+    #[test]
+    fn rx_desc_complete_packet() {
+        let mut desc = RxDesc::default();
+        desc.status = RxDesc::STATUS_DD | RxDesc::STATUS_EOP;
+        desc.length = 64;
+        desc.buffer_addr = 0x2000;
+
+        assert!(desc.status & RxDesc::STATUS_DD != 0);
+        assert!(desc.status & RxDesc::STATUS_EOP != 0);
+        assert_eq!(desc.length, 64);
     }
 }

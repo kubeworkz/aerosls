@@ -355,3 +355,325 @@ macro_rules! kernel_serial_printf {
     };
 }
 pub(crate) use kernel_serial_printf;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pci::{PciClass, PciDevice, PciBar};
+    use crate::manifest::{e1000_manifest, virtio_net_manifest, MatchResult};
+    use crate::device::{DeviceState, DeviceEvent, DeviceEntry};
+    use crate::recovery::{RecoveryManager, RecoveryConfig, CrashReason};
+
+    fn mock_device(bus: u8, slot: u8, vendor: u16, device: u16, class_base: u8) -> PciDevice {
+        PciDevice {
+            bus, slot, func: 0,
+            vendor_id: vendor, device_id: device,
+            class: PciClass { base: class_base, sub: 0x00, prog_if: 0x00 },
+            header_type: 0, revision_id: 0,
+            bars: [PciBar::default(); 6],
+            interrupt_pin: 1, interrupt_line: 0,
+            has_msi: true, has_msix: false, msi_offset: 0, msix_offset: 0,
+            is_bridge: false, secondary_bus: 0,
+        }
+    }
+
+    #[test]
+    fn devmgr_error_display() {
+        let cases = [
+            (DevMgrError::PciEnumFailed, "PCI enumeration failed"),
+            (DevMgrError::NoDriverMatch, "no driver matched device"),
+            (DevMgrError::SpawnFailed, "driver spawn failed"),
+            (DevMgrError::ManifestNotFound, "driver manifest not found"),
+            (DevMgrError::DeviceNotFound, "device not found"),
+            (DevMgrError::ChannelFull, "channel full"),
+            (DevMgrError::Timeout, "timeout"),
+            (DevMgrError::Internal, "internal error"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(alloc::format!("{}", err), expected);
+        }
+    }
+
+    #[test]
+    fn devmgr_error_equality() {
+        assert_eq!(DevMgrError::Timeout, DevMgrError::Timeout);
+        assert_ne!(DevMgrError::Timeout, DevMgrError::Internal);
+    }
+
+    #[test]
+    fn opcode_constants() {
+        assert_eq!(opcode::DRIVER_READY, 0xD001);
+        assert_eq!(opcode::DRIVER_SHUTDOWN, 0xD002);
+        assert_eq!(opcode::DRIVER_INIT, 0xD003);
+        assert_eq!(opcode::HEARTBEAT, 0xD004);
+        assert_eq!(opcode::HEARTBEAT_ACK, 0xD005);
+        assert_eq!(opcode::EVT_DEVICE_REMOVED, 0xE001);
+        assert_eq!(opcode::EVT_DRIVER_FAILED, 0xE002);
+        assert_eq!(opcode::EVT_DRIVER_RESTORED, 0xE003);
+        assert_eq!(opcode::SUBSCRIBE_EVENTS, 0xE010);
+    }
+
+    #[test]
+    fn constants() {
+        assert_eq!(MAX_DEVICES, 64);
+        assert_eq!(MAX_MANIFESTS, 32);
+        assert_eq!(MAX_CLIENTS, 16);
+        assert_eq!(HOTPLUG_POLL_NS, 5_000_000_000);
+        assert_eq!(HEALTH_CHECK_NS, 2_000_000_000);
+        assert_eq!(MAX_CRASH_RETRIES, 8);
+    }
+
+    #[test]
+    fn devmgr_new() {
+        let kernel = ();
+        let dm = DeviceManager::new(&kernel, 0, 1);
+        assert!(dm.devices.is_empty());
+        assert!(dm.manifests.is_empty());
+        assert!(dm.clients.is_empty());
+        assert_eq!(dm.bus_cap, 0);
+        assert_eq!(dm.parent_chan, 1);
+    }
+
+    #[test]
+    fn register_manifest() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+        dm.register_manifest(virtio_net_manifest());
+        assert_eq!(dm.manifests.len(), 2);
+    }
+
+    #[test]
+    fn register_manifest_limit() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        for _ in 0..MAX_MANIFESTS + 10 {
+            dm.register_manifest(e1000_manifest());
+        }
+        assert_eq!(dm.manifests.len(), MAX_MANIFESTS);
+    }
+
+    #[test]
+    fn subscribe_client() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.subscribe_client(10);
+        dm.subscribe_client(20);
+        assert_eq!(dm.clients, vec![10, 20]);
+    }
+
+    #[test]
+    fn subscribe_client_no_duplicates() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.subscribe_client(10);
+        dm.subscribe_client(10);
+        dm.subscribe_client(10);
+        assert_eq!(dm.clients, vec![10]);
+    }
+
+    #[test]
+    fn subscribe_client_limit() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        for i in 0..MAX_CLIENTS + 5 {
+            dm.subscribe_client(i as u32);
+        }
+        assert_eq!(dm.clients.len(), MAX_CLIENTS);
+    }
+
+    #[test]
+    fn on_device_discovered() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        let dev = mock_device(0, 3, 0x8086, 0x100E, 0x02);
+        dm.on_device_discovered(dev);
+        assert_eq!(dm.devices.len(), 1);
+        assert_eq!(dm.devices[0].device.vendor_id, 0x8086);
+    }
+
+    #[test]
+    fn on_device_discovered_duplicate() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        let dev = mock_device(0, 3, 0x8086, 0x100E, 0x02);
+        dm.on_device_discovered(dev.clone());
+        dm.on_device_discovered(dev);
+        assert_eq!(dm.devices.len(), 1);
+    }
+
+    #[test]
+    fn on_device_discovered_with_matching_manifest() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+
+        let dev = mock_device(0, 3, 0x8086, 0x100E, 0x02);
+        dm.on_device_discovered(dev);
+        assert_eq!(dm.devices.len(), 1);
+        // State should be Failed (spawn_driver stub fails)
+        assert_eq!(dm.devices[0].state, DeviceState::Failed);
+    }
+
+    #[test]
+    fn on_device_discovered_no_matching_manifest() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+
+        let dev = mock_device(0, 3, 0x1234, 0x9999, 0xFF); // unknown device
+        dm.on_device_discovered(dev);
+        assert_eq!(dm.devices.len(), 1);
+        assert_eq!(dm.devices[0].state, DeviceState::Discovered);
+    }
+
+    #[test]
+    fn on_driver_crashed() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        let dev = mock_device(0, 3, 0x8086, 0x100E, 0x02);
+        dm.on_device_discovered(dev);
+
+        // Simulate: device was in Failed state, crash it
+        dm.devices[0].state = DeviceState::DriverRunning;
+        dm.devices[0].driver_pid = 42;
+
+        dm.on_driver_crashed(0, CrashReason::Signal(139), 139, 1000);
+        assert_eq!(dm.devices[0].state, DeviceState::Failed);
+        assert_eq!(dm.devices[0].crash_count, 1);
+    }
+
+    #[test]
+    fn on_driver_crashed_out_of_bounds() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        // Should not panic
+        dm.on_driver_crashed(99, CrashReason::Unknown, 0, 0);
+    }
+
+    #[test]
+    fn on_device_removed() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        let dev = mock_device(0, 3, 0x8086, 0x100E, 0x02);
+        dm.on_device_discovered(dev);
+        dm.devices[0].state = DeviceState::DriverRunning;
+
+        dm.on_device_removed(0, 1000);
+        assert_eq!(dm.devices[0].state, DeviceState::RemovedWait);
+    }
+
+    #[test]
+    fn on_device_removed_out_of_bounds() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        // Should not panic
+        dm.on_device_removed(99, 0);
+    }
+
+    #[test]
+    fn compute_backoff() {
+        let kernel = ();
+        let dm = DeviceManager::new(&kernel, 0, 1);
+
+        let b1 = dm.compute_backoff(1);
+        let b2 = dm.compute_backoff(2);
+        let b5 = dm.compute_backoff(5);
+        let b20 = dm.compute_backoff(20);
+
+        assert!(b1 >= 100_000_000); // at least 100ms
+        assert!(b2 > b1);
+        assert!(b5 > b2);
+        // Should not exceed max (5s + 25% jitter = 6.25s)
+        assert!(b20 <= 6_250_000_000);
+    }
+
+    #[test]
+    fn poll_returns_false_when_empty() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        assert!(!dm.poll());
+    }
+
+    #[test]
+    fn match_driver_priority() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+        dm.register_manifest(virtio_net_manifest());
+
+        let dev = mock_device(0, 3, 0x8086, 0x100E, 0x02);
+        let entry = DeviceEntry::new(dev);
+        let idx = dm.match_driver(&entry.device);
+        assert_eq!(idx, Some(0)); // e1000 matches first
+    }
+
+    #[test]
+    fn match_driver_no_match() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+
+        let dev = mock_device(0, 3, 0x1234, 0x9999, 0xFF);
+        let entry = DeviceEntry::new(dev);
+        assert!(dm.match_driver(&entry.device).is_none());
+    }
+
+    #[test]
+    fn multiple_devices_tracked() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+
+        dm.on_device_discovered(mock_device(0, 0, 0x8086, 0x100E, 0x02));
+        dm.on_device_discovered(mock_device(0, 1, 0x1AF4, 0x1000, 0x02));
+        dm.on_device_discovered(mock_device(0, 2, 0x10DE, 0x1234, 0x03));
+
+        assert_eq!(dm.devices.len(), 3);
+    }
+
+    #[test]
+    fn full_device_lifecycle() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+
+        // Discover
+        dm.on_device_discovered(mock_device(0, 3, 0x8086, 0x100E, 0x02));
+        assert_eq!(dm.devices.len(), 1);
+
+        // Device is in Failed state (spawn stub)
+        assert_eq!(dm.devices[0].state, DeviceState::Failed);
+        assert_eq!(dm.devices[0].crash_count, 1);
+
+        // Simulate successful recovery
+        dm.devices[0].transition(DeviceEvent::SpawnSucceeded, 1000);
+        assert_eq!(dm.devices[0].state, DeviceState::DriverRunning);
+        assert_eq!(dm.devices[0].crash_count, 0);
+
+        // Crash again
+        dm.on_driver_crashed(0, CrashReason::HeartbeatTimeout, 0, 2000);
+        assert_eq!(dm.devices[0].state, DeviceState::Failed);
+    }
+
+    #[test]
+    fn hotplug_lifecycle() {
+        let kernel = ();
+        let mut dm = DeviceManager::new(&kernel, 0, 1);
+        dm.register_manifest(e1000_manifest());
+
+        // Discover and spawn
+        dm.on_device_discovered(mock_device(0, 3, 0x8086, 0x100E, 0x02));
+        dm.devices[0].transition(DeviceEvent::SpawnSucceeded, 100);
+        assert_eq!(dm.devices[0].state, DeviceState::DriverRunning);
+
+        // Hotplug removal
+        dm.on_device_removed(0, 200);
+        assert_eq!(dm.devices[0].state, DeviceState::RemovedWait);
+        assert!(dm.devices[0].was_removed);
+
+        // Re-detection
+        dm.devices[0].transition(DeviceEvent::DeviceRedetected, 300);
+        assert_eq!(dm.devices[0].state, DeviceState::Matched);
+        assert!(!dm.devices[0].was_removed);
+    }
+}

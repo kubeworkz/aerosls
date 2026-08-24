@@ -7,8 +7,6 @@ description = "Phase 4 Device Driver SDK micro-benchmarks for AeroSLS"
 [dependencies]
 aerosls-proto = { path = "../../user/proto" }
 aerosls-kernel-sim = { path = "../../user/kernel-sim" }
-
-[dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -26,6 +24,10 @@ harness = false
 [[bench]]
 name = "nic_throughput"
 harness = false
+
+[[bin]]
+name = "bench-report"
+path = "src/main.rs"
 
 [profile.bench]
 opt-level = 3

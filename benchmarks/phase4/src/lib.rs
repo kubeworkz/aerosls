@@ -6,9 +6,16 @@
 //! - Channel message throughput (send/recv round-trip)
 //! - NIC throughput comparison (zero-copy DMA path analysis)
 //!
-//! Host-side benchmarks use `aerosls-kernel-sim` to mock kernel semantics.
-//! On-target benchmarks require real hardware and are documented in the
-//! companion plan (benchmarks/phase4/ON-TARGET-PLAN.md).
+//! Run all benchmarks:
+//!   cargo bench
+//!
+//! Run a specific benchmark group:
+//!   cargo bench --bench irq_latency
+//!   cargo bench --bench dma_alloc
+//!   cargo bench --bench channel_throughput
+//!   cargo bench --bench nic_throughput
+//!
+//! Generate HTML reports in target/criterion/.
 
 pub mod irq_latency;
 pub mod dma_alloc;
@@ -16,6 +23,9 @@ pub mod channel_throughput;
 pub mod nic_throughput;
 
 use std::time::{Duration, Instant};
+
+// Re-export criterion for convenience
+pub use criterion;
 
 /// A single latency measurement result.
 #[derive(Debug, Clone)]
@@ -109,28 +119,6 @@ impl std::fmt::Display for ThroughputResult {
         writeln!(f, "  total ops:  {:>12}", self.total_ops)?;
         writeln!(f, "  duration:   {:>12.1?}", self.total_duration)
     }
-}
-
-/// Run a closure `iterations` times, collecting per-iteration durations.
-pub fn bench_loop<F: Fn()>(iterations: u64, f: F) -> LatencyResult {
-    let mut result = LatencyResult::new("bench_loop");
-    for _ in 0..iterations {
-        let start = Instant::now();
-        f();
-        result.push(start.elapsed());
-    }
-    result
-}
-
-/// Run a closure for a fixed duration, counting iterations.
-pub fn bench_throughput<F: Fn()>(duration: Duration, f: F) -> (u64, Duration) {
-    let start = Instant::now();
-    let mut count = 0u64;
-    while start.elapsed() < duration {
-        f();
-        count += 1;
-    }
-    (count, start.elapsed())
 }
 
 /// Format a comparison table of latency results.

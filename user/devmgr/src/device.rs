@@ -351,4 +351,298 @@ mod tests {
         assert!(!result);
         assert_eq!(dev.state, DeviceState::Discovered);
     }
+
+    #[test]
+    fn all_invalid_transitions() {
+        // Every state should reject SpawnSucceeded except Matched and Failed
+        let states = [
+            DeviceState::Discovered,
+            DeviceState::DriverRunning,
+            DeviceState::Removed,
+            DeviceState::RemovedWait,
+            DeviceState::Dead,
+        ];
+        for state in states {
+            let mut dev = DeviceEntry::new(mock_device());
+            dev.state = state;
+            assert!(!dev.transition(DeviceEvent::SpawnSucceeded, 0),
+                "{:?} should reject SpawnSucceeded", state);
+        }
+    }
+
+    #[test]
+    fn spawn_failed_increments_crash_count() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.transition(DeviceEvent::SpawnFailed, 100);
+        assert_eq!(dev.crash_count, 1);
+        assert_eq!(dev.state, DeviceState::Failed);
+
+        dev.transition(DeviceEvent::SpawnFailed, 200);
+        assert_eq!(dev.crash_count, 2);
+    }
+
+    #[test]
+    fn dead_after_max_retries_spawn_failed() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.crash_count = MAX_CRASH_RETRIES;
+        dev.state = DeviceState::Failed;
+
+        dev.transition(DeviceEvent::SpawnFailed, 0);
+        assert_eq!(dev.state, DeviceState::Dead);
+    }
+
+    #[test]
+    fn driver_running_clean_exit_goes_to_removed() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+        assert_eq!(dev.state, DeviceState::DriverRunning);
+
+        dev.transition(DeviceEvent::DriverExited(0), 200);
+        assert_eq!(dev.state, DeviceState::Removed);
+        assert_eq!(dev.driver_pid, 0);
+    }
+
+    #[test]
+    fn driver_running_nonzero_exit_goes_to_failed() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+
+        dev.transition(DeviceEvent::DriverExited(1), 200);
+        assert_eq!(dev.state, DeviceState::Failed);
+        assert_eq!(dev.crash_count, 1);
+    }
+
+    #[test]
+    fn recovery_from_failed_resets_crash_count() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+        dev.transition(DeviceEvent::DriverCrashed(139), 200);
+        assert_eq!(dev.crash_count, 1);
+
+        dev.transition(DeviceEvent::SpawnSucceeded, 300);
+        assert_eq!(dev.state, DeviceState::DriverRunning);
+        assert_eq!(dev.crash_count, 0);
+    }
+
+    #[test]
+    fn removed_wait_to_matched_on_redetect() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+        dev.transition(DeviceEvent::DeviceRemoved, 200);
+        assert_eq!(dev.state, DeviceState::RemovedWait);
+
+        // Redetect resets crash count
+        dev.crash_count = 5;
+        dev.transition(DeviceEvent::DeviceRedetected, 300);
+        assert_eq!(dev.state, DeviceState::Matched);
+        assert_eq!(dev.crash_count, 0);
+    }
+
+    #[test]
+    fn dead_can_be_restarted() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.state = DeviceState::Dead;
+        dev.crash_count = 99;
+        dev.was_removed = true;
+
+        dev.transition(DeviceEvent::Matched, 0);
+        assert_eq!(dev.state, DeviceState::Matched);
+        assert_eq!(dev.crash_count, 0);
+        assert!(!dev.was_removed);
+    }
+
+    #[test]
+    fn is_driver_active() {
+        let mut dev = DeviceEntry::new(mock_device());
+        assert!(!dev.is_driver_active());
+
+        dev.transition(DeviceEvent::Matched, 0);
+        assert!(!dev.is_driver_active());
+
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+        assert!(!dev.is_driver_active()); // pid is 0
+
+        dev.driver_pid = 42;
+        assert!(dev.is_driver_active());
+    }
+
+    #[test]
+    fn needs_respawn_timing() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.state = DeviceState::Failed;
+        dev.crash_count = 1;
+        dev.backoff_ns = 150_000_000; // 150ms
+        dev.last_crash_ns = 1000;
+
+        // Not enough time elapsed
+        assert!(!dev.needs_respawn(1000 + 100_000_000)); // 100ms elapsed
+
+        // Enough time elapsed
+        assert!(dev.needs_respawn(1000 + 200_000_000)); // 200ms elapsed
+    }
+
+    #[test]
+    fn needs_respawn_max_retries() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.state = DeviceState::Failed;
+        dev.crash_count = MAX_CRASH_RETRIES;
+        dev.backoff_ns = 0;
+        dev.last_crash_ns = 0;
+
+        assert!(!dev.needs_respawn(1_000_000_000));
+    }
+
+    #[test]
+    fn needs_respawn_wrong_state() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.state = DeviceState::DriverRunning;
+        dev.crash_count = 1;
+        dev.backoff_ns = 0;
+        dev.last_crash_ns = 0;
+
+        assert!(!dev.needs_respawn(1_000_000_000));
+    }
+
+    #[test]
+    fn state_names() {
+        let cases = [
+            (DeviceState::Discovered, "DISCOVERED"),
+            (DeviceState::Matched, "MATCHED"),
+            (DeviceState::DriverRunning, "DRIVER_RUNNING"),
+            (DeviceState::Failed, "FAILED"),
+            (DeviceState::Removed, "REMOVED"),
+            (DeviceState::RemovedWait, "REMOVED_WAIT"),
+            (DeviceState::Dead, "DEAD"),
+        ];
+        for (state, name) in cases {
+            let mut dev = DeviceEntry::new(mock_device());
+            dev.state = state;
+            assert_eq!(dev.state_name(), name);
+        }
+    }
+
+    #[test]
+    fn transition_records_timestamp() {
+        let mut dev = DeviceEntry::new(mock_device());
+        assert_eq!(dev.last_transition_ns, 0);
+
+        dev.transition(DeviceEvent::Matched, 42);
+        assert_eq!(dev.last_transition_ns, 42);
+
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+        assert_eq!(dev.last_transition_ns, 100);
+    }
+
+    #[test]
+    fn crash_records_last_crash_ns() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.transition(DeviceEvent::SpawnSucceeded, 100);
+
+        dev.transition(DeviceEvent::DriverCrashed(139), 500);
+        assert_eq!(dev.last_crash_ns, 500);
+    }
+
+    #[test]
+    fn all_valid_transitions() {
+        // Verify is_valid_transition matches the state machine
+        let valid = [
+            (DeviceState::Discovered, DeviceEvent::Matched),
+            (DeviceState::Matched, DeviceEvent::SpawnSucceeded),
+            (DeviceState::Matched, DeviceEvent::SpawnFailed),
+            (DeviceState::DriverRunning, DeviceEvent::DriverExited(0)),
+            (DeviceState::DriverRunning, DeviceEvent::DriverCrashed(1)),
+            (DeviceState::DriverRunning, DeviceEvent::DeviceRemoved),
+            (DeviceState::Failed, DeviceEvent::SpawnSucceeded),
+            (DeviceState::Failed, DeviceEvent::SpawnFailed),
+            (DeviceState::Failed, DeviceEvent::DeviceRemoved),
+            (DeviceState::Removed, DeviceEvent::DeviceRedetected),
+            (DeviceState::RemovedWait, DeviceEvent::DeviceRedetected),
+            (DeviceState::Dead, DeviceEvent::Matched),
+        ];
+        for (state, event) in valid {
+            assert!(is_valid_transition(state, event),
+                "{:?} + {:?} should be valid", state, event);
+        }
+    }
+
+    #[test]
+    fn invalid_event_opcodes() {
+        // Events that don't produce notifications should have opcode 0
+        assert_eq!(DeviceEvent::Matched.opcode(), 0);
+        assert_eq!(DeviceEvent::SpawnSucceeded.opcode(), 0xE003);
+        assert_eq!(DeviceEvent::SpawnFailed.opcode(), 0);
+        assert_eq!(DeviceEvent::DeviceRemoved.opcode(), 0xE001);
+        assert_eq!(DeviceEvent::DriverCrashed(1).opcode(), 0xE002);
+        assert_eq!(DeviceEvent::DriverExited(0).opcode(), 0);
+        assert_eq!(DeviceEvent::DeviceRedetected.opcode(), 0);
+        assert_eq!(DeviceEvent::RetryBudgetCheck.opcode(), 0);
+    }
+
+    #[test]
+    fn device_entry_clone() {
+        let mut dev = DeviceEntry::new(mock_device());
+        dev.transition(DeviceEvent::Matched, 0);
+        dev.driver_pid = 42;
+        dev.crash_count = 3;
+
+        let cloned = dev.clone();
+        assert_eq!(cloned.state, DeviceState::Matched);
+        assert_eq!(cloned.driver_pid, 42);
+        assert_eq!(cloned.crash_count, 3);
+    }
+
+    #[test]
+    fn driver_caps_default() {
+        let caps = DriverCaps::default();
+        assert_eq!(caps.io_port, 0);
+        assert_eq!(caps.irq, 0);
+        assert_eq!(caps.n_dma, 0);
+        assert_eq!(caps.control_chan, 0);
+    }
+
+    #[test]
+    fn full_lifecycle_e2e() {
+        // End-to-end: discover → match → spawn → run → crash → retry → recover
+        let mut dev = DeviceEntry::new(mock_device());
+        let mut now = 0u64;
+
+        // Discover
+        assert_eq!(dev.state, DeviceState::Discovered);
+
+        // Match
+        dev.transition(DeviceEvent::Matched, now);
+        assert_eq!(dev.state, DeviceState::Matched);
+
+        // Spawn
+        now += 100;
+        dev.transition(DeviceEvent::SpawnSucceeded, now);
+        assert_eq!(dev.state, DeviceState::DriverRunning);
+        dev.driver_pid = 42;
+
+        // Run for a while
+        now += 1_000_000_000;
+
+        // Crash
+        dev.transition(DeviceEvent::DriverCrashed(139), now);
+        assert_eq!(dev.state, DeviceState::Failed);
+        assert_eq!(dev.crash_count, 1);
+        assert_eq!(dev.driver_pid, 0);
+
+        // Retry (backoff elapsed)
+        dev.backoff_ns = 150_000_000;
+        dev.last_crash_ns = now;
+        now += 200_000_000;
+        assert!(dev.needs_respawn(now));
+
+        dev.transition(DeviceEvent::SpawnSucceeded, now);
+        assert_eq!(dev.state, DeviceState::DriverRunning);
+        assert_eq!(dev.crash_count, 0);
+        dev.driver_pid = 43;
+    }
 }

@@ -235,10 +235,43 @@ mod tests {
         }
     }
 
+    fn virtio_device() -> PciDevice {
+        PciDevice {
+            bus: 0, slot: 5, func: 0,
+            vendor_id: 0x1AF4, device_id: 0x1000,
+            class: crate::pci::PciClass { base: 0x02, sub: 0x00, prog_if: 0x00 },
+            header_type: 0, revision_id: 0,
+            bars: [crate::pci::PciBar::default(); 6],
+            interrupt_pin: 1, interrupt_line: 0,
+            has_msi: true, has_msix: false, msi_offset: 0, msix_offset: 0,
+            is_bridge: false, secondary_bus: 0,
+        }
+    }
+
+    fn unknown_device() -> PciDevice {
+        PciDevice {
+            bus: 0, slot: 7, func: 0,
+            vendor_id: 0xFFFF, device_id: 0x0001,
+            class: crate::pci::PciClass { base: 0xFF, sub: 0xFF, prog_if: 0xFF },
+            header_type: 0, revision_id: 0,
+            bars: [crate::pci::PciBar::default(); 6],
+            interrupt_pin: 0, interrupt_line: 0,
+            has_msi: false, has_msix: false, msi_offset: 0, msix_offset: 0,
+            is_bridge: false, secondary_bus: 0,
+        }
+    }
+
     #[test]
     fn exact_match() {
         let m = e1000_manifest();
         let dev = e1000_device();
+        assert_eq!(m.try_match(&dev), MatchResult::Exact);
+    }
+
+    #[test]
+    fn exact_match_virtio() {
+        let m = virtio_net_manifest();
+        let dev = virtio_device();
         assert_eq!(m.try_match(&dev), MatchResult::Exact);
     }
 
@@ -251,11 +284,164 @@ mod tests {
     }
 
     #[test]
+    fn no_match_wrong_device() {
+        let mut m = e1000_manifest();
+        m.device_id = 0x9999;
+        let dev = e1000_device();
+        assert_eq!(m.try_match(&dev), MatchResult::NoMatch);
+    }
+
+    #[test]
     fn class_code_match() {
         let mut m = e1000_manifest();
         m.vendor_id = 0;
         m.device_id = 0;
         let dev = e1000_device();
         assert_eq!(m.try_match(&dev), MatchResult::ClassCode);
+    }
+
+    #[test]
+    fn class_code_match_storage() {
+        let mut m = e1000_manifest();
+        m.vendor_id = 0;
+        m.device_id = 0;
+        m.class_code = 0x010802; // NVMe
+        let mut dev = e1000_device();
+        dev.class = crate::pci::PciClass { base: 0x01, sub: 0x08, prog_if: 0x02 };
+        assert_eq!(m.try_match(&dev), MatchResult::ClassCode);
+    }
+
+    #[test]
+    fn no_match_unknown_device() {
+        let m = e1000_manifest();
+        let dev = unknown_device();
+        assert_eq!(m.try_match(&dev), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn no_match_different_class() {
+        let m = e1000_manifest();
+        let mut dev = e1000_device();
+        dev.class = crate::pci::PciClass { base: 0x01, sub: 0x06, prog_if: 0x00 }; // SATA
+        assert_eq!(m.try_match(&dev), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn manifest_requires_cap() {
+        let m = e1000_manifest();
+        assert!(m.requires_cap(0x01)); // IO_PORT
+        assert!(m.requires_cap(0x02)); // IRQ
+        assert!(m.requires_cap(0x03)); // DMA_BUF
+        assert!(m.requires_cap(0x05)); // CHAN_R
+        assert!(m.requires_cap(0x06)); // CHAN_W
+        assert!(!m.requires_cap(0xFF)); // non-existent
+    }
+
+    #[test]
+    fn manifest_dma_requirements() {
+        let m = e1000_manifest();
+        let (pages, align) = m.dma_requirements();
+        assert_eq!(pages, 160); // detail0 of DMA_BUF cap
+        assert_eq!(align, 16);  // detail1 of DMA_BUF cap
+    }
+
+    #[test]
+    fn manifest_dma_requirements_virtio() {
+        let m = virtio_net_manifest();
+        let (pages, align) = m.dma_requirements();
+        assert_eq!(pages, 70);
+        assert_eq!(align, 16);
+    }
+
+    #[test]
+    fn manifest_dma_requirements_none() {
+        let mut m = e1000_manifest();
+        m.n_caps = 0; // no cap requirements
+        let (pages, align) = m.dma_requirements();
+        assert_eq!(pages, 0);
+        assert_eq!(align, 1);
+    }
+
+    #[test]
+    fn e1000_manifest_fields() {
+        let m = e1000_manifest();
+        assert_eq!(m.name, "drv.e1000.0");
+        assert_eq!(m.vendor_id, 0x8086);
+        assert_eq!(m.device_id, 0x100E);
+        assert_eq!(m.compatible, "intel,e1000");
+        assert_eq!(m.n_caps, 5);
+        assert_eq!(m.limits.max_memory_bytes, 4 * 1024 * 1024);
+        assert_eq!(m.limits.max_dma_frames, 160);
+        assert_eq!(m.limits.max_channels, 8);
+        assert_eq!(m.limits.max_irqs, 2);
+    }
+
+    #[test]
+    fn virtio_manifest_fields() {
+        let m = virtio_net_manifest();
+        assert_eq!(m.name, "drv.virtio-net.0");
+        assert_eq!(m.vendor_id, 0x1AF4);
+        assert_eq!(m.device_id, 0x1000);
+        assert_eq!(m.compatible, "virtio,net");
+        assert_eq!(m.n_caps, 5);
+        assert_eq!(m.limits.max_memory_bytes, 2 * 1024 * 1024);
+        assert_eq!(m.limits.max_dma_frames, 70);
+    }
+
+    #[test]
+    fn cap_requirement_default() {
+        let cap = CapRequirement::default();
+        assert_eq!(cap.cap_type, 0);
+        assert_eq!(cap.perm, 0);
+        assert_eq!(cap.count, 0);
+    }
+
+    #[test]
+    fn resource_limits_default() {
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.max_memory_bytes, 0);
+        assert_eq!(limits.max_dma_frames, 0);
+        assert_eq!(limits.max_channels, 0);
+    }
+
+    #[test]
+    fn exported_service_default() {
+        let svc = ExportedService::default();
+        assert_eq!(svc.name, [0u8; 16]);
+        assert_eq!(svc.port, 0);
+        assert_eq!(svc.version, 0);
+    }
+
+    #[test]
+    fn manifest_clone() {
+        let m = e1000_manifest();
+        let m2 = m.clone();
+        assert_eq!(m.name, m2.name);
+        assert_eq!(m.vendor_id, m2.vendor_id);
+        assert_eq!(m.n_caps, m2.n_caps);
+    }
+
+    #[test]
+    fn manifest_match_priority() {
+        // Exact should be preferred over ClassCode
+        let m = e1000_manifest();
+        let dev = e1000_device();
+        // Manifest has both vendor/device AND class code matching
+        assert_eq!(m.try_match(&dev), MatchResult::Exact, "exact should win over classcode");
+    }
+
+    #[test]
+    fn multiple_manifests_selection() {
+        let manifests = [e1000_manifest(), virtio_net_manifest()];
+        let dev = e1000_device();
+
+        let mut matched = None;
+        for (i, m) in manifests.iter().enumerate() {
+            if m.try_match(&dev) == MatchResult::Exact {
+                matched = Some(i);
+                break;
+            }
+        }
+        assert_eq!(matched, Some(0)); // e1000 manifest matches
     }
 }

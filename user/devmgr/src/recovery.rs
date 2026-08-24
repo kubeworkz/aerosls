@@ -351,11 +351,36 @@ pub fn quarantine_driver<K: Kernel>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pci::{PciDevice, PciBar, PciClass};
+
+    fn mock_device() -> PciDevice {
+        PciDevice {
+            bus: 0, slot: 3, func: 0,
+            vendor_id: 0x8086, device_id: 0x100E,
+            class: PciClass { base: 0x02, sub: 0x00, prog_if: 0x00 },
+            header_type: 0, revision_id: 0,
+            bars: [PciBar::default(); 6],
+            interrupt_pin: 1, interrupt_line: 0,
+            has_msi: true, has_msix: false, msi_offset: 0, msix_offset: 0,
+            is_bridge: false, secondary_bus: 0,
+        }
+    }
+
+    fn mock_entry() -> crate::device::DeviceEntry {
+        crate::device::DeviceEntry::new(mock_device())
+    }
+
+    fn make_rm() -> RecoveryManager<'static, ()> {
+        RecoveryManager {
+            kernel: &(),
+            config: RecoveryConfig::default(),
+            events: Vec::new(),
+        }
+    }
 
     #[test]
     fn backoff_growth() {
-        let config = RecoveryConfig::default();
-        let rm = RecoveryManager { kernel: &(), config, events: Vec::new() };
+        let rm = make_rm();
 
         let b0 = rm.compute_backoff(1);
         let b1 = rm.compute_backoff(2);
@@ -367,6 +392,302 @@ mod tests {
 
         // Should not exceed max
         let b20 = rm.compute_backoff(20);
-        assert!(b20 <= config.max_backoff_ns + config.max_backoff_ns / 4);
+        assert!(b20 <= rm.config.max_backoff_ns + rm.config.max_backoff_ns / 4);
+    }
+
+    #[test]
+    fn backoff_first_attempt() {
+        let rm = make_rm();
+        let b = rm.compute_backoff(1);
+        // Base is 100ms, jitter up to 25%
+        assert!(b >= 100_000_000);
+        assert!(b <= 125_000_000);
+    }
+
+    #[test]
+    fn backoff_exponential_growth() {
+        let rm = make_rm();
+        let mut prev = 0u64;
+        for attempt in 1..=10 {
+            let b = rm.compute_backoff(attempt);
+            // Should be >= previous (ignoring jitter)
+            assert!(b >= prev / 2, "attempt {}: {} < prev/2 {}", attempt, b, prev/2);
+            prev = b;
+        }
+    }
+
+    #[test]
+    fn backoff_max_cap() {
+        let rm = make_rm();
+        for attempt in 1..=32 {
+            let b = rm.compute_backoff(attempt);
+            // Max is 5s + 25% jitter = 6.25s
+            assert!(b <= 6_250_000_000,
+                "attempt {}: backoff {} exceeds max", attempt, b);
+        }
+    }
+
+    #[test]
+    fn backoff_zero_attempt() {
+        let rm = make_rm();
+        // saturating_sub(0, 1) = 0, so shift = 0, backoff = 100ms
+        let b = rm.compute_backoff(0);
+        assert!(b >= 100_000_000);
+    }
+
+    #[test]
+    fn recovery_config_defaults() {
+        let cfg = RecoveryConfig::default();
+        assert_eq!(cfg.max_retries, 8);
+        assert_eq!(cfg.base_backoff_ns, 100_000_000);
+        assert_eq!(cfg.max_backoff_ns, 5_000_000_000);
+        assert_eq!(cfg.health_timeout_ns, 5_000_000_000);
+    }
+
+    #[test]
+    fn crash_reason_display() {
+        let reasons = [
+            (CrashReason::ExitCode(1), "exit code 1"),
+            (CrashReason::Signal(139), "signal 139"),
+            (CrashReason::HeartbeatTimeout, "heartbeat timeout"),
+            (CrashReason::ChannelClosed, "channel closed"),
+            (CrashReason::Unknown, "unknown"),
+        ];
+        for (reason, expected) in reasons {
+            assert_eq!(alloc::format!("{}", reason), expected);
+        }
+    }
+
+    #[test]
+    fn crash_reason_equality() {
+        assert_eq!(CrashReason::ExitCode(1), CrashReason::ExitCode(1));
+        assert_ne!(CrashReason::ExitCode(1), CrashReason::ExitCode(2));
+        assert_ne!(CrashReason::Signal(139), CrashReason::HeartbeatTimeout);
+        assert_eq!(CrashReason::Unknown, CrashReason::Unknown);
+    }
+
+    #[test]
+    fn recovery_error_equality() {
+        assert_eq!(RecoveryError::SpawnFailed, RecoveryError::SpawnFailed);
+        assert_ne!(RecoveryError::SpawnFailed, RecoveryError::InitFailed);
+    }
+
+    #[test]
+    fn detect_crash_emits_event() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.state = crate::device::DeviceState::DriverRunning;
+
+        rm.detect_crash(&mut entry, 0, CrashReason::Signal(139), 139, 1000);
+
+        let events = rm.drain_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RecoveryEvent::DriverCrashed { device_idx, reason, exit_code } => {
+                assert_eq!(*device_idx, 0);
+                assert_eq!(*reason, CrashReason::Signal(139));
+                assert_eq!(*exit_code, 139);
+            }
+            _ => panic!("expected DriverCrashed event"),
+        }
+    }
+
+    #[test]
+    fn detect_crash_emits_dead_when_max_retries() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.crash_count = 7; // one less than max (8)
+
+        rm.detect_crash(&mut entry, 0, CrashReason::HeartbeatTimeout, 0, 1000);
+
+        let events = rm.drain_events();
+        // Should have DriverCrashed + DeviceDead
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[1], RecoveryEvent::DeviceDead { device_idx: 0, total_crashes: 8 }));
+    }
+
+    #[test]
+    fn detect_crash_no_dead_under_budget() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.crash_count = 5;
+
+        rm.detect_crash(&mut entry, 0, CrashReason::ChannelClosed, 0, 1000);
+
+        let events = rm.drain_events();
+        // Only DriverCrashed, no DeviceDead
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], RecoveryEvent::DriverCrashed { .. }));
+    }
+
+    #[test]
+    fn attempt_recovery_no_manifest_fails() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.crash_count = 1;
+        entry.backoff_ns = 150_000_000;
+
+        let result = rm.attempt_recovery(&mut entry, 0, None, 2000);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), RecoveryError::SpawnFailed);
+
+        let events = rm.drain_events();
+        assert!(events.iter().any(|e| matches!(e, RecoveryEvent::RecoveryFailed { .. })));
+    }
+
+    #[test]
+    fn attempt_recovery_with_manifest_succeeds() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.state = crate::device::DeviceState::Failed;
+        entry.crash_count = 1;
+
+        let manifest = crate::manifest::e1000_manifest();
+        let result = rm.attempt_recovery(&mut entry, 0, Some(&manifest), 3000);
+        assert!(result.is_ok());
+
+        assert_eq!(entry.state, crate::device::DeviceState::DriverRunning);
+        assert_eq!(entry.crash_count, 0);
+
+        let events = rm.drain_events();
+        assert!(events.iter().any(|e| matches!(e, RecoveryEvent::RecoveryStarted { .. })));
+        assert!(events.iter().any(|e| matches!(e, RecoveryEvent::DriverRestored { .. })));
+    }
+
+    #[test]
+    fn attempt_recovery_records_attempt() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.crash_count = 3;
+
+        let manifest = crate::manifest::e1000_manifest();
+        rm.attempt_recovery(&mut entry, 0, Some(&manifest), 3000).unwrap();
+
+        let events = rm.drain_events();
+        match events.iter().find(|e| matches!(e, RecoveryEvent::RecoveryStarted { .. })) {
+            Some(RecoveryEvent::RecoveryStarted { attempt, .. }) => {
+                assert_eq!(*attempt, 3);
+            }
+            _ => panic!("expected RecoveryStarted event"),
+        }
+    }
+
+    #[test]
+    fn notify_clients_sends_messages() {
+        let rm = make_rm();
+        let clients = [1, 2, 3];
+        rm.notify_clients(&clients, 0xE001, 0, &[42]);
+
+        let events = rm.drain_events();
+        assert_eq!(events.len(), 3);
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                RecoveryEvent::ClientNotified { client_pid, event: evt, device_idx } => {
+                    assert_eq!(*client_pid, (i + 1) as u32);
+                    assert_eq!(*evt, 0xE001);
+                    assert_eq!(*device_idx, 0);
+                }
+                _ => panic!("expected ClientNotified event"),
+            }
+        }
+    }
+
+    #[test]
+    fn notify_clients_empty() {
+        let rm = make_rm();
+        rm.notify_clients(&[], 0xE001, 0, &[]);
+        let events = rm.drain_events();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn drain_events_clears() {
+        let mut rm = make_rm();
+        rm.events.push(RecoveryEvent::DeviceDead { device_idx: 0, total_crashes: 8 });
+        rm.events.push(RecoveryEvent::DriverCrashed {
+            device_idx: 0, reason: CrashReason::Unknown, exit_code: 0
+        });
+
+        let events = rm.drain_events();
+        assert_eq!(events.len(), 2);
+        assert!(rm.events.is_empty());
+    }
+
+    #[test]
+    fn health_timeout_not_running() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.state = crate::device::DeviceState::Failed;
+
+        assert!(!rm.check_health_timeout(&entry, 0, 1000, 0));
+        assert!(rm.events.is_empty());
+    }
+
+    #[test]
+    fn health_timeout_within_budget() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.state = crate::device::DeviceState::DriverRunning;
+
+        // Heartbeat was 1s ago, timeout is 5s
+        assert!(!rm.check_health_timeout(&entry, 0, 1_000_000_000, 0));
+    }
+
+    #[test]
+    fn health_timeout_exceeded() {
+        let mut rm = make_rm();
+        let mut entry = mock_entry();
+        entry.state = crate::device::DeviceState::DriverRunning;
+
+        // Heartbeat was 10s ago, timeout is 5s
+        assert!(rm.check_health_timeout(&entry, 0, 10_000_000_000, 0));
+        let events = rm.drain_events();
+        assert!(events.iter().any(|e| matches!(e, RecoveryEvent::DriverCrashed { reason: CrashReason::HeartbeatTimeout, .. })));
+    }
+
+    #[test]
+    fn quarantine_clears_driver_state() {
+        let mut entry = mock_entry();
+        entry.driver_pid = 42;
+        entry.driver_caps.io_port = 10;
+        entry.driver_caps.irq = 11;
+        entry.driver_caps.dma = [12, 13, 14, 15];
+        entry.driver_caps.n_dma = 3;
+        entry.driver_caps.control_chan = 20;
+
+        quarantine_driver(&(), &mut entry);
+
+        assert_eq!(entry.driver_pid, 0);
+        assert_eq!(entry.driver_caps.io_port, 0xFFFF);
+        assert_eq!(entry.driver_caps.irq, 0xFFFF);
+        assert_eq!(entry.driver_caps.n_dma, 0);
+        assert_eq!(entry.driver_caps.control_chan, 0);
+    }
+
+    #[test]
+    fn quarantine_no_caps_is_noop() {
+        let mut entry = mock_entry();
+        // Default caps are all 0 / 0xFFFF
+        quarantine_driver(&(), &mut entry);
+        assert_eq!(entry.driver_pid, 0);
+    }
+
+    #[test]
+    fn recovery_config_clone() {
+        let cfg = RecoveryConfig::default();
+        let cfg2 = cfg;
+        assert_eq!(cfg.max_retries, cfg2.max_retries);
+        assert_eq!(cfg.base_backoff_ns, cfg2.base_backoff_ns);
+    }
+
+    #[test]
+    fn recovery_event_clone() {
+        let event = RecoveryEvent::DriverCrashed {
+            device_idx: 0,
+            reason: CrashReason::Signal(139),
+            exit_code: 139,
+        };
+        let event2 = event.clone();
+        assert!(matches!(event2, RecoveryEvent::DriverCrashed { .. }));
     }
 }
