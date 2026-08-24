@@ -182,8 +182,9 @@ impl<K: Kernel> DmServer<K> {
                 // `serve_one` always waits with TIMEOUT_NONE, so a returned
                 // TIMEOUT can only mean the kernel could not park this
                 // process (every process is blocked and nothing is runnable
-                // to hand the CPU to). At end of a boot that's an idle demo,
-                // not a failure — retry rather than abort the server loop.
+                // to hand the CPU to). Yield to let peers run; the timer
+                // ISR resumes us and the retry picks up any queued event.
+                self.k.sched_yield();
                 return Ok(DmOutcome::Idle);
             }
             Err(e) => return Err(DmError::Kernel(e)),
@@ -247,6 +248,16 @@ impl<K: Kernel> DmServer<K> {
         let reg = unsafe { DeviceRegistry::from_raw_parts(granted.base as *const u8, granted.len as usize) }
             .map_err(DmError::BadRegistry)?;
 
+        // Reply devices-ready FIRST, before any console logging. The
+        // adopt logs below are blocking console sends; if any of them
+        // parks on a full console queue, the reply would be delayed
+        // indefinitely and init's finite-deadline handshake would time out
+        // (live QEMU failure). The reply is the protocol signal — get it
+        // onto the messenger before spending time on diagnostic output.
+        self.k
+            .send(self.msg_w, MSG_DEVICES_READY, 0, &[], &[], 0)
+            .map_err(DmError::Kernel)?;
+
         // Adopt (v1: log) the discovered devices.
         for (i, e) in reg.iter().enumerate() {
             let name = e.manifest_name().unwrap_or("?");
@@ -256,11 +267,6 @@ impl<K: Kernel> DmServer<K> {
             ));
         }
         self.log_fmt(format_args!("[DM] registry: {} device(s) adopted", reg.len()));
-
-        // Reply devices-ready (blocking send, timeout 0).
-        self.k
-            .send(self.msg_w, MSG_DEVICES_READY, 0, &[], &[], 0)
-            .map_err(DmError::Kernel)?;
 
         Ok(DmOutcome::RegistryServed { devices: reg.len() })
     }
@@ -293,6 +299,9 @@ impl<K: Kernel> DmServer<K> {
                         self.log("[DM] messenger idle (all peers parked); waiting for events");
                         idle_logged = true;
                     }
+                    // Yield the CPU so other processes (e.g. init) can run.
+                    // Without this the DM busy-spins and starves peers.
+                    self.k.sched_yield();
                 }
                 _ => {}
             }

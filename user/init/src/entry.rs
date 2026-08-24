@@ -20,6 +20,10 @@ use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
+extern "C" {
+    fn k_yield();
+}
+
 /* The crt0 (crt0.S) is assembled by rustc's own LLVM integrated assembler
  * through global_asm — no external cross-GCC — and linked at address 0 by
  * init.ld (ENTRY(_start)). It saves rdi (the BIB pointer from the kernel's
@@ -285,8 +289,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             }
             Err(ChannelError::Timeout) => {
                 // The deadline elapsed (kernel woke the park with
-                // CAP_ERR_TIMEOUT); retry, then give up and move on.
+                // CAP_ERR_TIMEOUT); yield to let the DM run, then retry.
                 log_fmt!(&console, "[INIT] DM not ready yet (attempt {}/3)", attempt);
+                unsafe { k_yield(); }
             }
             Err(e) => {
                 log_fmt!(&console, "[INIT] DM handshake failed: {}", e);

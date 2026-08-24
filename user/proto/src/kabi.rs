@@ -133,6 +133,14 @@ pub trait Kernel {
     /// Close an endpoint with a reason; idempotent (transport spec §6.1).
     fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32>;
 
+    /// Voluntarily give up the CPU (SYS_SLS_YIELD). The process parks,
+    /// the scheduler picks the next runnable process, and the timer ISR
+    /// resumes us — the yield looks like a syscall that took a while.
+    /// Returns immediately if no other process is runnable.
+    fn sched_yield(&self) {
+        // Default no-op; real kernel overrides.
+    }
+
     /// Introspect one of the caller's own caps (capability-layer spec §3.5).
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32>;
 
@@ -220,6 +228,7 @@ mod abi {
     const SYS_CHAN_SEND: u64 = 313;
     const SYS_CHAN_CLOSE: u64 = 314;
     const SYS_CAP_INFO: u64 = 315;
+    const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
     /// `aerosls::syscall::sls_syscall`): number in rax, one arg pointer in
@@ -533,6 +542,13 @@ mod abi {
     }
 
     #[no_mangle]
+    pub extern "C" fn k_yield() {
+        unsafe {
+            sls_syscall(SYS_YIELD, 0);
+        }
+    }
+
+    #[no_mangle]
     pub extern "C" fn k_cap_info(handle: u32, out: *mut CapInfoOut) -> i32 {
         let mut req = CapInfoReq {
             handle: handle as u16,
@@ -696,6 +712,10 @@ mod abi {
                     len: out.len,
                 })
             }
+        }
+
+        fn sched_yield(&self) {
+            k_yield();
         }
 
         fn create_sidecar(&self, manifest: &[u8]) -> Result<(u32, u32), i32> {
